@@ -4073,3 +4073,43 @@ export async function chiList(
 export async function chiCancel(runId: string): Promise<ChiRunResult> {
 	return invoke<ChiRunResult>('chi_cancel', { runId });
 }
+
+// ── multi-window WP-01 cost-measurement spike (debug-only) ────────────────────
+// Pairs with src-tauri/src/commands/window_cost.rs.
+// Both the Rust side (cfg(debug_assertions)) and the FE side (import.meta.env.DEV
+// via lib/dev/index.ts) are gated for debug builds only.
+// Hard-removed after Phase-3 sign-off alongside bg_spike.
+
+/** One row in the per-window cost table. */
+export interface WindowCostRow {
+	/** "empty" | "thin" | "full" */
+	config: string;
+	/** Milliseconds from build() call to WebviewWindowBuilder returning. */
+	spawnMs: number;
+	/** Milliseconds from build() call to first window_cost_ping reply.
+	 *  null for the empty config (no Tauri JS bridge on about:blank) or on timeout. */
+	firstPaintMs: number | null;
+	/** Sum of VmRSS (kB) of new WebKitWebProcess children (Linux only). */
+	rssKb: number | null;
+	/** Per-OS note on how to measure RSS manually (macOS/Windows) or
+	 *  description of the auto-measurement (Linux). */
+	rssNote: string;
+	/** Non-fatal error if spawning or eval failed. */
+	error: string | null;
+}
+
+/** Top-level cost report returned by windowCostRun(). */
+export interface WindowCostReport {
+	rows: WindowCostRow[];
+	/** "linux" | "macos" | "windows" | "other" */
+	os: string;
+	/** Reminder of the per-OS manual RSS steps (see window_cost.rs docs). */
+	osRssNote: string;
+}
+
+/** Run the three-config (empty/thin/full) cost measurement sequence.
+ *  Takes up to ~45 s. Returns when all three windows have been spawned,
+ *  sampled, and closed. See lib/dev/window-cost.ts for a console helper. */
+export async function windowCostRun(): Promise<WindowCostReport> {
+	return invoke<WindowCostReport>('window_cost_run', {});
+}

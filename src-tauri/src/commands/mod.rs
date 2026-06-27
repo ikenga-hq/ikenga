@@ -48,6 +48,8 @@ pub mod supabase_config;
 pub mod trust;
 pub mod viewer;
 pub mod window;
+#[cfg(debug_assertions)]
+pub mod window_cost;
 
 pub use activity_bar::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
@@ -160,6 +162,10 @@ pub use supabase_config::{supabase_config_clear, supabase_config_get, supabase_c
 pub use trust::{pkg_trust_grant, pkg_trust_list, pkg_trust_preview, pkg_trust_revoke};
 pub use viewer::{viewer_port, viewer_serve, viewer_stop};
 pub use window::{window_close, window_list, window_spawn};
+#[cfg(debug_assertions)]
+pub use window_cost::{
+    new_state as new_window_cost_state, window_cost_ping, window_cost_run,
+};
 
 use std::path::{Path, PathBuf};
 

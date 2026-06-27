@@ -5,5 +5,9 @@
 
 // Side-effect import: installs window.__bgSpikeReply + window.bgSpikeRun.
 import './bg-spike';
+// Side-effect import: installs window.__windowCostPing + window.windowCostRun.
+// Required in every window that loads the dev bundle so Rust's eval() poll
+// can fire the first-paint signal in thin/full probe windows (WP-01).
+import './window-cost';
 
 export {};

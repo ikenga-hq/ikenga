@@ -84,7 +84,10 @@ use commands::{
     StreamingSidecarManager, StreamingSidecarManagerState, WebviewPanesState,
 };
 #[cfg(debug_assertions)]
-use commands::{bg_spike_reply, bg_spike_run, new_bg_spike_state};
+use commands::{
+    bg_spike_reply, bg_spike_run, new_bg_spike_state, new_window_cost_state, window_cost_ping,
+    window_cost_run,
+};
 use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
@@ -766,6 +769,11 @@ pub fn run() {
             #[cfg(debug_assertions)]
             app.manage(new_bg_spike_state());
 
+            // Multi-window WP-01 cost-measurement spike state. Debug builds only.
+            // See commands/window_cost.rs.
+            #[cfg(debug_assertions)]
+            app.manage(new_window_cost_state());
+
             // Phase 14: write the runtime env-vault file so the actions
             // sidecar can read vault values via its existing dotenv loader.
             // Best-effort: a failure here just means sidecars fall through
@@ -1042,6 +1050,11 @@ pub fn run() {
             bg_spike_run,
             #[cfg(debug_assertions)]
             bg_spike_reply,
+            // Multi-window WP-01 cost-measurement spike. Debug builds only.
+            #[cfg(debug_assertions)]
+            window_cost_run,
+            #[cfg(debug_assertions)]
+            window_cost_ping,
             // pkg kernel
             pkg_install_from_path,
             pkg_install_from_registry,
