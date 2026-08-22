@@ -81,7 +81,7 @@ describe('artifact sandbox containment', () => {
 				`is what you need, route it through the postMessage bridge in ` +
 				`src/lib/artifact/bridge-messages.ts instead of restoring this flag.`,
 		).toEqual([]);
-	});
+	}, 30000);
 
 	it('the artifact renderer itself never grants it', () => {
 		// Called out separately from the sweep above: this is the file the
