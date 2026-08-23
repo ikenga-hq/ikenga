@@ -1,6 +1,6 @@
 //! Auto-detection of installed shells and WSL distributions on the host machine.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

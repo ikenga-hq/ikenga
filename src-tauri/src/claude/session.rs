@@ -509,6 +509,7 @@ pub async fn spawn_streaming(
         .unwrap_or_else(|_| cwd.clone());
 
     let opts = session.opts.lock().await.clone();
+    let project_dir = session.claude_project_dir.lock().await.clone();
     let mut command = {
         #[cfg(windows)]
         {
