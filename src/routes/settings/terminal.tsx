@@ -22,7 +22,7 @@ function TerminalSettingsPage() {
 	const queryClient = useQueryClient();
 	const { profiles, selectedProfile, setDefaultProfileId, isLoading } = useDefaultShellProfile();
 	const { refetch: refetchProfiles, isFetching } = useShellProfiles();
-	const { customProfiles, addCustomProfile, removeCustomProfile } = useCustomShellProfiles();
+	const { addCustomProfile, removeCustomProfile } = useCustomShellProfiles();
 
 	const [isAddingCustom, setIsAddingCustom] = useState(false);
 	const [customLabel, setCustomLabel] = useState('');

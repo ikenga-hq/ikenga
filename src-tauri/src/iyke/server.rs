@@ -64,6 +64,7 @@ use super::projects::{
 };
 use super::secrets::{get_secret, get_secret_list, post_secret_delete, post_secret_set};
 use super::state::IykeState;
+use super::statusline::{get_statusline_snapshot, post_statusline_event};
 use super::tasks::{get_task_list, post_task_complete, post_task_create, post_task_update};
 use super::terminal::{
     get_terminal_audit, get_terminals, get_windows, post_tab_activate, post_terminal_get,
@@ -148,6 +149,8 @@ pub async fn serve(
         .route("/iyke/tab/activate", post(post_tab_activate))
         .route("/iyke/wait", post(post_wait))
         .route("/iyke/devtools", post(post_devtools))
+        .route("/iyke/statusline/event", post(post_statusline_event))
+        .route("/iyke/statusline/snapshot", get(get_statusline_snapshot))
         .route("/iyke/pkg/install", post(post_pkg_install))
         .route("/iyke/pkg/uninstall", post(post_pkg_uninstall))
         .route("/iyke/pkg/list", get(get_pkg_list))

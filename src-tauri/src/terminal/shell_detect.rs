@@ -1,6 +1,5 @@
 //! Auto-detection of installed shells and WSL distributions on the host machine.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +244,7 @@ fn detect_unix_shells(profiles: &mut Vec<ShellProfile>) {
     let mut added_ids = std::collections::HashSet::new();
 
     for (path, label, kind) in candidates {
-        if Path::new(path).is_file() {
+        if std::path::Path::new(path).is_file() {
             let id = kind.to_string();
             if !added_ids.contains(&id) {
                 let is_def = path == default_shell || (path.ends_with("zsh") && default_shell.ends_with("zsh")) || (path.ends_with("bash") && default_shell.ends_with("bash"));
