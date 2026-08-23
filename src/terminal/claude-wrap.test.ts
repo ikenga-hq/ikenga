@@ -1,47 +1,109 @@
-// Unit tests for buildClaudeWrappedCmd — the argv builder behind every
-// "open claude in a terminal" affordance (open-session-dialog Terminal mode,
-// /claude Run-command, new-session dialog, session resume, composer action).
-//
-// The load-bearing invariant: the prompt is passed POSITIONALLY, never as
-// `-p`. `-p` forces claude into headless print mode (one-shot, no TTY), which
-// is wrong for a terminal the user is meant to keep driving. Regression guard
-// for the `[via: groundwork/wp-card] -p` bug.
+// Unit tests for buildAgentWrappedCmd & buildClaudeWrappedCmd — the argv builder behind every
+// "open AI agent in a terminal" affordance.
 
 import { describe, expect, it } from 'vitest';
 
-import { buildClaudeWrappedCmd } from './claude-wrap';
+import { buildAgentWrappedCmd, buildClaudeWrappedCmd } from './claude-wrap';
 
-/** Pull the quoted `claude …` invocation out of the bash wrapper script so
+/** Pull the quoted command invocation out of the bash wrapper script so
  *  assertions read against the real command rather than the printf chrome. */
-function claudeInvocation(cmd: string[]): string {
+function extractInvocation(cmd: string[]): string {
 	const script = cmd.at(-1) ?? '';
-	// The wrapper is `printf '…' '<quoted>'; <quoted>; __status=$?; …`.
-	// The second occurrence (after the printf) is the actual run.
 	const runStart = script.indexOf('; ') + 2;
 	const runEnd = script.indexOf('; __status=$?');
 	return script.slice(runStart, runEnd);
 }
 
-describe('buildClaudeWrappedCmd', () => {
-	it('wraps the invocation in an interactive bash script that survives exit', () => {
-		const cmd = buildClaudeWrappedCmd();
+describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
+	it('wraps the invocation in an interactive bash script for posix targets', () => {
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash' });
 		expect(cmd.slice(0, 3)).toEqual(['/bin/bash', '-i', '-c']);
 		const script = cmd.at(-1) ?? '';
-		expect(script).toContain('exec "$SHELL" -i');
+		expect(script).toContain('exec "${SHELL:-bash}" -i');
 		expect(script).toContain('[claude exited');
 	});
 
-	it('starts a fresh interactive session with no flags by default', () => {
-		const cmd = buildClaudeWrappedCmd();
-		expect(claudeInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
+	it('wraps the invocation in PowerShell with ExecutionPolicy Bypass', () => {
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'powershell' });
+		expect(cmd[0]).toBe('powershell.exe');
+		expect(cmd).toContain('-ExecutionPolicy');
+		expect(cmd).toContain('Bypass');
+		const script = cmd.at(-1) ?? '';
+		expect(script).toContain("& 'claude'");
+		expect(script).toContain('[claude exited');
+	});
+
+	it('wraps the invocation in pwsh when pwsh target is specified', () => {
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'pwsh' });
+		expect(cmd[0]).toBe('pwsh.exe');
+		expect(cmd).toContain('-ExecutionPolicy');
+		expect(cmd).toContain('Bypass');
+	});
+
+	it('wraps the invocation for WSL with distribution and cwd flags', () => {
+		const cmd = buildClaudeWrappedCmd({
+			shellTarget: 'wsl',
+			wslDistro: 'Ubuntu',
+			cwd: 'C:\\Users\\nedJamez\\project',
+		});
+		expect(cmd[0]).toBe('wsl.exe');
+		expect(cmd).toContain('-d');
+		expect(cmd).toContain('Ubuntu');
+		expect(cmd).toContain('--cd');
+		expect(cmd).toContain('C:/Users/nedJamez/project');
+		expect(cmd).toContain('bash');
+	});
+
+	it('wraps Antigravity (agy) CLI correctly', () => {
+		const cmd = buildAgentWrappedCmd({
+			engine: 'antigravity',
+			resumeSessionId: 'conv-123',
+			model: 'gemini-pro',
+			prompt: 'inspect workspace',
+			shellTarget: 'bash',
+		});
+		expect(extractInvocation(cmd)).toBe(
+			`'agy' '--conversation' 'conv-123' '--model' 'gemini-pro' 'inspect workspace'`
+		);
+		const script = cmd.at(-1) ?? '';
+		expect(script).toContain('[antigravity exited');
+	});
+
+	it('wraps OpenAI Codex CLI correctly', () => {
+		const cmd = buildAgentWrappedCmd({
+			engine: 'codex',
+			resumeSessionId: 'thread-456',
+			model: 'o3-mini',
+			prompt: 'generate tests',
+			shellTarget: 'bash',
+		});
+		expect(extractInvocation(cmd)).toBe(
+			`'codex' 'resume' 'thread-456' '--model' 'o3-mini' 'generate tests'`
+		);
+		const script = cmd.at(-1) ?? '';
+		expect(script).toContain('[codex exited');
+	});
+
+	it('wraps Gemini CLI correctly', () => {
+		const cmd = buildAgentWrappedCmd({
+			engine: 'gemini',
+			model: 'gemini-2.0-flash',
+			prompt: 'summarize',
+			shellTarget: 'bash',
+		});
+		expect(extractInvocation(cmd)).toBe(`'gemini' '--model' 'gemini-2.0-flash' 'summarize'`);
+		const script = cmd.at(-1) ?? '';
+		expect(script).toContain('[gemini exited');
+	});
+
+	it('starts a fresh interactive session with no flags by default for Claude', () => {
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash' });
+		expect(extractInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
 	});
 
 	it('passes the prompt POSITIONALLY, not as -p (no headless print mode)', () => {
-		const cmd = buildClaudeWrappedCmd({ prompt: '[via: groundwork/wp-card]' });
-		const run = claudeInvocation(cmd);
-		// Each arg is shell-quoted, so a real flag appears as a standalone
-		// `'-p'` / `'--print'` token — distinct from the `-p` substring inside
-		// `'--dangerously-skip-permissions'`.
+		const cmd = buildClaudeWrappedCmd({ prompt: '[via: groundwork/wp-card]', shellTarget: 'bash' });
+		const run = extractInvocation(cmd);
 		expect(run).not.toContain(`'-p'`);
 		expect(run).not.toContain(`'--print'`);
 		expect(run).toBe(`'claude' '--dangerously-skip-permissions' '[via: groundwork/wp-card]'`);
@@ -53,23 +115,23 @@ describe('buildClaudeWrappedCmd', () => {
 			permissionMode: 'plan',
 			model: 'opus',
 			resumeSessionId: 'abc-123',
+			shellTarget: 'bash',
 		});
-		expect(claudeInvocation(cmd)).toBe(
+		expect(extractInvocation(cmd)).toBe(
 			`'claude' '--dangerously-skip-permissions' '--resume' 'abc-123' '--permission-mode' 'plan' '--model' 'opus' 'do the thing'`
 		);
 	});
 
 	it('emits --resume when a session id is given', () => {
-		const cmd = buildClaudeWrappedCmd({ resumeSessionId: 'sess-9' });
-		expect(claudeInvocation(cmd)).toBe(
+		const cmd = buildClaudeWrappedCmd({ resumeSessionId: 'sess-9', shellTarget: 'bash' });
+		expect(extractInvocation(cmd)).toBe(
 			`'claude' '--dangerously-skip-permissions' '--resume' 'sess-9'`
 		);
 	});
 
 	it('shell-escapes prompts containing single quotes', () => {
-		const cmd = buildClaudeWrappedCmd({ prompt: "it's fine" });
-		// POSIX `'…'` escape: close, escaped quote, reopen.
-		expect(claudeInvocation(cmd)).toContain(`'it'\\''s fine'`);
+		const cmd = buildClaudeWrappedCmd({ prompt: "it's fine", shellTarget: 'bash' });
+		expect(extractInvocation(cmd)).toContain(`'it'\\''s fine'`);
 	});
 
 	it('ignores empty/nullish optional fields', () => {
@@ -78,7 +140,8 @@ describe('buildClaudeWrappedCmd', () => {
 			resumeSessionId: null,
 			permissionMode: null,
 			model: undefined,
+			shellTarget: 'bash',
 		});
-		expect(claudeInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
+		expect(extractInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
 	});
 });

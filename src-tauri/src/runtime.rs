@@ -323,8 +323,33 @@ fn build_augmented_path() -> OsString {
         extras.push(PathBuf::from(p));
     }
     #[cfg(windows)]
-    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
-        extras.push(appdata.join("npm"));
+    {
+        if let Some(userprofile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+            extras.push(userprofile.join(".cargo").join("bin"));
+            extras.push(userprofile.join(".bun").join("bin"));
+            extras.push(userprofile.join("scoop").join("shims"));
+            extras.push(userprofile.join("AppData").join("Roaming").join("npm"));
+            extras.push(userprofile.join("AppData").join("Local").join("pnpm"));
+            extras.push(userprofile.join("AppData").join("Local").join("Programs").join("Git").join("bin"));
+            extras.push(userprofile.join("AppData").join("Local").join("Programs").join("Git").join("cmd"));
+            extras.push(userprofile.join("AppData").join("Local").join("Microsoft").join("WinGet").join("Links"));
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            extras.push(appdata.join("npm"));
+        }
+        if let Some(localappdata) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            extras.push(localappdata.join("pnpm"));
+            extras.push(localappdata.join("Programs").join("Git").join("bin"));
+            extras.push(localappdata.join("Programs").join("Git").join("cmd"));
+            extras.push(localappdata.join("Microsoft").join("WinGet").join("Links"));
+            extras.push(localappdata.join("Microsoft").join("WindowsApps"));
+        }
+        if let Some(progfiles) = std::env::var_os("ProgramFiles").map(PathBuf::from) {
+            extras.push(progfiles.join("PowerShell").join("7"));
+            extras.push(progfiles.join("Git").join("bin"));
+            extras.push(progfiles.join("Git").join("cmd"));
+            extras.push(progfiles.join("nodejs"));
+        }
     }
 
     for e in extras {

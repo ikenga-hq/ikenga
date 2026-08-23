@@ -68,6 +68,7 @@ use commands::{
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_foreground, pty_foreground_snapshot, pty_kill,
     pty_resize, pty_spawn, pty_terminal_list, pty_write, runtime_retry_bun_fetch,
+    terminal_detect_shells,
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
     secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
@@ -831,6 +832,7 @@ pub fn run() {
             pty_foreground,
             pty_foreground_snapshot,
             pty_terminal_list,
+            terminal_detect_shells,
             // multi-window substrate (plans/multi-window WP-03)
             window_spawn,
             window_close,
@@ -1064,6 +1066,7 @@ pub fn run() {
             agent_detect::detect_agent,
             agent_detect::detect_agent_config,
             agent_detect::list_claude_projects,
+            agent_detect::list_agent_projects,
             agent_detect::scaffold_agent_config,
             // activity bar pinning
             activity_pins_list,

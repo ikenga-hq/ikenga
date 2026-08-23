@@ -169,8 +169,34 @@ impl CodexPtyEngine {
         // Build the per-turn command. `codex exec` reads the prompt from
         // stdin when given `-` as the positional arg. `--skip-git-repo-check`
         // makes the spawn predictable inside arbitrary project dirs
-        // (codex defaults to refusing to run outside a git repo otherwise).
-        let mut cmd = Command::new(DEFAULT_CODEX_CMD);
+        let mut cmd = {
+            #[cfg(windows)]
+            {
+                let resolved = which::which_in(DEFAULT_CODEX_CMD, Some(crate::runtime::augmented_path()), ".")
+                    .or_else(|_| which::which_in("codex.cmd", Some(crate::runtime::augmented_path()), "."))
+                    .or_else(|_| which::which_in("codex.exe", Some(crate::runtime::augmented_path()), "."));
+                if let Ok(p) = resolved {
+                    let is_batch = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+                        .unwrap_or(false);
+                    if is_batch {
+                        let mut c = Command::new("cmd.exe");
+                        c.arg("/c").arg(p);
+                        c
+                    } else {
+                        Command::new(p)
+                    }
+                } else {
+                    Command::new(DEFAULT_CODEX_CMD)
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                Command::new(DEFAULT_CODEX_CMD)
+            }
+        };
         if let Some(resume) = &resume_id {
             cmd.args(["exec", "resume", resume, "--json"]);
         } else {

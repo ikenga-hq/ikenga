@@ -180,6 +180,29 @@ fn master_process_group_leader(_master: &dyn MasterPty) -> Option<i32> {
     None
 }
 
+#[cfg(windows)]
+fn resolve_windows_pty_command(cmd: &[String], cwd: &str) -> (String, Vec<String>) {
+    if cmd.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let raw_bin = &cmd[0];
+    let augmented = crate::runtime::augmented_path();
+    if let Ok(resolved) = which::which_in(raw_bin, Some(augmented), cwd) {
+        let is_batch = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+            .unwrap_or(false);
+        if is_batch {
+            let mut args = vec!["/c".to_string(), resolved.to_string_lossy().into_owned()];
+            args.extend(cmd[1..].iter().cloned());
+            return ("cmd.exe".to_string(), args);
+        }
+        return (resolved.to_string_lossy().into_owned(), cmd[1..].to_vec());
+    }
+    (raw_bin.clone(), cmd[1..].to_vec())
+}
+
 pub struct SpawnOpts {
     pub terminal_id: Option<String>,
     pub title: Option<String>,
@@ -255,6 +278,8 @@ struct PtySession {
     screen: Mutex<vt100::Parser>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    /// Child process ID if available from the OS.
+    pid: Option<u32>,
     /// Used to signal the reader thread to stop.
     killed: Arc<std::sync::atomic::AtomicBool>,
     /// Killer to terminate the child process directly.
@@ -382,14 +407,18 @@ impl PtyManager {
             })
             .context("openpty")?;
 
-        // Resolve `~/...` and shell vars in cwd.
         let resolved_cwd = shellexpand::full(&opts.cwd)
             .map(|c| c.into_owned())
             .unwrap_or(opts.cwd.clone());
 
-        let mut builder = CommandBuilder::new(&opts.cmd[0]);
-        if opts.cmd.len() > 1 {
-            builder.args(&opts.cmd[1..]);
+        #[cfg(windows)]
+        let (exec_bin, exec_args) = resolve_windows_pty_command(&opts.cmd, &resolved_cwd);
+        #[cfg(not(windows))]
+        let (exec_bin, exec_args) = (opts.cmd[0].clone(), opts.cmd[1..].to_vec());
+
+        let mut builder = CommandBuilder::new(&exec_bin);
+        if !exec_args.is_empty() {
+            builder.args(&exec_args);
         }
         builder.cwd(&resolved_cwd);
 
@@ -413,6 +442,7 @@ impl PtyManager {
         builder.env("COLORTERM", "truecolor");
 
         let mut child = pair.slave.spawn_command(builder).context("spawn child")?;
+        let child_pid = child.process_id();
         let child_killer = child.clone_killer();
 
         let writer = pair.master.take_writer().context("take writer")?;
@@ -436,6 +466,7 @@ impl PtyManager {
             screen: Mutex::new(vt100::Parser::new(opts.rows.max(1), opts.cols.max(1), 0)),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
+            pid: child_pid,
             killed: killed.clone(),
             child_killer: Mutex::new(child_killer),
             subscriber: Mutex::new(subscriber),
@@ -1101,6 +1132,16 @@ impl PtyManager {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut killer) = session.child_killer.lock() {
             let _ = killer.kill();
+        }
+        #[cfg(windows)]
+        {
+            if let Some(pid) = session.pid {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .creation_flags(0x08000000)
+                    .output();
+            }
         }
         // The wait thread will remove the entry once the child reaps.
         Ok(())

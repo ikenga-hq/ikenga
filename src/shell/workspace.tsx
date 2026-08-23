@@ -22,6 +22,7 @@ import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
 import { useTerminalStore } from '@/terminal/session-store';
+import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
 import { createTerminalSession } from '@/terminal/single-terminal';
 import { ActivityBar } from './activity-bar';
 import { TerminalHandoffPrompt } from './artifact-wizard/terminal-handoff-prompt';
@@ -238,7 +239,7 @@ export function Workspace() {
 				if (ctrlOnly && !e.altKey) {
 					e.preventDefault();
 					const sessionId = e.shiftKey
-						? createTerminalSession({ cmd: ['claude'], title: 'claude' })
+						? createTerminalSession({ cmd: buildClaudeWrappedCmd(), title: 'claude' })
 						: createTerminalSession();
 					const focusedId = usePaneStore.getState().focusedId;
 					usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
