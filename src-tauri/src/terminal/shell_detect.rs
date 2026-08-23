@@ -1,5 +1,8 @@
 //! Auto-detection of installed shells and WSL distributions on the host machine.
 
+// Used only by the Windows-only detection fns below.
+#[cfg(windows)]
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
