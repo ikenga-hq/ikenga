@@ -5,7 +5,7 @@
 //! and `getDiagnostics` IPC handlers.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
