@@ -196,20 +196,43 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             ExecutableSpec {
                 target_family: TargetFamily::Unix,
                 names: &["claude"],
-                extra_dirs: &[],
+                extra_dirs: &["~/.local/bin", "~/.npm-global/bin", "/usr/local/bin"],
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
                 names: &["claude", "claude.cmd", "claude.exe", "claude.bat"],
-                extra_dirs: &[],
+                extra_dirs: &[
+                    "~/AppData/Roaming/npm",
+                    "~/AppData/Local/pnpm",
+                    "~/.bun/bin",
+                    "~/.cargo/bin",
+                    "~/scoop/shims",
+                    "~/.local/bin",
+                    "~/AppData/Local/Programs/claude",
+                    "~/AppData/Local/Yarn/bin",
+                ],
             },
         ],
         version_arg: Some("--version"),
         version_regex: Some(DEFAULT_VERSION_REGEX),
-        auth_check: Some(AuthCheck::Exec {
-            cmd: "claude",
-            args: &["doctor"],
-            timeout_ms: 4000,
+        auth_check: Some(AuthCheck::Any {
+            checks: &[
+                AuthCheck::FilePresent {
+                    paths: &[
+                        "~/.claude.json",
+                        "~/.claude/config.json",
+                        "~/.claude",
+                    ],
+                },
+                AuthCheck::Exec {
+                    cmd: "claude",
+                    args: &["doctor"],
+                    timeout_ms: 4000,
+                },
+                AuthCheck::EnvVar {
+                    name: "ANTHROPIC_API_KEY",
+                },
+            ],
         }),
         capabilities: CAP_FULL,
     },
