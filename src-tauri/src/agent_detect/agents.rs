@@ -12,8 +12,11 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::known::{
-    family_matches, AgentCapabilities, AgentDef, AuthCheck, ExecutableSpec, TargetFamily, KNOWN_AGENTS,
+    family_matches, AgentCapabilities, AgentDef, AuthCheck, ExecutableSpec, KNOWN_AGENTS,
 };
+// Only `lookup_wsl_executable` reads the family tag directly.
+#[cfg(windows)]
+use super::known::TargetFamily;
 
 const DEFAULT_VERSION_TIMEOUT: Duration = Duration::from_millis(2000);
 
@@ -151,10 +154,14 @@ fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
             .or_else(|| name.strip_suffix(".bat"))
             .unwrap_or(name);
 
-        let output = std::process::Command::new("wsl.exe")
+        let Ok(output) = std::process::Command::new("wsl.exe")
             .args(["bash", "-l", "-c", &format!("which {clean_name}")])
             .output()
-            .ok()?;
+        else {
+            // One candidate name failing to spawn says nothing about the
+            // next one — keep probing instead of giving up on the agent.
+            continue;
+        };
 
         if output.status.success() {
             let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -650,7 +657,7 @@ fn probe_auth_files(paths: &[&str]) -> (Option<bool>, Option<String>) {
     let mut tried: Vec<String> = Vec::new();
     for p in paths {
         let expanded = expand_tilde(p);
-        if expanded.exists() {
+        if expanded.is_file() {
             return (Some(true), None);
         }
         #[cfg(windows)]
@@ -663,7 +670,7 @@ fn probe_auth_files(paths: &[&str]) -> (Option<bool>, Option<String>) {
                         let home_dir = d.path().join("home");
                         if let Ok(users) = std::fs::read_dir(&home_dir) {
                             for u in users.flatten() {
-                                if u.path().join(clean_p).exists() {
+                                if u.path().join(clean_p).is_file() {
                                     return (Some(true), None);
                                 }
                             }

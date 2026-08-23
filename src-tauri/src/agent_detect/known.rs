@@ -217,12 +217,12 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
         version_regex: Some(DEFAULT_VERSION_REGEX),
         auth_check: Some(AuthCheck::Any {
             checks: &[
+                // Only the credential store proves auth. `~/.claude.json`
+                // and `~/.claude/` are both created on first run, logged in
+                // or not, so neither can gate this. macOS keeps the token in
+                // the Keychain instead — that host falls through to `doctor`.
                 AuthCheck::FilePresent {
-                    paths: &[
-                        "~/.claude.json",
-                        "~/.claude/config.json",
-                        "~/.claude",
-                    ],
+                    paths: &["~/.claude/.credentials.json"],
                 },
                 AuthCheck::Exec {
                     cmd: "claude",
