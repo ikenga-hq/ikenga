@@ -518,7 +518,8 @@ pub fn run() {
             .title("Ikenga")
             .inner_size(1280.0, 800.0)
             .min_inner_size(960.0, 600.0)
-            .resizable(true);
+            .resizable(true)
+            .visible(true);
             // Drag-drop handler policy is per-OS.
             //
             // macOS: WKWebView's native handler intercepts ALL drag operations
@@ -543,7 +544,9 @@ pub fn run() {
             let builder = builder
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true);
-            builder.build()?;
+            let main_win = builder.build()?;
+            let _ = main_win.show();
+            let _ = main_win.set_focus();
             let kernel = Arc::new(pkg::Kernel::new(
                 app.handle().clone(),
                 pa_db.clone(),

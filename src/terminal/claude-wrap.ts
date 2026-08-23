@@ -122,11 +122,15 @@ export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 
 	if (isWindows || target === 'powershell' || target === 'pwsh' || target === 'native') {
 		const quoted = args.map(psQuote).join(' ');
-		const invocation = `& ${args.map(psQuote).join(' ')}`;
+		const binName = args[0];
+		const subArgs = args.slice(1).map(psQuote).join(' ');
 		const psExe = target === 'pwsh' ? 'pwsh.exe' : 'powershell.exe';
+		const wslScript = `${args.map(shQuote).join(' ')}; __status=$?; if [ $__status -ne 0 ]; then printf '\\n\\033[31m[${engine} exited %d]\\033[0m\\n' $__status; fi`;
 		const script =
 			`Write-Host ('$ ' + ${psQuote(quoted)}) -ForegroundColor DarkGray; ` +
-			`${invocation}; ` +
+			`if (Get-Command ${psQuote(binName)} -ErrorAction SilentlyContinue) { & ${psQuote(binName)} ${subArgs} } ` +
+			`elseif (Get-Command 'wsl.exe' -ErrorAction SilentlyContinue) { wsl.exe bash -l -i -c ${psQuote(wslScript)} } ` +
+			`else { & ${psQuote(binName)} ${subArgs} }; ` +
 			`$code = $LASTEXITCODE; ` +
 			`if ($code -ne 0) { Write-Host ('[${engine} exited ' + $code + ']') -ForegroundColor Red }; ` +
 			`if (Get-Command pwsh -ErrorAction SilentlyContinue) { pwsh -NoLogo } else { powershell -NoLogo }`;
