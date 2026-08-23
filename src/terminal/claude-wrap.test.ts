@@ -134,6 +134,13 @@ describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
 		expect(extractInvocation(cmd)).toContain(`'it'\\''s fine'`);
 	});
 
+	it('emits --teammate-mode when teammateMode option is given', () => {
+		const cmd = buildClaudeWrappedCmd({ teammateMode: 'in-process', shellTarget: 'bash' });
+		expect(extractInvocation(cmd)).toBe(
+			`'claude' '--dangerously-skip-permissions' '--teammate-mode' 'in-process'`
+		);
+	});
+
 	it('ignores empty/nullish optional fields', () => {
 		const cmd = buildClaudeWrappedCmd({
 			prompt: '',
@@ -141,6 +148,7 @@ describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
 			permissionMode: null,
 			model: undefined,
 			shellTarget: 'bash',
+			teammateMode: null,
 		});
 		expect(extractInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
 	});

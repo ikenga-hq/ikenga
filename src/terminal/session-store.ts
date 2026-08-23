@@ -34,6 +34,7 @@ export interface TerminalTab {
 	exitCode: number | null;
 	createdAt: number;
 	owner: TerminalOwner;
+	wasRunning?: boolean;
 }
 
 interface TerminalState {
@@ -75,6 +76,7 @@ interface SerializedTab {
 	title: string;
 	spec: TerminalTab['spec'];
 	status: TerminalTab['status'];
+	wasRunning?: boolean;
 	exitCode: number | null;
 	createdAt: number;
 	owner?: TerminalOwner;
@@ -109,18 +111,23 @@ export function stripSecretEnv(
 }
 
 function serialize(tabs: TerminalTab[]): SerializedTab[] {
-	return tabs.map(({ id, title, spec, status, exitCode, createdAt, owner }) => ({
-		id,
-		title,
-		// Strip credential-shaped env vars before persisting (ADR-013
-		// §Addendum Decision 3) — the restored tab is a durable on-disk record.
-		spec: { ...spec, env: stripSecretEnv(spec.env) },
-		// ptyIds are runtime-only; restored tabs always start exited.
-		status: status === 'running' || status === 'spawning' ? 'exited' : status,
-		exitCode,
-		createdAt,
-		owner,
-	}));
+	return tabs.map(({ id, title, spec, status, exitCode, createdAt, owner, wasRunning: prevWasRunning }) => {
+		const isCurrentlyRunning = status === 'running' || status === 'spawning';
+		const wasRunning = isCurrentlyRunning || Boolean(prevWasRunning);
+		return {
+			id,
+			title,
+			// Strip credential-shaped env vars before persisting (ADR-013
+			// §Addendum Decision 3) — the restored tab is a durable on-disk record.
+			spec: { ...spec, env: stripSecretEnv(spec.env) },
+			// ptyIds are runtime-only; restored tabs start spawning if previously running, else exited.
+			status: isCurrentlyRunning ? 'exited' : status,
+			wasRunning,
+			exitCode,
+			createdAt,
+			owner,
+		};
+	});
 }
 
 type SqlDb = {
@@ -309,7 +316,21 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 
 		setStatus: (id, status, exitCode = null) => {
 			set((s) => ({
-				tabs: s.tabs.map((t) => (t.id === id ? { ...t, status, exitCode } : t)),
+				tabs: s.tabs.map((t) =>
+					t.id === id
+						? {
+								...t,
+								status,
+								exitCode,
+								wasRunning:
+									status === 'running' || status === 'spawning'
+										? true
+										: status === 'exited'
+											? false
+											: t.wasRunning,
+							}
+						: t
+				),
 			}));
 			persistDebounced();
 		},
@@ -362,19 +383,24 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		rehydrateFromDb: async () => {
 			try {
 				const persisted = await readPersisted();
-				const restored: TerminalTab[] = persisted.map((p) => ({
-					...p,
-					ptyId: null,
-					// Force restored tabs into exited state — their PTYs are gone.
-					status: 'exited',
-					exitCode: p.exitCode,
-					// Force-default ownership to sidepane on rehydrate. Studio
-					// attachments are re-established by the Studio pane on mount
-					// (saved `attachedTerminalId` in PaneView); cross-store
-					// ordering with `loadPaneTree` makes restoring the saved
-					// owner here fragile.
-					owner: { kind: 'sidepane' },
-				}));
+				const restored: TerminalTab[] = persisted.map((p) => {
+					const shouldAutoRespawn =
+						p.wasRunning ?? (p.status === 'running' || p.status === 'spawning');
+					return {
+						...p,
+						ptyId: null,
+						// Restored tabs that were active before app exit restart in 'spawning' status
+						status: shouldAutoRespawn ? 'spawning' : 'exited',
+						wasRunning: shouldAutoRespawn,
+						exitCode: p.exitCode,
+						// Force-default ownership to sidepane on rehydrate. Studio
+						// attachments are re-established by the Studio pane on mount
+						// (saved `attachedTerminalId` in PaneView); cross-store
+						// ordering with `loadPaneTree` makes restoring the saved
+						// owner here fragile.
+						owner: { kind: 'sidepane' },
+					};
+				});
 				set({
 					tabs: restored,
 					activeId: restored[0]?.id ?? null,

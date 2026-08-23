@@ -30,6 +30,8 @@ export interface AgentWrapOpts {
 	wslDistro?: string | null;
 	/** Working directory for WSL launch. */
 	cwd?: string | null;
+	/** `in-process` | etc. — becomes `--teammate-mode`. (G-08) */
+	teammateMode?: string | null;
 }
 
 export type ClaudeWrapOpts = AgentWrapOpts;
@@ -73,6 +75,7 @@ export function buildAgentArgs(opts: AgentWrapOpts): string[] {
 			if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 			if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
 			if (opts.model) args.push('--model', opts.model);
+			if (opts.teammateMode) args.push('--teammate-mode', opts.teammateMode);
 			// Positional, last — seeds an interactive session. `-p` would force
 			// headless print mode; see AgentWrapOpts.prompt.
 			if (opts.prompt) args.push(opts.prompt);
