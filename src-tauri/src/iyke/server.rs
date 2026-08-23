@@ -46,6 +46,7 @@ use super::handlers::{
     post_sidebar, post_split, post_terminal_send, post_type, post_wait,
 };
 use super::hooks::{get_hook_events, post_hook_event};
+use super::ide::{get_ide_lock_status, post_ide_open_file};
 use super::layout::{get_layout, post_layout_reset};
 use super::mcp::{get_mcp_list, post_mcp_restart};
 use super::memory::{
@@ -154,6 +155,8 @@ pub async fn serve(
         .route("/iyke/statusline/snapshot", get(get_statusline_snapshot))
         .route("/iyke/hooks/event", post(post_hook_event))
         .route("/iyke/hooks/events", get(get_hook_events))
+        .route("/iyke/ide/open_file", post(post_ide_open_file))
+        .route("/iyke/ide/lock", get(get_ide_lock_status))
         .route("/iyke/pkg/install", post(post_pkg_install))
         .route("/iyke/pkg/uninstall", post(post_pkg_uninstall))
         .route("/iyke/pkg/list", get(get_pkg_list))

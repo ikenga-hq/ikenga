@@ -19,6 +19,7 @@ pub mod claude;
 pub mod comments;
 pub mod handlers;
 pub mod hooks;
+pub mod ide;
 pub mod layout;
 pub mod mcp;
 pub mod memory;

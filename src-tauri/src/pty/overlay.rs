@@ -86,6 +86,9 @@ pub fn ensure_claude_overlay_dir() -> io::Result<PathBuf> {
     // Configure hooks block in the overlay settings.json
     let _ = crate::iyke::hooks::configure_overlay_hooks(&overlay_dir, 0, None);
 
+    // Create ide/<port>.lock in overlay dir
+    let _ = crate::iyke::ide::write_ide_lock_file(&overlay_dir, 0, "ikenga-token");
+
     Ok(overlay_dir)
 }
 
