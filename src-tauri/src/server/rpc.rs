@@ -9,6 +9,67 @@ use tracing::debug;
 use super::AppState;
 use crate::pty::SpawnOpts;
 
+/// Resolve a caller-supplied path against the user's FS allowlist — the same
+/// `fs_roots` boundary `commands::fs` enforces for the desktop app, so a
+/// remote client can reach exactly what a local one can and nothing more.
+///
+/// `resolve_allowlisted` requires the path's parent to exist, which `mkdir -p`
+/// of a deep new chain does not satisfy; walk up to the nearest existing
+/// ancestor, check *that* against the allowlist, then re-attach the tail.
+fn resolve_path(input: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, PathBuf};
+
+    if input.is_empty() {
+        return Err("path is required".to_string());
+    }
+    if let Ok(p) = crate::commands::resolve_allowlisted(input) {
+        return Ok(p);
+    }
+
+    let expanded = shellexpand::full(input)
+        .map(|c| c.into_owned())
+        .map_err(|e| format!("expand path: {e}"))?;
+    let abs = {
+        let p = PathBuf::from(&expanded);
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("current_dir: {e}"))?
+                .join(p)
+        }
+    };
+    // `..` would let a canonicalized-ancestor check be re-escaped by the tail
+    // we re-attach, so refuse it outright rather than try to normalise it.
+    if abs.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("path may not contain `..`".to_string());
+    }
+
+    let mut ancestor = abs.as_path();
+    let existing = loop {
+        if ancestor.exists() {
+            break ancestor;
+        }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return Err(format!("path outside allowlist: {}", abs.display())),
+        }
+    };
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+    let tail = abs
+        .strip_prefix(existing)
+        .map_err(|_| "failed to resolve path".to_string())?;
+    let resolved = canonical_existing.join(tail);
+
+    let roots = crate::fs_roots::current().ok_or("fs_roots not initialized")?;
+    if !roots.is_allowed(&resolved) {
+        return Err(format!("path outside allowlist: {}", resolved.display()));
+    }
+    Ok(resolved)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct RpcRequest {
     pub cmd: String,
@@ -120,30 +181,44 @@ pub async fn rpc_handler(
         // --- FS Commands ---
         "fs_exists" => {
             let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-            let exists = std::path::Path::new(path_str).exists();
-            RpcResponse::success(exists)
+            match resolve_path(path_str) {
+                Ok(path) => RpcResponse::success(path.exists()),
+                Err(e) => RpcResponse::error(e),
+            }
         }
         "fs_read" => {
             let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-            match tokio::fs::read_to_string(path_str).await {
-                Ok(content) => RpcResponse::success(content),
-                Err(e) => RpcResponse::error(e.to_string()),
+            match resolve_path(path_str) {
+                Ok(path) => match tokio::fs::read_to_string(&path).await {
+                    Ok(content) => RpcResponse::success(content),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
             }
         }
         "fs_write" => {
             let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
             let content = payload.args.get("content").and_then(|v| v.as_str()).unwrap_or_default();
-            if let Some(parent) = std::path::Path::new(path_str).parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            match tokio::fs::write(path_str, content).await {
-                Ok(_) => RpcResponse::success(true),
-                Err(e) => RpcResponse::error(e.to_string()),
+            match resolve_path(path_str) {
+                Ok(path) => {
+                    if let Some(parent) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(parent).await;
+                    }
+                    match tokio::fs::write(&path, content).await {
+                        Ok(_) => RpcResponse::success(true),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e),
             }
         }
         "fs_list" => {
             let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            match std::fs::read_dir(path_str) {
+            let path = match resolve_path(path_str) {
+                Ok(p) => p,
+                Err(e) => return Json(RpcResponse::error(e)),
+            };
+            match std::fs::read_dir(path) {
                 Ok(entries) => {
                     let items: Vec<serde_json::Value> = entries.filter_map(|e| e.ok()).map(|entry| {
                         let name = entry.file_name().to_string_lossy().into_owned();
@@ -161,24 +236,37 @@ pub async fn rpc_handler(
         }
         "fs_mkdir" => {
             let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-            match tokio::fs::create_dir_all(path_str).await {
-                Ok(_) => RpcResponse::success(true),
-                Err(e) => RpcResponse::error(e.to_string()),
+            match resolve_path(path_str) {
+                Ok(path) => match tokio::fs::create_dir_all(&path).await {
+                    Ok(_) => RpcResponse::success(true),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e),
             }
         }
         "fs_roots_list" => {
-            let roots = vec![std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".to_string())];
+            let roots = crate::fs_roots::current()
+                .map(|r| r.list_inputs())
+                .unwrap_or_default();
             RpcResponse::success(roots)
         }
 
         // --- Secrets & Vault Commands (G-30) ---
+        //
+        // Not wired to Stronghold yet. Reads are restricted to the
+        // `IKENGA_SECRET_*` namespace the operator opts into: taking the key
+        // as a bare env var name made this a remote `printenv` for every
+        // credential in the daemon's environment.
         "secrets_get" => {
             let key = payload.args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
-            let env_val = std::env::var(key).or_else(|_| std::env::var(format!("IKENGA_SECRET_{key}"))).ok();
-            RpcResponse::success(env_val)
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                RpcResponse::error("secrets_get: invalid key")
+            } else {
+                RpcResponse::success(std::env::var(format!("IKENGA_SECRET_{key}")).ok())
+            }
         }
         "secrets_set" => {
-            RpcResponse::success(true)
+            RpcResponse::error("secrets_set is not implemented in the headless daemon")
         }
 
         // --- Unknown Command Fallback ---

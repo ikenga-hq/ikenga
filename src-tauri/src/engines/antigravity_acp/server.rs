@@ -7,6 +7,11 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 /// Antigravity CLI engine adapter normalizing to SessionUpdate ACP envelopes.
+///
+/// ⚠ STUB — every method returns an empty success without spawning the CLI,
+/// and nothing constructs `EngineHandle::Antigravity` yet. The type exists so
+/// the trait surface and the registry variant can be reviewed before the
+/// runtime lands.
 pub struct AntigravityEngine;
 
 impl Default for AntigravityEngine {

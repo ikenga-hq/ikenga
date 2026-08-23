@@ -3096,6 +3096,7 @@ dependencies = [
  "notify-debouncer-mini",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
+ "percent-encoding",
  "portable-pty",
  "rand 0.8.7",
  "regex",

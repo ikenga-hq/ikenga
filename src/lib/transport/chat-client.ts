@@ -1,3 +1,10 @@
+import { getAuthToken } from './index';
+
+function tokenQuery(): string {
+	const token = getAuthToken();
+	return token ? `?token=${encodeURIComponent(token)}` : '';
+}
+
 export interface ChatSessionUpdate {
 	jsonrpc: '2.0';
 	method: 'session/update';
@@ -16,6 +23,11 @@ export interface ChatSessionUpdate {
 	};
 }
 
+/**
+ * NOTE: the `/ws/chat` endpoint this talks to is a stub — the server echoes
+ * prompts back and does not run an engine. Nothing imports this client yet;
+ * it lands alongside the wire format so the shapes are reviewed together.
+ */
 export class ChatWebSocketClient {
 	private ws: WebSocket | null = null;
 	private threadId: string;
@@ -28,7 +40,7 @@ export class ChatWebSocketClient {
 
 	connect(): void {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const uri = \//\/ws/chat/\;
+		const uri = `${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(this.threadId)}${tokenQuery()}`;
 		this.ws = new WebSocket(uri);
 
 		this.ws.onmessage = (event) => {

@@ -3,7 +3,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use crate::pty::SpawnOpts;
@@ -17,24 +17,6 @@ pub enum PtyControlMessage {
     Kill,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct PtySpawnPayload {
-    pub terminal_id: Option<String>,
-    pub title: Option<String>,
-    pub cwd: Option<String>,
-    pub cmd: Option<Vec<String>>,
-    pub env: Option<std::collections::HashMap<String, String>>,
-    pub rows: Option<u16>,
-    pub cols: Option<u16>,
-}
-
-#[derive(Serialize)]
-pub struct PtySpawnResponse {
-    pub ok: bool,
-    pub pty_id: String,
-    pub terminal_id: String,
-}
-
 pub async fn pty_ws_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -46,10 +28,11 @@ pub async fn pty_ws_handler(
 async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Check if session exists or spawn a default one if needed
-    let session_res = state.pty_manager.subscribe_session(&id);
-    let (snapshot, mut pty_rx) = match session_res {
-        Ok(res) => res,
+    // The path segment may be a pty id, a terminal id, or a label. Resolve it
+    // once: `write` / `resize` / `kill` take the pty id only, so holding on to
+    // the unresolved segment silently drops every keystroke.
+    let pty_id = match state.pty_manager.resolve_id(&id) {
+        Ok(resolved) => resolved,
         Err(e) => {
             warn!("PTY session not found for {id}: {e}. Attempting auto-spawn.");
             let default_shell = if cfg!(windows) {
@@ -57,33 +40,35 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
             } else {
                 vec!["/bin/bash".to_string()]
             };
-            let spawn_res = state.pty_manager.spawn_headless(SpawnOpts {
-                terminal_id: Some(id.clone()),
-                title: Some("Terminal".to_string()),
-                cwd: ".".to_string(),
-                cmd: default_shell,
-                env: std::collections::HashMap::new(),
-                rows: 24,
-                cols: 80,
-            }).await;
-
-            match spawn_res {
-                Ok(new_id) => {
-                    match state.pty_manager.subscribe_session(&new_id) {
-                        Ok(res) => res,
-                        Err(err) => {
-                            error!("Failed to subscribe to auto-spawned PTY {new_id}: {err}");
-                            let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
-                            return;
-                        }
-                    }
-                }
+            match state
+                .pty_manager
+                .spawn_headless(SpawnOpts {
+                    terminal_id: Some(id.clone()),
+                    title: Some("Terminal".to_string()),
+                    cwd: ".".to_string(),
+                    cmd: default_shell,
+                    env: std::collections::HashMap::new(),
+                    rows: 24,
+                    cols: 80,
+                })
+                .await
+            {
+                Ok(new_id) => new_id,
                 Err(err) => {
                     error!("Failed to auto-spawn PTY for {id}: {err}");
                     let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
                     return;
                 }
             }
+        }
+    };
+
+    let (snapshot, mut pty_rx) = match state.pty_manager.subscribe_session(&pty_id) {
+        Ok(res) => res,
+        Err(err) => {
+            error!("Failed to subscribe to PTY {pty_id}: {err}");
+            let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
+            return;
         }
     };
 
@@ -96,13 +81,25 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
     }
 
     let pty_manager = state.pty_manager.clone();
-    let session_id = id.clone();
+    let session_id = pty_id.clone();
+    let id_for_send = pty_id.clone();
 
     // Task 1: Pump PTY output -> WebSocket binary frames
     let mut send_task = tokio::spawn(async move {
-        while let Ok(bytes) = pty_rx.recv().await {
-            if ws_tx.send(Message::Binary(bytes)).await.is_err() {
-                break;
+        loop {
+            match pty_rx.recv().await {
+                Ok(bytes) => {
+                    if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                // A burst past the channel's capacity means we dropped
+                // frames, not that the terminal ended — skipping ahead beats
+                // freezing the pane for the rest of the session.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("PTY {id_for_send}: websocket lagged, dropped {n} chunks");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });

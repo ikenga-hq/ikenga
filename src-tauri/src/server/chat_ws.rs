@@ -1,3 +1,11 @@
+//! ⚠ STUB — not a working chat engine.
+//!
+//! This handler validates the `session/update` wire shape end-to-end: it
+//! accepts a prompt and echoes it back wrapped in the envelopes the frontend
+//! expects. It never consults `AppState::engine_registry` and never spawns
+//! an agent. Wiring it to a real engine is the next piece of work; until
+//! then, treat any response from `/ws/chat/:id` as test data.
+
 use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
