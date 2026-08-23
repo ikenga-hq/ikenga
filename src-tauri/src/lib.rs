@@ -14,6 +14,7 @@ mod pty;
 mod runtime;
 pub mod vault_key;
 mod terminal;
+pub mod transcript;
 
 
 mod viewer_server;
