@@ -87,6 +87,47 @@ describe('useTerminalStore ownership', () => {
 	});
 });
 
+describe('rehydrateFromDb & auto-resume', () => {
+	beforeEach(() => {
+		reset();
+		localStorage.clear();
+	});
+
+	it('restores previously running tabs with spawning status', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		// Force persist synchronously to localStorage
+		await useTerminalStore.getState().persistToDb();
+
+		// Reset in-memory state
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		// Rehydrate from stored state
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab).toBeDefined();
+		expect(tab?.status).toBe('spawning');
+		expect(tab?.wasRunning).toBe(true);
+	});
+
+	it('keeps manually exited tabs as exited on rehydrate', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'exited', 0);
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab).toBeDefined();
+		expect(tab?.status).toBe('exited');
+		expect(tab?.wasRunning).toBe(false);
+	});
+});
+
 describe('stripSecretEnv (ADR-013 §Addendum Decision 3)', () => {
 	it('drops credential-shaped keys', () => {
 		const out = stripSecretEnv({
