@@ -16,6 +16,7 @@
 //! stream tile exactly — no duplicated or dropped bytes at the seam.
 
 pub mod foreground;
+pub mod overlay;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -404,6 +405,14 @@ impl PtyManager {
         // agent CLI launched in a pane resolve under nvm/npm/homebrew even when
         // the app inherited a thin GUI $PATH. Caller env below still wins.
         builder.env("PATH", crate::runtime::augmented_path());
+        // WP-00: Thread CLAUDE_CONFIG_DIR overlay if not explicitly specified by caller env.
+        if !opts.env.contains_key("CLAUDE_CONFIG_DIR") && std::env::var("CLAUDE_CONFIG_DIR").is_err() {
+            if let Ok(overlay_dir) = overlay::ensure_claude_overlay_dir() {
+                if let Some(dir_str) = overlay_dir.to_str() {
+                    builder.env("CLAUDE_CONFIG_DIR", dir_str);
+                }
+            }
+        }
         // Caller-supplied env wins.
         for (k, v) in &opts.env {
             builder.env(k, v);
