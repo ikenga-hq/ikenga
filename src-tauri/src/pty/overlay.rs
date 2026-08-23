@@ -80,6 +80,9 @@ pub fn ensure_claude_overlay_dir() -> io::Result<PathBuf> {
         let _ = fs::write(&overlay_settings, "{}");
     }
 
+    // Configure statusLine command block in the overlay settings.json
+    let _ = crate::iyke::statusline::configure_overlay_statusline(&overlay_dir, 0, None);
+
     Ok(overlay_dir)
 }
 

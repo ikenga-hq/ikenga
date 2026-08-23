@@ -30,6 +30,7 @@ pub mod rpc;
 pub mod secrets;
 pub mod server;
 pub mod state;
+pub mod statusline;
 pub mod tasks;
 pub mod terminal;
 pub mod trust;
