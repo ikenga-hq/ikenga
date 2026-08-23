@@ -1,6 +1,6 @@
 mod agent_detect;
 pub mod claude;
-mod commands;
+pub mod commands;
 pub mod engines;
 pub mod env_files;
 mod fs_roots;
@@ -10,10 +10,11 @@ pub mod path_fix;
 mod pkg;
 mod pkg_content;
 pub mod platform;
-mod pty;
+pub mod pty;
 mod runtime;
-pub mod vault_key;
+pub mod server;
 mod terminal;
+pub mod vault_key;
 
 
 mod viewer_server;

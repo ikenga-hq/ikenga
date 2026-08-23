@@ -9,8 +9,18 @@
 // later phases just fill in the Rust side.
 
 import type { WindowDescriptor } from '@ikenga/contract';
-import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getTransport, isTauri, type RpcTransport } from './transport';
+
+export { isTauri, getTransport, type RpcTransport };
+export type UnlistenFn = () => void;
+
+function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	return getTransport().invoke<T>(cmd, args);
+}
+
+function listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<UnlistenFn> {
+	return getTransport().listen<T>(event, handler);
+}
 
 // ─── PTY ──────────────────────────────────────────────────────────────────────
 
@@ -134,6 +144,27 @@ export async function ptyListen(
 	onData: (bytes: Uint8Array, endOffset: number) => void,
 	onExit: (code: number | null) => void
 ): Promise<UnlistenFn> {
+	if (!isTauri()) {
+		const transport = getTransport();
+		if (transport.openPtySocket) {
+			const ws = transport.openPtySocket(id);
+			ws.onmessage = (e) => {
+				if (e.data instanceof ArrayBuffer) {
+					onData(new Uint8Array(e.data), 0);
+				} else if (typeof e.data === 'string') {
+					const enc = new TextEncoder();
+					onData(enc.encode(e.data), 0);
+				}
+			};
+			ws.onclose = () => {
+				onExit(0);
+			};
+			return () => {
+				ws.close();
+			};
+		}
+	}
+
 	const dataUnlisten = await listen<string>(`pty://${id}`, (e) => {
 		const raw = e.payload;
 		const sep = raw.indexOf(':');
