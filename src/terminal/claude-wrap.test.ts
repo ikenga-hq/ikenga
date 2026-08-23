@@ -72,12 +72,20 @@ describe('buildClaudeWrappedCmd', () => {
 		expect(claudeInvocation(cmd)).toContain(`'it'\\''s fine'`);
 	});
 
+	it('emits --teammate-mode when teammateMode option is given', () => {
+		const cmd = buildClaudeWrappedCmd({ teammateMode: 'in-process' });
+		expect(claudeInvocation(cmd)).toBe(
+			`'claude' '--dangerously-skip-permissions' '--teammate-mode' 'in-process'`
+		);
+	});
+
 	it('ignores empty/nullish optional fields', () => {
 		const cmd = buildClaudeWrappedCmd({
 			prompt: '',
 			resumeSessionId: null,
 			permissionMode: null,
 			model: undefined,
+			teammateMode: null,
 		});
 		expect(claudeInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
 	});

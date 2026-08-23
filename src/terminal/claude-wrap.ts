@@ -23,6 +23,8 @@ export interface ClaudeWrapOpts {
 	/** `default` | `acceptEdits` | `plan` | etc. — becomes `--permission-mode`. */
 	permissionMode?: string | null;
 	model?: string | null;
+	/** `in-process` | etc. — becomes `--teammate-mode`. (G-08) */
+	teammateMode?: string | null;
 }
 
 /** POSIX single-quote escape: wrap in `'…'`, replace each `'` with `'\''`. */
@@ -40,6 +42,7 @@ function claudeArgs(opts: ClaudeWrapOpts): string[] {
 	if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 	if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
 	if (opts.model) args.push('--model', opts.model);
+	if (opts.teammateMode) args.push('--teammate-mode', opts.teammateMode);
 	// Positional, last — seeds an interactive session. `-p` would force
 	// headless print mode; see ClaudeWrapOpts.prompt.
 	if (opts.prompt) args.push(opts.prompt);
