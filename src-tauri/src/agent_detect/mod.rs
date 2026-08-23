@@ -65,19 +65,14 @@ pub struct ClaudeProjectEntry {
 /// reflects a slugged project path (Claude Code encodes the real path by
 /// replacing `/` with `-`). The Phase 4 roots step uses this to seed
 /// suggestions for `claudeProjectRoots`.
-#[tauri::command]
-pub async fn list_claude_projects() -> Result<Vec<ClaudeProjectEntry>, String> {
-    let home = match crate::platform::home_dir() {
-        Some(h) => h,
-        None => return Ok(Vec::new()),
+fn scan_claude_project_directory(
+    projects: &std::path::Path,
+    home: &std::path::Path,
+    out: &mut Vec<ClaudeProjectEntry>,
+) {
+    let Ok(read) = std::fs::read_dir(projects) else {
+        return;
     };
-    let projects = home.join(".claude").join("projects");
-    let read = match std::fs::read_dir(&projects) {
-        Ok(r) => r,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    let mut out: Vec<ClaudeProjectEntry> = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -88,16 +83,8 @@ pub async fn list_claude_projects() -> Result<Vec<ClaudeProjectEntry>, String> {
             None => continue,
         };
 
-        // Claude Code slugifies `/Users/iyke/royalti-co/ikenga/shell` →
-        // `-Users-iyke-royalti-co-ikenga-shell`. Reverse the encoding so the
-        // wizard can present the real path as a suggestion. Inversion is
-        // ambiguous (path components can themselves contain `-`), so prefer
-        // an existence-checked candidate and fall back to the naive
-        // all-slash replacement when nothing exists.
         let (decoded, path_verified) = decode_claude_slug_with_fs(&slug);
 
-        // Count session files (jsonl entries) and grab newest mtime so the
-        // wizard can sort recency-first.
         let mut session_count: u32 = 0;
         let mut last_modified_ms: u64 = 0;
         if let Ok(entries) = std::fs::read_dir(&path) {
@@ -122,15 +109,145 @@ pub async fn list_claude_projects() -> Result<Vec<ClaudeProjectEntry>, String> {
         out.push(ClaudeProjectEntry {
             slug,
             path: decoded.clone(),
-            display_path: contract_home(&decoded, &home),
+            display_path: contract_home(&decoded, home),
             session_count,
             last_modified_ms,
             path_verified,
         });
     }
+}
+
+/// Scan `~/.claude/projects/` (and WSL on Windows) for project session directories.
+#[tauri::command]
+pub async fn list_claude_projects() -> Result<Vec<ClaudeProjectEntry>, String> {
+    let home = match crate::platform::home_dir() {
+        Some(h) => h,
+        None => return Ok(Vec::new()),
+    };
+    let mut out: Vec<ClaudeProjectEntry> = Vec::new();
+
+    // 1. Host user home `.claude/projects`
+    let host_projects = home.join(".claude").join("projects");
+    scan_claude_project_directory(&host_projects, &home, &mut out);
+
+    // 2. On Windows, scan WSL distributions if present
+    #[cfg(windows)]
+    {
+        for wsl_root in &[r"\\wsl.localhost", r"\\wsl$"] {
+            let root = std::path::Path::new(wsl_root);
+            if let Ok(distros) = std::fs::read_dir(root) {
+                for distro in distros.flatten() {
+                    let home_dir = distro.path().join("home");
+                    if let Ok(users) = std::fs::read_dir(&home_dir) {
+                        for user in users.flatten() {
+                            let wsl_claude_projects = user.path().join(".claude").join("projects");
+                            if wsl_claude_projects.is_dir() {
+                                scan_claude_project_directory(
+                                    &wsl_claude_projects,
+                                    &user.path(),
+                                    &mut out,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
     Ok(out)
+}
+
+/// Generic project/conversation history lister across supported AI agents.
+#[tauri::command]
+pub async fn list_agent_projects(agent_id: String) -> Result<Vec<ClaudeProjectEntry>, String> {
+    match agent_id.as_str() {
+        "antigravity-cli" | "antigravity" | "gemini-cli" | "gemini" => {
+            let home = match crate::platform::home_dir() {
+                Some(h) => h,
+                None => return Ok(Vec::new()),
+            };
+            let mut out: Vec<ClaudeProjectEntry> = Vec::new();
+            let brain_dir = home.join(".gemini").join("antigravity").join("brain");
+            if let Ok(rd) = std::fs::read_dir(&brain_dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let slug = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let mut file_count: u32 = 0;
+                    let mut mtime: u64 = 0;
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                mtime = dur.as_millis() as u64;
+                            }
+                        }
+                    }
+                    if let Ok(sub) = std::fs::read_dir(&p) {
+                        for f in sub.flatten() {
+                            file_count += 1;
+                            if let Ok(meta) = f.metadata() {
+                                if let Ok(mod_t) = meta.modified() {
+                                    if let Ok(dur) = mod_t.duration_since(std::time::UNIX_EPOCH) {
+                                        let ms = dur.as_millis() as u64;
+                                        if ms > mtime {
+                                            mtime = ms;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    out.push(ClaudeProjectEntry {
+                        slug: slug.clone(),
+                        path: p.display().to_string(),
+                        display_path: format!("brain/{}", slug),
+                        session_count: file_count,
+                        last_modified_ms: mtime,
+                        path_verified: true,
+                    });
+                }
+            }
+            out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
+            Ok(out)
+        }
+        "codex" | "chatgpt" | "openai" => {
+            let home = match crate::platform::home_dir() {
+                Some(h) => h,
+                None => return Ok(Vec::new()),
+            };
+            let mut out: Vec<ClaudeProjectEntry> = Vec::new();
+            let codex_sessions = home.join(".codex").join("sessions");
+            if let Ok(rd) = std::fs::read_dir(&codex_sessions) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    let slug = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let mut mtime: u64 = 0;
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                                mtime = dur.as_millis() as u64;
+                            }
+                        }
+                    }
+                    out.push(ClaudeProjectEntry {
+                        slug: slug.clone(),
+                        path: p.display().to_string(),
+                        display_path: format!(".codex/{}", slug),
+                        session_count: 1,
+                        last_modified_ms: mtime,
+                        path_verified: true,
+                    });
+                }
+            }
+            out.sort_by(|a, b| b.last_modified_ms.cmp(&a.last_modified_ms));
+            Ok(out)
+        }
+        _ => list_claude_projects().await,
+    }
 }
 
 /// Pure-string fallback used when no FS probe matches: prepend `/` and
@@ -165,44 +282,79 @@ pub fn decode_claude_slug_with_fs(slug: &str) -> (String, bool) {
 /// in for the real filesystem so unit tests can assert the greedy walk
 /// against a fixture set without touching `~/`.
 pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F) -> (String, bool) {
-    if !slug.starts_with('-') {
-        return (slug.to_string(), exists(slug));
+    // 1. Windows drive slug: e.g. "C--Users-nedJamez-..." or "C-Users-..."
+    let is_win_drive = slug.len() >= 3
+        && slug.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        && (slug[1..].starts_with("--") || slug[1..].starts_with(":-") || slug[1..].starts_with('-'));
+
+    if is_win_drive {
+        let drive = &slug[0..1];
+        let body = if slug[1..].starts_with("--") || slug[1..].starts_with(":-") {
+            &slug[3..]
+        } else {
+            &slug[2..]
+        };
+        let tokens: Vec<&str> = body.split('-').collect();
+        if tokens.is_empty() {
+            let root = format!("{}:\\", drive.to_ascii_uppercase());
+            return (root.clone(), exists(&root));
+        }
+
+        // Seed with drive letter: "C:\Users" or "C:/Users"
+        let mut acc = format!("{}:\\{}", drive.to_ascii_uppercase(), tokens[0]);
+
+        const SEPARATORS: [char; 4] = ['\\', '-', '_', '.'];
+        for tok in &tokens[1..] {
+            let candidates: Vec<String> = SEPARATORS
+                .iter()
+                .map(|sep| format!("{}{}{}", acc, sep, tok))
+                .collect();
+            acc = candidates
+                .iter()
+                .find(|p| exists(p))
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+        }
+        let verified = exists(&acc);
+        return (acc, verified);
     }
-    let body = &slug[1..];
-    let tokens: Vec<&str> = body.split('-').collect();
-    if tokens.is_empty() {
-        return ("/".to_string(), false);
+
+    // 2. Unix slug starting with '-'
+    if slug.starts_with('-') {
+        let body = &slug[1..];
+        let tokens: Vec<&str> = body.split('-').collect();
+        if tokens.is_empty() {
+            return ("/".to_string(), exists("/"));
+        }
+
+        // Seed: leading `/<first-token>`. We don't FS-check this — the user's
+        // FS root almost certainly contains it (`/Users`, `/home`, etc.).
+        let mut acc = format!("/{}", tokens[0]);
+
+        // Probe order: '/' first (canonical Claude encoding) then '-', '_',
+        // '.'. Claude Code encodes any of these as '-' on disk, so we have to
+        // try each at every token boundary. The first existing candidate wins;
+        // when none exist we keep the '/' join (preserves any earlier verified
+        // prefix and defaults the unknown tail to canonical slashes).
+        const SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
+
+        for tok in &tokens[1..] {
+            let candidates: Vec<String> = SEPARATORS
+                .iter()
+                .map(|sep| format!("{}{}{}", acc, sep, tok))
+                .collect();
+            acc = candidates
+                .iter()
+                .find(|p| exists(p))
+                .cloned()
+                .unwrap_or_else(|| candidates[0].clone());
+        }
+
+        let verified = exists(&acc);
+        return (acc, verified);
     }
 
-    // Seed: leading `/<first-token>`. We don't FS-check this — the user's
-    // FS root almost certainly contains it (`/Users`, `/home`, etc.).
-    let mut acc = format!("/{}", tokens[0]);
-
-    // Probe order: '/' first (canonical Claude encoding) then '-', '_',
-    // '.'. Claude Code encodes any of these as '-' on disk, so we have to
-    // try each at every token boundary. The first existing candidate wins;
-    // when none exist we keep the '/' join (preserves any earlier verified
-    // prefix and defaults the unknown tail to canonical slashes).
-    const SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
-
-    for tok in &tokens[1..] {
-        let candidates: Vec<String> = SEPARATORS
-            .iter()
-            .map(|sep| format!("{}{}{}", acc, sep, tok))
-            .collect();
-        acc = candidates
-            .iter()
-            .find(|p| exists(p))
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone());
-    }
-
-    let verified = exists(&acc);
-    // Keep the partial-FS-aware result regardless of whether the final
-    // full path verifies. Any prefix that matched on disk is real; the
-    // unverified tail is still more useful than the all-slashes naive
-    // form (which would lose every dash boundary the walk just proved).
-    (acc, verified)
+    (slug.to_string(), exists(slug))
 }
 
 fn contract_home(path: &str, home: &std::path::Path) -> String {
@@ -211,10 +363,16 @@ fn contract_home(path: &str, home: &std::path::Path) -> String {
         None => return path.to_string(),
     };
     if let Some(rest) = path.strip_prefix(home_str) {
-        format!("~{}", rest)
-    } else {
-        path.to_string()
+        return format!("~{}", rest.replace('\\', "/"));
     }
+    // Also check with normalized slashes and case-insensitivity on Windows
+    let norm_path = path.replace('\\', "/");
+    let norm_home = home_str.replace('\\', "/");
+    if norm_path.to_lowercase().starts_with(&norm_home.to_lowercase()) {
+        let rest = &norm_path[norm_home.len()..];
+        return format!("~{}", rest);
+    }
+    path.to_string()
 }
 
 /// Phase 6 — agent-config scaffolder. Lays down the starter set of
@@ -358,5 +516,28 @@ mod claude_slug_tests {
         let set: HashSet<&'static str> = ["/a", "/a/b", "/a-b"].into_iter().collect();
         let (path, _) = decode_claude_slug_with_probe("-a-b", probe(&set));
         assert_eq!(path, "/a/b");
+    }
+
+    #[test]
+    fn greedy_decoder_handles_windows_drive_slugs() {
+        let set: HashSet<&'static str> = [
+            "C:\\Users",
+            "C:\\Users\\nedJamez",
+            "C:\\Users\\nedJamez\\Documents",
+            "C:\\Users\\nedJamez\\Documents\\royalti-co",
+            "C:\\Users\\nedJamez\\Documents\\royalti-co\\royalti-server-v2-6",
+        ]
+        .into_iter()
+        .collect();
+
+        let (path, verified) = decode_claude_slug_with_probe(
+            "C--Users-nedJamez-Documents-royalti-co-royalti-server-v2-6",
+            probe(&set),
+        );
+        assert_eq!(
+            path,
+            "C:\\Users\\nedJamez\\Documents\\royalti-co\\royalti-server-v2-6"
+        );
+        assert!(verified);
     }
 }

@@ -367,6 +367,35 @@ fn user_envelope(text: &str) -> String {
     s
 }
 
+fn create_chi_command(binary: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let resolved = which::which_in(binary, Some(crate::runtime::augmented_path()), ".")
+            .or_else(|_| which::which_in(format!("{binary}.cmd"), Some(crate::runtime::augmented_path()), "."))
+            .or_else(|_| which::which_in(format!("{binary}.exe"), Some(crate::runtime::augmented_path()), "."));
+        if let Ok(p) = resolved {
+            let is_batch = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+                .unwrap_or(false);
+            if is_batch {
+                let mut cmd = Command::new("cmd.exe");
+                cmd.arg("/c").arg(p);
+                cmd
+            } else {
+                Command::new(p)
+            }
+        } else {
+            Command::new(binary)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(binary)
+    }
+}
+
 /// Return a `(command, child)` for the requested engine.
 fn build_engine_command(
     engine_id: &str,
@@ -383,7 +412,7 @@ fn build_engine_command(
                 .unwrap_or_default()
                 .as_claude_flag();
 
-            let mut cmd = Command::new("claude");
+            let mut cmd = create_chi_command("claude");
             cmd.arg("--permission-prompt-tool")
                 .arg("stdio")
                 .arg("--permission-mode")
@@ -410,7 +439,7 @@ fn build_engine_command(
             Ok(cmd)
         }
         "antigravity-cli" => {
-            let mut cmd = Command::new("agy");
+            let mut cmd = create_chi_command("agy");
             cmd.arg("-p")
                 .arg(prompt)
                 .arg("--output-format")
@@ -439,7 +468,7 @@ fn build_engine_command(
         // arbitrary project dirs (codex defaults to refusing outside a
         // git repo). `-` as the positional arg means "read prompt from stdin".
         "codex" => {
-            let mut cmd = Command::new("codex");
+            let mut cmd = create_chi_command("codex");
             if let Some(id) = resume_id {
                 cmd.args(["exec", "resume", id, "--json"]);
             } else {

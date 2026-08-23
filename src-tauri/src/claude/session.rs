@@ -510,8 +510,34 @@ pub async fn spawn_streaming(
 
     let opts = session.opts.lock().await.clone();
     let project_dir = session.claude_project_dir.lock().await.clone();
-
-    let mut command = Command::new("claude");
+    let mut command = {
+        #[cfg(windows)]
+        {
+            let resolved = which::which_in("claude", Some(crate::runtime::augmented_path()), ".")
+                .or_else(|_| which::which_in("claude.cmd", Some(crate::runtime::augmented_path()), "."))
+                .or_else(|_| which::which_in("claude.exe", Some(crate::runtime::augmented_path()), "."));
+            if let Ok(p) = resolved {
+                let is_batch = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+                    .unwrap_or(false);
+                if is_batch {
+                    let mut cmd = Command::new("cmd.exe");
+                    cmd.arg("/c").arg(p);
+                    cmd
+                } else {
+                    Command::new(p)
+                }
+            } else {
+                Command::new("claude")
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("claude")
+        }
+    };
     command
         // Phase 4: `--permission-prompt-tool stdio` opens the
         // `sdk_control_request` channel on stdout so tool approvals become

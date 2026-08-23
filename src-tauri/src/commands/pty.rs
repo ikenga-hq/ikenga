@@ -169,3 +169,9 @@ pub async fn pty_terminal_list(
 ) -> Result<Vec<TerminalDescriptor>, String> {
     Ok(manager.list_terminals())
 }
+
+/// Detects available host shell profiles (e.g. PowerShell 7, Windows PowerShell, WSL distros, Git Bash, cmd.exe on Windows, or zsh/bash on Unix).
+#[tauri::command]
+pub async fn terminal_detect_shells() -> Result<Vec<crate::terminal::shell_detect::ShellProfile>, String> {
+    Ok(crate::terminal::shell_detect::detect_shells())
+}

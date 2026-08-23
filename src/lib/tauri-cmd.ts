@@ -106,6 +106,21 @@ export async function ptyTerminalList(): Promise<TerminalDescriptor[]> {
 	return invoke<TerminalDescriptor[]>('pty_terminal_list');
 }
 
+export interface ShellProfile {
+	id: string;
+	label: string;
+	icon: string;
+	cmd: string[];
+	isDefault: boolean;
+	kind: 'powershell' | 'pwsh' | 'wsl' | 'bash' | 'cmd' | 'zsh' | string;
+	distro?: string | null;
+}
+
+/** Detect available shell profiles on the host machine. */
+export async function terminalDetectShells(): Promise<ShellProfile[]> {
+	return invoke<ShellProfile[]>('terminal_detect_shells');
+}
+
 /**
  * Subscribe to PTY byte stream + exit. Backend emits each data chunk as
  * `"<endOffset>:<base64>"` — base64 because Tauri serializes payloads as JSON
@@ -3308,6 +3323,10 @@ export interface ClaudeProjectEntry {
 
 export async function listClaudeProjects(): Promise<ClaudeProjectEntry[]> {
 	return invoke<ClaudeProjectEntry[]>('list_claude_projects');
+}
+
+export async function listAgentProjects(agentId: string): Promise<ClaudeProjectEntry[]> {
+	return invoke<ClaudeProjectEntry[]>('list_agent_projects', { agentId });
 }
 
 // Agent-config scaffolder (Phase 6). Lays down a starter set of

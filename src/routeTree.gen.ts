@@ -65,6 +65,7 @@ import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-hea
 import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
 import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
 import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
+import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
 import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
 import { Route as PkgPkgIdSplatRouteImport } from './routes/pkg/$pkgId/$'
@@ -349,6 +350,11 @@ const SettingsStorageRoute = SettingsStorageRouteImport.update({
   path: '/storage',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsTerminalRoute = SettingsTerminalRouteImport.update({
+  id: '/terminal',
+  path: '/terminal',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
   id: '/artifacts/by-kind/$kind',
   path: '/artifacts/by-kind/$kind',
@@ -420,6 +426,7 @@ export interface FileRoutesByFullPath {
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/terminal': typeof SettingsTerminalRoute
   '/onboarding/': typeof OnboardingIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
@@ -478,6 +485,7 @@ export interface FileRoutesByTo {
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/terminal': typeof SettingsTerminalRoute
   '/onboarding': typeof OnboardingIndexRoute
   '/settings': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
@@ -540,6 +548,7 @@ export interface FileRoutesById {
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
+  '/settings/terminal': typeof SettingsTerminalRoute
   '/onboarding/': typeof OnboardingIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
@@ -603,6 +612,7 @@ export interface FileRouteTypes {
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
+    | '/settings/terminal'
     | '/onboarding/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
@@ -661,6 +671,7 @@ export interface FileRouteTypes {
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
+    | '/settings/terminal'
     | '/onboarding'
     | '/settings'
     | '/artifacts/by-kind/$kind'
@@ -722,6 +733,7 @@ export interface FileRouteTypes {
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
+    | '/settings/terminal'
     | '/onboarding/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
@@ -1153,6 +1165,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsStorageRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/terminal': {
+      id: '/settings/terminal'
+      path: '/terminal'
+      fullPath: '/settings/terminal'
+      preLoaderRoute: typeof SettingsTerminalRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/artifacts/by-kind/$kind': {
       id: '/artifacts/by-kind/$kind'
       path: '/artifacts/by-kind/$kind'
@@ -1241,6 +1260,7 @@ interface SettingsRouteRouteChildren {
   SettingsProjectsRoute: typeof SettingsProjectsRoute
   SettingsSecretsRoute: typeof SettingsSecretsRoute
   SettingsStorageRoute: typeof SettingsStorageRoute
+  SettingsTerminalRoute: typeof SettingsTerminalRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
@@ -1260,6 +1280,7 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsProjectsRoute: SettingsProjectsRoute,
   SettingsSecretsRoute: SettingsSecretsRoute,
   SettingsStorageRoute: SettingsStorageRoute,
+  SettingsTerminalRoute: SettingsTerminalRoute,
   SettingsIndexRoute: SettingsIndexRoute,
 }
 

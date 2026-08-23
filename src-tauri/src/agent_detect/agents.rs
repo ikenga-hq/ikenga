@@ -45,8 +45,18 @@ pub async fn detect_all() -> Vec<DetectedAgent> {
 /// the slowest probe.
 pub async fn detect_by_id(agent_id: &str) -> Option<DetectedAgent> {
     let os = std::env::consts::OS;
-    let def = KNOWN_AGENTS.iter().find(|d| d.id == agent_id)?;
-    detect_one(def, os).await
+    let def = KNOWN_AGENTS.iter().find(|d| {
+        d.id == agent_id
+            || (d.id == "gemini-cli" && agent_id == "gemini")
+            || (d.id == "antigravity-cli" && agent_id == "antigravity")
+            || (d.id == "cursor-agent" && agent_id == "cursor")
+            || (d.id == "qwen-code" && agent_id == "qwen")
+    })?;
+    let mut detected = detect_one(def, os).await?;
+    // If the caller queried by an alias like "gemini", keep the queried id so
+    // the frontend map keys line up.
+    detected.id = agent_id.to_string();
+    Some(detected)
 }
 
 /// Inlined tiny join_all so we don't drag in the full `futures` crate.
@@ -139,12 +149,22 @@ fn lookup_spec(spec: &ExecutableSpec) -> Option<PathBuf> {
 #[cfg(windows)]
 fn windows_npm_global_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    if let Some(userprofile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        dirs.push(userprofile.join("AppData").join("Roaming").join("npm"));
+        dirs.push(userprofile.join("AppData").join("Local").join("pnpm"));
+        dirs.push(userprofile.join(".cargo").join("bin"));
+        dirs.push(userprofile.join(".bun").join("bin"));
+        dirs.push(userprofile.join("scoop").join("shims"));
+        dirs.push(userprofile.join("AppData").join("Local").join("Microsoft").join("WinGet").join("Links"));
+    }
     if let Some(appdata) = std::env::var_os("APPDATA") {
         dirs.push(PathBuf::from(appdata).join("npm"));
     }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         dirs.push(PathBuf::from(&local).join("npm"));
+        dirs.push(PathBuf::from(&local).join("pnpm"));
         dirs.push(PathBuf::from(&local).join("Programs").join("npm"));
+        dirs.push(PathBuf::from(&local).join("Microsoft").join("WinGet").join("Links"));
     }
     if let Some(home) = crate::platform::home_dir() {
         dirs.push(home.join("AppData").join("Roaming").join("npm"));
@@ -189,9 +209,32 @@ fn is_executable(p: &std::path::Path) -> bool {
     }
 }
 
+fn create_agent_command(exec: &std::path::Path) -> Command {
+    #[cfg(windows)]
+    {
+        let is_batch = exec
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+            .unwrap_or(false);
+        if is_batch {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.arg("/c").arg(exec);
+            cmd
+        } else {
+            Command::new(exec)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(exec)
+    }
+}
+
 async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> Option<String> {
-    let mut cmd = Command::new(exec);
+    let mut cmd = create_agent_command(exec);
     cmd.arg(arg);
+    cmd.env("PATH", crate::runtime::augmented_path());
     cmd.kill_on_drop(true);
     let fut = cmd.output();
     let output = timeout(DEFAULT_VERSION_TIMEOUT, fut).await.ok()?.ok()?;
@@ -306,13 +349,16 @@ async fn probe_auth_acp_handshake(
 async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut child = Command::new(exec)
+    let mut child = create_agent_command(exec);
+    child
         .args(args)
         .env("PATH", crate::runtime::augmented_path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    let mut child = child
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
 
@@ -399,8 +445,9 @@ async fn probe_auth_exec(
             }
         }
     };
-    let mut command = Command::new(target);
+    let mut command = create_agent_command(&target);
     command.args(args);
+    command.env("PATH", crate::runtime::augmented_path());
     command.kill_on_drop(true);
     let fut = command.output();
     match timeout(Duration::from_millis(timeout_ms), fut).await {

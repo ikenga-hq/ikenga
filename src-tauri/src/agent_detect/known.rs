@@ -200,7 +200,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["claude.cmd", "claude.exe"],
+                names: &["claude", "claude.cmd", "claude.exe", "claude.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -224,7 +224,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["codex.cmd"],
+                names: &["codex", "codex.cmd", "codex.exe", "codex.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -259,7 +259,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["gemini.cmd"],
+                names: &["gemini", "gemini.cmd", "gemini.exe", "gemini.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -311,7 +311,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["agy.cmd", "agy.exe"],
+                names: &["agy", "agy.cmd", "agy.exe", "agy.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -337,7 +337,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["cursor-agent.cmd"],
+                names: &["cursor-agent", "cursor-agent.cmd", "cursor-agent.exe"],
                 extra_dirs: &[],
             },
         ],
@@ -357,7 +357,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["opencode.cmd"],
+                names: &["opencode", "opencode.cmd", "opencode.exe"],
                 extra_dirs: &[],
             },
         ],
@@ -377,7 +377,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["qwen.cmd"],
+                names: &["qwen", "qwen.cmd", "qwen.exe", "qwen.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -399,7 +399,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["aider.cmd"],
+                names: &["aider", "aider.exe", "aider.cmd", "aider.bat"],
                 extra_dirs: &[],
             },
         ],
@@ -428,7 +428,7 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
-                names: &["ollama.exe"],
+                names: &["ollama", "ollama.exe"],
                 extra_dirs: &[],
             },
         ],

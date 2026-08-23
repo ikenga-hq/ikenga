@@ -13,6 +13,7 @@ import {
 	ShieldAlert,
 	Sparkles,
 	Stethoscope,
+	Terminal,
 	type LucideIcon,
 } from 'lucide-react';
 
@@ -40,6 +41,7 @@ const NAV: NavSection[] = [
 			{ to: '/settings/activity-bar', label: 'Activity bar', Icon: LayoutGrid },
 			{ to: '/settings/artifact-grid', label: 'Artifact grid', Icon: Grid3x3 },
 			{ to: '/settings/agent', label: 'Agent', Icon: Bot },
+			{ to: '/settings/terminal', label: 'Terminal', Icon: Terminal },
 			{ to: '/settings/packages', label: 'Packages', Icon: Package },
 			{ to: '/settings/pkg-audit', label: 'Pkg violations', Icon: ShieldAlert },
 			{ to: '/settings/pkg-health', label: 'Pkg health', Icon: Stethoscope },

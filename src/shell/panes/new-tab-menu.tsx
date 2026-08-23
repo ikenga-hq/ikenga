@@ -4,8 +4,9 @@ import { useEffect, useState } from 'react';
 import { CommandRow, type CommandRowProps } from '@/components/ui/command-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { LeafNode, PaneView } from '@/lib/panes/types';
-import { defaultShellLabel } from '@/lib/platform';
+import { useDefaultShellProfile } from '@/lib/shell-profiles';
 import { NAV_GROUPS } from '@/shell/nav-config';
+import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
 import { createTerminalSession } from '@/terminal/single-terminal';
 
 interface NewTabMenuProps {
@@ -18,6 +19,7 @@ interface NewTabMenuProps {
 export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 	const addTab = usePaneStore((s) => s.addTab);
 	const focusPane = usePaneStore((s) => s.focusPane);
+	const { profiles, selectedProfile } = useDefaultShellProfile();
 
 	// Click outside to close. Defer one tick so the click that opened the
 	// menu isn't itself caught here.
@@ -68,26 +70,77 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 					</Command.Empty>
 
 					<Command.Group
-						heading="Pane type"
+						heading="Terminals & Shells"
 						className="text-[10px] uppercase tracking-wider text-muted-foreground"
 					>
-						<MenuItem
-							onSelect={() => commit({ kind: 'terminal', sessionId: createTerminalSession() })}
-							Icon={TerminalIcon}
-							label={`Terminal (${defaultShellLabel()})`}
-							shortcut="⌘T"
-						/>
 						<MenuItem
 							onSelect={() =>
 								commit({
 									kind: 'terminal',
-									sessionId: createTerminalSession({ cmd: ['claude'], title: 'claude' }),
+									sessionId: createTerminalSession({
+										cmd: selectedProfile.cmd,
+										title: selectedProfile.label,
+									}),
+								})
+							}
+							Icon={TerminalIcon}
+							label={`Terminal (${selectedProfile.label})`}
+							shortcut="⌘T"
+						/>
+						{profiles
+							.filter((p) => p.id !== selectedProfile.id)
+							.map((p) => (
+								<MenuItem
+									key={p.id}
+									onSelect={() =>
+										commit({
+											kind: 'terminal',
+											sessionId: createTerminalSession({
+												cmd: p.cmd,
+												title: p.label,
+											}),
+										})
+									}
+									Icon={TerminalIcon}
+									label={p.label}
+									detail={p.cmd.join(' ')}
+								/>
+							))}
+						<MenuItem
+							onSelect={() =>
+								commit({
+									kind: 'terminal',
+									sessionId: createTerminalSession({
+										cmd: buildClaudeWrappedCmd(),
+										title: 'claude',
+									}),
 								})
 							}
 							Icon={TerminalIcon}
 							label="Claude terminal"
 							shortcut="⌘⇧T"
 						/>
+						{profiles
+							.filter((p) => p.kind === 'wsl')
+							.map((p) => (
+								<MenuItem
+									key={`claude-${p.id}`}
+									onSelect={() =>
+										commit({
+											kind: 'terminal',
+											sessionId: createTerminalSession({
+												cmd: buildClaudeWrappedCmd({
+													shellTarget: 'wsl',
+													wslDistro: p.distro,
+												}),
+												title: `claude (${p.distro ?? 'wsl'})`,
+											}),
+										})
+									}
+									Icon={TerminalIcon}
+									label={`Claude (${p.label})`}
+								/>
+							))}
 					</Command.Group>
 
 					<Command.Group
