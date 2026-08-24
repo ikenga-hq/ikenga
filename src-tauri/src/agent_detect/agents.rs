@@ -434,6 +434,25 @@ async fn probe_auth_acp_handshake(
 /// The handshake itself: write `initialize`, then `session/new`, and inspect
 /// the `id:2` response. `Ok(true)` = authed, `Ok(false)` = `-32000`, `Err` =
 /// transport/parse problem (inconclusive).
+/// Does a JSON-RPC `-32000` message actually describe an auth failure?
+///
+/// `-32000` is ACP's generic server-error bucket, not a dedicated
+/// `AuthRequired` code, so the message is the only thing that distinguishes
+/// "you are logged out" from "this product was discontinued" or "you are out
+/// of quota". Returning `false` here makes the probe inconclusive rather than
+/// negative, which lets the cred-file / env-var fallbacks answer instead.
+fn is_auth_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("log in")
+        || lower.contains("credential")
+        || lower.contains("sign in")
+        || lower.contains("unauthenticated")
+        || lower.contains("not authorized")
+        || lower.contains("unauthorized")
+}
+
 async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -506,13 +525,41 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
         }
         if let Some(err) = msg.get("error") {
             let code = err.get("code").and_then(|v| v.as_i64());
-            // -32000 = ACP `AuthRequired`. Any other error is a real problem,
-            // not an auth verdict — surface as inconclusive.
-            return if code == Some(-32000) {
-                Ok(false)
-            } else {
-                Err(format!("session/new error: {err}"))
-            };
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+
+            // -32000 is the ACP server-error bucket. It USED to mean
+            // `AuthRequired` and nothing else, so the code alone was the
+            // verdict. Google now returns it for conditions that have nothing
+            // to do with auth, and treating those as "logged out" is worse
+            // than useless: `known.rs` wraps this in `FirstConclusive` so a
+            // negative here outranks the cred-file fallback, meaning a
+            // correctly-authenticated user is reported as signed out and no
+            // amount of re-authenticating clears it.
+            //
+            // Observed against gemini 0.55.1 (2026-08-24), both -32000:
+            //   "This client is no longer supported for Gemini Code Assist
+            //    for individuals. To continue using Gemini, please migrate to
+            //    the Antigravity suite of products: https://antigravity.google"
+            //   "Resource has been exhausted (e.g. check quota)."
+            //
+            // So the code narrows the field and the message decides. Anything
+            // we can't positively read as an auth failure is inconclusive,
+            // which lets the cred-file / env-var checks answer instead.
+            if code == Some(-32000) {
+                return if is_auth_failure_message(message) {
+                    Ok(false)
+                } else {
+                    // Not an auth verdict. Surfacing the message keeps a
+                    // product deprecation from masquerading as a login
+                    // problem in the wizard.
+                    Err(format!("session/new -32000 (not an auth failure): {message}"))
+                };
+            }
+            // Any other code is a real problem, not an auth verdict.
+            return Err(format!("session/new error: {err}"));
         }
         if msg.get("result").is_some() {
             return Ok(true);
@@ -703,6 +750,43 @@ fn env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agent_detect::known::TargetFamily;
+
+    /// Real `-32000` payloads captured from gemini 0.55.1 on 2026-08-24.
+    /// Neither is an auth failure, and treating them as one reports a
+    /// logged-in user as signed out — `known.rs` uses `FirstConclusive`, so a
+    /// false negative here outranks the cred-file fallback that would
+    /// otherwise correct it.
+    #[test]
+    fn non_auth_minus_32000_messages_are_not_auth_failures() {
+        assert!(!is_auth_failure_message(
+            "This client is no longer supported for Gemini Code Assist for individuals. \
+             To continue using Gemini, please migrate to the Antigravity suite of \
+             products: https://antigravity.google"
+        ));
+        assert!(!is_auth_failure_message(
+            "Resource has been exhausted (e.g. check quota)."
+        ));
+    }
+
+    #[test]
+    fn genuine_auth_messages_are_detected() {
+        for m in [
+            "Authentication required",
+            "Please log in with `gemini auth login`",
+            "unauthenticated",
+            "No credentials found",
+            "User is not authorized",
+            "Please sign in to continue",
+        ] {
+            assert!(is_auth_failure_message(m), "should detect auth failure: {m}");
+        }
+    }
+
+    #[test]
+    fn auth_detection_is_case_insensitive() {
+        assert!(is_auth_failure_message("AUTHENTICATION REQUIRED"));
+        assert!(is_auth_failure_message("Unauthorized"));
+    }
 
     #[test]
     fn expand_tilde_handles_home() {
