@@ -8,37 +8,31 @@
 //! keeps the shape identical to what a native-ACP peer (Gemini, future
 //! Codex-via-Zed-adapter) emits.
 //!
-//! Phase 1 of the multi-engine rebuild ships only the `claude_code` engine
-//! — the former `crate::acp` module renamed and reorganised so the
-//! ACP-as-naming presumption is gone. The internal use of ACP-crate types
-//! is retained because they are the actual wire vocabulary every future
-//! engine will speak (Phase 2: gemini_acp; Phase 3: codex_pty).
-//!
 //! The `Engine` trait below is the surface every adapter implements. The
 //! Tauri commands in `commands/chat.rs` dispatch into here via an
 //! `EngineRegistry` keyed by string id (`"claude-code"`, `"gemini"`,
 //! `"codex"`).
 
+pub mod antigravity_acp;
 pub mod claude_code;
 pub mod codex_pty;
 pub mod cursor_agent;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-
 use tokio::sync::RwLock;
 
+pub use antigravity_acp::AntigravityEngineState;
 use crate::engines::claude_code::server::ClaudeCodeEngineState;
 use crate::engines::codex_pty::CodexPtyEngineState;
 use crate::engines::cursor_agent::CursorAgentEngineState;
 
 /// In-memory registry of available engine adapters, keyed by stable id.
 ///
-/// Today the only entry is `"claude-code"`. Phase 2 adds `"gemini"`,
-/// Phase 3 adds `"codex"`. The `Arc<RwLock<...>>` shape leaves room for
-/// dynamic registration (e.g. engine pkgs declaring their own adapter at
-/// install time) without re-plumbing the call sites; current use is
-/// boot-time fill + read-only lookups.
+/// The `Arc<RwLock<...>>` shape leaves room for dynamic registration (e.g.
+/// engine pkgs declaring their own adapter at install time) without
+/// re-plumbing the call sites; current use is boot-time fill + read-only
+/// lookups.
 #[derive(Default, Clone)]
 pub struct EngineRegistry {
     by_id: Arc<RwLock<HashMap<String, EngineHandle>>>,
@@ -57,6 +51,8 @@ pub enum EngineHandle {
     /// Phase 4 scaffold (ADR-013). Runtime stubbed — see
     /// `cursor_agent::server` for the per-method error surface.
     CursorAgent(CursorAgentEngineState),
+    /// Stub — see `antigravity_acp::server`. Never constructed yet.
+    Antigravity(AntigravityEngineState),
 }
 
 impl EngineRegistry {

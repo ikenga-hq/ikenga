@@ -162,7 +162,6 @@ pub type ExitSink = Box<dyn FnOnce(i32) + Send + 'static>;
 /// once the id exists.
 enum SinkSpec {
     Tauri(AppHandle),
-    #[cfg(test)]
     Custom(DataSink, ExitSink),
 }
 
@@ -296,6 +295,7 @@ struct PtySession {
     /// Where emitted chunks go. Held on the session so `attach_begin` /
     /// `attach_arm` can flush a gate through the same path the emitter uses.
     sink: DataSink,
+    broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
 }
 
 pub struct PtyManager {
@@ -322,16 +322,21 @@ impl PtyManager {
         self.spawn_inner(SinkSpec::Tauri(app), opts, None).await
     }
 
-    /// Spawn against caller-supplied sinks instead of the Tauri event bus.
-    /// Test-only: it is how the attach-seam test observes the exact byte stream
-    /// a subscriber would receive.
-    #[cfg(test)]
     pub async fn spawn_with_sinks(
         self: &Arc<Self>,
         opts: SpawnOpts,
         data: DataSink,
         exit: ExitSink,
     ) -> Result<String> {
+        self.spawn_inner(SinkSpec::Custom(data, exit), opts, None)
+            .await
+    }
+
+    /// Spawn a headless PTY session without Tauri event sinks.
+    /// Chunks are retained in the scrollback ring and broadcast to WebSocket subscribers.
+    pub async fn spawn_headless(self: &Arc<Self>, opts: SpawnOpts) -> Result<String> {
+        let data: DataSink = Arc::new(|_bytes, _end| {});
+        let exit: ExitSink = Box::new(|_code| {});
         self.spawn_inner(SinkSpec::Custom(data, exit), opts, None)
             .await
     }
@@ -394,7 +399,6 @@ impl PtyManager {
                 });
                 (data, exit)
             }
-            #[cfg(test)]
             SinkSpec::Custom(data, exit) => (data, exit),
         };
 
@@ -457,6 +461,7 @@ impl PtyManager {
         let writer = pair.master.take_writer().context("take writer")?;
         let reader = pair.master.try_clone_reader().context("clone reader")?;
 
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(512);
         let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let session = Arc::new(PtySession {
@@ -484,6 +489,7 @@ impl PtyManager {
                 gate: None,
             }),
             sink: data_sink,
+            broadcast_tx,
         });
 
         self.sessions.insert(id.clone(), session.clone());
@@ -563,6 +569,7 @@ impl PtyManager {
                     return;
                 };
                 let end_offset = st.ring.push(bytes);
+                let _ = session_for_emit.broadcast_tx.send(bytes.to_vec());
                 if st.gate.is_some() {
                     let overflowed = {
                         // `is_some` checked directly above.
@@ -1154,6 +1161,35 @@ impl PtyManager {
         }
         // The wait thread will remove the entry once the child reaps.
         Ok(())
+    }
+
+    /// Subscribe to live output bytes emitted by the given terminal.
+    pub fn subscribe(&self, id: &str) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+        let resolved = self.resolve_id(id)?;
+        let session = self
+            .sessions
+            .get(&resolved)
+            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
+        Ok(session.broadcast_tx.subscribe())
+    }
+
+    /// Subscribe to live output bytes and return the current scrollback buffer.
+    pub fn subscribe_session(&self, id: &str) -> Result<(Vec<u8>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
+        let resolved = self.resolve_id(id)?;
+        let session = self
+            .sessions
+            .get(&resolved)
+            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?
+            .clone();
+        // Subscribe and snapshot under the same `emit` guard the reader loop
+        // takes to push into the ring and broadcast. Doing them separately
+        // lets a chunk land in between and be delivered twice — once in the
+        // replayed scrollback, once live.
+        let (snapshot, rx) = match session.emit.lock() {
+            Ok(st) => (st.ring.snapshot().0, session.broadcast_tx.subscribe()),
+            Err(_) => (Vec::new(), session.broadcast_tx.subscribe()),
+        };
+        Ok((snapshot, rx))
     }
 }
 
