@@ -9,9 +9,9 @@
 // later phases just fill in the Rust side.
 
 import type { WindowDescriptor } from '@ikenga/contract';
-import { getTransport, isTauri, type RpcTransport } from './transport';
+import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 
-export { isTauri, getTransport, type RpcTransport };
+export { isTauri, isRemoteWebSession, getTransport, type RpcTransport };
 export type UnlistenFn = () => void;
 
 function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -144,7 +144,7 @@ export async function ptyListen(
 	onData: (bytes: Uint8Array, endOffset: number) => void,
 	onExit: (code: number | null) => void
 ): Promise<UnlistenFn> {
-	if (!isTauri()) {
+	if (isRemoteWebSession()) {
 		const transport = getTransport();
 		if (transport.openPtySocket) {
 			const ws = transport.openPtySocket(id);
