@@ -487,6 +487,39 @@ fn build_engine_command(
             }
             Ok(cmd)
         }
+        "opencode" => {
+            let mut cmd = create_chi_command("opencode");
+            cmd.arg("run")
+                .arg("-p")
+                .arg(prompt)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("PATH", crate::runtime::augmented_path());
+
+            if let Some(m) = model {
+                cmd.arg("--model").arg(m);
+            }
+
+            Ok(cmd)
+        }
+        "pi" => {
+            let mut cmd = create_chi_command("pi");
+            cmd.arg("-p")
+                .arg(prompt)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("PATH", crate::runtime::augmented_path());
+
+            if let Some(m) = model {
+                cmd.arg("--model").arg(m);
+            }
+
+            Ok(cmd)
+        }
         // cursor-agent is scaffolded but not yet runnable through the chi
         // surface. Return a clean error rather than falling through to an
         // unhelpful "command not found" OS error.
@@ -1406,6 +1439,47 @@ mod tests {
             "--conversation", "conv-123",
             "--model", "gemini-2.0-flash",
             "--mode", "plan"
+        ]);
+    }
+
+    #[test]
+    fn test_build_engine_command_opencode() {
+        let cmd = build_engine_command(
+            "opencode",
+            "fix the bug",
+            "/tmp",
+            Some("claude-3-7-sonnet"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cmd.as_std().get_program(), "opencode");
+        let args: Vec<&str> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args, vec![
+            "run",
+            "-p", "fix the bug",
+            "--model", "claude-3-7-sonnet",
+        ]);
+    }
+
+    #[test]
+    fn test_build_engine_command_pi() {
+        let cmd = build_engine_command(
+            "pi",
+            "refactor this file",
+            "/tmp",
+            Some("claude-3-7-sonnet"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(cmd.as_std().get_program(), "pi");
+        let args: Vec<&str> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args, vec![
+            "-p", "refactor this file",
+            "--model", "claude-3-7-sonnet",
         ]);
     }
 }

@@ -3205,7 +3205,7 @@ mod tests {
             let dir = root.join(format!("scope{i}/skills"));
             std::fs::create_dir_all(&dir).unwrap();
             let link = dir.join("groundwork");
-            std::os::unix::fs::symlink(&master, &link).unwrap();
+            symlink_impl(&master, &link).unwrap();
             search_dirs.push(dir);
             links.push(link);
         }
@@ -3301,7 +3301,7 @@ mod tests {
         std::fs::create_dir_all(&master_b).unwrap();
         let link = root.join("scope/groundwork");
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&master_a, &link).unwrap();
+        symlink_impl(&master_a, &link).unwrap();
 
         relink_one(&link, &master_b).unwrap();
         assert_eq!(
@@ -3360,8 +3360,8 @@ mod tests {
             let sr = root.join(format!("scope{i}"));
             let skills = sr.join(".claude/skills");
             std::fs::create_dir_all(&skills).unwrap();
-            std::os::unix::fs::symlink(&ext_master, skills.join("groundwork")).unwrap();
-            std::os::unix::fs::symlink(&vault_master, skills.join("release-status")).unwrap();
+            symlink_impl(&ext_master, &skills.join("groundwork")).unwrap();
+            symlink_impl(&vault_master, &skills.join("release-status")).unwrap();
             scope_roots.push(sr);
         }
 
@@ -3560,7 +3560,7 @@ mod tests {
         // Pre-plant the foreign link at the colliding member's scope path.
         let collide_link = scope_path_for(&scope, Kind::Skill, "shared-leaf").unwrap();
         std::fs::create_dir_all(collide_link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&foreign, &collide_link).unwrap();
+        symlink_impl(&foreign, &collide_link).unwrap();
 
         // Enable still succeeds.
         place_bundle(&store, &scope, "workspace", "atelier").unwrap();

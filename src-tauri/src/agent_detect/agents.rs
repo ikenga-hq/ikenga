@@ -54,6 +54,8 @@ pub async fn detect_by_id(agent_id: &str) -> Option<DetectedAgent> {
             || (d.id == "antigravity-cli" && agent_id == "antigravity")
             || (d.id == "cursor-agent" && agent_id == "cursor")
             || (d.id == "qwen-code" && agent_id == "qwen")
+            || (d.id == "opencode" && agent_id == "opencode-ai")
+            || (d.id == "pi" && (agent_id == "pi-coding-agent" || agent_id == "pi-agent"))
     })?;
     let mut detected = detect_one(def, os).await?;
     // If the caller queried by an alias like "gemini", keep the queried id so
