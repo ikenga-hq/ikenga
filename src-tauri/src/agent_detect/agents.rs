@@ -14,6 +14,9 @@ use tokio::time::timeout;
 use super::known::{
     family_matches, AgentCapabilities, AgentDef, AuthCheck, ExecutableSpec, KNOWN_AGENTS,
 };
+// Only `lookup_wsl_executable` reads the family tag directly.
+#[cfg(windows)]
+use super::known::TargetFamily;
 
 const DEFAULT_VERSION_TIMEOUT: Duration = Duration::from_millis(2000);
 
@@ -74,6 +77,18 @@ where
 
 async fn detect_one(def: &AgentDef, os: &str) -> Option<DetectedAgent> {
     let exec_path = resolve_executable(def, os)?;
+    let is_wsl = exec_path.to_string_lossy().starts_with("wsl:");
+    let display_path = if is_wsl {
+        let raw = exec_path.to_string_lossy();
+        let parts: Vec<&str> = raw.split(':').collect();
+        if parts.len() >= 3 {
+            format!("{} (WSL)", parts[2])
+        } else {
+            format!("{raw} (WSL)")
+        }
+    } else {
+        exec_path.display().to_string()
+    };
     let version = if let Some(arg) = def.version_arg {
         probe_version(&exec_path, arg, def.version_regex).await
     } else {
@@ -86,7 +101,7 @@ async fn detect_one(def: &AgentDef, os: &str) -> Option<DetectedAgent> {
     Some(DetectedAgent {
         id: def.id.to_string(),
         display: def.display.to_string(),
-        executable_path: exec_path.display().to_string(),
+        executable_path: display_path,
         version,
         authed,
         auth_hint,
@@ -101,6 +116,58 @@ fn resolve_executable(def: &AgentDef, os: &str) -> Option<PathBuf> {
         }
         if let Some(found) = lookup_spec(spec) {
             return Some(found);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(wsl_path) = lookup_wsl_executable(def) {
+            return Some(wsl_path);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
+    let has_wsl = which::which("wsl.exe").is_ok()
+        || std::path::Path::new(r"C:\Windows\System32\wsl.exe").exists();
+    if !has_wsl {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    for spec in def.executables {
+        if matches!(spec.target_family, TargetFamily::Unix | TargetFamily::Any) {
+            names.extend(spec.names.iter().copied());
+        }
+    }
+    if names.is_empty() {
+        if let Some(spec) = def.executables.first() {
+            names.extend(spec.names.iter().copied());
+        }
+    }
+
+    for name in names {
+        let clean_name = name
+            .strip_suffix(".cmd")
+            .or_else(|| name.strip_suffix(".exe"))
+            .or_else(|| name.strip_suffix(".bat"))
+            .unwrap_or(name);
+
+        let Ok(output) = std::process::Command::new("wsl.exe")
+            .args(["bash", "-l", "-c", &format!("which {clean_name}")])
+            .output()
+        else {
+            // One candidate name failing to spawn says nothing about the
+            // next one — keep probing instead of giving up on the agent.
+            continue;
+        };
+
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() && path_str.starts_with('/') {
+                return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
+            }
         }
     }
     None
@@ -232,17 +299,36 @@ fn create_agent_command(exec: &std::path::Path) -> Command {
 }
 
 async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> Option<String> {
-    let mut cmd = create_agent_command(exec);
-    cmd.arg(arg);
-    cmd.env("PATH", crate::runtime::augmented_path());
-    cmd.kill_on_drop(true);
-    let fut = cmd.output();
-    let output = timeout(DEFAULT_VERSION_TIMEOUT, fut).await.ok()?.ok()?;
+    #[cfg(windows)]
+    let (output_res, regex) = {
+        let exec_str = exec.to_string_lossy();
+        if let Some(rest) = exec_str.strip_prefix("wsl:") {
+            let bin_name = rest.split(':').next().unwrap_or(rest);
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args(["bash", "-l", "-c", &format!("{bin_name} {arg}")]);
+            cmd.kill_on_drop(true);
+            (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+        } else {
+            let mut cmd = create_agent_command(exec);
+            cmd.arg(arg);
+            cmd.env("PATH", crate::runtime::augmented_path());
+            cmd.kill_on_drop(true);
+            (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+        }
+    };
+    #[cfg(not(windows))]
+    let (output_res, regex) = {
+        let mut cmd = create_agent_command(exec);
+        cmd.arg(arg);
+        cmd.env("PATH", crate::runtime::augmented_path());
+        cmd.kill_on_drop(true);
+        (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+    };
+    let output = output_res.ok()?.ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).into_owned();
     }
-    let regex = re.unwrap_or(super::known::DEFAULT_VERSION_REGEX);
     let parsed = Regex::new(regex).ok()?;
     let caps = parsed.captures(&text)?;
     caps.get(1).map(|m| m.as_str().to_string())
@@ -358,15 +444,31 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
 
-    let mut child = child
+    let mut spawned = child
         .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| format!("spawn `{}` failed: {e}", exec.display()))?;
 
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stdin = spawned
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "child stdin not captured".to_string())?;
+    let stdout = spawned
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout not captured".to_string())?;
     let mut lines = BufReader::new(stdout).lines();
 
-    // 1. initialize
+    // Protocol handshake — client initialization envelope.
+    //
+    // `protocolVersion` is a NUMBER in the ACP schema. Sending the string
+    // "0.1.0" makes gemini reject `initialize` outright, and the rejection is
+    // silent from here: the probe reads its verdict off the id:2 response,
+    // which still arrives, so a broken handshake looks like a clean negative.
+    // Verified against gemini 0.55.1 —
+    //   {"protocolVersion":1}       -> {"id":1,"result":{"protocolVersion":1,…}}
+    //   {"protocolVersion":"0.1.0"} -> {"id":1,"error":{"code":-32603,…
+    //        "expected":"number","path":["protocolVersion"],
+    //        "message":"Invalid input: expected number, received string"}}
     stdin
         .write_all(
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
@@ -376,7 +478,7 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
         .map_err(|e| format!("write initialize: {e}"))?;
     stdin.flush().await.map_err(|e| format!("flush: {e}"))?;
 
-    // 2. session/new — its result vs `-32000` error is the auth verdict.
+    // Immediately queue session/new — ACP allows pipelining.
     stdin
         .write_all(
             b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\
@@ -424,55 +526,139 @@ async fn probe_auth_exec(
     args: &[&str],
     timeout_ms: u64,
 ) -> (Option<bool>, Option<String>) {
-    // Prefer the resolved exec path when `cmd` matches its filename — saves
-    // us a second `which` lookup and avoids races where a second binary by
-    // the same name shadows the one we just found.
-    let target: PathBuf = if exec_fallback
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n == cmd || n == format!("{cmd}.cmd") || n == format!("{cmd}.exe"))
-        .unwrap_or(false)
+    #[cfg(windows)]
     {
-        exec_fallback.to_path_buf()
-    } else {
-        match which::which(cmd) {
-            Ok(p) => p,
-            Err(_) => {
-                return (
-                    Some(false),
-                    Some(format!("auth probe binary `{cmd}` not on PATH")),
-                );
+        let exec_str = exec_fallback.to_string_lossy();
+        if let Some(rest) = exec_str.strip_prefix("wsl:") {
+            let bin_name = rest.split(':').next().unwrap_or(cmd);
+            let args_joined = args.join(" ");
+            let full_cmd = format!("{bin_name} {args_joined}");
+            let mut command = Command::new("wsl.exe");
+            command.args(["bash", "-l", "-c", &full_cmd]);
+            command.kill_on_drop(true);
+            let fut = command.output();
+            match timeout(Duration::from_millis(timeout_ms), fut).await {
+                Ok(Ok(out)) => {
+                    if out.status.success() {
+                        (Some(true), None)
+                    } else {
+                        (
+                            Some(false),
+                            Some(format!(
+                                "auth probe `{cmd}` in WSL returned exit code {}",
+                                out.status.code().unwrap_or(-1)
+                            )),
+                        )
+                    }
+                }
+                Ok(Err(e)) => (
+                    None,
+                    Some(format!("failed to spawn auth probe `{cmd}` in WSL: {e}")),
+                ),
+                Err(_) => (
+                    None,
+                    Some(format!("auth probe `{cmd}` in WSL timed out after {timeout_ms}ms")),
+                ),
             }
-        }
-    };
-    let mut command = create_agent_command(&target);
-    command.args(args);
-    command.env("PATH", crate::runtime::augmented_path());
-    command.kill_on_drop(true);
-    let fut = command.output();
-    match timeout(Duration::from_millis(timeout_ms), fut).await {
-        Ok(Ok(out)) => {
-            if out.status.success() {
-                (Some(true), None)
+        } else {
+            let target: PathBuf = if exec_fallback
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == cmd || n == format!("{cmd}.cmd") || n == format!("{cmd}.exe") || n == format!("{cmd}.bat"))
+                .unwrap_or(false)
+            {
+                exec_fallback.to_path_buf()
             } else {
-                (
-                    Some(false),
-                    Some(format!(
-                        "`{cmd} {}` exited {}",
-                        args.join(" "),
-                        out.status
-                            .code()
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "?".into())
-                    )),
-                )
+                match which::which_in(cmd, Some(crate::runtime::augmented_path()), ".") {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return (
+                            Some(false),
+                            Some(format!("auth probe binary `{cmd}` not on PATH")),
+                        );
+                    }
+                }
+            };
+            let mut command = create_agent_command(&target);
+            command.args(args);
+            command.env("PATH", crate::runtime::augmented_path());
+            command.kill_on_drop(true);
+            let fut = command.output();
+            match timeout(Duration::from_millis(timeout_ms), fut).await {
+                Ok(Ok(out)) => {
+                    if out.status.success() {
+                        (Some(true), None)
+                    } else {
+                        (
+                            Some(false),
+                            Some(format!(
+                                "`{cmd} {}` exited {}",
+                                args.join(" "),
+                                out.status
+                                    .code()
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "?".into())
+                            )),
+                        )
+                    }
+                }
+                Ok(Err(e)) => (Some(false), Some(format!("auth probe failed: {e}"))),
+                Err(_) => (
+                    None,
+                    Some(format!("auth probe `{cmd}` timed out after {timeout_ms}ms")),
+                ),
             }
         }
-        Ok(Err(e)) => (Some(false), Some(format!("auth probe failed: {e}"))),
-        Err(_) => (
-            None,
-            Some(format!("auth probe `{cmd}` timed out after {timeout_ms}ms")),
-        ),
+    }
+    #[cfg(not(windows))]
+    {
+        let target: PathBuf = if exec_fallback
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == cmd)
+            .unwrap_or(false)
+        {
+            exec_fallback.to_path_buf()
+        } else {
+            match which::which_in(cmd, Some(crate::runtime::augmented_path()), ".") {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        Some(false),
+                        Some(format!("auth probe binary `{cmd}` not on PATH")),
+                    );
+                }
+            }
+        };
+        let mut command = create_agent_command(&target);
+        command.args(args);
+        command.env("PATH", crate::runtime::augmented_path());
+        command.kill_on_drop(true);
+        let fut = command.output();
+        match timeout(Duration::from_millis(timeout_ms), fut).await {
+            Ok(Ok(out)) => {
+                if out.status.success() {
+                    (Some(true), None)
+                } else {
+                    (
+                        Some(false),
+                        Some(format!(
+                            "`{cmd} {}` exited {}",
+                            args.join(" "),
+                            out.status
+                                .code()
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "?".into())
+                        )),
+                    )
+                }
+            }
+            Ok(Err(e)) => (Some(false), Some(format!("auth probe failed: {e}"))),
+            Err(_) => (
+                None,
+                Some(format!("auth probe `{cmd}` timed out after {timeout_ms}ms")),
+            ),
+        }
     }
 }
 
@@ -482,6 +668,25 @@ fn probe_auth_files(paths: &[&str]) -> (Option<bool>, Option<String>) {
         let expanded = expand_tilde(p);
         if expanded.is_file() {
             return (Some(true), None);
+        }
+        #[cfg(windows)]
+        {
+            let clean_p = p.strip_prefix("~/").unwrap_or(p);
+            for prefix in [r"\\wsl.localhost", r"\\wsl$"] {
+                let wsl_base = PathBuf::from(prefix);
+                if let Ok(distros) = std::fs::read_dir(&wsl_base) {
+                    for d in distros.flatten() {
+                        let home_dir = d.path().join("home");
+                        if let Ok(users) = std::fs::read_dir(&home_dir) {
+                            for u in users.flatten() {
+                                if u.path().join(clean_p).is_file() {
+                                    return (Some(true), None);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         tried.push(p.to_string());
     }

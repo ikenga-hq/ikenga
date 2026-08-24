@@ -29,7 +29,7 @@ describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
 		expect(cmd).toContain('-ExecutionPolicy');
 		expect(cmd).toContain('Bypass');
 		const script = cmd.at(-1) ?? '';
-		expect(script).toContain("& 'claude'");
+		expect(script).toContain("if (Get-Command 'claude'");
 		expect(script).toContain('[claude exited');
 	});
 

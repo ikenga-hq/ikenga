@@ -196,20 +196,43 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             ExecutableSpec {
                 target_family: TargetFamily::Unix,
                 names: &["claude"],
-                extra_dirs: &[],
+                extra_dirs: &["~/.local/bin", "~/.npm-global/bin", "/usr/local/bin"],
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
                 names: &["claude", "claude.cmd", "claude.exe", "claude.bat"],
-                extra_dirs: &[],
+                extra_dirs: &[
+                    "~/AppData/Roaming/npm",
+                    "~/AppData/Local/pnpm",
+                    "~/.bun/bin",
+                    "~/.cargo/bin",
+                    "~/scoop/shims",
+                    "~/.local/bin",
+                    "~/AppData/Local/Programs/claude",
+                    "~/AppData/Local/Yarn/bin",
+                ],
             },
         ],
         version_arg: Some("--version"),
         version_regex: Some(DEFAULT_VERSION_REGEX),
-        auth_check: Some(AuthCheck::Exec {
-            cmd: "claude",
-            args: &["doctor"],
-            timeout_ms: 4000,
+        auth_check: Some(AuthCheck::Any {
+            checks: &[
+                // Only the credential store proves auth. `~/.claude.json`
+                // and `~/.claude/` are both created on first run, logged in
+                // or not, so neither can gate this. macOS keeps the token in
+                // the Keychain instead — that host falls through to `doctor`.
+                AuthCheck::FilePresent {
+                    paths: &["~/.claude/.credentials.json"],
+                },
+                AuthCheck::Exec {
+                    cmd: "claude",
+                    args: &["doctor"],
+                    timeout_ms: 4000,
+                },
+                AuthCheck::EnvVar {
+                    name: "ANTHROPIC_API_KEY",
+                },
+            ],
         }),
         capabilities: CAP_FULL,
     },
