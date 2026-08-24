@@ -731,6 +731,9 @@ const ENGINE_DISPLAY_NAMES: Record<string, string> = {
 	'claude-code': 'Claude Code',
 	gemini: 'Gemini CLI',
 	codex: 'Codex CLI',
+	'cursor-agent': 'Cursor Agent',
+	opencode: 'OpenCode',
+	pi: 'Pi Coding Agent',
 };
 
 function engineDisplayName(id: string): string {

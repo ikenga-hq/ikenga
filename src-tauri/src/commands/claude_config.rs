@@ -2810,6 +2810,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn link_meta_symlink_reports_target_and_in_store() {
         // Lay out a fake store + a project .claude/agents symlink pointing in.
@@ -2834,6 +2835,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn link_meta_symlink_outside_store_is_not_in_store() {
         let root = unique_tmp("outside");
@@ -2861,6 +2863,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn link_meta_dangling_symlink_target_does_not_exist() {
         // A symlink whose target is missing is the ONLY orphaned case.
@@ -2890,6 +2893,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_symlink_target_some_when_resolving_none_when_dangling() {
         let root = unique_tmp("resolve");

@@ -1969,6 +1969,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn check_update_and_update_swap_in_place_without_relink() {
         let base = unique_tmp("update_git");

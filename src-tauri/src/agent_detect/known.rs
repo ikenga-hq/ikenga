@@ -155,6 +155,15 @@ const CAP_OPENCODE: AgentCapabilities = AgentCapabilities {
     session_resume: false,
 };
 
+const CAP_PI: AgentCapabilities = AgentCapabilities {
+    streaming: true,
+    tool_use: true,
+    thinking: false,
+    artifacts: false,
+    mcp: false,
+    session_resume: true,
+};
+
 const CAP_QWEN: AgentCapabilities = AgentCapabilities {
     streaming: true,
     tool_use: true,
@@ -376,18 +385,80 @@ pub const KNOWN_AGENTS: &[AgentDef] = &[
             ExecutableSpec {
                 target_family: TargetFamily::Unix,
                 names: &["opencode"],
-                extra_dirs: &[],
+                extra_dirs: &["~/.npm-global/bin", "~/.local/bin", "/usr/local/bin"],
             },
             ExecutableSpec {
                 target_family: TargetFamily::Windows,
                 names: &["opencode", "opencode.cmd", "opencode.exe"],
-                extra_dirs: &[],
+                extra_dirs: &[
+                    "~/AppData/Roaming/npm",
+                    "~/AppData/Local/pnpm",
+                    "~/.bun/bin",
+                ],
             },
         ],
         version_arg: Some("--version"),
         version_regex: Some(DEFAULT_VERSION_REGEX),
-        auth_check: None,
+        auth_check: Some(AuthCheck::Any {
+            checks: &[
+                AuthCheck::FilePresent {
+                    paths: &[
+                        "~/.config/opencode/config.json",
+                        "~/.opencode/auth.json",
+                    ],
+                },
+                AuthCheck::EnvVar {
+                    name: "OPENAI_API_KEY",
+                },
+                AuthCheck::EnvVar {
+                    name: "ANTHROPIC_API_KEY",
+                },
+            ],
+        }),
         capabilities: CAP_OPENCODE,
+    },
+    AgentDef {
+        id: "pi",
+        display: "Pi Coding Agent",
+        executables: &[
+            ExecutableSpec {
+                target_family: TargetFamily::Unix,
+                names: &["pi"],
+                extra_dirs: &["~/.npm-global/bin", "~/.local/bin", "/usr/local/bin"],
+            },
+            ExecutableSpec {
+                target_family: TargetFamily::Windows,
+                names: &["pi", "pi.cmd", "pi.exe", "pi.bat"],
+                extra_dirs: &[
+                    "~/AppData/Roaming/npm",
+                    "~/AppData/Local/pnpm",
+                    "~/.bun/bin",
+                    "~/.cargo/bin",
+                ],
+            },
+        ],
+        version_arg: Some("--version"),
+        version_regex: Some(DEFAULT_VERSION_REGEX),
+        auth_check: Some(AuthCheck::Any {
+            checks: &[
+                AuthCheck::FilePresent {
+                    paths: &[
+                        "~/.pi/config.json",
+                        "~/.config/pi/config.json",
+                    ],
+                },
+                AuthCheck::EnvVar {
+                    name: "OPENAI_API_KEY",
+                },
+                AuthCheck::EnvVar {
+                    name: "ANTHROPIC_API_KEY",
+                },
+                AuthCheck::EnvVar {
+                    name: "GEMINI_API_KEY",
+                },
+            ],
+        }),
+        capabilities: CAP_PI,
     },
     AgentDef {
         id: "qwen-code",
@@ -535,6 +606,7 @@ mod tests {
             ("gemini 1.0.0-rc.2", "1.0.0-rc.2"),
             ("cursor-agent 0.5.7", "0.5.7"),
             ("opencode v1.10.0", "1.10.0"),
+            ("pi 0.2.1", "0.2.1"),
             ("qwen 0.2", "0.2"),
             ("aider 0.85.1-dev", "0.85.1-dev"),
             ("ollama version is 0.5.4", "0.5.4"),

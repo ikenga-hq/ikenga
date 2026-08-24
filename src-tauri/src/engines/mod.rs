@@ -2,12 +2,16 @@ pub mod antigravity_acp;
 pub mod claude_code;
 pub mod codex_pty;
 pub mod cursor_agent;
+pub mod opencode_acp;
+pub mod pi_acp;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub use antigravity_acp::AntigravityEngineState;
+pub use opencode_acp::OpencodeEngineState;
+pub use pi_acp::PiEngineState;
 use crate::engines::claude_code::server::ClaudeCodeEngineState;
 use crate::engines::codex_pty::CodexPtyEngineState;
 use crate::engines::cursor_agent::CursorAgentEngineState;
@@ -23,6 +27,8 @@ pub enum EngineHandle {
     CodexPty(CodexPtyEngineState),
     CursorAgent(CursorAgentEngineState),
     Antigravity(AntigravityEngineState),
+    Opencode(OpencodeEngineState),
+    Pi(PiEngineState),
 }
 
 impl EngineRegistry {
