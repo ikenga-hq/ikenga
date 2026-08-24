@@ -459,11 +459,20 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
     let mut lines = BufReader::new(stdout).lines();
 
     // Protocol handshake — client initialization envelope.
+    //
+    // `protocolVersion` is a NUMBER in the ACP schema. Sending the string
+    // "0.1.0" makes gemini reject `initialize` outright, and the rejection is
+    // silent from here: the probe reads its verdict off the id:2 response,
+    // which still arrives, so a broken handshake looks like a clean negative.
+    // Verified against gemini 0.55.1 —
+    //   {"protocolVersion":1}       -> {"id":1,"result":{"protocolVersion":1,…}}
+    //   {"protocolVersion":"0.1.0"} -> {"id":1,"error":{"code":-32603,…
+    //        "expected":"number","path":["protocolVersion"],
+    //        "message":"Invalid input: expected number, received string"}}
     stdin
         .write_all(
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\
-              \"params\":{\"protocolVersion\":\"0.1.0\",\
-              \"clientInfo\":{\"name\":\"ikenga-auth-probe\",\"version\":\"1.0\"}}}\n",
+              \"params\":{\"protocolVersion\":1,\"clientCapabilities\":{}}}\n",
         )
         .await
         .map_err(|e| format!("write initialize: {e}"))?;
