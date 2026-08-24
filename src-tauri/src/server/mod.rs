@@ -237,6 +237,9 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     } else {
         warn!("no --data-dir: fs_* RPC commands will reject every path");
     }
+    if config.pkgs_dir.is_some() {
+        warn!("--pkgs-dir is reserved; no route serves pkgs yet");
+    }
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let pty_manager = Arc::new(PtyManager::new());

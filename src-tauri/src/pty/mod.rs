@@ -1181,12 +1181,14 @@ impl PtyManager {
             .get(&resolved)
             .ok_or_else(|| anyhow!("unknown terminal: {id}"))?
             .clone();
-        let rx = session.broadcast_tx.subscribe();
-        let snapshot = session
-            .emit
-            .lock()
-            .map(|st| st.ring.snapshot().0)
-            .unwrap_or_default();
+        // Subscribe and snapshot under the same `emit` guard the reader loop
+        // takes to push into the ring and broadcast. Doing them separately
+        // lets a chunk land in between and be delivered twice — once in the
+        // replayed scrollback, once live.
+        let (snapshot, rx) = match session.emit.lock() {
+            Ok(st) => (st.ring.snapshot().0, session.broadcast_tx.subscribe()),
+            Err(_) => (Vec::new(), session.broadcast_tx.subscribe()),
+        };
         Ok((snapshot, rx))
     }
 }

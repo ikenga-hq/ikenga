@@ -128,13 +128,24 @@ pub async fn rpc_handler(
                 });
             let rows = payload.args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
             let cols = payload.args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            // The caller's env was accepted and then dropped on the floor.
+            let env: std::collections::HashMap<String, String> = payload
+                .args
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             match state.pty_manager.spawn_headless(SpawnOpts {
                 terminal_id,
                 title,
                 cwd,
                 cmd,
-                env: std::collections::HashMap::new(),
+                env,
                 rows,
                 cols,
             }).await {

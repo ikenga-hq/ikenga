@@ -22,7 +22,8 @@ pub struct CliArgs {
     #[arg(long, default_value = "./dist", env = "IKENGA_STATIC_DIR")]
     pub static_dir: PathBuf,
 
-    /// Directory containing mini-app packages (/pkgs/:id)
+    /// Directory containing mini-app packages. Reserved — no route serves
+    /// pkgs yet, so setting this currently has no effect.
     #[arg(long, env = "IKENGA_PKGS_DIR")]
     pub pkgs_dir: Option<PathBuf>,
 
