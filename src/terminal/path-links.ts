@@ -19,7 +19,8 @@
  */
 
 import type { IDisposable, ILink, Terminal } from '@xterm/xterm';
-import { looksLikePath, resolvePath } from '@/lib/paths/file-paths';
+import { fsExists } from '@/lib/tauri-cmd';
+import { hasBalancedParens, looksLikePath, resolvePathCandidates } from '@/lib/paths/file-paths';
 import { usePaneStore } from '@/lib/panes/pane-store';
 
 export interface PathSpan {
@@ -33,19 +34,27 @@ export interface PathSpan {
 }
 
 /** Find path-shaped tokens in one rendered line, with their cell columns.
- *  Exported for unit testing. */
+ *  Exported for unit testing. Includes wall-clock cutoff and balanced paren handling (T-17). */
 export function scanLineForPaths(line: string): PathSpan[] {
+	if (!line) return [];
 	const out: PathSpan[] = [];
+	// Cap line length to 2048 to prevent pathological regex stalls
+	const safeLine = line.length > 2048 ? line.slice(0, 2048) : line;
+	const deadline = performance.now() + 5; // 5ms maximum budget per line
+
 	const re = /\S+/g;
 	let m: RegExpExecArray | null;
 	// biome-ignore lint/suspicious/noAssignInExpressions: standard exec loop
-	while ((m = re.exec(line)) !== null) {
+	while ((m = re.exec(safeLine)) !== null) {
+		if (performance.now() > deadline) break;
+
 		let tok = m[0];
 		let start = m.index; // 0-based offset of first char
 
 		// Strip surrounding wrappers/punctuation a path is often embedded in:
 		// `(…)`, `[…]`, `<…>`, quotes, and trailing sentence punctuation.
 		while (tok.length > 0 && /^[([<'"`]/.test(tok)) {
+			// If token has balanced parens (e.g. `(file.txt)`), stripping `(` requires stripping `)` later
 			tok = tok.slice(1);
 			start++;
 		}
@@ -75,13 +84,22 @@ export function scanLineForPaths(line: string): PathSpan[] {
 			end -= cut;
 		}
 
-		// Drop trailing closers/punctuation until the token is path-shaped.
-		while (tok.length >= 3 && !looksLikePath(tok) && /[)\]>'"`.,;:]$/.test(tok)) {
-			tok = tok.slice(0, -1);
-			end--;
+		// Drop trailing closers/punctuation until the token is path-shaped,
+		// but preserve trailing ')' if parentheses are already balanced internally (e.g. `file(1).png`).
+		while (tok.length >= 2 && !looksLikePath(tok)) {
+			const last = tok[tok.length - 1];
+			if (last === ')' && hasBalancedParens(tok)) {
+				break;
+			}
+			if (/[)\]>'"`.,;:]$/.test(tok)) {
+				tok = tok.slice(0, -1);
+				end--;
+			} else {
+				break;
+			}
 		}
 
-		if (tok.length >= 3 && looksLikePath(tok)) {
+		if (tok.length >= 2 && looksLikePath(tok)) {
 			// cell columns are 1-based; char at offset `start` is column start+1,
 			// and the last char (offset end-1) is column `end`.
 			out.push({
@@ -127,13 +145,14 @@ export function registerPathLinks(
 				decorations: { pointerCursor: true, underline: true },
 				activate: () => {
 					const effectiveCwd = typeof cwd === 'function' ? cwd() : cwd;
-					const resolved = resolvePath(span.text, effectiveCwd);
-					const store = usePaneStore.getState();
-					store.addTabBackground(store.focusedId, {
-						kind: 'artifact',
-						path: resolved,
-						line: span.line,
-						col: span.col,
+					resolvePathCandidates(span.text, effectiveCwd, fsExists).then((resolved) => {
+						const store = usePaneStore.getState();
+						store.addTabBackground(store.focusedId, {
+							kind: 'artifact',
+							path: resolved,
+							line: span.line,
+							col: span.col,
+						});
 					});
 				},
 			}));

@@ -88,4 +88,16 @@ describe('scanLineForPaths', () => {
 		const spans = scanLineForPaths('explore src/terminal or ~/.claude/projects or ./dist');
 		expect(spans.map((s) => s.text)).toEqual(['src/terminal', '~/.claude/projects', './dist']);
 	});
+
+	it('preserves balanced parentheses in filenames (T-17)', () => {
+		const spans = scanLineForPaths('generated /tmp/report(1).pdf and image(final).png');
+		expect(spans.map((s) => s.text)).toEqual(['/tmp/report(1).pdf', 'image(final).png']);
+	});
+
+	it('handles long lines safely within execution budget', () => {
+		const longLine = 'see src/index.ts ' + 'x'.repeat(3000);
+		const spans = scanLineForPaths(longLine);
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
+	});
 });
