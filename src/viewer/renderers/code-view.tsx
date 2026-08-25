@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { useTheme } from '@/lib/theme';
 import { fsRead } from '@/lib/tauri-cmd';
@@ -6,6 +6,8 @@ import { detectLang } from '../lib/lang';
 
 interface CodeViewProps {
 	path: string;
+	line?: number;
+	col?: number;
 }
 
 // Shiki is heavy — load lazily on first mount and cache the highlighter
@@ -18,9 +20,10 @@ function loadShiki() {
 	return highlighterPromise;
 }
 
-export function CodeView({ path }: CodeViewProps) {
+export function CodeView({ path, line, col }: CodeViewProps) {
 	const { resolvedTheme } = useTheme();
 	const isDark = resolvedTheme === 'dark';
+	const containerRef = useRef<HTMLDivElement | null>(null);
 	const [state, setState] = useState<
 		| { kind: 'loading' }
 		| { kind: 'ready'; html: string; raw: string; lang: string }
@@ -58,6 +61,22 @@ export function CodeView({ path }: CodeViewProps) {
 		};
 	}, [path, isDark]);
 
+	useEffect(() => {
+		if (state.kind !== 'ready' || !line || !containerRef.current) return;
+		const lines = containerRef.current.querySelectorAll('.line');
+		const target = lines[line - 1] as HTMLElement | undefined;
+		if (target) {
+			target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+			target.style.backgroundColor = isDark ? 'rgba(255, 255, 0, 0.15)' : 'rgba(255, 255, 0, 0.25)';
+			target.style.borderRadius = '2px';
+			target.style.display = 'inline-block';
+			target.style.width = '100%';
+		} else {
+			const approxLineHeight = 18;
+			containerRef.current.scrollTop = Math.max(0, (line - 5) * approxLineHeight);
+		}
+	}, [state.kind, line, col, isDark]);
+
 	if (state.kind === 'loading') {
 		return (
 			<div className="flex h-full items-center justify-center text-xs text-muted-foreground">
@@ -68,10 +87,11 @@ export function CodeView({ path }: CodeViewProps) {
 	if (state.kind === 'error') {
 		// Shiki throws if the language grammar is missing. Fall back to a plain
 		// <pre> render so the user still sees the file.
-		return <FallbackPre path={path} message={state.message} />;
+		return <FallbackPre path={path} message={state.message} line={line} />;
 	}
 	return (
 		<div
+			ref={containerRef}
 			className="h-full overflow-auto bg-background px-4 py-3 text-xs leading-relaxed [&_pre]:!bg-transparent [&_pre]:m-0"
 			// shiki produces self-contained HTML with inline colors — safe to inject
 			// because the source comes from our allowlisted fs_read.
@@ -80,8 +100,9 @@ export function CodeView({ path }: CodeViewProps) {
 	);
 }
 
-function FallbackPre({ path, message }: { path: string; message: string }) {
+function FallbackPre({ path, message, line }: { path: string; message: string; line?: number }) {
 	const [text, setText] = useState<string | null>(null);
+	const preRef = useRef<HTMLPreElement | null>(null);
 	useEffect(() => {
 		let cancelled = false;
 		fsRead(path)
@@ -94,6 +115,12 @@ function FallbackPre({ path, message }: { path: string; message: string }) {
 			cancelled = true;
 		};
 	}, [path]);
+
+	useEffect(() => {
+		if (!line || !preRef.current) return;
+		const approxLineHeight = 18;
+		preRef.current.scrollTop = Math.max(0, (line - 5) * approxLineHeight);
+	}, [line, text]);
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex shrink-0 items-center gap-2 border-b border-border bg-amber-500/10 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">

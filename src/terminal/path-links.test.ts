@@ -24,10 +24,28 @@ describe('scanLineForPaths', () => {
 		expect(spans[0].text).toBe('/tmp/out.png');
 	});
 
-	it('strips a :line:col suffix', () => {
+	it('strips and extracts a :line:col suffix', () => {
 		const spans = scanLineForPaths('  at src/index.ts:42:7');
 		expect(spans).toHaveLength(1);
 		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(42);
+		expect(spans[0].col).toBe(7);
+	});
+
+	it('strips and extracts a :line suffix', () => {
+		const spans = scanLineForPaths('file src/index.ts:105');
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(105);
+		expect(spans[0].col).toBeUndefined();
+	});
+
+	it('strips and extracts a (line, col) suffix', () => {
+		const spans = scanLineForPaths('error in src/index.ts(23,4)');
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(23);
+		expect(spans[0].col).toBe(4);
 	});
 
 	it('ignores URLs and prose', () => {
@@ -64,5 +82,22 @@ describe('scanLineForPaths', () => {
 
 	it('still rejects malformed tilde/slash heads', () => {
 		expect(scanLineForPaths('check //foo.md and ~~/bar.md')).toHaveLength(0);
+	});
+
+	it('finds directory paths containing slashes without extensions', () => {
+		const spans = scanLineForPaths('explore src/terminal or ~/.claude/projects or ./dist');
+		expect(spans.map((s) => s.text)).toEqual(['src/terminal', '~/.claude/projects', './dist']);
+	});
+
+	it('preserves balanced parentheses in filenames (T-17)', () => {
+		const spans = scanLineForPaths('generated /tmp/report(1).pdf and image(final).png');
+		expect(spans.map((s) => s.text)).toEqual(['/tmp/report(1).pdf', 'image(final).png']);
+	});
+
+	it('handles long lines safely within execution budget', () => {
+		const longLine = 'see src/index.ts ' + 'x'.repeat(3000);
+		const spans = scanLineForPaths(longLine);
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
 	});
 });

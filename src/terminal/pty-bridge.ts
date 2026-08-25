@@ -36,6 +36,7 @@ export { ptyAttachArm, ptyAttachBegin, ptyKill, ptyListen, ptyResize, ptySpawn, 
 export class Pty {
 	readonly id: string;
 	readonly label: string;
+	cwd?: string;
 	exited: boolean = false;
 	exitCode: number | null = null;
 
@@ -92,9 +93,14 @@ export class Pty {
 	 */
 	private totalOffset = 0;
 
-	private constructor(id: string, label: string) {
+	private constructor(id: string, label: string, cwd?: string) {
 		this.id = id;
 		this.label = label;
+		this.cwd = cwd;
+	}
+
+	setCwd(cwd: string): void {
+		this.cwd = cwd;
 	}
 
 	/**
@@ -244,7 +250,7 @@ export class Pty {
 			rows: opts.rows,
 			cols: opts.cols,
 		});
-		const pty = new Pty(id, opts.label ?? opts.cmd.join(' '));
+		const pty = new Pty(id, opts.label ?? opts.cmd.join(' '), opts.cwd);
 		try {
 			pty.unlisten = await ptyListen(
 				id,
