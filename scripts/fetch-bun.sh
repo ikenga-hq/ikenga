@@ -33,10 +33,11 @@ expected_sha_for() {
     darwin-x64)      echo "1d0211b8f1dc991182344687ad15e72ee86f154845a5f7fa477994cd341dd9b0" ;;
     darwin-aarch64)  echo "c669e97f6164e1c96e0701748db98dfa77492908cbd8394c7557134a735de381" ;;
     windows-x64)     echo "e6f093d39da486b20262ca8cdd5ed6a9e8bc9c2f275b78e6d3a0c5b28cc95901" ;;
+    windows-aarch64) echo "f473bfe2df73ee770548c93dd5d380aea7120c218ec2aa1afdd0bbba7bf18c47" ;;
     *) return 1 ;;
   esac
 }
-KNOWN_TARGETS="linux-x64 linux-aarch64 darwin-x64 darwin-aarch64 windows-x64"
+KNOWN_TARGETS="linux-x64 linux-aarch64 darwin-x64 darwin-aarch64 windows-x64 windows-aarch64"
 
 # ─── Args ───────────────────────────────────────────────────────────────────
 TARGET=""

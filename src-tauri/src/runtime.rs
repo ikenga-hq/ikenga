@@ -48,6 +48,8 @@ const BUN_TARGET: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64"
     "darwin-aarch64"
 } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
     "windows-x64"
+} else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+    "windows-aarch64"
 } else {
     "unsupported"
 };
@@ -78,6 +80,7 @@ pub fn bun_zip_sha256(target: &str) -> Option<&'static str> {
         "darwin-x64" => Some("1d0211b8f1dc991182344687ad15e72ee86f154845a5f7fa477994cd341dd9b0"),
         "darwin-aarch64" => Some("c669e97f6164e1c96e0701748db98dfa77492908cbd8394c7557134a735de381"),
         "windows-x64" => Some("e6f093d39da486b20262ca8cdd5ed6a9e8bc9c2f275b78e6d3a0c5b28cc95901"),
+        "windows-aarch64" => Some("f473bfe2df73ee770548c93dd5d380aea7120c218ec2aa1afdd0bbba7bf18c47"),
         _ => None,
     }
 }
@@ -758,6 +761,7 @@ mod tests {
             "darwin-x64",
             "darwin-aarch64",
             "windows-x64",
+            "windows-aarch64",
         ] {
             let arm = script
                 .lines()
