@@ -55,7 +55,7 @@ describe('trust-review tauri-cmd wrappers', () => {
 		];
 		invokeMock.mockResolvedValueOnce(sample);
 		const out = await pkgTrustListPending();
-		expect(invokeMock).toHaveBeenCalledWith('pkg_trust_list_pending', undefined);
+		expect(invokeMock).toHaveBeenCalledWith('pkg_trust_list_pending');
 		expect(out).toEqual(sample);
 	});
 
