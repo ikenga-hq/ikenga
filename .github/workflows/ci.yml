@@ -1,0 +1,106 @@
+name: CI
+
+# Fast per-PR gate: typecheck + unit tests. Deliberately does NOT build the
+# Tauri bundle — that lives in release.yml and needs Rust, the platform SDKs
+# and ~20 min of runner time. This job exists to catch the class of failure
+# that previously reached main unnoticed: a branch that doesn't compile, or
+# tests that were already red before a PR was opened.
+#
+# Workspace layout mirrors release.yml — shell's `workspace:*` deps
+# (@ikenga/contract, @ikenga/tokens) only resolve when the sibling repos are
+# checked out alongside and a pnpm workspace is synthesized at the root.
+# ikenga-pkgs is NOT needed here: it supplies the engine-cc dist and the
+# mcp-iyke source, both of which are Tauri bundle resources rather than
+# TypeScript imports.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR makes the in-flight run obsolete — cancel it rather than
+# paying for both. `github.ref` is unique per PR, so pushes to different PRs
+# never cancel each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+        with:
+          path: shell
+
+      - name: Checkout @ikenga/contract
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-contract
+          path: contract
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Checkout @ikenga/tokens
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-tokens
+          path: tokens
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      # Same synthesis as release.yml. There is no committed lockfile for this
+      # outer workspace, which is why the install below is --no-frozen-lockfile.
+      - name: Synthesize workspace
+        shell: bash
+        run: |
+          cat > pnpm-workspace.yaml <<'EOF'
+          packages:
+            - shell
+            - contract
+            - tokens
+          EOF
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Set up Node (for pnpm)
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: pnpm install (workspace root)
+        shell: bash
+        run: pnpm install --no-frozen-lockfile
+
+      # contract and tokens gitignore their dist/, and their package mains
+      # point at ./dist — without this step tsc can't resolve @ikenga/* types.
+      - name: Build workspace siblings (contract, tokens)
+        shell: bash
+        run: |
+          for pkg in '@ikenga/contract' '@ikenga/tokens'; do
+            echo "==> pnpm -F $pkg build"
+            pnpm -F "$pkg" build
+          done
+
+      - name: Typecheck
+        shell: bash
+        working-directory: shell
+        run: bun run typecheck
+
+      # Runs after typecheck so a compile break reports as a compile break
+      # rather than as a wall of downstream test failures.
+      - name: Unit tests
+        shell: bash
+        working-directory: shell
+        run: bun run test
