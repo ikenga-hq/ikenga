@@ -24,10 +24,28 @@ describe('scanLineForPaths', () => {
 		expect(spans[0].text).toBe('/tmp/out.png');
 	});
 
-	it('strips a :line:col suffix', () => {
+	it('strips and extracts a :line:col suffix', () => {
 		const spans = scanLineForPaths('  at src/index.ts:42:7');
 		expect(spans).toHaveLength(1);
 		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(42);
+		expect(spans[0].col).toBe(7);
+	});
+
+	it('strips and extracts a :line suffix', () => {
+		const spans = scanLineForPaths('file src/index.ts:105');
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(105);
+		expect(spans[0].col).toBeUndefined();
+	});
+
+	it('strips and extracts a (line, col) suffix', () => {
+		const spans = scanLineForPaths('error in src/index.ts(23,4)');
+		expect(spans).toHaveLength(1);
+		expect(spans[0].text).toBe('src/index.ts');
+		expect(spans[0].line).toBe(23);
+		expect(spans[0].col).toBe(4);
 	});
 
 	it('ignores URLs and prose', () => {

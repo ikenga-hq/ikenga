@@ -21,6 +21,7 @@ pub mod discovery;
 pub mod event;
 pub mod jsonl_reader;
 pub mod session;
+pub mod session_browser;
 pub mod stream_parser;
 
 use std::path::{Path, PathBuf};

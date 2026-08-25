@@ -22,7 +22,8 @@ pub struct CliArgs {
     #[arg(long, default_value = "./dist", env = "IKENGA_STATIC_DIR")]
     pub static_dir: PathBuf,
 
-    /// Directory containing mini-app packages (/pkgs/:id)
+    /// Directory containing mini-app packages. Reserved — no route serves
+    /// pkgs yet, so setting this currently has no effect.
     #[arg(long, env = "IKENGA_PKGS_DIR")]
     pub pkgs_dir: Option<PathBuf>,
 
@@ -30,9 +31,17 @@ pub struct CliArgs {
     #[arg(long, env = "IKENGA_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// Optional bearer token for authenticating remote access
+    /// Bearer token required on every API and WebSocket route. One is
+    /// generated and printed at startup if you don't supply it — the server
+    /// never runs unauthenticated.
     #[arg(long, env = "IKENGA_AUTH_TOKEN")]
     pub auth_token: Option<String>,
+
+    /// Extra origin permitted to call the API cross-site, e.g.
+    /// `http://localhost:5173` for a Vite dev server. Repeatable. Same-origin
+    /// requests never need this.
+    #[arg(long = "allow-origin", env = "IKENGA_ALLOW_ORIGINS", value_delimiter = ',')]
+    pub allowed_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -54,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         pkgs_dir: args.pkgs_dir,
         data_dir: args.data_dir,
         auth_token: args.auth_token,
+        allowed_origins: args.allowed_origins,
     };
 
     run_server(config).await

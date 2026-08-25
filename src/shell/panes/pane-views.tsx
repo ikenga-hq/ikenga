@@ -18,7 +18,7 @@ export function PaneBody({ paneId, view }: PaneBodyProps) {
 		case 'terminal':
 			return <TerminalView sessionId={view.sessionId} />;
 		case 'artifact':
-			return <ArtifactView path={view.path} paneId={paneId} />;
+			return <ArtifactView path={view.path} paneId={paneId} line={view.line} col={view.col} />;
 		case 'artifact-studio':
 			return (
 				<ArtifactStudioView

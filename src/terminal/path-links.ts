@@ -22,12 +22,14 @@ import type { IDisposable, ILink, Terminal } from '@xterm/xterm';
 import { looksLikePath, resolvePath } from '@/lib/paths/file-paths';
 import { usePaneStore } from '@/lib/panes/pane-store';
 
-interface PathSpan {
+export interface PathSpan {
 	/** 1-based start column (inclusive). */
 	startX: number;
 	/** 1-based end column (inclusive). */
 	endX: number;
 	text: string;
+	line?: number;
+	col?: number;
 }
 
 /** Find path-shaped tokens in one rendered line, with their cell columns.
@@ -49,11 +51,26 @@ export function scanLineForPaths(line: string): PathSpan[] {
 		}
 		let end = start + tok.length; // 0-based, exclusive
 
-		// Trim a trailing `:line` / `:line:col` suffix (grep -n, stack traces)
+		let lineNum: number | undefined;
+		let colNum: number | undefined;
+
+		// 1. Trim paren line/col suffix e.g. `foo.ts(42,7)` or `foo.ts(42)`
+		const parenMatch = tok.match(/\((\d+)(?:,\s*(\d+))?\)$/);
+		if (parenMatch && looksLikePath(tok.slice(0, tok.length - parenMatch[0].length))) {
+			const cut = parenMatch[0].length;
+			lineNum = parseInt(parenMatch[1], 10);
+			if (parenMatch[2]) colNum = parseInt(parenMatch[2], 10);
+			tok = tok.slice(0, tok.length - cut);
+			end -= cut;
+		}
+
+		// 2. Trim a trailing `:line` / `:line:col` suffix (grep -n, stack traces)
 		// if doing so leaves a real path.
-		const colon = tok.match(/:\d+(?::\d+)?$/);
+		const colon = tok.match(/:(\d+)(?::(\d+))?$/);
 		if (colon && looksLikePath(tok.slice(0, tok.length - colon[0].length))) {
 			const cut = colon[0].length;
+			lineNum = parseInt(colon[1], 10);
+			if (colon[2]) colNum = parseInt(colon[2], 10);
 			tok = tok.slice(0, tok.length - cut);
 			end -= cut;
 		}
@@ -67,7 +84,13 @@ export function scanLineForPaths(line: string): PathSpan[] {
 		if (tok.length >= 3 && looksLikePath(tok)) {
 			// cell columns are 1-based; char at offset `start` is column start+1,
 			// and the last char (offset end-1) is column `end`.
-			out.push({ startX: start + 1, endX: end, text: tok });
+			out.push({
+				startX: start + 1,
+				endX: end,
+				text: tok,
+				line: lineNum,
+				col: colNum,
+			});
 		}
 	}
 	return out;
@@ -76,9 +99,12 @@ export function scanLineForPaths(line: string): PathSpan[] {
 /**
  * Register the file-path link provider on a terminal. Returns a disposable;
  * call it from the host's cleanup. `cwd` resolves relative paths (absolute /
- * `~` paths ignore it).
+ * `~` paths ignore it). Can be a static string or a dynamic getter function.
  */
-export function registerPathLinks(term: Terminal, cwd?: string): IDisposable {
+export function registerPathLinks(
+	term: Terminal,
+	cwd?: string | (() => string | undefined)
+): IDisposable {
 	return term.registerLinkProvider({
 		provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
 			const line = term.buffer.active.getLine(bufferLineNumber - 1);
@@ -100,9 +126,15 @@ export function registerPathLinks(term: Terminal, cwd?: string): IDisposable {
 				},
 				decorations: { pointerCursor: true, underline: true },
 				activate: () => {
-					const resolved = resolvePath(span.text, cwd);
+					const effectiveCwd = typeof cwd === 'function' ? cwd() : cwd;
+					const resolved = resolvePath(span.text, effectiveCwd);
 					const store = usePaneStore.getState();
-					store.addTabBackground(store.focusedId, { kind: 'artifact', path: resolved });
+					store.addTabBackground(store.focusedId, {
+						kind: 'artifact',
+						path: resolved,
+						line: span.line,
+						col: span.col,
+					});
 				},
 			}));
 			callback(links);

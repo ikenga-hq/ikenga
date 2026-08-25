@@ -33,10 +33,10 @@ interface Props {
 	/** Called once a PTY has been created in spawn-mode. */
 	onPtyId?: (id: string) => void;
 	/**
-	 * Force the canvas/DOM renderer instead of WebGL. Detached windows
+	 * Force the DOM renderer instead of WebGL. Detached windows
 	 * (plans/multi-window WP-08) set this: WebGL "loads" in a secondary
 	 * WebKitGTK webview but renders no glyphs (only the cursor) without ever
-	 * firing onContextLoss, so the auto-fallback never triggers. Canvas works.
+	 * firing onContextLoss, so the auto-fallback never triggers. DOM renderer works.
 	 */
 	disableWebgl?: boolean;
 	/**
@@ -69,6 +69,8 @@ interface Props {
 	 * `scheduleAttachNudge` below for the two-step wobble that forces it.
 	 */
 	nudgeOnAttach?: boolean;
+	/** Configurable scrollback lines (defaults to 10,000). */
+	scrollback?: number;
 }
 
 const DARK_THEME: ITheme = {
@@ -165,9 +167,31 @@ function readThemeFromCssVars(dark: boolean): ITheme {
 // every mount since they close over this render's `setState`/refs.
 // ---------------------------------------------------------------------------
 
+interface SearchOptions {
+	regex?: boolean;
+	wholeWord?: boolean;
+	caseSensitive?: boolean;
+	incremental?: boolean;
+	decorations?: {
+		matchBackground?: string;
+		matchBorder?: string;
+		matchOverviewRuler: string;
+		activeMatchBackground?: string;
+		activeMatchBorder?: string;
+		activeMatchColorOverviewRuler: string;
+	};
+}
+
+interface SearchResultChangeEvent {
+	resultIndex: number;
+	resultCount: number;
+}
+
 interface SearchAddonLike {
-	findNext: (s: string) => boolean;
-	findPrevious: (s: string) => boolean;
+	findNext: (s: string, options?: SearchOptions) => boolean;
+	findPrevious: (s: string, options?: SearchOptions) => boolean;
+	onDidChangeResults?: (listener: (results: SearchResultChangeEvent) => void) => { dispose: () => void };
+	clearDecorations?: () => void;
 	dispose: () => void;
 }
 
@@ -318,7 +342,7 @@ function wirePtyToTerm(
 	} catch {
 		/* ignore */
 	}
-	status(`pty ${pty.id.slice(0, 8)} ${pty.label} (${webglUsed ? 'webgl' : 'canvas'})`);
+	status(`pty ${pty.id.slice(0, 8)} ${pty.label} (${webglUsed ? 'webgl' : 'dom'})`);
 	return { detachData, detachExit, onDataDispose, onResizeDispose };
 }
 
@@ -339,11 +363,16 @@ export function XTermHost({
 	sessionId,
 	focused,
 	nudgeOnAttach,
+	scrollback,
 }: Props) {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const wrapperRef = useRef<HTMLDivElement | null>(null);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const [searchTerm, setSearchTerm] = useState('');
+	const [caseSensitive, setCaseSensitive] = useState(false);
+	const [wholeWord, setWholeWord] = useState(false);
+	const [useRegex, setUseRegex] = useState(false);
+	const [searchResult, setSearchResult] = useState<SearchResultChangeEvent | null>(null);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
 
 	// Stash callbacks in refs so the spawn effect doesn't re-fire on each render.
@@ -545,7 +574,7 @@ export function XTermHost({
 				lineHeight: 1.2,
 				cursorBlink: true,
 				cursorStyle: 'block',
-				scrollback: 10_000,
+				scrollback: scrollback ?? 10_000,
 				allowProposedApi: true,
 				theme: readThemeFromCssVars(dark),
 				macOptionIsMeta: true,
@@ -563,9 +592,9 @@ export function XTermHost({
 
 			// File-path links (WebLinksAddon only handles URLs). Clicking a
 			// path-shaped token opens it in the artifact viewer. Relative paths
-			// resolve against the spawn cwd; absolute / ~ paths ignore it
+			// resolve against the live PTY / foreground cwd; absolute / ~ paths ignore it
 			// (works in attach-mode too, where no cwd is known).
-			const pathLinks = registerPathLinks(term, spec?.cwd);
+			const pathLinks = registerPathLinks(term, () => livePtyRef.current?.cwd ?? spec?.cwd);
 			pathLinksDisposeFn = () => pathLinks.dispose();
 
 			// Search addon — lazy import to keep initial bundle slim.
@@ -575,13 +604,28 @@ export function XTermHost({
 					if (cancelled) return;
 					const search = new mod.SearchAddon();
 					term.loadAddon(search);
+					let resultsDispose: (() => void) | null = null;
+					if (search.onDidChangeResults) {
+						const sub = search.onDidChangeResults((e: SearchResultChangeEvent) => {
+							setSearchResult(e);
+						});
+						resultsDispose = () => sub.dispose();
+					}
 					const searchLike: SearchAddonLike = {
-						findNext: (s) => search.findNext(s),
-						findPrevious: (s) => search.findPrevious(s),
-						dispose: () => search.dispose(),
+						findNext: (s, opts) => search.findNext(s, opts),
+						findPrevious: (s, opts) => search.findPrevious(s, opts),
+						onDidChangeResults: search.onDidChangeResults ? (l) => search.onDidChangeResults(l) : undefined,
+						clearDecorations: () => search.clearDecorations(),
+						dispose: () => {
+							resultsDispose?.();
+							search.dispose();
+						},
 					};
 					searchAddonRef.current = searchLike;
-					disposeSearch = () => search.dispose();
+					disposeSearch = () => {
+						resultsDispose?.();
+						search.dispose();
+					};
 					const entry = cacheable ? xtermCache.get(sessionId as string) : undefined;
 					if (entry) entry.searchAddon = searchLike;
 				} catch (err) {
@@ -604,22 +648,22 @@ export function XTermHost({
 			term.open(container);
 
 			if (disableWebgl) {
-				status('canvas renderer (webgl disabled)');
+				status('dom renderer (webgl disabled)');
 			} else {
 				try {
 					webglAddon = new WebglAddon();
 					webglAddon.onContextLoss(() => {
 						webglAddon?.dispose();
 						webglAddon = null;
-						status('webgl context lost — fell back to canvas');
+						status('webgl context lost — fell back to dom renderer');
 						const entry = cacheable ? xtermCache.get(sessionId as string) : undefined;
 						if (entry) entry.webglAddon = null;
 					});
 					term.loadAddon(webglAddon);
 					webglUsed = true;
 				} catch (err) {
-					console.warn('[xterm] webgl addon failed, using canvas fallback', err);
-					status('webgl unavailable — canvas renderer');
+					console.warn('[xterm] webgl addon failed, using dom fallback', err);
+					status('webgl unavailable — dom renderer');
 				}
 			}
 
@@ -922,11 +966,33 @@ export function XTermHost({
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [spec, pty, sessionId]);
 
-	function runSearch(direction: 'next' | 'prev') {
+	const getSearchOptions = (optOverrides?: { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean }): SearchOptions => ({
+		caseSensitive: optOverrides?.caseSensitive ?? caseSensitive,
+		wholeWord: optOverrides?.wholeWord ?? wholeWord,
+		regex: optOverrides?.regex ?? useRegex,
+		incremental: true,
+		decorations: {
+			matchBackground: isDarkMode() ? '#515c6a' : '#fed7aa',
+			matchOverviewRuler: '#f59e0b',
+			activeMatchBackground: isDarkMode() ? '#3b82f6' : '#60a5fa',
+			activeMatchColorOverviewRuler: '#2563eb',
+		},
+	});
+
+	function runSearch(
+		direction: 'next' | 'prev',
+		termOverride?: string,
+		optOverrides?: { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean }
+	) {
 		const addon = searchAddonRef.current;
-		if (!addon || !searchTerm) return;
-		if (direction === 'next') addon.findNext(searchTerm);
-		else addon.findPrevious(searchTerm);
+		const term = termOverride ?? searchTerm;
+		if (!addon || !term) {
+			setSearchResult(null);
+			return;
+		}
+		const opts = getSearchOptions(optOverrides);
+		if (direction === 'next') addon.findNext(term, opts);
+		else addon.findPrevious(term, opts);
 	}
 
 	// Drop a file onto the terminal → insert its shell-quoted path (trailing
@@ -992,12 +1058,18 @@ export function XTermHost({
 					<input
 						ref={searchInputRef}
 						value={searchTerm}
-						onChange={(e) => setSearchTerm(e.target.value)}
+						onChange={(e) => {
+							const val = e.target.value;
+							setSearchTerm(val);
+							if (val) runSearch('next', val);
+							else setSearchResult(null);
+						}}
 						onKeyDown={(e) => {
 							if (e.key === 'Enter') {
 								runSearch(e.shiftKey ? 'prev' : 'next');
 							} else if (e.key === 'Escape') {
 								setSearchOpen(false);
+								searchAddonRef.current?.clearDecorations?.();
 								termRef.current?.focus();
 							}
 						}}
@@ -1013,26 +1085,103 @@ export function XTermHost({
 							outline: 'none',
 						}}
 					/>
+					{searchTerm && searchResult && (
+						<span style={{ fontSize: 10, opacity: 0.7, padding: '0 4px', whiteSpace: 'nowrap' }}>
+							{searchResult.resultCount === 0
+								? 'No results'
+								: `${searchResult.resultIndex >= 0 ? searchResult.resultIndex + 1 : '?'} of ${searchResult.resultCount}`}
+						</span>
+					)}
 					<button
+						type="button"
+						onClick={() => {
+							const next = !caseSensitive;
+							setCaseSensitive(next);
+							if (searchTerm) runSearch('next', searchTerm, { caseSensitive: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: caseSensitive ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: caseSensitive ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Match Case (Aa)"
+					>
+						Aa
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							const next = !wholeWord;
+							setWholeWord(next);
+							if (searchTerm) runSearch('next', searchTerm, { wholeWord: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: wholeWord ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: wholeWord ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Match Whole Word (\b)"
+					>
+						\b
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							const next = !useRegex;
+							setUseRegex(next);
+							if (searchTerm) runSearch('next', searchTerm, { regex: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: useRegex ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: useRegex ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Use Regular Expression (.*)"
+					>
+						.*
+					</button>
+					<button
+						type="button"
 						onClick={() => runSearch('prev')}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Previous (Shift+Enter)"
 					>
 						↑
 					</button>
 					<button
+						type="button"
 						onClick={() => runSearch('next')}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Next (Enter)"
 					>
 						↓
 					</button>
 					<button
+						type="button"
 						onClick={() => {
 							setSearchOpen(false);
+							searchAddonRef.current?.clearDecorations?.();
 							termRef.current?.focus();
 						}}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Close (Esc)"
 					>
 						×

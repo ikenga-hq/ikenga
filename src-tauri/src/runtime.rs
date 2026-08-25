@@ -714,15 +714,18 @@ mod tests {
     fn version_ge_compares_semver_tuples() {
         // Pin is 1.4.0; accept equal-or-newer, reject older + unparsable.
         assert!(version_ge("1.4.0", "1.4.0")); // equal → accept
-        assert!(version_ge("1.4.1", "1.4.0")); // newer patch
         assert!(version_ge("1.5.0", "1.4.0")); // newer minor
         assert!(version_ge("2.0.0", "1.4.0")); // newer major
+        assert!(version_ge("1.4.1", "1.4.0")); // newer patch
         assert!(!version_ge("1.3.14", "1.4.0")); // older minor
-        assert!(!version_ge("1.3.99", "1.4.0")); // older minor
+        assert!(!version_ge("1.2.99", "1.4.0")); // older minor
         assert!(!version_ge("garbage", "1.4.0")); // unparsable → reject
+        // Pin 1.4.0 has no older patch of its own minor, so cover the
+        // older-patch branch against a synthetic base.
+        assert!(!version_ge("1.4.0", "1.4.1")); // older patch
         // Tolerate a leading `v` and pre-release suffix on the found string.
         assert!(version_ge("v1.4.0", "1.4.0"));
-        assert!(version_ge("1.4.1-canary.1", "1.4.0"));
+        assert!(version_ge("1.5.0-canary.1", "1.4.0"));
     }
 
     /// Drift guard: the Rust pin SoT (`BUN_VERSION` + `bun_zip_sha256`) must

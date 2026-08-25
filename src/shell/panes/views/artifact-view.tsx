@@ -14,12 +14,14 @@ interface ArtifactViewProps {
 	path: string;
 	/** Forwarded to HtmlFrame for iyke iframe bridging. */
 	paneId?: string;
+	line?: number;
+	col?: number;
 }
 
 // Thin pane-registry shim. Routing + chrome live in src/viewer/auto-router —
 // this module exists so the pane store's `kind: 'artifact'` view continues to
 // resolve to a stable export.
-export function ArtifactView({ path, paneId }: ArtifactViewProps) {
+export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	// Pop-out: spawn a thin single-surface viewer window for this file.
 	// The path is encoded in the surface_set entry ("viewer:<path>") so the
 	// detached ViewerSurface can extract it from ctx.surfaces[0].
@@ -65,7 +67,7 @@ export function ArtifactView({ path, paneId }: ArtifactViewProps) {
 					<ArrowUpRight className="h-3.5 w-3.5" />
 				</IconButton>
 			</div>
-			<ViewerRouter path={path} source="pane" paneId={paneId} editable />
+			<ViewerRouter path={path} source="pane" paneId={paneId} line={line} col={col} editable />
 		</div>
 	);
 }

@@ -13,7 +13,9 @@ pub mod platform;
 pub mod pty;
 mod runtime;
 pub mod server;
-mod terminal;
+pub mod settings_cascade;
+pub mod terminal;
+pub mod transcript;
 pub mod vault_key;
 
 
@@ -889,6 +891,8 @@ pub fn run() {
             claude_config_watch,
             claude_config_unwatch,
             claude_config_read_file,
+            settings_cascade::claude_config_resolve_cascade,
+            claude::session_browser::claude_session_list,
             // claude config — Phase 4 (4-tier discovery + pin CRUD)
             claude_assets_discover,
             claude_asset_pin,

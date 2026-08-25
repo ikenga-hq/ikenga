@@ -5,7 +5,7 @@
 // a placeholder pointing at the owning Studio (D4). `SingleTerminal` stays
 // ownership-agnostic so Studio can mount it directly without the gate.
 
-import { ArrowUpRight, ExternalLink, Undo2 } from 'lucide-react';
+import { Activity, ArrowUpRight, ExternalLink, GitBranch, History, ShieldAlert, Undo2 } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
@@ -20,8 +20,13 @@ import {
 	syncDetachedSurfaces,
 	useIsSurfaceDetached,
 } from '@/lib/window/detached-surfaces';
+import { CostHud } from '@/terminal/cost-hud';
+import { GitLedger } from '@/terminal/git-ledger';
+import { PermissionInbox } from '@/terminal/permission-inbox';
 import { type TerminalTab, useTerminalStore } from '@/terminal/session-store';
 import { SingleTerminal } from '@/terminal/single-terminal';
+import { ToolCallFeed } from '@/terminal/tool-call-feed';
+import { TranscriptReplay } from '@/terminal/transcript-replay';
 import { DetachedSurfacePlaceholder } from './detached-placeholder';
 
 interface TerminalViewProps {
@@ -130,26 +135,86 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 		);
 	}
 
+	const [sidePaneMode, setSidePaneMode] = useState<'none' | 'replay' | 'feed' | 'ledger' | 'permissions'>('none');
+
 	// Popped out into its own window — render the reclaim placeholder, not the
 	// live duplicate (both windows would otherwise drive the same core PTY).
 	if (isDetached && surfaceId) {
 		return <DetachedSurfacePlaceholder surfaceId={surfaceId} noun="terminal" />;
 	}
 
+	const togglePane = (mode: 'replay' | 'feed' | 'ledger' | 'permissions') => {
+		setSidePaneMode((prev) => (prev === mode ? 'none' : mode));
+	};
+
 	return (
-		<div className="relative h-full w-full">
-			{ptyId && (
-				<div className="absolute right-1.5 top-1.5 z-50">
+		<div className="relative flex h-full w-full flex-col overflow-hidden">
+			{/* WP-03: Cost & Context Telemetry HUD */}
+			<CostHud />
+
+			<div className="relative flex-1 flex h-full w-full overflow-hidden">
+				<div className="absolute right-1.5 top-1.5 z-50 flex items-center gap-1">
 					<IconButton
-						onClick={handlePopOut}
-						title="Pop out — open this terminal in a detached window"
-						aria-label="Pop out terminal"
+						onClick={() => togglePane('replay')}
+						title={sidePaneMode === 'replay' ? 'Hide Replay' : 'Show Transcript Replay (WP-05)'}
+						aria-label="Toggle Replay"
+						className={sidePaneMode === 'replay' ? 'bg-purple-950/80 text-purple-300 border border-purple-700/50' : ''}
 					>
-						<ArrowUpRight className="h-3.5 w-3.5" />
+						<History className="h-3.5 w-3.5" />
 					</IconButton>
+
+					<IconButton
+						onClick={() => togglePane('feed')}
+						title={sidePaneMode === 'feed' ? 'Hide Feed' : 'Show Live Tool-Call Feed (WP-08)'}
+						aria-label="Toggle Tool Feed"
+						className={sidePaneMode === 'feed' ? 'bg-sky-950/80 text-sky-300 border border-sky-700/50' : ''}
+					>
+						<Activity className="h-3.5 w-3.5" />
+					</IconButton>
+
+					<IconButton
+						onClick={() => togglePane('ledger')}
+						title={sidePaneMode === 'ledger' ? 'Hide Git Ledger' : 'Show Git Change Ledger (WP-09)'}
+						aria-label="Toggle Git Ledger"
+						className={sidePaneMode === 'ledger' ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/50' : ''}
+					>
+						<GitBranch className="h-3.5 w-3.5" />
+					</IconButton>
+
+					<IconButton
+						onClick={() => togglePane('permissions')}
+						title={sidePaneMode === 'permissions' ? 'Hide Permissions' : 'Show Permission Inbox (WP-10)'}
+						aria-label="Toggle Permissions"
+						className={sidePaneMode === 'permissions' ? 'bg-amber-950/80 text-amber-300 border border-amber-700/50' : ''}
+					>
+						<ShieldAlert className="h-3.5 w-3.5" />
+					</IconButton>
+
+					{ptyId && (
+						<IconButton
+							onClick={handlePopOut}
+							title="Pop out — open this terminal in a detached window"
+							aria-label="Pop out terminal"
+						>
+							<ArrowUpRight className="h-3.5 w-3.5" />
+						</IconButton>
+					)}
 				</div>
-			)}
-			<SingleTerminal sessionId={sessionId} isFocused={isFocused} nudgeOnAttach={nudgeOnAttach} />
+
+				<div className="flex-1 h-full relative">
+					<SingleTerminal sessionId={sessionId} isFocused={isFocused} nudgeOnAttach={nudgeOnAttach} />
+				</div>
+
+				{/* Telemetry & Control Side Panes */}
+				{sidePaneMode !== 'none' && (
+					<div className="w-1/2 h-full border-l border-border/50 bg-zinc-950">
+						{sidePaneMode === 'replay' && <TranscriptReplay sessionId={sessionId} />}
+						{sidePaneMode === 'feed' && <ToolCallFeed sessionId={sessionId} />}
+						{sidePaneMode === 'ledger' && <GitLedger sessionId={sessionId} />}
+						{sidePaneMode === 'permissions' && <PermissionInbox sessionId={sessionId} />}
+					</div>
+				)}
+			</div>
 		</div>
 	);
 }
