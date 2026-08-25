@@ -8,6 +8,11 @@ import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-dro
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { resolvePath } from '@/lib/paths/file-paths';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
+import {
+	evaluateTerminalKey,
+	getDefaultKeybindings,
+	type TerminalKeybindings,
+} from './keybindings';
 import { registerPathLinks } from './path-links';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
 import { readCaptureWithOffset } from './pty-output-buffer';
@@ -73,6 +78,8 @@ interface Props {
 	nudgeOnAttach?: boolean;
 	/** Configurable scrollback lines (defaults to 10,000). */
 	scrollback?: number;
+	/** Custom terminal keybinding overrides (T-11). */
+	keybindings?: Partial<TerminalKeybindings>;
 }
 
 const DARK_THEME: ITheme = {
@@ -366,6 +373,7 @@ export function XTermHost({
 	focused,
 	nudgeOnAttach,
 	scrollback,
+	keybindings,
 }: Props) {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -382,10 +390,12 @@ export function XTermHost({
 	const onExitRef = useRef(onExit);
 	const onPtyIdRef = useRef(onPtyId);
 	const focusedRef = useRef(focused);
+	const keybindingsRef = useRef(keybindings);
 	onStatusRef.current = onStatus;
 	onExitRef.current = onExit;
 	onPtyIdRef.current = onPtyId;
 	focusedRef.current = focused;
+	keybindingsRef.current = keybindings;
 	const status = (s: string) => onStatusRef.current?.(s);
 	const exit = (code: number | null) => onExitRef.current?.(code);
 
@@ -778,20 +788,20 @@ export function XTermHost({
 			if (e.type !== 'keydown') return true;
 			const mac = isMac();
 			const meta = mac ? e.metaKey : e.ctrlKey;
-			const key = e.key.toLowerCase();
 
-			// Mac: Cmd+C — copy if there's a selection, else fall through to PTY (SIGINT).
-			if (mac && e.metaKey && !e.shiftKey && !e.altKey && key === 'c') {
+			const action = evaluateTerminalKey(e, mac, keybindingsRef.current);
+			if (action === 'copy') {
 				const sel = term.getSelection();
 				if (sel) {
 					navigator.clipboard.writeText(sel).catch(() => {});
 					return false;
 				}
-				return true; // no selection: let the keystroke through (Cmd+C → ETX)
+				// On Mac with Cmd+C, if no selection, fall through to PTY (SIGINT).
+				if (mac) return true;
+				return false;
 			}
 
-			// Mac: Cmd+V — paste.
-			if (mac && e.metaKey && !e.shiftKey && !e.altKey && key === 'v') {
+			if (action === 'paste') {
 				navigator.clipboard
 					.readText()
 					.then((t) => term.paste(t))
@@ -799,32 +809,19 @@ export function XTermHost({
 				return false;
 			}
 
-			// Linux/Windows: Ctrl+Shift+C — copy.
-			if (!mac && e.ctrlKey && e.shiftKey && key === 'c') {
-				const sel = term.getSelection();
-				if (sel) {
-					navigator.clipboard.writeText(sel).catch(() => {});
-				}
-				return false;
-			}
-
-			// Linux/Windows: Ctrl+Shift+V — paste.
-			if (!mac && e.ctrlKey && e.shiftKey && key === 'v') {
-				navigator.clipboard
-					.readText()
-					.then((t) => term.paste(t))
-					.catch(() => {});
-				return false;
-			}
-
-			// Cmd+F (mac) or Ctrl+Shift+F (linux) — open search.
-			if (
-				(mac && e.metaKey && key === 'f' && !e.shiftKey && !e.altKey) ||
-				(!mac && e.ctrlKey && e.shiftKey && key === 'f')
-			) {
+			if (action === 'find') {
 				setSearchOpen(true);
-				// Defer focus to next tick — input mounts after this returns.
 				setTimeout(() => searchInputRef.current?.focus(), 0);
+				return false;
+			}
+
+			if (action === 'clear') {
+				term.clear();
+				return false;
+			}
+
+			if (action === 'selectAll') {
+				term.selectAll();
 				return false;
 			}
 
@@ -1093,6 +1090,11 @@ export function XTermHost({
 		setContextMenu({ x: e.clientX, y: e.clientY });
 	};
 
+	const effectiveKeybindings = {
+		...getDefaultKeybindings(isMac()),
+		...keybindings,
+	};
+
 	if (!spec && !pty) {
 		return <div className="empty">No PTY. Spawn one above.</div>;
 	}
@@ -1155,7 +1157,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Copy</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘C' : 'Ctrl+Shift+C'}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.copy}</span>
 					</button>
 					<button
 						type="button"
@@ -1185,7 +1187,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Paste</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘V' : 'Ctrl+Shift+V'}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.paste}</span>
 					</button>
 					<button
 						type="button"
@@ -1207,6 +1209,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Select All</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.selectAll}</span>
 					</button>
 					<div style={{ height: 1, background: 'rgba(127,127,127,0.2)', margin: '2px 0' }} />
 					<button
@@ -1229,6 +1232,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Clear Terminal</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.clear}</span>
 					</button>
 					<button
 						type="button"
@@ -1251,7 +1255,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Find…</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘F' : 'Ctrl+Shift+F'}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.find}</span>
 					</button>
 				</div>
 			)}

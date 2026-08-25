@@ -83,4 +83,9 @@ describe('scanLineForPaths', () => {
 	it('still rejects malformed tilde/slash heads', () => {
 		expect(scanLineForPaths('check //foo.md and ~~/bar.md')).toHaveLength(0);
 	});
+
+	it('finds directory paths containing slashes without extensions', () => {
+		const spans = scanLineForPaths('explore src/terminal or ~/.claude/projects or ./dist');
+		expect(spans.map((s) => s.text)).toEqual(['src/terminal', '~/.claude/projects', './dist']);
+	});
 });
