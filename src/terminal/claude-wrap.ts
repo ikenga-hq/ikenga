@@ -29,6 +29,7 @@ export interface AgentWrapOpts {
 	/** Target WSL distribution name (e.g. 'Ubuntu', 'Debian') when shellTarget === 'wsl'. */
 	wslDistro?: string | null;
 	/** Working directory for WSL launch. */
+	cwd?: string | null;
 	/** `in-process` | etc. — becomes `--teammate-mode`. (G-08) */
 	teammateMode?: string | null;
 }
