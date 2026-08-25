@@ -312,10 +312,8 @@ describe('PkgsSurface — wiring', () => {
 		// Banner appears because d.trust.length > 0.
 		const banner = screen.getByText(/pkg needs trust review/i);
 		expect(banner).toBeTruthy();
-		// Two Review buttons render: the banner's "Review →" and the row's
-		// "Review". Scope to the banner by walking up from its text node.
-		const bannerEl = banner.closest('div')!;
-		const bannerReview = bannerEl.querySelector('button')!;
+		// Two Review buttons render: the banner's "Review →" and the row's "Review".
+		const bannerReview = screen.getByRole('button', { name: /Review →/i });
 		await user.click(bannerReview);
 		expect(navigateMock).toHaveBeenCalledWith(
 			expect.objectContaining({

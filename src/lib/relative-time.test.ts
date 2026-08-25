@@ -47,7 +47,7 @@ describe('formatRelativeTime', () => {
 
 	it('renders month + day for >=14 days', () => {
 		const s = formatRelativeTime(NOW - 30 * 24 * 60 * min, NOW);
-		expect(s).toMatch(/[A-Z][a-z]{2,} \d{1,2}/);
+		expect(s).toMatch(/([A-Z][a-z]{2,} \d{1,2}|\d{1,2} [A-Z][a-z]{2,})/);
 	});
 
 	it('treats future timestamps as just-now', () => {

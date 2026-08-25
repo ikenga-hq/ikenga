@@ -28,7 +28,7 @@ export class ChatWebSocketClient {
 
 	connect(): void {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const uri = \//\/ws/chat/\;
+		const uri = `${protocol}//${window.location.host}/ws/chat/${this.threadId}`;
 		this.ws = new WebSocket(uri);
 
 		this.ws.onmessage = (event) => {

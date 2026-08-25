@@ -48,6 +48,8 @@ const BUN_TARGET: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64"
     "darwin-aarch64"
 } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
     "windows-x64"
+} else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+    "windows-aarch64"
 } else {
     "unsupported"
 };
@@ -67,17 +69,18 @@ const BUN_BIN_NAME: &str = if cfg!(target_os = "windows") {
 // asset (not the unzipped binary), matching the sidecar contract.
 
 /// Pinned Bun version (Bun's own `bun-vX.Y.Z` release tag, without the `bun-v`).
-pub const BUN_VERSION: &str = "1.3.14";
+pub const BUN_VERSION: &str = "1.4.0";
 
 /// Sha256 of `bun-<target>.zip` for each supported target. `None` for an
 /// unsupported host (matches `BUN_TARGET == "unsupported"`).
 pub fn bun_zip_sha256(target: &str) -> Option<&'static str> {
     match target {
-        "linux-x64" => Some("951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f"),
-        "linux-aarch64" => Some("a27ffb63a8310375836e0d6f668ae17fa8d8d18b88c37c821c65331973a19a3b"),
-        "darwin-x64" => Some("4183df3374623e5bab315c547cfa0974533cd457d86b73b639f7a87974cd6633"),
-        "darwin-aarch64" => Some("d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620"),
-        "windows-x64" => Some("0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922"),
+        "linux-x64" => Some("2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452"),
+        "linux-aarch64" => Some("4b1a332ee861983eb93bcfe6f770fff94e3e31b2c388bdaea3c8ed35e58eed0e"),
+        "darwin-x64" => Some("1d0211b8f1dc991182344687ad15e72ee86f154845a5f7fa477994cd341dd9b0"),
+        "darwin-aarch64" => Some("c669e97f6164e1c96e0701748db98dfa77492908cbd8394c7557134a735de381"),
+        "windows-x64" => Some("e6f093d39da486b20262ca8cdd5ed6a9e8bc9c2f275b78e6d3a0c5b28cc95901"),
+        "windows-aarch64" => Some("f473bfe2df73ee770548c93dd5d380aea7120c218ec2aa1afdd0bbba7bf18c47"),
         _ => None,
     }
 }
@@ -709,17 +712,17 @@ mod tests {
 
     #[test]
     fn version_ge_compares_semver_tuples() {
-        // Pin is 1.3.14; accept equal-or-newer, reject older + unparsable.
-        assert!(version_ge("1.3.14", "1.3.14")); // equal → accept
-        assert!(version_ge("1.4.0", "1.3.14")); // newer minor
-        assert!(version_ge("2.0.0", "1.3.14")); // newer major
-        assert!(version_ge("1.3.15", "1.3.14")); // newer patch
-        assert!(!version_ge("1.3.13", "1.3.14")); // older patch
-        assert!(!version_ge("1.2.99", "1.3.14")); // older minor
-        assert!(!version_ge("garbage", "1.3.14")); // unparsable → reject
+        // Pin is 1.4.0; accept equal-or-newer, reject older + unparsable.
+        assert!(version_ge("1.4.0", "1.4.0")); // equal → accept
+        assert!(version_ge("1.4.1", "1.4.0")); // newer patch
+        assert!(version_ge("1.5.0", "1.4.0")); // newer minor
+        assert!(version_ge("2.0.0", "1.4.0")); // newer major
+        assert!(!version_ge("1.3.14", "1.4.0")); // older minor
+        assert!(!version_ge("1.3.99", "1.4.0")); // older minor
+        assert!(!version_ge("garbage", "1.4.0")); // unparsable → reject
         // Tolerate a leading `v` and pre-release suffix on the found string.
-        assert!(version_ge("v1.3.14", "1.3.14"));
-        assert!(version_ge("1.4.0-canary.1", "1.3.14"));
+        assert!(version_ge("v1.4.0", "1.4.0"));
+        assert!(version_ge("1.4.1-canary.1", "1.4.0"));
     }
 
     /// Drift guard: the Rust pin SoT (`BUN_VERSION` + `bun_zip_sha256`) must
@@ -755,6 +758,7 @@ mod tests {
             "darwin-x64",
             "darwin-aarch64",
             "windows-x64",
+            "windows-aarch64",
         ] {
             let arm = script
                 .lines()

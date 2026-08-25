@@ -85,7 +85,7 @@ describe('PkgLoupe — head', () => {
 			)
 		);
 		// "Permissions" label + count "3" appear together
-		const permsTab = screen.getByRole('button', { name: /Permissions/i });
+		const permsTab = screen.getByRole('tab', { name: /Permissions/i });
 		expect(within(permsTab).getByText('3')).toBeTruthy();
 	});
 
@@ -109,7 +109,7 @@ describe('PkgLoupe — head', () => {
 				/>
 			)
 		);
-		const trustTab = screen.getByRole('button', { name: /Trust/i });
+		const trustTab = screen.getByRole('tab', { name: /Trust/i });
 		expect(within(trustTab).getByText(/pending/i)).toBeTruthy();
 	});
 });
@@ -134,7 +134,7 @@ describe('PkgLoupe — tab switching', () => {
 		// Start: Overview is showing.
 		expect(screen.getByText(/^about$/i)).toBeTruthy();
 		// Click Manifest tab.
-		await user.click(screen.getByRole('button', { name: /Manifest/i }));
+		await user.click(screen.getByRole('tab', { name: /Manifest/i }));
 		// Manifest body now visible; about-section is gone.
 		expect(screen.getByText(/manifest\.json/i)).toBeTruthy();
 		expect(screen.queryByText(/^about$/i)).toBeNull();
@@ -151,7 +151,7 @@ describe('PkgLoupe — tab switching', () => {
 				/>
 			)
 		);
-		await user.click(screen.getByRole('button', { name: /Permissions/i }));
+		await user.click(screen.getByRole('tab', { name: /Permissions/i }));
 		// The high-risk scope renders the "risk: high" pill from the
 		// classifier; low-risk gets "risk: low".
 		expect(screen.getByText('fs:write:.company/content')).toBeTruthy();

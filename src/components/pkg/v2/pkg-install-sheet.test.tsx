@@ -123,9 +123,9 @@ describe('PkgInstallSheet — generic', () => {
 	it('renders three tabs and the generic header', () => {
 		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} />));
 		expect(screen.getByText('Install pkg')).toBeTruthy();
-		expect(screen.getByRole('button', { name: /Manifest URL/i })).toBeTruthy();
-		expect(screen.getByRole('button', { name: /Local path/i })).toBeTruthy();
-		expect(screen.getByRole('button', { name: /Registry/i })).toBeTruthy();
+		expect(screen.getByRole('tab', { name: /Manifest URL/i })).toBeTruthy();
+		expect(screen.getByRole('tab', { name: /Local path/i })).toBeTruthy();
+		expect(screen.getByRole('tab', { name: /Registry/i })).toBeTruthy();
 	});
 
 	it('starts on the Manifest URL tab and shows the input', () => {
@@ -138,7 +138,7 @@ describe('PkgInstallSheet — generic', () => {
 	it('switching to Local path swaps the body', async () => {
 		const user = userEvent.setup();
 		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} />));
-		await user.click(screen.getByRole('button', { name: /Local path/i }));
+		await user.click(screen.getByRole('tab', { name: /Local path/i }));
 		expect(screen.getByText(/absolute path/i)).toBeTruthy();
 		expect(screen.getByPlaceholderText(/\/Users\/you\/my-pkg/i)).toBeTruthy();
 	});
@@ -168,7 +168,7 @@ describe('PkgInstallSheet — generic', () => {
 	it('Registry tab shows the redirect hint, no Install button', async () => {
 		const user = userEvent.setup();
 		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} />));
-		await user.click(screen.getByRole('button', { name: /^Registry$/i }));
+		await user.click(screen.getByRole('tab', { name: /^Registry$/i }));
 		expect(screen.getByText(/registry browser opens on \/packages\?filter=store/i)).toBeTruthy();
 		expect(screen.queryByRole('button', { name: /^Install$/i })).toBeNull();
 	});

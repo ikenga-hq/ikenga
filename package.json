@@ -14,7 +14,7 @@
 		"iyke:bundle": "bun build src/lib/iyke/iframe-bridge.entry.ts --outfile src-tauri/resources/iyke-iframe-bridge.js --target browser --format esm --minify",
 		"artifact:bundle": "bun build src/lib/artifact/bridge.entry.ts --outfile src-tauri/resources/artifact-iframe-bridge.js --target browser --format esm --minify",
 		"tokens:copy": "node -e \"const fs=require('fs');fs.copyFileSync(require.resolve('@ikenga/tokens/tokens.css'),'src-tauri/resources/ikenga-tokens.css')\"",
-		"iyke:mcp:build": "bash scripts/build-iyke-mcp.sh",
+		"iyke:mcp:build": "bun run scripts/build-iyke-mcp.ts",
 		"typecheck": "tsc --noEmit",
 		"tsr:generate": "tsr generate",
 		"tsr:watch": "tsr watch",

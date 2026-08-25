@@ -82,7 +82,7 @@ export function GraphDag({ graph, selected, incident, onSelect, draggedRef }: Re
 		const k = Math.min((W - pad * 2) / layout.width, (H - pad * 2) / layout.height, 1.1);
 		const tx = (W - layout.width * k) / 2;
 		const ty = (H - layout.height * k) / 2;
-		select(el)
+		(select(el) as any)
 			.transition()
 			.duration(380)
 			.call(zoomB.transform, zoomIdentity.translate(tx, ty).scale(k));

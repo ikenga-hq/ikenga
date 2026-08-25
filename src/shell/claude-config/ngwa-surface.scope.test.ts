@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Project } from '@/lib/tauri-cmd';
-import { projectIdForRoot } from './ngwa-surface';
+import { projectIdForRoot } from './ngwa-helpers';
 
 // Regression for the WP-08 scope-grammar parity gap: the FE used to emit
 // `project:<basename>`, but the Rust store resolves `project:<id>` via
