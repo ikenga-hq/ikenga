@@ -15,16 +15,13 @@
 import { getHomeSync } from '@/lib/home';
 
 // Multi-segment path pattern (contains slash, optional tilde / relative prefix).
-export const MULTI_SEGMENT_PATH_RE =
-	/^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
+export const MULTI_SEGMENT_PATH_RE = /^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
 
 // Single-segment file pattern (no slash, requires .<ext>).
-export const SINGLE_SEGMENT_PATH_RE =
-	/^[a-zA-Z0-9_.@()-]+\.[A-Za-z0-9]{1,7}$/;
+export const SINGLE_SEGMENT_PATH_RE = /^[a-zA-Z0-9_.@()-]+\.[A-Za-z0-9]{1,7}$/;
 
 // Backward-compatible alias for existing consumers.
-export const PATH_RE =
-	/^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
+export const PATH_RE = /^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
 
 // Restrict single-segment (no slash) paths to known dev/doc/asset extensions so
 // things like `e.g.` or `Mr.A` don't get mistaken for files. Multi-segment
@@ -186,27 +183,13 @@ export function normalizePath(p: string): string {
 	return joined || '.';
 }
 
-/**
- * Async fs-validated candidate resolver with ordered candidates (T-02).
- * Prioritizes:
- * 1. Direct synchronous resolvePath(rawPath, cwd)
- * 2. Normalized path resolution (resolving `.` and `..`)
- * 3. Path with trailing punctuation trimmed
- * 4. Leading `./` stripped
- */
-export async function resolvePathCandidates(
-	rawPath: string,
-	cwd?: string,
-	fsCheck?: (p: string) => Promise<boolean>
-): Promise<string> {
+/** Build the ordered candidate list for a raw path token. Pure — no fs access.
+ *  Order matters: the first candidate that exists on disk wins. */
+function pathCandidates(rawPath: string, cwd?: string): string[] {
 	const initial = resolvePath(rawPath, cwd);
-	if (!fsCheck) return initial;
-
 	const candidates = new Set<string>();
 	candidates.add(initial);
-
-	const normalized = normalizePath(initial);
-	candidates.add(normalized);
+	candidates.add(normalizePath(initial));
 
 	const trimmedPunctuation = initial.replace(/[.,;:]+$/, '');
 	if (trimmedPunctuation !== initial) {
@@ -220,8 +203,43 @@ export async function resolvePathCandidates(
 		candidates.add(normalizePath(withoutDotSlash));
 	}
 
-	const candidateList = Array.from(candidates).slice(0, 10);
+	return Array.from(candidates).slice(0, 10);
+}
+
+/**
+ * Async fs-validated resolver (T-02). Returns the first candidate that exists
+ * on disk, or `null` when none do.
+ *
+ * `looksLikePath` is deliberately permissive for multi-segment tokens so bare
+ * relative directories (`src/terminal`) linkify. That same permissiveness makes
+ * prose like `24/7`, `and/or` and `n/a` path-shaped — they are lexically
+ * indistinguishable from `src/terminal`. Existence on disk is the only honest
+ * discriminator, so callers that decorate UI should gate on this returning
+ * non-null rather than on `looksLikePath` alone.
+ */
+export async function resolveExistingPath(
+	rawPath: string,
+	cwd?: string,
+	fsCheck?: (p: string) => Promise<boolean>
+): Promise<string | null> {
+	if (!fsCheck) return null;
+	const candidateList = pathCandidates(rawPath, cwd);
 	const results = await Promise.all(candidateList.map((c) => fsCheck(c).catch(() => false)));
 	const matchIdx = results.findIndex(Boolean);
-	return matchIdx >= 0 ? candidateList[matchIdx] : initial;
+	return matchIdx >= 0 ? candidateList[matchIdx] : null;
+}
+
+/**
+ * Async fs-validated candidate resolver with ordered candidates (T-02).
+ * Returns the first candidate that exists, falling back to the plain
+ * synchronous resolution when nothing does.
+ */
+export async function resolvePathCandidates(
+	rawPath: string,
+	cwd?: string,
+	fsCheck?: (p: string) => Promise<boolean>
+): Promise<string> {
+	const initial = resolvePath(rawPath, cwd);
+	if (!fsCheck) return initial;
+	return (await resolveExistingPath(rawPath, cwd, fsCheck)) ?? initial;
 }

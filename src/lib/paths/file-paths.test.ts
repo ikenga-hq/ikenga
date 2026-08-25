@@ -3,6 +3,7 @@ import {
 	hasBalancedParens,
 	looksLikePath,
 	normalizePath,
+	resolveExistingPath,
 	resolvePath,
 	resolvePathCandidates,
 } from './file-paths';
@@ -44,5 +45,32 @@ describe('file-paths', () => {
 
 		const fallback = await resolvePathCandidates('src/missing.ts', '/workspace', mockFs);
 		expect(fallback).toBe('/workspace/src/missing.ts');
+	});
+});
+
+describe('resolveExistingPath', () => {
+	const onDisk = new Set(['/repo/src/index.ts', '/repo/src/terminal']);
+	const fsCheck = async (p: string) => onDisk.has(p);
+
+	it('returns the resolved path when it exists', async () => {
+		expect(await resolveExistingPath('src/index.ts', '/repo', fsCheck)).toBe('/repo/src/index.ts');
+		expect(await resolveExistingPath('src/terminal', '/repo', fsCheck)).toBe('/repo/src/terminal');
+	});
+
+	it('returns null for path-shaped prose that is not on disk', async () => {
+		for (const tok of ['24/7', 'and/or', 'n/a', 'km/h', 'he/him']) {
+			expect(await resolveExistingPath(tok, '/repo', fsCheck)).toBeNull();
+		}
+	});
+
+	it('returns null when no fs check is supplied', async () => {
+		expect(await resolveExistingPath('src/index.ts', '/repo')).toBeNull();
+	});
+
+	it('treats a failing fs check as non-existent', async () => {
+		const boom = async () => {
+			throw new Error('EACCES');
+		};
+		expect(await resolveExistingPath('src/index.ts', '/repo', boom)).toBeNull();
 	});
 });

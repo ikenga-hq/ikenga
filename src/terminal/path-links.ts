@@ -19,9 +19,9 @@
  */
 
 import type { IDisposable, ILink, Terminal } from '@xterm/xterm';
-import { fsExists } from '@/lib/tauri-cmd';
-import { hasBalancedParens, looksLikePath, resolvePathCandidates } from '@/lib/paths/file-paths';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { hasBalancedParens, looksLikePath, resolveExistingPath } from '@/lib/paths/file-paths';
+import { fsExists } from '@/lib/tauri-cmd';
 
 export interface PathSpan {
 	/** 1-based start column (inclusive). */
@@ -114,10 +114,42 @@ export function scanLineForPaths(line: string): PathSpan[] {
 	return out;
 }
 
+// Memoize existence checks so re-hovering a line doesn't refire IPC per token.
+// Bounded to 500 entries to prevent unbounded growth over long sessions.
+// Keyed by (cwd, rawPath). Mirrors the cache in components/markdown.tsx.
+const MAX_EXISTS_CACHE_SIZE = 500;
+const existsCache = new Map<string, Promise<string | null>>();
+
+function resolveExistingCached(rawPath: string, cwd: string | undefined): Promise<string | null> {
+	const key = `${cwd ?? ''}|${rawPath}`;
+	let cached = existsCache.get(key);
+	if (!cached) {
+		if (existsCache.size >= MAX_EXISTS_CACHE_SIZE) {
+			const oldestKey = existsCache.keys().next().value;
+			if (oldestKey !== undefined) existsCache.delete(oldestKey);
+		}
+		cached = resolveExistingPath(rawPath, cwd, fsExists);
+		existsCache.set(key, cached);
+	}
+	return cached;
+}
+
+/** Test seam — drops memoized existence results. */
+export function __clearPathLinkCache(): void {
+	existsCache.clear();
+}
+
 /**
  * Register the file-path link provider on a terminal. Returns a disposable;
  * call it from the host's cleanup. `cwd` resolves relative paths (absolute /
  * `~` paths ignore it). Can be a static string or a dynamic getter function.
+ *
+ * Only tokens that actually resolve to something on disk are decorated.
+ * `scanLineForPaths` accepts any multi-segment token so bare directories
+ * (`src/terminal`) linkify, but that also matches prose — `24/7`, `and/or`,
+ * `n/a`, `km/h`. Those are lexically indistinguishable from a real relative
+ * directory, so existence is the discriminator. The resolved path is carried
+ * onto the link, so `activate` opens it without re-resolving.
  */
 export function registerPathLinks(
 	term: Terminal,
@@ -136,27 +168,34 @@ export function registerPathLinks(
 				callback(undefined);
 				return;
 			}
-			const links: ILink[] = spans.map((span) => ({
-				text: span.text,
-				range: {
-					start: { x: span.startX, y: bufferLineNumber },
-					end: { x: span.endX, y: bufferLineNumber },
-				},
-				decorations: { pointerCursor: true, underline: true },
-				activate: () => {
-					const effectiveCwd = typeof cwd === 'function' ? cwd() : cwd;
-					resolvePathCandidates(span.text, effectiveCwd, fsExists).then((resolved) => {
-						const store = usePaneStore.getState();
-						store.addTabBackground(store.focusedId, {
-							kind: 'artifact',
-							path: resolved,
-							line: span.line,
-							col: span.col,
+			const effectiveCwd = typeof cwd === 'function' ? cwd() : cwd;
+			Promise.all(spans.map((span) => resolveExistingCached(span.text, effectiveCwd)))
+				.then((resolved) => {
+					const links: ILink[] = [];
+					spans.forEach((span, idx) => {
+						const path = resolved[idx];
+						if (!path) return; // not on disk — prose, not a path
+						links.push({
+							text: span.text,
+							range: {
+								start: { x: span.startX, y: bufferLineNumber },
+								end: { x: span.endX, y: bufferLineNumber },
+							},
+							decorations: { pointerCursor: true, underline: true },
+							activate: () => {
+								const store = usePaneStore.getState();
+								store.addTabBackground(store.focusedId, {
+									kind: 'artifact',
+									path,
+									line: span.line,
+									col: span.col,
+								});
+							},
 						});
 					});
-				},
-			}));
-			callback(links);
+					callback(links.length > 0 ? links : undefined);
+				})
+				.catch(() => callback(undefined));
 		},
 	});
 }
