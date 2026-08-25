@@ -5,6 +5,8 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { type ITheme, Terminal } from '@xterm/xterm';
 import { useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
+import { usePaneStore } from '@/lib/panes/pane-store';
+import { resolvePath } from '@/lib/paths/file-paths';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { registerPathLinks } from './path-links';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
@@ -579,6 +581,45 @@ export function XTermHost({
 				theme: readThemeFromCssVars(dark),
 				macOptionIsMeta: true,
 				convertEol: false,
+				linkHandler: {
+					activate: (_e: MouseEvent, text: string) => {
+						if (/^[a-z]+:\/\//i.test(text) && !text.startsWith('file://')) {
+							window.open(text, '_blank');
+							return;
+						}
+						let filePath = text;
+						let line: number | undefined;
+						let col: number | undefined;
+						if (filePath.startsWith('file://')) {
+							filePath = filePath.slice(7);
+							if (/^\/[a-zA-Z]:/.test(filePath)) {
+								filePath = filePath.slice(1);
+							}
+						}
+						const hashMatch = filePath.match(/#L?(\d+)(?::(?:C|col)?(\d+))?$/i);
+						if (hashMatch) {
+							line = parseInt(hashMatch[1], 10);
+							if (hashMatch[2]) col = parseInt(hashMatch[2], 10);
+							filePath = filePath.slice(0, filePath.length - hashMatch[0].length);
+						} else {
+							const colonMatch = filePath.match(/:(\d+)(?::(\d+))?$/);
+							if (colonMatch) {
+								line = parseInt(colonMatch[1], 10);
+								if (colonMatch[2]) col = parseInt(colonMatch[2], 10);
+								filePath = filePath.slice(0, filePath.length - colonMatch[0].length);
+							}
+						}
+						const effectiveCwd = livePtyRef.current?.cwd ?? spec?.cwd;
+						const resolved = resolvePath(filePath, effectiveCwd);
+						const store = usePaneStore.getState();
+						store.addTabBackground(store.focusedId, {
+							kind: 'artifact',
+							path: resolved,
+							line,
+							col,
+						});
+					},
+				},
 			});
 			termRef.current = term;
 
@@ -646,6 +687,8 @@ export function XTermHost({
 				container = mountEl;
 			}
 			term.open(container);
+			term.textarea?.setAttribute('aria-label', 'Terminal');
+			term.element?.setAttribute('aria-label', 'Terminal');
 
 			if (disableWebgl) {
 				status('dom renderer (webgl disabled)');
@@ -1027,6 +1070,29 @@ export function XTermHost({
 		return () => el.removeEventListener(OS_FILE_DROP_EVENT, onPaths);
 	}, []);
 
+	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+	useEffect(() => {
+		if (!contextMenu) return;
+		const close = () => setContextMenu(null);
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') setContextMenu(null);
+		};
+		window.addEventListener('click', close);
+		window.addEventListener('contextmenu', close);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('click', close);
+			window.removeEventListener('contextmenu', close);
+			window.removeEventListener('keydown', onKey);
+		};
+	}, [contextMenu]);
+
+	const handleContextMenu = (e: React.MouseEvent) => {
+		e.preventDefault();
+		setContextMenu({ x: e.clientX, y: e.clientY });
+	};
+
 	if (!spec && !pty) {
 		return <div className="empty">No PTY. Spawn one above.</div>;
 	}
@@ -1035,6 +1101,7 @@ export function XTermHost({
 		<div
 			ref={wrapperRef}
 			data-terminal-session={sessionId}
+			onContextMenu={handleContextMenu}
 			style={{
 				position: 'relative',
 				width: '100%',
@@ -1043,6 +1110,151 @@ export function XTermHost({
 				flexDirection: 'column',
 			}}
 		>
+			{contextMenu && (
+				<div
+					role="menu"
+					aria-label="Terminal Context Menu"
+					style={{
+						position: 'fixed',
+						top: contextMenu.y,
+						left: contextMenu.x,
+						zIndex: 9999,
+						minWidth: 160,
+						padding: '4px',
+						background: 'var(--bg-card, #1e1e1e)',
+						border: '1px solid var(--border-subtle, rgba(127,127,127,0.25))',
+						borderRadius: 6,
+						boxShadow: '0 6px 20px rgba(0,0,0,0.4)',
+						fontSize: 12,
+						color: 'var(--fg-default, #e5e5e5)',
+						display: 'flex',
+						flexDirection: 'column',
+						gap: 2,
+					}}
+					onClick={(e) => e.stopPropagation()}
+				>
+					<button
+						type="button"
+						disabled={!termRef.current?.hasSelection()}
+						onClick={() => {
+							const sel = termRef.current?.getSelection();
+							if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: termRef.current?.hasSelection() ? 'inherit' : 'rgba(127,127,127,0.5)',
+							cursor: termRef.current?.hasSelection() ? 'pointer' : 'default',
+							textAlign: 'left',
+						}}
+					>
+						<span>Copy</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘C' : 'Ctrl+Shift+C'}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							navigator.clipboard
+								.readText()
+								.then((t) => {
+									if (t) {
+										livePtyRef.current?.write(t).catch(() => {});
+										termRef.current?.focus();
+									}
+								})
+								.catch(() => {});
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Paste</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘V' : 'Ctrl+Shift+V'}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							termRef.current?.selectAll();
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Select All</span>
+					</button>
+					<div style={{ height: 1, background: 'rgba(127,127,127,0.2)', margin: '2px 0' }} />
+					<button
+						type="button"
+						onClick={() => {
+							termRef.current?.clear();
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Clear Terminal</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							setSearchOpen(true);
+							setTimeout(() => searchInputRef.current?.focus(), 0);
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Find…</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{isMac() ? '⌘F' : 'Ctrl+Shift+F'}</span>
+					</button>
+				</div>
+			)}
 			{searchOpen && (
 				<div
 					style={{
