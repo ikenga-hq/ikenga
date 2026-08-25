@@ -131,6 +131,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf
 
+      # `resources/builtin-pkgs/com.ikenga.engine-claude-code/dist` is a tracked
+      # symlink into the ikenga-pkgs monorepo, which this job deliberately does
+      # not check out. On Linux that symlink dangles, and tauri_build validates
+      # resource paths in the build script — so `cargo check` fails outright with
+      #   resource path `...engine-claude-code/dist` doesn't exist
+      # An empty directory satisfies it; only `tauri build` needs real contents.
+      #
+      # This does not reproduce locally on Windows: git materializes the symlink
+      # as a plain 59-byte text file, which tauri_build accepts. Verified on CI.
+      - name: Materialize engine-cc resource stub
+        run: |
+          d=src-tauri/resources/builtin-pkgs/com.ikenga.engine-claude-code/dist
+          rm -rf "$d"
+          mkdir -p "$d"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
