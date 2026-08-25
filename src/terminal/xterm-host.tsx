@@ -6,7 +6,7 @@ import { type ITheme, Terminal } from '@xterm/xterm';
 import { useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { resolvePath } from '@/lib/paths/file-paths';
+import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import {
 	evaluateTerminalKey,
@@ -600,12 +600,7 @@ export function XTermHost({
 						let filePath = text;
 						let line: number | undefined;
 						let col: number | undefined;
-						if (filePath.startsWith('file://')) {
-							filePath = filePath.slice(7);
-							if (/^\/[a-zA-Z]:/.test(filePath)) {
-								filePath = filePath.slice(1);
-							}
-						}
+						filePath = fileUrlToPath(filePath);
 						const hashMatch = filePath.match(/#L?(\d+)(?::(?:C|col)?(\d+))?$/i);
 						if (hashMatch) {
 							line = parseInt(hashMatch[1], 10);
@@ -652,15 +647,7 @@ export function XTermHost({
 			// (e.g. `\x1b]7;file://hostname/path\x1b\\` or `\x1b]7;/path\x1b\\`).
 			term.parser.registerOscHandler(7, (data) => {
 				try {
-					let path = data;
-					if (path.startsWith('file://')) {
-						path = path.slice(7);
-						const slashIdx = path.indexOf('/');
-						if (slashIdx !== -1) {
-							path = path.slice(slashIdx);
-						}
-					}
-					path = decodeURIComponent(path.trim());
+					const path = fileUrlToPath(data);
 					if (path) {
 						if (livePtyRef.current) livePtyRef.current.setCwd(path);
 						if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, path);
@@ -1165,12 +1152,12 @@ export function XTermHost({
 						zIndex: 9999,
 						minWidth: 160,
 						padding: '4px',
-						background: 'var(--bg-card, #1e1e1e)',
-						border: '1px solid var(--border-subtle, rgba(127,127,127,0.25))',
+						background: 'var(--color-card)',
+						border: '1px solid var(--color-border)',
 						borderRadius: 6,
 						boxShadow: '0 6px 20px rgba(0,0,0,0.4)',
 						fontSize: 12,
-						color: 'var(--fg-default, #e5e5e5)',
+						color: 'var(--color-card-foreground)',
 						display: 'flex',
 						flexDirection: 'column',
 						gap: 2,

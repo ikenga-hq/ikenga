@@ -243,3 +243,38 @@ export async function resolvePathCandidates(
 	if (!fsCheck) return initial;
 	return (await resolveExistingPath(rawPath, cwd, fsCheck)) ?? initial;
 }
+/**
+ * Convert a `file://` URL to a plain filesystem path. Returns non-`file://`
+ * input unchanged, so callers can pass a raw path through safely.
+ *
+ * Handles the two shapes terminals actually emit:
+ *   file://hostname/home/u/proj  → /home/u/proj   (authority stripped)
+ *   file:///C:/Users/u/proj      → C:/Users/u/proj (leading slash before the
+ *                                                   drive letter dropped)
+ *
+ * That second case is why this exists: without it a Windows shell's OSC 7 sets
+ * cwd to `/C:/Users/...`, every relative path then resolves against a location
+ * that cannot exist, and terminal path links stop resolving entirely.
+ */
+export function fileUrlToPath(raw: string): string {
+	const trimmed = raw.trim();
+	if (!trimmed.startsWith('file://')) return trimmed;
+
+	let path = trimmed.slice('file://'.length);
+
+	// Strip an optional authority: `file://host/p` → `/p`. For `file:///p` the
+	// remainder already starts with `/`, so this is a no-op.
+	const slashIdx = path.indexOf('/');
+	path = slashIdx === -1 ? '' : path.slice(slashIdx);
+
+	// Windows drive letters arrive as `/C:/…`; the leading slash is not part of
+	// the path.
+	if (path.startsWith('/') && /^[a-zA-Z]:/.test(path.slice(1))) path = path.slice(1);
+
+	try {
+		return decodeURIComponent(path);
+	} catch {
+		// Malformed percent-encoding — better to use the raw path than nothing.
+		return path;
+	}
+}

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	fileUrlToPath,
 	hasBalancedParens,
 	looksLikePath,
 	normalizePath,
@@ -72,5 +73,34 @@ describe('resolveExistingPath', () => {
 			throw new Error('EACCES');
 		};
 		expect(await resolveExistingPath('src/index.ts', '/repo', boom)).toBeNull();
+	});
+});
+
+describe('fileUrlToPath', () => {
+	it('strips the authority from a hosted file URL', () => {
+		expect(fileUrlToPath('file://hostname/home/u/proj')).toBe('/home/u/proj');
+		expect(fileUrlToPath('file:///home/u/proj')).toBe('/home/u/proj');
+	});
+
+	it('drops the leading slash before a Windows drive letter', () => {
+		// The regression: a Windows shell's OSC 7 emits file:///C:/… and the
+		// naive parse leaves /C:/… , which resolves against nothing.
+		expect(fileUrlToPath('file:///C:/Users/ned/proj')).toBe('C:/Users/ned/proj');
+		expect(fileUrlToPath('file:///d:/work')).toBe('d:/work');
+	});
+
+	it('percent-decodes the path', () => {
+		expect(fileUrlToPath('file:///home/u/my%20docs')).toBe('/home/u/my docs');
+		expect(fileUrlToPath('file:///C:/Program%20Files/x')).toBe('C:/Program Files/x');
+	});
+
+	it('returns non-file input unchanged', () => {
+		expect(fileUrlToPath('/already/a/path')).toBe('/already/a/path');
+		expect(fileUrlToPath('C:/win/path')).toBe('C:/win/path');
+		expect(fileUrlToPath('  /trimmed  ')).toBe('/trimmed');
+	});
+
+	it('falls back to the raw path on malformed percent-encoding', () => {
+		expect(fileUrlToPath('file:///bad/%E0%A4%A')).toBe('/bad/%E0%A4%A');
 	});
 });
