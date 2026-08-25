@@ -648,6 +648,48 @@ export function XTermHost({
 			const pathLinks = registerPathLinks(term, () => livePtyRef.current?.cwd ?? spec?.cwd);
 			pathLinksDisposeFn = () => pathLinks.dispose();
 
+			// OSC 7: Current Working Directory notification emitted by shells (T-10)
+			// (e.g. `\x1b]7;file://hostname/path\x1b\\` or `\x1b]7;/path\x1b\\`).
+			term.parser.registerOscHandler(7, (data) => {
+				try {
+					let path = data;
+					if (path.startsWith('file://')) {
+						path = path.slice(7);
+						const slashIdx = path.indexOf('/');
+						if (slashIdx !== -1) {
+							path = path.slice(slashIdx);
+						}
+					}
+					path = decodeURIComponent(path.trim());
+					if (path) {
+						if (livePtyRef.current) livePtyRef.current.setCwd(path);
+						if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, path);
+					}
+				} catch {
+					/* ignore malformed OSC 7 */
+				}
+				return true;
+			});
+
+			// OSC 133: FinalTerm / Shell Integration property markers (T-10)
+			// (e.g. `133;P;Cwd=/path`).
+			term.parser.registerOscHandler(133, (data) => {
+				try {
+					const parts = data.split(';');
+					const code = parts[0];
+					if (code === 'P' && parts[1]?.startsWith('Cwd=')) {
+						const cwdVal = parts[1].slice(4).trim();
+						if (cwdVal) {
+							if (livePtyRef.current) livePtyRef.current.setCwd(cwdVal);
+							if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, cwdVal);
+						}
+					}
+				} catch {
+					/* ignore malformed OSC 133 */
+				}
+				return true;
+			});
+
 			// Search addon — lazy import to keep initial bundle slim.
 			(async () => {
 				try {

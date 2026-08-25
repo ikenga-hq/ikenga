@@ -36,7 +36,7 @@ export { ptyAttachArm, ptyAttachBegin, ptyKill, ptyListen, ptyResize, ptySpawn, 
 export class Pty {
 	readonly id: string;
 	readonly label: string;
-	readonly cwd?: string;
+	cwd?: string;
 	exited: boolean = false;
 	exitCode: number | null = null;
 
@@ -96,6 +96,10 @@ export class Pty {
 	private constructor(id: string, label: string, cwd?: string) {
 		this.id = id;
 		this.label = label;
+		this.cwd = cwd;
+	}
+
+	setCwd(cwd: string): void {
 		this.cwd = cwd;
 	}
 
