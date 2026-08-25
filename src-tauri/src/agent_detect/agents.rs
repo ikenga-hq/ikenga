@@ -14,9 +14,6 @@ use tokio::time::timeout;
 use super::known::{
     family_matches, AgentCapabilities, AgentDef, AuthCheck, ExecutableSpec, TargetFamily, KNOWN_AGENTS,
 };
-// Only `lookup_wsl_executable` reads the family tag directly.
-#[cfg(windows)]
-use super::known::TargetFamily;
 
 const DEFAULT_VERSION_TIMEOUT: Duration = Duration::from_millis(2000);
 

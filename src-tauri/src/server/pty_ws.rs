@@ -103,9 +103,6 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
             }
         }
     });
-            }
-        }
-    });
 
     // Task 2: Pump WebSocket input -> PTY stdin / control commands
     let mut recv_task = tokio::spawn(async move {
