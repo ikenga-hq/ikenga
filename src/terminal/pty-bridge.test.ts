@@ -233,4 +233,11 @@ describe('Pty detached-attach scrollback replay (atomic handshake)', () => {
 		expect(seen.join('')).toBe('live');
 		off();
 	});
+
+	it('updates cwd via setCwd', async () => {
+		const pty = await Pty.spawn({ cmd: ['bash'], cwd: '/initial/dir' });
+		expect(pty.cwd).toBe('/initial/dir');
+		pty.setCwd('/new/updated/dir');
+		expect(pty.cwd).toBe('/new/updated/dir');
+	});
 });

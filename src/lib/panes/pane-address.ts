@@ -16,8 +16,10 @@ export function getPaneAddress(view: PaneView): string | null {
 	switch (view.kind) {
 		case 'route':
 			return view.path || '/';
-		case 'artifact':
-			return view.path;
+		case 'artifact': {
+			const loc = view.line ? (view.col ? `:${view.line}:${view.col}` : `:${view.line}`) : '';
+			return `${view.path}${loc}`;
+		}
 		case 'artifact-studio': {
 			// At compare density the address carries `?vs=<other>` so the
 			// resolver can round-trip back to the same view from a URL bar.

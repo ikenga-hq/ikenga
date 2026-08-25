@@ -6,7 +6,7 @@ export type PaneId = string;
 export type PaneView = (
 	| { kind: 'route'; path: string }
 	| { kind: 'terminal'; sessionId: string }
-	| { kind: 'artifact'; path: string }
+	| { kind: 'artifact'; path: string; line?: number; col?: number }
 	// Unified Artifact Studio with three densities:
 	//   grid    — folder (Lightroom-style contact sheet of artifact thumbnails)
 	//   loupe   — single artifact (preview + version strip + right rail)

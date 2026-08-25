@@ -352,10 +352,16 @@ function FilePathPill({
 // async monorepo-disambiguation walk below is markdown-specific.
 
 // Monorepo subproject names used as a disambiguation hint for `preferredSubproject`.
-// Empty by default; the developer ergonomics use-case is to populate this from a
-// user-configurable setting (future work). When empty, `preferredSubproject` is a
-// no-op and path resolution falls back to the cwd/cache heuristics.
-const MONOREPO_SUBPROJECTS: readonly string[] = [];
+// Populated with standard monorepo subprojects for workspace disambiguation (T-07).
+const MONOREPO_SUBPROJECTS: readonly string[] = [
+	'shell',
+	'engine',
+	'cli',
+	'packages',
+	'apps',
+	'docs',
+	'src',
+];
 
 /** Snapshot the focused pane's active artifact view; if its path is rooted at
  *  the monorepo, return the immediate subproject. Used as a disambiguation
@@ -377,14 +383,19 @@ function preferredSubproject(monorepoRoot: string): string | null {
 }
 
 // Memoize resolutions so a markdown doc with N pills referencing the same
-// path doesn't fire N parallel IPC waves. Keyed by (cwd, rawPath) since the
-// resolution depends on both.
+// path doesn't fire N parallel IPC waves. Bounded to 500 entries to prevent
+// unbounded memory growth over long sessions. Keyed by (cwd, rawPath).
+const MAX_RESOLVE_CACHE_SIZE = 500;
 const resolveCache = new Map<string, Promise<string>>();
 
 function resolvePathCached(rawPath: string, cwd: string | undefined): Promise<string> {
 	const key = `${cwd ?? ''}|${rawPath}`;
 	let cached = resolveCache.get(key);
 	if (!cached) {
+		if (resolveCache.size >= MAX_RESOLVE_CACHE_SIZE) {
+			const oldestKey = resolveCache.keys().next().value;
+			if (oldestKey !== undefined) resolveCache.delete(oldestKey);
+		}
 		cached = resolvePathWithFallback(rawPath, cwd);
 		resolveCache.set(key, cached);
 	}

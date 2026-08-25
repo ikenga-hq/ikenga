@@ -35,6 +35,8 @@ pub struct ForegroundProcess {
     /// Full argv, null-byte-stripped. Empty when the kernel returned no
     /// cmdline (kernel-thread, zombie). Best-effort.
     pub args: Vec<String>,
+    /// Live working directory of the foreground process.
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone)]
@@ -119,10 +121,15 @@ fn lookup_uncached(shell_pid: i32) -> Option<ForegroundProcess> {
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
 
+    let cwd = std::fs::read_link(format!("/proc/{tpgid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
     Some(ForegroundProcess {
         pid: tpgid,
         name: comm,
         args,
+        cwd,
     })
 }
 
