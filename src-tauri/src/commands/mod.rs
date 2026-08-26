@@ -107,11 +107,12 @@ pub use pa_actions::{
 };
 pub use permissions_audit::{pkg_permission_violations_clear, pkg_permission_violations_list};
 pub use pkg::{
-    list_all_skill_actions, list_skill_actions, pkg_db_diag, pkg_discover_workspace,
-    pkg_health_remove, pkg_health_remove_all, pkg_health_scan, pkg_install_from_path,
-    pkg_install_from_registry, pkg_is_trusted_for_elevated, pkg_kernel_status,
-    pkg_preview_manifest, pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get,
-    pkg_settings_set, pkg_uninstall, KernelState, PkgSettingsState,
+    list_all_skill_actions, list_skill_actions, pkg_activity_bar_set_badge, pkg_db_diag,
+    pkg_discover_workspace, pkg_health_remove, pkg_health_remove_all, pkg_health_scan,
+    pkg_install_from_path, pkg_install_from_registry, pkg_is_trusted_for_elevated,
+    pkg_kernel_status, pkg_preview_manifest, pkg_screenshot, pkg_set_enabled, pkg_set_scope,
+    pkg_settings_get, pkg_settings_set, pkg_uninstall, ActivityBarState, KernelState,
+    PkgSettingsState,
 };
 pub use pkg_content::{pkg_content_html, pkg_content_revoke, pkg_content_url, PkgContentState};
 pub use pkg_dev::{pkg_dev_register, pkg_dev_reload, pkg_dev_unregister};

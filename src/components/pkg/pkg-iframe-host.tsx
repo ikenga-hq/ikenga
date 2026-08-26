@@ -33,10 +33,14 @@
 // instance is keyed by ref and torn down + recreated cleanly on each effect
 // run; no useRef-mount-guard + cancelled-flag combination.
 
+import {
+	HOST_SIDECAR_EVENT_MAX_PER_SEC,
+	HOST_SIDECAR_EVENT_TYPE,
+	type HostSidecarEventNotification,
+} from '@ikenga/contract/app-bridge';
 import type { OperatorIdentity } from '@ikenga/contract/host-context';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { useEffect, useRef, useState } from 'react';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import {
@@ -65,6 +69,7 @@ import {
 	paActionsReject,
 	paActionsRetry,
 	paActionsUpdate,
+	pkgActivityBarSetBadge,
 	pkgContentHtml,
 	pkgContentRevoke,
 	pkgFetch,
@@ -74,10 +79,12 @@ import {
 	pkgMcpCall,
 	pkgPreviewManifest,
 	pkgSidecarCall,
+	pkgSidecarMessageEvent,
 	pkgStudioRequestProjectAccess,
 	type SqlValue,
 	skillRosterRead,
 } from '@/lib/tauri-cmd';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { usePaneScope } from '@/shell/panes/pane-scope';
 
 // Tauri event payload emitted by `Kernel::reload_pkg`. The FE only cares about
@@ -265,6 +272,27 @@ async function pkgSqliteTables(pkgId: string): Promise<string[]> {
 		return Array.isArray(tables) ? tables.filter((t): t is string => typeof t === 'string') : [];
 	} catch (e) {
 		console.warn(`[pkg-host] sqlite.tables lookup for ${pkgId} failed:`, e);
+		return [];
+	}
+}
+
+// The sidecar names a pkg declared via `manifest.sidecars[].name`, for the
+// WP-12 `host-sidecar-event` forwarder below — it needs to know which
+// `pkg://sidecar/{pkgId}/{name}/message` channels to subscribe to. Same
+// manifest-lookup shape as `pkgSqliteTables`; fails closed (empty list) on
+// any error so an unreadable manifest forwards nothing.
+async function pkgSidecarNames(pkgId: string): Promise<string[]> {
+	try {
+		const status = await pkgKernelStatus();
+		const entry = status.installed.find((p) => p.id === pkgId);
+		if (!entry) return [];
+		const manifest = await pkgPreviewManifest(entry.install_path);
+		const sidecars = manifest.sidecars;
+		return Array.isArray(sidecars)
+			? sidecars.map((s) => s.name).filter((n): n is string => typeof n === 'string')
+			: [];
+	} catch (e) {
+		console.warn(`[pkg-host] sidecar-name lookup for ${pkgId} failed:`, e);
 		return [];
 	}
 }
@@ -624,6 +652,34 @@ export async function dispatchHostCall(
 		return {
 			content: [{ type: 'text', text: `menu set: ${items.length} items` }],
 			structuredContent: { ok: true, count: items.length },
+		};
+	}
+
+	// host.pkg.setBadge({ dot?, count?, tooltip? } | null) — WP-11. A pkg pushes
+	// (or clears, with `null`/no args) its own activity-bar status badge, e.g.
+	// the git pkg's dirty/ahead-behind dot. Applies to this pkg's own rail icon
+	// only — there's no cross-pkg badge write. Errors (e.g. the pkg has no rail
+	// entry) surface as `ok: false` rather than throwing; the pkg-iframe-host
+	// bridge dispatcher expects every handler to resolve.
+	if (name === 'host.pkg.setBadge') {
+		const raw = args.badge ?? args;
+		let badge: { dot: boolean; count?: number | null; tooltip?: string | null } | null = null;
+		if (raw && typeof raw === 'object') {
+			const obj = raw as Record<string, unknown>;
+			badge = {
+				dot: obj.dot === true,
+				count: typeof obj.count === 'number' ? obj.count : null,
+				tooltip: typeof obj.tooltip === 'string' ? obj.tooltip : null,
+			};
+		}
+		try {
+			await pkgActivityBarSetBadge(pkgId, badge);
+		} catch (e) {
+			return errResult(`host.pkg.setBadge failed: ${(e as Error).message ?? String(e)}`);
+		}
+		return {
+			content: [{ type: 'text', text: badge ? 'badge set' : 'badge cleared' }],
+			structuredContent: { ok: true },
 		};
 	}
 
@@ -1460,6 +1516,82 @@ export function PkgIframeHostInner({
 		return () => {
 			cancelled = true;
 			unlisten?.();
+		};
+	}, [pkgId]);
+
+	// Step 3c (WP-12): forward the pkg's own long-lived SIDECAR stdout lines
+	// (distinct from Step 3b's MCP notification relay) into the iframe as a
+	// `host-sidecar-event` AppBridge notification. Companion to
+	// `pkgSidecarRpcSend`/`pkgSidecarMessageEvent` (`lib/tauri-cmd.ts`): once a
+	// pkg's long-lived sidecar is talking over the streaming-RPC path, each
+	// stdout line arrives here as a `pkg://sidecar/{pkgId}/{name}/message`
+	// Tauri event carrying the raw trimmed line as a string
+	// (`pkg_sidecar_stream.rs`). We `JSON.parse` it — a sidecar opting into
+	// this push MUST emit one JSON object per line — and drop anything that
+	// doesn't parse, rather than forwarding a bare string the iframe would
+	// have to guess the shape of.
+	//
+	// Rate cap mirrors the Step 3b relay's `MCP_NOTIFICATION_MAX_PER_SEC`
+	// budget (`lifecycle.rs`), scoped per (pkgId, sidecar name) via
+	// `HOST_SIDECAR_EVENT_MAX_PER_SEC`: a rolling one-second window per
+	// sidecar, dropping (not queueing) lines beyond the cap so the surviving
+	// lines are the freshest, not a backlog. This is the only defense against
+	// a chatty sidecar (a tight fs-watch loop) saturating the iframe — see
+	// `01-plan.md` §Risks "watcher events saturate the sidecar→shell relay".
+	useEffect(() => {
+		let cancelled = false;
+		const unlistens: UnlistenFn[] = [];
+
+		pkgSidecarNames(pkgId)
+			.then((names) => {
+				if (cancelled) return;
+				for (const name of names) {
+					let windowStart = 0;
+					let windowCount = 0;
+					const eventName = pkgSidecarMessageEvent(pkgId, name);
+					listen<string>(eventName, (evt) => {
+						const now = Date.now();
+						if (now - windowStart >= 1000) {
+							windowStart = now;
+							windowCount = 0;
+						}
+						if (windowCount >= HOST_SIDECAR_EVENT_MAX_PER_SEC) return;
+						windowCount += 1;
+
+						const bridge = bridgeRef.current;
+						if (!bridge) return;
+						let parsed: unknown;
+						try {
+							parsed = JSON.parse(evt.payload);
+						} catch {
+							// Not a JSON line — silently dropped per the sidecar-push
+							// contract (contract/src/app-bridge.ts).
+							return;
+						}
+						try {
+							void bridge.notification({
+								method: HOST_SIDECAR_EVENT_TYPE,
+								params: { pkgId, sidecar: name, event: parsed },
+							} satisfies HostSidecarEventNotification as Parameters<AppBridge['notification']>[0]);
+						} catch {
+							// Bridge may be mid-teardown.
+						}
+					})
+						.then((un) => {
+							if (cancelled) {
+								un();
+							} else {
+								unlistens.push(un);
+							}
+						})
+						.catch(() => {});
+				}
+			})
+			.catch(() => {});
+
+		return () => {
+			cancelled = true;
+			for (const un of unlistens) un();
 		};
 	}, [pkgId]);
 

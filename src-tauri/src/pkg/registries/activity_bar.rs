@@ -14,11 +14,30 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use anyhow::{anyhow, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::pkg::manifest::Package;
 use crate::pkg::registry::Registry;
+
+/// Status badge a pkg can push onto its own activity-bar icon (and, per
+/// WP-11, the project switcher) — e.g. the git pkg's dirty/ahead-behind dot.
+/// Not manifest-declared: it's set at runtime, after registration, via
+/// `ActivityBarRegistry::set_badge`, cleared by passing `None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivityBarBadge {
+    /// True to render a plain attention dot (e.g. "repo is dirty").
+    #[serde(default)]
+    pub dot: bool,
+    /// Optional small integer count (e.g. ahead+behind); rendered instead of
+    /// / alongside the dot when present. Kept as a string so callers aren't
+    /// forced through a numeric round-trip for things like "3↑2↓".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// Short human tooltip explaining the badge (e.g. "3 files changed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityBarEntry {
@@ -28,6 +47,12 @@ pub struct ActivityBarEntry {
     pub icon: Option<String>,
     pub section: Option<String>,
     pub route: String,
+    /// Runtime-set status badge; absent until a pkg calls `host.pkg.setBadge`
+    /// (forwarded to `ActivityBarRegistry::set_badge`). Reset to `None` on
+    /// every `register()` (fresh install / dev-reload) so a stale badge from
+    /// a previous manifest version never survives a reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge: Option<ActivityBarBadge>,
 }
 
 #[derive(Default)]
@@ -46,6 +71,25 @@ impl ActivityBarRegistry {
             .read()
             .map(|g| g.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Set (or clear, with `None`) the badge on a pkg's activity-bar entry.
+    /// Returns `Ok(false)` (not an error) when the pkg has no rail entry —
+    /// e.g. it hasn't registered a `ui.nav[0]`, or was never installed —
+    /// since a pkg racing its own badge push against boot/reload is a
+    /// normal transient, not a fault.
+    pub fn set_badge(&self, pkg_id: &str, badge: Option<ActivityBarBadge>) -> Result<bool> {
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| anyhow!("activity_bar lock poisoned"))?;
+        match entries.get_mut(pkg_id) {
+            Some(entry) => {
+                entry.badge = badge;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 
@@ -74,6 +118,7 @@ impl Registry for ActivityBarRegistry {
             icon: nav.icon.clone(),
             section: nav.section.clone(),
             route: nav.route.clone(),
+            badge: None,
         };
 
         let mut entries = self
