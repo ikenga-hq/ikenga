@@ -33,6 +33,7 @@
  */
 
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { isTauri } from '../transport';
 
 export const OS_FILE_DROP_EVENT = 'ikenga:os-file-drop';
 
@@ -121,6 +122,10 @@ function hideOverlay(): void {
 }
 
 export async function initOsFileDrop(): Promise<() => void> {
+	if (!isTauri()) {
+		console.log('[transport] api/webview (os-file-drop) is desktop-only — deferred to Wave 2');
+		return () => {};
+	}
 	const webview = getCurrentWebview();
 	const unlisten = await webview.onDragDropEvent((event) => {
 		const p = event.payload;

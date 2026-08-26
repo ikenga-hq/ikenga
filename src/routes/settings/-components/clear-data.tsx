@@ -3,7 +3,7 @@
 // cache, browser localStorage, AND the durable settings_kv mirror so a user
 // who clicks here gets a true clean slate (auth + theme survive).
 
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { AlertTriangle, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 

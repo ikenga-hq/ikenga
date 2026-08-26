@@ -13,23 +13,37 @@
 //! `EngineRegistry` keyed by string id (`"claude-code"`, `"gemini"`,
 //! `"codex"`).
 
+// Antigravity is the only adapter the headless daemon can drive today
+// (`server/chat_ws.rs`), and the only one whose CLI needs no desktop session.
+// The rest reach for `AppHandle` to emit on Tauri channels, or for
+// `crate::claude` / `crate::commands`, so they are desktop-only.
 pub mod antigravity_acp;
+#[cfg(feature = "desktop")]
 pub mod claude_code;
+#[cfg(feature = "desktop")]
 pub mod codex_pty;
+#[cfg(feature = "desktop")]
 pub mod cursor_agent;
+#[cfg(feature = "desktop")]
 pub mod opencode_acp;
+#[cfg(feature = "desktop")]
 pub mod pi_acp;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub use antigravity_acp::AntigravityEngineState;
-pub use opencode_acp::OpencodeEngineState;
-pub use pi_acp::PiEngineState;
+#[cfg(feature = "desktop")]
 use crate::engines::claude_code::server::ClaudeCodeEngineState;
+#[cfg(feature = "desktop")]
 use crate::engines::codex_pty::CodexPtyEngineState;
+#[cfg(feature = "desktop")]
 use crate::engines::cursor_agent::CursorAgentEngineState;
+pub use antigravity_acp::AntigravityEngineState;
+#[cfg(feature = "desktop")]
+pub use opencode_acp::OpencodeEngineState;
+#[cfg(feature = "desktop")]
+pub use pi_acp::PiEngineState;
 
 /// In-memory registry of available engine adapters, keyed by stable id.
 ///
@@ -50,14 +64,19 @@ pub struct EngineRegistry {
 /// without a giant match on concrete types.
 #[derive(Clone)]
 pub enum EngineHandle {
+    #[cfg(feature = "desktop")]
     ClaudeCode(ClaudeCodeEngineState),
+    #[cfg(feature = "desktop")]
     CodexPty(CodexPtyEngineState),
     /// Phase 4 scaffold (ADR-013). Runtime stubbed — see
     /// `cursor_agent::server` for the per-method error surface.
+    #[cfg(feature = "desktop")]
     CursorAgent(CursorAgentEngineState),
-    /// Stub — see `antigravity_acp::server`. Never constructed yet.
+    /// Antigravity CLI adapter (`engines/antigravity_acp/server`). WP-15.
     Antigravity(AntigravityEngineState),
+    #[cfg(feature = "desktop")]
     Opencode(OpencodeEngineState),
+    #[cfg(feature = "desktop")]
     Pi(PiEngineState),
 }
 

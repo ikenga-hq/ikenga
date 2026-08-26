@@ -40,6 +40,7 @@
 // chunk the detached graph never loads — so the detached terminal would render
 // without scroll/selection styling. Import it here, scoped to this lazy chunk.
 import '@xterm/xterm/css/xterm.css';
+import { isTauri } from '@/lib/transport';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Terminal } from 'lucide-react';
 import { useEffect, useState } from 'react';
@@ -79,7 +80,7 @@ export default function TerminalSurface({ ctx }: DetachedSurfaceProps) {
 	// to re-cross the IPC boundary for that.
 	const windowTitle = title?.label;
 	useEffect(() => {
-		if (!windowTitle) return;
+		if (!windowTitle || !isTauri()) return;
 		void getCurrentWindow()
 			.setTitle(`${windowTitle} — Ikenga`)
 			.catch(() => {

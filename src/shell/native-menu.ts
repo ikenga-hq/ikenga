@@ -8,6 +8,7 @@
 // agent-eng, etc.) subscribe to the event names below.
 
 import { isMac } from '@/lib/platform';
+import { isTauri } from '@/lib/transport';
 
 const EVT = {
 	newTerminal: 'cmd:new-terminal',
@@ -24,6 +25,10 @@ function emit(name: string) {
 }
 
 export async function installNativeMenu(): Promise<void> {
+	if (!isTauri()) {
+		console.log('[transport] api/menu (native menu) is desktop-only (in-DOM fallback undesigned) — deferred to Wave 2');
+		return;
+	}
 	if (!isMac) return;
 
 	try {

@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # load-bearing API for pkg-browser). Multi-webview was stabilized in
 # tauri 2.1 (PR #11616, Nov 2024) for the macOS WKWebView render path; the
 # feature flag remains the way to opt into the per-window child API.
-tauri = { version = "2.1", features = ["unstable", "devtools"] }
+tauri = { version = "2.1", default-features = false, features = ["unstable", "devtools", "compression", "dynamic-acl"] }
 # Focus the running window instead of forking a whole second app (own SQLite +
 # iyke bridge) when the launcher is double-clicked or the app is reopened while
 # running. Desktop-only (the crate is a no-op on android/ios, which we never
@@ -233,6 +233,11 @@ tempfile = "3"
 regex = "1"
 
 [features]
+default = ["desktop"]
+# The webview runtime and its GTK/WebKit stack. Everything the DESKTOP app
+# needs and the headless daemon does not — `ikenga-server` builds with
+# --no-default-features so it links no browser engine.
+desktop = ["tauri/wry", "tauri/x11", "tauri/dbus", "tauri/common-controls-v6"]
 # this feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
 unstable_message_id = []

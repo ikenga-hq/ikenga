@@ -27,7 +27,9 @@ fn create_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::R
 pub fn get_claude_overlay_dir() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime_dir.is_empty() {
-            return PathBuf::from(runtime_dir).join("ikenga").join("claude-overlay");
+            return PathBuf::from(runtime_dir)
+                .join("ikenga")
+                .join("claude-overlay");
         }
     }
     if let Some(home) = crate::platform::home_dir() {
@@ -80,14 +82,21 @@ pub fn ensure_claude_overlay_dir() -> io::Result<PathBuf> {
         let _ = fs::write(&overlay_settings, "{}");
     }
 
-    // Configure statusLine command block in the overlay settings.json
-    let _ = crate::iyke::statusline::configure_overlay_statusline(&overlay_dir, 0, None);
+    // Statusline / hooks / IDE-lock wiring exists so the DESKTOP shell can see
+    // what a `claude` session is doing. All three live in `iyke`, which is
+    // desktop-only; the daemon has no statusline to feed and no pane to focus,
+    // so it simply leaves the overlay without them.
+    #[cfg(feature = "desktop")]
+    {
+        // Configure statusLine command block in the overlay settings.json
+        let _ = crate::iyke::statusline::configure_overlay_statusline(&overlay_dir, 0, None);
 
-    // Configure hooks block in the overlay settings.json
-    let _ = crate::iyke::hooks::configure_overlay_hooks(&overlay_dir, 0, None);
+        // Configure hooks block in the overlay settings.json
+        let _ = crate::iyke::hooks::configure_overlay_hooks(&overlay_dir, 0, None);
 
-    // Create ide/<port>.lock in overlay dir
-    let _ = crate::iyke::ide::write_ide_lock_file(&overlay_dir, 0, "ikenga-token");
+        // Create ide/<port>.lock in overlay dir
+        let _ = crate::iyke::ide::write_ide_lock_file(&overlay_dir, 0, "ikenga-token");
+    }
 
     Ok(overlay_dir)
 }

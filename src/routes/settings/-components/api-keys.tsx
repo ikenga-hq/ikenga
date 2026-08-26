@@ -3,7 +3,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { CheckCircle2, Eye, EyeOff, KeyRound, Pencil, Plus, Trash2, XCircle } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';

@@ -145,7 +145,7 @@ async function loadDb(): Promise<SqlDb | null> {
 	if (dbLoadAttempted && !dbAvailable) return null;
 	dbLoadAttempted = true;
 	try {
-		const mod = await import('@tauri-apps/plugin-sql');
+		const mod = await import('@/lib/transport/sql-shim');
 		const Database = (mod as unknown as { default: { load: (url: string) => Promise<SqlDb> } })
 			.default;
 		const db = await Database.load(SQL_DB_URL);

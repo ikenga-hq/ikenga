@@ -1,0 +1,32 @@
+# Run ./deploy.sh first — it stages shell/scripts/server/out/{bin,dist}, which
+# is this compose file's build context. See Dockerfile for why the binary is
+# built outside the image.
+#
+# `version:` is intentionally absent: it is obsolete in Compose v2 and emits a
+# warning on every invocation.
+
+services:
+  ikenga-server:
+    build:
+      context: ./out
+      dockerfile: ../Dockerfile
+    container_name: ikenga-server
+    restart: unless-stopped
+    ports:
+      # Bound to loopback: the daemon is meant to sit behind a Tailscale
+      # perimeter (ikenga#113 / WP-14b), not be published straight onto the host's
+      # public interface. Change to "4000:4000" only behind a trusted network.
+      - "127.0.0.1:4000:4000"
+    environment:
+      - IKENGA_HOST=0.0.0.0
+      - IKENGA_PORT=4000
+      # Required. Fails closed without it — the daemon mints a random token per
+      # start, which breaks every client on restart.
+      - IKENGA_AUTH_TOKEN=${IKENGA_AUTH_TOKEN:?set IKENGA_AUTH_TOKEN (see bootstrap-credentials.sh)}
+      - IKENGA_VAULT_KEY=${IKENGA_VAULT_KEY:?set IKENGA_VAULT_KEY (see bootstrap-credentials.sh)}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - ./data:/opt/ikenga/data
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.gemini:/root/.gemini

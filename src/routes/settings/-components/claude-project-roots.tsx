@@ -5,7 +5,7 @@
 // the user adds here — it doesn't need to be listed explicitly.
 
 import { useEffect, useState } from 'react';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { FolderOpen, FolderPlus, Info, RotateCcw, Trash2 } from 'lucide-react';
 import { Link } from '@tanstack/react-router';
 

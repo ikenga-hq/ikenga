@@ -18,7 +18,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { open as openTauriDialog } from '@tauri-apps/plugin-dialog';
+import { open as openTauriDialog } from '@/lib/transport/dialog-shim';
 import * as Icons from 'lucide-react';
 
 import {

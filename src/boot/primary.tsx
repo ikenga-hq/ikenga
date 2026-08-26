@@ -17,6 +17,8 @@ import { initDefaultCwd } from '@/lib/shell/default-cwd';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
+import { FilepickerModal } from '@/components/ui/filepicker-modal';
+import { ReauthOverlay } from '@/components/ui/reauth-overlay';
 import { routeTree } from '../routeTree.gen';
 
 import '@xterm/xterm/css/xterm.css';
@@ -80,6 +82,8 @@ export function bootPrimary(): void {
 		<React.StrictMode>
 			<QueryClientProvider client={queryClient}>
 				<RouterProvider router={router} />
+				<FilepickerModal />
+				<ReauthOverlay />
 				{import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
 			</QueryClientProvider>
 		</React.StrictMode>

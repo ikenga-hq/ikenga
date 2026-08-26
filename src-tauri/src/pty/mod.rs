@@ -26,10 +26,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "desktop")]
 use base64::Engine;
 use dashmap::DashMap;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
+// The Tauri sink is one of two ways a session's bytes leave this module; the
+// other is the `Custom` callback pair the daemon uses. Only the former needs a
+// webview runtime.
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
@@ -161,6 +166,7 @@ pub type ExitSink = Box<dyn FnOnce(i32) + Send + 'static>;
 /// which `spawn_inner` generates, so the choice is passed in and materialized
 /// once the id exists.
 enum SinkSpec {
+    #[cfg(feature = "desktop")]
     Tauri(AppHandle),
     Custom(DataSink, ExitSink),
 }
@@ -320,6 +326,7 @@ impl PtyManager {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub async fn spawn(self: &Arc<Self>, app: AppHandle, opts: SpawnOpts) -> Result<String> {
         self.spawn_inner(SinkSpec::Tauri(app), opts, None).await
     }
@@ -346,6 +353,7 @@ impl PtyManager {
     /// Spawn with a byte subscriber attached. The subscriber sees raw PTY
     /// bytes alongside the normal `pty://{id}` event emission; used by the
     /// Claude session integration to feed `StreamParser`.
+    #[cfg(feature = "desktop")]
     pub async fn spawn_with_subscriber(
         self: &Arc<Self>,
         app: AppHandle,
@@ -387,6 +395,7 @@ impl PtyManager {
         // lets the frontend keep an absolute stream position for the capture
         // ring's own snapshot reconciliation.
         let (data_sink, exit_sink): (DataSink, ExitSink) = match sinks {
+            #[cfg(feature = "desktop")]
             SinkSpec::Tauri(app) => {
                 let event_name = format!("pty://{id}");
                 let exit_event = format!("pty://{id}/exit");
@@ -441,7 +450,9 @@ impl PtyManager {
         // the app inherited a thin GUI $PATH. Caller env below still wins.
         builder.env("PATH", crate::runtime::augmented_path());
         // WP-00: Thread CLAUDE_CONFIG_DIR overlay if not explicitly specified by caller env.
-        if !opts.env.contains_key("CLAUDE_CONFIG_DIR") && std::env::var("CLAUDE_CONFIG_DIR").is_err() {
+        if !opts.env.contains_key("CLAUDE_CONFIG_DIR")
+            && std::env::var("CLAUDE_CONFIG_DIR").is_err()
+        {
             if let Ok(overlay_dir) = overlay::ensure_claude_overlay_dir() {
                 if let Some(dir_str) = overlay_dir.to_str() {
                     builder.env("CLAUDE_CONFIG_DIR", dir_str);
@@ -571,7 +582,6 @@ impl PtyManager {
                     return;
                 };
                 let end_offset = st.ring.push(bytes);
-                let _ = session_for_emit.broadcast_tx.send(bytes.to_vec());
                 if st.gate.is_some() {
                     let overflowed = {
                         // `is_some` checked directly above.
@@ -585,10 +595,12 @@ impl PtyManager {
                             held = gate.held.len(),
                             "pty attach gate overflowed before arm; releasing the stream"
                         );
+                        let _ = session_for_emit.broadcast_tx.send(gate.held.clone());
                         (session_for_emit.sink)(&gate.held, end_offset);
                     }
                     return;
                 }
+                let _ = session_for_emit.broadcast_tx.send(bytes.to_vec());
                 (session_for_emit.sink)(bytes, end_offset);
             };
             let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
@@ -1100,6 +1112,11 @@ impl PtyManager {
             tracing::warn!("pty attach gate replaced before arm; flushing held bytes");
             if !prev.held.is_empty() {
                 let end = st.ring.total;
+                // Both consumers, exactly as `attach_arm` and the overflow
+                // path do. Flushing only to the sink drops these bytes from
+                // every WebSocket client for good — the gate holds back the
+                // broadcast too, so nothing else will ever replay them.
+                let _ = session.broadcast_tx.send(prev.held.clone());
                 (session.sink)(&prev.held, end);
             }
         }
@@ -1134,6 +1151,7 @@ impl PtyManager {
         let gate = st.gate.take().expect("token matched a present gate");
         if !gate.held.is_empty() {
             let end = st.ring.total;
+            let _ = session.broadcast_tx.send(gate.held.clone());
             (session.sink)(&gate.held, end);
         }
         true
@@ -1165,6 +1183,46 @@ impl PtyManager {
         Ok(())
     }
 
+    /// Exit state of a session: `None` while running, `Some(code)` once the
+    /// child has been waited on.
+    ///
+    /// An exited session stays in the map for `EXITED_RETENTION` so its
+    /// scrollback and exit code remain readable, which means "the session is
+    /// gone from `sessions`" and "the shell exited" are different questions.
+    /// Callers that need the second one must ask it here rather than inferring
+    /// it from a dropped channel.
+    pub fn exit_status(&self, id: &str) -> Result<Option<i32>> {
+        let resolved = self.resolve_id(id)?;
+        let session = self
+            .sessions
+            .get(&resolved)
+            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
+        Ok(session
+            .exited
+            .load(Ordering::Acquire)
+            .then(|| session.exit_code.load(Ordering::Relaxed)))
+    }
+
+    /// Resolve once the session has exited, yielding its exit code.
+    ///
+    /// Returns `None` if the session is unknown (already reaped). The waiter is
+    /// registered before the state is re-checked, so an exit landing between
+    /// the two cannot be missed.
+    pub async fn wait_for_exit(&self, id: &str) -> Option<i32> {
+        let resolved = self.resolve_id(id).ok()?;
+        let session = self.sessions.get(&resolved)?.clone();
+        loop {
+            if session.exited.load(Ordering::Acquire) {
+                return Some(session.exit_code.load(Ordering::Relaxed));
+            }
+            let notified = session.output_notify.notified();
+            if session.exited.load(Ordering::Acquire) {
+                return Some(session.exit_code.load(Ordering::Relaxed));
+            }
+            notified.await;
+        }
+    }
+
     /// Subscribe to live output bytes emitted by the given terminal.
     pub fn subscribe(&self, id: &str) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
         let resolved = self.resolve_id(id)?;
@@ -1173,25 +1231,6 @@ impl PtyManager {
             .get(&resolved)
             .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
         Ok(session.broadcast_tx.subscribe())
-    }
-
-    /// Subscribe to live output bytes and return the current scrollback buffer.
-    pub fn subscribe_session(&self, id: &str) -> Result<(Vec<u8>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
-        let resolved = self.resolve_id(id)?;
-        let session = self
-            .sessions
-            .get(&resolved)
-            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?
-            .clone();
-        // Subscribe and snapshot under the same `emit` guard the reader loop
-        // takes to push into the ring and broadcast. Doing them separately
-        // lets a chunk land in between and be delivered twice — once in the
-        // replayed scrollback, once live.
-        let (snapshot, rx) = match session.emit.lock() {
-            Ok(st) => (st.ring.snapshot().0, session.broadcast_tx.subscribe()),
-            Err(_) => (Vec::new(), session.broadcast_tx.subscribe()),
-        };
-        Ok((snapshot, rx))
     }
 }
 
@@ -1224,6 +1263,54 @@ mod tests {
     /// Guards against a vacuous pass: it asserts the gate genuinely held bytes
     /// back during the handshake window, and includes a negative control
     /// reproducing the OLD listen-then-snapshot ordering, which must duplicate.
+    /// `wait_for_exit` must resolve on the shell actually exiting, NOT on the
+    /// session leaving the map.
+    ///
+    /// An exited session is retained for `EXITED_RETENTION` (ten minutes) so
+    /// its scrollback stays readable, which means its `broadcast_tx` is still
+    /// alive that whole time. Code that inferred "exited" from a closed
+    /// broadcast channel — as `pty_ws` originally did — saw nothing for ten
+    /// minutes and left remote clients reconnecting to a finished shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_for_exit_resolves_on_exit_not_on_reap() {
+        let mgr = Arc::new(PtyManager::new());
+        let id = mgr
+            .spawn_headless(SpawnOpts {
+                terminal_id: None,
+                title: None,
+                cwd: "/".into(),
+                cmd: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                env: HashMap::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .expect("spawn");
+
+        let code = tokio::time::timeout(Duration::from_secs(10), mgr.wait_for_exit(&id))
+            .await
+            .expect("wait_for_exit must resolve well before the retention window");
+        assert_eq!(
+            code,
+            Some(7),
+            "the real exit status has to survive the trip"
+        );
+
+        // Still in the map, still subscribable — proving the resolution above
+        // was driven by the exit itself and not by the entry being removed.
+        assert_eq!(mgr.exit_status(&id).expect("still retained"), Some(7));
+        assert!(
+            mgr.subscribe(&id).is_ok(),
+            "an exited session is retained, so its broadcast sender is still alive"
+        );
+
+        // Already-exited sessions resolve immediately rather than hanging.
+        let again = tokio::time::timeout(Duration::from_secs(2), mgr.wait_for_exit(&id))
+            .await
+            .expect("must not block once the exit has already happened");
+        assert_eq!(again, Some(7));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn attach_seam_delivers_the_stream_exactly_once() {
         let mgr = Arc::new(PtyManager::new());

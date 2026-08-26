@@ -1,10 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { stripSecretEnv, useTerminalStore } from './session-store';
 
-// The store loads `@tauri-apps/plugin-sql` lazily on persist; mocking it
+// The store loads the SQL shim lazily on persist; mocking it
 // keeps the tests offline. Failure to load falls back to localStorage
 // (also fine in jsdom).
-vi.mock('@tauri-apps/plugin-sql', () => ({
+vi.mock('@/lib/transport/sql-shim', () => ({
 	default: {
 		load: async () => {
 			throw new Error('sql disabled in tests');

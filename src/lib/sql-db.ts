@@ -18,8 +18,8 @@
 // base — so `sqlite:<abs>/ikenga.db` opens the exact file the Rust side owns.
 // `appDataDir()` (JS) and `app_data_dir()` (Rust) resolve to the same place.
 
-import { appDataDir, join } from '@tauri-apps/api/path';
-import Database from '@tauri-apps/plugin-sql';
+import { appDataDir, join } from '@/lib/transport/path-shim';
+import Database from '@/lib/transport/sql-shim';
 
 let cached: Promise<Database> | null = null;
 

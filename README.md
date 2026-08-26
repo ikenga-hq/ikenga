@@ -277,6 +277,62 @@ Tauri produces an ad-hoc-signed `.app`; the script copies it to
 doesn't block first launch. For a universal binary, set
 `TAURI_TARGET=universal-apple-darwin` and build that target instead.
 
+### Server Deployment & Task 0 Credential Bootstrap
+
+`ikenga-server` is a headless control plane binary that can run on a remote server or VM (behind a Tailscale perimeter).
+
+#### Build & Stage Artifacts
+Run `shell/scripts/server/deploy.sh` from a clean checkout of `shell`:
+```bash
+./scripts/server/deploy.sh
+# Stages compiled binary & frontend assets into scripts/server/out/
+
+# Deploying from a non-Linux machine? Name the server's target, or you will
+# stage a binary the host cannot execute:
+TARGET=x86_64-unknown-linux-gnu ./scripts/server/deploy.sh
+```
+
+#### Task 0 Credential Bootstrap
+On the target host, run `bootstrap-credentials.sh` prior to starting `ikenga-server`:
+```bash
+./scripts/server/bootstrap-credentials.sh
+```
+This idempotently generates server secrets into `/opt/ikenga/.env` (mode 600). It only
+ever *appends* — an existing value is left alone, so re-running it can never destroy a
+credential nobody has another copy of.
+
+- `IKENGA_AUTH_TOKEN`: Pinned bearer token for API + WebSocket authentication. Read by
+  `ikenga-server` directly (clap `env = "IKENGA_AUTH_TOKEN"`).
+- `IKENGA_VAULT_KEY`: **Reserved — nothing reads it yet.** The headless vault is WP-12b
+  (ikenga#100); `secrets_set` currently answers "not implemented in the headless daemon".
+  It is generated now so the vault lands on a key that has been stable since first boot.
+- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`: appended to the same env file if exported.
+  systemd loads it via `EnvironmentFile` and the engine adapters inherit their
+  environment, so the agent CLIs pick them up without any config file being written.
+
+> ⚠️ **Security Posture Note (G-30)**: keeping long-lived credentials in
+> `/opt/ikenga/.env` lets `ikenga-server` run headless without manual passphrase entry.
+> That is the trade: **box compromise equals credential compromise**. It applies today to
+> `IKENGA_AUTH_TOKEN` and the agent API keys; `IKENGA_VAULT_KEY` joins them once WP-12b
+> gives it a consumer.
+
+#### Verifying a running daemon
+
+`scripts/server/verify-live.ts` drives the daemon's real HTTP and WebSocket
+surface — real PTYs, real reconnects, and a real `agy` turn. Nothing in it is
+stubbed, which is the point: the two worst defects found in this subsystem (a
+`tokio::join!` that never returned, and a deleted stylesheet import) both
+compiled clean and passed every offline gate.
+
+```bash
+IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
+  bun run scripts/server/verify-live.ts
+```
+
+#### Running under systemd or Docker
+- **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.
+- **Docker**: Run `docker compose -f scripts/server/docker-compose.yml up -d` after running `deploy.sh`.
+
 ### What we don't do yet
 
 - No code signing (no Apple Developer ID, no Windows EV cert)

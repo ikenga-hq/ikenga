@@ -5,7 +5,7 @@
 // the allowlist before persisting.
 
 import { useEffect, useState } from 'react';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { FolderOpen, FolderPlus, RotateCcw, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';

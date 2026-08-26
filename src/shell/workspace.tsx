@@ -28,6 +28,7 @@ import { ActivityBar } from './activity-bar';
 import { TerminalHandoffPrompt } from './artifact-wizard/terminal-handoff-prompt';
 import { WizardPopRecoveryChip } from './artifact-wizard/wizard-pop-recovery-chip';
 import { CommandPalette, useCommandPalette } from './command-palette';
+import { ConnectionBanner } from './connection-banner';
 import { ConnectorBanner } from './connector-banner';
 import { ContentPane } from './content-pane';
 import { Dock } from './dock/dock';
@@ -313,6 +314,7 @@ export function Workspace() {
 
 	return (
 		<div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
+			<ConnectionBanner />
 			<UpdaterBanner />
 			<PkgAutoUpdater />
 			<ConnectorBanner />

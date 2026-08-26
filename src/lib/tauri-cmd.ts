@@ -10,6 +10,7 @@
 
 import type { WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
+import { attachRemotePty } from './transport/pty-socket';
 
 export { isTauri, isRemoteWebSession, getTransport, type RpcTransport };
 export type UnlistenFn = () => void;
@@ -18,7 +19,10 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	return getTransport().invoke<T>(cmd, args);
 }
 
-function listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<UnlistenFn> {
+function listen<T>(
+	event: string,
+	handler: (event: { event: string; payload: T }) => void
+): Promise<UnlistenFn> {
 	return getTransport().listen<T>(event, handler);
 }
 
@@ -147,35 +151,7 @@ export async function ptyListen(
 	if (isRemoteWebSession()) {
 		const transport = getTransport();
 		if (transport.openPtySocket) {
-			const ws = transport.openPtySocket(id);
-			// `endOffset` is the cumulative byte count the chunk *ends* at, and
-			// `pty-bridge` derives each chunk's absolute start from it. Passing a
-			// constant 0 made every start negative and, with a dedup threshold
-			// set, dropped the whole stream — so count bytes as they arrive. The
-			// first frame is the server's scrollback replay, which is where this
-			// connection's stream genuinely starts.
-			let received = 0;
-			const emit = (bytes: Uint8Array) => {
-				received += bytes.length;
-				onData(bytes, received);
-			};
-			ws.onmessage = (e) => {
-				if (e.data instanceof ArrayBuffer) {
-					emit(new Uint8Array(e.data));
-				} else if (typeof e.data === 'string') {
-					emit(new TextEncoder().encode(e.data));
-				}
-			};
-			// A closed socket means no more output, not a clean `exit 0` — the
-			// wire carries no exit code, and a dropped connection would otherwise
-			// tell the UI the shell finished successfully. `null` is the
-			// "exited, code unknown" the handler type already allows.
-			ws.onclose = () => {
-				onExit(null);
-			};
-			return () => {
-				ws.close();
-			};
+			return attachRemotePty(transport.openPtySocket.bind(transport), id, onData, onExit);
 		}
 	}
 
