@@ -173,6 +173,26 @@ enum SinkSpec {
 
 static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Environment variables that belong to the HOST process and must never reach
+/// a child shell.
+///
+/// Deliberately narrow. Agent credentials (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+/// …) are NOT listed: a terminal inheriting the box's agent auth is the point
+/// of the remote-access design, not an accident. What is excluded is the
+/// daemon's own keys —
+///
+/// * `IKENGA_AUTH_TOKEN` — the bearer token that grants a terminal. Readable
+///   from inside a terminal, it is a credential that outlives the session and
+///   survives revoking the client.
+/// * `IKENGA_VAULT_KEY` — unlocks the secrets store; a shell that can read it
+///   can decrypt every secret at rest.
+/// * `IKENGA_SECRET_*` — the namespace `/api/rpc`'s `secrets_get` serves.
+///   These are application secrets fetched deliberately through an
+///   authenticated RPC, not shell environment.
+fn is_host_only_env(key: &str) -> bool {
+    matches!(key, "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY") || key.starts_with("IKENGA_SECRET_")
+}
+
 /// Wrapper for `MasterPty::process_group_leader`, which is `#[cfg(unix)]` in
 /// portable-pty 0.8. On Windows there's no PTY foreground-PG concept, so we
 /// surface `None` and let callers degrade gracefully.
@@ -438,10 +458,33 @@ impl PtyManager {
         }
         builder.cwd(&resolved_cwd);
 
-        // Inherit a sane PATH from the parent process so `claude` (and friends
-        // installed in user-local bins) resolve. portable-pty does not inherit
-        // env by default.
-        for (k, v) in std::env::vars() {
+        // Inherit the parent environment so `claude` (and friends installed in
+        // user-local bins) resolve.
+        //
+        // `env_clear()` FIRST is load-bearing, and the reason is not obvious:
+        // `CommandBuilder` seeds itself from `std::env::vars_os()` at
+        // construction (portable-pty 0.8.1 `cmdbuilder.rs:73`), so it inherits
+        // by DEFAULT. An in-tree comment used to claim the opposite. Filtering
+        // the loop below without clearing first therefore filters nothing —
+        // skipping a key just leaves the already-inherited copy in place, and
+        // the denylist becomes decoration. Proven by execution: with the loop
+        // filtered but no `env_clear`, a remote terminal still printed back
+        // `IKENGA_SECRET_*`.
+        //
+        // Wholesale inheritance is deliberate — agent CLIs need the user's real
+        // environment — but it means anything the HOST holds is readable from
+        // inside a shell it spawns. Fine for a desktop app the user already
+        // controls; not fine for a daemon serving terminals over a network,
+        // where the host's own credentials would be readable by whoever opened
+        // the terminal.
+        //
+        // `vars_os` rather than `vars` so a non-UTF-8 variable is passed
+        // through rather than silently dropped by the rebuild.
+        builder.env_clear();
+        for (k, v) in std::env::vars_os() {
+            if is_host_only_env(&k.to_string_lossy()) {
+                continue;
+            }
             builder.env(&k, &v);
         }
         // Override PATH with the augmented one (ADR-013 §Addendum Decision 2)
@@ -1263,6 +1306,35 @@ mod tests {
     /// Guards against a vacuous pass: it asserts the gate genuinely held bytes
     /// back during the handshake window, and includes a negative control
     /// reproducing the OLD listen-then-snapshot ordering, which must duplicate.
+    /// The denylist is the boundary between "the host's own credentials" and
+    /// "the user's environment". Both directions matter: blocking too little
+    /// leaks the daemon's bearer token into every terminal it serves; blocking
+    /// too much breaks the agent CLIs that are the reason the environment is
+    /// inherited at all.
+    #[test]
+    fn host_only_env_blocks_daemon_credentials_but_not_agent_auth() {
+        // The daemon's own keys — a shell must never see these.
+        assert!(is_host_only_env("IKENGA_AUTH_TOKEN"));
+        assert!(is_host_only_env("IKENGA_VAULT_KEY"));
+        assert!(is_host_only_env("IKENGA_SECRET_FAL"));
+        assert!(is_host_only_env("IKENGA_SECRET_"));
+
+        // Agent credentials are inherited ON PURPOSE: a remote terminal picking
+        // up the box's `claude` / `gemini` auth is the point of the design.
+        assert!(!is_host_only_env("ANTHROPIC_API_KEY"));
+        assert!(!is_host_only_env("GEMINI_API_KEY"));
+        assert!(!is_host_only_env("OPENAI_API_KEY"));
+
+        // And the ordinary environment is untouched.
+        assert!(!is_host_only_env("PATH"));
+        assert!(!is_host_only_env("HOME"));
+        assert!(!is_host_only_env("IKENGA_HOST"));
+        assert!(!is_host_only_env("IKENGA_PORT"));
+        // Near-misses must not be swept up by the prefix match.
+        assert!(!is_host_only_env("IKENGA_SECRETS_DIR"));
+        assert!(!is_host_only_env("MY_IKENGA_SECRET_X"));
+    }
+
     /// `wait_for_exit` must resolve on the shell actually exiting, NOT on the
     /// session leaving the map.
     ///
