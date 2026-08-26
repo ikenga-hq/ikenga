@@ -113,6 +113,14 @@ export class WebRemoteTransport implements RpcTransport {
 			body: JSON.stringify({ cmd, args: args ?? {} }),
 		});
 		if (!res.ok) {
+			if (res.status === 401) {
+				try {
+					const { useReauthStore } = await import('./reauth-store');
+					useReauthStore.getState().showReauth();
+				} catch {
+					// Fall through
+				}
+			}
 			throw new Error(`HTTP RPC error: ${res.status} ${res.statusText}`);
 		}
 		const json = await res.json();

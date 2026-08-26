@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { Monitor, Moon, RotateCcw, Sun } from 'lucide-react';
 import { useCallback, useRef, useState } from 'react';
 

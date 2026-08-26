@@ -951,8 +951,9 @@ mod tests {
     /// without a bump, the exact drift this guard exists to catch. 0056
     /// (email_actions + email_triage_cursor) landed without a bump too;
     /// 0057 (iyke_todo_task_link, WP-10) brings it to 57; 0058 (email_index +
-    /// email_ingest_cursor, headers-first mailbox ingest) brings it to 58.
-    const MIGRATION_COUNT: i64 = 61;
+    /// email_ingest_cursor, headers-first mailbox ingest) brings it to 58;
+    /// 0062 (content_review_axis) brings it to 62.
+    const MIGRATION_COUNT: i64 = 62;
 
     /// Schema init applies every embedded migration exactly once. The
     /// `_pa_migrations` table must end with one row per migration tuple.

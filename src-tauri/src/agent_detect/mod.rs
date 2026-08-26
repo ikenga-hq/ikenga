@@ -300,21 +300,68 @@ pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F)
             return (root.clone(), exists(&root));
         }
 
-        // Seed with drive letter: "C:\Users" or "C:/Users"
         let mut acc = format!("{}:\\{}", drive.to_ascii_uppercase(), tokens[0]);
+        let mut i = 1;
+        while i < tokens.len() {
+            let mut matched = false;
 
-        const SEPARATORS: [char; 4] = ['\\', '-', '_', '.'];
-        for tok in &tokens[1..] {
-            let candidates: Vec<String> = SEPARATORS
-                .iter()
-                .map(|sep| format!("{}{}{}", acc, sep, tok))
-                .collect();
-            acc = candidates
-                .iter()
-                .find(|p| exists(p))
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
+            // 1. Canonical main path separator for single token
+            let single_canonical = format!("{}\\{}", acc, tokens[i]);
+            if exists(&single_canonical) {
+                acc = single_canonical;
+                i += 1;
+                continue;
+            }
+
+            // 2. Multi-token slices (longest slice first) with `-`, `.`, or `_`
+            for j in (i + 2..=tokens.len()).rev() {
+                let slice = &tokens[i..j];
+                let dash_cand = format!("{}\\{}", acc, slice.join("-"));
+                if exists(&dash_cand) {
+                    acc = dash_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+                let dot_cand = format!("{}\\{}", acc, slice.join("."));
+                if exists(&dot_cand) {
+                    acc = dot_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+                let und_cand = format!("{}\\{}", acc, slice.join("_"));
+                if exists(&und_cand) {
+                    acc = und_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            // 3. Single token with alternative separators (`-`, `_`, `.`)
+            let alt_separators = ['-', '_', '.'];
+            for sep in alt_separators {
+                let cand = format!("{}{}{}", acc, sep, tokens[i]);
+                if exists(&cand) {
+                    acc = cand;
+                    i += 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            // 4. Default fallback: join with canonical path separator
+            acc = single_canonical;
+            i += 1;
         }
+
         let verified = exists(&acc);
         return (acc, verified);
     }
@@ -327,27 +374,66 @@ pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F)
             return ("/".to_string(), exists("/"));
         }
 
-        // Seed: leading `/<first-token>`. We don't FS-check this — the user's
-        // FS root almost certainly contains it (`/Users`, `/home`, etc.).
         let mut acc = format!("/{}", tokens[0]);
+        let mut i = 1;
+        while i < tokens.len() {
+            let mut matched = false;
 
-        // Probe order: '/' first (canonical Claude encoding) then '-', '_',
-        // '.'. Claude Code encodes any of these as '-' on disk, so we have to
-        // try each at every token boundary. The first existing candidate wins;
-        // when none exist we keep the '/' join (preserves any earlier verified
-        // prefix and defaults the unknown tail to canonical slashes).
-        const SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
+            // 1. Canonical main path separator for single token
+            let single_canonical = format!("{}/{}", acc, tokens[i]);
+            if exists(&single_canonical) {
+                acc = single_canonical;
+                i += 1;
+                continue;
+            }
 
-        for tok in &tokens[1..] {
-            let candidates: Vec<String> = SEPARATORS
-                .iter()
-                .map(|sep| format!("{}{}{}", acc, sep, tok))
-                .collect();
-            acc = candidates
-                .iter()
-                .find(|p| exists(p))
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
+            // 2. Multi-token slices (longest slice first) with `-`, `.`, or `_`
+            for j in (i + 2..=tokens.len()).rev() {
+                let slice = &tokens[i..j];
+                let dash_cand = format!("{}/{}", acc, slice.join("-"));
+                if exists(&dash_cand) {
+                    acc = dash_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+                let dot_cand = format!("{}/{}", acc, slice.join("."));
+                if exists(&dot_cand) {
+                    acc = dot_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+                let und_cand = format!("{}/{}", acc, slice.join("_"));
+                if exists(&und_cand) {
+                    acc = und_cand;
+                    i = j;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            // 3. Single token with alternative separators (`-`, `_`, `.`)
+            let alt_separators = ['-', '_', '.'];
+            for sep in alt_separators {
+                let cand = format!("{}{}{}", acc, sep, tokens[i]);
+                if exists(&cand) {
+                    acc = cand;
+                    i += 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            // 4. Default fallback: join with canonical path separator
+            acc = single_canonical;
+            i += 1;
         }
 
         let verified = exists(&acc);

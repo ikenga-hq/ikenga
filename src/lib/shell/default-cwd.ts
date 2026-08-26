@@ -11,7 +11,7 @@
 // used to live in dock.tsx, new-tab-menu.tsx, single-terminal.tsx, the
 // engine adapters, and the sessions dialog.
 
-import { homeDir } from '@tauri-apps/api/path';
+import { homeDir } from '@/lib/transport/path-shim';
 
 import { useShellStore } from './shell-store';
 

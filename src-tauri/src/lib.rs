@@ -140,6 +140,8 @@ pub fn run() {
     // verified. Registered now so the FE engine catalog can show the
     // row and the dispatcher can resolve "cursor-agent" without a
     // special case.
+    let antigravity_engine: engines::antigravity_acp::AntigravityEngineState =
+        Arc::new(engines::antigravity_acp::AntigravityEngine::new());
     let cursor_agent_engine: engines::cursor_agent::CursorAgentEngineState =
         Arc::new(engines::cursor_agent::CursorAgentEngine::new());
     let opencode_engine: engines::opencode_acp::OpencodeEngineState =
@@ -152,12 +154,15 @@ pub fn run() {
     let engine_registry: engines::EngineRegistryState = Arc::new(engines::EngineRegistry::new());
     {
         let reg = engine_registry.clone();
+        let antigravity_handle = engines::EngineHandle::Antigravity(antigravity_engine.clone());
         let claude_handle = engines::EngineHandle::ClaudeCode(claude_code_engine.clone());
         let codex_handle = engines::EngineHandle::CodexPty(codex_pty_engine.clone());
         let cursor_agent_handle = engines::EngineHandle::CursorAgent(cursor_agent_engine.clone());
         let opencode_handle = engines::EngineHandle::Opencode(opencode_engine.clone());
         let pi_handle = engines::EngineHandle::Pi(pi_engine.clone());
         tauri::async_runtime::block_on(async move {
+            reg.insert("antigravity", antigravity_handle.clone()).await;
+            reg.insert("antigravity-cli", antigravity_handle).await;
             reg.insert("claude-code", claude_handle).await;
             reg.insert("codex", codex_handle).await;
             reg.insert("cursor-agent", cursor_agent_handle).await;

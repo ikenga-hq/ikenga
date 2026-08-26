@@ -23,6 +23,7 @@
 
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { isTauri } from '../transport';
 
 const STORAGE_KEY = 'ikenga.zoom';
 const ZOOM_EVENT = 'ikenga://zoom-changed';
@@ -78,6 +79,7 @@ export function getZoom(): number {
 // no-Tauri-here case.
 async function applyLocally(level: number): Promise<void> {
 	current = level;
+	if (!isTauri()) return;
 	try {
 		await getCurrentWebview().setZoom(level);
 	} catch (err) {

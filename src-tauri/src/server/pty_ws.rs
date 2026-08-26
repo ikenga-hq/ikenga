@@ -63,22 +63,36 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
         }
     };
 
-    let (snapshot, mut pty_rx) = match state.pty_manager.subscribe_session(&pty_id) {
-        Ok(res) => res,
+    let snap = match state.pty_manager.attach_begin(&pty_id) {
+        Some(snap) => snap,
+        None => {
+            error!("Failed to begin attach for PTY {pty_id}");
+            let _ = ws_tx.send(Message::Text("Error: PTY session unavailable".to_string())).await;
+            return;
+        }
+    };
+
+    let mut pty_rx = match state.pty_manager.subscribe(&pty_id) {
+        Ok(rx) => rx,
         Err(err) => {
             error!("Failed to subscribe to PTY {pty_id}: {err}");
+            state.pty_manager.attach_arm(&pty_id, snap.token);
             let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
             return;
         }
     };
 
     // Replay initial scrollback snapshot as binary frame
-    if !snapshot.is_empty() {
-        if let Err(e) = ws_tx.send(Message::Binary(snapshot)).await {
+    if !snap.data.is_empty() {
+        if let Err(e) = ws_tx.send(Message::Binary(snap.data)).await {
             error!("Failed to send scrollback snapshot: {e}");
+            state.pty_manager.attach_arm(&pty_id, snap.token);
             return;
         }
     }
+
+    // Release gate: held bytes (if any) are flushed to broadcast_tx and delivered to pty_rx
+    state.pty_manager.attach_arm(&pty_id, snap.token);
 
     let pty_manager = state.pty_manager.clone();
     let session_id = pty_id.clone();

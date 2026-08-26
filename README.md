@@ -277,6 +277,33 @@ Tauri produces an ad-hoc-signed `.app`; the script copies it to
 doesn't block first launch. For a universal binary, set
 `TAURI_TARGET=universal-apple-darwin` and build that target instead.
 
+### Server Deployment & Task 0 Credential Bootstrap
+
+`ikenga-server` is a headless control plane binary that can run on a remote server or VM (behind a Tailscale perimeter).
+
+#### Build & Stage Artifacts
+Run `shell/scripts/server/deploy.sh` from a clean checkout of `shell`:
+```bash
+./scripts/server/deploy.sh
+# Stages compiled binary & frontend assets into scripts/server/out/
+```
+
+#### Task 0 Credential Bootstrap
+On the target host, run `bootstrap-credentials.sh` prior to starting `ikenga-server`:
+```bash
+./scripts/server/bootstrap-credentials.sh
+```
+This idempotently generates server secrets into `/opt/ikenga/.env` (mode 600):
+- `IKENGA_AUTH_TOKEN`: Pinned bearer token for API + WebSocket authentication.
+- `IKENGA_VAULT_KEY`: Headless master key for vault state decryption.
+- Plants agent API credentials (`~/.claude.json`, `~/.gemini/antigravity/env.json`) if `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` are exported.
+
+> ⚠️ **Security Posture Note (G-30)**: Establishing `IKENGA_VAULT_KEY` in `/opt/ikenga/.env` allows `ikenga-server` to run headless without manual passphrase entry. This shifts security posture: **box compromise equals vault compromise**.
+
+#### Running under systemd or Docker
+- **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.
+- **Docker**: Run `docker compose -f scripts/server/docker-compose.yml up -d` after running `deploy.sh`.
+
 ### What we don't do yet
 
 - No code signing (no Apple Developer ID, no Windows EV cert)

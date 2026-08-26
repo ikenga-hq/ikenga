@@ -3,7 +3,7 @@
 // `screenshot::config` state; persisted to disk by Tauri.
 
 import { useEffect, useState } from 'react';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { Camera, FolderPlus, RotateCcw } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';

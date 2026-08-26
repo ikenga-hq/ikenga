@@ -5,7 +5,7 @@ import {
 	open as openDialog,
 	save as saveDialog,
 	confirm as confirmDialog,
-} from '@tauri-apps/plugin-dialog';
+} from '@/lib/transport/dialog-shim';
 import {
 	Download,
 	Upload,

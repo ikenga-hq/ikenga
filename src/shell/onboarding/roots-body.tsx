@@ -17,7 +17,7 @@
 // prefix even when the full path can't be confirmed.
 
 import { useQuery } from '@tanstack/react-query';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';

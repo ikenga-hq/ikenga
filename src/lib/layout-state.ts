@@ -11,7 +11,7 @@
 // prefer SQLite and fall through to localStorage on any error or timeout.
 // Net result: state is durable even when the SQL plugin is misbehaving.
 
-import type Database from '@tauri-apps/plugin-sql';
+import type Database from '@/lib/transport/sql-shim';
 import { loadAppDb } from '@/lib/sql-db';
 import { scopedLsPrefix, windowLabel } from '@/lib/window/window-context';
 

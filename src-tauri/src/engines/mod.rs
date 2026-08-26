@@ -55,7 +55,7 @@ pub enum EngineHandle {
     /// Phase 4 scaffold (ADR-013). Runtime stubbed — see
     /// `cursor_agent::server` for the per-method error surface.
     CursorAgent(CursorAgentEngineState),
-    /// Stub — see `antigravity_acp::server`. Never constructed yet.
+    /// Antigravity CLI adapter (`engines/antigravity_acp/server`). WP-15.
     Antigravity(AntigravityEngineState),
     Opencode(OpencodeEngineState),
     Pi(PiEngineState),

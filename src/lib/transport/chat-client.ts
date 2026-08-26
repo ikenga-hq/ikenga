@@ -28,20 +28,75 @@ export interface ChatSessionUpdate {
  * prompts back and does not run an engine. Nothing imports this client yet;
  * it lands alongside the wire format so the shapes are reviewed together.
  */
+export type ChatConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+
+export interface ChatConnectionStatusInfo {
+	state: ChatConnectionState;
+	attempt: number;
+	nextRetryDelayMs: number;
+}
+
+/**
+ * ChatWebSocketClient — WebSocket transport client for `/ws/chat/:thread_id`.
+ * Features automatic reconnect lifecycle with exponential backoff and connection state tracking.
+ */
 export class ChatWebSocketClient {
 	private ws: WebSocket | null = null;
 	private threadId: string;
 	private onUpdate: (update: ChatSessionUpdate) => void;
+	private onStatusChange?: (info: ChatConnectionStatusInfo) => void;
 
-	constructor(threadId: string, onUpdate: (update: ChatSessionUpdate) => void) {
+	private state: ChatConnectionState = 'disconnected';
+	private attempt = 0;
+	private nextRetryDelayMs = 1000;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private isExplicitDisconnect = false;
+
+	constructor(
+		threadId: string,
+		onUpdate: (update: ChatSessionUpdate) => void,
+		onStatusChange?: (info: ChatConnectionStatusInfo) => void
+	) {
 		this.threadId = threadId;
 		this.onUpdate = onUpdate;
+		this.onStatusChange = onStatusChange;
+	}
+
+	public get connectionState(): ChatConnectionState {
+		return this.state;
+	}
+
+	private setStatus(state: ChatConnectionState, attempt = this.attempt, nextRetryDelayMs = this.nextRetryDelayMs): void {
+		this.state = state;
+		this.attempt = attempt;
+		this.nextRetryDelayMs = nextRetryDelayMs;
+		this.onStatusChange?.({ state, attempt, nextRetryDelayMs });
 	}
 
 	connect(): void {
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
+		this.isExplicitDisconnect = false;
+		this.setStatus(this.attempt > 0 ? 'reconnecting' : 'connecting');
+
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const uri = `${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(this.threadId)}${tokenQuery()}`;
-		this.ws = new WebSocket(uri);
+		
+		try {
+			this.ws = new WebSocket(uri);
+		} catch (err) {
+			console.error('Failed to create Chat WebSocket:', err);
+			this.scheduleReconnect();
+			return;
+		}
+
+		this.ws.onopen = () => {
+			this.attempt = 0;
+			this.nextRetryDelayMs = 1000;
+			this.setStatus('connected');
+		};
 
 		this.ws.onmessage = (event) => {
 			if (typeof event.data === 'string') {
@@ -53,6 +108,28 @@ export class ChatWebSocketClient {
 				}
 			}
 		};
+
+		this.ws.onerror = (err) => {
+			console.warn('[chat-client] WebSocket error:', err);
+		};
+
+		this.ws.onclose = () => {
+			if (!this.isExplicitDisconnect) {
+				this.scheduleReconnect();
+			} else {
+				this.setStatus('disconnected', 0, 1000);
+			}
+		};
+	}
+
+	private scheduleReconnect(): void {
+		this.attempt += 1;
+		const delay = Math.min(1000 * Math.pow(2, this.attempt - 1), 16000);
+		this.setStatus('reconnecting', this.attempt, delay);
+
+		this.reconnectTimer = setTimeout(() => {
+			this.connect();
+		}, delay);
 	}
 
 	sendPrompt(prompt: string, engine = 'antigravity-cli', cwd?: string, model?: string): void {
@@ -77,9 +154,15 @@ export class ChatWebSocketClient {
 	}
 
 	disconnect(): void {
+		this.isExplicitDisconnect = true;
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
 		if (this.ws) {
 			this.ws.close();
 			this.ws = null;
 		}
+		this.setStatus('disconnected', 0, 1000);
 	}
 }

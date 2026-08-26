@@ -11,7 +11,7 @@
 // `void loadHome()` is invoked at module-load so the cache is warm by the
 // time the first render needs it.
 
-import { homeDir } from '@tauri-apps/api/path';
+import { homeDir } from '@/lib/transport/path-shim';
 
 let homeCached = '';
 let homePromise: Promise<string> | null = null;

@@ -36,7 +36,7 @@
 import type { OperatorIdentity } from '@ikenga/contract/host-context';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { useEffect, useRef, useState } from 'react';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import {

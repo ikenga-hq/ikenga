@@ -10,6 +10,7 @@
 
 import type { WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
+import { connectionStateStore } from './transport/connection-state';
 
 export { isTauri, isRemoteWebSession, getTransport, type RpcTransport };
 export type UnlistenFn = () => void;
@@ -147,34 +148,87 @@ export async function ptyListen(
 	if (isRemoteWebSession()) {
 		const transport = getTransport();
 		if (transport.openPtySocket) {
-			const ws = transport.openPtySocket(id);
-			// `endOffset` is the cumulative byte count the chunk *ends* at, and
-			// `pty-bridge` derives each chunk's absolute start from it. Passing a
-			// constant 0 made every start negative and, with a dedup threshold
-			// set, dropped the whole stream — so count bytes as they arrive. The
-			// first frame is the server's scrollback replay, which is where this
-			// connection's stream genuinely starts.
+			let ws: WebSocket | null = null;
+			let isClosedExplicitly = false;
+			let attempt = 0;
+			let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 			let received = 0;
+
 			const emit = (bytes: Uint8Array) => {
 				received += bytes.length;
 				onData(bytes, received);
 			};
-			ws.onmessage = (e) => {
-				if (e.data instanceof ArrayBuffer) {
-					emit(new Uint8Array(e.data));
-				} else if (typeof e.data === 'string') {
-					emit(new TextEncoder().encode(e.data));
-				}
+
+			const connect = () => {
+				if (isClosedExplicitly) return;
+				ws = transport.openPtySocket!(id);
+
+				let isFirstFrame = true;
+
+				ws.onopen = () => {
+					if (attempt > 0) {
+						connectionStateStore.set({ state: 'connected', attempt: 0 });
+					}
+					attempt = 0;
+				};
+
+				ws.onmessage = (e) => {
+					let bytes: Uint8Array;
+					if (e.data instanceof ArrayBuffer) {
+						bytes = new Uint8Array(e.data);
+					} else {
+						bytes = new TextEncoder().encode(String(e.data));
+					}
+
+					if (isFirstFrame) {
+						isFirstFrame = false;
+						emit(bytes);
+						if (attempt > 0) {
+							const text = new TextDecoder().decode(bytes);
+							const lineCount = (text.match(/\n/g) || []).length || 1;
+							const reattachText = `\r\n\x1b[38;2;34;197;94m── reattached · replayed ${lineCount} line${lineCount === 1 ? '' : 's'} from scrollback ─────────\x1b[0m\r\n`;
+							emit(new TextEncoder().encode(reattachText));
+						}
+					} else {
+						emit(bytes);
+					}
+				};
+
+				ws.onerror = (err) => {
+					console.warn(`[pty-socket] WebSocket error for ${id}:`, err);
+				};
+
+				ws.onclose = () => {
+					if (isClosedExplicitly) {
+						onExit(null);
+						return;
+					}
+
+					attempt += 1;
+					const delay = Math.min(1000 * Math.pow(2, attempt - 1), 16000);
+					connectionStateStore.set({
+						state: 'reconnecting',
+						attempt,
+						nextRetryDelayMs: delay,
+					});
+
+					const timeStr = new Date().toLocaleTimeString('en-GB', { hour12: false });
+					const disconnectText = `\r\n\x1b[38;2;234;179;8m── disconnected · ${timeStr} ───────────────────────────────────\x1b[0m\r\n`;
+					emit(new TextEncoder().encode(disconnectText));
+
+					reconnectTimer = setTimeout(() => {
+						connect();
+					}, delay);
+				};
 			};
-			// A closed socket means no more output, not a clean `exit 0` — the
-			// wire carries no exit code, and a dropped connection would otherwise
-			// tell the UI the shell finished successfully. `null` is the
-			// "exited, code unknown" the handler type already allows.
-			ws.onclose = () => {
-				onExit(null);
-			};
+
+			connect();
+
 			return () => {
-				ws.close();
+				isClosedExplicitly = true;
+				if (reconnectTimer) clearTimeout(reconnectTimer);
+				if (ws) ws.close();
+				connectionStateStore.set({ state: 'connected', attempt: 0 });
 			};
 		}
 	}

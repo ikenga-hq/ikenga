@@ -1,0 +1,45 @@
+[Unit]
+Description=Ikenga Remote Server Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ikenga
+Group=ikenga
+WorkingDirectory=/opt/ikenga
+ExecStart=/opt/ikenga/bin/ikenga-server --host 0.0.0.0 --port 4000 --static-dir /opt/ikenga/dist --data-dir /opt/ikenga/data
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Carries IKENGA_AUTH_TOKEN and IKENGA_VAULT_KEY, written by
+# shell/scripts/server/bootstrap-credentials.sh. Run that BEFORE first start.
+#
+# This binds 0.0.0.0. Every route the daemon serves can run code or read the
+# user's files, so the bearer token is what stands between the process and the
+# network. The daemon fails closed — with no token it mints one at startup and
+# logs it — but a minted token rotates on every restart, so a managed deploy
+# needs the pinned one from this file. Do not remove EnvironmentFile to "fix" a
+# startup failure; fix the file.
+EnvironmentFile=/opt/ikenga/.env
+
+# Intended to sit behind a Tailscale perimeter (ikenga#113 / WP-14b), not on a public
+# interface. The token is defence in depth, not the whole perimeter.
+
+# --- Sandboxing ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# The daemon writes SQLite + vault state here; everything else stays read-only
+# under ProtectSystem=strict.
+ReadWritePaths=/opt/ikenga/data
+
+[Install]
+WantedBy=multi-user.target

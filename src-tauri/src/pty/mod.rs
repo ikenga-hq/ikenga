@@ -569,7 +569,6 @@ impl PtyManager {
                     return;
                 };
                 let end_offset = st.ring.push(bytes);
-                let _ = session_for_emit.broadcast_tx.send(bytes.to_vec());
                 if st.gate.is_some() {
                     let overflowed = {
                         // `is_some` checked directly above.
@@ -583,10 +582,12 @@ impl PtyManager {
                             held = gate.held.len(),
                             "pty attach gate overflowed before arm; releasing the stream"
                         );
+                        let _ = session_for_emit.broadcast_tx.send(gate.held.clone());
                         (session_for_emit.sink)(&gate.held, end_offset);
                     }
                     return;
                 }
+                let _ = session_for_emit.broadcast_tx.send(bytes.to_vec());
                 (session_for_emit.sink)(bytes, end_offset);
             };
             let mut pending: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
@@ -1132,6 +1133,7 @@ impl PtyManager {
         let gate = st.gate.take().expect("token matched a present gate");
         if !gate.held.is_empty() {
             let end = st.ring.total;
+            let _ = session.broadcast_tx.send(gate.held.clone());
             (session.sink)(&gate.held, end);
         }
         true
@@ -1171,25 +1173,6 @@ impl PtyManager {
             .get(&resolved)
             .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
         Ok(session.broadcast_tx.subscribe())
-    }
-
-    /// Subscribe to live output bytes and return the current scrollback buffer.
-    pub fn subscribe_session(&self, id: &str) -> Result<(Vec<u8>, tokio::sync::broadcast::Receiver<Vec<u8>>)> {
-        let resolved = self.resolve_id(id)?;
-        let session = self
-            .sessions
-            .get(&resolved)
-            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?
-            .clone();
-        // Subscribe and snapshot under the same `emit` guard the reader loop
-        // takes to push into the ring and broadcast. Doing them separately
-        // lets a chunk land in between and be delivered twice — once in the
-        // replayed scrollback, once live.
-        let (snapshot, rx) = match session.emit.lock() {
-            Ok(st) => (st.ring.snapshot().0, session.broadcast_tx.subscribe()),
-            Err(_) => (Vec::new(), session.broadcast_tx.subscribe()),
-        };
-        Ok((snapshot, rx))
     }
 }
 

@@ -19,7 +19,7 @@ import {
 	Plus,
 	Trash2,
 } from 'lucide-react';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog } from '@/lib/transport/dialog-shim';
 
 import { ListRow, RowAction } from '@/components/ui/list-row';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';

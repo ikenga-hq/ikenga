@@ -244,6 +244,12 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     let pty_manager = Arc::new(PtyManager::new());
     let engine_registry = Arc::new(EngineRegistry::new());
+    {
+        let antigravity_engine = Arc::new(crate::engines::antigravity_acp::AntigravityEngine::new());
+        let antigravity_handle = crate::engines::EngineHandle::Antigravity(antigravity_engine);
+        engine_registry.insert("antigravity", antigravity_handle.clone()).await;
+        engine_registry.insert("antigravity-cli", antigravity_handle).await;
+    }
     let token = config.auth_token.clone().unwrap_or_default();
     let router = create_router(config.clone(), pty_manager, engine_registry);
 

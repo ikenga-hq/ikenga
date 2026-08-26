@@ -6,7 +6,7 @@
 // possibly enriching the per-step summary text from the step payloads.
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { Pencil, RotateCcw } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
