@@ -1172,6 +1172,46 @@ impl PtyManager {
         Ok(())
     }
 
+    /// Exit state of a session: `None` while running, `Some(code)` once the
+    /// child has been waited on.
+    ///
+    /// An exited session stays in the map for `EXITED_RETENTION` so its
+    /// scrollback and exit code remain readable, which means "the session is
+    /// gone from `sessions`" and "the shell exited" are different questions.
+    /// Callers that need the second one must ask it here rather than inferring
+    /// it from a dropped channel.
+    pub fn exit_status(&self, id: &str) -> Result<Option<i32>> {
+        let resolved = self.resolve_id(id)?;
+        let session = self
+            .sessions
+            .get(&resolved)
+            .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
+        Ok(session
+            .exited
+            .load(Ordering::Acquire)
+            .then(|| session.exit_code.load(Ordering::Relaxed)))
+    }
+
+    /// Resolve once the session has exited, yielding its exit code.
+    ///
+    /// Returns `None` if the session is unknown (already reaped). The waiter is
+    /// registered before the state is re-checked, so an exit landing between
+    /// the two cannot be missed.
+    pub async fn wait_for_exit(&self, id: &str) -> Option<i32> {
+        let resolved = self.resolve_id(id).ok()?;
+        let session = self.sessions.get(&resolved)?.clone();
+        loop {
+            if session.exited.load(Ordering::Acquire) {
+                return Some(session.exit_code.load(Ordering::Relaxed));
+            }
+            let notified = session.output_notify.notified();
+            if session.exited.load(Ordering::Acquire) {
+                return Some(session.exit_code.load(Ordering::Relaxed));
+            }
+            notified.await;
+        }
+    }
+
     /// Subscribe to live output bytes emitted by the given terminal.
     pub fn subscribe(&self, id: &str) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>> {
         let resolved = self.resolve_id(id)?;
@@ -1212,6 +1252,50 @@ mod tests {
     /// Guards against a vacuous pass: it asserts the gate genuinely held bytes
     /// back during the handshake window, and includes a negative control
     /// reproducing the OLD listen-then-snapshot ordering, which must duplicate.
+    /// `wait_for_exit` must resolve on the shell actually exiting, NOT on the
+    /// session leaving the map.
+    ///
+    /// An exited session is retained for `EXITED_RETENTION` (ten minutes) so
+    /// its scrollback stays readable, which means its `broadcast_tx` is still
+    /// alive that whole time. Code that inferred "exited" from a closed
+    /// broadcast channel — as `pty_ws` originally did — saw nothing for ten
+    /// minutes and left remote clients reconnecting to a finished shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wait_for_exit_resolves_on_exit_not_on_reap() {
+        let mgr = Arc::new(PtyManager::new());
+        let id = mgr
+            .spawn_headless(SpawnOpts {
+                terminal_id: None,
+                title: None,
+                cwd: "/".into(),
+                cmd: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                env: HashMap::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .expect("spawn");
+
+        let code = tokio::time::timeout(Duration::from_secs(10), mgr.wait_for_exit(&id))
+            .await
+            .expect("wait_for_exit must resolve well before the retention window");
+        assert_eq!(code, Some(7), "the real exit status has to survive the trip");
+
+        // Still in the map, still subscribable — proving the resolution above
+        // was driven by the exit itself and not by the entry being removed.
+        assert_eq!(mgr.exit_status(&id).expect("still retained"), Some(7));
+        assert!(
+            mgr.subscribe(&id).is_ok(),
+            "an exited session is retained, so its broadcast sender is still alive"
+        );
+
+        // Already-exited sessions resolve immediately rather than hanging.
+        let again = tokio::time::timeout(Duration::from_secs(2), mgr.wait_for_exit(&id))
+            .await
+            .expect("must not block once the exit has already happened");
+        assert_eq!(again, Some(7));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn attach_seam_delivers_the_stream_exactly_once() {
         let mgr = Arc::new(PtyManager::new());

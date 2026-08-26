@@ -132,7 +132,13 @@ export function attachRemotePty(
 	};
 
 	const handleControlFrame = (raw: string) => {
-		let msg: { type?: string; end_offset?: number; len?: number; message?: string } | null = null;
+		let msg: {
+			type?: string;
+			end_offset?: number;
+			len?: number;
+			message?: string;
+			code?: number;
+		} | null = null;
 		try {
 			msg = JSON.parse(raw);
 		} catch {
@@ -160,13 +166,16 @@ export function attachRemotePty(
 				}
 				break;
 			case 'ikenga.exit':
-				finish(null);
+				// The shell exited. `code` is the real exit status when the
+				// daemon knows it; attaching to an already-exited session
+				// delivers its scrollback first and then lands here.
+				finish(typeof msg.code === 'number' ? msg.code : null);
 				break;
 			case 'ikenga.gone':
-				// The session no longer exists. Reconnecting cannot bring it
-				// back, and asking the daemon to spawn one would fabricate a
-				// replacement.
-				emitLocal(banner(YELLOW, 'terminal session ended on the host'));
+				// The session no longer exists at all — retention elapsed and
+				// it was reaped. Reconnecting cannot bring it back, and asking
+				// the daemon to spawn one would fabricate a replacement.
+				emitLocal(banner(YELLOW, 'terminal session no longer exists on the host'));
 				finish(null);
 				break;
 			case 'ikenga.error':

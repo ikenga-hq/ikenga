@@ -175,11 +175,35 @@ describe('attachRemotePty', () => {
 	it('treats an explicit exit as an exit, not a disconnect', () => {
 		const h = harness();
 		h.sockets[0].open();
-		h.sockets[0].text({ type: 'ikenga.exit', id: 'term-1' });
+		h.sockets[0].text({ type: 'ikenga.exit', id: 'term-1', code: 0 });
 		h.sockets[0].drop();
 		vi.advanceTimersByTime(60_000);
 
-		expect(h.onExit).toHaveBeenCalledWith(null);
+		expect(h.onExit).toHaveBeenCalledWith(0);
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	it('reports the shell exit code when the daemon supplies one', () => {
+		const h = harness();
+		h.sockets[0].open();
+		h.sockets[0].text({ type: 'ikenga.exit', id: 'term-1', code: 130 });
+		expect(h.onExit).toHaveBeenCalledWith(130);
+		vi.advanceTimersByTime(60_000);
+		expect(h.sockets).toHaveLength(1);
+	});
+
+	// Attaching to a session that exited during the gap: the daemon paints its
+	// retained scrollback, then says the shell is gone.
+	it('accepts scrollback followed by exit on an already-exited session', () => {
+		const h = harness();
+		h.sockets[0].open();
+		h.sockets[0].text({ type: 'ikenga.snapshot', end_offset: 6, len: 6 });
+		h.sockets[0].binary('bye!\r\n');
+		h.sockets[0].text({ type: 'ikenga.exit', id: 'term-1', code: 0 });
+
+		expect(h.streamText()).toBe('bye!\r\n');
+		expect(h.onExit).toHaveBeenCalledWith(0);
+		vi.advanceTimersByTime(60_000);
 		expect(h.sockets).toHaveLength(1);
 	});
 

@@ -182,30 +182,55 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, 
     let session_id = pty_id.clone();
     let id_for_send = pty_id.clone();
 
-    // Task 1: Pump PTY output -> WebSocket binary frames
+    // Task 1: Pump PTY output -> WebSocket binary frames, and announce exit.
+    //
+    // Exit is awaited explicitly rather than inferred from the broadcast
+    // channel closing. An exited session is RETAINED (with its scrollback) for
+    // EXITED_RETENTION, so its sender is not dropped for another ten minutes —
+    // a client keyed on `Closed` would spend that whole window reconnecting to
+    // a shell that already finished. A bare socket close is likewise
+    // indistinguishable from a dropped link, which is the ambiguity this frame
+    // exists to remove.
+    let exit_manager = state.pty_manager.clone();
+    let exit_watch_id = pty_id.clone();
     let mut send_task = tokio::spawn(async move {
+        let exit_fut = exit_manager.wait_for_exit(&exit_watch_id);
+        tokio::pin!(exit_fut);
+
         loop {
-            match pty_rx.recv().await {
-                Ok(bytes) => {
-                    if ws_tx.send(Message::Binary(bytes)).await.is_err() {
-                        break;
+            tokio::select! {
+                // Bias toward draining output: on exit there is usually a
+                // final chunk still in flight, and losing the last line of a
+                // command is the most visible way to get this wrong.
+                biased;
+
+                recv = pty_rx.recv() => match recv {
+                    Ok(bytes) => {
+                        if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                // A burst past the channel's capacity means we dropped
-                // frames, not that the terminal ended — skipping ahead beats
-                // freezing the pane for the rest of the session.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("PTY {id_for_send}: websocket lagged, dropped {n} chunks");
-                }
-                // Closed means the session was reaped: the shell exited. Say
-                // so explicitly — a bare socket close is indistinguishable
-                // from a dropped connection, and the client would reconnect
-                // forever against a terminal that is gone.
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // A burst past the channel's capacity means we dropped
+                    // frames, not that the terminal ended — skipping ahead
+                    // beats freezing the pane for the rest of the session.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("PTY {id_for_send}: websocket lagged, dropped {n} chunks");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+
+                code = &mut exit_fut => {
+                    // Flush whatever the shell emitted on its way out before
+                    // announcing the exit.
+                    while let Ok(bytes) = pty_rx.try_recv() {
+                        if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
                     let _ = ws_tx
                         .send(control(
                             "ikenga.exit",
-                            serde_json::json!({ "id": id_for_send }),
+                            serde_json::json!({ "id": id_for_send, "code": code }),
                         ))
                         .await;
                     break;

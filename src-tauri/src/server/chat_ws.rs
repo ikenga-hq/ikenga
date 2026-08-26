@@ -67,6 +67,12 @@ fn status_event(thread_id: &str, status: &str, stop_reason: Option<&str>) -> Str
     update_event(thread_id, update)
 }
 
+/// Acknowledges a `cancel` regardless of whether a turn was running, so the
+/// client can distinguish "cancel received" from "socket wedged".
+fn cancel_ack_event(thread_id: &str) -> String {
+    update_event(thread_id, serde_json::json!({ "type": "cancel_ack" }))
+}
+
 fn error_event(thread_id: &str, message: String) -> String {
     update_event(
         thread_id,
@@ -269,14 +275,31 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                     }
                     ChatClientMessage::Cancel => {
                         info!("Cancelled chat turn for thread {thread_id}");
-                        // Cancel the engine that actually owns the turn. The
-                        // spawned task emits the terminal status itself, so
-                        // nothing is sent from here beyond the ack.
-                        if let Some((_, engine_name)) = in_flight.as_ref() {
-                            cancel_turn(&state, engine_name, &thread_id).await;
-                        } else {
-                            cancel_turn(&state, DEFAULT_ENGINE, &thread_id).await;
-                            send(&ws_tx, status_event(&thread_id, "idle", Some("cancelled"))).await;
+                        // Reap first. A finished-but-unreaped handle is not a
+                        // running turn, and treating it as one made cancel a
+                        // silent no-op: the client got no reply at all.
+                        if in_flight.as_ref().is_some_and(|(h, _)| h.is_finished()) {
+                            in_flight = None;
+                        }
+
+                        // The ack always goes out, so the client can tell
+                        // "received and acted on" from "socket is wedged".
+                        send(&ws_tx, cancel_ack_event(&thread_id)).await;
+
+                        match in_flight.as_ref() {
+                            // A live turn owns its own terminal status —
+                            // emitting one here too would double-report the
+                            // end of the same turn.
+                            Some((_, engine_name)) => {
+                                cancel_turn(&state, engine_name, &thread_id).await;
+                            }
+                            // Nothing running, so nothing else will ever emit
+                            // a terminal status for this thread.
+                            None => {
+                                cancel_turn(&state, DEFAULT_ENGINE, &thread_id).await;
+                                send(&ws_tx, status_event(&thread_id, "idle", Some("cancelled")))
+                                    .await;
+                            }
                         }
                     }
                 }
