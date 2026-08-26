@@ -1346,6 +1346,16 @@ pub async fn chi_cancel(
         }
     }
 
+    // A persistent run lives in a detached tmux session, so killing the local
+    // child leaves the work running. `terminal_session_id` is written by the
+    // spawn path for exactly this purpose; without this the cancel was
+    // cosmetic for persistent runs.
+    if let Some(session_name) = row.terminal_session_id.as_deref() {
+        if multiplexer::session_alive(session_name) {
+            multiplexer::kill_tmux_session(session_name);
+        }
+    }
+
     cache_update_status(&db, &run_id, "cancelled", None).await?;
 
     Ok(ChiRunResult {

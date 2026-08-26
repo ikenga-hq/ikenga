@@ -1438,6 +1438,8 @@ mod cli_tests {
 
 fn log_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
+    // Consumed by the macOS and unix branches below; Windows uses neither.
+    #[cfg_attr(windows, allow(unused_variables))]
     let home = std::path::PathBuf::from(home);
     #[cfg(target_os = "macos")]
     {

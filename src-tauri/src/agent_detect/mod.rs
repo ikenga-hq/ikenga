@@ -392,9 +392,8 @@ pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F)
 
         // Seed: leading `/<first-token>`. We don't FS-check this — the user's
         // FS root almost certainly contains it (`/Users`, `/home`, etc.).
-        let mut acc = format!("/{}", tokens[0]);
-
-        let acc = walk_slug_tokens(acc, &tokens[1..], '/', &exists);
+        let seed = format!("/{}", tokens[0]);
+        let acc = walk_slug_tokens(seed, &tokens[1..], '/', &exists);
         let verified = exists(&acc);
         return (acc, verified);
     }

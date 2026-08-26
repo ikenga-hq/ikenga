@@ -378,6 +378,9 @@ async fn write_capture(
 // renderer. It does require briefly focusing the window (see below). Pane
 // capture still uses the FE path because the OS can't isolate a single pane.
 
+// Fields are read by the Linux and macOS capture_region_to implementations;
+// the Windows stub ignores the rect.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 struct ScreenRect {
     x: i32,
@@ -474,6 +477,8 @@ async fn capture_window_png(app: &AppHandle, focus_window: bool) -> Result<(Vec<
     Ok((png_bytes, geom))
 }
 
+// Called only from the non-Windows branch of the capture dispatcher.
+#[cfg(not(target_os = "windows"))]
 async fn capture_window_native(
     app: &AppHandle,
     out_path: Option<String>,
@@ -673,6 +678,8 @@ fn capture_region_to(_out: &Path, _rect: ScreenRect) -> Result<()> {
     Err(anyhow!("native window capture not supported on this OS"))
 }
 
+// Only the Linux and macOS `capture_region_to` implementations shell out.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_tool(tool: &str, args: &[&str]) -> Result<()> {
     let out = std::process::Command::new(tool)
         .args(args)
