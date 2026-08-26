@@ -20,6 +20,7 @@
 
 import { WINDOW_TOPICS } from '@ikenga/contract';
 import { listen } from '@tauri-apps/api/event';
+import { isTauri } from '@/lib/transport';
 import { create } from 'zustand';
 
 import { closeWindow, listWindows } from '@/lib/tauri-cmd';
@@ -117,6 +118,14 @@ let started = false;
  */
 export function initDetachedSurfaceTracking(): void {
 	if (started || isDetachedWindow()) return;
+	// Detached windows are a native-shell concept; there is no browser
+	// counterpart and no event bus to subscribe to. Without this guard the
+	// two `listen()` calls below throw at boot in a remote session, because
+	// `@tauri-apps/api/event` reaches straight into `__TAURI_INTERNALS__`.
+	if (!isTauri()) {
+		console.log('[transport] api/event (detached-surfaces) is desktop-only — deferred to Wave 2');
+		return;
+	}
 	started = true;
 	void syncDetachedSurfaces();
 	void listen(WINDOW_TOPICS.opened, () => void syncDetachedSurfaces());

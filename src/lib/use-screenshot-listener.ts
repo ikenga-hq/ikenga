@@ -12,6 +12,7 @@
 import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { isTauri } from '@/lib/transport';
 
 import {
 	capturePane,
@@ -41,6 +42,12 @@ interface ShortcutPayload {
 
 export function useScreenshotListener() {
 	useEffect(() => {
+		// Native capture has no browser path, and the `listen()` below throws
+		// at mount without a Tauri host.
+		if (!isTauri()) {
+			console.log('[transport] api/event (screenshot) is desktop-only — deferred to Wave 2');
+			return;
+		}
 		let alive = true;
 		const unlisteners: Array<() => void> = [];
 

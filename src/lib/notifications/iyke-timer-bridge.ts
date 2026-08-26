@@ -9,6 +9,7 @@
 // double-mount + HMR don't duplicate notifications.
 
 import { listen } from '@tauri-apps/api/event';
+import { isTauri } from '@/lib/transport';
 import {
 	isPermissionGranted,
 	requestPermission,
@@ -29,6 +30,12 @@ export interface IykeTimerFiredPayload {
 let activeBridge: { unsubscribe: Unsubscribe; refCount: number } | null = null;
 
 export function startIykeTimerBridge(): Unsubscribe {
+	// The timer fires as a Tauri event; in a browser session there is no bus
+	// to carry it, and subscribing throws at boot.
+	if (!isTauri()) {
+		console.log('[transport] api/event (iyke timer) is desktop-only — deferred to Wave 2');
+		return () => {};
+	}
 	if (activeBridge) {
 		activeBridge.refCount += 1;
 		return makeRefCountedUnsubscribe();
