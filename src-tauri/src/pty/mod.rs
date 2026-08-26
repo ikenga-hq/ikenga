@@ -278,7 +278,9 @@ struct PtySession {
     screen: Mutex<vt100::Parser>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    /// Child process ID if available from the OS.
+    /// Child process ID if available from the OS. Only read on Windows,
+    /// where teardown shells out to `taskkill /T` to kill the process tree.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pid: Option<u32>,
     /// Used to signal the reader thread to stop.
     killed: Arc<std::sync::atomic::AtomicBool>,

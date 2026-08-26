@@ -27,6 +27,8 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::Arc;
+// Only the unix shutdown path (and tests) use this.
+#[cfg_attr(windows, allow(unused_imports))]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

@@ -642,6 +642,8 @@ fn build_surface(
     pkg_id: &str,
     data_dir: PathBuf,
 ) -> Result<PaneSurface> {
+    // Only the macOS branch below mutates this.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = WebviewBuilder::new(label, WebviewUrl::External(parsed_url))
         .auto_resize()
         .data_directory(data_dir)

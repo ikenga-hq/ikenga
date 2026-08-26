@@ -105,9 +105,9 @@ fn detect_windows_shells(profiles: &mut Vec<ShellProfile>) {
             kind: "powershell".to_string(),
             distro: None,
         });
-        if !default_set {
-            default_set = true;
-        }
+        // No later profile reads default_set: WSL distros are always pushed
+        // with is_default: false, and the invariant above backstops the case
+        // where nothing claimed it.
     }
 
     // 3. WSL Distributions
