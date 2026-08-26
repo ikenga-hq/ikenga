@@ -22,8 +22,10 @@ pub struct CliArgs {
     #[arg(long, default_value = "./dist", env = "IKENGA_STATIC_DIR")]
     pub static_dir: PathBuf,
 
-    /// Directory containing mini-app packages. Reserved — no route serves
-    /// pkgs yet, so setting this currently has no effect.
+    /// Directory containing installed mini-app packages. Walked once at
+    /// startup; every pkg with an `iframe` UI route and a `dist/` is served
+    /// read-only from `GET /pkgs/<id>/*` behind the auth token. The daemon
+    /// installs nothing — point this at a directory something else populates.
     #[arg(long, env = "IKENGA_PKGS_DIR")]
     pub pkgs_dir: Option<PathBuf>,
 

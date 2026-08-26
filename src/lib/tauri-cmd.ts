@@ -10,9 +10,10 @@
 
 import type { WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
+import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
 
-export { isTauri, isRemoteWebSession, getTransport, type RpcTransport };
+export { getTransport, isRemoteWebSession, isTauri, type RpcTransport };
 export type UnlistenFn = () => void;
 
 function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -309,9 +310,28 @@ export async function fsSearch(
 	return invoke('fs_search', { root, query, showHidden, showIgnored, limit: limit ?? null });
 }
 
-/** Returns a watcher id; events emit on `fs://{watcherId}`. */
+/**
+ * Returns a watcher id.
+ *
+ * Desktop: the id is the Rust watcher's own, and events emit on
+ * `fs://{watcherId}`. Browser: there is no Tauri event bus and the daemon
+ * serves no `fs_watch` RPC arm, so this goes over the `/ws/fs` socket and the
+ * id is a client-side handle — see `transport/fs-socket.ts` for why it has to
+ * be ours rather than the daemon's. Either way the id is opaque and must be
+ * passed back to `fsListenWatch` / `fsUnwatch` unchanged.
+ */
 export async function fsWatch(path: string): Promise<string> {
+	const fs = remoteFsSocket();
+	if (fs) return fs.watch(path);
 	return invoke('fs_watch', { path });
+}
+
+/** The `/ws/fs` client, or null when this session should use Tauri events. */
+function remoteFsSocket(): ReturnType<typeof getFsSocketClient> | null {
+	if (!isRemoteWebSession()) return null;
+	const transport = getTransport();
+	if (!transport.openFsSocket) return null;
+	return getFsSocketClient(transport.openFsSocket.bind(transport));
 }
 
 // ─── FS allowlist (user-configurable) ────────────────────────────────────────
@@ -345,6 +365,11 @@ export async function osUsername(): Promise<string> {
 }
 
 export async function fsUnwatch(watcherId: string): Promise<void> {
+	const fs = remoteFsSocket();
+	if (fs) {
+		fs.unwatch(watcherId);
+		return;
+	}
 	return invoke('fs_unwatch', { watcherId });
 }
 
@@ -352,6 +377,8 @@ export async function fsListenWatch(
 	watcherId: string,
 	onChange: (change: FileChange) => void
 ): Promise<UnlistenFn> {
+	const fs = remoteFsSocket();
+	if (fs) return fs.listen(watcherId, onChange);
 	return listen<FileChange>(`fs://${watcherId}`, (e) => onChange(e.payload));
 }
 
@@ -431,17 +458,35 @@ export type VaultStatus = {
 	available: boolean;
 	keychainBackend: string;
 	error: string | null;
+	/** Which store answered: Stronghold (desktop) or `IKENGA_SECRET_*` env
+	 *  vars (headless daemon). See `src-tauri/src/secrets_env.rs`. */
+	mode: 'stronghold' | 'env' | string;
+	/** False when the backing store is read-only — the daemon has no vault by
+	 *  design, so set/delete are refused. Callers MUST gate write affordances
+	 *  on this rather than offering buttons that cannot work. */
+	writable: boolean;
 };
 
 export async function secretsVaultStatus(): Promise<VaultStatus> {
 	// Rust returns snake_case `keychain_backend`; normalize.
-	const raw = await invoke<{ available: boolean; keychain_backend: string; error: string | null }>(
-		'secrets_vault_status'
-	);
+	//
+	// `mode` / `writable` are additive (both builds send them today), but the
+	// defaults below are deliberately the desktop answer so an older backend
+	// that predates them degrades to "writable Stronghold" rather than
+	// silently disabling every write button.
+	const raw = await invoke<{
+		available: boolean;
+		keychain_backend: string;
+		error: string | null;
+		mode?: string;
+		writable?: boolean;
+	}>('secrets_vault_status');
 	return {
 		available: raw.available,
 		keychainBackend: raw.keychain_backend,
 		error: raw.error,
+		mode: raw.mode ?? 'stronghold',
+		writable: raw.writable ?? true,
 	};
 }
 
@@ -2715,6 +2760,20 @@ export async function pkgContentUrl(pkgId: string): Promise<PkgContentHandle> {
 // non-https origin (custom protocol or http loopback) get blocked even
 // though subresource fetches succeed.
 // See https://github.com/tauri-apps/tauri/issues/12767.
+//
+// TWO BACKENDS answer this command and they differ in what they can populate:
+//
+//   * Desktop (`commands/pkg_content.rs`) — mints a per-mount token, resolves
+//     the vault, and returns `baseUrl` as an absolute
+//     `http://127.0.0.1:<port>/<pkgId>/<token>/`.
+//   * Headless daemon (`server/pkg_static.rs`) — no vault, so `supabase` and
+//     `secrets` are OMITTED, not null; `baseUrl` is the same-origin path
+//     `/pkgs/<pkgId>/`; `token` is an opaque handle with nothing behind it.
+//     A pkg whose manifest marks either capability `required` is refused with
+//     a named error instead of being mounted half-configured.
+//
+// Hence `supabase?` / `secrets?`: on the daemon the properties are absent.
+// Every read must stay `?? null` — do not tighten these to non-optional.
 export interface PkgContentHtmlHandle {
 	html: string;
 	baseUrl: string;
@@ -2722,15 +2781,17 @@ export interface PkgContentHtmlHandle {
 	/** Resolved Supabase config when the pkg's manifest declared
 	 *  `capabilities.supabase`. `null` when the pkg didn't declare it, or
 	 *  declared it non-required and the vault has no keys. Pkgs that don't
-	 *  declare the capability never see this field populated. */
-	supabase: { url: string; anonKey: string } | null;
+	 *  declare the capability never see this field populated. Absent entirely
+	 *  from the headless daemon, which has no vault. */
+	supabase?: { url: string; anonKey: string } | null;
 	/** Resolved named secrets (ADR-017) when the pkg declared
 	 *  `capabilities.secrets` AND is trusted-for-elevated. `values` maps each
 	 *  declared `name` → its resolved plaintext; `missing` lists declared,
 	 *  non-required names absent from the vault. `null` when the pkg didn't
 	 *  declare the cap OR isn't trusted (fail-closed — silently ignored). The
-	 *  iframe never sees a `vault_key`. */
-	secrets: { values: Record<string, string>; missing: string[] } | null;
+	 *  iframe never sees a `vault_key`. Absent entirely from the headless
+	 *  daemon. */
+	secrets?: { values: Record<string, string>; missing: string[] } | null;
 }
 
 export async function pkgContentHtml(pkgId: string, source: string): Promise<PkgContentHtmlHandle> {

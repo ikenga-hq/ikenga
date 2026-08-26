@@ -13,13 +13,30 @@
 //! daemon's dependency closure is deliberately the short first list.
 
 // --- Headless core: compiled into BOTH binaries ---
+// `db` holds PaDb + the embedded migration set; `commands::db` keeps only the
+// two #[tauri::command] wrappers and re-exports PaDb.
+pub mod db;
 pub mod engines;
 mod fs_roots;
+// The watcher pool is sink-driven (`fs_watch::FsEventSink`), so nothing in
+// it needs an `AppHandle`. The desktop emit-backed sink is the one piece
+// gated inside the module; the daemon's `/ws/fs` supplies its own.
+pub mod fs_watch;
 pub mod path_allow;
 pub mod path_fix;
+// Only `pkg::manifest` + `pkg::registry` are headless — they are pure serde
+// and have never touched tauri. Everything else in `pkg/` (kernel, lifecycle,
+// webview, trust, …) is gated inside `pkg/mod.rs`. The daemon reads manifests
+// to serve `/pkgs/:id/*` read-only; it installs nothing.
+pub mod pkg;
+// Pure HTML rewrites (subresource inlining + `<base href>`) shared by the
+// desktop `pkg_content` srcdoc path and the daemon's `/pkgs` mount path. Same
+// code, two different reasons to need it — see the module docs.
+pub mod pkg_html;
 pub mod platform;
 pub mod pty;
 mod runtime;
+pub mod secrets_env;
 pub mod server;
 
 // --- Desktop-only ---
@@ -32,11 +49,7 @@ pub mod commands;
 #[cfg(feature = "desktop")]
 pub mod env_files;
 #[cfg(feature = "desktop")]
-mod fs_watch;
-#[cfg(feature = "desktop")]
 mod iyke;
-#[cfg(feature = "desktop")]
-mod pkg;
 #[cfg(feature = "desktop")]
 mod pkg_content;
 #[cfg(feature = "desktop")]
