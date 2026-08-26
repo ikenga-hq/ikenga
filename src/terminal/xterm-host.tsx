@@ -5,7 +5,14 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { type ITheme, Terminal } from '@xterm/xterm';
 import { useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
+import { usePaneStore } from '@/lib/panes/pane-store';
+import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
+import {
+	evaluateTerminalKey,
+	getDefaultKeybindings,
+	type TerminalKeybindings,
+} from './keybindings';
 import { registerPathLinks } from './path-links';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
 import { readCaptureWithOffset } from './pty-output-buffer';
@@ -33,10 +40,10 @@ interface Props {
 	/** Called once a PTY has been created in spawn-mode. */
 	onPtyId?: (id: string) => void;
 	/**
-	 * Force the canvas/DOM renderer instead of WebGL. Detached windows
+	 * Force the DOM renderer instead of WebGL. Detached windows
 	 * (plans/multi-window WP-08) set this: WebGL "loads" in a secondary
 	 * WebKitGTK webview but renders no glyphs (only the cursor) without ever
-	 * firing onContextLoss, so the auto-fallback never triggers. Canvas works.
+	 * firing onContextLoss, so the auto-fallback never triggers. DOM renderer works.
 	 */
 	disableWebgl?: boolean;
 	/**
@@ -69,6 +76,10 @@ interface Props {
 	 * `scheduleAttachNudge` below for the two-step wobble that forces it.
 	 */
 	nudgeOnAttach?: boolean;
+	/** Configurable scrollback lines (defaults to 10,000). */
+	scrollback?: number;
+	/** Custom terminal keybinding overrides (T-11). */
+	keybindings?: Partial<TerminalKeybindings>;
 }
 
 const DARK_THEME: ITheme = {
@@ -165,9 +176,31 @@ function readThemeFromCssVars(dark: boolean): ITheme {
 // every mount since they close over this render's `setState`/refs.
 // ---------------------------------------------------------------------------
 
+interface SearchOptions {
+	regex?: boolean;
+	wholeWord?: boolean;
+	caseSensitive?: boolean;
+	incremental?: boolean;
+	decorations?: {
+		matchBackground?: string;
+		matchBorder?: string;
+		matchOverviewRuler: string;
+		activeMatchBackground?: string;
+		activeMatchBorder?: string;
+		activeMatchColorOverviewRuler: string;
+	};
+}
+
+interface SearchResultChangeEvent {
+	resultIndex: number;
+	resultCount: number;
+}
+
 interface SearchAddonLike {
-	findNext: (s: string) => boolean;
-	findPrevious: (s: string) => boolean;
+	findNext: (s: string, options?: SearchOptions) => boolean;
+	findPrevious: (s: string, options?: SearchOptions) => boolean;
+	onDidChangeResults?: (listener: (results: SearchResultChangeEvent) => void) => { dispose: () => void };
+	clearDecorations?: () => void;
 	dispose: () => void;
 }
 
@@ -318,7 +351,7 @@ function wirePtyToTerm(
 	} catch {
 		/* ignore */
 	}
-	status(`pty ${pty.id.slice(0, 8)} ${pty.label} (${webglUsed ? 'webgl' : 'canvas'})`);
+	status(`pty ${pty.id.slice(0, 8)} ${pty.label} (${webglUsed ? 'webgl' : 'dom'})`);
 	return { detachData, detachExit, onDataDispose, onResizeDispose };
 }
 
@@ -339,11 +372,17 @@ export function XTermHost({
 	sessionId,
 	focused,
 	nudgeOnAttach,
+	scrollback,
+	keybindings,
 }: Props) {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const wrapperRef = useRef<HTMLDivElement | null>(null);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const [searchTerm, setSearchTerm] = useState('');
+	const [caseSensitive, setCaseSensitive] = useState(false);
+	const [wholeWord, setWholeWord] = useState(false);
+	const [useRegex, setUseRegex] = useState(false);
+	const [searchResult, setSearchResult] = useState<SearchResultChangeEvent | null>(null);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
 
 	// Stash callbacks in refs so the spawn effect doesn't re-fire on each render.
@@ -351,10 +390,12 @@ export function XTermHost({
 	const onExitRef = useRef(onExit);
 	const onPtyIdRef = useRef(onPtyId);
 	const focusedRef = useRef(focused);
+	const keybindingsRef = useRef(keybindings);
 	onStatusRef.current = onStatus;
 	onExitRef.current = onExit;
 	onPtyIdRef.current = onPtyId;
 	focusedRef.current = focused;
+	keybindingsRef.current = keybindings;
 	const status = (s: string) => onStatusRef.current?.(s);
 	const exit = (code: number | null) => onExitRef.current?.(code);
 
@@ -545,11 +586,45 @@ export function XTermHost({
 				lineHeight: 1.2,
 				cursorBlink: true,
 				cursorStyle: 'block',
-				scrollback: 10_000,
+				scrollback: scrollback ?? 10_000,
 				allowProposedApi: true,
 				theme: readThemeFromCssVars(dark),
 				macOptionIsMeta: true,
 				convertEol: false,
+				linkHandler: {
+					activate: (_e: MouseEvent, text: string) => {
+						if (/^[a-z]+:\/\//i.test(text) && !text.startsWith('file://')) {
+							window.open(text, '_blank');
+							return;
+						}
+						let filePath = text;
+						let line: number | undefined;
+						let col: number | undefined;
+						filePath = fileUrlToPath(filePath);
+						const hashMatch = filePath.match(/#L?(\d+)(?::(?:C|col)?(\d+))?$/i);
+						if (hashMatch) {
+							line = parseInt(hashMatch[1], 10);
+							if (hashMatch[2]) col = parseInt(hashMatch[2], 10);
+							filePath = filePath.slice(0, filePath.length - hashMatch[0].length);
+						} else {
+							const colonMatch = filePath.match(/:(\d+)(?::(\d+))?$/);
+							if (colonMatch) {
+								line = parseInt(colonMatch[1], 10);
+								if (colonMatch[2]) col = parseInt(colonMatch[2], 10);
+								filePath = filePath.slice(0, filePath.length - colonMatch[0].length);
+							}
+						}
+						const effectiveCwd = livePtyRef.current?.cwd ?? spec?.cwd;
+						const resolved = resolvePath(filePath, effectiveCwd);
+						const store = usePaneStore.getState();
+						store.addTabBackground(store.focusedId, {
+							kind: 'artifact',
+							path: resolved,
+							line,
+							col,
+						});
+					},
+				},
 			});
 			termRef.current = term;
 
@@ -563,10 +638,44 @@ export function XTermHost({
 
 			// File-path links (WebLinksAddon only handles URLs). Clicking a
 			// path-shaped token opens it in the artifact viewer. Relative paths
-			// resolve against the spawn cwd; absolute / ~ paths ignore it
+			// resolve against the live PTY / foreground cwd; absolute / ~ paths ignore it
 			// (works in attach-mode too, where no cwd is known).
-			const pathLinks = registerPathLinks(term, spec?.cwd);
+			const pathLinks = registerPathLinks(term, () => livePtyRef.current?.cwd ?? spec?.cwd);
 			pathLinksDisposeFn = () => pathLinks.dispose();
+
+			// OSC 7: Current Working Directory notification emitted by shells (T-10)
+			// (e.g. `\x1b]7;file://hostname/path\x1b\\` or `\x1b]7;/path\x1b\\`).
+			term.parser.registerOscHandler(7, (data) => {
+				try {
+					const path = fileUrlToPath(data);
+					if (path) {
+						if (livePtyRef.current) livePtyRef.current.setCwd(path);
+						if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, path);
+					}
+				} catch {
+					/* ignore malformed OSC 7 */
+				}
+				return true;
+			});
+
+			// OSC 133: FinalTerm / Shell Integration property markers (T-10)
+			// (e.g. `133;P;Cwd=/path`).
+			term.parser.registerOscHandler(133, (data) => {
+				try {
+					const parts = data.split(';');
+					const code = parts[0];
+					if (code === 'P' && parts[1]?.startsWith('Cwd=')) {
+						const cwdVal = parts[1].slice(4).trim();
+						if (cwdVal) {
+							if (livePtyRef.current) livePtyRef.current.setCwd(cwdVal);
+							if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, cwdVal);
+						}
+					}
+				} catch {
+					/* ignore malformed OSC 133 */
+				}
+				return true;
+			});
 
 			// Search addon — lazy import to keep initial bundle slim.
 			(async () => {
@@ -575,13 +684,28 @@ export function XTermHost({
 					if (cancelled) return;
 					const search = new mod.SearchAddon();
 					term.loadAddon(search);
+					let resultsDispose: (() => void) | null = null;
+					if (search.onDidChangeResults) {
+						const sub = search.onDidChangeResults((e: SearchResultChangeEvent) => {
+							setSearchResult(e);
+						});
+						resultsDispose = () => sub.dispose();
+					}
 					const searchLike: SearchAddonLike = {
-						findNext: (s) => search.findNext(s),
-						findPrevious: (s) => search.findPrevious(s),
-						dispose: () => search.dispose(),
+						findNext: (s, opts) => search.findNext(s, opts),
+						findPrevious: (s, opts) => search.findPrevious(s, opts),
+						onDidChangeResults: search.onDidChangeResults ? (l) => search.onDidChangeResults(l) : undefined,
+						clearDecorations: () => search.clearDecorations(),
+						dispose: () => {
+							resultsDispose?.();
+							search.dispose();
+						},
 					};
 					searchAddonRef.current = searchLike;
-					disposeSearch = () => search.dispose();
+					disposeSearch = () => {
+						resultsDispose?.();
+						search.dispose();
+					};
 					const entry = cacheable ? xtermCache.get(sessionId as string) : undefined;
 					if (entry) entry.searchAddon = searchLike;
 				} catch (err) {
@@ -602,24 +726,26 @@ export function XTermHost({
 				container = mountEl;
 			}
 			term.open(container);
+			term.textarea?.setAttribute('aria-label', 'Terminal');
+			term.element?.setAttribute('aria-label', 'Terminal');
 
 			if (disableWebgl) {
-				status('canvas renderer (webgl disabled)');
+				status('dom renderer (webgl disabled)');
 			} else {
 				try {
 					webglAddon = new WebglAddon();
 					webglAddon.onContextLoss(() => {
 						webglAddon?.dispose();
 						webglAddon = null;
-						status('webgl context lost — fell back to canvas');
+						status('webgl context lost — fell back to dom renderer');
 						const entry = cacheable ? xtermCache.get(sessionId as string) : undefined;
 						if (entry) entry.webglAddon = null;
 					});
 					term.loadAddon(webglAddon);
 					webglUsed = true;
 				} catch (err) {
-					console.warn('[xterm] webgl addon failed, using canvas fallback', err);
-					status('webgl unavailable — canvas renderer');
+					console.warn('[xterm] webgl addon failed, using dom fallback', err);
+					status('webgl unavailable — dom renderer');
 				}
 			}
 
@@ -691,20 +817,20 @@ export function XTermHost({
 			if (e.type !== 'keydown') return true;
 			const mac = isMac();
 			const meta = mac ? e.metaKey : e.ctrlKey;
-			const key = e.key.toLowerCase();
 
-			// Mac: Cmd+C — copy if there's a selection, else fall through to PTY (SIGINT).
-			if (mac && e.metaKey && !e.shiftKey && !e.altKey && key === 'c') {
+			const action = evaluateTerminalKey(e, mac, keybindingsRef.current);
+			if (action === 'copy') {
 				const sel = term.getSelection();
 				if (sel) {
 					navigator.clipboard.writeText(sel).catch(() => {});
 					return false;
 				}
-				return true; // no selection: let the keystroke through (Cmd+C → ETX)
+				// On Mac with Cmd+C, if no selection, fall through to PTY (SIGINT).
+				if (mac) return true;
+				return false;
 			}
 
-			// Mac: Cmd+V — paste.
-			if (mac && e.metaKey && !e.shiftKey && !e.altKey && key === 'v') {
+			if (action === 'paste') {
 				navigator.clipboard
 					.readText()
 					.then((t) => term.paste(t))
@@ -712,32 +838,19 @@ export function XTermHost({
 				return false;
 			}
 
-			// Linux/Windows: Ctrl+Shift+C — copy.
-			if (!mac && e.ctrlKey && e.shiftKey && key === 'c') {
-				const sel = term.getSelection();
-				if (sel) {
-					navigator.clipboard.writeText(sel).catch(() => {});
-				}
-				return false;
-			}
-
-			// Linux/Windows: Ctrl+Shift+V — paste.
-			if (!mac && e.ctrlKey && e.shiftKey && key === 'v') {
-				navigator.clipboard
-					.readText()
-					.then((t) => term.paste(t))
-					.catch(() => {});
-				return false;
-			}
-
-			// Cmd+F (mac) or Ctrl+Shift+F (linux) — open search.
-			if (
-				(mac && e.metaKey && key === 'f' && !e.shiftKey && !e.altKey) ||
-				(!mac && e.ctrlKey && e.shiftKey && key === 'f')
-			) {
+			if (action === 'find') {
 				setSearchOpen(true);
-				// Defer focus to next tick — input mounts after this returns.
 				setTimeout(() => searchInputRef.current?.focus(), 0);
+				return false;
+			}
+
+			if (action === 'clear') {
+				term.clear();
+				return false;
+			}
+
+			if (action === 'selectAll') {
+				term.selectAll();
 				return false;
 			}
 
@@ -922,11 +1035,33 @@ export function XTermHost({
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [spec, pty, sessionId]);
 
-	function runSearch(direction: 'next' | 'prev') {
+	const getSearchOptions = (optOverrides?: { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean }): SearchOptions => ({
+		caseSensitive: optOverrides?.caseSensitive ?? caseSensitive,
+		wholeWord: optOverrides?.wholeWord ?? wholeWord,
+		regex: optOverrides?.regex ?? useRegex,
+		incremental: true,
+		decorations: {
+			matchBackground: isDarkMode() ? '#515c6a' : '#fed7aa',
+			matchOverviewRuler: '#f59e0b',
+			activeMatchBackground: isDarkMode() ? '#3b82f6' : '#60a5fa',
+			activeMatchColorOverviewRuler: '#2563eb',
+		},
+	});
+
+	function runSearch(
+		direction: 'next' | 'prev',
+		termOverride?: string,
+		optOverrides?: { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean }
+	) {
 		const addon = searchAddonRef.current;
-		if (!addon || !searchTerm) return;
-		if (direction === 'next') addon.findNext(searchTerm);
-		else addon.findPrevious(searchTerm);
+		const term = termOverride ?? searchTerm;
+		if (!addon || !term) {
+			setSearchResult(null);
+			return;
+		}
+		const opts = getSearchOptions(optOverrides);
+		if (direction === 'next') addon.findNext(term, opts);
+		else addon.findPrevious(term, opts);
 	}
 
 	// Drop a file onto the terminal → insert its shell-quoted path (trailing
@@ -961,6 +1096,34 @@ export function XTermHost({
 		return () => el.removeEventListener(OS_FILE_DROP_EVENT, onPaths);
 	}, []);
 
+	const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+
+	useEffect(() => {
+		if (!contextMenu) return;
+		const close = () => setContextMenu(null);
+		const onKey = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') setContextMenu(null);
+		};
+		window.addEventListener('click', close);
+		window.addEventListener('contextmenu', close);
+		window.addEventListener('keydown', onKey);
+		return () => {
+			window.removeEventListener('click', close);
+			window.removeEventListener('contextmenu', close);
+			window.removeEventListener('keydown', onKey);
+		};
+	}, [contextMenu]);
+
+	const handleContextMenu = (e: React.MouseEvent) => {
+		e.preventDefault();
+		setContextMenu({ x: e.clientX, y: e.clientY });
+	};
+
+	const effectiveKeybindings = {
+		...getDefaultKeybindings(isMac()),
+		...keybindings,
+	};
+
 	if (!spec && !pty) {
 		return <div className="empty">No PTY. Spawn one above.</div>;
 	}
@@ -969,6 +1132,7 @@ export function XTermHost({
 		<div
 			ref={wrapperRef}
 			data-terminal-session={sessionId}
+			onContextMenu={handleContextMenu}
 			style={{
 				position: 'relative',
 				width: '100%',
@@ -977,6 +1141,153 @@ export function XTermHost({
 				flexDirection: 'column',
 			}}
 		>
+			{contextMenu && (
+				<div
+					role="menu"
+					aria-label="Terminal Context Menu"
+					style={{
+						position: 'fixed',
+						top: contextMenu.y,
+						left: contextMenu.x,
+						zIndex: 9999,
+						minWidth: 160,
+						padding: '4px',
+						background: 'var(--color-card)',
+						border: '1px solid var(--color-border)',
+						borderRadius: 6,
+						boxShadow: '0 6px 20px rgba(0,0,0,0.4)',
+						fontSize: 12,
+						color: 'var(--color-card-foreground)',
+						display: 'flex',
+						flexDirection: 'column',
+						gap: 2,
+					}}
+					onClick={(e) => e.stopPropagation()}
+				>
+					<button
+						type="button"
+						disabled={!termRef.current?.hasSelection()}
+						onClick={() => {
+							const sel = termRef.current?.getSelection();
+							if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: termRef.current?.hasSelection() ? 'inherit' : 'rgba(127,127,127,0.5)',
+							cursor: termRef.current?.hasSelection() ? 'pointer' : 'default',
+							textAlign: 'left',
+						}}
+					>
+						<span>Copy</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.copy}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							navigator.clipboard
+								.readText()
+								.then((t) => {
+									if (t) {
+										livePtyRef.current?.write(t).catch(() => {});
+										termRef.current?.focus();
+									}
+								})
+								.catch(() => {});
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Paste</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.paste}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							termRef.current?.selectAll();
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Select All</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.selectAll}</span>
+					</button>
+					<div style={{ height: 1, background: 'rgba(127,127,127,0.2)', margin: '2px 0' }} />
+					<button
+						type="button"
+						onClick={() => {
+							termRef.current?.clear();
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Clear Terminal</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.clear}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							setSearchOpen(true);
+							setTimeout(() => searchInputRef.current?.focus(), 0);
+							setContextMenu(null);
+						}}
+						style={{
+							display: 'flex',
+							alignItems: 'center',
+							justifyContent: 'space-between',
+							padding: '5px 8px',
+							border: 'none',
+							borderRadius: 4,
+							background: 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							textAlign: 'left',
+						}}
+					>
+						<span>Find…</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.find}</span>
+					</button>
+				</div>
+			)}
 			{searchOpen && (
 				<div
 					style={{
@@ -992,12 +1303,18 @@ export function XTermHost({
 					<input
 						ref={searchInputRef}
 						value={searchTerm}
-						onChange={(e) => setSearchTerm(e.target.value)}
+						onChange={(e) => {
+							const val = e.target.value;
+							setSearchTerm(val);
+							if (val) runSearch('next', val);
+							else setSearchResult(null);
+						}}
 						onKeyDown={(e) => {
 							if (e.key === 'Enter') {
 								runSearch(e.shiftKey ? 'prev' : 'next');
 							} else if (e.key === 'Escape') {
 								setSearchOpen(false);
+								searchAddonRef.current?.clearDecorations?.();
 								termRef.current?.focus();
 							}
 						}}
@@ -1013,26 +1330,103 @@ export function XTermHost({
 							outline: 'none',
 						}}
 					/>
+					{searchTerm && searchResult && (
+						<span style={{ fontSize: 10, opacity: 0.7, padding: '0 4px', whiteSpace: 'nowrap' }}>
+							{searchResult.resultCount === 0
+								? 'No results'
+								: `${searchResult.resultIndex >= 0 ? searchResult.resultIndex + 1 : '?'} of ${searchResult.resultCount}`}
+						</span>
+					)}
 					<button
+						type="button"
+						onClick={() => {
+							const next = !caseSensitive;
+							setCaseSensitive(next);
+							if (searchTerm) runSearch('next', searchTerm, { caseSensitive: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: caseSensitive ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: caseSensitive ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Match Case (Aa)"
+					>
+						Aa
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							const next = !wholeWord;
+							setWholeWord(next);
+							if (searchTerm) runSearch('next', searchTerm, { wholeWord: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: wholeWord ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: wholeWord ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Match Whole Word (\b)"
+					>
+						\b
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							const next = !useRegex;
+							setUseRegex(next);
+							if (searchTerm) runSearch('next', searchTerm, { regex: next });
+						}}
+						style={{
+							fontSize: 11,
+							padding: '1px 5px',
+							borderRadius: 3,
+							border: '1px solid',
+							borderColor: useRegex ? 'rgba(59, 130, 246, 0.6)' : 'rgba(127,127,127,0.3)',
+							background: useRegex ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
+							color: 'inherit',
+							cursor: 'pointer',
+							fontFamily: 'monospace',
+						}}
+						title="Use Regular Expression (.*)"
+					>
+						.*
+					</button>
+					<button
+						type="button"
 						onClick={() => runSearch('prev')}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Previous (Shift+Enter)"
 					>
 						↑
 					</button>
 					<button
+						type="button"
 						onClick={() => runSearch('next')}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Next (Enter)"
 					>
 						↓
 					</button>
 					<button
+						type="button"
 						onClick={() => {
 							setSearchOpen(false);
+							searchAddonRef.current?.clearDecorations?.();
 							termRef.current?.focus();
 						}}
-						style={{ fontSize: 11, padding: '1px 6px' }}
+						style={{ fontSize: 11, padding: '1px 6px', cursor: 'pointer' }}
 						title="Close (Esc)"
 					>
 						×

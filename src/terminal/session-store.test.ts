@@ -133,6 +133,13 @@ describe('rehydrateFromDb & auto-resume', () => {
 		expect(tab?.status).toBe('exited');
 		expect(tab?.wasRunning).toBe(false);
 	});
+
+	it('updateCwd updates the tab spec cwd', () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().updateCwd(id, '/new/working/dir');
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.spec.cwd).toBe('/new/working/dir');
+	});
 });
 
 describe('stripSecretEnv (ADR-013 §Addendum Decision 3)', () => {

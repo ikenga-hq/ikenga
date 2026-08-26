@@ -48,6 +48,7 @@ interface TerminalState {
 	rename: (id: string, title: string) => void;
 	setPtyId: (id: string, ptyId: string | null) => void;
 	setStatus: (id: string, status: TerminalTab['status'], exitCode?: number | null) => void;
+	updateCwd: (id: string, cwd: string) => void;
 
 	/** Attempt to attach `tabId` to an Artifact Studio pane. If the tab is
 	 *  currently owned by another Studio pane, returns
@@ -331,6 +332,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 							}
 						: t
 				),
+			}));
+			persistDebounced();
+		},
+
+		updateCwd: (id, cwd) => {
+			set((s) => ({
+				tabs: s.tabs.map((t) => (t.id === id ? { ...t, spec: { ...t.spec, cwd } } : t)),
 			}));
 			persistDebounced();
 		},

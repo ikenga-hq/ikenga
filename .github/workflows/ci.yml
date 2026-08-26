@@ -1,0 +1,175 @@
+name: CI
+
+# Fast per-PR gate: typecheck + unit tests. Deliberately does NOT build the
+# Tauri bundle — that lives in release.yml and needs Rust, the platform SDKs
+# and ~20 min of runner time. This job exists to catch the class of failure
+# that previously reached main unnoticed: a branch that doesn't compile, or
+# tests that were already red before a PR was opened.
+#
+# Workspace layout mirrors release.yml — shell's `workspace:*` deps
+# (@ikenga/contract, @ikenga/tokens) only resolve when the sibling repos are
+# checked out alongside and a pnpm workspace is synthesized at the root.
+# ikenga-pkgs is NOT needed here: it supplies the engine-cc dist and the
+# mcp-iyke source, both of which are Tauri bundle resources rather than
+# TypeScript imports.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR makes the in-flight run obsolete — cancel it rather than
+# paying for both. `github.ref` is unique per PR, so pushes to different PRs
+# never cancel each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+        with:
+          path: shell
+
+      - name: Checkout @ikenga/contract
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-contract
+          path: contract
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Checkout @ikenga/tokens
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-tokens
+          path: tokens
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      # Same synthesis as release.yml. There is no committed lockfile for this
+      # outer workspace, which is why the install below is --no-frozen-lockfile.
+      - name: Synthesize workspace
+        shell: bash
+        run: |
+          cat > pnpm-workspace.yaml <<'EOF'
+          packages:
+            - shell
+            - contract
+            - tokens
+          EOF
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Set up Node (for pnpm)
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: pnpm install (workspace root)
+        shell: bash
+        run: pnpm install --no-frozen-lockfile
+
+      # contract and tokens gitignore their dist/, and their package mains
+      # point at ./dist — without this step tsc can't resolve @ikenga/* types.
+      - name: Build workspace siblings (contract, tokens)
+        shell: bash
+        run: |
+          for pkg in '@ikenga/contract' '@ikenga/tokens'; do
+            echo "==> pnpm -F $pkg build"
+            pnpm -F "$pkg" build
+          done
+
+      - name: Typecheck
+        shell: bash
+        working-directory: shell
+        run: bun run typecheck
+
+      # Runs after typecheck so a compile break reports as a compile break
+      # rather than as a wall of downstream test failures.
+      - name: Unit tests
+        shell: bash
+        working-directory: shell
+        run: bun run test
+
+  # Rust side of the gate. A separate job so it runs in parallel with the TS
+  # one and reports its own pass/fail rather than hiding behind it.
+  #
+  # `cargo check` only — not `tauri build`, which additionally needs the Vite
+  # output, the ikenga-pkgs checkout for the engine-cc resource symlink, and
+  # ~20 min of runner time. Verified locally that `tauri_build::build()` does
+  # NOT require `frontendDist` to exist, so this job skips the frontend build
+  # entirely; `src-tauri/resources/builtin-pkgs` is tracked, so the resource
+  # path tauri.conf.json references is present on a bare checkout.
+  rust:
+    name: cargo check + test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      # WebKitGTK + GTK headers. ubuntu-22.04 (not -latest) to match the
+      # Linux leg of release.yml, so a green check here means the same
+      # headers the release build compiles against.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf
+
+      # `resources/builtin-pkgs/com.ikenga.engine-claude-code/dist` is a tracked
+      # symlink into the ikenga-pkgs monorepo, which this job deliberately does
+      # not check out. On Linux that symlink dangles, and tauri_build validates
+      # resource paths in the build script — so `cargo check` fails outright with
+      #   resource path `...engine-claude-code/dist` doesn't exist
+      # An empty directory satisfies it; only `tauri build` needs real contents.
+      #
+      # This does not reproduce locally on Windows: git materializes the symlink
+      # as a plain 59-byte text file, which tauri_build accepts. Verified on CI.
+      - name: Materialize engine-cc resource stub
+        run: |
+          d=src-tauri/resources/builtin-pkgs/com.ikenga.engine-claude-code/dist
+          rm -rf "$d"
+          mkdir -p "$d"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cold check is ~3 min locally; the cache makes the common case far
+      # cheaper. Keyed separately from release.yml's per-target caches.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ci-check
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets --message-format=short
+
+      # In-lib unit tests. Every test in this crate is a `#[cfg(test)] mod`
+      # inside src/ — 90 files, with no tests/ or benches/ directory — so
+      # `--lib` covers all of them without building target kinds that don't
+      # exist.
+      #
+      # Reuses what the check step just built, so the marginal cost is codegen
+      # + link of the test binary rather than a second full build. Keep this
+      # scoped: a Tauri debug build is large (check + test filled ~40 GB of
+      # target/ locally), so widening it to --all-targets risks runner disk.
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib --no-fail-fast

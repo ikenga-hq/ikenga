@@ -8,7 +8,7 @@ import {
 	summarizeSystems,
 	type NgwaItem,
 	type NgwaSystemId,
-} from './ngwa-surface';
+} from './ngwa-helpers';
 
 // WP-20 — the SYSTEM facet's pure logic: engine presence + per-engine counts,
 // per-kind aggregation across active engines, the all-on default + stale-id

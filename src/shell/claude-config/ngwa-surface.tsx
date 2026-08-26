@@ -54,8 +54,6 @@ import {
 	useRelinkDependents,
 	useRemovePrimitive,
 	type ConfigFormat,
-	type EngineId,
-	type KindStatus,
 } from '@/lib/queries/claude-config';
 import { obaSafeDelete, type SafeDeleteOutcome } from '@/lib/tauri-cmd';
 import {
@@ -74,46 +72,22 @@ import { AnalyzeSurface } from './analyze';
 import { EngineGlyph } from './engine-glyph';
 import { WriteTranscodeDrawer, isCrossEngineCopyable } from './write-drawer';
 
-// ─── URL-param vocabularies (must match WP-06's ngwa-mode.tsx) ──────────────
-export type NgwaSurfaceId =
-	| 'browse'
-	| 'registry'
-	| 'store'
-	| 'graph'
-	| 'map'
-	| 'life'
-	| 'health'
-	| 'flow';
-// `project:<id>` selects one specific project; `all`/`personal` are the
-// cross-cutting defaults. The sidebar enumerates one `project:<id>` per
-// scanned project root (WP-06 ↔ WP-07 seam).
-export type NgwaScopeId = 'all' | 'personal' | `project:${string}`;
-export type NgwaKindId = 'skills' | 'agents' | 'commands' | 'hooks' | 'mcps';
-// The SYSTEM facet (WP-20 / D-08) is multi-select — peers with Scope + Kind in
-// the sidebar but, unlike them, can hold several values at once. It threads
-// through the URL as a comma-separated `sys` param; an absent / empty param
-// means "all present systems on".
-export type NgwaSystemId = EngineId; // 'claude' | 'gemini' | 'codex'
-
-// ─── Engine identity (shared with the Ngwa sidebar) ─────────────────────────
-// Display name, the 2-char badge (CL/GM/CX), the `.evhead.eng.*` modifier, and
-// the engine-tint var — mirrors the D-08 mockup. The badge class on a row is
-// the lowercase engine id; the sub-header modifier is the short cl/gm/cx code.
-export const ENGINE_ORDER: readonly NgwaSystemId[] = ['claude', 'gemini', 'codex'];
-
-export const ENGINE_META: Record<
-	NgwaSystemId,
-	{ display: string; badge: string; code: 'cl' | 'gm' | 'cx' }
-> = {
-	claude: { display: 'Claude Code', badge: 'CL', code: 'cl' },
-	gemini: { display: 'Gemini', badge: 'GM', code: 'gm' },
-	codex: { display: 'Codex', badge: 'CX', code: 'cx' },
-};
-
-/** Absent `system` ⇒ `"claude"` (WP-19 contract). */
-const systemOf = (e: { system?: EngineId }): NgwaSystemId => e.system ?? 'claude';
-/** Absent `status` ⇒ `"active"` (WP-19 contract). */
-const statusOf = (e: { status?: KindStatus }): KindStatus => e.status ?? 'active';
+export * from './ngwa-helpers';
+import {
+	ENGINE_META,
+	ENGINE_ORDER,
+	UI_KIND_OF,
+	buildItems,
+	resolveActiveSystems,
+	siblingSystemsOf,
+	summarizeSystems,
+	type ItemState,
+	type NgwaItem,
+	type NgwaKindId,
+	type NgwaScopeId,
+	type NgwaSurfaceId,
+	type NgwaSystemId,
+} from './ngwa-helpers';
 
 // Map a serialization format onto the short row chip + its tint class.
 const FORMAT_CHIP: Record<ConfigFormat, { label: string; cls: 'json' | 'toml' | 'md' }> = {
@@ -146,51 +120,6 @@ const ANALYZE_LABEL: Record<string, string> = {
 
 // ─── Unified item model ─────────────────────────────────────────────────────
 // Browse + Registry render off one normalized shape derived from the on-disk
-// scan (ClaudeConfig) enriched with store-catalog membership.
-
-export type ItemState = 'enabled' | 'disabled' | 'local' | 'orphaned' | 'linked';
-type ItemMech = 'link' | 'merge';
-
-export interface NgwaItem {
-	id: string;
-	storeKind: ClaudeStoreKind; // skill | agent | command | hook | mcp
-	uiKind: NgwaKindId; // skills | agents | …
-	name: string;
-	scope: 'personal' | 'project';
-	scopeKey: ClaudeStoreScope; // 'workspace' | `project:<id>`
-	scopeLabel: string;
-	projectRoot: string | null;
-	path: string;
-	description: string | null;
-	state: ItemState;
-	mech: ItemMech;
-	overriddenBy: string | null;
-	// ── Ngwa Phase-2 cross-system (WP-20) ──
-	/** Owning engine. Absent on the scan ⇒ `"claude"`. */
-	system: NgwaSystemId;
-	/** On-disk serialization format (drives the row format chip). */
-	format: ConfigFormat | null;
-	/** Live vs. deprecated. Absent on the scan ⇒ `"active"`. */
-	status: KindStatus;
-	/** Source object for the detail superset. */
-	raw: ClaudeAgent | ClaudeSkill | ClaudeCommand | ClaudeHook | ClaudeMcp;
-	/** Store catalog row if this primitive is in the store. */
-	storeEntry: ClaudeStoreEntry | null;
-}
-
-const UI_KIND_OF: Record<ClaudeStoreKind, NgwaKindId> = {
-	skill: 'skills',
-	agent: 'agents',
-	command: 'commands',
-	hook: 'hooks',
-	mcp: 'mcps',
-	// WP-18: `bundle` has no dedicated Ngwa UI surface yet (its store-map cell is
-	// later-WP work). A bundle ships member skills, so should one ever reach this
-	// map before the dedicated surface lands it groups under skills. No bundle row
-	// reaches the FE today — the backend filters them out of claude_store_list.
-	bundle: 'skills',
-};
-
 const KIND_LABEL: Record<NgwaKindId, string> = {
 	skills: 'Skills',
 	agents: 'Agents',
@@ -213,251 +142,7 @@ const STATE_WORD: Record<ItemState, string> = {
 	linked: 'Linked',
 };
 
-const normRoot = (p: string) => p.replace(/\/+$/, '');
-const baseOf = (p: string) => normRoot(p).split('/').filter(Boolean).pop() ?? '';
-
-/** Resolve a project root path to the real DB project **id** — the slug the Rust
- *  store resolves via `get_project(id)` (`commands/claude_store.rs`), which is set
- *  independently from `root_path` and is NOT generally the directory basename.
- *  Matches by normalized `root_path` first, then by basename (covers `~` vs
- *  absolute divergence between `claudeProjectRoots` and `projects.root_path`).
- *  Returns null when no project row matches, so callers fall back to the basename
- *  surrogate — preserving prior behavior for unmapped roots. */
-export function projectIdForRoot(projects: Project[], root: string | null): string | null {
-	if (!root) return null;
-	const r = normRoot(root);
-	const exact = projects.find((p) => p.root_path && normRoot(p.root_path) === r);
-	if (exact) return exact.id;
-	const rb = baseOf(root);
-	const byBase = projects.find((p) => p.root_path && baseOf(p.root_path) === rb);
-	return byBase?.id ?? null;
-}
-
-// Map a scanned `ClaudeConfigScope` + projectRoot onto the store-scope grammar.
-// The project scope key MUST be the DB project id (a slug), not the basename —
-// the backend resolves `project:<id>` via `get_project`, so a basename surrogate
-// errors `no project with id "<basename>"` whenever slug != basename.
-function scopeKeyOf(
-	scope: 'personal' | 'project',
-	projectRoot: string | null,
-	projects: Project[]
-): ClaudeStoreScope {
-	if (scope === 'personal') return 'workspace';
-	const id = projectIdForRoot(projects, projectRoot) ?? baseOf(projectRoot ?? '') ?? 'project';
-	return `project:${id || 'project'}`;
-}
-
-function scopeLabelOf(scope: 'personal' | 'project', projectRoot: string | null): string {
-	if (scope === 'personal') return 'Personal';
-	return (projectRoot ?? 'project').split('/').filter(Boolean).pop() ?? 'project';
-}
-
-/** Derive the lifecycle state of a scanned, file-based primitive. JSON-merge
- *  kinds (hook/mcp) are always "enabled" while present (their presence in the
- *  scan == merged into settings). */
-function deriveState(
-	meta: { isSymlink: boolean; inStore: boolean; targetExists?: boolean },
-	mech: ItemMech
-): ItemState {
-	if (mech === 'merge') return 'enabled';
-	if (meta.isSymlink) {
-		// WP-03 req #6: only a DANGLING link is orphaned. A symlink that resolves
-		// reads as enabled (store-backed) or linked (resolves to a valid master
-		// outside the store, e.g. an externally-mastered primitive like groundwork).
-		if (meta.targetExists === false) return 'orphaned';
-		return meta.inStore ? 'enabled' : 'linked';
-	}
-	return 'local'; // a real file, not store-backed
-}
-
-export function buildItems(
-	config: ClaudeConfig,
-	store: ClaudeStoreEntry[],
-	projects: Project[]
-): NgwaItem[] {
-	const out: NgwaItem[] = [];
-	const storeByKey = new Map<string, ClaudeStoreEntry>();
-	for (const e of store) storeByKey.set(`${e.kind}:${e.name}`, e);
-	// Disambiguate ids that would otherwise collide — e.g. one hook command
-	// bound to several events shares kind:name:scope:root. Keeps React keys +
-	// selection identity unique without changing the id for unique items.
-	const seen = new Map<string, number>();
-
-	const push = (
-		storeKind: ClaudeStoreKind,
-		name: string,
-		scope: 'personal' | 'project',
-		projectRoot: string | null,
-		path: string,
-		description: string | null,
-		mech: ItemMech,
-		meta: { isSymlink: boolean; inStore: boolean },
-		overriddenBy: string | null,
-		raw: NgwaItem['raw']
-	) => {
-		const scopeKey = scopeKeyOf(scope, projectRoot, projects);
-		const storeEntry = storeByKey.get(`${storeKind}:${name}`) ?? null;
-		const system = systemOf(raw);
-		// Identity keys on engine too: the cross-engine `reviewer` (gemini-md +
-		// codex-toml) is two distinct primitives, so `system` must be in the id.
-		let id = `${system}:${storeKind}:${name}:${scope}:${projectRoot ?? ''}`;
-		const dup = seen.get(id) ?? 0;
-		seen.set(id, dup + 1);
-		if (dup > 0) id = `${id}#${dup}`;
-		out.push({
-			id,
-			storeKind,
-			uiKind: UI_KIND_OF[storeKind],
-			name,
-			scope,
-			scopeKey,
-			scopeLabel: scopeLabelOf(scope, projectRoot),
-			projectRoot,
-			path,
-			description,
-			state: deriveState(meta, mech),
-			mech,
-			overriddenBy,
-			system,
-			format: raw.format ?? null,
-			status: statusOf(raw),
-			raw,
-			storeEntry,
-		});
-	};
-
-	for (const a of config.agents)
-		push(
-			'agent',
-			a.name,
-			a.scope,
-			a.projectRoot,
-			a.path,
-			a.description,
-			'link',
-			a,
-			a.overriddenBy,
-			a
-		);
-	for (const s of config.skills)
-		push(
-			'skill',
-			s.name,
-			s.scope,
-			s.projectRoot,
-			s.path,
-			s.description,
-			'link',
-			s,
-			s.overriddenBy,
-			s
-		);
-	for (const c of config.commands)
-		push(
-			'command',
-			c.name,
-			c.scope,
-			c.projectRoot,
-			c.path,
-			c.description,
-			'link',
-			c,
-			c.overriddenBy,
-			c
-		);
-	for (const h of config.hooks)
-		push(
-			'hook',
-			h.name,
-			h.scope,
-			h.projectRoot,
-			h.settingsPath,
-			h.event,
-			'merge',
-			{ isSymlink: false, inStore: false },
-			null,
-			h
-		);
-	for (const m of config.mcps)
-		push(
-			'mcp',
-			m.name,
-			m.scope,
-			m.projectRoot,
-			m.path,
-			`${m.transport} server`,
-			'merge',
-			{ isSymlink: false, inStore: false },
-			null,
-			m
-		);
-
-	return out;
-}
-
-// ─── System-facet summary (shared sidebar ↔ surface) ────────────────────────
-// Engines present in the scan (preserving CL→GM→CX order), the per-engine total
-// count, and the per-kind count aggregated across the *active* (toggled-on)
-// systems. The sidebar consumes `present` + `engineCounts` to render the SYSTEM
-// facet, and `kindCounts(active)` to show Kind counts summed over active
-// engines (D-08 point 4).
-
-export interface NgwaSystemSummary {
-	/** Engines present in the scan, in canonical CL→GM→CX order. */
-	present: NgwaSystemId[];
-	/** Total primitive count per present engine. */
-	engineCounts: Record<NgwaSystemId, number>;
-	/** Per-kind counts, summed over a supplied set of active engines. */
-	kindCounts: (active: ReadonlySet<NgwaSystemId>) => Record<NgwaKindId, number>;
-}
-
-export function summarizeSystems(items: NgwaItem[]): NgwaSystemSummary {
-	const engineCounts = { claude: 0, gemini: 0, codex: 0 } as Record<NgwaSystemId, number>;
-	for (const it of items) engineCounts[it.system] = (engineCounts[it.system] ?? 0) + 1;
-	const present = ENGINE_ORDER.filter((e) => engineCounts[e] > 0);
-	const kindCounts = (active: ReadonlySet<NgwaSystemId>): Record<NgwaKindId, number> => {
-		const c: Record<NgwaKindId, number> = {
-			skills: 0,
-			agents: 0,
-			commands: 0,
-			hooks: 0,
-			mcps: 0,
-		};
-		for (const it of items) {
-			if (active.has(it.system)) c[it.uiKind] += 1;
-		}
-		return c;
-	};
-	return { present, engineCounts, kindCounts };
-}
-
-/** Other engines (besides the item's own) that carry a primitive of the same
- *  kind+name — the cross-engine collision the detail pane surfaces. Returns them
- *  in canonical CL→GM→CX order, de-duplicated. */
-export function siblingSystemsOf(item: NgwaItem | null, items: NgwaItem[]): NgwaSystemId[] {
-	if (!item) return [];
-	const others = new Set<NgwaSystemId>();
-	for (const x of items) {
-		if (x.storeKind === item.storeKind && x.name === item.name && x.system !== item.system) {
-			others.add(x.system);
-		}
-	}
-	return ENGINE_ORDER.filter((e) => others.has(e));
-}
-
-/** Resolve the effective active-system set from the URL `sys` selection and the
- *  engines actually present. An empty / absent selection ⇒ all present engines
- *  on (D-08 default). Selections are intersected with `present` so a stale id
- *  can't leave the list empty. */
-export function resolveActiveSystems(
-	selected: readonly NgwaSystemId[] | null,
-	present: readonly NgwaSystemId[]
-): Set<NgwaSystemId> {
-	const presentSet = new Set(present);
-	if (!selected || selected.length === 0) return new Set(present);
-	const picked = selected.filter((s) => presentSet.has(s));
-	return picked.length > 0 ? new Set(picked) : new Set(present);
-}
+// ─── Top-level surface ──────────────────────────────────────────────────────
 
 // ─── Top-level surface ──────────────────────────────────────────────────────
 

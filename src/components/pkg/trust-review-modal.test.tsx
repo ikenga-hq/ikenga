@@ -3,7 +3,7 @@
 // JSON formatter rather than rendering the React tree. Visual layout is
 // verified during live boot smoke (deferred — see plan status log).
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { _formatJson } from './trust-review-modal';
 
@@ -21,8 +21,13 @@ import {
 
 const invokeMock = vi.mocked(invoke);
 
+beforeEach(() => {
+	(globalThis as any).__TAURI_INTERNALS__ = {};
+});
+
 afterEach(() => {
 	invokeMock.mockReset();
+	delete (globalThis as any).__TAURI_INTERNALS__;
 });
 
 describe('_formatJson', () => {

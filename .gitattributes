@@ -1,0 +1,35 @@
+# Normalize line endings.
+#
+# Why this file exists: with core.autocrlf=true (the Windows default) the
+# working tree gets CRLF while the repo stores LF. Biome's formatter expects
+# LF, so `bun run lint` reported errors on every file on Windows checkouts —
+# effectively unusable, and it masked genuine lint findings underneath.
+# The same mismatch made generated files churn on every cross-platform edit.
+#
+# `eol=lf` pins LF in the working tree on every platform. Git still stores LF
+# either way; this only changes what lands on disk at checkout.
+
+* text=auto eol=lf
+
+# Windows-only script formats that genuinely require CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binary — never touch, never diff as text. `text=auto` detects most of these
+# on content, but being explicit avoids a misdetection corrupting a file.
+*.png       binary
+*.ico       binary
+*.icns      binary
+*.mp3       binary
+*.pub       binary
+*.minisig   binary
+*.wasm      binary
+*.ttf       binary
+*.woff      binary
+*.woff2     binary
+
+# Generated — collapse in reviews and suppress conflict noise. `linguist-*`
+# drives GitHub's diff view; `-diff` keeps them out of local diffs too.
+src/routeTree.gen.ts linguist-generated=true
+bun.lock             linguist-generated=true -diff

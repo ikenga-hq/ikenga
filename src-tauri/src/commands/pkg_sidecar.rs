@@ -179,6 +179,8 @@ fn err(msg: String) -> PkgSidecarCallResult {
 
 #[cfg(test)]
 mod tests {
+    // The only test here is unix-gated, so nothing consumes this elsewhere.
+    #[cfg_attr(not(unix), allow(unused_imports))]
     use super::*;
 
     /// Sanity-check the spawn primitives that pkg_sidecar_call uses end-to-

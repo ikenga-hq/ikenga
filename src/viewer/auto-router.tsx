@@ -32,6 +32,8 @@ interface ViewerRouterProps {
 	/** Enable in-place editing for renderers that support it (MarkdownView).
 	 *  Defaults false so thumbnails/embeds stay read-only. */
 	editable?: boolean;
+	line?: number;
+	col?: number;
 }
 
 type Renderer = React.ComponentType<{ path: string }>;
@@ -69,6 +71,8 @@ export function ViewerRouter({
 	chromeless,
 	paneId,
 	editable,
+	line,
+	col,
 }: ViewerRouterProps) {
 	// Synchronous first-pass — known extensions render immediately.
 	const initialMime = useMemo(() => mimeFromExt(path), [path]);
@@ -118,6 +122,8 @@ export function ViewerRouter({
 				<HtmlFrame path={path} paneId={paneId} />
 			) : Renderer === MarkdownView ? (
 				<MarkdownView path={path} editable={editable} />
+			) : Renderer === CodeView ? (
+				<CodeView path={path} line={line} col={col} />
 			) : (
 				<Renderer path={path} />
 			)}
