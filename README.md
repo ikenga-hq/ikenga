@@ -316,6 +316,19 @@ credential nobody has another copy of.
 > `IKENGA_AUTH_TOKEN` and the agent API keys; `IKENGA_VAULT_KEY` joins them once WP-12b
 > gives it a consumer.
 
+#### Verifying a running daemon
+
+`scripts/server/verify-live.ts` drives the daemon's real HTTP and WebSocket
+surface — real PTYs, real reconnects, and a real `agy` turn. Nothing in it is
+stubbed, which is the point: the two worst defects found in this subsystem (a
+`tokio::join!` that never returned, and a deleted stylesheet import) both
+compiled clean and passed every offline gate.
+
+```bash
+IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
+  bun run scripts/server/verify-live.ts
+```
+
 #### Running under systemd or Docker
 - **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.
 - **Docker**: Run `docker compose -f scripts/server/docker-compose.yml up -d` after running `deploy.sh`.
