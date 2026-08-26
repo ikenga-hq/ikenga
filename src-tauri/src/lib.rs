@@ -94,10 +94,9 @@ use commands::{
     oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
     oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
     oba_missing_requires, oba_relink_dependents, oba_safe_delete, oba_set_auto_update,
-    oba_unlink_one, oba_update, os_username, pin_screenshot_write, pkg_content_html,
-    pkg_activity_bar_set_badge, pkg_content_revoke, pkg_content_url, pkg_db_diag,
-    pkg_dev_register, pkg_dev_reload, pkg_dev_unregister, pkg_discover_workspace, pkg_fetch,
-    pkg_health_remove,
+    oba_unlink_one, oba_update, os_username, pin_screenshot_write, pkg_activity_bar_set_badge,
+    pkg_content_html, pkg_content_revoke, pkg_content_url, pkg_db_diag, pkg_dev_register,
+    pkg_dev_reload, pkg_dev_unregister, pkg_discover_workspace, pkg_fetch, pkg_health_remove,
     pkg_health_remove_all, pkg_health_scan, pkg_install_from_path, pkg_install_from_registry,
     pkg_invoke, pkg_is_trusted_for_elevated, pkg_kernel_status, pkg_mcp_call, pkg_preview_manifest,
     pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
@@ -116,9 +115,9 @@ use commands::{
     spike_grant_fs_read, spike_setup_test_file, studio_message_append, studio_message_list,
     studio_thread_delete, studio_thread_get, studio_thread_get_or_create,
     studio_thread_list_recent, terminal_detect_shells, window_close, window_list, window_spawn,
-    ActivityBarState, ChiCache, ChiRuntime, KernelState, PkgContentState, PkgSettingsState,
-    SidecarSupervisorState, SidecarsRegistryState, StreamingSidecarManager,
-    StreamingSidecarManagerState, WebviewPanesState,
+    ChiCache, ChiRuntime, KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState,
+    SidecarsRegistryState, StreamingSidecarManager, StreamingSidecarManagerState,
+    WebviewPanesState,
 };
 #[cfg(feature = "desktop")]
 #[cfg(debug_assertions)]
