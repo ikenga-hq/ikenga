@@ -31,10 +31,10 @@ use axum::{Json, Router};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
-pub use health::health_handler;
-pub use static_files::SpaStaticService;
 use crate::engines::EngineRegistry;
 use crate::pty::PtyManager;
+pub use health::health_handler;
+pub use static_files::SpaStaticService;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -193,7 +193,10 @@ pub fn create_router(
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     Router::new()
         .route("/api/health", get(health::health_handler))
@@ -203,10 +206,7 @@ pub fn create_router(
         .with_state(state)
 }
 
-async fn spa_fallback_handler(
-    State(state): State<Arc<AppState>>,
-    uri: Uri,
-) -> impl IntoResponse {
+async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> impl IntoResponse {
     state.spa_service.handle(uri).await
 }
 
@@ -245,10 +245,15 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     let pty_manager = Arc::new(PtyManager::new());
     let engine_registry = Arc::new(EngineRegistry::new());
     {
-        let antigravity_engine = Arc::new(crate::engines::antigravity_acp::AntigravityEngine::new());
+        let antigravity_engine =
+            Arc::new(crate::engines::antigravity_acp::AntigravityEngine::new());
         let antigravity_handle = crate::engines::EngineHandle::Antigravity(antigravity_engine);
-        engine_registry.insert("antigravity", antigravity_handle.clone()).await;
-        engine_registry.insert("antigravity-cli", antigravity_handle).await;
+        engine_registry
+            .insert("antigravity", antigravity_handle.clone())
+            .await;
+        engine_registry
+            .insert("antigravity-cli", antigravity_handle)
+            .await;
     }
     let token = config.auth_token.clone().unwrap_or_default();
     let router = create_router(config.clone(), pty_manager, engine_registry);
@@ -258,10 +263,21 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         addr,
         config.static_dir.display()
     );
+    // The opening link carries the bearer token, and that token grants a shell.
+    // Print it ONLY when the daemon minted an ephemeral one for this run and is
+    // therefore attached to somebody's terminal — a minted token dies with the
+    // process, so the console is the only place it can come from.
+    //
+    // A configured token must never be logged. Under systemd this call goes to
+    // journald, where it persists, is readable by anyone in `systemd-journal`,
+    // and outlives every rotation of the credential itself.
     if minted {
-        info!("no --auth-token given; minted one for this run");
+        info!("no --auth-token given; minted an ephemeral one for this run");
+        info!("open: http://{addr}/?token={token}");
+    } else {
+        info!("open: http://{addr}/?token=<IKENGA_AUTH_TOKEN>");
+        info!("token is the configured one; read it from the env file, not from this log");
     }
-    info!("open: http://{addr}/?token={token}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;

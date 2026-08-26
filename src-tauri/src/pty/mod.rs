@@ -26,10 +26,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "desktop")]
 use base64::Engine;
 use dashmap::DashMap;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
+// The Tauri sink is one of two ways a session's bytes leave this module; the
+// other is the `Custom` callback pair the daemon uses. Only the former needs a
+// webview runtime.
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
@@ -161,6 +166,7 @@ pub type ExitSink = Box<dyn FnOnce(i32) + Send + 'static>;
 /// which `spawn_inner` generates, so the choice is passed in and materialized
 /// once the id exists.
 enum SinkSpec {
+    #[cfg(feature = "desktop")]
     Tauri(AppHandle),
     Custom(DataSink, ExitSink),
 }
@@ -320,6 +326,7 @@ impl PtyManager {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub async fn spawn(self: &Arc<Self>, app: AppHandle, opts: SpawnOpts) -> Result<String> {
         self.spawn_inner(SinkSpec::Tauri(app), opts, None).await
     }
@@ -346,6 +353,7 @@ impl PtyManager {
     /// Spawn with a byte subscriber attached. The subscriber sees raw PTY
     /// bytes alongside the normal `pty://{id}` event emission; used by the
     /// Claude session integration to feed `StreamParser`.
+    #[cfg(feature = "desktop")]
     pub async fn spawn_with_subscriber(
         self: &Arc<Self>,
         app: AppHandle,
@@ -387,6 +395,7 @@ impl PtyManager {
         // lets the frontend keep an absolute stream position for the capture
         // ring's own snapshot reconciliation.
         let (data_sink, exit_sink): (DataSink, ExitSink) = match sinks {
+            #[cfg(feature = "desktop")]
             SinkSpec::Tauri(app) => {
                 let event_name = format!("pty://{id}");
                 let exit_event = format!("pty://{id}/exit");
@@ -441,7 +450,9 @@ impl PtyManager {
         // the app inherited a thin GUI $PATH. Caller env below still wins.
         builder.env("PATH", crate::runtime::augmented_path());
         // WP-00: Thread CLAUDE_CONFIG_DIR overlay if not explicitly specified by caller env.
-        if !opts.env.contains_key("CLAUDE_CONFIG_DIR") && std::env::var("CLAUDE_CONFIG_DIR").is_err() {
+        if !opts.env.contains_key("CLAUDE_CONFIG_DIR")
+            && std::env::var("CLAUDE_CONFIG_DIR").is_err()
+        {
             if let Ok(overlay_dir) = overlay::ensure_claude_overlay_dir() {
                 if let Some(dir_str) = overlay_dir.to_str() {
                     builder.env("CLAUDE_CONFIG_DIR", dir_str);
@@ -1279,7 +1290,11 @@ mod tests {
         let code = tokio::time::timeout(Duration::from_secs(10), mgr.wait_for_exit(&id))
             .await
             .expect("wait_for_exit must resolve well before the retention window");
-        assert_eq!(code, Some(7), "the real exit status has to survive the trip");
+        assert_eq!(
+            code,
+            Some(7),
+            "the real exit status has to survive the trip"
+        );
 
         // Still in the map, still subscribable — proving the resolution above
         // was driven by the exit itself and not by the entry being removed.

@@ -147,7 +147,7 @@ async fn run_turn(
                     };
                     let cb: &(dyn Fn(SessionUpdate) + Send + Sync) = &on_update;
                     engine
-                        .run_prompt(None, &thread_id, &prompt, model.as_deref(), Some(cb))
+                        .run_prompt(&thread_id, &prompt, model.as_deref(), Some(cb))
                         .await
                 }
             };
@@ -185,6 +185,10 @@ async fn run_turn(
 
             send(&ws_tx, status_event(&thread_id, "idle", Some(&stop_reason))).await;
         }
+        // Only reachable in the desktop build; headless `EngineHandle` has the
+        // single Antigravity variant, so this arm would be an unreachable
+        // pattern there.
+        #[cfg(feature = "desktop")]
         _ => {
             // Remaining adapters have no headless driver yet. Say so rather
             // than echoing the prompt back as though it were a reply.

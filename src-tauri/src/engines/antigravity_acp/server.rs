@@ -5,10 +5,16 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
-    LoadSessionResponse, McpCapabilities, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, RequestPermissionResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
+    LoadSessionResponse, McpCapabilities, PromptCapabilities, PromptResponse, ProtocolVersion,
+    RequestPermissionResponse, SessionUpdate, StopReason, TextContent,
 };
+// Session setup and channel emission are the desktop ACP entry points; the
+// daemon drives `run_prompt` directly and never builds these envelopes.
+#[cfg(feature = "desktop")]
+use agent_client_protocol::schema::{
+    NewSessionRequest, NewSessionResponse, PromptRequest, SessionId, SessionNotification,
+};
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -181,6 +187,7 @@ impl AntigravityEngine {
             .clone()
     }
 
+    #[cfg(feature = "desktop")]
     pub async fn handle_new_session(
         &self,
         _app: AppHandle,
@@ -200,6 +207,15 @@ impl AntigravityEngine {
         Ok(NewSessionResponse::new(SessionId::new(thread_id)))
     }
 
+    /// Desktop entry point: emit each delta on the Tauri channel the shell's
+    /// chat layer listens to.
+    ///
+    /// The channel emit is expressed as an `on_update` callback rather than by
+    /// handing `run_prompt` an `AppHandle`. Those were two ways of saying the
+    /// same thing, and the `AppHandle` one is what made the engine adapters —
+    /// and through them the whole daemon — unbuildable without a webview
+    /// runtime. See the crate docs in `lib.rs`.
+    #[cfg(feature = "desktop")]
     pub async fn handle_prompt(
         &self,
         app: AppHandle,
@@ -207,7 +223,16 @@ impl AntigravityEngine {
     ) -> Result<PromptResponse, String> {
         let thread_id = req.session_id.0.to_string();
         let prompt_text = extract_prompt_text(&req);
-        self.run_prompt(Some(&app), &thread_id, &prompt_text, None, None)
+        let channel = format!("chat://session/{thread_id}/antigravity");
+        let session_id = SessionId::new(thread_id.clone());
+
+        let emit = move |update: SessionUpdate| {
+            let notif = SessionNotification::new(session_id.clone(), update);
+            let _ = app.emit(&channel, &notif);
+        };
+        let cb: &(dyn Fn(SessionUpdate) + Send + Sync) = &emit;
+
+        self.run_prompt(&thread_id, &prompt_text, None, Some(cb))
             .await
     }
 
@@ -217,7 +242,6 @@ impl AntigravityEngine {
     /// `None` to use whatever `handle_set_model` last stored.
     pub async fn run_prompt(
         &self,
-        app: Option<&AppHandle>,
         thread_id: &str,
         text: &str,
         model: Option<&str>,
@@ -326,7 +350,6 @@ impl AntigravityEngine {
             s.in_flight = Some(child_handle.clone());
         }
 
-        let channel = format!("chat://session/{thread_id}/antigravity");
         let mut lines = BufReader::new(stdout).lines();
         let mut stop_reason = StopReason::EndTurn;
         let mut turn_error: Option<String> = None;
@@ -360,15 +383,7 @@ impl AntigravityEngine {
                             };
 
                             if let Some(cb) = on_update_cb {
-                                cb(update.clone());
-                            }
-
-                            if let Some(a) = app {
-                                let notif = SessionNotification::new(
-                                    SessionId::new(thread_id.to_string()),
-                                    update,
-                                );
-                                let _ = a.emit(&channel, &notif);
+                                cb(update);
                             }
                         }
                         AgyEvent::Result { status, error } => {
@@ -476,6 +491,7 @@ impl AntigravityEngine {
     /// The `agy` CLI exposes no reasoning-effort control, so this is reported
     /// as unsupported rather than silently accepted — an `Ok(())` here would
     /// tell the UI the setting took when nothing changed.
+    #[cfg(feature = "desktop")]
     pub async fn handle_set_effort(
         &self,
         _thread_id: String,
@@ -487,6 +503,7 @@ impl AntigravityEngine {
 
 pub type AntigravityEngineState = Arc<AntigravityEngine>;
 
+#[cfg(feature = "desktop")]
 fn extract_prompt_text(req: &PromptRequest) -> String {
     let mut parts = Vec::new();
     for block in &req.prompt {
@@ -544,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_model_and_mode_are_stored_set_effort_is_refused() {
+    async fn set_model_and_mode_are_stored() {
         let engine = AntigravityEngine::new();
         engine
             .handle_set_model("t-3".into(), Some("gemini-3-pro".into()))
@@ -566,13 +583,20 @@ mod tests {
             .await
             .unwrap();
         assert!(s.lock().await.model.is_none());
+    }
 
+    // `handle_set_effort` takes an `EffortLevel` from the desktop-only `claude`
+    // module, so this assertion only exists in that build.
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn set_effort_is_refused_rather_than_silently_accepted() {
+        let engine = AntigravityEngine::new();
         assert!(
             engine
-                .handle_set_effort("t-3".into(), crate::claude::session::EffortLevel::High)
+                .handle_set_effort("t-4".into(), crate::claude::session::EffortLevel::High)
                 .await
                 .is_err(),
-            "effort is unsupported and must not report success"
+            "the agy CLI has no effort control; reporting Ok would tell the UI it took"
         );
     }
 

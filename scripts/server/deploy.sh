@@ -21,10 +21,10 @@ fi
 # execute, and the only symptom is "Exec format error" at systemd start.
 TARGET="${TARGET:-}"
 if [[ -n "$TARGET" ]]; then
-  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server" "--target" "$TARGET")
+  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server" "--no-default-features" "--target" "$TARGET")
   BIN_DIR="$SHELL_DIR/src-tauri/target/$TARGET/$PROFILE"
 else
-  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server")
+  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server" "--no-default-features")
   BIN_DIR="$SHELL_DIR/src-tauri/target/$PROFILE"
   HOST_TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
   if [[ "$HOST_TRIPLE" != *linux* ]]; then
@@ -37,8 +37,22 @@ if [[ "$PROFILE" == "release" ]]; then
   CARGO_FLAGS+=("--release")
 fi
 
-echo "==> Building ikenga-server ($PROFILE${TARGET:+ · $TARGET})"
+# --no-default-features drops `tauri/wry`. Without it the binary links
+# libwebkit2gtk + the whole GTK stack and will not start on a server at all:
+#   error while loading shared libraries: libgdk-3.so.0
+# See the crate docs in src-tauri/src/lib.rs.
+echo "==> Building ikenga-server ($PROFILE${TARGET:+ · $TARGET}, headless)"
 cargo build "${CARGO_FLAGS[@]}"
+
+# Fail the build here rather than on the target host. This is the check that
+# would have caught the defect WP-16 fixed.
+echo "==> Verifying the binary links no desktop stack"
+if ldd "$BIN_DIR/ikenga-server" 2>/dev/null | grep -qiE "gtk|webkit|javascriptcore"; then
+  echo "error: ikenga-server links the desktop stack; it will not run headless." >&2
+  ldd "$BIN_DIR/ikenga-server" | grep -iE "gtk|webkit|javascriptcore" >&2
+  exit 1
+fi
+echo "    ok — $(ldd "$BIN_DIR/ikenga-server" | wc -l) shared deps, no GTK/WebKit"
 
 echo "==> Building frontend SPA"
 (cd "$SHELL_DIR" && bun run build)

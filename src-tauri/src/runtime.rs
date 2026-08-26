@@ -25,12 +25,25 @@
 //! is interactive, and bun-dependent sidecars park as
 //! `BlockedReason::RuntimeNotReady` (no strike) until the fetch completes.
 
+// The daemon uses exactly two things from this file: `augmented_path()` to
+// find agent CLIs, and `resolve_command()`. Everything else is the desktop
+// app's bundled-Bun apparatus — it ships a pinned Bun in its resource dir,
+// which a server has no equivalent of (the daemon resolves `bun` from PATH
+// like any other CLI). That machinery is therefore genuinely dead in a
+// headless build. Silenced as a group rather than gated item-by-item, because
+// `resolve_command` threads through it and splitting the file would hide that.
+#![cfg_attr(not(feature = "desktop"), allow(dead_code, unused_imports))]
+
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use sha2::{Digest, Sha256};
+// Bundled-Bun resolution needs the app's resource dir, which only exists in
+// the desktop build. `augmented_path()` and `resolve_command()` — the parts
+// the daemon uses to find agent CLIs — need neither.
+#[cfg(feature = "desktop")]
 use tauri::{AppHandle, Manager};
 
 /// Bun's release-asset target naming for the host we're building for. Maps
@@ -78,9 +91,13 @@ pub fn bun_zip_sha256(target: &str) -> Option<&'static str> {
         "linux-x64" => Some("2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452"),
         "linux-aarch64" => Some("4b1a332ee861983eb93bcfe6f770fff94e3e31b2c388bdaea3c8ed35e58eed0e"),
         "darwin-x64" => Some("1d0211b8f1dc991182344687ad15e72ee86f154845a5f7fa477994cd341dd9b0"),
-        "darwin-aarch64" => Some("c669e97f6164e1c96e0701748db98dfa77492908cbd8394c7557134a735de381"),
+        "darwin-aarch64" => {
+            Some("c669e97f6164e1c96e0701748db98dfa77492908cbd8394c7557134a735de381")
+        }
         "windows-x64" => Some("e6f093d39da486b20262ca8cdd5ed6a9e8bc9c2f275b78e6d3a0c5b28cc95901"),
-        "windows-aarch64" => Some("f473bfe2df73ee770548c93dd5d380aea7120c218ec2aa1afdd0bbba7bf18c47"),
+        "windows-aarch64" => {
+            Some("f473bfe2df73ee770548c93dd5d380aea7120c218ec2aa1afdd0bbba7bf18c47")
+        }
         _ => None,
     }
 }
@@ -94,6 +111,7 @@ static BUN_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static FETCHED_BUN: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Initialise the bundled-Bun lookup at app setup time. Idempotent.
+#[cfg(feature = "desktop")]
 pub fn init_from_app(app: &AppHandle) {
     let _ = BUN_PATH.get_or_init(|| resolve_bun_path(app));
 }
@@ -116,6 +134,7 @@ fn resolve_dev_bun_path() -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn resolve_bun_path(app: &AppHandle) -> Option<PathBuf> {
     if BUN_TARGET == "unsupported" {
         log::warn!(
@@ -221,12 +240,14 @@ fn version_ge(found: &str, pin: &str) -> bool {
 }
 
 /// `<app_data_dir>/bun` — the root under which fetched bun targets live.
+#[cfg(feature = "desktop")]
 pub fn app_data_bun_dir(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_data_dir().ok().map(|d| d.join("bun"))
 }
 
 /// Where a fetched bun for this host lands: `<app_data_dir>/bun/<target>/bun`.
 /// `None` when the host target is unsupported.
+#[cfg(feature = "desktop")]
 pub fn fetched_bun_path(app: &AppHandle) -> Option<PathBuf> {
     if BUN_TARGET == "unsupported" {
         return None;
@@ -243,7 +264,10 @@ fn sidecar_path_for(bin: &Path) -> PathBuf {
 /// for the current target.
 fn fetched_sidecar_matches_pin(bin: &Path) -> bool {
     let sidecar = sidecar_path_for(bin);
-    match (std::fs::read_to_string(&sidecar), bun_zip_sha256(BUN_TARGET)) {
+    match (
+        std::fs::read_to_string(&sidecar),
+        bun_zip_sha256(BUN_TARGET),
+    ) {
         (Ok(s), Some(pin)) => s.trim() == pin,
         _ => false,
     }
@@ -333,9 +357,30 @@ fn build_augmented_path() -> OsString {
             extras.push(userprofile.join("scoop").join("shims"));
             extras.push(userprofile.join("AppData").join("Roaming").join("npm"));
             extras.push(userprofile.join("AppData").join("Local").join("pnpm"));
-            extras.push(userprofile.join("AppData").join("Local").join("Programs").join("Git").join("bin"));
-            extras.push(userprofile.join("AppData").join("Local").join("Programs").join("Git").join("cmd"));
-            extras.push(userprofile.join("AppData").join("Local").join("Microsoft").join("WinGet").join("Links"));
+            extras.push(
+                userprofile
+                    .join("AppData")
+                    .join("Local")
+                    .join("Programs")
+                    .join("Git")
+                    .join("bin"),
+            );
+            extras.push(
+                userprofile
+                    .join("AppData")
+                    .join("Local")
+                    .join("Programs")
+                    .join("Git")
+                    .join("cmd"),
+            );
+            extras.push(
+                userprofile
+                    .join("AppData")
+                    .join("Local")
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links"),
+            );
         }
         if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
             extras.push(appdata.join("npm"));
@@ -430,6 +475,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Idempotent: if bun already resolves (`bun_ready`) or a valid fetched binary
 /// already sits on disk with a matching sidecar, returns early without
 /// re-downloading.
+#[cfg(feature = "desktop")]
 pub async fn ensure_bun<F>(app: &AppHandle, on_progress: F) -> Result<PathBuf, String>
 where
     F: Fn(BunFetchProgress) + Send + Sync,
@@ -720,10 +766,10 @@ mod tests {
         assert!(!version_ge("1.3.14", "1.4.0")); // older minor
         assert!(!version_ge("1.2.99", "1.4.0")); // older minor
         assert!(!version_ge("garbage", "1.4.0")); // unparsable → reject
-        // Pin 1.4.0 has no older patch of its own minor, so cover the
-        // older-patch branch against a synthetic base.
+                                                  // Pin 1.4.0 has no older patch of its own minor, so cover the
+                                                  // older-patch branch against a synthetic base.
         assert!(!version_ge("1.4.0", "1.4.1")); // older patch
-        // Tolerate a leading `v` and pre-release suffix on the found string.
+                                                // Tolerate a leading `v` and pre-release suffix on the found string.
         assert!(version_ge("v1.4.0", "1.4.0"));
         assert!(version_ge("1.5.0-canary.1", "1.4.0"));
     }

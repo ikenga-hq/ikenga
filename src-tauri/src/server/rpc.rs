@@ -22,7 +22,7 @@ fn resolve_path(input: &str) -> Result<std::path::PathBuf, String> {
     if input.is_empty() {
         return Err("path is required".to_string());
     }
-    if let Ok(p) = crate::commands::resolve_allowlisted(input) {
+    if let Ok(p) = crate::path_allow::resolve_allowlisted(input) {
         return Ok(p);
     }
 

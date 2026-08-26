@@ -7,6 +7,10 @@
 //! `OnceLock` so the resolver doesn't need to thread Tauri `State` through
 //! every fs command and through non-command callers like `viewer_serve`.
 
+// `add` / `remove` / `reset` are driven by the desktop settings commands;
+// the daemon only ever reads the root set that `install()` seeded.
+#![cfg_attr(not(feature = "desktop"), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 

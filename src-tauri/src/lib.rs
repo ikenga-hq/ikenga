@@ -1,39 +1,75 @@
-mod agent_detect;
-pub mod claude;
-pub mod commands;
+//! # Two binaries, one crate
+//!
+//! `ikenga-desktop` (default features) is the Tauri application.
+//! `ikenga-server` is the headless daemon, built with `--no-default-features`,
+//! which drops `tauri/wry` and with it the whole GTK + WebKit stack. That is
+//! not a size optimisation: with wry linked the daemon will not START on a
+//! server, because the dynamic linker demands `libwebkit2gtk-4.1` and five
+//! friends that no headless box has.
+//!
+//! Everything in the second group is desktop-only — built around
+//! `#[tauri::command]` and `AppHandle`, neither of which exists without a
+//! webview runtime (`AppHandle`'s default type parameter IS `Wry`). The
+//! daemon's dependency closure is deliberately the short first list.
+
+// --- Headless core: compiled into BOTH binaries ---
 pub mod engines;
-pub mod env_files;
 mod fs_roots;
-mod fs_watch;
-mod iyke;
+pub mod path_allow;
 pub mod path_fix;
-mod pkg;
-mod pkg_content;
 pub mod platform;
 pub mod pty;
 mod runtime;
 pub mod server;
-mod terminal;
+
+// --- Desktop-only ---
+#[cfg(feature = "desktop")]
+mod agent_detect;
+#[cfg(feature = "desktop")]
+pub mod claude;
+#[cfg(feature = "desktop")]
+pub mod commands;
+#[cfg(feature = "desktop")]
+pub mod env_files;
+#[cfg(feature = "desktop")]
+mod fs_watch;
+#[cfg(feature = "desktop")]
+mod iyke;
+#[cfg(feature = "desktop")]
+mod pkg;
+#[cfg(feature = "desktop")]
+mod pkg_content;
+#[cfg(feature = "desktop")]
 pub mod settings_cascade;
+#[cfg(feature = "desktop")]
+mod terminal;
+#[cfg(feature = "desktop")]
 pub mod transcript;
+#[cfg(feature = "desktop")]
 pub mod vault_key;
-
-
+#[cfg(feature = "desktop")]
 mod viewer_server;
 // Multi-window substrate (plans/multi-window): the G-WINDOW-MODEL contract
 // (WP-02) + the window registry / spawn-close-list commands (WP-03).
+#[cfg(feature = "desktop")]
 mod window;
 
+#[cfg(feature = "desktop")]
 use std::sync::Arc;
 
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 // tauri-plugin-sql is loaded as a plugin (below) so the frontend's
 // `@tauri-apps/plugin-sql` callers resolve, but it does NOT own the
 // migration list — that lives in `commands::db::ensure_schema`.
+#[cfg(feature = "desktop")]
 use tokio::sync::Mutex;
 
+#[cfg(feature = "desktop")]
 use commands::db::PaDb;
+#[cfg(feature = "desktop")]
 use commands::screenshot::new_pending as new_screenshot_pending;
+#[cfg(feature = "desktop")]
 use commands::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
     activity_pins_resolve_artifact, activity_pins_touch_open, activity_sections_create,
@@ -41,7 +77,7 @@ use commands::{
     agent_ops_delete_job, agent_ops_list_jobs, agent_ops_run_now, agent_ops_set_enabled,
     agent_ops_tail_run, agent_ops_upsert_job, atelier_file_read, atelier_file_write, backup_delete,
     backup_export, backup_import, backup_list, chi_cancel, chi_list, chi_resume, chi_run,
-    chi_status, ChiRuntime, claude_asset_list_pins, claude_asset_pin, claude_asset_unpin,
+    chi_status, claude_asset_list_pins, claude_asset_pin, claude_asset_unpin,
     claude_assets_discover, claude_config_load, claude_config_read_file, claude_config_unwatch,
     claude_config_watch, claude_list_sessions, claude_primitive_copy, claude_primitive_copy_batch,
     claude_primitive_disable, claude_primitive_disable_for, claude_primitive_enable,
@@ -71,7 +107,6 @@ use commands::{
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_foreground, pty_foreground_snapshot, pty_kill,
     pty_resize, pty_spawn, pty_terminal_list, pty_write, runtime_retry_bun_fetch,
-    terminal_detect_shells,
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
     secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
@@ -79,12 +114,15 @@ use commands::{
     set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_set,
     spike_grant_fs_read, spike_setup_test_file, studio_message_append, studio_message_list,
     studio_thread_delete, studio_thread_get, studio_thread_get_or_create,
-    studio_thread_list_recent, window_close, window_list, window_spawn, ChiCache, KernelState,
-    PkgContentState, PkgSettingsState, SidecarSupervisorState, SidecarsRegistryState,
-    StreamingSidecarManager, StreamingSidecarManagerState, WebviewPanesState,
+    studio_thread_list_recent, terminal_detect_shells, window_close, window_list, window_spawn,
+    ChiCache, ChiRuntime, KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState,
+    SidecarsRegistryState, StreamingSidecarManager, StreamingSidecarManagerState,
+    WebviewPanesState,
 };
+#[cfg(feature = "desktop")]
 #[cfg(debug_assertions)]
 use commands::{bg_spike_reply, bg_spike_run, new_bg_spike_state};
+#[cfg(feature = "desktop")]
 use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
@@ -94,11 +132,16 @@ use commands::{
     supabase_config_set, viewer_port, viewer_serve, viewer_stop, IykeRuntimeState,
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, SecretsLock,
 };
+#[cfg(feature = "desktop")]
 use fs_watch::FsWatchManager;
+#[cfg(feature = "desktop")]
 use iyke::{IykeRpc, IykeState};
+#[cfg(feature = "desktop")]
 use pty::PtyManager;
+#[cfg(feature = "desktop")]
 use viewer_server::ViewerServerManager;
 
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // CLI intercept: if invoked with --screenshot=window or --screenshot=pane:<id>,
@@ -146,8 +189,7 @@ pub fn run() {
         Arc::new(engines::cursor_agent::CursorAgentEngine::new());
     let opencode_engine: engines::opencode_acp::OpencodeEngineState =
         Arc::new(engines::opencode_acp::OpencodeEngine::new());
-    let pi_engine: engines::pi_acp::PiEngineState =
-        Arc::new(engines::pi_acp::PiEngine::new());
+    let pi_engine: engines::pi_acp::PiEngineState = Arc::new(engines::pi_acp::PiEngine::new());
     // Multi-engine dispatcher used by `commands/chat.rs`. Built once
     // here and `.manage()`d so every Tauri command resolves engines
     // through the same registry.
@@ -1134,6 +1176,7 @@ pub fn run() {
 
 /// Set up tracing → stderr + a rolling file in the platform log dir. Best
 /// effort; if the dir is unavailable we just log to stderr.
+#[cfg(feature = "desktop")]
 fn init_logging() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -1169,6 +1212,7 @@ fn init_logging() {
 /// back through `screenshot_window` / `screenshot_pane`. Doing the
 /// focused-pane resolution in the FE avoids mirroring `usePaneStore` on
 /// the Rust side just for one handler.
+#[cfg(feature = "desktop")]
 fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     use tauri_plugin_global_shortcut::{Builder, Code, Modifiers, Shortcut, ShortcutState};
 
@@ -1240,6 +1284,7 @@ fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 }
 
 /// ⌥Space on Mac, Super+Space on Linux. Toggle main window visibility.
+#[cfg(feature = "desktop")]
 fn register_summon_shortcut(
     app: &tauri::AppHandle,
 ) -> Result<(), tauri_plugin_global_shortcut::Error> {
@@ -1259,6 +1304,7 @@ fn register_summon_shortcut(
 /// screenshot. The plugin handler dispatches to the correct branch by
 /// matching the `Shortcut` value. Tolerant: each binding is registered
 /// individually so a clash on one doesn't kill the other.
+#[cfg(feature = "desktop")]
 fn register_screenshot_shortcuts(app: &tauri::AppHandle) {
     use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
@@ -1284,12 +1330,14 @@ fn register_screenshot_shortcuts(app: &tauri::AppHandle) {
 // running there's no daemon mode to fall through to: print an error and
 // exit 1.
 
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScreenshotCli {
     Window,
     Pane(String),
 }
 
+#[cfg(feature = "desktop")]
 fn parse_screenshot_arg<I: Iterator<Item = String>>(args: I) -> Option<ScreenshotCli> {
     for a in args.skip(1) {
         if let Some(rest) = a.strip_prefix("--screenshot=") {
@@ -1299,6 +1347,7 @@ fn parse_screenshot_arg<I: Iterator<Item = String>>(args: I) -> Option<Screensho
     None
 }
 
+#[cfg(feature = "desktop")]
 fn parse_screenshot_value(v: &str) -> Option<ScreenshotCli> {
     if v == "window" {
         Some(ScreenshotCli::Window)
@@ -1313,12 +1362,14 @@ fn parse_screenshot_value(v: &str) -> Option<ScreenshotCli> {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[derive(serde::Deserialize)]
 struct ControlFileRead {
     port: u16,
     token: String,
 }
 
+#[cfg(feature = "desktop")]
 fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     // Identifier must match `tauri.conf.json:identifier` so the running
     // shell and the --screenshot CLI path agree on where control.json
@@ -1343,6 +1394,7 @@ fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn run_screenshot_cli(cmd: ScreenshotCli) -> i32 {
     let Some(control_path) = screenshot_cli_control_path() else {
         eprintln!("error: could not resolve control.json path");
@@ -1406,6 +1458,7 @@ fn run_screenshot_cli(cmd: ScreenshotCli) -> i32 {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -1441,6 +1494,7 @@ mod cli_tests {
     }
 }
 
+#[cfg(feature = "desktop")]
 fn log_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     // Consumed by the macOS and unix branches below; Windows uses neither.
