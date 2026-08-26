@@ -137,6 +137,409 @@ impl PaDb {
     }
 }
 
+/// Embedded migration set, kept in lockstep with `migrations/*.sql`.
+///
+/// Module-level rather than function-local so tests can assert against
+/// `MIGRATIONS.len()` instead of restating the count. A hardcoded copy of the
+/// number silently drifted once already: 0062_content_review_axis landed while
+/// the test still expected 61, and nothing caught it because the Rust tests
+/// were not running in CI.
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "0001_init",
+        include_str!("../../migrations/0001_init.sql"),
+    ),
+    (
+        2,
+        "0002_viewer_recents",
+        include_str!("../../migrations/0002_viewer_recents.sql"),
+    ),
+    (
+        3,
+        "0003_claude_sessions",
+        include_str!("../../migrations/0003_claude_sessions.sql"),
+    ),
+    // 0004 (render_queue), 0005 (mbox_sync), 0006 (storyboards) created
+    // app-specific schema that was retired with the strip-down. We keep
+    // the SQL files in `migrations/` so existing dev DBs still apply
+    // them in version order before 0009 cleans them up; fresh installs
+    // run 0001→0003 then 0007→0009 (no app-specific tables ever exist).
+    (
+        4,
+        "0004_render_queue",
+        include_str!("../../migrations/0004_render_queue.sql"),
+    ),
+    (
+        5,
+        "0005_mbox_sync",
+        include_str!("../../migrations/0005_mbox_sync.sql"),
+    ),
+    (
+        6,
+        "0006_storyboards",
+        include_str!("../../migrations/0006_storyboards.sql"),
+    ),
+    (
+        7,
+        "0007_pkg_kernel",
+        include_str!("../../migrations/0007_pkg_kernel.sql"),
+    ),
+    (
+        8,
+        "0008_pkg_install_source",
+        include_str!("../../migrations/0008_pkg_install_source.sql"),
+    ),
+    (
+        9,
+        "0009_strip_legacy",
+        include_str!("../../migrations/0009_strip_legacy.sql"),
+    ),
+    (
+        10,
+        "0010_activity_bar_pinning",
+        include_str!("../../migrations/0010_activity_bar_pinning.sql"),
+    ),
+    (
+        11,
+        "0011_chat_sessions",
+        include_str!("../../migrations/0011_chat_sessions.sql"),
+    ),
+    (
+        12,
+        "0012_session_fork",
+        include_str!("../../migrations/0012_session_fork.sql"),
+    ),
+    (
+        13,
+        "0013_settings_kv",
+        include_str!("../../migrations/0013_settings_kv.sql"),
+    ),
+    (
+        14,
+        "0014_browser_sessions",
+        include_str!("../../migrations/0014_browser_sessions.sql"),
+    ),
+    (
+        15,
+        "0015_projects",
+        include_str!("../../migrations/0015_projects.sql"),
+    ),
+    (
+        16,
+        "0016_iyke_memory",
+        include_str!("../../migrations/0016_iyke_memory.sql"),
+    ),
+    (
+        17,
+        "0017_claude_asset_preferences",
+        include_str!("../../migrations/0017_claude_asset_preferences.sql"),
+    ),
+    (
+        18,
+        "0018_pkg_trust_versioning",
+        include_str!("../../migrations/0018_pkg_trust_versioning.sql"),
+    ),
+    (
+        19,
+        "0019_artifact_pin_metadata",
+        include_str!("../../migrations/0019_artifact_pin_metadata.sql"),
+    ),
+    (
+        20,
+        "0020_pkg_permission_violations",
+        include_str!("../../migrations/0020_pkg_permission_violations.sql"),
+    ),
+    (
+        21,
+        "0021_pkg_capability_snapshots",
+        include_str!("../../migrations/0021_pkg_capability_snapshots.sql"),
+    ),
+    (
+        22,
+        "0022_artifact_comments",
+        include_str!("../../migrations/0022_artifact_comments.sql"),
+    ),
+    (
+        23,
+        "0023_studio_threads",
+        include_str!("../../migrations/0023_studio_threads.sql"),
+    ),
+    (
+        24,
+        "0024_rename_chat_threads_to_chat_sessions",
+        include_str!("../../migrations/0024_rename_chat_threads_to_chat_sessions.sql"),
+    ),
+    // WP-02 (G-SCHEMA): Atelier/PA domain tables, down-mapped Postgres →
+    // SQLite as STRICT tables. Source of truth is royalti-pa's
+    // supabase/migrations/*.sql (consolidated to one CREATE per table,
+    // folding in subsequent ALTER … ADD COLUMN). Grouped by domain. These
+    // are the local-store target for the Supabase → ikenga.db migration; the
+    // WP-03 ETL loads rows, WP-05's validator reads the generated
+    // `tables.json` (see `write_tables_manifest`).
+    (
+        25,
+        "0025_tasks_domain",
+        include_str!("../../migrations/0025_tasks_domain.sql"),
+    ),
+    (
+        26,
+        "0026_mail_domain",
+        include_str!("../../migrations/0026_mail_domain.sql"),
+    ),
+    (
+        27,
+        "0027_outbound_domain",
+        include_str!("../../migrations/0027_outbound_domain.sql"),
+    ),
+    (
+        28,
+        "0028_sales_gtm_domain",
+        include_str!("../../migrations/0028_sales_gtm_domain.sql"),
+    ),
+    (
+        29,
+        "0029_finance_domain",
+        include_str!("../../migrations/0029_finance_domain.sql"),
+    ),
+    (
+        30,
+        "0030_content_product_domain",
+        include_str!("../../migrations/0030_content_product_domain.sql"),
+    ),
+    (
+        31,
+        "0031_work_domain",
+        include_str!("../../migrations/0031_work_domain.sql"),
+    ),
+    // WP-10a — full-domain migration schema gap-fill. 0032 repairs drift in
+    // the pure-ETL tables (live columns the WP-02 down-map missed); 0033
+    // recreates the latest_account_balances view; 0034–0039 add the 14
+    // remaining business tables, down-mapped from LIVE Supabase
+    // introspection (not the drifted in-repo migrations).
+    (
+        32,
+        "0032_pure_etl_drift_fix",
+        include_str!("../../migrations/0032_pure_etl_drift_fix.sql"),
+    ),
+    (
+        33,
+        "0033_finance_views",
+        include_str!("../../migrations/0033_finance_views.sql"),
+    ),
+    (
+        34,
+        "0034_mail_outbound_ext",
+        include_str!("../../migrations/0034_mail_outbound_ext.sql"),
+    ),
+    (
+        35,
+        "0035_sales_ext",
+        include_str!("../../migrations/0035_sales_ext.sql"),
+    ),
+    (
+        36,
+        "0036_fundraising_ext",
+        include_str!("../../migrations/0036_fundraising_ext.sql"),
+    ),
+    (
+        37,
+        "0037_content_ext",
+        include_str!("../../migrations/0037_content_ext.sql"),
+    ),
+    (
+        38,
+        "0038_strategy_ext",
+        include_str!("../../migrations/0038_strategy_ext.sql"),
+    ),
+    (
+        39,
+        "0039_infra_ext",
+        include_str!("../../migrations/0039_infra_ext.sql"),
+    ),
+    // WP-10c — make the latest_account_balances view deterministic (id DESC
+    // tie-break) for same-(txn_date,created_at) rows.
+    (
+        40,
+        "0040_finance_view_deterministic",
+        include_str!("../../migrations/0040_finance_view_deterministic.sql"),
+    ),
+    // WP-10 residual: content_performance_history (empty; local write target).
+    (
+        41,
+        "0041_content_perf_history",
+        include_str!("../../migrations/0041_content_perf_history.sql"),
+    ),
+    // WP-17b — mail thread-state table (read/unread · snooze · tags · preview).
+    (
+        42,
+        "0042_mail_domain",
+        include_str!("../../migrations/0042_mail_domain.sql"),
+    ),
+    // WP-18b — sales domain app-layer columns (title, owner, next_action,
+    // next_action_mode, win_probability) on sales_deals. Stage enum:
+    // lead → qualified → proposal → negotiation → closing → won | lost.
+    (
+        43,
+        "0043_sales_domain",
+        include_str!("../../migrations/0043_sales_domain.sql"),
+    ),
+    // WP-19b — outbound domain state tables (sequence steps · email approval
+    //           queue · generic sent log · newsletter draft queue + approval).
+    (
+        44,
+        "0044_outbound_domain",
+        include_str!("../../migrations/0044_outbound_domain.sql"),
+    ),
+    // WP-18b follow-up — map legacy sales_deals.stage values onto the 0043 enum.
+    (
+        45,
+        "0045_sales_stage_backfill",
+        include_str!("../../migrations/0045_sales_stage_backfill.sql"),
+    ),
+    // WP-20b — Finance domain alert queue (CFO-agent writes; Finance pkg reads).
+    (
+        46,
+        "0046_finance_domain",
+        include_str!("../../migrations/0046_finance_domain.sql"),
+    ),
+    // WP-21b — content domain tables (content_pieces, content_published,
+    // content_stage_transitions). STRICT, no FK, soft TEXT links.
+    // Stage enum: idea | outline | draft | review | scheduled.
+    (
+        47,
+        "0047_content_domain",
+        include_str!("../../migrations/0047_content_domain.sql"),
+    ),
+    // 0048 — task activity/audit log (task_events). Backfilled from existing
+    // tasks columns; no triggers (the splitter above can't handle them).
+    (
+        48,
+        "0048_task_events",
+        include_str!("../../migrations/0048_task_events.sql"),
+    ),
+    // 0049 — per-task derived auto-close confidence (task_signals) driving
+    // the Sweeper confidence bar. Backfill is a transparent heuristic.
+    (
+        49,
+        "0049_task_signals",
+        include_str!("../../migrations/0049_task_signals.sql"),
+    ),
+    // 0050 — approve-gate run-then-pause durable draft queue (pa_action_drafts).
+    // Producer side of the seam: host.paActionsPause writes rows; the approve-gate
+    // panel reads them; commit/reject flip status + emit events for the external
+    // mutation worker, which performs the real send. The shell never sends.
+    (
+        50,
+        "0050_pa_action_drafts",
+        include_str!("../../migrations/0050_pa_action_drafts.sql"),
+    ),
+    // 0051 — mutation-worker claim + retry + delivery columns on pa_action_drafts.
+    // Extends 0050: adds claimed_at/attempts/last_attempt_at/error_text/external_id/
+    // delivery_status/delivery_checked_at + idx_pa_drafts_claimable. Freezes G-SCHEMA.
+    (
+        51,
+        "0051_pa_action_drafts_send_state",
+        include_str!("../../migrations/0051_pa_action_drafts_send_state.sql"),
+    ),
+    // 0052 — social producer columns on social_queue (media_url, hashtags).
+    // Source-of-truth store live producers (Buffer worker, cmo-agent) stamp;
+    // the outbound pkg reads the same data from pa_action_drafts.payload_json.
+    (
+        52,
+        "0052_social_media_hashtags",
+        include_str!("../../migrations/0052_social_media_hashtags.sql"),
+    ),
+    // 0053 — atelier wave-4 research domain (com.ikenga.research): extends
+    // research_notes (next_action/target/agent_cycle_id/is_stale/word_count/
+    // owner), adds the research_sources monitored-source register, and a soft
+    // sales_deals.research_item_id link for the Hand-to-sales flow. No FK.
+    (
+        53,
+        "0053_research_domain",
+        include_str!("../../migrations/0053_research_domain.sql"),
+    ),
+    // 0054 — atelier wave-4 strategy domain (com.ikenga.strategy): OKR tables
+    // strategy_objectives / strategy_key_results / strategy_cycles. STRICT,
+    // no FK, soft TEXT links. Board falls back to strategic_initiatives until seeded.
+    (
+        54,
+        "0054_strategy_domain",
+        include_str!("../../migrations/0054_strategy_domain.sql"),
+    ),
+    // 0055 — pkg-browser WP-03: Managed Chrome dedicated-profile registry.
+    // chrome_profiles maps friendly profile names to their on-disk --user-data-dir
+    // paths. Parallel to browser_sessions (0014) for the WebKit partition model.
+    (
+        55,
+        "0055_chrome_profiles",
+        include_str!("../../migrations/0055_chrome_profiles.sql"),
+    ),
+    // email_actions is the audit + undo log for server-side IMAP triage
+    // (royalti-pa/scripts/imap-triage.ts). email_triage_cursor carries
+    // resume state so a run interrupted partway through ~25k moves neither
+    // redoes nor skips work.
+    (
+        56,
+        "0056_email_actions",
+        include_str!("../../migrations/0056_email_actions.sql"),
+    ),
+    // WP-10: nullable `task_id` on iyke_todos, linking an agent's runtime
+    // execution graph to the durable task board it serves.
+    //
+    // Renumbered 0056 → 0057 when this branch merged main, which had
+    // already claimed 56 for email_actions. Migration ids are apply-order
+    // keys, so two files sharing one id means the second never runs.
+    (
+        57,
+        "0057_iyke_todo_task_link",
+        include_str!("../../migrations/0057_iyke_todo_task_link.sql"),
+    ),
+    // email_index is the headers-only substrate for mailbox triage: ~88k
+    // messages across five accounts that `imap-propose.ts` clusters and
+    // scores. Deliberately NOT a reshape of email_messages — that table
+    // keeps bodies for the reply/draft path, which genuinely needs them.
+    // email_ingest_cursor carries uidvalidity, which email_triage_cursor
+    // (0056) lacks: a UIDVALIDITY reset silently repoints every cached UID
+    // at a different message, so the ingest halts on a mismatch.
+    (
+        58,
+        "0058_email_index",
+        include_str!("../../migrations/0058_email_index.sql"),
+    ),
+    // chi_cache is the local mapping layer for the Chi-first agent surface.
+    // Agent records (Claude JSONL, Devin sidecar ledger, etc.) remain the
+    // source of truth; this table only stores run_id → external_id mapping,
+    // one-off output metadata, and terminal session links for future
+    // persistence. WP-01 of plans/2026-08-08-ikenga-chi-first.
+    (
+        59,
+        "0059_chi_cache",
+        include_str!("../../migrations/0059_chi_cache.sql"),
+    ),
+    (
+        60,
+        "0060_drop_chat_sessions",
+        include_str!("../../migrations/0060_drop_chat_sessions.sql"),
+    ),
+    // WP-06 follow-up: the legacy chat_messages table predates
+    // 0011_chat_sessions.sql and was never referenced by the retired
+    // chat surface, so it is dropped now.
+    (
+        61,
+        "0061_drop_chat_messages",
+        include_str!("../../migrations/0061_drop_chat_messages.sql"),
+    ),
+    // WP-01 of the content-ops authoring layer: adds the approval axis
+    // (status/ref/doc_*/reviewable_after) to content_pieces. `stage` stays
+    // the production axis owned by com.ikenga.content and is untouched.
+    (
+        62,
+        "0062_content_review_axis",
+        include_str!("../../migrations/0062_content_review_axis.sql"),
+    ),
+];
+
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
 /// in a `_pa_migrations` table so each migration runs exactly once. SQL files
 /// are split on `;\n` so multi-statement files execute one statement at a
@@ -158,401 +561,7 @@ async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), String> {
         .map_err(|e| format!("read applied migrations: {e}"))?;
     let applied: std::collections::HashSet<i64> = applied.into_iter().collect();
 
-    let migrations: &[(i64, &str, &str)] = &[
-        (
-            1,
-            "0001_init",
-            include_str!("../../migrations/0001_init.sql"),
-        ),
-        (
-            2,
-            "0002_viewer_recents",
-            include_str!("../../migrations/0002_viewer_recents.sql"),
-        ),
-        (
-            3,
-            "0003_claude_sessions",
-            include_str!("../../migrations/0003_claude_sessions.sql"),
-        ),
-        // 0004 (render_queue), 0005 (mbox_sync), 0006 (storyboards) created
-        // app-specific schema that was retired with the strip-down. We keep
-        // the SQL files in `migrations/` so existing dev DBs still apply
-        // them in version order before 0009 cleans them up; fresh installs
-        // run 0001→0003 then 0007→0009 (no app-specific tables ever exist).
-        (
-            4,
-            "0004_render_queue",
-            include_str!("../../migrations/0004_render_queue.sql"),
-        ),
-        (
-            5,
-            "0005_mbox_sync",
-            include_str!("../../migrations/0005_mbox_sync.sql"),
-        ),
-        (
-            6,
-            "0006_storyboards",
-            include_str!("../../migrations/0006_storyboards.sql"),
-        ),
-        (
-            7,
-            "0007_pkg_kernel",
-            include_str!("../../migrations/0007_pkg_kernel.sql"),
-        ),
-        (
-            8,
-            "0008_pkg_install_source",
-            include_str!("../../migrations/0008_pkg_install_source.sql"),
-        ),
-        (
-            9,
-            "0009_strip_legacy",
-            include_str!("../../migrations/0009_strip_legacy.sql"),
-        ),
-        (
-            10,
-            "0010_activity_bar_pinning",
-            include_str!("../../migrations/0010_activity_bar_pinning.sql"),
-        ),
-        (
-            11,
-            "0011_chat_sessions",
-            include_str!("../../migrations/0011_chat_sessions.sql"),
-        ),
-        (
-            12,
-            "0012_session_fork",
-            include_str!("../../migrations/0012_session_fork.sql"),
-        ),
-        (
-            13,
-            "0013_settings_kv",
-            include_str!("../../migrations/0013_settings_kv.sql"),
-        ),
-        (
-            14,
-            "0014_browser_sessions",
-            include_str!("../../migrations/0014_browser_sessions.sql"),
-        ),
-        (
-            15,
-            "0015_projects",
-            include_str!("../../migrations/0015_projects.sql"),
-        ),
-        (
-            16,
-            "0016_iyke_memory",
-            include_str!("../../migrations/0016_iyke_memory.sql"),
-        ),
-        (
-            17,
-            "0017_claude_asset_preferences",
-            include_str!("../../migrations/0017_claude_asset_preferences.sql"),
-        ),
-        (
-            18,
-            "0018_pkg_trust_versioning",
-            include_str!("../../migrations/0018_pkg_trust_versioning.sql"),
-        ),
-        (
-            19,
-            "0019_artifact_pin_metadata",
-            include_str!("../../migrations/0019_artifact_pin_metadata.sql"),
-        ),
-        (
-            20,
-            "0020_pkg_permission_violations",
-            include_str!("../../migrations/0020_pkg_permission_violations.sql"),
-        ),
-        (
-            21,
-            "0021_pkg_capability_snapshots",
-            include_str!("../../migrations/0021_pkg_capability_snapshots.sql"),
-        ),
-        (
-            22,
-            "0022_artifact_comments",
-            include_str!("../../migrations/0022_artifact_comments.sql"),
-        ),
-        (
-            23,
-            "0023_studio_threads",
-            include_str!("../../migrations/0023_studio_threads.sql"),
-        ),
-        (
-            24,
-            "0024_rename_chat_threads_to_chat_sessions",
-            include_str!("../../migrations/0024_rename_chat_threads_to_chat_sessions.sql"),
-        ),
-        // WP-02 (G-SCHEMA): Atelier/PA domain tables, down-mapped Postgres →
-        // SQLite as STRICT tables. Source of truth is royalti-pa's
-        // supabase/migrations/*.sql (consolidated to one CREATE per table,
-        // folding in subsequent ALTER … ADD COLUMN). Grouped by domain. These
-        // are the local-store target for the Supabase → ikenga.db migration; the
-        // WP-03 ETL loads rows, WP-05's validator reads the generated
-        // `tables.json` (see `write_tables_manifest`).
-        (
-            25,
-            "0025_tasks_domain",
-            include_str!("../../migrations/0025_tasks_domain.sql"),
-        ),
-        (
-            26,
-            "0026_mail_domain",
-            include_str!("../../migrations/0026_mail_domain.sql"),
-        ),
-        (
-            27,
-            "0027_outbound_domain",
-            include_str!("../../migrations/0027_outbound_domain.sql"),
-        ),
-        (
-            28,
-            "0028_sales_gtm_domain",
-            include_str!("../../migrations/0028_sales_gtm_domain.sql"),
-        ),
-        (
-            29,
-            "0029_finance_domain",
-            include_str!("../../migrations/0029_finance_domain.sql"),
-        ),
-        (
-            30,
-            "0030_content_product_domain",
-            include_str!("../../migrations/0030_content_product_domain.sql"),
-        ),
-        (
-            31,
-            "0031_work_domain",
-            include_str!("../../migrations/0031_work_domain.sql"),
-        ),
-        // WP-10a — full-domain migration schema gap-fill. 0032 repairs drift in
-        // the pure-ETL tables (live columns the WP-02 down-map missed); 0033
-        // recreates the latest_account_balances view; 0034–0039 add the 14
-        // remaining business tables, down-mapped from LIVE Supabase
-        // introspection (not the drifted in-repo migrations).
-        (
-            32,
-            "0032_pure_etl_drift_fix",
-            include_str!("../../migrations/0032_pure_etl_drift_fix.sql"),
-        ),
-        (
-            33,
-            "0033_finance_views",
-            include_str!("../../migrations/0033_finance_views.sql"),
-        ),
-        (
-            34,
-            "0034_mail_outbound_ext",
-            include_str!("../../migrations/0034_mail_outbound_ext.sql"),
-        ),
-        (
-            35,
-            "0035_sales_ext",
-            include_str!("../../migrations/0035_sales_ext.sql"),
-        ),
-        (
-            36,
-            "0036_fundraising_ext",
-            include_str!("../../migrations/0036_fundraising_ext.sql"),
-        ),
-        (
-            37,
-            "0037_content_ext",
-            include_str!("../../migrations/0037_content_ext.sql"),
-        ),
-        (
-            38,
-            "0038_strategy_ext",
-            include_str!("../../migrations/0038_strategy_ext.sql"),
-        ),
-        (
-            39,
-            "0039_infra_ext",
-            include_str!("../../migrations/0039_infra_ext.sql"),
-        ),
-        // WP-10c — make the latest_account_balances view deterministic (id DESC
-        // tie-break) for same-(txn_date,created_at) rows.
-        (
-            40,
-            "0040_finance_view_deterministic",
-            include_str!("../../migrations/0040_finance_view_deterministic.sql"),
-        ),
-        // WP-10 residual: content_performance_history (empty; local write target).
-        (
-            41,
-            "0041_content_perf_history",
-            include_str!("../../migrations/0041_content_perf_history.sql"),
-        ),
-        // WP-17b — mail thread-state table (read/unread · snooze · tags · preview).
-        (
-            42,
-            "0042_mail_domain",
-            include_str!("../../migrations/0042_mail_domain.sql"),
-        ),
-        // WP-18b — sales domain app-layer columns (title, owner, next_action,
-        // next_action_mode, win_probability) on sales_deals. Stage enum:
-        // lead → qualified → proposal → negotiation → closing → won | lost.
-        (
-            43,
-            "0043_sales_domain",
-            include_str!("../../migrations/0043_sales_domain.sql"),
-        ),
-        // WP-19b — outbound domain state tables (sequence steps · email approval
-        //           queue · generic sent log · newsletter draft queue + approval).
-        (
-            44,
-            "0044_outbound_domain",
-            include_str!("../../migrations/0044_outbound_domain.sql"),
-        ),
-        // WP-18b follow-up — map legacy sales_deals.stage values onto the 0043 enum.
-        (
-            45,
-            "0045_sales_stage_backfill",
-            include_str!("../../migrations/0045_sales_stage_backfill.sql"),
-        ),
-        // WP-20b — Finance domain alert queue (CFO-agent writes; Finance pkg reads).
-        (
-            46,
-            "0046_finance_domain",
-            include_str!("../../migrations/0046_finance_domain.sql"),
-        ),
-        // WP-21b — content domain tables (content_pieces, content_published,
-        // content_stage_transitions). STRICT, no FK, soft TEXT links.
-        // Stage enum: idea | outline | draft | review | scheduled.
-        (
-            47,
-            "0047_content_domain",
-            include_str!("../../migrations/0047_content_domain.sql"),
-        ),
-        // 0048 — task activity/audit log (task_events). Backfilled from existing
-        // tasks columns; no triggers (the splitter above can't handle them).
-        (
-            48,
-            "0048_task_events",
-            include_str!("../../migrations/0048_task_events.sql"),
-        ),
-        // 0049 — per-task derived auto-close confidence (task_signals) driving
-        // the Sweeper confidence bar. Backfill is a transparent heuristic.
-        (
-            49,
-            "0049_task_signals",
-            include_str!("../../migrations/0049_task_signals.sql"),
-        ),
-        // 0050 — approve-gate run-then-pause durable draft queue (pa_action_drafts).
-        // Producer side of the seam: host.paActionsPause writes rows; the approve-gate
-        // panel reads them; commit/reject flip status + emit events for the external
-        // mutation worker, which performs the real send. The shell never sends.
-        (
-            50,
-            "0050_pa_action_drafts",
-            include_str!("../../migrations/0050_pa_action_drafts.sql"),
-        ),
-        // 0051 — mutation-worker claim + retry + delivery columns on pa_action_drafts.
-        // Extends 0050: adds claimed_at/attempts/last_attempt_at/error_text/external_id/
-        // delivery_status/delivery_checked_at + idx_pa_drafts_claimable. Freezes G-SCHEMA.
-        (
-            51,
-            "0051_pa_action_drafts_send_state",
-            include_str!("../../migrations/0051_pa_action_drafts_send_state.sql"),
-        ),
-        // 0052 — social producer columns on social_queue (media_url, hashtags).
-        // Source-of-truth store live producers (Buffer worker, cmo-agent) stamp;
-        // the outbound pkg reads the same data from pa_action_drafts.payload_json.
-        (
-            52,
-            "0052_social_media_hashtags",
-            include_str!("../../migrations/0052_social_media_hashtags.sql"),
-        ),
-        // 0053 — atelier wave-4 research domain (com.ikenga.research): extends
-        // research_notes (next_action/target/agent_cycle_id/is_stale/word_count/
-        // owner), adds the research_sources monitored-source register, and a soft
-        // sales_deals.research_item_id link for the Hand-to-sales flow. No FK.
-        (
-            53,
-            "0053_research_domain",
-            include_str!("../../migrations/0053_research_domain.sql"),
-        ),
-        // 0054 — atelier wave-4 strategy domain (com.ikenga.strategy): OKR tables
-        // strategy_objectives / strategy_key_results / strategy_cycles. STRICT,
-        // no FK, soft TEXT links. Board falls back to strategic_initiatives until seeded.
-        (
-            54,
-            "0054_strategy_domain",
-            include_str!("../../migrations/0054_strategy_domain.sql"),
-        ),
-        // 0055 — pkg-browser WP-03: Managed Chrome dedicated-profile registry.
-        // chrome_profiles maps friendly profile names to their on-disk --user-data-dir
-        // paths. Parallel to browser_sessions (0014) for the WebKit partition model.
-        (
-            55,
-            "0055_chrome_profiles",
-            include_str!("../../migrations/0055_chrome_profiles.sql"),
-        ),
-        // email_actions is the audit + undo log for server-side IMAP triage
-        // (royalti-pa/scripts/imap-triage.ts). email_triage_cursor carries
-        // resume state so a run interrupted partway through ~25k moves neither
-        // redoes nor skips work.
-        (
-            56,
-            "0056_email_actions",
-            include_str!("../../migrations/0056_email_actions.sql"),
-        ),
-        // WP-10: nullable `task_id` on iyke_todos, linking an agent's runtime
-        // execution graph to the durable task board it serves.
-        //
-        // Renumbered 0056 → 0057 when this branch merged main, which had
-        // already claimed 56 for email_actions. Migration ids are apply-order
-        // keys, so two files sharing one id means the second never runs.
-        (
-            57,
-            "0057_iyke_todo_task_link",
-            include_str!("../../migrations/0057_iyke_todo_task_link.sql"),
-        ),
-        // email_index is the headers-only substrate for mailbox triage: ~88k
-        // messages across five accounts that `imap-propose.ts` clusters and
-        // scores. Deliberately NOT a reshape of email_messages — that table
-        // keeps bodies for the reply/draft path, which genuinely needs them.
-        // email_ingest_cursor carries uidvalidity, which email_triage_cursor
-        // (0056) lacks: a UIDVALIDITY reset silently repoints every cached UID
-        // at a different message, so the ingest halts on a mismatch.
-        (
-            58,
-            "0058_email_index",
-            include_str!("../../migrations/0058_email_index.sql"),
-        ),
-        // chi_cache is the local mapping layer for the Chi-first agent surface.
-        // Agent records (Claude JSONL, Devin sidecar ledger, etc.) remain the
-        // source of truth; this table only stores run_id → external_id mapping,
-        // one-off output metadata, and terminal session links for future
-        // persistence. WP-01 of plans/2026-08-08-ikenga-chi-first.
-        (
-            59,
-            "0059_chi_cache",
-            include_str!("../../migrations/0059_chi_cache.sql"),
-        ),
-        (
-            60,
-            "0060_drop_chat_sessions",
-            include_str!("../../migrations/0060_drop_chat_sessions.sql"),
-        ),
-        // WP-06 follow-up: the legacy chat_messages table predates
-        // 0011_chat_sessions.sql and was never referenced by the retired
-        // chat surface, so it is dropped now.
-        (
-            61,
-            "0061_drop_chat_messages",
-            include_str!("../../migrations/0061_drop_chat_messages.sql"),
-        ),
-        // WP-01 of the content-ops authoring layer: adds the approval axis
-        // (status/ref/doc_*/reviewable_after) to content_pieces. `stage` stays
-        // the production axis owned by com.ikenga.content and is untouched.
-        (
-            62,
-            "0062_content_review_axis",
-            include_str!("../../migrations/0062_content_review_axis.sql"),
-        ),
-    ];
+    let migrations: &[(i64, &str, &str)] = MIGRATIONS;
 
     for (id, name, sql) in migrations {
         if applied.contains(id) {
@@ -952,7 +961,9 @@ mod tests {
     /// (email_actions + email_triage_cursor) landed without a bump too;
     /// 0057 (iyke_todo_task_link, WP-10) brings it to 57; 0058 (email_index +
     /// email_ingest_cursor, headers-first mailbox ingest) brings it to 58.
-    const MIGRATION_COUNT: i64 = 61;
+    /// Derived from the embedded set rather than restated, so adding a
+    /// migration cannot silently desync this expectation.
+    const MIGRATION_COUNT: i64 = MIGRATIONS.len() as i64;
 
     /// Schema init applies every embedded migration exactly once. The
     /// `_pa_migrations` table must end with one row per migration tuple.

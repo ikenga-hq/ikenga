@@ -263,6 +263,81 @@ pub fn decode_claude_slug_naive(slug: &str) -> String {
     }
 }
 
+/// Separators Claude's slug encoding flattens into `-`. The path separator is
+/// probed before these — that's the canonical encoding.
+const INNER_SEPARATORS: [char; 3] = ['-', '_', '.'];
+
+/// How many tokens a single path component may absorb during lookahead.
+/// Bounds the probe count at `3 * (MAX_LOOKAHEAD - 1)` per miss.
+const MAX_LOOKAHEAD: usize = 8;
+
+/// Walk `tokens`, extending `acc` one component at a time.
+///
+/// Fast path is a single token joined with `dir_sep` (then the inner
+/// separators). On a real filesystem every prefix exists, so this hits
+/// immediately and costs one probe.
+///
+/// When nothing matches, the component itself may contain separators that the
+/// slug flattened, in which case *no* prefix of it exists and stepping one
+/// token at a time can never reach it. The motivating case is a directory
+/// named `royalti-server-v2-6`: neither `royalti-server` nor `royalti-server-v2`
+/// is a directory, so the walk used to commit to a wrong split of
+/// `royalti / server / v2 / 6`. Lookahead joins several tokens with a uniform
+/// separator and probes that, longest first.
+///
+/// Mixed separators inside one component (`royalti-server-v2.6`) remain
+/// unresolved: that needs a combinatorial search, and the ambiguity is genuine
+/// since the slug alone cannot distinguish them. When nothing matches we keep
+/// the previous behaviour and default the unknown tail to `dir_sep`, so every
+/// verified prefix stays accurate.
+fn walk_slug_tokens<F: Fn(&str) -> bool>(
+    seed: String,
+    tokens: &[&str],
+    dir_sep: char,
+    exists: &F,
+) -> String {
+    let mut acc = seed;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let single: Vec<String> = std::iter::once(dir_sep)
+            .chain(INNER_SEPARATORS)
+            .map(|sep| format!("{}{}{}", acc, sep, tokens[i]))
+            .collect();
+
+        if let Some(hit) = single.iter().find(|p| exists(p)) {
+            acc = hit.clone();
+            i += 1;
+            continue;
+        }
+
+        let max_k = (tokens.len() - i).min(MAX_LOOKAHEAD);
+        let mut matched: Option<(String, usize)> = None;
+        'lookahead: for k in (2..=max_k).rev() {
+            for sep in INNER_SEPARATORS {
+                let segment = tokens[i..i + k].join(&sep.to_string());
+                let candidate = format!("{}{}{}", acc, dir_sep, segment);
+                if exists(&candidate) {
+                    matched = Some((candidate, k));
+                    break 'lookahead;
+                }
+            }
+        }
+
+        if let Some((candidate, k)) = matched {
+            acc = candidate;
+            i += k;
+            continue;
+        }
+
+        // Nothing exists — keep the canonical separator and move on.
+        acc = single[0].clone();
+        i += 1;
+    }
+
+    acc
+}
+
 /// Greedy existence-checked decoder. Returns `(path, verified)` where
 /// `verified` is true iff `metadata(path)` succeeded.
 ///
@@ -300,21 +375,9 @@ pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F)
             return (root.clone(), exists(&root));
         }
 
-        // Seed with drive letter: "C:\Users" or "C:/Users"
-        let mut acc = format!("{}:\\{}", drive.to_ascii_uppercase(), tokens[0]);
-
-        const SEPARATORS: [char; 4] = ['\\', '-', '_', '.'];
-        for tok in &tokens[1..] {
-            let candidates: Vec<String> = SEPARATORS
-                .iter()
-                .map(|sep| format!("{}{}{}", acc, sep, tok))
-                .collect();
-            acc = candidates
-                .iter()
-                .find(|p| exists(p))
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
-        }
+        // Seed with the drive letter, e.g. `C:\Users`.
+        let seed = format!("{}:\\{}", drive.to_ascii_uppercase(), tokens[0]);
+        let acc = walk_slug_tokens(seed, &tokens[1..], '\\', &exists);
         let verified = exists(&acc);
         return (acc, verified);
     }
@@ -331,25 +394,7 @@ pub fn decode_claude_slug_with_probe<F: Fn(&str) -> bool>(slug: &str, exists: F)
         // FS root almost certainly contains it (`/Users`, `/home`, etc.).
         let mut acc = format!("/{}", tokens[0]);
 
-        // Probe order: '/' first (canonical Claude encoding) then '-', '_',
-        // '.'. Claude Code encodes any of these as '-' on disk, so we have to
-        // try each at every token boundary. The first existing candidate wins;
-        // when none exist we keep the '/' join (preserves any earlier verified
-        // prefix and defaults the unknown tail to canonical slashes).
-        const SEPARATORS: [char; 4] = ['/', '-', '_', '.'];
-
-        for tok in &tokens[1..] {
-            let candidates: Vec<String> = SEPARATORS
-                .iter()
-                .map(|sep| format!("{}{}{}", acc, sep, tok))
-                .collect();
-            acc = candidates
-                .iter()
-                .find(|p| exists(p))
-                .cloned()
-                .unwrap_or_else(|| candidates[0].clone());
-        }
-
+        let acc = walk_slug_tokens(acc, &tokens[1..], '/', &exists);
         let verified = exists(&acc);
         return (acc, verified);
     }
@@ -540,4 +585,46 @@ mod claude_slug_tests {
         );
         assert!(verified);
     }
+    #[test]
+    fn greedy_decoder_absorbs_a_multi_separator_component() {
+        // The component itself contains separators the slug flattened, so no
+        // prefix of it exists on disk. Stepping one token at a time can never
+        // find it; only lookahead over the whole run does.
+        let set: HashSet<&'static str> = ["/home/x", "/home/x/royalti-co", "/home/x/royalti-co/api-server-v2-6"]
+            .into_iter()
+            .collect();
+
+        let (path, verified) =
+            decode_claude_slug_with_probe("-home-x-royalti-co-api-server-v2-6", probe(&set));
+        assert_eq!(path, "/home/x/royalti-co/api-server-v2-6");
+        assert!(verified);
+    }
+
+    #[test]
+    fn greedy_decoder_prefers_the_longest_component_that_exists() {
+        // Both `a-b` and `a-b-c` exist. Longest-first must win, otherwise the
+        // walk stops at `a-b` and splits the rest.
+        let set: HashSet<&'static str> = ["/r", "/r/a-b", "/r/a-b-c"].into_iter().collect();
+
+        let (path, verified) = decode_claude_slug_with_probe("-r-a-b-c", probe(&set));
+        assert_eq!(path, "/r/a-b-c");
+        assert!(verified);
+    }
+
+    #[test]
+    fn greedy_decoder_leaves_mixed_separator_components_unresolved() {
+        // Documented limitation: a component mixing `-` and `.` (a real case is
+        // `royalti-server-v2.6`) needs a combinatorial search, and the slug
+        // alone cannot disambiguate it. The verified prefix is still kept and
+        // only the unknown tail defaults to slashes.
+        let set: HashSet<&'static str> = ["/home/x", "/home/x/royalti-server-v2.6"]
+            .into_iter()
+            .collect();
+
+        let (path, verified) =
+            decode_claude_slug_with_probe("-home-x-royalti-server-v2-6", probe(&set));
+        assert_eq!(path, "/home/x/royalti/server/v2/6");
+        assert!(!verified);
+    }
+
 }

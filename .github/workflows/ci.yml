@@ -115,7 +115,7 @@ jobs:
   # entirely; `src-tauri/resources/builtin-pkgs` is tracked, so the resource
   # path tauri.conf.json references is present on a bare checkout.
   rust:
-    name: cargo check
+    name: cargo check + test
     runs-on: ubuntu-22.04
     timeout-minutes: 30
 
@@ -160,3 +160,16 @@ jobs:
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --all-targets --message-format=short
+
+      # In-lib unit tests. Every test in this crate is a `#[cfg(test)] mod`
+      # inside src/ — 90 files, with no tests/ or benches/ directory — so
+      # `--lib` covers all of them without building target kinds that don't
+      # exist.
+      #
+      # Reuses what the check step just built, so the marginal cost is codegen
+      # + link of the test binary rather than a second full build. Keep this
+      # scoped: a Tauri debug build is large (check + test filled ~40 GB of
+      # target/ locally), so widening it to --all-targets risks runner disk.
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --lib --no-fail-fast
