@@ -7,7 +7,15 @@ Type=simple
 User=ikenga
 Group=ikenga
 WorkingDirectory=/opt/ikenga
-ExecStart=/opt/ikenga/bin/ikenga-server --host 0.0.0.0 --port 4000 --static-dir /opt/ikenga/dist --data-dir /opt/ikenga/data
+# No --host here ON PURPOSE. clap's default is 127.0.0.1, so a unit that is
+# missing or has a malformed EnvironmentFile binds loopback and is unreachable
+# — the safe failure. The bind address comes from IKENGA_HOST in the env file
+# below, which bootstrap-credentials.sh sets to this host's Tailscale address.
+#
+# The previous value was `--host 0.0.0.0`, which contradicted the perimeter
+# note further down: on a box with a public IP that is a public listener, and
+# every route here can run code or read the user's files.
+ExecStart=/opt/ikenga/bin/ikenga-server --port 4000 --static-dir /opt/ikenga/dist --data-dir /opt/ikenga/data
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
@@ -23,8 +31,9 @@ LimitNOFILE=65536
 # startup failure; fix the file.
 EnvironmentFile=/opt/ikenga/.env
 
-# Intended to sit behind a Tailscale perimeter (ikenga#113 / WP-14b), not on a public
-# interface. The token is defence in depth, not the whole perimeter.
+# Sits behind a Tailscale perimeter (ikenga#113 / WP-14b), enforced by binding
+# IKENGA_HOST to the tailnet address rather than by the token alone. The token
+# is defence in depth, not the whole perimeter.
 
 # --- Sandboxing ---
 NoNewPrivileges=true
@@ -37,8 +46,14 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
-# The daemon writes SQLite + vault state here; everything else stays read-only
-# under ProtectSystem=strict.
+# The daemon writes SQLite + vault state here.
+#
+# ProtectSystem=strict makes the WHOLE hierarchy read-only apart from these
+# paths — including the service user's home. A remote terminal that cannot
+# write to its own home directory is not a usable dev shell, so the home of
+# whatever user this runs as has to be listed too. Add it at deploy time to
+# match the configured User=, e.g.:
+#   ReadWritePaths=/opt/ikenga/data /home/<service-user>
 ReadWritePaths=/opt/ikenga/data
 
 [Install]

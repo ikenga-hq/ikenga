@@ -26,7 +26,7 @@ ensure_var() {
     echo "  ${key}: already set, leaving as-is"
   else
     printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
-    echo "  ${key}: generated and written to ${ENV_FILE}"
+    echo "  ${key}: set in ${ENV_FILE}"
   fi
 }
 
@@ -49,6 +49,28 @@ ensure_var IKENGA_VAULT_KEY "$(openssl rand -hex 32)"
 #    Pin a stable one here. `ikenga-server` reads IKENGA_AUTH_TOKEN directly
 #    (clap `env = "IKENGA_AUTH_TOKEN"`), and the systemd unit loads this file.
 ensure_var IKENGA_AUTH_TOKEN "$(openssl rand -hex 32)"
+
+# 3. Bind address.
+#
+#    The systemd unit deliberately passes no --host, so an absent or malformed
+#    env file leaves the daemon on loopback — unreachable, which is the safe
+#    way to fail. Pin the tailnet address here so the daemon is reachable over
+#    the tailnet and NOWHERE else. Binding 0.0.0.0 on a box with a public IP
+#    publishes a shell to the internet with only the bearer token in front of
+#    it; the perimeter is the bind, not the token.
+# `|| true` is load-bearing: this script runs under `set -euo pipefail`, and
+# with pipefail a failing `tailscale ip` (installed but not logged in) would
+# fail the whole pipeline and abort the bootstrap partway through.
+TS_IP=""
+if command -v tailscale >/dev/null 2>&1; then
+  TS_IP="$( { tailscale ip -4 2>/dev/null || true; } | head -1 )"
+fi
+if [ -n "$TS_IP" ]; then
+  ensure_var IKENGA_HOST "$TS_IP"
+else
+  echo "  IKENGA_HOST: no Tailscale address found — leaving unset (daemon stays on 127.0.0.1)"
+  echo "               Set it by hand once the host is on the tailnet."
+fi
 
 echo "--> Agent credentials"
 
