@@ -1569,10 +1569,16 @@ export function PkgIframeHostInner({
 							return;
 						}
 						try {
+							// `host-sidecar-event` isn't a member of the AppBridge SDK's own
+							// `AppNotification` method union (same as `pkg-mcp-notification`
+							// above) — go through `unknown` per TS's own suggestion rather
+							// than a direct cast, which it flags as insufficient overlap.
 							void bridge.notification({
 								method: HOST_SIDECAR_EVENT_TYPE,
 								params: { pkgId, sidecar: name, event: parsed },
-							} satisfies HostSidecarEventNotification as Parameters<AppBridge['notification']>[0]);
+							} satisfies HostSidecarEventNotification as unknown as Parameters<
+								AppBridge['notification']
+							>[0]);
 						} catch {
 							// Bridge may be mid-teardown.
 						}
