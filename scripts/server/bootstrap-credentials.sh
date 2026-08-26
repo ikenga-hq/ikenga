@@ -33,6 +33,12 @@ ensure_var() {
 echo "--> Server secrets"
 
 # 1. Vault key for Stronghold-equivalent secret storage.
+#
+#    RESERVED, NOT YET CONSUMED. `ikenga-server` does not read this variable
+#    today — the headless vault is WP-12b (ikenga#100), and `secrets_set`
+#    currently answers "not implemented in the headless daemon". It is
+#    generated now so the value is stable from the first boot and the vault
+#    lands on an existing key rather than minting one after data exists.
 ensure_var IKENGA_VAULT_KEY "$(openssl rand -hex 32)"
 
 # 2. Bearer token for the API + WebSocket surface.
@@ -46,24 +52,29 @@ ensure_var IKENGA_AUTH_TOKEN "$(openssl rand -hex 32)"
 
 echo "--> Agent credentials"
 
-# Planted files hold live API keys, so they are created with a private umask
-# rather than whatever the caller happened to have set.
-umask 077
+# Agent API keys go into the SAME env file, not into hand-written config files.
+#
+# An earlier revision did `printf '{"apiKey":"%s"}' > ~/.claude.json`. That is
+# wrong twice over:
+#   1. It TRUNCATES ~/.claude.json, which is Claude Code's entire config —
+#      project history, MCP servers, oauth account, onboarding state. On any
+#      host where the CLI has been used, running bootstrap destroyed all of it,
+#      irrecoverably, with no backup.
+#   2. `apiKey` is not a key Claude Code reads. The supported mechanism is the
+#      ANTHROPIC_API_KEY environment variable — so the write was destructive
+#      AND non-functional.
+#
+# systemd loads this file via EnvironmentFile, and ikenga-server's engine
+# adapters inherit their environment, so the CLI children see these directly.
 
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  mkdir -p ~/.claude
-  printf '{"apiKey": "%s"}\n' "${ANTHROPIC_API_KEY}" > ~/.claude.json
-  chmod 600 ~/.claude.json
-  echo "  ANTHROPIC_API_KEY: planted into ~/.claude.json (mode 600)"
+  ensure_var ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY}"
 else
   echo "  ANTHROPIC_API_KEY: not set, skipping"
 fi
 
 if [ -n "${GEMINI_API_KEY:-}" ]; then
-  mkdir -p ~/.gemini/antigravity
-  printf '{"apiKey": "%s"}\n' "${GEMINI_API_KEY}" > ~/.gemini/antigravity/env.json
-  chmod 600 ~/.gemini/antigravity/env.json
-  echo "  GEMINI_API_KEY: planted into ~/.gemini/antigravity/env.json (mode 600)"
+  ensure_var GEMINI_API_KEY "${GEMINI_API_KEY}"
 else
   echo "  GEMINI_API_KEY: not set, skipping"
 fi

@@ -11,7 +11,11 @@ export function ReauthOverlay() {
 	const [timeStr, setTimeStr] = useState<string>('');
 	const [loading, setLoading] = useState<boolean>(false);
 
+	// Gated on `isOpen`. Hooks run before the `!isOpen` early return below, so
+	// an ungated interval ticks and re-renders this component once a second
+	// for the entire lifetime of every window, overlay shown or not.
 	useEffect(() => {
+		if (!isOpen) return;
 		const updateTime = () => {
 			const d = new Date();
 			setTimeStr(d.toTimeString().split(' ')[0] || '');
@@ -19,7 +23,7 @@ export function ReauthOverlay() {
 		updateTime();
 		const interval = setInterval(updateTime, 1000);
 		return () => clearInterval(interval);
-	}, []);
+	}, [isOpen]);
 
 	if (!isOpen) return null;
 
@@ -38,15 +42,19 @@ export function ReauthOverlay() {
 				{/* Top bar */}
 				<div className="flex items-center gap-2.5 border-b border-[var(--border-soft)] bg-[var(--danger-soft)] px-5 py-4">
 					<span className="h-2 w-2 flex-none rounded-full bg-[var(--danger)]" />
-					<h2 className="m-0 text-[var(--text-h4)] font-semibold">Session needs re-authenticating</h2>
-					<span className="ml-auto font-mono text-[var(--text-micro)] text-[var(--fg-faint)]">{timeStr}</span>
+					<h2 className="m-0 text-[var(--text-h4)] font-semibold">
+						Session needs re-authenticating
+					</h2>
+					<span className="ml-auto font-mono text-[var(--text-micro)] text-[var(--fg-faint)]">
+						{timeStr}
+					</span>
 				</div>
 
 				{/* Body */}
 				<div className="p-5">
 					<p className="mb-4 text-[var(--text-body-sm)] text-[var(--fg-muted)] leading-relaxed">
-						The daemon restarted and minted a new token, so this tab's saved one no longer works. Your work is
-						untouched — paste the current token to pick it back up.
+						The daemon restarted and minted a new token, so this tab's saved one no longer works.
+						Your work is untouched — paste the current token to pick it back up.
 					</p>
 
 					<div className="flex gap-2">
@@ -75,11 +83,13 @@ export function ReauthOverlay() {
 						</button>
 					</div>
 
-					{errorMsg && <div className="mt-3 font-mono text-[12px] text-[var(--danger)]">{errorMsg}</div>}
+					{errorMsg && (
+						<div className="mt-3 font-mono text-[12px] text-[var(--danger)]">{errorMsg}</div>
+					)}
 
 					<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
-						<b className="text-[var(--live)] font-semibold">Still running on the host</b> — session active. Nothing is lost
-						by reconnecting.
+						<b className="text-[var(--live)] font-semibold">Still running on the host</b> — session
+						active. Nothing is lost by reconnecting.
 					</div>
 				</div>
 			</div>

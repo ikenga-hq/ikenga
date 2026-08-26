@@ -10,6 +10,19 @@ export interface SqlDbInterface {
 	execute(query: string, bindValues?: unknown[]): Promise<SqlQueryResult>;
 }
 
+/**
+ * Browser-side SQLite proxy.
+ *
+ * ⚠ `db_query` / `db_exec` are **not implemented by the headless daemon yet**
+ * — it does not open `ikenga.db` at all (WP-12b / G-41, ikenga#100). Both
+ * calls below currently reject.
+ *
+ * That is deliberate rather than papered over: every caller in the shell
+ * (`layout-state`, `session-store`, `sql-db`) already treats a rejected load
+ * as "SQL unavailable" and falls through to `localStorage`, so a clear
+ * rejection degrades correctly. Returning an empty result instead would look
+ * like a real answer and silently present an empty database as the truth.
+ */
 export class SqlDbWebProxy implements SqlDbInterface {
 	constructor(public readonly dbPath: string) {}
 

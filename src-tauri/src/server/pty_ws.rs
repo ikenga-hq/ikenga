@@ -1,13 +1,14 @@
 use std::sync::Arc;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
-use crate::pty::SpawnOpts;
 use super::AppState;
+use crate::pty::SpawnOpts;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -17,15 +18,41 @@ pub enum PtyControlMessage {
     Kill,
 }
 
+#[derive(Deserialize, Debug, Default)]
+pub struct PtyQuery {
+    /// Create the session if the id resolves to nothing.
+    ///
+    /// Opt-in, because reconnect uses the same URL. Auto-spawning on every
+    /// attach means a client reconnecting to a shell the user exited silently
+    /// gets a **brand new shell** presented as the same session. Only the
+    /// first attach of a terminal passes this.
+    #[serde(default)]
+    pub spawn: bool,
+}
+
 pub async fn pty_ws_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<PtyQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_pty_socket(socket, state, id))
+    ws.on_upgrade(move |socket| handle_pty_socket(socket, state, id, query))
 }
 
-async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) {
+/// Control frames are JSON text; terminal output is always binary. The client
+/// distinguishes them by frame type, so a control frame can never be painted
+/// into the terminal as if it were output.
+fn control(kind: &str, extra: serde_json::Value) -> Message {
+    let mut obj = serde_json::json!({ "type": kind });
+    if let Some(map) = extra.as_object() {
+        for (k, v) in map {
+            obj[k] = v.clone();
+        }
+    }
+    Message::Text(obj.to_string())
+}
+
+async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, query: PtyQuery) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // The path segment may be a pty id, a terminal id, or a label. Resolve it
@@ -33,8 +60,8 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
     // the unresolved segment silently drops every keystroke.
     let pty_id = match state.pty_manager.resolve_id(&id) {
         Ok(resolved) => resolved,
-        Err(e) => {
-            warn!("PTY session not found for {id}: {e}. Attempting auto-spawn.");
+        Err(e) if query.spawn => {
+            warn!("PTY session not found for {id}: {e}. Auto-spawning (spawn=1).");
             let default_shell = if cfg!(windows) {
                 vec!["powershell.exe".to_string()]
             } else {
@@ -56,10 +83,25 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
                 Ok(new_id) => new_id,
                 Err(err) => {
                     error!("Failed to auto-spawn PTY for {id}: {err}");
-                    let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
+                    let _ = ws_tx
+                        .send(control(
+                            "ikenga.error",
+                            serde_json::json!({ "message": err.to_string() }),
+                        ))
+                        .await;
                     return;
                 }
             }
+        }
+        Err(e) => {
+            // No session and the client didn't ask for one: tell it the
+            // terminal is gone so it stops reconnecting, rather than
+            // manufacturing a replacement shell behind the user's back.
+            info!("PTY session not found for {id}: {e}. Reporting gone (spawn not requested).");
+            let _ = ws_tx
+                .send(control("ikenga.gone", serde_json::json!({ "id": id })))
+                .await;
+            return;
         }
     };
 
@@ -67,23 +109,65 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
         Some(snap) => snap,
         None => {
             error!("Failed to begin attach for PTY {pty_id}");
-            let _ = ws_tx.send(Message::Text("Error: PTY session unavailable".to_string())).await;
+            let _ = ws_tx
+                .send(control("ikenga.gone", serde_json::json!({ "id": id })))
+                .await;
             return;
         }
     };
+
+    // Watchdog, mirroring `commands::pty::pty_attach_begin`. While the gate is
+    // installed NOTHING is delivered to any consumer — desktop sink included —
+    // so a client that stalls mid-handshake (a slow socket blocking the
+    // snapshot write) would freeze the terminal for everyone until the hold cap
+    // overflows. `attach_arm` is token-checked, so a late fire is a no-op.
+    {
+        let watchdog = state.pty_manager.clone();
+        let watched_id = pty_id.clone();
+        let token = snap.token;
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::pty::ATTACH_GATE_TIMEOUT).await;
+            if watchdog.attach_arm(&watched_id, token) {
+                warn!(pty = %watched_id, "ws attach never armed; watchdog released the gate");
+            }
+        });
+    }
 
     let mut pty_rx = match state.pty_manager.subscribe(&pty_id) {
         Ok(rx) => rx,
         Err(err) => {
             error!("Failed to subscribe to PTY {pty_id}: {err}");
             state.pty_manager.attach_arm(&pty_id, snap.token);
-            let _ = ws_tx.send(Message::Text(format!("Error: {err}"))).await;
+            let _ = ws_tx
+                .send(control(
+                    "ikenga.error",
+                    serde_json::json!({ "message": err.to_string() }),
+                ))
+                .await;
             return;
         }
     };
 
-    // Replay initial scrollback snapshot as binary frame
-    if !snap.data.is_empty() {
+    // Announce the snapshot's absolute end offset BEFORE the bytes.
+    //
+    // Without it a reconnecting client cannot tell which part of the replayed
+    // scrollback it has already painted, and re-appends the whole buffer on
+    // every reconnect. With it the client keeps its own cursor into the
+    // stream and emits only the genuinely new tail.
+    let snapshot_len = snap.data.len();
+    if ws_tx
+        .send(control(
+            "ikenga.snapshot",
+            serde_json::json!({ "end_offset": snap.end_offset, "len": snapshot_len }),
+        ))
+        .await
+        .is_err()
+    {
+        state.pty_manager.attach_arm(&pty_id, snap.token);
+        return;
+    }
+
+    if snapshot_len > 0 {
         if let Err(e) = ws_tx.send(Message::Binary(snap.data)).await {
             error!("Failed to send scrollback snapshot: {e}");
             state.pty_manager.attach_arm(&pty_id, snap.token);
@@ -91,7 +175,7 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
         }
     }
 
-    // Release gate: held bytes (if any) are flushed to broadcast_tx and delivered to pty_rx
+    // Release gate: held bytes (if any) flush to broadcast_tx and land on pty_rx.
     state.pty_manager.attach_arm(&pty_id, snap.token);
 
     let pty_manager = state.pty_manager.clone();
@@ -113,7 +197,19 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String) 
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     warn!("PTY {id_for_send}: websocket lagged, dropped {n} chunks");
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // Closed means the session was reaped: the shell exited. Say
+                // so explicitly — a bare socket close is indistinguishable
+                // from a dropped connection, and the client would reconnect
+                // forever against a terminal that is gone.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let _ = ws_tx
+                        .send(control(
+                            "ikenga.exit",
+                            serde_json::json!({ "id": id_for_send }),
+                        ))
+                        .await;
+                    break;
+                }
             }
         }
     });

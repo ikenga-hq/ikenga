@@ -14,7 +14,7 @@ describe('transport coverage & shims', () => {
 	});
 
 	describe('path-shim', () => {
-		it('homeDir returns ~ in web mode', async () => {
+		it('homeDir returns a string in web mode', async () => {
 			const res = await homeDir();
 			expect(typeof res).toBe('string');
 		});
@@ -22,6 +22,9 @@ describe('transport coverage & shims', () => {
 		it('appDataDir returns app data path', async () => {
 			const dir = await appDataDir();
 			expect(dir).toContain('app.ikenga');
+			// With no daemon reachable (as here) `~` is the honest answer;
+			// `path-shim.test.ts` covers the case where fs_home resolves.
+			expect(dir).toBe('~/.local/share/app.ikenga');
 		});
 
 		it('join joins path components', async () => {
@@ -62,13 +65,50 @@ describe('transport coverage & shims', () => {
 			expect(result).toBe('/path/to/saved.txt');
 		});
 
-		it('confirm falls back gracefully', async () => {
-			const res = await confirm('Are you sure?');
-			expect(typeof res).toBe('boolean');
+		it('a second request settles the first instead of stranding it', async () => {
+			// Only one picker can be on screen. Replacing the request without
+			// resolving leaves the original `await open(...)` pending forever,
+			// with no UI left that could ever settle it.
+			const first = open({ title: 'First' });
+			const second = open({ title: 'Second' });
+
+			await expect(first).resolves.toBeNull();
+			expect(useDialogStore.getState().activeRequest?.options.title).toBe('Second');
+
+			useDialogStore.getState().closeDialog('/chosen');
+			await expect(second).resolves.toBe('/chosen');
 		});
 
-		it('message executes without error', async () => {
+		it('confirm returns false when the host cannot show a dialog', async () => {
+			// jsdom (and any embedder that blocks modals) returns undefined
+			// rather than throwing. That must read as "not confirmed" — a
+			// coerced-truthy undefined would be an accidental yes on a
+			// destructive prompt.
+			const original = window.confirm;
+			// @ts-expect-error — deliberately modelling the blocked-modal host
+			window.confirm = undefined;
+			await expect(confirm('Delete everything?')).resolves.toBe(false);
+			window.confirm = original;
+		});
+
+		it('confirm passes a real answer through', async () => {
+			const original = window.confirm;
+			window.confirm = vi.fn().mockReturnValue(true);
+			await expect(confirm('Proceed?')).resolves.toBe(true);
+			window.confirm = vi.fn().mockReturnValue(false);
+			await expect(confirm('Proceed?')).resolves.toBe(false);
+			window.confirm = original;
+		});
+
+		it('message falls back to the console when alert is unavailable', async () => {
+			const original = window.alert;
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			// @ts-expect-error — deliberately modelling the blocked-modal host
+			window.alert = undefined;
 			await message('Hello world');
+			expect(warn).toHaveBeenCalledWith(expect.stringContaining('Hello world'));
+			warn.mockRestore();
+			window.alert = original;
 		});
 	});
 

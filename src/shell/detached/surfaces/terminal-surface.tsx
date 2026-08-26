@@ -39,6 +39,7 @@
 // xterm's base stylesheet is otherwise imported only in boot/primary.tsx — a
 // chunk the detached graph never loads — so the detached terminal would render
 // without scroll/selection styling. Import it here, scoped to this lazy chunk.
+import '@xterm/xterm/css/xterm.css';
 import { isTauri } from '@/lib/transport';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Terminal } from 'lucide-react';

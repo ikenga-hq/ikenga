@@ -21,6 +21,7 @@ export function FilepickerModal() {
 	const [query, setQuery] = useState<string>('');
 	const [selectedIndex, setSelectedIndex] = useState<number>(0);
 	const [loading, setLoading] = useState<boolean>(false);
+	const [error, setError] = useState<string | null>(null);
 
 	// Initial directory load
 	useEffect(() => {
@@ -36,6 +37,7 @@ export function FilepickerModal() {
 	// Fetch directory contents
 	const loadDirectory = useCallback(async (dirPath: string) => {
 		setLoading(true);
+		setError(null);
 		try {
 			const transport = getTransport();
 			const result = await transport.invoke<FsEntry[]>('fs_list', { path: dirPath });
@@ -50,7 +52,12 @@ export function FilepickerModal() {
 				setCurrentDir(dirPath);
 			}
 		} catch (err) {
+			// Surfaced, not just logged: swallowing this renders an empty
+			// picker that is indistinguishable from an empty directory, and
+			// the user has no way to tell that the listing failed.
 			console.warn('[filepicker-modal] failed to list dir:', err);
+			setEntries([]);
+			setError(err instanceof Error ? err.message : String(err));
 		} finally {
 			setLoading(false);
 		}
@@ -74,7 +81,8 @@ export function FilepickerModal() {
 		setSelectedIndex(0);
 	}, [query]);
 
-	const hostName = typeof window !== 'undefined' ? window.location.hostname || 'ikenga.host' : 'ikenga.host';
+	const hostName =
+		typeof window !== 'undefined' ? window.location.hostname || 'ikenga.host' : 'ikenga.host';
 
 	const handleConfirm = useCallback(() => {
 		if (options.directory) {
@@ -157,9 +165,20 @@ export function FilepickerModal() {
 				{/* Directory list */}
 				<div className="max-h-[280px] overflow-y-auto py-2">
 					{loading ? (
-						<div className="p-4 text-center font-mono text-[12px] text-[var(--fg-faint)]">Loading...</div>
+						<div className="p-4 text-center font-mono text-[12px] text-[var(--fg-faint)]">
+							Loading...
+						</div>
+					) : error ? (
+						<div
+							className="p-4 text-center font-mono text-[12px] text-[var(--danger)]"
+							data-testid="filepicker-error"
+						>
+							Could not list this directory — {error}
+						</div>
 					) : filteredEntries.length === 0 ? (
-						<div className="p-4 text-center font-mono text-[12px] text-[var(--fg-faint)]">No matches</div>
+						<div className="p-4 text-center font-mono text-[12px] text-[var(--fg-faint)]">
+							No matches
+						</div>
 					) : (
 						filteredEntries.map((item, idx) => {
 							const isSelected = idx === selectedIndex;
@@ -180,10 +199,16 @@ export function FilepickerModal() {
 										}
 									}}
 								>
-									<span className="w-3.5 text-center text-[var(--fg-faint)]">{item.is_dir ? '▸' : '▪'}</span>
+									<span className="w-3.5 text-center text-[var(--fg-faint)]">
+										{item.is_dir ? '▸' : '▪'}
+									</span>
 									<span className="flex-1 font-mono text-[12px]">{item.name}</span>
 									<span className="font-mono text-[10px] text-[var(--fg-faint)]">
-										{item.is_dir ? 'dir' : item.size ? `${(item.size / 1024).toFixed(1)} KB` : 'file'}
+										{item.is_dir
+											? 'dir'
+											: item.size
+												? `${(item.size / 1024).toFixed(1)} KB`
+												: 'file'}
 									</span>
 								</div>
 							);

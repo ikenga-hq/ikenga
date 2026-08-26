@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use tracing::debug;
 
 use super::AppState;
@@ -113,12 +113,31 @@ pub async fn rpc_handler(
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
         "pty_spawn" => {
-            let terminal_id = payload.args.get("terminal_id").and_then(|v| v.as_str()).map(str::to_string);
-            let title = payload.args.get("title").and_then(|v| v.as_str()).map(str::to_string);
-            let cwd = payload.args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".").to_string();
-            let cmd: Vec<String> = payload.args.get("cmd")
+            let terminal_id = payload
+                .args
+                .get("terminal_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let title = payload
+                .args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let cwd = payload
+                .args
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".")
+                .to_string();
+            let cmd: Vec<String> = payload
+                .args
+                .get("cmd")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_else(|| {
                     if cfg!(windows) {
                         vec!["powershell.exe".to_string()]
@@ -126,8 +145,16 @@ pub async fn rpc_handler(
                         vec!["/bin/bash".to_string()]
                     }
                 });
-            let rows = payload.args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-            let cols = payload.args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            let rows = payload
+                .args
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24) as u16;
+            let cols = payload
+                .args
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80) as u16;
             // The caller's env was accepted and then dropped on the floor.
             let env: std::collections::HashMap<String, String> = payload
                 .args
@@ -140,38 +167,66 @@ pub async fn rpc_handler(
                 })
                 .unwrap_or_default();
 
-            match state.pty_manager.spawn_headless(SpawnOpts {
-                terminal_id,
-                title,
-                cwd,
-                cmd,
-                env,
-                rows,
-                cols,
-            }).await {
+            match state
+                .pty_manager
+                .spawn_headless(SpawnOpts {
+                    terminal_id,
+                    title,
+                    cwd,
+                    cmd,
+                    env,
+                    rows,
+                    cols,
+                })
+                .await
+            {
                 Ok(pty_id) => RpcResponse::success(serde_json::json!({ "pty_id": pty_id })),
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         "pty_write" => {
-            let id = payload.args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let data = payload.args.get("data").and_then(|v| v.as_str()).unwrap_or_default();
+            let id = payload
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let data = payload
+                .args
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match state.pty_manager.write(id, data.as_bytes()) {
                 Ok(_) => RpcResponse::success(true),
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         "pty_resize" => {
-            let id = payload.args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-            let rows = payload.args.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
-            let cols = payload.args.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+            let id = payload
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let rows = payload
+                .args
+                .get("rows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24) as u16;
+            let cols = payload
+                .args
+                .get("cols")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80) as u16;
             match state.pty_manager.resize(id, rows, cols) {
                 Ok(_) => RpcResponse::success(true),
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         "pty_kill" => {
-            let id = payload.args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let id = payload
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match state.pty_manager.kill(id) {
                 Ok(_) => RpcResponse::success(true),
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -182,23 +237,33 @@ pub async fn rpc_handler(
             RpcResponse::success(terminals)
         }
         "pty_foreground" => {
-            let id = payload.args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let id = payload
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             RpcResponse::success(state.pty_manager.foreground(id))
         }
-        "pty_foreground_snapshot" => {
-            RpcResponse::success(state.pty_manager.foreground_snapshot())
-        }
+        "pty_foreground_snapshot" => RpcResponse::success(state.pty_manager.foreground_snapshot()),
 
         // --- FS Commands ---
         "fs_exists" => {
-            let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            let path_str = payload
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match resolve_path(path_str) {
                 Ok(path) => RpcResponse::success(path.exists()),
                 Err(e) => RpcResponse::error(e),
             }
         }
         "fs_read" => {
-            let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            let path_str = payload
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match resolve_path(path_str) {
                 Ok(path) => match tokio::fs::read_to_string(&path).await {
                     Ok(content) => RpcResponse::success(content),
@@ -208,8 +273,16 @@ pub async fn rpc_handler(
             }
         }
         "fs_write" => {
-            let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-            let content = payload.args.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            let path_str = payload
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let content = payload
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match resolve_path(path_str) {
                 Ok(path) => {
                     if let Some(parent) = path.parent() {
@@ -224,29 +297,40 @@ pub async fn rpc_handler(
             }
         }
         "fs_list" => {
-            let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let path_str = payload
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
             let path = match resolve_path(path_str) {
                 Ok(p) => p,
                 Err(e) => return Json(RpcResponse::error(e)),
             };
             match std::fs::read_dir(path) {
                 Ok(entries) => {
-                    let items: Vec<serde_json::Value> = entries.filter_map(|e| e.ok()).map(|entry| {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        serde_json::json!({
-                            "name": name,
-                            "is_dir": is_dir,
-                            "path": entry.path().to_string_lossy().into_owned(),
+                    let items: Vec<serde_json::Value> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|entry| {
+                            let name = entry.file_name().to_string_lossy().into_owned();
+                            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            serde_json::json!({
+                                "name": name,
+                                "is_dir": is_dir,
+                                "path": entry.path().to_string_lossy().into_owned(),
+                            })
                         })
-                    }).collect();
+                        .collect();
                     RpcResponse::success(items)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         "fs_mkdir" => {
-            let path_str = payload.args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+            let path_str = payload
+                .args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             match resolve_path(path_str) {
                 Ok(path) => match tokio::fs::create_dir_all(&path).await {
                     Ok(_) => RpcResponse::success(true),
@@ -261,6 +345,19 @@ pub async fn rpc_handler(
                 .unwrap_or_default();
             RpcResponse::success(roots)
         }
+        // The browser has no `@tauri-apps/api/path`, so `homeDir()` resolves
+        // here. Without it the shim silently returns the literal string "~",
+        // which then gets joined into paths and handed to `fs_read` — a
+        // failure that looks like a missing file rather than a missing RPC.
+        "fs_home" => match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(home) if !home.is_empty() => RpcResponse::success(home),
+            _ => RpcResponse::error("fs_home: no HOME/USERPROFILE in the daemon environment"),
+        },
+        // `db_query` / `db_exec` are deliberately absent: the daemon does not
+        // open `ikenga.db` yet (WP-12b / G-41, ikenga#100). They fall through
+        // to the unknown-command arm below, so the frontend shim gets a real
+        // error and its localStorage fallback engages, instead of a silent
+        // wrong answer.
 
         // --- Secrets & Vault Commands (G-30) ---
         //
@@ -269,7 +366,11 @@ pub async fn rpc_handler(
         // as a bare env var name made this a remote `printenv` for every
         // credential in the daemon's environment.
         "secrets_get" => {
-            let key = payload.args.get("key").and_then(|v| v.as_str()).unwrap_or_default();
+            let key = payload
+                .args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 RpcResponse::error("secrets_get: invalid key")
             } else {
@@ -283,7 +384,9 @@ pub async fn rpc_handler(
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");
-            RpcResponse::error(format!("Command '{other}' not implemented in headless daemon"))
+            RpcResponse::error(format!(
+                "Command '{other}' not implemented in headless daemon"
+            ))
         }
     };
 

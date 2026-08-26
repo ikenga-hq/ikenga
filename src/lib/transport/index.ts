@@ -1,7 +1,12 @@
 export interface RpcTransport {
 	invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
-	listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<() => void>;
-	openPtySocket?(id: string): WebSocket;
+	listen<T>(
+		event: string,
+		handler: (event: { event: string; payload: T }) => void
+	): Promise<() => void>;
+	/** `spawn` asks the daemon to create the session if the id resolves to
+	 *  nothing. Only the first attach should set it — see `ptyListen`. */
+	openPtySocket?(id: string, opts?: { spawn?: boolean }): WebSocket;
 }
 
 export function isTauri(): boolean {
@@ -88,14 +93,18 @@ export class TauriTransport implements RpcTransport {
 		return args === undefined ? invoke<T>(cmd) : invoke<T>(cmd, args);
 	}
 
-	async listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<() => void> {
+	async listen<T>(
+		event: string,
+		handler: (event: { event: string; payload: T }) => void
+	): Promise<() => void> {
 		const { listen } = await import('@tauri-apps/api/event');
 		return listen<T>(event, handler);
 	}
 }
 
 export class WebRemoteTransport implements RpcTransport {
-	private eventListeners: Map<string, Set<(event: { event: string; payload: unknown }) => void>> = new Map();
+	private eventListeners: Map<string, Set<(event: { event: string; payload: unknown }) => void>> =
+		new Map();
 	private warnedEvents: Set<string> = new Set();
 
 	async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -147,7 +156,10 @@ export class WebRemoteTransport implements RpcTransport {
 	 * each distinct event name warns once, so a dead subscription shows up in
 	 * the console instead of being mistaken for "no events happened".
 	 */
-	async listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<() => void> {
+	async listen<T>(
+		event: string,
+		handler: (event: { event: string; payload: T }) => void
+	): Promise<() => void> {
 		if (!this.warnedEvents.has(event)) {
 			this.warnedEvents.add(event);
 			console.warn(
@@ -181,11 +193,16 @@ export class WebRemoteTransport implements RpcTransport {
 		}
 	}
 
-	openPtySocket(id: string): WebSocket {
+	openPtySocket(id: string, opts?: { spawn?: boolean }): WebSocket {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const params = new URLSearchParams();
 		const token = getAuthToken();
-		const query = token ? `?token=${encodeURIComponent(token)}` : '';
-		const ws = new WebSocket(`${protocol}//${window.location.host}/ws/pty/${encodeURIComponent(id)}${query}`);
+		if (token) params.set('token', token);
+		if (opts?.spawn) params.set('spawn', 'true');
+		const query = params.toString();
+		const ws = new WebSocket(
+			`${protocol}//${window.location.host}/ws/pty/${encodeURIComponent(id)}${query ? `?${query}` : ''}`
+		);
 		ws.binaryType = 'arraybuffer';
 		return ws;
 	}

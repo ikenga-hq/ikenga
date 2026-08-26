@@ -10,7 +10,7 @@
 
 import type { WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
-import { connectionStateStore } from './transport/connection-state';
+import { attachRemotePty } from './transport/pty-socket';
 
 export { isTauri, isRemoteWebSession, getTransport, type RpcTransport };
 export type UnlistenFn = () => void;
@@ -19,7 +19,10 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	return getTransport().invoke<T>(cmd, args);
 }
 
-function listen<T>(event: string, handler: (event: { event: string; payload: T }) => void): Promise<UnlistenFn> {
+function listen<T>(
+	event: string,
+	handler: (event: { event: string; payload: T }) => void
+): Promise<UnlistenFn> {
 	return getTransport().listen<T>(event, handler);
 }
 
@@ -148,88 +151,7 @@ export async function ptyListen(
 	if (isRemoteWebSession()) {
 		const transport = getTransport();
 		if (transport.openPtySocket) {
-			let ws: WebSocket | null = null;
-			let isClosedExplicitly = false;
-			let attempt = 0;
-			let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-			let received = 0;
-
-			const emit = (bytes: Uint8Array) => {
-				received += bytes.length;
-				onData(bytes, received);
-			};
-
-			const connect = () => {
-				if (isClosedExplicitly) return;
-				ws = transport.openPtySocket!(id);
-
-				let isFirstFrame = true;
-
-				ws.onopen = () => {
-					if (attempt > 0) {
-						connectionStateStore.set({ state: 'connected', attempt: 0 });
-					}
-					attempt = 0;
-				};
-
-				ws.onmessage = (e) => {
-					let bytes: Uint8Array;
-					if (e.data instanceof ArrayBuffer) {
-						bytes = new Uint8Array(e.data);
-					} else {
-						bytes = new TextEncoder().encode(String(e.data));
-					}
-
-					if (isFirstFrame) {
-						isFirstFrame = false;
-						emit(bytes);
-						if (attempt > 0) {
-							const text = new TextDecoder().decode(bytes);
-							const lineCount = (text.match(/\n/g) || []).length || 1;
-							const reattachText = `\r\n\x1b[38;2;34;197;94m── reattached · replayed ${lineCount} line${lineCount === 1 ? '' : 's'} from scrollback ─────────\x1b[0m\r\n`;
-							emit(new TextEncoder().encode(reattachText));
-						}
-					} else {
-						emit(bytes);
-					}
-				};
-
-				ws.onerror = (err) => {
-					console.warn(`[pty-socket] WebSocket error for ${id}:`, err);
-				};
-
-				ws.onclose = () => {
-					if (isClosedExplicitly) {
-						onExit(null);
-						return;
-					}
-
-					attempt += 1;
-					const delay = Math.min(1000 * Math.pow(2, attempt - 1), 16000);
-					connectionStateStore.set({
-						state: 'reconnecting',
-						attempt,
-						nextRetryDelayMs: delay,
-					});
-
-					const timeStr = new Date().toLocaleTimeString('en-GB', { hour12: false });
-					const disconnectText = `\r\n\x1b[38;2;234;179;8m── disconnected · ${timeStr} ───────────────────────────────────\x1b[0m\r\n`;
-					emit(new TextEncoder().encode(disconnectText));
-
-					reconnectTimer = setTimeout(() => {
-						connect();
-					}, delay);
-				};
-			};
-
-			connect();
-
-			return () => {
-				isClosedExplicitly = true;
-				if (reconnectTimer) clearTimeout(reconnectTimer);
-				if (ws) ws.close();
-				connectionStateStore.set({ state: 'connected', attempt: 0 });
-			};
+			return attachRemotePty(transport.openPtySocket.bind(transport), id, onData, onExit);
 		}
 	}
 

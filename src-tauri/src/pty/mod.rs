@@ -1101,6 +1101,11 @@ impl PtyManager {
             tracing::warn!("pty attach gate replaced before arm; flushing held bytes");
             if !prev.held.is_empty() {
                 let end = st.ring.total;
+                // Both consumers, exactly as `attach_arm` and the overflow
+                // path do. Flushing only to the sink drops these bytes from
+                // every WebSocket client for good — the gate holds back the
+                // broadcast too, so nothing else will ever replay them.
+                let _ = session.broadcast_tx.send(prev.held.clone());
                 (session.sink)(&prev.held, end);
             }
         }

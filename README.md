@@ -286,6 +286,10 @@ Run `shell/scripts/server/deploy.sh` from a clean checkout of `shell`:
 ```bash
 ./scripts/server/deploy.sh
 # Stages compiled binary & frontend assets into scripts/server/out/
+
+# Deploying from a non-Linux machine? Name the server's target, or you will
+# stage a binary the host cannot execute:
+TARGET=x86_64-unknown-linux-gnu ./scripts/server/deploy.sh
 ```
 
 #### Task 0 Credential Bootstrap
@@ -293,12 +297,24 @@ On the target host, run `bootstrap-credentials.sh` prior to starting `ikenga-ser
 ```bash
 ./scripts/server/bootstrap-credentials.sh
 ```
-This idempotently generates server secrets into `/opt/ikenga/.env` (mode 600):
-- `IKENGA_AUTH_TOKEN`: Pinned bearer token for API + WebSocket authentication.
-- `IKENGA_VAULT_KEY`: Headless master key for vault state decryption.
-- Plants agent API credentials (`~/.claude.json`, `~/.gemini/antigravity/env.json`) if `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` are exported.
+This idempotently generates server secrets into `/opt/ikenga/.env` (mode 600). It only
+ever *appends* — an existing value is left alone, so re-running it can never destroy a
+credential nobody has another copy of.
 
-> ⚠️ **Security Posture Note (G-30)**: Establishing `IKENGA_VAULT_KEY` in `/opt/ikenga/.env` allows `ikenga-server` to run headless without manual passphrase entry. This shifts security posture: **box compromise equals vault compromise**.
+- `IKENGA_AUTH_TOKEN`: Pinned bearer token for API + WebSocket authentication. Read by
+  `ikenga-server` directly (clap `env = "IKENGA_AUTH_TOKEN"`).
+- `IKENGA_VAULT_KEY`: **Reserved — nothing reads it yet.** The headless vault is WP-12b
+  (ikenga#100); `secrets_set` currently answers "not implemented in the headless daemon".
+  It is generated now so the vault lands on a key that has been stable since first boot.
+- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`: appended to the same env file if exported.
+  systemd loads it via `EnvironmentFile` and the engine adapters inherit their
+  environment, so the agent CLIs pick them up without any config file being written.
+
+> ⚠️ **Security Posture Note (G-30)**: keeping long-lived credentials in
+> `/opt/ikenga/.env` lets `ikenga-server` run headless without manual passphrase entry.
+> That is the trade: **box compromise equals credential compromise**. It applies today to
+> `IKENGA_AUTH_TOKEN` and the agent API keys; `IKENGA_VAULT_KEY` joins them once WP-12b
+> gives it a consumer.
 
 #### Running under systemd or Docker
 - **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.

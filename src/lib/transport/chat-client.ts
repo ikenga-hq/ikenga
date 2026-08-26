@@ -1,3 +1,4 @@
+import { connectionStateStore } from './connection-state';
 import { getAuthToken } from './index';
 
 function tokenQuery(): string {
@@ -24,9 +25,9 @@ export interface ChatSessionUpdate {
 }
 
 /**
- * NOTE: the `/ws/chat` endpoint this talks to is a stub — the server echoes
- * prompts back and does not run an engine. Nothing imports this client yet;
- * it lands alongside the wire format so the shapes are reviewed together.
+ * NOTE: `/ws/chat/:id` now drives the engine registry for real (WP-11b).
+ * Only `antigravity-cli` has a headless driver today; any other registered
+ * engine answers with an `error` update rather than a fabricated reply.
  */
 export type ChatConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
@@ -66,7 +67,11 @@ export class ChatWebSocketClient {
 		return this.state;
 	}
 
-	private setStatus(state: ChatConnectionState, attempt = this.attempt, nextRetryDelayMs = this.nextRetryDelayMs): void {
+	private setStatus(
+		state: ChatConnectionState,
+		attempt = this.attempt,
+		nextRetryDelayMs = this.nextRetryDelayMs
+	): void {
 		this.state = state;
 		this.attempt = attempt;
 		this.nextRetryDelayMs = nextRetryDelayMs;
@@ -83,7 +88,7 @@ export class ChatWebSocketClient {
 
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const uri = `${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(this.threadId)}${tokenQuery()}`;
-		
+
 		try {
 			this.ws = new WebSocket(uri);
 		} catch (err) {
@@ -102,6 +107,12 @@ export class ChatWebSocketClient {
 			if (typeof event.data === 'string') {
 				try {
 					const parsed = JSON.parse(event.data);
+					// `status: idle` is the turn's terminal event; drop the
+					// in-flight registration so the count reflects reality
+					// even when the turn ended in an error or a cancel.
+					if (parsed?.params?.update?.status === 'idle') {
+						connectionStateStore.agentTurnEnded(this.threadId);
+					}
 					this.onUpdate(parsed);
 				} catch (e) {
 					console.error('Failed to parse chat update:', e);
@@ -145,6 +156,9 @@ export class ChatWebSocketClient {
 				model,
 			})
 		);
+		// Registered so the connection banner can state how many agent turns
+		// are in flight from something it counted, rather than a constant.
+		connectionStateStore.agentTurnStarted(this.threadId);
 	}
 
 	cancel(): void {
@@ -155,6 +169,7 @@ export class ChatWebSocketClient {
 
 	disconnect(): void {
 		this.isExplicitDisconnect = true;
+		connectionStateStore.agentTurnEnded(this.threadId);
 		if (this.reconnectTimer) {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
