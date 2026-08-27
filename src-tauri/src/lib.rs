@@ -772,10 +772,21 @@ pub fn run() {
                                 root.as_deref(),
                             );
                         }
-                        if let Err(e) = kernel.reconcile_for_project(&active) {
-                            log::warn!(
+                        let active_for_reconcile = active.clone();
+                        // Registries call `block_on` inside register/unregister, so
+                        // the reconcile must not run on this tokio worker (#130).
+                        match tauri::async_runtime::spawn_blocking(move || {
+                            kernel.reconcile_for_project(&active_for_reconcile)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::warn!(
                                 "[pkg_kernel] reconcile for active=`{active}` failed: {e:#}"
-                            );
+                            ),
+                            Err(join) => log::error!(
+                                "[pkg_kernel] reconcile for active=`{active}` panicked: {join}"
+                            ),
                         }
                     });
                 });

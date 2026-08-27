@@ -425,3 +425,11 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		},
 	};
 });
+
+// Immediate close-flush on beforeunload (issue #133): ensures pending tab state is written on app exit
+if (typeof window !== 'undefined') {
+	window.addEventListener('beforeunload', () => {
+		const tabs = useTerminalStore.getState().tabs;
+		void writePersisted(serialize(tabs));
+	});
+}

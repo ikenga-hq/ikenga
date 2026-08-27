@@ -17,6 +17,7 @@ import { initDefaultCwd } from '@/lib/shell/default-cwd';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
+import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { FilepickerModal } from '@/components/ui/filepicker-modal';
 import { ReauthOverlay } from '@/components/ui/reauth-overlay';
 import { routeTree } from '../routeTree.gen';
@@ -80,12 +81,14 @@ export function bootPrimary(): void {
 
 	ReactDOM.createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
-			<QueryClientProvider client={queryClient}>
-				<RouterProvider router={router} />
-				<FilepickerModal />
-				<ReauthOverlay />
-				{import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
-			</QueryClientProvider>
+			<ErrorBoundary>
+				<QueryClientProvider client={queryClient}>
+					<RouterProvider router={router} />
+					<FilepickerModal />
+					<ReauthOverlay />
+					{import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
+				</QueryClientProvider>
+			</ErrorBoundary>
 		</React.StrictMode>
 	);
 }
