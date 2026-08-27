@@ -1,5 +1,99 @@
 # ikenga-desktop
 
+## 0.8.0
+
+### Minor Changes
+
+- d3f02ae: Remote-access wave 2: the headless server surface, plus two terminal fixes and
+  a credential-leak fix.
+  
+  **Security — the daemon no longer leaks its own credentials into every PTY.**
+  `pty::spawn_inner` inherited the parent environment wholesale, and
+  `bin/ikenga-server.rs` has clap read `IKENGA_AUTH_TOKEN` from the environment,
+  which systemd populates from `/opt/ikenga/.env`. Anyone who could open one
+  terminal could read the bearer token that grants terminals — a credential that
+  outlives the session and survives revoking the client. Privilege *persistence*
+  rather than escalation (holding the token already implies shell access), which
+  is why this ships as a fix.
+  
+  Two layers: `ikenga-server` scrubs `IKENGA_AUTH_TOKEN` / `IKENGA_VAULT_KEY`
+  from its own environment once clap has read them, and `pty::is_host_only_env`
+  denylists those plus `IKENGA_SECRET_*`. The `env_clear()` before the inherit
+  loop is load-bearing and not obvious: `CommandBuilder` seeds itself from
+  `std::env::vars_os()` at construction, so it inherits by default and skipping a
+  key in the loop leaves the already-inherited copy in place. Agent credentials
+  (`ANTHROPIC_API_KEY` and friends) are deliberately still inherited — a remote
+  terminal holding the box's agent auth is the point of the design. The split is:
+  unprefixed env reaches agent CLIs, `IKENGA_*` host credentials never reach a
+  shell.
+  
+  **Terminal labels can no longer collide.** `/iyke/terminal/spawn` rejected a
+  duplicate label by scanning for `status == "running"`, which cannot see a
+  terminal that has been spawned but has not yet reached `running` — so two
+  concurrent spawns with the same label both passed, roughly 1 in 5. Replaced
+  with `PtyManager::reserve_label`, which takes the name under a lock and holds
+  it until `set_label` succeeds; `LabelReservation`'s `Drop` releases it on every
+  early return so a failed spawn doesn't strand the name.
+  
+  **Popped-out terminals no longer fight over the PTY size.** Two windows
+  attached to one PTY at different sizes drove conflicting resizes and corrupted
+  the reflow. Attached non-owning viewers now skip `ptyResize` while their window
+  is unfocused (active viewer wins), and an unchanged size is a no-op on the Rust
+  side.
+  
+  Also lands the headless server surface behind it: static pkg serving with
+  lexical-then-canonical traversal checks, the fs-socket transport, and the
+  symlink-escape fix in the watcher allowlist.
+
+### Patch Changes
+
+- fe3554e: Bump the pinned Bun runtime from 1.3.14 to 1.4.0, and add native
+  `windows-aarch64` (Windows on ARM) as a supported Bun target.
+  
+  `BUN_VERSION` and the per-target sha256 table in `src-tauri/src/runtime.rs` are
+  the source of truth for both the runtime fetch path and the system-Bun
+  acceptance floor (`IKENGA_BUN_PATH` → system Bun ≥ pin → SHA-pinned fetch).
+  `scripts/fetch-bun.sh` mirrors both, and the `pin_table_matches_fetch_bun_script`
+  test asserts the two stay in lockstep — so this updates them together.
+  
+  All five per-target sha256s come from the published `SHASUMS256.txt` for
+  `bun-v1.4.0`; the linux-x64 zip was additionally downloaded and hashed locally
+  to confirm the manifest, and `fetch-bun.sh --target linux-x64` was run
+  end-to-end (download → sha verify → unzip → `bun --version` reports 1.4.0).
+  
+  `windows-aarch64` is new: `BUN_TARGET` previously fell through to `unsupported`
+  on Windows/ARM, so those hosts never got a fetched Bun and fell back to PATH.
+  Its sha256 is covered by the lockstep test — verified by deliberately corrupting
+  it and confirming the test fails naming that target.
+  
+  Note the raised floor: a system Bun older than 1.4.0 is now rejected and falls
+  through to the fetched copy.
+- 92d615a: Move the headless `ikenga-server` daemon into its own crate so it is no longer
+  bundled into the desktop app — fixing macOS universal releases, which had been
+  failing outright.
+  
+  Tauri's bundler enumerates every `[[bin]]` target of the Tauri crate and copies
+  each one into the app bundle, with no config to opt a binary out. While the
+  daemon was a second `[[bin]]` of `ikenga-desktop` it was silently shipped inside
+  every `.app`, `.deb`, `.AppImage` and `.exe`, and on `universal-apple-darwin` it
+  broke the build: Tauri `lipo`s only the *main* binary into the universal target
+  directory, so the bundler then looked for a
+  `target/universal-apple-darwin/release/ikenga-server` that was never created.
+  
+  That is what left v0.7.3 a draft with 7 of 10 assets. The `[[bin]]` arrived in
+  `5c8d19a7` (#98) and is not in v0.7.2, which is why the pipeline was green until
+  then — and why every subsequent release would have failed the same way.
+  
+  `src-tauri/server/` is now its own crate and a workspace member, depending on
+  `ikenga-desktop` with `default-features = false`. The bundler never sees it, and
+  the daemon ships the way it is actually deployed: built by
+  `scripts/server/deploy.sh` and run under systemd on its own host. Desktop
+  bundles lose a binary they never needed.
+  
+  `scripts/sync-version.mjs` now propagates the version into the new crate and its
+  `Cargo.lock` entry, so `ikenga-server --version` stays in lockstep; it fails
+  loudly if either pattern stops matching.
+
 ## 0.7.2
 
 ### Patch Changes
