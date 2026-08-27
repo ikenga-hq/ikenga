@@ -7,6 +7,9 @@ export interface RpcTransport {
 	/** `spawn` asks the daemon to create the session if the id resolves to
 	 *  nothing. Only the first attach should set it — see `ptyListen`. */
 	openPtySocket?(id: string, opts?: { spawn?: boolean }): WebSocket;
+	/** The daemon's `/ws/fs` watcher channel. One socket serves every
+	 *  watcher on the page — see `transport/fs-socket.ts`. */
+	openFsSocket?(): WebSocket;
 }
 
 export function isTauri(): boolean {
@@ -146,10 +149,10 @@ export class WebRemoteTransport implements RpcTransport {
 	 * has no counterpart to Tauri's event bus — `emit` on the Rust side goes
 	 * to an `AppHandle` that does not exist here — so every subscription made
 	 * through this transport stays silent. That is a real functional gap for
-	 * the ~30 `listen()`-based features in `tauri-cmd.ts` (fs watchers,
-	 * `projects:active-changed`, the pa-action approve-gate, runtime events);
-	 * `ptyListen` is the one exception, and it bypasses this path for a
-	 * dedicated WebSocket.
+	 * the ~30 `listen()`-based features in `tauri-cmd.ts`
+	 * (`projects:active-changed`, the pa-action approve-gate, runtime events).
+	 * `ptyListen` and `fsListenWatch` are the two exceptions, and both bypass
+	 * this path for a dedicated WebSocket (`/ws/pty/:id`, `/ws/fs`).
 	 *
 	 * Handlers are still registered so that the moment a producer lands it
 	 * can fan out through {@link WebRemoteTransport.dispatch}. Until then
@@ -205,6 +208,19 @@ export class WebRemoteTransport implements RpcTransport {
 		);
 		ws.binaryType = 'arraybuffer';
 		return ws;
+	}
+
+	/**
+	 * Open the file-watcher channel.
+	 *
+	 * Text-only (JSON control frames both ways), so no `binaryType` here —
+	 * unlike the PTY socket, which carries raw terminal bytes.
+	 */
+	openFsSocket(): WebSocket {
+		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const token = getAuthToken();
+		const query = token ? `?token=${encodeURIComponent(token)}` : '';
+		return new WebSocket(`${protocol}//${window.location.host}/ws/fs${query}`);
 	}
 }
 

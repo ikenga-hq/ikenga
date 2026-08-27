@@ -380,12 +380,12 @@ pub async fn secrets_list_keys(
     .map_err(|e| format!("join: {e}"))?
 }
 
-#[derive(Debug, Serialize)]
-pub struct VaultStatus {
-    pub available: bool,
-    pub keychain_backend: String,
-    pub error: Option<String>,
-}
+/// Wire shape lives in `crate::secrets_env` so the desktop app and the
+/// headless daemon cannot drift: both builds serialize the same five fields,
+/// and the frontend normalizes one shape. Desktop reports
+/// `mode: "stronghold", writable: true`; the daemon reports
+/// `mode: "env", writable: false`.
+pub use crate::secrets_env::VaultStatus;
 
 #[tauri::command]
 pub async fn secrets_vault_status(
@@ -404,11 +404,15 @@ pub async fn secrets_vault_status(
                         available: true,
                         keychain_backend: backend,
                         error: None,
+                        mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
+                        writable: true,
                     }),
                     Err(e) => Ok(VaultStatus {
                         available: false,
                         keychain_backend: backend,
                         error: Some(e),
+                        mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
+                        writable: true,
                     }),
                 }
             }
@@ -416,6 +420,8 @@ pub async fn secrets_vault_status(
                 available: false,
                 keychain_backend: backend,
                 error: Some(e.to_string()),
+                mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
+                writable: true,
             }),
         }
     })

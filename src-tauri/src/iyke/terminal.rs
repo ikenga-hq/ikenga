@@ -264,23 +264,19 @@ pub async fn post_terminal_spawn(
             return Err(err(StatusCode::BAD_REQUEST, "argv must not be empty"));
         }
     }
-    // Reject a duplicate label up front. Spawning and then failing to label
-    // would strand an unnamed terminal the caller didn't ask for.
-    if let Some(label) = &body.label {
+    // Reject a duplicate label up front and reserve it atomically so concurrent calls fail immediately.
+    let mut reservation = if let Some(label) = &body.label {
         if label.trim().is_empty() {
             return Err(err(StatusCode::BAD_REQUEST, "label must not be empty"));
         }
-        if manager
-            .list_terminals()
-            .iter()
-            .any(|t| t.status == "running" && t.label.as_deref() == Some(label.as_str()))
-        {
-            return Err(err(
-                StatusCode::CONFLICT,
-                format!("terminal label already in use: {label}"),
-            ));
-        }
-    }
+        Some(
+            manager
+                .reserve_label(label)
+                .map_err(|e| err(StatusCode::CONFLICT, e.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     let cwd = body.cwd.clone();
     let argv = body.argv.clone();
@@ -362,7 +358,12 @@ pub async fn post_terminal_spawn(
 
     if let Some(label) = body.label {
         match manager.set_label(&target, Some(label)) {
-            Ok(d) => out["label"] = json!(d.label),
+            Ok(d) => {
+                if let Some(r) = reservation.as_mut() {
+                    r.commit();
+                }
+                out["label"] = json!(d.label);
+            }
             Err(error) => out["label_error"] = json!(error.to_string()),
         }
     }

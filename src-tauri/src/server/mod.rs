@@ -14,6 +14,7 @@
 pub mod chat_ws;
 pub mod fs_ws;
 pub mod health;
+pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
 pub mod static_files;
@@ -34,6 +35,7 @@ use tracing::{info, warn};
 use crate::engines::EngineRegistry;
 use crate::pty::PtyManager;
 pub use health::health_handler;
+pub use pkg_static::PkgStaticService;
 pub use static_files::SpaStaticService;
 
 #[derive(Clone)]
@@ -58,6 +60,17 @@ pub struct AppState {
     pub spa_service: SpaStaticService,
     pub pty_manager: Arc<PtyManager>,
     pub engine_registry: Arc<EngineRegistry>,
+    /// Handle on `<data_dir>/ikenga.db`, backing the `db_query` / `db_exec`
+    /// RPC arms. `None` when the operator gave no `--data-dir`: there is no
+    /// sane default path for a daemon, and silently picking one would create
+    /// an empty database that looks authoritative. Those two arms then return
+    /// an error naming the missing flag, which is what the frontend's
+    /// `sql-shim` already degrades on.
+    pub pa_db: Option<Arc<crate::db::PaDb>>,
+    /// Read-only view of `--pkgs-dir`, backing `GET /pkgs/:id/*`. Built once
+    /// at router construction; empty when no `--pkgs-dir` was given, in which
+    /// case the route exists but 404s. See `server::pkg_static`.
+    pub pkg_static: PkgStaticService,
 }
 
 /// Compare two secrets without leaking their common prefix through timing.
@@ -165,14 +178,20 @@ pub fn create_router(
     config: ServerConfig,
     pty_manager: Arc<PtyManager>,
     engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
 ) -> Router {
     let spa_service = SpaStaticService::new(&config.static_dir);
+    // Walked here rather than in `run_server` so that every router — tests
+    // included — gets the same view of `--pkgs-dir`. Logs the ids it found.
+    let pkg_static = PkgStaticService::discover(config.pkgs_dir.as_deref());
     let allowed_origins = config.allowed_origins.clone();
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
         pty_manager,
         engine_registry,
+        pa_db,
+        pkg_static,
     });
 
     // Same-origin needs no CORS headers at all; anything else has to be named
@@ -193,6 +212,17 @@ pub fn create_router(
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
+        // Installed pkg bundles, read-only. Inside the protected group on
+        // purpose: pkg content is code, and the bearer token is the whole
+        // trust boundary. No second per-mount token is minted.
+        // All three forms are needed. `/*path` does NOT match an empty tail,
+        // so without the explicit `/pkgs/:id/` route a trailing slash falls
+        // through to the SPA fallback — which is OUTSIDE this auth layer, so
+        // `<iframe src="/pkgs/x/">` silently rendered the shell's index.html
+        // with no token at all. Verified against a live daemon; keep all three.
+        .route("/pkgs/:id", get(pkg_static::pkg_static_root_handler))
+        .route("/pkgs/:id/", get(pkg_static::pkg_static_root_handler))
+        .route("/pkgs/:id/*path", get(pkg_static::pkg_static_file_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -220,10 +250,11 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         config.auth_token = Some(uuid::Uuid::new_v4().simple().to_string());
     }
 
+    let mut pa_db: Option<Arc<crate::db::PaDb>> = None;
     // `/api/rpc`'s fs_* commands resolve every path through the same
     // allowlist the desktop app enforces. Without this the resolver has no
     // roots installed and refuses all paths — which is the safe direction,
-    // but not the useful one.
+    // but not the useful one. `--data-dir` is also where `ikenga.db` lives.
     if let Some(ref data_dir) = config.data_dir {
         std::fs::create_dir_all(data_dir)?;
         match crate::fs_roots::FsRoots::load(data_dir.join("fs_roots.json")) {
@@ -234,11 +265,34 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
             }
             Err(e) => warn!("fs_roots load failed: {e:#}"),
         }
+
+        // Sharing one `ikenga.db` with a running desktop app is not supported:
+        // `db::ensure_schema` reads the applied-migration set and writes the
+        // bookkeeping row without an enclosing transaction, so two processes
+        // racing a fresh migration can leave one of them failing on the
+        // `_pa_migrations` primary key. These two files only ever exist in a
+        // desktop profile, so their presence is the cheap tell.
+        for probe in ["secrets.stronghold", "pa.db"] {
+            if data_dir.join(probe).exists() {
+                warn!(
+                    "--data-dir {} already contains a desktop profile ({probe}). \
+                     ikenga.db is not safe to share with a running desktop app — \
+                     migrations are applied without a cross-process lock. Point \
+                     the daemon at its own directory.",
+                    data_dir.display()
+                );
+            }
+        }
+
+        // Opened lazily: `PaDb::new` only records the path. The pools (and the
+        // migration apply) happen on the first `db_query` / `db_exec`, so a
+        // daemon nobody queries never touches the file.
+        pa_db = Some(Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db"))));
     } else {
-        warn!("no --data-dir: fs_* RPC commands will reject every path");
-    }
-    if config.pkgs_dir.is_some() {
-        warn!("--pkgs-dir is reserved; no route serves pkgs yet");
+        warn!(
+            "no --data-dir: fs_* RPC commands will reject every path and \
+             db_query/db_exec have no database to open"
+        );
     }
 
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
@@ -256,7 +310,7 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
             .await;
     }
     let token = config.auth_token.clone().unwrap_or_default();
-    let router = create_router(config.clone(), pty_manager, engine_registry);
+    let router = create_router(config.clone(), pty_manager, engine_registry, pa_db);
 
     info!(
         "ikenga-server listening on http://{} (static assets: {})",

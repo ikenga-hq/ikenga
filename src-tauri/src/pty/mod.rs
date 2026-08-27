@@ -18,7 +18,7 @@
 pub mod foreground;
 pub mod overlay;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -173,6 +173,26 @@ enum SinkSpec {
 
 static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Environment variables that belong to the HOST process and must never reach
+/// a child shell.
+///
+/// Deliberately narrow. Agent credentials (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+/// …) are NOT listed: a terminal inheriting the box's agent auth is the point
+/// of the remote-access design, not an accident. What is excluded is the
+/// daemon's own keys —
+///
+/// * `IKENGA_AUTH_TOKEN` — the bearer token that grants a terminal. Readable
+///   from inside a terminal, it is a credential that outlives the session and
+///   survives revoking the client.
+/// * `IKENGA_VAULT_KEY` — unlocks the secrets store; a shell that can read it
+///   can decrypt every secret at rest.
+/// * `IKENGA_SECRET_*` — the namespace `/api/rpc`'s `secrets_get` serves.
+///   These are application secrets fetched deliberately through an
+///   authenticated RPC, not shell environment.
+fn is_host_only_env(key: &str) -> bool {
+    matches!(key, "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY") || key.starts_with("IKENGA_SECRET_")
+}
+
 /// Wrapper for `MasterPty::process_group_leader`, which is `#[cfg(unix)]` in
 /// portable-pty 0.8. On Windows there's no PTY foreground-PG concept, so we
 /// surface `None` and let callers degrade gracefully.
@@ -281,6 +301,7 @@ struct PtySession {
     lease: Mutex<Option<TerminalLease>>,
     last_output_at: AtomicU64,
     output_notify: Notify,
+    last_size: Mutex<(u16, u16)>,
     screen: Mutex<vt100::Parser>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -306,9 +327,32 @@ struct PtySession {
     broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
 }
 
+pub struct LabelReservation {
+    manager: Arc<PtyManager>,
+    label: String,
+    committed: bool,
+}
+
+impl LabelReservation {
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LabelReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut reserved) = self.manager.reserved_labels.lock() {
+                reserved.remove(&self.label);
+            }
+        }
+    }
+}
+
 pub struct PtyManager {
     sessions: DashMap<String, Arc<PtySession>>,
     audit: Mutex<VecDeque<TerminalAuditEntry>>,
+    reserved_labels: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -323,7 +367,45 @@ impl PtyManager {
         Self {
             sessions: DashMap::new(),
             audit: Mutex::new(VecDeque::with_capacity(AUDIT_CAP)),
+            reserved_labels: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn reserve_label(self: &Arc<Self>, label: &str) -> Result<LabelReservation> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("terminal label must not be empty"));
+        }
+        let mut reserved = self
+            .reserved_labels
+            .lock()
+            .map_err(|_| anyhow!("reserved_labels lock poisoned"))?;
+
+        if reserved.contains(trimmed) {
+            return Err(anyhow!("terminal label already in use: {trimmed}"));
+        }
+
+        for entry in self.sessions.iter() {
+            if !entry.value().exited.load(Ordering::Acquire)
+                && entry
+                    .value()
+                    .label
+                    .lock()
+                    .ok()
+                    .and_then(|val| val.clone())
+                    .as_deref()
+                    == Some(trimmed)
+            {
+                return Err(anyhow!("terminal label already in use: {trimmed}"));
+            }
+        }
+
+        reserved.insert(trimmed.to_string());
+        Ok(LabelReservation {
+            manager: self.clone(),
+            label: trimmed.to_string(),
+            committed: false,
+        })
     }
 
     #[cfg(feature = "desktop")]
@@ -438,10 +520,33 @@ impl PtyManager {
         }
         builder.cwd(&resolved_cwd);
 
-        // Inherit a sane PATH from the parent process so `claude` (and friends
-        // installed in user-local bins) resolve. portable-pty does not inherit
-        // env by default.
-        for (k, v) in std::env::vars() {
+        // Inherit the parent environment so `claude` (and friends installed in
+        // user-local bins) resolve.
+        //
+        // `env_clear()` FIRST is load-bearing, and the reason is not obvious:
+        // `CommandBuilder` seeds itself from `std::env::vars_os()` at
+        // construction (portable-pty 0.8.1 `cmdbuilder.rs:73`), so it inherits
+        // by DEFAULT. An in-tree comment used to claim the opposite. Filtering
+        // the loop below without clearing first therefore filters nothing —
+        // skipping a key just leaves the already-inherited copy in place, and
+        // the denylist becomes decoration. Proven by execution: with the loop
+        // filtered but no `env_clear`, a remote terminal still printed back
+        // `IKENGA_SECRET_*`.
+        //
+        // Wholesale inheritance is deliberate — agent CLIs need the user's real
+        // environment — but it means anything the HOST holds is readable from
+        // inside a shell it spawns. Fine for a desktop app the user already
+        // controls; not fine for a daemon serving terminals over a network,
+        // where the host's own credentials would be readable by whoever opened
+        // the terminal.
+        //
+        // `vars_os` rather than `vars` so a non-UTF-8 variable is passed
+        // through rather than silently dropped by the rebuild.
+        builder.env_clear();
+        for (k, v) in std::env::vars_os() {
+            if is_host_only_env(&k.to_string_lossy()) {
+                continue;
+            }
             builder.env(&k, &v);
         }
         // Override PATH with the augmented one (ADR-013 §Addendum Decision 2)
@@ -490,6 +595,7 @@ impl PtyManager {
             lease: Mutex::new(None),
             last_output_at: AtomicU64::new(now_ms()),
             output_notify: Notify::new(),
+            last_size: Mutex::new((opts.rows.max(1), opts.cols.max(1))),
             screen: Mutex::new(vt100::Parser::new(opts.rows.max(1), opts.cols.max(1), 0)),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
@@ -807,9 +913,15 @@ impl PtyManager {
     pub fn set_label(&self, id: &str, label: Option<String>) -> Result<TerminalDescriptor> {
         let resolved = self.resolve_id(id)?;
         if let Some(ref requested) = label {
-            if requested.trim().is_empty() {
+            let trimmed = requested.trim();
+            if trimmed.is_empty() {
                 return Err(anyhow!("terminal label must not be empty"));
             }
+            let mut reserved = self
+                .reserved_labels
+                .lock()
+                .map_err(|_| anyhow!("reserved_labels lock poisoned"))?;
+
             for entry in self.sessions.iter() {
                 if entry.key() != &resolved
                     && !entry.value().exited.load(Ordering::Acquire)
@@ -819,22 +931,34 @@ impl PtyManager {
                         .lock()
                         .ok()
                         .and_then(|value| value.clone())
-                        .as_ref()
-                        == Some(requested)
+                        .as_deref()
+                        == Some(trimmed)
                 {
-                    return Err(anyhow!("terminal label already in use: {requested}"));
+                    return Err(anyhow!("terminal label already in use: {trimmed}"));
                 }
             }
+            let session = self
+                .sessions
+                .get(&resolved)
+                .ok_or_else(|| anyhow!("unknown terminal"))?;
+            *session
+                .label
+                .lock()
+                .map_err(|_| anyhow!("terminal label lock poisoned"))? = Some(trimmed.to_string());
+
+            reserved.remove(trimmed);
+            Ok(self.describe(&resolved, &session))
+        } else {
+            let session = self
+                .sessions
+                .get(&resolved)
+                .ok_or_else(|| anyhow!("unknown terminal"))?;
+            *session
+                .label
+                .lock()
+                .map_err(|_| anyhow!("terminal label lock poisoned"))? = None;
+            Ok(self.describe(&resolved, &session))
         }
-        let session = self
-            .sessions
-            .get(&resolved)
-            .ok_or_else(|| anyhow!("unknown terminal"))?;
-        *session
-            .label
-            .lock()
-            .map_err(|_| anyhow!("terminal label lock poisoned"))? = label;
-        Ok(self.describe(&resolved, &session))
     }
 
     pub fn acquire_lease(&self, id: &str, agent_id: String, ttl_ms: u64) -> Result<(String, u64)> {
@@ -1019,18 +1143,28 @@ impl PtyManager {
             .get(id)
             .ok_or_else(|| anyhow!("unknown pty id: {id}"))?
             .clone();
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+
+        if let Ok(mut last_size) = session.last_size.lock() {
+            if last_size.0 == rows && last_size.1 == cols {
+                return Ok(());
+            }
+            *last_size = (rows, cols);
+        }
+
         let master = session
             .master
             .lock()
             .map_err(|_| anyhow!("master lock poisoned"))?;
         master.resize(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
         if let Ok(mut screen) = session.screen.lock() {
-            screen.set_size(rows.max(1), cols.max(1));
+            screen.set_size(rows, cols);
         }
         Ok(())
     }
@@ -1263,6 +1397,35 @@ mod tests {
     /// Guards against a vacuous pass: it asserts the gate genuinely held bytes
     /// back during the handshake window, and includes a negative control
     /// reproducing the OLD listen-then-snapshot ordering, which must duplicate.
+    /// The denylist is the boundary between "the host's own credentials" and
+    /// "the user's environment". Both directions matter: blocking too little
+    /// leaks the daemon's bearer token into every terminal it serves; blocking
+    /// too much breaks the agent CLIs that are the reason the environment is
+    /// inherited at all.
+    #[test]
+    fn host_only_env_blocks_daemon_credentials_but_not_agent_auth() {
+        // The daemon's own keys — a shell must never see these.
+        assert!(is_host_only_env("IKENGA_AUTH_TOKEN"));
+        assert!(is_host_only_env("IKENGA_VAULT_KEY"));
+        assert!(is_host_only_env("IKENGA_SECRET_FAL"));
+        assert!(is_host_only_env("IKENGA_SECRET_"));
+
+        // Agent credentials are inherited ON PURPOSE: a remote terminal picking
+        // up the box's `claude` / `gemini` auth is the point of the design.
+        assert!(!is_host_only_env("ANTHROPIC_API_KEY"));
+        assert!(!is_host_only_env("GEMINI_API_KEY"));
+        assert!(!is_host_only_env("OPENAI_API_KEY"));
+
+        // And the ordinary environment is untouched.
+        assert!(!is_host_only_env("PATH"));
+        assert!(!is_host_only_env("HOME"));
+        assert!(!is_host_only_env("IKENGA_HOST"));
+        assert!(!is_host_only_env("IKENGA_PORT"));
+        // Near-misses must not be swept up by the prefix match.
+        assert!(!is_host_only_env("IKENGA_SECRETS_DIR"));
+        assert!(!is_host_only_env("MY_IKENGA_SECRET_X"));
+    }
+
     /// `wait_for_exit` must resolve on the shell actually exiting, NOT on the
     /// session leaving the map.
     ///
@@ -1528,5 +1691,20 @@ mod tests {
         let contents = parser.screen().contents();
         assert!(contents.contains("second"));
         assert!(!contents.contains("first"));
+    }
+
+    #[test]
+    fn label_reservation_blocks_duplicate_and_releases_on_drop() {
+        let mgr = Arc::new(PtyManager::new());
+        let res1 = mgr.reserve_label("worker-1").expect("first reservation succeeds");
+        assert!(mgr.reserve_label("worker-1").is_err(), "duplicate reservation must fail");
+        drop(res1);
+        assert!(mgr.reserve_label("worker-1").is_ok(), "reservation should be released on drop");
+    }
+
+    #[test]
+    fn label_reservation_rejects_empty_label() {
+        let mgr = Arc::new(PtyManager::new());
+        assert!(mgr.reserve_label("  ").is_err(), "empty label must fail");
     }
 }

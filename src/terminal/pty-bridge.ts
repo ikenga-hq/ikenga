@@ -402,6 +402,17 @@ export class Pty {
 
 	async resize(rows: number, cols: number): Promise<void> {
 		if (this.disposed || this.exited) return;
+		// Active-viewer priority (D-10): Attached (non-owning) PTY viewers in an unfocused
+		// window do not send ptyResize commands while another window is active, preventing
+		// reflow corruption ping-pong between multi-window viewers.
+		if (
+			!this.owning &&
+			typeof document !== 'undefined' &&
+			typeof document.hasFocus === 'function' &&
+			!document.hasFocus()
+		) {
+			return;
+		}
 		return ptyResize(this.id, rows, cols);
 	}
 

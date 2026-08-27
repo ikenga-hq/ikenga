@@ -70,6 +70,71 @@ fn resolve_path(input: &str) -> Result<std::path::PathBuf, String> {
     Ok(resolved)
 }
 
+/// Returned when the daemon was started without `--data-dir`, so there is no
+/// `ikenga.db` to open. Says which flag is missing rather than "unknown
+/// command", which would read as unimplemented.
+const NO_DB: &str =
+    "no database: the daemon was started without --data-dir, so there is no ikenga.db to open";
+
+/// Pull `(sql, params)` out of an RPC payload, accepting **both** spellings the
+/// frontend uses.
+///
+/// This is not defensive coding, it is a real fork in the frontend:
+///
+/// * `src/lib/tauri-cmd.ts` (`dbQuery` / `dbExec`) sends `{sql, params}` — the
+///   Tauri command's own argument names. Used by viewer recents, the home
+///   widgets, and the pkg-iframe `host.dbQuery` / `host.dbExec` bridge.
+/// * `src/lib/transport/sql-shim.ts` (`SqlDbWebProxy`) sends `{query, values}`
+///   — the `@tauri-apps/plugin-sql` argument names, because it stands in for
+///   that package. Used by `layout-state`, `sql-db`, and the terminal
+///   `session-store`.
+///
+/// Both reach this one command name. Honouring only one spelling would leave
+/// the other half of the app looking like an empty database rather than an
+/// error — so accept both, and keep accepting both.
+fn db_args(args: &Value) -> Result<(String, Vec<Value>), String> {
+    let sql = args
+        .get("sql")
+        .or_else(|| args.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or("`sql` (or `query`) is required")?
+        .to_string();
+    let params = args
+        .get("params")
+        .or_else(|| args.get("values"))
+        .map(|v| match v {
+            Value::Array(a) => Ok(a.clone()),
+            Value::Null => Ok(Vec::new()),
+            _ => Err("`params` (or `values`) must be an array".to_string()),
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok((sql, params))
+}
+
+/// The `kind` discriminant of the frontend's `VaultScope`
+/// (`src/lib/tauri-cmd.ts`), whose wire shape is
+/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }`.
+///
+/// The daemon only distinguishes workspace from everything else, because its
+/// secret namespace is flat — see `crate::secrets_env`.
+enum ScopeKind {
+    Workspace,
+    Other(String),
+}
+
+fn scope_kind(args: &Value) -> Result<ScopeKind, String> {
+    let kind = args
+        .get("scope")
+        .and_then(|s| s.get("kind"))
+        .and_then(|k| k.as_str())
+        .ok_or("scope is required, e.g. {\"kind\":\"workspace\"}")?;
+    Ok(match kind {
+        "workspace" => ScopeKind::Workspace,
+        other => ScopeKind::Other(other.to_string()),
+    })
+}
+
 #[derive(Deserialize, Debug)]
 pub struct RpcRequest {
     pub cmd: String,
@@ -353,33 +418,147 @@ pub async fn rpc_handler(
             Ok(home) if !home.is_empty() => RpcResponse::success(home),
             _ => RpcResponse::error("fs_home: no HOME/USERPROFILE in the daemon environment"),
         },
-        // `db_query` / `db_exec` are deliberately absent: the daemon does not
-        // open `ikenga.db` yet (WP-12b / G-41, ikenga#100). They fall through
-        // to the unknown-command arm below, so the frontend shim gets a real
-        // error and its localStorage fallback engages, instead of a silent
-        // wrong answer.
+        // --- SQLite (WP-12b / G-41, ikenga#100) ---
+        //
+        // Backed by `crate::db`, the same module the desktop `#[tauri::command]`
+        // wrappers call, so the read-only guard and the row-to-JSON conversion
+        // are literally the same code on both surfaces.
+        "db_query" => match state.pa_db.as_deref() {
+            Some(db) => {
+                let (sql, params) = match db_args(&payload.args) {
+                    Ok(v) => v,
+                    Err(e) => return Json(RpcResponse::error(format!("db_query: {e}"))),
+                };
+                match crate::db::query_json(db, &sql, &params).await {
+                    Ok(rows) => RpcResponse::success(rows),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            None => RpcResponse::error(NO_DB),
+        },
+        "db_exec" => match state.pa_db.as_deref() {
+            Some(db) => {
+                let (sql, params) = match db_args(&payload.args) {
+                    Ok(v) => v,
+                    Err(e) => return Json(RpcResponse::error(format!("db_exec: {e}"))),
+                };
+                match crate::db::exec(db, &sql, &params).await {
+                    Ok(res) => RpcResponse::success(res),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            None => RpcResponse::error(NO_DB),
+        },
+
+        // --- Pkg iframe mount (WP-12b / W4) ---
+        //
+        // `<PkgIframeHost>` calls this on mount and puts `html` in the
+        // iframe's `srcdoc`. `supabase` / `secrets` are omitted — there is no
+        // vault here — and `buildHostContext` already treats both as optional,
+        // which is why a capability-free pkg needs none of the vault work.
+        // The refusals for pkgs that DO require them live in `mint_html`.
+        "pkg_content_html" => {
+            // `pkgId` is what `tauri-cmd.ts` sends (Tauri does the camel →
+            // snake conversion on the desktop side; nothing does it here).
+            // `pkg_id` is accepted too so a curl'd probe or a future caller
+            // using the Rust spelling isn't silently told the pkg is unknown.
+            let pkg_id = payload
+                .args
+                .get("pkgId")
+                .or_else(|| payload.args.get("pkg_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if pkg_id.is_empty() {
+                return Json(RpcResponse::error("pkg_content_html: `pkgId` is required"));
+            }
+            // The manifest route's `source`, e.g. `dist/index.html`. Defaulted
+            // rather than required: every pkg-pattern template emits exactly
+            // that, and a missing `source` should mount the entry document,
+            // not fail.
+            let source = payload
+                .args
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("index.html");
+            match state.pkg_static.mint_html(pkg_id, source) {
+                Ok(handle) => RpcResponse::success(handle),
+                Err(e) => RpcResponse::error(e),
+            }
+        }
+        // Nothing to revoke: the daemon mints no per-mount credential (the
+        // bearer token is the whole boundary — see `server::pkg_static`). This
+        // is a deliberate success, not the unknown-command fallthrough: the
+        // frontend calls it on every iframe unmount and swallows the result
+        // with `.catch(() => {})`, so a refusal here would be an invisible
+        // error on a path that is working exactly as designed.
+        "pkg_content_revoke" => RpcResponse::success(true),
 
         // --- Secrets & Vault Commands (G-30) ---
         //
-        // Not wired to Stronghold yet. Reads are restricted to the
-        // `IKENGA_SECRET_*` namespace the operator opts into: taking the key
-        // as a bare env var name made this a remote `printenv` for every
-        // credential in the daemon's environment.
+        // There is no vault in the daemon and that is decided, not pending:
+        // every server-side reader of a secret is desktop-gated, so an
+        // encrypted store here would exist only to be read back out over the
+        // bearer-token boundary. The daemon serves the flat, operator-opted-in
+        // `IKENGA_SECRET_*` namespace instead. Rationale, the PTY denylist
+        // interaction, and the operator runbook all live in
+        // `crate::secrets_env` — read that before changing anything below.
         "secrets_get" => {
             let key = payload
                 .args
                 .get("key")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-                RpcResponse::error("secrets_get: invalid key")
-            } else {
-                RpcResponse::success(std::env::var(format!("IKENGA_SECRET_{key}")).ok())
+            match crate::secrets_env::get(key) {
+                Ok(value) => RpcResponse::success(value),
+                Err(e) => RpcResponse::error(format!("secrets_get: {e}")),
             }
         }
-        "secrets_set" => {
-            RpcResponse::error("secrets_set is not implemented in the headless daemon")
-        }
+        "secrets_list_keys" => RpcResponse::success(crate::secrets_env::list_keys()),
+        // Without this arm Settings → API Keys / Integrations / Secrets and
+        // every connector probe are dead in a browser session: they all gate
+        // on `available`, and the unknown-command fallthrough throws.
+        "secrets_vault_status" => RpcResponse::success(crate::secrets_env::status()),
+
+        // Scoped reads: the env namespace is flat, which IS workspace scope.
+        // Project and pkg partitions exist only in the desktop vault, so they
+        // get a refusal that says which, rather than an empty list that reads
+        // like "you have no secrets there".
+        "secrets_get_scoped" => match scope_kind(&payload.args) {
+            Ok(ScopeKind::Workspace) => {
+                let key = payload
+                    .args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                match crate::secrets_env::get(key) {
+                    Ok(value) => RpcResponse::success(value),
+                    Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
+                }
+            }
+            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
+                "secrets_get_scoped: scope {kind:?} is not servable — {}",
+                crate::secrets_env::SCOPE_REFUSAL
+            )),
+            Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
+        },
+        "secrets_list_keys_scoped" => match scope_kind(&payload.args) {
+            Ok(ScopeKind::Workspace) => RpcResponse::success(crate::secrets_env::list_keys()),
+            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
+                "secrets_list_keys_scoped: scope {kind:?} is not servable — {}",
+                crate::secrets_env::SCOPE_REFUSAL
+            )),
+            Err(e) => RpcResponse::error(format!("secrets_list_keys_scoped: {e}")),
+        },
+
+        // Writes. Explicit refusal arms, NOT the unknown-command fallthrough:
+        // the fallthrough reads as "unfinished, someone will get to it", and
+        // the next person to read it would implement the thing this decision
+        // rejects. `secrets_env::WRITE_REFUSAL` is the operator runbook.
+        cmd @ ("secrets_set" | "secrets_delete" | "secrets_set_scoped"
+        | "secrets_delete_scoped") => RpcResponse::error(format!(
+            "{cmd} {}",
+            crate::secrets_env::WRITE_REFUSAL
+        )),
 
         // --- Unknown Command Fallback ---
         other => {
@@ -391,4 +570,56 @@ pub async fn rpc_handler(
     };
 
     Json(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The two frontend spellings are a real fork, not a hypothetical: half
+    /// the app sends `{sql, params}` (`tauri-cmd.ts`) and half sends
+    /// `{query, values}` (`transport/sql-shim.ts`). Both must land.
+    #[test]
+    fn db_args_accepts_both_frontend_spellings() {
+        let tauri_cmd = json!({ "sql": "SELECT 1", "params": [1, "x"] });
+        let sql_shim = json!({ "query": "SELECT 1", "values": [1, "x"] });
+
+        let a = db_args(&tauri_cmd).expect("tauri-cmd.ts spelling");
+        let b = db_args(&sql_shim).expect("sql-shim.ts spelling");
+        assert_eq!(a.0, "SELECT 1");
+        assert_eq!(a, b, "both spellings must decode identically");
+    }
+
+    /// Omitted bind lists are normal (`dbQuery(sql)` with no params) and must
+    /// not be an error; an explicit `null` is the same thing.
+    #[test]
+    fn db_args_defaults_missing_params_to_empty() {
+        let (sql, params) = db_args(&json!({ "sql": "SELECT 1" })).expect("no params");
+        assert_eq!(sql, "SELECT 1");
+        assert!(params.is_empty());
+
+        let (_, params) =
+            db_args(&json!({ "query": "SELECT 1", "values": null })).expect("null values");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn db_args_rejects_missing_sql_and_non_array_params() {
+        assert!(db_args(&json!({ "params": [] })).is_err());
+        assert!(db_args(&json!({ "sql": "SELECT 1", "params": "nope" })).is_err());
+    }
+
+    /// `db_exec`'s success payload is destructured in TS as
+    /// `SqlQueryResult { rowsAffected, lastInsertId }`. snake_case here would
+    /// read as `undefined` on both fields with no error anywhere.
+    #[test]
+    fn exec_result_serializes_camel_case() {
+        let wire = serde_json::to_value(crate::db::ExecResult {
+            rows_affected: 3,
+            last_insert_id: 42,
+        })
+        .expect("serialize");
+        assert_eq!(wire, json!({ "rowsAffected": 3, "lastInsertId": 42 }));
+    }
 }

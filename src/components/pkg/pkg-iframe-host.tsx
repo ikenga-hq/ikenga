@@ -78,6 +78,7 @@ import {
 	type SqlValue,
 	skillRosterRead,
 } from '@/lib/tauri-cmd';
+import { isTauri } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
 import { usePaneScope } from '@/shell/panes/pane-scope';
 
@@ -1209,19 +1210,28 @@ export function PkgIframeHostInner({
 	// reload counter when our pkg id matches. Only one listener per host
 	// instance — the event channel is global, the filter happens in JS.
 	useEffect(() => {
+		// `ikenga dev` hot-reload is a native-shell concept and there is no
+		// browser counterpart. Without this guard `listen()` reaches straight
+		// into `__TAURI_INTERNALS__` and rejects, and because nothing awaits
+		// the promise that surfaces as an unhandled rejection on EVERY pkg
+		// pane mount in a remote session. Same guard as
+		// `lib/window/detached-surfaces.ts` and `lib/use-screenshot-listener.ts`.
+		if (!isTauri()) return;
 		let unlisten: UnlistenFn | null = null;
 		let cancelled = false;
 		listen<PkgReloadedEvent>('pkg-reloaded', (ev) => {
 			if (cancelled) return;
 			if (ev.payload?.pkg_id !== pkgId) return;
 			setReloadKey((k) => k + 1);
-		}).then((fn) => {
-			if (cancelled) {
-				fn();
-				return;
-			}
-			unlisten = fn;
-		});
+		})
+			.then((fn) => {
+				if (cancelled) {
+					fn();
+					return;
+				}
+				unlisten = fn;
+			})
+			.catch(() => {});
 		return () => {
 			cancelled = true;
 			unlisten?.();

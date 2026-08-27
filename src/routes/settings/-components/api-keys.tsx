@@ -84,6 +84,10 @@ export function ApiKeysSectionBody() {
 
 	const known = useMemo(() => new Set(keys.data ?? []), [keys.data]);
 	const vaultAvailable = status.data?.available ?? false;
+	// The headless daemon serves reads from `IKENGA_SECRET_*` env vars and has
+	// no vault to write to (see src-tauri/src/secrets_env.rs). Reveal stays
+	// live; add/edit/delete are hidden rather than offered-and-refused.
+	const vaultWritable = status.data?.writable ?? true;
 
 	async function handleReveal(name: string) {
 		if (revealedKey?.key === name) {
@@ -118,7 +122,11 @@ export function ApiKeysSectionBody() {
 						)}
 						<div>
 							{vaultAvailable ? (
-								<span>Vault unlocked via {status.data.keychainBackend}.</span>
+								<span>
+									Vault unlocked via {status.data.keychainBackend}.
+									{!vaultWritable &&
+										' Read-only in this session — set IKENGA_SECRET_<KEY> in the daemon\u2019s environment and restart it to change a key.'}
+								</span>
 							) : (
 								<span>
 									Vault unavailable: {status.data.error ?? 'unknown error'}. Sidecars will fall back
@@ -178,18 +186,20 @@ export function ApiKeysSectionBody() {
 													)}
 												</Button>
 											)}
-											<Button
-												variant="ghost"
-												size="sm"
-												onClick={() => setEditKey(k.name)}
-												disabled={!vaultAvailable}
-											>
-												{present ? (
-													<Pencil className="h-3.5 w-3.5" />
-												) : (
-													<Plus className="h-3.5 w-3.5" />
-												)}
-											</Button>
+											{vaultWritable && (
+												<Button
+													variant="ghost"
+													size="sm"
+													onClick={() => setEditKey(k.name)}
+													disabled={!vaultAvailable}
+												>
+													{present ? (
+														<Pencil className="h-3.5 w-3.5" />
+													) : (
+														<Plus className="h-3.5 w-3.5" />
+													)}
+												</Button>
+											)}
 										</div>
 									</div>
 								);

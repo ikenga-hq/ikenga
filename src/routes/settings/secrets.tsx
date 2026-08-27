@@ -56,6 +56,10 @@ type TabKind = 'workspace' | 'project' | 'pkg';
 function SecretsPage() {
 	const status = useQuery(vaultStatusQueryOptions());
 	const vaultAvailable = status.data?.available ?? false;
+	// The headless daemon's store is flat, env-backed and read-only (see
+	// src-tauri/src/secrets_env.rs). Reads work; add/edit/delete are hidden
+	// rather than offered and then refused by the RPC.
+	const vaultWritable = status.data?.writable ?? true;
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
 
@@ -162,19 +166,28 @@ function SecretsPage() {
 									{keysQuery.isLoading ? 'Loading…' : `${keysQuery.data?.length ?? 0} secrets`}
 								</span>
 							</div>
-							<Button
-								variant="ghost"
-								size="sm"
-								className="h-7 px-2 text-[11px]"
-								onClick={() => setAddingNew(true)}
-								disabled={!canQuery || !vaultAvailable}
-							>
-								<Plus className="mr-1 h-3 w-3" /> Add secret
-							</Button>
+							{vaultWritable ? (
+								<Button
+									variant="ghost"
+									size="sm"
+									className="h-7 px-2 text-[11px]"
+									onClick={() => setAddingNew(true)}
+									disabled={!canQuery || !vaultAvailable}
+								>
+									<Plus className="mr-1 h-3 w-3" /> Add secret
+								</Button>
+							) : (
+								<span className="text-[11px] text-muted-foreground">Read-only</span>
+							)}
 						</div>
 						{!canQuery && (
 							<div className="px-3 py-6 text-center text-xs text-muted-foreground">
 								Select a pkg to view its secrets.
+							</div>
+						)}
+						{canQuery && keysQuery.isError && (
+							<div className="px-3 py-6 text-center text-xs text-red-700 dark:text-red-400">
+								{(keysQuery.error as Error).message}
 							</div>
 						)}
 						{canQuery && keysQuery.data && keysQuery.data.length === 0 && (
@@ -184,7 +197,13 @@ function SecretsPage() {
 						)}
 						<ul className="divide-y divide-border">
 							{(keysQuery.data ?? []).map((k) => (
-								<SecretRow key={k} scope={scope} name={k} onEdit={() => setEditKey(k)} />
+								<SecretRow
+									key={k}
+									scope={scope}
+									name={k}
+									writable={vaultWritable}
+									onEdit={() => setEditKey(k)}
+								/>
 							))}
 						</ul>
 					</div>
@@ -281,10 +300,12 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 function SecretRow({
 	scope,
 	name,
+	writable,
 	onEdit,
 }: {
 	scope: VaultScope;
 	name: string;
+	writable: boolean;
 	onEdit: () => void;
 }) {
 	const qc = useQueryClient();
@@ -323,31 +344,35 @@ function SecretRow({
 				>
 					{revealed === null ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
 				</Button>
-				<Button
-					variant="ghost"
-					size="sm"
-					className="h-6 px-2 text-[11px]"
-					onClick={onEdit}
-					aria-label={`Edit secret ${name}`}
-				>
-					<Pencil className="h-3 w-3" />
-				</Button>
-				<Button
-					variant="ghost"
-					size="sm"
-					className="h-6 px-2 text-[11px] text-muted-foreground hover:text-red-700"
-					onClick={() => {
-						if (!window.confirm(`Delete secret "${name}"?`)) return;
-						delMut.mutate(
-							{ scope, key: name },
-							{ onSuccess: () => qc.invalidateQueries({ queryKey: ['secrets'] }) }
-						);
-					}}
-					disabled={delMut.isPending}
-					aria-label={`Delete secret ${name}`}
-				>
-					<Trash2 className="h-3 w-3" />
-				</Button>
+				{writable && (
+					<>
+						<Button
+							variant="ghost"
+							size="sm"
+							className="h-6 px-2 text-[11px]"
+							onClick={onEdit}
+							aria-label={`Edit secret ${name}`}
+						>
+							<Pencil className="h-3 w-3" />
+						</Button>
+						<Button
+							variant="ghost"
+							size="sm"
+							className="h-6 px-2 text-[11px] text-muted-foreground hover:text-red-700"
+							onClick={() => {
+								if (!window.confirm(`Delete secret "${name}"?`)) return;
+								delMut.mutate(
+									{ scope, key: name },
+									{ onSuccess: () => qc.invalidateQueries({ queryKey: ['secrets'] }) }
+								);
+							}}
+							disabled={delMut.isPending}
+							aria-label={`Delete secret ${name}`}
+						>
+							<Trash2 className="h-3 w-3" />
+						</Button>
+					</>
+				)}
 			</div>
 		</li>
 	);
