@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main-window capability set: pty (custom commands), sql, stronghold, dialog, os. Sidecar binaries spawn through tokio::process directly (see src-tauri/src/sidecar/), not through tauri-plugin-shell. fs:* perm identifiers are listed with empty allow arrays — no static main-window fs grants; per-pkg fs is granted dynamically by pkg/registries/permissions.rs::add_fs_capabilities, and Rust-side app fs (commands::fs::*) bypasses Tauri ACL and enforces fs_roots.rs instead.",
+  "description": "Main-window capability set: pty (custom commands), sql, stronghold, dialog, os. Sidecar binaries spawn through tokio::process directly (see src-tauri/src/sidecar/), not through tauri-plugin-shell. fs:* perm identifiers are listed with empty allow arrays — no static main-window fs grants; per-pkg fs is granted dynamically by pkg/registries/permissions.rs::add_fs_capabilities, and Rust-side app fs (commands::fs::*) enforces fs_roots.rs on top of the ACL. `allow-app-commands` (see permissions/app-commands.toml) grants the app's own #[tauri::command] surface: since tauri 2.11.2 those are ACL-gated for this window because it loads remote content (http://localhost:<viewer_port>/) — without it every command is rejected (ikenga#140).",
   "windows": ["main"],
   "remote": {
     "urls": [
@@ -9,6 +9,7 @@
     ]
   },
   "permissions": [
+    "allow-app-commands",
     "core:default",
     "core:event:default",
     "core:window:default",

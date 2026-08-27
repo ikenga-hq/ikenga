@@ -340,7 +340,13 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         working-directory: shell
         run: |
-          xvfb-run -a dbus-run-session -- \
+          # The explicit screen size matters. xvfb-run's default is 640x480,
+          # and at that size the workspace lays out but a terminal pane never
+          # mounts its xterm — verified by execution: the same build that
+          # spawns `bash -l` and echoes a command back at 1600x1000 leaves the
+          # PTY unattached at 640x480. /iyke/dom does not depend on it today,
+          # but anything added to this gate that touches a pane would.
+          xvfb-run -a -s "-screen 0 1600x1000x24" dbus-run-session -- \
             bun run scripts/launch-smoke-gate.ts \
               --binary="src-tauri/target/${{ matrix.target }}/release/ikenga-desktop" \
               --timeout-sec=120
