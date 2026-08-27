@@ -40,9 +40,10 @@ use super::handlers::{
     get_query_cache, get_state, get_terminal_read, post_chi_cancel, post_chi_resume, post_chi_run,
     post_click, post_close, post_devtools, post_focus, post_go, post_iframe_message, post_key,
     post_mode, post_oba_install_local, post_open,
-    post_pkg_dev_register, post_pkg_dev_reload, post_pkg_dev_unregister, post_pkg_health_remove,
-    post_pkg_health_remove_all, post_pkg_health_scan, post_pkg_install, post_pkg_scope_set,
-    post_pkg_uninstall, post_refresh, post_resize, post_screenshot_pane, post_screenshot_window,
+    post_pkg_badge_set, post_pkg_dev_register, post_pkg_dev_reload, post_pkg_dev_unregister,
+    post_pkg_health_remove, post_pkg_health_remove_all, post_pkg_health_scan, post_pkg_install,
+    post_pkg_scope_set, post_pkg_uninstall, post_refresh, post_resize, post_screenshot_pane,
+    post_screenshot_window,
     post_sidebar, post_split, post_terminal_send, post_type, post_wait,
 };
 use super::hooks::{get_hook_events, post_hook_event};
@@ -161,6 +162,7 @@ pub async fn serve(
         .route("/iyke/pkg/uninstall", post(post_pkg_uninstall))
         .route("/iyke/pkg/list", get(get_pkg_list))
         .route("/iyke/pkg/scope-set", post(post_pkg_scope_set))
+        .route("/iyke/pkg/badge-set", post(post_pkg_badge_set))
         .route("/iyke/oba/install-local", post(post_oba_install_local))
         .route("/iyke/pkg/dev/register", post(post_pkg_dev_register))
         .route("/iyke/pkg/dev/unregister", post(post_pkg_dev_unregister))

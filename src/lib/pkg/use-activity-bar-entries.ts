@@ -13,6 +13,14 @@ import { listen } from '@tauri-apps/api/event';
 import { useEffect, useState } from 'react';
 import { pkgKernelStatus } from '@/lib/tauri-cmd';
 
+/** Shape mirrors the Rust `ActivityBarBadge` in
+ *  `pkg/registries/activity_bar.rs` (WP-11). */
+export interface PkgActivityBarBadge {
+	dot: boolean;
+	count?: number | null;
+	tooltip?: string | null;
+}
+
 /** Shape mirrors the Rust `ActivityBarEntry` in
  *  `pkg/registries/activity_bar.rs`. */
 export interface PkgActivityBarEntry {
@@ -22,6 +30,7 @@ export interface PkgActivityBarEntry {
 	icon?: string | null;
 	section?: string | null;
 	route: string;
+	badge?: PkgActivityBarBadge | null;
 }
 
 export interface PkgActivityBarState {
@@ -61,6 +70,10 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 			listen('pkg-installed', () => void refresh()),
 			listen('pkg-uninstalled', () => void refresh()),
 			listen('pkg-reloaded', () => void refresh()),
+			// WP-11: a pkg pushed/cleared its rail badge via
+			// `pkg_activity_bar_set_badge` — refetch the kernel snapshot rather
+			// than patching in place so this stays a single source of truth.
+			listen('pkg-badge-changed', () => void refresh()),
 		];
 		return () => {
 			cancelled = true;

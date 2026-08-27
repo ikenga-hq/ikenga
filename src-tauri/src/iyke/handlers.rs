@@ -1459,6 +1459,34 @@ pub async fn post_pkg_scope_set(
 }
 
 #[derive(Deserialize)]
+pub struct PkgBadgeSetBody {
+    pub pkg_id: String,
+    /// `None` (or the field omitted) clears the badge.
+    #[serde(default)]
+    pub badge: Option<crate::pkg::registries::ActivityBarBadge>,
+}
+
+/// WP-11 — set/clear a pkg's activity-bar status badge from outside the
+/// shell (external `iyke` driving, or smoke-testing without a real iframe).
+/// Mirrors the in-shell `host.pkg.setBadge` AppBridge verb; both call
+/// `pkg_activity_bar_set_badge`.
+pub async fn post_pkg_badge_set(
+    Extension(app): Extension<AppHandle>,
+    JsonBody(body): JsonBody<PkgBadgeSetBody>,
+) -> Result<Json<OkResponse>, (StatusCode, String)> {
+    use tauri::Manager;
+    let activity_bar = app
+        .try_state::<crate::commands::ActivityBarState>()
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "activity-bar state not registered".into(),
+        ))?;
+    crate::commands::pkg_activity_bar_set_badge(app.clone(), activity_bar, body.pkg_id, body.badge)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    Ok(ok())
+}
+
+#[derive(Deserialize)]
 pub struct ObaInstallLocalBody {
     pub kind: String,
     pub name: String,
