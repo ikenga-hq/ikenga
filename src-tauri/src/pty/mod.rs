@@ -18,7 +18,7 @@
 pub mod foreground;
 pub mod overlay;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -301,6 +301,7 @@ struct PtySession {
     lease: Mutex<Option<TerminalLease>>,
     last_output_at: AtomicU64,
     output_notify: Notify,
+    last_size: Mutex<(u16, u16)>,
     screen: Mutex<vt100::Parser>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -326,9 +327,32 @@ struct PtySession {
     broadcast_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
 }
 
+pub struct LabelReservation {
+    manager: Arc<PtyManager>,
+    label: String,
+    committed: bool,
+}
+
+impl LabelReservation {
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LabelReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Ok(mut reserved) = self.manager.reserved_labels.lock() {
+                reserved.remove(&self.label);
+            }
+        }
+    }
+}
+
 pub struct PtyManager {
     sessions: DashMap<String, Arc<PtySession>>,
     audit: Mutex<VecDeque<TerminalAuditEntry>>,
+    reserved_labels: Mutex<HashSet<String>>,
 }
 
 fn now_ms() -> u64 {
@@ -343,7 +367,45 @@ impl PtyManager {
         Self {
             sessions: DashMap::new(),
             audit: Mutex::new(VecDeque::with_capacity(AUDIT_CAP)),
+            reserved_labels: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn reserve_label(self: &Arc<Self>, label: &str) -> Result<LabelReservation> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("terminal label must not be empty"));
+        }
+        let mut reserved = self
+            .reserved_labels
+            .lock()
+            .map_err(|_| anyhow!("reserved_labels lock poisoned"))?;
+
+        if reserved.contains(trimmed) {
+            return Err(anyhow!("terminal label already in use: {trimmed}"));
+        }
+
+        for entry in self.sessions.iter() {
+            if !entry.value().exited.load(Ordering::Acquire)
+                && entry
+                    .value()
+                    .label
+                    .lock()
+                    .ok()
+                    .and_then(|val| val.clone())
+                    .as_deref()
+                    == Some(trimmed)
+            {
+                return Err(anyhow!("terminal label already in use: {trimmed}"));
+            }
+        }
+
+        reserved.insert(trimmed.to_string());
+        Ok(LabelReservation {
+            manager: self.clone(),
+            label: trimmed.to_string(),
+            committed: false,
+        })
     }
 
     #[cfg(feature = "desktop")]
@@ -533,6 +595,7 @@ impl PtyManager {
             lease: Mutex::new(None),
             last_output_at: AtomicU64::new(now_ms()),
             output_notify: Notify::new(),
+            last_size: Mutex::new((opts.rows.max(1), opts.cols.max(1))),
             screen: Mutex::new(vt100::Parser::new(opts.rows.max(1), opts.cols.max(1), 0)),
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
@@ -850,9 +913,15 @@ impl PtyManager {
     pub fn set_label(&self, id: &str, label: Option<String>) -> Result<TerminalDescriptor> {
         let resolved = self.resolve_id(id)?;
         if let Some(ref requested) = label {
-            if requested.trim().is_empty() {
+            let trimmed = requested.trim();
+            if trimmed.is_empty() {
                 return Err(anyhow!("terminal label must not be empty"));
             }
+            let mut reserved = self
+                .reserved_labels
+                .lock()
+                .map_err(|_| anyhow!("reserved_labels lock poisoned"))?;
+
             for entry in self.sessions.iter() {
                 if entry.key() != &resolved
                     && !entry.value().exited.load(Ordering::Acquire)
@@ -862,22 +931,34 @@ impl PtyManager {
                         .lock()
                         .ok()
                         .and_then(|value| value.clone())
-                        .as_ref()
-                        == Some(requested)
+                        .as_deref()
+                        == Some(trimmed)
                 {
-                    return Err(anyhow!("terminal label already in use: {requested}"));
+                    return Err(anyhow!("terminal label already in use: {trimmed}"));
                 }
             }
+            let session = self
+                .sessions
+                .get(&resolved)
+                .ok_or_else(|| anyhow!("unknown terminal"))?;
+            *session
+                .label
+                .lock()
+                .map_err(|_| anyhow!("terminal label lock poisoned"))? = Some(trimmed.to_string());
+
+            reserved.remove(trimmed);
+            Ok(self.describe(&resolved, &session))
+        } else {
+            let session = self
+                .sessions
+                .get(&resolved)
+                .ok_or_else(|| anyhow!("unknown terminal"))?;
+            *session
+                .label
+                .lock()
+                .map_err(|_| anyhow!("terminal label lock poisoned"))? = None;
+            Ok(self.describe(&resolved, &session))
         }
-        let session = self
-            .sessions
-            .get(&resolved)
-            .ok_or_else(|| anyhow!("unknown terminal"))?;
-        *session
-            .label
-            .lock()
-            .map_err(|_| anyhow!("terminal label lock poisoned"))? = label;
-        Ok(self.describe(&resolved, &session))
     }
 
     pub fn acquire_lease(&self, id: &str, agent_id: String, ttl_ms: u64) -> Result<(String, u64)> {
@@ -1062,18 +1143,28 @@ impl PtyManager {
             .get(id)
             .ok_or_else(|| anyhow!("unknown pty id: {id}"))?
             .clone();
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+
+        if let Ok(mut last_size) = session.last_size.lock() {
+            if last_size.0 == rows && last_size.1 == cols {
+                return Ok(());
+            }
+            *last_size = (rows, cols);
+        }
+
         let master = session
             .master
             .lock()
             .map_err(|_| anyhow!("master lock poisoned"))?;
         master.resize(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
         if let Ok(mut screen) = session.screen.lock() {
-            screen.set_size(rows.max(1), cols.max(1));
+            screen.set_size(rows, cols);
         }
         Ok(())
     }
@@ -1600,5 +1691,20 @@ mod tests {
         let contents = parser.screen().contents();
         assert!(contents.contains("second"));
         assert!(!contents.contains("first"));
+    }
+
+    #[test]
+    fn label_reservation_blocks_duplicate_and_releases_on_drop() {
+        let mgr = Arc::new(PtyManager::new());
+        let res1 = mgr.reserve_label("worker-1").expect("first reservation succeeds");
+        assert!(mgr.reserve_label("worker-1").is_err(), "duplicate reservation must fail");
+        drop(res1);
+        assert!(mgr.reserve_label("worker-1").is_ok(), "reservation should be released on drop");
+    }
+
+    #[test]
+    fn label_reservation_rejects_empty_label() {
+        let mgr = Arc::new(PtyManager::new());
+        assert!(mgr.reserve_label("  ").is_err(), "empty label must fail");
     }
 }
