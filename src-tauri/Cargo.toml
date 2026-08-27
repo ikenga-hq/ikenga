@@ -14,10 +14,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "ikenga-desktop"
 path = "src/main.rs"
 
-[[bin]]
-name = "ikenga-server"
-path = "src/bin/ikenga-server.rs"
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -248,3 +244,8 @@ unstable_message_id = []
 # picks up royalti-co/Cargo.toml's [workspace] which lists the OLD path
 # (ikenga-desktop/src-tauri).
 [workspace]
+# `server/` holds the headless daemon. It is a separate crate on purpose: Tauri's
+# bundler copies every `[[bin]]` of THIS crate into the app bundle and offers no
+# way to exclude one, so a second `[[bin]]` here both bloats every desktop
+# bundle and breaks `universal-apple-darwin` releases. See server/Cargo.toml.
+members = ["server"]

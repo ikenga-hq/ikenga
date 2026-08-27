@@ -3145,6 +3145,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ikenga-server"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ikenga-desktop",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
