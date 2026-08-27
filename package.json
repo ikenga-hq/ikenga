@@ -24,7 +24,8 @@
 		"test:watch": "vitest",
 		"fmt": "biome format --write .",
 		"lint": "biome lint .",
-		"engine:smoke": "bun run scripts/engine-wire-smoke.ts"
+		"engine:smoke": "bun run scripts/engine-wire-smoke.ts",
+		"test:acl-parity": "bun run scripts/check-acl-parity.ts"
 	},
 	"dependencies": {
 		"@ikenga/contract": "workspace:*",

@@ -35,7 +35,8 @@
  *
  * Needs a display. In CI, wrap it: `xvfb-run -a bun run scripts/...`.
  *
- * Exit: 0 pass, 1 fail.
+ * Exit: 0 pass, 1 fail, 2 inconclusive (the app never got past onboarding, so
+ * the gate has nothing to say about the bridge — see ikenga#147).
  */
 
 import { Database } from 'bun:sqlite';
@@ -60,8 +61,16 @@ function controlJsonPathFor(dataHome: string | null): string {
 	if (sys === 'darwin')
 		return join(home, 'Library', 'Application Support', IDENTIFIER, 'control.json');
 	if (sys === 'win32')
-		return join(process.env.LOCALAPPDATA || join(home, 'AppData', 'Local'), IDENTIFIER, 'control.json');
-	return join(process.env.XDG_DATA_HOME || join(home, '.local', 'share'), IDENTIFIER, 'control.json');
+		return join(
+			process.env.LOCALAPPDATA || join(home, 'AppData', 'Local'),
+			IDENTIFIER,
+			'control.json'
+		);
+	return join(
+		process.env.XDG_DATA_HOME || join(home, '.local', 'share'),
+		IDENTIFIER,
+		'control.json'
+	);
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -143,6 +152,56 @@ async function probe(control: ControlJson, deadline: number): Promise<void> {
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const base = `http://127.0.0.1:${control.port}`;
 
+	// ── Step 1: what is the app actually showing?
+	//
+	// This has to come first. `/iyke/dom` timing out is the #140 signature, but
+	// it is ALSO what a healthy build does when it is parked on the onboarding
+	// wizard — and conflating the two invalidated an entire session's
+	// reproduction of #140 (ikenga#147). Since the wizard now publishes a
+	// literal `route: '/onboarding'` (see routes/__root.tsx), the two cases are
+	// finally distinguishable, so we distinguish them before probing anything.
+	let shell: { mode?: unknown; route?: unknown } = {};
+	let stateErr = 'never attempted';
+	while (Date.now() < deadline) {
+		try {
+			const res = await fetch(`${base}/iyke/state`, { headers });
+			if (res.ok) {
+				const body = (await res.json()) as { shell?: { mode?: unknown; route?: unknown } };
+				shell = body?.shell ?? {};
+				// Deliberately assert the CONTENT: broken v0.8.0 served 200 + valid
+				// JSON with every one of these null, so a status check proves nothing.
+				if (shell.mode != null && shell.route != null) break;
+				stateErr = `/iyke/state answered but the shell never published — mode=${JSON.stringify(shell.mode)} route=${JSON.stringify(shell.route)}`;
+			} else {
+				stateErr = `/iyke/state returned HTTP ${res.status}`;
+			}
+		} catch (err) {
+			stateErr = `/iyke/state fetch error: ${String(err)}`;
+		}
+		await sleep(1000);
+	}
+	if (shell.mode == null || shell.route == null) {
+		fail(`${stateErr} (this is the ikenga#140 signature: the FE⇄backend channel is dead)`);
+	}
+	console.log(`[smoke-gate] /iyke/state populated — mode=${shell.mode} route=${shell.route}`);
+
+	// A published `/onboarding` route means the bridge is FINE and the harness
+	// is at fault: the seed in `seedOnboardingComplete` did not take. Say so in
+	// those words, and with a distinct exit code, so nobody spends another day
+	// debugging a bridge that works.
+	if (typeof shell.route === 'string' && shell.route.startsWith('/onboarding')) {
+		console.error(
+			'[smoke-gate] INCONCLUSIVE: the app is sitting on the onboarding wizard, ' +
+				'not the workspace. The iyke bridge is demonstrably ALIVE (it published this ' +
+				'route), so this is NOT ikenga#140 — the onboarding seed did not take. Fix the ' +
+				"harness (settings_kv['onboarding.state'] / the shell-store hydration path), " +
+				'then re-run. Verdict withheld.'
+		);
+		process.exit(2);
+	}
+
+	// ── Step 2: the load-bearing round-trip.
+	// backend → FE listener → invoke('iyke_dom_done') → backend.
 	let lastErr = 'never attempted';
 	while (Date.now() < deadline) {
 		try {
@@ -151,7 +210,7 @@ async function probe(control: ControlJson, deadline: number): Promise<void> {
 				const body = (await res.json()) as unknown;
 				if (body && typeof body === 'object') {
 					console.log('[smoke-gate] PASS: /iyke/dom answered — the FE bridge is live');
-					break;
+					return;
 				}
 				lastErr = '/iyke/dom returned non-object JSON';
 			} else {
@@ -164,25 +223,16 @@ async function probe(control: ControlJson, deadline: number): Promise<void> {
 		}
 		await sleep(1000);
 	}
-	if (Date.now() >= deadline) fail(`${lastErr} (this is the ikenga#140 signature)`);
-
-	const res = await fetch(`${base}/iyke/state`, { headers });
-	if (!res.ok) fail(`/iyke/state returned HTTP ${res.status}`);
-	const state = (await res.json()) as { shell?: { mode?: unknown; route?: unknown } };
-	const shell = state?.shell ?? {};
-	// Deliberately assert the CONTENT: broken v0.8.0 served 200 + valid JSON
-	// with every one of these null, so a status check alone proves nothing.
-	if (shell.mode == null || shell.route == null) {
-		fail(
-			`/iyke/state answered but the shell never published — mode=${JSON.stringify(shell.mode)} route=${JSON.stringify(shell.route)}`
-		);
-	}
-	console.log(`[smoke-gate] PASS: /iyke/state populated — mode=${shell.mode} route=${shell.route}`);
+	fail(`${lastErr} (this is the ikenga#140 signature)`);
 }
 
 async function main(): Promise<void> {
 	const arg = (name: string): string | undefined =>
-		process.argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
+		process.argv
+			.find((a) => a.startsWith(`--${name}=`))
+			?.split('=')
+			.slice(1)
+			.join('=');
 
 	const timeoutSec = Number.parseInt(arg('timeout-sec') ?? '90', 10);
 	const binary = arg('binary');
@@ -210,7 +260,9 @@ async function main(): Promise<void> {
 		const first = await waitForControl(controlPath, Date.now() + timeoutSec * 1000);
 		if (!first) {
 			const err = await new Response(proc.stderr as ReadableStream).text().catch(() => '');
-			fail(`app never wrote control.json on first boot within ${timeoutSec}s.\n${err.slice(-2000)}`);
+			fail(
+				`app never wrote control.json on first boot within ${timeoutSec}s.\n${err.slice(-2000)}`
+			);
 		}
 		console.log('[smoke-gate] phase 1 ok — backend booted');
 		await stop(proc);

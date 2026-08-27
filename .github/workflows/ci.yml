@@ -93,6 +93,17 @@ jobs:
             pnpm -F "$pkg" build
           done
 
+      # Cheapest gate in the pipeline and the one that would have caught
+      # ikenga#140. Since tauri 2.11.2, app commands are ACL-gated for the
+      # shell's remote-origin main window, so a command registered in
+      # `generate_handler!` but missing from
+      # `src-tauri/permissions/app-commands.toml` is dead at runtime while
+      # every compile-time gate stays green. Runs first: it takes milliseconds.
+      - name: ACL parity (generate_handler! vs app-commands.toml)
+        shell: bash
+        working-directory: shell
+        run: bun run test:acl-parity
+
       - name: Typecheck
         shell: bash
         working-directory: shell
