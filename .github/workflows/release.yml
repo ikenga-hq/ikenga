@@ -221,7 +221,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            patchelf
+            patchelf \
+            xvfb
 
       # ── Frontend deps ──────────────────────────────────────────────────────
       # pnpm at workspace root creates the shell/node_modules/@ikenga/*
@@ -317,6 +318,32 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           args: --target ${{ matrix.target }}
+
+      # Launch smoke gate — the only check in this pipeline that STARTS the app.
+      #
+      # Everything else verifies that the code compiles and its units pass.
+      # v0.8.0 shipped with a dead iyke FE⇄backend channel and no terminal
+      # could spawn, while typecheck, both cargo checks, 786 Rust tests, 804
+      # frontend tests, CI and all four release legs were green (ikenga#140).
+      # `GET /iyke/dom` round-trips backend -> FE listener -> invoke -> backend,
+      # so it fails on exactly that break. Verified by execution against both
+      # builds: passes on v0.7.2, fails on v0.8.0 with
+      # `iyke://dom-request timed out after 5000ms`.
+      #
+      # Linux leg only: it needs a webview and a display, and the bug it guards
+      # is platform-independent, so one leg is enough to catch it.
+      #
+      # On failure this job fails, `notes` (needs: build) never runs, and the
+      # release stays a DRAFT. That is the intended safe state — a build that
+      # cannot open a terminal must never become `Latest` (ikenga#141).
+      - name: Launch smoke gate (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        working-directory: shell
+        run: |
+          xvfb-run -a dbus-run-session -- \
+            bun run scripts/launch-smoke-gate.ts \
+              --binary="src-tauri/target/${{ matrix.target }}/release/ikenga-desktop" \
+              --timeout-sec=120
 
       # Workflow-dispatch runs don't publish a release — surface the built
       # installers as a workflow-run artifact so the UI download still works.

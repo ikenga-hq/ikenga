@@ -2,8 +2,12 @@ import { mark } from '@/lib/boot-timing';
 mark('boot:js-start');
 
 import './styles.css';
+import { installInstrumentation } from '@/lib/iyke/bridge';
 import { isDetachedWindow } from '@/lib/window/window-context';
 import { installZoom } from '@/lib/window/zoom';
+
+// Install console & error instrumentation immediately so logs are captured from frame 0
+installInstrumentation();
 
 // App zoom (⌘/⌃ +/-/0). Installed before either boot path so the persisted
 // level is applied while the first paint is still going up — restoring it

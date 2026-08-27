@@ -140,6 +140,16 @@ pub async fn write_explicit(pool: &SqlitePool, pkg_id: &str, snapshot_json: &str
     Ok(())
 }
 
+/// Delete any snapshot row for a pkg (e.g. on uninstall / dev unregister).
+pub async fn delete(pool: &SqlitePool, pkg_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM pkg_capability_snapshots WHERE pkg_id = ?")
+        .bind(pkg_id)
+        .execute(pool)
+        .await
+        .context("delete pkg_capability_snapshots")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +298,17 @@ mod tests {
             .expect("present");
         assert_eq!(snap.manifest_capabilities_json, json_v2);
         assert!(!snap.approved_by_implicit);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_capability_snapshot() {
+        let pool = open_test_pool().await;
+        let m = minimal_manifest();
+        let json = normalize(&m);
+        write_implicit(&pool, &m.id, &json).await.expect("implicit");
+        assert!(fetch(&pool, &m.id).await.unwrap().is_some());
+
+        delete(&pool, &m.id).await.expect("delete");
+        assert!(fetch(&pool, &m.id).await.unwrap().is_none());
     }
 }

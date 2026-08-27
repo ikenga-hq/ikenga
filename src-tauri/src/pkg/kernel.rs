@@ -535,6 +535,9 @@ impl Kernel {
         let id_owned = pkg_id.to_string();
         tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
+            if let Err(e) = cap_snapshot::delete(&pool, &id_owned).await {
+                log::warn!("[pkg_kernel] delete cap_snapshot for `{id_owned}` failed (continuing): {e:#}");
+            }
             sqlx::query("DELETE FROM pkg_installed WHERE id = ?")
                 .bind(&id_owned)
                 .execute(&pool)
