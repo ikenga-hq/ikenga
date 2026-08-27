@@ -107,9 +107,9 @@ use commands::{
     oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
     oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
     oba_missing_requires, oba_relink_dependents, oba_safe_delete, oba_set_auto_update,
-    oba_unlink_one, oba_update, os_username, pin_screenshot_write, pkg_content_html,
-    pkg_content_revoke, pkg_content_url, pkg_db_diag, pkg_dev_register, pkg_dev_reload,
-    pkg_dev_unregister, pkg_discover_workspace, pkg_fetch, pkg_health_remove,
+    oba_unlink_one, oba_update, os_username, pin_screenshot_write, pkg_activity_bar_set_badge,
+    pkg_content_html, pkg_content_revoke, pkg_content_url, pkg_db_diag, pkg_dev_register,
+    pkg_dev_reload, pkg_dev_unregister, pkg_discover_workspace, pkg_fetch, pkg_health_remove,
     pkg_health_remove_all, pkg_health_scan, pkg_install_from_path, pkg_install_from_registry,
     pkg_invoke, pkg_is_trusted_for_elevated, pkg_kernel_status, pkg_mcp_call, pkg_preview_manifest,
     pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
@@ -628,7 +628,7 @@ pub fn run() {
                     settings_reg.clone() as Arc<dyn pkg::Registry>,
                     cron_reg as Arc<dyn pkg::Registry>,
                     ui_routes_reg as Arc<dyn pkg::Registry>,
-                    activity_bar_reg as Arc<dyn pkg::Registry>,
+                    activity_bar_reg.clone() as Arc<dyn pkg::Registry>,
                     engine_assets_reg as Arc<dyn pkg::Registry>,
                     mcp_reg as Arc<dyn pkg::Registry>,
                     queries_reg as Arc<dyn pkg::Registry>,
@@ -724,6 +724,7 @@ pub fn run() {
             let kernel_arc_for_listener = kernel.clone();
             app.manage(KernelState(kernel));
             app.manage(PkgSettingsState(settings_reg));
+            app.manage(crate::commands::ActivityBarState(activity_bar_reg.clone()));
             app.manage(PkgContentState(pkg_content_server));
             // Clone for the post-launch bun-fetch task BEFORE `app.manage`
             // consumes the Arc — the task calls `wake_runtime_blocked()` on a
@@ -784,10 +785,21 @@ pub fn run() {
                                 root.as_deref(),
                             );
                         }
-                        if let Err(e) = kernel.reconcile_for_project(&active) {
-                            log::warn!(
+                        let active_for_reconcile = active.clone();
+                        // Registries call `block_on` inside register/unregister, so
+                        // the reconcile must not run on this tokio worker (#130).
+                        match tauri::async_runtime::spawn_blocking(move || {
+                            kernel.reconcile_for_project(&active_for_reconcile)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::warn!(
                                 "[pkg_kernel] reconcile for active=`{active}` failed: {e:#}"
-                            );
+                            ),
+                            Err(join) => log::error!(
+                                "[pkg_kernel] reconcile for active=`{active}` panicked: {join}"
+                            ),
                         }
                     });
                 });
@@ -1118,6 +1130,7 @@ pub fn run() {
             pkg_health_remove_all,
             pkg_settings_get,
             pkg_settings_set,
+            pkg_activity_bar_set_badge,
             pkg_preview_manifest,
             pkg_screenshot,
             pkg_content_url,

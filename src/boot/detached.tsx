@@ -19,6 +19,8 @@ import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { windowContext } from '@/lib/window/window-context';
 import { DetachedRoot } from '@/shell/detached/detached-root';
 
+import { ErrorBoundary } from '@/components/ui/error-boundary';
+
 /** Boot a thin detached single-surface window. */
 export function bootDetached(): void {
 	const ctx = windowContext();
@@ -35,9 +37,11 @@ export function bootDetached(): void {
 
 	ReactDOM.createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
-			<QueryClientProvider client={queryClient}>
-				<DetachedRoot ctx={ctx} />
-			</QueryClientProvider>
+			<ErrorBoundary>
+				<QueryClientProvider client={queryClient}>
+					<DetachedRoot ctx={ctx} />
+				</QueryClientProvider>
+			</ErrorBoundary>
 		</React.StrictMode>
 	);
 }

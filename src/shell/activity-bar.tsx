@@ -539,12 +539,15 @@ interface PkgRailButtonProps {
  *  `--tint-*` var. */
 function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
 	const Icon = iconForPkg(entry.icon);
+	const badge = entry.badge;
+	const hasCount = typeof badge?.count === 'number' && badge.count > 0;
+	const titleSuffix = badge?.tooltip ? ` · ${badge.tooltip}` : '';
 	return (
 		<button
 			type="button"
 			onClick={() => onSelect(entry)}
-			title={entry.label}
-			aria-label={entry.label}
+			title={`${entry.label}${titleSuffix}`}
+			aria-label={badge?.tooltip ? `${entry.label} — ${badge.tooltip}` : entry.label}
 			aria-current={isActive ? 'page' : undefined}
 			className={cn(
 				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
@@ -563,6 +566,22 @@ function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
 				/>
 			)}
 			<Icon className="h-[18px] w-[18px]" />
+			{hasCount ? (
+				<span
+					aria-hidden="true"
+					className="absolute right-1 top-1 grid h-3.5 min-w-[14px] place-items-center rounded-full bg-[var(--accent,#3b82f6)] px-1 text-[9px] font-semibold leading-none text-white"
+				>
+					{badge && badge.count! > 9 ? '9+' : badge?.count}
+				</span>
+			) : (
+				badge?.dot && (
+					<span
+						aria-hidden="true"
+						className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full ring-2"
+						style={{ background: 'var(--accent,#3b82f6)', ['--tw-ring-color' as string]: 'var(--bg-base)' }}
+					/>
+				)
+			)}
 		</button>
 	);
 }

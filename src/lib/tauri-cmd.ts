@@ -2695,6 +2695,24 @@ export async function pkgSettingsSet(pkgId: string, key: string, value: unknown)
 	return invoke('pkg_settings_set', { pkgId, key, value });
 }
 
+/** Mirrors the Rust `ActivityBarBadge` in `pkg/registries/activity_bar.rs`
+ *  (WP-11). `null`/`undefined` on the call clears the badge. */
+export interface PkgActivityBarBadge {
+	dot: boolean;
+	count?: number | null;
+	tooltip?: string | null;
+}
+
+/** Set (or clear, with `null`) the status badge on a pkg's own activity-bar
+ *  rail icon. Backs the `host.pkg.setBadge` AppBridge verb; errors if the
+ *  pkg has no rail entry (no `ui.nav[0]`, or not yet registered). */
+export async function pkgActivityBarSetBadge(
+	pkgId: string,
+	badge: PkgActivityBarBadge | null
+): Promise<void> {
+	return invoke('pkg_activity_bar_set_badge', { pkgId, badge });
+}
+
 /** Parsed manifest as raw JSON. Includes whatever optional blocks the
  *  manifest declared: permissions, settings, mcp, sidecars, ui, etc. */
 export interface PkgManifestScreenshot {

@@ -10,12 +10,12 @@ use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tokio::io::AsyncWriteExt;
 
 use crate::commands::claude_store::{resolve_pkg_requires, CatalogEntryRef, PkgRequiresResult};
 use crate::pkg::manifest::Package;
-use crate::pkg::registries::SettingsRegistry;
+use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, SettingsRegistry};
 use crate::pkg::{
     DiscoveredPkg, InstallSource, InstalledSummary, Kernel, KernelStatus, PkgHealthIssue,
 };
@@ -29,6 +29,13 @@ pub struct KernelState(pub Arc<Kernel>);
 /// Standalone handle on the settings registry so `pkg_settings_*` commands
 /// can read declared schemas without going through the kernel snapshot.
 pub struct PkgSettingsState(pub Arc<SettingsRegistry>);
+
+/// Standalone handle on the activity-bar registry (WP-11) so
+/// `pkg_activity_bar_set_badge` — and the mirrored `/iyke/pkg/badge-set`
+/// route — can mutate a pkg's rail badge without going through the kernel
+/// snapshot. Same shape as `PkgSettingsState`.
+#[derive(Clone)]
+pub struct ActivityBarState(pub Arc<ActivityBarRegistry>);
 
 #[derive(Serialize)]
 pub struct PkgInstallResult {
@@ -755,6 +762,36 @@ pub fn pkg_settings_set(
         .map_err(|e| format!("upsert pkg_settings: {e}"))?;
         Ok::<_, String>(())
     })?;
+    Ok(())
+}
+
+// ─── activity-bar badge (WP-11) ───────────────────────────────────────────────
+//
+// A pkg's own status dot/count on its activity-bar rail icon — e.g. the git
+// pkg pushing dirty/ahead-behind. Set via the `host.pkg.setBadge` AppBridge
+// verb (in-shell iframe path) or the `/iyke/pkg/badge-set` route (external /
+// smoke-test path); both funnel into this one command. `None` clears the
+// badge. Emits `pkg-badge-changed` so `usePkgActivityBarEntries` (which
+// otherwise only refetches on install/uninstall/reload) picks it up without
+// a poll.
+#[tauri::command]
+pub fn pkg_activity_bar_set_badge(
+    app: AppHandle,
+    activity_bar: State<'_, ActivityBarState>,
+    pkg_id: String,
+    badge: Option<ActivityBarBadge>,
+) -> Result<(), String> {
+    let found = activity_bar
+        .0
+        .set_badge(&pkg_id, badge.clone())
+        .map_err(|e| format!("{e:#}"))?;
+    if !found {
+        return Err(format!("no activity-bar entry for pkg `{pkg_id}`"));
+    }
+    let _ = app.emit(
+        "pkg-badge-changed",
+        serde_json::json!({ "pkg_id": pkg_id, "badge": badge }),
+    );
     Ok(())
 }
 

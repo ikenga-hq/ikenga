@@ -517,9 +517,8 @@ impl Kernel {
         // restart (mirrors the dev-loop `pkg-reloaded` path). Harmless if the
         // pkg isn't currently mounted — the host filters by pkg_id.
         if is_reinstall {
-            if let Ok(mut live) = self.live.write() {
-                live.insert(pkg_id.clone());
-            }
+            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+            live.insert(pkg_id.clone());
             if let Err(e) = self.app.emit(
                 "pkg-reloaded",
                 serde_json::json!({ "pkg_id": pkg_id, "version": pkg.manifest.version }),
@@ -1225,9 +1224,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         if let Ok(mut g) = self.installed.write() {
             g.remove(pkg_id);
         }
-        if let Ok(mut g) = self.live.write() {
-            g.remove(pkg_id);
-        }
+        let mut g = self.live.write().unwrap_or_else(|e| e.into_inner());
+        g.remove(pkg_id);
         Ok(())
     }
 
@@ -1291,9 +1289,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             }
             applied.push(reg.name());
         }
-        if let Ok(mut g) = self.live.write() {
-            g.insert(pkg_id.to_string());
-        }
+        let mut g = self.live.write().unwrap_or_else(|e| e.into_inner());
+        g.insert(pkg_id.to_string());
         log::info!(
             "[pkg_kernel] resume_after_review: `{pkg_id}` re-registered ({} registries)",
             applied.len()
@@ -1364,9 +1361,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         let applied_names = match replay_registers(&self.registries, &pkg) {
             Ok(names) => names,
             Err(e) => {
-                if let Ok(mut live) = self.live.write() {
-                    live.remove(pkg_id);
-                }
+                let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+                live.remove(pkg_id);
                 return Err(e);
             }
         };
@@ -1397,9 +1393,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             g.insert(pkg_id.to_string(), updated.clone());
             updated
         };
-        if let Ok(mut live) = self.live.write() {
-            live.insert(pkg_id.to_string());
-        }
+        let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+        live.insert(pkg_id.to_string());
 
         // Best-effort event emission for the FE. A failure here means the
         // iframe/webview won't auto-remount, but the reload itself
@@ -1515,6 +1510,16 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// We track which pkgs are currently "live" in `live` and compare on
     /// each reconcile to compute the delta.
     pub fn reconcile_for_project(&self, active_project_id: &str) -> Result<()> {
+        // This function drives registries that call `block_on` internally, so
+        // it must never run inside an async task on a tokio worker (issue #130:
+        // "Cannot start a runtime from within a runtime"). Callers hop it onto
+        // `spawn_blocking` or a plain thread. `tokio::task::try_id()` is `Some`
+        // only when polled as a task — it is `None` on blocking-pool threads,
+        // so `spawn_blocking` passes and an async caller trips this in dev.
+        debug_assert!(
+            tokio::task::try_id().is_none(),
+            "reconcile_for_project called from inside an async task — use spawn_blocking (issue #130)"
+        );
         let installed = self.list_installed();
         let want_live: std::collections::HashSet<String> = installed
             .iter()
@@ -1525,10 +1530,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .map(|s| s.id.clone())
             .collect();
 
-        let mut live_guard = self
-            .live
-            .write()
-            .map_err(|_| anyhow!("live lock poisoned"))?;
+        let mut live_guard = self.live.write().unwrap_or_else(|e| e.into_inner());
         let prev_live: std::collections::HashSet<String> = live_guard.clone();
 
         // Park anything live → not in target set.
@@ -1605,11 +1607,10 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// `kernel.boot()` returns.
     pub fn mark_all_live(&self) {
         if let Ok(g) = self.installed.read() {
-            if let Ok(mut live) = self.live.write() {
-                live.clear();
-                for id in g.keys() {
-                    live.insert(id.clone());
-                }
+            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+            live.clear();
+            for id in g.keys() {
+                live.insert(id.clone());
             }
         }
     }
