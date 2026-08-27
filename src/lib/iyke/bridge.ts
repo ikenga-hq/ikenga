@@ -415,7 +415,9 @@ async function handleDomRequest(payload: DomRequestPayload) {
 				json: [],
 				generation: 0,
 			},
-		}).catch(() => {});
+		}).catch((doneErr) => {
+			console.error('[iyke] iyke_dom_done error-reply failed:', doneErr);
+		});
 	} finally {
 		useIykeActivity.getState().end(actId);
 	}
@@ -467,7 +469,9 @@ async function handleQueryCacheRequest(payload: QueryCacheRequestPayload) {
 		await invoke('iyke_query_cache_done', {
 			requestId: payload.request_id,
 			result: { entries: [{ error: err instanceof Error ? err.message : String(err) }] },
-		}).catch(() => {});
+		}).catch((doneErr) => {
+			console.error('[iyke] iyke_query_cache_done error-reply failed:', doneErr);
+		});
 	} finally {
 		useIykeActivity.getState().end(actId);
 	}
@@ -503,7 +507,9 @@ async function handleWaitRequest(payload: WaitRequestPayload) {
 					elapsed_ms: 0,
 					message: err instanceof Error ? err.message : String(err),
 				},
-			}).catch(() => {});
+			}).catch((doneErr) => {
+				console.error('[iyke] iyke_wait_done error-reply failed:', doneErr);
+			});
 		} finally {
 			finish();
 		}
@@ -833,7 +839,9 @@ async function handleTerminalReadRequest(payload: TerminalReadPayload) {
 		invoke('iyke_terminal_read_done', {
 			requestId: payload.request_id,
 			result,
-		}).catch(() => {});
+		}).catch((err) => {
+			console.error('[iyke] iyke_terminal_read_done failed:', err);
+		});
 	try {
 		const sessionId = resolveTerminalSessionId(payload.pane ?? null);
 		if (!sessionId) {
@@ -920,7 +928,9 @@ async function handleTerminalSpawn(payload: {
 		invoke('iyke_terminal_spawn_done', {
 			requestId: payload.request_id,
 			result: { terminal_id: result.terminal_id ?? null, error: result.error ?? null },
-		}).catch(() => {});
+		}).catch((err) => {
+			console.error('[iyke] iyke_terminal_spawn_done failed:', err);
+		});
 
 	try {
 		const store = usePaneStore.getState();
@@ -970,7 +980,9 @@ async function handleTerminalSend(payload: TerminalSendPayload) {
 			? invoke('iyke_action_done', {
 					requestId: payload.request_id,
 					result: { matched },
-				}).catch(() => {})
+				}).catch((err) => {
+					console.error('[iyke] iyke_action_done failed:', err);
+				})
 			: Promise.resolve();
 	const sessionId = resolveTerminalSessionId(payload.pane ?? null);
 	const actId = useIykeActivity.getState().begin({
@@ -1073,7 +1085,7 @@ export function useIykeBridge(): void {
 					else unlisteners.push(u);
 				})
 				.catch((err) => {
-					console.warn('[iyke] subscribe failed:', err);
+					console.error('[iyke] subscribe failed:', err);
 				});
 
 		track(listen<DomRequestPayload>('iyke://dom-request', (e) => handleDomRequest(e.payload)));
@@ -1090,7 +1102,9 @@ export function useIykeBridge(): void {
 						json: state ?? {},
 						generation: currentStateGeneration(),
 					},
-				}).catch(() => {});
+				}).catch((err) => {
+					console.error('[iyke] iyke_dom_done (iframe-state) failed:', err);
+				});
 			})
 		);
 		track(

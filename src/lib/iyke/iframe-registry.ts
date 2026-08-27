@@ -193,7 +193,9 @@ export function installIykeIframeMessageListener() {
 					...entry,
 					source: paneId ?? 'iframe',
 				}));
-				invoke('iyke_log_push', { entries: batch }).catch(() => {});
+				invoke('iyke_log_push', { entries: batch }).catch((err) => {
+					console.error('[iyke] iframe_log_push failed:', err);
+				});
 				return;
 			}
 			case 'network': {
@@ -201,7 +203,9 @@ export function installIykeIframeMessageListener() {
 					...entry,
 					source: paneId ?? 'iframe',
 				}));
-				invoke('iyke_network_push', { entries: batch }).catch(() => {});
+				invoke('iyke_network_push', { entries: batch }).catch((err) => {
+					console.error('[iyke] iframe_network_push failed:', err);
+				});
 				return;
 			}
 			case 'state': {

@@ -68,7 +68,7 @@ export function useIykeControlListener(): void {
 					unlisteners.push(u);
 				}
 			}).catch((err) => {
-				console.warn('[iyke] failed to subscribe:', err);
+				console.error('[iyke] control listener failed to subscribe:', err);
 			});
 		}
 
