@@ -55,6 +55,22 @@ function renderBootError(err: unknown): void {
 	root.appendChild(wrap);
 }
 
+window.addEventListener('error', (event) => {
+	console.error('[main] Uncaught window error:', event.error || event.message);
+	const root = document.getElementById('root');
+	if (root && root.children.length === 0) {
+		renderBootError(event.error || event.message);
+	}
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+	console.error('[main] Unhandled promise rejection:', event.reason);
+	const root = document.getElementById('root');
+	if (root && root.children.length === 0) {
+		renderBootError(event.reason);
+	}
+});
+
 async function boot(): Promise<void> {
 	try {
 		await loadBoot();

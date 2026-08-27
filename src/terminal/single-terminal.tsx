@@ -92,35 +92,32 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 	useEffect(() => {
 		if (tab?.status === 'spawning') {
 			startedRef.current = false;
-			if (pty?.exited) setPty(null);
+			if (pty?.exited || !pty) setPty(getPty(sessionId) ?? null);
 		}
-	}, [tab?.status, pty]);
+	}, [tab?.status, pty, sessionId]);
 
 	if (!tab) {
 		return <Centered text={`Terminal session ${sessionId.slice(0, 8)}… not found.`} />;
 	}
 	if (!pty) {
-		if (tab.status === 'exited') {
+		if (tab.status === 'exited' || tab.status === 'error') {
 			return (
 				<Centered>
-					Terminal exited (code={tab.exitCode ?? '?'}).
+					{tab.status === 'error'
+						? `Failed to spawn: ${tab.spec.cmd.join(' ')}`
+						: `Terminal exited (code=${tab.exitCode ?? '?'}).`}
 					<br />
 					<button
 						type="button"
-						onClick={() => setStatus(sessionId, 'spawning')}
+						onClick={() => {
+							startedRef.current = false;
+							setStatus(sessionId, 'spawning');
+						}}
 						className="mt-2 rounded-md border border-border bg-background px-3 py-1 text-xs hover:bg-accent"
 					>
 						Restart <code className="ml-1 font-mono">{tab.spec.cmd.join(' ')}</code>
 					</button>
 				</Centered>
-			);
-		}
-		if (tab.status === 'error') {
-			return (
-				<Centered
-					text={`Failed to spawn: ${tab.spec.cmd.join(' ')}`}
-					className="text-destructive"
-				/>
 			);
 		}
 		return <Centered text={`Spawning ${tab.spec.cmd.join(' ')}…`} />;
