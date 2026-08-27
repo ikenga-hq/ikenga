@@ -1,0 +1,43 @@
+# `ikenga-server` lives in its own crate, NOT as a second `[[bin]]` of
+# `ikenga-desktop`, and that separation is load-bearing rather than cosmetic.
+#
+# Tauri's bundler enumerates every `[[bin]]` target of the Tauri crate and
+# copies each one into the app bundle. There is no config to opt a binary out
+# (tauri-apps/tauri discussion #7592). While this daemon was a second `[[bin]]`
+# it was silently shipped inside every .app / .deb / .AppImage / .exe — and on
+# `universal-apple-darwin` it broke the release outright, because Tauri `lipo`s
+# only the MAIN binary into the universal target dir, so the bundler then went
+# looking for a `target/universal-apple-darwin/release/ikenga-server` that was
+# never created:
+#
+#     failed to bundle project: Failed to copy binary from
+#     ".../universal-apple-darwin/release/ikenga-server": does not exist
+#
+# That is what left v0.7.3 a draft with 7 of 10 assets. As its own crate the
+# bundler never sees it, and the daemon ships the way it is actually deployed —
+# built by `scripts/server/deploy.sh` and run under systemd on its own host.
+#
+# Keep this crate free of any dependency on the `desktop` feature: the headless
+# gate in deploy.sh asserts the binary links no GTK/WebKit.
+[package]
+name = "ikenga-server"
+# Kept in lockstep with `ikenga-desktop` by scripts/sync-version.mjs — this is
+# what `ikenga-server --version` reports.
+version = "0.7.3"
+description = "Ikenga headless server daemon"
+authors = ["Ikenga"]
+edition = "2021"
+
+[[bin]]
+name = "ikenga-server"
+path = "src/main.rs"
+
+[dependencies]
+# `default-features = false` drops the `desktop` feature, and with it
+# tauri/wry and the whole GTK/WebKit stack.
+ikenga-desktop = { path = "..", default-features = false }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

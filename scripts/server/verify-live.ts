@@ -8,7 +8,7 @@
  * both compiled clean and passed every offline gate.
  *
  * Usage:
- *   cargo build --bin ikenga-server
+ *   cargo build -p ikenga-server
  *   IKENGA_AUTH_TOKEN=<token> ./src-tauri/target/debug/ikenga-server \
  *     --port 4477 --static-dir ./dist --data-dir /tmp/ikenga-verify
  *   IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \

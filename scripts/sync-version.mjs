@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Propagate the package.json version (bumped by `changeset version`) into the
-// other two places Tauri reads it: src-tauri/tauri.conf.json and Cargo.toml,
+// other places Tauri and the daemon read it: src-tauri/tauri.conf.json and Cargo.toml,
 // plus the ikenga-desktop entry in Cargo.lock. Run via `bun run changeset:version`.
 //
 // This is the "3-file problem" that made manual shell version bumps error-prone
@@ -32,6 +32,21 @@ const edits = [
 		path: 'src-tauri/Cargo.lock',
 		re: /(name = "ikenga-desktop"\nversion = ")[^"]+(")/,
 		label: 'Cargo.lock',
+	},
+	// src-tauri/server/Cargo.toml — the headless daemon is its own crate (it
+	// cannot be a second [[bin]] of the Tauri crate without being bundled into
+	// every desktop artifact), so its version needs propagating too. This is
+	// what `ikenga-server --version` reports.
+	{
+		path: 'src-tauri/server/Cargo.toml',
+		re: /^(version\s*=\s*")[^"]+(")/m,
+		label: 'server/Cargo.toml',
+	},
+	// Cargo.lock — the ikenga-server package entry
+	{
+		path: 'src-tauri/Cargo.lock',
+		re: /(name = "ikenga-server"\nversion = ")[^"]+(")/,
+		label: 'Cargo.lock (ikenga-server)',
 	},
 ];
 

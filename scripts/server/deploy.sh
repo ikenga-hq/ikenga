@@ -19,12 +19,18 @@ fi
 # an explicit TARGET this builds for the machine running the script — deploying
 # from a macOS or Windows laptop then ships a binary the Linux server cannot
 # execute, and the only symptom is "Exec format error" at systemd start.
+# `-p ikenga-server` builds the daemon crate (src-tauri/server/), which is a
+# workspace member rather than a `[[bin]]` of the Tauri crate — that is what
+# keeps it out of every desktop bundle. `--no-default-features` is no longer
+# passed or needed: the crate has no features of its own, and its dependency on
+# `ikenga-desktop` already pins `default-features = false`, so no GTK/WebKit is
+# reachable. The ldd gate below still proves that rather than assuming it.
 TARGET="${TARGET:-}"
 if [[ -n "$TARGET" ]]; then
-  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server" "--no-default-features" "--target" "$TARGET")
+  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "-p" "ikenga-server" "--target" "$TARGET")
   BIN_DIR="$SHELL_DIR/src-tauri/target/$TARGET/$PROFILE"
 else
-  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "--bin" "ikenga-server" "--no-default-features")
+  CARGO_FLAGS=("--manifest-path" "$SHELL_DIR/src-tauri/Cargo.toml" "-p" "ikenga-server")
   BIN_DIR="$SHELL_DIR/src-tauri/target/$PROFILE"
   HOST_TRIPLE="$(rustc -vV | awk '/^host: /{print $2}')"
   if [[ "$HOST_TRIPLE" != *linux* ]]; then
