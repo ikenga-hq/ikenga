@@ -1,6 +1,7 @@
 import { listen } from '@tauri-apps/api/event';
 import { Activity, AlertTriangle, Cpu, DollarSign, Gauge, ShieldAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { iykeFetch } from '@/lib/iyke/client';
 
 export interface StatuslineSnapshot {
 	session_id?: string;
@@ -35,7 +36,8 @@ export function CostHud() {
 
 	useEffect(() => {
 		// Initial fetch from backend snapshot REST endpoint if available
-		fetch('http://127.0.0.1:4000/iyke/statusline/snapshot')
+		// Live endpoint + bearer token — see the note in tool-call-feed.tsx.
+		iykeFetch('/iyke/statusline/snapshot')
 			.then((res) => (res.ok ? res.json() : null))
 			.then((data) => {
 				if (data) setSnapshot(data);
@@ -127,7 +129,10 @@ export function CostHud() {
 			{/* Right Section: Cost & Rate Limits */}
 			<div className="flex items-center gap-2 shrink-0">
 				{fiveHourRate !== undefined && (
-					<div className="flex items-center gap-1 text-zinc-400 text-[10px]" title="5-hour rate limit used">
+					<div
+						className="flex items-center gap-1 text-zinc-400 text-[10px]"
+						title="5-hour rate limit used"
+					>
 						<ShieldAlert className="h-2.5 w-2.5 text-zinc-400" />
 						<span>5h: {Math.round(fiveHourRate)}%</span>
 					</div>

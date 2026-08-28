@@ -18,6 +18,7 @@ pub mod browser_sessions;
 pub mod claude;
 pub mod comments;
 pub mod handlers;
+pub mod hook_settings;
 pub mod hooks;
 pub mod ide;
 pub mod layout;
@@ -93,6 +94,11 @@ pub struct Endpoint {
     pub url: String,
     pub token: String,
     pub port: u16,
+    /// Absolute path to the `--settings` file Ikenga hands `claude` so its
+    /// hooks + statusline reach this bridge (see `iyke::hook_settings`).
+    /// `None` if the file could not be written — the terminal wrapper then
+    /// simply omits `--settings` rather than launching a broken session.
+    pub hooks_settings_path: Option<String>,
 }
 
 /// Live runtime handle. Held by Tauri-managed state so its `Drop` impl
@@ -103,6 +109,7 @@ pub struct IykeRuntime {
     pub token: String,
     pub port: u16,
     pub control_path: PathBuf,
+    pub hooks_settings_path: Option<PathBuf>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -112,6 +119,10 @@ impl IykeRuntime {
             url: self.url.clone(),
             token: self.token.clone(),
             port: self.port,
+            hooks_settings_path: self
+                .hooks_settings_path
+                .as_ref()
+                .and_then(|p| p.to_str().map(str::to_string)),
         }
     }
 }
@@ -120,6 +131,11 @@ impl Drop for IykeRuntime {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
+        }
+        if let Some(p) = self.hooks_settings_path.as_ref() {
+            if p.exists() {
+                let _ = std::fs::remove_file(p);
+            }
         }
         if self.control_path.exists() {
             match std::fs::remove_file(&self.control_path) {
@@ -176,6 +192,28 @@ pub async fn start(
     write_control_file(&control_path, port, &token, state.started_at_unix_ms())
         .with_context(|| format!("write {}", control_path.display()))?;
 
+    // The `--settings` document handed to `claude` in Ikenga-launched
+    // terminals. Written HERE, after the server has bound, because the whole
+    // failure mode it replaces (ikenga#149) was a settings file baked with a
+    // placeholder `port: 0`. Writing it at the one point where the real port
+    // and token exist makes that impossible rather than merely unlikely.
+    // Non-fatal: without it the wrapper omits `--settings` and the session
+    // runs normally, just without the shell's live view.
+    let hooks_settings_path = match hook_settings::write(
+        control_path.parent().unwrap_or(Path::new(".")),
+        port,
+        &token,
+    ) {
+        Ok(p) => {
+            log::info!("iyke: wrote {}", p.display());
+            Some(p)
+        }
+        Err(e) => {
+            log::warn!("iyke: could not write claude hook settings (continuing): {e:#}");
+            None
+        }
+    };
+
     log::info!("iyke: listening on {url} (token {}…)", &token[..8]);
     log::info!("iyke: wrote {}", control_path.display());
 
@@ -184,6 +222,7 @@ pub async fn start(
         token,
         port,
         control_path,
+        hooks_settings_path,
         shutdown: Some(shutdown),
     })
 }

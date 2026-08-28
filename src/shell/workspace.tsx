@@ -4,6 +4,7 @@ import { PkgIframeLayer } from '@/components/pkg/pkg-iframe-layer';
 import { dumpBootTimings, mark } from '@/lib/boot-timing';
 import { initOsFileDrop } from '@/lib/dnd/os-file-drop';
 import { useIykeBridge } from '@/lib/iyke/bridge';
+import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useIykeControlListener } from '@/lib/iyke/control-listener';
 import { useIykeShellSync } from '@/lib/iyke/use-iyke-shell-sync';
 
@@ -58,6 +59,12 @@ export function Workspace() {
 	// Phase A: console + fetch shims, DOM/click/type/key/wait/query-cache
 	// listeners. Mount once at workspace level only.
 	useIykeBridge();
+	// Warm the `--settings` path so the first `claude` terminal already carries
+	// it. `buildAgentArgs` is synchronous, so it can only read a primed value;
+	// unprimed it omits the flag and the session loses the shell's live view.
+	useEffect(() => {
+		void loadClaudeSettingsPath();
+	}, []);
 	// Bidirectional sync between the address bar and the focused pane's
 	// route. Workspace level only — each pane's RouteView memory router
 	// stays an internal detail.

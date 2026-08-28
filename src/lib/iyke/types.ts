@@ -7,6 +7,11 @@ export interface IykeEndpoint {
 	url: string;
 	token: string;
 	port: number;
+	/** Absolute path to the `--settings` file Ikenga hands `claude` so its hooks
+	 *  and statusline reach this bridge. `null` if it could not be written — the
+	 *  terminal wrapper then omits `--settings` rather than launching a session
+	 *  wired to a port that isn't listening. See `iyke::hook_settings` (Rust). */
+	hooks_settings_path: string | null;
 }
 
 export interface IykeAppInfo {
