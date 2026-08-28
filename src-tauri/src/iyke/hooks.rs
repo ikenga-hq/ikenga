@@ -12,18 +12,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::{
-    extract::Query,
-    http::StatusCode,
-    response::IntoResponse,
-    Extension, Json,
-};
+use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
 use crate::commands::db::PaDb;
+use crate::iyke::hook_settings::GATE_HOLD_SECS;
 
 static HOOK_EVENTS_STORE: OnceLock<Arc<Mutex<Vec<HookPayload>>>> = OnceLock::new();
 
@@ -122,7 +118,14 @@ async fn pre_tool_use_gate_enabled(app: &AppHandle, terminal_id: Option<&str>) -
 }
 
 fn mint_request_id() -> String {
-    format!("perm-{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0), rand::random::<u32>())
+    format!(
+        "perm-{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        rand::random::<u32>()
+    )
 }
 
 /// Post route handler: POST /iyke/hooks/event
@@ -166,13 +169,18 @@ pub async fn post_hook_event(
 
         let _ = app.emit("hooks://event", &payload);
 
-        // Hold the hook response open until the human decides, bounded by a
-        // 60s timeout. Fail-closed: a timeout or a `denied` decision returns
-        // `continue: false` so the tool call is not executed.
-        let decision = timeout(Duration::from_secs(60), rx).await;
+        // Hold the hook response open until the human decides, bounded by
+        // `GATE_HOLD_SECS`. That bound is not arbitrary: it must stay strictly
+        // below the `curl --max-time` and the Claude Code hook timeout that
+        // `hook_settings` writes for this event, or curl gives up first, the
+        // decision never reaches Claude Code, and the gate silently passes the
+        // tool call through. See the nesting comment in `hook_settings`.
+        let decision = timeout(Duration::from_secs(GATE_HOLD_SECS), rx).await;
 
         // Clean up the pending request regardless of outcome.
-        let _ = get_held_requests().lock().map(|mut map| map.remove(&request_id));
+        let _ = get_held_requests()
+            .lock()
+            .map(|mut map| map.remove(&request_id));
 
         let allowed = match decision {
             Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
@@ -190,10 +198,29 @@ pub async fn post_hook_event(
             }
         };
 
+        // Deny is expressed as a `PreToolUse` permission decision, NOT as
+        // `continue: false`. `continue: false` stops the entire Claude session
+        // — denying one Bash call would end the conversation. The
+        // `hookSpecificOutput.permissionDecision` field blocks just this tool
+        // call and hands Claude a reason it can respond to.
+        let (permission_decision, reason) = if allowed {
+            ("allow", "Approved in the Ikenga permission inbox.")
+        } else {
+            (
+                "deny",
+                "Denied in the Ikenga permission inbox (or the request timed out).",
+            )
+        };
+
         return (
             StatusCode::OK,
             Json(serde_json::json!({
-                "continue": allowed,
+                "continue": true,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": permission_decision,
+                    "permissionDecisionReason": reason,
+                },
                 "request_id": request_id,
                 "gated": true,
             })),
@@ -273,14 +300,19 @@ mod tests {
         let payload: HookPayload = serde_json::from_str(json_str).expect("parse hook payload");
         assert_eq!(payload.hook_event_name.as_deref(), Some("PreToolUse"));
         assert_eq!(payload.tool_name.as_deref(), Some("Edit"));
-        assert_eq!(payload.tool_input.as_ref().unwrap()["file_path"], "src/main.rs");
+        assert_eq!(
+            payload.tool_input.as_ref().unwrap()["file_path"],
+            "src/main.rs"
+        );
     }
 
     #[test]
     fn held_requests_map_isolated() {
         let map = get_held_requests();
         let (tx, _rx) = oneshot::channel::<HookDecision>();
-        map.lock().unwrap().insert("perm-123".into(), HeldRequest { tx });
+        map.lock()
+            .unwrap()
+            .insert("perm-123".into(), HeldRequest { tx });
         assert!(map.lock().unwrap().contains_key("perm-123"));
     }
 }
