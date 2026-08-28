@@ -94,7 +94,9 @@ describe('WebRemoteTransport.listen', () => {
 		const t = new WebRemoteTransport();
 
 		const seen: unknown[] = [];
-		const off = await t.listen<{ id: string }>('projects:active-changed', (e) => seen.push(e.payload));
+		const off = await t.listen<{ id: string }>('projects:active-changed', (e) =>
+			seen.push(e.payload)
+		);
 
 		t.dispatch('projects:active-changed', { id: 'p1' });
 		expect(seen).toEqual([{ id: 'p1' }]);

@@ -50,7 +50,11 @@ export interface ToolResultRecord {
 	error?: string;
 }
 
-export type TranscriptEvent = UserTurnRecord | AssistantTurnRecord | ToolResultRecord | { type: string; [key: string]: unknown };
+export type TranscriptEvent =
+	| UserTurnRecord
+	| AssistantTurnRecord
+	| ToolResultRecord
+	| { type: string; [key: string]: unknown };
 
 interface TranscriptReplayProps {
 	sessionId: string;
@@ -100,7 +104,8 @@ export function TranscriptReplay({ sessionId }: TranscriptReplayProps) {
 
 				if (rec.type === 'user') {
 					const userRec = rec as UserTurnRecord;
-					const text = userRec.message?.content?.find((c) => c.type === 'text')?.text || 'User prompt';
+					const text =
+						userRec.message?.content?.find((c) => c.type === 'text')?.text || 'User prompt';
 
 					return (
 						<div key={key} className="py-2">
@@ -108,7 +113,11 @@ export function TranscriptReplay({ sessionId }: TranscriptReplayProps) {
 								onClick={() => toggleExpand(key)}
 								className="flex items-center gap-2 cursor-pointer text-sky-400 font-semibold hover:text-sky-300"
 							>
-								{isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+								{isExpanded ? (
+									<ChevronDown className="h-3 w-3" />
+								) : (
+									<ChevronRight className="h-3 w-3" />
+								)}
 								<Terminal className="h-3 w-3" />
 								<span>USER</span>
 								{userRec.timestamp && (
@@ -137,7 +146,11 @@ export function TranscriptReplay({ sessionId }: TranscriptReplayProps) {
 								onClick={() => toggleExpand(key)}
 								className="flex items-center gap-2 cursor-pointer text-purple-400 font-semibold hover:text-purple-300"
 							>
-								{isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+								{isExpanded ? (
+									<ChevronDown className="h-3 w-3" />
+								) : (
+									<ChevronRight className="h-3 w-3" />
+								)}
 								<Code className="h-3 w-3" />
 								<span>ASSISTANT</span>
 								{asstRec.message?.model && (
@@ -195,7 +208,9 @@ export function TranscriptReplay({ sessionId }: TranscriptReplayProps) {
 							<div className="flex items-center gap-1.5 text-emerald-400 font-medium">
 								<Wrench className="h-3 w-3" />
 								<span>Tool Result [{toolRes.toolName || 'tool'}]</span>
-								<span className={`text-[10px] ${toolRes.success ? 'text-emerald-400' : 'text-rose-400'}`}>
+								<span
+									className={`text-[10px] ${toolRes.success ? 'text-emerald-400' : 'text-rose-400'}`}
+								>
 									{toolRes.success ? '✓ success' : '✗ failed'}
 								</span>
 							</div>

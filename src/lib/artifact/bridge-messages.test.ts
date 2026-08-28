@@ -28,7 +28,7 @@ describe('isIkengaHostMessage', () => {
 				[IKENGA_HOST_MSG]: true,
 				v: IKENGA_BRIDGE_VERSION + 1,
 				data: { kind: 'capture' },
-			}),
+			})
 		).toBe(false);
 		// A string version must not coerce past a `===` check.
 		expect(
@@ -36,12 +36,21 @@ describe('isIkengaHostMessage', () => {
 				[IKENGA_HOST_MSG]: true,
 				v: String(IKENGA_BRIDGE_VERSION),
 				data: { kind: 'capture' },
-			}),
+			})
 		).toBe(false);
 	});
 
 	it('rejects junk without throwing', () => {
-		for (const junk of [null, undefined, 0, '', 'ping', [], { data: {} }, { [IKENGA_HOST_MSG]: true, v: 1 }]) {
+		for (const junk of [
+			null,
+			undefined,
+			0,
+			'',
+			'ping',
+			[],
+			{ data: {} },
+			{ [IKENGA_HOST_MSG]: true, v: 1 },
+		]) {
 			expect(isIkengaHostMessage(junk)).toBe(false);
 		}
 	});
@@ -49,7 +58,9 @@ describe('isIkengaHostMessage', () => {
 	it('rejects a null `data` that would otherwise pass a typeof check', () => {
 		// `typeof null === 'object'`, which is exactly how the previous
 		// implementation would have let this through.
-		expect(isIkengaHostMessage({ [IKENGA_HOST_MSG]: true, v: IKENGA_BRIDGE_VERSION, data: null })).toBe(false);
+		expect(
+			isIkengaHostMessage({ [IKENGA_HOST_MSG]: true, v: IKENGA_BRIDGE_VERSION, data: null })
+		).toBe(false);
 	});
 });
 
@@ -58,8 +69,12 @@ describe('isFromExpectedSender', () => {
 	const other = { name: 'other' } as unknown as Window;
 
 	it('accepts only the exact window we expect', () => {
-		expect(isFromExpectedSender({ source: expected } as unknown as MessageEvent, expected)).toBe(true);
-		expect(isFromExpectedSender({ source: other } as unknown as MessageEvent, expected)).toBe(false);
+		expect(isFromExpectedSender({ source: expected } as unknown as MessageEvent, expected)).toBe(
+			true
+		);
+		expect(isFromExpectedSender({ source: other } as unknown as MessageEvent, expected)).toBe(
+			false
+		);
 	});
 
 	it('denies when the expected window is absent', () => {

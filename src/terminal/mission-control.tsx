@@ -58,7 +58,11 @@ export function MissionControl() {
 						className="h-7 w-64 rounded bg-zinc-900 border border-zinc-700 px-2.5 text-[11px] text-zinc-200 focus:outline-none"
 					/>
 
-					<Button size="sm" onClick={handleDispatch} className="h-7 px-3 bg-purple-600 hover:bg-purple-500 text-white text-[11px]">
+					<Button
+						size="sm"
+						onClick={handleDispatch}
+						className="h-7 px-3 bg-purple-600 hover:bg-purple-500 text-white text-[11px]"
+					>
 						<Send className="mr-1 h-3 w-3" /> Dispatch
 					</Button>
 				</div>
@@ -81,7 +85,9 @@ export function MissionControl() {
 
 								<span
 									className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${
-										t.status === 'running' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/40' : 'bg-zinc-800 text-zinc-400'
+										t.status === 'running'
+											? 'bg-emerald-950 text-emerald-400 border border-emerald-800/40'
+											: 'bg-zinc-800 text-zinc-400'
 									}`}
 								>
 									{t.status}

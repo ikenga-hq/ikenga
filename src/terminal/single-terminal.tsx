@@ -2,8 +2,8 @@ import { listen } from '@tauri-apps/api/event';
 import { useEffect, useRef, useState } from 'react';
 import { defaultShellArgv } from '@/lib/platform';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
-import { getClaudeSettingsPathSync } from './claude-settings';
 import { buildClaudeWrappedCmd, type AgentWrapOpts } from './claude-wrap';
+import { buildSpawnOpts } from './spawn-opts';
 import { type HookEventPayload } from './tool-call-feed';
 import { Pty } from './pty-bridge';
 import { attachCapture } from './pty-output-buffer';
@@ -180,48 +180,12 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 function displayCmd(tab: TerminalTab): string[] {
 	if (tab.spec.wrap) {
 		// Show the user the resolved claude invocation (without the bash wrapper chrome).
-		return [tab.spec.wrap.engine ?? 'claude', ...(tab.spec.wrap.prompt ? [tab.spec.wrap.prompt] : [])];
+		return [
+			tab.spec.wrap.engine ?? 'claude',
+			...(tab.spec.wrap.prompt ? [tab.spec.wrap.prompt] : []),
+		];
 	}
 	return tab.spec.cmd;
-}
-
-function buildSpawnOpts(tab: TerminalTab, terminalId: string): {
-	terminalId: string;
-	title: string;
-	cwd: string;
-	cmd: string[];
-	env?: Record<string, string>;
-	label: string;
-	settingsPath?: string;
-} {
-	const base = {
-		terminalId,
-		title: tab.title,
-		cwd: tab.spec.cwd,
-		env: tab.spec.env,
-		label: tab.spec.cmd.join(' '),
-	};
-
-	// Claude terminals are wrapped in a shell script and have a per-terminal
-	// `--settings` file. Rebuild the argv so a restart or respawn can add
-	// `--resume` from the captured claude session id.
-	if (tab.spec.wrap) {
-		const wrap: AgentWrapOpts = {
-			...tab.spec.wrap,
-			terminalId,
-			resumeSessionId: tab.claudeSessionId ?? null,
-		};
-		const cmd = buildClaudeWrappedCmd(wrap);
-		// Only ask Rust to write the settings file if the argv actually carries
-		// `--settings` and we can derive the deterministic per-terminal path.
-		const settingsPath =
-			cmd.some((s) => s.includes('--settings')) &&
-			(tab.spec.wrap.engine ?? 'claude') === 'claude' &&
-			getClaudeSettingsPathSync(terminalId);
-		return { ...base, cmd, settingsPath: settingsPath || undefined };
-	}
-
-	return { ...base, cmd: tab.spec.cmd };
 }
 
 interface CenteredProps {

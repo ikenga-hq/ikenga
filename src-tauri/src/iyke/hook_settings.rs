@@ -48,6 +48,22 @@ use serde_json::json;
 /// `UserPromptSubmit`/`SessionStart` drive context injection; `PreCompact`
 /// drives the compaction guard; `Notification`/`PermissionRequest` drive the
 /// permission inbox; `SessionEnd` closes the session out.
+/// How long the backend parks a held `PreToolUse` response waiting for a human
+/// decision (ikenga#154). Must stay strictly below `GATE_CURL_MAX_TIME_SECS`.
+pub const GATE_HOLD_SECS: u64 = 30;
+
+/// `curl --max-time` for the gateable `PreToolUse` hook. Must outlast the hold
+/// so the decision actually reaches Claude Code, and stay below the hook
+/// timeout so curl is not killed mid-read.
+const GATE_CURL_MAX_TIME_SECS: u32 = 35;
+
+/// Explicit Claude Code hook timeout for `PreToolUse`. Claude Code defaults to
+/// 60s; we set it so the whole chain is declared in one place.
+const GATE_HOOK_TIMEOUT_SECS: u32 = 40;
+
+/// `curl --max-time` for every hook that answers immediately.
+const FAST_HOOK_MAX_TIME_SECS: u32 = 2;
+
 const HOOK_EVENTS: &[&str] = &[
     "PreToolUse",
     "PostToolUse",
@@ -74,17 +90,42 @@ pub fn build_for_terminal(port: u16, token: &str, terminal_id: Option<&str>) -> 
     // `-s` keeps curl quiet on success; `--max-time` matters because a hook
     // that hangs stalls the session, and the shell is a local listener that
     // either answers immediately or is gone (app quit mid-session).
-    let post = |path: &str| {
-        let suffix = terminal_id.map(|t| format!("?terminal={}", t)).unwrap_or_default();
+    //
+    // The budget is NOT uniform, and the ordering is load-bearing. A held
+    // `PreToolUse` gate (ikenga#154) parks the HTTP response for up to
+    // `GATE_HOLD_SECS` while a human decides in the permission inbox, so the
+    // three timeouts must nest strictly:
+    //
+    //     server hold (30s)  <  curl --max-time (35s)  <  hook timeout (40s)
+    //
+    // If curl gives up first it exits non-zero with empty stdout and Claude
+    // Code proceeds with the tool call — the gate silently does nothing. If
+    // Claude Code's own hook timeout fires first it kills curl, same outcome.
+    // Every other hook keeps the tight 2s budget: they answer immediately, and
+    // a slow one there is a stall with nothing to wait for.
+    let post_with = |path: &str, max_time: u32| {
+        let suffix = terminal_id
+            .map(|t| format!("?terminal={}", t))
+            .unwrap_or_default();
         format!(
-            "curl -s --max-time 2 -X POST -H 'Authorization: Bearer {token}' \
+            "curl -s --max-time {max_time} -X POST -H 'Authorization: Bearer {token}' \
 -H 'Content-Type: application/json' --data-binary @- \
 http://127.0.0.1:{port}{path}{suffix}"
         )
     };
+    let post = |path: &str| post_with(path, FAST_HOOK_MAX_TIME_SECS);
 
     let hook_cmd = post("/iyke/hooks/event");
     let hook_block = json!([{ "type": "command", "command": hook_cmd }]);
+
+    // `PreToolUse` is the only gateable event, so it is the only one that gets
+    // the wide budget plus an explicit `timeout` (Claude Code defaults to 60s,
+    // which would outlive curl and leave the hold un-answered).
+    let gate_block = json!([{
+        "type": "command",
+        "command": post_with("/iyke/hooks/event", GATE_CURL_MAX_TIME_SECS),
+        "timeout": GATE_HOOK_TIMEOUT_SECS,
+    }]);
 
     let mut hooks = serde_json::Map::new();
     for event in HOOK_EVENTS {
@@ -92,7 +133,12 @@ http://127.0.0.1:{port}{path}{suffix}"
         // events and a bare hook list for the rest. `PreToolUse` /
         // `PostToolUse` / `PreCompact` are the matcher-shaped ones.
         let value = if matches!(*event, "PreToolUse" | "PostToolUse" | "PreCompact") {
-            json!([{ "matcher": "*", "hooks": hook_block }])
+            let hooks = if *event == "PreToolUse" {
+                &gate_block
+            } else {
+                &hook_block
+            };
+            json!([{ "matcher": "*", "hooks": hooks }])
         } else {
             json!([{ "hooks": hook_block }])
         };
@@ -126,17 +172,17 @@ pub fn write_for_terminal(
     token: &str,
     terminal_id: Option<&str>,
 ) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("create {}", dir.display()))?;
-    let file_name = terminal_id.map(terminal_file_name).unwrap_or_else(|| FILE_NAME.to_string());
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let file_name = terminal_id
+        .map(terminal_file_name)
+        .unwrap_or_else(|| FILE_NAME.to_string());
     let path = dir.join(file_name);
     let data = serde_json::to_vec_pretty(&build_for_terminal(port, token, terminal_id))
         .context("serialize claude hook settings")?;
 
     let tmp = path.with_extension("json.tmp");
     write_private(&tmp, &data)?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("rename {}", path.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
     Ok(path)
 }
 
@@ -164,6 +210,61 @@ mod tests {
     /// The regression that motivated this module: the overlay wrote `port: 0`
     /// and no token, so every hook curl failed. Assert the real values land in
     /// every command string — "a settings file was produced" is not the claim.
+    /// The gate is only real if the three timeouts nest. Devin's first cut of
+    /// ikenga#154 held the response for 60s while the hook curl still carried
+    /// `--max-time 2`, so curl aborted 28 seconds before the human could
+    /// possibly answer, Claude Code saw an empty stdout, and the tool call ran
+    /// anyway. Every test in the suite still passed. Assert the ordering.
+    #[test]
+    fn the_gate_timeouts_nest_so_the_decision_can_actually_arrive() {
+        assert!(
+            (GATE_HOLD_SECS as u32) < GATE_CURL_MAX_TIME_SECS,
+            "curl must outlast the server hold, else the gate silently passes tool calls through"
+        );
+        assert!(
+            GATE_CURL_MAX_TIME_SECS < GATE_HOOK_TIMEOUT_SECS,
+            "Claude Code must not kill curl before it can read the decision"
+        );
+    }
+
+    /// `PreToolUse` is the gateable event and must carry the wide budget plus
+    /// an explicit timeout; every other hook keeps the fast one.
+    #[test]
+    fn only_pre_tool_use_gets_the_gate_budget() {
+        let v = build_for_terminal(44945, "tok-abc123", Some("term-1"));
+
+        let pre = &v["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(pre["timeout"], GATE_HOOK_TIMEOUT_SECS);
+        assert!(
+            pre["command"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("--max-time {GATE_CURL_MAX_TIME_SECS}")),
+            "PreToolUse must outlast the hold: {}",
+            pre["command"]
+        );
+
+        let post = &v["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert!(
+            post["timeout"].is_null(),
+            "only PreToolUse declares a timeout"
+        );
+        assert!(
+            post["command"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("--max-time {FAST_HOOK_MAX_TIME_SECS}")),
+            "non-gateable hooks keep the fast budget: {}",
+            post["command"]
+        );
+
+        let session_start = &v["hooks"]["SessionStart"][0]["hooks"][0];
+        assert!(session_start["command"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--max-time {FAST_HOOK_MAX_TIME_SECS}")));
+    }
+
     #[test]
     fn every_command_carries_the_live_port_and_token() {
         let v = build_for_terminal(44945, "tok-abc123", None);

@@ -117,6 +117,9 @@ pub struct IykeRuntime {
     pub port: u16,
     pub control_path: PathBuf,
     pub app_local_data_dir: PathBuf,
+    /// Absolute path to `~/.claude/ide/<port>.lock`, if we wrote one. Removed
+    /// on drop so a stale lock cannot point `claude` at a dead port.
+    pub ide_lock_path: Option<PathBuf>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -165,6 +168,19 @@ impl Drop for IykeRuntime {
                         "iyke: failed to remove {}: {e}",
                         self.control_path.display()
                     )
+                }
+            }
+        }
+        if let Some(ref ide_lock_path) = self.ide_lock_path {
+            if ide_lock_path.exists() {
+                match std::fs::remove_file(ide_lock_path) {
+                    Ok(()) => log::info!("iyke: removed ide lock {}", ide_lock_path.display()),
+                    Err(e) => {
+                        log::warn!(
+                            "iyke: failed to remove ide lock {}: {e}",
+                            ide_lock_path.display()
+                        )
+                    }
                 }
             }
         }
@@ -222,6 +238,23 @@ pub async fn start(
     // (`claude-hooks-<terminal_id>.json`) so hook events carry the terminal
     // id in their POST URL. See `iyke::hook_settings` and `commands/pty`.
 
+    // Write the IDE discovery lock so `claude --ide` can attach to this bridge.
+    // Failure is non-fatal — the bridge is still usable; discovery just won't work.
+    let ide_lock_path = crate::platform::home_dir()
+        .map(|home| home.join(".claude"))
+        .and_then(|claude_dir| {
+            crate::iyke::ide::write_ide_lock_file(&claude_dir, port, &token)
+                .map(|info| {
+                    log::info!("iyke: wrote ide lock {}", info.lock_path);
+                    PathBuf::from(info.lock_path)
+                })
+                .map_err(|e| {
+                    log::warn!("iyke: failed to write ide lock: {e}");
+                    e
+                })
+                .ok()
+        });
+
     log::info!("iyke: listening on {url} (token {}…)", &token[..8]);
     log::info!("iyke: wrote {}", control_path.display());
 
@@ -231,6 +264,7 @@ pub async fn start(
         port,
         control_path,
         app_local_data_dir,
+        ide_lock_path,
         shutdown: Some(shutdown),
     })
 }

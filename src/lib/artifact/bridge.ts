@@ -341,7 +341,11 @@ function computePosition(el: Element): { x: number; y: number } {
 }
 
 async function capturePng(el: Element): Promise<{ base64: string; width: number; height: number }> {
-	const dataUrl = await domToPng(el as HTMLElement, { scale: 1, backgroundColor: null, timeout: 5000 });
+	const dataUrl = await domToPng(el as HTMLElement, {
+		scale: 1,
+		backgroundColor: null,
+		timeout: 5000,
+	});
 	const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
 	const img = new Image();
 	img.src = dataUrl;
@@ -354,7 +358,11 @@ function isExcludedRoot(el: Element): boolean {
 }
 
 /** Capture a `PickPayload` for an element and mouse location. */
-async function makePickPayload(el: Element, clientX: number, clientY: number): Promise<M.PickPayload> {
+async function makePickPayload(
+	el: Element,
+	clientX: number,
+	clientY: number
+): Promise<M.PickPayload> {
 	const [shot, pos] = await Promise.all([capturePng(el), Promise.resolve(computePosition(el))]);
 	return {
 		selector: deriveSelector(el),
@@ -383,7 +391,9 @@ function setupHostBridge(themeHandle: ThemeHandle): void {
 	let mo: MutationObserver | null = null;
 	let watchingSelectors: string[] = [];
 
-	const editingRef: { current: { el: HTMLElement; selector: string; originalHtml: string } | null } = { current: null };
+	const editingRef: {
+		current: { el: HTMLElement; selector: string; originalHtml: string } | null;
+	} = { current: null };
 
 	function resolvePinRects(selectors: string[]): M.PinResolution[] {
 		return selectors.map((selector) => {
@@ -509,7 +519,10 @@ function setupHostBridge(themeHandle: ThemeHandle): void {
 				stopHover();
 				hoverHandler = (ev: MouseEvent) => {
 					const el = elementFromEventTarget(ev);
-					postToHost({ kind: 'hover', rect: el ? serialiseRect(el.getBoundingClientRect()) : null });
+					postToHost({
+						kind: 'hover',
+						rect: el ? serialiseRect(el.getBoundingClientRect()) : null,
+					});
 				};
 				textClickHandler = (ev: MouseEvent) => {
 					const el = elementFromEventTarget(ev) as HTMLElement | null;

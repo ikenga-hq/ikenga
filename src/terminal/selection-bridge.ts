@@ -21,7 +21,10 @@ export function formatDiagnosticsContext(filePath: string, diagnostics: Diagnost
 	if (!diagnostics || diagnostics.length === 0) return '';
 
 	const items = diagnostics
-		.map((d) => `  - L${d.line} [${d.severity.toUpperCase()}] ${d.message}${d.code ? ` (${d.code})` : ''}`)
+		.map(
+			(d) =>
+				`  - L${d.line} [${d.severity.toUpperCase()}] ${d.message}${d.code ? ` (${d.code})` : ''}`
+		)
 		.join('\n');
 
 	return `Diagnostics for @${filePath}:\n${items}`;

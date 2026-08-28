@@ -10,8 +10,14 @@
  */
 
 import { create } from 'zustand';
-import { ptyTerminalList, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import { ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import { RESUME_TERMINALS_KEY } from '@/lib/shell-profiles';
 import type { AgentWrapOpts } from './claude-wrap';
+import { loadClaudeSettingsPath } from './claude-settings';
+import { Pty } from './pty-bridge';
+import { attachCapture } from './pty-output-buffer';
+import { getPty, registerPty } from './pty-registry';
+import { buildSpawnOpts } from './spawn-opts';
 
 const STORAGE_KEY = 'terminal.tabs';
 const SQL_DB_URL = 'sqlite:ikenga-terminal.sqlite';
@@ -119,37 +125,39 @@ export function stripSecretEnv(
 }
 
 function serialize(tabs: TerminalTab[]): SerializedTab[] {
-	return tabs.map(({
-		id,
-		title,
-		spec,
-		claudeSessionId,
-		status,
-		exitCode,
-		createdAt,
-		owner,
-		wasRunning: prevWasRunning,
-	}) => {
-		const isCurrentlyRunning = status === 'running' || status === 'spawning';
-		const wasRunning = isCurrentlyRunning || Boolean(prevWasRunning);
-		const wrap = spec.wrap
-			? { ...spec.wrap, terminalId: undefined, resumeSessionId: undefined }
-			: undefined;
-		return {
+	return tabs.map(
+		({
 			id,
 			title,
-			// Strip credential-shaped env vars before persisting (ADR-013
-			// §Addendum Decision 3) — the restored tab is a durable on-disk record.
-			spec: { ...spec, env: stripSecretEnv(spec.env), wrap },
+			spec,
 			claudeSessionId,
-			// ptyIds are runtime-only; restored tabs start spawning if previously running, else exited.
-			status: isCurrentlyRunning ? 'exited' : status,
-			wasRunning,
+			status,
 			exitCode,
 			createdAt,
 			owner,
-		};
-	});
+			wasRunning: prevWasRunning,
+		}) => {
+			const isCurrentlyRunning = status === 'running' || status === 'spawning';
+			const wasRunning = isCurrentlyRunning || Boolean(prevWasRunning);
+			const wrap = spec.wrap
+				? { ...spec.wrap, terminalId: undefined, resumeSessionId: undefined }
+				: undefined;
+			return {
+				id,
+				title,
+				// Strip credential-shaped env vars before persisting (ADR-013
+				// §Addendum Decision 3) — the restored tab is a durable on-disk record.
+				spec: { ...spec, env: stripSecretEnv(spec.env), wrap },
+				claudeSessionId,
+				// ptyIds are runtime-only; restored tabs start spawning if previously running, else exited.
+				status: isCurrentlyRunning ? 'exited' : status,
+				wasRunning,
+				exitCode,
+				createdAt,
+				owner,
+			};
+		}
+	);
 }
 
 type SqlDb = {
@@ -267,6 +275,43 @@ function makeId(): string {
 /** Exported for callers that need to mint a tab id before building its argv. */
 export function makeTerminalId(): string {
 	return makeId();
+}
+
+async function readResumeSetting(): Promise<boolean> {
+	try {
+		const v = await settingsGet(RESUME_TERMINALS_KEY);
+		if (v == null) return false;
+		return v === 'true' || v === '1';
+	} catch {
+		return false;
+	}
+}
+
+async function respawnTab(tab: TerminalTab): Promise<void> {
+	// Another render or a concurrent rehydrate may have already spawned this PTY.
+	if (tab.ptyId || getPty(tab.id)) return;
+
+	// Prime the per-terminal `--settings` path so claude terminals wire their
+	// hooks to the live bridge. Failure is non-fatal: the session falls back
+	// to running without live telemetry.
+	await loadClaudeSettingsPath().catch(() => {});
+
+	const spawnOpts = buildSpawnOpts(tab, tab.id);
+	try {
+		const pty = await Pty.spawn(spawnOpts);
+		if (tab.ptyId || getPty(tab.id)) {
+			// Lost the race — another component spawned while we waited.
+			await pty.dispose().catch(() => {});
+			return;
+		}
+		registerPty(tab.id, pty);
+		attachCapture(tab.id, pty);
+		useTerminalStore.getState().setPtyId(tab.id, pty.id);
+		useTerminalStore.getState().setStatus(tab.id, 'running');
+	} catch (err) {
+		console.error('[session-store] auto-respawn failed for', tab.id, err);
+		useTerminalStore.getState().setStatus(tab.id, 'error');
+	}
 }
 
 export const useTerminalStore = create<TerminalState>((set, get) => {
@@ -470,6 +515,19 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 					activeId: restored[0]?.id ?? null,
 					rehydrated: true,
 				});
+
+				// App restart: rehydrate restores previously running tabs in the
+				// 'spawning' state. Respawning here instead of inside SingleTerminal
+				// means unfocused panes also get a PTY immediately, not when the
+				// user switches to them. Skipped when the user turns the setting off.
+				const resume = await readResumeSetting();
+				if (resume) {
+					for (const tab of restored) {
+						if (tab.status === 'spawning') {
+							void respawnTab(tab);
+						}
+					}
+				}
 			} catch (err) {
 				console.warn('[terminal/session-store] rehydrate failed', err);
 				set({ rehydrated: true });

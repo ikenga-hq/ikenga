@@ -17,7 +17,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::pkg::manifest::Package;
+use crate::pkg::manifest::{NavEntry, Package};
 use crate::pkg::registry::Registry;
 
 /// Status badge a pkg can push onto its own activity-bar icon (and, per
@@ -42,11 +42,18 @@ pub struct ActivityBarBadge {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityBarEntry {
     pub pkg_id: String,
+    /// Package display name. Used as the rail label when `ui.nav[0].section`
+    /// is absent, so multi-view packages are identifiable by their own name.
+    pub pkg_name: String,
     pub id: String,
     pub label: String,
     pub icon: Option<String>,
     pub section: Option<String>,
     pub route: String,
+    /// Full manifest `ui.nav` list, surfaced in the pkg-mode sidebar so the
+    /// pkg's views can render with a group heading even before the iframe
+    /// publishes a runtime menu.
+    pub nav: Vec<NavEntry>,
     /// Runtime-set status badge; absent until a pkg calls `host.pkg.setBadge`
     /// (forwarded to `ActivityBarRegistry::set_badge`). Reset to `None` on
     /// every `register()` (fresh install / dev-reload) so a stale badge from
@@ -111,13 +118,22 @@ impl Registry for ActivityBarRegistry {
             None => return Ok(()),
         };
 
+        // Rail label: prefer an explicit group label, then the package's own
+        // display name, then the first view's label. This keeps a multi-view
+        // pkg identifiable in the activity bar instead of being renamed after
+        // its first view (e.g. "Git" rather than "Changes").
+        let pkg_name = pkg.manifest.name.clone();
+        let label = nav.section.clone().unwrap_or_else(|| pkg_name.clone());
+
         let entry = ActivityBarEntry {
             pkg_id: pkg.manifest.id.clone(),
+            pkg_name,
             id: nav.id.clone(),
-            label: nav.label.clone(),
+            label,
             icon: nav.icon.clone(),
             section: nav.section.clone(),
             route: nav.route.clone(),
+            nav: block.nav.clone(),
             badge: None,
         };
 
@@ -243,6 +259,34 @@ mod tests {
                 }),
             )
             .unwrap());
+    }
+
+    #[test]
+    fn rail_label_uses_section_or_pkg_name() {
+        // No section set: the rail label should be the package's own display
+        // name, not the first view's label (e.g. "Git", not "Changes").
+        let reg = ActivityBarRegistry::new();
+        reg.register(&pkg_with("com.ikenga.git", true)).unwrap();
+        let entry = reg.list().into_iter().find(|e| e.pkg_id == "com.ikenga.git").unwrap();
+        assert_eq!(entry.label, "com.ikenga.git");
+        assert_eq!(entry.pkg_name, "com.ikenga.git");
+        assert_eq!(entry.nav.len(), 1);
+    }
+
+    #[test]
+    fn rail_label_prefers_explicit_section() {
+        let mut manifest = pkg_with("com.ikenga.git", true).manifest;
+        if let Some(ui) = manifest.ui.as_mut() {
+            ui.nav[0].section = Some("Git".into());
+        }
+        let pkg = Package {
+            manifest,
+            install_path: std::path::PathBuf::from("/tmp/_unused"),
+        };
+        let reg = ActivityBarRegistry::new();
+        reg.register(&pkg).unwrap();
+        let entry = reg.list().into_iter().find(|e| e.pkg_id == "com.ikenga.git").unwrap();
+        assert_eq!(entry.label, "Git");
     }
 
     #[test]

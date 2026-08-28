@@ -5,7 +5,15 @@
 // a placeholder pointing at the owning Studio (D4). `SingleTerminal` stays
 // ownership-agnostic so Studio can mount it directly without the gate.
 
-import { Activity, ArrowUpRight, ExternalLink, GitBranch, History, ShieldAlert, Undo2 } from 'lucide-react';
+import {
+	Activity,
+	ArrowUpRight,
+	ExternalLink,
+	GitBranch,
+	History,
+	ShieldAlert,
+	Undo2,
+} from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
@@ -135,7 +143,9 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 		);
 	}
 
-	const [sidePaneMode, setSidePaneMode] = useState<'none' | 'replay' | 'feed' | 'ledger' | 'permissions'>('none');
+	const [sidePaneMode, setSidePaneMode] = useState<
+		'none' | 'replay' | 'feed' | 'ledger' | 'permissions'
+	>('none');
 
 	// Popped out into its own window — render the reclaim placeholder, not the
 	// live duplicate (both windows would otherwise drive the same core PTY).
@@ -158,7 +168,11 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 						onClick={() => togglePane('replay')}
 						title={sidePaneMode === 'replay' ? 'Hide Replay' : 'Show Transcript Replay (WP-05)'}
 						aria-label="Toggle Replay"
-						className={sidePaneMode === 'replay' ? 'bg-purple-950/80 text-purple-300 border border-purple-700/50' : ''}
+						className={
+							sidePaneMode === 'replay'
+								? 'bg-purple-950/80 text-purple-300 border border-purple-700/50'
+								: ''
+						}
 					>
 						<History className="h-3.5 w-3.5" />
 					</IconButton>
@@ -167,7 +181,9 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 						onClick={() => togglePane('feed')}
 						title={sidePaneMode === 'feed' ? 'Hide Feed' : 'Show Live Tool-Call Feed (WP-08)'}
 						aria-label="Toggle Tool Feed"
-						className={sidePaneMode === 'feed' ? 'bg-sky-950/80 text-sky-300 border border-sky-700/50' : ''}
+						className={
+							sidePaneMode === 'feed' ? 'bg-sky-950/80 text-sky-300 border border-sky-700/50' : ''
+						}
 					>
 						<Activity className="h-3.5 w-3.5" />
 					</IconButton>
@@ -176,16 +192,26 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 						onClick={() => togglePane('ledger')}
 						title={sidePaneMode === 'ledger' ? 'Hide Git Ledger' : 'Show Git Change Ledger (WP-09)'}
 						aria-label="Toggle Git Ledger"
-						className={sidePaneMode === 'ledger' ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/50' : ''}
+						className={
+							sidePaneMode === 'ledger'
+								? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/50'
+								: ''
+						}
 					>
 						<GitBranch className="h-3.5 w-3.5" />
 					</IconButton>
 
 					<IconButton
 						onClick={() => togglePane('permissions')}
-						title={sidePaneMode === 'permissions' ? 'Hide Permissions' : 'Show Permission Inbox (WP-10)'}
+						title={
+							sidePaneMode === 'permissions' ? 'Hide Permissions' : 'Show Permission Inbox (WP-10)'
+						}
 						aria-label="Toggle Permissions"
-						className={sidePaneMode === 'permissions' ? 'bg-amber-950/80 text-amber-300 border border-amber-700/50' : ''}
+						className={
+							sidePaneMode === 'permissions'
+								? 'bg-amber-950/80 text-amber-300 border border-amber-700/50'
+								: ''
+						}
 					>
 						<ShieldAlert className="h-3.5 w-3.5" />
 					</IconButton>
@@ -202,7 +228,11 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 				</div>
 
 				<div className="flex-1 h-full relative">
-					<SingleTerminal sessionId={sessionId} isFocused={isFocused} nudgeOnAttach={nudgeOnAttach} />
+					<SingleTerminal
+						sessionId={sessionId}
+						isFocused={isFocused}
+						nudgeOnAttach={nudgeOnAttach}
+					/>
 				</div>
 
 				{/* Telemetry & Control Side Panes */}

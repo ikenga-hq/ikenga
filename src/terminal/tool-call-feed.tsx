@@ -93,7 +93,8 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 		listen<HookEventPayload>('hooks://event', (event) => {
 			const payload = event.payload;
 			if (!payload) return;
-			if (sessionId && payload.ikenga_terminal_id && payload.ikenga_terminal_id !== sessionId) return;
+			if (sessionId && payload.ikenga_terminal_id && payload.ikenga_terminal_id !== sessionId)
+				return;
 
 			const id = payload.tool_use_id || `tool-${Date.now()}-${Math.random()}`;
 

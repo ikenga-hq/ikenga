@@ -124,7 +124,10 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 									onSelect={() =>
 										commit({
 											kind: 'terminal',
-											sessionId: createClaudeTerminalSession({ shellTarget: 'wsl', wslDistro: p.distro }),
+											sessionId: createClaudeTerminalSession({
+												shellTarget: 'wsl',
+												wslDistro: p.distro,
+											}),
 										})
 									}
 									Icon={TerminalIcon}

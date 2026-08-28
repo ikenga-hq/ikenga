@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ptyTerminalList, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import { ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
 import { stripSecretEnv, useTerminalStore } from './session-store';
 
 // The store loads the SQL shim lazily on persist; mocking it
@@ -13,9 +13,13 @@ vi.mock('@/lib/transport/sql-shim', () => ({
 	},
 }));
 
-// `rehydrateFromDb` now reconciles against live PTYs.
+// `rehydrateFromDb` now reconciles against live PTYs and may respawn tabs.
 vi.mock('@/lib/tauri-cmd', () => ({
 	ptyTerminalList: vi.fn().mockResolvedValue([]),
+	settingsGet: vi.fn().mockResolvedValue(null),
+	ptySpawn: vi.fn().mockResolvedValue('pty-test'),
+	ptyListen: vi.fn().mockResolvedValue(() => {}),
+	ptyKill: vi.fn().mockResolvedValue(undefined),
 }));
 
 function reset() {
@@ -116,6 +120,7 @@ describe('rehydrateFromDb & auto-resume', () => {
 		expect(tab).toBeDefined();
 		expect(tab?.status).toBe('spawning');
 		expect(tab?.wasRunning).toBe(true);
+		expect(tab?.ptyId).toBeNull();
 	});
 
 	it('keeps manually exited tabs as exited on rehydrate', async () => {
@@ -179,7 +184,44 @@ describe('rehydrateFromDb & auto-resume', () => {
 		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
 
 		vi.mocked(ptyTerminalList).mockResolvedValueOnce([]);
+		vi.mocked(settingsGet).mockResolvedValueOnce('true');
 
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.status).toBe('spawning');
+		expect(tab?.ptyId).toBeNull();
+	});
+
+	it('auto-respawns restored tabs when resume setting is on', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(settingsGet).mockResolvedValueOnce('true');
+
+		// rehydrate sets status to 'spawning' and kicks off respawnTab.
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		// The tab starts as spawning; let the background spawn resolve.
+		expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('spawning');
+		await new Promise((r) => setTimeout(r, 10));
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.status).toBe('running');
+		expect(tab?.ptyId).toBe('pty-test');
+	});
+
+	it('does not auto-respawn when resume setting is off', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(settingsGet).mockResolvedValueOnce('false');
 		await useTerminalStore.getState().rehydrateFromDb();
 
 		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);

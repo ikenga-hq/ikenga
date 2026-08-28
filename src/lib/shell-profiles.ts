@@ -6,6 +6,7 @@ export const DEFAULT_SHELL_KEY = 'terminal.default_shell_id';
 export const CUSTOM_SHELL_KEY = 'terminal.custom_shell_profiles';
 export const AGENT_ENV_KEY = 'terminal.agent_env_kind'; // 'native' | 'wsl'
 export const AGENT_WSL_DISTRO_KEY = 'terminal.agent_wsl_distro';
+export const RESUME_TERMINALS_KEY = 'terminal.resume_on_start';
 
 export function getFallbackProfile(): ShellProfile {
 	if (isWindows) {
