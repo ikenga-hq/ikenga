@@ -5,7 +5,6 @@
 //! `PermissionRequest`, `UserPromptSubmit`, `PreCompact`) on `POST /iyke/hooks/event`,
 //! updates host hook event log, and broadcasts events over `hooks://event`.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
@@ -81,58 +80,6 @@ pub async fn get_hook_events() -> impl IntoResponse {
         .unwrap_or_default();
 
     (StatusCode::OK, Json(events))
-}
-
-/// Configures hook handlers in an overlay settings.json file.
-pub fn configure_overlay_hooks(overlay_dir: &Path, port: u16, token: Option<&str>) -> std::io::Result<()> {
-    let settings_path = overlay_dir.join("settings.json");
-    let mut root: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let auth_header = match token {
-        Some(t) => format!("-H 'Authorization: Bearer {}' ", t),
-        None => String::new(),
-    };
-
-    let hook_cmd = format!(
-        "curl -s -X POST {} -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:{}/iyke/hooks/event",
-        auth_header, port
-    );
-
-    let default_hook_block = serde_json::json!([
-        {
-            "type": "command",
-            "command": hook_cmd
-        }
-    ]);
-
-    let matched_hook_block = serde_json::json!([
-        {
-            "matcher": "*",
-            "hooks": default_hook_block
-        }
-    ]);
-
-    let hooks_map = serde_json::json!({
-        "PreToolUse": matched_hook_block,
-        "PostToolUse": matched_hook_block,
-        "SessionStart": serde_json::json!([{"hooks": default_hook_block}]),
-        "SessionEnd": serde_json::json!([{"hooks": default_hook_block}]),
-        "UserPromptSubmit": serde_json::json!([{"hooks": default_hook_block}]),
-        "Notification": serde_json::json!([{"hooks": default_hook_block}]),
-        "PermissionRequest": serde_json::json!([{"hooks": default_hook_block}])
-    });
-
-    if let Some(obj) = root.as_object_mut() {
-        obj.insert("hooks".to_string(), hooks_map);
-    }
-
-    let serialized = serde_json::to_string_pretty(&root)?;
-    std::fs::write(settings_path, serialized)
 }
 
 #[cfg(test)]
