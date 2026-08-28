@@ -9,11 +9,10 @@ name: Release
 #   ikenga-hq/ikenga-contract  → contract/    (workspace:* in shell)
 #   ikenga-hq/ikenga-tokens    → tokens/      (workspace:* in shell)
 #   ikenga-hq/ikenga-pkgs      → ikenga-pkgs/ (canonical monorepo per ADR-009;
-#                                               builtin pkg dist resolves
-#                                               into here via symlinks, and
-#                                               scripts/build-iyke-mcp.sh
-#                                               bundles from
-#                                               packages/mcp/iyke/)
+#                                               build materializes the engine-cc
+#                                               dist into shell resources, and
+#                                               scripts/build-iyke-mcp.sh bundles
+#                                               from packages/mcp/iyke/)
 #
 # `@ikenga/pkg-engine-claude-code` is consumed from npm (shell pins ^0.2.0),
 # not workspace-linked, since the cutover on 2026-05-18 retired its
@@ -112,17 +111,6 @@ jobs:
 
     steps:
       # ── Checkout shell + sibling workspace repos ────────────────────────────
-      # Windows runners have core.symlinks=false by default; the shell repo
-      # contains a symlink at src-tauri/resources/builtin-pkgs/com.ikenga.
-      # engine-claude-code/dist → ../../../../../ikenga-pkgs/packages/engine/
-      # claude-code/dist. Without this flip, checkout writes the symlink as
-      # a regular file containing the target path string, and Tauri's
-      # resource scan then fails with "resource path … doesn't exist".
-      - name: Enable git symlinks (Windows runner)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        run: git config --global core.symlinks true
-
       - name: Checkout shell
         uses: actions/checkout@v6
         with:
@@ -143,7 +131,8 @@ jobs:
           token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
 
       # Canonical pkg monorepo (ADR-009). Provides:
-      #   - The engine-cc dist that shell's builtin symlink targets.
+      #   - The engine-cc dist that `bun run engine:cc:materialize` copies into
+      #     shell resources.
       #   - The mcp-iyke source that scripts/build-iyke-mcp.sh bundles.
       # NOTE: this is a separate, self-contained pnpm workspace — we do not
       # add its packages to the synthesized outer workspace (pnpm doesn't
@@ -237,12 +226,8 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       # Build the workspace siblings' dist/ output. Each pkg gitignores its
-      # dist (proper convention), and the shell references them through
-      # symlinks under src-tauri/resources/builtin-pkgs/, plus type-import
-      # via the @ikenga/* package mains that point at ./dist. Without this
-      # step the Tauri build fails with:
-      #   resource path `…/builtin-pkgs/com.ikenga.engine-claude-code/dist`
-      #   doesn't exist
+      # dist (proper convention), and the shell type-imports via the
+      # @ikenga/* package mains that point at ./dist.
       - name: Build outer workspace siblings (contract, tokens)
         shell: bash
         run: |
@@ -252,7 +237,7 @@ jobs:
           done
 
       # ikenga-pkgs is its own pnpm workspace. Install + build its members
-      # so the engine-cc dist exists for the symlink target below and
+      # so the engine-cc dist exists for `bun run engine:cc:materialize` and
       # scripts/build-iyke-mcp.sh can bundle from packages/mcp/iyke/.
       - name: Install + build ikenga-pkgs (nested workspace)
         shell: bash
@@ -260,25 +245,6 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm -r build
-
-      # Materialize the engine-cc dist/ inside shell's resources tree.
-      # Locally this is a git-tracked symlink that points at
-      # ikenga-pkgs/packages/engine/claude-code/dist; Windows runners
-      # don't preserve symlinks reliably (even with core.symlinks=true,
-      # actions/checkout creates file-symlinks rather than directory-
-      # junctions). On every CI host we replace the symlink with a real
-      # copy of the freshly-built dist so Tauri's resource scan finds
-      # the files.
-      - name: Materialize engine-cc dist into shell resources
-        shell: bash
-        run: |
-          src="ikenga-pkgs/packages/engine/claude-code/dist"
-          dest="shell/src-tauri/resources/builtin-pkgs/com.ikenga.engine-claude-code/dist"
-          echo "==> $src → $dest"
-          rm -rf "$dest"
-          mkdir -p "$(dirname "$dest")"
-          cp -r "$src" "$dest"
-          ls "$dest"
 
       - name: Build iyke MCP binary
         shell: bash
