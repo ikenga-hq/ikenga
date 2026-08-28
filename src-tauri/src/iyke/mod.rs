@@ -21,6 +21,7 @@ pub mod handlers;
 pub mod hook_settings;
 pub mod hooks;
 pub mod ide;
+pub mod ide_ws;
 pub mod layout;
 pub mod mcp;
 pub mod memory;
@@ -208,6 +209,11 @@ pub async fn start(
 ) -> Result<IykeRuntime> {
     let token = auth::random_token_hex(32);
 
+    // Resolved before `serve` takes ownership of the handle — the lock body
+    // needs the active project's root, and Claude Code reads
+    // `workspaceFolders` to decide which IDE matches the cwd it was started in.
+    let workspace_folders = ide_ws::active_workspace_folders(&pa_db).await;
+
     let (url, port, shutdown) = server::serve(
         state.clone(),
         rpc,
@@ -238,12 +244,21 @@ pub async fn start(
     // (`claude-hooks-<terminal_id>.json`) so hook events carry the terminal
     // id in their POST URL. See `iyke::hook_settings` and `commands/pty`.
 
-    // Write the IDE discovery lock so `claude --ide` can attach to this bridge.
-    // Failure is non-fatal — the bridge is still usable; discovery just won't work.
+    // Write the IDE discovery lock so `claude --ide` can attach to the MCP
+    // WebSocket served at `/` on this same port (see `iyke::ide_ws`). Failure
+    // is non-fatal — the bridge is still usable; discovery just won't work.
+    //
+    // Reap first: `IykeRuntime::Drop` covers the graceful exit, but it does not
+    // run on SIGKILL or a crash, and a stale lock points `claude` at a dead
+    // port. Only our own locks, only when their pid is gone.
     let ide_lock_path = crate::platform::home_dir()
         .map(|home| home.join(".claude"))
         .and_then(|claude_dir| {
-            crate::iyke::ide::write_ide_lock_file(&claude_dir, port, &token)
+            let reaped = crate::iyke::ide::reap_stale_locks(&claude_dir);
+            if reaped > 0 {
+                log::info!("iyke: reaped {reaped} stale ide lock(s)");
+            }
+            crate::iyke::ide::write_ide_lock_file(&claude_dir, port, &token, workspace_folders)
                 .map(|info| {
                     log::info!("iyke: wrote ide lock {}", info.lock_path);
                     PathBuf::from(info.lock_path)
