@@ -1,5 +1,129 @@
 # ikenga-desktop
 
+## 0.8.3
+
+### Patch Changes
+
+- b315b6d: Make `claude --ide` actually work, and stop the IDE lock leaking the bridge token.
+  
+  #155 wired `write_ide_lock_file` into `iyke::start`, but the lock was malformed,
+  world-readable, and pointed at a server that did not exist. Verified end to end
+  against a real `claude --ide` session this time, not by unit test.
+  
+  - **The lock is now the shape Claude Code reads** — `pid`, `workspaceFolders`,
+    `ideName`, `transport: "ws"`, `runningInWindows`, `authToken`, with the port
+    as the file name. It previously wrote `{port, authToken, pid, lock_path}`,
+    which the CLI cannot use.
+  - **Written 0600.** It carries the iyke bridge bearer token and went out at 0644
+    via a plain `fs::write`. `control.json` and the per-terminal hook settings
+    both use an explicit private write for exactly this reason.
+  - **A real MCP-over-WebSocket server** (`iyke::ide_ws`) now answers on the port
+    the lock advertises, authenticating on `x-claude-code-ide-authorization`.
+    Implements `initialize`, `tools/list` and `tools/call` for the tools the shell
+    can honestly answer — `getWorkspaceFolders`, `openFile`, the selection pair
+    and `getDiagnostics` — and returns an explicit error for the rest rather than
+    a plausible-looking empty success.
+  - **The `mcp` subprotocol is selected.** Claude Code sends
+    `Sec-WebSocket-Protocol: mcp` and hangs up ~30ms after the handshake without
+    sending a frame if the server does not select it, so nothing above the
+    handshake can detect the failure.
+  - **Stale locks are reaped at start.** `Drop` does not run on SIGKILL, and a
+    stale lock points `claude` at a dead port. Reaping is narrow: only locks whose
+    `ideName` is ours and whose pid is gone. `kill(pid, 0) == 0` alone was not
+    enough — a live process we do not own fails with `EPERM`, which would have
+    read as dead.
+- 5d3f558: Make the terminal's live view of a Claude session actually receive events —
+  cost HUD, tool-call feed, permission inbox, git ledger (#149).
+  
+  All four are mounted in `shell/panes/views/terminal-view.tsx` and none had ever
+  received a single event, for three independent reasons:
+  
+  1. **Nothing was posting.** The hooks and `statusLine` were installed by the
+     `CLAUDE_CONFIG_DIR` overlay, which hardcoded `port: 0` — so every hook fired
+     `curl … http://127.0.0.1:0/iyke/hooks/event`. The overlay is gone; the wiring
+     now rides `claude --settings <file>`, documented by the CLI as loading
+     *additional* settings, layered over user/project/local rather than replacing
+     them. The user's real `~/.claude` is discovered natively and never written.
+  2. **Nothing could read.** `tool-call-feed.tsx`, `cost-hud.tsx` and
+     `permission-inbox.tsx` each hardcoded `http://127.0.0.1:4000`, a port the
+     bridge has never bound — it takes a dynamic one. They now go through
+     `iykeFetch`, which resolves the live endpoint and bearer token.
+  3. **One route did not exist.** `permission-inbox.tsx` POSTed to
+     `/iyke/hooks/decision`, which was never registered, so the operator's
+     approve/deny 404'd. Added as record-and-broadcast.
+  
+  The settings document is written by `iyke::hook_settings` at bridge start —
+  the one moment the real port and token both exist — beside `control.json`, 0600
+  because it carries a bearer token, and removed alongside it on clean shutdown
+  (a `SIGTERM` skips unwinding and leaves both behind — verified, and identical to
+  `control.json`'s existing behaviour; a stale file only ever points at a dead port,
+  and the wrapper reads the path from the live endpoint, never from disk). A stale port
+  is therefore impossible by construction rather than merely unlikely, and every
+  curl in the document is authenticated. Only terminals Ikenga launches are wired;
+  a `claude` started by hand in a plain shell is untouched.
+  
+  Two limits stated plainly. `/iyke/hooks/decision` is **record-only**: the
+  `PreToolUse` hook has already returned `{"continue": true}` by the time a human
+  sees the request, so it cannot retroactively gate the call — a real gate means
+  holding that response open, which is a separate design. And the IDE lock file
+  (`~/.claude/ide/<port>.lock`) is still unwired; `write_ide_lock_file` only ever
+  got `port: 0` and the literal token `"ikenga-token"`, so IDE discovery has never
+  worked either. Both tracked in #149.
+- b4b45b6: Close the follow-ups left open by the terminal-continuity work: a permission
+  gate that can actually gate, working `claude --ide` discovery, visible parked
+  packages, and an opt-in terminal resume.
+  
+  - **A real `PreToolUse` gate (#154).** `/iyke/hooks/event` now holds the hook
+    response open while a human decides in the permission inbox, opt-in per
+    terminal via `permissions.hold_terminal_<id>` (default off). The three
+    timeouts nest explicitly — server hold 30s < `curl --max-time` 35s < Claude
+    Code hook timeout 40s — because a hold that outlives the hook's own curl is
+    a gate that silently passes every tool call through. Deny is expressed as
+    `hookSpecificOutput.permissionDecision`, not `continue: false`, so denying
+    one tool call does not end the conversation.
+  - **`claude --ide` discovery (#155).** `write_ide_lock_file` is wired into
+    `iyke::start` with the live bridge port and token and removed on shutdown, so
+    a stale lock cannot point `claude` at a dead port. It was previously correct
+    but unreachable, and its only historical caller passed `port: 0` and a
+    placeholder token.
+  - **Parked packages are visible and recoverable (#157).** The activity-bar rail
+    badges a parked pkg instead of showing an entry indistinguishable from a
+    healthy one, and the pkg sidebar surfaces the park reason with a retry.
+    `ActivityBarEntry` now carries the pkg name, so a multi-view pkg is
+    identifiable by its own name rather than by its first `ui.nav` view.
+  - **Opt-in terminal resume (#133).** A default-off `terminal.resume_on_start`
+    setting; when enabled, rehydration respawns previously running tabs including
+    those in unfocused panes, preserving the Claude session id, rather than
+    waiting for someone to look at the pane.
+- 5d3f558: Make Ikenga-launched Claude terminals continuous across refreshes and restarts,
+  and fix hook attribution so each terminal tab sees only its own events.
+  
+  - **Per-terminal hook settings.** The `claude --settings` file is now written at
+    PTY-spawn time (`claude-hooks-<terminalId>.json`) rather than once at bridge
+    start, and every hook/statusline URL carries `?terminal=<id>`. Rust adds
+    `ikenga_terminal_id` to each event, so the tool-call feed, permission inbox,
+    git ledger, and cost HUD can distinguish terminal A from terminal B even when
+    both share the same cwd.
+  - **Refresh reattach.** `rehydrateFromDb` now calls `ptyTerminalList()` before
+    respawning and restores the `ptyId` of any matching live PTY. `SingleTerminal`
+    attaches via the existing atomic `Pty.attach` handshake instead of spawning a
+    duplicate.
+  - **Restart resume.** `SessionStart` hook `session_id` is captured and persisted
+    on the terminal tab. When the tab is later respawned (app restart or manual
+    restart), `claude` is launched with `--resume <session_id>` so the previous
+    conversation returns.
+  - **Statusline per terminal.** The `statusline://snapshot` event and
+    `GET /iyke/statusline/snapshot` endpoint now carry a per-terminal map;
+    `CostHud` filters to the terminal it belongs to.
+  - **Daemon-backed terminals (#102): deferred.** This PR fixes continuity without
+    moving PTYs into the server. Daemon-backed PTYs remain the right long-term
+    architecture for multi-window / remote sessions and will be scoped as a
+    separate work package against #102.
+  - **Package npm dependency materialization (#150).** Registry, local, dev, and
+    iyke installs now run `npm install --omit=dev` for packages that declare a
+    `lifecycle: "long-lived"` MCP server, preventing `ERR_MODULE_NOT_FOUND` on
+    first boot. Falls back to `bun install --production` if npm fails.
+
 ## 0.8.2
 
 ### Patch Changes
