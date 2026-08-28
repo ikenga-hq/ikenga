@@ -42,6 +42,8 @@ pub mod manifest;
 #[cfg(feature = "desktop")]
 pub mod mcp_runtime;
 #[cfg(feature = "desktop")]
+pub mod npm_install;
+#[cfg(feature = "desktop")]
 pub mod permissions_check;
 #[cfg(feature = "desktop")]
 pub mod registries;
@@ -63,6 +65,8 @@ pub use engine_adapter::EngineAdaptersRegistry;
 pub use kernel::{DiscoveredPkg, InstalledSummary, Kernel, KernelStatus, PkgHealthIssue};
 #[cfg(feature = "desktop")]
 pub use lifecycle::SidecarSupervisor;
+#[cfg(feature = "desktop")]
+pub use npm_install::materialize_npm_deps;
 pub use registry::Registry;
 #[cfg(feature = "desktop")]
 pub use source::InstallSource;

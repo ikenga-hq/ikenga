@@ -12,6 +12,15 @@
  * against the terminal's cwd); absolute paths — the common terminal case — pass
  * through untouched, so this works even in attach-mode where no cwd is known.
  *
+ * Wrapped paths are handled. xterm stores a logical row that exceeds the
+ * terminal width as several physical buffer lines, with `isWrapped` set on each
+ * continuation. Scanning one physical line at a time therefore missed exactly
+ * the paths most worth clicking — a long absolute path in a narrow split is
+ * split across rows, and each half is not path-shaped on its own. We rejoin the
+ * logical row first, scan that, then map offsets back to (row, column). An
+ * `ILink.range` may legitimately span rows; xterm renders the underline across
+ * them.
+ *
  * Known limitation: column ranges are computed against the cell string, so a
  * line containing wide (CJK/emoji) glyphs *before* a path can offset the
  * underline by a cell. Paths themselves are ASCII, so the link text and click
@@ -35,6 +44,8 @@ export interface PathSpan {
 
 /** Find path-shaped tokens in one rendered line, with their cell columns.
  *  Exported for unit testing. Includes wall-clock cutoff and balanced paren handling (T-17). */
+const DEADLINE_CHECK_AFTER_TOKENS = 64;
+
 export function scanLineForPaths(line: string): PathSpan[] {
 	if (!line) return [];
 	const out: PathSpan[] = [];
@@ -44,9 +55,19 @@ export function scanLineForPaths(line: string): PathSpan[] {
 
 	const re = /\S+/g;
 	let m: RegExpExecArray | null;
+	let tokensSeen = 0;
 	// biome-ignore lint/suspicious/noAssignInExpressions: standard exec loop
 	while ((m = re.exec(safeLine)) !== null) {
-		if (performance.now() > deadline) break;
+		// The wall-clock budget guards pathological input, so it must not be
+		// consultable until the input is plausibly pathological. Checking it on
+		// token 1 made the function nondeterministic: if the process is
+		// descheduled between setting `deadline` and the first iteration — which
+		// happens routinely under a loaded machine, and reproducibly when the
+		// full test suite runs files in parallel — the loop breaks immediately
+		// and a perfectly ordinary line yields zero paths. On a busy desktop that
+		// is a link provider that silently stops linking. No real line has 64
+		// whitespace-separated tokens before its first path.
+		if (tokensSeen++ >= DEADLINE_CHECK_AFTER_TOKENS && performance.now() > deadline) break;
 
 		let tok = m[0];
 		let start = m.index; // 0-based offset of first char
@@ -140,6 +161,82 @@ export function __clearPathLinkCache(): void {
 }
 
 /**
+ * Cap on how many physical rows we will rejoin into one logical row.
+ *
+ * A pasted blob can wrap over hundreds of rows, and `provideLinks` is called
+ * once per row — rejoining and rescanning the whole thing each time would be
+ * quadratic in the size of the paste. Sixteen rows is ~1900 columns at a
+ * typical width, comfortably more than any real path, and bounds the work.
+ */
+const MAX_WRAPPED_ROWS = 16;
+
+export interface LogicalLine {
+	/** The rejoined text of the whole logical row. */
+	text: string;
+	/** 1-based buffer line number the logical row starts on. */
+	startLine: number;
+	/** Columns per physical row — the modulus for mapping offsets back. */
+	cols: number;
+}
+
+/**
+ * Rejoin the logical row that `bufferLineNumber` belongs to.
+ *
+ * Uses `translateToString(false)` — untrimmed, padded to the full width — for
+ * every segment, because trimming would swallow the cells a wrapped path
+ * continues across and break the offset arithmetic. Trailing pad on the final
+ * row is harmless: it yields no tokens.
+ *
+ * Degrades to today's single-line behaviour when the buffer exposes no
+ * `isWrapped` (or no width), so a terminal that never wraps is unaffected.
+ *
+ * Exported for unit testing.
+ */
+export function readLogicalLine(term: Terminal, bufferLineNumber: number): LogicalLine | null {
+	const buf = term.buffer.active;
+	const at = (n: number) => (n >= 1 ? buf.getLine(n - 1) : undefined);
+
+	const here = at(bufferLineNumber);
+	if (!here) return null;
+
+	// Walk back to the first physical row of this logical row. `isWrapped` on
+	// line N means "N continues N-1", so keep stepping while the CURRENT line
+	// is a continuation.
+	let start = bufferLineNumber;
+	while (start > 1 && at(start)?.isWrapped && bufferLineNumber - start < MAX_WRAPPED_ROWS) {
+		start--;
+	}
+
+	// Walk forward while the NEXT line is a continuation of this one.
+	let end = start;
+	while (end - start + 1 < MAX_WRAPPED_ROWS && at(end + 1)?.isWrapped) {
+		end++;
+	}
+
+	const segments: string[] = [];
+	for (let n = start; n <= end; n++) {
+		const line = at(n);
+		if (!line) break;
+		// Untrimmed for every row but the last, so column math stays exact.
+		segments.push(line.translateToString(n === end));
+	}
+	const text = segments.join('');
+	// `term.cols` is the modulus for offset -> (row, column). Fall back to the
+	// whole length when it is unavailable, which collapses to one row.
+	const cols = term.cols && term.cols > 0 ? term.cols : Math.max(text.length, 1);
+	return { text, startLine: start, cols };
+}
+
+/** Map a 1-based offset in the rejoined logical row back to a buffer cell. */
+export function offsetToCell(offset1: number, logical: LogicalLine): { x: number; y: number } {
+	const zero = offset1 - 1;
+	return {
+		x: (zero % logical.cols) + 1,
+		y: logical.startLine + Math.floor(zero / logical.cols),
+	};
+}
+
+/**
  * Register the file-path link provider on a terminal. Returns a disposable;
  * call it from the host's cleanup. `cwd` resolves relative paths (absolute /
  * `~` paths ignore it). Can be a static string or a dynamic getter function.
@@ -157,13 +254,12 @@ export function registerPathLinks(
 ): IDisposable {
 	return term.registerLinkProvider({
 		provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
-			const line = term.buffer.active.getLine(bufferLineNumber - 1);
-			if (!line) {
+			const logical = readLogicalLine(term, bufferLineNumber);
+			if (!logical) {
 				callback(undefined);
 				return;
 			}
-			const text = line.translateToString(true);
-			const spans = scanLineForPaths(text);
+			const spans = scanLineForPaths(logical.text);
 			if (spans.length === 0) {
 				callback(undefined);
 				return;
@@ -177,9 +273,10 @@ export function registerPathLinks(
 						if (!path) return; // not on disk — prose, not a path
 						links.push({
 							text: span.text,
+							// May span rows when the path wraps — that is the point.
 							range: {
-								start: { x: span.startX, y: bufferLineNumber },
-								end: { x: span.endX, y: bufferLineNumber },
+								start: offsetToCell(span.startX, logical),
+								end: offsetToCell(span.endX, logical),
 							},
 							decorations: { pointerCursor: true, underline: true },
 							activate: () => {

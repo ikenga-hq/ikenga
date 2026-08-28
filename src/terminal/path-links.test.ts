@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fsExists } from '@/lib/tauri-cmd';
-import { __clearPathLinkCache, registerPathLinks, scanLineForPaths } from './path-links';
+import {
+	__clearPathLinkCache,
+	offsetToCell,
+	readLogicalLine,
+	registerPathLinks,
+	scanLineForPaths,
+} from './path-links';
 
 vi.mock('@/lib/tauri-cmd', () => ({ fsExists: vi.fn() }));
 vi.mock('@/lib/panes/pane-store', () => ({
@@ -166,5 +172,173 @@ describe('registerPathLinks — decorates only what exists on disk', () => {
 		expect(afterFirst).toBeGreaterThan(0); // guard: the mock is actually exercised
 		await term.getLinks();
 		expect(vi.mocked(fsExists).mock.calls.length).toBe(afterFirst);
+	});
+});
+
+// ── Wrapped rows ────────────────────────────────────────────────────────────
+//
+// xterm splits a logical row wider than the terminal into several physical
+// buffer lines, flagging each continuation with `isWrapped`. Scanning one
+// physical line at a time missed exactly the paths most worth clicking: a long
+// absolute path in a narrow split, whose halves are not path-shaped alone.
+
+/** Fake buffer of physical rows, each `cols` wide, wrapped as marked. */
+function wrappedTerm(rows: { text: string; isWrapped: boolean }[], cols: number) {
+	let provider: {
+		provideLinks: (y: number, cb: (links: unknown[] | undefined) => void) => void;
+	} | null = null;
+	return {
+		cols,
+		buffer: {
+			active: {
+				getLine: (i: number) => {
+					const r = rows[i];
+					if (!r) return undefined;
+					return {
+						isWrapped: r.isWrapped,
+						// Untrimmed rows are padded to full width, as xterm does.
+						translateToString: (trim: boolean) =>
+							trim ? r.text.replace(/\s+$/, '') : r.text.padEnd(cols, ' '),
+					};
+				},
+			},
+		},
+		registerLinkProvider(p: typeof provider) {
+			provider = p;
+			return { dispose() {} };
+		},
+		getLinks(y: number): Promise<{ text: string; range: unknown }[]> {
+			return new Promise((resolve) => {
+				provider?.provideLinks(y, (links) =>
+					resolve((links ?? []) as { text: string; range: unknown }[])
+				);
+			});
+		},
+	};
+}
+
+describe('readLogicalLine — rejoins wrapped rows', () => {
+	it('joins forward from the first row of a wrapped run', () => {
+		const term = wrappedTerm(
+			[
+				{ text: 'see /repo/sr', isWrapped: false },
+				{ text: 'c/index.ts n', isWrapped: true },
+				{ text: 'ow', isWrapped: true },
+			],
+			12
+		);
+		const logical = readLogicalLine(term as never, 1);
+		expect(logical?.startLine).toBe(1);
+		expect(logical?.text).toBe('see /repo/src/index.ts now');
+	});
+
+	it('walks BACK to the logical start when handed a continuation row', () => {
+		const term = wrappedTerm(
+			[
+				{ text: 'see /repo/sr', isWrapped: false },
+				{ text: 'c/index.ts n', isWrapped: true },
+				{ text: 'ow', isWrapped: true },
+			],
+			12
+		);
+		// xterm calls provideLinks for every row of the run, including row 2.
+		const logical = readLogicalLine(term as never, 2);
+		expect(logical?.startLine).toBe(1);
+		expect(logical?.text).toBe('see /repo/src/index.ts now');
+	});
+
+	it('does not swallow the following unwrapped row', () => {
+		const term = wrappedTerm(
+			[
+				{ text: 'aaaaaaaaaaaa', isWrapped: false },
+				{ text: 'bbb', isWrapped: true },
+				{ text: 'a separate line', isWrapped: false },
+			],
+			12
+		);
+		expect(readLogicalLine(term as never, 1)?.text).toBe('aaaaaaaaaaaabbb');
+	});
+});
+
+describe('offsetToCell', () => {
+	it('maps an offset past the wrap onto the next row', () => {
+		const logical = { text: 'x'.repeat(30), startLine: 5, cols: 12 };
+		expect(offsetToCell(1, logical)).toEqual({ x: 1, y: 5 });
+		expect(offsetToCell(12, logical)).toEqual({ x: 12, y: 5 });
+		expect(offsetToCell(13, logical)).toEqual({ x: 1, y: 6 });
+		expect(offsetToCell(25, logical)).toEqual({ x: 1, y: 7 });
+	});
+});
+
+describe('registerPathLinks — wrapped paths', () => {
+	beforeEach(() => {
+		__clearPathLinkCache();
+		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+	});
+
+	it('linkifies a path split across a wrap, with a range spanning both rows', async () => {
+		const term = wrappedTerm(
+			[
+				{ text: 'see /repo/sr', isWrapped: false },
+				{ text: 'c/index.ts', isWrapped: true },
+			],
+			12
+		);
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks(1);
+		expect(links.map((l) => l.text)).toEqual(['/repo/src/index.ts']);
+		// '/repo/src/index.ts' starts at offset 5 -> row 1 col 5, and ends at
+		// offset 22 -> row 2 col 10. A single-line scan could never produce this.
+		expect(links[0].range).toEqual({ start: { x: 5, y: 1 }, end: { x: 10, y: 2 } });
+	});
+
+	it('returns the same link when asked about the continuation row', async () => {
+		const term = wrappedTerm(
+			[
+				{ text: 'see /repo/sr', isWrapped: false },
+				{ text: 'c/index.ts', isWrapped: true },
+			],
+			12
+		);
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks(2);
+		expect(links.map((l) => l.text)).toEqual(['/repo/src/index.ts']);
+	});
+
+	it('proves the regression: each half alone is not path-shaped', async () => {
+		// Guard against a future "optimisation" that drops the rejoin.
+		expect(scanLineForPaths('see /repo/sr').map((s) => s.text)).toEqual(['/repo/sr']);
+		const term = wrappedTerm([{ text: 'see /repo/sr', isWrapped: false }], 12);
+		registerPathLinks(term as never, '/repo');
+		// '/repo/sr' is not on disk, so the truncated half yields nothing.
+		expect(await term.getLinks(1)).toEqual([]);
+	});
+});
+
+describe('scanLineForPaths — the wall-clock budget must not eat ordinary lines', () => {
+	it('still finds paths when the budget is already blown on entry', () => {
+		// Simulates a descheduled process: every clock read is far past any
+		// deadline. Before the token threshold this returned [] for a 43-char
+		// line, which is how two tests failed only under full-suite parallelism.
+		const realNow = performance.now;
+		performance.now = () => 1e12;
+		try {
+			const spans = scanLineForPaths('› [image] /tmp/v1-list-detail.png (145.3KB)');
+			expect(spans.map((s) => s.text)).toEqual(['/tmp/v1-list-detail.png']);
+		} finally {
+			performance.now = realNow;
+		}
+	});
+
+	it('still bails out on pathological input', () => {
+		const realNow = performance.now;
+		performance.now = () => 1e12;
+		try {
+			// 2000 tokens, well past the 64-token grace — the guard must engage.
+			const spans = scanLineForPaths(Array(2000).fill('a/b.ts').join(' '));
+			expect(spans.length).toBeLessThan(2000);
+		} finally {
+			performance.now = realNow;
+		}
 	});
 });

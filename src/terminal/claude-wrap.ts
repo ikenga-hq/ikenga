@@ -10,12 +10,15 @@
  */
 
 import { isWindows } from '@/lib/platform';
+import { getClaudeSettingsPathSync } from './claude-settings';
 
 export type AgentEngineKind = 'claude' | 'antigravity' | 'codex' | 'gemini';
 
 export interface AgentWrapOpts {
 	/** AI engine to launch. Defaults to 'claude'. */
 	engine?: AgentEngineKind;
+	/** Ikenga terminal id. Used to derive the per-terminal `--settings` file. */
+	terminalId?: string | null;
 	/** Session/conversation id to resume. Omit to start a fresh session. */
 	resumeSessionId?: string | null;
 	/** Initial prompt — passed as a positional arg so the agent starts an
@@ -72,6 +75,26 @@ export function buildAgentArgs(opts: AgentWrapOpts): string[] {
 		case 'claude':
 		default: {
 			const args = ['claude', '--dangerously-skip-permissions'];
+			// Hand claude the settings document that points its hooks and
+			// statusline at THIS app's iyke bridge, so the cost HUD, tool-call
+			// feed, permission inbox and git ledger receive events.
+			//
+			// `--settings` and not `CLAUDE_CONFIG_DIR`: the CLI documents it as
+			// loading *additional* settings, layered on top of user/project/local
+			// rather than replacing them. So the user's real `~/.claude.json`,
+			// credentials, skills, agents, commands and MCP servers are discovered
+			// natively and never written to — which is exactly what the overlay
+			// this replaces got wrong (ikenga#149).
+			//
+			// Per-terminal: the file name includes the Ikenga terminal id so hook
+			// events can be attributed to the terminal they came from. The file
+			// content is written by Rust at PTY-spawn time; here we only build the
+			// deterministic path so `claude --settings` sees it when it execs.
+			//
+			// Omitted when unprimed or unwritable: better a session with no live
+			// view than one wired to a port that isn't listening.
+			const settingsPath = getClaudeSettingsPathSync(opts.terminalId ?? undefined);
+			if (settingsPath) args.push('--settings', settingsPath);
 			if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 			if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
 			if (opts.model) args.push('--model', opts.model);

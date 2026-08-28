@@ -1,6 +1,10 @@
-//! Claude Code hook installer & receiver handlers (WP-07).
+//! Claude Code hook receiver handlers (WP-07).
 //!
-//! Auto-configures hook handlers in overlay settings.json, receives live event
+//! The hooks are installed by `iyke::hook_settings`, which builds the
+//! `--settings` document Ikenga hands `claude` in the terminals it launches.
+//! (It used to be an overlay `settings.json` written with a placeholder
+//! `port: 0`, so nothing here ever received an event — see ikenga#149.)
+//! Receives live event
 //! callbacks (`PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd`, `Notification`,
 //! `PermissionRequest`, `UserPromptSubmit`, `PreCompact`) on `POST /iyke/hooks/event`,
 //! updates host hook event log, and broadcasts events over `hooks://event`.
@@ -8,6 +12,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
@@ -23,6 +28,8 @@ fn get_events_store() -> &'static Arc<Mutex<Vec<HookPayload>>> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookPayload {
+    #[serde(default, rename = "ikenga_terminal_id")]
+    pub ikenga_terminal_id: Option<String>,
     #[serde(default, rename = "hook_event_name")]
     pub hook_event_name: Option<String>,
     #[serde(default, rename = "session_id")]
@@ -49,11 +56,23 @@ pub struct HookPayload {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookEventQuery {
+    pub terminal: Option<String>,
+}
+
 /// Post route handler: POST /iyke/hooks/event
 pub async fn post_hook_event(
     Extension(app): Extension<AppHandle>,
-    Json(payload): Json<HookPayload>,
+    Query(query): Query<HookEventQuery>,
+    Json(mut payload): Json<HookPayload>,
 ) -> impl IntoResponse {
+    // The query parameter is authoritative: the settings file is generated
+    // per-terminal and the URL it POSTs to carries `?terminal=<id>`.
+    if payload.ikenga_terminal_id.is_none() {
+        payload.ikenga_terminal_id = query.terminal.clone();
+    }
+
     if let Ok(mut store) = get_events_store().lock() {
         store.push(payload.clone());
         if store.len() > 200 {
@@ -68,6 +87,39 @@ pub async fn post_hook_event(
         Json(serde_json::json!({
             "continue": true
         })),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookDecision {
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// `approved` | `denied`.
+    pub decision: String,
+}
+
+/// Post route handler: POST /iyke/hooks/decision
+///
+/// The permission inbox (`shell/src/terminal/permission-inbox.tsx`) posts the
+/// operator's approve/deny here. RECORD-ONLY today, deliberately: the hook that
+/// produced the request already returned `{"continue": true}` by the time a
+/// human sees it, so this cannot retroactively gate the tool call. It exists so
+/// the decision is captured and broadcast rather than dropped on the floor —
+/// which is what it was doing, since this route did not exist at all and the
+/// frontend's POST 404'd.
+///
+/// Turning this into a real gate means holding the `PreToolUse` response open
+/// until a decision arrives (Claude Code honours `{"continue": false}` and a
+/// permission decision in the hook's stdout), bounded by the hook timeout. That
+/// is a separate design — see ikenga#149.
+pub async fn post_hook_decision(
+    Extension(app): Extension<AppHandle>,
+    Json(decision): Json<HookDecision>,
+) -> impl IntoResponse {
+    let _ = app.emit("hooks://decision", &decision);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "recorded": true, "gated": false })),
     )
 }
 

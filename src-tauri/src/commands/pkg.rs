@@ -75,6 +75,7 @@ pub async fn pkg_install_from_path(
     let kernel_arc = kernel.0.clone();
     let path_for_kernel = path.clone();
     let installed = tokio::task::spawn_blocking(move || {
+        crate::pkg::materialize_npm_deps(&path_for_kernel)?;
         kernel_arc.install_from_path(&path_for_kernel, source, project_id)
     })
     .await
@@ -568,6 +569,7 @@ async fn install_from_registry_inner(
         publisher_key: args.publisher_key,
     };
     let installed = tokio::task::spawn_blocking(move || {
+        crate::pkg::materialize_npm_deps(&final_dir_for_kernel)?;
         kernel.install_from_path(&final_dir_for_kernel, source, project_id)
     })
     .await

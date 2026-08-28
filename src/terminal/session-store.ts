@@ -10,6 +10,8 @@
  */
 
 import { create } from 'zustand';
+import { ptyTerminalList, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import type { AgentWrapOpts } from './claude-wrap';
 
 const STORAGE_KEY = 'terminal.tabs';
 const SQL_DB_URL = 'sqlite:ikenga-terminal.sqlite';
@@ -28,7 +30,10 @@ export type TerminalOwner =
 export interface TerminalTab {
 	id: string;
 	title: string;
-	spec: { cwd: string; cmd: string[]; env?: Record<string, string> };
+	spec: { cwd: string; cmd: string[]; env?: Record<string, string>; wrap?: AgentWrapOpts };
+	/** Claude session id captured from the `SessionStart` hook. Used to resume
+	 *  the conversation after an app restart. */
+	claudeSessionId?: string | null;
 	ptyId: string | null;
 	status: 'spawning' | 'running' | 'exited' | 'error';
 	exitCode: number | null;
@@ -42,12 +47,13 @@ interface TerminalState {
 	activeId: string | null;
 	rehydrated: boolean;
 
-	add: (spec: TerminalTab['spec'], title?: string) => string;
+	add: (spec: TerminalTab['spec'], title?: string, id?: string) => string;
 	setActive: (id: string) => void;
 	remove: (id: string) => void;
 	rename: (id: string, title: string) => void;
 	setPtyId: (id: string, ptyId: string | null) => void;
 	setStatus: (id: string, status: TerminalTab['status'], exitCode?: number | null) => void;
+	setClaudeSessionId: (id: string, sessionId: string | null) => void;
 	updateCwd: (id: string, cwd: string) => void;
 
 	/** Attempt to attach `tabId` to an Artifact Studio pane. If the tab is
@@ -76,6 +82,7 @@ interface SerializedTab {
 	id: string;
 	title: string;
 	spec: TerminalTab['spec'];
+	claudeSessionId?: string | null;
 	status: TerminalTab['status'];
 	wasRunning?: boolean;
 	exitCode: number | null;
@@ -112,15 +119,29 @@ export function stripSecretEnv(
 }
 
 function serialize(tabs: TerminalTab[]): SerializedTab[] {
-	return tabs.map(({ id, title, spec, status, exitCode, createdAt, owner, wasRunning: prevWasRunning }) => {
+	return tabs.map(({
+		id,
+		title,
+		spec,
+		claudeSessionId,
+		status,
+		exitCode,
+		createdAt,
+		owner,
+		wasRunning: prevWasRunning,
+	}) => {
 		const isCurrentlyRunning = status === 'running' || status === 'spawning';
 		const wasRunning = isCurrentlyRunning || Boolean(prevWasRunning);
+		const wrap = spec.wrap
+			? { ...spec.wrap, terminalId: undefined, resumeSessionId: undefined }
+			: undefined;
 		return {
 			id,
 			title,
 			// Strip credential-shaped env vars before persisting (ADR-013
 			// §Addendum Decision 3) — the restored tab is a durable on-disk record.
-			spec: { ...spec, env: stripSecretEnv(spec.env) },
+			spec: { ...spec, env: stripSecretEnv(spec.env), wrap },
+			claudeSessionId,
 			// ptyIds are runtime-only; restored tabs start spawning if previously running, else exited.
 			status: isCurrentlyRunning ? 'exited' : status,
 			wasRunning,
@@ -243,6 +264,11 @@ function makeId(): string {
 	return `tab-${Date.now()}-${nextSeq}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** Exported for callers that need to mint a tab id before building its argv. */
+export function makeTerminalId(): string {
+	return makeId();
+}
+
 export const useTerminalStore = create<TerminalState>((set, get) => {
 	const persistDebounced = debounce(() => {
 		void writePersisted(serialize(get().tabs));
@@ -253,10 +279,10 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		activeId: null,
 		rehydrated: false,
 
-		add: (spec, title) => {
-			const id = makeId();
+		add: (spec, title, id) => {
+			const tabId = id ?? makeId();
 			const tab: TerminalTab = {
-				id,
+				id: tabId,
 				title: title ?? spec.cmd[0] ?? 'shell',
 				spec,
 				ptyId: null,
@@ -265,9 +291,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 				createdAt: Date.now(),
 				owner: { kind: 'sidepane' },
 			};
-			set((s) => ({ tabs: [...s.tabs, tab], activeId: id }));
+			set((s) => ({ tabs: [...s.tabs, tab], activeId: tabId }));
 			persistDebounced();
-			return id;
+			return tabId;
 		},
 
 		setActive: (id) => {
@@ -336,6 +362,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 			persistDebounced();
 		},
 
+		setClaudeSessionId: (id, sessionId) => {
+			set((s) => ({
+				tabs: s.tabs.map((t) => (t.id === id ? { ...t, claudeSessionId: sessionId } : t)),
+			}));
+			persistDebounced();
+		},
+
 		updateCwd: (id, cwd) => {
 			set((s) => ({
 				tabs: s.tabs.map((t) => (t.id === id ? { ...t, spec: { ...t.spec, cwd } } : t)),
@@ -391,9 +424,32 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		rehydrateFromDb: async () => {
 			try {
 				const persisted = await readPersisted();
+
+				// On a webview reload the Tauri process (and its PTYs) survive.
+				// Reconcile against the live PTY list before deciding to respawn.
+				let liveByTerminalId: Map<string, TerminalDescriptor> | null = null;
+				try {
+					const live = await ptyTerminalList();
+					liveByTerminalId = new Map(live.map((d) => [d.terminal_id, d]));
+				} catch (err) {
+					console.warn('[terminal/session-store] ptyTerminalList failed during rehydrate', err);
+				}
+
 				const restored: TerminalTab[] = persisted.map((p) => {
 					const shouldAutoRespawn =
 						p.wasRunning ?? (p.status === 'running' || p.status === 'spawning');
+					const live = liveByTerminalId?.get(p.id);
+					if (live && shouldAutoRespawn) {
+						// The PTY survived the refresh: reattach instead of respawning.
+						return {
+							...p,
+							ptyId: live.pty_id,
+							status: 'running',
+							wasRunning: true,
+							exitCode: null,
+							owner: { kind: 'sidepane' },
+						};
+					}
 					return {
 						...p,
 						ptyId: null,

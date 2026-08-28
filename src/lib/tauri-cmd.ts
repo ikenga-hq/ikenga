@@ -37,6 +37,9 @@ export interface PtySpawnOpts {
 	env?: Record<string, string>;
 	rows?: number;
 	cols?: number;
+	/** Absolute path to the per-terminal `claude --settings` file. Rust will
+	 *  write the live hook + statusline wiring here before exec. */
+	settingsPath?: string;
 }
 
 export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
@@ -48,6 +51,7 @@ export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
 		env: opts.env ?? null,
 		rows: opts.rows ?? 24,
 		cols: opts.cols ?? 80,
+		settingsPath: opts.settingsPath ?? null,
 	});
 }
 

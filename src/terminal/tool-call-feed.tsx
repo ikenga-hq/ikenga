@@ -1,8 +1,20 @@
 import { listen } from '@tauri-apps/api/event';
-import { Activity, CheckCircle2, Clock, Code, FileText, Globe, Search, Terminal, XCircle } from 'lucide-react';
+import {
+	Activity,
+	CheckCircle2,
+	Clock,
+	Code,
+	FileText,
+	Globe,
+	Search,
+	Terminal,
+	XCircle,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { iykeFetch } from '@/lib/iyke/client';
 
 export interface HookEventPayload {
+	ikenga_terminal_id?: string;
 	hook_event_name?: string;
 	session_id?: string;
 	transcript_path?: string;
@@ -33,13 +45,17 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 
 	useEffect(() => {
 		// Initial fetch from backend REST endpoint if available
-		fetch('http://127.0.0.1:4000/iyke/hooks/events')
+		// Live endpoint + bearer token. This used to be a hardcoded
+		// `http://127.0.0.1:4000`, which the bridge has never bound — it takes a
+		// dynamic port. So this feed had two independent reasons to stay empty
+		// (ikenga#149): nothing was posting events, and nothing could read them.
+		iykeFetch('/iyke/hooks/events')
 			.then((res) => (res.ok ? res.json() : []))
 			.then((events: HookEventPayload[]) => {
 				if (Array.isArray(events)) {
 					const map = new Map<string, ToolCallEntry>();
 					for (const ev of events) {
-						if (sessionId && ev.session_id && ev.session_id !== sessionId) continue;
+						if (sessionId && ev.ikenga_terminal_id && ev.ikenga_terminal_id !== sessionId) continue;
 						const id = ev.tool_use_id || `ev-${Math.random()}`;
 						if (ev.hook_event_name === 'PreToolUse') {
 							map.set(id, {
@@ -77,7 +93,7 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 		listen<HookEventPayload>('hooks://event', (event) => {
 			const payload = event.payload;
 			if (!payload) return;
-			if (sessionId && payload.session_id && payload.session_id !== sessionId) return;
+			if (sessionId && payload.ikenga_terminal_id && payload.ikenga_terminal_id !== sessionId) return;
 
 			const id = payload.tool_use_id || `tool-${Date.now()}-${Math.random()}`;
 
@@ -137,11 +153,16 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 
 	const getToolIcon = (name: string) => {
 		const lower = name.toLowerCase();
-		if (lower.includes('bash') || lower.includes('command')) return <Terminal className="h-3.5 w-3.5 text-emerald-400" />;
-		if (lower.includes('edit') || lower.includes('write')) return <Code className="h-3.5 w-3.5 text-sky-400" />;
-		if (lower.includes('read') || lower.includes('file')) return <FileText className="h-3.5 w-3.5 text-amber-400" />;
-		if (lower.includes('search') || lower.includes('grep')) return <Search className="h-3.5 w-3.5 text-purple-400" />;
-		if (lower.includes('fetch') || lower.includes('web')) return <Globe className="h-3.5 w-3.5 text-blue-400" />;
+		if (lower.includes('bash') || lower.includes('command'))
+			return <Terminal className="h-3.5 w-3.5 text-emerald-400" />;
+		if (lower.includes('edit') || lower.includes('write'))
+			return <Code className="h-3.5 w-3.5 text-sky-400" />;
+		if (lower.includes('read') || lower.includes('file'))
+			return <FileText className="h-3.5 w-3.5 text-amber-400" />;
+		if (lower.includes('search') || lower.includes('grep'))
+			return <Search className="h-3.5 w-3.5 text-purple-400" />;
+		if (lower.includes('fetch') || lower.includes('web'))
+			return <Globe className="h-3.5 w-3.5 text-blue-400" />;
 		return <Activity className="h-3.5 w-3.5 text-zinc-400" />;
 	};
 

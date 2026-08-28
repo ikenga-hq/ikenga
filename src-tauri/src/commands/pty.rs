@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
+use crate::commands::IykeRuntimeState;
+use crate::iyke::hook_settings;
 use crate::pty::{foreground::ForegroundProcess, PtyManager, SpawnOpts, TerminalDescriptor};
 
 /// Trailing scrollback handed to a window that is attaching to a live PTY,
@@ -25,6 +28,7 @@ pub struct PtyAttachSnapshot {
 pub async fn pty_spawn(
     app: AppHandle,
     manager: State<'_, Arc<PtyManager>>,
+    runtime: State<'_, IykeRuntimeState>,
     terminal_id: Option<String>,
     title: Option<String>,
     cwd: String,
@@ -32,9 +36,45 @@ pub async fn pty_spawn(
     env: Option<HashMap<String, String>>,
     rows: u16,
     cols: u16,
+    settings_path: Option<String>,
 ) -> Result<String, String> {
     if cmd.is_empty() {
         return Err("cmd must contain at least one element".into());
+    }
+
+    // Write the per-terminal claude hook settings file before the child
+    // starts. The file path is deterministic and was already baked into the
+    // argv by the frontend; writing it here means the live port + token land
+    // in `claude`'s hands at the exact moment it reads `--settings`.
+    if let Some(path) = settings_path {
+        if let Some(term_id) = terminal_id.as_deref() {
+            let guard = runtime.lock().await;
+            if let Some(rt) = guard.as_ref() {
+                let expected: PathBuf = rt
+                    .hooks_settings_dir()
+                    .join(hook_settings::terminal_file_name(term_id));
+                if Path::new(&path) == expected {
+                    if let Err(e) = hook_settings::write_for_terminal(
+                        rt.hooks_settings_dir(),
+                        rt.port,
+                        &rt.token,
+                        Some(term_id),
+                    ) {
+                        tracing::warn!("pty_spawn: could not write claude hook settings for {term_id}: {e:#}");
+                    } else {
+                        tracing::info!("pty_spawn: wrote claude hook settings for {term_id}");
+                    }
+                } else {
+                    tracing::warn!(
+                        ?path,
+                        ?expected,
+                        "pty_spawn: settings path mismatch; refusing to write"
+                    );
+                }
+            } else {
+                tracing::warn!("pty_spawn: iyke runtime not ready; skipping hook settings");
+            }
+        }
     }
 
     let opts = SpawnOpts {

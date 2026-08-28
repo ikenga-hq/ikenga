@@ -20,7 +20,8 @@ import {
 } from '@/lib/tauri-cmd';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { buildAgentWrappedCmd } from '@/terminal/claude-wrap';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalStore } from '@/terminal/session-store';
 import { type Archetype, slugifyName } from '@/shell/artifact-wizard/archetypes';
 import { requestOrApplyHandoff } from '@/shell/artifact-wizard/handoff-pref';
@@ -158,12 +159,19 @@ function mountTerminalAgent(args: {
 	archetypeLabel: string;
 	agentLeafId: string;
 }): string {
-	const { cmd, title: agentTitle } = resolveAgentCmd(args.agent);
-	const sessionId = createTerminalSession({
-		cwd: args.cwd,
-		cmd,
-		title: `${agentTitle} · ${args.archetypeLabel.toLowerCase()}`,
-	});
+	const title = `${args.agent.kind} · ${args.archetypeLabel.toLowerCase()}`;
+	let sessionId: string;
+
+	if (args.agent.kind === 'claude') {
+		sessionId = createClaudeTerminalSession({ cwd: args.cwd }, title);
+	} else if (args.agent.kind === 'codex' || args.agent.kind === 'gemini') {
+		const cmd = buildAgentWrappedCmd({ engine: args.agent.kind });
+		sessionId = createTerminalSession({ cwd: args.cwd, cmd, title });
+	} else {
+		const { cmd } = resolveAgentCmd(args.agent);
+		sessionId = createTerminalSession({ cwd: args.cwd, cmd, title });
+	}
+
 	usePaneStore.getState().addTab(args.agentLeafId, {
 		kind: 'terminal',
 		sessionId,

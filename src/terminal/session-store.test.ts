@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ptyTerminalList, type TerminalDescriptor } from '@/lib/tauri-cmd';
 import { stripSecretEnv, useTerminalStore } from './session-store';
 
 // The store loads the SQL shim lazily on persist; mocking it
@@ -10,6 +11,11 @@ vi.mock('@/lib/transport/sql-shim', () => ({
 			throw new Error('sql disabled in tests');
 		},
 	},
+}));
+
+// `rehydrateFromDb` now reconciles against live PTYs.
+vi.mock('@/lib/tauri-cmd', () => ({
+	ptyTerminalList: vi.fn().mockResolvedValue([]),
 }));
 
 function reset() {
@@ -132,6 +138,74 @@ describe('rehydrateFromDb & auto-resume', () => {
 		useTerminalStore.getState().updateCwd(id, '/new/working/dir');
 		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
 		expect(tab?.spec.cwd).toBe('/new/working/dir');
+	});
+
+	it('reconciles live PTYs on rehydrate and marks them running', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		const live: TerminalDescriptor[] = [
+			{
+				terminal_id: id,
+				pty_id: 'pty-123',
+				title: 'bash',
+				label: null,
+				cwd: '/tmp',
+				argv: ['bash'],
+				status: 'running',
+				pid: 42,
+				foreground_command: null,
+				owner_agent_id: null,
+			},
+		];
+		vi.mocked(ptyTerminalList).mockResolvedValueOnce(live);
+
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.status).toBe('running');
+		expect(tab?.ptyId).toBe('pty-123');
+		expect(tab?.wasRunning).toBe(true);
+	});
+
+	it('respawns unmatched running tabs when no live PTY matches', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(ptyTerminalList).mockResolvedValueOnce([]);
+
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.status).toBe('spawning');
+		expect(tab?.ptyId).toBeNull();
+	});
+
+	it('persists and restores claudeSessionId + wrap opts for resume', async () => {
+		const id = useTerminalStore.getState().add({
+			cwd: '/tmp',
+			cmd: ['claude'],
+			wrap: { engine: 'claude', permissionMode: 'plan' },
+		});
+		useTerminalStore.getState().setClaudeSessionId(id, 'sess-789');
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(ptyTerminalList).mockResolvedValueOnce([]);
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab?.claudeSessionId).toBe('sess-789');
+		expect(tab?.spec.wrap).toMatchObject({ engine: 'claude', permissionMode: 'plan' });
+		expect(tab?.status).toBe('spawning');
 	});
 });
 

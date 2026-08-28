@@ -1,8 +1,9 @@
 // Unit tests for buildAgentWrappedCmd & buildClaudeWrappedCmd — the argv builder behind every
 // "open AI agent in a terminal" affordance.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
+import { __setClaudeSettingsPathForTests } from './claude-settings';
 import { buildAgentWrappedCmd, buildClaudeWrappedCmd } from './claude-wrap';
 
 /** Pull the quoted command invocation out of the bash wrapper script so
@@ -151,5 +152,64 @@ describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
 			teammateMode: null,
 		});
 		expect(extractInvocation(cmd)).toBe(`'claude' '--dangerously-skip-permissions'`);
+	});
+});
+
+// ── `--settings` injection (ikenga#149) ──────────────────────────────────────
+//
+// The shell's cost HUD / tool-call feed / permission inbox are fed by Claude
+// Code hooks pointed at the iyke bridge. That wiring used to arrive via a
+// CLAUDE_CONFIG_DIR overlay baked with `port: 0`, so it never worked. It now
+// rides `claude --settings <file>`, whose path is derived from the LIVE
+// endpoint. These assert the flag is present when primed, absent when not, and
+// scoped to claude — `agy`/`codex`/`gemini` have no such protocol.
+describe('claude --settings injection', () => {
+	afterEach(() => {
+		__setClaudeSettingsPathForTests(null);
+	});
+
+	it('passes --settings when the path has been primed', () => {
+		__setClaudeSettingsPathForTests('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash' });
+		const script = cmd.join(' ');
+		expect(script).toContain('--settings');
+		expect(script).toContain('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+	});
+
+	it('omits --settings entirely when unprimed', () => {
+		__setClaudeSettingsPathForTests(null);
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash' });
+		expect(cmd.join(' ')).not.toContain('--settings');
+	});
+
+	it('does not leak --settings into non-claude engines', () => {
+		__setClaudeSettingsPathForTests('/tmp/hooks.json');
+		for (const engine of ['antigravity', 'codex', 'gemini'] as const) {
+			const cmd = buildAgentWrappedCmd({ engine, shellTarget: 'bash' });
+			expect(cmd.join(' ')).not.toContain('--settings');
+		}
+	});
+
+	it('builds a per-terminal --settings path when a terminal id is supplied', () => {
+		__setClaudeSettingsPathForTests('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash', terminalId: 'term-xyz' });
+		const script = cmd.join(' ');
+		expect(script).toContain('--settings');
+		expect(script).toContain('/run/user/1000/app.ikenga/claude-hooks-term-xyz.json');
+		// And the legacy shared file is NOT used.
+		expect(script).not.toContain('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+	});
+
+	it('passes --resume before the positional prompt when resuming a claude session', () => {
+		__setClaudeSettingsPathForTests('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+		const cmd = buildClaudeWrappedCmd({
+			shellTarget: 'bash',
+			terminalId: 'term-abc',
+			resumeSessionId: 'sess-resume-123',
+			prompt: 'continue where we left off',
+		});
+		expect(extractInvocation(cmd)).toBe(
+			`'claude' '--dangerously-skip-permissions' '--settings' '/run/user/1000/app.ikenga/claude-hooks-term-abc.json' '--resume' 'sess-resume-123' 'continue where we left off'`
+		);
 	});
 });

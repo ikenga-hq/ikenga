@@ -4,6 +4,7 @@ import { PkgIframeLayer } from '@/components/pkg/pkg-iframe-layer';
 import { dumpBootTimings, mark } from '@/lib/boot-timing';
 import { initOsFileDrop } from '@/lib/dnd/os-file-drop';
 import { useIykeBridge } from '@/lib/iyke/bridge';
+import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useIykeControlListener } from '@/lib/iyke/control-listener';
 import { useIykeShellSync } from '@/lib/iyke/use-iyke-shell-sync';
 
@@ -22,8 +23,7 @@ import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
 import { useTerminalStore } from '@/terminal/session-store';
-import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { ActivityBar } from './activity-bar';
 import { TerminalHandoffPrompt } from './artifact-wizard/terminal-handoff-prompt';
 import { WizardPopRecoveryChip } from './artifact-wizard/wizard-pop-recovery-chip';
@@ -58,6 +58,12 @@ export function Workspace() {
 	// Phase A: console + fetch shims, DOM/click/type/key/wait/query-cache
 	// listeners. Mount once at workspace level only.
 	useIykeBridge();
+	// Warm the `--settings` path so the first `claude` terminal already carries
+	// it. `buildAgentArgs` is synchronous, so it can only read a primed value;
+	// unprimed it omits the flag and the session loses the shell's live view.
+	useEffect(() => {
+		void loadClaudeSettingsPath();
+	}, []);
 	// Bidirectional sync between the address bar and the focused pane's
 	// route. Workspace level only — each pane's RouteView memory router
 	// stays an internal detail.
@@ -239,9 +245,7 @@ export function Workspace() {
 				// still creates a terminal even though `mod` would match too).
 				if (ctrlOnly && !e.altKey) {
 					e.preventDefault();
-					const sessionId = e.shiftKey
-						? createTerminalSession({ cmd: buildClaudeWrappedCmd(), title: 'claude' })
-						: createTerminalSession();
+					const sessionId = e.shiftKey ? createClaudeTerminalSession() : createTerminalSession();
 					const focusedId = usePaneStore.getState().focusedId;
 					usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
 					return;

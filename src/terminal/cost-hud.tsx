@@ -1,8 +1,10 @@
 import { listen } from '@tauri-apps/api/event';
 import { Activity, AlertTriangle, Cpu, DollarSign, Gauge, ShieldAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { iykeFetch } from '@/lib/iyke/client';
 
 export interface StatuslineSnapshot {
+	ikenga_terminal_id?: string;
 	session_id?: string;
 	cwd?: string;
 	transcript_path?: string;
@@ -30,22 +32,27 @@ export interface StatuslineSnapshot {
 	};
 }
 
-export function CostHud() {
+export function CostHud({ sessionId }: { sessionId: string }) {
 	const [snapshot, setSnapshot] = useState<StatuslineSnapshot | null>(null);
 
 	useEffect(() => {
-		// Initial fetch from backend snapshot REST endpoint if available
-		fetch('http://127.0.0.1:4000/iyke/statusline/snapshot')
+		// Initial fetch from backend snapshot REST endpoint if available.
+		// Live endpoint + bearer token — see the note in tool-call-feed.tsx.
+		// The endpoint now returns a per-terminal map; we pick this terminal's
+		// snapshot and ignore events from siblings.
+		iykeFetch('/iyke/statusline/snapshot')
 			.then((res) => (res.ok ? res.json() : null))
-			.then((data) => {
-				if (data) setSnapshot(data);
+			.then((data: Record<string, StatuslineSnapshot> | null) => {
+				if (data) {
+					setSnapshot(data[sessionId] ?? null);
+				}
 			})
 			.catch(() => {});
 
 		// Subscribe to real-time statusline updates over Tauri event bus
 		let unlisten: (() => void) | undefined;
 		listen<StatuslineSnapshot>('statusline://snapshot', (event) => {
-			if (event.payload) {
+			if (event.payload?.ikenga_terminal_id === sessionId) {
 				setSnapshot(event.payload);
 			}
 		})
@@ -127,7 +134,10 @@ export function CostHud() {
 			{/* Right Section: Cost & Rate Limits */}
 			<div className="flex items-center gap-2 shrink-0">
 				{fiveHourRate !== undefined && (
-					<div className="flex items-center gap-1 text-zinc-400 text-[10px]" title="5-hour rate limit used">
+					<div
+						className="flex items-center gap-1 text-zinc-400 text-[10px]"
+						title="5-hour rate limit used"
+					>
 						<ShieldAlert className="h-2.5 w-2.5 text-zinc-400" />
 						<span>5h: {Math.round(fiveHourRate)}%</span>
 					</div>

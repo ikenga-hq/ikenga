@@ -13,7 +13,8 @@ import { createPortal } from 'react-dom';
 import { ExternalLink, Plus, RefreshCcw, Terminal as TerminalIcon, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/components/ui/utils';
-import { SingleTerminal, createTerminalSession } from '@/terminal/single-terminal';
+import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
+import { SingleTerminal, createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalStore, type TerminalTab } from '@/terminal/session-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
@@ -122,7 +123,15 @@ function StudioTerminalPicker({ paneId, artifactPath, onAttach }: StudioTerminal
 
 	const spawnCwd = activeProjectCwd();
 	const spawnNew = (preset: ShellPreset) => {
-		const id = createTerminalSession({ cwd: spawnCwd, cmd: preset.cmd, title: preset.title });
+		let id: string;
+		if (preset.title === 'claude') {
+			id = createClaudeTerminalSession({ cwd: spawnCwd }, 'claude');
+		} else if (preset.title === 'codex' || preset.title === 'gemini') {
+			const cmd = buildAgentWrappedCmd({ engine: preset.title as AgentEngineKind });
+			id = createTerminalSession({ cwd: spawnCwd, cmd, title: preset.title });
+		} else {
+			id = createTerminalSession({ cwd: spawnCwd, cmd: preset.cmd, title: preset.title });
+		}
 		// Attach immediately. Even if the PTY hasn't finished spawning,
 		// `attachToStudio` flips the owner field; the picker hides and the
 		// SingleTerminal will mount once the PTY id lands in the store.

@@ -27,8 +27,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneNode, PaneView } from '@/lib/panes/types';
 import { fuzzyMatchSection, slugifySectionId, usePinsStore } from '@/lib/shell/pins-store';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles, type TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
 import { ActionsGroup } from './palette-actions';
@@ -196,10 +195,7 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 												onSelect={() =>
 													addToFocused(() => ({
 														kind: 'terminal',
-														sessionId: createTerminalSession({
-															cmd: buildClaudeWrappedCmd(),
-															title: 'claude',
-														}),
+														sessionId: createClaudeTerminalSession(),
 													}))
 												}
 												Icon={Plus}
