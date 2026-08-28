@@ -24,7 +24,10 @@ received a single event, for three independent reasons:
 
 The settings document is written by `iyke::hook_settings` at bridge start —
 the one moment the real port and token both exist — beside `control.json`, 0600
-because it carries a bearer token, and removed with it on shutdown. A stale port
+because it carries a bearer token, and removed alongside it on clean shutdown
+(a `SIGTERM` skips unwinding and leaves both behind — verified, and identical to
+`control.json`'s existing behaviour; a stale file only ever points at a dead port,
+and the wrapper reads the path from the live endpoint, never from disk). A stale port
 is therefore impossible by construction rather than merely unlikely, and every
 curl in the document is authenticated. Only terminals Ikenga launches are wired;
 a `claude` started by hand in a plain shell is untouched.
