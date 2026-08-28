@@ -39,11 +39,10 @@ use super::handlers::{
     get_chi_list, get_chi_status, get_dom, get_iframe_state, get_logs, get_network, get_pkg_list,
     get_query_cache, get_state, get_terminal_read, post_chi_cancel, post_chi_resume, post_chi_run,
     post_click, post_close, post_devtools, post_focus, post_go, post_iframe_message, post_key,
-    post_mode, post_oba_install_local, post_open,
-    post_pkg_badge_set, post_pkg_dev_register, post_pkg_dev_reload, post_pkg_dev_unregister,
-    post_pkg_health_remove, post_pkg_health_remove_all, post_pkg_health_scan, post_pkg_install,
-    post_pkg_scope_set, post_pkg_uninstall, post_refresh, post_resize, post_screenshot_pane,
-    post_screenshot_window,
+    post_mode, post_oba_install_local, post_open, post_pkg_badge_set, post_pkg_dev_register,
+    post_pkg_dev_reload, post_pkg_dev_unregister, post_pkg_health_remove,
+    post_pkg_health_remove_all, post_pkg_health_scan, post_pkg_install, post_pkg_scope_set,
+    post_pkg_uninstall, post_refresh, post_resize, post_screenshot_pane, post_screenshot_window,
     post_sidebar, post_split, post_terminal_send, post_type, post_wait,
 };
 use super::hooks::{get_hook_events, post_hook_decision, post_hook_event};
@@ -301,7 +300,14 @@ pub async fn serve(
     // Unauthed reply endpoint — partner-site JS POSTs here to fulfill an
     // in-flight pkg-browser request. Auth is via the per-request
     // `oneshot_token` validated inside `BrowserRpc::resolve`.
-    let unauthed = Router::new().route("/iyke/browser/_reply", post(post_browser_reply));
+    // Two unauthed routes, each with its own credential check:
+    //   * the pkg-browser reply endpoint (per-request `oneshot_token`);
+    //   * the Claude Code IDE WebSocket at `/`, which authenticates with the
+    //     `x-claude-code-ide-authorization` header rather than a bearer token,
+    //     so it cannot sit behind `require_token`. See `iyke::ide_ws`.
+    let unauthed = Router::new()
+        .route("/iyke/browser/_reply", post(post_browser_reply))
+        .route("/", get(super::ide_ws::ide_ws_handler));
 
     let app = authed
         .merge(unauthed)
