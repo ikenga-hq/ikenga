@@ -4,7 +4,6 @@
 //! events over the Tauri event bus (`statusline://snapshot`), and maintains a thread-safe
 //! snapshot store for frontend HUD / state queries.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
@@ -215,41 +214,6 @@ pub async fn get_statusline_snapshot() -> impl IntoResponse {
         .and_then(|guard| guard.clone());
 
     (StatusCode::OK, Json(snapshot))
-}
-
-/// Configures the statusLine block in an overlay settings.json file.
-pub fn configure_overlay_statusline(overlay_dir: &Path, port: u16, token: Option<&str>) -> std::io::Result<()> {
-    let settings_path = overlay_dir.join("settings.json");
-    let mut root: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path).unwrap_or_else(|_| "{}".to_string());
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let auth_header = match token {
-        Some(t) => format!("-H 'Authorization: Bearer {}' ", t),
-        None => String::new(),
-    };
-
-    let command_str = format!(
-        "curl -s -X POST {} -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:{}/iyke/statusline/event",
-        auth_header, port
-    );
-
-    let statusline_block = serde_json::json!({
-        "type": "command",
-        "command": command_str,
-        "padding": 0,
-        "refreshInterval": 300
-    });
-
-    if let Some(obj) = root.as_object_mut() {
-        obj.insert("statusLine".to_string(), statusline_block);
-    }
-
-    let serialized = serde_json::to_string_pretty(&root)?;
-    std::fs::write(settings_path, serialized)
 }
 
 #[cfg(test)]

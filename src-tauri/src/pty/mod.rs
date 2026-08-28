@@ -16,7 +16,6 @@
 //! stream tile exactly — no duplicated or dropped bytes at the seam.
 
 pub mod foreground;
-pub mod overlay;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -554,17 +553,32 @@ impl PtyManager {
         // agent CLI launched in a pane resolve under nvm/npm/homebrew even when
         // the app inherited a thin GUI $PATH. Caller env below still wins.
         builder.env("PATH", crate::runtime::augmented_path());
-        // WP-00: Thread CLAUDE_CONFIG_DIR overlay if not explicitly specified by caller env.
-        if !opts.env.contains_key("CLAUDE_CONFIG_DIR")
-            && std::env::var("CLAUDE_CONFIG_DIR").is_err()
-        {
-            if let Ok(overlay_dir) = overlay::ensure_claude_overlay_dir() {
-                if let Some(dir_str) = overlay_dir.to_str() {
-                    builder.env("CLAUDE_CONFIG_DIR", dir_str);
-                }
-            }
-        }
-        // Caller-supplied env wins.
+        // NO `CLAUDE_CONFIG_DIR` OVERLAY HERE. It used to be threaded in at this
+        // point (WP-00), pointing every terminal at
+        // `$XDG_RUNTIME_DIR/ikenga/claude-overlay` and symlinking the user's real
+        // assets in. Two of those symlinks silently never happened, because the
+        // builder looked for `~/.claude/credentials.json` and
+        // `~/.claude/.claude.json` while the real files are
+        // `~/.claude/.credentials.json` and `~/.claude.json` — `if
+        // target.exists()` skipped both. So `claude` in an Ikenga terminal saw a
+        // config dir with no credentials and no `projects` map, asked the user to
+        // log in and to trust the folder, and then wrote a SECOND config there —
+        // one that `$XDG_RUNTIME_DIR` wipes on every reboot. See ikenga#149.
+        //
+        // The overlay's one legitimate purpose was seeding `settings.json` so the
+        // shell could inject its statusline + hooks invisibly. That never worked
+        // either: `ensure_claude_overlay_dir` hardcoded `port: 0` and no token, so
+        // it wrote `curl … http://127.0.0.1:0/iyke/{statusline,hooks}/event` — a
+        // dead port, fired on every PreToolUse/PostToolUse/SessionStart/SessionEnd/
+        // UserPromptSubmit. Injecting a failing curl into every tool call is worse
+        // than injecting nothing.
+        //
+        // So terminals now use the user's real `~/.claude` natively, which is what
+        // the 2026-07-20 overlay retirement already did for the chat path and
+        // missed here. If host-injected statusline/hooks come back, they must
+        // carry the live iyke bridge port and bearer token — not placeholders.
+        //
+        // Caller-supplied env wins (and can still set CLAUDE_CONFIG_DIR explicitly).
         for (k, v) in &opts.env {
             builder.env(k, v);
         }
