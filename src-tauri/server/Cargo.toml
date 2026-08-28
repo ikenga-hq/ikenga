@@ -23,7 +23,7 @@
 name = "ikenga-server"
 # Kept in lockstep with `ikenga-desktop` by scripts/sync-version.mjs — this is
 # what `ikenga-server --version` reports.
-version = "0.8.1"
+version = "0.8.2"
 description = "Ikenga headless server daemon"
 authors = ["Ikenga"]
 edition = "2021"
