@@ -43,15 +43,10 @@ pub struct OpenFileParams {
 
 /// Writes `ide/<port>.lock` in the specified base directory (e.g. `~/.claude`).
 ///
-/// UNCALLED as of ikenga#149. Its only caller was the `CLAUDE_CONFIG_DIR`
-/// overlay builder, which invoked it with a hardcoded `port: 0` and the literal
-/// token `"ikenga-token"` — so the lock it wrote advertised an unconnectable
-/// port and a fake credential, and IDE discovery never actually worked. The
-/// overlay is gone; this is kept because the function itself is correct and a
-/// real re-wiring needs it — but that re-wiring must pass the LIVE iyke bridge
-/// port and bearer token, and write into `~/.claude/ide/` now that terminals
-/// use the user's real config dir.
-#[allow(dead_code)]
+/// Called from `iyke::start` with the LIVE bridge `port` and `token`, and
+/// removed from `IykeRuntime::Drop` on app shutdown. This lets `claude --ide`
+/// discover a running Ikenga bridge instead of advertising `port: 0` and a
+/// placeholder token. See ikenga#155.
 pub fn write_ide_lock_file(
     base_dir: &Path,
     port: u16,

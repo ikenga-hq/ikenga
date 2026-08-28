@@ -68,7 +68,9 @@ export function requestFrameCapture(iframe: HTMLIFrameElement): Promise<string |
 		};
 
 		const timer = setTimeout(() => {
-			console.warn(`[screenshot] artifact frame did not render within ${FRAME_CAPTURE_TIMEOUT_MS}ms`);
+			console.warn(
+				`[screenshot] artifact frame did not render within ${FRAME_CAPTURE_TIMEOUT_MS}ms`
+			);
 			finish(null);
 		}, FRAME_CAPTURE_TIMEOUT_MS);
 
@@ -134,7 +136,7 @@ export async function substituteArtifactFrames(root: HTMLElement): Promise<() =>
 				iframe.style.removeProperty('display');
 				if (iframe.getAttribute('style') === '') iframe.removeAttribute('style');
 			});
-		}),
+		})
 	);
 
 	return () => {

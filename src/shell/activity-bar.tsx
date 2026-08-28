@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import {
 	Activity,
+	AlertTriangle,
 	CheckSquare,
 	Clock,
 	Folder,
@@ -541,17 +542,25 @@ function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
 	const Icon = iconForPkg(entry.icon);
 	const badge = entry.badge;
 	const hasCount = typeof badge?.count === 'number' && badge.count > 0;
-	const titleSuffix = badge?.tooltip ? ` · ${badge.tooltip}` : '';
+	const tooltip = [
+		entry.parked ? `Parked: ${entry.parked_reason ?? 'sidecar stopped'}` : null,
+		badge?.tooltip,
+	]
+		.filter(Boolean)
+		.join(' · ');
+	const title = `${entry.label}${tooltip ? ` · ${tooltip}` : ''}`;
 	return (
 		<button
 			type="button"
 			onClick={() => onSelect(entry)}
-			title={`${entry.label}${titleSuffix}`}
-			aria-label={badge?.tooltip ? `${entry.label} — ${badge.tooltip}` : entry.label}
+			title={title}
+			aria-label={title}
 			aria-current={isActive ? 'page' : undefined}
+			disabled={entry.parked}
 			className={cn(
 				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card'
+				'hover:bg-card',
+				entry.parked && 'opacity-60'
 			)}
 			style={{
 				color: isActive ? 'var(--fg)' : 'var(--fg-faint)',
@@ -566,7 +575,15 @@ function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
 				/>
 			)}
 			<Icon className="h-[18px] w-[18px]" />
-			{hasCount ? (
+			{entry.parked ? (
+				<span
+					aria-hidden="true"
+					className="absolute right-1 top-1 h-3.5 w-3.5 rounded-full bg-[var(--destructive,#ef4444)] ring-2 grid place-items-center"
+					style={{ ['--tw-ring-color' as string]: 'var(--bg-base)' }}
+				>
+					<AlertTriangle className="h-2.5 w-2.5 text-white" />
+				</span>
+			) : hasCount ? (
 				<span
 					aria-hidden="true"
 					className="absolute right-1 top-1 grid h-3.5 min-w-[14px] place-items-center rounded-full bg-[var(--accent,#3b82f6)] px-1 text-[9px] font-semibold leading-none text-white"
@@ -578,7 +595,10 @@ function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
 					<span
 						aria-hidden="true"
 						className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full ring-2"
-						style={{ background: 'var(--accent,#3b82f6)', ['--tw-ring-color' as string]: 'var(--bg-base)' }}
+						style={{
+							background: 'var(--accent,#3b82f6)',
+							['--tw-ring-color' as string]: 'var(--bg-base)',
+						}}
 					/>
 				)
 			)}

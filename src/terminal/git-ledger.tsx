@@ -30,18 +30,17 @@ export function GitLedger({ sessionId }: { sessionId: string }) {
 			if (!p || p.hook_event_name !== 'PostToolUse') return;
 			if (sessionId && p.ikenga_terminal_id && p.ikenga_terminal_id !== sessionId) return;
 
-				const filePath = p.tool_input?.path || p.tool_input?.target_file;
-				if (filePath) {
-					setTouchedFiles((prev) => {
-						const next = new Map(prev);
-						if (!next.has(filePath)) {
-							next.set(filePath, { path: filePath, status: 'M', staged: false });
-						}
-						return next;
-					});
-				}
+			const filePath = p.tool_input?.path || p.tool_input?.target_file;
+			if (filePath) {
+				setTouchedFiles((prev) => {
+					const next = new Map(prev);
+					if (!next.has(filePath)) {
+						next.set(filePath, { path: filePath, status: 'M', staged: false });
+					}
+					return next;
+				});
 			}
-		)
+		})
 			.then((fn) => {
 				unlisten = fn;
 			})
@@ -124,7 +123,9 @@ export function GitLedger({ sessionId }: { sessionId: string }) {
 					<div
 						key={item.path}
 						className={`flex items-center justify-between rounded p-2 border ${
-							selectedFile === item.path ? 'bg-zinc-900 border-sky-800/60' : 'bg-zinc-900/40 border-zinc-800/40'
+							selectedFile === item.path
+								? 'bg-zinc-900 border-sky-800/60'
+								: 'bg-zinc-900/40 border-zinc-800/40'
 						}`}
 					>
 						<div
@@ -133,7 +134,9 @@ export function GitLedger({ sessionId }: { sessionId: string }) {
 						>
 							<FileCode className="h-3.5 w-3.5 text-zinc-400 shrink-0" />
 							<span className="truncate text-[11px] text-zinc-200">{item.path}</span>
-							<span className="rounded bg-sky-950 px-1 text-[9px] text-sky-400 font-bold">{item.status}</span>
+							<span className="rounded bg-sky-950 px-1 text-[9px] text-sky-400 font-bold">
+								{item.status}
+							</span>
 						</div>
 
 						<div className="flex items-center gap-1 shrink-0">

@@ -166,15 +166,70 @@ export function buildItems(
 	};
 
 	for (const a of config.agents)
-		push('agent', a.name, a.scope, a.projectRoot, a.path, a.description, 'link', a, a.overriddenBy, a);
+		push(
+			'agent',
+			a.name,
+			a.scope,
+			a.projectRoot,
+			a.path,
+			a.description,
+			'link',
+			a,
+			a.overriddenBy,
+			a
+		);
 	for (const s of config.skills)
-		push('skill', s.name, s.scope, s.projectRoot, s.path, s.description, 'link', s, s.overriddenBy, s);
+		push(
+			'skill',
+			s.name,
+			s.scope,
+			s.projectRoot,
+			s.path,
+			s.description,
+			'link',
+			s,
+			s.overriddenBy,
+			s
+		);
 	for (const c of config.commands)
-		push('command', c.name, c.scope, c.projectRoot, c.path, c.description, 'link', c, c.overriddenBy, c);
+		push(
+			'command',
+			c.name,
+			c.scope,
+			c.projectRoot,
+			c.path,
+			c.description,
+			'link',
+			c,
+			c.overriddenBy,
+			c
+		);
 	for (const h of config.hooks)
-		push('hook', h.name, h.scope, h.projectRoot, h.settingsPath, h.event, 'merge', { isSymlink: false, inStore: false }, null, h);
+		push(
+			'hook',
+			h.name,
+			h.scope,
+			h.projectRoot,
+			h.settingsPath,
+			h.event,
+			'merge',
+			{ isSymlink: false, inStore: false },
+			null,
+			h
+		);
 	for (const m of config.mcps)
-		push('mcp', m.name, m.scope, m.projectRoot, m.path, `${m.transport} server`, 'merge', { isSymlink: false, inStore: false }, null, m);
+		push(
+			'mcp',
+			m.name,
+			m.scope,
+			m.projectRoot,
+			m.path,
+			`${m.transport} server`,
+			'merge',
+			{ isSymlink: false, inStore: false },
+			null,
+			m
+		);
 
 	return out;
 }

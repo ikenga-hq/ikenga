@@ -89,7 +89,14 @@ export type ChildToHostMessage =
 	| { kind: 'text-edit-pick'; selector: string; rect: SerializedRect; originalHtml: string }
 	| { kind: 'pins'; requestId: string; results: PinResolution[] }
 	| { kind: 'pin-update'; results: PinResolution[] }
-	| { kind: 'capture-result'; requestId: string; base64: string; width: number; height: number; error?: string }
+	| {
+			kind: 'capture-result';
+			requestId: string;
+			base64: string;
+			width: number;
+			height: number;
+			error?: string;
+	  }
 	| { kind: 'text-edit-commit'; selector: string; innerHtml: string; originalHtml: string }
 	| { kind: 'text-edit-cancel'; selector: string };
 
@@ -115,7 +122,9 @@ export interface HostMessageWrapper {
 	data: HostToChildMessage;
 }
 
-export function isIkengaHostMessage(data: unknown): data is HostMessageWrapper | ChildMessageWrapper {
+export function isIkengaHostMessage(
+	data: unknown
+): data is HostMessageWrapper | ChildMessageWrapper {
 	if (typeof data !== 'object' || data === null) return false;
 	const d = data as Record<string, unknown>;
 	return (

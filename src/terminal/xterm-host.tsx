@@ -199,7 +199,9 @@ interface SearchResultChangeEvent {
 interface SearchAddonLike {
 	findNext: (s: string, options?: SearchOptions) => boolean;
 	findPrevious: (s: string, options?: SearchOptions) => boolean;
-	onDidChangeResults?: (listener: (results: SearchResultChangeEvent) => void) => { dispose: () => void };
+	onDidChangeResults?: (listener: (results: SearchResultChangeEvent) => void) => {
+		dispose: () => void;
+	};
 	clearDecorations?: () => void;
 	dispose: () => void;
 }
@@ -694,7 +696,9 @@ export function XTermHost({
 					const searchLike: SearchAddonLike = {
 						findNext: (s, opts) => search.findNext(s, opts),
 						findPrevious: (s, opts) => search.findPrevious(s, opts),
-						onDidChangeResults: search.onDidChangeResults ? (l) => search.onDidChangeResults(l) : undefined,
+						onDidChangeResults: search.onDidChangeResults
+							? (l) => search.onDidChangeResults(l)
+							: undefined,
 						clearDecorations: () => search.clearDecorations(),
 						dispose: () => {
 							resultsDispose?.();
@@ -1035,7 +1039,11 @@ export function XTermHost({
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [spec, pty, sessionId]);
 
-	const getSearchOptions = (optOverrides?: { caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean }): SearchOptions => ({
+	const getSearchOptions = (optOverrides?: {
+		caseSensitive?: boolean;
+		wholeWord?: boolean;
+		regex?: boolean;
+	}): SearchOptions => ({
 		caseSensitive: optOverrides?.caseSensitive ?? caseSensitive,
 		wholeWord: optOverrides?.wholeWord ?? wholeWord,
 		regex: optOverrides?.regex ?? useRegex,

@@ -16,12 +16,18 @@ import {
 	Mail,
 	Package,
 	Pencil,
+	RefreshCw,
 	Send,
 	Sun,
 	TrendingUp,
 	type LucideIcon,
 } from 'lucide-react';
 
+import { Button } from '@/components/ui/button';
+import { usePkgActivityBarEntries } from '@/lib/pkg/use-activity-bar-entries';
+import { pkgSupervisorRestart } from '@/lib/tauri-cmd';
+
+import { useState } from 'react';
 import { Segmented } from '@/components/ui/segmented';
 import { usePkgMenuStore, type PkgMenuItem } from '@/lib/pkg/pkg-menu-store';
 import { SidebarNav, SidebarNavHeader, SidebarNavRow, SidebarNavSection } from './_nav';
@@ -58,11 +64,17 @@ export function PkgMode({ pkgId }: { pkgId: string }) {
 	const items = usePkgMenuStore((s) => s.menus[pkgId] ?? EMPTY_ITEMS);
 	const activeFeature = usePkgMenuStore((s) => s.activeFeatures[pkgId]);
 	const setActiveFeature = usePkgMenuStore((s) => s.setActiveFeature);
+	const { entries } = usePkgActivityBarEntries();
+	const entry = entries.find((e) => e.pkg_id === pkgId);
 
 	if (items.length === 0) {
 		return (
 			<div className="h-full overflow-y-auto py-3 px-4 text-xs text-muted-foreground">
-				Waiting for pkg menu…
+				{entry?.parked ? (
+					<ParkedBanner pkgId={pkgId} reason={entry.parked_reason} />
+				) : (
+					'Waiting for pkg menu…'
+				)}
 			</div>
 		);
 	}
@@ -143,6 +155,35 @@ export function pkgIdFromRoute(route: string | null | undefined): string | null 
 	if (!route) return null;
 	const m = route.match(/^\/pkg\/([^/]+)/);
 	return m ? m[1]! : null;
+}
+
+function ParkedBanner({ pkgId, reason }: { pkgId: string; reason?: string | null }) {
+	const [restarting, setRestarting] = useState(false);
+	return (
+		<div className="space-y-3">
+			<div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs">
+				<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+				<div className="space-y-1">
+					<p className="font-medium text-foreground">This package is parked</p>
+					<p className="text-muted-foreground">
+						{reason ?? 'The sidecar stopped after repeated crashes.'}
+					</p>
+				</div>
+			</div>
+			<Button
+				size="sm"
+				className="h-7 gap-1.5 text-xs"
+				disabled={restarting}
+				onClick={() => {
+					setRestarting(true);
+					void pkgSupervisorRestart(pkgId).finally(() => setRestarting(false));
+				}}
+			>
+				<RefreshCw className="h-3 w-3" />
+				Retry
+			</Button>
+		</div>
+	);
 }
 
 export type { PkgMenuItem };

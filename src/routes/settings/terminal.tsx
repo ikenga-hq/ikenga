@@ -13,6 +13,7 @@ import {
 	useCustomShellProfiles,
 	AGENT_ENV_KEY,
 	AGENT_WSL_DISTRO_KEY,
+	RESUME_TERMINALS_KEY,
 } from '@/lib/shell-profiles';
 import { settingsGet, settingsSet } from '@/lib/tauri-cmd';
 import { SettingGroup } from './-components/setting-group';
@@ -58,6 +59,23 @@ function TerminalSettingsPage() {
 		},
 		onSuccess: () => {
 			void queryClient.invalidateQueries({ queryKey: ['settings', AGENT_WSL_DISTRO_KEY] });
+		},
+	});
+
+	const resumeTerminalsQuery = useQuery<string>({
+		queryKey: ['settings', RESUME_TERMINALS_KEY],
+		queryFn: async () => {
+			const res = await settingsGet(RESUME_TERMINALS_KEY);
+			return res ?? 'true';
+		},
+	});
+
+	const resumeTerminalsMutation = useMutation({
+		mutationFn: async (value: boolean) => {
+			await settingsSet(RESUME_TERMINALS_KEY, value ? 'true' : 'false');
+		},
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ['settings', RESUME_TERMINALS_KEY] });
 		},
 	});
 
@@ -214,6 +232,28 @@ function TerminalSettingsPage() {
 							)}
 						</SettingGroup>
 					)}
+
+					<SettingGroup title="Session Restore">
+						<SettingRow
+							label="Resume terminals on start"
+							desc="Respawn previously running terminals when Ikenga starts, including tabs in unfocused panes."
+						>
+							<label className="flex items-center gap-2 text-sm">
+								<input
+									type="checkbox"
+									className="h-4 w-4 rounded border-border bg-background"
+									checked={resumeTerminalsQuery.data === 'true'}
+									onChange={(e) => resumeTerminalsMutation.mutate(e.target.checked)}
+									disabled={resumeTerminalsQuery.isLoading}
+								/>
+								<span
+									className={resumeTerminalsQuery.data !== 'true' ? 'text-muted-foreground' : ''}
+								>
+									Enabled
+								</span>
+							</label>
+						</SettingRow>
+					</SettingGroup>
 
 					<SettingGroup title="AI Agent Terminal Launchers">
 						<div className="divide-y divide-border">

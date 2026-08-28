@@ -14,7 +14,11 @@ import { ExternalLink, Plus, RefreshCcw, Terminal as TerminalIcon, X } from 'luc
 import { Button } from '@/components/ui/button';
 import { cn } from '@/components/ui/utils';
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
-import { SingleTerminal, createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
+import {
+	SingleTerminal,
+	createClaudeTerminalSession,
+	createTerminalSession,
+} from '@/terminal/single-terminal';
 import { useTerminalStore, type TerminalTab } from '@/terminal/session-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';

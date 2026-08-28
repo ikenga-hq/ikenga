@@ -74,7 +74,11 @@ export function __setClaudeSettingsPathForTests(path: string | null): void {
 		primed = false;
 	} else {
 		// Legacy test seam may pass the shared file path or a directory.
-		cachedAppDataDir = path.endsWith('.json') ? path.replace(/\/claude-hooks-[^/]+\.json$/, '').replace(/\/claude-hooks-settings\.json$/, '') : path;
+		cachedAppDataDir = path.endsWith('.json')
+			? path
+					.replace(/\/claude-hooks-[^/]+\.json$/, '')
+					.replace(/\/claude-hooks-settings\.json$/, '')
+			: path;
 		primed = true;
 	}
 	inFlight = null;

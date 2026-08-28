@@ -49,9 +49,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 			return (
 				<div style={containerStyle}>
 					<div style={titleStyle}>Application Error</div>
-					<div style={descStyle}>
-						An unexpected error occurred in the user interface.
-					</div>
+					<div style={descStyle}>An unexpected error occurred in the user interface.</div>
 					<div style={codeStyle}>
 						{errorMessage}
 						{errorStack ? `\n\n${errorStack}` : ''}

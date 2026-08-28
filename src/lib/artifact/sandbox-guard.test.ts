@@ -79,7 +79,7 @@ describe('artifact sandbox containment', () => {
 				`content we did not author this re-opens the parent-realm escape to ` +
 				`window.parent.__TAURI_INTERNALS__.invoke. If parent->child DOM access ` +
 				`is what you need, route it through the postMessage bridge in ` +
-				`src/lib/artifact/bridge-messages.ts instead of restoring this flag.`,
+				`src/lib/artifact/bridge-messages.ts instead of restoring this flag.`
 		).toEqual([]);
 	}, 30000);
 
@@ -99,9 +99,10 @@ describe('artifact sandbox containment', () => {
 		// file that may no longer set the flag, or may no longer exist.
 		for (const [rel] of ALLOWED) {
 			const body = stripComments(readFileSync(join(SRC, rel), 'utf8'));
-			expect(SANDBOX_ATTR.test(body), `${rel} is allowlisted but no longer sets allow-same-origin — remove the entry`).toBe(
-				true,
-			);
+			expect(
+				SANDBOX_ATTR.test(body),
+				`${rel} is allowlisted but no longer sets allow-same-origin — remove the entry`
+			).toBe(true);
 		}
 	});
 });

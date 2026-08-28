@@ -26,7 +26,9 @@ function emit(name: string) {
 
 export async function installNativeMenu(): Promise<void> {
 	if (!isTauri()) {
-		console.log('[transport] api/menu (native menu) is desktop-only (in-DOM fallback undesigned) — deferred to Wave 2');
+		console.log(
+			'[transport] api/menu (native menu) is desktop-only (in-DOM fallback undesigned) — deferred to Wave 2'
+		);
 		return;
 	}
 	if (!isMac) return;

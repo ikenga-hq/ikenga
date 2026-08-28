@@ -80,7 +80,11 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 			.then((res) => {
 				const html = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 				const { root, file } = pickViewerRoot(path, html);
-				return Promise.all([viewerServe(root), viewerPort()]).then(([h, port]) => ({ h, file, port }));
+				return Promise.all([viewerServe(root), viewerPort()]).then(([h, port]) => ({
+					h,
+					file,
+					port,
+				}));
 			})
 			.then(({ h, file, port }) => {
 				handle = h;

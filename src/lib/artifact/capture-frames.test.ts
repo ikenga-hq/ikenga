@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { IKENGA_BRIDGE_VERSION, IKENGA_HOST_MSG, wrapChildMessage } from './bridge-messages';
-import { findArtifactFrames, requestFrameCapture, substituteArtifactFrames } from './capture-frames';
+import {
+	findArtifactFrames,
+	requestFrameCapture,
+	substituteArtifactFrames,
+} from './capture-frames';
 
 // jsdom has no HTMLImageElement.decode and never loads a src, so the real
 // decode() would reject and the substitution would silently no-op — which is
@@ -47,7 +51,10 @@ function mountFrame(reply: 'ok' | 'error' | 'silent'): HTMLIFrameElement {
 			// Deliver asynchronously, like a real postMessage.
 			setTimeout(() => {
 				window.dispatchEvent(
-					new MessageEvent('message', { data: wrapChildMessage(payload), source: fakeWindow as never }),
+					new MessageEvent('message', {
+						data: wrapChildMessage(payload),
+						source: fakeWindow as never,
+					})
 				);
 			}, 0);
 		},
@@ -66,7 +73,9 @@ describe('findArtifactFrames', () => {
 
 describe('requestFrameCapture', () => {
 	it('resolves a data URL when the child renders', async () => {
-		await expect(requestFrameCapture(mountFrame('ok'))).resolves.toBe(`data:image/png;base64,${PNG}`);
+		await expect(requestFrameCapture(mountFrame('ok'))).resolves.toBe(
+			`data:image/png;base64,${PNG}`
+		);
 	});
 
 	it('resolves null when the child reports an error', async () => {
@@ -96,7 +105,7 @@ describe('requestFrameCapture', () => {
 					height: 1,
 				}),
 				source: iframe.contentWindow as never,
-			}),
+			})
 		);
 		await vi.advanceTimersByTimeAsync(3000);
 		await expect(p).resolves.toBeNull();
@@ -123,7 +132,7 @@ describe('requestFrameCapture', () => {
 					height: 1,
 				}),
 				source: { impostor: true } as never,
-			}),
+			})
 		);
 		await vi.advanceTimersByTimeAsync(3000);
 		await expect(p).resolves.toBeNull();
@@ -151,9 +160,12 @@ describe('requestFrameCapture', () => {
 		window.dispatchEvent(
 			new MessageEvent('message', {
 				// Correct marker and sender, missing version.
-				data: { [IKENGA_HOST_MSG]: true, data: { kind: 'capture-result', requestId: sentId, base64: PNG } },
+				data: {
+					[IKENGA_HOST_MSG]: true,
+					data: { kind: 'capture-result', requestId: sentId, base64: PNG },
+				},
 				source: iframe.contentWindow as never,
-			}),
+			})
 		);
 		await vi.advanceTimersByTimeAsync(3000);
 		await expect(p).resolves.toBeNull();
