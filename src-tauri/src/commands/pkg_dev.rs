@@ -48,6 +48,7 @@ pub async fn pkg_dev_register(
     // re-entering the runtime panics.
     let kernel_for_install = Arc::clone(&kernel_arc);
     let summary = tokio::task::spawn_blocking(move || {
+        crate::pkg::materialize_npm_deps(&path)?;
         kernel_for_install.install_from_path(&path, source, None)
     })
     .await

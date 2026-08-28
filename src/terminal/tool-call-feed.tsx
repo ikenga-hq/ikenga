@@ -14,6 +14,7 @@ import { useEffect, useState } from 'react';
 import { iykeFetch } from '@/lib/iyke/client';
 
 export interface HookEventPayload {
+	ikenga_terminal_id?: string;
 	hook_event_name?: string;
 	session_id?: string;
 	transcript_path?: string;
@@ -54,7 +55,7 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 				if (Array.isArray(events)) {
 					const map = new Map<string, ToolCallEntry>();
 					for (const ev of events) {
-						if (sessionId && ev.session_id && ev.session_id !== sessionId) continue;
+						if (sessionId && ev.ikenga_terminal_id && ev.ikenga_terminal_id !== sessionId) continue;
 						const id = ev.tool_use_id || `ev-${Math.random()}`;
 						if (ev.hook_event_name === 'PreToolUse') {
 							map.set(id, {
@@ -92,7 +93,7 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 		listen<HookEventPayload>('hooks://event', (event) => {
 			const payload = event.payload;
 			if (!payload) return;
-			if (sessionId && payload.session_id && payload.session_id !== sessionId) return;
+			if (sessionId && payload.ikenga_terminal_id && payload.ikenga_terminal_id !== sessionId) return;
 
 			const id = payload.tool_use_id || `tool-${Date.now()}-${Math.random()}`;
 

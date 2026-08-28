@@ -150,7 +150,7 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 	return (
 		<div className="relative flex h-full w-full flex-col overflow-hidden">
 			{/* WP-03: Cost & Context Telemetry HUD */}
-			<CostHud />
+			<CostHud sessionId={sessionId} />
 
 			<div className="relative flex-1 flex h-full w-full overflow-hidden">
 				<div className="absolute right-1.5 top-1.5 z-50 flex items-center gap-1">

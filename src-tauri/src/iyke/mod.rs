@@ -98,7 +98,14 @@ pub struct Endpoint {
     /// hooks + statusline reach this bridge (see `iyke::hook_settings`).
     /// `None` if the file could not be written — the terminal wrapper then
     /// simply omits `--settings` rather than launching a broken session.
+    ///
+    /// **DEPRECATED** in favour of per-terminal settings files under
+    /// `app_local_data_dir`. Kept for backwards-compat with older clients.
     pub hooks_settings_path: Option<String>,
+    /// Absolute path to the app-local directory where per-terminal
+    /// `claude-hooks-<terminal_id>.json` files are written. The frontend
+    /// builds the same path the PTY-spawn writer will use.
+    pub app_local_data_dir: String,
 }
 
 /// Live runtime handle. Held by Tauri-managed state so its `Drop` impl
@@ -109,7 +116,7 @@ pub struct IykeRuntime {
     pub token: String,
     pub port: u16,
     pub control_path: PathBuf,
-    pub hooks_settings_path: Option<PathBuf>,
+    pub app_local_data_dir: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -119,11 +126,18 @@ impl IykeRuntime {
             url: self.url.clone(),
             token: self.token.clone(),
             port: self.port,
-            hooks_settings_path: self
-                .hooks_settings_path
-                .as_ref()
-                .and_then(|p| p.to_str().map(str::to_string)),
+            hooks_settings_path: None,
+            app_local_data_dir: self
+                .app_local_data_dir
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_default(),
         }
+    }
+
+    /// Directory where per-terminal hook settings files live.
+    pub fn hooks_settings_dir(&self) -> &Path {
+        &self.app_local_data_dir
     }
 }
 
@@ -132,9 +146,15 @@ impl Drop for IykeRuntime {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(p) = self.hooks_settings_path.as_ref() {
-            if p.exists() {
-                let _ = std::fs::remove_file(p);
+        // Clean up any per-terminal hook settings files that may have been
+        // written before the PTY exit reaper could run (e.g. app kill).
+        if let Ok(entries) = std::fs::read_dir(&self.app_local_data_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("claude-hooks-") && name.ends_with(".json") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
             }
         }
         if self.control_path.exists() {
@@ -192,27 +212,15 @@ pub async fn start(
     write_control_file(&control_path, port, &token, state.started_at_unix_ms())
         .with_context(|| format!("write {}", control_path.display()))?;
 
-    // The `--settings` document handed to `claude` in Ikenga-launched
-    // terminals. Written HERE, after the server has bound, because the whole
-    // failure mode it replaces (ikenga#149) was a settings file baked with a
-    // placeholder `port: 0`. Writing it at the one point where the real port
-    // and token exist makes that impossible rather than merely unlikely.
-    // Non-fatal: without it the wrapper omits `--settings` and the session
-    // runs normally, just without the shell's live view.
-    let hooks_settings_path = match hook_settings::write(
-        control_path.parent().unwrap_or(Path::new(".")),
-        port,
-        &token,
-    ) {
-        Ok(p) => {
-            log::info!("iyke: wrote {}", p.display());
-            Some(p)
-        }
-        Err(e) => {
-            log::warn!("iyke: could not write claude hook settings (continuing): {e:#}");
-            None
-        }
-    };
+    let app_local_data_dir = control_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+
+    // Per-terminal `--settings` files are written at PTY-spawn time rather
+    // than here (WP-01 follow-up). Each claude terminal gets its own file
+    // (`claude-hooks-<terminal_id>.json`) so hook events carry the terminal
+    // id in their POST URL. See `iyke::hook_settings` and `commands/pty`.
 
     log::info!("iyke: listening on {url} (token {}…)", &token[..8]);
     log::info!("iyke: wrote {}", control_path.display());
@@ -222,7 +230,7 @@ pub async fn start(
         token,
         port,
         control_path,
-        hooks_settings_path,
+        app_local_data_dir,
         shutdown: Some(shutdown),
     })
 }
@@ -234,6 +242,7 @@ struct ControlFile<'a> {
     token: &'a str,
     pid: u32,
     started_at_unix_ms: u128,
+    app_local_data_dir: &'a Path,
     identifier: &'static str,
 }
 
@@ -242,12 +251,14 @@ fn write_control_file(path: &Path, port: u16, token: &str, started_at_unix_ms: u
         std::fs::create_dir_all(parent).context("create control file parent dir")?;
     }
 
+    let app_local_data_dir = path.parent().unwrap_or(Path::new("."));
     let payload = ControlFile {
         schema_version: 1,
         port,
         token,
         pid: std::process::id(),
         started_at_unix_ms,
+        app_local_data_dir,
         identifier: "app.ikenga",
     };
     let json = serde_json::to_vec_pretty(&payload).context("serialize control.json")?;

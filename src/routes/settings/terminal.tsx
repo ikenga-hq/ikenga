@@ -5,7 +5,7 @@ import { Terminal, RefreshCw, CheckCircle2, Play, Plus, Trash2, Bot } from 'luci
 import { Button } from '@/components/ui/button';
 import { isWindows } from '@/lib/platform';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
 import {
 	useDefaultShellProfile,
@@ -75,12 +75,22 @@ function TerminalSettingsPage() {
 
 	function openAgentTerminal(engine: AgentEngineKind, title: string) {
 		const isWsl = currentAgentEnv === 'wsl';
-		const cmd = buildAgentWrappedCmd({
-			engine,
-			shellTarget: isWsl ? 'wsl' : isWindows ? 'native' : 'posix',
-			wslDistro: isWsl ? currentAgentDistro : undefined,
-		});
-		openTestTerminal(cmd, title);
+		const shellTarget = isWsl ? 'wsl' : isWindows ? 'native' : 'posix';
+		const wslDistro = isWsl ? currentAgentDistro : undefined;
+		const focusedId = usePaneStore.getState().focusedId;
+
+		if (engine === 'claude') {
+			const sessionId = createClaudeTerminalSession({
+				shellTarget,
+				wslDistro: wslDistro ?? undefined,
+			});
+			usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
+			return;
+		}
+
+		const cmd = buildAgentWrappedCmd({ engine, shellTarget, wslDistro });
+		const sessionId = createTerminalSession({ cmd, title });
+		usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
 	}
 
 	const handleSaveCustomProfile = () => {

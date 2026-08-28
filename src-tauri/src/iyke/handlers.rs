@@ -1548,6 +1548,7 @@ pub async fn post_pkg_install(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let installed = tokio::task::spawn_blocking(move || {
+        crate::pkg::materialize_npm_deps(&path)?;
         kernel_arc.install_from_path(&path, source, project_id)
     })
     .await
@@ -1606,6 +1607,7 @@ pub async fn post_pkg_dev_register(
         path: install_path_str,
     };
     let summary = tokio::task::spawn_blocking(move || {
+        crate::pkg::materialize_npm_deps(&path)?;
         kernel_for_install.install_from_path(&path, source, None)
     })
     .await

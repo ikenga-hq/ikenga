@@ -19,12 +19,16 @@ export function GitLedger({ sessionId }: { sessionId: string }) {
 	useEffect(() => {
 		let unlisten: (() => void) | undefined;
 
-		listen<{ hook_event_name?: string; session_id?: string; tool_name?: string; tool_input?: { path?: string; target_file?: string } }>(
-			'hooks://event',
-			(event) => {
-				const p = event.payload;
-				if (!p || p.hook_event_name !== 'PostToolUse') return;
-				if (sessionId && p.session_id && p.session_id !== sessionId) return;
+		listen<{
+			ikenga_terminal_id?: string;
+			hook_event_name?: string;
+			session_id?: string;
+			tool_name?: string;
+			tool_input?: { path?: string; target_file?: string };
+		}>('hooks://event', (event) => {
+			const p = event.payload;
+			if (!p || p.hook_event_name !== 'PostToolUse') return;
+			if (sessionId && p.ikenga_terminal_id && p.ikenga_terminal_id !== sessionId) return;
 
 				const filePath = p.tool_input?.path || p.tool_input?.target_file;
 				if (filePath) {

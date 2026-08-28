@@ -12,8 +12,7 @@ import { PaneBody, viewLabel, viewSubtitle } from '@/shell/panes/pane-views';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { viewKey } from '@/shell/panes/view-key';
 import { viewWorkspace } from '@/shell/panes/tab-workspace';
-import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { cn } from '@/components/ui/utils';
 
 const COLLAPSED_WIDTH = '36px';
@@ -387,10 +386,7 @@ function DockAddButton({ onAdd }: { onAdd: (view: PaneView) => void }) {
 						onClick={() =>
 							pick({
 								kind: 'terminal',
-								sessionId: createTerminalSession({
-									cmd: buildClaudeWrappedCmd(),
-									title: 'claude',
-								}),
+								sessionId: createClaudeTerminalSession(),
 							})
 						}
 					/>

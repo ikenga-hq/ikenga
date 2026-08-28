@@ -34,6 +34,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 		let unlisten: (() => void) | undefined;
 
 		listen<{
+			ikenga_terminal_id?: string;
 			hook_event_name?: string;
 			session_id?: string;
 			tool_name?: string;
@@ -42,7 +43,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 		}>('hooks://event', (event) => {
 			const p = event.payload;
 			if (!p) return;
-			if (sessionId && p.session_id && p.session_id !== sessionId) return;
+			if (sessionId && p.ikenga_terminal_id && p.ikenga_terminal_id !== sessionId) return;
 
 			if (p.hook_event_name === 'PermissionRequest') {
 				const newEntry: PermissionRequestEntry = {

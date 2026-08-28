@@ -4,9 +4,11 @@
 //! events over the Tauri event bus (`statusline://snapshot`), and maintains a thread-safe
 //! snapshot store for frontend HUD / state queries.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
@@ -14,10 +16,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-static SNAPSHOT_STORE: OnceLock<Arc<Mutex<Option<StatuslineSnapshot>>>> = OnceLock::new();
+static SNAPSHOT_STORE: OnceLock<Arc<Mutex<HashMap<String, StatuslineSnapshot>>>> = OnceLock::new();
 
-fn get_store() -> &'static Arc<Mutex<Option<StatuslineSnapshot>>> {
-    SNAPSHOT_STORE.get_or_init(|| Arc::new(Mutex::new(None)))
+fn get_store() -> &'static Arc<Mutex<HashMap<String, StatuslineSnapshot>>> {
+    SNAPSHOT_STORE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +162,8 @@ pub struct WorktreeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatuslineSnapshot {
+    #[serde(default, rename = "ikenga_terminal_id")]
+    pub ikenga_terminal_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -192,13 +196,24 @@ pub struct StatuslineSnapshot {
     pub worktree: Option<WorktreeInfo>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatuslineEventQuery {
+    pub terminal: Option<String>,
+}
+
 /// Post route handler: POST /iyke/statusline/event
 pub async fn post_statusline_event(
     Extension(app): Extension<AppHandle>,
-    Json(snapshot): Json<StatuslineSnapshot>,
+    Query(query): Query<StatuslineEventQuery>,
+    Json(mut snapshot): Json<StatuslineSnapshot>,
 ) -> impl IntoResponse {
+    if snapshot.ikenga_terminal_id.is_none() {
+        snapshot.ikenga_terminal_id = query.terminal.clone();
+    }
+
+    let terminal_id = snapshot.ikenga_terminal_id.clone().unwrap_or_default();
     if let Ok(mut store) = get_store().lock() {
-        *store = Some(snapshot.clone());
+        store.insert(terminal_id, snapshot.clone());
     }
 
     let _ = app.emit("statusline://snapshot", &snapshot);
@@ -207,13 +222,13 @@ pub async fn post_statusline_event(
 }
 
 /// Get route handler: GET /iyke/statusline/snapshot
+///
+/// Returns the full per-terminal map. Callers pick their own terminal's
+/// snapshot by `ikenga_terminal_id`.
 pub async fn get_statusline_snapshot() -> impl IntoResponse {
-    let snapshot = get_store()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone());
+    let snapshots = get_store().lock().ok().map(|guard| guard.clone()).unwrap_or_default();
 
-    (StatusCode::OK, Json(snapshot))
+    (StatusCode::OK, Json(snapshots))
 }
 
 #[cfg(test)]

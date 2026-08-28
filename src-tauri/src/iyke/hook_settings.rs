@@ -66,15 +66,20 @@ pub const FILE_NAME: &str = "claude-hooks-settings.json";
 /// on directly — the whole point of this module is that the port and token are
 /// real, and a test that only checked "a file exists" would have passed against
 /// the port-0 overlay too.
-pub fn build(port: u16, token: &str) -> serde_json::Value {
+///
+/// `terminal_id` is baked into the hook and statusline URLs so every event can
+/// be attributed to the Ikenga terminal that spawned the claude session, even
+/// when several terminals share the same cwd.
+pub fn build_for_terminal(port: u16, token: &str, terminal_id: Option<&str>) -> serde_json::Value {
     // `-s` keeps curl quiet on success; `--max-time` matters because a hook
     // that hangs stalls the session, and the shell is a local listener that
     // either answers immediately or is gone (app quit mid-session).
     let post = |path: &str| {
+        let suffix = terminal_id.map(|t| format!("?terminal={}", t)).unwrap_or_default();
         format!(
             "curl -s --max-time 2 -X POST -H 'Authorization: Bearer {token}' \
 -H 'Content-Type: application/json' --data-binary @- \
-http://127.0.0.1:{port}{path}"
+http://127.0.0.1:{port}{path}{suffix}"
         )
     };
 
@@ -105,14 +110,27 @@ http://127.0.0.1:{port}{path}"
     })
 }
 
-/// Write the settings file next to `control.json`, 0600, atomically.
+/// Per-terminal settings file name, written next to `control.json`.
+/// The frontend and Rust both compute the same path from the terminal id.
+pub fn terminal_file_name(terminal_id: &str) -> String {
+    format!("claude-hooks-{terminal_id}.json")
+}
+
+/// Write a per-terminal settings file next to `control.json`, 0600, atomically.
 ///
-/// Returns the path to hand to `claude --settings`.
-pub fn write(dir: &Path, port: u16, token: &str) -> Result<PathBuf> {
+/// `terminal_id` is baked into the hook + statusline URLs as a query parameter.
+/// Returns the absolute path to hand to `claude --settings`.
+pub fn write_for_terminal(
+    dir: &Path,
+    port: u16,
+    token: &str,
+    terminal_id: Option<&str>,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join(FILE_NAME);
-    let data = serde_json::to_vec_pretty(&build(port, token))
+    let file_name = terminal_id.map(terminal_file_name).unwrap_or_else(|| FILE_NAME.to_string());
+    let path = dir.join(file_name);
+    let data = serde_json::to_vec_pretty(&build_for_terminal(port, token, terminal_id))
         .context("serialize claude hook settings")?;
 
     let tmp = path.with_extension("json.tmp");
@@ -148,7 +166,7 @@ mod tests {
     /// every command string — "a settings file was produced" is not the claim.
     #[test]
     fn every_command_carries_the_live_port_and_token() {
-        let v = build(44945, "tok-abc123");
+        let v = build_for_terminal(44945, "tok-abc123", None);
         let s = serde_json::to_string(&v).unwrap();
 
         assert!(!s.contains("127.0.0.1:0/"), "port 0 leaked back in: {s}");
@@ -167,7 +185,7 @@ mod tests {
 
     #[test]
     fn covers_every_event_the_shell_listens_for() {
-        let v = build(1, "t");
+        let v = build_for_terminal(1, "t", None);
         let hooks = v["hooks"].as_object().expect("hooks object");
         for event in HOOK_EVENTS {
             assert!(hooks.contains_key(*event), "missing hook event {event}");
@@ -190,7 +208,7 @@ mod tests {
     #[test]
     fn writes_a_private_file_and_returns_its_path() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = write(dir.path(), 4242, "tok").expect("write");
+        let path = write_for_terminal(dir.path(), 4242, "tok", None).expect("write");
         assert_eq!(path.file_name().unwrap(), FILE_NAME);
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("127.0.0.1:4242"));
@@ -202,5 +220,17 @@ mod tests {
         }
         // No `.tmp` left behind.
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn per_terminal_build_bakes_terminal_id_into_urls() {
+        let v = build_for_terminal(44945, "tok-abc123", Some("term-xyz"));
+        let s = serde_json::to_string(&v).unwrap();
+
+        assert!(s.contains("127.0.0.1:44945/iyke/hooks/event?terminal=term-xyz"));
+        assert!(s.contains("127.0.0.1:44945/iyke/statusline/event?terminal=term-xyz"));
+        // No un-attributed (bare) hook URLs.
+        assert!(!s.contains("/iyke/hooks/event\""));
+        assert!(!s.contains("/iyke/statusline/event\""));
     }
 }

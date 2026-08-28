@@ -189,4 +189,27 @@ describe('claude --settings injection', () => {
 			expect(cmd.join(' ')).not.toContain('--settings');
 		}
 	});
+
+	it('builds a per-terminal --settings path when a terminal id is supplied', () => {
+		__setClaudeSettingsPathForTests('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+		const cmd = buildClaudeWrappedCmd({ shellTarget: 'bash', terminalId: 'term-xyz' });
+		const script = cmd.join(' ');
+		expect(script).toContain('--settings');
+		expect(script).toContain('/run/user/1000/app.ikenga/claude-hooks-term-xyz.json');
+		// And the legacy shared file is NOT used.
+		expect(script).not.toContain('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+	});
+
+	it('passes --resume before the positional prompt when resuming a claude session', () => {
+		__setClaudeSettingsPathForTests('/run/user/1000/app.ikenga/claude-hooks-settings.json');
+		const cmd = buildClaudeWrappedCmd({
+			shellTarget: 'bash',
+			terminalId: 'term-abc',
+			resumeSessionId: 'sess-resume-123',
+			prompt: 'continue where we left off',
+		});
+		expect(extractInvocation(cmd)).toBe(
+			`'claude' '--dangerously-skip-permissions' '--settings' '/run/user/1000/app.ikenga/claude-hooks-term-abc.json' '--resume' 'sess-resume-123' 'continue where we left off'`
+		);
+	});
 });

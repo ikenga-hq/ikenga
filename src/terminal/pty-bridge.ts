@@ -249,6 +249,7 @@ export class Pty {
 			env: opts.env,
 			rows: opts.rows,
 			cols: opts.cols,
+			settingsPath: opts.settingsPath,
 		});
 		const pty = new Pty(id, opts.label ?? opts.cmd.join(' '), opts.cwd);
 		try {

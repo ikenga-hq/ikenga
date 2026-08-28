@@ -6,8 +6,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import type { LeafNode, PaneView } from '@/lib/panes/types';
 import { useDefaultShellProfile } from '@/lib/shell-profiles';
 import { NAV_GROUPS } from '@/shell/nav-config';
-import { buildClaudeWrappedCmd } from '@/terminal/claude-wrap';
-import { createTerminalSession } from '@/terminal/single-terminal';
+import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 
 interface NewTabMenuProps {
 	leaf: LeafNode;
@@ -110,10 +109,7 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 							onSelect={() =>
 								commit({
 									kind: 'terminal',
-									sessionId: createTerminalSession({
-										cmd: buildClaudeWrappedCmd(),
-										title: 'claude',
-									}),
+									sessionId: createClaudeTerminalSession(),
 								})
 							}
 							Icon={TerminalIcon}
@@ -128,13 +124,7 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 									onSelect={() =>
 										commit({
 											kind: 'terminal',
-											sessionId: createTerminalSession({
-												cmd: buildClaudeWrappedCmd({
-													shellTarget: 'wsl',
-													wslDistro: p.distro,
-												}),
-												title: `claude (${p.distro ?? 'wsl'})`,
-											}),
+											sessionId: createClaudeTerminalSession({ shellTarget: 'wsl', wslDistro: p.distro }),
 										})
 									}
 									Icon={TerminalIcon}

@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
+    extract::Query,
     http::StatusCode,
     response::IntoResponse,
     Extension, Json,
@@ -27,6 +28,8 @@ fn get_events_store() -> &'static Arc<Mutex<Vec<HookPayload>>> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookPayload {
+    #[serde(default, rename = "ikenga_terminal_id")]
+    pub ikenga_terminal_id: Option<String>,
     #[serde(default, rename = "hook_event_name")]
     pub hook_event_name: Option<String>,
     #[serde(default, rename = "session_id")]
@@ -53,11 +56,23 @@ pub struct HookPayload {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookEventQuery {
+    pub terminal: Option<String>,
+}
+
 /// Post route handler: POST /iyke/hooks/event
 pub async fn post_hook_event(
     Extension(app): Extension<AppHandle>,
-    Json(payload): Json<HookPayload>,
+    Query(query): Query<HookEventQuery>,
+    Json(mut payload): Json<HookPayload>,
 ) -> impl IntoResponse {
+    // The query parameter is authoritative: the settings file is generated
+    // per-terminal and the URL it POSTs to carries `?terminal=<id>`.
+    if payload.ikenga_terminal_id.is_none() {
+        payload.ikenga_terminal_id = query.terminal.clone();
+    }
+
     if let Ok(mut store) = get_events_store().lock() {
         store.push(payload.clone());
         if store.len() > 200 {

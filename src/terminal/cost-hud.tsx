@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { iykeFetch } from '@/lib/iyke/client';
 
 export interface StatuslineSnapshot {
+	ikenga_terminal_id?: string;
 	session_id?: string;
 	cwd?: string;
 	transcript_path?: string;
@@ -31,23 +32,27 @@ export interface StatuslineSnapshot {
 	};
 }
 
-export function CostHud() {
+export function CostHud({ sessionId }: { sessionId: string }) {
 	const [snapshot, setSnapshot] = useState<StatuslineSnapshot | null>(null);
 
 	useEffect(() => {
-		// Initial fetch from backend snapshot REST endpoint if available
+		// Initial fetch from backend snapshot REST endpoint if available.
 		// Live endpoint + bearer token — see the note in tool-call-feed.tsx.
+		// The endpoint now returns a per-terminal map; we pick this terminal's
+		// snapshot and ignore events from siblings.
 		iykeFetch('/iyke/statusline/snapshot')
 			.then((res) => (res.ok ? res.json() : null))
-			.then((data) => {
-				if (data) setSnapshot(data);
+			.then((data: Record<string, StatuslineSnapshot> | null) => {
+				if (data) {
+					setSnapshot(data[sessionId] ?? null);
+				}
 			})
 			.catch(() => {});
 
 		// Subscribe to real-time statusline updates over Tauri event bus
 		let unlisten: (() => void) | undefined;
 		listen<StatuslineSnapshot>('statusline://snapshot', (event) => {
-			if (event.payload) {
+			if (event.payload?.ikenga_terminal_id === sessionId) {
 				setSnapshot(event.payload);
 			}
 		})
