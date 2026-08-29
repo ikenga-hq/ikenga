@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// + top-level optional `signature`. All additive; api=1/2 manifests parse
 /// unchanged. Elevated caps are inert unless the pkg is trusted (builtin
 /// provenance OR signature-verified registry).
-pub const IKENGA_API_VERSION: u32 = 3;
+pub const IKENGA_API_VERSION: u32 = 4;
 
 /// Smallest supported manifest version. Packages with older `ikenga_api` are
 /// auto-disabled at boot; the kernel surfaces them with an "update required"
@@ -46,6 +46,9 @@ pub struct Manifest {
 
     #[serde(default)]
     pub kind: Option<String>, // "skill" | "embedded" | "windowed" — hint, not enforced
+
+    #[serde(default)]
+    pub auth_bridge: Option<ManifestAuthBridge>,
 
     #[serde(default)]
     pub author: Option<Author>,
@@ -394,6 +397,8 @@ pub struct WebviewCapability {
     /// (`@ikenga/contract`).
     #[serde(default = "default_engines")]
     pub engines: Vec<BrowserEngine>,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 /// host.fetch capability (ADR-017). URL allowlist reuses `permissions.net`; an
@@ -472,6 +477,12 @@ pub struct Author {
     pub name: String,
     #[serde(default)]
     pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestAuthBridge {
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +606,15 @@ pub struct Permissions {
     /// — keep in lockstep.
     #[serde(default)]
     pub engine: Vec<String>,
+
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestUiSession {
+    pub persistence: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -624,6 +644,9 @@ pub struct UiBlock {
     /// Directive name → allowlist sources. Empty / missing = blocked.
     #[serde(default)]
     pub permissions: Option<HashMap<String, Vec<String>>>,
+
+    #[serde(default)]
+    pub session: Option<ManifestUiSession>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,9 +657,11 @@ pub struct UiRoute {
     /// `iframe` (loaded via the existing iframe content-pane) or `component`
     /// (deferred — registered but not mountable yet).
     pub kind: String,
-    /// For `iframe`: a URL or package-relative HTML path. For `component`: an
+    /// For `iframe`/`webview`: a URL or package-relative HTML path. For `component`: an
     /// identifier the FE will resolve in a later phase.
     pub source: String,
+    #[serde(default)]
+    pub partition: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

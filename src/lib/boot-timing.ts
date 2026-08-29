@@ -128,7 +128,7 @@ export function resetBootTimings(): void {
 }
 
 // Expose on window in dev for manual REPL inspection.
-if (import.meta.env.DEV && typeof window !== 'undefined') {
+if (import.meta.env?.DEV && typeof window !== 'undefined') {
 	type Win = Window & {
 		__bootTimings?: {
 			compute: typeof computeBootTimings;

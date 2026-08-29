@@ -20,7 +20,7 @@ function IntegrationsPage() {
 	const status = useQuery(vaultStatusQueryOptions());
 	const keys = useQuery(vaultKeysQueryOptions());
 
-	const supabaseUrl = import.meta.env.VITE_SUPABASE_URL ?? '';
+	const supabaseUrl = import.meta.env?.VITE_SUPABASE_URL ?? '';
 	const known = new Set(keys.data ?? []);
 	const supabaseAnonPresent = known.has('VITE_SUPABASE_ANON_KEY');
 	const vaultAvailable = status.data?.available ?? false;

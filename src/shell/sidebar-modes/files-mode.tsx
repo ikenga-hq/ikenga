@@ -38,6 +38,7 @@ import {
 	DropdownMenuContent,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { useGitStatus } from '@/lib/shell/use-git-status';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -250,6 +251,10 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 		void writeText(entry.path).catch(() => {});
 	}, [entry.path]);
 
+	const { data: gitStatus } = useGitStatus();
+	const fileGitStatus = entry.isDir ? undefined : gitStatus?.files.get(entry.path);
+	const isDirtyFolder = entry.isDir ? gitStatus?.dirtyFolders.has(entry.path) : false;
+
 	return (
 		<div>
 			<ContextMenu>
@@ -297,9 +302,15 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 							<span className="h-3 w-3 shrink-0" aria-hidden />
 						)}
 						{entry.isDir ? (
-							<Folder className="h-3.5 w-3.5 shrink-0" />
+							<Folder className={cn('h-3.5 w-3.5 shrink-0', isDirtyFolder && 'text-amber-400/90')} />
 						) : (
-							<FileText className="h-3.5 w-3.5 shrink-0" />
+							<FileText className={cn(
+								'h-3.5 w-3.5 shrink-0',
+								fileGitStatus === 'modified' && 'text-amber-400',
+								fileGitStatus === 'added' && 'text-emerald-400',
+								fileGitStatus === 'untracked' && 'text-emerald-500/80',
+								fileGitStatus === 'conflicted' && 'text-red-400'
+							)} />
 						)}
 						{renaming ? (
 							<input
@@ -321,7 +332,32 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 								className="w-full min-w-0 rounded border border-border bg-background px-1 py-0 text-xs text-foreground outline-none focus:border-ring"
 							/>
 						) : (
-							<span className="flex-1 whitespace-nowrap">{entry.name}</span>
+							<span className={cn(
+								'flex-1 whitespace-nowrap',
+								fileGitStatus === 'modified' && 'text-amber-400 font-medium',
+								fileGitStatus === 'added' && 'text-emerald-400 font-medium',
+								fileGitStatus === 'untracked' && 'text-emerald-500/80',
+								fileGitStatus === 'conflicted' && 'text-red-400 font-medium'
+							)}>
+								{entry.name}
+							</span>
+						)}
+						{entry.isDir && isDirtyFolder && (
+							<span className="ml-1.5 h-1.5 w-1.5 rounded-full bg-amber-400/80 shrink-0" title="Contains modified files" />
+						)}
+						{!entry.isDir && fileGitStatus && (
+							<span className={cn(
+								'ml-auto font-mono text-[10px] font-semibold px-1 shrink-0',
+								fileGitStatus === 'modified' && 'text-amber-400',
+								fileGitStatus === 'added' && 'text-emerald-400',
+								fileGitStatus === 'untracked' && 'text-emerald-500/80',
+								fileGitStatus === 'conflicted' && 'text-red-400'
+							)}>
+								{fileGitStatus === 'modified' && 'M'}
+								{fileGitStatus === 'added' && 'A'}
+								{fileGitStatus === 'untracked' && 'U'}
+								{fileGitStatus === 'conflicted' && 'C'}
+							</span>
 						)}
 					</ListRow>
 				</ContextMenuTrigger>

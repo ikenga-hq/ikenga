@@ -6,6 +6,11 @@ import {
 	Clock,
 	Folder,
 	FolderKanban,
+	GitBranch,
+	GitCommit,
+	GitFork,
+	GitGraph,
+	GitPullRequest,
 	Grid3x3,
 	Layers,
 	LayoutDashboard,
@@ -148,6 +153,13 @@ const PKG_ICONS: Record<string, LucideIcon> = {
 	'folder-kanban': FolderKanban,
 	pencil: Pencil,
 	package: Package,
+	'git-branch': GitBranch,
+	'git-fork': GitFork,
+	'git-pull-request': GitPullRequest,
+	'git-commit': GitCommit,
+	'git-graph': GitGraph,
+	history: Clock,
+	'layout-grid': LayoutGrid,
 };
 
 function iconForPkg(name: string | null | undefined): LucideIcon {

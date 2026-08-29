@@ -10,7 +10,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import { createRouter, RouterProvider } from '@tanstack/react-router';
 import React from 'react';
-import ReactDOM from 'react-dom/client';
+import { createRoot } from 'react-dom/client';
 import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { queryClient } from '@/lib/query-client';
 import { initDefaultCwd } from '@/lib/shell/default-cwd';
@@ -41,7 +41,7 @@ export function bootPrimary(): void {
 	// Dev-only globals (e.g. `window.ikengaAcpSmoke` for the ACP migration
 	// Phase 3 smoke test). Lazy-imported so production builds tree-shake the
 	// helper entirely.
-	if (import.meta.env.DEV) {
+	if (import.meta.env?.DEV) {
 		void import('@/lib/dev');
 	}
 
@@ -79,14 +79,14 @@ export function bootPrimary(): void {
 	// window:// lifecycle bus.
 	initDetachedSurfaceTracking();
 
-	ReactDOM.createRoot(document.getElementById('root')!).render(
+	createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
 			<ErrorBoundary>
 				<QueryClientProvider client={queryClient}>
 					<RouterProvider router={router} />
 					<FilepickerModal />
 					<ReauthOverlay />
-					{import.meta.env.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
+					{import.meta.env?.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
 				</QueryClientProvider>
 			</ErrorBoundary>
 		</React.StrictMode>
