@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query';
+import { pkgKernelStatus } from '@/lib/tauri-cmd';
 import type { PaneView } from '@/lib/panes/types';
 import type { TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import { RouteView } from './views/route-view';
@@ -83,4 +85,27 @@ export function viewSubtitle(view: PaneView, resolveTerminal?: TerminalTitleReso
 		case 'scratchpad':
 			return view.scope;
 	}
+}
+
+/**
+ * Resolves a PaneView to its webview UiRouteEntry if it's a webview route.
+ * Used by PaneToolbar to inspect whether a pane is hosting a webview route.
+ */
+export function useWebviewRoute(view: PaneView | undefined) {
+	const { data } = useQuery({
+		queryKey: ['pkg-kernel-status'],
+		queryFn: pkgKernelStatus,
+		staleTime: Infinity,
+	});
+
+	if (!data || !view || view.kind !== 'route') return null;
+	const match = view.path.match(/^\/pkg\/([^/]+)(.*)$/);
+	if (!match) return null;
+	const pkgId = match[1];
+	const splat = match[2] || '/';
+	
+	const entries = (data.registries?.ui_routes as any)?.entries ?? [];
+	const entry = entries.find((e: any) => e.pkg_id === pkgId && (e.path === splat || e.path === splat + '/'));
+	if (entry?.kind === 'webview') return entry;
+	return null;
 }

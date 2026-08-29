@@ -129,8 +129,8 @@ pub use pkg_sidecar_stream::{
 pub use pkg_studio::pkg_studio_request_project_access;
 pub use pkg_trust::{pkg_trust_approve, pkg_trust_list_pending, pkg_trust_reject};
 pub use pkg_webview::{
-    pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
-    WebviewPanesState,
+    pkg_webview_clear_session, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate,
+    pkg_webview_set_rect, WebviewPanesState,
 };
 pub use projects::{
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory,

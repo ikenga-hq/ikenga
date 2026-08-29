@@ -224,6 +224,53 @@ pub struct WebviewPanesRegistry {
 struct PkgCapability {
     child_webviews: bool,
     partitions: Vec<String>,
+    /// `None` = field absent (permissive + warn), `Some(list)` = enforced.
+    allowed_origins: Option<Vec<String>>,
+}
+
+/// Does `origin` satisfy the pkg's declared `allowed_origins`?
+///
+/// `None` (the manifest never declared the field) is permissive — a pkg
+/// authored before v4, or from the pre-v4 scaffold template, must keep
+/// mounting rather than failing with an error naming a field it was never
+/// taught to write. Callers emit a `tracing::warn!` on that path.
+///
+/// A declared list is enforced, and an empty one denies everything (an
+/// explicit lockdown is a legitimate thing to write). Entries match as:
+///   - `*`                        — any origin
+///   - `https://app.example.com`  — exact origin
+///   - `https://*.example.com`    — any strict subdomain of example.com
+fn origin_allowed(origin: &str, allowed: &Option<Vec<String>>) -> bool {
+    let Some(list) = allowed else { return true };
+    list.iter().any(|pat| origin_matches(origin, pat))
+}
+
+fn origin_matches(origin: &str, pat: &str) -> bool {
+    if pat == "*" || pat == origin {
+        return true;
+    }
+    // `<scheme>://*.<suffix>` — the only glob shape we accept. Anything else
+    // is treated as a literal, so a typo fails closed instead of widening.
+    let Some((pat_scheme, pat_rest)) = pat.split_once("://") else {
+        return false;
+    };
+    let Some(suffix) = pat_rest.strip_prefix("*.") else {
+        return false;
+    };
+    if suffix.is_empty() || suffix.contains('/') {
+        return false;
+    }
+    let Some((origin_scheme, host)) = origin.split_once("://") else {
+        return false;
+    };
+    if origin_scheme != pat_scheme {
+        return false;
+    }
+    // Strict subdomain: `a.example.com` matches `*.example.com`;
+    // bare `example.com` does not (list it explicitly if you want it).
+    host.len() > suffix.len() + 1
+        && host.ends_with(suffix)
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
 }
 
 impl WebviewPanesRegistry {
@@ -284,6 +331,23 @@ impl WebviewPanesRegistry {
 
         let label = webview_label(pkg_id, pane_id);
         let parsed_url = url::Url::parse(url).with_context(|| format!("parse url `{url}`"))?;
+
+        let origin = parsed_url.origin().unicode_serialization();
+        if cap.allowed_origins.is_none() {
+            tracing::warn!(
+                pkg_id,
+                origin = %origin,
+                "pkg declares no `capabilities.webview.allowed_origins`; mounting \
+                 without an origin boundary. Declare the field to bound navigation."
+            );
+        }
+        if !origin_allowed(&origin, &cap.allowed_origins) {
+            return Err(anyhow!(
+                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
+                 (declared: {:?})",
+                cap.allowed_origins.as_deref().unwrap_or(&[])
+            ));
+        }
 
         let data_dir = partition_dir(app, pkg_id, partition)?;
         std::fs::create_dir_all(&data_dir)
@@ -361,6 +425,22 @@ impl WebviewPanesRegistry {
             .lookup(pkg_id, pane_id)
             .ok_or_else(|| anyhow!("no webview pane for ({pkg_id}, {pane_id})"))?;
         let parsed = url::Url::parse(url).with_context(|| format!("parse url `{url}`"))?;
+
+        let cap = self
+            .pkg_capabilities
+            .read()
+            .map_err(|_| anyhow!("pkg_capabilities lock poisoned"))?
+            .get(pkg_id)
+            .cloned()
+            .unwrap_or_default();
+        let origin = parsed.origin().unicode_serialization();
+        if !origin_allowed(&origin, &cap.allowed_origins) {
+            return Err(anyhow!(
+                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
+                 (declared: {:?})",
+                cap.allowed_origins.as_deref().unwrap_or(&[])
+            ));
+        }
         handle
             .surface
             .navigate(parsed)
@@ -382,9 +462,6 @@ impl WebviewPanesRegistry {
         Ok(())
     }
 
-    /// Phase 5: flip the per-pane pause flag. Returns the previous value
-    /// so callers can detect no-ops if they care. Always succeeds for any
-    /// known pane; unknown panes return an error.
     pub fn set_paused(&self, pkg_id: &str, pane_id: &str, paused: bool) -> Result<bool> {
         let handle = self
             .lookup(pkg_id, pane_id)
@@ -394,6 +471,67 @@ impl WebviewPanesRegistry {
             .swap(paused, std::sync::atomic::Ordering::SeqCst);
         log::info!("[pkg_webview] pane=({pkg_id},{pane_id}) paused {prev} -> {paused}");
         Ok(prev)
+    }
+
+    pub fn clear_session(&self, app: &AppHandle, pkg_id: &str, pane_id: &str) -> Result<()> {
+        let (_partition, data_dir) = {
+            let handle = self
+                .lookup(pkg_id, pane_id)
+                .ok_or_else(|| anyhow!("no webview pane for ({pkg_id}, {pane_id})"))?;
+            
+            #[cfg(target_os = "macos")]
+            {
+                if let PaneSurface::InWindow(w) = &handle.surface {
+                    if let Err(e) = w.clear_all_browsing_data() {
+                        log::warn!("[pkg_webview] clear_all_browsing_data failed on macOS: {e}");
+                    }
+                }
+            }
+
+            let partition = handle.partition.clone();
+            let data_dir = partition_dir(app, pkg_id, &partition)?;
+            (partition, data_dir)
+        };
+
+        // Ordering constraint (G-23): Destroy webview and release network process before unlinking
+        if let Err(e) = self.destroy(pkg_id, pane_id) {
+            log::warn!("[pkg_webview] clear_session destroy failed for ({pkg_id}, {pane_id}): {e}");
+        }
+
+        // Wipe session storage on disk
+        if std::fs::metadata(&data_dir).is_ok() {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                std::fs::remove_dir_all(&data_dir)
+                    .with_context(|| format!("remove webjars dir {}", data_dir.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_clear_on_exit(&self, app: &AppHandle) {
+        // macOS: We cannot easily wipe WKWebView data store for a specific identifier without the webview running.
+        // For now, we rely on the fact that WKWebView stores its data in the app's Library/WebKit directory,
+        // but since we can't target the exact `clear-on-exit` partition easily without the webview, we only
+        // clear the Linux/Windows data directories here.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        {
+            if let Ok(app_data) = app.path().app_data_dir() {
+                let webjars_dir = app_data.join("webjars");
+                if let Ok(entries) = std::fs::read_dir(&webjars_dir) {
+                    for entry in entries.flatten() {
+                        let clear_on_exit_dir = entry.path().join("clear-on-exit");
+                        if std::fs::metadata(&clear_on_exit_dir).is_ok() {
+                            if let Err(e) = std::fs::remove_dir_all(&clear_on_exit_dir) {
+                                log::warn!("[pkg_webview] failed to wipe clear-on-exit dir {}: {e}", clear_on_exit_dir.display());
+                            } else {
+                                log::info!("[pkg_webview] wiped clear-on-exit partition at {}", clear_on_exit_dir.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn is_paused(&self, pkg_id: &str, pane_id: &str) -> Result<bool> {
@@ -588,6 +726,7 @@ impl Registry for WebviewPanesRegistry {
             .map(|w| PkgCapability {
                 child_webviews: w.child_webviews,
                 partitions: w.partitions.clone(),
+                allowed_origins: w.allowed_origins.clone(),
             })
             .unwrap_or_default();
         self.pkg_capabilities
@@ -841,4 +980,65 @@ where
     .map_err(|e| anyhow!("run_on_main_thread: {e}"))?;
     rx.await
         .map_err(|e| anyhow!("main-thread channel closed: {e}"))?
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::{origin_allowed, origin_matches};
+
+    fn list(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn absent_field_is_permissive_so_pre_v4_manifests_still_mount() {
+        // G-28: `#[serde(default)]` on a Vec made "absent" indistinguishable
+        // from "deny everything", which broke the ui-webview scaffold template.
+        assert!(origin_allowed("https://anything.example.com", &None));
+    }
+
+    #[test]
+    fn declared_but_empty_is_an_explicit_lockdown() {
+        assert!(!origin_allowed("https://example.com", &list(&[])));
+    }
+
+    #[test]
+    fn exact_origin_matches() {
+        assert!(origin_allowed("https://sentry.io", &list(&["https://sentry.io"])));
+        assert!(!origin_allowed("https://evil.io", &list(&["https://sentry.io"])));
+    }
+
+    #[test]
+    fn star_allows_everything() {
+        assert!(origin_allowed("https://whatever.test", &list(&["*"])));
+    }
+
+    #[test]
+    fn subdomain_glob_matches_the_poc_manifests() {
+        // G-35: the three PoC packages ship exactly these patterns, and the
+        // old exact-comparison matcher rejected every one of them at mount.
+        assert!(origin_allowed(
+            "https://artists.spotify.com",
+            &list(&["https://*.spotify.com"])
+        ));
+        assert!(origin_allowed("https://sentry.io", &list(&["https://*.sentry.io", "https://sentry.io"])));
+        assert!(origin_allowed("https://www.notion.so", &list(&["https://*.notion.so"])));
+    }
+
+    #[test]
+    fn subdomain_glob_is_strict_about_scheme_apex_and_suffix_boundaries() {
+        assert!(!origin_matches("http://a.example.com", "https://*.example.com"));
+        // bare apex does not match `*.example.com` — list it explicitly
+        assert!(!origin_matches("https://example.com", "https://*.example.com"));
+        // must break on a dot: notexample.com is not a subdomain of example.com
+        assert!(!origin_matches("https://notexample.com", "https://*.example.com"));
+        assert!(!origin_matches("https://evil.com/example.com", "https://*.example.com"));
+    }
+
+    #[test]
+    fn malformed_patterns_fail_closed_rather_than_widening() {
+        assert!(!origin_matches("https://a.example.com", "https://*"));
+        assert!(!origin_matches("https://a.example.com", "*.example.com"));
+        assert!(!origin_matches("https://a.example.com", "https://*./"));
+    }
 }
