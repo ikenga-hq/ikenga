@@ -397,8 +397,13 @@ pub struct WebviewCapability {
     /// (`@ikenga/contract`).
     #[serde(default = "default_engines")]
     pub engines: Vec<BrowserEngine>,
+    /// Origins this pkg's webviews may load. `None` (field absent) is
+    /// permissive-with-warning so pre-v4 manifests and packages scaffolded
+    /// before the field existed keep mounting; `Some([])` is an explicit
+    /// deny-all lockdown; `Some(list)` matches exactly, `"*"` (any), or a
+    /// `https://*.example.com` subdomain glob. See `origin_allowed`.
     #[serde(default)]
-    pub allowed_origins: Vec<String>,
+    pub allowed_origins: Option<Vec<String>>,
 }
 
 /// host.fetch capability (ADR-017). URL allowlist reuses `permissions.net`; an
@@ -859,6 +864,7 @@ mod tests {
             version: "0.1.0".into(),
             ikenga_api: "1".into(),
             kind: None,
+            auth_bridge: None,
             author: None,
             targets: vec![],
             mcp: vec![],

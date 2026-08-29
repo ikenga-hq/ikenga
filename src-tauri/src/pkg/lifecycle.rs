@@ -1543,6 +1543,7 @@ mod tests {
             version: "0.1.0".into(),
             ikenga_api: "1".into(),
             kind: None,
+            auth_bridge: None,
             author: None,
             targets: vec![],
             mcp: vec![],
