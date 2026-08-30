@@ -24,6 +24,7 @@ import { ActionBar } from '@/components/pkg/actions/action-bar';
 import { PkgIframeHost } from '@/components/pkg/pkg-iframe-host';
 import { PkgWebviewHost } from '@/components/pkg/pkg-webview-host';
 import { pkgKernelStatus } from '@/lib/tauri-cmd';
+import { usePaneScope } from '@/shell/panes/views/route-view';
 
 export const Route = createFileRoute('/pkg/$pkgId/$')({
 	component: PkgRouteCatchAll,
@@ -35,6 +36,7 @@ interface UiRouteEntry {
 	path: string;
 	kind: string;
 	source: string;
+	partition?: string;
 }
 
 type State =
@@ -48,9 +50,11 @@ type State =
 function PkgRouteCatchAll() {
 	const { pkgId, _splat } = Route.useParams() as { pkgId: string; _splat: string };
 	const navigate = useNavigate();
+	const paneScope = usePaneScope();
 	// The splat doesn't include the leading slash; the registry stores
 	// entries with a leading-slash path, so we add it back here.
 	const routePath = `/${_splat ?? ''}`.replace(/\/+$/, '/').replace(/\/$/, '') || '/';
+	const paneId = paneScope ?? `${pkgId}:${routePath}`;
 
 	const [state, setState] = useState<State>({ kind: 'loading' });
 
@@ -152,16 +156,13 @@ function PkgRouteCatchAll() {
 		);
 	}
 	if (state.kind === 'webview') {
-		// The kernel keys child-webview handles on (pkg_id, pane_id). We don't
-		// have a true Pane abstraction at this catch-all (panes belong to the
-		// shell's layout layer; this route renders into whichever pane was
-		// focused at navigation time), so we derive a stable pane_id from the
-		// pkg + route path. That's "stable across re-renders of the same
-		// route" — which is the only stability the kernel needs — without
-		// requiring us to plumb the real pane id all the way down here.
-		const paneId = `${state.entry.pkg_id}:${state.entry.path}`;
 		return (
-			<PkgWebviewHost pkgId={state.entry.pkg_id} paneId={paneId} source={state.entry.source} />
+			<PkgWebviewHost
+				pkgId={state.entry.pkg_id}
+				paneId={paneId}
+				source={state.entry.source}
+				partition={state.entry.partition}
+			/>
 		);
 	}
 	// WP-25: a pane whose pkg `requires` skills surfaces those skills' actions

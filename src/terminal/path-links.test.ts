@@ -320,25 +320,27 @@ describe('scanLineForPaths — the wall-clock budget must not eat ordinary lines
 		// Simulates a descheduled process: every clock read is far past any
 		// deadline. Before the token threshold this returned [] for a 43-char
 		// line, which is how two tests failed only under full-suite parallelism.
-		const realNow = performance.now;
-		performance.now = () => 1e12;
+		const spy = vi.spyOn(performance, 'now').mockReturnValue(1e12);
 		try {
 			const spans = scanLineForPaths('› [image] /tmp/v1-list-detail.png (145.3KB)');
 			expect(spans.map((s) => s.text)).toEqual(['/tmp/v1-list-detail.png']);
 		} finally {
-			performance.now = realNow;
+			spy.mockRestore();
 		}
 	});
 
 	it('still bails out on pathological input', () => {
-		const realNow = performance.now;
-		performance.now = () => 1e12;
+		let calls = 0;
+		const spy = vi.spyOn(performance, 'now').mockImplementation(() => {
+			calls++;
+			return calls === 1 ? 0 : 1e12;
+		});
 		try {
 			// 2000 tokens, well past the 64-token grace — the guard must engage.
 			const spans = scanLineForPaths(Array(2000).fill('a/b.ts').join(' '));
 			expect(spans.length).toBeLessThan(2000);
 		} finally {
-			performance.now = realNow;
+			spy.mockRestore();
 		}
 	});
 });

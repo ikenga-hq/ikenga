@@ -94,6 +94,17 @@ impl Registry for SidecarsRegistry {
                     bin_path.display()
                 ));
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(&bin_path) {
+                    let mut perms = metadata.permissions();
+                    if perms.mode() & 0o111 == 0 {
+                        perms.set_mode(perms.mode() | 0o755);
+                        let _ = std::fs::set_permissions(&bin_path, perms);
+                    }
+                }
+            }
             new_entries.push(SidecarEntry {
                 pkg_id: pkg.manifest.id.clone(),
                 name: spec.name.clone(),

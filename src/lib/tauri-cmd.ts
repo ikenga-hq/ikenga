@@ -2979,6 +2979,10 @@ export async function pkgWebviewNavigate(
 	return invoke('pkg_webview_navigate', { pkgId, paneId, url });
 }
 
+export async function pkgWebviewClearSession(pkgId: string, paneId: string): Promise<void> {
+	return invoke('pkg_webview_clear_session', { pkgId, paneId });
+}
+
 // ─── Pkg MCP tool routing ───────────────────────────────────────────────
 //
 // v1 stub. The host bridge calls this when the iframe fires an MCP
