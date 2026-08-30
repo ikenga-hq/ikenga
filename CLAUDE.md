@@ -127,10 +127,16 @@ Captured during Phase 0 of the `pkg-browser` design. Read this before adding any
 - **Webview** — native child webview managed by `pkg/webview.rs::WebviewPanesRegistry` and rendered (positionally) by `src/components/pkg/pkg-webview-host.tsx`. Required for any pkg driving a site that blocks iframe embedding via CSP `frame-ancestors`. Requires `capabilities.webview.child_webviews = true` in the manifest plus a declared partition list. See *Phase 1 — final per-OS architecture* below for the macOS/Windows/Linux split.
 - **Component** — recorded but renders as `<PkgRouteUnmountable />` for non-builtins. Builtins (Tasks) bypass the catch-all by registering host routes directly.
 
-### Not-yet-built: child webviews
+### Child webviews — built (see "Phase 1 — child-webview kernel" below)
 
-- `tauri.conf.json` declares **one window**. No multi-webview, no `WebviewWindowBuilder`/`WebviewBuilder` usage anywhere in `src-tauri/`. Only `commands/screenshot.rs` references `WebviewWindow` and only to read pixels from the existing main window.
-- Tauri 2's multi-webview is stable in 2.x and doesn't require the old `unstable` flag, but the kernel exposes no `create_child_webview` / `eval_in_pane` / cookie-partition APIs to pkgs today. This is the load-bearing prerequisite for `pkg-browser` and any other pkg that needs to drive arbitrary external sites (iframes hit CSP `frame-ancestors` on Spotify-for-Artists, Bandcamp, partner portals, etc.).
+- The kernel owns child webviews via `pkg/webview.rs` (`WebviewPanesRegistry`) and the
+  `pkg_webview_create / destroy / navigate / set_rect` commands in `commands/pkg_webview.rs`.
+  `eval` exists on the registry but is deliberately **not** exposed as a Tauri command.
+- Mounting is gated on `ui.routes[].kind = "webview"` plus `capabilities.webview.child_webviews`;
+  cookie jars are per-pkg, per-partition under `app_data_dir/webjars/<pkg-slug>/<partition>/`, and
+  navigation is bounded by `capabilities.webview.allowed_origins` (absent = permissive + warn).
+- This is the load-bearing prerequisite for `pkg-browser` and any pkg that drives external sites
+  (iframes hit CSP `frame-ancestors` on Spotify-for-Artists, Bandcamp, partner portals, etc.).
 - WebKitGTK on Linux (`libwebkit2gtk-4.1` per the deb deps), WKWebView on macOS, WebView2 on Windows. CDP is only reachable on WebView2 (Windows only) — `eval()` over Tauri IPC is the cross-platform surface.
 
 ### MCP runtime — two paths, both stdio JSON-RPC
@@ -162,7 +168,7 @@ Phase 1 ("kernel: child-webview panes") is real net-new work, not just plumbing:
 
 1. New Tauri commands in `commands/pkg_webview.rs`: `pkg_webview_create / destroy / navigate / eval / set_visible`. Backed by `WebviewWindowBuilder` / per-window webview API. Cookie partition keyed by an opaque jar id passed by the pkg.
 2. New `WebviewPanesRegistry` in `pkg/registries/webview_panes.rs` — tracks `(pkg_id, pane_id) → webview handle`, cleans up on `unregister`.
-3. New manifest variant: `ui.routes[].kind = "webview"` *or* a separate `webview_panes` block (TBD in Phase 2). Plus `capabilities.webview = { partitions: string[] }`.
+3. New manifest variant: `ui.routes[].kind = "webview"` (with optional `partition` support) *or* a separate `webview_panes` block (TBD in Phase 2). Plus `capabilities.webview = { child_webviews: bool, partitions: string[], engines: string[], allowed_origins: string[] }`.
 4. Frontend: `src/components/pkg/pkg-webview-host.tsx` — a placeholder React component that asks the kernel to mount a child webview at its DOM rect, reposition on resize, destroy on unmount. The webview floats over the React tree natively.
 5. Background-execution mitigations from Phase 0.5 (App Nap on macOS, `CoreWebView2Controller.IsVisible` on Windows) get applied here.
 
@@ -285,8 +291,8 @@ Commit `2de5db9` (Rust side); FE half is a separate follow-up commit.
 - Windows target: `webview2-com = "0.33"` for the visibility hold.
 
 **Manifest extension** (Rust + `@ikenga/contract`):
-- New `capabilities.webview = { child_webviews: bool, partitions: string[] }` block. Required for any `kind: "webview"` route to mount.
-- TS Zod now includes `'webview'` in the `UiRouteSchema.kind` enum (drift fix — Zod was also missing the existing `capabilities.supabase` block, restored in the same commit).
+- New `capabilities.webview = { child_webviews: bool, partitions: string[], engines: string[], allowed_origins: string[] }` block. Required for any `kind: "webview"` route to mount.
+- TS Zod now includes `'webview'` in the `UiRouteSchema.kind` enum, and routes support an optional `partition` field.
 
 **Per-jar isolation strategy**:
 - Linux WebKitGTK + Windows WebView2: `data_directory(PathBuf)` keyed by `app_data_dir/webjars/<pkg-slug>/<partition>/`.
