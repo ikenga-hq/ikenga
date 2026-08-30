@@ -204,6 +204,7 @@ commands.allow = [
   "pkg_trust_reject",
   "pkg_trust_revoke",
   "pkg_uninstall",
+  "pkg_webview_clear_session",
   "pkg_webview_create",
   "pkg_webview_destroy",
   "pkg_webview_navigate",
