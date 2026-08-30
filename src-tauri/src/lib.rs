@@ -114,9 +114,9 @@ use commands::{
     pkg_invoke, pkg_is_trusted_for_elevated, pkg_kernel_status, pkg_mcp_call, pkg_preview_manifest,
     pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
     pkg_sidecar_call, pkg_sidecar_rpc_send, pkg_sidecar_rpc_shutdown,
-    pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_create,
-    pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect, project_archive,
-    project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
+    pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_clear_session,
+    pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
+    project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_foreground, pty_foreground_snapshot, pty_kill,
     pty_resize, pty_spawn, pty_terminal_list, pty_write, runtime_retry_bun_fetch,
@@ -1109,6 +1109,7 @@ pub fn run() {
             pkg_webview_destroy,
             pkg_webview_navigate,
             pkg_webview_set_rect,
+            pkg_webview_clear_session,
             // Phase 0.5 bg-execution spike. Debug builds only.
             #[cfg(debug_assertions)]
             bg_spike_run,
@@ -1196,6 +1197,13 @@ pub fn run() {
             // keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 commands::secrets::cleanup_runtime_file();
+                #[cfg(feature = "desktop")]
+                {
+                    use tauri::Manager;
+                    if let Some(state) = _app.try_state::<commands::pkg_webview::WebviewPanesState>() {
+                        state.0.cleanup_clear_on_exit(_app);
+                    }
+                }
             }
         });
 }

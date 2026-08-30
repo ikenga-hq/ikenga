@@ -117,3 +117,17 @@ pub async fn pkg_webview_set_rect(
         .await
         .map_err(|e| format!("{e:#}"))
 }
+
+#[tauri::command]
+pub async fn pkg_webview_clear_session(
+    app: AppHandle,
+    state: State<'_, WebviewPanesState>,
+    pkg_id: String,
+    pane_id: String,
+) -> Result<(), String> {
+    let panes = state.0.clone();
+    let app_for_main = app.clone();
+    run_on_main(&app, move || panes.clear_session(&app_for_main, &pkg_id, &pane_id))
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
