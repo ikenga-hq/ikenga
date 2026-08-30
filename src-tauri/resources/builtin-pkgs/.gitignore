@@ -8,3 +8,9 @@ com.royalti.storyboard/sidecars/pa-storyboard
 # HyperFrames wrapper UI is built from sidecars/hyperframes/wrapper/ — also a
 # build artifact, regenerated on every `bun run sidecars:build`.
 com.royalti.hyperframes/dist/
+
+# Engine-claude-code dist is materialized by `bun run engine:cc:materialize`
+# (or by the CI materialize step) from ikenga-pkgs or node_modules.
+# The source tree keeps a cross-repo symlink for Unix dev; Windows checkouts
+# write it as a text file. Never commit the generated copy.
+com.ikenga.engine-claude-code/dist/
