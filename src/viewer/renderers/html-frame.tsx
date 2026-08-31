@@ -10,7 +10,7 @@ import {
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { writeClipboardText } from '@/lib/transport/shims';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';
@@ -337,7 +337,7 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 						<DropdownMenuItem onSelect={() => setPick(menu.pick)}>
 							Add pin / comment here…
 						</DropdownMenuItem>
-						<DropdownMenuItem onSelect={() => void writeText(path).catch(() => {})}>
+						<DropdownMenuItem onSelect={() => void writeClipboardText(path).catch(() => {})}>
 							Copy path
 						</DropdownMenuItem>
 						{paneId && isHtmlPath(path) && (

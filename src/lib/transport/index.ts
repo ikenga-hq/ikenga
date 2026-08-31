@@ -247,3 +247,11 @@ export function getTransport(): RpcTransport {
 	}
 	return transportInstance;
 }
+
+export function listen<T>(
+	event: string,
+	handler: (event: { event: string; payload: T }) => void
+): Promise<() => void> {
+	return getTransport().listen<T>(event, handler);
+}
+

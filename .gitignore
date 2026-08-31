@@ -52,3 +52,6 @@ pnpm-debug.log*
 
 # Staged server deploy artifacts (deploy.sh output — binary + SPA bundle)
 scripts/server/out/
+
+# tanstack router
+.tanstack/

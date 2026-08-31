@@ -11,8 +11,7 @@
 // via `pkgKernelStatus` for debugging.
 
 import { useEffect, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { pkgKernelStatus } from '@/lib/tauri-cmd';
+import { listen, pkgKernelStatus, type UnlistenFn } from '@/lib/tauri-cmd';
 
 export type PkgState = { kind: 'booting' } | { kind: 'ready' } | { kind: 'error'; reason: string };
 

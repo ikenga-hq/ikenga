@@ -16,11 +16,11 @@ import { attachRemotePty } from './transport/pty-socket';
 export { getTransport, isRemoteWebSession, isTauri, type RpcTransport };
 export type UnlistenFn = () => void;
 
-function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+export function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	return getTransport().invoke<T>(cmd, args);
 }
 
-function listen<T>(
+export function listen<T>(
 	event: string,
 	handler: (event: { event: string; payload: T }) => void
 ): Promise<UnlistenFn> {

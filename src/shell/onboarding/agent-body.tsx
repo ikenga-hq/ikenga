@@ -11,7 +11,7 @@
 // and `findEngineNoopEntry` â keep those exports stable.
 
 import { useMutation } from '@tanstack/react-query';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openExternalUrl } from '@/lib/transport/shims';
 import { useEffect, useState } from 'react';
 
 import { LoreTerm } from '@/components/lore/lore-term';
@@ -306,7 +306,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 									handleSelect(entry.agent);
 								}
 							}}
-							onOpenDocs={() => void openExternal(engine.docsUrl).catch(() => {})}
+							onOpenDocs={() => void openExternalUrl(engine.docsUrl).catch(() => {})}
 						/>
 					);
 				})}

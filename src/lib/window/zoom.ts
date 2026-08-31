@@ -21,9 +21,7 @@
 // window listens for. Without the broadcast, a pop-out would keep its
 // boot-time zoom until relaunch.
 
-import { emit, listen } from '@tauri-apps/api/event';
-import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { isTauri } from '../transport';
+import { isTauri, listen } from '../transport';
 
 const STORAGE_KEY = 'ikenga.zoom';
 const ZOOM_EVENT = 'ikenga://zoom-changed';
@@ -81,6 +79,7 @@ async function applyLocally(level: number): Promise<void> {
 	current = level;
 	if (!isTauri()) return;
 	try {
+		const { getCurrentWebview } = await import('@tauri-apps/api/webview');
 		await getCurrentWebview().setZoom(level);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
@@ -110,10 +109,13 @@ export async function setZoom(level: number): Promise<void> {
 		// Private-mode / quota failure: the zoom still applied for this
 		// session, it just won't survive a restart. Not worth surfacing.
 	}
-	try {
-		await emit(ZOOM_EVENT, next);
-	} catch {
-		// Single-window or non-Tauri: nothing to notify.
+	if (isTauri()) {
+		try {
+			const { emit } = await import('@tauri-apps/api/event');
+			await emit(ZOOM_EVENT, next);
+		} catch {
+			// Single-window or non-Tauri: nothing to notify.
+		}
 	}
 }
 

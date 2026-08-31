@@ -8,13 +8,13 @@
 // repeated calls share a single refcounted listener so React StrictMode
 // double-mount + HMR don't duplicate notifications.
 
-import { listen } from '@tauri-apps/api/event';
 import { isTauri } from '@/lib/transport';
+import { listen } from '@/lib/tauri-cmd';
 import {
-	isPermissionGranted,
-	requestPermission,
-	sendNotification,
-} from '@tauri-apps/plugin-notification';
+	isNotificationPermissionGranted,
+	requestNotificationPermission,
+	sendDesktopNotification,
+} from '@/lib/transport/shims';
 
 type Unsubscribe = () => void;
 
@@ -90,12 +90,12 @@ export function handleTimerFired(payload: IykeTimerFiredPayload): void {
 
 async function fireOsNotification(payload: IykeTimerFiredPayload): Promise<void> {
 	try {
-		const granted = await isPermissionGranted();
+		let granted = await isNotificationPermissionGranted();
 		if (!granted) {
-			const result = await requestPermission();
+			const result = await requestNotificationPermission();
 			if (result !== 'granted') return;
 		}
-		sendNotification({
+		await sendDesktopNotification({
 			title: payload.title,
 			body: payload.body ?? '',
 		});
@@ -106,8 +106,8 @@ async function fireOsNotification(payload: IykeTimerFiredPayload): Promise<void>
 
 async function ensureNotificationPermission(): Promise<void> {
 	try {
-		const granted = await isPermissionGranted();
-		if (!granted) await requestPermission();
+		const granted = await isNotificationPermissionGranted();
+		if (!granted) await requestNotificationPermission();
 	} catch (e) {
 		console.warn('[iyke-timer-bridge] permission probe failed', e);
 	}

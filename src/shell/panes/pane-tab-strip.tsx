@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { writeClipboardText } from '@/lib/transport/shims';
 import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
@@ -215,7 +215,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 								{(tab.kind === 'artifact' || tab.kind === 'route') && (
 									<>
 										<ContextMenuSeparator />
-										<ContextMenuItem onSelect={() => void writeText(tab.path).catch(() => {})}>
+										<ContextMenuItem onSelect={() => void writeClipboardText(tab.path).catch(() => {})}>
 											Copy path
 										</ContextMenuItem>
 									</>

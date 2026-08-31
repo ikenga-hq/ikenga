@@ -14,7 +14,7 @@ import {
 	X,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+import { writeClipboardText } from '@/lib/transport/shims';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -248,7 +248,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 
 	const terminalCwd = entry.isDir ? entry.path : parentOf(entry.path);
 	const copyPath = useCallback(() => {
-		void writeText(entry.path).catch(() => {});
+		void writeClipboardText(entry.path).catch(() => {});
 	}, [entry.path]);
 
 	const { data: gitStatus } = useGitStatus();
@@ -396,7 +396,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 						</>
 					)}
 					<ContextMenuItem onSelect={copyPath}>Copy Path</ContextMenuItem>
-					<ContextMenuItem onSelect={() => void writeText(entry.name).catch(() => {})}>
+					<ContextMenuItem onSelect={() => void writeClipboardText(entry.name).catch(() => {})}>
 						Copy Name
 					</ContextMenuItem>
 					<ContextMenuSeparator />
