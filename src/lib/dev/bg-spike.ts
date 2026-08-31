@@ -17,7 +17,8 @@
 //
 // Delete this file + the import in dev/index.ts once Phase 0.5 sign-off lands.
 
-import { invoke, bgSpikeRun, type BgSpikeReport } from '@/lib/tauri-cmd';
+import { invoke } from '@/lib/transport';
+import { bgSpikeRun, type BgSpikeReport } from '@/lib/tauri-cmd';
 
 declare global {
 	interface Window {

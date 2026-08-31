@@ -11,7 +11,7 @@
 // and `findEngineNoopEntry` â keep those exports stable.
 
 import { useMutation } from '@tanstack/react-query';
-import { openExternalUrl } from '@/lib/transport/shims';
+import { openExternalUrl } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
 import { LoreTerm } from '@/components/lore/lore-term';

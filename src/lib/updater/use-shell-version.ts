@@ -3,24 +3,19 @@
 // non-Tauri webviews; the About page falls back to "—").
 
 import { useEffect, useState } from 'react';
-import { isTauri } from '@/lib/transport';
+import { getAppVersion } from '@/lib/transport';
 
 export function useShellVersion(): string | null {
 	const [version, setVersion] = useState<string | null>(null);
 	useEffect(() => {
 		let cancelled = false;
-		if (!isTauri()) {
-			return;
-		}
-		void (async () => {
-			try {
-				const { getVersion } = await import('@tauri-apps/api/app');
-				const v = await getVersion();
+		void getAppVersion()
+			.then((v) => {
 				if (!cancelled) setVersion(v);
-			} catch {
+			})
+			.catch(() => {
 				if (!cancelled) setVersion(null);
-			}
-		})();
+			});
 		return () => {
 			cancelled = true;
 		};

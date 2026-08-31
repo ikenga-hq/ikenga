@@ -4,7 +4,7 @@ import { CostHud, type StatuslineSnapshot } from './cost-hud';
 
 const eventHandlers: Array<(payload: { payload: StatuslineSnapshot }) => void> = [];
 
-vi.mock('@/lib/tauri-cmd', () => ({
+vi.mock('@/lib/transport', () => ({
 	listen: vi.fn((_channel: string, handler: (event: { payload: StatuslineSnapshot }) => void) => {
 		eventHandlers.push(handler);
 		return Promise.resolve(() => {});

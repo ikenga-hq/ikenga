@@ -9,8 +9,9 @@
 //
 // Not registered in nav. Open by navigating to /lsp-smoke in dev.
 import { createFileRoute } from '@tanstack/react-router';
+import { invoke } from '@/lib/transport';
+import { listen } from '@/lib/transport';
 import { useEffect, useState } from 'react';
-import { invoke, listen } from '@/lib/tauri-cmd';
 
 import { CodeEditor } from '@ikenga/ui-lib';
 import { createLspClient, createTsLspClient, type TsLspClient } from '@ikenga/ui-lib/lsp';

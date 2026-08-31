@@ -20,8 +20,8 @@
 // destroy the orphan it created. We use the same `dropped` flag pattern
 // `PkgIframeHost` uses.
 
+import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useRef, useState } from 'react';
-import { listen, type UnlistenFn } from '@/lib/tauri-cmd';
 
 import {
 	pkgWebviewCreate,

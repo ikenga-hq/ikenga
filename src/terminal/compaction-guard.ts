@@ -1,4 +1,4 @@
-import { listen } from '@/lib/tauri-cmd';
+import { listen } from '@/lib/transport';
 
 export interface CompactionGuardOptions {
 	onPreCompact?: (sessionId: string) => void;

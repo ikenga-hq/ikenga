@@ -9,7 +9,7 @@
 // supplies the progress bar / header / footer.
 
 import { useQuery } from '@tanstack/react-query';
-import { openExternalUrl } from '@/lib/transport/shims';
+import { openExternalUrl } from '@/lib/transport';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';

@@ -14,7 +14,7 @@ import {
 	X,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { writeClipboardText } from '@/lib/transport/shims';
+import { writeClipboardText } from '@/lib/transport';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { usePaneStore } from '@/lib/panes/pane-store';

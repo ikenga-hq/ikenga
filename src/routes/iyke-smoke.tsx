@@ -7,9 +7,10 @@
 // 4. Subscribe to `pkg://custom-thing`, POST to .../event — expect listener fires.
 // 5. Uninstall and POST again — expect 404.
 import { createFileRoute } from '@tanstack/react-router';
+import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
-import { iykeEndpoint, listen, pkgInstallFromPath, pkgKernelStatus, pkgUninstall, type UnlistenFn } from '@/lib/tauri-cmd';
+import { iykeEndpoint, pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
 export const Route = createFileRoute('/iyke-smoke')({
 	component: IykeSmoke,

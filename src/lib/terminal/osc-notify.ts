@@ -18,10 +18,10 @@
 // The parser is stateful — escape sequences span chunks routinely.
 
 import {
+	sendNotification,
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
-	sendDesktopNotification,
-} from '@/lib/transport/shims';
+} from '@/lib/transport';
 
 interface ParseState {
 	/** Buffer of currently-accumulating OSC payload (between `\e]` and terminator). */
@@ -192,7 +192,7 @@ export async function fireOscNotification(note: OscNotification): Promise<void> 
 			granted = (await requestNotificationPermission()) === 'granted';
 		}
 		if (!granted) return;
-		await sendDesktopNotification({ title: note.title, body: note.body });
+		await sendNotification({ title: note.title, body: note.body });
 	} catch (err) {
 		// Notification rejection shouldn't crash the terminal pane.
 		console.warn('[osc-notify] sendNotification failed:', err);

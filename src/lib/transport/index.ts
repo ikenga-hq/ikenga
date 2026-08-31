@@ -224,6 +224,30 @@ export class WebRemoteTransport implements RpcTransport {
 	}
 }
 
+export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	return getTransport().invoke<T>(cmd, args);
+}
+
+export async function listen<T>(
+	event: string,
+	handler: (event: { event: string; payload: T }) => void
+): Promise<() => void> {
+	return getTransport().listen<T>(event, handler);
+}
+
+export async function emit(event: string, payload?: unknown): Promise<void> {
+	if (isTauri()) {
+		try {
+			const { emit } = await import('@tauri-apps/api/event');
+			await emit(event, payload);
+			return;
+		} catch (e) {
+			console.warn(`Tauri emit('${event}') failed`, e);
+		}
+	}
+	console.warn(`[transport] emit('${event}') has no backend event bus in browser mode`);
+}
+
 let transportInstance: RpcTransport | null = null;
 
 /**
@@ -248,10 +272,4 @@ export function getTransport(): RpcTransport {
 	return transportInstance;
 }
 
-export function listen<T>(
-	event: string,
-	handler: (event: { event: string; payload: T }) => void
-): Promise<() => void> {
-	return getTransport().listen<T>(event, handler);
-}
-
+export * from './shims';

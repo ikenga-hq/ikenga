@@ -10,8 +10,8 @@
 // during `spawn`, before this listener attaches — but every subsequent
 // sibling open/close is observed.)
 
+import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useState } from 'react';
-import { listen, type UnlistenFn } from '@/lib/tauri-cmd';
 
 import { WINDOW_TOPICS, type WindowEventEnvelope } from '@ikenga/contract';
 

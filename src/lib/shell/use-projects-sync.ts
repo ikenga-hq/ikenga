@@ -13,10 +13,11 @@
 // Mounted at workspace level — exactly once per process.
 
 import { useEffect } from 'react';
+import type { UnlistenFn } from '@/lib/transport';
 
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { projectListenActiveChanged, type UnlistenFn } from '@/lib/tauri-cmd';
+import { projectListenActiveChanged } from '@/lib/tauri-cmd';
 
 export function useProjectsSync(): void {
 	const refreshProjects = useShellStore((s) => s.refreshProjects);

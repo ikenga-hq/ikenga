@@ -1,6 +1,6 @@
+import { listen } from '@/lib/transport';
 import { ChevronDown, ChevronRight, Code, MessageSquare, Terminal, Wrench } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import { listen } from '@/lib/tauri-cmd';
 
 export interface MessageContentItem {
 	type: 'text' | 'tool_use' | 'thinking';

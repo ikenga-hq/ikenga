@@ -1,5 +1,5 @@
+import { listen } from '@/lib/transport';
 import { useEffect, useRef, useState } from 'react';
-import { listen } from '@/lib/tauri-cmd';
 import { defaultShellArgv } from '@/lib/platform';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
 import { buildClaudeWrappedCmd, type AgentWrapOpts } from './claude-wrap';

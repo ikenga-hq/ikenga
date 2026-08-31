@@ -8,7 +8,7 @@
 // log/network entries (tagged with the source pane id) into the same
 // ring buffers the shell uses.
 
-import { invoke } from '@/lib/tauri-cmd';
+import { invoke } from '@/lib/transport';
 
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';

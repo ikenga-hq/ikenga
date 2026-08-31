@@ -10,7 +10,7 @@ import {
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
-import { writeClipboardText } from '@/lib/transport/shims';
+import { writeClipboardText } from '@/lib/transport';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';

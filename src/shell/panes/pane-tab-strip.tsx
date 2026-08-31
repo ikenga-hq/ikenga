@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
-import { writeClipboardText } from '@/lib/transport/shims';
+import { writeClipboardText } from '@/lib/transport';
 import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
