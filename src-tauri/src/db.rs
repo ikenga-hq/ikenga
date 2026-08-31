@@ -551,6 +551,14 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0062_content_review_axis",
         include_str!("../migrations/0062_content_review_axis.sql"),
     ),
+    // WP-05 of the meetings recording & transcription layer: adds the meetings,
+    // meeting_speakers, meeting_transcripts, meeting_action_items, and
+    // meeting_summaries tables to ikenga.local.
+    (
+        63,
+        "0063_meetings_domain",
+        include_str!("../migrations/0063_meetings_domain.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
