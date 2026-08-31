@@ -19,11 +19,10 @@
 // initializer no-ops there.
 
 import { WINDOW_TOPICS } from '@ikenga/contract';
-import { listen } from '@tauri-apps/api/event';
 import { isTauri } from '@/lib/transport';
 import { create } from 'zustand';
 
-import { closeWindow, listWindows } from '@/lib/tauri-cmd';
+import { closeWindow, listWindows, listen } from '@/lib/tauri-cmd';
 import { isDetachedWindow } from './window-context';
 
 interface DetachedSurfacesState {

@@ -41,7 +41,6 @@
 // without scroll/selection styling. Import it here, scoped to this lazy chunk.
 import '@xterm/xterm/css/xterm.css';
 import { isTauri } from '@/lib/transport';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Terminal } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
@@ -81,11 +80,14 @@ export default function TerminalSurface({ ctx }: DetachedSurfaceProps) {
 	const windowTitle = title?.label;
 	useEffect(() => {
 		if (!windowTitle || !isTauri()) return;
-		void getCurrentWindow()
-			.setTitle(`${windowTitle} — Ikenga`)
-			.catch(() => {
+		void (async () => {
+			try {
+				const { getCurrentWindow } = await import('@tauri-apps/api/window');
+				await getCurrentWindow().setTitle(`${windowTitle} — Ikenga`);
+			} catch {
 				/* non-fatal: the window keeps its default title */
-			});
+			}
+		})();
 	}, [windowTitle]);
 
 	useEffect(() => {

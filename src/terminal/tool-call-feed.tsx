@@ -1,4 +1,3 @@
-import { listen } from '@tauri-apps/api/event';
 import {
 	Activity,
 	CheckCircle2,
@@ -12,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { iykeFetch } from '@/lib/iyke/client';
+import { listen } from '@/lib/tauri-cmd';
 
 export interface HookEventPayload {
 	ikenga_terminal_id?: string;

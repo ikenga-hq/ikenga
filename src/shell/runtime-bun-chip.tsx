@@ -11,10 +11,9 @@
 
 import { useEffect, useState } from 'react';
 import { Download, RefreshCw } from 'lucide-react';
-import type { UnlistenFn } from '@tauri-apps/api/event';
 
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
-import { type RuntimeBunEvent, runtimeBunListen, runtimeRetryBunFetch } from '@/lib/tauri-cmd';
+import { type RuntimeBunEvent, type UnlistenFn, runtimeBunListen, runtimeRetryBunFetch } from '@/lib/tauri-cmd';
 
 export function RuntimeBunChip() {
 	const [ev, setEv] = useState<RuntimeBunEvent | null>(null);

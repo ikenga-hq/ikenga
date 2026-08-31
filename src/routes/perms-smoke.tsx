@@ -7,9 +7,9 @@
 // 4. Cleanup: uninstall.
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 
 import {
+	invoke,
 	pkgInstallFromPath,
 	pkgKernelStatus,
 	pkgUninstall,

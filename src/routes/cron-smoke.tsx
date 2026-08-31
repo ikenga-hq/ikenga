@@ -5,10 +5,9 @@
 // 3. Wait ~2s — assert listener fires ≥1×.
 // 4. Uninstall — record current count, wait ~2s more, assert no further fires.
 import { createFileRoute } from '@tanstack/react-router';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useEffect, useState } from 'react';
 
-import { pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
+import { listen, pkgInstallFromPath, pkgKernelStatus, pkgUninstall, type UnlistenFn } from '@/lib/tauri-cmd';
 
 export const Route = createFileRoute('/cron-smoke')({
 	component: CronSmoke,

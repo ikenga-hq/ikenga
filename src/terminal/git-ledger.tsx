@@ -1,7 +1,7 @@
-import { listen } from '@tauri-apps/api/event';
 import { Check, FileCode, GitBranch, GitCommit, RotateCcw } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { listen } from '@/lib/tauri-cmd';
 
 export interface GitLedgerItem {
 	path: string;

@@ -2,7 +2,7 @@ import { Outlet, createFileRoute, useLocation } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useMemo } from 'react';
 import { z } from 'zod';
-import { open as shellOpen } from '@tauri-apps/plugin-shell';
+import { openExternalUrl } from '@/lib/transport/shims';
 
 import { claudeConfigQueryOptions, useClaudeConfigWatch } from '@/lib/queries/claude-config';
 import { useShellStore } from '@/lib/shell/shell-store';
@@ -61,7 +61,7 @@ function ClaudeLayout() {
 	useClaudeConfigWatch(projectRoots, watchEnabled);
 
 	function handleOpenInEditor(path: string) {
-		void shellOpen(path);
+		void openExternalUrl(path);
 	}
 
 	const path = useLocation({ select: (l) => l.pathname });

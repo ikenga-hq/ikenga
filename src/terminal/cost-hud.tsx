@@ -1,7 +1,7 @@
-import { listen } from '@tauri-apps/api/event';
 import { Activity, AlertTriangle, Cpu, DollarSign, Gauge, ShieldAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { iykeFetch } from '@/lib/iyke/client';
+import { listen } from '@/lib/tauri-cmd';
 
 export interface StatuslineSnapshot {
 	ikenga_terminal_id?: string;

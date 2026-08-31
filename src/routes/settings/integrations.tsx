@@ -1,8 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
-import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { CheckCircle2, Copy, XCircle } from 'lucide-react';
 import { useState } from 'react';
+import { writeClipboardText } from '@/lib/transport/shims';
 
 import { FeedbackState } from '@/components/ui/feedback-state';
 import { Input } from '@/components/ui/input';
@@ -151,7 +151,7 @@ function IykeMcpSection() {
 
 	async function copy(kind: 'path' | 'json', text: string) {
 		try {
-			await writeText(text);
+			await writeClipboardText(text);
 			setCopied(kind);
 			setTimeout(() => setCopied((c) => (c === kind ? null : c)), 1500);
 		} catch (e) {

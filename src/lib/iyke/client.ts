@@ -7,7 +7,7 @@
 // the duration of the app process, so port + token never change without
 // a full reload.
 
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@/lib/tauri-cmd';
 
 import type { IykeEndpoint, IykeStateResponse } from './types';
 

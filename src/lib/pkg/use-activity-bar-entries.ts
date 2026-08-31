@@ -9,9 +9,8 @@
 // yet" — the activity bar needs that to avoid reconciling a persisted pkg mode
 // to 'app' before the kernel snapshot has even arrived.
 
-import { listen } from '@tauri-apps/api/event';
 import { useEffect, useState } from 'react';
-import { pkgKernelStatus } from '@/lib/tauri-cmd';
+import { listen, pkgKernelStatus } from '@/lib/tauri-cmd';
 
 /** Shape mirrors the Rust `ActivityBarBadge` in
  *  `pkg/registries/activity_bar.rs` (WP-11). */

@@ -18,10 +18,10 @@
 // The parser is stateful — escape sequences span chunks routinely.
 
 import {
-	sendNotification,
-	isPermissionGranted,
-	requestPermission,
-} from '@tauri-apps/plugin-notification';
+	isNotificationPermissionGranted,
+	requestNotificationPermission,
+	sendDesktopNotification,
+} from '@/lib/transport/shims';
 
 interface ParseState {
 	/** Buffer of currently-accumulating OSC payload (between `\e]` and terminator). */
@@ -187,12 +187,12 @@ function parseOscPayload(
 /** Convenience helper for callers: ensure permission, then send. */
 export async function fireOscNotification(note: OscNotification): Promise<void> {
 	try {
-		let granted = await isPermissionGranted();
+		let granted = await isNotificationPermissionGranted();
 		if (!granted) {
-			granted = (await requestPermission()) === 'granted';
+			granted = (await requestNotificationPermission()) === 'granted';
 		}
 		if (!granted) return;
-		await sendNotification({ title: note.title, body: note.body });
+		await sendDesktopNotification({ title: note.title, body: note.body });
 	} catch (err) {
 		// Notification rejection shouldn't crash the terminal pane.
 		console.warn('[osc-notify] sendNotification failed:', err);

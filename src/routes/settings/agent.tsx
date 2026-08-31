@@ -7,7 +7,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openExternalUrl } from '@/lib/transport/shims';
 import { AlertTriangle, Bot, Pencil, RotateCcw } from 'lucide-react';
 
 import { Banner } from '@/components/ui/banner';
@@ -165,7 +165,7 @@ function AgentSettingsPage() {
 								live.auth_hint?.startsWith('http') ? (
 									<button
 										type="button"
-										onClick={() => void openExternal(live.auth_hint!).catch(() => {})}
+										onClick={() => void openExternalUrl(live.auth_hint!).catch(() => {})}
 										className="text-xs underline-offset-2 hover:underline"
 										style={{ color: 'var(--primary)' }}
 									>

@@ -4,7 +4,7 @@ import { CostHud, type StatuslineSnapshot } from './cost-hud';
 
 const eventHandlers: Array<(payload: { payload: StatuslineSnapshot }) => void> = [];
 
-vi.mock('@tauri-apps/api/event', () => ({
+vi.mock('@/lib/tauri-cmd', () => ({
 	listen: vi.fn((_channel: string, handler: (event: { payload: StatuslineSnapshot }) => void) => {
 		eventHandlers.push(handler);
 		return Promise.resolve(() => {});
@@ -28,6 +28,11 @@ describe('CostHud per-terminal filtering', () => {
 
 		// Both start in the listening state.
 		expect(screen.getAllByText(/listening for statusline telemetry/i).length).toBe(2);
+
+		// Wait for both components to attach their listeners
+		await waitFor(() => {
+			expect(eventHandlers.length).toBeGreaterThanOrEqual(2);
+		});
 
 		// Fire a statusline event for term-a only.
 		for (const h of eventHandlers) {

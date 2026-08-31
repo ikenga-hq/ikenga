@@ -3,8 +3,8 @@
 // (the GitHub Releases latest.json), verifies the bundle sig against the
 // embedded minisign pubkey, and exposes downloadAndInstall() + relaunch().
 
-import { check, type Update } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
+import type { Update } from '@tauri-apps/plugin-updater';
+import { isTauri } from '@/lib/transport';
 
 export type UpdateInfo = {
 	version: string;
@@ -12,7 +12,7 @@ export type UpdateInfo = {
 	date?: string;
 	currentVersion: string;
 	/** Internal handle used to start the install. */
-	handle: Update;
+	handle?: Update;
 };
 
 /**
@@ -21,7 +21,9 @@ export type UpdateInfo = {
  * endpoint 404, sig mismatch — log + degrade gracefully).
  */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
+	if (!isTauri()) return null;
 	try {
+		const { check } = await import('@tauri-apps/plugin-updater');
 		const update = await check();
 		if (!update) return null;
 		return {
@@ -56,6 +58,7 @@ export async function installUpdate(
 	info: UpdateInfo,
 	onProgress?: (bytesDownloaded: number, totalBytes: number | null) => void
 ): Promise<void> {
+	if (!isTauri() || !info.handle) return;
 	let downloaded = 0;
 	let total: number | null = null;
 	await info.handle.downloadAndInstall((event) => {
@@ -80,5 +83,11 @@ export async function installUpdate(
  * opt-in auto-install path, which installs in the background but still waits
  * for the user to press Restart. */
 export async function restartApp(): Promise<void> {
-	await relaunch();
+	if (!isTauri()) return;
+	try {
+		const { relaunch } = await import('@tauri-apps/plugin-process');
+		await relaunch();
+	} catch (e) {
+		console.warn('[updater] relaunch failed', e);
+	}
 }

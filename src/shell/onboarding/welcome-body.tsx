@@ -9,7 +9,7 @@
 // supplies the progress bar / header / footer.
 
 import { useQuery } from '@tanstack/react-query';
-import { open as openExternal } from '@tauri-apps/plugin-shell';
+import { openExternalUrl } from '@/lib/transport/shims';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
@@ -262,7 +262,7 @@ function PreflightRow({ check }: { check: SystemCheck }) {
 							type="button"
 							onClick={() => {
 								const url = DOC_LINKS[check.id] ?? DEFAULT_DOC;
-								void openExternal(url).catch(() => {});
+								void openExternalUrl(url).catch(() => {});
 							}}
 							className="underline underline-offset-2"
 							data-testid="preflight-help"
