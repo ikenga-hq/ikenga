@@ -1,13 +1,14 @@
+import { listen } from '@/lib/transport';
+import {
+	isNotificationPermissionGranted,
+	requestNotificationPermission,
+	sendNotification,
+} from '@/lib/transport';
 import { Bell, Check, ShieldAlert, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { iykeFetch } from '@/lib/iyke/client';
-import { listen, settingsGet, settingsSet } from '@/lib/tauri-cmd';
-import {
-	isNotificationPermissionGranted,
-	requestNotificationPermission,
-	sendDesktopNotification,
-} from '@/lib/transport/shims';
+import { settingsGet, settingsSet } from '@/lib/tauri-cmd';
 
 export interface PermissionRequestEntry {
 	id: string;
@@ -74,7 +75,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 				setRequests((prev) => [newEntry, ...prev]);
 
 				// Trigger OS toast notification
-				sendDesktopNotification({
+				sendNotification({
 					title: 'Chi Permission Request',
 					body: `Approval required for tool ${p.tool_name || 'action'}`,
 				});
@@ -92,12 +93,12 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 
 				setRequests((prev) => [newEntry, ...prev]);
 
-				sendDesktopNotification({
+				sendNotification({
 					title: 'Tool Use Request',
 					body: `Claude wants to use ${p.tool_name || 'a tool'} — approve?`,
 				});
 			} else if (p.hook_event_name === 'Notification' || p.hook_event_name === 'Stop') {
-				sendDesktopNotification({
+				sendNotification({
 					title: 'Ikenga Assistant Update',
 					body: p.prompt || 'Assistant finished execution turn',
 				});

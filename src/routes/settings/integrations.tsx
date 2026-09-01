@@ -1,8 +1,8 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
+import { writeClipboardText } from '@/lib/transport';
 import { CheckCircle2, Copy, XCircle } from 'lucide-react';
 import { useState } from 'react';
-import { writeClipboardText } from '@/lib/transport/shims';
 
 import { FeedbackState } from '@/components/ui/feedback-state';
 import { Input } from '@/components/ui/input';

@@ -10,8 +10,9 @@
 //     side just for this) and invoke the matching Tauri command.
 
 import { useEffect } from 'react';
+import { invoke } from '@/lib/transport';
+import { listen } from '@/lib/transport';
 import { isTauri } from '@/lib/transport';
-import { invoke, listen } from '@/lib/tauri-cmd';
 
 import {
 	capturePane,

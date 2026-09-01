@@ -2,7 +2,7 @@ import { Outlet, createFileRoute, useLocation } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { useMemo } from 'react';
 import { z } from 'zod';
-import { openExternalUrl } from '@/lib/transport/shims';
+import { openExternalUrl } from '@/lib/transport';
 
 import { claudeConfigQueryOptions, useClaudeConfigWatch } from '@/lib/queries/claude-config';
 import { useShellStore } from '@/lib/shell/shell-store';

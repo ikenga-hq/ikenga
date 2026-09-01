@@ -7,7 +7,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { openExternalUrl } from '@/lib/transport/shims';
+import { openExternalUrl } from '@/lib/transport';
 import { AlertTriangle, Bot, Pencil, RotateCcw } from 'lucide-react';
 
 import { Banner } from '@/components/ui/banner';

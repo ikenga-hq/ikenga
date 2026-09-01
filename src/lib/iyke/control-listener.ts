@@ -13,8 +13,8 @@
 // dropped, never thrown, so a bad command from a misbehaving CLI/MCP
 // can't crash the UI.
 
+import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect } from 'react';
-import { listen, type UnlistenFn } from '@/lib/tauri-cmd';
 
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneView } from '@/lib/panes/types';

@@ -8,13 +8,13 @@
 // repeated calls share a single refcounted listener so React StrictMode
 // double-mount + HMR don't duplicate notifications.
 
+import { listen } from '@/lib/transport';
 import { isTauri } from '@/lib/transport';
-import { listen } from '@/lib/tauri-cmd';
 import {
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
-	sendDesktopNotification,
-} from '@/lib/transport/shims';
+	sendNotification,
+} from '@/lib/transport';
 
 type Unsubscribe = () => void;
 
@@ -90,12 +90,12 @@ export function handleTimerFired(payload: IykeTimerFiredPayload): void {
 
 async function fireOsNotification(payload: IykeTimerFiredPayload): Promise<void> {
 	try {
-		let granted = await isNotificationPermissionGranted();
+		const granted = await isNotificationPermissionGranted();
 		if (!granted) {
 			const result = await requestNotificationPermission();
 			if (result !== 'granted') return;
 		}
-		await sendDesktopNotification({
+		sendNotification({
 			title: payload.title,
 			body: payload.body ?? '',
 		});

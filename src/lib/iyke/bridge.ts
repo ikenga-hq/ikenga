@@ -13,8 +13,9 @@
 // useIykeControlListener). Never mount inside per-pane MemoryRouter
 // contexts.
 
+import { invoke } from '@/lib/transport';
+import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect } from 'react';
-import { invoke, listen, type UnlistenFn } from '@/lib/tauri-cmd';
 import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneNode } from '@/lib/panes/types';

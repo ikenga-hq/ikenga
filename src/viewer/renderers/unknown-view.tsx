@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { File } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { openExternalUrl } from '@/lib/transport/shims';
+import { openExternalUrl } from '@/lib/transport';
 import { fsRead } from '@/lib/tauri-cmd';
 import { basename } from '../lib/path';
 
@@ -41,6 +41,8 @@ export function UnknownView({ path, mime }: UnknownViewProps) {
 				variant="outline"
 				size="sm"
 				onClick={() => {
+					// tauri-plugin-shell's `open` shells out to xdg-open / `open` /
+					// explorer.exe — the OS picks the default handler.
 					void openExternalUrl(path);
 				}}
 			>

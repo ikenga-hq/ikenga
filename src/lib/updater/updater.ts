@@ -2,18 +2,18 @@
 // hits the endpoint declared in tauri.conf.json plugins.updater.endpoints
 // (the GitHub Releases latest.json), verifies the bundle sig against the
 // embedded minisign pubkey, and exposes downloadAndInstall() + relaunch().
+//
+// This file is the only allowed consumer of the update surface — it routes
+// through the transport shim so that browser sessions do not statically depend
+// on the Tauri plugin packages.
 
-import type { Update } from '@tauri-apps/plugin-updater';
-import { isTauri } from '@/lib/transport';
+import {
+	checkForUpdate as transportCheckForUpdate,
+	relaunchApp,
+	type UpdateInfo,
+} from '@/lib/transport';
 
-export type UpdateInfo = {
-	version: string;
-	notes?: string;
-	date?: string;
-	currentVersion: string;
-	/** Internal handle used to start the install. */
-	handle?: Update;
-};
+export type { UpdateInfo } from '@/lib/transport';
 
 /**
  * Check the configured endpoint for a newer release. Returns null when the
@@ -21,22 +21,7 @@ export type UpdateInfo = {
  * endpoint 404, sig mismatch — log + degrade gracefully).
  */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
-	if (!isTauri()) return null;
-	try {
-		const { check } = await import('@tauri-apps/plugin-updater');
-		const update = await check();
-		if (!update) return null;
-		return {
-			version: update.version,
-			notes: update.body,
-			date: update.date,
-			currentVersion: update.currentVersion,
-			handle: update,
-		};
-	} catch (err) {
-		console.warn('[updater] check failed:', err);
-		return null;
-	}
+	return transportCheckForUpdate();
 }
 
 /**
@@ -58,10 +43,13 @@ export async function installUpdate(
 	info: UpdateInfo,
 	onProgress?: (bytesDownloaded: number, totalBytes: number | null) => void
 ): Promise<void> {
-	if (!isTauri() || !info.handle) return;
+	if (!info.handle?.downloadAndInstall) {
+		throw new Error('[updater] installUpdate called without a valid desktop update handle');
+	}
+
 	let downloaded = 0;
 	let total: number | null = null;
-	await info.handle.downloadAndInstall((event) => {
+	await info.handle.downloadAndInstall((event: any) => {
 		switch (event.event) {
 			case 'Started':
 				total = event.data.contentLength ?? null;
@@ -83,11 +71,5 @@ export async function installUpdate(
  * opt-in auto-install path, which installs in the background but still waits
  * for the user to press Restart. */
 export async function restartApp(): Promise<void> {
-	if (!isTauri()) return;
-	try {
-		const { relaunch } = await import('@tauri-apps/plugin-process');
-		await relaunch();
-	} catch (e) {
-		console.warn('[updater] relaunch failed', e);
-	}
+	await relaunchApp();
 }

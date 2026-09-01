@@ -3,7 +3,7 @@
 // goes through iykeFetch so the FE shares one auth + transport path
 // with every other caller.
 
-import { listen, type UnlistenFn } from '@/lib/tauri-cmd';
+import { listen, type UnlistenFn } from '@/lib/transport';
 
 import { iykeFetch } from './client';
 

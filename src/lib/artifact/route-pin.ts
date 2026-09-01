@@ -7,7 +7,7 @@
 // should go through here rather than calling `commentRoute` directly, so the
 // clipboard sink can't be silently dropped again.
 
-import { writeClipboardText } from '@/lib/transport/shims';
+import { writeClipboardText } from '@/lib/transport';
 
 import { commentRoute, type RouteResult, type RouteSink } from '@/lib/tauri-cmd';
 
@@ -29,7 +29,8 @@ export async function routePin(args: {
 	try {
 		await writeClipboardText(res.clipboardText);
 		return { ...res, copied: true };
-	} catch {
+	} catch (e) {
+		console.warn('[pin] clipboard write failed', e);
 		return { ...res, copied: false };
 	}
 }
