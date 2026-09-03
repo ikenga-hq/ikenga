@@ -119,6 +119,28 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // A pkg mounted with `ikenga dev` points at its source directory inside the
+    // pnpm workspace, where `node_modules` is already a pnpm symlink farm. npm
+    // run there follows those symlinks into `.pnpm/…` and tries to `prepare` a
+    // dependency pnpm never prepared, failing on a script a published tarball
+    // does not ship:
+    //
+    //     npm error command sh -c npm run build && husky
+    //     Cannot find module '…/ext-apps/scripts/generate-schemas.ts'
+    //
+    // If node_modules is already present, the dependencies are materialized —
+    // pnpm did it — and there is nothing for npm to add. Skipping is both the
+    // correct behaviour and the only way a workspace-linked pkg can be
+    // dev-mounted. A registry-installed pkg never ships node_modules (npm pack
+    // always excludes it), so the real install path is unaffected.
+    if install_path.join("node_modules").exists() {
+        log::info!(
+            "node_modules already present in {}; skipping npm materialization",
+            install_path.display()
+        );
+        return Ok(());
+    }
+
     let package_json_path = install_path.join("package.json");
     if !package_json_path.exists() {
         return Ok(());
@@ -232,6 +254,34 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn existing_node_modules_skips_materialization() {
+        // The dev-mount case: pnpm has already linked everything, and running
+        // npm inside its symlink farm fails on a dependency's prepare script.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "com.test.pkg", "name": "T", "version": "0.1.0",
+                "ikenga_api": "3", "kind": "app",
+                "mcp": [{ "name": "m", "command": "node", "args": ["x.js"],
+                          "lifecycle": "long-lived" }]
+            })).unwrap(),
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.path().join("package.json"),
+            br#"{"name":"t","version":"1.0.0","dependencies":{"ajv":"^8"}}"#,
+        )
+        .expect("package.json");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("node_modules");
+
+        // Must return Ok without invoking npm at all. If npm ran here it would
+        // need network and would take seconds; this returns immediately.
+        materialize_npm_deps(dir.path()).expect("skip, not error");
+    }
+
 
     /// A pnpm workspace link in a pkg's package.json made `npm install` fail
     /// with EUNSUPPORTEDPROTOCOL, and because materialization failure aborts
