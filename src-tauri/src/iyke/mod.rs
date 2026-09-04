@@ -27,6 +27,7 @@ pub mod mcp;
 pub mod memory;
 pub mod pa_actions;
 pub mod permissions_audit;
+pub mod pkg_db;
 pub mod pkg_dispatch;
 pub mod playwright_proxy;
 pub mod projects;
@@ -230,6 +231,14 @@ pub async fn start(
     )
     .await
     .context("start iyke server")?;
+
+    // WP-23 (D-18): publish the bridge base URL so pkg spawn sites can hand
+    // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` to backend
+    // processes. Deliberately NOT written to the control file — that file
+    // carries the global bearer token and is read by tooling, whereas a pkg's
+    // db credential is minted per pkg and delivered only through its own
+    // process env. See `pkg::db_scope`.
+    crate::pkg::db_scope::set_bridge_url(&url);
 
     write_control_file(&control_path, port, &token, state.started_at_unix_ms())
         .with_context(|| format!("write {}", control_path.display()))?;

@@ -297,15 +297,24 @@ pub async fn serve(
             require_token,
         ));
 
-    // Unauthed reply endpoint — partner-site JS POSTs here to fulfill an
-    // in-flight pkg-browser request. Auth is via the per-request
-    // `oneshot_token` validated inside `BrowserRpc::resolve`.
-    // Two unauthed routes, each with its own credential check:
-    //   * the pkg-browser reply endpoint (per-request `oneshot_token`);
+    // Unauthed routes, each with its own credential check:
+    //   * the pkg-backend db sandbox (per-pkg `IKENGA_PKG_DB_TOKEN`);
+    //   * the pkg-browser reply endpoint — partner-site JS POSTs here to
+    //     fulfill an in-flight request, authenticated by the per-request
+    //     `oneshot_token` validated inside `BrowserRpc::resolve`;
     //   * the Claude Code IDE WebSocket at `/`, which authenticates with the
     //     `x-claude-code-ide-authorization` header rather than a bearer token,
     //     so it cannot sit behind `require_token`. See `iyke::ide_ws`.
+    // WP-23 (D-18): the pkg-backend database sandbox. Mounted unauthed with
+    // its own credential check because the credential is deliberately NOT the
+    // global iyke bearer token — that one grants terminals, secrets and the
+    // whole control surface, which is a far larger widening than the hole this
+    // closes. Each pkg backend presents its own per-pkg token, minted at spawn
+    // (`pkg::db_scope::inject_env`) and good for these two routes only. Every
+    // security decision lives in `pkg::db_scope`; see `iyke::pkg_db`.
     let unauthed = Router::new()
+        .route("/iyke/pkg-db/query", post(super::pkg_db::post_pkg_db_query))
+        .route("/iyke/pkg-db/exec", post(super::pkg_db::post_pkg_db_exec))
         .route("/iyke/browser/_reply", post(post_browser_reply))
         .route("/", get(super::ide_ws::ide_ws_handler));
 

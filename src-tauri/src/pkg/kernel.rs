@@ -693,6 +693,11 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 );
             }
         }
+        // WP-23 (D-18): drop this pkg's scoped-db bearer token so a still-running
+        // (or leaked) backend process can't keep querying under the identity of a
+        // pkg that no longer exists. Unlike the Tauri ACL above, this one really
+        // is revoked, immediately and without a restart.
+        crate::pkg::db_scope::revoke_grant(pkg_id);
         // FK cascades drop pkg_settings / pkg_migrations / pkg_permissions_granted.
         if let Err(e) = self.delete_install_row(pkg_id) {
             log::warn!("[pkg_kernel] DB delete for `{pkg_id}` failed (continuing): {e:#}");
