@@ -614,6 +614,16 @@ pub struct Permissions {
 
     #[serde(default)]
     pub events: Vec<String>,
+
+    /// OS-notification scopes this pkg may exercise from its iframe
+    /// (FE-gated `host.notify` verb — see `pkgDeclaresScope` in
+    /// pkg-iframe-host.tsx). `"send"` gates raising an OS notification.
+    /// Install-time sensitive: surfaces in the trust prompt like the other
+    /// permission lists. Mirrors `PermissionsSchema.notify` in
+    /// `@ikenga/contract/src/manifest.ts` — keep in lockstep (WP-26; not
+    /// yet mirrored there — see plan tracking).
+    #[serde(default)]
+    pub notify: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

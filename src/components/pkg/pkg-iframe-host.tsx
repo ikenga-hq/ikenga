@@ -80,6 +80,11 @@ import {
 } from '@/lib/tauri-cmd';
 import { isTauri } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
+import {
+	isNotificationPermissionGranted,
+	requestNotificationPermission,
+	sendNotification,
+} from '@/lib/transport/shims';
 import { usePaneScope } from '@/shell/panes/pane-scope';
 
 // Tauri event payload emitted by `Kernel::reload_pkg`. The FE only cares about
@@ -162,6 +167,32 @@ async function pkgDeclaresScope(pkgId: string, resource: string, action: string)
 		console.warn(`[pkg-host] scope check ${resource}:${action} for ${pkgId} failed:`, e);
 		return false;
 	}
+}
+
+// Per-pkg rate limit for `host.notify` (WP-26). An OS notification reaches
+// the user outside the shell window — exactly the property that makes a
+// spammed one so much worse than a spammed in-pane toast: it can't be
+// ignored by looking away, and a user who gets buried by a chatty pkg learns
+// to dismiss Ikenga's notifications on sight, which quietly disables the
+// real ones (e.g. the meetings nudge this verb exists for, WP-15). 3 per
+// rolling 60s per pkg leaves room for a legitimate retry without allowing a
+// runaway loop to become a denial-of-attention. In-memory only — resets on
+// reload, which is fine since a reload already interrupts whatever loop
+// would have been spamming.
+const NOTIFY_RATE_LIMIT = 3;
+const NOTIFY_RATE_WINDOW_MS = 60_000;
+const notifyTimestamps = new Map<string, number[]>();
+
+function notifyRateLimited(pkgId: string): boolean {
+	const now = Date.now();
+	const recent = (notifyTimestamps.get(pkgId) ?? []).filter((t) => now - t < NOTIFY_RATE_WINDOW_MS);
+	if (recent.length >= NOTIFY_RATE_LIMIT) {
+		notifyTimestamps.set(pkgId, recent);
+		return true;
+	}
+	recent.push(now);
+	notifyTimestamps.set(pkgId, recent);
+	return false;
 }
 
 // Whether the pkg declared `capabilities.sqlite` (opt-in to reading the local
@@ -653,6 +684,60 @@ export async function dispatchHostCall(
 		}
 		return {
 			content: [{ type: 'text', text: badge ? 'badge set' : 'badge cleared' }],
+			structuredContent: { ok: true },
+		};
+	}
+
+	// host.notify({ title, body? }) — WP-26. Raises an OS notification for the
+	// pkg — the one out-of-pane signal that reaches the user while the shell
+	// isn't focused, unlike `host.pkg.setBadge` above (an activity-bar dot,
+	// invisible off-screen). First consumer is the meetings nudge (WP-15),
+	// which must reach someone mid-call — exactly when Ikenga is not on
+	// screen. Gated on `permissions.notify` containing `'send'`, mirroring the
+	// `engine:invoke` shape `pkgDeclaresScope` already checks elsewhere in this
+	// file (host.* verbs bypass kernel scope enforcement, so the check happens
+	// here and fails closed). Rate-limited per pkg via `notifyRateLimited` so
+	// a pkg can't turn a legitimate nudge into a denial-of-attention loop.
+	if (name === 'host.notify') {
+		const title = typeof args.title === 'string' ? args.title.trim() : '';
+		if (!title) {
+			return errResult('host.notify: missing required `title` argument');
+		}
+		const body = typeof args.body === 'string' ? args.body : undefined;
+		if (!(await pkgDeclaresScope(pkgId, 'notify', 'send'))) {
+			return {
+				content: [{ type: 'text', text: "host.notify: pkg lacks the 'notify:send' scope" }],
+				isError: true,
+				structuredContent: { ok: false, reason: 'scope-denied' },
+			};
+		}
+		if (notifyRateLimited(pkgId)) {
+			return {
+				content: [
+					{ type: 'text', text: 'host.notify: rate limit exceeded (3 notifications per 60s)' },
+				],
+				isError: true,
+				structuredContent: { ok: false, reason: 'rate-limited' },
+			};
+		}
+		try {
+			let granted = await isNotificationPermissionGranted();
+			if (!granted) {
+				granted = (await requestNotificationPermission()) === 'granted';
+			}
+			if (!granted) {
+				return {
+					content: [{ type: 'text', text: 'host.notify: OS notification permission not granted' }],
+					isError: true,
+					structuredContent: { ok: false, reason: 'permission-denied' },
+				};
+			}
+			await sendNotification({ title, body });
+		} catch (e) {
+			return errResult(`host.notify failed: ${(e as Error).message ?? String(e)}`);
+		}
+		return {
+			content: [{ type: 'text', text: 'notification sent' }],
 			structuredContent: { ok: true },
 		};
 	}
