@@ -1144,6 +1144,14 @@ impl SupervisedSidecar {
             }
         }
 
+        // WP-23 (D-18): hand this pkg its scoped database accessor —
+        // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for
+        // the two `/iyke/pkg-db/*` routes, enforced against this pkg's own
+        // `permissions["sqlite.tables"]`. Set before the manifest's own `env`
+        // block so an explicit manifest entry still wins, same precedence as
+        // the project + settings-secret injections. See `pkg::db_scope`.
+        crate::pkg::db_scope::inject_env(&mut cmd, &self.pkg_id, &self.install_path);
+
         for (k, v) in &self.server.env {
             cmd.env(k, v);
         }

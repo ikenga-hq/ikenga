@@ -20,6 +20,9 @@
 
 #[cfg(feature = "desktop")]
 pub mod cap_snapshot;
+/// Host-side database sandbox for pkg backend processes (WP-23 / D-18).
+#[cfg(feature = "desktop")]
+pub mod db_scope;
 // WP-02 foundation: detection + launcher are standalone until the kernel/command
 // wiring lands in later WPs (WP-04 lifecycle, WP-07 routing). Allow dead-code so
 // the unconsumed public API doesn't warn in the interim.

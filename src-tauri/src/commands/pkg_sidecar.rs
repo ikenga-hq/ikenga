@@ -96,6 +96,11 @@ pub async fn pkg_sidecar_call(
     let mut cmd = Command::new(&entry.bin_path);
     cmd.args(&args);
     cmd.current_dir(&install_path);
+    // WP-23 (D-18): hand this pkg its scoped database accessor —
+    // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the
+    // two `/iyke/pkg-db/*` routes, enforced against this pkg's own
+    // `permissions["sqlite.tables"]`. See `pkg::db_scope`.
+    crate::pkg::db_scope::inject_env(&mut cmd, &pkg_id, &install_path);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

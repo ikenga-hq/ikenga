@@ -188,8 +188,15 @@ static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// * `IKENGA_SECRET_*` — the namespace `/api/rpc`'s `secrets_get` serves.
 ///   These are application secrets fetched deliberately through an
 ///   authenticated RPC, not shell environment.
+/// * `IKENGA_PKG_DB_TOKEN` — a pkg's scoped-db bearer (WP-23). Belt-and-braces:
+///   it is set on a pkg child's `Command` and never on the shell's own process
+///   env, so today there is nothing here to inherit. Listed so that stays true
+///   if the injection ever moves.
 fn is_host_only_env(key: &str) -> bool {
-    matches!(key, "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY") || key.starts_with("IKENGA_SECRET_")
+    matches!(
+        key,
+        "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY" | "IKENGA_PKG_DB_TOKEN"
+    ) || key.starts_with("IKENGA_SECRET_")
 }
 
 /// Wrapper for `MasterPty::process_group_leader`, which is `#[cfg(unix)]` in
@@ -1423,6 +1430,7 @@ mod tests {
         assert!(is_host_only_env("IKENGA_VAULT_KEY"));
         assert!(is_host_only_env("IKENGA_SECRET_FAL"));
         assert!(is_host_only_env("IKENGA_SECRET_"));
+        assert!(is_host_only_env("IKENGA_PKG_DB_TOKEN"));
 
         // Agent credentials are inherited ON PURPOSE: a remote terminal picking
         // up the box's `claude` / `gemini` auth is the point of the design.
