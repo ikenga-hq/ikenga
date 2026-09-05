@@ -207,10 +207,16 @@ describe('rehydrateFromDb & auto-resume', () => {
 
 		// The tab starts as spawning; let the background spawn resolve.
 		expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('spawning');
-		await new Promise((r) => setTimeout(r, 10));
+
+		// Poll rather than sleeping a fixed interval: respawnTab resolves on its
+		// own schedule, and a hardcoded wait is a race that a loaded CI runner
+		// loses — this assertion failed in CI at 10ms while passing locally.
+		await vi.waitFor(() => {
+			const t = useTerminalStore.getState().tabs.find((x) => x.id === id);
+			expect(t?.status).toBe('running');
+		});
 
 		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
-		expect(tab?.status).toBe('running');
 		expect(tab?.ptyId).toBe('pty-test');
 	});
 
