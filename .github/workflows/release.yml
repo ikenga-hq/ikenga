@@ -239,11 +239,22 @@ jobs:
       # ikenga-pkgs is its own pnpm workspace. Install + build its members
       # so the engine-cc dist exists for `bun run engine:cc:materialize` and
       # scripts/build-iyke-mcp.sh can bundle from packages/mcp/iyke/.
+      # --ignore-scripts skips native postinstall builds. The shell needs only
+      # the engine-cc dist and the iyke MCP bundle from this workspace, but a
+      # plain install compiles every package's native deps — including
+      # better-sqlite3, a runtime dep of packages/mcp/meetings. That compiles on
+      # Linux and macOS and fails on Windows, where node-gyp's Visual Studio
+      # probe dies with ERR_CHILD_PROCESS_STDIO_MAXBUFFER and then reports it as
+      # "Could not find any Visual Studio installation to use".
+      #
+      # Nothing here needs the binding: `pnpm -r build` is tsc, which needs only
+      # @types/better-sqlite3, and the meetings MCP materializes its own deps on
+      # the user's machine at pkg install time.
       - name: Install + build ikenga-pkgs (nested workspace)
         shell: bash
         working-directory: ikenga-pkgs
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --ignore-scripts
           pnpm -r build
 
       - name: Build iyke MCP binary
