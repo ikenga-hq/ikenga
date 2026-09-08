@@ -16,34 +16,35 @@ if [[ ! -f "$SRC" ]]; then
   exit 1
 fi
 
-DESTS=(
-  "$ROOT/royalti-video-engine/storyboard-app/src/iyke-bridge.ts"
-  "$ROOT/royalti-video-engine/src/iyke-bridge.ts"
-)
+# All three former destinations lived inside royalti-video-engine, which was
+# retired on 2026-09-08 (WP-16) and deleted:
+#
+#   $ROOT/royalti-video-engine/storyboard-app/src/iyke-bridge.ts
+#   $ROOT/royalti-video-engine/src/iyke-bridge.ts
+#   $ROOT/royalti-video-engine/hyperframes-projects/*/preview/iyke-bridge.ts
+#
+# Leaving them was worse than a broken path. The copy loop ran `mkdir -p`
+# before `cp`, so this script would silently RE-CREATE royalti-video-engine/
+# as ghost directories holding one file each, on a tree where that directory
+# is meant to be gone -- and report success while doing it.
+#
+# Nothing outside the engine consumed this bridge, so the list is empty rather
+# than repointed; inventing a destination would be guessing. Add real entries
+# here when a sidecar needs the bridge. The re-bundle step below is
+# independent and still does useful work.
+DESTS=()
 
-# HyperFrames preview projects each have their own src/. Find every
-# index.html with a sibling src/main.* and copy alongside.
-mapfile -t HF_DESTS < <(
-  find "$ROOT/royalti-video-engine/hyperframes-projects" \
-    -type f -name 'index.html' -path '*/preview/*' 2>/dev/null \
-    | while read -r html; do
-        dir="$(dirname "$html")"
-        if [[ -f "$dir/main.tsx" || -f "$dir/main.ts" ]]; then
-          echo "$dir/iyke-bridge.ts"
-        fi
-      done
-) || true
-
-DESTS+=("${HF_DESTS[@]}")
-
-for d in "${DESTS[@]}"; do
-  if [[ -z "$d" ]]; then continue; fi
-  mkdir -p "$(dirname "$d")"
-  cp "$SRC" "$d"
-  echo "  → $d"
-done
-
-echo "synced ${#DESTS[@]} copies"
+if [[ ${#DESTS[@]} -eq 0 ]]; then
+  echo "no sync destinations configured (see the note above) - skipping copy"
+else
+  for d in "${DESTS[@]}"; do
+    [[ -z "$d" ]] && continue
+    mkdir -p "$(dirname "$d")"
+    cp "$SRC" "$d"
+    echo "  -> $d"
+  done
+  echo "synced ${#DESTS[@]} copies"
+fi
 
 # Re-bundle the standalone IIFE used by the viewer-server's HTML injection.
 # Without this, design previews opened via HtmlFrame would still see the

@@ -210,10 +210,34 @@ export interface CompositionRow {
 	durationInFrames?: number;
 }
 
+/**
+ * Scan a directory of Remotion `.tsx` compositions.
+ *
+ * The default used to be royalti-video-engine/src/compositions, which was
+ * retired on 2026-09-08 (WP-16) and deleted. The `existsSync` guard below
+ * meant this did not throw -- it just returned [] forever, so the CLI reported
+ * "no compositions" on a machine that had them and nothing indicated why.
+ *
+ * There is no honest replacement default: compositions are no longer a global
+ * directory. Under the Studio Remotion lane a composition is a CELL, living at
+ * `<project>/cells/<rung>/<uid>/*.tsx`, so the root is per-project and the
+ * caller has to say which. `PA_COMPOSITIONS_DIR` covers scripted use; anything
+ * else must pass `rootOverride`.
+ */
 export function listCompositions(rootOverride?: string): CompositionRow[] {
-	const engineRoot =
-		rootOverride ?? join(homedir(), 'royalti-co', 'royalti-video-engine', 'src', 'compositions');
-	if (!existsSync(engineRoot)) return [];
+	const engineRoot = rootOverride ?? process.env.PA_COMPOSITIONS_DIR;
+	if (!engineRoot) {
+		console.error(
+			'listCompositions: no root given. Compositions moved to Studio project cells ' +
+				'(<project>/cells/<rung>/<uid>/*.tsx) when royalti-video-engine was retired. ' +
+				'Pass a root or set PA_COMPOSITIONS_DIR.',
+		);
+		return [];
+	}
+	if (!existsSync(engineRoot)) {
+		console.error(`listCompositions: ${engineRoot} does not exist`);
+		return [];
+	}
 	const out: CompositionRow[] = [];
 	for (const entry of readdirSync(engineRoot, { withFileTypes: true })) {
 		if (!entry.isFile() || !entry.name.endsWith('.tsx')) continue;
