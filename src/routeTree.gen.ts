@@ -9,145 +9,70 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as UiroutesSmokeRouteImport } from './routes/uiroutes-smoke'
-import { Route as TodosRouteImport } from './routes/todos'
-import { Route as SettingsSmokeRouteImport } from './routes/settings-smoke'
-import { Route as ScratchpadsRouteImport } from './routes/scratchpads'
-import { Route as PkgSmokeRouteImport } from './routes/pkg-smoke'
-import { Route as PkgKernelStatusRouteImport } from './routes/pkg-kernel-status'
-import { Route as PermsSmokeRouteImport } from './routes/perms-smoke'
-import { Route as PackagesRouteImport } from './routes/packages'
-import { Route as McpSmokeRouteImport } from './routes/mcp-smoke'
-import { Route as LspSmokeRouteImport } from './routes/lsp-smoke'
-import { Route as IykeSmokeRouteImport } from './routes/iyke-smoke'
-import { Route as InstallRouteImport } from './routes/install'
-import { Route as IframeMountSmokeRouteImport } from './routes/iframe-mount-smoke'
-import { Route as CronSmokeRouteImport } from './routes/cron-smoke'
-import { Route as CronRouteImport } from './routes/cron'
-import { Route as ClaudeAssetsSmokeRouteImport } from './routes/claude-assets-smoke'
-import { Route as AgentRunsRouteImport } from './routes/agent-runs'
-import { Route as SettingsRouteRouteImport } from './routes/settings/route'
-import { Route as OutboxRouteRouteImport } from './routes/outbox/route'
-import { Route as OnboardingRouteRouteImport } from './routes/onboarding/route'
-import { Route as ClaudeRouteRouteImport } from './routes/claude/route'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as SettingsIndexRouteImport } from './routes/settings/index'
-import { Route as OnboardingIndexRouteImport } from './routes/onboarding/index'
-import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
-import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
-import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
-import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
-import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-health'
-import { Route as SettingsPkgAuditRouteImport } from './routes/settings/pkg-audit'
-import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
-import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
-import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
-import { Route as SettingsDataHealthRouteImport } from './routes/settings/data-health'
-import { Route as SettingsBackupRouteImport } from './routes/settings/backup'
-import { Route as SettingsArtifactGridRouteImport } from './routes/settings/artifact-grid'
-import { Route as SettingsAppearanceRouteImport } from './routes/settings/appearance'
-import { Route as SettingsAgentRouteImport } from './routes/settings/agent'
-import { Route as SettingsActivityBarRouteImport } from './routes/settings/activity-bar'
-import { Route as SettingsAboutRouteImport } from './routes/settings/about'
-import { Route as ProjectsNewArtifactRouteImport } from './routes/projects/new-artifact'
-import { Route as PackagesBrowseRouteImport } from './routes/packages_.browse'
-import { Route as OutboxSocialRouteImport } from './routes/outbox/social'
-import { Route as OutboxSentRouteImport } from './routes/outbox/sent'
-import { Route as OutboxNewsletterRouteImport } from './routes/outbox/newsletter'
-import { Route as OutboxEmailRouteImport } from './routes/outbox/email'
-import { Route as OutboxApprovalsRouteImport } from './routes/outbox/approvals'
-import { Route as OnboardingWelcomeRouteImport } from './routes/onboarding/welcome'
-import { Route as OnboardingSummaryRouteImport } from './routes/onboarding/summary'
-import { Route as OnboardingScaffoldingRouteImport } from './routes/onboarding/scaffolding'
-import { Route as OnboardingRootsRouteImport } from './routes/onboarding/roots'
-import { Route as OnboardingPackagesRouteImport } from './routes/onboarding/packages'
-import { Route as OnboardingConnectorsRouteImport } from './routes/onboarding/connectors'
-import { Route as OnboardingAppearanceRouteImport } from './routes/onboarding/appearance'
-import { Route as OnboardingAgentRouteImport } from './routes/onboarding/agent'
+import { Route as AgentRunsRouteImport } from './routes/agent-runs'
+import { Route as ClaudeRouteRouteImport } from './routes/claude/route'
+import { Route as ClaudeAssetsSmokeRouteImport } from './routes/claude-assets-smoke'
+import { Route as CronRouteImport } from './routes/cron'
+import { Route as CronSmokeRouteImport } from './routes/cron-smoke'
+import { Route as IframeMountSmokeRouteImport } from './routes/iframe-mount-smoke'
+import { Route as InstallRouteImport } from './routes/install'
+import { Route as IykeSmokeRouteImport } from './routes/iyke-smoke'
+import { Route as LspSmokeRouteImport } from './routes/lsp-smoke'
+import { Route as McpSmokeRouteImport } from './routes/mcp-smoke'
+import { Route as OnboardingRouteRouteImport } from './routes/onboarding/route'
+import { Route as OutboxRouteRouteImport } from './routes/outbox/route'
+import { Route as PackagesRouteImport } from './routes/packages'
+import { Route as PermsSmokeRouteImport } from './routes/perms-smoke'
+import { Route as PkgKernelStatusRouteImport } from './routes/pkg-kernel-status'
+import { Route as PkgSmokeRouteImport } from './routes/pkg-smoke'
+import { Route as ScratchpadsRouteImport } from './routes/scratchpads'
+import { Route as SettingsRouteRouteImport } from './routes/settings/route'
+import { Route as SettingsSmokeRouteImport } from './routes/settings-smoke'
+import { Route as TodosRouteImport } from './routes/todos'
+import { Route as UiroutesSmokeRouteImport } from './routes/uiroutes-smoke'
 import { Route as ArtifactsHomeRouteImport } from './routes/artifacts/home'
+import { Route as OnboardingIndexRouteImport } from './routes/onboarding/index'
+import { Route as OnboardingAgentRouteImport } from './routes/onboarding/agent'
+import { Route as OnboardingAppearanceRouteImport } from './routes/onboarding/appearance'
+import { Route as OnboardingConnectorsRouteImport } from './routes/onboarding/connectors'
+import { Route as OnboardingPackagesRouteImport } from './routes/onboarding/packages'
+import { Route as OnboardingRootsRouteImport } from './routes/onboarding/roots'
+import { Route as OnboardingScaffoldingRouteImport } from './routes/onboarding/scaffolding'
+import { Route as OnboardingSummaryRouteImport } from './routes/onboarding/summary'
+import { Route as OnboardingWelcomeRouteImport } from './routes/onboarding/welcome'
+import { Route as OutboxApprovalsRouteImport } from './routes/outbox/approvals'
+import { Route as OutboxEmailRouteImport } from './routes/outbox/email'
+import { Route as OutboxNewsletterRouteImport } from './routes/outbox/newsletter'
+import { Route as OutboxSentRouteImport } from './routes/outbox/sent'
+import { Route as OutboxSocialRouteImport } from './routes/outbox/social'
+import { Route as PackagesBrowseRouteImport } from './routes/packages_.browse'
 import { Route as PkgPkgIdRouteRouteImport } from './routes/pkg/$pkgId/route'
+import { Route as ProjectsNewArtifactRouteImport } from './routes/projects/new-artifact'
+import { Route as SettingsIndexRouteImport } from './routes/settings/index'
+import { Route as SettingsAboutRouteImport } from './routes/settings/about'
+import { Route as SettingsActivityBarRouteImport } from './routes/settings/activity-bar'
+import { Route as SettingsAgentRouteImport } from './routes/settings/agent'
+import { Route as SettingsAppearanceRouteImport } from './routes/settings/appearance'
+import { Route as SettingsArtifactGridRouteImport } from './routes/settings/artifact-grid'
+import { Route as SettingsBackupRouteImport } from './routes/settings/backup'
+import { Route as SettingsDataHealthRouteImport } from './routes/settings/data-health'
+import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
+import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
+import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
+import { Route as SettingsPkgAuditRouteImport } from './routes/settings/pkg-audit'
+import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-health'
+import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
+import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
+import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
+import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
+import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
 import { Route as PkgPkgIdSplatRouteImport } from './routes/pkg/$pkgId/$'
-import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
 
-const UiroutesSmokeRoute = UiroutesSmokeRouteImport.update({
-  id: '/uiroutes-smoke',
-  path: '/uiroutes-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const TodosRoute = TodosRouteImport.update({
-  id: '/todos',
-  path: '/todos',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const SettingsSmokeRoute = SettingsSmokeRouteImport.update({
-  id: '/settings-smoke',
-  path: '/settings-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ScratchpadsRoute = ScratchpadsRouteImport.update({
-  id: '/scratchpads',
-  path: '/scratchpads',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PkgSmokeRoute = PkgSmokeRouteImport.update({
-  id: '/pkg-smoke',
-  path: '/pkg-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PkgKernelStatusRoute = PkgKernelStatusRouteImport.update({
-  id: '/pkg-kernel-status',
-  path: '/pkg-kernel-status',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PermsSmokeRoute = PermsSmokeRouteImport.update({
-  id: '/perms-smoke',
-  path: '/perms-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PackagesRoute = PackagesRouteImport.update({
-  id: '/packages',
-  path: '/packages',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const McpSmokeRoute = McpSmokeRouteImport.update({
-  id: '/mcp-smoke',
-  path: '/mcp-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LspSmokeRoute = LspSmokeRouteImport.update({
-  id: '/lsp-smoke',
-  path: '/lsp-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const IykeSmokeRoute = IykeSmokeRouteImport.update({
-  id: '/iyke-smoke',
-  path: '/iyke-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const InstallRoute = InstallRouteImport.update({
-  id: '/install',
-  path: '/install',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const IframeMountSmokeRoute = IframeMountSmokeRouteImport.update({
-  id: '/iframe-mount-smoke',
-  path: '/iframe-mount-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const CronSmokeRoute = CronSmokeRouteImport.update({
-  id: '/cron-smoke',
-  path: '/cron-smoke',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const CronRoute = CronRouteImport.update({
-  id: '/cron',
-  path: '/cron',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ClaudeAssetsSmokeRoute = ClaudeAssetsSmokeRouteImport.update({
-  id: '/claude-assets-smoke',
-  path: '/claude-assets-smoke',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AgentRunsRoute = AgentRunsRouteImport.update({
@@ -155,14 +80,49 @@ const AgentRunsRoute = AgentRunsRouteImport.update({
   path: '/agent-runs',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SettingsRouteRoute = SettingsRouteRouteImport.update({
-  id: '/settings',
-  path: '/settings',
+const ClaudeRouteRoute = ClaudeRouteRouteImport.update({
+  id: '/claude',
+  path: '/claude',
   getParentRoute: () => rootRouteImport,
 } as any)
-const OutboxRouteRoute = OutboxRouteRouteImport.update({
-  id: '/outbox',
-  path: '/outbox',
+const ClaudeAssetsSmokeRoute = ClaudeAssetsSmokeRouteImport.update({
+  id: '/claude-assets-smoke',
+  path: '/claude-assets-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CronRoute = CronRouteImport.update({
+  id: '/cron',
+  path: '/cron',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CronSmokeRoute = CronSmokeRouteImport.update({
+  id: '/cron-smoke',
+  path: '/cron-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const IframeMountSmokeRoute = IframeMountSmokeRouteImport.update({
+  id: '/iframe-mount-smoke',
+  path: '/iframe-mount-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const InstallRoute = InstallRouteImport.update({
+  id: '/install',
+  path: '/install',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const IykeSmokeRoute = IykeSmokeRouteImport.update({
+  id: '/iyke-smoke',
+  path: '/iyke-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LspSmokeRoute = LspSmokeRouteImport.update({
+  id: '/lsp-smoke',
+  path: '/lsp-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const McpSmokeRoute = McpSmokeRouteImport.update({
+  id: '/mcp-smoke',
+  path: '/mcp-smoke',
   getParentRoute: () => rootRouteImport,
 } as any)
 const OnboardingRouteRoute = OnboardingRouteRouteImport.update({
@@ -170,174 +130,64 @@ const OnboardingRouteRoute = OnboardingRouteRouteImport.update({
   path: '/onboarding',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ClaudeRouteRoute = ClaudeRouteRouteImport.update({
-  id: '/claude',
-  path: '/claude',
+const OutboxRouteRoute = OutboxRouteRouteImport.update({
+  id: '/outbox',
+  path: '/outbox',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const PackagesRoute = PackagesRouteImport.update({
+  id: '/packages',
+  path: '/packages',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SettingsIndexRoute = SettingsIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => SettingsRouteRoute,
+const PermsSmokeRoute = PermsSmokeRouteImport.update({
+  id: '/perms-smoke',
+  path: '/perms-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PkgKernelStatusRoute = PkgKernelStatusRouteImport.update({
+  id: '/pkg-kernel-status',
+  path: '/pkg-kernel-status',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PkgSmokeRoute = PkgSmokeRouteImport.update({
+  id: '/pkg-smoke',
+  path: '/pkg-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ScratchpadsRoute = ScratchpadsRouteImport.update({
+  id: '/scratchpads',
+  path: '/scratchpads',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsRouteRoute = SettingsRouteRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsSmokeRoute = SettingsSmokeRouteImport.update({
+  id: '/settings-smoke',
+  path: '/settings-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TodosRoute = TodosRouteImport.update({
+  id: '/todos',
+  path: '/todos',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const UiroutesSmokeRoute = UiroutesSmokeRouteImport.update({
+  id: '/uiroutes-smoke',
+  path: '/uiroutes-smoke',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ArtifactsHomeRoute = ArtifactsHomeRouteImport.update({
+  id: '/artifacts/home',
+  path: '/artifacts/home',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const OnboardingIndexRoute = OnboardingIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const SettingsTerminalRoute = SettingsTerminalRouteImport.update({
-  id: '/terminal',
-  path: '/terminal',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsStorageRoute = SettingsStorageRouteImport.update({
-  id: '/storage',
-  path: '/storage',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsSecretsRoute = SettingsSecretsRouteImport.update({
-  id: '/secrets',
-  path: '/secrets',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsProjectsRoute = SettingsProjectsRouteImport.update({
-  id: '/projects',
-  path: '/projects',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsPkgHealthRoute = SettingsPkgHealthRouteImport.update({
-  id: '/pkg-health',
-  path: '/pkg-health',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsPkgAuditRoute = SettingsPkgAuditRouteImport.update({
-  id: '/pkg-audit',
-  path: '/pkg-audit',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsPackagesRoute = SettingsPackagesRouteImport.update({
-  id: '/packages',
-  path: '/packages',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
-  id: '/onboarding',
-  path: '/onboarding',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsIntegrationsRoute = SettingsIntegrationsRouteImport.update({
-  id: '/integrations',
-  path: '/integrations',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsDataHealthRoute = SettingsDataHealthRouteImport.update({
-  id: '/data-health',
-  path: '/data-health',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsBackupRoute = SettingsBackupRouteImport.update({
-  id: '/backup',
-  path: '/backup',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsArtifactGridRoute = SettingsArtifactGridRouteImport.update({
-  id: '/artifact-grid',
-  path: '/artifact-grid',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsAppearanceRoute = SettingsAppearanceRouteImport.update({
-  id: '/appearance',
-  path: '/appearance',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsAgentRoute = SettingsAgentRouteImport.update({
-  id: '/agent',
-  path: '/agent',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsActivityBarRoute = SettingsActivityBarRouteImport.update({
-  id: '/activity-bar',
-  path: '/activity-bar',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const SettingsAboutRoute = SettingsAboutRouteImport.update({
-  id: '/about',
-  path: '/about',
-  getParentRoute: () => SettingsRouteRoute,
-} as any)
-const ProjectsNewArtifactRoute = ProjectsNewArtifactRouteImport.update({
-  id: '/projects/new-artifact',
-  path: '/projects/new-artifact',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PackagesBrowseRoute = PackagesBrowseRouteImport.update({
-  id: '/packages_/browse',
-  path: '/packages/browse',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const OutboxSocialRoute = OutboxSocialRouteImport.update({
-  id: '/social',
-  path: '/social',
-  getParentRoute: () => OutboxRouteRoute,
-} as any)
-const OutboxSentRoute = OutboxSentRouteImport.update({
-  id: '/sent',
-  path: '/sent',
-  getParentRoute: () => OutboxRouteRoute,
-} as any)
-const OutboxNewsletterRoute = OutboxNewsletterRouteImport.update({
-  id: '/newsletter',
-  path: '/newsletter',
-  getParentRoute: () => OutboxRouteRoute,
-} as any)
-const OutboxEmailRoute = OutboxEmailRouteImport.update({
-  id: '/email',
-  path: '/email',
-  getParentRoute: () => OutboxRouteRoute,
-} as any)
-const OutboxApprovalsRoute = OutboxApprovalsRouteImport.update({
-  id: '/approvals',
-  path: '/approvals',
-  getParentRoute: () => OutboxRouteRoute,
-} as any)
-const OnboardingWelcomeRoute = OnboardingWelcomeRouteImport.update({
-  id: '/welcome',
-  path: '/welcome',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingSummaryRoute = OnboardingSummaryRouteImport.update({
-  id: '/summary',
-  path: '/summary',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingScaffoldingRoute = OnboardingScaffoldingRouteImport.update({
-  id: '/scaffolding',
-  path: '/scaffolding',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingRootsRoute = OnboardingRootsRouteImport.update({
-  id: '/roots',
-  path: '/roots',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingPackagesRoute = OnboardingPackagesRouteImport.update({
-  id: '/packages',
-  path: '/packages',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingConnectorsRoute = OnboardingConnectorsRouteImport.update({
-  id: '/connectors',
-  path: '/connectors',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingAppearanceRoute = OnboardingAppearanceRouteImport.update({
-  id: '/appearance',
-  path: '/appearance',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
 const OnboardingAgentRoute = OnboardingAgentRouteImport.update({
@@ -345,14 +195,169 @@ const OnboardingAgentRoute = OnboardingAgentRouteImport.update({
   path: '/agent',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const ArtifactsHomeRoute = ArtifactsHomeRouteImport.update({
-  id: '/artifacts/home',
-  path: '/artifacts/home',
+const OnboardingAppearanceRoute = OnboardingAppearanceRouteImport.update({
+  id: '/appearance',
+  path: '/appearance',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingConnectorsRoute = OnboardingConnectorsRouteImport.update({
+  id: '/connectors',
+  path: '/connectors',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingPackagesRoute = OnboardingPackagesRouteImport.update({
+  id: '/packages',
+  path: '/packages',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingRootsRoute = OnboardingRootsRouteImport.update({
+  id: '/roots',
+  path: '/roots',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingScaffoldingRoute = OnboardingScaffoldingRouteImport.update({
+  id: '/scaffolding',
+  path: '/scaffolding',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingSummaryRoute = OnboardingSummaryRouteImport.update({
+  id: '/summary',
+  path: '/summary',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OnboardingWelcomeRoute = OnboardingWelcomeRouteImport.update({
+  id: '/welcome',
+  path: '/welcome',
+  getParentRoute: () => OnboardingRouteRoute,
+} as any)
+const OutboxApprovalsRoute = OutboxApprovalsRouteImport.update({
+  id: '/approvals',
+  path: '/approvals',
+  getParentRoute: () => OutboxRouteRoute,
+} as any)
+const OutboxEmailRoute = OutboxEmailRouteImport.update({
+  id: '/email',
+  path: '/email',
+  getParentRoute: () => OutboxRouteRoute,
+} as any)
+const OutboxNewsletterRoute = OutboxNewsletterRouteImport.update({
+  id: '/newsletter',
+  path: '/newsletter',
+  getParentRoute: () => OutboxRouteRoute,
+} as any)
+const OutboxSentRoute = OutboxSentRouteImport.update({
+  id: '/sent',
+  path: '/sent',
+  getParentRoute: () => OutboxRouteRoute,
+} as any)
+const OutboxSocialRoute = OutboxSocialRouteImport.update({
+  id: '/social',
+  path: '/social',
+  getParentRoute: () => OutboxRouteRoute,
+} as any)
+const PackagesBrowseRoute = PackagesBrowseRouteImport.update({
+  id: '/packages_/browse',
+  path: '/packages/browse',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PkgPkgIdRouteRoute = PkgPkgIdRouteRouteImport.update({
   id: '/pkg/$pkgId',
   path: '/pkg/$pkgId',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProjectsNewArtifactRoute = ProjectsNewArtifactRouteImport.update({
+  id: '/projects/new-artifact',
+  path: '/projects/new-artifact',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsIndexRoute = SettingsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsAboutRoute = SettingsAboutRouteImport.update({
+  id: '/about',
+  path: '/about',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsActivityBarRoute = SettingsActivityBarRouteImport.update({
+  id: '/activity-bar',
+  path: '/activity-bar',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsAgentRoute = SettingsAgentRouteImport.update({
+  id: '/agent',
+  path: '/agent',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsAppearanceRoute = SettingsAppearanceRouteImport.update({
+  id: '/appearance',
+  path: '/appearance',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsArtifactGridRoute = SettingsArtifactGridRouteImport.update({
+  id: '/artifact-grid',
+  path: '/artifact-grid',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsBackupRoute = SettingsBackupRouteImport.update({
+  id: '/backup',
+  path: '/backup',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsDataHealthRoute = SettingsDataHealthRouteImport.update({
+  id: '/data-health',
+  path: '/data-health',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsIntegrationsRoute = SettingsIntegrationsRouteImport.update({
+  id: '/integrations',
+  path: '/integrations',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
+  id: '/onboarding',
+  path: '/onboarding',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsPackagesRoute = SettingsPackagesRouteImport.update({
+  id: '/packages',
+  path: '/packages',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsPkgAuditRoute = SettingsPkgAuditRouteImport.update({
+  id: '/pkg-audit',
+  path: '/pkg-audit',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsPkgHealthRoute = SettingsPkgHealthRouteImport.update({
+  id: '/pkg-health',
+  path: '/pkg-health',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsProjectsRoute = SettingsProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsSecretsRoute = SettingsSecretsRouteImport.update({
+  id: '/secrets',
+  path: '/secrets',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsStorageRoute = SettingsStorageRouteImport.update({
+  id: '/storage',
+  path: '/storage',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsTerminalRoute = SettingsTerminalRouteImport.update({
+  id: '/terminal',
+  path: '/terminal',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
+  id: '/artifacts/by-kind/$kind',
+  path: '/artifacts/by-kind/$kind',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PkgPkgIdIndexRoute = PkgPkgIdIndexRouteImport.update({
@@ -364,11 +369,6 @@ const PkgPkgIdSplatRoute = PkgPkgIdSplatRouteImport.update({
   id: '/$',
   path: '/$',
   getParentRoute: () => PkgPkgIdRouteRoute,
-} as any)
-const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
-  id: '/artifacts/by-kind/$kind',
-  path: '/artifacts/by-kind/$kind',
-  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
@@ -773,116 +773,11 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/uiroutes-smoke': {
-      id: '/uiroutes-smoke'
-      path: '/uiroutes-smoke'
-      fullPath: '/uiroutes-smoke'
-      preLoaderRoute: typeof UiroutesSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/todos': {
-      id: '/todos'
-      path: '/todos'
-      fullPath: '/todos'
-      preLoaderRoute: typeof TodosRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/settings-smoke': {
-      id: '/settings-smoke'
-      path: '/settings-smoke'
-      fullPath: '/settings-smoke'
-      preLoaderRoute: typeof SettingsSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/scratchpads': {
-      id: '/scratchpads'
-      path: '/scratchpads'
-      fullPath: '/scratchpads'
-      preLoaderRoute: typeof ScratchpadsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/pkg-smoke': {
-      id: '/pkg-smoke'
-      path: '/pkg-smoke'
-      fullPath: '/pkg-smoke'
-      preLoaderRoute: typeof PkgSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/pkg-kernel-status': {
-      id: '/pkg-kernel-status'
-      path: '/pkg-kernel-status'
-      fullPath: '/pkg-kernel-status'
-      preLoaderRoute: typeof PkgKernelStatusRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/perms-smoke': {
-      id: '/perms-smoke'
-      path: '/perms-smoke'
-      fullPath: '/perms-smoke'
-      preLoaderRoute: typeof PermsSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/packages': {
-      id: '/packages'
-      path: '/packages'
-      fullPath: '/packages'
-      preLoaderRoute: typeof PackagesRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/mcp-smoke': {
-      id: '/mcp-smoke'
-      path: '/mcp-smoke'
-      fullPath: '/mcp-smoke'
-      preLoaderRoute: typeof McpSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/lsp-smoke': {
-      id: '/lsp-smoke'
-      path: '/lsp-smoke'
-      fullPath: '/lsp-smoke'
-      preLoaderRoute: typeof LspSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/iyke-smoke': {
-      id: '/iyke-smoke'
-      path: '/iyke-smoke'
-      fullPath: '/iyke-smoke'
-      preLoaderRoute: typeof IykeSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/install': {
-      id: '/install'
-      path: '/install'
-      fullPath: '/install'
-      preLoaderRoute: typeof InstallRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/iframe-mount-smoke': {
-      id: '/iframe-mount-smoke'
-      path: '/iframe-mount-smoke'
-      fullPath: '/iframe-mount-smoke'
-      preLoaderRoute: typeof IframeMountSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/cron-smoke': {
-      id: '/cron-smoke'
-      path: '/cron-smoke'
-      fullPath: '/cron-smoke'
-      preLoaderRoute: typeof CronSmokeRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/cron': {
-      id: '/cron'
-      path: '/cron'
-      fullPath: '/cron'
-      preLoaderRoute: typeof CronRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/claude-assets-smoke': {
-      id: '/claude-assets-smoke'
-      path: '/claude-assets-smoke'
-      fullPath: '/claude-assets-smoke'
-      preLoaderRoute: typeof ClaudeAssetsSmokeRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/agent-runs': {
@@ -892,18 +787,67 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AgentRunsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/settings': {
-      id: '/settings'
-      path: '/settings'
-      fullPath: '/settings'
-      preLoaderRoute: typeof SettingsRouteRouteImport
+    '/claude': {
+      id: '/claude'
+      path: '/claude'
+      fullPath: '/claude'
+      preLoaderRoute: typeof ClaudeRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/outbox': {
-      id: '/outbox'
-      path: '/outbox'
-      fullPath: '/outbox'
-      preLoaderRoute: typeof OutboxRouteRouteImport
+    '/claude-assets-smoke': {
+      id: '/claude-assets-smoke'
+      path: '/claude-assets-smoke'
+      fullPath: '/claude-assets-smoke'
+      preLoaderRoute: typeof ClaudeAssetsSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cron': {
+      id: '/cron'
+      path: '/cron'
+      fullPath: '/cron'
+      preLoaderRoute: typeof CronRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/cron-smoke': {
+      id: '/cron-smoke'
+      path: '/cron-smoke'
+      fullPath: '/cron-smoke'
+      preLoaderRoute: typeof CronSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/iframe-mount-smoke': {
+      id: '/iframe-mount-smoke'
+      path: '/iframe-mount-smoke'
+      fullPath: '/iframe-mount-smoke'
+      preLoaderRoute: typeof IframeMountSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/install': {
+      id: '/install'
+      path: '/install'
+      fullPath: '/install'
+      preLoaderRoute: typeof InstallRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/iyke-smoke': {
+      id: '/iyke-smoke'
+      path: '/iyke-smoke'
+      fullPath: '/iyke-smoke'
+      preLoaderRoute: typeof IykeSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/lsp-smoke': {
+      id: '/lsp-smoke'
+      path: '/lsp-smoke'
+      fullPath: '/lsp-smoke'
+      preLoaderRoute: typeof LspSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/mcp-smoke': {
+      id: '/mcp-smoke'
+      path: '/mcp-smoke'
+      fullPath: '/mcp-smoke'
+      preLoaderRoute: typeof McpSmokeRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/onboarding': {
@@ -913,242 +857,88 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OnboardingRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/claude': {
-      id: '/claude'
-      path: '/claude'
-      fullPath: '/claude'
-      preLoaderRoute: typeof ClaudeRouteRouteImport
+    '/outbox': {
+      id: '/outbox'
+      path: '/outbox'
+      fullPath: '/outbox'
+      preLoaderRoute: typeof OutboxRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/packages': {
+      id: '/packages'
+      path: '/packages'
+      fullPath: '/packages'
+      preLoaderRoute: typeof PackagesRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/settings/': {
-      id: '/settings/'
-      path: '/'
-      fullPath: '/settings/'
-      preLoaderRoute: typeof SettingsIndexRouteImport
-      parentRoute: typeof SettingsRouteRoute
+    '/perms-smoke': {
+      id: '/perms-smoke'
+      path: '/perms-smoke'
+      fullPath: '/perms-smoke'
+      preLoaderRoute: typeof PermsSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pkg-kernel-status': {
+      id: '/pkg-kernel-status'
+      path: '/pkg-kernel-status'
+      fullPath: '/pkg-kernel-status'
+      preLoaderRoute: typeof PkgKernelStatusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pkg-smoke': {
+      id: '/pkg-smoke'
+      path: '/pkg-smoke'
+      fullPath: '/pkg-smoke'
+      preLoaderRoute: typeof PkgSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/scratchpads': {
+      id: '/scratchpads'
+      path: '/scratchpads'
+      fullPath: '/scratchpads'
+      preLoaderRoute: typeof ScratchpadsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings-smoke': {
+      id: '/settings-smoke'
+      path: '/settings-smoke'
+      fullPath: '/settings-smoke'
+      preLoaderRoute: typeof SettingsSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/todos': {
+      id: '/todos'
+      path: '/todos'
+      fullPath: '/todos'
+      preLoaderRoute: typeof TodosRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/uiroutes-smoke': {
+      id: '/uiroutes-smoke'
+      path: '/uiroutes-smoke'
+      fullPath: '/uiroutes-smoke'
+      preLoaderRoute: typeof UiroutesSmokeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/artifacts/home': {
+      id: '/artifacts/home'
+      path: '/artifacts/home'
+      fullPath: '/artifacts/home'
+      preLoaderRoute: typeof ArtifactsHomeRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/onboarding/': {
       id: '/onboarding/'
       path: '/'
       fullPath: '/onboarding/'
       preLoaderRoute: typeof OnboardingIndexRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/settings/terminal': {
-      id: '/settings/terminal'
-      path: '/terminal'
-      fullPath: '/settings/terminal'
-      preLoaderRoute: typeof SettingsTerminalRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/storage': {
-      id: '/settings/storage'
-      path: '/storage'
-      fullPath: '/settings/storage'
-      preLoaderRoute: typeof SettingsStorageRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/secrets': {
-      id: '/settings/secrets'
-      path: '/secrets'
-      fullPath: '/settings/secrets'
-      preLoaderRoute: typeof SettingsSecretsRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/projects': {
-      id: '/settings/projects'
-      path: '/projects'
-      fullPath: '/settings/projects'
-      preLoaderRoute: typeof SettingsProjectsRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/pkg-health': {
-      id: '/settings/pkg-health'
-      path: '/pkg-health'
-      fullPath: '/settings/pkg-health'
-      preLoaderRoute: typeof SettingsPkgHealthRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/pkg-audit': {
-      id: '/settings/pkg-audit'
-      path: '/pkg-audit'
-      fullPath: '/settings/pkg-audit'
-      preLoaderRoute: typeof SettingsPkgAuditRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/packages': {
-      id: '/settings/packages'
-      path: '/packages'
-      fullPath: '/settings/packages'
-      preLoaderRoute: typeof SettingsPackagesRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/onboarding': {
-      id: '/settings/onboarding'
-      path: '/onboarding'
-      fullPath: '/settings/onboarding'
-      preLoaderRoute: typeof SettingsOnboardingRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/integrations': {
-      id: '/settings/integrations'
-      path: '/integrations'
-      fullPath: '/settings/integrations'
-      preLoaderRoute: typeof SettingsIntegrationsRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/data-health': {
-      id: '/settings/data-health'
-      path: '/data-health'
-      fullPath: '/settings/data-health'
-      preLoaderRoute: typeof SettingsDataHealthRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/backup': {
-      id: '/settings/backup'
-      path: '/backup'
-      fullPath: '/settings/backup'
-      preLoaderRoute: typeof SettingsBackupRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/artifact-grid': {
-      id: '/settings/artifact-grid'
-      path: '/artifact-grid'
-      fullPath: '/settings/artifact-grid'
-      preLoaderRoute: typeof SettingsArtifactGridRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/appearance': {
-      id: '/settings/appearance'
-      path: '/appearance'
-      fullPath: '/settings/appearance'
-      preLoaderRoute: typeof SettingsAppearanceRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/agent': {
-      id: '/settings/agent'
-      path: '/agent'
-      fullPath: '/settings/agent'
-      preLoaderRoute: typeof SettingsAgentRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/activity-bar': {
-      id: '/settings/activity-bar'
-      path: '/activity-bar'
-      fullPath: '/settings/activity-bar'
-      preLoaderRoute: typeof SettingsActivityBarRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/settings/about': {
-      id: '/settings/about'
-      path: '/about'
-      fullPath: '/settings/about'
-      preLoaderRoute: typeof SettingsAboutRouteImport
-      parentRoute: typeof SettingsRouteRoute
-    }
-    '/projects/new-artifact': {
-      id: '/projects/new-artifact'
-      path: '/projects/new-artifact'
-      fullPath: '/projects/new-artifact'
-      preLoaderRoute: typeof ProjectsNewArtifactRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/packages_/browse': {
-      id: '/packages_/browse'
-      path: '/packages/browse'
-      fullPath: '/packages/browse'
-      preLoaderRoute: typeof PackagesBrowseRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/outbox/social': {
-      id: '/outbox/social'
-      path: '/social'
-      fullPath: '/outbox/social'
-      preLoaderRoute: typeof OutboxSocialRouteImport
-      parentRoute: typeof OutboxRouteRoute
-    }
-    '/outbox/sent': {
-      id: '/outbox/sent'
-      path: '/sent'
-      fullPath: '/outbox/sent'
-      preLoaderRoute: typeof OutboxSentRouteImport
-      parentRoute: typeof OutboxRouteRoute
-    }
-    '/outbox/newsletter': {
-      id: '/outbox/newsletter'
-      path: '/newsletter'
-      fullPath: '/outbox/newsletter'
-      preLoaderRoute: typeof OutboxNewsletterRouteImport
-      parentRoute: typeof OutboxRouteRoute
-    }
-    '/outbox/email': {
-      id: '/outbox/email'
-      path: '/email'
-      fullPath: '/outbox/email'
-      preLoaderRoute: typeof OutboxEmailRouteImport
-      parentRoute: typeof OutboxRouteRoute
-    }
-    '/outbox/approvals': {
-      id: '/outbox/approvals'
-      path: '/approvals'
-      fullPath: '/outbox/approvals'
-      preLoaderRoute: typeof OutboxApprovalsRouteImport
-      parentRoute: typeof OutboxRouteRoute
-    }
-    '/onboarding/welcome': {
-      id: '/onboarding/welcome'
-      path: '/welcome'
-      fullPath: '/onboarding/welcome'
-      preLoaderRoute: typeof OnboardingWelcomeRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/summary': {
-      id: '/onboarding/summary'
-      path: '/summary'
-      fullPath: '/onboarding/summary'
-      preLoaderRoute: typeof OnboardingSummaryRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/scaffolding': {
-      id: '/onboarding/scaffolding'
-      path: '/scaffolding'
-      fullPath: '/onboarding/scaffolding'
-      preLoaderRoute: typeof OnboardingScaffoldingRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/roots': {
-      id: '/onboarding/roots'
-      path: '/roots'
-      fullPath: '/onboarding/roots'
-      preLoaderRoute: typeof OnboardingRootsRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/packages': {
-      id: '/onboarding/packages'
-      path: '/packages'
-      fullPath: '/onboarding/packages'
-      preLoaderRoute: typeof OnboardingPackagesRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/connectors': {
-      id: '/onboarding/connectors'
-      path: '/connectors'
-      fullPath: '/onboarding/connectors'
-      preLoaderRoute: typeof OnboardingConnectorsRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/appearance': {
-      id: '/onboarding/appearance'
-      path: '/appearance'
-      fullPath: '/onboarding/appearance'
-      preLoaderRoute: typeof OnboardingAppearanceRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
     '/onboarding/agent': {
@@ -1158,11 +948,95 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OnboardingAgentRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/artifacts/home': {
-      id: '/artifacts/home'
-      path: '/artifacts/home'
-      fullPath: '/artifacts/home'
-      preLoaderRoute: typeof ArtifactsHomeRouteImport
+    '/onboarding/appearance': {
+      id: '/onboarding/appearance'
+      path: '/appearance'
+      fullPath: '/onboarding/appearance'
+      preLoaderRoute: typeof OnboardingAppearanceRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/connectors': {
+      id: '/onboarding/connectors'
+      path: '/connectors'
+      fullPath: '/onboarding/connectors'
+      preLoaderRoute: typeof OnboardingConnectorsRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/packages': {
+      id: '/onboarding/packages'
+      path: '/packages'
+      fullPath: '/onboarding/packages'
+      preLoaderRoute: typeof OnboardingPackagesRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/roots': {
+      id: '/onboarding/roots'
+      path: '/roots'
+      fullPath: '/onboarding/roots'
+      preLoaderRoute: typeof OnboardingRootsRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/scaffolding': {
+      id: '/onboarding/scaffolding'
+      path: '/scaffolding'
+      fullPath: '/onboarding/scaffolding'
+      preLoaderRoute: typeof OnboardingScaffoldingRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/summary': {
+      id: '/onboarding/summary'
+      path: '/summary'
+      fullPath: '/onboarding/summary'
+      preLoaderRoute: typeof OnboardingSummaryRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/onboarding/welcome': {
+      id: '/onboarding/welcome'
+      path: '/welcome'
+      fullPath: '/onboarding/welcome'
+      preLoaderRoute: typeof OnboardingWelcomeRouteImport
+      parentRoute: typeof OnboardingRouteRoute
+    }
+    '/outbox/approvals': {
+      id: '/outbox/approvals'
+      path: '/approvals'
+      fullPath: '/outbox/approvals'
+      preLoaderRoute: typeof OutboxApprovalsRouteImport
+      parentRoute: typeof OutboxRouteRoute
+    }
+    '/outbox/email': {
+      id: '/outbox/email'
+      path: '/email'
+      fullPath: '/outbox/email'
+      preLoaderRoute: typeof OutboxEmailRouteImport
+      parentRoute: typeof OutboxRouteRoute
+    }
+    '/outbox/newsletter': {
+      id: '/outbox/newsletter'
+      path: '/newsletter'
+      fullPath: '/outbox/newsletter'
+      preLoaderRoute: typeof OutboxNewsletterRouteImport
+      parentRoute: typeof OutboxRouteRoute
+    }
+    '/outbox/sent': {
+      id: '/outbox/sent'
+      path: '/sent'
+      fullPath: '/outbox/sent'
+      preLoaderRoute: typeof OutboxSentRouteImport
+      parentRoute: typeof OutboxRouteRoute
+    }
+    '/outbox/social': {
+      id: '/outbox/social'
+      path: '/social'
+      fullPath: '/outbox/social'
+      preLoaderRoute: typeof OutboxSocialRouteImport
+      parentRoute: typeof OutboxRouteRoute
+    }
+    '/packages_/browse': {
+      id: '/packages_/browse'
+      path: '/packages/browse'
+      fullPath: '/packages/browse'
+      preLoaderRoute: typeof PackagesBrowseRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/pkg/$pkgId': {
@@ -1170,6 +1044,139 @@ declare module '@tanstack/react-router' {
       path: '/pkg/$pkgId'
       fullPath: '/pkg/$pkgId'
       preLoaderRoute: typeof PkgPkgIdRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/projects/new-artifact': {
+      id: '/projects/new-artifact'
+      path: '/projects/new-artifact'
+      fullPath: '/projects/new-artifact'
+      preLoaderRoute: typeof ProjectsNewArtifactRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/': {
+      id: '/settings/'
+      path: '/'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof SettingsIndexRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/about': {
+      id: '/settings/about'
+      path: '/about'
+      fullPath: '/settings/about'
+      preLoaderRoute: typeof SettingsAboutRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/activity-bar': {
+      id: '/settings/activity-bar'
+      path: '/activity-bar'
+      fullPath: '/settings/activity-bar'
+      preLoaderRoute: typeof SettingsActivityBarRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/agent': {
+      id: '/settings/agent'
+      path: '/agent'
+      fullPath: '/settings/agent'
+      preLoaderRoute: typeof SettingsAgentRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/appearance': {
+      id: '/settings/appearance'
+      path: '/appearance'
+      fullPath: '/settings/appearance'
+      preLoaderRoute: typeof SettingsAppearanceRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/artifact-grid': {
+      id: '/settings/artifact-grid'
+      path: '/artifact-grid'
+      fullPath: '/settings/artifact-grid'
+      preLoaderRoute: typeof SettingsArtifactGridRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/backup': {
+      id: '/settings/backup'
+      path: '/backup'
+      fullPath: '/settings/backup'
+      preLoaderRoute: typeof SettingsBackupRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/data-health': {
+      id: '/settings/data-health'
+      path: '/data-health'
+      fullPath: '/settings/data-health'
+      preLoaderRoute: typeof SettingsDataHealthRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/integrations': {
+      id: '/settings/integrations'
+      path: '/integrations'
+      fullPath: '/settings/integrations'
+      preLoaderRoute: typeof SettingsIntegrationsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/onboarding': {
+      id: '/settings/onboarding'
+      path: '/onboarding'
+      fullPath: '/settings/onboarding'
+      preLoaderRoute: typeof SettingsOnboardingRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/packages': {
+      id: '/settings/packages'
+      path: '/packages'
+      fullPath: '/settings/packages'
+      preLoaderRoute: typeof SettingsPackagesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/pkg-audit': {
+      id: '/settings/pkg-audit'
+      path: '/pkg-audit'
+      fullPath: '/settings/pkg-audit'
+      preLoaderRoute: typeof SettingsPkgAuditRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/pkg-health': {
+      id: '/settings/pkg-health'
+      path: '/pkg-health'
+      fullPath: '/settings/pkg-health'
+      preLoaderRoute: typeof SettingsPkgHealthRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/projects': {
+      id: '/settings/projects'
+      path: '/projects'
+      fullPath: '/settings/projects'
+      preLoaderRoute: typeof SettingsProjectsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/secrets': {
+      id: '/settings/secrets'
+      path: '/secrets'
+      fullPath: '/settings/secrets'
+      preLoaderRoute: typeof SettingsSecretsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/storage': {
+      id: '/settings/storage'
+      path: '/storage'
+      fullPath: '/settings/storage'
+      preLoaderRoute: typeof SettingsStorageRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/terminal': {
+      id: '/settings/terminal'
+      path: '/terminal'
+      fullPath: '/settings/terminal'
+      preLoaderRoute: typeof SettingsTerminalRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/artifacts/by-kind/$kind': {
+      id: '/artifacts/by-kind/$kind'
+      path: '/artifacts/by-kind/$kind'
+      fullPath: '/artifacts/by-kind/$kind'
+      preLoaderRoute: typeof ArtifactsByKindKindRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/pkg/$pkgId/': {
@@ -1185,13 +1192,6 @@ declare module '@tanstack/react-router' {
       fullPath: '/pkg/$pkgId/$'
       preLoaderRoute: typeof PkgPkgIdSplatRouteImport
       parentRoute: typeof PkgPkgIdRouteRoute
-    }
-    '/artifacts/by-kind/$kind': {
-      id: '/artifacts/by-kind/$kind'
-      path: '/artifacts/by-kind/$kind'
-      fullPath: '/artifacts/by-kind/$kind'
-      preLoaderRoute: typeof ArtifactsByKindKindRouteImport
-      parentRoute: typeof rootRouteImport
     }
   }
 }

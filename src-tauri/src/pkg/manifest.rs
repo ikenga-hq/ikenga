@@ -51,6 +51,10 @@ pub struct Manifest {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// Optional comment field often used in JSON manifests (e.g. "//": "...").
+    #[serde(rename = "//", default)]
+    pub _comment: Option<String>,
+
     #[serde(default)]
     pub kind: Option<String>, // "skill" | "embedded" | "windowed" — hint, not enforced
 
@@ -285,8 +289,10 @@ pub struct CapabilitiesBlock {
     /// Local SQLite capability (api ≥ 2). Declares that this pkg reads from
     /// `ikenga.db` via `db_query`. The host resolves the logical db name and
     /// threads it through `hostContext.sqlite` at iframe-mount time.
+    /// Accepts boolean `true` (defaults `db` to `"ikenga.local"`), `false` (disabled),
+    /// or an object `{ "db": "..." }`.
     /// Mirrors `SqliteCapabilitySchema` in `@ikenga/contract/manifest.ts`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_sqlite_capability")]
     pub sqlite: Option<SqliteCapability>,
     /// Native child-webview capability. Required for any `ui.routes[]` entry
     /// with `kind = "webview"` to mount. See `pkg/webview.rs` for the kernel
@@ -336,7 +342,7 @@ pub struct AgentOpsCapability {}
 /// Local SQLite capability block. Threads the db name into the iframe host
 /// context so the pkg can call `db_query("ikenga.local", sql, params)` without
 /// hard-coding the db name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteCapability {
     /// Logical DB name. Currently only `"ikenga.local"` is supported by the
@@ -355,6 +361,28 @@ impl Default for SqliteCapability {
 
 fn default_sqlite_db() -> String {
     "ikenga.local".to_string()
+}
+
+/// Custom deserializer for `CapabilitiesBlock.sqlite`: accepts `true`, `false`,
+/// or `{ "db": "..." }`.
+fn deserialize_sqlite_capability<'de, D>(
+    deserializer: D,
+) -> Result<Option<SqliteCapability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Helper {
+        Bool(bool),
+        Config(SqliteCapability),
+    }
+
+    match Option::<Helper>::deserialize(deserializer)? {
+        Some(Helper::Bool(true)) => Ok(Some(SqliteCapability::default())),
+        Some(Helper::Bool(false)) | None => Ok(None),
+        Some(Helper::Config(cfg)) => Ok(Some(cfg)),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1423,5 +1451,65 @@ mod tests {
             vec!["src/**/*.ts".to_string(), "config.toml".to_string()]
         );
         assert!(!s.auto_restart);
+    }
+
+    #[test]
+    fn sqlite_capability_parses_boolean_true() {
+        let json = r#"{
+            "id": "com.ikenga.mcp-meetings",
+            "name": "Meetings MCP", "version": "0.1.0", "ikenga_api": "3",
+            "capabilities": {
+                "sqlite": true
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with sqlite: true");
+        assert_eq!(
+            m.capabilities.unwrap().sqlite,
+            Some(SqliteCapability {
+                db: "ikenga.local".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn sqlite_capability_parses_boolean_false() {
+        let json = r#"{
+            "id": "com.ikenga.mcp-meetings",
+            "name": "Meetings MCP", "version": "0.1.0", "ikenga_api": "3",
+            "capabilities": {
+                "sqlite": false
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with sqlite: false");
+        assert_eq!(m.capabilities.unwrap().sqlite, None);
+    }
+
+    #[test]
+    fn sqlite_capability_parses_object() {
+        let json = r#"{
+            "id": "com.ikenga.mcp-meetings",
+            "name": "Meetings MCP", "version": "0.1.0", "ikenga_api": "3",
+            "capabilities": {
+                "sqlite": { "db": "custom.local" }
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with sqlite object");
+        assert_eq!(
+            m.capabilities.unwrap().sqlite,
+            Some(SqliteCapability {
+                db: "custom.local".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_parses_json_comment_field() {
+        let json = r#"{
+            "id": "com.ikenga.sidecar-meetings-bot",
+            "name": "Meetings Bot", "version": "0.1.0", "ikenga_api": "3",
+            "//": "comment text"
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with // comment");
+        assert_eq!(m._comment.as_deref(), Some("comment text"));
     }
 }
