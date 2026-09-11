@@ -573,6 +573,7 @@ mod tests {
         Package {
             manifest: Manifest {
                 description: None,
+                _comment: None,
                 id: id.into(),
                 name: "T".into(),
                 version: "0.1.0".into(),
