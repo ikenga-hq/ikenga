@@ -1471,4 +1471,286 @@ mod tests {
             .expect_err("write through the read path must be refused");
         assert!(err.contains("only SELECT/WITH"), "unexpected error: {err}");
     }
+
+    /// WP-18 / WP-05: Migration 0063 creates meetings domain tables with expected columns.
+    #[tokio::test]
+    async fn wp05_meetings_domain_schema_complete() {
+        let (db, _tmp) = fresh_db().await;
+        let writer = db.ensure_pool().await.expect("ensure_pool");
+        use sqlx::Row;
+
+        let expectations: &[(&str, &[&str])] = &[
+            (
+                "meetings",
+                &[
+                    "id",
+                    "title",
+                    "platform",
+                    "url",
+                    "status",
+                    "start_time",
+                    "end_time",
+                    "duration_seconds",
+                    "video_path",
+                    "audio_path",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "meeting_speakers",
+                &[
+                    "id",
+                    "meeting_id",
+                    "name",
+                    "avatar_url",
+                    "contact_id",
+                    "speaker_source",
+                ],
+            ),
+            (
+                "meeting_transcripts",
+                &[
+                    "id",
+                    "meeting_id",
+                    "speaker_id",
+                    "speaker_name",
+                    "speaker_source",
+                    "start_ms",
+                    "end_ms",
+                    "text",
+                    "confidence",
+                    "words_json",
+                ],
+            ),
+            (
+                "meeting_action_items",
+                &[
+                    "id",
+                    "meeting_id",
+                    "title",
+                    "assignee",
+                    "due_date",
+                    "status",
+                    "task_id",
+                ],
+            ),
+            (
+                "meeting_summaries",
+                &[
+                    "id",
+                    "meeting_id",
+                    "executive_summary",
+                    "key_decisions_json",
+                    "topics_json",
+                    "created_at",
+                ],
+            ),
+        ];
+
+        for (table, cols) in expectations {
+            let rows = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+                .fetch_all(&writer)
+                .await
+                .unwrap_or_else(|e| panic!("table_info({table}): {e}"));
+            assert!(!rows.is_empty(), "WP-05 meetings table `{table}` must exist");
+            let present: std::collections::HashSet<String> =
+                rows.iter().map(|r| r.get::<String, _>("name")).collect();
+            for col in *cols {
+                assert!(
+                    present.contains(*col),
+                    "table `{table}` missing column `{col}` (got {present:?})"
+                );
+            }
+        }
+
+        // Verify indexes exist
+        let idx_rows = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_meeting%'",
+        )
+        .fetch_all(&writer)
+        .await
+        .expect("fetch indexes");
+        let idx_names: std::collections::HashSet<String> =
+            idx_rows.iter().map(|r| r.get::<String, _>("name")).collect();
+        for expected_idx in [
+            "idx_meetings_status",
+            "idx_meetings_created_at",
+            "idx_meeting_speakers_meeting_id",
+            "idx_meeting_transcripts_meeting_id",
+            "idx_meeting_transcripts_start_ms",
+            "idx_meeting_action_items_meeting_id",
+            "idx_meeting_summaries_meeting_id",
+        ] {
+            assert!(
+                idx_names.contains(expected_idx),
+                "expected index `{expected_idx}` to exist in sqlite_master"
+            );
+        }
+    }
+
+    /// WP-18: Verify 0063 applies automatically on an existing DB where migrations 1..62
+    /// were already recorded in _pa_migrations.
+    #[tokio::test]
+    async fn migration_0063_applies_on_existing_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing.db");
+
+        // Step 1: Open raw sqlite pool, create schema up to 62 manually as an existing install
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .expect("create _pa_migrations");
+
+        // Apply migrations 1..62 only
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 63) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .expect("record migration");
+        }
+
+        // Verify meetings table does NOT exist yet
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meetings'",
+        )
+        .fetch_one(&raw_pool)
+        .await
+        .expect("count meetings table");
+        assert_eq!(count, 0, "meetings table should not exist before 0063");
+        drop(raw_pool);
+
+        // Step 2: Now open PaDb (as desktop app would on startup). ensure_pool() runs ensure_schema().
+        let pa_db = PaDb::new(db_path.clone());
+        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+
+        // Verify migration 63 was applied and recorded
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
+            .fetch_all(&writer)
+            .await
+            .expect("fetch applied");
+        assert_eq!(
+            applied.len(),
+            63,
+            "expected all 63 migrations recorded after startup"
+        );
+        assert!(applied.contains(&63), "migration 63 must be in _pa_migrations");
+
+        // Verify meetings table exists and is queryable
+        let meetings_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+                .fetch_one(&writer)
+                .await
+                .expect("select from meetings");
+        assert_eq!(meetings_count, 0);
+    }
+
+    /// WP-18: Verify external SQLite mutations (from another connection / external tool)
+    /// are immediately visible on subsequent PaDb reader pool queries.
+    #[tokio::test]
+    async fn external_sqlite_mutations_immediately_visible_to_reader_pool() {
+        let (db, tmp) = fresh_db().await;
+        let db_path = tmp.path().join("pa.db");
+
+        // Initialize reader pool and run an initial query
+        let rows_initial = query_json(&db, "SELECT COUNT(*) as cnt FROM meetings", &[])
+            .await
+            .expect("initial query");
+        assert_eq!(
+            rows_initial[0].get("cnt").and_then(Value::as_i64),
+            Some(0),
+            "initially 0 meetings"
+        );
+
+        // Simulate an external tool / CLI inserting a row into ikenga.db
+        let ext_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("external connect");
+
+        sqlx::query(
+            "INSERT INTO meetings (id, title, platform, status, start_time, duration_seconds, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        )
+        .bind("m-ext-1")
+        .bind("External Meeting")
+        .bind("google_meet")
+        .bind("completed")
+        .bind("2026-09-02T16:00:00Z")
+        .bind("2026-09-02T16:00:00Z")
+        .bind("2026-09-02T16:30:00Z")
+        .execute(&ext_pool)
+        .await
+        .expect("external insert");
+
+        // Query immediately via PaDb query_json (which uses the reader pool)
+        let rows_after_insert = query_json(
+            &db,
+            "SELECT id, title, status FROM meetings WHERE id = ?",
+            &[Value::from("m-ext-1")],
+        )
+        .await
+        .expect("query after external insert");
+
+        assert_eq!(
+            rows_after_insert.len(),
+            1,
+            "external INSERT must be immediately visible to reader pool"
+        );
+        let m = rows_after_insert[0].as_object().unwrap();
+        assert_eq!(m.get("title").and_then(Value::as_str), Some("External Meeting"));
+
+        // Simulate external DELETE
+        sqlx::query("DELETE FROM meetings WHERE id = ?")
+            .bind("m-ext-1")
+            .execute(&ext_pool)
+            .await
+            .expect("external delete");
+
+        // Query immediately via PaDb query_json
+        let rows_after_delete = query_json(
+            &db,
+            "SELECT id FROM meetings WHERE id = ?",
+            &[Value::from("m-ext-1")],
+        )
+        .await
+        .expect("query after external delete");
+
+        assert_eq!(
+            rows_after_delete.len(),
+            0,
+            "external DELETE must be immediately visible to reader pool"
+        );
+    }
 }
