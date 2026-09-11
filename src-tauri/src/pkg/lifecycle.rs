@@ -1547,6 +1547,7 @@ mod tests {
     fn fake_pkg(lifecycle: Option<&str>, command: &str) -> Package {
         let mut m = Manifest {
             description: None,
+            _comment: None,
             id: "com.royalti.testlife".into(),
             name: "T".into(),
             version: "0.1.0".into(),

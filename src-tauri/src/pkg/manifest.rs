@@ -905,6 +905,7 @@ mod tests {
     fn minimal() -> Manifest {
         Manifest {
             description: None,
+            _comment: None,
             id: "com.royalti.test".into(),
             name: "Test".into(),
             version: "0.1.0".into(),

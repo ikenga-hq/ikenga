@@ -158,6 +158,7 @@ mod tests {
     fn minimal_manifest() -> Manifest {
         Manifest {
             description: None,
+            _comment: None,
             id: "com.test.x".into(),
             name: "T".into(),
             version: "0.1.0".into(),
