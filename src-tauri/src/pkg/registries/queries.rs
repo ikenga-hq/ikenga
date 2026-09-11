@@ -118,6 +118,7 @@ mod tests {
 
     fn pkg_with(id: &str, prefixes: Vec<&str>) -> Package {
         let manifest = Manifest {
+        description: None,
             id: id.into(),
             name: id.into(),
             version: "0.1.0".into(),
