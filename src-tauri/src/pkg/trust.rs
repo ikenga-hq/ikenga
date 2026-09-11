@@ -572,6 +572,7 @@ mod tests {
     fn pkg_with_perms(id: &str, perms: Permissions) -> Package {
         Package {
             manifest: Manifest {
+                description: None,
                 id: id.into(),
                 name: "T".into(),
                 version: "0.1.0".into(),

@@ -171,6 +171,7 @@ mod tests {
     /// "never registered a rail entry" case `set_badge` must tolerate.
     fn pkg_with(id: &str, with_nav: bool) -> Package {
         let manifest = Manifest {
+        description: None,
             id: id.into(),
             name: id.into(),
             version: "0.1.0".into(),

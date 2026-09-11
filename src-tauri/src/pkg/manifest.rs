@@ -44,6 +44,13 @@ pub struct Manifest {
     pub version: String,
     pub ikenga_api: String,
 
+    /// Optional human-facing blurb. The contract Zod schema (`manifest.ts`)
+    /// allows this, but the strict `deny_unknown_fields` parser rejected it —
+    /// which made every registry pkg whose manifest carried the field
+    /// un-installable (`@ikenga/mcp-meetings@0.2.0`, found via WP-24 first-run).
+    #[serde(default)]
+    pub description: Option<String>,
+
     #[serde(default)]
     pub kind: Option<String>, // "skill" | "embedded" | "windowed" — hint, not enforced
 
@@ -869,6 +876,7 @@ mod tests {
 
     fn minimal() -> Manifest {
         Manifest {
+            description: None,
             id: "com.royalti.test".into(),
             name: "Test".into(),
             version: "0.1.0".into(),
@@ -947,6 +955,26 @@ mod tests {
         }"#;
         let m: Manifest = serde_json::from_str(json).expect("parse");
         assert!(m.requires.is_empty());
+    }
+
+    #[test]
+    fn description_field_parses_and_defaults_absent() {
+        // WP-24 first-run regression: the contract Zod schema allows an
+        // optional top-level `description`, but the strict Rust parser
+        // rejected it — making @ikenga/mcp-meetings@0.2.0 (and the other
+        // published meetings manifests) un-installable from the registry.
+        let json = r#"{
+            "id": "com.ikenga.mcp-meetings",
+            "name": "Meetings MCP", "version": "0.2.0", "ikenga_api": "3",
+            "description": "Meeting MCP server"
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("description field must parse");
+        assert_eq!(m.description.as_deref(), Some("Meeting MCP server"));
+
+        let bare: Manifest =
+            serde_json::from_str(r#"{ "id": "x", "name": "x", "version": "0.1.0", "ikenga_api": "1" }"#)
+                .expect("parse");
+        assert!(bare.description.is_none());
     }
 
     #[test]

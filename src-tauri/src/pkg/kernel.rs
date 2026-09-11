@@ -1727,6 +1727,7 @@ mod tests {
     fn fixture_pkg(id: &str) -> Package {
         Package {
             manifest: Manifest {
+                description: None,
                 id: id.into(),
                 name: "T".into(),
                 version: "1.0.0".into(),
