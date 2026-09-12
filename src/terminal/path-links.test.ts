@@ -116,7 +116,7 @@ describe('scanLineForPaths', () => {
 
 // Tokens that exist on disk in this fake fs. Everything else resolves to
 // nothing, which is what separates a real relative dir from prose.
-const REAL = new Set(['/repo/src/index.ts', '/repo/src/terminal']);
+const REAL = new Set(['/repo/src/index.ts', '/repo/src/terminal', '/tmp/test.txt']);
 
 function fakeTerm(lineText: string) {
 	let provider: {
@@ -172,6 +172,50 @@ describe('registerPathLinks — decorates only what exists on disk', () => {
 		expect(afterFirst).toBeGreaterThan(0); // guard: the mock is actually exercised
 		await term.getLinks();
 		expect(vi.mocked(fsExists).mock.calls.length).toBe(afterFirst);
+	});
+});
+
+describe('registerPathLinks — dynamic cwdGetter (WP-03 / G-PATH-CWD)', () => {
+	beforeEach(() => {
+		__clearPathLinkCache();
+		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+	});
+
+	it('resolves relative paths against live CWD when cwdGetter returns a new directory after cd', async () => {
+		let liveCwd = '/repo';
+		const term = fakeTerm('edited test.txt and src/index.ts');
+		registerPathLinks(term as never, () => liveCwd);
+
+		// While in /repo, src/index.ts exists but test.txt (/repo/test.txt) does not
+		const initialLinks = await term.getLinks();
+		expect(initialLinks.map((l) => l.text)).toEqual(['src/index.ts']);
+
+		// Simulate `cd /tmp`: liveCwd changes to /tmp
+		liveCwd = '/tmp';
+		__clearPathLinkCache();
+
+		// Now test.txt (/tmp/test.txt) resolves, while src/index.ts (/tmp/src/index.ts) does not
+		const afterCdLinks = await term.getLinks();
+		expect(afterCdLinks.map((l) => l.text)).toEqual(['test.txt']);
+	});
+
+	it('supports asynchronous cwdGetter functions', async () => {
+		const term = fakeTerm('see test.txt');
+		registerPathLinks(term as never, async () => {
+			return '/tmp';
+		});
+		const links = await term.getLinks();
+		expect(links.map((l) => l.text)).toEqual(['test.txt']);
+	});
+
+	it('falls back to initial spawnCwd when live lookup returns undefined (macOS G-03)', async () => {
+		const liveForegroundCwd: string | undefined = undefined;
+		const spawnCwd = '/repo';
+		const term = fakeTerm('see src/index.ts');
+		registerPathLinks(term as never, () => liveForegroundCwd ?? spawnCwd);
+
+		const links = await term.getLinks();
+		expect(links.map((l) => l.text)).toEqual(['src/index.ts']);
 	});
 });
 

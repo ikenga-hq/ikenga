@@ -250,7 +250,7 @@ export function offsetToCell(offset1: number, logical: LogicalLine): { x: number
  */
 export function registerPathLinks(
 	term: Terminal,
-	cwd?: string | (() => string | undefined)
+	cwd?: string | (() => string | undefined | Promise<string | undefined>)
 ): IDisposable {
 	return term.registerLinkProvider({
 		provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
@@ -264,8 +264,11 @@ export function registerPathLinks(
 				callback(undefined);
 				return;
 			}
-			const effectiveCwd = typeof cwd === 'function' ? cwd() : cwd;
-			Promise.all(spans.map((span) => resolveExistingCached(span.text, effectiveCwd)))
+			const rawCwd = typeof cwd === 'function' ? cwd() : cwd;
+			Promise.resolve(rawCwd)
+				.then((effectiveCwd) =>
+					Promise.all(spans.map((span) => resolveExistingCached(span.text, effectiveCwd)))
+				)
 				.then((resolved) => {
 					const links: ILink[] = [];
 					spans.forEach((span, idx) => {

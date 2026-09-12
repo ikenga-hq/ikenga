@@ -11,6 +11,7 @@
 import {
 	ptyAttachArm,
 	ptyAttachBegin,
+	ptyForeground,
 	ptyKill,
 	ptyListen,
 	ptyResize,
@@ -101,6 +102,24 @@ export class Pty {
 
 	setCwd(cwd: string): void {
 		this.cwd = cwd;
+	}
+
+	/**
+	 * Live working directory of the foreground process leader. Evaluates live CWD
+	 * via `pty_foreground` (reading `/proc/<tpgid>/cwd` on Linux) and updates cached `this.cwd`.
+	 * Falls back to `this.cwd` when foreground lookup returns no CWD (e.g. macOS).
+	 */
+	async getForegroundCwd(): Promise<string | undefined> {
+		try {
+			const fg = await ptyForeground(this.id);
+			if (fg?.cwd) {
+				this.cwd = fg.cwd;
+				return fg.cwd;
+			}
+		} catch {
+			/* ignore lookup failure, fall back to cached cwd */
+		}
+		return this.cwd;
 	}
 
 	/**

@@ -77,6 +77,8 @@ export interface ForegroundProcess {
 	name: string;
 	/** Full argv, null-byte-stripped. Empty when the kernel returned nothing. */
 	args: string[];
+	/** Live working directory of the foreground process leader. */
+	cwd?: string | null;
 }
 
 export async function ptyForeground(id: string): Promise<ForegroundProcess | null> {

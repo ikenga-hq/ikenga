@@ -321,7 +321,7 @@ function wirePtyToTerm(
 		term.write(bytes);
 	};
 	const exitHandler = (code: number | null) => {
-		// VS Code pattern: keep the canvas mounted, write an inline notice as
+		// VS Code pattern: keep the terminal mounted, write an inline notice as
 		// the last line so anything the process *did* emit stays visible
 		// above.
 		try {
@@ -409,6 +409,7 @@ export function XTermHost({
 	// file's path here.
 	const livePtyRef = useRef<Pty | null>(null);
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mount effect
 	useEffect(() => {
 		// We must have either a spec (spawn) or a pty (attach) to render.
 		if (!spec && !pty) return;
@@ -641,8 +642,15 @@ export function XTermHost({
 			// File-path links (WebLinksAddon only handles URLs). Clicking a
 			// path-shaped token opens it in the artifact viewer. Relative paths
 			// resolve against the live PTY / foreground cwd; absolute / ~ paths ignore it
-			// (works in attach-mode too, where no cwd is known).
-			const pathLinks = registerPathLinks(term, () => livePtyRef.current?.cwd ?? spec?.cwd);
+			// (works in attach-mode too, where no cwd is known). On Linux, evaluates
+			// live CWD via /proc/<tpgid>/cwd; on macOS falls back to spawnCwd (G-03).
+			const pathLinks = registerPathLinks(term, async () => {
+				if (livePtyRef.current) {
+					const fgCwd = await livePtyRef.current.getForegroundCwd();
+					if (fgCwd) return fgCwd;
+				}
+				return livePtyRef.current?.cwd ?? spec?.cwd;
+			});
 			pathLinksDisposeFn = () => pathLinks.dispose();
 
 			// OSC 7: Current Working Directory notification emitted by shells (T-10)
@@ -1385,9 +1393,9 @@ export function XTermHost({
 							cursor: 'pointer',
 							fontFamily: 'monospace',
 						}}
-						title="Match Whole Word (\b)"
+						title="Match Whole Word (Ab)"
 					>
-						\b
+						Ab
 					</button>
 					<button
 						type="button"
