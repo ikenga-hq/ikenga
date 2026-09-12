@@ -6,7 +6,14 @@
  * Ctrl+Shift chords to avoid clashing with standard PTY control codes like SIGINT).
  */
 
-export type TerminalAction = 'copy' | 'paste' | 'find' | 'clear' | 'selectAll';
+export type TerminalAction =
+	| 'copy'
+	| 'paste'
+	| 'find'
+	| 'clear'
+	| 'selectAll'
+	| 'jumpToPrevPrompt'
+	| 'jumpToNextPrompt';
 
 export interface TerminalKeybindings {
 	copy: string;
@@ -14,6 +21,8 @@ export interface TerminalKeybindings {
 	find: string;
 	clear: string;
 	selectAll: string;
+	jumpToPrevPrompt: string;
+	jumpToNextPrompt: string;
 }
 
 export const DEFAULT_MAC_KEYBINDINGS: TerminalKeybindings = {
@@ -22,6 +31,8 @@ export const DEFAULT_MAC_KEYBINDINGS: TerminalKeybindings = {
 	find: 'Cmd+F',
 	clear: 'Cmd+K',
 	selectAll: 'Cmd+A',
+	jumpToPrevPrompt: 'Cmd+Up',
+	jumpToNextPrompt: 'Cmd+Down',
 };
 
 export const DEFAULT_LINUX_WIN_KEYBINDINGS: TerminalKeybindings = {
@@ -30,6 +41,8 @@ export const DEFAULT_LINUX_WIN_KEYBINDINGS: TerminalKeybindings = {
 	find: 'Ctrl+Shift+F',
 	clear: 'Ctrl+Shift+K',
 	selectAll: 'Ctrl+Shift+A',
+	jumpToPrevPrompt: 'Ctrl+Up',
+	jumpToNextPrompt: 'Ctrl+Down',
 };
 
 export function getDefaultKeybindings(isMac: boolean): TerminalKeybindings {
@@ -44,10 +57,20 @@ export function matchesChord(e: KeyboardEvent, chord: string, isMac: boolean): b
 	const parts = chord.split('+').map((p) => p.trim().toLowerCase());
 	if (parts.length === 0) return false;
 
-	const targetKey = parts[parts.length - 1];
+	let targetKey = parts[parts.length - 1];
+	if (targetKey === 'arrowup') targetKey = 'up';
+	if (targetKey === 'arrowdown') targetKey = 'down';
+	if (targetKey === 'arrowleft') targetKey = 'left';
+	if (targetKey === 'arrowright') targetKey = 'right';
+
 	const modifiers = new Set(parts.slice(0, parts.length - 1));
 
-	const eventKey = e.key.toLowerCase();
+	let eventKey = e.key.toLowerCase();
+	if (eventKey === 'arrowup') eventKey = 'up';
+	if (eventKey === 'arrowdown') eventKey = 'down';
+	if (eventKey === 'arrowleft') eventKey = 'left';
+	if (eventKey === 'arrowright') eventKey = 'right';
+
 	if (eventKey !== targetKey) return false;
 
 	const requiresShift = modifiers.has('shift');
@@ -96,7 +119,15 @@ export function evaluateTerminalKey(
 		...customConfig,
 	};
 
-	const actions: TerminalAction[] = ['copy', 'paste', 'find', 'clear', 'selectAll'];
+	const actions: TerminalAction[] = [
+		'copy',
+		'paste',
+		'find',
+		'clear',
+		'selectAll',
+		'jumpToPrevPrompt',
+		'jumpToNextPrompt',
+	];
 	for (const action of actions) {
 		const chord = effective[action];
 		if (chord && matchesChord(e, chord, isMac)) {

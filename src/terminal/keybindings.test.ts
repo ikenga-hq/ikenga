@@ -60,4 +60,27 @@ describe('terminal keybindings', () => {
 		});
 		expect(action).toBe('copy');
 	});
+
+	it('evaluates prompt jump keybindings (Cmd+Up/Down on Mac, Ctrl+Up/Down on Linux)', () => {
+		expect(DEFAULT_MAC_KEYBINDINGS.jumpToPrevPrompt).toBe('Cmd+Up');
+		expect(DEFAULT_MAC_KEYBINDINGS.jumpToNextPrompt).toBe('Cmd+Down');
+		expect(DEFAULT_LINUX_WIN_KEYBINDINGS.jumpToPrevPrompt).toBe('Ctrl+Up');
+		expect(DEFAULT_LINUX_WIN_KEYBINDINGS.jumpToNextPrompt).toBe('Ctrl+Down');
+
+		// Mac Cmd+ArrowUp
+		const macUp = new KeyboardEvent('keydown', { key: 'ArrowUp', metaKey: true });
+		expect(evaluateTerminalKey(macUp, true)).toBe('jumpToPrevPrompt');
+
+		// Mac Cmd+ArrowDown
+		const macDown = new KeyboardEvent('keydown', { key: 'ArrowDown', metaKey: true });
+		expect(evaluateTerminalKey(macDown, true)).toBe('jumpToNextPrompt');
+
+		// Linux Ctrl+ArrowUp
+		const linuxUp = new KeyboardEvent('keydown', { key: 'ArrowUp', ctrlKey: true });
+		expect(evaluateTerminalKey(linuxUp, false)).toBe('jumpToPrevPrompt');
+
+		// Linux Ctrl+ArrowDown
+		const linuxDown = new KeyboardEvent('keydown', { key: 'ArrowDown', ctrlKey: true });
+		expect(evaluateTerminalKey(linuxDown, false)).toBe('jumpToNextPrompt');
+	});
 });

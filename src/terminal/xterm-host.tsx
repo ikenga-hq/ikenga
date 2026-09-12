@@ -14,6 +14,7 @@ import {
 	type TerminalKeybindings,
 } from './keybindings';
 import { registerPathLinks } from './path-links';
+import { setupSemanticPrompts, type SemanticPromptsManager } from './osc133';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
 import { readCaptureWithOffset } from './pty-output-buffer';
 import { useTerminalStore } from './session-store';
@@ -222,6 +223,7 @@ interface XTermCacheEntry {
 	detachExit: () => void;
 	onDataDispose: { dispose: () => void };
 	onResizeDispose: { dispose: () => void };
+	semanticPrompts?: SemanticPromptsManager;
 }
 
 const xtermCache = new Map<string, XTermCacheEntry>();
@@ -254,6 +256,11 @@ function disposeCacheEntry(entry: XTermCacheEntry): void {
 	}
 	try {
 		entry.pathLinksDispose();
+	} catch {
+		/* ignore */
+	}
+	try {
+		entry.semanticPrompts?.dispose();
 	} catch {
 		/* ignore */
 	}
@@ -406,6 +413,7 @@ export function XTermHost({
 	// Hold the search addon ref so the inline search input can drive it.
 	const searchAddonRef = useRef<SearchAddonLike | null>(null);
 	const termRef = useRef<Terminal | null>(null);
+	const semanticPromptsRef = useRef<SemanticPromptsManager | null>(null);
 	// Whichever PTY is currently live — the `pty` prop (attach mode) or the
 	// internally-spawned one (spec mode). The drop handler writes the dropped
 	// file's path here.
@@ -553,6 +561,7 @@ export function XTermHost({
 			oscObserver = cachedEntry.oscObserver;
 
 			termRef.current = term;
+			semanticPromptsRef.current = cachedEntry.semanticPrompts ?? null;
 			searchAddonRef.current = cachedEntry.searchAddon;
 			// The file-drop handler writes to `livePtyRef`. On a cache hit the
 			// spawn/attach wiring below is skipped, so set it here too —
@@ -670,24 +679,14 @@ export function XTermHost({
 				return true;
 			});
 
-			// OSC 133: FinalTerm / Shell Integration property markers (T-10)
-			// (e.g. `133;P;Cwd=/path`).
-			term.parser.registerOscHandler(133, (data) => {
-				try {
-					const parts = data.split(';');
-					const code = parts[0];
-					if (code === 'P' && parts[1]?.startsWith('Cwd=')) {
-						const cwdVal = parts[1].slice(4).trim();
-						if (cwdVal) {
-							if (livePtyRef.current) livePtyRef.current.setCwd(cwdVal);
-							if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, cwdVal);
-						}
-					}
-				} catch {
-					/* ignore malformed OSC 133 */
-				}
-				return true;
+			// OSC 133: FinalTerm / FTCS Semantic Prompts & Command Boundaries (WP-08 / T-10)
+			const semanticPrompts = setupSemanticPrompts(term, {
+				onCwd: (cwdVal) => {
+					if (livePtyRef.current) livePtyRef.current.setCwd(cwdVal);
+					if (sessionId) useTerminalStore.getState().updateCwd?.(sessionId, cwdVal);
+				},
 			});
+			semanticPromptsRef.current = semanticPrompts;
 
 			// Search addon — lazy import to keep initial bundle slim.
 			(async () => {
@@ -815,6 +814,7 @@ export function XTermHost({
 						detachExit,
 						onDataDispose,
 						onResizeDispose,
+						semanticPrompts,
 					});
 				}
 			}
@@ -865,6 +865,16 @@ export function XTermHost({
 
 			if (action === 'selectAll') {
 				term.selectAll();
+				return false;
+			}
+
+			if (action === 'jumpToPrevPrompt') {
+				semanticPromptsRef.current?.jumpToPrevPrompt();
+				return false;
+			}
+
+			if (action === 'jumpToNextPrompt') {
+				semanticPromptsRef.current?.jumpToNextPrompt();
 				return false;
 			}
 
@@ -1025,6 +1035,8 @@ export function XTermHost({
 			detachExit?.();
 			disposeSearch?.();
 			pathLinksDisposeFn?.();
+			semanticPromptsRef.current?.dispose();
+			semanticPromptsRef.current = null;
 			// Only kill the PTY if we own it (spawn-mode). In attach-mode the
 			// session-store (or detached-window caller) owns the lifecycle.
 			if (ownedPty) {

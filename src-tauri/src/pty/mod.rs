@@ -17,6 +17,7 @@
 
 pub mod daemon_client;
 pub mod foreground;
+pub mod shell_integration;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -593,6 +594,9 @@ impl PtyManager {
         // Sensible terminal defaults for full-screen TUIs (claude, vim, htop).
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
+
+        // Shell integration hooks (OSC 133 semantic prompts, WP-08 / T-10)
+        shell_integration::inject_shell_integration(&mut builder, &exec_bin, &opts.env);
 
         let mut child = pair.slave.spawn_command(builder).context("spawn child")?;
         let child_pid = child.process_id();
