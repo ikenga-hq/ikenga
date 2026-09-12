@@ -29,6 +29,7 @@ pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg_db;
 pub mod pkg_dispatch;
+pub mod pkg_trust;
 pub mod playwright_proxy;
 pub mod projects;
 pub mod rpc;

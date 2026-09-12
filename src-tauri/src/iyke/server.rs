@@ -315,6 +315,13 @@ pub async fn serve(
     let unauthed = Router::new()
         .route("/iyke/pkg-db/query", post(super::pkg_db::post_pkg_db_query))
         .route("/iyke/pkg-db/exec", post(super::pkg_db::post_pkg_db_exec))
+        // WP-04: per-folder Studio trust gate, reachable by the Studio sidecar
+        // with the same per-pkg bearer. Single-pkg by design; see
+        // `iyke::pkg_trust`.
+        .route(
+            "/iyke/pkg-trust/project-access",
+            post(super::pkg_trust::post_pkg_trust_project_access),
+        )
         .route("/iyke/browser/_reply", post(post_browser_reply))
         .route("/", get(super::ide_ws::ide_ws_handler));
 

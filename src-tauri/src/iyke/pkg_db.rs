@@ -67,7 +67,7 @@ fn deny(status: StatusCode, d: &DbScopeDenial) -> axum::response::Response {
 
 /// Bearer token off `Authorization`, falling back to `X-Ikenga-Pkg-Token` for
 /// clients that would rather not shape an `Authorization` header.
-fn presented_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn presented_token(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
