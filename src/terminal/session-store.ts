@@ -41,6 +41,7 @@ export interface TerminalTab {
 	 *  the conversation after an app restart. */
 	claudeSessionId?: string | null;
 	ptyId: string | null;
+	mode?: 'persistent' | 'ephemeral';
 	status: 'spawning' | 'running' | 'exited' | 'error';
 	exitCode: number | null;
 	createdAt: number;
@@ -57,7 +58,8 @@ interface TerminalState {
 	setActive: (id: string) => void;
 	remove: (id: string) => void;
 	rename: (id: string, title: string) => void;
-	setPtyId: (id: string, ptyId: string | null) => void;
+	setPtyId: (id: string, ptyId: string | null, mode?: 'persistent' | 'ephemeral') => void;
+	setMode: (id: string, mode: 'persistent' | 'ephemeral') => void;
 	setStatus: (id: string, status: TerminalTab['status'], exitCode?: number | null) => void;
 	setClaudeSessionId: (id: string, sessionId: string | null) => void;
 	updateCwd: (id: string, cwd: string) => void;
@@ -89,6 +91,8 @@ interface SerializedTab {
 	title: string;
 	spec: TerminalTab['spec'];
 	claudeSessionId?: string | null;
+	ptyId?: string | null;
+	mode?: 'persistent' | 'ephemeral';
 	status: TerminalTab['status'];
 	wasRunning?: boolean;
 	exitCode: number | null;
@@ -131,6 +135,8 @@ function serialize(tabs: TerminalTab[]): SerializedTab[] {
 			title,
 			spec,
 			claudeSessionId,
+			ptyId,
+			mode,
 			status,
 			exitCode,
 			createdAt,
@@ -142,6 +148,9 @@ function serialize(tabs: TerminalTab[]): SerializedTab[] {
 			const wrap = spec.wrap
 				? { ...spec.wrap, terminalId: undefined, resumeSessionId: undefined }
 				: undefined;
+			// Contract G-01: Only persistent (daemon-backed) sessions retain their ptyId across reload/restart.
+			// Ephemeral (in-process) sessions die on reload/restart.
+			const isPersistent = mode === 'persistent';
 			return {
 				id,
 				title,
@@ -149,8 +158,9 @@ function serialize(tabs: TerminalTab[]): SerializedTab[] {
 				// §Addendum Decision 3) — the restored tab is a durable on-disk record.
 				spec: { ...spec, env: stripSecretEnv(spec.env), wrap },
 				claudeSessionId,
-				// ptyIds are runtime-only; restored tabs start spawning if previously running, else exited.
-				status: isCurrentlyRunning ? 'exited' : status,
+				ptyId: isPersistent ? ptyId : null,
+				mode: isPersistent ? 'persistent' : 'ephemeral',
+				status: isCurrentlyRunning ? (isPersistent && ptyId ? 'running' : 'exited') : status,
 				wasRunning,
 				exitCode,
 				createdAt,
@@ -379,11 +389,20 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 			persistDebounced();
 		},
 
-		setPtyId: (id, ptyId) => {
+		setPtyId: (id, ptyId, mode) => {
 			set((s) => ({
-				tabs: s.tabs.map((t) => (t.id === id ? { ...t, ptyId } : t)),
+				tabs: s.tabs.map((t) =>
+					t.id === id ? { ...t, ptyId, ...(mode ? { mode } : {}) } : t
+				),
 			}));
-			// ptyIds aren't persisted, so no flush needed.
+			persistDebounced();
+		},
+
+		setMode: (id, mode) => {
+			set((s) => ({
+				tabs: s.tabs.map((t) => (t.id === id ? { ...t, mode } : t)),
+			}));
+			persistDebounced();
 		},
 
 		setStatus: (id, status, exitCode = null) => {
@@ -489,15 +508,32 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 						return {
 							...p,
 							ptyId: live.pty_id,
+							mode: 'ephemeral',
 							status: 'running',
 							wasRunning: true,
 							exitCode: null,
 							owner: { kind: 'sidepane' },
 						};
 					}
+
+					// Persistent (daemon-backed) tab that survived reload/restart:
+					// Attempt reattach to the daemon session.
+					if (p.mode === 'persistent' && p.ptyId && shouldAutoRespawn) {
+						return {
+							...p,
+							ptyId: p.ptyId,
+							mode: 'persistent',
+							status: 'running',
+							wasRunning: true,
+							exitCode: null,
+							owner: { kind: 'sidepane' },
+						};
+					}
+
 					return {
 						...p,
 						ptyId: null,
+						mode: p.mode ?? 'ephemeral',
 						// Restored tabs that were active before app exit restart in 'spawning' status
 						status: shouldAutoRespawn ? 'spawning' : 'exited',
 						wasRunning: shouldAutoRespawn,

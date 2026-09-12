@@ -255,6 +255,43 @@ describe('rehydrateFromDb & auto-resume', () => {
 		expect(tab?.spec.wrap).toMatchObject({ engine: 'claude', permissionMode: 'plan' });
 		expect(tab?.status).toBe('spawning');
 	});
+
+	it('preserves ptyId and mode for persistent tabs and restores them in running state', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setPtyId(id, 'pty-persistent-456', 'persistent');
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(ptyTerminalList).mockResolvedValueOnce([]);
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab).toBeDefined();
+		expect(tab?.mode).toBe('persistent');
+		expect(tab?.ptyId).toBe('pty-persistent-456');
+		expect(tab?.status).toBe('running');
+		expect(tab?.wasRunning).toBe(true);
+	});
+
+	it('drops ptyId for ephemeral tabs across reload (Contract G-01)', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setPtyId(id, 'pty-ephemeral-123', 'ephemeral');
+		useTerminalStore.getState().setStatus(id, 'running');
+
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(ptyTerminalList).mockResolvedValueOnce([]);
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		expect(tab).toBeDefined();
+		expect(tab?.mode).toBe('ephemeral');
+		expect(tab?.ptyId).toBeNull();
+		expect(tab?.status).toBe('spawning');
+	});
 });
 
 describe('stripSecretEnv (ADR-013 §Addendum Decision 3)', () => {

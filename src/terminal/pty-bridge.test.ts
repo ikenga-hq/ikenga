@@ -34,9 +34,11 @@ vi.mock('../lib/tauri-cmd', () => ({
 	ptyKill: vi.fn(async () => undefined),
 	ptyResize: vi.fn(async () => undefined),
 	ptyWrite: vi.fn(async () => undefined),
+	ptyDaemonInfo: vi.fn(async () => null),
 }));
 
-import { Pty } from './pty-bridge';
+import { ptyDaemonInfo, ptyKill } from '../lib/tauri-cmd';
+import { Pty, resetDaemonInfoCache } from './pty-bridge';
 
 function bytes(s: string): Uint8Array {
 	return new TextEncoder().encode(s);
@@ -62,6 +64,8 @@ beforeEach(() => {
 	attachBeginResolve = null;
 	armed = [];
 	total = 0;
+	resetDaemonInfoCache();
+	vi.mocked(ptyDaemonInfo).mockResolvedValue(null);
 });
 
 describe('Pty replay buffer', () => {
@@ -239,5 +243,109 @@ describe('Pty detached-attach scrollback replay (atomic handshake)', () => {
 		expect(pty.cwd).toBe('/initial/dir');
 		pty.setCwd('/new/updated/dir');
 		expect(pty.cwd).toBe('/new/updated/dir');
+	});
+});
+
+describe('Pty daemon proxy & continuity (WP-01 & WP-02)', () => {
+	it('spawns ephemeral PTY when daemon is unavailable', async () => {
+		vi.mocked(ptyDaemonInfo).mockResolvedValueOnce(null);
+		resetDaemonInfoCache();
+
+		const pty = await Pty.spawn({ cmd: ['bash'], cwd: '/tmp' });
+		expect(pty.mode).toBe('ephemeral');
+		expect(pty.id).toBe('fake-id');
+
+		await pty.dispose();
+		expect(ptyKill).toHaveBeenCalledWith('fake-id');
+	});
+
+	it('spawns persistent PTY via daemon RPC when daemon is available', async () => {
+		vi.mocked(ptyDaemonInfo).mockResolvedValueOnce({
+			available: true,
+			mode: 'persistent',
+			host: '127.0.0.1',
+			port: 4000,
+			token: 'test-token',
+			httpUrl: 'http://127.0.0.1:4000',
+			wsUrl: 'ws://127.0.0.1:4000',
+		});
+		resetDaemonInfoCache();
+
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ ok: true, data: { pty_id: 'daemon-pty-1' } }),
+		} as Response);
+
+		const pty = await Pty.spawn({ cmd: ['bash'], cwd: '/tmp' });
+		expect(pty.mode).toBe('persistent');
+		expect(pty.id).toBe('daemon-pty-1');
+
+		// Disposing a persistent PTY must NOT kill the daemon process (Contract G-02 continuity)
+		vi.mocked(ptyKill).mockClear();
+		await pty.dispose();
+		expect(ptyKill).not.toHaveBeenCalled();
+
+		fetchSpy.mockRestore();
+	});
+
+	it('routes kill() through daemon RPC for persistent PTYs', async () => {
+		vi.mocked(ptyDaemonInfo).mockResolvedValue({
+			available: true,
+			mode: 'persistent',
+			host: '127.0.0.1',
+			port: 4000,
+			token: 'test-token',
+			httpUrl: 'http://127.0.0.1:4000',
+			wsUrl: 'ws://127.0.0.1:4000',
+		});
+		resetDaemonInfoCache();
+
+		const fetchSpy = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: true, data: { pty_id: 'daemon-pty-2' } }),
+			} as Response)
+			.mockResolvedValueOnce({
+				ok: true,
+				json: async () => ({ ok: true }),
+			} as Response);
+
+		const pty = await Pty.spawn({ cmd: ['bash'], cwd: '/tmp' });
+		await pty.kill();
+
+		expect(fetchSpy).toHaveBeenLastCalledWith(
+			'http://127.0.0.1:4000/api/rpc',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({ cmd: 'pty_kill', args: { id: 'daemon-pty-2' } }),
+			})
+		);
+
+		fetchSpy.mockRestore();
+	});
+
+	it('throws when attaching to a stale session that does not exist on daemon', async () => {
+		vi.mocked(ptyDaemonInfo).mockResolvedValueOnce({
+			available: true,
+			mode: 'persistent',
+			host: '127.0.0.1',
+			port: 4000,
+			token: 'test-token',
+			httpUrl: 'http://127.0.0.1:4000',
+			wsUrl: 'ws://127.0.0.1:4000',
+		});
+		resetDaemonInfoCache();
+
+		const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({ ok: true, data: [] }), // empty session list
+		} as Response);
+
+		await expect(Pty.attach('stale-session-id', 'test')).rejects.toThrow(
+			'Session stale-session-id not found on daemon'
+		);
+
+		fetchSpy.mockRestore();
 	});
 });

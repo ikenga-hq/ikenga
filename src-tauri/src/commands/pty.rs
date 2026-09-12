@@ -215,3 +215,20 @@ pub async fn pty_terminal_list(
 pub async fn terminal_detect_shells() -> Result<Vec<crate::terminal::shell_detect::ShellProfile>, String> {
     Ok(crate::terminal::shell_detect::detect_shells())
 }
+
+/// Retrieve the active daemon connection info or fallback status.
+#[tauri::command]
+pub async fn pty_daemon_info(
+    daemon_state: State<'_, Arc<crate::pty::daemon_client::DaemonState>>,
+) -> Result<crate::pty::daemon_client::DaemonInfo, String> {
+    Ok(daemon_state.get_info())
+}
+
+/// Send shutdown request to the local daemon.
+#[tauri::command]
+pub async fn pty_daemon_shutdown(
+    daemon_state: State<'_, Arc<crate::pty::daemon_client::DaemonState>>,
+) -> Result<bool, String> {
+    Ok(daemon_state.shutdown())
+}
+

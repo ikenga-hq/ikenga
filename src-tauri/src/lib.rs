@@ -118,8 +118,9 @@ use commands::{
     pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
-    pty_attach_arm, pty_attach_begin, pty_foreground, pty_foreground_snapshot, pty_kill,
-    pty_resize, pty_spawn, pty_terminal_list, pty_write, runtime_retry_bun_fetch,
+    pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
+    pty_foreground_snapshot, pty_kill, pty_resize, pty_spawn, pty_terminal_list, pty_write,
+    runtime_retry_bun_fetch,
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
     secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
@@ -360,6 +361,11 @@ pub fn run() {
 
             // WP-02: runtime state for live Chi children.
             app.manage(Arc::new(ChiRuntime::new()));
+
+            // Wave 2: Desktop terminal daemon proxy & discovery
+            let daemon_info = pty::daemon_client::init_daemon(Some(data_dir.clone()));
+            let daemon_state = Arc::new(pty::daemon_client::DaemonState::new(daemon_info));
+            app.manage(daemon_state);
 
             // Phase 1 (projects-first-class): expire-and-delete sweeper for
             // iyke_locks. 30s cadence; cheap.
@@ -921,6 +927,8 @@ pub fn run() {
             pty_foreground_snapshot,
             pty_terminal_list,
             terminal_detect_shells,
+            pty_daemon_info,
+            pty_daemon_shutdown,
             // multi-window substrate (plans/multi-window WP-03)
             window_spawn,
             window_close,
@@ -1200,6 +1208,9 @@ pub fn run() {
                 #[cfg(feature = "desktop")]
                 {
                     use tauri::Manager;
+                    if let Some(daemon_state) = _app.try_state::<Arc<pty::daemon_client::DaemonState>>() {
+                        daemon_state.shutdown();
+                    }
                     if let Some(state) = _app.try_state::<commands::pkg_webview::WebviewPanesState>() {
                         state.0.cleanup_clear_on_exit(_app);
                     }

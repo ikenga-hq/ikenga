@@ -15,6 +15,7 @@
 //! gates the stream under one lock so the snapshot and the new listener's live
 //! stream tile exactly — no duplicated or dropped bytes at the seam.
 
+pub mod daemon_client;
 pub mod foreground;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1386,6 +1387,23 @@ impl PtyManager {
             .get(&resolved)
             .ok_or_else(|| anyhow!("unknown terminal: {id}"))?;
         Ok(session.broadcast_tx.subscribe())
+    }
+
+    /// Return the count of currently running (non-exited) PTY sessions.
+    pub fn active_session_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|entry| !entry.value().exited.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// Gracefully drain or terminate all active PTY sessions.
+    pub fn drain_all(&self) {
+        for entry in self.sessions.iter() {
+            if !entry.value().exited.load(Ordering::Acquire) {
+                let _ = self.kill(entry.key());
+            }
+        }
     }
 }
 

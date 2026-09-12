@@ -386,6 +386,8 @@ export function XTermHost({
 	const [useRegex, setUseRegex] = useState(false);
 	const [searchResult, setSearchResult] = useState<SearchResultChangeEvent | null>(null);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
+	const [spawnedMode, setSpawnedMode] = useState<'persistent' | 'ephemeral' | null>(null);
+	const terminalMode = pty?.mode ?? spawnedMode;
 
 	// Stash callbacks in refs so the spawn effect doesn't re-fire on each render.
 	const onStatusRef = useRef(onStatus);
@@ -967,6 +969,7 @@ export function XTermHost({
 						await p.dispose().catch(() => {});
 						return;
 					}
+					setSpawnedMode(p.mode);
 					ownedPty = p;
 					livePtyRef.current = p;
 					onPtyIdRef.current?.(p.id);
@@ -1450,6 +1453,39 @@ export function XTermHost({
 				</div>
 			)}
 			<div ref={containerRef} className="terminal-host" style={{ flex: 1, minHeight: 0 }} />
+			{terminalMode && (
+				<div
+					data-testid="terminal-mode-badge"
+					className={`terminal-mode-badge ${terminalMode}`}
+					style={{
+						position: 'absolute',
+						bottom: 4,
+						right: 8,
+						zIndex: 10,
+						fontSize: 10,
+						lineHeight: '12px',
+						fontFamily: 'monospace',
+						padding: '2px 5px',
+						borderRadius: 3,
+						pointerEvents: 'none',
+						userSelect: 'none',
+						opacity: 0.75,
+						background:
+							terminalMode === 'persistent' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(234, 179, 8, 0.15)',
+						color: terminalMode === 'persistent' ? '#22c55e' : '#eab308',
+						border: `1px solid ${
+							terminalMode === 'persistent' ? 'rgba(34, 197, 94, 0.3)' : 'rgba(234, 179, 8, 0.3)'
+						}`,
+					}}
+					title={
+						terminalMode === 'persistent'
+							? 'Persistent session (daemon-backed, survives reload)'
+							: 'Ephemeral session (in-process fallback, does not survive reload)'
+					}
+				>
+					{terminalMode}
+				</div>
+			)}
 		</div>
 	);
 }

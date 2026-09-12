@@ -11,14 +11,18 @@
 import {
 	ptyAttachArm,
 	ptyAttachBegin,
+	ptyDaemonInfo,
 	ptyForeground,
 	ptyKill,
 	ptyListen,
 	ptyResize,
 	ptySpawn,
 	ptyWrite,
+	type DaemonInfo,
+	type ForegroundProcess,
 	type PtySpawnOpts as RawPtySpawnOpts,
 } from '../lib/tauri-cmd';
+import { attachRemotePty, createDaemonPtySocketOpener } from '../lib/transport/pty-socket';
 
 export interface PtySpawnOpts extends RawPtySpawnOpts {
 	/** Human-readable label, e.g. `bash -l`. Used for status messages. */
@@ -27,6 +31,21 @@ export interface PtySpawnOpts extends RawPtySpawnOpts {
 
 export type PtyDataHandler = (bytes: Uint8Array) => void;
 export type PtyExitHandler = (code: number | null) => void;
+
+let cachedDaemonInfo: DaemonInfo | null | undefined;
+export async function getDaemonInfo(): Promise<DaemonInfo | null> {
+	if (cachedDaemonInfo !== undefined) return cachedDaemonInfo;
+	try {
+		cachedDaemonInfo = await ptyDaemonInfo();
+	} catch {
+		cachedDaemonInfo = null;
+	}
+	return cachedDaemonInfo ?? null;
+}
+
+export function resetDaemonInfoCache(): void {
+	cachedDaemonInfo = undefined;
+}
 
 /**
  * Re-exports of the raw command wrappers, in case anyone wants the imperative
@@ -37,9 +56,11 @@ export { ptyAttachArm, ptyAttachBegin, ptyKill, ptyListen, ptyResize, ptySpawn, 
 export class Pty {
 	readonly id: string;
 	readonly label: string;
+	readonly mode: 'persistent' | 'ephemeral';
 	cwd?: string;
 	exited: boolean = false;
 	exitCode: number | null = null;
+	sessionLost: boolean = false;
 
 	private dataSubs = new Set<PtyDataHandler>();
 	private exitSubs = new Set<PtyExitHandler>();
@@ -94,10 +115,16 @@ export class Pty {
 	 */
 	private totalOffset = 0;
 
-	private constructor(id: string, label: string, cwd?: string) {
+	private constructor(
+		id: string,
+		label: string,
+		cwd?: string,
+		mode: 'persistent' | 'ephemeral' = 'ephemeral'
+	) {
 		this.id = id;
 		this.label = label;
 		this.cwd = cwd;
+		this.mode = mode;
 	}
 
 	setCwd(cwd: string): void {
@@ -110,6 +137,35 @@ export class Pty {
 	 * Falls back to `this.cwd` when foreground lookup returns no CWD (e.g. macOS).
 	 */
 	async getForegroundCwd(): Promise<string | undefined> {
+		if (this.mode === 'persistent') {
+			const daemonInfo = await getDaemonInfo();
+			if (daemonInfo?.available) {
+				try {
+					const res = await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+							Authorization: `Bearer ${daemonInfo.token}`,
+						},
+						body: JSON.stringify({
+							cmd: 'pty_foreground',
+							args: { id: this.id },
+						}),
+					});
+					if (res.ok) {
+						const json = await res.json();
+						const fg = json.data as ForegroundProcess | null;
+						if (fg?.cwd) {
+							this.cwd = fg.cwd;
+							return fg.cwd;
+						}
+					}
+				} catch {
+					/* ignore lookup failure, fall back to cached cwd */
+				}
+				return this.cwd;
+			}
+		}
 		try {
 			const fg = await ptyForeground(this.id);
 			if (fg?.cwd) {
@@ -255,6 +311,61 @@ export class Pty {
 	 * Spawn a new PTY and start listening on its event streams.
 	 */
 	static async spawn(opts: PtySpawnOpts): Promise<Pty> {
+		const daemonInfo = await getDaemonInfo();
+		if (daemonInfo?.available) {
+			try {
+				const res = await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${daemonInfo.token}`,
+					},
+					body: JSON.stringify({
+						cmd: 'pty_spawn',
+						args: {
+							terminal_id: opts.terminalId,
+							title: opts.title,
+							cwd: opts.cwd,
+							cmd: opts.cmd,
+							env: opts.env,
+							rows: opts.rows ?? 24,
+							cols: opts.cols ?? 80,
+						},
+					}),
+				});
+				if (!res.ok) {
+					throw new Error(`Daemon spawn HTTP error: ${res.statusText}`);
+				}
+				const body = await res.json();
+				if (!body.ok) {
+					throw new Error(body.error ?? 'Daemon spawn error');
+				}
+				const id = (body.data?.pty_id as string) ?? opts.terminalId ?? 'term';
+				const pty = new Pty(id, opts.label ?? opts.cmd.join(' '), opts.cwd, 'persistent');
+				const opener = createDaemonPtySocketOpener(daemonInfo.wsUrl, daemonInfo.token);
+				pty.unlisten = attachRemotePty(
+					opener,
+					id,
+					(bytes, endOffset) => pty.deliverData(bytes, endOffset),
+					(code) => {
+						pty.exited = true;
+						pty.exitCode = code;
+						for (const sub of pty.exitSubs) {
+							try {
+								sub(code);
+							} catch (err) {
+								console.error('[pty] exit handler threw', err);
+							}
+						}
+					}
+				);
+				return pty;
+			} catch (err) {
+				console.warn('[pty] daemon spawn failed, falling back to in-process PTY:', err);
+			}
+		}
+
+		// Fallback: in-process PTY
 		const id = await ptySpawn({
 			// `terminalId` + `title` are what let the Rust core name this PTY in
 			// `TerminalDescriptor` — the view agents read over
@@ -270,7 +381,7 @@ export class Pty {
 			cols: opts.cols,
 			settingsPath: opts.settingsPath,
 		});
-		const pty = new Pty(id, opts.label ?? opts.cmd.join(' '), opts.cwd);
+		const pty = new Pty(id, opts.label ?? opts.cmd.join(' '), opts.cwd, 'ephemeral');
 		try {
 			pty.unlisten = await ptyListen(
 				id,
@@ -297,33 +408,68 @@ export class Pty {
 
 	/**
 	 * Attach to an EXISTING PTY by id (a terminal popped out into a detached
-	 * window). Subscribes to the live `pty://<id>` stream without spawning —
-	 * the origin pane still owns the PTY, so `dispose()` here only unsubscribes
-	 * and never kills it. New output + keystrokes flow live and write back to
-	 * the shared shell (both windows drive the same PTY).
-	 *
-	 * Scrollback: a three-step atomic handshake, NOT a listen-then-fetch race.
-	 *
-	 *   1. `ptyAttachBegin` — Rust snapshots the scrollback ring and gates the
-	 *      stream under the same lock the emitter holds. From here the PTY
-	 *      delivers nothing to anyone.
-	 *   2. `ptyListen` — register the live subscription inside that quiet window.
-	 *   3. `ptyAttachArm` — release the gate; everything emitted during the
-	 *      handshake arrives as the first live chunk, starting exactly where the
-	 *      snapshot ended.
-	 *
-	 * Because there is no interval in which a byte is both snapshotted and
-	 * delivered live, nothing is duplicated and nothing is dropped — which is
-	 * why the old `dedupUpTo` / offset-merge reconciliation is gone.
-	 *
-	 * The replayed bytes are still the raw trailing stream, so — like any
-	 * terminal reattach — mid-state escape sequences render against a fresh
-	 * screen; a few stale bytes may flicker at the top on first paint (that is
-	 * the separate T-3 paint bug, not a seam bug). Scrollback older than the
-	 * Rust ring cap (256KB) is not replayed.
+	 * window, or reattaching across reload). Subscribes to the live stream
+	 * without spawning.
 	 */
 	static async attach(id: string, label: string): Promise<Pty> {
-		const pty = new Pty(id, label);
+		const daemonInfo = await getDaemonInfo();
+		if (daemonInfo?.available) {
+			// Verify if the session still exists on the daemon before attaching.
+			try {
+				const res = await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${daemonInfo.token}`,
+					},
+					body: JSON.stringify({ cmd: 'pty_list' }),
+				});
+				if (res.ok) {
+					const body = await res.json();
+					if (body.ok && Array.isArray(body.data)) {
+						const exists = body.data.some(
+							(d: { pty_id?: string; terminal_id?: string }) =>
+								d.pty_id === id || d.terminal_id === id
+						);
+						if (!exists) {
+							throw new Error(`Session ${id} not found on daemon`);
+						}
+					}
+				}
+			} catch (err) {
+				if (err instanceof Error && err.message.includes('not found on daemon')) {
+					throw err;
+				}
+				// On network glitch / transient RPC error, proceed to attempt WebSocket attach
+			}
+
+			const pty = new Pty(id, label, undefined, 'persistent');
+			pty.owning = false;
+			const opener = createDaemonPtySocketOpener(daemonInfo.wsUrl, daemonInfo.token);
+			pty.unlisten = attachRemotePty(
+				opener,
+				id,
+				(bytes, endOffset) => pty.deliverData(bytes, endOffset),
+				(code) => {
+					pty.exited = true;
+					pty.exitCode = code;
+					for (const sub of pty.exitSubs) {
+						try {
+							sub(code);
+						} catch (err) {
+							console.error('[pty] exit handler threw', err);
+						}
+					}
+				},
+				() => {
+					pty.sessionLost = true;
+				}
+			);
+			return pty;
+		}
+
+		// Fallback: In-process attach
+		const pty = new Pty(id, label, undefined, 'ephemeral');
 		pty.owning = false;
 
 		// 1. Snapshot + gate. A failure here (or a reaped session) just means no
@@ -417,6 +563,23 @@ export class Pty {
 
 	async write(data: string): Promise<void> {
 		if (this.disposed || this.exited) return;
+		if (this.mode === 'persistent') {
+			const daemonInfo = await getDaemonInfo();
+			if (daemonInfo?.available) {
+				await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${daemonInfo.token}`,
+					},
+					body: JSON.stringify({
+						cmd: 'pty_write',
+						args: { id: this.id, data },
+					}),
+				}).catch(() => {});
+				return;
+			}
+		}
 		return ptyWrite(this.id, data);
 	}
 
@@ -433,11 +596,45 @@ export class Pty {
 		) {
 			return;
 		}
+		if (this.mode === 'persistent') {
+			const daemonInfo = await getDaemonInfo();
+			if (daemonInfo?.available) {
+				await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${daemonInfo.token}`,
+					},
+					body: JSON.stringify({
+						cmd: 'pty_resize',
+						args: { id: this.id, rows, cols },
+					}),
+				}).catch(() => {});
+				return;
+			}
+		}
 		return ptyResize(this.id, rows, cols);
 	}
 
 	async kill(): Promise<void> {
 		if (this.disposed || this.exited) return;
+		if (this.mode === 'persistent') {
+			const daemonInfo = await getDaemonInfo();
+			if (daemonInfo?.available) {
+				await fetch(`${daemonInfo.httpUrl}/api/rpc`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: `Bearer ${daemonInfo.token}`,
+					},
+					body: JSON.stringify({
+						cmd: 'pty_kill',
+						args: { id: this.id },
+					}),
+				}).catch(() => {});
+				return;
+			}
+		}
 		return ptyKill(this.id);
 	}
 
@@ -454,8 +651,10 @@ export class Pty {
 		this.dataSubs.clear();
 		this.exitSubs.clear();
 		// Attached (non-owning) PTYs only detach their listener; the origin pane
-		// owns the PTY lifecycle. Only an owning PTY kills the core process.
-		if (this.owning && !this.exited) {
+		// owns the PTY lifecycle. Only an owning ephemeral PTY kills the core process.
+		// For persistent (daemon-backed) PTYs, unmounting/reloading does NOT kill
+		// the daemon session!
+		if (this.owning && this.mode === 'ephemeral' && !this.exited) {
 			await ptyKill(this.id).catch(() => {});
 		}
 	}

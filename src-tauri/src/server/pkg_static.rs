@@ -666,11 +666,13 @@ mod tests {
             data_dir: None,
             auth_token: Some("tok".into()),
             allowed_origins: vec![],
+            idle_timeout_secs: None,
         };
         let router = crate::server::create_router(
             config,
             Arc::new(crate::pty::PtyManager::new()),
             Arc::new(crate::engines::EngineRegistry::new()),
+            None,
             None,
         );
 

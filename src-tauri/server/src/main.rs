@@ -48,6 +48,10 @@ pub struct CliArgs {
         value_delimiter = ','
     )]
     pub allowed_origins: Vec<String>,
+
+    /// Idle timeout in seconds before server automatically shuts down when no sessions are active.
+    #[arg(long, env = "IKENGA_IDLE_TIMEOUT")]
+    pub idle_timeout: Option<u64>,
 }
 
 #[tokio::main]
@@ -70,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: args.data_dir,
         auth_token: args.auth_token,
         allowed_origins: args.allowed_origins,
+        idle_timeout_secs: args.idle_timeout,
     };
 
     // Clap has read these into `config`; drop them from the process

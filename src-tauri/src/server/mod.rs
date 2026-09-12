@@ -52,6 +52,8 @@ pub struct ServerConfig {
     /// Extra origins permitted to call the API cross-site (e.g. a Vite dev
     /// server). Empty means same-origin only.
     pub allowed_origins: Vec<String>,
+    /// Idle timeout in seconds before server automatically shuts down when no sessions are active.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -71,6 +73,8 @@ pub struct AppState {
     /// at router construction; empty when no `--pkgs-dir` was given, in which
     /// case the route exists but 404s. See `server::pkg_static`.
     pub pkg_static: PkgStaticService,
+    /// Channel for triggering graceful server shutdown.
+    pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Compare two secrets without leaking their common prefix through timing.
@@ -174,12 +178,27 @@ async fn auth_middleware(
     Err(unauthorized("Unauthorized: invalid or missing auth token"))
 }
 
+pub async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    info!("POST /api/shutdown received: initiating graceful shutdown");
+    let _ = state.shutdown_tx.send(());
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "status": "shutting_down"
+        })),
+    )
+}
+
 pub fn create_router(
     config: ServerConfig,
     pty_manager: Arc<PtyManager>,
     engine_registry: Arc<EngineRegistry>,
     pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 ) -> Router {
+    let (default_tx, _) = tokio::sync::broadcast::channel(4);
+    let shutdown_tx = shutdown_tx.unwrap_or(default_tx);
     let spa_service = SpaStaticService::new(&config.static_dir);
     // Walked here rather than in `run_server` so that every router — tests
     // included — gets the same view of `--pkgs-dir`. Logs the ids it found.
@@ -192,6 +211,7 @@ pub fn create_router(
         engine_registry,
         pa_db,
         pkg_static,
+        shutdown_tx,
     });
 
     // Same-origin needs no CORS headers at all; anything else has to be named
@@ -209,6 +229,7 @@ pub fn create_router(
     // Protected API and WebSocket endpoints
     let protected_routes = Router::new()
         .route("/api/rpc", post(rpc::rpc_handler))
+        .route("/api/shutdown", post(shutdown_handler))
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
         .route("/ws/fs", get(fs_ws::fs_ws_handler))
@@ -310,7 +331,41 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
             .await;
     }
     let token = config.auth_token.clone().unwrap_or_default();
-    let router = create_router(config.clone(), pty_manager, engine_registry, pa_db);
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
+    let router = create_router(
+        config.clone(),
+        pty_manager.clone(),
+        engine_registry,
+        pa_db,
+        Some(shutdown_tx.clone()),
+    );
+
+    // Idle timeout watcher (G-02): shuts down daemon when no active sessions for idle_timeout_secs
+    if let Some(idle_timeout_secs) = config.idle_timeout_secs {
+        let pty_manager = pty_manager.clone();
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(idle_timeout_secs);
+            let mut idle_since: Option<std::time::Instant> = None;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let active = pty_manager.active_session_count();
+                if active > 0 {
+                    idle_since = None;
+                } else {
+                    let since = idle_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= timeout {
+                        info!(
+                            "Daemon idle for {}s (no active PTY sessions). Initiating auto-shutdown.",
+                            idle_timeout_secs
+                        );
+                        let _ = shutdown_tx.send(());
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     info!(
         "ikenga-server listening on http://{} (static assets: {})",
@@ -333,8 +388,63 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         info!("token is the configured one; read it from the env file, not from this log");
     }
 
+    // Write daemon discovery metadata file
+    let temp_meta_path = std::env::temp_dir().join("ikenga-daemon.json");
+    let daemon_meta = serde_json::json!({
+        "pid": std::process::id(),
+        "host": config.host,
+        "port": config.port,
+        "token": token,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let _ = std::fs::write(&temp_meta_path, daemon_meta.to_string());
+    let data_dir_meta = config.data_dir.as_ref().map(|d| d.join("daemon.json"));
+    if let Some(ref path) = data_dir_meta {
+        let _ = std::fs::write(path, daemon_meta.to_string());
+    }
+
+    let shutdown_signal = {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        async move {
+            let ctrl_c = async {
+                let _ = tokio::signal::ctrl_c().await;
+            };
+            #[cfg(unix)]
+            let terminate = async {
+                if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    sig.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                _ = ctrl_c => {
+                    info!("Received SIGINT (Ctrl+C), shutting down daemon");
+                }
+                _ = terminate => {
+                    info!("Received SIGTERM, shutting down daemon");
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Received shutdown signal, shutting down daemon");
+                }
+            }
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
+
+    info!("ikenga-server shutting down: cleaning up metadata and draining PTY sessions");
+    let _ = std::fs::remove_file(&temp_meta_path);
+    if let Some(ref path) = data_dir_meta {
+        let _ = std::fs::remove_file(path);
+    }
+    pty_manager.drain_all();
 
     Ok(())
 }

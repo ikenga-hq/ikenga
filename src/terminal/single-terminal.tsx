@@ -42,6 +42,7 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 	const setClaudeSessionId = useTerminalStore((s) => s.setClaudeSessionId);
 
 	const [pty, setPty] = useState<Pty | null>(() => getPty(sessionId) ?? null);
+	const [sessionLost, setSessionLost] = useState(false);
 	const startedRef = useRef(false);
 
 	// Spawn / attach lifecycle. Idempotent across remounts via the registry +
@@ -85,7 +86,12 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 					disposePty(sessionId);
 					setPtyId(sessionId, null);
 					setClaudeSessionId(sessionId, null);
-					setStatus(sessionId, 'exited', code);
+					if (p.sessionLost) {
+						setSessionLost(true);
+						setStatus(sessionId, 'error');
+					} else {
+						setStatus(sessionId, 'exited', code);
+					}
 				});
 				registerPty(sessionId, p);
 				// Tee PTY bytes into a per-session ring buffer so iyke can read
@@ -93,11 +99,14 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 				// canvas. Lifetime is tied to the PTY via the registry's dispose.
 				attachCapture(sessionId, p);
 				setPty(p);
-				setPtyId(sessionId, p.id);
+				setPtyId(sessionId, p.id, p.mode);
 				setStatus(sessionId, 'running');
 			} catch (err) {
 				console.error('[single-terminal] spawn/attach failed', err);
 				setPtyId(sessionId, null);
+				if (shouldAttach) {
+					setSessionLost(true);
+				}
 				setStatus(sessionId, 'error');
 			}
 		})();
@@ -112,6 +121,7 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 	useEffect(() => {
 		if (tab?.status === 'spawning') {
 			startedRef.current = false;
+			setSessionLost(false);
 			setPtyId(sessionId, null);
 			if (pty?.exited || !pty) setPty(getPty(sessionId) ?? null);
 		}
@@ -148,25 +158,41 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 		return <Centered text={`Terminal session ${sessionId.slice(0, 8)}… not found.`} />;
 	}
 	if (!pty) {
-		if (tab.status === 'exited' || tab.status === 'error') {
+		if (tab.status === 'exited' || tab.status === 'error' || sessionLost) {
+			const isLost = sessionLost || (tab.status === 'error' && tab.mode === 'persistent');
 			return (
 				<Centered>
-					{tab.status === 'error'
-						? `Failed to spawn: ${displayCmd(tab).join(' ')}`
-						: `Terminal exited (code=${tab.exitCode ?? '?'}).`}
-					<br />
-					<button
-						type="button"
-						onClick={() => {
-							startedRef.current = false;
-							setPtyId(sessionId, null);
-							setClaudeSessionId(sessionId, null);
-							setStatus(sessionId, 'spawning');
-						}}
-						className="mt-2 rounded-md border border-border bg-background px-3 py-1 text-xs hover:bg-accent"
-					>
-						Restart <code className="ml-1 font-mono">{displayCmd(tab).join(' ')}</code>
-					</button>
+					<div className="flex flex-col items-center gap-2 max-w-sm">
+						{isLost ? (
+							<>
+								<div className="text-sm font-semibold text-destructive">
+									Session Lost
+								</div>
+								<div className="text-xs text-muted-foreground">
+									The terminal session could not be reattached (the daemon may have restarted or the session was terminated).
+								</div>
+							</>
+						) : tab.status === 'error' ? (
+							<div className="text-destructive">
+								Failed to spawn: {displayCmd(tab).join(' ')}
+							</div>
+						) : (
+							<div>Terminal exited (code={tab.exitCode ?? '?'}).</div>
+						)}
+						<button
+							type="button"
+							onClick={() => {
+								startedRef.current = false;
+								setSessionLost(false);
+								setPtyId(sessionId, null);
+								setClaudeSessionId(sessionId, null);
+								setStatus(sessionId, 'spawning');
+							}}
+							className="mt-2 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium hover:bg-accent hover:text-accent-foreground transition-colors"
+						>
+							Restart <code className="ml-1 font-mono">{displayCmd(tab).join(' ')}</code>
+						</button>
+					</div>
 				</Centered>
 			);
 		}

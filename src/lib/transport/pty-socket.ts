@@ -13,6 +13,20 @@ const MAX_ATTEMPTS = 10;
 
 export type OpenPtySocket = (id: string, opts?: { spawn?: boolean }) => WebSocket;
 
+export function createDaemonPtySocketOpener(wsUrl: string, token?: string): OpenPtySocket {
+	return (id: string, opts?: { spawn?: boolean }) => {
+		const params = new URLSearchParams();
+		if (token) params.set('token', token);
+		if (opts?.spawn) params.set('spawn', 'true');
+		const query = params.toString();
+		const base = wsUrl.replace(/^http/, 'ws').replace(/\/+$/, '');
+		const socketUrl = `${base}/ws/pty/${encodeURIComponent(id)}${query ? `?${query}` : ''}`;
+		const ws = new WebSocket(socketUrl);
+		ws.binaryType = 'arraybuffer';
+		return ws;
+	};
+}
+
 interface SnapshotControl {
 	type: 'ikenga.snapshot';
 	end_offset: number;
@@ -50,7 +64,8 @@ export function attachRemotePty(
 	openPtySocket: OpenPtySocket,
 	id: string,
 	onData: (bytes: Uint8Array, endOffset: number) => void,
-	onExit: (code: number | null) => void
+	onExit: (code: number | null) => void,
+	onSessionLost?: () => void
 ): () => void {
 	let ws: WebSocket | null = null;
 	let closedByCaller = false;
@@ -176,12 +191,14 @@ export function attachRemotePty(
 				// it was reaped. Reconnecting cannot bring it back, and asking
 				// the daemon to spawn one would fabricate a replacement.
 				emitLocal(banner(YELLOW, 'terminal session no longer exists on the host'));
+				onSessionLost?.();
 				finish(null);
 				break;
 			case 'ikenga.error':
 				// The daemon could not attach at all. Surface it and stop —
 				// retrying an attach the daemon just refused only repeats it.
 				emitLocal(banner(YELLOW, `attach failed · ${msg.message ?? 'unknown error'}`));
+				onSessionLost?.();
 				finish(null);
 				break;
 			default:
@@ -230,6 +247,7 @@ export function attachRemotePty(
 		if (attempt > MAX_ATTEMPTS) {
 			emitLocal(banner(YELLOW, `disconnected · gave up after ${MAX_ATTEMPTS} attempts`));
 			connectionStateStore.socketDisconnected(id, attempt, 0);
+			onSessionLost?.();
 			finish(null);
 			return;
 		}

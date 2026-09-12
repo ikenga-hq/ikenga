@@ -142,6 +142,37 @@ export async function terminalDetectShells(): Promise<ShellProfile[]> {
 	return invoke<ShellProfile[]>('terminal_detect_shells');
 }
 
+export interface DaemonInfo {
+	available: boolean;
+	host: string;
+	port: number;
+	token: string;
+	httpUrl: string;
+	wsUrl: string;
+	pid?: number | null;
+	mode: 'persistent' | 'ephemeral';
+}
+
+/** Retrieve active daemon connection info or fallback status. */
+export async function ptyDaemonInfo(): Promise<DaemonInfo | null> {
+	if (isRemoteWebSession()) return null;
+	try {
+		return await invoke<DaemonInfo>('pty_daemon_info');
+	} catch {
+		return null;
+	}
+}
+
+/** Send graceful shutdown request to the local daemon. */
+export async function ptyDaemonShutdown(): Promise<boolean> {
+	if (isRemoteWebSession()) return false;
+	try {
+		return await invoke<boolean>('pty_daemon_shutdown');
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Subscribe to PTY byte stream + exit. Backend emits each data chunk as
  * `"<endOffset>:<base64>"` — base64 because Tauri serializes payloads as JSON

@@ -137,8 +137,9 @@ pub use projects::{
     project_list, project_scaffold_claude, project_set_active, project_skills_list, project_update,
 };
 pub use pty::{
-    pty_attach_arm, pty_attach_begin, pty_foreground, pty_foreground_snapshot, pty_kill,
-    pty_resize, pty_spawn, pty_terminal_list, pty_write, terminal_detect_shells,
+    pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
+    pty_foreground_snapshot, pty_kill, pty_resize, pty_spawn, pty_terminal_list, pty_write,
+    terminal_detect_shells,
 };
 pub use runtime::runtime_retry_bun_fetch;
 pub use screenshot::{
