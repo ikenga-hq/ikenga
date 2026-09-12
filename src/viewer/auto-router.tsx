@@ -121,7 +121,7 @@ export function ViewerRouter({
 			{Renderer === HtmlFrame ? (
 				<HtmlFrame path={path} paneId={paneId} />
 			) : Renderer === MarkdownView ? (
-				<MarkdownView path={path} editable={editable} />
+				<MarkdownView path={path} editable={editable} line={line} col={col} />
 			) : Renderer === CodeView ? (
 				<CodeView path={path} line={line} col={col} />
 			) : (

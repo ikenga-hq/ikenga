@@ -15,13 +15,15 @@
 import { getHomeSync } from '@/lib/home';
 
 // Multi-segment path pattern (contains slash, optional tilde / relative prefix).
-export const MULTI_SEGMENT_PATH_RE = /^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
+// Relaxed to recognize directory paths with/without trailing slashes and prefix roots (./, ../, ~/).
+export const MULTI_SEGMENT_PATH_RE =
+	/^(?:~?\/|~|\.\.?\/)(?:[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*)?$|^[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
 
 // Single-segment file pattern (no slash, requires .<ext>).
 export const SINGLE_SEGMENT_PATH_RE = /^[a-zA-Z0-9_.@()-]+\.[A-Za-z0-9]{1,7}$/;
 
 // Backward-compatible alias for existing consumers.
-export const PATH_RE = /^(?:~?\/|~|\.\.?\/)?[a-zA-Z0-9_.@()-][a-zA-Z0-9_./@()-]*$/;
+export const PATH_RE = MULTI_SEGMENT_PATH_RE;
 
 // Restrict single-segment (no slash) paths to known dev/doc/asset extensions so
 // things like `e.g.` or `Mr.A` don't get mistaken for files. Multi-segment
@@ -227,6 +229,31 @@ export async function resolveExistingPath(
 	const results = await Promise.all(candidateList.map((c) => fsCheck(c).catch(() => false)));
 	const matchIdx = results.findIndex(Boolean);
 	return matchIdx >= 0 ? candidateList[matchIdx] : null;
+}
+
+export type PathKind = 'file' | 'dir';
+
+export interface ResolvedEntity {
+	path: string;
+	kind: PathKind;
+}
+
+/**
+ * Async fs-validated entity resolver with candidate ordering (WP-07 / T-02 / T-03).
+ * Differentiates between files and directories so terminals can open files in the
+ * artifact viewer/editor and reveal/focus directories in the workspace tree.
+ * Returns null when none of the candidates exist on disk.
+ */
+export async function resolveExistingEntity(
+	rawPath: string,
+	cwd?: string,
+	checkEntity?: (p: string) => Promise<PathKind | null>
+): Promise<ResolvedEntity | null> {
+	if (!checkEntity) return null;
+	const candidateList = pathCandidates(rawPath, cwd);
+	const results = await Promise.all(candidateList.map((c) => checkEntity(c).catch(() => null)));
+	const matchIdx = results.findIndex((k) => k !== null);
+	return matchIdx >= 0 ? { path: candidateList[matchIdx], kind: results[matchIdx]! } : null;
 }
 
 /**

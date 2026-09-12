@@ -1,16 +1,41 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fsExists } from '@/lib/tauri-cmd';
+import { fsExists, fsKind } from '@/lib/tauri-cmd';
 import {
 	__clearPathLinkCache,
+	checkFsEntity,
 	offsetToCell,
 	readLogicalLine,
 	registerPathLinks,
 	scanLineForPaths,
 } from './path-links';
 
-vi.mock('@/lib/tauri-cmd', () => ({ fsExists: vi.fn() }));
+const mockAddTab = vi.fn();
+const mockAddTabBackground = vi.fn();
+const mockRevealPath = vi.fn();
+const mockSetActiveMode = vi.fn();
+
+vi.mock('@/lib/tauri-cmd', () => ({
+	fsExists: vi.fn(),
+	fsKind: vi.fn(),
+}));
+
 vi.mock('@/lib/panes/pane-store', () => ({
-	usePaneStore: { getState: () => ({ focusedId: 'p1', addTabBackground: vi.fn() }) },
+	usePaneStore: {
+		getState: () => ({
+			focusedId: 'p1',
+			addTab: mockAddTab,
+			addTabBackground: mockAddTabBackground,
+			revealPath: mockRevealPath,
+		}),
+	},
+}));
+
+vi.mock('@/lib/shell/shell-store', () => ({
+	useShellStore: {
+		getState: () => ({
+			setActiveMode: mockSetActiveMode,
+		}),
+	},
 }));
 
 describe('scanLineForPaths', () => {
@@ -128,9 +153,11 @@ function fakeTerm(lineText: string) {
 			provider = p;
 			return { dispose() {} };
 		},
-		getLinks(): Promise<{ text: string }[]> {
+		getLinks(): Promise<{ text: string; activate: () => void }[]> {
 			return new Promise((resolve) => {
-				provider?.provideLinks(1, (links) => resolve((links ?? []) as { text: string }[]));
+				provider?.provideLinks(1, (links) =>
+					resolve((links ?? []) as { text: string; activate: () => void }[])
+				);
 			});
 		},
 	};
@@ -139,7 +166,16 @@ function fakeTerm(lineText: string) {
 describe('registerPathLinks — decorates only what exists on disk', () => {
 	beforeEach(() => {
 		__clearPathLinkCache();
+		mockAddTab.mockClear();
+		mockAddTabBackground.mockClear();
+		mockRevealPath.mockClear();
+		mockSetActiveMode.mockClear();
 		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (p === '/repo/src/terminal') return 'dir';
+			if (REAL.has(p)) return 'file';
+			return 'missing';
+		});
 	});
 
 	it('does not linkify prose that is merely path-shaped', async () => {
@@ -179,6 +215,11 @@ describe('registerPathLinks — dynamic cwdGetter (WP-03 / G-PATH-CWD)', () => {
 	beforeEach(() => {
 		__clearPathLinkCache();
 		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (p === '/repo/src/terminal') return 'dir';
+			if (REAL.has(p)) return 'file';
+			return 'missing';
+		});
 	});
 
 	it('resolves relative paths against live CWD when cwdGetter returns a new directory after cd', async () => {
@@ -318,6 +359,11 @@ describe('registerPathLinks — wrapped paths', () => {
 	beforeEach(() => {
 		__clearPathLinkCache();
 		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (p === '/repo/src/terminal') return 'dir';
+			if (REAL.has(p)) return 'file';
+			return 'missing';
+		});
 	});
 
 	it('linkifies a path split across a wrap, with a range spanning both rows', async () => {
@@ -386,5 +432,109 @@ describe('scanLineForPaths — the wall-clock budget must not eat ordinary lines
 		} finally {
 			spy.mockRestore();
 		}
+	});
+});
+
+describe('registerPathLinks — line/col parsing & editor cursor jump (WP-05 / T-04)', () => {
+	beforeEach(() => {
+		__clearPathLinkCache();
+		mockAddTab.mockClear();
+		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (REAL.has(p)) return 'file';
+			return 'missing';
+		});
+	});
+
+	it('preserves :line:col suffix when activating link and calls addTab with line and col', async () => {
+		const term = fakeTerm('error in src/index.ts:42:15: syntax error');
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks();
+		expect(links).toHaveLength(1);
+		expect(links[0].text).toBe('src/index.ts');
+
+		// Click the link
+		links[0].activate();
+		expect(mockAddTab).toHaveBeenCalledWith('p1', {
+			kind: 'artifact',
+			path: '/repo/src/index.ts',
+			line: 42,
+			col: 15,
+		});
+	});
+
+	it('preserves (line, col) paren suffix when activating link', async () => {
+		const term = fakeTerm('at src/index.ts(105,4)');
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks();
+		expect(links).toHaveLength(1);
+
+		links[0].activate();
+		expect(mockAddTab).toHaveBeenCalledWith('p1', {
+			kind: 'artifact',
+			path: '/repo/src/index.ts',
+			line: 105,
+			col: 4,
+		});
+	});
+
+	it('preserves :line suffix without col when activating link', async () => {
+		const term = fakeTerm('warning at src/index.ts:77');
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks();
+		expect(links).toHaveLength(1);
+
+		links[0].activate();
+		expect(mockAddTab).toHaveBeenCalledWith('p1', {
+			kind: 'artifact',
+			path: '/repo/src/index.ts',
+			line: 77,
+			col: undefined,
+		});
+	});
+});
+
+describe('registerPathLinks — directory linking & tree reveal (WP-07 / T-02 / T-03)', () => {
+	beforeEach(() => {
+		__clearPathLinkCache();
+		mockSetActiveMode.mockClear();
+		mockRevealPath.mockClear();
+		vi.mocked(fsExists).mockImplementation(async (p: string) => REAL.has(p));
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (p === '/repo/src/terminal') return 'dir';
+			if (REAL.has(p)) return 'file';
+			return 'missing';
+		});
+	});
+
+	it('clicking a directory link switches active mode to files and reveals directory', async () => {
+		const term = fakeTerm('open src/terminal to inspect');
+		registerPathLinks(term as never, '/repo');
+		const links = await term.getLinks();
+		expect(links).toHaveLength(1);
+		expect(links[0].text).toBe('src/terminal');
+
+		links[0].activate();
+		expect(mockSetActiveMode).toHaveBeenCalledWith('files');
+		expect(mockRevealPath).toHaveBeenCalledWith('/repo/src/terminal');
+	});
+
+	it('checkFsEntity accurately resolves file, dir, and missing', async () => {
+		vi.mocked(fsKind).mockImplementation(async (p: string) => {
+			if (p === '/test/dir') return 'dir';
+			if (p === '/test/file.ts') return 'file';
+			return 'missing';
+		});
+
+		expect(await checkFsEntity('/test/dir')).toBe('dir');
+		expect(await checkFsEntity('/test/file.ts')).toBe('file');
+		expect(await checkFsEntity('/test/missing')).toBeNull();
+	});
+
+	it('checkFsEntity falls back to fsExists if fsKind throws', async () => {
+		vi.mocked(fsKind).mockRejectedValue(new Error('unsupported command'));
+		vi.mocked(fsExists).mockResolvedValue(true);
+
+		expect(await checkFsEntity('/test/file.ts')).toBe('file');
 	});
 });

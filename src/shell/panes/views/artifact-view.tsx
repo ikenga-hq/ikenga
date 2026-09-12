@@ -1,5 +1,5 @@
 import { ArrowUpRight } from 'lucide-react';
-import { useCallback } from 'react';
+import { useCallback, useEffect } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
 import { spawnWindow } from '@/lib/tauri-cmd';
 import {
@@ -22,6 +22,17 @@ interface ArtifactViewProps {
 // this module exists so the pane store's `kind: 'artifact'` view continues to
 // resolve to a stable export.
 export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
+	// Dispatch editor jump event when line/col are provided (WP-05 / T-04)
+	useEffect(() => {
+		if (line !== undefined) {
+			window.dispatchEvent(
+				new CustomEvent('ikenga:editor-jump', {
+					detail: { path, line, col },
+				})
+			);
+		}
+	}, [path, line, col]);
+
 	// Pop-out: spawn a thin single-surface viewer window for this file.
 	// The path is encoded in the surface_set entry ("viewer:<path>") so the
 	// detached ViewerSurface can extract it from ctx.surfaces[0].

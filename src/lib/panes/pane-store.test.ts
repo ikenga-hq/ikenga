@@ -120,3 +120,58 @@ describe('hydrate', () => {
 		expect(state.closedHistory).toEqual([{ kind: 'route', path: '/closed-once' }]);
 	});
 });
+
+describe('addTab & updateTab line/col jump (WP-05 / T-04)', () => {
+	it('updates existing artifact tab with new line and col when navigated to again', () => {
+		const store = usePaneStore.getState();
+		const focusedId = store.focusedId;
+
+		// 1. Open file initially without line/col
+		store.addTab(focusedId, { kind: 'artifact', path: '/src/main.rs' });
+		let root = usePaneStore.getState().root;
+		if (root.type !== 'leaf') throw new Error('expected leaf');
+		expect(root.tabs).toHaveLength(2); // [/test, /src/main.rs]
+		expect(root.tabs[1]).toEqual({ kind: 'artifact', path: '/src/main.rs' });
+
+		// 2. Navigate to the same file with line 42 col 15
+		store.addTab(focusedId, { kind: 'artifact', path: '/src/main.rs', line: 42, col: 15 });
+		root = usePaneStore.getState().root;
+		if (root.type !== 'leaf') throw new Error('expected leaf');
+		expect(root.tabs).toHaveLength(2); // Deduplicated: still 2 tabs
+		expect(root.activeTabIdx).toBe(1);
+		expect(root.tabs[1]).toEqual({ kind: 'artifact', path: '/src/main.rs', line: 42, col: 15 });
+
+		// 3. Jump to a different line in the same file
+		store.addTab(focusedId, { kind: 'artifact', path: '/src/main.rs', line: 100, col: 1 });
+		root = usePaneStore.getState().root;
+		if (root.type !== 'leaf') throw new Error('expected leaf');
+		expect(root.tabs[1]).toEqual({ kind: 'artifact', path: '/src/main.rs', line: 100, col: 1 });
+	});
+
+	it('updates existing tab line and col across panes when opened in background', () => {
+		const store = usePaneStore.getState();
+		const focusedId = store.focusedId;
+		store.addTab(focusedId, { kind: 'artifact', path: '/src/lib.rs' });
+
+		// Background tab update
+		store.addTabBackground(focusedId, { kind: 'artifact', path: '/src/lib.rs', line: 20, col: 5 });
+		const root = usePaneStore.getState().root;
+		if (root.type !== 'leaf') throw new Error('expected leaf');
+		expect(root.tabs[1]).toEqual({ kind: 'artifact', path: '/src/lib.rs', line: 20, col: 5 });
+	});
+});
+
+describe('revealPath (WP-07 / T-03)', () => {
+	it('sets revealRequest with incremented nonce', () => {
+		const store = usePaneStore.getState();
+		const initialNonce = store.revealRequest?.nonce ?? 0;
+
+		store.revealPath('/repo/src/terminal');
+		let req = usePaneStore.getState().revealRequest;
+		expect(req).toEqual({ path: '/repo/src/terminal', nonce: initialNonce + 1 });
+
+		store.revealPath('/repo/src/terminal');
+		req = usePaneStore.getState().revealRequest;
+		expect(req).toEqual({ path: '/repo/src/terminal', nonce: initialNonce + 2 });
+	});
+});

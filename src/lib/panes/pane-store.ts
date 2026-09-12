@@ -17,6 +17,7 @@ import {
 	splitLeaf,
 	splitLeafAt,
 	switchTab,
+	updateTab,
 	type MoveTabMode,
 } from './pane-reducer';
 import { MAX_CLOSED_HISTORY, type PaneTreeSnapshot } from './pane-persistence';
@@ -45,6 +46,8 @@ interface PaneStoreState {
 	 * subscribes to the `nonce` to reveal + scroll-to the file in its tree.
 	 * Not persisted. */
 	revealRequest: { path: string; nonce: number } | null;
+	/** Request the Files sidebar to reveal + expand to this path in the workspace tree. */
+	revealPath: (path: string) => void;
 
 	splitFocused: (direction: PaneDirection) => void;
 	splitPane: (id: PaneId, direction: PaneDirection) => void;
@@ -258,6 +261,9 @@ export const usePaneStore = create<PaneStoreState>((set, get) => ({
 	refreshTicks: {},
 	history: {},
 	revealRequest: null,
+	revealPath: (path) => {
+		set((s) => ({ revealRequest: { path, nonce: (s.revealRequest?.nonce ?? 0) + 1 } }));
+	},
 
 	splitFocused: (direction) => {
 		const { root, focusedId } = get();
@@ -324,18 +330,18 @@ export const usePaneStore = create<PaneStoreState>((set, get) => ({
 				? focusedId
 				: (getLeafIdsInOrder(root)[0] ?? id);
 
-		// Prefer the same pane: if it's already there, just switch to it.
+		// Prefer the same pane: if it's already there, switch to it and update view (e.g. line/col).
 		const sameLeaf = findExistingTab(root, targetId, view);
 		if (sameLeaf >= 0) {
-			set({ root: switchTab(root, targetId, sameLeaf) });
+			set({ root: updateTab(root, targetId, sameLeaf, view) });
 			return;
 		}
 		// Otherwise, look across all panes — focus the pane that already holds
-		// it instead of duplicating.
+		// it instead of duplicating (and update view if needed e.g. line/col).
 		const elsewhere = findExistingTabAnywhere(root, view);
 		if (elsewhere) {
 			set({
-				root: switchTab(root, elsewhere.leafId, elsewhere.tabIdx),
+				root: updateTab(root, elsewhere.leafId, elsewhere.tabIdx, view),
 				focusedId: elsewhere.leafId,
 			});
 			return;
@@ -345,8 +351,20 @@ export const usePaneStore = create<PaneStoreState>((set, get) => ({
 
 	addTabBackground: (id, view) => {
 		const { root } = get();
-		if (findExistingTab(root, id, view) >= 0) return;
-		if (findExistingTabAnywhere(root, view)) return;
+		const sameLeaf = findExistingTab(root, id, view);
+		if (sameLeaf >= 0) {
+			if (view.kind === 'artifact' && (view.line !== undefined || view.col !== undefined)) {
+				set({ root: updateTab(root, id, sameLeaf, view) });
+			}
+			return;
+		}
+		const elsewhere = findExistingTabAnywhere(root, view);
+		if (elsewhere) {
+			if (view.kind === 'artifact' && (view.line !== undefined || view.col !== undefined)) {
+				set({ root: updateTab(root, elsewhere.leafId, elsewhere.tabIdx, view) });
+			}
+			return;
+		}
 		const leafBefore = findLeaf(root, id);
 		const prevActive = leafBefore?.activeTabIdx ?? 0;
 		const next = addTab(root, id, view);

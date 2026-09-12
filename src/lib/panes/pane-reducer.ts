@@ -268,6 +268,27 @@ export function switchTab(root: PaneNode, leafId: PaneId, idx: number): PaneNode
 	});
 }
 
+/**
+ * Update an existing tab at `tabIdx` with `view` (preserving its `pinned` flag
+ * and stable `tabUid`), and switch to it as the active tab.
+ */
+export function updateTab(
+	root: PaneNode,
+	leafId: PaneId,
+	tabIdx: number,
+	view: PaneView
+): PaneNode {
+	return mapLeaves(root, (leaf) => {
+		if (leaf.id !== leafId) return leaf;
+		if (tabIdx < 0 || tabIdx >= leaf.tabs.length) return leaf;
+		const current = leaf.tabs[tabIdx];
+		const next: PaneView = current?.pinned ? { ...view, pinned: true } : view;
+		carryTabUid(current, next);
+		const tabs = leaf.tabs.map((t, i) => (i === tabIdx ? next : t));
+		return { ...leaf, tabs, activeTabIdx: tabIdx };
+	});
+}
+
 export function setTabPinned(
 	root: PaneNode,
 	leafId: PaneId,

@@ -4,6 +4,7 @@ import {
 	hasBalancedParens,
 	looksLikePath,
 	normalizePath,
+	resolveExistingEntity,
 	resolveExistingPath,
 	resolvePath,
 	resolvePathCandidates,
@@ -73,6 +74,42 @@ describe('resolveExistingPath', () => {
 			throw new Error('EACCES');
 		};
 		expect(await resolveExistingPath('src/index.ts', '/repo', boom)).toBeNull();
+	});
+});
+
+describe('resolveExistingEntity (WP-07 / T-02 / T-03)', () => {
+	const mockFs = new Map<string, 'file' | 'dir'>([
+		['/repo/src/index.ts', 'file'],
+		['/repo/src/terminal', 'dir'],
+		['/repo/dist', 'dir'],
+		['/repo/test.txt', 'file'],
+	]);
+
+	const checkEntity = async (p: string) => mockFs.get(p) ?? null;
+
+	it('resolves a file entity with kind file', async () => {
+		const res = await resolveExistingEntity('src/index.ts', '/repo', checkEntity);
+		expect(res).toEqual({ path: '/repo/src/index.ts', kind: 'file' });
+	});
+
+	it('resolves a directory entity with kind dir', async () => {
+		const res = await resolveExistingEntity('src/terminal', '/repo', checkEntity);
+		expect(res).toEqual({ path: '/repo/src/terminal', kind: 'dir' });
+	});
+
+	it('resolves directory paths with trailing slash', async () => {
+		const res = await resolveExistingEntity('dist/', '/repo', checkEntity);
+		expect(res).toEqual({ path: '/repo/dist', kind: 'dir' });
+	});
+
+	it('returns null for non-existent paths and prose', async () => {
+		for (const tok of ['24/7', 'and/or', 'n/a', 'km/h', 'missing/dir']) {
+			expect(await resolveExistingEntity(tok, '/repo', checkEntity)).toBeNull();
+		}
+	});
+
+	it('returns null when no checkEntity function is provided', async () => {
+		expect(await resolveExistingEntity('src/index.ts', '/repo')).toBeNull();
 	});
 });
 

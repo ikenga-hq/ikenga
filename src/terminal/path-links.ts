@@ -29,8 +29,15 @@
 
 import type { IDisposable, ILink, Terminal } from '@xterm/xterm';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { hasBalancedParens, looksLikePath, resolveExistingPath } from '@/lib/paths/file-paths';
-import { fsExists } from '@/lib/tauri-cmd';
+import { useShellStore } from '@/lib/shell/shell-store';
+import {
+	hasBalancedParens,
+	looksLikePath,
+	resolveExistingEntity,
+	type PathKind,
+	type ResolvedEntity,
+} from '@/lib/paths/file-paths';
+import { fsExists, fsKind } from '@/lib/tauri-cmd';
 
 export interface PathSpan {
 	/** 1-based start column (inclusive). */
@@ -85,7 +92,8 @@ export function scanLineForPaths(line: string): PathSpan[] {
 		let colNum: number | undefined;
 
 		// 1. Trim paren line/col suffix e.g. `foo.ts(42,7)` or `foo.ts(42)`
-		const parenMatch = tok.match(/\((\d+)(?:,\s*(\d+))?\)$/);
+		// tolerating optional trailing sentence/compiler punctuation like `foo.ts(42,7):`
+		const parenMatch = tok.match(/\((\d+)(?:,\s*(\d+))?\)[)\]>'"`.,;:]*$/);
 		if (parenMatch && looksLikePath(tok.slice(0, tok.length - parenMatch[0].length))) {
 			const cut = parenMatch[0].length;
 			lineNum = parseInt(parenMatch[1], 10);
@@ -94,9 +102,9 @@ export function scanLineForPaths(line: string): PathSpan[] {
 			end -= cut;
 		}
 
-		// 2. Trim a trailing `:line` / `:line:col` suffix (grep -n, stack traces)
-		// if doing so leaves a real path.
-		const colon = tok.match(/:(\d+)(?::(\d+))?$/);
+		// 2. Trim a trailing `:line` / `:line:col` suffix (grep -n, stack traces, compiler output)
+		// if doing so leaves a real path. Tolerates trailing colon / punctuation like `src/main.rs:42:15:`
+		const colon = tok.match(/:(\d+)(?::(\d+))?[:.,;)]*$/);
 		if (colon && looksLikePath(tok.slice(0, tok.length - colon[0].length))) {
 			const cut = colon[0].length;
 			lineNum = parseInt(colon[1], 10);
@@ -135,29 +143,45 @@ export function scanLineForPaths(line: string): PathSpan[] {
 	return out;
 }
 
+export async function checkFsEntity(path: string): Promise<PathKind | null> {
+	try {
+		const kind = await fsKind(path);
+		if (kind === 'file' || kind === 'dir') return kind;
+	} catch {}
+	// Fall back to fsExists for environments / mocks where only fsExists is defined
+	try {
+		const exists = await fsExists(path);
+		if (exists) return 'file';
+	} catch {}
+	return null;
+}
+
 // Memoize existence checks so re-hovering a line doesn't refire IPC per token.
 // Bounded to 500 entries to prevent unbounded growth over long sessions.
-// Keyed by (cwd, rawPath). Mirrors the cache in components/markdown.tsx.
+// Keyed by (cwd, rawPath).
 const MAX_EXISTS_CACHE_SIZE = 500;
-const existsCache = new Map<string, Promise<string | null>>();
+const entityCache = new Map<string, Promise<ResolvedEntity | null>>();
 
-function resolveExistingCached(rawPath: string, cwd: string | undefined): Promise<string | null> {
+function resolveExistingEntityCached(
+	rawPath: string,
+	cwd: string | undefined
+): Promise<ResolvedEntity | null> {
 	const key = `${cwd ?? ''}|${rawPath}`;
-	let cached = existsCache.get(key);
+	let cached = entityCache.get(key);
 	if (!cached) {
-		if (existsCache.size >= MAX_EXISTS_CACHE_SIZE) {
-			const oldestKey = existsCache.keys().next().value;
-			if (oldestKey !== undefined) existsCache.delete(oldestKey);
+		if (entityCache.size >= MAX_EXISTS_CACHE_SIZE) {
+			const oldestKey = entityCache.keys().next().value;
+			if (oldestKey !== undefined) entityCache.delete(oldestKey);
 		}
-		cached = resolveExistingPath(rawPath, cwd, fsExists);
-		existsCache.set(key, cached);
+		cached = resolveExistingEntity(rawPath, cwd, checkFsEntity);
+		entityCache.set(key, cached);
 	}
 	return cached;
 }
 
 /** Test seam — drops memoized existence results. */
 export function __clearPathLinkCache(): void {
-	existsCache.clear();
+	entityCache.clear();
 }
 
 /**
@@ -267,13 +291,13 @@ export function registerPathLinks(
 			const rawCwd = typeof cwd === 'function' ? cwd() : cwd;
 			Promise.resolve(rawCwd)
 				.then((effectiveCwd) =>
-					Promise.all(spans.map((span) => resolveExistingCached(span.text, effectiveCwd)))
+					Promise.all(spans.map((span) => resolveExistingEntityCached(span.text, effectiveCwd)))
 				)
 				.then((resolved) => {
 					const links: ILink[] = [];
 					spans.forEach((span, idx) => {
-						const path = resolved[idx];
-						if (!path) return; // not on disk — prose, not a path
+						const entity = resolved[idx];
+						if (!entity) return; // not on disk — prose, not a path
 						links.push({
 							text: span.text,
 							// May span rows when the path wraps — that is the point.
@@ -283,13 +307,20 @@ export function registerPathLinks(
 							},
 							decorations: { pointerCursor: true, underline: true },
 							activate: () => {
-								const store = usePaneStore.getState();
-								store.addTabBackground(store.focusedId, {
-									kind: 'artifact',
-									path,
-									line: span.line,
-									col: span.col,
-								});
+								if (entity.kind === 'dir') {
+									// Focus the workspace tree on this directory (WP-07 / T-03)
+									useShellStore.getState().setActiveMode('files');
+									usePaneStore.getState().revealPath?.(entity.path);
+								} else {
+									// Open file in artifact viewer/editor at line/col (WP-05 / T-04)
+									const store = usePaneStore.getState();
+									store.addTab(store.focusedId, {
+										kind: 'artifact',
+										path: entity.path,
+										line: span.line,
+										col: span.col,
+									});
+								}
 							},
 						});
 					});

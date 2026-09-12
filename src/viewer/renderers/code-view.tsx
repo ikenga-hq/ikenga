@@ -63,6 +63,15 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 
 	useEffect(() => {
 		if (state.kind !== 'ready' || !line || !containerRef.current) return;
+
+		// Clear previous line highlights and cursor carets
+		const prevLines = containerRef.current.querySelectorAll('.line');
+		prevLines.forEach((l) => {
+			(l as HTMLElement).style.backgroundColor = '';
+		});
+		const prevCarets = containerRef.current.querySelectorAll('.code-cursor-caret');
+		prevCarets.forEach((el) => el.remove());
+
 		const lines = containerRef.current.querySelectorAll('.line');
 		const target = lines[line - 1] as HTMLElement | undefined;
 		if (target) {
@@ -71,6 +80,54 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 			target.style.borderRadius = '2px';
 			target.style.display = 'inline-block';
 			target.style.width = '100%';
+
+			if (col && col > 0) {
+				// Locate character position at 1-based column `col` (T-04)
+				let curCol = 1;
+				let foundNode: Node | null = null;
+				let foundOffset = 0;
+				const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+				let n = walker.nextNode();
+				while (n) {
+					const len = n.nodeValue?.length ?? 0;
+					if (curCol + len >= col) {
+						foundNode = n;
+						foundOffset = Math.max(0, Math.min(col - curCol, len));
+						break;
+					}
+					curCol += len;
+					n = walker.nextNode();
+				}
+
+				if (foundNode) {
+					try {
+						const range = document.createRange();
+						range.setStart(foundNode, foundOffset);
+						range.collapse(true);
+						const sel = window.getSelection();
+						if (sel) {
+							sel.removeAllRanges();
+							sel.addRange(range);
+						}
+					} catch {}
+
+					try {
+						const caret = document.createElement('span');
+						caret.className =
+							'code-cursor-caret inline-block w-[2px] h-[1.15em] bg-primary animate-pulse align-middle -ml-[1px] relative z-10';
+						caret.setAttribute('data-col', String(col));
+						const textNode = foundNode as Text;
+						if (foundOffset === 0) {
+							textNode.parentNode?.insertBefore(caret, textNode);
+						} else if (foundOffset >= textNode.length) {
+							textNode.parentNode?.insertBefore(caret, textNode.nextSibling);
+						} else {
+							const after = textNode.splitText(foundOffset);
+							textNode.parentNode?.insertBefore(caret, after);
+						}
+					} catch {}
+				}
+			}
 		} else {
 			const approxLineHeight = 18;
 			containerRef.current.scrollTop = Math.max(0, (line - 5) * approxLineHeight);
@@ -87,7 +144,7 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 	if (state.kind === 'error') {
 		// Shiki throws if the language grammar is missing. Fall back to a plain
 		// <pre> render so the user still sees the file.
-		return <FallbackPre path={path} message={state.message} line={line} />;
+		return <FallbackPre path={path} message={state.message} line={line} col={col} />;
 	}
 	return (
 		<div
@@ -100,7 +157,12 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 	);
 }
 
-function FallbackPre({ path, message, line }: { path: string; message: string; line?: number }) {
+function FallbackPre({
+	path,
+	message,
+	line,
+	col: _col,
+}: { path: string; message: string; line?: number; col?: number }) {
 	const [text, setText] = useState<string | null>(null);
 	const preRef = useRef<HTMLPreElement | null>(null);
 	useEffect(() => {

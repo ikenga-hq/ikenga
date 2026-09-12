@@ -14,6 +14,8 @@ interface MarkdownViewProps {
 	/** When true, show the Edit toggle + split source/preview editor. Defaults
 	 *  to false so thumbnails and read-only embeds are unaffected. */
 	editable?: boolean;
+	line?: number;
+	col?: number;
 }
 
 type LoadState =
@@ -24,7 +26,7 @@ type LoadState =
 const decode = (bytes: number[] | Uint8Array) =>
 	new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes));
 
-export function MarkdownView({ path, editable = false }: MarkdownViewProps) {
+export function MarkdownView({ path, editable = false, line, col }: MarkdownViewProps) {
 	const [state, setState] = useState<LoadState>({ kind: 'loading' });
 	// `body` is the last-known on-disk content; `draft` is the editor buffer.
 	// They diverge while editing and re-converge on a successful save.
@@ -86,6 +88,24 @@ export function MarkdownView({ path, editable = false }: MarkdownViewProps) {
 			setSaveState({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
 		}
 	}, [state.kind, draft, path]);
+
+	// Cursor jump & scroll for CodeMirror 6 editor (WP-05 / T-04)
+	useEffect(() => {
+		if (!line) return;
+		const v = editorRef.current?.view();
+		if (!v) return;
+		try {
+			const docLines = v.state.doc.lines;
+			const targetLine = Math.min(Math.max(1, line), docLines);
+			const docLine = v.state.doc.line(targetLine);
+			const targetCol = Math.max(1, col ?? 1);
+			const pos = Math.min(docLine.from + targetCol - 1, docLine.to);
+			v.dispatch({
+				selection: { anchor: pos },
+				scrollIntoView: true,
+			});
+		} catch {}
+	}, [line, col, mode, state.kind]);
 
 	// ── Editor actions (operate on the live CodeMirror view) ─────────────────
 	const withView = useCallback(
