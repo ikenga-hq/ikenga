@@ -16,7 +16,7 @@ import type { AgentWrapOpts } from './claude-wrap';
 import { loadClaudeSettingsPath } from './claude-settings';
 import { Pty } from './pty-bridge';
 import { attachCapture } from './pty-output-buffer';
-import { getPty, registerPty } from './pty-registry';
+import { acquirePty, disposePty, getPty } from './pty-registry';
 import { buildSpawnOpts } from './spawn-opts';
 
 const STORAGE_KEY = 'terminal.tabs';
@@ -297,27 +297,49 @@ async function readResumeSetting(): Promise<boolean> {
 	}
 }
 
-async function respawnTab(tab: TerminalTab): Promise<void> {
-	// Another render or a concurrent rehydrate may have already spawned this PTY.
-	if (tab.ptyId || getPty(tab.id)) return;
-
-	// Prime the per-terminal `--settings` path so claude terminals wire their
-	// hooks to the live bridge. Failure is non-fatal: the session falls back
-	// to running without live telemetry.
-	await loadClaudeSettingsPath().catch(() => {});
-
-	const spawnOpts = buildSpawnOpts(tab, tab.id);
-	try {
-		const pty = await Pty.spawn(spawnOpts);
-		if (tab.ptyId || getPty(tab.id)) {
-			// Lost the race — another component spawned while we waited.
-			await pty.dispose().catch(() => {});
-			return;
+/**
+ * The one way to get a tab's PTY: attaches when the tab carries a `ptyId`,
+ * otherwise spawns. Single-flight per tab id (see `acquirePty`), so the
+ * rehydrate auto-resume and any number of SingleTerminal mounts/re-renders
+ * share one PTY instead of each opening their own.
+ */
+export function openTabPty(tab: TerminalTab): Promise<Pty> {
+	const attachId = tab.ptyId;
+	return acquirePty(
+		tab.id,
+		async () => {
+			if (attachId) return Pty.attach(attachId, tab.title);
+			// Prime the per-terminal `--settings` path so claude terminals wire
+			// their hooks to the live bridge. Failure is non-fatal: the session
+			// falls back to running without live telemetry.
+			await loadClaudeSettingsPath().catch(() => {});
+			return Pty.spawn(buildSpawnOpts(tab, tab.id));
+		},
+		(pty) => {
+			const store = useTerminalStore.getState();
+			pty.onExit((code) => {
+				// Drop the dead PTY from the registry so a click-to-respawn finds
+				// a clean slate, and forget its resume id.
+				disposePty(tab.id);
+				const s = useTerminalStore.getState();
+				s.setPtyId(tab.id, null);
+				s.setClaudeSessionId(tab.id, null);
+				if (pty.sessionLost) s.setStatus(tab.id, 'error');
+				else s.setStatus(tab.id, 'exited', code);
+			});
+			// Tee PTY bytes into a per-session ring buffer so iyke can read the
+			// visible/scrollback content without screenshotting xterm's canvas.
+			attachCapture(tab.id, pty);
+			store.setPtyId(tab.id, pty.id, pty.mode);
+			store.setStatus(tab.id, 'running');
 		}
-		registerPty(tab.id, pty);
-		attachCapture(tab.id, pty);
-		useTerminalStore.getState().setPtyId(tab.id, pty.id);
-		useTerminalStore.getState().setStatus(tab.id, 'running');
+	);
+}
+
+async function respawnTab(tab: TerminalTab): Promise<void> {
+	if (tab.ptyId || getPty(tab.id)) return;
+	try {
+		await openTabPty(tab);
 	} catch (err) {
 		console.error('[session-store] auto-respawn failed for', tab.id, err);
 		useTerminalStore.getState().setStatus(tab.id, 'error');
@@ -391,9 +413,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 
 		setPtyId: (id, ptyId, mode) => {
 			set((s) => ({
-				tabs: s.tabs.map((t) =>
-					t.id === id ? { ...t, ptyId, ...(mode ? { mode } : {}) } : t
-				),
+				tabs: s.tabs.map((t) => (t.id === id ? { ...t, ptyId, ...(mode ? { mode } : {}) } : t)),
 			}));
 			persistDebounced();
 		},

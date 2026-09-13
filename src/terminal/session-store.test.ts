@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
-import { stripSecretEnv, useTerminalStore } from './session-store';
+import { ptySpawn, ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
+import { openTabPty, stripSecretEnv, useTerminalStore } from './session-store';
 
 // The store loads the SQL shim lazily on persist; mocking it
 // keeps the tests offline. Failure to load falls back to localStorage
@@ -218,6 +218,31 @@ describe('rehydrateFromDb & auto-resume', () => {
 
 		const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
 		expect(tab?.ptyId).toBe('pty-test');
+	});
+
+	it('opens one PTY when auto-resume races the tab mounting', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(settingsGet).mockResolvedValueOnce('true');
+		vi.mocked(ptySpawn).mockClear();
+
+		// Kicks off respawnTab in the background.
+		await useTerminalStore.getState().rehydrateFromDb();
+		const restored = useTerminalStore.getState().tabs.find((t) => t.id === id);
+		if (!restored) throw new Error('tab not restored');
+
+		// What SingleTerminal does on mount — and again on every re-render that
+		// replaces the tab object — while the resume spawn is still in flight.
+		const [a, b] = await Promise.all([openTabPty(restored), openTabPty(restored)]);
+		await vi.waitFor(() => {
+			expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('running');
+		});
+
+		expect(a).toBe(b);
+		expect(ptySpawn).toHaveBeenCalledTimes(1);
 	});
 
 	it('does not auto-respawn when resume setting is off', async () => {

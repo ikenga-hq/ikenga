@@ -1,14 +1,12 @@
 import { listen } from '@/lib/transport';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { defaultShellArgv } from '@/lib/platform';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
 import { buildClaudeWrappedCmd, type AgentWrapOpts } from './claude-wrap';
-import { buildSpawnOpts } from './spawn-opts';
 import { type HookEventPayload } from './tool-call-feed';
-import { Pty } from './pty-bridge';
-import { attachCapture } from './pty-output-buffer';
-import { disposePty, getPty, registerPty } from './pty-registry';
-import { makeTerminalId, useTerminalStore, type TerminalTab } from './session-store';
+import type { Pty } from './pty-bridge';
+import { getPty } from './pty-registry';
+import { makeTerminalId, openTabPty, useTerminalStore, type TerminalTab } from './session-store';
 import { XTermHost } from './xterm-host';
 
 interface SingleTerminalProps {
@@ -43,84 +41,47 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 
 	const [pty, setPty] = useState<Pty | null>(() => getPty(sessionId) ?? null);
 	const [sessionLost, setSessionLost] = useState(false);
-	const startedRef = useRef(false);
 
-	// Spawn / attach lifecycle. Idempotent across remounts via the registry +
-	// startedRef guard. Three cases:
+	// Spawn / attach lifecycle. Three cases:
 	//
 	// 1. `tab.ptyId` set, no local pty — the PTY survived a refresh or was
 	//    restored from DB. Attach to the live PTY.
 	// 2. `tab.status === 'spawning'` — spawn a new PTY, rebuilding the claude
 	//    argv with `--resume <claudeSessionId>` if we have one.
 	// 3. Otherwise (exited/error) — render the placeholder / restart button.
+	//
+	// `openTabPty` is single-flight per tab and owns registration + exit
+	// wiring, so this effect re-running (it depends on `tab`, which every
+	// store write replaces) or racing the rehydrate auto-resume just joins the
+	// same open. A cancelled run only skips `setPty`; it must NOT dispose the
+	// PTY — the registry owns it, and the next run picks it up.
 	useEffect(() => {
-		if (!tab) return;
-		if (startedRef.current) return;
-		if (pty) return;
-
+		if (!tab || pty) return;
 		const shouldAttach = Boolean(tab.ptyId);
-		const shouldSpawn = tab.status === 'spawning';
-		if (!shouldAttach && !shouldSpawn) return;
+		if (!shouldAttach && tab.status !== 'spawning') return;
 
-		startedRef.current = true;
 		let cancelled = false;
-
-		(async () => {
-			try {
-				let p: Pty;
-				if (shouldAttach && tab.ptyId) {
-					p = await Pty.attach(tab.ptyId, tab.title);
-				} else {
-					const spawnOpts = buildSpawnOpts(tab, sessionId);
-					p = await Pty.spawn(spawnOpts);
-				}
-
-				if (cancelled) {
-					await p.dispose().catch(() => {});
-					return;
-				}
-
-				p.onExit((code) => {
-					// Drop the dead PTY from the registry so a click-to-respawn finds
-					// a clean slate, and forget its resume id.
-					disposePty(sessionId);
-					setPtyId(sessionId, null);
-					setClaudeSessionId(sessionId, null);
-					if (p.sessionLost) {
-						setSessionLost(true);
-						setStatus(sessionId, 'error');
-					} else {
-						setStatus(sessionId, 'exited', code);
-					}
-				});
-				registerPty(sessionId, p);
-				// Tee PTY bytes into a per-session ring buffer so iyke can read
-				// the visible/scrollback content without screenshotting xterm's
-				// canvas. Lifetime is tied to the PTY via the registry's dispose.
-				attachCapture(sessionId, p);
-				setPty(p);
-				setPtyId(sessionId, p.id, p.mode);
-				setStatus(sessionId, 'running');
-			} catch (err) {
+		openTabPty(tab)
+			.then((p) => {
+				if (!cancelled) setPty(p);
+			})
+			.catch((err) => {
+				if (cancelled) return;
 				console.error('[single-terminal] spawn/attach failed', err);
 				setPtyId(sessionId, null);
-				if (shouldAttach) {
-					setSessionLost(true);
-				}
+				if (shouldAttach) setSessionLost(true);
 				setStatus(sessionId, 'error');
-			}
-		})();
+			});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [tab, pty, sessionId, setPtyId, setStatus, setClaudeSessionId]);
+	}, [tab, pty, sessionId, setPtyId, setStatus]);
 
-	// Allow respawn — when status flips back to 'spawning' (manual respawn),
-	// reset the spawn guard so the effect above takes another shot.
+	// Manual respawn — when status flips back to 'spawning', clear the
+	// lost-session flag and any exited PTY so the effect above opens a new one.
 	useEffect(() => {
 		if (tab?.status === 'spawning') {
-			startedRef.current = false;
 			setSessionLost(false);
 			setPtyId(sessionId, null);
 			if (pty?.exited || !pty) setPty(getPty(sessionId) ?? null);
@@ -165,24 +126,20 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 					<div className="flex flex-col items-center gap-2 max-w-sm">
 						{isLost ? (
 							<>
-								<div className="text-sm font-semibold text-destructive">
-									Session Lost
-								</div>
+								<div className="text-sm font-semibold text-destructive">Session Lost</div>
 								<div className="text-xs text-muted-foreground">
-									The terminal session could not be reattached (the daemon may have restarted or the session was terminated).
+									The terminal session could not be reattached (the daemon may have restarted or the
+									session was terminated).
 								</div>
 							</>
 						) : tab.status === 'error' ? (
-							<div className="text-destructive">
-								Failed to spawn: {displayCmd(tab).join(' ')}
-							</div>
+							<div className="text-destructive">Failed to spawn: {displayCmd(tab).join(' ')}</div>
 						) : (
 							<div>Terminal exited (code={tab.exitCode ?? '?'}).</div>
 						)}
 						<button
 							type="button"
 							onClick={() => {
-								startedRef.current = false;
 								setSessionLost(false);
 								setPtyId(sessionId, null);
 								setClaudeSessionId(sessionId, null);
