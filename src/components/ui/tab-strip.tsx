@@ -9,6 +9,7 @@ import {
 import { Pin, PinOff, X } from 'lucide-react';
 
 import { cn } from '@/components/ui/utils';
+import type { DropTargetProps } from '@/lib/panes/pointer-drag';
 
 // Unified tab rail. The pane strip, the expanded dock strip, and the studio
 // right-rail all render through `TabStrip` + `Tab`; the collapsed dock uses
@@ -27,6 +28,9 @@ import { cn } from '@/components/ui/utils';
 // Per-call-site look (padding, min-width, glyph, inline tint) stays at the call
 // site — the structure + a11y + keyboard, which is where they had drifted, is
 // what consolidates here.
+//
+// Dragging is pointer-event based (`lib/panes/pointer-drag.ts`), not HTML5
+// DnD: tabs expose `onDragPointerDown` and strips accept `dropTarget` props.
 //
 // Spec: plans/shell-design-system/parts/components/tab-strip.md §3–§4
 //       + designs/tab-strip.html (the locked Dusk Wood mockup).
@@ -110,11 +114,8 @@ export interface TabStripProps {
 	className?: string;
 	/** Extra inline style merged onto the scroller (e.g. drop-hover bg). */
 	style?: React.CSSProperties;
-	/** Drag-over/drop handlers for an external (pane↔dock) drop onto the strip. */
-	dropHandlers?: Pick<
-		HTMLAttributes<HTMLDivElement>,
-		'onDragOver' | 'onDragLeave' | 'onDrop' | 'onDragEnter'
-	>;
+	/** Pointer-drag drop target for the whole strip (`useDropTarget`). */
+	dropTarget?: DropTargetProps;
 	children: ReactNode;
 }
 
@@ -128,7 +129,7 @@ export function TabStrip({
 	mixed,
 	className,
 	style,
-	dropHandlers,
+	dropTarget,
 	children,
 }: TabStripProps) {
 	const { containerRef, onKeyDown } = useRovingTablist({
@@ -172,7 +173,7 @@ export function TabStrip({
 			)}
 			style={{ scrollbarWidth: 'none', ...style }}
 			data-tabstrip-mixed={mixed ? 'true' : 'false'}
-			{...dropHandlers}
+			{...dropTarget}
 		>
 			{children}
 		</div>
@@ -199,12 +200,9 @@ export interface TabProps {
 	onTogglePin?: () => void;
 	/** Middle-click on the tab body (pane/dock close-on-middle-click). */
 	onMiddleClick?: () => void;
-	draggable?: boolean;
-	/** Drag DOM handlers (onDragStart/Over/Leave/Drop/End) for in-strip reorder. */
-	dragHandlers?: Pick<
-		HTMLAttributes<HTMLDivElement>,
-		'onDragStart' | 'onDragEnd' | 'onDragOver' | 'onDragLeave' | 'onDrop'
-	>;
+	/** Pointer-down on the tab body (not its pin/close buttons) — call
+	 *  `beginPointerDrag` here to make the tab draggable. Omit = not draggable. */
+	onDragPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
 	/** Reorder drop indicator edge. */
 	dropEdge?: 'before' | 'after' | null;
 	/** Look preset: `rail` = uppercase mono studio tabs. */
@@ -241,8 +239,7 @@ export const Tab = forwardRef<HTMLDivElement, TabProps & HTMLAttributes<HTMLDivE
 			onClose,
 			onTogglePin,
 			onMiddleClick,
-			draggable = false,
-			dragHandlers,
+			onDragPointerDown,
 			dropEdge,
 			variant = 'default',
 			className,
@@ -265,9 +262,17 @@ export const Tab = forwardRef<HTMLDivElement, TabProps & HTMLAttributes<HTMLDivE
 				data-tab-index={index}
 				data-ws={ws}
 				data-active={active ? 'true' : 'false'}
-				draggable={draggable}
 				title={title}
 				onClick={onActivate}
+				onPointerDown={(e) => {
+					// Compose, don't replace: Radix's trigger listens here too.
+					rest.onPointerDown?.(e);
+					if (!onDragPointerDown || e.defaultPrevented) return;
+					// The pin/close buttons are clicks, never drag handles.
+					const nested = (e.target as Element).closest('button');
+					if (nested && e.currentTarget.contains(nested)) return;
+					onDragPointerDown(e);
+				}}
 				onAuxClick={(e) => {
 					if (e.button === 1 && onMiddleClick) {
 						e.preventDefault();
@@ -286,7 +291,6 @@ export const Tab = forwardRef<HTMLDivElement, TabProps & HTMLAttributes<HTMLDivE
 						onTogglePin();
 					}
 				}}
-				{...dragHandlers}
 				className={cn(
 					'group relative flex shrink-0 cursor-default select-none items-center gap-2',
 					'outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
@@ -354,23 +358,14 @@ export interface TabRailProps {
 	count: number;
 	onSwitch: (idx: number) => void;
 	className?: string;
-	dropHandlers?: Pick<
-		HTMLAttributes<HTMLDivElement>,
-		'onDragOver' | 'onDragLeave' | 'onDrop' | 'onDragEnter'
-	>;
+	/** Pointer-drag drop target for the whole rail (`useDropTarget`). */
+	dropTarget?: DropTargetProps;
 	children: ReactNode;
 }
 
 /** Vertical icon rail for the collapsed dock. Shares the roving keyboard model
  *  (↑/↓ switch); tabs are `RailTab`s (icon-only, right-edge active marker). */
-export function TabRail({
-	label,
-	count,
-	onSwitch,
-	className,
-	dropHandlers,
-	children,
-}: TabRailProps) {
+export function TabRail({ label, count, onSwitch, className, dropTarget, children }: TabRailProps) {
 	const { containerRef, onKeyDown } = useRovingTablist({
 		orientation: 'vertical',
 		count,
@@ -384,7 +379,7 @@ export function TabRail({
 			aria-label={label}
 			onKeyDown={onKeyDown}
 			className={cn('flex flex-col items-center gap-1', className)}
-			{...dropHandlers}
+			{...dropTarget}
 		>
 			{children}
 		</div>
@@ -398,8 +393,9 @@ export interface RailTabProps {
 	glyph: ReactNode;
 	ws?: string;
 	onActivate: () => void;
-	draggable?: boolean;
-	dragHandlers?: Pick<HTMLAttributes<HTMLButtonElement>, 'onDragStart' | 'onDragEnd'>;
+	/** Pointer-down on the rail tab — call `beginPointerDrag` to make it
+	 *  draggable. Omit = not draggable. */
+	onDragPointerDown?: (e: React.PointerEvent<HTMLButtonElement>) => void;
 }
 
 /** A single collapsed-dock rail tab (icon button + workspace-tinted edge marker). */
@@ -410,8 +406,7 @@ export function RailTab({
 	glyph,
 	ws,
 	onActivate,
-	draggable = false,
-	dragHandlers,
+	onDragPointerDown,
 }: RailTabProps) {
 	return (
 		<button
@@ -422,9 +417,8 @@ export function RailTab({
 			title={label}
 			tabIndex={active ? 0 : -1}
 			data-tab-index={index}
-			draggable={draggable}
 			onClick={onActivate}
-			{...dragHandlers}
+			onPointerDown={onDragPointerDown}
 			className={cn(
 				'relative grid size-7 place-items-center rounded-sm transition-colors hover:bg-card',
 				'outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',

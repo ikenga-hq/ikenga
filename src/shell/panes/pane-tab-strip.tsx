@@ -5,6 +5,7 @@ import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { useDragState } from '@/lib/panes/drag-state';
+import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { TabStrip, Tab } from '@/components/ui/tab-strip';
 import {
 	ContextMenu,
@@ -69,6 +70,59 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	// means the drop will insert *before* tab idx; `'after'` means after.
 	const [dropAt, setDropAt] = useState<{ idx: number; side: 'before' | 'after' } | null>(null);
 
+	// The slot under client `x`: which tab, and which half of it. Past the last
+	// tab (empty strip space) counts as after the last one.
+	function slotAt(stripEl: Element, x: number): { idx: number; side: 'before' | 'after' } | null {
+		const tabEls = Array.from(
+			stripEl.querySelectorAll<HTMLElement>('[role="tab"][data-tab-index]')
+		);
+		if (tabEls.length === 0) return null;
+		for (const el of tabEls) {
+			const r = el.getBoundingClientRect();
+			if (x < r.left && el === tabEls[0])
+				return { idx: Number(el.dataset.tabIndex), side: 'before' };
+			if (x >= r.left && x <= r.right) {
+				return {
+					idx: Number(el.dataset.tabIndex),
+					side: x < r.left + r.width / 2 ? 'before' : 'after',
+				};
+			}
+		}
+		return { idx: Number(tabEls[tabEls.length - 1].dataset.tabIndex), side: 'after' };
+	}
+
+	// In-strip reorder: one pointer-drag target for the whole strip. Only this
+	// pane's own tabs reorder here; moves between panes go through the body
+	// drop zones.
+	const stripDrop = useDropTarget({
+		accepts: () => {
+			const d = useDragState.getState();
+			return d.active && d.source === 'pane' && d.srcLeafId === leaf.id;
+		},
+		onOver: (x, _y, el) => {
+			const slot = slotAt(el, x);
+			if (!slot || slot.idx === useDragState.getState().srcTabIdx) {
+				setDropAt(null);
+				return;
+			}
+			setDropAt((prev) => (prev && prev.idx === slot.idx && prev.side === slot.side ? prev : slot));
+		},
+		onLeave: () => setDropAt(null),
+		onDrop: (x, _y, el) => {
+			setDropAt(null);
+			const d = useDragState.getState();
+			const from = d.srcTabIdx;
+			const slot = slotAt(el, x);
+			if (slot && from != null && slot.idx !== from) {
+				// Destination index in the *current* tabs array.
+				let to = slot.side === 'before' ? slot.idx : slot.idx + 1;
+				if (from < to) to -= 1;
+				if (to !== from) reorderTab(leaf.id, from, to);
+			}
+			d.end();
+		},
+	});
+
 	// Per `<workspace>/design/shell/concepts/_shared/shell.css` §"Workspace tint on tabs":
 	// single-workspace strips suppress inactive hairlines (the pane focus accent
 	// already announces the workspace). Mixed strips opt in to the per-tab tint
@@ -104,6 +158,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 				onSwitch={activate}
 				onReorder={(from, to) => reorderTab(leaf.id, from, to)}
 				mixed={isMixedWorkspace}
+				dropTarget={stripDrop}
 			>
 				{leaf.tabs.map((tab, idx) => {
 					const isActive = idx === leaf.activeTabIdx;
@@ -130,7 +185,6 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 									onClose={() => closeTab(leaf.id, idx)}
 									onTogglePin={() => toggleTabPinned(leaf.id, idx)}
 									onMiddleClick={!isPinned ? () => closeTab(leaf.id, idx) : undefined}
-									draggable={!isPinned}
 									dropEdge={dropAt?.idx === idx ? dropAt.side : null}
 									className={cn(
 										'border-r border-border',
@@ -138,59 +192,19 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 											? 'min-w-[32px] max-w-[140px] px-2'
 											: 'min-w-[120px] max-w-[180px] px-3'
 									)}
-									dragHandlers={{
-										onDragStart: (e) => {
-											if (isPinned) {
-												e.preventDefault();
-												return;
-											}
-											e.dataTransfer.effectAllowed = 'move';
-											// Some browsers cancel the drag unless dataTransfer carries
-											// data — the real payload lives in useDragState.
-											e.dataTransfer.setData('application/x-pane-tab', `${leaf.id}:${idx}`);
-											useDragState.getState().startPane(leaf.id, idx);
-										},
-										onDragEnd: () => {
-											useDragState.getState().end();
-											setDropAt(null);
-										},
-										onDragOver: (e) => {
-											const drag = useDragState.getState();
-											if (drag.source !== 'pane' || drag.srcLeafId !== leaf.id) return;
-											if (drag.srcTabIdx === idx) return;
-											e.preventDefault();
-											e.dataTransfer.dropEffect = 'move';
-											const rect = e.currentTarget.getBoundingClientRect();
-											const side = e.clientX < rect.left + rect.width / 2 ? 'before' : 'after';
-											setDropAt((prev) =>
-												prev && prev.idx === idx && prev.side === side ? prev : { idx, side }
-											);
-										},
-										onDragLeave: (e) => {
-											// Only clear when leaving the tab entirely, not on child enter.
-											if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-											setDropAt((prev) => (prev?.idx === idx ? null : prev));
-										},
-										onDrop: (e) => {
-											const drag = useDragState.getState();
-											if (drag.source !== 'pane' || drag.srcLeafId !== leaf.id) return;
-											if (drag.srcTabIdx === null || drag.srcTabIdx === idx) {
-												setDropAt(null);
-												return;
-											}
-											e.preventDefault();
-											e.stopPropagation();
-											const rect = e.currentTarget.getBoundingClientRect();
-											const side = e.clientX < rect.left + rect.width / 2 ? 'before' : 'after';
-											const from = drag.srcTabIdx;
-											// Compute destination index in the *current* tabs array.
-											let to = side === 'before' ? idx : idx + 1;
-											if (from < to) to -= 1;
-											reorderTab(leaf.id, from, to);
-											setDropAt(null);
-											drag.end();
-										},
-									}}
+									onDragPointerDown={
+										isPinned
+											? undefined
+											: (e) =>
+													beginPointerDrag(e, {
+														label,
+														onStart: () => useDragState.getState().startPane(leaf.id, idx),
+														onEnd: () => {
+															useDragState.getState().end();
+															setDropAt(null);
+														},
+													})
+									}
 								/>
 							</ContextMenuTrigger>
 							<ContextMenuContent>
@@ -215,7 +229,9 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 								{(tab.kind === 'artifact' || tab.kind === 'route') && (
 									<>
 										<ContextMenuSeparator />
-										<ContextMenuItem onSelect={() => void writeClipboardText(tab.path).catch(() => {})}>
+										<ContextMenuItem
+											onSelect={() => void writeClipboardText(tab.path).catch(() => {})}
+										>
 											Copy path
 										</ContextMenuItem>
 									</>

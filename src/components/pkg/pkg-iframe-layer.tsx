@@ -24,8 +24,9 @@
 //     make WebKitGTK reload `about:srcdoc` (the Tauri #12767 class of bug),
 //     which would defeat the entire keep-alive.
 //   • During an active tab drag every pooled iframe is hidden the same way, so
-//     the pane's own HTML5 drop zones (z-20, in-pane) receive the drag/drop and
-//     their hover indicator is visible — no z-index fight with a fixed element.
+//     the pointer-drag hit-test reaches the pane's own drop zones (z-20,
+//     in-pane) and their hover indicator is visible — no z-index fight with a
+//     fixed element.
 
 import { useEffect } from 'react';
 
@@ -67,8 +68,9 @@ function PooledIframe({ surface, hidden }: { surface: PoolSurface; hidden: boole
 
 export function PkgIframeLayer() {
 	const surfaces = useIframePool((s) => s.surfaces);
-	// Hide every pooled iframe while a tab drag is in flight so the pane's HTML5
-	// drop zones own the pointer/drag events.
+	// Hide every pooled iframe while a tab drag is in flight so the drag
+	// controller's hit-test (`elementsFromPoint`) reaches the pane drop zones
+	// beneath them instead of stopping at an iframe.
 	const dragActive = useDragState((s) => s.active);
 
 	// Focus routing. A pooled iframe is `position:fixed` outside the pane's DOM,

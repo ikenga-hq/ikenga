@@ -7,6 +7,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { TabStrip, Tab, TabRail, RailTab } from '@/components/ui/tab-strip';
 import { useDockStore, DOCK_MIN_WIDTH, DOCK_MAX_WIDTH } from './dock-store';
 import { useDragState } from '@/lib/panes/drag-state';
+import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { PaneBody, viewLabel, viewSubtitle } from '@/shell/panes/pane-views';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
@@ -35,41 +36,55 @@ export function Dock() {
 	const drag = useDragState();
 	const [dropHover, setDropHover] = useState(false);
 
+	// Pane → dock. One pointer-drag target shared by every dock drop surface
+	// (collapsed rail, expanded tab header, "Drop to dock" body overlay), so
+	// moving between them never flickers the hover state. Dock → dock drags
+	// aren't accepted (in-dock reordering is out of scope).
+	const dockDrop = useDropTarget({
+		accepts: () => {
+			const d = useDragState.getState();
+			return d.active && d.source === 'pane';
+		},
+		onOver: () => setDropHover(true),
+		onLeave: () => setDropHover(false),
+		onDrop: () => handleExternalDrop(),
+	});
+
 	if (dockState === 'hidden') return null;
 
 	const width = dockState === 'collapsed' ? COLLAPSED_WIDTH : `${storedWidth}px`;
 
 	// Pane → dock: detach the source tab and append it as a dock tab. We use
 	// moveTab to a sentinel pane id won't work, so instead we read the source
-	// view directly off the pane store and explicitly closeTab there. Dock →
-	// dock drops are no-ops for now (in-dock reordering is out of scope).
+	// view directly off the pane store and explicitly closeTab there.
 	function handleExternalDrop() {
 		setDropHover(false);
-		if (
-			!drag.active ||
-			drag.source !== 'pane' ||
-			drag.srcLeafId == null ||
-			drag.srcTabIdx == null
-		) {
-			drag.end();
+		const d = useDragState.getState();
+		if (!d.active || d.source !== 'pane' || d.srcLeafId == null || d.srcTabIdx == null) {
+			d.end();
 			return;
 		}
 		const paneStore = usePaneStore.getState();
-		const root = paneStore.root;
-		const srcLeaf = findLeafShallow(root, drag.srcLeafId);
-		if (!srcLeaf) {
-			drag.end();
-			return;
-		}
-		const view = srcLeaf.tabs[drag.srcTabIdx];
+		const srcLeaf = findLeafShallow(paneStore.root, d.srcLeafId);
+		const view = srcLeaf?.tabs[d.srcTabIdx];
 		if (!view) {
-			drag.end();
+			d.end();
 			return;
 		}
 		// Append into dock first, then close from source pane.
 		appendView(view);
-		paneStore.closeTab(drag.srcLeafId, drag.srcTabIdx);
-		drag.end();
+		paneStore.closeTab(d.srcLeafId, d.srcTabIdx);
+		d.end();
+	}
+
+	/** Drag a dock tab out (into a pane's drop zones). */
+	function dragDockTab(idx: number, label: string) {
+		return (e: React.PointerEvent<HTMLElement>) =>
+			beginPointerDrag(e, {
+				label,
+				onStart: () => useDragState.getState().startDock(idx),
+				onEnd: () => useDragState.getState().end(),
+			});
 	}
 
 	if (dockState === 'collapsed') {
@@ -82,13 +97,7 @@ export function Dock() {
 					background: 'var(--bg-base)',
 					borderColor: 'var(--border-soft)',
 				}}
-				onDragOver={(e) => {
-					if (drag.active) {
-						e.preventDefault();
-						e.dataTransfer.dropEffect = 'move';
-					}
-				}}
-				onDrop={handleExternalDrop}
+				{...dockDrop}
 			>
 				<TabRail
 					label="Dock tabs"
@@ -101,31 +110,20 @@ export function Dock() {
 						const ws = viewWorkspace(tab);
 						const isActive = idx === activeIdx;
 						const isPinned = Boolean(tab.pinned);
+						const label = viewLabel(tab, resolveTerminal);
 						return (
 							<RailTab
 								key={`${idx}-${tab.kind}`}
 								index={idx}
 								active={isActive}
 								ws={ws}
-								label={viewLabel(tab, resolveTerminal)}
+								label={label}
 								glyph={<DockTabIcon view={tab} />}
 								onActivate={() => {
 									switchTab(idx);
 									setState('expanded');
 								}}
-								draggable={!isPinned}
-								dragHandlers={{
-									onDragStart: (e) => {
-										if (isPinned) {
-											e.preventDefault();
-											return;
-										}
-										e.dataTransfer.effectAllowed = 'move';
-										e.dataTransfer.setData('application/x-dock-tab', `${idx}`);
-										useDragState.getState().startDock(idx);
-									},
-									onDragEnd: () => useDragState.getState().end(),
-								}}
+								onDragPointerDown={isPinned ? undefined : dragDockTab(idx, label)}
 							/>
 						);
 					})}
@@ -163,15 +161,7 @@ export function Dock() {
 					borderColor: 'var(--border-soft)',
 					background: 'var(--bg-sunken)',
 				}}
-				onDragOver={(e) => {
-					if (drag.active) {
-						e.preventDefault();
-						e.dataTransfer.dropEffect = 'move';
-						setDropHover(true);
-					}
-				}}
-				onDragLeave={() => setDropHover(false)}
-				onDrop={handleExternalDrop}
+				{...dockDrop}
 			>
 				<TabStrip
 					label="Dock tabs"
@@ -185,6 +175,7 @@ export function Dock() {
 						const ws = viewWorkspace(tab);
 						const isActive = idx === activeIdx;
 						const isPinned = Boolean(tab.pinned);
+						const label = viewLabel(tab, resolveTerminal);
 						return (
 							<Tab
 								key={`${idx}-${tab.kind}`}
@@ -192,11 +183,11 @@ export function Dock() {
 								active={isActive}
 								ws={ws}
 								glyph={<DockTabIcon view={tab} />}
-								label={viewLabel(tab, resolveTerminal)}
+								label={label}
 								// See pane-tab-strip: a terminal label is literal command
 								// and directory names, so it must not be title-cased.
 								labelClassName={tab.kind === 'terminal' ? undefined : 'capitalize'}
-								title={`${viewLabel(tab, resolveTerminal)}\n${viewSubtitle(tab, resolveTerminal)}`}
+								title={`${label}\n${viewSubtitle(tab, resolveTerminal)}`}
 								className="px-3"
 								pinned={isPinned}
 								closable={!isPinned}
@@ -204,19 +195,7 @@ export function Dock() {
 								onClose={() => closeTab(idx)}
 								onTogglePin={() => togglePinned(idx)}
 								onMiddleClick={!isPinned ? () => closeTab(idx) : undefined}
-								draggable={!isPinned}
-								dragHandlers={{
-									onDragStart: (e) => {
-										if (isPinned) {
-											e.preventDefault();
-											return;
-										}
-										e.dataTransfer.effectAllowed = 'move';
-										e.dataTransfer.setData('application/x-dock-tab', `${idx}`);
-										useDragState.getState().startDock(idx);
-									},
-									onDragEnd: () => useDragState.getState().end(),
-								}}
+								onDragPointerDown={isPinned ? undefined : dragDockTab(idx, label)}
 							/>
 						);
 					})}
@@ -247,17 +226,7 @@ export function Dock() {
 				)}
 				<div
 					aria-hidden="true"
-					onDragEnter={(e) => {
-						if (drag.active && drag.source === 'pane') e.preventDefault();
-					}}
-					onDragOver={(e) => {
-						if (!drag.active || drag.source !== 'pane') return;
-						e.preventDefault();
-						e.dataTransfer.dropEffect = 'move';
-						setDropHover(true);
-					}}
-					onDragLeave={() => setDropHover(false)}
-					onDrop={handleExternalDrop}
+					{...dockDrop}
 					className={cn(
 						'absolute inset-0 z-20 flex items-center justify-center border-2 border-dashed text-xs font-medium transition-colors',
 						drag.active && drag.source === 'pane'
