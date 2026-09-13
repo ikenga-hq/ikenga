@@ -274,6 +274,11 @@ pub struct Kernel {
     /// against the target set and registers/unregisters to converge.
     live: RwLock<std::collections::HashSet<String>>,
 
+    /// Serializes `reconcile_for_project`. `live` is no longer held across
+    /// registry calls (#131), so without this two concurrent reconciles could
+    /// both compute the same delta and double-resume a pkg. Poison-tolerant.
+    reconcile_lock: Mutex<()>,
+
     /// Dev-mode (2026-05-18): per-pkg file watchers spawned by
     /// `pkg_dev_register`. The handle holds the underlying notify
     /// debouncer; dropping it tears down the watcher worker. Keyed by
@@ -343,6 +348,7 @@ impl Kernel {
             app,
             db,
             live: RwLock::new(std::collections::HashSet::new()),
+            reconcile_lock: Mutex::new(()),
             dev_watchers: RwLock::new(HashMap::new()),
             health: RwLock::new(Vec::new()),
         }
@@ -1528,6 +1534,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             tokio::task::try_id().is_none(),
             "reconcile_for_project called from inside an async task — use spawn_blocking (issue #130)"
         );
+        let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
         let installed = self.list_installed();
         let want_live: std::collections::HashSet<String> = installed
             .iter()
@@ -1538,8 +1545,14 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .map(|s| s.id.clone())
             .collect();
 
-        let mut live_guard = self.live.write().unwrap_or_else(|e| e.into_inner());
-        let prev_live: std::collections::HashSet<String> = live_guard.clone();
+        let prev_live: std::collections::HashSet<String> = self
+            .live
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let mut parked_ids: Vec<String> = Vec::new();
+        let mut resumed_ids: Vec<String> = Vec::new();
 
         // Park anything live → not in target set.
         for pkg_id in prev_live
@@ -1556,7 +1569,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                     );
                 }
             }
-            live_guard.remove(&pkg_id);
+            parked_ids.push(pkg_id);
         }
 
         // Resume anything in target set → not yet live.
@@ -1596,7 +1609,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                         applied.push(reg.name());
                     }
                     if !failed {
-                        live_guard.insert(pkg_id);
+                        resumed_ids.push(pkg_id);
                     }
                 }
                 Err(e) => {
@@ -1606,6 +1619,16 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 }
             }
         }
+
+        // Commit the delta with a brief write lock (Issue #131).
+        let mut live_guard = self.live.write().unwrap_or_else(|e| e.into_inner());
+        for id in parked_ids {
+            live_guard.remove(&id);
+        }
+        for id in resumed_ids {
+            live_guard.insert(id);
+        }
+        drop(live_guard);
         Ok(())
     }
 

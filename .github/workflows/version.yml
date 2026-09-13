@@ -49,8 +49,10 @@ jobs:
           title: 'chore: version packages'
           commit: 'chore: version packages'
         env:
-          # GITHUB_TOKEN: opens/commits the "version packages" PR (changesets needs it).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN: uses WORKSPACE_DEPS_PAT if available so the version PR
+          # and branch are attributed to a collaborator rather than github-actions[bot],
+          # avoiding GitHub's action_required workflow approval gate on CI (issue #193).
+          GITHUB_TOKEN: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
           # RELEASE_PAT: used by scripts/tag-release.sh to PUSH the v* tag so it
           # triggers release.yml. A tag pushed with GITHUB_TOKEN does NOT trigger
           # workflows (GitHub anti-recursion) — see #26. Reuses the existing
