@@ -1070,10 +1070,16 @@ pub async fn post_terminal_send(
     )
     .await
     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
-    Ok(Json(serde_json::json!({
-        "ok": result.matched,
-        "error": if result.matched { Value::Null } else { Value::String("pane has no writable terminal".into()) }
-    })))
+    // A write that reached no PTY must be a hard error — returning ok:true here
+    // was the root cause of the silent-success bug in issue #78, where agents
+    // sent bytes into a pane with no active terminal tab and got "ok" back.
+    if !result.matched {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "pane has no active terminal tab".into(),
+        ));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 fn terminal_key_bytes(combo: &str) -> Option<Vec<u8>> {
