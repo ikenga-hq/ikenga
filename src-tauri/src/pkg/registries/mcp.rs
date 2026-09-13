@@ -154,12 +154,20 @@ impl Registry for McpRegistry {
                 ));
             }
             let key = Self::key_for(pkg, server);
-            let value = json!({
+            let mut value = json!({
                 "type": "stdio",
                 "command": server.command,
                 "args": server.args,
                 "env": server.env,
             });
+            if !pkg.install_path.as_os_str().is_empty() {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "cwd".to_string(),
+                        Value::String(pkg.install_path.to_string_lossy().into_owned()),
+                    );
+                }
+            }
             new_keys.push((
                 key.clone(),
                 McpEntry {
