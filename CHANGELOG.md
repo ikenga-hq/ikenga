@@ -1,5 +1,11 @@
 # ikenga-desktop
 
+## 0.10.1
+
+### Patch Changes
+
+- aa5f2bb: Fix launching Claude terminals on Windows when `claude` lives only in WSL: the `--settings` path is now translated to `/mnt/<drive>/…`, and `wsl.exe -e` stops the distro login shell from expanding the wrapper's `$__status` early.
+
 ## 0.10.0
 
 ### Minor Changes
