@@ -631,13 +631,21 @@ pub fn run() {
             // on macOS (documented limitation), but the composer's HTML5
             // file-drop keeps working.
             //
-            // Linux/Windows: the native handler intercepts only OS→webview FILE
-            // drops, not in-page element drags, so pane DnD is unaffected — and
-            // it is the ONLY source of a dropped file's absolute path (WebKitGTK
-            // blanks `dataTransfer` for security when the handler is off, so
-            // HTML5 yields empty `files`/`getData`). We keep it ENABLED and route
-            // `onDragDropEvent` paths to the surface under the cursor (see
-            // `src/lib/dnd/os-file-drop.ts`); the composer drop is bridged there.
+            // Linux/Windows: the handler stays ENABLED. It is the ONLY source of
+            // a dropped file's absolute path (WebKitGTK blanks `dataTransfer`
+            // for security when the handler is off, so HTML5 yields empty
+            // `files`/`getData`); `onDragDropEvent` paths are routed to the
+            // surface under the cursor (see `src/lib/dnd/os-file-drop.ts`) and
+            // the composer drop is bridged there.
+            //
+            // The catch: on Windows, WebView2 delivers NO HTML5 drag events to
+            // the page while this handler is on (Tauri: disabling it "is
+            // required to use HTML5 drag and drop APIs on the frontend on
+            // Windows"). So in-page drags — pane/dock tab move, split and
+            // reorder, pin reordering — don't use HTML5 DnD at all; they run
+            // on pointer events (`src/lib/panes/pointer-drag.ts`), which no
+            // native handler intercepts. Don't add new HTML5 `draggable`
+            // surfaces: they silently won't work on Windows.
             #[cfg(target_os = "macos")]
             let builder = builder.disable_drag_drop_handler();
             // Overlay title-bar + hidden title are macOS-only; the rest of

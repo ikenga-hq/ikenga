@@ -1,11 +1,12 @@
-// HTML5 native drag-and-drop drop targets for tab moves.
+// Drop targets for tab moves, overlaid on each pane's body area.
 //
-// Rendered overlaid on each pane's body area while a tab drag is active
-// (the dataTransfer-bearing dragstart from `pane-tab-strip` or the dock
-// flips `useDragState` to true, which makes this component visible). The
-// overlay reports a dragover-relative zone (4 edges or center) and either
-// dispatches a `moveTab` action (pane-source) or transfers the view from
-// the dock into the pane (dock-source).
+// Always mounted; while a tab drag is active (`useDragState`, published by a
+// pane-strip or dock tab through `beginPointerDrag`) the overlay switches on
+// pointer-events so the drag controller's hit-test finds it. It reports a
+// pointer-relative zone (4 edges or center) and either dispatches a `moveTab`
+// action (pane-source) or transfers the view from the dock into the pane
+// (dock-source). Pointer events rather than HTML5 DnD: see
+// `lib/panes/pointer-drag.ts`.
 //
 // Edge inset is 25% of the pane's width/height. Outside that ring the
 // zone is `'center'` (move-as-tab). Inside it, `'left'` / `'right'`
@@ -16,6 +17,7 @@
 import { useState } from 'react';
 
 import { useDragState } from '@/lib/panes/drag-state';
+import { useDropTarget } from '@/lib/panes/pointer-drag';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useDockStore } from '@/shell/dock/dock-store';
 import { type PaneId } from '@/lib/panes/types';
@@ -46,95 +48,49 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 	// never collide with a pane id).
 	const sameAsSrc = drag.source === 'pane' && drag.srcLeafId === paneId;
 
-	function onDragEnter(e: React.DragEvent<HTMLDivElement>) {
-		if (!drag.active) return;
-		// WebKit/Tauri requires preventDefault on dragenter for subsequent
-		// dragover events to fire reliably on absolutely-positioned overlays.
-		e.preventDefault();
-	}
-
-	function onDragOver(e: React.DragEvent<HTMLDivElement>) {
-		if (!drag.active) return;
-		e.preventDefault();
-		const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-		const zone = detectZone(rect, e.clientX, e.clientY);
-		if (zone !== 'center' && !canSplit) {
+	const dropTarget = useDropTarget({
+		// Declining an edge at the split cap lets the drop fall through to
+		// nothing, which cancels it — same as the old `dropEffect = 'none'`.
+		accepts: (x, y, el) =>
+			useDragState.getState().active &&
+			(canSplit || detectZone(el.getBoundingClientRect(), x, y) === 'center'),
+		onOver: (x, y, el) => {
+			const zone = detectZone(el.getBoundingClientRect(), x, y);
+			setHoverZone((prev) => (prev === zone ? prev : zone));
+		},
+		onLeave: () => setHoverZone(null),
+		onDrop: (x, y, el) => {
 			setHoverZone(null);
-			e.dataTransfer.dropEffect = 'none';
-			return;
-		}
-		setHoverZone(zone);
-		e.dataTransfer.dropEffect = 'move';
-	}
-
-	function onDragLeave() {
-		setHoverZone(null);
-	}
-
-	function onDrop(e: React.DragEvent<HTMLDivElement>) {
-		if (!drag.active) return;
-		e.preventDefault();
-		if (drag.srcTabIdx == null) {
-			drag.end();
-			setHoverZone(null);
-			return;
-		}
-		const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-		const zone = detectZone(rect, e.clientX, e.clientY);
-		if (zone !== 'center' && !canSplit) {
-			drag.end();
-			setHoverZone(null);
-			return;
-		}
-
-		const mode =
-			zone === 'center'
-				? 'append'
-				: zone === 'left'
-					? 'left'
-					: zone === 'right'
-						? 'right'
-						: zone === 'top'
-							? 'top'
-							: 'bottom';
-
-		if (drag.source === 'pane') {
-			if (drag.srcLeafId == null) {
-				drag.end();
-				setHoverZone(null);
+			const d = useDragState.getState();
+			if (!d.active || d.srcTabIdx == null) {
+				d.end();
 				return;
 			}
-			moveTab(drag.srcLeafId, drag.srcTabIdx, paneId, mode);
-		} else if (drag.source === 'dock') {
-			// Dock → pane: pull the view out of the dock store and place it via
-			// the pane store. Only close from the dock if the placement succeeds.
-			const view = useDockStore.getState().tabs[drag.srcTabIdx];
-			if (!view) {
-				drag.end();
-				setHoverZone(null);
-				return;
-			}
-			const ok = placeView(paneId, view, mode);
-			if (ok) useDockStore.getState().closeTab(drag.srcTabIdx);
-		}
+			const zone = detectZone(el.getBoundingClientRect(), x, y);
+			const mode = zone === 'center' ? 'append' : zone;
 
-		drag.end();
-		setHoverZone(null);
-	}
+			if (d.source === 'pane') {
+				if (d.srcLeafId != null) moveTab(d.srcLeafId, d.srcTabIdx, paneId, mode);
+			} else if (d.source === 'dock') {
+				// Dock → pane: pull the view out of the dock store and place it via
+				// the pane store. Only close from the dock if the placement succeeds.
+				const view = useDockStore.getState().tabs[d.srcTabIdx];
+				if (view && placeView(paneId, view, mode)) {
+					useDockStore.getState().closeTab(d.srcTabIdx);
+				}
+			}
+			d.end();
+		},
+	});
 
 	return (
 		<div
+			{...dropTarget}
 			className={cn(
 				'absolute inset-0 z-20',
-				// Stay mounted so WebKit registers us as a drop target before the
-				// user starts dragging; only intercept events while a drag is in
-				// flight.
+				// Invisible to the hit-test (and to clicks) unless a drag is in flight.
 				drag.active ? 'pointer-events-auto' : 'pointer-events-none'
 			)}
-			onDragEnter={onDragEnter}
-			onDragOver={onDragOver}
-			onDragLeave={onDragLeave}
-			onDrop={onDrop}
 			data-testid={`drop-zone-${paneId}`}
 		>
 			<ZoneIndicator zone={hoverZone} dimmed={sameAsSrc && hoverZone === 'center'} />

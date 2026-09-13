@@ -27,9 +27,11 @@
  * fall back to the raw point, so a platform that already reports logical pixels
  * (dpr === 1, or a future Tauri fix) still works.
  *
- * macOS keeps the native handler disabled (it would break in-page pane DnD;
- * see lib.rs), so this never fires there and each surface's HTML5 path stays
- * in charge.
+ * macOS keeps the native handler disabled (see lib.rs), so this never fires
+ * there and each surface's HTML5 file-drop path stays in charge. In-page drags
+ * (tabs, pins) don't use HTML5 DnD on any OS — they run on pointer events
+ * (`lib/panes/pointer-drag.ts`) because WebView2 blocks HTML5 drag events while
+ * this handler is enabled on Windows.
  */
 
 import { getCurrentWebview } from '@/lib/transport';

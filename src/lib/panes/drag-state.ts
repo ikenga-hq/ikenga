@@ -1,5 +1,6 @@
-// Transient drag state for tab DnD. Lives outside pane-store so that
-// dragstart/dragend mutations don't churn the persistence subscriber.
+// Transient drag state for tab DnD. Lives outside pane-store so that drag
+// start/end mutations don't churn the persistence subscriber. Set and cleared
+// by the pointer-drag controller (`pointer-drag.ts`) via tab sources.
 //
 // `source` discriminates pane-tab drags from dock-tab drags so drop targets
 // can pull the source view from the right store. Pane-source drags carry

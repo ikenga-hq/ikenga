@@ -11,6 +11,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { createFileRoute } from '@tanstack/react-router';
 import { GripVertical, Pin as PinGlyph, Plus, Trash2, X } from 'lucide-react';
+import { create } from 'zustand';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -23,6 +24,7 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
+import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { PinIcon } from '@/shell/pin-icon';
 import {
 	computeCrossSectionReorderIds,
@@ -305,18 +307,60 @@ interface PinListProps {
 	pins: Pin[];
 }
 
-interface DragState {
+interface PinDrag {
 	pinId: string;
 	fromSectionId: string | null;
+}
+
+// The pin being dragged. Shared by every section's list (not per-list state)
+// so a pin can be dropped into a different section. Drags run on pointer
+// events, not HTML5 DnD, which WebView2 blocks on Windows — see
+// `lib/panes/pointer-drag.ts`.
+const usePinDrag = create<{ drag: PinDrag | null; setDrag: (d: PinDrag | null) => void }>(
+	(set) => ({ drag: null, setDrag: (drag) => set({ drag }) })
+);
+
+/** Insertion index for a pointer at client `y` over a list's pin rows. */
+function insertIndexAt(listEl: Element, y: number): number {
+	const rows = Array.from(listEl.querySelectorAll<HTMLElement>('li[data-pin-idx]'));
+	for (const row of rows) {
+		const r = row.getBoundingClientRect();
+		if (y < r.top + r.height / 2) return Number(row.dataset.pinIdx);
+	}
+	return rows.length;
 }
 
 function PinList({ sectionId, pins }: PinListProps) {
 	const removePin = usePinsStore((s) => s.removePin);
 	const reorderPins = usePinsStore((s) => s.reorderPins);
-	const [drag, setDrag] = useState<DragState | null>(null);
+	const drag = usePinDrag((s) => s.drag);
 	const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
 	const sectionKey = sectionId ?? '';
+
+	const listDrop = useDropTarget({
+		accepts: () => usePinDrag.getState().drag !== null,
+		onOver: (_x, y, el) => {
+			const next = insertIndexAt(el, y);
+			setHoverIdx((prev) => (prev === next ? prev : next));
+		},
+		onLeave: () => setHoverIdx(null),
+		onDrop: (_x, y, el) => {
+			const dropped = usePinDrag.getState().drag;
+			setHoverIdx(null);
+			if (!dropped) return;
+			const dstIdx = insertIndexAt(el, y);
+			if (dropped.fromSectionId === sectionId) {
+				const srcIdx = pins.findIndex((p) => p.id === dropped.pinId);
+				if (srcIdx < 0) return;
+				// Same-position no-op (drop adjacent to self with no movement).
+				if (srcIdx === dstIdx || srcIdx + 1 === dstIdx) return;
+				void commitDrop(srcIdx, dstIdx);
+			} else {
+				void commitCrossSectionDrop(dropped.pinId, dstIdx);
+			}
+		},
+	});
 
 	if (pins.length === 0) {
 		return (
@@ -342,60 +386,29 @@ function PinList({ sectionId, pins }: PinListProps) {
 	}
 
 	return (
-		<ul
-			className="flex flex-col"
-			data-section-key={sectionKey}
-			onDragLeave={(e) => {
-				if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-				setHoverIdx(null);
-			}}
-		>
+		<ul {...listDrop} className="flex flex-col" data-section-key={sectionKey}>
 			{pins.map((pin, idx) => {
 				const isDragging = drag?.pinId === pin.id;
 				const showInsertBefore = hoverIdx === idx && drag !== null && !isDragging;
 				return (
 					<li
 						key={pin.id}
-						draggable
-						onDragStart={(e) => {
-							e.dataTransfer.effectAllowed = 'move';
-							e.dataTransfer.setData('application/x-pin-drag', `${pin.id}|${pin.sectionId ?? ''}`);
-							setDrag({ pinId: pin.id, fromSectionId: pin.sectionId });
-						}}
-						onDragEnd={() => {
-							setDrag(null);
-							setHoverIdx(null);
-						}}
-						onDragOver={(e) => {
-							if (!drag) return;
-							e.preventDefault();
-							e.dataTransfer.dropEffect = 'move';
-							const rect = e.currentTarget.getBoundingClientRect();
-							const isAbove = e.clientY < rect.top + rect.height / 2;
-							const next = isAbove ? idx : idx + 1;
-							setHoverIdx((prev) => (prev === next ? prev : next));
-						}}
-						onDrop={async (e) => {
-							e.preventDefault();
-							if (!drag) return;
-							const rect = e.currentTarget.getBoundingClientRect();
-							const isAbove = e.clientY < rect.top + rect.height / 2;
-							const dstIdx = isAbove ? idx : idx + 1;
-							const wasDragging = drag;
-							setDrag(null);
-							setHoverIdx(null);
-							if (wasDragging.fromSectionId === sectionId) {
-								const srcIdx = pins.findIndex((p) => p.id === wasDragging.pinId);
-								if (srcIdx < 0) return;
-								// Same-position no-op (drop adjacent to self with no movement).
-								if (srcIdx === dstIdx || srcIdx + 1 === dstIdx) return;
-								await commitDrop(srcIdx, dstIdx);
-							} else {
-								await commitCrossSectionDrop(wasDragging.pinId, dstIdx);
-							}
+						data-pin-idx={idx}
+						onPointerDown={(e) => {
+							// The unpin button is a click, not a drag handle.
+							if ((e.target as Element).closest('button')) return;
+							beginPointerDrag(e, {
+								label: pin.label,
+								onStart: () =>
+									usePinDrag.getState().setDrag({ pinId: pin.id, fromSectionId: pin.sectionId }),
+								onEnd: () => {
+									usePinDrag.getState().setDrag(null);
+									setHoverIdx(null);
+								},
+							});
 						}}
 						className={cn(
-							'group relative flex items-center gap-3 px-4 py-2 transition-colors',
+							'group relative flex select-none items-center gap-3 px-4 py-2 transition-colors',
 							idx > 0 && 'border-t border-border/40',
 							isDragging && 'opacity-40',
 							showInsertBefore &&
@@ -425,31 +438,12 @@ function PinList({ sectionId, pins }: PinListProps) {
 					</li>
 				);
 			})}
-			{/* Tail drop target — only shown while dragging so it doesn't take up
-			    extra space at rest. Hover state is the implicit pseudo `idx ===
-			    pins.length`. */}
+			{/* Tail spacer — only shown while dragging so it doesn't take up extra
+			    space at rest. It sits inside the list's drop target, so a pointer
+			    below the last pin inserts at the end (hover `idx === pins.length`). */}
 			{drag !== null && (
 				<li
 					data-tail-drop
-					onDragOver={(e) => {
-						e.preventDefault();
-						e.dataTransfer.dropEffect = 'move';
-						setHoverIdx(pins.length);
-					}}
-					onDrop={async (e) => {
-						e.preventDefault();
-						if (!drag) return;
-						const wasDragging = drag;
-						setDrag(null);
-						setHoverIdx(null);
-						if (wasDragging.fromSectionId === sectionId) {
-							const srcIdx = pins.findIndex((p) => p.id === wasDragging.pinId);
-							if (srcIdx < 0 || srcIdx === pins.length - 1) return;
-							await commitDrop(srcIdx, pins.length);
-						} else {
-							await commitCrossSectionDrop(wasDragging.pinId, pins.length);
-						}
-					}}
 					className={cn(
 						'h-3 transition-colors',
 						hoverIdx === pins.length && 'border-t-2 border-primary'
@@ -467,26 +461,19 @@ interface EmptyDropZoneProps {
 
 function EmptyDropZone({ sectionId, onDropPin }: EmptyDropZoneProps) {
 	const [hover, setHover] = useState(false);
+	const dropTarget = useDropTarget({
+		accepts: () => usePinDrag.getState().drag !== null,
+		onOver: () => setHover(true),
+		onLeave: () => setHover(false),
+		onDrop: () => {
+			const dropped = usePinDrag.getState().drag;
+			setHover(false);
+			if (dropped) void onDropPin(dropped.pinId, dropped.fromSectionId);
+		},
+	});
 	return (
 		<div
-			onDragOver={(e) => {
-				if (!e.dataTransfer.types.includes('application/x-pin-drag')) return;
-				e.preventDefault();
-				setHover(true);
-			}}
-			onDragLeave={() => setHover(false)}
-			onDrop={async (e) => {
-				const payload = e.dataTransfer.getData('application/x-pin-drag');
-				if (!payload) {
-					setHover(false);
-					return;
-				}
-				const [pinId, fromSection] = payload.split('|');
-				setHover(false);
-				if (pinId) {
-					await onDropPin(pinId, fromSection ? fromSection : null);
-				}
-			}}
+			{...dropTarget}
 			className={cn(
 				'flex items-center justify-center px-4 py-6 text-xs text-muted-foreground transition-colors',
 				hover && 'bg-accent/40 text-accent-foreground'
