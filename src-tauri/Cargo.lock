@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-desktop"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "age",
  "agent-client-protocol",
@@ -3158,7 +3158,7 @@ dependencies = [
 
 [[package]]
 name = "ikenga-server"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "clap",
