@@ -22,6 +22,7 @@ vi.mock('@/lib/tauri-cmd', () => ({
 	pkgContentRevoke: vi.fn(),
 	pkgMcpCall: vi.fn(),
 	pkgSidecarCall: vi.fn(),
+	ptyWrite: vi.fn(),
 }));
 
 import {
@@ -31,7 +32,9 @@ import {
 	paActionsUpdate,
 	pkgKernelStatus,
 	pkgPreviewManifest,
+	ptyWrite,
 } from '@/lib/tauri-cmd';
+import { useTerminalStore } from '@/terminal/session-store';
 import { dispatchHostCall } from './pkg-iframe-host';
 
 const kernelStatus = vi.mocked(pkgKernelStatus);
@@ -40,6 +43,7 @@ const commit = vi.mocked(paActionsCommit);
 const reject = vi.mocked(paActionsReject);
 const retry = vi.mocked(paActionsRetry);
 const update = vi.mocked(paActionsUpdate);
+const mockPtyWrite = vi.mocked(ptyWrite);
 
 const PKG = 'com.ikenga.outbound';
 const DRAFT = 'draft-42';
@@ -151,5 +155,63 @@ describe('host.paActions.* (pkg-iframe approve-gate write verbs)', () => {
 			ok: false,
 			error: 'draft is not in the failed state',
 		});
+	});
+});
+
+describe('host.sendToActiveSession (Issue #127)', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: true });
+	});
+
+	it('rejects a missing prompt/text argument', async () => {
+		withScope(true);
+		const res = await dispatchHostCall(PKG, 'host.sendToActiveSession', {});
+		expect(res.isError).toBe(true);
+		expect(res.content[0].text).toContain('missing required `prompt` or `text` argument');
+	});
+
+	it('denies execution when engine:invoke scope is missing', async () => {
+		withScope(false);
+		const res = await dispatchHostCall(PKG, 'host.sendToActiveSession', { prompt: 'hello Chi' });
+		expect(res.isError).toBe(true);
+		expect(res.structuredContent).toEqual({ ok: false, reason: 'scope-denied' });
+		expect(mockPtyWrite).not.toHaveBeenCalled();
+	});
+
+	it('returns no-active-session when no terminal tabs exist', async () => {
+		withScope(true);
+		const res = await dispatchHostCall(PKG, 'host.sendToActiveSession', { prompt: 'hello Chi' });
+		expect(res.structuredContent).toEqual({ ok: false, reason: 'no-active-session' });
+		expect(mockPtyWrite).not.toHaveBeenCalled();
+	});
+
+	it('writes bracketed prompt and returns threadId when active session exists', async () => {
+		withScope(true);
+		useTerminalStore.setState({
+			tabs: [
+				{
+					id: 'tab-1',
+					ptyId: 'pty-123',
+					claudeSessionId: 'sess-abc',
+					status: 'running',
+					title: 'Terminal 1',
+					spec: { cwd: '/tmp', cmd: ['bash'] },
+					exitCode: null,
+					createdAt: 0,
+					owner: { kind: 'sidepane' },
+				},
+			],
+			activeId: 'tab-1',
+			rehydrated: true,
+		});
+
+		const res = await dispatchHostCall(PKG, 'host.sendToActiveSession', {
+			prompt: 'generate visual',
+		});
+		expect(res.isError).toBeFalsy();
+		expect(res.structuredContent).toEqual({ ok: true, threadId: 'sess-abc' });
+		expect(mockPtyWrite).toHaveBeenCalledWith('pty-123', '\x1b[200~generate visual\x1b[201~');
+		expect(mockPtyWrite).toHaveBeenCalledWith('pty-123', '\r');
 	});
 });

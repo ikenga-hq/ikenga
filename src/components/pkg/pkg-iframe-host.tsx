@@ -35,7 +35,6 @@
 
 import type { OperatorIdentity } from '@ikenga/contract/host-context';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
-import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useRef, useState } from 'react';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import {
@@ -75,10 +74,11 @@ import {
 	pkgPreviewManifest,
 	pkgSidecarCall,
 	pkgStudioRequestProjectAccess,
+	ptyWrite,
 	type SqlValue,
 	skillRosterRead,
 } from '@/lib/tauri-cmd';
-import { isTauri } from '@/lib/transport';
+import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
 import {
 	isNotificationPermissionGranted,
@@ -86,6 +86,7 @@ import {
 	sendNotification,
 } from '@/lib/transport/shims';
 import { usePaneScope } from '@/shell/panes/pane-scope';
+import { useTerminalStore } from '@/terminal/session-store';
 
 // Tauri event payload emitted by `Kernel::reload_pkg`. The FE only cares about
 // `pkg_id` for the host filter; `version` + `registries` are useful for debug
@@ -740,6 +741,80 @@ export async function dispatchHostCall(
 			content: [{ type: 'text', text: 'notification sent' }],
 			structuredContent: { ok: true },
 		};
+	}
+
+	// ─── host.sendToActiveSession — send prompt into active session (Issue #127) ───
+	if (name === 'host.sendToActiveSession') {
+		const prompt =
+			typeof args.prompt === 'string'
+				? args.prompt
+				: typeof args.text === 'string'
+					? args.text
+					: null;
+		if (!prompt) {
+			return errResult('host.sendToActiveSession: missing required `prompt` or `text` argument');
+		}
+
+		if (!(await pkgDeclaresScope(pkgId, 'engine', 'invoke'))) {
+			return {
+				content: [
+					{ type: 'text', text: "host.sendToActiveSession: pkg lacks the 'engine:invoke' scope" },
+				],
+				isError: true,
+				structuredContent: { ok: false, reason: 'scope-denied' },
+			};
+		}
+
+		try {
+			const focusedView = usePaneStore.getState().focusedView();
+			let targetSessionId: string | null = null;
+			if (focusedView && focusedView.kind === 'terminal') {
+				targetSessionId = focusedView.sessionId;
+			}
+			if (!targetSessionId) {
+				targetSessionId = useTerminalStore.getState().activeId;
+			}
+			if (!targetSessionId) {
+				const tabs = useTerminalStore.getState().tabs;
+				if (tabs.length > 0) {
+					targetSessionId = tabs[0].id;
+				}
+			}
+
+			if (!targetSessionId) {
+				return {
+					content: [{ type: 'text', text: 'host.sendToActiveSession: no active session' }],
+					structuredContent: { ok: false, reason: 'no-active-session' },
+				};
+			}
+
+			const tab = useTerminalStore.getState().tabs.find((t) => t.id === targetSessionId);
+			if (!tab?.ptyId) {
+				return {
+					content: [
+						{
+							type: 'text',
+							text: 'host.sendToActiveSession: target terminal session has no active PTY',
+						},
+					],
+					structuredContent: { ok: false, reason: 'no-active-session' },
+				};
+			}
+
+			// Bracketed paste signals to the TUI input that multi-line payload is a single pasted block,
+			// followed by carriage return to submit.
+			await ptyWrite(tab.ptyId, `\x1b[200~${prompt}\x1b[201~`);
+			await ptyWrite(tab.ptyId, '\r');
+
+			const threadId = tab.claudeSessionId ?? targetSessionId;
+			return {
+				content: [{ type: 'text', text: `prompt sent to active session ${threadId}` }],
+				structuredContent: { ok: true, threadId },
+			};
+		} catch (e) {
+			const msg = (e as Error).message ?? String(e);
+			return errResult(`host.sendToActiveSession failed: ${msg}`);
+		}
 	}
 
 	// ─── approve-gate write verbs (host.paActions.*) — WP-18a ───────────────────
