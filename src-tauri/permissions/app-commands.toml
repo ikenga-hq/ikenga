@@ -221,6 +221,8 @@ commands.allow = [
   "project_update",
   "pty_attach_arm",
   "pty_attach_begin",
+  "pty_daemon_info",
+  "pty_daemon_shutdown",
   "pty_foreground",
   "pty_foreground_snapshot",
   "pty_kill",
