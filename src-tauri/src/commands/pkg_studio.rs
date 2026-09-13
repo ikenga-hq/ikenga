@@ -97,11 +97,15 @@ async fn prompt_for_access(app: &AppHandle, canonical_path: &str) -> bool {
     rx.await.unwrap_or(false)
 }
 
-/// Frozen-signature command. See module docs.
-#[tauri::command]
-pub async fn pkg_studio_request_project_access(
-    app: AppHandle,
-    db: tauri::State<'_, Arc<PaDb>>,
+/// Transport-independent trust decision.
+///
+/// Extracted so the Tauri command and the iyke localhost relay
+/// (`iyke::pkg_trust`, used by the Studio sidecar — a separate OS process that
+/// cannot `invoke()`) resolve to exactly the *same* decision and cannot drift.
+/// See `plans/studio/verify/2026-09-12-wp32-live/wp04/design-note.md`.
+pub async fn request_project_access(
+    app: &AppHandle,
+    db: &Arc<PaDb>,
     path: PathBuf,
 ) -> Result<RequestAccessResponse, String> {
     let canonical = canonicalize(&path)?;
@@ -116,7 +120,7 @@ pub async fn pkg_studio_request_project_access(
     }
 
     // (2) First time for this folder → prompt and await the decision.
-    let granted = prompt_for_access(&app, &canonical).await;
+    let granted = prompt_for_access(app, &canonical).await;
     if !granted {
         tracing::info!("[pkg_studio] project access DECLINED for `{canonical}` — no row written");
         return Ok(RequestAccessResponse { granted: false });
@@ -132,6 +136,17 @@ pub async fn pkg_studio_request_project_access(
         tracing::info!("[pkg_studio] project access GRANTED for `{canonical}` — row written");
     }
     Ok(RequestAccessResponse { granted: true })
+}
+
+/// Frozen-signature command. See module docs. One-line wrapper over
+/// [`request_project_access`] so the Tauri and HTTP transports cannot drift.
+#[tauri::command]
+pub async fn pkg_studio_request_project_access(
+    app: AppHandle,
+    db: tauri::State<'_, Arc<PaDb>>,
+    path: PathBuf,
+) -> Result<RequestAccessResponse, String> {
+    request_project_access(&app, db.inner(), path).await
 }
 
 #[cfg(test)]
