@@ -204,6 +204,19 @@ pub fn run() {
     let opencode_engine: engines::opencode_acp::OpencodeEngineState =
         Arc::new(engines::opencode_acp::OpencodeEngine::new());
     let pi_engine: engines::pi_acp::PiEngineState = Arc::new(engines::pi_acp::PiEngine::new());
+    // WP-20: the OpenRouter HTTP engine. No CLI to spawn and no binary to
+    // detect — it resolves `OPENROUTER_API_KEY` from Stronghold at prompt time
+    // (see `engines/openrouter_http/mod.rs`), so it is constructed
+    // unconditionally and simply fails the turn with a "key is not set"
+    // message until the user stores one.
+    let openrouter_engine: engines::openrouter_http::OpenRouterHttpEngineState =
+        Arc::new(engines::openrouter_http::OpenRouterHttpEngine::new());
+    // The engine needs an `AppHandle` for vault + `pkg_settings` reads, but it
+    // is constructed before the app exists and its `run_prompt` keeps the same
+    // `AppHandle`-free signature as every sibling adapter. Handed over in
+    // `setup` below; a turn that somehow runs before that fails with a clear
+    // message rather than panicking.
+    let openrouter_for_setup = openrouter_engine.clone();
     // Multi-engine dispatcher used by `commands/chat.rs`. Built once
     // here and `.manage()`d so every Tauri command resolves engines
     // through the same registry.
@@ -216,6 +229,7 @@ pub fn run() {
         let cursor_agent_handle = engines::EngineHandle::CursorAgent(cursor_agent_engine.clone());
         let opencode_handle = engines::EngineHandle::Opencode(opencode_engine.clone());
         let pi_handle = engines::EngineHandle::Pi(pi_engine.clone());
+        let openrouter_handle = engines::EngineHandle::OpenRouterHttp(openrouter_engine.clone());
         tauri::async_runtime::block_on(async move {
             reg.insert("antigravity", antigravity_handle.clone()).await;
             reg.insert("antigravity-cli", antigravity_handle).await;
@@ -224,6 +238,12 @@ pub fn run() {
             reg.insert("cursor-agent", cursor_agent_handle).await;
             reg.insert("opencode", opencode_handle).await;
             reg.insert("pi", pi_handle).await;
+            // Keyed by the pkg manifest's `engine.agentId`.
+            reg.insert(
+                engines::openrouter_http::server::OPENROUTER_ENGINE_ID,
+                openrouter_handle,
+            )
+            .await;
         });
     }
     let screenshot_pending: ScreenshotPending = new_screenshot_pending();
@@ -297,6 +317,7 @@ pub fn run() {
         .manage(cursor_agent_engine)
         .manage(opencode_engine)
         .manage(pi_engine)
+        .manage(openrouter_engine)
         .manage(engine_registry)
         .manage(screenshot_pending.clone())
         .manage(SecretsLock::new())
@@ -307,6 +328,10 @@ pub fn run() {
             // is missing — `runtime::resolve_command` then falls back to
             // PATH lookup with a warning.
             runtime::init_from_app(&app.handle());
+
+            // WP-20: give the OpenRouter engine the handle it resolves its
+            // vault key + `pkg_settings` through.
+            openrouter_for_setup.attach_app(app.handle().clone());
 
             // Ensure app data dir exists; SQLite + Stronghold both write here.
             let data_dir = app

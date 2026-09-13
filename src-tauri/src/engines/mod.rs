@@ -1,7 +1,8 @@
 //! Engine adapters for the chat surface.
 //!
-//! Each engine drives one underlying coding-assistant CLI and feeds the
-//! shell's chat layer through the same wire contract (Agent Client
+//! Each engine drives one underlying coding assistant — a local CLI for all
+//! of them except `openrouter_http`, which is itself the HTTP client — and
+//! feeds the shell's chat layer through the same wire contract (Agent Client
 //! Protocol-shaped events on `chat://session/{id}` Tauri channels). The
 //! contract is defined in the `agent-client-protocol` crate types —
 //! re-using its `SessionUpdate` / `RequestPermissionRequest` / etc. structs
@@ -26,6 +27,12 @@ pub mod codex_pty;
 pub mod cursor_agent;
 #[cfg(feature = "desktop")]
 pub mod opencode_acp;
+// The only adapter with no CLI behind it — it is the HTTP client itself, and
+// therefore the only one that holds a credential (WP-20 / G-ENGINE-KEY).
+// Desktop-gated because key + settings resolution both need an `AppHandle`;
+// see the module docs for what it would take to lift into the daemon.
+#[cfg(feature = "desktop")]
+pub mod openrouter_http;
 #[cfg(feature = "desktop")]
 pub mod pi_acp;
 
@@ -42,6 +49,8 @@ use crate::engines::cursor_agent::CursorAgentEngineState;
 pub use antigravity_acp::AntigravityEngineState;
 #[cfg(feature = "desktop")]
 pub use opencode_acp::OpencodeEngineState;
+#[cfg(feature = "desktop")]
+pub use openrouter_http::OpenRouterHttpEngineState;
 #[cfg(feature = "desktop")]
 pub use pi_acp::PiEngineState;
 
@@ -76,6 +85,10 @@ pub enum EngineHandle {
     Antigravity(AntigravityEngineState),
     #[cfg(feature = "desktop")]
     Opencode(OpencodeEngineState),
+    /// OpenRouter HTTP adapter (`engines/openrouter_http`). WP-20 — no child
+    /// process; streams SSE from the OpenRouter API with a vault-resolved key.
+    #[cfg(feature = "desktop")]
+    OpenRouterHttp(OpenRouterHttpEngineState),
     #[cfg(feature = "desktop")]
     Pi(PiEngineState),
 }
