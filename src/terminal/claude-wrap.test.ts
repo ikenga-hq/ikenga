@@ -52,7 +52,22 @@ describe('buildClaudeWrappedCmd & buildAgentWrappedCmd', () => {
 		expect(cmd).toContain('Ubuntu');
 		expect(cmd).toContain('--cd');
 		expect(cmd).toContain('C:/Users/nedJamez/project');
-		expect(cmd).toContain('bash');
+		// `-e` must precede bash, or the distro login shell expands `$__status`.
+		expect(cmd.indexOf('-e')).toBe(cmd.indexOf('bash') - 1);
+	});
+
+	it('hands WSL claude a /mnt path for a Windows-side --settings file', () => {
+		__setClaudeSettingsPathForTests('C:\\Users\\me\\AppData\\Local\\app.ikenga');
+		const wsl = buildClaudeWrappedCmd({ shellTarget: 'wsl', terminalId: 't1' }).at(-1) ?? '';
+		expect(wsl).toContain("'/mnt/c/Users/me/AppData/Local/app.ikenga/claude-hooks-t1.json'");
+		expect(wsl).not.toContain('C:\\Users');
+
+		// Native branch: Windows path for a Windows claude, /mnt path in the WSL fallback.
+		const ps = buildClaudeWrappedCmd({ shellTarget: 'powershell', terminalId: 't1' }).at(-1) ?? '';
+		expect(ps).toContain("& 'claude' '--dangerously-skip-permissions' '--settings' 'C:\\Users\\me");
+		expect(ps).toContain('wsl.exe -e bash -l -i -c');
+		expect(ps).toContain('/mnt/c/Users/me/AppData/Local/app.ikenga/claude-hooks-t1.json');
+		__setClaudeSettingsPathForTests(null);
 	});
 
 	it('wraps Antigravity (agy) CLI correctly', () => {

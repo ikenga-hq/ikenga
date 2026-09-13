@@ -49,7 +49,30 @@ function psQuote(arg: string): string {
 	return `'${arg.replace(/'/g, `''`)}'`;
 }
 
-export function buildAgentArgs(opts: AgentWrapOpts): string[] {
+/**
+ * `C:\Users\x\f.json` → `/mnt/c/Users/x/f.json` (WSL's default automount).
+ * Non-drive paths pass through unchanged.
+ *
+ * Needed because the `--settings` file is written Windows-side under
+ * `%LOCALAPPDATA%\app.ikenga`, but when `claude` only exists inside WSL the
+ * Linux binary receives that path verbatim and fails with "Settings file not
+ * found".
+ */
+export function toWslPath(p: string): string {
+	const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+	if (!m) return p;
+	return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`;
+}
+
+/**
+ * `pathStyle: 'wsl'` rewrites host paths the shell itself generated (today just
+ * `--settings`) so a Linux `claude` inside WSL can open them. User-supplied
+ * args (prompt, model) are never rewritten.
+ */
+export function buildAgentArgs(
+	opts: AgentWrapOpts,
+	pathStyle: 'native' | 'wsl' = 'native'
+): string[] {
 	const engine = opts.engine ?? 'claude';
 	switch (engine) {
 		case 'antigravity': {
@@ -94,7 +117,9 @@ export function buildAgentArgs(opts: AgentWrapOpts): string[] {
 			// Omitted when unprimed or unwritable: better a session with no live
 			// view than one wired to a port that isn't listening.
 			const settingsPath = getClaudeSettingsPathSync(opts.terminalId ?? undefined);
-			if (settingsPath) args.push('--settings', settingsPath);
+			if (settingsPath) {
+				args.push('--settings', pathStyle === 'wsl' ? toWslPath(settingsPath) : settingsPath);
+			}
 			if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 			if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
 			if (opts.model) args.push('--model', opts.model);
@@ -113,7 +138,7 @@ export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 	const target = opts.shellTarget ?? (isWindows ? 'native' : 'posix');
 
 	if (target === 'wsl') {
-		const quoted = args.map(shQuote).join(' ');
+		const quoted = buildAgentArgs(opts, 'wsl').map(shQuote).join(' ');
 		const script =
 			`printf '\\033[2m$ %s\\033[0m\\n' ${shQuote(quoted)}; ` +
 			`${quoted}; ` +
@@ -128,7 +153,10 @@ export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 			// Convert Windows path separators to forward slashes for WSL compatibility
 			wslCmd.push('--cd', opts.cwd.replace(/\\/g, '/'));
 		}
-		wslCmd.push('bash', '-l', '-i', '-c', script);
+		// `-e` execs bash directly. Without it wsl.exe hands the command line to
+		// the distro's login shell first, which expands `$__status` / `$?` to
+		// empty before bash sees the script → `[: -ne: unary operator expected`.
+		wslCmd.push('-e', 'bash', '-l', '-i', '-c', script);
 		return wslCmd;
 	}
 
@@ -148,11 +176,11 @@ export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {
 		const binName = args[0];
 		const subArgs = args.slice(1).map(psQuote).join(' ');
 		const psExe = target === 'pwsh' ? 'pwsh.exe' : 'powershell.exe';
-		const wslScript = `${args.map(shQuote).join(' ')}; __status=$?; if [ $__status -ne 0 ]; then printf '\\n\\033[31m[${engine} exited %d]\\033[0m\\n' $__status; fi`;
+		const wslScript = `${buildAgentArgs(opts, 'wsl').map(shQuote).join(' ')}; __status=$?; if [ $__status -ne 0 ]; then printf '\\n\\033[31m[${engine} exited %d]\\033[0m\\n' $__status; fi`;
 		const script =
 			`Write-Host ('$ ' + ${psQuote(quoted)}) -ForegroundColor DarkGray; ` +
 			`if (Get-Command ${psQuote(binName)} -ErrorAction SilentlyContinue) { & ${psQuote(binName)} ${subArgs} } ` +
-			`elseif (Get-Command 'wsl.exe' -ErrorAction SilentlyContinue) { wsl.exe bash -l -i -c ${psQuote(wslScript)} } ` +
+			`elseif (Get-Command 'wsl.exe' -ErrorAction SilentlyContinue) { wsl.exe -e bash -l -i -c ${psQuote(wslScript)} }` +
 			`else { & ${psQuote(binName)} ${subArgs} }; ` +
 			`$code = $LASTEXITCODE; ` +
 			`if ($code -ne 0) { Write-Host ('[${engine} exited ' + $code + ']') -ForegroundColor Red }; ` +
