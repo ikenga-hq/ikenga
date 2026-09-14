@@ -20,6 +20,8 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::platform::NoConsoleWindow;
+
 /// Config written to disk and passed to chi-runner via IKENGA_CHI_CONF.
 #[derive(Serialize)]
 pub struct RunnerConf<'a> {
@@ -45,8 +47,12 @@ pub enum SpawnResult {
 
 /// Probe whether `tmux` is available on PATH.
 pub fn tmux_available() -> bool {
+    // tmux isn't native to Windows, but if a port of it is on PATH (e.g. via
+    // MSYS/Cygwin), this probe would otherwise flash a console window on
+    // every daemon startup that checks it.
     Command::new("tmux")
         .arg("-V")
+        .no_console_window()
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -86,6 +92,7 @@ pub fn spawn_in_tmux(conf: &RunnerConf<'_>, cache_dir: &Path) -> SpawnResult {
             "-e", &format!("IKENGA_CHI_CONF={}", conf_path.display()),
             &runner_path,
         ])
+        .no_console_window()
         .status();
 
     match status {
@@ -103,6 +110,7 @@ pub fn spawn_in_tmux(conf: &RunnerConf<'_>, cache_dir: &Path) -> SpawnResult {
 pub fn kill_tmux_session(session_name: &str) {
     let _ = Command::new("tmux")
         .args(["kill-session", "-t", session_name])
+        .no_console_window()
         .status();
 }
 
@@ -110,6 +118,7 @@ pub fn kill_tmux_session(session_name: &str) {
 pub fn session_alive(session_name: &str) -> bool {
     Command::new("tmux")
         .args(["has-session", "-t", session_name])
+        .no_console_window()
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

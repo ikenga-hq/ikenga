@@ -73,17 +73,29 @@ pub fn default_shell_argv() -> Vec<String> {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Windows-only: starts the child as the root of a new process group, the
+/// same isolation `std::os::unix::process::CommandExt::process_group(0)`
+/// gives a detached daemon on unix (so it survives the parent GUI window
+/// exiting/reloading and doesn't share the parent's Ctrl+C group).
+#[cfg(windows)]
+pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
 /// Shared helper so every spawn site opts out of the console-flash consistently,
 /// instead of each callsite re-deriving the flag (or forgetting it). Implemented
 /// for both `std::process::Command` and `tokio::process::Command`.
 ///
 /// `creation_flags` *replaces* whatever flags were previously set rather than
 /// merging with them, so a callsite that also needs e.g.
-/// `CREATE_NEW_PROCESS_GROUP` must OR that flag in before calling this (there's
-/// no getter to read back an already-set value) — none of today's callsites do,
-/// but keep that in mind before adding one.
+/// `CREATE_NEW_PROCESS_GROUP` must use `no_console_window_with` instead of
+/// calling `no_console_window` and a separate `creation_flags` — the second
+/// call would clobber the first.
 pub trait NoConsoleWindow {
     fn no_console_window(&mut self) -> &mut Self;
+
+    /// Like `no_console_window`, but ORs in additional Windows creation
+    /// flags (e.g. `CREATE_NEW_PROCESS_GROUP` for a detached daemon) instead
+    /// of just `CREATE_NO_WINDOW`. `extra` is ignored on non-Windows.
+    fn no_console_window_with(&mut self, extra: u32) -> &mut Self;
 }
 
 impl NoConsoleWindow for std::process::Command {
@@ -92,6 +104,19 @@ impl NoConsoleWindow for std::process::Command {
         {
             use std::os::windows::process::CommandExt;
             self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+
+    fn no_console_window_with(&mut self, extra: u32) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            self.creation_flags(CREATE_NO_WINDOW | extra);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = extra;
         }
         self
     }
@@ -104,6 +129,18 @@ impl NoConsoleWindow for tokio::process::Command {
         #[cfg(windows)]
         {
             self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+
+    fn no_console_window_with(&mut self, extra: u32) -> &mut Self {
+        #[cfg(windows)]
+        {
+            self.creation_flags(CREATE_NO_WINDOW | extra);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = extra;
         }
         self
     }
