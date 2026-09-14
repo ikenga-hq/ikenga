@@ -16,6 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::pkg::manifest::Manifest;
+use crate::platform::NoConsoleWindow;
 use crate::runtime::augmented_path;
 
 /// Minimal `package.json` shape — we only need to read `dependencies`.
@@ -204,6 +205,7 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
         .args(["install", "--omit=dev", "--no-audit", "--no-fund"])
         .current_dir(install_path)
         .env("PATH", search_path)
+        .no_console_window()
         .output();
 
     // Restore the pkg's own package.json before inspecting the result, so a
@@ -233,6 +235,7 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
             .args(["install", "--production"])
             .current_dir(install_path)
             .env("PATH", search_path)
+            .no_console_window()
             .output()
             .context("spawn bun install")?;
 

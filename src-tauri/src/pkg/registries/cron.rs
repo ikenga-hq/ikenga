@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::pkg::manifest::Package;
 use crate::pkg::registries::SidecarsRegistry;
 use crate::pkg::registry::Registry;
+use crate::platform::NoConsoleWindow;
 
 /// Hard cap on cron-fired sidecar runs. Pollers/sends are quick; if a job
 /// blows past 10 minutes something is wrong and we'd rather kill it than
@@ -351,6 +352,7 @@ async fn run_sidecar_cron(
     let mut cmd = Command::new(&entry.bin_path);
     cmd.arg(&subcommand);
     cmd.current_dir(&install_path);
+    cmd.no_console_window();
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

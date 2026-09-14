@@ -31,6 +31,7 @@ use crate::commands::db::PaDb;
 use crate::commands::pkg::KernelState;
 use crate::pkg::manifest::Package;
 use crate::pkg::permissions_check::{check_shell_execute, record_violation};
+use crate::platform::NoConsoleWindow;
 
 /// Default timeout for one-shot invocations — generous but bounded so a hung
 /// process can't pin a Tauri worker forever.
@@ -141,7 +142,8 @@ pub async fn pkg_invoke(
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .no_console_window();
 
     let child = match cmd.spawn() {
         Ok(c) => c,

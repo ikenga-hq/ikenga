@@ -17,8 +17,12 @@ use super::known::{
 // Only `lookup_wsl_executable` reads the family tag directly.
 #[cfg(windows)]
 use super::known::TargetFamily;
+use crate::platform::NoConsoleWindow;
 
-const DEFAULT_VERSION_TIMEOUT: Duration = Duration::from_millis(2000);
+// Windows cold start: a freshly-installed CLI's first exec can take
+// 500ms-1.7s+ while Defender scans the new binary before letting it run.
+// 2s was tight enough to occasionally misreport an installed CLI as absent.
+const DEFAULT_VERSION_TIMEOUT: Duration = Duration::from_millis(5000);
 
 #[derive(Debug, Serialize)]
 pub struct DetectedAgent {
@@ -158,6 +162,7 @@ fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
 
         let Ok(output) = std::process::Command::new("wsl.exe")
             .args(["bash", "-l", "-c", &format!("which {clean_name}")])
+            .no_console_window()
             .output()
         else {
             // One candidate name failing to spawn says nothing about the
@@ -289,9 +294,12 @@ fn create_agent_command(exec: &std::path::Path) -> Command {
         if is_batch {
             let mut cmd = Command::new("cmd.exe");
             cmd.arg("/c").arg(exec);
+            cmd.no_console_window();
             cmd
         } else {
-            Command::new(exec)
+            let mut cmd = Command::new(exec);
+            cmd.no_console_window();
+            cmd
         }
     }
     #[cfg(not(windows))]
@@ -309,6 +317,7 @@ async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> O
             let mut cmd = Command::new("wsl.exe");
             cmd.args(["bash", "-l", "-c", &format!("{bin_name} {arg}")]);
             cmd.kill_on_drop(true);
+            cmd.no_console_window();
             (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
         } else {
             let mut cmd = create_agent_command(exec);
@@ -585,6 +594,7 @@ async fn probe_auth_exec(
             let mut command = Command::new("wsl.exe");
             command.args(["bash", "-l", "-c", &full_cmd]);
             command.kill_on_drop(true);
+            command.no_console_window();
             let fut = command.output();
             match timeout(Duration::from_millis(timeout_ms), fut).await {
                 Ok(Ok(out)) => {

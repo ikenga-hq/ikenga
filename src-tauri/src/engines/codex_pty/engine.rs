@@ -51,6 +51,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::engines::codex_pty::parser::{parse_event, to_session_updates, ParsedEvent};
+use crate::platform::NoConsoleWindow;
 use crate::pty::PtyManager;
 
 /// Default codex executable name. Resolved via `$PATH` at spawn time.
@@ -184,12 +185,17 @@ impl CodexPtyEngine {
                     if is_batch {
                         let mut c = Command::new("cmd.exe");
                         c.arg("/c").arg(p);
+                        c.no_console_window();
                         c
                     } else {
-                        Command::new(p)
+                        let mut c = Command::new(p);
+                        c.no_console_window();
+                        c
                     }
                 } else {
-                    Command::new(DEFAULT_CODEX_CMD)
+                    let mut c = Command::new(DEFAULT_CODEX_CMD);
+                    c.no_console_window();
+                    c
                 }
             }
             #[cfg(not(windows))]

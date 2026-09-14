@@ -67,6 +67,48 @@ pub fn default_shell_argv() -> Vec<String> {
     }
 }
 
+/// Windows-only: prevents a console-subsystem child (node, bun, npm.cmd,
+/// taskkill, wsl.exe, ...) spawned from this GUI process from popping up its
+/// own visible console window. No effect on macOS/Linux.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Shared helper so every spawn site opts out of the console-flash consistently,
+/// instead of each callsite re-deriving the flag (or forgetting it). Implemented
+/// for both `std::process::Command` and `tokio::process::Command`.
+///
+/// `creation_flags` *replaces* whatever flags were previously set rather than
+/// merging with them, so a callsite that also needs e.g.
+/// `CREATE_NEW_PROCESS_GROUP` must OR that flag in before calling this (there's
+/// no getter to read back an already-set value) — none of today's callsites do,
+/// but keep that in mind before adding one.
+pub trait NoConsoleWindow {
+    fn no_console_window(&mut self) -> &mut Self;
+}
+
+impl NoConsoleWindow for std::process::Command {
+    fn no_console_window(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
+
+impl NoConsoleWindow for tokio::process::Command {
+    fn no_console_window(&mut self) -> &mut Self {
+        // tokio::process::Command exposes `creation_flags` as an inherent
+        // Windows-only method (no CommandExt import needed, unlike std's).
+        #[cfg(windows)]
+        {
+            self.creation_flags(CREATE_NO_WINDOW);
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

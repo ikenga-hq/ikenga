@@ -1332,10 +1332,10 @@ impl PtyManager {
         #[cfg(windows)]
         {
             if let Some(pid) = session.pid {
-                use std::os::windows::process::CommandExt;
+                use crate::platform::NoConsoleWindow;
                 let _ = std::process::Command::new("taskkill")
                     .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .creation_flags(0x08000000)
+                    .no_console_window()
                     .output();
             }
         }

@@ -196,9 +196,8 @@ fn read_wsl_distros_from_wsl_exe() -> Vec<String> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW = 0x08000000
-        cmd.creation_flags(0x08000000);
+        use crate::platform::NoConsoleWindow;
+        cmd.no_console_window();
     }
 
     if let Ok(output) = cmd.output() {

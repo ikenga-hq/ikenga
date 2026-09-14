@@ -36,6 +36,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::commands::pkg::KernelState;
 use crate::commands::pkg_sidecar::SidecarsRegistryState;
+use crate::platform::NoConsoleWindow;
 
 /// Key into the streaming map: `(pkg_id, sidecar_name)`.
 type StreamKey = (String, String);
@@ -182,6 +183,7 @@ fn spawn_streaming_child_sync(
 
     let mut cmd = Command::new(&bin_path);
     cmd.current_dir(&install_path);
+    cmd.no_console_window();
     // WP-23 (D-18): hand this pkg its scoped database accessor —
     // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the
     // two `/iyke/pkg-db/*` routes, enforced against this pkg's own

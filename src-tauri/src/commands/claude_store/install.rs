@@ -24,6 +24,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform::NoConsoleWindow;
+
 use super::registry;
 use super::{
     atomic_copy_dir, atomic_copy_file, read_description, store_path_for, validate_name,
@@ -93,6 +95,7 @@ fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Out
     if let Some(d) = cwd {
         c.current_dir(d);
     }
+    c.no_console_window();
     c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{cmd}` not found on PATH — install it to use {cmd}-sourced primitives")
@@ -167,7 +170,8 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
     let mut c = Command::new("npx");
     c.args(["--yes", "skills", "add", spec])
         .current_dir(staging)
-        .env("HOME", staging);
+        .env("HOME", staging)
+        .no_console_window();
     let out = c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
@@ -194,7 +198,8 @@ fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
     let mut c = Command::new("npx");
     c.args(["--yes", "skills", "add", spec, "--skill", "*"])
         .current_dir(staging)
-        .env("HOME", staging);
+        .env("HOME", staging)
+        .no_console_window();
     let out = c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()

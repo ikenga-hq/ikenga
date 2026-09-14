@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::platform::NoConsoleWindow;
+
 /// Default antigravity CLI binary name.
 const DEFAULT_AGY_CMD: &str = "agy";
 
@@ -271,6 +273,7 @@ impl AntigravityEngine {
                 .unwrap_or_else(|_| PathBuf::from(DEFAULT_AGY_CMD));
 
         let mut cmd = Command::new(cmd_binary);
+        cmd.no_console_window();
         cmd.arg("-p")
             .arg(text)
             .arg("--output-format")

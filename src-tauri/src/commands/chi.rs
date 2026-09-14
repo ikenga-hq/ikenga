@@ -25,6 +25,7 @@ use crate::commands::claude::claude_list_sessions;
 use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
 use crate::engines::codex_pty::parser as codex_parser;
+use crate::platform::NoConsoleWindow;
 use crate::terminal::multiplexer;
 
 /// Cache state. Lives in `app_data_dir` and is `.manage()`d in `lib.rs`.
@@ -382,12 +383,17 @@ fn create_chi_command(binary: &str) -> Command {
             if is_batch {
                 let mut cmd = Command::new("cmd.exe");
                 cmd.arg("/c").arg(p);
+                cmd.no_console_window();
                 cmd
             } else {
-                Command::new(p)
+                let mut cmd = Command::new(p);
+                cmd.no_console_window();
+                cmd
             }
         } else {
-            Command::new(binary)
+            let mut cmd = Command::new(binary);
+            cmd.no_console_window();
+            cmd
         }
     }
     #[cfg(not(windows))]

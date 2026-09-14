@@ -37,6 +37,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex};
 
+use crate::platform::NoConsoleWindow;
+
 use crate::claude::{
     artifact_watcher::ArtifactWatcher, event::ChatEvent, stream_parser::StreamParser,
 };
@@ -527,12 +529,17 @@ pub async fn spawn_streaming(
                 if is_batch {
                     let mut cmd = Command::new("cmd.exe");
                     cmd.arg("/c").arg(p);
+                    cmd.no_console_window();
                     cmd
                 } else {
-                    Command::new(p)
+                    let mut cmd = Command::new(p);
+                    cmd.no_console_window();
+                    cmd
                 }
             } else {
-                Command::new("claude")
+                let mut cmd = Command::new("claude");
+                cmd.no_console_window();
+                cmd
             }
         }
         #[cfg(not(windows))]
