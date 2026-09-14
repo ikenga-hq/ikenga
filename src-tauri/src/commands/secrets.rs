@@ -997,14 +997,68 @@ fn legacy_windows_tmp_dir() -> PathBuf {
     PathBuf::from("/tmp").join("ikenga-actions")
 }
 
+/// True for a symlink or, on Windows, any reparse point (junctions, mount
+/// points). The legacy cleanup never follows or deletes through these.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_link_or_reparse_point(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Best-effort removal of the legacy env copies in `dir` (and `dir` itself
 /// if that leaves it empty). Returns how many files were removed.
+///
+/// `C:\tmp` is writable by every authenticated user, so another local user
+/// could swap `ikenga-actions` (or a file in it) for a junction/symlink
+/// into this user's profile. Everything is checked with `symlink_metadata`
+/// first: links and reparse points are skipped, and only regular files are
+/// removed. Logs carry paths only, never file contents.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn remove_legacy_env_copies(dir: &std::path::Path) -> usize {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if is_link_or_reparse_point(&meta) => {
+            tracing::warn!(
+                "vault: legacy env dir {} is a symlink or reparse point; skipping cleanup",
+                dir.display()
+            );
+            return 0;
+        }
+        Ok(meta) if meta.is_dir() => {}
+        // Absent (the common case) or not a directory: nothing to do.
+        _ => return 0,
+    }
     let mut removed = 0;
     for name in ["env-vault", "env"] {
-        if std::fs::remove_file(dir.join(name)).is_ok() {
-            removed += 1;
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if is_link_or_reparse_point(&meta) {
+            tracing::warn!(
+                "vault: legacy env file {} is a symlink or reparse point; not removing",
+                path.display()
+            );
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                "vault: could not remove legacy env file {}: {e}",
+                path.display()
+            ),
         }
     }
     // `remove_dir` refuses non-empty dirs, so anything else in there stays.
@@ -1013,8 +1067,9 @@ fn remove_legacy_env_copies(dir: &std::path::Path) -> usize {
 }
 
 /// Once per process on Windows, delete the world-readable copies earlier
-/// builds left in `C:\tmp\ikenga-actions`. Called from the single writer
-/// (`dump_to_runtime_file_locked`) so it runs before fresh copies land.
+/// builds left in `C:\tmp\ikenga-actions`. Called first thing in the single
+/// writer (`dump_to_runtime_file_locked`), before any Stronghold / manifest
+/// work, so it still runs when the vault fails to open.
 fn cleanup_legacy_windows_tmp_copies() {
     #[cfg(windows)]
     {
@@ -1088,6 +1143,9 @@ fn dump_to_runtime_file_locked<R: Runtime>(
     app: &AppHandle<R>,
     state: &Arc<Mutex<Option<Stronghold>>>,
 ) -> Result<PathBuf, String> {
+    // Before any vault work: a failed Stronghold open must not leave the
+    // world-readable legacy copies behind.
+    cleanup_legacy_windows_tmp_copies();
     let active_pid = resolve_active_project_blocking(app);
     with_stronghold(app, state, false, |sh| {
         let m_legacy = read_manifest(sh)?;
@@ -1145,8 +1203,6 @@ fn dump_to_runtime_file_locked<R: Runtime>(
             body.push_str(&shell_escape(&val));
             body.push('\n');
         }
-
-        cleanup_legacy_windows_tmp_copies();
 
         let path = runtime_env_vault_path();
         if let Some(parent) = path.parent() {
@@ -1362,6 +1418,41 @@ mod tests {
         std::fs::write(dir.join("unrelated"), "x").unwrap();
         assert_eq!(remove_legacy_env_copies(&dir), 0);
         assert!(dir.join("unrelated").exists());
+        // A same-named directory is not a regular file and is left alone.
+        std::fs::create_dir_all(dir.join("env")).unwrap();
+        assert_eq!(remove_legacy_env_copies(&dir), 0);
+        assert!(dir.join("env").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_legacy_env_copies_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        // Stand-in for a file in the victim's profile.
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("env"), "SECRET=\"v\"\n").unwrap();
+        std::fs::write(victim.join("env-vault"), "SECRET=\"v\"\n").unwrap();
+
+        // Symlinked files inside a real legacy dir: the links stay, and
+        // their targets are untouched.
+        let dir = tmp.path().join("ikenga-actions");
+        std::fs::create_dir_all(&dir).unwrap();
+        symlink(victim.join("env"), dir.join("env")).unwrap();
+        std::fs::write(dir.join("env-vault"), "K=\"v\"\n").unwrap();
+        assert_eq!(remove_legacy_env_copies(&dir), 1);
+        assert!(victim.join("env").exists());
+        assert!(std::fs::symlink_metadata(dir.join("env")).is_ok());
+        assert!(!dir.join("env-vault").exists());
+
+        // The legacy dir itself swapped for a symlink: nothing is removed.
+        let linked_dir = tmp.path().join("ikenga-actions-link");
+        symlink(&victim, &linked_dir).unwrap();
+        assert_eq!(remove_legacy_env_copies(&linked_dir), 0);
+        assert!(victim.join("env").exists());
+        assert!(victim.join("env-vault").exists());
+        assert!(std::fs::symlink_metadata(&linked_dir).is_ok());
     }
 
     #[test]

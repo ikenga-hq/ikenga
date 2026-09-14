@@ -880,7 +880,8 @@ pub fn run() {
             // Phase 14: write the runtime env-vault file so the actions
             // sidecar can read vault values via its existing dotenv loader.
             // Best-effort: a failure here just means sidecars fall through
-            // to ~/.config/pa-actions/env or ikenga/.env.
+            // to ~/.config/ikenga-actions/env (%LOCALAPPDATA%\ikenga-actions\env
+            // on Windows) or ikenga/.env.
             //
             // FE-init-fix (2026-05-13): this used to run synchronously
             // here, but Stronghold::new + get_client can block the setup
