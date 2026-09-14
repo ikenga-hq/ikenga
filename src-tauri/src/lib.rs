@@ -1457,7 +1457,8 @@ fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     // Resolve $HOME lazily — the Windows branch below doesn't need it, and
     // `std::env::var_os("HOME")` is unset there, which used to make this
     // whole function return `None` (an early-return before the Windows
-    // branch even ran, same bug fixed in `log_dir` below).
+    // branch even ran). `log_dir` has the same-shaped bug but is owned by
+    // PR #201 (fix/windows-terminal-clipboard-links-daemon).
     #[cfg(target_os = "macos")]
     {
         let home = crate::platform::home_dir()?;
@@ -1578,17 +1579,16 @@ mod cli_tests {
 
 #[cfg(feature = "desktop")]
 fn log_dir() -> Option<std::path::PathBuf> {
-    // Resolve $HOME lazily — the Windows branch doesn't need it, and raw
-    // $HOME is unset there, which used to make the whole function return
-    // `None` via an early `?` before the Windows branch ever ran.
+    let home = std::env::var_os("HOME")?;
+    // Consumed by the macOS and unix branches below; Windows uses neither.
+    #[cfg_attr(windows, allow(unused_variables))]
+    let home = std::path::PathBuf::from(home);
     #[cfg(target_os = "macos")]
     {
-        let home = crate::platform::home_dir()?;
         Some(home.join("Library/Logs/Ikenga"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let home = crate::platform::home_dir()?;
         Some(home.join(".local/share/ikenga/logs"))
     }
     #[cfg(target_os = "windows")]
