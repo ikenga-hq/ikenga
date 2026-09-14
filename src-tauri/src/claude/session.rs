@@ -37,6 +37,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, Mutex};
 
+#[cfg(windows)]
 use crate::platform::NoConsoleWindow;
 
 use crate::claude::{

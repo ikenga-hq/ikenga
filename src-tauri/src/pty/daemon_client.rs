@@ -262,18 +262,6 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
         cmd.process_group(0);
     }
 
-    #[cfg(windows)]
-    {
-        // ikenga-server.exe is a console-subsystem binary with no
-        // windows_subsystem attribute; spawned unadorned from this GUI
-        // process it pops a visible console window that stays open for the
-        // life of the detached daemon. CREATE_NEW_PROCESS_GROUP mirrors the
-        // unix process_group(0) detach above so the daemon survives the GUI
-        // window exiting/reloading.
-        use crate::platform::{NoConsoleWindow, CREATE_NEW_PROCESS_GROUP};
-        cmd.no_console_window_with(CREATE_NEW_PROCESS_GROUP);
-    }
-
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());

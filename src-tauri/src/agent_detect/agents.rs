@@ -17,6 +17,7 @@ use super::known::{
 // Only `lookup_wsl_executable` reads the family tag directly.
 #[cfg(windows)]
 use super::known::TargetFamily;
+#[cfg(windows)]
 use crate::platform::NoConsoleWindow;
 
 // Windows cold start: a freshly-installed CLI's first exec can take

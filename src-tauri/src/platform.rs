@@ -85,17 +85,13 @@ pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// for both `std::process::Command` and `tokio::process::Command`.
 ///
 /// `creation_flags` *replaces* whatever flags were previously set rather than
-/// merging with them, so a callsite that also needs e.g.
-/// `CREATE_NEW_PROCESS_GROUP` must use `no_console_window_with` instead of
-/// calling `no_console_window` and a separate `creation_flags` — the second
-/// call would clobber the first.
+/// merging with them, so a callsite that also needs additional Windows
+/// creation flags (e.g. `CREATE_NEW_PROCESS_GROUP`) must OR them together
+/// into a single `creation_flags(CREATE_NO_WINDOW | extra)` call of its own
+/// instead of calling `no_console_window()` and a separate `creation_flags()`
+/// — the second call would clobber the first.
 pub trait NoConsoleWindow {
     fn no_console_window(&mut self) -> &mut Self;
-
-    /// Like `no_console_window`, but ORs in additional Windows creation
-    /// flags (e.g. `CREATE_NEW_PROCESS_GROUP` for a detached daemon) instead
-    /// of just `CREATE_NO_WINDOW`. `extra` is ignored on non-Windows.
-    fn no_console_window_with(&mut self, extra: u32) -> &mut Self;
 }
 
 impl NoConsoleWindow for std::process::Command {
@@ -104,19 +100,6 @@ impl NoConsoleWindow for std::process::Command {
         {
             use std::os::windows::process::CommandExt;
             self.creation_flags(CREATE_NO_WINDOW);
-        }
-        self
-    }
-
-    fn no_console_window_with(&mut self, extra: u32) -> &mut Self {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            self.creation_flags(CREATE_NO_WINDOW | extra);
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = extra;
         }
         self
     }
@@ -129,18 +112,6 @@ impl NoConsoleWindow for tokio::process::Command {
         #[cfg(windows)]
         {
             self.creation_flags(CREATE_NO_WINDOW);
-        }
-        self
-    }
-
-    fn no_console_window_with(&mut self, extra: u32) -> &mut Self {
-        #[cfg(windows)]
-        {
-            self.creation_flags(CREATE_NO_WINDOW | extra);
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = extra;
         }
         self
     }

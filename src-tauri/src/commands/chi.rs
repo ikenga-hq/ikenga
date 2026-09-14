@@ -25,6 +25,7 @@ use crate::commands::claude::claude_list_sessions;
 use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
 use crate::engines::codex_pty::parser as codex_parser;
+#[cfg(windows)]
 use crate::platform::NoConsoleWindow;
 use crate::terminal::multiplexer;
 

@@ -51,6 +51,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::engines::codex_pty::parser::{parse_event, to_session_updates, ParsedEvent};
+#[cfg(windows)]
 use crate::platform::NoConsoleWindow;
 use crate::pty::PtyManager;
 
