@@ -1234,8 +1234,8 @@ pub fn run() {
         .run(|_app, event| {
             // Phase 14: best-effort cleanup of the runtime env-vault file
             // when the app is shutting down. Not critical (the file lives
-            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile), but
-            // keeps the surface tidy.
+            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
+            // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]

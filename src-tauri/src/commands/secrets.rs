@@ -20,13 +20,17 @@
 //!     vault. `Store::keys()` is not stable across plugin versions; the
 //!     manifest is portable.
 //!   - The `secrets_dump_to_runtime_file` helper writes all key/value pairs
-//!     to an OS-runtime file (`$XDG_RUNTIME_DIR/ikenga-actions/env-vault` or
-//!     `$TMPDIR/ikenga-actions/env-vault` on macOS) so sidecar processes can
-//!     read them via the existing dotenv loader. The runtime file is chmod
-//!     0600 and cleaned up on app quit.
+//!     to an OS-runtime file (`$XDG_RUNTIME_DIR/ikenga-actions/env-vault`,
+//!     `$TMPDIR/ikenga-actions/env-vault` on macOS, or
+//!     `%LOCALAPPDATA%\ikenga-actions\env-vault` on Windows) so sidecar
+//!     processes can read them via the existing dotenv loader. The runtime
+//!     file is chmod 0600 on unix (Windows relies on the user-profile ACL)
+//!     and cleaned up on app quit. On Windows, copies that older builds left
+//!     in the world-readable `C:\tmp\ikenga-actions` are deleted once per run.
 //!   - A second **durable** copy is written to
-//!     `$XDG_CONFIG_HOME/ikenga-actions/env` (Linux) or
-//!     `~/Library/Application Support/ikenga-actions/env` (macOS) on every
+//!     `$XDG_CONFIG_HOME/ikenga-actions/env` (Linux),
+//!     `~/Library/Application Support/ikenga-actions/env` (macOS) or
+//!     `%LOCALAPPDATA%\ikenga-actions\env` (Windows) on every
 //!     `secrets_set` / `secrets_delete`. This file survives shell restarts so
 //!     the mutation-worker daemon can send overnight with the shell closed.
 //!     It is NOT cleaned up on quit — that is by design.
@@ -913,10 +917,13 @@ pub fn bulk_set<R: Runtime>(
 
 // ─── Runtime env-vault file (for the actions sidecar) ────────────────────────
 
-/// Path to the runtime env-vault file. macOS uses `$TMPDIR`, others use
-/// `$XDG_RUNTIME_DIR` (with a `/tmp` fallback). chmod 600.
+/// Path to the runtime env-vault file. macOS uses `$TMPDIR`, Windows uses
+/// `%LOCALAPPDATA%` (see `windows_local_appdata_base`), others use
+/// `$XDG_RUNTIME_DIR` (with a `/tmp` fallback). chmod 600 on unix.
 pub fn runtime_env_vault_path() -> PathBuf {
-    let base: PathBuf = if cfg!(target_os = "macos") {
+    let base: PathBuf = if cfg!(windows) {
+        windows_secrets_base()
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -932,10 +939,13 @@ pub fn runtime_env_vault_path() -> PathBuf {
 /// vault. The mutation-worker daemon reads this path when the shell is not
 /// running (overnight sends). Uses `$XDG_CONFIG_HOME` on Linux, or
 /// `~/Library/Application Support` on macOS, falling back to `~/.config`
-/// if neither env var is set. chmod 600. NOT cleaned up on app quit — the
-/// file's whole purpose is to survive the shell being closed.
+/// if neither env var is set; `%LOCALAPPDATA%` on Windows. chmod 600 on
+/// unix. NOT cleaned up on app quit — the file's whole purpose is to
+/// survive the shell being closed.
 pub fn durable_env_path() -> PathBuf {
-    let base: PathBuf = if cfg!(target_os = "macos") {
+    let base: PathBuf = if cfg!(windows) {
+        windows_secrets_base()
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -949,6 +959,77 @@ pub fn durable_env_path() -> PathBuf {
             })
     };
     base.join("ikenga-actions").join("env")
+}
+
+/// Windows base dir for both env files. Without this branch the unix
+/// fallbacks resolved `/tmp` to `C:\tmp`, a folder any local user can read
+/// (and Authenticated Users can modify), and chmod 0600 is a no-op there.
+/// `%LOCALAPPDATA%` sits in the user profile, which is ACL'd to that user
+/// by default. Local rather than Roaming (`%APPDATA%`) on purpose: Roaming
+/// is synced to domain profile servers, and these files hold plaintext
+/// secrets that must stay on this machine.
+fn windows_secrets_base() -> PathBuf {
+    windows_local_appdata_base(
+        std::env::var_os("LOCALAPPDATA"),
+        crate::platform::home_dir(),
+    )
+    // No profile hint at all (never on a real user session): the Win32
+    // temp dir is still per-user, unlike `C:\tmp`.
+    .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Pure resolution for `windows_secrets_base`, split out so the Linux CI
+/// can test it: `%LOCALAPPDATA%`, else `<home>\AppData\Local`.
+fn windows_local_appdata_base(
+    local_appdata: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    local_appdata
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| home.map(|h| h.join("AppData").join("Local")))
+}
+
+/// Where builds before the Windows branch above wrote both env files on
+/// Windows (`C:\tmp\ikenga-actions`). Resolved exactly as the old code did.
+#[cfg(windows)]
+fn legacy_windows_tmp_dir() -> PathBuf {
+    PathBuf::from("/tmp").join("ikenga-actions")
+}
+
+/// Best-effort removal of the legacy env copies in `dir` (and `dir` itself
+/// if that leaves it empty). Returns how many files were removed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn remove_legacy_env_copies(dir: &std::path::Path) -> usize {
+    let mut removed = 0;
+    for name in ["env-vault", "env"] {
+        if std::fs::remove_file(dir.join(name)).is_ok() {
+            removed += 1;
+        }
+    }
+    // `remove_dir` refuses non-empty dirs, so anything else in there stays.
+    let _ = std::fs::remove_dir(dir);
+    removed
+}
+
+/// Once per process on Windows, delete the world-readable copies earlier
+/// builds left in `C:\tmp\ikenga-actions`. Called from the single writer
+/// (`dump_to_runtime_file_locked`) so it runs before fresh copies land.
+fn cleanup_legacy_windows_tmp_copies() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = legacy_windows_tmp_dir();
+            let removed = remove_legacy_env_copies(&dir);
+            if removed > 0 {
+                tracing::info!(
+                    "vault: removed {removed} legacy env file(s) from {}",
+                    dir.display()
+                );
+            }
+        });
+    }
 }
 
 fn shell_escape(value: &str) -> String {
@@ -1065,6 +1146,8 @@ fn dump_to_runtime_file_locked<R: Runtime>(
             body.push('\n');
         }
 
+        cleanup_legacy_windows_tmp_copies();
+
         let path = runtime_env_vault_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir runtime: {e}"))?;
@@ -1082,7 +1165,7 @@ fn dump_to_runtime_file_locked<R: Runtime>(
                 .map_err(|e| format!("chmod runtime: {e}"))?;
         }
 
-        // Also write the durable copy at ~/.config/ikenga-actions/env so the
+        // Also write the durable copy (`durable_env_path`) so the
         // mutation-worker daemon can read credentials while the shell is closed
         // (overnight sends). Failure is non-fatal — the volatile runtime vault
         // is still the primary path; log and continue.
@@ -1215,8 +1298,9 @@ mod tests {
     fn durable_env_path_ends_with_expected_suffix() {
         let p = durable_env_path();
         let s = p.to_string_lossy();
+        // Component-wise so the `\` separator on Windows still matches.
         assert!(
-            s.ends_with("ikenga-actions/env"),
+            p.ends_with(std::path::Path::new("ikenga-actions").join("env")),
             "durable_env_path should end with ikenga-actions/env, got: {s}"
         );
         // Must NOT be inside a volatile tmp/runtime dir.
@@ -1224,6 +1308,60 @@ mod tests {
             !s.contains("/run/user/") && !s.starts_with("/tmp"),
             "durable_env_path must not point to a volatile runtime dir, got: {s}"
         );
+    }
+
+    #[test]
+    fn windows_base_prefers_local_appdata_then_home() {
+        let local = PathBuf::from("C:/Users/me/AppData/Local");
+        assert_eq!(
+            windows_local_appdata_base(
+                Some(local.clone().into_os_string()),
+                Some(PathBuf::from("C:/Users/other"))
+            ),
+            Some(local)
+        );
+        // Empty LOCALAPPDATA falls through to the profile dir.
+        let home = PathBuf::from("C:/Users/me");
+        assert_eq!(
+            windows_local_appdata_base(Some("".into()), Some(home.clone())),
+            Some(home.join("AppData").join("Local"))
+        );
+        // Nothing to go on: no silent `/tmp` default.
+        assert_eq!(windows_local_appdata_base(None, None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_env_paths_are_not_under_tmp() {
+        let legacy = legacy_windows_tmp_dir();
+        for p in [runtime_env_vault_path(), durable_env_path()] {
+            assert!(
+                !p.starts_with(&legacy) && !p.starts_with("/tmp") && !p.starts_with("C:\\tmp"),
+                "Windows env path must not be under C:\\tmp, got: {}",
+                p.display()
+            );
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            assert!(runtime_env_vault_path().starts_with(PathBuf::from(&local)));
+            assert!(durable_env_path().starts_with(PathBuf::from(&local)));
+        }
+    }
+
+    #[test]
+    fn remove_legacy_env_copies_deletes_files_and_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ikenga-actions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("env-vault"), "K=\"v\"\n").unwrap();
+        std::fs::write(dir.join("env"), "K=\"v\"\n").unwrap();
+        assert_eq!(remove_legacy_env_copies(&dir), 2);
+        assert!(!dir.exists());
+        // Idempotent, and a dir holding anything else is left in place.
+        assert_eq!(remove_legacy_env_copies(&dir), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("unrelated"), "x").unwrap();
+        assert_eq!(remove_legacy_env_copies(&dir), 0);
+        assert!(dir.join("unrelated").exists());
     }
 
     #[test]
