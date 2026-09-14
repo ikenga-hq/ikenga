@@ -7,7 +7,9 @@ import { useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
+import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
+import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
 import {
 	evaluateTerminalKey,
 	getDefaultKeybindings,
@@ -605,6 +607,18 @@ export function XTermHost({
 				theme: readThemeFromCssVars(dark),
 				macOptionIsMeta: true,
 				convertEol: false,
+				// Every local PTY on Windows is ConPTY, which repaints rows with
+				// explicit CRLFs — and xterm clears `isWrapped` on every explicit
+				// line feed. So a URL or path that soft-wrapped (e.g. claude's
+				// /login link) lost its continuation flag, and both WebLinksAddon
+				// and path-links.ts only linkified it when it fit on one row. This
+				// turns on xterm's ConPTY heuristic: a row whose last cell is
+				// non-blank is treated as wrapping into the next. (Deprecated alias
+				// of `windowsPty`, used because the non-deprecated form only enables
+				// the heuristic for builds < 21376, which this Windows 11 isn't —
+				// yet the CRLF repaints still happen.) Side effect: no reflow on
+				// resize, which ConPTY redraws itself anyway.
+				windowsMode: isWindows,
 				linkHandler: {
 					activate: (_e: MouseEvent, text: string) => {
 						if (/^[a-z]+:\/\//i.test(text) && !text.startsWith('file://')) {
@@ -675,6 +689,24 @@ export function XTermHost({
 					}
 				} catch {
 					/* ignore malformed OSC 7 */
+				}
+				return true;
+			});
+
+			// OSC 52: clipboard write from the app inside the PTY
+			// (`\x1b]52;c;<base64>\x07`). This is how TUIs that own the mouse —
+			// the claude CLI among them — put their own selection on the system
+			// clipboard. Read queries (`?`) are ignored: letting a PTY program
+			// read the clipboard is an exfiltration vector.
+			term.parser.registerOscHandler(52, (data) => {
+				const sep = data.indexOf(';');
+				const payload = sep === -1 ? data : data.slice(sep + 1);
+				if (!payload || payload === '?') return true;
+				try {
+					const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+					writeClipboardText(new TextDecoder().decode(bytes)).catch(() => {});
+				} catch {
+					/* ignore malformed OSC 52 */
 				}
 				return true;
 			});
@@ -836,7 +868,7 @@ export function XTermHost({
 			if (action === 'copy') {
 				const sel = term.getSelection();
 				if (sel) {
-					navigator.clipboard.writeText(sel).catch(() => {});
+					writeClipboardText(sel).catch(() => {});
 					return false;
 				}
 				// On Mac with Cmd+C, if no selection, fall through to PTY (SIGINT).
@@ -844,12 +876,38 @@ export function XTermHost({
 				return false;
 			}
 
-			if (action === 'paste') {
-				navigator.clipboard
-					.readText()
-					.then((t) => term.paste(t))
+			// Paste goes through the Tauri clipboard plugin, not
+			// `navigator.clipboard.readText()` — WebView2 gates the latter behind
+			// a per-origin "wants to see text copied to the clipboard" prompt,
+			// and a dismissed prompt made paste fail silently.
+			const pasteNow = () => {
+				readClipboardText()
+					.then((t) => {
+						if (t) term.paste(t);
+					})
 					.catch(() => {});
+			};
+			if (action === 'paste') {
+				e.preventDefault();
+				pasteNow();
 				return false;
+			}
+
+			// Windows/Linux conveniences on top of the Ctrl+Shift defaults,
+			// matching Windows Terminal: plain Ctrl+C copies only when there is a
+			// selection (otherwise it stays SIGINT), and plain Ctrl+V pastes.
+			if (!mac && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+				const k = e.key.toLowerCase();
+				if (k === 'c' && term.hasSelection()) {
+					writeClipboardText(term.getSelection()).catch(() => {});
+					term.clearSelection();
+					return false;
+				}
+				if (k === 'v') {
+					e.preventDefault();
+					pasteNow();
+					return false;
+				}
 			}
 
 			if (action === 'find') {
@@ -1200,7 +1258,7 @@ export function XTermHost({
 						disabled={!termRef.current?.hasSelection()}
 						onClick={() => {
 							const sel = termRef.current?.getSelection();
-							if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+							if (sel) writeClipboardText(sel).catch(() => {});
 							setContextMenu(null);
 						}}
 						style={{
@@ -1222,8 +1280,7 @@ export function XTermHost({
 					<button
 						type="button"
 						onClick={() => {
-							navigator.clipboard
-								.readText()
+							readClipboardText()
 								.then((t) => {
 									if (t) {
 										livePtyRef.current?.write(t).catch(() => {});
