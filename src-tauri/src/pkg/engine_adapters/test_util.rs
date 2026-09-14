@@ -35,6 +35,7 @@ pub(super) fn test_lock() -> MutexGuard<'static, ()> {
 /// `set_var` and `remove_var`.
 pub(super) struct HomeGuard {
     previous: Option<std::ffi::OsString>,
+    previous_userprofile: Option<std::ffi::OsString>,
     _tmp: tempfile::TempDir,
 }
 
@@ -43,8 +44,14 @@ impl HomeGuard {
         let tmp = tempfile::tempdir().expect("tempdir");
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
+        // `home_dir()` prefers USERPROFILE on Windows, so it must also be
+        // pointed at the tempdir there or adapter code under test would
+        // resolve the real user profile instead of the isolated fixture.
+        let previous_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("USERPROFILE", tmp.path());
         Self {
             previous,
+            previous_userprofile,
             _tmp: tmp,
         }
     }
@@ -55,6 +62,10 @@ impl Drop for HomeGuard {
         match self.previous.take() {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+        match self.previous_userprofile.take() {
+            Some(h) => std::env::set_var("USERPROFILE", h),
+            None => std::env::remove_var("USERPROFILE"),
         }
     }
 }

@@ -542,9 +542,8 @@ fn map_path_err(e: anyhow::Error) -> StoreError {
 // ─── Path resolution ──────────────────────────────────────────────────────────
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("HOME not set"))
+    // $HOME is unset on Windows; route through the platform resolver.
+    crate::platform::home_dir().ok_or_else(|| anyhow!("home directory not found"))
 }
 
 /// `<dir>/.claude` for a project root, or `~/.claude` for workspace scope.
@@ -858,9 +857,12 @@ mod tests {
         let baseline = fs::read(&claude_json).unwrap();
 
         // Run enable+disable with HOME overridden. Env mutation is process-wide
-        // — guard it for this single-threaded test path.
+        // — guard it for this single-threaded test path. USERPROFILE too,
+        // since `home_dir()` prefers it on Windows.
         let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
         std::env::set_var("HOME", home);
+        std::env::set_var("USERPROFILE", home);
 
         let def = json!({ "type": "stdio", "command": "royalti-mcp", "args": [] });
         enable_mcp("workspace", None, "royalti", def).unwrap();
@@ -881,10 +883,14 @@ mod tests {
         disable_mcp("workspace", None, "royalti").unwrap();
         let after_remove = fs::read(&claude_json).unwrap();
 
-        // Restore HOME before any assertion can early-return.
+        // Restore HOME/USERPROFILE before any assertion can early-return.
         match prev_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+        match prev_userprofile {
+            Some(h) => std::env::set_var("USERPROFILE", h),
+            None => std::env::remove_var("USERPROFILE"),
         }
 
         assert_eq!(
@@ -946,6 +952,7 @@ mod tests {
 
     struct HomeGuard {
         previous: Option<std::ffi::OsString>,
+        previous_userprofile: Option<std::ffi::OsString>,
         _tmp: tempfile::TempDir,
     }
     impl HomeGuard {
@@ -953,8 +960,14 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let previous = std::env::var_os("HOME");
             std::env::set_var("HOME", tmp.path());
+            // `home_dir()` prefers USERPROFILE on Windows, so it must be
+            // pointed at the tempdir too or these tests would resolve the
+            // real user profile there instead of the fixture.
+            let previous_userprofile = std::env::var_os("USERPROFILE");
+            std::env::set_var("USERPROFILE", tmp.path());
             Self {
                 previous,
+                previous_userprofile,
                 _tmp: tmp,
             }
         }
@@ -967,6 +980,10 @@ mod tests {
             match self.previous.take() {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+            match self.previous_userprofile.take() {
+                Some(h) => std::env::set_var("USERPROFILE", h),
+                None => std::env::remove_var("USERPROFILE"),
             }
         }
     }

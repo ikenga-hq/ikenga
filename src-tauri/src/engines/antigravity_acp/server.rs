@@ -178,7 +178,11 @@ impl AntigravityEngine {
             .entry(thread_id)
             .or_insert_with(|| {
                 let resolved = if cwd.is_empty() {
-                    std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+                    // $HOME is unset on Windows; fall back to the platform
+                    // resolver, and only to "/" if that also comes up empty.
+                    crate::platform::home_dir()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/".to_string())
                 } else {
                     cwd
                 };

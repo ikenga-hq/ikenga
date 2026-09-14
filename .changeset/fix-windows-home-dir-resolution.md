@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": patch
+---
+
+Windows home-directory resolution. Over a dozen production call sites read raw `$HOME` — unset on a normal Windows GUI launch — instead of the existing `platform::home_dir()` helper (which falls back to `%USERPROFILE%`/`%HOMEDRIVE%%HOMEPATH%`), so Claude session discovery, agent-ops, backups, the claude-store hook/MCP/skill installer, PATH augmentation, engine default-cwd resolution, and the screenshot-CLI control path all silently failed or fell back to `/` on Windows. `log_dir()` and `screenshot_cli_control_path()` also had an early `HOME`-read `?` that returned `None` before ever reaching the Windows branch, which doesn't need `HOME` at all — restructured so the Windows branch resolves independently. `npx skills add`'s sandboxed install now also pins `USERPROFILE` alongside `HOME`, since Node's `os.homedir()` reads `USERPROFILE` on Windows and the previous sandbox was a no-op there. Test helpers that fake `HOME` now set/restore `USERPROFILE` too, so they stay hermetic under the new resolver.

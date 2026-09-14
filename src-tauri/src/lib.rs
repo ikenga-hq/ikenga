@@ -1454,18 +1454,22 @@ fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     // lives. Pre-strip this hardcoded `io.royalti.pa.desktop`, which had
     // drifted from the real bundle id `app.ikenga` and broke the CLI on
     // any clean install.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    // Resolve $HOME lazily — the Windows branch below doesn't need it, and
+    // `std::env::var_os("HOME")` is unset there, which used to make this
+    // whole function return `None` (an early-return before the Windows
+    // branch even ran, same bug fixed in `log_dir` below).
     #[cfg(target_os = "macos")]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join("Library/Application Support/app.ikenga/control.json"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join(".local/share/app.ikenga/control.json"))
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = home;
         std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .map(|p| p.join("app.ikenga").join("control.json"))
@@ -1574,16 +1578,17 @@ mod cli_tests {
 
 #[cfg(feature = "desktop")]
 fn log_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    // Consumed by the macOS and unix branches below; Windows uses neither.
-    #[cfg_attr(windows, allow(unused_variables))]
-    let home = std::path::PathBuf::from(home);
+    // Resolve $HOME lazily — the Windows branch doesn't need it, and raw
+    // $HOME is unset there, which used to make the whole function return
+    // `None` via an early `?` before the Windows branch ever ran.
     #[cfg(target_os = "macos")]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join("Library/Logs/Ikenga"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join(".local/share/ikenga/logs"))
     }
     #[cfg(target_os = "windows")]

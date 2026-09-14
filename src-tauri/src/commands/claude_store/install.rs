@@ -167,7 +167,11 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
     let mut c = Command::new("npx");
     c.args(["--yes", "skills", "add", spec])
         .current_dir(staging)
-        .env("HOME", staging);
+        .env("HOME", staging)
+        // Node's `os.homedir()` reads %USERPROFILE% on Windows, not $HOME —
+        // without this the sandbox is a no-op there and `skills add` writes
+        // into the real user profile instead of `staging`.
+        .env("USERPROFILE", staging);
     let out = c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
@@ -194,7 +198,9 @@ fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
     let mut c = Command::new("npx");
     c.args(["--yes", "skills", "add", spec, "--skill", "*"])
         .current_dir(staging)
-        .env("HOME", staging);
+        .env("HOME", staging)
+        // See npx_skills_add: os.homedir() reads %USERPROFILE% on Windows.
+        .env("USERPROFILE", staging);
     let out = c.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()

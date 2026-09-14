@@ -873,7 +873,8 @@ pub fn project_skills_list(
         }
     }
     if include_user_global {
-        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        // $HOME is unset on Windows; route through the platform resolver.
+        if let Some(home) = crate::platform::home_dir() {
             let global_skills = home.join(".claude").join("skills");
             for s in list_skills_in_dir(&global_skills, "user") {
                 if seen_slugs.contains(&s.slug) {

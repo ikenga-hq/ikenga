@@ -936,15 +936,17 @@ pub fn runtime_env_vault_path() -> PathBuf {
 /// file's whole purpose is to survive the shell being closed.
 pub fn durable_env_path() -> PathBuf {
     let base: PathBuf = if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+        crate::platform::home_dir()
+            .map(|h| h.join("Library").join("Application Support"))
             .unwrap_or_else(|| PathBuf::from("/tmp"))
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(".config"))
+                // $HOME is unset on Windows; route through the platform
+                // resolver rather than silently falling all the way to /tmp.
+                crate::platform::home_dir()
+                    .map(|h| h.join(".config"))
                     .unwrap_or_else(|| PathBuf::from("/tmp"))
             })
     };

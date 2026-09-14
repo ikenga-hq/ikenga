@@ -226,7 +226,8 @@ impl ClaudeCodeEngine {
                     Some(req_cwd.clone())
                 }
             })
-            .or_else(|| std::env::var("HOME").ok())
+            // $HOME is unset on Windows; fall back to the platform resolver.
+            .or_else(|| crate::platform::home_dir().map(|p| p.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "/".to_string());
 
         // Phase 3 ignores `mcp_servers` — claude already wires its own MCP
