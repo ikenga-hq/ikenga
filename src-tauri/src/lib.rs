@@ -880,7 +880,8 @@ pub fn run() {
             // Phase 14: write the runtime env-vault file so the actions
             // sidecar can read vault values via its existing dotenv loader.
             // Best-effort: a failure here just means sidecars fall through
-            // to ~/.config/pa-actions/env or ikenga/.env.
+            // to ~/.config/ikenga-actions/env (%LOCALAPPDATA%\ikenga-actions\env
+            // on Windows) or ikenga/.env.
             //
             // FE-init-fix (2026-05-13): this used to run synchronously
             // here, but Stronghold::new + get_client can block the setup
@@ -1234,8 +1235,8 @@ pub fn run() {
         .run(|_app, event| {
             // Phase 14: best-effort cleanup of the runtime env-vault file
             // when the app is shutting down. Not critical (the file lives
-            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile), but
-            // keeps the surface tidy.
+            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
+            // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]
