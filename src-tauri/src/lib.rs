@@ -880,7 +880,8 @@ pub fn run() {
             // Phase 14: write the runtime env-vault file so the actions
             // sidecar can read vault values via its existing dotenv loader.
             // Best-effort: a failure here just means sidecars fall through
-            // to ~/.config/pa-actions/env or ikenga/.env.
+            // to ~/.config/ikenga-actions/env (%LOCALAPPDATA%\ikenga-actions\env
+            // on Windows) or ikenga/.env.
             //
             // FE-init-fix (2026-05-13): this used to run synchronously
             // here, but Stronghold::new + get_client can block the setup
@@ -1234,8 +1235,8 @@ pub fn run() {
         .run(|_app, event| {
             // Phase 14: best-effort cleanup of the runtime env-vault file
             // when the app is shutting down. Not critical (the file lives
-            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile), but
-            // keeps the surface tidy.
+            // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
+            // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]
@@ -1454,18 +1455,23 @@ fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     // lives. Pre-strip this hardcoded `io.royalti.pa.desktop`, which had
     // drifted from the real bundle id `app.ikenga` and broke the CLI on
     // any clean install.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    // Resolve $HOME lazily — the Windows branch below doesn't need it, and
+    // `std::env::var_os("HOME")` is unset there, which used to make this
+    // whole function return `None` (an early-return before the Windows
+    // branch even ran). `log_dir` has the same-shaped bug but is owned by
+    // PR #201 (fix/windows-terminal-clipboard-links-daemon).
     #[cfg(target_os = "macos")]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join("Library/Application Support/app.ikenga/control.json"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join(".local/share/app.ikenga/control.json"))
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = home;
         std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .map(|p| p.join("app.ikenga").join("control.json"))
@@ -1574,18 +1580,19 @@ mod cli_tests {
 
 #[cfg(feature = "desktop")]
 fn log_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    // Consumed by the macOS and unix branches below; Windows uses neither.
-    #[cfg_attr(windows, allow(unused_variables))]
-    let home = std::path::PathBuf::from(home);
     #[cfg(target_os = "macos")]
     {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
         Some(home.join("Library/Logs/Ikenga"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
         Some(home.join(".local/share/ikenga/logs"))
     }
+    // No HOME lookup here: Windows doesn't set HOME for a normal GUI launch, and
+    // an early `var_os("HOME")?` used to return None before reaching this branch,
+    // so the installed app wrote no log file at all.
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("LOCALAPPDATA")

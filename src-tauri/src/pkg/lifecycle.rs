@@ -1779,12 +1779,28 @@ mod tests {
     async fn restart_from_stopped_resets_to_spawning() {
         // Phase 9: operator restart of a Stopped one-shot must work the same
         // way as restart from Parked — re-launch a fresh supervisor task.
+        //
+        // restart() itself resets the state to Spawning synchronously (see
+        // `claim_terminal_to_spawning`), but it also spawns a fresh
+        // `supervisor_loop` task via `tauri::async_runtime::spawn` — which
+        // runs on Tauri's own global multi-thread runtime, not this test's
+        // `#[tokio::test]` runtime. That task really spawns the declared
+        // command and can drive the state past Spawning (Crashed/Stopped)
+        // on its own OS thread at any time, racing the assertion below. A
+        // command that exits immediately (`/bin/true`) made that race easy
+        // to lose under load: the child could exit, the handshake write
+        // could hit a closed pipe, and the loop could flip the state to
+        // Stopped before this thread's `current_state()` read. `sleep`
+        // keeps the child (and thus Spawning) alive for seconds — many
+        // orders of magnitude longer than the synchronous check below
+        // needs — so the assertion is effectively deterministic without
+        // weakening what's being verified (restart() really relaunches).
         let sidecar = Arc::new(SupervisedSidecar::new(
             "x".into(),
             McpServer {
                 name: "t".into(),
-                command: "/bin/true".into(),
-                args: vec![],
+                command: "/bin/sleep".into(),
+                args: vec!["2".into()],
                 env: HashMap::new(),
                 lifecycle: Some("long-lived".into()),
                 restart_when_changed: vec![],
@@ -1804,12 +1820,26 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_restart_clears_blocked_state() {
+        // The Parked branch below has the same race as
+        // `restart_from_stopped_resets_to_spawning` above: restart() resets
+        // state to Spawning synchronously but then spawns a fresh
+        // `supervisor_loop` task onto Tauri's global runtime (a real,
+        // separate multi-thread runtime — see the comment on that test).
+        // That task can reach the OS, spawn the declared command, have it
+        // exit, and drive the state to Crashed *before* this thread's
+        // `current_state()` assertion runs. `/bin/false` used to make that
+        // failure trivially fast (CI: "expected Spawning ... got Crashed
+        // { ..., last_err: \"write initialize: Broken pipe\" }") since the
+        // handshake write raced the child's near-instant exit. `sleep`
+        // keeps the child alive well past the synchronous check, without
+        // changing what the test verifies (restart() from Parked resets to
+        // Spawning and relaunches a fresh supervisor task).
         let sidecar = Arc::new(SupervisedSidecar::new(
             "x".into(),
             McpServer {
                 name: "t".into(),
-                command: "/bin/false".into(),
-                args: vec![],
+                command: "/bin/sleep".into(),
+                args: vec!["2".into()],
                 env: HashMap::new(),
                 lifecycle: Some("long-lived".into()),
                 restart_when_changed: vec![],

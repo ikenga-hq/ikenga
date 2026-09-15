@@ -2186,7 +2186,8 @@ pub(crate) fn expand(input: &str) -> Result<PathBuf> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // $HOME is unset on Windows; route through the platform resolver.
+    crate::platform::home_dir()
 }
 
 pub(crate) fn mtime_ms(p: &Path) -> i64 {
@@ -3122,6 +3123,7 @@ mod tests {
 
     struct HomeGuard {
         previous: Option<std::ffi::OsString>,
+        previous_userprofile: Option<std::ffi::OsString>,
         _tmp: tempfile::TempDir,
     }
     impl HomeGuard {
@@ -3129,8 +3131,14 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             let previous = std::env::var_os("HOME");
             std::env::set_var("HOME", tmp.path());
+            // `home_dir()` prefers USERPROFILE on Windows, so it must also be
+            // pointed at the tempdir there or these tests would scan the
+            // real user profile instead of the isolated fixture.
+            let previous_userprofile = std::env::var_os("USERPROFILE");
+            std::env::set_var("USERPROFILE", tmp.path());
             Self {
                 previous,
+                previous_userprofile,
                 _tmp: tmp,
             }
         }
@@ -3143,6 +3151,10 @@ mod tests {
             match self.previous.take() {
                 Some(h) => std::env::set_var("HOME", h),
                 None => std::env::remove_var("HOME"),
+            }
+            match self.previous_userprofile.take() {
+                Some(h) => std::env::set_var("USERPROFILE", h),
+                None => std::env::remove_var("USERPROFILE"),
             }
         }
     }

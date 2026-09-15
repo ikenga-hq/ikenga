@@ -939,7 +939,9 @@ fn strip_home_prefix<'a>(value: &'a str, home: &str) -> Option<&'a str> {
 }
 
 fn current_home_dir() -> Option<String> {
-    std::env::var("HOME").ok().filter(|s| !s.is_empty())
+    // $HOME is unset on Windows; go through the platform resolver and
+    // convert back to the String this callsite's callers expect.
+    crate::platform::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 // ─── NDJSON text-export + loader (WP-06, G-03 / decision 7) ─────────────────

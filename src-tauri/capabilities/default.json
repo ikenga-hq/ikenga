@@ -27,6 +27,7 @@
     "process:allow-restart",
     "global-shortcut:default",
     "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "notification:default",
     "notification:allow-notify",
     "notification:allow-is-permission-granted",

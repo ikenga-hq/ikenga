@@ -332,7 +332,11 @@ fn build_augmented_path() -> OsString {
 
     // Candidate per-user bin dirs to append as fallbacks.
     let mut extras: Vec<PathBuf> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // Not unix-only: cargo/bun/npm-global all install under `<home>/.xxx/bin`
+    // on Windows too (rustup, bun, and nvm-windows all keep the same
+    // relative layout under %USERPROFILE%), so this needs to resolve there —
+    // raw $HOME does not.
+    if let Some(home) = crate::platform::home_dir() {
         extras.push(home.join(".local/bin"));
         extras.push(home.join(".bun/bin"));
         extras.push(home.join(".cargo/bin"));
