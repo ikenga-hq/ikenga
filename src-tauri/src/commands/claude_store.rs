@@ -792,8 +792,10 @@ fn is_enabled_in(scope_claude: &Path, store: &Path, kind: Kind, name: &str) -> b
 async fn resolve_scope_claude(db: &Arc<PaDb>, scope: &str) -> Result<PathBuf, String> {
     validate_pin_scope(scope)?;
     if scope == "workspace" {
-        let home = std::env::var_os("HOME").ok_or_else(|| "HOME not set".to_string())?;
-        return Ok(PathBuf::from(home).join(".claude"));
+        // $HOME is unset on Windows; route through the platform resolver.
+        let home =
+            crate::platform::home_dir().ok_or_else(|| "home directory not found".to_string())?;
+        return Ok(home.join(".claude"));
     }
     let id = scope
         .strip_prefix("project:")
@@ -929,9 +931,8 @@ fn fragment_target_path(
     hook_file: Option<HookFileTag>,
 ) -> Result<PathBuf, String> {
     let home = || {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| "HOME not set".to_string())
+        // $HOME is unset on Windows; route through the platform resolver.
+        crate::platform::home_dir().ok_or_else(|| "home directory not found".to_string())
     };
     match kind {
         Kind::Hook => {
@@ -2092,9 +2093,8 @@ fn copy_cross_engine_row(
 /// The user home dir (`$HOME`). Resolved at the command boundary and threaded
 /// into the pure file-path core so the core itself never touches the env.
 fn user_home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME not set".to_string())
+    // $HOME is unset on Windows; route through the platform resolver.
+    crate::platform::home_dir().ok_or_else(|| "home directory not found".to_string())
 }
 
 /// Resolve a `ClaudeStoreScope` string to the scope ROOT (the parent of the
@@ -2104,8 +2104,10 @@ fn user_home_dir() -> Result<PathBuf, String> {
 async fn resolve_scope_root_dir(db: &Arc<PaDb>, scope: &str) -> Result<PathBuf, String> {
     validate_pin_scope(scope)?;
     if scope == "workspace" {
-        let home = std::env::var_os("HOME").ok_or_else(|| "HOME not set".to_string())?;
-        return Ok(PathBuf::from(home));
+        // $HOME is unset on Windows; route through the platform resolver.
+        let home =
+            crate::platform::home_dir().ok_or_else(|| "home directory not found".to_string())?;
+        return Ok(home);
     }
     let id = scope
         .strip_prefix("project:")

@@ -708,7 +708,8 @@ fn push_source(map: &mut HashMap<String, Vec<AssetSource>>, src: AssetSource) {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // Raw $HOME is unset on Windows; route through the shared resolver.
+    crate::platform::home_dir()
 }
 
 fn expand(input: &str) -> Result<PathBuf, String> {

@@ -1455,18 +1455,23 @@ fn screenshot_cli_control_path() -> Option<std::path::PathBuf> {
     // lives. Pre-strip this hardcoded `io.royalti.pa.desktop`, which had
     // drifted from the real bundle id `app.ikenga` and broke the CLI on
     // any clean install.
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    // Resolve $HOME lazily — the Windows branch below doesn't need it, and
+    // `std::env::var_os("HOME")` is unset there, which used to make this
+    // whole function return `None` (an early-return before the Windows
+    // branch even ran). `log_dir` has the same-shaped bug but is owned by
+    // PR #201 (fix/windows-terminal-clipboard-links-daemon).
     #[cfg(target_os = "macos")]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join("Library/Application Support/app.ikenga/control.json"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = crate::platform::home_dir()?;
         Some(home.join(".local/share/app.ikenga/control.json"))
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = home;
         std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .map(|p| p.join("app.ikenga").join("control.json"))

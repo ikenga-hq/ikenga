@@ -26,9 +26,8 @@ use std::time::Duration;
 // ─── path resolution ─────────────────────────────────────────────────────────
 
 fn home() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME not set".to_string())
+    // $HOME is unset on Windows; route through the platform resolver.
+    crate::platform::home_dir().ok_or_else(|| "home directory not found".to_string())
 }
 
 fn daemon_lock_path() -> Result<PathBuf, String> {

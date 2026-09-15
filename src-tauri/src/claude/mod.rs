@@ -42,13 +42,14 @@ pub fn slug_to_project_dir(slug: &str) -> String {
 /// Resolve `~/.claude/projects/<slug>` for a given slug.
 #[allow(dead_code)]
 pub fn project_log_dir(slug: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    // $HOME is unset on Windows; use the platform resolver.
+    let home = crate::platform::home_dir()?;
     Some(home.join(".claude").join("projects").join(slug))
 }
 
 /// `~/.claude/projects/` root.
 pub fn projects_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = crate::platform::home_dir()?;
     Some(home.join(".claude").join("projects"))
 }
 
