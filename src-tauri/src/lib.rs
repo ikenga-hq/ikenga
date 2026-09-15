@@ -1574,18 +1574,19 @@ mod cli_tests {
 
 #[cfg(feature = "desktop")]
 fn log_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    // Consumed by the macOS and unix branches below; Windows uses neither.
-    #[cfg_attr(windows, allow(unused_variables))]
-    let home = std::path::PathBuf::from(home);
     #[cfg(target_os = "macos")]
     {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
         Some(home.join("Library/Logs/Ikenga"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
         Some(home.join(".local/share/ikenga/logs"))
     }
+    // No HOME lookup here: Windows doesn't set HOME for a normal GUI launch, and
+    // an early `var_os("HOME")?` used to return None before reaching this branch,
+    // so the installed app wrote no log file at all.
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("LOCALAPPDATA")

@@ -1,7 +1,7 @@
 //! Desktop PtyManager daemon client.
 //!
 //! Discovers a running `ikenga-server` daemon or launches one in a detached
-//! process with a 500ms timeout. Decouples PTY process lifecycle from the
+//! process and waits up to [`SPAWN_READY_TIMEOUT`] for it to become healthy. Decouples PTY process lifecycle from the
 //! desktop Tauri GUI window so terminal sessions survive app restarts and reloads.
 
 use std::path::{Path, PathBuf};
@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+/// How long a freshly spawned daemon gets to answer `/api/health`. This was
+/// 500ms, which no cold start on Windows ever met: measured 574–1744ms for a
+/// debug `ikenga-server.exe` (Defender scans the image on first exec), so every
+/// launch fell back to ephemeral while the daemon came up a moment later. Only
+/// paid when no daemon is already running.
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_millis(3000);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,11 +269,23 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
         cmd.process_group(0);
     }
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `ikenga-server.exe` is a console-subsystem binary: spawned from the GUI
+        // app without CREATE_NO_WINDOW, Windows opens a console window for it.
+        // CREATE_NEW_PROCESS_GROUP is the Windows analogue of `process_group(0)`
+        // above — console Ctrl+C/Ctrl+Break aimed at us doesn't reach the daemon.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to spawn ikenga-server daemon ({e}); falling back to ephemeral mode");
@@ -275,12 +294,13 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
     };
 
     let pid = child.id();
-    info!("Spawned detached ikenga-server (pid {pid}) on {http_url}, awaiting readiness (timeout 500ms)...");
+    info!(
+        "Spawned detached ikenga-server (pid {pid}) on {http_url}, awaiting readiness (timeout {}ms)...",
+        SPAWN_READY_TIMEOUT.as_millis()
+    );
 
-    // Poll health endpoint for up to 500ms
     let start = Instant::now();
-    let timeout = Duration::from_millis(500);
-    while start.elapsed() < timeout {
+    while start.elapsed() < SPAWN_READY_TIMEOUT {
         if probe_health(&http_url, 40) {
             info!(
                 "ikenga-server daemon became ready in {}ms",
@@ -300,6 +320,13 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    warn!("ikenga-server daemon did not become healthy within 500ms timeout; falling back to ephemeral in-process mode");
+    warn!(
+        "ikenga-server daemon did not become healthy within {}ms; falling back to ephemeral in-process mode",
+        SPAWN_READY_TIMEOUT.as_millis()
+    );
+    // Don't leave it running: it would come up on port 4000 holding a token only
+    // this call knew, and the next launch's port-4000 probe would find a healthy
+    // daemon it can't authenticate to.
+    let _ = child.kill();
     DaemonInfo::default()
 }
