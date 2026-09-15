@@ -37,6 +37,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::commands::db::PaDb;
+use crate::platform::NoConsoleWindow;
 
 /// The installed pkg id whose `install_path` carries the prebuilt sidecar.
 const SIDECAR_PKG_ID: &str = "com.ikenga.sidecar-playwright-browser";
@@ -184,7 +185,8 @@ impl PlaywrightProxy {
             .env("PATH", crate::runtime::augmented_path())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .no_console_window();
         if let Some(dir) = &pkg_dir {
             cmd.current_dir(dir);
         }

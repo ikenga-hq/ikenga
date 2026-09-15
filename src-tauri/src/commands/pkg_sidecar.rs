@@ -25,6 +25,7 @@ use tokio::time::{timeout, Duration};
 
 use crate::commands::pkg::KernelState;
 use crate::pkg::registries::SidecarsRegistry;
+use crate::platform::NoConsoleWindow;
 
 /// Tauri-state wrapper so commands can resolve sidecar paths without going
 /// through the kernel snapshot.
@@ -96,6 +97,7 @@ pub async fn pkg_sidecar_call(
     let mut cmd = Command::new(&entry.bin_path);
     cmd.args(&args);
     cmd.current_dir(&install_path);
+    cmd.no_console_window();
     // WP-23 (D-18): hand this pkg its scoped database accessor —
     // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the
     // two `/iyke/pkg-db/*` routes, enforced against this pkg's own

@@ -31,12 +31,20 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::pkg::manifest::McpServer;
+use crate::platform::NoConsoleWindow;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "ikenga-desktop";
 const CLIENT_VERSION: &str = "0.1.0";
-/// Per-call wallclock cap (initialize + tools/call). Slow servers should
-/// stream progress notifications rather than block past this.
+/// Cap on spawn -> initialize -> notifications/initialized. Split out from
+/// `CALL_TIMEOUT` because on Windows a cold-started node/bun child can take
+/// 500ms-1.7s+ just to answer its first message (Defender scans a new binary
+/// image on first exec) — that latency belongs to the handshake, not to the
+/// tool call it's followed by.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-call wallclock cap for `tools/call` itself, once the handshake above
+/// has already completed. Slow servers should stream progress notifications
+/// rather than block past this.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Run the full handshake + tools/call against a package's MCP server and
@@ -91,6 +99,7 @@ pub async fn call_tool(
     let mut cmd = Command::new(crate::runtime::resolve_command(&server.command));
     cmd.args(&server.args);
     cmd.current_dir(install_path);
+    cmd.no_console_window();
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -131,7 +140,7 @@ pub async fn call_tool(
         });
     }
 
-    let result = timeout(CALL_TIMEOUT, async {
+    timeout(HANDSHAKE_TIMEOUT, async {
         // 1. initialize
         write_line(
             &mut stdin,
@@ -158,7 +167,12 @@ pub async fn call_tool(
             }),
         )
         .await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("mcp handshake for tool `{}` timed out after {:?}", tool, HANDSHAKE_TIMEOUT))??;
 
+    let result = timeout(CALL_TIMEOUT, async {
         // 3. tools/call
         write_line(
             &mut stdin,

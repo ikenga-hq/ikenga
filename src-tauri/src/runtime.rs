@@ -46,6 +46,8 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Manager};
 
+use crate::platform::NoConsoleWindow;
+
 /// Bun's release-asset target naming for the host we're building for. Maps
 /// from Rust's `cfg(target_os/arch)` to the directory layout `fetch-bun.sh`
 /// writes to. `unsupported` means we never wrote a binary for this host —
@@ -205,7 +207,11 @@ fn resolve_bun_path(app: &AppHandle) -> Option<PathBuf> {
 /// Run `<bun> --version` and accept only if `>= BUN_VERSION`. Any spawn or
 /// parse failure returns false (treated as "not acceptable").
 fn system_bun_version_ok(p: &Path) -> bool {
-    let out = match std::process::Command::new(p).arg("--version").output() {
+    let out = match std::process::Command::new(p)
+        .arg("--version")
+        .no_console_window()
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return false,
     };

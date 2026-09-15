@@ -79,6 +79,7 @@ use tokio::time::timeout;
 
 use crate::pkg::manifest::{McpServer, Package, SettingsField};
 use crate::pkg::registry::Registry;
+use crate::platform::NoConsoleWindow;
 
 /// Per-call wallclock cap for `tools/call` against a supervised child.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,7 +92,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap on the initialize handshake. A child that can't `initialize` within
 /// this window is treated as crashed (the retry budget kicks in).
-const INIT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Windows cold start: a freshly-spawned node/bun sidecar can take
+/// 500ms-1.7s+ to answer its first message while Defender scans the new
+/// binary image on first exec. 5s was tight enough to trip the 3-strikes
+/// crash breaker on a clean install before the OS had cached the binary.
+const INIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Restart policy: at most this many crashes inside the sliding window
 /// before transitioning to Parked.
@@ -1076,6 +1082,7 @@ impl SupervisedSidecar {
         let mut cmd = Command::new(crate::runtime::resolve_command(&self.server.command));
         cmd.args(&self.server.args);
         cmd.current_dir(&self.install_path);
+        cmd.no_console_window();
 
         // Phase 5 (projects-first-class): inject IKENGA_PROJECT_ID +
         // IKENGA_PROJECT_ROOT before the manifest-declared env so a pkg
