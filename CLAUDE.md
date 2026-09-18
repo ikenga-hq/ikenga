@@ -48,9 +48,56 @@ When adding a Tauri command:
 2. Add the typed wrapper in `src/lib/tauri-cmd.ts`.
 3. Never call `invoke()` directly from components — always go through `tauri-cmd.ts`.
 
-### Shell layout (`src/shell/`)
+### Shell layout (`src/shell/`) — Phase 1 (in progress)
 
-`workspace.tsx` is the PanelGroup root with persisted sizes (`lib/layout-state.ts` → SQLite). The window is: activity-bar / sidebar / content-pane / side-pane. The side pane has tabs (Terminal | Chat | Viewer | Off). Routes render into `content-pane.tsx` via `<Outlet />`. `command-palette.tsx` is ⌘K; `native-menu.ts` is Mac-only. `mini-apps-config.ts` and `nav-config.ts` define the activity-bar entries and routing.
+The shell frame is being rearchitected around three nouns — **Project**, **Chi**, **Ngwa** — per
+`plans/shell-ux-rearchitecture/01-plan.md` (locked design D-01: `plans/shell-ux-rearchitecture/designs/frame-workbench-v4.html`).
+This lands through Phase 1 on the integration branch `feat/phase-1-frame`; as of this writing the
+code in this repo still reflects the pre-rearchitecture layout described further down under
+"Pane mount model" and elsewhere in this file — treat any mention of the current Dock module,
+`sidebar-modes/`, per-pkg rail modes, or the current side-pane tab set as the outgoing shape, not
+the target.
+
+**Target frame (Phase 1):**
+
+- **Rail** — four fixed entries: Project (`⌘1`), Chi (`⌘2`), Ngwa (`⌘3`), Settings (`⌘,`), plus
+  pinned items. Replaces the old per-pkg rail modes (today's activity-bar-entries config and
+  `pkg:${id}` modes) — pkgs no longer own a rail icon; they contribute views instead.
+- **Explorer** — the Project-mode sidebar: file tree, artifacts, sessions, ngwa-project, automations,
+  todos, scratchpads, views as collapsible sections (`ExplorerSectionState[]`, see G-STATE below),
+  replacing the current `sidebar-modes/` per-mode sidebars.
+- **Companion** — the Chi-mode panel, built from today's Dock module: a single dispatch
+  bar (target picker + input) over state panels (sessions, permission inbox, cost HUD, tool feed,
+  hooks bus) plus pkg-contributed `ui.companion_panels[]`. **A dispatch input is not a chat surface**
+  (ADR-021, amending ADR-019 `docs/adr/019-chi-first-agent-surface.md` — see
+  `../docs/adr/021-companion-dispatch-not-chat.md`): the Companion renders state only and never
+  renders model output as chat bubbles, a scrollback, or streamed/markdown-rendered assistant prose.
+  Output lives in the terminal pane or a replayed-transcript pane tab. Full forbidden/allowed table
+  and the grep-able conformance checklist: `plans/shell-ux-rearchitecture/06-interaction-spec.md` §5.4
+  and ADR-021.
+- **Keymap registry** (`src/lib/keymap`, not yet created) — the single declarative source for shortcut
+  bindings, replacing today's three inlined `keydown` handlers (`workspace.tsx`, `activity-bar.tsx`,
+  `sidebar-modes/files-mode.tsx`). Drives the `?` shortcut-overlay modal and `<kbd>` tooltips. Retired
+  this release: `⌘4`/`⌘5`/`⌘6` and their `SHORTCUT_MAP` handlers.
+- **Route map** — `/packages` → `ngwa`, `/claude` → `ngwa`, `/ngwa` → `ngwa`, `/settings` → `settings`,
+  `/chi` → `chi` (`lib/shell/mode-routes.ts`). Package routes resolve to `null`: package views live
+  under Project and no longer own a mode.
+- **Removed modes** — `CoreMode` narrows to `'project' | 'chi' | 'ngwa' | 'settings'`
+  (`ActivityMode` alias, `ACTIVITY_MODES`). The old `'app' | 'files' | 'sessions' | 'artifact-grid' | 'pkgs' | 'pkg:${id}'` modes
+  and `isPkgMode`/`pkgIdFromMode` become a `@deprecated` compile-compat shim (`LegacyActivityMode`),
+  deleted once the rail and sidebar are cut over (see the frozen contract below for the exact
+  migration mapping).
+- **Shared state contract** — the `activeMode`, `activeProject`, `explorerSections[]` and
+  `companion.activeTarget` shapes, persistence, and the v15→v16 migration are frozen in
+  `plans/shell-ux-rearchitecture/drafts/g-state.md` (gate **G-STATE**); WPs building against this
+  frame code against that file, not against any one work package's merge.
+- **Integration branch:** `feat/phase-1-frame`. Full work-package breakdown and status:
+  `plans/shell-ux-rearchitecture/05-tracking.md`.
+
+Until this Phase 1 work lands, `workspace.tsx` remains the PanelGroup root with persisted sizes
+(`lib/layout-state.ts` → SQLite): activity-bar / sidebar / content-pane / side-pane, with the
+side pane's current tab set (Terminal / Viewer / Off). Routes render into `content-pane.tsx` via
+`<Outlet />`. `command-palette.tsx` is ⌘K; `native-menu.ts` is Mac-only.
 
 ### Routes (`src/routes/`)
 
