@@ -1912,23 +1912,41 @@ fn emit(app: &AppHandle, event: &str, payload: Value) -> Result<(), (StatusCode,
 }
 
 /// Modes recognized by the in-app `useShellStore`. Kept in sync with
-/// `src/lib/shell/shell-store.ts` (`ActivityMode`). Server-side check is
-/// a sanity gate; the FE listener is the source of truth.
+/// `ACTIVITY_MODES` in `src/lib/shell/shell-store.ts` (G-STATE v16:
+/// `project | chi | ngwa | settings`). Server-side check is a sanity gate;
+/// the FE listener (`resolveIykeMode` in `control-listener.ts`) is the
+/// source of truth.
 ///
-/// CORE modes mirror the `CoreMode` union. Dynamic `pkg:<id>` modes (one per
-/// installed app pkg) are accepted by prefix — the FE reconciles a stale pkg
-/// mode to 'app' if the pkg isn't installed, so the bridge needn't know the
-/// live pkg set.
+/// For one release the pre-v16 names (`app`, `files`, `sessions`,
+/// `artifact-grid`, `pkgs`, `pkg:<id>`) are still accepted here — the FE maps
+/// them onto a v16 mode via `normalizeMode` (with a warning), so old CLIs and
+/// skills keep working. Drop them once that release window closes.
 fn is_valid_mode(m: &str) -> bool {
     matches!(
         m,
-        "app" | "files" | "sessions" | "artifact-grid" | "ngwa" | "pkgs" | "settings"
+        // v16 modes (ACTIVITY_MODES)
+        "project" | "chi" | "ngwa" | "settings"
+        // legacy, normalized FE-side by normalizeMode
+        | "app" | "files" | "sessions" | "artifact-grid" | "pkgs"
     ) || m.starts_with("pkg:")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_key_bytes;
+    use super::{is_valid_mode, terminal_key_bytes};
+
+    #[test]
+    fn is_valid_mode_accepts_v16_and_legacy_names_rejects_garbage() {
+        for m in ["project", "chi", "ngwa", "settings"] {
+            assert!(is_valid_mode(m), "v16 mode {m:?} should be accepted");
+        }
+        for m in ["app", "files", "sessions", "artifact-grid", "pkgs", "pkg:x"] {
+            assert!(is_valid_mode(m), "legacy mode {m:?} should be accepted");
+        }
+        for m in ["", "PROJECT", "mail"] {
+            assert!(!is_valid_mode(m), "garbage mode {m:?} should be rejected");
+        }
+    }
 
     #[test]
     fn terminal_key_translation_matches_frontend_sequences() {
