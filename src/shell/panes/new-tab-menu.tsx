@@ -2,6 +2,7 @@ import { Command } from 'cmdk';
 import { Hash, Terminal as TerminalIcon } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { CommandRow, type CommandRowProps } from '@/components/ui/command-row';
+import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { LeafNode, PaneView } from '@/lib/panes/types';
 import { useDefaultShellProfile } from '@/lib/shell-profiles';
@@ -84,7 +85,7 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 							}
 							Icon={TerminalIcon}
 							label={`Terminal (${selectedProfile.label})`}
-							shortcut="⌘T"
+							shortcut={labelFor('pane.new-shell-terminal')}
 						/>
 						{profiles
 							.filter((p) => p.id !== selectedProfile.id)
@@ -114,7 +115,7 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 							}
 							Icon={TerminalIcon}
 							label="Claude terminal"
-							shortcut="⌘⇧T"
+							shortcut={labelFor('pane.new-claude-terminal')}
 						/>
 						{profiles
 							.filter((p) => p.kind === 'wsl')
