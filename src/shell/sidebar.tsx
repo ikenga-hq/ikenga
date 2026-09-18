@@ -1,5 +1,11 @@
 import { usePkgActivityBarEntries } from '@/lib/pkg/use-activity-bar-entries';
-import { isPkgMode, pkgIdFromMode, useShellStore } from '@/lib/shell/shell-store';
+import {
+	type CoreMode, // TODO(WP-04)
+	isPkgMode, // TODO(WP-04): deprecated, never true after v16
+	type LegacyActivityMode, // TODO(WP-04)
+	pkgIdFromMode, // TODO(WP-04)
+	useShellStore,
+} from '@/lib/shell/shell-store';
 import { AppMode } from './sidebar-modes/app-mode';
 import { ArtifactGridMode } from './sidebar-modes/artifact-grid-mode';
 import { FilesMode } from './sidebar-modes/files-mode';
@@ -18,7 +24,8 @@ const CORE_TITLES = {
 } as const;
 
 export function Sidebar() {
-	const activeMode = useShellStore((s) => s.activeMode);
+	// TODO(WP-04): widened cast so the pre-v16 switch below still compiles (g-state.md §6).
+	const activeMode = useShellStore((s) => s.activeMode) as CoreMode | LegacyActivityMode;
 	// Entries are only consulted for the head title when in a pkg mode; the
 	// hook is cheap (one cached kernel snapshot) and safe to always call.
 	const { entries: pkgEntries } = usePkgActivityBarEntries();

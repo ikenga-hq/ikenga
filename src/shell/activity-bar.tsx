@@ -71,16 +71,19 @@ import {
 	usePinsStore,
 } from '@/lib/shell/pins-store';
 import {
-	type ActivityMode,
-	type CoreMode,
-	isPkgMode,
+	type CoreMode, // TODO(WP-03)
+	isPkgMode, // TODO(WP-03): deprecated, never true after v16
+	type LegacyActivityMode, // TODO(WP-03)
 	useShellStore,
 } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
 import { PinIcon } from './pin-icon';
 
+// TODO(WP-03): compile shim (g-state.md §6) — this pre-v16 rail still names legacy modes.
+type ActivityMode = CoreMode | LegacyActivityMode;
+
 interface CoreItem {
-	mode: CoreMode;
+	mode: ActivityMode; // TODO(WP-03)
 	label: string;
 	Icon: LucideIcon;
 	shortcut: string;
@@ -134,7 +137,7 @@ const MODE_LANDING: Partial<Record<ActivityMode, string>> = {
 // Dynamic `pkg:<id>` modes claim no workspace tint of their own — they map to
 // the neutral 'app' tint so the `[data-workspace]` cascade stays valid.
 function modeToWorkspace(mode: ActivityMode): IkengaWorkspace {
-	return isPkgMode(mode) ? 'app' : mode;
+	return isPkgMode(mode) ? 'app' : (mode as IkengaWorkspace); // TODO(WP-03)
 }
 
 // Map manifest `ui.nav[].icon` strings to LucideIcon components. Pkg authors
@@ -168,7 +171,7 @@ function iconForPkg(name: string | null | undefined): LucideIcon {
 }
 
 export function ActivityBar() {
-	const activeMode = useShellStore((s) => s.activeMode);
+	const activeMode = useShellStore((s) => s.activeMode) as ActivityMode; // TODO(WP-03)
 	const setActiveMode = useShellStore((s) => s.setActiveMode);
 	const setWorkspace = useIkengaStore((s) => s.setWorkspace);
 	const hydratePins = usePinsStore((s) => s.hydrate);
@@ -208,7 +211,7 @@ export function ActivityBar() {
 		const leaf = findLeaf(root, focusedId);
 		const view = leaf?.tabs[leaf?.activeTabIdx ?? 0];
 		const focusedPath = view?.kind === 'route' ? view.path : null;
-		if (focusedPath && modeForRoute(focusedPath) === activeMode) return;
+		if (focusedPath && (modeForRoute(focusedPath) as ActivityMode | null) === activeMode) return; // TODO(WP-03)
 		setActiveMode('app');
 	}, [pkgEntriesLoaded, pkgEntries, activeMode, setActiveMode]);
 

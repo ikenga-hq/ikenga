@@ -59,7 +59,7 @@ export function useRouterPaneSync(): void {
 			const path = focusedRoute();
 			if (path === null) return;
 			// Direction C — re-sync the activity mode to the focused route's
-			// exclusive owner (pkg:<id>, packages, ngwa, settings) so the rail
+			// exclusive owner (v16: ngwa, settings, chi) so the rail
 			// + sidebar follow a programmatic / deep-link / restored navigation
 			// the same way they follow a rail-icon click. Shared routes
 			// (sessions, artifacts, /, …) return null and leave the current
@@ -86,7 +86,7 @@ export function useRouterPaneSync(): void {
 		if (path && browserPath(router) !== path) {
 			void router.navigate({ to: path, replace: true });
 		}
-		// Cold-start Direction C: a persisted focused pane on a pkg/system
+		// Cold-start Direction C: a persisted focused pane on a mode-owned
 		// route re-syncs the activity mode on launch (same rule as Direction B).
 		const coldMode = path ? modeForRoute(path) : null;
 		if (coldMode) {
