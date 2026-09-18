@@ -7,21 +7,37 @@
 // Menu items dispatch DOM CustomEvents on `window`. Listeners (terminal-eng,
 // agent-eng, etc.) subscribe to the event names below.
 
+import { toAccelerator } from '@/lib/keymap/platform';
+import { findEntry } from '@/lib/keymap/registry';
 import { isMac } from '@/lib/platform';
 import { isTauri } from '@/lib/transport';
 
+// The View submenu used to carry two more items, each firing its own dead
+// `EVT` entry that no listener anywhere in `shell/src` ever subscribed to
+// (confirmed by grep before deletion — see WP-08 / DEC-26): one toggled the
+// side pane, the other the nav rail. The rail one was already claimed by
+// `⌘B`, so the fix is removal, not a rebind — Explorer toggle stays the
+// single `⌘B` binding registered once, in `workspace.tsx` (WP-20,
+// do-not-touch).
 const EVT = {
 	newTerminal: 'cmd:new-terminal',
 	switchAdapter: 'cmd:switch-adapter',
 	openFile: 'cmd:open-file',
 	openProjectFolder: 'cmd:open-project-folder',
-	toggleSidePane: 'cmd:toggle-side-pane',
-	toggleNavRail: 'cmd:toggle-nav-rail',
 	openCommandPalette: 'cmd:open-command-palette',
 } as const;
 
 function emit(name: string) {
 	window.dispatchEvent(new CustomEvent(name));
+}
+
+/** Native `accelerator` string for a registry command — the single source
+ *  every menu item below reads instead of a hard-coded `CmdOrCtrl+...`
+ *  literal. Falls back to `undefined` (no accelerator) if the command is
+ *  somehow missing, rather than crashing menu construction. */
+function accelerator(command: string): string | undefined {
+	const entry = findEntry(command);
+	return entry ? toAccelerator(entry.key) : undefined;
 }
 
 export async function installNativeMenu(): Promise<void> {
@@ -45,19 +61,19 @@ export async function installNativeMenu(): Promise<void> {
 				await MenuItem.new({
 					id: 'new-session',
 					text: 'New Session',
-					accelerator: 'CmdOrCtrl+N',
+					accelerator: accelerator('menu.new-session'),
 					action: () => emit(EVT.newTerminal),
 				}),
 				await MenuItem.new({
 					id: 'open-file',
 					text: 'Open File…',
-					accelerator: 'CmdOrCtrl+O',
+					accelerator: accelerator('menu.open-file'),
 					action: () => emit(EVT.openFile),
 				}),
 				await MenuItem.new({
 					id: 'open-project',
 					text: 'Open Project Folder…',
-					accelerator: 'CmdOrCtrl+Shift+O',
+					accelerator: accelerator('menu.open-project-folder'),
 					action: () => emit(EVT.openProjectFolder),
 				}),
 			],
@@ -82,37 +98,27 @@ export async function installNativeMenu(): Promise<void> {
 				await MenuItem.new({
 					id: 'new-terminal',
 					text: 'New Terminal',
-					accelerator: 'CmdOrCtrl+T',
+					accelerator: accelerator('menu.new-terminal'),
 					action: () => emit(EVT.newTerminal),
 				}),
 				await MenuItem.new({
 					id: 'switch-adapter',
 					text: 'Switch Adapter (coming soon)',
-					accelerator: 'CmdOrCtrl+Shift+A',
+					accelerator: accelerator('session.switch-adapter'),
 					action: () => emit(EVT.switchAdapter),
 				}),
 			],
 		});
 
+		// The two dead side-pane / nav-rail toggle items were removed from
+		// here (WP-08 / DEC-26) — see the note above `EVT`.
 		const viewSubmenu = await Submenu.new({
 			text: 'View',
 			items: [
 				await MenuItem.new({
-					id: 'toggle-side-pane',
-					text: 'Toggle Side Pane',
-					accelerator: 'CmdOrCtrl+\\',
-					action: () => emit(EVT.toggleSidePane),
-				}),
-				await MenuItem.new({
-					id: 'toggle-nav-rail',
-					text: 'Toggle Nav Rail',
-					accelerator: 'CmdOrCtrl+B',
-					action: () => emit(EVT.toggleNavRail),
-				}),
-				await MenuItem.new({
 					id: 'command-palette',
 					text: 'Command Palette',
-					accelerator: 'CmdOrCtrl+K',
+					accelerator: accelerator('palette.open'),
 					action: () => emit(EVT.openCommandPalette),
 				}),
 			],

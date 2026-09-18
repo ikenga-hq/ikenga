@@ -1,4 +1,5 @@
 import { RefreshCw, SplitSquareHorizontal, SplitSquareVertical, X } from 'lucide-react';
+import { labelFor } from '@/lib/keymap/registry';
 import type { PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
@@ -41,7 +42,7 @@ export function PaneToolbar({ paneId }: PaneToolbarProps) {
 			<IconButton
 				onClick={() => splitPane(paneId, 'horizontal')}
 				disabled={splitDisabled}
-				title={splitTitle ?? 'Split right (⌘\\)'}
+				title={splitTitle ?? `Split right (${labelFor('pane.split-right')})`}
 				aria-label="Split right"
 			>
 				<SplitSquareHorizontal className="h-3.5 w-3.5" />
@@ -49,7 +50,7 @@ export function PaneToolbar({ paneId }: PaneToolbarProps) {
 			<IconButton
 				onClick={() => splitPane(paneId, 'vertical')}
 				disabled={splitDisabled}
-				title={splitTitle ?? 'Split down (⌘⇧\\)'}
+				title={splitTitle ?? `Split down (${labelFor('pane.split-down')})`}
 				aria-label="Split down"
 			>
 				<SplitSquareVertical className="h-3.5 w-3.5" />

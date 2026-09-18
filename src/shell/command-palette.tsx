@@ -22,6 +22,7 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CommandRow, type CommandRowProps } from '@/components/ui/command-row';
 import { useFocusReturn, useFocusTrap } from '@/lib/a11y/focus';
+import { isTypingTarget, labelFor } from '@/lib/keymap/registry';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneNode, PaneView } from '@/lib/panes/types';
@@ -189,7 +190,7 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 												}
 												Icon={Plus}
 												label="New Terminal"
-												shortcut="⌃T"
+												shortcut={labelFor('pane.new-shell-terminal')}
 											/>
 											<PaletteItem
 												onSelect={() =>
@@ -200,20 +201,20 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 												}
 												Icon={Plus}
 												label="New Claude Terminal"
-												shortcut="⌃⇧T"
+												shortcut={labelFor('pane.new-claude-terminal')}
 											/>
 											<PaletteItem
 												onSelect={() => go('/projects/new-artifact')}
 												Icon={Sparkles}
 												label="New artifact…"
-												shortcut="⌘⇧N"
+												shortcut={labelFor('pane.new-artifact')}
 											/>
 											<PaletteItem
 												onSelect={() => onOpenChange(false)}
 												disabled={true}
 												Icon={RefreshCw}
 												label="Switch Adapter (coming soon)"
-												shortcut="⌘⇧A"
+												shortcut={labelFor('session.switch-adapter')}
 											/>
 											<PaletteItem
 												onSelect={() => onOpenChange(false)}
@@ -710,6 +711,12 @@ interface PaletteState {
 export function useCommandPalette() {
 	const [state, setState] = useState<PaletteState>({ open: false, mode: 'all' });
 	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	// Read synchronously inside the keydown handler so the *close* branch
+	// below doesn't depend on a stale closure over `state.open`.
+	const openRef = useRef(state.open);
+	useEffect(() => {
+		openRef.current = state.open;
+	}, [state.open]);
 
 	// Return focus to the trigger element when the palette closes (Esc, scrim
 	// click, row select). cmdk manages its own internal focus while open but
@@ -721,8 +728,19 @@ export function useCommandPalette() {
 			const mod = e.metaKey || e.ctrlKey;
 			const key = e.key.toLowerCase();
 			if (mod && key === 'k') {
-				e.preventDefault();
-				setState((s) => ({ open: !s.open, mode: 'all' }));
+				// `palette.open` (mod+k, not-input) is guarded the same way every
+				// other frame shortcut is (D3): typing in a text field never opens
+				// the palette out from under the caret. But that guard must not
+				// apply to *closing* it — the palette's own cmdk search input is
+				// itself a typing target, and ⌘K has always toggled it closed
+				// from there (spec §2, "⌘K should work as today").
+				if (openRef.current) {
+					e.preventDefault();
+					setState((s) => ({ open: false, mode: s.mode }));
+				} else if (!isTypingTarget(e.target)) {
+					e.preventDefault();
+					setState({ open: true, mode: 'all' });
+				}
 			} else if (e.key === 'Escape') {
 				setState({ open: false, mode: 'all' });
 			}

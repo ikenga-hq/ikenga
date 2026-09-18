@@ -56,6 +56,7 @@ import { cn } from '@/components/ui/utils';
 import { type IkengaMode, type IkengaWorkspace, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
+import { labelFor, useKey } from '@/lib/keymap/registry';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import {
 	type PkgActivityBarEntry,
@@ -89,16 +90,43 @@ interface CoreItem {
 	shortcut: string;
 }
 
+// Rail mode → keymap registry command (src/lib/keymap/defaults.ts). Single
+// source of truth for both the label shown in each rail button's tooltip and
+// the physical key the ⌘1..⌘6/⌘, handler below listens for — nothing in this
+// file hard-codes a key label or a key character anymore (WP-08).
+const RAIL_COMMAND: Record<
+	'app' | 'files' | 'sessions' | 'artifact-grid' | 'pkgs' | 'ngwa' | 'settings',
+	string
+> = {
+	app: 'rail.app',
+	files: 'rail.files',
+	sessions: 'rail.sessions',
+	'artifact-grid': 'rail.artifact-grid',
+	pkgs: 'rail.pkgs',
+	ngwa: 'rail.ngwa',
+	settings: 'rail.settings',
+};
+
 // Post-strip: workspace surfaces up top, system surfaces (packages,
 // settings) at the bottom. App pkgs no longer claim rail icons.
 // Artifact-grid lives in the top rail because it's the per-project
 // authoring surface — same shape as App / Files / Sessions. Uses
 // `Grid3x3` so it doesn't collide visually with App's `LayoutGrid`.
 const CORE_TOP: CoreItem[] = [
-	{ mode: 'app', label: 'App', Icon: LayoutGrid, shortcut: '⌘1' },
-	{ mode: 'files', label: 'Files', Icon: Folder, shortcut: '⌘2' },
-	{ mode: 'sessions', label: 'Sessions', Icon: SquareTerminal, shortcut: '⌘3' },
-	{ mode: 'artifact-grid', label: 'Artifact grid', Icon: Grid3x3, shortcut: '⌘4' },
+	{ mode: 'app', label: 'App', Icon: LayoutGrid, shortcut: labelFor(RAIL_COMMAND.app) },
+	{ mode: 'files', label: 'Files', Icon: Folder, shortcut: labelFor(RAIL_COMMAND.files) },
+	{
+		mode: 'sessions',
+		label: 'Sessions',
+		Icon: SquareTerminal,
+		shortcut: labelFor(RAIL_COMMAND.sessions),
+	},
+	{
+		mode: 'artifact-grid',
+		label: 'Artifact grid',
+		Icon: Grid3x3,
+		shortcut: labelFor(RAIL_COMMAND['artifact-grid']),
+	},
 ];
 
 // Packages + Ngwa sit above Settings — system-level surfaces (registry,
@@ -107,20 +135,10 @@ const CORE_TOP: CoreItem[] = [
 // mode, replacing the old App-mode /claude NavItem. The Layers glyph reads
 // as the layered config store (Ọba) it manages.
 const CORE_BOTTOM: CoreItem[] = [
-	{ mode: 'pkgs', label: 'Packages', Icon: Package, shortcut: '⌘5' },
-	{ mode: 'ngwa', label: 'Ngwa', Icon: Layers, shortcut: '⌘6' },
-	{ mode: 'settings', label: 'Settings', Icon: Settings, shortcut: '⌘,' },
+	{ mode: 'pkgs', label: 'Packages', Icon: Package, shortcut: labelFor(RAIL_COMMAND.pkgs) },
+	{ mode: 'ngwa', label: 'Ngwa', Icon: Layers, shortcut: labelFor(RAIL_COMMAND.ngwa) },
+	{ mode: 'settings', label: 'Settings', Icon: Settings, shortcut: labelFor(RAIL_COMMAND.settings) },
 ];
-
-const SHORTCUT_MAP: Record<string, ActivityMode> = {
-	'1': 'app',
-	'2': 'files',
-	'3': 'sessions',
-	'4': 'artifact-grid',
-	'5': 'pkgs',
-	'6': 'ngwa',
-	',': 'settings',
-};
 
 /** Landing route per mode — used by ⌘N shortcut + click. Settings + Packages
  *  + Ngwa navigate the focused pane; App / Files / Sessions reuse whatever the
@@ -258,24 +276,24 @@ export function ActivityBar() {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
 
-	useEffect(() => {
-		function onKey(e: KeyboardEvent) {
-			const mod = e.metaKey || e.ctrlKey;
-			if (!mod || e.shiftKey || e.altKey) return;
-			const target = e.target as HTMLElement | null;
-			if (target?.matches('input, textarea, [contenteditable="true"]')) return;
-			const next = SHORTCUT_MAP[e.key];
-			if (!next) return;
-			e.preventDefault();
-			setActiveMode(next);
-			const landing = MODE_LANDING[next];
-			if (landing) {
-				usePaneStore.getState().navigateFocused(landing);
-			}
+	// Each rail mode's ⌘1..⌘6/⌘, binding is a registry entry with `when:
+	// 'not-input'` (defaults.ts) — `useKey()` is the one place that guard
+	// lives (D3) rather than the ad-hoc `target.matches(...)` check this
+	// listener used to duplicate.
+	function selectRailMode(mode: ActivityMode) {
+		setActiveMode(mode);
+		const landing = MODE_LANDING[mode];
+		if (landing) {
+			usePaneStore.getState().navigateFocused(landing);
 		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-	}, [setActiveMode]);
+	}
+	useKey(RAIL_COMMAND.app, () => selectRailMode('app'));
+	useKey(RAIL_COMMAND.files, () => selectRailMode('files'));
+	useKey(RAIL_COMMAND.sessions, () => selectRailMode('sessions'));
+	useKey(RAIL_COMMAND['artifact-grid'], () => selectRailMode('artifact-grid'));
+	useKey(RAIL_COMMAND.pkgs, () => selectRailMode('pkgs'));
+	useKey(RAIL_COMMAND.ngwa, () => selectRailMode('ngwa'));
+	useKey(RAIL_COMMAND.settings, () => selectRailMode('settings'));
 
 	const hasAnyPins =
 		hydrated &&
@@ -453,9 +471,10 @@ function ProjectIndicator() {
 
 	const abbrev = active ? projectAbbrev(active) : '··';
 	const color = active?.color ?? '#7c7c7c';
+	const switchHint = labelFor('palette.projects');
 	const title = active
-		? `Project: ${active.display_name}${active.root_path ? `\nRoot: ${active.root_path}` : ''}\n(⌘P to switch)`
-		: 'No active project (⌘P to switch)';
+		? `Project: ${active.display_name}${active.root_path ? `\nRoot: ${active.root_path}` : ''}\n(${switchHint} to switch)`
+		: `No active project (${switchHint} to switch)`;
 
 	return (
 		<Popover open={open} onOpenChange={setOpen}>
