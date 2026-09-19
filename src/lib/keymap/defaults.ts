@@ -51,59 +51,38 @@ export interface KeymapEntry {
 }
 
 export const DEFAULT_KEYMAP: KeymapEntry[] = [
-	// --- Rail (src/shell/activity-bar.tsx) ---
-	// `knownOverlap` on rail.app..rail.ngwa: on non-mac, `mod+N` resolves to
-	// the literal `ctrl+N` that `pane.focus-N` (global, workspace.tsx) is
+	// --- Rail (src/shell/activity-bar.tsx) — WP-03: Project · Chi · Ngwa ·
+	// Settings (spec §2). ⌘4–⌘6 are retired and deliberately left unbound this
+	// release (§2 "Retired", §7 Q2) — no entry, so nothing fires and nothing
+	// can be labelled with them.
+	// `knownOverlap` on rail.project..rail.ngwa: on non-mac, `mod+N` resolves
+	// to the literal `ctrl+N` that `pane.focus-N` (global, workspace.tsx) is
 	// also bound to. Both are live `window` keydown listeners and neither
-	// calls `stopPropagation`, so today a non-mac Ctrl+1 both switches the
-	// rail AND focuses pane 1 — a real, shipped parallel-fire, not a clash.
+	// calls `stopPropagation`, so a non-mac Ctrl+1 both switches the rail AND
+	// focuses pane 1 — a shipped parallel-fire, not a clash.
 	{
-		command: 'rail.app',
+		command: 'rail.project',
 		key: 'mod+1',
 		when: 'not-input',
 		source: 'default',
-		label: 'Rail → App',
+		label: 'Rail → Project',
 		knownOverlap: ['pane.focus-1'],
 	},
 	{
-		command: 'rail.files',
+		command: 'rail.chi',
 		key: 'mod+2',
 		when: 'not-input',
 		source: 'default',
-		label: 'Rail → Files',
+		label: 'Rail → Chi',
 		knownOverlap: ['pane.focus-2'],
 	},
 	{
-		command: 'rail.sessions',
+		command: 'rail.ngwa',
 		key: 'mod+3',
 		when: 'not-input',
 		source: 'default',
-		label: 'Rail → Sessions',
-		knownOverlap: ['pane.focus-3'],
-	},
-	{
-		command: 'rail.artifact-grid',
-		key: 'mod+4',
-		when: 'not-input',
-		source: 'default',
-		label: 'Rail → Artifact grid',
-		knownOverlap: ['pane.focus-4'],
-	},
-	{
-		command: 'rail.pkgs',
-		key: 'mod+5',
-		when: 'not-input',
-		source: 'default',
-		label: 'Rail → Packages',
-		knownOverlap: ['pane.focus-5'],
-	},
-	{
-		command: 'rail.ngwa',
-		key: 'mod+6',
-		when: 'not-input',
-		source: 'default',
 		label: 'Rail → Ngwa',
-		knownOverlap: ['pane.focus-6'],
+		knownOverlap: ['pane.focus-3'],
 	},
 	{
 		command: 'rail.settings',

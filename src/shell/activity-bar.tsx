@@ -1,40 +1,42 @@
-import { useQuery } from '@tanstack/react-query';
+// The rail (WP-03): Project · Chi · Ngwa · pins · Settings.
+//
+// Three nouns, one surface each (DEC-1): Project (⌘1) owns the workbench,
+// Chi (⌘2) brings the Companion forward, Ngwa (⌘3) is the equipment
+// catalogue that absorbed Packages. Below them sit the user's pins (a
+// package's rail presence is a pin since WP-22 seeded one per former rail
+// icon), then Settings (⌘,) at the foot. ⌘4–⌘6 are retired and unbound.
+//
+// Keyboard: the rail is one tab stop (roving tabindex, spec §1.4); ↑/↓ move
+// between items, Home/End jump, Enter/Space activate. Every item has a
+// 400 ms tooltip carrying its key hint from the keymap registry (§1.3) and
+// an inset focus ring (§1.2). The first-contact gloss for the lore nouns is
+// `rail-gloss.tsx`.
+//
+// Re-homed out of the rail (see the WP-03 PR's affordance account): the
+// pending-approvals badge → the status bar's permissions segment (WP-09;
+// meanwhile ⌘K → "Approvals"), the theme toggle → a ⌘K palette action
+// (WP-09) and Settings › Appearance. The active-project indicator stays at
+// the rail foot until WP-09 lifts it into the title row.
+
 import {
-	Activity,
-	AlertTriangle,
-	CheckSquare,
-	Clock,
+	ArrowDown,
+	ArrowUp,
 	Folder,
 	FolderKanban,
-	GitBranch,
-	GitCommit,
-	GitFork,
-	GitGraph,
-	GitPullRequest,
-	Grid3x3,
-	Layers,
-	LayoutDashboard,
-	LayoutGrid,
-	ListChecks,
+	HeartPulse,
 	type LucideIcon,
-	Mail,
-	Monitor,
-	Moon,
 	Package,
 	Pencil,
 	Pin as PinGlyph,
 	PinOff,
 	Plus,
-	Send,
 	Settings,
 	Settings2,
 	SquareDashed,
-	SquareTerminal,
-	Sun,
+	Store,
 	Trash2,
-	TrendingUp,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	ContextMenu,
@@ -52,148 +54,167 @@ import {
 	DialogTitle,
 } from '@/components/ui/dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/components/ui/utils';
-import { type IkengaMode, type IkengaWorkspace, useIkengaStore } from '@/lib/ikenga/theme-store';
-import { usePaneStore } from '@/lib/panes/pane-store';
-import { findLeaf } from '@/lib/panes/pane-reducer';
+import { useIkengaStore } from '@/lib/ikenga/theme-store';
 import { labelFor, useKey } from '@/lib/keymap/registry';
-import { modeForRoute } from '@/lib/shell/mode-routes';
+import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	type PkgActivityBarEntry,
 	usePkgActivityBarEntries,
 } from '@/lib/pkg/use-activity-bar-entries';
-import { paActionsListQueryOptions } from '@/lib/queries/pa-actions';
 import { useUpdatesAvailable } from '@/lib/registry/use-updates-available';
 import {
+	computeReorderIds,
 	dispatchPinSelection,
 	type Pin,
 	type Section,
 	useActivityBarPins,
 	usePinsStore,
 } from '@/lib/shell/pins-store';
-import {
-	type CoreMode, // TODO(WP-03)
-	isPkgMode, // TODO(WP-03): deprecated, never true after v16
-	type LegacyActivityMode, // TODO(WP-03)
-	useShellStore,
-} from '@/lib/shell/shell-store';
+import { type CoreMode, useShellStore } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
+import { focusCompanion } from './companion-focus';
 import { PinIcon } from './pin-icon';
+import { RailGloss, type RailGlossTerm } from './rail-gloss';
 
-// TODO(WP-03): compile shim (g-state.md §6) — this pre-v16 rail still names legacy modes.
-type ActivityMode = CoreMode | LegacyActivityMode;
+// ─── Rail keys ────────────────────────────────────────────────────────────
 
-interface CoreItem {
-	mode: ActivityMode; // TODO(WP-03)
-	label: string;
-	Icon: LucideIcon;
-	shortcut: string;
+/** Glyphs from the locked frame (`designs/frame-workbench-v4.html` `#i-chi`,
+ *  `#i-ngwa`), drawn on the same 16-unit grid and stroked with currentColor
+ *  so the tint cascade colours them like the lucide glyphs beside them. */
+function ChiGlyph({ className }: { className?: string }) {
+	return (
+		<svg
+			viewBox="0 0 16 16"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.4}
+			strokeLinecap="round"
+			strokeLinejoin="round"
+			aria-hidden="true"
+			className={className}
+		>
+			<path d="M8 2v12" />
+			<path d="M3.5 5.5 8 8l4.5-2.5" />
+			<path d="M3.5 11 8 8.5 12.5 11" />
+		</svg>
+	);
 }
 
-// Rail mode → keymap registry command (src/lib/keymap/defaults.ts). Single
-// source of truth for both the label shown in each rail button's tooltip and
-// the physical key the ⌘1..⌘6/⌘, handler below listens for — nothing in this
-// file hard-codes a key label or a key character anymore (WP-08).
-const RAIL_COMMAND: Record<
-	'app' | 'files' | 'sessions' | 'artifact-grid' | 'pkgs' | 'ngwa' | 'settings',
-	string
-> = {
-	app: 'rail.app',
-	files: 'rail.files',
-	sessions: 'rail.sessions',
-	'artifact-grid': 'rail.artifact-grid',
-	pkgs: 'rail.pkgs',
-	ngwa: 'rail.ngwa',
-	settings: 'rail.settings',
+function NgwaGlyph({ className }: { className?: string }) {
+	return (
+		<svg
+			viewBox="0 0 16 16"
+			fill="none"
+			stroke="currentColor"
+			strokeWidth={1.4}
+			strokeLinejoin="round"
+			aria-hidden="true"
+			className={className}
+		>
+			<path d="M3 3h4.5v4.5H3z" />
+			<path d="M8.5 3H13v4.5H8.5z" />
+			<path d="M3 8.5h4.5V13H3z" />
+			<path d="M8.5 8.5H13V13H8.5z" />
+		</svg>
+	);
+}
+
+interface RailKeyDef {
+	mode: CoreMode;
+	label: string;
+	/** Keymap registry command (src/lib/keymap/defaults.ts, `rail.*`). */
+	command: string;
+	Icon: LucideIcon | typeof ChiGlyph;
+}
+
+const TOP_KEYS: readonly RailKeyDef[] = [
+	{ mode: 'project', label: 'Project', command: 'rail.project', Icon: Folder },
+	{ mode: 'chi', label: 'Chi', command: 'rail.chi', Icon: ChiGlyph },
+	{ mode: 'ngwa', label: 'Ngwa', command: 'rail.ngwa', Icon: NgwaGlyph },
+];
+
+const SETTINGS_KEY: RailKeyDef = {
+	mode: 'settings',
+	label: 'Settings',
+	command: 'rail.settings',
+	Icon: Settings,
 };
 
-// Post-strip: workspace surfaces up top, system surfaces (packages,
-// settings) at the bottom. App pkgs no longer claim rail icons.
-// Artifact-grid lives in the top rail because it's the per-project
-// authoring surface — same shape as App / Files / Sessions. Uses
-// `Grid3x3` so it doesn't collide visually with App's `LayoutGrid`.
-const CORE_TOP: CoreItem[] = [
-	{ mode: 'app', label: 'App', Icon: LayoutGrid, shortcut: labelFor(RAIL_COMMAND.app) },
-	{ mode: 'files', label: 'Files', Icon: Folder, shortcut: labelFor(RAIL_COMMAND.files) },
-	{
-		mode: 'sessions',
-		label: 'Sessions',
-		Icon: SquareTerminal,
-		shortcut: labelFor(RAIL_COMMAND.sessions),
-	},
-	{
-		mode: 'artifact-grid',
-		label: 'Artifact grid',
-		Icon: Grid3x3,
-		shortcut: labelFor(RAIL_COMMAND['artifact-grid']),
-	},
-];
-
-// Packages + Ngwa sit above Settings — system-level surfaces (registry,
-// Claude-config management), not per-workspace entries like the top rail.
-// Ngwa (⌘6) graduates the Claude-config browser into its own activity-bar
-// mode, replacing the old App-mode /claude NavItem. The Layers glyph reads
-// as the layered config store (Ọba) it manages.
-const CORE_BOTTOM: CoreItem[] = [
-	{ mode: 'pkgs', label: 'Packages', Icon: Package, shortcut: labelFor(RAIL_COMMAND.pkgs) },
-	{ mode: 'ngwa', label: 'Ngwa', Icon: Layers, shortcut: labelFor(RAIL_COMMAND.ngwa) },
-	{ mode: 'settings', label: 'Settings', Icon: Settings, shortcut: labelFor(RAIL_COMMAND.settings) },
-];
-
-/** Landing route per mode — used by ⌘N shortcut + click. Settings + Packages
- *  + Ngwa navigate the focused pane; App / Files / Sessions reuse whatever the
- *  user last looked at in that mode (handled by tab-workspace state). Ngwa's
- *  Browse surface (the 2-pane Claude-config list/detail) is owned by WP-07,
- *  which fills the `/claude` route the sidebar deep-links into. */
-const MODE_LANDING: Partial<Record<ActivityMode, string>> = {
+/** Landing route per mode, navigated in the focused pane on click / key.
+ *  Project and Chi keep whatever the pane shows. */
+const MODE_LANDING: Partial<Record<CoreMode, string>> = {
 	settings: '/settings/appearance',
-	pkgs: '/packages/browse',
+	// TODO(WP-10): '/ngwa/installed' (spec §2 ⌘3) once that route exists.
 	ngwa: '/claude',
 };
 
-// Workspace tint mirrors core mode 1:1 post-strip; no mini-app rollup.
-// Dynamic `pkg:<id>` modes claim no workspace tint of their own — they map to
-// the neutral 'app' tint so the `[data-workspace]` cascade stays valid.
-function modeToWorkspace(mode: ActivityMode): IkengaWorkspace {
-	return isPkgMode(mode) ? 'app' : (mode as IkengaWorkspace); // TODO(WP-03)
+/** Ngwa's context menu (spec §3.1 row 3) — the pointer path to what used to
+ *  be the Packages rail key. Health is the kernel status page, which also
+ *  carries the "parked" state the old per-pkg rail icons showed. */
+const NGWA_MENU: ReadonlyArray<{ label: string; to: string; Icon: LucideIcon }> = [
+	{ label: 'Installed', to: '/packages', Icon: Package },
+	{ label: 'Store', to: '/packages/browse', Icon: Store },
+	{ label: 'Health', to: '/pkg-kernel-status', Icon: HeartPulse },
+];
+
+/** Tier-1 lore nouns on the rail get the first-contact gloss (spec §1.3,
+ *  "Gloss scope: rail keys for Chi and Ngwa only"). Ngwa first, as in the
+ *  locked frame; Chi on a later launch. */
+function glossTerms(): RailGlossTerm[] {
+	return [
+		{
+			term: 'ngwa',
+			text: 'Ngwa — your equipment',
+			keyLabel: labelFor('rail.ngwa'),
+			anchor: 'ngwa',
+		},
+		{
+			term: 'chi',
+			text: 'Chi — your engine session',
+			keyLabel: labelFor('rail.chi'),
+			anchor: 'chi',
+		},
+	];
 }
 
-// Map manifest `ui.nav[].icon` strings to LucideIcon components. Pkg authors
-// reference icons by name; the shell controls which ones are actually
-// available. Unknown names fall back to a generic `Package` glyph.
-const PKG_ICONS: Record<string, LucideIcon> = {
-	activity: Activity,
-	clock: Clock,
-	'check-square': CheckSquare,
-	'layout-dashboard': LayoutDashboard,
-	'list-checks': ListChecks,
-	'trending-up': TrendingUp,
-	send: Send,
-	mail: Mail,
-	folder: Folder,
-	'folder-kanban': FolderKanban,
-	pencil: Pencil,
-	package: Package,
-	'git-branch': GitBranch,
-	'git-fork': GitFork,
-	'git-pull-request': GitPullRequest,
-	'git-commit': GitCommit,
-	'git-graph': GitGraph,
-	history: Clock,
-	'layout-grid': LayoutGrid,
-};
+// ─── Roving tabindex ─────────────────────────────────────────────────────
 
-function iconForPkg(name: string | null | undefined): LucideIcon {
-	if (name && name in PKG_ICONS) return PKG_ICONS[name]!;
-	return Package;
+interface RovingApi {
+	tabIndexFor: (id: string) => 0 | -1;
+	onItemFocus: (id: string) => void;
 }
+
+const RovingContext = createContext<RovingApi>({
+	tabIndexFor: () => 0,
+	onItemFocus: () => {},
+});
+
+const ROVING_KEYS = new Set(['ArrowDown', 'ArrowUp', 'Home', 'End']);
+
+/** ↑/↓ (wrapping) and Home/End over every `[data-rail-item]` in DOM order.
+ *  Exported for the component test. */
+export function railKeyTarget(key: string, count: number, index: number): number {
+	if (key === 'Home') return 0;
+	if (key === 'End') return count - 1;
+	if (key === 'ArrowDown') return (index + 1) % count;
+	return (index - 1 + count) % count;
+}
+
+// ─── The rail ────────────────────────────────────────────────────────────
 
 export function ActivityBar() {
-	const activeMode = useShellStore((s) => s.activeMode) as ActivityMode; // TODO(WP-03)
+	const activeMode = useShellStore((s) => s.activeMode);
 	const setActiveMode = useShellStore((s) => s.setActiveMode);
 	const setWorkspace = useIkengaStore((s) => s.setWorkspace);
 	const hydratePins = usePinsStore((s) => s.hydrate);
 	const { sections, pinsBySection, sectionLessPins, hydrated } = useActivityBarPins();
+	const updatesAvailable = useUpdatesAvailable();
+	const pinStatus = usePinPkgStatus();
+	const railRef = useRef<HTMLElement>(null);
+	const [rovingId, setRovingId] = useState<string | null>(null);
+	const terms = useMemo(glossTerms, []);
 
 	// Hydrate user pins on first mount. Idempotent — store guards against
 	// re-runs and concurrent hydrate calls.
@@ -201,37 +222,13 @@ export function ActivityBar() {
 		void hydratePins();
 	}, [hydratePins]);
 
-	// Mirror activeMode → ikenga.workspace so the data-workspace attribute on
-	// <html> drives all the workspace-tint variables.
+	// Mirror activeMode → ikenga.workspace, whose DOM sync is the only writer
+	// of <html data-workspace> (theme-store.ts). The four modes and the four
+	// workspaces are the same nouns, so this is 1:1. `pkg-iframe-host.tsx`
+	// observes that attribute and re-pushes the theme into every iframe pkg.
 	useEffect(() => {
-		setWorkspace(modeToWorkspace(activeMode));
+		setWorkspace(activeMode);
 	}, [activeMode, setWorkspace]);
-
-	const updatesAvailable = useUpdatesAvailable();
-	const { entries: pkgEntries, loaded: pkgEntriesLoaded } = usePkgActivityBarEntries();
-
-	// Reconcile a stale pkg mode. A `pkg:<id>` mode can survive in persisted
-	// state after its pkg was uninstalled; once the kernel snapshot has loaded
-	// and confirms no matching entry, fall back to 'app' so the sidebar doesn't
-	// strand on "Waiting for pkg menu…". Guarded on `pkgEntriesLoaded` so it
-	// never fires before the snapshot arrives.
-	useEffect(() => {
-		if (!pkgEntriesLoaded || !isPkgMode(activeMode)) return;
-		const stillInstalled = pkgEntries.some((e) => `pkg:${e.pkg_id}` === activeMode);
-		if (stillInstalled) return;
-		// Transient guard: during a dev reload the pkg entry briefly leaves the
-		// kernel snapshot before re-registering. Don't snap to 'app' while the
-		// focused pane is still showing this pkg's route — PkgMode renders a
-		// "Waiting for pkg menu…" placeholder in the gap, and the route→mode
-		// sync (router-pane-sync) re-asserts the mode once the pkg re-registers.
-		// Only reconcile to 'app' once the user has actually navigated away.
-		const { root, focusedId } = usePaneStore.getState();
-		const leaf = findLeaf(root, focusedId);
-		const view = leaf?.tabs[leaf?.activeTabIdx ?? 0];
-		const focusedPath = view?.kind === 'route' ? view.path : null;
-		if (focusedPath && (modeForRoute(focusedPath) as ActivityMode | null) === activeMode) return; // TODO(WP-03)
-		setActiveMode('app');
-	}, [pkgEntriesLoaded, pkgEntries, activeMode, setActiveMode]);
 
 	// Clicking the rail item that's ALREADY active collapses the sidebar, and
 	// clicking it again reopens it — the standard editor-rail affordance.
@@ -253,173 +250,346 @@ export function ActivityBar() {
 		return false;
 	}
 
-	function handleSelectPkg(entry: PkgActivityBarEntry) {
-		// Each app pkg owns its own activity mode (`pkg:<id>`). Switch to it so
-		// the rail icon highlights and the sidebar renders the pkg's runtime
-		// menu (Sidebar branches on `isPkgMode`), then navigate the focused pane
-		// to the pkg route. App mode keeps its own main nav, untouched.
-		if (applyRailToggle(activeMode === `pkg:${entry.pkg_id}`)) return;
-		setActiveMode(`pkg:${entry.pkg_id}`);
-		usePaneStore.getState().navigateFocused(entry.route);
-	}
-
-	function handleSelectMode(mode: ActivityMode) {
-		if (applyRailToggle(activeMode === mode)) return;
+	function enterMode(mode: CoreMode) {
 		setActiveMode(mode);
 		const landing = MODE_LANDING[mode];
-		if (landing) {
-			usePaneStore.getState().navigateFocused(landing);
+		if (landing) usePaneStore.getState().navigateFocused(landing);
+		// Chi is the only rail key with a second effect: it brings the
+		// Companion forward (spec §2 ⌘2). WP-06 listens for this.
+		if (mode === 'chi') focusCompanion();
+	}
+
+	function handleSelectMode(mode: CoreMode) {
+		if (applyRailToggle(activeMode === mode)) return;
+		enterMode(mode);
+	}
+
+	/** Ngwa context-menu pick: enter Ngwa (without the collapse toggle) and
+	 *  open the chosen page in the focused pane. */
+	function navigateInNgwa(to: string) {
+		if (activeMode !== 'ngwa') {
+			const { sidebarCollapsed, setSidebarCollapsed } = useShellStore.getState();
+			if (sidebarCollapsed) setSidebarCollapsed(false);
+			setActiveMode('ngwa');
 		}
+		usePaneStore.getState().navigateFocused(to);
 	}
 
 	function handleSelectPin(pin: Pin) {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
 
-	// Each rail mode's ⌘1..⌘6/⌘, binding is a registry entry with `when:
-	// 'not-input'` (defaults.ts) — `useKey()` is the one place that guard
-	// lives (D3) rather than the ad-hoc `target.matches(...)` check this
-	// listener used to duplicate.
-	function selectRailMode(mode: ActivityMode) {
-		setActiveMode(mode);
-		const landing = MODE_LANDING[mode];
-		if (landing) {
-			usePaneStore.getState().navigateFocused(landing);
-		}
-	}
-	useKey(RAIL_COMMAND.app, () => selectRailMode('app'));
-	useKey(RAIL_COMMAND.files, () => selectRailMode('files'));
-	useKey(RAIL_COMMAND.sessions, () => selectRailMode('sessions'));
-	useKey(RAIL_COMMAND['artifact-grid'], () => selectRailMode('artifact-grid'));
-	useKey(RAIL_COMMAND.pkgs, () => selectRailMode('pkgs'));
-	useKey(RAIL_COMMAND.ngwa, () => selectRailMode('ngwa'));
-	useKey(RAIL_COMMAND.settings, () => selectRailMode('settings'));
+	// Each binding is a registry entry with `when: 'not-input'` (defaults.ts);
+	// `useKey()` owns the typing-target guard. A key always enters its mode —
+	// the collapse toggle is a pointer affordance only.
+	useKey('rail.project', () => enterMode('project'));
+	useKey('rail.chi', () => enterMode('chi'));
+	useKey('rail.ngwa', () => enterMode('ngwa'));
+	useKey('rail.settings', () => enterMode('settings'));
 
 	const hasAnyPins =
 		hydrated &&
 		(sectionLessPins.length > 0 ||
 			Array.from(pinsBySection.values()).some((list) => list.length > 0));
 
+	// Every rail item id, in render order. The roving tab stop is the last
+	// item that had focus while it still exists, else the active mode's key.
+	const itemIds: string[] = [
+		...TOP_KEYS.map((k) => k.mode),
+		...(hasAnyPins
+			? [
+					...sections.flatMap((s) => (pinsBySection.get(s.id) ?? []).map((p) => `pin:${p.id}`)),
+					...sectionLessPins.map((p) => `pin:${p.id}`),
+				]
+			: []),
+		SETTINGS_KEY.mode,
+		'project-switcher',
+	];
+	const tabStop = rovingId && itemIds.includes(rovingId) ? rovingId : activeMode;
+	const roving: RovingApi = {
+		tabIndexFor: (id) => (id === tabStop ? 0 : -1),
+		onItemFocus: setRovingId,
+	};
+
+	function onRailKeyDown(e: React.KeyboardEvent<HTMLElement>) {
+		if (!ROVING_KEYS.has(e.key) || e.altKey || e.ctrlKey || e.metaKey) return;
+		const rail = railRef.current;
+		if (!rail) return;
+		const items = Array.from(rail.querySelectorAll<HTMLElement>('[data-rail-item]'));
+		const index = items.indexOf(document.activeElement as HTMLElement);
+		if (index < 0 || items.length === 0) return;
+		e.preventDefault();
+		items[railKeyTarget(e.key, items.length, index)]?.focus();
+	}
+
 	return (
-		<nav
-			aria-label="Activity bar"
-			className="flex h-full w-14 shrink-0 flex-col items-center border-r border-border-soft py-3"
-			style={{ background: 'var(--bg-base)' }}
-		>
-			{/* Registered: pkg / nav-config items. Pinned items live below the
-          divider so pkg updates and uninstalls don't clobber user pins. */}
-			<div className="flex flex-col items-center">
-				{CORE_TOP.map((item) => (
-					<RailButton
-						key={item.mode}
-						mode={item.mode}
-						label={item.label}
-						Icon={item.Icon}
-						shortcut={item.shortcut}
-						isActive={activeMode === item.mode}
-						onSelect={handleSelectMode}
-						badgeCount={0}
-					/>
-				))}
-			</div>
-
-			{pkgEntries.length > 0 && (
-				<>
-					<div
-						className="my-2 h-px w-6 shrink-0"
-						style={{ background: 'var(--border-soft)' }}
-						aria-hidden="true"
-					/>
-					<div className="flex flex-col items-center" data-section="pkgs">
-						{pkgEntries.map((entry) => (
-							<PkgRailButton
-								key={entry.pkg_id}
-								entry={entry}
-								isActive={activeMode === `pkg:${entry.pkg_id}`}
-								onSelect={handleSelectPkg}
+		<RovingContext.Provider value={roving}>
+			<TooltipProvider delayDuration={400} skipDelayDuration={150}>
+				<nav
+					ref={railRef}
+					aria-label="Activity bar"
+					className="ikenga-rail"
+					onKeyDown={onRailKeyDown}
+				>
+					{TOP_KEYS.map((key) =>
+						key.mode === 'ngwa' ? (
+							<NgwaMenuWrap key={key.mode} onPick={navigateInNgwa}>
+								<RailKey
+									def={key}
+									isActive={activeMode === key.mode}
+									onSelect={handleSelectMode}
+									badgeCount={updatesAvailable}
+								/>
+							</NgwaMenuWrap>
+						) : (
+							<RailKey
+								key={key.mode}
+								def={key}
+								isActive={activeMode === key.mode}
+								onSelect={handleSelectMode}
+								badgeCount={0}
 							/>
-						))}
-					</div>
-				</>
-			)}
+						)
+					)}
 
-			{hasAnyPins && (
-				<>
-					<div
-						className="my-2 h-px w-6 shrink-0"
-						style={{ background: 'var(--border-soft)' }}
-						aria-hidden="true"
-					/>
-					<div className="flex flex-col items-center gap-1 overflow-y-auto">
-						{sections.map((section) => {
-							const list = pinsBySection.get(section.id) ?? [];
-							if (list.length === 0) return null;
-							return (
-								<SectionContextWrap key={section.id} section={section} pinCount={list.length}>
-									<div
-										className="flex flex-col items-center"
-										data-section={section.id}
-										title={section.label}
-									>
-										{list.map((pin) => (
+					{hasAnyPins && (
+						<>
+							<div className="ikenga-rail-rule" aria-hidden="true" />
+							<div className="ikenga-rail-pins">
+								{sections.map((section) => {
+									const list = pinsBySection.get(section.id) ?? [];
+									if (list.length === 0) return null;
+									return (
+										<SectionContextWrap key={section.id} section={section} pinCount={list.length}>
+											<div
+												className="ikenga-rail-section"
+												data-section={section.id}
+												title={section.label}
+											>
+												{list.map((pin, i) => (
+													<PinContextWrap
+														key={pin.id}
+														pin={pin}
+														siblings={list}
+														index={i}
+														allSections={sections}
+														onOpen={handleSelectPin}
+													>
+														<PinButton
+															pin={pin}
+															status={pinStatus.get(pin.target)}
+															onSelect={handleSelectPin}
+														/>
+													</PinContextWrap>
+												))}
+											</div>
+										</SectionContextWrap>
+									);
+								})}
+								{sectionLessPins.length > 0 && (
+									<div className="ikenga-rail-section" data-section="__none" title="Other">
+										{sectionLessPins.map((pin, i) => (
 											<PinContextWrap
 												key={pin.id}
 												pin={pin}
+												siblings={sectionLessPins}
+												index={i}
 												allSections={sections}
 												onOpen={handleSelectPin}
 											>
-												<PinButton pin={pin} onSelect={handleSelectPin} />
+												<PinButton
+													pin={pin}
+													status={pinStatus.get(pin.target)}
+													onSelect={handleSelectPin}
+												/>
 											</PinContextWrap>
 										))}
 									</div>
-								</SectionContextWrap>
-							);
-						})}
-						{sectionLessPins.length > 0 && (
-							<div className="flex flex-col items-center" data-section="__none" title="Other">
-								{sectionLessPins.map((pin) => (
-									<PinContextWrap
-										key={pin.id}
-										pin={pin}
-										allSections={sections}
-										onOpen={handleSelectPin}
-									>
-										<PinButton pin={pin} onSelect={handleSelectPin} />
-									</PinContextWrap>
-								))}
+								)}
 							</div>
-						)}
-					</div>
-				</>
-			)}
+						</>
+					)}
 
-			<div className="mt-auto" />
+					<div className="ikenga-rail-spacer" />
 
-			<ApprovalsRailButton />
+					<RailKey
+						def={SETTINGS_KEY}
+						isActive={activeMode === 'settings'}
+						onSelect={handleSelectMode}
+						badgeCount={0}
+					/>
 
-			<ThemeToggleButton />
+					{/* Active-project indicator — kept at the rail foot until WP-09
+					    lifts it into the title row (spec §3.1, §6A.4). */}
+					<ProjectIndicator />
 
-			{CORE_BOTTOM.map((item) => (
-				<RailButton
-					key={item.mode}
-					mode={item.mode}
-					label={item.label}
-					Icon={item.Icon}
-					shortcut={item.shortcut}
-					isActive={activeMode === item.mode}
-					onSelect={handleSelectMode}
-					badgeCount={item.mode === 'pkgs' ? updatesAvailable : 0}
-				/>
-			))}
-
-			{/* Active-project indicator — phase 0 (projects-first-class). Sits
-			    below the bottom rail (Packages + Settings) so it's the visual
-			    floor of the activity bar, distinct from the pinned section
-			    that may grow above. */}
-			<ProjectIndicator />
-		</nav>
+					<RailGloss terms={terms} railRef={railRef} />
+				</nav>
+			</TooltipProvider>
+		</RovingContext.Provider>
 	);
 }
+
+// ─── Items ───────────────────────────────────────────────────────────────
+
+/** The steady-state rail tooltip: label plus the registry's key hint as a
+ *  `<kbd>` (spec §1.3). Radix keeps it hoverable, dismissible with Escape and
+ *  open while hovered (WCAG 1.4.13). */
+function RailTooltip({
+	label,
+	keyLabel,
+	children,
+}: {
+	label: string;
+	keyLabel?: string;
+	children: React.ReactNode;
+}) {
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>{children}</TooltipTrigger>
+			<TooltipContent side="right" sideOffset={6} data-rail-tooltip="">
+				{label}
+				{keyLabel ? <kbd className="ikenga-rail-kbd">{keyLabel}</kbd> : null}
+			</TooltipContent>
+		</Tooltip>
+	);
+}
+
+interface RailKeyProps extends Omit<React.ComponentPropsWithoutRef<'button'>, 'onSelect'> {
+	def: RailKeyDef;
+	isActive: boolean;
+	onSelect: (m: CoreMode) => void;
+	/** Renders a small count pill in the top-right when > 0. */
+	badgeCount: number;
+}
+
+function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps) {
+	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
+	const { Icon, label, mode } = def;
+	const plural = badgeCount === 1 ? '' : 's';
+	const tipLabel = badgeCount > 0 ? `${label} · ${badgeCount} update${plural}` : label;
+	return (
+		<RailTooltip label={tipLabel} keyLabel={labelFor(def.command)}>
+			<button
+				type="button"
+				{...rest}
+				onClick={() => onSelect(mode)}
+				onFocus={() => onItemFocus(mode)}
+				tabIndex={tabIndexFor(mode)}
+				aria-label={badgeCount > 0 ? `${label} (${badgeCount} update${plural} available)` : label}
+				aria-current={isActive ? 'page' : undefined}
+				data-rail-item={mode}
+				className="ikenga-rail-item"
+			>
+				<Icon className="h-[18px] w-[18px]" />
+				{badgeCount > 0 && (
+					<span aria-hidden="true" className="ikenga-rail-badge">
+						{badgeCount > 9 ? '9+' : badgeCount}
+					</span>
+				)}
+			</button>
+		</RailTooltip>
+	);
+}
+
+function NgwaMenuWrap({
+	onPick,
+	children,
+}: {
+	onPick: (to: string) => void;
+	children: React.ReactNode;
+}) {
+	return (
+		<ContextMenu>
+			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+			<ContextMenuContent>
+				{NGWA_MENU.map(({ label, to, Icon }) => (
+					<ContextMenuItem key={to} onSelect={() => onPick(to)}>
+						<Icon className="h-3.5 w-3.5" />
+						{label}
+					</ContextMenuItem>
+				))}
+			</ContextMenuContent>
+		</ContextMenu>
+	);
+}
+
+/** Per-pin package state, keyed by route. A pin seeded from a package's
+ *  former rail icon (WP-22) carries that icon's badge and "parked" warning
+ *  so neither is lost with the per-package rail buttons. Reads only `badge`
+ *  / `parked` — never `label`, which the kernel sets to the nav *section*
+ *  (Round 8), not the package's name. */
+interface PinPkgStatus {
+	badge: PkgActivityBarEntry['badge'];
+	parked: boolean;
+	parkedReason: string | null;
+}
+
+function usePinPkgStatus(): ReadonlyMap<string, PinPkgStatus> {
+	const { entries } = usePkgActivityBarEntries();
+	return useMemo(() => {
+		const map = new Map<string, PinPkgStatus>();
+		for (const e of entries) {
+			map.set(e.route, {
+				badge: e.badge ?? null,
+				parked: !!e.parked,
+				parkedReason: e.parked_reason ?? null,
+			});
+		}
+		return map;
+	}, [entries]);
+}
+
+interface PinButtonProps extends Omit<React.ComponentPropsWithoutRef<'button'>, 'onSelect'> {
+	pin: Pin;
+	status?: PinPkgStatus;
+	onSelect: (p: Pin) => void;
+}
+
+/** Forwards unknown props (and, React 19, `ref`) to the `<button>` so the
+ *  `ContextMenuTrigger asChild` / `TooltipTrigger asChild` wrappers can
+ *  attach their handlers to it. */
+function PinButton({ pin, status, onSelect, ...rest }: PinButtonProps) {
+	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
+	const id = `pin:${pin.id}`;
+	const badge = status?.badge;
+	const count = typeof badge?.count === 'number' && badge.count > 0 ? badge.count : 0;
+	const detail = [
+		status?.parked ? `Parked: ${status.parkedReason ?? 'sidecar stopped'}` : null,
+		badge?.tooltip,
+	]
+		.filter(Boolean)
+		.join(' · ');
+	return (
+		<RailTooltip label={detail ? `${pin.label} · ${detail}` : pin.label}>
+			<button
+				type="button"
+				{...rest}
+				onClick={() => onSelect(pin)}
+				onFocus={() => onItemFocus(id)}
+				tabIndex={tabIndexFor(id)}
+				aria-label={detail ? `${pin.label} (${detail})` : pin.label}
+				data-rail-item={id}
+				data-pin-id={pin.id}
+				data-pin-kind={pin.kind}
+				className="ikenga-rail-item ikenga-rail-pin"
+			>
+				<PinIcon iconLucide={pin.iconLucide} iconEmoji={pin.iconEmoji} Fallback={PinGlyph} />
+				{status?.parked ? (
+					<span aria-hidden="true" className="ikenga-rail-dot" data-tone="danger" />
+				) : count > 0 ? (
+					<span aria-hidden="true" className="ikenga-rail-badge">
+						{count > 9 ? '9+' : count}
+					</span>
+				) : badge?.dot ? (
+					<span aria-hidden="true" className="ikenga-rail-dot" />
+				) : null}
+			</button>
+		</RailTooltip>
+	);
+}
+
+// ─── Active-project indicator (kept; WP-09 lifts it) ─────────────────────
 
 /** Two-char abbreviation for the activity-bar indicator. Falls back to the
  *  first two visible chars of the display name. */
@@ -436,6 +606,7 @@ function projectAbbrev(p: Project): string {
 
 function ProjectIndicator() {
 	const [open, setOpen] = useState(false);
+	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
 	const projects = useShellStore((s) => s.projects);
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const setActiveProject = useShellStore((s) => s.setActiveProject);
@@ -483,11 +654,10 @@ function ProjectIndicator() {
 					type="button"
 					title={title}
 					aria-label={title}
-					className={cn(
-						'relative my-1 grid h-9 w-9 place-items-center rounded-md transition-colors',
-						'hover:bg-card'
-					)}
-					style={{ color: 'var(--fg-faint)' }}
+					tabIndex={tabIndexFor('project-switcher')}
+					onFocus={() => onItemFocus('project-switcher')}
+					data-rail-item="project-switcher"
+					className="ikenga-rail-item"
 				>
 					<span
 						aria-hidden
@@ -560,262 +730,43 @@ function ProjectIndicator() {
 	);
 }
 
-interface PkgRailButtonProps {
-	entry: PkgActivityBarEntry;
-	/** True when this pkg's mode (`pkg:<id>`) is the active activity mode. */
-	isActive: boolean;
-	onSelect: (entry: PkgActivityBarEntry) => void;
-}
-
-/** Rail button for a pkg activity-bar entry. Selecting it switches the shell
- *  into the pkg's own mode (`pkg:<id>`) — see `handleSelectPkg`. Active state
- *  mirrors `RailButton`'s left-bar + raised-bg treatment, but neutral: pkgs
- *  claim no workspace tint, so the active glyph uses `--fg` rather than a
- *  `--tint-*` var. */
-function PkgRailButton({ entry, isActive, onSelect }: PkgRailButtonProps) {
-	const Icon = iconForPkg(entry.icon);
-	const badge = entry.badge;
-	const hasCount = typeof badge?.count === 'number' && badge.count > 0;
-	const tooltip = [
-		entry.parked ? `Parked: ${entry.parked_reason ?? 'sidecar stopped'}` : null,
-		badge?.tooltip,
-	]
-		.filter(Boolean)
-		.join(' · ');
-	const title = `${entry.label}${tooltip ? ` · ${tooltip}` : ''}`;
-	return (
-		<button
-			type="button"
-			onClick={() => onSelect(entry)}
-			title={title}
-			aria-label={title}
-			aria-current={isActive ? 'page' : undefined}
-			disabled={entry.parked}
-			className={cn(
-				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card',
-				entry.parked && 'opacity-60'
-			)}
-			style={{
-				color: isActive ? 'var(--fg)' : 'var(--fg-faint)',
-				background: isActive ? 'var(--bg-raised)' : undefined,
-			}}
-		>
-			{isActive && (
-				<span
-					aria-hidden="true"
-					className="absolute -left-0.5 top-2 bottom-2 w-0.5 rounded-r"
-					style={{ background: 'var(--fg)' }}
-				/>
-			)}
-			<Icon className="h-[18px] w-[18px]" />
-			{entry.parked ? (
-				<span
-					aria-hidden="true"
-					className="absolute right-1 top-1 h-3.5 w-3.5 rounded-full bg-[var(--destructive,#ef4444)] ring-2 grid place-items-center"
-					style={{ ['--tw-ring-color' as string]: 'var(--bg-base)' }}
-				>
-					<AlertTriangle className="h-2.5 w-2.5 text-white" />
-				</span>
-			) : hasCount ? (
-				<span
-					aria-hidden="true"
-					className="absolute right-1 top-1 grid h-3.5 min-w-[14px] place-items-center rounded-full bg-[var(--accent,#3b82f6)] px-1 text-[9px] font-semibold leading-none text-white"
-				>
-					{badge && badge.count! > 9 ? '9+' : badge?.count}
-				</span>
-			) : (
-				badge?.dot && (
-					<span
-						aria-hidden="true"
-						className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full ring-2"
-						style={{
-							background: 'var(--accent,#3b82f6)',
-							['--tw-ring-color' as string]: 'var(--bg-base)',
-						}}
-					/>
-				)
-			)}
-		</button>
-	);
-}
-
-interface RailButtonProps {
-	mode: ActivityMode;
-	label: string;
-	Icon: LucideIcon;
-	shortcut: string;
-	isActive: boolean;
-	onSelect: (m: ActivityMode) => void;
-	/** Renders a small dot/pill in the top-right when > 0. */
-	badgeCount: number;
-}
-
-function RailButton({
-	mode,
-	label,
-	Icon,
-	shortcut,
-	isActive,
-	onSelect,
-	badgeCount,
-}: RailButtonProps) {
-	const ws = modeToWorkspace(mode);
-	const titleSuffix = badgeCount > 0 ? ` · ${badgeCount} update${badgeCount === 1 ? '' : 's'}` : '';
-	return (
-		<button
-			type="button"
-			onClick={() => onSelect(mode)}
-			title={`${label} (${shortcut})${titleSuffix}`}
-			aria-label={badgeCount > 0 ? `${label} (${badgeCount} updates available)` : label}
-			aria-current={isActive ? 'page' : undefined}
-			data-ws={ws}
-			className={cn(
-				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card'
-			)}
-			style={{
-				color: isActive ? `var(--tint-${ws}-fg)` : 'var(--fg-faint)',
-				background: isActive ? 'var(--bg-raised)' : undefined,
-			}}
-		>
-			{isActive && (
-				<span
-					aria-hidden="true"
-					className="absolute -left-0.5 top-2 bottom-2 w-0.5 rounded-r"
-					style={{ background: `var(--tint-${ws}-fg)` }}
-				/>
-			)}
-			<Icon className="h-[18px] w-[18px]" />
-			{badgeCount > 0 && (
-				<span
-					aria-hidden="true"
-					className="absolute right-1 top-1 grid h-3.5 min-w-[14px] place-items-center rounded-full bg-[var(--accent,#3b82f6)] px-1 text-[9px] font-semibold leading-none text-white"
-				>
-					{badgeCount > 9 ? '9+' : badgeCount}
-				</span>
-			)}
-		</button>
-	);
-}
-
-/** Standalone activity-bar attention badge for pending approvals. Shows only
- *  when ≥1 draft is awaiting at the approve gate; clicking opens
- *  /outbox/approvals. Polls (15s) so the count stays fresh even if the
- *  pa-action-paused event is missed; the route's commit/reject invalidations
- *  refresh it too. */
-function ApprovalsRailButton() {
-	const navigateFocused = usePaneStore((s) => s.navigateFocused);
-	const { data } = useQuery({ ...paActionsListQueryOptions(), refetchInterval: 15_000 });
-	const count = data?.length ?? 0;
-	if (count === 0) return null;
-	const plural = count === 1 ? '' : 's';
-	return (
-		<button
-			type="button"
-			onClick={() => navigateFocused('/outbox/approvals')}
-			title={`${count} approval${plural} awaiting`}
-			aria-label={`${count} approval${plural} awaiting — open the approve gate`}
-			className={cn(
-				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card'
-			)}
-			style={{ color: 'var(--fg-faint)' }}
-		>
-			<CheckSquare className="h-[18px] w-[18px]" />
-			<span
-				aria-hidden="true"
-				className="absolute right-1 top-1 grid h-3.5 min-w-[14px] place-items-center rounded-full bg-[var(--live,#22c55e)] px-1 text-[9px] font-semibold leading-none text-white"
-			>
-				{count > 9 ? '9+' : count}
-			</span>
-		</button>
-	);
-}
-
-const MODE_CYCLE: Record<IkengaMode, IkengaMode> = {
-	light: 'dark',
-	dark: 'system',
-	system: 'light',
-};
-
-const MODE_ICON: Record<IkengaMode, LucideIcon> = {
-	light: Sun,
-	dark: Moon,
-	system: Monitor,
-};
-
-const MODE_LABEL: Record<IkengaMode, string> = {
-	light: 'Light',
-	dark: 'Dark',
-	system: 'System',
-};
-
-function ThemeToggleButton() {
-	const mode = useIkengaStore((s) => s.mode);
-	const setMode = useIkengaStore((s) => s.setMode);
-	const Icon = MODE_ICON[mode];
-	const next = MODE_CYCLE[mode];
-	return (
-		<button
-			type="button"
-			onClick={() => setMode(next)}
-			title={`Theme: ${MODE_LABEL[mode]} (click for ${MODE_LABEL[next]})`}
-			aria-label={`Theme: ${MODE_LABEL[mode]}`}
-			className={cn(
-				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card'
-			)}
-			style={{ color: 'var(--fg-faint)' }}
-		>
-			<Icon className="h-[18px] w-[18px]" />
-		</button>
-	);
-}
-
-interface PinButtonProps {
-	pin: Pin;
-	onSelect: (p: Pin) => void;
-}
-
-function PinButton({ pin, onSelect }: PinButtonProps) {
-	return (
-		<button
-			type="button"
-			onClick={() => onSelect(pin)}
-			title={pin.label}
-			aria-label={pin.label}
-			data-pin-id={pin.id}
-			data-pin-kind={pin.kind}
-			className={cn(
-				'relative my-0.5 grid h-9 w-9 place-items-center rounded-md transition-colors',
-				'hover:bg-card'
-			)}
-			style={{ color: 'var(--fg-faint)' }}
-		>
-			<PinIcon iconLucide={pin.iconLucide} iconEmoji={pin.iconEmoji} Fallback={PinGlyph} />
-		</button>
-	);
-}
+// ─── Pin + section context menus (kept) ──────────────────────────────────
 
 interface PinContextWrapProps {
 	pin: Pin;
+	/** The pin's section, in rail order — for Move up / Move down. */
+	siblings: readonly Pin[];
+	index: number;
 	allSections: readonly Section[];
 	onOpen: (pin: Pin) => void;
 	children: React.ReactNode;
 }
 
-/** Right-click menu for a single pin. Open / Unpin / Move-to-section
- *  (inline list of all sections + No section). Move calls reorderPins
- *  with the pin id solo at sort_order 0 in the destination section —
- *  good enough for v0; the settings page is the place for finer ordering. */
-function PinContextWrap({ pin, allSections, onOpen, children }: PinContextWrapProps) {
+/** Right-click menu for a single pin: Open, Move up / Move down (the
+ *  single-pointer alternative to drag-reorder, WCAG 2.5.7 — spec §6A.10),
+ *  Move to section, Unpin. Cross-section moves put the pin first in the
+ *  destination; `/settings/activity-bar` remains the place for finer edits. */
+function PinContextWrap({
+	pin,
+	siblings,
+	index,
+	allSections,
+	onOpen,
+	children,
+}: PinContextWrapProps) {
 	const removePin = usePinsStore((s) => s.removePin);
 	const reorderPins = usePinsStore((s) => s.reorderPins);
+	const sectionKey = pin.sectionId ?? '';
 
 	async function moveTo(sectionId: string | null) {
 		if (sectionId === pin.sectionId) return;
 		await reorderPins([pin.id], sectionId ?? '');
+	}
+
+	async function moveBy(delta: -1 | 1) {
+		const ids = computeReorderIds(siblings, index, index + delta);
+		if (ids.length === 0) return;
+		await reorderPins(ids, sectionKey);
 	}
 
 	const otherSections = allSections.filter((s) => s.id !== pin.sectionId);
@@ -827,6 +778,15 @@ function PinContextWrap({ pin, allSections, onOpen, children }: PinContextWrapPr
 				<ContextMenuItem onSelect={() => onOpen(pin)}>
 					<PinGlyph className="h-3.5 w-3.5" />
 					Open {pin.label}
+				</ContextMenuItem>
+				<ContextMenuSeparator />
+				<ContextMenuItem disabled={index === 0} onSelect={() => void moveBy(-1)}>
+					<ArrowUp className="h-3.5 w-3.5" />
+					Move up
+				</ContextMenuItem>
+				<ContextMenuItem disabled={index >= siblings.length - 1} onSelect={() => void moveBy(1)}>
+					<ArrowDown className="h-3.5 w-3.5" />
+					Move down
 				</ContextMenuItem>
 				<ContextMenuSeparator />
 				{otherSections.length > 0 && (

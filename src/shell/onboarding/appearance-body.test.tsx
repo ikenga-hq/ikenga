@@ -11,7 +11,7 @@ beforeEach(() => {
 		mode: 'dark',
 		density: 'comfortable',
 		tintStrength: 'subtle',
-		workspace: 'app',
+		workspace: 'project',
 	});
 });
 

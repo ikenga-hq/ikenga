@@ -309,7 +309,7 @@ export function registerPathLinks(
 							activate: () => {
 								if (entity.kind === 'dir') {
 									// Focus the workspace tree on this directory (WP-07 / T-03)
-									useShellStore.getState().setActiveMode('files');
+									useShellStore.getState().setActiveMode('project');
 									usePaneStore.getState().revealPath?.(entity.path);
 								} else {
 									// Open file in artifact viewer/editor at line/col (WP-05 / T-04)

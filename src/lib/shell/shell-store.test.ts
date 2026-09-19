@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	ACTIVITY_MODES,
 	createDefaultExplorerSections,
+	type CoreMode,
 	createDefaultOnboardingState,
 	dedupeRoots,
 	migrateShellStore,
@@ -386,20 +387,31 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(localStorage.getItem(BACKUP_KEY)).toBeNull();
 	});
 
-	it('setActiveMode normalizes legacy input and never stores it', async () => {
+	it('setActiveMode stores the four modes and can never store anything else', async () => {
 		const { useShellStore } = await freshStore();
 		const { setActiveMode } = useShellStore.getState();
-		setActiveMode('files');
+		for (const m of ACTIVITY_MODES) {
+			setActiveMode(m);
+			expect(useShellStore.getState().activeMode).toBe(m);
+		}
+		// WP-03 removed the legacy input arm from the type. An untyped caller
+		// (a bridge payload cast to CoreMode) still cannot store a pre-v16 name.
+		setActiveMode('files' as CoreMode);
 		expect(useShellStore.getState().activeMode).toBe('project');
-		setActiveMode('pkgs');
-		expect(useShellStore.getState().activeMode).toBe('ngwa');
-		setActiveMode('settings');
-		expect(useShellStore.getState().activeMode).toBe('settings');
-		setActiveMode('pkg:com.ikenga.tasks');
+		setActiveMode('pkg:com.ikenga.tasks' as CoreMode);
 		expect(useShellStore.getState().activeMode).toBe('project');
 		setActiveMode('chi');
-		expect(useShellStore.getState().activeMode).toBe('chi');
 		expect(JSON.parse(localStorage.getItem(KEY)!).state.activeMode).toBe('chi');
+	});
+
+	it('isPreV16ModeName recognises exactly the names /iyke/mode still normalizes', async () => {
+		const { isPreV16ModeName } = await freshStore();
+		for (const m of ['app', 'files', 'sessions', 'artifact-grid', 'pkgs', 'pkg:com.ikenga.tasks']) {
+			expect(isPreV16ModeName(m)).toBe(true);
+		}
+		for (const m of [...ACTIVITY_MODES, 'mail', '', 42, null]) {
+			expect(isPreV16ModeName(m)).toBe(false);
+		}
 	});
 
 	it('setProjectExtraRoots trims, dedupes and recomputes activeProject', async () => {
