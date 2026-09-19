@@ -334,4 +334,27 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		label: 'Switch Adapter (coming soon)',
 		platformOnly: 'mac',
 	},
+
+	// --- WP-09 frame chrome: the Shortcuts view (§2 `?`, §6A.5 `⌘/`). Both
+	// open the ⌘K palette on its grouped Shortcuts view (v4 P11 — one overlay,
+	// one registry). Listeners live in `useCommandPalette()`
+	// (command-palette.tsx), next to `palette.open`'s, because the palette's
+	// open state is owned there. `?` is matched on `e.key` with Shift ignored
+	// (it needs Shift on some layouts and not on others), so it is not wired
+	// through `useKey()`; both are `not-input` — `?` must type a literal `?`
+	// into a text field, and `⌘/` is "toggle comment" inside code editors. ---
+	{
+		command: 'shortcuts.open',
+		key: 'mod+/',
+		when: 'not-input',
+		source: 'default',
+		label: 'Keyboard shortcuts',
+	},
+	{
+		command: 'shortcuts.open-quick',
+		key: '?',
+		when: 'not-input',
+		source: 'default',
+		label: 'Keyboard shortcuts (outside text fields)',
+	},
 ];

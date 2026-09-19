@@ -1,9 +1,6 @@
-// WP-20 (frame slot skeleton): status bar.
-//
-// No status-bar component exists yet in the current frame — the design's
-// planned status bar (P5, `designs/frame-workbench-v4.html`) has not been
-// built. This slot renders null until a later WP introduces one. Kept as
-// its own file so that WP lands here without re-entering `workspace.tsx`.
+// Status bar slot (WP-20 skeleton, filled by WP-09). See ../status-bar.tsx.
+import { StatusBar } from '@/shell/status-bar';
+
 export function StatusBarSlot() {
-	return null;
+	return <StatusBar />;
 }
