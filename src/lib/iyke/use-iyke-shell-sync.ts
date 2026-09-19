@@ -1,14 +1,17 @@
 import { useEffect } from 'react';
+import { getHomeSync } from '@/lib/home';
+import { formatKeyLabel } from '@/lib/keymap/platform';
 import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneId, PaneNode, PaneView } from '@/lib/panes/types';
-import { useShellStore } from '@/lib/shell/shell-store';
-import { getHomeSync } from '@/lib/home';
+import { type ActiveProject, useShellStore } from '@/lib/shell/shell-store';
+import { type IykeKeymapEntry, iykeSetFrame } from '@/lib/tauri-cmd';
 import { type TerminalTab, useTerminalStore } from '@/terminal/session-store';
 import { formatTerminalTitle } from '@/terminal/terminal-title';
 
 import { setShell } from './client';
 import { getIframe, IFRAME_STATE_EVENT } from './iframe-registry';
+import { type KeymapEntry, listKeymap } from './keymap-bridge';
 
 /**
  * Bridge between React shell state and the Iyke Rust mirror. Mounted
@@ -53,6 +56,49 @@ export function useIykeShellSync(): void {
 		window.addEventListener(IFRAME_STATE_EVENT, onState);
 		return () => window.removeEventListener(IFRAME_STATE_EVENT, onState);
 	}, []);
+
+	// WP-21: `shell.active_project` in `iyke state`. `activeProject` is
+	// derived and reference-stable (G-STATE §2), so this fires only when the
+	// id, root or extra roots actually change.
+	const activeProject = useShellStore((s) => s.activeProject);
+	useEffect(() => {
+		pushActiveProject(activeProject);
+	}, [activeProject]);
+
+	// WP-21: `GET /iyke/keys`. Phase 1's keymap is defaults-only and never
+	// changes at runtime, so it is pushed once when the workspace mounts.
+	// Phase 6 overrides will need to re-push on change.
+	useEffect(() => {
+		iykeSetFrame({ keymap: keymapPayload() }).catch((err) => {
+			console.warn('[iyke] set_frame (keymap) failed:', err);
+		});
+	}, []);
+}
+
+function pushActiveProject(activeProject: ActiveProject): void {
+	iykeSetFrame({
+		activeProject: {
+			id: activeProject.id,
+			root_path: activeProject.root_path,
+			extra_roots: [...activeProject.extra_roots],
+		},
+	}).catch((err) => {
+		console.warn('[iyke] set_frame (active_project) failed:', err);
+	});
+}
+
+/** The registry rows `GET /iyke/keys` serves: `{command, key, when, source}`
+ *  plus the human label and the key hint resolved for this platform. */
+export function keymapPayload(entries: KeymapEntry[] = listKeymap()): IykeKeymapEntry[] {
+	return entries.map((e) => ({
+		command: e.command,
+		key: e.key,
+		when: e.when,
+		source: e.source,
+		label: e.label,
+		key_label: formatKeyLabel(e.key),
+		...(e.platformOnly ? { platform_only: e.platformOnly } : {}),
+	}));
 }
 
 function pushShellState(
