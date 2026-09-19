@@ -11,7 +11,7 @@ function fireKeydown(init: KeyboardEventInit, target?: EventTarget) {
 	return event;
 }
 
-// `rail.app` is bound to `mod+1` — resolve the actual modifier for whichever
+// `rail.project` is bound to `mod+1` — resolve the actual modifier for whichever
 // platform this test process reports, so the test doesn't hard-code an
 // assumption about which OS it runs on.
 const MOD_KEY_INIT: KeyboardEventInit = isMacPlatform()
@@ -62,7 +62,7 @@ describe('conflicts()', () => {
 		];
 		const result = conflicts({ platform: 'mac', entries: withClash });
 		expect(result.length).toBe(1);
-		expect(result[0].commands.sort()).toEqual(['rail.app', 'test.clash']);
+		expect(result[0].commands.sort()).toEqual(['rail.project', 'test.clash']);
 	});
 
 	it('resolves the documented ⌘T/⌃T non-mac collision via platformOnly, not omission', () => {
@@ -111,19 +111,19 @@ describe('conflicts()', () => {
 	});
 
 	it('documents the non-mac rail/pane-focus double-fire via `knownOverlap`, not by hiding it', () => {
-		// On non-mac, `mod+1` (rail.app) resolves to the literal `ctrl+1` that
+		// On non-mac, `mod+1` (rail.project) resolves to the literal `ctrl+1` that
 		// `pane.focus-1` (global) is also bound to — both are live listeners
 		// with no stopPropagation, so today's app really does double-fire.
-		const railApp = findEntry('rail.app');
-		expect(railApp?.knownOverlap).toContain('pane.focus-1');
+		const railProject = findEntry('rail.project');
+		expect(railProject?.knownOverlap).toContain('pane.focus-1');
 		expect(conflicts({ platform: 'other' })).toEqual([]);
 
 		const withoutDeclaration = getKeymap().map((e) =>
-			e.command === 'rail.app' ? { ...e, knownOverlap: undefined } : e
+			e.command === 'rail.project' ? { ...e, knownOverlap: undefined } : e
 		);
 		const result = conflicts({ platform: 'other', entries: withoutDeclaration });
-		const group = result.find((c) => c.commands.includes('rail.app'));
-		expect(group?.commands.sort()).toEqual(['pane.focus-1', 'rail.app']);
+		const group = result.find((c) => c.commands.includes('rail.project'));
+		expect(group?.commands.sort()).toEqual(['pane.focus-1', 'rail.project']);
 	});
 
 	it('reports an undocumented same-key `global` + `not-input` pair as a real clash', () => {
@@ -163,12 +163,12 @@ describe('conflicts()', () => {
 
 describe('labelFor()', () => {
 	it('renders the mac glyph form', () => {
-		expect(labelFor('rail.app', { mac: true })).toBe('⌘1');
+		expect(labelFor('rail.project', { mac: true })).toBe('⌘1');
 		expect(labelFor('pane.split-down', { mac: true })).toBe('⌘⇧\\');
 	});
 
 	it('renders the spelled-out form elsewhere', () => {
-		expect(labelFor('rail.app', { mac: false })).toBe('Ctrl+1');
+		expect(labelFor('rail.project', { mac: false })).toBe('Ctrl+1');
 		expect(labelFor('pane.split-down', { mac: false })).toBe('Ctrl+Shift+\\');
 	});
 
@@ -194,7 +194,7 @@ describe('labelFor()', () => {
 describe('useKey() — D3: typing in input/textarea/contenteditable never fires a frame shortcut', () => {
 	it('does not fire when the event target is an <input>', () => {
 		const handler = vi.fn();
-		renderHook(() => useKey('rail.app', handler));
+		renderHook(() => useKey('rail.project', handler));
 		const input = document.createElement('input');
 		document.body.appendChild(input);
 		act(() => {
@@ -206,7 +206,7 @@ describe('useKey() — D3: typing in input/textarea/contenteditable never fires 
 
 	it('does not fire when the event target is a <textarea>', () => {
 		const handler = vi.fn();
-		renderHook(() => useKey('rail.app', handler));
+		renderHook(() => useKey('rail.project', handler));
 		const textarea = document.createElement('textarea');
 		document.body.appendChild(textarea);
 		act(() => {
@@ -218,7 +218,7 @@ describe('useKey() — D3: typing in input/textarea/contenteditable never fires 
 
 	it('does not fire when the event target is contenteditable', () => {
 		const handler = vi.fn();
-		renderHook(() => useKey('rail.app', handler));
+		renderHook(() => useKey('rail.project', handler));
 		const div = document.createElement('div');
 		div.setAttribute('contenteditable', 'true');
 		document.body.appendChild(div);
@@ -231,7 +231,7 @@ describe('useKey() — D3: typing in input/textarea/contenteditable never fires 
 
 	it('fires for a non-input target with the bound combo', () => {
 		const handler = vi.fn();
-		renderHook(() => useKey('rail.app', handler));
+		renderHook(() => useKey('rail.project', handler));
 		act(() => {
 			fireKeydown(MOD_KEY_INIT, document.body);
 		});
@@ -240,7 +240,7 @@ describe('useKey() — D3: typing in input/textarea/contenteditable never fires 
 
 	it('does not fire for an unrelated key', () => {
 		const handler = vi.fn();
-		renderHook(() => useKey('rail.app', handler));
+		renderHook(() => useKey('rail.project', handler));
 		act(() => {
 			fireKeydown(UNRELATED_KEY_INIT, document.body);
 		});

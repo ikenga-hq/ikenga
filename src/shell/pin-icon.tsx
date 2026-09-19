@@ -3,12 +3,33 @@
 // the fallback. If neither is set, falls back to a generic Folder/Pin
 // glyph the caller picks via `fallback`.
 //
-// Lucide icon names use kebab-case from day one (matches the dynamic-icons
-// loader's `iconNames` array). Unknown names render as the fallback.
+// Lucide icon names are kebab-case (the dynamic-icons loader's `iconNames`).
+// Since WP-03 the rail no longer carries its own pkg icon whitelist
+// (`PKG_ICONS`): a package's rail presence is a pin seeded from its manifest
+// `ui.nav[0].icon` (WP-22), and manifests spell those names either way
+// (`layout-dashboard`, `LayoutDashboard`, `Box`). So the name is normalized
+// to kebab-case and checked against `iconNames`; anything unknown renders
+// the fallback instead of an empty button.
 
-import { Suspense } from 'react';
-import { DynamicIcon, type IconName } from 'lucide-react/dynamic';
 import type { LucideIcon } from 'lucide-react';
+import { DynamicIcon, type IconName, iconNames } from 'lucide-react/dynamic';
+import { Suspense } from 'react';
+
+const KNOWN_ICONS: ReadonlySet<string> = new Set(iconNames);
+
+/** `LayoutDashboard` / `layoutDashboard` / `layout_dashboard` / ` Box ` →
+ *  kebab-case, or null when the result is not a lucide icon name. Exported
+ *  for tests. */
+export function normalizeLucideName(name: string | null | undefined): IconName | null {
+	if (!name) return null;
+	const kebab = name
+		.trim()
+		.replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+		.replace(/([A-Z])([A-Z][a-z])/g, '$1-$2')
+		.replace(/[\s_]+/g, '-')
+		.toLowerCase();
+	return KNOWN_ICONS.has(kebab) ? (kebab as IconName) : null;
+}
 
 interface PinIconProps {
 	iconLucide: string | null;
@@ -26,10 +47,11 @@ export function PinIcon({
 	className,
 	sizeClass = 'h-[18px] w-[18px]',
 }: PinIconProps) {
-	if (iconLucide) {
+	const lucide = normalizeLucideName(iconLucide);
+	if (lucide) {
 		return (
 			<Suspense fallback={<Fallback className={`${sizeClass} ${className ?? ''}`} />}>
-				<DynamicIcon name={iconLucide as IconName} className={`${sizeClass} ${className ?? ''}`} />
+				<DynamicIcon name={lucide} className={`${sizeClass} ${className ?? ''}`} />
 			</Suspense>
 		);
 	}

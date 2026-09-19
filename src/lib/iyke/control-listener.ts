@@ -22,7 +22,7 @@ import { modeForRoute } from '@/lib/shell/mode-routes';
 import {
 	type CoreMode,
 	isCoreMode,
-	isLegacyActivityMode,
+	isPreV16ModeName,
 	normalizeMode,
 	useShellStore,
 } from '@/lib/shell/shell-store';
@@ -61,7 +61,7 @@ interface RefreshPayload {
  */
 export function resolveIykeMode(mode: unknown): CoreMode | null {
 	if (isCoreMode(mode)) return mode;
-	if (isLegacyActivityMode(mode)) {
+	if (isPreV16ModeName(mode)) {
 		const next = normalizeMode(mode);
 		console.warn(`[iyke] iyke:mode '${mode}' is a legacy mode name — using '${next}'.`);
 		return next;

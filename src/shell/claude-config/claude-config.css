@@ -5,19 +5,6 @@
  * tokens come from `lib/ikenga/tokens.css`.
  */
 
-/* Ngwa mode tint — the sibling of the `--tint-<mode>-bg/-fg` set in
- * `ikenga-tokens.css` (app/mail/outbox/studio/agents/files). The `ngwa`
- * pair was never added there (WP-06 gap), so the SYSTEM-facet selected
- * state, the D-09 checkbox checked-fill, and the activity-bar rail
- * highlight — all of which reference `--tint-ngwa-fg` — resolved to
- * nothing. Define them here (this stylesheet is eagerly imported by
- * `ngwa-mode`, so the :root vars land before any consumer renders).
- * Values mirror the locked design (`designs/write-transcode-drawer.html`). */
-:root {
-	--tint-ngwa-bg: hsl(28, 16%, 11%);
-	--tint-ngwa-fg: hsl(28, 40%, 68%);
-}
-
 .ccfg {
 	display: grid;
 	grid-template-rows: auto auto 1fr;

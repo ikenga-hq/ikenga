@@ -1,13 +1,15 @@
-// Default sidebar entries for App mode. These are shell-internal surfaces
-// only — app pkgs contribute their own nav via the UiRoutesRegistry and
-// declarative `ui.nav` blocks in their manifests, surfaced by the kernel
-// snapshot. The pkg-aware sidebar is rendered alongside this list inside
-// AppMode so users can launch installed pkgs without needing a custom
-// per-pkg rail icon.
+// Default sidebar entries for the interim App menu, which the sidebar shows
+// for the Project and Chi rail modes until WP-04's Explorer replaces it.
+// These are shell-internal surfaces only — app pkgs contribute their own nav
+// via the UiRoutesRegistry and declarative `ui.nav` blocks in their
+// manifests, surfaced by the kernel snapshot. The pkg-aware list is rendered
+// alongside this one inside AppMode, and since WP-03 a package's rail
+// presence is a pin (seeded once from `ui.nav[0]` by WP-22), never a rail
+// mode of its own.
 //
-// Packages-related nav (catalog, updates, trust, store) lives in the
-// dedicated Packages mode (activity-bar ⌘4 → PkgsMode); it isn't a
-// concern of the main App mode anymore.
+// Packages-related nav (catalog, updates, trust, store) belongs to Ngwa
+// (rail ⌘3; its key's context menu opens Installed / Store / Health); it
+// isn't a concern of this menu.
 
 import { Activity, CheckSquare, Clock, FileText, Home } from 'lucide-react';
 
@@ -26,8 +28,8 @@ export const NAV_GROUPS: NavGroup[] = [
 		label: null,
 		items: [
 			{ to: '/', label: 'Home', Icon: Home },
-			// `/claude` moved out of App mode into the dedicated Ngwa
-			// activity-bar mode (⌘6). See `src/shell/sidebar-modes/ngwa-mode.tsx`.
+			// `/claude` lives under the Ngwa rail mode (⌘3). See
+			// `src/shell/sidebar-modes/ngwa-mode.tsx`.
 		],
 	},
 	{

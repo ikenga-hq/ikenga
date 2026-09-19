@@ -76,43 +76,25 @@ export const ACTIVITY_MODES: readonly CoreMode[] = Object.freeze([
 
 export const DEFAULT_MODE: CoreMode = 'project';
 
-/** @deprecated compile-compat for the old activity bar + sidebar only (WP-03 /
- *  WP-04 delete it). Accepted as *input* to `setActiveMode`, never stored. */
-export type LegacyActivityMode =
-	| 'app'
-	| 'files'
-	| 'sessions'
-	| 'artifact-grid'
-	| 'pkgs'
-	| `pkg:${string}`;
-
-/** @deprecated True for a v14/v15 dynamic `pkg:<id>` mode. The store never
- *  holds one after v16; kept so the old rail and sidebar still compile. */
-export function isPkgMode(m: string): m is `pkg:${string}` {
-	return m.startsWith('pkg:');
-}
-
-/** @deprecated Extract the pkg id from a `pkg:<id>` mode, or null. */
-export function pkgIdFromMode(m: string): string | null {
-	return isPkgMode(m) ? m.slice('pkg:'.length) : null;
-}
-
 /** True for one of the four v16 modes. */
 export function isCoreMode(m: unknown): m is CoreMode {
 	return typeof m === 'string' && (ACTIVITY_MODES as readonly string[]).includes(m);
 }
 
+/** Mode names the pre-v16 rail wrote (v10–v15 core modes and v14 dynamic
+ *  `pkg:<id>` modes). Only the `/iyke/mode` bridge still accepts them, for
+ *  one release, normalized through `normalizeMode` (g-state.md §5). */
+const PRE_V16_MODE_NAMES: readonly string[] = Object.freeze([
+	'app',
+	'files',
+	'sessions',
+	'artifact-grid',
+	'pkgs',
+]);
+
 /** True for a pre-v16 mode name that `normalizeMode` maps onto a CoreMode. */
-export function isLegacyActivityMode(m: unknown): m is LegacyActivityMode {
-	return (
-		typeof m === 'string' &&
-		(m === 'app' ||
-			m === 'files' ||
-			m === 'sessions' ||
-			m === 'artifact-grid' ||
-			m === 'pkgs' ||
-			isPkgMode(m))
-	);
+export function isPreV16ModeName(m: unknown): m is string {
+	return typeof m === 'string' && (PRE_V16_MODE_NAMES.includes(m) || m.startsWith('pkg:'));
 }
 
 /**
@@ -381,8 +363,7 @@ export function createDefaultOnboardingState(): OnboardingState {
 interface ShellState {
 	/** Always one of ACTIVITY_MODES — legacy names are normalized on the way in. */
 	activeMode: CoreMode;
-	/** The `LegacyActivityMode` arm is transitional (removed by WP-03). */
-	setActiveMode: (m: CoreMode | LegacyActivityMode) => void;
+	setActiveMode: (m: CoreMode) => void;
 
 	// ─── Active project + roots (G-STATE) ────────────────────────────────
 	/** Derived, kept in sync by the store; a stable reference, so it is safe
@@ -689,8 +670,9 @@ export const useShellStore = create<ShellState>()(
 	persist(
 		(set, get) => ({
 			activeMode: DEFAULT_MODE,
-			// Legacy names are accepted as input for one release and normalized;
-			// the store only ever holds a CoreMode.
+			// Typed CoreMode-only since WP-03. Still routed through the total
+			// `normalizeMode` so an untyped caller (a bridge payload cast to
+			// CoreMode) can never store anything but one of the four modes.
 			setActiveMode: (m) => set({ activeMode: normalizeMode(m) }),
 
 			// Before `refreshProjects` resolves this is the seed `default` row

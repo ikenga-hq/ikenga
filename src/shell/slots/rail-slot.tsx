@@ -1,6 +1,7 @@
-// WP-20 (frame slot skeleton): the activity-bar rail.
+// WP-20 (frame slot skeleton): the rail.
 //
-// Renders today's ActivityBar verbatim. Owned by WP-06 going forward.
+// Filled by WP-03 — Project · Chi · Ngwa · pins · Settings
+// (`src/shell/activity-bar.tsx`).
 import { ActivityBar } from '@/shell/activity-bar';
 
 export function RailSlot() {

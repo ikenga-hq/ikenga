@@ -1,15 +1,15 @@
 import { type PaneView } from '@/lib/panes/types';
-import { type IkengaWorkspace } from '@/lib/ikenga/theme-store';
+import { type IkengaTint } from '@/lib/ikenga/theme-store';
 
 // Map a route prefix to its workspace tint. Post-strip, only shell-internal
 // routes are admitted to the union; pkg routes (`/pkg/...`) all roll up to
 // 'app'.
-const ROUTE_PREFIXES: Array<[string, IkengaWorkspace]> = [
+const ROUTE_PREFIXES: Array<[string, IkengaTint]> = [
 	['/settings', 'settings'],
 	['/files', 'files'],
 ];
 
-export function viewWorkspace(view: PaneView): IkengaWorkspace {
+export function viewWorkspace(view: PaneView): IkengaTint {
 	switch (view.kind) {
 		case 'route': {
 			for (const [prefix, ws] of ROUTE_PREFIXES) {
