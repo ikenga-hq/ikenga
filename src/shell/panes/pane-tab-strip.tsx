@@ -32,7 +32,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	const focusPane = usePaneStore((s) => s.focusPane);
 	const toggleTabPinned = usePaneStore((s) => s.toggleTabPinned);
 	const reorderTab = usePaneStore((s) => s.reorderTab);
-	const placeView = usePaneStore((s) => s.placeView);
+	const moveTab = usePaneStore((s) => s.moveTab);
 
 	// Path of the artifact being pinned to the sidebar via the tab context menu
 	// (null = dialog closed). Reuses the same PinArtifactDialog as the address bar.
@@ -220,11 +220,36 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 									{isPinned ? 'Unpin tab' : 'Pin tab'}
 								</ContextMenuItem>
 								<ContextMenuSeparator />
-								<ContextMenuItem onSelect={() => placeView(leaf.id, tab, 'right')}>
-									Split right
+								{/* §6A.10 — the single-pointer alternative to drag-reorder
+								    that WCAG 2.5.7 requires (roving-tablist ⌃⇧←/→ is the
+								    keyboard one; a keyboard alternative alone doesn't
+								    satisfy 2.5.7, so this menu path is the pointer one). */}
+								<ContextMenuItem disabled={idx === 0} onSelect={() => reorderTab(leaf.id, idx, idx - 1)}>
+									Move left
 								</ContextMenuItem>
-								<ContextMenuItem onSelect={() => placeView(leaf.id, tab, 'bottom')}>
-									Split down
+								<ContextMenuItem
+									disabled={idx === leaf.tabs.length - 1}
+									onSelect={() => reorderTab(leaf.id, idx, idx + 1)}
+								>
+									Move right
+								</ContextMenuItem>
+								{/* §6A.2 — the only tab-level path to a split: moving the
+								    tab to a new pane is a move whose side effect is a
+								    split. Split itself isn't offered here (⋯ menu, drag,
+								    ⌘\ / ⌘⇧\ only). Needs a second tab in this leaf — moving
+								    a leaf's only tab would just close the leaf it came
+								    from with nothing left to keep (pane-reducer.ts guard). */}
+								<ContextMenuItem
+									disabled={leaf.tabs.length < 2}
+									onSelect={() => moveTab(leaf.id, idx, leaf.id, 'right')}
+								>
+									Move to new pane (right)
+								</ContextMenuItem>
+								<ContextMenuItem
+									disabled={leaf.tabs.length < 2}
+									onSelect={() => moveTab(leaf.id, idx, leaf.id, 'bottom')}
+								>
+									Move to new pane (down)
 								</ContextMenuItem>
 								{(tab.kind === 'artifact' || tab.kind === 'route') && (
 									<>

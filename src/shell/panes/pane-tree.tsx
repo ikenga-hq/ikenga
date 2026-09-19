@@ -3,6 +3,7 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { type PaneNode, type SplitNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { Pane } from './pane';
+import './panes.css';
 
 function leafKey(node: PaneNode): string {
 	if (node.type === 'leaf') return node.id;
@@ -51,9 +52,20 @@ function PaneSplit({ node, path }: { node: SplitNode; path: number[] }) {
 									: 'h-px bg-border data-[resize-handle-state=hover]:bg-primary/40 data-[resize-handle-state=drag]:bg-primary/60'
 							}
 							data-panel-resize-handle-enabled="true"
+							// §4.4: 1px visual, ~8px hit area. `hitAreaMargins` is the
+							// library's own hit-test padding — it never adds to the
+							// rendered box (the handle stays `w-px`/`h-px`), it only
+							// widens the invisible region pointermove hit-tests against.
+							hitAreaMargins={{ fine: 4, coarse: 8 }}
 						/>
 					)}
-					<Panel id={leafKey(child)} order={i} defaultSize={node.sizes[i]} minSize={10}>
+					<Panel
+						id={leafKey(child)}
+						order={i}
+						defaultSize={node.sizes[i]}
+						minSize={10}
+						className="pane-leaf-container"
+					>
 						<PaneTreeNode node={child} path={[...path, i]} />
 					</Panel>
 				</Fragment>
