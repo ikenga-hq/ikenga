@@ -35,7 +35,8 @@ It goes in the **live probe** if a mock could make it pass while the real thing 
   Once WP-21 lands, `iyke state` also has to report the new project.
 - PTY dispatch: text sent into a real terminal runs, and its output comes back
 - `chi_run`: a real agent run starts and finishes (opt-in with `--with-chi`)
-- real v15 → v16 migration on a copy of a v15 profile (arrives with WP-02)
+- real v15 → v16 migration on a copy of a v15 profile (`v15-migration`; still a
+  BLOCKED stub; WP-02 has merged the migration, the probe check itself is a follow-up)
 
 If a check needs both halves, split it. For example, "switching project re-titles
 the Explorer" is a browser-mode spec. It drives the switch with
@@ -88,12 +89,16 @@ bundler alias is involved.
 
 ### Specs
 
-- `frame.spec.ts`: a smoke test of the frame as it is today, before any
-  Phase 1 change. It checks that the core rail modes, the pkg entry, the pin
-  and its section, the project indicator, the sidebar and the pane tree all
-  render, that selecting a rail item re-titles the sidebar, and that no
-  uncaught errors occur. WP-20's no-op slot refactor has to keep it green
-  without editing it.
+- `frame.spec.ts`: a smoke test of the frame as it stands on
+  `feat/phase-1-frame`, after WP-02's G-STATE v16 store and before WP-03/WP-04
+  rework the rail and sidebar. It checks that the core rail items (by
+  accessible name), the pkg entry, the pin and its section, the project
+  indicator, a sidebar region and the pane tree all render, that selecting
+  Settings on the rail shows the settings navigation, and that no uncaught
+  errors occur. It deliberately asserts no mode-specific sidebar title: since
+  v16, the old rail's Files item stores mode `project` (g-state.md §6 interim
+  behaviour), so those titles are in flux until WP-04. WP-20's no-op slot
+  refactor has to keep it green without editing it.
 
 Each later WP adds `e2e/<area>.spec.ts` for its own browser-mode DoD lines.
 

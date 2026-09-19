@@ -1,7 +1,9 @@
-// Frame smoke — WP-19. Pins TODAY's frame (before any Phase 1 change) so the
-// harness itself is proven green before the frame starts moving. Later WPs
-// add their own specs next to this one; WP-20's no-op slot refactor must keep
-// this one green unchanged.
+// Frame smoke — WP-19. Pins the frame as it stands on feat/phase-1-frame
+// (after WP-02's G-STATE v16 store, before WP-03/WP-04 rework the rail and
+// sidebar), so the harness itself is proven green before the frame starts
+// moving. It asserts only what those WPs are not about to change: the rail
+// renders, a sidebar region exists, the pane tree mounts, Settings opens the
+// settings nav, and nothing throws. No mode-specific sidebar titles.
 
 import { expect, type Page, test } from '@playwright/test';
 import {
@@ -60,6 +62,7 @@ test.describe('frame smoke (current frame)', () => {
 		).toBeVisible();
 
 		// ── Sidebar ─────────────────────────────────────────────────────────
+		// Region only: its title follows the active mode, which is in flux.
 		await expect(page.getByRole('navigation', { name: /sidebar$/ })).toBeVisible();
 
 		// ── Pane tree ───────────────────────────────────────────────────────
@@ -70,10 +73,13 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(main.locator('[data-pane-id][data-focused="true"]')).toHaveCount(1);
 		await expect(panes.first().getByRole('button', { name: 'New tab' })).toBeVisible();
 
-		// Rail → sidebar wiring: picking another mode retitles the sidebar
-		// (CORE_TITLES in src/shell/sidebar.tsx).
-		await rail.getByRole('button', { name: 'Files', exact: true }).click();
-		await expect(page.getByRole('navigation', { name: 'Files sidebar' })).toBeVisible();
+		// Rail → sidebar wiring. Settings is a CoreMode on both sides of v16
+		// (g-state.md), so selecting it is stable across WP-03/WP-04; the other
+		// rail items' sidebar titles are interim and deliberately not pinned here.
+		await rail.getByRole('button', { name: 'Settings', exact: true }).click();
+		const settingsNav = page.getByRole('navigation', { name: 'Settings navigation' });
+		await expect(settingsNav).toBeVisible();
+		await expect(settingsNav.getByText('Appearance', { exact: true })).toBeVisible();
 
 		// Record (not assert) which host commands had no canned answer, so a
 		// spec author can see what to add to the fixture when the frame grows.
