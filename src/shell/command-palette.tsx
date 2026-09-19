@@ -22,7 +22,8 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CommandRow, type CommandRowProps } from '@/components/ui/command-row';
 import { useFocusReturn, useFocusTrap } from '@/lib/a11y/focus';
-import { isTypingTarget, labelFor } from '@/lib/keymap/registry';
+import { findEntry, isTypingTarget, labelFor } from '@/lib/keymap/registry';
+import { eventMatchesCombo, isMacPlatform } from '@/lib/keymap/platform';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneNode, PaneView } from '@/lib/panes/types';
@@ -31,9 +32,23 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles, type TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
-import { ActionsGroup } from './palette-actions';
+import { ActionsGroup, ManageGroup } from './palette-actions';
+import { ShortcutsView } from './shortcuts-view';
 
-export type PaletteMode = 'all' | 'views' | 'switcher' | 'projects';
+export type PaletteMode = 'all' | 'views' | 'switcher' | 'projects' | 'shortcuts';
+
+/** Window event other frame chrome (title row, status bar) dispatches to open
+ *  the palette. The palette's open state is owned by `useCommandPalette()`
+ *  inside `Workspace`; this lets a slot open it without threading the
+ *  controller through `workspace.tsx` (WP-20: slots never re-enter it). */
+export const PALETTE_OPEN_EVENT = 'ikenga:palette-open';
+
+/** Open the ⌘K palette in `mode` from anywhere in the frame. */
+export function openCommandPalette(mode: PaletteMode = 'all'): void {
+	window.dispatchEvent(
+		new CustomEvent<{ mode: PaletteMode }>(PALETTE_OPEN_EVENT, { detail: { mode } })
+	);
+}
 
 interface CommandPaletteProps {
 	open: boolean;
@@ -144,13 +159,21 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 					ref={panelRef}
 					role="dialog"
 					aria-modal="true"
-					aria-label={pinTarget !== null ? 'Pin to activity bar' : 'Command palette'}
+					aria-label={
+						mode === 'shortcuts'
+							? 'Keyboard shortcuts'
+							: pinTarget !== null
+								? 'Pin to activity bar'
+								: 'Command palette'
+					}
 					tabIndex={-1}
 					data-open={entered ? 'true' : 'false'}
 					className="relative w-full max-w-xl overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-2xl outline-none transition-[opacity,transform] duration-[var(--motion-fast)] ease-[var(--ease-calm)] data-[open=false]:-translate-y-2 data-[open=false]:opacity-0 data-[open=true]:translate-y-0 data-[open=true]:opacity-100"
 					onClick={(e) => e.stopPropagation()}
 				>
-					{pinTarget !== null ? (
+					{mode === 'shortcuts' ? (
+						<ShortcutsView onBack={() => openCommandPalette('all')} />
+					) : pinTarget !== null ? (
 						<PinForm
 							target={pinTarget}
 							onClose={() => {
@@ -234,6 +257,10 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 										</Command.Group>
 
 										{mode === 'all' && <ActionsGroup onClose={() => onOpenChange(false)} />}
+
+										{mode === 'all' && (
+											<ManageGroup onShowShortcuts={() => openCommandPalette('shortcuts')} />
+										)}
 
 										{mode === 'all' && (
 											<Command.Group heading="Navigate" className="text-xs text-muted-foreground">
@@ -717,6 +744,56 @@ export function useCommandPalette() {
 	useEffect(() => {
 		openRef.current = state.open;
 	}, [state.open]);
+	const modeRef = useRef(state.mode);
+	useEffect(() => {
+		modeRef.current = state.mode;
+	}, [state.mode]);
+
+	// Other frame chrome (title-row project chip, status-bar shortcuts item)
+	// opens the palette through `openCommandPalette()`.
+	useEffect(() => {
+		function onOpen(e: Event) {
+			const mode = (e as CustomEvent<{ mode?: PaletteMode }>).detail?.mode ?? 'all';
+			setState({ open: true, mode });
+		}
+		window.addEventListener(PALETTE_OPEN_EVENT, onOpen);
+		return () => window.removeEventListener(PALETTE_OPEN_EVENT, onOpen);
+	}, []);
+
+	// WP-09 — `?` and `⌘/` open the grouped Shortcuts view (§2, §6A.5).
+	// Registry-driven: the combos come from `shortcuts.open` /
+	// `shortcuts.open-quick`, never a literal here. Both respect `not-input`
+	// for *opening*; like ⌘K, `⌘/` still toggles from inside the palette's own
+	// input once the palette is open (the input is a typing target), and `?`
+	// closes the view when focus is not in its filter field.
+	useEffect(() => {
+		const mac = isMacPlatform();
+		function onKey(e: KeyboardEvent) {
+			const slash = findEntry('shortcuts.open');
+			const quick = findEntry('shortcuts.open-quick');
+			const typing = isTypingTarget(e.target);
+			if (slash && eventMatchesCombo(e, slash.key, mac)) {
+				if (openRef.current) {
+					e.preventDefault();
+					setState({ open: true, mode: modeRef.current === 'shortcuts' ? 'all' : 'shortcuts' });
+				} else if (!typing) {
+					e.preventDefault();
+					setState({ open: true, mode: 'shortcuts' });
+				}
+				return;
+			}
+			if (quick && e.key === quick.key && !e.metaKey && !e.ctrlKey && !e.altKey && !typing) {
+				e.preventDefault();
+				if (openRef.current && modeRef.current === 'shortcuts') {
+					setState({ open: false, mode: 'all' });
+				} else {
+					setState({ open: true, mode: 'shortcuts' });
+				}
+			}
+		}
+		window.addEventListener('keydown', onKey);
+		return () => window.removeEventListener('keydown', onKey);
+	}, []);
 
 	// Return focus to the trigger element when the palette closes (Esc, scrim
 	// click, row select). cmdk manages its own internal focus while open but
