@@ -20,8 +20,9 @@ import { useDragState } from '@/lib/panes/drag-state';
 import { useDropTarget } from '@/lib/panes/pointer-drag';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useDockStore } from '@/shell/dock/dock-store';
-import { type PaneId } from '@/lib/panes/types';
+import { MAX_LEAVES, type PaneId } from '@/lib/panes/types';
 import { cn } from '@/components/ui/utils';
+import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 
 const EDGE_INSET = 0.25;
 
@@ -43,17 +44,21 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 	const placeView = usePaneStore((s) => s.placeView);
 	const canSplit = usePaneStore((s) => s.canSplit());
 	const [hoverZone, setHoverZone] = useState<Zone | null>(null);
+	// §4.3: the drag-to-edge split entry point is blocked at the 6-leaf cap
+	// (edge zones stay lit but disabled, above); a dropped edge attempt there
+	// also surfaces the shared floating toast so the reason isn't silent.
+	const [showCapToast, setShowCapToast] = useState(false);
 
 	// No-op self-drag of a pane's only tab (pane-source only — dock id can
 	// never collide with a pane id).
 	const sameAsSrc = drag.source === 'pane' && drag.srcLeafId === paneId;
 
 	const dropTarget = useDropTarget({
-		// Declining an edge at the split cap lets the drop fall through to
-		// nothing, which cancels it — same as the old `dropEffect = 'none'`.
-		accepts: (x, y, el) =>
-			useDragState.getState().active &&
-			(canSplit || detectZone(el.getBoundingClientRect(), x, y) === 'center'),
+		// §4.3: at the split cap, edge zones stay lit but in a disabled
+		// treatment (so the cap is legible mid-drag) instead of not
+		// rendering at all — `accepts` stays true for every zone; the cap is
+		// enforced in `onDrop` below. `center` (move-as-tab) is never capped.
+		accepts: () => useDragState.getState().active,
 		onOver: (x, y, el) => {
 			const zone = detectZone(el.getBoundingClientRect(), x, y);
 			setHoverZone((prev) => (prev === zone ? prev : zone));
@@ -67,6 +72,12 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 				return;
 			}
 			const zone = detectZone(el.getBoundingClientRect(), x, y);
+			// Edge zones are blocked at the 6-leaf cap; `center` still works.
+			if (zone !== 'center' && !canSplit) {
+				setShowCapToast(true);
+				d.end();
+				return;
+			}
 			const mode = zone === 'center' ? 'append' : zone;
 
 			if (d.source === 'pane') {
@@ -93,7 +104,20 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 			)}
 			data-testid={`drop-zone-${paneId}`}
 		>
-			<ZoneIndicator zone={hoverZone} dimmed={sameAsSrc && hoverZone === 'center'} />
+			<ZoneIndicator
+				zone={hoverZone}
+				dimmed={sameAsSrc && hoverZone === 'center'}
+				disabled={hoverZone !== null && hoverZone !== 'center' && !canSplit}
+			/>
+			{showCapToast && (
+				<FloatingToastChip
+					variant="notice"
+					anchor="pane-corner"
+					label={`Pane limit reached (${MAX_LEAVES}).`}
+					onDismiss={() => setShowCapToast(false)}
+					ttlMs={2500}
+				/>
+			)}
 		</div>
 	);
 }
@@ -101,11 +125,20 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 interface ZoneIndicatorProps {
 	zone: Zone | null;
 	dimmed: boolean;
+	/** §4.3: an edge zone at the 6-leaf cap — stays visible, disabled
+	 *  treatment, so the cap is legible mid-drag instead of the zone just
+	 *  not lighting up. */
+	disabled: boolean;
 }
 
-function ZoneIndicator({ zone, dimmed }: ZoneIndicatorProps) {
+function ZoneIndicator({ zone, dimmed, disabled }: ZoneIndicatorProps) {
 	if (!zone) return null;
-	const base = 'absolute border-2 border-primary/70 bg-primary/15 transition-opacity';
+	const base = cn(
+		'absolute transition-opacity',
+		disabled
+			? 'border-2 border-muted-foreground/40 bg-muted-foreground/10 cursor-not-allowed'
+			: 'border-2 border-primary/70 bg-primary/15'
+	);
 	const positional = (() => {
 		switch (zone) {
 			case 'center':
