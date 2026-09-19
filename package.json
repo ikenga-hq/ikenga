@@ -26,7 +26,9 @@
 		"fmt": "biome format --write .",
 		"lint": "biome lint .",
 		"engine:smoke": "bun run scripts/engine-wire-smoke.ts",
-		"test:acl-parity": "bun run scripts/check-acl-parity.ts"
+		"test:acl-parity": "bun run scripts/check-acl-parity.ts",
+		"test:e2e": "playwright test",
+		"probe:frame": "bun run scripts/frame-live-probe.ts"
 	},
 	"dependencies": {
 		"@ikenga/contract": "workspace:*",
@@ -113,6 +115,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.13",
+		"@playwright/test": "^1.63.0",
 		"@tailwindcss/vite": "^4.2.4",
 		"@tanstack/router-cli": "^1.166.38",
 		"@tauri-apps/cli": "^2.1.0",
