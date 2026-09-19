@@ -19,7 +19,7 @@ import { useState } from 'react';
 import { useDragState } from '@/lib/panes/drag-state';
 import { useDropTarget } from '@/lib/panes/pointer-drag';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { useDockStore } from '@/shell/dock/dock-store';
+import { useCompanionStore } from '@/shell/companion/companion-store';
 import { MAX_LEAVES, type PaneId } from '@/lib/panes/types';
 import { cn } from '@/components/ui/utils';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
@@ -85,9 +85,9 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 			} else if (d.source === 'dock') {
 				// Dock → pane: pull the view out of the dock store and place it via
 				// the pane store. Only close from the dock if the placement succeeds.
-				const view = useDockStore.getState().tabs[d.srcTabIdx];
+				const view = useCompanionStore.getState().tabs[d.srcTabIdx];
 				if (view && placeView(paneId, view, mode)) {
-					useDockStore.getState().closeTab(d.srcTabIdx);
+					useCompanionStore.getState().closeTab(d.srcTabIdx);
 				}
 			}
 			d.end();

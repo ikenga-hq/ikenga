@@ -32,10 +32,28 @@ export interface StatuslineSnapshot {
 	};
 }
 
-export function CostHud({ sessionId }: { sessionId: string }) {
+/** No session selected (the Companion's panel scope is empty): one action —
+ *  ask the Companion to open its session picker. */
+function NoSessionEmpty() {
+	return (
+		<div className="flex h-7 items-center justify-between border-b border-border/40 px-3 text-[11px] text-muted-foreground font-mono select-none">
+			<span>No session selected</span>
+			<button
+				type="button"
+				onClick={() => window.dispatchEvent(new CustomEvent('ikenga:companion-pick-session'))}
+				className="rounded px-1.5 py-0.5 underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+			>
+				Choose a session
+			</button>
+		</div>
+	);
+}
+
+export function CostHud({ sessionId }: { sessionId?: string | null }) {
 	const [snapshot, setSnapshot] = useState<StatuslineSnapshot | null>(null);
 
 	useEffect(() => {
+		if (!sessionId) return;
 		// Initial fetch from backend snapshot REST endpoint if available.
 		// Live endpoint + bearer token — see the note in tool-call-feed.tsx.
 		// The endpoint now returns a per-terminal map; we pick this terminal's
@@ -65,6 +83,8 @@ export function CostHud({ sessionId }: { sessionId: string }) {
 			if (unlisten) unlisten();
 		};
 	}, []);
+
+	if (!sessionId) return <NoSessionEmpty />;
 
 	if (!snapshot) {
 		return (
