@@ -161,24 +161,36 @@ fn lookup_wsl_executable(def: &AgentDef) -> Option<PathBuf> {
             .or_else(|| name.strip_suffix(".bat"))
             .unwrap_or(name);
 
-        let Ok(output) = std::process::Command::new("wsl.exe")
-            .args(["bash", "-l", "-c", &format!("which {clean_name}")])
-            .no_console_window()
-            .output()
-        else {
-            // One candidate name failing to spawn says nothing about the
-            // next one — keep probing instead of giving up on the agent.
-            continue;
-        };
-
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() && path_str.starts_with('/') {
-                return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
-            }
+        // One candidate name failing to resolve says nothing about the next
+        // one — keep probing instead of giving up on the agent.
+        if let Some(path_str) = wsl_which(clean_name) {
+            return Some(PathBuf::from(format!("wsl:{clean_name}:{path_str}")));
         }
     }
     None
+}
+
+/// Absolute path of `name` inside the default WSL distro's login shell, or
+/// `None` when WSL is absent or the binary isn't on the distro's PATH. Shared
+/// by agent detection and the headless Chi runtime (`commands/chi.rs`), so
+/// both agree on whether a WSL-only CLI exists.
+#[cfg(windows)]
+pub(crate) fn wsl_which(name: &str) -> Option<String> {
+    let has_wsl = which::which("wsl.exe").is_ok()
+        || std::path::Path::new(r"C:\Windows\System32\wsl.exe").exists();
+    if !has_wsl {
+        return None;
+    }
+    let output = std::process::Command::new("wsl.exe")
+        .args(["bash", "-l", "-c", &format!("which {name}")])
+        .no_console_window()
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!path_str.is_empty() && path_str.starts_with('/')).then_some(path_str)
 }
 
 fn lookup_spec(spec: &ExecutableSpec) -> Option<PathBuf> {
