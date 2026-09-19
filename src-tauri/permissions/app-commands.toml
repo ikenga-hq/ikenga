@@ -132,6 +132,7 @@ commands.allow = [
   "iyke_mcp_info",
   "iyke_network_push",
   "iyke_query_cache_done",
+  "iyke_set_frame",
   "iyke_set_shell",
   "iyke_terminal_read_done",
   "iyke_terminal_spawn_done",

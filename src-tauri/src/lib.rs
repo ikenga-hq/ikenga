@@ -1115,6 +1115,7 @@ pub fn run() {
             // iyke
             iyke_endpoint,
             iyke_set_shell,
+            iyke::handlers::iyke_set_frame,
             iyke_log_push,
             iyke_network_push,
             iyke_dom_done,
