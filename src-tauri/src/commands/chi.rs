@@ -369,41 +369,159 @@ fn user_envelope(text: &str) -> String {
     s
 }
 
-fn create_chi_command(binary: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let resolved = which::which_in(binary, Some(crate::runtime::augmented_path()), ".")
-            .or_else(|_| which::which_in(format!("{binary}.cmd"), Some(crate::runtime::augmented_path()), "."))
-            .or_else(|_| which::which_in(format!("{binary}.exe"), Some(crate::runtime::augmented_path()), "."));
-        if let Ok(p) = resolved {
-            let is_batch = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
-                .unwrap_or(false);
-            if is_batch {
-                let mut cmd = Command::new("cmd.exe");
-                cmd.arg("/c").arg(p);
-                cmd.no_console_window();
-                cmd
-            } else {
-                let mut cmd = Command::new(p);
-                cmd.no_console_window();
-                cmd
-            }
-        } else {
-            let mut cmd = Command::new(binary);
-            cmd.no_console_window();
-            cmd
-        }
+/// How a headless Chi engine binary gets launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EngineLaunch {
+    /// A host executable. On Windows a resolved `.cmd` / `.bat` shim runs
+    /// through `cmd.exe /c`.
+    Native(PathBuf),
+    /// Found only inside WSL (e.g. Claude Code installed in the distro, not
+    /// on Windows). Launched as `wsl.exe --cd <cwd> -e bash -l -c '<bin> <args>'`
+    /// — the same shape the interactive terminal uses (`src/terminal/claude-wrap.ts`).
+    Wsl { binary: String },
+}
+
+/// Where engine binaries are looked up. A trait so tests can stand in for
+/// the host PATH and WSL.
+trait EngineResolver {
+    /// Resolved host path of `binary`, if it is on the (augmented) PATH.
+    fn native(&self, binary: &str) -> Option<PathBuf>;
+    /// Whether `binary` is on the default WSL distro's login PATH.
+    fn in_wsl(&self, binary: &str) -> bool;
+}
+
+/// The real resolver: augmented host PATH first, then WSL on Windows.
+struct HostResolver;
+
+impl EngineResolver for HostResolver {
+    fn native(&self, binary: &str) -> Option<PathBuf> {
+        let path = crate::runtime::augmented_path();
+        let found = which::which_in(binary, Some(path), ".");
+        #[cfg(windows)]
+        let found = found
+            .or_else(|_| which::which_in(format!("{binary}.cmd"), Some(path), "."))
+            .or_else(|_| which::which_in(format!("{binary}.exe"), Some(path), "."));
+        found.ok()
     }
+
+    #[cfg(windows)]
+    fn in_wsl(&self, binary: &str) -> bool {
+        // `wsl.exe bash -l -c which …` costs ~0.5–2 s, so remember hits for
+        // the life of the process. Misses are re-probed: the user may install
+        // the CLI while the shell is running.
+        static FOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let found = FOUND.get_or_init(Default::default);
+        if found.lock().map(|s| s.contains(binary)).unwrap_or(false) {
+            return true;
+        }
+        let hit = crate::agent_detect::agents::wsl_which(binary).is_some();
+        if hit {
+            if let Ok(mut s) = found.lock() {
+                s.insert(binary.to_string());
+            }
+        }
+        hit
+    }
+
     #[cfg(not(windows))]
-    {
-        Command::new(binary)
+    fn in_wsl(&self, _binary: &str) -> bool {
+        false
     }
 }
 
-/// Return a `(command, child)` for the requested engine.
+fn resolve_engine(binary: &str, resolver: &dyn EngineResolver) -> Result<EngineLaunch, String> {
+    if let Some(path) = resolver.native(binary) {
+        return Ok(EngineLaunch::Native(path));
+    }
+    if resolver.in_wsl(binary) {
+        return Ok(EngineLaunch::Wsl {
+            binary: binary.to_string(),
+        });
+    }
+    let searched = if cfg!(windows) {
+        "on PATH or inside WSL"
+    } else {
+        "on PATH"
+    };
+    Err(format!(
+        "engine binary `{binary}` not found {searched} — install it or add it to PATH"
+    ))
+}
+
+/// Single-quote `s` for a POSIX shell.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `C:\Users\x` → `/mnt/c/Users/x` (WSL's default automount); anything else
+/// passes through. Mirrors `toWslPath` in `src/terminal/claude-wrap.ts`.
+fn to_wsl_path(p: &str) -> String {
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        return format!("/mnt/{drive}/{}", p[3..].replace('\\', "/"));
+    }
+    p.to_string()
+}
+
+/// Build the piped engine command for `launch` with `args`. `set_cwd` is
+/// false for engines that take the directory as a flag instead (codex `--cd`);
+/// a WSL launch always passes `--cd` to `wsl.exe`.
+fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bool) -> Command {
+    let mut cmd = match launch {
+        EngineLaunch::Native(path) => {
+            let is_batch = cfg!(windows)
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+                    .unwrap_or(false);
+            let mut cmd = if is_batch {
+                let mut cmd = Command::new("cmd.exe");
+                cmd.arg("/c").arg(path);
+                cmd
+            } else {
+                Command::new(path)
+            };
+            cmd.args(args).env("PATH", crate::runtime::augmented_path());
+            cmd
+        }
+        EngineLaunch::Wsl { binary } => {
+            let script = std::iter::once(binary.as_str())
+                .chain(args.iter().map(String::as_str))
+                .map(sh_quote)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut cmd = Command::new("wsl.exe");
+            cmd.args([
+                "--cd",
+                &cwd.replace('\\', "/"),
+                "-e",
+                "bash",
+                "-l",
+                "-c",
+                &script,
+            ]);
+            cmd
+        }
+    };
+    if set_cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    cmd.no_console_window();
+    cmd
+}
+
+/// Return the command for the requested engine.
 fn build_engine_command(
     engine_id: &str,
     prompt: &str,
@@ -412,6 +530,27 @@ fn build_engine_command(
     mode: Option<&str>,
     resume_id: Option<&str>,
 ) -> Result<Command, String> {
+    build_engine_command_with(
+        &HostResolver,
+        engine_id,
+        prompt,
+        cwd,
+        model,
+        mode,
+        resume_id,
+    )
+}
+
+fn build_engine_command_with(
+    resolver: &dyn EngineResolver,
+    engine_id: &str,
+    prompt: &str,
+    cwd: &str,
+    model: Option<&str>,
+    mode: Option<&str>,
+    resume_id: Option<&str>,
+) -> Result<Command, String> {
+    let s = |v: &str| v.to_string();
     match engine_id {
         "claude-code" => {
             let permission_mode = mode
@@ -419,55 +558,42 @@ fn build_engine_command(
                 .unwrap_or_default()
                 .as_claude_flag();
 
-            let mut cmd = create_chi_command("claude");
-            cmd.arg("--permission-prompt-tool")
-                .arg("stdio")
-                .arg("--permission-mode")
-                .arg(permission_mode)
-                .arg("--print")
-                .arg("--input-format")
-                .arg("stream-json")
-                .arg("--output-format")
-                .arg("stream-json")
-                .arg("--verbose")
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .env("PATH", crate::runtime::augmented_path());
-
+            let launch = resolve_engine("claude", resolver)?;
+            let mut args: Vec<String> = [
+                "--permission-prompt-tool",
+                "stdio",
+                "--permission-mode",
+                permission_mode,
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+            .map(s)
+            .to_vec();
             if let Some(id) = resume_id {
-                cmd.arg("--resume").arg(id);
+                args.extend([s("--resume"), s(id)]);
             }
             if let Some(m) = model {
-                cmd.arg("--model").arg(m);
+                args.extend([s("--model"), s(m)]);
             }
-
-            Ok(cmd)
+            Ok(engine_command(&launch, &args, cwd, true))
         }
         "antigravity-cli" => {
-            let mut cmd = create_chi_command("agy");
-            cmd.arg("-p")
-                .arg(prompt)
-                .arg("--output-format")
-                .arg("stream-json")
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .env("PATH", crate::runtime::augmented_path());
-
+            let launch = resolve_engine("agy", resolver)?;
+            let mut args = vec![s("-p"), s(prompt), s("--output-format"), s("stream-json")];
             if let Some(id) = resume_id {
-                cmd.arg("--conversation").arg(id);
+                args.extend([s("--conversation"), s(id)]);
             }
             if let Some(m) = model {
-                cmd.arg("--model").arg(m);
+                args.extend([s("--model"), s(m)]);
             }
             if let Some(mo) = mode {
-                cmd.arg("--mode").arg(mo);
+                args.extend([s("--mode"), s(mo)]);
             }
-
-            Ok(cmd)
+            Ok(engine_command(&launch, &args, cwd, true))
         }
         // Codex uses `codex exec --json` for new sessions and
         // `codex exec resume <thread_id> --json` for subsequent turns.
@@ -475,57 +601,40 @@ fn build_engine_command(
         // arbitrary project dirs (codex defaults to refusing outside a
         // git repo). `-` as the positional arg means "read prompt from stdin".
         "codex" => {
-            let mut cmd = create_chi_command("codex");
-            if let Some(id) = resume_id {
-                cmd.args(["exec", "resume", id, "--json"]);
-            } else {
-                cmd.args(["exec", "--json"]);
-            }
-            cmd.args(["--skip-git-repo-check", "--cd", cwd, "-"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .env("PATH", crate::runtime::augmented_path());
+            let launch = resolve_engine("codex", resolver)?;
+            let mut args = match resume_id {
+                Some(id) => vec![s("exec"), s("resume"), s(id), s("--json")],
+                None => vec![s("exec"), s("--json")],
+            };
+            // `--cd` is read by codex itself, so a WSL codex needs a Linux path.
+            let codex_cwd = match launch {
+                EngineLaunch::Wsl { .. } => to_wsl_path(cwd),
+                EngineLaunch::Native(_) => s(cwd),
+            };
+            args.extend([s("--skip-git-repo-check"), s("--cd"), codex_cwd, s("-")]);
             // `--model` is a codex global flag (before the subcommand);
             // codex itself selects the default model from its config if
             // omitted, so we only pass it when explicitly set.
             if let Some(m) = model {
-                cmd.arg("--model").arg(m);
+                args.extend([s("--model"), s(m)]);
             }
-            Ok(cmd)
+            Ok(engine_command(&launch, &args, cwd, false))
         }
         "opencode" => {
-            let mut cmd = create_chi_command("opencode");
-            cmd.arg("run")
-                .arg("-p")
-                .arg(prompt)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .env("PATH", crate::runtime::augmented_path());
-
+            let launch = resolve_engine("opencode", resolver)?;
+            let mut args = vec![s("run"), s("-p"), s(prompt)];
             if let Some(m) = model {
-                cmd.arg("--model").arg(m);
+                args.extend([s("--model"), s(m)]);
             }
-
-            Ok(cmd)
+            Ok(engine_command(&launch, &args, cwd, true))
         }
         "pi" => {
-            let mut cmd = create_chi_command("pi");
-            cmd.arg("-p")
-                .arg(prompt)
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .env("PATH", crate::runtime::augmented_path());
-
+            let launch = resolve_engine("pi", resolver)?;
+            let mut args = vec![s("-p"), s(prompt)];
             if let Some(m) = model {
-                cmd.arg("--model").arg(m);
+                args.extend([s("--model"), s(m)]);
             }
-
-            Ok(cmd)
+            Ok(engine_command(&launch, &args, cwd, true))
         }
         // cursor-agent is scaffolded but not yet runnable through the chi
         // surface. Return a clean error rather than falling through to an
@@ -558,6 +667,36 @@ fn spawn_engine_child(
     Ok((child, stdin, stdout, stderr))
 }
 
+type EngineChild = (
+    Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+    Option<tokio::process::ChildStderr>,
+);
+
+/// Spawn the engine for a run whose cache row already exists. If building or
+/// spawning fails (engine not installed, bad cwd, …) the row is closed out as
+/// `failed` with the error, so `/iyke/chi/status` and the Sessions list show
+/// why instead of the run sitting `queued` / `running` forever.
+async fn spawn_engine_or_fail(
+    db: &PaDb,
+    run_id: &str,
+    cmd: Result<Command, String>,
+) -> Result<EngineChild, String> {
+    match cmd.and_then(spawn_engine_child) {
+        Ok(child) => Ok(child),
+        Err(e) => {
+            log::warn!(target: "ikenga::chi", "chi run {run_id} failed to start: {e}");
+            if let Err(db_err) =
+                cache_update_done(db, run_id, "failed", Some(&e), false, None).await
+            {
+                log::warn!(target: "ikenga::chi", "chi run {run_id}: could not record spawn failure: {db_err}");
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Background task for a Claude Code one-off. Reads `stdout`, writes partial
 /// output to `output_path`, and updates `chi_cache` as the run progresses.
 async fn claude_one_off_task(
@@ -580,7 +719,11 @@ async fn claude_one_off_task(
     }
     let _ = stdin.flush().await;
     // Close stdin so claude knows no more input is coming for this turn.
+    // `shutdown()` on a child pipe does not close the handle, so drop it:
+    // until the write end closes, stream-json claude waits for more input
+    // and the run never finishes.
     let _ = stdin.shutdown().await;
+    drop(stdin);
 
     // Spawn stderr logger.
     if let Some(stderr) = stderr {
@@ -847,6 +990,9 @@ async fn codex_one_off_task(
     }
     let _ = stdin.flush().await;
     let _ = stdin.shutdown().await;
+    // Close the pipe for real so codex sees EOF on the `-` prompt (see
+    // claude_one_off_task).
+    drop(stdin);
 
     if let Some(stderr) = stderr {
         tauri::async_runtime::spawn(async move {
@@ -1069,8 +1215,8 @@ pub(crate) async fn spawn_chi_run(
         opts.model.as_deref(),
         opts.mode.as_deref(),
         opts.resume_session_id.as_deref(),
-    )?;
-    let (child, stdin, stdout, stderr) = spawn_engine_child(cmd)?;
+    );
+    let (child, stdin, stdout, stderr) = spawn_engine_or_fail(&db, &run_id, cmd).await?;
     cache_update_status(&db, &run_id, "running", None).await?;
 
     let child = Arc::new(Mutex::new(child));
@@ -1155,8 +1301,8 @@ pub async fn chi_resume(
         row.model.as_deref(),
         row.mode.as_deref(),
         Some(&resume_id),
-    )?;
-    let (child, stdin, stdout, stderr) = spawn_engine_child(cmd)?;
+    );
+    let (child, stdin, stdout, stderr) = spawn_engine_or_fail(&db, &run_id, cmd).await?;
 
     let child = Arc::new(Mutex::new(child));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -1438,7 +1584,8 @@ mod tests {
 
     #[test]
     fn test_build_engine_command_antigravity() {
-        let cmd = build_engine_command(
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["agy"]),
             "antigravity-cli",
             "hello",
             "/tmp",
@@ -1461,7 +1608,8 @@ mod tests {
 
     #[test]
     fn test_build_engine_command_opencode() {
-        let cmd = build_engine_command(
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["opencode"]),
             "opencode",
             "fix the bug",
             "/tmp",
@@ -1482,7 +1630,8 @@ mod tests {
 
     #[test]
     fn test_build_engine_command_pi() {
-        let cmd = build_engine_command(
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["pi"]),
             "pi",
             "refactor this file",
             "/tmp",
@@ -1498,5 +1647,230 @@ mod tests {
             "-p", "refactor this file",
             "--model", "claude-3-7-sonnet",
         ]);
+    }
+
+    /// Stands in for the host PATH and WSL. `native` binaries resolve to a
+    /// bare path of the same name so program assertions stay readable.
+    struct FakeResolver {
+        native: Vec<&'static str>,
+        wsl: Vec<&'static str>,
+    }
+
+    impl FakeResolver {
+        fn native(bins: &[&'static str]) -> Self {
+            Self {
+                native: bins.to_vec(),
+                wsl: vec![],
+            }
+        }
+        fn wsl(bins: &[&'static str]) -> Self {
+            Self {
+                native: vec![],
+                wsl: bins.to_vec(),
+            }
+        }
+    }
+
+    impl EngineResolver for FakeResolver {
+        fn native(&self, binary: &str) -> Option<PathBuf> {
+            self.native.contains(&binary).then(|| PathBuf::from(binary))
+        }
+        fn in_wsl(&self, binary: &str) -> bool {
+            self.wsl.contains(&binary)
+        }
+    }
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn resolve_engine_prefers_host_path_over_wsl() {
+        let r = FakeResolver {
+            native: vec!["claude"],
+            wsl: vec!["claude"],
+        };
+        assert_eq!(
+            resolve_engine("claude", &r).unwrap(),
+            EngineLaunch::Native(PathBuf::from("claude"))
+        );
+    }
+
+    #[test]
+    fn resolve_engine_falls_back_to_wsl() {
+        assert_eq!(
+            resolve_engine("claude", &FakeResolver::wsl(&["claude"])).unwrap(),
+            EngineLaunch::Wsl {
+                binary: "claude".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_engine_errors_clearly_when_nothing_resolves() {
+        let err = resolve_engine("claude", &FakeResolver::native(&[])).unwrap_err();
+        assert!(err.contains("`claude` not found"), "{err}");
+        assert!(err.contains("install it or add it to PATH"), "{err}");
+        // …and build_engine_command surfaces it instead of an OS spawn error.
+        let err = build_engine_command_with(
+            &FakeResolver::native(&[]),
+            "claude-code",
+            "hi",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("`claude` not found"), "{err}");
+    }
+
+    #[test]
+    fn claude_code_in_wsl_launches_like_the_terminal() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::wsl(&["claude"]),
+            "claude-code",
+            "ignored: claude reads the prompt from stdin",
+            r"C:\work\proj",
+            Some("opus"),
+            None,
+            Some("sess-1"),
+        )
+        .unwrap();
+        assert_eq!(cmd.as_std().get_program(), "wsl.exe");
+        let args = args_of(&cmd);
+        assert_eq!(
+            &args[..6],
+            ["--cd", "C:/work/proj", "-e", "bash", "-l", "-c"]
+        );
+        assert_eq!(
+            args[6],
+            "'claude' '--permission-prompt-tool' 'stdio' '--permission-mode' 'default' \
+             '--print' '--input-format' 'stream-json' '--output-format' 'stream-json' \
+             '--verbose' '--resume' 'sess-1' '--model' 'opus'"
+        );
+        assert_eq!(args.len(), 7);
+    }
+
+    #[test]
+    fn wsl_launch_quotes_prompts_for_bash() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::wsl(&["pi"]),
+            "pi",
+            "it's $HOME; rm -rf /",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(args_of(&cmd)[6], r"'pi' '-p' 'it'\''s $HOME; rm -rf /'");
+    }
+
+    #[test]
+    fn codex_in_wsl_gets_a_linux_cd_path() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::wsl(&["codex"]),
+            "codex",
+            "",
+            r"C:\Users\x\proj",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let args = args_of(&cmd);
+        assert_eq!(args[1], "C:/Users/x/proj");
+        assert!(
+            args[6].contains("'--cd' '/mnt/c/Users/x/proj'"),
+            "{}",
+            args[6]
+        );
+        assert_eq!(to_wsl_path("/already/linux"), "/already/linux");
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_marks_the_run_failed() {
+        let db = test_db().await;
+        let cache = ChiCache::new(std::env::temp_dir());
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let opts = ChiRunOpts {
+            engine_id: "claude-code".into(),
+            prompt: "hello".into(),
+            cwd: None,
+            model: None,
+            mode: None,
+            timeout_seconds: None,
+            parent_id: None,
+            resume_session_id: None,
+            persistent: false,
+        };
+        cache_insert(&db, &run_id, &opts, &cache.run_output_path(&run_id), "cli")
+            .await
+            .unwrap();
+
+        // Resolution failure (engine not installed).
+        let err = spawn_engine_or_fail(
+            &db,
+            &run_id,
+            Err("engine binary `claude` not found on PATH or inside WSL".into()),
+        )
+        .await
+        .unwrap_err();
+        let row = cache_get(&db, &run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.error.as_deref(), Some(err.as_str()));
+        assert!(row.ended_at.is_some());
+
+        // OS spawn failure (resolved, but the program can't start).
+        cache_update_status(&db, &run_id, "running", None)
+            .await
+            .unwrap();
+        let bogus = Command::new("ikenga-definitely-not-a-real-binary");
+        let err = spawn_engine_or_fail(&db, &run_id, Ok(bogus))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("spawn engine:"), "{err}");
+        let row = cache_get(&db, &run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    }
+
+    #[tokio::test]
+    async fn spawn_chi_run_records_failed_status_when_the_engine_cannot_start() {
+        let db = Arc::new(test_db().await);
+        let cache =
+            ChiCache::new(std::env::temp_dir().join(format!("chi-test-{}", uuid::Uuid::new_v4())));
+        let runtime = Arc::new(ChiRuntime::new());
+        let opts = ChiRunOpts {
+            // cursor-agent always refuses to build, so this drives the real
+            // spawn_chi_run path without depending on what's installed.
+            engine_id: "cursor-agent".into(),
+            prompt: "hello".into(),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            model: None,
+            mode: None,
+            timeout_seconds: None,
+            parent_id: None,
+            resume_session_id: None,
+            persistent: false,
+        };
+        let err = spawn_chi_run(db.clone(), &cache, &runtime, opts, "cli")
+            .await
+            .err()
+            .expect("cursor-agent must not start");
+        assert!(
+            err.contains("cursor-agent runtime not implemented"),
+            "{err}"
+        );
+
+        let rows = cache_list(&db, Some("cursor-agent"), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed", "run must not stay queued");
+        assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+        assert!(rows[0].ended_at.is_some());
     }
 }
