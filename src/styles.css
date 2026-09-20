@@ -326,42 +326,6 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
- * Workspace tints for the rail nouns (WP-03).
- *
- * `data-workspace` now carries project | chi | ngwa | settings
- * (theme-store.ts). `settings` has had a tint in @ikenga/tokens all along;
- * the other three arrive with the tokens changeset (tokens#11), which borrows
- * existing values: project ← files, chi ← agents, ngwa ← app. Until that
- * version is published and the shell bumps to it, alias them here with the
- * same values tokens#11 ships, so every `var(--tint-<noun>-*)` resolves.
- * Known, not fixed here: the tokens' `[data-workspace=…]` rules (these and
- * the published ones alike) lose to the `:root[data-mode=…]` defaults for
- * `--tint-*-active` on specificity, so the chrome still paints the default
- * active tint in every workspace, as it did before WP-03. Reported to WP-01.
- * TODO(WP-01 publish): delete this block once @ikenga/tokens ships tokens#11.
- * ------------------------------------------------------------------------- */
-:root {
-	--tint-project-bg: var(--tint-files-bg);
-	--tint-project-fg: var(--tint-files-fg);
-	--tint-chi-bg: var(--tint-agents-bg);
-	--tint-chi-fg: var(--tint-agents-fg);
-	--tint-ngwa-bg: var(--tint-app-bg);
-	--tint-ngwa-fg: var(--tint-app-fg);
-}
-[data-workspace="project"] {
-	--tint-bg-active: var(--tint-project-bg);
-	--tint-fg-active: var(--tint-project-fg);
-}
-[data-workspace="chi"] {
-	--tint-bg-active: var(--tint-chi-bg);
-	--tint-fg-active: var(--tint-chi-fg);
-}
-[data-workspace="ngwa"] {
-	--tint-bg-active: var(--tint-ngwa-bg);
-	--tint-fg-active: var(--tint-ngwa-fg);
-}
-
-/* ---------------------------------------------------------------------------
  * The rail — Project · Chi · Ngwa · pins · Settings (WP-03).
  *
  * Geometry and states follow the locked frame (designs/frame-workbench-v4.html
