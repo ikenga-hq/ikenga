@@ -12,6 +12,34 @@ const host = process.env.TAURI_DEV_HOST;
 // env var, set it here too (or before `bun run tauri dev`).
 const VIEWER_PORT = Number(process.env.IKENGA_VIEWER_PORT ?? 47821);
 
+function stripDevRoutesPlugin(): import('vite').Plugin {
+	return {
+		name: 'strip-dev-routes',
+		apply: 'build',
+		enforce: 'pre',
+		transform(code, id) {
+			if (!id.replace(/\\/g, '/').includes('src/routeTree.gen')) return null;
+			let transformed = code;
+			// 1. Remove dev route imports
+			transformed = transformed.replace(/^import\s+.*\s+from\s+['"].*\/routes\/dev\/.*['"];?\r?\n/gm, '');
+			// 2. Remove const Dev...Route = ...
+			transformed = transformed.replace(/^\s*const\s+Dev\w+Route\s*=\s*Dev\w+RouteImport[\s\S]*?\)\s*as\s+any\s*\)\r?\n/gm, '');
+			// 3. Remove from rootRouteChildren
+			transformed = transformed.replace(/^\s*Dev\w+Route:\s*Dev\w+Route,?\r?\n/gm, '');
+			// 4. Remove union types
+			transformed = transformed.replace(/^\s*\|\s*['"]\/dev\/[^'"]+['"]\r?\n/gm, '');
+			// 5. Remove interface property mappings
+			transformed = transformed.replace(/^\s*['"]\/dev\/[^'"]+['"]:\s*typeof\s+Dev\w+Route\r?\n/gm, '');
+			// 6. Remove route definition objects in interfaces
+			transformed = transformed.replace(/^\s*['"]\/dev\/[^'"]+['"]:\s*\{\s*id:\s*['"]\/dev\/[^'"]+['"][\s\S]*?\n\s*\}\r?\n/gm, '');
+			return {
+				code: transformed,
+				map: null,
+			};
+		},
+	};
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
 	plugins: [
@@ -19,6 +47,7 @@ export default defineConfig({
 			routesDirectory: './src/routes',
 			generatedRouteTree: './src/routeTree.gen.ts',
 		}),
+		stripDevRoutesPlugin(),
 		react(),
 		tailwindcss(),
 	],
@@ -107,6 +136,7 @@ export default defineConfig({
 		target: 'esnext',
 		minify: !process.env.TAURI_ENV_DEBUG ? 'esbuild' : false,
 		sourcemap: !!process.env.TAURI_ENV_DEBUG,
+		manifest: true,
 	},
 	optimizeDeps: {
 		exclude: ['@tauri-apps/api', '@ikenga/ui-lib'],

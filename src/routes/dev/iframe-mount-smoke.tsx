@@ -23,7 +23,7 @@
 // successful initialize round-trip is the assertion that the wire format
 // + AppBridge plumbing + hostContext composition all work end-to-end.
 
-import { createFileRoute, useSearch } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { PkgIframeHost } from '@/components/pkg/pkg-iframe-host';
@@ -48,8 +48,13 @@ type Phase =
 	| 'storyboard'
 	| 'storyboard-recovery';
 
-export const Route = createFileRoute('/iframe-mount-smoke')({
-	component: IframeMountSmoke,
+export const Route = createFileRoute('/dev/iframe-mount-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? IframeMountSmoke : () => null,
 	validateSearch: (s: Record<string, unknown>): { phase?: Phase } => ({
 		phase: (s.phase as Phase) || undefined,
 	}),
@@ -92,7 +97,7 @@ interface UiSnap {
 }
 
 function IframeMountSmoke() {
-	const search = useSearch({ from: '/iframe-mount-smoke' });
+	const search = Route.useSearch();
 	const phase: Phase = search.phase ?? 'roundtrip';
 
 	const [rows, setRows] = useState<Row[]>([]);

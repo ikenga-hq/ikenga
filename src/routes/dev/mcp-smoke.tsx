@@ -1,31 +1,39 @@
-// Claude assets registry smoke test.
+// MCP registry smoke test.
 //
-// 1. Install /tmp/test-pkg-com.example.claude (declares skills/commands/agents).
-// 2. Status → assert registry surfaces 3 entries (skills + commands + agents).
-// 3. Read each target via fsRead → assert symlink resolves and file contents match.
-// 4. Uninstall → re-stat targets via fsExists → assert all gone.
-import { createFileRoute } from '@tanstack/react-router';
+// 1. Install /tmp/test-pkg-com.example.mcp (declares 2 stdio MCP servers).
+// 2. Status → assert registry surfaces both entries with `pkg-com-example-mcp-*` keys.
+// 3. Uninstall → assert registry empty for the pkg.
+//
+// Filesystem-side verification (the entries land in ~/.claude.json:mcpServers
+// and are removed on uninstall) happens out-of-band via shell — the
+// allowlisted fs commands don't reach the home-level .claude.json.
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/claude-assets-smoke')({
-	component: ClaudeAssetsSmoke,
+export const Route = createFileRoute('/dev/mcp-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? McpSmoke : () => null,
 });
 
-const PKG_PATH = '/tmp/test-pkg-com.example.claude';
-const PKG_ID = 'com.example.claude';
+const PKG_PATH = '/tmp/test-pkg-com.example.mcp';
+const PKG_ID = 'com.example.mcp';
+const PKG_SLUG = 'com-example-mcp';
 
 type Row = { label: string; outcome: string };
 
 interface Entry {
 	pkg_id: string;
-	kind: string;
-	source: string;
-	target: string;
+	name: string;
+	key: string;
 }
 
-function ClaudeAssetsSmoke() {
+function McpSmoke() {
 	const [rows, setRows] = useState<Row[]>([]);
 	const [verdict, setVerdict] = useState('RUNNING');
 
@@ -34,7 +42,7 @@ function ClaudeAssetsSmoke() {
 		const log = (label: string, outcome: string) => {
 			if (cancelled) return;
 			// eslint-disable-next-line no-console
-			console.log(`[claude-assets-smoke] ${label}: ${outcome}`);
+			console.log(`[mcp-smoke] ${label}: ${outcome}`);
 			setRows((p) => [...p, { label, outcome }]);
 		};
 
@@ -55,37 +63,34 @@ function ClaudeAssetsSmoke() {
 			}
 
 			let registryOk = false;
-			let recordedTargets: string[] = [];
 			try {
 				const s = await pkgKernelStatus();
-				const reg = s.registries.claude_assets as { entries: Entry[]; count: number } | undefined;
+				const reg = s.registries.mcp as
+					| { entries: Entry[]; count: number; config_path?: string }
+					| undefined;
 				const mine = (reg?.entries ?? []).filter((e) => e.pkg_id === PKG_ID);
-				const kinds = new Set(mine.map((m) => m.kind));
-				recordedTargets = mine.map((m) => m.target);
+				const echo = mine.find((e) => e.name === 'echo-server');
+				const ls = mine.find((e) => e.name === 'ls-server');
 				registryOk =
-					mine.length === 3 && kinds.has('skills') && kinds.has('commands') && kinds.has('agents');
+					mine.length === 2 &&
+					echo?.key === `pkg-${PKG_SLUG}-echo-server` &&
+					ls?.key === `pkg-${PKG_SLUG}-ls-server`;
 				log(
 					'REGISTRY',
-					`pkg_assets=${mine.length} kinds=${JSON.stringify([...kinds])} targets=${JSON.stringify(recordedTargets)}`
+					`pkg_mcps=${mine.length} keys=${JSON.stringify(mine.map((m) => m.key))} config=${reg?.config_path ?? 'n/a'}`
 				);
 			} catch (e) {
 				log('REGISTRY', `FAIL ${(e as Error).message ?? String(e)}`);
 			}
 
-			// Filesystem verification happens out-of-band — the fs Tauri commands
-			// are allowlisted to ~/royalti-co + ~/.claude/projects + ~/.company,
-			// and ~/.claude/{skills,commands,agents}/ is outside that scope. The
-			// registry snapshot gives us the target paths; verify with a shell
-			// check after the test (see CLI in this route's prompt).
-
 			let uninstallOk = false;
 			try {
 				await pkgUninstall(PKG_ID);
 				const s = await pkgKernelStatus();
-				const reg = s.registries.claude_assets as { entries: Entry[]; count: number } | undefined;
+				const reg = s.registries.mcp as { entries: Entry[]; count: number } | undefined;
 				const mine = (reg?.entries ?? []).filter((e) => e.pkg_id === PKG_ID);
 				uninstallOk = mine.length === 0;
-				log('UNINSTALL', `pkg_assets_after=${mine.length}`);
+				log('UNINSTALL', `pkg_mcps_after=${mine.length}`);
 			} catch (e) {
 				log('UNINSTALL', `FAIL ${(e as Error).message ?? String(e)}`);
 			}
@@ -103,16 +108,13 @@ function ClaudeAssetsSmoke() {
 
 	return (
 		<div style={{ padding: 24, fontFamily: 'monospace', fontSize: 13 }}>
-			<h1 style={{ fontSize: 16, marginBottom: 12 }}>Smoke: Claude Assets Registry</h1>
-			<div
-				data-testid="claude-assets-smoke-verdict"
-				style={{ marginBottom: 16, fontWeight: 'bold' }}
-			>
+			<h1 style={{ fontSize: 16, marginBottom: 12 }}>Smoke: MCP Registry</h1>
+			<div data-testid="mcp-smoke-verdict" style={{ marginBottom: 16, fontWeight: 'bold' }}>
 				{verdict}
 			</div>
 			<ul style={{ listStyle: 'none', padding: 0 }}>
 				{rows.map((r, i) => (
-					<li key={i} data-testid={`claude-assets-smoke-row-${i}`}>
+					<li key={i} data-testid={`mcp-smoke-row-${i}`}>
 						<strong>{r.label}</strong> — {r.outcome}
 					</li>
 				))}

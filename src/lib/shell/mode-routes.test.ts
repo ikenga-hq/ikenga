@@ -6,6 +6,8 @@ import { modeForRoute } from './mode-routes';
 
 describe('modeForRoute', () => {
 	it('maps the exclusive v16 mode prefixes', () => {
+		expect(modeForRoute('/project')).toBe('project');
+		expect(modeForRoute('/project/dashboard')).toBe('project');
 		expect(modeForRoute('/packages')).toBe('ngwa');
 		expect(modeForRoute('/packages/browse')).toBe('ngwa');
 		expect(modeForRoute('/packages?filter=review')).toBe('ngwa');

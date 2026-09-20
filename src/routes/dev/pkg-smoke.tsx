@@ -4,15 +4,20 @@
 // `?phase=install`: install only, leave persisted (test boot replay).
 // `?phase=verify`:  no-install; just check status reflects prior install.
 // `?phase=cleanup`: uninstall only.
-import { createFileRoute, useSearch } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
 type Phase = 'roundtrip' | 'install' | 'verify' | 'cleanup';
 
-export const Route = createFileRoute('/pkg-smoke')({
-	component: PkgSmoke,
+export const Route = createFileRoute('/dev/pkg-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? PkgSmoke : () => null,
 	validateSearch: (s: Record<string, unknown>): { phase?: Phase } => ({
 		phase: (s.phase as Phase) || undefined,
 	}),
@@ -24,7 +29,7 @@ const PKG_ID = 'com.example.demo';
 type Row = { label: string; outcome: string };
 
 function PkgSmoke() {
-	const search = useSearch({ from: '/pkg-smoke' });
+	const search = Route.useSearch();
 	const phase: Phase = search.phase ?? 'roundtrip';
 	const [rows, setRows] = useState<Row[]>([]);
 	const [verdict, setVerdict] = useState('RUNNING');

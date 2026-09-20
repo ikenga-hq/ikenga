@@ -5,7 +5,7 @@
 // 2. Install /tmp/test-pkg-com.example.perms (declares fs.read for that path).
 // 3. Read again — expect success + matching body.
 // 4. Cleanup: uninstall.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { invoke } from '@/lib/transport';
 
@@ -16,8 +16,13 @@ import {
 	spikeGrantFsRead,
 } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/perms-smoke')({
-	component: PermsSmoke,
+export const Route = createFileRoute('/dev/perms-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? PermsSmoke : () => null,
 });
 
 const PKG_PATH = '/tmp/test-pkg-com.example.perms';

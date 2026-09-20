@@ -5,7 +5,7 @@
 // 3. pkgSettingsGet → assert seeded defaults are present.
 // 4. pkgSettingsSet → override one field, re-read, assert new value sticks.
 // 5. Uninstall → assert schema gone from snapshot.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import {
@@ -16,8 +16,13 @@ import {
 	pkgUninstall,
 } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/settings-smoke')({
-	component: SettingsSmoke,
+export const Route = createFileRoute('/dev/settings-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? SettingsSmoke : () => null,
 });
 
 const PKG_PATH = '/tmp/test-pkg-com.example.settings';

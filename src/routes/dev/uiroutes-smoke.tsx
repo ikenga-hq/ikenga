@@ -7,13 +7,18 @@
 //
 // The shell is NOT actually mounting the iframe yet — this just proves the
 // registry lifecycle and snapshot wiring.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/uiroutes-smoke')({
-	component: UiRoutesSmoke,
+export const Route = createFileRoute('/dev/uiroutes-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? UiRoutesSmoke : () => null,
 });
 
 const PKG_PATH = '/tmp/test-pkg-com.example.uiroutes';
