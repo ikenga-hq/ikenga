@@ -362,6 +362,105 @@ describe('C5 — no session selected', () => {
 	});
 });
 
+describe('target picker a11y (menu semantics)', () => {
+	async function openPicker(withTerminal = false) {
+		if (withTerminal) {
+			const { useTerminalStore } = await import('@/terminal/session-store');
+			useTerminalStore.setState({
+				tabs: [
+					{
+						id: 'term-a',
+						title: 'bash',
+						spec: { cwd: '/', cmd: ['bash'] },
+						ptyId: 'pty-a',
+						status: 'running',
+						exitCode: null,
+						createdAt: 0,
+						owner: { kind: 'sidepane' },
+					},
+				],
+			});
+		}
+		useCompanionStore.setState({ state: 'expanded' });
+		wrap(<Companion />);
+		const chip = await screen.findByRole('button', { name: /^Dispatch target:/ });
+		fireEvent.click(chip);
+		return { chip, menu: await screen.findByRole('menu', { name: 'Dispatch targets' }) };
+	}
+
+	it('every option carries a menuitem role — none render as bare text', async () => {
+		const { menu } = await openPicker(true);
+		// Nothing inside the menu still exposes the implicit button role: every
+		// one of them declares a menuitem role instead.
+		expect(within(menu).queryAllByRole('button')).toHaveLength(0);
+		const options = [
+			...within(menu).getAllByRole('menuitemradio'),
+			...within(menu).queryAllByRole('menuitem'),
+		];
+		expect(options.length).toBeGreaterThan(0);
+		for (const o of options) expect(o.textContent?.trim()).toBeTruthy();
+	});
+
+	it('options are owned by the menu through role="group", not bare divs', async () => {
+		const { menu } = await openPicker(true);
+		const groups = within(menu).getAllByRole('group');
+		expect(groups.length).toBeGreaterThan(0);
+		// Every child of the menu is a group (ARIA menu required-children), and
+		// every option is a direct child of one.
+		for (const child of Array.from(menu.children)) {
+			expect(child.getAttribute('role')).toBe('group');
+		}
+		for (const group of groups) {
+			expect(group.getAttribute('aria-label')).toBeTruthy();
+			const options = within(group).getAllByRole('menuitemradio');
+			for (const o of options) expect(o.parentElement).toBe(group);
+		}
+	});
+
+	it('the selected target is the checked radio', async () => {
+		useShellStore.setState({
+			companion: { activeTarget: { kind: 'new', engine_id: 'claude-code' } },
+		});
+		const { menu } = await openPicker();
+		const checked = within(menu)
+			.getAllByRole('menuitemradio')
+			.filter((o) => o.getAttribute('aria-checked') === 'true');
+		expect(checked).toHaveLength(1);
+		expect(checked[0].textContent).toContain('claude-code');
+	});
+
+	it('ArrowDown on the chip opens the menu on the first option (APG menu button)', async () => {
+		useCompanionStore.setState({ state: 'expanded' });
+		wrap(<Companion />);
+		const chip = await screen.findByRole('button', { name: /^Dispatch target:/ });
+		fireEvent.keyDown(chip, { key: 'ArrowDown' });
+		const menu = await screen.findByRole('menu', { name: 'Dispatch targets' });
+		const options = within(menu).getAllByRole('menuitemradio');
+		expect(options[0].getAttribute('tabindex')).toBe('0');
+		await waitFor(() => expect(document.activeElement).toBe(options[0]));
+	});
+
+	it('ArrowUp on the chip opens the menu on the last option', async () => {
+		useCompanionStore.setState({ state: 'expanded' });
+		wrap(<Companion />);
+		const chip = await screen.findByRole('button', { name: /^Dispatch target:/ });
+		fireEvent.keyDown(chip, { key: 'ArrowUp' });
+		const menu = await screen.findByRole('menu', { name: 'Dispatch targets' });
+		const options = within(menu).getAllByRole('menuitemradio');
+		await waitFor(() => expect(document.activeElement).toBe(options.at(-1)));
+	});
+
+	it('Home and End move the roving cursor to the ends', async () => {
+		const { menu } = await openPicker(true);
+		const options = within(menu).getAllByRole('menuitemradio');
+		expect(options.length).toBeGreaterThan(1);
+		fireEvent.keyDown(menu, { key: 'End' });
+		await waitFor(() => expect(document.activeElement).toBe(options.at(-1)));
+		fireEvent.keyDown(menu, { key: 'Home' });
+		await waitFor(() => expect(document.activeElement).toBe(options[0]));
+	});
+});
+
 describe('C12 — one input, no PermissionInbox (ADR-021 / spec §5.4, §5.6)', () => {
 	it('the expanded Companion, with live sessions and a pending request, has exactly one text input', async () => {
 		const { useTerminalStore } = await import('@/terminal/session-store');

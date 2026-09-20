@@ -177,8 +177,14 @@ export function TargetPicker() {
 	// biome-ignore lint/correctness/useExhaustiveDependencies: see above
 	useEffect(() => {
 		if (!open) return;
-		const el = menuRef.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]')[cursor];
-		el?.focus();
+		const els = menuRef.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]');
+		if (!els?.length) return;
+		// `-1` means "the last item" — how the chip's ArrowUp opens the menu.
+		if (cursor < 0) {
+			setCursor(els.length - 1);
+			return;
+		}
+		els[cursor]?.focus();
 	}, [open, cursor, items.length]);
 
 	function close() {
@@ -198,7 +204,13 @@ export function TargetPicker() {
 	}
 
 	function onMenuKey(e: React.KeyboardEvent) {
-		if (e.key === 'ArrowDown') {
+		if (e.key === 'Home') {
+			e.preventDefault();
+			setCursor(0);
+		} else if (e.key === 'End') {
+			e.preventDefault();
+			setCursor(items.length ? items.length - 1 : 0);
+		} else if (e.key === 'ArrowDown') {
 			e.preventDefault();
 			setCursor((c) => (items.length ? (c + 1) % items.length : 0));
 		} else if (e.key === 'ArrowUp') {
@@ -211,7 +223,22 @@ export function TargetPicker() {
 		}
 	}
 
-	let lastGroup: string | null = null;
+	// The menu's children must be `menuitem*` or `group` for the roles to be
+	// owned (WAI-ARIA `menu` required-children). Items were previously wrapped
+	// in a bare <div> each, with the group caption as a sibling div — so the
+	// menu owned neither. Runs of the same `group` collapse into one
+	// `role="group"`, and the caption inside it is aria-hidden because the
+	// group's own accessible name already carries it.
+	const groups = useMemo(() => {
+		const out: { group: string; items: PickerItem[] }[] = [];
+		for (const item of items) {
+			const last = out.at(-1);
+			if (last && last.group === item.group) last.items.push(item);
+			else out.push({ group: item.group, items: [item] });
+		}
+		return out;
+	}, [items]);
+
 	return (
 		<div className="relative mb-2 max-w-full">
 			<button
@@ -223,6 +250,13 @@ export function TargetPicker() {
 				onClick={() => {
 					setOpen((o) => (o === 'targets' ? null : 'targets'));
 					setCursor(0);
+				}}
+				onKeyDown={(e) => {
+					// APG menu button: Down opens on the first item, Up on the last.
+					if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+					e.preventDefault();
+					setOpen('targets');
+					setCursor(e.key === 'ArrowDown' ? 0 : -1);
 				}}
 				onContextMenu={(e) => {
 					if (target.kind !== 'session') return;
@@ -252,38 +286,47 @@ export function TargetPicker() {
 							No engine installed — open Ngwa → Store
 						</div>
 					)}
-					{items.map((item, i) => {
-						const header = item.group !== lastGroup && open === 'targets' ? item.group : null;
-						lastGroup = item.group;
-						return (
-							<div key={item.id}>
-								{header && (
-									<div
-										className="px-3 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-wider"
-										style={{ color: 'var(--fg-muted)' }}
-									>
-										{header}
-									</div>
-								)}
-								<button
-									type="button"
-									{...(item.target
-										? { role: 'menuitemradio', 'aria-checked': Boolean(item.selected) }
-										: { role: 'menuitem' })}
-									tabIndex={i === cursor ? 0 : -1}
-									onClick={() => pick(item)}
-									className="flex text-[var(--fg)] hover:bg-[var(--bg-sunken)] min-h-6 w-full items-center gap-2 px-3 py-1 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+					{groups.map(({ group, items: groupItems }) => (
+						// A <fieldset> — what the rule suggests — is not a valid child of
+						// role="menu". ARIA's grouping element inside a menu is a div with
+						// role="group".
+						// biome-ignore lint/a11y/useSemanticElements: see above
+						<div key={group} role="group" aria-label={group}>
+							{open === 'targets' && (
+								// The group's accessible name already says this; repeating it as
+								// a text node would have AT read every caption twice.
+								<div
+									aria-hidden="true"
+									className="px-3 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-wider"
+									style={{ color: 'var(--fg-muted)' }}
 								>
-									<span className="truncate">{item.label}</span>
-									{item.selected && (
-										<span className="ml-auto text-[10px]" style={{ color: 'var(--fg-muted)' }}>
-											current
-										</span>
-									)}
-								</button>
-							</div>
-						);
-					})}
+									{group}
+								</div>
+							)}
+							{groupItems.map((item) => {
+								const i = items.indexOf(item);
+								return (
+									<button
+										key={item.id}
+										type="button"
+										{...(item.target
+											? { role: 'menuitemradio', 'aria-checked': Boolean(item.selected) }
+											: { role: 'menuitem' })}
+										tabIndex={i === cursor ? 0 : -1}
+										onClick={() => pick(item)}
+										className="flex text-[var(--fg)] hover:bg-[var(--bg-sunken)] min-h-6 w-full items-center gap-2 px-3 py-1 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+									>
+										<span className="truncate">{item.label}</span>
+										{item.selected && (
+											<span className="ml-auto text-[10px]" style={{ color: 'var(--fg-muted)' }}>
+												current
+											</span>
+										)}
+									</button>
+								);
+							})}
+						</div>
+					))}
 				</div>
 			)}
 		</div>
