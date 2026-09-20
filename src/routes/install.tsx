@@ -6,9 +6,23 @@
 // Plan: plans/shell/2026-05-17-pkg-surface-unify.md — Phase 5.
 
 import { createFileRoute, redirect } from '@tanstack/react-router';
+import { z } from 'zod';
+
+const searchSchema = z.object({
+	install: z.string().optional(),
+});
 
 export const Route = createFileRoute('/install')({
-	beforeLoad: () => {
-		throw redirect({ to: '/packages', search: { install: 'local-path' } });
+	beforeLoad: ({ search, location }) => {
+		throw redirect({
+			to: '/ngwa/installed',
+			search: {
+				...search,
+				install: search.install ?? 'local-path',
+			},
+			hash: location.hash,
+		});
 	},
+	validateSearch: searchSchema,
 });
+

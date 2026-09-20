@@ -4,14 +4,19 @@
 // 2. Subscribe to `pkg://cron-tick`.
 // 3. Wait ~2s — assert listener fires ≥1×.
 // 4. Uninstall — record current count, wait ~2s more, assert no further fires.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
 import { pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/cron-smoke')({
-	component: CronSmoke,
+export const Route = createFileRoute('/dev/cron-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? CronSmoke : () => null,
 });
 
 const PKG_PATH = '/tmp/test-pkg-com.example.cron';

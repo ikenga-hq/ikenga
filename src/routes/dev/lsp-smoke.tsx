@@ -8,7 +8,7 @@
 //   - diagnostics arrive via the linter gutter
 //
 // Not registered in nav. Open by navigating to /lsp-smoke in dev.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { invoke } from '@/lib/transport';
 import { listen } from '@/lib/transport';
 import { useEffect, useState } from 'react';
@@ -17,8 +17,13 @@ import { CodeEditor } from '@ikenga/ui-lib';
 import { createLspClient, createTsLspClient, type TsLspClient } from '@ikenga/ui-lib/lsp';
 import { createTauriDirectTransport } from '@ikenga/ui-lib/lsp/transports/tauri-direct';
 
-export const Route = createFileRoute('/lsp-smoke')({
-	component: LspSmoke,
+export const Route = createFileRoute('/dev/lsp-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? LspSmoke : () => null,
 });
 
 const PKG_ID = 'com.ikenga.tsserver-lsp';

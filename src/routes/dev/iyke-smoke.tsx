@@ -6,14 +6,19 @@
 // 3. POST to /pkg/com.example.iyke/echo — expect body echoed back.
 // 4. Subscribe to `pkg://custom-thing`, POST to .../event — expect listener fires.
 // 5. Uninstall and POST again — expect 404.
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, notFound } from '@tanstack/react-router';
 import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
 import { iykeEndpoint, pkgInstallFromPath, pkgKernelStatus, pkgUninstall } from '@/lib/tauri-cmd';
 
-export const Route = createFileRoute('/iyke-smoke')({
-	component: IykeSmoke,
+export const Route = createFileRoute('/dev/iyke-smoke')({
+	beforeLoad: () => {
+		if (!import.meta.env.DEV) {
+			throw notFound();
+		}
+	},
+	component: import.meta.env.DEV ? IykeSmoke : () => null,
 });
 
 const PKG_PATH = '/tmp/test-pkg-com.example.iyke';

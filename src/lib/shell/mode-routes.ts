@@ -27,6 +27,7 @@
 import type { CoreMode } from './shell-store';
 
 const EXCLUSIVE_MODE_PREFIXES: ReadonlyArray<readonly [string, CoreMode]> = [
+	['/project', 'project'],
 	['/packages', 'ngwa'],
 	['/claude', 'ngwa'],
 	['/ngwa', 'ngwa'],
