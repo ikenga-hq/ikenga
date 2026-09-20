@@ -395,6 +395,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 							<ContextMenuSeparator />
 						</>
 					)}
+					<ContextMenuItem onSelect={() => { /* Hand to Chi (stubbed until WP-06) */ }}>Hand to Chi</ContextMenuItem>
 					<ContextMenuItem onSelect={copyPath}>Copy Path</ContextMenuItem>
 					<ContextMenuItem onSelect={() => void writeClipboardText(entry.name).catch(() => {})}>
 						Copy Name
@@ -677,7 +678,36 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 	);
 }
 
-export function FilesMode() {
+export const filesFileContextMenu = [
+	{ id: 'open', label: 'Open', run: () => {} },
+	{ id: 'open-to-side', label: 'Open to the Side', run: () => {} },
+	{ id: 'open-below', label: 'Open Below', run: () => {} },
+	{ id: 'pin-sidebar', label: 'Pin to Sidebar…', run: () => {} },
+	{ id: 'open-in-studio', label: 'Open in Studio', run: () => {} },
+	{ id: 'open-terminal-here', label: 'Open Terminal Here', run: () => {} },
+	{ id: 'open-terminal-side', label: 'Open Terminal to the Side', run: () => {} },
+	{ id: 'open-terminal-below', label: 'Open Terminal Below', run: () => {} },
+	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
+	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
+	{ id: 'copy-name', label: 'Copy Name', run: () => {} },
+	{ id: 'rename', label: 'Rename…', run: () => {} },
+	{ id: 'delete', label: 'Delete', run: () => {} },
+];
+
+export const filesDirectoryContextMenu = [
+	{ id: 'open-terminal-here', label: 'Open Terminal Here', run: () => {} },
+	{ id: 'reveal-file-manager', label: 'Reveal in file manager', run: () => {} },
+	{ id: 'new-file', label: 'New file…', run: () => {} },
+	{ id: 'new-folder', label: 'New folder…', run: () => {} },
+	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
+	{ id: 'rename', label: 'Rename…', run: () => {} },
+	{ id: 'delete', label: 'Delete', run: () => {} },
+	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
+];
+
+export const filesContextMenu = filesFileContextMenu;
+
+export function FilesSection(_ctx: { projectId: string }) {
 	const fileRoots = useShellStore((s) => s.fileRoots);
 	const hydrated = useFilesStore((s) => s.hydrated);
 	const hydrate = useFilesStore((s) => s.hydrate);
@@ -819,9 +849,14 @@ export function FilesMode() {
 			</div>
 			<div ref={scrollerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
 				{fileRoots.length === 0 && (
-					<div className="p-4 text-xs text-muted-foreground">
-						No file roots configured. Add one from{' '}
-						<span className="font-medium text-foreground">Settings</span>.
+					<div className="p-4 text-center">
+					  <h3 className="text-sm font-semibold">No project open</h3>
+					  <p className="text-xs text-muted-foreground mt-1 mb-3">
+					    Files, artifacts and sessions are all scoped to a project. Open one and every section fills.
+					  </p>
+					  <button className="text-xs bg-primary text-primary-foreground px-3 py-1.5 rounded">
+					    Open a folder…
+					  </button>
 					</div>
 				)}
 				{fileRoots.map((root, i) => (
