@@ -116,6 +116,96 @@ jobs:
         working-directory: shell
         run: bun run test
 
+  # Browser-mode frame harness (WP-19, DEC-27): Playwright drives the React
+  # frame in headless Chromium over a `vite build` + `vite preview` of this
+  # branch, with the Tauri host mocked at the IPC seam
+  # (e2e/fixtures/tauri-mock.ts). Separate job so a red e2e never hides a red
+  # typecheck and vice versa. Same workspace synthesis as `verify` — the frame
+  # imports @ikenga/contract and @ikenga/tokens.
+  e2e:
+    name: Frame e2e (browser mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+        with:
+          path: shell
+
+      - name: Checkout @ikenga/contract
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-contract
+          path: contract
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Checkout @ikenga/tokens
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-tokens
+          path: tokens
+          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Synthesize workspace
+        shell: bash
+        run: |
+          cat > pnpm-workspace.yaml <<'EOF'
+          packages:
+            - shell
+            - contract
+            - tokens
+          EOF
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Set up Node (for pnpm)
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: pnpm install (workspace root)
+        shell: bash
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build workspace siblings (contract, tokens)
+        shell: bash
+        run: |
+          for pkg in '@ikenga/contract' '@ikenga/tokens'; do
+            echo "==> pnpm -F $pkg build"
+            pnpm -F "$pkg" build
+          done
+
+      # Browser binaries are not an npm dependency; fetch the Chromium build
+      # that matches the installed @playwright/test, plus its apt deps.
+      - name: Install Playwright Chromium
+        shell: bash
+        working-directory: shell
+        run: bunx playwright install --with-deps chromium
+
+      - name: Frame e2e
+        shell: bash
+        working-directory: shell
+        run: bun run test:e2e
+
+      - name: Upload e2e traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frame-e2e-results
+          path: shell/node_modules/.cache/e2e-results
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Rust side of the gate. A separate job so it runs in parallel with the TS
   # one and reports its own pass/fail rather than hiding behind it.
   #

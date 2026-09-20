@@ -3,7 +3,14 @@ import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useTerminalStore } from '@/terminal/session-store';
 
-export function MissionControl() {
+export interface MissionControlProps {
+	/** Mounted inside the Chi Companion (ADR-021 / spec §5.4): hide the
+	 *  dispatcher (target select + prompt input + Dispatch) — the Companion's
+	 *  dispatch bar is its one input — and the sample model / cost figures. */
+	embedded?: boolean;
+}
+
+export function MissionControl({ embedded = false }: MissionControlProps = {}) {
 	const tabs = useTerminalStore((s) => s.tabs);
 	const setActive = useTerminalStore((s) => s.setActive);
 	const [globalPrompt, setGlobalPrompt] = useState('');
@@ -35,37 +42,39 @@ export function MissionControl() {
 					<span>Mission Control ({tabs.length} sessions active)</span>
 				</div>
 
-				<div className="flex items-center gap-2">
-					<select
-						value={targetSession}
-						onChange={(e) => setTargetSession(e.target.value)}
-						className="h-7 rounded bg-zinc-900 border border-zinc-700 px-2 text-[11px] text-zinc-200 focus:outline-none"
-					>
-						<option value="all">All Sessions</option>
-						{tabs.map((t) => (
-							<option key={t.id} value={t.id}>
-								{t.title} ({t.id.slice(0, 6)})
-							</option>
-						))}
-					</select>
+				{!embedded && (
+					<div className="flex items-center gap-2">
+						<select
+							value={targetSession}
+							onChange={(e) => setTargetSession(e.target.value)}
+							className="h-7 rounded bg-zinc-900 border border-zinc-700 px-2 text-[11px] text-zinc-200 focus:outline-none"
+						>
+							<option value="all">All Sessions</option>
+							{tabs.map((t) => (
+								<option key={t.id} value={t.id}>
+									{t.title} ({t.id.slice(0, 6)})
+								</option>
+							))}
+						</select>
 
-					<input
-						type="text"
-						placeholder="Dispatch prompt across sessions..."
-						value={globalPrompt}
-						onChange={(e) => setGlobalPrompt(e.target.value)}
-						onKeyDown={(e) => e.key === 'Enter' && handleDispatch()}
-						className="h-7 w-64 rounded bg-zinc-900 border border-zinc-700 px-2.5 text-[11px] text-zinc-200 focus:outline-none"
-					/>
+						<input
+							type="text"
+							placeholder="Dispatch prompt across sessions..."
+							value={globalPrompt}
+							onChange={(e) => setGlobalPrompt(e.target.value)}
+							onKeyDown={(e) => e.key === 'Enter' && handleDispatch()}
+							className="h-7 w-64 rounded bg-zinc-900 border border-zinc-700 px-2.5 text-[11px] text-zinc-200 focus:outline-none"
+						/>
 
-					<Button
-						size="sm"
-						onClick={handleDispatch}
-						className="h-7 px-3 bg-purple-600 hover:bg-purple-500 text-white text-[11px]"
-					>
-						<Send className="mr-1 h-3 w-3" /> Dispatch
-					</Button>
-				</div>
+						<Button
+							size="sm"
+							onClick={handleDispatch}
+							className="h-7 px-3 bg-purple-600 hover:bg-purple-500 text-white text-[11px]"
+						>
+							<Send className="mr-1 h-3 w-3" /> Dispatch
+						</Button>
+					</div>
+				)}
 			</div>
 
 			{/* Session Grid */}
@@ -95,10 +104,12 @@ export function MissionControl() {
 							</div>
 
 							<div className="mt-2 space-y-1 text-[10px] text-zinc-400">
-								<div className="flex items-center gap-1">
-									<Cpu className="h-3 w-3 text-purple-400" />
-									<span>Claude 3.5 Sonnet</span>
-								</div>
+								{!embedded && (
+									<div className="flex items-center gap-1">
+										<Cpu className="h-3 w-3 text-purple-400" />
+										<span>Claude 3.5 Sonnet</span>
+									</div>
+								)}
 
 								<div className="flex items-center gap-1 truncate" title={t.spec.cwd}>
 									<span className="text-zinc-500">CWD:</span>
@@ -108,10 +119,12 @@ export function MissionControl() {
 						</div>
 
 						<div className="mt-3 flex items-center justify-between border-t border-zinc-800/60 pt-2 text-[10px]">
-							<div className="flex items-center gap-1 text-emerald-400 font-semibold">
-								<DollarSign className="h-3 w-3" />
-								<span>$0.024</span>
-							</div>
+							{!embedded && (
+								<div className="flex items-center gap-1 text-emerald-400 font-semibold">
+									<DollarSign className="h-3 w-3" />
+									<span>$0.024</span>
+								</div>
+							)}
 
 							<div className="flex items-center gap-1 text-purple-400 group-hover:underline">
 								<span>Focus Tab</span>

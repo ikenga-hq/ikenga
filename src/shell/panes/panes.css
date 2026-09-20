@@ -1,0 +1,46 @@
+/*
+ * Pane chrome — WP-07 (spec §4, §6A.1–6A.3).
+ *
+ * There is no other pane stylesheet; everything else in `panes/**` styles
+ * itself with Tailwind utilities. This file holds the handful of rules that
+ * Tailwind utilities can't express cleanly:
+ *   - the `.leaf.micro` container-query clamp (real element width, not a
+ *     breakpoint)
+ *   - a belt-and-suspenders reduced-motion override for the pane-tools
+ *     opacity reveal (the call sites already carry Tailwind's
+ *     `motion-reduce:transition-none`; this is the same rule expressed as
+ *     plain CSS so a reduced-motion test can assert on computed style
+ *     without depending on Tailwind's variant plumbing)
+ *
+ * Tokens only — no literal colors here (shell-design-system rule). This file
+ * carries no color at all; geometry only.
+ */
+
+/* Each split leaf gets its own inline-size container so `.leaf.micro` can
+ * respond to the leaf's *actual* pixel width, not a viewport breakpoint —
+ * two leaves can be on opposite sides of 260px in the same window. */
+.pane-leaf-container {
+	container-type: inline-size;
+	container-name: pane-leaf;
+}
+
+@container pane-leaf (max-width: 260px) {
+	/* Merged single-tab row: hide the address path text, keep the
+	 * accessible label (aria-label carries the tab title) and the tools. */
+	.leaf .pane-address-text {
+		display: none;
+	}
+
+	/* Tabbed row: clamp tab width so 2+ tabs still fit a micro pane instead
+	 * of overflowing the strip. */
+	.leaf [role='tab'] {
+		min-width: 0 !important;
+		max-width: 64px !important;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.pane-tools {
+		transition: none !important;
+	}
+}

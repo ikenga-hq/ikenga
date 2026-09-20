@@ -20,9 +20,10 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneView } from '@/lib/panes/types';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import {
-	ACTIVITY_MODES,
-	type ActivityMode,
-	isPkgMode,
+	type CoreMode,
+	isCoreMode,
+	isPreV16ModeName,
+	normalizeMode,
 	useShellStore,
 } from '@/lib/shell/shell-store';
 import { createTerminalSession } from '@/terminal/single-terminal';
@@ -49,6 +50,24 @@ interface ClosePayload {
 }
 interface RefreshPayload {
 	pane_id?: string | null;
+}
+
+/**
+ * The `/iyke/mode` allow-list (G-STATE, g-state.md §5). The four v16 modes
+ * (`ACTIVITY_MODES`) pass as-is. For one release, pre-v16 names (`app`,
+ * `files`, `sessions`, `artifact-grid`, `pkgs`, `pkg:<id>`) are normalized
+ * onto a v16 mode with a warning so old CLIs / skills keep working. Anything
+ * else is rejected (logged, returns null) — never thrown.
+ */
+export function resolveIykeMode(mode: unknown): CoreMode | null {
+	if (isCoreMode(mode)) return mode;
+	if (isPreV16ModeName(mode)) {
+		const next = normalizeMode(mode);
+		console.warn(`[iyke] iyke:mode '${mode}' is a legacy mode name — using '${next}'.`);
+		return next;
+	}
+	console.warn('[iyke] iyke:mode ignored — unknown mode:', mode);
+	return null;
 }
 
 /**
@@ -81,8 +100,8 @@ export function useIykeControlListener(): void {
 				}
 				usePaneStore.getState().navigateFocused(path);
 				// Keep the activity-bar mode coherent with where we just
-				// navigated. Only routes that *exclusively* belong to a system
-				// mode (Packages / Ngwa / Settings) flip it; shared routes
+				// navigated. Only routes that *exclusively* belong to a mode
+				// (Ngwa / Settings / Chi) flip it; shared routes
 				// (/sessions, /artifacts, …) return null and leave it untouched.
 				const mode = modeForRoute(path);
 				if (mode) useShellStore.getState().setActiveMode(mode);
@@ -91,18 +110,8 @@ export function useIykeControlListener(): void {
 
 		track(
 			listen<ModePayload>('iyke:mode', (e) => {
-				const mode = e.payload?.mode;
-				// CORE modes are allow-listed; dynamic `pkg:<id>` modes (one per
-				// installed app pkg) pass by prefix. A stale pkg mode reconciles
-				// to 'app' in the activity bar, so we needn't check the live set.
-				const valid =
-					typeof mode === 'string' &&
-					(ACTIVITY_MODES.includes(mode as ActivityMode) || isPkgMode(mode));
-				if (!valid) {
-					console.warn('[iyke] iyke:mode ignored — unknown mode:', mode);
-					return;
-				}
-				useShellStore.getState().setActiveMode(mode as ActivityMode);
+				const mode = resolveIykeMode(e.payload?.mode);
+				if (mode) useShellStore.getState().setActiveMode(mode);
 			})
 		);
 

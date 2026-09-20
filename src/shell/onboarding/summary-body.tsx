@@ -50,15 +50,15 @@ export function SummaryBody({ onFinish, goTo }: SummaryBodyProps) {
 	const steps = useShellStore((s) => s.onboarding.steps);
 	const startedAt = useShellStore((s) => s.onboarding.startedAt);
 	const userName = useShellStore((s) => s.userName);
-	const fileRoots = useShellStore((s) => s.fileRoots);
-	const claudeProjectRoots = useShellStore((s) => s.claudeProjectRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const extraRoots = activeProject?.extra_roots ?? [];
 	const theme = useIkengaStore((s) => s.theme);
 	const mode = useIkengaStore((s) => s.mode);
 	const density = useIkengaStore((s) => s.density);
 
 	const cards: CardModel[] = useMemo(
-		() => buildCards(steps, { fileRoots, claudeProjectRoots, theme, mode, density }),
-		[steps, fileRoots, claudeProjectRoots, theme, mode, density]
+		() => buildCards(steps, { extraRoots, theme, mode, density }),
+		[steps, extraRoots, theme, mode, density]
 	);
 
 	const blocker = findBlockingState(steps);
@@ -229,8 +229,7 @@ const STEP_LABEL: Record<OnboardingStepId, string> = {
 };
 
 interface ContextSnapshot {
-	fileRoots: string[];
-	claudeProjectRoots: string[];
+	extraRoots: string[];
 	theme: string;
 	mode: string;
 	density: string;
@@ -286,14 +285,13 @@ function renderCard(
 		}
 		case 'roots': {
 			const p = rec.payload as RootsStepPayload | undefined;
-			const fileCount = p?.fileRoots.length ?? ctx.fileRoots.length;
-			const projCount = p?.claudeProjectRoots.length ?? ctx.claudeProjectRoots.length;
-			const fileSample =
-				(p?.fileRoots ?? ctx.fileRoots).slice(0, 3).join('\n') || '(no file roots)';
+			const rootCount = p?.extraRoots?.length ?? ctx.extraRoots.length;
+			const rootSample =
+				(p?.extraRoots ?? ctx.extraRoots).slice(0, 3).join('\n') || '(no project roots)';
 			return {
 				...base,
-				value: `${fileCount} file · ${projCount} project root${projCount === 1 ? '' : 's'}`,
-				detail: fileSample,
+				value: `${rootCount} project root${rootCount === 1 ? '' : 's'}`,
+				detail: rootSample,
 			};
 		}
 		case 'packages': {

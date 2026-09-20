@@ -36,11 +36,11 @@ use super::claude::{
 };
 use super::comments::{get_pin_read, post_pin_acknowledge, post_pin_resolve};
 use super::handlers::{
-    get_chi_list, get_chi_status, get_dom, get_iframe_state, get_logs, get_network, get_pkg_list,
-    get_query_cache, get_state, get_terminal_read, post_chi_cancel, post_chi_resume, post_chi_run,
-    post_click, post_close, post_devtools, post_focus, post_go, post_iframe_message, post_key,
-    post_mode, post_oba_install_local, post_open, post_pkg_badge_set, post_pkg_dev_register,
-    post_pkg_dev_reload, post_pkg_dev_unregister, post_pkg_health_remove,
+    get_chi_list, get_chi_status, get_dom, get_iframe_state, get_keys, get_logs, get_network,
+    get_pkg_list, get_query_cache, get_state, get_terminal_read, post_chi_cancel, post_chi_resume,
+    post_chi_run, post_click, post_close, post_devtools, post_focus, post_go, post_iframe_message,
+    post_key, post_mode, post_oba_install_local, post_open, post_pkg_badge_set,
+    post_pkg_dev_register, post_pkg_dev_reload, post_pkg_dev_unregister, post_pkg_health_remove,
     post_pkg_health_remove_all, post_pkg_health_scan, post_pkg_install, post_pkg_scope_set,
     post_pkg_uninstall, post_refresh, post_resize, post_screenshot_pane, post_screenshot_window,
     post_sidebar, post_split, post_terminal_send, post_type, post_wait,
@@ -111,6 +111,8 @@ pub async fn serve(
     // which uses a per-request oneshot_token instead of the global bearer.
     let authed = Router::new()
         .route("/iyke/state", get(get_state))
+        // WP-21: keymap registry as last pushed by the FE (503 before push).
+        .route("/iyke/keys", get(get_keys))
         .route("/iyke/go", post(post_go))
         .route("/iyke/mode", post(post_mode))
         .route("/iyke/sidebar", post(post_sidebar))

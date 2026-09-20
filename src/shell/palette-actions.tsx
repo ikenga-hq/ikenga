@@ -21,17 +21,23 @@ import { Command } from 'cmdk';
 import {
 	CheckSquare,
 	FileText,
+	Keyboard,
 	type LucideIcon,
 	Mail,
+	Monitor,
+	Moon,
 	Search,
 	Send,
 	Sparkles,
+	Sun,
 	Target,
 	TrendingUp,
 	Users,
 } from 'lucide-react';
 import { CommandRow } from '@/components/ui/command-row';
 import { dispatchAction, isDispatchable } from '@/components/pkg/actions/action-runner';
+import { type IkengaMode, useIkengaStore } from '@/lib/ikenga/theme-store';
+import { labelFor } from '@/lib/keymap/registry';
 import { queryKeys } from '@/lib/query-keys';
 import { listAllSkillActions, type SkillAction } from '@/lib/tauri-cmd';
 
@@ -159,6 +165,65 @@ export function ActionsGroup({ onClose }: { onClose: () => void }) {
 					/>
 				);
 			})}
+		</Command.Group>
+	);
+}
+
+// ─── WP-09 — the palette "Manage" group (mode `all`) ─────────────────────────
+//
+// Frame-level commands that used to live as rail buttons. The theme toggle is
+// re-homed here from the rail (WP-03 / PR #215 removes `ThemeToggleButton`);
+// the cycle and labels are the rail's, unchanged: light → dark → system.
+
+export const THEME_CYCLE: Record<IkengaMode, IkengaMode> = {
+	light: 'dark',
+	dark: 'system',
+	system: 'light',
+};
+
+const THEME_ICON: Record<IkengaMode, LucideIcon> = {
+	light: Sun,
+	dark: Moon,
+	system: Monitor,
+};
+
+export const THEME_LABEL: Record<IkengaMode, string> = {
+	light: 'Light',
+	dark: 'Dark',
+	system: 'System',
+};
+
+/** `onShowShortcuts` switches the open palette to its Shortcuts view. It is
+ *  injected so this module never imports `command-palette.tsx` (which
+ *  imports this one). */
+export function ManageGroup({ onShowShortcuts }: { onShowShortcuts: () => void }) {
+	const mode = useIkengaStore((s) => s.mode);
+	const setMode = useIkengaStore((s) => s.setMode);
+	const next = THEME_CYCLE[mode];
+	const Icon = THEME_ICON[next];
+
+	return (
+		<Command.Group heading="Manage" className="text-xs text-muted-foreground">
+			<CommandRow
+				size="md"
+				value={`toggle theme appearance light dark system ${THEME_LABEL[next]}`}
+				Icon={Icon}
+				label={`Toggle theme: ${THEME_LABEL[mode]} → ${THEME_LABEL[next]}`}
+				onSelect={() => {
+					// The palette stays open: the theme flips live behind it and a
+					// second Enter keeps cycling, like repeated clicks on the old
+					// rail button.
+					setMode(next);
+				}}
+			/>
+			<CommandRow
+				size="md"
+				value="keyboard shortcuts keys bindings help"
+				Icon={Keyboard}
+				label="Keyboard shortcuts"
+				shortcut={labelFor('shortcuts.open')}
+				onSelect={onShowShortcuts}
+			/>
 		</Command.Group>
 	);
 }

@@ -25,7 +25,9 @@ use tauri::{AppHandle, Emitter, LogicalSize, Manager};
 use super::rpc;
 use super::state::{IykeState, LogEntry, NetworkEntry};
 use super::IykeRpc;
-use crate::commands::chi::{chi_cancel, chi_list, chi_resume, chi_run, chi_status, ChiCache, ChiRunOpts, ChiRuntime};
+use crate::commands::chi::{
+    chi_cancel, chi_list, chi_resume, chi_run, chi_status, ChiCache, ChiRunOpts, ChiRuntime,
+};
 use crate::commands::db::PaDb;
 use crate::pty::PtyManager;
 
@@ -123,7 +125,7 @@ pub struct AppInfo {
     pub identifier: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShellInfo {
     pub mode: Option<String>,
     pub route: Option<String>,
@@ -136,6 +138,137 @@ pub struct ShellInfo {
     /// FE has pushed once. Present so `/iyke/sidebar` is observable and not
     /// just actuate-only.
     pub sidebar_collapsed: Option<bool>,
+    /// WP-21: the shell store's derived `activeProject` (G-STATE §2), pushed
+    /// by `use-iyke-shell-sync.ts` through `iyke_set_frame`. `null` until the
+    /// FE has pushed once. Additive — `schema_version` stays 1.
+    #[serde(default)]
+    pub active_project: Option<ActiveProjectInfo>,
+    /// WP-21: bridge API level of this shell ([`BRIDGE_API`]). Set by Rust,
+    /// never pushed by the FE, so a CLI can tell a too-old shell from a
+    /// too-new CLI. Absent (deserializes as `0`) on shells that predate it.
+    #[serde(default)]
+    pub bridge_api: u32,
+}
+
+/// Bridge API level served in `ShellInfo.bridge_api`. Bump when a route or
+/// field a CLI depends on is added, so `iyke` can say "this shell needs a
+/// newer iyke" / "this iyke needs a newer shell" instead of failing on an
+/// unknown route.
+///
+/// - `1` (implicit — the field was absent): everything before WP-21.
+/// - `2`: `shell.active_project`, `shell.bridge_api`, `GET /iyke/keys`.
+pub const BRIDGE_API: u32 = 2;
+
+/// WP-21: mirror of the FE `ActiveProject` (`src/lib/shell/shell-store.ts`).
+/// Field names are the FE's own snake_case, so the push needs no mapping.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveProjectInfo {
+    pub id: String,
+    /// `null` for the path-less `default` project row.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    #[serde(default)]
+    pub extra_roots: Vec<String>,
+}
+
+/// WP-21: one keymap registry row as served by `GET /iyke/keys` — the
+/// registry's `{command, key, when, source}` plus its human `label` and the
+/// FE-resolved `key_label` (`⌘K` on macOS, `Ctrl+K` elsewhere).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeymapEntryInfo {
+    pub command: String,
+    pub key: String,
+    pub when: String,
+    pub source: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub key_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_only: Option<String>,
+}
+
+/// WP-21: FE-pushed frame state that `IykeState`'s `ShellSnapshot` doesn't
+/// carry — the active project and the keymap registry. Held here rather than
+/// on `IykeState` so the push is one new command, not a widening of
+/// `iyke_set_shell`. Partial-update semantics like `set_shell`: a `None`
+/// field leaves the stored value untouched.
+#[derive(Debug, Default)]
+pub struct FrameMirror {
+    active_project: tokio::sync::RwLock<Option<ActiveProjectInfo>>,
+    keymap: tokio::sync::RwLock<Option<Vec<KeymapEntryInfo>>>,
+}
+
+impl FrameMirror {
+    pub async fn set(
+        &self,
+        active_project: Option<ActiveProjectInfo>,
+        keymap: Option<Vec<KeymapEntryInfo>>,
+    ) {
+        if active_project.is_some() {
+            *self.active_project.write().await = active_project;
+        }
+        if keymap.is_some() {
+            *self.keymap.write().await = keymap;
+        }
+    }
+
+    pub async fn active_project(&self) -> Option<ActiveProjectInfo> {
+        self.active_project.read().await.clone()
+    }
+
+    pub async fn keymap(&self) -> Option<Vec<KeymapEntryInfo>> {
+        self.keymap.read().await.clone()
+    }
+}
+
+/// Process-wide mirror shared by the `iyke_set_frame` command and the HTTP
+/// handlers (one shell process, one bridge).
+pub fn frame_mirror() -> &'static FrameMirror {
+    static MIRROR: std::sync::OnceLock<FrameMirror> = std::sync::OnceLock::new();
+    MIRROR.get_or_init(FrameMirror::default)
+}
+
+/// WP-21: FE → Rust push of the frame state `iyke_set_shell` doesn't carry.
+/// `use-iyke-shell-sync.ts` sends `activeProject` whenever the store's
+/// derived `activeProject` changes, and `keymap` once at boot.
+#[tauri::command]
+pub async fn iyke_set_frame(
+    active_project: Option<ActiveProjectInfo>,
+    keymap: Option<Vec<KeymapEntryInfo>>,
+) -> Result<(), String> {
+    frame_mirror().set(active_project, keymap).await;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeysResponse {
+    pub schema_version: u32,
+    pub count: usize,
+    pub entries: Vec<KeymapEntryInfo>,
+}
+
+/// `GET /iyke/keys` body, split out so tests can drive a fresh mirror.
+async fn keys_response(mirror: &FrameMirror) -> Result<Json<KeysResponse>, (StatusCode, String)> {
+    match mirror.keymap().await {
+        Some(entries) => Ok(Json(KeysResponse {
+            schema_version: 1,
+            count: entries.len(),
+            entries,
+        })),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "keymap not pushed yet: the shell frontend publishes its keymap registry at boot \
+             (use-iyke-shell-sync); retry once the workspace has mounted"
+                .to_string(),
+        )),
+    }
+}
+
+/// `GET /iyke/keys` — the last keymap registry the FE pushed. 503 until the
+/// first push.
+pub async fn get_keys() -> Result<Json<KeysResponse>, (StatusCode, String)> {
+    keys_response(frame_mirror()).await
 }
 
 pub async fn get_state(
@@ -144,6 +277,7 @@ pub async fn get_state(
     Extension(pty_manager): Extension<Arc<PtyManager>>,
 ) -> Json<StateResponse> {
     let shell = state.snapshot().await;
+    let active_project = frame_mirror().active_project().await;
     let registry = app.state::<crate::window::registry::WindowRegistry>();
     let mut windows = vec![super::terminal::IykeWindowInfo::from_descriptor(
         crate::window::descriptor::WindowDescriptor {
@@ -176,6 +310,8 @@ pub async fn get_state(
             route: shell.route,
             panes: shell.panes,
             sidebar_collapsed: shell.sidebar_collapsed,
+            active_project,
+            bridge_api: BRIDGE_API,
         },
         terminals,
         windows,
@@ -1912,23 +2048,179 @@ fn emit(app: &AppHandle, event: &str, payload: Value) -> Result<(), (StatusCode,
 }
 
 /// Modes recognized by the in-app `useShellStore`. Kept in sync with
-/// `src/lib/shell/shell-store.ts` (`ActivityMode`). Server-side check is
-/// a sanity gate; the FE listener is the source of truth.
+/// `ACTIVITY_MODES` in `src/lib/shell/shell-store.ts` (G-STATE v16:
+/// `project | chi | ngwa | settings`). Server-side check is a sanity gate;
+/// the FE listener (`resolveIykeMode` in `control-listener.ts`) is the
+/// source of truth.
 ///
-/// CORE modes mirror the `CoreMode` union. Dynamic `pkg:<id>` modes (one per
-/// installed app pkg) are accepted by prefix — the FE reconciles a stale pkg
-/// mode to 'app' if the pkg isn't installed, so the bridge needn't know the
-/// live pkg set.
+/// For one release the pre-v16 names (`app`, `files`, `sessions`,
+/// `artifact-grid`, `pkgs`, `pkg:<id>`) are still accepted here — the FE maps
+/// them onto a v16 mode via `normalizeMode` (with a warning), so old CLIs and
+/// skills keep working. Drop them once that release window closes.
 fn is_valid_mode(m: &str) -> bool {
     matches!(
         m,
-        "app" | "files" | "sessions" | "artifact-grid" | "ngwa" | "pkgs" | "settings"
+        // v16 modes (ACTIVITY_MODES)
+        "project" | "chi" | "ngwa" | "settings"
+        // legacy, normalized FE-side by normalizeMode
+        | "app" | "files" | "sessions" | "artifact-grid" | "pkgs"
     ) || m.starts_with("pkg:")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_key_bytes;
+    use super::{is_valid_mode, terminal_key_bytes};
+
+    #[test]
+    fn is_valid_mode_accepts_v16_and_legacy_names_rejects_garbage() {
+        for m in ["project", "chi", "ngwa", "settings"] {
+            assert!(is_valid_mode(m), "v16 mode {m:?} should be accepted");
+        }
+        for m in ["app", "files", "sessions", "artifact-grid", "pkgs", "pkg:x"] {
+            assert!(is_valid_mode(m), "legacy mode {m:?} should be accepted");
+        }
+        for m in ["", "PROJECT", "mail"] {
+            assert!(!is_valid_mode(m), "garbage mode {m:?} should be rejected");
+        }
+    }
+
+    fn sample_project() -> super::ActiveProjectInfo {
+        super::ActiveProjectInfo {
+            id: "p1".into(),
+            root_path: Some("/work/p1".into()),
+            extra_roots: vec!["/work/shared".into()],
+        }
+    }
+
+    fn sample_keys() -> Vec<super::KeymapEntryInfo> {
+        vec![
+            super::KeymapEntryInfo {
+                command: "palette.open".into(),
+                key: "mod+k".into(),
+                when: "global".into(),
+                source: "default".into(),
+                label: "Command palette".into(),
+                key_label: "Ctrl+K".into(),
+                platform_only: None,
+            },
+            super::KeymapEntryInfo {
+                command: "terminal.clear".into(),
+                key: "mod+k".into(),
+                when: "terminal-focus".into(),
+                source: "default".into(),
+                label: "Clear terminal".into(),
+                key_label: "⌘K".into(),
+                platform_only: Some("mac".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn shell_info_serializes_active_project_and_bridge_api() {
+        let info = super::ShellInfo {
+            mode: Some("project".into()),
+            route: Some("/".into()),
+            panes: None,
+            sidebar_collapsed: Some(false),
+            active_project: Some(sample_project()),
+            bridge_api: super::BRIDGE_API,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["bridge_api"], serde_json::json!(2));
+        assert_eq!(
+            v["active_project"],
+            serde_json::json!({
+                "id": "p1",
+                "root_path": "/work/p1",
+                "extra_roots": ["/work/shared"],
+            })
+        );
+        // Pre-existing fields keep their names and shapes.
+        assert_eq!(v["mode"], serde_json::json!("project"));
+        assert_eq!(v["sidebar_collapsed"], serde_json::json!(false));
+        assert!(v.get("panes").is_some() && v["panes"].is_null());
+
+        // Before the first push, active_project is present-and-null.
+        let empty = super::ShellInfo {
+            mode: None,
+            route: None,
+            panes: None,
+            sidebar_collapsed: None,
+            active_project: None,
+            bridge_api: super::BRIDGE_API,
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert!(v.get("active_project").is_some() && v["active_project"].is_null());
+        assert_eq!(v["bridge_api"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn shell_info_old_shape_still_deserializes() {
+        // Exactly what a pre-WP-21 shell served under `shell`.
+        let old = serde_json::json!({
+            "mode": "files",
+            "route": "/files",
+            "panes": { "leaves": [], "tree": null },
+            "sidebar_collapsed": true,
+        });
+        let info: super::ShellInfo = serde_json::from_value(old).unwrap();
+        assert_eq!(info.mode.as_deref(), Some("files"));
+        assert_eq!(info.sidebar_collapsed, Some(true));
+        assert_eq!(info.active_project, None);
+        assert_eq!(
+            info.bridge_api, 0,
+            "absent bridge_api reads as 0 (pre-versioning shell)"
+        );
+
+        // A path-less default project (root_path null, no extra_roots key).
+        let partial = serde_json::json!({
+            "mode": null, "route": null, "panes": null, "sidebar_collapsed": null,
+            "active_project": { "id": "default", "root_path": null },
+            "bridge_api": 2,
+        });
+        let info: super::ShellInfo = serde_json::from_value(partial).unwrap();
+        let p = info.active_project.unwrap();
+        assert_eq!(p.id, "default");
+        assert_eq!(p.root_path, None);
+        assert!(p.extra_roots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_mirror_partial_updates_keep_untouched_fields() {
+        let m = super::FrameMirror::default();
+        assert_eq!(m.active_project().await, None);
+        m.set(Some(sample_project()), None).await;
+        m.set(None, Some(sample_keys())).await;
+        assert_eq!(m.active_project().await, Some(sample_project()));
+        assert_eq!(m.keymap().await.unwrap().len(), 2);
+        // A None push leaves both in place.
+        m.set(None, None).await;
+        assert_eq!(m.active_project().await, Some(sample_project()));
+        assert_eq!(m.keymap().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn keys_handler_is_503_before_push_and_serves_the_pushed_list_after() {
+        let m = super::FrameMirror::default();
+        let err = super::keys_response(&m).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.1.contains("keymap not pushed yet"),
+            "clear message: {}",
+            err.1
+        );
+
+        m.set(None, Some(sample_keys())).await;
+        let axum::Json(body) = super::keys_response(&m).await.unwrap();
+        assert_eq!(body.schema_version, 1);
+        assert_eq!(body.count, 2);
+        assert_eq!(body.entries, sample_keys());
+
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["entries"][0]["key_label"], serde_json::json!("Ctrl+K"));
+        assert!(v["entries"][0].get("platform_only").is_none());
+        assert_eq!(v["entries"][1]["platform_only"], serde_json::json!("mac"));
+    }
 
     #[test]
     fn terminal_key_translation_matches_frontend_sequences() {

@@ -2,10 +2,6 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { scopedPersistName } from '@/lib/window/window-context';
 import {
-	fsRootsAdd,
-	fsRootsList,
-	fsRootsRemove,
-	fsRootsReset,
 	type Project,
 	projectGetActive,
 	projectList,
@@ -24,7 +20,6 @@ import {
 
 const KV_DEFAULT_ENGINE = 'agent.defaultEngineId';
 const KV_LEGACY_CHAT_ADAPTER = 'agent.chatAdapterId';
-const KV_CLAUDE_ROOTS = 'claude.projectRoots';
 const KV_CLAUDE_WATCH = 'claude.watchEnabled';
 const KV_ONBOARDING = 'onboarding.state';
 const KV_USER_NAME = 'user.name';
@@ -53,69 +48,205 @@ function parseKv<T>(raw: string | undefined): T | undefined {
 	}
 }
 
-// Post-strip: only 4 first-class workspaces. Mail / Outbox / Studio /
-// Agents were app-pkg surfaces and got removed with the strip-down.
-// Mini-apps are gone too — they were placeholders for media tooling
-// that lives in app pkgs now.
-export type CoreMode =
-	| 'app'
-	| 'files'
-	| 'sessions'
-	| 'artifact-grid'
-	| 'ngwa'
-	| 'pkgs'
-	| 'settings';
-
-// Dynamic per-pkg modes. Every app pkg with a `manifest.ui.nav[0]` entry owns
-// its own activity-bar mode `pkg:<pkg_id>` — clicking its rail icon makes that
-// the active mode and the sidebar renders the pkg's published menu (PkgMode),
-// instead of borrowing 'app' mode and clobbering the shell's main nav. Pkg ids
-// are dotted (e.g. `com.ikenga.tasks`); they never collide with the CORE modes.
-export type PkgActivityMode = `pkg:${string}`;
-export type ActivityMode = CoreMode | PkgActivityMode;
-
-/** True for a dynamic `pkg:<id>` mode. Type-predicate so callers narrow to
- *  `CoreMode` in the `else` branch (e.g. the sidebar's mode switch). */
-export function isPkgMode(m: string): m is PkgActivityMode {
-	return m.startsWith('pkg:');
-}
-
-/** Extract the pkg id from a `pkg:<id>` mode, or null for CORE modes. */
-export function pkgIdFromMode(m: string): string | null {
-	return isPkgMode(m) ? m.slice('pkg:'.length) : null;
-}
+// ─── Modes (G-STATE, persist v16) ──────────────────────────────────────────
+//
+// Phase 1 of the shell UX rearchitecture narrows the activity rail to four
+// first-class modes: Project (the workbench — files, artifacts, sessions and
+// package views all live under it), Chi (agents), Ngwa (Claude config +
+// packages) and Settings. Package views no longer own a mode of their own.
+// Contract: plans/shell-ux-rearchitecture/drafts/g-state.md §1.
+export type CoreMode = 'project' | 'chi' | 'ngwa' | 'settings';
+export type ActivityMode = CoreMode;
 
 // Runtime list of every valid activity mode — the single source of truth that
 // must stay in lockstep with the `CoreMode` union above. Consumed by the store
-// migration (snap stale modes → 'app') and by the iyke control listener to
-// validate `/iyke/mode`. Keeping it here (rather than re-declaring per call
-// site) is what stops the listener's allow-list from drifting behind the union.
-export const ACTIVITY_MODES: readonly ActivityMode[] = Object.freeze([
+// migration, `normalizeMode` and the iyke control listener's `/iyke/mode`
+// allow-list, so none of them can drift behind the union.
+export const ACTIVITY_MODES: readonly CoreMode[] = Object.freeze([
+	'project',
+	'chi',
+	'ngwa',
+	'settings',
+]);
+
+export const DEFAULT_MODE: CoreMode = 'project';
+
+/** True for one of the four v16 modes. */
+export function isCoreMode(m: unknown): m is CoreMode {
+	return typeof m === 'string' && (ACTIVITY_MODES as readonly string[]).includes(m);
+}
+
+/** Mode names the pre-v16 rail wrote (v10–v15 core modes and v14 dynamic
+ *  `pkg:<id>` modes). Only the `/iyke/mode` bridge still accepts them, for
+ *  one release, normalized through `normalizeMode` (g-state.md §5). */
+const PRE_V16_MODE_NAMES: readonly string[] = Object.freeze([
 	'app',
 	'files',
 	'sessions',
 	'artifact-grid',
-	'ngwa',
 	'pkgs',
-	'settings',
 ]);
 
-// Default file roots. Kept in sync with `src-tauri/src/fs_roots.rs::DEFAULT_ROOTS`;
-// the Rust side is authoritative — these are only the seed values used by the
-// onboarding wizard's "reset to defaults" affordance and the test harness.
-// At runtime, `fileRoots` is hydrated from Rust on app boot (see
-// `hydrateFileRootsFromRust`).
-//
-// Empty by design: a fresh install has no allowlist until the user adds a
-// root via the onboarding wizard or Settings → Storage.
-export const DEFAULT_FILE_ROOTS: readonly string[] = Object.freeze([]);
+/** True for a pre-v16 mode name that `normalizeMode` maps onto a CoreMode. */
+export function isPreV16ModeName(m: unknown): m is string {
+	return typeof m === 'string' && (PRE_V16_MODE_NAMES.includes(m) || m.startsWith('pkg:'));
+}
 
-// Project roots scanned by the /claude config browser. Each root is a dir
-// that contains a `.claude/` subfolder (agents/skills/commands/settings).
-// Personal `~/.claude/` is always scanned in addition to these — it doesn't
-// need to be listed. Empty by default; the user adds roots via onboarding
-// step "roots" or Settings.
-export const DEFAULT_CLAUDE_PROJECT_ROOTS: readonly string[] = Object.freeze([]);
+/**
+ * The v15 → v16 mode mapping (g-state.md §4). Total: any input, including
+ * garbage, yields a CoreMode.
+ *   app · files · sessions · artifact-grid · pkg:<id> → project
+ *   pkgs · ngwa → ngwa
+ *   settings → settings; project · chi unchanged
+ *   missing, non-string, anything else → project
+ */
+export function normalizeMode(m: unknown): CoreMode {
+	if (isCoreMode(m)) return m;
+	if (m === 'pkgs') return 'ngwa';
+	return DEFAULT_MODE;
+}
+
+// ─── Active project (derived) ─────────────────────────────────────────────
+export interface ActiveProject {
+	/** === activeProjectId (Rust-owned, never persisted). */
+	id: string;
+	/** From `projects[]`; null for the path-less `default` row. */
+	root_path: string | null;
+	/** dedupe([...projectExtraRoots[id] ?? [], ...carriedRoots]), order kept. */
+	extra_roots: string[];
+}
+
+/** Trim, drop empty / non-string entries, dedupe on the exact trimmed string
+ *  keeping first occurrence. Non-array input yields `[]`. */
+export function dedupeRoots(input: unknown): string[] {
+	if (!Array.isArray(input)) return [];
+	const out: string[] = [];
+	for (const raw of input) {
+		if (typeof raw !== 'string') continue;
+		const trimmed = raw.trim();
+		if (!trimmed || out.includes(trimmed)) continue;
+		out.push(trimmed);
+	}
+	return out;
+}
+
+function computeActiveProject(
+	id: string,
+	projects: readonly Project[],
+	projectExtraRoots: Record<string, string[]>,
+	carriedRoots: readonly string[],
+	prev?: ActiveProject
+): ActiveProject {
+	const root_path = projects.find((p) => p.id === id)?.root_path ?? null;
+	const extra_roots = dedupeRoots([...(projectExtraRoots[id] ?? []), ...carriedRoots]);
+	// Keep the previous reference when nothing changed, so selectors on
+	// `activeProject` don't re-render on unrelated project-list refreshes.
+	if (
+		prev &&
+		prev.id === id &&
+		prev.root_path === root_path &&
+		prev.extra_roots.length === extra_roots.length &&
+		prev.extra_roots.every((r, i) => r === extra_roots[i])
+	) {
+		return prev;
+	}
+	return { id, root_path, extra_roots };
+}
+
+// ─── Explorer sections ────────────────────────────────────────────────────
+export type BuiltinExplorerSectionId =
+	| 'files'
+	| 'artifacts'
+	| 'sessions'
+	| 'ngwa-project'
+	| 'automations'
+	| 'todos'
+	| 'scratchpads'
+	| 'views';
+
+export interface ExplorerSectionState {
+	/** BuiltinExplorerSectionId, or `${pkg_id}:${section_id}` from Phase 4. */
+	id: string;
+	/** 'shell' or the contributing pkg id. */
+	source: 'shell' | string;
+	/** Integer, ascending; built-ins 0..7 by default. */
+	order: number;
+	collapsed: boolean;
+}
+
+const DEFAULT_EXPLORER_LAYOUT: ReadonlyArray<readonly [BuiltinExplorerSectionId, boolean]> = [
+	['files', false],
+	['artifacts', false],
+	['sessions', false],
+	['ngwa-project', true],
+	['automations', false],
+	['todos', true],
+	['scratchpads', true],
+	['views', true],
+];
+
+/** Spec §6.1 defaults: Files · Artifacts · Sessions · Automations open; the
+ *  rest collapsed. Fresh objects on every call. */
+export function createDefaultExplorerSections(): ExplorerSectionState[] {
+	return DEFAULT_EXPLORER_LAYOUT.map(([id, collapsed], order) => ({
+		id,
+		source: 'shell',
+		order,
+		collapsed,
+	}));
+}
+
+// ─── Companion ────────────────────────────────────────────────────────────
+export type CompanionTarget =
+	| { kind: 'session'; session_id: string }
+	| { kind: 'new'; engine_id: string | null }
+	| { kind: 'persistent'; engine_id: string | null };
+
+// ─── v15 backup / rollback (g-state.md §4) ────────────────────────────────
+const SHELL_STORE_BASE_KEY = 'shell-store';
+export const V15_BACKUP_SUFFIX = '.__v15_backup';
+
+function safeLocalStorage(): Storage | null {
+	try {
+		return typeof localStorage === 'undefined' ? null : localStorage;
+	} catch {
+		return null;
+	}
+}
+
+/** Write the incoming pre-v16 payload as the exact Zustand
+ *  envelope `JSON.stringify({ state, version })`. Skipped when the key already
+ *  exists. Never throws — a failed backup must not block the migration. */
+function writeV15Backup(persisted: unknown, version: number): void {
+	try {
+		const storage = safeLocalStorage();
+		if (!storage) return;
+		const key = `${scopedPersistName(SHELL_STORE_BASE_KEY)}${V15_BACKUP_SUFFIX}`;
+		if (storage.getItem(key) !== null) return;
+		// Serialising here, before migrate mutates anything, *is* the deep
+		// clone: the string is a snapshot of the incoming payload.
+		storage.setItem(key, JSON.stringify({ state: persisted, version }));
+	} catch (err) {
+		console.warn('[shell-store] v15 backup failed; migrating anyway:', err);
+	}
+}
+
+/**
+ * Rollback helper: put the `__v15_backup` blob back under the live key and
+ * remove the backup. Run it (DevTools or `iyke eval`) on the v16 build, then
+ * quit and launch the v15 build — it reads its own byte-identical blob.
+ * Returns false (and changes nothing) when no backup exists.
+ */
+export function restoreV15Backup(
+	storage: Storage = localStorage,
+	key: string = scopedPersistName(SHELL_STORE_BASE_KEY)
+): boolean {
+	const backup = storage.getItem(`${key}${V15_BACKUP_SUFFIX}`);
+	if (backup === null) return false;
+	storage.setItem(key, backup);
+	storage.removeItem(`${key}${V15_BACKUP_SUFFIX}`);
+	return true;
+}
 
 // ─── Onboarding wizard state (Phase 3 scaffold) ──────────────────────────
 //
@@ -208,8 +339,32 @@ export function createDefaultOnboardingState(): OnboardingState {
 }
 
 interface ShellState {
-	activeMode: ActivityMode;
-	setActiveMode: (m: ActivityMode) => void;
+	/** Always one of ACTIVITY_MODES — legacy names are normalized on the way in. */
+	activeMode: CoreMode;
+	setActiveMode: (m: CoreMode) => void;
+
+	// ─── Active project + roots (G-STATE) ────────────────────────────────
+	/** Derived, kept in sync by the store; a stable reference, so it is safe
+	 *  as a selector result. Never persisted. */
+	activeProject: ActiveProject;
+	/** Persisted; extra roots per project id. */
+	projectExtraRoots: Record<string, string[]>;
+	/** Persisted; v15 fileRoots ∪ claudeProjectRoots, written once by migrate. */
+	carriedRoots: string[];
+	/** Trims, dedupes, recomputes `activeProject`. */
+	setProjectExtraRoots: (projectId: string, roots: string[]) => void;
+
+	// ─── Explorer sections (G-STATE) ─────────────────────────────────────
+	/** Persisted per profile, kept sorted by `order`. */
+	explorerSections: ExplorerSectionState[];
+	setExplorerSectionCollapsed: (id: string, collapsed: boolean) => void;
+	/** Swap with the neighbour above (-1) or below (+1); orders renumbered 0..n-1. */
+	moveExplorerSection: (id: string, delta: -1 | 1) => void;
+
+	// ─── Companion (G-STATE) ─────────────────────────────────────────────
+	/** Not persisted — session ids are dead after a restart. */
+	companion: { activeTarget: CompanionTarget };
+	setCompanionTarget: (t: CompanionTarget) => void;
 
 	// ─── Sidebar visibility ──────────────────────────────────────────────
 	// Lives here rather than as local state in `workspace.tsx` because two
@@ -254,24 +409,6 @@ interface ShellState {
 	updatesAutoInstallPkgs: boolean;
 	setUpdatesAutoInstallPkgs: (v: boolean) => void;
 
-	fileRoots: string[];
-	addFileRoot: (path: string) => void;
-	removeFileRoot: (path: string) => void;
-	/** Replace `oldPath` with `newPath` (no-op if oldPath isn't present, or if
-	 * the new path is empty / a duplicate of an existing entry). Used by the
-	 * editable settings selectors. */
-	updateFileRoot: (oldPath: string, newPath: string) => void;
-	resetFileRoots: () => void;
-	/** Pull the authoritative list from Rust (`fs_roots_list`) and overwrite
-	 * local state. Called at app boot; safe to call multiple times. Rejects
-	 * silently in non-Tauri test environments. */
-	hydrateFileRootsFromRust: () => Promise<void>;
-
-	claudeProjectRoots: string[];
-	addClaudeProjectRoot: (path: string) => void;
-	removeClaudeProjectRoot: (path: string) => void;
-	updateClaudeProjectRoot: (oldPath: string, newPath: string) => void;
-	resetClaudeProjectRoots: () => void;
 	claudeWatchEnabled: boolean;
 	setClaudeWatchEnabled: (enabled: boolean) => void;
 
@@ -326,6 +463,14 @@ interface ShellState {
 	refreshProjects: () => Promise<void>;
 }
 
+/** Store keys kept out of the persisted blob (g-state.md §3). */
+const NOT_PERSISTED: ReadonlySet<string> = new Set([
+	'projects',
+	'activeProjectId',
+	'activeProject',
+	'companion',
+]);
+
 function clampActiveIndex(idx: number): number {
 	if (Number.isNaN(idx) || idx < 0) return 0;
 	if (idx > ONBOARDING_STEPS.length - 1) return ONBOARDING_STEPS.length - 1;
@@ -336,7 +481,7 @@ function clampActiveIndex(idx: number): number {
 // the migrate fn through a clean public API, so we hoist the logic into
 // a named helper and reference it from both the `persist({ migrate })`
 // option and the tests.
-export function migrateShellStore(persisted: unknown, _version: number): unknown {
+export function migrateShellStore(persisted: unknown, version: number): unknown {
 	const p = (persisted ?? {}) as Partial<ShellState> & {
 		activeMode?: string;
 		agent_onboarded?: boolean;
@@ -344,24 +489,14 @@ export function migrateShellStore(persisted: unknown, _version: number): unknown
 		onboarding?: Partial<OnboardingState>;
 	};
 
-	// v7 carry-over: snap stale activeMode → 'app'. v10 widens valid set to
-	// include 'pkgs' (registry browser activity-bar entry). v11 widens
-	// again with 'artifact-grid' (projects-and-artifact-wizard plan §B2).
-	// v13 widens with 'ngwa' (Ngwa Claude-config mode — replaces App-mode
-	// /claude NavItem; activity-bar ⌘6). The valid set now lives in the
-	// exported ACTIVITY_MODES const above so it can't drift from the union.
-	// v14: dynamic `pkg:<id>` modes are also valid — each app pkg owns its own
-	// activity-bar mode. We can't validate the id against installed pkgs here
-	// (the kernel snapshot loads async, after rehydrate), so we preserve any
-	// `pkg:` mode; a stale one (pkg since-uninstalled) is reconciled → 'app'
-	// at runtime by the activity bar once entries load.
-	if (
-		p.activeMode &&
-		!ACTIVITY_MODES.includes(p.activeMode as ActivityMode) &&
-		!isPkgMode(p.activeMode)
-	) {
-		p.activeMode = 'app';
-	}
+	// v7 carry-over, repointed at v16: every stored activeMode — whatever
+	// version it was written by — goes through the one total mapping in
+	// `normalizeMode` (g-state.md §4). Dead pre-v7 modes, the v10–v15 rail
+	// modes and v14 `pkg:<id>` modes all land on a v16 CoreMode; missing or
+	// non-string values become 'project'.
+	(p as { activeMode?: unknown }).activeMode = normalizeMode(
+		(p as { activeMode?: unknown }).activeMode
+	);
 
 	// v8: build OnboardingState from defaults + legacy keys if present.
 	if (!p.onboarding) {
@@ -431,14 +566,120 @@ export function migrateShellStore(persisted: unknown, _version: number): unknown
 		delete ((p.onboarding as unknown as { steps?: Record<string, unknown> }).steps ?? {}).telemetry;
 	}
 
+	// v16 (G-STATE): v15 roots were global and the active project is unknown
+	// at migrate time (`projects` loads async after rehydrate), so the union
+	// of fileRoots + claudeProjectRoots is carried globally and surfaces in
+	// `activeProject.extra_roots` whichever project is active. The legacy
+	// fields themselves are left untouched (WP-05 retires them).
+	if (version < 16) {
+		const rec = p as unknown as Record<string, unknown>;
+		const legacyFileRoots = Array.isArray(rec.fileRoots) ? rec.fileRoots : [];
+		const legacyClaudeRoots = Array.isArray(rec.claudeProjectRoots) ? rec.claudeProjectRoots : [];
+		rec.carriedRoots = dedupeRoots([...legacyFileRoots, ...legacyClaudeRoots]);
+		rec.projectExtraRoots = {};
+		if (!Array.isArray(rec.explorerSections)) {
+			rec.explorerSections = createDefaultExplorerSections();
+		}
+		// Derived / session-scoped — never read from a blob.
+		delete rec.activeProject;
+		delete rec.companion;
+	}
+
 	return p;
+}
+
+/**
+ * Persist `merge`: overlay the (migrated) blob on the initial state, then
+ * re-derive what is never persisted. Also runs on a fresh profile (with
+ * `persisted === undefined`), where it yields exactly the §2 defaults.
+ */
+function mergeShellState(persisted: unknown, current: ShellState): ShellState {
+	const blob =
+		persisted && typeof persisted === 'object'
+			? { ...(persisted as Record<string, unknown>) }
+			: ({} as Record<string, unknown>);
+	// Rust-owned, derived or session-scoped: the in-memory value wins.
+	delete blob.projects;
+	delete blob.activeProjectId;
+	delete blob.activeProject;
+	delete blob.companion;
+	const next = { ...current, ...blob } as ShellState;
+	next.activeMode = normalizeMode(next.activeMode);
+	next.carriedRoots = dedupeRoots(next.carriedRoots);
+	if (
+		!next.projectExtraRoots ||
+		typeof next.projectExtraRoots !== 'object' ||
+		Array.isArray(next.projectExtraRoots)
+	) {
+		next.projectExtraRoots = {};
+	}
+	if (!Array.isArray(next.explorerSections)) {
+		next.explorerSections = createDefaultExplorerSections();
+	}
+	next.activeProject = computeActiveProject(
+		next.activeProjectId,
+		next.projects,
+		next.projectExtraRoots,
+		next.carriedRoots,
+		current.activeProject
+	);
+	return next;
 }
 
 export const useShellStore = create<ShellState>()(
 	persist(
 		(set, get) => ({
-			activeMode: 'app',
-			setActiveMode: (activeMode) => set({ activeMode }),
+			activeMode: DEFAULT_MODE,
+			// Typed CoreMode-only since WP-03. Still routed through the total
+			// `normalizeMode` so an untyped caller (a bridge payload cast to
+			// CoreMode) can never store anything but one of the four modes.
+			setActiveMode: (m) => set({ activeMode: normalizeMode(m) }),
+
+			// Before `refreshProjects` resolves this is the seed `default` row
+			// with no root; `merge` re-derives it on rehydrate.
+			activeProject: { id: 'default', root_path: null, extra_roots: [] },
+			projectExtraRoots: {},
+			carriedRoots: [],
+			setProjectExtraRoots: (projectId, roots) => {
+				const s = get();
+				const projectExtraRoots = { ...s.projectExtraRoots, [projectId]: dedupeRoots(roots) };
+				set({
+					projectExtraRoots,
+					activeProject: computeActiveProject(
+						s.activeProjectId,
+						s.projects,
+						projectExtraRoots,
+						s.carriedRoots,
+						s.activeProject
+					),
+				});
+			},
+
+			explorerSections: createDefaultExplorerSections(),
+			setExplorerSectionCollapsed: (id, collapsed) =>
+				set((s) => ({
+					explorerSections: s.explorerSections.map((sec) =>
+						sec.id === id && sec.collapsed !== collapsed ? { ...sec, collapsed } : sec
+					),
+				})),
+			moveExplorerSection: (id, delta) =>
+				set((s) => {
+					const sorted = [...s.explorerSections].sort((a, b) => a.order - b.order);
+					const idx = sorted.findIndex((sec) => sec.id === id);
+					const target = idx + delta;
+					if (idx < 0 || target < 0 || target >= sorted.length) return s;
+					const moved = sorted[idx]!;
+					sorted[idx] = sorted[target]!;
+					sorted[target] = moved;
+					return {
+						explorerSections: sorted.map((sec, order) =>
+							sec.order === order ? sec : { ...sec, order }
+						),
+					};
+				}),
+
+			companion: { activeTarget: { kind: 'new', engine_id: null } },
+			setCompanionTarget: (activeTarget) => set({ companion: { activeTarget } }),
 
 			sidebarCollapsed: false,
 			setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
@@ -473,93 +714,6 @@ export const useShellStore = create<ShellState>()(
 				kvSet(KV_UPDATES_AUTO_INSTALL_PKGS, updatesAutoInstallPkgs);
 			},
 
-			fileRoots: [...DEFAULT_FILE_ROOTS],
-			// All four mutators update local state optimistically for instant UI
-			// feedback, then sync the authoritative list back from Rust. The
-			// invoke promise is swallowed in non-Tauri test environments so the
-			// existing unit tests (which never see a Tauri runtime) still pass.
-			addFileRoot: (path) => {
-				const trimmed = path.trim();
-				if (!trimmed) return;
-				if (!get().fileRoots.includes(trimmed)) {
-					set({ fileRoots: [...get().fileRoots, trimmed] });
-				}
-				fsRootsAdd(trimmed)
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			removeFileRoot: (path) => {
-				set({ fileRoots: get().fileRoots.filter((r) => r !== path) });
-				fsRootsRemove(path)
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			updateFileRoot: (oldPath, newPath) => {
-				const trimmed = newPath.trim();
-				if (!trimmed || trimmed === oldPath) return;
-				const cur = get().fileRoots;
-				const idx = cur.indexOf(oldPath);
-				if (idx < 0) return;
-				// Don't allow renaming on top of another existing entry.
-				if (cur.includes(trimmed)) return;
-				const next = [...cur];
-				next[idx] = trimmed;
-				set({ fileRoots: next });
-				// Rust has no atomic "rename" — sequence remove+add. If the
-				// remove succeeds but add fails (e.g. invalid path), the user
-				// sees a shorter list, matching the local state we already set.
-				fsRootsRemove(oldPath)
-					.then(() => fsRootsAdd(trimmed))
-					.then((latest) => set({ fileRoots: latest }))
-					.catch(() => {});
-			},
-			resetFileRoots: () => {
-				set({ fileRoots: [...DEFAULT_FILE_ROOTS] });
-				fsRootsReset()
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			hydrateFileRootsFromRust: async () => {
-				try {
-					const next = await fsRootsList();
-					set({ fileRoots: next });
-				} catch {
-					// Test environment or pre-setup boot — keep the persisted
-					// snapshot. Caller can retry.
-				}
-			},
-
-			claudeProjectRoots: [...DEFAULT_CLAUDE_PROJECT_ROOTS],
-			addClaudeProjectRoot: (path) => {
-				const trimmed = path.trim();
-				if (!trimmed) return;
-				if (get().claudeProjectRoots.includes(trimmed)) return;
-				const next = [...get().claudeProjectRoots, trimmed];
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			removeClaudeProjectRoot: (path) => {
-				const next = get().claudeProjectRoots.filter((r) => r !== path);
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			updateClaudeProjectRoot: (oldPath, newPath) => {
-				const trimmed = newPath.trim();
-				if (!trimmed || trimmed === oldPath) return;
-				const cur = get().claudeProjectRoots;
-				const idx = cur.indexOf(oldPath);
-				if (idx < 0) return;
-				if (cur.includes(trimmed)) return;
-				const next = [...cur];
-				next[idx] = trimmed;
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			resetClaudeProjectRoots: () => {
-				const next = [...DEFAULT_CLAUDE_PROJECT_ROOTS];
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
 			claudeWatchEnabled: true,
 			setClaudeWatchEnabled: (claudeWatchEnabled) => {
 				set({ claudeWatchEnabled });
@@ -710,7 +864,20 @@ export const useShellStore = create<ShellState>()(
 				// listener uses to invalidate project-scoped queries.
 				const prev = get().activeProjectId;
 				if (prev === id) return;
-				set({ activeProjectId: id });
+				const withActive = (activeProjectId: string) => {
+					const s = get();
+					return {
+						activeProjectId,
+						activeProject: computeActiveProject(
+							activeProjectId,
+							s.projects,
+							s.projectExtraRoots,
+							s.carriedRoots,
+							s.activeProject
+						),
+					};
+				};
+				set(withActive(id));
 				try {
 					await projectSetActive(id);
 				} catch (err) {
@@ -721,7 +888,7 @@ export const useShellStore = create<ShellState>()(
 					// Roll back the optimistic flip — but only if nobody
 					// flipped again in the meantime.
 					if (get().activeProjectId === id) {
-						set({ activeProjectId: prev });
+						set(withActive(prev));
 					}
 					throw err;
 				}
@@ -729,7 +896,18 @@ export const useShellStore = create<ShellState>()(
 			refreshProjects: async () => {
 				try {
 					const [list, active] = await Promise.all([projectList(true), projectGetActive()]);
-					set({ projects: list, activeProjectId: active.id });
+					const s = get();
+					set({
+						projects: list,
+						activeProjectId: active.id,
+						activeProject: computeActiveProject(
+							active.id,
+							list,
+							s.projectExtraRoots,
+							s.carriedRoots,
+							s.activeProject
+						),
+					});
 				} catch (err) {
 					// Tauri unavailable (test env / pre-setup boot) — but a real
 					// failure here leaves the store on the seed `default` project
@@ -754,7 +932,6 @@ export const useShellStore = create<ShellState>()(
 					suppressKv = true;
 					try {
 						kvSet(KV_DEFAULT_ENGINE, s.defaultEngineId);
-						kvSet(KV_CLAUDE_ROOTS, s.claudeProjectRoots);
 						kvSet(KV_CLAUDE_WATCH, s.claudeWatchEnabled);
 						kvSet(KV_ONBOARDING, s.onboarding);
 						kvSet(KV_UPDATES_AUTO_CHECK, s.updatesAutoCheck);
@@ -775,8 +952,6 @@ export const useShellStore = create<ShellState>()(
 					if (adapter === null || typeof adapter === 'string') {
 						next.defaultEngineId = adapter;
 					}
-					const roots = parseKv<string[]>(all[KV_CLAUDE_ROOTS]);
-					if (Array.isArray(roots)) next.claudeProjectRoots = roots;
 					const watch = parseKv<boolean>(all[KV_CLAUDE_WATCH]);
 					if (typeof watch === 'boolean') next.claudeWatchEnabled = watch;
 					const ob = parseKv<OnboardingState>(all[KV_ONBOARDING]);
@@ -828,15 +1003,26 @@ export const useShellStore = create<ShellState>()(
 		//     in the activity bar. Additive — no persisted user holds a pkg mode.
 		// v15: removed telemetry consent and the telemetry onboarding step.
 		//     Migrate drops any persisted `telemetryConsent` and `onboarding.steps.telemetry`.
+		// v16: G-STATE (plans/shell-ux-rearchitecture/drafts/g-state.md). CoreMode
+		//     narrowed to project|chi|ngwa|settings via `normalizeMode`; v15
+		//     fileRoots ∪ claudeProjectRoots carried as `carriedRoots`; new
+		//     `projectExtraRoots` + `explorerSections`. The incoming pre-v16
+		//     payload is kept under `<key>.__v15_backup` for one release
+		//     (`restoreV15Backup` is the rollback path).
 		{
 			// Window-namespaced (plans/multi-window WP-05): the primary `main`
 			// window keeps the bare `shell-store` key (existing persisted state
 			// preserved); a detached window gets a `::<label>` suffix so its
 			// `activeMode`/onboarding writes don't clobber the primary's via the
 			// localStorage that all same-origin Tauri windows share (research 03).
-			name: scopedPersistName('shell-store'),
-			version: 15,
-			migrate: (persisted, version) => migrateShellStore(persisted, version) as ShellState,
+			name: scopedPersistName(SHELL_STORE_BASE_KEY),
+			version: 16,
+			migrate: (persisted, version) => {
+				// Backup first, before any v16 mutation of the payload.
+				if (version < 16) writeV15Backup(persisted, version);
+				return migrateShellStore(persisted, version) as ShellState;
+			},
+			merge: (persisted, current) => mergeShellState(persisted, current),
 			// `projects` + `activeProjectId` are owned by Rust (migration 0015)
 			// and re-pulled every boot via `refreshProjects`. They must NOT be
 			// persisted here — a stale localStorage snapshot (e.g. a path-less
@@ -844,9 +1030,11 @@ export const useShellStore = create<ShellState>()(
 			// authoritative Rust copy and make `activeProjectCwd()` fall back to
 			// `~`, so new terminals spawn in $HOME instead of the active
 			// project root. Keep them out of the persisted blob.
+			// v16: `activeProject` is derived (rebuilt on rehydrate) and
+			// `companion` is session-scoped (its session ids die with the app).
 			partialize: (state) =>
 				Object.fromEntries(
-					Object.entries(state).filter(([k]) => k !== 'projects' && k !== 'activeProjectId')
+					Object.entries(state).filter(([k]) => !NOT_PERSISTED.has(k))
 				) as Partial<ShellState>,
 		}
 	)

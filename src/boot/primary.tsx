@@ -14,6 +14,7 @@ import { createRoot } from 'react-dom/client';
 import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { queryClient } from '@/lib/query-client';
 import { initDefaultCwd } from '@/lib/shell/default-cwd';
+import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
@@ -52,11 +53,6 @@ export function bootPrimary(): void {
 	// Install native menu best-effort (Mac-only; silently no-ops elsewhere).
 	void installNativeMenu();
 
-	// Pull the authoritative FS allowlist from Rust so the Files panel reflects
-	// what the Rust resolver will actually permit. Fire-and-forget; failures
-	// (test env, pre-setup boot) leave the persisted snapshot in place.
-	void useShellStore.getState().hydrateFileRootsFromRust();
-
 	// Resolve $HOME once so `defaultCwd()` (used by terminal/session
 	// fallbacks) can return it synchronously. Fire-and-forget — failure leaves
 	// the helper falling back to '~'.
@@ -67,6 +63,12 @@ export function bootPrimary(): void {
 	// successes overwrite Zustand state with the Tauri-side authoritative copy.
 	void useShellStore.getState().hydrateSettingsFromRust();
 	void useIkengaStore.getState().hydrateAppearanceFromRust();
+
+	// WP-22: one-shot reconciler that seeds activity_pins from the kernel's
+	// activity-bar registry so pkg rail icons a user already has survive the
+	// move to a pinned rail. Fire-and-forget; internally guarded by a KV flag
+	// and never throws into boot.
+	void seedPinsFromRail();
 
 	// Pull the durable projects list + active project id (migration 0015,
 	// Phase 0). The Rust side owns the truth; this just seeds the in-memory

@@ -2248,6 +2248,42 @@ export async function iykeSetShell(args: {
 	});
 }
 
+/** WP-21: mirrors `ActiveProjectInfo` in `src-tauri/src/iyke/handlers.rs`
+ *  (same snake_case keys as the store's `ActiveProject`). */
+export interface IykeActiveProject {
+	id: string;
+	root_path: string | null;
+	extra_roots: string[];
+}
+
+/** WP-21: one `GET /iyke/keys` row — mirrors `KeymapEntryInfo` in
+ *  `src-tauri/src/iyke/handlers.rs`. */
+export interface IykeKeymapEntry {
+	command: string;
+	key: string;
+	when: string;
+	source: string;
+	label: string;
+	/** Platform-resolved key hint (`⌘K` on macOS, `Ctrl+K` elsewhere). */
+	key_label: string;
+	platform_only?: 'mac' | 'other';
+}
+
+/**
+ * WP-21: push frame state `iyke_set_shell` doesn't carry into the Rust
+ * mirror behind `GET /iyke/state` (`shell.active_project`) and
+ * `GET /iyke/keys`. Omitted fields leave the stored value untouched.
+ */
+export async function iykeSetFrame(args: {
+	activeProject?: IykeActiveProject | null;
+	keymap?: IykeKeymapEntry[] | null;
+}): Promise<void> {
+	return invoke('iyke_set_frame', {
+		activeProject: args.activeProject ?? null,
+		keymap: args.keymap ?? null,
+	});
+}
+
 // ─── Screenshots ──────────────────────────────────────────────────────────────
 
 export interface ScreenshotResult {
@@ -4139,12 +4175,17 @@ export interface ChiRunOpts extends Record<string, unknown> {
 	timeoutSeconds?: number;
 	parentId?: string;
 	resumeSessionId?: string;
+	/** Launch via the tmux multiplexer so the session survives an app
+	 *  restart (falls back to in-process). Rust `ChiRunOpts.persistent`. */
+	persistent?: boolean;
 }
 
 /** Start a new Chi run. The engine child is spawned in WP-02; WP-01 mints
- *  a run id and persists a cache row. */
+ *  a run id and persists a cache row. The Rust command takes a single
+ *  `opts: ChiRunOpts` argument, and Tauri 2 reads arguments by name — so the
+ *  fields travel nested under `opts`, never flat. */
 export async function chiRun(opts: ChiRunOpts): Promise<ChiRunResult> {
-	return invoke<ChiRunResult>('chi_run', opts);
+	return invoke<ChiRunResult>('chi_run', { opts });
 }
 
 /** Resume an existing Chi run by its Ikenga run_id. */

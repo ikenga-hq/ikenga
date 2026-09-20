@@ -507,7 +507,7 @@ describe('registerPathLinks — directory linking & tree reveal (WP-07 / T-02 / 
 		});
 	});
 
-	it('clicking a directory link switches active mode to files and reveals directory', async () => {
+	it('clicking a directory link switches active mode to project and reveals directory', async () => {
 		const term = fakeTerm('open src/terminal to inspect');
 		registerPathLinks(term as never, '/repo');
 		const links = await term.getLinks();
@@ -515,7 +515,7 @@ describe('registerPathLinks — directory linking & tree reveal (WP-07 / T-02 / 
 		expect(links[0].text).toBe('src/terminal');
 
 		links[0].activate();
-		expect(mockSetActiveMode).toHaveBeenCalledWith('files');
+		expect(mockSetActiveMode).toHaveBeenCalledWith('project');
 		expect(mockRevealPath).toHaveBeenCalledWith('/repo/src/terminal');
 	});
 

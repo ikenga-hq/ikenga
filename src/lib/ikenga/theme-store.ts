@@ -41,18 +41,40 @@ export type IkengaDensity = 'compact' | 'comfortable' | 'spacious';
 /** How aggressive the workspace tint reads on chrome. */
 export type IkengaTintStrength = 'off' | 'subtle' | 'strong';
 
-/** First-class workspaces post-strip. Old tints (mail/outbox/studio/
- *  agents) stay as dormant CSS variables in the design tokens for any
- *  pkg that wants to opt into them, but the type union doesn't carry
- *  them anymore. */
-export type IkengaWorkspace =
+/** The workspace written to `<html data-workspace>` — one per rail noun
+ *  (WP-03, g-state.md §1): Project · Chi · Ngwa · Settings. This store is
+ *  the only writer of that attribute (`installIkengaDomSync` below). */
+export type IkengaWorkspace = 'project' | 'chi' | 'ngwa' | 'settings';
+
+/** Dormant tint names. The pre-v16 rail wrote these to `data-workspace`;
+ *  nothing does any more, but their `--tint-<name>-*` variables stay in the
+ *  design tokens for any pkg (or per-tab chrome, `tab-workspace.ts`) that
+ *  opts into one. Never a valid `setWorkspace` argument. */
+export type IkengaLegacyTint =
 	| 'app'
 	| 'files'
 	| 'sessions'
 	| 'artifact-grid'
-	| 'ngwa'
 	| 'pkgs'
-	| 'settings';
+	| 'mail'
+	| 'outbox'
+	| 'studio'
+	| 'agents';
+
+/** Any tint name the chrome may colour with: a rail workspace or a dormant
+ *  legacy tint. */
+export type IkengaTint = IkengaWorkspace | IkengaLegacyTint;
+
+export const IKENGA_WORKSPACES: readonly IkengaWorkspace[] = Object.freeze([
+	'project',
+	'chi',
+	'ngwa',
+	'settings',
+]);
+
+function isIkengaWorkspace(w: unknown): w is IkengaWorkspace {
+	return typeof w === 'string' && (IKENGA_WORKSPACES as readonly string[]).includes(w);
+}
 
 interface IkengaState {
 	theme: IkengaTheme;
@@ -102,7 +124,7 @@ export const useIkengaStore = create<IkengaState>()(
 			mode: 'dark',
 			density: 'comfortable',
 			tintStrength: 'subtle',
-			workspace: 'app',
+			workspace: 'project',
 			setTheme: (theme) => {
 				set({ theme });
 				kvSet(KV_THEME, theme);
@@ -172,7 +194,17 @@ export const useIkengaStore = create<IkengaState>()(
 			// detached window converges on the primary's theme once that resolves.
 			name: scopedPersistName('ikenga.theme'),
 			storage: createJSONStorage(() => localStorage),
-			version: 1,
+			// v2 (WP-03): `workspace` narrows to the four rail nouns. A v1 blob's
+			// pre-v16 name (`app`, `files`, `pkgs`, …) must not reach
+			// `data-workspace` for the frame before the rail's first sync.
+			version: 2,
+			migrate: (persisted) => {
+				const p = (persisted ?? {}) as Partial<IkengaState>;
+				if (!isIkengaWorkspace(p.workspace)) {
+					p.workspace = (p.workspace as unknown) === 'pkgs' ? 'ngwa' : 'project';
+				}
+				return p as IkengaState;
+			},
 		}
 	)
 );

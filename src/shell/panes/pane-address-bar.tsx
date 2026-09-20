@@ -8,26 +8,49 @@
 // history entry. `bumpKey()` re-mounts the leaf so refresh resets viewer
 // state. Invalid input rings the input red briefly without navigating.
 
-import { ArrowLeft, ArrowRight, Pin as PinGlyph, RefreshCw } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Pin as PinGlyph, Plus, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
+import {
+	ContextMenu,
+	ContextMenuContent,
+	ContextMenuItem,
+	ContextMenuSeparator,
+	ContextMenuTrigger,
+} from '@/components/ui/context-menu';
 import { formatPaneAddressForDisplay, parsePaneAddress } from '@/lib/panes/pane-address';
 import { resolveArtifactAddress } from '@/lib/panes/pane-address-resolver';
-import type { PaneId, PaneView } from '@/lib/panes/types';
+import type { LeafNode, PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneHistory } from '@/lib/panes/use-pane-history';
+import { usePaneStore } from '@/lib/panes/pane-store';
+import { useDragState } from '@/lib/panes/drag-state';
+import { beginPointerDrag } from '@/lib/panes/pointer-drag';
+import { writeClipboardText } from '@/lib/transport';
 import { usePathToManifestId, usePinsStore } from '@/lib/shell/pins-store';
 import { PinArtifactDialog } from './pin-artifact-dialog';
+import { PaneTools } from './pane-toolbar';
+import { viewLabel } from './pane-views';
+import { NewTabMenu, useAnchorRect } from './new-tab-menu';
 
 interface PaneAddressBarProps {
 	paneId: PaneId;
 	view: PaneView;
+	/** §6A.3 merged row only: the leaf this address bar stands in for — its
+	 *  one tab's title becomes the row's `aria-label` (a browser-style URL
+	 *  bar has no room to also show the tab title as visible text), and its
+	 *  "+ New tab" affordance rides along in the same row since the tab
+	 *  strip that normally carries it doesn't render for a single tab. */
+	leaf?: LeafNode;
+	/** §6A.3 merged row only: appends the reveal-gated `⟳ + ⋯` tools cluster
+	 *  to this same row instead of a separate tab-strip row rendering them. */
+	mergedTools?: boolean;
 }
 
 const INVALID_FLASH_MS = 600;
 
-export function PaneAddressBar({ paneId, view }: PaneAddressBarProps) {
+export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressBarProps) {
 	const { canGoBack, canGoForward, back, forward, replace, bumpKey } = usePaneHistory(paneId, view);
 
 	// Display rule (Phase 3): pinned artifacts show their canonical
@@ -90,49 +113,136 @@ export function PaneAddressBar({ paneId, view }: PaneAddressBarProps) {
 	);
 	const [pinDialogOpen, setPinDialogOpen] = useState(false);
 
+	// §6A.3: in the merged row the tab title becomes this row's accessible
+	// label (a browser-style address bar has no visible room for it), and
+	// the address text itself is what a `.leaf.micro` container query hides
+	// first, leaving the icon-less row to just its aria-label + tools.
+	const rowLabel = leaf ? viewLabel(leaf.tabs[0]) : undefined;
+
+	const focusPane = usePaneStore((s) => s.focusPane);
+	const closeTab = usePaneStore((s) => s.closeTab);
+	const toggleTabPinned = usePaneStore((s) => s.toggleTabPinned);
+	const [newTabOpen, setNewTabOpen] = useState(false);
+	const addBtnRef = useRef<HTMLButtonElement | null>(null);
+	const newTabAnchor = useAnchorRect(newTabOpen, addBtnRef);
+
+	// §6A.3 deviation fix: a merged single-tab row has no tab strip, so its
+	// one tab has no other way to reach the tab-level actions (Close, Pin
+	// tab, Copy path) or to become a drag source for a cross-pane move. The
+	// address text itself stands in for the tab here — same context menu
+	// items the 2+-tab strip offers on a `Tab`, minus the reorder/"move to
+	// new pane" items that only make sense with a sibling tab to move past.
+	const soleTab = leaf?.tabs[0];
+	const isSoleTabPinned = Boolean(soleTab?.pinned);
+
 	return (
-		<div className="flex shrink-0 items-center gap-0.5 border-b border-border bg-background px-1.5 py-1">
-			<IconButton onClick={() => back()} disabled={!canGoBack} title="Back" aria-label="Back">
-				<ArrowLeft className="h-3.5 w-3.5" />
-			</IconButton>
-			<IconButton
-				onClick={() => forward()}
-				disabled={!canGoForward}
-				title="Forward"
-				aria-label="Forward"
-			>
-				<ArrowRight className="h-3.5 w-3.5" />
-			</IconButton>
-			<IconButton onClick={() => bumpKey()} title="Refresh" aria-label="Refresh pane">
-				<RefreshCw className="h-3.5 w-3.5" />
-			</IconButton>
-			<Input
-				ref={inputRef}
-				type="text"
-				value={draft}
-				onChange={(e) => {
-					setDraft(e.target.value);
-					if (invalid) setInvalid(false);
-				}}
-				onKeyDown={(e) => {
-					if (e.key === 'Enter') {
-						e.preventDefault();
-						submit();
-					} else if (e.key === 'Escape') {
-						setDraft(address);
-						inputRef.current?.blur();
-					}
-				}}
-				spellCheck={false}
-				autoCorrect="off"
-				autoCapitalize="off"
-				aria-invalid={invalid || undefined}
-				aria-label="Address"
-				className={cn(
-					'ml-1 h-6 flex-1 rounded-sm px-2 py-0 font-mono text-xs',
-					invalid && 'border-destructive ring-2 ring-destructive/40'
+		<div
+			className="flex shrink-0 items-center gap-0.5 border-b border-border bg-background px-1.5 py-1"
+			role="toolbar"
+			aria-label={rowLabel}
+		>
+			{/* §6A.1 / DoD P3: in the merged row, Back/Forward fold into the `⋯`
+			    menu (PaneTools' `history` prop below) instead of two more
+			    always-visible icons — that's what keeps a multi-pane resting
+			    layout under the reference control count. The non-merged
+			    (2+ tab) address bar keeps its own Back/Forward, unchanged. */}
+			{!mergedTools && (
+				<>
+					<IconButton onClick={() => back()} disabled={!canGoBack} title="Back" aria-label="Back">
+						<ArrowLeft className="h-3.5 w-3.5" />
+					</IconButton>
+					<IconButton
+						onClick={() => forward()}
+						disabled={!canGoForward}
+						title="Forward"
+						aria-label="Forward"
+					>
+						<ArrowRight className="h-3.5 w-3.5" />
+					</IconButton>
+				</>
+			)}
+			{!mergedTools && (
+				<IconButton onClick={() => bumpKey()} title="Refresh" aria-label="Refresh pane">
+					<RefreshCw className="h-3.5 w-3.5" />
+				</IconButton>
+			)}
+			<ContextMenu>
+				<ContextMenuTrigger asChild disabled={!mergedTools || !leaf}>
+					<Input
+						ref={inputRef}
+						type="text"
+						value={draft}
+						onChange={(e) => {
+							setDraft(e.target.value);
+							if (invalid) setInvalid(false);
+						}}
+						onKeyDown={(e) => {
+							if (e.key === 'Enter') {
+								e.preventDefault();
+								submit();
+							} else if (e.key === 'Escape') {
+								setDraft(address);
+								inputRef.current?.blur();
+							}
+						}}
+						// §6A.3: the address text is this tab's drag source when there's
+						// no tab strip to carry one. `beginPointerDrag` is threshold-gated
+						// (see pointer-drag.ts) so a plain click still places the cursor —
+						// only a real drag past the threshold hijacks the pointer.
+						onPointerDown={
+							mergedTools && leaf
+								? (e) =>
+										beginPointerDrag(e, {
+											label: rowLabel ?? 'Tab',
+											onStart: () => useDragState.getState().startPane(leaf.id, 0),
+											onEnd: () => useDragState.getState().end(),
+										})
+								: undefined
+						}
+						spellCheck={false}
+						autoCorrect="off"
+						autoCapitalize="off"
+						aria-invalid={invalid || undefined}
+						aria-label="Address"
+						className={cn(
+							'pane-address-text ml-1 h-6 flex-1 rounded-sm px-2 py-0 font-mono text-xs',
+							invalid && 'border-destructive ring-2 ring-destructive/40'
+						)}
+					/>
+				</ContextMenuTrigger>
+				{mergedTools && leaf && soleTab && (
+					<ContextMenuContent>
+						{soleTab.kind === 'artifact' && (
+							<>
+								<ContextMenuItem onSelect={() => setPinDialogOpen(true)}>
+									Pin to sidebar…
+								</ContextMenuItem>
+								<ContextMenuSeparator />
+							</>
+						)}
+						<ContextMenuItem onSelect={() => toggleTabPinned(leaf.id, 0)}>
+							{isSoleTabPinned ? 'Unpin tab' : 'Pin tab'}
+						</ContextMenuItem>
+						{(soleTab.kind === 'artifact' || soleTab.kind === 'route') && (
+							<>
+								<ContextMenuSeparator />
+								<ContextMenuItem
+									onSelect={() => void writeClipboardText(soleTab.path).catch(() => {})}
+								>
+									Copy path
+								</ContextMenuItem>
+							</>
+						)}
+						<ContextMenuSeparator />
+						<ContextMenuItem
+							disabled={isSoleTabPinned}
+							onSelect={() => closeTab(leaf.id, 0)}
+						>
+							Close
+						</ContextMenuItem>
+					</ContextMenuContent>
 				)}
-			/>
+			</ContextMenu>
 			{view.kind === 'artifact' && (
 				<>
 					<IconButton
@@ -155,6 +265,38 @@ export function PaneAddressBar({ paneId, view }: PaneAddressBarProps) {
 						path={view.path}
 					/>
 				</>
+			)}
+			{mergedTools && leaf && (
+				<>
+					<button
+						ref={addBtnRef}
+						type="button"
+						onClick={(e) => {
+							e.stopPropagation();
+							focusPane(leaf.id);
+							setNewTabOpen((v) => !v);
+						}}
+						title="New tab in pane"
+						aria-label="New tab"
+						aria-expanded={newTabOpen}
+						className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+					>
+						<Plus className="h-3.5 w-3.5" />
+					</button>
+					<NewTabMenu
+						leaf={leaf}
+						open={newTabOpen}
+						onClose={() => setNewTabOpen(false)}
+						anchor={newTabAnchor}
+					/>
+				</>
+			)}
+			{mergedTools && (
+				<PaneTools
+					paneId={paneId}
+					onRefresh={bumpKey}
+					history={{ canGoBack, canGoForward, back, forward }}
+				/>
 			)}
 		</div>
 	);

@@ -40,10 +40,28 @@ export interface ToolCallEntry {
 	durationMs?: number;
 }
 
-export function ToolCallFeed({ sessionId }: { sessionId: string }) {
+/** No session selected (the Companion's panel scope is empty): one action —
+ *  ask the Companion to open its session picker. */
+function NoSessionEmpty({ title }: { title: string }) {
+	return (
+		<div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-xs text-muted-foreground font-mono select-none">
+			<p>{title}</p>
+			<button
+				type="button"
+				onClick={() => window.dispatchEvent(new CustomEvent('ikenga:companion-pick-session'))}
+				className="rounded border border-border px-2 py-1 hover:bg-card focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+			>
+				Choose a session
+			</button>
+		</div>
+	);
+}
+
+export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 	const [calls, setCalls] = useState<ToolCallEntry[]>([]);
 
 	useEffect(() => {
+		if (!sessionId) return;
 		// Initial fetch from backend REST endpoint if available
 		// Live endpoint + bearer token. This used to be a hardcoded
 		// `http://127.0.0.1:4000`, which the bridge has never bound — it takes a
@@ -166,6 +184,8 @@ export function ToolCallFeed({ sessionId }: { sessionId: string }) {
 			return <Globe className="h-3.5 w-3.5 text-blue-400" />;
 		return <Activity className="h-3.5 w-3.5 text-zinc-400" />;
 	};
+
+	if (!sessionId) return <NoSessionEmpty title="No session selected — no tool calls to show." />;
 
 	if (calls.length === 0) {
 		return (

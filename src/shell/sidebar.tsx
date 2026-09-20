@@ -1,88 +1,38 @@
-import { usePkgActivityBarEntries } from '@/lib/pkg/use-activity-bar-entries';
-import { isPkgMode, pkgIdFromMode, useShellStore } from '@/lib/shell/shell-store';
-import { AppMode } from './sidebar-modes/app-mode';
-import { ArtifactGridMode } from './sidebar-modes/artifact-grid-mode';
-import { FilesMode } from './sidebar-modes/files-mode';
-import { NgwaMode } from './sidebar-modes/ngwa-mode';
-import { PkgMode } from './sidebar-modes/pkg-mode';
-import { PkgsMode } from './sidebar-modes/pkgs-mode';
+import type React from 'react';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { SettingsMode } from './sidebar-modes/settings-mode';
-
-const CORE_TITLES = {
-	app: 'Ikenga',
-	files: 'Files',
-	'artifact-grid': 'Artifact grid',
-	ngwa: 'Ngwa',
-	pkgs: 'Packages',
-	settings: 'Settings',
-} as const;
+import { Explorer } from './explorer/explorer';
 
 export function Sidebar() {
 	const activeMode = useShellStore((s) => s.activeMode);
-	// Entries are only consulted for the head title when in a pkg mode; the
-	// hook is cheap (one cached kernel snapshot) and safe to always call.
-	const { entries: pkgEntries } = usePkgActivityBarEntries();
 
-	let title: string = CORE_TITLES.app;
-	let body: React.ReactNode;
-
-	if (isPkgMode(activeMode)) {
-		// A pkg owns the sidebar in its own mode — render its published menu.
-		// Title is the pkg's activity-bar label, falling back to the raw id if
-		// the snapshot hasn't loaded the entry yet.
-		const pkgId = pkgIdFromMode(activeMode) ?? '';
-		const entry = pkgEntries.find((e) => e.pkg_id === pkgId);
-		title = entry?.label ?? pkgId;
-		body = <PkgMode pkgId={pkgId} />;
-		return renderSidebar(title, body);
+	if (activeMode === 'chi' || activeMode === 'ngwa') {
+		return null;
 	}
 
 	switch (activeMode) {
-		case 'app':
-			title = CORE_TITLES.app;
-			body = <AppMode />;
-			break;
-		case 'files':
-			title = CORE_TITLES.files;
-			body = <FilesMode />;
-			break;
-		case 'artifact-grid':
-			title = CORE_TITLES['artifact-grid'];
-			body = <ArtifactGridMode />;
-			break;
-		case 'ngwa':
-			title = CORE_TITLES.ngwa;
-			body = <NgwaMode />;
-			break;
-		case 'pkgs':
-			title = CORE_TITLES.pkgs;
-			body = <PkgsMode />;
-			break;
 		case 'settings':
-			title = CORE_TITLES.settings;
-			body = <SettingsMode />;
-			break;
+			return renderSidebar('Settings', <SettingsMode />);
+		case 'project':
 		default:
-			// Should be unreachable post-strip — CoreMode is a closed union of
-			// 4 variants. Keeps the compiler honest if the union ever widens.
-			title = CORE_TITLES.app;
-			body = <AppMode />;
+			return (
+				<nav
+					aria-label="Explorer sidebar"
+					className="flex h-full flex-col border-r border-border bg-card"
+				>
+					<Explorer />
+				</nav>
+			);
 	}
-
-	return renderSidebar(title, body);
 }
 
-/** The sidebar chrome — workspace-tinted head + scrollable body. Shared by the
- *  CORE-mode switch and the `pkg:<id>` path so they render identically. */
+/** The sidebar chrome — workspace-tinted head + scrollable body. */
 function renderSidebar(title: string, body: React.ReactNode) {
 	return (
 		<nav
 			aria-label={`${title} sidebar`}
 			className="flex h-full flex-col border-r border-border bg-card"
-			// Workspace-tinted gradient on the head, fading into surface (shell.css §sidebar-head).
 			style={{
-				// Re-resolve --tint-bg-active per workspace via the [data-workspace] attribute on <html>.
-				// No JS branching needed — the var cascades.
 				['--ikenga-sidebar-tint' as string]: 'var(--tint-bg-active, var(--bg-surface))',
 			}}
 		>

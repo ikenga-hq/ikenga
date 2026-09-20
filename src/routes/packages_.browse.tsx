@@ -6,7 +6,11 @@
 import { createFileRoute, redirect } from '@tanstack/react-router';
 
 export const Route = createFileRoute('/packages_/browse')({
-	beforeLoad: () => {
-		throw redirect({ to: '/packages' });
+	beforeLoad: ({ search, location }) => {
+		throw redirect({
+			to: '/ngwa/store',
+			search,
+			hash: location.hash,
+		});
 	},
 });
