@@ -53,11 +53,6 @@ export function bootPrimary(): void {
 	// Install native menu best-effort (Mac-only; silently no-ops elsewhere).
 	void installNativeMenu();
 
-	// Pull the authoritative FS allowlist from Rust so the Files panel reflects
-	// what the Rust resolver will actually permit. Fire-and-forget; failures
-	// (test env, pre-setup boot) leave the persisted snapshot in place.
-	void useShellStore.getState().hydrateFileRootsFromRust();
-
 	// Resolve $HOME once so `defaultCwd()` (used by terminal/session
 	// fallbacks) can return it synchronously. Fire-and-forget — failure leaves
 	// the helper falling back to '~'.

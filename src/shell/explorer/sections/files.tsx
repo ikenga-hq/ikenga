@@ -708,7 +708,16 @@ export const filesDirectoryContextMenu = [
 export const filesContextMenu = filesFileContextMenu;
 
 export function FilesSection(_ctx: { projectId: string }) {
-	const fileRoots = useShellStore((s) => s.fileRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const roots = useMemo(() => {
+		const list: string[] = [];
+		if (activeProject?.root_path) list.push(activeProject.root_path);
+		for (const r of activeProject?.extra_roots ?? []) {
+			if (!list.includes(r)) list.push(r);
+		}
+		return list;
+	}, [activeProject?.root_path, activeProject?.extra_roots]);
+
 	const hydrated = useFilesStore((s) => s.hydrated);
 	const hydrate = useFilesStore((s) => s.hydrate);
 	const expandedRoot = useFilesStore((s) => s.expandedRoot);
@@ -725,7 +734,7 @@ export function FilesSection(_ctx: { projectId: string }) {
 
 	// Index of the open root; headers at/above it stick to the top, those below
 	// stick to the bottom. `-1` (none open) → everything sticks to the top.
-	const openIndex = expandedRoot ? fileRoots.indexOf(expandedRoot) : -1;
+	const openIndex = expandedRoot ? roots.indexOf(expandedRoot) : -1;
 
 	useEffect(() => {
 		void hydrate();
@@ -737,10 +746,10 @@ export function FilesSection(_ctx: { projectId: string }) {
 	// or a persisted choice from a previous session.
 	const didInitOpen = useRef(false);
 	useEffect(() => {
-		if (!hydrated || didInitOpen.current || fileRoots.length === 0) return;
+		if (!hydrated || didInitOpen.current || roots.length === 0) return;
 		didInitOpen.current = true;
-		if (expandedRoot === null) setExpandedRoot(fileRoots[0]);
-	}, [hydrated, expandedRoot, fileRoots, setExpandedRoot]);
+		if (expandedRoot === null) setExpandedRoot(roots[0]);
+	}, [hydrated, expandedRoot, roots, setExpandedRoot]);
 
 	// Reveal-on-open: when a file is opened into a pane, open its root, expand
 	// the ancestor dirs leading to it, and select it (TreeNode scrolls itself
@@ -757,7 +766,7 @@ export function FilesSection(_ctx: { projectId: string }) {
 		if (!revealRequest || lastRevealNonce.current === revealRequest.nonce) return;
 		lastRevealNonce.current = revealRequest.nonce;
 		const { path } = revealRequest;
-		const root = fileRoots.find(
+		const root = roots.find(
 			(r) => path === r || path.startsWith(r.endsWith('/') ? r : `${r}/`)
 		);
 		if (!root) return;
@@ -771,7 +780,7 @@ export function FilesSection(_ctx: { projectId: string }) {
 			cur = parentOf(cur);
 		}
 		reveal(root, ancestors, path);
-	}, [revealRequest, fileRoots, reveal]);
+	}, [revealRequest, roots, reveal]);
 
 	// Cmd+. (Mac) / Ctrl+. (Linux/Windows) → toggle hidden files. Matches the
 	// Finder convention. Bare `.` (no modifier) is left alone so users can
@@ -848,7 +857,7 @@ export function FilesSection(_ctx: { projectId: string }) {
 				</DropdownMenu>
 			</div>
 			<div ref={scrollerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
-				{fileRoots.length === 0 && (
+				{roots.length === 0 && (
 					<div className="p-4 text-center">
 					  <h3 className="text-sm font-semibold">No project open</h3>
 					  <p className="text-xs text-muted-foreground mt-1 mb-3">
@@ -859,7 +868,7 @@ export function FilesSection(_ctx: { projectId: string }) {
 					  </button>
 					</div>
 				)}
-				{fileRoots.map((root, i) => (
+				{roots.map((root, i) => (
 					<RootSection
 						key={root}
 						rootPath={root}

@@ -1,12 +1,7 @@
 // Step 3 — Projects.
 //
-// One list, two derived effects. Users pick the project folders Ikenga
-// should know about; on Continue we:
-//   • Write them to `claudeProjectRoots` (seeds the /claude config browser).
-//   • Mirror them once into `fileRoots` (the Tauri FS read/watch allowlist),
-//     so users don't have to reason about the dual-list distinction during
-//     onboarding. Settings still exposes both lists independently for
-//     power users who want to diverge them later.
+// One list: users pick the project folders Ikenga should know about;
+// on Continue we write them to `activeProject.extra_roots`.
 //
 // The pre-merge version of this file maintained two side-by-side sections
 // (file roots + project roots). User testing showed the distinction was
@@ -23,15 +18,14 @@ import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
-import { DEFAULT_CLAUDE_PROJECT_ROOTS, useShellStore } from '@/lib/shell/shell-store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { type ClaudeProjectEntry, listClaudeProjects } from '@/lib/tauri-cmd';
 import { useEffect, useState } from 'react';
 
 import { useOnboardingStep } from './use-onboarding-step';
 
 export interface RootsStepPayload {
-	fileRoots: string[];
-	claudeProjectRoots: string[];
+	extraRoots: string[];
 }
 
 interface RootsBodyProps {
@@ -41,23 +35,45 @@ interface RootsBodyProps {
 const CLAUDE_PROJECTS_QUERY = ['onboarding', 'claude-projects'] as const;
 
 /**
- * Copy `paths` into the store's `fileRoots`, skipping any already present.
+ * Copy `paths` into the store's `extra_roots`, skipping any already present.
  * Exported so the unit test can drive the same code path the Continue
  * button does, without rendering the component.
  */
 export function mirrorProjectsToFileRoots(paths: readonly string[]): void {
 	const state = useShellStore.getState();
-	const existing = new Set(state.fileRoots);
+	const activeId = state.activeProjectId || 'default';
+	const existing = new Set(state.activeProject?.extra_roots ?? []);
+	const next = [...(state.activeProject?.extra_roots ?? [])];
 	for (const p of paths) {
-		if (!existing.has(p)) state.addFileRoot(p);
+		if (!existing.has(p)) {
+			existing.add(p);
+			next.push(p);
+		}
 	}
+	state.setProjectExtraRoots(activeId, next);
 }
 
 export function RootsBody({ onContinue }: RootsBodyProps) {
-	const claudeProjectRoots = useShellStore((s) => s.claudeProjectRoots);
-	const addClaudeProjectRoot = useShellStore((s) => s.addClaudeProjectRoot);
-	const removeClaudeProjectRoot = useShellStore((s) => s.removeClaudeProjectRoot);
-	const updateClaudeProjectRoot = useShellStore((s) => s.updateClaudeProjectRoot);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const setProjectExtraRoots = useShellStore((s) => s.setProjectExtraRoots);
+	const roots = activeProject?.extra_roots ?? [];
+
+	function addRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		if (!roots.includes(path)) {
+			setProjectExtraRoots(activeId, [...roots, path]);
+		}
+	}
+
+	function removeRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.filter((r) => r !== path));
+	}
+
+	function updateRoot(oldPath: string, nextPath: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.map((r) => (r === oldPath ? nextPath : r)));
+	}
 
 	const { setPayload } = useOnboardingStep<RootsStepPayload>('roots');
 
@@ -69,21 +85,16 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 		refetchOnWindowFocus: false,
 	});
 
-	// Keep the step payload in sync with the store so the summary screen
-	// has a snapshot to render even if the user comes back later. We
-	// snapshot fileRoots here too — the summary still shows both lists
-	// (this step just doesn't surface file roots in its own UI any more).
 	useEffect(() => {
 		setPayload({
-			fileRoots: [...useShellStore.getState().fileRoots],
-			claudeProjectRoots: [...claudeProjectRoots],
+			extraRoots: [...roots],
 		});
-	}, [claudeProjectRoots, setPayload]);
+	}, [roots, setPayload]);
 
 	const browseProject = async () => {
 		try {
 			const picked = await openDialog({ directory: true, multiple: false });
-			if (typeof picked === 'string' && picked.length > 0) addClaudeProjectRoot(picked);
+			if (typeof picked === 'string' && picked.length > 0) addRoot(picked);
 		} catch {
 			/* swallow */
 		}
@@ -93,45 +104,39 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 	// configured roots — we only surface them as suggestions.
 	const projectSuggestions = (claudeProjects ?? []).filter((p) => {
 		const candidates = new Set([p.path, p.display_path]);
-		return !claudeProjectRoots.some((r) => candidates.has(r));
+		return !roots.some((r) => candidates.has(r));
 	});
 
 	const handleContinue = () => {
-		// Mirror once on advance — not on every keystroke. If the user
-		// later removes a project from this step, the mirrored file root
-		// stays put (they can prune it from Settings); that's preferable
-		// to silently revoking FS access mid-edit.
-		mirrorProjectsToFileRoots(claudeProjectRoots);
+		mirrorProjectsToFileRoots(roots);
 		onContinue();
 	};
 
 	return (
 		<div className="mx-auto max-w-3xl">
 			<div className="mb-6">
-				<p
-					className="mb-2 text-xs font-semibold uppercase tracking-[0.04em]"
-					style={{ color: 'var(--primary)' }}
-				>
-					Your <LoreTerm term="Obi">Obi</LoreTerm>
-				</p>
-				<h1 className="text-3xl font-bold leading-tight tracking-tight">
-					Where will your <LoreTerm term="Chi">Chi</LoreTerm> do its work?
-				</h1>
-				<p className="mt-2 max-w-[60ch] text-sm" style={{ color: 'var(--fg-muted)' }}>
-					Your Obi is the folders your workspace calls home — Ikenga reads them and routes them in
-					your sidebar. You can add more later from Settings.
+				<h2 className="text-lg font-semibold tracking-tight text-foreground">
+					Which projects should <LoreTerm term="ikenga" /> know about?
+				</h2>
+				<p className="mt-1 text-sm text-muted-foreground">
+					We will scan each folder for <span className="font-mono text-xs">.claude/</span>{' '}
+					configuration and make them reachable from the file tree. You can always add more from
+					Settings later.
 				</p>
 			</div>
 
-			<section className="mb-8">
-				<div className="mb-3 flex items-baseline justify-between">
-					<h3 className="text-[13px] font-semibold">Projects</h3>
-					<span className="text-[11.5px]" style={{ color: 'var(--fg-faint)' }}>
+			<div className="space-y-6">
+				{/* ── Project roots (Claude Code config) ── */}
+				<div className="flex items-center justify-between">
+					<label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+						Project folders
+					</label>
+					<span className="text-[11px] text-muted-foreground">
 						scanned by <span className="font-mono">/claude</span>
 					</span>
 				</div>
 				<div className="grid gap-2" data-testid="project-roots-list">
-					{claudeProjectRoots.length === 0 && (
+					{roots.length === 0 && (
 						<div
 							className="rounded-md border border-dashed p-3 text-xs"
 							style={{
@@ -143,13 +148,13 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 							scanned in addition to whatever you add here.
 						</div>
 					)}
-					{claudeProjectRoots.map((path) => (
+					{roots.map((path) => (
 						<RootRow
 							key={path}
 							path={path}
-							onRemove={() => removeClaudeProjectRoot(path)}
-							onCommit={(next) => updateClaudeProjectRoot(path, next)}
-							isDefault={(DEFAULT_CLAUDE_PROJECT_ROOTS as readonly string[]).includes(path)}
+							onRemove={() => removeRoot(path)}
+							onCommit={(next) => updateRoot(path, next)}
+							isDefault={false}
 						/>
 					))}
 				</div>
@@ -165,7 +170,7 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 						variant="secondary"
 						onClick={() => {
 							if (customProjectPath.trim()) {
-								addClaudeProjectRoot(customProjectPath.trim());
+								addRoot(customProjectPath.trim());
 								setCustomProjectPath('');
 							}
 						}}
@@ -192,7 +197,7 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 								<button
 									key={s.slug}
 									type="button"
-									onClick={() => addClaudeProjectRoot(s.path)}
+									onClick={() => addRoot(s.path)}
 									data-verified={s.path_verified}
 									className="flex items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition-colors hover:border-[var(--border-strong)]"
 									style={{ borderColor: 'var(--border-soft)' }}
@@ -232,7 +237,7 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 						</div>
 					</div>
 				)}
-			</section>
+			</div>
 
 			<div className="mt-8 flex items-center justify-end gap-3">
 				<Button onClick={handleContinue} data-testid="roots-inline-continue">

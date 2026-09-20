@@ -10,7 +10,7 @@ import { FolderOpen, FolderPlus, RotateCcw, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/components/ui/utils';
-import { DEFAULT_FILE_ROOTS, useShellStore } from '@/lib/shell/shell-store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { fsList } from '@/lib/tauri-cmd';
 
 interface EditablePathRowProps {
@@ -18,7 +18,6 @@ interface EditablePathRowProps {
 	onCommit: (next: string) => void;
 	onRemove: () => void;
 	removeLabel: string;
-	isDefault?: boolean;
 }
 
 function EditablePathRow({
@@ -26,7 +25,6 @@ function EditablePathRow({
 	onCommit,
 	onRemove,
 	removeLabel,
-	isDefault,
 }: EditablePathRowProps) {
 	const [draft, setDraft] = useState(value);
 	const [invalid, setInvalid] = useState(false);
@@ -58,35 +56,26 @@ function EditablePathRow({
 			<div className="flex min-w-0 flex-1 items-center gap-2">
 				<FolderOpen className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 				<input
+					type="text"
 					value={draft}
-					onChange={(e) => {
-						setDraft(e.target.value);
-						if (invalid) setInvalid(false);
-					}}
-					onBlur={() => void commit()}
+					onChange={(e) => setDraft(e.target.value)}
+					onBlur={commit}
 					onKeyDown={(e) => {
 						if (e.key === 'Enter') {
-							e.preventDefault();
-							(e.target as HTMLInputElement).blur();
+							e.currentTarget.blur();
 						} else if (e.key === 'Escape') {
-							e.preventDefault();
 							setDraft(value);
 							setInvalid(false);
-							(e.target as HTMLInputElement).blur();
 						}
 					}}
-					aria-invalid={invalid || undefined}
 					className={cn(
-						'min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 py-0.5 font-mono text-xs text-foreground outline-none',
-						'hover:border-border focus:border-ring focus:bg-background',
-						invalid && 'border-destructive bg-destructive/5 focus:border-destructive'
+						'flex-1 bg-transparent font-mono text-xs text-foreground outline-none',
+						invalid && 'text-red-600'
 					)}
-					spellCheck={false}
+					aria-label="Edit file root path"
 				/>
-				{isDefault && (
-					<span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-						default
-					</span>
+				{invalid && (
+					<span className="text-[10px] text-red-600">Unreachable or invalid path</span>
 				)}
 			</div>
 			<Button
@@ -103,15 +92,35 @@ function EditablePathRow({
 }
 
 export function FileRootsSectionBody() {
-	const fileRoots = useShellStore((s) => s.fileRoots);
-	const addFileRoot = useShellStore((s) => s.addFileRoot);
-	const removeFileRoot = useShellStore((s) => s.removeFileRoot);
-	const updateFileRoot = useShellStore((s) => s.updateFileRoot);
-	const resetFileRoots = useShellStore((s) => s.resetFileRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const setProjectExtraRoots = useShellStore((s) => s.setProjectExtraRoots);
+	const roots = activeProject?.extra_roots ?? [];
+
+	function addRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		if (!roots.includes(path)) {
+			setProjectExtraRoots(activeId, [...roots, path]);
+		}
+	}
+
+	function removeRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.filter((r) => r !== path));
+	}
+
+	function updateRoot(oldPath: string, nextPath: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.map((r) => (r === oldPath ? nextPath : r)));
+	}
+
+	function resetRoots() {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, []);
+	}
 
 	async function handleAdd() {
 		const picked = await openDialog({ directory: true, multiple: false });
-		if (typeof picked === 'string') addFileRoot(picked);
+		if (typeof picked === 'string') addRoot(picked);
 	}
 
 	return (
@@ -122,21 +131,17 @@ export function FileRootsSectionBody() {
 				<kbd>Enter</kbd> to commit, <kbd>Esc</kbd> to revert.
 			</p>
 			<ul className="space-y-1 rounded-md border border-border bg-background">
-				{fileRoots.map((root) => {
-					const isDefault = (DEFAULT_FILE_ROOTS as readonly string[]).includes(root);
-					return (
-						<EditablePathRow
-							key={root}
-							value={root}
-							onCommit={(next) => updateFileRoot(root, next)}
-							onRemove={() => removeFileRoot(root)}
-							removeLabel={`Remove ${root}`}
-							isDefault={isDefault}
-						/>
-					);
-				})}
-				{fileRoots.length === 0 && (
-					<li className="px-3 py-3 text-xs text-muted-foreground">No file roots configured.</li>
+				{roots.map((root) => (
+					<EditablePathRow
+						key={root}
+						value={root}
+						onCommit={(next) => updateRoot(root, next)}
+						onRemove={() => removeRoot(root)}
+						removeLabel={`Remove ${root}`}
+					/>
+				))}
+				{roots.length === 0 && (
+					<li className="px-3 py-3 text-xs text-muted-foreground">No extra roots configured.</li>
 				)}
 			</ul>
 			<div className="flex gap-2">
@@ -144,7 +149,7 @@ export function FileRootsSectionBody() {
 					<FolderPlus className="mr-1 h-3.5 w-3.5" />
 					Add directory
 				</Button>
-				<Button variant="ghost" size="sm" onClick={resetFileRoots}>
+				<Button variant="ghost" size="sm" onClick={resetRoots}>
 					<RotateCcw className="mr-1 h-3.5 w-3.5" />
 					Reset to defaults
 				</Button>

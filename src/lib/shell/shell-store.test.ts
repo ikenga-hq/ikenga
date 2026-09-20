@@ -233,8 +233,6 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(s.updatesAutoCheck).toBe(false);
 		expect(s.updatesAutoInstallApp).toBe(true);
 		expect(s.updatesAutoInstallPkgs).toBe(false);
-		expect(s.fileRoots).toEqual(['/home/ada/label']);
-		expect(s.claudeProjectRoots).toEqual([]);
 		expect(s.claudeWatchEnabled).toBe(false);
 		expect(s.claudeBrowserMode).toBe('roots');
 		expect(s.onboarding).toEqual(state.onboarding);
@@ -252,13 +250,7 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(s.carriedRoots).toEqual(expected);
 		expect(s.projectExtraRoots).toEqual({});
 		expect(s.activeProject).toEqual({ id: 'default', root_path: null, extra_roots: expected });
-		// Legacy fields untouched (WP-05 retires them).
-		expect(s.fileRoots).toEqual(fileRoots);
-		expect(s.claudeProjectRoots).toEqual(claudeProjectRoots);
-		// And they persist in the v16 blob, so a v15 build can still read it.
 		const stored = JSON.parse(localStorage.getItem(KEY)!).state;
-		expect(stored.fileRoots).toEqual(fileRoots);
-		expect(stored.claudeProjectRoots).toEqual(claudeProjectRoots);
 		expect(stored.carriedRoots).toEqual(expected);
 	});
 
@@ -285,8 +277,6 @@ describe('shell-store v16 (G-STATE)', () => {
 			expect(s.companion).toEqual({ activeTarget: { kind: 'new', engine_id: null } });
 			// "everything else unchanged from v15" — spot-check the v15 initial values.
 			expect(s.sidebarCollapsed).toBe(false);
-			expect(s.fileRoots).toEqual([]);
-			expect(s.claudeProjectRoots).toEqual([]);
 			expect(s.onboarding).toEqual(createDefaultOnboardingState());
 		};
 		assertDefaults();

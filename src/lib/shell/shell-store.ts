@@ -2,10 +2,6 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { scopedPersistName } from '@/lib/window/window-context';
 import {
-	fsRootsAdd,
-	fsRootsList,
-	fsRootsRemove,
-	fsRootsReset,
 	type Project,
 	projectGetActive,
 	projectList,
@@ -24,7 +20,6 @@ import {
 
 const KV_DEFAULT_ENGINE = 'agent.defaultEngineId';
 const KV_LEGACY_CHAT_ADAPTER = 'agent.chatAdapterId';
-const KV_CLAUDE_ROOTS = 'claude.projectRoots';
 const KV_CLAUDE_WATCH = 'claude.watchEnabled';
 const KV_ONBOARDING = 'onboarding.state';
 const KV_USER_NAME = 'user.name';
@@ -253,23 +248,6 @@ export function restoreV15Backup(
 	return true;
 }
 
-// Default file roots. Kept in sync with `src-tauri/src/fs_roots.rs::DEFAULT_ROOTS`;
-// the Rust side is authoritative — these are only the seed values used by the
-// onboarding wizard's "reset to defaults" affordance and the test harness.
-// At runtime, `fileRoots` is hydrated from Rust on app boot (see
-// `hydrateFileRootsFromRust`).
-//
-// Empty by design: a fresh install has no allowlist until the user adds a
-// root via the onboarding wizard or Settings → Storage.
-export const DEFAULT_FILE_ROOTS: readonly string[] = Object.freeze([]);
-
-// Project roots scanned by the /claude config browser. Each root is a dir
-// that contains a `.claude/` subfolder (agents/skills/commands/settings).
-// Personal `~/.claude/` is always scanned in addition to these — it doesn't
-// need to be listed. Empty by default; the user adds roots via onboarding
-// step "roots" or Settings.
-export const DEFAULT_CLAUDE_PROJECT_ROOTS: readonly string[] = Object.freeze([]);
-
 // ─── Onboarding wizard state (Phase 3 scaffold) ──────────────────────────
 //
 // First-run setup. Persisted alongside the rest of shell-store so the user
@@ -431,24 +409,6 @@ interface ShellState {
 	updatesAutoInstallPkgs: boolean;
 	setUpdatesAutoInstallPkgs: (v: boolean) => void;
 
-	fileRoots: string[];
-	addFileRoot: (path: string) => void;
-	removeFileRoot: (path: string) => void;
-	/** Replace `oldPath` with `newPath` (no-op if oldPath isn't present, or if
-	 * the new path is empty / a duplicate of an existing entry). Used by the
-	 * editable settings selectors. */
-	updateFileRoot: (oldPath: string, newPath: string) => void;
-	resetFileRoots: () => void;
-	/** Pull the authoritative list from Rust (`fs_roots_list`) and overwrite
-	 * local state. Called at app boot; safe to call multiple times. Rejects
-	 * silently in non-Tauri test environments. */
-	hydrateFileRootsFromRust: () => Promise<void>;
-
-	claudeProjectRoots: string[];
-	addClaudeProjectRoot: (path: string) => void;
-	removeClaudeProjectRoot: (path: string) => void;
-	updateClaudeProjectRoot: (oldPath: string, newPath: string) => void;
-	resetClaudeProjectRoots: () => void;
 	claudeWatchEnabled: boolean;
 	setClaudeWatchEnabled: (enabled: boolean) => void;
 
@@ -754,93 +714,6 @@ export const useShellStore = create<ShellState>()(
 				kvSet(KV_UPDATES_AUTO_INSTALL_PKGS, updatesAutoInstallPkgs);
 			},
 
-			fileRoots: [...DEFAULT_FILE_ROOTS],
-			// All four mutators update local state optimistically for instant UI
-			// feedback, then sync the authoritative list back from Rust. The
-			// invoke promise is swallowed in non-Tauri test environments so the
-			// existing unit tests (which never see a Tauri runtime) still pass.
-			addFileRoot: (path) => {
-				const trimmed = path.trim();
-				if (!trimmed) return;
-				if (!get().fileRoots.includes(trimmed)) {
-					set({ fileRoots: [...get().fileRoots, trimmed] });
-				}
-				fsRootsAdd(trimmed)
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			removeFileRoot: (path) => {
-				set({ fileRoots: get().fileRoots.filter((r) => r !== path) });
-				fsRootsRemove(path)
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			updateFileRoot: (oldPath, newPath) => {
-				const trimmed = newPath.trim();
-				if (!trimmed || trimmed === oldPath) return;
-				const cur = get().fileRoots;
-				const idx = cur.indexOf(oldPath);
-				if (idx < 0) return;
-				// Don't allow renaming on top of another existing entry.
-				if (cur.includes(trimmed)) return;
-				const next = [...cur];
-				next[idx] = trimmed;
-				set({ fileRoots: next });
-				// Rust has no atomic "rename" — sequence remove+add. If the
-				// remove succeeds but add fails (e.g. invalid path), the user
-				// sees a shorter list, matching the local state we already set.
-				fsRootsRemove(oldPath)
-					.then(() => fsRootsAdd(trimmed))
-					.then((latest) => set({ fileRoots: latest }))
-					.catch(() => {});
-			},
-			resetFileRoots: () => {
-				set({ fileRoots: [...DEFAULT_FILE_ROOTS] });
-				fsRootsReset()
-					.then((next) => set({ fileRoots: next }))
-					.catch(() => {});
-			},
-			hydrateFileRootsFromRust: async () => {
-				try {
-					const next = await fsRootsList();
-					set({ fileRoots: next });
-				} catch {
-					// Test environment or pre-setup boot — keep the persisted
-					// snapshot. Caller can retry.
-				}
-			},
-
-			claudeProjectRoots: [...DEFAULT_CLAUDE_PROJECT_ROOTS],
-			addClaudeProjectRoot: (path) => {
-				const trimmed = path.trim();
-				if (!trimmed) return;
-				if (get().claudeProjectRoots.includes(trimmed)) return;
-				const next = [...get().claudeProjectRoots, trimmed];
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			removeClaudeProjectRoot: (path) => {
-				const next = get().claudeProjectRoots.filter((r) => r !== path);
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			updateClaudeProjectRoot: (oldPath, newPath) => {
-				const trimmed = newPath.trim();
-				if (!trimmed || trimmed === oldPath) return;
-				const cur = get().claudeProjectRoots;
-				const idx = cur.indexOf(oldPath);
-				if (idx < 0) return;
-				if (cur.includes(trimmed)) return;
-				const next = [...cur];
-				next[idx] = trimmed;
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
-			resetClaudeProjectRoots: () => {
-				const next = [...DEFAULT_CLAUDE_PROJECT_ROOTS];
-				set({ claudeProjectRoots: next });
-				kvSet(KV_CLAUDE_ROOTS, next);
-			},
 			claudeWatchEnabled: true,
 			setClaudeWatchEnabled: (claudeWatchEnabled) => {
 				set({ claudeWatchEnabled });
@@ -1059,7 +932,6 @@ export const useShellStore = create<ShellState>()(
 					suppressKv = true;
 					try {
 						kvSet(KV_DEFAULT_ENGINE, s.defaultEngineId);
-						kvSet(KV_CLAUDE_ROOTS, s.claudeProjectRoots);
 						kvSet(KV_CLAUDE_WATCH, s.claudeWatchEnabled);
 						kvSet(KV_ONBOARDING, s.onboarding);
 						kvSet(KV_UPDATES_AUTO_CHECK, s.updatesAutoCheck);
@@ -1080,8 +952,6 @@ export const useShellStore = create<ShellState>()(
 					if (adapter === null || typeof adapter === 'string') {
 						next.defaultEngineId = adapter;
 					}
-					const roots = parseKv<string[]>(all[KV_CLAUDE_ROOTS]);
-					if (Array.isArray(roots)) next.claudeProjectRoots = roots;
 					const watch = parseKv<boolean>(all[KV_CLAUDE_WATCH]);
 					if (typeof watch === 'boolean') next.claudeWatchEnabled = watch;
 					const ob = parseKv<OnboardingState>(all[KV_ONBOARDING]);

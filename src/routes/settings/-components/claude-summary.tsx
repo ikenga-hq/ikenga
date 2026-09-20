@@ -14,7 +14,10 @@ import { claudeConfigQueryOptions } from '@/lib/queries/claude-config';
 import { useShellStore } from '@/lib/shell/shell-store';
 
 export function ClaudeSummarySectionBody() {
-	const projectRoots = useShellStore((s) => s.claudeProjectRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const projectRoots = activeProject?.root_path
+		? [activeProject.root_path, ...activeProject.extra_roots.filter((r) => r !== activeProject.root_path)]
+		: activeProject?.extra_roots ?? [];
 	const query = useQuery(claudeConfigQueryOptions(projectRoots));
 
 	const total = query.data
