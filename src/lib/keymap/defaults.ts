@@ -275,12 +275,41 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'Focus pane 6',
 	},
+
+	// --- Companion (src/shell/companion/, WP-06) — `companion.toggle` was
+	// `dock.cycle` before the Dock became the Companion; its handler still
+	// lives in workspace.tsx. The three dispatch keys are handled by the
+	// dispatch input's own `onKeyDown` (they only mean anything while it holds
+	// focus); they are registered so the hint row reads them from here.
+	// ⌘⇧A (spec §2 "focus the dispatch input") is NOT bound: on macOS it is
+	// already `session.switch-adapter` (a `global` native-menu accelerator).
 	{
-		command: 'dock.cycle',
+		command: 'companion.toggle',
 		key: 'mod+j',
 		when: 'not-input',
 		source: 'default',
-		label: 'Cycle dock',
+		label: 'Toggle Companion',
+	},
+	{
+		command: 'companion.send',
+		key: 'enter',
+		when: 'global',
+		source: 'default',
+		label: 'Companion → send to target',
+	},
+	{
+		command: 'companion.new-run',
+		key: 'shift+enter',
+		when: 'global',
+		source: 'default',
+		label: 'Companion → start a new run',
+	},
+	{
+		command: 'companion.persistent-run',
+		key: 'alt+enter',
+		when: 'global',
+		source: 'default',
+		label: 'Companion → start a persistent run',
 	},
 
 	// --- Native menu (src/shell/native-menu.ts) — macOS-only. These are OS

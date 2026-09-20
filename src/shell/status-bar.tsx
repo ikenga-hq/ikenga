@@ -47,7 +47,7 @@ import { listen } from '@/lib/transport';
 import { useTerminalStore } from '@/terminal/session-store';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
 import { openCommandPalette } from './command-palette';
-import { useDockStore } from './dock/dock-store';
+import { useCompanionStore } from './companion/companion-store';
 import { GIT_BRANCHES_ROUTE, GIT_CHANGES_ROUTE, useGitRepoSummary } from './title-row';
 
 /** Ngwa deep links. Phase 1 lands on the pkg surface's matching filter; the
@@ -339,7 +339,7 @@ export function StatusBar() {
 					<SegButton
 						id="runs"
 						rovingId={rovingId}
-						onClick={() => useDockStore.getState().setState('expanded')}
+						onClick={() => useCompanionStore.getState().setState('expanded')}
 						label={`${plural(runs, 'run')} live — open the Companion`}
 						className="text-[var(--ember)]"
 					>

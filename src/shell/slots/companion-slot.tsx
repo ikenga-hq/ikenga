@@ -1,9 +1,10 @@
-// WP-20 (frame slot skeleton): the right-side "Companion" dock.
+// WP-20 (frame slot skeleton): the right-hand Companion region.
 //
-// Renders today's Dock verbatim. Owned by WP-09 going forward (per
-// `designs/frame-workbench-v4.html`, this is the "Companion" region).
-import { Dock } from '@/shell/dock/dock';
+// Filled by WP-06 (per `designs/frame-workbench-v4.html`, D-01, this is the
+// Chi Companion — dispatch bar, session tabs, state panels; ADR-021). WP-06
+// owns this slot, not WP-09.
+import { Companion } from '@/shell/companion/companion';
 
 export function CompanionSlot() {
-	return <Dock />;
+	return <Companion />;
 }

@@ -5,7 +5,7 @@ import { persistPanelSizes } from '@/lib/shell/panel-sizes';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { CommandPalette, useCommandPalette } from './command-palette';
-import { useDockStore } from './dock/dock-store';
+import { useCompanionStore } from './companion/companion-store';
 import { BannerSlot } from './slots/banner-slot';
 import { CompanionSlot } from './slots/companion-slot';
 import { IframePoolOverlay, RestOverlays } from './slots/overlay-slot';
@@ -123,10 +123,10 @@ export function Workspace() {
 				usePaneStore.getState().focusByIndex(parseInt(e.key, 10) - 1);
 				return;
 			}
-			// ⌘J — cycle dock state (collapsed → expanded).
+			// ⌘J — toggle the Companion (strip ↔ expanded); keymap `companion.toggle`.
 			if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j' && !inEditable) {
 				e.preventDefault();
-				useDockStore.getState().cycleState();
+				useCompanionStore.getState().cycleState();
 				return;
 			}
 		}

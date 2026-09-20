@@ -4175,12 +4175,17 @@ export interface ChiRunOpts extends Record<string, unknown> {
 	timeoutSeconds?: number;
 	parentId?: string;
 	resumeSessionId?: string;
+	/** Launch via the tmux multiplexer so the session survives an app
+	 *  restart (falls back to in-process). Rust `ChiRunOpts.persistent`. */
+	persistent?: boolean;
 }
 
 /** Start a new Chi run. The engine child is spawned in WP-02; WP-01 mints
- *  a run id and persists a cache row. */
+ *  a run id and persists a cache row. The Rust command takes a single
+ *  `opts: ChiRunOpts` argument, and Tauri 2 reads arguments by name — so the
+ *  fields travel nested under `opts`, never flat. */
 export async function chiRun(opts: ChiRunOpts): Promise<ChiRunResult> {
-	return invoke<ChiRunResult>('chi_run', opts);
+	return invoke<ChiRunResult>('chi_run', { opts });
 }
 
 /** Resume an existing Chi run by its Ikenga run_id. */
