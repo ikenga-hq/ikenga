@@ -78,7 +78,9 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		mockShellStoreState = {
 			activeProjectId: 'royalti-co',
 			activeProject: { id: 'royalti-co', root_path: '/path/to/royalti-co', extra_roots: [] },
-			fileRoots: ['/path/to/royalti-co'],
+			projects: [
+				{ id: 'royalti-co', display_name: 'royalti-co', root_path: '/path/to/royalti-co', icon: null, color: null, description: null, position: 0, is_default: false, created_at: 0, archived_at: null },
+			],
 			explorerSections: [
 				{ id: 'files', source: 'shell', order: 0, collapsed: false },
 				{ id: 'artifacts', source: 'shell', order: 1, collapsed: false },

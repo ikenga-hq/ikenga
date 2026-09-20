@@ -10,8 +10,7 @@ import type { ScaffoldingPayload } from './scaffolding-body';
 import { buildCards, findBlockingState } from './summary-body';
 
 const CTX = {
-	fileRoots: ['~/royalti-co', '~/.company'],
-	claudeProjectRoots: ['~/royalti-co'],
+	extraRoots: ['~/royalti-co', '~/.company'],
 	theme: 'A',
 	mode: 'dark',
 	density: 'comfortable',

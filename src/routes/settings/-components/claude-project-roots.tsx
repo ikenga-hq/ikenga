@@ -11,21 +11,41 @@ import { Link } from '@tanstack/react-router';
 
 import { Button } from '@/components/ui/button';
 import { cn } from '@/components/ui/utils';
-import { DEFAULT_CLAUDE_PROJECT_ROOTS, useShellStore } from '@/lib/shell/shell-store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { fsList } from '@/lib/tauri-cmd';
 
 export function ClaudeProjectRootsSectionBody() {
-	const claudeProjectRoots = useShellStore((s) => s.claudeProjectRoots);
-	const addClaudeProjectRoot = useShellStore((s) => s.addClaudeProjectRoot);
-	const removeClaudeProjectRoot = useShellStore((s) => s.removeClaudeProjectRoot);
-	const updateClaudeProjectRoot = useShellStore((s) => s.updateClaudeProjectRoot);
-	const resetClaudeProjectRoots = useShellStore((s) => s.resetClaudeProjectRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const setProjectExtraRoots = useShellStore((s) => s.setProjectExtraRoots);
+	const roots = activeProject?.extra_roots ?? [];
 	const claudeWatchEnabled = useShellStore((s) => s.claudeWatchEnabled);
 	const setClaudeWatchEnabled = useShellStore((s) => s.setClaudeWatchEnabled);
 
+	function addRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		if (!roots.includes(path)) {
+			setProjectExtraRoots(activeId, [...roots, path]);
+		}
+	}
+
+	function removeRoot(path: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.filter((r) => r !== path));
+	}
+
+	function updateRoot(oldPath: string, nextPath: string) {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, roots.map((r) => (r === oldPath ? nextPath : r)));
+	}
+
+	function resetRoots() {
+		const activeId = activeProject?.id || 'default';
+		setProjectExtraRoots(activeId, []);
+	}
+
 	async function handleAdd() {
 		const picked = await openDialog({ directory: true, multiple: false });
-		if (typeof picked === 'string') addClaudeProjectRoot(picked);
+		if (typeof picked === 'string') addRoot(picked);
 	}
 
 	return (
@@ -53,20 +73,16 @@ export function ClaudeProjectRootsSectionBody() {
 				always scanned in addition to these — no need to add it.
 			</p>
 			<ul className="space-y-1 rounded-md border border-border bg-background">
-				{claudeProjectRoots.map((root) => {
-					const isDefault = (DEFAULT_CLAUDE_PROJECT_ROOTS as readonly string[]).includes(root);
-					return (
-						<EditableRow
-							key={root}
-							value={root}
-							onCommit={(next) => updateClaudeProjectRoot(root, next)}
-							onRemove={() => removeClaudeProjectRoot(root)}
-							removeLabel={`Remove ${root}`}
-							isDefault={isDefault}
-						/>
-					);
-				})}
-				{claudeProjectRoots.length === 0 && (
+				{roots.map((root) => (
+					<EditableRow
+						key={root}
+						value={root}
+						onCommit={(next) => updateRoot(root, next)}
+						onRemove={() => removeRoot(root)}
+						removeLabel={`Remove ${root}`}
+					/>
+				))}
+				{roots.length === 0 && (
 					<li className="px-3 py-3 text-xs text-muted-foreground">
 						No project roots configured — only personal <code>~/.claude/</code> will be shown.
 					</li>
@@ -77,7 +93,7 @@ export function ClaudeProjectRootsSectionBody() {
 					<FolderPlus className="mr-1 h-3.5 w-3.5" />
 					Add project root
 				</Button>
-				<Button variant="ghost" size="sm" onClick={resetClaudeProjectRoots}>
+				<Button variant="ghost" size="sm" onClick={resetRoots}>
 					<RotateCcw className="mr-1 h-3.5 w-3.5" />
 					Reset to defaults
 				</Button>

@@ -53,7 +53,15 @@ export const Route = createFileRoute('/claude')({
 });
 
 function ClaudeLayout() {
-	const projectRoots = useShellStore((s) => s.claudeProjectRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
+	const projectRoots = useMemo(() => {
+		const list: string[] = [];
+		if (activeProject?.root_path) list.push(activeProject.root_path);
+		for (const r of activeProject?.extra_roots ?? []) {
+			if (!list.includes(r)) list.push(r);
+		}
+		return list;
+	}, [activeProject?.root_path, activeProject?.extra_roots]);
 	const projects = useShellStore((s) => s.projects);
 	const watchEnabled = useShellStore((s) => s.claudeWatchEnabled);
 

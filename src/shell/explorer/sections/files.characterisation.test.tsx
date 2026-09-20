@@ -44,7 +44,10 @@ describe('FilesMode Characterisation', () => {
 
   it('renders files mode and lists root', async () => {
     (useShellStore as any).mockImplementation((selector: any) => {
-      const state = { fileRoots: ['/test-root'], activeProjectId: 'proj-1' };
+      const state = {
+        activeProject: { id: 'proj-1', root_path: '/test-root', extra_roots: [] },
+        activeProjectId: 'proj-1',
+      };
       return selector(state);
     });
     

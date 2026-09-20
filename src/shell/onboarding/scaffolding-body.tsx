@@ -69,14 +69,12 @@ const STARTER_PREVIEW = {
 
 export function ScaffoldingBody({ onContinue, onSkip }: ScaffoldingBodyProps) {
 	const selectedAgentId = useShellStore((s) => s.onboarding.selectedAgentId);
-	const claudeProjectRoots = useShellStore((s) => s.claudeProjectRoots);
-	const fileRoots = useShellStore((s) => s.fileRoots);
+	const activeProject = useShellStore((s) => s.activeProject);
 	const { setPayload, markCompleted, markSkipped } =
 		useOnboardingStep<ScaffoldingPayload>('scaffolding');
 
-	// Primary root := first project root if any, else first file root, else
-	// null. The user can still navigate Back to re-pick if this looks wrong.
-	const primaryRoot = claudeProjectRoots[0] ?? fileRoots[0] ?? null;
+	// Primary root := active project root_path if any, else first extra root, else null.
+	const primaryRoot = activeProject?.root_path ?? activeProject?.extra_roots[0] ?? null;
 
 	const isClaudeAgent = selectedAgentId === 'claude-code';
 

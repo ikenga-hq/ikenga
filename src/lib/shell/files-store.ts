@@ -2,25 +2,37 @@
 // (SQLite via layout-state). Children listings are owned by TanStack Query
 // keyed by path; this store only persists what the FS itself can't tell us:
 // which folders the user has expanded, which file is selected, and where
-// the tree was scrolled.
+// the tree was scrolled — re-keyed per active project.
 
 import { create } from 'zustand';
 import { debounce, loadLayoutState, saveLayoutState } from '@/lib/layout-state';
+import { useShellStore } from './shell-store';
 
 export const STORAGE_KEY = 'files.explorer.v1';
 
-interface Persisted {
+export interface ProjectFilesPersisted {
 	expanded: string[];
 	selectedPath: string | null;
 	scrollTop: number;
 	showHidden: boolean;
 	showIgnored: boolean;
-	/** The single root section currently expanded in the Files pane (accordion:
-	 *  one open at a time). `null`/absent means all roots are collapsed. */
+	expandedRoot: string | null;
+}
+
+export interface FilesPersisted {
+	byProject: Record<string, ProjectFilesPersisted>;
+	// Legacy fields for backward compatibility / migration
+	expanded?: string[];
+	selectedPath?: string | null;
+	scrollTop?: number;
+	showHidden?: boolean;
+	showIgnored?: boolean;
 	expandedRoot?: string | null;
 }
 
-interface FilesState {
+export interface FilesState {
+	activeProjectId: string;
+	byProject: Record<string, ProjectFilesPersisted>;
 	expanded: Set<string>;
 	selectedPath: string | null;
 	scrollTop: number;
@@ -39,7 +51,8 @@ interface FilesState {
 	expandedRoot: string | null;
 	hydrated: boolean;
 	hydrate: () => Promise<void>;
-	snapshot: () => Persisted;
+	snapshot: () => FilesPersisted;
+	setActiveProjectId: (projectId: string) => void;
 	toggle: (path: string) => void;
 	expand: (path: string) => void;
 	collapse: (path: string) => void;
@@ -61,13 +74,20 @@ interface FilesState {
 	prune: (paths: string[]) => void;
 }
 
-const persist = debounce((data: Persisted) => {
+const persist = debounce((data: FilesPersisted) => {
 	void saveLayoutState(STORAGE_KEY, data);
 }, 250);
 
-export type FilesPersisted = Persisted;
+const EMPTY_PROJECT_PERSISTED: ProjectFilesPersisted = {
+	expanded: [],
+	selectedPath: null,
+	scrollTop: 0,
+	showHidden: false,
+	showIgnored: false,
+	expandedRoot: null,
+};
 
-function snapshotOf(s: FilesState): Persisted {
+function currentProjectSlice(s: FilesState): ProjectFilesPersisted {
 	return {
 		expanded: [...s.expanded],
 		selectedPath: s.selectedPath,
@@ -78,30 +98,29 @@ function snapshotOf(s: FilesState): Persisted {
 	};
 }
 
-const EMPTY_PERSISTED: Persisted = {
-	expanded: [],
-	selectedPath: null,
-	scrollTop: 0,
-	showHidden: false,
-	showIgnored: false,
-	expandedRoot: null,
-};
-
-function persistedFromState(
-	s: Pick<
-		FilesState,
-		'expanded' | 'selectedPath' | 'scrollTop' | 'showHidden' | 'showIgnored' | 'expandedRoot'
-	>
-): Persisted {
-	return snapshotOf(s as FilesState);
+function snapshotOf(s: FilesState): FilesPersisted {
+	const curSlice = currentProjectSlice(s);
+	const byProj = { ...s.byProject };
+	if (s.activeProjectId) {
+		byProj[s.activeProjectId] = curSlice;
+	}
+	return {
+		byProject: byProj,
+	};
 }
 
 function persistCurrent(get: () => FilesState): void {
 	if (!get().hydrated) return;
-	persist(persistedFromState(get()));
+	persist(snapshotOf(get()));
 }
 
+const initialProjectId = typeof useShellStore !== 'undefined'
+	? (useShellStore.getState().activeProjectId || 'default')
+	: 'default';
+
 export const useFilesStore = create<FilesState>((set, get) => ({
+	activeProjectId: initialProjectId,
+	byProject: {},
 	expanded: new Set<string>(),
 	selectedPath: null,
 	scrollTop: 0,
@@ -113,20 +132,67 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
 	hydrate: async () => {
 		if (get().hydrated) return;
-		const data = await loadLayoutState<Persisted>(STORAGE_KEY, EMPTY_PERSISTED);
+		const data = await loadLayoutState<FilesPersisted>(STORAGE_KEY, { byProject: {} });
+		const byProject: Record<string, ProjectFilesPersisted> = { ...(data?.byProject ?? {}) };
+
+		// Backwards compatibility / migration from v1 unkeyed layout:
+		if (Array.isArray((data as unknown as ProjectFilesPersisted)?.expanded) && Object.keys(byProject).length === 0) {
+			const legacy = data as unknown as ProjectFilesPersisted;
+			byProject['default'] = {
+				expanded: legacy.expanded ?? [],
+				selectedPath: legacy.selectedPath ?? null,
+				scrollTop: legacy.scrollTop ?? 0,
+				showHidden: legacy.showHidden ?? false,
+				showIgnored: legacy.showIgnored ?? false,
+				expandedRoot: legacy.expandedRoot ?? null,
+			};
+		}
+
+		const projId = useShellStore.getState().activeProjectId || 'default';
+		const target = byProject[projId] ?? EMPTY_PROJECT_PERSISTED;
+
 		set({
-			expanded: new Set(data.expanded ?? []),
-			selectedPath: data.selectedPath ?? null,
-			scrollTop: data.scrollTop ?? 0,
-			showHidden: data.showHidden ?? false,
-			showIgnored: data.showIgnored ?? false,
+			activeProjectId: projId,
+			byProject,
+			expanded: new Set(target.expanded ?? []),
+			selectedPath: target.selectedPath ?? null,
+			scrollTop: target.scrollTop ?? 0,
+			showHidden: target.showHidden ?? false,
+			showIgnored: target.showIgnored ?? false,
 			queries: {},
-			expandedRoot: data.expandedRoot ?? null,
+			expandedRoot: target.expandedRoot ?? null,
 			hydrated: true,
 		});
 	},
 
-	snapshot: () => persistedFromState(get()),
+	snapshot: () => snapshotOf(get()),
+
+	setActiveProjectId: (projectId: string) => {
+		const curId = get().activeProjectId;
+		if (curId === projectId) return;
+
+		const curSlice = currentProjectSlice(get());
+		const nextByProject = {
+			...get().byProject,
+			[curId]: curSlice,
+		};
+
+		const target = nextByProject[projectId] ?? EMPTY_PROJECT_PERSISTED;
+
+		set({
+			activeProjectId: projectId,
+			byProject: nextByProject,
+			expanded: new Set(target.expanded ?? []),
+			selectedPath: target.selectedPath ?? null,
+			scrollTop: target.scrollTop ?? 0,
+			showHidden: target.showHidden ?? false,
+			showIgnored: target.showIgnored ?? false,
+			queries: {},
+			expandedRoot: target.expandedRoot ?? null,
+		});
+
+		persistCurrent(get);
+	},
 
 	toggle: (path) => {
 		const next = new Set(get().expanded);
@@ -229,3 +295,13 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 		persistCurrent(get);
 	},
 }));
+
+// Synchronously sync with shell store's activeProjectId in the same tick:
+useShellStore.subscribe((state) => {
+	const curStoreId = useFilesStore.getState().activeProjectId;
+	const nextId = state.activeProjectId;
+	if (nextId && nextId !== curStoreId) {
+		useFilesStore.getState().setActiveProjectId(nextId);
+	}
+});
+
