@@ -23,7 +23,7 @@ function stripDevRoutesPlugin(): import('vite').Plugin {
 			// 1. Remove dev route imports
 			transformed = transformed.replace(/^import\s+.*\s+from\s+['"].*\/routes\/dev\/.*['"];?\r?\n/gm, '');
 			// 2. Remove const Dev...Route = ...
-			transformed = transformed.replace(/^\s*const\s+Dev\w+Route\s*=\s*Dev\w+RouteImport[\s\S]*?\)\s*as\s+any\s*\)\r?\n/gm, '');
+			transformed = transformed.replace(/^\s*const\s+Dev\w+Route\s*=\s*Dev\w+RouteImport[\s\S]*?\}\s*as\s+any\s*\)\r?\n/gm, '');
 			// 3. Remove from rootRouteChildren
 			transformed = transformed.replace(/^\s*Dev\w+Route:\s*Dev\w+Route,?\r?\n/gm, '');
 			// 4. Remove union types
