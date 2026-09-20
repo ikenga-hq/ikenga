@@ -392,3 +392,239 @@ test.describe('rail (WP-03)', () => {
 		}
 	});
 });
+
+// ── Explorer (WP-04) ────────────────────────────────────────────────────────
+test.describe('explorer (WP-04)', () => {
+	test('renders all 8 registered built-in sections for the active project', async ({ page }) => {
+		const { pageErrors } = await bootRail(page);
+		const explorer = page.getByRole('navigation', { name: 'Explorer sidebar' });
+		await expect(explorer).toBeVisible();
+
+		const expectedSections = [
+			'files',
+			'artifacts',
+			'sessions',
+			'ngwa-project',
+			'automations',
+			'todos',
+			'scratchpads',
+			'views',
+		];
+
+		for (const id of expectedSections) {
+			await expect(explorer.locator(`[data-explorer-section="${id}"]`)).toBeVisible();
+		}
+
+		// Explorer top header controls
+		await expect(explorer.getByTestId('explorer-project-chip')).toBeVisible();
+		await expect(explorer.getByRole('button', { name: /Collapse all sections|Restore sections/ })).toBeVisible();
+
+		// Clicking a section header toggles its open state
+		const filesHeader = explorer.locator('[data-section-id="files"]');
+		await expect(filesHeader).toBeVisible();
+		const wasExpanded = (await filesHeader.getAttribute('aria-expanded')) === 'true';
+		await filesHeader.click();
+		await expect(filesHeader).toHaveAttribute('aria-expanded', String(!wasExpanded));
+		await filesHeader.click();
+		await expect(filesHeader).toHaveAttribute('aria-expanded', String(wasExpanded));
+
+		expect(pageErrors).toEqual([]);
+	});
+
+	test('project switcher popover lists projects and switches active project', async ({ page }) => {
+		await bootRail(page);
+		const explorer = page.getByRole('navigation', { name: 'Explorer sidebar' });
+		const chip = explorer.getByTestId('explorer-project-chip');
+		await chip.click();
+
+		// Popover appears with available projects
+		const popover = page.locator('[role="dialog"], [data-radix-popper-content-wrapper]');
+		await expect(popover.first()).toBeVisible();
+		await expect(popover.first().getByText('Default')).toBeVisible();
+		await expect(popover.first().getByText('Label Ops')).toBeVisible();
+
+		// Switching to Label Ops
+		await popover.first().getByText('Label Ops').click();
+		await expect(chip).toContainText('Label Ops');
+	});
+});
+
+// ── Companion (WP-06) ───────────────────────────────────────────────────────
+test.describe('companion (WP-06)', () => {
+	test('renders dispatch bar, target picker, session tabs and panels; collapse and expand', async ({
+		page,
+	}) => {
+		await bootRail(page);
+		const companion = page.locator('aside[aria-label="Chi companion"]');
+		await expect(companion).toBeVisible();
+
+		// Starts in collapsed strip state at rest (§5.1)
+		const stripBtn = companion.locator('button[aria-expanded="false"]');
+		await expect(stripBtn).toBeVisible();
+
+		// Expand Companion by clicking strip button
+		await stripBtn.click();
+		await expect(companion.getByPlaceholder('Dispatch an instruction…')).toBeVisible();
+
+		// Panels rendered
+		for (const panelName of ['Permissions', 'Cost', 'Tool feed', 'Runs']) {
+			await expect(companion.getByRole('button', { name: new RegExp(`^${panelName}`) })).toBeVisible();
+		}
+
+		// Collapse Companion via header collapse button
+		const collapseBtn = companion.getByRole('button', { name: 'Collapse Companion' });
+		await collapseBtn.click();
+
+		// Companion collapses back into strip
+		await expect(companion.locator('button[aria-expanded="false"]')).toBeVisible();
+	});
+});
+
+// ── Three-Noun Routes & Redirects (WP-10) ────────────────────────────────────
+test.describe('three-noun routes (WP-10)', () => {
+	test('routes to /project/dashboard, /chi, /ngwa/installed, and /automations via address bar', async ({
+		page,
+	}) => {
+		page.on('console', (msg) => {
+			if (msg.type() === 'error') console.log('[BROWSER CONSOLE ERROR]:', msg.text());
+		});
+		await installTauriMock(page);
+		await page.goto('/', { waitUntil: 'domcontentloaded' });
+		const addressInput = page.getByRole('textbox', { name: 'Address' });
+		await expect(addressInput).toBeVisible();
+
+		// Navigate to /chi
+		await addressInput.fill('/chi');
+		await addressInput.press('Enter');
+		await expect(page.getByText('Chi — Companion Dispatch')).toBeVisible();
+
+		// Navigate to /ngwa/installed
+		await addressInput.fill('/ngwa/installed');
+		await addressInput.press('Enter');
+		await expect(page.locator('.legacy-ngwa')).toBeVisible();
+		await expect(page.locator('[data-surface="browse"]')).toBeVisible();
+
+		// Navigate to /automations
+		await addressInput.fill('/automations');
+		await addressInput.press('Enter');
+		await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible();
+
+		// Navigate to /project/dashboard
+		await addressInput.fill('/project/dashboard');
+		await addressInput.press('Enter');
+		await expect(page.locator('.home-greeting')).toBeVisible();
+
+		// Legacy redirect /packages -> /ngwa/installed
+		await addressInput.fill('/packages');
+		await addressInput.press('Enter');
+		await expect(page.locator('.legacy-ngwa')).toBeVisible();
+	});
+});
+
+// ── D-01 Conformance & Resting Control Counts (WP-12) ────────────────────────
+test.describe('D-01 conformance (WP-12)', () => {
+	test('resting interactive controls table matches D-01 budget at default layout and 4-split', async ({
+		page,
+	}) => {
+		const gitSnapshotStdout = `${JSON.stringify({
+			jsonrpc: '2.0',
+			id: 1,
+			result: {
+				ok: true,
+				snapshot: {
+					branch: 'feat/phase-1-frame',
+					detached: false,
+					headSha: '87ac712aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+					staged: 1,
+					unstaged: 2,
+					untracked: 0,
+					conflicted: 0,
+				},
+			},
+		})}\n`;
+
+		await installTauriMock(page, {
+			responses: {
+				project_get_active: MOCK_PROJECTS[1],
+				activity_pins_list: RAIL_PINS,
+				pkg_sidecar_call: { ok: true, stdout: gitSnapshotStdout, stderr: '', code: 0 },
+			},
+		});
+		await page.goto('/', { waitUntil: 'domcontentloaded' });
+		await expect(page.getByRole('navigation', { name: 'Activity bar' })).toBeVisible();
+
+		const countRegion = async (selector: string): Promise<number> => {
+			return await page.evaluate((sel) => {
+				const interactive =
+					'button, a[href], input, select, textarea, [role="button"], [role="tab"], [tabindex="0"]';
+				const container = document.querySelector(sel);
+				if (!container) return 0;
+				const nodes = Array.from(container.querySelectorAll(interactive)) as HTMLElement[];
+				let count = 0;
+				for (const el of nodes) {
+					if (el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true })) {
+						count++;
+					}
+				}
+				return count;
+			}, selector);
+		};
+
+		// Resting counts at default layout (1 pane, Companion collapsed strip at rest)
+		const banner = await countRegion('[data-testid="banner-slot"]');
+		const titleRow = await countRegion('[aria-label="Title row"]');
+		const rail = await countRegion('nav[aria-label="Activity bar"]');
+		const explorer = await countRegion('nav[aria-label="Explorer sidebar"]');
+		const paneChrome = await page.evaluate(() => {
+			const nodes = Array.from(
+				document.querySelectorAll(
+					'[data-pane-id] > .flex.shrink-0 button, [data-pane-id] > .flex.shrink-0 [role="tab"]'
+				)
+			) as HTMLElement[];
+			return nodes.filter((el) => el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true })).length;
+		});
+		const companion = await countRegion('aside[aria-label="Chi companion"]');
+		const statusBar = await countRegion('footer[aria-label="Status bar"]');
+
+		const total = banner + titleRow + rail + explorer + paneChrome + companion + statusBar;
+
+		console.log(
+			'[RESTING CONTROL COUNT - DEFAULT LAYOUT]:',
+			JSON.stringify({
+				banner,
+				titleRow,
+				rail,
+				explorer,
+				paneChrome,
+				companion,
+				statusBar,
+				total,
+			})
+		);
+
+		// Budget assertions (D-01 budget: whole window <= 132 resting controls):
+		// Title row must be exactly 2 (project chip, branch chip)
+		expect(titleRow).toBe(2);
+		// Rail has exactly 8 items (Project, Chi, Ngwa, 3 pins, Settings, Project switcher)
+		expect(rail).toBe(8);
+		// Pane chrome on single resting pane
+		expect(paneChrome).toBeLessThanOrEqual(10);
+		// Status bar: zero counts hidden
+		expect(statusBar).toBeLessThanOrEqual(9);
+		// Whole window resting control count must be significantly below v3's 160
+		expect(total).toBeLessThanOrEqual(132);
+
+		// Every focusable control in the frame has a visible outline/ring when focused (WCAG 2.4.11)
+		const railButtons = page.locator('nav[aria-label="Activity bar"] button');
+		const firstRailBtn = railButtons.first();
+		await firstRailBtn.focus();
+		const outline = await firstRailBtn.evaluate((el) => {
+			const s = window.getComputedStyle(el);
+			return s.outlineStyle !== 'none' || s.boxShadow !== 'none';
+		});
+		expect(outline).toBe(true);
+	});
+});
+
+
+

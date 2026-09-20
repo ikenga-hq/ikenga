@@ -32,7 +32,9 @@ describe('Shell Integration Scripts (WP-08 / T-10)', () => {
 		expect(fish).toContain('133;D');
 	});
 
-	it('runs bash.sh under bash and confirms OSC 133 emission with exit code capture', () => {
+	it.skipIf(process.platform === 'win32')(
+		'runs bash.sh under bash and confirms OSC 133 emission with exit code capture',
+		() => {
 		const cmd = `PROMPT_COMMAND=". '${bashScriptPath}'" bash -i << 'INPUT' 2>&1
 echo "HELLO"
 false

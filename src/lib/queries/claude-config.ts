@@ -118,8 +118,8 @@ export function useClaudeConfigWatch(projectRoots: readonly string[], enabled = 
 					await claudeConfigUnwatch(ids);
 					return;
 				}
-				watcherIds = ids;
-				unlisten = await claudeConfigListen(ids, () => {
+				watcherIds = Array.isArray(ids) ? ids : [];
+				unlisten = await claudeConfigListen(watcherIds, () => {
 					debounce(() => {
 						queryClient.invalidateQueries({ queryKey: queryKeys.claudeConfig.all });
 					});
@@ -132,7 +132,7 @@ export function useClaudeConfigWatch(projectRoots: readonly string[], enabled = 
 		return () => {
 			cancelled = true;
 			if (unlisten) unlisten();
-			if (watcherIds.length) {
+			if (watcherIds?.length) {
 				void claudeConfigUnwatch(watcherIds);
 			}
 		};

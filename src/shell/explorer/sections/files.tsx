@@ -39,6 +39,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useGitStatus } from '@/lib/shell/use-git-status';
+import { handToChi } from '@/shell/companion/companion-store';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -395,7 +396,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 							<ContextMenuSeparator />
 						</>
 					)}
-					<ContextMenuItem onSelect={() => { /* Hand to Chi (stubbed until WP-06) */ }}>Hand to Chi</ContextMenuItem>
+					<ContextMenuItem onSelect={() => handToChi(entry.path)}>Hand to Chi</ContextMenuItem>
 					<ContextMenuItem onSelect={copyPath}>Copy Path</ContextMenuItem>
 					<ContextMenuItem onSelect={() => void writeClipboardText(entry.name).catch(() => {})}>
 						Copy Name
@@ -687,7 +688,7 @@ export const filesFileContextMenu = [
 	{ id: 'open-terminal-here', label: 'Open Terminal Here', run: () => {} },
 	{ id: 'open-terminal-side', label: 'Open Terminal to the Side', run: () => {} },
 	{ id: 'open-terminal-below', label: 'Open Terminal Below', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
+	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => handToChi('') },
 	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
 	{ id: 'copy-name', label: 'Copy Name', run: () => {} },
 	{ id: 'rename', label: 'Rename…', run: () => {} },
@@ -702,8 +703,9 @@ export const filesDirectoryContextMenu = [
 	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
 	{ id: 'rename', label: 'Rename…', run: () => {} },
 	{ id: 'delete', label: 'Delete', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
+	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => handToChi('') },
 ];
+
 
 export const filesContextMenu = filesFileContextMenu;
 
