@@ -4,7 +4,7 @@
 // regex-derived from primitive bodies (@/lib/claude-graph/flow).
 
 import type { ClaudeConfig, ClaudeStoreEntry } from '@/lib/tauri-cmd';
-import type { NgwaItem, NgwaSurfaceId } from '../ngwa-surface';
+import type { EngineConfigItem, NgwaSurfaceId } from '../ngwa-surface';
 import { FlowView } from './flow-view';
 import { GraphView } from './graph-view';
 import { HealthView } from './health-view';
@@ -15,7 +15,7 @@ interface AnalyzeSurfaceProps {
 	surface: NgwaSurfaceId;
 	config: ClaudeConfig | null;
 	scope: string;
-	items: NgwaItem[];
+	items: EngineConfigItem[];
 	store: ClaudeStoreEntry[];
 }
 
