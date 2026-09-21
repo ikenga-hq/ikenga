@@ -8,7 +8,7 @@
 // `unimplemented!()` from Rust for phase 1 — the wrappers are typed today so
 // later phases just fill in the Rust side.
 
-import type { WindowDescriptor } from '@ikenga/contract';
+import type { NgwaSnapshot, WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
@@ -1168,6 +1168,16 @@ export interface EngineLayout {
 /** Fetch the frozen G-ADAPTER layout descriptor for all engines (read-only). */
 export async function engineLayout(): Promise<EngineLayout[]> {
 	return invoke<EngineLayout[]>('engine_layout');
+}
+
+/**
+ * Ngwa unified snapshot (WP-14 / G-NGWA-ITEM).
+ * Joins pkg kernel, Ọba Claude-asset store, engine-config scan,
+ * engine_assets registry, and trust state into a unified snapshot
+ * with transcript JSONL usage mirror.
+ */
+export async function ngwaSnapshot(): Promise<NgwaSnapshot> {
+	return invoke<NgwaSnapshot>('ngwa_snapshot');
 }
 
 // ─── Claude config — 4-tier layered discovery (Phase 4) ──────────────────────
@@ -2341,7 +2351,8 @@ export async function spikeGrantFsRead(capabilityId: string, path: string): Prom
 export type PkgInstallSource =
 	| { kind: 'builtin' }
 	| { kind: 'registry'; url: string; publisher_key: string | null }
-	| { kind: 'local'; path: string };
+	| { kind: 'local'; path: string }
+	| { kind: 'dev'; path: string };
 
 export interface PkgInstalledSummary {
 	id: string;

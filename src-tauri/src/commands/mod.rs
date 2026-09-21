@@ -22,6 +22,7 @@ pub mod fs;
 pub mod fs_roots;
 pub mod identity;
 pub mod iyke;
+pub mod ngwa;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -101,6 +102,7 @@ pub use iyke::{
     iyke_network_push, iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done,
     iyke_terminal_spawn_done, iyke_wait_done, IykeRuntimeState,
 };
+pub use ngwa::ngwa_snapshot;
 pub use pa_actions::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update,

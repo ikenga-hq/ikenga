@@ -559,6 +559,13 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0063_meetings_domain",
         include_str!("../migrations/0063_meetings_domain.sql"),
     ),
+    // WP-14 (G-NGWA-ITEM / DEC-24): adds ngwa_transcript_files watermark table
+    // and ngwa_usage_events mirror table for transcript JSONL usage.
+    (
+        64,
+        "0064_ngwa_usage",
+        include_str!("../migrations/0064_ngwa_usage.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -1669,6 +1676,93 @@ mod tests {
                 .await
                 .expect("select from meetings");
         assert_eq!(meetings_count, 0);
+    }
+
+    /// WP-14: Verify 0064 applies automatically on an existing DB where migrations 1..63
+    /// were already recorded in _pa_migrations.
+    #[tokio::test]
+    async fn migration_0064_applies_on_existing_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_63.db");
+
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .expect("create _pa_migrations");
+
+        // Apply migrations 1..63 only
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 64) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .expect("record migration");
+        }
+
+        // Verify ngwa_usage_events table does NOT exist yet
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngwa_usage_events'",
+        )
+        .fetch_one(&raw_pool)
+        .await
+        .expect("count ngwa_usage_events table");
+        assert_eq!(count, 0, "ngwa_usage_events should not exist before 0064");
+        drop(raw_pool);
+
+        // Open PaDb — ensure_pool() should apply migration 64
+        let pa_db = PaDb::new(db_path.clone());
+        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
+            .fetch_all(&writer)
+            .await
+            .expect("fetch applied");
+        assert_eq!(
+            applied.len(),
+            64,
+            "expected all 64 migrations recorded after startup"
+        );
+        assert!(applied.contains(&64), "migration 64 must be in _pa_migrations");
+
+        // Verify ngwa_usage_events and ngwa_transcript_files exist
+        let events_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_usage_events")
+                .fetch_one(&writer)
+                .await
+                .expect("select from ngwa_usage_events");
+        assert_eq!(events_count, 0);
+
+        let files_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_transcript_files")
+                .fetch_one(&writer)
+                .await
+                .expect("select from ngwa_transcript_files");
+        assert_eq!(files_count, 0);
     }
 
     /// WP-18: Verify external SQLite mutations (from another connection / external tool)

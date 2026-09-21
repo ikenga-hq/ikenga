@@ -36,6 +36,10 @@ pub enum TranscriptRecord {
         message: Option<AssistantMessage>,
         #[serde(default, rename = "requestId")]
         request_id: Option<String>,
+        #[serde(default, rename = "attributionSkill")]
+        attribution_skill: Option<String>,
+        #[serde(default, rename = "attributionAgent")]
+        attribution_agent: Option<String>,
     },
     ToolResult {
         #[serde(default)]

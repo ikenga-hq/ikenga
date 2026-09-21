@@ -103,7 +103,7 @@ use commands::{
     fs_roots_reset, fs_search, fs_trash, fs_unwatch, fs_watch, fs_write, iyke_action_done,
     iyke_dom_done, iyke_dom_query, iyke_endpoint, iyke_log_push, iyke_mcp_info, iyke_network_push,
     iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done, iyke_terminal_spawn_done,
-    iyke_wait_done, list_all_skill_actions, list_skill_actions, oba_auto_update_all,
+    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot, oba_auto_update_all,
     oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
     oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
     oba_missing_requires, oba_relink_dependents, oba_safe_delete, oba_set_auto_update,
@@ -1045,6 +1045,8 @@ pub fn run() {
             os_username,
             // Ngwa Phase-2 cross-system — G-ADAPTER engine layout descriptor
             engine_layout,
+            // Ngwa Phase-2 — WP-14 unified snapshot (G-NGWA-ITEM)
+            ngwa_snapshot,
             // viewer
             viewer_serve,
             viewer_stop,
