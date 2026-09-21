@@ -9,7 +9,7 @@
 // conflict is read from `placements[].overridden_by` (DEC-31).
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowRight, Bot, Circle, CircleDot, Minus } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Bot, Circle, CircleDot, HelpCircle, Minus } from 'lucide-react';
 import type { NgwaItem, NgwaKind, NgwaPlacement, NgwaScope } from '@ikenga/contract';
 import type { ClaudeStoreKind, ClaudeStoreScope, EngineId } from '@/lib/tauri-cmd';
 import {
@@ -91,7 +91,7 @@ function normPath(p: string): string {
 	return p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
 }
 
-export type CellMark = 'on' | 'off' | 'link' | 'none' | 'conflict';
+export type CellMark = 'on' | 'off' | 'link' | 'none' | 'conflict' | 'unknown';
 
 export interface MatrixRow {
 	key: string;
@@ -170,7 +170,14 @@ export function conflictOf(row: MatrixRow): ScopeConflict | null {
 		if (it.scope.kind !== 'project') continue;
 		const pp = it.placements.find((p) => normPath(p.path) === target);
 		if (pp) {
-			return { row, personal, shadowed, shadowPath: shadowed.overridden_by, project: it, projectPlacement: pp };
+			return {
+				row,
+				personal,
+				shadowed,
+				shadowPath: shadowed.overridden_by,
+				project: it,
+				projectPlacement: pp,
+			};
 		}
 	}
 	return {
@@ -187,11 +194,20 @@ function placementsIn(it: NgwaItem, scopeKey: string): NgwaPlacement[] {
 	return it.placements.filter((p) => scopeKeyOf(p.scope) === scopeKey);
 }
 
+/** A symlink on disk. `mechanism` is the layout's *intended* mechanism, not
+ *  what is on disk (the golden snapshot has `symlink-dir` real folders), so
+ *  only `link_target` / `in_store` count. */
 export function isLink(p: NgwaPlacement): boolean {
 	return p.mechanism !== 'settings-key' && (p.link_target !== null || p.in_store);
 }
 
-export function scopeMark(row: MatrixRow, scopeKey: string, conflict: ScopeConflict | null): CellMark {
+export function scopeMark(
+	row: MatrixRow,
+	scopeKey: string,
+	conflict: ScopeConflict | null,
+	unknown = false
+): CellMark {
+	if (unknown && !row.pkg) return 'unknown';
 	const it = row.byScope.get(scopeKey);
 	if (!it) return 'none';
 	if (conflict && scopeKey === 'personal') return 'conflict';
@@ -205,8 +221,11 @@ export function scopeMark(row: MatrixRow, scopeKey: string, conflict: ScopeConfl
 }
 
 /** Engine cells read the union of the row's placements (must-fix 6). */
-export function engineMark(row: MatrixRow, engine: string): CellMark {
-	const ps = row.items.flatMap((it) => it.placements).filter((p) => p.engine === engine && p.present);
+export function engineMark(row: MatrixRow, engine: string, unknown = false): CellMark {
+	if (unknown && !row.pkg) return 'unknown';
+	const ps = row.items
+		.flatMap((it) => it.placements)
+		.filter((p) => p.engine === engine && p.present);
 	if (ps.length === 0) return 'none';
 	return ps.some(isLink) ? 'link' : 'on';
 }
@@ -216,6 +235,51 @@ export function claudePlacement(it: NgwaItem | undefined, scopeKey: string): Ngw
 	if (!it) return null;
 	const ps = placementsIn(it, scopeKey).filter((p) => p.engine === 'claude');
 	return ps.find((p) => p.present) ?? ps[0] ?? null;
+}
+
+// ─── Target paths: what the backend will actually touch ──────────────────────
+
+function joinPath(root: string, ...parts: string[]): string {
+	return [root.replace(/[\\/]+$/, ''), ...parts].join('/');
+}
+
+/** Folder primitives (skills) are removed, replaced and placed as a whole
+ *  folder (`remove_dir_all` / `atomic_copy_dir`), even though the scan's
+ *  placement path is the `SKILL.md` inside it. */
+export function isDirKind(sk: ClaudeStoreKind | null): boolean {
+	return sk === 'skill';
+}
+
+/** The node on disk a placement stands for: the folder for a skill. */
+export function placementTarget(p: NgwaPlacement, sk: ClaudeStoreKind | null): string {
+	return isDirKind(sk) ? p.path.replace(/[\\/]SKILL\.md$/i, '') : p.path;
+}
+
+/** The path the Rust command writes or deletes for (engine, kind, name) under
+ *  `root`. Mirrors `scope_path_for` (claude) and `engine_file_path` (skills on
+ *  gemini/codex, via `.agents/skills/`). `null` when it cannot be known here:
+ *  no root, a settings kind, or a user-tier engine file whose extension the
+ *  layout decides. */
+export function expectedPath(
+	engine: string,
+	sk: ClaudeStoreKind | null,
+	name: string,
+	root: string | null
+): string | null {
+	if (!root || !sk || sk === 'hook' || sk === 'mcp' || sk === 'bundle') return null;
+	if (engine === 'claude') {
+		return sk === 'skill'
+			? joinPath(root, '.claude', 'skills', name)
+			: joinPath(root, '.claude', `${sk}s`, `${name}.md`);
+	}
+	if ((engine === 'gemini' || engine === 'codex') && sk === 'skill') {
+		return joinPath(root, '.agents', 'skills', name);
+	}
+	return null;
+}
+
+export function samePath(a: string, b: string): boolean {
+	return normPath(a) === normPath(b);
 }
 
 // ─── Confirm dialog (DEC-30) — shared with Health ────────────────────────────
@@ -290,11 +354,11 @@ export function errText(e: unknown): string {
 	}
 }
 
-/** One line per placement nature, as DEC-30 requires. */
-export function PlacementNature({ p }: { p: NgwaPlacement }) {
+/** What removing this placement does, as DEC-30 requires. */
+export function PlacementNature({ p, dir }: { p: NgwaPlacement; dir: boolean }) {
 	if (p.mechanism === 'settings-key') {
 		return (
-			<p>
+			<p data-nature="settings">
 				It is a settings entry inside <code>{p.path}</code>. The entry is removed from that file;
 				the rest of the file is kept.
 			</p>
@@ -302,7 +366,7 @@ export function PlacementNature({ p }: { p: NgwaPlacement }) {
 	}
 	if (isLink(p)) {
 		return (
-			<p>
+			<p data-nature="link">
 				It is a <b>symlink</b>
 				{p.link_target ? (
 					<>
@@ -310,12 +374,18 @@ export function PlacementNature({ p }: { p: NgwaPlacement }) {
 						to <code>{p.link_target}</code>
 					</>
 				) : null}
-				. Only the link is removed; the store copy survives.
+				. Only the link is removed;{' '}
+				{p.in_store ? 'the store copy survives.' : 'whatever it points at is left untouched.'}
 			</p>
 		);
 	}
-	return (
-		<p>
+	return dir ? (
+		<p data-nature="real-dir">
+			It is a <b>real folder</b>, not a link. The folder <b>and everything in it</b> are{' '}
+			<b>deleted permanently</b>.
+		</p>
+	) : (
+		<p data-nature="real-file">
 			It is a <b>real file</b>, not a link. It is <b>deleted permanently</b>.
 		</p>
 	);
@@ -328,6 +398,8 @@ export interface ScopeColumn {
 	label: string;
 	sub: string;
 	active: boolean;
+	/** Project root on disk; personal columns take the surface's `homeDir`. */
+	root?: string | null;
 }
 
 /** Every mutating call the matrix can make. The route implements each with
@@ -372,6 +444,9 @@ export interface NgwaScopesSurfaceProps {
 	error?: Error | null;
 	unreadableSources?: Array<{ source: string; error: string | null }>;
 	scopes: ScopeColumn[];
+	/** The user's home directory — the personal scope root. `null` while it is
+	 *  unresolved; every path-checked action is then disabled with a reason. */
+	homeDir?: string | null;
 	actions: NgwaScopeActions;
 	kind?: string;
 	onKindChange?: (kind: string) => void;
@@ -398,7 +473,11 @@ const MARK_TITLE: Record<CellMark, string> = {
 	link: 'symlinked from the store',
 	none: 'not present',
 	conflict: 'shadowed by a nearer copy',
+	unknown: 'unknown — a source is unreadable',
 };
+
+/** Sources whose loss makes primitive cells unknowable (must-fix 2a). */
+const PRIMITIVE_SOURCES = ['engine_config', 'oba'];
 
 interface PopItem {
 	label: string;
@@ -415,12 +494,18 @@ interface OpenPop {
 	items: PopItem[];
 }
 
+interface EnableTarget {
+	label: string;
+	go: () => Promise<unknown>;
+}
+
 export function NgwaScopesSurface({
 	items,
 	isLoading = false,
 	error = null,
 	unreadableSources = [],
 	scopes,
+	homeDir = null,
 	actions,
 	kind = '*',
 	onKindChange,
@@ -447,6 +532,17 @@ export function NgwaScopesSurface({
 		(key: string) => scopes.find((s) => s.key === key)?.label ?? key,
 		[scopes]
 	);
+	const rootOf = useCallback(
+		(key: string): string | null =>
+			key === 'personal' ? homeDir || null : (scopes.find((s) => s.key === key)?.root ?? null),
+		[scopes, homeDir]
+	);
+
+	const primitivesDown = unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source));
+	const unknown = primitivesDown.length > 0;
+	const unknownReason = unknown
+		? `State unknown: ${primitivesDown.map((s) => s.source).join(', ')} unreadable`
+		: undefined;
 
 	const allRows = useMemo(() => buildRows(items), [items]);
 	const searchedRows = useMemo(() => {
@@ -468,6 +564,14 @@ export function NgwaScopesSurface({
 		}
 		return m;
 	}, [allRows]);
+
+	/** Every scanned placement, for "is anything already at this path?". */
+	const allPlacements = useMemo(() => items.flatMap((it) => it.placements), [items]);
+	const atPath = useCallback(
+		(path: string, sk: ClaudeStoreKind | null): NgwaPlacement | null =>
+			allPlacements.find((p) => samePath(placementTarget(p, sk), path)) ?? null,
+		[allPlacements]
+	);
 
 	const unregistered = useMemo(() => {
 		const visible = new Set(orderedScopes.map((s) => s.key));
@@ -494,10 +598,132 @@ export function NgwaScopesSurface({
 
 	const closePop = useCallback(() => setPop(null), []);
 
+	// ── Guards: every placing / deleting action checks the path it touches ──
+
+	/** Why Enable here (claude, scope `key`) must not run, or undefined. */
+	function enableBlock(row: MatrixRow, key: string): string | undefined {
+		if (unknownReason) return unknownReason;
+		const sk = row.storeKind;
+		if (!sk) return 'This kind has no scope writer';
+		const settings = sk === 'hook' || sk === 'mcp';
+		const dest = settings ? null : expectedPath('claude', sk, row.name, rootOf(key));
+		const there = dest ? atPath(dest, sk) : null;
+		// place_primitive has no clobber guard: a real file at the target is the
+		// first thing to rule out, and it is named, not folded into "enabled".
+		if (dest && there && !isLink(there)) {
+			return `A real ${isDirKind(sk) ? 'folder' : 'file'} is already at ${dest}; enabling would replace it`;
+		}
+		const mark = scopeMark(row, key, conflicts.get(row.key) ?? null);
+		if (mark === 'on' || mark === 'link' || mark === 'conflict') return 'Already enabled here';
+		if (!row.storeBacked) return 'Not in the Ọba store, so there is nothing to place; use Copy here';
+		if (settings) return undefined;
+		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		if (there) return 'Already enabled here';
+		return undefined;
+	}
+
+	/** The claude source a Move/Copy into `key` reads from, or a reason. */
+	function moveSource(row: MatrixRow, key: string): { key: string; p: NgwaPlacement } | string {
+		const sk = row.storeKind;
+		const candidates = [...row.byScope.keys()].filter((k) => k !== key);
+		candidates.sort((a, b) => (a === 'personal' ? -1 : b === 'personal' ? 1 : 0));
+		for (const k of candidates) {
+			const cp = claudePlacement(row.byScope.get(k), k);
+			if (!cp) continue;
+			if (sk === 'hook' || sk === 'mcp') return { key: k, p: cp };
+			const exp = expectedPath('claude', sk, row.name, rootOf(k));
+			if (exp && samePath(placementTarget(cp, sk), exp)) return { key: k, p: cp };
+		}
+		return 'Not placed for claude at a checkable path in any other scope';
+	}
+
+	/** Why Move/Copy into `key` must not run, or undefined. */
+	function moveCopyBlock(row: MatrixRow, key: string): string | undefined {
+		if (unknownReason) return unknownReason;
+		const sk = row.storeKind;
+		if (!sk) return 'This kind has no scope writer';
+		const src = moveSource(row, key);
+		if (typeof src === 'string') return src;
+		if (sk === 'hook' || sk === 'mcp') {
+			const here = row.byScope.get(key);
+			return here && placementsIn(here, key).length > 0 ? 'Already present here' : undefined;
+		}
+		const dest = expectedPath('claude', sk, row.name, rootOf(key));
+		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		if (atPath(dest, sk)) return `Something is already at ${dest}`;
+		return undefined;
+	}
+
+	/** The claude placement at the exact path Disable/Remove delete, or a reason. */
+	function claudeTarget(row: MatrixRow, key: string): NgwaPlacement | string {
+		if (unknownReason) return unknownReason;
+		const sk = row.storeKind;
+		const cp = claudePlacement(row.byScope.get(key), key);
+		if (sk === 'hook' || sk === 'mcp') {
+			return cp && cp.mechanism === 'settings-key' ? cp : 'Nothing placed for claude here';
+		}
+		const dest = expectedPath('claude', sk, row.name, rootOf(key));
+		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		const there = row.items
+			.flatMap((it) => it.placements)
+			.find((p) => p.engine === 'claude' && samePath(placementTarget(p, sk), dest));
+		return there ?? `Nothing scanned at ${dest}`;
+	}
+
+	/** Engine Disable: the placement at the path `disable_for_core` deletes, and a symlink. */
+	function engineDisableTarget(row: MatrixRow, engine: EngineId): { p: NgwaPlacement; key: string } | string {
+		if (unknownReason) return unknownReason;
+		const sk = row.storeKind;
+		const mine = row.items.flatMap((it) => it.placements).filter((p) => p.engine === engine && p.present);
+		if (mine.length === 0) return `Not placed for ${engine}`;
+		if (sk === 'hook' || sk === 'mcp') {
+			if (!row.storeBacked) return 'Not in the Ọba store; the entry cannot be matched to a store fragment';
+			const p = mine.find((x) => x.mechanism === 'settings-key');
+			return p ? { p, key: scopeKeyOf(p.scope) } : `Not placed for ${engine}`;
+		}
+		let why = `The ${engine} placement is not at the path the disable command deletes`;
+		for (const p of mine) {
+			const key = scopeKeyOf(p.scope);
+			const dest = expectedPath(engine, sk, row.name, rootOf(key));
+			if (!dest) {
+				why = `The ${engine} target path for ${row.kind}s cannot be checked here`;
+				continue;
+			}
+			if (!samePath(placementTarget(p, sk), dest)) continue;
+			if (!isLink(p)) {
+				why = `A real ${isDirKind(sk) ? 'folder' : 'file'}, not a store link; disabling would delete it`;
+				continue;
+			}
+			return { p, key };
+		}
+		return why;
+	}
+
+	/** Engine Enable (personal): why it must not run, or undefined. */
+	function engineEnableBlock(row: MatrixRow, engine: EngineId): string | undefined {
+		if (unknownReason) return unknownReason;
+		const sk = row.storeKind;
+		if (row.pkg || !sk) return 'Not placed per engine';
+		if (engineMark(row, engine) !== 'none') return `Already placed for ${engine}`;
+		if (!row.storeBacked) return 'Not in the Ọba store, so there is nothing to place';
+		if (sk === 'hook' || sk === 'mcp') return undefined;
+		const dest = expectedPath(engine, sk, row.name, homeDir || null);
+		if (!dest) {
+			return homeDir
+				? `The ${engine} target path for ${row.kind}s cannot be checked here`
+				: 'Home directory unknown, so the target path cannot be checked';
+		}
+		const there = atPath(dest, sk);
+		if (there && !isLink(there)) {
+			return `A real ${isDirKind(sk) ? 'folder' : 'file'} is already at ${dest}; enabling would replace it`;
+		}
+		if (there) return `Already placed for ${engine}`;
+		return undefined;
+	}
+
 	// ── Popover content ──
 	function scopePopItems(row: MatrixRow, col: ScopeColumn): PopItem[] {
 		const here = row.byScope.get(col.key);
-		const mark = scopeMark(row, col.key, conflicts.get(row.key) ?? null);
 		const scope = wireOf(col.key);
 		const where = col.label;
 
@@ -548,7 +774,9 @@ export function NgwaScopesSurface({
 				{
 					label: `Remove from ${where}`,
 					danger: true,
-					disabledReason: builtin ? 'Shipped with the shell and cannot be uninstalled; disable it instead' : undefined,
+					disabledReason: builtin
+						? 'Shipped with the shell and cannot be uninstalled; disable it instead'
+						: undefined,
 					onSelect: () =>
 						setConfirm({
 							title: `Uninstall ${row.label}`,
@@ -573,68 +801,104 @@ export function NgwaScopesSurface({
 
 		const sk = row.storeKind;
 		if (!sk) return [{ label: 'Enable here', disabledReason: 'This kind has no scope writer' }];
-		const conflict = conflicts.get(row.key) ?? null;
-		if (mark === 'conflict' && conflict) {
-			return conflictPopItems(conflict);
+		if (unknownReason) {
+			return [
+				{ label: 'Enable here', disabledReason: unknownReason },
+				{ label: 'Move here', disabledReason: unknownReason },
+				{ label: 'Copy here', disabledReason: unknownReason },
+				{ sep: true, label: '' },
+				{ label: 'Disable', disabledReason: unknownReason },
+				{ label: `Remove from ${where}`, danger: true, disabledReason: unknownReason },
+			];
 		}
-		const present = mark === 'on' || mark === 'link';
-		const otherKeys = [...row.byScope.keys()].filter(
-			(k) => k !== col.key && claudePlacement(row.byScope.get(k), k) !== null
-		);
-		const source = otherKeys.includes('personal') ? 'personal' : otherKeys[0];
-		const cp = claudePlacement(here, col.key);
-		const cpPresent = cp?.present ? cp : null;
-		const sourceReason = !source ? 'Not placed for claude in any other scope' : undefined;
-		const presentReason = here && placementsIn(here, col.key).length > 0 ? 'Already present here' : undefined;
+		const conflict = conflicts.get(row.key) ?? null;
+		if (conflict && col.key === 'personal') return conflictPopItems(conflict);
+
+		const src = moveSource(row, col.key);
+		const mcBlock = moveCopyBlock(row, col.key);
+		const target = claudeTarget(row, col.key);
+		const disableBlock =
+			typeof target === 'string'
+				? target
+				: target.mechanism !== 'settings-key' && !isLink(target)
+					? `A real ${isDirKind(sk) ? 'folder' : 'file'}, not a store link; disabling would delete it. Use Remove from ${where}`
+					: undefined;
 		return [
 			{
 				label: 'Enable here',
-				disabledReason: present
-					? 'Already enabled here'
-					: !row.storeBacked
-						? 'Not in the Ọba store, so there is nothing to place; use Copy here'
-						: undefined,
+				disabledReason: enableBlock(row, col.key),
 				onSelect: () =>
 					void run(`Enabled ${row.label} in ${where}`, () => actions.enable(sk, row.name, scope)),
 			},
 			{
 				label: 'Move here',
-				sub: source ? `from ${scopeLabel(source)}` : undefined,
-				disabledReason: presentReason ?? sourceReason,
-				onSelect: () =>
-					source &&
-					void run(`Moved ${row.label} to ${where}`, () =>
-						actions.move(sk, row.name, wireOf(source), scope)
-					),
+				sub: typeof src === 'string' ? undefined : `from ${scopeLabel(src.key)}`,
+				disabledReason: mcBlock,
+				onSelect: () => typeof src !== 'string' && setConfirm(moveRequest(row, sk, src, col.key)),
 			},
 			{
 				label: 'Copy here',
-				sub: source ? `from ${scopeLabel(source)}` : undefined,
-				disabledReason: presentReason ?? sourceReason,
+				sub: typeof src === 'string' ? undefined : `from ${scopeLabel(src.key)}`,
+				disabledReason: mcBlock,
 				onSelect: () =>
-					source &&
+					typeof src !== 'string' &&
 					void run(`Copied ${row.label} into ${where}`, () =>
-						actions.copy(sk, row.name, wireOf(source), scope)
+						actions.copy(sk, row.name, wireOf(src.key), scope)
 					),
 			},
 			{ sep: true, label: '' },
 			{
 				label: 'Disable',
-				disabledReason: !cpPresent
-					? 'Not placed for claude here'
-					: cpPresent.mechanism !== 'settings-key' && !isLink(cpPresent)
-						? `A real file, not a store link; disabling would delete it. Use Remove from ${where}`
-						: undefined,
+				disabledReason: disableBlock,
 				onSelect: () =>
 					void run(`Disabled ${row.label} in ${where}`, () => actions.disable(sk, row.name, scope)),
 			},
 			{
 				label: `Remove from ${where}`,
 				danger: true,
-				disabledReason: cp ? undefined : 'Nothing placed for claude here',
-				onSelect: () => cp && setConfirm(removeRequest(row, sk, col.key, cp)),
+				disabledReason: typeof target === 'string' ? target : undefined,
+				onSelect: () =>
+					typeof target !== 'string' && setConfirm(removeRequest(row, sk, col.key, target)),
 			},
 		];
+	}
+
+	function moveRequest(
+		row: MatrixRow,
+		sk: ClaudeStoreKind,
+		src: { key: string; p: NgwaPlacement },
+		toKey: string
+	): ConfirmRequest {
+		const settings = sk === 'hook' || sk === 'mcp';
+		const from = settings ? src.p.path : placementTarget(src.p, sk);
+		const to = settings ? null : expectedPath('claude', sk, row.name, rootOf(toKey));
+		return {
+			title: `Move ${row.label} to ${scopeLabel(toKey)}`,
+			confirmLabel: 'Move',
+			body: settings ? (
+				<>
+					<p>
+						Writes the store copy of the entry into {scopeLabel(toKey)}, then removes it from{' '}
+						<code data-move-source>{from}</code>.
+					</p>
+					<p>Any local edits to the entry in that file are lost; the store fragment is what is written.</p>
+				</>
+			) : (
+				<>
+					<p>
+						Copies <code data-move-source>{from}</code> to <code>{to}</code>, then <b>deletes the source</b>
+						{isDirKind(sk) ? ' folder and everything in it' : ''}.
+					</p>
+					{isLink(src.p) ? (
+						<p>
+							The source is a store link, so the destination becomes a <b>standalone copy</b> that no
+							longer receives store updates.
+						</p>
+					) : null}
+				</>
+			),
+			run: () => actions.move(sk, row.name, wireOf(src.key), wireOf(toKey)),
+		};
 	}
 
 	function removeRequest(
@@ -644,15 +908,19 @@ export function NgwaScopesSurface({
 		p: NgwaPlacement
 	): ConfirmRequest {
 		const where = scopeLabel(scopeKey);
+		const dir = isDirKind(sk) && p.mechanism !== 'settings-key';
+		const target = p.mechanism === 'settings-key' ? p.path : placementTarget(p, sk);
 		return {
 			title: `Remove ${row.label} from ${where}`,
 			confirmLabel: 'Remove',
 			body: (
 				<>
 					<p>
-						This removes <code data-remove-path>{p.path}</code>.
+						This removes {dir ? 'the folder ' : ''}
+						<code data-remove-path>{target}</code>
+						{p.mechanism === 'settings-key' ? ' (one entry)' : ''}.
 					</p>
-					<PlacementNature p={p} />
+					<PlacementNature p={p} dir={dir} />
 					<p>There is no undo.</p>
 				</>
 			),
@@ -662,26 +930,37 @@ export function NgwaScopesSurface({
 
 	function updatePersonalRequest(c: ScopeConflict): ConfirmRequest | null {
 		const sk = c.row.storeKind;
-		const personalClaude = claudePlacement(c.personal, 'personal');
-		if (!sk || !c.project || !personalClaude) return null;
+		if (!sk || !c.project || unknownReason) return null;
+		const personal = claudeTarget(c.row, 'personal');
+		if (typeof personal === 'string') return null;
 		const projKey = scopeKeyOf(c.project.scope);
+		const dir = isDirKind(sk);
+		const from = c.projectPlacement ? placementTarget(c.projectPlacement, sk) : c.shadowPath;
 		return {
 			title: `Update personal ${c.row.label}`,
 			confirmLabel: 'Overwrite personal',
 			body: (
 				<>
 					<p>
-						Copies the {scopeLabel(projKey)} version from{' '}
-						<code>{c.projectPlacement?.path ?? c.shadowPath}</code> over{' '}
-						<code data-overwrite-path>{personalClaude.path}</code>.
+						Copies the {scopeLabel(projKey)} version from <code>{from}</code> over{' '}
+						{dir ? 'the folder ' : ''}
+						<code data-overwrite-path>{placementTarget(personal, sk)}</code>.
 					</p>
-					{isLink(personalClaude) ? (
-						<p>
-							The personal copy is a <b>symlink</b>: the link is replaced by a real copy and the store
-							copy survives.
+					{isLink(personal) ? (
+						<p data-nature="link">
+							The personal copy is a <b>symlink</b>: the link is replaced by a real{' '}
+							{dir ? 'folder' : 'file'} and{' '}
+							{personal.in_store
+								? 'the store copy survives.'
+								: 'whatever it pointed at is left untouched.'}
+						</p>
+					) : dir ? (
+						<p data-nature="real-dir">
+							The personal copy is a <b>real folder</b>: the folder <b>and everything in it</b> are
+							replaced.
 						</p>
 					) : (
-						<p>
+						<p data-nature="real-file">
 							The personal copy is a <b>real file</b>: its current contents are overwritten.
 						</p>
 					)}
@@ -695,7 +974,7 @@ export function NgwaScopesSurface({
 	function conflictPopItems(c: ScopeConflict): PopItem[] {
 		const upd = updatePersonalRequest(c);
 		const sk = c.row.storeKind;
-		const personalClaude = claudePlacement(c.personal, 'personal');
+		const target = claudeTarget(c.row, 'personal');
 		return [
 			{
 				label: 'Update personal',
@@ -703,15 +982,19 @@ export function NgwaScopesSurface({
 					? undefined
 					: !c.project
 						? `The shadowing copy (${c.shadowPath}) is not in a registered project`
-						: 'No claude placement in personal to overwrite',
+						: typeof target === 'string'
+							? target
+							: 'Cannot update personal',
 				onSelect: () => upd && setConfirm(upd),
 			},
 			{
 				label: 'Remove from Personal',
 				danger: true,
-				disabledReason: personalClaude && sk ? undefined : 'Nothing placed for claude in personal',
+				disabledReason: typeof target === 'string' ? target : undefined,
 				onSelect: () =>
-					personalClaude && sk && setConfirm(removeRequest(c.row, sk, 'personal', personalClaude)),
+					typeof target !== 'string' &&
+					sk &&
+					setConfirm(removeRequest(c.row, sk, 'personal', target)),
 			},
 		];
 	}
@@ -732,21 +1015,13 @@ export function NgwaScopesSurface({
 				{ label: 'Disable', disabledReason: why },
 			];
 		}
-		const mark = engineMark(row, engine);
-		const cross = 'Cross-engine move and copy are not wired on this screen';
-		const placed = row.items
-			.flatMap((it) => it.placements)
-			.find((p) => p.engine === engine && p.present);
+		const cross = unknownReason ?? 'Cross-engine move and copy are not wired on this screen';
+		const dis = engineDisableTarget(row, engine);
 		return [
 			{
 				label: 'Enable here',
 				sub: 'in Personal',
-				disabledReason:
-					mark !== 'none'
-						? `Already placed for ${engine}`
-						: !row.storeBacked
-							? 'Not in the Ọba store, so there is nothing to place'
-							: undefined,
+				disabledReason: engineEnableBlock(row, engine),
 				onSelect: () =>
 					void run(`Enabled ${row.label} for ${engine}`, () =>
 						actions.enableFor(engine, sk, row.name, 'workspace')
@@ -757,45 +1032,39 @@ export function NgwaScopesSurface({
 			{ sep: true, label: '' },
 			{
 				label: 'Disable',
-				sub: placed ? `in ${scopeLabel(scopeKeyOf(placed.scope))}` : undefined,
-				disabledReason: !placed
-					? `Not placed for ${engine}`
-					: placed.mechanism !== 'settings-key' && !isLink(placed)
-						? 'A real file, not a store link; disabling would delete it'
-						: undefined,
+				sub: typeof dis === 'string' ? undefined : `in ${scopeLabel(dis.key)}`,
+				disabledReason: typeof dis === 'string' ? dis : undefined,
 				onSelect: () =>
-					placed &&
+					typeof dis !== 'string' &&
 					void run(`Disabled ${row.label} for ${engine}`, () =>
-						actions.disableFor(engine, sk, row.name, wireOf(scopeKeyOf(placed.scope)))
+						actions.disableFor(engine, sk, row.name, wireOf(dis.key))
 					),
 			},
 		];
 	}
 
-	// ── Enable all (D-02: confirm, then apply) ──
-	function enableAllScope(col: ScopeColumn) {
+	// ── Enable all (D-02: confirm, then apply). Targets are exactly the rows
+	// whose own cell action is allowed, so "untouched" is true by construction.
+	function enableAllScope(col: ScopeColumn): EnableTarget[] {
 		const scope = wireOf(col.key);
-		const targets: Array<{ label: string; go: () => Promise<unknown> }> = [];
+		const targets: EnableTarget[] = [];
 		for (const row of rows) {
-			const mark = scopeMark(row, col.key, conflicts.get(row.key) ?? null);
-			if (mark !== 'none' && mark !== 'off') continue;
 			const here = row.byScope.get(col.key);
 			if (row.pkg) {
 				if (here && here.state !== 'enabled') {
 					targets.push({ label: row.label, go: () => actions.pkgSetEnabled(here.id, true) });
 				}
-			} else if (row.storeKind && row.storeBacked) {
+			} else if (row.storeKind && enableBlock(row, col.key) === undefined) {
 				const sk = row.storeKind;
 				targets.push({ label: row.label, go: () => actions.enable(sk, row.name, scope) });
 			}
 		}
 		return targets;
 	}
-	function enableAllEngine(engine: EngineId) {
-		const targets: Array<{ label: string; go: () => Promise<unknown> }> = [];
+	function enableAllEngine(engine: EngineId): EnableTarget[] {
+		const targets: EnableTarget[] = [];
 		for (const row of rows) {
-			if (row.pkg || !row.storeKind || !row.storeBacked) continue;
-			if (engineMark(row, engine) !== 'none') continue;
+			if (row.pkg || !row.storeKind || engineEnableBlock(row, engine) !== undefined) continue;
 			const sk = row.storeKind;
 			targets.push({
 				label: row.label,
@@ -804,7 +1073,12 @@ export function NgwaScopesSurface({
 		}
 		return targets;
 	}
-	function askEnableAll(where: string, targets: Array<{ label: string; go: () => Promise<unknown> }>) {
+	function enableAllReason(where: string, targets: EnableTarget[]): string | undefined {
+		if (unknownReason) return unknownReason;
+		if (targets.length === 0) return `Every eligible row is already enabled in ${where}`;
+		return undefined;
+	}
+	function askEnableAll(where: string, targets: EnableTarget[]) {
 		setConfirm({
 			title: `Enable all in ${where}`,
 			confirmLabel: `Enable ${targets.length}`,
@@ -812,7 +1086,7 @@ export function NgwaScopesSurface({
 				<>
 					<p>
 						This enables <b>{targets.length}</b> item{targets.length === 1 ? '' : 's'} in <b>{where}</b>.
-						Items already enabled there are untouched.
+						Items already enabled there, and anything already on disk at a target path, are untouched.
 					</p>
 					<p>{targets.map((t) => t.label).join(', ')}</p>
 				</>
@@ -858,9 +1132,6 @@ export function NgwaScopesSurface({
 	}
 
 	const conflictList = [...conflicts.values()];
-	const conflictSourcesDown = unreadableSources.filter(
-		(s) => s.source === 'engine_config' || s.source === 'oba'
-	);
 	const kindCounts = new Map<string, number>();
 	for (const r of searchedRows) kindCounts.set(r.kind, (kindCounts.get(r.kind) ?? 0) + 1);
 
@@ -870,8 +1141,10 @@ export function NgwaScopesSurface({
 				<div className="source-banner" role="alert" data-unreadable>
 					<AlertTriangle className="h-4 w-4" />
 					<span>
-						Unreadable: {unreadableSources.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}
-						. Rows from those sources are missing, not absent.
+						Unreadable:{' '}
+						{unreadableSources.map((s) => `${s.source}${s.error ? ` (${s.error})` : ''}`).join('; ')}.
+						Rows from those sources are missing, not absent
+						{unknown ? ', and actions that place or delete files are disabled' : ''}.
 					</span>
 				</div>
 			)}
@@ -910,6 +1183,7 @@ export function NgwaScopesSurface({
 									<th className="left">Equipment</th>
 									{orderedScopes.map((col) => {
 										const targets = enableAllScope(col);
+										const why = enableAllReason(col.label, targets);
 										return (
 											<th
 												key={col.key}
@@ -922,12 +1196,8 @@ export function NgwaScopesSurface({
 													type="button"
 													className="chip enall"
 													data-enall={col.key}
-													disabled={pending || targets.length === 0}
-													title={
-														targets.length === 0
-															? `Every eligible row is already enabled in ${col.label}`
-															: undefined
-													}
+													disabled={pending || why !== undefined}
+													title={why}
 													onClick={() => askEnableAll(col.label, targets)}
 												>
 													Enable all
@@ -937,6 +1207,7 @@ export function NgwaScopesSurface({
 									})}
 									{engineCols.map((eng) => {
 										const targets = enableAllEngine(eng);
+										const why = enableAllReason(eng, targets);
 										return (
 											<th key={eng} className="eng" data-col={eng}>
 												<span className="colname">{eng}</span>
@@ -945,12 +1216,8 @@ export function NgwaScopesSurface({
 													type="button"
 													className="chip enall"
 													data-enall={eng}
-													disabled={pending || targets.length === 0}
-													title={
-														targets.length === 0
-															? `Every eligible row is already placed for ${eng}`
-															: undefined
-													}
+													disabled={pending || why !== undefined}
+													title={why}
 													onClick={() => askEnableAll(eng, targets)}
 												>
 													Enable all
@@ -974,7 +1241,7 @@ export function NgwaScopesSurface({
 											</td>
 											{orderedScopes.map((col) => {
 												const id = `${row.key}|${col.key}`;
-												const mark = scopeMark(row, col.key, conflict);
+												const mark = scopeMark(row, col.key, conflict, unknown);
 												const v = row.byScope.get(col.key)?.version;
 												return (
 													<td key={col.key} className="cell">
@@ -988,7 +1255,11 @@ export function NgwaScopesSurface({
 																setPop(
 																	pop?.id === id
 																		? null
-																		: { id, title: `${col.label} · ${row.label}`, items: scopePopItems(row, col) }
+																		: {
+																				id,
+																				title: `${col.label} · ${row.label}`,
+																				items: scopePopItems(row, col),
+																			}
 																)
 															}
 															pop={pop?.id === id ? pop : null}
@@ -999,7 +1270,7 @@ export function NgwaScopesSurface({
 											})}
 											{engineCols.map((eng) => {
 												const id = `${row.key}|${eng}`;
-												const mark = engineMark(row, eng);
+												const mark = engineMark(row, eng, unknown);
 												return (
 													<td key={eng} className="cell eng">
 														<MatrixCell
@@ -1063,15 +1334,15 @@ export function NgwaScopesSurface({
 				{/* ── Sidenote ── */}
 				<aside className="sidenote sc" data-sidenote aria-label="Matrix precedence and legend">
 					<div className="subhead first">Precedence</div>
-					{conflictSourcesDown.length > 0 ? (
+					{unknown ? (
 						<div className="snote warn" data-conflicts-unknown>
-							Conflicts unknown: {conflictSourcesDown.map((s) => s.source).join(', ')} unreadable.
+							Conflicts unknown: {primitivesDown.map((s) => s.source).join(', ')} unreadable.
 						</div>
 					) : conflictList.length > 0 ? (
 						conflictList.map((c) => {
 							const projKey = c.project ? scopeKeyOf(c.project.scope) : null;
 							const upd = updatePersonalRequest(c);
-							const personalClaude = claudePlacement(c.personal, 'personal');
+							const target = claudeTarget(c.row, 'personal');
 							return (
 								<div key={c.row.key} className="conflictbox" data-conflict={c.row.key}>
 									<AlertTriangle className="h-4 w-4 flex-none" />
@@ -1090,7 +1361,13 @@ export function NgwaScopesSurface({
 												className="chip"
 												data-act="update-personal"
 												disabled={!upd}
-												title={upd ? undefined : 'The shadowing copy is not in a registered project'}
+												title={
+													upd
+														? undefined
+														: typeof target === 'string'
+															? target
+															: 'The shadowing copy is not in a registered project'
+												}
 												onClick={() => upd && setConfirm(upd)}
 											>
 												Update personal
@@ -1099,12 +1376,12 @@ export function NgwaScopesSurface({
 												type="button"
 												className="chip clear"
 												data-act="remove-personal"
-												disabled={!personalClaude || !c.row.storeKind}
-												title={personalClaude ? undefined : 'Nothing placed for claude in personal'}
+												disabled={typeof target === 'string' || !c.row.storeKind}
+												title={typeof target === 'string' ? target : undefined}
 												onClick={() =>
-													personalClaude &&
+													typeof target !== 'string' &&
 													c.row.storeKind &&
-													setConfirm(removeRequest(c.row, c.row.storeKind, 'personal', personalClaude))
+													setConfirm(removeRequest(c.row, c.row.storeKind, 'personal', target))
 												}
 											>
 												Remove personal
@@ -1142,6 +1419,10 @@ export function NgwaScopesSurface({
 							<AlertTriangle className="h-3.5 w-3.5 mk-conflict" />
 							<span>shadowed by a nearer copy of the same name</span>
 						</div>
+						<div>
+							<HelpCircle className="h-3.5 w-3.5" />
+							<span>unknown: its source is unreadable</span>
+						</div>
 					</div>
 					<p className="note">
 						Click any cell to enable, move or copy the item into that scope or engine. Column headers
@@ -1157,7 +1438,8 @@ export function NgwaScopesSurface({
 					setConfirm(null);
 					setPop(null);
 					if (result?.ok) setStatus({ tone: 'ok', text: `${title}: done` });
-					else if (result && !result.ok) setStatus({ tone: 'err', text: `${title} failed: ${result.error}` });
+					else if (result && !result.ok)
+						setStatus({ tone: 'err', text: `${title} failed: ${result.error}` });
 				}}
 			/>
 		</div>
@@ -1174,6 +1456,8 @@ function MarkIcon({ mark }: { mark: CellMark }) {
 			return <ArrowRight className="h-3.5 w-3.5" />;
 		case 'conflict':
 			return <AlertTriangle className="h-3.5 w-3.5" />;
+		case 'unknown':
+			return <HelpCircle className="h-3.5 w-3.5" />;
 		default:
 			return <Minus className="h-3 w-3" />;
 	}

@@ -8,7 +8,7 @@
 
 import { useCallback, useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
 import { ngwaSnapshotQueryKey, useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import {
@@ -20,6 +20,7 @@ import {
 	useMovePrimitive,
 	useRemovePrimitive,
 } from '@/lib/queries/claude-config';
+import { loadHome } from '@/lib/home';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { pkgSetEnabled, pkgUninstall } from '@/lib/tauri-cmd';
 import {
@@ -43,6 +44,9 @@ function NgwaScopesPage() {
 	const qc = useQueryClient();
 	const { items, unreadableSources, isLoading, error } = useNgwaSnapshot();
 	const projects = useShellStore((s) => s.projects);
+	// The personal scope root. Unresolved ('' from loadHome) → null, and every
+	// path-checked action is disabled with a reason instead of guessing.
+	const home = useQuery({ queryKey: ['ngwa', 'home-dir'], queryFn: loadHome, staleTime: Infinity });
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 
 	const scopes = useMemo<ScopeColumn[]>(() => {
@@ -59,6 +63,7 @@ function NgwaScopesPage() {
 				label: p.display_name || p.id,
 				sub: '.claude',
 				active: p.id === activeProjectId,
+				root: p.root_path,
 			});
 		}
 		return cols;
@@ -125,6 +130,7 @@ function NgwaScopesPage() {
 				error={error}
 				unreadableSources={unreadableSources}
 				scopes={scopes}
+				homeDir={home.data || null}
 				actions={actions}
 				kind={search.kind ?? '*'}
 				onKindChange={(kind) =>

@@ -72,8 +72,14 @@ export function mkPlacement(p: Partial<NgwaPlacement> & Pick<NgwaPlacement, 'pat
 	};
 }
 
-export const P1_ROOT = '/r/royalti-co';
-export const P2_ROOT = '/r/ikenga';
+// Paths follow the golden snapshot (`src/lib/ngwa/__fixtures__/
+// ngwa-snapshot.golden.json`): home `/home/x`, a project root with a drive
+// letter, skill placements ending in `/SKILL.md`, and `mechanism` being the
+// layout's intent (a real skill folder still reads `symlink-dir`).
+export const HOME = '/home/x';
+export const STORE = '/home/x/.ikenga/store';
+export const P1_ROOT = 'C:/Users/x/royalti-co';
+export const P2_ROOT = 'C:/Users/x/ikenga';
 
 export function engineItems(which: Array<'claude' | 'codex' | 'gemini'>): NgwaItem[] {
 	const ids = { claude: 'claude-code', codex: 'codex', gemini: 'gemini' } as const;
@@ -107,24 +113,34 @@ export function engineItems(which: Array<'claude' | 'codex' | 'gemini'>): NgwaIt
 	);
 }
 
+const P1 = { kind: 'project', project_id: 'p1' } as const;
+const P2 = { kind: 'project', project_id: 'p2' } as const;
+
+/** A store-linked skill placement, golden shape. */
+function skillLink(root: string, dotdir: string, name: string, extra: Partial<NgwaPlacement> = {}) {
+	return mkPlacement({
+		path: `${root}/${dotdir}/skills/${name}/SKILL.md`,
+		link_target: `${STORE}/skills/${name}`,
+		in_store: true,
+		managed_by: 'oba',
+		...extra,
+	});
+}
+
 /** The scopes fixture: every row shape the matrix must get right. */
 export function scopesItems(): NgwaItem[] {
 	return [
 		...engineItems(['claude', 'codex']),
-		// Ọba skill, personal store symlink, shadowed by a real project copy (DEC-31).
-		// Both versions are null: detection must not depend on version.
+		// Ọba skill: personal store link shadowed by the project copy (DEC-31,
+		// golden `groundwork`). Versions are null: detection must not use them.
 		mkItem({
 			id: 'skill:personal:groundwork',
 			kind: 'skill',
 			name: 'groundwork',
-			install_path: '/store/skills/groundwork',
+			install_path: `${STORE}/skills/groundwork`,
 			placements: [
-				mkPlacement({
-					path: '/home/.claude/skills/groundwork',
-					link_target: '/store/skills/groundwork',
-					in_store: true,
-					managed_by: 'oba',
-					overridden_by: `${P1_ROOT}/.claude/skills/groundwork`,
+				skillLink(HOME, '.claude', 'groundwork', {
+					overridden_by: `${P1_ROOT}/.claude/skills/groundwork/SKILL.md`,
 				}),
 			],
 			engines: ['claude'],
@@ -133,13 +149,8 @@ export function scopesItems(): NgwaItem[] {
 			id: 'skill:project:p1:groundwork',
 			kind: 'skill',
 			name: 'groundwork',
-			scope: { kind: 'project', project_id: 'p1' },
-			placements: [
-				mkPlacement({
-					path: `${P1_ROOT}/.claude/skills/groundwork`,
-					scope: { kind: 'project', project_id: 'p1' },
-				}),
-			],
+			scope: P1,
+			placements: [skillLink(P1_ROOT, '.claude', 'groundwork', { scope: P1 })],
 			engines: ['claude'],
 		}),
 		// Same name, different kind, in another project: NOT a conflict.
@@ -147,63 +158,93 @@ export function scopesItems(): NgwaItem[] {
 			id: 'agent:project:p2:groundwork',
 			kind: 'agent',
 			name: 'groundwork',
-			scope: { kind: 'project', project_id: 'p2' },
+			scope: P2,
 			placements: [
-				mkPlacement({
-					path: `${P2_ROOT}/.claude/agents/groundwork.md`,
-					mechanism: 'file',
-					scope: { kind: 'project', project_id: 'p2' },
-				}),
+				mkPlacement({ path: `${P2_ROOT}/.claude/agents/groundwork.md`, mechanism: 'file', scope: P2 }),
 			],
 			engines: ['claude'],
 		}),
-		// Ọba agent in the store, not placed in personal (cell = off).
+		// Ọba agent in the store, placed nowhere (cell = off).
 		mkItem({
 			id: 'agent:personal:explore',
 			kind: 'agent',
 			name: 'explore',
-			install_path: '/store/agents/explore.md',
+			install_path: `${STORE}/agents/explore.md`,
 			state: 'disabled',
 		}),
-		// Personal store-backed skill placed for claude (personal) and codex (in p2):
-		// the engine cells read the union.
+		// Ọba agent in the store; the project holds a REAL hand-written file of
+		// the same name. Enabling into p1 would replace it (must-fix 2b).
+		mkItem({
+			id: 'agent:personal:reviewer',
+			kind: 'agent',
+			name: 'reviewer',
+			install_path: `${STORE}/agents/reviewer.md`,
+			placements: [
+				mkPlacement({
+					path: `${HOME}/.claude/agents/reviewer.md`,
+					link_target: `${STORE}/agents/reviewer.md`,
+					in_store: true,
+					managed_by: 'oba',
+				}),
+			],
+			engines: ['claude'],
+		}),
+		mkItem({
+			id: 'agent:project:p1:reviewer',
+			kind: 'agent',
+			name: 'reviewer',
+			scope: P1,
+			placements: [
+				mkPlacement({ path: `${P1_ROOT}/.claude/agents/reviewer.md`, mechanism: 'file', scope: P1 }),
+			],
+			engines: ['claude'],
+		}),
+		// Store skill linked for claude (personal) and codex (p2, at the exact
+		// `.agents/skills/` path disable_for_core deletes).
 		mkItem({
 			id: 'skill:personal:lint',
 			kind: 'skill',
 			name: 'lint',
 			version: '1.2.0',
-			install_path: '/store/skills/lint',
-			placements: [
-				mkPlacement({
-					path: '/home/.claude/skills/lint',
-					link_target: '/store/skills/lint',
-					in_store: true,
-				}),
-			],
+			install_path: `${STORE}/skills/lint`,
+			placements: [skillLink(HOME, '.claude', 'lint')],
 			engines: ['claude'],
 		}),
 		mkItem({
 			id: 'skill:project:p2:lint',
 			kind: 'skill',
 			name: 'lint',
-			scope: { kind: 'project', project_id: 'p2' },
-			placements: [
-				mkPlacement({
-					engine: 'codex',
-					path: `${P2_ROOT}/.agents/skills/lint`,
-					scope: { kind: 'project', project_id: 'p2' },
-					link_target: '/store/skills/lint',
-					in_store: true,
-				}),
-			],
+			scope: P2,
+			placements: [skillLink(P2_ROOT, '.agents', 'lint', { engine: 'codex', scope: P2 })],
 			engines: ['codex'],
 		}),
-		// A real personal command file (not in the store).
+		// A REAL skill folder (golden `com-ikenga-iyke` shape: symlink-dir, no
+		// link, not in store), and a real folder under codex's `.agents/skills`.
+		mkItem({
+			id: 'skill:personal:notes',
+			kind: 'skill',
+			name: 'notes',
+			placements: [
+				mkPlacement({ path: `${HOME}/.claude/skills/notes/SKILL.md` }),
+				mkPlacement({ engine: 'codex', path: `${HOME}/.agents/skills/notes/SKILL.md` }),
+			],
+			engines: ['claude', 'codex'],
+		}),
+		// Store-linked for codex, but NOT at the path the codex disable deletes.
+		mkItem({
+			id: 'skill:personal:deck',
+			kind: 'skill',
+			name: 'deck',
+			install_path: `${STORE}/skills/deck`,
+			placements: [skillLink(HOME, '.codex', 'deck', { engine: 'codex' })],
+			engines: ['codex'],
+		}),
+		// A real personal command file, not in the store (golden `ship` shape).
 		mkItem({
 			id: 'command:personal:release',
 			kind: 'command',
 			name: 'release',
-			placements: [mkPlacement({ path: '/home/.claude/commands/release.md', mechanism: 'file' })],
+			placements: [mkPlacement({ path: `${HOME}/.claude/commands/release.md`, mechanism: 'file' })],
 			engines: ['claude'],
 		}),
 		// Pkgs.
@@ -231,7 +272,7 @@ export function scopesItems(): NgwaItem[] {
 			kind: 'app',
 			name: 'com.ikenga.studio',
 			display_name: 'Studio',
-			scope: { kind: 'project', project_id: 'p1' },
+			scope: P1,
 			state: 'disabled',
 			install_path: '/pkgs/studio',
 		}),

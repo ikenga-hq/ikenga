@@ -253,8 +253,9 @@ describe('/ngwa/health — Violations panel (fold-in of pkg-audit + pkg-health)'
 	it('counts unsigned per gate §5 and lists them on Review', async () => {
 		mount();
 		await waitFor(() =>
-			expect(document.querySelector('[data-unsigned]')?.textContent).toContain('3 of 5')
+			expect(document.querySelector('[data-unsigned]')?.textContent).toBe('3 of 5 installed items are unsigned')
 		);
+		expect(panel('violations').textContent).not.toContain('came from unsigned manifests');
 		fireEvent.click(document.querySelector('[data-act="review-unsigned"]') as HTMLElement);
 		const list = document.querySelector('[data-list="unsigned"]');
 		expect(list?.textContent).toContain('com.x.app');
@@ -420,6 +421,18 @@ describe('/ngwa/health — Sidecars, Cron, Data, Engines use real sources', () =
 		expect(within(gemini).getByRole('button', { name: 'Open Store' })).toBeTruthy();
 	});
 
+	it('Open Store (Engines) navigates to the Store filtered to engines', async () => {
+		const { router } = mount();
+		const gemini = await waitFor(() => {
+			const g = document.querySelector<HTMLElement>('[data-engine="gemini"]');
+			if (!g || !within(g).queryByRole('button', { name: 'Open Store' })) throw new Error('not yet');
+			return g;
+		});
+		fireEvent.click(within(gemini).getByRole('button', { name: 'Open Store' }));
+		await waitFor(() => expect(router.state.location.pathname).toBe('/ngwa/store'));
+		expect(router.state.location.search).toEqual({ kind: 'engine' });
+	});
+
 	it('a probe failure is an error, not "not found"', async () => {
 		m.detectAgent.mockRejectedValue(new Error('spawn EPERM'));
 		mount();
@@ -446,9 +459,38 @@ describe('/ngwa/health — auditline and ?section=', () => {
 		);
 		const final = document.querySelector('[data-auditline]')?.textContent ?? line;
 		expect(final).toContain('kernel');
-		expect(final).not.toContain('usage');
-		expect(final).not.toContain('backups folder');
+		// usage is not listed among the sources read; it is named as unreadable.
+		const read = final.slice(0, final.indexOf('could not read'));
+		expect(read).not.toContain('usage');
+		expect(final).toContain('could not read: usage');
+		expect(read).not.toContain('backups folder'); // failed: listed as unreadable instead
+		expect(final).toContain('could not read: usage, backups folder');
 		expect(final).not.toContain('SQLite file sizes'); // not measured yet
+	});
+
+	it('the auditline shows a healthy check only when every source read cleanly', async () => {
+		mount();
+		await waitFor(() =>
+			expect(document.querySelector('[data-auditline]')?.getAttribute('data-audit-state')).toBe('ok')
+		);
+		cleanup();
+		m.backupList.mockRejectedValue(new Error('nope'));
+		mount();
+		await waitFor(() =>
+			expect(document.querySelector('[data-auditline]')?.textContent).toContain('could not read: backups folder')
+		);
+		expect(document.querySelector('[data-auditline]')?.textContent).toContain('Audited');
+		expect(document.querySelector('[data-auditline]')?.getAttribute('data-audit-state')).toBe('degraded');
+	});
+
+	it('a failed snapshot reads as an error in the auditline, not "not read yet"', async () => {
+		m.ngwaSnapshot.mockRejectedValue(new Error('scan exploded'));
+		mount();
+		await waitFor(() =>
+			expect(document.querySelector('[data-auditline]')?.textContent).toContain('Snapshot failed: scan exploded')
+		);
+		expect(document.querySelector('[data-auditline]')?.textContent).not.toContain('not read yet');
+		expect(document.querySelector('[data-auditline]')?.getAttribute('data-audit-state')).toBe('degraded');
 	});
 
 	it('?section=data focuses the Data panel', async () => {

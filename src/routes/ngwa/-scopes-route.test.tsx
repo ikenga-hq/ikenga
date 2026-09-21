@@ -1,17 +1,25 @@
 // /ngwa/scopes route tests (WP-16a). The real route is mounted in a real
 // router; `tauri-cmd` is mocked, so no command touches disk. Each test clicks a
 // control and asserts the exact command + arguments, including scope mapping
-// (personal → 'workspace', project → `project:<id>`).
+// (personal → 'workspace', project → `project:<id>`). Fixtures follow the
+// golden snapshot's shape (skill paths end in `/SKILL.md`).
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import * as cmd from '@/lib/tauri-cmd';
+import * as home from '@/lib/home';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { Route as ScopesRoute } from './scopes';
-import { PROJECTS, mkSnapshot, mountRoutes, scopesItems } from './-ngwa-test-fixtures';
+import { HOME, P1_ROOT, P2_ROOT, PROJECTS, mkSnapshot, mountRoutes, scopesItems } from './-ngwa-test-fixtures';
 
 vi.mock('@/lib/registry/use-registry', () => ({
 	useRegistryIndex: () => ({ data: undefined, isLoading: false, error: null }),
+}));
+
+vi.mock('@/lib/home', () => ({
+	loadHome: vi.fn(),
+	getHomeSync: () => '',
+	shortPath: (p: string) => p,
 }));
 
 vi.mock('@/lib/tauri-cmd', async (orig) => {
@@ -33,26 +41,24 @@ vi.mock('@/lib/tauri-cmd', async (orig) => {
 
 const m = vi.mocked(cmd);
 
+const WRITES = [
+	() => m.claudePrimitiveEnable,
+	() => m.claudePrimitiveDisable,
+	() => m.claudePrimitiveCopy,
+	() => m.claudePrimitiveMove,
+	() => m.claudePrimitiveRemove,
+	() => m.claudePrimitiveEnableFor,
+	() => m.claudePrimitiveDisableFor,
+	() => m.pkgSetEnabled,
+	() => m.pkgUninstall,
+];
+
 beforeEach(() => {
 	m.ngwaSnapshot.mockResolvedValue(mkSnapshot(scopesItems()));
-	for (const f of [
-		m.claudePrimitiveEnable,
-		m.claudePrimitiveDisable,
-		m.claudePrimitiveCopy,
-		m.claudePrimitiveMove,
-		m.claudePrimitiveRemove,
-		m.claudePrimitiveEnableFor,
-		m.claudePrimitiveDisableFor,
-		m.pkgSetEnabled,
-		m.pkgUninstall,
-	]) {
-		// biome-ignore lint/suspicious/noExplicitAny: heterogeneous mocks
-		(f as any).mockResolvedValue(undefined);
-	}
-	useShellStore.setState({
-		projects: PROJECTS,
-		activeProjectId: 'p1',
-	} as never);
+	vi.mocked(home.loadHome).mockResolvedValue(HOME);
+	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous mocks
+	for (const f of WRITES) (f() as any).mockResolvedValue(undefined);
+	useShellStore.setState({ projects: PROJECTS, activeProjectId: 'p1' } as never);
 });
 
 afterEach(() => {
@@ -63,6 +69,9 @@ afterEach(() => {
 async function mount(url = '/ngwa/scopes') {
 	const r = mountRoutes([{ route: ScopesRoute, path: '/ngwa/scopes' }], url);
 	await screen.findByRole('table', { name: 'Scope and Engine Matrix' });
+	// Home resolves asynchronously; wait until path-checked actions are live.
+	await waitFor(() => expect(home.loadHome).toHaveBeenCalled());
+	await act(async () => {});
 	return r;
 }
 
@@ -78,22 +87,35 @@ function openCell(rowKey: string, col: string) {
 }
 
 function item(menu: HTMLElement, name: RegExp) {
-	return within(menu).getByRole('menuitem', { name });
+	return within(menu).getByRole('menuitem', { name }) as HTMLButtonElement;
 }
+
+const dialog = () => screen.getByRole('dialog');
+const noWrites = () => {
+	for (const f of WRITES) expect(f()).not.toHaveBeenCalled();
+};
 
 const GW = 'prim:skill:groundwork';
 const LINT = 'prim:skill:lint';
+const NOTES = 'prim:skill:notes';
+const DECK = 'prim:skill:deck';
 const EXPLORE = 'prim:agent:explore';
+const REVIEWER = 'prim:agent:reviewer';
 const RELEASE = 'prim:command:release';
 const TASKS = 'pkg:app:com.ikenga.tasks';
 const STUDIO = 'pkg:app:com.ikenga.studio';
+
+function unreadable(source: 'engine_config' | 'oba') {
+	const snap = mkSnapshot(scopesItems());
+	snap.sources[source] = { ok: false, error: 'EACCES', count: 0 };
+	return snap;
+}
 
 describe('/ngwa/scopes — matrix semantics', () => {
 	it('keys rows by (kind, name): the same name in two kinds is two rows and not a conflict', async () => {
 		await mount();
 		expect(document.querySelector('[data-row="prim:skill:groundwork"]')).not.toBeNull();
 		expect(document.querySelector('[data-row="prim:agent:groundwork"]')).not.toBeNull();
-		// Only the skill is in conflict.
 		expect(document.querySelectorAll('[data-conflict]').length).toBe(1);
 		expect(cell('prim:agent:groundwork', 'personal').getAttribute('data-mark')).toBe('none');
 	});
@@ -105,7 +127,6 @@ describe('/ngwa/scopes — matrix semantics', () => {
 		);
 		expect(heads).toEqual(['personal', 'project:p1', 'project:p2', 'claude', 'codex']);
 		expect(document.querySelector('th[data-col="project:p1"]')?.className).toContain('active');
-		// The p2 agent appears only in the p2 column.
 		expect(cell('prim:agent:groundwork', 'project:p2').getAttribute('data-mark')).toBe('on');
 		expect(cell('prim:agent:groundwork', 'project:p1').getAttribute('data-mark')).toBe('none');
 	});
@@ -113,18 +134,14 @@ describe('/ngwa/scopes — matrix semantics', () => {
 	it('flags the overridden_by conflict on the personal cell even with null versions', async () => {
 		await mount();
 		expect(cell(GW, 'personal').getAttribute('data-mark')).toBe('conflict');
-		expect(cell(GW, 'project:p1').getAttribute('data-mark')).toBe('on');
+		expect(cell(GW, 'project:p1').getAttribute('data-mark')).toBe('link');
 		expect(screen.getByText('groundwork exists twice')).toBeTruthy();
 	});
 
 	it('does not call a version mismatch a conflict without overridden_by', async () => {
 		const items = scopesItems().map((it) =>
 			it.id === 'skill:personal:groundwork'
-				? {
-						...it,
-						version: '0.7.4',
-						placements: it.placements.map((p) => ({ ...p, overridden_by: null })),
-					}
+				? { ...it, version: '0.7.4', placements: it.placements.map((p) => ({ ...p, overridden_by: null })) }
 				: it.id === 'skill:project:p1:groundwork'
 					? { ...it, version: '0.7.6' }
 					: it
@@ -137,15 +154,16 @@ describe('/ngwa/scopes — matrix semantics', () => {
 
 	it('reads engine cells as the union of the row placements', async () => {
 		await mount();
-		// lint: claude placement on the personal item, codex placement on the p2 item.
 		expect(cell(LINT, 'claude').getAttribute('data-mark')).toBe('link');
 		expect(cell(LINT, 'codex').getAttribute('data-mark')).toBe('link');
 		expect(cell(RELEASE, 'codex').getAttribute('data-mark')).toBe('none');
 	});
 
-	it('renders the symlinked legend state in cells', async () => {
+	it('renders the legend states from the real on-disk nature, not the layout mechanism', async () => {
 		await mount();
 		expect(cell(LINT, 'personal').getAttribute('data-mark')).toBe('link');
+		// golden `com-ikenga-iyke` shape: mechanism symlink-dir, but a real folder.
+		expect(cell(NOTES, 'personal').getAttribute('data-mark')).toBe('on');
 		expect(cell(RELEASE, 'personal').getAttribute('data-mark')).toBe('on');
 		expect(cell(EXPLORE, 'personal').getAttribute('data-mark')).toBe('off');
 	});
@@ -168,12 +186,19 @@ describe('/ngwa/scopes — matrix semantics', () => {
 
 	it('the all chip shows the unfiltered count, and ?kind= is read', async () => {
 		await mount('/ngwa/scopes?kind=skill');
-		const all = document.querySelector('[data-mk="*"] .n');
-		// 11 items → 10 rows (groundwork skill + lint merge across scopes; 2 engines, …)
-		const rowsTotal = Number(all?.textContent);
-		expect(document.querySelectorAll('tbody tr').length).toBe(2); // groundwork + lint skills
-		expect(rowsTotal).toBeGreaterThan(2);
+		expect(document.querySelectorAll('tbody tr').length).toBe(4); // groundwork, lint, notes, deck
+		const all = Number(document.querySelector('[data-mk="*"] .n')?.textContent);
+		expect(all).toBe(12);
 		expect(document.querySelector('[data-mk="skill"]')?.getAttribute('aria-pressed')).toBe('true');
+	});
+
+	it('kind chips filter the rows and write ?kind= to the URL', async () => {
+		const { router } = await mount();
+		fireEvent.click(document.querySelector('[data-mk="agent"]') as HTMLElement);
+		await waitFor(() => expect(router.state.location.search).toEqual({ kind: 'agent' }));
+		expect(document.querySelectorAll('tbody tr').length).toBe(3); // groundwork, explore, reviewer
+		fireEvent.click(document.querySelector('[data-mk="*"]') as HTMLElement);
+		await waitFor(() => expect(router.state.location.search).toEqual({}));
 	});
 
 	it('reads ?search=', async () => {
@@ -181,29 +206,88 @@ describe('/ngwa/scopes — matrix semantics', () => {
 		expect(document.querySelectorAll('tbody tr').length).toBe(1);
 	});
 
-	it('renders an unreadable source as unknown, never as "no conflicts"', async () => {
-		m.ngwaSnapshot.mockResolvedValue(
-			mkSnapshot(scopesItems(), {
-				sources: {
-					kernel: { ok: true, error: null, count: 1 },
-					oba: { ok: true, error: null, count: 1 },
-					engine_config: { ok: false, error: 'EACCES', count: 0 },
-					engine_assets: { ok: true, error: null, count: 1 },
-					trust: { ok: true, error: null, count: 1 },
-					usage: { ok: true, error: null, count: 1 },
-				},
-			})
-		);
-		await mount();
-		expect(document.querySelector('[data-conflicts-unknown]')).not.toBeNull();
-		expect(document.querySelector('[data-no-conflicts]')).toBeNull();
-		expect(document.querySelector('[data-unreadable]')?.textContent).toContain('engine_config');
+	it('Open Store navigates to the Store filtered to engines', async () => {
+		const { router } = await mount();
+		fireEvent.click(within(document.querySelector('[data-enginefoot="gemini"]') as HTMLElement).getByRole('button', { name: 'Open Store' }));
+		await waitFor(() => expect(router.state.location.pathname).toBe('/ngwa/store'));
+		expect(router.state.location.search).toEqual({ kind: 'engine' });
 	});
 
 	it('shows the snapshot error, not an empty matrix', async () => {
 		m.ngwaSnapshot.mockRejectedValue(new Error('scan exploded'));
 		mountRoutes([{ route: ScopesRoute, path: '/ngwa/scopes' }], '/ngwa/scopes');
 		expect((await screen.findByRole('alert')).textContent).toContain('scan exploded');
+	});
+});
+
+describe('/ngwa/scopes — unreadable sources (must-fix 2a)', () => {
+	for (const source of ['engine_config', 'oba'] as const) {
+		it(`${source} unreadable: cells read unknown, every placing action and every Enable all is disabled`, async () => {
+			m.ngwaSnapshot.mockResolvedValue(unreadable(source));
+			await mount();
+			expect(document.querySelector('[data-conflicts-unknown]')).not.toBeNull();
+			expect(document.querySelector('[data-no-conflicts]')).toBeNull();
+			for (const [r, c] of [
+				[EXPLORE, 'personal'],
+				[LINT, 'project:p1'],
+				[GW, 'personal'],
+				[LINT, 'codex'],
+			]) {
+				expect(cell(r, c).getAttribute('data-mark')).toBe('unknown');
+			}
+			const enalls = [...document.querySelectorAll<HTMLButtonElement>('[data-enall]')];
+			expect(enalls.length).toBe(5);
+			for (const b of enalls) {
+				expect(b.disabled).toBe(true);
+				expect(b.title).toContain(`${source} unreadable`);
+			}
+			const menu = openCell(EXPLORE, 'project:p2');
+			for (const n of [/^Enable here/, /^Move here/, /^Copy here/, /^Disable/, /^Remove from/]) {
+				expect(item(menu, n).disabled).toBe(true);
+				expect(item(menu, n).title).toContain('unreadable');
+			}
+			fireEvent.keyDown(document, { key: 'Escape' });
+			const eng = openCell(GW, 'codex');
+			expect(item(eng, /^Enable here/).disabled).toBe(true);
+			expect(item(eng, /^Disable/).disabled).toBe(true);
+			noWrites();
+		});
+	}
+});
+
+describe('/ngwa/scopes — never place over a real file (must-fix 2b)', () => {
+	it('a real file in the target cell blocks Enable, Move and Copy with a reason', async () => {
+		await mount();
+		const menu = openCell(REVIEWER, 'project:p1');
+		const en = item(menu, /^Enable here/);
+		expect(en.disabled).toBe(true);
+		expect(en.title).toBe(
+			`A real file is already at ${P1_ROOT}/.claude/agents/reviewer.md; enabling would replace it`
+		);
+		expect(item(menu, /^Move here/).disabled).toBe(true);
+		expect(item(menu, /^Copy here/).disabled).toBe(true);
+		expect(item(menu, /^Copy here/).title).toContain(`${P1_ROOT}/.claude/agents/reviewer.md`);
+	});
+
+	it('Enable all never includes a row whose target path holds a real file', async () => {
+		await mount();
+		fireEvent.click(document.querySelector('[data-enall="project:p1"]') as HTMLElement);
+		expect(dialog().textContent).toContain('untouched');
+		expect(dialog().textContent).not.toContain('reviewer');
+		await act(async () => {
+			fireEvent.click(within(dialog()).getByRole('button', { name: /^Enable \d+$/ }));
+		});
+		await waitFor(() => expect(m.claudePrimitiveEnable).toHaveBeenCalled());
+		expect(m.claudePrimitiveEnable).not.toHaveBeenCalledWith('agent', 'reviewer', 'project:p1');
+		expect(m.claudePrimitiveEnable).toHaveBeenCalledWith('agent', 'explore', 'project:p1');
+	});
+
+	it('an unresolved home directory disables personal placing actions instead of guessing', async () => {
+		vi.mocked(home.loadHome).mockResolvedValue('');
+		await mount();
+		const en = item(openCell(EXPLORE, 'personal'), /^Enable here/);
+		expect(en.disabled).toBe(true);
+		expect(en.title).toContain('root unknown');
 	});
 });
 
@@ -227,8 +311,7 @@ describe('/ngwa/scopes — popover behaviour', () => {
 
 	it('disables with a reason instead of going inert', async () => {
 		await mount();
-		const menu = openCell(LINT, 'personal');
-		const en = item(menu, /^Enable here/) as HTMLButtonElement;
+		const en = item(openCell(LINT, 'personal'), /^Enable here/);
 		expect(en.disabled).toBe(true);
 		expect(en.title).toBe('Already enabled here');
 	});
@@ -261,19 +344,15 @@ describe('/ngwa/scopes — actions call the real commands', () => {
 		);
 	});
 
-	it('refuses Disable on a real file (it would delete it)', async () => {
+	it('refuses Disable on a real file or folder (it would delete it)', async () => {
 		await mount();
-		const d = item(openCell(RELEASE, 'personal'), /^Disable/) as HTMLButtonElement;
+		const d = item(openCell(RELEASE, 'personal'), /^Disable/);
 		expect(d.disabled).toBe(true);
 		expect(d.title).toContain('real file');
-	});
-
-	it('Move here → claudePrimitiveMove(from personal to project)', async () => {
-		await mount();
-		fireEvent.click(item(openCell(LINT, 'project:p1'), /^Move here/));
-		await waitFor(() =>
-			expect(m.claudePrimitiveMove).toHaveBeenCalledWith('skill', 'lint', 'workspace', 'project:p1')
-		);
+		fireEvent.keyDown(document, { key: 'Escape' });
+		const f = item(openCell(NOTES, 'personal'), /^Disable/);
+		expect(f.disabled).toBe(true);
+		expect(f.title).toContain('real folder');
 	});
 
 	it('Copy here → claudePrimitiveCopy(from personal to project)', async () => {
@@ -286,30 +365,39 @@ describe('/ngwa/scopes — actions call the real commands', () => {
 
 	it('engine cell Enable here → claudePrimitiveEnableFor(engine, kind, name, workspace)', async () => {
 		await mount();
-		// explore is store-backed and placed nowhere.
-		fireEvent.click(item(openCell(EXPLORE, 'codex'), /^Enable here/));
+		fireEvent.click(item(openCell(GW, 'codex'), /^Enable here/));
 		await waitFor(() =>
-			expect(m.claudePrimitiveEnableFor).toHaveBeenCalledWith(
-				'codex',
-				'agent',
-				'explore',
-				'workspace',
-				'shared'
-			)
+			expect(m.claudePrimitiveEnableFor).toHaveBeenCalledWith('codex', 'skill', 'groundwork', 'workspace', 'shared')
 		);
 	});
 
-	it('engine cell Disable → claudePrimitiveDisableFor in the placement scope', async () => {
+	it('engine Enable for a user-tier engine file is disabled: its path cannot be checked', async () => {
+		await mount();
+		const en = item(openCell(EXPLORE, 'codex'), /^Enable here/);
+		expect(en.disabled).toBe(true);
+		expect(en.title).toContain('cannot be checked');
+	});
+
+	it('engine column Enable all confirms, then enables exactly the checkable rows', async () => {
+		await mount();
+		fireEvent.click(document.querySelector('[data-enall="codex"]') as HTMLElement);
+		expect(dialog().textContent).toContain('Enable all in codex');
+		fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
+		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+		noWrites();
+		fireEvent.click(document.querySelector('[data-enall="codex"]') as HTMLElement);
+		await act(async () => {
+			fireEvent.click(within(dialog()).getByRole('button', { name: 'Enable 1' }));
+		});
+		await waitFor(() => expect(m.claudePrimitiveEnableFor).toHaveBeenCalledTimes(1));
+		expect(m.claudePrimitiveEnableFor).toHaveBeenCalledWith('codex', 'skill', 'groundwork', 'workspace', 'shared');
+	});
+
+	it('engine Disable → claudePrimitiveDisableFor at the exact path it deletes', async () => {
 		await mount();
 		fireEvent.click(item(openCell(LINT, 'codex'), /^Disable/));
 		await waitFor(() =>
-			expect(m.claudePrimitiveDisableFor).toHaveBeenCalledWith(
-				'codex',
-				'skill',
-				'lint',
-				'project:p2',
-				'shared'
-			)
+			expect(m.claudePrimitiveDisableFor).toHaveBeenCalledWith('codex', 'skill', 'lint', 'project:p2', 'shared')
 		);
 	});
 
@@ -335,30 +423,59 @@ describe('/ngwa/scopes — actions call the real commands', () => {
 	});
 });
 
-describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)', () => {
-	function dialog() {
-		return screen.getByRole('dialog');
-	}
+describe('/ngwa/scopes — engine Disable deletes only what it checked (must-fix 3)', () => {
+	it('a real folder at the codex path is not offered for Disable (V5)', async () => {
+		await mount();
+		const d = item(openCell(NOTES, 'codex'), /^Disable/);
+		expect(d.disabled).toBe(true);
+		expect(d.title).toContain('real folder');
+		fireEvent.click(d);
+		expect(m.claudePrimitiveDisableFor).not.toHaveBeenCalled();
+	});
 
-	it('Remove from Personal names the path and the symlink; cancel calls nothing', async () => {
+	it('a placement at a different path than disable_for_core deletes is not offered', async () => {
+		await mount();
+		const d = item(openCell(DECK, 'codex'), /^Disable/);
+		expect(d.disabled).toBe(true);
+		expect(d.title).toContain('not at the path');
+	});
+});
+
+describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)', () => {
+	it('Remove a skill names the FOLDER (not SKILL.md), says symlink and store copy survives; cancel calls nothing', async () => {
 		await mount();
 		fireEvent.click(item(openCell(LINT, 'personal'), /^Remove from Personal/));
 		const d = dialog();
-		expect(d.querySelector('[data-remove-path]')?.textContent).toBe('/home/.claude/skills/lint');
-		expect(d.textContent).toContain('symlink');
-		expect(d.textContent).toContain('store copy survives');
+		expect(d.querySelector('[data-remove-path]')?.textContent).toBe(`${HOME}/.claude/skills/lint`);
+		expect(d.textContent).not.toContain('SKILL.md');
+		expect(d.querySelector('[data-nature]')?.getAttribute('data-nature')).toBe('link');
+		expect(d.textContent).toContain('the store copy survives');
 		fireEvent.click(within(d).getByRole('button', { name: 'Cancel' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-		expect(m.claudePrimitiveRemove).not.toHaveBeenCalled();
+		noWrites();
+	});
+
+	it('Remove a real skill folder says the folder and everything in it are deleted', async () => {
+		await mount();
+		fireEvent.click(item(openCell(NOTES, 'personal'), /^Remove from Personal/));
+		const d = dialog();
+		expect(d.querySelector('[data-remove-path]')?.textContent).toBe(`${HOME}/.claude/skills/notes`);
+		expect(d.querySelector('[data-nature]')?.getAttribute('data-nature')).toBe('real-dir');
+		expect(d.textContent).toContain('and everything in it');
+		expect(d.textContent).toContain('deleted permanently');
+		await act(async () => {
+			fireEvent.click(within(d).getByRole('button', { name: 'Remove' }));
+		});
+		await waitFor(() => expect(m.claudePrimitiveRemove).toHaveBeenCalledWith('skill', 'notes', 'workspace'));
 	});
 
 	it('Remove a real file says it is deleted permanently; confirm calls claudePrimitiveRemove once', async () => {
 		await mount();
 		fireEvent.click(item(openCell(RELEASE, 'personal'), /^Remove from Personal/));
 		const d = dialog();
-		expect(d.textContent).toContain('real file');
-		expect(d.textContent).toContain('deleted permanently');
-		expect(m.claudePrimitiveRemove).not.toHaveBeenCalled();
+		expect(d.querySelector('[data-remove-path]')?.textContent).toBe(`${HOME}/.claude/commands/release.md`);
+		expect(d.querySelector('[data-nature]')?.getAttribute('data-nature')).toBe('real-file');
+		noWrites();
 		await act(async () => {
 			fireEvent.click(within(d).getByRole('button', { name: 'Remove' }));
 		});
@@ -366,14 +483,35 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		expect(m.claudePrimitiveRemove).toHaveBeenCalledWith('command', 'release', 'workspace');
 	});
 
-	it('Remove in a project maps to project:<id>', async () => {
+	it('Remove in a project maps to project:<id> and names that folder', async () => {
 		await mount();
 		fireEvent.click(item(openCell(GW, 'project:p1'), /^Remove from royalti-co/));
+		expect(dialog().querySelector('[data-remove-path]')?.textContent).toBe(`${P1_ROOT}/.claude/skills/groundwork`);
 		await act(async () => {
 			fireEvent.click(within(dialog()).getByRole('button', { name: 'Remove' }));
 		});
 		await waitFor(() =>
 			expect(m.claudePrimitiveRemove).toHaveBeenCalledWith('skill', 'groundwork', 'project:p1')
+		);
+	});
+
+	it('Move confirms first, says the source is deleted and becomes a standalone copy', async () => {
+		await mount();
+		fireEvent.click(item(openCell(LINT, 'project:p1'), /^Move here/));
+		const d = dialog();
+		expect(d.querySelector('[data-move-source]')?.textContent).toBe(`${HOME}/.claude/skills/lint`);
+		expect(d.textContent).toContain(`${P1_ROOT}/.claude/skills/lint`);
+		expect(d.textContent).toContain('deletes the source');
+		expect(d.textContent).toContain('standalone copy');
+		fireEvent.click(within(d).getByRole('button', { name: 'Cancel' }));
+		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+		noWrites();
+		fireEvent.click(item(openCell(LINT, 'project:p1'), /^Move here/));
+		await act(async () => {
+			fireEvent.click(within(dialog()).getByRole('button', { name: 'Move' }));
+		});
+		await waitFor(() =>
+			expect(m.claudePrimitiveMove).toHaveBeenCalledWith('skill', 'lint', 'workspace', 'project:p1')
 		);
 	});
 
@@ -383,7 +521,7 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		expect(dialog().textContent).toContain('/pkgs/tasks');
 		fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-		expect(m.pkgUninstall).not.toHaveBeenCalled();
+		noWrites();
 		fireEvent.click(item(openCell(TASKS, 'personal'), /^Remove from Personal/));
 		await act(async () => {
 			fireEvent.click(within(dialog()).getByRole('button', { name: 'Uninstall' }));
@@ -392,15 +530,17 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		expect(m.pkgUninstall).toHaveBeenCalledWith('com.ikenga.tasks');
 	});
 
-	it('Update personal (conflict popover): cancel calls nothing, confirm copies project over personal', async () => {
+	it('Update personal (conflict popover) names the personal FOLDER; cancel nothing; confirm copies project over personal', async () => {
 		await mount();
-		const menu = openCell(GW, 'personal');
-		fireEvent.click(item(menu, /^Update personal/));
+		fireEvent.click(item(openCell(GW, 'personal'), /^Update personal/));
 		const d = dialog();
-		expect(d.querySelector('[data-overwrite-path]')?.textContent).toBe('/home/.claude/skills/groundwork');
+		expect(d.querySelector('[data-overwrite-path]')?.textContent).toBe(`${HOME}/.claude/skills/groundwork`);
+		expect(d.textContent).toContain(`${P1_ROOT}/.claude/skills/groundwork`);
+		expect(d.textContent).not.toContain('SKILL.md');
+		expect(d.textContent).toContain('the store copy survives');
 		fireEvent.click(within(d).getByRole('button', { name: 'Cancel' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-		expect(m.claudePrimitiveCopy).not.toHaveBeenCalled();
+		noWrites();
 
 		fireEvent.click(screen.getByRole('button', { name: 'Update personal' }));
 		await act(async () => {
@@ -410,10 +550,23 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		expect(m.claudePrimitiveCopy).toHaveBeenCalledWith('skill', 'groundwork', 'project:p1', 'workspace');
 	});
 
+	it('Remove from Personal in the conflict popover confirms, then removes from workspace', async () => {
+		await mount();
+		fireEvent.click(item(openCell(GW, 'personal'), /^Remove from Personal/));
+		expect(dialog().querySelector('[data-remove-path]')?.textContent).toBe(`${HOME}/.claude/skills/groundwork`);
+		noWrites();
+		await act(async () => {
+			fireEvent.click(within(dialog()).getByRole('button', { name: 'Remove' }));
+		});
+		await waitFor(() =>
+			expect(m.claudePrimitiveRemove).toHaveBeenCalledWith('skill', 'groundwork', 'workspace')
+		);
+	});
+
 	it('Remove personal from the side note confirms, then removes from workspace', async () => {
 		await mount();
 		fireEvent.click(screen.getByRole('button', { name: 'Remove personal' }));
-		expect(m.claudePrimitiveRemove).not.toHaveBeenCalled();
+		noWrites();
 		await act(async () => {
 			fireEvent.click(within(dialog()).getByRole('button', { name: 'Remove' }));
 		});
@@ -424,25 +577,28 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 
 	it('Enable all asks first; cancel calls nothing; confirm enables each target', async () => {
 		await mount();
-		const btn = document.querySelector<HTMLButtonElement>('[data-enall="project:p2"]');
-		expect(btn).not.toBeNull();
-		fireEvent.click(btn as HTMLButtonElement);
-		const d = dialog();
-		expect(d.textContent).toContain('Enable all in ikenga');
-		fireEvent.click(within(d).getByRole('button', { name: 'Cancel' }));
+		const btn = document.querySelector<HTMLButtonElement>('[data-enall="project:p2"]') as HTMLButtonElement;
+		fireEvent.click(btn);
+		expect(dialog().textContent).toContain('Enable all in ikenga');
+		fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-		expect(m.claudePrimitiveEnable).not.toHaveBeenCalled();
+		noWrites();
 
-		fireEvent.click(btn as HTMLButtonElement);
+		fireEvent.click(btn);
 		await act(async () => {
 			fireEvent.click(within(dialog()).getByRole('button', { name: /^Enable \d+$/ }));
 		});
-		// Store-backed rows absent from p2: explore (agent) and groundwork (skill).
-		await waitFor(() =>
-			expect(m.claudePrimitiveEnable).toHaveBeenCalledWith('agent', 'explore', 'project:p2')
-		);
-		expect(m.claudePrimitiveEnable).toHaveBeenCalledWith('skill', 'groundwork', 'project:p2');
-		// lint is present in p2 (codex placement) — untouched. release is not store-backed.
-		expect(m.claudePrimitiveEnable).not.toHaveBeenCalledWith('command', 'release', 'project:p2');
+		await waitFor(() => expect(m.claudePrimitiveEnable).toHaveBeenCalledTimes(4));
+		for (const [k, n] of [
+			['agent', 'explore'],
+			['skill', 'groundwork'],
+			['agent', 'reviewer'],
+			['skill', 'deck'],
+		]) {
+			expect(m.claudePrimitiveEnable).toHaveBeenCalledWith(k, n, 'project:p2');
+		}
+		// lint is present in p2 (codex); release and notes are not in the store.
+		expect(m.claudePrimitiveEnable).not.toHaveBeenCalledWith('skill', 'lint', 'project:p2');
+		expect(P2_ROOT).toBeTruthy();
 	});
 });

@@ -309,6 +309,25 @@ export function NgwaHealthSurface({
 				.filter(([, h]) => h.ok)
 				.map(([k]) => k)
 		: [];
+	const failedSources: string[] = [];
+	if (snapshot) {
+		for (const [k, h] of Object.entries(snapshot.sources) as Array<[string, { ok: boolean }]>) {
+			if (!h.ok) failedSources.push(k);
+		}
+	}
+	if (violationsQ.isError) failedSources.push('permission audit');
+	if (installsQ.isError) failedSources.push('install records');
+	if (kernelQ.isError || (kernelQ.isSuccess && (sidecars.error || pkgCron.error))) {
+		failedSources.push('kernel registries');
+	}
+	if (agentOpsQ.isError) failedSources.push('agent-ops');
+	if (dbSize.isError) failedSources.push('SQLite file sizes');
+	if (orphansQ.isError) failedSources.push('orphan scan');
+	if (backupsQ.isError) failedSources.push('backups folder');
+	ENGINE_IDS.forEach((e, i) => {
+		if (probes[i]?.isError) failedSources.push(`engine probe (${e})`);
+	});
+	const auditOk = !error && snapshot !== null && failedSources.length === 0;
 	const ageMin = snapshot ? Math.max(0, Math.floor((now() - snapshot.as_of_ms) / 60_000)) : null;
 
 	const violationCount = violationsQ.isSuccess && installsQ.isSuccess ? violations.length + installs.length : null;
@@ -552,11 +571,12 @@ export function NgwaHealthSurface({
 							) : (
 								<>
 									<span className="t1" data-unsigned>
-										{unsigned.length} of {items.length} installed items came from unsigned manifests
+										{unsigned.length} of {items.length} installed items are unsigned
 									</span>
 									<span className="t2">
-										Unsigned means the manifest carries no signature and no approval is pending. The
-										registry index is signed; manifests inside it are not yet.
+										Unsigned means no signature and no approval pending. Skills, agents, commands and
+										hooks carry no manifest, so they can never be signed; pkgs are unsigned when their
+										manifest has no signature.
 									</span>
 								</>
 							)}
@@ -1007,10 +1027,16 @@ export function NgwaHealthSurface({
 				</section>
 
 				{/* ── Auditline ── */}
-				<div className="auditline" data-auditline>
-					<CheckCircle className="h-3.5 w-3.5 ok" />
+				<div className="auditline" data-auditline data-audit-state={auditOk ? 'ok' : 'degraded'}>
+					{auditOk ? (
+						<CheckCircle className="h-3.5 w-3.5 ok" />
+					) : (
+						<AlertTriangle className="h-3.5 w-3.5 herr" />
+					)}
 					<span>
-						{snapshot && ageMin !== null ? (
+						{error ? (
+							<span className="herr">Snapshot failed: {error.message}</span>
+						) : snapshot && ageMin !== null ? (
 							<>
 								Audited {ageMin === 0 ? 'less than a minute' : `${ageMin} min`} ago from{' '}
 								<span className="font-mono">ngwa_snapshot</span> ({snapshotSourcesOk.join(', ') || 'no source readable'})
@@ -1018,6 +1044,7 @@ export function NgwaHealthSurface({
 						) : (
 							<>Snapshot not read yet</>
 						)}
+						{failedSources.length > 0 && <> · could not read: {failedSources.join(', ')}</>}
 						{readSources.length > 0 && <> · also read: {readSources.join(', ')}</>}. Anything not
 						measured reads “—”.
 					</span>
