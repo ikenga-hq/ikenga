@@ -671,6 +671,71 @@ fn make_symlink(target: &Path, link: &Path) -> Result<(), String> {
     })
 }
 
+// ─── Clobber guard ────────────────────────────────────────────────────────────
+//
+// `make_symlink` and the `atomic_copy_*` helpers rename over whatever sits at
+// the destination. On Unix and on Windows that silently replaces a regular
+// file. So every write onto a scope path goes through this guard first, under
+// one rule, the same one `relink_one` already follows: **never overwrite a real
+// file or directory**.
+//
+// A symlink is treated differently from a real path. It holds no data of its
+// own, so replacing one loses nothing: the file it pointed at is untouched.
+// Placement therefore replaces a foreign or dangling symlink (with a warning),
+// matching the engine adapters' stale-link rule, and refuses a real path. The
+// one deliberate overwrite (copy/move with `overwrite: true`, used by the Ngwa
+// "Update personal" flow behind a confirm naming the path) is opt-in.
+
+/// What occupies a path we are about to write onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Occupant {
+    /// Nothing there.
+    Absent,
+    /// A symlink: store-backed, foreign or dangling. Replacing it loses no data.
+    Symlink,
+    /// A real file or directory: user data we must never silently replace.
+    Real,
+}
+
+/// Classify `path` **without following links**. `Path::exists` follows links,
+/// so it reports a dangling link as absent and a link to a real file as the
+/// real file; `symlink_metadata` reports the node itself.
+fn occupant(path: &Path) -> Result<Occupant, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Ok(Occupant::Symlink),
+        Ok(_) => Ok(Occupant::Real),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Occupant::Absent),
+        Err(e) => Err(format!("lstat {}: {e}", path.display())),
+    }
+}
+
+/// The refusal message for a real path in the way. It names the path and says
+/// what to do, so a caller can surface it to the user verbatim.
+fn clobber_refusal(path: &Path, verb: &str) -> String {
+    format!(
+        "refusing to {verb} {}: a real file or directory is already there, and it \
+         is not a store link. Move or remove it first; a real file is never \
+         overwritten silently.",
+        path.display()
+    )
+}
+
+/// Refuse a real occupant; allow an absent path or a symlink. Returns what was
+/// there so a caller can warn when it is about to replace a symlink.
+fn refuse_real_occupant(path: &Path, verb: &str) -> Result<Occupant, String> {
+    let occ = occupant(path)?;
+    if occ == Occupant::Real {
+        return Err(clobber_refusal(path, verb));
+    }
+    Ok(occ)
+}
+
+/// True when both files exist and hold identical bytes. Used to make
+/// copy-on-enable idempotent: re-enabling over an unchanged copy is a no-op.
+fn same_file_bytes(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 #[cfg(unix)]
 fn symlink_impl(target: &Path, link: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(target, link)
@@ -1195,6 +1260,15 @@ fn place_primitive(
             link_target: Some(target.to_string_lossy().to_string()),
         });
     }
+    // Clobber guard: never replace a real file or directory (a user's own
+    // hand-written agent or command, say). A symlink that isn't ours, foreign or
+    // dangling, holds no data and is replaced, with a warning.
+    if refuse_real_occupant(&link, "enable into")? == Occupant::Symlink {
+        tracing::warn!(
+            link = %link.display(),
+            "enable is replacing a non-store symlink (foreign or dangling); what it pointed at is untouched"
+        );
+    }
     make_symlink(&target, &link)?;
     Ok(ClaudeStoreMutation {
         kind: kind.as_str().to_string(),
@@ -1450,6 +1524,7 @@ fn copy_core(
     to_scope: &str,
     kind: Kind,
     name: &str,
+    overwrite: bool,
 ) -> Result<ClaudeStoreMutation, String> {
     let _ = from_scope;
     let src = scope_path_for(from_claude, kind, name)?;
@@ -1473,6 +1548,13 @@ fn copy_core(
     // copy (not a link that would dangle if the source scope is later cleaned).
     let resolved = std::fs::canonicalize(&src)
         .map_err(|e| format!("resolve source {}: {e}", src.display()))?;
+    // Clobber guard: a real file or directory at the destination is refused
+    // unless the caller explicitly asked to overwrite it. The Ngwa "Update
+    // personal" flow does, behind a confirm naming the path. A symlink there
+    // holds no data and is replaced.
+    if !overwrite {
+        refuse_real_occupant(&dst, "copy over")?;
+    }
     if kind.is_dir_primitive() {
         atomic_copy_dir(&resolved, &dst)?;
     } else {
@@ -1498,8 +1580,11 @@ fn move_core(
     to_scope: &str,
     kind: Kind,
     name: &str,
+    overwrite: bool,
 ) -> Result<ClaudeStoreMutation, String> {
-    let mutation = copy_core(from_claude, to_claude, from_scope, to_scope, kind, name)?;
+    // The copy leg carries the clobber guard. If it refuses, we return before
+    // touching the source, so a refused move loses nothing.
+    let mutation = copy_core(from_claude, to_claude, from_scope, to_scope, kind, name, overwrite)?;
     // Source removal is scope-local; never touches the store.
     let src = scope_path_for(from_claude, kind, name)?;
     remove_primitive(&src, kind)?;
@@ -1746,6 +1831,13 @@ fn enable_for_core(
         Mechanism::SymlinkDir => {
             // Idempotent: an existing store-backed link is a no-op.
             if !is_engine_enabled(&dest, store) {
+                // Clobber guard, as in `place_primitive`.
+                if refuse_real_occupant(&dest, "enable into")? == Occupant::Symlink {
+                    tracing::warn!(
+                        link = %dest.display(),
+                        "enable is replacing a non-store symlink (foreign or dangling); what it pointed at is untouched"
+                    );
+                }
                 make_symlink(&target_src, &dest)?;
             }
             Some(target_src.to_string_lossy().to_string())
@@ -1753,10 +1845,22 @@ fn enable_for_core(
         Mechanism::File => {
             // Copy-on-enable: a single standalone file the engine reads in place.
             // We resolve the store copy into real bytes at the destination.
-            if kind.is_dir_primitive() {
-                atomic_copy_dir(&target_src, &dest)?;
-            } else {
-                atomic_copy_file(&target_src, &dest)?;
+            //
+            // The destination is a real file by design, so the clobber guard here
+            // is content-aware: an identical copy is left alone (idempotent
+            // re-enable), and any other real file (a user's own, or a copy they
+            // edited) is refused rather than overwritten.
+            match occupant(&dest)? {
+                Occupant::Real
+                    if !kind.is_dir_primitive() && same_file_bytes(&target_src, &dest) => {}
+                Occupant::Real => return Err(clobber_refusal(&dest, "enable into")),
+                Occupant::Absent | Occupant::Symlink => {
+                    if kind.is_dir_primitive() {
+                        atomic_copy_dir(&target_src, &dest)?;
+                    } else {
+                        atomic_copy_file(&target_src, &dest)?;
+                    }
+                }
             }
             None
         }
@@ -1983,6 +2087,13 @@ fn write_transcoded_dest(
     dest: &Path,
     to_scope: &str,
 ) -> Result<ClaudeStoreMutation, StoreError> {
+    // Clobber guard: the cross-engine copy never overwrites a real file or
+    // directory at the destination. Each destination is its own row in the
+    // batch, so a refusal fails that row only.
+    refuse_real_occupant(dest, "copy over").map_err(|message| StoreError::Io {
+        path: dest.to_string_lossy().to_string(),
+        message,
+    })?;
     // Same-format → independent copy; cross-format → transcode. (Symlink-based
     // dedup was reverted after a data-loss incident — see the primitive-registry
     // plan; symlinks return there with provenance + dependent-aware deletes.)
@@ -2289,6 +2400,7 @@ pub async fn claude_primitive_copy(
     name: String,
     fromScope: String,
     toScope: String,
+    overwrite: Option<bool>,
 ) -> Result<ClaudeStoreMutation, String> {
     let k = Kind::parse(&kind)?;
     validate_name(&name)?;
@@ -2308,7 +2420,15 @@ pub async fn claude_primitive_copy(
     }
     let from_claude = resolve_scope_claude(&db, &fromScope).await?;
     let to_claude = resolve_scope_claude(&db, &toScope).await?;
-    copy_core(&from_claude, &to_claude, &fromScope, &toScope, k, &name)
+    copy_core(
+        &from_claude,
+        &to_claude,
+        &fromScope,
+        &toScope,
+        k,
+        &name,
+        overwrite.unwrap_or(false),
+    )
 }
 
 /// Move a primitive from one scope to another (copy-then-remove-source).
@@ -2320,6 +2440,7 @@ pub async fn claude_primitive_move(
     name: String,
     fromScope: String,
     toScope: String,
+    overwrite: Option<bool>,
 ) -> Result<ClaudeStoreMutation, String> {
     let k = Kind::parse(&kind)?;
     validate_name(&name)?;
@@ -2345,7 +2466,15 @@ pub async fn claude_primitive_move(
     }
     let from_claude = resolve_scope_claude(&db, &fromScope).await?;
     let to_claude = resolve_scope_claude(&db, &toScope).await?;
-    let mutation = move_core(&from_claude, &to_claude, &fromScope, &toScope, k, &name)?;
+    let mutation = move_core(
+        &from_claude,
+        &to_claude,
+        &fromScope,
+        &toScope,
+        k,
+        &name,
+        overwrite.unwrap_or(false),
+    )?;
     // WP-04: the primitive left `fromScope` and now lives in `toScope`; carry
     // any pin across rather than orphan it at the now-empty source scope.
     let pool = db.ensure_pool().await?;
@@ -3788,6 +3917,238 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    // ── Clobber guard: a real file or directory is never silently replaced ──
+    //
+    // Absent destination → placed: `enable_creates_symlink_into_store`.
+    // Existing store link → no-op: `enable_is_idempotent`.
+
+    /// Read a file back, for "left untouched" assertions.
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    fn is_symlink(p: &Path) -> bool {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
+    /// The case that motivated the guard: a user's own hand-written agent with
+    /// the same name as a store agent. Enable used to rename a symlink over it.
+    #[test]
+    fn enable_refuses_to_clobber_a_real_agent_file() {
+        let (base, store, scope) = fixture("clobber_agent");
+        seed_agent(&store, "a", "store copy");
+        let link = scope_path_for(&scope, Kind::Agent, "a").unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&link, "my own hand-written agent").unwrap();
+
+        let err = place_primitive(&store, &scope, "workspace", Kind::Agent, "a").unwrap_err();
+        assert!(err.contains("refusing to enable into"), "clear refusal: {err}");
+        assert!(err.contains(&link.display().to_string()), "names the path: {err}");
+        assert!(!is_symlink(&link), "the real file was not replaced by a link");
+        assert_eq!(read(&link), "my own hand-written agent", "bytes untouched");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Same guard for a dir-kind primitive: a real skill folder stays put, with
+    /// every file inside it.
+    #[test]
+    fn enable_refuses_to_clobber_a_real_skill_dir() {
+        let (base, store, scope) = fixture("clobber_skill");
+        seed_skill(&store, "s", "store copy");
+        let dir = scope_path_for(&scope, Kind::Skill, "s").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "mine").unwrap();
+        std::fs::write(dir.join("notes.txt"), "keep me").unwrap();
+
+        let err = place_primitive(&store, &scope, "workspace", Kind::Skill, "s").unwrap_err();
+        assert!(err.contains("refusing to enable into"), "{err}");
+        assert!(!is_symlink(&dir), "the real folder was not replaced by a link");
+        assert_eq!(read(&dir.join("SKILL.md")), "mine");
+        assert_eq!(read(&dir.join("notes.txt")), "keep me");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Decision: a symlink that isn't ours (it points outside the store) is
+    /// replaced. It holds no data, and the file it pointed at survives. This
+    /// matches the engine adapters' stale-link rule.
+    #[test]
+    fn enable_replaces_a_foreign_symlink_and_leaves_its_target() {
+        let (base, store, scope) = fixture("clobber_foreign");
+        seed_agent(&store, "a", "store copy");
+        let foreign = base.join("dotfiles").join("a.md");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, "theirs").unwrap();
+        let link = scope_path_for(&scope, Kind::Agent, "a").unwrap();
+        make_symlink(&foreign, &link).unwrap();
+
+        place_primitive(&store, &scope, "workspace", Kind::Agent, "a").unwrap();
+        assert!(is_enabled_in(&scope, &store, Kind::Agent, "a"), "now a store link");
+        assert_eq!(read(&foreign), "theirs", "the foreign target is untouched");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Decision: a dangling symlink is replaced too; there is nothing behind it.
+    #[test]
+    fn enable_replaces_a_dangling_symlink() {
+        let (base, store, scope) = fixture("clobber_dangling");
+        seed_agent(&store, "a", "store copy");
+        let link = scope_path_for(&scope, Kind::Agent, "a").unwrap();
+        make_symlink(&base.join("gone.md"), &link).unwrap();
+
+        place_primitive(&store, &scope, "workspace", Kind::Agent, "a").unwrap();
+        assert!(is_enabled_in(&scope, &store, Kind::Agent, "a"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn two_scopes(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = unique_tmp(tag);
+        let from = base.join("from").join(".claude");
+        let to = base.join("to").join(".claude");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        (base, from, to)
+    }
+
+    fn put_agent(scope: &Path, name: &str, body: &str) -> PathBuf {
+        let p = scope_path_for(scope, Kind::Agent, name).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn copy_refuses_a_real_destination_unless_asked_to_overwrite() {
+        let (base, from, to) = two_scopes("clobber_copy");
+        put_agent(&from, "a", "source");
+        let dst = put_agent(&to, "a", "mine");
+
+        let err = copy_core(&from, &to, "workspace", "project:p", Kind::Agent, "a", false)
+            .unwrap_err();
+        assert!(err.contains("refusing to copy over"), "{err}");
+        assert_eq!(read(&dst), "mine", "refused copy leaves the destination untouched");
+
+        // The deliberate overwrite (Ngwa "Update personal") is opt-in.
+        copy_core(&from, &to, "workspace", "project:p", Kind::Agent, "a", true).unwrap();
+        assert_eq!(read(&dst), "source", "overwrite: true replaces it");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A refused move must lose nothing: the copy leg refuses before the source
+    /// is removed.
+    #[test]
+    fn move_refused_by_a_real_destination_keeps_the_source() {
+        let (base, from, to) = two_scopes("clobber_move");
+        let src = put_agent(&from, "a", "source");
+        let dst = put_agent(&to, "a", "mine");
+
+        let err = move_core(&from, &to, "workspace", "project:p", Kind::Agent, "a", false)
+            .unwrap_err();
+        assert!(err.contains("refusing to copy over"), "{err}");
+        assert_eq!(read(&src), "source", "source kept");
+        assert_eq!(read(&dst), "mine", "destination untouched");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A symlink at the copy destination holds no data, so copy replaces it
+    /// without needing `overwrite`.
+    #[test]
+    fn copy_replaces_a_symlink_destination() {
+        let (base, from, to) = two_scopes("clobber_copy_link");
+        put_agent(&from, "a", "source");
+        let elsewhere = base.join("elsewhere.md");
+        std::fs::write(&elsewhere, "linked").unwrap();
+        let dst = scope_path_for(&to, Kind::Agent, "a").unwrap();
+        make_symlink(&elsewhere, &dst).unwrap();
+
+        copy_core(&from, &to, "workspace", "project:p", Kind::Agent, "a", false).unwrap();
+        assert!(!is_symlink(&dst), "destination is now a real copy");
+        assert_eq!(read(&dst), "source");
+        assert_eq!(read(&elsewhere), "linked", "the old link's target survives");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Copy-on-enable (Codex agents are `Mechanism::File`): an identical copy is
+    /// an idempotent no-op; a real file with other content, such as a user's own
+    /// file or a copy they edited, is refused and left untouched.
+    #[test]
+    fn codex_copy_on_enable_is_idempotent_but_never_clobbers() {
+        let (base, store, scope_root, home) = engine_fixture("clobber_cx");
+        seed_agent(&store, "planner", "a planner");
+        let enable = || {
+            enable_for_core(
+                EngineId::Codex,
+                &store,
+                &scope_root,
+                &home,
+                "workspace",
+                Kind::Agent,
+                "planner",
+            )
+        };
+
+        let dest = PathBuf::from(enable().unwrap().path);
+        enable().expect("re-enabling over an identical copy is a no-op");
+
+        std::fs::write(&dest, "edited by hand").unwrap();
+        let err = enable().unwrap_err();
+        assert!(err.contains("refusing to enable into"), "{err}");
+        assert_eq!(read(&dest), "edited by hand", "the edited copy is untouched");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `Mechanism::SymlinkDir` on another engine goes through the same guard.
+    #[test]
+    fn gemini_enable_refuses_to_clobber_a_real_agent_file() {
+        let (base, store, scope_root, home) = engine_fixture("clobber_gm");
+        seed_agent(&store, "planner", "a planner");
+        let dest = home.join(".gemini").join("agents").join("planner.md");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "mine").unwrap();
+
+        let err = enable_for_core(
+            EngineId::Gemini,
+            &store,
+            &scope_root,
+            &home,
+            "workspace",
+            Kind::Agent,
+            "planner",
+        )
+        .unwrap_err();
+        assert!(err.contains("refusing to enable into"), "{err}");
+        assert!(!is_symlink(&dest));
+        assert_eq!(read(&dest), "mine");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The cross-engine copy refuses a real destination too; the batch reports
+    /// it as that row's error.
+    #[test]
+    fn cross_engine_copy_refuses_a_real_destination() {
+        let (base, _store, scope_root, home) = engine_fixture("clobber_xe");
+        let src = seed_md_source(&base.join("src"), "planner.md", "planner", "Plan it.");
+        let dest = home.join(".gemini").join("agents").join("planner.md");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "mine").unwrap();
+
+        let err = copy_cross_engine_row(
+            EngineId::Claude,
+            EngineId::Gemini,
+            Kind::Agent,
+            "planner",
+            &src,
+            "workspace",
+            &scope_root,
+            &home,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("refusing to copy over"), "{err:?}");
+        assert_eq!(read(&dest), "mine");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn enable_missing_store_entry_errors() {
         let (base, store, scope) = fixture("missing");
@@ -3841,7 +4202,7 @@ mod tests {
         seed_agent(&store, "a", "x");
         place_primitive(&store, &from, "workspace", Kind::Agent, "a").unwrap();
 
-        let m = copy_core(&from, &to, "workspace", "project:p2", Kind::Agent, "a").unwrap();
+        let m = copy_core(&from, &to, "workspace", "project:p2", Kind::Agent, "a", false).unwrap();
         // Source link still present.
         let src_link = scope_path_for(&from, Kind::Agent, "a").unwrap();
         assert!(std::fs::symlink_metadata(&src_link)
@@ -3866,7 +4227,7 @@ mod tests {
         std::fs::create_dir_all(&to).unwrap();
         seed_skill(&store, "s", "x");
         place_primitive(&store, &from, "workspace", Kind::Skill, "s").unwrap();
-        let m = copy_core(&from, &to, "workspace", "project:p2", Kind::Skill, "s").unwrap();
+        let m = copy_core(&from, &to, "workspace", "project:p2", Kind::Skill, "s", false).unwrap();
         let dst = PathBuf::from(&m.path);
         assert!(!std::fs::symlink_metadata(&dst)
             .unwrap()
@@ -3889,7 +4250,7 @@ mod tests {
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, "---\nname: a\n---\nbody").unwrap();
 
-        let m = move_core(&from, &to, "workspace", "project:p2", Kind::Agent, "a").unwrap();
+        let m = move_core(&from, &to, "workspace", "project:p2", Kind::Agent, "a", false).unwrap();
         assert!(std::fs::symlink_metadata(&src).is_err(), "source removed");
         assert!(PathBuf::from(&m.path).is_file(), "dest present");
         // Store untouched (move is scope-local).
@@ -3929,7 +4290,7 @@ mod tests {
         place_primitive(&store, &from, "workspace", Kind::Agent, "a").unwrap();
         let rogue = base.join("rogue-dest");
         std::fs::create_dir_all(&rogue).unwrap();
-        let e = copy_core(&from, &rogue, "workspace", "x", Kind::Agent, "a").unwrap_err();
+        let e = copy_core(&from, &rogue, "workspace", "x", Kind::Agent, "a", false).unwrap_err();
         assert!(e.contains("outside .claude/store"), "copy dest: {e}");
         std::fs::remove_dir_all(&base).ok();
     }
