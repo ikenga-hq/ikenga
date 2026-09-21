@@ -1589,7 +1589,13 @@ export async function claudePrimitiveCopy(
 	kind: ClaudeStoreKind,
 	name: string,
 	fromScope: ClaudeStoreScope,
-	toScope: ClaudeStoreScope
+	toScope: ClaudeStoreScope,
+	/**
+	 * A real file or folder already at the destination is refused unless
+	 * `overwrite` is true. Only pass it after the user has confirmed that
+	 * exact path will be replaced.
+	 */
+	opts: { overwrite?: boolean } = {}
 ): Promise<ClaudeStoreMutation> {
 	if (NGWA_STORE_MOCK) {
 		const entry = ngwaMockFind(kind, name);
@@ -1602,6 +1608,7 @@ export async function claudePrimitiveCopy(
 		name,
 		fromScope,
 		toScope,
+		overwrite: opts.overwrite ?? false,
 	});
 }
 
@@ -1615,7 +1622,13 @@ export async function claudePrimitiveMove(
 	kind: ClaudeStoreKind,
 	name: string,
 	fromScope: ClaudeStoreScope,
-	toScope: ClaudeStoreScope
+	toScope: ClaudeStoreScope,
+	/**
+	 * A real file or folder already at the destination is refused unless
+	 * `overwrite` is true. Only pass it after the user has confirmed that
+	 * exact path will be replaced.
+	 */
+	opts: { overwrite?: boolean } = {}
 ): Promise<ClaudeStoreMutation> {
 	if (NGWA_STORE_MOCK) {
 		const entry = ngwaMockFind(kind, name);
@@ -1631,6 +1644,7 @@ export async function claudePrimitiveMove(
 		name,
 		fromScope,
 		toScope,
+		overwrite: opts.overwrite ?? false,
 	});
 }
 
