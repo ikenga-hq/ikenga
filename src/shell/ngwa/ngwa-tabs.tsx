@@ -37,29 +37,27 @@ export function NgwaTabs({ activeTab, installedCount }: NgwaTabsProps) {
 				<span className="k">2</span>
 			</Link>
 
-			<span
-				className="ntab opacity-50 cursor-not-allowed"
+			<Link
+				to="/ngwa/scopes"
+				className={`ntab ${activeTab === 'scopes' ? 'on' : ''}`}
 				role="tab"
-				aria-selected={false}
-				aria-disabled="true"
-				title="Scopes surface (coming in WP-16)"
+				aria-selected={activeTab === 'scopes'}
 			>
 				<Layers className="h-3.5 w-3.5" />
 				<span>Scopes</span>
 				<span className="k">3</span>
-			</span>
+			</Link>
 
-			<span
-				className="ntab opacity-50 cursor-not-allowed"
+			<Link
+				to="/ngwa/health"
+				className={`ntab ${activeTab === 'health' ? 'on' : ''}`}
 				role="tab"
-				aria-selected={false}
-				aria-disabled="true"
-				title="Health surface (coming in WP-16)"
+				aria-selected={activeTab === 'health'}
 			>
 				<HeartPulse className="h-3.5 w-3.5" />
 				<span>Health</span>
 				<span className="k">4</span>
-			</span>
+			</Link>
 
 			<span
 				className="ntab opacity-50 cursor-not-allowed"

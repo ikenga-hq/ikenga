@@ -1,8 +1,14 @@
-// Settings → Packages → Violations audit (ADR-017 / WP-08).
-// Lists recent pkg_permission_violations across all installed pkgs.
-import { createFileRoute } from '@tanstack/react-router';
-import { PkgViolationsAudit } from '@/components/pkg/v2/pkg-violations-audit';
+// Settings → Packages → Violations audit (DEC-16 / WP-16).
+// Folded under /ngwa/health?section=violations.
+
+import { createFileRoute, redirect } from '@tanstack/react-router';
 
 export const Route = createFileRoute('/settings/pkg-audit')({
-	component: PkgViolationsAudit,
+	beforeLoad: ({ location }) => {
+		throw redirect({
+			to: '/ngwa/health',
+			search: { section: 'violations' },
+			hash: location.hash,
+		});
+	},
 });
