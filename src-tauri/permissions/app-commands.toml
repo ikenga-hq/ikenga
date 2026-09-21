@@ -141,6 +141,7 @@ commands.allow = [
   "list_all_skill_actions",
   "list_claude_projects",
   "list_skill_actions",
+  "ngwa_snapshot",
   "oba_auto_update_all",
   "oba_backfill_registry",
   "oba_check_update",
