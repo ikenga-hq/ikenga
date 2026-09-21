@@ -171,7 +171,7 @@
 }
 
 .view-ngwa .chip.clear {
-	color: var(--on-danger);
+	color: var(--danger);
 	border-color: var(--danger-soft);
 }
 
@@ -255,10 +255,10 @@
 .view-ngwa .kind.k-app { color: var(--tint-project-fg, var(--info)); }
 .view-ngwa .kind.k-engine,
 .view-ngwa .kind.k-agent { color: var(--tint-chi-fg, var(--agent, var(--achievement))); }
-.view-ngwa .kind.k-tool { color: var(--on-achievement, var(--warning)); }
-.view-ngwa .kind.k-skill { color: var(--on-live, var(--success)); }
-.view-ngwa .kind.k-command { color: var(--on-info, var(--info)); }
-.view-ngwa .kind.k-hook { color: var(--on-danger, var(--danger)); }
+.view-ngwa .kind.k-tool { color: var(--warning); }
+.view-ngwa .kind.k-skill { color: var(--success); }
+.view-ngwa .kind.k-command { color: var(--info); }
+.view-ngwa .kind.k-hook { color: var(--danger); }
 .view-ngwa .kind.k-workflow { color: var(--primary); }
 .view-ngwa .kind.k-schedule { color: var(--fg-muted); }
 
@@ -635,7 +635,7 @@
 	background: var(--achievement-soft);
 	flex-wrap: wrap;
 	border-bottom: 1px solid var(--border-soft);
-	color: var(--on-achievement);
+	color: var(--achievement);
 	font-size: var(--text-micro);
 }
 
@@ -757,19 +757,19 @@
 }
 
 .view-ngwa .badge.t-unsigned {
-	color: var(--on-achievement);
+	color: var(--achievement);
 	background: var(--achievement-soft);
 	border-color: transparent;
 }
 
 .view-ngwa .badge.t-builtin {
-	color: var(--on-live);
+	color: var(--live);
 	background: var(--systemic-soft);
 	border-color: transparent;
 }
 
 .view-ngwa .badge.t-review {
-	color: var(--on-danger);
+	color: var(--danger);
 	background: var(--danger-soft);
 	border-color: transparent;
 }
@@ -809,7 +809,7 @@
 .view-ngwa .source-banner {
 	padding: var(--space-2) var(--space-3);
 	background: var(--danger-soft);
-	color: var(--on-danger);
+	color: var(--danger);
 	font-size: var(--text-caption);
 	border-bottom: 1px solid var(--danger);
 	display: flex;
@@ -943,7 +943,7 @@
 }
 
 .view-ngwa .cellbtn.conflict {
-	color: var(--on-danger);
+	color: var(--danger);
 	background: var(--danger-soft);
 }
 
@@ -1040,15 +1040,15 @@
 }
 
 .view-ngwa .panel > h3 .n.bad {
-	color: var(--on-danger);
+	color: var(--danger);
 }
 
 .view-ngwa .panel > h3 .n.ok {
-	color: var(--on-live);
+	color: var(--live);
 }
 
 .view-ngwa .panel > h3 .n.warn {
-	color: var(--on-achievement);
+	color: var(--achievement);
 }
 
 .view-ngwa .hrow {
@@ -1078,7 +1078,7 @@
 .view-ngwa .hrow .t1 code {
 	font-family: var(--font-mono);
 	font-size: var(--text-micro);
-	color: var(--on-achievement);
+	color: var(--achievement);
 }
 
 .view-ngwa .hrow .t2 {
@@ -1119,3 +1119,295 @@
 	margin-top: var(--space-1);
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════
+   WP-16a — matrix popover, confirm, status, health sub-lists (tokens only)
+   ══════════════════════════════════════════════════════════════════════════ */
+.view-ngwa .cellwrap {
+	position: relative;
+	width: 100%;
+}
+
+.view-ngwa .cellbtn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.view-ngwa .cellbtn.no {
+	opacity: 0.45;
+}
+
+.view-ngwa .cellbtn .cellver {
+	font-family: var(--font-mono);
+	font-size: 10px;
+	margin-left: 3px;
+}
+
+.view-ngwa .cellbtn:focus-visible {
+	outline: none;
+	box-shadow: inset 0 0 0 2px var(--primary);
+}
+
+.view-ngwa .mk-on {
+	color: var(--live);
+}
+
+.view-ngwa .mk-link {
+	color: var(--info);
+}
+
+.view-ngwa .mk-conflict {
+	color: var(--danger);
+}
+
+.view-ngwa table.matrix thead th.active .colname {
+	color: var(--primary);
+}
+
+.view-ngwa table.matrix thead th .enall {
+	height: 20px;
+	padding: 0 6px;
+	margin-top: 3px;
+}
+
+.view-ngwa .cellpop {
+	position: absolute;
+	top: 100%;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 20;
+	min-width: 180px;
+	margin-top: 2px;
+	padding: var(--space-1);
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	box-shadow: var(--shadow-2);
+	text-align: left;
+}
+
+.view-ngwa .cellpop .mgroup {
+	padding: var(--space-1) var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	border-bottom: 1px solid var(--border-soft);
+	margin-bottom: var(--space-1);
+}
+
+.view-ngwa .cellpop .mitem {
+	display: flex;
+	width: 100%;
+	align-items: baseline;
+	gap: var(--space-1);
+	padding: var(--space-1) var(--space-2);
+	font-size: var(--text-caption);
+	color: var(--fg);
+	background: transparent;
+	border: 0;
+	border-radius: var(--radius-sm);
+	cursor: pointer;
+	text-align: left;
+}
+
+.view-ngwa .cellpop .mitem:hover:not([disabled]),
+.view-ngwa .cellpop .mitem:focus-visible {
+	background: var(--bg-surface);
+	outline: none;
+}
+
+.view-ngwa .cellpop .mitem[disabled] {
+	color: var(--fg-faint);
+	cursor: not-allowed;
+}
+
+.view-ngwa .cellpop .mitem.danger:not([disabled]) {
+	color: var(--danger);
+}
+
+.view-ngwa .cellpop .msub {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .cellpop .msep {
+	height: 1px;
+	margin: var(--space-1) 0;
+	background: var(--border-soft);
+}
+
+.view-ngwa .mstatus {
+	flex: none;
+	padding: var(--space-1) var(--space-3);
+	font-size: var(--text-micro);
+	border-top: 1px solid var(--border-soft);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .mstatus.err,
+.view-ngwa .herr {
+	color: var(--danger);
+}
+
+.view-ngwa .sidenote .subhead {
+	margin: var(--space-3) 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-ngwa .sidenote .subhead.first {
+	margin-top: 0;
+}
+
+.view-ngwa .sidenote .snote {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	padding: var(--space-2);
+	background: var(--bg-raised);
+	border-radius: var(--radius-sm);
+}
+
+.view-ngwa .sidenote .snote.warn {
+	color: var(--warning);
+}
+
+.view-ngwa .sidenote .note {
+	margin-top: var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	line-height: 1.5;
+}
+
+.view-ngwa .conflictbox {
+	display: flex;
+	gap: var(--space-2);
+	padding: var(--space-2);
+	margin-bottom: var(--space-2);
+	border: 1px solid var(--danger-soft);
+	border-radius: var(--radius-md);
+	background: var(--bg-raised);
+	color: var(--danger);
+}
+
+.view-ngwa .conflictbox .txt {
+	color: var(--fg);
+	min-width: 0;
+}
+
+.view-ngwa .conflictbox .t1 {
+	display: block;
+	font-size: var(--text-caption);
+}
+
+.view-ngwa .conflictbox .t2 {
+	display: block;
+	margin-top: 2px;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	line-height: 1.45;
+}
+
+.view-ngwa .conflictbox .acts {
+	display: flex;
+	gap: var(--space-1);
+	margin-top: var(--space-2);
+}
+
+.view-ngwa .chip.danger:not([disabled]),
+[data-ngwa-confirm] .chip.danger:not([disabled]) {
+	color: var(--danger);
+	border-color: var(--danger);
+}
+
+[data-ngwa-confirm] .chip {
+	height: var(--btn-h-sm);
+	padding: 0 var(--space-3);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-surface);
+	color: var(--fg);
+	font-size: var(--text-caption);
+}
+
+[data-ngwa-confirm] .ngwa-confirm-body p + p {
+	margin-top: var(--space-2);
+}
+
+[data-ngwa-confirm] code {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	word-break: break-all;
+}
+
+.view-ngwa .panel:focus-visible {
+	outline: none;
+	box-shadow: 0 0 0 2px var(--primary);
+}
+
+.view-ngwa .hsub {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-1) var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	background: var(--bg-sunken);
+	border-bottom: 1px solid var(--border-soft);
+}
+
+.view-ngwa .hsub .rt {
+	margin-left: auto;
+	display: flex;
+	gap: var(--space-1);
+}
+
+.view-ngwa .hlist {
+	max-height: 280px;
+	overflow-y: auto;
+}
+
+.view-ngwa .hnote {
+	padding: var(--space-2) var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .tag {
+	display: inline-block;
+	padding: 0 5px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	font-family: var(--font-mono);
+	font-size: 10px;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-ngwa .tag.bad {
+	color: var(--danger);
+	border-color: var(--danger);
+}
+
+.view-ngwa .tag.info {
+	color: var(--info);
+	border-color: var(--info);
+}
+
+.view-ngwa .hlog {
+	margin: 0 var(--space-3) var(--space-2);
+	padding: var(--space-2);
+	max-height: 200px;
+	overflow: auto;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	white-space: pre-wrap;
+	background: var(--bg-sunken);
+	border-radius: var(--radius-sm);
+}
+
+.view-ngwa .auditline .ok {
+	color: var(--live);
+}

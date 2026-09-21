@@ -1,199 +1,100 @@
-// Ngwa Health Surface component tests (WP-16 / locked D-02).
+// Ngwa Health surface tests (WP-16a). The panels are covered route-level in
+// src/routes/ngwa/-health-route.test.tsx; this file holds the helpers and the
+// "one engine signal" check across both screens (must-fix 3).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
+import { cleanup, render, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { NgwaHealthSurface } from './ngwa-health-surface';
-import type { NgwaItem } from '@ikenga/contract';
-import * as tauriCmd from '@/lib/tauri-cmd';
+import { NgwaHealthSurface, fmtBytes, fmtTime, issueLabel } from './ngwa-health-surface';
+import { NgwaScopesSurface, type NgwaScopeActions } from './ngwa-scopes-surface';
+import { engineItems, mkItem, mkPlacement, mkSnapshot } from '@/routes/ngwa/-ngwa-test-fixtures';
 
-vi.mock('@/lib/tauri-cmd', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('@/lib/tauri-cmd')>();
+vi.mock('@/lib/tauri-cmd', async (orig) => {
+	const actual = await orig<typeof import('@/lib/tauri-cmd')>();
+	const never = () => new Promise(() => {});
 	return {
 		...actual,
-		pkgPermissionViolationsList: vi.fn().mockResolvedValue([]),
-		pkgHealthScan: vi.fn().mockResolvedValue([]),
-		dataHealthScan: vi.fn().mockResolvedValue([]),
+		pkgPermissionViolationsList: vi.fn(never),
+		pkgHealthScan: vi.fn(never),
+		pkgKernelStatus: vi.fn(never),
+		agentOpsListJobs: vi.fn(never),
+		backupList: vi.fn(never),
+		detectAgent: vi.fn(never),
 	};
 });
 
-afterEach(() => {
-	cleanup();
-	vi.clearAllMocks();
+afterEach(() => cleanup());
+
+const noop = () => Promise.resolve();
+const actions: NgwaScopeActions = {
+	enable: noop,
+	disable: noop,
+	copy: noop,
+	move: noop,
+	remove: noop,
+	enableFor: noop,
+	disableFor: noop,
+	pkgSetEnabled: noop,
+	pkgUninstall: noop,
+	openStore: () => {},
+};
+
+describe('health helpers', () => {
+	it('never turns an unmeasured value into a number', () => {
+		expect(fmtTime(null)).toBe('—');
+		expect(fmtBytes(null)).toBe('absent');
+		expect(fmtBytes(0)).toBe('0 B');
+	});
+	it('labels an orphan row by its table, not as a broken install', () => {
+		expect(issueLabel({ kind: 'orphan_row', table: 'pkg_settings' })).toBe('orphan: pkg_settings');
+		expect(issueLabel({ kind: 'manifest_missing' })).toBe('missing manifest');
+	});
 });
 
-function createTestQueryClient() {
-	return new QueryClient({
-		defaultOptions: {
-			queries: {
-				retry: false,
-			},
-		},
-	});
-}
-
-function makeItem(partial: Partial<NgwaItem>): NgwaItem {
-	const id = partial.id ?? 'test-item';
-	const name = partial.name ?? id;
-	return {
-		id,
-		kind: 'skill',
-		name,
-		display_name: partial.display_name ?? name,
-		description: 'A test equipment item',
-		version: '1.0.0',
-		latest_version: null,
-		scope: { kind: 'personal' },
-		origin: {
-			source: 'registry',
-			url: null,
-			ref: null,
-			resolved_version: '1.0.0',
-			publisher: null,
-			managed: true,
-			auto_update: false,
-			installed_at_ms: 1000,
-			updated_at_ms: 1000,
-		},
-		state: 'enabled',
-		runtime: null,
-		trust: {
-			state: 'auto_trusted',
-			signed: true,
-			auto_trusted: true,
-			review_pending: false,
-			perms: null,
-			last_granted_at_ms: null,
-		},
-		placements: [],
-		usage: null,
-		requires: [],
-		required_by: [],
-		owner_pkg_id: null,
-		install_path: '/path/to/item',
-		engines: ['claude'],
-		...partial,
-	};
-}
-
-describe('NgwaHealthSurface component (WP-16 / locked D-02)', () => {
-	it('renders all five consolidated health panels', () => {
-		const queryClient = createTestQueryClient();
-		const items: NgwaItem[] = [
-			makeItem({ id: 'app-studio', name: 'studio', kind: 'app', engines: ['claude'] }),
-			makeItem({ id: 'skill-groundwork', name: 'groundwork', kind: 'skill', engines: ['claude'] }),
-		];
-
-		const { container } = render(
-			<QueryClientProvider client={queryClient}>
-				<NgwaHealthSurface items={items} />
-			</QueryClientProvider>
-		);
-
-		// 1. Violations panel
-		expect(container.querySelector('[data-panel="violations"]')).not.toBeNull();
-
-		// 2. Sidecars panel
-		expect(container.querySelector('[data-panel="sidecars"]')).not.toBeNull();
-
-		// 3. Cron panel
-		expect(container.querySelector('[data-panel="cron"]')).not.toBeNull();
-
-		// 4. Data panel
-		expect(container.querySelector('[data-panel="data"]')).not.toBeNull();
-
-		// 5. Engines panel
-		expect(container.querySelector('[data-panel="engines"]')).not.toBeNull();
-	});
-
-	it('surfaces permission violations when reported by backend', async () => {
-		const queryClient = createTestQueryClient();
-		vi.mocked(tauriCmd.pkgPermissionViolationsList).mockResolvedValueOnce([
-			{
-				id: 1,
-				pkg_id: 'com.malicious.tool',
-				scope_kind: 'fs_write_outside_sandbox',
-				attempted: '/etc/hosts',
-				declared: '~/.claude/**',
-				occurred_at: 1726000000000,
-			},
-		]);
-
-		const items: NgwaItem[] = [];
-
-		render(
-			<QueryClientProvider client={queryClient}>
-				<NgwaHealthSurface items={items} />
-			</QueryClientProvider>
-		);
-
-		await waitFor(() => {
-			expect(screen.getByText(/com\.malicious\.tool/)).not.toBeNull();
-			expect(screen.getByText(/\/etc\/hosts/)).not.toBeNull();
+describe('one engine signal for both screens', () => {
+	for (const installed of [
+		['claude'] as const,
+		['claude', 'gemini'] as const,
+		['claude', 'codex', 'gemini'] as const,
+	]) {
+		it(`agrees for engine pkgs: ${installed.join(', ')}`, async () => {
+			// codex placements exist even when the codex engine pkg does not.
+			const items = [
+				...engineItems([...installed]),
+				mkItem({
+					id: 'skill:personal:s',
+					kind: 'skill',
+					name: 's',
+					placements: [
+						mkPlacement({ path: '/c/s' }),
+						mkPlacement({ engine: 'codex', path: '/x/s' }),
+						mkPlacement({ engine: 'gemini', path: '/g/s' }),
+					],
+				}),
+			];
+			const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			const { container } = render(
+				<QueryClientProvider client={qc}>
+					<NgwaScopesSurface
+						items={items}
+						scopes={[{ key: 'personal', label: 'Personal', sub: '~/.claude', active: false }]}
+						actions={actions}
+					/>
+					<NgwaHealthSurface
+						items={items}
+						snapshot={mkSnapshot(items)}
+						onOpenBackup={() => {}}
+						onOpenStore={() => {}}
+					/>
+				</QueryClientProvider>
+			);
+			const cols = [...container.querySelectorAll('thead th.eng')].map((th) => th.getAttribute('data-col'));
+			const healthInstalled = ['claude', 'codex', 'gemini'].filter(
+				(e) => !container.querySelector(`[data-engine="${e}"] [data-act="installengine"]`)
+			);
+			expect(cols).toEqual([...installed].sort((a, b) => ['claude', 'codex', 'gemini'].indexOf(a) - ['claude', 'codex', 'gemini'].indexOf(b)));
+			await waitFor(() => expect(healthInstalled).toEqual(cols));
+			expect(container.querySelector('[data-enginen]')?.textContent).toBe(`${installed.length} of 3`);
 		});
-	});
-
-	it('measures database size when button is clicked in Data panel', async () => {
-		const queryClient = createTestQueryClient();
-		const items: NgwaItem[] = [];
-
-		render(
-			<QueryClientProvider client={queryClient}>
-				<NgwaHealthSurface items={items} />
-			</QueryClientProvider>
-		);
-
-		const measureBtn = screen.getByRole('button', { name: /^measure$/i });
-		fireEvent.click(measureBtn);
-
-		await waitFor(() => {
-			expect(screen.getByText(/2\.4 MB \(SQLite WAL\)/)).not.toBeNull();
-		});
-	});
-
-	it('scans dangling soft-FKs on demand when clicked', async () => {
-		const queryClient = createTestQueryClient();
-		vi.mocked(tauriCmd.dataHealthScan).mockResolvedValueOnce([
-			{
-				table: 'chat_messages',
-				column: 'session_id',
-				parent_table: 'sessions',
-				orphan_count: 3,
-				sample_ids: ['msg-1', 'msg-2', 'msg-3'],
-			},
-		]);
-
-		const items: NgwaItem[] = [];
-
-		render(
-			<QueryClientProvider client={queryClient}>
-				<NgwaHealthSurface items={items} />
-			</QueryClientProvider>
-		);
-
-		const scanBtn = screen.getByRole('button', { name: /^scan$/i });
-		fireEvent.click(scanBtn);
-
-		await waitFor(() => {
-			expect(tauriCmd.dataHealthScan).toHaveBeenCalled();
-			expect(screen.getByText('3')).not.toBeNull();
-		});
-	});
-
-	it('supports install engine action from Engines panel', () => {
-		const queryClient = createTestQueryClient();
-		const onInstallEngine = vi.fn();
-		const items: NgwaItem[] = [];
-
-		render(
-			<QueryClientProvider client={queryClient}>
-				<NgwaHealthSurface items={items} onInstallEngine={onInstallEngine} />
-			</QueryClientProvider>
-		);
-
-		const installGeminiBtn = screen.getByRole('button', { name: /install engine/i });
-		fireEvent.click(installGeminiBtn);
-
-		expect(onInstallEngine).toHaveBeenCalledWith('gemini');
-	});
+	}
 });

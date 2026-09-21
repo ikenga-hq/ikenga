@@ -136,6 +136,9 @@ use commands::{
 #[cfg(feature = "desktop")]
 #[cfg(debug_assertions)]
 use commands::{bg_spike_reply, bg_spike_run, new_bg_spike_state};
+// DEC-32 (WP-16a): read-only database file sizes for Ngwa → Health.
+#[cfg(feature = "desktop")]
+use commands::data_health_db_size;
 #[cfg(feature = "desktop")]
 use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
@@ -1112,8 +1115,9 @@ pub fn run() {
             // db
             db_query,
             db_exec,
-            // data health (orphan audit)
+            // data health (orphan audit + DEC-32 db size)
             data_health_scan,
+            data_health_db_size,
             // iyke
             iyke_endpoint,
             iyke_set_shell,
