@@ -5,7 +5,9 @@
 //! and emits events over `transcript://{session_id}` bus.
 
 pub mod parser;
+pub mod usage;
 pub mod watcher;
 
 pub use parser::{parse_line, TranscriptRecord};
+pub use usage::{scan_and_mirror_transcripts, UsageSnapshot};
 pub use watcher::{read_new_records, watch_transcript_session};
