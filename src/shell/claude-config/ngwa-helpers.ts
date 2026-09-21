@@ -43,7 +43,7 @@ export const statusOf = (e: { status?: KindStatus }): KindStatus => e.status ?? 
 export type ItemState = 'enabled' | 'disabled' | 'local' | 'orphaned' | 'linked';
 export type ItemMech = 'link' | 'merge';
 
-export interface NgwaItem {
+export interface EngineConfigItem {
 	id: string;
 	storeKind: ClaudeStoreKind;
 	uiKind: NgwaKindId;
@@ -118,8 +118,8 @@ export function buildItems(
 	config: ClaudeConfig,
 	store: ClaudeStoreEntry[],
 	projects: Project[]
-): NgwaItem[] {
-	const out: NgwaItem[] = [];
+): EngineConfigItem[] {
+	const out: EngineConfigItem[] = [];
 	const storeByKey = new Map<string, ClaudeStoreEntry>();
 	for (const e of store) storeByKey.set(`${e.kind}:${e.name}`, e);
 	const seen = new Map<string, number>();
@@ -134,7 +134,7 @@ export function buildItems(
 		mech: ItemMech,
 		meta: { isSymlink: boolean; inStore: boolean },
 		overriddenBy: string | null,
-		raw: NgwaItem['raw']
+		raw: EngineConfigItem['raw']
 	) => {
 		const scopeKey = scopeKeyOf(scope, projectRoot, projects);
 		const storeEntry = storeByKey.get(`${storeKind}:${name}`) ?? null;
@@ -240,7 +240,7 @@ export interface NgwaSystemSummary {
 	kindCounts: (active: ReadonlySet<NgwaSystemId>) => Record<NgwaKindId, number>;
 }
 
-export function summarizeSystems(items: NgwaItem[]): NgwaSystemSummary {
+export function summarizeSystems(items: EngineConfigItem[]): NgwaSystemSummary {
 	const engineCounts = { claude: 0, gemini: 0, codex: 0 } as Record<NgwaSystemId, number>;
 	for (const it of items) engineCounts[it.system] = (engineCounts[it.system] ?? 0) + 1;
 	const present = ENGINE_ORDER.filter((e) => engineCounts[e] > 0);
@@ -260,7 +260,7 @@ export function summarizeSystems(items: NgwaItem[]): NgwaSystemSummary {
 	return { present, engineCounts, kindCounts };
 }
 
-export function siblingSystemsOf(item: NgwaItem | null, items: NgwaItem[]): NgwaSystemId[] {
+export function siblingSystemsOf(item: EngineConfigItem | null, items: EngineConfigItem[]): NgwaSystemId[] {
 	if (!item) return [];
 	const others = new Set<NgwaSystemId>();
 	for (const x of items) {

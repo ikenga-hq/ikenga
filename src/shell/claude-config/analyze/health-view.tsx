@@ -1,5 +1,5 @@
 // Inventory & health (Phase 4 · D-03 "Health" view) — the Ngwa Analyze
-// `surface=health` roll-up. Tallies the scan (`items: NgwaItem[]`) by
+// `surface=health` roll-up. Tallies the scan (`items: EngineConfigItem[]`) by
 // kind × scope, lifecycle state, and mechanism, plus store utilization from the
 // catalog (`store`). Rides the current scan; no Rust change. Per-view filters:
 // scope (select) + kind (pills).
@@ -10,10 +10,10 @@
 import { useMemo, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import type { ClaudeStoreEntry, ClaudeStoreKind, ClaudeStoreScope } from '@/lib/tauri-cmd';
-import type { ItemState, NgwaItem } from '../ngwa-surface';
+import type { ItemState, EngineConfigItem } from '../ngwa-surface';
 
 interface HealthViewProps {
-	items: NgwaItem[];
+	items: EngineConfigItem[];
 	store: ClaudeStoreEntry[];
 	/** Sidebar scope — informational; the view carries its own scope select. */
 	scope: string;

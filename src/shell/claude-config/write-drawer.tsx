@@ -35,7 +35,7 @@ import {
 	type NgwaTranscodeMode,
 } from '@/lib/queries/claude-config';
 
-import { ENGINE_META, ENGINE_ORDER, type NgwaItem, type NgwaSystemId } from './ngwa-surface';
+import { ENGINE_META, ENGINE_ORDER, type EngineConfigItem, type NgwaSystemId } from './ngwa-surface';
 import { EngineGlyph } from './engine-glyph';
 
 // ─── Directionality matrix (06-cross-engine-transcode.md) ────────────────────
@@ -122,7 +122,7 @@ interface DestRow {
  *  (separate rows would write the same symlink twice). Agents/commands keep
  *  distinct per-engine paths → one row each. Mode is resolved per the matrix. */
 function buildDestinations(
-	item: NgwaItem,
+	item: EngineConfigItem,
 	present: readonly NgwaSystemId[],
 	projectScopes: Array<{ key: ClaudeStoreScope; label: string }>
 ): DestRow[] {
@@ -185,7 +185,7 @@ function buildDestinations(
 // `prompt` (commands) triple-quoted block. This is a UI preview only — the
 // authoritative transcode runs in `transcoder.rs` (WP-24); we never write here.
 
-function sourceBodyOf(item: NgwaItem): { frontmatter: Record<string, unknown>; body: string } {
+function sourceBodyOf(item: EngineConfigItem): { frontmatter: Record<string, unknown>; body: string } {
 	if (item.storeKind === 'agent') {
 		const a = item.raw as ClaudeAgent;
 		return { frontmatter: a.frontmatter ?? {}, body: a.body ?? '' };
@@ -208,7 +208,7 @@ function tomlValue(v: unknown): string {
 	return JSON.stringify(String(v));
 }
 
-function renderTranscodePreview(item: NgwaItem): { srcText: string; dstLines: React.ReactNode[] } {
+function renderTranscodePreview(item: EngineConfigItem): { srcText: string; dstLines: React.ReactNode[] } {
 	const { frontmatter, body } = sourceBodyOf(item);
 	const promptKey = item.storeKind === 'command' ? 'prompt' : 'system_prompt';
 	const fmEntries = Object.entries(frontmatter);
@@ -248,7 +248,7 @@ export function WriteTranscodeDrawer({
 	projectScopes,
 	onClose,
 }: {
-	item: NgwaItem;
+	item: EngineConfigItem;
 	present: readonly NgwaSystemId[];
 	projectScopes: Array<{ key: ClaudeStoreScope; label: string }>;
 	onClose: () => void;

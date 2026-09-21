@@ -1,0 +1,818 @@
+/* Ngwa Equipment View (WP-15 / locked D-02 frame-workbench-v4.html)
+   Tokens only — no literal colours.
+   Scoped under .view-ngwa to prevent collisions with the shell frame.
+*/
+
+.view-ngwa {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg-base);
+	color: var(--fg);
+	font-family: var(--font-sans);
+}
+
+.view-ngwa .sc {
+	overflow-y: auto;
+	overflow-x: hidden;
+}
+
+/* Ngwa Tab Bar (installed · store · scopes · health · create) */
+.view-ngwa .ntabs {
+	height: 32px;
+	flex: none;
+	display: flex;
+	align-items: stretch;
+	background: var(--bg-surface);
+	border-bottom: 1px solid var(--border);
+	overflow: hidden;
+}
+
+.view-ngwa .ntab {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	color: var(--fg-muted);
+	font-size: var(--text-caption);
+	border-right: 1px solid var(--border-soft);
+	white-space: nowrap;
+	transition: color var(--motion-fast) var(--ease-calm);
+	cursor: pointer;
+	background: transparent;
+	border-top: none;
+	border-bottom: none;
+	border-left: none;
+}
+
+.view-ngwa .ntab:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-ngwa .ntab:active {
+	background: var(--bg-sunken);
+}
+
+.view-ngwa .ntab .k {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .ntab.on {
+	background: var(--bg-base);
+	color: var(--fg);
+	font-weight: 500;
+	box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+.view-ngwa .ntab .cnt {
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-pill);
+	padding: 0 5px;
+}
+
+.view-ngwa .ntabs .far {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+/* Surfaces */
+.view-ngwa .surface {
+	flex: 1;
+	min-height: 0;
+	display: none;
+	flex-direction: column;
+}
+
+.view-ngwa .surface.on {
+	display: flex;
+}
+
+/* Facet Bar */
+.view-ngwa .facetbar {
+	flex: none;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+}
+
+.view-ngwa .frow2 {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .flabel {
+	font-size: var(--text-micro);
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+	font-weight: 600;
+	width: 46px;
+	flex: none;
+}
+
+.view-ngwa .chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	height: 22px;
+	padding: 0 var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-pill);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	background: var(--bg-surface);
+	white-space: nowrap;
+	transition: background var(--motion-fast) var(--ease-calm), color var(--motion-fast) var(--ease-calm);
+	cursor: pointer;
+}
+
+.view-ngwa .chip:hover:not([disabled]) {
+	background: var(--bg-raised);
+	color: var(--fg);
+	border-color: var(--border-strong);
+}
+
+.view-ngwa .chip.on {
+	background: var(--primary-soft);
+	border-color: var(--primary);
+	color: var(--fg);
+}
+
+.view-ngwa .chip .n {
+	color: var(--fg-muted);
+	font-family: var(--font-mono);
+	font-size: 10px;
+}
+
+.view-ngwa .chip[disabled] {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.view-ngwa .chip[hidden] {
+	display: none;
+}
+
+.view-ngwa .chip.clear {
+	color: var(--on-danger);
+	border-color: var(--danger-soft);
+}
+
+.view-ngwa .chip.clear:hover {
+	background: var(--danger-soft);
+	color: var(--fg);
+	border-color: var(--danger);
+}
+
+.view-ngwa .chip.disclose .caret {
+	transition: transform var(--motion-fast) var(--ease-calm);
+}
+
+.view-ngwa .chip.disclose[aria-expanded='true'] .caret {
+	transform: rotate(90deg);
+}
+
+.view-ngwa .morefilters {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+	padding: var(--space-1) 0;
+}
+
+.view-ngwa .search {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	height: 24px;
+	flex: 1;
+	min-width: 120px;
+	padding: 0 var(--space-2);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .search input {
+	flex: 1;
+	min-width: 0;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	background: transparent;
+	border: none;
+	outline: none;
+}
+
+.view-ngwa .search input::placeholder {
+	color: var(--fg-muted);
+}
+
+.view-ngwa .toolsep {
+	width: 1px;
+	height: 16px;
+	background: var(--border);
+}
+
+.view-ngwa .empty {
+	padding: var(--space-6) var(--space-4);
+	color: var(--fg-muted);
+	font-size: var(--text-caption);
+	max-width: 62ch;
+	line-height: var(--lead-body);
+}
+
+/* Kind Badges */
+.view-ngwa .kind {
+	font-size: 10px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+	flex: none;
+}
+
+.view-ngwa .kind.k-app { color: var(--tint-project-fg, var(--info)); }
+.view-ngwa .kind.k-engine,
+.view-ngwa .kind.k-agent { color: var(--tint-chi-fg, var(--agent, var(--achievement))); }
+.view-ngwa .kind.k-tool { color: var(--on-achievement, var(--warning)); }
+.view-ngwa .kind.k-skill { color: var(--on-live, var(--success)); }
+.view-ngwa .kind.k-command { color: var(--on-info, var(--info)); }
+.view-ngwa .kind.k-hook { color: var(--on-danger, var(--danger)); }
+.view-ngwa .kind.k-workflow { color: var(--primary); }
+.view-ngwa .kind.k-schedule { color: var(--fg-muted); }
+
+.view-ngwa .meta {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	white-space: nowrap;
+}
+
+.view-ngwa .meta.mono {
+	font-family: var(--font-mono);
+}
+
+/* Engine dots */
+.view-ngwa .dots {
+	display: inline-flex;
+	gap: 3px;
+	align-items: center;
+	flex: none;
+}
+
+.view-ngwa .dots i {
+	width: 6px;
+	height: 6px;
+	border-radius: var(--radius-pill);
+	display: block;
+	background: var(--border-strong);
+}
+
+.view-ngwa .dots i.on {
+	background: var(--systemic, var(--primary));
+}
+
+.view-ngwa .grpchip {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-pill);
+	padding: 0 6px;
+	white-space: nowrap;
+}
+
+/* Split Column Layout */
+.view-ngwa .split {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+}
+
+.view-ngwa .listcol {
+	flex: 1 1 0;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+.view-ngwa .detailcol {
+	width: 42%;
+	min-width: 300px;
+	flex: none;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	border-left: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+
+.view-ngwa .lhead {
+	height: 24px;
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	padding: 0 var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-micro);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-ngwa .lhead .c-usage {
+	margin-left: auto;
+	width: 96px;
+	text-align: right;
+}
+
+.view-ngwa .lhead .c-state {
+	width: 78px;
+}
+
+/* Item Rows */
+.view-ngwa .irow {
+	height: 30px;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	width: 100%;
+	padding: 0 var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-body);
+	color: var(--fg);
+	text-align: left;
+	background: transparent;
+	border-top: none;
+	border-left: none;
+	border-right: none;
+	cursor: pointer;
+}
+
+.view-ngwa .irow:hover {
+	background: var(--bg-surface);
+}
+
+.view-ngwa .irow.sel {
+	background: var(--primary-soft);
+	box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.view-ngwa .irow .nm {
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.view-ngwa .irow.child {
+	height: 26px;
+	padding-left: var(--space-8);
+	color: var(--fg-muted);
+	box-shadow: inset 2px 0 0 var(--border-strong);
+}
+
+.view-ngwa .irow.child .nm {
+	font-weight: 400;
+}
+
+.view-ngwa .irow.child.promoted {
+	padding-left: var(--space-3);
+	box-shadow: none;
+	color: var(--fg);
+}
+
+.view-ngwa .irow.off .nm,
+.view-ngwa .irow.off .kind {
+	opacity: 0.55;
+}
+
+.view-ngwa .irow .tail {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	flex: none;
+}
+
+.view-ngwa .irow .c-usage {
+	width: 96px;
+	text-align: right;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .irow .c-state {
+	width: 78px;
+}
+
+/* Detail Pane */
+.view-ngwa .dhead {
+	flex: none;
+	padding: var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+}
+
+.view-ngwa .dtitle {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .dtitle h2 {
+	font-size: var(--text-h3);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin: 0;
+}
+
+.view-ngwa .dtitle .v {
+	font-family: var(--font-mono);
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .dsub {
+	margin-top: var(--space-2);
+	display: flex;
+	gap: var(--space-3);
+	flex-wrap: wrap;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .dsub b {
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.view-ngwa .dacts {
+	margin-top: var(--space-3);
+	display: flex;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .dtabs {
+	flex: none;
+	display: flex;
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-base);
+	overflow: hidden;
+}
+
+.view-ngwa .dtab {
+	height: 28px;
+	padding: 0 var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	border-right: 1px solid var(--border-soft);
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	white-space: nowrap;
+	background: transparent;
+	border-top: none;
+	border-bottom: none;
+	border-left: none;
+	cursor: pointer;
+}
+
+.view-ngwa .dtab:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-ngwa .dtab.on {
+	background: var(--bg-surface);
+	color: var(--fg);
+	box-shadow: inset 0 -2px 0 var(--primary);
+}
+
+.view-ngwa .dbody {
+	flex: 1;
+	min-height: 0;
+	padding: var(--space-3);
+}
+
+/* Detail Preview / Markdown */
+.view-ngwa .fm {
+	background: var(--bg-sunken);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: var(--space-2);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	line-height: 1.5;
+	color: var(--fg-muted);
+	white-space: pre-wrap;
+	margin-bottom: var(--space-3);
+}
+
+.view-ngwa .fm .key {
+	color: var(--primary);
+}
+
+.view-ngwa .fm .dim {
+	color: var(--fg-muted);
+}
+
+.view-ngwa .md h1 {
+	font-family: var(--font-display);
+	font-size: var(--text-h3);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin-bottom: var(--space-2);
+}
+
+.view-ngwa .md p {
+	font-size: var(--text-body);
+	line-height: var(--lead-body);
+	color: var(--fg-muted);
+	margin-bottom: var(--space-2);
+	max-width: 70ch;
+}
+
+.view-ngwa .drow {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 28px;
+	padding: var(--space-1) 0;
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-caption);
+}
+
+.view-ngwa .drow:last-child {
+	border-bottom: 0;
+}
+
+.view-ngwa .drow .k2 {
+	width: 132px;
+	flex: none;
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .drow .val {
+	color: var(--fg);
+	min-width: 0;
+}
+
+.view-ngwa .drow .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: none;
+}
+
+/* Tree in Files Tab */
+.view-ngwa .tree {
+	font-family: var(--font-mono);
+	font-size: var(--text-caption);
+	line-height: 1.7;
+}
+
+.view-ngwa .tree .t {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	color: var(--fg-muted);
+	padding: 1px var(--space-1);
+	border-radius: var(--radius-xs);
+}
+
+.view-ngwa .tree .t .f {
+	color: var(--fg);
+}
+
+.view-ngwa .tree .t .c {
+	margin-left: auto;
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .tree .t:hover {
+	background: var(--bg-raised);
+}
+
+.view-ngwa .tree .t.dir {
+	cursor: pointer;
+}
+
+/* Store Surface */
+.view-ngwa .updates {
+	flex: none;
+	min-height: 32px;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	background: var(--achievement-soft);
+	flex-wrap: wrap;
+	border-bottom: 1px solid var(--border-soft);
+	color: var(--on-achievement);
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .updates .who {
+	color: var(--fg-muted);
+	font-family: var(--font-mono);
+}
+
+.view-ngwa .updates .rt {
+	margin-left: auto;
+	display: flex;
+	gap: var(--space-2);
+	padding: 4px 0;
+}
+
+.view-ngwa .srow {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-3);
+	width: 100%;
+	text-align: left;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: transparent;
+	border-top: none;
+	border-left: none;
+	border-right: none;
+	cursor: pointer;
+}
+
+.view-ngwa .srow:hover {
+	background: var(--bg-surface);
+}
+
+.view-ngwa .srow.sel {
+	background: var(--primary-soft);
+	box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.view-ngwa .srow .mark {
+	width: 28px;
+	height: 28px;
+	flex: none;
+	display: grid;
+	place-items: center;
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	background: var(--bg-raised);
+	color: var(--fg-muted);
+	margin-top: 2px;
+}
+
+.view-ngwa .srow .mid {
+	flex: 1;
+	min-width: 0;
+	display: block;
+}
+
+.view-ngwa .srow .l1 {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .srow .pkg {
+	font-family: var(--font-mono);
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.view-ngwa .srow .l2 {
+	display: block;
+	margin-top: 2px;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.view-ngwa .srow .l3 {
+	display: flex;
+	margin-top: 3px;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .tagp {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-xs);
+	padding: 0 5px;
+	background: var(--bg-base);
+}
+
+.view-ngwa .srow .rt {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 4px;
+}
+
+/* Badges & Status */
+.view-ngwa .badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 19px;
+	padding: 0 var(--space-2);
+	border-radius: var(--radius-pill);
+	font-size: var(--text-micro);
+	font-weight: 500;
+	border: 1px solid var(--border);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .badge.t-unsigned {
+	color: var(--on-achievement);
+	background: var(--achievement-soft);
+	border-color: transparent;
+}
+
+.view-ngwa .badge.t-builtin {
+	color: var(--on-live);
+	background: var(--systemic-soft);
+	border-color: transparent;
+}
+
+.view-ngwa .badge.t-review {
+	color: var(--on-danger);
+	background: var(--danger-soft);
+	border-color: transparent;
+}
+
+.view-ngwa .state {
+	font-size: var(--text-micro);
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--fg-muted);
+}
+
+.view-ngwa .state::before {
+	content: '';
+	width: 6px;
+	height: 6px;
+	border-radius: var(--radius-pill);
+	background: var(--live);
+	display: block;
+	flex: none;
+}
+
+.view-ngwa .state.s-disabled::before {
+	background: var(--fg-faint);
+}
+
+.view-ngwa .state.s-update::before {
+	background: var(--achievement);
+}
+
+.view-ngwa .state.s-broken::before,
+.view-ngwa .state.s-orphaned::before {
+	background: var(--danger);
+}
+
+/* Unreadable source banner */
+.view-ngwa .source-banner {
+	padding: var(--space-2) var(--space-3);
+	background: var(--danger-soft);
+	color: var(--on-danger);
+	font-size: var(--text-caption);
+	border-bottom: 1px solid var(--danger);
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
