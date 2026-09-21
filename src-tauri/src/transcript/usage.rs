@@ -1,7 +1,7 @@
 //! Transcript JSONL usage mirror (WP-14 / DEC-24, reworked by WP-14a / DEC-27).
 //!
 //! Walks `~/.claude/projects/**.jsonl`, extracts per-item usage facts from
-//! assistant records, and mirrors them into SQLite (migration 0064) so the
+//! assistant records, and mirrors them into SQLite (migrations 0064, 0065) so the
 //! aggregates outlive Claude Code's own 30-day eviction of the source files.
 //!
 //! ## What a "use" is (DEC-27)
@@ -24,6 +24,24 @@
 //! (input + output + cache-creation + cache-read). Claude Code writes one
 //! record per content block and repeats the message's `usage` on each, so
 //! turns are keyed by message id and upserted with `MAX()`.
+//!
+//! ## Resumed and forked sessions (DEC-29, migration 0065)
+//!
+//! Resuming a session copies its history into a new file under a new
+//! `sessionId`; the copied assistant records keep their `message.id` and
+//! timestamps. Every attribution this module counts sits on an `assistant`
+//! record carrying a `message.id` (the fallback keys, `requestId` and `uuid`,
+//! are copied unchanged too), so a message id identifies a copy.
+//!
+//! A session counts an item only through messages it **owns**. Of the sessions
+//! holding a message id, the owner is the one with the earliest start — the
+//! earliest record timestamp its files show — ties broken by the smallest
+//! session key. Ownership depends on every file, and files are scanned
+//! incrementally in no fixed order, so the scan stores *holdings*
+//! (`ngwa_usage_messages`) and *starts* (`ngwa_usage_session_starts`) and
+//! [`resolve_owned_sessions`] decides ownership when the mirror is loaded. The
+//! result therefore does not depend on scan order. Token accounting is
+//! per-message already and is unchanged.
 //!
 //! ## Incremental scan (F-4 / F-8)
 //!
@@ -180,34 +198,63 @@ fn non_empty(v: Option<&serde_json::Value>) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// What one JSONL line contributes: the session it dates (for the session's
+/// start, DEC-29) and the usage facts it carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordFacts {
+    /// `(session_key, timestamp_ms)` for any record, of any type, with a
+    /// parseable timestamp and a session key.
+    pub dated: Option<(String, i64)>,
+    pub facts: Vec<UsageFact>,
+}
+
 /// Extract the usage facts one JSONL line carries. Non-assistant records,
 /// malformed JSON, and records without a parseable timestamp, session key or
 /// message id yield nothing.
 pub fn extract_facts(line: &str, ctx: &FileContext) -> Vec<UsageFact> {
+    extract_record(line, ctx).facts
+}
+
+/// Parse one JSONL line once, returning both its date (every record type) and
+/// its usage facts (assistant records only).
+pub fn extract_record(line: &str, ctx: &FileContext) -> RecordFacts {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return RecordFacts::default();
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return Vec::new();
+        return RecordFacts::default();
     };
-    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return Vec::new();
-    }
     let Some(timestamp_ms) = v
         .get("timestamp")
         .and_then(|t| t.as_str())
         .and_then(parse_timestamp_ms)
     else {
-        return Vec::new();
+        return RecordFacts::default();
     };
     let session_key = match &ctx.subagent {
         Some(s) => s.agent_id.clone(),
         None => match non_empty(v.get("sessionId")) {
             Some(s) => s.to_string(),
-            None => return Vec::new(),
+            None => return RecordFacts::default(),
         },
     };
+    let dated = Some((session_key.clone(), timestamp_ms));
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return RecordFacts { dated, facts: Vec::new() };
+    }
+    RecordFacts {
+        dated,
+        facts: assistant_facts(&v, ctx, session_key, timestamp_ms),
+    }
+}
+
+fn assistant_facts(
+    v: &serde_json::Value,
+    ctx: &FileContext,
+    session_key: String,
+    timestamp_ms: i64,
+) -> Vec<UsageFact> {
     let msg = v.get("message");
     let Some(message_id) = non_empty(msg.and_then(|m| m.get("id")))
         .or_else(|| non_empty(v.get("requestId")))
@@ -296,14 +343,23 @@ pub struct Watermark {
     pub head_hash: String,
 }
 
-/// Aggregated session row produced by one file read.
+/// One attributed message a session holds (DEC-29): whether it *counts* for
+/// the session is decided at aggregation time, by [`resolve_owned_sessions`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRow {
+pub struct MessageRow {
     pub kind: UsageKind,
     pub name: String,
     pub session_key: String,
-    pub first_used_ms: i64,
-    pub last_used_ms: i64,
+    pub message_id: String,
+    /// Latest timestamp among the message's records.
+    pub timestamp_ms: i64,
+}
+
+/// The earliest record timestamp one file read shows for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStart {
+    pub session_key: String,
+    pub start_ms: i64,
 }
 
 /// Aggregated turn row produced by one file read.
@@ -328,7 +384,8 @@ pub struct FileScan {
     pub head_hash: String,
     /// The file shrank or was rewritten: delete its old contributions first.
     pub reset: bool,
-    pub sessions: Vec<SessionRow>,
+    pub messages: Vec<MessageRow>,
+    pub starts: Vec<SessionStart>,
     pub turns: Vec<TurnRow>,
     /// A read error stopped the scan early; the watermark stays at the last
     /// good line so the rest is retried next time.
@@ -393,7 +450,8 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
     let ctx = file_context(path);
     let mut offset = start;
     let mut read_error: Option<String> = None;
-    let mut sessions: HashMap<(UsageKind, String, String), (i64, i64)> = HashMap::new();
+    let mut messages: HashMap<(UsageKind, String, String, String), i64> = HashMap::new();
+    let mut starts: HashMap<String, i64> = HashMap::new();
     let mut turns: HashMap<(UsageKind, String, String), (String, i64, i64)> = HashMap::new();
 
     let open = File::open(path).and_then(|mut f| {
@@ -416,12 +474,21 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
                         }
                         offset += n as u64;
                         let line = String::from_utf8_lossy(&buf);
-                        for f in extract_facts(&line, &ctx) {
-                            let s = sessions
-                                .entry((f.kind, f.name.clone(), f.session_key.clone()))
-                                .or_insert((f.timestamp_ms, f.timestamp_ms));
-                            s.0 = s.0.min(f.timestamp_ms);
-                            s.1 = s.1.max(f.timestamp_ms);
+                        let rec = extract_record(&line, &ctx);
+                        if let Some((sk, ts)) = rec.dated {
+                            let s = starts.entry(sk).or_insert(ts);
+                            *s = (*s).min(ts);
+                        }
+                        for f in rec.facts {
+                            let m = messages
+                                .entry((
+                                    f.kind,
+                                    f.name.clone(),
+                                    f.session_key.clone(),
+                                    f.message_id.clone(),
+                                ))
+                                .or_insert(f.timestamp_ms);
+                            *m = (*m).max(f.timestamp_ms);
                             let t = turns
                                 .entry((f.kind, f.name, f.message_id))
                                 .or_insert((f.session_key, f.timestamp_ms, f.tokens));
@@ -448,7 +515,8 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
             head_len: wm.map(|w| w.head_len).unwrap_or(0),
             head_hash: wm.map(|w| w.head_hash.clone()).unwrap_or_default(),
             reset: false,
-            sessions: Vec::new(),
+            messages: Vec::new(),
+            starts: Vec::new(),
             turns: Vec::new(),
             read_error,
             commit: false,
@@ -464,19 +532,25 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
         }
     };
 
-    let mut sessions: Vec<SessionRow> = sessions
+    let mut messages: Vec<MessageRow> = messages
         .into_iter()
-        .map(|((kind, name, session_key), (first, last))| SessionRow {
+        .map(|((kind, name, session_key, message_id), ts)| MessageRow {
             kind,
             name,
             session_key,
-            first_used_ms: first,
-            last_used_ms: last,
+            message_id,
+            timestamp_ms: ts,
         })
         .collect();
-    sessions.sort_by(|a, b| {
-        (a.kind, &a.name, &a.session_key).cmp(&(b.kind, &b.name, &b.session_key))
+    messages.sort_by(|a, b| {
+        (a.kind, &a.name, &a.session_key, &a.message_id)
+            .cmp(&(b.kind, &b.name, &b.session_key, &b.message_id))
     });
+    let mut starts: Vec<SessionStart> = starts
+        .into_iter()
+        .map(|(session_key, start_ms)| SessionStart { session_key, start_ms })
+        .collect();
+    starts.sort_by(|a, b| a.session_key.cmp(&b.session_key));
     let mut turns: Vec<TurnRow> = turns
         .into_iter()
         .map(|((kind, name, message_id), (session_key, ts, tokens))| TurnRow {
@@ -497,7 +571,8 @@ pub fn scan_file(path: &Path, wm: Option<&Watermark>) -> Option<FileScan> {
         head_len,
         head_hash,
         reset,
-        sessions,
+        messages,
+        starts,
         turns,
         read_error,
         commit: true,
@@ -540,7 +615,8 @@ pub struct ScanReport {
     pub files_seen: usize,
     pub files_read: usize,
     pub files_reset: usize,
-    pub session_rows: usize,
+    pub message_rows: usize,
+    pub start_rows: usize,
     pub turn_rows: usize,
     pub read_errors: Vec<String>,
 }
@@ -587,32 +663,47 @@ async fn load_watermarks(pool: &SqlitePool) -> Result<HashMap<String, Watermark>
 pub async fn commit_file_scan(pool: &SqlitePool, scan: &FileScan, now: i64) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     if scan.reset {
-        sqlx::query("DELETE FROM ngwa_usage_sessions WHERE source_path = ?")
-            .bind(&scan.path)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        for table in ["ngwa_usage_messages", "ngwa_usage_session_starts"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE source_path = ?"))
+                .bind(&scan.path)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         sqlx::query("DELETE FROM ngwa_usage_turns WHERE source_path = ?")
             .bind(&scan.path)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
     }
-    for s in &scan.sessions {
+    for m in &scan.messages {
         sqlx::query(
-            r#"INSERT INTO ngwa_usage_sessions
-                 (kind, name, session_key, first_used_ms, last_used_ms, source_path)
+            r#"INSERT INTO ngwa_usage_messages
+                 (kind, name, session_key, message_id, timestamp_ms, source_path)
                VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(kind, name, session_key) DO UPDATE SET
-                 first_used_ms = MIN(first_used_ms, excluded.first_used_ms),
-                 last_used_ms  = MAX(last_used_ms, excluded.last_used_ms)"#,
+               ON CONFLICT(kind, name, session_key, message_id) DO UPDATE SET
+                 timestamp_ms = MAX(timestamp_ms, excluded.timestamp_ms)"#,
         )
-        .bind(s.kind.as_str())
-        .bind(&s.name)
-        .bind(&s.session_key)
-        .bind(s.first_used_ms)
-        .bind(s.last_used_ms)
+        .bind(m.kind.as_str())
+        .bind(&m.name)
+        .bind(&m.session_key)
+        .bind(&m.message_id)
+        .bind(m.timestamp_ms)
         .bind(&scan.path)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    for st in &scan.starts {
+        sqlx::query(
+            r#"INSERT INTO ngwa_usage_session_starts (session_key, source_path, start_ms)
+               VALUES (?, ?, ?)
+               ON CONFLICT(session_key, source_path) DO UPDATE SET
+                 start_ms = MIN(start_ms, excluded.start_ms)"#,
+        )
+        .bind(&st.session_key)
+        .bind(&scan.path)
+        .bind(st.start_ms)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -703,7 +794,8 @@ pub async fn scan_and_mirror_transcripts(
         if scan.reset {
             report.files_reset += 1;
         }
-        report.session_rows += scan.sessions.len();
+        report.message_rows += scan.messages.len();
+        report.start_rows += scan.starts.len();
         report.turn_rows += scan.turns.len();
     }
     Ok(report)
@@ -851,15 +943,98 @@ impl UsageSnapshot {
     }
 }
 
-/// Load the mirror into a [`UsageSnapshot`].
-pub async fn load_usage_snapshot(pool: &SqlitePool, now_ms: i64) -> Result<UsageSnapshot, String> {
-    let d30 = now_ms - 30 * DAY_MS;
-    let raw_sessions: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT kind, name, session_key, last_used_ms FROM ngwa_usage_sessions",
+/// DEC-29: the session that owns each message, among those holding it.
+///
+/// `holdings` are `(message_id, session_key)` pairs; `starts` maps a session
+/// to its start. The owner is the holder with the earliest start, ties broken
+/// by the smallest session key. A holder with no recorded start sorts last
+/// (it cannot happen for a scanned file: every fact is itself dated). The
+/// answer depends only on the set of holdings, never on their order.
+pub fn message_owners<'a>(
+    holdings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    starts: &HashMap<String, i64>,
+) -> HashMap<&'a str, &'a str> {
+    let start = |sk: &str| starts.get(sk).copied().unwrap_or(i64::MAX);
+    let mut owners: HashMap<&'a str, &'a str> = HashMap::new();
+    for (mid, sk) in holdings {
+        match owners.get(mid) {
+            Some(cur) if (start(cur), *cur) <= (start(sk), sk) => {}
+            _ => {
+                owners.insert(mid, sk);
+            }
+        }
+    }
+    owners
+}
+
+/// DEC-29: collapse message-level holdings into the session rows a
+/// [`UsageSnapshot`] counts, keeping only messages each session **owns**.
+/// Returns `(kind, name, session_key, last_used_ms)`, sorted.
+pub fn resolve_owned_sessions(
+    messages: &[MessageRow],
+    starts: &HashMap<String, i64>,
+) -> Vec<(UsageKind, String, String, i64)> {
+    let owners = message_owners(
+        messages
+            .iter()
+            .map(|m| (m.message_id.as_str(), m.session_key.as_str())),
+        starts,
+    );
+    let mut sessions: HashMap<(UsageKind, &str, &str), i64> = HashMap::new();
+    for m in messages {
+        if owners.get(m.message_id.as_str()) != Some(&m.session_key.as_str()) {
+            continue;
+        }
+        let e = sessions
+            .entry((m.kind, m.name.as_str(), m.session_key.as_str()))
+            .or_insert(m.timestamp_ms);
+        *e = (*e).max(m.timestamp_ms);
+    }
+    let mut out: Vec<(UsageKind, String, String, i64)> = sessions
+        .into_iter()
+        .map(|((k, n, s), last)| (k, n.to_string(), s.to_string(), last))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The mirror's session rows after ownership (DEC-29) is resolved across
+/// every file scanned so far: `(kind, name, session_key, last_used_ms)`.
+pub async fn load_owned_sessions(
+    pool: &SqlitePool,
+) -> Result<Vec<(UsageKind, String, String, i64)>, String> {
+    let raw_messages: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT kind, name, session_key, message_id, timestamp_ms FROM ngwa_usage_messages",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("load usage sessions: {e}"))?;
+    .map_err(|e| format!("load usage messages: {e}"))?;
+    let raw_starts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT session_key, MIN(start_ms) FROM ngwa_usage_session_starts GROUP BY session_key",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("load session starts: {e}"))?;
+    let messages: Vec<MessageRow> = raw_messages
+        .into_iter()
+        .filter_map(|(k, name, session_key, message_id, timestamp_ms)| {
+            UsageKind::parse(&k).map(|kind| MessageRow {
+                kind,
+                name,
+                session_key,
+                message_id,
+                timestamp_ms,
+            })
+        })
+        .collect();
+    let starts: HashMap<String, i64> = raw_starts.into_iter().collect();
+    Ok(resolve_owned_sessions(&messages, &starts))
+}
+
+/// Load the mirror into a [`UsageSnapshot`].
+pub async fn load_usage_snapshot(pool: &SqlitePool, now_ms: i64) -> Result<UsageSnapshot, String> {
+    let d30 = now_ms - 30 * DAY_MS;
+    let sessions = load_owned_sessions(pool).await?;
     let raw_tokens: Vec<(String, String, i64)> = sqlx::query_as(
         r#"SELECT kind, name, SUM(tokens) FROM ngwa_usage_turns
            WHERE timestamp_ms >= ? AND kind <> 'mcp_server' GROUP BY kind, name"#,
@@ -877,15 +1052,11 @@ pub async fn load_usage_snapshot(pool: &SqlitePool, now_ms: i64) -> Result<Usage
     .await
     .map_err(|e| format!("load mcp usage tokens: {e}"))?;
     let min_first: Option<i64> =
-        sqlx::query_scalar("SELECT MIN(first_used_ms) FROM ngwa_usage_sessions")
+        sqlx::query_scalar("SELECT MIN(timestamp_ms) FROM ngwa_usage_messages")
             .fetch_one(pool)
             .await
             .map_err(|e| format!("load usage window: {e}"))?;
 
-    let sessions = raw_sessions
-        .into_iter()
-        .filter_map(|(k, n, s, l)| UsageKind::parse(&k).map(|k| (k, n, s, l)))
-        .collect();
     let tokens = raw_tokens
         .into_iter()
         .filter_map(|(k, n, t)| UsageKind::parse(&k).map(|k| (k, n, t)))
@@ -901,6 +1072,107 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Shared test fixtures: a synthetic resumed-session pair shaped like the real
+/// one (`8f46768f…` → `e94d16cb…`, DEC-29). Used here and by the 0065
+/// migration test in `db.rs`.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::path::{Path, PathBuf};
+
+    /// Parent session key. Deliberately sorts *after* the child's, so the tie
+    /// break cannot be what picks the parent: only the earlier start can.
+    pub const PARENT: &str = "p-zzz-parent";
+    pub const CHILD: &str = "c-aaa-child";
+
+    /// A `queue-operation` record, which opens a real main transcript. A
+    /// resume does not copy these, so they are what gives a parent its
+    /// earlier start (on the real pair: 21:52:10.852 and 21:52:11.172, before
+    /// the copied opening prompt).
+    pub fn queue_op(session: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"{ts}","sessionId":"{session}"}}"#
+        )
+    }
+
+    pub fn user(session: &str, uuid: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"user","sessionId":"{session}","uuid":"{uuid}","timestamp":"{ts}","message":{{"role":"user","content":"hi"}}}}"#
+        )
+    }
+
+    /// An assistant record. `skill` sets `attributionSkill`; `content` is the
+    /// raw JSON of the content blocks.
+    pub fn assistant(session: &str, uuid: &str, msg_id: &str, ts: &str, skill: Option<&str>, content: &str) -> String {
+        let attr = skill
+            .map(|s| format!(r#","attributionSkill":"{s}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"type":"assistant","sessionId":"{session}","uuid":"{uuid}","requestId":"req-{msg_id}","timestamp":"{ts}"{attr},"message":{{"id":"{msg_id}","usage":{{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"content":[{content}]}}}}"#
+        )
+    }
+
+    pub const SKILL_X_CALL: &str = r#"{"type":"tool_use","name":"Skill","input":{"skill":"skill-x"}}"#;
+    pub const MCP_CALL: &str = r#"{"type":"tool_use","name":"mcp__iyke__iyke_state","input":{}}"#;
+
+    /// Timestamp of the parent's uncopied leading `queue-operation`.
+    pub const PARENT_QUEUE_TS: &str = "2026-09-20T10:00:00.000Z";
+    /// Timestamp of the opening prompt, which a resume copies unchanged.
+    pub const OPENING_TS: &str = "2026-09-20T10:00:02.000Z";
+
+    /// The copyable history, keyed to `session` with uuids prefixed `pfx`. A
+    /// resume copies all of it, opening prompt included, with the original
+    /// timestamps; only the `sessionId` and (in this fixture) the uuids change.
+    fn history(session: &str, pfx: &str) -> Vec<String> {
+        let mut v = Vec::new();
+        v.push(user(session, &format!("{pfx}-u1"), OPENING_TS));
+        v.push(assistant(session, &format!("{pfx}-a1"), "msg-1", "2026-09-20T10:00:05.000Z", None, SKILL_X_CALL));
+        v.push(assistant(session, &format!("{pfx}-a2"), "msg-2", "2026-09-20T10:00:06.000Z", Some("skill-x"), MCP_CALL));
+        v.push(assistant(session, &format!("{pfx}-a3"), "msg-2", "2026-09-20T10:00:06.500Z", Some("skill-x"), ""));
+        v
+    }
+
+    /// Write the pair under `root/proj/`. Session A (parent) uses `skill-x` and
+    /// the `iyke` MCP server. Session B (child) is a copy of A's history - new
+    /// `sessionId` and uuids, same `message.id`s and timestamps - that then
+    /// uses only `skill-y` in its own messages, plus `skill-x` again when
+    /// `child_reuses_x`. Returns `(parent_path, child_path)`.
+    pub fn write_fork_pair(root: &Path, child_reuses_x: bool) -> (PathBuf, PathBuf) {
+        write_fork_pair_with(root, child_reuses_x, false)
+    }
+
+    /// As [`write_fork_pair`]. With `parent_continues`, the parent keeps
+    /// writing after the child's last record (its own `skill-z` use at
+    /// 12:00), so the parent both starts *and* ends outside the child: a rule
+    /// keyed on the latest record rather than the earliest would pick the
+    /// child as owner of the inherited history.
+    pub fn write_fork_pair_with(
+        root: &Path,
+        child_reuses_x: bool,
+        parent_continues: bool,
+    ) -> (PathBuf, PathBuf) {
+        let dir = root.join("proj");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Only the parent has the leading queue-operation: it is not copied.
+        let mut parent = vec![queue_op(PARENT, PARENT_QUEUE_TS)];
+        parent.extend(history(PARENT, "p"));
+        if parent_continues {
+            parent.push(user(PARENT, "p-u20", "2026-09-20T12:00:00.000Z"));
+            parent.push(assistant(PARENT, "p-a20", "msg-20", "2026-09-20T12:00:05.000Z", Some("skill-z"), ""));
+        }
+        let mut child = history(CHILD, "c");
+        child.push(user(CHILD, "c-u9", "2026-09-20T11:00:00.000Z"));
+        child.push(assistant(CHILD, "c-a9", "msg-9", "2026-09-20T11:00:05.000Z", Some("skill-y"), ""));
+        if child_reuses_x {
+            child.push(assistant(CHILD, "c-a10", "msg-10", "2026-09-20T11:30:00.000Z", Some("skill-x"), ""));
+        }
+        let p = dir.join(format!("{PARENT}.jsonl"));
+        let c = dir.join(format!("{CHILD}.jsonl"));
+        std::fs::write(&p, format!("{}\n", parent.join("\n"))).expect("write parent");
+        std::fs::write(&c, format!("{}\n", child.join("\n"))).expect("write child");
+        (p, c)
+    }
 }
 
 #[cfg(test)]
@@ -926,31 +1198,47 @@ mod tests {
         (tmp, pool)
     }
 
-    async fn count_sessions(pool: &SqlitePool, kind: &str, name: &str) -> i64 {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ngwa_usage_sessions WHERE kind = ? AND name = ?",
-        )
-        .bind(kind)
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .expect("count")
+    /// Sessions counting `(kind, name)` after DEC-29 ownership is resolved.
+    async fn owned_sessions(pool: &SqlitePool, kind: &str, name: &str) -> Vec<String> {
+        load_owned_sessions(pool)
+            .await
+            .expect("owned sessions")
+            .into_iter()
+            .filter(|(k, n, _, _)| k.as_str() == kind && n == name)
+            .map(|(_, _, s, _)| s)
+            .collect()
     }
 
-    async fn table_dump(pool: &SqlitePool) -> (Vec<(String, String, String, i64, i64)>, Vec<(String, String, String, i64)>) {
+    async fn count_sessions(pool: &SqlitePool, kind: &str, name: &str) -> i64 {
+        owned_sessions(pool, kind, name).await.len() as i64
+    }
+
+    type Dump = (
+        Vec<(String, String, String, String, i64)>,
+        Vec<(String, i64)>,
+        Vec<(String, String, String, i64)>,
+    );
+
+    async fn table_dump(pool: &SqlitePool) -> Dump {
         let s = sqlx::query_as(
-            "SELECT kind, name, session_key, first_used_ms, last_used_ms FROM ngwa_usage_sessions ORDER BY kind, name, session_key",
+            "SELECT kind, name, session_key, message_id, timestamp_ms FROM ngwa_usage_messages ORDER BY kind, name, session_key, message_id",
         )
         .fetch_all(pool)
         .await
-        .expect("sessions");
+        .expect("messages");
+        let st = sqlx::query_as(
+            "SELECT session_key, start_ms FROM ngwa_usage_session_starts ORDER BY session_key, source_path",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("starts");
         let t = sqlx::query_as(
             "SELECT kind, name, message_id, tokens FROM ngwa_usage_turns ORDER BY kind, name, message_id",
         )
         .fetch_all(pool)
         .await
         .expect("turns");
-        (s, t)
+        (s, st, t)
     }
 
     #[test]
@@ -1206,6 +1494,192 @@ mod tests {
         assert!(scan_and_mirror_transcripts(&pool, &missing).await.is_err());
     }
 
+    // ── DEC-29: resumed / forked sessions ──────────────────────────────────
+
+    use super::fixtures::{self, CHILD, PARENT};
+
+    async fn scan_in_order(pool: &SqlitePool, files: &[&Path]) {
+        for f in files {
+            let scan = scan_file(f, None).expect("scan");
+            commit_file_scan(pool, &scan, 0).await.expect("commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_counts_inherited_history_once() {
+        let (_db, pool) = temp_pool().await;
+        let corpus = tempfile::tempdir().expect("corpus");
+        fixtures::write_fork_pair(corpus.path(), false);
+        scan_and_mirror_transcripts(&pool, corpus.path()).await.expect("scan");
+
+        // The parent's earlier start comes only from its uncopied leading
+        // queue-operation; the copied opening prompt has the same timestamp in
+        // both files, as on the real pair.
+        let starts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT session_key, start_ms FROM ngwa_usage_session_starts ORDER BY session_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("starts");
+        assert_eq!(
+            starts,
+            vec![
+                (CHILD.to_string(), parse_timestamp_ms(fixtures::OPENING_TS).unwrap()),
+                (PARENT.to_string(), parse_timestamp_ms(fixtures::PARENT_QUEUE_TS).unwrap()),
+            ]
+        );
+
+        // Both files hold skill-x, but only the parent owns those messages.
+        assert_eq!(owned_sessions(&pool, "skill", "skill-x").await, vec![PARENT.to_string()]);
+        assert_eq!(owned_sessions(&pool, "skill", "skill-y").await, vec![CHILD.to_string()]);
+        assert_eq!(owned_sessions(&pool, "mcp_server", "iyke").await, vec![PARENT.to_string()]);
+        // The holdings really are shared: the pre-fix rule would count two.
+        let holders: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT session_key) FROM ngwa_usage_messages WHERE kind='skill' AND name='skill-x'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("holders");
+        assert_eq!(holders, 2);
+
+        // Tokens stay per-message: msg-2 counted once, not once per copy.
+        let now = parse_timestamp_ms("2026-09-21T00:00:00Z").unwrap();
+        let snap = load_usage_snapshot(&pool, now).await.expect("snapshot");
+        let x = snap.for_primitive(UsageKind::Skill, "skill-x").expect("measured");
+        assert_eq!((x.count_7d, x.count_30d, x.tokens_30d), (1, 1, 30));
+        assert_eq!(x.last_used_ms, parse_timestamp_ms("2026-09-20T10:00:06.500Z"));
+        let y = snap.for_primitive(UsageKind::Skill, "skill-y").expect("measured");
+        assert_eq!(y.count_30d, 1);
+    }
+
+    #[tokio::test]
+    async fn fork_counts_do_not_depend_on_scan_order() {
+        let corpus = tempfile::tempdir().expect("corpus");
+        let (parent, child) = fixtures::write_fork_pair(corpus.path(), false);
+
+        let (_a, parent_first) = temp_pool().await;
+        scan_in_order(&parent_first, &[&parent, &child]).await;
+
+        let (_b, child_first) = temp_pool().await;
+        scan_in_order(&child_first, &[&child]).await;
+        // Child alone: it is the only holder, so it owns the copy for now.
+        assert_eq!(owned_sessions(&child_first, "skill", "skill-x").await, vec![CHILD.to_string()]);
+        scan_in_order(&child_first, &[&parent]).await;
+        // The parent arriving later takes the messages over.
+        assert_eq!(owned_sessions(&child_first, "skill", "skill-x").await, vec![PARENT.to_string()]);
+
+        let a = load_owned_sessions(&parent_first).await.expect("a");
+        let b = load_owned_sessions(&child_first).await.expect("b");
+        assert_eq!(a, b, "the same corpus scanned in either order yields the same sessions");
+        assert_eq!(table_dump(&parent_first).await, table_dump(&child_first).await);
+        for (kind, name, want) in [("skill", "skill-x", 1), ("skill", "skill-y", 1), ("mcp_server", "iyke", 1)] {
+            assert_eq!(count_sessions(&parent_first, kind, name).await, want, "{name} parent-first");
+            assert_eq!(count_sessions(&child_first, kind, name).await, want, "{name} child-first");
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_owner_is_the_earliest_start_even_when_the_parent_ends_last() {
+        // The parent keeps writing after the child's last record. Ownership
+        // must follow the earliest start (the parent's queue-operation), not
+        // the latest record, which here would be the parent's and so hand the
+        // inherited history to the child.
+        let (_db, pool) = temp_pool().await;
+        let corpus = tempfile::tempdir().expect("corpus");
+        let (parent, child) = fixtures::write_fork_pair_with(corpus.path(), false, true);
+        scan_and_mirror_transcripts(&pool, corpus.path()).await.expect("scan");
+
+        let last = |p: &Path| {
+            std::fs::read_to_string(p)
+                .expect("read")
+                .lines()
+                .filter_map(|l| extract_record(l, &main_ctx()).dated.map(|(_, ts)| ts))
+                .max()
+                .expect("dated records")
+        };
+        assert!(last(&parent) > last(&child), "the parent really does end after the child");
+
+        assert_eq!(owned_sessions(&pool, "skill", "skill-x").await, vec![PARENT.to_string()]);
+        assert_eq!(owned_sessions(&pool, "mcp_server", "iyke").await, vec![PARENT.to_string()]);
+        assert_eq!(owned_sessions(&pool, "skill", "skill-y").await, vec![CHILD.to_string()]);
+        assert_eq!(owned_sessions(&pool, "skill", "skill-z").await, vec![PARENT.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tied_starts_count_a_shared_message_once() {
+        let (_db, pool) = temp_pool().await;
+        let corpus = tempfile::tempdir().expect("corpus");
+        let ts = "2026-09-20T10:00:00.000Z";
+        for s in ["s-b", "s-a"] {
+            std::fs::write(
+                corpus.path().join(format!("{s}.jsonl")),
+                format!("{}\n", fixtures::assistant(s, &format!("{s}-u"), "shared", ts, Some("skill-x"), "")),
+            )
+            .expect("write");
+        }
+        scan_and_mirror_transcripts(&pool, corpus.path()).await.expect("scan");
+        let starts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT session_key, start_ms FROM ngwa_usage_session_starts ORDER BY session_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0].1, starts[1].1, "the starts really are tied");
+        assert_eq!(
+            owned_sessions(&pool, "skill", "skill-x").await,
+            vec!["s-a".to_string()],
+            "counted exactly once, by the smaller session key"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_child_counts_its_own_later_use() {
+        let (_db, pool) = temp_pool().await;
+        let corpus = tempfile::tempdir().expect("corpus");
+        fixtures::write_fork_pair(corpus.path(), true);
+        scan_and_mirror_transcripts(&pool, corpus.path()).await.expect("scan");
+        assert_eq!(
+            owned_sessions(&pool, "skill", "skill-x").await,
+            vec![CHILD.to_string(), PARENT.to_string()],
+            "a genuinely new use of skill-x after the resume counts the child"
+        );
+        let last: Vec<i64> = load_owned_sessions(&pool)
+            .await
+            .expect("owned")
+            .into_iter()
+            .filter(|(k, n, s, _)| *k == UsageKind::Skill && n == "skill-x" && s == CHILD)
+            .map(|(_, _, _, l)| l)
+            .collect();
+        assert_eq!(
+            last,
+            vec![parse_timestamp_ms("2026-09-20T11:30:00Z").unwrap()],
+            "the child's row reflects only its own message, not the inherited ones"
+        );
+    }
+
+    #[test]
+    fn message_owners_ignores_holding_order() {
+        let starts: HashMap<String, i64> =
+            [("late".to_string(), 20), ("early".to_string(), 10), ("tie-b".to_string(), 10)]
+                .into_iter()
+                .collect();
+        let holdings = [
+            ("m1", "late"),
+            ("m1", "tie-b"),
+            ("m1", "early"),
+            ("m2", "late"),
+            ("m3", "unknown"),
+            ("m3", "late"),
+        ];
+        let forward = message_owners(holdings.iter().copied(), &starts);
+        let backward = message_owners(holdings.iter().rev().copied(), &starts);
+        assert_eq!(forward, backward);
+        assert_eq!(forward.get("m1"), Some(&"early"), "earliest start; 'early' < 'tie-b' breaks the tie");
+        assert_eq!(forward.get("m2"), Some(&"late"), "a sole holder owns its message");
+        assert_eq!(forward.get("m3"), Some(&"late"), "a holder with no recorded start sorts last");
+    }
+
     /// DoD live check — read-only over the real `~/.claude/projects`, mirrored
     /// into a throwaway database in a temp dir. Never touches the user's
     /// Ikenga database. Run with:
@@ -1219,8 +1693,8 @@ mod tests {
         let t0 = std::time::Instant::now();
         let r1 = scan_and_mirror_transcripts(&pool, &root).await.expect("scan");
         println!(
-            "cold scan: {:?} — files_seen={} files_read={} session_rows={} turn_rows={} read_errors={}",
-            t0.elapsed(), r1.files_seen, r1.files_read, r1.session_rows, r1.turn_rows, r1.read_errors.len()
+            "cold scan: {:?} — files_seen={} files_read={} message_rows={} start_rows={} turn_rows={} read_errors={}",
+            t0.elapsed(), r1.files_seen, r1.files_read, r1.message_rows, r1.start_rows, r1.turn_rows, r1.read_errors.len()
         );
         let t1 = std::time::Instant::now();
         let r2 = scan_and_mirror_transcripts(&pool, &root).await.expect("scan 2");
@@ -1256,6 +1730,71 @@ mod tests {
                     .unwrap_or_default();
                 println!("{:<42} {:>9} {:>8} {:>14}  {}", n, a.count_30d, a.count_7d, a.tokens_30d, last);
             }
+        }
+
+        // DEC-29 on the real resumed pair: what each session *holds* (the
+        // pre-fix rule counted every holding) versus what it *owns*.
+        let d30 = now - 30 * DAY_MS;
+        let holders_30d = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let n: i64 = sqlx::query_scalar(
+                    r#"SELECT COUNT(*) FROM (SELECT session_key FROM ngwa_usage_messages
+                        WHERE kind = 'skill' AND name = ? GROUP BY session_key
+                        HAVING MAX(timestamp_ms) >= ?)"#,
+                )
+                .bind(name)
+                .bind(d30)
+                .fetch_one(&pool)
+                .await
+                .expect("holders");
+                n
+            }
+        };
+        for name in ["groundwork", "royalti-design"] {
+            let owned = snap.for_primitive(UsageKind::Skill, name).map(|a| a.count_30d).unwrap_or(0);
+            println!(
+                "\n{name}: count_30d = {owned} (sessions owning a use); every-holder rule on the same rows = {}",
+                holders_30d(name).await
+            );
+        }
+        let owned = load_owned_sessions(&pool).await.expect("owned");
+        for sk in [
+            "8f46768f-0f8b-4218-93cf-c613d458e744",
+            "e94d16cb-4734-4aa2-956c-0840da85f5f9",
+        ] {
+            let start: Option<i64> = sqlx::query_scalar(
+                "SELECT MIN(start_ms) FROM ngwa_usage_session_starts WHERE session_key = ?",
+            )
+            .bind(sk)
+            .fetch_one(&pool)
+            .await
+            .expect("start");
+            let held: Vec<(String, String, i64)> = sqlx::query_as(
+                r#"SELECT kind, name, COUNT(DISTINCT message_id) FROM ngwa_usage_messages
+                   WHERE session_key = ? AND kind <> 'agent' GROUP BY kind, name ORDER BY kind, name"#,
+            )
+            .bind(sk)
+            .fetch_all(&pool)
+            .await
+            .expect("held");
+            let counts: Vec<String> = owned
+                .iter()
+                .filter(|(_, _, s, _)| s == sk)
+                .map(|(k, n, _, _)| format!("{}:{n}", k.as_str()))
+                .collect();
+            println!(
+                "\nsession {sk} start={}",
+                start
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_default()
+            );
+            println!(
+                "  holds (messages): {}",
+                held.iter().map(|(k, n, c)| format!("{k}:{n}={c}")).collect::<Vec<_>>().join(", ")
+            );
+            println!("  counts for (owns): {}", counts.join(", "));
         }
     }
 }
