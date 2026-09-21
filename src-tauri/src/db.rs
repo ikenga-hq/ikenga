@@ -559,8 +559,9 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0063_meetings_domain",
         include_str!("../migrations/0063_meetings_domain.sql"),
     ),
-    // WP-14 (G-NGWA-ITEM / DEC-24): adds ngwa_transcript_files watermark table
-    // and ngwa_usage_events mirror table for transcript JSONL usage.
+    // WP-14 (G-NGWA-ITEM / DEC-24, DEC-27): adds the ngwa_transcript_files
+    // watermark table and the ngwa_usage_sessions / ngwa_usage_turns mirror
+    // tables for transcript JSONL usage.
     (
         64,
         "0064_ngwa_usage",
@@ -1662,10 +1663,12 @@ mod tests {
             .fetch_all(&writer)
             .await
             .expect("fetch applied");
+        // Every embedded migration, not a literal: this test must not break each
+        // time a later migration lands (0064 did exactly that).
         assert_eq!(
             applied.len(),
-            63,
-            "expected all 63 migrations recorded after startup"
+            MIGRATIONS.len(),
+            "expected every embedded migration recorded after startup"
         );
         assert!(applied.contains(&63), "migration 63 must be in _pa_migrations");
 
@@ -1724,14 +1727,14 @@ mod tests {
                 .expect("record migration");
         }
 
-        // Verify ngwa_usage_events table does NOT exist yet
+        // Verify the 0064 tables do NOT exist yet
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngwa_usage_events'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngwa_usage_sessions'",
         )
         .fetch_one(&raw_pool)
         .await
-        .expect("count ngwa_usage_events table");
-        assert_eq!(count, 0, "ngwa_usage_events should not exist before 0064");
+        .expect("count ngwa_usage_sessions table");
+        assert_eq!(count, 0, "ngwa_usage_sessions should not exist before 0064");
         drop(raw_pool);
 
         // Open PaDb — ensure_pool() should apply migration 64
@@ -1744,18 +1747,26 @@ mod tests {
             .expect("fetch applied");
         assert_eq!(
             applied.len(),
-            64,
-            "expected all 64 migrations recorded after startup"
+            MIGRATIONS.len(),
+            "expected every embedded migration recorded after startup"
         );
         assert!(applied.contains(&64), "migration 64 must be in _pa_migrations");
 
-        // Verify ngwa_usage_events and ngwa_transcript_files exist
-        let events_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_usage_events")
+        // Verify the three 0064 tables exist (DEC-27 / DEC-28 schema)
+        for table in ["ngwa_usage_sessions", "ngwa_usage_turns"] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&writer)
                 .await
-                .expect("select from ngwa_usage_events");
-        assert_eq!(events_count, 0);
+                .unwrap_or_else(|e| panic!("select from {table}: {e}"));
+            assert_eq!(n, 0, "{table} starts empty");
+        }
+        // UNIQUE(kind, name, session_key) is what makes rescans idempotent.
+        let insert = "INSERT INTO ngwa_usage_sessions (kind, name, session_key, first_used_ms, last_used_ms, source_path) VALUES ('skill', 'gw', 's1', 1, 1, 'f')";
+        sqlx::query(insert).execute(&writer).await.expect("first insert");
+        assert!(
+            sqlx::query(insert).execute(&writer).await.is_err(),
+            "duplicate (kind, name, session_key) must violate the UNIQUE constraint"
+        );
 
         let files_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_transcript_files")

@@ -1,0 +1,817 @@
+{
+  "items": [
+    {
+      "id": "agent:personal:reviewer",
+      "kind": "agent",
+      "name": "reviewer",
+      "display_name": "reviewer",
+      "description": "Reviews diffs",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "local",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": true,
+        "auto_update": false,
+        "installed_at_ms": 1789568000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude/agents/reviewer.md",
+          "mechanism": "symlink-dir",
+          "present": true,
+          "link_target": "/home/x/.ikenga/store/agents/reviewer.md",
+          "in_store": true,
+          "managed_by": "oba",
+          "overridden_by": null,
+          "format": "md-yaml",
+          "status": "active"
+        }
+      ],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": 1789740800000,
+        "count_7d": 1,
+        "count_30d": 1,
+        "tokens_30d": 45000,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/store/agents/reviewer.md",
+      "engines": [
+        "claude"
+      ]
+    },
+    {
+      "id": "com.example.lint",
+      "kind": "tool",
+      "name": "com.example.lint",
+      "display_name": "Lint",
+      "description": null,
+      "version": "1.0.0",
+      "latest_version": null,
+      "scope": {
+        "kind": "project",
+        "project_id": "proj-royalti"
+      },
+      "origin": {
+        "source": "local",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": true,
+        "auto_update": false,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "auto_granted",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": {
+          "shell_execute": [],
+          "fs_write_outside_sandbox": [],
+          "net": [],
+          "vault_keys": []
+        },
+        "last_granted_at_ms": null
+      },
+      "placements": [],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": null,
+        "count_7d": 0,
+        "count_30d": 0,
+        "tokens_30d": 0,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/pkgs/com.example.lint",
+      "engines": []
+    },
+    {
+      "id": "com.example.watcher",
+      "kind": "sidecar",
+      "name": "com.example.watcher",
+      "display_name": "Watcher",
+      "description": null,
+      "version": "1.0.0",
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "dev",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": true,
+        "auto_update": false,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": {
+        "state": "stopped",
+        "pid": null,
+        "uptime_s": null,
+        "restarts": 0,
+        "last_err": "boom",
+        "last_crash_ms": null
+      },
+      "trust": {
+        "state": "auto_trusted",
+        "signed": false,
+        "auto_trusted": true,
+        "review_pending": true,
+        "perms": {
+          "shell_execute": [],
+          "fs_write_outside_sandbox": [],
+          "net": [],
+          "vault_keys": []
+        },
+        "last_granted_at_ms": null
+      },
+      "placements": [],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/pkgs/com.example.watcher",
+      "engines": []
+    },
+    {
+      "id": "com.ikenga.engine-claude-code",
+      "kind": "engine",
+      "name": "com.ikenga.engine-claude-code",
+      "display_name": "Claude Code",
+      "description": null,
+      "version": "1.0.0",
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "builtin",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": false,
+        "auto_update": false,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "auto_trusted",
+        "signed": false,
+        "auto_trusted": true,
+        "review_pending": false,
+        "perms": {
+          "shell_execute": [],
+          "fs_write_outside_sandbox": [],
+          "net": [],
+          "vault_keys": []
+        },
+        "last_granted_at_ms": null
+      },
+      "placements": [],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/pkgs/com.ikenga.engine-claude-code",
+      "engines": []
+    },
+    {
+      "id": "com.ikenga.git",
+      "kind": "app",
+      "name": "com.ikenga.git",
+      "display_name": "Git",
+      "description": "Git workbench",
+      "version": "1.0.0",
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "registry",
+        "url": "https://registry.ikenga.dev/index.json",
+        "ref": null,
+        "resolved_version": null,
+        "publisher": "ed25519:abc",
+        "managed": true,
+        "auto_update": true,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": {
+        "state": "running",
+        "pid": 4242,
+        "uptime_s": 903,
+        "restarts": 1,
+        "last_err": null,
+        "last_crash_ms": 1789827200000
+      },
+      "trust": {
+        "state": "granted",
+        "signed": true,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": {
+          "shell_execute": [
+            "git *"
+          ],
+          "fs_write_outside_sandbox": [],
+          "net": [
+            "https://api.github.com/"
+          ],
+          "vault_keys": []
+        },
+        "last_granted_at_ms": 1789136000000
+      },
+      "placements": [],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": 1789913600000,
+        "count_7d": 1,
+        "count_30d": 1,
+        "tokens_30d": 9000,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [
+        {
+          "kind": "skill",
+          "name": "groundwork",
+          "item_id": "skill:personal:groundwork",
+          "source": "git",
+          "ref": "v1.2.0"
+        },
+        {
+          "kind": "skill",
+          "name": "not-installed",
+          "item_id": null,
+          "source": null,
+          "ref": null
+        }
+      ],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/pkgs/com.ikenga.git",
+      "engines": []
+    },
+    {
+      "id": "com.ikenga.iyke",
+      "kind": "app",
+      "name": "com.ikenga.iyke",
+      "display_name": "Iyke",
+      "description": null,
+      "version": "1.0.0",
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "builtin",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": false,
+        "auto_update": false,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "auto_trusted",
+        "signed": false,
+        "auto_trusted": true,
+        "review_pending": false,
+        "perms": {
+          "shell_execute": [],
+          "fs_write_outside_sandbox": [],
+          "net": [],
+          "vault_keys": []
+        },
+        "last_granted_at_ms": null
+      },
+      "placements": [],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/pkgs/com.ikenga.iyke",
+      "engines": []
+    },
+    {
+      "id": "command:personal:ship",
+      "kind": "command",
+      "name": "ship",
+      "display_name": "ship",
+      "description": "Ship it",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "local",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": true,
+        "auto_update": false,
+        "installed_at_ms": 1789568000000,
+        "updated_at_ms": null
+      },
+      "state": "disabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude/commands/ship.md",
+          "mechanism": "file",
+          "present": true,
+          "link_target": null,
+          "in_store": false,
+          "managed_by": "user",
+          "overridden_by": null,
+          "format": "md-yaml",
+          "status": "active"
+        }
+      ],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/store/commands/ship.md",
+      "engines": [
+        "claude"
+      ]
+    },
+    {
+      "id": "hook:personal:secret-scan.sh",
+      "kind": "hook",
+      "name": "secret-scan.sh",
+      "display_name": "secret-scan.sh",
+      "description": "Event: PreToolUse",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "local",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": false,
+        "auto_update": false,
+        "installed_at_ms": null,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude/settings.json",
+          "mechanism": "settings-key",
+          "present": true,
+          "link_target": null,
+          "in_store": false,
+          "managed_by": "user",
+          "overridden_by": null,
+          "format": "json-embedded",
+          "status": "active"
+        }
+      ],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": null,
+      "engines": [
+        "claude"
+      ]
+    },
+    {
+      "id": "schedule:personal:com.ikenga.git:fetch",
+      "kind": "schedule",
+      "name": "fetch",
+      "display_name": "fetch",
+      "description": "Expr: */15 * * * * | Handler: fetch",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "registry",
+        "url": "https://registry.ikenga.dev/index.json",
+        "ref": null,
+        "resolved_version": null,
+        "publisher": "ed25519:abc",
+        "managed": true,
+        "auto_update": true,
+        "installed_at_ms": 1787408000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [],
+      "usage": null,
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": "com.ikenga.git",
+      "install_path": null,
+      "engines": []
+    },
+    {
+      "id": "skill:personal:com-ikenga-iyke",
+      "kind": "skill",
+      "name": "com-ikenga-iyke",
+      "display_name": "com-ikenga-iyke",
+      "description": "com-ikenga-iyke skill",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "local",
+        "url": null,
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": false,
+        "auto_update": false,
+        "installed_at_ms": null,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude/skills/com-ikenga-iyke/SKILL.md",
+          "mechanism": "symlink-dir",
+          "present": true,
+          "link_target": null,
+          "in_store": false,
+          "managed_by": "pkg",
+          "overridden_by": null,
+          "format": "md-yaml",
+          "status": "active"
+        }
+      ],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": null,
+        "count_7d": 0,
+        "count_30d": 0,
+        "tokens_30d": 0,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": "com.ikenga.iyke",
+      "install_path": null,
+      "engines": [
+        "claude"
+      ]
+    },
+    {
+      "id": "skill:personal:groundwork",
+      "kind": "skill",
+      "name": "groundwork",
+      "display_name": "groundwork",
+      "description": "Plan scaffolding",
+      "version": "abc1234",
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "git",
+        "url": "https://github.com/ikenga-hq/groundwork",
+        "ref": "v1.2.0",
+        "resolved_version": "abc1234",
+        "publisher": null,
+        "managed": true,
+        "auto_update": true,
+        "installed_at_ms": 1788272000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude/skills/groundwork/SKILL.md",
+          "mechanism": "symlink-dir",
+          "present": true,
+          "link_target": "/home/x/.ikenga/store/skills/groundwork",
+          "in_store": true,
+          "managed_by": "oba",
+          "overridden_by": "C:/Users/x/royalti-co/.claude/skills/groundwork/SKILL.md",
+          "format": "md-yaml",
+          "status": "active"
+        },
+        {
+          "engine": "gemini",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.gemini/skills/groundwork/SKILL.md",
+          "mechanism": "symlink-dir",
+          "present": true,
+          "link_target": "/home/x/.ikenga/store/skills/groundwork",
+          "in_store": true,
+          "managed_by": "oba",
+          "overridden_by": null,
+          "format": "md-yaml",
+          "status": "active"
+        }
+      ],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": 1789913600000,
+        "count_7d": 1,
+        "count_30d": 2,
+        "tokens_30d": 120000,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [
+        {
+          "kind": "app",
+          "name": "com.ikenga.git",
+          "item_id": "com.ikenga.git",
+          "source": "registry",
+          "ref": null
+        }
+      ],
+      "owner_pkg_id": null,
+      "install_path": "/home/x/.ikenga/store/skills/groundwork",
+      "engines": [
+        "claude",
+        "gemini"
+      ]
+    },
+    {
+      "id": "skill:project:proj-royalti:groundwork",
+      "kind": "skill",
+      "name": "groundwork",
+      "display_name": "groundwork",
+      "description": "Plan scaffolding",
+      "version": "abc1234",
+      "latest_version": null,
+      "scope": {
+        "kind": "project",
+        "project_id": "proj-royalti"
+      },
+      "origin": {
+        "source": "git",
+        "url": "https://github.com/ikenga-hq/groundwork",
+        "ref": "v1.2.0",
+        "resolved_version": "abc1234",
+        "publisher": null,
+        "managed": true,
+        "auto_update": true,
+        "installed_at_ms": 1788272000000,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "project",
+            "project_id": "proj-royalti"
+          },
+          "path": "C:/Users/x/royalti-co/.claude/skills/groundwork/SKILL.md",
+          "mechanism": "symlink-dir",
+          "present": true,
+          "link_target": "/home/x/.ikenga/store/skills/groundwork",
+          "in_store": true,
+          "managed_by": "oba",
+          "overridden_by": null,
+          "format": "md-yaml",
+          "status": "active"
+        }
+      ],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": 1789913600000,
+        "count_7d": 1,
+        "count_30d": 2,
+        "tokens_30d": 120000,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": null,
+      "engines": [
+        "claude"
+      ]
+    },
+    {
+      "id": "tool:personal:Claude Browser",
+      "kind": "tool",
+      "name": "Claude Browser",
+      "display_name": "Claude Browser",
+      "description": "Transport: http",
+      "version": null,
+      "latest_version": null,
+      "scope": {
+        "kind": "personal"
+      },
+      "origin": {
+        "source": "local",
+        "url": "http://localhost:7000/mcp",
+        "ref": null,
+        "resolved_version": null,
+        "publisher": null,
+        "managed": false,
+        "auto_update": false,
+        "installed_at_ms": null,
+        "updated_at_ms": null
+      },
+      "state": "enabled",
+      "runtime": null,
+      "trust": {
+        "state": "not_applicable",
+        "signed": false,
+        "auto_trusted": false,
+        "review_pending": false,
+        "perms": null,
+        "last_granted_at_ms": null
+      },
+      "placements": [
+        {
+          "engine": "claude",
+          "scope": {
+            "kind": "personal"
+          },
+          "path": "/home/x/.claude.json",
+          "mechanism": "settings-key",
+          "present": true,
+          "link_target": null,
+          "in_store": false,
+          "managed_by": "user",
+          "overridden_by": null,
+          "format": "json-embedded",
+          "status": "active"
+        }
+      ],
+      "usage": {
+        "source": "transcript",
+        "last_used_ms": 1786544000000,
+        "count_7d": 0,
+        "count_30d": 0,
+        "tokens_30d": 0,
+        "window_start_ms": 1786112000000
+      },
+      "requires": [],
+      "required_by": [],
+      "owner_pkg_id": null,
+      "install_path": null,
+      "engines": [
+        "claude"
+      ]
+    }
+  ],
+  "as_of_ms": 1790000000000,
+  "sources": {
+    "kernel": {
+      "ok": true,
+      "error": null,
+      "count": 5
+    },
+    "oba": {
+      "ok": true,
+      "error": null,
+      "count": 3
+    },
+    "engine_config": {
+      "ok": true,
+      "error": null,
+      "count": 8
+    },
+    "engine_assets": {
+      "ok": true,
+      "error": null,
+      "count": 1
+    },
+    "trust": {
+      "ok": true,
+      "error": null,
+      "count": 1
+    },
+    "usage": {
+      "ok": true,
+      "error": null,
+      "count": 5
+    }
+  }
+}
