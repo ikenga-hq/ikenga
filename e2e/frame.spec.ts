@@ -6,6 +6,7 @@
 // data-workspace hand-off — is the second describe below.
 
 import { expect, type Page, type TestInfo, test } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 import {
 	installTauriMock,
 	MOCK_PINS,
@@ -488,7 +489,14 @@ test.describe('three-noun routes (WP-10)', () => {
 		page.on('console', (msg) => {
 			if (msg.type() === 'error') console.log('[BROWSER CONSOLE ERROR]:', msg.text());
 		});
-		await installTauriMock(page);
+		// WP-15 replaced the interim `.legacy-ngwa` view with the faceted Ngwa list,
+		// which reads `ngwa_snapshot`. Feed it the golden fixture - real serialized
+		// producer output from WP-14a - so the page renders true-shaped data rather
+		// than the mock's default `null`.
+		const ngwaGolden = JSON.parse(
+			readFileSync(new URL('../src/lib/ngwa/__fixtures__/ngwa-snapshot.golden.json', import.meta.url), 'utf8')
+		);
+		await installTauriMock(page, { responses: { ngwa_snapshot: ngwaGolden } });
 		await page.goto('/', { waitUntil: 'domcontentloaded' });
 		const addressInput = page.getByRole('textbox', { name: 'Address' });
 		await expect(addressInput).toBeVisible();
@@ -501,8 +509,11 @@ test.describe('three-noun routes (WP-10)', () => {
 		// Navigate to /ngwa/installed
 		await addressInput.fill('/ngwa/installed');
 		await addressInput.press('Enter');
-		await expect(page.locator('.legacy-ngwa')).toBeVisible();
-		await expect(page.locator('[data-surface="browse"]')).toBeVisible();
+		const ngwaTabs = page.getByRole('tablist', { name: 'Ngwa surfaces' });
+		await expect(ngwaTabs).toBeVisible();
+		await expect(ngwaTabs.getByRole('tab', { selected: true })).toContainText('Installed');
+		// A row from the golden snapshot proves the list rendered real data.
+		await expect(page.locator('.view-ngwa .nm', { hasText: 'Claude Code' }).first()).toBeVisible();
 
 		// Navigate to /automations
 		await addressInput.fill('/automations');
@@ -517,7 +528,10 @@ test.describe('three-noun routes (WP-10)', () => {
 		// Legacy redirect /packages -> /ngwa/installed
 		await addressInput.fill('/packages');
 		await addressInput.press('Enter');
-		await expect(page.locator('.legacy-ngwa')).toBeVisible();
+		await expect(page.getByRole('tablist', { name: 'Ngwa surfaces' })).toBeVisible();
+		await expect(
+			page.getByRole('tablist', { name: 'Ngwa surfaces' }).getByRole('tab', { selected: true })
+		).toContainText('Installed');
 	});
 });
 
