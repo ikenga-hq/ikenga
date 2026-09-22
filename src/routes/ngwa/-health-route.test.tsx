@@ -231,6 +231,8 @@ describe('/ngwa/health — Violations panel (fold-in of pkg-audit + pkg-health)'
 			return b;
 		});
 		fireEvent.click(btn);
+		expect(dialog().querySelector('[data-removeall-rescan]')?.textContent).toContain('rescans when you confirm');
+		expect(dialog().textContent).toContain('Last scan found 4');
 		fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 		expect(m.pkgHealthRemoveAll).not.toHaveBeenCalled();

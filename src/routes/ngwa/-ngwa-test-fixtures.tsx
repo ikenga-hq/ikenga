@@ -239,6 +239,42 @@ export function scopesItems(): NgwaItem[] {
 			placements: [skillLink(HOME, '.codex', 'deck', { engine: 'codex' })],
 			engines: ['codex'],
 		}),
+		// A REAL folder whose path canonicalizes into the store (a symlinked
+		// ~/.claude/skills parent): in_store true, link_target null. Not a link.
+		mkItem({
+			id: 'skill:personal:vault',
+			kind: 'skill',
+			name: 'vault',
+			install_path: `${STORE}/skills/vault`,
+			placements: [mkPlacement({ path: `${HOME}/.claude/skills/vault/SKILL.md`, in_store: true })],
+			engines: ['claude'],
+		}),
+		// Settings-embedded rows, golden shape: a user hook and a user MCP server
+		// with no store entry (Disable would erase the user's own config).
+		mkItem({
+			id: 'hook:personal:secret-scan.sh',
+			kind: 'hook',
+			name: 'secret-scan.sh',
+			description: 'Event: PreToolUse',
+			placements: [
+				mkPlacement({
+					path: `${HOME}/.claude/settings.json`,
+					mechanism: 'settings-key',
+					format: 'json-embedded',
+				}),
+			],
+			engines: ['claude'],
+		}),
+		mkItem({
+			id: 'tool:personal:github',
+			kind: 'tool',
+			name: 'github',
+			description: 'Transport: stdio',
+			placements: [
+				mkPlacement({ path: `${HOME}/.claude.json`, mechanism: 'settings-key', format: 'json-embedded' }),
+			],
+			engines: ['claude'],
+		}),
 		// A real personal command file, not in the store (golden `ship` shape).
 		mkItem({
 			id: 'command:personal:release',

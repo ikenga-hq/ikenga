@@ -8,7 +8,7 @@
 
 import { useCallback, useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query';
 import { z } from 'zod';
 import { ngwaSnapshotQueryKey, useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import {
@@ -43,6 +43,7 @@ function NgwaScopesPage() {
 	const navigate = useNavigate();
 	const qc = useQueryClient();
 	const { items, unreadableSources, isLoading, error } = useNgwaSnapshot();
+	const refreshing = useIsFetching({ queryKey: ngwaSnapshotQueryKey }) > 0;
 	const projects = useShellStore((s) => s.projects);
 	// The personal scope root. Unresolved ('' from loadHome) → null, and every
 	// path-checked action is disabled with a reason instead of guessing.
@@ -98,8 +99,10 @@ function NgwaScopesPage() {
 		() => ({
 			enable: (kind, name, scope) => after(enable.mutateAsync({ kind, name, scope })),
 			disable: (kind, name, scope) => after(disable.mutateAsync({ kind, name, scope })),
-			copy: (kind, name, fromScope, toScope) =>
-				after(copy.mutateAsync({ kind, name, fromScope, toScope })),
+			copy: (kind, name, fromScope, toScope, opts) =>
+				after(
+					copy.mutateAsync({ kind, name, fromScope, toScope, overwrite: opts?.overwrite === true })
+				),
 			move: (kind, name, fromScope, toScope) =>
 				after(move.mutateAsync({ kind, name, fromScope, toScope })),
 			remove: (kind, name, scope) => after(remove.mutateAsync({ kind, name, scope })),
@@ -142,6 +145,7 @@ function NgwaScopesPage() {
 				}
 				search={search.search}
 				focusScope={focusScope}
+				refreshing={refreshing}
 			/>
 		</div>
 	);

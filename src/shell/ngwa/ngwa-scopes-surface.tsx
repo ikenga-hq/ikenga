@@ -194,11 +194,14 @@ function placementsIn(it: NgwaItem, scopeKey: string): NgwaPlacement[] {
 	return it.placements.filter((p) => scopeKeyOf(p.scope) === scopeKey);
 }
 
-/** A symlink on disk. `mechanism` is the layout's *intended* mechanism, not
- *  what is on disk (the golden snapshot has `symlink-dir` real folders), so
- *  only `link_target` / `in_store` count. */
+/** A symlink on disk. Only `link_target` counts: every symlink has one,
+ *  dangling ones included. `mechanism` is the layout's *intended* mechanism
+ *  (the golden snapshot has `symlink-dir` real folders), and `in_store` is
+ *  computed by canonicalizing the whole path, so a REAL folder under a
+ *  symlinked `~/.claude/skills` reads `in_store: true` — trusting it would
+ *  call the store's own copy "a link" and let Remove delete it. */
 export function isLink(p: NgwaPlacement): boolean {
-	return p.mechanism !== 'settings-key' && (p.link_target !== null || p.in_store);
+	return p.mechanism !== 'settings-key' && p.link_target !== null;
 }
 
 export function scopeMark(
@@ -276,6 +279,40 @@ export function expectedPath(
 		return joinPath(root, '.agents', 'skills', name);
 	}
 	return null;
+}
+
+export interface ResolvedRoot {
+	root: string | null;
+	/** Why the root cannot be used, when `root` is null. */
+	why?: string;
+}
+
+const ROOT_UNKNOWN = 'Scope root unknown, so the target path cannot be checked';
+
+/** Resolve a scope root the way the backend does, or refuse. A leading `~` is
+ *  expanded with the resolved home; anything with a variable (`$`, `%`), a
+ *  `~user` form or a relative path cannot be resolved here exactly as Rust
+ *  would, so it is reported as unresolvable rather than guessed. */
+export function resolveRoot(raw: string | null | undefined, home: string | null): ResolvedRoot {
+	if (!raw || !raw.trim()) return { root: null, why: ROOT_UNKNOWN };
+	const t = raw.trim();
+	if (/[$%]/.test(t)) {
+		return {
+			root: null,
+			why: `Root ${t} uses a variable, so it cannot be resolved here exactly as the backend would`,
+		};
+	}
+	if (t === '~' || t.startsWith('~/') || t.startsWith('~\\')) {
+		if (!home) return { root: null, why: 'Home directory unknown, so the target path cannot be checked' };
+		return { root: home.replace(/[\\/]+$/, '') + t.slice(1) };
+	}
+	if (t.startsWith('~')) {
+		return { root: null, why: `Root ${t} names another user's home, so it cannot be resolved here` };
+	}
+	if (!/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(t)) {
+		return { root: null, why: `Root ${t} is not an absolute path, so it cannot be resolved here` };
+	}
+	return { root: t };
 }
 
 export function samePath(a: string, b: string): boolean {
@@ -412,7 +449,9 @@ export interface NgwaScopeActions {
 		kind: ClaudeStoreKind,
 		name: string,
 		from: ClaudeStoreScope,
-		to: ClaudeStoreScope
+		to: ClaudeStoreScope,
+		/** `overwrite: true` only for DEC-31 "Update personal", after its confirm. */
+		opts?: { overwrite?: boolean }
 	) => Promise<unknown>;
 	move: (
 		kind: ClaudeStoreKind,
@@ -452,6 +491,8 @@ export interface NgwaScopesSurfaceProps {
 	onKindChange?: (kind: string) => void;
 	search?: string;
 	focusScope?: string;
+	/** The snapshot is refetching: open menus would act on stale rows. */
+	refreshing?: boolean;
 }
 
 const SCOPE_KINDS: readonly { id: string; label: string }[] = [
@@ -494,6 +535,17 @@ interface OpenPop {
 	items: PopItem[];
 }
 
+/** What is open. Items are rebuilt from the current rows on every render, so a
+ *  refetch or a finished mutation can never leave a stale action clickable. */
+interface OpenCell {
+	id: string;
+	rowKey: string;
+	col: string;
+	engine: boolean;
+}
+
+const BUSY_REASON = 'Waiting for the last change to finish and the matrix to refresh';
+
 interface EnableTarget {
 	label: string;
 	go: () => Promise<unknown>;
@@ -511,8 +563,9 @@ export function NgwaScopesSurface({
 	onKindChange,
 	search,
 	focusScope,
+	refreshing = false,
 }: NgwaScopesSurfaceProps) {
-	const [pop, setPop] = useState<OpenPop | null>(null);
+	const [openCell, setOpenCell] = useState<OpenCell | null>(null);
 	const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 	const [status, setStatus] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null);
 	const [pending, setPending] = useState(false);
@@ -532,11 +585,15 @@ export function NgwaScopesSurface({
 		(key: string) => scopes.find((s) => s.key === key)?.label ?? key,
 		[scopes]
 	);
-	const rootOf = useCallback(
-		(key: string): string | null =>
-			key === 'personal' ? homeDir || null : (scopes.find((s) => s.key === key)?.root ?? null),
+	const rootInfo = useCallback(
+		(key: string): ResolvedRoot =>
+			key === 'personal'
+				? resolveRoot(homeDir, homeDir)
+				: resolveRoot(scopes.find((s) => s.key === key)?.root ?? null, homeDir || null),
 		[scopes, homeDir]
 	);
+	const rootOf = useCallback((key: string) => rootInfo(key).root, [rootInfo]);
+	const rootWhy = useCallback((key: string) => rootInfo(key).why ?? ROOT_UNKNOWN, [rootInfo]);
 
 	const primitivesDown = unreadableSources.filter((s) => PRIMITIVE_SOURCES.includes(s.source));
 	const unknown = primitivesDown.length > 0;
@@ -596,7 +653,8 @@ export function NgwaScopesSurface({
 		}
 	}, []);
 
-	const closePop = useCallback(() => setPop(null), []);
+	const closePop = useCallback(() => setOpenCell(null), []);
+	const busy = pending || refreshing;
 
 	// ── Guards: every placing / deleting action checks the path it touches ──
 
@@ -617,7 +675,7 @@ export function NgwaScopesSurface({
 		if (mark === 'on' || mark === 'link' || mark === 'conflict') return 'Already enabled here';
 		if (!row.storeBacked) return 'Not in the Ọba store, so there is nothing to place; use Copy here';
 		if (settings) return undefined;
-		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		if (!dest) return rootWhy(key);
 		if (there) return 'Already enabled here';
 		return undefined;
 	}
@@ -649,7 +707,7 @@ export function NgwaScopesSurface({
 			return here && placementsIn(here, key).length > 0 ? 'Already present here' : undefined;
 		}
 		const dest = expectedPath('claude', sk, row.name, rootOf(key));
-		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		if (!dest) return rootWhy(key);
 		if (atPath(dest, sk)) return `Something is already at ${dest}`;
 		return undefined;
 	}
@@ -663,7 +721,7 @@ export function NgwaScopesSurface({
 			return cp && cp.mechanism === 'settings-key' ? cp : 'Nothing placed for claude here';
 		}
 		const dest = expectedPath('claude', sk, row.name, rootOf(key));
-		if (!dest) return 'Scope root unknown, so the target path cannot be checked';
+		if (!dest) return rootWhy(key);
 		const there = row.items
 			.flatMap((it) => it.placements)
 			.find((p) => p.engine === 'claude' && samePath(placementTarget(p, sk), dest));
@@ -817,12 +875,15 @@ export function NgwaScopesSurface({
 		const src = moveSource(row, col.key);
 		const mcBlock = moveCopyBlock(row, col.key);
 		const target = claudeTarget(row, col.key);
+		const settingsKind = sk === 'hook' || sk === 'mcp';
 		const disableBlock =
 			typeof target === 'string'
 				? target
-				: target.mechanism !== 'settings-key' && !isLink(target)
-					? `A real ${isDirKind(sk) ? 'folder' : 'file'}, not a store link; disabling would delete it. Use Remove from ${where}`
-					: undefined;
+				: settingsKind && !row.storeBacked
+					? `Not in the Ọba store: Disable would delete your own ${sk === 'mcp' ? 'MCP server' : 'hook'} entry from ${target.path}, including its settings. Use Remove from ${where} to delete it deliberately`
+					: target.mechanism !== 'settings-key' && !isLink(target)
+						? `A real ${isDirKind(sk) ? 'folder' : 'file'}, not a store link; disabling would delete it. Use Remove from ${where}`
+						: undefined;
 		return [
 			{
 				label: 'Enable here',
@@ -840,11 +901,7 @@ export function NgwaScopesSurface({
 				label: 'Copy here',
 				sub: typeof src === 'string' ? undefined : `from ${scopeLabel(src.key)}`,
 				disabledReason: mcBlock,
-				onSelect: () =>
-					typeof src !== 'string' &&
-					void run(`Copied ${row.label} into ${where}`, () =>
-						actions.copy(sk, row.name, wireOf(src.key), scope)
-					),
+				onSelect: () => typeof src !== 'string' && setConfirm(copyRequest(row, sk, src, col.key)),
 			},
 			{ sep: true, label: '' },
 			{
@@ -861,6 +918,41 @@ export function NgwaScopesSurface({
 					typeof target !== 'string' && setConfirm(removeRequest(row, sk, col.key, target)),
 			},
 		];
+	}
+
+	function copyRequest(
+		row: MatrixRow,
+		sk: ClaudeStoreKind,
+		src: { key: string; p: NgwaPlacement },
+		toKey: string
+	): ConfirmRequest {
+		const settings = sk === 'hook' || sk === 'mcp';
+		const from = settings ? src.p.path : placementTarget(src.p, sk);
+		const to = settings ? null : expectedPath('claude', sk, row.name, rootOf(toKey));
+		return {
+			title: `Copy ${row.label} to ${scopeLabel(toKey)}`,
+			confirmLabel: 'Copy',
+			body: settings ? (
+				<>
+					<p>
+						Writes the store copy of the entry into {scopeLabel(toKey)}. The source{' '}
+						<code data-copy-source>{from}</code> is left as it is.
+					</p>
+				</>
+			) : (
+				<>
+					<p>
+						Copies <code data-copy-source>{from}</code> to <code data-copy-dest>{to}</code>. The source
+						is left as it is.
+					</p>
+					<p>
+						Nothing is overwritten: if anything already exists at the destination, including a
+						folder this screen cannot see, the copy is refused.
+					</p>
+				</>
+			),
+			run: () => actions.copy(sk, row.name, wireOf(src.key), wireOf(toKey)),
+		};
 	}
 
 	function moveRequest(
@@ -895,6 +987,10 @@ export function NgwaScopesSurface({
 							longer receives store updates.
 						</p>
 					) : null}
+					<p>
+						Nothing is overwritten: if anything already exists at the destination, including a
+						folder this screen cannot see, the move is refused and the source is kept.
+					</p>
 				</>
 			),
 			run: () => actions.move(sk, row.name, wireOf(src.key), wireOf(toKey)),
@@ -935,14 +1031,16 @@ export function NgwaScopesSurface({
 		if (typeof personal === 'string') return null;
 		const projKey = scopeKeyOf(c.project.scope);
 		const dir = isDirKind(sk);
-		const from = c.projectPlacement ? placementTarget(c.projectPlacement, sk) : c.shadowPath;
+		// The path copy_core reads: resolve_scope_claude(project)/<kind>s/<name>.
+		const from = expectedPath('claude', sk, c.row.name, rootOf(projKey));
+		if (!from) return null;
 		return {
 			title: `Update personal ${c.row.label}`,
 			confirmLabel: 'Overwrite personal',
 			body: (
 				<>
 					<p>
-						Copies the {scopeLabel(projKey)} version from <code>{from}</code> over{' '}
+						Copies the {scopeLabel(projKey)} version from <code data-update-source>{from}</code> over{' '}
 						{dir ? 'the folder ' : ''}
 						<code data-overwrite-path>{placementTarget(personal, sk)}</code>.
 					</p>
@@ -967,7 +1065,8 @@ export function NgwaScopesSurface({
 					<p>There is no undo.</p>
 				</>
 			),
-			run: () => actions.copy(sk, c.row.name, wireOf(projKey), 'workspace'),
+			// DEC-31: the one deliberate overwrite, behind this confirm.
+			run: () => actions.copy(sk, c.row.name, wireOf(projKey), 'workspace', { overwrite: true }),
 		};
 	}
 
@@ -984,7 +1083,7 @@ export function NgwaScopesSurface({
 						? `The shadowing copy (${c.shadowPath}) is not in a registered project`
 						: typeof target === 'string'
 							? target
-							: 'Cannot update personal',
+							: rootWhy(scopeKeyOf(c.project.scope)),
 				onSelect: () => upd && setConfirm(upd),
 			},
 			{
@@ -1043,6 +1142,13 @@ export function NgwaScopesSurface({
 		];
 	}
 
+	function popFor(title: string, list: PopItem[]): OpenPop {
+		const items = busy
+			? list.map((it) => (it.sep ? it : { ...it, disabledReason: BUSY_REASON }))
+			: list;
+		return { id: title, title, items };
+	}
+
 	// ── Enable all (D-02: confirm, then apply). Targets are exactly the rows
 	// whose own cell action is allowed, so "untouched" is true by construction.
 	function enableAllScope(col: ScopeColumn): EnableTarget[] {
@@ -1078,7 +1184,12 @@ export function NgwaScopesSurface({
 		if (targets.length === 0) return `Every eligible row is already enabled in ${where}`;
 		return undefined;
 	}
-	function askEnableAll(where: string, targets: EnableTarget[]) {
+	// The latest target builders, so a confirmed Enable all re-checks the
+	// current rows instead of trusting the list captured when it opened.
+	const latest = useRef({ scope: enableAllScope, engine: enableAllEngine });
+	latest.current = { scope: enableAllScope, engine: enableAllEngine };
+
+	function askEnableAll(where: string, targets: EnableTarget[], recompute: () => EnableTarget[]) {
 		setConfirm({
 			title: `Enable all in ${where}`,
 			confirmLabel: `Enable ${targets.length}`,
@@ -1092,8 +1203,13 @@ export function NgwaScopesSurface({
 				</>
 			),
 			run: async () => {
+				const now = recompute();
+				const was = targets.map((t) => t.label).join('\n');
+				if (now.map((t) => t.label).join('\n') !== was) {
+					throw new Error('The matrix changed since this was opened; nothing was enabled. Review it again');
+				}
 				const failed: string[] = [];
-				for (const t of targets) {
+				for (const t of now) {
 					try {
 						await t.go();
 					} catch (e) {
@@ -1196,9 +1312,9 @@ export function NgwaScopesSurface({
 													type="button"
 													className="chip enall"
 													data-enall={col.key}
-													disabled={pending || why !== undefined}
-													title={why}
-													onClick={() => askEnableAll(col.label, targets)}
+													disabled={busy || why !== undefined}
+													title={busy ? BUSY_REASON : why}
+													onClick={() => askEnableAll(col.label, targets, () => latest.current.scope(col))}
 												>
 													Enable all
 												</button>
@@ -1216,9 +1332,9 @@ export function NgwaScopesSurface({
 													type="button"
 													className="chip enall"
 													data-enall={eng}
-													disabled={pending || why !== undefined}
-													title={why}
-													onClick={() => askEnableAll(eng, targets)}
+													disabled={busy || why !== undefined}
+													title={busy ? BUSY_REASON : why}
+													onClick={() => askEnableAll(eng, targets, () => latest.current.engine(eng))}
 												>
 													Enable all
 												</button>
@@ -1250,19 +1366,19 @@ export function NgwaScopesSurface({
 															mark={mark}
 															version={mark === 'conflict' ? (v ?? '—') : undefined}
 															label={`${row.label} in ${col.label}: ${MARK_TITLE[mark]}`}
-															open={pop?.id === id}
+															open={openCell?.id === id}
 															onOpen={() =>
-																setPop(
-																	pop?.id === id
+																setOpenCell(
+																	openCell?.id === id
 																		? null
-																		: {
-																				id,
-																				title: `${col.label} · ${row.label}`,
-																				items: scopePopItems(row, col),
-																			}
+																		: { id, rowKey: row.key, col: col.key, engine: false }
 																)
 															}
-															pop={pop?.id === id ? pop : null}
+															pop={
+																openCell?.id === id
+																	? popFor(`${col.label} · ${row.label}`, scopePopItems(row, col))
+																	: null
+															}
 															onClosePop={closePop}
 														/>
 													</td>
@@ -1277,15 +1393,19 @@ export function NgwaScopesSurface({
 															id={id}
 															mark={mark}
 															label={`${row.label} for ${eng}: ${MARK_TITLE[mark]}`}
-															open={pop?.id === id}
+															open={openCell?.id === id}
 															onOpen={() =>
-																setPop(
-																	pop?.id === id
+																setOpenCell(
+																	openCell?.id === id
 																		? null
-																		: { id, title: `${eng} · ${row.label}`, items: enginePopItems(row, eng) }
+																		: { id, rowKey: row.key, col: eng, engine: true }
 																)
 															}
-															pop={pop?.id === id ? pop : null}
+															pop={
+																openCell?.id === id
+																	? popFor(`${eng} · ${row.label}`, enginePopItems(row, eng))
+																	: null
+															}
 															onClosePop={closePop}
 														/>
 													</td>
@@ -1436,7 +1556,7 @@ export function NgwaScopesSurface({
 				onClose={(result) => {
 					const title = confirm?.title ?? '';
 					setConfirm(null);
-					setPop(null);
+					setOpenCell(null);
 					if (result?.ok) setStatus({ tone: 'ok', text: `${title}: done` });
 					else if (result && !result.ok)
 						setStatus({ tone: 'err', text: `${title} failed: ${result.error}` });

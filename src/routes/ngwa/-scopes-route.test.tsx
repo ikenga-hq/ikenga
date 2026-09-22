@@ -10,7 +10,17 @@ import * as cmd from '@/lib/tauri-cmd';
 import * as home from '@/lib/home';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { Route as ScopesRoute } from './scopes';
-import { HOME, P1_ROOT, P2_ROOT, PROJECTS, mkSnapshot, mountRoutes, scopesItems } from './-ngwa-test-fixtures';
+import {
+	HOME,
+	P1_ROOT,
+	P2_ROOT,
+	PROJECTS,
+	mkItem,
+	mkPlacement,
+	mkSnapshot,
+	mountRoutes,
+	scopesItems,
+} from './-ngwa-test-fixtures';
 
 vi.mock('@/lib/registry/use-registry', () => ({
 	useRegistryIndex: () => ({ data: undefined, isLoading: false, error: null }),
@@ -186,9 +196,9 @@ describe('/ngwa/scopes — matrix semantics', () => {
 
 	it('the all chip shows the unfiltered count, and ?kind= is read', async () => {
 		await mount('/ngwa/scopes?kind=skill');
-		expect(document.querySelectorAll('tbody tr').length).toBe(4); // groundwork, lint, notes, deck
+		expect(document.querySelectorAll('tbody tr').length).toBe(5); // groundwork, lint, notes, deck, vault
 		const all = Number(document.querySelector('[data-mk="*"] .n')?.textContent);
-		expect(all).toBe(12);
+		expect(all).toBe(15);
 		expect(document.querySelector('[data-mk="skill"]')?.getAttribute('aria-pressed')).toBe('true');
 	});
 
@@ -355,12 +365,19 @@ describe('/ngwa/scopes — actions call the real commands', () => {
 		expect(f.title).toContain('real folder');
 	});
 
-	it('Copy here → claudePrimitiveCopy(from personal to project)', async () => {
+	it('Copy here confirms, says nothing is overwritten, and calls claudePrimitiveCopy WITHOUT overwrite', async () => {
 		await mount();
 		fireEvent.click(item(openCell(RELEASE, 'project:p2'), /^Copy here/));
-		await waitFor(() =>
-			expect(m.claudePrimitiveCopy).toHaveBeenCalledWith('command', 'release', 'workspace', 'project:p2')
-		);
+		const d = dialog();
+		expect(d.querySelector('[data-copy-dest]')?.textContent).toBe(`${P2_ROOT}/.claude/commands/release.md`);
+		expect(d.textContent).toContain('Nothing is overwritten');
+		noWrites();
+		await act(async () => {
+			fireEvent.click(within(d).getByRole('button', { name: 'Copy' }));
+		});
+		await waitFor(() => expect(m.claudePrimitiveCopy).toHaveBeenCalledTimes(1));
+		// Exactly four arguments: no { overwrite } reaches the backend.
+		expect(m.claudePrimitiveCopy.mock.calls[0]).toEqual(['command', 'release', 'workspace', 'project:p2']);
 	});
 
 	it('engine cell Enable here → claudePrimitiveEnableFor(engine, kind, name, workspace)', async () => {
@@ -387,10 +404,11 @@ describe('/ngwa/scopes — actions call the real commands', () => {
 		noWrites();
 		fireEvent.click(document.querySelector('[data-enall="codex"]') as HTMLElement);
 		await act(async () => {
-			fireEvent.click(within(dialog()).getByRole('button', { name: 'Enable 1' }));
+			fireEvent.click(within(dialog()).getByRole('button', { name: 'Enable 2' }));
 		});
-		await waitFor(() => expect(m.claudePrimitiveEnableFor).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(m.claudePrimitiveEnableFor).toHaveBeenCalledTimes(2));
 		expect(m.claudePrimitiveEnableFor).toHaveBeenCalledWith('codex', 'skill', 'groundwork', 'workspace', 'shared');
+		expect(m.claudePrimitiveEnableFor).toHaveBeenCalledWith('codex', 'skill', 'vault', 'workspace', 'shared');
 	});
 
 	it('engine Disable → claudePrimitiveDisableFor at the exact path it deletes', async () => {
@@ -535,7 +553,8 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		fireEvent.click(item(openCell(GW, 'personal'), /^Update personal/));
 		const d = dialog();
 		expect(d.querySelector('[data-overwrite-path]')?.textContent).toBe(`${HOME}/.claude/skills/groundwork`);
-		expect(d.textContent).toContain(`${P1_ROOT}/.claude/skills/groundwork`);
+		// The source is the path copy_core reads, from the path-mirror — not overridden_by.
+		expect(d.querySelector('[data-update-source]')?.textContent).toBe(`${P1_ROOT}/.claude/skills/groundwork`);
 		expect(d.textContent).not.toContain('SKILL.md');
 		expect(d.textContent).toContain('the store copy survives');
 		fireEvent.click(within(d).getByRole('button', { name: 'Cancel' }));
@@ -547,7 +566,14 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 			fireEvent.click(within(dialog()).getByRole('button', { name: 'Overwrite personal' }));
 		});
 		await waitFor(() => expect(m.claudePrimitiveCopy).toHaveBeenCalledTimes(1));
-		expect(m.claudePrimitiveCopy).toHaveBeenCalledWith('skill', 'groundwork', 'project:p1', 'workspace');
+		// DEC-31 is the one deliberate overwrite (#234 refuses a real destination otherwise).
+		expect(m.claudePrimitiveCopy.mock.calls[0]).toEqual([
+			'skill',
+			'groundwork',
+			'project:p1',
+			'workspace',
+			{ overwrite: true },
+		]);
 	});
 
 	it('Remove from Personal in the conflict popover confirms, then removes from workspace', async () => {
@@ -588,17 +614,123 @@ describe('/ngwa/scopes — destructive actions confirm first (DEC-30 / DEC-31)',
 		await act(async () => {
 			fireEvent.click(within(dialog()).getByRole('button', { name: /^Enable \d+$/ }));
 		});
-		await waitFor(() => expect(m.claudePrimitiveEnable).toHaveBeenCalledTimes(4));
+		await waitFor(() => expect(m.claudePrimitiveEnable).toHaveBeenCalledTimes(5));
 		for (const [k, n] of [
 			['agent', 'explore'],
 			['skill', 'groundwork'],
 			['agent', 'reviewer'],
 			['skill', 'deck'],
+			['skill', 'vault'],
 		]) {
 			expect(m.claudePrimitiveEnable).toHaveBeenCalledWith(k, n, 'project:p2');
 		}
 		// lint is present in p2 (codex); release and notes are not in the store.
 		expect(m.claudePrimitiveEnable).not.toHaveBeenCalledWith('skill', 'lint', 'project:p2');
 		expect(P2_ROOT).toBeTruthy();
+	});
+});
+
+describe('/ngwa/scopes — WP-16a round 3: data-loss routes', () => {
+	const GITHUB = 'prim:tool:github';
+	const HOOK = 'prim:hook:secret-scan.sh';
+	const VAULT = 'prim:skill:vault';
+
+	it('Disable on a user MCP server with no store entry is blocked: it would delete their config', async () => {
+		await mount();
+		const d = item(openCell(GITHUB, 'personal'), /^Disable/);
+		expect(d.disabled).toBe(true);
+		expect(d.title).toContain('your own MCP server');
+		expect(d.title).toContain(`${HOME}/.claude.json`);
+		fireEvent.click(d);
+		noWrites();
+	});
+
+	it('Disable on a user hook with no store entry is blocked too', async () => {
+		await mount();
+		const d = item(openCell(HOOK, 'personal'), /^Disable/);
+		expect(d.disabled).toBe(true);
+		expect(d.title).toContain('your own hook');
+		noWrites();
+	});
+
+	it('Remove on a user MCP server stays deliberate: behind a confirm naming the settings file', async () => {
+		await mount();
+		fireEvent.click(item(openCell(GITHUB, 'personal'), /^Remove from Personal/));
+		expect(dialog().querySelector('[data-remove-path]')?.textContent).toBe(`${HOME}/.claude.json`);
+		expect(dialog().querySelector('[data-nature]')?.getAttribute('data-nature')).toBe('settings');
+		fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
+		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+		noWrites();
+	});
+
+	it('a real folder that canonicalizes into the store (in_store, no link_target) is NOT a link', async () => {
+		await mount();
+		expect(cell(VAULT, 'personal').getAttribute('data-mark')).toBe('on');
+		const d = item(openCell(VAULT, 'personal'), /^Disable/);
+		expect(d.disabled).toBe(true);
+		expect(d.title).toContain('real folder');
+		fireEvent.keyDown(document, { key: 'Escape' });
+		fireEvent.click(item(openCell(VAULT, 'personal'), /^Remove from Personal/));
+		expect(dialog().querySelector('[data-nature]')?.getAttribute('data-nature')).toBe('real-dir');
+		expect(dialog().textContent).not.toContain('store copy survives');
+	});
+
+	it('a ~ project root is expanded with home, so a real folder there blocks Move and Copy', async () => {
+		useShellStore.setState({
+			projects: PROJECTS.map((p) => (p.id === 'p1' ? { ...p, root_path: '~/royalti-co' } : p)),
+		} as never);
+		const items = scopesItems().concat([
+			mkItem({
+				id: 'skill:project:p1:lint',
+				kind: 'skill',
+				name: 'lint',
+				scope: { kind: 'project', project_id: 'p1' },
+				state: 'enabled',
+				placements: [
+					mkPlacement({
+						path: `${HOME}/royalti-co/.claude/skills/lint/SKILL.md`,
+						scope: { kind: 'project', project_id: 'p1' },
+					}),
+				],
+			}),
+		]);
+		m.ngwaSnapshot.mockResolvedValue(mkSnapshot(items));
+		await mount();
+		const menu = openCell(LINT, 'project:p1');
+		expect(item(menu, /^Move here/).disabled).toBe(true);
+		expect(item(menu, /^Move here/).title).toBe(`Something is already at ${HOME}/royalti-co/.claude/skills/lint`);
+		expect(item(menu, /^Copy here/).disabled).toBe(true);
+	});
+
+	it('a root with a variable is unresolvable: placing actions are disabled with a reason', async () => {
+		useShellStore.setState({
+			projects: PROJECTS.map((p) => (p.id === 'p2' ? { ...p, root_path: '$WORK/ikenga' } : p)),
+		} as never);
+		await mount();
+		const en = item(openCell(EXPLORE, 'project:p2'), /^Enable here/);
+		expect(en.disabled).toBe(true);
+		expect(en.title).toContain('uses a variable');
+		fireEvent.keyDown(document, { key: 'Escape' });
+		// release has a checkable personal source, so the root is the only reason left.
+		const menu = openCell(RELEASE, 'project:p2');
+		for (const n of [/^Move here/, /^Copy here/]) {
+			expect(item(menu, n).disabled).toBe(true);
+			expect(item(menu, n).title).toContain('uses a variable');
+		}
+	});
+
+	it('while a change is pending, an open menu and Enable all are disabled, not stale', async () => {
+		m.claudePrimitiveEnable.mockReturnValue(new Promise(() => {}));
+		await mount();
+		fireEvent.click(item(openCell(EXPLORE, 'project:p2'), /^Enable here/));
+		await waitFor(() => expect(m.claudePrimitiveEnable).toHaveBeenCalledTimes(1));
+		const menu = openCell(REVIEWER, 'project:p2');
+		for (const n of [/^Enable here/, /^Move here/, /^Copy here/, /^Disable/]) {
+			expect(item(menu, n).disabled).toBe(true);
+			expect(item(menu, n).title).toContain('Waiting for the last change');
+		}
+		for (const b of document.querySelectorAll<HTMLButtonElement>('[data-enall]')) {
+			expect(b.disabled).toBe(true);
+		}
 	});
 });

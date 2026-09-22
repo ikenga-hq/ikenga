@@ -453,15 +453,19 @@ export function NgwaHealthSurface({
 									onClick={() =>
 										ask(
 											{
-												title: `Remove all ${installs.length} unhealthy records`,
+												title: 'Remove all unhealthy records',
 												confirmLabel: 'Remove all',
 												body: (
 													<>
-														<p>
-															Deletes every detected record: each broken <code>pkg_installed</code> row with its
-															child <code>pkg_*</code> rows, and each orphan row.
+														<p data-removeall-rescan>
+															The kernel <b>rescans when you confirm</b> and deletes whatever is broken or
+															orphaned <b>at that moment</b>: each broken <code>pkg_installed</code> row with its
+															child <code>pkg_*</code> rows, and each orphan row. That set can differ from the
+															list below if anything changed since this screen last scanned.
 														</p>
-														<p>{installs.map((r) => r.id).join(', ')}</p>
+														<p>
+															Last scan found {installs.length}: {installs.map((r) => r.id).join(', ')}
+														</p>
 														<p>Files on disk are never touched. There is no undo.</p>
 													</>
 												),
