@@ -2268,6 +2268,16 @@ pub async fn claude_store_list(
     db: State<'_, Arc<PaDb>>,
     kind: Option<String>,
 ) -> Result<Vec<ClaudeStoreEntry>, String> {
+    claude_store_list_inner(db.inner(), kind).await
+}
+
+/// The catalog listing behind `claude_store_list`, callable without Tauri
+/// `State` (the `ngwa_snapshot_inner` join and the iyke bridge routes reach
+/// it with a bare `&Arc<PaDb>`, WP-28).
+pub async fn claude_store_list_inner(
+    db: &Arc<PaDb>,
+    kind: Option<String>,
+) -> Result<Vec<ClaudeStoreEntry>, String> {
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
     let kinds: Vec<Kind> = match kind {
         Some(k) => vec![Kind::parse(&k)?],

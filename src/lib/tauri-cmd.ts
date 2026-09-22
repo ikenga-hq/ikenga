@@ -2293,18 +2293,32 @@ export interface IykeKeymapEntry {
 	platform_only?: 'mac' | 'other';
 }
 
+/** WP-28: one `GET /iyke/explorer/sections` row — mirrors
+ *  `ExplorerSectionInfo` in `src-tauri/src/iyke/handlers.rs`, which is the
+ *  store's `ExplorerSectionState` field-for-field. */
+export interface IykeExplorerSection {
+	id: string;
+	source: string;
+	order: number;
+	collapsed: boolean;
+}
+
 /**
  * WP-21: push frame state `iyke_set_shell` doesn't carry into the Rust
  * mirror behind `GET /iyke/state` (`shell.active_project`) and
- * `GET /iyke/keys`. Omitted fields leave the stored value untouched.
+ * `GET /iyke/keys` — plus (WP-28) `explorerSections` behind
+ * `GET /iyke/explorer/sections`. Omitted fields leave the stored value
+ * untouched.
  */
 export async function iykeSetFrame(args: {
 	activeProject?: IykeActiveProject | null;
 	keymap?: IykeKeymapEntry[] | null;
+	explorerSections?: IykeExplorerSection[] | null;
 }): Promise<void> {
 	return invoke('iyke_set_frame', {
 		activeProject: args.activeProject ?? null,
 		keymap: args.keymap ?? null,
+		explorerSections: args.explorerSections ?? null,
 	});
 }
 
