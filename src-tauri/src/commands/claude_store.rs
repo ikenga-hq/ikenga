@@ -1064,10 +1064,27 @@ fn disable_fragment_in_scope(
     match kind {
         Kind::Hook => {
             let frag = read_hook_fragment(store, name)?;
-            merge::disable_hook(scope, project_root, frag.file.to_merge(), &frag.event)
+            merge::disable_hook(
+                scope,
+                project_root,
+                frag.file.to_merge(),
+                &frag.event,
+                &frag.block,
+            )
                 .map_err(|e| e.to_string())
         }
-        Kind::Mcp => merge::disable_mcp(scope, project_root, name).map_err(|e| e.to_string()),
+        Kind::Mcp => {
+            // Only a store-backed MCP server can be disabled. With no store
+            // fragment, the entry is the user's own, and disabling would delete
+            // it (command, args and env) with nothing to restore it from.
+            let store_def = read_mcp_fragment(store, name).map_err(|e| {
+                format!(
+                    "refusing to disable MCP server {name:?}: it has no store entry, so it \
+                     is your own server and disabling would delete it ({e})"
+                )
+            })?;
+            merge::disable_mcp(scope, project_root, name, &store_def).map_err(|e| e.to_string())
+        }
         other => Err(format!("kind {} is not a JSON fragment", other.as_str())),
     }
 }
@@ -1133,11 +1150,20 @@ fn disable_fragment_in_scope_for(
     match kind {
         Kind::Hook => {
             let frag = read_hook_fragment(store, name)?;
-            merge::disable_hook_for(engine, scope, project_root, hook_file, &frag.event)
+            merge::disable_hook_for(engine, scope, project_root, hook_file, &frag.event, &frag.block)
                 .map_err(|e| e.to_string())
         }
         Kind::Mcp => {
-            merge::disable_mcp_for(engine, scope, project_root, name).map_err(|e| e.to_string())
+            {
+                let store_def = read_mcp_fragment(store, name).map_err(|e| {
+                    format!(
+                        "refusing to disable MCP server {name:?}: it has no store entry, so it \
+                         is your own server and disabling would delete it ({e})"
+                    )
+                })?;
+                merge::disable_mcp_for(engine, scope, project_root, name, &store_def)
+                    .map_err(|e| e.to_string())
+            }
         }
         other => Err(format!("kind {} is not a JSON fragment", other.as_str())),
     }
@@ -4146,6 +4172,27 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:?}").contains("refusing to copy over"), "{err:?}");
         assert_eq!(read(&dest), "mine");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// With no store fragment, an MCP server is the user's own: disabling it
+    /// through the command layer is refused and the config is left untouched.
+    #[test]
+    fn disable_mcp_without_a_store_fragment_is_refused() {
+        let (base, store, _scope) = fixture("mcp_own");
+        let proj = base.join("proj");
+        let cfg = proj.join(".mcp.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":{"github":{"command":"gh-mcp","env":{"GITHUB_TOKEN":"ghp_mine"}}}}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&cfg).unwrap();
+
+        let err = disable_fragment_in_scope(&store, Kind::Mcp, "github", "project:p", Some(&proj))
+            .unwrap_err();
+        assert!(err.contains("it has no store entry"), "{err}");
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "the user's server survives");
         std::fs::remove_dir_all(&base).ok();
     }
 
