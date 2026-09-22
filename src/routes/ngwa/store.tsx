@@ -1,29 +1,35 @@
-// /ngwa/store — Ngwa Package Store (WP-10).
+// /ngwa/store — Ngwa Package Store (WP-15 / locked D-02).
 //
-// Mounts PkgsSurface with store filter alongside NgwaFacetBar.
+// Mounts NgwaStoreSurface with enriched registry catalog and updates banner.
 
 import { createFileRoute } from '@tanstack/react-router';
 import { z } from 'zod';
-import { PkgsSurface } from '@/components/pkg/v2/pkgs-surface';
-import { NgwaFacetBar, type NgwaSearchParams } from './-facet-bar';
+import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
+import { NgwaStoreSurface } from '@/shell/ngwa/ngwa-store-surface';
+import { NgwaTabs } from '@/shell/ngwa/ngwa-tabs';
+import '@/shell/ngwa/ngwa.css';
 
 const searchSchema = z.object({
-	filter: z.enum(['all', 'installed', 'updates', 'store', 'review', 'disabled']).optional(),
-	install: z.enum(['manifest-url', 'local-path', 'registry']).optional(),
-	surface: z.any().optional(),
+	filter: z.string().optional(),
+	install: z.string().optional(),
+	surface: z.string().optional(),
 	scope: z.string().optional(),
-	kind: z.any().optional(),
+	kind: z.string().optional(),
 	sys: z.string().optional(),
+	search: z.string().optional(),
 });
 
 function NgwaStorePage() {
-	const search = Route.useSearch();
+	const { items, storeCatalog, isLoading, error } = useNgwaSnapshot();
+
 	return (
-		<div className="flex h-full flex-col bg-background text-foreground">
-			<NgwaFacetBar search={{ ...search, surface: 'store' } as NgwaSearchParams} />
-			<div className="flex-1 min-h-0 overflow-y-auto">
-				<PkgsSurface initialFilter={search.filter ?? 'store'} initialInstallTab={search.install} />
-			</div>
+		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
+			<NgwaTabs activeTab="store" installedCount={items.length} />
+			<NgwaStoreSurface
+				catalog={storeCatalog}
+				isLoading={isLoading}
+				error={error}
+			/>
 		</div>
 	);
 }

@@ -6,7 +6,7 @@ import {
 	resolveActiveSystems,
 	siblingSystemsOf,
 	summarizeSystems,
-	type NgwaItem,
+	type EngineConfigItem,
 	type NgwaSystemId,
 } from './ngwa-helpers';
 
@@ -54,7 +54,7 @@ function buildConfig(): ClaudeConfig {
 	};
 }
 
-function items(): NgwaItem[] {
+function items(): EngineConfigItem[] {
 	return buildItems(buildConfig(), [], NO_PROJECTS);
 }
 

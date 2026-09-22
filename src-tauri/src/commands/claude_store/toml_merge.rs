@@ -52,13 +52,17 @@ pub type Block = serde_json::Value;
 /// `model`, `[mcp_servers.<other>]`, comments, ordering — are preserved
 /// byte-for-byte.
 pub fn enable_mcp(config_toml: &Path, name: &str, server_def: Block) -> Result<(), StoreError> {
+    guard_toml(config_toml, "mcp_servers", name, &server_def, false)?;
     splice(config_toml, "mcp_servers", name, Some(server_def))
 }
 
 /// Disable (remove) `mcp_servers.<name>` from a Codex `config.toml`. Removing
 /// the last server leaves an empty `[mcp_servers]` table; every other key is
 /// preserved. A missing file / parent / child is a no-op (no write, no error).
-pub fn disable_mcp(config_toml: &Path, name: &str) -> Result<(), StoreError> {
+/// Removed only if it is exactly the store's `store_def`; a user's own or an
+/// edited server is refused (see `merge.rs`'s ownership guard note).
+pub fn disable_mcp(config_toml: &Path, name: &str, store_def: &Block) -> Result<(), StoreError> {
+    guard_toml(config_toml, "mcp_servers", name, store_def, true)?;
     splice(config_toml, "mcp_servers", name, None)
 }
 
@@ -66,13 +70,91 @@ pub fn disable_mcp(config_toml: &Path, name: &str) -> Result<(), StoreError> {
 /// top-level `[hooks]` table in a Codex `config.toml`. `block` is the value
 /// placed at `hooks.<event>`. All other keys preserved.
 pub fn enable_hook(config_toml: &Path, event: &str, block: Block) -> Result<(), StoreError> {
+    guard_toml(config_toml, "hooks", event, &block, false)?;
     splice(config_toml, "hooks", event, Some(block))
 }
 
 /// Disable (remove) the inline hook block keyed by `event` from `[hooks]` in a
 /// Codex `config.toml`. Missing file / key is a no-op.
-pub fn disable_hook(config_toml: &Path, event: &str) -> Result<(), StoreError> {
+/// Removed only if it is exactly the store's `store_block`.
+pub fn disable_hook(config_toml: &Path, event: &str, store_block: &Block) -> Result<(), StoreError> {
+    guard_toml(config_toml, "hooks", event, store_block, true)?;
     splice(config_toml, "hooks", event, None)
+}
+
+// ─── Ownership guard (TOML) ───────────────────────────────────────────────────
+//
+// Same rule as `merge.rs`: only replace or remove an entry that is exactly what
+// the store puts there. The comparison is semantic, not textual, so key order
+// and comments don't matter: the live item is read back as JSON, and the store
+// block is passed through the *same* JSON→TOML conversion `enable_*` uses before
+// being read back, so an untouched entry always compares equal to its source.
+
+/// A TOML item as a JSON value, for comparison.
+fn item_to_json(item: &Item) -> Option<serde_json::Value> {
+    match item {
+        Item::None => None,
+        Item::Value(v) => Some(value_to_json(v)),
+        Item::Table(t) => Some(serde_json::Value::Object(
+            t.iter()
+                .filter_map(|(k, v)| item_to_json(v).map(|j| (k.to_string(), j)))
+                .collect(),
+        )),
+        Item::ArrayOfTables(a) => Some(serde_json::Value::Array(
+            a.iter()
+                .filter_map(|t| item_to_json(&Item::Table(t.clone())))
+                .collect(),
+        )),
+    }
+}
+
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::String(s) => serde_json::Value::String(s.value().clone()),
+        Value::Integer(i) => serde_json::Value::from(*i.value()),
+        Value::Float(f) => serde_json::Number::from_f64(*f.value())
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Boolean(b) => serde_json::Value::Bool(*b.value()),
+        Value::Datetime(d) => serde_json::Value::String(d.value().to_string()),
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(value_to_json).collect()),
+        Value::InlineTable(t) => serde_json::Value::Object(
+            t.iter().map(|(k, v)| (k.to_string(), value_to_json(v))).collect(),
+        ),
+    }
+}
+
+fn guard_toml(
+    path: &Path,
+    parent_key: &str,
+    child_key: &str,
+    store: &Block,
+    removing: bool,
+) -> Result<(), StoreError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let doc = read_document(path)?;
+    let current = doc
+        .get(parent_key)
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get(child_key))
+        .and_then(item_to_json);
+    let Some(current) = current else {
+        return Ok(());
+    };
+    // A store block with no TOML representation can't match anything on disk.
+    let expected = json_to_toml_item(store.clone(), path)
+        .ok()
+        .and_then(|i| item_to_json(&i));
+    if expected.as_ref() == Some(&current) {
+        return Ok(());
+    }
+    Err(StoreError::NotOurs {
+        path: path.to_string_lossy().to_string(),
+        key: format!("{parent_key}.{child_key}"),
+        reason: super::merge::ownership_conflict_reason(removing),
+    })
 }
 
 // ─── Core splice ──────────────────────────────────────────────────────────────
@@ -276,6 +358,49 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
+    // ── Ownership guard (TOML) ──────────────────────────────────────────────
+
+    #[test]
+    fn toml_disable_mcp_refuses_a_users_own_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.toml");
+        fs::write(&p, "[mcp_servers.github]\ncommand = \"gh-mcp\"\n").unwrap();
+        let before = fs::read(&p).unwrap();
+
+        let err = disable_mcp(&p, "github", &json!({ "command": "other" })).unwrap_err();
+        assert!(matches!(err, StoreError::NotOurs { .. }), "{err:?}");
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    /// The comparison is semantic: the store's own entry is recognised even if
+    /// its keys were reordered and a comment added, so it can still be disabled.
+    #[test]
+    fn toml_recognises_its_own_entry_despite_formatting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.toml");
+        fs::write(
+            &p,
+            "# mine\n[mcp_servers.royalti]\n# reordered by hand\nargs = [\"--stdio\"]\ncommand = \"royalti-mcp\"\n",
+        )
+        .unwrap();
+        let def = json!({ "command": "royalti-mcp", "args": ["--stdio"] });
+        disable_mcp(&p, "royalti", &def).unwrap();
+        assert!(!fs::read_to_string(&p).unwrap().contains("royalti-mcp"));
+    }
+
+    #[test]
+    fn toml_enable_hook_refuses_to_replace_an_existing_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.toml");
+        fs::write(&p, "[hooks]\nPreToolUse = { type = \"command\", command = \"mine\" }\n").unwrap();
+        let before = fs::read(&p).unwrap();
+
+        let err = enable_hook(&p, "PreToolUse", json!({ "type": "command", "command": "store" }))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotOurs { .. }), "{err:?}");
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
     /// Seed a Codex `config.toml` with several unrelated keys + comments we must
     /// never disturb.
     fn seed_config(dir: &Path) -> std::path::PathBuf {
@@ -314,7 +439,7 @@ mod tests {
             Some("royalti-mcp")
         );
 
-        disable_mcp(&p, "royalti").unwrap();
+        disable_mcp(&p, "royalti", &def).unwrap();
         let after_remove = fs::read(&p).unwrap();
         assert_eq!(
             after_remove, baseline,
@@ -329,12 +454,12 @@ mod tests {
         let baseline = fs::read(&p).unwrap();
 
         let block = json!({ "type": "command", "command": "echo hi" });
-        enable_hook(&p, "PreToolUse", block).unwrap();
+        enable_hook(&p, "PreToolUse", block.clone()).unwrap();
         let after_add = fs::read_to_string(&p).unwrap();
         assert!(after_add.contains("PreToolUse"));
         assert!(after_add.contains("# Codex config — do not reformat"));
 
-        disable_hook(&p, "PreToolUse").unwrap();
+        disable_hook(&p, "PreToolUse", &block).unwrap();
         let after_remove = fs::read(&p).unwrap();
         assert_eq!(
             after_remove, baseline,
@@ -346,8 +471,8 @@ mod tests {
     fn disable_on_clean_machine_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("config.toml");
-        disable_mcp(&p, "nope").unwrap();
-        disable_hook(&p, "Stop").unwrap();
+        disable_mcp(&p, "nope", &json!({})).unwrap();
+        disable_hook(&p, "Stop", &json!({})).unwrap();
         assert!(!p.exists(), "no file materialized by a no-op disable");
     }
 

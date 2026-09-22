@@ -1,10 +1,10 @@
 // Shared store-map model (Phase 4 · D-07). Both the Presence matrix and the
 // Flow rail consume this: store-backed file primitives × scopes, with each
-// (entry, scope) cell carrying its on-disk state. Built from the NgwaItem scan
+// (entry, scope) cell carrying its on-disk state. Built from the EngineConfigItem scan
 // model (`buildItems`) + the store catalog (`ClaudeStoreEntry.enabledIn`).
 
 import type { ClaudeStoreEntry, ClaudeStoreKind } from '@/lib/tauri-cmd';
-import type { ItemState, NgwaItem } from '../ngwa-surface';
+import type { ItemState, EngineConfigItem } from '../ngwa-surface';
 
 /** Per-cell presence: a scan state, or 'none' when absent in that scope. */
 export type Cell = ItemState | 'none';
@@ -57,7 +57,7 @@ function rowStatus(cells: Map<string, Cell>, inStore: boolean): ItemState {
 	return inStore ? 'disabled' : 'local';
 }
 
-export function buildStoreModel(items: NgwaItem[], store: ClaudeStoreEntry[]): StoreModel {
+export function buildStoreModel(items: EngineConfigItem[], store: ClaudeStoreEntry[]): StoreModel {
 	const fileItems = items.filter((i) => STORE_FILE_KINDS.includes(i.storeKind));
 
 	// Columns: every scope key seen in items + store.enabledIn, 'workspace' first.

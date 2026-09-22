@@ -22,6 +22,7 @@ pub mod fs;
 pub mod fs_roots;
 pub mod identity;
 pub mod iyke;
+pub mod ngwa;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -86,7 +87,7 @@ pub use comments::{
     comment_create, comment_delete, comment_get, comment_list, comment_record_routing,
     comment_set_status, pin_screenshot_write,
 };
-pub use data_health::data_health_scan;
+pub use data_health::{data_health_db_size, data_health_scan};
 pub use db::{db_exec, db_query};
 pub use desktop::{iyke_mcp_info, set_dock_badge};
 pub use engine_layout::engine_layout;
@@ -101,6 +102,7 @@ pub use iyke::{
     iyke_network_push, iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done,
     iyke_terminal_spawn_done, iyke_wait_done, IykeRuntimeState,
 };
+pub use ngwa::ngwa_snapshot;
 pub use pa_actions::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update,

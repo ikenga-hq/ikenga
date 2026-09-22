@@ -559,6 +559,23 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0063_meetings_domain",
         include_str!("../migrations/0063_meetings_domain.sql"),
     ),
+    // WP-14 (G-NGWA-ITEM / DEC-24, DEC-27): adds the ngwa_transcript_files
+    // watermark table and the ngwa_usage_sessions / ngwa_usage_turns mirror
+    // tables for transcript JSONL usage.
+    (
+        64,
+        "0064_ngwa_usage",
+        include_str!("../migrations/0064_ngwa_usage.sql"),
+    ),
+    // WP-14b (DEC-29): message-level usage rows + per-session starts, so a
+    // resumed or forked session is counted only through messages it owns.
+    // Empties the retired ngwa_usage_sessions and resets every transcript
+    // watermark, so the next scan re-reads the corpus into the new tables.
+    (
+        65,
+        "0065_ngwa_usage_ownership",
+        include_str!("../migrations/0065_ngwa_usage_ownership.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -1655,10 +1672,12 @@ mod tests {
             .fetch_all(&writer)
             .await
             .expect("fetch applied");
+        // Every embedded migration, not a literal: this test must not break each
+        // time a later migration lands (0064 did exactly that).
         assert_eq!(
             applied.len(),
-            63,
-            "expected all 63 migrations recorded after startup"
+            MIGRATIONS.len(),
+            "expected every embedded migration recorded after startup"
         );
         assert!(applied.contains(&63), "migration 63 must be in _pa_migrations");
 
@@ -1669,6 +1688,239 @@ mod tests {
                 .await
                 .expect("select from meetings");
         assert_eq!(meetings_count, 0);
+    }
+
+    /// WP-14: Verify 0064 applies automatically on an existing DB where migrations 1..63
+    /// were already recorded in _pa_migrations.
+    #[tokio::test]
+    async fn migration_0064_applies_on_existing_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_63.db");
+
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .expect("create _pa_migrations");
+
+        // Apply migrations 1..63 only
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 64) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .expect("record migration");
+        }
+
+        // Verify the 0064 tables do NOT exist yet
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ngwa_usage_sessions'",
+        )
+        .fetch_one(&raw_pool)
+        .await
+        .expect("count ngwa_usage_sessions table");
+        assert_eq!(count, 0, "ngwa_usage_sessions should not exist before 0064");
+        drop(raw_pool);
+
+        // Open PaDb — ensure_pool() should apply migration 64
+        let pa_db = PaDb::new(db_path.clone());
+        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
+            .fetch_all(&writer)
+            .await
+            .expect("fetch applied");
+        assert_eq!(
+            applied.len(),
+            MIGRATIONS.len(),
+            "expected every embedded migration recorded after startup"
+        );
+        assert!(applied.contains(&64), "migration 64 must be in _pa_migrations");
+
+        // Verify the three 0064 tables exist (DEC-27 / DEC-28 schema)
+        for table in ["ngwa_usage_sessions", "ngwa_usage_turns"] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&writer)
+                .await
+                .unwrap_or_else(|e| panic!("select from {table}: {e}"));
+            assert_eq!(n, 0, "{table} starts empty");
+        }
+        // UNIQUE(kind, name, session_key) is what makes rescans idempotent.
+        let insert = "INSERT INTO ngwa_usage_sessions (kind, name, session_key, first_used_ms, last_used_ms, source_path) VALUES ('skill', 'gw', 's1', 1, 1, 'f')";
+        sqlx::query(insert).execute(&writer).await.expect("first insert");
+        assert!(
+            sqlx::query(insert).execute(&writer).await.is_err(),
+            "duplicate (kind, name, session_key) must violate the UNIQUE constraint"
+        );
+
+        let files_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_transcript_files")
+                .fetch_one(&writer)
+                .await
+                .expect("select from ngwa_transcript_files");
+        assert_eq!(files_count, 0);
+    }
+
+    /// WP-14b (DEC-29): 0065 applies on a database that already ran 0064 and
+    /// scanned a resumed-session pair under the old rule. The stale per-session
+    /// rows (which count the pair's inherited skill twice) and the watermarks
+    /// (which would make the next scan skip both files, leaving the new tables
+    /// empty) must both be cleared, so the next scan yields the DEC-29 counts:
+    /// neither stale rows, nor a mix, nor an empty mirror.
+    #[tokio::test]
+    async fn migration_0065_applies_on_db_with_0064_and_next_scan_is_correct() {
+        use crate::transcript::usage::{self, fixtures};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_64.db");
+        let corpus = tempfile::tempdir().expect("corpus");
+        let (parent, child) = fixtures::write_fork_pair(corpus.path(), false);
+
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .expect("create _pa_migrations");
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id <= 64) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .expect("record migration");
+        }
+
+        // The state the pre-0065 scanner leaves behind: one session row per
+        // holder (skill-x counted for parent AND child), and a watermark at
+        // the end of each file, so an unchanged file is never re-read.
+        for sk in [fixtures::PARENT, fixtures::CHILD] {
+            sqlx::query(
+                "INSERT INTO ngwa_usage_sessions (kind, name, session_key, first_used_ms, last_used_ms, source_path) VALUES ('skill', 'skill-x', ?, 1, 1, 'old')",
+            )
+            .bind(sk)
+            .execute(&raw_pool)
+            .await
+            .expect("stale session row");
+        }
+        for f in [&parent, &child] {
+            let scan = usage::scan_file(f, None).expect("scan");
+            sqlx::query(
+                "INSERT INTO ngwa_transcript_files (path, mtime_ms, byte_offset, head_len, head_hash, scanned_at_ms) VALUES (?, ?, ?, ?, ?, 0)",
+            )
+            .bind(&scan.path)
+            .bind(scan.mtime_ms)
+            .bind(scan.byte_offset as i64)
+            .bind(scan.head_len as i64)
+            .bind(&scan.head_hash)
+            .execute(&raw_pool)
+            .await
+            .expect("stale watermark");
+            assert!(
+                usage::scan_file(
+                    f,
+                    Some(&usage::Watermark {
+                        mtime_ms: scan.mtime_ms,
+                        byte_offset: scan.byte_offset,
+                        head_len: scan.head_len,
+                        head_hash: scan.head_hash.clone(),
+                    })
+                )
+                .is_none(),
+                "with this watermark the file would be skipped"
+            );
+        }
+        drop(raw_pool);
+
+        // Open PaDb as the desktop app would: ensure_pool() applies 0065 only.
+        let pa_db = PaDb::new(db_path.clone());
+        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
+            .fetch_all(&writer)
+            .await
+            .expect("fetch applied");
+        assert_eq!(applied.len(), MIGRATIONS.len());
+        assert!(applied.contains(&65), "migration 65 must be in _pa_migrations");
+        for (table, want) in [
+            ("ngwa_usage_sessions", 0i64),
+            ("ngwa_transcript_files", 0),
+            ("ngwa_usage_messages", 0),
+            ("ngwa_usage_session_starts", 0),
+        ] {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&writer)
+                .await
+                .unwrap_or_else(|e| panic!("select from {table}: {e}"));
+            assert_eq!(n, want, "{table} after 0065");
+        }
+
+        // The next scan re-reads both files and counts by ownership.
+        let report = usage::scan_and_mirror_transcripts(&writer, corpus.path())
+            .await
+            .expect("scan");
+        assert_eq!(report.files_read, 2, "the reset watermarks force a full re-read");
+        let owned = usage::load_owned_sessions(&writer).await.expect("owned");
+        let for_item = |name: &str| -> Vec<String> {
+            owned
+                .iter()
+                .filter(|(k, n, _, _)| *k == usage::UsageKind::Skill && n == name)
+                .map(|(_, _, s, _)| s.clone())
+                .collect()
+        };
+        assert_eq!(for_item("skill-x"), vec![fixtures::PARENT.to_string()]);
+        assert_eq!(for_item("skill-y"), vec![fixtures::CHILD.to_string()]);
+
+        // UNIQUE(kind, name, session_key, message_id) keeps rescans idempotent.
+        let insert = "INSERT INTO ngwa_usage_messages (kind, name, session_key, message_id, timestamp_ms, source_path) VALUES ('skill', 'skill-x', 'p-zzz-parent', 'msg-2', 1, 'f')";
+        assert!(
+            sqlx::query(insert).execute(&writer).await.is_err(),
+            "a duplicate (kind, name, session_key, message_id) must violate the UNIQUE constraint"
+        );
     }
 
     /// WP-18: Verify external SQLite mutations (from another connection / external tool)

@@ -82,6 +82,15 @@ pub enum StoreError {
         to: String,
         reason: String,
     },
+    /// The settings entry at `key` is not exactly what the store placed there:
+    /// it is the user's own entry, another store item's, or a store entry they
+    /// have edited since it was enabled. Refused *before* any write, so it is
+    /// never silently overwritten or deleted.
+    NotOurs {
+        path: String,
+        key: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -102,6 +111,9 @@ impl std::fmt::Display for StoreError {
             StoreError::Unsupported { message } => write!(f, "{message}"),
             StoreError::TranscodeUnsupported { from, to, reason } => {
                 write!(f, "no {from}→{to} transcode: {reason}")
+            }
+            StoreError::NotOurs { path, key, reason } => {
+                write!(f, "refusing to change `{key}` in {path}: {reason}")
             }
         }
     }
@@ -206,6 +218,9 @@ pub fn enable_hook(
     block: Value,
 ) -> Result<()> {
     let path = hook_path(scope, project_root, file)?;
+    // `hooks.<event>` holds every hook on that event, so replacing it would wipe
+    // the user's own hooks (see the guard note).
+    guard_json(&path, "hooks", event, &block, false)?;
     splice_nested(&path, "hooks", event, Some(block))
 }
 
@@ -218,9 +233,113 @@ pub fn disable_hook(
     project_root: Option<&Path>,
     file: HookFile,
     event: &str,
+    store_block: &Value,
 ) -> Result<()> {
     let path = hook_path(scope, project_root, file)?;
+    // Removes the whole event, so only when it holds exactly the store's block.
+    guard_json(&path, "hooks", event, store_block, true)?;
     splice_nested(&path, "hooks", event, None)
+}
+
+// ─── Ownership guard ──────────────────────────────────────────────────────────
+//
+// Every splice below writes or removes one keyed entry (`mcpServers.<name>`,
+// `hooks.<event>`) in a file the user also edits by hand. The splice itself
+// replaces or deletes whatever is at that key, so without a guard:
+//   - disabling an MCP server the user wrote themselves deleted it, env and
+//     API keys included, with nothing in the store to bring it back;
+//   - enabling a store hook on an event (`PreToolUse`, say) replaced *every*
+//     hook already on that event, including the user's own and security hooks;
+//   - enabling a store MCP server replaced a user's own server of that name.
+//
+// The rule: a write may only replace or remove an entry that is **exactly**
+// what the store puts there. Enable accepts an absent entry or one already
+// equal to the store block (idempotent). Disable accepts an absent entry
+// (no-op) or one equal to the store block. Anything else is someone's data and
+// is refused with `NotOurs`. That includes a store entry the user has edited
+// since enabling it (a pasted-in API key, say): disabling it would silently
+// discard the edit.
+//
+// Consequence: two store hooks can't share an event. That case was already
+// broken (the second enable overwrote the first); now it is refused out loud.
+
+/// The current value at `parent.child` in a JSON settings file, if any.
+fn current_nested(path: &Path, parent_key: &str, child_key: &str) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let root = read_object(path)?;
+    Ok(root
+        .get(parent_key)
+        .and_then(Value::as_object)
+        .and_then(|o| o.get(child_key))
+        .cloned())
+}
+
+/// Why a splice of `store` at `parent.child` would destroy data that is not
+/// the store's, or `None` when it is safe.
+pub(super) fn ownership_conflict_reason(removing: bool) -> String {
+    if removing {
+        "it is not exactly what the store placed there. It is your own entry, or \
+         one you have edited since it was enabled, and disabling would delete it."
+            .to_string()
+    } else {
+        "something different is already there: your own entry, or another store \
+         item's. Enabling would overwrite it."
+            .to_string()
+    }
+}
+
+/// The JSON ownership check. `Ok(None)` means safe to splice.
+fn json_ownership_conflict(
+    path: &Path,
+    parent_key: &str,
+    child_key: &str,
+    store: &Value,
+    removing: bool,
+) -> Result<Option<String>> {
+    Ok(match current_nested(path, parent_key, child_key)? {
+        None => None,
+        Some(current) if current == *store => None,
+        Some(_) => Some(ownership_conflict_reason(removing)),
+    })
+}
+
+/// The JSON ownership check, as an `anyhow` error for the Phase-1 API.
+fn guard_json(
+    path: &Path,
+    parent_key: &str,
+    child_key: &str,
+    store: &Value,
+    removing: bool,
+) -> Result<()> {
+    match json_ownership_conflict(path, parent_key, child_key, store, removing)? {
+        None => Ok(()),
+        Some(reason) => Err(anyhow!(
+            "refusing to change `{parent_key}.{child_key}` in {}: {reason}",
+            path.display()
+        )),
+    }
+}
+
+/// The JSON ownership check, as a typed `NotOurs` for the engine-aware API.
+fn guard_json_typed(
+    path: &Path,
+    parent_key: &str,
+    child_key: &str,
+    store: &Value,
+    removing: bool,
+) -> Result<(), StoreError> {
+    match json_ownership_conflict(path, parent_key, child_key, store, removing)
+        .map_err(|e| from_anyhow(path, e))?
+    {
+        None => Ok(()),
+        Some(reason) => Err(StoreError::NotOurs {
+            path: path.to_string_lossy().to_string(),
+            key: format!("{parent_key}.{child_key}"),
+            reason,
+        }),
+    }
 }
 
 // ─── Public API — mcpServers ──────────────────────────────────────────────────
@@ -237,6 +356,8 @@ pub fn enable_mcp(
     server_def: Value,
 ) -> Result<()> {
     let path = mcp_path(scope, project_root)?;
+    // Never replace a different server of the same name (see the guard note).
+    guard_json(&path, "mcpServers", name, &server_def, false)?;
     splice_nested(&path, "mcpServers", name, Some(server_def))
 }
 
@@ -244,8 +365,17 @@ pub fn enable_mcp(
 /// leaves an empty `mcpServers: {}` object; every other key — crucially the
 /// `~/.claude.json` session state — is preserved. A missing file or missing
 /// key is a no-op.
-pub fn disable_mcp(scope: &str, project_root: Option<&Path>, name: &str) -> Result<()> {
+///
+/// `store_def` is the store's definition for `name`. The entry is removed only
+/// if it is exactly that; a user's own server, or an edited one, is refused.
+pub fn disable_mcp(
+    scope: &str,
+    project_root: Option<&Path>,
+    name: &str,
+    store_def: &Value,
+) -> Result<()> {
     let path = mcp_path(scope, project_root)?;
+    guard_json(&path, "mcpServers", name, store_def, true)?;
     splice_nested(&path, "mcpServers", name, None)
 }
 
@@ -388,8 +518,11 @@ pub fn enable_hook_for(
     let target = hook_target(engine, scope, project_root, file)?;
     strict_key_guard(&target, "hooks")?;
     match target.format {
-        ConfigFormat::JsonEmbedded => splice_nested(&target.path, "hooks", event, Some(block))
-            .map_err(|e| from_anyhow(&target.path, e)),
+        ConfigFormat::JsonEmbedded => {
+            guard_json_typed(&target.path, "hooks", event, &block, false)?;
+            splice_nested(&target.path, "hooks", event, Some(block))
+                .map_err(|e| from_anyhow(&target.path, e))
+        }
         ConfigFormat::Toml => super::toml_merge::enable_hook(&target.path, event, block),
         ConfigFormat::MdYaml => Err(StoreError::Unsupported {
             message: format!("hooks are not an md-yaml primitive for {engine:?}"),
@@ -405,12 +538,16 @@ pub fn disable_hook_for(
     project_root: Option<&Path>,
     file: HookFile,
     event: &str,
+    store_block: &Value,
 ) -> Result<(), StoreError> {
     let target = hook_target(engine, scope, project_root, file)?;
     match target.format {
-        ConfigFormat::JsonEmbedded => splice_nested(&target.path, "hooks", event, None)
-            .map_err(|e| from_anyhow(&target.path, e)),
-        ConfigFormat::Toml => super::toml_merge::disable_hook(&target.path, event),
+        ConfigFormat::JsonEmbedded => {
+            guard_json_typed(&target.path, "hooks", event, store_block, true)?;
+            splice_nested(&target.path, "hooks", event, None)
+                .map_err(|e| from_anyhow(&target.path, e))
+        }
+        ConfigFormat::Toml => super::toml_merge::disable_hook(&target.path, event, store_block),
         ConfigFormat::MdYaml => Err(StoreError::Unsupported {
             message: format!("hooks are not an md-yaml primitive for {engine:?}"),
         }),
@@ -435,6 +572,7 @@ pub fn enable_mcp_for(
     strict_key_guard(&target, parent)?;
     match target.format {
         ConfigFormat::JsonEmbedded => {
+            guard_json_typed(&target.path, "mcpServers", name, &server_def, false)?;
             splice_nested(&target.path, "mcpServers", name, Some(server_def))
                 .map_err(|e| from_anyhow(&target.path, e))
         }
@@ -452,12 +590,16 @@ pub fn disable_mcp_for(
     scope: &str,
     project_root: Option<&Path>,
     name: &str,
+    store_def: &Value,
 ) -> Result<(), StoreError> {
     let target = mcp_target(engine, scope, project_root)?;
     match target.format {
-        ConfigFormat::JsonEmbedded => splice_nested(&target.path, "mcpServers", name, None)
-            .map_err(|e| from_anyhow(&target.path, e)),
-        ConfigFormat::Toml => super::toml_merge::disable_mcp(&target.path, name),
+        ConfigFormat::JsonEmbedded => {
+            guard_json_typed(&target.path, "mcpServers", name, store_def, true)?;
+            splice_nested(&target.path, "mcpServers", name, None)
+                .map_err(|e| from_anyhow(&target.path, e))
+        }
+        ConfigFormat::Toml => super::toml_merge::disable_mcp(&target.path, name, store_def),
         ConfigFormat::MdYaml => Err(StoreError::Unsupported {
             message: format!("mcp is not an md-yaml primitive for {engine:?}"),
         }),
@@ -701,6 +843,153 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
+    // ── Ownership guard: never destroy an entry that isn't the store's ──────
+
+    fn write_json(p: &Path, v: &Value) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    }
+
+    /// The reported bug: "disabling" a hand-written MCP server deleted it,
+    /// env and API keys included.
+    #[test]
+    fn disable_mcp_refuses_a_users_own_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = root.join(".mcp.json");
+        write_json(
+            &p,
+            &json!({ "mcpServers": {
+                "github": { "command": "gh-mcp", "env": { "GITHUB_TOKEN": "ghp_mine" } },
+                "exa": { "command": "exa-mcp" }
+            }}),
+        );
+        let before = fs::read(&p).unwrap();
+
+        let store_def = json!({ "command": "some-other-github-mcp" });
+        let err = disable_mcp("project:demo", Some(root), "github", &store_def).unwrap_err();
+        assert!(err.to_string().contains("refusing to change `mcpServers.github`"), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), before, "config byte-for-byte untouched");
+    }
+
+    /// A store server the user has since edited (a pasted-in API key, say) is
+    /// not silently discarded either.
+    #[test]
+    fn disable_mcp_refuses_an_edited_store_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let def = json!({ "command": "royalti-mcp", "env": { "API_KEY": "" } });
+        enable_mcp("project:demo", Some(root), "royalti", def.clone()).unwrap();
+        let p = root.join(".mcp.json");
+        let mut v: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        v["mcpServers"]["royalti"]["env"]["API_KEY"] = json!("sk-pasted-by-user");
+        write_json(&p, &v);
+        let before = fs::read(&p).unwrap();
+
+        assert!(disable_mcp("project:demo", Some(root), "royalti", &def).is_err());
+        assert_eq!(fs::read(&p).unwrap(), before, "the edit survives");
+    }
+
+    /// Enabling a store server must not replace a user's own server of the
+    /// same name.
+    #[test]
+    fn enable_mcp_refuses_to_replace_a_users_own_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = root.join(".mcp.json");
+        write_json(&p, &json!({ "mcpServers": { "github": { "command": "gh-mcp" } } }));
+        let before = fs::read(&p).unwrap();
+
+        let err = enable_mcp("project:demo", Some(root), "github", json!({ "command": "store-gh" }))
+            .unwrap_err();
+        assert!(err.to_string().contains("Enabling would overwrite it"), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    /// `hooks.<event>` holds every hook on that event. Enabling a store hook
+    /// used to replace the whole array, wiping the user's own hooks, security
+    /// hooks such as a secret scanner included.
+    #[test]
+    fn enable_hook_refuses_to_wipe_existing_hooks_on_the_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = root.join(".claude").join("settings.json");
+        let users_hooks = json!([{ "matcher": "Bash", "hooks": [
+            { "type": "command", "command": ".claude/hooks/secret-scan.sh" }
+        ]}]);
+        write_json(&p, &json!({ "hooks": { "PreToolUse": users_hooks.clone() } }));
+        let before = fs::read(&p).unwrap();
+
+        let store_block = json!([{ "matcher": "Edit", "hooks": [
+            { "type": "command", "command": "store-hook" }
+        ]}]);
+        let err = enable_hook(
+            "project:demo",
+            Some(root),
+            HookFile::Shared,
+            "PreToolUse",
+            store_block,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("refusing to change `hooks.PreToolUse`"), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), before, "the secret-scan hook survives");
+    }
+
+    /// Disabling removes the whole event, so it is refused unless the event
+    /// holds exactly the store's block.
+    #[test]
+    fn disable_hook_refuses_when_the_event_holds_other_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = root.join(".claude").join("settings.json");
+        let store_block = json!([{ "matcher": "Edit", "hooks": [] }]);
+        let mixed = json!([
+            { "matcher": "Edit", "hooks": [] },
+            { "matcher": "Bash", "hooks": [{ "type": "command", "command": "mine" }] }
+        ]);
+        write_json(&p, &json!({ "hooks": { "PreToolUse": mixed } }));
+        let before = fs::read(&p).unwrap();
+
+        assert!(disable_hook(
+            "project:demo",
+            Some(root),
+            HookFile::Shared,
+            "PreToolUse",
+            &store_block
+        )
+        .is_err());
+        assert_eq!(fs::read(&p).unwrap(), before);
+    }
+
+    /// Re-enabling an entry that already equals the store block is idempotent.
+    #[test]
+    fn enable_is_idempotent_when_the_entry_is_already_the_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let def = json!({ "command": "royalti-mcp" });
+        enable_mcp("project:demo", Some(root), "royalti", def.clone()).unwrap();
+        enable_mcp("project:demo", Some(root), "royalti", def.clone()).unwrap();
+        disable_mcp("project:demo", Some(root), "royalti", &def).unwrap();
+    }
+
+    /// The engine-aware path reports the refusal as a typed `NotOurs`.
+    #[test]
+    fn engine_aware_disable_reports_not_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let p = root.join(".mcp.json");
+        write_json(&p, &json!({ "mcpServers": { "github": { "command": "gh-mcp" } } }));
+        let err = disable_mcp_for(
+            EngineId::Claude,
+            "project:demo",
+            Some(root),
+            "github",
+            &json!({ "command": "other" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, StoreError::NotOurs { .. }), "{err:?}");
+    }
+
     // ── Scope grammar (mirrors the pin layer's coverage) ──────────────────
     #[test]
     fn scope_grammar() {
@@ -748,7 +1037,7 @@ mod tests {
         let block = json!([
             { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo hi" } ] }
         ]);
-        enable_hook(scope, Some(root), HookFile::Shared, "PreToolUse", block).unwrap();
+        enable_hook(scope, Some(root), HookFile::Shared, "PreToolUse", block.clone()).unwrap();
 
         let after_add: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         // Hook landed under hooks.PreToolUse.
@@ -763,7 +1052,7 @@ mod tests {
             &json!({ "type": "command", "command": "~/bin/sl" })
         );
 
-        disable_hook(scope, Some(root), HookFile::Shared, "PreToolUse").unwrap();
+        disable_hook(scope, Some(root), HookFile::Shared, "PreToolUse", &block).unwrap();
         let after_remove = fs::read(&p).unwrap();
 
         // The only delta disable leaves is an empty `hooks: {}` object — assert
@@ -808,7 +1097,7 @@ mod tests {
         let scope = "project:demo";
 
         let def = json!({ "type": "stdio", "command": "royalti-mcp", "args": ["--stdio"] });
-        enable_mcp(scope, Some(root), "royalti", def).unwrap();
+        enable_mcp(scope, Some(root), "royalti", def.clone()).unwrap();
 
         let after_add: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
         let servers = after_add.get("mcpServers").unwrap();
@@ -819,7 +1108,7 @@ mod tests {
             &json!({ "type": "stdio", "command": "exa-mcp", "args": [] })
         );
 
-        disable_mcp(scope, Some(root), "royalti").unwrap();
+        disable_mcp(scope, Some(root), "royalti", &def).unwrap();
         let after_remove = fs::read(&p).unwrap();
         assert_eq!(
             after_remove, baseline,
@@ -865,7 +1154,7 @@ mod tests {
         std::env::set_var("USERPROFILE", home);
 
         let def = json!({ "type": "stdio", "command": "royalti-mcp", "args": [] });
-        enable_mcp("workspace", None, "royalti", def).unwrap();
+        enable_mcp("workspace", None, "royalti", def.clone()).unwrap();
 
         let after_add: Value = serde_json::from_slice(&fs::read(&claude_json).unwrap()).unwrap();
         // Session keys still present & equal after the add.
@@ -880,7 +1169,7 @@ mod tests {
         assert!(servers.get("royalti").is_some());
         assert!(servers.get("pencil").is_some());
 
-        disable_mcp("workspace", None, "royalti").unwrap();
+        disable_mcp("workspace", None, "royalti", &def).unwrap();
         let after_remove = fs::read(&claude_json).unwrap();
 
         // Restore HOME/USERPROFILE before any assertion can early-return.
@@ -904,8 +1193,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // No files exist yet.
-        disable_hook("project:demo", Some(root), HookFile::Local, "PreToolUse").unwrap();
-        disable_mcp("project:demo", Some(root), "nope").unwrap();
+        disable_hook("project:demo", Some(root), HookFile::Local, "PreToolUse", &json!([])).unwrap();
+        disable_mcp("project:demo", Some(root), "nope", &json!({})).unwrap();
         assert!(!root.join(".claude").join("settings.local.json").exists());
         assert!(!root.join(".mcp.json").exists());
     }
@@ -1004,7 +1293,7 @@ mod tests {
             Some(root),
             HookFile::Shared,
             "PreToolUse",
-            block,
+            block.clone(),
         )
         .unwrap();
         let p = root.join(".claude").join("settings.json");
@@ -1016,6 +1305,7 @@ mod tests {
             Some(root),
             HookFile::Shared,
             "PreToolUse",
+            &block,
         )
         .unwrap();
         let v2: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
@@ -1040,7 +1330,7 @@ mod tests {
 
         let def = json!({ "command": "royalti-mcp", "args": ["--stdio"] });
         // user scope → no project root needed for Codex
-        enable_mcp_for(EngineId::Codex, "workspace", None, "royalti", def).unwrap();
+        enable_mcp_for(EngineId::Codex, "workspace", None, "royalti", def.clone()).unwrap();
 
         // target resolves to ~/.codex/config.toml
         assert_eq!(
@@ -1061,7 +1351,7 @@ mod tests {
             .and_then(|m| m.get("exa"))
             .is_some());
 
-        disable_mcp_for(EngineId::Codex, "workspace", None, "royalti").unwrap();
+        disable_mcp_for(EngineId::Codex, "workspace", None, "royalti", &def).unwrap();
         assert_eq!(
             fs::read(&cfg).unwrap(),
             baseline,
@@ -1134,12 +1424,12 @@ mod tests {
         write_object(&settings, &m).unwrap();
 
         let def = json!({ "command": "royalti-mcp", "args": [] });
-        enable_mcp_for(EngineId::Gemini, "workspace", None, "royalti", def).unwrap();
+        enable_mcp_for(EngineId::Gemini, "workspace", None, "royalti", def.clone()).unwrap();
         let v: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
         assert!(v.pointer("/mcpServers/royalti").is_some());
         assert_eq!(v.get("theme").unwrap(), &json!("dark"));
 
-        disable_mcp_for(EngineId::Gemini, "workspace", None, "royalti").unwrap();
+        disable_mcp_for(EngineId::Gemini, "workspace", None, "royalti", &def).unwrap();
         let v2: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
         assert!(v2.pointer("/mcpServers/royalti").is_none());
         assert_eq!(v2.get("theme").unwrap(), &json!("dark"));

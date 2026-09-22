@@ -8,7 +8,7 @@
 // `unimplemented!()` from Rust for phase 1 — the wrappers are typed today so
 // later phases just fill in the Rust side.
 
-import type { WindowDescriptor } from '@ikenga/contract';
+import type { NgwaSnapshot, WindowDescriptor } from '@ikenga/contract';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
@@ -1170,6 +1170,16 @@ export async function engineLayout(): Promise<EngineLayout[]> {
 	return invoke<EngineLayout[]>('engine_layout');
 }
 
+/**
+ * Ngwa unified snapshot (WP-14 / G-NGWA-ITEM).
+ * Joins pkg kernel, Ọba Claude-asset store, engine-config scan,
+ * engine_assets registry, and trust state into a unified snapshot
+ * with transcript JSONL usage mirror.
+ */
+export async function ngwaSnapshot(): Promise<NgwaSnapshot> {
+	return invoke<NgwaSnapshot>('ngwa_snapshot');
+}
+
 // ─── Claude config — 4-tier layered discovery (Phase 4) ──────────────────────
 //
 // New surface for the Claude Config Browser UI. Returns *all* sources for each
@@ -1579,7 +1589,13 @@ export async function claudePrimitiveCopy(
 	kind: ClaudeStoreKind,
 	name: string,
 	fromScope: ClaudeStoreScope,
-	toScope: ClaudeStoreScope
+	toScope: ClaudeStoreScope,
+	/**
+	 * A real file or folder already at the destination is refused unless
+	 * `overwrite` is true. Only pass it after the user has confirmed that
+	 * exact path will be replaced.
+	 */
+	opts: { overwrite?: boolean } = {}
 ): Promise<ClaudeStoreMutation> {
 	if (NGWA_STORE_MOCK) {
 		const entry = ngwaMockFind(kind, name);
@@ -1592,6 +1608,7 @@ export async function claudePrimitiveCopy(
 		name,
 		fromScope,
 		toScope,
+		overwrite: opts.overwrite ?? false,
 	});
 }
 
@@ -1605,7 +1622,13 @@ export async function claudePrimitiveMove(
 	kind: ClaudeStoreKind,
 	name: string,
 	fromScope: ClaudeStoreScope,
-	toScope: ClaudeStoreScope
+	toScope: ClaudeStoreScope,
+	/**
+	 * A real file or folder already at the destination is refused unless
+	 * `overwrite` is true. Only pass it after the user has confirmed that
+	 * exact path will be replaced.
+	 */
+	opts: { overwrite?: boolean } = {}
 ): Promise<ClaudeStoreMutation> {
 	if (NGWA_STORE_MOCK) {
 		const entry = ngwaMockFind(kind, name);
@@ -1621,6 +1644,7 @@ export async function claudePrimitiveMove(
 		name,
 		fromScope,
 		toScope,
+		overwrite: opts.overwrite ?? false,
 	});
 }
 
@@ -2341,7 +2365,8 @@ export async function spikeGrantFsRead(capabilityId: string, path: string): Prom
 export type PkgInstallSource =
 	| { kind: 'builtin' }
 	| { kind: 'registry'; url: string; publisher_key: string | null }
-	| { kind: 'local'; path: string };
+	| { kind: 'local'; path: string }
+	| { kind: 'dev'; path: string };
 
 export interface PkgInstalledSummary {
 	id: string;
@@ -2742,6 +2767,21 @@ export interface OrphanReport {
  *  omitted (the FE renders those as a green check). */
 export async function dataHealthScan(): Promise<OrphanReport[]> {
 	return invoke<OrphanReport[]>('data_health_scan');
+}
+
+/** On-disk byte sizes of the shell database and its SQLite `-wal` / `-shm`
+ *  siblings (DEC-32, WP-16a). `null` means the file is absent, never zero.
+ *  Mirrors the Rust `DbFileSizes` (commands/data_health.rs). */
+export interface DbFileSizes {
+	db_path: string;
+	db_bytes: number | null;
+	wal_bytes: number | null;
+	shm_bytes: number | null;
+}
+
+/** Stat the database files (read-only; opens nothing). */
+export async function dataHealthDbSize(): Promise<DbFileSizes> {
+	return invoke<DbFileSizes>('data_health_db_size');
 }
 
 export interface PkgSettingsField {

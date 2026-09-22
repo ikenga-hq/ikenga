@@ -82,7 +82,7 @@ import {
 	siblingSystemsOf,
 	summarizeSystems,
 	type ItemState,
-	type NgwaItem,
+	type EngineConfigItem,
 	type NgwaKindId,
 	type NgwaScopeId,
 	type NgwaSurfaceId,
@@ -319,7 +319,7 @@ function Legend() {
 }
 
 // ─── Scope filtering shared by both surfaces ────────────────────────────────
-function passScope(it: NgwaItem, scope: NgwaScopeId): boolean {
+function passScope(it: EngineConfigItem, scope: NgwaScopeId): boolean {
 	if (scope === 'all') return true;
 	if (scope === 'personal') return it.scope === 'personal';
 	// `project:<id>` — narrow to the one project this item belongs to.
@@ -436,7 +436,7 @@ function useResizableSplit(
 // ─── BROWSE surface (2-pane: list │ resizable divider │ detail) ─────────────
 
 interface BrowseProps {
-	items: NgwaItem[];
+	items: EngineConfigItem[];
 	scope: NgwaScopeId;
 	kind: NgwaKindId;
 	activeSystems: ReadonlySet<NgwaSystemId>;
@@ -488,10 +488,10 @@ function BrowseSurface({
 	// sub-header rather than interleaving. Only emitted when more than one engine
 	// is active — a single active engine collapses to the flat list so the
 	// Claude-only view is byte-identical to today (regression guard).
-	const engineGroups = useMemo<Array<{ system: NgwaSystemId; items: NgwaItem[] }> | null>(() => {
+	const engineGroups = useMemo<Array<{ system: NgwaSystemId; items: EngineConfigItem[] }> | null>(() => {
 		const activeCount = present.filter((e) => activeSystems.has(e)).length;
 		if (activeCount <= 1) return null;
-		const by = new Map<NgwaSystemId, NgwaItem[]>();
+		const by = new Map<NgwaSystemId, EngineConfigItem[]>();
 		for (const it of list) {
 			if (!by.has(it.system)) by.set(it.system, []);
 			by.get(it.system)!.push(it);
@@ -502,7 +502,7 @@ function BrowseSurface({
 
 	// A short path hint for an engine sub-header, derived from the first row's
 	// on-disk path (e.g. `.gemini/agents`). Falls back to the engine display.
-	function enginePathHint(its: NgwaItem[]): string {
+	function enginePathHint(its: EngineConfigItem[]): string {
 		const p = its[0]?.path ?? '';
 		const m = p.match(/(\.(?:claude|gemini|codex)\/[a-z]+)/);
 		return m ? m[1] : ENGINE_META[its[0]?.system ?? 'claude'].display;
@@ -1122,7 +1122,7 @@ function BrowseRow({
 	onClick,
 	showEngineMeta = false,
 }: {
-	item: NgwaItem;
+	item: EngineConfigItem;
 	active: boolean;
 	onClick: () => void;
 	/** Multi-engine (facet) mode: show the per-row format chip + deprecated chip.
@@ -1175,7 +1175,7 @@ function BrowseRow({
 // ─── REGISTRY surface (full-width 8-col table + @filter DSL + bulk) ─────────
 
 interface RegistryProps {
-	items: NgwaItem[];
+	items: EngineConfigItem[];
 	store: ClaudeStoreEntry[];
 	scope: NgwaScopeId;
 	activeSystems: ReadonlySet<NgwaSystemId>;
@@ -1214,7 +1214,7 @@ function RegistrySurface({
 
 	// @filter DSL: chips + inline `@token`s in the query. Free words match
 	// name/description; recognised `@token`s narrow scope/state/kind.
-	function pass(it: NgwaItem): boolean {
+	function pass(it: EngineConfigItem): boolean {
 		if (!passScope(it, scope)) return false;
 		if (!activeSystems.has(it.system)) return false;
 		for (const f of chips) {
@@ -1258,7 +1258,7 @@ function RegistrySurface({
 		});
 	}
 
-	function toggleEnabled(it: NgwaItem) {
+	function toggleEnabled(it: EngineConfigItem) {
 		if (it.state === 'enabled') {
 			disable.mutate({ kind: it.storeKind, name: it.name, scope: it.scopeKey });
 		} else if (it.state === 'disabled') {
@@ -1520,7 +1520,7 @@ const cellCenter: React.CSSProperties = {
 	fontSize: 11,
 };
 
-function matchToken(it: NgwaItem, w: string): boolean {
+function matchToken(it: EngineConfigItem, w: string): boolean {
 	switch (w) {
 		case 'personal':
 			return it.scope === 'personal';
@@ -1586,7 +1586,7 @@ function ItemDetail({
 	present = ['claude'],
 	headingId,
 }: {
-	item: NgwaItem;
+	item: EngineConfigItem;
 	projectScopes: Array<{ key: ClaudeStoreScope; label: string }>;
 	onEdit: (path: string) => void;
 	/** Other engines that have a primitive of the same kind+name (cross-engine
@@ -1965,7 +1965,7 @@ function ItemDetail({
 	);
 }
 
-function detailParts(item: NgwaItem): {
+function detailParts(item: EngineConfigItem): {
 	fmRows: Array<[string, React.ReactNode]>;
 	chips: React.ReactNode;
 	body: string;

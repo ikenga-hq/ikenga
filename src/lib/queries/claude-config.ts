@@ -431,10 +431,15 @@ export function useCopyPrimitive() {
 			name: string;
 			fromScope: ClaudeStoreScope;
 			toScope: ClaudeStoreScope;
+			/** Replace a real destination. Only after the user confirmed that
+			 *  exact overwrite (Ngwa "Update personal", DEC-31). */
+			overwrite?: boolean;
 		}
 	>({
-		mutationFn: ({ kind, name, fromScope, toScope }) =>
-			claudePrimitiveCopy(kind, name, fromScope, toScope),
+		mutationFn: ({ kind, name, fromScope, toScope, overwrite }) =>
+			overwrite
+				? claudePrimitiveCopy(kind, name, fromScope, toScope, { overwrite: true })
+				: claudePrimitiveCopy(kind, name, fromScope, toScope),
 		onSuccess: invalidate,
 	});
 }

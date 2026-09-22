@@ -5,12 +5,12 @@
 
 import { useMemo, useState } from 'react';
 import type { ClaudeStoreEntry } from '@/lib/tauri-cmd';
-import type { NgwaItem } from '../ngwa-surface';
+import type { EngineConfigItem } from '../ngwa-surface';
 import { StoreMatrix } from './store-matrix';
 import { buildStoreModel, filterStoreModel } from './store-model';
 
 interface StoreMapProps {
-	items: NgwaItem[];
+	items: EngineConfigItem[];
 	store: ClaudeStoreEntry[];
 }
 
