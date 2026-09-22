@@ -115,8 +115,8 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		defaultOrder: 7,
 		render: (ctx) => React.createElement(ViewsSection, ctx),
 		useCount: () => {
-			const { entries } = usePkgActivityBarEntries();
-			return entries.length;
+			const { views } = usePkgActivityBarEntries();
+			return views.length;
 		},
 		contextMenu: () => viewsContextMenu,
 	},

@@ -2,7 +2,8 @@ import { useCallback } from 'react';
 import { LayoutGrid } from 'lucide-react';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { usePkgActivityBarEntries } from '@/lib/pkg/use-activity-bar-entries';
+import { usePkgActivityBarEntries, type PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
+import { PinIcon } from '@/shell/pin-icon';
 import type { ExplorerSectionContext } from '../section-registry';
 
 export const viewsContextMenu = [
@@ -12,8 +13,14 @@ export const viewsContextMenu = [
 	{ id: 'open-ngwa', label: 'Open pkg in Ngwa', run: () => {} },
 ];
 
+/** Explorer **Views** section — renders every `ui.views[]` contribution
+ *  across installed pkgs (manifest v5, G-MANIFEST-V5 §2). The `views` list
+ *  from `usePkgActivityBarEntries` is registry-canonical: during the `ui.nav`
+ *  alias window the kernel already mapped `nav[i]` → `views[i]`, so nothing
+ *  here needs a legacy fallback. Each row opens the view's pane route
+ *  (`/pkg/<id><route>`) in the focused pane. */
 export function ViewsSection(_ctx: ExplorerSectionContext) {
-	const { entries, loaded } = usePkgActivityBarEntries();
+	const { views, loaded } = usePkgActivityBarEntries();
 
 	const openView = useCallback((route: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -25,7 +32,7 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
 	}, []);
 
-	if (loaded && entries.length === 0) {
+	if (loaded && views.length === 0) {
 		return (
 			<div className="p-4 text-center">
 				<h3 className="text-sm font-semibold">No contributed views</h3>
@@ -45,16 +52,25 @@ export function ViewsSection(_ctx: ExplorerSectionContext) {
 
 	return (
 		<div className="py-1">
-			{entries.map((entry) => (
+			{views.map((view: PkgViewEntry) => (
 				<ListRow
-					key={entry.id}
+					key={view.qualified_id}
 					size="sm"
-					onActivate={() => openView(entry.route)}
-					title={entry.label}
+					onActivate={() => openView(view.pane_route)}
+					title={view.title}
 					className="w-full gap-1.5 px-2"
 				>
-					<LayoutGrid className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					<span className="flex-1 truncate text-xs">{entry.label}</span>
+					<PinIcon
+						iconLucide={view.icon ?? null}
+						iconEmoji={null}
+						Fallback={LayoutGrid}
+						sizeClass="h-3.5 w-3.5"
+						className="shrink-0 text-muted-foreground"
+					/>
+					<span className="flex-1 truncate text-xs">{view.title}</span>
+					<span className="shrink-0 truncate text-[10px] text-muted-foreground/70">
+						{view.pkg_name}
+					</span>
 				</ListRow>
 			))}
 		</div>

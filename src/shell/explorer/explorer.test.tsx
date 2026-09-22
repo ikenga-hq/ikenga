@@ -7,7 +7,11 @@ import { ExplorerHeader } from './explorer-header';
 import { SectionFrame } from './section-frame';
 import { builtInSections } from './section-registry';
 import { listExplorerSections as bridgeListSections } from '@/lib/iyke/explorer-bridge';
-import { filesContextMenu, filesFileContextMenu, filesDirectoryContextMenu } from './sections/files';
+import {
+	filesContextMenu,
+	filesFileContextMenu,
+	filesDirectoryContextMenu,
+} from './sections/files';
 import { artifactsContextMenu } from './sections/artifacts';
 import { sessionsContextMenu } from './sections/sessions';
 import { ngwaProjectContextMenu } from './sections/ngwa-project';
@@ -79,7 +83,18 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 			activeProjectId: 'royalti-co',
 			activeProject: { id: 'royalti-co', root_path: '/path/to/royalti-co', extra_roots: [] },
 			projects: [
-				{ id: 'royalti-co', display_name: 'royalti-co', root_path: '/path/to/royalti-co', icon: null, color: null, description: null, position: 0, is_default: false, created_at: 0, archived_at: null },
+				{
+					id: 'royalti-co',
+					display_name: 'royalti-co',
+					root_path: '/path/to/royalti-co',
+					icon: null,
+					color: null,
+					description: null,
+					position: 0,
+					is_default: false,
+					created_at: 0,
+					archived_at: null,
+				},
 			],
 			explorerSections: [
 				{ id: 'files', source: 'shell', order: 0, collapsed: false },
@@ -98,7 +113,7 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		(useShellStore as any).mockImplementation((selector: any) => selector(mockShellStoreState));
 		(useTerminalStore as any).mockImplementation((selector: any) => selector({ tabs: [] }));
 		(useGitStatus as any).mockReturnValue({ data: { files: new Map(), dirtyFolders: new Set() } });
-		(usePkgActivityBarEntries as any).mockReturnValue({ entries: [], loaded: true });
+		(usePkgActivityBarEntries as any).mockReturnValue({ entries: [], views: [], loaded: true });
 	});
 
 	it('DoD 1: all eight sections render for royalti-co', () => {
@@ -138,7 +153,12 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		};
 
 		const { unmount, queryByText, getByText } = render(
-			<SectionFrame section={sectionDefWithZero as any} context={ctx} isOpen={true} onToggle={() => {}}>
+			<SectionFrame
+				section={sectionDefWithZero as any}
+				context={ctx}
+				isOpen={true}
+				onToggle={() => {}}
+			>
 				<div>Child</div>
 			</SectionFrame>
 		);
@@ -149,7 +169,12 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 
 		// Badge with 5 should render
 		render(
-			<SectionFrame section={sectionDefWithCount as any} context={ctx} isOpen={true} onToggle={() => {}}>
+			<SectionFrame
+				section={sectionDefWithCount as any}
+				context={ctx}
+				isOpen={true}
+				onToggle={() => {}}
+			>
 				<div>Child</div>
 			</SectionFrame>
 		);
