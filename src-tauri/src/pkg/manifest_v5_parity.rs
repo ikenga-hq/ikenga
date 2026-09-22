@@ -46,10 +46,13 @@ const FIXTURE_ROOT: &str = concat!(
     "/../../contract/src/__fixtures__/manifest-v5"
 );
 
+/// `IKENGA_CONTRACT_DIR` overrides the sibling-checkout convention (CI checks
+/// the contract repo out inside the workspace and points here).
 fn fixture_root() -> PathBuf {
-    Path::new(FIXTURE_ROOT)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(FIXTURE_ROOT))
+    let root = std::env::var_os("IKENGA_CONTRACT_DIR")
+        .map(|d| PathBuf::from(d).join("src/__fixtures__/manifest-v5"))
+        .unwrap_or_else(|| PathBuf::from(FIXTURE_ROOT));
+    root.canonicalize().unwrap_or(root)
 }
 
 /// Sorted `*.json` paths in one verdict folder. `None` when the contract
@@ -58,6 +61,11 @@ fn fixture_root() -> PathBuf {
 fn folder_paths(folder: &str) -> Option<Vec<PathBuf>> {
     let dir = fixture_root().join(folder);
     if !dir.is_dir() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "manifest_v5_parity: {} not found under CI — check out ikenga-contract and set IKENGA_CONTRACT_DIR",
+            dir.display()
+        );
         eprintln!(
             "manifest_v5_parity: skipping `{folder}` — {} not found \
              (sibling contract/ checkout absent)",

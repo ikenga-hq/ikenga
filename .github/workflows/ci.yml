@@ -254,6 +254,23 @@ jobs:
       # + link of the test binary rather than a second full build. Keep this
       # scoped: a Tauri debug build is large (check + test filled ~40 GB of
       # target/ locally), so widening it to --all-targets risks runner disk.
+      # Sibling repos the manifest-v5 parity + pkg-fleet tests read (WP-28).
+      # `actions/checkout` can't write outside the workspace, so they land
+      # under `_siblings/` and the tests are pointed there via env.
+      - name: Checkout @ikenga/contract (fixtures)
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-contract
+          path: _siblings/contract
+      - name: Checkout ikenga-pkgs (manifest fleet)
+        uses: actions/checkout@v6
+        with:
+          repository: ikenga-hq/ikenga-pkgs
+          path: _siblings/ikenga-pkgs
+
       - name: cargo test
         working-directory: src-tauri
+        env:
+          IKENGA_CONTRACT_DIR: ${{ github.workspace }}/_siblings/contract
+          IKENGA_PKGS_DIR: ${{ github.workspace }}/_siblings/ikenga-pkgs
         run: cargo test --lib --no-fail-fast
