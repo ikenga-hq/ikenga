@@ -95,6 +95,7 @@ commands.allow = [
   "comment_record_routing",
   "comment_route",
   "comment_set_status",
+  "data_health_db_size",
   "data_health_scan",
   "db_exec",
   "db_export_ndjson",

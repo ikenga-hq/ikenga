@@ -87,7 +87,7 @@ pub use comments::{
     comment_create, comment_delete, comment_get, comment_list, comment_record_routing,
     comment_set_status, pin_screenshot_write,
 };
-pub use data_health::data_health_scan;
+pub use data_health::{data_health_db_size, data_health_scan};
 pub use db::{db_exec, db_query};
 pub use desktop::{iyke_mcp_info, set_dock_badge};
 pub use engine_layout::engine_layout;

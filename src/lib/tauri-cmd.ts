@@ -2769,6 +2769,21 @@ export async function dataHealthScan(): Promise<OrphanReport[]> {
 	return invoke<OrphanReport[]>('data_health_scan');
 }
 
+/** On-disk byte sizes of the shell database and its SQLite `-wal` / `-shm`
+ *  siblings (DEC-32, WP-16a). `null` means the file is absent, never zero.
+ *  Mirrors the Rust `DbFileSizes` (commands/data_health.rs). */
+export interface DbFileSizes {
+	db_path: string;
+	db_bytes: number | null;
+	wal_bytes: number | null;
+	shm_bytes: number | null;
+}
+
+/** Stat the database files (read-only; opens nothing). */
+export async function dataHealthDbSize(): Promise<DbFileSizes> {
+	return invoke<DbFileSizes>('data_health_db_size');
+}
+
 export interface PkgSettingsField {
 	key: string;
 	type: string;

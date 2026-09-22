@@ -25,6 +25,8 @@ interface NavItem {
 	to: string;
 	label: string;
 	Icon: LucideIcon;
+	/** Shown when the entry leaves Settings (e.g. "Ngwa"). */
+	badge?: string;
 }
 
 interface NavSection {
@@ -43,9 +45,21 @@ const NAV: NavSection[] = [
 			{ to: '/settings/agent', label: 'Agent', Icon: Bot },
 			{ to: '/settings/terminal', label: 'Terminal', Icon: Terminal },
 			{ to: '/settings/packages', label: 'Packages', Icon: Package },
-			{ to: '/settings/pkg-audit', label: 'Pkg violations', Icon: ShieldAlert },
-			{ to: '/settings/pkg-health', label: 'Pkg health', Icon: Stethoscope },
-			{ to: '/settings/data-health', label: 'Data health', Icon: DatabaseZap },
+			// WP-16a: these three moved to Ngwa → Health. Linked there directly and
+			// badged "Ngwa" so the jump out of Settings is announced, not a bounce.
+			{
+				to: '/ngwa/health?section=violations',
+				label: 'Pkg violations',
+				Icon: ShieldAlert,
+				badge: 'Ngwa',
+			},
+			{
+				to: '/ngwa/health?section=violations',
+				label: 'Pkg health',
+				Icon: Stethoscope,
+				badge: 'Ngwa',
+			},
+			{ to: '/ngwa/health?section=data', label: 'Data health', Icon: DatabaseZap, badge: 'Ngwa' },
 			{ to: '/settings/onboarding', label: 'Onboarding', Icon: Sparkles },
 		],
 	},
@@ -79,13 +93,15 @@ export function SettingsMode() {
 		<SidebarNav ariaLabel="Settings navigation">
 			{NAV.map((sec) => (
 				<SidebarNavSection key={sec.label} label={sec.label}>
-					{sec.items.map(({ to, label, Icon }) => {
-						const isActive = activePath === to || activePath?.startsWith(`${to}/`) === true;
+					{sec.items.map(({ to, label, Icon, badge }) => {
+						const isActive =
+							!badge && (activePath === to || activePath?.startsWith(`${to}/`) === true);
 						return (
 							<SidebarNavRow
-								key={to}
+								key={`${to}:${label}`}
 								icon={Icon}
 								label={label}
+								badge={badge}
 								active={isActive}
 								onSelect={() => navigateFocused(to)}
 							/>

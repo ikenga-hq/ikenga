@@ -199,6 +199,56 @@ pub async fn data_health_scan(db: State<'_, Arc<PaDb>>) -> Result<Vec<OrphanRepo
     scan_orphans(&pool).await
 }
 
+/// On-disk byte sizes of the shell database and its SQLite sidecar files
+/// (DEC-32, WP-16a). `None` means the file is absent — not zero. The WAL and
+/// shared-memory files only exist while a connection has the database open in
+/// WAL mode, so `None` for them is normal.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DbFileSizes {
+    /// Absolute path of the main database file that was measured.
+    pub db_path: String,
+    pub db_bytes: Option<u64>,
+    pub wal_bytes: Option<u64>,
+    pub shm_bytes: Option<u64>,
+}
+
+/// `<db_path>` + `suffix`, e.g. `pa.db` → `pa.db-wal` (SQLite's naming).
+fn sibling_with_suffix(db_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = db_path.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+/// Byte size of one file via `metadata` only. Absent → `Ok(None)`. Any other
+/// failure (permission, not a regular file) is an error, never a silent `None`.
+fn file_size(path: &std::path::Path) -> Result<Option<u64>, String> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Ok(Some(m.len())),
+        Ok(_) => Err(format!("{} is not a regular file", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("stat {}: {e}", path.display())),
+    }
+}
+
+/// Measure the database and its `-wal` / `-shm` siblings. **Read-only**: it
+/// only calls `metadata` and never opens any of the files, so it cannot
+/// create, lock, truncate or checkpoint anything.
+pub fn measure_db_files(db_path: &std::path::Path) -> Result<DbFileSizes, String> {
+    Ok(DbFileSizes {
+        db_path: db_path.to_string_lossy().into_owned(),
+        db_bytes: file_size(db_path)?,
+        wal_bytes: file_size(&sibling_with_suffix(db_path, "-wal"))?,
+        shm_bytes: file_size(&sibling_with_suffix(db_path, "-shm"))?,
+    })
+}
+
+/// DEC-32: report the database file sizes for Ngwa → Health → Data. Stats the
+/// files only; does not touch the connection pools.
+#[tauri::command]
+pub async fn data_health_db_size(db: State<'_, Arc<PaDb>>) -> Result<DbFileSizes, String> {
+    measure_db_files(db.db_path_for_diag())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +337,62 @@ mod tests {
             !reports.iter().any(|r| r.table == "tasks" && r.column == "parent_task_id"),
             "a task pointing at a real parent must not be flagged; got {reports:?}"
         );
+    }
+
+    /// DEC-32: sizes come from the files on disk, an absent sibling is `None`
+    /// (never 0), and measuring changes nothing — contents and modified time
+    /// are identical afterwards and no sibling file is created.
+    #[test]
+    fn measure_db_files_reports_sizes_and_writes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("pa.db");
+        std::fs::write(&db, b"0123456789").expect("write db");
+        std::fs::write(tmp.path().join("pa.db-wal"), b"abc").expect("write wal");
+        let before_mtime = std::fs::metadata(&db).unwrap().modified().unwrap();
+
+        let sizes = measure_db_files(&db).expect("measure");
+        assert_eq!(sizes.db_bytes, Some(10));
+        assert_eq!(sizes.wal_bytes, Some(3));
+        assert_eq!(sizes.shm_bytes, None, "absent -shm must be None, not 0");
+        assert_eq!(sizes.db_path, db.to_string_lossy());
+
+        assert_eq!(std::fs::read(&db).unwrap(), b"0123456789");
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        assert!(
+            !tmp.path().join("pa.db-shm").exists(),
+            "measuring must not create -shm"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["pa.db".to_string(), "pa.db-wal".to_string()]);
+    }
+
+    /// A database that does not exist yet measures as all-`None` and is not
+    /// created by the measurement.
+    #[test]
+    fn measure_db_files_absent_db_is_none_and_not_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("missing.db");
+        let sizes = measure_db_files(&db).expect("measure");
+        assert_eq!(
+            (sizes.db_bytes, sizes.wal_bytes, sizes.shm_bytes),
+            (None, None, None)
+        );
+        assert!(!db.exists());
+    }
+
+    /// A directory where the database file should be is an error, not a size.
+    #[test]
+    fn measure_db_files_non_file_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("pa.db");
+        std::fs::create_dir(&db).expect("mkdir");
+        assert!(measure_db_files(&db).is_err());
     }
 }
