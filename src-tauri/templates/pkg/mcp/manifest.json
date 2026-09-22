@@ -1,0 +1,27 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "skill",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+
+  "mcp": [
+    {
+      "name": "{{slug}}",
+      "command": "bun",
+      "args": ["run", "src/index.ts"],
+      "lifecycle": "long-lived",
+      "restart_when_changed": ["src/**/*.ts"]
+    }
+  ],
+
+  "permissions": {
+    "shell.execute": ["bun"],
+    "fs.read": [],
+    "fs.write": [],
+    "net": [],
+    "supabase.tables": [],
+    "vault.keys": []
+  }
+}

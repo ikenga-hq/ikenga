@@ -109,6 +109,15 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'Project switcher',
 	},
+	// --- Ngwa create (WP-26) ---
+	{
+		command: 'ngwa.create',
+		key: 'mod+n',
+		when: 'not-input',
+		source: 'default',
+		label: 'Ngwa → Create',
+		knownOverlap: ['menu.new-session'],
+	},
 	// Documented for `conflicts()` only — same key as `palette.open`, but a
 	// different `when` is precedence, not a clash (§6A.5). The terminal's own
 	// listener (src/terminal/keybindings.ts, do-not-touch) still owns this.
@@ -329,6 +338,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'New Session',
 		platformOnly: 'mac',
+		knownOverlap: ['ngwa.create'],
 	},
 	{
 		command: 'menu.open-file',

@@ -1,0 +1,31 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "embedded",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+
+  "ui": {
+    "routes": [
+      {
+        "path": "/",
+        "kind": "iframe",
+        "source": "http://localhost:5173"
+      }
+    ]
+  },
+
+  "capabilities": {
+    "supabase": { "required": false }
+  },
+
+  "permissions": {
+    "shell.execute": [],
+    "fs.read": [],
+    "fs.write": [],
+    "net": [],
+    "supabase.tables": [],
+    "vault.keys": []
+  }
+}

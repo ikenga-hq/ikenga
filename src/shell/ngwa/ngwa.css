@@ -1601,3 +1601,35 @@
 	background: var(--bg-surface);
 }
 
+/* Ngwa Create Surface (WP-24 / locked D-02) */
+.ngwa-create-container {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg-base);
+	color: var(--fg);
+}
+
+.ngwa-create-subhead {
+	height: 32px;
+	flex: none;
+	background: var(--bg-surface);
+	border-bottom: 1px solid var(--border);
+}
+
+.ngwa-create-kinds-col {
+	background: var(--bg-surface);
+	border-right: 1px solid var(--border);
+}
+
+.ngwa-create-form-col {
+	background: var(--bg-base);
+}
+
+.ngwa-create-preview-col {
+	background: var(--bg-surface);
+	border-left: 1px solid var(--border);
+}
+
+

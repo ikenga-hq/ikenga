@@ -1,0 +1,4 @@
+# Override the workspace-level `dist/` ignore — this template is a thin
+# no-build pkg where dist/ IS the source, not a build output.
+!dist/
+!dist/**

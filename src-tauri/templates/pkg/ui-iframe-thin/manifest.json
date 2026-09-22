@@ -1,0 +1,38 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "embedded",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+
+  "ui": {
+    "routes": [
+      { "path": "/", "kind": "iframe", "source": "dist/index.html" }
+    ],
+    "csp": {
+      "script-src": ["'self'", "'unsafe-inline'", "https://esm.sh"],
+      "style-src":  ["'self'", "'unsafe-inline'", "https://esm.sh"],
+      "font-src":   ["'self'", "https://esm.sh", "data:"],
+      "connect-src": [
+        "'self'",
+        "https://esm.sh",
+        "https://*.supabase.co",
+        "wss://*.supabase.co"
+      ]
+    }
+  },
+
+  "capabilities": {
+    "supabase": { "required": false }
+  },
+
+  "permissions": {
+    "shell.execute": [],
+    "fs.read": [],
+    "fs.write": [],
+    "net": ["https://esm.sh", "https://*.supabase.co"],
+    "supabase.tables": [],
+    "vault.keys": []
+  }
+}

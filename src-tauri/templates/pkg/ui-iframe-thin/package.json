@@ -1,0 +1,22 @@
+{
+  "name": "@ikenga/pkg-{{slug}}",
+  "version": "{{version}}",
+  "description": "{{description}}",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikenga-hq/ikenga-pkgs.git",
+    "directory": "packages/apps/{{slug}}"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "files": [
+    "manifest.json",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "echo 'no build — single-file thin pkg'",
+    "typecheck": "echo 'no ts — single-file thin pkg'"
+  }
+}

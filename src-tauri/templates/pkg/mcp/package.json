@@ -1,0 +1,44 @@
+{
+  "name": "@ikenga/mcp-{{slug}}",
+  "version": "{{version}}",
+  "description": "{{description}}",
+  "license": "Apache-2.0",
+  "author": "{{author_name}}",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikenga-hq/ikenga-pkgs.git",
+    "directory": "packages/mcp/{{slug}}"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "{{slug}}-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "manifest.json",
+    "README.md"
+  ],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

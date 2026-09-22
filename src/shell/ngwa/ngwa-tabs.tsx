@@ -59,17 +59,16 @@ export function NgwaTabs({ activeTab, installedCount }: NgwaTabsProps) {
 				<span className="k">4</span>
 			</Link>
 
-			<span
-				className="ntab opacity-50 cursor-not-allowed"
+			<Link
+				to="/ngwa/create"
+				className={`ntab ${activeTab === 'create' ? 'on' : ''}`}
 				role="tab"
-				aria-selected={false}
-				aria-disabled="true"
-				title="Create surface (coming in WP-17)"
+				aria-selected={activeTab === 'create'}
 			>
 				<Plus className="h-3.5 w-3.5" />
 				<span>Create</span>
 				<span className="k">5</span>
-			</span>
+			</Link>
 		</div>
 	);
 }
