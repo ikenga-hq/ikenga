@@ -2,12 +2,20 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { NgwaStoreSurface } from './ngwa-store-surface';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
 
 afterEach(() => {
 	cleanup();
 });
+
+function renderWithClient(ui: React.ReactElement) {
+	const client = new QueryClient({
+		defaultOptions: { queries: { retry: false } },
+	});
+	return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+}
 
 const mockCatalog: NgwaStoreEntry[] = [
 	{
@@ -92,20 +100,20 @@ const mockCatalog: NgwaStoreEntry[] = [
 
 describe('NgwaStoreSurface', () => {
 	it('renders store catalog items', () => {
-		const { container } = render(<NgwaStoreSurface catalog={mockCatalog} />);
+		const { container } = renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
 		expect(screen.getAllByText('pkg-tasks').length).toBeGreaterThanOrEqual(1);
 		expect(screen.getAllByText('skill-groundwork').length).toBeGreaterThanOrEqual(1);
 		expect(container.querySelector('.updates')).not.toBeNull();
 	});
 
 	it('renders updates banner with correct update count and details', () => {
-		render(<NgwaStoreSurface catalog={mockCatalog} />);
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
 		expect(screen.getByText(/1 update available/i)).toBeDefined();
 		expect(screen.getAllByText(/0.8.2 → 0.8.3/i).length).toBeGreaterThanOrEqual(1);
 	});
 
 	it('filters entries by search query', () => {
-		render(<NgwaStoreSurface catalog={mockCatalog} />);
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
 		const searchInput = screen.getByPlaceholderText('Search the registry…');
 		fireEvent.change(searchInput, { target: { value: 'groundwork' } });
 
@@ -114,7 +122,7 @@ describe('NgwaStoreSurface', () => {
 	});
 
 	it('filters entries by kind facet chip', () => {
-		const { container } = render(<NgwaStoreSurface catalog={mockCatalog} />);
+		const { container } = renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
 		const skillChip = container.querySelector('button[data-kind="skill"]') as HTMLElement;
 		expect(skillChip).toBeDefined();
 		fireEvent.click(skillChip);
@@ -126,7 +134,7 @@ describe('NgwaStoreSurface', () => {
 	it('handles update and install callbacks', () => {
 		const onUpdate = vi.fn();
 		const onInstall = vi.fn();
-		render(
+		renderWithClient(
 			<NgwaStoreSurface
 				catalog={mockCatalog}
 				onUpdate={onUpdate}

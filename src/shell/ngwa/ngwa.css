@@ -1411,3 +1411,193 @@
 .view-ngwa .auditline .ok {
 	color: var(--live);
 }
+
+/* ── Item Detail Full Pane (WP-17 / D-08) ── */
+.view-ngwa-detail {
+	background: var(--bg-surface);
+}
+
+.view-ngwa .idheader {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: var(--space-3) var(--space-4);
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-raised);
+	gap: var(--space-3);
+}
+
+.view-ngwa .idheader-left {
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	min-width: 0;
+}
+
+.view-ngwa .idmark {
+	width: 36px;
+	height: 36px;
+	display: grid;
+	place-items: center;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	background: var(--bg-sunken);
+	color: var(--fg-muted);
+	flex: none;
+}
+
+.view-ngwa .idtitles {
+	min-width: 0;
+}
+
+.view-ngwa .idtitle-line {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+.view-ngwa .idtitle-line h1 {
+	font-size: var(--text-heading, 1.15rem);
+	font-weight: 600;
+	margin: 0;
+	color: var(--fg);
+}
+
+.view-ngwa .vbadge {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	padding: 1px 6px;
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border-soft);
+}
+
+.view-ngwa .idmeta-line {
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 2px;
+}
+
+.view-ngwa .idheader-acts {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .idtabs {
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+	padding: 0 var(--space-4);
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-raised);
+	flex: none;
+}
+
+.view-ngwa .idtab {
+	padding: var(--space-2) var(--space-3);
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+	border: none;
+	background: transparent;
+	border-bottom: 2px solid transparent;
+	cursor: pointer;
+	font-weight: 500;
+}
+
+.view-ngwa .idtab:hover {
+	color: var(--fg);
+}
+
+.view-ngwa .idtab.on {
+	color: var(--primary);
+	border-bottom-color: var(--primary);
+}
+
+.view-ngwa .idbody {
+	padding: var(--space-4);
+	overflow-y: auto;
+}
+
+.view-ngwa .idinner {
+	max-width: 840px;
+}
+
+.view-ngwa .iddesc {
+	font-size: var(--text-body);
+	color: var(--fg-muted);
+	margin: 0 0 var(--space-4);
+	line-height: 1.5;
+}
+
+.view-ngwa .cempty {
+	padding: var(--space-2) var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+/* ── Trust Sheet Modal (WP-18 / D-07) ── */
+.trust-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.6);
+	display: grid;
+	place-items: center;
+	z-index: 1000;
+	padding: var(--space-4);
+}
+
+.trust-sheet {
+	width: 100%;
+	max-width: 580px;
+	max-height: 85vh;
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+	box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.trust-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: var(--space-3) var(--space-4);
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+
+.trust-head .mark {
+	width: 32px;
+	height: 32px;
+	display: grid;
+	place-items: center;
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border-soft);
+}
+
+.trust-body {
+	padding: var(--space-4);
+	overflow-y: auto;
+	flex: 1;
+	min-height: 0;
+}
+
+.trust-foot {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: var(--space-2);
+	padding: var(--space-3) var(--space-4);
+	border-top: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+

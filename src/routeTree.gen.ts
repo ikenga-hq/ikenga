@@ -76,6 +76,7 @@ import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
 import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
 import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
 import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
+import { Route as NgwaItemItemIdRouteImport } from './routes/ngwa/item.$itemId'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
 import { Route as PkgPkgIdSplatRouteImport } from './routes/pkg/$pkgId/$'
 
@@ -414,6 +415,11 @@ const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
   path: '/artifacts/by-kind/$kind',
   getParentRoute: () => rootRouteImport,
 } as any)
+const NgwaItemItemIdRoute = NgwaItemItemIdRouteImport.update({
+  id: '/ngwa/item/$itemId',
+  path: '/ngwa/item/$itemId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PkgPkgIdIndexRoute = PkgPkgIdIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -493,6 +499,7 @@ export interface FileRoutesByFullPath {
   '/project/': typeof ProjectIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
+  '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
   '/pkg/$pkgId/': typeof PkgPkgIdIndexRoute
 }
@@ -561,6 +568,7 @@ export interface FileRoutesByTo {
   '/project': typeof ProjectIndexRoute
   '/settings': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
+  '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
   '/pkg/$pkgId': typeof PkgPkgIdIndexRoute
 }
@@ -633,6 +641,7 @@ export interface FileRoutesById {
   '/project/': typeof ProjectIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
+  '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
   '/pkg/$pkgId/': typeof PkgPkgIdIndexRoute
 }
@@ -706,6 +715,7 @@ export interface FileRouteTypes {
     | '/project/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
+    | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
     | '/pkg/$pkgId/'
   fileRoutesByTo: FileRoutesByTo
@@ -774,6 +784,7 @@ export interface FileRouteTypes {
     | '/project'
     | '/settings'
     | '/artifacts/by-kind/$kind'
+    | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
     | '/pkg/$pkgId'
   id:
@@ -845,6 +856,7 @@ export interface FileRouteTypes {
     | '/project/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
+    | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
     | '/pkg/$pkgId/'
   fileRoutesById: FileRoutesById
@@ -886,6 +898,7 @@ export interface RootRouteChildren {
   NgwaIndexRoute: typeof NgwaIndexRoute
   ProjectIndexRoute: typeof ProjectIndexRoute
   ArtifactsByKindKindRoute: typeof ArtifactsByKindKindRoute
+  NgwaItemItemIdRoute: typeof NgwaItemItemIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -1359,6 +1372,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ArtifactsByKindKindRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/ngwa/item/$itemId': {
+      id: '/ngwa/item/$itemId'
+      path: '/ngwa/item/$itemId'
+      fullPath: '/ngwa/item/$itemId'
+      preLoaderRoute: typeof NgwaItemItemIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pkg/$pkgId/': {
       id: '/pkg/$pkgId/'
       path: '/'
@@ -1519,6 +1539,7 @@ const rootRouteChildren: RootRouteChildren = {
   NgwaIndexRoute: NgwaIndexRoute,
   ProjectIndexRoute: ProjectIndexRoute,
   ArtifactsByKindKindRoute: ArtifactsByKindKindRoute,
+  NgwaItemItemIdRoute: NgwaItemItemIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

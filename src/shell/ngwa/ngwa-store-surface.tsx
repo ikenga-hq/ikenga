@@ -15,7 +15,9 @@ import {
 	ChevronDown,
 } from 'lucide-react';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
+import type { NgwaItem } from '@ikenga/contract';
 import { kindIcon } from './ngwa-list';
+import { NgwaTrustSheet } from './ngwa-trust-sheet';
 import './ngwa.css';
 
 export interface NgwaStoreSurfaceProps {
@@ -55,6 +57,7 @@ export function NgwaStoreSurface({
 	const [trustFilter, setTrustFilter] = useState('*');
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [openInstallMenuId, setOpenInstallMenuId] = useState<string | null>(null);
+	const [trustReviewItem, setTrustReviewItem] = useState<NgwaItem | null>(null);
 
 	// Updates available
 	const updateEntries = useMemo(() => {
@@ -365,12 +368,29 @@ export function NgwaStoreSurface({
 									{'integrity' in selectedEntry.registryEntry ? String((selectedEntry.registryEntry as Record<string, unknown>).integrity) : 'minisign-verified index'}
 								</span>
 							</div>
+
+							{selectedEntry.installedItem && (
+								<button
+									type="button"
+									className="btn ghost text-xs mt-3 w-full"
+									onClick={() => setTrustReviewItem(selectedEntry.installedItem)}
+								>
+									<Shield className="h-3.5 w-3.5 mr-1" /> Review permissions & trust
+								</button>
+							)}
 						</div>
 					) : (
 						<div className="empty">Select an item to view details.</div>
 					)}
 				</aside>
 			</div>
+
+			<NgwaTrustSheet
+				open={Boolean(trustReviewItem)}
+				onOpenChange={(isOpen) => !isOpen && setTrustReviewItem(null)}
+				item={trustReviewItem}
+				mode="review"
+			/>
 		</div>
 	);
 }

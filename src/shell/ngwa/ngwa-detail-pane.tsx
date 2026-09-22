@@ -18,7 +18,9 @@ import {
 	Download,
 	ExternalLink,
 	Sparkles,
+	Maximize2,
 } from 'lucide-react';
+import { useNavigate } from '@tanstack/react-router';
 import type { NgwaItem } from '@ikenga/contract';
 import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
 import { openExternalUrl } from '@/lib/transport';
@@ -38,6 +40,7 @@ export function NgwaDetailPane({
 	onUpdate,
 	onHandToChi,
 }: NgwaDetailPaneProps) {
+	const navigate = useNavigate();
 	const [activeTab, setActiveTab] = useState<DetailTab>('body');
 	const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
 
@@ -125,6 +128,15 @@ export function NgwaDetailPane({
 						title="Open files in editor"
 					>
 						<ExternalLink className="h-3 w-3" /> Open in editor
+					</button>
+
+					<button
+						type="button"
+						className="chip"
+						onClick={() => void navigate({ to: '/ngwa/item/$itemId', params: { itemId: item.id } })}
+						title="Open full pane detail"
+					>
+						<Maximize2 className="h-3 w-3" /> Open in pane
 					</button>
 
 					{onHandToChi && (
