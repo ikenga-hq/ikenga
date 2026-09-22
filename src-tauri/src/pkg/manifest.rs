@@ -2336,13 +2336,20 @@ mod tests {
         };
         use crate::pkg::registry::Registry;
 
-        let pkgs_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../ikenga-pkgs/packages")
-            .canonicalize()
-            .unwrap_or_else(|_| {
+        // `IKENGA_PKGS_DIR` overrides the sibling-checkout convention (CI
+        // checks ikenga-pkgs out inside the workspace and points here).
+        let pkgs_root = std::env::var_os("IKENGA_PKGS_DIR")
+            .map(|d| PathBuf::from(d).join("packages"))
+            .unwrap_or_else(|| {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ikenga-pkgs/packages")
             });
+        let pkgs_root = pkgs_root.canonicalize().unwrap_or(pkgs_root);
         if !pkgs_root.is_dir() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "ikenga_pkgs_fleet: {} not found under CI — check out ikenga-pkgs and set IKENGA_PKGS_DIR",
+                pkgs_root.display()
+            );
             eprintln!(
                 "ikenga_pkgs_fleet: skipping — {} not found (sibling checkout absent)",
                 pkgs_root.display()

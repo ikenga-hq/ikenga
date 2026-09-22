@@ -73,6 +73,17 @@ export function useIykeShellSync(): void {
 			console.warn('[iyke] set_frame (keymap) failed:', err);
 		});
 	}, []);
+
+	// WP-28: `GET /iyke/explorer/sections`. `explorerSections` is replaced
+	// wholesale by reorder/collapse mutations, so the subscription fires
+	// exactly on change; the wire shape is the store's
+	// `ExplorerSectionState` field-for-field (G-STATE §1).
+	const explorerSections = useShellStore((s) => s.explorerSections);
+	useEffect(() => {
+		iykeSetFrame({ explorerSections }).catch((err) => {
+			console.warn('[iyke] set_frame (explorer_sections) failed:', err);
+		});
+	}, [explorerSections]);
 }
 
 function pushActiveProject(activeProject: ActiveProject): void {
