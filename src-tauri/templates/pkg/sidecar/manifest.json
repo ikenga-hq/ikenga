@@ -1,0 +1,42 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "skill",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+  "targets": [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+  ],
+
+  "sidecars": [
+    {
+      "name": "pa-{{pkg_slug}}-main",
+      "bin": "bin/{target}/{{slug}}",
+      "stdio": "json",
+      "restart_when_changed": ["bin/**/*"]
+    }
+  ],
+
+  "iyke": {
+    "routes": [
+      {
+        "method": "POST",
+        "path": "/pkg/{{id}}/run",
+        "handler": "sidecar:pa-{{pkg_slug}}-main run"
+      }
+    ],
+    "events": []
+  },
+
+  "permissions": {
+    "shell.execute": ["pa-{{pkg_slug}}-main"],
+    "fs.read": ["$pkg_data/**"],
+    "fs.write": ["$pkg_data/**"],
+    "net": [],
+    "supabase.tables": [],
+    "vault.keys": []
+  }
+}

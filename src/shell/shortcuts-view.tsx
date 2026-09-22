@@ -26,6 +26,7 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'panes', label: 'Panes and tabs', namespaces: ['pane', 'tab'] },
 		{ id: 'companion', label: 'Companion', namespaces: ['dock', 'companion', 'session'] },
 		{ id: 'terminal', label: 'Terminal', namespaces: ['terminal'] },
+		{ id: 'ngwa', label: 'Ngwa', namespaces: ['ngwa'] },
 		{ id: 'menu', label: 'Menu bar', namespaces: ['menu'] },
 		{ id: 'help', label: 'Help', namespaces: ['shortcuts'] },
 	];

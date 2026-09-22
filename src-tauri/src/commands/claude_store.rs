@@ -854,7 +854,7 @@ fn is_enabled_in(scope_claude: &Path, store: &Path, kind: Kind, name: &str) -> b
 
 /// Resolve a `ClaudeStoreScope` string to that scope's `.claude` directory.
 /// `workspace` → `~/.claude`; `project:<id>` → `<project.root_path>/.claude`.
-async fn resolve_scope_claude(db: &Arc<PaDb>, scope: &str) -> Result<PathBuf, String> {
+pub(crate) async fn resolve_scope_claude(db: &Arc<PaDb>, scope: &str) -> Result<PathBuf, String> {
     validate_pin_scope(scope)?;
     if scope == "workspace" {
         // $HOME is unset on Windows; route through the platform resolver.
@@ -887,7 +887,7 @@ async fn resolve_scope_claude(db: &Arc<PaDb>, scope: &str) -> Result<PathBuf, St
 /// `.claude.json` suffix per scope+kind. We do **not** invent a second
 /// resolver: this funnels through the identical `get_project` path
 /// `resolve_scope_claude` uses, just returning the root instead of `root/.claude`.
-async fn resolve_scope_root(db: &Arc<PaDb>, scope: &str) -> Result<Option<PathBuf>, String> {
+pub(crate) async fn resolve_scope_root(db: &Arc<PaDb>, scope: &str) -> Result<Option<PathBuf>, String> {
     validate_pin_scope(scope)?;
     if scope == "workspace" {
         return Ok(None);

@@ -35,6 +35,7 @@ import { Route as DevPkgSmokeRouteImport } from './routes/dev/pkg-smoke'
 import { Route as DevSettingsSmokeRouteImport } from './routes/dev/settings-smoke'
 import { Route as DevUiroutesSmokeRouteImport } from './routes/dev/uiroutes-smoke'
 import { Route as NgwaIndexRouteImport } from './routes/ngwa/index'
+import { Route as NgwaCreateRouteImport } from './routes/ngwa/create'
 import { Route as NgwaHealthRouteImport } from './routes/ngwa/health'
 import { Route as NgwaInstalledRouteImport } from './routes/ngwa/installed'
 import { Route as NgwaScopesRouteImport } from './routes/ngwa/scopes'
@@ -208,6 +209,11 @@ const DevUiroutesSmokeRoute = DevUiroutesSmokeRouteImport.update({
 const NgwaIndexRoute = NgwaIndexRouteImport.update({
   id: '/ngwa/',
   path: '/ngwa/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const NgwaCreateRoute = NgwaCreateRouteImport.update({
+  id: '/ngwa/create',
+  path: '/ngwa/create',
   getParentRoute: () => rootRouteImport,
 } as any)
 const NgwaHealthRoute = NgwaHealthRouteImport.update({
@@ -457,6 +463,7 @@ export interface FileRoutesByFullPath {
   '/dev/pkg-smoke': typeof DevPkgSmokeRoute
   '/dev/settings-smoke': typeof DevSettingsSmokeRoute
   '/dev/uiroutes-smoke': typeof DevUiroutesSmokeRoute
+  '/ngwa/create': typeof NgwaCreateRoute
   '/ngwa/health': typeof NgwaHealthRoute
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
@@ -526,6 +533,7 @@ export interface FileRoutesByTo {
   '/dev/pkg-smoke': typeof DevPkgSmokeRoute
   '/dev/settings-smoke': typeof DevSettingsSmokeRoute
   '/dev/uiroutes-smoke': typeof DevUiroutesSmokeRoute
+  '/ngwa/create': typeof NgwaCreateRoute
   '/ngwa/health': typeof NgwaHealthRoute
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
@@ -599,6 +607,7 @@ export interface FileRoutesById {
   '/dev/pkg-smoke': typeof DevPkgSmokeRoute
   '/dev/settings-smoke': typeof DevSettingsSmokeRoute
   '/dev/uiroutes-smoke': typeof DevUiroutesSmokeRoute
+  '/ngwa/create': typeof NgwaCreateRoute
   '/ngwa/health': typeof NgwaHealthRoute
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
@@ -673,6 +682,7 @@ export interface FileRouteTypes {
     | '/dev/pkg-smoke'
     | '/dev/settings-smoke'
     | '/dev/uiroutes-smoke'
+    | '/ngwa/create'
     | '/ngwa/health'
     | '/ngwa/installed'
     | '/ngwa/scopes'
@@ -742,6 +752,7 @@ export interface FileRouteTypes {
     | '/dev/pkg-smoke'
     | '/dev/settings-smoke'
     | '/dev/uiroutes-smoke'
+    | '/ngwa/create'
     | '/ngwa/health'
     | '/ngwa/installed'
     | '/ngwa/scopes'
@@ -814,6 +825,7 @@ export interface FileRouteTypes {
     | '/dev/pkg-smoke'
     | '/dev/settings-smoke'
     | '/dev/uiroutes-smoke'
+    | '/ngwa/create'
     | '/ngwa/health'
     | '/ngwa/installed'
     | '/ngwa/scopes'
@@ -887,6 +899,7 @@ export interface RootRouteChildren {
   DevPkgSmokeRoute: typeof DevPkgSmokeRoute
   DevSettingsSmokeRoute: typeof DevSettingsSmokeRoute
   DevUiroutesSmokeRoute: typeof DevUiroutesSmokeRoute
+  NgwaCreateRoute: typeof NgwaCreateRoute
   NgwaHealthRoute: typeof NgwaHealthRoute
   NgwaInstalledRoute: typeof NgwaInstalledRoute
   NgwaScopesRoute: typeof NgwaScopesRoute
@@ -1083,6 +1096,13 @@ declare module '@tanstack/react-router' {
       path: '/ngwa'
       fullPath: '/ngwa/'
       preLoaderRoute: typeof NgwaIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/ngwa/create': {
+      id: '/ngwa/create'
+      path: '/ngwa/create'
+      fullPath: '/ngwa/create'
+      preLoaderRoute: typeof NgwaCreateRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/ngwa/health': {
@@ -1528,6 +1548,7 @@ const rootRouteChildren: RootRouteChildren = {
   DevPkgSmokeRoute: DevPkgSmokeRoute,
   DevSettingsSmokeRoute: DevSettingsSmokeRoute,
   DevUiroutesSmokeRoute: DevUiroutesSmokeRoute,
+  NgwaCreateRoute: NgwaCreateRoute,
   NgwaHealthRoute: NgwaHealthRoute,
   NgwaInstalledRoute: NgwaInstalledRoute,
   NgwaScopesRoute: NgwaScopesRoute,

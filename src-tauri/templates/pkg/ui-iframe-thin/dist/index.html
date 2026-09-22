@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>{{name}}</title>
+    <style>
+      :root {
+        --pkg-bg: var(--color-background-primary, #fff);
+        --pkg-fg: var(--color-text-primary, #111);
+        --pkg-muted: var(--color-text-secondary, #666);
+        --pkg-border: var(--color-border-primary, #e5e5e5);
+        --pkg-danger: var(--color-text-danger, #c44);
+        font-family: var(--font-sans, system-ui, -apple-system, sans-serif);
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 2rem; background: var(--pkg-bg); color: var(--pkg-fg); font: 14px/1.4 var(--font-sans, system-ui); }
+      h1 { margin: 0 0 0.5rem; font-size: 1.1rem; }
+      .status { color: var(--pkg-muted); font-size: 0.9rem; }
+      .boot { color: var(--pkg-muted); }
+      .err { color: var(--pkg-danger); white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div class="boot">Loading…</div></div>
+    <!--
+      Bootstrap pattern. DO NOT replace this with `<script src="./app.js">`:
+      the kernel inlines relative-src scripts to dodge a WebKitGTK srcdoc bug,
+      and the inlined module ends up rooted at `about:srcdoc` so relative
+      imports inside it fail. Resolving against `document.baseURI` (which
+      reflects the host-injected `<base href>`) and dynamic-importing app.js
+      lets app.js load as a fetched file with a real URL — its own relative
+      imports then work normally. See docs/pkg-patterns/01-ui-iframe.md
+      §"Srcdoc trap".
+    -->
+    <script type="module">
+      try {
+        await import(new URL('app.js', document.baseURI).href);
+      } catch (e) {
+        document.getElementById('root').innerHTML =
+          '<div class="err">Boot failed: ' + (e?.message ?? e) + '</div>';
+        throw e;
+      }
+    </script>
+  </body>
+</html>

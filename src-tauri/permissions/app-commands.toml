@@ -189,6 +189,7 @@ commands.allow = [
   "pkg_permission_violations_clear",
   "pkg_permission_violations_list",
   "pkg_preview_manifest",
+  "pkg_scaffold",
   "pkg_screenshot",
   "pkg_set_enabled",
   "pkg_set_scope",

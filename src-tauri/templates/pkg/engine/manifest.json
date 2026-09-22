@@ -1,0 +1,62 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "engine",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+
+  "ui": {},
+
+  "permissions": {
+    "shell.execute": ["{{slug}}"],
+    "fs.read": ["$pkg_data/sessions/**"],
+    "fs.write": ["$pkg_data/sessions/**"],
+    "net": [],
+    "supabase.tables": [],
+    "vault.keys": []
+  },
+
+  "settings": {
+    "schema": [
+      {
+        "key": "{{slug}}_binary",
+        "type": "string",
+        "label": "Path to `{{slug}}` CLI",
+        "default": "{{slug}}",
+        "description": "Resolved against $PATH if not absolute."
+      },
+      {
+        "key": "model",
+        "type": "string",
+        "label": "Default model",
+        "default": ""
+      }
+    ]
+  },
+
+  "engine": {
+    "agentId": "{{slug}}",
+    "display": "{{name}}",
+    "capabilities": {
+      "streaming": true,
+      "toolUse": false,
+      "thinking": false,
+      "artifacts": false,
+      "fileAttachments": false,
+      "imageInput": false,
+      "slashCommands": false,
+      "modelSwitching": true,
+      "promptCaching": false,
+      "agenticTools": false,
+      "mcp": false,
+      "sessionResume": false
+    },
+    "onboarding": {
+      "requiredVaultKeys": [],
+      "requiredEnvVars": [],
+      "authCommand": "",
+      "docsUrl": ""
+    }
+  }
+}

@@ -39,6 +39,7 @@ pub mod pkg_webview;
 pub mod projects;
 pub mod pty;
 pub mod runtime;
+pub mod scaffold;
 pub mod screenshot;
 pub mod secrets;
 pub mod settings_kv;
@@ -144,6 +145,7 @@ pub use pty::{
     terminal_detect_shells,
 };
 pub use runtime::runtime_retry_bun_fetch;
+pub use scaffold::{pkg_scaffold, PkgScaffoldParams, PkgScaffoldResult};
 pub use screenshot::{
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window,

@@ -4250,3 +4250,46 @@ export async function chiList(
 export async function chiCancel(runId: string): Promise<ChiRunResult> {
 	return invoke<ChiRunResult>('chi_cancel', { runId });
 }
+
+// ─── Ngwa In-Shell Scaffolding (WP-23 / D-02) ─────────────────────────────────
+
+export interface PkgScaffoldParams {
+	kind:
+		| 'skill'
+		| 'agent'
+		| 'command'
+		| 'hook'
+		| 'workflow'
+		| 'schedule'
+		| 'artifact'
+		| 'app'
+		| 'tool'
+		| 'engine'
+		| 'sidecar'
+		| 'project'
+		| string;
+	name: string;
+	slug: string;
+	description: string;
+	scope: 'personal' | 'workspace' | `project:${string}` | string;
+	projectId?: string | null;
+	targetDir?: string | null;
+	tools?: string[] | null;
+	authorName?: string | null;
+	authorKey?: string | null;
+}
+
+export interface PkgScaffoldResult {
+	ok: boolean;
+	kind: string;
+	slug: string;
+	targetPath: string;
+	targetFolder: string;
+	filesWritten: string[];
+}
+
+/** Scaffold an equipment item into the workspace, personal directory, or active project. */
+export async function pkgScaffold(params: PkgScaffoldParams): Promise<PkgScaffoldResult> {
+	return invoke<PkgScaffoldResult>('pkg_scaffold', { params });
+}
+

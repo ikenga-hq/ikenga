@@ -286,6 +286,7 @@ export function ActivityBar() {
 	useKey('rail.chi', () => enterMode('chi'));
 	useKey('rail.ngwa', () => enterMode('ngwa'));
 	useKey('rail.settings', () => enterMode('settings'));
+	useKey('ngwa.create', () => navigateInNgwa('/ngwa/create'));
 
 	const hasAnyPins =
 		hydrated &&

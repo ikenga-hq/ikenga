@@ -1,0 +1,17 @@
+{
+  "id": "{{id}}",
+  "name": "{{name}}",
+  "version": "{{version}}",
+  "ikenga_api": "1",
+  "kind": "skill",
+  "author": { "name": "{{author_name}}", "key": "{{author_key}}" },
+
+  "permissions": {
+    "shell.execute": [],
+    "fs.read": [],
+    "fs.write": [],
+    "net": [],
+    "supabase.tables": [],
+    "vault.keys": []
+  }
+}

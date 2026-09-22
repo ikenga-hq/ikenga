@@ -1,0 +1,26 @@
+{
+  "name": "@ikenga/pkg-{{slug}}",
+  "version": "{{version}}",
+  "description": "{{description}}",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ikenga-hq/ikenga-pkgs.git",
+    "directory": "packages/sidecars/{{slug}}"
+  },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "files": [
+    "manifest.json",
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
