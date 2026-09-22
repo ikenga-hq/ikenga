@@ -10,7 +10,7 @@ import type { ActivityPin } from '@/lib/tauri-cmd';
 // here they are inert so the rail renders the same with or without Tauri.
 vi.mock('@/lib/registry/use-updates-available', () => ({ useUpdatesAvailable: () => 0 }));
 vi.mock('@/lib/pkg/use-activity-bar-entries', () => ({
-	usePkgActivityBarEntries: () => ({ entries: [], loaded: true }),
+	usePkgActivityBarEntries: () => ({ entries: [], views: [], loaded: true }),
 }));
 
 // Each test re-imports the store graph (vi.resetModules) so it rehydrates

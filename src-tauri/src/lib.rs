@@ -523,6 +523,18 @@ pub fn run() {
             ));
             let ui_routes_reg = Arc::new(pkg::registries::UiRoutesRegistry::new());
             let activity_bar_reg = Arc::new(pkg::registries::ActivityBarRegistry::new());
+            // Manifest v5 (G-MANIFEST-V5 §2, WP-28): contribution-block
+            // registries. Pure in-memory record registries — snapshots flow
+            // through `pkg_kernel_status` for the Phase-1 slots (Explorer
+            // Views section, rail pins) and the Phase 5/6 consumers.
+            let views_reg = Arc::new(pkg::registries::ViewsRegistry::new());
+            let explorer_sections_reg =
+                Arc::new(pkg::registries::ExplorerSectionsRegistry::new());
+            let companion_panels_reg =
+                Arc::new(pkg::registries::CompanionPanelsRegistry::new());
+            let context_actions_reg =
+                Arc::new(pkg::registries::ContextActionsRegistry::new());
+            let widgets_reg = Arc::new(pkg::registries::WidgetsRegistry::new());
             // ADR-012 Tracks D + P: kernel-resident engine adapter registry.
             // v1 contains exactly one adapter — `ClaudeCodeAdapter` — and
             // it's registered statically here. Both the `McpRegistry` (MCP
@@ -671,6 +683,11 @@ pub fn run() {
                     cron_reg as Arc<dyn pkg::Registry>,
                     ui_routes_reg as Arc<dyn pkg::Registry>,
                     activity_bar_reg.clone() as Arc<dyn pkg::Registry>,
+                    views_reg as Arc<dyn pkg::Registry>,
+                    explorer_sections_reg as Arc<dyn pkg::Registry>,
+                    companion_panels_reg as Arc<dyn pkg::Registry>,
+                    context_actions_reg as Arc<dyn pkg::Registry>,
+                    widgets_reg as Arc<dyn pkg::Registry>,
                     engine_assets_reg as Arc<dyn pkg::Registry>,
                     mcp_reg as Arc<dyn pkg::Registry>,
                     queries_reg as Arc<dyn pkg::Registry>,

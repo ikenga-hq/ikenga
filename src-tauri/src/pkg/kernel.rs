@@ -531,6 +531,24 @@ impl Kernel {
             ) {
                 log::warn!("[pkg_kernel] emit pkg-reloaded for `{pkg_id}` failed: {e}");
             }
+        } else {
+            // Fresh install (no prior `pkg_installed` row): emit
+            // `pkg-installed` so the FE can refresh registry consumers and —
+            // manifest v5 (G-MANIFEST-V5 §3) — apply `pin_on_install` for
+            // views that declare it. The event's existence IS the freshness
+            // signal: reinstalls take the `pkg-reloaded` branch above and
+            // never re-pin. Boot replay doesn't reach `install_from_path` at
+            // all, so a reboot can't resurrect a user's unpin.
+            if let Err(e) = self.app.emit(
+                "pkg-installed",
+                serde_json::json!({
+                    "pkg_id": pkg_id,
+                    "version": pkg.manifest.version,
+                    "installed_at": installed_at,
+                }),
+            ) {
+                log::warn!("[pkg_kernel] emit pkg-installed for `{pkg_id}` failed: {e}");
+            }
         }
 
         Ok(summary)
@@ -712,6 +730,15 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .write()
             .map_err(|_| anyhow!("installed lock poisoned"))?
             .remove(pkg_id);
+        // Best-effort: `usePkgActivityBarEntries` already listens for this —
+        // it just never fired before. Emitted AFTER the row + in-memory maps
+        // are updated so a listener's immediate re-fetch sees the removal.
+        if let Err(e) = self
+            .app
+            .emit("pkg-uninstalled", serde_json::json!({ "pkg_id": pkg_id }))
+        {
+            log::warn!("[pkg_kernel] emit pkg-uninstalled for `{pkg_id}` failed: {e}");
+        }
         log::info!("[pkg_kernel] uninstalled `{pkg_id}` (restart for full ACL revocation)");
         Ok(())
     }

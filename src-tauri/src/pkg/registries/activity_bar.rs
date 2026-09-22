@@ -1,14 +1,16 @@
 //! Activity-bar registry — entries a package contributes to the shell's
 //! left-most activity bar.
 //!
-//! Surfaced from `manifest.ui.nav[0]` (the first nav entry per pkg, by
-//! convention the "open this app" affordance). The frontend reads the kernel
-//! snapshot and renders one icon per pkg alongside the built-in
-//! activity-bar items. Click navigates the focused pane to the entry's route.
+//! Surfaced from `manifest.ui.views[0]` (manifest v5; during the `ui.nav`
+//! alias window `Package::load` has already mapped `nav[i]` → `views[i]`,
+//! so nav-only manifests land here identically — G-MANIFEST-V5 §4). The
+//! frontend reads the kernel snapshot and renders one icon per pkg alongside
+//! the built-in activity-bar items. Click navigates the focused pane to the
+//! entry's route.
 //!
-//! v1 scope: one entry per pkg. Additional `ui.nav[]` items beyond [0] are
-//! reserved for the in-shell pkg sidebar (Phase 2 — runtime menu protocol).
-//! We don't render them here.
+//! v1 scope: one entry per pkg. Additional `ui.views[]` items beyond [0] are
+//! surfaced in `nav` (mapped to the NavEntry wire shape) for the pkg sidebar
+//! / Explorer Views consumers. We don't render them here.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -19,6 +21,8 @@ use serde_json::{json, Value};
 
 use crate::pkg::manifest::{NavEntry, Package};
 use crate::pkg::registry::Registry;
+
+use super::views::pane_route_for;
 
 /// Status badge a pkg can push onto its own activity-bar icon (and, per
 /// WP-11, the project switcher) — e.g. the git pkg's dirty/ahead-behind dot.
@@ -82,9 +86,9 @@ impl ActivityBarRegistry {
 
     /// Set (or clear, with `None`) the badge on a pkg's activity-bar entry.
     /// Returns `Ok(false)` (not an error) when the pkg has no rail entry —
-    /// e.g. it hasn't registered a `ui.nav[0]`, or was never installed —
-    /// since a pkg racing its own badge push against boot/reload is a
-    /// normal transient, not a fault.
+    /// e.g. it hasn't registered a `ui.views[0]` (or `ui.nav[0]`, via the
+    /// v5 alias), or was never installed — since a pkg racing its own badge
+    /// push against boot/reload is a normal transient, not a fault.
     pub fn set_badge(&self, pkg_id: &str, badge: Option<ActivityBarBadge>) -> Result<bool> {
         let mut entries = self
             .entries
@@ -106,34 +110,52 @@ impl Registry for ActivityBarRegistry {
     }
 
     fn register(&self, pkg: &Package) -> Result<()> {
-        // Read the first manifest.ui.nav entry, if any. Pkgs without nav
-        // entries don't appear in the activity bar — they can still be
-        // launched via /pkg/<id>/ deep link or the Packages mode.
+        // Read the first manifest.ui.views entry, if any. Post-alias (v5),
+        // `views` is populated for nav-only manifests too, so this is the
+        // "views[0], fallback nav[0]" claim from G-MANIFEST-V5 §4 — the nav
+        // field itself is never read here. Pkgs without views don't appear
+        // in the activity bar — they can still be launched via /pkg/<id>/
+        // deep link or the Packages mode.
         let block = match &pkg.manifest.ui {
             Some(b) => b,
             None => return Ok(()),
         };
-        let nav = match block.nav.first() {
-            Some(n) => n,
+        let first = match block.views.first() {
+            Some(v) => v,
             None => return Ok(()),
         };
 
-        // Rail label: prefer an explicit group label, then the package's own
-        // display name, then the first view's label. This keeps a multi-view
-        // pkg identifiable in the activity bar instead of being renamed after
-        // its first view (e.g. "Git" rather than "Changes").
+        // Rail label: the package's own display name. `views[]` carries no
+        // section grouping (that was a nav-only field), so the pkg name keeps
+        // a multi-view pkg identifiable in the activity bar instead of being
+        // renamed after its first view (e.g. "Git" rather than "Changes").
         let pkg_name = pkg.manifest.name.clone();
-        let label = nav.section.clone().unwrap_or_else(|| pkg_name.clone());
+        let pkg_id = pkg.manifest.id.clone();
+        // `nav` on the entry keeps its NavEntry wire shape — the pkg-mode
+        // sidebar and the WP-22 pin seed read `nav[i].label`/`route`. Views
+        // map onto it with `label = title`, `section = None`, and `route`
+        // normalized to the pane path form the pane store navigates.
+        let nav: Vec<NavEntry> = block
+            .views
+            .iter()
+            .map(|v| NavEntry {
+                id: v.id.clone(),
+                label: v.title.clone(),
+                icon: v.icon.clone(),
+                section: None,
+                route: pane_route_for(&pkg_id, &v.route),
+            })
+            .collect();
 
         let entry = ActivityBarEntry {
-            pkg_id: pkg.manifest.id.clone(),
-            pkg_name,
-            id: nav.id.clone(),
-            label,
-            icon: nav.icon.clone(),
-            section: nav.section.clone(),
-            route: nav.route.clone(),
-            nav: block.nav.clone(),
+            pkg_id,
+            pkg_name: pkg_name.clone(),
+            id: first.id.clone(),
+            label: pkg_name,
+            icon: first.icon.clone(),
+            section: None,
+            route: pane_route_for(&pkg.manifest.id, &first.route),
+            nav,
             badge: None,
         };
 
@@ -163,13 +185,16 @@ impl Registry for ActivityBarRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pkg::manifest::{Manifest, NavEntry, Permissions, UiBlock};
+    use crate::pkg::manifest::{Manifest, Permissions, UiBlock, ViewEntry};
     use std::path::PathBuf;
 
-    /// A pkg with exactly one `ui.nav` entry, so it earns an activity-bar row.
-    /// `with_nav = false` produces a pkg with no `ui` block at all — the
-    /// "never registered a rail entry" case `set_badge` must tolerate.
-    fn pkg_with(id: &str, with_nav: bool) -> Package {
+    /// A pkg with exactly one `ui.views` entry, so it earns an activity-bar
+    /// row. `with_view = false` produces a pkg with no `ui` block at all —
+    /// the "never registered a rail entry" case `set_badge` must tolerate.
+    /// Note the fixture declares `views` directly: registries only ever see
+    /// manifests post-`Package::load`, where the nav→views alias has already
+    /// run — so the registry never reads `nav` itself.
+    fn pkg_with(id: &str, with_view: bool) -> Package {
         let manifest = Manifest {
             description: None,
             _comment: None,
@@ -186,13 +211,13 @@ mod tests {
             permissions: Permissions::default(),
             migrations: None,
             settings: None,
-            ui: with_nav.then(|| UiBlock {
-                nav: vec![NavEntry {
+            ui: with_view.then(|| UiBlock {
+                views: vec![ViewEntry {
                     id: "open".into(),
-                    label: "Git".into(),
+                    title: "Git".into(),
                     icon: None,
-                    section: None,
-                    route: "/pkg/com.ikenga.git/".into(),
+                    route: "/".into(),
+                    pin_on_install: true,
                 }],
                 ..UiBlock::default()
             }),
@@ -249,7 +274,7 @@ mod tests {
         // Never installed at all.
         assert!(!reg.set_badge("com.ikenga.nope", None).unwrap());
 
-        // Installed, but contributed no `ui.nav[0]` → no rail entry to badge.
+        // Installed, but contributed no `ui.views[0]` → no rail entry to badge.
         reg.register(&pkg_with("com.ikenga.headless", false))
             .unwrap();
         assert!(!reg
@@ -265,31 +290,26 @@ mod tests {
     }
 
     #[test]
-    fn rail_label_uses_section_or_pkg_name() {
-        // No section set: the rail label should be the package's own display
-        // name, not the first view's label (e.g. "Git", not "Changes").
+    fn rail_label_is_pkg_name_and_route_is_pane_path() {
+        // v5: `views[]` has no section grouping, so the rail label is the
+        // package's own display name, not the first view's title (e.g.
+        // "Git", not "Changes"). `route` is the pane path the pane store
+        // navigates (`/pkg/<id><route>`).
         let reg = ActivityBarRegistry::new();
         reg.register(&pkg_with("com.ikenga.git", true)).unwrap();
-        let entry = reg.list().into_iter().find(|e| e.pkg_id == "com.ikenga.git").unwrap();
+        let entry = reg
+            .list()
+            .into_iter()
+            .find(|e| e.pkg_id == "com.ikenga.git")
+            .unwrap();
         assert_eq!(entry.label, "com.ikenga.git");
         assert_eq!(entry.pkg_name, "com.ikenga.git");
+        assert_eq!(entry.route, "/pkg/com.ikenga.git/");
         assert_eq!(entry.nav.len(), 1);
-    }
-
-    #[test]
-    fn rail_label_prefers_explicit_section() {
-        let mut manifest = pkg_with("com.ikenga.git", true).manifest;
-        if let Some(ui) = manifest.ui.as_mut() {
-            ui.nav[0].section = Some("Git".into());
-        }
-        let pkg = Package {
-            manifest,
-            install_path: std::path::PathBuf::from("/tmp/_unused"),
-        };
-        let reg = ActivityBarRegistry::new();
-        reg.register(&pkg).unwrap();
-        let entry = reg.list().into_iter().find(|e| e.pkg_id == "com.ikenga.git").unwrap();
-        assert_eq!(entry.label, "Git");
+        // `nav` keeps the NavEntry wire shape, mapped from views:
+        // label = view title, route = pane path.
+        assert_eq!(entry.nav[0].label, "Git");
+        assert_eq!(entry.nav[0].route, "/pkg/com.ikenga.git/");
     }
 
     #[test]

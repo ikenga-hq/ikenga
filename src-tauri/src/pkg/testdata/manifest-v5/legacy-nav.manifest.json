@@ -1,0 +1,29 @@
+{
+	"id": "com.ikenga.git-fixture",
+	"name": "Git (fixture)",
+	"version": "0.9.0",
+	"ikenga_api": "1",
+	"description": "WP-28 parity fixture — pre-v5 manifest with ui.nav only.",
+	"ui": {
+		"routes": [
+			{ "path": "/", "kind": "iframe", "source": "dist/index.html" },
+			{ "path": "/history", "kind": "iframe", "source": "dist/index.html" }
+		],
+		"nav": [
+			{
+				"id": "git.changes",
+				"label": "Changes",
+				"icon": "git-branch",
+				"section": "source",
+				"route": "/pkg/com.ikenga.git-fixture/"
+			},
+			{
+				"id": "git.history",
+				"label": "History",
+				"icon": "history",
+				"section": "source",
+				"route": "/pkg/com.ikenga.git-fixture/history"
+			}
+		]
+	}
+}

@@ -1,0 +1,32 @@
+{
+	"id": "com.ikenga.api4-fixture",
+	"name": "API 4 (fixture)",
+	"version": "2.1.0",
+	"ikenga_api": "4",
+	"description": "WP-28 parity fixture — newest pre-v5 api level keeps parsing.",
+	"permissions": {
+		"shell.execute": ["bun"],
+		"fs.read": ["$home/**"],
+		"net": ["https://api.example.com"]
+	},
+	"ui": {
+		"routes": [
+			{ "path": "/", "kind": "iframe", "source": "dist/index.html" }
+		],
+		"nav": [
+			{
+				"id": "home",
+				"label": "Home",
+				"icon": "home",
+				"route": "/pkg/com.ikenga.api4-fixture/"
+			}
+		]
+	},
+	"cron": [
+		{
+			"id": "nightly",
+			"expr": "0 0 3 * * *",
+			"handler": "sidecar:nightly run"
+		}
+	]
+}
