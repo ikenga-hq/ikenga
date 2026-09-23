@@ -2832,7 +2832,7 @@ export interface PkgActivityBarBadge {
 
 /** Set (or clear, with `null`) the status badge on a pkg's own activity-bar
  *  rail icon. Backs the `host.pkg.setBadge` AppBridge verb; errors if the
- *  pkg has no rail entry (no `ui.nav[0]`, or not yet registered). */
+ *  pkg has no rail entry (no `ui.views[0]`, or not yet registered). */
 export async function pkgActivityBarSetBadge(
 	pkgId: string,
 	badge: PkgActivityBarBadge | null
@@ -4306,4 +4306,3 @@ export interface PkgScaffoldResult {
 export async function pkgScaffold(params: PkgScaffoldParams): Promise<PkgScaffoldResult> {
 	return invoke<PkgScaffoldResult>('pkg_scaffold', { params });
 }
-

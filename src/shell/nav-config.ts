@@ -1,10 +1,10 @@
 // Default sidebar entries for the interim App menu, which the sidebar shows
 // for the Project and Chi rail modes until WP-04's Explorer replaces it.
 // These are shell-internal surfaces only — app pkgs contribute their own nav
-// via the UiRoutesRegistry and declarative `ui.nav` blocks in their
+// via the UiRoutesRegistry and declarative `ui.views` blocks in their
 // manifests, surfaced by the kernel snapshot. The pkg-aware list is rendered
 // alongside this one inside AppMode, and since WP-03 a package's rail
-// presence is a pin (seeded once from `ui.nav[0]` by WP-22), never a rail
+// presence is a pin (seeded once from `ui.views[0]` by WP-22), never a rail
 // mode of its own.
 //
 // Packages-related nav (catalog, updates, trust, store) belongs to Ngwa

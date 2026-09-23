@@ -36,8 +36,11 @@ use serde::{Deserialize, Serialize};
 /// `ui.companion_panels[]`, `ui.context_actions[]`, `ui.widgets[]` (all
 /// optional-with-default, so api=1..4 manifests parse unchanged) and
 /// hard-retired `ui.side_pane_viewers` (declaring it now fails validation).
-/// `ui.nav` is a one-release alias for `ui.views` — `Package::load` maps it
-/// and logs one deprecation warning per parse.
+/// `ui.nav` was a one-release alias for `ui.views` (§4): v0.12.0 was the
+/// soft-warn release, and DEC-37 closed the window — declaring `ui.nav` now
+/// fails validation with a canonical message naming `ui.views[]`. The
+/// `NavEntry` wire shape survives, but only as the activity-bar registry's
+/// snapshot type, sourced from `ui.views[]`.
 pub const IKENGA_API_VERSION: u32 = 5;
 
 /// Smallest supported manifest version. Packages with older `ikenga_api` are
@@ -682,13 +685,20 @@ pub struct ManifestUiSession {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiBlock {
-    /// Legacy view list (pre-v5 rail claim + pkg sidebar menu). Deprecated in
-    /// favour of `views` for exactly one shell release (G-MANIFEST-V5 §4):
-    /// `Package::load` maps `nav[i]` → `views[i]` with
-    /// `pin_on_install: i == 0` and logs one warning per parse. Kept as a
-    /// field so api=1..4 manifests keep parsing; the alias is deleted next
-    /// release, after which `nav` becomes an unknown field.
-    #[serde(default)]
+    /// v5 hard cutover (G-MANIFEST-V5 §4 / DEC-37): the legacy `ui.nav` list
+    /// had a one-release alias window onto `ui.views`; v0.12.0 was the
+    /// soft-warn release, so declaring `ui.nav` now fails validation with a
+    /// canonical message. Same enforcement shape as `side_pane_viewers`
+    /// below — `UiBlock` is deliberately NOT `deny_unknown_fields`
+    /// (forward-compat), so a field deserializer that errors on presence is
+    /// what makes the rejection happen. The value is never stored or
+    /// serialized.
+    #[serde(
+        default,
+        rename = "nav",
+        deserialize_with = "reject_nav",
+        skip_serializing
+    )]
     pub nav: Vec<NavEntry>,
     /// v5 (G-MANIFEST-V5 §2): the pkg's view entry points, consumed by the
     /// Explorer **Views** section and the `views` kernel registry. `views[0]`
@@ -775,8 +785,8 @@ pub struct UiRoute {
 // optional-with-default on `UiBlock`, so api=1..4 manifests parse unchanged.
 
 /// `ui.views[]` — one view entry point (G-MANIFEST-V5 §2 `ViewEntrySchema`).
-/// Replaces `ui.nav`; during the alias release `Package::load` synthesizes
-/// entries from `ui.nav[]` (see `Manifest::apply_nav_views_alias`).
+/// Replaces `ui.nav` outright — the alias window closed with DEC-37, so this
+/// is the only way a pkg contributes a view entry point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewEntry {
@@ -947,6 +957,21 @@ pub struct WidgetEntry {
     pub span: WidgetSpan,
 }
 
+/// Field deserializer for the retired `ui.nav` alias — consumes the value and
+/// returns a canonical rejection (G-MANIFEST-V5 §4 / DEC-37). Mirrors the Zod
+/// `z.never({ message })` on `UiBlockSchema.nav` in `@ikenga/contract`; keep
+/// the two messages in lockstep.
+fn reject_nav<'de, D>(d: D) -> std::result::Result<Vec<NavEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(d)?;
+    Err(serde::de::Error::custom(
+        "`ui.nav` was removed in manifest v5 (G-MANIFEST-V5 §4 / DEC-37) \
+         — declare `ui.views[]` instead",
+    ))
+}
+
 /// Field deserializer for the retired `ui.side_pane_viewers` — consumes the
 /// value and returns a canonical rejection. `UiBlock` stays
 /// non-`deny_unknown_fields` for forward compat, so without this the field
@@ -983,39 +1008,6 @@ where
             Err(serde::de::Error::custom("expected an integer"))
         }
     }
-}
-
-/// What `Manifest::apply_nav_views_alias` did — the caller (`Package::load`)
-/// logs exactly one warning when this is `Some`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NavAliasOutcome {
-    /// `ui.nav` was non-empty and `ui.views` empty: synthesized `views[i]`
-    /// from `nav[i]` (`pin_on_install: i == 0`, routes normalized from
-    /// `/pkg/<id><path>` / `pkg://<id><path>` to the `<path>` namespace form
-    /// `ui.routes[]` declares).
-    Applied,
-    /// Both `nav` and `views` were declared: `nav` ignored (parse never
-    /// fails on the alias — §4).
-    IgnoredBothDeclared,
-}
-
-/// Normalize a legacy `ui.nav[].route` to the namespace-path form
-/// `ui.views[].route` declares. `/pkg/<id>` / `pkg://<id>` prefixes strip to
-/// the remaining path (bare prefix → `/`); anything else (e.g. a shell
-/// route) passes through verbatim and will fail the `views`→`routes`
-/// reference check at `register()` — loud, per §2b.
-fn normalize_nav_route(pkg_id: &str, route: &str) -> String {
-    for prefix in [format!("/pkg/{pkg_id}"), format!("pkg://{pkg_id}")] {
-        if let Some(rest) = route.strip_prefix(&prefix) {
-            if rest.is_empty() {
-                return "/".to_string();
-            }
-            if rest.starts_with('/') {
-                return rest.to_string();
-            }
-        }
-    }
-    route.to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1152,40 +1144,6 @@ pub struct WorkflowEntry {
     pub steps: Vec<WorkflowStep>,
 }
 
-impl Manifest {
-    /// Apply the `ui.nav` → `ui.views` alias (G-MANIFEST-V5 §4, one shell
-    /// release). Called once per `Package::load` — the ONLY call site — so
-    /// a `nav`-declaring manifest produces exactly one `log::warn!` per
-    /// parse. `None` means no `nav` block (nothing to warn about).
-    ///
-    /// Alias semantics: `nav[i]` → `views[i]` = `{id, title: label, icon,
-    /// route, pin_on_install: i == 0}` — `nav[0]` was the rail claim, so it
-    /// maps to the auto-pin. When both are declared, `nav` is ignored (the
-    /// warning names the pkg; parse never fails on the alias).
-    pub fn apply_nav_views_alias(&mut self) -> Option<NavAliasOutcome> {
-        let ui = self.ui.as_mut()?;
-        if ui.nav.is_empty() {
-            return None;
-        }
-        if !ui.views.is_empty() {
-            return Some(NavAliasOutcome::IgnoredBothDeclared);
-        }
-        ui.views = ui
-            .nav
-            .iter()
-            .enumerate()
-            .map(|(i, n)| ViewEntry {
-                id: n.id.clone(),
-                title: n.label.clone(),
-                icon: n.icon.clone(),
-                route: normalize_nav_route(&self.id, &n.route),
-                pin_on_install: i == 0,
-            })
-            .collect();
-        Some(NavAliasOutcome::Applied)
-    }
-}
-
 /// Loaded package: parsed manifest plus the absolute path it was loaded from.
 /// The kernel passes this to every registry's `register()`.
 #[derive(Debug, Clone)]
@@ -1195,43 +1153,18 @@ pub struct Package {
 }
 
 impl Package {
-    /// Load `<dir>/manifest.json`, parse it, validate it, and apply the
-    /// `ui.nav` → `ui.views` alias (v5, one shell release). Every registry
-    /// and the persisted `manifest_json` therefore see `views` as canonical.
+    /// Load `<dir>/manifest.json`, parse it and validate it. Since DEC-37
+    /// closed the `ui.nav` alias window, `ui.views[]` is the only source of
+    /// view entry points — a manifest still declaring `ui.nav` fails to parse
+    /// here (see `reject_nav`), so every registry and the persisted
+    /// `manifest_json` see `views` as canonical with no post-parse fixup.
     pub fn load(install_path: &Path) -> Result<Self> {
         let manifest_path = install_path.join("manifest.json");
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("read {}", manifest_path.display()))?;
-        let mut manifest: Manifest = serde_json::from_str(&raw)
+        let manifest: Manifest = serde_json::from_str(&raw)
             .with_context(|| format!("parse manifest at {}", manifest_path.display()))?;
         Self::validate(&manifest)?;
-        // Exactly one warning per parse for a nav-declaring pkg — this is
-        // the single warn site for the alias (§4 / WP-28 DoD).
-        match manifest.apply_nav_views_alias() {
-            Some(NavAliasOutcome::Applied) => log::warn!(
-                "[manifest] `{}` declares `ui.nav` — deprecated alias for `ui.views` \
-                 (v5); mapped {} nav entr{} to views. The alias is removed next \
-                 shell release.",
-                manifest.id,
-                manifest.ui.as_ref().map(|u| u.views.len()).unwrap_or(0),
-                if manifest
-                    .ui
-                    .as_ref()
-                    .map(|u| u.views.len() == 1)
-                    .unwrap_or(false)
-                {
-                    "y"
-                } else {
-                    "ies"
-                }
-            ),
-            Some(NavAliasOutcome::IgnoredBothDeclared) => log::warn!(
-                "[manifest] `{}` declares both `ui.nav` and `ui.views` — `ui.nav` \
-                 ignored (v5 alias; removed next shell release)",
-                manifest.id
-            ),
-            None => {}
-        }
         Ok(Self {
             manifest,
             install_path: install_path.to_path_buf(),
@@ -2320,50 +2253,56 @@ mod tests {
         }
     }
 
-    /// §4 alias — `nav[i]` → `views[i]` with `pin_on_install: i == 0`, and the
-    /// pane-route form `/pkg/<id><path>` (or `pkg://<id><path>`) normalizes to
-    /// the namespace path `ui.routes[]` declares.
+    /// DEC-37 hard cutover: a nav-only manifest no longer parses at all —
+    /// the canonical rejection names `ui.views[]` as the replacement, same
+    /// shape as the `ui.side_pane_viewers` retirement.
     #[test]
-    fn nav_alias_maps_entries_and_normalizes_routes() {
+    fn nav_only_manifest_is_rejected_with_canonical_message() {
         let json = r#"{
             "id": "com.ikenga.git",
             "name": "Git", "version": "0.1.0", "ikenga_api": "1",
             "ui": {
                 "routes": [
-                    {"path": "/", "kind": "iframe", "source": "dist/index.html"},
-                    {"path": "/history", "kind": "iframe", "source": "dist/index.html"}
+                    {"path": "/", "kind": "iframe", "source": "dist/index.html"}
                 ],
                 "nav": [
                     {"id": "git.changes", "label": "Changes", "icon": "git-branch",
-                     "section": "source", "route": "/pkg/com.ikenga.git/"},
-                    {"id": "git.history", "label": "History", "icon": "history",
-                     "section": "source", "route": "pkg://com.ikenga.git/history"}
+                     "section": "source", "route": "/pkg/com.ikenga.git/"}
                 ]
             }
         }"#;
-        let mut m: Manifest = serde_json::from_str(json).expect("parse nav manifest");
-        let outcome = m.apply_nav_views_alias();
-        assert_eq!(outcome, Some(NavAliasOutcome::Applied));
-
-        let ui = m.ui.as_ref().unwrap();
-        assert_eq!(ui.views.len(), 2);
-        // nav[0] was the rail claim → pin_on_install.
-        assert_eq!(ui.views[0].id, "git.changes");
-        assert_eq!(ui.views[0].title, "Changes");
-        assert_eq!(ui.views[0].icon.as_deref(), Some("git-branch"));
-        assert_eq!(ui.views[0].route, "/");
-        assert!(ui.views[0].pin_on_install);
-        assert_eq!(ui.views[1].route, "/history");
-        assert!(!ui.views[1].pin_on_install);
-        // `nav` keeps its field + values — the field isn't cleared by the alias.
-        assert_eq!(ui.nav.len(), 2);
+        let err = serde_json::from_str::<Manifest>(json)
+            .expect_err("ui.nav must fail to parse after DEC-37");
+        let msg = err.to_string();
+        assert!(msg.contains("ui.nav"), "error names the retired field: {msg}");
+        assert!(
+            msg.contains("ui.views"),
+            "canonical error names the replacement: {msg}"
+        );
+        assert!(msg.contains("DEC-37"), "error cites the decision: {msg}");
     }
 
-    /// §4: declaring both means `views` wins, `nav` is ignored, outcome is
-    /// `IgnoredBothDeclared` (the load-site warn names the pkg; parse never
-    /// fails on the alias).
+    /// The api version does not exempt anyone — an api=1..4 pkg still on
+    /// `ui.nav` is exactly the population the cutover breaks.
     #[test]
-    fn nav_alias_ignored_when_views_declared() {
+    fn nav_rejection_is_not_api_gated() {
+        for api in ["1", "4", "5"] {
+            let json = format!(
+                r#"{{"id": "com.ikenga.git", "name": "Git", "version": "0.1.0",
+                     "ikenga_api": "{api}",
+                     "ui": {{"nav": [{{"id": "n", "label": "N", "route": "/"}}]}}}}"#
+            );
+            let err = serde_json::from_str::<Manifest>(&json)
+                .err()
+                .unwrap_or_else(|| panic!("ui.nav must fail to parse at api={api}"));
+            assert!(err.to_string().contains("ui.nav"), "api={api}");
+        }
+    }
+
+    /// Declaring both `nav` and `views` is a rejection too — there is no
+    /// "views win" precedence left to fall back on.
+    #[test]
+    fn nav_and_views_declared_is_rejected() {
         let json = r#"{
             "id": "com.ikenga.git",
             "name": "Git", "version": "0.1.0", "ikenga_api": "5",
@@ -2373,80 +2312,60 @@ mod tests {
                 "nav": [{"id": "n", "label": "N", "route": "/pkg/com.ikenga.git/"}]
             }
         }"#;
-        let mut m: Manifest = serde_json::from_str(json).expect("parse");
-        let outcome = m.apply_nav_views_alias();
-        assert_eq!(outcome, Some(NavAliasOutcome::IgnoredBothDeclared));
-        let ui = m.ui.as_ref().unwrap();
-        assert_eq!(ui.views.len(), 1);
-        assert_eq!(ui.views[0].id, "v");
-        assert_eq!(ui.nav.len(), 1);
+        let err = serde_json::from_str::<Manifest>(json)
+            .expect_err("declaring both must fail after DEC-37");
+        assert!(err.to_string().contains("ui.nav"));
     }
 
-    /// No `nav` → no alias, no warning outcome.
+    /// An empty `ui.nav` array is a declaration too — presence, not content,
+    /// is what the deserializer rejects.
     #[test]
-    fn nav_alias_noop_without_nav() {
-        let mut m = minimal();
-        assert_eq!(m.apply_nav_views_alias(), None);
-        m.ui = Some(UiBlock::default());
-        assert_eq!(m.apply_nav_views_alias(), None);
+    fn empty_nav_array_is_still_rejected() {
+        let json = r#"{
+            "id": "com.ikenga.git",
+            "name": "Git", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"nav": []}
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(json).is_err());
     }
 
-    /// Route normalization edge cases.
+    /// A views-only manifest is unaffected — `Package::load` no longer does
+    /// any post-parse alias fixup, so `views` arrives verbatim.
     #[test]
-    fn nav_route_normalization_edge_cases() {
-        let id = "com.ikenga.git";
-        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git"), "/");
-        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git/"), "/");
-        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git/x"), "/x");
-        assert_eq!(normalize_nav_route(id, "pkg://com.ikenga.git"), "/");
-        assert_eq!(normalize_nav_route(id, "pkg://com.ikenga.git/x"), "/x");
-        // A nav entry pointing at a *different* pkg's pane route is NOT
-        // normalized — it passes through verbatim and fails the §2b routes[]
-        // check at register() (loud, by design).
-        assert_eq!(
-            normalize_nav_route(id, "/pkg/com.ikenga.other/x"),
-            "/pkg/com.ikenga.other/x"
-        );
-        // Shell routes pass through verbatim.
-        assert_eq!(normalize_nav_route(id, "/settings"), "/settings");
-        // Pathological: prefix-match without a path boundary stays verbatim.
-        assert_eq!(
-            normalize_nav_route(id, "/pkg/com.ikenga.gitsuffix/x"),
-            "/pkg/com.ikenga.gitsuffix/x"
-        );
-    }
-
-    /// The alias runs inside `Package::load` — the single warn site — so a
-    /// nav-only manifest registers (parse + alias) and logs exactly one
-    /// warning per parse. Verified with a capturing `log` logger.
-    #[test]
-    fn nav_only_manifest_loads_with_exactly_one_alias_warning() {
+    fn views_only_manifest_loads_without_alias_fixup() {
         use std::io::Write;
-        use std::sync::{Mutex, Once};
 
-        // One-process-wide capture logger; installed once for the whole test
-        // binary. Records are filtered by the unique marker id below, so
-        // parallel tests' logs can't pollute the assertion.
-        struct Capture;
-        static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        static INIT: Once = Once::new();
-        impl log::Log for Capture {
-            fn enabled(&self, _: &log::Metadata) -> bool {
-                true
-            }
-            fn log(&self, record: &log::Record) {
-                if let Ok(mut g) = RECORDS.lock() {
-                    g.push(format!("{}:{}", record.level(), record.args()));
-                }
-            }
-            fn flush(&self) {}
-        }
-        INIT.call_once(|| {
-            log::set_logger(&Capture).ok();
-            log::set_max_level(log::LevelFilter::Warn);
-        });
+        let marker = "com.ikenga.views-only";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_json = format!(
+            r#"{{"id": "{marker}", "name": "ViewsOnly", "version": "0.1.0",
+                "ikenga_api": "5",
+                "ui": {{
+                    "routes": [{{"path": "/", "kind": "iframe", "source": "dist/index.html"}}],
+                    "views": [{{"id": "home", "title": "Home", "route": "/",
+                               "pin_on_install": true}}]
+                }}}}"#
+        );
+        let mut f =
+            std::fs::File::create(dir.path().join("manifest.json")).expect("write manifest");
+        f.write_all(manifest_json.as_bytes()).unwrap();
+        drop(f);
 
-        let marker = "com.ikenga.navalias-once";
+        let pkg = Package::load(dir.path()).expect("views-only manifest must load");
+        let ui = pkg.manifest.ui.as_ref().unwrap();
+        assert_eq!(ui.views.len(), 1);
+        assert_eq!(ui.views[0].id, "home");
+        assert_eq!(ui.views[0].route, "/");
+        assert!(ui.views[0].pin_on_install);
+    }
+
+    /// A nav-declaring manifest on disk fails at `Package::load` — the
+    /// rejection is a parse error, not a post-parse warning.
+    #[test]
+    fn nav_manifest_fails_at_package_load() {
+        use std::io::Write;
+
+        let marker = "com.ikenga.navalias-gone";
         let dir = tempfile::tempdir().expect("tempdir");
         let manifest_json = format!(
             r#"{{"id": "{marker}", "name": "NavAlias", "version": "0.1.0",
@@ -2461,27 +2380,9 @@ mod tests {
         f.write_all(manifest_json.as_bytes()).unwrap();
         drop(f);
 
-        let pkg = Package::load(dir.path()).expect("nav-only manifest must load");
-        let ui = pkg.manifest.ui.as_ref().unwrap();
-        assert_eq!(ui.views.len(), 1);
-        assert_eq!(ui.views[0].id, "home");
-        assert_eq!(ui.views[0].title, "Home");
-        assert_eq!(ui.views[0].route, "/");
-        assert!(ui.views[0].pin_on_install);
-
-        let warns: Vec<String> = RECORDS
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.starts_with("WARN:") && r.contains(marker))
-            .cloned()
-            .collect();
-        assert_eq!(
-            warns.len(),
-            1,
-            "exactly one alias warning per parse; got {warns:?}"
-        );
-        assert!(warns[0].contains("ui.nav"));
+        let err = Package::load(dir.path()).expect_err("nav-only manifest must not load");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("ui.nav"), "load error names ui.nav: {chain}");
     }
 
     /// api window: `[1, 5]` — v5 manifests are compatible and api=1..4 keep

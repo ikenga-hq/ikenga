@@ -6,7 +6,7 @@
 // Lucide icon names are kebab-case (the dynamic-icons loader's `iconNames`).
 // Since WP-03 the rail no longer carries its own pkg icon whitelist
 // (`PKG_ICONS`): a package's rail presence is a pin seeded from its manifest
-// `ui.nav[0].icon` (WP-22), and manifests spell those names either way
+// `ui.views[0].icon` (WP-22), and manifests spell those names either way
 // (`layout-dashboard`, `LayoutDashboard`, `Box`). So the name is normalized
 // to kebab-case and checked against `iconNames`; anything unknown renders
 // the fallback instead of an empty button.

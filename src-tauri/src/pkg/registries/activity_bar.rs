@@ -1,16 +1,19 @@
 //! Activity-bar registry — entries a package contributes to the shell's
 //! left-most activity bar.
 //!
-//! Surfaced from `manifest.ui.views[0]` (manifest v5; during the `ui.nav`
-//! alias window `Package::load` has already mapped `nav[i]` → `views[i]`,
-//! so nav-only manifests land here identically — G-MANIFEST-V5 §4). The
+//! Surfaced from `manifest.ui.views[0]` (manifest v5). The `ui.nav` alias
+//! window closed with DEC-37, so `views[]` is the only source — a manifest
+//! still declaring `ui.nav` no longer parses at all. The
 //! frontend reads the kernel snapshot and renders one icon per pkg alongside
 //! the built-in activity-bar items. Click navigates the focused pane to the
 //! entry's route.
 //!
 //! v1 scope: one entry per pkg. Additional `ui.views[]` items beyond [0] are
-//! surfaced in `nav` (mapped to the NavEntry wire shape) for the pkg sidebar
-//! / Explorer Views consumers. We don't render them here.
+//! surfaced in `nav` for the pkg sidebar / Explorer Views consumers. We
+//! don't render them here. NOTE the entry field is still called `nav` and
+//! still carries the `NavEntry` wire shape — the pkg-mode sidebar and the
+//! WP-22 pin seed (`src/lib/shell/seed-pins.ts`) read it — but it is
+//! *sourced from `ui.views[]`*, not from the retired manifest field.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -46,17 +49,19 @@ pub struct ActivityBarBadge {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActivityBarEntry {
     pub pkg_id: String,
-    /// Package display name. Used as the rail label when `ui.nav[0].section`
-    /// is absent, so multi-view packages are identifiable by their own name.
+    /// Package display name. Used as the rail label (`views[]` carries no
+    /// section grouping), so multi-view packages are identifiable by name.
     pub pkg_name: String,
     pub id: String,
     pub label: String,
     pub icon: Option<String>,
     pub section: Option<String>,
     pub route: String,
-    /// Full manifest `ui.nav` list, surfaced in the pkg-mode sidebar so the
-    /// pkg's views can render with a group heading even before the iframe
-    /// publishes a runtime menu.
+    /// The pkg's full `ui.views[]` list mapped onto the legacy `NavEntry`
+    /// wire shape, surfaced in the pkg-mode sidebar (and read by the WP-22
+    /// pin seed) so the pkg's views can render with a group heading even
+    /// before the iframe publishes a runtime menu. The name is historical:
+    /// the `ui.nav` manifest field it was named after is gone (DEC-37).
     pub nav: Vec<NavEntry>,
     /// Runtime-set status badge; absent until a pkg calls `host.pkg.setBadge`
     /// (forwarded to `ActivityBarRegistry::set_badge`). Reset to `None` on
@@ -86,8 +91,8 @@ impl ActivityBarRegistry {
 
     /// Set (or clear, with `None`) the badge on a pkg's activity-bar entry.
     /// Returns `Ok(false)` (not an error) when the pkg has no rail entry —
-    /// e.g. it hasn't registered a `ui.views[0]` (or `ui.nav[0]`, via the
-    /// v5 alias), or was never installed — since a pkg racing its own badge
+    /// e.g. it hasn't registered a `ui.views[0]`, or was never installed
+    /// — since a pkg racing its own badge
     /// push against boot/reload is a normal transient, not a fault.
     pub fn set_badge(&self, pkg_id: &str, badge: Option<ActivityBarBadge>) -> Result<bool> {
         let mut entries = self
@@ -110,10 +115,9 @@ impl Registry for ActivityBarRegistry {
     }
 
     fn register(&self, pkg: &Package) -> Result<()> {
-        // Read the first manifest.ui.views entry, if any. Post-alias (v5),
-        // `views` is populated for nav-only manifests too, so this is the
-        // "views[0], fallback nav[0]" claim from G-MANIFEST-V5 §4 — the nav
-        // field itself is never read here. Pkgs without views don't appear
+        // Read the first manifest.ui.views entry, if any. Since DEC-37 there
+        // is no nav fallback: `ui.views[0]` is the rail claim, full stop.
+        // Pkgs without views don't appear
         // in the activity bar — they can still be launched via /pkg/<id>/
         // deep link or the Packages mode.
         let block = match &pkg.manifest.ui {
@@ -132,8 +136,8 @@ impl Registry for ActivityBarRegistry {
         let pkg_name = pkg.manifest.name.clone();
         let pkg_id = pkg.manifest.id.clone();
         // `nav` on the entry keeps its NavEntry wire shape — the pkg-mode
-        // sidebar and the WP-22 pin seed read `nav[i].label`/`route`. Views
-        // map onto it with `label = title`, `section = None`, and `route`
+        // sidebar and the WP-22 pin seed read `nav[i].label`/`route`, so the
+        // shape outlives the retired manifest field. Views map onto it with `label = title`, `section = None`, and `route`
         // normalized to the pane path form the pane store navigates.
         let nav: Vec<NavEntry> = block
             .views

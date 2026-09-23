@@ -10,9 +10,8 @@
 //! Reference rule (§2b): every `views[].route` must equal a path declared in
 //! the same manifest's `ui.routes[]`. Validated here at `register()` and the
 //! pkg fails loudly on a miss — same class as the sidecar-name prefix rule.
-//! Alias note: `ui.nav[]` entries arrive already normalized to namespace
-//! paths by `Package::load` (the alias maps `/pkg/<id>/x` → `/x`), so they
-//! satisfy this check when the nav entry pointed at a declared route.
+//! (The `ui.nav` alias that used to feed normalized routes in here was
+//! removed by DEC-37 — every route now comes straight from `ui.views[]`.)
 //!
 //! Ordering: entries are stored per-pkg in manifest-declaration order —
 //! `views[0]` must mean the pkg's first declared view (the rail claim), so
