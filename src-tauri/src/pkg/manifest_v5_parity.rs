@@ -8,7 +8,11 @@
 //! |-------------|---------------------------------------------------------|
 //! | `valid/`    | parses                                                  |
 //! | `invalid/`  | rejected (Zod `.parse` fails)                           |
-//! | `alias/`    | parses; the `ui.nav`→`ui.views` alias applies (§4)      |
+//!
+//! The `alias/` folder is gone as of DEC-37: the one-release `ui.nav` →
+//! `ui.views` window (§4) closed after v0.12.0, so the former alias fixtures
+//! (`nav-only.json`, `nav-and-views.json`) now live in `invalid/` and are
+//! rejected by both parsers.
 //!
 //! This module is the Rust side of that Rust↔Zod parity check. It walks the
 //! same folders out of the sibling workspace checkout via
@@ -32,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::manifest::{Manifest, NavAliasOutcome, Package};
+use super::manifest::{Manifest, Package};
 use super::registries::{
     ActivityBarRegistry, CompanionPanelsRegistry, ContextActionsRegistry, ExplorerSectionsRegistry,
     ViewsRegistry, WidgetsRegistry,
@@ -92,11 +96,8 @@ fn fixture_name(path: &Path) -> String {
 }
 
 fn pkg_from_json(json: &str) -> Package {
-    let mut manifest: Manifest =
+    let manifest: Manifest =
         serde_json::from_str(json).expect("fixture manifest must deserialize");
-    // `Package::load` is the only site that applies the alias — replicate it
-    // here so fixture tests exercise the same normalization path.
-    manifest.apply_nav_views_alias();
     Package {
         manifest,
         install_path: PathBuf::from("/tmp/_fixture"),
@@ -209,48 +210,37 @@ fn invalid_fixtures_are_rejected() {
     }
 }
 
-/// `alias/` — parses, and `apply_nav_views_alias` maps `ui.nav` → `ui.views`.
-/// `nav-only.json` is api=1 on purpose: the real alias population is the
-/// api=1..4 fleet still declaring `ui.nav` (README §contract).
+/// DEC-37: the former `alias/` folder is gone, and both of its fixtures now
+/// sit in `invalid/` where they are rejected with the canonical message
+/// naming `ui.views[]`. `nav-only.json` is api=1 on purpose — the api=1..4
+/// fleet is exactly the population the cutover breaks, and the api version
+/// does not exempt it (README §contract).
 #[test]
-fn alias_fixture_nav_only_applies() {
-    let Some(paths) = folder_paths("alias") else {
-        return;
-    };
-    assert_eq!(
-        paths.len(),
-        1,
-        "alias/ is a single-fixture folder on contract@0.19"
+fn alias_folder_is_retired_and_nav_fixtures_are_rejected() {
+    if folder_paths("valid").is_none() {
+        return; // contract checkout absent — same skip convention as the sweep
+    }
+    assert!(
+        !fixture_root().join("alias").is_dir(),
+        "alias/ must be gone after the DEC-37 cutover"
     );
-    let mut manifest: Manifest =
-        serde_json::from_str(&read_fixture(&paths[0])).expect("alias/nav-only must parse");
-    assert_eq!(
-        manifest.apply_nav_views_alias(),
-        Some(NavAliasOutcome::Applied)
-    );
-
-    let views = &manifest.ui.as_ref().unwrap().views;
-    assert_eq!(views.len(), 2);
-    assert_eq!(views[0].id, "home");
-    assert_eq!(views[0].title, "Home");
-    assert_eq!(views[0].route, "/home");
-    // The alias pins exactly the rail claim (views[0]).
-    assert!(views[0].pin_on_install);
-    assert_eq!(views[1].id, "settings");
-    assert!(!views[1].pin_on_install);
-
-    // …and the aliased pkg registers across the whole v5 surface.
-    register_all(&Package {
-        manifest,
-        install_path: PathBuf::from("/tmp/_fixture"),
-    });
+    for name in ["nav-only.json", "nav-and-views.json"] {
+        let path = fixture_root().join("invalid").join(name);
+        assert!(path.is_file(), "invalid/{name} must exist after DEC-37");
+        let err = serde_json::from_str::<Manifest>(&read_fixture(&path))
+            .err()
+            .unwrap_or_else(|| panic!("invalid/{name} must fail Manifest parse"));
+        let msg = err.to_string();
+        assert!(msg.contains("ui.nav"), "invalid/{name}: {msg}");
+        assert!(msg.contains("ui.views"), "invalid/{name}: {msg}");
+    }
 }
 
-/// `valid/v4-manifest.json` — api=4 stays inside the compat window, and its
-/// `ui.nav` aliases (the alias is not v5-gated; api=1..4 is the population it
-/// exists for).
+/// `valid/v4-manifest.json` — api=4 stays inside the compat window, and now
+/// declares `ui.views[]` directly (it carried `ui.nav` during the alias
+/// window).
 #[test]
-fn v4_fixture_stays_compatible_and_aliases() {
+fn v4_fixture_stays_compatible() {
     let json = read_fixture(&fixture_root().join("valid/v4-manifest.json"));
     let manifest: Manifest = serde_json::from_str(&json).unwrap();
     assert_eq!(manifest.ikenga_api, "4");
@@ -262,30 +252,8 @@ fn v4_fixture_stays_compatible_and_aliases() {
         pkg.is_compatible(),
         "api=4 must remain inside [IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION]"
     );
-    let mut manifest = pkg.manifest;
-    assert_eq!(
-        manifest.apply_nav_views_alias(),
-        Some(NavAliasOutcome::Applied),
-        "api=4 ui.nav aliases to views"
-    );
-    let views = &manifest.ui.as_ref().unwrap().views;
+    let views = &pkg.manifest.ui.as_ref().unwrap().views;
     assert_eq!(views[0].id, "home");
-    assert!(views[0].pin_on_install);
-}
-
-/// `valid/nav-and-views.json` — when both are declared, `views` wins and
-/// `nav` is ignored (§4: the alias never fails a parse).
-#[test]
-fn nav_and_views_declared_views_win() {
-    let json = read_fixture(&fixture_root().join("valid/nav-and-views.json"));
-    let mut manifest: Manifest = serde_json::from_str(&json).unwrap();
-    assert_eq!(
-        manifest.apply_nav_views_alias(),
-        Some(NavAliasOutcome::IgnoredBothDeclared)
-    );
-    let views = &manifest.ui.as_ref().unwrap().views;
-    assert_eq!(views.len(), 1);
-    assert_eq!(views[0].id, "grid");
 }
 
 // ── Snapshot wire shapes (the fields the TS consumers destructure) ───────────
@@ -477,9 +445,10 @@ fn widgets_snapshot_wire_shape_and_span_values() {
     assert_eq!(entries[2]["span"], "wide");
 }
 
-/// The rail-claim projection (`activity_bar`) is views-sourced post-WP-28:
-/// `route` is views[0]'s *pane* route and `nav` carries the full views list
-/// mapped onto the NavEntry wire shape the pkg-mode sidebar reads.
+/// The rail-claim projection (`activity_bar`) is views-sourced: `route` is
+/// views[0]'s *pane* route and `nav` carries the full views list mapped onto
+/// the NavEntry wire shape the pkg-mode sidebar and the WP-22 pin seed read.
+/// The wire shape outlives the manifest field it was named after (DEC-37).
 /// Fixture: `valid/views.json`.
 #[test]
 fn activity_bar_snapshot_is_views_sourced() {
@@ -508,14 +477,13 @@ fn activity_bar_snapshot_is_views_sourced() {
     assert_eq!(nav[0]["route"], "/pkg/com.ikenga.views-demo/grid");
 }
 
-/// `valid/full.json` — every contribution block in one manifest: parse,
-/// alias is a no-op (no `nav`), all six registries accept it.
+/// `valid/full.json` — every contribution block in one manifest: parse and
+/// all six registries accept it.
 #[test]
 fn full_fixture_registers_everything() {
-    let mut manifest: Manifest =
+    let manifest: Manifest =
         serde_json::from_str(&read_fixture(&fixture_root().join("valid/full.json"))).unwrap();
     assert_eq!(manifest.ikenga_api, "5");
-    assert_eq!(manifest.apply_nav_views_alias(), None);
     register_all(&Package {
         manifest,
         install_path: PathBuf::from("/tmp/_fixture"),

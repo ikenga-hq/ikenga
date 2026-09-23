@@ -15,9 +15,9 @@ export const viewsContextMenu = [
 
 /** Explorer **Views** section — renders every `ui.views[]` contribution
  *  across installed pkgs (manifest v5, G-MANIFEST-V5 §2). The `views` list
- *  from `usePkgActivityBarEntries` is registry-canonical: during the `ui.nav`
- *  alias window the kernel already mapped `nav[i]` → `views[i]`, so nothing
- *  here needs a legacy fallback. Each row opens the view's pane route
+ *  from `usePkgActivityBarEntries` is registry-canonical — the `ui.nav`
+ *  alias was removed outright by DEC-37, so nothing here needs a legacy
+ *  fallback. Each row opens the view's pane route
  *  (`/pkg/<id><route>`) in the focused pane. */
 export function ViewsSection(_ctx: ExplorerSectionContext) {
 	const { views, loaded } = usePkgActivityBarEntries();

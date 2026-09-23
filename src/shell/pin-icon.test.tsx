@@ -1,5 +1,5 @@
 // PinIcon name resolution (WP-03): seeded package pins carry the manifest's
-// `ui.nav[0].icon`, spelled either way; unknown names fall back.
+// `ui.views[0].icon`, spelled either way; unknown names fall back.
 
 import { render } from '@testing-library/react';
 import { Pin } from 'lucide-react';

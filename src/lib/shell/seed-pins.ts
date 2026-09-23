@@ -3,7 +3,8 @@
 // Package rail entries are *not* pins: `usePkgActivityBarEntries`
 // (`@/lib/pkg/use-activity-bar-entries`) derives them at runtime from each
 // installed manifest's `ui.views[0]` (manifest v5; during the alias window
-// the kernel maps legacy `ui.nav[0]` into `views[0]` — WP-28), so a Zustand
+// the activity-bar registry maps `ui.views[]` onto the legacy NavEntry wire
+// shape — WP-28; the `ui.nav` manifest field itself is gone per DEC-37), so a Zustand
 // store migration can never see them. For pkgs installed *before* v5 there
 // was no `pin_on_install` either — this reconciler covers that cohort.
 // Without it, a user with N rail icons today loses all N the moment the
@@ -58,7 +59,8 @@ export function computeEntriesToSeed(
 
 /** A pin's label is the pkg's own view label ("Wikipedia"), not the rail
  *  entry's `label`, which the kernel sets to `views[0]`'s pkg display name.
- *  (`entry.nav` is the mapped `ui.views` list — labels are view titles.) */
+ *  (`entry.nav` is the `ui.views` list mapped onto the NavEntry wire shape —
+ *  labels are view titles.) */
 export function pinLabelFor(entry: PkgActivityBarEntry): string {
 	return entry.nav?.[0]?.label?.trim() || entry.pkg_name?.trim() || entry.label;
 }

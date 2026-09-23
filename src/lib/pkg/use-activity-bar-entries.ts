@@ -1,8 +1,7 @@
 // Activity-bar entries contributed by installed pkgs via manifest `ui.views[0]`
-// (manifest v5, G-MANIFEST-V5 §2/§4). During the `ui.nav` alias window the
-// kernel maps `nav[i]` → `views[i]`, so the `views` registry is canonical;
-// the legacy `activity_bar` registry snapshot (nav-sourced) is the per-pkg
-// fallback while the window lasts.
+// (manifest v5, G-MANIFEST-V5 §2). The `ui.nav` alias window closed with
+// DEC-37, so `ui.views[]` is the only source: both the `views` registry and
+// the `activity_bar` registry snapshot are views-sourced on the Rust side.
 //
 // Read from the pkg kernel snapshot and re-fetched on pkg install / uninstall /
 // reload so newly-mounted pkgs appear (and removed ones disappear) without a
@@ -32,9 +31,11 @@ export interface PkgActivityBarBadge {
 	tooltip?: string | null;
 }
 
-/** One item from `Manifest.ui.nav[]` / the NavEntry wire shape views are
- *  mapped onto in the activity-bar registry. Mirrors `pkg::manifest::NavEntry`
- *  in Rust. */
+/** The legacy `NavEntry` wire shape that `ui.views[]` entries are mapped onto
+ *  in the activity-bar registry. Mirrors `pkg::manifest::NavEntry` in Rust.
+ *  The name is historical — the `ui.nav` manifest field is gone (DEC-37), but
+ *  the wire shape stays: the pkg-mode sidebar and the WP-22 pin seed
+ *  (`lib/shell/seed-pins.ts`) both read it. */
 export interface PkgNavEntry {
 	id: string;
 	label: string;
@@ -84,7 +85,7 @@ export interface PkgActivityBarEntry {
 }
 
 export interface PkgActivityBarState {
-	/** Rail claims — `views[0]` per pkg (plus the nav fallback below). */
+	/** Rail claims — `views[0]` per pkg (plus the registry fallback below). */
 	entries: PkgActivityBarEntry[];
 	/** Every contributed view across installed pkgs — the Explorer **Views**
 	 *  section's list. */
@@ -153,9 +154,10 @@ async function applyPinOnInstall(pkgId: string): Promise<void> {
 }
 
 /** Build the `entries` rail claims: `views[0]` per pkg from the views
- *  registry, with the legacy `activity_bar` registry (nav-sourced) filling in
- *  any pkg that lacks a views entry — the `nav[0]` fallback for the alias
- *  window. Badges merge from `activity_bar` entries (the badge lives on that
+ *  registry, with the `activity_bar` registry filling in any pkg missing from
+ *  it. Both registries are views-sourced post-DEC-37, so that fallback only
+ *  fires if the two registries disagree (e.g. `ViewsRegistry::register`
+ *  rejected a §2b route reference the activity bar accepted). Badges merge from `activity_bar` entries (the badge lives on that
  *  registry entry per WP-11); `parked` merges from the sidecar supervisor. */
 function mergeRegistries(
 	views: PkgViewEntry[],
@@ -192,8 +194,8 @@ function mergeRegistries(
 			badge: legacy?.badge ?? null,
 		});
 	}
-	// nav[0] fallback: pkgs present in the legacy registry but missing from
-	// `views` (shouldn't happen post-alias — belt-and-braces for the window).
+	// Registry-disagreement fallback: pkgs present in `activity_bar` but
+	// missing from `views`. Belt-and-braces — see mergeRegistries' doc.
 	for (const e of activityBar) {
 		if (!byPkg.has(e.pkg_id)) out.push(e);
 	}
