@@ -39,6 +39,7 @@ import {
 } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { NgwaItem, NgwaKind } from '@ikenga/contract';
+import type { WorkflowGraph } from '@/lib/workflows/graph';
 import {
 	formatUsageDisplay,
 	resolveTrustFacet,
@@ -52,6 +53,8 @@ import {
 	type PkgSettingsSnapshot,
 } from '@/lib/tauri-cmd';
 import { openExternalUrl } from '@/lib/transport';
+import { NgwaFlowRenderer } from './ngwa-flow-renderer';
+import { usePkgWorkflowGraphs } from './use-pkg-workflow-graphs';
 import './ngwa.css';
 
 export interface NgwaItemDetailSurfaceProps {
@@ -63,8 +66,15 @@ export interface NgwaItemDetailSurfaceProps {
 	onUninstall?: (item: NgwaItem) => void;
 }
 
-export type PkgDetailTab = 'overview' | 'settings' | 'permissions' | 'files' | 'activity' | 'versions';
-export type PrimitiveDetailTab = 'overview' | 'body' | 'usage' | 'scope';
+export type PkgDetailTab =
+	| 'overview'
+	| 'settings'
+	| 'permissions'
+	| 'files'
+	| 'activity'
+	| 'versions'
+	| 'flow';
+export type PrimitiveDetailTab = 'overview' | 'body' | 'usage' | 'scope' | 'flow';
 
 export function isPackageKind(kind: NgwaKind): boolean {
 	return ['app', 'engine', 'tool', 'sidecar', 'bundle'].includes(kind);
@@ -109,6 +119,16 @@ export function NgwaItemDetailSurface({
 	const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({ root: true });
 
 	const trustFacet = resolveTrustFacet(item.trust);
+
+	// ── Flow tab (WP-31 review fix, Round 29) ───────────────────────────────
+	// The flow renderer is reachable here: a `workflow`-kind item always gets a
+	// Flow tab, and a pkg item gets one as soon as its manifest declares
+	// §10 `workflows[]`. Graphs come from `graph.ts`'s `fromPkgWorkflow`.
+	const { graphs: workflowGraphs, isLoading: workflowsLoading } = usePkgWorkflowGraphs(
+		item.owner_pkg_id ?? item.id,
+		item.install_path,
+	);
+	const showFlowTab = item.kind === 'workflow' || workflowGraphs.length > 0;
 
 	function toggleFolder(key: string) {
 		setOpenFolders((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -286,6 +306,17 @@ export function NgwaItemDetailSurface({
 						>
 							Versions
 						</button>
+						{showFlowTab && (
+							<button
+								type="button"
+								role="tab"
+								aria-selected={activePkgTab === 'flow'}
+								className={`idtab ${activePkgTab === 'flow' ? 'on' : ''}`}
+								onClick={() => setActivePkgTab('flow')}
+							>
+								Flow
+							</button>
+						)}
 					</>
 				) : (
 					<>
@@ -325,6 +356,17 @@ export function NgwaItemDetailSurface({
 						>
 							Scope
 						</button>
+						{showFlowTab && (
+							<button
+								type="button"
+								role="tab"
+								aria-selected={activePrimTab === 'flow'}
+								className={`idtab ${activePrimTab === 'flow' ? 'on' : ''}`}
+								onClick={() => setActivePrimTab('flow')}
+							>
+								Flow
+							</button>
+						)}
 					</>
 				)}
 			</div>
@@ -345,6 +387,9 @@ export function NgwaItemDetailSurface({
 						)}
 						{activePkgTab === 'activity' && <PkgActivityTab item={item} />}
 						{activePkgTab === 'versions' && <PkgVersionsTab item={item} onUpdate={onUpdate} />}
+						{activePkgTab === 'flow' && (
+							<FlowTab graphs={workflowGraphs} isLoading={workflowsLoading} />
+						)}
 					</>
 				) : (
 					<>
@@ -352,9 +397,59 @@ export function NgwaItemDetailSurface({
 						{activePrimTab === 'body' && <PrimitiveBodyTab item={item} />}
 						{activePrimTab === 'usage' && <PrimitiveUsageTab item={item} />}
 						{activePrimTab === 'scope' && <PrimitiveScopeTab item={item} />}
+						{activePrimTab === 'flow' && (
+							<FlowTab graphs={workflowGraphs} isLoading={workflowsLoading} />
+						)}
 					</>
 				)}
 			</div>
+		</div>
+	);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   FLOW TAB (WP-31 — mounts the flow renderer)
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function FlowTab({
+	graphs,
+	isLoading,
+}: {
+	graphs: WorkflowGraph[];
+	isLoading: boolean;
+}) {
+	const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+
+	if (isLoading) {
+		return (
+			<div className="idinner">
+				<div className="empty">Reading declared workflows…</div>
+			</div>
+		);
+	}
+
+	if (graphs.length === 0) {
+		return (
+			<div className="idinner">
+				<div className="empty" data-iempty>
+					This item declares no <span className="mono">workflows[]</span> in its manifest.
+				</div>
+			</div>
+		);
+	}
+
+	return (
+		<div className="idinner" data-testid="ngwa-flow-tab">
+			{graphs.map((graph) => (
+				<div key={graph.id} className="space-y-2">
+					<div className="grouphead first">{graph.title}</div>
+					<NgwaFlowRenderer
+						graph={graph}
+						activeNodeId={selectedNodeId}
+						onSelectNode={setSelectedNodeId}
+					/>
+				</div>
+			))}
 		</div>
 	);
 }

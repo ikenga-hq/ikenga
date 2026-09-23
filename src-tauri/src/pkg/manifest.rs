@@ -1118,6 +1118,16 @@ pub struct QueriesBlock {
     pub key_prefixes: Vec<String>,
 }
 
+/// §10 `handler` shape, character-for-character the same pattern as
+/// `contract/src/manifest.ts` `WorkflowStepSchema.handler`. Kept as a literal
+/// so a drift between the two sides is a one-line diff.
+pub const WORKFLOW_HANDLER_PATTERN: &str =
+    r"^/iyke/pkg/[a-z0-9]+(\.[a-z0-9-]+)+/[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$";
+
+static WORKFLOW_HANDLER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(WORKFLOW_HANDLER_PATTERN).expect("WORKFLOW_HANDLER_PATTERN compiles")
+});
+
 /// Contributed workflow step declaration (DEC-41, G-MANIFEST-V5 §10).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1228,7 +1238,10 @@ impl Package {
         })
     }
 
-    fn validate(m: &Manifest) -> Result<()> {
+    /// `pub(crate)` so the sibling parity module can drive the §10
+    /// register()-time checks directly (`workflows[]` has no registry of its
+    /// own — the checks live here).
+    pub(crate) fn validate(m: &Manifest) -> Result<()> {
         if m.id.is_empty() {
             return Err(anyhow!("manifest.id required"));
         }
@@ -1296,6 +1309,23 @@ impl Package {
                         "duplicate step id `{}` in workflow `{}`",
                         step.id,
                         wf.id
+                    ));
+                }
+
+                // Full §10 handler regex — mirrors `contract/src/manifest.ts`
+                // `WorkflowStepSchema.handler`. The prefix-equality check
+                // below additionally pins `<pkg_id>` to THIS manifest's id;
+                // this pass pins the *shape*, including the reverse-DNS
+                // `<pkg_id>` (at least one dot-separated label), which
+                // prefix equality alone could never catch for a manifest
+                // whose own id is malformed.
+                if !WORKFLOW_HANDLER_RE.is_match(&step.handler) {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` must be /iyke/pkg/<pkg_id>/<cmd> \
+                         matching `{}` (DEC-41, G-MANIFEST-V5 §10)",
+                        step.id,
+                        step.handler,
+                        WORKFLOW_HANDLER_PATTERN
                     ));
                 }
 
@@ -2614,8 +2644,14 @@ mod tests {
         }"#;
         let m: Manifest = serde_json::from_str(json).expect("parse manifest");
         let err = Package::validate(&m).expect_err("must reject uppercase cmd segment");
+        // Since the Round-29 review fix the full §10 regex (mirroring
+        // `contract/src/manifest.ts`) runs first, so an uppercase `<cmd>`
+        // segment is caught there; the per-segment charset check remains as
+        // the message that names the offending segment.
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("segments must be lowercase-dash"),
+            msg.contains("must be /iyke/pkg/<pkg_id>/<cmd>")
+                || msg.contains("segments must be lowercase-dash"),
             "unexpected error: {err}"
         );
     }

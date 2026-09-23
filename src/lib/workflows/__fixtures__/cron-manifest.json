@@ -1,0 +1,57 @@
+{
+  "id": "com.ikenga.local-store-etl",
+  "name": "Local Store ETL",
+  "version": "0.1.0",
+  "ikenga_api": "2",
+  "kind": "embedded",
+
+  "author": {
+    "name": "Royalti",
+    "key": "royalti"
+  },
+
+  "targets": [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+  ],
+
+  "sidecars": [
+    {
+      "name": "pa-com-ikenga-local-store-etl-main",
+      "bin": "dist/pa-com-ikenga-local-store-etl-main",
+      "stdio": "json",
+      "lifecycle": "per-call",
+      "auto_restart": false
+    }
+  ],
+
+  "cron": [
+    {
+      "id": "daily-sync",
+      "expr": "0 0 6 * * *",
+      "handler": "sidecar:pa-com-ikenga-local-store-etl-main sync",
+      "env_from_settings": ["api_key"]
+    }
+  ],
+
+  "iyke": {
+    "routes": [
+      {
+        "method": "POST",
+        "path": "/pkg/com.ikenga.local-store-etl/etl",
+        "handler": "sidecar:pa-com-ikenga-local-store-etl-main run"
+      }
+    ],
+    "events": []
+  },
+
+  "permissions": {
+    "shell.execute": ["pa-com-ikenga-local-store-etl-main"],
+    "fs.read": ["$pkg_data/**"],
+    "fs.write": ["$pkg_data/**"],
+    "net": [],
+    "sqlite.tables": ["*"],
+    "vault.keys": ["SUPABASE_SERVICE_ROLE_KEY", "VITE_SUPABASE_URL"]
+  }
+}

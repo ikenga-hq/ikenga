@@ -1,5 +1,7 @@
 import type { WorkflowEdge, WorkflowGraph, WorkflowNode } from '../graph';
 import { createWorkflowGraph } from '../graph';
+import { WorkflowImportError } from '../import-error';
+import { parseJsObjectLiteral, sliceBalanced } from '../js-literal';
 
 export interface GroundworkImportOptions {
   id?: string;
@@ -34,80 +36,83 @@ export function importGroundwork(
   return importFromMarkdown(content, options);
 }
 
+/**
+ * Parse a groundwork `orchestrate.workflow.js` **without executing it**.
+ *
+ * `orchestrate --emit-workflow` writes the wave plan as
+ * `const WAVES = ${JSON.stringify(waves, null, 2)}` — a pure JSON literal — so
+ * the bracketed slice is extracted by a string-aware scanner and handed to
+ * `JSON.parse`. A malformed or hostile file yields a `WorkflowImportError`;
+ * nothing in the imported file is ever evaluated.
+ */
 function importFromWorkflowJs(
   content: string,
   options: GroundworkImportOptions,
 ): WorkflowGraph {
-  // Extract plan title / meta
-  const metaMatch = content.match(/export const meta\s*=\s*(\{[\s\S]*?\n\})/);
   let title = options.title ?? 'Groundwork Plan';
   let planId = options.id ?? 'groundwork-plan';
 
-  if (metaMatch) {
-    try {
-      // Evaluate meta object safely with Function constructor
-      const fn = new Function(`return (${metaMatch[1]});`);
-      const meta = fn();
-      if (meta.name) planId = options.id ?? meta.name;
-      if (meta.description) title = options.title ?? meta.description;
-    } catch {
-      // fallback
+  const metaStart = content.indexOf('export const meta');
+  if (metaStart !== -1) {
+    const metaSlice = sliceBalanced(content, metaStart, '{', '}');
+    const meta = metaSlice ? parseJsObjectLiteral(metaSlice) : undefined;
+    if (meta && typeof meta === 'object') {
+      const { name, description } = meta as { name?: unknown; description?: unknown };
+      if (typeof name === 'string' && name) planId = options.id ?? name;
+      if (typeof description === 'string' && description) title = options.title ?? description;
     }
   }
 
-  // Extract WAVES array
-  const waves: GroundworkWave[] = [];
   const wavesStart = content.indexOf('const WAVES');
-
-  if (wavesStart !== -1) {
-    const bracketStart = content.indexOf('[', wavesStart);
-    if (bracketStart !== -1) {
-      let depth = 0;
-      let bracketEnd = -1;
-      for (let i = bracketStart; i < content.length; i++) {
-        if (content[i] === '[') depth++;
-        else if (content[i] === ']') {
-          depth--;
-          if (depth === 0) {
-            bracketEnd = i;
-            break;
-          }
-        }
-      }
-
-      if (bracketEnd !== -1) {
-        try {
-          const arrayStr = content.slice(bracketStart, bracketEnd + 1);
-          const fn = new Function(`return (${arrayStr});`);
-          const rawWaves = fn() as Array<{
-            title: string;
-            gate: string | null;
-            wps?: Array<{ id: string; title: string; brief?: string; tier?: string }>;
-          }>;
-
-      for (let i = 0; i < rawWaves.length; i++) {
-        const rawWave = rawWaves[i];
-        const waveId = `wave-${i + 1}`;
-        const wps = (rawWave.wps ?? []).map((wp) => ({
-          id: wp.id,
-          title: wp.title,
-          brief: wp.brief,
-          tier: wp.tier,
-          dependsOn: extractDependsOn(wp.brief ?? ''),
-        }));
-        waves.push({
-          id: waveId,
-          title: rawWave.title,
-          wps,
-        });
-      }
-        } catch {
-          // fallback to markdown parsing if JS eval fails
-          return importFromMarkdown(content, options);
-        }
-      }
-    }
+  if (wavesStart === -1) {
+    throw new WorkflowImportError(
+      'waves-not-found',
+      'groundwork import: no `const WAVES = [...]` literal found in the workflow script',
+      options.sourcePath,
+    );
   }
+
+  const arrayStr = sliceBalanced(content, wavesStart, '[', ']');
+  if (arrayStr === null) {
+    throw new WorkflowImportError(
+      'waves-not-found',
+      'groundwork import: `const WAVES` is not followed by a balanced `[...]` literal',
+      options.sourcePath,
+    );
+  }
+
+  let rawWaves: Array<{
+    title?: string;
+    gate?: string | null;
+    wps?: Array<{ id: string; title: string; brief?: string; tier?: string }>;
+  }>;
+  try {
+    const parsed: unknown = JSON.parse(arrayStr);
+    if (!Array.isArray(parsed)) {
+      throw new Error('WAVES literal is not an array');
+    }
+    rawWaves = parsed as typeof rawWaves;
+  } catch (e) {
+    throw new WorkflowImportError(
+      'waves-not-json',
+      `groundwork import: the \`const WAVES\` literal is not valid JSON (${
+        e instanceof Error ? e.message : String(e)
+      }). groundwork emits it via JSON.stringify — a non-JSON literal is never evaluated.`,
+      options.sourcePath,
+    );
+  }
+
+  const waves: GroundworkWave[] = rawWaves.map((rawWave, i) => ({
+    id: `wave-${i + 1}`,
+    title: rawWave.title ?? `Wave ${i + 1}`,
+    wps: (rawWave.wps ?? []).map((wp) => ({
+      id: wp.id,
+      title: wp.title,
+      brief: wp.brief,
+      tier: wp.tier,
+      dependsOn: extractDependsOn(wp.brief ?? ''),
+    })),
+  }));
 
   return buildGraphFromWaves(planId, title, waves, options.sourcePath, options.projectId);
 }

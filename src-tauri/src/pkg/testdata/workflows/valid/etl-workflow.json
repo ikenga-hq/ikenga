@@ -1,0 +1,66 @@
+{
+  "id": "com.ikenga.local-store-etl",
+  "name": "Local Store ETL",
+  "version": "0.1.0",
+  "ikenga_api": "5",
+  "kind": "embedded",
+
+  "author": {
+    "name": "Royalti",
+    "key": "royalti"
+  },
+
+  "sidecars": [
+    {
+      "name": "pa-com-ikenga-local-store-etl-main",
+      "bin": "dist/pa-com-ikenga-local-store-etl-main",
+      "stdio": "json",
+      "lifecycle": "per-call",
+      "auto_restart": false
+    }
+  ],
+
+  "iyke": {
+    "routes": [
+      {
+        "method": "POST",
+        "path": "/pkg/com.ikenga.local-store-etl/etl",
+        "handler": "sidecar:pa-com-ikenga-local-store-etl-main run"
+      },
+      {
+        "method": "POST",
+        "path": "/pkg/com.ikenga.local-store-etl/etl/verify",
+        "handler": "sidecar:pa-com-ikenga-local-store-etl-main verify"
+      }
+    ],
+    "events": []
+  },
+
+  "workflows": [
+    {
+      "id": "nightly-etl",
+      "title": "Nightly ETL",
+      "steps": [
+        {
+          "id": "extract",
+          "title": "Extract and load",
+          "handler": "/iyke/pkg/com.ikenga.local-store-etl/etl",
+          "inputs": { "since": { "type": "string", "format": "date-time" } },
+          "produces": ["rows_loaded"]
+        },
+        {
+          "id": "verify",
+          "title": "Verify row counts",
+          "handler": "/iyke/pkg/com.ikenga.local-store-etl/etl/verify",
+          "depends_on": ["extract"]
+        }
+      ]
+    }
+  ],
+
+  "permissions": {
+    "shell.execute": ["pa-com-ikenga-local-store-etl-main"],
+    "fs.read": ["$pkg_data/**"],
+    "fs.write": ["$pkg_data/**"]
+  }
+}

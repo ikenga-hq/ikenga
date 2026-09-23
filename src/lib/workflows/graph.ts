@@ -65,12 +65,20 @@ export function createWorkflowGraph(options: CreateWorkflowGraphOptions): Workfl
  * - scope = { kind: 'personal' }
  * - source = 'plugin'
  * - Each step becomes a `step` node with `run: { kind: 'command', ref: step.handler }`
+ * - `source_ref` = `<manifest>#/workflows/<entry index>/steps/<step index>`
  * - Each depends_on entry becomes a `depends-on` edge
  */
 export function fromPkgWorkflow(
   pkgId: string,
   pkgManifestPath: string,
   workflow: WorkflowEntry,
+  /**
+   * The entry's index in `manifest.workflows[]`. §10 pins `source_ref` to
+   * `<manifest>#/workflows/<i>/steps/<j>` — a **JSON Pointer into the
+   * manifest**, so `<i>` is the entry index, never the workflow id (which is
+   * not addressable by pointer). Defaults to 0 for a single-entry manifest.
+   */
+  workflowIndex = 0,
 ): WorkflowGraph {
   const nodes: WorkflowNode[] = workflow.steps.map((step, idx) => ({
     id: step.id,
@@ -80,7 +88,7 @@ export function fromPkgWorkflow(
       kind: 'command',
       ref: step.handler,
     },
-    source_ref: `${pkgManifestPath}#/workflows/${workflow.id}/steps/${idx}`,
+    source_ref: `${pkgManifestPath}#/workflows/${workflowIndex}/steps/${idx}`,
   }));
 
   const edges: WorkflowEdge[] = [];
@@ -108,6 +116,13 @@ export function fromPkgWorkflow(
 /**
  * Detect cycles in a workflow graph DAG.
  * Returns valid: true if acyclic, or valid: false with detected cycle node IDs.
+ *
+ * Each connected component is walked independently: the DFS always unwinds
+ * `currentPath` and settles every node it entered to `visited`, including on
+ * the path that records a cycle. (Before the WP-31 Round-29 fix the early
+ * `return false` left the offending path on `currentPath` and its nodes stuck
+ * in `visiting`, so a *later* root spliced stale ancestors into its own
+ * `cycles[]` entry — or reported a cycle where there was none.)
  */
 export function validateWorkflowDag(graph: WorkflowGraph): { valid: boolean; cycles?: string[][] } {
   const adj = new Map<string, string[]>();
@@ -131,28 +146,32 @@ export function validateWorkflowDag(graph: WorkflowGraph): { valid: boolean; cyc
   const cycles: string[][] = [];
   const currentPath: string[] = [];
 
+  /** Returns true when a cycle was recorded anywhere below `nodeId`. */
   function dfs(nodeId: string): boolean {
     visited.set(nodeId, 'visiting');
     currentPath.push(nodeId);
 
-    const neighbors = adj.get(nodeId) ?? [];
-    for (const neighbor of neighbors) {
+    let foundCycle = false;
+    for (const neighbor of adj.get(nodeId) ?? []) {
       const state = visited.get(neighbor);
       if (state === 'visiting') {
+        // Back edge — the cycle is the `currentPath` suffix from `neighbor`.
         const cycleStartIndex = currentPath.indexOf(neighbor);
         cycles.push([...currentPath.slice(cycleStartIndex), neighbor]);
-        return false;
+        foundCycle = true;
+        // Keep scanning siblings; do NOT bail out — bailing is what left the
+        // path and the `visiting` marks un-unwound.
+        continue;
       }
-      if (state === 'unvisited') {
-        if (!dfs(neighbor)) {
-          return false;
-        }
+      if (state === 'unvisited' && dfs(neighbor)) {
+        foundCycle = true;
       }
     }
 
+    // Unwind unconditionally so a later root starts from a clean path.
     currentPath.pop();
     visited.set(nodeId, 'visited');
-    return true;
+    return foundCycle;
   }
 
   for (const node of graph.nodes) {

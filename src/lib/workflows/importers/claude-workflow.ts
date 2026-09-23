@@ -1,5 +1,6 @@
 import type { WorkflowEdge, WorkflowGraph, WorkflowNode } from '../graph';
 import { createWorkflowGraph } from '../graph';
+import { parseJsObjectLiteral, sliceBalanced } from '../js-literal';
 
 export interface ClaudeWorkflowImportOptions {
   id?: string;
@@ -39,41 +40,29 @@ export function importClaudeWorkflow(
   let parsedPhases: PhaseDefinition[] = [];
 
   if (metaStart !== -1) {
-    const braceStart = scriptContent.indexOf('{', metaStart);
-    if (braceStart !== -1) {
-      let depth = 0;
-      let braceEnd = -1;
-      for (let i = braceStart; i < scriptContent.length; i++) {
-        if (scriptContent[i] === '{') depth++;
-        else if (scriptContent[i] === '}') {
-          depth--;
-          if (depth === 0) {
-            braceEnd = i;
-            break;
-          }
-        }
+    // Read the literal WITHOUT executing it — an imported workflow script is
+    // untrusted input (WP-31 review fix, Round 29). `parseJsObjectLiteral`
+    // normalizes the literal to JSON; a literal carrying computed values
+    // yields `undefined` and the importer falls through to its heuristics
+    // rather than evaluating anything.
+    const metaSlice = sliceBalanced(scriptContent, metaStart, '{', '}');
+    const parsed = metaSlice ? parseJsObjectLiteral(metaSlice) : undefined;
+    if (parsed && typeof parsed === 'object') {
+      const meta = parsed as {
+        name?: unknown;
+        title?: unknown;
+        description?: unknown;
+        phases?: unknown;
+      };
+
+      if (typeof meta.name === 'string' && meta.name) workflowId = options.id ?? meta.name;
+      if (typeof meta.title === 'string' && meta.title) title = options.title ?? meta.title;
+      else if (typeof meta.description === 'string' && meta.description) {
+        title = options.title ?? meta.description;
       }
-      if (braceEnd !== -1) {
-        const metaStr = scriptContent.slice(braceStart, braceEnd + 1);
-        try {
-          const fn = new Function(`return (${metaStr});`);
-          const meta = fn() as {
-            name?: string;
-            title?: string;
-            description?: string;
-            phases?: PhaseDefinition[];
-          };
 
-          if (meta.name) workflowId = options.id ?? meta.name;
-          if (meta.title) title = options.title ?? meta.title;
-          else if (meta.description) title = options.title ?? meta.description;
-
-          if (Array.isArray(meta.phases)) {
-            parsedPhases = meta.phases;
-          }
-        } catch {
-          // ignore eval error
-        }
+      if (Array.isArray(meta.phases)) {
+        parsedPhases = meta.phases as PhaseDefinition[];
       }
     }
   }

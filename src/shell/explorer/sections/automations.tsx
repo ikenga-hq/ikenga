@@ -1,8 +1,10 @@
 import { useCallback } from 'react';
-import { Clock } from 'lucide-react';
+import { Clock, GitBranch } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { pkgKernelStatus, pkgPreviewManifest } from '@/lib/tauri-cmd';
+import { workflowGraphsFromManifest } from '@/shell/ngwa/use-pkg-workflow-graphs';
 import type { ExplorerSectionContext } from '../section-registry';
 
 export const automationsContextMenu = [
@@ -16,18 +18,58 @@ export const automationsContextMenu = [
 export interface AutomationItem {
 	id: string;
 	name: string;
+	/** Cron expression for a schedule; step count for a declared workflow. */
 	schedule: string;
 	status?: 'ok' | 'running' | 'failed' | 'paused';
+	kind?: 'workflow' | 'schedule';
+}
+
+/**
+ * List the §10 `workflows[]` entries declared across installed pkgs
+ * (WP-31 review fix, Round 29).
+ *
+ * Neither `ngwa_snapshot` nor `pkg_kernel_status` exposes `workflows[]` — the
+ * snapshot is the G-NGWA-ITEM join and kernel status is
+ * `installed[] + registries + api_version` — so this walks the kernel's
+ * `installed[]` and reads each pkg's manifest through the existing
+ * `pkg_preview_manifest` command. No new Tauri command, no ACL change.
+ *
+ * Exported for the section's test.
+ */
+export async function listDeclaredWorkflows(): Promise<AutomationItem[]> {
+	const status = await pkgKernelStatus();
+	const installed = (status.installed ?? []).filter((p) => p.enabled && p.install_path);
+
+	const perPkg = await Promise.all(
+		installed.map(async (pkg) => {
+			try {
+				const manifest = await pkgPreviewManifest(pkg.install_path);
+				return workflowGraphsFromManifest(
+					pkg.id,
+					`${pkg.install_path}/manifest.json`,
+					(manifest as { workflows?: unknown }).workflows,
+				);
+			} catch {
+				// One unreadable manifest must not blank the whole section.
+				return [];
+			}
+		}),
+	);
+
+	return perPkg.flat().map((graph) => ({
+		id: graph.id,
+		name: graph.title,
+		schedule: `${graph.nodes.length} step${graph.nodes.length === 1 ? '' : 's'}`,
+		kind: 'workflow' as const,
+	}));
 }
 
 export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 	const query = useQuery<AutomationItem[]>({
 		queryKey: ['explorer-automations', projectId],
-		queryFn: async () => {
-			// In Phase 1 automations read from agent-ops or project definitions
-			return [];
-		},
+		queryFn: listDeclaredWorkflows,
 		staleTime: 30_000,
+		retry: false,
 	});
 
 	const items = query.data ?? [];
@@ -65,7 +107,11 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 					title={item.name}
 					className="w-full gap-1.5 px-2"
 				>
-					<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+					{item.kind === 'workflow' ? (
+						<GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+					) : (
+						<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+					)}
 					<span className="flex-1 truncate text-xs">{item.name}</span>
 					<span className="text-[10px] text-muted-foreground font-mono">{item.schedule}</span>
 				</ListRow>
