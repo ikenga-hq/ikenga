@@ -1,0 +1,24 @@
+{
+  "id": "my-org.studio",
+  "name": "Studio",
+  "version": "0.1.0",
+  "ikenga_api": "5",
+  "iyke": {
+    "routes": [
+      { "method": "POST", "path": "/pkg/my-org.studio/build", "handler": "echo" }
+    ]
+  },
+  "workflows": [
+    {
+      "id": "build-pipeline",
+      "title": "Build Pipeline",
+      "steps": [
+        {
+          "id": "build",
+          "title": "Build",
+          "handler": "/iyke/pkg/my-org.studio/build"
+        }
+      ]
+    }
+  ]
+}

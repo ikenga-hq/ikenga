@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task|Agent|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py ~/.claude/hooks/route-subagent-model.py",
+            "statusMessage": "Routing subagent model"
+          }
+        ]
+      }
+    ]
+  }
+}

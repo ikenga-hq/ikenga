@@ -10,6 +10,9 @@ vi.mock('@/lib/tauri-cmd', () => ({
 	pkgSettingsSet: vi.fn(),
 	pkgTrustGrant: vi.fn(),
 	pkgTrustRevoke: vi.fn(),
+	// WP-31: the Flow tab reads `workflows[]` off the manifest. Default to a
+	// manifest with none so the existing tab assertions are unaffected.
+	pkgPreviewManifest: vi.fn().mockResolvedValue({ id: 'test-item', workflows: [] }),
 }));
 
 afterEach(() => {
@@ -224,5 +227,66 @@ describe('NgwaItemDetailSurface (WP-17 / D-08)', () => {
 
 		fireEvent.click(screen.getByText('Update to 1.3.0'));
 		expect(onUpdate).toHaveBeenCalledWith(item);
+	});
+
+	// ── Flow tab (WP-31 review fix, Round 29) ───────────────────────────────
+
+	it('mounts the flow renderer behind a Flow tab for a pkg declaring workflows[]', async () => {
+		vi.mocked(tauriCmd.pkgPreviewManifest).mockResolvedValueOnce({
+			id: 'com.ikenga.studio',
+			name: 'Studio',
+			version: '1.2.0',
+			ikenga_api: '5',
+			workflows: [
+				{
+					id: 'nightly',
+					title: 'Nightly Build',
+					steps: [
+						{
+							id: 'build',
+							title: 'Build Artifacts',
+							handler: '/iyke/pkg/com.ikenga.studio/build',
+							inputs: {},
+							produces: [],
+							depends_on: [],
+						},
+						{
+							id: 'publish',
+							title: 'Publish Artifacts',
+							handler: '/iyke/pkg/com.ikenga.studio/publish',
+							inputs: {},
+							produces: [],
+							depends_on: ['build'],
+						},
+					],
+				},
+			],
+		} as never);
+
+		const item = makeItem({
+			id: 'com.ikenga.studio',
+			kind: 'app',
+			install_path: '/home/.ikenga/pkgs/studio',
+		});
+		renderWithClient(<NgwaItemDetailSurface item={item} />);
+
+		// The tab appears once the manifest resolves…
+		const flowTab = await waitFor(() => screen.getByRole('tab', { name: 'Flow' }));
+		fireEvent.click(flowTab);
+
+		// …and the renderer is mounted with the graph `graph.ts` built.
+		await waitFor(() => expect(screen.getByTestId('ngwa-flow-tab')).toBeDefined());
+		// The graph title shows both as the group head and in the renderer.
+		expect(screen.getAllByText('Nightly Build').length).toBeGreaterThan(0);
+		expect(screen.getByText('Build Artifacts')).toBeDefined();
+		expect(screen.getByText('Publish Artifacts')).toBeDefined();
+	});
+
+	it('offers no Flow tab when the manifest declares no workflows[]', async () => {
+		const item = makeItem({ id: 'pkg-plain', kind: 'app' });
+		renderWithClient(<NgwaItemDetailSurface item={item} />);
+
+		await waitFor(() => expect(screen.getByRole('tab', { name: 'Overview' })).toBeDefined());
+		expect(screen.queryByRole('tab', { name: 'Flow' })).toBeNull();
 	});
 });

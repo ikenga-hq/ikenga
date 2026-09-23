@@ -521,3 +521,141 @@ fn full_fixture_registers_everything() {
         install_path: PathBuf::from("/tmp/_fixture"),
     });
 }
+
+// ── §10 `workflows[]` parity (WP-31, Round-29 review fix) ────────────────────
+//
+// `workflows[]` is a top-level field, not a `ui.*` block, and its
+// register()-time checks live in `Package::validate` rather than in a
+// registry. The verdict-by-folder contract is therefore:
+//
+// | folder     | expected verdict                                             |
+// |------------|--------------------------------------------------------------|
+// | `valid/`   | deserializes AND `Package::validate` accepts                 |
+// | `invalid/` | deserializes (serde is shape-only) AND `validate` errors      |
+//
+// `@ikenga/contract` #43 shipped no `workflows/` fixtures, so the canonical
+// set is read when present and the shell's own
+// `src/pkg/testdata/workflows/{valid,invalid}` stands in otherwise. Contract-
+// side fixtures are a follow-up; when they land, drop the local folder and
+// this helper falls through to the canonical set on its own.
+
+/// Local stand-in fixture root — see `testdata/workflows/README.md`.
+const LOCAL_WORKFLOW_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/pkg/testdata/workflows");
+
+/// `(dir, is_contract_side)` for one workflows verdict folder. Prefers the
+/// contract checkout; falls back to the local stand-in.
+fn workflow_folder(folder: &str) -> (PathBuf, bool) {
+    let contract_dir = fixture_root().join("workflows").join(folder);
+    if contract_dir.is_dir() {
+        return (contract_dir, true);
+    }
+    (PathBuf::from(LOCAL_WORKFLOW_FIXTURES).join(folder), false)
+}
+
+fn workflow_fixture_paths(folder: &str) -> Vec<PathBuf> {
+    let (dir, from_contract) = workflow_folder(folder);
+    assert!(
+        dir.is_dir(),
+        "workflows parity: neither the contract checkout nor the local stand-in has `{folder}` \
+         (looked for {})",
+        dir.display()
+    );
+    if !from_contract {
+        eprintln!(
+            "workflows parity: contract-side `workflows/{folder}` absent — using the local \
+             stand-in at {} (contract fixtures are a tracked follow-up)",
+            dir.display()
+        );
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "workflows parity: no fixtures in {}",
+        dir.display()
+    );
+    paths
+}
+
+#[test]
+fn workflow_fixtures_match_verdicts() {
+    for path in workflow_fixture_paths("valid") {
+        let name = fixture_name(&path);
+        let manifest: Manifest = serde_json::from_str(&read_fixture(&path))
+            .unwrap_or_else(|e| panic!("valid/{name} must deserialize: {e}"));
+        assert!(
+            !manifest.workflows.is_empty(),
+            "valid/{name} is a workflows fixture but declares no `workflows[]`"
+        );
+        Package::validate(&manifest)
+            .unwrap_or_else(|e| panic!("valid/{name} must validate cleanly: {e:#}"));
+    }
+
+    for path in workflow_fixture_paths("invalid") {
+        let name = fixture_name(&path);
+        // serde is shape-only, so an invalid §10 declaration still
+        // deserializes — the §10 checks are `validate`'s, one layer later
+        // (the same split the `invalid/view-route-*` fixtures document).
+        let manifest: Manifest = serde_json::from_str(&read_fixture(&path))
+            .unwrap_or_else(|e| panic!("invalid/{name} must still deserialize: {e}"));
+        let err = Package::validate(&manifest)
+            .expect_err(&format!("invalid/{name} must be rejected by Package::validate"));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("workflow"),
+            "invalid/{name} was rejected for an unrelated reason: {msg}"
+        );
+    }
+}
+
+/// The §10 `handler` regex is applied on the Rust side, and it is the SAME
+/// pattern as `contract/src/manifest.ts` `WorkflowStepSchema.handler`.
+///
+/// Before the Round-29 fix the Rust side only checked prefix equality against
+/// `manifest.id` plus the `<cmd>` segment charset — so a manifest whose own id
+/// is not spelled the way the regex demands (uppercase label, dashed FIRST
+/// label) sailed through the Rust parser while Zod rejected it. These cases
+/// pin that gap closed; each fixture is rejected only because of the regex.
+#[test]
+fn workflow_handler_regex_mirrors_contract_pattern() {
+    // Pinned verbatim so drift against contract/src/manifest.ts is a one-line
+    // diff in review.
+    assert_eq!(
+        super::manifest::WORKFLOW_HANDLER_PATTERN,
+        r"^/iyke/pkg/[a-z0-9]+(\.[a-z0-9-]+)+/[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$"
+    );
+
+    let re = regex::Regex::new(super::manifest::WORKFLOW_HANDLER_PATTERN).unwrap();
+
+    for ok in [
+        "/iyke/pkg/com.ikenga.studio/build",
+        "/iyke/pkg/com.ikenga.studio/test/unit",
+        "/iyke/pkg/com.ikenga.local-store-etl/etl",
+        "/iyke/pkg/io.royalti.x2/run-now",
+    ] {
+        assert!(re.is_match(ok), "should match: {ok}");
+    }
+
+    for bad in [
+        // <pkg_id> shape — what prefix equality alone could never catch.
+        "/iyke/pkg/com.Ikenga.studio/build", // uppercase label
+        "/iyke/pkg/my-org.studio/build",     // dash in the FIRST label
+        "/iyke/pkg/studio/build",            // not reverse-DNS
+        "/iyke/pkg/com.ikenga.studio./build",
+        // <cmd> shape
+        "/iyke/pkg/com.ikenga.studio/Build",
+        "/iyke/pkg/com.ikenga.studio/-build",
+        "/iyke/pkg/com.ikenga.studio/build_now",
+        "/iyke/pkg/com.ikenga.studio/",
+        "/iyke/pkg/com.ikenga.studio",
+        // prefix
+        "/pkg/com.ikenga.studio/build",
+        "iyke/pkg/com.ikenga.studio/build",
+    ] {
+        assert!(!re.is_match(bad), "should NOT match: {bad}");
+    }
+}
