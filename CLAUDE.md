@@ -260,68 +260,6 @@ Mirrors `resume_after_review` (the prior closest path) but adds an unregister-fi
 
 Smoke verified end-to-end: mount, reload on save (`0.1.0 → 0.2.0 → 0.1.0 → 0.3.0`), atomic recovery from invalid JSON (kernel keeps the prior version registered while the manifest is broken, resumes when it parses again), SIGINT → clean unregister + watcher drop.
 
-## Phase 0.5 — background-execution spike runbook
-
-The spike is wired into the running shell (not a separate Tauri app) so it inherits the real production webview, IPC layer, and OS integration. Tests the *main* webview (proxy for child-webview behavior on rows 2–5; row 1 of the matrix needs Phase 1's child-webview API to be testable at all).
-
-**Files** (all gated `cfg(debug_assertions)` / `import.meta.env.DEV`, deleted after sign-off):
-- `src-tauri/src/commands/bg_spike.rs` — Rust command pair (`bg_spike_run`, `bg_spike_reply`).
-- `src/lib/tauri-cmd.ts` — `bgSpikeRun()` typed wrapper at the bottom.
-- `src/lib/dev/bg-spike.ts` — installs `window.__bgSpikeReply` + `window.bgSpikeRun` console helpers.
-
-### How it measures
-
-Tauri 2's `WebviewWindow::eval` is fire-and-forget — host gets no direct timing back. So Rust evals a snippet that calls `window.__bgSpikeReply(nonce)` in the page; the FE hook invokes `bg_spike_reply(nonce)` back into Rust; Rust records `t1 - t0` as the round-trip. This is the same shape as the latency a `pkg-browser` MCP tool will experience, end-to-end.
-
-### Matrix to run on each OS (macOS / Windows / Linux)
-
-For each row, in DevTools console:
-
-```js
-// 60-second runs at 500ms cadence, 5s per-ping timeout. Pass a tag so the
-// console output is greppable across runs.
-await window.bgSpikeRun({ tag: 'focused' })          // Row baseline
-// → minimize the Ikenga window with the OS chrome, wait 30s, then:
-await window.bgSpikeRun({ tag: 'minimized' })        // Row 2
-// → restore + focus another app for the full run:
-await window.bgSpikeRun({ tag: 'backgrounded' })     // Row 3
-// → screen off (close lid / xset dpms force off / Ctrl+Shift+Power on Mac)
-//   for the full run; keep machine awake (caffeinate -dim on macOS,
-//   `systemd-inhibit --what=sleep sleep 90` on Linux):
-await window.bgSpikeRun({ tag: 'screen-off' })       // Row 4
-// → laptop to sleep mid-run; on wake, the queued ping should resolve.
-//   Documented as "queued, runs on wake" — no pass/fail metric.
-```
-
-Each call returns `{ intendedCount, completedCount, timeoutCount, p50Us, p95Us, p99Us, maxUs, … }`. Console output prints a one-line summary table.
-
-### Pass/fail thresholds (per-OS, per-row)
-
-| Row | Required | Threshold |
-|---|---|---|
-| `focused` | baseline RTT | p95 < 50ms |
-| `minimized` | eval still works | p95 < 500ms, completedCount/intendedCount > 0.95 |
-| `backgrounded` | no App Nap delay | p95 < 500ms, completedCount/intendedCount > 0.95 |
-| `screen-off` | works degraded | p95 < 2000ms, no full hangs |
-| `sleep` | queued | wake resolves the in-flight ping |
-
-### Decision gate (after collecting all 3 OSes)
-
-- **Green** (3 of 5 rows pass on all OSes, sleep documented): proceed to Phase 1 unmodified.
-- **Yellow** (one or more OSes fail `minimized` only): proceed to Phase 1 + bake the keep-awake mitigation into the kernel (assert macOS `NSProcessInfo.beginActivity(.userInitiated)` / Windows `CoreWebView2Controller.IsVisible = true` while any browser MCP tool call is in flight). Document `pkg-browser` as "works while the app window is open."
-- **Red** (any platform breaks `eval` round-trip when minimized even with mitigations): rescope. Either accept "open window only" as a hard limitation or bring forward `pkg-browser-cdp` so headless Chromium covers minimized/overnight workflows.
-
-### After sign-off
-
-Delete:
-- `src-tauri/src/commands/bg_spike.rs`
-- The `#[cfg(debug_assertions)]` blocks in `src-tauri/src/commands/mod.rs` referencing `bg_spike`
-- The `#[cfg(debug_assertions)]` blocks in `src-tauri/src/lib.rs` (import + manage + handler entries)
-- The `src/lib/dev/bg-spike.ts` file + the `import './bg-spike'` line in `src/lib/dev/index.ts`
-- The "Phase 0.5 background-execution spike (debug-only)" section at the end of `src/lib/tauri-cmd.ts`
-
-This section in CLAUDE.md stays — it's the architecture record.
-
 ### Phase 1 — child-webview kernel (landed 2026-05-12)
 
 Commit `2de5db9` (Rust side); FE half is a separate follow-up commit.
@@ -373,34 +311,8 @@ After multiple Linux smoke tests, `pkg/webview.rs` was rewritten one more time a
 
 **Long-term Linux fix** (deferred, see separate research session): vendor or upstream-PR a wry change that uses `GtkOverlay`/`GtkFixed` instead of `GtkBox` as the child-webview container. Discussion #1178 has the recipe; nobody has merged it. ~few hundred LOC, well-bounded.
 
-### Findings — Linux WebKitGTK (2026-05-12)
+## Background-execution spike — archived
 
-Run on Linux 6.17 / WebKitGTK (`libwebkit2gtk-4.1`) on a ThinkPad T490s. 60s runs at 500ms cadence, 5s per-ping timeout. Same dev binary (`bun run tauri dev`) across all four rows.
-
-| Row | done/intended | p50_ms | p95_ms | p99_ms | max_ms | timeouts |
-|---|---|---|---|---|---|---|
-| focused | 120/120 | 1.34 | 2.72 | 27.93 | 38.68 | 0 |
-| minimized | 113/114 | 1.28 | 3.09 | 5.60 | 94.75 | 1 |
-| backgrounded | 120/120 | 1.23 | 2.59 | 3.68 | 4.48 | 0 |
-| screen-off | 120/120 | 1.34 | 2.95 | 6.46 | 6.74 | 0 |
-
-**All four rows pass with margin.** Sub-3ms p95 across every state — focus / occlusion / screen state are essentially invisible to host-injected `eval`. The one timeout in `minimized` was the moment of the minimize animation itself; the next ping landed normally. The single 94ms `max_ms` in `minimized` is the same artifact.
-
-**Decision: Green on Linux.** No keep-awake mitigation needed for this OS.
-
-**Outstanding: macOS and Windows** were not run (no machine available this session). The original concerns — macOS App Nap and Windows WebView2 `TrySuspend` — apply to those engines, not WebKitGTK. Linux passing tells us the kernel + eval pipeline is sound but says nothing about the other two OSes.
-
-### Recommendation: Phase 1 "defensive Yellow"
-
-Proceed to Phase 1 as planned, but **bake the keep-awake mitigations in from day one** rather than waiting for macOS / Windows numbers. They're cheap, the kernel is small, and they remove a re-architecture risk if the macOS pass turns out worse:
-
-- **macOS**: hold `NSProcessInfo.beginActivity(.userInitiated, reason: "Ikenga browser automation")` while any `pkg_webview_eval` call is in flight; release when the in-flight count drops to zero.
-- **Windows**: set `CoreWebView2Controller.IsVisible = true` on browser-pkg-owned webviews even when the host window is minimized; don't honor `TrySuspend` on them.
-- **Linux**: nothing (Green confirmed).
-
-If a future macOS or Windows spike run shows the mitigations are sufficient, no rework. If they're not, we already have the right hooks in place to layer on the next mitigation (separate borderless window, etc.) without touching the public manifest / MCP surface.
-
-### Notes / known minor issues from this run
-
-- The "[bg_spike] reply hook not installed" warnings printed in the original spike output were a **cosmetic bug** in the Rust eval snippet (`X && X() || warn` evaluates the warn branch because `X()` returns `undefined`). Replies were still firing — that's how we got 120/120 in three of four rows. Fixed in the same commit as these findings; subsequent runs should be silent.
-- The user ran `screen-off` on Linux Wayland despite the runbook suggesting to skip it (`xset dpms force off` doesn't work on Wayland). Result still passed cleanly, presumably via a system-menu lock or lid action that blanked the display without suspending the process. Documented as: screen-off works on Linux when you can get the screen off, regardless of the mechanism.
+The Phase 0.5 spike runbook, its per-OS test matrix and thresholds, and the
+WebKitGTK findings / "defensive Yellow" recommendation now live in
+`../plans/shell/2026-05-13-background-execution-spike.md` (workspace meta-repo).
