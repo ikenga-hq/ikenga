@@ -40,7 +40,7 @@ use crate::commands::engine_layout::{
 };
 use crate::commands::pkg::KernelState;
 use crate::commands::projects;
-use crate::pkg::kernel::InstalledSummary;
+use crate::pkg::kernel::{InstalledSummary, KernelStatus};
 use crate::pkg::manifest::{Manifest, Package, RequireSource, RequiresEntry};
 use crate::pkg::source::InstallSource;
 use crate::pkg::trust::{self, TrustState};
@@ -1277,16 +1277,37 @@ pub async fn ngwa_snapshot(
     db: State<'_, Arc<PaDb>>,
     app: AppHandle,
 ) -> Result<NgwaSnapshot, String> {
-    let now = usage::now_ms();
-    let pool = db.ensure_pool().await?;
     let app_data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("resolve app_data_dir: {e}"))?;
+    ngwa_snapshot_inner(
+        kernel.0.status(),
+        db.inner(),
+        &app_data_dir,
+        usage::claude_projects_dir(),
+    )
+    .await
+}
 
-    let usage = collect_usage(&pool, usage::claude_projects_dir(), now).await;
+/// The snapshot data path shared by the `ngwa_snapshot` command and the
+/// `GET /iyke/ngwa/snapshot` bridge route (WP-28 — iyke handlers have no
+/// Tauri `State`, so both call this one function rather than duplicating the
+/// join). All inputs are resolved by the caller: `status` is
+/// `kernel.status()`, `app_data_dir` anchors trust evaluation, and
+/// `transcript_root` is the `~/.claude/projects` corpus
+/// (`usage::claude_projects_dir()` in production — tests pass a fixture dir
+/// so the cold 130s-scale corpus scan never runs in the harness).
+pub async fn ngwa_snapshot_inner(
+    status: KernelStatus,
+    db: &Arc<PaDb>,
+    app_data_dir: &PathBuf,
+    transcript_root: Option<PathBuf>,
+) -> Result<NgwaSnapshot, String> {
+    let now = usage::now_ms();
+    let pool = db.ensure_pool().await?;
 
-    let status = kernel.0.status();
+    let usage = collect_usage(&pool, transcript_root, now).await;
 
     let projects: Vec<(String, String)> = projects::list_projects(&pool, false)
         .await
@@ -1297,10 +1318,11 @@ pub async fn ngwa_snapshot(
     let project_roots: Vec<String> = projects.iter().map(|(_, r)| r.clone()).collect();
 
     let config = claude_config::claude_config_load(project_roots).await;
-    let trust_pending = crate::commands::pkg_trust::pkg_trust_list_pending(db.clone(), kernel.clone())
-        .await
-        .map(|v| v.into_iter().map(|r| r.pkg_id).collect::<HashSet<_>>());
-    let oba = claude_store::claude_store_list(db.clone(), None).await;
+    let trust_pending =
+        crate::commands::pkg_trust::pending_trust_reviews(&pool, &status.installed)
+            .await
+            .map(|v| v.into_iter().map(|r| r.pkg_id).collect::<HashSet<_>>());
+    let oba = claude_store::claude_store_list_inner(db, None).await;
 
     let mut pkgs = Vec::with_capacity(status.installed.len());
     for summary in status.installed {
@@ -1311,7 +1333,7 @@ pub async fn ngwa_snapshot(
             .and_then(|r| r.map_err(|e| format!("{e:#}")));
         let (manifest, trust) = match loaded {
             Ok(pkg) => {
-                let t = trust::evaluate(&pool, &pkg, &summary.source, &app_data_dir)
+                let t = trust::evaluate(&pool, &pkg, &summary.source, app_data_dir)
                     .await
                     .map_err(|e| format!("{e:#}"));
                 (Ok(pkg.manifest), t)
@@ -2076,6 +2098,110 @@ mod tests {
             serde_json::to_string(&NgwaScope::Project { project_id: "p1".into() }).unwrap(),
             r#"{"kind":"project","project_id":"p1"}"#
         );
+    }
+
+    /// WP-28: `GET /iyke/ngwa/snapshot` and the `ngwa_snapshot` command share
+    /// `ngwa_snapshot_inner`. Drive it with an empty kernel + fixture dirs
+    /// (no AppHandle needed) and diff the serialized wire shape against the
+    /// iyke-cli vendored golden (`iyke-cli/tests/fixtures/`): same top-level
+    /// keys, same `sources` health keys, same per-item field set when the
+    /// golden carries items.
+    #[tokio::test]
+    async fn ngwa_snapshot_inner_route_shape_matches_cli_golden() {
+        const CLI_GOLDEN: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../iyke-cli/tests/fixtures/ngwa-snapshot.golden.json"
+        );
+        let golden_text = match std::fs::read_to_string(CLI_GOLDEN) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!(
+                    "ngwa_snapshot_inner golden-shape test skipped — \
+                     {CLI_GOLDEN} not found (sibling iyke-cli checkout absent)"
+                );
+                return;
+            }
+        };
+        let golden: serde_json::Value = serde_json::from_str(&golden_text).unwrap();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(PaDb::new(tmp.path().join("ikenga.db")));
+        let corpus = tmp.path().join("claude-projects");
+        std::fs::create_dir_all(&corpus).unwrap();
+        let app_data = tmp.path().join("app-data");
+        std::fs::create_dir_all(&app_data).unwrap();
+        let status = crate::pkg::kernel::KernelStatus {
+            installed: vec![],
+            registries: HashMap::new(),
+            api_version: crate::pkg::manifest::IKENGA_API_VERSION,
+        };
+
+        let snap = ngwa_snapshot_inner(status, &db, &app_data, Some(corpus))
+            .await
+            .expect("inner snapshot builds on empty state");
+        let v = serde_json::to_value(&snap).unwrap();
+
+        // Top-level wire shape == golden.
+        let mut got: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        got.sort();
+        let mut want: Vec<String> = golden
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "top-level keys drifted from the CLI golden");
+
+        // `sources` health map: same source names, each with the same
+        // {ok, error?, count} keys.
+        let mut got_sources: Vec<String> = v["sources"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        got_sources.sort();
+        let mut want_sources: Vec<String> = golden["sources"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        want_sources.sort();
+        assert_eq!(
+            got_sources, want_sources,
+            "sources map drifted from the CLI golden"
+        );
+
+        // Per-item field set == golden's first item (all items share the
+        // schema — the golden diff is on the field *names*, not values).
+        if let Some(gitem) = golden["items"].as_array().and_then(|a| a.first()) {
+            let mut want_item_keys: Vec<String> = gitem
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            want_item_keys.sort();
+            // A fresh kernel has no items, so pin the shape via a synthetic
+            // serialize round-trip: every NgwaItem field name is in the
+            // golden's set. Reuse the WP-14 golden inputs for one real item.
+            let inputs = golden_inputs();
+            let rich = build_snapshot(inputs);
+            let rv = serde_json::to_value(&rich).unwrap();
+            let mut got_item_keys: Vec<String> = rv["items"].as_array().unwrap()[0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            got_item_keys.sort();
+            assert_eq!(
+                got_item_keys, want_item_keys,
+                "item field set drifted from the CLI golden"
+            );
+        }
     }
 }
 

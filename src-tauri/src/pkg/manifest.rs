@@ -6,9 +6,10 @@
 //! The kernel walks the present blocks and registers each against the
 //! corresponding registry; absent blocks are no-ops.
 //!
-//! Versioning policy: the host supports `ikenga_api` versions {N, N-1}. Older
-//! manifests are auto-disabled with a user-facing message rather than shimmed
-//! — see `IKENGA_API_VERSION` and `is_compatible`.
+//! Versioning policy: the host supports `ikenga_api` versions in the closed
+//! interval `[IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION]`. Older manifests
+//! are auto-disabled with a user-facing message rather than shimmed — see
+//! `IKENGA_API_VERSION` and `is_compatible`.
 //!
 //! Names use snake_case in JSON (matching the spec discussed) and are
 //! re-mapped via `#[serde(rename = "...")]` where Rust idiom differs.
@@ -20,7 +21,8 @@ use serde::{Deserialize, Serialize};
 
 /// Current host API contract version. Bump when manifest semantics change in
 /// a non-additive way. Packages declaring older versions are auto-disabled
-/// once they fall outside the {current, current-1} support window.
+/// once they fall outside the [IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION]
+/// support window.
 ///
 /// v2 (WP-05): added `capabilities.sqlite` + `permissions["sqlite.tables"]`;
 /// `permissions["supabase.tables"]` kept as a compat alias for api=1 manifests.
@@ -29,7 +31,14 @@ use serde::{Deserialize, Serialize};
 /// + top-level optional `signature`. All additive; api=1/2 manifests parse
 /// unchanged. Elevated caps are inert unless the pkg is trusted (builtin
 /// provenance OR signature-verified registry).
-pub const IKENGA_API_VERSION: u32 = 4;
+///
+/// v5 (WP-28, G-MANIFEST-V5): added `ui.views[]`, `ui.explorer_sections[]`,
+/// `ui.companion_panels[]`, `ui.context_actions[]`, `ui.widgets[]` (all
+/// optional-with-default, so api=1..4 manifests parse unchanged) and
+/// hard-retired `ui.side_pane_viewers` (declaring it now fails validation).
+/// `ui.nav` is a one-release alias for `ui.views` — `Package::load` maps it
+/// and logs one deprecation warning per parse.
+pub const IKENGA_API_VERSION: u32 = 5;
 
 /// Smallest supported manifest version. Packages with older `ikenga_api` are
 /// auto-disabled at boot; the kernel surfaces them with an "update required"
@@ -167,6 +176,10 @@ pub struct Manifest {
     /// `@ikenga/contract/manifest.ts`.
     #[serde(default)]
     pub signature: Option<String>,
+
+    /// Contributed workflow declarations (DEC-41, G-MANIFEST-V5 §10).
+    #[serde(default)]
+    pub workflows: Vec<WorkflowEntry>,
 }
 
 /// One forward-dependency edge (`requires[]` element). Names a standalone Ọba
@@ -669,8 +682,38 @@ pub struct ManifestUiSession {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiBlock {
+    /// Legacy view list (pre-v5 rail claim + pkg sidebar menu). Deprecated in
+    /// favour of `views` for exactly one shell release (G-MANIFEST-V5 §4):
+    /// `Package::load` maps `nav[i]` → `views[i]` with
+    /// `pin_on_install: i == 0` and logs one warning per parse. Kept as a
+    /// field so api=1..4 manifests keep parsing; the alias is deleted next
+    /// release, after which `nav` becomes an unknown field.
     #[serde(default)]
     pub nav: Vec<NavEntry>,
+    /// v5 (G-MANIFEST-V5 §2): the pkg's view entry points, consumed by the
+    /// Explorer **Views** section and the `views` kernel registry. `views[0]`
+    /// is the rail claim; `pin_on_install` on a view is honoured once, at
+    /// first install, via `activityPinsAdd`. Every `route` must match a
+    /// declared `ui.routes[].path` — validated at `register()` (§2b).
+    #[serde(default)]
+    pub views: Vec<ViewEntry>,
+    /// v5: Project-Explorer sections contributed by this pkg. Rendered
+    /// natively from `data_route` JSON (never an iframe); state id is
+    /// `${pkg_id}:${id}` per G-STATE §1.
+    #[serde(default)]
+    pub explorer_sections: Vec<ExplorerSectionEntry>,
+    /// v5: Companion state panels (ADR-021: state only, never model prose).
+    /// `session_scoped` threads the read-only `panelScopeSessionId` through
+    /// the AppBridge hostContext.
+    #[serde(default)]
+    pub companion_panels: Vec<CompanionPanelEntry>,
+    /// v5: selector-scoped context-menu contributions. Action identity is
+    /// `${pkg_id}:${action_id}` (G-MANIFEST-V5 §8 Q6).
+    #[serde(default)]
+    pub context_actions: Vec<ContextActionEntry>,
+    /// v5: project-dashboard widgets on a fixed grid (`span` small|medium|wide).
+    #[serde(default)]
+    pub widgets: Vec<WidgetEntry>,
     /// Declarative UI routes contributed by this package. `iframe`-kind routes
     /// are mounted at `/pkg/<id><path>` via the host catch-all, served by the
     /// `pkg_content` HTTP server. `component`-kind routes are documented as
@@ -680,7 +723,19 @@ pub struct UiBlock {
     pub routes: Vec<UiRoute>,
     #[serde(default, rename = "command_palette")]
     pub command_palette: Vec<CommandPaletteEntry>,
-    #[serde(default, rename = "side_pane_viewers")]
+    /// v5 hard-retire (G-MANIFEST-V5 §8 Q1): `ui.side_pane_viewers` is gone —
+    /// any manifest still declaring it fails validation with a canonical
+    /// error naming the replacements, same hard-cutover precedent as the
+    /// WP-17 skills/commands bundling retirement. `UiBlock` is deliberately
+    /// NOT `deny_unknown_fields` (forward-compat), so the rejection is
+    /// enforced by a field deserializer that errors on presence; the value
+    /// is never stored or serialized.
+    #[serde(
+        default,
+        rename = "side_pane_viewers",
+        deserialize_with = "reject_side_pane_viewers",
+        skip_serializing
+    )]
     pub side_pane_viewers: Vec<SidePaneViewer>,
 
     /// Per-directive CSP overrides for the iframe content. Directive name →
@@ -712,6 +767,255 @@ pub struct UiRoute {
     pub source: String,
     #[serde(default)]
     pub partition: Option<String>,
+}
+
+// ── manifest v5 contribution blocks (G-MANIFEST-V5 §2, FROZEN 2026-09-22) ──
+// These mirror the Zod schemas in `@ikenga/contract/src/manifest.ts` one-for-one
+// (`deny_unknown_fields` ↔ `.strict()`); keep them in lockstep. All fields are
+// optional-with-default on `UiBlock`, so api=1..4 manifests parse unchanged.
+
+/// `ui.views[]` — one view entry point (G-MANIFEST-V5 §2 `ViewEntrySchema`).
+/// Replaces `ui.nav`; during the alias release `Package::load` synthesizes
+/// entries from `ui.nav[]` (see `Manifest::apply_nav_views_alias`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewEntry {
+    pub id: String,
+    pub title: String,
+    /// Lucide icon name; same vocabulary as activity pins.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// A pkg UI namespace path (`/grid` → pane route `pkg://<id>/grid`).
+    /// Must match a declared `ui.routes[]` path — validated at `register()`
+    /// by `ViewsRegistry` (§2b).
+    pub route: String,
+    /// Honoured ONCE, at first install (no prior `pkg_installed` row); the
+    /// shell calls `activityPinsAdd` for the view. Updates never re-pin;
+    /// unpin is permanent.
+    #[serde(default)]
+    pub pin_on_install: bool,
+}
+
+/// `ui.explorer_sections[]` — a Project-Explorer section contributed by this
+/// pkg (G-MANIFEST-V5 §2 `ExplorerSectionEntrySchema`). The section is DATA,
+/// rendered natively by the shared section frame — never an embedded iframe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplorerSectionEntry {
+    /// Pkg-local id; the `ExplorerSectionState.id` is `${pkg_id}:${id}`
+    /// (G-STATE §1). The registry surfaces it as `qualified_id`.
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Sort order across pkgs; default = declaration order, ties by pkg id.
+    /// `z.number().int().optional()` — integral floats (`5.0`) are accepted
+    /// for schema parity.
+    #[serde(default, deserialize_with = "deserialize_opt_int")]
+    pub order: Option<i64>,
+    /// GET iyke route under `/pkg/<id>/` returning `ExplorerSectionData`.
+    pub data_route: String,
+}
+
+/// The JSON a `data_route` returns (G-MANIFEST-V5 §2 `ExplorerSectionDataSchema`).
+/// Not a manifest field — the wire shape the shell's section frame renders.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplorerSectionData {
+    #[serde(default)]
+    pub rows: Vec<ExplorerSectionRow>,
+    #[serde(default)]
+    pub as_of_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorerSectionRow {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub badge: Option<ExplorerSectionRowBadge>,
+    /// Pane target on click: a pkg route (`pkg://...`) or a shell route (`/...`).
+    #[serde(default)]
+    pub open: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplorerSectionRowBadge {
+    #[serde(default, deserialize_with = "deserialize_opt_int")]
+    pub count: Option<i64>,
+    #[serde(default)]
+    pub tooltip: Option<String>,
+}
+
+/// `ui.companion_panels[]` — a Companion state panel (G-MANIFEST-V5 §2
+/// `CompanionPanelEntrySchema`). ADR-021 applies: panels render state, never
+/// model prose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionPanelEntry {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Pane route rendered in the panel slot (an iframe view) — must match a
+    /// declared `ui.routes[]` path, validated at `register()`.
+    pub route: String,
+    /// When true the shell threads `panelScopeSessionId` (the selected
+    /// Companion session tab) through the AppBridge hostContext. Read-only
+    /// in Phase 4 (G-MANIFEST-V5 §8 Q5).
+    #[serde(default)]
+    pub session_scoped: bool,
+}
+
+/// `ContextSelectorSchema` — the `when` clause of a context action
+/// (G-MANIFEST-V5 §2). Members are NOT `.strict()` upstream, so unknown keys
+/// inside a variant are ignored (Zod-strip parity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ContextSelector {
+    #[serde(rename = "file")]
+    File {
+        #[serde(default)]
+        glob: Option<String>,
+    },
+    #[serde(rename = "artifact")]
+    Artifact,
+    #[serde(rename = "session")]
+    Session,
+    #[serde(rename = "ngwa-item")]
+    NgwaItem {
+        #[serde(default)]
+        kinds: Option<Vec<String>>,
+    },
+}
+
+/// `ContextActionRunSchema` — what the action does (G-MANIFEST-V5 §2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ContextActionRun {
+    /// "Hand to Chi" — fills the Companion dispatch bar. `prompt` is a
+    /// template over the D-06 variable set ({{file.path}}, {{selection}},
+    /// {{project.root}}, {{pane.url}}, {{branch}}).
+    #[serde(rename = "dispatch")]
+    Dispatch {
+        prompt: String,
+        #[serde(default)]
+        target: Option<String>,
+    },
+    #[serde(rename = "view")]
+    View { route: String },
+}
+
+/// `ui.context_actions[]` — one selector-scoped menu contribution
+/// (G-MANIFEST-V5 §2 `ContextActionEntrySchema`). Kernel identity is
+/// `${pkg_id}:${id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextActionEntry {
+    pub id: String,
+    pub label: String,
+    pub when: ContextSelector,
+    pub run: ContextActionRun,
+}
+
+/// `ui.widgets[].span` — fixed-grid width (G-MANIFEST-V5 §8 Q7). No
+/// drag-canvas semantics for pkg widgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WidgetSpan {
+    Small,
+    Medium,
+    Wide,
+}
+
+impl Default for WidgetSpan {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+/// `ui.widgets[]` — one project-dashboard widget (G-MANIFEST-V5 §2
+/// `WidgetEntrySchema`). `route` is an iframe view rendered in the
+/// dashboard grid and must match a declared `ui.routes[]` path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WidgetEntry {
+    pub id: String,
+    pub title: String,
+    pub route: String,
+    #[serde(default)]
+    pub span: WidgetSpan,
+}
+
+/// Field deserializer for the retired `ui.side_pane_viewers` — consumes the
+/// value and returns a canonical rejection. `UiBlock` stays
+/// non-`deny_unknown_fields` for forward compat, so without this the field
+/// would be silently ignored instead of failing validation (§8 Q1).
+fn reject_side_pane_viewers<'de, D>(d: D) -> std::result::Result<Vec<SidePaneViewer>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(d)?;
+    Err(serde::de::Error::custom(
+        "`ui.side_pane_viewers` was removed in manifest v5 (G-MANIFEST-V5 §8 Q1) \
+         — declare `ui.views[]` or `ui.companion_panels[]` instead",
+    ))
+}
+
+/// `z.number().int().optional()` parity: accepts an integer or an integral
+/// float (`5` / `5.0`), rejects fractions, strings, and non-numbers.
+fn deserialize_opt_int<'de, D>(d: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Number>::deserialize(d)?;
+    match v {
+        None => Ok(None),
+        Some(n) => {
+            if let Some(i) = n.as_i64() {
+                return Ok(Some(i));
+            }
+            if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f.is_finite() && f.abs() <= i64::MAX as f64 {
+                    return Ok(Some(f as i64));
+                }
+            }
+            Err(serde::de::Error::custom("expected an integer"))
+        }
+    }
+}
+
+/// What `Manifest::apply_nav_views_alias` did — the caller (`Package::load`)
+/// logs exactly one warning when this is `Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavAliasOutcome {
+    /// `ui.nav` was non-empty and `ui.views` empty: synthesized `views[i]`
+    /// from `nav[i]` (`pin_on_install: i == 0`, routes normalized from
+    /// `/pkg/<id><path>` / `pkg://<id><path>` to the `<path>` namespace form
+    /// `ui.routes[]` declares).
+    Applied,
+    /// Both `nav` and `views` were declared: `nav` ignored (parse never
+    /// fails on the alias — §4).
+    IgnoredBothDeclared,
+}
+
+/// Normalize a legacy `ui.nav[].route` to the namespace-path form
+/// `ui.views[].route` declares. `/pkg/<id>` / `pkg://<id>` prefixes strip to
+/// the remaining path (bare prefix → `/`); anything else (e.g. a shell
+/// route) passes through verbatim and will fail the `views`→`routes`
+/// reference check at `register()` — loud, per §2b.
+fn normalize_nav_route(pkg_id: &str, route: &str) -> String {
+    for prefix in [format!("/pkg/{pkg_id}"), format!("pkg://{pkg_id}")] {
+        if let Some(rest) = route.strip_prefix(&prefix) {
+            if rest.is_empty() {
+                return "/".to_string();
+            }
+            if rest.starts_with('/') {
+                return rest.to_string();
+            }
+        }
+    }
+    route.to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -814,6 +1118,64 @@ pub struct QueriesBlock {
     pub key_prefixes: Vec<String>,
 }
 
+/// Contributed workflow step declaration (DEC-41, G-MANIFEST-V5 §10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStep {
+    pub id: String,
+    pub title: String,
+    pub handler: String,
+    #[serde(default)]
+    pub inputs: serde_json::Value,
+    #[serde(default)]
+    pub produces: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// Contributed workflow declaration (DEC-41, G-MANIFEST-V5 §10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowEntry {
+    pub id: String,
+    pub title: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+impl Manifest {
+    /// Apply the `ui.nav` → `ui.views` alias (G-MANIFEST-V5 §4, one shell
+    /// release). Called once per `Package::load` — the ONLY call site — so
+    /// a `nav`-declaring manifest produces exactly one `log::warn!` per
+    /// parse. `None` means no `nav` block (nothing to warn about).
+    ///
+    /// Alias semantics: `nav[i]` → `views[i]` = `{id, title: label, icon,
+    /// route, pin_on_install: i == 0}` — `nav[0]` was the rail claim, so it
+    /// maps to the auto-pin. When both are declared, `nav` is ignored (the
+    /// warning names the pkg; parse never fails on the alias).
+    pub fn apply_nav_views_alias(&mut self) -> Option<NavAliasOutcome> {
+        let ui = self.ui.as_mut()?;
+        if ui.nav.is_empty() {
+            return None;
+        }
+        if !ui.views.is_empty() {
+            return Some(NavAliasOutcome::IgnoredBothDeclared);
+        }
+        ui.views = ui
+            .nav
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ViewEntry {
+                id: n.id.clone(),
+                title: n.label.clone(),
+                icon: n.icon.clone(),
+                route: normalize_nav_route(&self.id, &n.route),
+                pin_on_install: i == 0,
+            })
+            .collect();
+        Some(NavAliasOutcome::Applied)
+    }
+}
+
 /// Loaded package: parsed manifest plus the absolute path it was loaded from.
 /// The kernel passes this to every registry's `register()`.
 #[derive(Debug, Clone)]
@@ -823,14 +1185,43 @@ pub struct Package {
 }
 
 impl Package {
-    /// Load `<dir>/manifest.json` and parse it.
+    /// Load `<dir>/manifest.json`, parse it, validate it, and apply the
+    /// `ui.nav` → `ui.views` alias (v5, one shell release). Every registry
+    /// and the persisted `manifest_json` therefore see `views` as canonical.
     pub fn load(install_path: &Path) -> Result<Self> {
         let manifest_path = install_path.join("manifest.json");
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("read {}", manifest_path.display()))?;
-        let manifest: Manifest = serde_json::from_str(&raw)
+        let mut manifest: Manifest = serde_json::from_str(&raw)
             .with_context(|| format!("parse manifest at {}", manifest_path.display()))?;
         Self::validate(&manifest)?;
+        // Exactly one warning per parse for a nav-declaring pkg — this is
+        // the single warn site for the alias (§4 / WP-28 DoD).
+        match manifest.apply_nav_views_alias() {
+            Some(NavAliasOutcome::Applied) => log::warn!(
+                "[manifest] `{}` declares `ui.nav` — deprecated alias for `ui.views` \
+                 (v5); mapped {} nav entr{} to views. The alias is removed next \
+                 shell release.",
+                manifest.id,
+                manifest.ui.as_ref().map(|u| u.views.len()).unwrap_or(0),
+                if manifest
+                    .ui
+                    .as_ref()
+                    .map(|u| u.views.len() == 1)
+                    .unwrap_or(false)
+                {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ),
+            Some(NavAliasOutcome::IgnoredBothDeclared) => log::warn!(
+                "[manifest] `{}` declares both `ui.nav` and `ui.views` — `ui.nav` \
+                 ignored (v5 alias; removed next shell release)",
+                manifest.id
+            ),
+            None => {}
+        }
         Ok(Self {
             manifest,
             install_path: install_path.to_path_buf(),
@@ -865,10 +1256,140 @@ impl Package {
                 ));
             }
         }
+        Self::validate_workflows(m)?;
         Ok(())
     }
 
-    /// Compatibility check: host supports {IKENGA_API_VERSION, that-1}.
+    fn validate_workflows(m: &Manifest) -> Result<()> {
+        if m.workflows.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen_wf_ids = std::collections::HashSet::new();
+
+        for wf in &m.workflows {
+            if wf.id.is_empty() {
+                return Err(anyhow!("workflow id cannot be empty"));
+            }
+            if !seen_wf_ids.insert(&wf.id) {
+                return Err(anyhow!(
+                    "duplicate workflow id `{}` in manifest `{}`",
+                    wf.id,
+                    m.id
+                ));
+            }
+            if wf.steps.is_empty() {
+                return Err(anyhow!(
+                    "workflow `{}` in manifest `{}` must declare at least one step",
+                    wf.id,
+                    m.id
+                ));
+            }
+
+            let mut seen_step_ids = std::collections::HashSet::new();
+            for step in &wf.steps {
+                if step.id.is_empty() {
+                    return Err(anyhow!("step id cannot be empty in workflow `{}`", wf.id));
+                }
+                if !seen_step_ids.insert(&step.id) {
+                    return Err(anyhow!(
+                        "duplicate step id `{}` in workflow `{}`",
+                        step.id,
+                        wf.id
+                    ));
+                }
+
+                // Check handler route shape: /iyke/pkg/<pkg_id>/<cmd> (DEC-41, §10)
+                let expected_prefix = format!("/iyke/pkg/{}/", m.id);
+                if !step.handler.starts_with(&expected_prefix) {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` must start with `{}` (DEC-41, G-MANIFEST-V5 §10)",
+                        step.id,
+                        step.handler,
+                        expected_prefix
+                    ));
+                }
+
+                // Check <cmd> segments (lowercase-dash only: [a-z0-9][a-z0-9-]*)
+                let cmd_part = &step.handler[expected_prefix.len()..];
+                if cmd_part.is_empty() {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` missing <cmd> segment after `{}`",
+                        step.id,
+                        step.handler,
+                        expected_prefix
+                    ));
+                }
+                for segment in cmd_part.split('/') {
+                    if segment.is_empty()
+                        || !segment
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                            .unwrap_or(false)
+                        || !segment
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    {
+                        return Err(anyhow!(
+                            "workflow step `{}` handler `{}` has invalid <cmd> segment `{}`: segments must be lowercase-dash [a-z0-9][a-z0-9-]*",
+                            step.id,
+                            step.handler,
+                            segment
+                        ));
+                    }
+                }
+
+                // Stripped path /pkg/<pkg_id>/<cmd> must appear in iyke.routes[] with method: "POST"
+                let stripped_path = format!("/pkg/{}/{}", m.id, cmd_part);
+                let has_post_route = m
+                    .iyke
+                    .as_ref()
+                    .map(|b| {
+                        b.routes
+                            .iter()
+                            .any(|r| r.path == stripped_path && r.method.eq_ignore_ascii_case("POST"))
+                    })
+                    .unwrap_or(false);
+
+                if !has_post_route {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` stripped path `{}` must appear in `iyke.routes[]` with method: \"POST\" (G-MANIFEST-V5 §10)",
+                        step.id,
+                        step.handler,
+                        stripped_path
+                    ));
+                }
+            }
+
+            // Check depends_on references
+            for step in &wf.steps {
+                for dep in &step.depends_on {
+                    if dep == &step.id {
+                        return Err(anyhow!(
+                            "workflow step `{}` cannot depend on itself in workflow `{}`",
+                            step.id,
+                            wf.id
+                        ));
+                    }
+                    if !seen_step_ids.contains(dep) {
+                        return Err(anyhow!(
+                            "workflow step `{}` depends on unknown step `{}` in workflow `{}` (no cross-workflow references allowed)",
+                            step.id,
+                            dep,
+                            wf.id
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compatibility check: the host supports the closed interval
+    /// `[IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION]` — bumping the current
+    /// version never drops older manifests below the floor.
     pub fn is_compatible(&self) -> bool {
         let api: u32 = match self.manifest.ikenga_api.parse() {
             Ok(v) => v,
@@ -929,6 +1450,7 @@ mod tests {
             screenshots: vec![],
             requires: vec![],
             signature: None,
+            workflows: vec![],
         }
     }
 
@@ -1512,5 +2034,786 @@ mod tests {
         }"#;
         let m: Manifest = serde_json::from_str(json).expect("parse manifest with // comment");
         assert_eq!(m._comment.as_deref(), Some("comment text"));
+    }
+
+    // ── manifest v5 (WP-28, G-MANIFEST-V5 §2/§4/§8) ─────────────────────────
+
+    /// The full §2 contribution surface parses: `views`, `explorer_sections`,
+    /// `companion_panels`, `context_actions`, `widgets` — including the
+    /// tagged-union `when`/`run` shapes and the `span` default.
+    #[test]
+    fn v5_contribution_blocks_parse_full_shape() {
+        let json = r#"{
+            "id": "com.ikenga.agentops",
+            "name": "Agent Ops", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {
+                "routes": [
+                    {"path": "/", "kind": "iframe", "source": "dist/index.html"},
+                    {"path": "/jobs", "kind": "iframe", "source": "dist/index.html"},
+                    {"path": "/badge", "kind": "iframe", "source": "dist/index.html"}
+                ],
+                "views": [
+                    {"id": "jobs", "title": "Jobs", "icon": "list-checks", "route": "/jobs", "pin_on_install": true}
+                ],
+                "explorer_sections": [
+                    {"id": "queue", "title": "Run queue", "icon": "layers", "order": 3,
+                     "data_route": "/pkg/com.ikenga.agentops/sections/queue"}
+                ],
+                "companion_panels": [
+                    {"id": "job-status", "title": "Job status", "route": "/", "session_scoped": true}
+                ],
+                "context_actions": [
+                    {"id": "retry-job", "label": "Retry job",
+                     "when": {"kind": "ngwa-item", "kinds": ["automation-run"]},
+                     "run": {"kind": "dispatch", "prompt": "Retry {{ngwa.item}}", "target": "agentops"}},
+                    {"id": "open-log", "label": "Open log",
+                     "when": {"kind": "file", "glob": "**/*.log"},
+                     "run": {"kind": "view", "route": "/jobs"}}
+                ],
+                "widgets": [
+                    {"id": "open-jobs", "title": "Open jobs", "route": "/badge", "span": "wide"}
+                ]
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse full v5 manifest");
+        let ui = m.ui.expect("ui block");
+
+        assert_eq!(ui.views.len(), 1);
+        let v = &ui.views[0];
+        assert_eq!(v.id, "jobs");
+        assert_eq!(v.route, "/jobs");
+        assert!(v.pin_on_install);
+
+        assert_eq!(ui.explorer_sections.len(), 1);
+        assert_eq!(ui.explorer_sections[0].order, Some(3));
+        assert_eq!(
+            ui.explorer_sections[0].data_route,
+            "/pkg/com.ikenga.agentops/sections/queue"
+        );
+
+        assert_eq!(ui.companion_panels.len(), 1);
+        assert!(ui.companion_panels[0].session_scoped);
+
+        assert_eq!(ui.context_actions.len(), 2);
+        match &ui.context_actions[0].when {
+            ContextSelector::NgwaItem { kinds } => {
+                assert_eq!(kinds.as_deref(), Some(&["automation-run".to_string()][..]));
+            }
+            other => panic!("expected ngwa-item selector, got {other:?}"),
+        }
+        match &ui.context_actions[0].run {
+            ContextActionRun::Dispatch { prompt, target } => {
+                assert!(prompt.contains("{{ngwa.item}}"));
+                assert_eq!(target.as_deref(), Some("agentops"));
+            }
+            other => panic!("expected dispatch run, got {other:?}"),
+        }
+        match &ui.context_actions[1].when {
+            ContextSelector::File { glob } => assert_eq!(glob.as_deref(), Some("**/*.log")),
+            other => panic!("expected file selector, got {other:?}"),
+        }
+        match &ui.context_actions[1].run {
+            ContextActionRun::View { route } => assert_eq!(route, "/jobs"),
+            other => panic!("expected view run, got {other:?}"),
+        }
+
+        assert_eq!(ui.widgets.len(), 1);
+        assert_eq!(ui.widgets[0].span, WidgetSpan::Wide);
+    }
+
+    /// All v5 blocks are optional-with-default — an api=1 manifest with a
+    /// legacy `ui` block parses unchanged (§2: "api=1..4 manifests parse
+    /// unchanged").
+    #[test]
+    fn v5_blocks_default_empty_on_api1_manifest() {
+        let json = r#"{
+            "id": "com.ikenga.legacy",
+            "name": "Legacy", "version": "0.1.0", "ikenga_api": "1",
+            "ui": {
+                "routes": [{"path": "/", "kind": "iframe", "source": "dist/index.html"}]
+            }
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse api=1 manifest");
+        let ui = m.ui.expect("ui block");
+        assert!(ui.views.is_empty());
+        assert!(ui.explorer_sections.is_empty());
+        assert!(ui.companion_panels.is_empty());
+        assert!(ui.context_actions.is_empty());
+        assert!(ui.widgets.is_empty());
+    }
+
+    /// `.strict()` parity: unknown keys inside a view entry are rejected.
+    #[test]
+    fn v5_view_entry_rejects_unknown_field() {
+        let json = r#"{
+            "id": "com.ikenga.x",
+            "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"views": [{"id": "v", "title": "V", "route": "/", "bogus": true}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown ViewEntry field must be rejected");
+    }
+
+    /// `.strict()` parity on every other v5 entry block.
+    #[test]
+    fn v5_entry_blocks_reject_unknown_fields() {
+        for (field, entry) in [
+            (
+                "explorer_sections",
+                r#"{"id":"s","title":"S","data_route":"/pkg/com.ikenga.x/d","bogus":1}"#,
+            ),
+            (
+                "companion_panels",
+                r#"{"id":"p","title":"P","route":"/","bogus":1}"#,
+            ),
+            (
+                "context_actions",
+                r#"{"id":"a","label":"A","when":{"kind":"session"},"run":{"kind":"view","route":"/"},"bogus":1}"#,
+            ),
+            ("widgets", r#"{"id":"w","title":"W","route":"/","bogus":1}"#),
+        ] {
+            let json = format!(
+                r#"{{"id":"com.ikenga.x","name":"X","version":"0.1.0","ikenga_api":"5",
+                    "ui":{{"{field}":[{entry}]}}}}"#
+            );
+            let result: Result<Manifest, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_err(),
+                "unknown field in `ui.{field}` must be rejected"
+            );
+        }
+    }
+
+    /// Tagged-union members are NOT `.strict()` upstream — extra keys inside a
+    /// selector/run object are stripped (Zod parity), unknown `kind` fails.
+    #[test]
+    fn v5_context_selector_strips_member_fields_rejects_unknown_kind() {
+        let ok = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "file", "glob": "*.rs", "future": true},
+                "run": {"kind": "view", "route": "/", "future": 1}}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(ok).expect("member extra keys strip");
+        match &m.ui.unwrap().context_actions[0].when {
+            ContextSelector::File { glob } => assert_eq!(glob.as_deref(), Some("*.rs")),
+            other => panic!("expected file selector, got {other:?}"),
+        }
+
+        let bad = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "bogus"},
+                "run": {"kind": "view", "route": "/"}}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(bad);
+        assert!(result.is_err(), "unknown selector kind must be rejected");
+    }
+
+    /// `span` defaults to `medium`; an unknown span value fails (z.enum parity).
+    #[test]
+    fn v5_widget_span_defaults_medium_and_rejects_unknown() {
+        let ok = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"widgets": [{"id": "w", "title": "W", "route": "/"}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(ok).expect("parse");
+        assert_eq!(m.ui.unwrap().widgets[0].span, WidgetSpan::Medium);
+
+        let bad = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"widgets": [{"id": "w", "title": "W", "route": "/", "span": "huge"}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(bad);
+        assert!(result.is_err(), "unknown span must be rejected");
+    }
+
+    /// `order` accepts ints and integral floats (`z.number().int()` parity),
+    /// rejects fractions and strings.
+    #[test]
+    fn v5_explorer_section_order_accepts_ints_and_integral_floats() {
+        for (order_json, want) in [
+            ("3", Some(3i64)),
+            ("3.0", Some(3)),
+            ("\"3\"", None),
+            ("3.5", None),
+        ] {
+            let json = format!(
+                r#"{{"id":"com.ikenga.x","name":"X","version":"0.1.0","ikenga_api":"5",
+                    "ui":{{"explorer_sections":[{{"id":"s","title":"S",
+                        "data_route":"/pkg/com.ikenga.x/s","order":{order_json}}}]}}}}"#
+            );
+            let result: Result<Manifest, _> = serde_json::from_str(&json);
+            match want {
+                Some(w) => assert_eq!(
+                    result
+                        .unwrap_or_else(|e| panic!("order {order_json} must parse: {e}"))
+                        .ui
+                        .unwrap()
+                        .explorer_sections[0]
+                        .order,
+                    Some(w),
+                    "order {order_json}"
+                ),
+                None => assert!(
+                    result.is_err(),
+                    "order {order_json} must be rejected (non-integer)"
+                ),
+            }
+        }
+    }
+
+    /// §8 Q1 hard-retire: `ui.side_pane_viewers` fails validation with a
+    /// canonical error — even when declared empty (presence is the offense).
+    #[test]
+    fn v5_side_pane_viewers_rejected_with_canonical_error() {
+        for decl in [
+            r#""side_pane_viewers": [{"id": "v", "label": "V", "route": "/"}]"#,
+            r#""side_pane_viewers": []"#,
+            r#""side_pane_viewers": null"#,
+        ] {
+            let json = format!(
+                r#"{{"id":"com.ikenga.x","name":"X","version":"0.1.0","ikenga_api":"5",
+                    "ui":{{{decl}}}}}"#
+            );
+            let result: Result<Manifest, _> = serde_json::from_str(&json);
+            let err = result.expect_err("side_pane_viewers must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("side_pane_viewers"),
+                "canonical error names the retired field: {msg}"
+            );
+            assert!(
+                msg.contains("ui.views") && msg.contains("ui.companion_panels"),
+                "canonical error names the replacements: {msg}"
+            );
+        }
+    }
+
+    /// §4 alias — `nav[i]` → `views[i]` with `pin_on_install: i == 0`, and the
+    /// pane-route form `/pkg/<id><path>` (or `pkg://<id><path>`) normalizes to
+    /// the namespace path `ui.routes[]` declares.
+    #[test]
+    fn nav_alias_maps_entries_and_normalizes_routes() {
+        let json = r#"{
+            "id": "com.ikenga.git",
+            "name": "Git", "version": "0.1.0", "ikenga_api": "1",
+            "ui": {
+                "routes": [
+                    {"path": "/", "kind": "iframe", "source": "dist/index.html"},
+                    {"path": "/history", "kind": "iframe", "source": "dist/index.html"}
+                ],
+                "nav": [
+                    {"id": "git.changes", "label": "Changes", "icon": "git-branch",
+                     "section": "source", "route": "/pkg/com.ikenga.git/"},
+                    {"id": "git.history", "label": "History", "icon": "history",
+                     "section": "source", "route": "pkg://com.ikenga.git/history"}
+                ]
+            }
+        }"#;
+        let mut m: Manifest = serde_json::from_str(json).expect("parse nav manifest");
+        let outcome = m.apply_nav_views_alias();
+        assert_eq!(outcome, Some(NavAliasOutcome::Applied));
+
+        let ui = m.ui.as_ref().unwrap();
+        assert_eq!(ui.views.len(), 2);
+        // nav[0] was the rail claim → pin_on_install.
+        assert_eq!(ui.views[0].id, "git.changes");
+        assert_eq!(ui.views[0].title, "Changes");
+        assert_eq!(ui.views[0].icon.as_deref(), Some("git-branch"));
+        assert_eq!(ui.views[0].route, "/");
+        assert!(ui.views[0].pin_on_install);
+        assert_eq!(ui.views[1].route, "/history");
+        assert!(!ui.views[1].pin_on_install);
+        // `nav` keeps its field + values — the field isn't cleared by the alias.
+        assert_eq!(ui.nav.len(), 2);
+    }
+
+    /// §4: declaring both means `views` wins, `nav` is ignored, outcome is
+    /// `IgnoredBothDeclared` (the load-site warn names the pkg; parse never
+    /// fails on the alias).
+    #[test]
+    fn nav_alias_ignored_when_views_declared() {
+        let json = r#"{
+            "id": "com.ikenga.git",
+            "name": "Git", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {
+                "routes": [{"path": "/", "kind": "iframe", "source": "dist/index.html"}],
+                "views": [{"id": "v", "title": "V", "route": "/"}],
+                "nav": [{"id": "n", "label": "N", "route": "/pkg/com.ikenga.git/"}]
+            }
+        }"#;
+        let mut m: Manifest = serde_json::from_str(json).expect("parse");
+        let outcome = m.apply_nav_views_alias();
+        assert_eq!(outcome, Some(NavAliasOutcome::IgnoredBothDeclared));
+        let ui = m.ui.as_ref().unwrap();
+        assert_eq!(ui.views.len(), 1);
+        assert_eq!(ui.views[0].id, "v");
+        assert_eq!(ui.nav.len(), 1);
+    }
+
+    /// No `nav` → no alias, no warning outcome.
+    #[test]
+    fn nav_alias_noop_without_nav() {
+        let mut m = minimal();
+        assert_eq!(m.apply_nav_views_alias(), None);
+        m.ui = Some(UiBlock::default());
+        assert_eq!(m.apply_nav_views_alias(), None);
+    }
+
+    /// Route normalization edge cases.
+    #[test]
+    fn nav_route_normalization_edge_cases() {
+        let id = "com.ikenga.git";
+        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git"), "/");
+        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git/"), "/");
+        assert_eq!(normalize_nav_route(id, "/pkg/com.ikenga.git/x"), "/x");
+        assert_eq!(normalize_nav_route(id, "pkg://com.ikenga.git"), "/");
+        assert_eq!(normalize_nav_route(id, "pkg://com.ikenga.git/x"), "/x");
+        // A nav entry pointing at a *different* pkg's pane route is NOT
+        // normalized — it passes through verbatim and fails the §2b routes[]
+        // check at register() (loud, by design).
+        assert_eq!(
+            normalize_nav_route(id, "/pkg/com.ikenga.other/x"),
+            "/pkg/com.ikenga.other/x"
+        );
+        // Shell routes pass through verbatim.
+        assert_eq!(normalize_nav_route(id, "/settings"), "/settings");
+        // Pathological: prefix-match without a path boundary stays verbatim.
+        assert_eq!(
+            normalize_nav_route(id, "/pkg/com.ikenga.gitsuffix/x"),
+            "/pkg/com.ikenga.gitsuffix/x"
+        );
+    }
+
+    /// The alias runs inside `Package::load` — the single warn site — so a
+    /// nav-only manifest registers (parse + alias) and logs exactly one
+    /// warning per parse. Verified with a capturing `log` logger.
+    #[test]
+    fn nav_only_manifest_loads_with_exactly_one_alias_warning() {
+        use std::io::Write;
+        use std::sync::{Mutex, Once};
+
+        // One-process-wide capture logger; installed once for the whole test
+        // binary. Records are filtered by the unique marker id below, so
+        // parallel tests' logs can't pollute the assertion.
+        struct Capture;
+        static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static INIT: Once = Once::new();
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record) {
+                if let Ok(mut g) = RECORDS.lock() {
+                    g.push(format!("{}:{}", record.level(), record.args()));
+                }
+            }
+            fn flush(&self) {}
+        }
+        INIT.call_once(|| {
+            log::set_logger(&Capture).ok();
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+
+        let marker = "com.ikenga.navalias-once";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_json = format!(
+            r#"{{"id": "{marker}", "name": "NavAlias", "version": "0.1.0",
+                "ikenga_api": "1",
+                "ui": {{
+                    "routes": [{{"path": "/", "kind": "iframe", "source": "dist/index.html"}}],
+                    "nav": [{{"id": "home", "label": "Home", "route": "/pkg/{marker}/"}}]
+                }}}}"#
+        );
+        let mut f =
+            std::fs::File::create(dir.path().join("manifest.json")).expect("write manifest");
+        f.write_all(manifest_json.as_bytes()).unwrap();
+        drop(f);
+
+        let pkg = Package::load(dir.path()).expect("nav-only manifest must load");
+        let ui = pkg.manifest.ui.as_ref().unwrap();
+        assert_eq!(ui.views.len(), 1);
+        assert_eq!(ui.views[0].id, "home");
+        assert_eq!(ui.views[0].title, "Home");
+        assert_eq!(ui.views[0].route, "/");
+        assert!(ui.views[0].pin_on_install);
+
+        let warns: Vec<String> = RECORDS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("WARN:") && r.contains(marker))
+            .cloned()
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "exactly one alias warning per parse; got {warns:?}"
+        );
+        assert!(warns[0].contains("ui.nav"));
+    }
+
+    /// api window: `[1, 5]` — v5 manifests are compatible and api=1..4 keep
+    /// loading; api=6 is above the window and rejected.
+    #[test]
+    fn api_v5_compatibility_window() {
+        for (api, want) in [
+            ("0", false),
+            ("1", true),
+            ("4", true),
+            ("5", true),
+            ("6", false),
+        ] {
+            let mut m = minimal();
+            m.ikenga_api = api.into();
+            let pkg = Package {
+                manifest: m,
+                install_path: PathBuf::from("/tmp/_unused"),
+            };
+            assert_eq!(pkg.is_compatible(), want, "ikenga_api={api}");
+        }
+    }
+
+    // ── workflows[] (WP-31, DEC-41, G-MANIFEST-V5 §10) ───────────────────────
+
+    #[test]
+    fn workflows_parses_and_validates_cleanly() {
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"},
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/test/unit", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build",
+                            "inputs": {"optimize": true},
+                            "produces": ["dist/bundle.js"]
+                        },
+                        {
+                            "id": "test",
+                            "title": "Run Tests",
+                            "handler": "/iyke/pkg/com.ikenga.studio/test/unit",
+                            "depends_on": ["build"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with workflows");
+        assert_eq!(m.workflows.len(), 1);
+        let wf = &m.workflows[0];
+        assert_eq!(wf.id, "build-pipeline");
+        assert_eq!(wf.steps.len(), 2);
+        assert_eq!(wf.steps[0].id, "build");
+        assert_eq!(wf.steps[0].handler, "/iyke/pkg/com.ikenga.studio/build");
+        assert_eq!(wf.steps[1].depends_on, vec!["build".to_string()]);
+        assert!(Package::validate(&m).is_ok());
+    }
+
+    #[test]
+    fn workflows_rejects_missing_post_route() {
+        // Manifest declares workflow handler pointing to a route with method GET, not POST
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "GET", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject route without method: POST");
+        assert!(
+            err.to_string().contains("must appear in `iyke.routes[]` with method: \"POST\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_foreign_pkg_id() {
+        // Manifest com.ikenga.studio has handler referencing com.ikenga.other
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.other/build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject foreign pkg_id");
+        assert!(
+            err.to_string().contains("must start with `/iyke/pkg/com.ikenga.studio/`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_invalid_cmd_segments() {
+        // Uppercase or invalid characters in cmd segment
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/Build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/Build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject uppercase cmd segment");
+        assert!(
+            err.to_string().contains("segments must be lowercase-dash"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_unknown_or_self_depends_on() {
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build",
+                            "depends_on": ["nonexistent"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject nonexistent depends_on");
+        assert!(
+            err.to_string().contains("depends on unknown step `nonexistent`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Headless sweep over the real pkg fleet (`ikenga-pkgs/packages/*/*`):
+    /// every shipped manifest must keep parsing under api=5 (the
+    /// `[MIN_SUPPORTED, CURRENT]` window), and every pkg must register
+    /// cleanly against all five v5 contribution registries plus the
+    /// normalized-views activity-bar registry — including the §2b
+    /// `views[].route ∈ ui.routes[].path` check that aliased `nav` entries
+    /// are subjected to.
+    ///
+    /// Skips (not fails) when the sibling `ikenga-pkgs` checkout is absent —
+    /// e.g. a crates.io-style standalone build of this crate.
+    #[test]
+    fn ikenga_pkgs_fleet_parses_and_registers() {
+        use crate::pkg::registries::{
+            ActivityBarRegistry, CompanionPanelsRegistry, ContextActionsRegistry,
+            ExplorerSectionsRegistry, ViewsRegistry, WidgetsRegistry,
+        };
+        use crate::pkg::registry::Registry;
+
+        // `IKENGA_PKGS_DIR` overrides the sibling-checkout convention (CI
+        // checks ikenga-pkgs out inside the workspace and points here).
+        let pkgs_root = std::env::var_os("IKENGA_PKGS_DIR")
+            .map(|d| PathBuf::from(d).join("packages"))
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ikenga-pkgs/packages")
+            });
+        let pkgs_root = pkgs_root.canonicalize().unwrap_or(pkgs_root);
+        if !pkgs_root.is_dir() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "ikenga_pkgs_fleet: {} not found under CI — check out ikenga-pkgs and set IKENGA_PKGS_DIR",
+                pkgs_root.display()
+            );
+            eprintln!(
+                "ikenga_pkgs_fleet: skipping — {} not found (sibling checkout absent)",
+                pkgs_root.display()
+            );
+            return;
+        }
+
+        // Collect `<type>/<pkg>` dirs that carry a manifest.json.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for ty in std::fs::read_dir(&pkgs_root).expect("read packages/") {
+            let ty = ty.expect("dir entry").path();
+            if !ty.is_dir() {
+                continue;
+            }
+            for pkg_dir in std::fs::read_dir(&ty).expect("read <type>/") {
+                let pkg_dir = pkg_dir.expect("dir entry").path();
+                if pkg_dir.join("manifest.json").is_file() {
+                    dirs.push(pkg_dir);
+                }
+            }
+        }
+        dirs.sort();
+        assert!(
+            dirs.len() >= 50,
+            "expected the ~55-pkg fleet under {}, found {}",
+            pkgs_root.display(),
+            dirs.len()
+        );
+
+        // The WP-28 registration surface. (ui_routes/sidecars/etc. touch the
+        // filesystem or process state and are covered by kernel tests; these
+        // six are pure manifest→registry projections.)
+        let registries: Vec<Box<dyn Registry>> = vec![
+            Box::new(ViewsRegistry::new()),
+            Box::new(ExplorerSectionsRegistry::new()),
+            Box::new(CompanionPanelsRegistry::new()),
+            Box::new(ContextActionsRegistry::new()),
+            Box::new(WidgetsRegistry::new()),
+            Box::new(ActivityBarRegistry::new()),
+        ];
+
+        // Pkgs that fail `Package::load` for PRE-EXISTING reasons unrelated
+        // to manifest v5 — fleet drift in ikenga-pkgs, tracked here so the
+        // test stays a strict regression net for everything else. Each entry
+        // must *actually* fail (see `unexpected_ok` below), so fixing the pkg
+        // in ikenga-pkgs forces this list to shrink rather than silently
+        // passing.
+        // - playwright-browser: sidecar name `pa-playwright-browser` predates
+        //   the `pa-<dashed-pkg-id>-` prefix rule.
+        const KNOWN_FLEET_DRIFT: &[&str] = &["com.ikenga.sidecar-playwright-browser"];
+
+        let mut nav_aliased = 0usize;
+        let mut native_views = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        let mut unexpected_ok: Vec<String> = Vec::new();
+        for dir in &dirs {
+            match Package::load(dir) {
+                Ok(pkg) => {
+                    if KNOWN_FLEET_DRIFT.contains(&pkg.manifest.id.as_str()) {
+                        unexpected_ok.push(pkg.manifest.id.clone());
+                        continue;
+                    }
+                    if !pkg.is_compatible() {
+                        failures.push(format!(
+                            "{}: ikenga_api {} outside [1, {IKENGA_API_VERSION}]",
+                            pkg.manifest.id, pkg.manifest.ikenga_api
+                        ));
+                        continue;
+                    }
+                    if let Some(ui) = &pkg.manifest.ui {
+                        if !ui.nav.is_empty() {
+                            nav_aliased += 1;
+                            if ui.views.is_empty() {
+                                failures.push(format!(
+                                    "{}: nav present but alias produced no views",
+                                    pkg.manifest.id
+                                ));
+                            }
+                        }
+                        if ui.nav.is_empty() && !ui.views.is_empty() {
+                            native_views += 1;
+                        }
+                    }
+                    for reg in &registries {
+                        if let Err(e) = reg.register(&pkg) {
+                            failures.push(format!("{}: {}: {e}", pkg.manifest.id, reg.name()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Load failures are only tolerated for the known-drift
+                    // list; anything else is a WP-28 parse regression. The id
+                    // comes from the raw JSON since `Package::load` failed.
+                    let raw_id = std::fs::read_to_string(dir.join("manifest.json"))
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v.get("id")?.as_str().map(str::to_string));
+                    let is_known = raw_id
+                        .as_deref()
+                        .map(|id| KNOWN_FLEET_DRIFT.contains(&id))
+                        .unwrap_or(false);
+                    if !is_known {
+                        failures.push(format!("{}: load: {e}", dir.display()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unexpected_ok.is_empty(),
+            "KNOWN_FLEET_DRIFT entries now load — remove them from the list: {unexpected_ok:?}"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} fleet failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        // Fleet sanity: ~16 pkgs contribute legacy nav or native views today;
+        // all must land in the views registry (via alias or native views).
+        assert!(
+            nav_aliased + native_views >= 10,
+            "expected ≥10 views-contributing pkgs, saw nav_aliased={nav_aliased}, native_views={native_views} (fleet drifted?)"
+        );
+        eprintln!(
+            "ikenga_pkgs_fleet: {} manifests parsed, {} nav-aliased, {} native-views",
+            dirs.len(),
+            nav_aliased,
+            native_views
+        );
     }
 }

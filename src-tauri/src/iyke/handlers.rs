@@ -157,7 +157,9 @@ pub struct ShellInfo {
 ///
 /// - `1` (implicit — the field was absent): everything before WP-21.
 /// - `2`: `shell.active_project`, `shell.bridge_api`, `GET /iyke/keys`.
-pub const BRIDGE_API: u32 = 2;
+/// - `3`: `GET /iyke/ngwa/snapshot`, `GET /iyke/explorer/sections` (WP-28
+///   follow-up — the WP-21b client surface).
+pub const BRIDGE_API: u32 = 3;
 
 /// WP-21: mirror of the FE `ActiveProject` (`src/lib/shell/shell-store.ts`).
 /// Field names are the FE's own snake_case, so the push needs no mapping.
@@ -188,15 +190,31 @@ pub struct KeymapEntryInfo {
     pub platform_only: Option<String>,
 }
 
+/// WP-28: one `GET /iyke/explorer/sections` row — mirrors the FE store's
+/// `ExplorerSectionState` (`src/lib/shell/shell-store.ts`):
+/// `{ id, source, order, collapsed }`. `id` is a builtin section id or the
+/// pkg-qualified `${pkg_id}:${section_id}` (G-STATE §1); `source` is
+/// `"shell"` or the contributing pkg id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorerSectionInfo {
+    pub id: String,
+    pub source: String,
+    /// Integer, ascending; built-ins occupy 0..n by default.
+    pub order: i64,
+    pub collapsed: bool,
+}
+
 /// WP-21: FE-pushed frame state that `IykeState`'s `ShellSnapshot` doesn't
-/// carry — the active project and the keymap registry. Held here rather than
-/// on `IykeState` so the push is one new command, not a widening of
-/// `iyke_set_shell`. Partial-update semantics like `set_shell`: a `None`
-/// field leaves the stored value untouched.
+/// carry — the active project, the keymap registry, and (WP-28) the
+/// Explorer section layout. Held here rather than on `IykeState` so the
+/// push is one new command, not a widening of `iyke_set_shell`.
+/// Partial-update semantics like `set_shell`: a `None` field leaves the
+/// stored value untouched.
 #[derive(Debug, Default)]
 pub struct FrameMirror {
     active_project: tokio::sync::RwLock<Option<ActiveProjectInfo>>,
     keymap: tokio::sync::RwLock<Option<Vec<KeymapEntryInfo>>>,
+    explorer_sections: tokio::sync::RwLock<Option<Vec<ExplorerSectionInfo>>>,
 }
 
 impl FrameMirror {
@@ -204,12 +222,16 @@ impl FrameMirror {
         &self,
         active_project: Option<ActiveProjectInfo>,
         keymap: Option<Vec<KeymapEntryInfo>>,
+        explorer_sections: Option<Vec<ExplorerSectionInfo>>,
     ) {
         if active_project.is_some() {
             *self.active_project.write().await = active_project;
         }
         if keymap.is_some() {
             *self.keymap.write().await = keymap;
+        }
+        if explorer_sections.is_some() {
+            *self.explorer_sections.write().await = explorer_sections;
         }
     }
 
@@ -219,6 +241,10 @@ impl FrameMirror {
 
     pub async fn keymap(&self) -> Option<Vec<KeymapEntryInfo>> {
         self.keymap.read().await.clone()
+    }
+
+    pub async fn explorer_sections(&self) -> Option<Vec<ExplorerSectionInfo>> {
+        self.explorer_sections.read().await.clone()
     }
 }
 
@@ -231,13 +257,17 @@ pub fn frame_mirror() -> &'static FrameMirror {
 
 /// WP-21: FE → Rust push of the frame state `iyke_set_shell` doesn't carry.
 /// `use-iyke-shell-sync.ts` sends `activeProject` whenever the store's
-/// derived `activeProject` changes, and `keymap` once at boot.
+/// derived `activeProject` changes, `keymap` once at boot, and (WP-28)
+/// `explorerSections` whenever the Explorer layout changes.
 #[tauri::command]
 pub async fn iyke_set_frame(
     active_project: Option<ActiveProjectInfo>,
     keymap: Option<Vec<KeymapEntryInfo>>,
+    explorer_sections: Option<Vec<ExplorerSectionInfo>>,
 ) -> Result<(), String> {
-    frame_mirror().set(active_project, keymap).await;
+    frame_mirror()
+        .set(active_project, keymap, explorer_sections)
+        .await;
     Ok(())
 }
 
@@ -269,6 +299,71 @@ async fn keys_response(mirror: &FrameMirror) -> Result<Json<KeysResponse>, (Stat
 /// first push.
 pub async fn get_keys() -> Result<Json<KeysResponse>, (StatusCode, String)> {
     keys_response(frame_mirror()).await
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplorerSectionsResponse {
+    pub schema_version: u32,
+    pub count: usize,
+    /// The FE store's `explorerSections[]` verbatim —
+    /// `{ id, source, order, collapsed }` (G-STATE §1).
+    pub sections: Vec<ExplorerSectionInfo>,
+}
+
+/// `GET /iyke/explorer/sections` body, split out so tests can drive a fresh
+/// mirror (the process-wide `frame_mirror()` can't be un-set between tests).
+async fn explorer_sections_response(
+    mirror: &FrameMirror,
+) -> Result<Json<ExplorerSectionsResponse>, (StatusCode, String)> {
+    match mirror.explorer_sections().await {
+        Some(sections) => Ok(Json(ExplorerSectionsResponse {
+            schema_version: 1,
+            count: sections.len(),
+            sections,
+        })),
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "explorer sections not pushed yet: the shell frontend publishes its \
+             explorerSections at workspace mount (use-iyke-shell-sync); retry \
+             once the workspace has mounted"
+                .to_string(),
+        )),
+    }
+}
+
+/// `GET /iyke/explorer/sections` — the current Explorer section layout the FE
+/// store holds, pushed through `iyke_set_frame`. 503 until the first push.
+/// (WP-28 — the WP-21b client reads this to reason about section state.)
+pub async fn get_explorer_sections(
+) -> Result<Json<ExplorerSectionsResponse>, (StatusCode, String)> {
+    explorer_sections_response(frame_mirror()).await
+}
+
+/// `GET /iyke/ngwa/snapshot` — the identical `NgwaSnapshot` the
+/// `ngwa_snapshot` Tauri command returns: both call
+/// `commands::ngwa::ngwa_snapshot_inner`, so the route can never drift from
+/// the command. A cold first call blocks on the `~/.claude/projects`
+/// transcript scan — WP-21b clients budget 130s for it.
+pub async fn get_ngwa_snapshot(
+    Extension(app): Extension<AppHandle>,
+    Extension(db): Extension<Arc<PaDb>>,
+) -> Result<Json<crate::commands::ngwa::NgwaSnapshot>, (StatusCode, String)> {
+    let kernel = app.state::<crate::commands::pkg::KernelState>();
+    let app_data_dir = app.path().app_data_dir().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("resolve app_data_dir: {e}"),
+        )
+    })?;
+    crate::commands::ngwa::ngwa_snapshot_inner(
+        kernel.0.status(),
+        &db,
+        &app_data_dir,
+        crate::transcript::usage::claude_projects_dir(),
+    )
+    .await
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 pub async fn get_state(
@@ -2126,7 +2221,8 @@ mod tests {
             bridge_api: super::BRIDGE_API,
         };
         let v = serde_json::to_value(&info).unwrap();
-        assert_eq!(v["bridge_api"], serde_json::json!(2));
+        assert_eq!(v["bridge_api"], serde_json::json!(super::BRIDGE_API));
+        assert_eq!(super::BRIDGE_API, 3, "bump the FE `BRIDGE_API` mirror when this changes");
         assert_eq!(
             v["active_project"],
             serde_json::json!({
@@ -2151,7 +2247,7 @@ mod tests {
         };
         let v = serde_json::to_value(&empty).unwrap();
         assert!(v.get("active_project").is_some() && v["active_project"].is_null());
-        assert_eq!(v["bridge_api"], serde_json::json!(2));
+        assert_eq!(v["bridge_api"], serde_json::json!(super::BRIDGE_API));
     }
 
     #[test]
@@ -2185,18 +2281,49 @@ mod tests {
         assert!(p.extra_roots.is_empty());
     }
 
+    fn sample_explorer_sections() -> Vec<super::ExplorerSectionInfo> {
+        vec![
+            super::ExplorerSectionInfo {
+                id: "files".into(),
+                source: "shell".into(),
+                order: 0,
+                collapsed: false,
+            },
+            super::ExplorerSectionInfo {
+                id: "com.ikenga.demo:queue".into(),
+                source: "com.ikenga.demo".into(),
+                order: 9,
+                collapsed: true,
+            },
+        ]
+    }
+
     #[tokio::test]
     async fn frame_mirror_partial_updates_keep_untouched_fields() {
         let m = super::FrameMirror::default();
         assert_eq!(m.active_project().await, None);
-        m.set(Some(sample_project()), None).await;
-        m.set(None, Some(sample_keys())).await;
+        m.set(Some(sample_project()), None, None).await;
+        m.set(None, Some(sample_keys()), None).await;
         assert_eq!(m.active_project().await, Some(sample_project()));
         assert_eq!(m.keymap().await.unwrap().len(), 2);
         // A None push leaves both in place.
-        m.set(None, None).await;
+        m.set(None, None, None).await;
         assert_eq!(m.active_project().await, Some(sample_project()));
         assert_eq!(m.keymap().await.unwrap().len(), 2);
+        // Same partial-update semantics for explorer_sections.
+        assert_eq!(m.explorer_sections().await, None);
+        m.set(None, None, Some(sample_explorer_sections())).await;
+        assert_eq!(
+            m.explorer_sections().await.unwrap().len(),
+            2,
+            "explorer_sections stores the pushed layout"
+        );
+        m.set(Some(sample_project()), None, None).await;
+        assert_eq!(
+            m.explorer_sections().await.unwrap().len(),
+            2,
+            "a None explorer_sections push leaves the stored layout untouched"
+        );
     }
 
     #[tokio::test]
@@ -2210,7 +2337,7 @@ mod tests {
             err.1
         );
 
-        m.set(None, Some(sample_keys())).await;
+        m.set(None, Some(sample_keys()), None).await;
         let axum::Json(body) = super::keys_response(&m).await.unwrap();
         assert_eq!(body.schema_version, 1);
         assert_eq!(body.count, 2);
@@ -2220,6 +2347,75 @@ mod tests {
         assert_eq!(v["entries"][0]["key_label"], serde_json::json!("Ctrl+K"));
         assert!(v["entries"][0].get("platform_only").is_none());
         assert_eq!(v["entries"][1]["platform_only"], serde_json::json!("mac"));
+    }
+
+    /// WP-28: `GET /iyke/explorer/sections` serves the FE store's
+    /// `explorerSections[]` verbatim (`{id, source, order, collapsed}` —
+    /// G-STATE §1), 503 before the first `iyke_set_frame` push.
+    #[tokio::test]
+    async fn explorer_sections_503_before_push_and_store_shape_after() {
+        let m = super::FrameMirror::default();
+        let err = super::explorer_sections_response(&m).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.1.contains("explorer sections not pushed yet"),
+            "clear message: {}",
+            err.1
+        );
+
+        m.set(None, None, Some(sample_explorer_sections())).await;
+        let axum::Json(body) = super::explorer_sections_response(&m).await.unwrap();
+        assert_eq!(body.schema_version, 1);
+        assert_eq!(body.count, 2);
+        assert_eq!(body.sections, sample_explorer_sections());
+
+        // Wire shape = the FE store's field names, verbatim (shell-store.ts
+        // `ExplorerSectionState`).
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v["sections"][0],
+            serde_json::json!({
+                "id": "files",
+                "source": "shell",
+                "order": 0,
+                "collapsed": false,
+            })
+        );
+        assert_eq!(
+            v["sections"][1],
+            serde_json::json!({
+                "id": "com.ikenga.demo:queue",
+                "source": "com.ikenga.demo",
+                "order": 9,
+                "collapsed": true,
+            })
+        );
+
+        // The route's axum shape: the handler is extension-free (reads the
+        // process mirror), so a bare Router round-trip exercises it end to
+        // end — same function `serve()` mounts.
+        let app = axum::Router::new().route(
+            "/iyke/explorer/sections",
+            axum::routing::get(super::get_explorer_sections),
+        );
+        use tower::ServiceExt;
+        let res = app
+            .oneshot(
+                axum::http::Request::get("/iyke/explorer/sections")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The process-wide mirror may or may not have been pushed by another
+        // test; the contract is "200 + payload once pushed, 503 before" — so
+        // only the status enum is asserted here.
+        assert!(
+            res.status() == axum::http::StatusCode::OK
+                || res.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "route registered + returns the mirror's verdict, got {}",
+            res.status()
+        );
     }
 
     #[test]

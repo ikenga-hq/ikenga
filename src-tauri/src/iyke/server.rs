@@ -36,8 +36,9 @@ use super::claude::{
 };
 use super::comments::{get_pin_read, post_pin_acknowledge, post_pin_resolve};
 use super::handlers::{
-    get_chi_list, get_chi_status, get_dom, get_iframe_state, get_keys, get_logs, get_network,
-    get_pkg_list, get_query_cache, get_state, get_terminal_read, post_chi_cancel, post_chi_resume,
+    get_chi_list, get_chi_status, get_dom, get_explorer_sections, get_iframe_state, get_keys,
+    get_logs, get_network, get_ngwa_snapshot, get_pkg_list, get_query_cache, get_state,
+    get_terminal_read, post_chi_cancel, post_chi_resume,
     post_chi_run, post_click, post_close, post_devtools, post_focus, post_go, post_iframe_message,
     post_key, post_mode, post_oba_install_local, post_open, post_pkg_badge_set,
     post_pkg_dev_register, post_pkg_dev_reload, post_pkg_dev_unregister, post_pkg_health_remove,
@@ -226,6 +227,14 @@ pub async fn serve(
         .route("/iyke/project/archive", post(post_project_archive))
         .route("/iyke/project/set-active", post(post_project_set_active))
         .route("/iyke/project/active", get(get_project_active))
+        // WP-28 (WP-21b needs-decision, accepted): the same NgwaSnapshot the
+        // `ngwa_snapshot` command serves — shared `ngwa_snapshot_inner` data
+        // path, cold corpus scan included (clients budget 130s).
+        .route("/iyke/ngwa/snapshot", get(get_ngwa_snapshot))
+        // WP-28: the FE store's `explorerSections[]` as pushed through
+        // `iyke_set_frame` (503 until the first push), same envelope and
+        // error shape as `/iyke/keys`.
+        .route("/iyke/explorer/sections", get(get_explorer_sections))
         // Chi-first agent surface (WP-03).
         .route("/iyke/chi/run", post(post_chi_run))
         .route("/iyke/chi/resume", post(post_chi_resume))

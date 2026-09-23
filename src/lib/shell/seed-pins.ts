@@ -2,11 +2,13 @@
 //
 // Package rail entries are *not* pins: `usePkgActivityBarEntries`
 // (`@/lib/pkg/use-activity-bar-entries`) derives them at runtime from each
-// installed manifest's `ui.nav[0]`, so a Zustand store migration can never
-// see them, and there is no `pin_on_install` (that lands with manifest v5).
-// Without this reconciler, a user with N rail icons today loses all N the
-// moment the pinned-rail UI ships, because none of them were ever written
-// to `activity_pins`.
+// installed manifest's `ui.views[0]` (manifest v5; during the alias window
+// the kernel maps legacy `ui.nav[0]` into `views[0]` — WP-28), so a Zustand
+// store migration can never see them. For pkgs installed *before* v5 there
+// was no `pin_on_install` either — this reconciler covers that cohort.
+// Without it, a user with N rail icons today loses all N the moment the
+// pinned-rail UI ships, because none of them were ever written to
+// `activity_pins`.
 //
 // This module runs once, after boot, from `src/boot/primary.tsx` — never
 // from the Zustand `persist` `migrate` (that must stay synchronous) and
@@ -54,9 +56,9 @@ export function computeEntriesToSeed(
 	return entries.filter((e) => !isAlreadyPinned(e, existingPins));
 }
 
-/** A pin's label is the pkg's own nav label ("Wikipedia"), not the rail
- *  entry's `label`, which the kernel sets to `ui.nav[0].section` when present
- *  ("apps") and would make every seeded pin read the same. */
+/** A pin's label is the pkg's own view label ("Wikipedia"), not the rail
+ *  entry's `label`, which the kernel sets to `views[0]`'s pkg display name.
+ *  (`entry.nav` is the mapped `ui.views` list — labels are view titles.) */
 export function pinLabelFor(entry: PkgActivityBarEntry): string {
 	return entry.nav?.[0]?.label?.trim() || entry.pkg_name?.trim() || entry.label;
 }

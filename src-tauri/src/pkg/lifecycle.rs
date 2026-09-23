@@ -1578,6 +1578,7 @@ mod tests {
             screenshots: vec![],
             requires: vec![],
             signature: None,
+            workflows: vec![],
         };
         m.mcp.push(McpServer {
             name: "t".into(),

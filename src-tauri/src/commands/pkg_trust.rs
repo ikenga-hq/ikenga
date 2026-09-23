@@ -18,6 +18,7 @@ use tauri::State;
 use crate::commands::db::PaDb;
 use crate::commands::pkg::KernelState;
 use crate::pkg::cap_snapshot;
+use crate::pkg::kernel::InstalledSummary;
 use crate::pkg::manifest::Package;
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,7 +48,16 @@ pub async fn pkg_trust_list_pending(
 ) -> Result<Vec<TrustReview>, String> {
     let pool = db.ensure_pool().await?;
     let installed = kernel.0.list_installed();
+    pending_trust_reviews(&pool, &installed).await
+}
 
+/// The scan behind [`pkg_trust_list_pending`], factored so callers without
+/// Tauri `State` (the `GET /iyke/ngwa/snapshot` route via
+/// `commands::ngwa::ngwa_snapshot_inner`) run the identical logic.
+pub(crate) async fn pending_trust_reviews(
+    pool: &sqlx::SqlitePool,
+    installed: &[InstalledSummary],
+) -> Result<Vec<TrustReview>, String> {
     let mut out: Vec<TrustReview> = Vec::new();
     for s in installed {
         let pkg = match Package::load(Path::new(&s.install_path)) {

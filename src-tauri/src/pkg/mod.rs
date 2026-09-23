@@ -42,6 +42,8 @@ pub mod kernel;
 #[cfg(feature = "desktop")]
 pub mod lifecycle;
 pub mod manifest;
+#[cfg(test)]
+mod manifest_v5_parity;
 #[cfg(feature = "desktop")]
 pub mod mcp_runtime;
 #[cfg(feature = "desktop")]
