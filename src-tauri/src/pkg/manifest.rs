@@ -2468,11 +2468,11 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
-        // Fleet sanity: ~16 pkgs contribute legacy nav today; all must land
-        // in the views registry via the alias.
+        // Fleet sanity: ~16 pkgs contribute legacy nav or native views today;
+        // all must land in the views registry (via alias or native views).
         assert!(
-            nav_aliased >= 10,
-            "expected ≥10 nav-aliased pkgs, saw {nav_aliased} (fleet drifted?)"
+            nav_aliased + native_views >= 10,
+            "expected ≥10 views-contributing pkgs, saw nav_aliased={nav_aliased}, native_views={native_views} (fleet drifted?)"
         );
         eprintln!(
             "ikenga_pkgs_fleet: {} manifests parsed, {} nav-aliased, {} native-views",
