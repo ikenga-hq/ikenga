@@ -145,6 +145,7 @@ mod tests {
             screenshots: vec![],
             requires: vec![],
             signature: None,
+            workflows: vec![],
         };
         Package {
             manifest,

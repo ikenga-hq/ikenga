@@ -176,6 +176,10 @@ pub struct Manifest {
     /// `@ikenga/contract/manifest.ts`.
     #[serde(default)]
     pub signature: Option<String>,
+
+    /// Contributed workflow declarations (DEC-41, G-MANIFEST-V5 §10).
+    #[serde(default)]
+    pub workflows: Vec<WorkflowEntry>,
 }
 
 /// One forward-dependency edge (`requires[]` element). Names a standalone Ọba
@@ -1114,6 +1118,30 @@ pub struct QueriesBlock {
     pub key_prefixes: Vec<String>,
 }
 
+/// Contributed workflow step declaration (DEC-41, G-MANIFEST-V5 §10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStep {
+    pub id: String,
+    pub title: String,
+    pub handler: String,
+    #[serde(default)]
+    pub inputs: serde_json::Value,
+    #[serde(default)]
+    pub produces: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// Contributed workflow declaration (DEC-41, G-MANIFEST-V5 §10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowEntry {
+    pub id: String,
+    pub title: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
 impl Manifest {
     /// Apply the `ui.nav` → `ui.views` alias (G-MANIFEST-V5 §4, one shell
     /// release). Called once per `Package::load` — the ONLY call site — so
@@ -1228,6 +1256,134 @@ impl Package {
                 ));
             }
         }
+        Self::validate_workflows(m)?;
+        Ok(())
+    }
+
+    fn validate_workflows(m: &Manifest) -> Result<()> {
+        if m.workflows.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen_wf_ids = std::collections::HashSet::new();
+
+        for wf in &m.workflows {
+            if wf.id.is_empty() {
+                return Err(anyhow!("workflow id cannot be empty"));
+            }
+            if !seen_wf_ids.insert(&wf.id) {
+                return Err(anyhow!(
+                    "duplicate workflow id `{}` in manifest `{}`",
+                    wf.id,
+                    m.id
+                ));
+            }
+            if wf.steps.is_empty() {
+                return Err(anyhow!(
+                    "workflow `{}` in manifest `{}` must declare at least one step",
+                    wf.id,
+                    m.id
+                ));
+            }
+
+            let mut seen_step_ids = std::collections::HashSet::new();
+            for step in &wf.steps {
+                if step.id.is_empty() {
+                    return Err(anyhow!("step id cannot be empty in workflow `{}`", wf.id));
+                }
+                if !seen_step_ids.insert(&step.id) {
+                    return Err(anyhow!(
+                        "duplicate step id `{}` in workflow `{}`",
+                        step.id,
+                        wf.id
+                    ));
+                }
+
+                // Check handler route shape: /iyke/pkg/<pkg_id>/<cmd> (DEC-41, §10)
+                let expected_prefix = format!("/iyke/pkg/{}/", m.id);
+                if !step.handler.starts_with(&expected_prefix) {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` must start with `{}` (DEC-41, G-MANIFEST-V5 §10)",
+                        step.id,
+                        step.handler,
+                        expected_prefix
+                    ));
+                }
+
+                // Check <cmd> segments (lowercase-dash only: [a-z0-9][a-z0-9-]*)
+                let cmd_part = &step.handler[expected_prefix.len()..];
+                if cmd_part.is_empty() {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` missing <cmd> segment after `{}`",
+                        step.id,
+                        step.handler,
+                        expected_prefix
+                    ));
+                }
+                for segment in cmd_part.split('/') {
+                    if segment.is_empty()
+                        || !segment
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                            .unwrap_or(false)
+                        || !segment
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    {
+                        return Err(anyhow!(
+                            "workflow step `{}` handler `{}` has invalid <cmd> segment `{}`: segments must be lowercase-dash [a-z0-9][a-z0-9-]*",
+                            step.id,
+                            step.handler,
+                            segment
+                        ));
+                    }
+                }
+
+                // Stripped path /pkg/<pkg_id>/<cmd> must appear in iyke.routes[] with method: "POST"
+                let stripped_path = format!("/pkg/{}/{}", m.id, cmd_part);
+                let has_post_route = m
+                    .iyke
+                    .as_ref()
+                    .map(|b| {
+                        b.routes
+                            .iter()
+                            .any(|r| r.path == stripped_path && r.method.eq_ignore_ascii_case("POST"))
+                    })
+                    .unwrap_or(false);
+
+                if !has_post_route {
+                    return Err(anyhow!(
+                        "workflow step `{}` handler `{}` stripped path `{}` must appear in `iyke.routes[]` with method: \"POST\" (G-MANIFEST-V5 §10)",
+                        step.id,
+                        step.handler,
+                        stripped_path
+                    ));
+                }
+            }
+
+            // Check depends_on references
+            for step in &wf.steps {
+                for dep in &step.depends_on {
+                    if dep == &step.id {
+                        return Err(anyhow!(
+                            "workflow step `{}` cannot depend on itself in workflow `{}`",
+                            step.id,
+                            wf.id
+                        ));
+                    }
+                    if !seen_step_ids.contains(dep) {
+                        return Err(anyhow!(
+                            "workflow step `{}` depends on unknown step `{}` in workflow `{}` (no cross-workflow references allowed)",
+                            step.id,
+                            dep,
+                            wf.id
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1294,6 +1450,7 @@ mod tests {
             screenshots: vec![],
             requires: vec![],
             signature: None,
+            workflows: vec![],
         }
     }
 
@@ -2316,6 +2473,184 @@ mod tests {
             };
             assert_eq!(pkg.is_compatible(), want, "ikenga_api={api}");
         }
+    }
+
+    // ── workflows[] (WP-31, DEC-41, G-MANIFEST-V5 §10) ───────────────────────
+
+    #[test]
+    fn workflows_parses_and_validates_cleanly() {
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"},
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/test/unit", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build",
+                            "inputs": {"optimize": true},
+                            "produces": ["dist/bundle.js"]
+                        },
+                        {
+                            "id": "test",
+                            "title": "Run Tests",
+                            "handler": "/iyke/pkg/com.ikenga.studio/test/unit",
+                            "depends_on": ["build"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest with workflows");
+        assert_eq!(m.workflows.len(), 1);
+        let wf = &m.workflows[0];
+        assert_eq!(wf.id, "build-pipeline");
+        assert_eq!(wf.steps.len(), 2);
+        assert_eq!(wf.steps[0].id, "build");
+        assert_eq!(wf.steps[0].handler, "/iyke/pkg/com.ikenga.studio/build");
+        assert_eq!(wf.steps[1].depends_on, vec!["build".to_string()]);
+        assert!(Package::validate(&m).is_ok());
+    }
+
+    #[test]
+    fn workflows_rejects_missing_post_route() {
+        // Manifest declares workflow handler pointing to a route with method GET, not POST
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "GET", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject route without method: POST");
+        assert!(
+            err.to_string().contains("must appear in `iyke.routes[]` with method: \"POST\""),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_foreign_pkg_id() {
+        // Manifest com.ikenga.studio has handler referencing com.ikenga.other
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.other/build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject foreign pkg_id");
+        assert!(
+            err.to_string().contains("must start with `/iyke/pkg/com.ikenga.studio/`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_invalid_cmd_segments() {
+        // Uppercase or invalid characters in cmd segment
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/Build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/Build"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject uppercase cmd segment");
+        assert!(
+            err.to_string().contains("segments must be lowercase-dash"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workflows_rejects_unknown_or_self_depends_on() {
+        let json = r#"{
+            "id": "com.ikenga.studio",
+            "name": "Studio", "version": "0.1.0", "ikenga_api": "5",
+            "iyke": {
+                "routes": [
+                    {"method": "POST", "path": "/pkg/com.ikenga.studio/build", "handler": "echo"}
+                ]
+            },
+            "workflows": [
+                {
+                    "id": "build-pipeline",
+                    "title": "Build Pipeline",
+                    "steps": [
+                        {
+                            "id": "build",
+                            "title": "Build Artifacts",
+                            "handler": "/iyke/pkg/com.ikenga.studio/build",
+                            "depends_on": ["nonexistent"]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).expect("parse manifest");
+        let err = Package::validate(&m).expect_err("must reject nonexistent depends_on");
+        assert!(
+            err.to_string().contains("depends on unknown step `nonexistent`"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Headless sweep over the real pkg fleet (`ikenga-pkgs/packages/*/*`):

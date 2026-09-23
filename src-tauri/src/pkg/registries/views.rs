@@ -209,6 +209,7 @@ mod tests {
                 screenshots: vec![],
                 requires: vec![],
                 signature: None,
+                workflows: vec![],
             },
             install_path: PathBuf::from("/tmp/_unused"),
         }
