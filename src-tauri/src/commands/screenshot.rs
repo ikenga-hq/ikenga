@@ -19,9 +19,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use uuid::Uuid;
+
+use crate::settings::{SettingsManager, SettingsScope};
 
 // modern-screenshot inlines all stylesheets/fonts/images for the captured
 // subtree, which on the full workspace DOM (mini-app iframes + hundreds of
@@ -116,7 +119,7 @@ pub struct ScreenshotConfig {
 
 pub struct ScreenshotConfigState {
     cfg: RwLock<ScreenshotConfig>,
-    path: PathBuf,
+    sync_lock: Mutex<()>,
 }
 
 pub type ScreenshotConfigStateRef = Arc<ScreenshotConfigState>;
@@ -130,7 +133,7 @@ impl ScreenshotConfigState {
             .unwrap_or_default();
         Self {
             cfg: RwLock::new(cfg),
-            path,
+            sync_lock: Mutex::new(()),
         }
     }
 
@@ -147,26 +150,55 @@ impl ScreenshotConfigState {
         self.cfg.read().await.clone()
     }
 
-    pub async fn set_override(&self, dir: Option<String>) -> Result<()> {
-        let trimmed = dir.and_then(|s| {
-            let t = s.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
+    pub async fn set_override_memory(&self, dir: Option<String>) {
+        let _sync_guard = self.sync_lock.lock().await;
+        self.set_override_memory_unlocked(dir).await;
+    }
+
+    async fn set_override_memory_unlocked(&self, dir: Option<String>) {
+        self.cfg.write().await.override_dir = dir;
+    }
+}
+
+pub async fn sync_from_settings(
+    manager: &SettingsManager,
+    state: &ScreenshotConfigStateRef,
+) -> Result<()> {
+    let _sync_guard = state.sync_lock.lock().await;
+    let result = manager
+        .read(SettingsScope::Personal, None)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let value = result
+        .effective
+        .get_field("storage.screenshotDirectory")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let dir = match value {
+        Value::Null => None,
+        Value::String(value) if value.trim().is_empty() => None,
+        Value::String(value) => Some(value),
+        _ => return Err(anyhow!("settings screenshot directory is invalid")),
+    };
+    state.set_override_memory_unlocked(dir).await;
+    Ok(())
+}
+
+pub fn install_settings_listener(
+    app: &AppHandle,
+    manager: Arc<SettingsManager>,
+    state: ScreenshotConfigStateRef,
+) {
+    use tauri::Listener;
+    let _ = app.listen("settings://changed", move |_event| {
+        let manager = Arc::clone(&manager);
+        let state = Arc::clone(&state);
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = sync_from_settings(&manager, &state).await {
+                tracing::warn!("[settings] screenshot state sync failed: {error:#}");
             }
         });
-        let mut g = self.cfg.write().await;
-        g.override_dir = trimmed;
-        let json = serde_json::to_string_pretty(&*g)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create parent {}", parent.display()))?;
-        }
-        std::fs::write(&self.path, json)
-            .with_context(|| format!("write {}", self.path.display()))?;
-        Ok(())
-    }
+    });
 }
 
 #[derive(Serialize, Clone)]
@@ -906,7 +938,11 @@ pub struct ScreenshotConfigDto {
 #[tauri::command]
 pub async fn screenshot_get_config(
     state: State<'_, ScreenshotConfigStateRef>,
+    settings: State<'_, Arc<SettingsManager>>,
 ) -> Result<ScreenshotConfigDto, String> {
+    sync_from_settings(settings.inner(), state.inner())
+        .await
+        .map_err(|e| format!("{e:#}"))?;
     let snap = state.inner().snapshot().await;
     let default_dir = platform_default_screenshot_dir()
         .map_err(|e| format!("{e:#}"))?
@@ -928,13 +964,29 @@ pub async fn screenshot_get_config(
 #[tauri::command]
 pub async fn screenshot_set_dir(
     state: State<'_, ScreenshotConfigStateRef>,
+    settings: State<'_, Arc<SettingsManager>>,
     dir: Option<String>,
 ) -> Result<(), String> {
-    state
-        .inner()
-        .set_override(dir)
+    let normalized = dir.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+    let value = normalized
+        .as_ref()
+        .map(|value| Value::String(value.clone()))
+        .unwrap_or(Value::Null);
+    settings
+        .write_field(
+            SettingsScope::Personal,
+            None,
+            "storage.screenshotDirectory",
+            value,
+            normalized.is_none(),
+        )
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|error| error.to_string())?;
+    state.inner().set_override_memory(normalized).await;
+    Ok(())
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

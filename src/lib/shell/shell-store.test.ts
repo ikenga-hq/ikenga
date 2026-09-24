@@ -225,7 +225,7 @@ describe('shell-store v16 (G-STATE)', () => {
 		// Backup = the exact incoming envelope.
 		expect(localStorage.getItem(BACKUP_KEY)).toBe(raw);
 		// The live key was rewritten as v16.
-		expect(JSON.parse(localStorage.getItem(KEY)!).version).toBe(16);
+		expect(JSON.parse(localStorage.getItem(KEY)!).version).toBe(17);
 		// Every other v15 field survives unchanged.
 		expect(s.sidebarCollapsed).toBe(true);
 		expect(s.userName).toBe('Ada');
@@ -236,6 +236,8 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(s.claudeWatchEnabled).toBe(false);
 		expect(s.claudeBrowserMode).toBe('roots');
 		expect(s.onboarding).toEqual(state.onboarding);
+		expect(s.settingsRecovery?.userName).toBe('Ada');
+		expect(s.settingsRecovery?.fileRoots).toEqual(['/home/ada/label']);
 	});
 
 	it('fixture 2 — v15 fileRoots + claudeProjectRoots survive deduplicated as activeProject.extra_roots', async () => {
@@ -251,7 +253,9 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(s.projectExtraRoots).toEqual({});
 		expect(s.activeProject).toEqual({ id: 'default', root_path: null, extra_roots: expected });
 		const stored = JSON.parse(localStorage.getItem(KEY)!).state;
-		expect(stored.carriedRoots).toEqual(expected);
+		expect(stored.carriedRoots).toBeUndefined();
+		expect(stored.projectExtraRoots).toBeUndefined();
+		expect(stored.settingsRecovery.carriedRoots).toEqual(expected);
 	});
 
 	it('fixture 3 — fresh profile: migrate is NOT called, state equals the §2 defaults, no backup', async () => {
@@ -336,7 +340,7 @@ describe('shell-store v16 (G-STATE)', () => {
 		// v16 is live and the key holds a v16 blob.
 		expect(useShellStore.getState().activeMode).toBe('project');
 		expect(localStorage.getItem(KEY)).not.toBe(raw);
-		expect(JSON.parse(localStorage.getItem(KEY)!).version).toBe(16);
+		expect(JSON.parse(localStorage.getItem(KEY)!).version).toBe(17);
 
 		expect(restoreV15Backup()).toBe(true);
 
@@ -440,6 +444,18 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(st().explorerSections).toBe(snapshot);
 	});
 
+	it('v17 keeps user settings in memory but removes them from the persisted blob', async () => {
+		seedV15(v15State());
+		const { useShellStore } = await freshStore();
+		expect(useShellStore.getState().userName).toBe('Ada');
+		const stored = JSON.parse(localStorage.getItem(KEY)!).state;
+		expect(stored.userName).toBeUndefined();
+		expect(stored.defaultEngineId).toBeUndefined();
+		expect(stored.onboarding).toBeUndefined();
+		expect(stored.settingsRecovery.userName).toBe('Ada');
+		expect(stored.settingsRecovery.defaultEngineId).toBe('com.ikenga.engine-claude-code');
+	});
+
 	it('companion target is set in memory but never persisted', async () => {
 		const { useShellStore } = await freshStore();
 		useShellStore.getState().setCompanionTarget({ kind: 'session', session_id: 'abc' });
@@ -452,9 +468,9 @@ describe('shell-store v16 (G-STATE)', () => {
 		expect(stored.activeProject).toBeUndefined();
 		expect(stored.projects).toBeUndefined();
 		expect(stored.activeProjectId).toBeUndefined();
-		expect(stored.explorerSections).toHaveLength(8);
-		expect(stored.projectExtraRoots).toEqual({});
-		expect(stored.carriedRoots).toEqual([]);
+		expect(stored.explorerSections).toBeUndefined();
+		expect(stored.projectExtraRoots).toBeUndefined();
+		expect(stored.carriedRoots).toBeUndefined();
 	});
 });
 
@@ -489,6 +505,11 @@ describe('normalizeMode / dedupeRoots', () => {
 		expect(migrated.carriedRoots).toEqual(['/a', '/b', '/c']);
 		expect(migrated.projectExtraRoots).toEqual({});
 		expect(migrated.fileRoots).toEqual(['/a', 7, ' /b']);
+		expect((migrated.settingsRecovery as { fileRoots?: unknown[] }).fileRoots).toEqual([
+			'/a',
+			7,
+			' /b',
+		]);
 		expect(migrated.explorerSections).toEqual(createDefaultExplorerSections());
 	});
 });

@@ -1,11 +1,27 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { useIkengaStore } from '@/lib/ikenga/theme-store';
+import {
+	readSettingsFile,
+	watchSettings,
+	writeSettingsField,
+	writeSettingsFields,
+} from '@/lib/settings/client';
+import type {
+	SettingsFieldValueMap,
+	SettingsFileResult,
+	SettingsOnboarding,
+	SettingsPersonalField,
+	SettingsWriteEntry,
+	SettingsWriteOptions,
+} from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
 import {
 	type Project,
 	projectGetActive,
 	projectList,
 	projectSetActive,
+	settingsGet,
 	settingsGetAll,
 	settingsSet,
 } from '@/lib/tauri-cmd';
@@ -19,26 +35,26 @@ import {
 // write-throughs on every relevant setter.
 
 const KV_DEFAULT_ENGINE = 'agent.defaultEngineId';
-const KV_LEGACY_CHAT_ADAPTER = 'agent.chatAdapterId';
 const KV_CLAUDE_WATCH = 'claude.watchEnabled';
 const KV_ONBOARDING = 'onboarding.state';
 const KV_USER_NAME = 'user.name';
 const KV_UPDATES_AUTO_CHECK = 'updates.autoCheck';
 const KV_UPDATES_AUTO_INSTALL_APP = 'updates.autoInstallApp';
 const KV_UPDATES_AUTO_INSTALL_PKGS = 'updates.autoInstallPkgs';
+const KV_SHELL_MIGRATION = 'settings.migrations.shell-v17';
 
 // Set true while pulling values from Rust into the store so the
 // subscribe-based onboarding mirror doesn't push them straight back.
 let suppressKv = false;
-
-function kvSet(key: string, value: unknown): void {
-	if (suppressKv) return;
-	settingsSet(key, JSON.stringify(value)).catch(() => {
-		// Tauri unavailable (test env / pre-setup) — localStorage is still
-		// the in-page cache so the user's edit is not lost.
-	});
+let settingsWriteQueue: Promise<void> = Promise.resolve();
+let settingsHydrationQueue: Promise<void> = Promise.resolve();
+let settingsHydrationGeneration = 0;
+function hasTauriRuntime(): boolean {
+	return (
+		typeof window !== 'undefined' &&
+		('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+	);
 }
-
 function parseKv<T>(raw: string | undefined): T | undefined {
 	if (raw == null) return undefined;
 	try {
@@ -46,6 +62,303 @@ function parseKv<T>(raw: string | undefined): T | undefined {
 	} catch {
 		return undefined;
 	}
+}
+function currentAppearance() {
+	const state = useIkengaStore.getState();
+	return {
+		theme: state.theme,
+		mode: state.mode,
+		density: state.density,
+		tintStrength: state.tintStrength,
+	};
+}
+
+function enqueueSettingsTask(task: () => Promise<unknown>): Promise<void> {
+	const next = settingsWriteQueue.catch(() => {}).then(task);
+	settingsWriteQueue = next.then(
+		() => undefined,
+		() => undefined
+	);
+	return next.then(() => undefined);
+}
+
+function enqueueSettingsWrite(
+	label: string,
+	task: () => Promise<unknown>,
+	rollback: () => void,
+): void {
+	if (!hasTauriRuntime()) return;
+	const run = async () => {
+		let lastError: unknown;
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			try {
+				await task();
+				return;
+			} catch (error) {
+				lastError = error;
+			}
+		}
+		console.error(`[settings] write failed for ${label}:`, lastError);
+		const previousSuppress = suppressKv;
+		suppressKv = true;
+		try {
+			rollback();
+		} finally {
+			suppressKv = previousSuppress;
+		}
+	};
+	void enqueueSettingsTask(run).catch(() => {});
+}
+
+function kvSet(key: string, value: unknown, rollback: () => void = () => {}): void {
+	if (suppressKv) return;
+	enqueueSettingsWrite(key, () => settingsSet(key, JSON.stringify(value)), rollback);
+}
+
+function queueSettingsField<K extends SettingsPersonalField>(
+	field: K,
+	value: SettingsFieldValueMap[K],
+	rollback: () => void,
+): void {
+	enqueueSettingsWrite(
+		field,
+		() =>
+			writeSettingsField({
+				scope: 'personal',
+				field,
+				value,
+			} as SettingsWriteOptions),
+		rollback,
+	);
+}
+
+function enqueueSettingsHydration(task: (ticket: number) => Promise<void>): Promise<void> {
+	const ticket = ++settingsHydrationGeneration;
+	const next = settingsHydrationQueue.catch(() => {}).then(() => task(ticket));
+	settingsHydrationQueue = next;
+	return next;
+}
+
+async function readSettingsFileWithRetry(
+	projectId?: string | null,
+): Promise<SettingsFileResult | null> {
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		try {
+			return await readSettingsFile({ scope: 'project', projectId: projectId ?? null });
+		} catch {
+			if (attempt === 1) return null;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+	}
+	return null;
+}
+
+function recordAt(value: unknown, path: readonly string[]): unknown {
+	let current = value;
+	for (const key of path) {
+		if (!current || typeof current !== 'object' || Array.isArray(current)) return undefined;
+		current = (current as Record<string, unknown>)[key];
+	}
+	return current;
+}
+
+function stringAt(value: unknown, path: readonly string[]): string | undefined {
+	const result = recordAt(value, path);
+	return typeof result === 'string' ? result : undefined;
+}
+
+function booleanAt(value: unknown, path: readonly string[]): boolean | undefined {
+	const result = recordAt(value, path);
+	return typeof result === 'boolean' ? result : undefined;
+}
+
+function normalizeExplorerSections(value: unknown): ExplorerSectionState[] {
+	if (!Array.isArray(value)) return createDefaultExplorerSections();
+	const sections: ExplorerSectionState[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== 'object') continue;
+		const record = item as Record<string, unknown>;
+		if (typeof record.id !== 'string' || typeof record.source !== 'string') continue;
+		if (typeof record.order !== 'number' || typeof record.collapsed !== 'boolean') continue;
+		sections.push({
+			id: record.id,
+			source: record.source,
+			order: record.order,
+			collapsed: record.collapsed,
+		});
+	}
+	return sections.length > 0 ? sections : createDefaultExplorerSections();
+}
+
+function normalizeOnboarding(value: unknown): OnboardingState {
+	const defaults = createDefaultOnboardingState();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return defaults;
+	const record = value as Record<string, unknown>;
+	const steps =
+		record.steps && typeof record.steps === 'object' && !Array.isArray(record.steps)
+			? { ...defaults.steps, ...(record.steps as Record<string, OnboardingStepRecord>) }
+			: defaults.steps;
+	return {
+		...defaults,
+		...record,
+		steps,
+		loreGlossSeen: Array.isArray(record.loreGlossSeen)
+			? record.loreGlossSeen.filter((term): term is string => typeof term === 'string')
+			: [],
+	} as OnboardingState;
+}
+
+function projectCanWriteSettings(project: Project | undefined): boolean {
+	return project != null && project.archived_at == null && project.root_path != null;
+}
+
+function rootSettingsEntry(
+	projectId: string,
+	value: string[],
+	project: Project | undefined,
+): SettingsWriteEntry {
+	if (projectCanWriteSettings(project)) {
+		return { scope: 'project', field: 'projects.extraRoots', value, projectId };
+	}
+	return { scope: 'personal', field: 'projects.extraRoots', value };
+}
+
+function settingsFileFields(state: ShellState): SettingsWriteEntry[] {
+	const appearance = currentAppearance();
+	const userName = state.userName;
+	const defaultEngineId = state.defaultEngineId;
+	const claudeBrowserMode = state.claudeBrowserMode;
+	const claudeWatchEnabled = state.claudeWatchEnabled;
+	const sidebarCollapsed = state.sidebarCollapsed;
+	const explorerSections = state.explorerSections;
+	const onboarding = state.onboarding as SettingsOnboarding;
+	const updatesAutoCheck = state.updatesAutoCheck;
+	const updatesAutoInstallApp = state.updatesAutoInstallApp;
+	const updatesAutoInstallPkgs = state.updatesAutoInstallPkgs;
+	return [
+		{ scope: 'personal', field: 'appearance.theme', value: appearance.theme },
+		{ scope: 'personal', field: 'appearance.mode', value: appearance.mode },
+		{ scope: 'personal', field: 'appearance.density', value: appearance.density },
+		{ scope: 'personal', field: 'appearance.tintStrength', value: appearance.tintStrength },
+		{
+			scope: 'personal',
+			field: 'workspace.userName',
+			value: userName,
+		},
+		{
+			scope: 'personal',
+			field: 'engines.defaultEngineId',
+			value: defaultEngineId,
+		},
+		{
+			scope: 'personal',
+			field: 'workspace.claudeBrowserMode',
+			value: claudeBrowserMode,
+		},
+		{
+			scope: 'personal',
+			field: 'workspace.claudeWatchEnabled',
+			value: claudeWatchEnabled,
+		},
+		{
+			scope: 'personal',
+			field: 'workspace.sidebarCollapsed',
+			value: sidebarCollapsed,
+		},
+		{
+			scope: 'personal',
+			field: 'workspace.explorerSections',
+			value: explorerSections,
+		},
+		{
+			scope: 'personal',
+			field: 'workspace.onboarding',
+			value: onboarding,
+		},
+		{
+			scope: 'personal',
+			field: 'about.updates.autoCheck',
+			value: updatesAutoCheck,
+		},
+		{
+			scope: 'personal',
+			field: 'about.updates.autoInstallApp',
+			value: updatesAutoInstallApp,
+		},
+		{
+			scope: 'personal',
+			field: 'about.updates.autoInstallPkgs',
+			value: updatesAutoInstallPkgs,
+		},
+	];
+}
+
+function legacySettingsFields(state: ShellState): SettingsWriteEntry[] {
+	const fields = settingsFileFields(state);
+	const projectRoots = state.projectExtraRoots;
+	const activeProjectId = state.activeProjectId || 'default';
+	let activeWritten = false;
+	for (const [projectId, roots] of Object.entries(projectRoots)) {
+		const project = state.projects.find((entry) => entry.id === projectId);
+		if (project?.archived_at != null) continue;
+		const isActive = projectId === activeProjectId;
+		if (!project && !isActive && projectId !== 'default') continue;
+		if (!isActive && !projectCanWriteSettings(project)) continue;
+		fields.push(
+			rootSettingsEntry(
+				projectId,
+				isActive
+					? dedupeRoots([...roots, ...state.carriedRoots])
+					: dedupeRoots(roots),
+				project,
+			),
+		);
+		if (isActive) activeWritten = true;
+	}
+	if (!activeWritten) {
+		const project = state.projects.find((entry) => entry.id === activeProjectId);
+		if (project?.archived_at == null) {
+			fields.push(
+				rootSettingsEntry(
+					activeProjectId,
+					dedupeRoots([...(projectRoots[activeProjectId] ?? []), ...state.carriedRoots]),
+					project,
+				),
+			);
+		}
+	}
+	return fields;
+}
+
+async function writeMissingLegacyState(
+	state: ShellState,
+	snapshot: SettingsFileResult,
+): Promise<void> {
+	const missing: SettingsWriteEntry[] = [];
+	for (const field of legacySettingsFields(state)) {
+		const document =
+			field.scope === 'project'
+				? (await readSettingsFileWithRetry(field.projectId))?.project
+				: snapshot.personal;
+		if (recordAt(document, field.field.split('.')) === undefined) missing.push(field);
+	}
+	const activeProject = state.projects.find((entry) => entry.id === state.activeProjectId);
+	if (
+		projectCanWriteSettings(activeProject) &&
+		missing.some((field) => field.scope === 'project' && field.field === 'projects.extraRoots') &&
+		recordAt(snapshot.personal, ['projects', 'extraRoots']) !== undefined
+	) {
+		missing.push({ scope: 'personal', field: 'projects.extraRoots', value: [], remove: true });
+	}
+	if (missing.length > 0) await writeSettingsFields(missing, state.activeProjectId);
+}
+
+function persistWorkspaceField<K extends SettingsPersonalField>(
+	field: K,
+	value: SettingsFieldValueMap[K],
+	rollback: () => void = () => {}
+): void {
+	queueSettingsField(field, value, rollback);
 }
 
 // ─── Modes (G-STATE, persist v16) ──────────────────────────────────────────
@@ -338,6 +651,29 @@ export function createDefaultOnboardingState(): OnboardingState {
 	};
 }
 
+export interface SettingsRecovery {
+	userName?: string;
+	defaultEngineId?: string | null;
+	updatesAutoCheck?: boolean;
+	updatesAutoInstallApp?: boolean;
+	updatesAutoInstallPkgs?: boolean;
+	claudeWatchEnabled?: boolean;
+	claudeBrowserMode?: 'layered' | 'roots';
+	sidebarCollapsed?: boolean;
+	projectExtraRoots?: Record<string, string[]>;
+	carriedRoots?: string[];
+	explorerSections?: ExplorerSectionState[];
+	onboarding?: OnboardingState;
+	appearance?: {
+		theme: 'A' | 'B' | 'C';
+		mode: 'light' | 'dark' | 'system';
+		density: 'compact' | 'comfortable' | 'spacious';
+		tintStrength: 'off' | 'subtle' | 'strong';
+	};
+	fileRoots?: unknown[];
+	claudeProjectRoots?: unknown[];
+}
+
 interface ShellState {
 	/** Always one of ACTIVITY_MODES — legacy names are normalized on the way in. */
 	activeMode: CoreMode;
@@ -355,8 +691,8 @@ interface ShellState {
 	setProjectExtraRoots: (projectId: string, roots: string[]) => void;
 
 	// ─── Explorer sections (G-STATE) ─────────────────────────────────────
-	/** Persisted per profile, kept sorted by `order`. */
 	explorerSections: ExplorerSectionState[];
+	settingsRecovery: SettingsRecovery | null;
 	setExplorerSectionCollapsed: (id: string, collapsed: boolean) => void;
 	/** Swap with the neighbour above (-1) or below (+1); orders renumbered 0..n-1. */
 	moveExplorerSection: (id: string, delta: -1 | 1) => void;
@@ -469,6 +805,18 @@ const NOT_PERSISTED: ReadonlySet<string> = new Set([
 	'activeProjectId',
 	'activeProject',
 	'companion',
+	'userName',
+	'defaultEngineId',
+	'updatesAutoCheck',
+	'updatesAutoInstallApp',
+	'updatesAutoInstallPkgs',
+	'claudeWatchEnabled',
+	'claudeBrowserMode',
+	'sidebarCollapsed',
+	'projectExtraRoots',
+	'carriedRoots',
+	'explorerSections',
+	'onboarding',
 ]);
 
 function clampActiveIndex(idx: number): number {
@@ -549,7 +897,8 @@ export function migrateShellStore(persisted: unknown, version: number): unknown 
 	// missing on disk. (v15 removed the telemetry consent seeding that used
 	// to live here.)
 	const px = p as Partial<ShellState> & {
-		onboarding?: OnboardingState;
+	onboarding?: SettingsOnboarding;
+
 		defaultEngineId?: string | null;
 		chatAdapterId?: string | null;
 	};
@@ -585,6 +934,60 @@ export function migrateShellStore(persisted: unknown, version: number): unknown 
 		delete rec.companion;
 	}
 
+	const rec = p as unknown as Record<string, unknown>;
+	if (
+		version < 17 ||
+		['userName', 'defaultEngineId', 'updatesAutoCheck', 'updatesAutoInstallApp', 'updatesAutoInstallPkgs', 'claudeWatchEnabled', 'claudeBrowserMode', 'sidebarCollapsed', 'projectExtraRoots', 'carriedRoots', 'explorerSections', 'onboarding', 'fileRoots', 'claudeProjectRoots'].some((key) =>
+			Object.hasOwn(rec, key)
+		)
+	) {
+		rec.carriedRoots = dedupeRoots(rec.carriedRoots);
+		rec.projectExtraRoots =
+			rec.projectExtraRoots &&
+			typeof rec.projectExtraRoots === 'object' &&
+			!Array.isArray(rec.projectExtraRoots)
+				? Object.fromEntries(
+						Object.entries(rec.projectExtraRoots as Record<string, unknown>).map(([id, roots]) => [
+							id,
+							dedupeRoots(roots),
+						])
+					)
+				: {};
+		rec.explorerSections = normalizeExplorerSections(rec.explorerSections);
+		if (!rec.settingsRecovery) {
+			rec.settingsRecovery = {
+				userName: typeof rec.userName === 'string' ? rec.userName : undefined,
+				defaultEngineId:
+					typeof rec.defaultEngineId === 'string' || rec.defaultEngineId === null
+						? rec.defaultEngineId
+						: undefined,
+				updatesAutoCheck:
+					typeof rec.updatesAutoCheck === 'boolean' ? rec.updatesAutoCheck : undefined,
+				updatesAutoInstallApp:
+					typeof rec.updatesAutoInstallApp === 'boolean' ? rec.updatesAutoInstallApp : undefined,
+				updatesAutoInstallPkgs:
+					typeof rec.updatesAutoInstallPkgs === 'boolean' ? rec.updatesAutoInstallPkgs : undefined,
+				claudeWatchEnabled:
+					typeof rec.claudeWatchEnabled === 'boolean' ? rec.claudeWatchEnabled : undefined,
+				claudeBrowserMode:
+					rec.claudeBrowserMode === 'layered' || rec.claudeBrowserMode === 'roots'
+						? rec.claudeBrowserMode
+						: undefined,
+				sidebarCollapsed:
+					typeof rec.sidebarCollapsed === 'boolean' ? rec.sidebarCollapsed : undefined,
+				projectExtraRoots: rec.projectExtraRoots as Record<string, string[]>,
+				carriedRoots: rec.carriedRoots as string[],
+				explorerSections: rec.explorerSections as ExplorerSectionState[],
+				onboarding: rec.onboarding as OnboardingState,
+				appearance: currentAppearance(),
+				fileRoots: Array.isArray(rec.fileRoots) ? rec.fileRoots : undefined,
+				claudeProjectRoots: Array.isArray(rec.claudeProjectRoots)
+					? rec.claudeProjectRoots
+					: undefined,
+			} satisfies SettingsRecovery;
+		}
+	}
+
 	return p;
 }
 
@@ -604,6 +1007,56 @@ function mergeShellState(persisted: unknown, current: ShellState): ShellState {
 	delete blob.activeProject;
 	delete blob.companion;
 	const next = { ...current, ...blob } as ShellState;
+	const recovery = next.settingsRecovery;
+	if (recovery) {
+		if (!Object.hasOwn(blob, 'userName') && recovery.userName !== undefined) {
+			next.userName = recovery.userName;
+		}
+		if (!Object.hasOwn(blob, 'defaultEngineId') && recovery.defaultEngineId !== undefined) {
+			next.defaultEngineId = recovery.defaultEngineId;
+		}
+		if (!Object.hasOwn(blob, 'updatesAutoCheck') && recovery.updatesAutoCheck !== undefined) {
+			next.updatesAutoCheck = recovery.updatesAutoCheck;
+		}
+		if (
+			!Object.hasOwn(blob, 'updatesAutoInstallApp') &&
+			recovery.updatesAutoInstallApp !== undefined
+		) {
+			next.updatesAutoInstallApp = recovery.updatesAutoInstallApp;
+		}
+		if (
+			!Object.hasOwn(blob, 'updatesAutoInstallPkgs') &&
+			recovery.updatesAutoInstallPkgs !== undefined
+		) {
+			next.updatesAutoInstallPkgs = recovery.updatesAutoInstallPkgs;
+		}
+		if (!Object.hasOwn(blob, 'claudeWatchEnabled') && recovery.claudeWatchEnabled !== undefined) {
+			next.claudeWatchEnabled = recovery.claudeWatchEnabled;
+		}
+		if (!Object.hasOwn(blob, 'claudeBrowserMode') && recovery.claudeBrowserMode !== undefined) {
+			next.claudeBrowserMode = recovery.claudeBrowserMode;
+		}
+		if (!Object.hasOwn(blob, 'sidebarCollapsed') && recovery.sidebarCollapsed !== undefined) {
+			next.sidebarCollapsed = recovery.sidebarCollapsed;
+		}
+		if (!Object.hasOwn(blob, 'projectExtraRoots') && recovery.projectExtraRoots !== undefined) {
+			next.projectExtraRoots = Object.fromEntries(
+				Object.entries(recovery.projectExtraRoots).map(([id, roots]) => [
+					id,
+					dedupeRoots(roots),
+				])
+			);
+		}
+		if (!Object.hasOwn(blob, 'carriedRoots') && recovery.carriedRoots !== undefined) {
+			next.carriedRoots = dedupeRoots(recovery.carriedRoots);
+		}
+		if (!Object.hasOwn(blob, 'explorerSections') && recovery.explorerSections !== undefined) {
+			next.explorerSections = normalizeExplorerSections(recovery.explorerSections);
+		}
+		if (!Object.hasOwn(blob, 'onboarding') && recovery.onboarding !== undefined) {
+			next.onboarding = normalizeOnboarding(recovery.onboarding);
+		}
+	}
 	next.activeMode = normalizeMode(next.activeMode);
 	next.carriedRoots = dedupeRoots(next.carriedRoots);
 	if (
@@ -612,6 +1065,10 @@ function mergeShellState(persisted: unknown, current: ShellState): ShellState {
 		Array.isArray(next.projectExtraRoots)
 	) {
 		next.projectExtraRoots = {};
+	} else {
+		next.projectExtraRoots = Object.fromEntries(
+			Object.entries(next.projectExtraRoots).map(([id, roots]) => [id, dedupeRoots(roots)])
+		);
 	}
 	if (!Array.isArray(next.explorerSections)) {
 		next.explorerSections = createDefaultExplorerSections();
@@ -642,7 +1099,11 @@ export const useShellStore = create<ShellState>()(
 			carriedRoots: [],
 			setProjectExtraRoots: (projectId, roots) => {
 				const s = get();
-				const projectExtraRoots = { ...s.projectExtraRoots, [projectId]: dedupeRoots(roots) };
+				const project = s.projects.find((entry) => entry.id === projectId);
+				if (project?.archived_at != null) return;
+				const previousRoots = s.projectExtraRoots[projectId] ?? [];
+				const nextRoots = dedupeRoots(roots);
+				const projectExtraRoots = { ...s.projectExtraRoots, [projectId]: nextRoots };
 				set({
 					projectExtraRoots,
 					activeProject: computeActiveProject(
@@ -653,76 +1114,139 @@ export const useShellStore = create<ShellState>()(
 						s.activeProject
 					),
 				});
+				enqueueSettingsWrite(
+					'projects.extraRoots',
+					() =>
+						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project)),
+					() => {
+						const current = get();
+						if (JSON.stringify(current.projectExtraRoots[projectId] ?? []) !== JSON.stringify(nextRoots)) return;
+						const restored = { ...current.projectExtraRoots, [projectId]: previousRoots };
+						set({
+							projectExtraRoots: restored,
+							activeProject: computeActiveProject(
+								current.activeProjectId,
+								current.projects,
+								restored,
+								current.carriedRoots,
+								current.activeProject
+							),
+						});
+					}
+				);
 			},
 
 			explorerSections: createDefaultExplorerSections(),
-			setExplorerSectionCollapsed: (id, collapsed) =>
-				set((s) => ({
-					explorerSections: s.explorerSections.map((sec) =>
-						sec.id === id && sec.collapsed !== collapsed ? { ...sec, collapsed } : sec
-					),
-				})),
-			moveExplorerSection: (id, delta) =>
-				set((s) => {
-					const sorted = [...s.explorerSections].sort((a, b) => a.order - b.order);
-					const idx = sorted.findIndex((sec) => sec.id === id);
-					const target = idx + delta;
-					if (idx < 0 || target < 0 || target >= sorted.length) return s;
-					const moved = sorted[idx]!;
-					sorted[idx] = sorted[target]!;
-					sorted[target] = moved;
-					return {
-						explorerSections: sorted.map((sec, order) =>
-							sec.order === order ? sec : { ...sec, order }
-						),
-					};
-				}),
+			settingsRecovery: null,
+			setExplorerSectionCollapsed: (id, collapsed) => {
+				const previous = get().explorerSections;
+				const next = previous.map((sec) =>
+					sec.id === id && sec.collapsed !== collapsed ? { ...sec, collapsed } : sec
+				);
+				set({ explorerSections: next });
+				persistWorkspaceField('workspace.explorerSections', next, () => {
+					if (get().explorerSections === next) set({ explorerSections: previous });
+				});
+			},
+			moveExplorerSection: (id, delta) => {
+				const current = get();
+				const previous = current.explorerSections;
+				const sorted = [...previous].sort((a, b) => a.order - b.order);
+				const idx = sorted.findIndex((sec) => sec.id === id);
+				const target = idx + delta;
+				if (idx < 0 || target < 0 || target >= sorted.length) return;
+				const moved = sorted[idx]!;
+				sorted[idx] = sorted[target]!;
+				sorted[target] = moved;
+				const next = sorted.map((sec, order) =>
+					sec.order === order ? sec : { ...sec, order }
+				);
+				set({ explorerSections: next });
+				persistWorkspaceField('workspace.explorerSections', next, () => {
+					if (get().explorerSections === next) set({ explorerSections: previous });
+				});
+			},
 
 			companion: { activeTarget: { kind: 'new', engine_id: null } },
 			setCompanionTarget: (activeTarget) => set({ companion: { activeTarget } }),
 
 			sidebarCollapsed: false,
-			setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
-			toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+			setSidebarCollapsed: (sidebarCollapsed) => {
+				const previous = get().sidebarCollapsed;
+				set({ sidebarCollapsed });
+				persistWorkspaceField('workspace.sidebarCollapsed', sidebarCollapsed, () => {
+					if (get().sidebarCollapsed === sidebarCollapsed) set({ sidebarCollapsed: previous });
+				});
+			},
+			toggleSidebar: () => {
+				const previous = get().sidebarCollapsed;
+				const sidebarCollapsed = !previous;
+				set({ sidebarCollapsed });
+				persistWorkspaceField('workspace.sidebarCollapsed', sidebarCollapsed, () => {
+					if (get().sidebarCollapsed === sidebarCollapsed) set({ sidebarCollapsed: previous });
+				});
+			},
 
 			userName: '',
 			setUserName: (userName) => {
+				const previous = get().userName;
 				const trimmed = userName.trim();
 				set({ userName: trimmed });
-				kvSet(KV_USER_NAME, trimmed);
+				kvSet(KV_USER_NAME, trimmed, () => {
+					if (get().userName === trimmed) set({ userName: previous });
+				});
 			},
 
 			defaultEngineId: null,
 			setDefaultEngineId: (defaultEngineId) => {
+				const previous = get().defaultEngineId;
 				set({ defaultEngineId });
-				kvSet(KV_DEFAULT_ENGINE, defaultEngineId);
+				kvSet(KV_DEFAULT_ENGINE, defaultEngineId, () => {
+					if (get().defaultEngineId === defaultEngineId) set({ defaultEngineId: previous });
+				});
 			},
 
 			updatesAutoCheck: true,
 			setUpdatesAutoCheck: (updatesAutoCheck) => {
+				const previous = get().updatesAutoCheck;
 				set({ updatesAutoCheck });
-				kvSet(KV_UPDATES_AUTO_CHECK, updatesAutoCheck);
+				kvSet(KV_UPDATES_AUTO_CHECK, updatesAutoCheck, () => {
+					if (get().updatesAutoCheck === updatesAutoCheck) set({ updatesAutoCheck: previous });
+				});
 			},
 			updatesAutoInstallApp: false,
 			setUpdatesAutoInstallApp: (updatesAutoInstallApp) => {
+				const previous = get().updatesAutoInstallApp;
 				set({ updatesAutoInstallApp });
-				kvSet(KV_UPDATES_AUTO_INSTALL_APP, updatesAutoInstallApp);
+				kvSet(KV_UPDATES_AUTO_INSTALL_APP, updatesAutoInstallApp, () => {
+					if (get().updatesAutoInstallApp === updatesAutoInstallApp) set({ updatesAutoInstallApp: previous });
+				});
 			},
 			updatesAutoInstallPkgs: true,
 			setUpdatesAutoInstallPkgs: (updatesAutoInstallPkgs) => {
+				const previous = get().updatesAutoInstallPkgs;
 				set({ updatesAutoInstallPkgs });
-				kvSet(KV_UPDATES_AUTO_INSTALL_PKGS, updatesAutoInstallPkgs);
+				kvSet(KV_UPDATES_AUTO_INSTALL_PKGS, updatesAutoInstallPkgs, () => {
+					if (get().updatesAutoInstallPkgs === updatesAutoInstallPkgs) set({ updatesAutoInstallPkgs: previous });
+				});
 			},
 
 			claudeWatchEnabled: true,
 			setClaudeWatchEnabled: (claudeWatchEnabled) => {
+				const previous = get().claudeWatchEnabled;
 				set({ claudeWatchEnabled });
-				kvSet(KV_CLAUDE_WATCH, claudeWatchEnabled);
+				kvSet(KV_CLAUDE_WATCH, claudeWatchEnabled, () => {
+					if (get().claudeWatchEnabled === claudeWatchEnabled) set({ claudeWatchEnabled: previous });
+				});
 			},
 
 			claudeBrowserMode: 'layered',
 			setClaudeBrowserMode: (claudeBrowserMode) => {
+				const previous = get().claudeBrowserMode;
 				set({ claudeBrowserMode });
+				persistWorkspaceField('workspace.claudeBrowserMode', claudeBrowserMode, () => {
+					if (get().claudeBrowserMode === claudeBrowserMode) set({ claudeBrowserMode: previous });
+				});
 			},
 
 			// ─── Onboarding actions ────────────────────────────────────────
@@ -892,6 +1416,11 @@ export const useShellStore = create<ShellState>()(
 					}
 					throw err;
 				}
+				try {
+					await get().hydrateSettingsFromRust();
+				} catch (error) {
+					console.error('[shell-store] project settings hydration failed:', error);
+				}
 			},
 			refreshProjects: async () => {
 				try {
@@ -908,6 +1437,9 @@ export const useShellStore = create<ShellState>()(
 							s.activeProject
 						),
 					});
+					await get().hydrateSettingsFromRust().catch((error) => {
+						console.error('[shell-store] project settings hydration failed:', error);
+					});
 				} catch (err) {
 					// Tauri unavailable (test env / pre-setup boot) — but a real
 					// failure here leaves the store on the seed `default` project
@@ -917,64 +1449,132 @@ export const useShellStore = create<ShellState>()(
 				}
 			},
 
-			hydrateSettingsFromRust: async () => {
-				let all: Record<string, string> = {};
-				try {
-					all = await settingsGetAll();
-				} catch {
-					// Tauri unavailable (test env or pre-setup boot).
-					return;
-				}
-				if (Object.keys(all).length === 0) {
-					// First boot post-migration: seed settings_kv from whatever
-					// localStorage hydrated us with so existing users carry over.
-					const s = get();
+			hydrateSettingsFromRust: () =>
+				enqueueSettingsHydration(async (hydrationTicket) => {
+					let legacy: Record<string, string> = {};
+					try {
+						legacy = await settingsGetAll();
+					} catch {
+						legacy = {};
+					}
+					if (Object.keys(legacy).length > 0) {
+						const next: Partial<ShellState> = {};
+						const adapter = parseKv<string | null>(
+							legacy[KV_DEFAULT_ENGINE] ?? legacy['agent.chatAdapterId']
+						);
+						if (adapter === null || typeof adapter === 'string') {
+							next.defaultEngineId = adapter;
+						}
+						const watch = parseKv<boolean>(legacy[KV_CLAUDE_WATCH]);
+						if (typeof watch === 'boolean') next.claudeWatchEnabled = watch;
+						const onboarding = parseKv<OnboardingState>(legacy[KV_ONBOARDING]);
+						if (onboarding && typeof onboarding === 'object') {
+							next.onboarding = normalizeOnboarding(onboarding);
+						}
+						const userName = parseKv<string>(legacy[KV_USER_NAME]);
+						if (typeof userName === 'string') next.userName = userName;
+						const autoCheck = parseKv<boolean>(legacy[KV_UPDATES_AUTO_CHECK]);
+						if (typeof autoCheck === 'boolean') next.updatesAutoCheck = autoCheck;
+						const autoApp = parseKv<boolean>(legacy[KV_UPDATES_AUTO_INSTALL_APP]);
+						if (typeof autoApp === 'boolean') next.updatesAutoInstallApp = autoApp;
+						const autoPkgs = parseKv<boolean>(legacy[KV_UPDATES_AUTO_INSTALL_PKGS]);
+						if (typeof autoPkgs === 'boolean') next.updatesAutoInstallPkgs = autoPkgs;
+						suppressKv = true;
+						try {
+							set(next);
+						} finally {
+							suppressKv = false;
+						}
+					}
+					if (hydrationTicket !== settingsHydrationGeneration) return;
+					if (get().settingsRecovery && get().projects.length === 0) return;
+					const expectedProjectId = get().activeProjectId;
+					const firstSnapshot = await readSettingsFileWithRetry();
+					if (!firstSnapshot) return;
+					let snapshot: SettingsFileResult = firstSnapshot;
+					if (hydrationTicket !== settingsHydrationGeneration) return;
+					if (get().activeProjectId !== expectedProjectId) return;
+					if (snapshot.projectId !== null && snapshot.projectId !== expectedProjectId) return;
+
+					try {
+						await enqueueSettingsTask(async () => {
+							if (get().settingsRecovery) {
+								await writeMissingLegacyState(get(), snapshot);
+							}
+							if (get().settingsRecovery) {
+								await settingsSet(KV_SHELL_MIGRATION, JSON.stringify(true));
+								const verified = (await settingsGet(KV_SHELL_MIGRATION)) === 'true';
+								if (!verified) throw new Error('shell settings migration marker was not verified');
+								const refreshedSnapshot = await readSettingsFileWithRetry();
+								if (!refreshedSnapshot) throw new Error('settings reread failed');
+								snapshot = refreshedSnapshot;
+								if (get().activeProjectId !== expectedProjectId) {
+									throw new Error('settings project changed during handoff');
+								}
+								if (snapshot.projectId !== null && snapshot.projectId !== expectedProjectId) {
+									throw new Error('settings project mismatch during handoff');
+								}
+								if (get().settingsRecovery) {
+									set((state) => {
+										const next = { ...state, carriedRoots: [], settingsRecovery: null };
+										delete (next as unknown as Record<string, unknown>).fileRoots;
+										delete (next as unknown as Record<string, unknown>).claudeProjectRoots;
+										return next;
+									});
+								}
+							}
+						});
+					} catch {
+						return;
+					}
+					if (hydrationTicket !== settingsHydrationGeneration) return;
+					if (get().activeProjectId !== expectedProjectId) return;
+					if (snapshot.projectId !== null && snapshot.projectId !== expectedProjectId) return;
+
+					const effective = snapshot.effective;
+					const current = get();
+					const projectId = snapshot.projectId ?? current.activeProjectId;
+					const roots = recordAt(effective, ['projects', 'extraRoots']);
+					const projectExtraRoots = { ...current.projectExtraRoots };
+					projectExtraRoots[projectId] = Array.isArray(roots) ? dedupeRoots(roots) : [];
+					const onboarding = recordAt(effective, ['workspace', 'onboarding']);
+					const explorerSections = recordAt(effective, ['workspace', 'explorerSections']);
+					const next: Partial<ShellState> = {
+						userName: stringAt(effective, ['workspace', 'userName']) ?? '',
+						defaultEngineId:
+							(recordAt(effective, ['engines', 'defaultEngineId']) as string | null | undefined) ??
+							null,
+						updatesAutoCheck: booleanAt(effective, ['about', 'updates', 'autoCheck']) ?? true,
+						updatesAutoInstallApp:
+							booleanAt(effective, ['about', 'updates', 'autoInstallApp']) ?? false,
+						updatesAutoInstallPkgs:
+							booleanAt(effective, ['about', 'updates', 'autoInstallPkgs']) ?? true,
+						claudeWatchEnabled: booleanAt(effective, ['workspace', 'claudeWatchEnabled']) ?? true,
+						claudeBrowserMode:
+							stringAt(effective, ['workspace', 'claudeBrowserMode']) === 'roots'
+								? 'roots'
+								: 'layered',
+						sidebarCollapsed: booleanAt(effective, ['workspace', 'sidebarCollapsed']) ?? false,
+						explorerSections: normalizeExplorerSections(explorerSections),
+						onboarding: normalizeOnboarding(onboarding),
+					};
+					const activeProject = computeActiveProject(
+						projectId,
+						current.projects,
+						projectExtraRoots,
+						[],
+						current.activeProject
+					);
 					suppressKv = true;
 					try {
-						kvSet(KV_DEFAULT_ENGINE, s.defaultEngineId);
-						kvSet(KV_CLAUDE_WATCH, s.claudeWatchEnabled);
-						kvSet(KV_ONBOARDING, s.onboarding);
-						kvSet(KV_UPDATES_AUTO_CHECK, s.updatesAutoCheck);
-						kvSet(KV_UPDATES_AUTO_INSTALL_APP, s.updatesAutoInstallApp);
-						kvSet(KV_UPDATES_AUTO_INSTALL_PKGS, s.updatesAutoInstallPkgs);
+						set({ ...next, carriedRoots: [], projectExtraRoots, activeProject });
 					} finally {
 						suppressKv = false;
 					}
-					return;
-				}
-				// Tauri has values — overwrite the relevant store slices.
-				suppressKv = true;
-				try {
-					const next: Partial<ShellState> = {};
-					const adapter = parseKv<string | null>(
-						all[KV_DEFAULT_ENGINE] ?? all[KV_LEGACY_CHAT_ADAPTER]
-					);
-					if (adapter === null || typeof adapter === 'string') {
-						next.defaultEngineId = adapter;
-					}
-					const watch = parseKv<boolean>(all[KV_CLAUDE_WATCH]);
-					if (typeof watch === 'boolean') next.claudeWatchEnabled = watch;
-					const ob = parseKv<OnboardingState>(all[KV_ONBOARDING]);
-					if (ob && typeof ob === 'object') {
-						// Backfill loreGlossSeen for KV blobs persisted before v2.
-						if (!Array.isArray(ob.loreGlossSeen)) ob.loreGlossSeen = [];
-						next.onboarding = ob;
-					}
-					const userName = parseKv<string>(all[KV_USER_NAME]);
-					if (typeof userName === 'string') next.userName = userName;
-					const autoCheck = parseKv<boolean>(all[KV_UPDATES_AUTO_CHECK]);
-					if (typeof autoCheck === 'boolean') next.updatesAutoCheck = autoCheck;
-					const autoApp = parseKv<boolean>(all[KV_UPDATES_AUTO_INSTALL_APP]);
-					if (typeof autoApp === 'boolean') next.updatesAutoInstallApp = autoApp;
-					const autoPkgs = parseKv<boolean>(all[KV_UPDATES_AUTO_INSTALL_PKGS]);
-					if (typeof autoPkgs === 'boolean') next.updatesAutoInstallPkgs = autoPkgs;
-					set(next);
-				} finally {
-					suppressKv = false;
-				}
-			},
-		}),
-		// Bump version when ActivityMode union or persisted shape changes.
+					await useIkengaStore.getState().hydrateAppearanceFromRust().catch(() => {});
+				}),
+			}),
+				// Bump version when ActivityMode union or persisted shape changes.
 		// v5: mail/outbox/studio promoted to CoreMode (then v7 narrowed).
 		// v6: added claudeProjectRoots / claudeWatchEnabled.
 		// v7: strip-down — CoreMode narrowed to {app, files, sessions, settings};
@@ -1016,7 +1616,7 @@ export const useShellStore = create<ShellState>()(
 			// `activeMode`/onboarding writes don't clobber the primary's via the
 			// localStorage that all same-origin Tauri windows share (research 03).
 			name: scopedPersistName(SHELL_STORE_BASE_KEY),
-			version: 16,
+			version: 17,
 			migrate: (persisted, version) => {
 				// Backup first, before any v16 mutation of the payload.
 				if (version < 16) writeV15Backup(persisted, version);
@@ -1048,6 +1648,17 @@ export const useShellStore = create<ShellState>()(
 // we don't push the value we just pulled.
 useShellStore.subscribe((state, prev) => {
 	if (state.onboarding !== prev.onboarding) {
-		kvSet(KV_ONBOARDING, state.onboarding);
+		kvSet(KV_ONBOARDING, state.onboarding, () => {
+			if (useShellStore.getState().onboarding === state.onboarding) {
+				useShellStore.setState({ onboarding: prev.onboarding });
+			}
+		});
 	}
 });
+
+if (hasTauriRuntime()) {
+	void watchSettings(async () => {
+		await useShellStore.getState().hydrateSettingsFromRust();
+		await useIkengaStore.getState().hydrateAppearanceFromRust();
+	}).catch(() => {});
+}
