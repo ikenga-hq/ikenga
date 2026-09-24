@@ -48,6 +48,12 @@ let suppressKv = false;
 let settingsWriteQueue: Promise<void> = Promise.resolve();
 let settingsHydrationQueue: Promise<void> = Promise.resolve();
 let settingsHydrationGeneration = 0;
+function hasTauriRuntime(): boolean {
+	return (
+		typeof window !== 'undefined' &&
+		('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+	);
+}
 function currentAppearance() {
 	const state = useIkengaStore.getState();
 	return {
@@ -72,6 +78,7 @@ function enqueueSettingsWrite(
 	task: () => Promise<unknown>,
 	rollback: () => void,
 ): void {
+	if (!hasTauriRuntime()) return;
 	const run = async () => {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1605,10 +1612,7 @@ useShellStore.subscribe((state, prev) => {
 	}
 });
 
-if (
-	typeof window !== 'undefined' &&
-	('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
-) {
+if (hasTauriRuntime()) {
 	void watchSettings(async () => {
 		await useShellStore.getState().hydrateSettingsFromRust();
 		await useIkengaStore.getState().hydrateAppearanceFromRust();
