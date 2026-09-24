@@ -146,6 +146,16 @@ impl SettingsManager {
         scope: SettingsScope,
         project_id: Option<&str>,
     ) -> Result<SettingsReadResult, String> {
+        self.read_scoped(scope, project_id, cache_writes_allowed(scope, project_id))
+            .await
+    }
+
+    async fn read_scoped(
+        &self,
+        scope: SettingsScope,
+        project_id: Option<&str>,
+        cache: bool,
+    ) -> Result<SettingsReadResult, String> {
         self.ensure_migration_ready()?;
         let generation = self.project_generation.load(Ordering::Acquire);
         let pool = self.db.ensure_pool().await?;
@@ -202,9 +212,11 @@ impl SettingsManager {
         if self.project_generation.load(Ordering::Acquire) != generation {
             return Err("settings project generation changed during read".to_string());
         }
-        self.cache_result(&result, generation).await?;
-        if self.project_generation.load(Ordering::Acquire) != generation {
-            return Err("settings project generation changed during cache refresh".to_string());
+        if cache {
+            self.cache_result(&result, generation).await?;
+            if self.project_generation.load(Ordering::Acquire) != generation {
+                return Err("settings project generation changed during cache refresh".to_string());
+            }
         }
         Ok(result)
     }
@@ -248,7 +260,9 @@ impl SettingsManager {
         let existing = read_document(&path)?;
         if remove && existing.is_none() {
             self.delete_field_cache(field, cache_project_id).await?;
-            return self.read(scope, project_id).await;
+            return self
+                .read_scoped(scope, project_id, cache_writes_allowed(scope, project_id))
+                .await;
         }
         let mut document = existing.unwrap_or_else(SettingsDocument::default);
         let mut project_file_removed = false;
@@ -295,7 +309,13 @@ impl SettingsManager {
             tracing::warn!("[settings] watcher refresh after write failed: {e}");
         }
         self.emit_change(&path);
-        let read_result = self.read(scope, project_id).await;
+        let cached = cache_writes_allowed(scope, project_id);
+        let read_result = self
+            .read_scoped(scope, project_id, cached)
+            .await;
+        if !cached {
+            self.refresh_cache().await?;
+        }
         screenshot_result?;
         read_result
     }
@@ -393,14 +413,26 @@ impl SettingsManager {
         self.project_generation.fetch_add(1, Ordering::AcqRel);
         let _cache_guard = self.cache_lock.lock().await;
         let pool = self.db.ensure_pool().await?;
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT key FROM settings_kv")
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| format!("settings_clear_all: {e}"))?;
+        let owned: Vec<String> = rows
+            .into_iter()
+            .map(|(key,)| key)
+            .filter(|key| schema::is_settings_owned_key(key))
+            .collect();
         let mut tx = pool
             .begin()
             .await
             .map_err(|e| format!("begin settings_clear_all: {e}"))?;
-        sqlx::query("DELETE FROM settings_kv")
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("settings_clear_all: {e}"))?;
+        for key in &owned {
+            sqlx::query("DELETE FROM settings_kv WHERE key = ?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("settings_clear_all: {e}"))?;
+        }
         tx.commit()
             .await
             .map_err(|e| format!("commit settings_clear_all: {e}"))?;
@@ -944,6 +976,15 @@ fn effective_document(
     base.resolved()
 }
 
+/// The KV cache mirrors exactly one document: the effective active-project
+/// read (`Project` scope, no explicit project id). Reads that target another
+/// project or a bare personal document must not repopulate it, or a
+/// non-active project's overlay would leak into the legacy mirror and into
+/// `settings_get_all` consumers.
+fn cache_writes_allowed(scope: SettingsScope, project_id: Option<&str>) -> bool {
+    scope == SettingsScope::Project && project_id.is_none()
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1014,5 +1055,13 @@ mod tests {
             "artifact-grid.default-sink",
         ];
         assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn only_active_project_reads_refresh_the_cache_mirror() {
+        assert!(cache_writes_allowed(SettingsScope::Project, None));
+        assert!(!cache_writes_allowed(SettingsScope::Project, Some("other")));
+        assert!(!cache_writes_allowed(SettingsScope::Personal, None));
+        assert!(!cache_writes_allowed(SettingsScope::Personal, Some("other")));
     }
 }
