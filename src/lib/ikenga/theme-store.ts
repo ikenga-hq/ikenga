@@ -17,7 +17,8 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
-import { settingsGetAll, settingsSet } from '@/lib/tauri-cmd';
+import { settingsGetAll, settingsWriteField } from '@/lib/tauri-cmd';
+import type { SettingsWriteOptions } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
 
 /** Palette variants. A=default (Iroko/dusk), B=Kola amber, C=verdigris. */
@@ -93,19 +94,40 @@ interface IkengaState {
 	hydrateAppearanceFromRust: () => Promise<void>;
 }
 
-const KV_THEME = 'appearance.theme';
-const KV_MODE = 'appearance.mode';
-const KV_DENSITY = 'appearance.density';
-const KV_TINT = 'appearance.tintStrength';
+const KV_THEME = 'appearance.theme' as const;
+const KV_MODE = 'appearance.mode' as const;
+const KV_DENSITY = 'appearance.density' as const;
+const KV_TINT = 'appearance.tintStrength' as const;
+
+type AppearanceField =
+	| typeof KV_THEME
+	| typeof KV_MODE
+	| typeof KV_DENSITY
+	| typeof KV_TINT;
+type AppearanceValueMap = {
+	[K in AppearanceField]: K extends typeof KV_THEME
+		? IkengaTheme
+		: K extends typeof KV_MODE
+			? IkengaMode
+			: K extends typeof KV_DENSITY
+				? IkengaDensity
+				: IkengaTintStrength;
+};
 
 let suppressKv = false;
+let appearanceWriteQueue: Promise<void> = Promise.resolve();
 
-function kvSet(key: string, value: unknown): void {
+function kvSet<K extends AppearanceField>(key: K, value: AppearanceValueMap[K]): void {
 	if (suppressKv) return;
-	settingsSet(key, JSON.stringify(value)).catch(() => {
-		// Tauri unavailable (test env / pre-setup) — localStorage still holds
-		// the user's edit.
-	});
+	const options = { scope: 'personal', field: key, value } as SettingsWriteOptions;
+	const next = appearanceWriteQueue
+		.catch(() => {})
+		.then(() => settingsWriteField(options));
+	appearanceWriteQueue = next.then(
+		() => undefined,
+		() => undefined
+	);
+	void appearanceWriteQueue.catch(() => {});
 }
 
 function parseKv<T>(raw: string | undefined): T | undefined {
