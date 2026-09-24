@@ -38,7 +38,7 @@ declare module '@tanstack/react-router' {
 }
 
 /** Boot the full primary workspace window. */
-export function bootPrimary(): void {
+export async function bootPrimary(): Promise<void> {
 	// Dev-only globals (e.g. `window.ikengaAcpSmoke` for the ACP migration
 	// Phase 3 smoke test). Lazy-imported so production builds tree-shake the
 	// helper entirely.
@@ -61,7 +61,7 @@ export function bootPrimary(): void {
 	// Pull the durable settings_kv mirror (migration 0013). Same fire-and-forget
 	// semantics — failures leave the localStorage-hydrated snapshot in place,
 	// successes overwrite Zustand state with the Tauri-side authoritative copy.
-	void useShellStore.getState().hydrateSettingsFromRust();
+	await useShellStore.getState().hydrateSettingsFromRust();
 	void useIkengaStore.getState().hydrateAppearanceFromRust();
 
 	// WP-22: one-shot reconciler that seeds activity_pins from the kernel's

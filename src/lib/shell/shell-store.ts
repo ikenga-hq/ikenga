@@ -22,6 +22,7 @@ import {
 	projectList,
 	projectSetActive,
 	settingsGet,
+	settingsGetAll,
 	settingsSet,
 } from '@/lib/tauri-cmd';
 
@@ -53,6 +54,14 @@ function hasTauriRuntime(): boolean {
 		typeof window !== 'undefined' &&
 		('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
 	);
+}
+function parseKv<T>(raw: string | undefined): T | undefined {
+	if (raw == null) return undefined;
+	try {
+		return JSON.parse(raw) as T;
+	} catch {
+		return undefined;
+	}
 }
 function currentAppearance() {
 	const state = useIkengaStore.getState();
@@ -1442,6 +1451,41 @@ export const useShellStore = create<ShellState>()(
 
 			hydrateSettingsFromRust: () =>
 				enqueueSettingsHydration(async (hydrationTicket) => {
+					let legacy: Record<string, string> = {};
+					try {
+						legacy = await settingsGetAll();
+					} catch {
+						legacy = {};
+					}
+					if (Object.keys(legacy).length > 0) {
+						const next: Partial<ShellState> = {};
+						const adapter = parseKv<string | null>(
+							legacy[KV_DEFAULT_ENGINE] ?? legacy['agent.chatAdapterId']
+						);
+						if (adapter === null || typeof adapter === 'string') {
+							next.defaultEngineId = adapter;
+						}
+						const watch = parseKv<boolean>(legacy[KV_CLAUDE_WATCH]);
+						if (typeof watch === 'boolean') next.claudeWatchEnabled = watch;
+						const onboarding = parseKv<OnboardingState>(legacy[KV_ONBOARDING]);
+						if (onboarding && typeof onboarding === 'object') {
+							next.onboarding = normalizeOnboarding(onboarding);
+						}
+						const userName = parseKv<string>(legacy[KV_USER_NAME]);
+						if (typeof userName === 'string') next.userName = userName;
+						const autoCheck = parseKv<boolean>(legacy[KV_UPDATES_AUTO_CHECK]);
+						if (typeof autoCheck === 'boolean') next.updatesAutoCheck = autoCheck;
+						const autoApp = parseKv<boolean>(legacy[KV_UPDATES_AUTO_INSTALL_APP]);
+						if (typeof autoApp === 'boolean') next.updatesAutoInstallApp = autoApp;
+						const autoPkgs = parseKv<boolean>(legacy[KV_UPDATES_AUTO_INSTALL_PKGS]);
+						if (typeof autoPkgs === 'boolean') next.updatesAutoInstallPkgs = autoPkgs;
+						suppressKv = true;
+						try {
+							set(next);
+						} finally {
+							suppressKv = false;
+						}
+					}
 					if (hydrationTicket !== settingsHydrationGeneration) return;
 					if (get().settingsRecovery && get().projects.length === 0) return;
 					const expectedProjectId = get().activeProjectId;
