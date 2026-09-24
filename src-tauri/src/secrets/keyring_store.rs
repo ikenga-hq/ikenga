@@ -942,7 +942,7 @@ impl SecretsStore for KeyringStore {
         }
         let read = read?;
         let expected: Vec<u8> = token.as_bytes().to_vec();
-        if read.as_deref() != Some(expected.as_slice()) {
+        if !read.is_some_and(|value| value == expected) {
             return Err(StoreError::uncommitted(
                 "authoritative keychain probe read mismatch".into(),
             ));
