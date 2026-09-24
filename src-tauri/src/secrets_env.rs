@@ -45,8 +45,8 @@ pub const ENV_PREFIX: &str = "IKENGA_SECRET_";
 /// `VaultStatus::mode` for the daemon's env-backed store.
 pub const MODE_ENV: &str = "env";
 
-/// `VaultStatus::mode` for the desktop app's Stronghold vault.
-pub const MODE_STRONGHOLD: &str = "stronghold";
+/// `VaultStatus::mode` for the desktop app's OS keychain.
+pub const MODE_KEYCHAIN: &str = "keychain";
 
 /// Human-readable backend label. Surfaced verbatim by Settings → API Keys
 /// ("Vault unlocked via {keychainBackend}"), so it has to read as a sentence
@@ -74,7 +74,7 @@ pub const WRITE_REFUSAL: &str = concat!(
 pub const SCOPE_REFUSAL: &str = concat!(
     "the headless daemon's secret store is flat: IKENGA_SECRET_<KEY> environment variables, ",
     "with no project or pkg partitioning. Only {\"kind\":\"workspace\"} is servable here; ",
-    "project- and pkg-scoped secrets exist only in the desktop app's Stronghold vault."
+    "project- and pkg-scoped secrets exist only in the desktop app's OS keychain."
 );
 
 /// A key is servable iff it can name an environment variable: non-empty,
@@ -124,7 +124,7 @@ fn list_keys_from<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
 /// every connector gates on `available`. `mode` and `writable` are additive:
 /// the daemon reports `("env", false)` so the Settings UI can stop offering
 /// buttons that cannot work, and the desktop app reports
-/// `("stronghold", true)`. Dropping either of the original three breaks every
+/// `("keychain", true)`. Dropping either of the original three breaks every
 /// connector silently, so this struct is a superset and never a rename.
 #[derive(Debug, Serialize)]
 pub struct VaultStatus {

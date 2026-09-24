@@ -53,13 +53,13 @@ mod iyke;
 #[cfg(feature = "desktop")]
 mod pkg_content;
 #[cfg(feature = "desktop")]
+pub mod secrets;
+#[cfg(feature = "desktop")]
 pub mod settings_cascade;
 #[cfg(feature = "desktop")]
 mod terminal;
 #[cfg(feature = "desktop")]
 pub mod transcript;
-#[cfg(feature = "desktop")]
-pub mod vault_key;
 #[cfg(feature = "desktop")]
 mod viewer_server;
 // Multi-window substrate (plans/multi-window): the G-WINDOW-MODEL contract
@@ -295,22 +295,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
-        .plugin(
-            tauri_plugin_stronghold::Builder::new(|_password: &str| {
-                // Phase 14: vault key is bootstrapped from the OS keychain.
-                // The plugin's `_password` is ignored — we always pass an
-                // empty string from the Rust side and the keychain is the
-                // single source of truth. If the keychain is unavailable the
-                // callback returns an empty Vec; Stronghold::new will fail
-                // and the secrets_vault_status command surfaces the error to
-                // the UI.
-                vault_key::fetch_or_create().unwrap_or_else(|e| {
-                    log::error!("vault key bootstrap failed: {e}");
-                    Vec::new()
-                })
-            })
-            .build(),
-        )
         .manage(pty_manager.clone())
         .manage(fs_watch_manager)
         .manage(viewer_manager)
@@ -342,6 +326,26 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| format!("app_data_dir: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
+
+            match secrets::migrate::run(&data_dir) {
+                Ok(_) => {}
+                Err(error) => {
+                    if let Err(mark_error) = app
+                        .state::<SecretsLock>()
+                        .mark_unavailable(error.clone())
+                    {
+                        log::error!("[secrets] unavailable state failed: {mark_error}");
+                    }
+                    if let Err(invalidation_error) =
+                        commands::secrets::invalidate_env_vaults(app.handle())
+                    {
+                        log::error!(
+                            "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
+                        );
+                    }
+                    log::error!("[secrets] migration failed: {error}");
+                }
+            }
 
             // User-configurable FS allowlist. Must be installed before the
             // first call to `commands::resolve_allowlisted` (which fs_*,

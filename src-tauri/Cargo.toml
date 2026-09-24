@@ -34,7 +34,7 @@ tauri = { version = "2.1", default-features = false, features = ["unstable", "de
 # (tauri#12313); we rely on that rather than an app-level deferred-restart.
 tauri-plugin-single-instance = "2"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
-tauri-plugin-stronghold = "2"
+tauri-plugin-stronghold = { version = "2", optional = true }
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"
@@ -183,8 +183,12 @@ vt100 = "0.15"
 # the host window is occluded / minimized. Phase 0.5 confirmed Linux doesn't
 # need this; Windows uses webview2-com for its analog.
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"], optional = true }
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSProcessInfo", "NSString"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "linux-native", "crypto-rust", "vendored"], optional = true }
 
 # Unix-wide libc. Two consumers:
 #   - macOS pty::foreground — sysctl(KERN_PROC_PID) to read
@@ -201,7 +205,9 @@ libc = "0.2"
 # here to the same major as tauri-runtime-wry to avoid pulling a second
 # version (which causes windows-core type-mismatch errors at compile).
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"], optional = true }
 webview2-com = "0.38"
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
 
 # Mac-only polish (window vibrancy + dock-tile badge) was removed
 # in the strip-down. The resolved objc2 v0.5 didn't export
@@ -233,7 +239,7 @@ default = ["desktop"]
 # The webview runtime and its GTK/WebKit stack. Everything the DESKTOP app
 # needs and the headless daemon does not — `ikenga-server` builds with
 # --no-default-features so it links no browser engine.
-desktop = ["tauri/wry", "tauri/x11", "tauri/dbus", "tauri/common-controls-v6"]
+desktop = ["tauri/wry", "tauri/x11", "tauri/dbus", "tauri/common-controls-v6", "dep:keyring", "dep:tauri-plugin-stronghold"]
 # this feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
 unstable_message_id = []
