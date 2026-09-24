@@ -97,8 +97,8 @@ pub async fn resolve_project_scope(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let id = match requested {
-        Some(id) => id,
+    let id = match requested.as_deref() {
+        Some(id) => id.to_string(),
         None => sqlx::query_scalar::<_, String>("SELECT value FROM settings_kv WHERE key = ?")
             .bind(ACTIVE_PROJECT_KEY)
             .fetch_optional(pool)
@@ -197,7 +197,7 @@ async fn project_root_is_duplicate(
         let Some(other_root) = other_root.filter(|value| !value.trim().is_empty()) else {
             continue;
         };
-        if normalize_project_root(&other_root).ok().as_ref() == Some(root) {
+        if normalize_project_root(&other_root).ok().as_deref() == Some(root) {
             tracing::warn!(
                 "[settings] project {id} shares settings root {}",
                 root.display()

@@ -250,7 +250,7 @@ impl SettingsDocument {
         Ok(())
     }
 
-    pub fn merge(overlay: &Self) -> Self {
+    pub fn merge(&self, overlay: &Self) -> Self {
         let mut result = self.clone();
         merge_map(&mut result.appearance, &overlay.appearance);
         merge_map(&mut result.projects, &overlay.projects);

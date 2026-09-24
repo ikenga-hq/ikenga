@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::commands::db::PaDb;
 
 use self::migrate::{migrate_from_kv, SCREENSHOT_MIGRATION_KEY};
-use self::schema::{self, SettingsDocument};
+use self::schema::SettingsDocument;
 pub use self::scope::SettingsScope;
 use self::scope::{
     normalize_project_root, personal_path, project_path, read_document, resolve_paths,
@@ -845,10 +845,12 @@ impl SettingsManager {
                 }
             },
         );
-        debouncer
+        let watch_result = debouncer
             .watcher()
-            .watch(&watch_dir, notify::RecursiveMode::NonRecursive)
-            .map_err(|e| format!("watch {}: {e}", watch_dir.display()))?;
+            .watch(&watch_dir, notify::RecursiveMode::NonRecursive);
+        if let Err(error) = watch_result {
+            return Err(format!("watch {}: {error}", watch_dir.display()));
+        }
         let mut watchers = self
             .watchers
             .lock()
