@@ -1,77 +1,48 @@
-//! Secrets via the `tauri_plugin_stronghold::stronghold::Stronghold` wrapper
-//! (a thin shim over `iota_stronghold`). Snapshot lives at
-//! `app_data_dir/secrets.stronghold`. The vault key is bootstrapped from a
-//! file at `app_data_dir/.vault-key` — see `crate::vault_key`. No password
-//! prompt; no argon2.
-//!
-//! The `tauri-plugin-stronghold` plugin itself is intentionally NOT
-//! registered in `lib.rs`. The FE never invokes plugin-direct commands; all
-//! vault access goes through the `secrets_*` commands here, serialized by
-//! `SecretsLock`. Registering the plugin would expose handlers that bypass
-//! our lock and race on the same snapshot file (each `Stronghold` instance
-//! owns its own per-instance RwLocks, so two instances on one snapshot path
-//! corrupt writes via `commit_with_keyprovider`).
-//!
-//! Implementation notes:
-//!   - We always open Stronghold with the key from the vault-key file.
-//!   - All values are stored as UTF-8 bytes under a single client (`pa`).
-//!   - We maintain a parallel `__manifest` entry containing a JSON array of
-//!     known key names, so the UI can list keys without scanning the whole
-//!     vault. `Store::keys()` is not stable across plugin versions; the
-//!     manifest is portable.
-//!   - The `secrets_dump_to_runtime_file` helper writes all key/value pairs
-//!     to an OS-runtime file (`$XDG_RUNTIME_DIR/ikenga-actions/env-vault`,
-//!     `$TMPDIR/ikenga-actions/env-vault` on macOS, or
-//!     `%LOCALAPPDATA%\ikenga-actions\env-vault` on Windows) so sidecar
-//!     processes can read them via the existing dotenv loader. The runtime
-//!     file is chmod 0600 on unix (Windows relies on the user-profile ACL)
-//!     and cleaned up on app quit. On Windows, copies that older builds left
-//!     in the world-readable `C:\tmp\ikenga-actions` are deleted once per run.
-//!   - A second **durable** copy is written to
-//!     `$XDG_CONFIG_HOME/ikenga-actions/env` (Linux),
-//!     `~/Library/Application Support/ikenga-actions/env` (macOS) or
-//!     `%LOCALAPPDATA%\ikenga-actions\env` (Windows) on every
-//!     `secrets_set` / `secrets_delete`. This file survives shell restarts so
-//!     the mutation-worker daemon can send overnight with the shell closed.
-//!     It is NOT cleaned up on quit — that is by design.
-//!   - `read_secret` is a sync helper exposed for capability resolvers (e.g.
-//!     pkg_content's Supabase capability) that need vault values during
-//!     command handling without round-tripping through the public
-//!     `secrets_get` Tauri command.
-
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, State};
-use tauri_plugin_stronghold::stronghold::Stronghold;
 
-use crate::vault_key;
+use crate::secrets::{
+    index::INDEX_FILENAME, KeyringStore, SecretsStore, SharedSecretStore, SharedSecretStoreSlot,
+    StoreError, UnavailableSecretStore,
+};
 
-const CLIENT_NAME: &[u8] = b"pa";
 const MANIFEST_KEY: &[u8] = b"__manifest";
-/// Phase 7 — scope-tagged manifest. Stored alongside `__manifest` so legacy
-/// readers (anything tracking unscoped names) keep working during the
-/// deprecation window. Values are fully-qualified scoped names —
-/// `workspace::KEY`, `project::<id>::KEY`, `pkg::<id>::KEY`.
 const MANIFEST_V2_KEY: &[u8] = b"__manifest_v2";
+const ENV_VAULT_PENDING_FILENAME: &str = "env-vault.pending.json";
+const ENV_VAULT_DENIED_FILENAME: &str = "env-vault.denied";
+const ENV_VAULT_DENIED_BODY: &[u8] = b"# IKENGA SECRETS DENIED\n";
 
-/// App-managed cache + serialization lock for Stronghold. The wrapped
-/// `Stronghold` instance is opened lazily on first use (or eagerly during
-/// `setup`) and reused across every `secrets_*` command — `load_snapshot`
-/// runs once per app lifetime, `commit_with_keyprovider` runs only on writes.
-///
-/// `std::sync::Mutex` is correct here because all blocking work happens
-/// inside `tokio::task::spawn_blocking`, never across `.await`. Two parallel
-/// instances on the same snapshot file would corrupt writes (each has its
-/// own per-instance RwLocks); this single cached instance + serialized
-/// access is the canonical pattern.
-pub struct SecretsLock(pub Arc<Mutex<Option<Stronghold>>>);
+pub struct SecretsLock(pub SharedSecretStoreSlot);
 
 impl SecretsLock {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(None)))
+    }
+
+    pub fn from_slot(slot: SharedSecretStoreSlot) -> Self {
+        Self(slot)
+    }
+
+    pub fn replace_store(&self, store: SharedSecretStore) -> Result<(), String> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|error| format!("secrets lock poisoned: {error}"))?;
+        *guard = Some(store);
+        Ok(())
+    }
+
+    pub fn mark_unavailable(&self, reason: impl Into<String>) -> Result<(), String> {
+        self.replace_store(Arc::new(UnavailableSecretStore::new(reason)))
+    }
+
+    pub fn probe(&self, app: &AppHandle) -> Result<(), String> {
+        let state = self.0.clone();
+        with_store(app, &state, |store| store.probe()).map_err(|error| error.to_string())
     }
 }
 
@@ -81,73 +52,57 @@ impl Default for SecretsLock {
     }
 }
 
-fn snapshot_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    Ok(dir.join("secrets.stronghold"))
-}
-
-/// Lazily open the cached Stronghold and load (or create) our client. After
-/// first call the in-memory `Stronghold` is reused for the app's lifetime.
-fn ensure_open<R: Runtime>(
+fn ensure_store<R: Runtime>(
     app: &AppHandle<R>,
-    slot: &mut Option<Stronghold>,
-) -> Result<(), String> {
+    slot: &mut Option<SharedSecretStore>,
+) -> Result<(), StoreError> {
     if slot.is_some() {
         return Ok(());
     }
-    let path = snapshot_path(app)?;
-    let pw = vault_key::fetch_or_create().map_err(|e| format!("vault key: {e}"))?;
-    let stronghold = Stronghold::new(&path, pw).map_err(|e| format!("stronghold open: {e}"))?;
-    // After `Stronghold::new` runs `load_snapshot` (if the file exists), the
-    // client still needs to be brought into memory. Try `get_client` first
-    // (no-op if the in-memory map already has it — shouldn't on a fresh
-    // instance, but cheap), then `load_client` (snapshot → memory), and only
-    // `create_client` when the snapshot has no such client at all.
-    if stronghold.get_client(CLIENT_NAME).is_err() && stronghold.load_client(CLIENT_NAME).is_err() {
-        stronghold
-            .create_client(CLIENT_NAME)
-            .map_err(|e| format!("stronghold create_client: {e}"))?;
-    }
-    *slot = Some(stronghold);
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| StoreError::uncommitted(format!("app_data_dir: {error}")))?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| StoreError::uncommitted(format!("mkdir: {error}")))?;
+    let store = Arc::new(KeyringStore::new(data_dir.join(INDEX_FILENAME))?);
+    *slot = Some(store);
     Ok(())
 }
 
-/// Run a closure under the cached Stronghold. `commit` controls whether to
-/// persist after the closure runs — reads pass `false`, writes pass `true`.
-/// Lock-poisoning short-circuits with an error rather than panicking.
-fn with_stronghold<R: Runtime, F, T>(
+fn with_store<R: Runtime, F, T>(
     app: &AppHandle<R>,
-    state: &Arc<Mutex<Option<Stronghold>>>,
-    commit: bool,
+    state: &SharedSecretStoreSlot,
     f: F,
-) -> Result<T, String>
+) -> Result<T, StoreError>
 where
-    F: FnOnce(&Stronghold) -> Result<T, String>,
+    F: FnOnce(&dyn SecretsStore) -> Result<T, StoreError>,
 {
     let mut guard = state
         .lock()
-        .map_err(|e| format!("secrets lock poisoned: {e}"))?;
-    ensure_open(app, &mut guard)?;
-    let sh = guard.as_ref().expect("ensure_open populated the slot");
-    let result = f(sh)?;
-    if commit {
-        if let Err(e) = sh.save() {
-            log::warn!("stronghold save failed: {e}");
-        }
-    }
-    Ok(result)
+        .map_err(|error| StoreError::uncommitted(format!("secrets lock poisoned: {error}")))?;
+    ensure_store(app, &mut guard)?;
+    let store = guard.as_ref().expect("ensure_store populated the slot");
+    f(store.as_ref())
 }
 
-// ─── Phase 7: vault scope partitioning ──────────────────────────────────
-//
-// Vault keys are namespaced by Scope to keep secrets from leaking across
-// projects / pkgs. The on-disk Stronghold remains one snapshot — the
-// namespacing is at the key-name level. Existing un-namespaced keys
-// continue to work via the legacy fallback path on read.
+fn finish_mutation<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &SharedSecretStoreSlot,
+    result: Result<(), StoreError>,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => dump_to_runtime_file_locked(app, state).map(|_| ()),
+        Err(error) if error.is_committed() => {
+            let env_result = dump_to_runtime_file_locked(app, state);
+            match env_result {
+                Ok(_) => Err(error.to_string()),
+                Err(env_error) => Err(format!("{error}; env-vault update failed: {env_error}")),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -172,8 +127,6 @@ impl Scope {
     }
 }
 
-/// Fully-qualify a key under a scope. Used by every scoped read/write
-/// against Stronghold. The result is the literal key stored in the vault.
 pub fn vault_key(scope: &Scope, key: &str) -> String {
     match scope {
         Scope::Workspace => format!("workspace::{key}"),
@@ -210,67 +163,6 @@ pub fn parse_scoped(fqk: &str) -> Option<(Scope, String)> {
     None
 }
 
-fn read_manifest(stronghold: &Stronghold) -> Result<BTreeSet<String>, String> {
-    let client = stronghold
-        .get_client(CLIENT_NAME)
-        .map_err(|e| format!("get_client: {e}"))?;
-    let store = client.store();
-    match store.get(MANIFEST_KEY) {
-        Ok(Some(bytes)) => {
-            let s = String::from_utf8(bytes).map_err(|e| format!("manifest utf8: {e}"))?;
-            let v: Vec<String> =
-                serde_json::from_str(&s).map_err(|e| format!("manifest json: {e}"))?;
-            Ok(v.into_iter().collect())
-        }
-        Ok(None) => Ok(BTreeSet::new()),
-        Err(e) => Err(format!("manifest get: {e}")),
-    }
-}
-
-fn write_manifest(stronghold: &Stronghold, keys: &BTreeSet<String>) -> Result<(), String> {
-    let client = stronghold
-        .get_client(CLIENT_NAME)
-        .map_err(|e| format!("get_client: {e}"))?;
-    let store = client.store();
-    let v: Vec<&String> = keys.iter().collect();
-    let json = serde_json::to_string(&v).map_err(|e| format!("manifest serialize: {e}"))?;
-    store
-        .insert(MANIFEST_KEY.to_vec(), json.into_bytes(), None)
-        .map_err(|e| format!("manifest insert: {e}"))?;
-    Ok(())
-}
-
-/// Read the v2 (scoped) manifest. Returns fully-qualified names.
-fn read_manifest_v2(stronghold: &Stronghold) -> Result<BTreeSet<String>, String> {
-    let client = stronghold
-        .get_client(CLIENT_NAME)
-        .map_err(|e| format!("get_client: {e}"))?;
-    let store = client.store();
-    match store.get(MANIFEST_V2_KEY) {
-        Ok(Some(bytes)) => {
-            let s = String::from_utf8(bytes).map_err(|e| format!("manifest_v2 utf8: {e}"))?;
-            let v: Vec<String> =
-                serde_json::from_str(&s).map_err(|e| format!("manifest_v2 json: {e}"))?;
-            Ok(v.into_iter().collect())
-        }
-        Ok(None) => Ok(BTreeSet::new()),
-        Err(e) => Err(format!("manifest_v2 get: {e}")),
-    }
-}
-
-fn write_manifest_v2(stronghold: &Stronghold, keys: &BTreeSet<String>) -> Result<(), String> {
-    let client = stronghold
-        .get_client(CLIENT_NAME)
-        .map_err(|e| format!("get_client: {e}"))?;
-    let store = client.store();
-    let v: Vec<&String> = keys.iter().collect();
-    let json = serde_json::to_string(&v).map_err(|e| format!("manifest_v2 serialize: {e}"))?;
-    store
-        .insert(MANIFEST_V2_KEY.to_vec(), json.into_bytes(), None)
-        .map_err(|e| format!("manifest_v2 insert: {e}"))?;
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn secrets_get(
     app: AppHandle,
@@ -281,24 +173,10 @@ pub async fn secrets_get(
         return Ok(None);
     }
     let state = lock.0.clone();
-    tokio::task::spawn_blocking(move || {
-        with_stronghold(&app, &state, false, |sh| {
-            let client = sh
-                .get_client(CLIENT_NAME)
-                .map_err(|e| format!("get_client: {e}"))?;
-            let store = client.store();
-            match store.get(key.as_bytes()) {
-                Ok(Some(bytes)) => {
-                    let s = String::from_utf8(bytes).map_err(|e| format!("utf8: {e}"))?;
-                    Ok(Some(s))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(format!("store get: {e}")),
-            }
-        })
-    })
-    .await
-    .map_err(|e| format!("join: {e}"))?
+    tokio::task::spawn_blocking(move || with_store(&app, &state, |store| store.get(&key)))
+        .await
+        .map_err(|error| format!("join: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -313,27 +191,12 @@ pub async fn secrets_set(
     }
     let state = lock.0.clone();
     let app_for_dump = app.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        with_stronghold(&app, &state, true, |sh| {
-            let client = sh
-                .get_client(CLIENT_NAME)
-                .map_err(|e| format!("get_client: {e}"))?;
-            let store = client.store();
-            store
-                .insert(key.as_bytes().to_vec(), value.into_bytes(), None)
-                .map_err(|e| format!("store insert: {e}"))?;
-            let mut manifest = read_manifest(sh)?;
-            manifest.insert(key);
-            write_manifest(sh, &manifest)?;
-            Ok(())
-        })?;
-        // Re-dump on the same blocking thread so we don't bounce work back
-        // through the runtime just to enter another spawn_blocking.
-        let _ = dump_to_runtime_file_locked(&app_for_dump, &state);
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        let result = with_store(&app, &state, |store| store.set(&key, &value));
+        finish_mutation(&app_for_dump, &state, result)
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
 }
 
 #[tauri::command]
@@ -347,25 +210,12 @@ pub async fn secrets_delete(
     }
     let state = lock.0.clone();
     let app_for_dump = app.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        with_stronghold(&app, &state, true, |sh| {
-            let client = sh
-                .get_client(CLIENT_NAME)
-                .map_err(|e| format!("get_client: {e}"))?;
-            let store = client.store();
-            store
-                .delete(key.as_bytes())
-                .map_err(|e| format!("store delete: {e}"))?;
-            let mut manifest = read_manifest(sh)?;
-            manifest.remove(&key);
-            write_manifest(sh, &manifest)?;
-            Ok(())
-        })?;
-        let _ = dump_to_runtime_file_locked(&app_for_dump, &state);
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        let result = with_store(&app, &state, |store| store.delete(&key));
+        finish_mutation(&app_for_dump, &state, result)
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
 }
 
 #[tauri::command]
@@ -375,20 +225,20 @@ pub async fn secrets_list_keys(
 ) -> Result<Vec<String>, String> {
     let state = lock.0.clone();
     tokio::task::spawn_blocking(move || {
-        with_stronghold(&app, &state, false, |sh| {
-            let manifest = read_manifest(sh)?;
-            Ok(manifest.into_iter().collect())
+        with_store(&app, &state, |store| {
+            Ok(store
+                .list_meta()?
+                .into_iter()
+                .map(|meta| meta.name)
+                .filter(|name| parse_scoped(name).is_none())
+                .collect())
         })
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
-/// Wire shape lives in `crate::secrets_env` so the desktop app and the
-/// headless daemon cannot drift: both builds serialize the same five fields,
-/// and the frontend normalizes one shape. Desktop reports
-/// `mode: "stronghold", writable: true`; the daemon reports
-/// `mode: "env", writable: false`.
 pub use crate::secrets_env::VaultStatus;
 
 #[tauri::command]
@@ -398,34 +248,29 @@ pub async fn secrets_vault_status(
 ) -> Result<VaultStatus, String> {
     let state = lock.0.clone();
     tokio::task::spawn_blocking(move || {
-        let backend = vault_key::keychain_backend().to_string();
-        match vault_key::fetch_or_create() {
-            Ok(_) => {
-                // Probe an actual open + manifest read so we surface
-                // post-keychain-open failures (snapshot corruption, etc.) too.
-                match with_stronghold(&app, &state, false, |sh| read_manifest(sh)) {
-                    Ok(_) => Ok(VaultStatus {
-                        available: true,
-                        keychain_backend: backend,
-                        error: None,
-                        mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
-                        writable: true,
-                    }),
-                    Err(e) => Ok(VaultStatus {
-                        available: false,
-                        keychain_backend: backend,
-                        error: Some(e),
-                        mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
-                        writable: true,
-                    }),
-                }
-            }
-            Err(e) => Ok(VaultStatus {
+        let backend = crate::secrets::keyring_store::backend_label().to_string();
+        let probe = with_store(&app, &state, |store| {
+            store.probe()?;
+            Ok((store.backend_label().to_string(), store.diagnostics()))
+        });
+        match probe {
+            Ok((keychain_backend, diagnostics)) => Ok(VaultStatus {
+                available: true,
+                keychain_backend,
+                error: if diagnostics.is_empty() {
+                    None
+                } else {
+                    Some(diagnostics.join("; "))
+                },
+                mode: crate::secrets_env::MODE_KEYCHAIN.to_string(),
+                writable: true,
+            }),
+            Err(error) => Ok(VaultStatus {
                 available: false,
                 keychain_backend: backend,
-                error: Some(e.to_string()),
-                mode: crate::secrets_env::MODE_STRONGHOLD.to_string(),
-                writable: true,
+                error: Some(error.to_string()),
+                mode: crate::secrets_env::MODE_KEYCHAIN.to_string(),
+                writable: false,
             }),
         }
     })
@@ -433,16 +278,6 @@ pub async fn secrets_vault_status(
     .map_err(|e| format!("join: {e}"))?
 }
 
-// ─── Internal read helper (for capability resolvers) ────────────────────────
-
-/// Read a single key from the vault. Used by capability resolvers (e.g.
-/// pkg_content's Supabase capability) that need to consult secrets without
-/// going through the public `secrets_get` Tauri command.
-///
-/// Synchronous: takes the `SecretsLock` directly and runs against the cached
-/// Stronghold. Caller is already inside an async command but vault reads off
-/// the cached instance are sub-millisecond, so blocking the runtime briefly
-/// is acceptable. Wrap in `spawn_blocking` if calling on a hot path.
 #[allow(dead_code)]
 pub fn read_secret(
     app: &AppHandle,
@@ -452,39 +287,9 @@ pub fn read_secret(
     if key.as_bytes() == MANIFEST_KEY {
         return Ok(None);
     }
-    with_stronghold(app, &lock.0, false, |sh| {
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        match store.get(key.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let s = String::from_utf8(bytes).map_err(|e| format!("utf8: {e}"))?;
-                Ok(Some(s))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(format!("store get: {e}")),
-        }
-    })
+    with_store(app, &lock.0, |store| store.get(key)).map_err(|error| error.to_string())
 }
 
-// ─── F-9: settings-secret env injection ─────────────────────────────────────
-
-/// Resolve the env-var secrets a pkg declares in its `settings` schema.
-///
-/// For each `type:"secret"` settings field carrying an `env` name, read the
-/// secret value from Stronghold under the pkg's OWN scope (`Scope::pkg`, with
-/// the legacy-unscoped fallback that `read_secret_scoped` already provides)
-/// and return `(ENV_NAME, value)` pairs for the caller to set on a spawning
-/// child (`cmd.env(name, value)`).
-///
-/// Scoped strictly to the pkg's own manifest — its manifest is its
-/// entitlement, so no `permissions.vault.keys` glob check is involved. A
-/// secret absent from the vault is skipped silently (the process-env fallback
-/// still applies). Synchronous + `block_on`-free: it reads off the cached
-/// Stronghold, matching `read_secret`'s contract, so it is safe to call from
-/// both the sync (`spawn_streaming_child_sync`) and async
-/// (`spawn_and_handshake`) spawn paths without touching the Tokio runtime.
 pub fn resolve_settings_secret_env(
     app: &AppHandle,
     pkg_id: &str,
@@ -532,32 +337,20 @@ pub fn read_secret_scoped(
     if key.as_bytes() == MANIFEST_KEY || key.as_bytes() == MANIFEST_V2_KEY {
         return Ok(None);
     }
-    with_stronghold(app, &lock.0, false, |sh| {
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        let scoped = vault_key(scope, key);
-        match store.get(scoped.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let s = String::from_utf8(bytes).map_err(|e| format!("utf8: {e}"))?;
-                return Ok(Some(s));
-            }
-            Ok(None) => {}
-            Err(e) => return Err(format!("scoped get: {e}")),
+    let scoped = vault_key(scope, key);
+    with_store(app, &lock.0, |store| {
+        if let Some(value) = store.get(&scoped)? {
+            return Ok(Some(value));
         }
-        match store.get(key.as_bytes()) {
-            Ok(Some(bytes)) => {
-                let s = String::from_utf8(bytes).map_err(|e| format!("utf8: {e}"))?;
-                log::warn!(
-                    "vault: legacy unscoped key `{key}` read (deprecation: migrate to `{scoped}`)"
-                );
-                Ok(Some(s))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(format!("legacy get: {e}")),
+        if let Some(value) = store.get(key)? {
+            log::warn!(
+                "vault: legacy unscoped key `{key}` read (deprecation: migrate to `{scoped}`)"
+            );
+            return Ok(Some(value));
         }
+        Ok(None)
     })
+    .map_err(|error| error.to_string())
 }
 
 pub fn scoped_set_locked_pub(
@@ -567,9 +360,8 @@ pub fn scoped_set_locked_pub(
     key: &str,
     value: &str,
 ) -> Result<(), String> {
-    scoped_set_locked(app, &lock.0, scope, key, value)?;
-    let _ = dump_to_runtime_file_locked(app, &lock.0);
-    Ok(())
+    let result = scoped_set_locked(app, &lock.0, scope, key, value);
+    finish_mutation(app, &lock.0, result)
 }
 
 pub fn scoped_delete_locked_pub(
@@ -578,9 +370,8 @@ pub fn scoped_delete_locked_pub(
     scope: &Scope,
     key: &str,
 ) -> Result<(), String> {
-    scoped_delete_locked(app, &lock.0, scope, key)?;
-    let _ = dump_to_runtime_file_locked(app, &lock.0);
-    Ok(())
+    let result = scoped_delete_locked(app, &lock.0, scope, key);
+    finish_mutation(app, &lock.0, result)
 }
 
 // ─── Manifest vault.keys glob parsing (Phase 7) ─────────────────────────
@@ -706,71 +497,44 @@ pub fn scoped_list_locked_pub(
     lock: &SecretsLock,
     scope: &Scope,
 ) -> Result<Vec<String>, String> {
-    scoped_list_locked(app, &lock.0, scope)
+    scoped_list_locked(app, &lock.0, scope).map_err(|error| error.to_string())
 }
 
 fn scoped_set_locked(
     app: &AppHandle,
-    state: &Arc<Mutex<Option<Stronghold>>>,
+    state: &SharedSecretStoreSlot,
     scope: &Scope,
     key: &str,
     value: &str,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     if key.as_bytes() == MANIFEST_KEY || key.as_bytes() == MANIFEST_V2_KEY || key.is_empty() {
-        return Err("invalid key".into());
+        return Err(StoreError::uncommitted("invalid key"));
     }
-    with_stronghold(app, state, true, |sh| {
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        let scoped = vault_key(scope, key);
-        store
-            .insert(scoped.as_bytes().to_vec(), value.as_bytes().to_vec(), None)
-            .map_err(|e| format!("store insert: {e}"))?;
-        let mut m2 = read_manifest_v2(sh)?;
-        m2.insert(scoped);
-        write_manifest_v2(sh, &m2)?;
-        Ok(())
-    })
+    with_store(app, state, |store| store.set(&vault_key(scope, key), value))
 }
 
 fn scoped_delete_locked(
     app: &AppHandle,
-    state: &Arc<Mutex<Option<Stronghold>>>,
+    state: &SharedSecretStoreSlot,
     scope: &Scope,
     key: &str,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     if key.as_bytes() == MANIFEST_KEY || key.as_bytes() == MANIFEST_V2_KEY {
-        return Err("invalid key".into());
+        return Err(StoreError::uncommitted("invalid key"));
     }
-    with_stronghold(app, state, true, |sh| {
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        let scoped = vault_key(scope, key);
-        store
-            .delete(scoped.as_bytes())
-            .map_err(|e| format!("store delete: {e}"))?;
-        let mut m2 = read_manifest_v2(sh)?;
-        m2.remove(&scoped);
-        write_manifest_v2(sh, &m2)?;
-        Ok(())
-    })
+    with_store(app, state, |store| store.delete(&vault_key(scope, key)))
 }
 
 fn scoped_list_locked(
     app: &AppHandle,
-    state: &Arc<Mutex<Option<Stronghold>>>,
+    state: &SharedSecretStoreSlot,
     scope: &Scope,
-) -> Result<Vec<String>, String> {
-    with_stronghold(app, state, false, |sh| {
-        let m2 = read_manifest_v2(sh)?;
-        let mut out: Vec<String> = Vec::new();
-        for fqk in m2 {
-            if let Some((sc, key)) = parse_scoped(&fqk) {
-                if &sc == scope {
+) -> Result<Vec<String>, StoreError> {
+    with_store(app, state, |store| {
+        let mut out = Vec::new();
+        for meta in store.list_meta()? {
+            if let Some((candidate_scope, key)) = parse_scoped(&meta.name) {
+                if &candidate_scope == scope {
                     out.push(key);
                 }
             }
@@ -791,11 +555,11 @@ pub async fn secrets_get_scoped(
     tokio::task::spawn_blocking(move || {
         // SecretsLock isn't State<>-shaped here; reconstruct a transient
         // one so we can reuse the public read_secret_scoped helper.
-        let l = SecretsLock(state);
-        read_secret_scoped(&app, &l, &scope, &key)
+        let lock = SecretsLock::from_slot(state);
+        read_secret_scoped(&app, &lock, &scope, &key)
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
 }
 
 #[tauri::command]
@@ -808,13 +572,12 @@ pub async fn secrets_set_scoped(
 ) -> Result<(), String> {
     let state = lock.0.clone();
     let app_for_dump = app.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        scoped_set_locked(&app, &state, &scope, &key, &value)?;
-        let _ = dump_to_runtime_file_locked(&app_for_dump, &state);
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        let result = scoped_set_locked(&app, &state, &scope, &key, &value);
+        finish_mutation(&app_for_dump, &state, result)
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
 }
 
 #[tauri::command]
@@ -826,13 +589,12 @@ pub async fn secrets_delete_scoped(
 ) -> Result<(), String> {
     let state = lock.0.clone();
     let app_for_dump = app.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        scoped_delete_locked(&app, &state, &scope, &key)?;
-        let _ = dump_to_runtime_file_locked(&app_for_dump, &state);
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        let result = scoped_delete_locked(&app, &state, &scope, &key);
+        finish_mutation(&app_for_dump, &state, result)
     })
     .await
-    .map_err(|e| format!("join: {e}"))?
+    .map_err(|error| format!("join: {error}"))?
 }
 
 #[tauri::command]
@@ -844,75 +606,32 @@ pub async fn secrets_list_keys_scoped(
     let state = lock.0.clone();
     tokio::task::spawn_blocking(move || scoped_list_locked(&app, &state, &scope))
         .await
-        .map_err(|e| format!("join: {e}"))?
+        .map_err(|error| format!("join: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 // ─── Backup helpers (phase 2) ────────────────────────────────────────────────
 
-/// Enumerate the entire vault as `key → value` pairs. Used by the backup
-/// exporter; the result is age-encrypted before leaving the process. Skips
-/// the internal `__manifest` key.
 pub fn dump_all_kvs<R: Runtime>(
     app: &AppHandle<R>,
     lock: &SecretsLock,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
-    with_stronghold(app, &lock.0, false, |sh| {
-        let manifest = read_manifest(sh)?;
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        let mut out = std::collections::BTreeMap::new();
-        for k in &manifest {
-            if k.as_bytes() == MANIFEST_KEY {
-                continue;
-            }
-            match store.get(k.as_bytes()) {
-                Ok(Some(b)) => match String::from_utf8(b) {
-                    Ok(v) => {
-                        out.insert(k.clone(), v);
-                    }
-                    Err(_) => log::warn!("secret {k} is non-utf8, skipping in backup"),
-                },
-                Ok(None) => {}
-                Err(e) => log::warn!("secret {k} read failed: {e}"),
-            }
-        }
-        Ok(out)
-    })
+    with_store(app, &lock.0, |store| store.export_all()).map_err(|error| error.to_string())
 }
 
-/// Apply a full set of `key → value` pairs to the vault. Used by the backup
-/// importer's boot-time apply step. Each key is upserted; the manifest is
-/// updated once at the end. Existing values for keys that aren't in `kvs`
-/// are left in place — this is a merge, not a replacement, so a partial or
-/// secret-less restore can't accidentally wipe a user's vault.
 pub fn bulk_set<R: Runtime>(
     app: &AppHandle<R>,
     lock: &SecretsLock,
     kvs: &std::collections::BTreeMap<String, String>,
 ) -> Result<usize, String> {
-    if kvs.is_empty() {
-        return Ok(0);
-    }
-    with_stronghold(app, &lock.0, true, |sh| {
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-        let mut manifest = read_manifest(sh)?;
-        for (k, v) in kvs {
-            if k.as_bytes() == MANIFEST_KEY || k.is_empty() {
-                continue;
-            }
-            store
-                .insert(k.as_bytes().to_vec(), v.as_bytes().to_vec(), None)
-                .map_err(|e| format!("insert {k}: {e}"))?;
-            manifest.insert(k.clone());
-        }
-        write_manifest(sh, &manifest)?;
-        Ok(kvs.len())
-    })
+    let filtered: std::collections::BTreeMap<String, String> = kvs
+        .iter()
+        .filter(|(name, _)| {
+            !name.is_empty() && name.as_str() != "__manifest" && name.as_str() != "__manifest_v2"
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    with_store(app, &lock.0, |store| store.import_all(&filtered)).map_err(|error| error.to_string())
 }
 
 // ─── Runtime env-vault file (for the actions sidecar) ────────────────────────
@@ -1066,10 +785,6 @@ fn remove_legacy_env_copies(dir: &std::path::Path) -> usize {
     removed
 }
 
-/// Once per process on Windows, delete the world-readable copies earlier
-/// builds left in `C:\tmp\ikenga-actions`. Called first thing in the single
-/// writer (`dump_to_runtime_file_locked`), before any Stronghold / manifest
-/// work, so it still runs when the vault fails to open.
 fn cleanup_legacy_windows_tmp_copies() {
     #[cfg(windows)]
     {
@@ -1126,143 +841,203 @@ fn resolve_active_project_blocking<R: Runtime>(app: &AppHandle<R>) -> String {
     })
 }
 
-/// Dump vault key/values into the runtime env-vault file using the
-/// shared cached Stronghold. The dumped file is what sidecars + per-call
-/// MCP children pick up via dotenv — so the file contains *resolved*
-/// values for the active project, not scope-prefixed key names.
-///
-/// Resolution cascade per name:
-///   1. `project::<active_id>::NAME` — active project's value.
-///   2. `workspace::NAME` — cross-project fallback.
-///   3. legacy unscoped `NAME` — pre-Phase-7 entries.
-///
-/// Pkg-scoped values (`pkg::<id>::*`) are intentionally NOT dumped —
-/// those resolve at command-handling time inside the kernel where we
-/// know the caller's pkg id, not in the shared sidecar env file.
 fn dump_to_runtime_file_locked<R: Runtime>(
     app: &AppHandle<R>,
-    state: &Arc<Mutex<Option<Stronghold>>>,
+    state: &SharedSecretStoreSlot,
 ) -> Result<PathBuf, String> {
-    // Before any vault work: a failed Stronghold open must not leave the
-    // world-readable legacy copies behind.
     cleanup_legacy_windows_tmp_copies();
+    let pending = env_vault_pending_path(app)?;
+    if pending.exists() {
+        invalidate_env_vault_outputs(app)?;
+    }
     let active_pid = resolve_active_project_blocking(app);
-    with_stronghold(app, state, false, |sh| {
-        let m_legacy = read_manifest(sh)?;
-        let m_v2 = read_manifest_v2(sh)?;
-        let client = sh
-            .get_client(CLIENT_NAME)
-            .map_err(|e| format!("get_client: {e}"))?;
-        let store = client.store();
-
-        // Collect every visible key NAME from the union of:
-        //   - legacy (unscoped) manifest
-        //   - v2 entries whose scope is Workspace or Project(active)
+    let body = match with_store(app, state, |store| {
+        store.probe()?;
         let mut names: BTreeSet<String> = BTreeSet::new();
-        for k in &m_legacy {
-            names.insert(k.clone());
-        }
-        for fqk in &m_v2 {
-            if let Some((scope, key)) = parse_scoped(fqk) {
-                match &scope {
-                    Scope::Workspace => {
-                        names.insert(key);
-                    }
-                    Scope::Project { id } if id == &active_pid => {
-                        names.insert(key);
-                    }
-                    _ => {}
+        for meta in store.list_meta()? {
+            match parse_scoped(&meta.name) {
+                None => {
+                    names.insert(meta.name);
                 }
+                Some((Scope::Workspace, key)) => {
+                    names.insert(key);
+                }
+                Some((Scope::Project { id }, key)) if id == active_pid => {
+                    names.insert(key);
+                }
+                Some((Scope::Project { .. }, _)) | Some((Scope::Pkg { .. }, _)) => {}
             }
         }
 
         let mut body = String::from("# Auto-generated by ikenga-desktop. Do not edit.\n");
         for name in &names {
-            // Cascade: project → workspace → legacy. First hit wins.
+            if !safe_env_name(name) {
+                return Err(StoreError::uncommitted(format!(
+                    "env-vault cannot safely serialize secret name `{name}`"
+                )));
+            }
             let candidates: [String; 3] = [
                 format!("project::{active_pid}::{name}"),
                 format!("workspace::{name}"),
                 name.clone(),
             ];
             let mut value: Option<String> = None;
-            for fqk in &candidates {
-                match store.get(fqk.as_bytes()) {
-                    Ok(Some(b)) => match String::from_utf8(b) {
-                        Ok(v) => {
-                            value = Some(v);
-                            break;
-                        }
-                        Err(_) => continue,
-                    },
-                    _ => continue,
+            for candidate in &candidates {
+                if let Some(found) = store.get(candidate)? {
+                    if !safe_env_value(&found) {
+                        return Err(StoreError::uncommitted(format!(
+                            "env-vault cannot safely serialize secret `{name}`"
+                        )));
+                    }
+                    value = Some(found);
+                    break;
                 }
             }
-            let Some(val) = value else { continue };
+            let Some(value) = value else { continue };
             body.push_str(name);
             body.push('=');
-            body.push_str(&shell_escape(&val));
+            body.push_str(&shell_escape(&value));
             body.push('\n');
         }
 
-        let path = runtime_env_vault_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir runtime: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+        Ok(body)
+    }) {
+        Ok(body) => body,
+        Err(error) => {
+            let invalidation = invalidate_env_vault_outputs(app);
+            return match invalidation {
+                Ok(()) => Err(format!("env-vault publication blocked: {error}")),
+                Err(invalidation) => Err(format!(
+                    "env-vault publication blocked: {error}; output invalidation failed: {invalidation}"
+                )),
+            };
         }
-        std::fs::write(&path, &body).map_err(|e| format!("write runtime: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("chmod runtime: {e}"))?;
-        }
-
-        // Also write the durable copy (`durable_env_path`) so the
-        // mutation-worker daemon can read credentials while the shell is closed
-        // (overnight sends). Failure is non-fatal — the volatile runtime vault
-        // is still the primary path; log and continue.
-        let durable = durable_env_path();
-        if let Some(parent) = durable.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("vault: could not create durable env dir {}: {e}", parent.display());
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
-            }
-        }
-        match std::fs::write(&durable, &body) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) = std::fs::set_permissions(
-                        &durable,
-                        std::fs::Permissions::from_mode(0o600),
-                    ) {
-                        tracing::warn!("vault: chmod durable env {}: {e}", durable.display());
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("vault: could not write durable env {}: {e}", durable.display());
-            }
-        }
-
-        Ok(path)
-    })
+    };
+    clear_env_deny_state(app)?;
+    publish_env_vaults(app, &body)
 }
 
-/// Public entry point used from the Tauri `setup` hook. Pulls the shared
-/// cache out of app state. Setup runs synchronously before the runtime
-/// starts handling commands, so this is fine to call directly without
-/// `spawn_blocking`.
+fn safe_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn safe_env_value(value: &str) -> bool {
+    !value.contains('=') && !value.chars().any(char::is_control)
+}
+
+fn env_vault_pending_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(ENV_VAULT_PENDING_FILENAME))
+        .map_err(|error| format!("app_data_dir: {error}"))
+}
+
+fn env_vault_denied_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(ENV_VAULT_DENIED_FILENAME))
+        .map_err(|error| format!("app_data_dir: {error}"))
+}
+
+fn ensure_private_env_parent(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create env-vault directory {}: {error}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| format!("protect env-vault directory {}: {error}", parent.display()),
+        )?;
+    }
+    Ok(())
+}
+
+fn publish_env_vaults<R: Runtime>(app: &AppHandle<R>, body: &str) -> Result<PathBuf, String> {
+    let runtime = runtime_env_vault_path();
+    let durable = durable_env_path();
+    let pending = env_vault_pending_path(app)?;
+    let denied = env_vault_denied_path(app)?;
+    if denied.exists() {
+        return Err("env-vault publication is denied by durable state".into());
+    }
+    let result = (|| {
+        ensure_private_env_parent(&runtime)?;
+        ensure_private_env_parent(&durable)?;
+        crate::secrets::index::write_atomic(&pending, b"pending")?;
+        crate::secrets::index::write_atomic(&runtime, body.as_bytes())?;
+        crate::secrets::index::write_atomic(&durable, body.as_bytes())?;
+        remove_env_file(&pending)
+    })();
+    match result {
+        Ok(()) => Ok(runtime),
+        Err(error) => {
+            let invalidation = invalidate_env_vault_outputs(app);
+            match invalidation {
+                Ok(()) => Err(format!("env-vault publication failed: {error}")),
+                Err(invalidation) => Err(format!(
+                    "env-vault publication failed: {error}; output invalidation failed: {invalidation}"
+                )),
+            }
+        }
+    }
+}
+
+fn invalidate_env_vault_outputs<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    invalidate_env_paths(
+        &runtime_env_vault_path(),
+        &durable_env_path(),
+        &env_vault_denied_path(app)?,
+        &env_vault_pending_path(app)?,
+    )
+}
+
+fn invalidate_env_paths(
+    runtime: &Path,
+    durable: &Path,
+    denied: &Path,
+    pending: &Path,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = crate::secrets::index::write_atomic(denied, b"denied") {
+        failures.push(format!("write env-vault deny state: {error}"));
+    }
+    for path in [runtime, durable] {
+        if let Err(error) = crate::secrets::index::write_atomic(path, ENV_VAULT_DENIED_BODY) {
+            failures.push(format!("overwrite {}: {error}", path.display()));
+        }
+    }
+    if let Err(error) = remove_env_file(pending) {
+        failures.push(error);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn clear_env_deny_state<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    remove_env_file(&env_vault_denied_path(app)?)
+}
+
+fn remove_env_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
+    }
+}
+
+pub fn invalidate_env_vaults<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    invalidate_env_vault_outputs(app)
+}
+
 pub fn dump_to_runtime_file<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     let lock: State<'_, SecretsLock> = app
         .try_state::<SecretsLock>()
@@ -1453,6 +1228,42 @@ mod tests {
         assert!(victim.join("env").exists());
         assert!(victim.join("env-vault").exists());
         assert!(std::fs::symlink_metadata(&linked_dir).is_ok());
+    }
+
+    #[test]
+    fn env_serialization_rejects_injection_characters() {
+        assert!(safe_env_name("OPENAI_API_KEY"));
+        assert!(!safe_env_name("OPENAI=API_KEY"));
+        assert!(!safe_env_name("OPENAI\nAPI_KEY"));
+        assert!(!safe_env_name("OPENAI.API_KEY"));
+        assert!(safe_env_value("plain-value"));
+        assert!(!safe_env_value("line\nbreak"));
+        assert!(!safe_env_value("carriage\rreturn"));
+        assert!(!safe_env_value("token=override"));
+        assert!(!safe_env_value("bell\u{0007}"));
+    }
+
+    #[test]
+    fn env_invalidation_overwrites_plaintext_and_sets_deny_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let durable = dir.path().join("durable");
+        let denied = dir.path().join("denied");
+        let pending = dir.path().join("pending");
+        std::fs::write(&runtime, "TOKEN=\"secret\"\n").unwrap();
+        std::fs::write(&durable, "TOKEN=\"secret\"\n").unwrap();
+        std::fs::write(&pending, b"pending").unwrap();
+
+        invalidate_env_paths(&runtime, &durable, &denied, &pending).unwrap();
+        assert_eq!(std::fs::read(&runtime).unwrap(), ENV_VAULT_DENIED_BODY);
+        assert_eq!(std::fs::read(&durable).unwrap(), ENV_VAULT_DENIED_BODY);
+        assert!(denied.exists());
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn env_serialization_escapes_quoted_shell_characters() {
+        assert_eq!(shell_escape("a\"b\\c$d`e"), "\"a\\\"b\\\\c\\$d\\`e\"");
     }
 
     #[test]

@@ -25,9 +25,11 @@ pub async fn detect_system(app: tauri::AppHandle) -> Result<SystemReport, String
         .path()
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
-    // build_report does only sync work (no subprocesses). Stay on the
-    // current thread — `spawn_blocking` would be overkill.
-    Ok(system::build_report(dir))
+    let backend_ready = app
+        .try_state::<crate::commands::secrets::SecretsLock>()
+        .map(|lock| lock.probe(&app).is_ok())
+        .unwrap_or(false);
+    Ok(system::build_report(dir, backend_ready))
 }
 
 #[tauri::command]
