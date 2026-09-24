@@ -83,7 +83,13 @@ function enqueueSettingsWrite(
 			}
 		}
 		console.error(`[settings] write failed for ${label}:`, lastError);
-		rollback();
+		const previousSuppress = suppressKv;
+		suppressKv = true;
+		try {
+			rollback();
+		} finally {
+			suppressKv = previousSuppress;
+		}
 	};
 	void enqueueSettingsTask(run).catch(() => {});
 }
