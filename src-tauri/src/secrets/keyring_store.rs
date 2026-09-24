@@ -650,7 +650,7 @@ fn recover_pending(
         let item = item_name(name).map_err(StoreError::uncommitted)?;
         if backend
             .get_authoritative(&item)
-            .map_err(StoreError::uncommitted)?
+            .map_err(|error| StoreError::uncommitted(error.to_string()))?
             .is_none()
         {
             next.remove(name).map_err(StoreError::uncommitted)?;
@@ -661,7 +661,7 @@ fn recover_pending(
         let item = item_name(name).map_err(StoreError::uncommitted)?;
         if backend
             .get_authoritative(&item)
-            .map_err(StoreError::uncommitted)?
+            .map_err(|error| StoreError::uncommitted(error.to_string()))?
             .is_some()
         {
             next.insert(name).map_err(StoreError::uncommitted)?;
@@ -677,7 +677,10 @@ fn recover_pending(
 impl SecretsStore for KeyringStore {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError> {
         let item = item_name(name).map_err(StoreError::uncommitted)?;
-        let value = self.backend.get(&item).map_err(StoreError::uncommitted)?;
+        let value = self
+            .backend
+            .get(&item)
+            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
         value
             .map(|bytes| {
                 String::from_utf8(bytes)
@@ -882,7 +885,7 @@ impl SecretsStore for KeyringStore {
             if self
                 .backend
                 .get_authoritative(&item)
-                .map_err(StoreError::committed)?
+                .map_err(|error| StoreError::committed(error.to_string()))?
                 .is_some()
             {
                 let rollback = self.restore_snapshot(&previous, &affected);
@@ -925,12 +928,15 @@ impl SecretsStore for KeyringStore {
         let item = format!("ikenga:__probe::{}", token.simple());
         self.backend
             .set(&item, token.as_bytes())
-            .map_err(StoreError::uncommitted)?;
+            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
         let read = self
             .backend
             .get_authoritative(&item)
-            .map_err(StoreError::uncommitted);
-        let delete = self.backend.delete(&item).map_err(StoreError::uncommitted);
+            .map_err(|error| StoreError::uncommitted(error.to_string()));
+        let delete = self
+            .backend
+            .delete(&item)
+            .map_err(|error| StoreError::uncommitted(error.to_string()));
         if let Err(error) = delete {
             return Err(error);
         }

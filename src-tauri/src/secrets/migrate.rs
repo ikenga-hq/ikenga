@@ -8,7 +8,7 @@ use tauri_plugin_stronghold::stronghold::Stronghold;
 
 use super::index::{pending_path, write_atomic, INDEX_FILENAME};
 use super::keyring_store::KeyringStore;
-use super::store::{SecretMeta, SecretsStore};
+use super::store::SecretsStore;
 
 const LEGACY_FILENAME: &str = "secrets.stronghold";
 const LEGACY_BACKUP_FILENAME: &str = "secrets.stronghold.bak";
@@ -398,18 +398,14 @@ fn read_legacy(legacy_path: &Path, key_path: &Path) -> Result<BTreeMap<String, S
         .get_client(LEGACY_CLIENT_NAME)
         .map_err(|error| format!("read legacy Stronghold client: {error}"))?;
     let store = client.store();
-    let manifest = read_manifest(
+    let mut manifest_names = read_manifest(
         store
             .get(LEGACY_MANIFEST)
             .map_err(|error| format!("read legacy Stronghold manifest: {error}"))?,
-    );
-    let scoped_manifest = read_manifest(
-        store
-            .get(LEGACY_MANIFEST_V2)
-            .map_err(|error| format!("read legacy Stronghold scoped manifest: {error}"))?,
-    );
-    let mut manifest_names = manifest;
-    manifest_names.extend(scoped_manifest);
+    )?;
+    manifest_names.extend(read_manifest(store.get(LEGACY_MANIFEST_V2).map_err(
+        |error| format!("read legacy Stronghold scoped manifest: {error}"),
+    )?)?);
     let enumerated = store
         .keys()
         .map_err(|error| format!("enumerate legacy Stronghold keys: {error}"))?;
@@ -488,7 +484,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::secrets::store::StoreError;
+    use crate::secrets::store::{SecretMeta, StoreError};
 
     #[derive(Default)]
     struct MemoryStore {
