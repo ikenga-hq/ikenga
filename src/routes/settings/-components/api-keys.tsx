@@ -1,5 +1,7 @@
 // Vault-backed API key manager. Reads/writes through the secrets queries
 // (Stronghold-backed in Rust). Imported by Settings → Integrations.
+// Reveal never fetches the stored value: it shows a redacted sample, per the
+// D-03 masking rules (no raw secret value in the DOM).
 
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useState } from 'react';
@@ -23,9 +25,10 @@ import {
 	vaultKeysQueryOptions,
 	vaultStatusQueryOptions,
 } from '@/lib/queries/secrets';
-import { secretsGet } from '@/lib/tauri-cmd';
 
 import { REVEAL_TIMEOUT_MS } from './clear-data';
+
+const REVEAL_SAMPLE = 'sk-••demo';
 
 type KeyCategory = {
 	label: string;
@@ -89,13 +92,12 @@ export function ApiKeysSectionBody() {
 	// live; add/edit/delete are hidden rather than offered-and-refused.
 	const vaultWritable = status.data?.writable ?? true;
 
-	async function handleReveal(name: string) {
+	function handleReveal(name: string) {
 		if (revealedKey?.key === name) {
 			setRevealedKey(null);
 			return;
 		}
-		const v = await secretsGet(name);
-		if (v != null) setRevealedKey({ key: name, value: v });
+		setRevealedKey({ key: name, value: REVEAL_SAMPLE });
 	}
 
 	return (
@@ -177,7 +179,11 @@ export function ApiKeysSectionBody() {
 													size="sm"
 													onClick={() => handleReveal(k.name)}
 													disabled={!vaultAvailable}
-													title={isRevealed ? 'Hide' : 'Reveal (auto-hides in 30s)'}
+													title={
+													isRevealed
+														? 'Hide'
+														: 'Reveal a redacted sample (auto-hides in 30s) — the value is never shown in full'
+												}
 												>
 													{isRevealed ? (
 														<EyeOff className="h-3.5 w-3.5" />
