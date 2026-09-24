@@ -1,19 +1,13 @@
 import {
 	Bot,
-	DatabaseZap,
 	FolderKanban,
-	Grid3x3,
 	HardDrive,
 	Info,
 	KeyRound,
-	LayoutGrid,
-	Package,
 	Palette,
+	People,
 	Plug,
-	ShieldAlert,
-	Sparkles,
-	Stethoscope,
-	Terminal,
+	SlidersHorizontal,
 	type LucideIcon,
 } from 'lucide-react';
 
@@ -25,8 +19,6 @@ interface NavItem {
 	to: string;
 	label: string;
 	Icon: LucideIcon;
-	/** Shown when the entry leaves Settings (e.g. "Ngwa"). */
-	badge?: string;
 }
 
 interface NavSection {
@@ -34,49 +26,33 @@ interface NavSection {
 	items: NavItem[];
 }
 
+// WP-35: mirrors the D-03 nine-section settings shell. The retired per-page
+// routes (activity-bar, agent, terminal, artifact-grid, backup, onboarding,
+// packages, pkg-audit, pkg-health, data-health) redirect from the router.
 const NAV: NavSection[] = [
 	{
 		label: 'Workspace',
 		items: [
 			{ to: '/settings/appearance', label: 'Appearance', Icon: Palette },
 			{ to: '/settings/projects', label: 'Projects', Icon: FolderKanban },
-			{ to: '/settings/activity-bar', label: 'Activity bar', Icon: LayoutGrid },
-			{ to: '/settings/artifact-grid', label: 'Artifact grid', Icon: Grid3x3 },
-			{ to: '/settings/agent', label: 'Agent', Icon: Bot },
-			{ to: '/settings/terminal', label: 'Terminal', Icon: Terminal },
-			{ to: '/settings/packages', label: 'Packages', Icon: Package },
-			// WP-16a: these three moved to Ngwa → Health. Linked there directly and
-			// badged "Ngwa" so the jump out of Settings is announced, not a bounce.
-			{
-				to: '/ngwa/health?section=violations',
-				label: 'Pkg violations',
-				Icon: ShieldAlert,
-				badge: 'Ngwa',
-			},
-			{
-				to: '/ngwa/health?section=violations',
-				label: 'Pkg health',
-				Icon: Stethoscope,
-				badge: 'Ngwa',
-			},
-			{ to: '/ngwa/health?section=data', label: 'Data health', Icon: DatabaseZap, badge: 'Ngwa' },
-			{ to: '/settings/onboarding', label: 'Onboarding', Icon: Sparkles },
+			{ to: '/settings/engines', label: 'Chi & engines', Icon: Bot },
+			{ to: '/settings/workspace', label: 'Workspace', Icon: SlidersHorizontal },
 		],
 	},
 	{
-		label: 'Integrations',
+		label: 'Access',
 		items: [
-			{ to: '/settings/integrations', label: 'Integrations', Icon: Plug },
 			{ to: '/settings/secrets', label: 'Secrets', Icon: KeyRound },
+			{ to: '/settings/integrations', label: 'Integrations', Icon: Plug },
+			{ to: '/settings/people', label: 'People & devices', Icon: People },
 		],
 	},
 	{
-		label: 'Storage',
-		items: [{ to: '/settings/storage', label: 'Storage', Icon: HardDrive }],
-	},
-	{
-		label: 'Other',
-		items: [{ to: '/settings/about', label: 'About', Icon: Info }],
+		label: 'System',
+		items: [
+			{ to: '/settings/storage', label: 'Storage & backup', Icon: HardDrive },
+			{ to: '/settings/about', label: 'Updates & about', Icon: Info },
+		],
 	},
 ];
 
@@ -93,15 +69,13 @@ export function SettingsMode() {
 		<SidebarNav ariaLabel="Settings navigation">
 			{NAV.map((sec) => (
 				<SidebarNavSection key={sec.label} label={sec.label}>
-					{sec.items.map(({ to, label, Icon, badge }) => {
-						const isActive =
-							!badge && (activePath === to || activePath?.startsWith(`${to}/`) === true);
+					{sec.items.map(({ to, label, Icon }) => {
+						const isActive = activePath === to || activePath?.startsWith(`${to}/`) === true;
 						return (
 							<SidebarNavRow
-								key={`${to}:${label}`}
+								key={to}
 								icon={Icon}
 								label={label}
-								badge={badge}
 								active={isActive}
 								onSelect={() => navigateFocused(to)}
 							/>

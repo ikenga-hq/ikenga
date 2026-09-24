@@ -67,15 +67,18 @@ import { Route as SettingsAppearanceRouteImport } from './routes/settings/appear
 import { Route as SettingsArtifactGridRouteImport } from './routes/settings/artifact-grid'
 import { Route as SettingsBackupRouteImport } from './routes/settings/backup'
 import { Route as SettingsDataHealthRouteImport } from './routes/settings/data-health'
+import { Route as SettingsEnginesRouteImport } from './routes/settings/engines'
 import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
 import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
 import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
+import { Route as SettingsPeopleRouteImport } from './routes/settings/people'
 import { Route as SettingsPkgAuditRouteImport } from './routes/settings/pkg-audit'
 import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-health'
 import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
 import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
 import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
 import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
+import { Route as SettingsWorkspaceRouteImport } from './routes/settings/workspace'
 import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
 import { Route as NgwaItemItemIdRouteImport } from './routes/ngwa/item.$itemId'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
@@ -371,6 +374,11 @@ const SettingsDataHealthRoute = SettingsDataHealthRouteImport.update({
   path: '/data-health',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsEnginesRoute = SettingsEnginesRouteImport.update({
+  id: '/engines',
+  path: '/engines',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const SettingsIntegrationsRoute = SettingsIntegrationsRouteImport.update({
   id: '/integrations',
   path: '/integrations',
@@ -384,6 +392,11 @@ const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
 const SettingsPackagesRoute = SettingsPackagesRouteImport.update({
   id: '/packages',
   path: '/packages',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsPeopleRoute = SettingsPeopleRouteImport.update({
+  id: '/people',
+  path: '/people',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const SettingsPkgAuditRoute = SettingsPkgAuditRouteImport.update({
@@ -414,6 +427,11 @@ const SettingsStorageRoute = SettingsStorageRouteImport.update({
 const SettingsTerminalRoute = SettingsTerminalRouteImport.update({
   id: '/terminal',
   path: '/terminal',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsWorkspaceRoute = SettingsWorkspaceRouteImport.update({
+  id: '/workspace',
+  path: '/workspace',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
@@ -491,15 +509,18 @@ export interface FileRoutesByFullPath {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi/': typeof ChiIndexRoute
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
@@ -561,15 +582,18 @@ export interface FileRoutesByTo {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi': typeof ChiIndexRoute
   '/ngwa': typeof NgwaIndexRoute
   '/onboarding': typeof OnboardingIndexRoute
@@ -635,15 +659,18 @@ export interface FileRoutesById {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi/': typeof ChiIndexRoute
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
@@ -710,15 +737,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi/'
     | '/ngwa/'
     | '/onboarding/'
@@ -780,15 +810,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi'
     | '/ngwa'
     | '/onboarding'
@@ -853,15 +886,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi/'
     | '/ngwa/'
     | '/onboarding/'
@@ -1322,6 +1358,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsDataHealthRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/engines': {
+      id: '/settings/engines'
+      path: '/engines'
+      fullPath: '/settings/engines'
+      preLoaderRoute: typeof SettingsEnginesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/settings/integrations': {
       id: '/settings/integrations'
       path: '/integrations'
@@ -1341,6 +1384,13 @@ declare module '@tanstack/react-router' {
       path: '/packages'
       fullPath: '/settings/packages'
       preLoaderRoute: typeof SettingsPackagesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/people': {
+      id: '/settings/people'
+      path: '/people'
+      fullPath: '/settings/people'
+      preLoaderRoute: typeof SettingsPeopleRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
     '/settings/pkg-audit': {
@@ -1383,6 +1433,13 @@ declare module '@tanstack/react-router' {
       path: '/terminal'
       fullPath: '/settings/terminal'
       preLoaderRoute: typeof SettingsTerminalRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/workspace': {
+      id: '/settings/workspace'
+      path: '/workspace'
+      fullPath: '/settings/workspace'
+      preLoaderRoute: typeof SettingsWorkspaceRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
     '/artifacts/by-kind/$kind': {
@@ -1472,15 +1529,18 @@ interface SettingsRouteRouteChildren {
   SettingsArtifactGridRoute: typeof SettingsArtifactGridRoute
   SettingsBackupRoute: typeof SettingsBackupRoute
   SettingsDataHealthRoute: typeof SettingsDataHealthRoute
+  SettingsEnginesRoute: typeof SettingsEnginesRoute
   SettingsIntegrationsRoute: typeof SettingsIntegrationsRoute
   SettingsOnboardingRoute: typeof SettingsOnboardingRoute
   SettingsPackagesRoute: typeof SettingsPackagesRoute
+  SettingsPeopleRoute: typeof SettingsPeopleRoute
   SettingsPkgAuditRoute: typeof SettingsPkgAuditRoute
   SettingsPkgHealthRoute: typeof SettingsPkgHealthRoute
   SettingsProjectsRoute: typeof SettingsProjectsRoute
   SettingsSecretsRoute: typeof SettingsSecretsRoute
   SettingsStorageRoute: typeof SettingsStorageRoute
   SettingsTerminalRoute: typeof SettingsTerminalRoute
+  SettingsWorkspaceRoute: typeof SettingsWorkspaceRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
@@ -1492,15 +1552,18 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsArtifactGridRoute: SettingsArtifactGridRoute,
   SettingsBackupRoute: SettingsBackupRoute,
   SettingsDataHealthRoute: SettingsDataHealthRoute,
+  SettingsEnginesRoute: SettingsEnginesRoute,
   SettingsIntegrationsRoute: SettingsIntegrationsRoute,
   SettingsOnboardingRoute: SettingsOnboardingRoute,
   SettingsPackagesRoute: SettingsPackagesRoute,
+  SettingsPeopleRoute: SettingsPeopleRoute,
   SettingsPkgAuditRoute: SettingsPkgAuditRoute,
   SettingsPkgHealthRoute: SettingsPkgHealthRoute,
   SettingsProjectsRoute: SettingsProjectsRoute,
   SettingsSecretsRoute: SettingsSecretsRoute,
   SettingsStorageRoute: SettingsStorageRoute,
   SettingsTerminalRoute: SettingsTerminalRoute,
+  SettingsWorkspaceRoute: SettingsWorkspaceRoute,
   SettingsIndexRoute: SettingsIndexRoute,
 }
 
