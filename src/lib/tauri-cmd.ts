@@ -9,6 +9,11 @@
 // later phases just fill in the Rust side.
 
 import type { NgwaSnapshot, WindowDescriptor } from '@ikenga/contract';
+import type {
+	SettingsFileResult,
+	SettingsScope,
+	SettingsWriteOptions,
+} from '@/lib/settings/types';
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
@@ -441,6 +446,38 @@ export async function settingsGetAll(): Promise<Record<string, string>> {
 
 export async function settingsClearAll(): Promise<void> {
 	return invoke('settings_clear_all');
+}
+
+export async function settingsReadFile(
+	scope: SettingsScope = 'project',
+	projectId?: string | null,
+): Promise<SettingsFileResult> {
+	return invoke<SettingsFileResult>('settings_read_file', {
+		scope,
+		projectId: projectId ?? null,
+	});
+}
+
+export async function settingsWriteField(
+	options: SettingsWriteOptions,
+): Promise<SettingsFileResult> {
+	return invoke<SettingsFileResult>('settings_write_field', {
+		scope: options.scope,
+		field: options.field,
+		value: options.value,
+		remove: options.remove ?? false,
+		projectId: options.projectId ?? null,
+	});
+}
+
+export async function settingsOpenFile(
+	scope: SettingsScope,
+	projectId?: string | null,
+): Promise<string> {
+	return invoke<string>('settings_open_file', {
+		scope,
+		projectId: projectId ?? null,
+	});
 }
 
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
