@@ -1521,7 +1521,8 @@ export const useShellStore = create<ShellState>()(
 					}
 					await useIkengaStore.getState().hydrateAppearanceFromRust().catch(() => {});
 				}),
-		// Bump version when ActivityMode union or persisted shape changes.
+			}),
+				// Bump version when ActivityMode union or persisted shape changes.
 		// v5: mail/outbox/studio promoted to CoreMode (then v7 narrowed).
 		// v6: added claudeProjectRoots / claudeWatchEnabled.
 		// v7: strip-down — CoreMode narrowed to {app, files, sessions, settings};

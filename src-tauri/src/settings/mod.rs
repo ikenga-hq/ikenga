@@ -844,7 +844,7 @@ impl SettingsManager {
                     );
                 }
             },
-        );
+        ).map_err(|error| format!("create settings watcher: {error}"))?;
         let watch_result = debouncer
             .watcher()
             .watch(&watch_dir, notify::RecursiveMode::NonRecursive);
