@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use agent_client_protocol::schema::{ContentBlock, PromptResponse, SessionUpdate, StopReason};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -25,6 +26,7 @@ use crate::commands::claude::claude_list_sessions;
 use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
 use crate::engines::codex_pty::parser as codex_parser;
+use crate::engines::{EngineHandle, EngineRegistryState, OpenRouterHttpEngineState};
 #[cfg(windows)]
 use crate::platform::NoConsoleWindow;
 use crate::terminal::multiplexer;
@@ -76,13 +78,27 @@ impl ChiRuntime {
     }
 }
 
-/// Handle to a live Chi child so `chi_cancel` can interrupt it.
+/// Handle to a live Chi run so `chi_cancel` can interrupt it.
 pub struct ChiRunHandle {
-    /// The actual OS child process. Shared with the reader task.
-    pub child: Arc<Mutex<Child>>,
-    /// Set to true by `chi_cancel` before killing the child. The reader task
-    /// uses this to distinguish a manual cancel from a natural exit / failure.
+    /// The actual OS child process. Shared with the reader task. `None` for
+    /// CLI-less engines driven in-process — there is no child to kill, and
+    /// `in_process` is the interrupt instead.
+    pub child: Option<Arc<Mutex<Child>>>,
+    /// Set to true by `chi_cancel`, read (and cleared) by the reader task.
     pub cancelled: Arc<AtomicBool>,
+    /// Cancel hook for in-process engines (no child process to kill).
+    pub in_process: Option<InProcessCancel>,
+}
+
+/// How `chi_cancel` interrupts a run that has no OS child.
+#[derive(Clone)]
+pub enum InProcessCancel {
+    /// The OpenRouter HTTP adapter: `handle_cancel` flags the session and
+    /// triggers the abort signal the streaming read selects on.
+    OpenRouter {
+        engine: OpenRouterHttpEngineState,
+        thread_id: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -104,6 +120,22 @@ pub struct ChiRunOpts {
     /// `chi_cache.terminal_session_id`.
     #[serde(default)]
     pub persistent: bool,
+}
+
+/// Rebuild a run's opts from its cache row for `chi_resume` — only the fields
+/// the resume paths actually read (engine id, prompt, model, mode).
+fn row_into_resume_opts(row: &ChiCacheRow, prompt: String) -> ChiRunOpts {
+    ChiRunOpts {
+        engine_id: row.engine_id.clone(),
+        prompt,
+        cwd: None,
+        model: row.model.clone(),
+        mode: row.mode.clone(),
+        timeout_seconds: None,
+        parent_id: None,
+        resume_session_id: None,
+        persistent: false,
+    }
 }
 
 #[derive(Serialize)]
@@ -639,12 +671,10 @@ fn build_engine_command_with(
         // cursor-agent is scaffolded but not yet runnable through the chi
         // surface. Return a clean error rather than falling through to an
         // unhelpful "command not found" OS error.
-        "cursor-agent" => Err(
-            "cursor-agent runtime not implemented — \
+        "cursor-agent" => Err("cursor-agent runtime not implemented — \
              the cursor-agent CLI does not yet expose a stable non-interactive mode \
              compatible with the chi pipe protocol (ADR-013 Phase 4)"
-                .to_string(),
-        ),
+            .to_string()),
         _ => Err(format!("engine not yet supported by iyke chi: {engine_id}")),
     }
 }
@@ -652,8 +682,15 @@ fn build_engine_command_with(
 /// Spawns the engine child and returns the (child, stdin, stdout, stderr).
 fn spawn_engine_child(
     mut cmd: Command,
-) -> Result<(Child, tokio::process::ChildStdin, tokio::process::ChildStdout, Option<tokio::process::ChildStderr>), String>
-{
+) -> Result<
+    (
+        Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+        Option<tokio::process::ChildStderr>,
+    ),
+    String,
+> {
     let mut child = cmd.spawn().map_err(|e| format!("spawn engine: {e}"))?;
     let stdin = child
         .stdin
@@ -673,6 +710,262 @@ type EngineChild = (
     tokio::process::ChildStdout,
     Option<tokio::process::ChildStderr>,
 );
+
+/// Look up the OpenRouter HTTP adapter in the managed `EngineRegistry`.
+///
+/// `None` means "not drivable from this process": the registry is missing
+/// (headless build) or the handle is not the HTTP adapter. Callers fall
+/// through to the CLI path, whose error explains what the engine id supports.
+async fn openrouter_adapter(app: &AppHandle) -> Option<OpenRouterHttpEngineState> {
+    let registry = app.state::<EngineRegistryState>();
+    match registry
+        .get(crate::engines::openrouter_http::server::OPENROUTER_ENGINE_ID)
+        .await
+    {
+        Some(EngineHandle::OpenRouterHttp(engine)) => Some(engine),
+        _ => None,
+    }
+}
+
+/// Run-start tail shared by `chi_run` (new run) and `chi_resume` (continuing
+/// turn) for the CLI-less engine. Marks the row running, registers the cancel
+/// handle, and spawns the in-process turn task.
+#[allow(clippy::too_many_arguments)]
+async fn openrouter_start_run(
+    db: Arc<PaDb>,
+    runtime: &Arc<ChiRuntime>,
+    run_id: String,
+    output_path: PathBuf,
+    engine: OpenRouterHttpEngineState,
+    thread_id: String,
+    prompt: String,
+    model: Option<String>,
+) -> Result<ChiRunResult, String> {
+    cache_update_status(&db, &run_id, "running", None).await?;
+    // The thread id doubles as the engine-native resume id: history is
+    // process-local, so resume = same thread id while this process lives.
+    cache_update_external_id(&db, &run_id, &thread_id)
+        .await
+        .ok();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    runtime
+        .insert(
+            &run_id,
+            Arc::new(ChiRunHandle {
+                child: None,
+                cancelled: cancelled.clone(),
+                in_process: Some(InProcessCancel::OpenRouter {
+                    engine: engine.clone(),
+                    thread_id: thread_id.clone(),
+                }),
+            }),
+        )
+        .await;
+
+    let run_id_for_task = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        openrouter_one_off_task(
+            db,
+            run_id_for_task,
+            output_path,
+            cancelled,
+            engine,
+            thread_id,
+            prompt,
+            model,
+        )
+        .await;
+    });
+
+    Ok(ChiRunResult {
+        run_id,
+        status: "running".to_string(),
+        output: None,
+        output_truncated: None,
+        error: None,
+    })
+}
+
+/// Shared tail of the CLI-less run paths: attach the app, (re)register the
+/// thread with its cwd, and hand off to `openrouter_start_run`. `run_id` and
+/// `output_path` come from `spawn_chi_run`'s cache bookkeeping; `thread_id`
+/// is `None` for a new run (thread id = run id) and the existing thread id
+/// for a resumed turn.
+async fn openrouter_spawn_run(
+    app: &AppHandle,
+    db: Arc<PaDb>,
+    runtime: &Arc<ChiRuntime>,
+    run_id: String,
+    output_path: PathBuf,
+    opts: &ChiRunOpts,
+    cwd: String,
+    resume_thread_id: Option<String>,
+) -> Result<ChiRunResult, String> {
+    let Some(engine) = openrouter_adapter(app).await else {
+        let msg = format!(
+            "engine '{}' is not registered as the CLI-less HTTP adapter (openrouter)",
+            opts.engine_id
+        );
+        cache_update_done(&db, &run_id, "failed", Some(&msg), false, None)
+            .await
+            .ok();
+        return Err(msg);
+    };
+
+    let thread_id = resume_thread_id.unwrap_or_else(|| run_id.clone());
+    engine.attach_app(app.clone());
+    engine.register_session(thread_id.clone(), cwd).await;
+
+    openrouter_start_run(
+        db,
+        runtime,
+        run_id,
+        output_path,
+        engine,
+        thread_id,
+        opts.prompt.clone(),
+        opts.model.clone(),
+    )
+    .await
+}
+
+/// Partial output shared between the ACP update callback and the turn task.
+/// `flushed` coalesces disk writes: flush at most once per 512 new bytes.
+struct OpenRouterOutputBuffer {
+    text: String,
+    flushed: usize,
+}
+
+/// Pull the visible reply text out of one ACP update. Only
+/// `AgentMessageChunk` text blocks count — thinking and tool-call envelopes
+/// are surfaced to ACP clients but are not the run's output, matching what
+/// the CLI readers accumulate (`TurnState::assistant_text`).
+fn agent_message_delta(update: &SessionUpdate) -> Option<String> {
+    match update {
+        SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Map one finished turn to the chi status pair. `PromptResponse` carries the
+/// adapter's stop reason; a refusal is a completed turn the model declined to
+/// answer, so it closes the run as `failed` with a reason (same treatment the
+/// claude reader gives `stop_reason: "error"`).
+fn openrouter_turn_outcome(result: &Result<PromptResponse, String>) -> (String, Option<String>) {
+    match result {
+        Ok(resp) => match resp.stop_reason {
+            StopReason::Cancelled => ("cancelled".to_string(), None),
+            StopReason::Refusal => (
+                "failed".to_string(),
+                Some("openrouter reported stop_reason refusal".to_string()),
+            ),
+            // EndTurn, MaxTokens, and any future variant are complete turns.
+            _ => ("done".to_string(), None),
+        },
+        Err(e) => ("failed".to_string(), Some(e.clone())),
+    }
+}
+
+/// Background task for a CLI-less engine turn (`openrouter`). No child
+/// process: the adapter streams HTTP SSE in-process and emits ACP updates on
+/// the callback; reply text lands in the same partial-flushed output file the
+/// CLI readers write.
+async fn openrouter_one_off_task(
+    db: Arc<PaDb>,
+    run_id: String,
+    output_path: PathBuf,
+    cancelled: Arc<AtomicBool>,
+    engine: OpenRouterHttpEngineState,
+    thread_id: String,
+    prompt: String,
+    model: Option<String>,
+) {
+    let shared = Arc::new(std::sync::Mutex::new(OpenRouterOutputBuffer {
+        text: String::new(),
+        flushed: 0,
+    }));
+    let cb_shared = shared.clone();
+    let cb_output_path = output_path.clone();
+    let cb = move |update: SessionUpdate| {
+        let Some(delta) = agent_message_delta(&update) else {
+            return;
+        };
+        let should_flush = {
+            let mut buf = cb_shared.lock().expect("output buffer poisoned");
+            buf.text.push_str(&delta);
+            buf.text.len() - buf.flushed >= OPENROUTER_FLUSH_BYTES
+        };
+        if !should_flush {
+            return;
+        }
+        let text = {
+            let mut buf = cb_shared.lock().expect("output buffer poisoned");
+            buf.flushed = buf.text.len();
+            buf.text.clone()
+        };
+        write_output_file_sync(&cb_output_path, &text, None);
+    };
+    let cb_ref: &(dyn Fn(SessionUpdate) + Send + Sync) = &cb;
+
+    let result = engine
+        .run_prompt(&thread_id, &prompt, model.as_deref(), Some(cb_ref))
+        .await;
+
+    let output = {
+        let mut buf = shared.lock().expect("output buffer poisoned");
+        buf.flushed = buf.text.len();
+        std::mem::take(&mut buf.text)
+    };
+
+    // Determine final status. `cancelled` is set by `chi_cancel` before it
+    // calls `handle_cancel`; the adapter's own Cancelled stop reason is the
+    // authoritative signal that the abort landed.
+    let (status, turn_error) = openrouter_turn_outcome(&result);
+    let (status, turn_error) = if cancelled.load(Ordering::SeqCst) && status != "cancelled" {
+        // Cancel raced the natural end: keep the cancel.
+        ("cancelled".to_string(), None)
+    } else {
+        (status, turn_error)
+    };
+
+    let output_truncated = output.len() > 100_000;
+    let file_error = match write_output_file(&output_path, &output, turn_error.as_deref()).await {
+        Ok(()) => turn_error.clone(),
+        Err(e) => Some(format!("write output file: {e}")),
+    };
+
+    cache_update_done(
+        &db,
+        &run_id,
+        &status,
+        file_error.as_deref(),
+        output_truncated,
+        None,
+    )
+    .await
+    .ok();
+}
+
+/// Synchronous sibling of [`write_output_file`] for the ACP update callback,
+/// which runs inside the adapter's streaming loop and cannot await. Best
+/// effort: a failed flush is retried by the next delta or the final write.
+fn write_output_file_sync(path: &Path, output: &str, error: Option<&str>) {
+    let file = RunOutputFile {
+        output: Some(output.to_string()),
+        error: error.map(|s| s.to_string()),
+        done_at: Some(now_iso()),
+    };
+    if let Ok(json) = serde_json::to_string(&file) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Minimum number of new bytes before the callback flushes partial output.
+const OPENROUTER_FLUSH_BYTES: usize = 512;
 
 /// Spawn the engine for a run whose cache row already exists. If building or
 /// spawning fails (engine not installed, bad cwd, …) the row is closed out as
@@ -714,7 +1007,9 @@ async fn claude_one_off_task(
     // Send the initial prompt envelope.
     let envelope = user_envelope(&prompt);
     if let Err(e) = stdin.write_all(envelope.as_bytes()).await {
-        cache_update_status(&db, &run_id, "failed", Some(&format!("stdin write: {e}"))).await.ok();
+        cache_update_status(&db, &run_id, "failed", Some(&format!("stdin write: {e}")))
+            .await
+            .ok();
         return;
     }
     let _ = stdin.flush().await;
@@ -754,14 +1049,22 @@ async fn claude_one_off_task(
                         ChatEvent::SessionInit { session_id, .. } if !session_id.is_empty() => {
                             if external_id.is_none() {
                                 external_id = Some(session_id.clone());
-                                cache_update_external_id(&db, &run_id, &session_id).await.ok();
-                                cache_update_status(&db, &run_id, "running", None).await.ok();
+                                cache_update_external_id(&db, &run_id, &session_id)
+                                    .await
+                                    .ok();
+                                cache_update_status(&db, &run_id, "running", None)
+                                    .await
+                                    .ok();
                             }
                         }
                         ChatEvent::Text { delta, .. } => {
                             output.push_str(&delta);
                         }
-                        ChatEvent::Artifact { path, mime, produced_by } => {
+                        ChatEvent::Artifact {
+                            path,
+                            mime,
+                            produced_by,
+                        } => {
                             artifacts.push(serde_json::json!({
                                 "path": path,
                                 "mime": mime,
@@ -772,9 +1075,7 @@ async fn claude_one_off_task(
                             saw_done = true;
                             stop_reason = s.clone();
                         }
-                        ChatEvent::ControlRequest { subtype, .. }
-                            if subtype == "permission" =>
-                        {
+                        ChatEvent::ControlRequest { subtype, .. } if subtype == "permission" => {
                             cache_update_status(&db, &run_id, "awaiting_auth", None)
                                 .await
                                 .ok();
@@ -819,7 +1120,10 @@ async fn claude_one_off_task(
         )
     };
 
-    let output_truncated = done_output.as_ref().map(|s| s.len() > 100_000).unwrap_or(false);
+    let output_truncated = done_output
+        .as_ref()
+        .map(|s| s.len() > 100_000)
+        .unwrap_or(false);
     let output_json = done_output.as_deref().unwrap_or("");
 
     // Write final output file.
@@ -883,19 +1187,26 @@ async fn antigravity_one_off_task(
             if let Some(event) = val.get("event").and_then(|e| e.as_str()) {
                 match event {
                     "init" => {
-                        if let Some(conv_id) = val.get("conversation_id").and_then(|id| id.as_str()) {
+                        if let Some(conv_id) = val.get("conversation_id").and_then(|id| id.as_str())
+                        {
                             if external_id.is_none() {
                                 external_id = Some(conv_id.to_string());
                                 cache_update_external_id(&db, &run_id, conv_id).await.ok();
-                                cache_update_status(&db, &run_id, "running", None).await.ok();
+                                cache_update_status(&db, &run_id, "running", None)
+                                    .await
+                                    .ok();
                             }
                         }
                     }
                     "step_update" => {
                         if let Some(step_update) = val.get("step_update") {
-                            if let Some(step_type) = step_update.get("step_type").and_then(|t| t.as_str()) {
+                            if let Some(step_type) =
+                                step_update.get("step_type").and_then(|t| t.as_str())
+                            {
                                 if step_type == "agent_response" {
-                                    if let Some(delta) = step_update.get("text_delta").and_then(|d| d.as_str()) {
+                                    if let Some(delta) =
+                                        step_update.get("text_delta").and_then(|d| d.as_str())
+                                    {
                                         output.push_str(delta);
                                     }
                                 }
@@ -939,7 +1250,10 @@ async fn antigravity_one_off_task(
         )
     };
 
-    let output_truncated = done_output.as_ref().map(|s| s.len() > 100_000).unwrap_or(false);
+    let output_truncated = done_output
+        .as_ref()
+        .map(|s| s.len() > 100_000)
+        .unwrap_or(false);
     let output_json = done_output.as_deref().unwrap_or("");
 
     let file_error = if let Err(e) = write_output_file(&output_path, output_json, error).await {
@@ -1025,7 +1339,9 @@ async fn codex_one_off_task(
                 if external_id.is_none() {
                     external_id = Some(thread_id.clone());
                     cache_update_external_id(&db, &run_id, thread_id).await.ok();
-                    cache_update_status(&db, &run_id, "running", None).await.ok();
+                    cache_update_status(&db, &run_id, "running", None)
+                        .await
+                        .ok();
                 }
             }
             codex_parser::ParsedEvent::TurnCompleted { .. } => {
@@ -1071,7 +1387,10 @@ async fn codex_one_off_task(
         )
     };
 
-    let output_truncated = done_output.as_ref().map(|s| s.len() > 100_000).unwrap_or(false);
+    let output_truncated = done_output
+        .as_ref()
+        .map(|s| s.len() > 100_000)
+        .unwrap_or(false);
     let output_json = done_output.as_deref().unwrap_or("");
 
     let file_error = if let Err(e) = write_output_file(&output_path, output_json, error).await {
@@ -1095,11 +1414,7 @@ async fn codex_one_off_task(
     let _ = child.try_wait();
 }
 
-async fn write_output_file(
-    path: &Path,
-    output: &str,
-    error: Option<&str>,
-) -> Result<(), String> {
+async fn write_output_file(path: &Path, output: &str, error: Option<&str>) -> Result<(), String> {
     let file = RunOutputFile {
         output: Some(output.to_string()),
         error: error.map(|s| s.to_string()),
@@ -1123,23 +1438,35 @@ async fn read_output_file(path: &Path) -> Option<RunOutputFile> {
 /// run id immediately.
 #[tauri::command]
 pub async fn chi_run(
-    _app: AppHandle,
+    app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     cache: State<'_, ChiCache>,
     runtime: State<'_, Arc<ChiRuntime>>,
     opts: ChiRunOpts,
 ) -> Result<ChiRunResult, String> {
-    spawn_chi_run(db.inner().clone(), cache.inner(), runtime.inner(), opts, "cli").await
+    spawn_chi_run(
+        db.inner().clone(),
+        cache.inner(),
+        runtime.inner(),
+        Some(&app),
+        opts,
+        "cli",
+    )
+    .await
 }
 
 /// Core of `chi_run`, callable from other commands that need to launch an
 /// agent without going through the Tauri command boundary (e.g.
 /// `comment_route`'s `chi` sink). `owner` tags the cache row so the audit
 /// trail distinguishes a CLI-initiated run from a pin-initiated one.
+///
+/// `app` is `None` only from tests; CLI-less engines (openrouter) need it for
+/// the managed `EngineRegistry` + vault and fail the run cleanly without it.
 pub(crate) async fn spawn_chi_run(
     db: Arc<PaDb>,
     cache: &ChiCache,
     runtime: &Arc<ChiRuntime>,
+    app: Option<&AppHandle>,
     opts: ChiRunOpts,
     owner: &str,
 ) -> Result<ChiRunResult, String> {
@@ -1153,11 +1480,35 @@ pub(crate) async fn spawn_chi_run(
     let cwd = opts
         .cwd
         .clone()
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string()))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| ".".to_string());
     let cwd = shellexpand::full(&cwd)
         .map(|c| c.into_owned())
         .unwrap_or_else(|_| cwd.clone());
+
+    // ── CLI-less (in-process) engine path ────────────────────────────────────
+    // `openrouter` has no CLI to spawn — the adapter IS the HTTP client
+    // (WP-20). Dispatch it in-process through the managed `EngineRegistry`
+    // instead of failing binary resolution; the output file + cache contract
+    // stays identical to the CLI readers. Runs before the tmux path because
+    // `spawn_in_tmux` can only launch binaries.
+    if opts.engine_id == "openrouter" {
+        let Some(app) = app else {
+            let msg = "openrouter chi runs need the desktop app handle (engine registry + \
+                       vault); refusing the run"
+                .to_string();
+            log::warn!(target: "ikenga::chi", "chi run {run_id}: {msg}");
+            cache_update_done(&db, &run_id, "failed", Some(&msg), false, None)
+                .await
+                .ok();
+            return Err(msg);
+        };
+        return openrouter_spawn_run(app, db, runtime, run_id, output_path, &opts, cwd, None).await;
+    }
 
     // ── Persistent (tmux-backed) path ────────────────────────────────────────
     // Try this first so we never spawn a redundant in-process child.
@@ -1175,16 +1526,16 @@ pub(crate) async fn spawn_chi_run(
         };
         match multiplexer::spawn_in_tmux(&conf, &cache.cache_dir()) {
             multiplexer::SpawnResult::Ok { session_name } => {
-                cache_update_status(&db, &run_id, "running", None).await.ok();
-                if let Ok(pool) = db.ensure_pool().await {
-                    sqlx::query(
-                        "UPDATE chi_cache SET terminal_session_id = ? WHERE run_id = ?",
-                    )
-                    .bind(&session_name)
-                    .bind(&run_id)
-                    .execute(&pool)
+                cache_update_status(&db, &run_id, "running", None)
                     .await
                     .ok();
+                if let Ok(pool) = db.ensure_pool().await {
+                    sqlx::query("UPDATE chi_cache SET terminal_session_id = ? WHERE run_id = ?")
+                        .bind(&session_name)
+                        .bind(&run_id)
+                        .execute(&pool)
+                        .await
+                        .ok();
                 }
                 log::info!(
                     target: "ikenga::chi",
@@ -1222,8 +1573,9 @@ pub(crate) async fn spawn_chi_run(
     let child = Arc::new(Mutex::new(child));
     let cancelled = Arc::new(AtomicBool::new(false));
     let handle = Arc::new(ChiRunHandle {
-        child: child.clone(),
+        child: Some(child.clone()),
         cancelled: cancelled.clone(),
+        in_process: None,
     });
     runtime.insert(&run_id, handle).await;
 
@@ -1235,17 +1587,44 @@ pub(crate) async fn spawn_chi_run(
     tauri::async_runtime::spawn(async move {
         if engine_id == "antigravity-cli" {
             antigravity_one_off_task(
-                db, cache, run_id_for_task, output_path, child, cancelled, stdin, stdout, stderr, prompt,
+                db,
+                cache,
+                run_id_for_task,
+                output_path,
+                child,
+                cancelled,
+                stdin,
+                stdout,
+                stderr,
+                prompt,
             )
             .await;
         } else if engine_id == "codex" {
             codex_one_off_task(
-                db, cache, run_id_for_task, output_path, child, cancelled, stdin, stdout, stderr, prompt,
+                db,
+                cache,
+                run_id_for_task,
+                output_path,
+                child,
+                cancelled,
+                stdin,
+                stdout,
+                stderr,
+                prompt,
             )
             .await;
         } else {
             claude_one_off_task(
-                db, cache, run_id_for_task, output_path, child, cancelled, stdin, stdout, stderr, prompt,
+                db,
+                cache,
+                run_id_for_task,
+                output_path,
+                child,
+                cancelled,
+                stdin,
+                stdout,
+                stderr,
+                prompt,
             )
             .await;
         }
@@ -1260,12 +1639,10 @@ pub(crate) async fn spawn_chi_run(
     })
 }
 
-
-
 /// Resume an existing Chi session using its engine-native `external_id`.
 #[tauri::command]
 pub async fn chi_resume(
-    _app: AppHandle,
+    app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     cache: State<'_, ChiCache>,
     runtime: State<'_, Arc<ChiRuntime>>,
@@ -1281,15 +1658,45 @@ pub async fn chi_resume(
     let cache = cache.inner().clone();
     let output_path = PathBuf::from(row.output_path.as_deref().unwrap_or(""));
 
-    let resume_id = row.external_id.ok_or_else(|| {
-        format!("chi run {run_id} has no engine session id to resume against")
-    })?;
+    // ── CLI-less (in-process) engine path ────────────────────────────────────
+    // History is process-local: resume = same thread id while this process
+    // lives. Refuse (rather than run an empty-context turn) when the
+    // transcript is gone — the same honesty rule the adapter enforces over
+    // ACP in `handle_load_session`.
+    if row.engine_id == "openrouter" {
+        let Some(engine) = openrouter_adapter(&app).await else {
+            return Err(
+                "openrouter engine is not registered; restart the shell to resume its runs"
+                    .to_string(),
+            );
+        };
+        let thread_id = row
+            .external_id
+            .clone()
+            .unwrap_or_else(|| row.run_id.clone());
+        if let Err(e) = engine.handle_load_session(thread_id.clone(), None).await {
+            return Err(e);
+        }
+        return openrouter_spawn_run(
+            &app,
+            db,
+            &runtime,
+            run_id,
+            output_path,
+            &row_into_resume_opts(&row, prompt),
+            row.cwd.clone().unwrap_or_else(|| ".".to_string()),
+            Some(thread_id),
+        )
+        .await;
+    }
+
+    let resume_id = row
+        .external_id
+        .ok_or_else(|| format!("chi run {run_id} has no engine session id to resume against"))?;
 
     cache_update_status(&db, &run_id, "running", None).await?;
 
-    let cwd = row
-        .cwd
-        .unwrap_or_else(|| ".".to_string());
+    let cwd = row.cwd.unwrap_or_else(|| ".".to_string());
     let cwd = shellexpand::full(&cwd)
         .map(|c| c.into_owned())
         .unwrap_or_else(|_| cwd.clone());
@@ -1307,8 +1714,9 @@ pub async fn chi_resume(
     let child = Arc::new(Mutex::new(child));
     let cancelled = Arc::new(AtomicBool::new(false));
     let handle = Arc::new(ChiRunHandle {
-        child: child.clone(),
+        child: Some(child.clone()),
         cancelled: cancelled.clone(),
+        in_process: None,
     });
     runtime.insert(&run_id, handle).await;
 
@@ -1384,17 +1792,13 @@ pub async fn chi_status(
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
 
-    let output_path = row
-        .output_path
-        .as_deref()
-        .map(Path::new)
-        .map(|p| {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cache.cache_dir().join(p)
-            }
-        });
+    let output_path = row.output_path.as_deref().map(Path::new).map(|p| {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cache.cache_dir().join(p)
+        }
+    });
     let file = if let Some(path) = output_path {
         read_output_file(&path).await
     } else {
@@ -1432,7 +1836,8 @@ pub async fn chi_list(
                         // Refresh last_seen_at on matching cache rows.
                         for row in rows.iter_mut() {
                             if row.external_id.as_deref() == Some(&s.session_id) {
-                                row.last_seen_at = s.last_message_at.clone().or(Some(s.started_at.clone()));
+                                row.last_seen_at =
+                                    s.last_message_at.clone().or(Some(s.started_at.clone()));
                             }
                         }
                         continue;
@@ -1493,9 +1898,22 @@ pub async fn chi_cancel(
 
     if let Some(handle) = runtime.remove(&run_id).await {
         handle.cancelled.store(true, Ordering::SeqCst);
-        let mut child = handle.child.lock().await;
-        if let Err(e) = child.start_kill() {
-            return Err(format!("kill child: {e}"));
+        match &handle.in_process {
+            // CLI-less engines: interrupt through the adapter itself. The
+            // abort signal breaks the in-flight stream read; `run_prompt`
+            // then reports `Cancelled`.
+            Some(InProcessCancel::OpenRouter { engine, thread_id }) => {
+                if let Err(e) = engine.handle_cancel(thread_id.clone()).await {
+                    return Err(format!("cancel openrouter turn: {e}"));
+                }
+            }
+            None => {}
+        }
+        if let Some(child) = &handle.child {
+            let mut child = child.lock().await;
+            if let Err(e) = child.start_kill() {
+                return Err(format!("kill child: {e}"));
+            }
         }
     }
 
@@ -1577,7 +1995,9 @@ mod tests {
         let cache = ChiCache::new(std::env::temp_dir());
         cache.ensure_cache_dir().unwrap();
         let path = cache.run_output_path("test-run");
-        write_output_file(&path, "partial output", None).await.unwrap();
+        write_output_file(&path, "partial output", None)
+            .await
+            .unwrap();
         let file = read_output_file(&path).await.unwrap();
         assert_eq!(file.output.as_deref(), Some("partial output"));
     }
@@ -1596,14 +2016,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(cmd.as_std().get_program(), "agy");
-        let args: Vec<&str> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
-        assert_eq!(args, vec![
-            "-p", "hello",
-            "--output-format", "stream-json",
-            "--conversation", "conv-123",
-            "--model", "gemini-2.0-flash",
-            "--mode", "plan"
-        ]);
+        let args: Vec<&str> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-p",
+                "hello",
+                "--output-format",
+                "stream-json",
+                "--conversation",
+                "conv-123",
+                "--model",
+                "gemini-2.0-flash",
+                "--mode",
+                "plan"
+            ]
+        );
     }
 
     #[test]
@@ -1620,12 +2052,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(cmd.as_std().get_program(), "opencode");
-        let args: Vec<&str> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
-        assert_eq!(args, vec![
-            "run",
-            "-p", "fix the bug",
-            "--model", "claude-3-7-sonnet",
-        ]);
+        let args: Vec<&str> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["run", "-p", "fix the bug", "--model", "claude-3-7-sonnet",]
+        );
     }
 
     #[test]
@@ -1642,11 +2077,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(cmd.as_std().get_program(), "pi");
-        let args: Vec<&str> = cmd.as_std().get_args().map(|s| s.to_str().unwrap()).collect();
-        assert_eq!(args, vec![
-            "-p", "refactor this file",
-            "--model", "claude-3-7-sonnet",
-        ]);
+        let args: Vec<&str> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-p", "refactor this file", "--model", "claude-3-7-sonnet",]
+        );
     }
 
     /// Stands in for the host PATH and WSL. `native` binaries resolve to a
@@ -1858,7 +2297,7 @@ mod tests {
             resume_session_id: None,
             persistent: false,
         };
-        let err = spawn_chi_run(db.clone(), &cache, &runtime, opts, "cli")
+        let err = spawn_chi_run(db.clone(), &cache, &runtime, None, opts, "cli")
             .await
             .err()
             .expect("cursor-agent must not start");
@@ -1872,5 +2311,98 @@ mod tests {
         assert_eq!(rows[0].status, "failed", "run must not stay queued");
         assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
         assert!(rows[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn chi_run_openrouter_without_app_handle_fails_closed() {
+        let db = Arc::new(test_db().await);
+        let cache =
+            ChiCache::new(std::env::temp_dir().join(format!("chi-test-{}", uuid::Uuid::new_v4())));
+        let runtime = Arc::new(ChiRuntime::new());
+        let opts = ChiRunOpts {
+            engine_id: "openrouter".into(),
+            prompt: "hello".into(),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            model: None,
+            mode: None,
+            timeout_seconds: None,
+            parent_id: None,
+            resume_session_id: None,
+            persistent: false,
+        };
+        let err = spawn_chi_run(db.clone(), &cache, &runtime, None, opts, "cli")
+            .await
+            .err()
+            .expect("openrouter without an app handle must not start");
+        assert!(err.contains("app handle"), "{err}");
+
+        let rows = cache_list(&db, Some("openrouter"), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed", "run must not stay queued");
+        assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+        assert!(rows[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn agent_message_delta_extracts_only_visible_reply_text() {
+        let chunk = |text: &str| {
+            agent_client_protocol::schema::ContentChunk::new(ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new(text.to_string()),
+            ))
+        };
+        assert_eq!(
+            agent_message_delta(&SessionUpdate::AgentMessageChunk(chunk("hello "))),
+            Some("hello ".to_string())
+        );
+        // Thinking and tool-call envelopes are surfaced to ACP clients but are
+        // not run output.
+        assert_eq!(
+            agent_message_delta(&SessionUpdate::AgentThoughtChunk(chunk("hmm"))),
+            None
+        );
+        assert_eq!(
+            agent_message_delta(&SessionUpdate::UserMessageChunk(chunk("user text"))),
+            None
+        );
+    }
+
+    #[test]
+    fn openrouter_turn_outcome_maps_stop_reasons_to_chi_status() {
+        let (status, error) =
+            openrouter_turn_outcome(&Ok(PromptResponse::new(StopReason::EndTurn)));
+        assert_eq!(status, "done");
+        assert!(error.is_none());
+
+        let (status, _) = openrouter_turn_outcome(&Ok(PromptResponse::new(StopReason::MaxTokens)));
+        assert_eq!(status, "done");
+
+        let (status, error) =
+            openrouter_turn_outcome(&Ok(PromptResponse::new(StopReason::Refusal)));
+        assert_eq!(status, "failed");
+        assert_eq!(
+            error.as_deref(),
+            Some("openrouter reported stop_reason refusal")
+        );
+
+        let (status, error) =
+            openrouter_turn_outcome(&Ok(PromptResponse::new(StopReason::Cancelled)));
+        assert_eq!(status, "cancelled");
+        assert!(error.is_none());
+
+        let (status, error) =
+            openrouter_turn_outcome(&Err("openrouter HTTP 429: rate limited".into()));
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("openrouter HTTP 429: rate limited"));
+    }
+
+    #[test]
+    fn partial_output_file_is_valid_run_output() {
+        let path = std::env::temp_dir().join(format!("chi-or-flush-{}.json", uuid::Uuid::new_v4()));
+        write_output_file_sync(&path, "partial", None);
+        let read = std::fs::read_to_string(&path).unwrap();
+        let file: RunOutputFile = serde_json::from_str(&read).unwrap();
+        assert_eq!(file.output.as_deref(), Some("partial"));
+        assert!(file.error.is_none());
+        std::fs::remove_file(path).ok();
     }
 }
