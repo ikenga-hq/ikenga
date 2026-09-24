@@ -15,7 +15,6 @@ const MIGRATION_ARTIFACTS: &[&str] = &[
     "secrets.stronghold.migrated",
     "secrets-migration.json",
     "secrets-migration.rollback.json",
-    "secrets-index.pending.json",
     KEYUTILS_DISABLED_FILENAME,
 ];
 
@@ -648,11 +647,10 @@ fn recover_pending(
     let mut changed = false;
     for name in &pending.deletes {
         let item = item_name(name).map_err(StoreError::uncommitted)?;
-        if backend
+        let authoritative = backend
             .get_authoritative(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()))?
-            .is_none()
-        {
+            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
+        if authoritative.is_none() {
             next.remove(name).map_err(StoreError::uncommitted)?;
             changed = true;
         }
@@ -670,6 +668,7 @@ fn recover_pending(
     }
     if changed {
         next.save().map_err(StoreError::committed)?;
+        *index = next;
     }
     IndexPending::clear(path).map_err(StoreError::committed)
 }
@@ -785,7 +784,19 @@ impl SecretsStore for KeyringStore {
         for name in values.keys() {
             validate_name(name).map_err(StoreError::uncommitted)?;
         }
-        let previous = self.authoritative_snapshot(&index)?;
+        let mut previous = self.authoritative_snapshot(&index)?;
+        for name in values.keys() {
+            if previous.contains_key(name) {
+                continue;
+            }
+            let item = item_name(name).map_err(StoreError::uncommitted)?;
+            let value = self.backend.get_authoritative(&item).map_err(|error| {
+                StoreError::uncommitted(format!(
+                    "read previous keychain value for `{name}`: {error}"
+                ))
+            })?;
+            previous.insert(name.clone(), value);
+        }
         let affected: BTreeSet<String> = values.keys().cloned().collect();
         self.write_pending(&affected, &BTreeSet::new())?;
         for (name, value) in values {
