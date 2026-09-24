@@ -956,7 +956,7 @@ export function migrateShellStore(persisted: unknown, version: number): unknown 
 				projectExtraRoots: rec.projectExtraRoots as Record<string, string[]>,
 				carriedRoots: rec.carriedRoots as string[],
 				explorerSections: rec.explorerSections as ExplorerSectionState[],
-				onboarding: rec.onboarding as SettingsOnboarding,
+				onboarding: rec.onboarding as OnboardingState,
 				appearance: currentAppearance(),
 				fileRoots: Array.isArray(rec.fileRoots) ? rec.fileRoots : undefined,
 				claudeProjectRoots: Array.isArray(rec.claudeProjectRoots)
@@ -1095,12 +1095,7 @@ export const useShellStore = create<ShellState>()(
 				enqueueSettingsWrite(
 					'projects.extraRoots',
 					() =>
-						writeSettingsField({
-							scope: projectCanWriteSettings(project) ? 'project' : 'personal',
-							field: 'projects.extraRoots',
-							value: nextRoots,
-							projectId,
-						}),
+						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project)),
 					() => {
 						const current = get();
 						if (JSON.stringify(current.projectExtraRoots[projectId] ?? []) !== JSON.stringify(nextRoots)) return;

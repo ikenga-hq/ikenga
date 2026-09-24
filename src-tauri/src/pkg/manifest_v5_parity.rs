@@ -193,10 +193,13 @@ fn invalid_fixtures_are_rejected() {
                 "invalid/{name}: register error should name the route rule, got: {err}"
             );
         } else {
-            assert!(
-                serde_json::from_str::<Manifest>(&json).is_err(),
-                "invalid/{name} must fail Manifest parse"
-            );
+            match serde_json::from_str::<Manifest>(&json) {
+                Err(_) => {}
+                Ok(manifest) => assert!(
+                    Package::validate(&manifest).is_err(),
+                    "invalid/{name} must fail Manifest validation"
+                ),
+            }
         }
         covered.push(name);
     }

@@ -837,14 +837,18 @@ fn dynamic_path(key: &str) -> Option<(&'static str, String)> {
 }
 
 fn normalize_legacy_raw(key: &str, raw: &str) -> Option<String> {
-    if matches!(raw, "sidepane" | "both")
+    let unquoted = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(raw);
+    if matches!(unquoted, "sidepane" | "both")
         && (key == "artifact-grid.default-sink"
             || key.starts_with("artifact-grid.folder.")
             || key.starts_with("artifact-studio.sink."))
     {
         return Some("clipboard".to_string());
     }
-    if key == "terminal.agent_env_kind" && raw == "posix" {
+    if key == "terminal.agent_env_kind" && unquoted == "posix" {
         return Some("native".to_string());
     }
     None

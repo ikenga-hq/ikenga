@@ -7,11 +7,8 @@ import {
 } from '@/lib/tauri-cmd';
 import type {
 	SettingsChangeEvent,
-	SettingsDocument,
-	SettingsField,
 	SettingsFileResult,
 	SettingsScope,
-	SettingsWriteEntry,
 	SettingsWriteOptions,
 } from './types';
 
