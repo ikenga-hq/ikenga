@@ -38,6 +38,8 @@ pub mod pty;
 mod runtime;
 pub mod secrets_env;
 pub mod server;
+#[cfg(feature = "desktop")]
+pub mod settings;
 
 // --- Desktop-only ---
 #[cfg(feature = "desktop")]
@@ -53,13 +55,13 @@ mod iyke;
 #[cfg(feature = "desktop")]
 mod pkg_content;
 #[cfg(feature = "desktop")]
+pub mod secrets;
+#[cfg(feature = "desktop")]
 pub mod settings_cascade;
 #[cfg(feature = "desktop")]
 mod terminal;
 #[cfg(feature = "desktop")]
 pub mod transcript;
-#[cfg(feature = "desktop")]
-pub mod vault_key;
 #[cfg(feature = "desktop")]
 mod viewer_server;
 // Multi-window substrate (plans/multi-window): the G-WINDOW-MODEL contract
@@ -125,13 +127,13 @@ use commands::{
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
     secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
     secrets_list_keys_scoped, secrets_set, secrets_set_scoped, secrets_vault_status,
-    set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_set,
-    spike_grant_fs_read, spike_setup_test_file, studio_message_append, studio_message_list,
-    studio_thread_delete, studio_thread_get, studio_thread_get_or_create,
-    studio_thread_list_recent, terminal_detect_shells, window_close, window_list, window_spawn,
-    ChiCache, ChiRuntime, KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState,
-    SidecarsRegistryState, StreamingSidecarManager, StreamingSidecarManagerState,
-    WebviewPanesState,
+    set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_open_file,
+    settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
+    spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
+    studio_thread_get, studio_thread_get_or_create, studio_thread_list_recent,
+    terminal_detect_shells, window_close, window_list, window_spawn, ChiCache, ChiRuntime,
+    KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState, SidecarsRegistryState,
+    StreamingSidecarManager, StreamingSidecarManagerState, WebviewPanesState,
 };
 #[cfg(feature = "desktop")]
 #[cfg(debug_assertions)]
@@ -295,22 +297,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_sql::Builder::default().build())
-        .plugin(
-            tauri_plugin_stronghold::Builder::new(|_password: &str| {
-                // Phase 14: vault key is bootstrapped from the OS keychain.
-                // The plugin's `_password` is ignored — we always pass an
-                // empty string from the Rust side and the keychain is the
-                // single source of truth. If the keychain is unavailable the
-                // callback returns an empty Vec; Stronghold::new will fail
-                // and the secrets_vault_status command surfaces the error to
-                // the UI.
-                vault_key::fetch_or_create().unwrap_or_else(|e| {
-                    log::error!("vault key bootstrap failed: {e}");
-                    Vec::new()
-                })
-            })
-            .build(),
-        )
         .manage(pty_manager.clone())
         .manage(fs_watch_manager)
         .manage(viewer_manager)
@@ -342,6 +328,26 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| format!("app_data_dir: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
+
+            match secrets::migrate::run(&data_dir) {
+                Ok(_) => {}
+                Err(error) => {
+                    if let Err(mark_error) = app
+                        .state::<SecretsLock>()
+                        .mark_unavailable(error.clone())
+                    {
+                        log::error!("[secrets] unavailable state failed: {mark_error}");
+                    }
+                    if let Err(invalidation_error) =
+                        commands::secrets::invalidate_env_vaults(app.handle())
+                    {
+                        log::error!(
+                            "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
+                        );
+                    }
+                    log::error!("[secrets] migration failed: {error}");
+                }
+            }
 
             // User-configurable FS allowlist. Must be installed before the
             // first call to `commands::resolve_allowlisted` (which fs_*,
@@ -384,6 +390,29 @@ pub fn run() {
             let pa_db = Arc::new(PaDb::new(db_path));
             app.manage(pa_db.clone());
 
+            let settings_manager = Arc::new(settings::SettingsManager::new(
+                app.handle().clone(),
+                pa_db.clone(),
+                data_dir.clone(),
+            ));
+            if let Err(e) = tauri::async_runtime::block_on(settings_manager.initialize()) {
+                tracing::warn!("[settings] initialization failed: {e}");
+            }
+            app.manage(settings_manager.clone());
+            {
+                use tauri::Listener;
+                let app_for_settings = app.handle().clone();
+                let manager_for_settings = settings_manager.clone();
+                app_for_settings.listen("projects:active-changed", move |_evt| {
+                    let manager = manager_for_settings.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = manager.refresh_watch().await {
+                            tracing::warn!("[settings] project watcher refresh failed: {e}");
+                        }
+                    });
+                });
+            }
+
             // WP-01 (chi-first agent surface): cache directory + metadata cache.
             app.manage(ChiCache::new(data_dir.clone()));
 
@@ -425,7 +454,17 @@ pub fn run() {
             // synchronously here so the first capture sees the right value.
             let screenshot_cfg: ScreenshotConfigStateRef =
                 Arc::new(ScreenshotConfigState::load(&data_dir));
-            app.manage(screenshot_cfg);
+            app.manage(screenshot_cfg.clone());
+            if let Err(e) = tauri::async_runtime::block_on(
+                commands::screenshot::sync_from_settings(&settings_manager, &screenshot_cfg),
+            ) {
+                tracing::warn!("[settings] screenshot state sync failed: {e:#}");
+            }
+            commands::screenshot::install_settings_listener(
+                app.handle(),
+                settings_manager.clone(),
+                screenshot_cfg,
+            );
 
             log::info!("ikenga app data dir: {}", data_dir.display());
 
@@ -1087,6 +1126,9 @@ pub fn run() {
             settings_set,
             settings_get_all,
             settings_clear_all,
+            settings_read_file,
+            settings_write_field,
+            settings_open_file,
             // projects (phase 0 of projects-first-class plan)
             project_create,
             project_update,

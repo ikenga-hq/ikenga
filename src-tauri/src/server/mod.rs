@@ -293,7 +293,7 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         // racing a fresh migration can leave one of them failing on the
         // `_pa_migrations` primary key. These two files only ever exist in a
         // desktop profile, so their presence is the cheap tell.
-        for probe in ["secrets.stronghold", "pa.db"] {
+        for probe in ["secrets-index.json", "pa.db"] {
             if data_dir.join(probe).exists() {
                 warn!(
                     "--data-dir {} already contains a desktop profile ({probe}). \

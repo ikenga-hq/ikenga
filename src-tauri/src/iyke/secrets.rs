@@ -76,7 +76,7 @@ async fn resolve_scope(
 
 fn get_lock(app: &AppHandle) -> SecretsLock {
     let s = app.state::<SecretsLock>();
-    SecretsLock(s.0.clone())
+    SecretsLock::from_slot(s.0.clone())
 }
 
 #[derive(Deserialize)]
