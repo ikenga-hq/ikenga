@@ -1605,7 +1605,10 @@ useShellStore.subscribe((state, prev) => {
 	}
 });
 
-if (typeof window !== 'undefined') {
+if (
+	typeof window !== 'undefined' &&
+	('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+) {
 	void watchSettings(async () => {
 		await useShellStore.getState().hydrateSettingsFromRust();
 		await useIkengaStore.getState().hydrateAppearanceFromRust();
