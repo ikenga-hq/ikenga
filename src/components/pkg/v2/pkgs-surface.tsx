@@ -11,6 +11,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { Banner } from '@/components/ui/banner';
 import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
+import { OfflineState } from '@/components/states';
 import type { PkgRowV2 } from '@/lib/pkgs/use-derived';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
@@ -229,7 +230,16 @@ export function PkgsSurface({ initialFilter = 'all', initialInstallTab }: PkgsSu
 				{d.isLoading && !d.installed.length && (
 					<FeedbackState variant="loading" fill heading="Loading kernel status…" />
 				)}
-				{!d.isLoading && !visible.length && (
+				{filter === 'store' && d.registryError && (
+					<OfflineState
+						data-state="ngwa-store-offline"
+						fill
+						heading="Registry unreachable"
+						body="Everything installed still runs. Only browsing and installing new packages needs the network."
+						action={{ label: 'Retry', onClick: d.retryRegistry }}
+					/>
+				)}
+				{!(filter === 'store' && d.registryError) && !d.isLoading && !visible.length && (
 					<FeedbackState
 						variant="empty"
 						fill

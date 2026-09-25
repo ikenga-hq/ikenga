@@ -651,6 +651,14 @@ export async function secretsListKeys(): Promise<string[]> {
 	return invoke('secrets_list_keys');
 }
 
+/** Names only, straight from `secrets-index.json` — never the live Stronghold
+ *  store, so it works whether or not the vault is unlocked and never returns
+ *  a value. Used by the restore wizard to say which current keys a vault
+ *  merge would touch without asking the user to unlock the vault first. */
+export async function secretsIndexNames(): Promise<string[]> {
+	return invoke('secrets_index_names');
+}
+
 // ─── Phase 7 — scoped secrets ─────────────────────────────────────────────
 
 /** Vault scope discriminator matching Rust's `commands::secrets::Scope`.
