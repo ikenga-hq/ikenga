@@ -312,14 +312,18 @@ pub async fn post_hook_event(
     }
 
     // WP-40: resolve a terminal's pending `PermissionRequest` row once the
-    // prompt is over — on the `PostToolUse` of the very tool call it asked
-    // about (same `tool_use_id`, else same tool + input; a parallel call
-    // finishing in the same terminal does not count), or on `Stop` /
-    // `SessionEnd`, which Claude cannot reach while a prompt is up. A denied
-    // prompt never gets its `PostToolUse`; the turn's `Stop` resolves it.
-    // No-op when nothing is pending. Spawned, as above.
+    // prompt is over — on the `PostToolUse` / `PostToolUseFailure` of the
+    // very tool call it asked about (same tool + input fingerprint:
+    // `PermissionRequest` carries no `tool_use_id`; a parallel call finishing
+    // in the same terminal does not count), or on `Stop` / `SessionEnd` / the
+    // terminal's next `UserPromptSubmit`, none of which Claude can reach while
+    // a prompt is up. A denied prompt never gets its `PostToolUse`; the
+    // turn's `Stop` (else the next prompt) resolves it. All of these events
+    // are registered in `hook_settings::HOOK_EVENTS`. No-op when nothing is
+    // pending. Spawned, as above.
     let event = payload.hook_event_name.as_deref().unwrap_or("");
-    let resolve_keys = if event == "PostToolUse"
+    let finishes_tool = crate::notifications::producers::finishes_terminal_tool(event);
+    let resolve_keys = if finishes_tool
         || crate::notifications::producers::ends_terminal_permissions(event)
     {
         let keys = crate::notifications::producers::terminal_permission_keys(
@@ -327,7 +331,7 @@ pub async fn post_hook_event(
             payload.session_id.as_deref(),
         );
         match terminal_prompts().lock() {
-            Ok(mut prompts) if event == "PostToolUse" => prompts.tool_finished(
+            Ok(mut prompts) if finishes_tool => prompts.tool_finished(
                 &keys,
                 payload.tool_use_id.as_deref(),
                 payload.tool_name.as_deref(),
@@ -335,7 +339,7 @@ pub async fn post_hook_event(
             ),
             Ok(mut prompts) => prompts.ended(&keys),
             // Poisoned: only an end event may still resolve, blindly.
-            Err(_) if event != "PostToolUse" => keys,
+            Err(_) if !finishes_tool => keys,
             Err(_) => Vec::new(),
         }
     } else {

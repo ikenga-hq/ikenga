@@ -118,11 +118,25 @@ pub fn terminal_permission_key(terminal_id: Option<&str>, session_id: Option<&st
 }
 
 /// Hook events after which **every** pending `PermissionRequest` in a
-/// terminal is over: Claude cannot stop a turn (or end the session) while a
-/// prompt is still waiting. `PostToolUse` is not one of them — it only ends
+/// terminal is over: Claude cannot stop a turn (`Stop`), end the session
+/// (`SessionEnd`), or accept the user's next prompt (`UserPromptSubmit` — the
+/// input box is replaced by the permission dialog while one is up) while a
+/// prompt is still waiting. `UserPromptSubmit` is the backstop for a prompt
+/// the user *denied* in the terminal when the turn's `Stop` never reached us.
+/// `PostToolUse` / `PostToolUseFailure` are not among them — they only end
 /// the prompt for the same tool call ([`TerminalPrompts::tool_finished`]).
+///
+/// Every event here must be registered in `iyke::hook_settings::HOOK_EVENTS`,
+/// or Claude Code never sends it and the branch is dead.
 pub fn ends_terminal_permissions(hook_event_name: &str) -> bool {
-    matches!(hook_event_name, "Stop" | "SessionEnd")
+    matches!(hook_event_name, "Stop" | "SessionEnd" | "UserPromptSubmit")
+}
+
+/// Hook events that report one tool call as done: `PostToolUse` (it ran) and
+/// `PostToolUseFailure` (it was approved but failed). Either ends the
+/// in-terminal prompt that asked about that call.
+pub fn finishes_terminal_tool(hook_event_name: &str) -> bool {
+    matches!(hook_event_name, "PostToolUse" | "PostToolUseFailure")
 }
 
 /// Most prompts remembered per terminal key. Claude shows them one at a
@@ -130,11 +144,18 @@ pub fn ends_terminal_permissions(hook_event_name: &str) -> bool {
 const MAX_PROMPTS_PER_TERMINAL: usize = 32;
 
 /// One in-terminal `PermissionRequest` still waiting for its tool call.
+///
+/// Claude Code's `PermissionRequest` hook payload carries **no**
+/// `tool_use_id` (only `tool_name`, `tool_input` and the permission
+/// suggestions), so in practice the match against `PostToolUse` /
+/// `PostToolUseFailure` goes through `fingerprint`. The id comparison is kept
+/// for a payload that does carry one; it is never required.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingPrompt {
     tool_use_id: Option<String>,
-    /// `tool_name` + 16 hex of sha256(`tool_input`), the fallback identity
-    /// when either hook payload lacks a `tool_use_id`.
+    /// `tool_name` + 16 hex of sha256(`tool_input`), the identity used
+    /// whenever either hook payload lacks a `tool_use_id` (always, for
+    /// `PermissionRequest` today).
     fingerprint: String,
 }
 
@@ -162,7 +183,10 @@ impl PendingPrompt {
 /// can finish while a prompt is still up — so a `PostToolUse` resolves the
 /// row only when it is the tool call a pending prompt asked about (same
 /// `tool_use_id`, else same tool name + input) and no other prompt on that
-/// key is left. `Stop` / `SessionEnd` clear the key outright.
+/// key is left. `PostToolUseFailure` counts the same. `Stop` / `SessionEnd` /
+/// the terminal's next `UserPromptSubmit` clear the key outright
+/// ([`ends_terminal_permissions`]) — the only way a prompt *denied* in the
+/// terminal (which never gets a `PostToolUse`) is resolved.
 ///
 /// Pure bookkeeping (the hooks bus holds one behind a mutex); every method
 /// returns the row keys that should now be resolved.
@@ -187,7 +211,7 @@ impl TerminalPrompts {
         list.push(PendingPrompt::new(tool_use_id, tool_name, tool_input));
     }
 
-    /// A `PostToolUse` hook arrived. `keys` are the row keys it could belong
+    /// A `PostToolUse` / `PostToolUseFailure` hook arrived. `keys` are the row keys it could belong
     /// to (terminal-scoped, then session-scoped). Drops the first matching
     /// pending prompt; returns the key when that left it empty.
     pub fn tool_finished(
@@ -215,7 +239,7 @@ impl TerminalPrompts {
         Vec::new()
     }
 
-    /// `Stop` / `SessionEnd`: every prompt on these keys is over. Returns all
+    /// `Stop` / `SessionEnd` / `UserPromptSubmit`: every prompt on these keys is over. Returns all
     /// of `keys` — the row may predate this tracker (app restart), so resolve
     /// it whether or not anything was remembered.
     pub fn ended(&mut self, keys: &[String]) -> Vec<String> {
@@ -754,6 +778,59 @@ mod tests {
         assert!(prompts.tool_finished(&keys, Some("a"), Some("Bash"), None).is_empty());
         // After a restart nothing is remembered; Stop still resolves the row.
         assert_eq!(TerminalPrompts::default().ended(&keys), keys);
+    }
+
+    #[test]
+    fn end_events_cover_a_prompt_denied_in_the_terminal() {
+        // A denied prompt never gets `PostToolUse`; each of these must end it.
+        for event in ["Stop", "SessionEnd", "UserPromptSubmit"] {
+            assert!(ends_terminal_permissions(event), "{event} must end prompts");
+        }
+        for event in ["PostToolUse", "PostToolUseFailure", "PreToolUse", "Notification"] {
+            assert!(!ends_terminal_permissions(event), "{event} must not end every prompt");
+        }
+        assert!(finishes_terminal_tool("PostToolUse"));
+        assert!(finishes_terminal_tool("PostToolUseFailure"));
+        assert!(!finishes_terminal_tool("Stop"));
+    }
+
+    #[test]
+    fn denied_prompt_resolves_on_the_next_user_prompt() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), Some("s1"));
+        // PermissionRequest carries no tool_use_id.
+        prompts.requested(
+            &keys[0],
+            None,
+            Some("Bash"),
+            Some(&json!({ "command": "rm -rf build" })),
+        );
+        // Denied: no PostToolUse ever arrives. The next UserPromptSubmit ends it.
+        assert!(ends_terminal_permissions("UserPromptSubmit"));
+        assert_eq!(prompts.ended(&keys), keys);
+        assert!(prompts
+            .tool_finished(
+                &keys,
+                Some("toolu_late"),
+                Some("Bash"),
+                Some(&json!({ "command": "rm -rf build" })),
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn approved_but_failed_tool_resolves_via_post_tool_use_failure_fingerprint() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), None);
+        let input = json!({ "command": "cargo publish" });
+        prompts.requested(&keys[0], None, Some("Bash"), Some(&input));
+        // PostToolUseFailure carries a tool_use_id, the request did not:
+        // the tool_name + input fingerprint is what matches.
+        assert!(finishes_terminal_tool("PostToolUseFailure"));
+        assert_eq!(
+            prompts.tool_finished(&keys, Some("toolu_fail"), Some("Bash"), Some(&input)),
+            vec![keys[0].clone()]
+        );
     }
 
     #[test]
