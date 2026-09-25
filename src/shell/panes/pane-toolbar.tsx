@@ -14,6 +14,7 @@ import { findLeaf } from '@/lib/panes/pane-reducer';
 import { hasAddressBar } from '@/lib/panes/pane-address';
 import { IconButton } from '@/components/ui/icon-button';
 import { useWebviewRoute } from './pane-views';
+import { PkgPaneMenuItems, usePkgIdForPane } from './pkg-pane-menu';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -101,6 +102,9 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 	const splitTitle = splitDisabled ? 'Max 6 panes' : undefined;
 	const closeDisabled = leafCount <= 1;
 	const canCopyPath = Boolean(activeTab && hasAddressBar(activeTab));
+	// WP-45: pkg views get the D-08 `pkg-view` menu branch.
+	const pkgId = usePkgIdForPane(paneId);
+	const reload = () => (onRefresh ? onRefresh() : refreshPane(paneId));
 
 	return (
 		<div
@@ -113,7 +117,7 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 		>
 			<WebviewSessionControl view={activeTab} paneId={paneId} />
 			<IconButton
-				onClick={() => (onRefresh ? onRefresh() : refreshPane(paneId))}
+				onClick={reload}
 				title="Refresh pane content"
 				aria-label="Refresh pane"
 				className={cn(PANE_TOOLS_HOVER, PANE_TOOLS_FOCUS)}
@@ -145,6 +149,8 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 							<DropdownMenuSeparator />
 						</>
 					)}
+					{/* WP-45: the pkg branch leads, per the design's pkgDotsMenu() order. */}
+					{pkgId && <PkgPaneMenuItems paneId={paneId} pkgId={pkgId} onReload={reload} />}
 					<DropdownMenuItem
 						disabled={splitDisabled}
 						title={splitTitle}

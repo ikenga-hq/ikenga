@@ -120,7 +120,7 @@ use commands::{
     pkg_scaffold, pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
     pkg_sidecar_call, pkg_sidecar_rpc_send, pkg_sidecar_rpc_shutdown,
     pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_clear_session,
-    pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
+    pkg_webview_allow_origin, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
@@ -1258,6 +1258,7 @@ pub fn run() {
             spike_setup_test_file,
             // pkg-browser child webviews
             pkg_webview_create,
+            pkg_webview_allow_origin,
             pkg_webview_destroy,
             pkg_webview_navigate,
             pkg_webview_set_rect,
