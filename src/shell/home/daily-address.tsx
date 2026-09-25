@@ -10,8 +10,10 @@
 //
 //   tile          | source                                    | real API
 //   --------------|-------------------------------------------|---------------------------------
-//   runs          | cached Chi runs + Claude session history   | chiList() (chi.rs `chi_list`)
-//   permissions   | WP-40 notifications, kind=permission       | notificationsListQueryOptions()
+//   runs          | cached Chi runs whose cwd is under the     | chiList() (chi.rs `chi_list`),
+//                 | active project's root                      | filtered client-side
+//   permissions   | WP-40 notifications, kind=permission,      | notificationsListQueryOptions()
+//                 | still unresolved (`resolvedAt == null`)    | + isNotificationResolved()
 //   updates       | WP-40 notifications, kind=update           | notificationsListQueryOptions()
 //                 | + live updater state                       | useUpdater() / usePkgsDerived()
 //   todos         | native todos table, active project scope   | listTodos() (@/lib/iyke/memory)
@@ -23,36 +25,48 @@
 // (`title-row.tsx`'s `DailyAddressReopenButton`, rendered only while
 // dismissed for today). Persistence: `dailyAddressDismissedOn` on the plain
 // Zustand-persisted half of `shell-store.ts` — see the field's doc comment
-// there for why this uses the shell-store rather than the settings.json
-// client.
+// there for why the per-day dismissal uses the shell-store. Turning the
+// address off altogether is a real setting: `workspace.dailyAddress` in
+// settings.json (Settings › Workspace, `src/lib/settings/daily-address.ts`).
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
 import {
 	Clock,
 	Inbox,
 	ListChecks,
 	RefreshCw,
+	Settings as SettingsIcon,
 	ShieldAlert,
+	Sparkles,
 	X,
 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { type ReactNode, useState } from 'react';
 import { EmptyState, ErrorState, LoadingState } from '@/components/states';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/components/ui/utils';
+import { iykeFetch } from '@/lib/iyke/client';
 import { completeTodo, listTodos, type Todo } from '@/lib/iyke/memory';
+import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs } from '@/lib/pkgs/use-update-pkgs';
 import { queryKeys } from '@/lib/query-keys';
 import {
+	invalidateNotifications,
+	isNotificationResolved,
+	notificationDecision,
 	notificationsListQueryOptions,
 	useMarkAllNotificationsRead,
-	useMarkNotificationsRead,
 } from '@/lib/queries/notifications';
+import { readSettingsFile } from '@/lib/settings/client';
+import { isDailyAddressEnabled } from '@/lib/settings/daily-address';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { chiList, type ChiCacheRow, type NotificationRow } from '@/lib/tauri-cmd';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { useUpdater } from '@/lib/updater/use-updater';
+import { runConsecrationAgain } from '@/shell/onboarding/run-again';
 
 /** Local (not UTC) calendar date, `YYYY-MM-DD`. Deliberately not
  *  `toISOString()` (UTC) — "today" must track the user's own midnight. */
@@ -163,13 +177,61 @@ function isRecentOrActive(row: ChiCacheRow): boolean {
 	return !Number.isNaN(t) && Date.now() - t <= RECENT_WINDOW_MS;
 }
 
-function RunsTile() {
-	const navigateFocused = usePaneStore((s) => s.navigateFocused);
-	const { data, isLoading, isError, refetch } = useQuery({
+/** Forward slashes, no trailing separator — so `C:\a\b` and `/a/b/` compare. */
+function normalizePath(p: string): string {
+	const s = p.replace(/\\/g, '/');
+	return s.length > 1 ? s.replace(/\/+$/, '') : s;
+}
+
+/** `cwd` is the project root or somewhere beneath it (not a sibling that
+ *  merely shares the prefix: `/code/app2` is not under `/code/app`). */
+export function isUnderProjectRoot(cwd: string | null | undefined, root: string): boolean {
+	if (!cwd) return false;
+	const c = normalizePath(cwd);
+	const r = normalizePath(root);
+	return c === r || c.startsWith(r.endsWith('/') ? r : `${r}/`);
+}
+
+/**
+ * The runs the "Since you were last here" tile counts: recent or still
+ * going, and — when a project is active — started in that project (its
+ * `cwd` under the project root). Runs with no recorded `cwd` can't be
+ * attributed and are left out of a project's address. No active project
+ * root = no scope to apply.
+ */
+export function projectRecentRuns(
+	rows: readonly ChiCacheRow[],
+	projectRoot: string | null,
+): ChiCacheRow[] {
+	return rows
+		.filter(isRecentOrActive)
+		.filter((r) => projectRoot == null || isUnderProjectRoot(r.cwd, projectRoot));
+}
+
+/** Enough history that a busy other project doesn't push this one's day out
+ *  of the window before the client-side project filter runs. */
+const RUNS_FETCH_LIMIT = 200;
+
+function useActiveProjectRoot(): string | null {
+	return useShellStore(
+		(s) => s.projects.find((p) => p.id === s.activeProjectId)?.root_path ?? null
+	);
+}
+
+function useProjectRuns() {
+	const projectRoot = useActiveProjectRoot();
+	const query = useQuery({
 		queryKey: queryKeys.dailyAddress.runs(),
-		queryFn: () => chiList(null, 30),
+		queryFn: () => chiList(null, RUNS_FETCH_LIMIT),
 		staleTime: 30_000,
 	});
+	const runs = query.data ? projectRecentRuns(query.data, projectRoot) : undefined;
+	return { ...query, runs };
+}
+
+function RunsTile() {
+	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	const { runs, isLoading, isError, refetch } = useProjectRuns();
 
 	if (isLoading) {
 		return <LoadingState data-state="daily-address-runs-loading" heading="Checking recent runs…" />;
@@ -184,7 +246,8 @@ function RunsTile() {
 		);
 	}
 
-	const recent = (data ?? []).filter(isRecentOrActive).slice(0, 6);
+	const all = runs ?? [];
+	const recent = all.slice(0, 6);
 	if (recent.length === 0) {
 		return (
 			<EmptyState
@@ -202,7 +265,7 @@ function RunsTile() {
 	return (
 		<Tile
 			title="Since you were last here"
-			count={`${recent.length} run${recent.length === 1 ? '' : 's'}`}
+			count={`${all.length} run${all.length === 1 ? '' : 's'}`}
 			footer={
 				<button
 					type="button"
@@ -226,13 +289,101 @@ function RunsTile() {
 }
 
 // ─── waiting on you (permissions) ──────────────────────────────────────────
+//
+// "Waiting on you" = permission rows whose ask is not over yet
+// (`resolvedAt == null`, WP-40) — independent of read state: a pending ask
+// the user glanced at in the bell is still waiting. The mock
+// (designs/onboarding.html `renderDash`) answers inline; here that is done
+// as far as the row's action allows:
+//   - `permission.decide` (the held hooks gate): Allow once / Deny, posted to
+//     `/iyke/hooks/decision` like the permission inbox. The mock's "Always
+//     for this project" has no backend path for a gate answer, so it is not
+//     offered.
+//   - `open.terminal` / `open.thread` (Claude Code's own terminal prompt, ACP
+//     asks): answered where they were asked — Open goes there.
+// Opening never marks the row read; the row leaves this tile when the ask
+// resolves, not when it is looked at.
+
+/** Enough rows that a burst of resolved asks doesn't hide a pending one. */
+const PERMISSIONS_FETCH_LIMIT = 50;
+
+export function pendingPermissions(rows: readonly NotificationRow[]): NotificationRow[] {
+	return rows.filter((row) => row.kind === 'permission' && !isNotificationResolved(row));
+}
+
+function usePendingPermissions() {
+	const query = useQuery(
+		notificationsListQueryOptions({ kinds: ['permission'], limit: PERMISSIONS_FETCH_LIMIT })
+	);
+	const pending = query.data ? pendingPermissions(query.data) : undefined;
+	return { ...query, pending };
+}
+
+function openTerminalPane(sessionId: string): void {
+	const { focusedId, addTab } = usePaneStore.getState();
+	addTab(focusedId, { kind: 'terminal', sessionId });
+}
+
+function postHookDecision(requestId: string, decision: 'approved' | 'denied'): Promise<unknown> {
+	return iykeFetch('/iyke/hooks/decision', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ requestId, decision }),
+	}).catch(() => {});
+}
+
+function PermissionActions({ row, onDecided }: { row: NotificationRow; onDecided: () => void }) {
+	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	const decision = notificationDecision(row);
+
+	if (decision) {
+		const decide = async (d: 'approved' | 'denied') => {
+			if (d === 'denied') {
+				const ok = await confirmDialog(
+					'Claude will get a refusal for this tool call and continue. It may ask again. Denying does not stop the session.',
+					{ title: 'Deny this request?', kind: 'warning', okLabel: 'Deny' }
+				);
+				if (!ok) return;
+			}
+			await postHookDecision(decision.requestId, d);
+			onDecided();
+		};
+		return (
+			<span className="mr-1 flex shrink-0 items-center gap-1">
+				<Button type="button" size="sm" onClick={() => void decide('approved')}>
+					Allow once
+				</Button>
+				<Button type="button" size="sm" variant="outline" onClick={() => void decide('denied')}>
+					Deny
+				</Button>
+			</span>
+		);
+	}
+
+	const action = asKnownNotificationAction(row.action);
+	const open = () => {
+		if (action?.kind === 'open.terminal') {
+			const id = action.terminalId ?? action.sessionId;
+			if (id) return openTerminalPane(id);
+		} else if (action?.kind === 'open.thread' && action.threadId) {
+			return openTerminalPane(action.threadId);
+		}
+		navigateFocused('/chi');
+	};
+	return (
+		<Button type="button" size="sm" variant="outline" className="mr-1" onClick={open}>
+			Open
+		</Button>
+	);
+}
 
 function PermissionsTile() {
 	const navigateFocused = usePaneStore((s) => s.navigateFocused);
-	const markRead = useMarkNotificationsRead();
-	const { data, isLoading, isError, refetch } = useQuery(
-		notificationsListQueryOptions({ kinds: ['permission'], unreadOnly: true, limit: 5 })
-	);
+	const qc = useQueryClient();
+	// Hidden right after a decision so the row doesn't linger until the
+	// backend's resolve round-trips back through `notifications://changed`.
+	const [decided, setDecided] = useState<ReadonlySet<number>>(() => new Set());
+	const { pending, isLoading, isError, refetch } = usePendingPermissions();
 
 	if (isLoading) {
 		return <LoadingState data-state="daily-address-permissions-loading" heading="Checking permissions…" />;
@@ -247,7 +398,7 @@ function PermissionsTile() {
 		);
 	}
 
-	const rows = data ?? [];
+	const rows = (pending ?? []).filter((r) => !decided.has(r.id));
 	if (rows.length === 0) {
 		return (
 			<EmptyState
@@ -262,26 +413,20 @@ function PermissionsTile() {
 
 	return (
 		<Tile title="Waiting on you" count={`${rows.length} permission${rows.length === 1 ? '' : 's'}`}>
-			{rows.map((row: NotificationRow) => (
+			{rows.slice(0, 5).map((row: NotificationRow) => (
 				<Row
 					key={row.id}
 					name={row.title}
 					subtitle={row.body ?? undefined}
 					timestamp={relativeTime(new Date(row.updatedAt).toISOString())}
 					actions={
-						<Button
-							type="button"
-							size="sm"
-							variant="outline"
-							className="mr-1"
-							onClick={(e) => {
-								e.stopPropagation();
-								navigateFocused('/chi');
-								markRead.mutate([row.id]);
+						<PermissionActions
+							row={row}
+							onDecided={() => {
+								setDecided((prev) => new Set(prev).add(row.id));
+								void invalidateNotifications(qc);
 							}}
-						>
-							Open
-						</Button>
+						/>
 					}
 				/>
 			))}
@@ -392,18 +537,24 @@ function UpdatesTile() {
 
 const OPEN_TODO_STATUSES = new Set(['open', 'in_progress', 'blocked']);
 
-function TodosTile() {
-	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+function useProjectTodos() {
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
-	const qc = useQueryClient();
 	const queryKey = queryKeys.dailyAddress.todos(activeProjectId);
-	const { data, isLoading, isError, refetch } = useQuery({
+	const query = useQuery({
 		queryKey,
 		queryFn: async () => {
 			const res = await listTodos({ scope: `project:${activeProjectId}` });
 			return res?.todos ?? [];
 		},
 	});
+	const open = query.data?.filter((t) => OPEN_TODO_STATUSES.has(t.status));
+	return { ...query, queryKey, open };
+}
+
+function TodosTile() {
+	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	const qc = useQueryClient();
+	const { queryKey, open: allOpen, isLoading, isError, refetch } = useProjectTodos();
 	const complete = useMutation({
 		mutationFn: (id: string) => completeTodo(id),
 		onSuccess: () => void qc.invalidateQueries({ queryKey }),
@@ -422,7 +573,8 @@ function TodosTile() {
 		);
 	}
 
-	const open = (data ?? []).filter((t) => OPEN_TODO_STATUSES.has(t.status)).slice(0, 4);
+	const openCount = allOpen?.length ?? 0;
+	const open = (allOpen ?? []).slice(0, 4);
 	if (open.length === 0) {
 		return (
 			<EmptyState
@@ -437,7 +589,7 @@ function TodosTile() {
 	return (
 		<Tile
 			title="Todos"
-			count={`${open.length} open`}
+			count={`${openCount} open`}
 			footer={
 				<button
 					type="button"
@@ -473,14 +625,97 @@ function TodosTile() {
 	);
 }
 
+// ─── greeting ───────────────────────────────────────────────────────────────
+
+export function greetingFor(hour: number): string {
+	if (hour < 12) return 'Good morning';
+	if (hour < 18) return 'Good afternoon';
+	return 'Good evening';
+}
+
+function plural(n: number, one: string, many = `${one}s`): string {
+	return `${n} ${n === 1 ? one : many}`;
+}
+
+/**
+ * The line under the greeting, from whatever has loaded (a part whose source
+ * is still loading or failed is left out rather than guessed). The mock's
+ * "Yesterday your Chi ran four things, one is still going, and four todos
+ * are open." `null` when nothing has loaded yet.
+ */
+export function summarizeDay(parts: {
+	runs?: readonly ChiCacheRow[];
+	pending?: number;
+	openTodos?: number;
+}): string | null {
+	const bits: string[] = [];
+	if (parts.runs) {
+		const active = parts.runs.filter((r) => r.status === 'running' || r.status === 'queued').length;
+		const finished = parts.runs.length - active;
+		if (parts.runs.length === 0) bits.push('no runs since yesterday');
+		else {
+			bits.push(`your Chi ran ${plural(finished, 'thing')} since yesterday`);
+			if (active > 0) bits.push(`${active} ${active === 1 ? 'is' : 'are'} still going`);
+		}
+	}
+	if (parts.pending != null && parts.pending > 0) {
+		bits.push(`${plural(parts.pending, 'permission')} ${parts.pending === 1 ? 'is' : 'are'} waiting on you`);
+	}
+	if (parts.openTodos != null) {
+		bits.push(`${plural(parts.openTodos, 'todo')} ${parts.openTodos === 1 ? 'is' : 'are'} open`);
+	}
+	if (bits.length === 0) return null;
+	const sentence =
+		bits.length === 1 ? bits[0]! : `${bits.slice(0, -1).join(', ')}, and ${bits[bits.length - 1]}`;
+	return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+}
+
+function Greeting() {
+	const userName = useShellStore((s) => s.userName);
+	const { runs } = useProjectRuns();
+	const { pending } = usePendingPermissions();
+	const { open } = useProjectTodos();
+	const summary = summarizeDay({ runs, pending: pending?.length, openTodos: open?.length });
+	const name = userName?.trim();
+	return (
+		<h1 className="flex flex-col gap-0.5 text-base font-semibold text-foreground">
+			<span>
+				{greetingFor(new Date().getHours())}
+				{name ? `, ${name}` : ''}.
+			</span>
+			{summary && (
+				<span data-testid="daily-address-summary" className="text-xs font-normal text-muted-foreground">
+					{summary}
+				</span>
+			)}
+		</h1>
+	);
+}
+
 // ─── the address ────────────────────────────────────────────────────────────
+
+/** Same key the settings shell reads under, so its `settings://changed`
+ *  watcher and its post-write `refresh()` (both invalidate `['settings',
+ *  'file']`) keep this in step. */
+const PERSONAL_SETTINGS_QK = ['settings', 'file', 'personal', null] as const;
 
 export function DailyAddress() {
 	const dismissedOn = useShellStore((s) => s.dailyAddressDismissedOn);
 	const setDismissed = useShellStore((s) => s.setDailyAddressDismissed);
+	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	const navigate = useNavigate();
 	const today = todayLocalDate();
+	const settings = useQuery({
+		queryKey: PERSONAL_SETTINGS_QK,
+		queryFn: () => readSettingsFile({ scope: 'personal', projectId: null }),
+		staleTime: 15_000,
+	});
 
 	if (dismissedOn === today) return null;
+	// Wait for the setting rather than flash an address the user turned off.
+	// A read failure falls back to the default (on).
+	if (settings.isLoading) return null;
+	if (!isDailyAddressEnabled(settings.data?.effective)) return null;
 
 	return (
 		<section
@@ -488,12 +723,12 @@ export function DailyAddress() {
 			aria-label="Daily address"
 			className={cn('mb-4 flex flex-col gap-2 rounded-[var(--radius-md)] border border-border bg-card p-3')}
 		>
-			<div className="flex items-center justify-between px-1">
-				<h2 className="text-sm font-semibold text-foreground">Daily address</h2>
+			<div className="flex items-start justify-between gap-2 px-1">
+				<Greeting />
 				<button
 					type="button"
 					aria-label="Dismiss daily address"
-					className="grid size-11 place-items-center rounded text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring"
+					className="grid size-11 shrink-0 place-items-center rounded text-muted-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:ring-2 focus-visible:ring-ring"
 					onClick={() => setDismissed(today)}
 				>
 					<X aria-hidden className="size-4" />
@@ -507,11 +742,26 @@ export function DailyAddress() {
 			</div>
 			<div className="flex flex-wrap items-center gap-2 px-1 pt-1 text-[11px] text-muted-foreground">
 				<Inbox aria-hidden className="size-3.5" />
-				<span>
-					Assembled at app open, read-only. Turn it off, or change what it counts, in Settings ›
-					Workspace.
-				</span>
+				<span>Assembled at app open, read-only. Turn it off in Settings › Workspace.</span>
 				<span className="flex-1" />
+				<Button
+					type="button"
+					size="sm"
+					variant="outline"
+					onClick={() => navigateFocused('/settings/workspace')}
+				>
+					<SettingsIcon aria-hidden className="mr-1 size-3.5" />
+					Settings › Workspace
+				</Button>
+				<Button
+					type="button"
+					size="sm"
+					variant="outline"
+					onClick={() => void runConsecrationAgain(() => void navigate({ to: '/onboarding' }))}
+				>
+					<Sparkles aria-hidden className="mr-1 size-3.5" />
+					Run consecration again
+				</Button>
 				<span className="font-mono text-[10px] text-muted-foreground/70">
 					iyke go /project/dashboard
 				</span>
