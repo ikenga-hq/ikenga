@@ -318,7 +318,19 @@ export function deriveFromQueries(inputs: DeriveInputs): DerivedPkgs {
 	};
 }
 
-export function usePkgsDerived(): DerivedPkgs {
+/** `usePkgsDerived()`'s return type — `DerivedPkgs` plus the raw registry
+ *  query's error/refetch. Kept off `DerivedPkgs` itself (and off
+ *  `deriveFromQueries`) so the pure-function shape existing fixtures build
+ *  against (`pkgs-surface.test.tsx::makeDerived`) doesn't grow two fields it
+ *  never needed. WP-43 added this pair for the Ngwa Store `offline` state —
+ *  "everything installed still runs, only browsing/installing needs the
+ *  network" is exactly what a registry-only error means here. */
+export interface UsePkgsDerivedResult extends DerivedPkgs {
+	registryError: Error | null;
+	retryRegistry: () => void;
+}
+
+export function usePkgsDerived(): UsePkgsDerivedResult {
 	const status = useQuery({
 		queryKey: ['pkg', 'kernel-status'],
 		queryFn: pkgKernelStatus,
@@ -359,7 +371,7 @@ export function usePkgsDerived(): DerivedPkgs {
 
 	const registry = useRegistryIndex();
 
-	return useMemo<DerivedPkgs>(
+	const derived = useMemo<DerivedPkgs>(
 		() =>
 			deriveFromQueries({
 				statusData: status.data,
@@ -386,4 +398,10 @@ export function usePkgsDerived(): DerivedPkgs {
 			registry.data,
 		]
 	);
+
+	return {
+		...derived,
+		registryError: (registry.error as Error | null) ?? null,
+		retryRegistry: () => void registry.refetch(),
+	};
 }
