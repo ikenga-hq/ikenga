@@ -33,6 +33,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -47,6 +48,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -3130,6 +3132,7 @@ dependencies = [
 name = "ikenga-desktop"
 version = "0.12.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "age",
  "agent-client-protocol",
