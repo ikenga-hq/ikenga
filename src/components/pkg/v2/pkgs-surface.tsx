@@ -11,7 +11,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { Banner } from '@/components/ui/banner';
 import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
-import { OfflineState } from '@/components/states';
+import { LoadingState, OfflineState } from '@/components/states';
 import type { PkgRowV2 } from '@/lib/pkgs/use-derived';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
@@ -228,7 +228,11 @@ export function PkgsSurface({ initialFilter = 'all', initialInstallTab }: PkgsSu
 					/>
 				)}
 				{d.isLoading && !d.installed.length && (
-					<FeedbackState variant="loading" fill heading="Loading kernel status…" />
+					<LoadingState
+						data-state="ngwa-store-loading"
+						fill
+						heading={filter === 'store' ? 'Fetching the index' : 'Loading kernel status…'}
+					/>
 				)}
 				{filter === 'store' && d.registryError && (
 					<OfflineState

@@ -379,7 +379,14 @@ export function RestoreWizard({ open, onOpenChange, onStaged }: RestoreWizardPro
 							<Button
 								variant="ghost"
 								className="h-11"
-								onClick={() => setStep((s) => Math.max(0, (s - 1)) as Step)}
+								onClick={() =>
+									setStep(
+										(s) =>
+											(s === 2 && !preview?.manifest.has_secrets
+												? 0
+												: Math.max(0, s - 1)) as Step
+									)
+								}
 							>
 								Back
 							</Button>
