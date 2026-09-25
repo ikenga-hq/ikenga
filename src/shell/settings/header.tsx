@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { openSettingsFile, writeSettingsField } from '@/lib/settings/client';
+import { PERSONAL_ONLY_FIELDS } from '@/lib/settings/types';
 import type { SettingsWriteOptions } from '@/lib/settings/types';
 import {
 	type SettingsSectionId,
@@ -19,6 +20,8 @@ import {
 	settingsSection,
 } from '@/shell/settings/nav';
 import { useSettingsSection } from '@/shell/settings/field';
+
+const PERSONAL_ONLY_FIELD_SET = new Set<string>(PERSONAL_ONLY_FIELDS);
 
 export function settingsPathLabel(scope: SettingsScopeId, projectRoot: string | null): string {
 	if (scope === 'personal') return '~/.ikenga/settings.json';
@@ -37,7 +40,25 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 	const pathLabel = settingsPathLabel(scope, projectRoot);
 	const iykeLine = settingsIykeLine(sectionId, scope);
 	const [copied, setCopied] = useState(false);
-	const scopeless = section.fields.length === 0;
+	// Matches handleReset's own skip conditions below, so "Reset section" is
+	// enabled exactly when it would actually change something. Secrets,
+	// Integrations and People's fields are all informational (search-only,
+	// `field: null` — see nav.tsx), so they'd otherwise show an enabled Reset
+	// that silently does nothing.
+	const hasFields = section.fields.some(
+		(meta) => meta.field !== null && meta.field !== 'workspace.onboarding'
+	);
+	// A Personal/Project switch is meaningful only when the section owns at
+	// least one field that can actually carry a project override. Secrets,
+	// Integrations and People have no schema fields at all; About's and
+	// Storage's fields are every one of them personal-only
+	// (drafts/settings-schema.md §2.1 — `about.updates.*`,
+	// `storage.screenshotDirectory`), so switching to Project there changed
+	// nothing. Kept separate from `hasFields` below: About/Storage still have
+	// fields worth resetting, they just can't be project-scoped.
+	const scopeless = !section.fields.some(
+		(meta) => meta.field !== null && !PERSONAL_ONLY_FIELD_SET.has(meta.field)
+	);
 
 	async function handleCopy() {
 		try {
@@ -108,6 +129,11 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 			)}
 
 			{!searchActive && !scopeless && (
+				// `min-h-[var(--tab-h)]` on each button, not a hardcoded px value —
+				// `--tab-h` is the same tab-height token `.ccfg-tab` sizes off of
+				// (src/shell/claude-config/claude-config.css) and is the shell's
+				// 44px hit-target floor in spacious density (tokens.css
+				// `[data-density='spacious']`; D-03 44px targets, WP-35 DoD).
 				<div
 					role="group"
 					aria-label="Settings scope"
@@ -117,7 +143,7 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 						type="button"
 						aria-pressed={scope === 'personal'}
 						onClick={() => setScope('personal')}
-						className={`rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
+						className={`min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
 							scope === 'personal'
 								? 'bg-card text-foreground shadow-sm'
 								: 'text-muted-foreground hover:text-foreground'
@@ -131,7 +157,7 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 						disabled={!projectRoot}
 						title={projectRoot ? undefined : 'The active project has no filesystem root'}
 						onClick={() => setScope('project')}
-						className={`rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 ${
+						className={`min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 ${
 							scope === 'project'
 								? 'bg-card text-foreground shadow-sm'
 								: 'text-muted-foreground hover:text-foreground'
@@ -198,7 +224,7 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 						<DropdownMenuSeparator />
 						<DropdownMenuItem
 							variant="destructive"
-							disabled={scopeless || searchActive}
+							disabled={!hasFields || searchActive}
 							onSelect={() => void handleReset()}
 						>
 							<RotateCcw className="mr-2 h-3.5 w-3.5" />

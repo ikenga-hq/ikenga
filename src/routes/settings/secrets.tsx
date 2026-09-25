@@ -109,7 +109,7 @@ function SecretsPage() {
 					Vault secrets
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
-					Stronghold-encrypted at rest, partitioned by scope. Workspace and active-project secrets
+					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project secrets
 					are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve at
 					command-handling time inside the kernel.
 				</p>
@@ -379,7 +379,10 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 						tabIndex={active ? 0 : -1}
 						onClick={() => onTabChange(item.kind)}
 						className={cn(
-							'inline-flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors',
+							// min-h off the shared tab-height token, not a hardcoded px
+							// value — see the comment on the Personal/Project scope
+							// switch in shell/settings/header.tsx.
+							'inline-flex min-h-[var(--tab-h)] items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors',
 							'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
 							active
 								? 'bg-accent text-accent-foreground'
@@ -534,7 +537,7 @@ function SecretDialog({
 					<DialogTitle>{editKey ? `Edit secret: ${editKey}` : 'Add secret'}</DialogTitle>
 					<DialogDescription>
 						Scope: <span className="font-mono">{scopeLabel(scope)}</span>. Values are
-						Stronghold-encrypted at rest and never written to a log. For an existing secret the
+						Encrypted at rest in the OS keychain and never written to a log. For an existing secret the
 						field starts empty; type a value to replace it.
 					</DialogDescription>
 				</DialogHeader>

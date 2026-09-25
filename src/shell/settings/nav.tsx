@@ -100,22 +100,46 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		id: 'secrets',
 		label: 'Secrets',
 		Icon: KeyRound,
-		description: 'Stronghold vault — workspace, project and pkg scoped secrets.',
-		fields: [],
+		description: 'OS keychain-backed vault — workspace, project and pkg scoped secrets.',
+		// Secrets values are never indexed (drafts/settings-schema.md §2.1: the
+		// `secrets` section "never contains secret values") — only the static
+		// row/control labels the page renders, same as any other section.
+		fields: [
+			{ field: null, label: 'Vault lock state', help: 'locked, unlocked, unconfigured' },
+			{ field: null, label: 'Set passphrase' },
+			{ field: null, label: 'Lock now' },
+			{ field: null, label: 'Unlock' },
+			{ field: null, label: 'Workspace scope', help: 'vault scope tab' },
+			{ field: null, label: 'Project scope', help: 'vault scope tab' },
+			{ field: null, label: 'Pkg scope', help: 'vault scope tab' },
+			{ field: null, label: 'Add secret' },
+		],
 	},
 	{
 		id: 'integrations',
 		label: 'Integrations',
 		Icon: Plug,
 		description: 'Supabase, connectors, iyke MCP and bridge API keys.',
-		fields: [],
+		fields: [
+			{ field: null, label: 'Connectors', help: 'connector cards' },
+			{ field: null, label: 'Claude Code', help: 'CLI detection and auth' },
+			{ field: null, label: 'Iyke MCP', help: 'bundled MCP server binary path' },
+			{ field: null, label: 'Supabase project URL' },
+			{ field: null, label: 'Supabase anon key' },
+			{ field: null, label: 'API keys' },
+			{ field: null, label: 'Bridge API keys', help: 'iyke bridge bearer token' },
+		],
 	},
 	{
 		id: 'people',
 		label: 'People & devices',
 		Icon: Users,
 		description: 'Who this workspace is shared with, and on which devices.',
-		fields: [],
+		fields: [
+			{ field: null, label: 'Members' },
+			{ field: null, label: 'Devices' },
+			{ field: null, label: 'Pending invites' },
+		],
 	},
 	{
 		id: 'storage',
