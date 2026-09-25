@@ -108,6 +108,9 @@ impl From<UnlockError> for StoreError {
     fn from(error: UnlockError) -> Self {
         match error {
             UnlockError::Locked | UnlockError::NotConfigured => Self::locked(),
+            UnlockError::EnvelopeMissing => {
+                Self::unavailable(UnlockError::EnvelopeMissing.to_string())
+            }
             UnlockError::WrongPassphrase => Self::unknown("wrong passphrase"),
             UnlockError::InvalidPassphrase => Self::unavailable("passphrase is invalid"),
             other => Self::unknown(other.to_string()),
@@ -153,9 +156,22 @@ pub trait SecretsStore: Send + Sync {
 
     fn probe(&self) -> Result<(), StoreError>;
 
-    fn prepare_encryption(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    /// Bring every stored value up to the store's at-rest format. For
+    /// `EncryptedStore` with a configured passphrase this encrypts any
+    /// plaintext value left from before the passphrase was set; plain stores
+    /// have nothing to do. Deliberately has no default body: callers reach it
+    /// through `&dyn SecretsStore`, so a wrapper that forgot to override it
+    /// would silently skip the migration.
+    fn prepare_encryption(&self) -> Result<(), StoreError>;
+
+    /// Report whether the stored data itself shows that a passphrase was
+    /// configured (values in the encrypted at-rest format), latching the
+    /// sticky "configured" state when it does. Run before a first
+    /// `set_passphrase` so a missing envelope can never lead to a fresh DEK
+    /// over existing ciphertext. Plain stores hold no such format and return
+    /// `Ok(false)`. No default body, for the same reason as
+    /// `prepare_encryption`.
+    fn detect_configuration(&self) -> Result<bool, StoreError>;
 
     fn backend_label(&self) -> &'static str;
 
@@ -208,6 +224,14 @@ impl SecretsStore for UnavailableSecretStore {
         Err(self.error())
     }
 
+    fn prepare_encryption(&self) -> Result<(), StoreError> {
+        Err(self.error())
+    }
+
+    fn detect_configuration(&self) -> Result<bool, StoreError> {
+        Err(self.error())
+    }
+
     fn backend_label(&self) -> &'static str {
         "unavailable"
     }
@@ -248,6 +272,16 @@ mod tests {
             store.probe().unwrap_err().kind(),
             StoreErrorKind::Unavailable
         );
+        assert_eq!(
+            store.detect_configuration().unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn envelope_missing_maps_to_unavailable() {
+        let error: StoreError = UnlockError::EnvelopeMissing.into();
+        assert_eq!(error.kind(), StoreErrorKind::Unavailable);
     }
 
     #[test]

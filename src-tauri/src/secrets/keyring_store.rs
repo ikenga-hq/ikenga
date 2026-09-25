@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::index::{item_name, pending_path, validate_name, IndexPending, SecretIndex};
+use super::index::{item_name, pending_path, validate_legacy_name, IndexPending, SecretIndex};
 use super::store::{SecretMeta, SecretsStore, StoreError};
 
 const SERVICE: &str = "ikenga";
@@ -737,7 +737,7 @@ impl SecretsStore for KeyringStore {
         }
         let mut index = self.lock_index()?;
         for name in values.keys() {
-            validate_name(name).map_err(StoreError::uncommitted)?;
+            validate_legacy_name(name).map_err(StoreError::uncommitted)?;
         }
         let mut previous = self.authoritative_snapshot(&index)?;
         for name in values.keys() {
@@ -797,7 +797,7 @@ impl SecretsStore for KeyringStore {
     fn replace_all(&self, values: &BTreeMap<String, String>) -> Result<usize, StoreError> {
         let mut index = self.lock_index()?;
         for name in values.keys() {
-            validate_name(name).map_err(StoreError::uncommitted)?;
+            validate_legacy_name(name).map_err(StoreError::uncommitted)?;
         }
         let previous = self.authoritative_snapshot(&index)?;
         let target: BTreeSet<String> = values.keys().cloned().collect();
@@ -910,6 +910,17 @@ impl SecretsStore for KeyringStore {
             ));
         }
         self.lock_index()?.save().map_err(StoreError::uncommitted)
+    }
+
+    fn prepare_encryption(&self) -> Result<(), StoreError> {
+        // The keychain layer stores the bytes it is handed; value encryption
+        // belongs to `EncryptedStore`, which wraps this store.
+        Ok(())
+    }
+
+    fn detect_configuration(&self) -> Result<bool, StoreError> {
+        // The encrypted value format is `EncryptedStore`'s; it scans for it.
+        Ok(false)
     }
 
     fn backend_label(&self) -> &'static str {
@@ -1206,6 +1217,35 @@ mod tests {
         store.replace_all(&replacement).unwrap();
         assert_eq!(store.export_all().unwrap(), replacement);
         assert_eq!(provider.get_item("ikenga:workspace::REMOVE"), None);
+    }
+
+    #[test]
+    fn legacy_name_with_a_space_loads_reads_and_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets-index.json");
+        // An index written before WP-34 tightened the charset for new names.
+        fs::write(&path, br#"["My Token"]"#).unwrap();
+        let provider = Arc::new(FakeProvider::default());
+        provider.insert("ikenga:My Token", b"legacy-value");
+        let store = KeyringStore::with_backend(
+            &path,
+            Arc::new(FakeBackend {
+                provider: provider.clone(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            store.get("My Token").unwrap().as_deref(),
+            Some("legacy-value")
+        );
+        let mut replacement = BTreeMap::new();
+        replacement.insert("My Token".to_string(), "rewritten".to_string());
+        store.replace_all(&replacement).unwrap();
+        assert_eq!(store.export_all().unwrap(), replacement);
+        assert_eq!(
+            provider.get_item("ikenga:My Token"),
+            Some(b"rewritten".to_vec())
+        );
     }
 
     #[test]

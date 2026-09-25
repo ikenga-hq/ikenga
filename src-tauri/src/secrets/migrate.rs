@@ -624,6 +624,14 @@ mod tests {
             Ok(())
         }
 
+        fn prepare_encryption(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn detect_configuration(&self) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
         fn backend_label(&self) -> &'static str {
             "memory"
         }

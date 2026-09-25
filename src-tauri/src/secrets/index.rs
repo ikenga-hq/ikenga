@@ -38,7 +38,10 @@ impl SecretIndex {
             .map_err(|e| format!("parse secrets index {}: {e}", path.display()))?;
         let mut names = BTreeSet::new();
         for value in values {
-            validate_stored_name(&value)?;
+            // Permissive on load: names written by WP-33 and earlier only had
+            // to be non-empty and NUL-free. Rejecting them here would make
+            // the whole store unloadable (and the values unreachable).
+            validate_legacy_name(&value)?;
             names.insert(value);
         }
         Ok(Self { path, names })
@@ -49,13 +52,13 @@ impl SecretIndex {
     }
 
     pub fn insert(&mut self, name: &str) -> Result<(), String> {
-        validate_stored_name(name)?;
+        validate_legacy_name(name)?;
         self.names.insert(name.to_string());
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
-        validate_stored_name(name)?;
+        validate_legacy_name(name)?;
         self.names.remove(name);
         Ok(())
     }
@@ -128,20 +131,24 @@ pub fn pending_path(index_path: &Path) -> PathBuf {
         .join(INDEX_PENDING_FILENAME)
 }
 
-pub fn validate_name(name: &str) -> Result<(), String> {
+/// Permissive name check for names that may already exist in the store:
+/// index load, pending-index recovery, keychain item names, migration from
+/// Stronghold, backup restore, and the store layer's own writes (which
+/// re-encrypt legacy values under their existing names). This is exactly the
+/// WP-33 contract — non-empty, not reserved, no NUL, fits the keychain — so
+/// every name an earlier build could have written keeps loading.
+///
+/// New names minted through the command surface go through the strict
+/// [`validate_name`] / [`validate_key`] instead.
+pub fn validate_legacy_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("secret name is empty".into());
     }
     if name == "__manifest" || name == "__manifest_v2" {
         return Err("secret name is reserved".into());
     }
-    if name.contains('\0')
-        || !name.is_ascii()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
-    {
-        return Err("secret name contains unsupported characters".into());
+    if name.contains('\0') {
+        return Err("secret name contains a null byte".into());
     }
     if name.len().saturating_add(ITEM_PREFIX.len()) > 32_767 {
         return Err("secret name is too long for the platform keychain".into());
@@ -149,8 +156,37 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Strict name check for NEW writes (`secrets_set`, `secrets_set_scoped`):
+/// the legacy rules plus an `[A-Za-z0-9_.:-]` charset. Never used on load,
+/// recovery or migration paths — see [`validate_legacy_name`].
+pub fn validate_name(name: &str) -> Result<(), String> {
+    validate_legacy_name(name)?;
+    if !name.is_ascii()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err("secret name contains unsupported characters".into());
+    }
+    Ok(())
+}
+
+/// Strict check for a bare (unscoped) key on a new write.
 pub fn validate_key(key: &str) -> Result<(), String> {
     validate_name(key)?;
+    if key.contains("::") {
+        return Err("secret key contains a scope delimiter".into());
+    }
+    Ok(())
+}
+
+/// Permissive check for a bare key that addresses an existing (possibly
+/// legacy) entry through the unscoped read/delete commands. Keeps the scope
+/// delimiter ban so the unscoped commands cannot reach into a scoped name,
+/// but accepts any legacy charset so pre-WP-34 names stay readable and
+/// deletable.
+pub fn validate_legacy_key(key: &str) -> Result<(), String> {
+    validate_legacy_name(key)?;
     if key.contains("::") {
         return Err("secret key contains a scope delimiter".into());
     }
@@ -171,27 +207,8 @@ pub fn validate_scope_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_stored_name(name: &str) -> Result<(), String> {
-    if let Some(key) = name.strip_prefix("workspace::") {
-        return validate_key(key);
-    }
-    for prefix in ["project::", "pkg::"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            let mut parts = rest.split("::");
-            let id = parts.next().unwrap_or_default();
-            let key = parts.next().unwrap_or_default();
-            if parts.next().is_some() {
-                return Err("scoped secret name has too many delimiters".into());
-            }
-            validate_scope_id(id)?;
-            return validate_key(key);
-        }
-    }
-    validate_key(name)
-}
-
 pub fn item_name(name: &str) -> Result<String, String> {
-    validate_stored_name(name)?;
+    validate_legacy_name(name)?;
     Ok(format!("{ITEM_PREFIX}{name}"))
 }
 
@@ -444,12 +461,38 @@ mod tests {
     }
 
     #[test]
-    fn stored_names_reject_ambiguous_scopes() {
-        assert!(validate_stored_name("workspace::TOKEN").is_ok());
-        assert!(validate_stored_name("project::alpha::TOKEN").is_ok());
-        assert!(validate_stored_name("project::alpha::TOKEN::extra").is_err());
-        assert!(validate_stored_name("pkg::bad/id::TOKEN").is_err());
-        assert!(validate_stored_name("TOKEN::extra").is_err());
+    fn new_writes_are_strict_but_legacy_names_are_accepted() {
+        assert!(validate_key("TOKEN").is_ok());
+        assert!(validate_key("My Token").is_err());
+        assert!(validate_key("TOKEN::extra").is_err());
+        assert!(validate_name("caf\u{e9}").is_err());
+        assert!(validate_legacy_name("My Token").is_ok());
+        assert!(validate_legacy_name("caf\u{e9}").is_ok());
+        assert!(validate_legacy_key("My Token").is_ok());
+        assert!(validate_legacy_key("My::Token").is_err());
+        assert!(validate_legacy_name("").is_err());
+        assert!(validate_legacy_name("__manifest").is_err());
+        assert!(validate_legacy_name("bad\0name").is_err());
+    }
+
+    #[test]
+    fn legacy_index_name_with_a_space_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_FILENAME);
+        fs::write(&path, br#"["My Token", "workspace::TOKEN"]"#).unwrap();
+        let mut index = SecretIndex::load(&path).unwrap();
+        assert_eq!(
+            index.names(),
+            vec!["My Token".to_string(), "workspace::TOKEN".to_string()]
+        );
+        assert_eq!(item_name("My Token").unwrap(), "ikenga:My Token");
+        index.remove("My Token").unwrap();
+        index.insert("My Token").unwrap();
+        index.save().unwrap();
+        assert!(SecretIndex::load(&path)
+            .unwrap()
+            .names()
+            .contains(&"My Token".to_string()));
     }
 
     #[test]
