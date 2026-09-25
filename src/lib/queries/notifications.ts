@@ -21,8 +21,10 @@ import {
 	useQueryClient,
 } from '@tanstack/react-query';
 import { useEffect, useRef } from 'react';
+import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { queryKeys } from '@/lib/query-keys';
 import {
+	type KnownNotificationAction,
 	listen,
 	NOTIFICATIONS_CHANGED_EVENT,
 	type NotificationKind,
@@ -40,7 +42,14 @@ import {
 	type UnlistenFn,
 } from '@/lib/tauri-cmd';
 
+export {
+	asKnownNotificationAction,
+	KNOWN_NOTIFICATION_ACTION_KINDS,
+} from '@/lib/notifications/action-kind';
+
 export type {
+	KnownNotificationAction,
+	KnownNotificationActionKind,
 	NotificationAction,
 	NotificationKind,
 	NotificationRow,
@@ -125,8 +134,9 @@ export function useMarkAllNotificationsRead() {
 
 /**
  * Mute / unmute one kind. Rejects `permission` / `violation` before the call
- * (Rust refuses them too). Un-muting marks the kind's rows read first, so the
- * badge does not jump by a backlog.
+ * (Rust refuses them too). Un-muting marks read the kind's rows recorded
+ * while it was muted, so the badge does not jump by a backlog; rows that were
+ * already unread before the mute stay unread.
  */
 export function useSetNotificationKindMuted() {
 	const qc = useQueryClient();
@@ -187,6 +197,25 @@ export function useNotificationsLiveSync(
 }
 
 // ─── View helpers ───────────────────────────────────────────────────────────
+
+/** The thing the row asks about is over (see `NotificationRow.resolvedAt`). */
+export function isNotificationResolved(row: NotificationRow): boolean {
+	return row.resolvedAt != null;
+}
+
+/**
+ * The row's inline Allow / Deny, or `null` when it has none to offer: not a
+ * `permission.decide` action, or already resolved (a dead ask). Answer via
+ * `/iyke/hooks/decision` with `requestId` — only the hooks gate emits one.
+ * ACP asks are open-only `open.thread` rows (inline decide is a follow-up).
+ */
+export function notificationDecision(
+	row: NotificationRow,
+): Extract<KnownNotificationAction, { kind: 'permission.decide' }> | null {
+	if (isNotificationResolved(row)) return null;
+	const action = asKnownNotificationAction(row.action);
+	return action?.kind === 'permission.decide' ? action : null;
+}
 
 /** Local midnight of `now`. */
 function startOfDay(now: number): number {

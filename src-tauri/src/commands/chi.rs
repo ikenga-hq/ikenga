@@ -355,18 +355,27 @@ async fn cache_update_done(
     .execute(&pool)
     .await
     .map_err(|e| format!("chi_cache update done: {e}"))?;
-    notify_run_terminal(db, run_id, status, error).await;
+    notify_run_terminal(db, run_id, status, error, artifacts).await;
     Ok(())
 }
 
 /// WP-40 `run_finished` / `run_failed` producer. `cache_update_done` is the
 /// single place a Chi run reaches a terminal status (every engine's one-off
 /// task, spawn failures, stdin failures), so producing here covers them all.
-/// `cancelled` produces nothing (a human did it). Best-effort.
+/// `cancelled` produces nothing (a human did it). Best-effort. The run's
+/// artifacts ride along (count + first path) so the row can "Open artifact".
 ///
-/// Not covered: tmux-backed persistent runs finish inside the tmux runner,
-/// out of process, and never reach this function.
-async fn notify_run_terminal(db: &PaDb, run_id: &str, status: &str, error: Option<&str>) {
+/// Not covered (tracked WP-40 follow-ups): tmux-backed persistent runs finish
+/// inside the tmux runner, out of process, and never reach this function;
+/// agent-ops schedules (D-07's "pulse-refresh finished" example rows) have no
+/// in-shell completion signal at all yet.
+async fn notify_run_terminal(
+    db: &PaDb,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    artifacts: Option<&serde_json::Value>,
+) {
     let row = match cache_get(db, run_id).await {
         Ok(Some(row)) => row,
         Ok(None) => return,
@@ -375,13 +384,14 @@ async fn notify_run_terminal(db: &PaDb, run_id: &str, status: &str, error: Optio
             return;
         }
     };
-    if let Some(new) = crate::notifications::producers::run_terminal(
+    if let Some(new) = crate::notifications::producers::run_terminal_with_artifacts(
         run_id,
         status,
         &row.engine_id,
         row.brief.as_deref(),
         row.cwd.as_deref(),
         error,
+        artifacts,
     ) {
         crate::notifications::record_with_db(db, new).await;
     }
@@ -1903,7 +1913,10 @@ mod tests {
         cache_update_done(&db, &failed_id, "failed", Some("exit 1"), false, None)
             .await
             .unwrap();
-        cache_update_done(&db, &done_id, "done", None, false, None)
+        let produced = serde_json::json!([
+            { "path": "/tmp/royalti-co/snap-1.json", "mime": "application/json", "producedBy": "Write" }
+        ]);
+        cache_update_done(&db, &done_id, "done", None, false, Some(&produced))
             .await
             .unwrap();
         cache_update_done(&db, &cancelled_id, "cancelled", None, false, None)
@@ -1924,6 +1937,10 @@ mod tests {
         let done = for_run(&done_id);
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].kind, NotificationKind::RunFinished);
+        let action = done[0].action.as_ref().unwrap();
+        assert_eq!(action["artifactCount"], 1);
+        assert_eq!(action["firstArtifactPath"], "/tmp/royalti-co/snap-1.json");
+        assert_eq!(failed[0].action.as_ref().unwrap()["artifactCount"], 0);
         assert!(for_run(&cancelled_id).is_empty());
     }
 

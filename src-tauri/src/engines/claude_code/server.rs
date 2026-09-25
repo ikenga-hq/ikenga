@@ -530,7 +530,8 @@ impl ClaudeCodeEngine {
         // WP-40 `permission` producer: persist the ask so the notification
         // centre (and the daily address) see it even after the transient
         // `chat://notify` is gone. Spawned so this loop never waits on a DB
-        // write; the round-trip task below marks it read once it resolves.
+        // write; the round-trip task below resolves it (`resolvedAt`) once
+        // it is answered, cancelled or times out.
         let pa_db = app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone());
         if let Some(db) = pa_db.clone() {
             let new = crate::notifications::producers::permission_from_engine(
@@ -551,6 +552,7 @@ impl ClaudeCodeEngine {
         let tool_name_for_task = tool_name;
         let tool_input_for_task = tool_input;
         let session_for_task = session.clone();
+        let thread_id_for_notification = thread_id.clone();
         // Mirror the response wire shape to the request: `can_use_tool` →
         // 2.1.x `control_response`, anything else → legacy
         // `sdk_control_response` (see `claude::session::ControlWire`).
@@ -585,8 +587,10 @@ impl ClaudeCodeEngine {
                 &response,
             );
             // WP-40: answered, cancelled or timed out — the ask is over.
-            let notification_key =
-                crate::notifications::producers::engine_permission_key(&request_id_for_task);
+            let notification_key = crate::notifications::producers::engine_permission_key(
+                &thread_id_for_notification,
+                &request_id_for_task,
+            );
             if let Err(e) =
                 send_control_response(session_for_task, request_id_for_task, body, wire).await
             {

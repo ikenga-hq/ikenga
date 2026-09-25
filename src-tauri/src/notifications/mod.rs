@@ -14,6 +14,12 @@
 //! * Reads ([`list`], [`unread_count`]) and read-state writes ([`mark_read`],
 //!   [`mark_all_read`], [`mark_read_by_key`]) back the `notifications_*` Tauri
 //!   commands (`commands::notifications`) and `GET /iyke/notifications`.
+//! * Resolution ([`resolve_by_key`], [`resolve_installed_updates`]) is a
+//!   separate state from read: `resolved_at` says the thing a row asks about
+//!   is over (a permission decided / timed out / answered in its terminal, an
+//!   update installed). A row can be read but still pending, or resolved
+//!   before anyone read it. The centre must not offer Allow / Deny on a
+//!   resolved `permission` row, and resolved rows never count as unread.
 //! * Every change is published on a process-wide broadcast channel
 //!   ([`subscribe`]). [`spawn_event_forwarder`] relays it to the webview as
 //!   the `notifications://changed` Tauri event. Producers therefore only need
@@ -51,8 +57,17 @@ use tokio::sync::broadcast;
 pub const EVENT_NAME: &str = "notifications://changed";
 
 /// Rows older than this that are already read are pruned on insert.
+///
+/// Consequence for `Coalesce::Once` keys (updates): once the read row for
+/// "Ikenga 0.9.1 is available" is pruned, a later check that still sees
+/// 0.9.1 as available announces it again. That is accepted — a month-old,
+/// still-uninstalled update is worth one more mention — so no tombstone of
+/// announced keys is kept. Installed versions do not re-announce: the
+/// updater stops reporting them, and [`resolve_installed_updates`] resolves
+/// their rows.
 const READ_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-/// Hard cap on table size, pruned on insert (oldest first).
+/// Hard cap on table size, pruned on insert (oldest first). Unread,
+/// unresolved `permission` rows are exempt (see [`prune`]).
 const MAX_ROWS: i64 = 1000;
 /// Default and maximum page size for [`list`].
 pub const DEFAULT_LIMIT: i64 = 100;
@@ -122,9 +137,10 @@ pub enum Coalesce {
     /// Drop the repeat if ANY row with the key exists, read or not. For
     /// one-shot facts: "0.9.1 is available", "permission request X".
     Once,
-    /// Fold into the newest UNREAD row with the key (count + 1, copy and
-    /// action replaced, `updated_at` bumped); insert a fresh row when every
-    /// earlier one has been read. For repeating facts: violations, runs.
+    /// Fold into the newest UNREAD, UNRESOLVED row with the key (count + 1,
+    /// copy and action replaced, `updated_at` bumped); insert a fresh row
+    /// when every earlier one has been read or resolved. For repeating
+    /// facts: violations, runs, terminal permission prompts.
     WhileUnread,
 }
 
@@ -155,6 +171,11 @@ pub struct Notification {
     pub created_at: i64,
     pub updated_at: i64,
     pub read_at: Option<i64>,
+    /// Unix ms the thing this row asks about was over (permission decided,
+    /// timed out or answered in its terminal; update installed). `None` =
+    /// still open. Independent of `read_at`. Serialized as `resolvedAt`.
+    #[serde(default)]
+    pub resolved_at: Option<i64>,
 }
 
 /// Result of [`record`].
@@ -180,7 +201,13 @@ impl RecordOutcome {
 pub struct UnreadCount {
     pub total: i64,
     /// Unread per kind, muted kinds excluded. Keys are `NotificationKind::as_str`.
+    /// Resolved rows never count.
     pub by_kind: BTreeMap<String, i64>,
+    /// `permission` rows still awaiting an answer (unresolved), read or not.
+    /// What the daily address (WP-39) should show as "pending permissions":
+    /// a held ask the user glanced at (read) is still pending.
+    #[serde(default)]
+    pub pending_permissions: i64,
 }
 
 /// Filter for [`list`].
@@ -247,6 +274,8 @@ pub(crate) fn publish(reason: ChangeReason, notification: Option<Notification>) 
 /// muted kind without re-reading settings per event.
 pub fn spawn_event_forwarder(app: tauri::AppHandle) {
     use tauri::Emitter;
+    // Hand edits of the muted list publish `mute_changed` too.
+    mute::spawn_settings_listener(app.clone());
     let mut rx = subscribe();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -285,7 +314,7 @@ fn now_ms() -> i64 {
 }
 
 const SELECT_COLUMNS: &str = "id, kind, title, body, action, source, dedupe_key, count, \
-                              created_at, updated_at, read_at";
+                              created_at, updated_at, read_at, resolved_at";
 
 fn row_to_notification(row: &sqlx::sqlite::SqliteRow) -> Result<Notification, String> {
     let kind_raw: String = row.try_get("kind").map_err(|e| format!("kind: {e}"))?;
@@ -309,6 +338,9 @@ fn row_to_notification(row: &sqlx::sqlite::SqliteRow) -> Result<Notification, St
             .try_get("updated_at")
             .map_err(|e| format!("updated_at: {e}"))?,
         read_at: row.try_get("read_at").map_err(|e| format!("read_at: {e}"))?,
+        resolved_at: row
+            .try_get("resolved_at")
+            .map_err(|e| format!("resolved_at: {e}"))?,
     })
 }
 
@@ -349,7 +381,7 @@ pub async fn record(
         (Some(key), Coalesce::WhileUnread) => {
             let unread: Option<i64> = sqlx::query_scalar(
                 "SELECT id FROM notifications
-                 WHERE dedupe_key = ? AND read_at IS NULL
+                 WHERE dedupe_key = ? AND read_at IS NULL AND resolved_at IS NULL
                  ORDER BY id DESC LIMIT 1",
             )
             .bind(key)
@@ -449,8 +481,17 @@ pub async fn record_with_db(db: &crate::commands::db::PaDb, new: NewNotification
     }
 }
 
+/// SQL predicate for rows the cap never evicts: a still-open permission ask.
+const PROTECTED_FROM_CAP: &str =
+    "kind = 'permission' AND read_at IS NULL AND resolved_at IS NULL";
+
 /// Retention: read rows older than 30 days go, then the table is capped at
-/// `MAX_ROWS` newest. Unread rows are only ever dropped by the cap.
+/// `MAX_ROWS` newest. Unread rows are only ever dropped by the cap, and the
+/// cap never drops an unread, unresolved `permission` row — a flood of
+/// violations must not evict a held ask. Protected rows still count toward
+/// `MAX_ROWS`, so the table stays bounded; they are bounded themselves
+/// (gate / ACP asks resolve within their timeout, terminal asks fold to one
+/// unread row per terminal).
 async fn prune(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     now: i64,
@@ -460,14 +501,21 @@ async fn prune(
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("notifications prune (age): {e}"))?;
-    sqlx::query(
+    let protected: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM notifications WHERE {PROTECTED_FROM_CAP}"
+    ))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("notifications prune (count): {e}"))?;
+    sqlx::query(&format!(
         "DELETE FROM notifications WHERE id IN (
            SELECT id FROM notifications
+           WHERE NOT ({PROTECTED_FROM_CAP})
            ORDER BY updated_at DESC, id DESC
            LIMIT -1 OFFSET ?
-         )",
-    )
-    .bind(MAX_ROWS)
+         )"
+    ))
+    .bind((MAX_ROWS - protected).max(0))
     .execute(&mut **tx)
     .await
     .map_err(|e| format!("notifications prune (cap): {e}"))?;
@@ -510,7 +558,29 @@ pub async fn list(pool: &sqlx::SqlitePool, q: &ListQuery) -> Result<Vec<Notifica
         .fetch_all(pool)
         .await
         .map_err(|e| format!("notifications list: {e}"))?;
-    rows.iter().map(row_to_notification).collect()
+    // Same stance as `unread_count`: a row this build cannot read (an unknown
+    // kind written by a newer build before a downgrade) is skipped, not fatal
+    // to the whole list.
+    let mut out = Vec::with_capacity(rows.len());
+    let mut skipped = 0usize;
+    for row in &rows {
+        match row_to_notification(row) {
+            Ok(n) => out.push(n),
+            Err(e) => {
+                if skipped == 0 {
+                    log::warn!(
+                        target: "ikenga::notifications",
+                        "skipping unreadable notification row: {e}"
+                    );
+                }
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 1 {
+        log::warn!(target: "ikenga::notifications", "skipped {skipped} unreadable rows");
+    }
+    Ok(out)
 }
 
 /// Unread count, muted kinds excluded.
@@ -519,7 +589,9 @@ pub async fn unread_count(
     exclude: &[NotificationKind],
 ) -> Result<UnreadCount, String> {
     let rows = sqlx::query(
-        "SELECT kind, COUNT(*) AS n FROM notifications WHERE read_at IS NULL GROUP BY kind",
+        "SELECT kind, COUNT(*) AS n FROM notifications
+         WHERE read_at IS NULL AND resolved_at IS NULL
+         GROUP BY kind",
     )
     .fetch_all(pool)
     .await
@@ -538,6 +610,13 @@ pub async fn unread_count(
         out.total += n;
         out.by_kind.insert(kind.as_str().to_string(), n);
     }
+    // Permission cannot be muted, so `exclude` never applies here.
+    out.pending_permissions = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE kind = 'permission' AND resolved_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("notifications pending permissions: {e}"))?;
     Ok(out)
 }
 
@@ -595,9 +674,8 @@ pub async fn mark_all_read(
     Ok(changed)
 }
 
-/// Mark the rows carrying `dedupe_key` read. Used when the thing a row asks
-/// about is resolved elsewhere (a permission answered in its dialog, a gate
-/// timing out) so the centre does not keep offering a dead Allow / Deny.
+/// Mark the rows carrying `dedupe_key` read. Read state only — to say the
+/// thing a row asks about is over, use [`resolve_by_key`].
 pub async fn mark_read_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Result<u64, String> {
     let changed = sqlx::query(
         "UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND dedupe_key = ?",
@@ -614,10 +692,99 @@ pub async fn mark_read_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Resu
     Ok(changed)
 }
 
-/// Best-effort [`mark_read_by_key`] for emit sites holding a `PaDb`.
+/// Resolve the open rows carrying `dedupe_key`: the thing they ask about is
+/// over (a permission decided in its dialog or the centre, a gate timing out,
+/// a terminal prompt answered). Sets `resolved_at` and — as before this state
+/// existed — `read_at` if still unread, so a dead ask never lingers on the
+/// badge. Already-resolved rows keep their original timestamps. The centre
+/// reads `resolvedAt` to hide a dead Allow / Deny. Publishes `read`.
+pub async fn resolve_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Result<u64, String> {
+    let now = now_ms();
+    let changed = sqlx::query(
+        "UPDATE notifications
+         SET resolved_at = ?, read_at = COALESCE(read_at, ?)
+         WHERE resolved_at IS NULL AND dedupe_key = ?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(dedupe_key)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("notifications resolve by key: {e}"))?
+    .rows_affected();
+    if changed > 0 {
+        publish(ChangeReason::Read, None);
+    }
+    Ok(changed)
+}
+
+/// Dotted numeric version compare (`v`-prefix and `-pre` / `+build` suffixes
+/// ignored, missing parts are 0). `None` when a part is not numeric.
+fn version_le(a: &str, b: &str) -> Option<bool> {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        let core = v
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['-', '+'])
+            .next()
+            .unwrap_or("");
+        if core.is_empty() {
+            return None;
+        }
+        core.split('.').map(|p| p.parse::<u64>().ok()).collect()
+    }
+    let (mut a, mut b) = (parts(a)?, parts(b)?);
+    let len = a.len().max(b.len());
+    a.resize(len, 0);
+    b.resize(len, 0);
+    Some(a <= b)
+}
+
+/// Resolve `update` rows whose announced version is already installed: the
+/// shell row `update:shell:<v>` once the running shell is `>= v`, a pkg row
+/// `update:pkg:<id>@<v>` once pkg `<id>` is installed at `>= v`. Rows whose
+/// version does not parse are left alone. Returns rows resolved.
+///
+/// Run on boot and on every update check (`notifications_record_update`),
+/// so it needs nothing from the updater UI: an app update relaunches into
+/// the boot sweep; a pkg update is caught by the next check.
+pub async fn resolve_installed_updates(
+    pool: &sqlx::SqlitePool,
+    shell_version: Option<&str>,
+    installed_pkgs: &[(String, String)],
+) -> Result<u64, String> {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT dedupe_key FROM notifications
+         WHERE kind = 'update' AND resolved_at IS NULL AND dedupe_key IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("notifications update sweep: {e}"))?;
+    let mut resolved = 0;
+    for key in keys {
+        let installed_now = if let Some(v) = key.strip_prefix("update:shell:") {
+            shell_version.and_then(|cur| version_le(v, cur))
+        } else if let Some(rest) = key.strip_prefix("update:pkg:") {
+            rest.rsplit_once('@').and_then(|(id, v)| {
+                installed_pkgs
+                    .iter()
+                    .find(|(pid, _)| pid == id)
+                    .and_then(|(_, cur)| version_le(v, cur))
+            })
+        } else {
+            None
+        };
+        if installed_now == Some(true) {
+            resolved += resolve_by_key(pool, &key).await?;
+        }
+    }
+    Ok(resolved)
+}
+
+/// Best-effort [`resolve_by_key`] for emit sites holding a `PaDb`.
 pub async fn resolve_key_with_db(db: &crate::commands::db::PaDb, dedupe_key: &str) {
     let result = match db.ensure_pool().await {
-        Ok(pool) => mark_read_by_key(&pool, dedupe_key).await,
+        Ok(pool) => resolve_by_key(&pool, dedupe_key).await,
         Err(e) => Err(e),
     };
     if let Err(e) = result {
@@ -684,10 +851,16 @@ mod tests {
                 .unwrap();
         for c in [
             "id", "kind", "title", "body", "action", "source", "dedupe_key", "count",
-            "created_at", "updated_at", "read_at",
+            "created_at", "updated_at", "read_at", "resolved_at",
         ] {
             assert!(cols.iter().any(|x| x == c), "missing column {c}: {cols:?}");
         }
+        let mute_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('notification_mutes')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mute_cols, vec!["kind".to_string(), "muted_at".to_string()]);
     }
 
     #[tokio::test]
@@ -990,6 +1163,221 @@ mod tests {
                 .await
                 .unwrap()
                 .total,
+            0
+        );
+    }
+    #[tokio::test]
+    async fn resolve_by_key_sets_resolved_and_read_and_drops_it_from_counts() {
+        let (pool, _tmp) = fresh_pool().await;
+        let key = "permission:hook:perm-9";
+        record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::Once))
+            .await
+            .unwrap();
+        let c = unread_count(&pool, &[]).await.unwrap();
+        assert_eq!(c.by_kind.get("permission"), Some(&1));
+        assert_eq!(c.pending_permissions, 1);
+
+        // Read but still pending: off the unread badge, still pending.
+        mark_all_read(&pool, None).await.unwrap();
+        let c = unread_count(&pool, &[]).await.unwrap();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.pending_permissions, 1);
+        let row = &list(&pool, &ListQuery::default()).await.unwrap()[0];
+        assert!(row.read_at.is_some());
+        assert!(row.resolved_at.is_none());
+
+        assert_eq!(resolve_by_key(&pool, key).await.unwrap(), 1);
+        // Idempotent: the original resolution time is kept.
+        assert_eq!(resolve_by_key(&pool, key).await.unwrap(), 0);
+        let row = &list(&pool, &ListQuery::default()).await.unwrap()[0];
+        assert!(row.resolved_at.is_some());
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().pending_permissions, 0);
+    }
+
+    #[tokio::test]
+    async fn resolving_an_unread_row_also_marks_it_read() {
+        let (pool, _tmp) = fresh_pool().await;
+        let key = "permission:acp:t:r";
+        record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::Once))
+            .await
+            .unwrap();
+        resolve_by_key(&pool, key).await.unwrap();
+        let row = &list(&pool, &ListQuery::default()).await.unwrap()[0];
+        assert!(row.read_at.is_some() && row.resolved_at.is_some());
+        let c = unread_count(&pool, &[]).await.unwrap();
+        assert_eq!(c.total, 0);
+        assert_eq!(c.pending_permissions, 0);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_terminal_ask_is_not_folded_into_by_the_next_one() {
+        let (pool, _tmp) = fresh_pool().await;
+        let key = "permission:terminal:t-1";
+        let first = record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::WhileUnread))
+            .await
+            .unwrap();
+        resolve_by_key(&pool, key).await.unwrap();
+        let next = record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::WhileUnread))
+            .await
+            .unwrap();
+        assert!(matches!(next, RecordOutcome::Inserted(_)));
+        assert_ne!(next.notification().unwrap().id, first.notification().unwrap().id);
+        assert!(next.notification().unwrap().resolved_at.is_none());
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().pending_permissions, 1);
+    }
+
+    #[tokio::test]
+    async fn notification_serializes_resolved_at_as_camel_case() {
+        let (pool, _tmp) = fresh_pool().await;
+        record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
+            .await
+            .unwrap();
+        let row = list(&pool, &ListQuery::default()).await.unwrap().remove(0);
+        let wire = serde_json::to_value(&row).unwrap();
+        assert!(wire.get("resolvedAt").is_some_and(Value::is_null));
+        let c = serde_json::to_value(unread_count(&pool, &[]).await.unwrap()).unwrap();
+        assert_eq!(c["pendingPermissions"], 0);
+    }
+
+    #[tokio::test]
+    async fn cap_never_evicts_an_open_permission_ask() {
+        let (pool, _tmp) = fresh_pool().await;
+        let old = now_ms() - 60_000;
+        // The oldest row in the table: an unread, unresolved permission ask.
+        sqlx::query(
+            "INSERT INTO notifications (kind, title, source, dedupe_key, count, created_at, updated_at)
+             VALUES ('permission', 'held ask', 'test', 'permission:hook:old', 1, ?, ?)",
+        )
+        .bind(old)
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Fill past the cap with newer violation rows.
+        for i in 0..MAX_ROWS {
+            sqlx::query(
+                "INSERT INTO notifications (kind, title, source, count, created_at, updated_at)
+                 VALUES ('violation', 'v', 'test', 1, ?, ?)",
+            )
+            .bind(old + 1 + i)
+            .bind(old + 1 + i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        record(&pool, note(NotificationKind::Violation, None, Coalesce::Never))
+            .await
+            .unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, MAX_ROWS, "cap still bounds the table");
+        let ask: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM notifications WHERE dedupe_key = 'permission:hook:old'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(ask.is_some(), "the open permission ask survived the cap");
+    }
+
+    #[tokio::test]
+    async fn list_skips_rows_of_an_unknown_kind() {
+        let (pool, _tmp) = fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO notifications (kind, title, source, count, created_at, updated_at)
+             VALUES ('from_the_future', 'x', 'test', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
+            .await
+            .unwrap();
+        let rows = list(&pool, &ListQuery::default()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, NotificationKind::Update);
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().total, 1);
+    }
+
+    #[test]
+    fn version_le_compares_dotted_numbers() {
+        assert_eq!(version_le("0.9.1", "0.9.1"), Some(true));
+        assert_eq!(version_le("0.9.1", "0.10.0"), Some(true));
+        assert_eq!(version_le("v1.2", "1.2.0"), Some(true));
+        assert_eq!(version_le("1.2.1", "1.2.0"), Some(false));
+        assert_eq!(version_le("1.3.0-beta.1", "1.3.0"), Some(true));
+        assert_eq!(version_le("latest", "1.0.0"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_installed_updates_resolves_only_installed_versions() {
+        use super::producers::{update, UpdateSource};
+        let (pool, _tmp) = fresh_pool().await;
+        for n in [
+            update(UpdateSource::Shell, "0.13.0", None, None).unwrap(),
+            update(UpdateSource::Shell, "0.14.0", None, None).unwrap(),
+            update(UpdateSource::Pkg, "1.2.0", Some("com.ikenga.tasks"), None).unwrap(),
+            update(UpdateSource::Pkg, "2.0.0", Some("com.ikenga.iyke"), None).unwrap(),
+        ] {
+            record(&pool, n).await.unwrap();
+        }
+        let installed = vec![
+            ("com.ikenga.tasks".to_string(), "1.2.0".to_string()),
+            ("com.ikenga.iyke".to_string(), "1.9.9".to_string()),
+        ];
+        let n = resolve_installed_updates(&pool, Some("0.13.0"), &installed)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let open: Vec<String> = list(&pool, &ListQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.resolved_at.is_none())
+            .filter_map(|r| r.dedupe_key)
+            .collect();
+        assert_eq!(open.len(), 2);
+        assert!(open.contains(&"update:shell:0.14.0".to_string()));
+        assert!(open.contains(&"update:pkg:com.ikenga.iyke@2.0.0".to_string()));
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().by_kind.get("update"), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn unmute_marks_read_only_rows_recorded_while_muted() {
+        let (pool, _tmp) = fresh_pool().await;
+        // Unread before the mute: must survive the unmute.
+        let before = record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
+            .await
+            .unwrap();
+        // Back-date it so it is strictly older than the mute time.
+        sqlx::query("UPDATE notifications SET updated_at = updated_at - 10000 WHERE id = ?")
+            .bind(before.notification().unwrap().id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        mute::note_muted(&pool, NotificationKind::RunFinished).await.unwrap();
+        record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mute::clear_muted_backlog(&pool, NotificationKind::RunFinished)
+                .await
+                .unwrap(),
+            1
+        );
+        let unread = list(&pool, &ListQuery { unread_only: true, ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].id, before.notification().unwrap().id);
+        // The mute time is forgotten: a second clear marks nothing.
+        assert_eq!(
+            mute::clear_muted_backlog(&pool, NotificationKind::RunFinished)
+                .await
+                .unwrap(),
             0
         );
     }
