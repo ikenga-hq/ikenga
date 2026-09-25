@@ -9,8 +9,8 @@
 // but it does prove nothing *claims* a command id that doesn't exist.
 
 import { describe, expect, it } from 'vitest';
-import { findEntry } from '@/lib/keymap/registry';
-import { allMenuCommandIds, MENU_TREE } from './tree';
+import { findEntry, getKeymap } from '@/lib/keymap/registry';
+import { allMenuCommandIds, cascadeKeyLabel, MENU_TREE } from './tree';
 
 describe('MENU_TREE — WP-08 registry parity', () => {
 	it('every commandId used by a menu item resolves in the keymap registry', () => {
@@ -51,5 +51,32 @@ describe('MENU_TREE — WP-08 registry parity', () => {
 				}
 			}
 		}
+	});
+
+	// WP-46-F0: a menu leaf whose only WP-08 registry entry is
+	// `platformOnly: 'mac'` must render no key hint on the Windows/Linux
+	// cascade — `findEntry`'s permissive same-command fallback (correct for
+	// `macAccelerator` / the native macOS menu) must not leak a mac-only
+	// binding's key onto a platform where it isn't actually bound.
+	it('never shows a key hint on the non-mac cascade for a command whose only registry entry is mac-only', () => {
+		for (const commandId of allMenuCommandIds()) {
+			const candidates = getKeymap().filter((e) => e.command === commandId);
+			const macOnlyExclusive =
+				candidates.length > 0 && candidates.every((e) => e.platformOnly === 'mac');
+			if (!macOnlyExclusive) continue;
+			expect(
+				cascadeKeyLabel(commandId, { mac: false }),
+				`"${commandId}" is mac-only but the non-mac cascade would show a phantom key hint`
+			).toBe('');
+			// The same command still shows its real hint on macOS.
+			expect(cascadeKeyLabel(commandId, { mac: true })).not.toBe('');
+		}
+	});
+
+	it('still shows the real key hint on the non-mac cascade for a command with a non-mac binding', () => {
+		// `ngwa.create` (mod+n) carries no `platformOnly` restriction — it's
+		// the live, working Ctrl+N binding the mac-only `menu.new-session`
+		// must not be confused for (WP-46-F0's own regression example).
+		expect(cascadeKeyLabel('ngwa.create', { mac: false })).toBe('Ctrl+N');
 	});
 });

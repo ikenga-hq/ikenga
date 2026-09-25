@@ -16,7 +16,7 @@
 // shipped/added tally used in the PR body.
 
 import { findEntry, labelFor } from '@/lib/keymap/registry';
-import { toAccelerator } from '@/lib/keymap/platform';
+import { isMacPlatform, toAccelerator } from '@/lib/keymap/platform';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -365,10 +365,23 @@ export function macAccelerator(commandId: string | undefined): string | undefine
 
 /** Human-readable key hint for a leaf's `commandId` (⌘ glyphs on macOS,
  *  spelled-out Ctrl/Alt/Shift elsewhere — `labelFor` already branches on the
- *  live platform), or `''` for a leaf with none. */
-export function cascadeKeyLabel(commandId: string | undefined): string {
+ *  live platform), or `''` for a leaf with none.
+ *
+ *  `findEntry`'s fallback (used by `macAccelerator` and the native macOS
+ *  menu, where it's always correct) returns the *other* platform's entry
+ *  when the command has no candidate for the live one — appropriate for a
+ *  mac-only accelerator lookup, wrong here: the Windows/Linux cascade must
+ *  never show a key hint for a binding that's actually restricted to macOS
+ *  (WP-46-F0). So this checks the resolved entry's own `platformOnly`
+ *  against the live platform and renders no hint rather than a phantom one;
+ *  a real non-mac binding for the same command still resolves normally. */
+export function cascadeKeyLabel(commandId: string | undefined, opts?: { mac?: boolean }): string {
 	if (!commandId) return '';
-	return labelFor(commandId);
+	const mac = opts?.mac ?? isMacPlatform();
+	const entry = findEntry(commandId, { mac });
+	if (!entry) return '';
+	if (entry.platformOnly && entry.platformOnly !== (mac ? 'mac' : 'other')) return '';
+	return labelFor(commandId, { mac });
 }
 
 /** Every `commandId` used anywhere in `MENU_TREE` — the seam `tree.test.ts`
