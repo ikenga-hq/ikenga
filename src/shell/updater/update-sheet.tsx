@@ -213,11 +213,30 @@ function PkgUpdatePanel() {
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [failures, setFailures] = useState<UpdateFailure[]>([]);
 	const [doneIds, setDoneIds] = useState<Set<string>>(new Set());
-	// Installed but parked by the kernel pending capability review
-	// (pkg_trust_list_pending) — a permission diff stop, not a success
-	// (WP-41-F1). Reviewing (or rejecting) one clears it from this list.
+	// Rows the pre-install capability diff (`pkgTrustPreviewIncoming`,
+	// WP-41-F1) flagged before `pkgInstallFromRegistry` ever ran — parked,
+	// NOT installed, and NOT a success. Approving in the modal below
+	// installs the row for real; rejecting just drops it from the batch.
 	const [needsApproval, setNeedsApproval] = useState<PkgTrustReview[]>([]);
 	const [reviewPkgId, setReviewPkgId] = useState<string | null>(null);
+
+	// Approve = install this one row now that the user has seen the diff.
+	// `approvedIds` tells the batch mutation to skip the pre-install check
+	// it would otherwise repeat (and park it again).
+	async function approveRow(pkgId: string) {
+		const row = pkgs.updates.find((r) => r.id === pkgId);
+		if (!row) throw new Error(`${pkgId} is no longer in the update batch`);
+		const res = await updatePkgs.mutateAsync({ rows: [row], approvedIds: new Set([pkgId]) });
+		if (res.failed.length) {
+			throw new Error(res.failed[0]?.error ?? `install of ${pkgId} failed`);
+		}
+		setDoneIds((prev) => new Set(prev).add(pkgId));
+	}
+
+	// Reject = drop it. Nothing was installed — the diff ran before
+	// `pkgInstallFromRegistry` — so there's nothing to uninstall; `onChange`
+	// below removes it from `needsApproval` and closes the modal.
+	async function rejectRow(_pkgId: string) {}
 
 	function resetBatch() {
 		setFailures([]);
@@ -335,8 +354,8 @@ function PkgUpdatePanel() {
 			)}
 			{needsApproval.length > 0 && (
 				<p className="text-sm text-warning">
-					{plural(needsApproval.length, 'package')} installed but parked — the new version asks
-					for a capability you haven't granted. Review each row above before it runs.
+					{plural(needsApproval.length, 'package')} stopped before installing — the new version
+					asks for a capability you haven't granted. Review each row above to install it.
 				</p>
 			)}
 			<p className="text-xs text-muted-foreground">
@@ -359,6 +378,8 @@ function PkgUpdatePanel() {
 				open={reviewPkgId !== null}
 				onOpenChange={(open) => !open && setReviewPkgId(null)}
 				initialReviews={needsApproval.filter((r) => r.pkg_id === reviewPkgId)}
+				onApprove={approveRow}
+				onReject={rejectRow}
 				onChange={() => {
 					setNeedsApproval((prev) => prev.filter((r) => r.pkg_id !== reviewPkgId));
 					setReviewPkgId(null);

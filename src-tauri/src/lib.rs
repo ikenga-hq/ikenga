@@ -150,8 +150,9 @@ use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
     pkg_trust_approve, pkg_trust_grant, pkg_trust_list, pkg_trust_list_pending, pkg_trust_preview,
-    pkg_trust_reject, pkg_trust_revoke, session_cancel, session_destroy, session_destroy_all,
-    session_ensure, session_send, session_tool_result, supabase_config_clear, supabase_config_get,
+    pkg_trust_preview_incoming, pkg_trust_reject, pkg_trust_revoke, session_cancel,
+    session_destroy, session_destroy_all, session_ensure, session_send, session_tool_result,
+    supabase_config_clear, supabase_config_get,
     supabase_config_set, viewer_port, viewer_serve, viewer_stop, IykeRuntimeState,
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, SecretsLock,
 };
@@ -1201,6 +1202,7 @@ pub fn run() {
             pkg_trust_revoke,
             // trust-review modal (2026-05-15) — capability-diff batch surface
             pkg_trust_list_pending,
+            pkg_trust_preview_incoming,
             pkg_trust_approve,
             pkg_trust_reject,
             // per-folder Studio project-access gate (WP-04)

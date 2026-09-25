@@ -2719,6 +2719,36 @@ export async function pkgTrustListPending(): Promise<PkgTrustReview[]> {
 	return invoke<PkgTrustReview[]>('pkg_trust_list_pending');
 }
 
+export interface PkgTrustPreviewIncomingArgs {
+	pkgId: string;
+	/** The incoming (not-yet-installed) version, for display in the review row. */
+	manifestVersion: string;
+	/** JSON-stringified `capabilities` block from the incoming manifest, if any. */
+	capabilitiesJson?: string;
+	/** JSON-stringified `permissions` block from the incoming manifest, if any. */
+	permissionsJson?: string;
+}
+
+/**
+ * Diff an incoming, not-yet-installed version's `capabilities` +
+ * `permissions` against what's already approved for `pkgId`, without
+ * installing anything (WP-41-F1). `null` means nothing to flag: no
+ * capability/permission change, or the pkg has no prior snapshot to diff
+ * against yet. Powers the updater batch's pre-install park decision —
+ * `install_from_path` always records its own install as implicitly
+ * approved, so the diff has to run before that, not after.
+ */
+export async function pkgTrustPreviewIncoming(
+	args: PkgTrustPreviewIncomingArgs
+): Promise<PkgTrustReview | null> {
+	return invoke<PkgTrustReview | null>('pkg_trust_preview_incoming', {
+		pkgId: args.pkgId,
+		manifestVersion: args.manifestVersion,
+		capabilitiesJson: args.capabilitiesJson ?? null,
+		permissionsJson: args.permissionsJson ?? null,
+	});
+}
+
 /**
  * Approve the current manifest's capabilities + permissions: write a new
  * explicit snapshot and re-register the pkg with the kernel (which boots

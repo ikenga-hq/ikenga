@@ -205,6 +205,7 @@ commands.allow = [
   "pkg_trust_list",
   "pkg_trust_list_pending",
   "pkg_trust_preview",
+  "pkg_trust_preview_incoming",
   "pkg_trust_reject",
   "pkg_trust_revoke",
   "pkg_uninstall",
