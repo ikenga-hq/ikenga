@@ -194,14 +194,34 @@ function normalizeOnboarding(value: unknown): OnboardingState {
 	const defaults = createDefaultOnboardingState();
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return defaults;
 	const record = value as Record<string, unknown>;
+	// `{...defaults.steps, ...record.steps}` merges by key — a persisted blob
+	// keyed on the pre-WP-38 step ids (agent/roots/packages/connectors/
+	// scaffolding/appearance/summary) has no overlapping keys with the new
+	// defaults, so every new-id step stays freshly `{status:'pending'}` and
+	// the stale keys just ride along unused. Safe by construction; no crash
+	// even without the version check below.
 	const steps =
 		record.steps && typeof record.steps === 'object' && !Array.isArray(record.steps)
 			? { ...defaults.steps, ...(record.steps as Record<string, OnboardingStepRecord>) }
 			: defaults.steps;
+	// WP-38 (ONBOARDING_STATE_VERSION 2 → 3): a persisted blob stamped with an
+	// older version predates the step-id re-map, so `activeIndex` (an index
+	// into the *old* 8-step order) and `selectedAgentId` no longer point at
+	// anything meaningful against the new 7-step `ONBOARDING_STEPS`. Reset
+	// just the wizard's own position bookkeeping — `startedAt`/`completedAt`
+	// survive (an already-finished user must not be resurrected into the
+	// wizard; `route.tsx`'s `beforeLoad` already redirects on `completedAt`),
+	// and every actual settings write from the old steps lives outside this
+	// object entirely, so nothing the shipped wizard wrote is lost.
+	const staleVersion = typeof record.version !== 'number' || record.version < ONBOARDING_STATE_VERSION;
 	return {
 		...defaults,
 		...record,
 		steps,
+		version: ONBOARDING_STATE_VERSION,
+		activeIndex: staleVersion ? 0 : clampActiveIndex(Number(record.activeIndex)),
+		mode: staleVersion ? 'first_run' : ((record.mode as OnboardingState['mode']) ?? 'first_run'),
+		selectedAgentId: staleVersion ? null : ((record.selectedAgentId as string | null) ?? null),
 		loreGlossSeen: Array.isArray(record.loreGlossSeen)
 			? record.loreGlossSeen.filter((term): term is string => typeof term === 'string')
 			: [],
@@ -568,15 +588,23 @@ export function restoreV15Backup(
 // Step bodies are filled in by Phase 4+; Phase 3 just lays down the shape +
 // migration + chrome.
 
+// WP-38 (D-04 consecration re-map): the shipped 8-step id set
+// (welcome/agent/roots/packages/connectors/scaffolding/appearance/summary)
+// is retired in favour of D-04's 7 steps, mapped onto the three nouns
+// (Chi/Obi/Ngwa). See `plans/shell-ux-rearchitecture/designs/onboarding.html`
+// header comment "OLD → NEW" for the full per-step mapping and the PR body
+// of the WP-38 PR for the write-map table. Old id → new id:
+//   welcome → welcome · agent → engine · roots → project
+//   packages + connectors + scaffolding → equipment (merged)
+//   appearance → look · summary → done · (new) → shortcuts
 export type OnboardingStepId =
 	| 'welcome'
-	| 'agent'
-	| 'roots'
-	| 'packages'
-	| 'connectors' // dynamic; substeps are derived (Phase 5)
-	| 'scaffolding'
-	| 'appearance'
-	| 'summary';
+	| 'engine'
+	| 'project'
+	| 'equipment' // dynamic; merges the old packages/connectors/scaffolding steps
+	| 'look'
+	| 'shortcuts' // new — no shipped equivalent (D-04)
+	| 'done';
 
 export type OnboardingStatus = 'pending' | 'in_progress' | 'completed' | 'skipped';
 
@@ -605,28 +633,44 @@ export interface OnboardingState {
 }
 
 // Canonical step order. Source of truth for activeIndex math + stepper UI.
+// D-04 order: welcome → engine → project → equipment → look → shortcuts → done.
 export const ONBOARDING_STEPS: readonly OnboardingStepId[] = Object.freeze([
 	'welcome',
-	'agent',
-	'roots',
-	'packages',
-	'connectors',
-	'scaffolding',
-	'appearance',
-	'summary',
+	'engine',
+	'project',
+	'equipment',
+	'look',
+	'shortcuts',
+	'done',
 ]);
 
-// Steps the user is allowed to skip. Welcome/Summary are not skippable
-// (they're framing), agent/roots/packages are required to actually use
-// the shell. The rest are optional.
+// Steps the user is allowed to skip. Per D-04's footer rule (`designs/
+// onboarding.html`: `$('#btnSkip').hidden = (S.step === 'welcome' || S.step
+// === 'done')`), Skip is available on every step except the first and last —
+// a deliberate widening from the shipped wizard, where `agent`/`roots`/
+// `packages` were not skippable. The shell is engine- and project-optional
+// (D-04 `engine-none` / "Start empty"), so this now matches product intent.
 export const OPTIONAL_ONBOARDING_STEPS: ReadonlySet<OnboardingStepId> = new Set<OnboardingStepId>([
-	'connectors',
-	'scaffolding',
-	'appearance',
+	'engine',
+	'project',
+	'equipment',
+	'look',
+	'shortcuts',
 ]);
 
-/** Bump when the OnboardingState shape changes in a way that needs migration. */
-export const ONBOARDING_STATE_VERSION = 2;
+/**
+ * Bump when the OnboardingState shape changes in a way that needs migration.
+ * v3 (WP-38): `OnboardingStepId` renamed/re-mapped (see the union's doc
+ * comment above). Nothing here touches `migrateShellStore` — the outer
+ * Zustand persist migration stays WP-40's alone (v17→v18 on 5b, per
+ * `05-tracking.md` §File ownership). Instead `normalizeOnboarding` below
+ * detects a stale `version` on rehydrate and resets just the wizard's own
+ * position bookkeeping (`activeIndex`/`mode`/`selectedAgentId`) to safe
+ * defaults — every actual *setting* the old wizard wrote (userName, extra
+ * roots, appearance, defaultEngineId, vault entries, scaffolded files) lives
+ * outside `onboarding.steps` and is untouched by this reset.
+ */
+export const ONBOARDING_STATE_VERSION = 3;
 
 function freshStepRecord(): OnboardingStepRecord {
 	return { status: 'pending' };
@@ -725,8 +769,11 @@ interface ShellState {
 
 	// ─── Default engine agent ────────────────────────────────────────────
 	// Which engine adapter pkg drives terminal sessions. Mirrors the
-	// agent step's `selectedAgentId` after onboarding completes; left
-	// null when the user picks offline mode.
+	// onboarding `engine` step's `selectedAgentId` (WP-38 wires the write —
+	// the pre-rename `agent` step recorded the choice on `onboarding.
+	// selectedAgentId` only and never actually called `setDefaultEngineId`
+	// despite this comment; see the WP-38 PR write-map); left null when the
+	// user picks offline mode.
 	defaultEngineId: string | null;
 	setDefaultEngineId: (id: string | null) => void;
 

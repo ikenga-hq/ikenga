@@ -1,14 +1,24 @@
-// Step 2 â Coding agent picker.
+// Step 2 (D-04 `engine`) — Chi picker. Renamed from the shipped `agent` step
+// (`agent-body.tsx`, retired by this file) as part of WP-38's re-map; see
+// the WP-38 PR body for the full old→new write map.
 //
 // Renders a fixed list of supported engines as cards with skeleton rows
 // while their PATH lookups resolve. Each engine probe fires independently
-// so the slowest one never blocks the fastest from revealing. The chosen
-// engineId is written through to settings_kv via `setDefaultEngineId` so
-// the choice survives "Clear local data". Empty-state still offers the
-// engine-noop offline CTA inherited from the previous flow.
+// so the slowest one never blocks the fastest from revealing. `results` /
+// `refresh` come from the route (`engine.tsx`), which owns the single
+// `useAgentDetect` call so the D-04 `engine-none` state check and this
+// body's render share one probe instead of two.
 //
-// Tests rely on `OFFLINE_PAYLOAD`, `agentToPayload`, `shouldShowAuthWarning`,
-// and `findEngineNoopEntry` â keep those exports stable.
+// FIX (WP-38): the retired `agent-body.tsx`'s header comment claimed "The
+// chosen engineId is written through to settings_kv via `setDefaultEngineId`
+// so the choice survives Clear local data" — but the code never actually
+// called `setDefaultEngineId`, only `setSelectedAgentId` (onboarding-local)
+// and the step payload. `designs/onboarding.html`'s `WRITES.engine` says
+// this step "Writes engine.default and the engine pkg install", so this
+// version actually calls `setDefaultEngineId`, closing that gap.
+//
+// Tests rely on `OFFLINE_PAYLOAD`, `engineToPayload`, `shouldShowAuthWarning`,
+// and `findEngineNoopEntry` — keep those exports stable.
 
 import { useMutation } from '@tanstack/react-query';
 import { openExternalUrl } from '@/lib/transport';
@@ -25,14 +35,16 @@ import {
 	type RegistryIndex,
 	resolveInstallPlan,
 } from '@/lib/registry/client';
+import { openSettingsFile } from '@/lib/settings/client';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { type AgentDetectEntry, useAgentDetect } from '@/lib/shell/use-agent-detect';
+import type { AgentDetectEntry, AgentDetectMap } from '@/lib/shell/use-agent-detect';
 import { type DetectedAgent, pkgInstallFromRegistry, pkgKernelStatus } from '@/lib/tauri-cmd';
+import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
 
 import { useOnboardingStep } from './use-onboarding-step';
 
-export interface AgentStepPayload {
+export interface EngineStepPayload {
 	agentId: string;
 	display?: string;
 	executablePath?: string;
@@ -40,20 +52,22 @@ export interface AgentStepPayload {
 	authed?: boolean | null;
 }
 
-interface AgentBodyProps {
+interface EngineBodyProps {
 	onContinue: () => void;
+	results: AgentDetectMap;
+	refresh: () => void;
 }
 
 const OFFLINE_AGENT_ID = 'engine-noop';
 const ENGINE_NOOP_NPM_NAME = '@ikenga/pkg-engine-noop';
 const ENGINE_NOOP_PKG_ID = 'com.ikenga.engine-noop';
 const REGISTRY_UNREACHABLE_MSG =
-	"Couldn't reach the registry â you can install the offline engine later from Packages â Browse.";
+	"Couldn't reach the registry — you can install the offline engine later from Ngwa → Store.";
 
 // Stable display order. The Rust side already knows about these ids in
 // `KNOWN_AGENTS`; the wizard surfaces them whether the binary is present
 // or not so the user sees the full menu of supported engines.
-const SUPPORTED_ENGINES: ReadonlyArray<{
+export const SUPPORTED_ENGINES: ReadonlyArray<{
 	id: string;
 	display: string;
 	description: string;
@@ -64,7 +78,7 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'claude-code',
 		display: 'Claude Code',
-		description: 'Anthropic â full ACP capabilities, MCP, thinking, resume.',
+		description: 'Anthropic — full ACP capabilities, MCP, thinking, resume.',
 		binaryHint: 'claude',
 		docsUrl: 'https://docs.anthropic.com/en/docs/claude-code',
 		installCmd: 'npm install -g @anthropic-ai/claude-code',
@@ -72,7 +86,7 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'codex',
 		display: 'OpenAI Codex CLI',
-		description: 'OpenAI â streaming + tool use. No MCP yet.',
+		description: 'OpenAI — streaming + tool use. No MCP yet.',
 		binaryHint: 'codex',
 		docsUrl: 'https://platform.openai.com/docs/guides/codex',
 		installCmd: 'npm install -g @openai/codex',
@@ -80,7 +94,7 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'gemini',
 		display: 'Gemini CLI',
-		description: 'Google â streaming + tool use.',
+		description: 'Google — streaming + tool use.',
 		binaryHint: 'gemini',
 		docsUrl: 'https://github.com/google-gemini/gemini-cli',
 		installCmd: 'npm install -g @google/gemini-cli',
@@ -88,14 +102,14 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'cursor-agent',
 		display: 'Cursor Agent',
-		description: 'Cursor â€” streaming, tool use, MCP.',
+		description: 'Cursor — streaming, tool use, MCP.',
 		binaryHint: 'cursor-agent',
 		docsUrl: 'https://docs.cursor.com/en/cli',
 	},
 	{
 		id: 'opencode',
 		display: 'OpenCode',
-		description: 'Open source â€” terminal coding agent, subagents, MCP, models.',
+		description: 'Open source — terminal coding agent, subagents, MCP, models.',
 		binaryHint: 'opencode',
 		docsUrl: 'https://opencode.ai',
 		installCmd: 'npm install -g opencode-ai',
@@ -103,7 +117,7 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'pi',
 		display: 'Pi Coding Agent',
-		description: 'Minimalist coding harness â€” multi-provider, edit, bash tools.',
+		description: 'Minimalist coding harness — multi-provider, edit, bash tools.',
 		binaryHint: 'pi',
 		docsUrl: 'https://github.com/earendil-works/pi',
 		installCmd: 'npm install -g @earendil-works/pi-coding-agent',
@@ -111,20 +125,29 @@ const SUPPORTED_ENGINES: ReadonlyArray<{
 	{
 		id: 'ollama',
 		display: 'Ollama',
-		description: 'Local models â€” terminal use, no tool use yet.',
+		description: 'Local models — terminal use, no tool use yet.',
 		binaryHint: 'ollama',
 		docsUrl: 'https://ollama.com',
 	},
 ];
 
-const SUPPORTED_ENGINE_IDS = SUPPORTED_ENGINES.map((e) => e.id);
+export const SUPPORTED_ENGINE_IDS = SUPPORTED_ENGINES.map((e) => e.id);
 
-export function AgentBody({ onContinue }: AgentBodyProps) {
-	const { record, setPayload } = useOnboardingStep<AgentStepPayload>('agent');
+/** Pure — exported so the route (`engine.tsx`) can compute the D-04
+ *  `engine-none` chrome state from the same probe results this body
+ *  renders, without re-running `useAgentDetect`. */
+export function computeAllMissing(results: AgentDetectMap): boolean {
+	const anyDetected = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'detected');
+	const anyPending = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'pending');
+	return !anyPending && !anyDetected;
+}
+
+export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
+	const { record, setPayload } = useOnboardingStep<EngineStepPayload>('engine');
 	const selectedAgentId = useShellStore((s) => s.onboarding.selectedAgentId);
 	const setSelectedAgentId = useShellStore((s) => s.setSelectedAgentId);
+	const setDefaultEngineId = useShellStore((s) => s.setDefaultEngineId);
 
-	const { results, refresh } = useAgentDetect(SUPPORTED_ENGINE_IDS);
 	const isOffline = selectedAgentId === OFFLINE_AGENT_ID;
 
 	// Pre-select the first detected engine the first time the user lands
@@ -142,14 +165,15 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 
 	function applySelection(agent: DetectedAgent) {
 		setSelectedAgentId(agent.id);
-		setPayload(agentToPayload(agent));
+		setDefaultEngineId(agent.id);
+		setPayload(engineToPayload(agent));
 	}
 
 	const handleSelect = (agent: DetectedAgent) => {
 		applySelection(agent);
 	};
 
-	// âââ Manual override ââââââââââââââââââââââââââââââââââââââââââââââââââ
+	// ── Manual override ─────────────────────────────────────────────────
 	const [overridePath, setOverridePath] = useState('');
 	const [overrideError, setOverrideError] = useState<string | null>(null);
 	const [overrideBusy, setOverrideBusy] = useState(false);
@@ -167,7 +191,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 		setOverrideBusy(true);
 		setOverrideError(null);
 		try {
-			// Spawn-and-respond is the only verification we owe the user â the
+			// Spawn-and-respond is the only verification we owe the user — the
 			// engine adapter will surface a clear error if the binary fails on
 			// first send. Pin a generic 'custom' id and stash the path in the
 			// payload so the adapter can pick it up.
@@ -193,7 +217,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 		}
 	}
 
-	// âââ Offline fallback (engine-noop install) âââââââââââââââââââââââââââ
+	// ── Offline fallback (engine-noop install) ──────────────────────────
 	const [offlineError, setOfflineError] = useState<string | null>(null);
 
 	const offlineMut = useMutation({
@@ -233,6 +257,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 		onSuccess: () => {
 			setOfflineError(null);
 			setSelectedAgentId(OFFLINE_AGENT_ID);
+			setDefaultEngineId(null);
 			setPayload(OFFLINE_PAYLOAD);
 		},
 		onError: (e) => {
@@ -259,7 +284,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 	const allMissing = !anyPending && !anyDetected;
 
 	const offlineButtonLabel = (long: boolean) => {
-		if (offlineMut.isPending) return 'Installing offline engineâ¦';
+		if (offlineMut.isPending) return 'Installing offline engine…';
 		if (isOffline) return 'Offline selected';
 		return long ? 'Use offline mode' : 'Continue offline';
 	};
@@ -274,16 +299,15 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 					>
 						Choose your <LoreTerm term="Chi">Chi</LoreTerm>
 					</p>
-					<h1 className="text-3xl font-bold leading-tight tracking-tight">
-						Which <LoreTerm term="Chi">Chi</LoreTerm> should drive your{' '}
-						<LoreTerm term="Ikenga">Ikenga</LoreTerm>?
+					<h1 className="font-display text-3xl font-bold leading-tight tracking-tight">
+						Pick your <LoreTerm term="Chi">Chi</LoreTerm>.
 					</h1>
 					<p className="mt-2 max-w-[60ch] text-sm" style={{ color: 'var(--fg-muted)' }}>
 						{anyPending
-							? 'Scanning your $PATH for each agent in parallelâ¦'
+							? 'Scanning your $PATH for each agent in parallel…'
 							: anyDetected
-								? 'Pick one to continue. You can change your Chi later from Settings â Engine.'
-								: "We couldn't find any Chi on $PATH. Install one below, point at a custom binary, or continue offline."}
+								? 'Pick one to continue. You can change your Chi later from Settings → Chi & engines.'
+								: "We couldn't find any Chi on $PATH. Install one below, point at a custom binary, or continue offline — the shell is engine-optional."}
 					</p>
 				</div>
 				<Button variant="secondary" size="sm" onClick={() => refresh()} data-testid="agents-rescan">
@@ -291,7 +315,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 				</Button>
 			</div>
 
-			{/* ââ Engine grid (always 5 cards; status reveals per-engine) ââââ */}
+			{/* ── Engine grid (always 7 cards; status reveals per-engine) ── */}
 			<div className="grid gap-4 md:grid-cols-2" data-testid="agents-grid">
 				{SUPPORTED_ENGINES.map((engine) => {
 					const entry = results[engine.id] ?? { status: 'pending' as const };
@@ -312,7 +336,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 				})}
 			</div>
 
-			{/* ââ Custom binary override âââââââââââââââââââââââââââââââââââââ */}
+			{/* ── Custom binary override ──────────────────────────────── */}
 			<details
 				className="mt-6 rounded-md border p-4"
 				style={{ borderColor: 'var(--border-soft)', background: 'var(--bg-surface)' }}
@@ -350,7 +374,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 							disabled={overrideBusy}
 							data-testid="agents-override-apply"
 						>
-							{overrideBusy ? 'Verifyingâ¦' : 'Use this binary'}
+							{overrideBusy ? 'Verifying…' : 'Use this binary'}
 						</Button>
 					</div>
 					{overrideError && (
@@ -369,7 +393,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 				</div>
 			</details>
 
-			{/* ââ Offline-mode strip ââââââââââââââââââââââââââââââââââââââââ */}
+			{/* ── Offline-mode strip ──────────────────────────────────── */}
 			<div
 				className="mt-6 flex items-center gap-4 rounded-md border border-dashed p-4"
 				style={{ borderColor: 'var(--border-strong)' }}
@@ -387,7 +411,7 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 				<div className="flex-1">
 					<div className="text-[13px] font-semibold">
 						{allMissing
-							? 'No Chi found on this machine â continue without one'
+							? 'No Chi found on this machine — continue without one'
 							: 'Continue without a Chi'}
 					</div>
 					<div className="mt-0.5 text-xs" style={{ color: 'var(--fg-muted)' }}>
@@ -420,7 +444,12 @@ export function AgentBody({ onContinue }: AgentBodyProps) {
 				</div>
 			)}
 
-			{/* ââ Inline Continue ââââââââââââââââââââââââââââââââââââââââââââ */}
+			<WritesNote
+				stepId="engine"
+				onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
+			/>
+
+			{/* ── Inline Continue ─────────────────────────────────────── */}
 			<div className="mt-8 flex items-center justify-end gap-3">
 				<Button
 					onClick={onContinue}
@@ -454,8 +483,8 @@ interface EngineCardProps {
 
 function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardProps) {
 	const interactive = entry.status === 'detected';
-	// `div role="button"` (not a real <button>) so the "Docs â" affordance can
-	// nest inside â the HTML spec and React forbid <button> inside <button>.
+	// `div role="button"` (not a real <button>) so the "Docs →" affordance can
+	// nest inside — the HTML spec and React forbid <button> inside <button>.
 	const handleKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
 		if (!interactive) return;
 		if (e.key === 'Enter' || e.key === ' ') {
@@ -496,7 +525,7 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 					style={{ background: 'var(--primary)', color: 'var(--primary-fg, white)' }}
 					aria-hidden="true"
 				>
-					â
+					✓
 				</span>
 			)}
 
@@ -555,7 +584,7 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 							className="text-[11.5px] underline-offset-2 hover:underline"
 							style={{ color: 'var(--primary)' }}
 						>
-							Docs â
+							Docs →
 						</button>
 					</div>
 				)}
@@ -593,7 +622,7 @@ function StatusPill({ entry }: { entry: AgentDetectEntry }) {
 		return (
 			<span data-testid="status-pill" data-status="pending">
 				<StatusChip tone="faint" dot className="animate-pulse">
-					Scanningâ¦
+					Scanning…
 				</StatusChip>
 			</span>
 		);
@@ -635,7 +664,7 @@ function AuthPill({ authed }: { authed: boolean | null }) {
 	return null;
 }
 
-// ââ Pure helpers (testable without DOM) âââââââââââââââââââââââââââââââââ
+// ── Pure helpers (testable without DOM) ─────────────────────────────────
 
 /** Decide whether the auth-warning banner should render for the given
  *  selected agent. */
@@ -644,7 +673,7 @@ export function shouldShowAuthWarning(agent: DetectedAgent | null | undefined): 
 }
 
 /** Build the payload we persist when an agent card is selected. */
-export function agentToPayload(agent: DetectedAgent): AgentStepPayload {
+export function engineToPayload(agent: DetectedAgent): EngineStepPayload {
 	return {
 		agentId: agent.id,
 		display: agent.display,
@@ -654,9 +683,9 @@ export function agentToPayload(agent: DetectedAgent): AgentStepPayload {
 	};
 }
 
-/** The offline fallback payload â exported so the summary step and tests
+/** The offline fallback payload — exported so the summary step and tests
  *  share the same constant. */
-export const OFFLINE_PAYLOAD: AgentStepPayload = Object.freeze({
+export const OFFLINE_PAYLOAD: EngineStepPayload = Object.freeze({
 	agentId: OFFLINE_AGENT_ID,
 	display: 'Offline (no engine)',
 	authed: null,

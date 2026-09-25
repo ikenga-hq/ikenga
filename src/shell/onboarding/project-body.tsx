@@ -1,11 +1,12 @@
-// Step 3 — Projects.
+// Step 3 (D-04 `project`) — the container. Renamed from the shipped `roots`
+// step (`roots-body.tsx`, retired by this file) as part of WP-38's re-map.
 //
-// One list: users pick the project folders Ikenga should know about;
-// on Continue we write them to `activeProject.extra_roots`.
-//
-// The pre-merge version of this file maintained two side-by-side sections
-// (file roots + project roots). User testing showed the distinction was
-// confusing — the goal here is to ask one question.
+// One list: users pick the project folders Ikenga should know about; on
+// Continue we write them to `activeProject.extra_roots`. The "extra roots"
+// framing survives verbatim inside this step per the WP-38 write-map
+// (`designs/onboarding.html`'s comment: "`extra roots` (roots-body's second
+// list) survives as the project step's 'Extra roots' disclosure" — this
+// body already reads as one list asking one question, same as before).
 //
 // Suggestions come from a `~/.claude/projects/` scan (Rust command
 // `list_claude_projects`); the decoder there now keeps any FS-verified
@@ -18,17 +19,19 @@ import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
+import { openSettingsFile } from '@/lib/settings/client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { type ClaudeProjectEntry, listClaudeProjects } from '@/lib/tauri-cmd';
+import { WritesNote } from '@/shell/onboarding/footer';
 import { useEffect, useState } from 'react';
 
 import { useOnboardingStep } from './use-onboarding-step';
 
-export interface RootsStepPayload {
+export interface ProjectStepPayload {
 	extraRoots: string[];
 }
 
-interface RootsBodyProps {
+interface ProjectBodyProps {
 	onContinue: () => void;
 }
 
@@ -53,7 +56,7 @@ export function mirrorProjectsToFileRoots(paths: readonly string[]): void {
 	state.setProjectExtraRoots(activeId, next);
 }
 
-export function RootsBody({ onContinue }: RootsBodyProps) {
+export function ProjectBody({ onContinue }: ProjectBodyProps) {
 	const activeProject = useShellStore((s) => s.activeProject);
 	const setProjectExtraRoots = useShellStore((s) => s.setProjectExtraRoots);
 	const roots = activeProject?.extra_roots ?? [];
@@ -75,7 +78,7 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 		setProjectExtraRoots(activeId, roots.map((r) => (r === oldPath ? nextPath : r)));
 	}
 
-	const { setPayload } = useOnboardingStep<RootsStepPayload>('roots');
+	const { setPayload } = useOnboardingStep<ProjectStepPayload>('project');
 
 	const [customProjectPath, setCustomProjectPath] = useState('');
 
@@ -115,13 +118,14 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 	return (
 		<div className="mx-auto max-w-3xl">
 			<div className="mb-6">
-				<h2 className="text-lg font-semibold tracking-tight text-foreground">
-					Which projects should <LoreTerm term="ikenga" /> know about?
+				<h2 className="font-display text-lg font-semibold tracking-tight text-foreground">
+					Open a project.
 				</h2>
 				<p className="mt-1 text-sm text-muted-foreground">
-					We will scan each folder for <span className="font-mono text-xs">.claude/</span>{' '}
-					configuration and make them reachable from the file tree. You can always add more from
-					Settings later.
+					Project is the container. Every surface — files, artifacts, sessions,{' '}
+					<LoreTerm term="Ngwa">Ngwa</LoreTerm>, automations — is scoped to the one that is open. We
+					will scan each folder for <span className="font-mono text-xs">.claude/</span>{' '}
+					configuration. You can always add more from Settings later.
 				</p>
 			</div>
 
@@ -239,8 +243,13 @@ export function RootsBody({ onContinue }: RootsBodyProps) {
 				)}
 			</div>
 
+			<WritesNote
+				stepId="project"
+				onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
+			/>
+
 			<div className="mt-8 flex items-center justify-end gap-3">
-				<Button onClick={handleContinue} data-testid="roots-inline-continue">
+				<Button onClick={handleContinue} data-testid="project-inline-continue">
 					Continue
 				</Button>
 			</div>
