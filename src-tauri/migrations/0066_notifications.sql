@@ -43,7 +43,7 @@
 --   - One statement per ';' (split by runner).
 --   - Only '--' line comments.
 
-CREATE TABLE IF NOT EXISTS notifications (
+CREATE TABLE IF NOT EXISTS shell_notifications (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   kind        TEXT    NOT NULL,
   title       TEXT    NOT NULL,
@@ -58,17 +58,17 @@ CREATE TABLE IF NOT EXISTS notifications (
   resolved_at INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_notifications_updated
-  ON notifications (updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_shell_notifications_updated
+  ON shell_notifications (updated_at DESC, id DESC);
 
-CREATE INDEX IF NOT EXISTS idx_notifications_unread_kind
-  ON notifications (read_at, kind);
+CREATE INDEX IF NOT EXISTS idx_shell_notifications_unread_kind
+  ON shell_notifications (read_at, kind);
 
-CREATE INDEX IF NOT EXISTS idx_notifications_dedupe
-  ON notifications (dedupe_key, read_at);
+CREATE INDEX IF NOT EXISTS idx_shell_notifications_dedupe
+  ON shell_notifications (dedupe_key, read_at);
 
-CREATE INDEX IF NOT EXISTS idx_notifications_kind_resolved
-  ON notifications (kind, resolved_at);
+CREATE INDEX IF NOT EXISTS idx_shell_notifications_kind_resolved
+  ON shell_notifications (kind, resolved_at);
 
 -- When each kind was muted (unix ms), so un-muting marks read only the rows
 -- recorded WHILE muted (`updated_at >= muted_at`), not an older backlog that

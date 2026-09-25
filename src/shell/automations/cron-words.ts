@@ -18,7 +18,7 @@ function isWildcard(field: string): boolean {
 	return field === '*';
 }
 
-/** `*/N` → N, else null. */
+// `*/N` → N, else null.
 function stepValue(field: string): number | null {
 	const m = /^\*\/(\d+)$/.exec(field);
 	return m ? Number(m[1]) : null;

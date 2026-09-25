@@ -367,7 +367,7 @@ pub async fn record(
     let outcome_id: Option<(i64, bool)> = match (&new.dedupe_key, new.coalesce) {
         (Some(key), Coalesce::Once) => {
             let exists: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM notifications WHERE dedupe_key = ? LIMIT 1")
+                sqlx::query_scalar("SELECT id FROM shell_notifications WHERE dedupe_key = ? LIMIT 1")
                     .bind(key)
                     .fetch_optional(&mut *tx)
                     .await
@@ -380,7 +380,7 @@ pub async fn record(
         }
         (Some(key), Coalesce::WhileUnread) => {
             let unread: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM notifications
+                "SELECT id FROM shell_notifications
                  WHERE dedupe_key = ? AND read_at IS NULL AND resolved_at IS NULL
                  ORDER BY id DESC LIMIT 1",
             )
@@ -391,7 +391,7 @@ pub async fn record(
             match unread {
                 Some(id) => {
                     sqlx::query(
-                        "UPDATE notifications
+                        "UPDATE shell_notifications
                          SET title = ?, body = ?, action = ?, source = ?,
                              count = count + 1, updated_at = ?
                          WHERE id = ?",
@@ -417,7 +417,7 @@ pub async fn record(
         Some(found) => found,
         None => {
             let res = sqlx::query(
-                "INSERT INTO notifications
+                "INSERT INTO shell_notifications
                    (kind, title, body, action, source, dedupe_key, count, created_at, updated_at, read_at)
                  VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)",
             )
@@ -439,7 +439,7 @@ pub async fn record(
     prune(&mut tx, now).await?;
 
     let row = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM notifications WHERE id = ?"
+        "SELECT {SELECT_COLUMNS} FROM shell_notifications WHERE id = ?"
     ))
     .bind(id)
     .fetch_one(&mut *tx)
@@ -496,20 +496,20 @@ async fn prune(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     now: i64,
 ) -> Result<(), String> {
-    sqlx::query("DELETE FROM notifications WHERE read_at IS NOT NULL AND updated_at < ?")
+    sqlx::query("DELETE FROM shell_notifications WHERE read_at IS NOT NULL AND updated_at < ?")
         .bind(now - READ_RETENTION_MS)
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("notifications prune (age): {e}"))?;
     let protected: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(*) FROM notifications WHERE {PROTECTED_FROM_CAP}"
+        "SELECT COUNT(*) FROM shell_notifications WHERE {PROTECTED_FROM_CAP}"
     ))
     .fetch_one(&mut **tx)
     .await
     .map_err(|e| format!("notifications prune (count): {e}"))?;
     sqlx::query(&format!(
-        "DELETE FROM notifications WHERE id IN (
-           SELECT id FROM notifications
+        "DELETE FROM shell_notifications WHERE id IN (
+           SELECT id FROM shell_notifications
            WHERE NOT ({PROTECTED_FROM_CAP})
            ORDER BY updated_at DESC, id DESC
            LIMIT -1 OFFSET ?
@@ -524,7 +524,7 @@ async fn prune(
 
 /// Newest first (by latest occurrence).
 pub async fn list(pool: &sqlx::SqlitePool, q: &ListQuery) -> Result<Vec<Notification>, String> {
-    let mut sql = format!("SELECT {SELECT_COLUMNS} FROM notifications WHERE 1 = 1");
+    let mut sql = format!("SELECT {SELECT_COLUMNS} FROM shell_notifications WHERE 1 = 1");
     let mut binds: Vec<String> = Vec::new();
     if q.unread_only {
         sql.push_str(" AND read_at IS NULL");
@@ -589,7 +589,7 @@ pub async fn unread_count(
     exclude: &[NotificationKind],
 ) -> Result<UnreadCount, String> {
     let rows = sqlx::query(
-        "SELECT kind, COUNT(*) AS n FROM notifications
+        "SELECT kind, COUNT(*) AS n FROM shell_notifications
          WHERE read_at IS NULL AND resolved_at IS NULL
          GROUP BY kind",
     )
@@ -612,7 +612,7 @@ pub async fn unread_count(
     }
     // Permission cannot be muted, so `exclude` never applies here.
     out.pending_permissions = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM notifications WHERE kind = 'permission' AND resolved_at IS NULL",
+        "SELECT COUNT(*) FROM shell_notifications WHERE kind = 'permission' AND resolved_at IS NULL",
     )
     .fetch_one(pool)
     .await
@@ -627,7 +627,7 @@ pub async fn mark_read(pool: &sqlx::SqlitePool, ids: &[i64]) -> Result<u64, Stri
         return Ok(0);
     }
     let sql = format!(
-        "UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND id IN ({})",
+        "UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL AND id IN ({})",
         placeholders(ids.len())
     );
     let mut query = sqlx::query(&sql).bind(now_ms());
@@ -653,14 +653,14 @@ pub async fn mark_all_read(
     let now = now_ms();
     let res = match kind {
         Some(k) => {
-            sqlx::query("UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND kind = ?")
+            sqlx::query("UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL AND kind = ?")
                 .bind(now)
                 .bind(k.as_str())
                 .execute(pool)
                 .await
         }
         None => {
-            sqlx::query("UPDATE notifications SET read_at = ? WHERE read_at IS NULL")
+            sqlx::query("UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL")
                 .bind(now)
                 .execute(pool)
                 .await
@@ -678,7 +678,7 @@ pub async fn mark_all_read(
 /// thing a row asks about is over, use [`resolve_by_key`].
 pub async fn mark_read_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Result<u64, String> {
     let changed = sqlx::query(
-        "UPDATE notifications SET read_at = ? WHERE read_at IS NULL AND dedupe_key = ?",
+        "UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL AND dedupe_key = ?",
     )
     .bind(now_ms())
     .bind(dedupe_key)
@@ -701,7 +701,7 @@ pub async fn mark_read_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Resu
 pub async fn resolve_by_key(pool: &sqlx::SqlitePool, dedupe_key: &str) -> Result<u64, String> {
     let now = now_ms();
     let changed = sqlx::query(
-        "UPDATE notifications
+        "UPDATE shell_notifications
          SET resolved_at = ?, read_at = COALESCE(read_at, ?)
          WHERE resolved_at IS NULL AND dedupe_key = ?",
     )
@@ -754,7 +754,7 @@ pub async fn resolve_installed_updates(
     installed_pkgs: &[(String, String)],
 ) -> Result<u64, String> {
     let keys: Vec<String> = sqlx::query_scalar(
-        "SELECT dedupe_key FROM notifications
+        "SELECT dedupe_key FROM shell_notifications
          WHERE kind = 'update' AND resolved_at IS NULL AND dedupe_key IS NOT NULL",
     )
     .fetch_all(pool)
@@ -845,7 +845,7 @@ mod tests {
     async fn migration_0066_creates_the_notifications_table() {
         let (pool, _tmp) = fresh_pool().await;
         let cols: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info('notifications')")
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('shell_notifications')")
                 .fetch_all(&pool)
                 .await
                 .unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
         let old = now_ms() - READ_RETENTION_MS - 1000;
         for read in [true, false] {
             sqlx::query(
-                "INSERT INTO notifications (kind, title, source, count, created_at, updated_at, read_at)
+                "INSERT INTO shell_notifications (kind, title, source, count, created_at, updated_at, read_at)
                  VALUES ('update', 'old', 'test', 1, ?, ?, ?)",
             )
             .bind(old)
@@ -1245,7 +1245,7 @@ mod tests {
         let old = now_ms() - 60_000;
         // The oldest row in the table: an unread, unresolved permission ask.
         sqlx::query(
-            "INSERT INTO notifications (kind, title, source, dedupe_key, count, created_at, updated_at)
+            "INSERT INTO shell_notifications (kind, title, source, dedupe_key, count, created_at, updated_at)
              VALUES ('permission', 'held ask', 'test', 'permission:hook:old', 1, ?, ?)",
         )
         .bind(old)
@@ -1256,7 +1256,7 @@ mod tests {
         // Fill past the cap with newer violation rows.
         for i in 0..MAX_ROWS {
             sqlx::query(
-                "INSERT INTO notifications (kind, title, source, count, created_at, updated_at)
+                "INSERT INTO shell_notifications (kind, title, source, count, created_at, updated_at)
                  VALUES ('violation', 'v', 'test', 1, ?, ?)",
             )
             .bind(old + 1 + i)
@@ -1268,13 +1268,13 @@ mod tests {
         record(&pool, note(NotificationKind::Violation, None, Coalesce::Never))
             .await
             .unwrap();
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shell_notifications")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(total, MAX_ROWS, "cap still bounds the table");
         let ask: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM notifications WHERE dedupe_key = 'permission:hook:old'",
+            "SELECT id FROM shell_notifications WHERE dedupe_key = 'permission:hook:old'",
         )
         .fetch_optional(&pool)
         .await
@@ -1286,7 +1286,7 @@ mod tests {
     async fn list_skips_rows_of_an_unknown_kind() {
         let (pool, _tmp) = fresh_pool().await;
         sqlx::query(
-            "INSERT INTO notifications (kind, title, source, count, created_at, updated_at)
+            "INSERT INTO shell_notifications (kind, title, source, count, created_at, updated_at)
              VALUES ('from_the_future', 'x', 'test', 1, 1, 1)",
         )
         .execute(&pool)
@@ -1352,7 +1352,7 @@ mod tests {
             .await
             .unwrap();
         // Back-date it so it is strictly older than the mute time.
-        sqlx::query("UPDATE notifications SET updated_at = updated_at - 10000 WHERE id = ?")
+        sqlx::query("UPDATE shell_notifications SET updated_at = updated_at - 10000 WHERE id = ?")
             .bind(before.notification().unwrap().id)
             .execute(&pool)
             .await

@@ -176,7 +176,7 @@ pub async fn clear_muted_backlog(
     let mut changed = 0;
     if let Some(since) = muted_at {
         changed = sqlx::query(
-            "UPDATE notifications SET read_at = ?
+            "UPDATE shell_notifications SET read_at = ?
              WHERE read_at IS NULL AND kind = ? AND updated_at >= ?",
         )
         .bind(chrono::Utc::now().timestamp_millis())
