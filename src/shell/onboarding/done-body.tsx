@@ -306,6 +306,13 @@ function renderCard(
 	if (rec.status === 'skipped') {
 		return { ...base, value: 'Skipped', skipped: true };
 	}
+	// Only a completed step's writes are real. A step left via Back or the
+	// rail may still hold a payload from before this rule (or a pre-commit
+	// default), which would name a project / engine / pack the user never
+	// confirmed. Welcome and Keys already read `status` themselves.
+	if (rec.status !== 'completed' && id !== 'welcome' && id !== 'shortcuts') {
+		return { ...base, value: 'Not answered' };
+	}
 	switch (id) {
 		case 'welcome': {
 			return {

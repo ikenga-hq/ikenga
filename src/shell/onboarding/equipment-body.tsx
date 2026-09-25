@@ -63,7 +63,11 @@ import {
 	scaffoldAgentConfig,
 } from '@/lib/tauri-cmd';
 import { WritesNote } from '@/shell/onboarding/footer';
-import { effectiveOnboardingScope, useOnboardingScope } from '@/shell/onboarding/scope';
+import {
+	effectiveOnboardingScope,
+	onboardingClaudeRoot,
+	useOnboardingScope,
+} from '@/shell/onboarding/scope';
 import { SettingsScopeSwitch } from '@/shell/settings/scope-switch';
 
 import { useOnboardingStep } from './use-onboarding-step';
@@ -313,8 +317,18 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 		queryFn: loadHome,
 		staleTime: Number.POSITIVE_INFINITY,
 	});
-	const claudeRoot = scope === 'project' ? primaryRoot : homeDir || null;
-	const claudeDirLabel = scope === 'project' ? '<project>/.claude/' : '~/.claude/';
+	// Never touch the home `~/.claude/` implicitly: with no project root the
+	// switch falls back to personal on its own, and that fallback must not
+	// scaffold or merge into a directory the user never pointed at. Personal
+	// is a target only once the user picks it (`explicitScope`); until then
+	// the `.claude/` option is off, with the reason shown (§1.2).
+	const personalChosen = scope === 'personal' && explicitScope === 'personal';
+	const claudeRoot = onboardingClaudeRoot(explicitScope, primaryRoot, homeDir);
+	const claudeDirLabel = !claudeRoot
+		? null
+		: scope === 'project'
+			? '<project>/.claude/'
+			: '~/.claude/';
 	const isClaudeAgent = selectedAgentId === 'claude-code';
 
 	const { data: inventory } = useQuery<AgentConfigInventory>({
@@ -552,9 +566,28 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 							style={{ borderColor: 'var(--border-soft)', color: 'var(--fg-muted)' }}
 							data-testid="equipment-no-claude"
 						>
-							{isClaudeAgent
-								? 'No project root selected — add one from the previous step to scaffold .claude/.'
-								: '.claude/ scaffolding only ships for Claude Code today. Skipped for your engine.'}
+							{isClaudeAgent && personalChosen ? (
+								'Locating your personal ~/.claude/…'
+							) : isClaudeAgent ? (
+								<>
+									<div data-testid="equipment-no-claude-reason">
+										No project root — nothing will be written to .claude/. Add a project from the
+										previous step, or choose your personal ~/.claude/ on purpose.
+									</div>
+									<Button
+										type="button"
+										size="sm"
+										variant="outline"
+										className="mt-3"
+										onClick={() => setScope('personal')}
+										data-testid="equipment-use-personal-claude"
+									>
+										Use my personal ~/.claude/
+									</Button>
+								</>
+							) : (
+								'.claude/ scaffolding only ships for Claude Code today. Skipped for your engine.'
+							)}
 						</div>
 					)}
 
@@ -568,7 +601,10 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						</div>
 					)}
 
-					<WritesNote stepId="equipment" file={`~/.ikenga/pkgs/ + ${claudeDirLabel}`} />
+					<WritesNote
+						stepId="equipment"
+						file={claudeDirLabel ? `~/.ikenga/pkgs/ + ${claudeDirLabel}` : '~/.ikenga/pkgs/'}
+					/>
 				</div>
 
 				{/* ── Col B: suggested packages + connectors ─────────────── */}

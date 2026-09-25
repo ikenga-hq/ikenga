@@ -153,6 +153,8 @@ interface OnboardingFooterProps {
 	onBack: () => void;
 	onSkip: () => void;
 	onNext: () => void;
+	/** A step commit is in flight: Continue shows busy and ignores clicks. */
+	nextBusy?: boolean;
 }
 
 export function OnboardingFooter({
@@ -164,6 +166,7 @@ export function OnboardingFooter({
 	onBack,
 	onSkip,
 	onNext,
+	nextBusy = false,
 }: OnboardingFooterProps) {
 	const links = SETTINGS_LINKS[stepId];
 	return (
@@ -207,10 +210,12 @@ export function OnboardingFooter({
 					)}
 					<Button
 						onClick={onNext}
+						disabled={nextBusy}
+						aria-busy={nextBusy || undefined}
 						data-testid="wizard-next"
 						className="h-11 px-6 text-sm font-semibold"
 					>
-						{isLast ? 'Enter your Obi' : 'Continue'}
+						{nextBusy ? 'Saving…' : isLast ? 'Enter your Obi' : 'Continue'}
 					</Button>
 				</div>
 			</div>

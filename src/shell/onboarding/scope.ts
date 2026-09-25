@@ -31,3 +31,20 @@ export function effectiveOnboardingScope(
 	if (!projectRoot) return 'personal';
 	return explicit ?? 'project';
 }
+
+/**
+ * Where the `equipment` step may read / write `.claude/`, or `null` for
+ * nowhere. Project scope → the project root. Personal → the home directory,
+ * but ONLY when the user picked Personal on purpose: the rootless fallback
+ * above ("Start empty", or a default project with no root) is personal by
+ * default, and a default must never scaffold into `~/.claude/`.
+ */
+export function onboardingClaudeRoot(
+	explicit: SettingsScopeId | null,
+	projectRoot: string | null,
+	homeDir: string | null | undefined
+): string | null {
+	const scope = effectiveOnboardingScope(explicit, projectRoot);
+	if (scope === 'project') return projectRoot;
+	return explicit === 'personal' ? homeDir || null : null;
+}

@@ -34,6 +34,7 @@ import {
 	type OnboardingStepRecord,
 	useShellStore,
 } from '@/lib/shell/shell-store';
+import { ErrorState } from '@/components/states';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
 
@@ -72,7 +73,9 @@ export interface WizardStepChildArgs<P> {
 	isLast: boolean;
 	/** Register work that must finish before the wizard advances — run by
 	 *  BOTH the footer's Continue and a body's inline one (they share
-	 *  `goNext`). A throw keeps the user on the step. Pass null to clear. */
+	 *  `goNext`, which runs at most one commit at a time). A throw keeps the
+	 *  user on the step and shows the error inline with a Retry. Pass null
+	 *  to clear. */
 	setBeforeNext: (fn: BeforeNext | null) => void;
 }
 
@@ -147,6 +150,12 @@ export function WizardStepper<P = unknown>({
 
 	const bodyRef = useRef<HTMLDivElement>(null);
 	const beforeNextRef = useRef<BeforeNext | null>(null);
+	// One commit at a time: a double-click (or footer + inline Continue) must
+	// not run `beforeNext` twice — e.g. two `project_create` calls. The ref
+	// guards synchronously; the state drives the busy Continue.
+	const committingRef = useRef(false);
+	const [committing, setCommitting] = useState(false);
+	const [commitError, setCommitError] = useState<string | null>(null);
 
 	useEffect(() => {
 		if (myIndex >= 0 && myIndex !== activeIndex) {
@@ -170,11 +179,19 @@ export function WizardStepper<P = unknown>({
 	const goNext = useMemo(
 		() => async () => {
 			dismissResume();
+			if (committingRef.current) return;
+			committingRef.current = true;
+			setCommitting(true);
+			setCommitError(null);
 			try {
 				await beforeNextRef.current?.();
 			} catch (err) {
 				console.warn('[onboarding] step commit failed; staying on step', err);
+				setCommitError(commitErrorMessage(err));
 				return;
+			} finally {
+				committingRef.current = false;
+				setCommitting(false);
 			}
 			markCompleted();
 			const nextIndex = Math.min(ONBOARDING_STEPS.length - 1, myIndex + 1);
@@ -336,6 +353,16 @@ export function WizardStepper<P = unknown>({
 							</Button>
 						</div>
 					)}
+					{commitError !== null && (
+						<ErrorState
+							data-state="commit-error"
+							data-testid="wizard-commit-error"
+							heading="Couldn't save this step"
+							body={commitError}
+							action={{ label: 'Retry', onClick: () => void goNext() }}
+							className="mb-6"
+						/>
+					)}
 					{children(childArgs)}
 				</div>
 			</div>
@@ -349,9 +376,17 @@ export function WizardStepper<P = unknown>({
 				onBack={goBack}
 				onSkip={skip}
 				onNext={childArgs.goNext}
+				nextBusy={committing}
 			/>
 		</div>
 	);
+}
+
+/** Inline copy for a failed step commit (Tauri rejects with a string). */
+export function commitErrorMessage(err: unknown): string {
+	if (err instanceof Error && err.message) return err.message;
+	if (typeof err === 'string' && err) return err;
+	return 'Something went wrong — try again.';
 }
 
 const COUNT_WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven'];

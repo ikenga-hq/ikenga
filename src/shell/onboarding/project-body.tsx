@@ -16,7 +16,8 @@
 //   - `activeProject.extra_roots` via `setProjectExtraRoots` — now through
 //     the "Extra roots" disclosure, landing in the settings.json the scope
 //     switch names (unchanged default: project when writable, else personal).
-//   - the step payload's `extraRoots` (read by `done`).
+//   - the step payload's `extraRoots` (read by `done`) — written by the
+//     commit only, never live, so leaving via Back / the rail records nothing.
 //   (The old `mirrorProjectsToFileRoots` helper had no callers left once
 //   the commit below took over its write.)
 // New, per D-04 ("one becomes activeProject"): a detected / picked repo is
@@ -114,9 +115,9 @@ export function ProjectBody({ onContinue, registerBeforeNext }: ProjectBodyProps
 	const projects = useShellStore((s) => s.projects);
 	const projectExtraRoots = useShellStore((s) => s.projectExtraRoots);
 	const { record, setPayload } = useOnboardingStep<ProjectStepPayload>('project');
-	// Frozen at mount: the live payload effect below rewrites the record on
-	// every selection change (including the transient "empty" before the scan
-	// resolves), so only the answer from a previous visit may seed the pick.
+	// The answer from a previous visit (the payload is written only by the
+	// commit below), frozen at mount so this visit's commit doesn't re-seed
+	// the pick mid-render.
 	const [prior] = useState(() => record.payload);
 
 	const { data: claudeProjects, isLoading: scanning } = useQuery<ClaudeProjectEntry[]>({
@@ -226,6 +227,10 @@ export function ProjectBody({ onContinue, registerBeforeNext }: ProjectBodyProps
 		};
 	}, [inside]);
 
+	// Written to the step record ONLY by the commit below. The selection
+	// defaults to the first verified repo before the user picks anything, so
+	// a live write would record a project the user never chose whenever they
+	// left via Back or the rail.
 	const payload: ProjectStepPayload = {
 		extraRoots: [...roots],
 		mode: isEmpty ? 'empty' : 'detected',
@@ -234,11 +239,6 @@ export function ProjectBody({ onContinue, registerBeforeNext }: ProjectBodyProps
 		projectRoot: selectedPath,
 		scope,
 	};
-	const payloadKey = JSON.stringify(payload);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: payloadKey is the value identity of `payload`.
-	useEffect(() => {
-		setPayload(payload);
-	}, [payloadKey, setPayload]);
 
 	// ── Commit on Continue (footer or inline) ───────────────────────────
 	const commit: BeforeNext = async () => {
