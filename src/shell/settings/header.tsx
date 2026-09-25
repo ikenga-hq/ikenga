@@ -20,6 +20,7 @@ import {
 	settingsSection,
 } from '@/shell/settings/nav';
 import { useSettingsSection } from '@/shell/settings/field';
+import { SettingsScopeSwitch } from '@/shell/settings/scope-switch';
 
 const PERSONAL_ONLY_FIELD_SET = new Set<string>(PERSONAL_ONLY_FIELDS);
 
@@ -129,43 +130,12 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 			)}
 
 			{!searchActive && !scopeless && (
-				// `min-h-[var(--tab-h)]` on each button, not a hardcoded px value —
-				// `--tab-h` is the same tab-height token `.ccfg-tab` sizes off of
-				// (src/shell/claude-config/claude-config.css) and is the shell's
-				// 44px hit-target floor in spacious density (tokens.css
-				// `[data-density='spacious']`; D-03 44px targets, WP-35 DoD).
-				<div
-					role="group"
-					aria-label="Settings scope"
-					className="ml-2 inline-flex items-center gap-0.5 rounded-md border border-border p-0.5"
-				>
-					<button
-						type="button"
-						aria-pressed={scope === 'personal'}
-						onClick={() => setScope('personal')}
-						className={`min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary ${
-							scope === 'personal'
-								? 'bg-card text-foreground shadow-sm'
-								: 'text-muted-foreground hover:text-foreground'
-						}`}
-					>
-						Personal
-					</button>
-					<button
-						type="button"
-						aria-pressed={scope === 'project'}
-						disabled={!projectRoot}
-						title={projectRoot ? undefined : 'The active project has no filesystem root'}
-						onClick={() => setScope('project')}
-						className={`min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-not-allowed disabled:opacity-50 ${
-							scope === 'project'
-								? 'bg-card text-foreground shadow-sm'
-								: 'text-muted-foreground hover:text-foreground'
-						}`}
-					>
-						Project
-					</button>
-				</div>
+				<SettingsScopeSwitch
+					scope={scope}
+					onScopeChange={setScope}
+					projectAvailable={!!projectRoot}
+					className="ml-2"
+				/>
 			)}
 
 			<div className="ml-auto flex shrink-0 items-center gap-1">
