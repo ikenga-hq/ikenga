@@ -153,9 +153,13 @@ pub trait SecretsStore: Send + Sync {
 
     fn probe(&self) -> Result<(), StoreError>;
 
-    fn prepare_encryption(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
+    /// Bring every stored value up to the store's at-rest format. For
+    /// `EncryptedStore` with a configured passphrase this encrypts any
+    /// plaintext value left from before the passphrase was set; plain stores
+    /// have nothing to do. Deliberately has no default body: callers reach it
+    /// through `&dyn SecretsStore`, so a wrapper that forgot to override it
+    /// would silently skip the migration.
+    fn prepare_encryption(&self) -> Result<(), StoreError>;
 
     fn backend_label(&self) -> &'static str;
 
@@ -205,6 +209,10 @@ impl SecretsStore for UnavailableSecretStore {
     }
 
     fn probe(&self) -> Result<(), StoreError> {
+        Err(self.error())
+    }
+
+    fn prepare_encryption(&self) -> Result<(), StoreError> {
         Err(self.error())
     }
 

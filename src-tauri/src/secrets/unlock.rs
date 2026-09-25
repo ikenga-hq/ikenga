@@ -1,3 +1,20 @@
+//! Passphrase unlock state for the secrets vault (WP-34, DEC-47).
+//!
+//! The passphrase is **optional**. With no envelope on disk the vault is
+//! "unconfigured": `LockState.locked` is `false` and `EncryptedStore` passes
+//! every call straight through to the keychain store, exactly as WP-33 did.
+//! Only once an envelope exists (`configured`) does a missing in-memory DEK
+//! mean `Locked`.
+//!
+//! Every time the DEK leaves memory (explicit lock or idle expiry) the lock
+//! `generation` advances. Env-vault publication captures the generation
+//! before it reads values and re-checks it under the publish mutex before
+//! writing plaintext files, so a lock that lands mid-publish can never be
+//! overtaken by a stale publish. Idle expiries that happen as a side effect
+//! of another call (`state()`, `with_dek`) are remembered until
+//! `expire_if_idle` reports them, so the env-vault invalidation that follows
+//! an idle lock is never skipped.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,6 +48,7 @@ pub enum UnlockError {
     Locked,
     NotConfigured,
     AlreadyConfigured,
+    CurrentPassphraseRequired,
     InvalidPassphrase,
     WrongPassphrase,
     InvalidEnvelope(String),
@@ -45,6 +63,9 @@ impl std::fmt::Display for UnlockError {
             Self::Locked => f.write_str("secrets are locked"),
             Self::NotConfigured => f.write_str("secrets passphrase is not configured"),
             Self::AlreadyConfigured => f.write_str("secrets passphrase is already configured"),
+            Self::CurrentPassphraseRequired => {
+                f.write_str("the current passphrase is required to change it")
+            }
             Self::InvalidPassphrase => f.write_str("passphrase must not be empty"),
             Self::WrongPassphrase => f.write_str("wrong passphrase"),
             Self::InvalidEnvelope(message) => {
@@ -80,6 +101,11 @@ struct UnlockInner {
     dek: Option<Zeroizing<[u8; DEK_LEN]>>,
     last_activity: Option<Instant>,
     last_activity_unix_ms: Option<u64>,
+    /// Advances every time the DEK leaves memory (lock or idle expiry).
+    generation: u64,
+    /// An idle expiry happened (possibly inside `state()` / `with_dek`) and
+    /// `expire_if_idle` has not reported it yet.
+    expired_unobserved: bool,
 }
 
 impl UnlockState {
@@ -94,6 +120,8 @@ impl UnlockState {
                 dek: None,
                 last_activity: None,
                 last_activity_unix_ms: None,
+                generation: 0,
+                expired_unobserved: false,
             })),
             idle_timeout,
         }
@@ -152,9 +180,12 @@ impl UnlockState {
             }
         };
         self.expire_locked(&mut inner);
+        let configured = self.is_configured();
         LockState {
-            configured: self.is_configured(),
-            locked: inner.dek.is_none(),
+            configured,
+            // No passphrase configured means there is nothing to unlock: the
+            // vault behaves exactly as the plain keychain store (WP-33).
+            locked: configured && inner.dek.is_none(),
             idle_timeout_secs: self.idle_timeout.as_secs(),
             last_activity_unix_ms: inner.last_activity_unix_ms,
         }
@@ -197,27 +228,16 @@ impl UnlockState {
         current_passphrase: Option<&str>,
     ) -> Result<(), UnlockError> {
         if !self.is_configured() {
+            // First set: there is no existing passphrase to prove.
             return self.set_passphrase(passphrase);
         }
-        if let Some(current) = current_passphrase {
-            return self.rotate(current, passphrase);
+        // Changing an existing passphrase always proves the current one, even
+        // while unlocked: an unattended unlocked session must not be enough
+        // to re-wrap the DEK under a passphrase someone else chose.
+        match current_passphrase {
+            Some(current) => self.rotate(current, passphrase),
+            None => Err(UnlockError::CurrentPassphraseRequired),
         }
-        let path = self.envelope_path()?;
-        let dek = {
-            let mut inner = self.inner.lock().map_err(|_| UnlockError::Poisoned)?;
-            self.expire_locked(&mut inner);
-            inner
-                .dek
-                .as_ref()
-                .map(|dek| Zeroizing::new(**dek))
-                .ok_or(UnlockError::Locked)?
-        };
-        let envelope = crypto::wrap_dek(passphrase, &dek)?;
-        persist_envelope(&path, &envelope)?;
-        let mut inner = self.inner.lock().map_err(|_| UnlockError::Poisoned)?;
-        inner.dek = Some(dek);
-        self.touch_locked(&mut inner);
-        Ok(())
     }
 
     pub fn unlock(&self, passphrase: &str) -> Result<(), UnlockError> {
@@ -235,14 +255,32 @@ impl UnlockState {
         let was_unlocked = inner.dek.take().is_some();
         inner.last_activity = None;
         inner.last_activity_unix_ms = None;
+        if was_unlocked {
+            inner.generation = inner.generation.wrapping_add(1);
+        }
         Ok(was_unlocked)
     }
 
+    /// Expire the DEK if the idle timeout has passed. Returns `true` when an
+    /// idle expiry happened since the last call — including one triggered as
+    /// a side effect of `state()` or `with_dek` — so the caller's env-vault
+    /// invalidation is never skipped.
     pub fn expire_if_idle(&self) -> Result<bool, UnlockError> {
         let mut inner = self.inner.lock().map_err(|_| UnlockError::Poisoned)?;
-        let was_unlocked = inner.dek.is_some();
         self.expire_locked(&mut inner);
-        Ok(was_unlocked && inner.dek.is_none())
+        Ok(std::mem::take(&mut inner.expired_unobserved))
+    }
+
+    /// Counter that advances whenever the DEK leaves memory. Env-vault
+    /// publication compares it before and after reading values to detect a
+    /// lock that raced it.
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|inner| inner.generation)
+            // Poisoned: `state()` then reports locked, which aborts any
+            // publication that re-checks it (fails closed).
+            .unwrap_or(u64::MAX)
     }
 
     pub fn with_dek<T, E>(&self, f: impl FnOnce(&[u8; DEK_LEN]) -> Result<T, E>) -> Result<T, E>
@@ -272,7 +310,10 @@ impl UnlockState {
         if last_activity.elapsed() < self.idle_timeout {
             return;
         }
-        inner.dek.take();
+        if inner.dek.take().is_some() {
+            inner.expired_unobserved = true;
+            inner.generation = inner.generation.wrapping_add(1);
+        }
         inner.last_activity = None;
         inner.last_activity_unix_ms = None;
     }
@@ -429,13 +470,62 @@ mod tests {
         let unlock = state(dir.path(), Duration::from_secs(60));
         let initial = unlock.state();
         assert!(!initial.configured);
-        assert!(initial.locked);
+        // No passphrase set: nothing to unlock (behaves exactly as WP-33).
+        assert!(!initial.locked);
         unlock.set_passphrase("passphrase").unwrap();
         let active = unlock.state();
         assert!(active.configured);
         assert!(!active.locked);
         assert!(active.last_activity_unix_ms.is_some());
         unlock.lock().unwrap();
-        assert!(unlock.state().last_activity_unix_ms.is_none());
+        let locked = unlock.state();
+        assert!(locked.locked);
+        assert!(locked.last_activity_unix_ms.is_none());
+    }
+
+    #[test]
+    fn changing_a_configured_passphrase_requires_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let unlock = state(dir.path(), Duration::from_secs(60));
+        // First set needs no current passphrase.
+        unlock.set_or_rotate("first", None).unwrap();
+        assert!(unlock.is_configured());
+        // Unlocked, but still refused without the current passphrase.
+        assert!(unlock.is_unlocked());
+        assert_eq!(
+            unlock.set_or_rotate("second", None).unwrap_err(),
+            UnlockError::CurrentPassphraseRequired
+        );
+        assert_eq!(
+            unlock.set_or_rotate("second", Some("wrong")).unwrap_err(),
+            UnlockError::WrongPassphrase
+        );
+        unlock.set_or_rotate("second", Some("first")).unwrap();
+        unlock.lock().unwrap();
+        assert_eq!(
+            unlock.unlock("first").unwrap_err(),
+            UnlockError::WrongPassphrase
+        );
+        unlock.unlock("second").unwrap();
+    }
+
+    #[test]
+    fn generation_advances_on_lock_and_idle_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let unlock = state(dir.path(), Duration::from_millis(1));
+        unlock.set_passphrase("passphrase").unwrap();
+        let before = unlock.generation();
+        unlock.lock().unwrap();
+        assert_ne!(unlock.generation(), before);
+
+        unlock.unlock("passphrase").unwrap();
+        let before = unlock.generation();
+        std::thread::sleep(Duration::from_millis(5));
+        // The expiry happens as a side effect of `state()` ...
+        assert!(unlock.state().locked);
+        assert_ne!(unlock.generation(), before);
+        // ... and is still reported to the idle loop exactly once.
+        assert!(unlock.expire_if_idle().unwrap());
+        assert!(!unlock.expire_if_idle().unwrap());
     }
 }

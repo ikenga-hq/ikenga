@@ -1,3 +1,19 @@
+//! Value-encryption wrapper over the keychain store (WP-34, DEC-47).
+//!
+//! Two modes, decided per call from the unlock envelope on disk:
+//!
+//! - **Unconfigured** (no passphrase ever set): a pure passthrough to the
+//!   inner store — no encryption, never `Locked`. This is the WP-33
+//!   behaviour the WP-34 DoD requires. A value that is already encrypted is
+//!   refused rather than served as ciphertext (the envelope went missing).
+//! - **Configured**: every value is AES-256-GCM encrypted with the DEK before
+//!   it reaches the keychain; without the DEK in memory, value access returns
+//!   a typed `Locked` error. Setting the first passphrase (and every unlock)
+//!   runs `prepare_encryption`, which encrypts any plaintext value left from
+//!   the unconfigured era. A plaintext value met on a configured read is
+//!   encrypted in place (migrate-on-read) so it is never served from the
+//!   keychain as plaintext indefinitely.
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -27,24 +43,10 @@ impl EncryptedStore {
         Self { inner, unlock }
     }
 
-    pub fn prepare_encryption(&self) -> Result<(), StoreError> {
-        self.with_store_dek(|dek| {
-            let names = self.inner.list_meta()?;
-            let mut values = BTreeMap::new();
-            for meta in names {
-                let stored = self.inner.get(&meta.name)?.ok_or_else(|| {
-                    StoreError::uncommitted(format!("indexed secret is missing: {}", meta.name))
-                })?;
-                let encoded = if is_encrypted(&stored) {
-                    decode_value(&stored, dek, &meta.name)?;
-                    stored
-                } else {
-                    encode_value(dek, &stored, &meta.name)?
-                };
-                values.insert(meta.name, encoded);
-            }
-            self.inner.replace_all(&values).map(|_| ())
-        })
+    /// `true` once a passphrase envelope exists. Until then the store is a
+    /// passthrough.
+    fn configured(&self) -> bool {
+        self.unlock.is_configured()
     }
 
     fn with_store_dek<T>(
@@ -58,19 +60,48 @@ impl EncryptedStore {
         let Some(stored) = self.inner.get(name)? else {
             return Ok(None);
         };
-        if !is_encrypted(&stored) {
-            return Ok(Some(stored));
+        if is_encrypted(&stored) {
+            return decode_value(&stored, dek, name).map(Some);
         }
-        decode_value(&stored, dek, name).map(Some)
+        // Plaintext on a configured vault: left from before the passphrase
+        // was set, or written by a call that raced the first set. Encrypt it
+        // in place now. A failed write-back is logged and retried by the
+        // `prepare_encryption` that runs on every unlock.
+        let encoded = encode_value(dek, &stored, name)?;
+        if let Err(error) = self.inner.set(name, &encoded) {
+            log::warn!(
+                "[secrets] could not encrypt plaintext value `{name}` on read: {error}"
+            );
+        }
+        Ok(Some(stored))
+    }
+}
+
+fn encrypted_without_envelope(name: &str) -> StoreError {
+    StoreError::unavailable(format!(
+        "secret `{name}` is encrypted but no passphrase envelope exists"
+    ))
+}
+
+fn passthrough_value(name: &str, stored: Option<String>) -> Result<Option<String>, StoreError> {
+    match stored {
+        Some(value) if is_encrypted(&value) => Err(encrypted_without_envelope(name)),
+        other => Ok(other),
     }
 }
 
 impl SecretsStore for EncryptedStore {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError> {
+        if !self.configured() {
+            return passthrough_value(name, self.inner.get(name)?);
+        }
         self.with_store_dek(|dek| self.get_with_dek(dek, name))
     }
 
     fn set(&self, name: &str, value: &str) -> Result<(), StoreError> {
+        if !self.configured() {
+            return self.inner.set(name, value);
+        }
         self.with_store_dek(|dek| {
             let encoded = encode_value(dek, value, name)?;
             self.inner.set(name, &encoded)
@@ -78,6 +109,9 @@ impl SecretsStore for EncryptedStore {
     }
 
     fn delete(&self, name: &str) -> Result<(), StoreError> {
+        if !self.configured() {
+            return self.inner.delete(name);
+        }
         self.with_store_dek(|_| self.inner.delete(name))
     }
 
@@ -86,6 +120,17 @@ impl SecretsStore for EncryptedStore {
     }
 
     fn export_all(&self) -> Result<BTreeMap<String, String>, StoreError> {
+        if !self.configured() {
+            let values = self.inner.export_all()?;
+            if let Some(name) = values
+                .iter()
+                .find(|(_, value)| is_encrypted(value))
+                .map(|(name, _)| name)
+            {
+                return Err(encrypted_without_envelope(name));
+            }
+            return Ok(values);
+        }
         self.with_store_dek(|dek| {
             let mut out = BTreeMap::new();
             for meta in self.inner.list_meta()? {
@@ -99,6 +144,9 @@ impl SecretsStore for EncryptedStore {
     }
 
     fn import_all(&self, values: &BTreeMap<String, String>) -> Result<usize, StoreError> {
+        if !self.configured() {
+            return self.inner.import_all(values);
+        }
         self.with_store_dek(|dek| {
             let mut encoded = BTreeMap::new();
             for (name, value) in values {
@@ -109,6 +157,9 @@ impl SecretsStore for EncryptedStore {
     }
 
     fn replace_all(&self, values: &BTreeMap<String, String>) -> Result<usize, StoreError> {
+        if !self.configured() {
+            return self.inner.replace_all(values);
+        }
         self.with_store_dek(|dek| {
             let mut encoded = BTreeMap::new();
             for (name, value) in values {
@@ -120,6 +171,39 @@ impl SecretsStore for EncryptedStore {
 
     fn probe(&self) -> Result<(), StoreError> {
         self.inner.probe()
+    }
+
+    /// Encrypt every plaintext value in the inner store. A no-op while no
+    /// passphrase is configured; `Locked` when configured without the DEK.
+    /// Values that are already encrypted must open with the current DEK. The
+    /// inner store is only rewritten (atomically, via `replace_all`) when at
+    /// least one value actually changed, so routine unlocks do not churn the
+    /// keychain.
+    fn prepare_encryption(&self) -> Result<(), StoreError> {
+        if !self.configured() {
+            return Ok(());
+        }
+        self.with_store_dek(|dek| {
+            let mut values = BTreeMap::new();
+            let mut changed = false;
+            for meta in self.inner.list_meta()? {
+                let stored = self.inner.get(&meta.name)?.ok_or_else(|| {
+                    StoreError::uncommitted(format!("indexed secret is missing: {}", meta.name))
+                })?;
+                let encoded = if is_encrypted(&stored) {
+                    decode_value(&stored, dek, &meta.name)?;
+                    stored
+                } else {
+                    changed = true;
+                    encode_value(dek, &stored, &meta.name)?
+                };
+                values.insert(meta.name, encoded);
+            }
+            if !changed {
+                return Ok(());
+            }
+            self.inner.replace_all(&values).map(|_| ())
+        })
     }
 
     fn backend_label(&self) -> &'static str {
@@ -239,6 +323,10 @@ mod tests {
             Ok(())
         }
 
+        fn prepare_encryption(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+
         fn backend_label(&self) -> &'static str {
             "memory"
         }
@@ -276,6 +364,103 @@ mod tests {
         assert_eq!(
             store.get("workspace::TOKEN").unwrap().as_deref(),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn no_passphrase_is_a_passthrough_that_never_returns_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, store) = encrypted_store(dir.path());
+        assert!(!store.unlock.is_configured());
+        assert!(!store.unlock.state().locked);
+
+        store.set("workspace::TOKEN", "plain").unwrap();
+        // Stored exactly as WP-33 stored it: no envelope, no encryption.
+        assert_eq!(raw.values.lock().unwrap()["workspace::TOKEN"], "plain");
+        assert_eq!(
+            store.get("workspace::TOKEN").unwrap().as_deref(),
+            Some("plain")
+        );
+        assert_eq!(store.get("workspace::MISSING").unwrap(), None);
+
+        let mut values = BTreeMap::new();
+        values.insert("workspace::OTHER".to_string(), "other".to_string());
+        store.import_all(&values).unwrap();
+        assert_eq!(store.export_all().unwrap().len(), 2);
+        store.prepare_encryption().unwrap();
+        assert_eq!(raw.values.lock().unwrap()["workspace::OTHER"], "other");
+
+        store.delete("workspace::TOKEN").unwrap();
+        assert_eq!(store.get("workspace::TOKEN").unwrap(), None);
+        store.replace_all(&BTreeMap::new()).unwrap();
+        assert!(store.list_meta().unwrap().is_empty());
+    }
+
+    #[test]
+    fn first_passphrase_encrypts_pre_existing_plaintext_through_the_trait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, store) = encrypted_store(dir.path());
+        store.set("workspace::TOKEN", "legacy").unwrap();
+        store.set("My Token", "spaced").unwrap();
+        assert_eq!(raw.values.lock().unwrap()["workspace::TOKEN"], "legacy");
+
+        store.unlock.set_or_rotate("passphrase", None).unwrap();
+        // Callers hold `&dyn SecretsStore`; the override must be reached
+        // through the trait object, not an inherent method.
+        let as_trait: &dyn SecretsStore = &store;
+        as_trait.prepare_encryption().unwrap();
+        {
+            let stored = raw.values.lock().unwrap();
+            assert!(stored["workspace::TOKEN"].starts_with(VALUE_PREFIX));
+            assert!(stored["My Token"].starts_with(VALUE_PREFIX));
+        }
+        assert_eq!(
+            store.get("workspace::TOKEN").unwrap().as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(store.get("My Token").unwrap().as_deref(), Some("spaced"));
+
+        store.unlock.lock().unwrap();
+        assert_eq!(
+            store.get("workspace::TOKEN").unwrap_err().kind(),
+            StoreErrorKind::Locked
+        );
+    }
+
+    #[test]
+    fn plaintext_met_on_a_configured_read_is_encrypted_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, store) = encrypted_store(dir.path());
+        store.unlock.set_passphrase("passphrase").unwrap();
+        // A plaintext write that raced the first set.
+        raw.insert("workspace::LATE", "late");
+        assert_eq!(
+            store.get("workspace::LATE").unwrap().as_deref(),
+            Some("late")
+        );
+        assert!(raw.values.lock().unwrap()["workspace::LATE"].starts_with(VALUE_PREFIX));
+        assert_eq!(
+            store.get("workspace::LATE").unwrap().as_deref(),
+            Some("late")
+        );
+    }
+
+    #[test]
+    fn ciphertext_is_never_served_when_the_envelope_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (raw, store) = encrypted_store(dir.path());
+        store.unlock.set_passphrase("passphrase").unwrap();
+        store.set("workspace::TOKEN", "secret").unwrap();
+        std::fs::remove_file(dir.path().join(super::super::unlock::UNLOCK_ENVELOPE_FILENAME))
+            .unwrap();
+        assert!(raw.values.lock().unwrap()["workspace::TOKEN"].starts_with(VALUE_PREFIX));
+        assert_eq!(
+            store.get("workspace::TOKEN").unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.export_all().unwrap_err().kind(),
+            StoreErrorKind::Unavailable
         );
     }
 

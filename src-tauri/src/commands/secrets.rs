@@ -1,3 +1,31 @@
+//! Secrets commands and the runtime/durable env-vault files.
+//!
+//! # Env-vault files are plaintext while unlocked (by design)
+//!
+//! Sidecars and the headless mutation-worker daemon read secrets from two
+//! dotenv files, not from the vault (ADR-022 R6b): the volatile runtime file
+//! (`runtime_env_vault_path`) and the **durable** file (`durable_env_path`,
+//! `%LOCALAPPDATA%\ikenga-actions\env` on Windows). Both hold every
+//! resolvable secret **in plaintext** whenever they are published. With a
+//! WP-34 passphrase configured, that is only ever true while the vault is
+//! unlocked:
+//!
+//! - publication needs the DEK (a locked vault fails the read, which
+//!   invalidates both files instead of publishing);
+//! - explicit lock, idle expiry and app exit overwrite both files with a
+//!   deny body and leave a durable deny marker, so nothing plaintext survives
+//!   a lock or a clean shutdown;
+//! - a publication racing a lock re-checks the lock generation under the
+//!   env-publish mutex and aborts (see `dump_to_runtime_file_locked`).
+//!
+//! What remains, deliberately: while unlocked the durable file is plaintext
+//! on disk (per-user ACL / chmod 600 is its only protection), and a crash or
+//! power loss while unlocked skips the exit wipe and leaves it until the next
+//! launch invalidates it. The trade-off is that a passphrase-protected vault
+//! gives the daemon no secrets after the shell exits. With no passphrase
+//! configured the WP-33 contract is unchanged: the durable file persists
+//! across shell exits.
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -7,7 +35,9 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use zeroize::Zeroizing;
 
 use crate::secrets::{
-    index::{validate_key, validate_name, validate_scope_id, INDEX_FILENAME},
+    index::{
+        validate_key, validate_legacy_key, validate_legacy_name, validate_scope_id, INDEX_FILENAME,
+    },
     EncryptedStore, KeyringStore, LockState, SecretsStore, SharedSecretStore,
     SharedSecretStoreSlot, StoreError, UnavailableSecretStore, UnlockState,
     UNLOCK_ENVELOPE_FILENAME,
@@ -216,20 +246,20 @@ pub fn vault_key(scope: &Scope, key: &str) -> String {
 /// namespace without re-parsing strings repeatedly.
 pub fn parse_scoped(fqk: &str) -> Option<(Scope, String)> {
     if let Some(rest) = fqk.strip_prefix("workspace::") {
-        return validate_key(rest)
+        return validate_legacy_key(rest)
             .ok()
             .map(|_| (Scope::Workspace, rest.to_string()));
     }
     if let Some(rest) = fqk.strip_prefix("project::") {
         let (id, key) = rest.split_once("::")?;
-        if validate_scope_id(id).is_err() || validate_key(key).is_err() {
+        if validate_scope_id(id).is_err() || validate_legacy_key(key).is_err() {
             return None;
         }
         return Some((Scope::project(id), key.to_string()));
     }
     if let Some(rest) = fqk.strip_prefix("pkg::") {
         let (id, key) = rest.split_once("::")?;
-        if validate_scope_id(id).is_err() || validate_key(key).is_err() {
+        if validate_scope_id(id).is_err() || validate_legacy_key(key).is_err() {
             return None;
         }
         return Some((Scope::pkg(id), key.to_string()));
@@ -246,7 +276,8 @@ pub async fn secrets_get(
     if key.as_bytes() == MANIFEST_KEY || key.as_bytes() == MANIFEST_V2_KEY {
         return Ok(None);
     }
-    if validate_key(&key).is_err() {
+    // Reads address existing entries, which may carry a pre-WP-34 name.
+    if validate_legacy_key(&key).is_err() {
         return Err("invalid key".into());
     }
     let state = lock.store.clone();
@@ -288,7 +319,8 @@ pub async fn secrets_delete(
     lock: State<'_, SecretsLock>,
     key: String,
 ) -> Result<(), String> {
-    if validate_key(&key).is_err() {
+    // Deletes address existing entries, which may carry a pre-WP-34 name.
+    if validate_legacy_key(&key).is_err() {
         return Err("invalid key".into());
     }
     let state = lock.store.clone();
@@ -397,20 +429,24 @@ pub async fn secrets_set_passphrase(
     let passphrase = Zeroizing::new(passphrase);
     let current_passphrase = current_passphrase.or(old_passphrase).map(Zeroizing::new);
     tokio::task::spawn_blocking(move || {
-        with_store(&app_for_work, &state, unlock.as_ref(), |store| {
+        // One store-slot critical section covers set/rotate and the
+        // encryption of pre-existing plaintext values, so no other secrets
+        // call interleaves between "envelope exists" and "every value is
+        // encrypted". If the migration fails after a first set, the envelope
+        // stays; plaintext left behind is encrypted on read and retried by
+        // the `prepare_encryption` that runs on every unlock.
+        let outcome = with_store(&app_for_work, &state, unlock.as_ref(), |store| {
             store.probe()?;
-            Ok(())
-        })?;
-        unlock
-            .set_or_rotate(
+            if let Err(error) = unlock.set_or_rotate(
                 passphrase.as_str(),
                 current_passphrase.as_ref().map(|value| value.as_str()),
-            )
-            .map_err(|error| error.to_string())?;
-        with_store(&app_for_work, &state, unlock.as_ref(), |store| {
-            store.prepare_encryption()
+            ) {
+                return Ok(Err(error.to_string()));
+            }
+            store.prepare_encryption().map(Ok)
         })
         .map_err(|error| error.to_string())?;
+        outcome?;
         dump_to_runtime_file_locked(&app_for_work, &state, unlock.as_ref())
             .map_err(|error| error.to_string())?;
         Ok(unlock.state())
@@ -435,14 +471,14 @@ pub async fn secrets_unlock(
     let app_for_work = app.clone();
     let passphrase = Zeroizing::new(passphrase);
     tokio::task::spawn_blocking(move || {
-        with_store(&app_for_work, &state, unlock.as_ref(), |_| Ok(()))?;
-        unlock
-            .unlock(passphrase.as_str())
-            .map_err(|error| error.to_string())?;
-        with_store(&app_for_work, &state, unlock.as_ref(), |store| {
-            store.prepare_encryption()
+        let outcome = with_store(&app_for_work, &state, unlock.as_ref(), |store| {
+            if let Err(error) = unlock.unlock(passphrase.as_str()) {
+                return Ok(Err(error.to_string()));
+            }
+            store.prepare_encryption().map(Ok)
         })
         .map_err(|error| error.to_string())?;
+        outcome?;
         dump_to_runtime_file_locked(&app_for_work, &state, unlock.as_ref())
             .map_err(|error| error.to_string())?;
         Ok(unlock.state())
@@ -456,6 +492,12 @@ pub async fn secrets_lock(
     app: AppHandle,
     lock: State<'_, SecretsLock>,
 ) -> Result<LockState, String> {
+    if !lock.unlock.is_configured() {
+        // No passphrase: there is nothing to lock, and the env-vault files
+        // keep their WP-33 contract (invalidating them would only starve the
+        // daemon until the next mutation).
+        return Ok(lock.state());
+    }
     lock.unlock.lock().map_err(|error| error.to_string())?;
     invalidate_env_vaults(&app)
         .map_err(|error| format!("secrets locked but env-vault invalidation failed: {error}"))?;
@@ -537,7 +579,8 @@ pub fn read_secret_scoped(
     if key.as_bytes() == MANIFEST_KEY || key.as_bytes() == MANIFEST_V2_KEY {
         return Ok(None);
     }
-    if validate_key(key).is_err() {
+    // Reads address existing entries (possibly pre-WP-34 names).
+    if validate_legacy_key(key).is_err() {
         return Err("invalid key".into());
     }
     scope.validate().map_err(|error| error.to_string())?;
@@ -752,7 +795,8 @@ fn scoped_delete_locked(
     scope: &Scope,
     key: &str,
 ) -> Result<(), StoreError> {
-    if validate_key(key).is_err() {
+    // Deletes address existing entries (possibly pre-WP-34 names).
+    if validate_legacy_key(key).is_err() {
         return Err(StoreError::invalid("invalid key"));
     }
     scope.validate().map_err(StoreError::invalid)?;
@@ -874,7 +918,8 @@ pub fn bulk_set<R: Runtime>(
     let filtered: std::collections::BTreeMap<String, String> = kvs
         .iter()
         .map(|(name, value)| {
-            validate_name(name).map_err(|error| StoreError::invalid(error))?;
+            // A restore re-imports names an earlier build may have written.
+            validate_legacy_name(name).map_err(|error| StoreError::invalid(error))?;
             Ok((name.clone(), value.clone()))
         })
         .collect::<Result<_, StoreError>>()
@@ -910,8 +955,10 @@ pub fn runtime_env_vault_path() -> PathBuf {
 /// running (overnight sends). Uses `$XDG_CONFIG_HOME` on Linux, or
 /// `~/Library/Application Support` on macOS, falling back to `~/.config`
 /// if neither env var is set; `%LOCALAPPDATA%` on Windows. chmod 600 on
-/// unix. NOT cleaned up on app quit — the file's whole purpose is to
-/// survive the shell being closed.
+/// unix. With no passphrase configured it is NOT cleaned up on app quit —
+/// the file's whole purpose is to survive the shell being closed. With a
+/// WP-34 passphrase configured it is plaintext only while unlocked and is
+/// overwritten on lock, idle expiry and exit (see the module docs).
 pub fn durable_env_path() -> PathBuf {
     let base: PathBuf = if cfg!(windows) {
         windows_secrets_base()
@@ -1103,6 +1150,8 @@ fn dump_to_runtime_file_locked<R: Runtime>(
         invalidate_env_vault_outputs(app)?;
     }
     let active_pid = resolve_active_project_blocking(app);
+    // Captured before any value is read; re-checked under the publish mutex.
+    let generation = unlock.generation();
     let body = match with_store(app, state, unlock, |store| {
         store.probe()?;
         let mut names: BTreeSet<String> = BTreeSet::new();
@@ -1165,8 +1214,34 @@ fn dump_to_runtime_file_locked<R: Runtime>(
             };
         }
     };
+    // Re-check under the env-publish mutex: a lock or idle expiry that
+    // landed while values were being read must win. Every lock path advances
+    // the generation before it invalidates, and invalidation takes this same
+    // mutex, so either the change is visible here (abort) or the
+    // invalidation runs after this publish and overwrites it.
+    let _publish = env_publish_guard();
+    if unlock.generation() != generation || unlock.state().locked {
+        let invalidation = invalidate_env_vault_outputs_unguarded(app);
+        return Err(match invalidation {
+            Ok(()) => "env-vault publication aborted: secrets locked during publication".into(),
+            Err(invalidation) => format!(
+                "env-vault publication aborted: secrets locked during publication; output invalidation failed: {invalidation}"
+            ),
+        });
+    }
     clear_env_deny_state(app)?;
-    publish_env_vaults(app, &body)
+    publish_env_vaults_unguarded(app, &body)
+}
+
+/// Serialises env-vault publication against env-vault invalidation so a
+/// lock can never be overtaken by a publish that read values before it.
+static ENV_PUBLISH_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_publish_guard() -> std::sync::MutexGuard<'static, ()> {
+    // The guarded data is `()`; a panic elsewhere leaves nothing to repair.
+    ENV_PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn safe_env_name(name: &str) -> bool {
@@ -1271,7 +1346,11 @@ fn ensure_private_env_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn publish_env_vaults<R: Runtime>(app: &AppHandle<R>, body: &str) -> Result<PathBuf, String> {
+/// Caller must hold `env_publish_guard()`.
+fn publish_env_vaults_unguarded<R: Runtime>(
+    app: &AppHandle<R>,
+    body: &str,
+) -> Result<PathBuf, String> {
     let runtime = runtime_env_vault_path();
     let durable = durable_env_path();
     let pending = env_vault_pending_path(app)?;
@@ -1290,7 +1369,7 @@ fn publish_env_vaults<R: Runtime>(app: &AppHandle<R>, body: &str) -> Result<Path
     match result {
         Ok(()) => Ok(runtime),
         Err(error) => {
-            let invalidation = invalidate_env_vault_outputs(app);
+            let invalidation = invalidate_env_vault_outputs_unguarded(app);
             match invalidation {
                 Ok(()) => Err(format!("env-vault publication failed: {error}")),
                 Err(invalidation) => Err(format!(
@@ -1302,6 +1381,12 @@ fn publish_env_vaults<R: Runtime>(app: &AppHandle<R>, body: &str) -> Result<Path
 }
 
 fn invalidate_env_vault_outputs<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let _publish = env_publish_guard();
+    invalidate_env_vault_outputs_unguarded(app)
+}
+
+/// Caller must hold `env_publish_guard()`.
+fn invalidate_env_vault_outputs_unguarded<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     invalidate_env_paths(
         &runtime_env_vault_path(),
         &durable_env_path(),
@@ -1360,6 +1445,29 @@ pub fn dump_to_runtime_file<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, S
         .try_state::<SecretsLock>()
         .ok_or_else(|| "SecretsLock state not registered".to_string())?;
     dump_to_runtime_file_locked(app, &lock.store, lock.unlock.as_ref())
+}
+
+/// App exit hook for a passphrase-protected vault: drops (zeroizes) the
+/// in-memory DEK and, when a passphrase is configured, overwrites both
+/// env-vault files — including the durable one the daemon reads — with the
+/// deny body and leaves the durable deny marker, exactly as an explicit lock
+/// does. The next launch publishes again only after an unlock. With no
+/// passphrase configured this is a no-op and the WP-33 durable-file contract
+/// holds. Best-effort: failures are logged, never block shutdown.
+pub fn wipe_env_vaults_on_exit<R: Runtime>(app: &AppHandle<R>) {
+    let Some(lock) = app.try_state::<SecretsLock>() else {
+        return;
+    };
+    let configured = lock.unlock.is_configured();
+    if let Err(error) = lock.unlock.lock() {
+        log::warn!("[secrets] could not drop the unlock key on exit: {error}");
+    }
+    if !configured {
+        return;
+    }
+    if let Err(error) = invalidate_env_vaults(app) {
+        log::warn!("[secrets] env-vault invalidation on exit failed: {error}");
+    }
 }
 
 /// Best-effort cleanup of the runtime env-vault file. Called from the app

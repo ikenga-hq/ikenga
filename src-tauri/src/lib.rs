@@ -1345,6 +1345,12 @@ pub fn run() {
             // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
             // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                // WP-34: with a passphrase configured, the env-vault files
+                // (including the durable one) are plaintext only while
+                // unlocked — overwrite them and drop the DEK on exit, the
+                // same invalidation an explicit lock performs. No-op without
+                // a passphrase (WP-33 durable-file contract).
+                commands::secrets::wipe_env_vaults_on_exit(_app);
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]
                 {
