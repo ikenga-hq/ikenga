@@ -1,22 +1,31 @@
-// <WizardStepper> — Variant A (edge-to-edge full-window) chrome.
+// <WizardStepper> — D-04 consecration chrome (`designs/onboarding.html`).
 //
-// The Phase 1 approved design (`<workspace>/design/shell/concepts/03-screens/
-// 2026-05-11-onboarding-wizard/prototypes/variant-A-welcome.html`) maps to
-// this layout:
-//   ┌──────────────────────────────────────────────┐  <- title bar (Tauri)
-//   │▰▰▰▱▱▱▱▱▱  progress fill (doubles as stepper) │  4px tall
-//   │  brand ─────────────── step N of 8 · Welcome │  header
-//   ├──────────────────────────────────────────────┤
-//   │              <step body content>             │  scrollable
-//   ├──────────────────────────────────────────────┤
-//   │ meta              [Skip]  [Back]  [Continue] │  footer
-//   └──────────────────────────────────────────────┘
+// Full-window, no frame (D-03..07 §"Shared rules": full-window flows have no
+// frame). Layout mirrors the mock's `#wiz`:
+//   ┌──────────────────────────────────────────────────────────────┐
+//   │ Ikenga            Consecration · Step N of 7             ⋯   │  top bar
+//   │▰▰▰▱▱▱▱▱▱  progress fill                                      │  4px
+//   ├───────────┬────────────────────────────────────────────────┤
+//   │  step     │  <step body — renders its own h1/lede/gloss/    │
+//   │  rail     │   acts + content; the ONE place Fraunces        │
+//   │ (1..7)    │   appears, via `className="font-display"` on    │
+//   │           │   each body's <h1>>                             │
+//   ├───────────┴────────────────────────────────────────────────┤
+//   │ writes note · iyke line          [Skip]  [Back]  [Continue] │  footer
+//   └──────────────────────────────────────────────────────────────┘
 //
-// Step bodies are render-prop children. They receive `{ goNext, goBack,
-// skip, payload, setPayload, record }` — but step bodies are STUBS in
-// Phase 3 (Phase 4 fills them).
+// Step bodies are render-prop children, same contract as the shipped Phase
+// 3/4 wizard: `{ goNext, goBack, skip, goTo, payload, setPayload, record,
+// isOptional, isFirst, isLast }`.
+//
+// `data-state` (G-55 state map): every rendered D-04 state gets
+// `data-state="<name>"` on this component's root. Precedence when more than
+// one condition could apply: an explicit `stateOverride` prop (a step route
+// computes `engine-none` / `offline` itself, since only it knows the
+// relevant domain condition) wins; otherwise the resume banner's `resume`
+// state wins over the plain step id.
 
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 
 import {
@@ -27,24 +36,27 @@ import {
 } from '@/lib/shell/shell-store';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
-import { cn } from '@/components/ui/utils';
 
+import { OnboardingFooter } from './footer';
+import { OnboardingRail } from './rail';
 import { useOnboardingStep } from './use-onboarding-step';
 
-// Human-readable labels for the stepper header. Kept here rather than on
-// the step type itself so the wizard chrome owns the copy. Tier-1 lore
-// terms (Chi, Obi) replace the technical English in the breadcrumb per
-// design/shell/concepts/03-screens/onboarding-wizard/specs/PHASE-1B-LORE-DELTA.md.
+// Header labels — kept short for the top-bar step count line. The rail's own
+// labels (`RAIL_COPY` in `rail.tsx`) carry the longer descriptive sub-line.
 const STEP_LABELS: Record<OnboardingStepId, string> = {
-	welcome: 'Consecration',
-	agent: 'Chi',
-	roots: 'Obi',
-	packages: 'Alusi',
-	connectors: 'Connectors',
-	scaffolding: 'Scaffolding',
-	appearance: 'Appearance',
-	summary: 'Summary',
+	welcome: 'Welcome',
+	engine: 'Chi',
+	project: 'Project',
+	equipment: 'Ngwa',
+	look: 'Look',
+	shortcuts: 'Keys',
+	done: 'Done',
 };
+
+/** Every extra (non-step) D-04 state this chrome can render, per
+ *  `designs/onboarding.html` `STATES` (`daily-address` is WP-39's — the
+ *  Project dashboard, not this wizard). */
+export type OnboardingChromeState = OnboardingStepId | 'resume' | 'offline' | 'engine-none';
 
 export interface WizardStepChildArgs<P> {
 	goNext: () => void;
@@ -62,10 +74,49 @@ export interface WizardStepChildArgs<P> {
 
 interface WizardStepperProps<P> {
 	stepId: OnboardingStepId;
+	/** A step route computes this itself from a domain condition only it
+	 *  knows about — `engine.tsx` for `engine-none`, `equipment.tsx` for
+	 *  `offline` (registry unreachable). Omitted for the plain-step render. */
+	stateOverride?: 'offline' | 'engine-none';
 	children: (args: WizardStepChildArgs<P>) => React.ReactNode;
 }
 
-export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperProps<P>) {
+// ─── "Resume" (wizard reopened half-done) ──────────────────────────────────
+//
+// Must be decided once per app session (on the FIRST step render after
+// `/onboarding` loads), not re-derived on every step transition — otherwise
+// finishing step 1 in one continuous run would immediately look like a
+// "resume" the moment `activeIndex` ticks past 0. `route.tsx`'s
+// `OnboardingLayout` (mounted once for the whole wizard route subtree) calls
+// `primeOnboardingResumeFlag()` before any step renders; `WizardStepper`
+// (which remounts per step) only reads the frozen result. Both flags are
+// module state rather than store state because they are session-local UI
+// posture, not anything worth persisting or mirroring to settings.json.
+let resumeFlag: boolean | null = null;
+let resumeAcknowledged = false;
+
+export function primeOnboardingResumeFlag(): void {
+	if (resumeFlag !== null) return;
+	const ob = useShellStore.getState().onboarding;
+	resumeFlag =
+		ob.mode === 'first_run' &&
+		ob.completedAt === null &&
+		ob.startedAt !== null &&
+		Object.values(ob.steps).some((s) => s.status === 'completed' || s.status === 'skipped');
+}
+
+/** Test-only escape hatch — vitest can't otherwise reset the module
+ *  singleton between cases that each want a fresh "first render". */
+export function __resetOnboardingResumeFlagForTests(): void {
+	resumeFlag = null;
+	resumeAcknowledged = false;
+}
+
+export function WizardStepper<P = unknown>({
+	stepId,
+	stateOverride,
+	children,
+}: WizardStepperProps<P>) {
 	const navigate = useNavigate();
 	const { record, setPayload, markCompleted, markSkipped, isOptional } =
 		useOnboardingStep<P>(stepId);
@@ -77,50 +128,46 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 	const setActiveIndex = useShellStore((s) => s.setOnboardingActiveIndex);
 	const enterOnboardingEdit = useShellStore((s) => s.enterOnboardingEdit);
 	const finishOnboarding = useShellStore((s) => s.finishOnboarding);
+	const resetOnboarding = useShellStore((s) => s.resetOnboarding);
 
 	const myIndex = ONBOARDING_STEPS.indexOf(stepId);
 	const isFirst = myIndex === 0;
 	const isLast = myIndex === ONBOARDING_STEPS.length - 1;
 	const progressPct = ((myIndex + 1) / ONBOARDING_STEPS.length) * 100;
 
-	// Ref for the body container — used to move focus on step transitions
-	// so screen readers announce the new step content (WCAG 2.4.3).
+	// Whether to still show the resume banner — frozen per session by
+	// `resumeFlag`, dismissed (this session only) by `resumeAcknowledged`.
+	const [showResume, setShowResume] = useState(() => resumeFlag === true && !resumeAcknowledged);
+
 	const bodyRef = useRef<HTMLDivElement>(null);
 
-	// On mount of each step, ensure the store's activeIndex matches the URL
-	// (the user may have navigated via the address bar / settings link).
-	// Idempotent — guarded against re-entry by the equality check.
 	useEffect(() => {
 		if (myIndex >= 0 && myIndex !== activeIndex) {
 			setActiveIndex(myIndex);
 		}
-		// Lazily stamp `startedAt` the first time any step renders. The store
-		// action is idempotent so this is safe on every effect run.
 		startOnboarding(mode);
 	}, [myIndex, activeIndex, setActiveIndex, startOnboarding, mode]);
 
-	// Move focus to the step body on every step transition so screen readers
-	// announce the new step content (WCAG 2.4.3 Focus Order).
-	// Keyed on myIndex — fires whenever the step mounts/changes.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: myIndex is the intentional trigger, not an unused dep.
 	useEffect(() => {
 		bodyRef.current?.focus();
 	}, [myIndex]);
 
+	const dismissResume = () => {
+		if (!resumeAcknowledged) {
+			resumeAcknowledged = true;
+			setShowResume(false);
+		}
+	};
+
 	const goNext = useMemo(
 		() => () => {
-			// Mark this step complete, then walk to the next. The summary step's
-			// "Open workspace" handler stamps `completedAt` separately (Phase 4
-			// wires that — Phase 3's summary stub doesn't trigger it).
+			dismissResume();
 			markCompleted();
 			const nextIndex = Math.min(ONBOARDING_STEPS.length - 1, myIndex + 1);
 			const nextId = ONBOARDING_STEPS[nextIndex]!;
 			setActiveIndex(nextIndex);
-			if (isLast) {
-				// Finishing the summary step itself just stays put; the explicit
-				// "Open workspace" action is the real exit.
-				return;
-			}
+			if (isLast) return;
 			void navigate({ to: `/onboarding/${nextId}` });
 		},
 		[isLast, markCompleted, myIndex, navigate, setActiveIndex]
@@ -128,6 +175,7 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 
 	const goBack = useMemo(
 		() => () => {
+			dismissResume();
 			if (isFirst) return;
 			const prevIndex = Math.max(0, myIndex - 1);
 			const prevId = ONBOARDING_STEPS[prevIndex]!;
@@ -139,6 +187,7 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 
 	const skip = useMemo(
 		() => () => {
+			dismissResume();
 			if (!isOptional) return;
 			markSkipped();
 			const nextIndex = Math.min(ONBOARDING_STEPS.length - 1, myIndex + 1);
@@ -151,14 +200,19 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 
 	const goTo = useMemo(
 		() => (id: OnboardingStepId) => {
+			dismissResume();
 			enterOnboardingEdit(id);
 			void navigate({ to: `/onboarding/${id}` });
 		},
 		[enterOnboardingEdit, navigate]
 	);
 
-	// Phase 3 doesn't auto-finish — but expose the handle on the last step
-	// so Phase 4's summary body can call it.
+	const startOver = () => {
+		dismissResume();
+		resetOnboarding();
+		void navigate({ to: '/onboarding/welcome' });
+	};
+
 	const childArgs: WizardStepChildArgs<P> = {
 		goNext: isLast ? finishOnboarding : goNext,
 		goBack,
@@ -172,35 +226,21 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 		isLast,
 	};
 
+	const dataState: OnboardingChromeState = stateOverride ?? (showResume ? 'resume' : stepId);
+
 	return (
 		<div
 			data-testid="wizard-stepper"
+			data-state={dataState}
 			className="flex h-full min-h-0 flex-col bg-background text-foreground"
 		>
-			{/* ── Progress rail — doubles as stepper (Variant A) ───────── */}
-			<div
-				className="h-1 w-full"
-				style={{ background: 'var(--bg-raised)' }}
-				role="progressbar"
-				aria-valuemin={0}
-				aria-valuemax={ONBOARDING_STEPS.length}
-				aria-valuenow={myIndex + 1}
-				aria-label={`Onboarding progress: step ${myIndex + 1} of ${ONBOARDING_STEPS.length}`}
-			>
-				<div
-					data-testid="wizard-progress-fill"
-					className="h-full transition-[width] duration-300 ease-out motion-reduce:transition-none"
-					style={{ width: `${progressPct}%`, background: 'var(--primary)' }}
-				/>
-			</div>
-
-			{/* ── Header — brand + step label ────────────────────────── */}
+			{/* ── Top bar ─────────────────────────────────────────────── */}
 			<header
-				className="flex items-center justify-between border-b px-12 py-5"
+				className="flex items-center justify-between border-b px-6 py-3"
 				style={{ borderColor: 'var(--border-soft)' }}
 			>
 				<div className="inline-flex items-center gap-2.5 text-[15px] font-bold tracking-tight">
-					<svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
 						<path
 							d="M4 20L12 4L20 20"
 							stroke="var(--primary)"
@@ -210,6 +250,9 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 						<path d="M8 14H16" stroke="var(--primary)" strokeWidth="2.4" strokeLinecap="square" />
 					</svg>
 					Ikenga
+					<span className="ml-2 text-xs font-normal" style={{ color: 'var(--fg-faint)' }}>
+						Consecration
+					</span>
 				</div>
 				<div
 					data-testid="wizard-step-label"
@@ -230,52 +273,66 @@ export function WizardStepper<P = unknown>({ stepId, children }: WizardStepperPr
 				</div>
 			</header>
 
-			{/* ── Body — step bodies render here. ────────────────────── */}
-			{/* tabIndex={-1} + ref={bodyRef} so focus moves here on each step
-			    transition, letting screen readers announce the new step content
-			    (WCAG 2.4.3). The element is intentionally not in the Tab order
-			    (tabIndex=-1) — focus is only placed programmatically. */}
+			{/* ── Progress rail (thin bar, doubles as top-level progress) ── */}
 			<div
-				ref={bodyRef}
-				tabIndex={-1}
-				className="min-h-0 flex-1 overflow-auto px-16 py-10 focus-visible:outline-none"
+				className="h-1 w-full"
+				style={{ background: 'var(--bg-raised)' }}
+				role="progressbar"
+				aria-valuemin={0}
+				aria-valuemax={ONBOARDING_STEPS.length}
+				aria-valuenow={myIndex + 1}
+				aria-label={`Onboarding progress: step ${myIndex + 1} of ${ONBOARDING_STEPS.length}`}
 			>
-				{children(childArgs)}
+				<div
+					data-testid="wizard-progress-fill"
+					className="h-full transition-[width] duration-300 ease-out motion-reduce:transition-none"
+					style={{ width: `${progressPct}%`, background: 'var(--primary)' }}
+				/>
 			</div>
 
-			{/* ── Footer — Skip / Back / Continue ─────────────────────── */}
-			<footer
-				className="flex items-center justify-between border-t px-12 py-4"
-				style={{ borderColor: 'var(--border-soft)', background: 'var(--bg-surface)' }}
-			>
-				<span className="font-mono text-xs" style={{ color: 'var(--fg-faint)' }}>
-					{summariseProgress(steps)}
-				</span>
-				<div className="flex items-center gap-3">
-					{isOptional && !isLast && (
-						<Button variant="ghost" onClick={skip} data-testid="wizard-skip" className={cn('h-9')}>
-							Skip
-						</Button>
-					)}
-					{!isFirst && (
-						<Button
-							variant="ghost"
-							onClick={goBack}
-							data-testid="wizard-back"
-							className={cn('h-9')}
+			<div className="flex min-h-0 flex-1">
+				<OnboardingRail
+					activeStepId={stepId}
+					activeIndex={activeIndex}
+					steps={steps}
+					onNavigate={goTo}
+				/>
+
+				{/* ── Body — step bodies render here. ────────────────────── */}
+				<div
+					ref={bodyRef}
+					tabIndex={-1}
+					className="min-h-0 flex-1 overflow-auto px-16 py-10 focus-visible:outline-none"
+				>
+					{showResume && stateOverride === undefined && (
+						<div
+							className="mb-6 flex items-center gap-3 rounded-md border px-4 py-3 text-sm"
+							style={{ borderColor: 'var(--border-soft)', background: 'var(--bg-surface)' }}
+							data-testid="onboarding-resume-banner"
 						>
-							Back
-						</Button>
+							<span aria-hidden="true">🕐</span>
+							<span className="flex-1">
+								<b>You left off here.</b> Nothing you already answered was lost.
+							</span>
+							<Button variant="ghost" size="sm" onClick={startOver} data-testid="onboarding-start-over">
+								Start over
+							</Button>
+						</div>
 					)}
-					<Button
-						onClick={childArgs.goNext}
-						data-testid="wizard-next"
-						className="h-11 px-6 text-sm font-semibold"
-					>
-						{isLast ? 'Enter your Obi' : 'Continue'}
-					</Button>
+					{children(childArgs)}
 				</div>
-			</footer>
+			</div>
+
+			<OnboardingFooter
+				stepId={stepId}
+				isFirst={isFirst}
+				isLast={isLast}
+				isOptional={isOptional}
+				progressLabel={summariseProgress(steps)}
+				onBack={goBack}
+				onSkip={skip}
+				onNext={childArgs.goNext}
+			/>
 		</div>
 	);
 }

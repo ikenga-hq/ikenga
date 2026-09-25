@@ -17,7 +17,22 @@ import {
 	ONBOARDING_STATE_VERSION,
 	ONBOARDING_STEPS,
 	type OnboardingState,
+	type OnboardingStepRecord,
 } from './shell-store';
+
+// WP-38 renamed `OnboardingStepId` (agent/roots/packages/connectors/
+// scaffolding/appearance/summary → engine/project/equipment/look/.../done).
+// `migrateShellStore`'s own legacy v7 arm still literally writes a
+// `steps.agent` key (untouched here per WP-38's brief — that bump is WP-40's
+// alone) — these tests assert real, unchanged runtime behaviour of that
+// arm, so the reads are widened to `Record<string, OnboardingStepRecord>`
+// rather than the now-narrower `OnboardingStepId`-keyed type. The `.agent`
+// key itself is orphaned dead weight post-rename (nothing reads it any
+// more) and should become `.engine` whenever `migrateShellStore` is next
+// touched — flagged in the WP-38 PR body, not fixed here.
+function legacySteps(state: OnboardingState): Record<string, OnboardingStepRecord> {
+	return state.steps as unknown as Record<string, OnboardingStepRecord>;
+}
 
 describe('shell-store onboarding migration', () => {
 	it('seeds a fresh OnboardingState when missing from persisted blob', () => {
@@ -55,9 +70,9 @@ describe('shell-store onboarding migration', () => {
 		};
 
 		expect(migrated.onboarding.selectedAgentId).toBe('claude-code');
-		expect(migrated.onboarding.steps.agent.status).toBe('completed');
-		expect(typeof migrated.onboarding.steps.agent.completedAt).toBe('number');
-		expect(migrated.onboarding.steps.agent.payload).toEqual({ agentId: 'claude-code' });
+		expect(legacySteps(migrated.onboarding).agent?.status).toBe('completed');
+		expect(typeof legacySteps(migrated.onboarding).agent?.completedAt).toBe('number');
+		expect(legacySteps(migrated.onboarding).agent?.payload).toEqual({ agentId: 'claude-code' });
 
 		// Legacy keys are scrubbed so they don't get reused.
 		expect(migrated.agent_onboarded).toBeUndefined();
@@ -66,7 +81,7 @@ describe('shell-store onboarding migration', () => {
 		// Other steps stay pending — the legacy flag wasn't a full-wizard
 		// completion signal.
 		expect(migrated.onboarding.steps.welcome.status).toBe('pending');
-		expect(migrated.onboarding.steps.summary.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).summary?.status).toBe('pending');
 		expect(migrated.onboarding.completedAt).toBeNull();
 	});
 
@@ -81,16 +96,17 @@ describe('shell-store onboarding migration', () => {
 
 		expect(migrated.onboarding.selectedAgentId).toBe('codex');
 		// Without the agent_onboarded flag, the step itself isn't marked done.
-		expect(migrated.onboarding.steps.agent.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).agent?.status).toBe('pending');
 	});
 
 	it('merges over defaults when persisted blob already has a partial onboarding slice', () => {
 		const partial = createDefaultOnboardingState();
 		partial.steps.welcome = { status: 'completed', completedAt: 123 };
 		// Intentionally omit a step from the persisted record to simulate a
-		// future shape that adds a new step the user hasn't seen yet.
+		// future shape that adds a new step the user hasn't seen yet. `shortcuts`
+		// is WP-38's own real example of exactly that (no shipped equivalent).
 		const stepsMinusOne = { ...partial.steps };
-		delete (stepsMinusOne as Record<string, unknown>).scaffolding;
+		delete (stepsMinusOne as Record<string, unknown>).shortcuts;
 		const blob = {
 			activeMode: 'app',
 			onboarding: { ...partial, steps: stepsMinusOne },
@@ -99,7 +115,7 @@ describe('shell-store onboarding migration', () => {
 		const migrated = migrateShellStore(blob, 7) as { onboarding: OnboardingState };
 		expect(migrated.onboarding.steps.welcome.status).toBe('completed');
 		// Missing step got filled in from defaults.
-		expect(migrated.onboarding.steps.scaffolding.status).toBe('pending');
+		expect(migrated.onboarding.steps.shortcuts.status).toBe('pending');
 	});
 
 	it('drops removed telemetry state during v15 migration', () => {

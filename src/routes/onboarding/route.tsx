@@ -1,17 +1,20 @@
 // Onboarding wizard layout route.
 //
-// All step routes live under this — `/onboarding/welcome`, `/onboarding/agent`,
-// etc. Variant A (the approved Phase 1 chrome) is edge-to-edge full window,
-// which means we don't render the workspace activity bar / sidebar / dock
-// at all when we're inside the wizard.
+// All step routes live under this — `/onboarding/welcome`, `/onboarding/
+// engine`, `/onboarding/project`, `/onboarding/equipment`, `/onboarding/
+// look`, `/onboarding/shortcuts`, `/onboarding/done` (D-04 re-map, WP-38).
+// Edge-to-edge full window, which means we don't render the workspace
+// activity bar / sidebar / dock at all when we're inside the wizard.
 //
 // We rely on TanStack's parent layout `Outlet` here. The workspace shell
 // itself can detect the `/onboarding` prefix on its own (see boot-redirect
 // in `__root.tsx`); this route only handles the in-wizard rendering.
 
 import { Outlet, createFileRoute, redirect } from '@tanstack/react-router';
+import { useMemo } from 'react';
 
 import { useShellStore, ONBOARDING_STEPS } from '@/lib/shell/shell-store';
+import { primeOnboardingResumeFlag } from '@/shell/onboarding/wizard-stepper';
 
 export const Route = createFileRoute('/onboarding')({
 	beforeLoad: ({ location }) => {
@@ -33,6 +36,14 @@ export const Route = createFileRoute('/onboarding')({
 });
 
 function OnboardingLayout() {
+	// This layout mounts once for the whole `/onboarding/*` subtree (unlike
+	// each step's <WizardStepper>, which remounts per step) — the one place
+	// to decide, per app session, whether this is a "resume" (WP-38 D-04
+	// `resume` state: wizard reopened half-done). See the doc comment on
+	// `primeOnboardingResumeFlag` in `wizard-stepper.tsx`.
+	useMemo(() => {
+		primeOnboardingResumeFlag();
+	}, []);
 	// Edge-to-edge: just an Outlet. The step bodies wrap themselves in
 	// <WizardStepper> which provides the chrome.
 	return <Outlet />;
