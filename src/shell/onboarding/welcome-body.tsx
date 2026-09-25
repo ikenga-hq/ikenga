@@ -173,7 +173,7 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 
 				<div className="mt-4">
 					<Link
-						to="/settings/backup"
+						to="/settings/storage"
 						className="text-xs underline-offset-2 hover:underline"
 						style={{ color: 'var(--primary)' }}
 						data-testid="welcome-restore-link"

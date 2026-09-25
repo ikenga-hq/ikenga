@@ -83,16 +83,14 @@ export interface SettingsLink {
 	to: string;
 }
 
-// "Everything here can be changed in Settings" — resolved per D-03 section
-// where one exists on this branch today. WP-35 (the D-03 settings-shell
-// rewrite) hasn't landed on this base yet (`feat/phase-5b-flows` is cut
-// from the WP-32/33 substrate merge, not WP-35/36/37 — see the WP-38 PR
-// body), so the shipped route names are the pre-WP-35 ones. Two land
-// exactly on their D-03 name already (`projects`, `appearance`); the rest
-// point at the closest existing route and are flagged in the PR body for a
-// one-line swap once WP-35 ships `/settings/engines` etc.
+// "Everything here can be changed in Settings" — resolved per D-03 section.
+// Carried onto the v0.13.0 (WP-35) settings shell: all links below now point
+// directly at the real D-03 section routes rather than the pre-WP-35 names
+// they were flagged against in the original PR body (`/settings/agent` and
+// `/settings/backup` still exist as redirect stubs to `engines`/`storage`,
+// but there's no reason to bounce through them here).
 export const SETTINGS_LINKS: Partial<Record<OnboardingStepId, SettingsLink[]>> = {
-	engine: [{ label: 'Settings · Chi & engines', to: '/settings/agent' }],
+	engine: [{ label: 'Settings · Chi & engines', to: '/settings/engines' }],
 	project: [{ label: 'Settings · Projects', to: '/settings/projects' }],
 	equipment: [
 		{ label: 'Ngwa', to: '/ngwa' },
