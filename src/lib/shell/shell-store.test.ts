@@ -22,14 +22,11 @@ import {
 
 // WP-38 renamed `OnboardingStepId` (agent/roots/packages/connectors/
 // scaffolding/appearance/summary → engine/project/equipment/look/.../done).
-// `migrateShellStore`'s own legacy v7 arm still literally writes a
-// `steps.agent` key (untouched here per WP-38's brief — that bump is WP-40's
-// alone) — these tests assert real, unchanged runtime behaviour of that
-// arm, so the reads are widened to `Record<string, OnboardingStepRecord>`
-// rather than the now-narrower `OnboardingStepId`-keyed type. The `.agent`
-// key itself is orphaned dead weight post-rename (nothing reads it any
-// more) and should become `.engine` whenever `migrateShellStore` is next
-// touched — flagged in the WP-38 PR body, not fixed here.
+// WP-47 moved `migrateShellStore`'s legacy v8 arm from the orphaned
+// `steps.agent` key to `steps.engine` (agent → engine is WP-38's own rename
+// map), so a pre-WP-38 onboarded user's engine step reads as completed.
+// Reads stay widened to `Record<string, OnboardingStepRecord>` so the
+// assertions can also prove no stray `.agent` key is written.
 function legacySteps(state: OnboardingState): Record<string, OnboardingStepRecord> {
 	return state.steps as unknown as Record<string, OnboardingStepRecord>;
 }
@@ -55,7 +52,7 @@ describe('shell-store onboarding migration', () => {
 		}
 	});
 
-	it('migrates legacy `agent_onboarded` + `selected_agent_id` into the agent step', () => {
+	it('migrates legacy `agent_onboarded` + `selected_agent_id` into the engine step', () => {
 		const migrated = migrateShellStore(
 			{
 				activeMode: 'app',
@@ -70,9 +67,10 @@ describe('shell-store onboarding migration', () => {
 		};
 
 		expect(migrated.onboarding.selectedAgentId).toBe('claude-code');
-		expect(legacySteps(migrated.onboarding).agent?.status).toBe('completed');
-		expect(typeof legacySteps(migrated.onboarding).agent?.completedAt).toBe('number');
-		expect(legacySteps(migrated.onboarding).agent?.payload).toEqual({ agentId: 'claude-code' });
+		expect(legacySteps(migrated.onboarding).engine?.status).toBe('completed');
+		expect(typeof legacySteps(migrated.onboarding).engine?.completedAt).toBe('number');
+		expect(legacySteps(migrated.onboarding).engine?.payload).toEqual({ agentId: 'claude-code' });
+		expect(legacySteps(migrated.onboarding).agent).toBeUndefined();
 
 		// Legacy keys are scrubbed so they don't get reused.
 		expect(migrated.agent_onboarded).toBeUndefined();
@@ -96,7 +94,7 @@ describe('shell-store onboarding migration', () => {
 
 		expect(migrated.onboarding.selectedAgentId).toBe('codex');
 		// Without the agent_onboarded flag, the step itself isn't marked done.
-		expect(legacySteps(migrated.onboarding).agent?.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).engine?.status).toBe('pending');
 	});
 
 	it('merges over defaults when persisted blob already has a partial onboarding slice', () => {

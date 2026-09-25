@@ -4,8 +4,8 @@
 //
 // No `@testing-library/jest-dom` in this repo — plain DOM assertions only.
 
-import { fireEvent, render } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // The trust sheet pulls react-query + the Ngwa snapshot; neither is under
 // test here — only that "Allow host…" mounts it in `violation` mode.
@@ -32,6 +32,10 @@ import {
 	PkgLoadingState,
 	PkgSidecarDownStrip,
 } from './pkg-view-states';
+
+// Sheets portal to document.body; unmount between tests so one test's sheet
+// can't satisfy (or break) the next test's body-wide query.
+afterEach(cleanup);
 
 const PKG = 'com.ikenga.studio';
 const BLOCKED = { host: 'fal.media', target: 'https://fal.media/files/x', scope: 'csp:frame-src' };

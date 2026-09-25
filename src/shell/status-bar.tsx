@@ -180,10 +180,10 @@ function ReadOnly({ id, title, children }: { id: string; title: string; children
 
 /** WP-40b (D-07): the notifications bell + popover, and the toast bridge it
  *  mounts alongside itself. See `src/shell/notifications/bell.tsx`. */
-export function NotificationsBellSlot() {
+export function NotificationsBellSlot({ rovingId }: { rovingId?: string | null } = {}) {
 	return (
 		<span data-slot="notifications-bell" className="contents">
-			<NotificationsBell />
+			<NotificationsBell tabIndex={rovingId === undefined ? undefined : rovingId === 'notifications' ? 0 : -1} />
 		</span>
 	);
 }
@@ -228,6 +228,8 @@ export function StatusBar() {
 		git && 'branch',
 		git && git.modified > 0 && 'modified',
 		...ngwaSegments.map((seg) => seg.id),
+		// WP-40b's bell leads the right-hand cluster and joins the roving set.
+		'notifications',
 		approvals > 0 && 'permissions',
 		runs > 0 && 'runs',
 		'shortcuts',
@@ -336,7 +338,7 @@ export function StatusBar() {
 
 			{/* ── right ── */}
 			<span className="ml-auto flex items-center gap-1">
-				<NotificationsBellSlot />
+				<NotificationsBellSlot rovingId={rovingId} />
 				{approvals > 0 && (
 					<SegButton
 						id="permissions"

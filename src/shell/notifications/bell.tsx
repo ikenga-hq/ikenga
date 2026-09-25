@@ -18,7 +18,9 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { notificationsUnreadCountQueryOptions } from '@/lib/queries/notifications';
 import { NotificationsPopoverContent } from './popover';
 
-export function NotificationsBell() {
+/** `tabIndex` lets the status bar's roving toolbar (T6: one tab stop) own the
+ *  bell's tab stop; omit it anywhere else. */
+export function NotificationsBell({ tabIndex }: { tabIndex?: number } = {}) {
 	const [open, setOpen] = useState(false);
 	const { data } = useQuery(notificationsUnreadCountQueryOptions());
 	const count = data?.total ?? 0;
@@ -31,6 +33,7 @@ export function NotificationsBell() {
 					<button
 						type="button"
 						data-seg="notifications"
+						tabIndex={tabIndex}
 						aria-label={label}
 						title="Notifications"
 						className="relative flex h-5 items-center rounded-[var(--radius-xs)] px-1.5 text-muted-foreground outline-none transition-colors duration-[var(--motion-fast)] ease-[var(--ease-calm)] motion-reduce:transition-none hover:bg-[var(--bg-raised)] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
