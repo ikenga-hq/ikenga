@@ -1,28 +1,39 @@
 // Headless background pkg auto-updater. Mounted once in the workspace
-// alongside <UpdaterBanner /> (which owns the app-binary side). Mounting
-// usePkgsDerived here is what performs the boot-time + 6h registry check for
-// pkg updates — the activity-bar badge and /packages surface subscribe to the
-// same queries.
+// alongside <UpdaterBanner /> (which owns the app-binary side) — together the
+// two sources of the WP-41 D-07 `update-flow` surface
+// (`designs/system-flows.html?state=update-flow`, package-updates variant).
+// Mounting usePkgsDerived here is what performs the boot-time + 6h registry
+// check for pkg updates — the activity-bar badge and /packages surface
+// subscribe to the same queries.
 //
 // When `updates.autoCheck` AND `updates.autoInstallPkgs` are both on, any
 // outdated pkg is updated in place silently — pkgs are sandboxed and
 // hot-reload via the kernel's `pkg-reloaded` event, so there's no relaunch and
 // the surprise cost is low (unlike an app-binary update). A small dismissible
-// strip confirms what was updated; when auto-install is off, the existing
-// badge + /packages "Update all" strip surface the updates instead.
+// strip confirms what was updated. When auto-install is off, this banner
+// offers "Update all" instead, opening the shared `<UpdateSheet>` at its
+// Packages tab (`update-sheet.tsx`) — the same batch list + progress either
+// path ends up rendering; only who kicks it off differs.
 
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Package } from 'lucide-react';
 import { Banner } from '@/components/ui/banner';
+import { Button } from '@/components/ui/button';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
+import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
 import { useShellStore } from '@/lib/shell/shell-store';
+
+function plural(n: number, one: string, many = `${one}s`): string {
+	return `${n} ${n === 1 ? one : many}`;
+}
 
 export function PkgAutoUpdater() {
 	const autoCheck = useShellStore((s) => s.updatesAutoCheck);
 	const autoInstallPkgs = useShellStore((s) => s.updatesAutoInstallPkgs);
 	const d = usePkgsDerived();
 	const updatePkgs = useUpdatePkgs();
+	const openSheet = useUpdateSheetStore((s) => s.openSheet);
 	// id@latest of every update we've already kicked off this session, so a
 	// query refetch (or the post-update invalidation) can't re-trigger the
 	// same upgrade. A genuinely newer release later still fires (different key).
@@ -51,9 +62,16 @@ export function PkgAutoUpdater() {
 
 	if (progress) {
 		return (
-			<Banner tone="info" icon={<Loader2 className="animate-spin motion-reduce:animate-none" />}>
-				Updating <span className="font-medium">{progress.current || 'packages'}</span> (
-				{progress.done}/{progress.total})…
+			<Banner data-state="update-packages" tone="info" icon={<Package />}>
+				<span className="inline-flex items-center gap-2">
+					<span className="ember-dots" aria-hidden="true">
+						<i />
+						<i />
+						<i />
+					</span>
+					Updating <span className="font-medium">{progress.current || 'packages'}</span> (
+					{progress.done}/{progress.total})…
+				</span>
 			</Banner>
 		);
 	}
@@ -62,7 +80,7 @@ export function PkgAutoUpdater() {
 	// which read as "the update ran and nothing happened".
 	if (failures.length > 0) {
 		return (
-			<Banner tone="danger" icon={<AlertTriangle />} onDismiss={() => setFailures([])}>
+			<Banner data-state="update-packages" tone="danger" icon={<AlertTriangle />} onDismiss={() => setFailures([])}>
 				{doneCount ? (
 					<span>
 						Updated <span className="font-medium">{doneCount}</span>,{' '}
@@ -81,14 +99,40 @@ export function PkgAutoUpdater() {
 
 	if (doneCount && doneCount > 0) {
 		return (
-			<Banner tone="success" icon={<CheckCircle2 />} onDismiss={() => setDoneCount(null)}>
+			<Banner data-state="update-packages" tone="success" icon={<CheckCircle2 />} onDismiss={() => setDoneCount(null)}>
 				Updated <span className="font-medium">{doneCount}</span> package
 				{doneCount === 1 ? '' : 's'}.
 			</Banner>
 		);
 	}
 
-	// Render nothing in the common case; the badge + /packages "Update all"
-	// strip carry the non-auto-install path.
-	return null;
+	// Auto-install is on — the effect above handles it silently; nothing to
+	// offer here while there's no progress/result to report.
+	if (autoCheck && autoInstallPkgs) return null;
+
+	// Manual path: updates exist but auto-install is off. Offer the same
+	// batch flow the mockup's pkg banner does ("N package updates available
+	// · Update all (N)"), opening the shared sheet's Packages tab rather than
+	// running the batch inline — the badge + /packages strip still work too.
+	if (!d.updates.length) return null;
+	const names = d.updates
+		.slice(0, 2)
+		.map((r) => r.name)
+		.join(', ');
+	return (
+		<Banner
+			data-state="update-packages"
+			tone="warning"
+			icon={<Package />}
+			actions={
+				<Button size="sm" onClick={() => openSheet('pkgs')}>
+					Update all ({d.updates.length})
+				</Button>
+			}
+		>
+			<span className="font-medium">{plural(d.updates.length, 'package update')}</span>
+			<span className="text-muted-foreground"> available</span>
+			{names && <span className="text-muted-foreground"> · {names}</span>}
+		</Banner>
+	);
 }
