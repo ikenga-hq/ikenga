@@ -1,9 +1,11 @@
 import { useCallback } from 'react';
+import { TerminalSquare } from 'lucide-react';
 import { ListRow } from '@/components/ui/list-row';
 import { cn } from '@/components/ui/utils';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useTerminalStore } from '@/terminal/session-store';
 import { createTerminalSession } from '@/terminal/single-terminal';
+import { EmptyState } from '@/components/states';
 import type { ExplorerSectionContext } from '../section-registry';
 
 export const sessionsContextMenu = [
@@ -31,19 +33,13 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 
 	if (tabs.length === 0) {
 		return (
-			<div className="p-4 text-center">
-				<h3 className="text-sm font-semibold">No sessions in this project</h3>
-				<p className="text-xs text-muted-foreground mt-1 mb-3">
-					A session is a terminal with an engine in it. Starting one also starts the cost and tool feed.
-				</p>
-				<button
-					type="button"
-					onClick={handleStartSession}
-					className="text-xs bg-primary text-primary-foreground px-3 py-1.5 rounded hover:bg-primary/90 transition-colors"
-				>
-					Start a session
-				</button>
-			</div>
+			<EmptyState
+				data-state="explorer-sessions-empty"
+				icon={TerminalSquare}
+				heading="No sessions in this project"
+				body="A session is a terminal with an engine in it. Starting one also starts the cost and tool feed."
+				action={{ label: 'Start a session', onClick: handleStartSession }}
+			/>
 		);
 	}
 

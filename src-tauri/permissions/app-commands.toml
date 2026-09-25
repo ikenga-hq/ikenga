@@ -247,6 +247,7 @@ commands.allow = [
   "secrets_delete_scoped",
   "secrets_get",
   "secrets_get_scoped",
+  "secrets_index_names",
   "secrets_list_keys",
   "secrets_list_keys_scoped",
   "secrets_lock",
