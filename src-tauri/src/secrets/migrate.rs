@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tauri_plugin_stronghold::stronghold::Stronghold;
 
 use super::index::{pending_path, write_atomic, SecretIndex, INDEX_FILENAME};
-use super::keyring_store::KeyringStore;
+use super::keyring_store::{KeyringStore, SERVICE};
 use super::store::SecretsStore;
 
 const LEGACY_FILENAME: &str = "secrets.stronghold";
@@ -94,6 +94,12 @@ impl MigrationPaths {
 }
 
 pub fn run(data_dir: &Path) -> Result<MigrationOutcome, String> {
+    run_with_service(data_dir, SERVICE)
+}
+
+/// [`run`] against an explicit keychain service. Production always passes
+/// [`SERVICE`]; the WP-37 rehearsal passes an isolated one.
+pub(crate) fn run_with_service(data_dir: &Path, service: &str) -> Result<MigrationOutcome, String> {
     let paths = MigrationPaths::new(data_dir);
     if paths.rollback_marker.exists() {
         let marker: RollbackMarker = read_json(&paths.rollback_marker)?;
@@ -109,9 +115,9 @@ pub fn run(data_dir: &Path) -> Result<MigrationOutcome, String> {
         && !paths.migrated.exists()
         && !paths.marker.exists();
     let store = if initial_migration {
-        KeyringStore::new_for_migration(paths.index.clone())
+        KeyringStore::new_for_migration_with_service(paths.index.clone(), service)
     } else {
-        KeyringStore::new(paths.index.clone())
+        KeyringStore::new_with_service(paths.index.clone(), service)
     }
     .map_err(|error| error.to_string())?;
     migrate_with(data_dir, &store, |legacy_path, key_path| {
@@ -120,6 +126,11 @@ pub fn run(data_dir: &Path) -> Result<MigrationOutcome, String> {
 }
 
 pub fn rollback(data_dir: &Path) -> Result<bool, String> {
+    rollback_with_service(data_dir, SERVICE)
+}
+
+/// [`rollback`] against an explicit keychain service (see [`run_with_service`]).
+pub(crate) fn rollback_with_service(data_dir: &Path, service: &str) -> Result<bool, String> {
     let paths = MigrationPaths::new(data_dir);
     if paths.rollback_marker.exists() {
         return Err(format!(
@@ -132,7 +143,8 @@ pub fn rollback(data_dir: &Path) -> Result<bool, String> {
     };
     let backup_sha256 = fingerprint(&backup)?;
     let target_values = read_legacy(&backup, &paths.key)?;
-    let store = KeyringStore::new(paths.index.clone()).map_err(|error| error.to_string())?;
+    let store = KeyringStore::new_with_service(paths.index.clone(), service)
+        .map_err(|error| error.to_string())?;
     store.probe().map_err(|error| {
         format!("rollback cannot verify authoritative keychain access: {error}")
     })?;
@@ -448,7 +460,10 @@ fn restore_original_snapshot(paths: &MigrationPaths, backup: &Path) -> Result<St
     Ok(restored)
 }
 
-fn read_legacy(legacy_path: &Path, key_path: &Path) -> Result<BTreeMap<String, String>, String> {
+pub(crate) fn read_legacy(
+    legacy_path: &Path,
+    key_path: &Path,
+) -> Result<BTreeMap<String, String>, String> {
     let metadata = fs::symlink_metadata(legacy_path)
         .map_err(|error| format!("inspect legacy Stronghold snapshot: {error}"))?;
     if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {

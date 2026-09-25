@@ -68,6 +68,9 @@ mod viewer_server;
 // (WP-02) + the window registry / spawn-close-list commands (WP-03).
 #[cfg(feature = "desktop")]
 mod window;
+// WP-37: `#[ignore]`d Phase 5a migration rehearsal against a copy of app data.
+#[cfg(all(test, feature = "desktop"))]
+mod rehearsal_5a;
 
 #[cfg(feature = "desktop")]
 use std::sync::Arc;

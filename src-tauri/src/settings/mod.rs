@@ -770,45 +770,7 @@ impl SettingsManager {
         &self,
         pool: &sqlx::SqlitePool,
     ) -> Result<HashMap<String, PathBuf>, String> {
-        let rows = sqlx::query("SELECT id, root_path, archived_at FROM projects ORDER BY id ASC")
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("list settings project roots: {e}"))?;
-        let mut roots = HashMap::new();
-        let mut owners: HashMap<PathBuf, String> = HashMap::new();
-        for row in rows {
-            let id: String = row
-                .try_get("id")
-                .map_err(|e| format!("read project id: {e}"))?;
-            let archived_at: Option<i64> = row
-                .try_get("archived_at")
-                .map_err(|e| format!("read project archive state: {e}"))?;
-            if archived_at.is_some() {
-                continue;
-            }
-            let root: Option<String> = row
-                .try_get("root_path")
-                .map_err(|e| format!("read project root: {e}"))?;
-            let Some(root) = root.filter(|value| !value.trim().is_empty()) else {
-                continue;
-            };
-            let root = match normalize_project_root(&root) {
-                Ok(root) => root,
-                Err(error) => {
-                    tracing::warn!("[settings] skipping project {id}: {error}");
-                    continue;
-                }
-            };
-            if let Some(owner) = owners.get(&root) {
-                tracing::warn!(
-                    "[settings] skipping duplicate project root {root:?} for {id}; owned by {owner}"
-                );
-                continue;
-            }
-            owners.insert(root.clone(), id.clone());
-            roots.insert(id, root);
-        }
-        Ok(roots)
+        project_roots_from_pool(pool).await
     }
 
     fn prune_project_watchers(&self, roots: &HashMap<String, PathBuf>) -> Result<(), String> {
@@ -954,7 +916,54 @@ impl SettingsManager {
     }
 }
 
-fn effective_document(
+/// Active (non-archived) project roots keyed by project id, normalized and
+/// de-duplicated. Free function so the WP-37 rehearsal can read the same
+/// roots from a copied database without an `AppHandle`.
+pub(crate) async fn project_roots_from_pool(
+    pool: &sqlx::SqlitePool,
+) -> Result<HashMap<String, PathBuf>, String> {
+    let rows = sqlx::query("SELECT id, root_path, archived_at FROM projects ORDER BY id ASC")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("list settings project roots: {e}"))?;
+    let mut roots = HashMap::new();
+    let mut owners: HashMap<PathBuf, String> = HashMap::new();
+    for row in rows {
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| format!("read project id: {e}"))?;
+        let archived_at: Option<i64> = row
+            .try_get("archived_at")
+            .map_err(|e| format!("read project archive state: {e}"))?;
+        if archived_at.is_some() {
+            continue;
+        }
+        let root: Option<String> = row
+            .try_get("root_path")
+            .map_err(|e| format!("read project root: {e}"))?;
+        let Some(root) = root.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let root = match normalize_project_root(&root) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!("[settings] skipping project {id}: {error}");
+                continue;
+            }
+        };
+        if let Some(owner) = owners.get(&root) {
+            tracing::warn!(
+                "[settings] skipping duplicate project root {root:?} for {id}; owned by {owner}"
+            );
+            continue;
+        }
+        owners.insert(root.clone(), id.clone());
+        roots.insert(id, root);
+    }
+    Ok(roots)
+}
+
+pub(crate) fn effective_document(
     scope: SettingsScope,
     personal: &SettingsDocument,
     project: Option<&SettingsDocument>,

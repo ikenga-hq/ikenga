@@ -212,6 +212,15 @@ pub fn item_name(name: &str) -> Result<String, String> {
     Ok(format!("{ITEM_PREFIX}{name}"))
 }
 
+/// [`item_name`] under a keychain service other than the production one.
+/// The service doubles as the item prefix because the Windows credential
+/// target is the item name itself: a different service with the production
+/// prefix would still address (and overwrite) the production credentials.
+pub(crate) fn item_name_for_service(service: &str, name: &str) -> Result<String, String> {
+    validate_legacy_name(name)?;
+    Ok(format!("{service}:{name}"))
+}
+
 pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -501,6 +510,19 @@ mod tests {
             item_name("workspace::TOKEN").unwrap(),
             "ikenga:workspace::TOKEN"
         );
+    }
+
+    #[test]
+    fn service_item_names_match_the_default_and_isolate_other_services() {
+        assert_eq!(
+            item_name_for_service("ikenga", "workspace::TOKEN").unwrap(),
+            item_name("workspace::TOKEN").unwrap()
+        );
+        assert_eq!(
+            item_name_for_service("ikenga-rehearsal-5a", "workspace::TOKEN").unwrap(),
+            "ikenga-rehearsal-5a:workspace::TOKEN"
+        );
+        assert!(item_name_for_service("ikenga-rehearsal-5a", "__manifest").is_err());
     }
 
     #[test]
