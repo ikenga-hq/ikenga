@@ -15,10 +15,18 @@ import {
 	useIkengaStore,
 } from '@/lib/ikenga/theme-store';
 import { writeSettingsField } from '@/lib/settings/client';
+import type { SettingsWriteOptions } from '@/lib/settings/types';
 import { loadAppDb } from '@/lib/sql-db';
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
 
 import { LAYOUT_LS_PREFIX } from './-components/clear-data';
+
+interface AppearanceProjectValueMap {
+	'appearance.theme': IkengaTheme;
+	'appearance.mode': IkengaMode;
+	'appearance.density': IkengaDensity;
+	'appearance.tintStrength': IkengaTintStrength;
+}
 
 // Per-theme preview palettes — driven by the theme value, not the host theme,
 // so each card always renders in its own colors.
@@ -96,12 +104,12 @@ function AppearancePage() {
 	const isProject = scope === 'project';
 	const appearance = result?.effective.appearance ?? {};
 
-	async function writeProject(
-		field: 'appearance.theme' | 'appearance.mode' | 'appearance.density' | 'appearance.tintStrength',
-		value: string
+	async function writeProject<K extends keyof AppearanceProjectValueMap>(
+		field: K,
+		value: AppearanceProjectValueMap[K]
 	) {
 		if (!projectId) return;
-		await writeSettingsField({ scope: 'project', field, value, projectId });
+		await writeSettingsField({ scope: 'project', field, value, projectId } as SettingsWriteOptions);
 		refresh();
 	}
 
@@ -342,7 +350,9 @@ function SettingStubRow({
 		<div className="grid grid-cols-[1fr_auto] items-center gap-4 px-4 py-3">
 			<div className="min-w-0 space-y-0.5">
 				<div className="text-sm font-medium text-foreground">{label}</div>
-				<div className="text-xs leading-relaxed text-muted-foreground">{desc}</div>
+				<div id={`stub-desc-${stubId}`} className="text-xs leading-relaxed text-muted-foreground">
+					{desc}
+				</div>
 			</div>
 			<div className="shrink-0">{children}</div>
 		</div>

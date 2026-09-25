@@ -131,7 +131,7 @@ function queueAppearanceWrite(options: SettingsWriteOptions): void {
 
 function kvSet<K extends AppearanceField>(key: K, value: AppearanceValueMap[K]): void {
 	if (suppressKv) return;
-	queueAppearanceWrite({ scope: 'personal', field: key, value });
+	queueAppearanceWrite({ scope: 'personal', field: key, value } as SettingsWriteOptions);
 }
 
 export const useIkengaStore = create<IkengaState>()(
@@ -166,6 +166,9 @@ export const useIkengaStore = create<IkengaState>()(
 			} catch {
 				return;
 			}
+			// No Tauri host (browser mode / e2e): invoke resolves null — keep
+			// the localStorage-hydrated snapshot.
+			if (!result) return;
 			if (!result.personalPresent && !result.projectPresent) {
 				const s = get();
 				suppressKv = true;

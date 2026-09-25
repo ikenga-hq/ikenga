@@ -1,4 +1,4 @@
-import { Copy, Ellipsis, ExternalLink, FileText, RotateCcw } from 'lucide-react';
+import { Check, Copy, Ellipsis, ExternalLink, FileText, RotateCcw } from 'lucide-react';
 import { useState } from 'react';
 
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { openSettingsFile, writeSettingsField } from '@/lib/settings/client';
+import type { SettingsWriteOptions } from '@/lib/settings/types';
 import {
 	type SettingsSectionId,
 	type SettingsScopeId,
@@ -55,10 +56,29 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 		);
 		if (!ok) return;
 		for (const meta of section.fields) {
-			if (meta.field === 'workspace.onboarding') continue;
+			if (!meta.field || meta.field === 'workspace.onboarding') continue;
 			if (scope === 'project' && !overrides.has(meta.field)) continue;
 			try {
-				await writeSettingsField({ scope, field: meta.field, value: null, remove: true, projectId });
+				// `value` is ignored by the backend when `remove` is true; only the
+				// `scope`/`projectId` pairing needs to satisfy SettingsWriteOptions'
+				// discriminated union here (see field.tsx's useRevertOverride).
+				if (scope === 'project') {
+					if (!projectId) continue;
+					await writeSettingsField({
+						scope: 'project',
+						field: meta.field,
+						value: null,
+						remove: true,
+						projectId,
+					} as SettingsWriteOptions);
+				} else {
+					await writeSettingsField({
+						scope: 'personal',
+						field: meta.field,
+						value: null,
+						remove: true,
+					} as SettingsWriteOptions);
+				}
 			} catch {
 				break;
 			}
@@ -146,10 +166,19 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 						</Button>
 					</DropdownMenuTrigger>
 					<DropdownMenuContent align="end" className="w-72">
-						<DropdownMenuItem onSelect={() => void handleCopy()}>
-							<Copy className="mr-2 h-3.5 w-3.5" />
+						<DropdownMenuItem
+							onSelect={(e) => {
+								e.preventDefault();
+								void handleCopy();
+							}}
+						>
+							{copied ? (
+								<Check className="mr-2 h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+							) : (
+								<Copy className="mr-2 h-3.5 w-3.5" />
+							)}
 							<div className="flex min-w-0 flex-col">
-								<span>Copy as iyke</span>
+								<span>{copied ? 'Copied!' : 'Copy as iyke'}</span>
 								<span className="truncate font-mono text-[10px] text-muted-foreground">
 									{iykeLine}
 								</span>
