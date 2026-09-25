@@ -925,7 +925,7 @@ export function migrateShellStore(persisted: unknown, version: number): unknown 
 
 		if (hadLegacyAgent || legacyAgentId) {
 			if (hadLegacyAgent) {
-				next.steps.agent = {
+				next.steps.engine = {
 					status: 'completed',
 					completedAt: Date.now(),
 					payload: legacyAgentId ? { agentId: legacyAgentId } : undefined,

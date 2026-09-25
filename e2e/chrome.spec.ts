@@ -83,16 +83,18 @@ function shotPath(testInfo: TestInfo, name: string): string {
 }
 
 test.describe('frame chrome (WP-09)', () => {
-	test('title row: exactly two controls — project chip and branch chip (T1)', async ({ page }) => {
+	test('title row: project chip + branch chip, plus the ≡ menu off macOS (T1, D-08 native-menu-win)', async ({ page }) => {
 		const errors = trackPageErrors(page);
 		await boot(page);
 		const row = page.getByRole('toolbar', { name: 'Title row' });
 		await expect(row.getByTestId('title-branch-chip')).toContainText('feat/frame-chrome');
 		await expect(row.getByTestId('title-project-chip')).toContainText(ACTIVE.display_name);
-		// Every focusable thing in the row.
+		// Every focusable thing in the row. macOS has the native menu bar, so
+		// only the two chips; Windows/Linux add WP-46's ≡ cascade at the far left.
+		const isMac = await page.evaluate(() => /Mac/i.test(navigator.platform));
 		await expect(
 			row.locator('button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])')
-		).toHaveCount(2);
+		).toHaveCount(isMac ? 2 : 3);
 		expect(errors, errors.join('\n\n')).toEqual([]);
 	});
 

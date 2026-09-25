@@ -78,7 +78,7 @@ function EngineSectionBody() {
 	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
 	const payload = useShellStore(
 		(s) =>
-			s.onboarding.steps.agent.payload as
+			s.onboarding.steps.engine.payload as
 				| {
 						agentId: string;
 						display?: string;

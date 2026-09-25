@@ -171,7 +171,7 @@ describe('daily address reopen (WP-39)', () => {
 		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
 
 		const reopen = screen.getByTestId('title-daily-address-reopen');
-		expect(reopen).toBeInTheDocument();
+		expect(reopen).toBeTruthy();
 		await user.click(reopen);
 		expect(useShellStore.getState().dailyAddressDismissedOn).toBeNull();
 	});

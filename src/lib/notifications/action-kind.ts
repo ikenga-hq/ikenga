@@ -33,8 +33,10 @@ export function asKnownNotificationAction(
 	if (action.kind === 'permission.decide' && action.via === 'acp') {
 		return {
 			kind: 'open.thread',
-			threadId: String(action.threadId ?? ''),
-			requestId: String(action.requestId ?? ''),
+			// The typed union no longer carries an ACP permission.decide
+			// variant (WP-40 round 2), so read the legacy fields untyped.
+			threadId: String((action as Record<string, unknown>).threadId ?? ''),
+			requestId: String((action as Record<string, unknown>).requestId ?? ''),
 		};
 	}
 	if (action.kind === 'permission.decide' && action.via !== 'hooks') {

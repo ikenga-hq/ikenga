@@ -166,35 +166,35 @@ describe('todayLocalDate', () => {
 describe('<DailyAddress/>', () => {
 	it('renders data-state="daily-address" by default (not dismissed today)', async () => {
 		renderAddress();
-		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeInTheDocument());
+		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeTruthy());
 		expect(document.querySelector('[data-state="daily-address"]')).not.toBeNull();
 	});
 
 	it('dismissing hides it and persists today\'s date on the shell store', async () => {
 		const user = userEvent.setup();
 		renderAddress();
-		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeInTheDocument());
+		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeTruthy());
 
 		await user.click(screen.getByLabelText('Dismiss daily address'));
 
-		expect(screen.queryByLabelText('Daily address')).not.toBeInTheDocument();
+		expect(screen.queryByLabelText('Daily address')).toBeNull();
 		expect(useShellStore.getState().dailyAddressDismissedOn).toBe(todayLocalDate());
 	});
 
 	it('a past dismissal date still shows it (only today\'s date suppresses it)', async () => {
 		useShellStore.setState({ dailyAddressDismissedOn: '2000-01-01' });
 		renderAddress();
-		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeInTheDocument());
+		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeTruthy());
 	});
 
 	it('reopening (clearing the dismissal) shows it again', async () => {
 		useShellStore.setState({ dailyAddressDismissedOn: todayLocalDate() });
 		renderAddress();
-		expect(screen.queryByLabelText('Daily address')).not.toBeInTheDocument();
+		expect(screen.queryByLabelText('Daily address')).toBeNull();
 
 		useShellStore.getState().setDailyAddressDismissed(null);
 		renderAddress();
-		expect(await screen.findByLabelText('Daily address')).toBeInTheDocument();
+		expect(await screen.findByLabelText('Daily address')).toBeTruthy();
 	});
 
 	it('is hidden when workspace.dailyAddress is off in settings.json', async () => {
@@ -203,7 +203,7 @@ describe('<DailyAddress/>', () => {
 		// Let the settings read settle, then the address must still be absent.
 		await new Promise((r) => setTimeout(r, 0));
 		await new Promise((r) => setTimeout(r, 0));
-		expect(screen.queryByLabelText('Daily address')).not.toBeInTheDocument();
+		expect(screen.queryByLabelText('Daily address')).toBeNull();
 		expect(mocks.chiList).not.toHaveBeenCalled();
 	});
 
@@ -225,7 +225,7 @@ describe('<DailyAddress/>', () => {
 	it('greets the user by name', async () => {
 		useShellStore.setState({ userName: 'nedjamez' });
 		renderAddress();
-		expect(await screen.findByText(/, nedjamez\./)).toBeInTheDocument();
+		expect(await screen.findByText(/, nedjamez\./)).toBeTruthy();
 	});
 });
 
@@ -306,8 +306,8 @@ describe('since you were last here (project-scoped runs)', () => {
 			run({ run_id: 'out', brief: 'other project run', cwd: '/code/other' }),
 		]);
 		renderAddress();
-		expect(await screen.findByText('in-project run')).toBeInTheDocument();
-		expect(screen.queryByText('other project run')).not.toBeInTheDocument();
+		expect(await screen.findByText('in-project run')).toBeTruthy();
+		expect(screen.queryByText('other project run')).toBeNull();
 	});
 });
 
