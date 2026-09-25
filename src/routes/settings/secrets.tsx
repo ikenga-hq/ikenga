@@ -23,7 +23,7 @@ import {
 	Plus,
 	Trash2,
 } from 'lucide-react';
-import { useCallback, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import { type KeyboardEvent, type ReactNode, useCallback, useMemo, useRef, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -45,9 +45,9 @@ import {
 } from '@/lib/queries/secrets';
 import { useShellStore } from '@/lib/shell/shell-store';
 import {
+	type PkgInstalledSummary,
 	pkgKernelStatus,
 	secretsGetScoped,
-	type PkgInstalledSummary,
 	type VaultScope,
 } from '@/lib/tauri-cmd';
 
@@ -55,11 +55,9 @@ type TabKind = 'workspace' | 'project' | 'pkg';
 
 function SecretsPage() {
 	const status = useQuery(vaultStatusQueryOptions());
-	const vaultAvailable = status.data?.available ?? false;
-	// The headless daemon's store is flat, env-backed and read-only (see
-	// src-tauri/src/secrets_env.rs). Reads work; add/edit/delete are hidden
-	// rather than offered and then refused by the RPC.
-	const vaultWritable = status.data?.writable ?? true;
+	const vaultAvailable = status.data?.available === true;
+	const vaultUnlocked = vaultAvailable && status.data?.locked === false;
+	const vaultWritable = status.data?.writable === true && vaultUnlocked;
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
 
@@ -88,7 +86,7 @@ function SecretsPage() {
 
 	const keysQuery = useQuery({
 		...vaultKeysScopedQueryOptions(scope),
-		enabled: canQuery && vaultAvailable,
+		enabled: canQuery && vaultUnlocked,
 	});
 
 	const [editKey, setEditKey] = useState<string | null>(null);
@@ -101,7 +99,7 @@ function SecretsPage() {
 					Settings · <span className="font-semibold text-foreground">Secrets</span>
 				</span>
 				<StatusChip tone={vaultAvailable ? 'live' : 'danger'} dot className="ml-auto">
-					Vault {vaultAvailable ? 'available' : 'unavailable'}
+					Vault {vaultUnlocked ? 'unlocked' : vaultAvailable ? 'locked' : 'unavailable'}
 				</StatusChip>
 			</div>
 
@@ -172,7 +170,7 @@ function SecretsPage() {
 									size="sm"
 									className="h-7 px-2 text-[11px]"
 									onClick={() => setAddingNew(true)}
-									disabled={!canQuery || !vaultAvailable}
+									disabled={!canQuery || !vaultUnlocked}
 								>
 									<Plus className="mr-1 h-3 w-3" /> Add secret
 								</Button>
@@ -399,8 +397,7 @@ function SecretDialog({
 			setValue(v ?? '');
 			setLoaded(true);
 		});
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [editKey]);
+	}, [editKey, scope]);
 
 	const canSave = name.trim().length > 0 && value.length > 0 && !setMut.isPending && loaded;
 
@@ -420,8 +417,11 @@ function SecretDialog({
 				</DialogHeader>
 				<div className="space-y-3">
 					<div>
-						<label className="text-xs font-medium">Key</label>
+						<label className="text-xs font-medium" htmlFor="secret-key-input">
+							Key
+						</label>
 						<Input
+							id="secret-key-input"
 							value={name}
 							onChange={(e) => setName(e.target.value)}
 							placeholder="MY_API_KEY"
@@ -430,8 +430,11 @@ function SecretDialog({
 						/>
 					</div>
 					<div>
-						<label className="text-xs font-medium">Value</label>
+						<label className="text-xs font-medium" htmlFor="secret-value-input">
+							Value
+						</label>
 						<Input
+							id="secret-value-input"
 							value={value}
 							onChange={(e) => setValue(e.target.value)}
 							type="password"

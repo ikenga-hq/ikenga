@@ -18,12 +18,17 @@ pub struct SecretIndex {
 impl SecretIndex {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                names: BTreeSet::new(),
-            });
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    names: BTreeSet::new(),
+                });
+            }
+            Err(error) => return Err(format!("inspect secrets index {}: {error}", path.display())),
         }
+        reject_link(&path, "secrets index")?;
         let raw = fs::read_to_string(&path)
             .map_err(|e| format!("read secrets index {}: {e}", path.display()))?;
         if raw.trim().is_empty() {
@@ -33,7 +38,10 @@ impl SecretIndex {
             .map_err(|e| format!("parse secrets index {}: {e}", path.display()))?;
         let mut names = BTreeSet::new();
         for value in values {
-            validate_name(&value)?;
+            // Permissive on load: names written by WP-33 and earlier only had
+            // to be non-empty and NUL-free. Rejecting them here would make
+            // the whole store unloadable (and the values unreachable).
+            validate_legacy_name(&value)?;
             names.insert(value);
         }
         Ok(Self { path, names })
@@ -44,13 +52,13 @@ impl SecretIndex {
     }
 
     pub fn insert(&mut self, name: &str) -> Result<(), String> {
-        validate_name(name)?;
+        validate_legacy_name(name)?;
         self.names.insert(name.to_string());
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
-        validate_name(name)?;
+        validate_legacy_name(name)?;
         self.names.remove(name);
         Ok(())
     }
@@ -74,9 +82,19 @@ pub struct IndexPending {
 
 impl IndexPending {
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect pending secrets index {}: {error}",
+                    path.display()
+                ));
+            }
         }
+        reject_link(path, "pending secrets index")?;
         serde_json::from_slice(
             &fs::read(path)
                 .map_err(|e| format!("read pending secrets index {}: {e}", path.display()))?,
@@ -113,7 +131,16 @@ pub fn pending_path(index_path: &Path) -> PathBuf {
         .join(INDEX_PENDING_FILENAME)
 }
 
-pub fn validate_name(name: &str) -> Result<(), String> {
+/// Permissive name check for names that may already exist in the store:
+/// index load, pending-index recovery, keychain item names, migration from
+/// Stronghold, backup restore, and the store layer's own writes (which
+/// re-encrypt legacy values under their existing names). This is exactly the
+/// WP-33 contract — non-empty, not reserved, no NUL, fits the keychain — so
+/// every name an earlier build could have written keeps loading.
+///
+/// New names minted through the command surface go through the strict
+/// [`validate_name`] / [`validate_key`] instead.
+pub fn validate_legacy_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("secret name is empty".into());
     }
@@ -129,8 +156,59 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Strict name check for NEW writes (`secrets_set`, `secrets_set_scoped`):
+/// the legacy rules plus an `[A-Za-z0-9_.:-]` charset. Never used on load,
+/// recovery or migration paths — see [`validate_legacy_name`].
+pub fn validate_name(name: &str) -> Result<(), String> {
+    validate_legacy_name(name)?;
+    if !name.is_ascii()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err("secret name contains unsupported characters".into());
+    }
+    Ok(())
+}
+
+/// Strict check for a bare (unscoped) key on a new write.
+pub fn validate_key(key: &str) -> Result<(), String> {
+    validate_name(key)?;
+    if key.contains("::") {
+        return Err("secret key contains a scope delimiter".into());
+    }
+    Ok(())
+}
+
+/// Permissive check for a bare key that addresses an existing (possibly
+/// legacy) entry through the unscoped read/delete commands. Keeps the scope
+/// delimiter ban so the unscoped commands cannot reach into a scoped name,
+/// but accepts any legacy charset so pre-WP-34 names stay readable and
+/// deletable.
+pub fn validate_legacy_key(key: &str) -> Result<(), String> {
+    validate_legacy_name(key)?;
+    if key.contains("::") {
+        return Err("secret key contains a scope delimiter".into());
+    }
+    Ok(())
+}
+
+pub fn validate_scope_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("scope id is empty".into());
+    }
+    if !id.is_ascii()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err("scope id contains unsupported characters".into());
+    }
+    Ok(())
+}
+
 pub fn item_name(name: &str) -> Result<String, String> {
-    validate_name(name)?;
+    validate_legacy_name(name)?;
     Ok(format!("{ITEM_PREFIX}{name}"))
 }
 
@@ -139,23 +217,113 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("create file parent {}: {e}", parent.display()))?;
+    ensure_directory_chain(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if is_link_or_reparse_point(&metadata) {
+            return Err(format!(
+                "refusing to replace linked file {}",
+                path.display()
+            ));
+        }
+    }
     let temp = temp_path(path);
-    let _ = fs::remove_file(&temp);
-    let mut file =
-        fs::File::create(&temp).map_err(|e| format!("create temp file {}: {e}", temp.display()))?;
+    if let Ok(metadata) = fs::symlink_metadata(&temp) {
+        if is_link_or_reparse_point(&metadata) {
+            return Err(format!(
+                "refusing to replace linked temp file {}",
+                temp.display()
+            ));
+        }
+        fs::remove_file(&temp)
+            .map_err(|error| format!("remove temp file {}: {error}", temp.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| format!("create temp file {}: {error}", temp.display()))?;
     file.write_all(body)
-        .map_err(|e| format!("write temp file {}: {e}", temp.display()))?;
+        .map_err(|error| format!("write temp file {}: {error}", temp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("protect temp file {}: {e}", temp.display()))?;
+            .map_err(|error| format!("protect temp file {}: {error}", temp.display()))?;
     }
     file.sync_all()
-        .map_err(|e| format!("sync temp file {}: {e}", temp.display()))?;
+        .map_err(|error| format!("sync temp file {}: {error}", temp.display()))?;
     replace_file(&temp, path)
+}
+
+fn ensure_directory_chain(path: &Path) -> Result<(), String> {
+    let mut chain = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        chain.push(ancestor);
+    }
+    for directory in chain.into_iter().rev() {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if is_link_or_reparse_point(&metadata) {
+                    return Err(format!(
+                        "refusing linked secrets directory {}",
+                        directory.display()
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(format!(
+                        "secrets path is not a directory: {}",
+                        directory.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(directory).map_err(|error| {
+                    format!("create directory {}: {error}", directory.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_link(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
+    if is_link_or_reparse_point(&metadata) {
+        return Err(format!(
+            "{label} is a symlink or reparse point: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} is not a regular file: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -290,6 +458,41 @@ mod tests {
         assert!(validate_name("__manifest").is_err());
         assert!(validate_name("__manifest_v2").is_err());
         assert!(validate_name("bad\0name").is_err());
+    }
+
+    #[test]
+    fn new_writes_are_strict_but_legacy_names_are_accepted() {
+        assert!(validate_key("TOKEN").is_ok());
+        assert!(validate_key("My Token").is_err());
+        assert!(validate_key("TOKEN::extra").is_err());
+        assert!(validate_name("caf\u{e9}").is_err());
+        assert!(validate_legacy_name("My Token").is_ok());
+        assert!(validate_legacy_name("caf\u{e9}").is_ok());
+        assert!(validate_legacy_key("My Token").is_ok());
+        assert!(validate_legacy_key("My::Token").is_err());
+        assert!(validate_legacy_name("").is_err());
+        assert!(validate_legacy_name("__manifest").is_err());
+        assert!(validate_legacy_name("bad\0name").is_err());
+    }
+
+    #[test]
+    fn legacy_index_name_with_a_space_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_FILENAME);
+        fs::write(&path, br#"["My Token", "workspace::TOKEN"]"#).unwrap();
+        let mut index = SecretIndex::load(&path).unwrap();
+        assert_eq!(
+            index.names(),
+            vec!["My Token".to_string(), "workspace::TOKEN".to_string()]
+        );
+        assert_eq!(item_name("My Token").unwrap(), "ikenga:My Token");
+        index.remove("My Token").unwrap();
+        index.insert("My Token").unwrap();
+        index.save().unwrap();
+        assert!(SecretIndex::load(&path)
+            .unwrap()
+            .names()
+            .contains(&"My Token".to_string()));
     }
 
     #[test]

@@ -1,3 +1,11 @@
+//! Stronghold-to-platform-keychain migration with durable verification.
+//!
+//! Rollback restores the original Stronghold snapshot byte-for-byte before it
+//! retires the keychain state. If the original snapshot cannot be opened and
+//! verified, or if the authoritative backend cannot be retired, rollback fails
+//! closed and leaves the transition marker in place. A successful rollback
+//! retains that marker so a subsequent launch cannot silently migrate again.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri_plugin_stronghold::stronghold::Stronghold;
 
-use super::index::{pending_path, write_atomic, INDEX_FILENAME};
+use super::index::{pending_path, write_atomic, SecretIndex, INDEX_FILENAME};
 use super::keyring_store::KeyringStore;
 use super::store::SecretsStore;
 
@@ -36,6 +44,8 @@ struct MigrationMarker {
     backup_sha256: String,
     index_sha256: String,
     count: usize,
+    #[serde(default)]
+    index_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,28 +131,43 @@ pub fn rollback(data_dir: &Path) -> Result<bool, String> {
         return Ok(false);
     };
     let backup_sha256 = fingerprint(&backup)?;
+    let target_values = read_legacy(&backup, &paths.key)?;
     let store = KeyringStore::new(paths.index.clone()).map_err(|error| error.to_string())?;
-    let values = store.export_all().map_err(|error| error.to_string())?;
+    store.probe().map_err(|error| {
+        format!("rollback cannot verify authoritative keychain access: {error}")
+    })?;
+    write_json(
+        &paths.rollback_marker,
+        &RollbackMarker {
+            version: MARKER_VERSION,
+            backup_sha256: backup_sha256.clone(),
+            legacy_sha256: None,
+            state: "preparing".into(),
+        },
+    )?;
+    let restored_sha256 = restore_original_snapshot(&paths, &backup)?;
+    if restored_sha256 != backup_sha256 {
+        return Err("rollback restored an unexpected Stronghold snapshot".into());
+    }
+    if read_legacy(&paths.legacy, &paths.key)? != target_values {
+        return Err("rollback Stronghold snapshot verification failed".into());
+    }
     write_json(
         &paths.rollback_marker,
         &RollbackMarker {
             version: MARKER_VERSION,
             backup_sha256,
-            legacy_sha256: None,
-            state: "preparing".into(),
+            legacy_sha256: Some(restored_sha256),
+            state: "ready".into(),
         },
     )?;
-    let legacy_sha256 = build_rollback_snapshot(&paths, &values)?;
-    let marker = RollbackMarker {
-        version: MARKER_VERSION,
-        backup_sha256: fingerprint(&backup)?,
-        legacy_sha256: Some(legacy_sha256),
-        state: "ready".into(),
-    };
-    write_json(&paths.rollback_marker, &marker)?;
     store
         .replace_all(&BTreeMap::new())
-        .map_err(|error| format!("retire keychain state for rollback: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "rollback restored the original Stronghold snapshot but could not retire current keychain state: {error}"
+            )
+        })?;
     remove_if_exists(&paths.index)?;
     remove_if_exists(&paths.pending)?;
     remove_if_exists(&paths.marker)?;
@@ -212,6 +237,12 @@ where
     if source_sha256 != backup_sha256 || source_sha256 != legacy_fingerprint {
         return Err("migration source fingerprint changed during verification".into());
     }
+    let index_names = store
+        .list_meta()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|meta| meta.name)
+        .collect::<Vec<_>>();
     let index_sha256 = index_fingerprint(store)?;
     let marker = MigrationMarker {
         version: MARKER_VERSION,
@@ -219,12 +250,14 @@ where
         backup_sha256,
         index_sha256,
         count,
+        index_names,
     };
     write_json(&paths.marker, &marker)?;
     let persisted_marker: MigrationMarker = read_json(&paths.marker)?;
     if persisted_marker != marker
         || persisted_marker.index_sha256 != index_fingerprint(store)?
         || persisted_marker.count != values.len()
+        || !index_contains_names(&paths.index, &persisted_marker.index_names)?
     {
         return Err("migration marker verification failed".into());
     }
@@ -266,6 +299,24 @@ fn validate_migration_marker(
     if !paths.index.exists() {
         return Err("migration marker exists without secrets index".into());
     }
+    let index = SecretIndex::load(&paths.index)
+        .map_err(|error| format!("migration index verification failed: {error}"))?;
+    let current_names = index.names();
+    if !marker.index_names.is_empty() {
+        if marker.index_names.len() != marker.count
+            || marker.index_names.iter().collect::<BTreeSet<_>>().len() != marker.index_names.len()
+        {
+            return Err("migration marker count does not match its index names".into());
+        }
+        if index_fingerprint_from_names(&marker.index_names) != marker.index_sha256 {
+            return Err("migration marker index fingerprint does not match its names".into());
+        }
+        for name in &marker.index_names {
+            if !current_names.contains(name) {
+                return Err(format!("migration index is missing `{name}`"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -285,34 +336,77 @@ fn verify_store(
 }
 
 fn index_fingerprint(store: &dyn SecretsStore) -> Result<String, String> {
-    let mut names = store
+    let names = store
         .list_meta()
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|meta| meta.name)
         .collect::<Vec<_>>();
+    Ok(index_fingerprint_from_names(&names))
+}
+
+fn index_fingerprint_from_names(names: &[String]) -> String {
+    let mut names = names.to_vec();
     names.sort();
     let mut hasher = Sha256::new();
     for name in names {
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
-    Ok(hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
+}
+
+fn index_contains_names(path: &Path, expected: &[String]) -> Result<bool, String> {
+    if expected.is_empty() {
+        return Ok(true);
+    }
+    let index = SecretIndex::load(path)
+        .map_err(|error| format!("migration index verification failed: {error}"))?;
+    let names = index.names();
+    Ok(expected.iter().all(|name| names.contains(name)))
 }
 
 fn fingerprint(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!(
+            "refusing linked migration artifact {}",
+            path.display()
+        ));
+    }
     let bytes =
         fs::read(path).map_err(|error| format!("fingerprint {}: {error}", path.display()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let body = serde_json::to_vec_pretty(value)
+    let mut body = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("serialize migration marker: {error}"))?;
+    body.push(b'\n');
     write_atomic(path, &body)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect migration marker {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!("migration marker is linked: {}", path.display()));
+    }
     serde_json::from_slice(
         &fs::read(path).map_err(|error| format!("read migration marker: {error}"))?,
     )
@@ -320,6 +414,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
 }
 
 fn copy_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("inspect migration source {}: {error}", source.display()))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!("migration source is linked: {}", source.display()));
+    }
     let bytes = fs::read(source)
         .map_err(|error| format!("read migration source {}: {error}", source.display()))?;
     write_atomic(destination, &bytes)
@@ -327,65 +426,34 @@ fn copy_atomic(source: &Path, destination: &Path) -> Result<(), String> {
 
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+            }
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("remove {}: {error}", path.display())),
     }
 }
 
-fn build_rollback_snapshot(
-    paths: &MigrationPaths,
-    values: &BTreeMap<String, String>,
-) -> Result<String, String> {
-    let key = read_legacy_key(&paths.key)?;
-    let temp = paths.legacy.with_extension("stronghold.rollback.tmp");
-    let _ = fs::remove_file(&temp);
-    let stronghold = Stronghold::new(&temp, key)
-        .map_err(|error| format!("create rollback Stronghold snapshot: {error}"))?;
-    stronghold
-        .create_client(LEGACY_CLIENT_NAME)
-        .map_err(|error| format!("create rollback Stronghold client: {error}"))?;
-    let client = stronghold
-        .get_client(LEGACY_CLIENT_NAME)
-        .map_err(|error| format!("open rollback Stronghold client: {error}"))?;
-    let store = client.store();
-    let mut unscoped = Vec::new();
-    let mut scoped = Vec::new();
-    for (name, value) in values {
-        store
-            .insert(name.as_bytes().to_vec(), value.as_bytes().to_vec(), None)
-            .map_err(|error| format!("write rollback value for `{name}`: {error}"))?;
-        if is_scoped_name(name) {
-            scoped.push(name.clone());
-        } else {
-            unscoped.push(name.clone());
-        }
+fn restore_original_snapshot(paths: &MigrationPaths, backup: &Path) -> Result<String, String> {
+    copy_atomic(backup, &paths.legacy)?;
+    let restored = fingerprint(&paths.legacy)?;
+    if restored != fingerprint(backup)? {
+        return Err("rollback Stronghold snapshot fingerprint changed".into());
     }
-    for (key, names) in [(LEGACY_MANIFEST, unscoped), (LEGACY_MANIFEST_V2, scoped)] {
-        let json = serde_json::to_vec(&names)
-            .map_err(|error| format!("serialize rollback manifest: {error}"))?;
-        store
-            .insert(key.to_vec(), json, None)
-            .map_err(|error| format!("write rollback manifest: {error}"))?;
-    }
-    stronghold
-        .save()
-        .map_err(|error| format!("save rollback Stronghold snapshot: {error}"))?;
-    let verified = read_legacy(&temp, &paths.key)?;
-    if verified != *values {
-        let _ = fs::remove_file(&temp);
-        return Err("rollback Stronghold snapshot verification failed".into());
-    }
-    copy_atomic(&temp, &paths.legacy)?;
-    remove_if_exists(&temp)?;
-    fingerprint(&paths.legacy)
-}
-
-fn is_scoped_name(name: &str) -> bool {
-    name.starts_with("workspace::") || name.starts_with("project::") || name.starts_with("pkg::")
+    Ok(restored)
 }
 
 fn read_legacy(legacy_path: &Path, key_path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let metadata = fs::symlink_metadata(legacy_path)
+        .map_err(|error| format!("inspect legacy Stronghold snapshot: {error}"))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err("legacy Stronghold snapshot is linked".into());
+    }
     let key = read_legacy_key(key_path)?;
     let stronghold = Stronghold::new(legacy_path, key)
         .map_err(|error| format!("open legacy Stronghold snapshot: {error}"))?;
@@ -466,6 +534,14 @@ fn read_manifest(bytes: Option<Vec<u8>>) -> Result<BTreeSet<String>, String> {
 }
 
 fn read_legacy_key(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect legacy Stronghold key {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!(
+            "legacy Stronghold key is linked: {}",
+            path.display()
+        ));
+    }
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("read legacy Stronghold key {}: {error}", path.display()))?;
     let bytes = hex::decode(raw.trim())
@@ -548,6 +624,14 @@ mod tests {
             Ok(())
         }
 
+        fn prepare_encryption(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn detect_configuration(&self) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
         fn backend_label(&self) -> &'static str {
             "memory"
         }
@@ -562,14 +646,19 @@ mod tests {
 
     fn write_completed_marker(paths: &MigrationPaths, source: &Path) {
         let hash = fingerprint(source).unwrap();
+        let index_names = SecretIndex::load(&paths.index)
+            .map(|index| index.names())
+            .unwrap_or_default();
+        let index_sha256 = index_fingerprint_from_names(&index_names);
         write_json(
             &paths.marker,
             &MigrationMarker {
                 version: MARKER_VERSION,
                 source_sha256: hash.clone(),
                 backup_sha256: hash,
-                index_sha256: hex::encode(Sha256::digest(b"index")),
-                count: 1,
+                index_sha256,
+                count: index_names.len(),
+                index_names,
             },
         )
         .unwrap();
@@ -590,6 +679,24 @@ mod tests {
         assert!(!paths.legacy.exists());
         assert_eq!(fs::read(&paths.backup).unwrap(), b"legacy-snapshot");
         assert!(paths.marker.exists());
+    }
+
+    #[test]
+    fn completed_marker_rejects_a_missing_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = MigrationPaths::new(dir.path());
+        fs::write(&paths.legacy, b"legacy-snapshot").unwrap();
+        let store = memory_store(Some(paths.index.clone()));
+        let mut values = BTreeMap::new();
+        values.insert("workspace::TOKEN".to_string(), "value".to_string());
+        migrate_with(dir.path(), &store, |_, _| Ok(values)).unwrap();
+        fs::write(&paths.index, b"[]").unwrap();
+
+        let error = migrate_with(dir.path(), &store, |_, _| {
+            panic!("corrupt index must not trigger another migration")
+        })
+        .unwrap_err();
+        assert!(error.contains("missing `workspace::TOKEN`"));
     }
 
     #[test]
@@ -723,17 +830,17 @@ mod tests {
     }
 
     #[test]
-    fn rollback_snapshot_round_trips_keychain_values() {
+    fn rollback_restores_the_original_snapshot_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let paths = MigrationPaths::new(dir.path());
-        fs::write(&paths.key, hex::encode([7u8; 32])).unwrap();
-        let mut values = BTreeMap::new();
-        values.insert("LEGACY".to_string(), "one".to_string());
-        values.insert("workspace::TOKEN".to_string(), "two".to_string());
+        fs::write(&paths.backup, b"original-stronghold-snapshot").unwrap();
 
-        let hash = build_rollback_snapshot(&paths, &values).unwrap();
-        assert_eq!(hash, fingerprint(&paths.legacy).unwrap());
-        assert_eq!(read_legacy(&paths.legacy, &paths.key).unwrap(), values);
+        let hash = restore_original_snapshot(&paths, &paths.backup).unwrap();
+        assert_eq!(hash, fingerprint(&paths.backup).unwrap());
+        assert_eq!(
+            fs::read(&paths.legacy).unwrap(),
+            b"original-stronghold-snapshot"
+        );
     }
 
     #[test]
