@@ -5,13 +5,16 @@
 // session target.
 
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { useNavigate } from '@tanstack/react-router';
+import { Bot, ChevronDown, ChevronRight, User } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { EmptyState, OfflineState } from '@/components/states';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
-import { chiList, detectAgents } from '@/lib/tauri-cmd';
+import { chiList, type DetectedAgent, detectAgents } from '@/lib/tauri-cmd';
 import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
+import { createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { useCompanionStore } from './companion-store';
 
@@ -60,6 +63,7 @@ export function TargetPicker() {
 	const consumePicker = useCompanionStore((s) => s.consumePicker);
 	const resolveTerminal = useTerminalTitles();
 	const label = useTargetLabel(target);
+	const navigate = useNavigate();
 
 	const [open, setOpen] = useState<null | 'targets' | 'session'>(null);
 	const [cursor, setCursor] = useState(0);
@@ -86,6 +90,32 @@ export function TargetPicker() {
 		enabled: open === 'targets',
 		refetchOnWindowFocus: false,
 	});
+
+	// Detected agents keyed by id, so the "New session on…" / "Persistent run
+	// on…" rows can skip an engine that's installed but not signed in — D-07's
+	// "signed out" cell replaces the broken row rather than sitting beside it.
+	const detectedById = useMemo(() => {
+		const m = new Map<string, DetectedAgent>();
+		for (const a of engines.data ?? []) m.set(a.id, a);
+		return m;
+	}, [engines.data]);
+
+	const engineIds = useMemo(() => {
+		const set = new Set<string>();
+		if (defaultEngineId) set.add(defaultEngineId);
+		for (const a of engines.data ?? []) set.add(a.id);
+		return set;
+	}, [defaultEngineId, engines.data]);
+
+	// The first known-unauthenticated engine among the ones that would
+	// otherwise be offered — drives the "signed out" empty state below.
+	const unauthedEngine = useMemo(() => {
+		for (const id of engineIds) {
+			const agent = detectedById.get(id);
+			if (agent?.authed === false) return agent;
+		}
+		return null;
+	}, [engineIds, detectedById]);
 
 	const items = useMemo<PickerItem[]>(() => {
 		if (open === 'session') {
@@ -135,10 +165,8 @@ export function TargetPicker() {
 				selected: sameTarget(tgt, target),
 			});
 		}
-		const engineIds = new Set<string>();
-		if (defaultEngineId) engineIds.add(defaultEngineId);
-		for (const a of engines.data ?? []) engineIds.add(a.id);
 		for (const id of engineIds) {
+			if (detectedById.get(id)?.authed === false) continue; // → the "signed out" empty state
 			const tgt: CompanionTarget = { kind: 'new', engine_id: id };
 			out.push({
 				id: `n:${id}`,
@@ -149,6 +177,7 @@ export function TargetPicker() {
 			});
 		}
 		for (const id of engineIds) {
+			if (detectedById.get(id)?.authed === false) continue;
 			const tgt: CompanionTarget = { kind: 'persistent', engine_id: id };
 			out.push({
 				id: `p:${id}`,
@@ -159,7 +188,7 @@ export function TargetPicker() {
 			});
 		}
 		return out;
-	}, [open, target, terminals, runs.data, engines.data, defaultEngineId, resolveTerminal]);
+	}, [open, target, terminals, runs.data, engineIds, detectedById, resolveTerminal]);
 
 	useEffect(() => {
 		if (!open) return;
@@ -281,11 +310,47 @@ export function TargetPicker() {
 					className="absolute left-0 top-full z-50 mt-1 max-h-80 w-64 overflow-y-auto rounded-md border py-1 shadow-lg"
 					style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
 				>
-					{items.length === 0 && (
-						<div className="px-3 py-1.5 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
-							No engine installed — open Ngwa → Store
-						</div>
-					)}
+					{open === 'targets' &&
+						items.length === 0 &&
+						(unauthedEngine ? (
+							<OfflineState
+								data-state="companion-signed-out"
+								icon={User}
+								heading={`${unauthedEngine.display} is not signed in`}
+								body={
+									unauthedEngine.auth_hint ??
+									`The binary is on your PATH at ${unauthedEngine.executable_path}. It just has no credentials.`
+								}
+								action={{
+									label: `Run ${unauthedEngine.id} login`,
+									onClick: () => {
+										const sessionId = createTerminalSession({
+											cmd: [unauthedEngine.executable_path, 'login'],
+											title: `${unauthedEngine.id} login`,
+										});
+										const panes = usePaneStore.getState();
+										panes.placeView(panes.focusedId, { kind: 'terminal', sessionId }, 'append');
+										close();
+									},
+								}}
+								className="min-h-0"
+							/>
+						) : (
+							<EmptyState
+								data-state="companion-no-engine"
+								icon={Bot}
+								heading="No engine installed"
+								body="The shell works without one — panes, artifacts and packages are all still yours. Chi needs an engine to have a seat."
+								action={{
+									label: 'Install claude-code',
+									onClick: () => {
+										close();
+										void navigate({ to: '/packages', search: { filter: 'store' } });
+									},
+								}}
+								className="min-h-0"
+							/>
+						))}
 					{groups.map(({ group, items: groupItems }) => (
 						// A <fieldset> — what the rule suggests — is not a valid child of
 						// role="menu". ARIA's grouping element inside a menu is a div with
