@@ -158,8 +158,8 @@ pub use screenshot::{
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, ScreenshotResult,
 };
 pub use secrets::{
-    secrets_delete, secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
+    secrets_delete, secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_index_names,
+    secrets_list_keys, secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
     secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status, SecretsLock,
 };
 pub use settings_kv::{
