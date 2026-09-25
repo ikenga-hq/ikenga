@@ -480,6 +480,211 @@ export async function settingsOpenFile(
 	});
 }
 
+// ─── Notifications (WP-40) ────────────────────────────────────────────────────
+// Mirrors `src-tauri/src/commands/notifications.rs`. The table is written by
+// Rust-side producers (permission / run / violation) plus
+// `notificationsRecordUpdate` for the two webview-side update checks. Live
+// changes arrive on the `notifications://changed` event
+// (`NOTIFICATIONS_CHANGED_EVENT`).
+
+/** Wire names of `notifications::NotificationKind`. */
+export type NotificationKind =
+	| 'permission'
+	| 'run_finished'
+	| 'run_failed'
+	| 'update'
+	| 'violation'
+	| 'invite';
+
+/**
+ * `{ kind, ...params }` for the action kinds producers emit; the centre
+ * (WP-40b) maps each to its buttons. Unlike {@link NotificationAction} this
+ * union has no catch-all, so `switch (a.kind)` narrows the params. Get one
+ * from a row with {@link asKnownNotificationAction}.
+ *
+ * `permission.decide` carries Allow / Deny inline and is only emitted for
+ * the hooks gate (`via: 'hooks'` → `POST /iyke/hooks/decision { requestId,
+ * decision }`). Hide the buttons once the row has `resolvedAt`.
+ * `open.thread` (chat-engine / ACP asks) and `open.terminal` (Claude Code's
+ * own terminal prompt) are open-only: the thread's dialog or the terminal
+ * answers them. Inline Allow / Deny for ACP asks is a follow-up that needs a
+ * real engine resolve path first.
+ */
+export type KnownNotificationAction =
+	| {
+			kind: 'permission.decide';
+			via: 'hooks';
+			requestId: string;
+			terminalId: string | null;
+	  }
+	| { kind: 'open.thread'; threadId: string; requestId: string }
+	| { kind: 'open.terminal'; terminalId: string | null; sessionId: string | null }
+	| {
+			kind: 'open.chi_run';
+			runId: string;
+			status: 'done' | 'failed';
+			/** Artifacts the run produced (absent on rows written before it was recorded). */
+			artifactCount?: number;
+			/** Path of the first artifact, for "Open artifact". */
+			firstArtifactPath?: string | null;
+	  }
+	| { kind: 'open.release_notes'; source: 'shell'; version: string }
+	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
+	| { kind: 'open.violations'; pkgId: string };
+
+export type KnownNotificationActionKind = KnownNotificationAction['kind'];
+
+/** An action kind this build does not know (a newer producer). */
+export interface UnknownNotificationAction {
+	kind: string;
+	[param: string]: unknown;
+}
+
+/**
+ * What a row's `action` may hold: a known action or an unknown one. Checking
+ * `kind` on this type does NOT narrow the params (the unknown member matches
+ * every kind) — narrow with {@link asKnownNotificationAction} first.
+ */
+export type NotificationAction = KnownNotificationAction | UnknownNotificationAction;
+
+// Runtime narrowing lives in a dependency-free module so it can be unit-tested
+// (and used by modules whose tests mock this file) without the Tauri runtime.
+export {
+	asKnownNotificationAction,
+	KNOWN_NOTIFICATION_ACTION_KINDS,
+} from '@/lib/notifications/action-kind';
+
+export interface NotificationRow {
+	id: number;
+	kind: NotificationKind;
+	title: string;
+	body: string | null;
+	action: NotificationAction | null;
+	/** Producer id (`iyke.hooks`, `engine.claude-code`, `chi`, `updater`, `pkg.permissions_check`). */
+	source: string;
+	dedupeKey: string | null;
+	/** Occurrences folded into this row (e.g. violation denials). */
+	count: number;
+	/** First occurrence, unix ms. */
+	createdAt: number;
+	/** Latest occurrence, unix ms — lists sort on this. */
+	updatedAt: number;
+	readAt: number | null;
+	/**
+	 * Unix ms the thing this row asks about was over — a permission decided,
+	 * timed out or answered in its terminal; an update installed. `null` =
+	 * still open. Independent of `readAt` (a row can be read but pending).
+	 * Never offer Allow / Deny on a resolved row. Always sent by Rust;
+	 * optional only so older fixtures still type-check.
+	 */
+	resolvedAt?: number | null;
+}
+
+export interface NotificationsUnreadCount {
+	total: number;
+	/** Muted kinds are absent. Resolved rows never count. */
+	byKind: Partial<Record<NotificationKind, number>>;
+	/**
+	 * `permission` rows still awaiting an answer (unresolved), read or not —
+	 * the daily address's "pending permissions". Always sent by Rust.
+	 */
+	pendingPermissions?: number;
+}
+
+export interface NotificationsMuteState {
+	muted: NotificationKind[];
+	/** Everything but `permission` and `violation`. */
+	mutable: NotificationKind[];
+}
+
+export interface NotificationsListOptions {
+	unreadOnly?: boolean;
+	kinds?: NotificationKind[];
+	limit?: number;
+	/** Cursor: rows with `updatedAt` strictly below this. */
+	before?: number;
+	includeMuted?: boolean;
+}
+
+export type NotificationsChangeReason =
+	| 'created'
+	| 'coalesced'
+	| 'read'
+	| 'read_all'
+	| 'mute_changed';
+
+/** Payload of `notifications://changed`. */
+export interface NotificationsChangedEvent {
+	reason: NotificationsChangeReason;
+	/** Present for `created` / `coalesced`. */
+	notification: NotificationRow | null;
+	/** True when the row's kind is muted — the toast bridge stays quiet. */
+	muted: boolean;
+}
+
+export const NOTIFICATIONS_CHANGED_EVENT = 'notifications://changed';
+
+export async function notificationsList(
+	options: NotificationsListOptions = {},
+): Promise<NotificationRow[]> {
+	return invoke<NotificationRow[]>('notifications_list', {
+		unreadOnly: options.unreadOnly ?? null,
+		kinds: options.kinds ?? null,
+		limit: options.limit ?? null,
+		before: options.before ?? null,
+		includeMuted: options.includeMuted ?? null,
+	});
+}
+
+export async function notificationsUnreadCount(): Promise<NotificationsUnreadCount> {
+	return invoke<NotificationsUnreadCount>('notifications_unread_count');
+}
+
+export async function notificationsMarkRead(ids: number[]): Promise<number> {
+	return invoke<number>('notifications_mark_read', { ids });
+}
+
+export async function notificationsMarkAllRead(kind?: NotificationKind | null): Promise<number> {
+	return invoke<number>('notifications_mark_all_read', { kind: kind ?? null });
+}
+
+export async function notificationsMuteState(): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_state');
+}
+
+export async function notificationsMuteKind(kind: NotificationKind): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_kind', { kind });
+}
+
+export async function notificationsUnmuteKind(
+	kind: NotificationKind,
+): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_unmute_kind', { kind });
+}
+
+export interface NotificationsRecordUpdateArgs {
+	source: 'shell' | 'pkg';
+	version: string;
+	/** Required when `source === 'pkg'`. */
+	pkgId?: string | null;
+	pkgName?: string | null;
+}
+
+/**
+ * `update` producer entry point for the webview-side update checks. Returns
+ * the created row, or `null` when that version was already announced.
+ */
+export async function notificationsRecordUpdate(
+	args: NotificationsRecordUpdateArgs,
+): Promise<NotificationRow | null> {
+	return invoke<NotificationRow | null>('notifications_record_update', {
+		source: args.source,
+		version: args.version,
+		pkgId: args.pkgId ?? null,
+		pkgName: args.pkgName ?? null,
+	});
+}
+
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
 
 export async function secretsGet(key: string): Promise<string | null> {
