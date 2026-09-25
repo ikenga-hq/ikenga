@@ -10,6 +10,11 @@
 // every 6 h never re-announces a version. Fire-and-forget: a failed write
 // must never break an update check, so these never reject — errors are
 // logged and swallowed.
+//
+// Resolution needs nothing from here: Rust resolves an `update` row once its
+// version is installed (`notifications::resolve_installed_updates`, run on
+// boot and on every `notifications_record_update` call), so the updater UI
+// never has to report installs.
 
 import { isTauri, notificationsRecordUpdate } from '@/lib/tauri-cmd';
 

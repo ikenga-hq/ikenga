@@ -135,6 +135,112 @@ pub fn muted_kinds_for_app(app: &tauri::AppHandle) -> Vec<NotificationKind> {
 /// the popover cannot lose one another.
 static MUTE_WRITE: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// The muted set last published, so the settings listener can tell a real
+/// change from a write of the same list. `None` until first seen.
+static LAST_MUTED: std::sync::Mutex<Option<Vec<NotificationKind>>> = std::sync::Mutex::new(None);
+
+fn remember_muted(kinds: &[NotificationKind]) {
+    if let Ok(mut last) = LAST_MUTED.lock() {
+        *last = Some(kinds.to_vec());
+    }
+}
+
+// ─── Mute timestamps (`notification_mutes`, migration 0066) ─────────────────
+
+/// Record that `kind` became muted now. Keeps the original time if it is
+/// already recorded (muting twice does not move the window).
+pub async fn note_muted(pool: &sqlx::SqlitePool, kind: NotificationKind) -> Result<(), String> {
+    sqlx::query("INSERT OR IGNORE INTO notification_mutes (kind, muted_at) VALUES (?, ?)")
+        .bind(kind.as_str())
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(pool)
+        .await
+        .map_err(|e| format!("notification_mutes insert: {e}"))?;
+    Ok(())
+}
+
+/// Un-mute bookkeeping: mark read the unread rows of `kind` recorded WHILE it
+/// was muted (`updated_at >= muted_at`) and forget the mute time. Rows that
+/// were already unread before the mute stay unread. With no recorded mute
+/// time, nothing is marked read. Returns rows marked read.
+pub async fn clear_muted_backlog(
+    pool: &sqlx::SqlitePool,
+    kind: NotificationKind,
+) -> Result<u64, String> {
+    let muted_at: Option<i64> =
+        sqlx::query_scalar("SELECT muted_at FROM notification_mutes WHERE kind = ?")
+            .bind(kind.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("notification_mutes read: {e}"))?;
+    let mut changed = 0;
+    if let Some(since) = muted_at {
+        changed = sqlx::query(
+            "UPDATE notifications SET read_at = ?
+             WHERE read_at IS NULL AND kind = ? AND updated_at >= ?",
+        )
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(kind.as_str())
+        .bind(since)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("notifications unmute backlog: {e}"))?
+        .rows_affected();
+    }
+    sqlx::query("DELETE FROM notification_mutes WHERE kind = ?")
+        .bind(kind.as_str())
+        .execute(pool)
+        .await
+        .map_err(|e| format!("notification_mutes delete: {e}"))?;
+    if changed > 0 {
+        super::publish(super::ChangeReason::ReadAll, None);
+    }
+    Ok(changed)
+}
+
+/// Hand edits to `workspace.notifications.mutedKinds` publish no command, so
+/// listen to `settings://changed` and, when the muted set really changed,
+/// do the same bookkeeping as the mute / unmute commands and publish
+/// `mute_changed` (the FE mute-state + list queries refetch on it).
+pub fn spawn_settings_listener(app: tauri::AppHandle) {
+    use tauri::{Listener, Manager};
+    remember_muted(&muted_kinds_for_app(&app));
+    let handle = app.clone();
+    let _ = app.listen("settings://changed", move |_evt| {
+        let app = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let now = muted_kinds_for_app(&app);
+            let before = {
+                let Ok(mut last) = LAST_MUTED.lock() else { return };
+                let before = last.clone().unwrap_or_default();
+                if before == now {
+                    return;
+                }
+                *last = Some(now.clone());
+                before
+            };
+            let db = app
+                .try_state::<Arc<crate::commands::db::PaDb>>()
+                .map(|d| d.inner().clone());
+            if let Some(db) = db {
+                if let Ok(pool) = db.ensure_pool().await {
+                    for kind in now.iter().filter(|k| !before.contains(k)) {
+                        if let Err(e) = note_muted(&pool, *kind).await {
+                            log::warn!(target: "ikenga::notifications", "{e}");
+                        }
+                    }
+                    for kind in before.iter().filter(|k| !now.contains(k)) {
+                        if let Err(e) = clear_muted_backlog(&pool, *kind).await {
+                            log::warn!(target: "ikenga::notifications", "{e}");
+                        }
+                    }
+                }
+            }
+            super::publish(super::ChangeReason::MuteChanged, None);
+        });
+    });
+}
+
 /// Mute or unmute one kind in `settings.json`. Returns the new state.
 pub async fn set_muted(
     manager: &SettingsManager,
@@ -157,6 +263,9 @@ pub async fn set_muted(
             )
             .await?;
     }
+    // The settings watcher will see this write; remembering the new set first
+    // keeps its listener from repeating the bookkeeping.
+    remember_muted(&next);
     super::publish(super::ChangeReason::MuteChanged, None);
     Ok(MuteState::from_muted(next))
 }

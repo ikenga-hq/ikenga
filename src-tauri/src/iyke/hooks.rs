@@ -216,8 +216,9 @@ pub async fn post_hook_event(
             .lock()
             .map(|mut map| map.remove(&request_id));
 
-        // WP-40: answered or timed out, the ask is over — mark its row read so
-        // the centre does not keep offering a dead Allow / Deny. Spawned for
+        // WP-40: answered or timed out, the ask is over — resolve its row
+        // (`resolvedAt`, and read) so the centre does not keep offering a
+        // dead Allow / Deny. Spawned for
         // the same reason as the record above: never delay the hook reply.
         if let Some(db) = app_db(&app) {
             let key = crate::notifications::producers::hook_gate_key(&request_id);
@@ -288,6 +289,32 @@ pub async fn post_hook_event(
         tauri::async_runtime::spawn(async move {
             record_permission_notification(&app, new).await;
         });
+    }
+
+    // WP-40: the terminal moved on (the tool ran, the turn stopped, or the
+    // session ended), so a prompt it was showing has been answered — resolve
+    // that terminal's pending `PermissionRequest` row so it stops counting as
+    // pending. Both scopes the row may have been keyed by (terminal id, else
+    // Claude session id). No-op when nothing is pending. Spawned, as above.
+    if payload
+        .hook_event_name
+        .as_deref()
+        .is_some_and(crate::notifications::producers::resolves_terminal_permission)
+    {
+        if let Some(db) = app_db(&app) {
+            use crate::notifications::producers::terminal_permission_key;
+            let terminal_id = payload.ikenga_terminal_id.as_deref();
+            let session_id = payload.session_id.as_deref();
+            let mut keys = vec![terminal_permission_key(terminal_id, session_id)];
+            if terminal_id.is_some_and(|t| !t.is_empty()) && session_id.is_some() {
+                keys.push(terminal_permission_key(None, session_id));
+            }
+            tauri::async_runtime::spawn(async move {
+                for key in keys {
+                    crate::notifications::resolve_key_with_db(&db, &key).await;
+                }
+            });
+        }
     }
 
     (

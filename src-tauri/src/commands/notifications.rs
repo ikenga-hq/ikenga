@@ -97,18 +97,32 @@ pub async fn notifications_mute_state(
 }
 
 /// Mute one kind (writes settings.json). `permission` and `violation` are
-/// refused.
+/// refused. The mute time is recorded so un-muting can tell rows recorded
+/// while muted from an older backlog.
 #[tauri::command]
 pub async fn notifications_mute_kind(
+    db: State<'_, Arc<PaDb>>,
     settings: State<'_, Arc<SettingsManager>>,
     kind: String,
 ) -> Result<mute::MuteState, String> {
     let kind = NotificationKind::parse(&kind)?;
-    mute::set_muted(settings.inner(), kind, true).await
+    let state = mute::set_muted(settings.inner(), kind, true).await?;
+    // Best-effort: without it, un-muting just marks nothing read.
+    match db.ensure_pool().await {
+        Ok(pool) => {
+            if let Err(e) = mute::note_muted(&pool, kind).await {
+                log::warn!(target: "ikenga::notifications", "{e}");
+            }
+        }
+        Err(e) => log::warn!(target: "ikenga::notifications", "no db pool: {e}"),
+    }
+    Ok(state)
 }
 
-/// Unmute one kind. Rows of that kind recorded while it was muted are marked
-/// read first, so un-muting does not dump a backlog onto the badge.
+/// Unmute one kind. Only rows of that kind recorded while it was muted
+/// (`updated_at >=` the mute time) are marked read first, so un-muting does
+/// not dump a backlog onto the badge; rows already unread before the mute
+/// stay unread.
 #[tauri::command]
 pub async fn notifications_unmute_kind(
     db: State<'_, Arc<PaDb>>,
@@ -119,7 +133,7 @@ pub async fn notifications_unmute_kind(
     let was_muted = mute::muted_kinds(settings.inner()).contains(&kind);
     if was_muted {
         let pool = db.ensure_pool().await?;
-        notifications::mark_all_read(&pool, Some(kind)).await?;
+        mute::clear_muted_backlog(&pool, kind).await?;
     }
     mute::set_muted(settings.inner(), kind, false).await
 }
@@ -131,8 +145,14 @@ pub async fn notifications_unmute_kind(
 /// built in Rust (`producers::update`) so the webview cannot mint other kinds.
 /// Returns the row when one was created, `None` when that version was already
 /// announced.
+///
+/// Every call also sweeps `update` rows whose version is now installed
+/// ([`notifications::resolve_installed_updates`]), so a pkg updated in-session
+/// stops reading as an open update on the next check without the updater UI
+/// having to report installs.
 #[tauri::command]
 pub async fn notifications_record_update(
+    app: tauri::AppHandle,
     db: State<'_, Arc<PaDb>>,
     source: String,
     version: String,
@@ -143,7 +163,48 @@ pub async fn notifications_record_update(
     let new = producers::update(source, &version, pkg_id.as_deref(), pkg_name.as_deref())?;
     let pool = db.ensure_pool().await?;
     let outcome = notifications::record(&pool, new).await?;
+    sweep_installed_updates(&app, &pool).await;
     Ok(outcome.notification().cloned())
+}
+
+/// Installed versions the update sweep compares against: the running shell
+/// and every installed pkg.
+fn installed_versions(app: &tauri::AppHandle) -> (String, Vec<(String, String)>) {
+    use tauri::Manager;
+    let shell = app.package_info().version.to_string();
+    let pkgs = app
+        .try_state::<crate::commands::pkg::KernelState>()
+        .map(|k| {
+            k.0.list_installed()
+                .into_iter()
+                .map(|s| (s.id, s.version))
+                .collect()
+        })
+        .unwrap_or_default();
+    (shell, pkgs)
+}
+
+async fn sweep_installed_updates(app: &tauri::AppHandle, pool: &sqlx::SqlitePool) {
+    let (shell, pkgs) = installed_versions(app);
+    if let Err(e) = notifications::resolve_installed_updates(pool, Some(&shell), &pkgs).await {
+        log::warn!(target: "ikenga::notifications", "update sweep failed: {e}");
+    }
+}
+
+/// Boot-time update sweep: an app update relaunches into this, resolving the
+/// "Ikenga <v> is available" row it answered. Call once the pkg kernel is
+/// managed. Best-effort, off the setup thread.
+pub fn spawn_boot_update_sweep(app: tauri::AppHandle) {
+    use tauri::Manager;
+    tauri::async_runtime::spawn(async move {
+        let Some(db) = app.try_state::<Arc<PaDb>>().map(|d| d.inner().clone()) else {
+            return;
+        };
+        match db.ensure_pool().await {
+            Ok(pool) => sweep_installed_updates(&app, &pool).await,
+            Err(e) => log::warn!(target: "ikenga::notifications", "no db pool: {e}"),
+        }
+    });
 }
 
 #[cfg(test)]

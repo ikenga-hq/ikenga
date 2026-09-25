@@ -497,23 +497,70 @@ export type NotificationKind =
 	| 'invite';
 
 /**
- * `{ kind, ...params }`. The action kinds producers emit today; the centre
- * (WP-40b) maps each to its buttons.
+ * `{ kind, ...params }` for the action kinds producers emit; the centre
+ * (WP-40b) maps each to its buttons. Unlike {@link NotificationAction} this
+ * union has no catch-all, so `switch (a.kind)` narrows the params. Get one
+ * from a row with {@link asKnownNotificationAction}.
+ *
+ * `permission.decide` carries Allow / Deny inline; `via` says how to answer:
+ * `'hooks'` → `POST /iyke/hooks/decision { requestId, decision }`;
+ * `'acp'` → the chat engine's permission-respond path for `threadId` /
+ * `requestId`. Hide the buttons once the row has `resolvedAt`.
+ * `open.terminal` is open-only: Claude Code's own terminal prompt is answered
+ * in the terminal.
  */
-export type NotificationAction =
+export type KnownNotificationAction =
 	| {
 			kind: 'permission.decide';
 			via: 'hooks';
 			requestId: string;
 			terminalId: string | null;
 	  }
+	| {
+			kind: 'permission.decide';
+			via: 'acp';
+			threadId: string;
+			requestId: string;
+			/** Always `null`; present so both variants share the field. */
+			terminalId: null;
+	  }
+	/** Legacy: ACP asks written before they became `permission.decide`. */
 	| { kind: 'open.thread'; threadId: string; requestId: string }
 	| { kind: 'open.terminal'; terminalId: string | null; sessionId: string | null }
-	| { kind: 'open.chi_run'; runId: string; status: 'done' | 'failed' }
+	| {
+			kind: 'open.chi_run';
+			runId: string;
+			status: 'done' | 'failed';
+			/** Artifacts the run produced (absent on rows written before it was recorded). */
+			artifactCount?: number;
+			/** Path of the first artifact, for "Open artifact". */
+			firstArtifactPath?: string | null;
+	  }
 	| { kind: 'open.release_notes'; source: 'shell'; version: string }
 	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
-	| { kind: 'open.violations'; pkgId: string }
-	| { kind: string; [param: string]: unknown };
+	| { kind: 'open.violations'; pkgId: string };
+
+export type KnownNotificationActionKind = KnownNotificationAction['kind'];
+
+/** An action kind this build does not know (a newer producer). */
+export interface UnknownNotificationAction {
+	kind: string;
+	[param: string]: unknown;
+}
+
+/**
+ * What a row's `action` may hold: a known action or an unknown one. Checking
+ * `kind` on this type does NOT narrow the params (the unknown member matches
+ * every kind) — narrow with {@link asKnownNotificationAction} first.
+ */
+export type NotificationAction = KnownNotificationAction | UnknownNotificationAction;
+
+// Runtime narrowing lives in a dependency-free module so it can be unit-tested
+// (and used by modules whose tests mock this file) without the Tauri runtime.
+export {
+	asKnownNotificationAction,
+	KNOWN_NOTIFICATION_ACTION_KINDS,
+} from '@/lib/notifications/action-kind';
 
 export interface NotificationRow {
 	id: number;
@@ -531,12 +578,25 @@ export interface NotificationRow {
 	/** Latest occurrence, unix ms — lists sort on this. */
 	updatedAt: number;
 	readAt: number | null;
+	/**
+	 * Unix ms the thing this row asks about was over — a permission decided,
+	 * timed out or answered in its terminal; an update installed. `null` =
+	 * still open. Independent of `readAt` (a row can be read but pending).
+	 * Never offer Allow / Deny on a resolved row. Always sent by Rust;
+	 * optional only so older fixtures still type-check.
+	 */
+	resolvedAt?: number | null;
 }
 
 export interface NotificationsUnreadCount {
 	total: number;
-	/** Muted kinds are absent. */
+	/** Muted kinds are absent. Resolved rows never count. */
 	byKind: Partial<Record<NotificationKind, number>>;
+	/**
+	 * `permission` rows still awaiting an answer (unresolved), read or not —
+	 * the daily address's "pending permissions". Always sent by Rust.
+	 */
+	pendingPermissions?: number;
 }
 
 export interface NotificationsMuteState {
