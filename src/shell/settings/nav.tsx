@@ -5,14 +5,15 @@ import {
 	Info,
 	KeyRound,
 	Palette,
-	People,
 	Plug,
 	SlidersHorizontal,
+	Users,
 	type LucideIcon,
 } from 'lucide-react';
 
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
+import type { SettingsField } from '@/lib/settings/types';
 
 export type SettingsSectionId =
 	| 'appearance'
@@ -29,7 +30,7 @@ export type SettingsScopeId = 'personal' | 'project';
 
 export interface SettingsFieldMeta {
 	/** Dotted schema path; `null` for informational rows that hold no value. */
-	field: string | null;
+	field: SettingsField | null;
 	label: string;
 	help?: string;
 	keywords?: string;
@@ -112,7 +113,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 	{
 		id: 'people',
 		label: 'People & devices',
-		Icon: People,
+		Icon: Users,
 		description: 'Who this workspace is shared with, and on which devices.',
 		fields: [],
 	},

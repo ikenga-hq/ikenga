@@ -5,9 +5,9 @@ import {
 	Info,
 	KeyRound,
 	Palette,
-	People,
 	Plug,
 	SlidersHorizontal,
+	Users,
 	type LucideIcon,
 } from 'lucide-react';
 
@@ -44,7 +44,7 @@ const NAV: NavSection[] = [
 		items: [
 			{ to: '/settings/secrets', label: 'Secrets', Icon: KeyRound },
 			{ to: '/settings/integrations', label: 'Integrations', Icon: Plug },
-			{ to: '/settings/people', label: 'People & devices', Icon: People },
+			{ to: '/settings/people', label: 'People & devices', Icon: Users },
 		],
 	},
 	{

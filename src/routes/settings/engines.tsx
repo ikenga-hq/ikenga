@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { openExternalUrl } from '@/lib/transport';
@@ -32,6 +33,8 @@ import {
 	settingsGet,
 	settingsSet,
 } from '@/lib/tauri-cmd';
+import { writeSettingsField } from '@/lib/settings/client';
+import type { SettingsAgentEnvironment, SettingsWriteOptions } from '@/lib/settings/types';
 import {
 	createClaudeTerminalSession,
 	createTerminalSession,
@@ -40,6 +43,12 @@ import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wr
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
+
+interface EngineFieldValueMap {
+	'engines.agentEnvironment': SettingsAgentEnvironment;
+	'engines.agentWslDistro': string | null;
+	'engines.resumeTerminals': boolean;
+}
 
 function EnginesPage() {
 	return (
@@ -130,6 +139,18 @@ function EngineSectionBody() {
 						)}
 					</div>
 				</SettingsFieldRow>
+
+				<div className="grid grid-cols-[1fr_auto] items-center gap-4 px-4 py-3">
+					<div className="min-w-0 space-y-0.5">
+						<div className="text-sm font-medium text-foreground">Default agent id</div>
+						<div className="text-xs leading-relaxed text-muted-foreground">
+							The pkg id wired as the default terminal agent. Null when offline.
+						</div>
+					</div>
+					<span className="font-mono text-[11px] text-muted-foreground">
+						{defaultEngineId ?? '(none)'}
+					</span>
+				</div>
 
 				{!isOffline && (
 					<>
@@ -253,12 +274,12 @@ function TerminalSectionBody() {
 	const agentWslDistroOverride = engines.agentWslDistro;
 	const resumeTerminalsOverride = engines.resumeTerminals;
 
-	async function writeEngine(
-		field: 'engines.agentEnvironment' | 'engines.agentWslDistro' | 'engines.resumeTerminals',
-		value: string | boolean | null
+	async function writeEngine<K extends keyof EngineFieldValueMap>(
+		field: K,
+		value: EngineFieldValueMap[K]
 	) {
 		if (!projectId) return;
-		await writeSettingsField({ scope: 'project', field, value, projectId });
+		await writeSettingsField({ scope: 'project', field, value, projectId } as SettingsWriteOptions);
 		refresh();
 	}
 
@@ -282,7 +303,7 @@ function TerminalSectionBody() {
 	const agentEnvMutation = useMutation({
 		mutationFn: async (envKind: string) => {
 			if (isProject) {
-				await writeEngine('engines.agentEnvironment', envKind);
+				await writeEngine('engines.agentEnvironment', envKind as SettingsAgentEnvironment);
 				return;
 			}
 			await settingsSet(AGENT_ENV_KEY, envKind);
@@ -482,9 +503,81 @@ function TerminalSectionBody() {
 							onChange={(e) => resumeTerminalsMutation.mutate(e.target.checked)}
 							disabled={resumeTerminalsQuery.isLoading && !isProject}
 						/>
-						<span className={!resumeTerminals ? 'text-muted-foreground' : ''}>Enabled</span>
+						<span className={!resumeTerminalsEffective ? 'text-muted-foreground' : ''}>Enabled</span>
 					</label>
 				</SettingsFieldRow>
+
+				<div className="flex items-center justify-between px-4 py-3">
+					<div className="space-y-0.5">
+						<div className="flex items-center gap-2 text-sm font-medium text-foreground">
+							<Bot className="h-4 w-4 text-primary" /> Claude Code CLI
+						</div>
+						<div className="text-xs text-muted-foreground">
+							Interactive Claude session with crash protection and exit codes.
+						</div>
+					</div>
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-7 gap-1.5 text-xs"
+						onClick={() => openAgentTerminal('claude', 'claude')}
+					>
+						<Play className="h-3 w-3" /> Launch Claude
+					</Button>
+				</div>
+
+				<div className="flex items-center justify-between px-4 py-3">
+					<div className="space-y-0.5">
+						<div className="flex items-center gap-2 text-sm font-medium text-foreground">
+							<Bot className="h-4 w-4 text-primary" /> Antigravity CLI (agy)
+						</div>
+						<div className="text-xs text-muted-foreground">
+							Interactive Antigravity assistant terminal.
+						</div>
+					</div>
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-7 gap-1.5 text-xs"
+						onClick={() => openAgentTerminal('antigravity', 'antigravity')}
+					>
+						<Play className="h-3 w-3" /> Launch Antigravity
+					</Button>
+				</div>
+
+				<div className="flex items-center justify-between px-4 py-3">
+					<div className="space-y-0.5">
+						<div className="flex items-center gap-2 text-sm font-medium text-foreground">
+							<Bot className="h-4 w-4 text-primary" /> OpenAI Codex CLI
+						</div>
+						<div className="text-xs text-muted-foreground">Interactive Codex coding terminal.</div>
+					</div>
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-7 gap-1.5 text-xs"
+						onClick={() => openAgentTerminal('codex', 'codex')}
+					>
+						<Play className="h-3 w-3" /> Launch Codex
+					</Button>
+				</div>
+
+				<div className="flex items-center justify-between px-4 py-3">
+					<div className="space-y-0.5">
+						<div className="flex items-center gap-2 text-sm font-medium text-foreground">
+							<Bot className="h-4 w-4 text-primary" /> Gemini CLI
+						</div>
+						<div className="text-xs text-muted-foreground">Interactive Google Gemini CLI session.</div>
+					</div>
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-7 gap-1.5 text-xs"
+						onClick={() => openAgentTerminal('gemini', 'gemini')}
+					>
+						<Play className="h-3 w-3" /> Launch Gemini
+					</Button>
+				</div>
 
 				<div className="divide-y divide-border">
 					{profiles.map((p) => {

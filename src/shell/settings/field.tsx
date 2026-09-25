@@ -11,6 +11,7 @@ import {
 	writeSettingsField,
 	type SettingsFileResult,
 } from '@/lib/settings/client';
+import type { SettingsField, SettingsWriteOptions } from '@/lib/settings/types';
 
 export interface SettingsSectionContextValue {
 	scope: SettingsScopeId;
@@ -56,7 +57,18 @@ export function useRevertOverride() {
 	const { projectId, refresh } = useSettingsSection();
 	return useMutation({
 		mutationFn: async (field: string) => {
-			await writeSettingsField({ scope: 'project', field, value: null, remove: true, projectId });
+			if (!projectId) return;
+			// `value` is ignored by the backend when `remove` is true (settings_kv
+			// write_field short-circuits on delete before touching it); the field
+			// key here is a runtime-validated dotted path, not a literal, so it
+			// can't be narrowed to the exact SettingsFieldValueMap member.
+			await writeSettingsField({
+				scope: 'project',
+				field: field as SettingsField,
+				value: null,
+				remove: true,
+				projectId,
+			} as SettingsWriteOptions);
 		},
 		onSuccess: () => refresh(),
 	});
