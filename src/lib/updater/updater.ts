@@ -7,6 +7,7 @@
 // through the transport shim so that browser sessions do not statically depend
 // on the Tauri plugin packages.
 
+import { recordShellUpdateAvailable } from '@/lib/notifications/record-update';
 import {
 	checkForUpdate as transportCheckForUpdate,
 	relaunchApp,
@@ -21,7 +22,12 @@ export type { UpdateInfo } from '@/lib/transport';
  * endpoint 404, sig mismatch — log + degrade gracefully).
  */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
-	return transportCheckForUpdate();
+	const info = await transportCheckForUpdate();
+	// WP-40 `update` producer. Every check (banner poll, About "Check now")
+	// funnels through here; Rust dedupes per version. Not awaited — recording
+	// must never slow or fail the check.
+	if (info) void recordShellUpdateAvailable(info.version);
+	return info;
 }
 
 /**

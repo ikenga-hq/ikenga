@@ -480,6 +480,159 @@ export async function settingsOpenFile(
 	});
 }
 
+// ─── Notifications (WP-40) ────────────────────────────────────────────────────
+// Mirrors `src-tauri/src/commands/notifications.rs`. The table is written by
+// Rust-side producers (permission / run / violation) plus
+// `notificationsRecordUpdate` for the two webview-side update checks. Live
+// changes arrive on the `notifications://changed` event
+// (`NOTIFICATIONS_CHANGED_EVENT`).
+
+/** Wire names of `notifications::NotificationKind`. */
+export type NotificationKind =
+	| 'permission'
+	| 'run_finished'
+	| 'run_failed'
+	| 'update'
+	| 'violation'
+	| 'invite';
+
+/**
+ * `{ kind, ...params }`. The action kinds producers emit today; the centre
+ * (WP-40b) maps each to its buttons.
+ */
+export type NotificationAction =
+	| {
+			kind: 'permission.decide';
+			via: 'hooks';
+			requestId: string;
+			terminalId: string | null;
+	  }
+	| { kind: 'open.thread'; threadId: string; requestId: string }
+	| { kind: 'open.terminal'; terminalId: string | null; sessionId: string | null }
+	| { kind: 'open.chi_run'; runId: string; status: 'done' | 'failed' }
+	| { kind: 'open.release_notes'; source: 'shell'; version: string }
+	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
+	| { kind: 'open.violations'; pkgId: string }
+	| { kind: string; [param: string]: unknown };
+
+export interface NotificationRow {
+	id: number;
+	kind: NotificationKind;
+	title: string;
+	body: string | null;
+	action: NotificationAction | null;
+	/** Producer id (`iyke.hooks`, `engine.claude-code`, `chi`, `updater`, `pkg.permissions_check`). */
+	source: string;
+	dedupeKey: string | null;
+	/** Occurrences folded into this row (e.g. violation denials). */
+	count: number;
+	/** First occurrence, unix ms. */
+	createdAt: number;
+	/** Latest occurrence, unix ms — lists sort on this. */
+	updatedAt: number;
+	readAt: number | null;
+}
+
+export interface NotificationsUnreadCount {
+	total: number;
+	/** Muted kinds are absent. */
+	byKind: Partial<Record<NotificationKind, number>>;
+}
+
+export interface NotificationsMuteState {
+	muted: NotificationKind[];
+	/** Everything but `permission` and `violation`. */
+	mutable: NotificationKind[];
+}
+
+export interface NotificationsListOptions {
+	unreadOnly?: boolean;
+	kinds?: NotificationKind[];
+	limit?: number;
+	/** Cursor: rows with `updatedAt` strictly below this. */
+	before?: number;
+	includeMuted?: boolean;
+}
+
+export type NotificationsChangeReason =
+	| 'created'
+	| 'coalesced'
+	| 'read'
+	| 'read_all'
+	| 'mute_changed';
+
+/** Payload of `notifications://changed`. */
+export interface NotificationsChangedEvent {
+	reason: NotificationsChangeReason;
+	/** Present for `created` / `coalesced`. */
+	notification: NotificationRow | null;
+	/** True when the row's kind is muted — the toast bridge stays quiet. */
+	muted: boolean;
+}
+
+export const NOTIFICATIONS_CHANGED_EVENT = 'notifications://changed';
+
+export async function notificationsList(
+	options: NotificationsListOptions = {},
+): Promise<NotificationRow[]> {
+	return invoke<NotificationRow[]>('notifications_list', {
+		unreadOnly: options.unreadOnly ?? null,
+		kinds: options.kinds ?? null,
+		limit: options.limit ?? null,
+		before: options.before ?? null,
+		includeMuted: options.includeMuted ?? null,
+	});
+}
+
+export async function notificationsUnreadCount(): Promise<NotificationsUnreadCount> {
+	return invoke<NotificationsUnreadCount>('notifications_unread_count');
+}
+
+export async function notificationsMarkRead(ids: number[]): Promise<number> {
+	return invoke<number>('notifications_mark_read', { ids });
+}
+
+export async function notificationsMarkAllRead(kind?: NotificationKind | null): Promise<number> {
+	return invoke<number>('notifications_mark_all_read', { kind: kind ?? null });
+}
+
+export async function notificationsMuteState(): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_state');
+}
+
+export async function notificationsMuteKind(kind: NotificationKind): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_kind', { kind });
+}
+
+export async function notificationsUnmuteKind(
+	kind: NotificationKind,
+): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_unmute_kind', { kind });
+}
+
+export interface NotificationsRecordUpdateArgs {
+	source: 'shell' | 'pkg';
+	version: string;
+	/** Required when `source === 'pkg'`. */
+	pkgId?: string | null;
+	pkgName?: string | null;
+}
+
+/**
+ * `update` producer entry point for the webview-side update checks. Returns
+ * the created row, or `null` when that version was already announced.
+ */
+export async function notificationsRecordUpdate(
+	args: NotificationsRecordUpdateArgs,
+): Promise<NotificationRow | null> {
+	return invoke<NotificationRow | null>('notifications_record_update', {
+		source: args.source,
+		version: args.version,
+		pkgId: args.pkgId ?? null,
+		pkgName: args.pkgName ?? null,
+	});
+}
+
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
 
 export async function secretsGet(key: string): Promise<string | null> {
