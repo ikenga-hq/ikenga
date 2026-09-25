@@ -27,7 +27,7 @@
 //   · engine — the Companion's next-dispatch target, else the default engine
 
 import { useQuery } from '@tanstack/react-query';
-import { Bot, Folder, GitBranch, HelpCircle, Package, ShieldCheck } from 'lucide-react';
+import { Folder, GitBranch, HelpCircle, Package, ShieldCheck } from 'lucide-react';
 import {
 	Fragment,
 	type KeyboardEvent as ReactKeyboardEvent,
@@ -50,6 +50,10 @@ import { openCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
 import { NotificationsBell } from './notifications/bell';
 import { GIT_BRANCHES_ROUTE, GIT_CHANGES_ROUTE, useGitRepoSummary } from './title-row';
+// WP-41 (D-07 update-flow) — the one status-bar edit this WP makes: swap the
+// plain engine segment for a component that also mirrors a live shell-update
+// download (see that file's header for why it needs its own store).
+import { UpdaterStatusBarProgress } from './updater/status-bar-slot';
 
 /** Ngwa deep links. Phase 1 lands on the pkg surface's matching filter; the
  *  `/ngwa/*` routes (WP-10) take over these targets when they exist. */
@@ -129,7 +133,11 @@ function useNextEngineId(): string | null {
 
 // ─── presentation ──────────────────────────────────────────────────────────
 
-const ITEM =
+// Exported so other status-bar segments mounted outside this file (e.g.
+// `updater/status-bar-slot.tsx`'s progress segment, which replaces the
+// `engine` segment in place) share one source of truth for the styling
+// instead of a byte-identical copy (WP-41-F3).
+export const ITEM =
 	'flex h-5 items-center gap-1 rounded-[var(--radius-xs)] px-2 text-muted-foreground outline-none';
 const BUTTON = cn(
 	ITEM,
@@ -359,12 +367,10 @@ export function StatusBar() {
 						<span className="font-mono text-[var(--achievement)]">${cost.toFixed(2)}</span>
 					</ReadOnly>
 				)}
-				{engine && (
-					<ReadOnly id="engine" title="Engine for the next dispatch — choose it in the Companion">
-						<Bot aria-hidden className="h-3 w-3" />
-						<span className="font-mono">{engine}</span>
-					</ReadOnly>
-				)}
+				{/* WP-41 (D-07 update-flow, 06-interaction-spec.md §3.13 #90): a live
+				 * shell-update download replaces this segment; otherwise it's the
+				 * same engine read-only segment as before. */}
+				<UpdaterStatusBarProgress engine={engine} />
 				<SegButton
 					id="shortcuts"
 					rovingId={rovingId}
