@@ -1,9 +1,8 @@
 import { AlertTriangle, CheckCircle2, Download, ShieldAlert, UserPlus, X, XCircle } from 'lucide-react';
 import * as React from 'react';
 import { cn } from '@/components/ui/utils';
-import { useMarkNotificationsRead, useNotificationsLiveSync } from '@/lib/queries/notifications';
+import { useNotificationsLiveSync } from '@/lib/queries/notifications';
 import type { NotificationKind, NotificationRow } from '@/lib/tauri-cmd';
-import { notificationActionButtons } from '@/shell/notifications/actions';
 
 export type FloatingToastChipVariant = 'progress' | 'error' | 'notice' | 'info';
 export type FloatingToastChipAnchor = 'viewport-top' | 'pane-corner';
@@ -141,6 +140,10 @@ export function FloatingToastChip({
 // itself lives in the `notifications` table / the bell popover
 // (`src/shell/notifications/`); this renders a 3.2s `FloatingToastChip`
 // copy of whatever `notifications://changed` just created, then discards it.
+// Text-only, like the design's `toast(text, { ms: 3200 })`: no CTA. A live
+// decision (Allow once / Deny) on a pill that vanishes in 3.2 s is a
+// misclick trap, and every action already lives on the row in the popover
+// (`src/shell/notifications/actions.ts`), which knows when an ask is over.
 // Suppressed when the event's `muted` flag is set — Rust already excludes
 // muted kinds from the unread count, and the toast honors the same rule
 // rather than surfacing a notice for something the popover won't show as
@@ -187,7 +190,6 @@ let notificationToastSeq = 0;
  *  overlapping pills. */
 export function NotificationToastBridge() {
 	const [queue, setQueue] = React.useState<QueuedNotificationToast[]>([]);
-	const markRead = useMarkNotificationsRead();
 
 	useNotificationsLiveSync((event) => {
 		if (event.reason !== 'created' && event.reason !== 'coalesced') return;
@@ -205,8 +207,6 @@ export function NotificationToastBridge() {
 
 	if (!shown) return null;
 
-	const primaryAction = notificationActionButtons(shown.row)[0];
-
 	return (
 		<FloatingToastChip
 			key={shown.key}
@@ -214,18 +214,6 @@ export function NotificationToastBridge() {
 			anchor="viewport-top"
 			icon={NOTIFICATION_TOAST_ICON[shown.row.kind]}
 			label={shown.row.title}
-			action={
-				primaryAction
-					? {
-							label: primaryAction.label,
-							onClick: () => {
-								primaryAction.run();
-								if (shown.row.readAt == null) markRead.mutate([shown.row.id]);
-								dismiss(shown.key);
-							},
-						}
-					: undefined
-			}
 			onDismiss={() => dismiss(shown.key)}
 			ttlMs={NOTIFICATION_TOAST_TTL_MS}
 		/>

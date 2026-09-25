@@ -27,7 +27,10 @@ vi.mock('@/lib/iyke/client', () => ({
 	iykeFetch: mocks.iykeFetch,
 }));
 
-import { notificationActionButtons } from './actions';
+import { HOOK_GATE_ANSWERABLE_MS, isPermissionAskLive, notificationActionButtons } from './actions';
+
+/** Rows below are created at t=0; "now" inside the hold window. */
+const NOW = 1_000;
 
 function row(overrides: Partial<NotificationRow>): NotificationRow {
 	return {
@@ -42,6 +45,7 @@ function row(overrides: Partial<NotificationRow>): NotificationRow {
 		createdAt: 0,
 		updatedAt: 0,
 		readAt: null,
+		resolvedAt: null,
 		...overrides,
 	};
 }
@@ -58,7 +62,8 @@ describe('notificationActionButtons', () => {
 			row({
 				kind: 'permission',
 				action: { kind: 'permission.decide', via: 'hooks', requestId: 'req-1', terminalId: 't-1' },
-			})
+			}),
+			NOW
 		);
 		expect(buttons.map((b) => b.label)).toEqual(['Allow once', 'Deny']);
 		expect(buttons[0]?.variant).toBe('primary');
@@ -78,6 +83,68 @@ describe('notificationActionButtons', () => {
 			'/iyke/hooks/decision',
 			expect.objectContaining({ body: JSON.stringify({ requestId: 'req-1', decision: 'denied' }) })
 		);
+	});
+
+	it('permission.decide: a resolved row offers no live decision, only Open terminal', () => {
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'permission',
+				resolvedAt: 500,
+				readAt: 500,
+				action: { kind: 'permission.decide', via: 'hooks', requestId: 'req-1', terminalId: 't-1' },
+			}),
+			NOW
+		);
+		expect(buttons.map((b) => b.label)).toEqual(['Open terminal']);
+		buttons[0]?.run();
+		expect(mocks.iykeFetch).not.toHaveBeenCalled();
+		expect(mocks.addTab).toHaveBeenCalledWith('pane-1', { kind: 'terminal', sessionId: 't-1' });
+	});
+
+	it('permission.decide: resolved without a terminal renders no buttons', () => {
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'permission',
+				resolvedAt: 500,
+				action: { kind: 'permission.decide', via: 'hooks', requestId: 'req-1', terminalId: null },
+			}),
+			NOW
+		);
+		expect(buttons).toEqual([]);
+	});
+
+	it('permission.decide: an expired hold offers no live decision even without resolvedAt', () => {
+		const decide = {
+			kind: 'permission.decide',
+			via: 'hooks',
+			requestId: 'req-1',
+			terminalId: null,
+		} as const;
+		expect(notificationActionButtons(row({ action: decide }), HOOK_GATE_ANSWERABLE_MS + 1)).toEqual([]);
+	});
+
+	it('isPermissionAskLive: read-but-pending stays live; an older row without resolvedAt uses read state', () => {
+		expect(isPermissionAskLive(row({ readAt: 500, resolvedAt: null }), NOW)).toBe(true);
+		const legacy = row({ readAt: 500 });
+		delete (legacy as Partial<NotificationRow>).resolvedAt;
+		expect(isPermissionAskLive(legacy, NOW)).toBe(false);
+		const legacyUnread = row({});
+		delete (legacyUnread as Partial<NotificationRow>).resolvedAt;
+		expect(isPermissionAskLive(legacyUnread, NOW)).toBe(true);
+	});
+
+	it('permission.decide via acp is narrowed to open-only open.thread', () => {
+		const buttons = notificationActionButtons(
+			row({
+				kind: 'permission',
+				action: { kind: 'permission.decide', via: 'acp', threadId: 'th-9', requestId: 'r-9' },
+			}),
+			NOW
+		);
+		expect(buttons.map((b) => b.label)).toEqual(['Open thread']);
+		buttons[0]?.run();
+		expect(mocks.iykeFetch).not.toHaveBeenCalled();
+		expect(mocks.addTab).toHaveBeenCalledWith('pane-1', { kind: 'terminal', sessionId: 'th-9' });
 	});
 
 	it('open.terminal opens a terminal pane keyed by terminalId, falling back to sessionId', () => {
