@@ -1,3 +1,13 @@
+//! Persistent secret storage backed by the platform credential store.
+//!
+//! The earlier WP-33 Linux attempt treated the keyring as one interchangeable
+//! backend. That was wrong: on Linux, Secret Service can be unavailable while
+//! keyutils still answers, and a keyutils hit is not proof of authoritative
+//! persistence. Secret Service is therefore the authoritative backend. Keyutils
+//! is a read-only fallback for a read that cannot reach Secret Service; it is
+//! never written or deleted by this module. Every mutation, probe, import, and
+//! migration uses Secret Service directly and fails closed when it is absent.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,15 +25,18 @@ const MIGRATION_ARTIFACTS: &[&str] = &[
     "secrets.stronghold.migrated",
     "secrets-migration.json",
     "secrets-migration.rollback.json",
+    "secrets-unlock.json",
     KEYUTILS_DISABLED_FILENAME,
 ];
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct BackendError {
     message: String,
     cache_fallback_allowed: bool,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl BackendError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
@@ -52,10 +65,23 @@ impl std::fmt::Display for BackendError {
 
 type BackendResult<T> = Result<T, BackendError>;
 
+fn backend_store_error(error: BackendError) -> StoreError {
+    if error.allows_cache_fallback() {
+        StoreError::unavailable(error.to_string())
+    } else {
+        StoreError::unknown(error.to_string())
+    }
+}
+
 trait CredentialProvider: Send + Sync {
     fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>>;
     fn set(&self, item: &str, value: &[u8]) -> BackendResult<()>;
     fn delete(&self, item: &str) -> BackendResult<()>;
+}
+
+#[allow(dead_code)]
+trait CredentialReader: Send + Sync {
+    fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>>;
 }
 
 trait SecretBackend: Send + Sync {
@@ -174,29 +200,12 @@ impl SecretBackend for NativeSecretBackend {
 struct KeyutilsProvider;
 
 #[cfg(target_os = "linux")]
-impl CredentialProvider for KeyutilsProvider {
+impl CredentialReader for KeyutilsProvider {
     fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>> {
         let credential =
             keyring::keyutils::KeyutilsCredential::new_with_target(Some(item), SERVICE, USER)
                 .map_err(keyring_error)?;
         get_entry(&keyring::Entry::new_with_credential(Box::new(credential)))
-    }
-
-    fn set(&self, item: &str, value: &[u8]) -> BackendResult<()> {
-        let credential =
-            keyring::keyutils::KeyutilsCredential::new_with_target(Some(item), SERVICE, USER)
-                .map_err(keyring_error)?;
-        set_entry(
-            &keyring::Entry::new_with_credential(Box::new(credential)),
-            value,
-        )
-    }
-
-    fn delete(&self, item: &str) -> BackendResult<()> {
-        let credential =
-            keyring::keyutils::KeyutilsCredential::new_with_target(Some(item), SERVICE, USER)
-                .map_err(keyring_error)?;
-        delete_entry(&keyring::Entry::new_with_credential(Box::new(credential)))
     }
 }
 
@@ -230,18 +239,20 @@ impl CredentialProvider for SecretServiceProvider {
     }
 }
 
+#[allow(dead_code)]
 struct LinuxSecretBackend {
     secret_service: Arc<dyn CredentialProvider>,
-    keyutils_cache: Arc<dyn CredentialProvider>,
+    keyutils_cache: Arc<dyn CredentialReader>,
     cache_disabled: AtomicBool,
     cache_disabled_path: Option<PathBuf>,
     diagnostic: Mutex<Option<String>>,
 }
 
+#[allow(dead_code)]
 impl LinuxSecretBackend {
     fn new(
         secret_service: Arc<dyn CredentialProvider>,
-        keyutils_cache: Arc<dyn CredentialProvider>,
+        keyutils_cache: Arc<dyn CredentialReader>,
         cache_disabled_path: Option<PathBuf>,
     ) -> Self {
         let cache_disabled = cache_disabled_path
@@ -269,58 +280,12 @@ impl LinuxSecretBackend {
                 .map(|path| path.exists())
                 .unwrap_or(false)
     }
-
-    fn disable_cache(&self, operation: &str, error: BackendError) {
-        self.cache_disabled.store(true, Ordering::Release);
-        let marker_error = self
-            .cache_disabled_path
-            .as_ref()
-            .filter(|path| !path.exists())
-            .and_then(|path| super::index::write_atomic(path, b"disabled").err());
-        let message = match marker_error {
-            Some(marker_error) => {
-                format!("{operation}: {error}; cache disable marker failed: {marker_error}")
-            }
-            None => format!("{operation}: {error}; keyutils cache disabled"),
-        };
-        if let Ok(mut diagnostic) = self.diagnostic.lock() {
-            *diagnostic = Some(message);
-        }
-    }
 }
 
 impl SecretBackend for LinuxSecretBackend {
     fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>> {
         match self.secret_service.get(item) {
-            Ok(Some(value)) => {
-                if !self.cache_is_disabled() {
-                    if let Err(error) = self.keyutils_cache.delete(item) {
-                        self.disable_cache(
-                            "Secret Service read succeeded but keyutils cache invalidation failed",
-                            error,
-                        );
-                        return Ok(Some(value));
-                    }
-                    if let Err(error) = self.keyutils_cache.set(item, &value) {
-                        self.disable_cache(
-                            "Secret Service read succeeded but keyutils cache write failed",
-                            error,
-                        );
-                    }
-                }
-                Ok(Some(value))
-            }
-            Ok(None) => {
-                if !self.cache_is_disabled() {
-                    if let Err(error) = self.keyutils_cache.delete(item) {
-                        self.disable_cache(
-                            "Secret Service entry is absent and keyutils cache invalidation failed",
-                            error,
-                        );
-                    }
-                }
-                Ok(None)
-            }
+            Ok(value) => Ok(value),
             Err(secret_service_error) => {
                 if !secret_service_error.allows_cache_fallback() {
                     return Err(secret_service_error);
@@ -350,44 +315,17 @@ impl SecretBackend for LinuxSecretBackend {
     fn set(&self, item: &str, value: &[u8]) -> BackendResult<()> {
         self.secret_service.set(item, value).map_err(|error| {
             BackendError::rejected(format!("Secret Service write failed: {error}"))
-        })?;
-        if self.cache_is_disabled() {
-            return Ok(());
-        }
-        if let Err(error) = self.keyutils_cache.delete(item) {
-            self.disable_cache(
-                "keyutils cache invalidation failed after Secret Service write",
-                error,
-            );
-            return Ok(());
-        }
-        if let Err(error) = self.keyutils_cache.set(item, value) {
-            self.disable_cache(
-                "Secret Service write succeeded but keyutils cache write failed",
-                error,
-            );
-        }
-        Ok(())
+        })
     }
 
     fn delete(&self, item: &str) -> BackendResult<()> {
         self.secret_service.delete(item).map_err(|error| {
             BackendError::rejected(format!("Secret Service delete failed: {error}"))
-        })?;
-        if self.cache_is_disabled() {
-            return Ok(());
-        }
-        if let Err(error) = self.keyutils_cache.delete(item) {
-            self.disable_cache(
-                "Secret Service delete succeeded but keyutils cache invalidation failed",
-                error,
-            );
-        }
-        Ok(())
+        })
     }
 
     fn label(&self) -> &'static str {
-        "Secret Service with Linux keyutils cache"
+        "Secret Service with read-only Linux keyutils fallback"
     }
 
     fn diagnostic(&self) -> Option<String> {
@@ -452,7 +390,7 @@ impl SecretBackend for UnsupportedBackend {
 fn native_backend_label() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "Secret Service with Linux keyutils cache"
+        "Secret Service with read-only Linux keyutils fallback"
     }
     #[cfg(target_os = "macos")]
     {
@@ -489,6 +427,11 @@ impl KeyringStore {
         Self::with_backend_config(&path, platform_backend(&path), true)
     }
 
+    pub fn persist_index(&self) -> Result<(), StoreError> {
+        self.lock_index()?.save().map_err(StoreError::uncommitted)
+    }
+
+    #[cfg(test)]
     fn with_backend(
         index_path: impl AsRef<Path>,
         backend: Arc<dyn SecretBackend>,
@@ -502,7 +445,11 @@ impl KeyringStore {
         allow_missing_index: bool,
     ) -> Result<Self, StoreError> {
         let path = index_path.as_ref().to_path_buf();
-        if !path.exists() && !allow_missing_index && migration_artifacts_present(&path) {
+        let artifacts = migration_artifacts_present(&path);
+        let blocking_artifacts = migration_artifacts_present_except_legacy(&path);
+        if !path.exists()
+            && ((!allow_missing_index && artifacts) || (allow_missing_index && blocking_artifacts))
+        {
             return Err(StoreError::uncommitted(format!(
                 "secrets index is missing while migration artifacts exist: {}",
                 path.display()
@@ -634,6 +581,17 @@ fn migration_artifacts_present(index_path: &Path) -> bool {
         .any(|artifact| parent.join(artifact).exists())
 }
 
+fn migration_artifacts_present_except_legacy(index_path: &Path) -> bool {
+    let parent = index_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    MIGRATION_ARTIFACTS
+        .iter()
+        .filter(|artifact| **artifact != "secrets.stronghold")
+        .any(|artifact| parent.join(artifact).exists())
+}
+
 fn recover_pending(
     index: &mut SecretIndex,
     backend: &dyn SecretBackend,
@@ -649,7 +607,7 @@ fn recover_pending(
         let item = item_name(name).map_err(StoreError::uncommitted)?;
         let authoritative = backend
             .get_authoritative(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
+            .map_err(backend_store_error)?;
         if authoritative.is_none() {
             next.remove(name).map_err(StoreError::uncommitted)?;
             changed = true;
@@ -659,7 +617,7 @@ fn recover_pending(
         let item = item_name(name).map_err(StoreError::uncommitted)?;
         if backend
             .get_authoritative(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()))?
+            .map_err(backend_store_error)?
             .is_some()
         {
             next.insert(name).map_err(StoreError::uncommitted)?;
@@ -676,10 +634,7 @@ fn recover_pending(
 impl SecretsStore for KeyringStore {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError> {
         let item = item_name(name).map_err(StoreError::uncommitted)?;
-        let value = self
-            .backend
-            .get(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
+        let value = self.backend.get(&item).map_err(backend_store_error)?;
         value
             .map(|bytes| {
                 String::from_utf8(bytes)
@@ -934,20 +889,16 @@ impl SecretsStore for KeyringStore {
     }
 
     fn probe(&self) -> Result<(), StoreError> {
-        self.lock_index()?.save().map_err(StoreError::uncommitted)?;
         let token = uuid::Uuid::new_v4();
         let item = format!("ikenga:__probe::{}", token.simple());
         self.backend
             .set(&item, token.as_bytes())
-            .map_err(|error| StoreError::uncommitted(error.to_string()))?;
+            .map_err(backend_store_error)?;
         let read = self
             .backend
             .get_authoritative(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()));
-        let delete = self
-            .backend
-            .delete(&item)
-            .map_err(|error| StoreError::uncommitted(error.to_string()));
+            .map_err(backend_store_error);
+        let delete = self.backend.delete(&item).map_err(backend_store_error);
         if let Err(error) = delete {
             return Err(error);
         }
@@ -958,7 +909,7 @@ impl SecretsStore for KeyringStore {
                 "authoritative keychain probe read mismatch",
             ));
         }
-        Ok(())
+        self.lock_index()?.save().map_err(StoreError::uncommitted)
     }
 
     fn backend_label(&self) -> &'static str {
@@ -1027,17 +978,23 @@ mod tests {
         }
     }
 
+    impl CredentialReader for FakeProvider {
+        fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>> {
+            <Self as CredentialProvider>::get(self, item)
+        }
+    }
+
     struct FakeBackend {
         provider: Arc<FakeProvider>,
     }
 
     impl SecretBackend for FakeBackend {
         fn get(&self, item: &str) -> BackendResult<Option<Vec<u8>>> {
-            self.provider.get(item)
+            CredentialProvider::get(&*self.provider, item)
         }
 
         fn get_authoritative(&self, item: &str) -> BackendResult<Option<Vec<u8>>> {
-            self.provider.get(item)
+            CredentialProvider::get(&*self.provider, item)
         }
 
         fn set(&self, item: &str, value: &[u8]) -> BackendResult<()> {
@@ -1144,7 +1101,27 @@ mod tests {
             }),
             true,
         )
+        .is_err());
+        fs::remove_file(dir.path().join("secrets.stronghold.bak")).unwrap();
+        fs::write(dir.path().join("secrets.stronghold"), b"legacy").unwrap();
+        assert!(KeyringStore::with_backend_config(
+            &path,
+            Arc::new(FakeBackend {
+                provider: Arc::new(FakeProvider::default()),
+            }),
+            true,
+        )
         .is_ok());
+        fs::remove_file(dir.path().join("secrets.stronghold")).unwrap();
+        fs::write(dir.path().join("secrets-unlock.json"), b"envelope").unwrap();
+        assert!(KeyringStore::with_backend_config(
+            &path,
+            Arc::new(FakeBackend {
+                provider: Arc::new(FakeProvider::default()),
+            }),
+            true,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1259,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_backend_secret_service_absence_invalidates_cache() {
+    fn linux_backend_secret_service_absence_does_not_invalidate_read_only_cache() {
         let dir = tempfile::tempdir().unwrap();
         let keyutils_cache = Arc::new(FakeProvider::default());
         let secret_service = Arc::new(FakeProvider::default());
@@ -1267,21 +1244,28 @@ mod tests {
         let backend = linux_backend(secret_service, keyutils_cache.clone(), dir.path());
 
         assert_eq!(backend.get("ikenga:workspace::TOKEN").unwrap(), None);
-        assert_eq!(keyutils_cache.get_item("ikenga:workspace::TOKEN"), None);
+        assert_eq!(
+            keyutils_cache.get_item("ikenga:workspace::TOKEN"),
+            Some(b"stale".to_vec())
+        );
     }
 
     #[test]
-    fn linux_backend_cache_invalidation_failure_disables_cache() {
+    fn linux_backend_cache_failures_do_not_affect_authoritative_absence() {
         let dir = tempfile::tempdir().unwrap();
         let keyutils_cache = Arc::new(FakeProvider::default());
         let secret_service = Arc::new(FakeProvider::default());
         keyutils_cache.insert("ikenga:workspace::TOKEN", b"stale");
         *keyutils_cache.fail_deletes.lock().unwrap() = true;
-        let backend = linux_backend(secret_service, keyutils_cache, dir.path());
+        let backend = linux_backend(secret_service, keyutils_cache.clone(), dir.path());
 
         assert_eq!(backend.get("ikenga:workspace::TOKEN").unwrap(), None);
-        assert!(backend.diagnostic().is_some());
-        assert!(dir.path().join(KEYUTILS_DISABLED_FILENAME).exists());
+        assert!(backend.diagnostic().is_none());
+        assert!(!dir.path().join(KEYUTILS_DISABLED_FILENAME).exists());
+        assert_eq!(
+            keyutils_cache.get_item("ikenga:workspace::TOKEN"),
+            Some(b"stale".to_vec())
+        );
     }
 
     #[test]
@@ -1320,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_backend_successful_write_reports_cache_failure_after_persistence() {
+    fn linux_backend_successful_write_never_writes_keyutils() {
         let dir = tempfile::tempdir().unwrap();
         let keyutils_cache = Arc::new(FakeProvider::default());
         let secret_service = Arc::new(FakeProvider::default());
@@ -1330,11 +1314,12 @@ mod tests {
         backend
             .set("ikenga:workspace::TOKEN", b"persisted-value")
             .unwrap();
-        assert!(backend.diagnostic().is_some());
+        assert!(backend.diagnostic().is_none());
         assert_eq!(
             secret_service.get_item("ikenga:workspace::TOKEN"),
             Some(b"persisted-value".to_vec())
         );
+        assert_eq!(keyutils_cache.get_item("ikenga:workspace::TOKEN"), None);
     }
 
     #[test]
@@ -1355,11 +1340,11 @@ mod tests {
             store.get("workspace::TOKEN").unwrap().as_deref(),
             Some("persisted")
         );
-        assert_eq!(store.diagnostics().len(), 1);
+        assert!(store.diagnostics().is_empty());
     }
 
     #[test]
-    fn linux_backend_successful_delete_survives_cache_failure() {
+    fn linux_backend_successful_delete_never_writes_keyutils() {
         let dir = tempfile::tempdir().unwrap();
         let keyutils_cache = Arc::new(FakeProvider::default());
         let secret_service = Arc::new(FakeProvider::default());
@@ -1370,7 +1355,7 @@ mod tests {
 
         backend.delete("ikenga:workspace::TOKEN").unwrap();
         assert_eq!(secret_service.get_item("ikenga:workspace::TOKEN"), None);
-        assert!(backend.diagnostic().is_some());
+        assert!(backend.diagnostic().is_none());
     }
 
     #[test]
@@ -1385,7 +1370,7 @@ mod tests {
 
         store.set("workspace::TOKEN", "persisted").unwrap();
         assert_eq!(store.list_meta().unwrap().len(), 1);
-        assert_eq!(store.diagnostics().len(), 1);
+        assert!(store.diagnostics().is_empty());
         assert_eq!(
             store.get("workspace::TOKEN").unwrap().as_deref(),
             Some("persisted")
@@ -1405,8 +1390,46 @@ mod tests {
             backend.get("ikenga:workspace::TOKEN").unwrap(),
             Some(b"persisted".to_vec())
         );
-        assert!(backend.diagnostic().is_some());
-        assert!(dir.path().join(KEYUTILS_DISABLED_FILENAME).exists());
+        assert!(backend.diagnostic().is_none());
+        assert!(!dir.path().join(KEYUTILS_DISABLED_FILENAME).exists());
+    }
+
+    #[test]
+    fn keyring_probe_does_not_write_index_when_authoritative_backend_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets-index.json");
+        fs::write(&path, b"[]").unwrap();
+        let secret_service = Arc::new(FakeProvider::default());
+        *secret_service.fail_writes.lock().unwrap() = true;
+        let backend = linux_backend(
+            secret_service,
+            Arc::new(FakeProvider::default()),
+            dir.path(),
+        );
+        let store = KeyringStore::with_backend(&path, Arc::new(backend)).unwrap();
+        assert!(store.probe().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn linux_backend_authoritative_unavailable_blocks_mutations_and_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let keyutils_cache = Arc::new(FakeProvider::default());
+        let secret_service = Arc::new(FakeProvider::default());
+        keyutils_cache.insert("ikenga:workspace::TOKEN", b"cached");
+        *secret_service.fail_reads.lock().unwrap() = true;
+        *secret_service.fail_writes.lock().unwrap() = true;
+        *secret_service.fail_deletes.lock().unwrap() = true;
+        let backend = linux_backend(secret_service, keyutils_cache.clone(), dir.path());
+
+        assert!(backend.set("ikenga:workspace::TOKEN", b"new").is_err());
+        assert!(backend.delete("ikenga:workspace::TOKEN").is_err());
+        let probe = backend.set("ikenga:__probe::token", b"probe");
+        assert!(probe.is_err());
+        assert_eq!(
+            keyutils_cache.get_item("ikenga:workspace::TOKEN"),
+            Some(b"cached".to_vec())
+        );
     }
 
     #[test]

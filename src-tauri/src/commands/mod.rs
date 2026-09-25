@@ -153,7 +153,8 @@ pub use screenshot::{
 };
 pub use secrets::{
     secrets_delete, secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_set, secrets_set_scoped, secrets_vault_status, SecretsLock,
+    secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
+    secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status, SecretsLock,
 };
 pub use settings_kv::{
     settings_clear_all, settings_get, settings_get_all, settings_open_file, settings_read_file,

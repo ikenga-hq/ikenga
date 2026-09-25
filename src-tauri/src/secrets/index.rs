@@ -18,12 +18,17 @@ pub struct SecretIndex {
 impl SecretIndex {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                names: BTreeSet::new(),
-            });
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path,
+                    names: BTreeSet::new(),
+                });
+            }
+            Err(error) => return Err(format!("inspect secrets index {}: {error}", path.display())),
         }
+        reject_link(&path, "secrets index")?;
         let raw = fs::read_to_string(&path)
             .map_err(|e| format!("read secrets index {}: {e}", path.display()))?;
         if raw.trim().is_empty() {
@@ -33,7 +38,7 @@ impl SecretIndex {
             .map_err(|e| format!("parse secrets index {}: {e}", path.display()))?;
         let mut names = BTreeSet::new();
         for value in values {
-            validate_name(&value)?;
+            validate_stored_name(&value)?;
             names.insert(value);
         }
         Ok(Self { path, names })
@@ -44,13 +49,13 @@ impl SecretIndex {
     }
 
     pub fn insert(&mut self, name: &str) -> Result<(), String> {
-        validate_name(name)?;
+        validate_stored_name(name)?;
         self.names.insert(name.to_string());
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
-        validate_name(name)?;
+        validate_stored_name(name)?;
         self.names.remove(name);
         Ok(())
     }
@@ -74,9 +79,19 @@ pub struct IndexPending {
 
 impl IndexPending {
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect pending secrets index {}: {error}",
+                    path.display()
+                ));
+            }
         }
+        reject_link(path, "pending secrets index")?;
         serde_json::from_slice(
             &fs::read(path)
                 .map_err(|e| format!("read pending secrets index {}: {e}", path.display()))?,
@@ -120,8 +135,13 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name == "__manifest" || name == "__manifest_v2" {
         return Err("secret name is reserved".into());
     }
-    if name.contains('\0') {
-        return Err("secret name contains a null byte".into());
+    if name.contains('\0')
+        || !name.is_ascii()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err("secret name contains unsupported characters".into());
     }
     if name.len().saturating_add(ITEM_PREFIX.len()) > 32_767 {
         return Err("secret name is too long for the platform keychain".into());
@@ -129,8 +149,49 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_key(key: &str) -> Result<(), String> {
+    validate_name(key)?;
+    if key.contains("::") {
+        return Err("secret key contains a scope delimiter".into());
+    }
+    Ok(())
+}
+
+pub fn validate_scope_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("scope id is empty".into());
+    }
+    if !id.is_ascii()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err("scope id contains unsupported characters".into());
+    }
+    Ok(())
+}
+
+pub fn validate_stored_name(name: &str) -> Result<(), String> {
+    if let Some(key) = name.strip_prefix("workspace::") {
+        return validate_key(key);
+    }
+    for prefix in ["project::", "pkg::"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let mut parts = rest.split("::");
+            let id = parts.next().unwrap_or_default();
+            let key = parts.next().unwrap_or_default();
+            if parts.next().is_some() {
+                return Err("scoped secret name has too many delimiters".into());
+            }
+            validate_scope_id(id)?;
+            return validate_key(key);
+        }
+    }
+    validate_key(name)
+}
+
 pub fn item_name(name: &str) -> Result<String, String> {
-    validate_name(name)?;
+    validate_stored_name(name)?;
     Ok(format!("{ITEM_PREFIX}{name}"))
 }
 
@@ -139,23 +200,113 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("create file parent {}: {e}", parent.display()))?;
+    ensure_directory_chain(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if is_link_or_reparse_point(&metadata) {
+            return Err(format!(
+                "refusing to replace linked file {}",
+                path.display()
+            ));
+        }
+    }
     let temp = temp_path(path);
-    let _ = fs::remove_file(&temp);
-    let mut file =
-        fs::File::create(&temp).map_err(|e| format!("create temp file {}: {e}", temp.display()))?;
+    if let Ok(metadata) = fs::symlink_metadata(&temp) {
+        if is_link_or_reparse_point(&metadata) {
+            return Err(format!(
+                "refusing to replace linked temp file {}",
+                temp.display()
+            ));
+        }
+        fs::remove_file(&temp)
+            .map_err(|error| format!("remove temp file {}: {error}", temp.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| format!("create temp file {}: {error}", temp.display()))?;
     file.write_all(body)
-        .map_err(|e| format!("write temp file {}: {e}", temp.display()))?;
+        .map_err(|error| format!("write temp file {}: {error}", temp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("protect temp file {}: {e}", temp.display()))?;
+            .map_err(|error| format!("protect temp file {}: {error}", temp.display()))?;
     }
     file.sync_all()
-        .map_err(|e| format!("sync temp file {}: {e}", temp.display()))?;
+        .map_err(|error| format!("sync temp file {}: {error}", temp.display()))?;
     replace_file(&temp, path)
+}
+
+fn ensure_directory_chain(path: &Path) -> Result<(), String> {
+    let mut chain = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        chain.push(ancestor);
+    }
+    for directory in chain.into_iter().rev() {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if is_link_or_reparse_point(&metadata) {
+                    return Err(format!(
+                        "refusing linked secrets directory {}",
+                        directory.display()
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(format!(
+                        "secrets path is not a directory: {}",
+                        directory.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(directory).map_err(|error| {
+                    format!("create directory {}: {error}", directory.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_link(path: &Path, label: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
+    if is_link_or_reparse_point(&metadata) {
+        return Err(format!(
+            "{label} is a symlink or reparse point: {}",
+            path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("{label} is not a regular file: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -290,6 +441,15 @@ mod tests {
         assert!(validate_name("__manifest").is_err());
         assert!(validate_name("__manifest_v2").is_err());
         assert!(validate_name("bad\0name").is_err());
+    }
+
+    #[test]
+    fn stored_names_reject_ambiguous_scopes() {
+        assert!(validate_stored_name("workspace::TOKEN").is_ok());
+        assert!(validate_stored_name("project::alpha::TOKEN").is_ok());
+        assert!(validate_stored_name("project::alpha::TOKEN::extra").is_err());
+        assert!(validate_stored_name("pkg::bad/id::TOKEN").is_err());
+        assert!(validate_stored_name("TOKEN::extra").is_err());
     }
 
     #[test]

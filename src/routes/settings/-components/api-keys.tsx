@@ -4,9 +4,8 @@
 // D-03 masking rules (no raw secret value in the DOM).
 
 import { useQuery } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
-import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { CheckCircle2, Eye, EyeOff, KeyRound, Pencil, Plus, Trash2, XCircle } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -75,7 +74,10 @@ export const KEY_CATALOG: KeyCategory[] = [
 
 export function ApiKeysSectionBody() {
 	const status = useQuery(vaultStatusQueryOptions());
-	const keys = useQuery(vaultKeysQueryOptions());
+	const keys = useQuery({
+		...vaultKeysQueryOptions(),
+		enabled: status.data?.available === true && status.data?.locked === false,
+	});
 	const [editKey, setEditKey] = useState<string | null>(null);
 	const [revealedKey, setRevealedKey] = useState<{ key: string; value: string } | null>(null);
 
@@ -86,11 +88,9 @@ export function ApiKeysSectionBody() {
 	}, [revealedKey]);
 
 	const known = useMemo(() => new Set(keys.data ?? []), [keys.data]);
-	const vaultAvailable = status.data?.available ?? false;
-	// The headless daemon serves reads from `IKENGA_SECRET_*` env vars and has
-	// no vault to write to (see src-tauri/src/secrets_env.rs). Reveal stays
-	// live; add/edit/delete are hidden rather than offered-and-refused.
-	const vaultWritable = status.data?.writable ?? true;
+	const vaultAvailable = status.data?.available === true;
+	const vaultUnlocked = vaultAvailable && status.data?.locked === false;
+	const vaultWritable = status.data?.writable === true && vaultUnlocked;
 
 	function handleReveal(name: string) {
 		if (revealedKey?.key === name) {
@@ -111,24 +111,26 @@ export function ApiKeysSectionBody() {
 				<div
 					className={cn(
 						'rounded-md border px-3 py-2 text-xs',
-						vaultAvailable
+						vaultUnlocked
 							? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-200'
 							: 'border-red-200 bg-red-50 text-red-900 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200'
 					)}
 				>
 					<div className="flex items-start gap-2">
-						{vaultAvailable ? (
+						{vaultUnlocked ? (
 							<CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
 						) : (
 							<XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
 						)}
 						<div>
-							{vaultAvailable ? (
+							{vaultUnlocked ? (
 								<span>
 									Vault unlocked via {status.data.keychainBackend}.
 									{!vaultWritable &&
 										' Read-only in this session — set IKENGA_SECRET_<KEY> in the daemon\u2019s environment and restart it to change a key.'}
 								</span>
+							) : vaultAvailable ? (
+								<span>Vault locked. Unlock it to read or change secrets.</span>
 							) : (
 								<span>
 									Vault unavailable: {status.data.error ?? 'unknown error'}. Sidecars will fall back
@@ -180,10 +182,10 @@ export function ApiKeysSectionBody() {
 													onClick={() => handleReveal(k.name)}
 													disabled={!vaultAvailable}
 													title={
-													isRevealed
-														? 'Hide'
-														: 'Reveal a redacted sample (auto-hides in 30s) — the value is never shown in full'
-												}
+														isRevealed
+															? 'Hide'
+															: 'Reveal a redacted sample (auto-hides in 30s) — the value is never shown in full'
+													}
 												>
 													{isRevealed ? (
 														<EyeOff className="h-3.5 w-3.5" />
@@ -197,7 +199,7 @@ export function ApiKeysSectionBody() {
 													variant="ghost"
 													size="sm"
 													onClick={() => setEditKey(k.name)}
-													disabled={!vaultAvailable}
+													disabled={!vaultUnlocked}
 												>
 													{present ? (
 														<Pencil className="h-3.5 w-3.5" />

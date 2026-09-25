@@ -24,7 +24,6 @@ function IntegrationsPage() {
 	const known = new Set(keys.data ?? []);
 	const supabaseAnonPresent = known.has('VITE_SUPABASE_ANON_KEY');
 	const vaultAvailable = status.data?.available === true;
-	const vaultUnlocked = vaultAvailable && status.data?.locked === false;
 
 	const connected =
 		(vaultAvailable ? 1 : 0) + (supabaseUrl ? 1 : 0) + (supabaseAnonPresent ? 1 : 0);

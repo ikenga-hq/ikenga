@@ -47,7 +47,8 @@ import {
 	useSetScopedSecret,
 	vaultKeysScopedQueryOptions,
 	vaultStatusQueryOptions,
-} from '@/lib/queries/secrets';import { useShellStore } from '@/lib/shell/shell-store';
+} from '@/lib/queries/secrets';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { useUnlockSheet } from '@/shell/secrets/unlock-sheet';
 
 type TabKind = 'workspace' | 'project' | 'pkg';
@@ -68,7 +69,6 @@ function SecretsPage() {
 	const configured = lock.data?.configured ?? false;
 	const locked = lock.data?.locked ?? true;
 	const vaultUnlocked = vaultAvailable && configured && !locked;
-	const unlockSheet = useUnlockSheet();
 
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
@@ -434,12 +434,6 @@ function SecretRow({
 			if (hideTimer.current !== null) window.clearTimeout(hideTimer.current);
 			hideTimer.current = window.setTimeout(() => setRevealed(false), HOLD_REVEAL_MS);
 		}, HOLD_DELAY_MS);
-	}
-
-	function hideSoon() {
-		stopHold();
-		if (hideTimer.current !== null) window.clearTimeout(hideTimer.current);
-		hideTimer.current = window.setTimeout(() => setRevealed(false), 2_000);
 	}
 
 	return (
