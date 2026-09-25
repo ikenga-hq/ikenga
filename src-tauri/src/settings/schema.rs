@@ -25,6 +25,7 @@ pub const RESOLVED_DEFAULT_FIELDS: &[&str] = &[
     "workspace.artifact.folderOverrides",
     "workspace.artifact.artifactSinkOverrides",
     "workspace.artifact.showResolved",
+    "workspace.notifications.mutedKinds",
     "storage.screenshotDirectory",
     "about.updates.autoCheck",
     "about.updates.autoInstallApp",
@@ -50,6 +51,8 @@ pub const PERSONAL_ONLY_FIELDS: &[&str] = &[
     "workspace.sidebarCollapsed",
     "workspace.explorerSections",
     "workspace.onboarding",
+    "workspace.notifications",
+    "workspace.notifications.mutedKinds",
     "storage.screenshotDirectory",
     "about.updates",
     "about.updates.autoCheck",
@@ -397,6 +400,14 @@ impl SettingsDocument {
                 validate_field(&format!("about.updates.{key}"), value)?;
             }
         }
+        if let Some(notifications) = self.workspace.get("notifications") {
+            let map = notifications
+                .as_object()
+                .ok_or_else(|| "workspace.notifications must be an object".to_string())?;
+            for (key, value) in map {
+                validate_field(&format!("workspace.notifications.{key}"), value)?;
+            }
+        }
         if let Some(last_agent) = self.workspace.get("lastAgent") {
             let map = last_agent
                 .as_object()
@@ -508,6 +519,8 @@ pub fn is_known_field(path: &str) -> bool {
             | "workspace.lastAgent"
             | "workspace.lastAgent.kind"
             | "workspace.lastAgent.customCommand"
+            | "workspace.notifications"
+            | "workspace.notifications.mutedKinds"
             | "storage.screenshotDirectory"
             | "about.updates"
             | "about.updates.autoCheck"
@@ -559,9 +572,14 @@ fn validate_field(path: &str, value: &Value) -> Result<(), String> {
             ensure_bool(value, &invalid)
         }
         "workspace.explorerSections" => ensure_array(value, &invalid),
-        "workspace.onboarding" | "workspace.artifact" | "workspace.lastAgent" => {
-            ensure_object(value, &invalid)
-        }
+        "workspace.onboarding"
+        | "workspace.artifact"
+        | "workspace.lastAgent"
+        | "workspace.notifications" => ensure_object(value, &invalid),
+        // WP-40: any string array. Unknown / unmutable kinds are ignored at
+        // read time (`notifications::mute::parse_muted`) so a hand-edited
+        // file never fails to parse over a notification-kind typo.
+        "workspace.notifications.mutedKinds" => ensure_string_array(value, &invalid),
         "workspace.artifact.defaultSink" => {
             ensure_enum(value, &["auto", "terminal", "chi", "clipboard"], &invalid)
         }
@@ -678,6 +696,7 @@ pub fn default_value(path: &str) -> Option<Value> {
         | "workspace.artifact.artifactSinkOverrides"
         | "workspace.artifact.showResolved" => Some(Value::Object(Map::new())),
         "workspace.lastAgent.kind" | "workspace.lastAgent.customCommand" => Some(Value::Null),
+        "workspace.notifications.mutedKinds" => Some(Value::Array(Vec::new())),
         "storage.screenshotDirectory" => Some(Value::Null),
         "about.updates.autoCheck" => Some(Value::Bool(true)),
         "about.updates.autoInstallApp" => Some(Value::Bool(false)),
@@ -1397,6 +1416,49 @@ mod tests {
                 }),
             )
             .is_err());
+    }
+
+    /// WP-40: per-kind notification mutes live at
+    /// `workspace.notifications.mutedKinds` — personal-only, defaulting to
+    /// `[]`, any string array accepted (kinds are filtered at read time).
+    #[test]
+    fn notification_muted_kinds_field_is_personal_defaulted_and_tolerant() {
+        let path = "workspace.notifications.mutedKinds";
+        assert!(is_known_field(path));
+        assert!(is_personal_only_field(path));
+        assert_eq!(
+            SettingsDocument::default().resolved().get_field(path),
+            Some(&serde_json::json!([]))
+        );
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field(path, serde_json::json!(["update", "not-a-kind"]))
+            .unwrap();
+        assert_eq!(
+            document.get_field(path),
+            Some(&serde_json::json!(["update", "not-a-kind"]))
+        );
+        assert!(document.set_field(path, serde_json::json!("update")).is_err());
+        assert!(document.set_field(path, serde_json::json!([1])).is_err());
+
+        let parsed = SettingsDocument::parse(
+            br#"{"version":1,"workspace":{"notifications":{"mutedKinds":["invite"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.get_field(path),
+            Some(&serde_json::json!(["invite"]))
+        );
+        assert!(SettingsDocument::parse(
+            br#"{"version":1,"workspace":{"notifications":{"mutedKinds":"invite"}}}"#
+        )
+        .is_err());
+
+        // A project file cannot mute anything.
+        let mut project = SettingsDocument::default();
+        project.set_field(path, serde_json::json!(["update"])).unwrap();
+        assert!(project.project_overlay().get_field(path).is_none());
     }
 
     #[test]

@@ -527,6 +527,23 @@ impl ClaudeCodeEngine {
         let notify = payload_from_permission(&thread_id, &tool_name, tool_input.as_ref());
         let _ = app.emit("chat://notify", &notify);
 
+        // WP-40 `permission` producer: persist the ask so the notification
+        // centre (and the daily address) see it even after the transient
+        // `chat://notify` is gone. Spawned so this loop never waits on a DB
+        // write; the round-trip task below marks it read once it resolves.
+        let pa_db = app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone());
+        if let Some(db) = pa_db.clone() {
+            let new = crate::notifications::producers::permission_from_engine(
+                &thread_id,
+                &request_id,
+                &tool_name,
+                tool_input.as_ref(),
+            );
+            tauri::async_runtime::spawn(async move {
+                crate::notifications::record_with_db(&db, new).await;
+            });
+        }
+
         // Move the heavy lifting onto its own task so the outer prompt
         // loop keeps draining claude's stdout.
         let waiters_handle = waiters.clone();
@@ -567,6 +584,9 @@ impl ClaudeCodeEngine {
                 tool_input_for_task.as_ref(),
                 &response,
             );
+            // WP-40: answered, cancelled or timed out — the ask is over.
+            let notification_key =
+                crate::notifications::producers::engine_permission_key(&request_id_for_task);
             if let Err(e) =
                 send_control_response(session_for_task, request_id_for_task, body, wire).await
             {
@@ -574,6 +594,9 @@ impl ClaudeCodeEngine {
                     target: "ikenga::engines::claude_code::server",
                     "send_control_response failed: {e}",
                 );
+            }
+            if let Some(db) = pa_db {
+                crate::notifications::resolve_key_with_db(&db, &notification_key).await;
             }
         });
     }

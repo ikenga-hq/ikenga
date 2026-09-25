@@ -117,6 +117,21 @@ async fn pre_tool_use_gate_enabled(app: &AppHandle, terminal_id: Option<&str>) -
     matches!(row.map(|r| r.0).as_deref(), Some("true") | Some("1"))
 }
 
+/// The app's `PaDb`, if managed yet.
+fn app_db(app: &AppHandle) -> Option<Arc<PaDb>> {
+    app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone())
+}
+
+/// WP-40 `permission` producer for the hooks bus. Best-effort.
+async fn record_permission_notification(
+    app: &AppHandle,
+    new: crate::notifications::NewNotification,
+) {
+    if let Some(db) = app_db(app) {
+        crate::notifications::record_with_db(&db, new).await;
+    }
+}
+
 fn mint_request_id() -> String {
     format!(
         "perm-{}-{}",
@@ -169,6 +184,25 @@ pub async fn post_hook_event(
 
         let _ = app.emit("hooks://event", &payload);
 
+        // WP-40: the held gate is a permission ask — record it so the
+        // notification centre can offer Allow / Deny while it is held.
+        // Spawned, not awaited: the hold below must start now. Its bound sits
+        // only 5 s under curl's --max-time, and a busy DB write (busy_timeout
+        // is 5 s) must never eat that margin.
+        {
+            let app = app.clone();
+            let new = crate::notifications::producers::permission_from_hook_gate(
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+                payload.ikenga_terminal_id.as_deref(),
+                payload.cwd.as_deref(),
+                &request_id,
+            );
+            tauri::async_runtime::spawn(async move {
+                record_permission_notification(&app, new).await;
+            });
+        }
+
         // Hold the hook response open until the human decides, bounded by
         // `GATE_HOLD_SECS`. That bound is not arbitrary: it must stay strictly
         // below the `curl --max-time` and the Claude Code hook timeout that
@@ -181,6 +215,16 @@ pub async fn post_hook_event(
         let _ = get_held_requests()
             .lock()
             .map(|mut map| map.remove(&request_id));
+
+        // WP-40: answered or timed out, the ask is over — mark its row read so
+        // the centre does not keep offering a dead Allow / Deny. Spawned for
+        // the same reason as the record above: never delay the hook reply.
+        if let Some(db) = app_db(&app) {
+            let key = crate::notifications::producers::hook_gate_key(&request_id);
+            tauri::async_runtime::spawn(async move {
+                crate::notifications::resolve_key_with_db(&db, &key).await;
+            });
+        }
 
         let allowed = match decision {
             Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
@@ -228,6 +272,23 @@ pub async fn post_hook_event(
     }
 
     let _ = app.emit("hooks://event", &payload);
+
+    // WP-40: Claude Code's own permission prompt in an Ikenga terminal. The
+    // answer happens in the terminal; the row points there.
+    // Spawned so the hook reply is never held on a DB write.
+    if payload.hook_event_name.as_deref() == Some("PermissionRequest") {
+        let app = app.clone();
+        let new = crate::notifications::producers::permission_from_hook_request(
+            payload.tool_name.as_deref(),
+            payload.tool_input.as_ref(),
+            payload.ikenga_terminal_id.as_deref(),
+            payload.session_id.as_deref(),
+            payload.cwd.as_deref(),
+        );
+        tauri::async_runtime::spawn(async move {
+            record_permission_notification(&app, new).await;
+        });
+    }
 
     (
         StatusCode::OK,

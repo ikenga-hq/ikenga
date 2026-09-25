@@ -23,6 +23,7 @@ pub mod fs_roots;
 pub mod identity;
 pub mod iyke;
 pub mod ngwa;
+pub mod notifications;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -104,6 +105,11 @@ pub use iyke::{
     iyke_terminal_spawn_done, iyke_wait_done, IykeRuntimeState,
 };
 pub use ngwa::ngwa_snapshot;
+pub use notifications::{
+    notifications_list, notifications_mark_all_read, notifications_mark_read,
+    notifications_mute_kind, notifications_mute_state, notifications_record_update,
+    notifications_unmute_kind, notifications_unread_count,
+};
 pub use pa_actions::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update,

@@ -221,6 +221,16 @@ impl SettingsManager {
         Ok(result)
     }
 
+    /// Read one field from the **personal** file (`~/.ikenga/settings.json`),
+    /// resolved against schema defaults. No KV-cache refresh, no watcher
+    /// registration and no migration-ready gate: this is for hot read paths
+    /// that only need a personal-only value (WP-40 notification mutes, read on
+    /// every list / unread-count call). A missing file yields the default.
+    pub fn personal_field(&self, field: &str) -> Result<Option<Value>, String> {
+        let document = read_document(&personal_path(&self.home))?.unwrap_or_default();
+        Ok(document.resolved().get_field(field).cloned())
+    }
+
     pub async fn write_field(
         &self,
         scope: SettingsScope,
