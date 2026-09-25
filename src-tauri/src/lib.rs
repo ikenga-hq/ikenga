@@ -68,6 +68,9 @@ mod viewer_server;
 // (WP-02) + the window registry / spawn-close-list commands (WP-03).
 #[cfg(feature = "desktop")]
 mod window;
+// WP-37: `#[ignore]`d Phase 5a migration rehearsal against a copy of app data.
+#[cfg(all(test, feature = "desktop"))]
+mod rehearsal_5a;
 
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
@@ -126,7 +129,8 @@ use commands::{
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
     secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_set, secrets_set_scoped, secrets_vault_status,
+    secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set, secrets_set_passphrase,
+    secrets_set_scoped, secrets_unlock, secrets_vault_status,
     set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_open_file,
     settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
     spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
@@ -329,25 +333,60 @@ pub fn run() {
                 .map_err(|e| format!("app_data_dir: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
 
-            match secrets::migrate::run(&data_dir) {
-                Ok(_) => {}
+            let secrets_ready = match app.state::<SecretsLock>().configure_data_dir(&data_dir) {
+                Ok(()) => true,
                 Err(error) => {
+                    log::error!("[secrets] unlock state configuration failed: {error}");
                     if let Err(mark_error) = app
                         .state::<SecretsLock>()
-                        .mark_unavailable(error.clone())
+                        .mark_unavailable(error)
                     {
                         log::error!("[secrets] unavailable state failed: {mark_error}");
                     }
-                    if let Err(invalidation_error) =
-                        commands::secrets::invalidate_env_vaults(app.handle())
-                    {
-                        log::error!(
-                            "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
-                        );
-                    }
-                    log::error!("[secrets] migration failed: {error}");
+                    false
                 }
+            };
+
+            if secrets_ready {
+                match secrets::migrate::run(&data_dir) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if let Err(mark_error) = app
+                            .state::<SecretsLock>()
+                            .mark_unavailable(error.clone())
+                        {
+                            log::error!("[secrets] unavailable state failed: {mark_error}");
+                        }
+                        if let Err(invalidation_error) =
+                            commands::secrets::invalidate_env_vaults(app.handle())
+                        {
+                            log::error!(
+                                "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
+                            );
+                        }
+                        log::error!("[secrets] migration failed: {error}");
+                    }
+                }
+            } else if let Err(invalidation_error) =
+                commands::secrets::invalidate_env_vaults(app.handle())
+            {
+                log::error!(
+                    "[secrets] env-vault invalidation after unlock setup failure failed: {invalidation_error}"
+                );
             }
+
+            let idle_lock = app.state::<SecretsLock>().inner().clone();
+            let idle_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if idle_lock.expire_if_idle() {
+                        if let Err(error) = commands::secrets::invalidate_env_vaults(&idle_app) {
+                            log::warn!("[secrets] idle env-vault invalidation failed: {error}");
+                        }
+                    }
+                }
+            });
 
             // User-configurable FS allowlist. Must be installed before the
             // first call to `commands::resolve_allowlisted` (which fs_*,
@@ -1116,6 +1155,10 @@ pub fn run() {
             secrets_delete,
             secrets_list_keys,
             secrets_vault_status,
+            secrets_set_passphrase,
+            secrets_unlock,
+            secrets_lock,
+            secrets_lock_state,
             // secrets — Phase 7 scoped variants
             secrets_get_scoped,
             secrets_set_scoped,
@@ -1305,6 +1348,12 @@ pub fn run() {
             // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
             // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                // WP-34: with a passphrase configured, the env-vault files
+                // (including the durable one) are plaintext only while
+                // unlocked — overwrite them and drop the DEK on exit, the
+                // same invalidation an explicit lock performs. No-op without
+                // a passphrase (WP-33 durable-file contract).
+                commands::secrets::wipe_env_vaults_on_exit(_app);
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]
                 {

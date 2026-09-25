@@ -42,19 +42,7 @@ function AboutPage() {
 	const matchingRelease = findReleaseByVersion(releases.data, updater.available?.version ?? '');
 
 	return (
-		<div className="mx-auto max-w-3xl space-y-5 p-6">
-			<header className="space-y-1">
-				<h1 className="font-display text-2xl font-semibold tracking-tight">About Ikenga</h1>
-				<p className="text-sm text-muted-foreground">
-					The shell itself — kernel, chrome, and bundled engines. Per-pkg versions and updates live
-					in{' '}
-					<a className="text-primary underline-offset-2 hover:underline" href="/packages">
-						/packages
-					</a>
-					.
-				</p>
-			</header>
-
+		<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
 			<SettingGroup title="Current build">
 				<HeaderStrip
 					currentVersion={currentVersion}
