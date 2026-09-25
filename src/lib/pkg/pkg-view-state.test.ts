@@ -4,8 +4,10 @@
 import { describe, expect, it } from 'vitest';
 import {
 	addedCapabilityLines,
+	blockedHeading,
 	blockedInfoFromNavigation,
 	blockedInfoFromViolation,
+	canAllowHost,
 	handshakeSteps,
 	isBlockingViolation,
 	itemDetailPath,
@@ -51,7 +53,7 @@ describe('isBlockingViolation', () => {
 		}
 	});
 
-	it('a script block before the view initialised blocks (its boot was stopped)', () => {
+	it('a script block inside the boot window blocks (its boot was stopped)', () => {
 		expect(
 			isBlockingViolation({ blockedURI: 'https://cdn.x/a.js', effectiveDirective: 'script-src' }, false)
 		).toBe(true);
@@ -112,7 +114,47 @@ describe('blockedInfoFromNavigation', () => {
 			host: 'fal.media',
 			target: 'https://fal.media/files/x',
 			scope: 'webview:allowed_origins',
+			origin: 'https://fal.media',
 		});
+	});
+});
+
+describe('canAllowHost', () => {
+	it('only a kernel webview origin block can be allowed', () => {
+		expect(
+			canAllowHost({
+				host: 'fal.media',
+				target: 'https://fal.media/x',
+				scope: 'webview:allowed_origins',
+				origin: 'https://fal.media',
+			})
+		).toBe(true);
+		expect(
+			canAllowHost({ host: 'fal.media', target: 'https://fal.media/x', scope: 'csp:frame-src' })
+		).toBe(false);
+	});
+});
+
+describe('blockedHeading', () => {
+	const csp = (blockedURI: string, effectiveDirective: string) =>
+		blockedHeading(blockedInfoFromViolation({ blockedURI, effectiveDirective }));
+
+	it('navigation blocks keep the design copy', () => {
+		expect(csp('https://fal.media/a', 'frame-src')).toBe('Blocked a navigation to fal.media');
+		expect(
+			blockedHeading({
+				host: 'fal.media',
+				target: 'https://fal.media/a',
+				scope: 'webview:allowed_origins',
+				origin: 'https://fal.media',
+			})
+		).toBe('Blocked a navigation to fal.media');
+	});
+
+	it('script blocks say script, and never "navigation to inline"', () => {
+		expect(csp('', 'script-src')).toBe('Blocked an inline script');
+		expect(csp('eval', 'script-src')).toBe('Blocked a script eval');
+		expect(csp('https://cdn.x/a.js', 'script-src-elem')).toBe('Blocked a script from cdn.x');
 	});
 });
 

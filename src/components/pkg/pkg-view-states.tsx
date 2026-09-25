@@ -15,15 +15,18 @@
 
 import { Check, Circle, CircleDot, Lock, Plug, ShieldAlert } from 'lucide-react';
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import { EmptyState, ErrorState, LoadingState, OfflineState } from '@/components/states';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import {
 	addedCapabilityLines,
+	blockedHeading,
+	canAllowHost,
 	handshakeSteps,
 	type PkgBlockedInfo,
 	type PkgBootPhase,
 } from '@/lib/pkg/pkg-view-state';
-import type { PkgTrustReview } from '@/lib/tauri-cmd';
+import { type PkgTrustReview, pkgWebviewAllowOrigin } from '@/lib/tauri-cmd';
 import { NgwaTrustSheet } from '@/shell/ngwa/ngwa-trust-sheet';
 
 const MONO_DETAIL: React.CSSProperties = {
@@ -118,7 +121,14 @@ export interface PkgConsentStateProps {
  *  capabilities the user has not approved (`pkg_trust_list_pending`).
  *  Inline in the pane — not a modal. One action: allow (→
  *  `pkg_trust_approve`, which re-registers the pkg). Declining is just not
- *  allowing; rejecting uninstalls, which stays in Ngwa. */
+ *  allowing; rejecting uninstalls, which stays in Ngwa.
+ *
+ *  Accepted deviation from the design (WP-45 review F2 — carry into the PR
+ *  call-outs + 05 WP-45 DoD note): the design draws a consent *bar* over a
+ *  still-running view with Allow once / Always for this project / Deny. Here
+ *  the kernel has parked the pkg (no routes registered, nothing running), so
+ *  the state is full-pane with the single Allow WP-43 permits; reject stays
+ *  in Ngwa. Callers must ignore Allow while `busy` (review F3). */
 export function PkgConsentState({ pkgId, review, onAllow, busy, error }: PkgConsentStateProps) {
 	const lines = addedCapabilityLines(review.old_capabilities, review.new_capabilities);
 	return (
@@ -183,7 +193,11 @@ export interface PkgSidecarDownStripProps {
 }
 
 /** "View fine, sidecar stopped: strip with Restart." OfflineState (warn
- *  tone, not error) laid out as a one-line strip above the still-live view. */
+ *  tone, not error) laid out as a one-line strip above the still-live view.
+ *  The icon is sized down to the strip (`[&>svg]:size-4` beats
+ *  OfflineState's own `size-7`). Deviations from the design strip: its "Log"
+ *  link is the ⋯ menu's Report violation log / Ngwa Health, and there is no
+ *  dismiss × — the strip clears itself when the sidecar comes back. */
 export function PkgSidecarDownStrip({ reason, onRestart, busy }: PkgSidecarDownStripProps) {
 	return (
 		<OfflineState
@@ -192,7 +206,7 @@ export function PkgSidecarDownStrip({ reason, onRestart, busy }: PkgSidecarDownS
 			heading="Sidecar stopped"
 			body={`${reason} — the view still works; anything that needs the sidecar does not.`}
 			action={{ label: busy ? 'Restarting…' : 'Restart', onClick: onRestart }}
-			className="min-h-0 shrink-0 flex-row flex-wrap justify-start gap-x-3 gap-y-1 border-b px-3 py-1.5 text-left [&>div]:max-w-none"
+			className="min-h-0 shrink-0 flex-row flex-wrap justify-start gap-x-3 gap-y-1 border-b px-3 py-1.5 text-left [&>div]:max-w-none [&>svg]:size-4"
 		/>
 	);
 }
@@ -202,22 +216,32 @@ export function PkgSidecarDownStrip({ reason, onRestart, busy }: PkgSidecarDownS
 export interface PkgBlockedStateProps {
 	pkgId: string;
 	blocked: PkgBlockedInfo;
-	/** Opens the trust review sheet (below) with only this line to grant. */
-	onAllowHost: () => void;
+	/** Webview blocks: opens the trust review sheet (below) with only this
+	 *  origin to grant. */
+	onAllowHost?: () => void;
+	/** Iframe CSP blocks: "Allow host…" cannot lift a policy the package
+	 *  wrote itself, so the state's one action is Reload view instead. */
+	onReload?: () => void;
 }
 
-export function PkgBlockedState({ pkgId, blocked, onAllowHost }: PkgBlockedStateProps) {
-	const isWebview = blocked.scope === 'webview:allowed_origins';
+export function PkgBlockedState({ pkgId, blocked, onAllowHost, onReload }: PkgBlockedStateProps) {
+	const allowable = canAllowHost(blocked);
+	const action =
+		allowable && onAllowHost
+			? { label: 'Allow host…', onClick: onAllowHost }
+			: onReload
+				? { label: 'Reload view', onClick: onReload }
+				: undefined;
 	return (
 		<ErrorState
 			data-state="pkg-blocked"
 			fill
 			icon={Lock}
-			heading={`Blocked a navigation to ${blocked.host}`}
+			heading={blockedHeading(blocked)}
 			body={
 				<div className="flex flex-col gap-2">
 					<span>
-						{isWebview ? (
+						{allowable ? (
 							<>
 								This host is not in the package&rsquo;s{' '}
 								<code>capabilities.webview.allowed_origins</code>. The kernel stopped the load
@@ -225,8 +249,10 @@ export function PkgBlockedState({ pkgId, blocked, onAllowHost }: PkgBlockedState
 							</>
 						) : (
 							<>
-								The package&rsquo;s content security policy (<code>{blocked.scope.slice(4)}</code>)
-								stopped this load.
+								The package&rsquo;s own content security policy (
+								<code>{blocked.scope.replace(/^csp:/, '')}</code>) stopped this load. Allow host is
+								not available here: the shell adds no policy of its own, so only the package
+								author can allow this source.
 							</>
 						)}
 					</span>
@@ -235,15 +261,19 @@ export function PkgBlockedState({ pkgId, blocked, onAllowHost }: PkgBlockedState
 					</div>
 				</div>
 			}
-			action={{ label: 'Allow host…', onClick: onAllowHost }}
+			action={action}
 		/>
 	);
 }
 
 /** "Allow host…" → the existing Ngwa trust review sheet in `violation` mode,
- *  scoped to the one blocked line. Mounted only while open so the Ngwa
- *  snapshot query (a cold scan can take a while) never runs for a pane that
- *  is simply showing its view. */
+ *  scoped to the one blocked origin: its grant is `pkg_webview_allow_origin`
+ *  (additive, persisted), not the pkg-wide trust grant, and it hides Revoke
+ *  trust. Mounted only while open so the Ngwa snapshot query (a cold scan
+ *  can take a while) never runs for a pane that is simply showing its view.
+ *  Portaled to `document.body` so a pooled iframe surface's stacking context
+ *  (z-30, overflow hidden) can't cap or clip it (review F7). Renders nothing
+ *  for a block that cannot be allowed. */
 export function PkgBlockedTrustSheet({
 	pkgId,
 	blocked,
@@ -255,16 +285,18 @@ export function PkgBlockedTrustSheet({
 	blocked: PkgBlockedInfo;
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
+	/** Called once the origin is granted — re-attempt the blocked load. */
 	onApproved?: () => void;
 }) {
-	if (!open) return null;
-	return (
+	if (!open || !canAllowHost(blocked)) return null;
+	return createPortal(
 		<BlockedTrustSheetInner
 			pkgId={pkgId}
 			blocked={blocked}
 			onOpenChange={onOpenChange}
 			onApproved={onApproved}
-		/>
+		/>,
+		document.body
 	);
 }
 
@@ -281,6 +313,7 @@ function BlockedTrustSheetInner({
 }) {
 	const { items } = useNgwaSnapshot();
 	const item = items.find((i) => i.id === pkgId) ?? null;
+	const origin = blocked.origin ?? blocked.target;
 	return (
 		<NgwaTrustSheet
 			open
@@ -288,7 +321,14 @@ function BlockedTrustSheetInner({
 			item={item}
 			mode="violation"
 			violationScopeKind={blocked.scope}
-			violationTarget={blocked.host}
+			violationTarget={origin}
+			violationGrant={{
+				label: `Allow ${blocked.host}`,
+				pendingLabel: 'Allowing…',
+				run: async () => {
+					await pkgWebviewAllowOrigin(pkgId, origin);
+				},
+			}}
 			onApproved={onApproved}
 		/>
 	);

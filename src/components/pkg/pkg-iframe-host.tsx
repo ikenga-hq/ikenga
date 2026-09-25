@@ -40,6 +40,7 @@ import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePkgLifecycle } from '@/lib/pkgs/lifecycle';
 import {
 	blockedInfoFromViolation,
+	HANDSHAKE_AFTER_LOAD_GRACE_MS,
 	HANDSHAKE_OVERLAY_TIMEOUT_MS,
 	isBlockingViolation,
 	type PkgBlockedInfo,
@@ -100,12 +101,10 @@ import { usePaneScope } from '@/shell/panes/pane-scope';
 import { useTerminalStore } from '@/terminal/session-store';
 import {
 	PkgBlockedState,
-	PkgBlockedTrustSheet,
 	PkgConsentState,
 	PkgCrashedState,
 	PkgLoadingState,
 	PkgSidecarDownStrip,
-	useAllowHostSheet,
 } from './pkg-view-states';
 
 // Tauri event payload emitted by `Kernel::reload_pkg`. The FE only cares about
@@ -1200,9 +1199,13 @@ export function PkgIframeHostInner({
 	const [consentBusy, setConsentBusy] = useState(false);
 	const [consentError, setConsentError] = useState<string | null>(null);
 	const [sidecarRestarting, setSidecarRestarting] = useState(false);
-	const allowHost = useAllowHostSheet();
-	// Mirror of `handshakeDone` readable from the CSP listener without
-	// re-subscribing it on every flip.
+	// Ref guard so a double click on Allow can't send two approvals while
+	// the first is in flight (state lags a render behind).
+	const consentBusyRef = useRef(false);
+	// "Boot window closed" — the view initialised OR the loading overlay
+	// stepped aside (load grace / timeout). Readable from the CSP listener
+	// without re-subscribing it on every flip; a script violation only takes
+	// the view down while this is false (`isBlockingViolation`).
 	const handshakeDoneRef = useRef(false);
 	// Supervised-sidecar status (`pkg://lifecycle`, emitted by
 	// `pkg/lifecycle.rs`). Pkgs with no long-lived sidecar never leave
@@ -1377,6 +1380,7 @@ export function PkgIframeHostInner({
 		setHandshakeDone(false);
 		setHandshakeTimedOut(false);
 		handshakeDoneRef.current = false;
+		consentBusyRef.current = false;
 		(async () => {
 			try {
 				const handle = await pkgContentHtml(pkgId, source);
@@ -1636,11 +1640,29 @@ export function PkgIframeHostInner({
 	}, [srcDoc, pkgId]);
 
 	// Step 2c (WP-45, `pkg-loading`): let the handshake overlay step aside
-	// if the view never answers `ui/initialize`.
+	// if the view never answers `ui/initialize` — after a short grace once
+	// the iframe has loaded (a view that renders without the AppBridge is
+	// not held behind an opaque, input-blocking overlay), and in any case
+	// after HANDSHAKE_OVERLAY_TIMEOUT_MS. Stepping aside also closes the
+	// boot window for the CSP listener.
 	useEffect(() => {
 		if (!srcDoc || handshakeDone) return;
-		const t = setTimeout(() => setHandshakeTimedOut(true), HANDSHAKE_OVERLAY_TIMEOUT_MS);
-		return () => clearTimeout(t);
+		const stepAside = () => {
+			handshakeDoneRef.current = true;
+			setHandshakeTimedOut(true);
+		};
+		const t = setTimeout(stepAside, HANDSHAKE_OVERLAY_TIMEOUT_MS);
+		let grace: ReturnType<typeof setTimeout> | null = null;
+		const iframe = iframeRef.current;
+		const onLoad = () => {
+			if (grace === null) grace = setTimeout(stepAside, HANDSHAKE_AFTER_LOAD_GRACE_MS);
+		};
+		iframe?.addEventListener('load', onLoad);
+		return () => {
+			clearTimeout(t);
+			if (grace !== null) clearTimeout(grace);
+			iframe?.removeEventListener('load', onLoad);
+		};
 	}, [srcDoc, handshakeDone]);
 
 	// Step 2d (WP-45, `pkg-consent`): a load failure may be the kernel
@@ -1796,12 +1818,17 @@ export function PkgIframeHostInner({
 	}, [tokenForRevoke]);
 
 	const onAllowConsent = () => {
+		if (consentBusyRef.current) return;
+		consentBusyRef.current = true;
 		setConsentBusy(true);
 		setConsentError(null);
 		pkgTrustApprove(pkgId)
 			.then(reloadView)
 			.catch((e) => setConsentError((e as Error).message ?? String(e)))
-			.finally(() => setConsentBusy(false));
+			.finally(() => {
+				consentBusyRef.current = false;
+				setConsentBusy(false);
+			});
 	};
 
 	const onRestartSidecar = () => {
@@ -1824,18 +1851,12 @@ export function PkgIframeHostInner({
 		);
 	}
 
+	// Iframe blocks are CSP violations from the package's own policy (the
+	// shell injects none), which no host-side grant can lift — so no Allow
+	// host… / trust sheet here; the state's action is Reload view.
 	if (blocked) {
 		return (
-			<>
-				<PkgBlockedState pkgId={pkgId} blocked={blocked} onAllowHost={allowHost.openSheet} />
-				<PkgBlockedTrustSheet
-					pkgId={pkgId}
-					blocked={blocked}
-					open={allowHost.open}
-					onOpenChange={allowHost.setOpen}
-					onApproved={reloadView}
-				/>
-			</>
+			<PkgBlockedState pkgId={pkgId} blocked={blocked} onReload={reloadView} />
 		);
 	}
 

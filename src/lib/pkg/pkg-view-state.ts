@@ -63,6 +63,12 @@ export function handshakeSteps(
  *  exactly as it did before WP-45 — the overlay just stops covering it. */
 export const HANDSHAKE_OVERLAY_TIMEOUT_MS = 5000;
 
+/** Grace after the iframe's `load` before the overlay steps aside anyway. A
+ *  bridge view answers `ui/initialize` well inside it; a view that renders
+ *  without the AppBridge is no longer held behind the overlay for the full
+ *  HANDSHAKE_OVERLAY_TIMEOUT_MS (WP-45 review F5). */
+export const HANDSHAKE_AFTER_LOAD_GRACE_MS = 600;
+
 // ─── pkg-consent: parked trust review ────────────────────────────────────────
 
 /** The lines the inline consent prompt lists: every leaf of the pending
@@ -111,6 +117,38 @@ export interface PkgBlockedInfo {
 	 *  for kernel-side navigation blocks. Fed to the trust sheet's
 	 *  violation `scope`. */
 	scope: string;
+	/** Webview blocks only: the serialized origin the kernel rejected — what
+	 *  "Allow host…" grants (`pkg_webview_allow_origin`). */
+	origin?: string;
+}
+
+/** Can "Allow host…" actually lift this block? Only a kernel-side webview
+ *  origin rejection: the user can grant the origin additively. An iframe CSP
+ *  block comes from the package's own policy (the shell injects none), which
+ *  no host-side grant can override. */
+export function canAllowHost(info: PkgBlockedInfo): boolean {
+	return info.scope === WEBVIEW_ORIGIN_SCOPE && Boolean(info.origin);
+}
+
+const WEBVIEW_ORIGIN_SCOPE = 'webview:allowed_origins';
+
+const SCRIPT_DIRECTIVES = new Set(['script-src', 'script-src-elem', 'script-src-attr']);
+
+/** Heading for the `pkg-blocked` state. "Blocked a navigation to …" only
+ *  when a navigation was what got stopped (design copy); script and other
+ *  resource blocks say what they were, and a keyword target (`inline`,
+ *  `eval`) is not dressed up as a host (WP-45 review F4). */
+export function blockedHeading(info: PkgBlockedInfo): string {
+	if (info.scope === WEBVIEW_ORIGIN_SCOPE) return `Blocked a navigation to ${info.host}`;
+	const directive = info.scope.startsWith('csp:') ? info.scope.slice(4) : info.scope;
+	const isKeyword = info.target === 'inline' || info.target === 'eval';
+	if (NAVIGATION_DIRECTIVES.has(directive)) return `Blocked a navigation to ${info.host}`;
+	if (SCRIPT_DIRECTIVES.has(directive) || directive === 'default-src') {
+		if (info.target === 'inline') return 'Blocked an inline script';
+		if (info.target === 'eval') return 'Blocked a script eval';
+		return `Blocked a script from ${info.host}`;
+	}
+	return isKeyword ? `Blocked ${info.target} content` : `Blocked a load from ${info.host}`;
 }
 
 /** Directives whose violation means a navigation / frame load was stopped —
@@ -123,13 +161,18 @@ const NAVIGATION_DIRECTIVES = new Set(['frame-src', 'child-src', 'form-action', 
 const BOOT_DIRECTIVES = new Set(['script-src', 'script-src-elem', 'default-src']);
 
 /** Should this violation replace the view with `pkg-blocked`? Yes for any
- *  navigation directive; yes for a script block before the view initialised
- *  (its boot was stopped); otherwise no — a blocked image, font or fetch
- *  never took a view down before WP-45 and still doesn't. The host logs it
- *  and the view keeps running. */
-export function isBlockingViolation(v: CspViolationLike, viewInitialized: boolean): boolean {
+ *  navigation directive; yes for a script block inside the boot window (its
+ *  boot was stopped); otherwise no — a blocked image, font or fetch never
+ *  took a view down before WP-45 and still doesn't. The host logs it and the
+ *  view keeps running.
+ *
+ *  `bootWindowClosed` is true once the view initialised OR the loading
+ *  overlay stepped aside (load grace / timeout). A view that never sends
+ *  `ui/initialize` must not stay "booting" forever, or any later script
+ *  violation would take a working view down (WP-45 review F4). */
+export function isBlockingViolation(v: CspViolationLike, bootWindowClosed: boolean): boolean {
 	if (NAVIGATION_DIRECTIVES.has(v.effectiveDirective)) return true;
-	return !viewInitialized && BOOT_DIRECTIVES.has(v.effectiveDirective);
+	return !bootWindowClosed && BOOT_DIRECTIVES.has(v.effectiveDirective);
 }
 
 export function blockedInfoFromViolation(v: CspViolationLike): PkgBlockedInfo {
@@ -149,7 +192,12 @@ export interface NavigationBlockedEvent {
 export const NAVIGATION_BLOCKED_EVENT = 'pkg://navigation-blocked';
 
 export function blockedInfoFromNavigation(ev: NavigationBlockedEvent): PkgBlockedInfo {
-	return { host: hostOf(ev.url || ev.origin), target: ev.url, scope: 'webview:allowed_origins' };
+	return {
+		host: hostOf(ev.url || ev.origin),
+		target: ev.url || ev.origin,
+		scope: WEBVIEW_ORIGIN_SCOPE,
+		origin: ev.origin,
+	};
 }
 
 function hostOf(target: string): string {

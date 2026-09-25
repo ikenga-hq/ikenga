@@ -16,6 +16,10 @@ vi.mock('@/shell/ngwa/ngwa-trust-sheet', () => ({
 		return <div data-testid="trust-sheet" />;
 	},
 }));
+const allowOrigin = vi.fn(async (_pkgId: string, origin: string) => origin);
+vi.mock('@/lib/tauri-cmd', () => ({
+	pkgWebviewAllowOrigin: (pkgId: string, origin: string) => allowOrigin(pkgId, origin),
+}));
 vi.mock('@/lib/ngwa/use-ngwa-snapshot', () => ({
 	useNgwaSnapshot: () => ({ items: [{ id: 'com.ikenga.studio', name: 'studio' }] }),
 }));
@@ -31,6 +35,12 @@ import {
 
 const PKG = 'com.ikenga.studio';
 const BLOCKED = { host: 'fal.media', target: 'https://fal.media/files/x', scope: 'csp:frame-src' };
+const WEBVIEW_BLOCKED = {
+	host: 'fal.media',
+	target: 'https://fal.media/files/x',
+	scope: 'webview:allowed_origins',
+	origin: 'https://fal.media',
+};
 
 function root(container: HTMLElement, state: string) {
 	const el = container.querySelector(`[data-state="${state}"]`);
@@ -125,13 +135,14 @@ describe('pkg-sidecar-down', () => {
 });
 
 describe('pkg-blocked', () => {
-	it('names the blocked host and offers one Allow host… action', () => {
+	it('webview block: names the host, cites allowed_origins, one Allow host… action', () => {
 		const onAllowHost = vi.fn();
 		const { container } = render(
-			<PkgBlockedState pkgId={PKG} blocked={BLOCKED} onAllowHost={onAllowHost} />
+			<PkgBlockedState pkgId={PKG} blocked={WEBVIEW_BLOCKED} onAllowHost={onAllowHost} />
 		);
 		const el = root(container, 'pkg-blocked');
 		expect(el.textContent).toContain('Blocked a navigation to fal.media');
+		expect(el.textContent).toContain('capabilities.webview.allowed_origins');
 		const buttons = el.querySelectorAll('button');
 		expect(buttons).toHaveLength(1);
 		expect(buttons[0].textContent).toBe('Allow host…');
@@ -139,31 +150,71 @@ describe('pkg-blocked', () => {
 		expect(onAllowHost).toHaveBeenCalledTimes(1);
 	});
 
-	it('webview blocks cite allowed_origins', () => {
+	it('iframe CSP block: no Allow host (no grant can lift it), Reload view instead', () => {
+		const onAllowHost = vi.fn();
+		const onReload = vi.fn();
 		const { container } = render(
 			<PkgBlockedState
 				pkgId={PKG}
-				blocked={{ ...BLOCKED, scope: 'webview:allowed_origins' }}
+				blocked={BLOCKED}
+				onAllowHost={onAllowHost}
+				onReload={onReload}
+			/>
+		);
+		const el = root(container, 'pkg-blocked');
+		expect(el.textContent).toContain('Allow host is not available');
+		const buttons = el.querySelectorAll('button');
+		expect(buttons).toHaveLength(1);
+		expect(buttons[0].textContent).toBe('Reload view');
+		fireEvent.click(buttons[0]);
+		expect(onReload).toHaveBeenCalledTimes(1);
+		expect(onAllowHost).not.toHaveBeenCalled();
+	});
+
+	it('an inline script block is not called a navigation', () => {
+		const { container } = render(
+			<PkgBlockedState
+				pkgId={PKG}
+				blocked={{ host: 'inline', target: 'inline', scope: 'csp:script-src' }}
 				onAllowHost={() => {}}
 			/>
 		);
-		expect(root(container, 'pkg-blocked').textContent).toContain(
-			'capabilities.webview.allowed_origins'
-		);
+		const text = root(container, 'pkg-blocked').textContent ?? '';
+		expect(text).toContain('Blocked an inline script');
+		expect(text).not.toContain('navigation to inline');
 	});
 
-	it('Allow host… opens the trust sheet in violation mode with only this host', () => {
+	it('Allow host… opens a scoped violation sheet that grants only this origin', async () => {
 		trustSheetProps.mockClear();
+		allowOrigin.mockClear();
 		const { queryByTestId, rerender } = render(
-			<PkgBlockedTrustSheet pkgId={PKG} blocked={BLOCKED} open={false} onOpenChange={() => {}} />
+			<PkgBlockedTrustSheet
+				pkgId={PKG}
+				blocked={WEBVIEW_BLOCKED}
+				open={false}
+				onOpenChange={() => {}}
+			/>
 		);
 		expect(queryByTestId('trust-sheet')).toBeNull();
-		rerender(<PkgBlockedTrustSheet pkgId={PKG} blocked={BLOCKED} open onOpenChange={() => {}} />);
-		expect(queryByTestId('trust-sheet')).not.toBeNull();
+		rerender(
+			<PkgBlockedTrustSheet pkgId={PKG} blocked={WEBVIEW_BLOCKED} open onOpenChange={() => {}} />
+		);
+		// Portaled to document.body, out of any pooled-surface stacking context.
+		expect(document.body.querySelector('[data-testid="trust-sheet"]')).not.toBeNull();
 		const props = trustSheetProps.mock.calls.at(-1)?.[0] as Record<string, unknown>;
 		expect(props.mode).toBe('violation');
-		expect(props.violationTarget).toBe('fal.media');
-		expect(props.violationScopeKind).toBe('csp:frame-src');
+		expect(props.violationTarget).toBe('https://fal.media');
+		expect(props.violationScopeKind).toBe('webview:allowed_origins');
 		expect((props.item as { id: string }).id).toBe(PKG);
+		const grant = props.violationGrant as { run: () => Promise<void> };
+		await grant.run();
+		expect(allowOrigin).toHaveBeenCalledWith(PKG, 'https://fal.media');
+	});
+
+	it('never mounts the sheet for a CSP block', () => {
+		const { queryByTestId } = render(
+			<PkgBlockedTrustSheet pkgId={PKG} blocked={BLOCKED} open onOpenChange={() => {}} />
+		);
+		expect(queryByTestId('trust-sheet')).toBeNull();
 	});
 });

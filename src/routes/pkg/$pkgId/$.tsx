@@ -18,7 +18,7 @@
 // only path for it too.)
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { ActionBar } from '@/components/pkg/actions/action-bar';
 import { PkgIframeHost } from '@/components/pkg/pkg-iframe-host';
@@ -70,6 +70,9 @@ function PkgRouteCatchAll() {
 	// (now re-registered) routes.
 	const [resolveKey, setResolveKey] = useState(0);
 	const [consentBusy, setConsentBusy] = useState(false);
+	// Ref guard: a second click while the approval is in flight is ignored
+	// (state lags a render behind; each approve re-registers the pkg).
+	const consentBusyRef = useRef(false);
 	const [consentError, setConsentError] = useState<string | null>(null);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: resolveKey is a trigger-only dep — bumping it re-resolves after a consent approval.
@@ -160,12 +163,17 @@ function PkgRouteCatchAll() {
 				busy={consentBusy}
 				error={consentError}
 				onAllow={() => {
+					if (consentBusyRef.current) return;
+					consentBusyRef.current = true;
 					setConsentBusy(true);
 					setConsentError(null);
 					pkgTrustApprove(pkgId)
 						.then(() => setResolveKey((k) => k + 1))
 						.catch((e) => setConsentError((e as Error).message ?? String(e)))
-						.finally(() => setConsentBusy(false));
+						.finally(() => {
+							consentBusyRef.current = false;
+							setConsentBusy(false);
+						});
 				}}
 			/>
 		);

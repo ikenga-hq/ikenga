@@ -2,15 +2,20 @@
 // `designs/pane-chrome.html?state=pkg-view`, `pkgDotsMenu()`).
 //
 // Design order: Reload view · Open devtools · View permissions · Package
-// settings · Restart sidecar ─ Unpin · Report violation log. Every item is
-// bound to an action that already exists, or omitted:
+// settings · Restart sidecar ─ Unpin · Report violation log. The branch
+// renders first in the menu (above Split right / Split down / Copy path),
+// ending in its own separator. Every item is bound to an action that already
+// exists, or omitted:
 //
 //   Reload view           → the pane's own refresh (`refreshPane` /
 //                           the merged row's `onRefresh`), which re-runs the
 //                           iframe host's fetch + handshake.
-//   Open devtools         → OMITTED. The only devtools opener is the iyke
+//   Open devtools         → OMITTED — accepted deviation from D-08 (the
+//                           01 §Verification "⋯ menu is complete" line must
+//                           carry it). The only devtools opener is the iyke
 //                           HTTP bridge (`POST /iyke/devtools`, debug builds
-//                           only, primary window); there is no Tauri command.
+//                           only, primary window); there is no Tauri command,
+//                           and adding one is a needs-decision, not WP-45.
 //   View permissions      → Ngwa item detail (`/ngwa/item/<pkgId>`) in a new
 //   Package settings        tab of this pane. It owns both the Permissions and
 //                           Settings tabs; it has no tab deep-link yet, so
@@ -21,9 +26,14 @@
 //                           rail pin targets this pkg.
 //   Report violation log  → Ngwa Health violations panel
 //                           (`/ngwa/health?section=violations`) in a new tab.
+//                           Also where the sidecar-down strip's design "Log"
+//                           link lands (the strip keeps one action: Restart).
+//   Keep blocking         → shown only while a webview pane is parked on
+//                           `pkg-blocked` (`pkg-blocked-store`): restores the
+//                           native surface on its previous page.
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Bolt, PinOff, RefreshCw, Settings, Shield } from 'lucide-react';
+import { AlertTriangle, Ban, Bolt, PinOff, RefreshCw, Settings, Shield } from 'lucide-react';
 import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -33,6 +43,7 @@ import {
 	pkgIdFromRoutePath,
 	VIOLATION_LOG_PATH,
 } from '@/lib/pkg/pkg-view-state';
+import { useKeepBlocking } from '@/lib/pkg/pkg-blocked-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { pkgKernelStatus, pkgSupervisorRestart } from '@/lib/tauri-cmd';
 
@@ -78,12 +89,18 @@ export function PkgPaneMenuItems({
 		)
 	);
 	const removePin = usePinsStore((s) => s.removePin);
+	const keepBlocking = useKeepBlocking(pkgId, paneId);
 
 	const openRoute = (path: string) => addTab(paneId, { kind: 'route', path });
 
 	return (
 		<>
-			<DropdownMenuSeparator />
+			{keepBlocking && (
+				<DropdownMenuItem onSelect={keepBlocking} data-action="pkg.keep-blocking">
+					<Ban className="h-3.5 w-3.5" />
+					Keep blocking
+				</DropdownMenuItem>
+			)}
 			<DropdownMenuItem onSelect={onReload} data-action="pkg.reload-view">
 				<RefreshCw className="h-3.5 w-3.5" />
 				Reload view
@@ -134,6 +151,7 @@ export function PkgPaneMenuItems({
 				<AlertTriangle className="h-3.5 w-3.5" />
 				Report violation log
 			</DropdownMenuItem>
+			<DropdownMenuSeparator />
 		</>
 	);
 }

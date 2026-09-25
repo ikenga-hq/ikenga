@@ -149,6 +149,8 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 							<DropdownMenuSeparator />
 						</>
 					)}
+					{/* WP-45: the pkg branch leads, per the design's pkgDotsMenu() order. */}
+					{pkgId && <PkgPaneMenuItems paneId={paneId} pkgId={pkgId} onReload={reload} />}
 					<DropdownMenuItem
 						disabled={splitDisabled}
 						title={splitTitle}
@@ -177,7 +179,6 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 							</DropdownMenuItem>
 						</>
 					)}
-					{pkgId && <PkgPaneMenuItems paneId={paneId} pkgId={pkgId} onReload={reload} />}
 					<DropdownMenuSeparator />
 					<DropdownMenuItem
 						disabled={closeDisabled}

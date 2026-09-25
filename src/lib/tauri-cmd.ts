@@ -3178,6 +3178,13 @@ export async function pkgWebviewNavigate(
 	return invoke('pkg_webview_navigate', { pkgId, paneId, url });
 }
 
+/** WP-45 "Allow host…": grant this pkg's child webviews one extra origin
+ *  beyond its declared `capabilities.webview.allowed_origins` (additive,
+ *  persisted). Accepts a full URL; resolves to the normalized origin. */
+export async function pkgWebviewAllowOrigin(pkgId: string, origin: string): Promise<string> {
+	return invoke('pkg_webview_allow_origin', { pkgId, origin });
+}
+
 export async function pkgWebviewClearSession(pkgId: string, paneId: string): Promise<void> {
 	return invoke('pkg_webview_clear_session', { pkgId, paneId });
 }
