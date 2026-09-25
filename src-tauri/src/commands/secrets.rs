@@ -36,7 +36,7 @@ use zeroize::Zeroizing;
 
 use crate::secrets::{
     index::{
-        validate_key, validate_legacy_name, validate_scope_id, INDEX_FILENAME,
+        validate_key, validate_legacy_name, validate_scope_id, SecretIndex, INDEX_FILENAME,
     },
     EncryptedStore, KeyringStore, LockState, SecretsStore, SharedSecretStore,
     SharedSecretStoreSlot, StoreError, UnavailableSecretStore, UnlockState,
@@ -406,6 +406,21 @@ pub async fn secrets_list_keys(
     .await
     .map_err(|error| format!("join: {error}"))?
     .map_err(|error| error.to_string())
+}
+
+/// Names only, straight from `secrets-index.json` — never touches the
+/// Stronghold store, so it works whether or not the vault is unlocked. Added
+/// for WP-43's restore wizard, which needs to say which current keys a
+/// restore's vault merge would touch without asking the user to unlock the
+/// vault just to preview that list. No value is ever read or returned.
+#[tauri::command]
+pub async fn secrets_index_names(app: AppHandle) -> Result<Vec<String>, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("app_data_dir: {error}"))?;
+    let index = SecretIndex::load(data_dir.join(INDEX_FILENAME))?;
+    Ok(index.names())
 }
 
 pub use crate::secrets_env::VaultStatus;
