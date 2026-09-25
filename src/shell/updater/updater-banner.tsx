@@ -24,14 +24,10 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { markPendingRestart } from '@/lib/updater/post-restart';
-import { progressPct } from '@/lib/updater/updater-store';
+import { plural, progressPct } from '@/lib/updater/updater-store';
 import { useLiveSessionCount } from '@/lib/updater/restart-sessions';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { useUpdaterSnooze } from '@/lib/updater/snooze';
-
-function plural(n: number, one: string, many = `${one}s`): string {
-	return `${n} ${n === 1 ? one : many}`;
-}
 
 export function UpdaterBanner() {
 	const autoCheck = useShellStore((s) => s.updatesAutoCheck);

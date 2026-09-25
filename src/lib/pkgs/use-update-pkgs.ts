@@ -11,7 +11,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { fetchPkgDetail, resolveInstallPlan, type PkgDetail } from '@/lib/registry/client';
 import { registryKeys, useRegistryIndex } from '@/lib/registry/use-registry';
-import { pkgInstallFromRegistry } from '@/lib/tauri-cmd';
+import { pkgInstallFromRegistry, pkgTrustListPending, type PkgTrustReview } from '@/lib/tauri-cmd';
 import type { PkgRowV2 } from './use-derived';
 
 export interface UpdateProgress {
@@ -42,6 +42,16 @@ export interface UpdatePkgsResult {
 	 *  to the user (they used to be swallowed entirely, which looked like
 	 *  "progress bar ran, nothing happened"). */
 	failed: UpdateFailure[];
+	/**
+	 * Pkgs that installed but the kernel parked out of the registry replay
+	 * because the new version's manifest declares capabilities/permissions
+	 * beyond the last-approved snapshot (`pkg_trust_list_pending` —
+	 * WP-41-F1). These are on disk but not running until reviewed; treat
+	 * them as "needs approval", not "updated". Empty on any batch that
+	 * didn't trigger a capability diff — existing callers that ignore this
+	 * field see unchanged behavior.
+	 */
+	needsApproval: PkgTrustReview[];
 }
 
 export function useUpdatePkgs() {
@@ -94,7 +104,26 @@ export function useUpdatePkgs() {
 				}
 			}
 			onProgress?.({ done: done + failed.length, total: targets.length, current: '' });
-			return { updated: done, failed };
+
+			// A pkg that installed but requested new capabilities lands parked,
+			// not running — cross-reference against the boot-time capability-diff
+			// review list so the caller can show "needs approval" instead of a
+			// false "updated" (WP-41-F1). Best-effort: if the pending scan itself
+			// fails, don't fail the whole batch result over it.
+			let needsApproval: PkgTrustReview[] = [];
+			if (done > 0) {
+				try {
+					const pending = await pkgTrustListPending();
+					const updatedIds = new Set(
+						targets.filter((row) => !failed.some((f) => f.id === row.id)).map((row) => row.id)
+					);
+					needsApproval = pending.filter((r) => updatedIds.has(r.pkg_id));
+				} catch {
+					needsApproval = [];
+				}
+			}
+
+			return { updated: done, failed, needsApproval };
 		},
 		onSettled: () => {
 			// Settled, not success: even a batch that ends with failures may have

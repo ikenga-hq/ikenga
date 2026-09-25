@@ -22,11 +22,8 @@ import { Button } from '@/components/ui/button';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
+import { plural } from '@/lib/updater/updater-store';
 import { useShellStore } from '@/lib/shell/shell-store';
-
-function plural(n: number, one: string, many = `${one}s`): string {
-	return `${n} ${n === 1 ? one : many}`;
-}
 
 export function PkgAutoUpdater() {
 	const autoCheck = useShellStore((s) => s.updatesAutoCheck);

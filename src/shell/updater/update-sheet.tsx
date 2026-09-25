@@ -15,7 +15,7 @@
 // writes before relaunching (`src/lib/updater/post-restart.ts`).
 
 import { useEffect, useState } from 'react';
-import { AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ShieldAlert } from 'lucide-react';
 import { Markdown } from '@/components/markdown';
 import { Button } from '@/components/ui/button';
 import {
@@ -27,19 +27,17 @@ import {
 	SheetTitle,
 } from '@/components/ui/sheet';
 import { cn } from '@/components/ui/utils';
+import { TrustReviewModal } from '@/components/pkg/trust-review-modal';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
-import { progressPct } from '@/lib/updater/updater-store';
+import { plural, progressPct } from '@/lib/updater/updater-store';
 import { markPendingRestart } from '@/lib/updater/post-restart';
 import { useLiveSessionCount } from '@/lib/updater/restart-sessions';
 import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { useUpdater } from '@/lib/updater/use-updater';
 import { useGitHubReleases, findReleaseByVersion } from '@/lib/updater/use-github-releases';
+import type { PkgTrustReview } from '@/lib/tauri-cmd';
 import { RestartWarning } from './restart-warning';
-
-function plural(n: number, one: string, many = `${one}s`): string {
-	return `${n} ${n === 1 ? one : many}`;
-}
 
 export function UpdateSheet() {
 	const open = useUpdateSheetStore((s) => s.open);
@@ -134,6 +132,9 @@ function ShellUpdatePanel() {
 					>
 						Restart now
 					</Button>
+					<Button variant="outline" onClick={() => useUpdateSheetStore.getState().close()}>
+						Later
+					</Button>
 				</SheetFooter>
 			</div>
 		);
@@ -212,12 +213,22 @@ function PkgUpdatePanel() {
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [failures, setFailures] = useState<UpdateFailure[]>([]);
 	const [doneIds, setDoneIds] = useState<Set<string>>(new Set());
+	// Installed but parked by the kernel pending capability review
+	// (pkg_trust_list_pending) — a permission diff stop, not a success
+	// (WP-41-F1). Reviewing (or rejecting) one clears it from this list.
+	const [needsApproval, setNeedsApproval] = useState<PkgTrustReview[]>([]);
+	const [reviewPkgId, setReviewPkgId] = useState<string | null>(null);
+
+	function resetBatch() {
+		setFailures([]);
+		setDoneIds(new Set());
+		setNeedsApproval([]);
+	}
 
 	// A fresh open (or a fresh batch of updates landing) clears the last run's
 	// result rather than showing a stale done/failed state forever.
 	useEffect(() => {
-		setFailures([]);
-		setDoneIds(new Set());
+		resetBatch();
 	}, [pkgs.updates.length]);
 
 	if (pkgs.updates.length === 0) {
@@ -226,15 +237,20 @@ function PkgUpdatePanel() {
 
 	function runBatch() {
 		setFailures([]);
+		setNeedsApproval([]);
 		updatePkgs.mutate(
 			{ rows: pkgs.updates, onProgress: setProgress },
 			{
 				onSuccess: (res) => {
 					if (res.failed.length) setFailures(res.failed);
+					if (res.needsApproval.length) setNeedsApproval(res.needsApproval);
+					const parkedIds = new Set(res.needsApproval.map((r) => r.pkg_id));
 					setDoneIds((prev) => {
 						const next = new Set(prev);
 						for (const row of pkgs.updates) {
-							if (!res.failed.some((f) => f.id === row.id)) next.add(row.id);
+							if (!res.failed.some((f) => f.id === row.id) && !parkedIds.has(row.id)) {
+								next.add(row.id);
+							}
 						}
 						return next;
 					});
@@ -243,6 +259,8 @@ function PkgUpdatePanel() {
 			}
 		);
 	}
+
+	const hasRunResult = doneIds.size > 0 || failures.length > 0 || needsApproval.length > 0;
 
 	return (
 		<div data-state="update-packages" className="space-y-4">
@@ -254,6 +272,7 @@ function PkgUpdatePanel() {
 					const isCurrent = updatePkgs.isPending && progress?.current === row.name;
 					const isDone = doneIds.has(row.id);
 					const failure = failures.find((f) => f.id === row.id);
+					const review = needsApproval.find((r) => r.pkg_id === row.id);
 					return (
 						<li
 							key={row.id}
@@ -279,6 +298,23 @@ function PkgUpdatePanel() {
 								>
 									<AlertTriangle className="h-3 w-3" /> failed
 								</span>
+							) : review ? (
+								<span className="flex shrink-0 items-center gap-2">
+									<span
+										className="flex items-center gap-1 text-[11px] text-warning"
+									>
+										<ShieldAlert className="h-3 w-3" /> needs approval
+									</span>
+									<Button
+										type="button"
+										size="sm"
+										variant="outline"
+										className="h-6 px-2 text-[11px]"
+										onClick={() => setReviewPkgId(row.id)}
+									>
+										Review
+									</Button>
+								</span>
 							) : isDone ? (
 								<span
 									className="flex shrink-0 items-center gap-1 text-[11px]"
@@ -297,17 +333,37 @@ function PkgUpdatePanel() {
 					{failures.map((f) => `${f.name}: ${f.error}`).join(' · ')}
 				</p>
 			)}
+			{needsApproval.length > 0 && (
+				<p className="text-sm text-warning">
+					{plural(needsApproval.length, 'package')} installed but parked — the new version asks
+					for a capability you haven't granted. Review each row above before it runs.
+				</p>
+			)}
 			<p className="text-xs text-muted-foreground">
 				Each package is verified and re-registered on its own; one failure never rolls back the
 				others.
 			</p>
-			<SheetFooter className="px-0">
+			<SheetFooter className="gap-2 px-0">
 				<Button onClick={runBatch} disabled={updatePkgs.isPending}>
 					{updatePkgs.isPending
 						? `Updating ${progress ? `${progress.done}/${progress.total}` : '…'}`
 						: `Update all (${pkgs.updates.length})`}
 				</Button>
+				{hasRunResult && !updatePkgs.isPending && (
+					<Button type="button" variant="outline" onClick={resetBatch}>
+						Reset the batch
+					</Button>
+				)}
 			</SheetFooter>
+			<TrustReviewModal
+				open={reviewPkgId !== null}
+				onOpenChange={(open) => !open && setReviewPkgId(null)}
+				initialReviews={needsApproval.filter((r) => r.pkg_id === reviewPkgId)}
+				onChange={() => {
+					setNeedsApproval((prev) => prev.filter((r) => r.pkg_id !== reviewPkgId));
+					setReviewPkgId(null);
+				}}
+			/>
 		</div>
 	);
 }

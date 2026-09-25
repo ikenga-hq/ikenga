@@ -132,7 +132,11 @@ function useNextEngineId(): string | null {
 
 // ─── presentation ──────────────────────────────────────────────────────────
 
-const ITEM =
+// Exported so other status-bar segments mounted outside this file (e.g.
+// `updater/status-bar-slot.tsx`'s progress segment, which replaces the
+// `engine` segment in place) share one source of truth for the styling
+// instead of a byte-identical copy (WP-41-F3).
+export const ITEM =
 	'flex h-5 items-center gap-1 rounded-[var(--radius-xs)] px-2 text-muted-foreground outline-none';
 const BUTTON = cn(
 	ITEM,

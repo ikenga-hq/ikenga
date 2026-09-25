@@ -109,3 +109,9 @@ export function progressPct(bytesDownloaded: number, totalBytes: number | null):
 	if (!totalBytes || totalBytes <= 0) return null;
 	return Math.min(100, Math.round((bytesDownloaded / totalBytes) * 100));
 }
+
+/** `n <one|many>` — shared by the banner, the sheet and the auto-updater so
+ *  the three surfaces don't each carry a copy-pasted pluralizer (WP-41-F2). */
+export function plural(n: number, one: string, many = `${one}s`): string {
+	return `${n} ${n === 1 ? one : many}`;
+}

@@ -16,9 +16,7 @@
 import { Bot, Download } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
 import { progressPct, useUpdaterStore } from '@/lib/updater/updater-store';
-
-const ITEM =
-	'flex h-5 items-center gap-1 rounded-[var(--radius-xs)] px-2 text-muted-foreground outline-none';
+import { ITEM } from '@/shell/status-bar';
 
 export function UpdaterStatusBarProgress({ engine }: { engine: string | null }) {
 	const installing = useUpdaterStore((s) => s.installing);
@@ -28,14 +26,19 @@ export function UpdaterStatusBarProgress({ engine }: { engine: string | null }) 
 
 	if (installing) {
 		const pct = progressPct(bytesDownloaded, totalBytes);
+		// The version + percentage are visible text in the segment itself
+		// (matching the locked design's always-on-screen "Downloading 0.9.1 ·
+		// 28%" label) — `title` stays as a supplement for the full string, not
+		// the only place it appears (WP-41-F0).
+		const label = `Downloading${version ? ` ${version}` : ''}${pct !== null ? ` · ${pct}%` : '…'}`;
 		return (
 			<span
 				data-seg="updater-progress"
 				title={`Downloading Ikenga ${version ?? ''}${pct !== null ? ` — ${pct}%` : ''}`.trim()}
 				className={cn(ITEM, 'cursor-default')}
 			>
-				<Download aria-hidden className="h-3 w-3" />
-				<span className="font-mono">{pct !== null ? `${pct}%` : 'downloading…'}</span>
+				<Download aria-hidden className="h-3 w-3 shrink-0" />
+				<span className="whitespace-nowrap font-mono">{label}</span>
 			</span>
 		);
 	}
