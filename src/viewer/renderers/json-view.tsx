@@ -67,11 +67,14 @@ export function JsonView({ path }: JsonViewProps) {
 	);
 }
 
-const PUNCT = 'text-muted-foreground';
-const KEY_COLOR = 'text-sky-600 dark:text-sky-400';
-const STRING_COLOR = 'text-emerald-600 dark:text-emerald-400';
-const NUMBER_COLOR = 'text-amber-600 dark:text-amber-400';
-const BOOL_COLOR = 'text-purple-600 dark:text-purple-400';
+// The `--syntax-*` tokens (@ikenga/tokens, both modes) — the same ones the
+// locked design's `.rjson` mock uses: `.k` attribute, `.s` string, `.n`
+// number, `.b` keyword (true/false/null), `.p` punctuation.
+const PUNCT: React.CSSProperties = { color: 'var(--syntax-punctuation, var(--fg-muted))' };
+const KEY_COLOR: React.CSSProperties = { color: 'var(--syntax-attribute)' };
+const STRING_COLOR: React.CSSProperties = { color: 'var(--syntax-string)' };
+const NUMBER_COLOR: React.CSSProperties = { color: 'var(--syntax-number)' };
+const BOOL_COLOR: React.CSSProperties = { color: 'var(--syntax-keyword)' };
 
 function JsonNode({
 	label,
@@ -92,8 +95,8 @@ function JsonNode({
 				<span className="w-3 shrink-0" />
 				{label !== null && (
 					<>
-						<span className={KEY_COLOR}>"{label}"</span>
-						<span className={PUNCT}>:</span>
+						<span style={KEY_COLOR}>"{label}"</span>
+						<span style={PUNCT}>:</span>
 					</>
 				)}
 				<Leaf value={value} />
@@ -121,11 +124,11 @@ function JsonNode({
 				)}
 				{label !== null && (
 					<>
-						<span className={KEY_COLOR}>"{label}"</span>
-						<span className={PUNCT}>:</span>
+						<span style={KEY_COLOR}>"{label}"</span>
+						<span style={PUNCT}>:</span>
 					</>
 				)}
-				<span className={PUNCT}>
+				<span style={PUNCT}>
 					{isArr ? `[${entries.length}]` : `{${entries.length}}`}
 				</span>
 			</button>
@@ -136,9 +139,9 @@ function JsonNode({
 }
 
 function Leaf({ value }: { value: unknown }) {
-	if (value === null) return <span className={BOOL_COLOR}>null</span>;
-	if (typeof value === 'string') return <span className={STRING_COLOR}>"{value}"</span>;
-	if (typeof value === 'number') return <span className={NUMBER_COLOR}>{value}</span>;
-	if (typeof value === 'boolean') return <span className={BOOL_COLOR}>{String(value)}</span>;
+	if (value === null) return <span style={BOOL_COLOR}>null</span>;
+	if (typeof value === 'string') return <span style={STRING_COLOR}>"{value}"</span>;
+	if (typeof value === 'number') return <span style={NUMBER_COLOR}>{value}</span>;
+	if (typeof value === 'boolean') return <span style={BOOL_COLOR}>{String(value)}</span>;
 	return <span>{String(value)}</span>;
 }

@@ -89,7 +89,20 @@ export function parseDelimited(text: string, delimiter: string): ParsedCsv {
 	return { header, rows: body };
 }
 
+/** Rows rendered per step. The table has no windowing (no virtualization
+ *  dependency is in scope), so a multi-hundred-thousand-row export would
+ *  otherwise put every row in the DOM at once; beyond this the footer says
+ *  "showing N of M" and offers "Show more" (WP-44 review F2). */
+export const CSV_ROW_CAP = 2000;
+
+/** How many rows to render: `shown`, clamped to the row count. Exported for
+ *  `csv-view.test.ts`. */
+export function renderedRowCount(total: number, shown: number): number {
+	return Math.max(0, Math.min(total, shown));
+}
+
 export function CsvView({ path }: CsvViewProps) {
+	const [shown, setShown] = useState(CSV_ROW_CAP);
 	const delimiter = path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
 	const [state, setState] = useState<
 		| { kind: 'loading' }
@@ -100,6 +113,7 @@ export function CsvView({ path }: CsvViewProps) {
 	useEffect(() => {
 		let cancelled = false;
 		setState({ kind: 'loading' });
+		setShown(CSV_ROW_CAP);
 		fsRead(path)
 			.then((res) => {
 				if (cancelled) return;
@@ -131,6 +145,7 @@ export function CsvView({ path }: CsvViewProps) {
 	}
 
 	const { header, rows } = state.data;
+	const visible = renderedRowCount(rows.length, shown);
 
 	if (header.length === 0 && rows.length === 0) {
 		return (
@@ -157,7 +172,7 @@ export function CsvView({ path }: CsvViewProps) {
 						</tr>
 					</thead>
 					<tbody>
-						{rows.map((r, ri) => (
+						{rows.slice(0, visible).map((r, ri) => (
 							<tr key={ri} className="odd:bg-transparent even:bg-muted/10 hover:bg-accent/40">
 								{header.map((_, ci) => (
 									<td key={ci} className="whitespace-nowrap border-b border-border/60 px-2 py-1 font-mono">
@@ -170,8 +185,21 @@ export function CsvView({ path }: CsvViewProps) {
 				</table>
 			</div>
 			<div className="flex shrink-0 items-center gap-3 border-t border-border bg-muted/20 px-3 py-1 font-mono text-[10px] text-muted-foreground">
-				<span>{rows.length.toLocaleString()} rows</span>
+				<span>
+					{visible < rows.length
+						? `showing first ${visible.toLocaleString()} of ${rows.length.toLocaleString()} rows`
+						: `${rows.length.toLocaleString()} rows`}
+				</span>
 				<span>{header.length} columns</span>
+				{visible < rows.length && (
+					<button
+						type="button"
+						className="underline-offset-2 hover:text-foreground hover:underline"
+						onClick={() => setShown((n) => n + CSV_ROW_CAP)}
+					>
+						Show {Math.min(CSV_ROW_CAP, rows.length - visible).toLocaleString()} more
+					</button>
+				)}
 			</div>
 		</div>
 	);

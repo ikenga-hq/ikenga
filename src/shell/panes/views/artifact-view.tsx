@@ -1,5 +1,5 @@
 import { ArrowUpRight } from 'lucide-react';
-import { lazy, Suspense, useCallback, useEffect } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
 import { spawnWindow } from '@/lib/tauri-cmd';
 import {
@@ -82,9 +82,17 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	const device = useViewerPaneState((s) => s.forPane(stateKey).device);
 	const variant = useViewerPaneState((s) => s.forPane(stateKey).variant);
 	const setVariant = useViewerPaneState((s) => s.setVariant);
+	const resetViewerState = useViewerPaneState((s) => s.reset);
 
 	const { changed, reloadKey, dismiss } = useArtifactDiskWatch(path);
 	const { stopped, restart } = useViewerServerHealth(path);
+	// D-08 `artifact-stopped` is strip + plate: the dismissible "viewer server
+	// stopped" strip above the full-content plate. Dismissal lasts until the
+	// server comes back (or the pane moves to another file).
+	const [stoppedStripDismissed, setStoppedStripDismissed] = useState(false);
+	useEffect(() => {
+		if (!stopped) setStoppedStripDismissed(false);
+	}, [stopped]);
 
 	// Navigating to a different artifact in this same pane starts the D-08
 	// chrome variant over — a stale "Version history" or "Open source" split
@@ -94,6 +102,13 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	useEffect(() => {
 		setVariant(stateKey, 'default');
 	}, [path, stateKey, setVariant]);
+
+	// The viewer leaves this pane (tab switched away, pane closed): drop its
+	// chrome state so the store doesn't keep an entry per pane for the whole
+	// session and the next artifact here starts from a clean slate.
+	useEffect(() => {
+		return () => resetViewerState(stateKey);
+	}, [stateKey, resetViewerState]);
 
 	// Popped out into its own window — render the reclaim placeholder, not the
 	// live duplicate.
@@ -151,6 +166,13 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 					<ArrowUpRight className="h-3.5 w-3.5" />
 				</IconButton>
 			</div>
+			{stopped && !stoppedStripDismissed && (
+				<ArtifactInfoStrip
+					kind="stopped"
+					onRestart={restart}
+					onDismiss={() => setStoppedStripDismissed(true)}
+				/>
+			)}
 			{!stopped && changed && variant === 'default' && (
 				<ArtifactInfoStrip kind="changed" onDismiss={dismiss} />
 			)}

@@ -44,8 +44,9 @@ interface ViewerPaneStore {
 	resetZoom(paneId: string): void;
 	setDevice(paneId: string, device: DeviceWidth): void;
 	setVariant(paneId: string, variant: ArtifactVariant): void;
-	/** Called when a pane's active tab changes away from this path — the next
-	 *  artifact opened in the pane starts from a clean slate. */
+	/** Called by `ArtifactView` on unmount (the pane's active tab changes
+	 *  away from the viewer, or the pane closes) — the next artifact opened in
+	 *  the pane starts from a clean slate and closed panes leave no entry. */
 	reset(paneId: string): void;
 }
 

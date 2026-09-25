@@ -5,6 +5,12 @@ import { AlertTriangle, RefreshCw, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/components/ui/utils';
 
+const WARN_STYLE: React.CSSProperties = {
+	color: 'var(--achievement)',
+	background: 'color-mix(in srgb, var(--achievement) 10%, transparent)',
+	borderColor: 'color-mix(in srgb, var(--achievement) 30%, transparent)',
+};
+
 interface ArtifactInfoStripProps {
 	kind: 'changed' | 'stopped';
 	onDismiss?: () => void;
@@ -19,10 +25,11 @@ export function ArtifactInfoStrip({ kind, onDismiss, onRestart }: ArtifactInfoSt
 			role="status"
 			className={cn(
 				'flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs',
-				warn
-					? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400'
-					: 'border-border bg-muted/30 text-muted-foreground'
+				!warn && 'border-border bg-muted/30 text-muted-foreground'
 			)}
+			// Warn tone from the design tokens (`--achievement`, the same amber
+			// WP-43's OfflineState uses), not a Tailwind palette class.
+			style={warn ? WARN_STYLE : undefined}
 		>
 			{warn ? (
 				<AlertTriangle className="h-3.5 w-3.5 shrink-0" />

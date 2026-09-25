@@ -3,7 +3,16 @@
 // (DEC-50 — no build/test until the branch closes, see the WP-44 report).
 
 import { describe, expect, it } from 'vitest';
-import { parseDelimited } from './csv-view';
+import { CSV_ROW_CAP, parseDelimited, renderedRowCount } from './csv-view';
+
+describe('renderedRowCount', () => {
+	it('caps a large file at the step size and never exceeds the total', () => {
+		expect(renderedRowCount(500_000, CSV_ROW_CAP)).toBe(CSV_ROW_CAP);
+		expect(renderedRowCount(500_000, CSV_ROW_CAP * 2)).toBe(CSV_ROW_CAP * 2);
+		expect(renderedRowCount(12, CSV_ROW_CAP)).toBe(12);
+		expect(renderedRowCount(0, CSV_ROW_CAP)).toBe(0);
+	});
+});
 
 describe('parseDelimited', () => {
 	it('splits a simple comma-delimited body from its header', () => {
