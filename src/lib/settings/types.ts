@@ -61,6 +61,15 @@ export interface SettingsOnboarding {
 	loreGlossSeen: string[];
 }
 
+/**
+ * WP-40 per-kind notification mutes. Any string is accepted on disk; unknown
+ * kinds and the two unmutable ones (`permission`, `violation`) are ignored when
+ * read. Written via `notifications_mute_kind` / `notifications_unmute_kind`.
+ */
+export interface SettingsNotifications {
+	mutedKinds: string[];
+}
+
 export interface SettingsWorkspace {
 	userName: string;
 	claudeBrowserMode: 'layered' | 'roots';
@@ -70,6 +79,9 @@ export interface SettingsWorkspace {
 	onboarding: Record<string, unknown>;
 	artifact: SettingsArtifactSettings;
 	lastAgent: { kind: SettingsLastAgentKind; customCommand: string | null };
+	notifications: SettingsNotifications;
+	/** WP-39 / D-04: show the day-start summary on the Project dashboard. Default `true`. */
+	dailyAddress: boolean;
 }
 
 export interface SettingsAppearance {
@@ -169,6 +181,9 @@ export interface SettingsFieldValueMap {
 	'workspace.lastAgent': { kind: SettingsLastAgentKind; customCommand: string | null };
 	'workspace.lastAgent.kind': SettingsLastAgentKind;
 	'workspace.lastAgent.customCommand': string | null;
+	'workspace.notifications': SettingsNotifications;
+	'workspace.notifications.mutedKinds': string[];
+	'workspace.dailyAddress': boolean;
 	'storage.screenshotDirectory': string | null;
 	'about.updates': SettingsUpdates;
 	'about.updates.autoCheck': boolean;
@@ -185,6 +200,9 @@ export type SettingsPersonalOnlyField =
 	| 'workspace.sidebarCollapsed'
 	| 'workspace.explorerSections'
 	| 'workspace.onboarding'
+	| 'workspace.notifications'
+	| 'workspace.notifications.mutedKinds'
+	| 'workspace.dailyAddress'
 	| 'storage.screenshotDirectory'
 	| 'about.updates'
 	| 'about.updates.autoCheck'
@@ -254,6 +272,9 @@ export const PERSONAL_ONLY_FIELDS = [
 	'workspace.sidebarCollapsed',
 	'workspace.explorerSections',
 	'workspace.onboarding',
+	'workspace.notifications',
+	'workspace.notifications.mutedKinds',
+	'workspace.dailyAddress',
 	'storage.screenshotDirectory',
 	'about.updates',
 	'about.updates.autoCheck',
@@ -293,6 +314,7 @@ export const SETTINGS_DEFAULTS = {
 			showResolved: {},
 		},
 		lastAgent: { kind: null, customCommand: null },
+		notifications: { mutedKinds: [] },
 	},
 	about: { updates: { autoCheck: true, autoInstallApp: false, autoInstallPkgs: true } },
 	storage: { screenshotDirectory: null },

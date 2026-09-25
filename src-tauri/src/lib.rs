@@ -52,6 +52,10 @@ pub mod commands;
 pub mod env_files;
 #[cfg(feature = "desktop")]
 mod iyke;
+// WP-40: the `notifications` aggregation table, its producers, mute prefs and
+// the `notifications://changed` forwarder.
+#[cfg(feature = "desktop")]
+pub mod notifications;
 #[cfg(feature = "desktop")]
 mod pkg_content;
 #[cfg(feature = "desktop")]
@@ -108,7 +112,10 @@ use commands::{
     fs_roots_reset, fs_search, fs_trash, fs_unwatch, fs_watch, fs_write, iyke_action_done,
     iyke_dom_done, iyke_dom_query, iyke_endpoint, iyke_log_push, iyke_mcp_info, iyke_network_push,
     iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done, iyke_terminal_spawn_done,
-    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot, oba_auto_update_all,
+    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot,
+    notifications_list, notifications_mark_all_read, notifications_mark_read,
+    notifications_mute_kind, notifications_mute_state, notifications_record_update,
+    notifications_unmute_kind, notifications_unread_count, oba_auto_update_all,
     oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
     oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
     oba_missing_requires, oba_relink_dependents, oba_safe_delete, oba_set_auto_update,
@@ -120,7 +127,7 @@ use commands::{
     pkg_scaffold, pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
     pkg_sidecar_call, pkg_sidecar_rpc_send, pkg_sidecar_rpc_shutdown,
     pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_clear_session,
-    pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
+    pkg_webview_allow_origin, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
@@ -128,9 +135,9 @@ use commands::{
     runtime_retry_bun_fetch,
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
-    secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set, secrets_set_passphrase,
-    secrets_set_scoped, secrets_unlock, secrets_vault_status,
+    secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_index_names,
+    secrets_list_keys, secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
+    secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status,
     set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_open_file,
     settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
     spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
@@ -150,8 +157,9 @@ use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
     pkg_trust_approve, pkg_trust_grant, pkg_trust_list, pkg_trust_list_pending, pkg_trust_preview,
-    pkg_trust_reject, pkg_trust_revoke, session_cancel, session_destroy, session_destroy_all,
-    session_ensure, session_send, session_tool_result, supabase_config_clear, supabase_config_get,
+    pkg_trust_preview_incoming, pkg_trust_reject, pkg_trust_revoke, session_cancel,
+    session_destroy, session_destroy_all, session_ensure, session_send, session_tool_result,
+    supabase_config_clear, supabase_config_get,
     supabase_config_set, viewer_port, viewer_serve, viewer_stop, IykeRuntimeState,
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, SecretsLock,
 };
@@ -438,6 +446,9 @@ pub fn run() {
                 tracing::warn!("[settings] initialization failed: {e}");
             }
             app.manage(settings_manager.clone());
+            // WP-40: relay notification changes to the webview as
+            // `notifications://changed` (muted flag stamped from settings).
+            notifications::spawn_event_forwarder(app.handle().clone());
             {
                 use tauri::Listener;
                 let app_for_settings = app.handle().clone();
@@ -860,6 +871,9 @@ pub fn run() {
             }
             let kernel_arc_for_listener = kernel.clone();
             app.manage(KernelState(kernel));
+            // WP-40: resolve `update` notifications whose version is now
+            // installed (an app update relaunches into this).
+            commands::notifications::spawn_boot_update_sweep(app.handle().clone());
             app.manage(PkgSettingsState(settings_reg));
             app.manage(crate::commands::ActivityBarState(activity_bar_reg.clone()));
             app.manage(PkgContentState(pkg_content_server));
@@ -1154,6 +1168,7 @@ pub fn run() {
             secrets_set,
             secrets_delete,
             secrets_list_keys,
+            secrets_index_names,
             secrets_vault_status,
             secrets_set_passphrase,
             secrets_unlock,
@@ -1172,6 +1187,15 @@ pub fn run() {
             settings_read_file,
             settings_write_field,
             settings_open_file,
+            // notifications — WP-40 aggregation table (D-07 notification centre)
+            notifications_list,
+            notifications_unread_count,
+            notifications_mark_read,
+            notifications_mark_all_read,
+            notifications_mute_state,
+            notifications_mute_kind,
+            notifications_unmute_kind,
+            notifications_record_update,
             // projects (phase 0 of projects-first-class plan)
             project_create,
             project_update,
@@ -1200,6 +1224,7 @@ pub fn run() {
             pkg_trust_revoke,
             // trust-review modal (2026-05-15) — capability-diff batch surface
             pkg_trust_list_pending,
+            pkg_trust_preview_incoming,
             pkg_trust_approve,
             pkg_trust_reject,
             // per-folder Studio project-access gate (WP-04)
@@ -1257,6 +1282,7 @@ pub fn run() {
             spike_setup_test_file,
             // pkg-browser child webviews
             pkg_webview_create,
+            pkg_webview_allow_origin,
             pkg_webview_destroy,
             pkg_webview_navigate,
             pkg_webview_set_rect,

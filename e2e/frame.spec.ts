@@ -617,8 +617,10 @@ test.describe('D-01 conformance (WP-12)', () => {
 		);
 
 		// Budget assertions (D-01 budget: whole window <= 132 resting controls):
-		// Title row must be exactly 2 (project chip, branch chip)
-		expect(titleRow).toBe(2);
+		// Title row: project chip + branch chip, plus WP-46's ≡ menu off macOS
+		// (D-08 native-menu-win).
+		const isMac = await page.evaluate(() => /Mac/i.test(navigator.platform));
+		expect(titleRow).toBe(isMac ? 2 : 3);
 		// Rail has exactly 8 items (Project, Chi, Ngwa, 3 pins, Settings, Project switcher)
 		expect(rail).toBe(8);
 		// Pane chrome on single resting pane

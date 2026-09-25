@@ -355,7 +355,46 @@ async fn cache_update_done(
     .execute(&pool)
     .await
     .map_err(|e| format!("chi_cache update done: {e}"))?;
+    notify_run_terminal(db, run_id, status, error, artifacts).await;
     Ok(())
+}
+
+/// WP-40 `run_finished` / `run_failed` producer. `cache_update_done` is the
+/// single place a Chi run reaches a terminal status (every engine's one-off
+/// task, spawn failures, stdin failures), so producing here covers them all.
+/// `cancelled` produces nothing (a human did it). Best-effort. The run's
+/// artifacts ride along (count + first path) so the row can "Open artifact".
+///
+/// Not covered (tracked WP-40 follow-ups): tmux-backed persistent runs finish
+/// inside the tmux runner, out of process, and never reach this function;
+/// agent-ops schedules (D-07's "pulse-refresh finished" example rows) have no
+/// in-shell completion signal at all yet.
+async fn notify_run_terminal(
+    db: &PaDb,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    artifacts: Option<&serde_json::Value>,
+) {
+    let row = match cache_get(db, run_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(e) => {
+            log::warn!(target: "ikenga::chi", "chi run {run_id}: notification lookup failed: {e}");
+            return;
+        }
+    };
+    if let Some(new) = crate::notifications::producers::run_terminal_with_artifacts(
+        run_id,
+        status,
+        &row.engine_id,
+        row.brief.as_deref(),
+        row.cwd.as_deref(),
+        error,
+        artifacts,
+    ) {
+        crate::notifications::record_with_db(db, new).await;
+    }
 }
 
 /// Build the line-delimited user envelope that streaming-input mode expects.
@@ -714,7 +753,11 @@ async fn claude_one_off_task(
     // Send the initial prompt envelope.
     let envelope = user_envelope(&prompt);
     if let Err(e) = stdin.write_all(envelope.as_bytes()).await {
-        cache_update_status(&db, &run_id, "failed", Some(&format!("stdin write: {e}"))).await.ok();
+        // Terminal failure: close the row out through `cache_update_done` so it
+        // gets `ended_at` and the WP-40 `run_failed` notification.
+        cache_update_done(&db, &run_id, "failed", Some(&format!("stdin write: {e}")), false, None)
+            .await
+            .ok();
         return;
     }
     let _ = stdin.flush().await;
@@ -983,7 +1026,8 @@ async fn codex_one_off_task(
 ) {
     // Write prompt to stdin then close it so codex knows EOF.
     if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-        cache_update_status(&db, &run_id, "failed", Some(&format!("stdin write: {e}")))
+        // Terminal failure: see the matching note in `claude_one_off_task`.
+        cache_update_done(&db, &run_id, "failed", Some(&format!("stdin write: {e}")), false, None)
             .await
             .ok();
         return;
@@ -1837,6 +1881,67 @@ mod tests {
         let row = cache_get(&db, &run_id).await.unwrap().unwrap();
         assert_eq!(row.status, "failed");
         assert_eq!(row.error.as_deref(), Some(err.as_str()));
+    }
+
+    /// WP-40: a Chi run reaching `failed` / `done` produces a `run_failed` /
+    /// `run_finished` notification; `cancelled` produces none.
+    #[tokio::test]
+    async fn terminal_run_statuses_produce_run_notifications() {
+        use crate::notifications::{self, ListQuery, NotificationKind};
+
+        let db = test_db().await;
+        let cache = ChiCache::new(std::env::temp_dir());
+        let mk_opts = || ChiRunOpts {
+            engine_id: "claude-code".into(),
+            prompt: "pulse-refresh".into(),
+            cwd: Some("/tmp/royalti-co".into()),
+            model: None,
+            mode: None,
+            timeout_seconds: None,
+            parent_id: None,
+            resume_session_id: None,
+            persistent: false,
+        };
+        let failed_id = uuid::Uuid::new_v4().to_string();
+        let done_id = uuid::Uuid::new_v4().to_string();
+        let cancelled_id = uuid::Uuid::new_v4().to_string();
+        for id in [&failed_id, &done_id, &cancelled_id] {
+            cache_insert(&db, id, &mk_opts(), &cache.run_output_path(id), "cli")
+                .await
+                .unwrap();
+        }
+        cache_update_done(&db, &failed_id, "failed", Some("exit 1"), false, None)
+            .await
+            .unwrap();
+        let produced = serde_json::json!([
+            { "path": "/tmp/royalti-co/snap-1.json", "mime": "application/json", "producedBy": "Write" }
+        ]);
+        cache_update_done(&db, &done_id, "done", None, false, Some(&produced))
+            .await
+            .unwrap();
+        cache_update_done(&db, &cancelled_id, "cancelled", None, false, None)
+            .await
+            .unwrap();
+
+        let pool = db.ensure_pool().await.unwrap();
+        let rows = notifications::list(&pool, &ListQuery::default()).await.unwrap();
+        let for_run = |id: &str| {
+            rows.iter()
+                .filter(|n| n.action.as_ref().and_then(|a| a["runId"].as_str()) == Some(id))
+                .collect::<Vec<_>>()
+        };
+        let failed = for_run(&failed_id);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].kind, NotificationKind::RunFailed);
+        assert_eq!(failed[0].title, "pulse-refresh failed");
+        let done = for_run(&done_id);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].kind, NotificationKind::RunFinished);
+        let action = done[0].action.as_ref().unwrap();
+        assert_eq!(action["artifactCount"], 1);
+        assert_eq!(action["firstArtifactPath"], "/tmp/royalti-co/snap-1.json");
+        assert_eq!(failed[0].action.as_ref().unwrap()["artifactCount"], 0);
+        assert!(for_run(&cancelled_id).is_empty());
     }
 
     #[tokio::test]

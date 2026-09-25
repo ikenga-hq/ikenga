@@ -1,9 +1,17 @@
 // WP-09 — the title row (D-01, `designs/frame-workbench-v4.html` `.titlebar`;
 // spec §6A.4, which supersedes §3.2).
 //
-// Exactly two controls: the project chip (⌘P) and the branch chip. Search is
-// ⌘K; layout, the Companion toggle and notifications live in the status bar;
-// window controls stay OS-native. The row itself is the window drag region.
+// Exactly two controls on macOS: the project chip (⌘P) and the branch chip.
+// Search is ⌘K; layout, the Companion toggle and notifications live in the
+// status bar; window controls stay OS-native. The row itself is the window
+// drag region.
+//
+// WP-46 (D-08 `native-menu-win`) adds a third control at the far left on
+// Windows/Linux only: the `≡` button opening the native-menu tree as an
+// in-app cascading menu (`NativeMenuCascade`, `./menu/cascade.tsx`) — those
+// platforms get no OS application menu bar at all. `mac` is overridable
+// (defaults to the live platform) so `title-row.test.tsx` can exercise both
+// branches without depending on the module-load-time `isMac` constant.
 //
 // The project chip is a new component with the same behaviour as the rail's
 // `ProjectIndicator` (`activity-bar.tsx`, owned by WP-03): same store
@@ -19,7 +27,7 @@
 // root is not a repo, the chip is hidden entirely (§3.2 row 10).
 
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, Folder, FolderKanban, GitBranch, Plus } from 'lucide-react';
+import { ChevronDown, Folder, FolderKanban, GitBranch, Plus, Sunrise } from 'lucide-react';
 import { useState } from 'react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/components/ui/utils';
@@ -27,6 +35,8 @@ import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { pkgSidecarCall, type Project } from '@/lib/tauri-cmd';
+import { todayLocalDate } from '@/shell/home/daily-address';
+import { NativeMenuCascade } from './menu/cascade';
 
 const GIT_PKG_ID = 'com.ikenga.git';
 /** Git pkg routes (its manifest's `ui.routes`): `/` is Changes. */
@@ -274,9 +284,32 @@ export function BranchChip() {
 	);
 }
 
+// ─── daily address reopen (WP-39, D-04) ────────────────────────────────────
+// The one control the title row gains beyond WP-09's project + branch chips
+// — but only while the day-start summary is dismissed. On a fresh profile
+// (or any day it hasn't been dismissed yet) this renders nothing, so WP-09's
+// "exactly two controls" contract holds unchanged for the common case.
+
+function DailyAddressReopenButton() {
+	const dismissedOn = useShellStore((s) => s.dailyAddressDismissedOn);
+	const setDailyAddressDismissed = useShellStore((s) => s.setDailyAddressDismissed);
+	if (dismissedOn !== todayLocalDate()) return null;
+	return (
+		<button
+			type="button"
+			data-testid="title-daily-address-reopen"
+			aria-label="Reopen today's daily address"
+			onClick={() => setDailyAddressDismissed(null)}
+			className={cn(CHIP, 'text-muted-foreground')}
+		>
+			<Sunrise aria-hidden className="h-3.5 w-3.5" />
+		</button>
+	);
+}
+
 // ─── the row ───────────────────────────────────────────────────────────────
 
-export function TitleRow() {
+export function TitleRow({ mac }: { mac?: boolean } = {}) {
 	return (
 		<div
 			role="toolbar"
@@ -285,8 +318,10 @@ export function TitleRow() {
 			data-tauri-drag-region
 			className="flex h-[38px] flex-none items-center gap-3 border-b border-border bg-[var(--bg-surface)] px-3"
 		>
+			<NativeMenuCascade mac={mac} />
 			<ProjectChip />
 			<BranchChip />
+			<DailyAddressReopenButton />
 		</div>
 	);
 }

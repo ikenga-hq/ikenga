@@ -48,6 +48,16 @@ use serde_json::json;
 /// `UserPromptSubmit`/`SessionStart` drive context injection; `PreCompact`
 /// drives the compaction guard; `Notification`/`PermissionRequest` drive the
 /// permission inbox; `SessionEnd` closes the session out.
+///
+/// WP-40: `Stop` and `PostToolUseFailure` resolve the notification row of an
+/// in-terminal `PermissionRequest` (a denied prompt never gets `PostToolUse`;
+/// an approved tool that fails gets `PostToolUseFailure` instead). See
+/// `notifications::producers::{ends_terminal_permissions,
+/// finishes_terminal_tool}` — every event those match must be listed here.
+///
+/// No migration is needed for existing users: the settings file is rewritten
+/// from this list on every terminal spawn (`commands::pty`), so a new event
+/// reaches every terminal opened after upgrade.
 /// How long the backend parks a held `PreToolUse` response waiting for a human
 /// decision (ikenga#154). Must stay strictly below `GATE_CURL_MAX_TIME_SECS`.
 pub const GATE_HOLD_SECS: u64 = 30;
@@ -73,6 +83,8 @@ const HOOK_EVENTS: &[&str] = &[
     "PreCompact",
     "Notification",
     "PermissionRequest",
+    "Stop",
+    "PostToolUseFailure",
 ];
 
 /// `--settings` file name, written next to `control.json`.
@@ -131,8 +143,12 @@ http://127.0.0.1:{port}{path}{suffix}"
     for event in HOOK_EVENTS {
         // Claude Code's hook schema takes a matcher list for tool-scoped
         // events and a bare hook list for the rest. `PreToolUse` /
-        // `PostToolUse` / `PreCompact` are the matcher-shaped ones.
-        let value = if matches!(*event, "PreToolUse" | "PostToolUse" | "PreCompact") {
+        // `PostToolUse` / `PostToolUseFailure` / `PreCompact` are the
+        // matcher-shaped ones.
+        let value = if matches!(
+            *event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PreCompact"
+        ) {
             let hooks = if *event == "PreToolUse" {
                 &gate_block
             } else {
@@ -292,16 +308,44 @@ mod tests {
             assert!(hooks.contains_key(*event), "missing hook event {event}");
         }
         // Tool-scoped events must carry a matcher, or Claude Code ignores them.
-        for event in ["PreToolUse", "PostToolUse", "PreCompact"] {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact"] {
             assert!(
                 hooks[event][0].get("matcher").is_some(),
                 "{event} needs a matcher"
             );
         }
-        for event in ["SessionStart", "SessionEnd", "UserPromptSubmit"] {
+        for event in ["SessionStart", "SessionEnd", "UserPromptSubmit", "Stop"] {
             assert!(
                 hooks[event][0].get("matcher").is_none(),
                 "{event} must not carry a matcher"
+            );
+        }
+    }
+
+    /// WP-40 round 3: the hooks bus resolves in-terminal permission rows on
+    /// these events. Unregistered, Claude Code never sends them and a prompt
+    /// denied in the terminal stayed pending until `SessionEnd`.
+    #[test]
+    fn registers_every_event_that_resolves_a_terminal_permission() {
+        use crate::notifications::producers::{ends_terminal_permissions, finishes_terminal_tool};
+        let v = build_for_terminal(1, "t", Some("term-1"));
+        let hooks = v["hooks"].as_object().expect("hooks object");
+        for event in [
+            "Stop",
+            "SessionEnd",
+            "UserPromptSubmit",
+            "PostToolUse",
+            "PostToolUseFailure",
+        ] {
+            assert!(
+                ends_terminal_permissions(event) || finishes_terminal_tool(event),
+                "{event} should resolve terminal prompts"
+            );
+            assert!(hooks.contains_key(event), "{event} is not registered");
+            let cmd = serde_json::to_string(&hooks[event]).unwrap();
+            assert!(
+                cmd.contains(&format!("--max-time {FAST_HOOK_MAX_TIME_SECS}")),
+                "{event} must answer fast: {cmd}"
             );
         }
     }

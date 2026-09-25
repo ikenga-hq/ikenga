@@ -40,7 +40,8 @@ vi.mock('@/shell/connection-banner', async () => ({
 vi.mock('@/shell/trust-review-banner', async () => ({
 	TrustReviewBanner: make(await import('react'), 'trust-review'),
 }));
-vi.mock('@/shell/updater-banner', async () => ({
+// WP-41: UpdaterBanner moved into src/shell/updater/ (absorbed folder).
+vi.mock('@/shell/updater/updater-banner', async () => ({
 	UpdaterBanner: make(await import('react'), 'updater'),
 }));
 vi.mock('@/shell/pkg-auto-updater', async () => ({

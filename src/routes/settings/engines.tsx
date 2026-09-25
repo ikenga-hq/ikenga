@@ -78,7 +78,7 @@ function EngineSectionBody() {
 	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
 	const payload = useShellStore(
 		(s) =>
-			s.onboarding.steps.agent.payload as
+			s.onboarding.steps.engine.payload as
 				| {
 						agentId: string;
 						display?: string;
@@ -108,8 +108,8 @@ function EngineSectionBody() {
 	const version = live?.version ?? payload?.version;
 
 	function handleChange() {
-		enterOnboardingEdit('agent');
-		void navigate({ to: '/onboarding/agent' });
+		enterOnboardingEdit('engine');
+		void navigate({ to: '/onboarding/engine' });
 	}
 
 	return (
