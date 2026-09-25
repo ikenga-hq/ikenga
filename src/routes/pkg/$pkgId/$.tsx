@@ -22,8 +22,14 @@ import { useEffect, useState } from 'react';
 
 import { ActionBar } from '@/components/pkg/actions/action-bar';
 import { PkgIframeHost } from '@/components/pkg/pkg-iframe-host';
+import { PkgConsentState } from '@/components/pkg/pkg-view-states';
 import { PkgWebviewHost } from '@/components/pkg/pkg-webview-host';
-import { pkgKernelStatus } from '@/lib/tauri-cmd';
+import {
+	type PkgTrustReview,
+	pkgKernelStatus,
+	pkgTrustApprove,
+	pkgTrustListPending,
+} from '@/lib/tauri-cmd';
 import { usePaneScope } from '@/shell/panes/views/route-view';
 
 export const Route = createFileRoute('/pkg/$pkgId/$')({
@@ -45,6 +51,9 @@ type State =
 	| { kind: 'webview'; entry: UiRouteEntry }
 	| { kind: 'unmountable'; entry: UiRouteEntry }
 	| { kind: 'redirect'; toSplat: string }
+	// WP-45 `pkg-consent`: the kernel parked this pkg for a capability review
+	// (`pkg_trust_list_pending`), so none of its routes are registered.
+	| { kind: 'consent'; review: PkgTrustReview }
 	| { kind: 'not_found'; routePath: string };
 
 function PkgRouteCatchAll() {
@@ -57,7 +66,13 @@ function PkgRouteCatchAll() {
 	const paneId = paneScope ?? `${pkgId}:${routePath}`;
 
 	const [state, setState] = useState<State>({ kind: 'loading' });
+	// Bumped after an inline consent approval so the resolver re-reads the
+	// (now re-registered) routes.
+	const [resolveKey, setResolveKey] = useState(0);
+	const [consentBusy, setConsentBusy] = useState(false);
+	const [consentError, setConsentError] = useState<string | null>(null);
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: resolveKey is a trigger-only dep — bumping it re-resolves after a consent approval.
 	useEffect(() => {
 		let cancelled = false;
 		(async () => {
@@ -90,6 +105,15 @@ function PkgRouteCatchAll() {
 							return;
 						}
 					}
+					// No routes at all: before calling it uninstalled, check whether
+					// the kernel is holding it for a capability review.
+					const pending = await pkgTrustListPending().catch(() => []);
+					if (cancelled) return;
+					const review = pending.find((r) => r.pkg_id === pkgId);
+					if (review) {
+						setState({ kind: 'consent', review });
+						return;
+					}
 					setState({ kind: 'not_found', routePath });
 					return;
 				}
@@ -112,7 +136,7 @@ function PkgRouteCatchAll() {
 		return () => {
 			cancelled = true;
 		};
-	}, [pkgId, routePath, _splat]);
+	}, [pkgId, routePath, _splat, resolveKey]);
 
 	// Perform the stale-subpath redirect once resolved. `replace` keeps the
 	// broken URL out of history so Back doesn't bounce into it again.
@@ -127,6 +151,24 @@ function PkgRouteCatchAll() {
 
 	if (state.kind === 'loading' || state.kind === 'redirect') {
 		return <div className="p-6 text-sm opacity-60">Resolving package route…</div>;
+	}
+	if (state.kind === 'consent') {
+		return (
+			<PkgConsentState
+				pkgId={pkgId}
+				review={state.review}
+				busy={consentBusy}
+				error={consentError}
+				onAllow={() => {
+					setConsentBusy(true);
+					setConsentError(null);
+					pkgTrustApprove(pkgId)
+						.then(() => setResolveKey((k) => k + 1))
+						.catch((e) => setConsentError((e as Error).message ?? String(e)))
+						.finally(() => setConsentBusy(false));
+				}}
+			/>
+		);
 	}
 	if (state.kind === 'not_found') {
 		return (

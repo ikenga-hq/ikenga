@@ -20,8 +20,16 @@
 // destroy the orphan it created. We use the same `dropped` flag pattern
 // `PkgIframeHost` uses.
 
-import { listen, type UnlistenFn } from '@/lib/transport';
+import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useRef, useState } from 'react';
+
+import {
+	blockedInfoFromNavigation,
+	NAVIGATION_BLOCKED_EVENT,
+	type NavigationBlockedEvent,
+	type PkgBlockedInfo,
+} from '@/lib/pkg/pkg-view-state';
+import { PkgBlockedState, PkgBlockedTrustSheet, useAllowHostSheet } from './pkg-view-states';
 
 import {
 	pkgWebviewCreate,
@@ -80,6 +88,37 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 	const placeholderRef = useRef<HTMLDivElement>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [mounted, setMounted] = useState(false);
+	// WP-45 `pkg-blocked`: set from the kernel's `pkg://navigation-blocked`
+	// broadcast (`pkg/webview.rs::emit_if_origin_blocked`) for this pane.
+	const [blocked, setBlocked] = useState<PkgBlockedInfo | null>(null);
+	const allowHost = useAllowHostSheet();
+
+	// Subscribed before the mount effect's first-frame wait resolves, so a
+	// create-time rejection is caught. Only rendered while no webview is
+	// mounted: a blocked *navigate* leaves the live webview on its previous
+	// page, and the native surface would cover any React state anyway.
+	useEffect(() => {
+		if (!isTauri()) return;
+		let unlisten: UnlistenFn | null = null;
+		let cancelled = false;
+		listen<NavigationBlockedEvent>(NAVIGATION_BLOCKED_EVENT, (ev) => {
+			if (cancelled) return;
+			if (ev.payload?.pkgId !== pkgId || ev.payload?.paneId !== paneId) return;
+			setBlocked(blockedInfoFromNavigation(ev.payload));
+		})
+			.then((fn) => {
+				if (cancelled) {
+					fn();
+					return;
+				}
+				unlisten = fn;
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+			unlisten?.();
+		};
+	}, [pkgId, paneId]);
 
 	// Mount effect — create the webview at the placeholder's initial rect.
 	useEffect(() => {
@@ -206,6 +245,20 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 			window.removeEventListener('resize', schedule);
 		};
 	}, [mounted, pkgId, paneId]);
+
+	if (blocked && !mounted) {
+		return (
+			<>
+				<PkgBlockedState pkgId={pkgId} blocked={blocked} onAllowHost={allowHost.openSheet} />
+				<PkgBlockedTrustSheet
+					pkgId={pkgId}
+					blocked={blocked}
+					open={allowHost.open}
+					onOpenChange={allowHost.setOpen}
+				/>
+			</>
+		);
+	}
 
 	if (error) {
 		return (

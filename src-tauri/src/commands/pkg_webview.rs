@@ -26,7 +26,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State, WebviewWindow};
 
 use crate::pkg::keep_awake;
-use crate::pkg::webview::{run_on_main, PaneRect, WebviewPanesRegistry};
+use crate::pkg::webview::{emit_if_origin_blocked, run_on_main, PaneRect, WebviewPanesRegistry};
 
 pub struct WebviewPanesState(pub Arc<WebviewPanesRegistry>);
 
@@ -57,6 +57,9 @@ pub async fn pkg_webview_create(
     let panes = state.0.clone();
     let app_for_main = app.clone();
     let parent_label = calling_window.label().to_string();
+    // WP-45: kept for the `pkg://navigation-blocked` broadcast below; the
+    // originals move into the main-thread closure.
+    let (pkg_id_evt, pane_id_evt) = (pkg_id.clone(), pane_id.clone());
     let webview_label = run_on_main(&app, move || {
         panes.create(
             &app_for_main,
@@ -69,7 +72,10 @@ pub async fn pkg_webview_create(
         )
     })
     .await
-    .map_err(|e| format!("{e:#}"))?;
+    .map_err(|e| {
+        emit_if_origin_blocked(&app, &pkg_id_evt, &pane_id_evt, &e);
+        format!("{e:#}")
+    })?;
     Ok(PkgWebviewCreateResult { webview_label })
 }
 
@@ -97,9 +103,13 @@ pub async fn pkg_webview_navigate(
 ) -> Result<(), String> {
     let _guard = keep_awake::acquire("ikenga pkg_webview_navigate");
     let panes = state.0.clone();
+    let (pkg_id_evt, pane_id_evt) = (pkg_id.clone(), pane_id.clone());
     run_on_main(&app, move || panes.navigate(&pkg_id, &pane_id, &url))
         .await
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| {
+            emit_if_origin_blocked(&app, &pkg_id_evt, &pane_id_evt, &e);
+            format!("{e:#}")
+        })
 }
 
 #[tauri::command]

@@ -228,6 +228,70 @@ struct PkgCapability {
     allowed_origins: Option<Vec<String>>,
 }
 
+/// Tauri event channel for an origin-boundary rejection (WP-45, D-08
+/// `pkg-blocked`). One channel for the whole app; the pane host filters by
+/// `(pkgId, paneId)`. Emitted by the callers that hold an `AppHandle`
+/// (`commands::pkg_webview` create/navigate, the iyke `browser/goto`
+/// handler) via [`emit_if_origin_blocked`] — the registry itself stays
+/// handle-free and its behaviour is unchanged: the same error is still
+/// returned to the caller, the event is only a broadcast of it.
+pub const NAVIGATION_BLOCKED_EVENT: &str = "pkg://navigation-blocked";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationBlockedEvent {
+    pub pkg_id: String,
+    pub pane_id: String,
+    pub url: String,
+    pub origin: String,
+    pub allowed_origins: Vec<String>,
+}
+
+/// Typed form of the "origin not in `allowed_origins`" rejection so callers
+/// can recognise it (`anyhow::Error::downcast_ref`) without matching on the
+/// message. `Display` is byte-identical to the previous `anyhow!` string, so
+/// the error surfaced over IPC does not change.
+#[derive(Debug, Clone)]
+pub struct OriginBlocked {
+    pub url: String,
+    pub origin: String,
+    pub allowed_origins: Vec<String>,
+}
+
+impl std::fmt::Display for OriginBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "origin `{}` is not in `capabilities.webview.allowed_origins` \
+             (declared: {:?})",
+            self.origin,
+            self.allowed_origins.as_slice()
+        )
+    }
+}
+
+impl std::error::Error for OriginBlocked {}
+
+/// Broadcast `pkg://navigation-blocked` when `err` is an [`OriginBlocked`]
+/// rejection; a no-op for every other error. Best-effort — an emit failure
+/// is logged and swallowed, never turned into a second error.
+pub fn emit_if_origin_blocked(app: &AppHandle, pkg_id: &str, pane_id: &str, err: &anyhow::Error) {
+    use tauri::Emitter;
+    let Some(blocked) = err.downcast_ref::<OriginBlocked>() else {
+        return;
+    };
+    let payload = NavigationBlockedEvent {
+        pkg_id: pkg_id.to_string(),
+        pane_id: pane_id.to_string(),
+        url: blocked.url.clone(),
+        origin: blocked.origin.clone(),
+        allowed_origins: blocked.allowed_origins.clone(),
+    };
+    if let Err(e) = app.emit(NAVIGATION_BLOCKED_EVENT, payload) {
+        log::warn!("[pkg_webview] `{pkg_id}` emit navigation-blocked failed: {e}");
+    }
+}
+
 /// Does `origin` satisfy the pkg's declared `allowed_origins`?
 ///
 /// `None` (the manifest never declared the field) is permissive — a pkg
@@ -342,11 +406,11 @@ impl WebviewPanesRegistry {
             );
         }
         if !origin_allowed(&origin, &cap.allowed_origins) {
-            return Err(anyhow!(
-                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
-                 (declared: {:?})",
-                cap.allowed_origins.as_deref().unwrap_or(&[])
-            ));
+            return Err(anyhow::Error::new(OriginBlocked {
+                url: url.to_string(),
+                origin,
+                allowed_origins: cap.allowed_origins.clone().unwrap_or_default(),
+            }));
         }
 
         let data_dir = partition_dir(app, pkg_id, partition)?;
@@ -435,11 +499,11 @@ impl WebviewPanesRegistry {
             .unwrap_or_default();
         let origin = parsed.origin().unicode_serialization();
         if !origin_allowed(&origin, &cap.allowed_origins) {
-            return Err(anyhow!(
-                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
-                 (declared: {:?})",
-                cap.allowed_origins.as_deref().unwrap_or(&[])
-            ));
+            return Err(anyhow::Error::new(OriginBlocked {
+                url: url.to_string(),
+                origin,
+                allowed_origins: cap.allowed_origins.clone().unwrap_or_default(),
+            }));
         }
         handle
             .surface
@@ -984,7 +1048,27 @@ where
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{origin_allowed, origin_matches};
+    use super::{origin_allowed, origin_matches, OriginBlocked};
+
+    #[test]
+    fn origin_blocked_message_is_unchanged_and_downcastable() {
+        // WP-45: the typed error must keep the exact IPC string the FE and
+        // iyke already surface, and be recognisable for the
+        // `pkg://navigation-blocked` broadcast.
+        let err = anyhow::Error::new(OriginBlocked {
+            url: "https://fal.media/files/x".into(),
+            origin: "https://fal.media".into(),
+            allowed_origins: vec!["https://studio.example.com".into()],
+        });
+        assert_eq!(
+            format!("{err:#}"),
+            "origin `https://fal.media` is not in `capabilities.webview.allowed_origins` \
+             (declared: [\"https://studio.example.com\"])"
+        );
+        let blocked = err.downcast_ref::<OriginBlocked>().expect("typed");
+        assert_eq!(blocked.origin, "https://fal.media");
+        assert!(anyhow::anyhow!("other").downcast_ref::<OriginBlocked>().is_none());
+    }
 
     fn list(v: &[&str]) -> Option<Vec<String>> {
         Some(v.iter().map(|s| s.to_string()).collect())
