@@ -1,6 +1,9 @@
-import { X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Download, ShieldAlert, UserPlus, X, XCircle } from 'lucide-react';
 import * as React from 'react';
 import { cn } from '@/components/ui/utils';
+import { useMarkNotificationsRead, useNotificationsLiveSync } from '@/lib/queries/notifications';
+import type { NotificationKind, NotificationRow } from '@/lib/tauri-cmd';
+import { notificationActionButtons } from '@/shell/notifications/actions';
 
 export type FloatingToastChipVariant = 'progress' | 'error' | 'notice' | 'info';
 export type FloatingToastChipAnchor = 'viewport-top' | 'pane-corner';
@@ -127,5 +130,104 @@ export function FloatingToastChip({
 				)}
 			</div>
 		</div>
+	);
+}
+
+// ─── WP-40b: notification toast bridge (D-07 `notifications`) ─────────────
+//
+// "A toast is gone in three seconds and the banner slot holds one notice.
+// This is the list behind both — a toast becomes a transient copy of a row
+// that stays." (designs/system-flows.html?state=notifications) The row
+// itself lives in the `notifications` table / the bell popover
+// (`src/shell/notifications/`); this renders a 3.2s `FloatingToastChip`
+// copy of whatever `notifications://changed` just created, then discards it.
+// Suppressed when the event's `muted` flag is set — Rust already excludes
+// muted kinds from the unread count, and the toast honors the same rule
+// rather than surfacing a notice for something the popover won't show as
+// unread.
+//
+// This is the ONE place in the app that calls `useNotificationsLiveSync()`
+// (`src/lib/queries/notifications.ts` asks for exactly one mount "near the
+// shell root"). It is mounted once, at the top level of
+// `src/shell/notifications/bell.tsx` — a sibling of the `Popover`, not
+// inside `PopoverContent` (which unmounts on close and would stop hearing
+// events, and would defeat the badge count staying live while the popover
+// is shut).
+
+const NOTIFICATION_TOAST_VARIANT: Record<NotificationKind, FloatingToastChipVariant> = {
+	permission: 'notice',
+	violation: 'error',
+	run_failed: 'error',
+	run_finished: 'info',
+	update: 'info',
+	invite: 'info',
+};
+
+const NOTIFICATION_TOAST_ICON: Record<NotificationKind, React.ReactNode> = {
+	permission: <ShieldAlert className="h-3 w-3" />,
+	violation: <AlertTriangle className="h-3 w-3" />,
+	run_failed: <XCircle className="h-3 w-3" />,
+	run_finished: <CheckCircle2 className="h-3 w-3" />,
+	update: <Download className="h-3 w-3" />,
+	invite: <UserPlus className="h-3 w-3" />,
+};
+
+/** designs/system-flows.html's own toast demo: `later(i * 260, () => toast(..., { ms: 3200 }))`. */
+const NOTIFICATION_TOAST_TTL_MS = 3200;
+
+interface QueuedNotificationToast {
+	key: number;
+	row: NotificationRow;
+}
+
+let notificationToastSeq = 0;
+
+/** One toast on screen at a time; a burst (e.g. three violations in the same
+ *  second) queues and drains at the same 3.2s cadence rather than stacking
+ *  overlapping pills. */
+export function NotificationToastBridge() {
+	const [queue, setQueue] = React.useState<QueuedNotificationToast[]>([]);
+	const markRead = useMarkNotificationsRead();
+
+	useNotificationsLiveSync((event) => {
+		if (event.reason !== 'created' && event.reason !== 'coalesced') return;
+		if (event.muted || !event.notification) return;
+		notificationToastSeq += 1;
+		const row = event.notification;
+		setQueue((q) => [...q, { key: notificationToastSeq, row }]);
+	});
+
+	const shown = queue[0] ?? null;
+
+	const dismiss = React.useCallback((key: number) => {
+		setQueue((q) => q.filter((t) => t.key !== key));
+	}, []);
+
+	if (!shown) return null;
+
+	const primaryAction = notificationActionButtons(shown.row)[0];
+
+	return (
+		<FloatingToastChip
+			key={shown.key}
+			variant={NOTIFICATION_TOAST_VARIANT[shown.row.kind]}
+			anchor="viewport-top"
+			icon={NOTIFICATION_TOAST_ICON[shown.row.kind]}
+			label={shown.row.title}
+			action={
+				primaryAction
+					? {
+							label: primaryAction.label,
+							onClick: () => {
+								primaryAction.run();
+								if (shown.row.readAt == null) markRead.mutate([shown.row.id]);
+								dismiss(shown.key);
+							},
+						}
+					: undefined
+			}
+			onDismiss={() => dismiss(shown.key)}
+			ttlMs={NOTIFICATION_TOAST_TTL_MS}
+		/>
 	);
 }

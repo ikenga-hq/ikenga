@@ -48,6 +48,7 @@ import { useTerminalStore } from '@/terminal/session-store';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
 import { openCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
+import { NotificationsBell } from './notifications/bell';
 import { GIT_BRANCHES_ROUTE, GIT_CHANGES_ROUTE, useGitRepoSummary } from './title-row';
 
 /** Ngwa deep links. Phase 1 lands on the pkg surface's matching filter; the
@@ -169,9 +170,14 @@ function ReadOnly({ id, title, children }: { id: string; title: string; children
 	);
 }
 
-/** Phase 5 (D-07) mounts the notifications bell here. Empty until then. */
+/** WP-40b (D-07): the notifications bell + popover, and the toast bridge it
+ *  mounts alongside itself. See `src/shell/notifications/bell.tsx`. */
 export function NotificationsBellSlot() {
-	return <span data-slot="notifications-bell" className="contents" />;
+	return (
+		<span data-slot="notifications-bell" className="contents">
+			<NotificationsBell />
+		</span>
+	);
 }
 
 export function StatusBar() {
