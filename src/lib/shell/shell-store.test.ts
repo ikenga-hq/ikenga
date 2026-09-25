@@ -79,7 +79,7 @@ describe('shell-store onboarding migration', () => {
 		// Other steps stay pending — the legacy flag wasn't a full-wizard
 		// completion signal.
 		expect(migrated.onboarding.steps.welcome.status).toBe('pending');
-		expect(legacySteps(migrated.onboarding).summary?.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).done?.status).toBe('pending');
 		expect(migrated.onboarding.completedAt).toBeNull();
 	});
 
