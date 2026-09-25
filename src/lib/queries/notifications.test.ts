@@ -23,8 +23,11 @@ vi.mock('@/lib/tauri-cmd', () => ({
 import { queryKeys } from '@/lib/query-keys';
 import type { NotificationRow } from '@/lib/tauri-cmd';
 import {
+	asKnownNotificationAction,
 	groupNotificationsByDay,
 	isNotificationKindMutable,
+	isNotificationResolved,
+	notificationDecision,
 	MUTABLE_NOTIFICATION_KINDS,
 	NOTIFICATION_KINDS,
 	notificationsListQueryOptions,
@@ -131,5 +134,33 @@ describe('notifications queries', () => {
 		const { today, earlier } = groupNotificationsByDay(rows, now);
 		expect(today.map((r) => r.id)).toEqual([1, 2]);
 		expect(earlier.map((r) => r.id)).toEqual([3]);
+	});
+
+	it('resolved rows are dead asks: no inline decision', () => {
+		const hooks = row({
+			kind: 'permission',
+			action: { kind: 'permission.decide', via: 'hooks', requestId: 'r1', terminalId: 't1' },
+		});
+		expect(isNotificationResolved(hooks)).toBe(false);
+		expect(notificationDecision(hooks)?.via).toBe('hooks');
+		expect(notificationDecision({ ...hooks, resolvedAt: 5 })).toBeNull();
+		expect(isNotificationResolved({ ...hooks, resolvedAt: 5 })).toBe(true);
+		// Rows from before `resolvedAt` existed read as open.
+		expect(isNotificationResolved({ ...hooks, resolvedAt: undefined })).toBe(false);
+	});
+
+	it('ACP asks and terminal prompts are open-only: no inline decision', () => {
+		const acp = row({
+			kind: 'permission',
+			action: { kind: 'open.thread', threadId: 'th', requestId: 'r2' },
+		});
+		expect(notificationDecision(acp)).toBeNull();
+		expect(asKnownNotificationAction(acp.action)?.kind).toBe('open.thread');
+		const terminal = row({
+			kind: 'permission',
+			action: { kind: 'open.terminal', terminalId: 't', sessionId: null },
+		});
+		expect(notificationDecision(terminal)).toBeNull();
+		expect(asKnownNotificationAction(terminal.action)?.kind).toBe('open.terminal');
 	});
 });

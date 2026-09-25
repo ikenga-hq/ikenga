@@ -870,6 +870,9 @@ pub fn run() {
             }
             let kernel_arc_for_listener = kernel.clone();
             app.manage(KernelState(kernel));
+            // WP-40: resolve `update` notifications whose version is now
+            // installed (an app update relaunches into this).
+            commands::notifications::spawn_boot_update_sweep(app.handle().clone());
             app.manage(PkgSettingsState(settings_reg));
             app.manage(crate::commands::ActivityBarState(activity_bar_reg.clone()));
             app.manage(PkgContentState(pkg_content_server));
