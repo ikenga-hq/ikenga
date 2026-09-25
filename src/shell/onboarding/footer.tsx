@@ -105,8 +105,12 @@ export const SETTINGS_LINKS: Partial<Record<OnboardingStepId, SettingsLink[]>> =
 export function WritesNote({
 	stepId,
 	onOpenFile,
+	file,
 }: {
 	stepId: OnboardingStepId;
+	/** Overrides `WRITES[stepId].file` where the D-04 scope switch moves the
+	 *  write (`project`, `equipment`). */
+	file?: string;
 	/** Steps whose `WRITES[stepId].openable` is true pass a handler — usually
 	 *  `() => void openSettingsFile('personal').catch(() => {})`. Omitted (or
 	 *  a no-op) for `equipment`/`shortcuts`, which write outside settings.json
@@ -122,7 +126,7 @@ export function WritesNote({
 		>
 			<span style={{ color: 'var(--fg-faint)' }}>Writes</span>
 			<span className="font-mono" style={{ color: 'var(--fg)' }}>
-				{w.file}
+				{file ?? w.file}
 			</span>
 			<span className="flex-1">{w.note}</span>
 			{w.openable && onOpenFile && (
@@ -149,6 +153,8 @@ interface OnboardingFooterProps {
 	onBack: () => void;
 	onSkip: () => void;
 	onNext: () => void;
+	/** A step commit is in flight: Continue shows busy and ignores clicks. */
+	nextBusy?: boolean;
 }
 
 export function OnboardingFooter({
@@ -160,6 +166,7 @@ export function OnboardingFooter({
 	onBack,
 	onSkip,
 	onNext,
+	nextBusy = false,
 }: OnboardingFooterProps) {
 	const links = SETTINGS_LINKS[stepId];
 	return (
@@ -203,10 +210,12 @@ export function OnboardingFooter({
 					)}
 					<Button
 						onClick={onNext}
+						disabled={nextBusy}
+						aria-busy={nextBusy || undefined}
 						data-testid="wizard-next"
 						className="h-11 px-6 text-sm font-semibold"
 					>
-						{isLast ? 'Enter your Obi' : 'Continue'}
+						{nextBusy ? 'Saving…' : isLast ? 'Enter your Obi' : 'Continue'}
 					</Button>
 				</div>
 			</div>

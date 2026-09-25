@@ -296,6 +296,7 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 					paneId={paneId}
 					onRefresh={bumpKey}
 					history={{ canGoBack, canGoForward, back, forward }}
+					onPinToArtifacts={view.kind === 'artifact' ? () => setPinDialogOpen(true) : undefined}
 				/>
 			)}
 		</div>

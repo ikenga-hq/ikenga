@@ -54,6 +54,7 @@ import {
 	type ConnectorRequirement,
 	resolveRequiredConnectors,
 } from '@/lib/onboarding/resolve-connectors';
+import { loadHome } from '@/lib/home';
 import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	type AgentConfigInventory,
@@ -62,6 +63,12 @@ import {
 	scaffoldAgentConfig,
 } from '@/lib/tauri-cmd';
 import { WritesNote } from '@/shell/onboarding/footer';
+import {
+	effectiveOnboardingScope,
+	onboardingClaudeRoot,
+	useOnboardingScope,
+} from '@/shell/onboarding/scope';
+import { SettingsScopeSwitch } from '@/shell/settings/scope-switch';
 
 import { useOnboardingStep } from './use-onboarding-step';
 
@@ -124,15 +131,18 @@ const ICON_GLYPH: Record<CatalogIconKey, string> = {
 	engine: '⌘',
 };
 
+// @ikenga/tokens role pairs (each `*-soft` is redefined per theme × mode in
+// tokens.css), so the badges follow dark/light instead of the light-only HSL
+// literals the shipped packages step carried.
 const ICON_BG: Record<CatalogIconKey, { bg: string; fg: string }> = {
-	studio: { bg: 'hsl(8,60%,90%)', fg: 'hsl(8,70%,32%)' },
-	tasks: { bg: 'hsl(220,30%,90%)', fg: 'hsl(220,60%,35%)' },
-	mail: { bg: 'hsl(42,60%,88%)', fg: 'hsl(42,80%,30%)' },
-	outbound: { bg: 'hsl(14,60%,90%)', fg: 'hsl(14,70%,32%)' },
-	content: { bg: 'hsl(170,30%,88%)', fg: 'hsl(170,50%,24%)' },
-	sales: { bg: 'hsl(220,20%,88%)', fg: 'hsl(220,30%,24%)' },
-	files: { bg: 'hsl(28,28%,88%)', fg: 'hsl(28,60%,28%)' },
-	engine: { bg: 'hsl(28,40%,90%)', fg: 'hsl(20,60%,32%)' },
+	studio: { bg: 'var(--agent-soft)', fg: 'var(--agent)' },
+	tasks: { bg: 'var(--info-soft)', fg: 'var(--info)' },
+	mail: { bg: 'var(--achievement-soft, var(--bg-raised))', fg: 'var(--achievement)' },
+	outbound: { bg: 'var(--live-soft)', fg: 'var(--live)' },
+	content: { bg: 'var(--systemic-soft, var(--bg-raised))', fg: 'var(--systemic)' },
+	sales: { bg: 'var(--bg-raised)', fg: 'var(--fg-muted)' },
+	files: { bg: 'var(--bg-raised)', fg: 'var(--fg)' },
+	engine: { bg: 'color-mix(in srgb, var(--primary) 14%, transparent)', fg: 'var(--primary)' },
 };
 
 const STARTER_PREVIEW = {
@@ -293,12 +303,38 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 	const selectedAgentId = useShellStore((s) => s.onboarding.selectedAgentId);
 	const activeProject = useShellStore((s) => s.activeProject);
 	const primaryRoot = activeProject?.root_path ?? activeProject?.extra_roots[0] ?? null;
+
+	// D-04 Personal / Project scope switch (shared with the `project` step).
+	// Here it picks WHICH `.claude/` the adopt / merge / scaffold choice acts
+	// on: the project's own (committed with the repo) or the personal
+	// `~/.claude/` (this machine only). Untouched, it stays on the project
+	// whenever there is one — the shipped `scaffolding` step's only target.
+	const explicitScope = useOnboardingScope((s) => s.explicit);
+	const setScope = useOnboardingScope((s) => s.setScope);
+	const scope = effectiveOnboardingScope(explicitScope, primaryRoot);
+	const { data: homeDir } = useQuery({
+		queryKey: ['onboarding', 'home-dir'],
+		queryFn: loadHome,
+		staleTime: Number.POSITIVE_INFINITY,
+	});
+	// Never touch the home `~/.claude/` implicitly: with no project root the
+	// switch falls back to personal on its own, and that fallback must not
+	// scaffold or merge into a directory the user never pointed at. Personal
+	// is a target only once the user picks it (`explicitScope`); until then
+	// the `.claude/` option is off, with the reason shown (§1.2).
+	const personalChosen = scope === 'personal' && explicitScope === 'personal';
+	const claudeRoot = onboardingClaudeRoot(explicitScope, primaryRoot, homeDir);
+	const claudeDirLabel = !claudeRoot
+		? null
+		: scope === 'project'
+			? '<project>/.claude/'
+			: '~/.claude/';
 	const isClaudeAgent = selectedAgentId === 'claude-code';
 
 	const { data: inventory } = useQuery<AgentConfigInventory>({
-		enabled: isClaudeAgent && !!primaryRoot,
-		queryKey: ['onboarding', 'agent-config', 'claude-code', primaryRoot],
-		queryFn: () => detectAgentConfig('claude-code', primaryRoot as string),
+		enabled: isClaudeAgent && !!claudeRoot,
+		queryKey: ['onboarding', 'agent-config', 'claude-code', claudeRoot],
+		queryFn: () => detectAgentConfig('claude-code', claudeRoot as string),
 		refetchOnWindowFocus: false,
 	});
 	const hasExisting = inventory?.config_dir_present === true;
@@ -317,18 +353,18 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 		try {
 			// (a) scaffold, if applicable.
 			let scaffoldingResult: EquipmentScaffoldingResult | undefined;
-			if (!isClaudeAgent || !primaryRoot) {
-				scaffoldingResult = { choice: 'na', rootPath: primaryRoot, profile: 'none', at: Date.now() };
+			if (!isClaudeAgent || !claudeRoot) {
+				scaffoldingResult = { choice: 'na', rootPath: claudeRoot, profile: 'none', at: Date.now() };
 			} else if (hasExisting && claudeDirChoice === 'adopt') {
 				// "Use what is there. Nothing is copied, merged or overwritten —
 				// the shell just reads it." No Rust call.
-				scaffoldingResult = { choice: 'adopt', rootPath: primaryRoot, profile: 'none', at: Date.now() };
+				scaffoldingResult = { choice: 'adopt', rootPath: claudeRoot, profile: 'none', at: Date.now() };
 			} else if (hasExisting && claudeDirChoice === 'leave') {
 				// "The shell will not read this project's .claude/ at all." No
 				// Rust call — and no backing setting exists yet to actually
 				// suppress discovery (flagged in the WP-38 PR body); recorded
 				// as intent only, same as `adopt` does today.
-				scaffoldingResult = { choice: 'leave', rootPath: primaryRoot, profile: 'none', at: Date.now() };
+				scaffoldingResult = { choice: 'leave', rootPath: claudeRoot, profile: 'none', at: Date.now() };
 			} else {
 				// `merge` on an existing dir, or the only path on a fresh one —
 				// both are additive (APPROVAL.md `augment`), never `replace`;
@@ -339,7 +375,7 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 				if (provider) {
 					const result = await scaffoldAgentConfig(
 						provider.agentId,
-						primaryRoot,
+						claudeRoot,
 						STARTER_PREVIEW.profile,
 						mode
 					);
@@ -351,7 +387,7 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 				}
 				scaffoldingResult = {
 					choice: hasExisting ? 'merge' : 'scaffold',
-					rootPath: primaryRoot,
+					rootPath: claudeRoot,
 					profile: STARTER_PREVIEW.profile,
 					at: Date.now(),
 				};
@@ -433,19 +469,28 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						<span className="font-mono text-xs">Ngwa</span>.
 					</p>
 				</div>
+				<SettingsScopeSwitch
+					scope={scope}
+					onScopeChange={setScope}
+					projectAvailable={!!primaryRoot}
+					ariaLabel="Scope"
+					className="flex-none"
+				/>
 			</div>
 
 			<div className="grid gap-10 lg:grid-cols-[1fr_1.2fr]">
 				{/* ── Col A: found on disk + .claude/ choice ─────────────── */}
 				<div>
-					{isClaudeAgent && primaryRoot && hasExisting ? (
+					{isClaudeAgent && claudeRoot && hasExisting ? (
 						<div
 							className="rounded-lg border p-5"
 							style={{ borderColor: 'var(--border-soft)', background: 'var(--bg-surface)' }}
 							data-testid="equipment-claude-dir"
 						>
 							<div className="text-[13px] font-semibold">
-								This project already has a .claude/ directory.
+								{scope === 'project'
+									? 'This project already has a .claude/ directory.'
+									: 'Your personal ~/.claude/ directory already exists.'}
 							</div>
 							{inventory && (
 								<div className="mt-3 grid grid-cols-2 gap-y-1 text-xs sm:grid-cols-4">
@@ -491,10 +536,10 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 								{claudeDirChoice === 'merge' &&
 									'Adds any starter skill, agent or hook that is missing. Existing files are never replaced; conflicts are listed for you to resolve.'}
 								{claudeDirChoice === 'leave' &&
-									'The shell will not read this project’s .claude/ at all. You can turn it on later in Settings › Workspace.'}
+									`The shell will not read ${scope === 'project' ? 'this project’s .claude/' : '~/.claude/'} at all. You can turn it on later in Settings › Workspace.`}
 							</p>
 						</div>
-					) : isClaudeAgent && primaryRoot ? (
+					) : isClaudeAgent && claudeRoot ? (
 						<div
 							className="rounded-lg border p-5"
 							style={{ borderColor: 'var(--border-soft)', background: 'var(--bg-surface)' }}
@@ -521,9 +566,28 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 							style={{ borderColor: 'var(--border-soft)', color: 'var(--fg-muted)' }}
 							data-testid="equipment-no-claude"
 						>
-							{isClaudeAgent
-								? 'No project root selected — add one from the previous step to scaffold .claude/.'
-								: '.claude/ scaffolding only ships for Claude Code today. Skipped for your engine.'}
+							{isClaudeAgent && personalChosen ? (
+								'Locating your personal ~/.claude/…'
+							) : isClaudeAgent ? (
+								<>
+									<div data-testid="equipment-no-claude-reason">
+										No project root — nothing will be written to .claude/. Add a project from the
+										previous step, or choose your personal ~/.claude/ on purpose.
+									</div>
+									<Button
+										type="button"
+										size="sm"
+										variant="outline"
+										className="mt-3"
+										onClick={() => setScope('personal')}
+										data-testid="equipment-use-personal-claude"
+									>
+										Use my personal ~/.claude/
+									</Button>
+								</>
+							) : (
+								'.claude/ scaffolding only ships for Claude Code today. Skipped for your engine.'
+							)}
 						</div>
 					)}
 
@@ -537,7 +601,10 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						</div>
 					)}
 
-					<WritesNote stepId="equipment" />
+					<WritesNote
+						stepId="equipment"
+						file={claudeDirLabel ? `~/.ikenga/pkgs/ + ${claudeDirLabel}` : '~/.ikenga/pkgs/'}
+					/>
 				</div>
 
 				{/* ── Col B: suggested packages + connectors ─────────────── */}

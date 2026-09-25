@@ -11,7 +11,7 @@
 // in `__root.tsx`); this route only handles the in-wizard rendering.
 
 import { Outlet, createFileRoute, redirect } from '@tanstack/react-router';
-import { useMemo } from 'react';
+import { useState } from 'react';
 
 import { useShellStore, ONBOARDING_STEPS } from '@/lib/shell/shell-store';
 import { primeOnboardingResumeFlag } from '@/shell/onboarding/wizard-stepper';
@@ -41,9 +41,17 @@ function OnboardingLayout() {
 	// to decide, per app session, whether this is a "resume" (WP-38 D-04
 	// `resume` state: wizard reopened half-done). See the doc comment on
 	// `primeOnboardingResumeFlag` in `wizard-stepper.tsx`.
-	useMemo(() => {
+	//
+	// A lazy `useState` initialiser, not `useEffect`: the flag must be primed
+	// before the child <WizardStepper> reads it in its own first render, and
+	// a parent's effects only run after its children have rendered. The
+	// initialiser runs exactly once per mount (and the function is idempotent
+	// besides, so StrictMode's double-invoke is harmless) — unlike `useMemo`,
+	// which React may discard and re-run, and which isn't for side effects.
+	useState(() => {
 		primeOnboardingResumeFlag();
-	}, []);
+		return true;
+	});
 	// Edge-to-edge: just an Outlet. The step bodies wrap themselves in
 	// <WizardStepper> which provides the chrome.
 	return <Outlet />;

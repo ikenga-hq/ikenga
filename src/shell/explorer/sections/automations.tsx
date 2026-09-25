@@ -5,6 +5,7 @@ import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { pkgKernelStatus, pkgPreviewManifest } from '@/lib/tauri-cmd';
 import { workflowGraphsFromManifest } from '@/shell/ngwa/use-pkg-workflow-graphs';
+import { cronToWords } from '@/shell/automations/cron-words';
 import type { ExplorerSectionContext } from '../section-registry';
 
 export const automationsContextMenu = [
@@ -64,10 +65,41 @@ export async function listDeclaredWorkflows(): Promise<AutomationItem[]> {
 	}));
 }
 
+interface PkgCronEntry {
+	pkg_id: string;
+	cron_id: string;
+	expr: string;
+	handler: string;
+}
+
+/**
+ * List manifest `cron[]` entries across installed pkgs (WP-42 — Round 32 G-45
+ * follow-up: "manifest cron[] still unlisted"). Reads the same typed
+ * `registries.cron` the WP-16 Ngwa Health Surface's Cron panel already uses
+ * for this data (`ngwa-health-surface.tsx`, DEC-33) rather than re-parsing
+ * `ngwa_snapshot`'s composite description string.
+ *
+ * Exported for the section's test.
+ */
+export async function listCronSchedules(): Promise<AutomationItem[]> {
+	const status = await pkgKernelStatus();
+	const reg = (status.registries?.cron ?? {}) as { entries?: PkgCronEntry[] };
+	const entries = reg.entries ?? [];
+	return entries.map((c) => ({
+		id: `schedule:${c.pkg_id}:${c.cron_id}`,
+		name: c.cron_id,
+		schedule: cronToWords(c.expr),
+		kind: 'schedule' as const,
+	}));
+}
+
 export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 	const query = useQuery<AutomationItem[]>({
 		queryKey: ['explorer-automations', projectId],
-		queryFn: listDeclaredWorkflows,
+		queryFn: async () => {
+			const [workflows, schedules] = await Promise.all([listDeclaredWorkflows(), listCronSchedules()]);
+			return [...schedules, ...workflows];
+		},
 		staleTime: 30_000,
 		retry: false,
 	});

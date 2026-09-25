@@ -1,6 +1,11 @@
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { describe, expect, it, afterEach, vi } from 'vitest';
-import { AutomationsSection, automationsContextMenu, listDeclaredWorkflows } from './automations';
+import {
+  AutomationsSection,
+  automationsContextMenu,
+  listCronSchedules,
+  listDeclaredWorkflows,
+} from './automations';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import * as tauriCmd from '@/lib/tauri-cmd';
 
@@ -140,5 +145,38 @@ describe('AutomationsSection (WP-04 contract / WP-31)', () => {
     expect(items.map((i) => i.id)).toEqual(['com.ikenga.studio:nightly']);
     expect(items[0].kind).toBe('workflow');
     expect(tauriCmd.pkgPreviewManifest).not.toHaveBeenCalledWith('/pkgs/off');
+  });
+
+  it('lists manifest cron[] entries from registries.cron (WP-42, Round 32 G-45)', async () => {
+    vi.mocked(tauriCmd.pkgKernelStatus).mockResolvedValue({
+      api_version: 5,
+      registries: {
+        cron: {
+          entries: [
+            { pkg_id: 'com.ikenga.studio', cron_id: 'nightly-build', expr: '0 2 * * *', handler: 'build' },
+          ],
+        },
+      },
+      installed: [],
+    } as never);
+
+    const items = await listCronSchedules();
+
+    expect(items).toEqual([
+      {
+        id: 'schedule:com.ikenga.studio:nightly-build',
+        name: 'nightly-build',
+        schedule: 'Every day at 02:00',
+        kind: 'schedule',
+      },
+    ]);
+  });
+
+  it('returns no cron schedules when the registry is absent', async () => {
+    vi.mocked(tauriCmd.pkgKernelStatus).mockResolvedValue(
+      kernelStatus([{ id: 'com.ikenga.hello', install_path: '/pkgs/hello' }]),
+    );
+
+    expect(await listCronSchedules()).toEqual([]);
   });
 });

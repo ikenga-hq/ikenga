@@ -1,6 +1,14 @@
 // WP-09 T1 / T6 — the title row has exactly two controls (project chip +
 // branch chip), both keyboard-reachable; the branch chip reads the git pkg's
 // `repo.snapshot` through `pkgSidecarCall` and hides when that fails.
+//
+// WP-46 amendment: "exactly two controls" held unconditionally because
+// nothing in the row was ever platform-gated. Now that the `≡` native-menu
+// cascade button (D-08 `native-menu-win`) mounts on Windows/Linux only, T1
+// and the "hides branch chip" test below pin `mac={true}` explicitly so they
+// keep proving what they always proved (macOS: exactly two/one controls).
+// The new `<NativeMenuCascade />` describe block below covers the non-mac
+// third control.
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render as rtlRender, screen, waitFor } from '@testing-library/react';
@@ -89,14 +97,15 @@ describe('parseRepoSnapshot', () => {
 });
 
 describe('<TitleRow />', () => {
-	it('T1: renders exactly two controls — project chip and branch chip', async () => {
+	it('T1: renders exactly two controls on macOS — project chip and branch chip', async () => {
 		sidecarMock.mockResolvedValue({
 			ok: true,
 			stdout: snapshotStdout({ branch: 'main', detached: false, staged: 0, unstaged: 3 }),
 		});
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await screen.findByTestId('title-branch-chip');
 		const row = screen.getByTestId('title-row');
+		expect(screen.queryByTestId('native-menu-cascade')).toBeNull();
 		expect(tabbables(row)).toHaveLength(2);
 		expect(screen.getByTestId('title-project-chip').textContent).toContain('Label Ops');
 		expect(screen.getByTestId('title-branch-chip').textContent).toContain('main');
@@ -108,7 +117,7 @@ describe('<TitleRow />', () => {
 
 	it('hides the branch chip entirely when the git pkg is absent', async () => {
 		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await waitFor(() => expect(sidecarMock).toHaveBeenCalledTimes(2));
 		expect(screen.queryByTestId('title-branch-chip')).toBeNull();
 		expect(tabbables(screen.getByTestId('title-row'))).toHaveLength(1);
@@ -122,7 +131,7 @@ describe('<TitleRow />', () => {
 			stdout: snapshotStdout({ branch: 'main', detached: false }),
 		});
 		const user = userEvent.setup();
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await screen.findByTestId('title-branch-chip');
 
 		await user.tab();
@@ -149,7 +158,7 @@ describe('daily address reopen (WP-39)', () => {
 
 	it('is absent when not dismissed today — T1 still holds', async () => {
 		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
 		expect(screen.queryByTestId('title-daily-address-reopen')).toBeNull();
 	});
@@ -158,7 +167,7 @@ describe('daily address reopen (WP-39)', () => {
 		useShellStore.setState({ dailyAddressDismissedOn: todayLocalDate() });
 		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
 		const user = userEvent.setup();
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
 
 		const reopen = screen.getByTestId('title-daily-address-reopen');
@@ -170,8 +179,42 @@ describe('daily address reopen (WP-39)', () => {
 	it('stays absent for a past dismissal date (only today suppresses it)', async () => {
 		useShellStore.setState({ dailyAddressDismissedOn: '2000-01-01' });
 		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
-		render(<TitleRow />);
+		render(<TitleRow mac />);
 		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
 		expect(screen.queryByTestId('title-daily-address-reopen')).toBeNull();
+	});
+});
+
+// WP-46 — D-08 `native-menu-win`: the `≡` cascade button is the title row's
+// third control on Windows/Linux (macOS keeps the OS menu bar and renders
+// none of this — see the T1 amendment above).
+describe('<TitleRow /> — native-menu cascade (non-mac)', () => {
+	beforeEach(() => {
+		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
+	});
+
+	it('mounts the ≡ button with the D-08 state marker, as the row’s third control', async () => {
+		render(<TitleRow mac={false} />);
+		const button = await screen.findByTestId('native-menu-button');
+		expect(button).toBeTruthy();
+		const wrapper = screen.getByTestId('native-menu-cascade');
+		expect(wrapper.getAttribute('data-state')).toBe('native-menu-win');
+		expect(tabbables(screen.getByTestId('title-row')).length).toBeGreaterThanOrEqual(1);
+	});
+
+	it('opens the same nine-menu tree as a cascading menu', async () => {
+		const user = userEvent.setup();
+		render(<TitleRow mac={false} />);
+		const button = await screen.findByTestId('native-menu-button');
+		await user.click(button);
+		for (const label of ['Ikenga', 'File', 'Edit', 'View', 'Project', 'Chi', 'Ngwa', 'Window', 'Help']) {
+			expect(await screen.findByText(label)).toBeTruthy();
+		}
+	});
+
+	it('does not mount on macOS', async () => {
+		render(<TitleRow mac />);
+		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
+		expect(screen.queryByTestId('native-menu-cascade')).toBeNull();
 	});
 });

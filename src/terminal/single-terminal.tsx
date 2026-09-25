@@ -139,7 +139,7 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 						heading={`Process exited · code ${tab.exitCode ?? '?'}`}
 						body="The scrollback is kept. Restarting reuses the same working directory and the same engine."
 						fill
-						action={{ label: `Restart ${displayCmd(tab).join(' ')}`, onClick: restart }}
+						action={{ label: 'Restart the session', onClick: restart }}
 					/>
 				);
 			}
