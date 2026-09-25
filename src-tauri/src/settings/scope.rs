@@ -231,11 +231,55 @@ pub async fn resolve_paths(
 
 pub fn read_document(path: &Path) -> Result<Option<SettingsDocument>, String> {
     recover_orphan_backup(path)?;
+    reject_link_path(path, "settings document")?;
     match std::fs::read(path) {
         Ok(bytes) => SettingsDocument::parse(&bytes).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("read {}: {error}", path.display())),
     }
+}
+
+fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn reject_link_path(path: &Path, label: &str) -> Result<(), String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = path.parent() {
+        candidates.push(parent.to_path_buf());
+    }
+    candidates.push(path.to_path_buf());
+    for candidate in candidates {
+        if candidate.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("inspect {label} {}: {error}", candidate.display()));
+            }
+        };
+        if is_link_or_reparse_point(&metadata) {
+            return Err(format!(
+                "refusing linked {label} path {}",
+                candidate.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn write_document(path: &Path, document: &SettingsDocument) -> Result<(), String> {
@@ -244,6 +288,7 @@ pub fn write_document(path: &Path, document: &SettingsDocument) -> Result<(), St
 }
 
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    reject_link_path(path, "settings document")?;
     recover_orphan_backup(path)?;
     let parent = path
         .parent()
@@ -420,5 +465,31 @@ mod tests {
             SettingsScope::Project
         );
         assert!(SettingsScope::parse("workspace").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_and_reads_reject_symlinked_settings_paths() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::TempDir::new().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+
+        let dir = temp.path().join("project").join(".ikenga");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        symlink(victim.join("settings.json"), &path).unwrap();
+        let document = SettingsDocument::default();
+        assert!(write_document(&path, &document).is_err());
+        assert!(read_document(&path).is_err());
+        assert!(!victim.join("settings.json").exists());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        symlink(&victim, &dir).unwrap();
+        let path = dir.join("settings.json");
+        assert!(write_document(&path, &document).is_err());
+        assert!(read_document(&path).is_err());
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
     }
 }

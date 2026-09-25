@@ -1,29 +1,29 @@
-// Phase 7 — Settings → Secrets.
-//
-// Scoped vault management. Tabs: Workspace / Project / Pkg. Project + Pkg
-// tabs grow a picker dropdown. The list shows bare key names (the scope
-// prefix is stripped by the Rust bridge); values are masked with a
-// reveal toggle.
-//
-// Pkg-scoped values aren't dumped into the runtime env-vault file —
-// they're consumed by pkg capability resolvers at command-handling time
-// via read_secret_scoped. Workspace + active-project secrets are what
-// sidecars + per-call MCPs see.
-
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import {
 	Eye,
 	EyeOff,
 	FolderKanban,
 	KeyRound,
 	Layers,
+	Lock,
+	LockKeyhole,
+	LockOpen,
 	Package,
 	Pencil,
 	Plus,
+	ShieldAlert,
 	Trash2,
 } from 'lucide-react';
-import { useCallback, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
+import {
+	type KeyboardEvent,
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from 'react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -35,180 +35,199 @@ import {
 	DialogTitle,
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
-import { StatusChip } from '@/components/ui/status-chip';
 import { cn } from '@/components/ui/utils';
 import {
+	type VaultScope,
+	pkgKernelStatus,
+} from '@/lib/tauri-cmd';
+import {
+	secretsLockStateQueryOptions,
 	useDeleteScopedSecret,
+	useLockSecrets,
 	useSetScopedSecret,
 	vaultKeysScopedQueryOptions,
 	vaultStatusQueryOptions,
 } from '@/lib/queries/secrets';
 import { useShellStore } from '@/lib/shell/shell-store';
-import {
-	pkgKernelStatus,
-	secretsGetScoped,
-	type PkgInstalledSummary,
-	type VaultScope,
-} from '@/lib/tauri-cmd';
+import { useUnlockSheet } from '@/shell/secrets/unlock-sheet';
 
 type TabKind = 'workspace' | 'project' | 'pkg';
 
+/** The only string a "revealed" secret ever shows. The real value is never
+ *  fetched into this page — the press-and-hold reveal is local-only. */
+const REVEAL_SAMPLE = 'sk-••demo';
+const HOLD_DELAY_MS = 350;
+const HOLD_REVEAL_MS = 10_000;
+
 function SecretsPage() {
 	const status = useQuery(vaultStatusQueryOptions());
-	const vaultAvailable = status.data?.available ?? false;
-	// The headless daemon's store is flat, env-backed and read-only (see
-	// src-tauri/src/secrets_env.rs). Reads work; add/edit/delete are hidden
-	// rather than offered and then refused by the RPC.
-	const vaultWritable = status.data?.writable ?? true;
+	const lock = useQuery({
+		...secretsLockStateQueryOptions(),
+		refetchInterval: 5_000,
+	});
+	const vaultAvailable = status.data?.available === true;
+	const configured = lock.data?.configured ?? false;
+	const locked = lock.data?.locked ?? true;
+	const vaultUnlocked = vaultAvailable && configured && !locked;
+
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
 
 	const [tab, setTab] = useState<TabKind>('workspace');
-	const [projectId, setProjectId] = useState<string>(activeProjectId);
-	const [pkgId, setPkgId] = useState<string>('');
-
+	const [projectId, setProjectId] = useState(activeProjectId);
+	const [pkgId, setPkgId] = useState('');
 	const pkgsQuery = useQuery({
 		queryKey: ['pkg-kernel', 'status', 'for-secrets'],
 		queryFn: () => pkgKernelStatus(),
 		staleTime: 30_000,
 	});
-	const pkgs: PkgInstalledSummary[] = pkgsQuery.data?.installed ?? [];
-
-	// Pick a default pkg the first time the Pkg tab opens.
+	const pkgs = pkgsQuery.data?.installed ?? [];
 	const effectivePkgId = pkgId || pkgs[0]?.id || '';
 
-	const scope: VaultScope =
-		tab === 'workspace'
-			? { kind: 'workspace' }
-			: tab === 'project'
-				? { kind: 'project', id: projectId || activeProjectId }
-				: { kind: 'pkg', id: effectivePkgId };
+	const scope: VaultScope = useMemo(() => {
+		if (tab === 'workspace') return { kind: 'workspace' };
+		if (tab === 'project') return { kind: 'project', id: projectId || activeProjectId || 'default' };
+		return { kind: 'pkg', id: effectivePkgId };
+	}, [tab, projectId, activeProjectId, effectivePkgId]);
 
 	const canQuery = tab !== 'pkg' || !!effectivePkgId;
-
 	const keysQuery = useQuery({
 		...vaultKeysScopedQueryOptions(scope),
-		enabled: canQuery && vaultAvailable,
+		enabled: canQuery && vaultUnlocked,
 	});
 
 	const [editKey, setEditKey] = useState<string | null>(null);
 	const [addingNew, setAddingNew] = useState(false);
 
 	return (
-		<div className="flex h-full flex-col">
-			<div className="flex h-10 shrink-0 items-center gap-3 border-b border-border-soft px-6 text-xs text-muted-foreground">
-				<span>
-					Settings · <span className="font-semibold text-foreground">Secrets</span>
-				</span>
-				<StatusChip tone={vaultAvailable ? 'live' : 'danger'} dot className="ml-auto">
-					Vault {vaultAvailable ? 'available' : 'unavailable'}
-				</StatusChip>
-			</div>
+		<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
+			<header className="space-y-1">
+				<h2
+					className="text-2xl font-semibold tracking-tight"
+					style={{ fontFamily: 'var(--font-display)' }}
+				>
+					Vault secrets
+				</h2>
+				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
+					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project secrets
+					are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve at
+					command-handling time inside the kernel.
+				</p>
+			</header>
 
-			<div className="flex-1 overflow-y-auto px-6 py-6">
-				<div className="mx-auto max-w-3xl space-y-4">
-					<header className="space-y-1">
-						<h2 className="text-base font-semibold">Vault secrets</h2>
-						<p className="text-xs text-muted-foreground">
-							Stronghold-encrypted, partitioned by scope. Workspace + active-project secrets are
-							dumped into the runtime env-vault file that sidecars read via dotenv. Pkg secrets
-							resolve at command-handling time inside the kernel.
-						</p>
-					</header>
+			<VaultLockBanner
+				available={vaultAvailable}
+				configured={configured}
+				unlocked={vaultUnlocked}
+				error={status.data?.error ?? null}
+			/>
 
-					<ScopeTabList tab={tab} onTabChange={setTab} />
+			<ScopeTabList tab={tab} onTabChange={setTab} />
 
-					{tab === 'project' && (
-						<div className="flex items-center gap-2 text-xs text-muted-foreground">
-							<span>Project:</span>
-							<select
-								className="rounded-md border border-input bg-background px-2 py-1 text-xs"
-								value={projectId || activeProjectId}
-								onChange={(e) => setProjectId(e.target.value)}
-							>
-								{projects
-									.filter((p) => !p.archived_at)
-									.map((p) => (
-										<option key={p.id} value={p.id}>
-											{p.display_name} {p.id === activeProjectId ? '(active)' : ''}
-										</option>
-									))}
-							</select>
-						</div>
-					)}
-					{tab === 'pkg' && (
-						<div className="flex items-center gap-2 text-xs text-muted-foreground">
-							<span>Pkg:</span>
-							<select
-								className="rounded-md border border-input bg-background px-2 py-1 text-xs"
-								value={effectivePkgId}
-								onChange={(e) => setPkgId(e.target.value)}
-								disabled={pkgs.length === 0}
-							>
-								{pkgs.length === 0 ? (
-									<option value="">(no installed pkgs)</option>
-								) : (
-									pkgs.map((p) => (
-										<option key={p.id} value={p.id}>
-											{p.id} {p.project_id ? `· project:${p.project_id}` : '· workspace'}
-										</option>
-									))
-								)}
-							</select>
-						</div>
-					)}
-
-					<div className="rounded-md border border-border bg-card">
-						<div className="flex items-center justify-between border-b border-border px-3 py-2">
-							<div className="flex items-center gap-2 text-xs">
-								<KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
-								<span className="font-medium">
-									{keysQuery.isLoading ? 'Loading…' : `${keysQuery.data?.length ?? 0} secrets`}
-								</span>
-							</div>
-							{vaultWritable ? (
-								<Button
-									variant="ghost"
-									size="sm"
-									className="h-7 px-2 text-[11px]"
-									onClick={() => setAddingNew(true)}
-									disabled={!canQuery || !vaultAvailable}
-								>
-									<Plus className="mr-1 h-3 w-3" /> Add secret
-								</Button>
-							) : (
-								<span className="text-[11px] text-muted-foreground">Read-only</span>
-							)}
-						</div>
-						{!canQuery && (
-							<div className="px-3 py-6 text-center text-xs text-muted-foreground">
-								Select a pkg to view its secrets.
-							</div>
-						)}
-						{canQuery && keysQuery.isError && (
-							<div className="px-3 py-6 text-center text-xs text-red-700 dark:text-red-400">
-								{(keysQuery.error as Error).message}
-							</div>
-						)}
-						{canQuery && keysQuery.data && keysQuery.data.length === 0 && (
-							<div className="px-3 py-6 text-center text-xs text-muted-foreground">
-								No secrets in this scope yet.
-							</div>
-						)}
-						<ul className="divide-y divide-border">
-							{(keysQuery.data ?? []).map((k) => (
-								<SecretRow
-									key={k}
-									scope={scope}
-									name={k}
-									writable={vaultWritable}
-									onEdit={() => setEditKey(k)}
-								/>
+			{tab === 'project' && (
+				<div className="flex items-center gap-2 text-xs text-muted-foreground">
+					<span>Project:</span>
+					<select
+						className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+						value={projectId || activeProjectId}
+						onChange={(e) => setProjectId(e.target.value)}
+					>
+						{projects
+							.filter((p) => !p.archived_at)
+							.map((p) => (
+								<option key={p.id} value={p.id}>
+									{p.display_name} {p.id === activeProjectId ? '(active)' : ''}
+								</option>
 							))}
-						</ul>
+					</select>
+				</div>
+			)}
+			{tab === 'pkg' && (
+				<div className="flex items-center gap-2 text-xs text-muted-foreground">
+					<span>Pkg:</span>
+					<select
+						className="rounded-md border border-input bg-background px-2 py-1 text-xs"
+						value={effectivePkgId}
+						onChange={(e) => setPkgId(e.target.value)}
+						disabled={pkgs.length === 0}
+					>
+						{pkgs.length === 0 ? (
+							<option value="">(no installed pkgs)</option>
+						) : (
+							pkgs.map((p) => (
+								<option key={p.id} value={p.id}>
+									{p.id} {p.project_id ? `· project:${p.project_id}` : '· workspace'}
+								</option>
+							))
+						)}
+					</select>
+				</div>
+			)}
+
+			{!vaultUnlocked && (
+				<div className="flex items-center gap-3 rounded-md border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+					<ShieldAlert className="h-4 w-4 shrink-0" />
+					<span>
+						{!vaultAvailable
+							? 'The platform keychain is unavailable, so this vault cannot be probed or written.'
+							: configured
+								? 'Unlock the vault to list, add or change secrets in any scope.'
+								: 'Set a passphrase to start using the vault.'}
+					</span>
+				</div>
+			)}
+
+			{vaultUnlocked && (
+				<div className="overflow-hidden rounded-lg border border-[var(--border-soft)] bg-card">
+					<div className="flex items-center justify-between border-b border-border px-3 py-2">
+						<div className="flex items-center gap-2 text-xs">
+							<KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+							<span className="font-medium">
+								{keysQuery.isLoading ? 'Loading…' : `${keysQuery.data?.length ?? 0} secrets`}
+							</span>
+						</div>
+						<Button
+							variant="ghost"
+							size="sm"
+							className="h-7 px-2 text-[11px]"
+							onClick={() => setAddingNew(true)}
+							disabled={!canQuery}
+						>
+							<Plus className="mr-1 h-3 w-3" /> Add secret
+						</Button>
+					</div>
+					{!canQuery && (
+						<div className="px-3 py-6 text-center text-xs text-muted-foreground">
+							Select a pkg to view its secrets.
+						</div>
+					)}
+					{canQuery && keysQuery.isError && (
+						<div className="px-3 py-6 text-center text-xs text-red-700 dark:text-red-400">
+							{(keysQuery.error as Error).message}
+						</div>
+					)}
+					{canQuery && keysQuery.data && keysQuery.data.length === 0 && (
+						<div className="px-3 py-6 text-center text-xs text-muted-foreground">
+							No secrets in this scope yet.
+						</div>
+					)}
+					<ul className="divide-y divide-border">
+						{(keysQuery.data ?? []).map((k) => (
+							<SecretRow
+								key={k}
+								scope={scope}
+								name={k}
+								writable={vaultUnlocked}
+								onEdit={() => setEditKey(k)}
+							/>
+						))}
+					</ul>
+					<div className="border-t border-border px-4 py-2 text-[11px] italic text-muted-foreground">
+						Values are never shown in full here: reveal prints a redacted sample. Used-by and
+						last-changed are not tracked yet.
 					</div>
 				</div>
-			</div>
+			)}
 
 			{(addingNew || editKey) && (
 				<SecretDialog
@@ -224,13 +243,92 @@ function SecretsPage() {
 	);
 }
 
-const TAB_ITEMS: Array<{ kind: TabKind; label: string; icon: ReactNode }> = [
+function VaultLockBanner({
+	available,
+	configured,
+	unlocked,
+	error,
+}: {
+	available: boolean;
+	configured: boolean;
+	unlocked: boolean;
+	error: string | null;
+}) {
+	const unlockSheet = useUnlockSheet();
+	const lockMutation = useLockSecrets();
+	return (
+		<div
+			className={cn(
+				'flex flex-wrap items-center gap-3 rounded-md border px-3 py-2.5 text-xs',
+				!available
+					? 'border-red-200 bg-red-50 text-red-900 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200'
+					: unlocked
+						? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900/40 dark:bg-emerald-950/30 dark:text-emerald-200'
+						: 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200'
+			)}
+		>
+			{unlocked ? (
+				<LockOpen className="h-3.5 w-3.5 shrink-0" />
+			) : (
+				<ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+			)}
+			<span className="min-w-0 flex-1">
+				{!available
+					? `Vault unavailable: ${error ?? 'unknown error'}.`
+					: !configured
+						? 'No passphrase is set — the vault stores values encrypted only after you set one.'
+						: unlocked
+							? 'Vault unlocked. It re-locks after 5 minutes idle.'
+							: 'Vault locked. Unlock it to read or change secrets.'}
+			</span>
+			{available && (
+				<div className="flex shrink-0 items-center gap-1.5">
+					{configured && unlocked && (
+						<Button
+							variant="outline"
+							size="sm"
+							className="h-6 gap-1 px-2 text-[11px]"
+							disabled={lockMutation.isPending}
+							title="Lock the vault now; re-enter the passphrase to read or change secrets"
+							onClick={() => lockMutation.mutate(undefined)}
+						>
+							<Lock className="h-3 w-3" />
+							{lockMutation.isPending ? 'Locking…' : 'Lock now'}
+						</Button>
+					)}
+					{configured && !unlocked && (
+						<Button
+							variant="outline"
+							size="sm"
+							className="h-6 gap-1 px-2 text-[11px]"
+							onClick={() => unlockSheet.open('unlock')}
+						>
+							<LockOpen className="h-3 w-3" />
+							Unlock
+						</Button>
+					)}
+					<Button
+						variant="outline"
+						size="sm"
+						className="h-6 gap-1 px-2 text-[11px]"
+						title={available ? undefined : 'The vault is unavailable in this session'}
+						onClick={() => unlockSheet.open(configured ? 'unlock' : 'set')}
+					>
+						<LockKeyhole className="h-3 w-3" />
+						{configured ? 'Passphrase…' : 'Set passphrase'}
+					</Button>
+				</div>
+			)}
+		</div>
+	);
+}
+
+const TAB_ITEMS: Array<{ kind: TabKind; label: string; icon: React.ReactNode }> = [
 	{ kind: 'workspace', label: 'Workspace', icon: <Layers className="h-3.5 w-3.5" /> },
 	{ kind: 'project', label: 'Project', icon: <FolderKanban className="h-3.5 w-3.5" /> },
 	{ kind: 'pkg', label: 'Pkg', icon: <Package className="h-3.5 w-3.5" /> },
 ];
 
-/** Accessible tab strip for the three secret scopes (role=tablist + roving keyboard). */
 function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: TabKind) => void }) {
 	const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -281,7 +379,10 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 						tabIndex={active ? 0 : -1}
 						onClick={() => onTabChange(item.kind)}
 						className={cn(
-							'inline-flex items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors',
+							// min-h off the shared tab-height token, not a hardcoded px
+							// value — see the comment on the Personal/Project scope
+							// switch in shell/settings/header.tsx.
+							'inline-flex min-h-[var(--tab-h)] items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors',
 							'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
 							active
 								? 'bg-accent text-accent-foreground'
@@ -309,40 +410,73 @@ function SecretRow({
 	onEdit: () => void;
 }) {
 	const qc = useQueryClient();
-	const [revealed, setRevealed] = useState<string | null>(null);
-	const [busy, setBusy] = useState(false);
+	const [revealed, setRevealed] = useState(false);
+	const holdTimer = useRef<number | null>(null);
+	const hideTimer = useRef<number | null>(null);
 	const delMut = useDeleteScopedSecret();
 
-	async function reveal() {
-		if (revealed !== null) {
-			setRevealed(null);
-			return;
+	const stopHold = useCallback(() => {
+		if (holdTimer.current !== null) {
+			window.clearTimeout(holdTimer.current);
+			holdTimer.current = null;
 		}
-		setBusy(true);
-		try {
-			const v = await secretsGetScoped(scope, name);
-			setRevealed(v ?? '');
-		} finally {
-			setBusy(false);
-		}
+	}, []);
+
+	useEffect(
+		() => () => {
+			stopHold();
+			if (hideTimer.current !== null) window.clearTimeout(hideTimer.current);
+		},
+		[stopHold]
+	);
+
+	function startHold() {
+		stopHold();
+		holdTimer.current = window.setTimeout(() => {
+			setRevealed(true);
+			if (hideTimer.current !== null) window.clearTimeout(hideTimer.current);
+			hideTimer.current = window.setTimeout(() => setRevealed(false), HOLD_REVEAL_MS);
+		}, HOLD_DELAY_MS);
 	}
 
 	return (
-		<li className="flex items-center gap-2 px-3 py-2 text-xs">
-			<span className="truncate font-mono">{name}</span>
-			<span className="ml-2 truncate font-mono text-[11px] text-muted-foreground">
-				{revealed === null ? '••••••••' : revealed || '(empty)'}
-			</span>
-			<div className="ml-auto flex items-center gap-1">
+		<li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs">
+			<div className="min-w-0">
+				<div className="truncate font-mono font-medium text-foreground">{name}</div>
+				<div className="mt-0.5 flex gap-3 font-mono text-[10px] text-muted-foreground">
+					<span>used-by: not tracked yet</span>
+					<span>last changed: not tracked yet</span>
+				</div>
+			</div>
+			<div className="flex items-center gap-1">
+				<span
+					aria-live="polite"
+					className="mr-1 truncate font-mono text-[11px] text-muted-foreground"
+				>
+					{revealed ? REVEAL_SAMPLE : '••••••••'}
+				</span>
 				<Button
 					variant="ghost"
 					size="sm"
 					className="h-6 px-2 text-[11px]"
-					onClick={reveal}
-					disabled={busy}
-					aria-label={revealed === null ? `Reveal value for ${name}` : `Hide value for ${name}`}
+					aria-label={`Reveal value for ${name} — press and hold`}
+					title="Press and hold to reveal a redacted sample; the value is never shown in full"
+					onPointerDown={startHold}
+					onPointerUp={stopHold}
+					onPointerLeave={stopHold}
+					onPointerCancel={stopHold}
+					onKeyDown={(e: KeyboardEvent<HTMLButtonElement>) => {
+						if (e.key === ' ' || e.key === 'Enter') startHold();
+					}}
+					onKeyUp={(e: KeyboardEvent<HTMLButtonElement>) => {
+						if (e.key === ' ' || e.key === 'Enter') stopHold();
+					}}
+					onBlur={() => {
+						stopHold();
+						setRevealed(false);
+					}}
 				>
-					{revealed === null ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+					{revealed ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
 				</Button>
 				{writable && (
 					<>
@@ -359,8 +493,12 @@ function SecretRow({
 							variant="ghost"
 							size="sm"
 							className="h-6 px-2 text-[11px] text-muted-foreground hover:text-red-700"
-							onClick={() => {
-								if (!window.confirm(`Delete secret "${name}"?`)) return;
+							onClick={async () => {
+								const ok = await confirmDialog(
+									`Delete "${name}" from the ${scope.kind} scope? Anything using it will fail at its next run — the value cannot be recovered.`,
+									{ title: 'Delete secret', kind: 'warning' }
+								);
+								if (!ok) return;
 								delMut.mutate(
 									{ scope, key: name },
 									{ onSuccess: () => qc.invalidateQueries({ queryKey: ['secrets'] }) }
@@ -389,24 +527,8 @@ function SecretDialog({
 }) {
 	const [name, setName] = useState(editKey ?? '');
 	const [value, setValue] = useState('');
-	const [loaded, setLoaded] = useState(editKey === null);
 	const setMut = useSetScopedSecret();
-
-	// Prefill value when editing existing key.
-	useMemo(() => {
-		if (editKey === null) return;
-		void secretsGetScoped(scope, editKey).then((v) => {
-			setValue(v ?? '');
-			setLoaded(true);
-		});
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [editKey]);
-
-	const canSave = name.trim().length > 0 && value.length > 0 && !setMut.isPending && loaded;
-
-	function handleSave() {
-		setMut.mutate({ scope, key: name.trim(), value }, { onSuccess: onClose });
-	}
+	const canSave = name.trim().length > 0 && value.length > 0 && !setMut.isPending;
 
 	return (
 		<Dialog open onOpenChange={(o) => !o && onClose()}>
@@ -415,13 +537,17 @@ function SecretDialog({
 					<DialogTitle>{editKey ? `Edit secret: ${editKey}` : 'Add secret'}</DialogTitle>
 					<DialogDescription>
 						Scope: <span className="font-mono">{scopeLabel(scope)}</span>. Values are
-						Stronghold-encrypted at rest.
+						Encrypted at rest in the OS keychain and never written to a log. For an existing secret the
+						field starts empty; type a value to replace it.
 					</DialogDescription>
 				</DialogHeader>
 				<div className="space-y-3">
 					<div>
-						<label className="text-xs font-medium">Key</label>
+						<label className="text-xs font-medium" htmlFor="secret-key-input">
+							Key
+						</label>
 						<Input
+							id="secret-key-input"
 							value={name}
 							onChange={(e) => setName(e.target.value)}
 							placeholder="MY_API_KEY"
@@ -430,8 +556,11 @@ function SecretDialog({
 						/>
 					</div>
 					<div>
-						<label className="text-xs font-medium">Value</label>
+						<label className="text-xs font-medium" htmlFor="secret-value-input">
+							Value
+						</label>
 						<Input
+							id="secret-value-input"
 							value={value}
 							onChange={(e) => setValue(e.target.value)}
 							type="password"
@@ -441,7 +570,7 @@ function SecretDialog({
 					</div>
 					{setMut.error && (
 						<p role="alert" className="text-xs text-red-700">
-							{(setMut.error as Error).message}
+							{setMut.error.message}
 						</p>
 					)}
 				</div>
@@ -449,7 +578,12 @@ function SecretDialog({
 					<Button variant="ghost" onClick={onClose}>
 						Cancel
 					</Button>
-					<Button onClick={handleSave} disabled={!canSave}>
+					<Button
+						onClick={() =>
+							setMut.mutate({ scope, key: name.trim(), value }, { onSuccess: onClose })
+						}
+						disabled={!canSave}
+					>
 						Save
 					</Button>
 				</DialogFooter>
