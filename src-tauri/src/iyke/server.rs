@@ -66,7 +66,9 @@ use super::projects::{
     get_project_active, get_project_list, post_project_archive, post_project_create,
     post_project_set_active, post_project_update,
 };
-use super::secrets::{get_secret, get_secret_list, post_secret_delete, post_secret_set};
+use super::secrets::{
+    get_secret, get_secret_list, get_secret_lock_state, post_secret_delete, post_secret_set,
+};
 use super::state::IykeState;
 use super::statusline::{get_statusline_snapshot, post_statusline_event};
 use super::tasks::{get_task_list, post_task_complete, post_task_create, post_task_update};
@@ -267,6 +269,7 @@ pub async fn serve(
         .route("/iyke/secret/list", get(get_secret_list))
         .route("/iyke/secret/set", post(post_secret_set))
         .route("/iyke/secret/delete", post(post_secret_delete))
+        .route("/iyke/secrets/lock-state", get(get_secret_lock_state))
         // Memory primitives (Phase 1 — DESIGN.md §4-6).
         .route("/iyke/scratchpad/write", post(post_scratchpad_write))
         .route("/iyke/scratchpad/append", post(post_scratchpad_append))

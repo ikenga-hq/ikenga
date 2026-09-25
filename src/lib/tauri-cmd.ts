@@ -685,35 +685,66 @@ export type VaultStatus = {
 	available: boolean;
 	keychainBackend: string;
 	error: string | null;
-	/** Which store answered: Stronghold (desktop) or `IKENGA_SECRET_*` env
-	 *  vars (headless daemon). See `src-tauri/src/secrets_env.rs`. */
-	mode: 'stronghold' | 'env' | string;
-	/** False when the backing store is read-only — the daemon has no vault by
-	 *  design, so set/delete are refused. Callers MUST gate write affordances
-	 *  on this rather than offering buttons that cannot work. */
+	mode: 'stronghold' | 'keychain' | 'env' | 'unknown' | string;
 	writable: boolean;
+	locked: boolean;
+	configured: boolean;
+	idleTimeoutSecs: number;
+	lastActivityUnixMs: number | null;
 };
 
+export type SecretsLockState = {
+	configured: boolean;
+	locked: boolean;
+	idle_timeout_secs: number;
+	last_activity_unix_ms: number | null;
+};
+
+export async function secretsSetPassphrase(
+	passphrase: string,
+	currentPassphrase?: string | null
+): Promise<SecretsLockState> {
+	return invoke('secrets_set_passphrase', {
+		passphrase,
+		currentPassphrase: currentPassphrase ?? null,
+		oldPassphrase: null,
+	});
+}
+
+export async function secretsUnlock(passphrase: string): Promise<SecretsLockState> {
+	return invoke('secrets_unlock', { passphrase });
+}
+
+export async function secretsLock(): Promise<SecretsLockState> {
+	return invoke('secrets_lock');
+}
+
+export async function secretsLockState(): Promise<SecretsLockState> {
+	return invoke('secrets_lock_state');
+}
+
 export async function secretsVaultStatus(): Promise<VaultStatus> {
-	// Rust returns snake_case `keychain_backend`; normalize.
-	//
-	// `mode` / `writable` are additive (both builds send them today), but the
-	// defaults below are deliberately the desktop answer so an older backend
-	// that predates them degrades to "writable Stronghold" rather than
-	// silently disabling every write button.
 	const raw = await invoke<{
-		available: boolean;
-		keychain_backend: string;
-		error: string | null;
+		available?: boolean;
+		keychain_backend?: string;
+		error?: string | null;
 		mode?: string;
 		writable?: boolean;
+		locked?: boolean;
+		configured?: boolean;
+		idle_timeout_secs?: number;
+		last_activity_unix_ms?: number | null;
 	}>('secrets_vault_status');
 	return {
-		available: raw.available,
-		keychainBackend: raw.keychain_backend,
-		error: raw.error,
-		mode: raw.mode ?? 'stronghold',
-		writable: raw.writable ?? true,
+		available: raw.available === true,
+		keychainBackend: raw.keychain_backend ?? 'unavailable',
+		error: raw.error ?? null,
+		mode: raw.mode ?? 'unknown',
+		writable: raw.writable === true,
+		locked: raw.locked !== false,
+		configured: raw.configured === true,
+		idleTimeoutSecs: raw.idle_timeout_secs ?? 0,
+		lastActivityUnixMs: raw.last_activity_unix_ms ?? null,
 	};
 }
 

@@ -39,6 +39,7 @@ export const queryKeys = {
 	secrets: {
 		all: ['secrets'] as const,
 		vaultStatus: () => ['secrets', 'vault-status'] as const,
+		lockState: () => ['secrets', 'lock-state'] as const,
 		keys: () => ['secrets', 'keys'] as const,
 	},
 	fs: {

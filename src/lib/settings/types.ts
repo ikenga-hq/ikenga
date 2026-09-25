@@ -230,12 +230,19 @@ type PersonalSettingsWrite = {
 	};
 }[SettingsPersonalField];
 
-type ProjectSettingsWrite = {
-	[K in SettingsProjectOnlyField]: SettingsWriteBase<K> & {
-		scope: 'project';
-		projectId: string;
-	};
-}[SettingsProjectOnlyField];
+type ProjectSettingsWrite =
+	| {
+			[K in SettingsProjectOnlyField]: SettingsWriteBase<K> & {
+				scope: 'project';
+				projectId: string;
+			};
+	  }[SettingsProjectOnlyField]
+	| {
+			[K in SettingsSharedField]: SettingsWriteBase<K> & {
+				scope: 'project';
+				projectId: string;
+			};
+	  }[SettingsSharedField];
 
 type RootSettingsWrite =
 	| (SettingsWriteBase<'projects.extraRoots'> & {

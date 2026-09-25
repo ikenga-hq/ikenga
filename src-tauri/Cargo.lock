@@ -33,6 +33,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -47,6 +48,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1281,6 +1283,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -3127,8 +3130,10 @@ dependencies = [
 
 [[package]]
 name = "ikenga-desktop"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
  "age",
  "agent-client-protocol",
  "anyhow",
@@ -3137,6 +3142,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap 6.2.1",
+ "dotenvy",
  "flate2",
  "futures-util",
  "glob",
@@ -3157,6 +3163,7 @@ dependencies = [
  "rand 0.8.7",
  "regex",
  "reqwest 0.12.28",
+ "rust-argon2 2.1.0",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3198,12 +3205,13 @@ dependencies = [
  "webview2-com",
  "which",
  "windows-sys 0.60.2",
+ "zeroize",
  "zip 2.4.2",
 ]
 
 [[package]]
 name = "ikenga-server"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "clap",

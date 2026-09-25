@@ -18,6 +18,7 @@ import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
+import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { FilepickerModal } from '@/components/ui/filepicker-modal';
 import { ReauthOverlay } from '@/components/ui/reauth-overlay';
@@ -85,7 +86,9 @@ export async function bootPrimary(): Promise<void> {
 		<React.StrictMode>
 			<ErrorBoundary>
 				<QueryClientProvider client={queryClient}>
-					<RouterProvider router={router} />
+					<SecretsUnlockSheetProvider>
+						<RouterProvider router={router} />
+					</SecretsUnlockSheetProvider>
 					<FilepickerModal />
 					<ReauthOverlay />
 					{import.meta.env?.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}

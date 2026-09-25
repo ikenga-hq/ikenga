@@ -10,14 +10,14 @@
 //   - types: IkengaTheme, IkengaMode, IkengaDensity, IkengaTintStrength,
 //            IkengaWorkspace
 //
-// Theme/mode/density/tintStrength also mirror to settings_kv via Tauri so
-// the user's appearance choices survive "Clear local data" (see
+// Theme/mode/density/tintStrength also mirror into the file-backed settings
+// contract so the user's appearance choices survive "Clear local data" (see
 // `hydrateAppearanceFromRust`).
 
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 
-import { settingsGetAll, settingsWriteField } from '@/lib/tauri-cmd';
+import { settingsReadFile, settingsWriteField } from '@/lib/tauri-cmd';
 import type { SettingsWriteOptions } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
 
@@ -88,9 +88,10 @@ interface IkengaState {
 	setDensity: (d: IkengaDensity) => void;
 	setTintStrength: (s: IkengaTintStrength) => void;
 	setWorkspace: (w: IkengaWorkspace) => void;
-	/** Pull durable appearance prefs from Rust (settings_kv) and overwrite
-	 * local state. If settings_kv is empty, push the current localStorage-
-	 * hydrated snapshot in once. Called once at app boot from `main.tsx`. */
+	/** Pull durable appearance prefs from the personal/project settings
+	 * files and overwrite local state. When no settings file exists yet,
+	 * seed it once from the current localStorage-hydrated snapshot so
+	 * existing users carry over. Called once at app boot from `main.tsx`. */
 	hydrateAppearanceFromRust: () => Promise<void>;
 }
 
@@ -117,9 +118,7 @@ type AppearanceValueMap = {
 let suppressKv = false;
 let appearanceWriteQueue: Promise<void> = Promise.resolve();
 
-function kvSet<K extends AppearanceField>(key: K, value: AppearanceValueMap[K]): void {
-	if (suppressKv) return;
-	const options = { scope: 'personal', field: key, value } as SettingsWriteOptions;
+function queueAppearanceWrite(options: SettingsWriteOptions): void {
 	const next = appearanceWriteQueue
 		.catch(() => {})
 		.then(() => settingsWriteField(options));
@@ -130,13 +129,9 @@ function kvSet<K extends AppearanceField>(key: K, value: AppearanceValueMap[K]):
 	void appearanceWriteQueue.catch(() => {});
 }
 
-function parseKv<T>(raw: string | undefined): T | undefined {
-	if (raw == null) return undefined;
-	try {
-		return JSON.parse(raw) as T;
-	} catch {
-		return undefined;
-	}
+function kvSet<K extends AppearanceField>(key: K, value: AppearanceValueMap[K]): void {
+	if (suppressKv) return;
+	queueAppearanceWrite({ scope: 'personal', field: key, value } as SettingsWriteOptions);
 }
 
 export const useIkengaStore = create<IkengaState>()(
@@ -164,49 +159,54 @@ export const useIkengaStore = create<IkengaState>()(
 				kvSet(KV_TINT, tintStrength);
 			},
 			setWorkspace: (workspace) => set({ workspace }),
-			hydrateAppearanceFromRust: async () => {
-				let all: Record<string, string> = {};
-				try {
-					all = await settingsGetAll();
-				} catch {
-					return;
-				}
-				const hasAny = [KV_THEME, KV_MODE, KV_DENSITY, KV_TINT].some((k) => k in all);
-				if (!hasAny) {
-					// settings_kv has nothing for appearance — seed it from current
-					// localStorage state so existing users carry over.
-					const s = get();
-					suppressKv = true;
-					try {
-						kvSet(KV_THEME, s.theme);
-						kvSet(KV_MODE, s.mode);
-						kvSet(KV_DENSITY, s.density);
-						kvSet(KV_TINT, s.tintStrength);
-					} finally {
-						suppressKv = false;
-					}
-					return;
-				}
+		hydrateAppearanceFromRust: async () => {
+			let result: Awaited<ReturnType<typeof settingsReadFile>>;
+			try {
+				result = await settingsReadFile('personal');
+			} catch {
+				return;
+			}
+			// No Tauri host (browser mode / e2e): invoke resolves null — keep
+			// the localStorage-hydrated snapshot.
+			if (!result) return;
+			if (!result.personalPresent && !result.projectPresent) {
+				const s = get();
 				suppressKv = true;
 				try {
-					const next: Partial<IkengaState> = {};
-					const t = parseKv<IkengaTheme>(all[KV_THEME]);
-					if (t === 'A' || t === 'B' || t === 'C') next.theme = t;
-					const m = parseKv<IkengaMode>(all[KV_MODE]);
-					if (m === 'light' || m === 'dark' || m === 'system') next.mode = m;
-					const d = parseKv<IkengaDensity>(all[KV_DENSITY]);
-					if (d === 'compact' || d === 'comfortable' || d === 'spacious') {
-						next.density = d;
-					}
-					const ts = parseKv<IkengaTintStrength>(all[KV_TINT]);
-					if (ts === 'off' || ts === 'subtle' || ts === 'strong') {
-						next.tintStrength = ts;
-					}
-					set(next);
+					queueAppearanceWrite({ scope: 'personal', field: KV_THEME, value: s.theme });
+					queueAppearanceWrite({ scope: 'personal', field: KV_MODE, value: s.mode });
+					queueAppearanceWrite({ scope: 'personal', field: KV_DENSITY, value: s.density });
+					queueAppearanceWrite({
+						scope: 'personal',
+						field: KV_TINT,
+						value: s.tintStrength,
+					});
 				} finally {
 					suppressKv = false;
 				}
-			},
+				return;
+			}
+			const appearance = result.effective.appearance ?? {};
+			const next: Partial<IkengaState> = {};
+			const t = appearance.theme;
+			if (t === 'A' || t === 'B' || t === 'C') next.theme = t;
+			const m = appearance.mode;
+			if (m === 'light' || m === 'dark' || m === 'system') next.mode = m;
+			const d = appearance.density;
+			if (d === 'compact' || d === 'comfortable' || d === 'spacious') {
+				next.density = d;
+			}
+			const ts = appearance.tintStrength;
+			if (ts === 'off' || ts === 'subtle' || ts === 'strong') {
+				next.tintStrength = ts;
+			}
+			suppressKv = true;
+			try {
+				set(next);
+			} finally {
+				suppressKv = false;
+			}
+		},
 		}),
 		{
 			// Window-namespaced (plans/multi-window WP-05) so a detached window's
