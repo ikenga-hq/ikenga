@@ -83,4 +83,9 @@ export const queryKeys = {
 		finance: () => ['home', 'finance'] as const,
 		boardsPkgStatus: () => ['home', 'boards', 'pkg-status'] as const,
 	},
+	// WP-39 — the Project dashboard's daily address widget row.
+	dailyAddress: {
+		runs: () => ['daily-address', 'runs'] as const,
+		todos: (projectId: string) => ['daily-address', 'todos', projectId] as const,
+	},
 } as const;

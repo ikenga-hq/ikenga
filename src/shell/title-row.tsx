@@ -19,7 +19,7 @@
 // root is not a repo, the chip is hidden entirely (§3.2 row 10).
 
 import { useQuery } from '@tanstack/react-query';
-import { ChevronDown, Folder, FolderKanban, GitBranch, Plus } from 'lucide-react';
+import { ChevronDown, Folder, FolderKanban, GitBranch, Plus, Sunrise } from 'lucide-react';
 import { useState } from 'react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/components/ui/utils';
@@ -27,6 +27,7 @@ import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { pkgSidecarCall, type Project } from '@/lib/tauri-cmd';
+import { todayLocalDate } from '@/shell/home/daily-address';
 
 const GIT_PKG_ID = 'com.ikenga.git';
 /** Git pkg routes (its manifest's `ui.routes`): `/` is Changes. */
@@ -274,6 +275,29 @@ export function BranchChip() {
 	);
 }
 
+// ─── daily address reopen (WP-39, D-04) ────────────────────────────────────
+// The one control the title row gains beyond WP-09's project + branch chips
+// — but only while the day-start summary is dismissed. On a fresh profile
+// (or any day it hasn't been dismissed yet) this renders nothing, so WP-09's
+// "exactly two controls" contract holds unchanged for the common case.
+
+function DailyAddressReopenButton() {
+	const dismissedOn = useShellStore((s) => s.dailyAddressDismissedOn);
+	const setDailyAddressDismissed = useShellStore((s) => s.setDailyAddressDismissed);
+	if (dismissedOn !== todayLocalDate()) return null;
+	return (
+		<button
+			type="button"
+			data-testid="title-daily-address-reopen"
+			aria-label="Reopen today's daily address"
+			onClick={() => setDailyAddressDismissed(null)}
+			className={cn(CHIP, 'text-muted-foreground')}
+		>
+			<Sunrise aria-hidden className="h-3.5 w-3.5" />
+		</button>
+	);
+}
+
 // ─── the row ───────────────────────────────────────────────────────────────
 
 export function TitleRow() {
@@ -287,6 +311,7 @@ export function TitleRow() {
 		>
 			<ProjectChip />
 			<BranchChip />
+			<DailyAddressReopenButton />
 		</div>
 	);
 }
