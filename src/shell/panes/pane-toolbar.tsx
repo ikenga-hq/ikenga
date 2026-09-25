@@ -1,11 +1,25 @@
 import {
 	ArrowLeft,
 	ArrowRight,
+	Camera,
+	Code2,
+	ExternalLink,
+	FolderOpen,
+	History,
+	Link as LinkIcon,
+	Monitor,
 	MoreHorizontal,
+	Pin as PinIcon,
 	RefreshCw,
+	RotateCcw,
+	Send,
+	Smartphone,
 	SplitSquareHorizontal,
 	SplitSquareVertical,
+	Tablet,
 	X,
+	ZoomIn,
+	ZoomOut,
 } from 'lucide-react';
 import { labelFor } from '@/lib/keymap/registry';
 import type { PaneId, PaneView } from '@/lib/panes/types';
@@ -18,15 +32,22 @@ import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
+	DropdownMenuLabel,
+	DropdownMenuRadioGroup,
+	DropdownMenuRadioItem,
 	DropdownMenuSeparator,
 	DropdownMenuShortcut,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
-import { writeClipboardText } from '@/lib/transport';
-import { pkgWebviewClearSession } from '@/lib/tauri-cmd';
+import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
 import { useState } from 'react';
 import { cn } from '@/components/ui/utils';
+import { handToChi } from '@/shell/companion/companion-store';
+import { usePinsStore } from '@/lib/shell/pins-store';
+import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
+import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
 
 interface PaneToolbarProps {
 	paneId: PaneId;
@@ -45,6 +66,11 @@ interface PaneToolbarProps {
 		back: () => void;
 		forward: () => void;
 	};
+	/** D-08 artifact `⋯` menu — "Pin to Artifacts". The pin dialog itself is
+	 *  owned by `PaneAddressBar` (it's already there for the address bar's own
+	 *  Pin button), so this menu just asks it to open. Only ever passed for an
+	 *  artifact tab. */
+	onPinToArtifacts?: () => void;
 }
 
 // §a11y line (WCAG 1.4.11, non-text contrast ≥ 3:1): IconButton's shared
@@ -86,10 +112,11 @@ const PANE_TOOLS_FOCUS = 'focus-visible:ring-[color-mix(in_srgb,var(--fg)_65%,tr
 // Reveal rule (§6A.1): visible on the focused pane always; on any other pane
 // while *that pane* is hovered or contains focus. The parent `Pane` sets
 // `group/pane` + `data-focused` on its root so this can react to either.
-export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
+export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: PaneToolbarProps) {
 	const splitPane = usePaneStore((s) => s.splitPane);
 	const closePane = usePaneStore((s) => s.closePane);
 	const refreshPane = usePaneStore((s) => s.refreshPane);
+	const revealPath = usePaneStore((s) => s.revealPath);
 	const canSplit = usePaneStore((s) => s.canSplit());
 	const leafCount = usePaneStore((s) => s.leafCount());
 	const activeTab = usePaneStore((s) => {
@@ -101,6 +128,19 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 	const splitTitle = splitDisabled ? 'Max 6 panes' : undefined;
 	const closeDisabled = leafCount <= 1;
 	const canCopyPath = Boolean(activeTab && hasAddressBar(activeTab));
+
+	// D-08 artifact `⋯` menu (designs/pane-chrome.html?state=artifact).
+	const artifactPath = activeTab?.kind === 'artifact' ? activeTab.path : undefined;
+	const isArtifact = artifactPath !== undefined;
+	const isHtmlArtifact = Boolean(artifactPath && isHtmlArtifactPath(artifactPath));
+	const viewerState = useViewerPaneState((s) => s.forPane(paneId));
+	const zoomBy = useViewerPaneState((s) => s.zoomBy);
+	const resetZoom = useViewerPaneState((s) => s.resetZoom);
+	const setDevice = useViewerPaneState((s) => s.setDevice);
+	const setVariant = useViewerPaneState((s) => s.setVariant);
+	const alreadyPinned = usePinsStore((s) =>
+		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
+	);
 
 	return (
 		<div
@@ -131,7 +171,7 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 						<MoreHorizontal className="h-3.5 w-3.5" />
 					</IconButton>
 				</DropdownMenuTrigger>
-				<DropdownMenuContent align="end" className="w-56">
+				<DropdownMenuContent align="end" className="w-64">
 					{history && (
 						<>
 							<DropdownMenuItem disabled={!history.canGoBack} onSelect={() => history.back()}>
@@ -170,6 +210,107 @@ export function PaneTools({ paneId, onRefresh, history }: PaneToolbarProps) {
 								onSelect={() => void writeClipboardText(activeTab.path).catch(() => {})}
 							>
 								Copy path
+							</DropdownMenuItem>
+						</>
+					)}
+					{isArtifact && artifactPath && (
+						<>
+							<DropdownMenuSeparator />
+							<DropdownMenuItem
+								disabled={!isHtmlArtifact}
+								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
+								onSelect={() =>
+									void resolveHtmlViewerUrl(artifactPath)
+										.then((url) => openExternalUrl(url))
+										.catch(() => {})
+								}
+							>
+								<ExternalLink className="h-3.5 w-3.5" />
+								Open in browser
+							</DropdownMenuItem>
+							<DropdownMenuItem
+								onSelect={() => setVariant(paneId, viewerState.variant === 'source' ? 'default' : 'source')}
+							>
+								<Code2 className="h-3.5 w-3.5" />
+								{viewerState.variant === 'source' ? 'Close source' : 'Open source'}
+							</DropdownMenuItem>
+							<DropdownMenuItem onSelect={() => revealPath(artifactPath)}>
+								<FolderOpen className="h-3.5 w-3.5" />
+								Reveal in Files
+							</DropdownMenuItem>
+							<DropdownMenuItem
+								disabled={!isHtmlArtifact}
+								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
+								onSelect={() =>
+									void resolveHtmlViewerUrl(artifactPath)
+										.then((url) => writeClipboardText(url))
+										.catch(() => {})
+								}
+							>
+								<LinkIcon className="h-3.5 w-3.5" />
+								Copy viewer URL
+							</DropdownMenuItem>
+							<DropdownMenuSeparator />
+							<DropdownMenuItem onSelect={() => zoomBy(paneId, 10)}>
+								<ZoomIn className="h-3.5 w-3.5" />
+								Zoom in
+								<DropdownMenuShortcut>⌘+</DropdownMenuShortcut>
+							</DropdownMenuItem>
+							<DropdownMenuItem onSelect={() => zoomBy(paneId, -10)}>
+								<ZoomOut className="h-3.5 w-3.5" />
+								Zoom out
+								<DropdownMenuShortcut>⌘−</DropdownMenuShortcut>
+							</DropdownMenuItem>
+							<DropdownMenuItem onSelect={() => resetZoom(paneId)}>
+								<RotateCcw className="h-3.5 w-3.5" />
+								Reset zoom ({viewerState.zoom}%)
+								<DropdownMenuShortcut>⌘0</DropdownMenuShortcut>
+							</DropdownMenuItem>
+							<DropdownMenuSeparator />
+							<DropdownMenuLabel className="px-2 py-1 text-[10px] uppercase text-muted-foreground">
+								Device width
+							</DropdownMenuLabel>
+							<DropdownMenuRadioGroup
+								value={viewerState.device}
+								onValueChange={(v) => setDevice(paneId, v as DeviceWidth)}
+							>
+								<DropdownMenuRadioItem value="390">
+									<Smartphone className="h-3.5 w-3.5" />
+									390 · phone
+								</DropdownMenuRadioItem>
+								<DropdownMenuRadioItem value="768">
+									<Tablet className="h-3.5 w-3.5" />
+									768 · tablet
+								</DropdownMenuRadioItem>
+								<DropdownMenuRadioItem value="full">
+									<Monitor className="h-3.5 w-3.5" />
+									Full width
+								</DropdownMenuRadioItem>
+							</DropdownMenuRadioGroup>
+							<DropdownMenuSeparator />
+							<DropdownMenuItem onSelect={() => void screenshotPane(paneId).catch(() => {})}>
+								<Camera className="h-3.5 w-3.5" />
+								Screenshot
+							</DropdownMenuItem>
+							<DropdownMenuItem
+								disabled={alreadyPinned}
+								title={alreadyPinned ? 'Already pinned' : undefined}
+								onSelect={() => onPinToArtifacts?.()}
+							>
+								<PinIcon className="h-3.5 w-3.5" />
+								Pin to Artifacts
+							</DropdownMenuItem>
+							<DropdownMenuItem onSelect={() => handToChi(artifactPath)}>
+								<Send className="h-3.5 w-3.5" />
+								Hand to Chi
+							</DropdownMenuItem>
+							<DropdownMenuItem
+								onSelect={() =>
+									setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history')
+								}
+							>
+								<History className="h-3.5 w-3.5" />
+								{viewerState.variant === 'history' ? 'Close version history' : 'Version history'}
 							</DropdownMenuItem>
 						</>
 					)}
