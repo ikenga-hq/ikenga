@@ -1,199 +1,162 @@
 name: CI
 
-# Fast per-PR gate: typecheck + unit tests. Deliberately does NOT build the
-# Tauri bundle — that lives in release.yml and needs Rust, the platform SDKs
-# and ~20 min of runner time. This job exists to catch the class of failure
-# that previously reached main unnoticed: a branch that doesn't compile, or
-# tests that were already red before a PR was opened.
+# Tiered CI. Typecheck + unit tests + `cargo check`/`cargo test` + browser e2e,
+# but not all of it on every push:
 #
-# Workspace layout mirrors release.yml — shell's `workspace:*` deps
-# (@ikenga/contract, @ikenga/tokens) only resolve when the sibling repos are
-# checked out alongside and a pnpm workspace is synthesized at the root.
-# ikenga-pkgs is NOT needed here: it supplies the engine-cc dist and the
-# mcp-iyke source, both of which are Tauri bundle resources rather than
-# TypeScript imports.
+#   fast tier  — every non-draft PR, scoped to what changed:
+#                ACL parity always (seconds, no install); typecheck + unit
+#                tests when TS changed; `cargo check` when Rust changed.
+#   full tier  — adds `cargo test` and the browser-mode frame e2e. Runs for
+#                PRs into `main` (release PRs), PRs labelled `ci:full`, the
+#                nightly schedule on `main`, and manual dispatch.
+#
+# Skipped entirely: draft PRs (marking ready runs it), docs-only changes, and
+# pushes to `main` (the PR already ran; the nightly covers `main`).
+#
+# Deliberately does NOT build the Tauri bundle — that lives in release.yml
+# and needs the platform SDKs and ~20 min of runner time.
 
 on:
   pull_request:
-  push:
-    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'design/**'
+      - '*.png'
+      - 'LICENSE'
+  schedule:
+    - cron: '23 2 * * *' # nightly, full tier on main
+  workflow_dispatch:
 
-# A new push to a PR makes the in-flight run obsolete — cancel it rather than
-# paying for both. `github.ref` is unique per PR, so pushes to different PRs
-# never cancel each other.
+# A new push to a PR makes the in-flight run obsolete — cancel it. Labelling a
+# PR with anything other than `ci:full` gets its own group so it never cancels
+# a real run (the scope job then skips it).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'label' || 'run' }}
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: Typecheck + tests
+  scope:
+    name: Scope + ACL parity
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 5
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+       (github.event.action != 'labeled' || github.event.label.name == 'ci:full'))
+    outputs:
+      ts: ${{ steps.filter.outputs.ts == 'true' || steps.mode.outputs.full == 'true' }}
+      rust: ${{ steps.filter.outputs.rust == 'true' || steps.mode.outputs.full == 'true' }}
+      full: ${{ steps.mode.outputs.full }}
     steps:
-      - name: Checkout shell
-        uses: actions/checkout@v6
-        with:
-          path: shell
+      - uses: actions/checkout@v6
 
-      - name: Checkout @ikenga/contract
-        uses: actions/checkout@v6
-        with:
-          repository: ikenga-hq/ikenga-contract
-          path: contract
-          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Checkout @ikenga/tokens
-        uses: actions/checkout@v6
-        with:
-          repository: ikenga-hq/ikenga-tokens
-          path: tokens
-          token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
-
-      # Same synthesis as release.yml. There is no committed lockfile for this
-      # outer workspace, which is why the install below is --no-frozen-lockfile.
-      - name: Synthesize workspace
+      - name: Choose tier
+        id: mode
         shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          cat > pnpm-workspace.yaml <<'EOF'
-          packages:
-            - shell
-            - contract
-            - tokens
-          EOF
+          full=false
+          if [ "$EVENT" != pull_request ] || [ "$BASE" = main ] || grep -q '"ci:full"' <<<"$LABELS"; then
+            full=true
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "tier: $([ "$full" = true ] && echo full || echo fast)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install bun
-        uses: oven-sh/setup-bun@v2
+      - name: What changed
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
         with:
-          bun-version: latest
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
-
-      - name: Set up Node (for pnpm)
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-
-      - name: pnpm install (workspace root)
-        shell: bash
-        run: pnpm install --no-frozen-lockfile
-
-      # contract and tokens gitignore their dist/, and their package mains
-      # point at ./dist — without this step tsc can't resolve @ikenga/* types.
-      - name: Build workspace siblings (contract, tokens)
-        shell: bash
-        run: |
-          for pkg in '@ikenga/contract' '@ikenga/tokens'; do
-            echo "==> pnpm -F $pkg build"
-            pnpm -F "$pkg" build
-          done
+          filters: |
+            ts:
+              - 'src/**'
+              - 'e2e/**'
+              - 'scripts/**'
+              - 'public/**'
+              - 'index.html'
+              - 'package.json'
+              - 'bun.lock'
+              - 'tsconfig*.json'
+              - '*.config.ts'
+              - 'biome.json'
+              - '.github/**'
+            rust:
+              - 'src-tauri/**'
+              - '.github/**'
 
       # Cheapest gate in the pipeline and the one that would have caught
       # ikenga#140. Since tauri 2.11.2, app commands are ACL-gated for the
       # shell's remote-origin main window, so a command registered in
       # `generate_handler!` but missing from
       # `src-tauri/permissions/app-commands.toml` is dead at runtime while
-      # every compile-time gate stays green. Runs first: it takes milliseconds.
+      # every compile-time gate stays green. The script uses only node
+      # builtins, so it runs without an install.
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: ACL parity (generate_handler! vs app-commands.toml)
-        shell: bash
-        working-directory: shell
         run: bun run test:acl-parity
 
-      - name: Typecheck
-        shell: bash
-        working-directory: shell
-        run: bun run typecheck
-
-      # Runs after typecheck so a compile break reports as a compile break
-      # rather than as a wall of downstream test failures.
-      - name: Unit tests
-        shell: bash
-        working-directory: shell
-        run: bun run test
-
-  # Browser-mode frame harness (WP-19, DEC-27): Playwright drives the React
-  # frame in headless Chromium over a `vite build` + `vite preview` of this
-  # branch, with the Tauri host mocked at the IPC seam
-  # (e2e/fixtures/tauri-mock.ts). Separate job so a red e2e never hides a red
-  # typecheck and vice versa. Same workspace synthesis as `verify` — the frame
-  # imports @ikenga/contract and @ikenga/tokens.
-  e2e:
-    name: Frame e2e (browser mode)
+  verify:
+    name: Typecheck + tests
+    needs: scope
+    if: needs.scope.outputs.ts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 20
     steps:
       - name: Checkout shell
         uses: actions/checkout@v6
         with:
           path: shell
 
-      - name: Checkout @ikenga/contract
-        uses: actions/checkout@v6
+      - uses: ./shell/.github/actions/setup-workspace
         with:
-          repository: ikenga-hq/ikenga-contract
-          path: contract
           token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Checkout @ikenga/tokens
+      - name: Typecheck
+        working-directory: shell
+        run: bun run typecheck
+
+      # After typecheck so a compile break reports as a compile break rather
+      # than as a wall of downstream test failures.
+      - name: Unit tests
+        working-directory: shell
+        run: bun run test
+
+  # Browser-mode frame harness (WP-19, DEC-27): Playwright drives the React
+  # frame in headless Chromium over a `vite build` + `vite preview` of this
+  # branch, with the Tauri host mocked at the IPC seam
+  # (e2e/fixtures/tauri-mock.ts). Full tier only.
+  e2e:
+    name: Frame e2e (browser mode)
+    needs: scope
+    if: needs.scope.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout shell
         uses: actions/checkout@v6
         with:
-          repository: ikenga-hq/ikenga-tokens
-          path: tokens
+          path: shell
+
+      - uses: ./shell/.github/actions/setup-workspace
+        with:
           token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
-
-      - name: Synthesize workspace
-        shell: bash
-        run: |
-          cat > pnpm-workspace.yaml <<'EOF'
-          packages:
-            - shell
-            - contract
-            - tokens
-          EOF
-
-      - name: Install bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
-
-      - name: Set up Node (for pnpm)
-        uses: actions/setup-node@v6
-        with:
-          node-version: 20
-
-      - name: pnpm install (workspace root)
-        shell: bash
-        run: pnpm install --no-frozen-lockfile
-
-      - name: Build workspace siblings (contract, tokens)
-        shell: bash
-        run: |
-          for pkg in '@ikenga/contract' '@ikenga/tokens'; do
-            echo "==> pnpm -F $pkg build"
-            pnpm -F "$pkg" build
-          done
 
       # Browser binaries are not an npm dependency; fetch the Chromium build
       # that matches the installed @playwright/test, plus its apt deps.
       - name: Install Playwright Chromium
-        shell: bash
         working-directory: shell
         run: bunx playwright install --with-deps chromium
 
       - name: Frame e2e
-        shell: bash
         working-directory: shell
         run: bun run test:e2e
 
@@ -206,18 +169,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Rust side of the gate. A separate job so it runs in parallel with the TS
-  # one and reports its own pass/fail rather than hiding behind it.
-  #
-  # `cargo check` only — not `tauri build`, which additionally needs the Vite
-  # output, the ikenga-pkgs checkout for the engine-cc dist, and ~20 min of
-  # runner time. Verified locally that `tauri_build::build()` does NOT require
-  # `frontendDist` to exist, so this job skips the frontend build entirely.
+  # Rust side. `cargo check` whenever Rust changed; `cargo test` on the full
+  # tier only. Not `tauri build` — verified that `tauri_build::build()` does
+  # NOT require `frontendDist` to exist, so the frontend build is skipped.
   rust:
     name: cargo check + test
+    needs: scope
+    if: needs.scope.outputs.rust == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
-
     steps:
       - name: Checkout shell
         uses: actions/checkout@v6
@@ -233,42 +193,42 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Cold check is ~3 min locally; the cache makes the common case far
-      # cheaper. Keyed separately from release.yml's per-target caches.
+      # Keyed separately from release.yml's per-target caches. Only `main`
+      # (the nightly) saves the cache; PR runs restore it, so PR churn can't
+      # evict the warm entry.
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
           key: ci-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check
         working-directory: src-tauri
         run: cargo check --all-targets --message-format=short
 
-      # In-lib unit tests. Every test in this crate is a `#[cfg(test)] mod`
-      # inside src/ — 90 files, with no tests/ or benches/ directory — so
-      # `--lib` covers all of them without building target kinds that don't
-      # exist.
-      #
-      # Reuses what the check step just built, so the marginal cost is codegen
-      # + link of the test binary rather than a second full build. Keep this
-      # scoped: a Tauri debug build is large (check + test filled ~40 GB of
-      # target/ locally), so widening it to --all-targets risks runner disk.
       # Sibling repos the manifest-v5 parity + pkg-fleet tests read (WP-28).
       # `actions/checkout` can't write outside the workspace, so they land
       # under `_siblings/` and the tests are pointed there via env.
       - name: Checkout @ikenga/contract (fixtures)
+        if: needs.scope.outputs.full == 'true'
         uses: actions/checkout@v6
         with:
           repository: ikenga-hq/ikenga-contract
           path: _siblings/contract
       - name: Checkout ikenga-pkgs (manifest fleet)
+        if: needs.scope.outputs.full == 'true'
         uses: actions/checkout@v6
         with:
           repository: ikenga-hq/ikenga-pkgs
           path: _siblings/ikenga-pkgs
 
+      # In-lib unit tests: every test in this crate is a `#[cfg(test)] mod`
+      # inside src/, so `--lib` covers all of them. Reuses what the check step
+      # built. Keep it scoped — widening to --all-targets risks runner disk
+      # (check + test filled ~40 GB of target/ locally).
       - name: cargo test
+        if: needs.scope.outputs.full == 'true'
         working-directory: src-tauri
         env:
           IKENGA_CONTRACT_DIR: ${{ github.workspace }}/_siblings/contract
