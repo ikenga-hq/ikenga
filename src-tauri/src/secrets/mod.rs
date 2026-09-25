@@ -13,5 +13,6 @@ pub use store::{
     StoreErrorKind, UnavailableSecretStore,
 };
 pub use unlock::{
-    LockState, UnlockError, UnlockState, DEFAULT_IDLE_TIMEOUT, UNLOCK_ENVELOPE_FILENAME,
+    LockState, UnlockError, UnlockState, VaultMode, DEFAULT_IDLE_TIMEOUT,
+    UNLOCK_ENVELOPE_FILENAME,
 };

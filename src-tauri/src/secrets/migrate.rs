@@ -628,6 +628,10 @@ mod tests {
             Ok(())
         }
 
+        fn detect_configuration(&self) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
         fn backend_label(&self) -> &'static str {
             "memory"
         }

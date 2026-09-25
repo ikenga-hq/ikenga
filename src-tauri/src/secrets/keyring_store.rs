@@ -918,6 +918,11 @@ impl SecretsStore for KeyringStore {
         Ok(())
     }
 
+    fn detect_configuration(&self) -> Result<bool, StoreError> {
+        // The encrypted value format is `EncryptedStore`'s; it scans for it.
+        Ok(false)
+    }
+
     fn backend_label(&self) -> &'static str {
         self.backend.label()
     }
