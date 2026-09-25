@@ -83,10 +83,12 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 								status: 'running',
 								startTime: Date.now(),
 							});
-						} else if (ev.hook_event_name === 'PostToolUse') {
+						} else if (ev.hook_event_name === 'PostToolUse' || ev.hook_event_name === 'PostToolUseFailure') {
+							// WP-40 registers PostToolUseFailure: an approved tool that errored ends as 'failed'.
+							const endStatus = ev.hook_event_name === 'PostToolUseFailure' ? 'failed' : 'done';
 							const existing = map.get(id);
 							if (existing) {
-								existing.status = 'done';
+								existing.status = endStatus;
 								existing.endTime = Date.now();
 								existing.durationMs = existing.endTime - existing.startTime;
 								existing.tool_output = ev.tool_output;
@@ -96,7 +98,7 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 									tool_name: ev.tool_name || 'Tool',
 									tool_input: ev.tool_input,
 									tool_output: ev.tool_output,
-									status: 'done',
+									status: endStatus,
 									startTime: Date.now(),
 								});
 							}
@@ -133,11 +135,12 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 					];
 				}
 
-				if (payload.hook_event_name === 'PostToolUse') {
+				if (payload.hook_event_name === 'PostToolUse' || payload.hook_event_name === 'PostToolUseFailure') {
+					const endStatus = payload.hook_event_name === 'PostToolUseFailure' ? 'failed' : 'done';
 					if (existingIndex >= 0) {
 						const updated = [...prev];
 						const item = { ...updated[existingIndex] };
-						item.status = 'done';
+						item.status = endStatus;
 						item.endTime = Date.now();
 						item.durationMs = item.endTime - item.startTime;
 						item.tool_output = payload.tool_output;
@@ -151,7 +154,7 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 							tool_name: payload.tool_name || 'Tool',
 							tool_input: payload.tool_input,
 							tool_output: payload.tool_output,
-							status: 'done',
+							status: endStatus,
 							startTime: Date.now(),
 						},
 					];
