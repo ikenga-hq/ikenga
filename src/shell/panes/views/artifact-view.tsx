@@ -152,7 +152,11 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	}
 
 	return (
-		<div className="relative flex h-full w-full flex-col">
+		<div
+			className="relative flex h-full w-full flex-col"
+			// G-55 state map: D-08 `artifact` / `artifact-source` (history carries its own root).
+			data-state={variant === 'source' ? 'artifact-source' : variant === 'history' ? undefined : 'artifact'}
+		>
 			{/* Pop-out affordance — floated top-right over the viewer chrome.
 			    Positioned absolute so it overlays the ViewerRouter's own header
 			    without requiring ViewerRouter to know about multi-window. */}
@@ -224,7 +228,7 @@ function DeviceZoomFrame({
 
 	const width = device === '390' ? 390 : 768;
 	return (
-		<div className="flex h-full w-full flex-col overflow-hidden bg-muted/20">
+		<div data-state="artifact-device" className="flex h-full w-full flex-col overflow-hidden bg-muted/20">
 			{/* `height: '100%'` (not `min-h-[…]`) so the scaled child's own
 			    percentage-based compensation (see `inner` above) has a definite
 			    ancestor height to resolve against all the way up — a `min-h`/auto
