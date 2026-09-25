@@ -968,12 +968,17 @@ async fn rehearsal_5a() {
             }
         }
     }
-    let targets: BTreeSet<&String> = records.iter().map(|(target, _)| target).collect();
+    // Record counts per target (module path only) so the report shows which
+    // code paths actually logged during the run.
+    let mut per_target: BTreeMap<&String, usize> = BTreeMap::new();
+    for (target, _) in &records {
+        *per_target.entry(target).or_default() += 1;
+    }
     report.fact(
         "D.log_scan",
         json!({
             "records_captured": records.len(),
-            "distinct_targets": targets.len(),
+            "records_per_target": per_target,
             "secrets_scanned": secrets.len(),
             "min_secret_len": secrets.iter().map(String::len).min(),
             "hits": hits,
