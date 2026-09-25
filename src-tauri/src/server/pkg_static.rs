@@ -667,6 +667,7 @@ mod tests {
             auth_token: Some("tok".into()),
             allowed_origins: vec![],
             idle_timeout_secs: None,
+            executor_tier: crate::executor::ExecutorTier::T0,
         };
         let router = crate::server::create_router(
             config,

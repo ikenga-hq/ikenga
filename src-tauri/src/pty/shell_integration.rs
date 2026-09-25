@@ -1,7 +1,8 @@
 //! Shell integration hooks emitting OSC 133 prompt markers (WP-08 / T-10).
 
 use std::path::{Path, PathBuf};
-use portable_pty::CommandBuilder;
+
+use crate::executor::SpawnSpec;
 
 const BASH_SCRIPT: &str = include_str!("../../../src/terminal/shell-integration/bash.sh");
 const ZSH_SCRIPT: &str = include_str!("../../../src/terminal/shell-integration/zsh.zsh");
@@ -42,9 +43,11 @@ fi
     Ok(dir)
 }
 
-/// Injects shell integration environment variables and hooks into CommandBuilder.
+/// Injects shell integration environment variables and hooks into the PTY
+/// child's spawn spec. Appended after the caller's env, so these win — the
+/// same precedence they had when this wrote straight to the `CommandBuilder`.
 pub fn inject_shell_integration(
-    builder: &mut CommandBuilder,
+    builder: &mut SpawnSpec,
     exec_bin: &str,
     existing_env: &std::collections::HashMap<String, String>,
 ) {
