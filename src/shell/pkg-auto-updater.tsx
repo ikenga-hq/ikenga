@@ -14,6 +14,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Loader2 } from 'lucide-react';
 import { Banner } from '@/components/ui/banner';
+import { recordPkgUpdatesAvailable } from '@/lib/notifications/record-update';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
 import { useShellStore } from '@/lib/shell/shell-store';
@@ -30,6 +31,23 @@ export function PkgAutoUpdater() {
 	const [progress, setProgress] = useState<UpdateProgress | null>(null);
 	const [doneCount, setDoneCount] = useState<number | null>(null);
 	const [failures, setFailures] = useState<UpdateFailure[]>([]);
+	// WP-40 `update` producer for pkgs: one notification per (pkg, version).
+	// Skipped when auto-install is on — the effect below installs it at once,
+	// so "is available" would be stale on arrival. Rust dedupes per version;
+	// the ref only saves a round-trip per re-render.
+	const announced = useRef<Set<string>>(new Set());
+
+	useEffect(() => {
+		if (autoCheck && autoInstallPkgs) return;
+		const fresh = d.updates.filter(
+			(r) => r.latest && !announced.current.has(`${r.id}@${r.latest}`)
+		);
+		if (!fresh.length) return;
+		for (const r of fresh) announced.current.add(`${r.id}@${r.latest}`);
+		void recordPkgUpdatesAvailable(
+			fresh.map((r) => ({ id: r.id, name: r.name, latest: r.latest }))
+		);
+	}, [autoCheck, autoInstallPkgs, d.updates]);
 
 	useEffect(() => {
 		if (!autoCheck || !autoInstallPkgs) return;

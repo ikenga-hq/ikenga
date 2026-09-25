@@ -15,6 +15,27 @@ export const queryKeys = {
 		list: (projectDir?: string | null) => ['claude_sessions', 'list', projectDir ?? 'all'] as const,
 		detail: (sessionId: string) => ['claude_sessions', 'detail', sessionId] as const,
 	},
+	// WP-40 notification aggregation table. Every mutation and every
+	// `notifications://changed` event invalidates `all`.
+	notifications: {
+		all: ['notifications'] as const,
+		list: (filter: {
+			unreadOnly?: boolean;
+			kinds?: readonly string[];
+			limit?: number;
+			includeMuted?: boolean;
+		} = {}) =>
+			[
+				'notifications',
+				'list',
+				filter.unreadOnly ?? false,
+				[...(filter.kinds ?? [])].sort().join(',') || 'all',
+				filter.limit ?? null,
+				filter.includeMuted ?? false,
+			] as const,
+		unreadCount: () => ['notifications', 'unread-count'] as const,
+		muteState: () => ['notifications', 'mute-state'] as const,
+	},
 	secrets: {
 		all: ['secrets'] as const,
 		vaultStatus: () => ['secrets', 'vault-status'] as const,

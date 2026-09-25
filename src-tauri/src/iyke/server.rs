@@ -58,6 +58,7 @@ use super::memory::{
     post_timer_cancel, post_timer_schedule, post_todo_complete, post_todo_create, post_todo_update,
     TimerScheduler,
 };
+use super::notifications::get_notifications;
 use super::pa_actions::post_pa_actions_pause;
 use super::permissions_audit::get_violations_list;
 use super::pkg_dispatch::pkg_dispatch;
@@ -258,6 +259,8 @@ pub async fn serve(
         // Runtime-ACL violations (2026-05-15). Read-only by design — clearing
         // is a human action via Settings → Pkgs only.
         .route("/iyke/violations/list", get(get_violations_list))
+        // WP-40: read-only notifications view (`iyke notifications list`).
+        .route("/iyke/notifications", get(get_notifications))
         .route("/iyke/layout/get", get(get_layout))
         .route("/iyke/layout/reset", post(post_layout_reset))
         .route("/iyke/secret/get", get(get_secret))
