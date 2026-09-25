@@ -439,6 +439,11 @@ fn copy_atomic(source: &Path, destination: &Path) -> Result<(), String> {
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => {
+            // Directory fsync is a unix concept: on Windows `File::open` on a
+            // directory fails with Access Denied, which aborted every rollback
+            // after its first removal (WP-37). Same split as
+            // `index::replace_file`.
+            #[cfg(unix)]
             if let Some(parent) = path.parent() {
                 fs::File::open(parent)
                     .and_then(|directory| directory.sync_all())
@@ -856,6 +861,16 @@ mod tests {
             fs::read(&paths.legacy).unwrap(),
             b"original-stronghold-snapshot"
         );
+    }
+
+    #[test]
+    fn remove_if_exists_removes_a_file_and_tolerates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets-migration.json");
+        fs::write(&path, b"{}").unwrap();
+        remove_if_exists(&path).unwrap();
+        assert!(!path.exists());
+        remove_if_exists(&path).unwrap();
     }
 
     #[test]
