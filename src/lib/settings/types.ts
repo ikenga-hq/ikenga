@@ -80,6 +80,8 @@ export interface SettingsWorkspace {
 	artifact: SettingsArtifactSettings;
 	lastAgent: { kind: SettingsLastAgentKind; customCommand: string | null };
 	notifications: SettingsNotifications;
+	/** WP-39 / D-04: show the day-start summary on the Project dashboard. Default `true`. */
+	dailyAddress: boolean;
 }
 
 export interface SettingsAppearance {
@@ -181,6 +183,7 @@ export interface SettingsFieldValueMap {
 	'workspace.lastAgent.customCommand': string | null;
 	'workspace.notifications': SettingsNotifications;
 	'workspace.notifications.mutedKinds': string[];
+	'workspace.dailyAddress': boolean;
 	'storage.screenshotDirectory': string | null;
 	'about.updates': SettingsUpdates;
 	'about.updates.autoCheck': boolean;
@@ -199,6 +202,7 @@ export type SettingsPersonalOnlyField =
 	| 'workspace.onboarding'
 	| 'workspace.notifications'
 	| 'workspace.notifications.mutedKinds'
+	| 'workspace.dailyAddress'
 	| 'storage.screenshotDirectory'
 	| 'about.updates'
 	| 'about.updates.autoCheck'
@@ -270,6 +274,7 @@ export const PERSONAL_ONLY_FIELDS = [
 	'workspace.onboarding',
 	'workspace.notifications',
 	'workspace.notifications.mutedKinds',
+	'workspace.dailyAddress',
 	'storage.screenshotDirectory',
 	'about.updates',
 	'about.updates.autoCheck',

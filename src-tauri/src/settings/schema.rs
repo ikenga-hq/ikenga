@@ -26,6 +26,7 @@ pub const RESOLVED_DEFAULT_FIELDS: &[&str] = &[
     "workspace.artifact.artifactSinkOverrides",
     "workspace.artifact.showResolved",
     "workspace.notifications.mutedKinds",
+    "workspace.dailyAddress",
     "storage.screenshotDirectory",
     "about.updates.autoCheck",
     "about.updates.autoInstallApp",
@@ -53,6 +54,7 @@ pub const PERSONAL_ONLY_FIELDS: &[&str] = &[
     "workspace.onboarding",
     "workspace.notifications",
     "workspace.notifications.mutedKinds",
+    "workspace.dailyAddress",
     "storage.screenshotDirectory",
     "about.updates",
     "about.updates.autoCheck",
@@ -521,6 +523,7 @@ pub fn is_known_field(path: &str) -> bool {
             | "workspace.lastAgent.customCommand"
             | "workspace.notifications"
             | "workspace.notifications.mutedKinds"
+            | "workspace.dailyAddress"
             | "storage.screenshotDirectory"
             | "about.updates"
             | "about.updates.autoCheck"
@@ -568,9 +571,9 @@ fn validate_field(path: &str, value: &Value) -> Result<(), String> {
         "engines.resumeTerminals" => ensure_bool(value, &invalid),
         "workspace.userName" | "storage.screenshotDirectory" => ensure_string(value, &invalid),
         "workspace.claudeBrowserMode" => ensure_enum(value, &["layered", "roots"], &invalid),
-        "workspace.claudeWatchEnabled" | "workspace.sidebarCollapsed" => {
-            ensure_bool(value, &invalid)
-        }
+        "workspace.claudeWatchEnabled"
+        | "workspace.sidebarCollapsed"
+        | "workspace.dailyAddress" => ensure_bool(value, &invalid),
         "workspace.explorerSections" => ensure_array(value, &invalid),
         "workspace.onboarding"
         | "workspace.artifact"
@@ -697,6 +700,8 @@ pub fn default_value(path: &str) -> Option<Value> {
         | "workspace.artifact.showResolved" => Some(Value::Object(Map::new())),
         "workspace.lastAgent.kind" | "workspace.lastAgent.customCommand" => Some(Value::Null),
         "workspace.notifications.mutedKinds" => Some(Value::Array(Vec::new())),
+        // WP-39 / D-04: the Project dashboard's day-start summary, on by default.
+        "workspace.dailyAddress" => Some(Value::Bool(true)),
         "storage.screenshotDirectory" => Some(Value::Null),
         "about.updates.autoCheck" => Some(Value::Bool(true)),
         "about.updates.autoInstallApp" => Some(Value::Bool(false)),
@@ -1458,6 +1463,29 @@ mod tests {
         // A project file cannot mute anything.
         let mut project = SettingsDocument::default();
         project.set_field(path, serde_json::json!(["update"])).unwrap();
+        assert!(project.project_overlay().get_field(path).is_none());
+    }
+
+    /// WP-39: `workspace.dailyAddress` — personal-only bool, default `true`.
+    #[test]
+    fn daily_address_field_is_personal_bool_defaulting_on() {
+        let path = "workspace.dailyAddress";
+        assert!(is_known_field(path));
+        assert!(is_personal_only_field(path));
+        assert_eq!(
+            SettingsDocument::default().resolved().get_field(path),
+            Some(&serde_json::json!(true))
+        );
+
+        let mut document = SettingsDocument::default();
+        document.set_field(path, serde_json::json!(false)).unwrap();
+        assert_eq!(document.get_field(path), Some(&serde_json::json!(false)));
+        assert!(document.set_field(path, serde_json::json!("off")).is_err());
+        assert!(SettingsDocument::parse(br#"{"version":1,"workspace":{"dailyAddress":"no"}}"#).is_err());
+
+        // A project file cannot turn it off for the user.
+        let mut project = SettingsDocument::default();
+        project.set_field(path, serde_json::json!(false)).unwrap();
         assert!(project.project_overlay().get_field(path).is_none());
     }
 

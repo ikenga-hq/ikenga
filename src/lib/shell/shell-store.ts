@@ -850,6 +850,21 @@ interface ShellState {
 	/** Pull the project list + active project id from Rust. Safe to call
 	 *  multiple times; rejects silently in non-Tauri test environments. */
 	refreshProjects: () => Promise<void>;
+
+	// ─── Daily address (WP-39, D-04 `daily-address`) ─────────────────────
+	// Plain Zustand-persisted state — deliberately NOT routed through the
+	// settings.json client (unlike userName/sidebarCollapsed/etc above):
+	// this value changes at most once a day and both proposed persistence
+	// homes are equally valid per the WP-39 brief, so the one with no
+	// migrate-arm and no Rust/schema surface wins. Local date (YYYY-MM-DD)
+	// the day-start summary was last dismissed on the Project dashboard;
+	// `null` (or any date other than today) shows it. Included in the
+	// persisted blob by construction (absent from `NOT_PERSISTED` below) —
+	// no `migrateShellStore` version bump, a fresh install simply defaults
+	// to `null` via the same `{...current, ...blob}` merge every other
+	// additive field here relies on.
+	dailyAddressDismissedOn: string | null;
+	setDailyAddressDismissed: (date: string | null) => void;
 }
 
 /** Store keys kept out of the persisted blob (g-state.md §3). */
@@ -1301,6 +1316,9 @@ export const useShellStore = create<ShellState>()(
 					if (get().claudeBrowserMode === claudeBrowserMode) set({ claudeBrowserMode: previous });
 				});
 			},
+
+			dailyAddressDismissedOn: null,
+			setDailyAddressDismissed: (date) => set({ dailyAddressDismissedOn: date }),
 
 			// ─── Onboarding actions ────────────────────────────────────────
 			onboarding: createDefaultOnboardingState(),

@@ -25,6 +25,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
+import { todayLocalDate } from '@/shell/home/daily-address';
 import { GIT_BRANCHES_ROUTE, parseRepoSnapshot, TitleRow } from './title-row';
 
 function render(ui: ReactElement) {
@@ -144,6 +145,43 @@ describe('<TitleRow />', () => {
 		screen.getByTestId('title-project-chip').focus();
 		await user.keyboard('{Enter}');
 		expect(await screen.findByText('Switch project')).toBeTruthy();
+	});
+});
+
+// WP-39 — the one control the title row gains beyond T1's two: hidden by
+// default (T1 above still sees exactly two), shown only while the daily
+// address is dismissed for today.
+describe('daily address reopen (WP-39)', () => {
+	beforeEach(() => {
+		useShellStore.setState({ dailyAddressDismissedOn: null });
+	});
+
+	it('is absent when not dismissed today — T1 still holds', async () => {
+		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
+		render(<TitleRow mac />);
+		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
+		expect(screen.queryByTestId('title-daily-address-reopen')).toBeNull();
+	});
+
+	it('appears once dismissed today, and reopening clears the dismissal', async () => {
+		useShellStore.setState({ dailyAddressDismissedOn: todayLocalDate() });
+		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
+		const user = userEvent.setup();
+		render(<TitleRow mac />);
+		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
+
+		const reopen = screen.getByTestId('title-daily-address-reopen');
+		expect(reopen).toBeInTheDocument();
+		await user.click(reopen);
+		expect(useShellStore.getState().dailyAddressDismissedOn).toBeNull();
+	});
+
+	it('stays absent for a past dismissal date (only today suppresses it)', async () => {
+		useShellStore.setState({ dailyAddressDismissedOn: '2000-01-01' });
+		sidecarMock.mockResolvedValue({ ok: false, stdout: '' });
+		render(<TitleRow mac />);
+		await waitFor(() => expect(sidecarMock).toHaveBeenCalled());
+		expect(screen.queryByTestId('title-daily-address-reopen')).toBeNull();
 	});
 });
 
