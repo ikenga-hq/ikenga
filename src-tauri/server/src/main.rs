@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use ikenga_desktop_lib::executor::ExecutorTier;
 use ikenga_desktop_lib::server::{run_server, ServerConfig};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -52,6 +53,13 @@ pub struct CliArgs {
     /// Idle timeout in seconds before server automatically shuts down when no sessions are active.
     #[arg(long, env = "IKENGA_IDLE_TIMEOUT")]
     pub idle_timeout: Option<u64>,
+
+    /// Session-executor isolation tier (ADR-023): `t0` in-process, `t1`
+    /// per-user uid, `t2` container per session, `t3` firejail per session.
+    /// Only `t0` is implemented on this build; any other tier makes the
+    /// server refuse to start rather than fall back to a weaker one.
+    #[arg(long, env = "IKENGA_EXECUTOR_TIER", default_value = "t0")]
+    pub executor_tier: ExecutorTier,
 }
 
 #[tokio::main]
@@ -75,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         auth_token: args.auth_token,
         allowed_origins: args.allowed_origins,
         idle_timeout_secs: args.idle_timeout,
+        executor_tier: args.executor_tier,
     };
 
     // Clap has read these into `config`; drop them from the process
@@ -102,4 +111,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     run_server(config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executor_tier_defaults_to_t0() {
+        let args = CliArgs::try_parse_from(["ikenga-server"]).unwrap();
+        assert_eq!(args.executor_tier, ExecutorTier::T0);
+    }
+
+    #[test]
+    fn executor_tier_parses_every_tier_from_the_flag() {
+        for tier in ExecutorTier::ALL {
+            let args =
+                CliArgs::try_parse_from(["ikenga-server", "--executor-tier", tier.as_str()])
+                    .unwrap();
+            assert_eq!(args.executor_tier, tier);
+        }
+    }
+
+    #[test]
+    fn unknown_executor_tier_is_a_startup_error() {
+        let err = CliArgs::try_parse_from(["ikenga-server", "--executor-tier", "t9"])
+            .expect_err("t9 names no tier");
+        assert!(err.to_string().contains("t9"), "{err}");
+    }
 }
