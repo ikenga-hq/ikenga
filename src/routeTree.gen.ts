@@ -41,13 +41,12 @@ import { Route as NgwaInstalledRouteImport } from './routes/ngwa/installed'
 import { Route as NgwaScopesRouteImport } from './routes/ngwa/scopes'
 import { Route as NgwaStoreRouteImport } from './routes/ngwa/store'
 import { Route as OnboardingIndexRouteImport } from './routes/onboarding/index'
-import { Route as OnboardingAgentRouteImport } from './routes/onboarding/agent'
-import { Route as OnboardingAppearanceRouteImport } from './routes/onboarding/appearance'
-import { Route as OnboardingConnectorsRouteImport } from './routes/onboarding/connectors'
-import { Route as OnboardingPackagesRouteImport } from './routes/onboarding/packages'
-import { Route as OnboardingRootsRouteImport } from './routes/onboarding/roots'
-import { Route as OnboardingScaffoldingRouteImport } from './routes/onboarding/scaffolding'
-import { Route as OnboardingSummaryRouteImport } from './routes/onboarding/summary'
+import { Route as OnboardingDoneRouteImport } from './routes/onboarding/done'
+import { Route as OnboardingEngineRouteImport } from './routes/onboarding/engine'
+import { Route as OnboardingEquipmentRouteImport } from './routes/onboarding/equipment'
+import { Route as OnboardingLookRouteImport } from './routes/onboarding/look'
+import { Route as OnboardingProjectRouteImport } from './routes/onboarding/project'
+import { Route as OnboardingShortcutsRouteImport } from './routes/onboarding/shortcuts'
 import { Route as OnboardingWelcomeRouteImport } from './routes/onboarding/welcome'
 import { Route as OutboxApprovalsRouteImport } from './routes/outbox/approvals'
 import { Route as OutboxEmailRouteImport } from './routes/outbox/email'
@@ -244,39 +243,34 @@ const OnboardingIndexRoute = OnboardingIndexRouteImport.update({
   path: '/',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingAgentRoute = OnboardingAgentRouteImport.update({
-  id: '/agent',
-  path: '/agent',
+const OnboardingDoneRoute = OnboardingDoneRouteImport.update({
+  id: '/done',
+  path: '/done',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingAppearanceRoute = OnboardingAppearanceRouteImport.update({
-  id: '/appearance',
-  path: '/appearance',
+const OnboardingEngineRoute = OnboardingEngineRouteImport.update({
+  id: '/engine',
+  path: '/engine',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingConnectorsRoute = OnboardingConnectorsRouteImport.update({
-  id: '/connectors',
-  path: '/connectors',
+const OnboardingEquipmentRoute = OnboardingEquipmentRouteImport.update({
+  id: '/equipment',
+  path: '/equipment',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingPackagesRoute = OnboardingPackagesRouteImport.update({
-  id: '/packages',
-  path: '/packages',
+const OnboardingLookRoute = OnboardingLookRouteImport.update({
+  id: '/look',
+  path: '/look',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingRootsRoute = OnboardingRootsRouteImport.update({
-  id: '/roots',
-  path: '/roots',
+const OnboardingProjectRoute = OnboardingProjectRouteImport.update({
+  id: '/project',
+  path: '/project',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingScaffoldingRoute = OnboardingScaffoldingRouteImport.update({
-  id: '/scaffolding',
-  path: '/scaffolding',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingSummaryRoute = OnboardingSummaryRouteImport.update({
-  id: '/summary',
-  path: '/summary',
+const OnboardingShortcutsRoute = OnboardingShortcutsRouteImport.update({
+  id: '/shortcuts',
+  path: '/shortcuts',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
 const OnboardingWelcomeRoute = OnboardingWelcomeRouteImport.update({
@@ -486,13 +480,12 @@ export interface FileRoutesByFullPath {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -559,13 +552,12 @@ export interface FileRoutesByTo {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -636,13 +628,12 @@ export interface FileRoutesById {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -714,13 +705,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -787,13 +777,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -863,13 +852,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -1176,53 +1164,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OnboardingIndexRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/agent': {
-      id: '/onboarding/agent'
-      path: '/agent'
-      fullPath: '/onboarding/agent'
-      preLoaderRoute: typeof OnboardingAgentRouteImport
+    '/onboarding/done': {
+      id: '/onboarding/done'
+      path: '/done'
+      fullPath: '/onboarding/done'
+      preLoaderRoute: typeof OnboardingDoneRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/appearance': {
-      id: '/onboarding/appearance'
-      path: '/appearance'
-      fullPath: '/onboarding/appearance'
-      preLoaderRoute: typeof OnboardingAppearanceRouteImport
+    '/onboarding/engine': {
+      id: '/onboarding/engine'
+      path: '/engine'
+      fullPath: '/onboarding/engine'
+      preLoaderRoute: typeof OnboardingEngineRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/connectors': {
-      id: '/onboarding/connectors'
-      path: '/connectors'
-      fullPath: '/onboarding/connectors'
-      preLoaderRoute: typeof OnboardingConnectorsRouteImport
+    '/onboarding/equipment': {
+      id: '/onboarding/equipment'
+      path: '/equipment'
+      fullPath: '/onboarding/equipment'
+      preLoaderRoute: typeof OnboardingEquipmentRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/packages': {
-      id: '/onboarding/packages'
-      path: '/packages'
-      fullPath: '/onboarding/packages'
-      preLoaderRoute: typeof OnboardingPackagesRouteImport
+    '/onboarding/look': {
+      id: '/onboarding/look'
+      path: '/look'
+      fullPath: '/onboarding/look'
+      preLoaderRoute: typeof OnboardingLookRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/roots': {
-      id: '/onboarding/roots'
-      path: '/roots'
-      fullPath: '/onboarding/roots'
-      preLoaderRoute: typeof OnboardingRootsRouteImport
+    '/onboarding/project': {
+      id: '/onboarding/project'
+      path: '/project'
+      fullPath: '/onboarding/project'
+      preLoaderRoute: typeof OnboardingProjectRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/scaffolding': {
-      id: '/onboarding/scaffolding'
-      path: '/scaffolding'
-      fullPath: '/onboarding/scaffolding'
-      preLoaderRoute: typeof OnboardingScaffoldingRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/summary': {
-      id: '/onboarding/summary'
-      path: '/summary'
-      fullPath: '/onboarding/summary'
-      preLoaderRoute: typeof OnboardingSummaryRouteImport
+    '/onboarding/shortcuts': {
+      id: '/onboarding/shortcuts'
+      path: '/shortcuts'
+      fullPath: '/onboarding/shortcuts'
+      preLoaderRoute: typeof OnboardingShortcutsRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
     '/onboarding/welcome': {
@@ -1474,25 +1455,23 @@ declare module '@tanstack/react-router' {
 }
 
 interface OnboardingRouteRouteChildren {
-  OnboardingAgentRoute: typeof OnboardingAgentRoute
-  OnboardingAppearanceRoute: typeof OnboardingAppearanceRoute
-  OnboardingConnectorsRoute: typeof OnboardingConnectorsRoute
-  OnboardingPackagesRoute: typeof OnboardingPackagesRoute
-  OnboardingRootsRoute: typeof OnboardingRootsRoute
-  OnboardingScaffoldingRoute: typeof OnboardingScaffoldingRoute
-  OnboardingSummaryRoute: typeof OnboardingSummaryRoute
+  OnboardingDoneRoute: typeof OnboardingDoneRoute
+  OnboardingEngineRoute: typeof OnboardingEngineRoute
+  OnboardingEquipmentRoute: typeof OnboardingEquipmentRoute
+  OnboardingLookRoute: typeof OnboardingLookRoute
+  OnboardingProjectRoute: typeof OnboardingProjectRoute
+  OnboardingShortcutsRoute: typeof OnboardingShortcutsRoute
   OnboardingWelcomeRoute: typeof OnboardingWelcomeRoute
   OnboardingIndexRoute: typeof OnboardingIndexRoute
 }
 
 const OnboardingRouteRouteChildren: OnboardingRouteRouteChildren = {
-  OnboardingAgentRoute: OnboardingAgentRoute,
-  OnboardingAppearanceRoute: OnboardingAppearanceRoute,
-  OnboardingConnectorsRoute: OnboardingConnectorsRoute,
-  OnboardingPackagesRoute: OnboardingPackagesRoute,
-  OnboardingRootsRoute: OnboardingRootsRoute,
-  OnboardingScaffoldingRoute: OnboardingScaffoldingRoute,
-  OnboardingSummaryRoute: OnboardingSummaryRoute,
+  OnboardingDoneRoute: OnboardingDoneRoute,
+  OnboardingEngineRoute: OnboardingEngineRoute,
+  OnboardingEquipmentRoute: OnboardingEquipmentRoute,
+  OnboardingLookRoute: OnboardingLookRoute,
+  OnboardingProjectRoute: OnboardingProjectRoute,
+  OnboardingShortcutsRoute: OnboardingShortcutsRoute,
   OnboardingWelcomeRoute: OnboardingWelcomeRoute,
   OnboardingIndexRoute: OnboardingIndexRoute,
 }
