@@ -109,7 +109,7 @@ fn standalone_prompt(comment: &Comment) -> String {
 /// re-route). `override_sink` forces a specific sink; omit to auto-detect.
 #[tauri::command]
 pub async fn comment_route(
-    _app: AppHandle,
+    app: AppHandle,
     db: State<'_, Arc<PaDb>>,
     pty: State<'_, Arc<PtyManager>>,
     cache: State<'_, ChiCache>,
@@ -140,7 +140,10 @@ pub async fn comment_route(
     match chosen {
         RouteSink::Terminal => {
             if let Some((pty_id, fg_name)) = &claude_pty {
-                if pty.write(pty_id, terminal_line(&comment).as_bytes()).is_ok() {
+                if pty
+                    .write(pty_id, terminal_line(&comment).as_bytes())
+                    .is_ok()
+                {
                     pty_id_used = Some(pty_id.clone());
                     pty_foreground_used = Some(fg_name.clone());
                 }
@@ -164,8 +167,15 @@ pub async fn comment_route(
                 resume_session_id: None,
                 persistent: false,
             };
-            let run =
-                spawn_chi_run(db.inner().clone(), &cache, &runtime, opts, "pin").await?;
+            let run = spawn_chi_run(
+                db.inner().clone(),
+                &cache,
+                &runtime,
+                Some(&app),
+                opts,
+                "pin",
+            )
+            .await?;
             run_id_used = Some(run.run_id);
         }
         RouteSink::Clipboard => {
