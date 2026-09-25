@@ -5,7 +5,7 @@
 // (`06-interaction-spec.md` §1.2).
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Clock, History, MoreHorizontal, Play } from 'lucide-react';
+import { Clock, History, Info, Pencil, Play } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { agentOpsRunNow, agentOpsSetEnabled } from '@/lib/tauri-cmd';
 import { AGENT_OPS_JOBS_QUERY_KEY } from './use-automations';
@@ -119,7 +119,7 @@ export function ScheduleTable({ rows, onOpenHistory, onOpenEdit }: ScheduleTable
 									</span>
 								)}
 								{row.paused && (
-									<span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+									<span className="rounded bg-warning-soft px-1.5 py-0.5 text-[10px] text-warning">
 										paused
 									</span>
 								)}
@@ -167,7 +167,7 @@ export function ScheduleTable({ rows, onOpenHistory, onOpenEdit }: ScheduleTable
 									title={row.editDisabledReason ?? undefined}
 									onClick={() => onOpenEdit(row)}
 								>
-									<MoreHorizontal className="h-4 w-4" />
+									{row.editDisabledReason ? <Info className="h-4 w-4" /> : <Pencil className="h-4 w-4" />}
 								</Button>
 							</div>
 						</td>

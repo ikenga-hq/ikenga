@@ -60,6 +60,7 @@ function agentOpsRowsFrom(result: AgentOpsListJobsResult | null): AutomationRow[
 			name: j.label || j.id,
 			cronWords: cronToWordsDialect(j.schedule, j.schedule_dialect),
 			cronExpr: j.schedule,
+			timezone: j.timezone,
 			target: `${j.mode} · ${j.command}`,
 			engine: j.model ?? j.agent ?? (j.mode === 'agent' ? 'claude-code' : '—'),
 			lastRun: j.state?.lastStatus ? `${j.state.lastStatus} · ${fmtMs(j.state?.lastRunAtMs)}` : 'never',
@@ -67,7 +68,11 @@ function agentOpsRowsFrom(result: AgentOpsListJobsResult | null): AutomationRow[
 			filePath: AGENT_OPS_JOBS_FILE,
 			paused: !j.enabled,
 			runNowDisabledReason,
-			pauseDisabledReason: daemonDown ? 'The agent-ops daemon is not running.' : null,
+			// Pause/Resume (agent_ops_set_enabled) is a pure config-file
+			// read/modify/write — unlike Run now, it never contacts the
+			// daemon, so it stays live even when the daemon is down, same as
+			// Edit/Delete below (WP-42-F1: the reason must be honest).
+			pauseDisabledReason: null,
 			editDisabledReason: null,
 			deleteDisabledReason: null,
 			agentOpsJobId: j.id,
@@ -94,6 +99,7 @@ async function workflowRows(status: PkgKernelStatus): Promise<AutomationRow[]> {
 						name: graph.title,
 						cronWords: null,
 						cronExpr: null,
+						timezone: 'UTC',
 						target: `workflow · ${graph.title} (${stepCount} step${stepCount === 1 ? '' : 's'})`,
 						engine: '—',
 						lastRun: '—',
@@ -201,6 +207,7 @@ function manifestCronRows(status: PkgKernelStatus): AutomationRow[] {
 			name: c.cron_id,
 			cronWords: cronToWords(c.expr),
 			cronExpr: c.expr,
+			timezone: 'UTC',
 			target: `${c.pkg_id} · ${c.handler}`,
 			engine: '—',
 			lastRun: '—',

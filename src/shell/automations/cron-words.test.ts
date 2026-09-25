@@ -37,6 +37,15 @@ describe('cronToWords', () => {
 	it('falls back to the raw expression for an unrecognized weekday list', () => {
 		expect(cronToWords('0 9 * * mon-fri')).toBe('at 0 9 * * mon-fri');
 	});
+
+	it('describes a weekday range', () => {
+		expect(cronToWords('0 9 * * 1-5')).toBe('Every Monday-Friday at 09:00');
+	});
+
+	it('falls back for a reversed or degenerate weekday range', () => {
+		expect(cronToWords('0 9 * * 5-1')).toBe('at 0 9 * * 5-1');
+		expect(cronToWords('0 9 * * 1-1')).toBe('at 0 9 * * 1-1');
+	});
 });
 
 describe('cronToWordsDialect', () => {

@@ -78,6 +78,16 @@ export function cronToWords(expr: string): string {
 		return `Every ${names.join('/')} at ${time}`;
 	}
 
+	// Weekday range, e.g. `1-5` — the common "business hours, weekdays" form.
+	const rangeMatch = /^([0-6])-([0-6])$/.exec(dow);
+	if (rangeMatch) {
+		const start = Number(rangeMatch[1]);
+		const end = Number(rangeMatch[2]);
+		if (end > start) {
+			return `Every ${WEEKDAYS[start]}-${WEEKDAYS[end]} at ${time}`;
+		}
+	}
+
 	return `at ${expr}`;
 }
 

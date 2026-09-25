@@ -18,6 +18,11 @@ export interface AutomationRow {
 	 *  separately (D-07 rule). `null` for a workflow with no schedule trigger. */
 	cronWords: string | null;
 	cronExpr: string | null;
+	/** IANA timezone the schedule runs in. Round-tripped from the daemon's own
+	 *  record (`AgentOpsRawJob.timezone`) so editing and saving a job never
+	 *  silently rewrites it to UTC (WP-42-F0). `'UTC'` for read-only sources
+	 *  that carry no timezone concept. */
+	timezone: string;
 	/** What runs — e.g. `skill · release-status`, `shell · build.sh`, `workflow · Nightly Build`. */
 	target: string;
 	/** Engine id, or `—` for a bare shell command / no-engine source. */
