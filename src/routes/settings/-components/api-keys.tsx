@@ -24,6 +24,7 @@ import {
 	vaultKeysQueryOptions,
 	vaultStatusQueryOptions,
 } from '@/lib/queries/secrets';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 
 import { REVEAL_TIMEOUT_MS } from './clear-data';
 
