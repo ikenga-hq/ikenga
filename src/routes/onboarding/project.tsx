@@ -12,7 +12,9 @@ export const Route = createFileRoute('/onboarding/project')({
 function ProjectStep() {
 	return (
 		<WizardStepper stepId="project">
-			{({ goNext }) => <ProjectBody onContinue={goNext} />}
+			{({ goNext, setBeforeNext }) => (
+				<ProjectBody onContinue={goNext} registerBeforeNext={setBeforeNext} />
+			)}
 		</WizardStepper>
 	);
 }

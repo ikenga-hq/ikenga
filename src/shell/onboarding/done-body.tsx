@@ -331,6 +331,18 @@ function renderCard(
 			const p = rec.payload as ProjectStepPayload | undefined;
 			const rootCount = p?.extraRoots?.length ?? ctx.extraRoots.length;
 			const rootSample = (p?.extraRoots ?? ctx.extraRoots).slice(0, 3).join('\n') || '(no project roots)';
+			const extra = `${rootCount} extra root${rootCount === 1 ? '' : 's'}`;
+			// D-04 `done`: "royalti-co · ~/…/royalti-co" or "Empty workspace".
+			if (p?.mode === 'empty') {
+				return { ...base, value: `Empty workspace · ${extra}`, detail: rootSample };
+			}
+			if (p?.mode === 'detected' && p.projectRoot) {
+				return {
+					...base,
+					value: `${p.projectName ?? p.projectRoot} · ${p.projectRoot}`,
+					detail: `${extra}\n${rootSample}`,
+				};
+			}
 			return {
 				...base,
 				value: `${rootCount} project root${rootCount === 1 ? '' : 's'}`,

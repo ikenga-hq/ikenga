@@ -12,6 +12,7 @@ import type {
 	SettingsFileResult,
 	SettingsOnboarding,
 	SettingsPersonalField,
+	SettingsScope,
 	SettingsWriteEntry,
 	SettingsWriteOptions,
 } from '@/lib/settings/types';
@@ -236,8 +237,11 @@ function rootSettingsEntry(
 	projectId: string,
 	value: string[],
 	project: Project | undefined,
+	scope?: SettingsScope,
 ): SettingsWriteEntry {
-	if (projectCanWriteSettings(project)) {
+	// An explicit scope (the D-04 consecration's Personal / Project switch)
+	// wins; project scope still needs a writable root to land in.
+	if (scope !== 'personal' && projectCanWriteSettings(project)) {
 		return { scope: 'project', field: 'projects.extraRoots', value, projectId };
 	}
 	return { scope: 'personal', field: 'projects.extraRoots', value };
@@ -731,8 +735,10 @@ interface ShellState {
 	projectExtraRoots: Record<string, string[]>;
 	/** Persisted; v15 fileRoots ∪ claudeProjectRoots, written once by migrate. */
 	carriedRoots: string[];
-	/** Trims, dedupes, recomputes `activeProject`. */
-	setProjectExtraRoots: (projectId: string, roots: string[]) => void;
+	/** Trims, dedupes, recomputes `activeProject`. `scope` pins which
+	 *  settings.json the write lands in (the consecration's scope switch);
+	 *  omitted, it follows `rootSettingsEntry`'s project-if-writable rule. */
+	setProjectExtraRoots: (projectId: string, roots: string[], scope?: SettingsScope) => void;
 
 	// ─── Explorer sections (G-STATE) ─────────────────────────────────────
 	explorerSections: ExplorerSectionState[];
@@ -1144,7 +1150,7 @@ export const useShellStore = create<ShellState>()(
 			activeProject: { id: 'default', root_path: null, extra_roots: [] },
 			projectExtraRoots: {},
 			carriedRoots: [],
-			setProjectExtraRoots: (projectId, roots) => {
+			setProjectExtraRoots: (projectId, roots, scope) => {
 				const s = get();
 				const project = s.projects.find((entry) => entry.id === projectId);
 				if (project?.archived_at != null) return;
@@ -1164,7 +1170,7 @@ export const useShellStore = create<ShellState>()(
 				enqueueSettingsWrite(
 					'projects.extraRoots',
 					() =>
-						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project)),
+						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project, scope)),
 					() => {
 						const current = get();
 						if (JSON.stringify(current.projectExtraRoots[projectId] ?? []) !== JSON.stringify(nextRoots)) return;

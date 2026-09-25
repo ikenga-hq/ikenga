@@ -105,8 +105,8 @@ export function OnboardingRail({ activeStepId, activeIndex, steps, onNavigate }:
 			{/* `designs/onboarding.html` `.steprail .foot` — the rail's own,
 			    step-independent reassurance. Each step's footer additionally
 			    carries a step-specific "change later" link to the exact D-03
-			    section (see `footer.tsx`'s `SETTINGS_LINKS`); this one is the
-			    generic fallback that's always true. */}
+			    section (see `footer.tsx`'s `SETTINGS_LINKS`); this one opens
+			    Settings › Workspace, which owns "Run consecration again". */}
 			<div
 				className="mt-auto pt-4 text-[11px] leading-relaxed"
 				style={{ borderTop: '1px solid var(--border-soft)', color: 'var(--fg-faint)' }}
@@ -115,11 +115,12 @@ export function OnboardingRail({ activeStepId, activeIndex, steps, onNavigate }:
 				<span style={{ color: 'var(--fg)', fontWeight: 600 }}>Settings</span>.
 				<div className="mt-1.5">
 					<Link
-						to="/settings"
+						to="/settings/workspace"
 						className="underline-offset-2 hover:underline"
 						style={{ color: 'var(--primary)' }}
+						data-testid="onboarding-rail-settings"
 					>
-						Open Settings →
+						Open Settings → Workspace
 					</Link>
 				</div>
 			</div>

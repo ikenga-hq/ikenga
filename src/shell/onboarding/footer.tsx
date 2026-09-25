@@ -105,8 +105,12 @@ export const SETTINGS_LINKS: Partial<Record<OnboardingStepId, SettingsLink[]>> =
 export function WritesNote({
 	stepId,
 	onOpenFile,
+	file,
 }: {
 	stepId: OnboardingStepId;
+	/** Overrides `WRITES[stepId].file` where the D-04 scope switch moves the
+	 *  write (`project`, `equipment`). */
+	file?: string;
 	/** Steps whose `WRITES[stepId].openable` is true pass a handler — usually
 	 *  `() => void openSettingsFile('personal').catch(() => {})`. Omitted (or
 	 *  a no-op) for `equipment`/`shortcuts`, which write outside settings.json
@@ -122,7 +126,7 @@ export function WritesNote({
 		>
 			<span style={{ color: 'var(--fg-faint)' }}>Writes</span>
 			<span className="font-mono" style={{ color: 'var(--fg)' }}>
-				{w.file}
+				{file ?? w.file}
 			</span>
 			<span className="flex-1">{w.note}</span>
 			{w.openable && onOpenFile && (

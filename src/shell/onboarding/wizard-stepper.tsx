@@ -70,7 +70,13 @@ export interface WizardStepChildArgs<P> {
 	isOptional: boolean;
 	isFirst: boolean;
 	isLast: boolean;
+	/** Register work that must finish before the wizard advances — run by
+	 *  BOTH the footer's Continue and a body's inline one (they share
+	 *  `goNext`). A throw keeps the user on the step. Pass null to clear. */
+	setBeforeNext: (fn: BeforeNext | null) => void;
 }
+
+export type BeforeNext = () => Promise<void> | void;
 
 interface WizardStepperProps<P> {
 	stepId: OnboardingStepId;
@@ -140,6 +146,7 @@ export function WizardStepper<P = unknown>({
 	const [showResume, setShowResume] = useState(() => resumeFlag === true && !resumeAcknowledged);
 
 	const bodyRef = useRef<HTMLDivElement>(null);
+	const beforeNextRef = useRef<BeforeNext | null>(null);
 
 	useEffect(() => {
 		if (myIndex >= 0 && myIndex !== activeIndex) {
@@ -161,8 +168,14 @@ export function WizardStepper<P = unknown>({
 	};
 
 	const goNext = useMemo(
-		() => () => {
+		() => async () => {
 			dismissResume();
+			try {
+				await beforeNextRef.current?.();
+			} catch (err) {
+				console.warn('[onboarding] step commit failed; staying on step', err);
+				return;
+			}
 			markCompleted();
 			const nextIndex = Math.min(ONBOARDING_STEPS.length - 1, myIndex + 1);
 			const nextId = ONBOARDING_STEPS[nextIndex]!;
@@ -214,7 +227,7 @@ export function WizardStepper<P = unknown>({
 	};
 
 	const childArgs: WizardStepChildArgs<P> = {
-		goNext: isLast ? finishOnboarding : goNext,
+		goNext: isLast ? finishOnboarding : () => void goNext(),
 		goBack,
 		skip,
 		goTo,
@@ -224,6 +237,9 @@ export function WizardStepper<P = unknown>({
 		isOptional,
 		isFirst,
 		isLast,
+		setBeforeNext: (fn) => {
+			beforeNextRef.current = fn;
+		},
 	};
 
 	const dataState: OnboardingChromeState = stateOverride ?? (showResume ? 'resume' : stepId);
@@ -312,7 +328,8 @@ export function WizardStepper<P = unknown>({
 						>
 							<span aria-hidden="true">🕐</span>
 							<span className="flex-1">
-								<b>You left off here.</b> Nothing you already answered was lost.
+								<b>You left off here.</b> {describeResume(steps, stepId)} Nothing you already
+								answered was lost.
 							</span>
 							<Button variant="ghost" size="sm" onClick={startOver} data-testid="onboarding-start-over">
 								Start over
@@ -335,6 +352,31 @@ export function WizardStepper<P = unknown>({
 			/>
 		</div>
 	);
+}
+
+const COUNT_WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven'];
+
+function joinNames(names: string[]): string {
+	if (names.length <= 1) return names.join('');
+	return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** D-04 `resume` banner middle clause (`designs/onboarding.html`: "Chi,
+ *  Project and Welcome are done; three steps remain."), computed from the
+ *  real per-step status. "Remain" excludes the step being resumed on, as
+ *  in the mock (three ticked, sitting on four, of seven). */
+export function describeResume(
+	steps: Record<OnboardingStepId, OnboardingStepRecord>,
+	currentId: OnboardingStepId
+): string {
+	const done = ONBOARDING_STEPS.filter(
+		(id) => steps[id].status === 'completed' || steps[id].status === 'skipped'
+	);
+	const remaining = ONBOARDING_STEPS.filter((id) => id !== currentId && !done.includes(id)).length;
+	const remainClause = `${COUNT_WORDS[remaining] ?? remaining} step${remaining === 1 ? '' : 's'} remain${remaining === 1 ? 's' : ''}.`;
+	if (done.length === 0) return remainClause;
+	const names = joinNames(done.map((id) => STEP_LABELS[id]));
+	return `${names} ${done.length === 1 ? 'is' : 'are'} done; ${remainClause}`;
 }
 
 function summariseProgress(steps: Record<OnboardingStepId, OnboardingStepRecord>): string {
