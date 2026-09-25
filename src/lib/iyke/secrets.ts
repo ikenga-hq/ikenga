@@ -5,6 +5,7 @@
 // FE has the same surface external callers (CLI, MCP) get, and for
 // future browser-pkg paths that talk through the bridge.
 
+import type { SecretsLockState } from '@/lib/tauri-cmd';
 import { iykeFetch } from './client';
 
 /** Wire-format scope. Same shape the Rust handler parses:
@@ -49,6 +50,14 @@ export async function iykeSecretDelete(key: string, scope?: IykeScopeString): Pr
 	});
 	if (!res.ok) throw new Error(`iyke /iyke/secret/delete ${res.status}: ${await res.text()}`);
 }
+
+export async function iykeSecretsLockState(): Promise<SecretsLockState> {
+	const res = await iykeFetch('/iyke/secrets/lock-state');
+	if (!res.ok) throw new Error(`iyke /iyke/secrets/lock-state ${res.status}: ${await res.text()}`);
+	return (await res.json()) as SecretsLockState;
+}
+
+export const iykeSecretLockState = iykeSecretsLockState;
 
 export async function iykeSecretList(scope?: IykeScopeString): Promise<{ keys: string[] }> {
 	const qs = new URLSearchParams();

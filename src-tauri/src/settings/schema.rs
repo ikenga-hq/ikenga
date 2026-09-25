@@ -72,6 +72,14 @@ pub fn is_personal_only_field(path: &str) -> bool {
     PERSONAL_ONLY_FIELDS.contains(&path)
 }
 
+/// True for KV rows the settings domain owns: the legacy mirror keys.
+/// Everything else in `settings_kv` (`shell.activeProjectId`, migration
+/// gates, pin/permission flags, unknown future keys) belongs to another
+/// domain owner and survives `settings_clear_all`.
+pub fn is_settings_owned_key(key: &str) -> bool {
+    is_known_legacy_key(key)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SettingsDocument {
     #[serde(rename = "$schema", default = "default_schema")]
@@ -455,14 +463,15 @@ fn merge_map(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
 fn collect_leaf_paths(prefix: &str, map: &Map<String, Value>, out: &mut Vec<String>) {
     for (key, value) in map {
         let path = format!("{prefix}.{key}");
-        if value.as_array().is_some_and(|items| items.is_empty()) {
-            continue;
-        }
         if let Some(child) = value.as_object() {
             if child.is_empty() {
                 continue;
             }
             collect_leaf_paths(&path, child, out);
+            continue;
+        }
+        if value.as_array().is_some_and(|items| items.is_empty()) {
+            out.push(path);
             continue;
         }
         out.push(path);
@@ -1335,6 +1344,28 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_values_are_overrides_and_content() {
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("projects.extraRoots", Value::Array(Vec::new()))
+            .unwrap();
+        assert!(document.has_content());
+        assert_eq!(document.leaf_paths(), vec!["projects.extraRoots"]);
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("workspace.artifact.folderOverrides", Value::Object(Map::new()))
+            .unwrap();
+        assert!(!document.has_content());
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("workspace.lastAgent.kind", Value::Null)
+            .unwrap();
+        assert!(document.has_content());
+    }
+
+    #[test]
     fn resolved_defaults_preserve_explicit_null() {
         let mut document = SettingsDocument::default();
         document
@@ -1372,6 +1403,19 @@ mod tests {
     fn secret_values_are_not_accepted_in_the_settings_document() {
         let with_secret = br#"{"version":1,"secrets":{"token":"do-not-store"}}"#;
         assert!(SettingsDocument::parse(with_secret).is_err());
+    }
+
+    #[test]
+    fn settings_owned_keys_are_exactly_the_legacy_mirror() {
+        assert!(is_settings_owned_key("appearance.theme"));
+        assert!(is_settings_owned_key("artifact-grid.folder./w/a.default-sink"));
+        assert!(is_settings_owned_key("artifact-studio.sink./w/a"));
+        assert!(is_settings_owned_key("artifact-grid:show-resolved:/w/a"));
+        assert!(is_settings_owned_key("artifact-wizard.lastAgent.p1"));
+        assert!(!is_settings_owned_key("shell.activeProjectId"));
+        assert!(!is_settings_owned_key("settings.migrations.file-v1"));
+        assert!(!is_settings_owned_key("settings.migrations.shell-v17"));
+        assert!(!is_settings_owned_key("some.future.domain.key"));
     }
 
     #[test]
