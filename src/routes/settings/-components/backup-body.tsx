@@ -1,7 +1,6 @@
 ﻿import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import {
-	open as openDialog,
 	save as saveDialog,
 	confirm as confirmDialog,
 } from '@/lib/transport/dialog-shim';
@@ -13,16 +12,13 @@ import {
 	AlertTriangle,
 	CheckCircle2,
 	Lock,
-	Package,
 } from 'lucide-react';
 
 import {
 	backupExport,
-	backupImport,
 	backupList,
 	backupDelete,
 	type BackupSummary,
-	type ImportPreview,
 	type ImportResult,
 	type PathMode,
 } from '@/lib/tauri-cmd';
@@ -38,8 +34,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from '@/components/ui/dialog';
-
-
+import { RestoreWizard } from '@/shell/backup/restore-wizard';
 
 const BACKUPS_QUERY_KEY = ['settings', 'backup', 'list'] as const;
 
@@ -50,7 +45,7 @@ export function BackupSectionBody() {
 		queryFn: () => backupList(),
 	});
 
-	const [busy, setBusy] = useState<null | 'export' | 'import'>(null);
+	const [busy, setBusy] = useState<null | 'export'>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [success, setSuccess] = useState<string | null>(null);
 	const [exportDialog, setExportDialog] = useState<{
@@ -60,12 +55,7 @@ export function BackupSectionBody() {
 		confirmPassphrase: string;
 		pathMode: PathMode;
 	} | null>(null);
-	const [preview, setPreview] = useState<{
-		src: string;
-		preview: ImportPreview;
-		passphrase: string;
-	} | null>(null);
-	const [restartPrompt, setRestartPrompt] = useState<ImportResult | null>(null);
+	const [restoreOpen, setRestoreOpen] = useState(false);
 
 	const refreshList = () => qc.invalidateQueries({ queryKey: BACKUPS_QUERY_KEY });
 
@@ -134,74 +124,18 @@ export function BackupSectionBody() {
 		}
 	}
 
-	async function onPickAndPreview() {
+	function onOpenRestoreWizard() {
 		setError(null);
 		setSuccess(null);
-		const src = await openDialog({
-			multiple: false,
-			filters: [{ name: 'Ikenga backup', extensions: ['ikbak'] }],
-		});
-		if (!src || typeof src !== 'string') return;
-		setBusy('import');
-		try {
-			const res = (await backupImport(src, { dryRun: true })) as ImportPreview;
-			setPreview({ src, preview: res, passphrase: '' });
-		} catch (e) {
-			setError(`Could not read backup: ${String(e)}`);
-		} finally {
-			setBusy(null);
-		}
+		setRestoreOpen(true);
 	}
 
-	async function onConfirmImport() {
-		if (!preview) return;
-		if (preview.preview.manifest.has_secrets && !preview.passphrase) {
-			setError(
-				'This bundle contains secrets. Enter the passphrase to include them, ' +
-					'or proceed without secrets to restore the database only.'
-			);
-			return;
-		}
-		const ok = await confirmDialog(
-			'This will replace your local app data on next launch. Continue?',
-			{ title: 'Restore backup', kind: 'warning' }
+	function onRestoreStaged(res: ImportResult) {
+		setSuccess(
+			res.secrets_staged
+				? 'Restore staged · secrets included. Restart to apply.'
+				: 'Restore staged. Restart to apply.'
 		);
-		if (!ok) return;
-		setBusy('import');
-		try {
-			const res = (await backupImport(preview.src, {
-				dryRun: false,
-				passphrase: preview.passphrase || undefined,
-			})) as ImportResult;
-			setPreview(null);
-			setRestartPrompt(res);
-		} catch (e) {
-			setError(`Restore failed: ${String(e)}`);
-		} finally {
-			setBusy(null);
-		}
-	}
-
-	async function onConfirmImportSkipSecrets() {
-		if (!preview) return;
-		const ok = await confirmDialog(
-			'Restore the database only? Secrets in the backup will be ignored.',
-			{ title: 'Restore without secrets', kind: 'warning' }
-		);
-		if (!ok) return;
-		setBusy('import');
-		try {
-			const res = (await backupImport(preview.src, {
-				dryRun: false,
-				passphrase: undefined,
-			})) as ImportResult;
-			setPreview(null);
-			setRestartPrompt(res);
-		} catch (e) {
-			setError(`Restore failed: ${String(e)}`);
-		} finally {
-			setBusy(null);
-		}
 	}
 
 	async function onDelete(path: string) {
@@ -256,12 +190,13 @@ export function BackupSectionBody() {
 					<div>
 						<h2 className="text-base font-medium">Restore from file</h2>
 						<p className="mt-1 text-sm text-muted-foreground">
-							Pick a <code>.ikbak</code> file. You'll see a preview before anything is applied.
+							Pick a <code>.ikbak</code> file. The wizard walks through what will be replaced
+							before anything is applied.
 						</p>
 					</div>
-					<Button variant="outline" onClick={onPickAndPreview} disabled={busy !== null}>
+					<Button variant="outline" onClick={onOpenRestoreWizard} disabled={busy !== null}>
 						<Upload className="mr-2 h-4 w-4" />
-						{busy === 'import' ? 'Readingâ€¦' : 'Restore'}
+						Restore
 					</Button>
 				</div>
 			</Card>
@@ -398,154 +333,7 @@ export function BackupSectionBody() {
 				</DialogContent>
 			</Dialog>
 
-			{/* Restore preview dialog with passphrase + pkg list */}
-			<Dialog
-				open={!!preview}
-				onOpenChange={(open) => {
-					if (!open) setPreview(null);
-				}}
-			>
-				<DialogContent className="max-w-lg">
-					<DialogHeader>
-						<DialogTitle>Restore preview</DialogTitle>
-						<DialogDescription>Review the bundle before applying.</DialogDescription>
-					</DialogHeader>
-					{preview && (
-						<div className="space-y-3 text-sm">
-							<KV k="Source" v={shortPath(preview.src)} />
-							<KV k="Created" v={preview.preview.manifest.created_at} />
-							<KV k="From host" v={preview.preview.manifest.hostname} />
-							<KV k="Size" v={formatBytes(preview.preview.size_bytes)} />
-							<KV k="Schema" v={describeSchemaAction(preview.preview.schema_action)} />
-							<KV
-								k="Secrets"
-								v={preview.preview.manifest.has_secrets ? 'Yes (encrypted)' : 'None'}
-							/>
-							<KV k="Pkgs" v={`${preview.preview.manifest.pkg_count}`} />
-							<KV
-								k="Path mode"
-								v={`${preview.preview.manifest.path_mode}${
-									preview.preview.manifest.home_dir
-										? ` (from ${preview.preview.manifest.home_dir})`
-										: ''
-								}`}
-							/>
-
-							{preview.preview.manifest.path_warnings.length > 0 && (
-								<details className="rounded border border-border p-2 text-xs">
-									<summary className="cursor-pointer font-medium">
-										<AlertTriangle className="mr-2 inline h-3.5 w-3.5" />
-										{preview.preview.manifest.path_warnings.length} path
-										{preview.preview.manifest.path_warnings.length === 1 ? '' : 's'} outside $HOME
-										(kept raw)
-									</summary>
-									<ul className="mt-2 space-y-1 font-mono">
-										{preview.preview.manifest.path_warnings.slice(0, 50).map((w, i) => (
-											<li key={`${w.table}.${w.column}.${i}`}>
-												<span className="text-muted-foreground">
-													{w.table}.{w.column}:
-												</span>{' '}
-												{w.value}
-											</li>
-										))}
-										{preview.preview.manifest.path_warnings.length > 50 && (
-											<li className="text-muted-foreground">
-												â€¦ and {preview.preview.manifest.path_warnings.length - 50} more
-											</li>
-										)}
-									</ul>
-								</details>
-							)}
-
-							{preview.preview.pkgs.length > 0 && (
-								<details className="rounded border border-border p-2 text-xs">
-									<summary className="cursor-pointer font-medium">
-										<Package className="mr-2 inline h-3.5 w-3.5" />
-										Installed pkgs in backup ({preview.preview.pkgs.length})
-									</summary>
-									<ul className="mt-2 space-y-1 font-mono">
-										{preview.preview.pkgs.map((p) => (
-											<li key={p.id}>
-												{p.id}@{p.version}
-												{!p.enabled && (
-													<span className="ml-2 text-muted-foreground">(disabled)</span>
-												)}
-											</li>
-										))}
-									</ul>
-								</details>
-							)}
-
-							{preview.preview.manifest.has_secrets && (
-								<div className="space-y-1">
-									<label className="text-xs text-muted-foreground">
-										Passphrase (leave blank to skip secrets)
-									</label>
-									<Input
-										type="password"
-										value={preview.passphrase}
-										onChange={(e) =>
-											setPreview((p) => (p ? { ...p, passphrase: e.target.value } : p))
-										}
-									/>
-								</div>
-							)}
-
-							{preview.preview.schema_action.kind === 'newer_than_app' && (
-								<Alert variant="destructive">
-									<AlertDescription>
-										Backup is newer than this app version. Upgrade Ikenga before restoring.
-									</AlertDescription>
-								</Alert>
-							)}
-						</div>
-					)}
-					<DialogFooter>
-						<Button variant="outline" onClick={() => setPreview(null)}>
-							Cancel
-						</Button>
-						{preview?.preview.manifest.has_secrets && (
-							<Button
-								variant="outline"
-								onClick={onConfirmImportSkipSecrets}
-								disabled={busy !== null}
-							>
-								DB only
-							</Button>
-						)}
-						<Button
-							onClick={onConfirmImport}
-							disabled={busy !== null || preview?.preview.schema_action.kind === 'newer_than_app'}
-						>
-							Apply on next launch
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
-
-			{/* Restart prompt */}
-			<Dialog
-				open={!!restartPrompt}
-				onOpenChange={(open) => {
-					if (!open) setRestartPrompt(null);
-				}}
-			>
-				<DialogContent>
-					<DialogHeader>
-						<DialogTitle>Restart required</DialogTitle>
-						<DialogDescription>
-							The restore is staged. Quit and reopen Ikenga to apply it.
-							{restartPrompt?.secrets_staged
-								? ' Secrets will be re-applied to the vault on next boot.'
-								: ''}{' '}
-							The running session is unchanged until then.
-						</DialogDescription>
-					</DialogHeader>
-					<DialogFooter>
-						<Button onClick={() => setRestartPrompt(null)}>OK</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
+			<RestoreWizard open={restoreOpen} onOpenChange={setRestoreOpen} onStaged={onRestoreStaged} />
 		</div>
 	);
 }
@@ -586,17 +374,6 @@ function describePathMode(m: PathMode): string {
 			return 'Rewrite $HOME/... â†’ ${IKENGA_HOME}/... and back on restore. Cross-machine portable.';
 		case 'bundled':
 			return 'Copy referenced files into the bundle. Not yet implemented.';
-	}
-}
-
-function describeSchemaAction(a: ImportPreview['schema_action']): string {
-	switch (a.kind) {
-		case 'match':
-			return 'Match';
-		case 'forward':
-			return `Migrate forward (v${a.from} â†’ v${a.to})`;
-		case 'newer_than_app':
-			return `Newer than app (v${a.backup} > v${a.app})`;
 	}
 }
 
