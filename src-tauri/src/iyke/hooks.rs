@@ -88,6 +88,15 @@ fn get_held_requests() -> &'static Arc<Mutex<HashMap<String, HeldRequest>>> {
     HELD_REQUESTS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
+/// WP-40: in-terminal `PermissionRequest` prompts still waiting, so a
+/// `PostToolUse` resolves only the row of the tool call it was asked about.
+static TERMINAL_PROMPTS: OnceLock<Mutex<crate::notifications::producers::TerminalPrompts>> =
+    OnceLock::new();
+
+fn terminal_prompts() -> &'static Mutex<crate::notifications::producers::TerminalPrompts> {
+    TERMINAL_PROMPTS.get_or_init(Default::default)
+}
+
 fn hold_setting_key(terminal_id: &str) -> String {
     format!("permissions.hold_terminal_{terminal_id}")
 }
@@ -278,6 +287,17 @@ pub async fn post_hook_event(
     // answer happens in the terminal; the row points there.
     // Spawned so the hook reply is never held on a DB write.
     if payload.hook_event_name.as_deref() == Some("PermissionRequest") {
+        if let Ok(mut prompts) = terminal_prompts().lock() {
+            prompts.requested(
+                &crate::notifications::producers::terminal_permission_key(
+                    payload.ikenga_terminal_id.as_deref(),
+                    payload.session_id.as_deref(),
+                ),
+                payload.tool_use_id.as_deref(),
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+            );
+        }
         let app = app.clone();
         let new = crate::notifications::producers::permission_from_hook_request(
             payload.tool_name.as_deref(),
@@ -291,26 +311,40 @@ pub async fn post_hook_event(
         });
     }
 
-    // WP-40: the terminal moved on (the tool ran, the turn stopped, or the
-    // session ended), so a prompt it was showing has been answered — resolve
-    // that terminal's pending `PermissionRequest` row so it stops counting as
-    // pending. Both scopes the row may have been keyed by (terminal id, else
-    // Claude session id). No-op when nothing is pending. Spawned, as above.
-    if payload
-        .hook_event_name
-        .as_deref()
-        .is_some_and(crate::notifications::producers::resolves_terminal_permission)
+    // WP-40: resolve a terminal's pending `PermissionRequest` row once the
+    // prompt is over — on the `PostToolUse` of the very tool call it asked
+    // about (same `tool_use_id`, else same tool + input; a parallel call
+    // finishing in the same terminal does not count), or on `Stop` /
+    // `SessionEnd`, which Claude cannot reach while a prompt is up. A denied
+    // prompt never gets its `PostToolUse`; the turn's `Stop` resolves it.
+    // No-op when nothing is pending. Spawned, as above.
+    let event = payload.hook_event_name.as_deref().unwrap_or("");
+    let resolve_keys = if event == "PostToolUse"
+        || crate::notifications::producers::ends_terminal_permissions(event)
     {
+        let keys = crate::notifications::producers::terminal_permission_keys(
+            payload.ikenga_terminal_id.as_deref(),
+            payload.session_id.as_deref(),
+        );
+        match terminal_prompts().lock() {
+            Ok(mut prompts) if event == "PostToolUse" => prompts.tool_finished(
+                &keys,
+                payload.tool_use_id.as_deref(),
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+            ),
+            Ok(mut prompts) => prompts.ended(&keys),
+            // Poisoned: only an end event may still resolve, blindly.
+            Err(_) if event != "PostToolUse" => keys,
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    if !resolve_keys.is_empty() {
         if let Some(db) = app_db(&app) {
-            use crate::notifications::producers::terminal_permission_key;
-            let terminal_id = payload.ikenga_terminal_id.as_deref();
-            let session_id = payload.session_id.as_deref();
-            let mut keys = vec![terminal_permission_key(terminal_id, session_id)];
-            if terminal_id.is_some_and(|t| !t.is_empty()) && session_id.is_some() {
-                keys.push(terminal_permission_key(None, session_id));
-            }
             tauri::async_runtime::spawn(async move {
-                for key in keys {
+                for key in resolve_keys {
                     crate::notifications::resolve_key_with_db(&db, &key).await;
                 }
             });

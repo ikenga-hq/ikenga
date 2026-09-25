@@ -502,12 +502,13 @@ export type NotificationKind =
  * union has no catch-all, so `switch (a.kind)` narrows the params. Get one
  * from a row with {@link asKnownNotificationAction}.
  *
- * `permission.decide` carries Allow / Deny inline; `via` says how to answer:
- * `'hooks'` → `POST /iyke/hooks/decision { requestId, decision }`;
- * `'acp'` → the chat engine's permission-respond path for `threadId` /
- * `requestId`. Hide the buttons once the row has `resolvedAt`.
- * `open.terminal` is open-only: Claude Code's own terminal prompt is answered
- * in the terminal.
+ * `permission.decide` carries Allow / Deny inline and is only emitted for
+ * the hooks gate (`via: 'hooks'` → `POST /iyke/hooks/decision { requestId,
+ * decision }`). Hide the buttons once the row has `resolvedAt`.
+ * `open.thread` (chat-engine / ACP asks) and `open.terminal` (Claude Code's
+ * own terminal prompt) are open-only: the thread's dialog or the terminal
+ * answers them. Inline Allow / Deny for ACP asks is a follow-up that needs a
+ * real engine resolve path first.
  */
 export type KnownNotificationAction =
 	| {
@@ -516,15 +517,6 @@ export type KnownNotificationAction =
 			requestId: string;
 			terminalId: string | null;
 	  }
-	| {
-			kind: 'permission.decide';
-			via: 'acp';
-			threadId: string;
-			requestId: string;
-			/** Always `null`; present so both variants share the field. */
-			terminalId: null;
-	  }
-	/** Legacy: ACP asks written before they became `permission.decide`. */
 	| { kind: 'open.thread'; threadId: string; requestId: string }
 	| { kind: 'open.terminal'; terminalId: string | null; sessionId: string | null }
 	| {

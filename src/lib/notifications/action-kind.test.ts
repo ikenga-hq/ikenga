@@ -24,19 +24,28 @@ describe('asKnownNotificationAction', () => {
 		expect(KNOWN_NOTIFICATION_ACTION_KINDS).toContain('permission.decide');
 	});
 
-	it('narrows on kind and via so params are typed', () => {
-		const raw: NotificationAction = {
-			kind: 'permission.decide',
-			via: 'acp',
-			threadId: 'th-1',
-			requestId: 'req-1',
-			terminalId: null,
-		};
+	it('narrows on kind so params are typed', () => {
+		const raw: NotificationAction = { kind: 'open.thread', threadId: 'th-1', requestId: 'req-1' };
 		const a = asKnownNotificationAction(raw);
 		// Compile-time: after narrowing, `threadId` is `string`, not `unknown`.
 		let threadId: string | null = null;
-		if (a?.kind === 'permission.decide' && a.via === 'acp') threadId = a.threadId;
+		if (a?.kind === 'open.thread') threadId = a.threadId;
 		expect(threadId).toBe('th-1');
+	});
+
+	it('reads a stray ACP permission.decide as open-only open.thread', () => {
+		const a = asKnownNotificationAction({
+			kind: 'permission.decide',
+			via: 'acp',
+			threadId: 'th-2',
+			requestId: 'req-3',
+			terminalId: null,
+		});
+		expect(a).toEqual<KnownNotificationAction>({
+			kind: 'open.thread',
+			threadId: 'th-2',
+			requestId: 'req-3',
+		});
 	});
 
 	it('reads a permission.decide without a recognised via as hooks', () => {

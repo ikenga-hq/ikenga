@@ -205,9 +205,9 @@ export function isNotificationResolved(row: NotificationRow): boolean {
 
 /**
  * The row's inline Allow / Deny, or `null` when it has none to offer: not a
- * `permission.decide` action, or already resolved (a dead ask). Branch on
- * `via` to answer: `'hooks'` → `/iyke/hooks/decision`, `'acp'` → the chat
- * engine's permission-respond path for `threadId`.
+ * `permission.decide` action, or already resolved (a dead ask). Answer via
+ * `/iyke/hooks/decision` with `requestId` — only the hooks gate emits one.
+ * ACP asks are open-only `open.thread` rows (inline decide is a follow-up).
  */
 export function notificationDecision(
 	row: NotificationRow,

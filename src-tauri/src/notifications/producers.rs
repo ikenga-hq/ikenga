@@ -18,19 +18,22 @@
 //! Action JSON is `{ "kind": "<action kind>", ...params }`; the UI (WP-40b)
 //! maps each action kind to its buttons. Action kinds used here:
 //!
-//! * `permission.decide` — Allow once / Deny inline. `via` says how to answer:
-//!   `"hooks"` (held `PreToolUse` gate: `POST /iyke/hooks/decision` with
-//!   `requestId`) or `"acp"` (chat-engine round-trip: answer `requestId` on
-//!   `threadId` through the engine's permission-respond path,
-//!   `ClaudeCodeEngine::resolve_permission`). Hide the buttons once the row
-//!   has `resolvedAt`.
+//! * `permission.decide` — Allow once / Deny inline. **Hooks gate only**
+//!   (`via: "hooks"`: a held `PreToolUse`, answered by
+//!   `POST /iyke/hooks/decision` with `requestId`). Hide the buttons once the
+//!   row has `resolvedAt`.
+//! * `open.thread` — a chat-engine (ACP) permission ask. **Open only**: the
+//!   in-thread dialog answers it. Inline Allow / Deny for ACP rows is a
+//!   follow-up that needs a real resolve path (nothing in production calls
+//!   `ClaudeCodeEngine::resolve_permission` yet). Resolves when the
+//!   round-trip completes.
 //! * `open.terminal` — Claude Code's own prompt inside a terminal. **Open
 //!   only**: the answer happens in the terminal, so the row cannot carry
-//!   Allow / Deny. It resolves when that terminal's next `PostToolUse` /
-//!   `Stop` / `SessionEnd` hook arrives.
-//! * `open.thread` (no longer emitted; kept for rows written before ACP rows
-//!   became `permission.decide`), `open.chi_run`, `open.release_notes`,
-//!   `open.pkg_updates`, `open.violations`.
+//!   Allow / Deny. It resolves on that terminal's `PostToolUse` for the same
+//!   tool call (see [`TerminalPrompts`]), or its `Stop` /
+//!   `SessionEnd`.
+//! * `open.chi_run`, `open.release_notes`, `open.pkg_updates`,
+//!   `open.violations`.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -104,8 +107,8 @@ pub fn engine_permission_key(thread_id: &str, request_id: &str) -> String {
 
 /// Dedupe key of Claude Code's in-terminal `PermissionRequest` prompt: the
 /// Ikenga terminal id, else the Claude session id, else `unknown`. The hooks
-/// bus resolves it when the same terminal's next `PostToolUse` / `Stop` /
-/// `SessionEnd` arrives (the prompt was answered, or the session ended).
+/// bus resolves it once every prompt folded into it is over (see
+/// [`TerminalPrompts`]).
 pub fn terminal_permission_key(terminal_id: Option<&str>, session_id: Option<&str>) -> String {
     let scope = terminal_id
         .filter(|t| !t.is_empty())
@@ -114,9 +117,127 @@ pub fn terminal_permission_key(terminal_id: Option<&str>, session_id: Option<&st
     format!("permission:terminal:{scope}")
 }
 
-/// Hook events after which a terminal's pending `PermissionRequest` is over.
-pub fn resolves_terminal_permission(hook_event_name: &str) -> bool {
-    matches!(hook_event_name, "PostToolUse" | "Stop" | "SessionEnd")
+/// Hook events after which **every** pending `PermissionRequest` in a
+/// terminal is over: Claude cannot stop a turn (or end the session) while a
+/// prompt is still waiting. `PostToolUse` is not one of them — it only ends
+/// the prompt for the same tool call ([`TerminalPrompts::tool_finished`]).
+pub fn ends_terminal_permissions(hook_event_name: &str) -> bool {
+    matches!(hook_event_name, "Stop" | "SessionEnd")
+}
+
+/// Most prompts remembered per terminal key. Claude shows them one at a
+/// time, so this is only a bound against a key that never sees `Stop`.
+const MAX_PROMPTS_PER_TERMINAL: usize = 32;
+
+/// One in-terminal `PermissionRequest` still waiting for its tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPrompt {
+    tool_use_id: Option<String>,
+    /// `tool_name` + 16 hex of sha256(`tool_input`), the fallback identity
+    /// when either hook payload lacks a `tool_use_id`.
+    fingerprint: String,
+}
+
+impl PendingPrompt {
+    fn new(tool_use_id: Option<&str>, tool_name: Option<&str>, tool_input: Option<&Value>) -> Self {
+        let input = tool_input.map(Value::to_string).unwrap_or_default();
+        let digest = Sha256::digest(input.as_bytes());
+        Self {
+            tool_use_id: tool_use_id.filter(|id| !id.is_empty()).map(str::to_string),
+            fingerprint: format!("{}:{}", tool_name.unwrap_or(""), hex::encode(&digest[..8])),
+        }
+    }
+
+    fn matches(&self, other: &PendingPrompt) -> bool {
+        match (&self.tool_use_id, &other.tool_use_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.fingerprint == other.fingerprint,
+        }
+    }
+}
+
+/// Which in-terminal `PermissionRequest` prompts are still waiting, per
+/// [`terminal_permission_key`]. Several prompts can fold into one row
+/// (`Coalesce::WhileUnread`), and a parallel tool call in the same terminal
+/// can finish while a prompt is still up — so a `PostToolUse` resolves the
+/// row only when it is the tool call a pending prompt asked about (same
+/// `tool_use_id`, else same tool name + input) and no other prompt on that
+/// key is left. `Stop` / `SessionEnd` clear the key outright.
+///
+/// Pure bookkeeping (the hooks bus holds one behind a mutex); every method
+/// returns the row keys that should now be resolved.
+#[derive(Debug, Default)]
+pub struct TerminalPrompts {
+    pending: std::collections::HashMap<String, Vec<PendingPrompt>>,
+}
+
+impl TerminalPrompts {
+    /// A `PermissionRequest` hook arrived; its row is keyed by `key`.
+    pub fn requested(
+        &mut self,
+        key: &str,
+        tool_use_id: Option<&str>,
+        tool_name: Option<&str>,
+        tool_input: Option<&Value>,
+    ) {
+        let list = self.pending.entry(key.to_string()).or_default();
+        if list.len() >= MAX_PROMPTS_PER_TERMINAL {
+            list.remove(0);
+        }
+        list.push(PendingPrompt::new(tool_use_id, tool_name, tool_input));
+    }
+
+    /// A `PostToolUse` hook arrived. `keys` are the row keys it could belong
+    /// to (terminal-scoped, then session-scoped). Drops the first matching
+    /// pending prompt; returns the key when that left it empty.
+    pub fn tool_finished(
+        &mut self,
+        keys: &[String],
+        tool_use_id: Option<&str>,
+        tool_name: Option<&str>,
+        tool_input: Option<&Value>,
+    ) -> Vec<String> {
+        let done = PendingPrompt::new(tool_use_id, tool_name, tool_input);
+        for key in keys {
+            let Some(list) = self.pending.get_mut(key) else {
+                continue;
+            };
+            let Some(i) = list.iter().position(|p| p.matches(&done)) else {
+                continue;
+            };
+            list.remove(i);
+            if list.is_empty() {
+                self.pending.remove(key);
+                return vec![key.clone()];
+            }
+            return Vec::new();
+        }
+        Vec::new()
+    }
+
+    /// `Stop` / `SessionEnd`: every prompt on these keys is over. Returns all
+    /// of `keys` — the row may predate this tracker (app restart), so resolve
+    /// it whether or not anything was remembered.
+    pub fn ended(&mut self, keys: &[String]) -> Vec<String> {
+        for key in keys {
+            self.pending.remove(key);
+        }
+        keys.to_vec()
+    }
+}
+
+/// Row keys a terminal hook event may resolve: terminal-scoped first, plus
+/// the session-scoped key when both ids are known (a row recorded before the
+/// terminal id was known is keyed by the session).
+pub fn terminal_permission_keys(
+    terminal_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Vec<String> {
+    let mut keys = vec![terminal_permission_key(terminal_id, session_id)];
+    if terminal_id.is_some_and(|t| !t.is_empty()) && session_id.is_some_and(|s| !s.is_empty()) {
+        keys.push(terminal_permission_key(None, session_id));
+    }
+    keys
 }
 
 /// A `PreToolUse` hook held by the permission-inbox gate: the tool call is
@@ -180,9 +301,14 @@ pub fn permission_from_hook_request(
     }
 }
 
-/// A chat-engine (ACP) permission round-trip. The row carries Allow / Deny
-/// inline (`permission.decide` via `acp`); the in-thread dialog answers the
-/// same request, and whichever answers first resolves the row.
+/// A chat-engine (ACP) permission round-trip. The in-thread dialog answers
+/// it; the row opens the thread and resolves when the round-trip completes.
+///
+/// Deliberately **not** `permission.decide`: nothing in production can answer
+/// an ACP request from outside the thread yet
+/// (`ClaudeCodeEngine::resolve_permission` has no caller), and WP-40b reads
+/// every `permission.decide` as a hooks-gate decision. Inline Allow / Deny
+/// for ACP rows is a follow-up that needs a real resolve path first.
 pub fn permission_from_engine(
     thread_id: &str,
     request_id: &str,
@@ -198,13 +324,9 @@ pub fn permission_from_engine(
             Some(format!("session {}", short_id(thread_id))),
         ]),
         action: Some(json!({
-            "kind": "permission.decide",
-            "via": "acp",
+            "kind": "open.thread",
             "threadId": thread_id,
             "requestId": request_id,
-            // Same shape as the hooks variant so a reader that only knows
-            // that one does not trip on a missing field.
-            "terminalId": Value::Null,
         })),
         source: SOURCE_ENGINE_CLAUDE.into(),
         dedupe_key: Some(engine_permission_key(thread_id, request_id)),
@@ -510,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_from_engine_carries_acp_decide_scoped_by_thread() {
+    fn permission_from_engine_opens_the_thread_scoped_by_thread() {
         let n = permission_from_engine(
             "0123456789abcdef",
             "req-7",
@@ -520,11 +642,12 @@ mod tests {
         assert_eq!(n.kind, NotificationKind::Permission);
         assert_eq!(n.body.as_deref(), Some("ls -la · session 01234567"));
         let action = n.action.as_ref().unwrap();
-        assert_eq!(action["kind"], "permission.decide");
-        assert_eq!(action["via"], "acp");
+        // Open-only: no resolve path can answer an ACP ask from outside the
+        // thread yet, and WP-40b reads every `permission.decide` as hooks.
+        assert_eq!(action["kind"], "open.thread");
+        assert!(action.get("via").is_none());
         assert_eq!(action["threadId"], "0123456789abcdef");
         assert_eq!(action["requestId"], "req-7");
-        assert!(action["terminalId"].is_null());
         assert_eq!(
             n.dedupe_key.as_deref(),
             Some("permission:acp:0123456789abcdef:req-7")
@@ -543,12 +666,94 @@ mod tests {
         assert_eq!(terminal_permission_key(None, Some("s")), "permission:terminal:s");
         assert_eq!(terminal_permission_key(Some(""), Some("s")), "permission:terminal:s");
         assert_eq!(terminal_permission_key(None, None), "permission:terminal:unknown");
-        for ev in ["PostToolUse", "Stop", "SessionEnd"] {
-            assert!(resolves_terminal_permission(ev));
+        for ev in ["Stop", "SessionEnd"] {
+            assert!(ends_terminal_permissions(ev));
         }
-        for ev in ["PreToolUse", "PermissionRequest", "Notification", "UserPromptSubmit"] {
-            assert!(!resolves_terminal_permission(ev));
+        for ev in ["PostToolUse", "PreToolUse", "PermissionRequest", "Notification"] {
+            assert!(!ends_terminal_permissions(ev));
         }
+        assert_eq!(
+            terminal_permission_keys(Some("t"), Some("s")),
+            vec!["permission:terminal:t".to_string(), "permission:terminal:s".to_string()]
+        );
+        assert_eq!(
+            terminal_permission_keys(None, Some("s")),
+            vec!["permission:terminal:s".to_string()]
+        );
+    }
+
+    #[test]
+    fn parallel_tool_finishing_does_not_resolve_a_waiting_prompt() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), Some("s1"));
+        let key = &keys[0];
+        prompts.requested(
+            key,
+            Some("toolu_bash"),
+            Some("Bash"),
+            Some(&json!({ "command": "rm -rf build" })),
+        );
+        // A parallel Read in the same terminal finishes first: not the ask.
+        let resolved = prompts.tool_finished(
+            &keys,
+            Some("toolu_read"),
+            Some("Read"),
+            Some(&json!({ "file_path": "a.rs" })),
+        );
+        assert!(resolved.is_empty());
+        // The asked-about call finishes: now the row is over.
+        let resolved = prompts.tool_finished(
+            &keys,
+            Some("toolu_bash"),
+            Some("Bash"),
+            Some(&json!({ "command": "rm -rf build" })),
+        );
+        assert_eq!(resolved, vec![key.clone()]);
+        // Nothing left: a later PostToolUse resolves nothing.
+        assert!(prompts
+            .tool_finished(&keys, Some("toolu_bash"), Some("Bash"), None)
+            .is_empty());
+    }
+
+    #[test]
+    fn prompt_matches_on_name_and_input_when_a_payload_has_no_tool_use_id() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), None);
+        let bash = json!({ "command": "cargo publish" });
+        prompts.requested(&keys[0], None, Some("Bash"), Some(&bash));
+        // Same tool, different input: a parallel call, not the ask.
+        let other = json!({ "command": "ls" });
+        assert!(prompts
+            .tool_finished(&keys, Some("toolu_x"), Some("Bash"), Some(&other))
+            .is_empty());
+        assert_eq!(
+            prompts.tool_finished(&keys, Some("toolu_y"), Some("Bash"), Some(&bash)),
+            vec![keys[0].clone()]
+        );
+    }
+
+    #[test]
+    fn folded_prompts_resolve_only_when_the_last_one_finishes() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), None);
+        prompts.requested(&keys[0], Some("a"), Some("Bash"), None);
+        prompts.requested(&keys[0], Some("b"), Some("Edit"), None);
+        assert!(prompts.tool_finished(&keys, Some("a"), Some("Bash"), None).is_empty());
+        assert_eq!(
+            prompts.tool_finished(&keys, Some("b"), Some("Edit"), None),
+            vec![keys[0].clone()]
+        );
+    }
+
+    #[test]
+    fn stop_ends_every_prompt_even_ones_not_remembered() {
+        let mut prompts = TerminalPrompts::default();
+        let keys = terminal_permission_keys(Some("t1"), Some("s1"));
+        prompts.requested(&keys[0], Some("a"), Some("Bash"), None);
+        assert_eq!(prompts.ended(&keys), keys);
+        assert!(prompts.tool_finished(&keys, Some("a"), Some("Bash"), None).is_empty());
+        // After a restart nothing is remembered; Stop still resolves the row.
+        assert_eq!(TerminalPrompts::default().ended(&keys), keys);
     }
 
     #[test]

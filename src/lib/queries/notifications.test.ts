@@ -149,20 +149,13 @@ describe('notifications queries', () => {
 		expect(isNotificationResolved({ ...hooks, resolvedAt: undefined })).toBe(false);
 	});
 
-	it('ACP asks carry an acp decision; open-only rows carry none', () => {
+	it('ACP asks and terminal prompts are open-only: no inline decision', () => {
 		const acp = row({
 			kind: 'permission',
-			action: {
-				kind: 'permission.decide',
-				via: 'acp',
-				threadId: 'th',
-				requestId: 'r2',
-				terminalId: null,
-			},
+			action: { kind: 'open.thread', threadId: 'th', requestId: 'r2' },
 		});
-		const d = notificationDecision(acp);
-		expect(d?.via).toBe('acp');
-		expect(d && d.via === 'acp' ? d.threadId : null).toBe('th');
+		expect(notificationDecision(acp)).toBeNull();
+		expect(asKnownNotificationAction(acp.action)?.kind).toBe('open.thread');
 		const terminal = row({
 			kind: 'permission',
 			action: { kind: 'open.terminal', terminalId: 't', sessionId: null },
