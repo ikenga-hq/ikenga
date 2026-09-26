@@ -11,6 +11,10 @@
 // defined "hits" for those exact strings. `TABLE[k]` and `k in TABLE` are
 // both safe against a null-prototype object — there is no prototype chain
 // left for either to walk.
+import { keyHolderIn } from '@/lib/actions/merge';
+import type { KeymapEntry } from '@/lib/keymap/defaults';
+import { isMacPlatform } from '@/lib/keymap/platform';
+
 function frozenTable<V>(entries: Readonly<Record<string, V>>): Readonly<Record<string, V>> {
 	return Object.assign(Object.create(null) as Record<string, V>, entries);
 }
@@ -105,4 +109,28 @@ export interface ImportDiffRow {
 	detail: string;
 	/** Idempotency / row identity for React keys and re-render diffing. */
 	key: string;
+}
+
+/**
+ * Keys already claimed by earlier `add` rows in one import (fix round 2,
+ * item 4). Compared the way the keymap compares keys — modifier order, `mod`
+ * per platform, a chord's first stroke — through the same `keyHolderIn` the
+ * effective model uses, never as raw strings: `shift+mod+k` and `mod+shift+k`
+ * are one key, and `mod+k mod+s` collides with `mod+k`.
+ */
+export function createKeyClaims(): {
+	claimedBy: (key: string) => string | null;
+	claim: (key: string, label: string) => void;
+} {
+	const platform = isMacPlatform() ? 'mac' : 'other';
+	const entries: KeymapEntry[] = [];
+	return {
+		claimedBy(key) {
+			const holder = keyHolderIn(entries, key, platform);
+			return holder && 'command' in holder ? holder.command : null;
+		},
+		claim(key, label) {
+			entries.push({ command: label, key, when: 'always', source: 'personal', label });
+		},
+	};
 }

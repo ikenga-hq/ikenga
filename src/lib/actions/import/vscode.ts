@@ -12,12 +12,14 @@
 import { keyHolder, addKeybinding, type KeybindingRule } from '@/lib/actions/store';
 import {
 	canonicalizeKeySequence,
+	isMacPlatform,
 	isValidKeyToken,
 	splitKeySequence,
 	validateKeySequence,
 } from '@/lib/keymap/platform';
 import { contextKeysOf, normalizeAst, serializeWhen, tryParseWhen, type WhenNode } from '@/lib/keymap/when';
 import {
+	createKeyClaims,
 	type ImportDiffRow,
 	MAX_IMPORT_FILE_BYTES,
 	VSCODE_COMMAND_MAP,
@@ -210,7 +212,10 @@ export function detectVSCodeSourcePlatform(rules: readonly VSCodeRawRule[]): VSC
 			}
 		}
 	}
-	return 'other';
+	// No `cmd` anywhere: the file says nothing about its platform, so read it
+	// as this machine's — a mac file that only uses `ctrl` keeps `ctrl`
+	// rather than folding into `mod` (⌘ here).
+	return isMacPlatform() ? 'mac' : 'other';
 }
 
 /** One VS Code stroke (`ctrl+k`, `cmd+shift+p`) to our storage grammar
@@ -399,7 +404,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 	// Fix round 1, item 4: two rows in the *same* import both asking for a
 	// key that was free in the effective model at the start of this diff —
 	// the second one can't have it either, since Add can only write it once.
-	const claimedInThisImport = new Map<string, string>();
+	const claimedInThisImport = createKeyClaims();
 
 	return rules.map((raw, i): VSCodeImportRow => {
 		const rawCommand = typeof raw.command === 'string' ? raw.command : null;
@@ -434,7 +439,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 			return { kind: 'skip', key, title, detail: `${whenResult.reason} — not imported` };
 		}
 
-		const claimedBy = claimedInThisImport.get(translatedKey);
+		const claimedBy = claimedInThisImport.claimedBy(translatedKey);
 		if (claimedBy) {
 			return {
 				kind: 'clash',
@@ -468,7 +473,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 			};
 		}
 
-		claimedInThisImport.set(translatedKey, `\`${title}\``);
+		claimedInThisImport.claim(translatedKey, `\`${title}\``);
 		const rule: KeybindingRule = { key: translatedKey, command: mappedId, ...(whenResult.when ? { when: whenResult.when } : {}) };
 		return {
 			kind: 'add',

@@ -13,7 +13,7 @@ import {
 	translateVSCodeKey,
 	translateVSCodeWhen,
 } from './vscode';
-import { MAX_IMPORT_FILE_BYTES, VSCODE_COMMAND_MAP } from './vscode-map';
+import { createKeyClaims, MAX_IMPORT_FILE_BYTES, VSCODE_COMMAND_MAP } from './vscode-map';
 
 describe('parseVSCodeKeybindingsText', () => {
 	it('parses a plain JSON array', () => {
@@ -68,7 +68,7 @@ describe('detectVSCodeSourcePlatform (fix round 1, item 6)', () => {
 		expect(detectVSCodeSourcePlatform([{ key: 'ctrl+t', command: 'a' }, { key: 'cmd+shift+p', command: 'b' }])).toBe('mac');
 	});
 
-	it('defaults to `other` with no `cmd`/`command` token', () => {
+	it('with no `cmd`/`command` token, follows the live platform (`other` under jsdom)', () => {
 		expect(detectVSCodeSourcePlatform([{ key: 'ctrl+t', command: 'a' }, { key: 'win+e', command: 'b' }])).toBe('other');
 	});
 });
@@ -250,5 +250,23 @@ describe('buildVSCodeDiff', () => {
 			expect(r.kind).toBe('skip');
 			expect(r.detail).toMatch(/not in the frozen VS Code command map/);
 		}
+	});
+});
+
+describe('createKeyClaims (fix round 2, item 4)', () => {
+	it('compares keys the way the keymap does, not as raw strings', () => {
+		const claims = createKeyClaims();
+		claims.claim('mod+shift+k', 'first');
+		expect(claims.claimedBy('shift+mod+k')).toBe('first');
+		expect(claims.claimedBy('mod+alt+k')).toBeNull();
+	});
+
+	it('a chord collides with a claimed single stroke on its first stroke, and vice versa', () => {
+		const claims = createKeyClaims();
+		claims.claim('mod+k', 'single');
+		expect(claims.claimedBy('mod+k mod+s')).toBeNull(); // a chord is held only by the same full sequence…
+		const chords = createKeyClaims();
+		chords.claim('mod+k mod+s', 'chord');
+		expect(chords.claimedBy('mod+k')).toBe('chord'); // …but a stroke is held by a chord that starts with it
 	});
 });

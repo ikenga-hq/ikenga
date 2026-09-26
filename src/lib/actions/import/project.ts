@@ -25,7 +25,7 @@ import {
 } from '@/lib/actions/store';
 import { validateKeySequence } from '@/lib/keymap/platform';
 import type { ImportDiffRow } from './vscode-map';
-import { MAX_IMPORT_FILE_BYTES, resolveImportIcon } from './vscode-map';
+import { createKeyClaims, MAX_IMPORT_FILE_BYTES, resolveImportIcon } from './vscode-map';
 
 /** DEC-55, G-ACTIONS §8.3: project-scope actions of these kinds refuse to
  *  run until the project is trusted. Mirrors `types.ts`'s `GATED_RUN_KINDS`
@@ -158,7 +158,7 @@ export function buildProjectDiff(source: TeammateProjectSource, model: Effective
 
 	// Fix round 1, item 4: two rows in the same import asking for the same
 	// free key — the second one can't have it either.
-	const claimedInThisImport = new Map<string, string>();
+	const claimedInThisImport = createKeyClaims();
 
 	const bindingRows: ProjectImportBindingRow[] = source.bindings.map((rawRule, i): ProjectImportBindingRow => {
 		const key = `team-binding-${i}-${rawRule.command}-${rawRule.key}`;
@@ -204,7 +204,7 @@ export function buildProjectDiff(source: TeammateProjectSource, model: Effective
 			return { kind: 'skip', key, title, detail: 'removes a binding — not imported' };
 		}
 
-		const claimedBy = claimedInThisImport.get(rule.key);
+		const claimedBy = claimedInThisImport.claimedBy(rule.key);
 		if (claimedBy) {
 			return { kind: 'clash', key, title, detail: `asks for a key already taken by ${claimedBy} earlier in this import — imported unbound` };
 		}
@@ -229,7 +229,7 @@ export function buildProjectDiff(source: TeammateProjectSource, model: Effective
 				detail: `already held by \`${heldByLabel}\` — kept yours, imported unbound`,
 			};
 		}
-		claimedInThisImport.set(rule.key, `\`${title}\``);
+		claimedInThisImport.claim(rule.key, `\`${title}\``);
 		return {
 			kind: 'add',
 			key,
