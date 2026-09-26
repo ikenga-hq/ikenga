@@ -233,7 +233,8 @@ describe('defaults — DEC-62 `when` values and the new fields', () => {
 	it('carries the `source` and (defaulted) `scope` fields', () => {
 		for (const e of DEFAULT_KEYMAP) {
 			expect(e.source).toBe('default');
-			expect(e.scope ?? 'app').toBe('app');
+			// DEC-60 (WP-54): the `os.*` rows are the only OS-wide defaults.
+			expect(e.scope ?? 'app', e.command).toBe(e.command.startsWith('os.') ? 'os' : 'app');
 		}
 	});
 
