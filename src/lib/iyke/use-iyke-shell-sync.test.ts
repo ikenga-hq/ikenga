@@ -173,7 +173,7 @@ describe('useIykeShellSync — WP-21 frame push', () => {
 		});
 	});
 
-	it('keymapPayload keeps a held removal rule's `-` so it never reads as a new binding', () => {
+	it('keymapPayload keeps the `-` of a held removal rule, so it never reads as a new binding', () => {
 		const [row] = keymapPayload({
 			entries: [],
 			held: [{ index: 1, rule: { key: 'mod+w', command: '-pane.close' }, trust: 'changed' }],
