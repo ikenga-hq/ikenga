@@ -377,6 +377,13 @@ describe('menus (§1.4, §9.2, DEC-58)', () => {
 		});
 		expect(menuIds(m.menus.get('todos'))).toEqual(['toggle-done', '---', 'open-source', 'hand-to-chi']);
 	});
+
+	it('package `artifact` actions close the pane artifact branch, before the separator + pane.close (§7.3a)', () => {
+		const m = model({ packages: [pkgAction({ pkgId: 'com.x', localId: 'export', selector: { kind: 'artifact' } })] });
+		const ids = menuIds(m.menus.get('pane'));
+		expect(ids.slice(-4)).toEqual(['viewer.toggle-history', 'com.x:export', '---', 'pane.close']);
+		expect(menuIds(m.menus.get('artifacts')).at(-1)).toBe('com.x:export');
+	});
 });
 
 // ─── Package actions and key requests ────────────────────────────────────────

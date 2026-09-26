@@ -15,8 +15,8 @@
 // start it) it is the defaults. Callers never read `DEFAULT_KEYMAP` directly.
 
 import { useEffect } from 'react';
-import { getContextKeys, getEvalOptions } from './context-keys';
-import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapScope } from './defaults';
+import { type ContextKeys, getContextKeys, getEvalOptions } from './context-keys';
+import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapScope, type KeymapSource } from './defaults';
 import {
 	canonicalizeKeySequence,
 	eventMatchesCombo,
@@ -24,7 +24,7 @@ import {
 	isMacPlatform,
 	resolveKeySequence,
 } from './platform';
-import { evaluateWhen, normalizeWhen } from './when';
+import { evaluateWhen, normalizeWhen, whenSpecificity } from './when';
 
 export type { KeymapEntry, KeymapRuleOrigin, KeymapScope, KeymapSource } from './defaults';
 export type { WhenClause } from './when';
@@ -255,6 +255,112 @@ export function conflicts(opts?: {
 	return out;
 }
 
+// ─── Keypress resolution (G-ACTIONS §2.3, DEC-58) ─────────────────────────
+
+/** An entry of the effective keymap (`getKeymap()`): same shape as a
+ *  `KeymapEntry`, named for G-ACTIONS-API. */
+export type EffectiveKeymapEntry = KeymapEntry;
+
+/** §2.3: higher layer wins. */
+export const LAYER_RANK: Readonly<Record<KeymapSource, number>> = {
+	default: 0,
+	package: 1,
+	personal: 2,
+	project: 3,
+};
+
+function safeSpecificity(when: string | undefined | null): number {
+	try {
+		return whenSpecificity(when);
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * §2.3 winner among the rules that match a keypress (key sequence matched,
+ * `when` true now, hosted commands already excluded): highest layer, then
+ * the most specific `when`, then the latest in merge order. `keymap` is the
+ * effective list the candidates come from (merge order = index). Exactly
+ * one wins; nothing double-fires (DEC-58).
+ */
+export function resolveKeypressWinner(
+	candidates: readonly KeymapEntry[],
+	keymap: readonly KeymapEntry[]
+): KeymapEntry | null {
+	let best: KeymapEntry | null = null;
+	let bestRank: [number, number, number] = [-1, -1, -1];
+	for (const entry of candidates) {
+		const rank: [number, number, number] = [
+			LAYER_RANK[entry.source] ?? 0,
+			safeSpecificity(entry.when),
+			keymap.indexOf(entry),
+		];
+		if (
+			!best ||
+			rank[0] > bestRank[0] ||
+			(rank[0] === bestRank[0] && rank[1] > bestRank[1]) ||
+			(rank[0] === bestRank[0] && rank[1] === bestRank[1] && rank[2] > bestRank[2])
+		) {
+			best = entry;
+			bestRank = rank;
+		}
+	}
+	return best;
+}
+
+export interface KeypressResolution {
+	/** The one command that fires (§2.3), or null. */
+	winner: EffectiveKeymapEntry | null;
+	/** Every in-app, non-hosted binding matching the key whose `when` holds. */
+	candidates: EffectiveKeymapEntry[];
+}
+
+function isKeyboardEventLike(input: KeyboardEvent | { key: string }): input is KeyboardEvent {
+	return 'ctrlKey' in input || 'metaKey' in input;
+}
+
+/**
+ * The one "winner for a key + context" query (G-ACTIONS §2.3). `input` is a
+ * keydown (matched like the dispatcher: single strokes only, IME / Dead-key
+ * events match nothing) or a key string (`{ key: 'mod+b' }`, compared in
+ * the platform-resolved form; chords allowed). Candidates are the effective
+ * `scope: 'app'` entries on `platform` that match, are not hosted (§4.6)
+ * and whose `when` is true against `ctx` (default: the live context of the
+ * event's target). `entries` overrides the keymap (tests, previews).
+ */
+export function resolveKeypress(
+	input: KeyboardEvent | { key: string },
+	ctx?: ContextKeys,
+	platform?: KeymapPlatform,
+	entries?: readonly EffectiveKeymapEntry[]
+): KeypressResolution {
+	const p = platform ?? livePlatform();
+	const mac = p === 'mac';
+	const keymap = entries ?? getKeymap();
+	const event = isKeyboardEventLike(input) ? input : null;
+	const target = event ? null : comparableOrNull(input.key, p);
+	if (!event && target === null) return { winner: null, candidates: [] };
+	const context = ctx ?? getContextKeys(event?.target ?? null);
+	const evalOptions = getEvalOptions();
+	const candidates = entriesForPlatform(keymap, p).filter((entry) => {
+		if ((entry.scope ?? 'app') !== 'app' || isHostedCommand(entry.command)) return false;
+		const matches = event
+			? eventMatchesCombo(event, entry.key, mac)
+			: comparableOrNull(entry.key, p) === target;
+		return matches && evaluateWhen(entry.when, context, evalOptions);
+	});
+	return { winner: resolveKeypressWinner(candidates, keymap), candidates };
+}
+
+function comparableOrNull(seq: string, platform: KeymapPlatform): string | null {
+	try {
+		return comparableKeySequence(seq, platform);
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Fire `handler` when `command`'s bound key is pressed and its `when` holds
  * against the live context (`context-keys.ts`). Centralises the guard every
@@ -263,9 +369,11 @@ export function conflicts(opts?: {
  * composition or Dead-key event never matches (`strokesFromEvent`). No-ops
  * (and warns) for a command with no registry entry, and no-ops silently for
  * a hosted command (§4.6) — its owner fires it. Single strokes only; chords
- * go through the dispatcher's chord machine (WP-54, `chord.ts`). The entry
- * is looked up on every keydown, so a rebind in the effective keymap
- * (WP-52) takes effect without remounting.
+ * go through the dispatcher's chord machine (WP-54, `chord.ts`). Every
+ * keydown is resolved with `resolveKeypress()` over the effective keymap,
+ * and the handler fires only when `command` is the §2.3 winner — so two
+ * commands on one key never both fire (DEC-58), and a rebind takes effect
+ * without remounting.
  */
 export function useKey(
 	command: string,
@@ -280,20 +388,9 @@ export function useKey(
 			console.warn(`[keymap] useKey: no registry entry for "${command}"`);
 			return;
 		}
-		const mac = isMacPlatform();
-		const platform: KeymapPlatform = mac ? 'mac' : 'other';
 		function onKey(e: KeyboardEvent) {
-			// Every effective in-app binding of `command` on this platform —
-			// a user may add a second key, or unbind the default (then none).
-			const bindings = entriesForPlatform(getKeymap(), platform).filter(
-				(entry) => entry.command === command && (entry.scope ?? 'app') === 'app'
-			);
-			const hit = bindings.find(
-				(entry) =>
-					eventMatchesCombo(e, entry.key, mac) &&
-					evaluateWhen(entry.when, getContextKeys(e.target), getEvalOptions())
-			);
-			if (!hit) return;
+			const { winner } = resolveKeypress(e);
+			if (!winner || winner.command !== command) return;
 			e.preventDefault();
 			handler(e);
 		}

@@ -80,22 +80,57 @@
 //   useActionsStore  — the zustand store: { status, model, error, version }
 //   `getKeymap()` (`@/lib/keymap/registry`) returns `model.keymap.entries`
 //   once published; `subscribeKeymap()` fires on every publish.
-//   resolveKeypressWinner(candidates, keymap) — §2.3 (from `merge.ts`)
+//   type EffectiveKeymapEntry = KeymapEntry     (an entry of `getKeymap()`)
+//   resolveKeypress(input: KeyboardEvent | { key: string }, ctx?: ContextKeys,
+//       platform?: 'mac' | 'other', entries?: EffectiveKeymapEntry[])
+//       → { winner: EffectiveKeymapEntry | null; candidates: EffectiveKeymapEntry[] }
+//       THE "winner for a key + context" query (§2.3, DEC-58): candidates =
+//       effective `scope:'app'` entries on the platform whose key matches
+//       (an event: single strokes, IME / Dead keys match nothing; a string:
+//       platform-resolved comparison, chords allowed), not hosted (§4.6),
+//       `when` true against `ctx` (default: live context of the event
+//       target); winner by layer, then `when` specificity, then merge order.
+//       `useKey()` fires only its command's win. The dispatcher (WP-54), the
+//       Keys tab and iyke use it. `entries` defaults to `getKeymap()`.
+//       Lives in `@/lib/keymap/registry`; type `KeypressResolution`.
+//   resolveKeypressWinner(candidates, keymap) — the §2.3 ranking alone
+//   bindingsFor(actionId, platform?): EffectiveKeymapEntry[]   every
+//       effective binding of the action (app + OS scope), merge order
+//   keyHolder(key, platform?): KeyHolder | null   §7.4 "holds" over the
+//       current model (package grants included): single stroke
+//       (`binding` | `os`), else a chord prefix (`chord`), else an earlier
+//       grant (`package`), else a native-role accelerator; null = free.
+//       A chord key is held only by the same full sequence. WP-61's import.
+//   `platform` defaults to the live platform everywhere.
 //
 // ── Lifecycle and change subscription ───────────────────────────────────────
 //   startActionsStore(): Promise<EffectiveModel>   idempotent; first read +
 //       subscriptions: `actions://changed` (watcher + trust grants/revokes),
 //       `pkg-installed` / `pkg-uninstalled` / `pkg-reloaded`, and the active
-//       project. Every one re-merges without a restart. The hooks call it.
+//       project (a project change re-reads files AND packages, for that
+//       project id). Every one re-merges without a restart. The `use*`
+//       hooks call it too, but nothing else does: WP-54 calls it once at
+//       the app root on boot (so `getKeymap()` / `useKey()` see the
+//       effective keymap before any hook mounts).
 //   stopActionsStore(): void                       tears down; getKeymap()
 //       reverts to the defaults
-//   refreshActionsModel(): Promise<EffectiveModel> re-read files + packages
+//   refreshActionsModel(projectId?: string | null): Promise<EffectiveModel>
+//       re-read files + packages (null = the Rust side resolves the project)
 //   subscribeEffectiveModel(listener: (model) => void): () => void
+//   Hand-off (WP-62): `use-iyke-shell-sync.ts` pushes the keymap to iyke
+//   once; WP-62 must re-send it on every `subscribeKeymap()` notification.
 //
-// ── Writes (every write goes through the WP-50 validator; a refused write
-//    throws `ActionsValidationError` and leaves the file untouched; a file
-//    that is malformed on disk is never overwritten from its stale in-force
-//    copy — `ActionsFileNotWritableError`; each write re-merges) ─────────────
+// ── Writes ──────────────────────────────────────────────────────────────────
+//   Every write goes through the WP-50 validator; a refused write throws
+//   `ActionsValidationError` (re-exported here) and leaves the file untouched.
+//   A file present on disk but not in force as written — stale, unreadable,
+//   `document: null`, or any `validation.errors` — is never rewritten
+//   (§1.1): `ActionsFileNotWritableError`, nothing written. Writes are
+//   SERIALIZED: one module-level chain, call order; each edit re-reads the
+//   files fresh (`readActionsFiles`, not the cached model), applies itself,
+//   writes, re-merges — so overlapping edits and on-disk edits inside the
+//   watcher debounce are never lost. Write-side types re-exported here:
+//   `ActionsScope`, `KeybindingRule`, `MenuOverride`, `UserAction`.
 //   saveUserAction(scope, action: UserAction): Promise<void>        upsert by id
 //   deleteUserAction(scope, id): Promise<void>
 //   resetUserActions(scope): Promise<void>          deletes `actions`
@@ -108,10 +143,14 @@
 //   unhideAction(scope, id, menuIds?): Promise<void>
 //   addKeybinding(scope, rule: KeybindingRule): Promise<void>
 //   rebindKey(scope, entry: KeymapEntry, newKey, opts?: {when?}): Promise<void>
-//       entry's own rule at `scope` → edited in place; otherwise one negative
+//       entry's own rule at `scope` → edited in place (key + `when` only;
+//       its `platform` / `scope` stay as written); otherwise one negative
 //       rule for the old key + one positive rule for the new key (§1.5)
 //   unbindKey(scope, entry: KeymapEntry): Promise<void>
 //       own rule at `scope` → removed; otherwise one negative rule
+//   Limitation: rebind / unbind at a scope BELOW the entry's layer (a
+//   project rule at `personal`) would never win (§2.3) — both reject with
+//   `LowerScopeOverrideError` ({scope, entry}) and write nothing.
 //   resetKeyOverride(scope, command): Promise<void> removes every rule for
 //       `command` at `scope` (never writes the default back)
 //   removeKeybinding(scope, index): Promise<void>
@@ -123,7 +162,14 @@
 import { useEffect } from 'react';
 import { create } from 'zustand';
 import type { KeymapEntry } from '@/lib/keymap/defaults';
-import { setEffectiveKeymap } from '@/lib/keymap/registry';
+import { isMacPlatform } from '@/lib/keymap/platform';
+import {
+	type EffectiveKeymapEntry,
+	entriesForPlatform,
+	type KeymapPlatform,
+	LAYER_RANK,
+	setEffectiveKeymap,
+} from '@/lib/keymap/registry';
 import { normalizeWhen } from '@/lib/keymap/when';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { listen, pkgKernelStatus, type UnlistenFn } from '@/lib/tauri-cmd';
@@ -144,7 +190,7 @@ import {
 	writeActionsFile,
 	writeKeybindingsFile,
 } from './client';
-import { buildEffectiveModel, type EffectiveKeymap, type EffectiveModel } from './merge';
+import { buildEffectiveModel, type EffectiveKeymap, type EffectiveModel, type KeyHolder, keyHolderIn } from './merge';
 import type { EffectiveMenu } from './menus';
 import { type EffectiveAction, isLockedAction, type PackageActionSource, readPackageActions } from './registry';
 
@@ -160,6 +206,10 @@ export type {
 	PackageKeyRequest,
 } from './merge';
 export { LAYER_RANK, resolveKeypressWinner } from './merge';
+export type { EffectiveKeymapEntry, KeypressResolution } from '@/lib/keymap/registry';
+export { resolveKeypress } from '@/lib/keymap/registry';
+export { ActionsValidationError } from './client';
+export type { ActionsScope, KeybindingRule, MenuOverride, UserAction } from './client';
 export type {
 	EffectiveMenu,
 	EffectiveMenuActionItem,
@@ -201,6 +251,22 @@ export class ActionsFileNotWritableError extends Error {
 		super(message);
 		this.name = 'ActionsFileNotWritableError';
 		this.scope = scope;
+	}
+}
+
+/** A rebind / unbind at a scope below the layer the binding comes from
+ *  (a project rule edited at `personal`): the lower layer's rule could never
+ *  win (§2.3), so nothing is written. Edit it at `entry.source`'s scope. */
+export class LowerScopeOverrideError extends Error {
+	readonly scope: ActionsScope;
+	readonly entry: KeymapEntry;
+	constructor(scope: ActionsScope, entry: KeymapEntry) {
+		super(
+			`\`${entry.command}\` on \`${entry.key}\` comes from the ${entry.source} layer; a ${scope} rule cannot override it`
+		);
+		this.name = 'LowerScopeOverrideError';
+		this.scope = scope;
+		this.entry = entry;
 	}
 }
 
@@ -251,9 +317,10 @@ function fail(err: unknown): void {
 	useActionsStore.setState({ status: 'error', error: message });
 }
 
-async function loadFiles(): Promise<boolean> {
+/** `projectId` null = the Rust side resolves the active project. */
+async function loadFiles(projectId: string | null = null): Promise<boolean> {
 	const seq = ++filesSeq;
-	const files = await readActionsFiles(null);
+	const files = await readActionsFiles(projectId);
 	if (seq !== filesSeq) return false;
 	inputs = { ...inputs, files };
 	return true;
@@ -274,10 +341,11 @@ async function loadPackages(): Promise<boolean> {
 	return true;
 }
 
-/** Re-reads the files and the package snapshot, then re-merges. */
-export async function refreshActionsModel(): Promise<EffectiveModel> {
+/** Re-reads the files and the package snapshot, then re-merges. `projectId`
+ *  (default: resolved by the Rust side) names the project to read. */
+export async function refreshActionsModel(projectId: string | null = null): Promise<EffectiveModel> {
 	try {
-		await Promise.all([loadFiles(), loadPackages()]);
+		await Promise.all([loadFiles(projectId), loadPackages()]);
 		return publish();
 	} catch (err) {
 		fail(err);
@@ -316,7 +384,8 @@ export function startActionsStore(): Promise<EffectiveModel> {
 	const unsubscribeProject = useShellStore.subscribe((state, prev) => {
 		const a = state.activeProject;
 		const b = prev.activeProject;
-		if (a?.id !== b?.id || a?.root_path !== b?.root_path) void refreshFiles();
+		// Project-scoped packages change with the project too: full refresh.
+		if (a?.id !== b?.id || a?.root_path !== b?.root_path) void refreshActionsModel(a?.id ?? null);
 	});
 	teardown = [
 		unsubscribeProject,
@@ -374,6 +443,25 @@ export function getEffectiveMenu(menuId: string): EffectiveMenu | null {
 	return getEffectiveModel().menus.get(menuId);
 }
 
+function livePlatform(): KeymapPlatform {
+	return isMacPlatform() ? 'mac' : 'other';
+}
+
+/** Every effective binding of `actionId` on `platform` (default: live), in
+ *  merge order — in-app and OS scope, hosted commands included. */
+export function bindingsFor(actionId: string, platform?: KeymapPlatform): EffectiveKeymapEntry[] {
+	return entriesForPlatform(getEffectiveKeymap().entries, platform ?? livePlatform()).filter(
+		(entry) => entry.command === actionId
+	);
+}
+
+/** What holds `key` on `platform` (default: live) in the current model —
+ *  the §7.4 "holds" notion package requests are granted against (null =
+ *  free). See `keyHolderIn` (`merge.ts`). */
+export function keyHolder(key: string, platform?: KeymapPlatform): KeyHolder | null {
+	return keyHolderIn(getEffectiveKeymap().entries, key, platform ?? livePlatform());
+}
+
 function useStarted(): void {
 	useEffect(() => {
 		void startActionsStore();
@@ -408,15 +496,21 @@ function clone<T>(value: T): T {
 }
 
 function writableState<D extends ActionsDocument | KeybindingsDocument>(
+	files: ActionsFilesResult,
 	scope: ActionsScope,
 	pick: (files: ActionsScopeFiles) => ActionsFileState<D>
 ): ActionsFileState<D> {
-	const files = getEffectiveModel().files;
-	if (!files) throw new ActionsFileNotWritableError(scope, 'the actions model has not loaded yet');
 	const scoped = scope === 'personal' ? files.personal : files.project;
 	if (!scoped) throw new ActionsFileNotWritableError(scope, 'the active project has no filesystem root');
 	const state = pick(scoped);
-	if (state.stale || state.error) {
+	// §1.1: a file that is on disk but not in force as written (malformed,
+	// unreadable, or failing validation — with or without a valid copy from
+	// earlier this session) is never rewritten from the model.
+	if (
+		state.stale ||
+		state.error ||
+		(state.present && (state.document === null || state.validation.errors.length > 0))
+	) {
 		throw new ActionsFileNotWritableError(
 			scope,
 			`${state.path} is not in force as written (${state.error ?? 'invalid on disk'}); fix or reset the file first`
@@ -425,24 +519,47 @@ function writableState<D extends ActionsDocument | KeybindingsDocument>(
 	return state;
 }
 
-async function editActions(scope: ActionsScope, edit: (doc: ActionsDocument) => void): Promise<void> {
-	const state = writableState(scope, (f) => f.actions);
-	const doc: ActionsDocument = state.document
-		? clone(state.document)
-		: { $schema: ACTIONS_SCHEMA, version: 1 };
-	edit(doc);
-	await writeActionsFile(scope, doc, getEffectiveModel().projectId);
-	await refreshFiles();
+/** Every write runs through this one chain, in call order: each edit reads
+ *  the files fresh, applies itself and writes before the next one starts,
+ *  so overlapping edits (or an on-disk edit inside the watcher's debounce)
+ *  never overwrite each other. A failed write does not block the next. */
+let writeChain: Promise<unknown> = Promise.resolve();
+
+function serialized<T>(task: () => Promise<T>): Promise<T> {
+	const run = writeChain.then(task, task);
+	writeChain = run.catch(() => {});
+	return run;
 }
 
-async function editKeybindings(scope: ActionsScope, edit: (doc: KeybindingsDocument) => void): Promise<void> {
-	const state = writableState(scope, (f) => f.keybindings);
-	const doc: KeybindingsDocument = state.document
-		? clone(state.document)
-		: { $schema: KEYBINDINGS_SCHEMA, version: 1 };
-	edit(doc);
-	await writeKeybindingsFile(scope, doc, getEffectiveModel().projectId);
-	await refreshFiles();
+async function readForWrite(): Promise<ActionsFilesResult> {
+	const model = getEffectiveModel();
+	return readActionsFiles(model.files ? model.projectId : null);
+}
+
+function editActions(scope: ActionsScope, edit: (doc: ActionsDocument) => void): Promise<void> {
+	return serialized(async () => {
+		const files = await readForWrite();
+		const state = writableState(files, scope, (f) => f.actions);
+		const doc: ActionsDocument = state.document
+			? clone(state.document)
+			: { $schema: ACTIONS_SCHEMA, version: 1 };
+		edit(doc);
+		await writeActionsFile(scope, doc, files.projectId);
+		await refreshFiles();
+	});
+}
+
+function editKeybindings(scope: ActionsScope, edit: (doc: KeybindingsDocument) => void): Promise<void> {
+	return serialized(async () => {
+		const files = await readForWrite();
+		const state = writableState(files, scope, (f) => f.keybindings);
+		const doc: KeybindingsDocument = state.document
+			? clone(state.document)
+			: { $schema: KEYBINDINGS_SCHEMA, version: 1 };
+		edit(doc);
+		await writeKeybindingsFile(scope, doc, files.projectId);
+		await refreshFiles();
+	});
 }
 
 /** Upserts a user action by id (its `scope` is set to the file's, §1.2). */
@@ -569,6 +686,11 @@ function negativeFor(entry: KeymapEntry): KeybindingRule {
 	};
 }
 
+/** `entry` comes from a layer above `scope` (§2.3: that rule would win). */
+function isLowerScope(scope: ActionsScope, entry: KeymapEntry): boolean {
+	return LAYER_RANK[entry.source] > LAYER_RANK[scope];
+}
+
 function ownRule(scope: ActionsScope, entry: KeymapEntry, doc: KeybindingsDocument): number | null {
 	if (entry.origin?.scope !== scope) return null;
 	const rule = doc.bindings?.[entry.origin.index];
@@ -586,22 +708,26 @@ export function rebindKey(
 	newKey: string,
 	opts?: { when?: string }
 ): Promise<void> {
+	if (isLowerScope(scope, entry)) return Promise.reject(new LowerScopeOverrideError(scope, entry));
 	return editKeybindings(scope, (doc) => {
 		const bindings = [...(doc.bindings ?? [])];
 		const when = storedWhen(opts?.when ?? entry.when);
-		const positive: KeybindingRule = {
-			key: newKey,
-			command: entry.command,
-			...(when ? { when } : {}),
-			...(entry.scope === 'os' ? { scope: 'os' as const } : {}),
-			...(entry.platformOnly ? { platform: entry.platformOnly } : {}),
-		};
 		const own = ownRule(scope, entry, doc);
 		if (own !== null) {
-			bindings[own] = { ...bindings[own], ...positive };
-			if (!when) delete bindings[own].when;
+			// In place: only key and `when` change; the rule's own `platform`
+			// and `scope` stay as the user wrote them.
+			const next: KeybindingRule = { ...bindings[own], key: newKey };
+			if (when) next.when = when;
+			else delete next.when;
+			bindings[own] = next;
 		} else {
-			bindings.push(negativeFor(entry), positive);
+			bindings.push(negativeFor(entry), {
+				key: newKey,
+				command: entry.command,
+				...(when ? { when } : {}),
+				...(entry.scope === 'os' ? { scope: 'os' as const } : {}),
+				...(entry.platformOnly ? { platform: entry.platformOnly } : {}),
+			});
 		}
 		doc.bindings = bindings;
 	});
@@ -610,6 +736,7 @@ export function rebindKey(
 /** Unbinds `entry` at `scope`: removes that scope's own rule, else appends
  *  one negative rule. The key is never tombstoned (DEC-58). */
 export function unbindKey(scope: ActionsScope, entry: KeymapEntry): Promise<void> {
+	if (isLowerScope(scope, entry)) return Promise.reject(new LowerScopeOverrideError(scope, entry));
 	return editKeybindings(scope, (doc) => {
 		const bindings = [...(doc.bindings ?? [])];
 		const own = ownRule(scope, entry, doc);

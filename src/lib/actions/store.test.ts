@@ -28,14 +28,19 @@ vi.mock('./client', async (importOriginal) => ({
 }));
 
 import { getKeymap } from '@/lib/keymap/registry';
+import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	ActionsFileNotWritableError,
+	bindingsFor,
 	getEffectiveMenu,
 	getEffectiveModel,
 	hideAction,
+	keyHolder,
 	LockedActionError,
+	LowerScopeOverrideError,
 	rebindKey,
 	resetKeyOverride,
+	saveUserAction,
 	setMenuOverride,
 	startActionsStore,
 	stopActionsStore,
@@ -291,6 +296,68 @@ describe('writes', () => {
 		expect(h.writeActions).not.toHaveBeenCalled();
 	});
 
+	it('refuses a file that is present but invalid with no valid copy (document null + validation error, §1.1)', async () => {
+		const malformed = files({});
+		malformed.personal.actions = {
+			...malformed.personal.actions,
+			present: true,
+			document: null,
+			stale: false,
+			error: null,
+			validation: { errors: [{ code: 'E_JSON', path: '', message: 'unexpected token' }], warnings: [] },
+		};
+		h.read.mockResolvedValue(malformed);
+		await startActionsStore();
+		await expect(hideAction('personal', 'copy-name')).rejects.toBeInstanceOf(ActionsFileNotWritableError);
+		expect(h.writeActions).not.toHaveBeenCalled();
+	});
+
+	it('serializes overlapping writes, each from a fresh read: two concurrent edits both land', async () => {
+		let disk: ActionsDocument | null = null;
+		h.read.mockImplementation(() => Promise.resolve(files({ personalActions: disk ?? undefined })));
+		h.writeActions.mockImplementation((_scope: ActionsScope, doc: ActionsDocument) => {
+			disk = JSON.parse(JSON.stringify(doc)) as ActionsDocument;
+			return Promise.resolve({ written: true });
+		});
+		await startActionsStore();
+		const a = { id: 'a-one', name: 'A', scope: 'personal' as const, run: { kind: 'open' as const, url: '/a' } };
+		const b = { id: 'b-two', name: 'B', scope: 'personal' as const, run: { kind: 'open' as const, url: '/b' } };
+		await Promise.all([saveUserAction('personal', a), saveUserAction('personal', b)]);
+		expect(h.writeActions).toHaveBeenCalledTimes(2);
+		const [, last] = h.writeActions.mock.calls[1] as [ActionsScope, ActionsDocument];
+		expect(last.actions?.map((x) => x.id)).toEqual(['a-one', 'b-two']);
+	});
+
+	it('an in-place rebind keeps the rule as written: no `platform` from a narrowed entry', async () => {
+		h.read.mockResolvedValue(
+			files({
+				personalBindings: [
+					{ key: 'mod+shift+e', command: 'tab.close' },
+					{ key: 'mod+shift+e', command: '-tab.close', platform: 'other' },
+				],
+			})
+		);
+		await startActionsStore();
+		const own = getKeymap().find((e) => e.command === 'tab.close' && e.source === 'personal');
+		expect(own?.platformOnly).toBe('mac');
+		if (!own) return;
+		await rebindKey('personal', own, 'mod+alt+e');
+		const [, doc] = h.writeKeybindings.mock.calls[0] as [ActionsScope, KeybindingsDocument];
+		expect(doc.bindings?.[0]).toEqual({ key: 'mod+alt+e', command: 'tab.close' });
+	});
+
+	it('rebind / unbind below the entry layer throws LowerScopeOverrideError and writes nothing', async () => {
+		h.read.mockResolvedValue(
+			files({ projectBindings: [{ key: 'mod+shift+e', command: 'tab.close' }], projectTrust: 'trusted' })
+		);
+		await startActionsStore();
+		const fromProject = getKeymap().find((e) => e.command === 'tab.close' && e.source === 'project');
+		if (!fromProject) throw new Error('project rule missing');
+		await expect(unbindKey('personal', fromProject)).rejects.toBeInstanceOf(LowerScopeOverrideError);
+		await expect(rebindKey('personal', fromProject, 'mod+alt+e')).rejects.toBeInstanceOf(LowerScopeOverrideError);
+		expect(h.writeKeybindings).not.toHaveBeenCalled();
+	});
+
 	it('the hidden item leaves the live menu after the re-read', async () => {
 		h.read.mockResolvedValueOnce(files({}));
 		await startActionsStore();
@@ -300,5 +367,25 @@ describe('writes', () => {
 		await vi.waitFor(() =>
 			expect(getEffectiveMenu('files')?.items.some((i) => i.kind === 'action' && i.id === 'copy-name')).toBe(false)
 		);
+	});
+});
+
+describe('queries and project change', () => {
+	it('bindingsFor / keyHolder read the current model', async () => {
+		h.read.mockResolvedValue(files({ personalBindings: [{ key: 'mod+shift+e', command: 'tab.close' }] }));
+		await startActionsStore();
+		expect(bindingsFor('tab.close', 'other').map((e) => e.key)).toContain('mod+shift+e');
+		expect(keyHolder('mod+shift+e', 'other')).toEqual({ kind: 'binding', command: 'tab.close', layer: 'personal' });
+		expect(keyHolder('mod+c', 'other')).toEqual({ kind: 'native-role', key: 'mod+c' });
+		expect(keyHolder('mod+alt+shift+f12', 'other')).toBeNull();
+	});
+
+	it('a project change re-reads files and packages for that project id', async () => {
+		h.read.mockResolvedValue(files({}));
+		await startActionsStore();
+		const pkgCalls = h.pkgStatus.mock.calls.length;
+		useShellStore.setState({ activeProject: { id: 'p2', root_path: '/work/p2', extra_roots: [] } });
+		await vi.waitFor(() => expect(h.read).toHaveBeenLastCalledWith('p2'));
+		expect(h.pkgStatus.mock.calls.length).toBeGreaterThan(pkgCalls);
 	});
 });

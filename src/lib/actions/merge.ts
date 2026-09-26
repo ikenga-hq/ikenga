@@ -34,10 +34,11 @@ import { canonicalizeKeySequence, validateKeySequence } from '@/lib/keymap/platf
 import {
 	comparableKeySequence,
 	conflicts,
+	entriesForPlatform,
 	type KeymapConflicts,
 	type KeymapPlatform,
 } from '@/lib/keymap/registry';
-import { normalizeWhen, whenSpecificity } from '@/lib/keymap/when';
+import { normalizeWhen } from '@/lib/keymap/when';
 import { buildMenu, type EffectiveMenu, type MenuMergeInput, type MenuMergeIssue, menuIdsFor } from './menus';
 import {
 	builtinActions,
@@ -63,13 +64,9 @@ import type {
 
 export const PLATFORMS: readonly KeymapPlatform[] = ['mac', 'other'];
 
-/** §2.3: higher layer wins. */
-export const LAYER_RANK: Readonly<Record<KeymapSource, number>> = {
-	default: 0,
-	package: 1,
-	personal: 2,
-	project: 3,
-};
+// §2.3 layer rank and keypress winner live beside `useKey` in the keymap
+// registry (one resolver for the dispatcher, `useKey` and the Keys tab).
+export { LAYER_RANK, resolveKeypressWinner } from '@/lib/keymap/registry';
 
 /** §7.4 item 5: predefined native-role accelerators (`MENU_TREE`
  *  `predefined` items) — held on every platform, plus ⌘H / ⌘M on macOS. */
@@ -202,46 +199,6 @@ function safeNormalize(when: string | undefined | null): string {
 	} catch {
 		return `⟨invalid⟩ ${when ?? ''}`;
 	}
-}
-
-function safeSpecificity(when: string | undefined | null): number {
-	try {
-		return whenSpecificity(when);
-	} catch {
-		return 0;
-	}
-}
-
-/**
- * §2.3 winner among the rules that match a keypress (key sequence matched,
- * `when` true now, hosted commands already excluded): highest layer, then
- * the most specific `when`, then the latest in merge order. `keymap` is the
- * effective list the candidates come from (merge order = index). Exactly
- * one wins; nothing double-fires (DEC-58).
- */
-export function resolveKeypressWinner(
-	candidates: readonly KeymapEntry[],
-	keymap: readonly KeymapEntry[]
-): KeymapEntry | null {
-	let best: KeymapEntry | null = null;
-	let bestRank: [number, number, number] = [-1, -1, -1];
-	for (const entry of candidates) {
-		const rank: [number, number, number] = [
-			LAYER_RANK[entry.source] ?? 0,
-			safeSpecificity(entry.when),
-			keymap.indexOf(entry),
-		];
-		if (
-			!best ||
-			rank[0] > bestRank[0] ||
-			(rank[0] === bestRank[0] && rank[1] > bestRank[1]) ||
-			(rank[0] === bestRank[0] && rank[1] === bestRank[1] && rank[2] > bestRank[2])
-		) {
-			best = entry;
-			bestRank = rank;
-		}
-	}
-	return best;
 }
 
 /** Did the Rust validator already raise `code` at `path` for that file? */
@@ -478,6 +435,59 @@ function grantRequests(
 		}
 	}
 	return { requests, grants };
+}
+
+function comparableOrNull(seq: string, platform: KeymapPlatform): string | null {
+	try {
+		return comparableKeySequence(seq, platform);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * What holds `key` on `platform` in an effective keymap (§7.4) — the same
+ * notion the merge grants package requests against, read over `entries`
+ * (the published keymap, package grants included): an effective single
+ * stroke (default / personal / project, whatever its `when`; OS keys as
+ * `os`), else a chord whose first stroke is `key`, else an earlier package
+ * grant, else a predefined native-role accelerator. A chord `key` is held
+ * only by an entry bound to the same full sequence. Null = free.
+ */
+export function keyHolderIn(
+	entries: readonly KeymapEntry[],
+	key: string,
+	platform: KeymapPlatform
+): KeyHolder | null {
+	const k = comparableOrNull(key, platform);
+	if (k === null) return null;
+	const chord = k.includes(' ');
+	let prefix: KeymapEntry | null = null;
+	let pkg: KeymapEntry | null = null;
+	for (const entry of entriesForPlatform(entries, platform)) {
+		const seq = comparableOrNull(entry.key, platform);
+		if (seq === null) continue;
+		if (chord) {
+			if (seq === k) return { kind: 'chord', command: entry.command, layer: entry.source };
+			continue;
+		}
+		const strokes = seq.split(' ');
+		if (strokes[0] !== k) continue;
+		if (strokes.length > 1) {
+			prefix ??= entry;
+		} else if (entry.source === 'package') {
+			pkg ??= entry;
+		} else {
+			return (entry.scope ?? 'app') === 'os'
+				? { kind: 'os', command: entry.command, layer: entry.source }
+				: { kind: 'binding', command: entry.command, layer: entry.source };
+		}
+	}
+	if (chord) return null;
+	if (prefix) return { kind: 'chord', command: prefix.command, layer: prefix.source };
+	if (pkg) return { kind: 'package', command: pkg.command };
+	const native = NATIVE_ROLE_KEYS[platform].some((n) => comparableOrNull(n, platform) === k);
+	return native ? { kind: 'native-role', key } : null;
 }
 
 /** Whether the project's keybindings rules are held (DEC-65). Fail closed:

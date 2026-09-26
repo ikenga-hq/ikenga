@@ -2,7 +2,17 @@ import { act, renderHook } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { listKeymap as bridgeListKeymap } from '@/lib/iyke/keymap-bridge';
 import { DEFAULT_KEYMAP, type KeymapEntry } from './defaults';
-import { conflicts, findEntry, getKeymap, isHostedCommand, labelFor, listKeymap, useKey } from './registry';
+import {
+	conflicts,
+	findEntry,
+	getKeymap,
+	isHostedCommand,
+	labelFor,
+	listKeymap,
+	resolveKeypress,
+	setEffectiveKeymap,
+	useKey,
+} from './registry';
 import { isMacPlatform, validateKeySequence } from './platform';
 import { normalizeWhen } from './when';
 
@@ -352,6 +362,50 @@ describe('useKey() — D3: typing in input/textarea/contenteditable never fires 
 			fireKeydown(UNRELATED_KEY_INIT, document.body);
 		});
 		expect(handler).not.toHaveBeenCalled();
+	});
+});
+
+describe('resolveKeypress() / useKey() — exactly one command fires (§2.3, DEC-58)', () => {
+	const MOD_B: KeyboardEventInit = isMacPlatform() ? { key: 'b', metaKey: true } : { key: 'b', ctrlKey: true };
+	const twoOnOneKey = (): KeymapEntry[] => [
+		entry({ command: 'explorer.toggle', key: 'mod+b', when: 'always' }),
+		entry({ command: 'companion.toggle', key: 'mod+b', when: 'always', source: 'personal' }),
+	];
+
+	it('resolveKeypress returns every matching candidate and the higher-layer winner', () => {
+		const keymap = twoOnOneKey();
+		const byString = resolveKeypress({ key: 'mod+b' }, undefined, 'other', keymap);
+		expect(byString.candidates.map((e) => e.command).sort()).toEqual(['companion.toggle', 'explorer.toggle']);
+		expect(byString.winner?.command).toBe('companion.toggle');
+		expect(resolveKeypress({ key: 'mod+j' }, undefined, 'other', keymap)).toEqual({ winner: null, candidates: [] });
+	});
+
+	it('resolveKeypress excludes hosted commands and OS-scope entries', () => {
+		const keymap = [
+			entry({ command: 'companion.send', key: 'mod+b', when: 'always', source: 'project' }),
+			entry({ command: 'os.summon', key: 'mod+b', when: 'always', scope: 'os' }),
+			entry({ command: 'explorer.toggle', key: 'mod+b', when: 'always' }),
+		];
+		const { winner, candidates } = resolveKeypress({ key: 'mod+b' }, undefined, 'mac', keymap);
+		expect(candidates.map((e) => e.command)).toEqual(['explorer.toggle']);
+		expect(winner?.command).toBe('explorer.toggle');
+	});
+
+	it('two commands on one key: only the winner\'s useKey handler runs', () => {
+		setEffectiveKeymap(twoOnOneKey());
+		try {
+			const explorer = vi.fn();
+			const companion = vi.fn();
+			renderHook(() => useKey('explorer.toggle', explorer));
+			renderHook(() => useKey('companion.toggle', companion));
+			act(() => {
+				fireKeydown(MOD_B, document.body);
+			});
+			expect(companion).toHaveBeenCalledTimes(1);
+			expect(explorer).not.toHaveBeenCalled();
+		} finally {
+			setEffectiveKeymap(null);
+		}
 	});
 });
 

@@ -311,6 +311,16 @@ function placementsAt(action: EffectiveAction, menuId: string, layer: MenuLayer)
 		}));
 }
 
+/** Where package appends go: the end of the menu, except `pane`, where
+ *  they close the artifact branch — before the trailing separator and
+ *  `pane.close` (§7.3a). */
+function packageInsertIndex(menuId: string, work: readonly WorkItem[]): number {
+	if (menuId !== 'pane') return work.length;
+	const close = work.findIndex((item) => item.kind === 'action' && item.id === 'pane.close');
+	if (close < 0) return work.length;
+	return close > 0 && work[close - 1].kind === 'separator' ? close - 1 : close;
+}
+
 function containsId(items: readonly WorkItem[], id: string): boolean {
 	return items.some((item) => item.kind === 'action' && item.id === id);
 }
@@ -424,11 +434,14 @@ export function buildMenu(input: MenuMergeInput, issues: MenuMergeIssue[]): Effe
 		});
 	}
 
-	// 2. Package appends, grant order (§7.3a, §12).
+	// 2. Package appends, grant order (§7.3a, §12). In `pane` they join the
+	//    artifact branch: before its closing separator + `pane.close`.
+	const appends: WorkItem[] = [];
 	for (const action of input.packageActions) {
-		if (containsId(work, action.id)) continue;
-		work.push(...placementsAt(action, menuId, 'package'));
+		if (containsId(work, action.id) || containsId(appends, action.id)) continue;
+		appends.push(...placementsAt(action, menuId, 'package'));
 	}
+	if (appends.length > 0) work.splice(packageInsertIndex(menuId, work), 0, ...appends);
 
 	// 3–4. Personal, then project: own placements, then the override.
 	const hidden = new Set<string>();
