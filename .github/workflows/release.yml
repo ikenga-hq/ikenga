@@ -120,6 +120,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ikenga-hq/ikenga-contract
+          # Pinned while Phase 6 lands G-PKG-KEY on contract `main` (WP-51,
+          # ikenga-contract#47): its fixtures carry `context_actions[].key` and a
+          # typed `command_palette[].action`, which this branch's parser rejects.
+          # `feat/phase-6-actions` tracks contract HEAD. Unpin at the Phase 6
+          # release (WP-63).
+          ref: 4807cf210449ed8cba6fa9f9084528e862633454
           path: contract
           token: ${{ secrets.WORKSPACE_DEPS_PAT || secrets.GITHUB_TOKEN }}
 
