@@ -1,0 +1,255 @@
+/* D-06 · Actions, menus and keys (WP-57) — additions on top of `ngwa.css`'s
+   shared `.view-ngwa` scaffold (`.facetbar`/`.chip`/`.split`/`.listcol`/
+   `.detailcol`/`.lhead`/`.irow`/`.surface`/`.ntabs`/`.dhead`/`.dtabs`/
+   `.dbody`). The route root carries both `view-ngwa view-acts`, same as
+   `designs/actions.html`'s `class="view-ngwa view-acts"` — Actions is built
+   as the same shape of screen as Ngwa Installed (FORM COMES FROM, actions.html
+   header comment): a faceted list + detail pane. Rules here are scoped under
+   `.view-acts` and only cover what `ngwa.css` does not already have.
+*/
+
+/* ── Header (`vhead`) — file path, scope switch, header actions ── */
+
+.view-acts .vhead {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	padding: var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	flex-wrap: wrap;
+	row-gap: var(--space-2);
+}
+
+.view-acts .vhead h1 {
+	font-family: var(--font-display);
+	font-size: var(--text-h3);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: none;
+}
+
+.view-acts .newchip {
+	font-size: 10px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--achievement);
+	background: var(--achievement-soft);
+	border-radius: var(--radius-xs);
+	padding: 1px 6px;
+}
+
+.view-acts .filepath {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	white-space: nowrap;
+}
+
+.view-acts .vhead .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+/* ── iyke footer line (product principle 5) ── */
+
+.view-acts .iykeline {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-1) var(--space-3);
+	border-top: 1px solid var(--border-soft);
+	background: var(--bg-surface);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .iykeline b {
+	color: var(--fg);
+	font-weight: 600;
+}
+
+.view-acts .iykeline .cp {
+	margin-left: auto;
+	background: transparent;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+	padding: 1px 6px;
+	cursor: pointer;
+}
+
+.view-acts .iykeline .cp:hover {
+	color: var(--fg);
+	background: var(--bg-raised);
+}
+
+/* ── Actions list — runs / key / source columns ── */
+
+.view-acts .lhead .c-runs {
+	margin-left: auto;
+}
+
+.view-acts .lhead .c-runs,
+.view-acts .lhead .c-key,
+.view-acts .lhead .c-src {
+	flex: none;
+	width: 84px;
+	text-align: right;
+}
+
+.view-acts .irow .tail .c-runs,
+.view-acts .irow .tail .c-src {
+	width: 84px;
+	flex: none;
+	text-align: right;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .irow .tail .c-key {
+	width: 84px;
+	flex: none;
+	display: flex;
+	justify-content: flex-end;
+}
+
+.view-acts .kind.k-builtin {
+	color: var(--fg-muted);
+}
+
+.view-acts .kind.k-package {
+	color: var(--info);
+}
+
+.view-acts .kind.k-personal {
+	color: var(--success);
+}
+
+.view-acts .kind.k-project {
+	color: var(--primary);
+}
+
+/* ── kbd chips (shared/kbd.tsx) ── */
+
+.kbdrow {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	flex: none;
+}
+
+kbd.kbd {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+	line-height: 1.5;
+}
+
+/* ── key recorder (shared/key-recorder.tsx) ── */
+
+.rec {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+	height: 26px;
+	padding: 0 var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+	color: var(--fg);
+	font-size: var(--text-caption);
+	cursor: pointer;
+}
+
+.rec.sm {
+	height: 22px;
+	font-size: var(--text-micro);
+}
+
+.rec:hover {
+	border-color: var(--border-strong);
+}
+
+.rec[data-recording] {
+	border-color: var(--primary);
+	background: var(--primary-soft);
+	color: var(--primary);
+}
+
+.rec .lbl.empty {
+	color: var(--fg-muted);
+}
+
+.rec .lbl.recording {
+	color: var(--primary);
+	font-weight: 500;
+}
+
+/* ── JSON preview (shared/json-preview.tsx) ── */
+
+.json-preview .jp-caption {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-bottom: var(--space-1);
+}
+
+.json-preview .fm .jp-key {
+	color: var(--primary);
+}
+
+.json-preview .fm .jp-val {
+	color: var(--fg);
+}
+
+/* ── Detail pane — run body, placements ── */
+
+.view-acts .runbody {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+	margin-bottom: var(--space-3);
+}
+
+.view-acts .placechips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-1);
+	margin-top: var(--space-1);
+}
+
+.view-acts .dbody .subhead {
+	margin: var(--space-3) 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .dbody .subhead.first {
+	margin-top: 0;
+}
+
+/* ── Empty state (uses the shared EmptyState primitive) ── */
+
+.view-acts .surface[data-state='empty'] {
+	background: var(--bg-base);
+}
