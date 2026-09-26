@@ -134,7 +134,13 @@ const BUILTIN_NAMES: ReadonlyArray<readonly [string, string, boolean?]> = [
 	['section.move-down', 'Move section down'],
 	// Companion
 	['companion.focus-dispatch', 'Focus the dispatch input'],
-	// Native-menu commands with no DK entry
+	// Native-menu commands with no DK entry. The first three lost their key
+	// when WP-54 applied DEC-64 / DEC-63.2 (§2.4, §10.2: unbound, their
+	// `MENU_TREE` leaves stay unaccelerated) — named here so they stay
+	// built-in actions.
+	['menu.new-session', 'New Session'],
+	['menu.new-terminal', 'New Terminal'],
+	['session.switch-adapter', 'Switch Adapter (coming soon)'],
 	['ikenga.check-updates', 'Check for Updates…'],
 	['project.project-settings', 'Project Settings'],
 	['chi.permission-inbox', 'Permission Inbox'],

@@ -2687,6 +2687,30 @@ export async function screenshotWindow(outPath?: string): Promise<ScreenshotResu
 	return invoke('screenshot_window', { outPath: outPath ?? null });
 }
 
+// ─── OS-wide shortcuts (G-ACTIONS §6, DEC-60; WP-54) ─────────────────────────
+
+/** One effective OS rule: an action id and its key in the registry grammar
+ *  (`alt+space`, `ctrl+alt+shift+s`). */
+export interface OsShortcutRuleArg {
+	command: string;
+	key: string;
+}
+
+/** Per-rule registration result; `reason` is set when `registered` is false. */
+export interface OsShortcutStatusResult {
+	command: string;
+	key: string;
+	registered: boolean;
+	reason: string | null;
+}
+
+/** Replace the OS-wide shortcuts `lib.rs` registers with `rules` (the
+ *  effective default + personal `scope: "os"` rules). Tolerant per rule: one
+ *  failure is reported in its status and never blocks the others. */
+export async function osShortcutsApply(rules: OsShortcutRuleArg[]): Promise<OsShortcutStatusResult[]> {
+	return invoke<OsShortcutStatusResult[]>('os_shortcuts_apply', { rules });
+}
+
 export async function screenshotPane(paneId: string, outPath?: string): Promise<ScreenshotResult> {
 	return invoke('screenshot_pane', {
 		paneId,

@@ -9,13 +9,28 @@
 // but it does prove nothing *claims* a command id that doesn't exist.
 
 import { describe, expect, it } from 'vitest';
+import { isBuiltinActionId } from '@/lib/actions/registry';
 import { findEntry, getKeymap } from '@/lib/keymap/registry';
-import { allMenuCommandIds, cascadeKeyLabel, MENU_TREE } from './tree';
+import { allMenuCommandIds, cascadeKeyLabel, MENU_TREE, macAccelerator } from './tree';
 
 describe('MENU_TREE — WP-08 registry parity', () => {
-	it('every commandId used by a menu item resolves in the keymap registry', () => {
+	it('every commandId used by a menu item resolves in the keymap registry or the built-in catalog', () => {
+		// DEC-64 / DEC-63.2 (WP-54) left three leaves deliberately unbound
+		// (`menu.new-session`, `menu.new-terminal`, `session.switch-adapter`):
+		// no keymap entry, still a built-in action, rendered unaccelerated.
 		for (const commandId of allMenuCommandIds()) {
-			expect(findEntry(commandId), `menu item references unknown command "${commandId}"`).toBeTruthy();
+			expect(
+				findEntry(commandId) ?? (isBuiltinActionId(commandId) || undefined),
+				`menu item references unknown command "${commandId}"`
+			).toBeTruthy();
+		}
+	});
+
+	it('the DEC-64 leaves carry no accelerator', () => {
+		for (const commandId of ['menu.new-session', 'menu.new-terminal', 'session.switch-adapter']) {
+			expect(allMenuCommandIds()).toContain(commandId);
+			expect(findEntry(commandId), commandId).toBeUndefined();
+			expect(macAccelerator(commandId), commandId).toBeUndefined();
 		}
 	});
 
