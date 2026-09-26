@@ -1,0 +1,315 @@
+/* D-06 Menus tab (WP-59): ordered tree editor + live preview. Ported from
+ * `designs/actions.html`'s "menus tab" block (`.view-ngwa .menuwrap` family,
+ * `.itemrow`/`.mitem`), ids on the shipped root class the shell already
+ * carries (`shell.tsx`'s `view-ngwa view-acts`). Own file, own folder — the
+ * brief lists `actions.css` classes as reuse-only (shared/don't-edit), so
+ * these new rules live here instead of being added to it; `.kind`/`.k-*`,
+ * `.src-dot`, `.detailcol`/`.dhead`/`.dtitle`/`.dsub`, `.chip`, `kbd.kbd` and
+ * `.issuesbanner` are reused as shipped from `actions.css` / `ngwa.css`.
+ */
+
+.view-acts .menuwrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+}
+
+.view-acts .menulist {
+	width: 232px;
+	flex: none;
+	min-height: 0;
+	overflow-y: auto;
+	border-right: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+.view-acts .menulist .mrow {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	text-align: left;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+}
+.view-acts .menulist .mrow:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+.view-acts .menulist .mrow.on {
+	background: var(--tint-bg-active);
+	color: var(--fg);
+	box-shadow: inset 2px 0 0 var(--primary);
+}
+.view-acts .menulist .mrow .n {
+	margin-left: auto;
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--fg-muted);
+}
+
+/* D-06's ten-entry place list (§ minor "don't list empty ids flat"):
+ * "Explorer section ⋯" and "Native menu" are one row each, with a picker
+ * for the concrete `section/<id>` / `native/<top>` underneath. */
+.view-acts .menulist .mrow-group {
+	border-bottom: 1px solid var(--border-soft);
+}
+.view-acts .menulist .mrow-group .mrow {
+	border-bottom: none;
+}
+.view-acts .menulist .mrow-group-pick {
+	display: block;
+	width: calc(100% - var(--space-3) * 2);
+	margin: 0 var(--space-3) var(--space-2);
+	padding: 2px var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+}
+
+.view-acts .treecol {
+	flex: 1 1 0;
+	min-width: 0;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+.view-acts .treehead {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	flex-wrap: wrap;
+}
+.view-acts .treehead .t {
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-weight: 500;
+}
+.view-acts .treehead .meta {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+.view-acts .treehead .rt {
+	margin-left: auto;
+	display: flex;
+	gap: var(--space-2);
+}
+.view-acts .tree2 {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: var(--space-2) var(--space-3);
+}
+.view-acts .mfoot {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-3);
+	border-top: 1px solid var(--border-soft);
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+/* ── tree rows ─────────────────────────────────────────────────────────── */
+
+.view-acts .itemrow {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 30px;
+	padding: 0 var(--space-2);
+	border-radius: var(--radius-sm);
+	border: 1px solid transparent;
+	background: var(--bg-surface);
+	margin-bottom: 2px;
+	font-size: var(--text-caption);
+	color: var(--fg);
+}
+.view-acts .itemrow:hover {
+	border-color: var(--border);
+}
+.view-acts .itemrow:focus-visible {
+	outline: 2px solid var(--primary);
+	outline-offset: 1px;
+}
+.view-acts .itemrow.sep2 {
+	min-height: 16px;
+	background: transparent;
+	color: var(--fg-faint);
+}
+.view-acts .itemrow.sep2 .line {
+	flex: 1;
+	height: 1px;
+	background: var(--border);
+}
+.view-acts .itemrow.dragging {
+	opacity: 0.35;
+}
+.view-acts .itemrow.dropafter {
+	box-shadow: 0 2px 0 var(--primary);
+}
+.view-acts .itemrow.dropbefore {
+	box-shadow: 0 -2px 0 var(--primary);
+}
+.view-acts .itemrow .grip {
+	width: 16px;
+	flex: none;
+	color: var(--fg-faint);
+	cursor: grab;
+	display: grid;
+	place-items: center;
+	/* Review round 1 major 8: without this, touch browsers treat a drag from
+	 * the grip as a scroll/refresh gesture and fight the pointer capture. */
+	touch-action: none;
+}
+.view-acts .itemrow .grip:active {
+	cursor: grabbing;
+}
+.view-acts .itemrow .lbl2 {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.view-acts .itemrow .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: none;
+}
+
+/* 6A.10: a single-pointer Move up/down alternative to drag, beside the grip.
+ * Reserved-slot opacity reveal (the 6A.1 pattern) — hidden until the row is
+ * hovered or keeps focus-within, so the idle tree matches D-06's static
+ * `menus` screenshot and the buttons only appear when they're reachable. */
+.view-acts .itemrow .movebtns {
+	display: flex;
+	align-items: center;
+	flex: none;
+	opacity: 0;
+}
+.view-acts .itemrow:hover .movebtns,
+.view-acts .itemrow:focus-within .movebtns {
+	opacity: 1;
+}
+@media (prefers-reduced-motion: no-preference) {
+	.view-acts .itemrow .movebtns {
+		transition: opacity 120ms ease;
+	}
+}
+/* Review round 1 minor ("controls meet the 44px target through the shared
+ * density tokens"): NOT applied to these two. `.itemrow`'s `min-height` is
+ * itself density-driven (`--row-h`, 36/28/44px) and D-06's idle screenshot
+ * shows the eye at this row height — sizing `.eye`/`.movebtn` off
+ * `--btn-h-lg` (40/34/44px) would overflow a comfortable/compact row and
+ * break the pixel match this tab's DoD requires. Left as a fixed 24px,
+ * matching the drawn row; revisit once `--row-h` and the button tokens are
+ * reconciled (tracked as drift in the report). */
+.view-acts .itemrow .movebtn,
+.view-acts .itemrow .eye {
+	width: 24px;
+	height: 24px;
+	display: grid;
+	place-items: center;
+	border-radius: var(--radius-xs);
+	color: var(--fg-muted);
+	flex: none;
+}
+.view-acts .itemrow .movebtn:hover:not(:disabled),
+.view-acts .itemrow .eye:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+.view-acts .itemrow .movebtn:disabled {
+	opacity: 0.35;
+	cursor: not-allowed;
+}
+.view-acts .itemrow .eye[aria-disabled='true'] {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+.view-acts .itemrow.off .lbl2 {
+	color: var(--fg-faint);
+	text-decoration: line-through;
+}
+.view-acts .itemrow .lock {
+	color: var(--fg-faint);
+	flex: none;
+	display: grid;
+	place-items: center;
+}
+.view-acts .itemrow .hiddenelsewhere {
+	flex: none;
+	font-size: var(--text-micro);
+	color: var(--fg-faint);
+	white-space: nowrap;
+}
+
+.reordering,
+.reordering * {
+	cursor: grabbing !important;
+	user-select: none;
+}
+
+/* ── the live "sitting in a menu" preview ─────────────────────────────── */
+
+.view-acts .menupreview {
+	display: flex;
+	justify-content: center;
+	align-items: flex-start;
+	padding: var(--space-3);
+	background: var(--bg-sunken);
+	flex: 1;
+	overflow-y: auto;
+}
+.view-acts .menu.inline {
+	position: static;
+	z-index: auto;
+	min-width: 210px;
+	max-width: 100%;
+	background: var(--bg-raised);
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-md);
+	box-shadow: var(--shadow-2);
+	padding: var(--space-1);
+	overflow: hidden;
+}
+.view-acts .menu.inline .msep {
+	height: 1px;
+	background: var(--border);
+	margin: var(--space-1) 0;
+}
+.view-acts .menu.inline .mitem {
+	width: 100%;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	height: 28px;
+	padding: 0 var(--space-2);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-caption);
+	color: var(--fg);
+	cursor: default;
+}
+.view-acts .menu.inline .mitem.danger {
+	color: var(--danger);
+}
+.view-acts .menu.inline .mitem.isnew {
+	background: color-mix(in srgb, var(--achievement) 13%, transparent);
+	box-shadow: inset 2px 0 0 var(--achievement);
+}
+.view-acts .menu.inline .mitem .k {
+	margin-left: auto;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
