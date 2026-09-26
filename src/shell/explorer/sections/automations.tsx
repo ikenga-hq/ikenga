@@ -9,17 +9,6 @@ import { cronToWords } from '@/shell/automations/cron-words';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('automations')`
-// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
-// `contextMenu` field (out of this WP's FILES list; see the PR report).
-export const automationsContextMenu = [
-	{ id: 'run-now', label: 'Run now', run: () => {} },
-	{ id: 'pause-resume', label: 'Pause / Resume', run: () => {} },
-	{ id: 'open-definition', label: 'Open definition file', run: () => {} },
-	{ id: 'open-last-log', label: 'Open last run log', run: () => {} },
-	{ id: 'open-in-ngwa', label: 'Open in Ngwa', run: () => {} },
-];
-
 export interface AutomationItem {
 	id: string;
 	name: string;

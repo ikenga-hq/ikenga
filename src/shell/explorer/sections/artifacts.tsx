@@ -12,20 +12,6 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { PinArtifactDialog } from '@/shell/panes/pin-artifact-dialog';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('artifacts')`
-// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
-// `contextMenu` field (out of this WP's FILES list; see the PR report).
-export const artifactsContextMenu = [
-	{ id: 'open-loupe', label: 'Open (loupe)', run: () => {} },
-	{ id: 'open-studio', label: 'Open in Studio (grid)', run: () => {} },
-	{ id: 'compare', label: 'Compare with…', run: () => {} },
-	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'pin-sidebar', label: 'Pin to Sidebar…', run: () => {} },
-	{ id: 'copy-uri', label: 'Copy ikenga:// URI', run: () => {} },
-	{ id: 'reveal-files', label: 'Reveal in Files', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
-];
-
 export function ArtifactsSection({ projectId }: ExplorerSectionContext) {
 	const query = useQuery<RecentArtifact[]>({
 		queryKey: ['explorer-artifacts', projectId],

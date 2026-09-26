@@ -10,17 +10,6 @@ import type { NgwaSnapshot } from '@ikenga/contract';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('ngwa-project')`
-// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
-// `contextMenu` field (out of this WP's FILES list; see the PR report).
-export const ngwaProjectContextMenu = [
-	{ id: 'open-detail', label: 'Open detail', run: () => {} },
-	{ id: 'open-definition', label: 'Open definition file', run: () => {} },
-	{ id: 'change-scope', label: 'Change scope…', run: () => {} },
-	{ id: 'disable', label: 'Disable', run: () => {} },
-	{ id: 'uninstall', label: 'Uninstall…', run: () => {} },
-];
-
 /** `ngwaSnapshotQueryKey` (`lib/ngwa/use-ngwa-snapshot.ts`), inlined so this
  *  section doesn't pull the snapshot hook's registry join into its graph. */
 const NGWA_SNAPSHOT_QUERY_KEY = ['ngwa', 'snapshot'] as const;

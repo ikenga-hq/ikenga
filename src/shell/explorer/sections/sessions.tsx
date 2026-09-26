@@ -11,18 +11,6 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { handToChi } from '@/shell/companion/companion-store';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('session')`
-// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
-// `contextMenu` field (out of this WP's FILES list; see the PR report).
-export const sessionsContextMenu = [
-	{ id: 'open-pane', label: 'Open in pane', run: () => {} },
-	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'make-dispatch', label: 'Make dispatch target', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
-	{ id: 'rename', label: 'Rename…', run: () => {} },
-	{ id: 'kill', label: 'Kill session', run: () => {} },
-];
-
 export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const tabs = useTerminalStore((s) => s.tabs);
 

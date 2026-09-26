@@ -8,16 +8,6 @@ import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('scratchpads')`
-// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
-// `contextMenu` field (out of this WP's FILES list; see the PR report).
-export const scratchpadsContextMenu = [
-	{ id: 'open', label: 'Open', run: () => {} },
-	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'rename', label: 'Rename…', run: () => {} },
-	{ id: 'delete', label: 'Delete', run: () => {} },
-];
-
 export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 	const scope = `project:${projectId}`;
 	const qc = useQueryClient();

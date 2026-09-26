@@ -245,6 +245,8 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		// their `ContextMenu` from `getEffectiveMenu(<id>)` (`resolveMenuItems`,
 		// `src/shell/menu/resolve.ts`) instead. `menus.ts`'s `DEFAULT_MENUS` is
 		// the frozen source of each menu's default order (§10.3's 76 rows).
+		// The stub arrays are deleted (WP-63); render-equals-data is asserted
+		// per menu in `src/shell/menu/effective-context-menu.test.tsx`.
 		const menuIds = [
 			'files',
 			'files-view',

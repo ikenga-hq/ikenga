@@ -672,36 +672,6 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 	);
 }
 
-export const filesFileContextMenu = [
-	{ id: 'open', label: 'Open', run: () => {} },
-	{ id: 'open-to-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'open-below', label: 'Open Below', run: () => {} },
-	{ id: 'pin-sidebar', label: 'Pin to Sidebar…', run: () => {} },
-	{ id: 'open-in-studio', label: 'Open in Studio', run: () => {} },
-	{ id: 'open-terminal-here', label: 'Open Terminal Here', run: () => {} },
-	{ id: 'open-terminal-side', label: 'Open Terminal to the Side', run: () => {} },
-	{ id: 'open-terminal-below', label: 'Open Terminal Below', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => handToChi('') },
-	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
-	{ id: 'copy-name', label: 'Copy Name', run: () => {} },
-	{ id: 'rename', label: 'Rename…', run: () => {} },
-	{ id: 'delete', label: 'Delete', run: () => {} },
-];
-
-export const filesDirectoryContextMenu = [
-	{ id: 'open-terminal-here', label: 'Open Terminal Here', run: () => {} },
-	{ id: 'reveal-file-manager', label: 'Reveal in file manager', run: () => {} },
-	{ id: 'new-file', label: 'New file…', run: () => {} },
-	{ id: 'new-folder', label: 'New folder…', run: () => {} },
-	{ id: 'copy-path', label: 'Copy Path', run: () => {} },
-	{ id: 'rename', label: 'Rename…', run: () => {} },
-	{ id: 'delete', label: 'Delete', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => handToChi('') },
-];
-
-
-export const filesContextMenu = filesFileContextMenu;
-
 /** The `files-view` menu (G-ACTIONS §1.3) — the Files "View options" `⋯`.
  *  Mounted only while that dropdown is open. Its two default items are
  *  checkboxes; a user / package item appended to the menu renders plain. */

@@ -8,15 +8,6 @@ import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { handToChi } from '@/shell/companion/companion-store';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('todos')` below
-// (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused `contextMenu`
-// field (out of this WP's FILES list; see the PR report).
-export const todosContextMenu = [
-	{ id: 'toggle-done', label: 'Toggle done', run: () => {} },
-	{ id: 'open-source', label: 'Open source file', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
-];
-
 export function TodosSection({ projectId }: ExplorerSectionContext) {
 	const qc = useQueryClient();
 	const queryKey = ['explorer-todos', projectId];

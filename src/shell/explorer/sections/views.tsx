@@ -8,16 +8,6 @@ import { PinIcon } from '@/shell/pin-icon';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
-// WP-04 stub array — real menu content is `getEffectiveMenu('views')` below
-// (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused `contextMenu`
-// field (out of this WP's FILES list; see the PR report).
-export const viewsContextMenu = [
-	{ id: 'open', label: 'Open', run: () => {} },
-	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'pin-rail', label: 'Pin to rail', run: () => {} },
-	{ id: 'open-ngwa', label: 'Open pkg in Ngwa', run: () => {} },
-];
-
 /** Explorer **Views** section — renders every `ui.views[]` contribution
  *  across installed pkgs (manifest v5, G-MANIFEST-V5 §2). The `views` list
  *  from `usePkgActivityBarEntries` is registry-canonical — the `ui.nav`
