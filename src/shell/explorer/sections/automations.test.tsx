@@ -2,7 +2,6 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import {
   AutomationsSection,
-  automationsContextMenu,
   listCronSchedules,
   listDeclaredWorkflows,
 } from './automations';
@@ -81,13 +80,6 @@ const STUDIO_MANIFEST = {
 } as never;
 
 describe('AutomationsSection (WP-04 contract / WP-31)', () => {
-  it('exports section context menu following WP-04 contract', () => {
-    expect(automationsContextMenu).toBeDefined();
-    expect(automationsContextMenu.length).toBeGreaterThanOrEqual(4);
-    expect(automationsContextMenu.map((m) => m.id)).toContain('run-now');
-    expect(automationsContextMenu.map((m) => m.id)).toContain('open-definition');
-  });
-
   it('renders empty state when no pkg declares workflows[]', async () => {
     vi.mocked(tauriCmd.pkgKernelStatus).mockResolvedValue(
       kernelStatus([{ id: 'com.ikenga.hello', install_path: '/pkgs/hello' }]),

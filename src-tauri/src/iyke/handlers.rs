@@ -159,7 +159,11 @@ pub struct ShellInfo {
 /// - `2`: `shell.active_project`, `shell.bridge_api`, `GET /iyke/keys`.
 /// - `3`: `GET /iyke/ngwa/snapshot`, `GET /iyke/explorer/sections` (WP-28
 ///   follow-up — the WP-21b client surface).
-pub const BRIDGE_API: u32 = 3;
+/// - `4`: `GET /iyke/keys` gains `?search=`; `GET /iyke/actions`,
+///   `GET /iyke/menus/:id`, `POST /iyke/actions/set`,
+///   `POST /iyke/actions/import`, `POST /iyke/keys/set`,
+///   `GET /iyke/keys/resolve` (WP-62 — `actions_routes.rs`).
+pub const BRIDGE_API: u32 = 4;
 
 /// WP-21: mirror of the FE `ActiveProject` (`src/lib/shell/shell-store.ts`).
 /// Field names are the FE's own snake_case, so the push needs no mapping.
@@ -188,6 +192,15 @@ pub struct KeymapEntryInfo {
     pub key_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_only: Option<String>,
+    /// WP-62 (DEC-65): `"held"` for a project rule an untrusted project's
+    /// `keybindings.json` asked for — it fires nothing until trusted. Absent
+    /// on working rows. Without these two fields serde would drop them and
+    /// `iyke keys list` would show a held rule as a working binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The trust state holding a `held` row (`untrusted`, `changed`, `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
 }
 
 /// WP-28: one `GET /iyke/explorer/sections` row — mirrors the FE store's
@@ -278,14 +291,44 @@ pub struct KeysResponse {
     pub entries: Vec<KeymapEntryInfo>,
 }
 
+/// `GET /iyke/keys?search=` query params. WP-62's `iyke keys list --search`.
+#[derive(Debug, Deserialize)]
+pub struct KeysQuery {
+    #[serde(default)]
+    pub search: Option<String>,
+}
+
 /// `GET /iyke/keys` body, split out so tests can drive a fresh mirror.
-async fn keys_response(mirror: &FrameMirror) -> Result<Json<KeysResponse>, (StatusCode, String)> {
+/// `search`, when present, is a case-insensitive substring filter across
+/// `command`, `key`, `when` and `label` — the same fields D-06's Keys tab
+/// search box matches (`actions.html`'s `renderKeys` row filter).
+async fn keys_response(
+    mirror: &FrameMirror,
+    search: Option<&str>,
+) -> Result<Json<KeysResponse>, (StatusCode, String)> {
     match mirror.keymap().await {
-        Some(entries) => Ok(Json(KeysResponse {
-            schema_version: 1,
-            count: entries.len(),
-            entries,
-        })),
+        Some(entries) => {
+            let filtered = match search {
+                Some(q) if !q.is_empty() => {
+                    let q = q.to_ascii_lowercase();
+                    entries
+                        .into_iter()
+                        .filter(|e| {
+                            e.command.to_ascii_lowercase().contains(&q)
+                                || e.key.to_ascii_lowercase().contains(&q)
+                                || e.when.to_ascii_lowercase().contains(&q)
+                                || e.label.to_ascii_lowercase().contains(&q)
+                        })
+                        .collect()
+                }
+                _ => entries,
+            };
+            Ok(Json(KeysResponse {
+                schema_version: 1,
+                count: filtered.len(),
+                entries: filtered,
+            }))
+        }
         None => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "keymap not pushed yet: the shell frontend publishes its keymap registry at boot \
@@ -295,10 +338,10 @@ async fn keys_response(mirror: &FrameMirror) -> Result<Json<KeysResponse>, (Stat
     }
 }
 
-/// `GET /iyke/keys` — the last keymap registry the FE pushed. 503 until the
-/// first push.
-pub async fn get_keys() -> Result<Json<KeysResponse>, (StatusCode, String)> {
-    keys_response(frame_mirror()).await
+/// `GET /iyke/keys` — the last keymap registry the FE pushed, optionally
+/// filtered by `?search=`. 503 until the first push.
+pub async fn get_keys(Query(q): Query<KeysQuery>) -> Result<Json<KeysResponse>, (StatusCode, String)> {
+    keys_response(frame_mirror(), q.search.as_deref()).await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2197,6 +2240,8 @@ mod tests {
                 label: "Command palette".into(),
                 key_label: "Ctrl+K".into(),
                 platform_only: None,
+                status: None,
+                trust: None,
             },
             super::KeymapEntryInfo {
                 command: "terminal.clear".into(),
@@ -2206,8 +2251,35 @@ mod tests {
                 label: "Clear terminal".into(),
                 key_label: "⌘K".into(),
                 platform_only: Some("mac".into()),
+                status: None,
+                trust: None,
             },
         ]
+    }
+
+    /// WP-62 review: a held project rule keeps `status` / `trust` through
+    /// the FE → Rust frame and back out of `GET /iyke/keys`.
+    #[test]
+    fn held_keymap_row_round_trips_status_and_trust() {
+        let raw = serde_json::json!({
+            "command": "pane.close",
+            "key": "mod+shift+g",
+            "when": "",
+            "source": "project",
+            "label": "pane.close",
+            "key_label": "Ctrl+Shift+G",
+            "status": "held",
+            "trust": "untrusted",
+        });
+        let row: super::KeymapEntryInfo = serde_json::from_value(raw).expect("held row parses");
+        assert_eq!(row.status.as_deref(), Some("held"));
+        assert_eq!(row.trust.as_deref(), Some("untrusted"));
+        let out = serde_json::to_value(&row).expect("serializes");
+        assert_eq!(out["status"], "held");
+        assert_eq!(out["trust"], "untrusted");
+        // A working row carries neither field on the wire.
+        let working = serde_json::to_value(&sample_keys()[0]).expect("serializes");
+        assert!(working.get("status").is_none() && working.get("trust").is_none());
     }
 
     #[test]
@@ -2222,7 +2294,7 @@ mod tests {
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["bridge_api"], serde_json::json!(super::BRIDGE_API));
-        assert_eq!(super::BRIDGE_API, 3, "bump the FE `BRIDGE_API` mirror when this changes");
+        assert_eq!(super::BRIDGE_API, 4, "bump the FE `BRIDGE_API` mirror when this changes");
         assert_eq!(
             v["active_project"],
             serde_json::json!({
@@ -2329,7 +2401,7 @@ mod tests {
     #[tokio::test]
     async fn keys_handler_is_503_before_push_and_serves_the_pushed_list_after() {
         let m = super::FrameMirror::default();
-        let err = super::keys_response(&m).await.unwrap_err();
+        let err = super::keys_response(&m, None).await.unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             err.1.contains("keymap not pushed yet"),
@@ -2338,7 +2410,7 @@ mod tests {
         );
 
         m.set(None, Some(sample_keys()), None).await;
-        let axum::Json(body) = super::keys_response(&m).await.unwrap();
+        let axum::Json(body) = super::keys_response(&m, None).await.unwrap();
         assert_eq!(body.schema_version, 1);
         assert_eq!(body.count, 2);
         assert_eq!(body.entries, sample_keys());
@@ -2347,6 +2419,23 @@ mod tests {
         assert_eq!(v["entries"][0]["key_label"], serde_json::json!("Ctrl+K"));
         assert!(v["entries"][0].get("platform_only").is_none());
         assert_eq!(v["entries"][1]["platform_only"], serde_json::json!("mac"));
+    }
+
+    /// WP-62: `iyke keys list --search` — case-insensitive substring match
+    /// across command/key/when/label.
+    #[tokio::test]
+    async fn keys_handler_search_filters_case_insensitively() {
+        let m = super::FrameMirror::default();
+        m.set(None, Some(sample_keys()), None).await;
+        let axum::Json(body) = super::keys_response(&m, Some("PALETTE")).await.unwrap();
+        assert_eq!(body.count, 1);
+        assert_eq!(body.entries[0].command, "palette.open");
+
+        let axum::Json(none) = super::keys_response(&m, Some("no-such-command")).await.unwrap();
+        assert_eq!(none.count, 0);
+
+        let axum::Json(all) = super::keys_response(&m, Some("")).await.unwrap();
+        assert_eq!(all.count, 2, "an empty search string is treated as no filter");
     }
 
     /// WP-28: `GET /iyke/explorer/sections` serves the FE store's

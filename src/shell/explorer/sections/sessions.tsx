@@ -3,19 +3,13 @@ import { TerminalSquare } from 'lucide-react';
 import { ListRow } from '@/components/ui/list-row';
 import { cn } from '@/components/ui/utils';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { useTerminalStore } from '@/terminal/session-store';
 import { createTerminalSession } from '@/terminal/single-terminal';
 import { EmptyState } from '@/components/states';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
+import { handToChi } from '@/shell/companion/companion-store';
 import type { ExplorerSectionContext } from '../section-registry';
-
-export const sessionsContextMenu = [
-	{ id: 'open-pane', label: 'Open in pane', run: () => {} },
-	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
-	{ id: 'make-dispatch', label: 'Make dispatch target', run: () => {} },
-	{ id: 'hand-to-chi', label: 'Hand to Chi', run: () => {} },
-	{ id: 'rename', label: 'Rename…', run: () => {} },
-	{ id: 'kill', label: 'Kill session', run: () => {} },
-];
 
 export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const tabs = useTerminalStore((s) => s.tabs);
@@ -23,6 +17,11 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const openSession = useCallback((sessionId: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
 		addTab(focusedId, { kind: 'terminal', sessionId });
+	}, []);
+
+	const openSessionSplit = useCallback((sessionId: string) => {
+		const { focusedId, placeView } = usePaneStore.getState();
+		placeView(focusedId, { kind: 'terminal', sessionId }, 'right');
 	}, []);
 
 	const handleStartSession = useCallback(() => {
@@ -55,19 +54,35 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 					: 'bg-muted-foreground/40';
 
 				return (
-					<ListRow
+					<EffectiveContextMenu
 						key={tab.id}
-						size="sm"
-						onActivate={() => openSession(tab.id)}
-						title={tab.title || tab.id}
-						className="w-full gap-1.5 px-2"
+						menuId="session"
+						// A-9: `rename` (it needed `window.prompt`; no dialog-shim
+						// prompt exists) and `kill-session` (removing the tab entry
+						// doesn't kill its PTY, and there is no tab→PTY kill API) are
+						// left out until they have real handlers.
+						builtinsNeedHandler
+						handlers={{
+							open: () => openSession(tab.id),
+							'open-to-side': () => openSessionSplit(tab.id),
+							'make-dispatch': () =>
+								useShellStore.getState().setCompanionTarget({ kind: 'session', session_id: tab.id }),
+							'hand-to-chi': () => handToChi(tab.title || tab.id),
+						}}
 					>
-						<span className={cn('size-1.5 shrink-0 rounded-full', pulseClass)} aria-hidden="true" />
-						<span className="flex-1 truncate text-xs">{tab.title || `Terminal (${tab.id.slice(0, 6)})`}</span>
-						<span className="text-[10px] text-muted-foreground font-mono">
-							{tab.spec.cmd?.[0] || 'sh'}
-						</span>
-					</ListRow>
+						<ListRow
+							size="sm"
+							onActivate={() => openSession(tab.id)}
+							title={tab.title || tab.id}
+							className="w-full gap-1.5 px-2"
+						>
+							<span className={cn('size-1.5 shrink-0 rounded-full', pulseClass)} aria-hidden="true" />
+							<span className="flex-1 truncate text-xs">{tab.title || `Terminal (${tab.id.slice(0, 6)})`}</span>
+							<span className="text-[10px] text-muted-foreground font-mono">
+								{tab.spec.cmd?.[0] || 'sh'}
+							</span>
+						</ListRow>
+					</EffectiveContextMenu>
 				);
 			})}
 		</div>

@@ -39,13 +39,41 @@ pub struct SettingsPaths {
     pub project_root: Option<PathBuf>,
 }
 
+/// `<root>/.ikenga/<name>` — the one directory every Ikenga user file lives
+/// in: `~/.ikenga/` for the personal scope, `<project-root>/.ikenga/` for a
+/// project. G-SETTINGS (`settings.json`) and G-ACTIONS (`actions.json`,
+/// `keybindings.json`) share it.
+pub fn ikenga_file(root: &Path, name: &str) -> PathBuf {
+    root.join(".ikenga").join(name)
+}
+
 pub fn personal_path(home: &Path) -> PathBuf {
-    home.join(".ikenga").join("settings.json")
+    ikenga_file(home, "settings.json")
 }
 
 pub fn project_path(root: &Path) -> PathBuf {
-    root.join(".ikenga").join("settings.json")
+    ikenga_file(root, "settings.json")
 }
+
+/// Which strict-JSON document a generic read or atomic write handles. The
+/// `validate` hook decides whether an orphaned `.recovery` file (or the live
+/// file next to it) is sound, so another document family can reuse the
+/// atomic-write / recovery / link-rejection substrate without its files being
+/// judged as `settings.json`.
+#[derive(Clone, Copy)]
+pub struct IkengaDocument {
+    pub label: &'static str,
+    pub validate: fn(&[u8]) -> Result<(), String>,
+}
+
+fn validate_settings_bytes(bytes: &[u8]) -> Result<(), String> {
+    SettingsDocument::parse(bytes).map(|_| ())
+}
+
+const SETTINGS_DOCUMENT: IkengaDocument = IkengaDocument {
+    label: "settings",
+    validate: validate_settings_bytes,
+};
 
 pub fn normalize_project_root(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
@@ -230,10 +258,21 @@ pub async fn resolve_paths(
 }
 
 pub fn read_document(path: &Path) -> Result<Option<SettingsDocument>, String> {
-    recover_orphan_backup(path)?;
-    reject_link_path(path, "settings document")?;
+    match read_document_bytes(path, SETTINGS_DOCUMENT)? {
+        Some(bytes) => SettingsDocument::parse(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The read half of `read_document` for any document family: restores an
+/// orphaned `.recovery` file, refuses a symlinked / reparse-point file or
+/// parent, and returns the raw bytes (`None` when the file is absent). The
+/// caller parses and validates.
+pub fn read_document_bytes(path: &Path, kind: IkengaDocument) -> Result<Option<Vec<u8>>, String> {
+    recover_orphan_backup(path, kind)?;
+    reject_link_path(path, &format!("{} document", kind.label))?;
     match std::fs::read(path) {
-        Ok(bytes) => SettingsDocument::parse(&bytes).map(Some),
+        Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("read {}: {error}", path.display())),
     }
@@ -288,16 +327,28 @@ pub fn write_document(path: &Path, document: &SettingsDocument) -> Result<(), St
 }
 
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    reject_link_path(path, "settings document")?;
-    recover_orphan_backup(path)?;
+    write_document_bytes_atomic(path, bytes, SETTINGS_DOCUMENT)
+}
+
+/// `write_bytes_atomic` for any document family: same-directory temp file,
+/// `sync_all`, rename (with the `.recovery` fallback), and link rejection.
+/// The caller validates `bytes` before calling.
+pub fn write_document_bytes_atomic(
+    path: &Path,
+    bytes: &[u8],
+    kind: IkengaDocument,
+) -> Result<(), String> {
+    let label = kind.label;
+    reject_link_path(path, &format!("{label} document"))?;
+    recover_orphan_backup(path, kind)?;
     let parent = path
         .parent()
-        .ok_or_else(|| format!("settings path has no parent: {}", path.display()))?;
+        .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| format!("settings path has no file name: {}", path.display()))?;
+        .ok_or_else(|| format!("{label} path has no file name: {}", path.display()))?;
     let temp = parent.join(format!(
         ".{name}.{}.tmp",
         std::time::SystemTime::now()
@@ -324,7 +375,7 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         }
         file.sync_all()
             .map_err(|e| format!("sync {}: {e}", temp.display()))?;
-        replace_path(&temp, path)?;
+        replace_path(&temp, path, kind)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -339,7 +390,7 @@ fn recovery_path(path: &Path) -> Option<PathBuf> {
     Some(parent.join(format!(".{name}.recovery")))
 }
 
-fn recover_orphan_backup(path: &Path) -> Result<(), String> {
+fn recover_orphan_backup(path: &Path, kind: IkengaDocument) -> Result<(), String> {
     let Some(backup) = recovery_path(path) else {
         return Ok(());
     };
@@ -348,27 +399,28 @@ fn recover_orphan_backup(path: &Path) -> Result<(), String> {
     }
     if path.exists() {
         let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        SettingsDocument::parse(&bytes)
-            .map_err(|e| format!("settings {} is invalid: {e}", path.display()))?;
+        (kind.validate)(&bytes)
+            .map_err(|e| format!("{} {} is invalid: {e}", kind.label, path.display()))?;
         std::fs::remove_file(&backup)
             .map_err(|e| format!("remove recovery {}: {e}", backup.display()))?;
         return Ok(());
     }
     let bytes =
         std::fs::read(&backup).map_err(|e| format!("read recovery {}: {e}", backup.display()))?;
-    SettingsDocument::parse(&bytes)
+    (kind.validate)(&bytes)
         .map_err(|e| format!("recovery {} is invalid: {e}", backup.display()))?;
     std::fs::rename(&backup, path)
         .map_err(|e| format!("recover {} to {}: {e}", backup.display(), path.display()))
 }
 
-fn replace_path(temp: &Path, path: &Path) -> Result<(), String> {
-    recover_orphan_backup(path)?;
+fn replace_path(temp: &Path, path: &Path, kind: IkengaDocument) -> Result<(), String> {
+    recover_orphan_backup(path, kind)?;
     match std::fs::rename(temp, path) {
         Ok(()) => Ok(()),
         Err(first_error) if path.exists() => {
-            let backup = recovery_path(path)
-                .ok_or_else(|| format!("settings path has no recovery name: {}", path.display()))?;
+            let backup = recovery_path(path).ok_or_else(|| {
+                format!("{} path has no recovery name: {}", kind.label, path.display())
+            })?;
             std::fs::rename(path, &backup).map_err(|backup_error| {
                 format!(
                     "replace {}: {first_error}; backup: {backup_error}",
@@ -419,6 +471,40 @@ mod tests {
         write_document(&path, &document).unwrap();
         let read = read_document(&path).unwrap().unwrap();
         assert_eq!(read.appearance.get("theme").unwrap().as_str(), Some("C"));
+    }
+
+    #[test]
+    fn ikenga_file_is_the_shared_dot_directory() {
+        assert_eq!(
+            ikenga_file(Path::new("home"), "actions.json"),
+            Path::new("home/.ikenga/actions.json")
+        );
+        assert_eq!(
+            ikenga_file(Path::new("project"), "keybindings.json"),
+            Path::new("project/.ikenga/keybindings.json")
+        );
+    }
+
+    #[test]
+    fn generic_document_recovery_uses_its_own_validator() {
+        fn any_json(bytes: &[u8]) -> Result<(), String> {
+            serde_json::from_slice::<serde_json::Value>(bytes)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        let kind = IkengaDocument {
+            label: "test",
+            validate: any_json,
+        };
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(".ikenga").join("actions.json");
+        let body = br#"{"$schema":"urn:ikenga:actions:v1","version":1}"#;
+        write_document_bytes_atomic(&path, body, kind).unwrap();
+        // A non-settings document with an orphaned recovery file next to it
+        // is judged by its own validator, not SettingsDocument::parse.
+        std::fs::write(recovery_path(&path).unwrap(), body).unwrap();
+        assert_eq!(read_document_bytes(&path, kind).unwrap().unwrap(), body);
+        assert!(!recovery_path(&path).unwrap().exists());
     }
 
     #[test]

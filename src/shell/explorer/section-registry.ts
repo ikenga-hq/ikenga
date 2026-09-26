@@ -11,14 +11,14 @@ import {
 	LayoutGrid,
 } from 'lucide-react';
 
-import { FilesSection, filesContextMenu } from './sections/files';
-import { ArtifactsSection, artifactsContextMenu } from './sections/artifacts';
-import { SessionsSection, sessionsContextMenu } from './sections/sessions';
-import { NgwaProjectSection, ngwaProjectContextMenu } from './sections/ngwa-project';
-import { AutomationsSection, automationsContextMenu } from './sections/automations';
-import { TodosSection, todosContextMenu } from './sections/todos';
-import { ScratchpadsSection, scratchpadsContextMenu } from './sections/scratchpads';
-import { ViewsSection, viewsContextMenu } from './sections/views';
+import { FilesSection } from './sections/files';
+import { ArtifactsSection } from './sections/artifacts';
+import { SessionsSection } from './sections/sessions';
+import { NgwaProjectSection } from './sections/ngwa-project';
+import { AutomationsSection } from './sections/automations';
+import { TodosSection } from './sections/todos';
+import { ScratchpadsSection } from './sections/scratchpads';
+import { ViewsSection } from './sections/views';
 
 import { useTerminalStore } from '@/terminal/session-store';
 import { useGitStatus } from '@/lib/shell/use-git-status';
@@ -26,12 +26,6 @@ import { usePkgActivityBarEntries } from '@/lib/pkg/use-activity-bar-entries';
 
 export interface ExplorerSectionContext {
 	projectId: string;
-}
-
-export interface ContextMenuItemDef {
-	id: string;
-	label: string;
-	run: () => void;
 }
 
 export interface ExplorerSectionDefinition {
@@ -43,7 +37,6 @@ export interface ExplorerSectionDefinition {
 	badge?: (ctx: ExplorerSectionContext) => string | undefined;
 	count?: (ctx: ExplorerSectionContext) => number | undefined;
 	useCount?: (ctx: ExplorerSectionContext) => number | undefined;
-	contextMenu?: (ctx: ExplorerSectionContext) => ContextMenuItemDef[];
 }
 
 export const builtInSections: ExplorerSectionDefinition[] = [
@@ -57,7 +50,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 			const git = useGitStatus();
 			return git.data?.files.size ?? 0;
 		},
-		contextMenu: () => filesContextMenu,
 	},
 	{
 		id: 'artifacts',
@@ -65,7 +57,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: Shapes,
 		defaultOrder: 1,
 		render: (ctx) => React.createElement(ArtifactsSection, ctx),
-		contextMenu: () => artifactsContextMenu,
 	},
 	{
 		id: 'sessions',
@@ -74,7 +65,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		defaultOrder: 2,
 		render: (ctx) => React.createElement(SessionsSection, ctx),
 		useCount: () => useTerminalStore((s) => s.tabs.length),
-		contextMenu: () => sessionsContextMenu,
 	},
 	{
 		id: 'ngwa-project',
@@ -82,7 +72,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: Package,
 		defaultOrder: 3,
 		render: (ctx) => React.createElement(NgwaProjectSection, ctx),
-		contextMenu: () => ngwaProjectContextMenu,
 	},
 	{
 		id: 'automations',
@@ -90,7 +79,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: Clock,
 		defaultOrder: 4,
 		render: (ctx) => React.createElement(AutomationsSection, ctx),
-		contextMenu: () => automationsContextMenu,
 	},
 	{
 		id: 'todos',
@@ -98,7 +86,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: CheckSquare,
 		defaultOrder: 5,
 		render: (ctx) => React.createElement(TodosSection, ctx),
-		contextMenu: () => todosContextMenu,
 	},
 	{
 		id: 'scratchpads',
@@ -106,7 +93,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: FileEdit,
 		defaultOrder: 6,
 		render: (ctx) => React.createElement(ScratchpadsSection, ctx),
-		contextMenu: () => scratchpadsContextMenu,
 	},
 	{
 		id: 'views',
@@ -118,7 +104,6 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 			const { views } = usePkgActivityBarEntries();
 			return views.length;
 		},
-		contextMenu: () => viewsContextMenu,
 	},
 ];
 

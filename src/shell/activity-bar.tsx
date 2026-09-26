@@ -34,7 +34,7 @@ import {
 	Store,
 	Trash2,
 } from 'lucide-react';
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	ContextMenu,
@@ -43,6 +43,9 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import {
 	Dialog,
 	DialogContent,
@@ -53,7 +56,8 @@ import {
 } from '@/components/ui/dialog';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useIkengaStore } from '@/lib/ikenga/theme-store';
-import { labelFor, useKey } from '@/lib/keymap/registry';
+import { useCommands } from '@/lib/keymap/dispatcher';
+import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	type PkgActivityBarEntry,
@@ -273,14 +277,17 @@ export function ActivityBar() {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
 
-	// Each binding is a registry entry with `when: 'not-input'` (defaults.ts);
-	// `useKey()` owns the typing-target guard. A key always enters its mode —
-	// the collapse toggle is a pointer affordance only.
-	useKey('rail.project', () => enterMode('project'));
-	useKey('rail.chi', () => enterMode('chi'));
-	useKey('rail.ngwa', () => enterMode('ngwa'));
-	useKey('rail.settings', () => enterMode('settings'));
-	useKey('ngwa.create', () => navigateInNgwa('/ngwa/create'));
+	// Each key is a registry command (`defaults.ts`, `!inputFocus`) fired by
+	// the one key dispatcher (WP-54), which owns the typing guard and every
+	// rebind; the rail only says what each does. A key always enters its
+	// mode — the collapse toggle is a pointer affordance only.
+	useCommands({
+		'rail.project': () => enterMode('project'),
+		'rail.chi': () => enterMode('chi'),
+		'rail.ngwa': () => enterMode('ngwa'),
+		'rail.settings': () => enterMode('settings'),
+		'ngwa.create': () => navigateInNgwa('/ngwa/create'),
+	});
 
 	const hasAnyPins =
 		hydrated &&
@@ -482,6 +489,18 @@ function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps)
 	);
 }
 
+const NGWA_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'ngwa.installed': <Package className="h-3.5 w-3.5" />,
+	'ngwa.store': <Store className="h-3.5 w-3.5" />,
+	'ngwa.health': <HeartPulse className="h-3.5 w-3.5" />,
+};
+const NGWA_MENU_ROUTE: Readonly<Record<string, string>> = {
+	'ngwa.installed': NGWA_MENU[0].to,
+	'ngwa.store': NGWA_MENU[1].to,
+	'ngwa.health': NGWA_MENU[2].to,
+};
+
+/** `rail-ngwa` (G-ACTIONS §1.3), resolved only while the menu is open. */
 function NgwaMenuWrap({
 	onPick,
 	children,
@@ -490,17 +509,17 @@ function NgwaMenuWrap({
 	children: React.ReactNode;
 }) {
 	return (
-		<ContextMenu>
-			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				{NGWA_MENU.map(({ label, to, Icon }) => (
-					<ContextMenuItem key={to} onSelect={() => onPick(to)}>
-						<Icon className="h-3.5 w-3.5" />
-						{label}
-					</ContextMenuItem>
-				))}
-			</ContextMenuContent>
-		</ContextMenu>
+		<EffectiveContextMenu
+			menuId="rail-ngwa"
+			icons={NGWA_MENU_ICONS}
+			handlers={{
+				'ngwa.installed': () => onPick(NGWA_MENU_ROUTE['ngwa.installed']),
+				'ngwa.store': () => onPick(NGWA_MENU_ROUTE['ngwa.store']),
+				'ngwa.health': () => onPick(NGWA_MENU_ROUTE['ngwa.health']),
+			}}
+		>
+			{children}
+		</EffectiveContextMenu>
 	);
 }
 
@@ -619,53 +638,112 @@ function PinContextWrap({
 	}
 
 	const otherSections = allSections.filter((s) => s.id !== pin.sectionId);
+	// `rail` (G-ACTIONS §1.3): resolved by `PinMenuBody`, mounted only while
+	// this pin's menu is open.
+	const [open, setOpen] = useState(false);
 
 	return (
-		<ContextMenu>
+		<ContextMenu onOpenChange={setOpen}>
 			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				<ContextMenuItem onSelect={() => onOpen(pin)}>
-					<PinGlyph className="h-3.5 w-3.5" />
-					Open {pin.label}
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				<ContextMenuItem disabled={index === 0} onSelect={() => void moveBy(-1)}>
-					<ArrowUp className="h-3.5 w-3.5" />
-					Move up
-				</ContextMenuItem>
-				<ContextMenuItem disabled={index >= siblings.length - 1} onSelect={() => void moveBy(1)}>
-					<ArrowDown className="h-3.5 w-3.5" />
-					Move down
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				{otherSections.length > 0 && (
-					<>
-						<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-							Move to
-						</div>
-						{otherSections.map((s) => (
-							<ContextMenuItem key={s.id} onSelect={() => moveTo(s.id)}>
-								<SquareDashed className="h-3.5 w-3.5" />
-								{s.label}
-							</ContextMenuItem>
-						))}
-					</>
-				)}
-				{pin.sectionId !== null && (
-					<ContextMenuItem onSelect={() => moveTo(null)}>
-						<SquareDashed className="h-3.5 w-3.5" />
-						No section
-					</ContextMenuItem>
-				)}
-				{(otherSections.length > 0 || pin.sectionId !== null) && <ContextMenuSeparator />}
-				<ContextMenuItem variant="destructive" onSelect={() => removePin(pin.id)}>
-					<PinOff className="h-3.5 w-3.5" />
-					Unpin
-				</ContextMenuItem>
-			</ContextMenuContent>
+			{open && (
+				<PinMenuBody
+					pin={pin}
+					isFirst={index === 0}
+					isLast={index >= siblings.length - 1}
+					otherSections={otherSections}
+					handlers={{
+						'rail.pin-open': () => onOpen(pin),
+						'rail.pin-move-up': () => void moveBy(-1),
+						'rail.pin-move-down': () => void moveBy(1),
+						'rail.pin-no-section': () => void moveTo(null),
+						'rail.unpin': () => void removePin(pin.id),
+					}}
+					onMoveTo={(sectionId) => void moveTo(sectionId)}
+				/>
+			)}
 		</ContextMenu>
 	);
 }
+
+const PIN_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'rail.pin-open': <PinGlyph className="h-3.5 w-3.5" />,
+	'rail.pin-move-up': <ArrowUp className="h-3.5 w-3.5" />,
+	'rail.pin-move-down': <ArrowDown className="h-3.5 w-3.5" />,
+	'rail.pin-no-section': <SquareDashed className="h-3.5 w-3.5" />,
+	'rail.unpin': <PinOff className="h-3.5 w-3.5" />,
+};
+
+function PinMenuBody({
+	pin,
+	isFirst,
+	isLast,
+	otherSections,
+	handlers,
+	onMoveTo,
+}: {
+	pin: Pin;
+	isFirst: boolean;
+	isLast: boolean;
+	otherSections: readonly Section[];
+	handlers: Record<string, () => void>;
+	onMoveTo: (sectionId: string) => void;
+}) {
+	const railMenu = useEffectiveMenu('rail');
+	const rows = resolveMenuItems(railMenu, {
+		conditions: { 'sectioned-pin': pin.sectionId !== null },
+		disabled: (id) => (id === 'rail.pin-move-up' ? isFirst : id === 'rail.pin-move-down' ? isLast : false),
+		labels: { 'rail.pin-open': `Open ${pin.label}` },
+		icons: PIN_MENU_ICONS,
+		handlers,
+	});
+	if (rows.length === 0) return null;
+	return (
+		<ContextMenuContent>
+			{rows.map((row, i) => {
+				if (row.kind === 'separator') {
+					// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+					return <ContextMenuSeparator key={`sep-${i}`} />;
+				}
+				if (row.display === 'submenu' && row.id === 'rail.pin-move-to-section') {
+					// `rail.pin-move-to-section` (§1.3): a flat, header-divided
+					// list of the other sections — not a nested flyout.
+					return otherSections.length > 0 ? (
+						<Fragment key={row.id}>
+							<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+								Move to
+							</div>
+							{otherSections.map((s) => (
+								<ContextMenuItem key={s.id} data-action={row.dataAction} onSelect={() => onMoveTo(s.id)}>
+									<SquareDashed className="h-3.5 w-3.5" />
+									{s.label}
+								</ContextMenuItem>
+							))}
+						</Fragment>
+					) : null;
+				}
+				return (
+					<ContextMenuItem
+						key={row.id}
+						data-action={row.dataAction}
+						disabled={row.disabled}
+						title={row.disabledReason}
+						variant={row.danger ? 'destructive' : undefined}
+						onSelect={row.run}
+					>
+						{row.icon}
+						{row.label}
+					</ContextMenuItem>
+				);
+			})}
+		</ContextMenuContent>
+	);
+}
+
+const RAIL_SECTION_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'rail.section-rename': <Pencil className="h-3.5 w-3.5" />,
+	'rail.section-manage': <Settings2 className="h-3.5 w-3.5" />,
+	'rail.section-delete': <Trash2 className="h-3.5 w-3.5" />,
+};
 
 interface SectionContextWrapProps {
 	section: Section;
@@ -715,37 +793,26 @@ function SectionContextWrap({ section, pinCount, children }: SectionContextWrapP
 
 	return (
 		<>
-			<ContextMenu>
-				<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-				<ContextMenuContent>
+			<EffectiveContextMenu
+				menuId="rail-section"
+				header={
 					<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
 						Section · {section.label}
 					</div>
-					<ContextMenuItem
-						onSelect={() => {
-							setDraftLabel(section.label);
-							setRenameError(null);
-							setRenameOpen(true);
-						}}
-					>
-						<Pencil className="h-3.5 w-3.5" />
-						Rename…
-					</ContextMenuItem>
-					<ContextMenuItem
-						onSelect={() => {
-							usePaneStore.getState().navigateFocused('/settings/activity-bar');
-						}}
-					>
-						<Settings2 className="h-3.5 w-3.5" />
-						Manage in Settings
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
-						<Trash2 className="h-3.5 w-3.5" />
-						Delete section…
-					</ContextMenuItem>
-				</ContextMenuContent>
-			</ContextMenu>
+				}
+				icons={RAIL_SECTION_MENU_ICONS}
+				handlers={{
+					'rail.section-rename': () => {
+						setDraftLabel(section.label);
+						setRenameError(null);
+						setRenameOpen(true);
+					},
+					'rail.section-manage': () => usePaneStore.getState().navigateFocused('/settings/activity-bar'),
+					'rail.section-delete': () => setConfirmDelete(true),
+				}}
+			>
+				{children}
+			</EffectiveContextMenu>
 
 			<Dialog open={renameOpen} onOpenChange={setRenameOpen}>
 				<DialogContent className="sm:max-w-sm">

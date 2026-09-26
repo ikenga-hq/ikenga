@@ -143,11 +143,17 @@ http://127.0.0.1:{port}{path}{suffix}"
     for event in HOOK_EVENTS {
         // Claude Code's hook schema takes a matcher list for tool-scoped
         // events and a bare hook list for the rest. `PreToolUse` /
-        // `PostToolUse` / `PostToolUseFailure` / `PreCompact` are the
-        // matcher-shaped ones.
+        // `PostToolUse` / `PostToolUseFailure` / `PermissionRequest` /
+        // `PreCompact` are the matcher-shaped ones. `PermissionRequest` needs
+        // its matcher or the action runner never sees a native prompt open
+        // (WP-53 N3: a PTY inject's trailing CR would answer it).
         let value = if matches!(
             *event,
-            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PreCompact"
+            "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PermissionRequest"
+                | "PreCompact"
         ) {
             let hooks = if *event == "PreToolUse" {
                 &gate_block
@@ -308,7 +314,13 @@ mod tests {
             assert!(hooks.contains_key(*event), "missing hook event {event}");
         }
         // Tool-scoped events must carry a matcher, or Claude Code ignores them.
-        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact"] {
+        for event in [
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PermissionRequest",
+            "PreCompact",
+        ] {
             assert!(
                 hooks[event][0].get("matcher").is_some(),
                 "{event} needs a matcher"

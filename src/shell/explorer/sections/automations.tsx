@@ -6,15 +6,8 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { pkgKernelStatus, pkgPreviewManifest } from '@/lib/tauri-cmd';
 import { workflowGraphsFromManifest } from '@/shell/ngwa/use-pkg-workflow-graphs';
 import { cronToWords } from '@/shell/automations/cron-words';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
-
-export const automationsContextMenu = [
-	{ id: 'run-now', label: 'Run now', run: () => {} },
-	{ id: 'pause-resume', label: 'Pause / Resume', run: () => {} },
-	{ id: 'open-definition', label: 'Open definition file', run: () => {} },
-	{ id: 'open-last-log', label: 'Open last run log', run: () => {} },
-	{ id: 'open-in-ngwa', label: 'Open in Ngwa', run: () => {} },
-];
 
 export interface AutomationItem {
 	id: string;
@@ -111,6 +104,16 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'route', path: '/automations' });
 	}, []);
 
+	const openNgwa = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
+	}, []);
+
+	const openRuns = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/automations?view=runs' });
+	}, []);
+
 	if (items.length === 0) {
 		return (
 			<div className="p-4 text-center">
@@ -132,21 +135,34 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 	return (
 		<div className="py-1">
 			{items.map((item) => (
-				<ListRow
+				<EffectiveContextMenu
 					key={item.id}
-					size="sm"
-					onActivate={openAutomations}
-					title={item.name}
-					className="w-full gap-1.5 px-2"
+					menuId="automations"
+					// A-9: `run-now`, `pause-resume` and `open-definition` are left
+					// out — Ngwa's `workflows[]` / `cron[]` registries are read-only
+					// lists with no per-item trigger, pause or definition-file
+					// endpoint, and a row that only navigates is not that behaviour.
+					builtinsNeedHandler
+					handlers={{
+						'open-last-log': openRuns,
+						'open-in-ngwa': openNgwa,
+					}}
 				>
-					{item.kind === 'workflow' ? (
-						<GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					) : (
-						<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					)}
-					<span className="flex-1 truncate text-xs">{item.name}</span>
-					<span className="text-[10px] text-muted-foreground font-mono">{item.schedule}</span>
-				</ListRow>
+					<ListRow
+						size="sm"
+						onActivate={openAutomations}
+						title={item.name}
+						className="w-full gap-1.5 px-2"
+					>
+						{item.kind === 'workflow' ? (
+							<GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						) : (
+							<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						)}
+						<span className="flex-1 truncate text-xs">{item.name}</span>
+						<span className="text-[10px] text-muted-foreground font-mono">{item.schedule}</span>
+					</ListRow>
+				</EffectiveContextMenu>
 			))}
 		</div>
 	);

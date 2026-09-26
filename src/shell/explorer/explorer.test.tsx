@@ -7,18 +7,7 @@ import { ExplorerHeader } from './explorer-header';
 import { SectionFrame } from './section-frame';
 import { builtInSections } from './section-registry';
 import { listExplorerSections as bridgeListSections } from '@/lib/iyke/explorer-bridge';
-import {
-	filesContextMenu,
-	filesFileContextMenu,
-	filesDirectoryContextMenu,
-} from './sections/files';
-import { artifactsContextMenu } from './sections/artifacts';
-import { sessionsContextMenu } from './sections/sessions';
-import { ngwaProjectContextMenu } from './sections/ngwa-project';
-import { automationsContextMenu } from './sections/automations';
-import { todosContextMenu } from './sections/todos';
-import { scratchpadsContextMenu } from './sections/scratchpads';
-import { viewsContextMenu } from './sections/views';
+import { DEFAULT_MENUS } from '@/lib/actions/menus';
 
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useTerminalStore } from '@/terminal/session-store';
@@ -38,28 +27,33 @@ vi.mock('@/lib/shell/shell-store');
 vi.mock('@/terminal/session-store');
 vi.mock('@/lib/shell/use-git-status');
 vi.mock('@/lib/pkg/use-activity-bar-entries');
-vi.mock('@/lib/shell/files-store', () => ({
-	useFilesStore: vi.fn((sel) =>
-		sel({
-			hydrated: true,
-			hydrate: vi.fn(),
-			expandedRoot: null,
-			setExpandedRoot: vi.fn(),
-			expanded: new Set(),
-			queries: {},
-			setQuery: vi.fn(),
-			toggleRoot: vi.fn(),
-			showHidden: false,
-			showIgnored: false,
-			setShowHidden: vi.fn(),
-			setShowIgnored: vi.fn(),
-			scrollTop: 0,
-			setScrollTop: vi.fn(),
-			reveal: vi.fn(),
-			toggleShowHidden: vi.fn(),
-		})
-	),
-}));
+vi.mock('@/lib/shell/files-store', () => {
+	const filesState = {
+		hydrated: true,
+		hydrate: vi.fn(),
+		expandedRoot: null,
+		setExpandedRoot: vi.fn(),
+		expanded: new Set(),
+		queries: {},
+		setQuery: vi.fn(),
+		toggleRoot: vi.fn(),
+		showHidden: false,
+		showIgnored: false,
+		setShowHidden: vi.fn(),
+		setShowIgnored: vi.fn(),
+		scrollTop: 0,
+		setScrollTop: vi.fn(),
+		reveal: vi.fn(),
+		toggleShowHidden: vi.fn(),
+		selectedPath: null,
+	};
+	const useFilesStore = vi.fn((sel) => sel(filesState));
+	// The keymap dispatcher's context-key service reads `useFilesStore.getState()`
+	// directly (WP-56 registers commands here, which installs the real
+	// dispatcher on window `keydown`) — a plain `vi.fn()` has no `.getState`.
+	(useFilesStore as unknown as { getState: () => typeof filesState }).getState = () => filesState;
+	return { useFilesStore };
+});
 
 const queryClient = new QueryClient({
 	defaultOptions: { queries: { retry: false } },
@@ -111,6 +105,11 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		};
 
 		(useShellStore as any).mockImplementation((selector: any) => selector(mockShellStoreState));
+		// WP-56: Explorer now registers commands via `useCommands()`, which
+		// installs the real key dispatcher on window `keydown`. Its context-key
+		// service reads `useShellStore.getState()` directly (not the selector
+		// hook), which the automock leaves returning `undefined`.
+		(useShellStore as any).getState = () => mockShellStoreState;
 		(useTerminalStore as any).mockImplementation((selector: any) => selector({ tabs: [] }));
 		(useGitStatus as any).mockReturnValue({ data: { files: new Map(), dirtyFolders: new Set() } });
 		(usePkgActivityBarEntries as any).mockReturnValue({ entries: [], views: [], loaded: true });
@@ -238,37 +237,45 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		fireEvent.keyDown(region, { key: '[', metaKey: true, shiftKey: true });
 	});
 
-	it('DoD 4: each Explorer context menu is authored as an exported ordered array of { id, label, run }', () => {
-		const menus = [
-			filesContextMenu,
-			filesFileContextMenu,
-			filesDirectoryContextMenu,
-			artifactsContextMenu,
-			sessionsContextMenu,
-			ngwaProjectContextMenu,
-			automationsContextMenu,
-			todosContextMenu,
-			scratchpadsContextMenu,
-			viewsContextMenu,
+	it('DoD 4 (superseded by WP-55): every Explorer context menu renders from the effective model (G-ACTIONS §1.3), not the WP-04 stub arrays', () => {
+		// The WP-04 `{ id, label, run: () => {} }` stub arrays this test used to
+		// assert against are dead code now — `TreeNode`, `ArtifactsSection`,
+		// `SessionsSection`, `NgwaProjectSection`, `AutomationsSection`,
+		// `TodosSection`, `ScratchpadsSection` and `ViewsSection` all render
+		// their `ContextMenu` from `getEffectiveMenu(<id>)` (`resolveMenuItems`,
+		// `src/shell/menu/resolve.ts`) instead. `menus.ts`'s `DEFAULT_MENUS` is
+		// the frozen source of each menu's default order (§10.3's 76 rows).
+		// The stub arrays are deleted (WP-63); render-equals-data is asserted
+		// per menu in `src/shell/menu/effective-context-menu.test.tsx`.
+		const menuIds = [
+			'files',
+			'files-view',
+			'artifacts',
+			'session',
+			'automations',
+			'ngwa-project',
+			'scratchpads',
+			'todos',
+			'views',
 		];
-
-		for (const menu of menus) {
-			expect(Array.isArray(menu)).toBe(true);
-			expect(menu.length).toBeGreaterThan(0);
-			for (const item of menu) {
-				expect(typeof item.id).toBe('string');
-				expect(typeof item.label).toBe('string');
-				expect(typeof item.run).toBe('function');
+		for (const id of menuIds) {
+			const defaults = DEFAULT_MENUS[id];
+			expect(Array.isArray(defaults), `no default contents for menu "${id}"`).toBe(true);
+			expect(defaults.length, `menu "${id}" has no default items`).toBeGreaterThan(0);
+			for (const entry of defaults) {
+				if (entry === '---') continue;
+				expect(typeof entry.id).toBe('string');
 			}
 		}
 	});
 
-	it('DoD 5: Hand to Chi is exported/present in relevant context menus', () => {
-		expect(filesContextMenu.some((i) => i.label === 'Hand to Chi')).toBe(true);
-		expect(filesDirectoryContextMenu.some((i) => i.label === 'Hand to Chi')).toBe(true);
-		expect(artifactsContextMenu.some((i) => i.label === 'Hand to Chi')).toBe(true);
-		expect(sessionsContextMenu.some((i) => i.label === 'Hand to Chi')).toBe(true);
-		expect(todosContextMenu.some((i) => i.label === 'Hand to Chi')).toBe(true);
+	it('DoD 5: Hand to Chi is a default item of every menu it belongs to (G-ACTIONS §10.3)', () => {
+		const hasHandToChi = (menuId: string) =>
+			DEFAULT_MENUS[menuId].some((e) => e !== '---' && e.id === 'hand-to-chi');
+		expect(hasHandToChi('files')).toBe(true);
+		expect(hasHandToChi('artifacts')).toBe(true);
+		expect(hasHandToChi('session')).toBe(true);
+		expect(hasHandToChi('todos')).toBe(true);
 	});
 
 	it('DoD 6: empty states offer exactly one action with locked copy from designs/system-flows.html?state=states', () => {

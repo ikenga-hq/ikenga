@@ -1,86 +1,71 @@
+// The terminal's keys are the registry's hosted `terminal.*` commands
+// (WP-54, DEC-56, G-ACTIONS §10.2): same platform defaults as the old T-11
+// table, now rebindable through `keybindings.json` like any other key.
+
 import { describe, expect, it } from 'vitest';
-import {
-	DEFAULT_LINUX_WIN_KEYBINDINGS,
-	DEFAULT_MAC_KEYBINDINGS,
-	evaluateTerminalKey,
-	getDefaultKeybindings,
-	matchesChord,
-} from './keybindings';
+import { DEFAULT_KEYMAP, type KeymapEntry } from '@/lib/keymap/defaults';
+import { evaluateTerminalKey, TERMINAL_COMMANDS, terminalActionFor, terminalKeyLabel } from './keybindings';
 
-describe('terminal keybindings', () => {
-	it('exports valid platform default constants', () => {
-		expect(DEFAULT_MAC_KEYBINDINGS.copy).toBe('Cmd+C');
-		expect(DEFAULT_LINUX_WIN_KEYBINDINGS.copy).toBe('Ctrl+Shift+C');
-		expect(getDefaultKeybindings(true)).toEqual(DEFAULT_MAC_KEYBINDINGS);
-		expect(getDefaultKeybindings(false)).toEqual(DEFAULT_LINUX_WIN_KEYBINDINGS);
+const IN_TERMINAL = { terminalFocus: true };
+const key = (init: KeyboardEventInit) => new KeyboardEvent('keydown', init);
+
+describe('terminal keybindings (registry `terminal.*`)', () => {
+	it('every terminal action is a default registry command on both platforms', () => {
+		for (const command of Object.values(TERMINAL_COMMANDS)) {
+			const entries = DEFAULT_KEYMAP.filter((e) => e.command === command);
+			expect(entries.map((e) => e.platformOnly).sort(), command).toEqual(['mac', 'other']);
+			for (const e of entries) expect(e.when).toBe('terminalFocus');
+			expect(terminalActionFor(command)).not.toBeNull();
+		}
+		expect(terminalActionFor('palette.open')).toBeNull();
 	});
 
-	it('matches Mac chords correctly', () => {
-		const cmdC = new KeyboardEvent('keydown', { key: 'c', metaKey: true });
-		expect(matchesChord(cmdC, 'Cmd+C', true)).toBe(true);
-		expect(matchesChord(cmdC, 'Ctrl+Shift+C', true)).toBe(false);
-
-		const cmdV = new KeyboardEvent('keydown', { key: 'v', metaKey: true });
-		expect(matchesChord(cmdV, 'Cmd+V', true)).toBe(true);
-
-		const cmdShiftF = new KeyboardEvent('keydown', { key: 'f', metaKey: true, shiftKey: true });
-		expect(matchesChord(cmdShiftF, 'Cmd+Shift+F', true)).toBe(true);
+	it('macOS defaults are ⌘-based', () => {
+		const opts = { mac: true, ctx: IN_TERMINAL };
+		expect(evaluateTerminalKey(key({ key: 'c', metaKey: true }), opts)).toBe('copy');
+		expect(evaluateTerminalKey(key({ key: 'v', metaKey: true }), opts)).toBe('paste');
+		expect(evaluateTerminalKey(key({ key: 'f', metaKey: true }), opts)).toBe('find');
+		expect(evaluateTerminalKey(key({ key: 'k', metaKey: true }), opts)).toBe('clear');
+		expect(evaluateTerminalKey(key({ key: 'a', metaKey: true }), opts)).toBe('selectAll');
+		expect(evaluateTerminalKey(key({ key: 'ArrowUp', metaKey: true }), opts)).toBe('jumpToPrevPrompt');
+		expect(evaluateTerminalKey(key({ key: 'ArrowDown', metaKey: true }), opts)).toBe('jumpToNextPrompt');
+		// Ctrl+Shift+C is not a mac binding.
+		expect(evaluateTerminalKey(key({ key: 'c', ctrlKey: true, shiftKey: true }), opts)).toBeNull();
 	});
 
-	it('matches Linux/Windows chords correctly', () => {
-		const ctrlShiftC = new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, shiftKey: true });
-		expect(matchesChord(ctrlShiftC, 'Ctrl+Shift+C', false)).toBe(true);
-		expect(matchesChord(ctrlShiftC, 'Cmd+C', false)).toBe(false);
-
-		const ctrlShiftV = new KeyboardEvent('keydown', { key: 'v', ctrlKey: true, shiftKey: true });
-		expect(matchesChord(ctrlShiftV, 'Ctrl+Shift+V', false)).toBe(true);
-
-		const ctrlShiftF = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, shiftKey: true });
-		expect(matchesChord(ctrlShiftF, 'Ctrl+Shift+F', false)).toBe(true);
+	it('Windows/Linux defaults are Ctrl+Shift-based; plain Ctrl+C stays for the PTY', () => {
+		const opts = { mac: false, ctx: IN_TERMINAL };
+		expect(evaluateTerminalKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), opts)).toBe('copy');
+		expect(evaluateTerminalKey(key({ key: 'V', ctrlKey: true, shiftKey: true }), opts)).toBe('paste');
+		expect(evaluateTerminalKey(key({ key: 'F', ctrlKey: true, shiftKey: true }), opts)).toBe('find');
+		expect(evaluateTerminalKey(key({ key: 'K', ctrlKey: true, shiftKey: true }), opts)).toBe('clear');
+		expect(evaluateTerminalKey(key({ key: 'ArrowUp', ctrlKey: true }), opts)).toBe('jumpToPrevPrompt');
+		expect(evaluateTerminalKey(key({ key: 'ArrowDown', ctrlKey: true }), opts)).toBe('jumpToNextPrompt');
+		expect(evaluateTerminalKey(key({ key: 'c', ctrlKey: true }), opts)).toBeNull();
+		expect(evaluateTerminalKey(key({ key: 'c' }), opts)).toBeNull();
 	});
 
-	it('evaluates terminal actions with platform defaults', () => {
-		const macEvent = new KeyboardEvent('keydown', { key: 'c', metaKey: true });
-		expect(evaluateTerminalKey(macEvent, true)).toBe('copy');
-
-		const winEvent = new KeyboardEvent('keydown', { key: 'v', ctrlKey: true, shiftKey: true });
-		expect(evaluateTerminalKey(winEvent, false)).toBe('paste');
-
-		const winFind = new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, shiftKey: true });
-		expect(evaluateTerminalKey(winFind, false)).toBe('find');
-
-		const plainC = new KeyboardEvent('keydown', { key: 'c' });
-		expect(evaluateTerminalKey(plainC, false)).toBeNull();
+	it('fires only while the terminal has focus (`when: terminalFocus`)', () => {
+		expect(evaluateTerminalKey(key({ key: 'k', metaKey: true }), { mac: true, ctx: { terminalFocus: false } })).toBeNull();
 	});
 
-	it('supports custom keybinding overrides', () => {
-		const customEvent = new KeyboardEvent('keydown', { key: 'y', ctrlKey: true, altKey: true });
-		const action = evaluateTerminalKey(customEvent, false, {
-			copy: 'Ctrl+Alt+Y',
-		});
-		expect(action).toBe('copy');
+	it('a personal rebind changes the key (one grammar, no private table)', () => {
+		const entries: KeymapEntry[] = [
+			...DEFAULT_KEYMAP.filter((e) => e.command !== 'terminal.copy'),
+			{ command: 'terminal.copy', key: 'ctrl+alt+y', when: 'terminalFocus', source: 'personal', label: 'Copy' },
+		];
+		const opts = { mac: false, entries, ctx: IN_TERMINAL };
+		expect(evaluateTerminalKey(key({ key: 'y', ctrlKey: true, altKey: true }), opts)).toBe('copy');
+		expect(evaluateTerminalKey(key({ key: 'C', ctrlKey: true, shiftKey: true }), opts)).toBeNull();
 	});
 
-	it('evaluates prompt jump keybindings (Cmd+Up/Down on Mac, Ctrl+Up/Down on Linux)', () => {
-		expect(DEFAULT_MAC_KEYBINDINGS.jumpToPrevPrompt).toBe('Cmd+Up');
-		expect(DEFAULT_MAC_KEYBINDINGS.jumpToNextPrompt).toBe('Cmd+Down');
-		expect(DEFAULT_LINUX_WIN_KEYBINDINGS.jumpToPrevPrompt).toBe('Ctrl+Up');
-		expect(DEFAULT_LINUX_WIN_KEYBINDINGS.jumpToNextPrompt).toBe('Ctrl+Down');
+	it('IME composition never fires', () => {
+		const composing = new KeyboardEvent('keydown', { key: 'k', metaKey: true, isComposing: true });
+		expect(evaluateTerminalKey(composing, { mac: true, ctx: IN_TERMINAL })).toBeNull();
+	});
 
-		// Mac Cmd+ArrowUp
-		const macUp = new KeyboardEvent('keydown', { key: 'ArrowUp', metaKey: true });
-		expect(evaluateTerminalKey(macUp, true)).toBe('jumpToPrevPrompt');
-
-		// Mac Cmd+ArrowDown
-		const macDown = new KeyboardEvent('keydown', { key: 'ArrowDown', metaKey: true });
-		expect(evaluateTerminalKey(macDown, true)).toBe('jumpToNextPrompt');
-
-		// Linux Ctrl+ArrowUp
-		const linuxUp = new KeyboardEvent('keydown', { key: 'ArrowUp', ctrlKey: true });
-		expect(evaluateTerminalKey(linuxUp, false)).toBe('jumpToPrevPrompt');
-
-		// Linux Ctrl+ArrowDown
-		const linuxDown = new KeyboardEvent('keydown', { key: 'ArrowDown', ctrlKey: true });
-		expect(evaluateTerminalKey(linuxDown, false)).toBe('jumpToNextPrompt');
+	it('labels come from the registry', () => {
+		expect(terminalKeyLabel('copy', { mac: true })).toBe('⌘C');
+		expect(terminalKeyLabel('copy', { mac: false })).toBe('Ctrl+Shift+C');
 	});
 });

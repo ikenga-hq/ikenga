@@ -1,0 +1,222 @@
+/* D-06 Keys tab + conflict state (WP-60) — table, platform preview, held
+   rows. `table.keys` mirrors `designs/actions.html`'s own `table.keys` (same
+   column shape, same tokens), scoped under `.view-acts` like the rest of the
+   Actions surface — but owned by this folder (WP-60 review: these rules
+   moved out of the shared `actions.css` so WP-58/59/61 never conflict on
+   that file). Imported once from `keys/index.tsx`. */
+
+.view-acts .keyhead {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	flex-wrap: wrap;
+	row-gap: var(--space-2);
+}
+
+.view-acts .platseg {
+	display: inline-flex;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	overflow: hidden;
+}
+
+.view-acts .platseg button {
+	height: 24px;
+	padding: 0 var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	background: transparent;
+	border: none;
+	border-right: 1px solid var(--border);
+	cursor: pointer;
+}
+
+.view-acts .platseg button:last-child {
+	border-right: 0;
+}
+
+.view-acts .platseg button:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .platseg button.on {
+	background: var(--primary-soft);
+	color: var(--fg);
+}
+
+.view-acts .keynotice {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-1) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: color-mix(in srgb, var(--warning) 14%, var(--bg-surface));
+	color: var(--fg);
+	font-size: var(--text-caption);
+}
+
+.view-acts .keynotice.danger {
+	background: var(--danger-soft);
+	color: var(--danger);
+}
+
+.view-acts table.keys {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: var(--text-caption);
+}
+
+.view-acts table.keys thead th {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	background: var(--bg-surface);
+	border-bottom: 1px solid var(--border);
+	height: 26px;
+	text-align: left;
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+	padding: 0 var(--space-3);
+}
+
+/* WP-60 review (conformance): the shared density tokens, not a hardcoded
+   height, so the row meets the 44px hit-target floor in spacious density
+   (`[data-density='spacious']` → `--row-h: 44px`, `ikenga-tokens.css`) the
+   same way every other list in the shell does. */
+.view-acts table.keys td {
+	border-bottom: 1px solid var(--border-soft);
+	padding: 4px var(--space-3);
+	height: var(--row-h);
+	vertical-align: middle;
+}
+
+.view-acts table.keys tbody tr:hover {
+	background: var(--bg-raised);
+}
+
+.view-acts table.keys tbody tr.editing {
+	background: var(--primary-soft);
+}
+
+.view-acts table.keys tbody tr.held {
+	background: color-mix(in srgb, var(--warning) 7%, transparent);
+}
+
+.view-acts table.keys tbody tr.clash {
+	background: color-mix(in srgb, var(--danger) 7%, transparent);
+}
+
+.view-acts table.keys tbody tr.clash td:first-child {
+	box-shadow: inset 2px 0 0 var(--danger);
+}
+
+.view-acts table.keys td.c-when {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	width: 220px;
+}
+
+.view-acts table.keys td.c-key {
+	width: 180px;
+}
+
+.view-acts table.keys td.c-src {
+	width: 168px;
+}
+
+.view-acts table.keys td.c-act {
+	width: 168px;
+	text-align: right;
+	white-space: nowrap;
+}
+
+.view-acts table.keys td.c-act .chip + .chip {
+	margin-left: 4px;
+}
+
+.view-acts .srccell {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	flex-wrap: wrap;
+}
+
+.view-acts .cmdlbl {
+	display: block;
+}
+
+.view-acts .cmdid {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .reqkey {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+.view-acts .heldby {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .chordwarn {
+	color: var(--warning);
+}
+
+/* WP-60 review (conformance): D-06 renders danger-soft text in `--on-danger`
+   (a --danger/--fg mix tuned for contrast on the soft background), not the
+   bare `--danger` used for borders/icons. `ikenga-tokens.css` (out of this
+   folder) does not define `--on-danger` yet — the fallback keeps today's
+   color until it lands; see the PR report. */
+.view-acts .pchip.danger {
+	color: var(--on-danger, var(--danger));
+	background: var(--danger-soft);
+	border-color: transparent;
+}
+
+.view-acts .rowerr {
+	margin: 0;
+	padding: var(--space-1) 0;
+	font-size: var(--text-micro);
+	color: var(--danger);
+}
+
+.view-acts .clashnote {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--on-danger, var(--danger));
+	padding: 2px 0;
+}
+
+.view-acts .clashnote .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+	flex-wrap: wrap;
+}
+
+.view-acts .restrictinput {
+	height: 24px;
+	padding: 0 var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+	color: var(--fg);
+	font-size: var(--text-micro);
+	min-width: 180px;
+}

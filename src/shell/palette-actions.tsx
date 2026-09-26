@@ -20,12 +20,18 @@ import { useQuery } from '@tanstack/react-query';
 import { Command } from 'cmdk';
 import {
 	CheckSquare,
+	Columns2,
 	FileText,
+	FolderOpen,
 	Keyboard,
 	type LucideIcon,
 	Mail,
+	MessageSquare,
 	Monitor,
 	Moon,
+	PanelLeft,
+	RotateCcw,
+	Rows2,
 	Search,
 	Send,
 	Sparkles,
@@ -37,9 +43,10 @@ import {
 import { CommandRow } from '@/components/ui/command-row';
 import { dispatchAction, isDispatchable } from '@/components/pkg/actions/action-runner';
 import { type IkengaMode, useIkengaStore } from '@/lib/ikenga/theme-store';
-import { labelFor } from '@/lib/keymap/registry';
 import { queryKeys } from '@/lib/query-keys';
 import { listAllSkillActions, type SkillAction } from '@/lib/tauri-cmd';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 
 // Domain → leading glyph. Presentation-only (the manifest has no per-action
 // icon field); a design choice, not a data field. Unknown / absent domains
@@ -193,6 +200,24 @@ export const THEME_LABEL: Record<IkengaMode, string> = {
 	system: 'System',
 };
 
+// The `palette` menu's canonical ids (G-ACTIONS §1.3) rendered here have no
+// per-action icon of their own (built-ins own their surface's glyph, per
+// `registry.ts`) — this is the local map.
+const PALETTE_MENU_ICON: Readonly<Record<string, LucideIcon>> = {
+	'pane.split-right': Columns2,
+	'pane.split-down': Rows2,
+	'pane.reopen': RotateCcw,
+	'explorer.toggle': PanelLeft,
+	'companion.toggle': MessageSquare,
+	'palette.projects': FolderOpen,
+	'shortcuts.open': Keyboard,
+};
+
+// Search keywords the shipped rows carried beyond their label.
+const PALETTE_MENU_SEARCH: Readonly<Record<string, string>> = {
+	'shortcuts.open': 'keyboard shortcuts keys bindings help',
+};
+
 /** `onShowShortcuts` switches the open palette to its Shortcuts view. It is
  *  injected so this module never imports `command-palette.tsx` (which
  *  imports this one). */
@@ -201,6 +226,19 @@ export function ManageGroup({ onShowShortcuts }: { onShowShortcuts: () => void }
 	const setMode = useIkengaStore((s) => s.setMode);
 	const next = THEME_CYCLE[mode];
 	const Icon = THEME_ICON[next];
+
+	// The `palette` menu (G-ACTIONS §1.3): pane creation / frame toggles, plus
+	// every package and user action placed here (§12, G-70) — order, hidden
+	// ids and appends already applied by the merge. Every default id here is
+	// already a global command (workspace.tsx, the rail, or this file's own
+	// `useCommands` below), so the generic fallback (`runMenuAction`) fires it
+	// correctly; only "Keyboard shortcuts" needs a local override, since its
+	// owner handler lives in the caller (`command-palette.tsx`) rather than
+	// the command table.
+	const paletteMenu = useEffectiveMenu('palette');
+	const rows = resolveMenuItems(paletteMenu, {
+		handlers: { 'shortcuts.open': onShowShortcuts },
+	});
 
 	return (
 		<Command.Group heading="Manage" className="text-xs text-muted-foreground">
@@ -216,14 +254,19 @@ export function ManageGroup({ onShowShortcuts }: { onShowShortcuts: () => void }
 					setMode(next);
 				}}
 			/>
-			<CommandRow
-				size="md"
-				value="keyboard shortcuts keys bindings help"
-				Icon={Keyboard}
-				label="Keyboard shortcuts"
-				shortcut={labelFor('shortcuts.open')}
-				onSelect={onShowShortcuts}
-			/>
+			{rows.map((row) =>
+				row.kind === 'separator' ? null : (
+					<CommandRow
+						key={row.id}
+						size="md"
+						value={PALETTE_MENU_SEARCH[row.id] ?? row.label}
+						Icon={PALETTE_MENU_ICON[row.id] ?? Sparkles}
+						label={row.label}
+						shortcut={row.shortcut || undefined}
+						onSelect={row.run}
+					/>
+				)
+			)}
 		</Command.Group>
 	);
 }

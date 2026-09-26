@@ -46,9 +46,8 @@ function SettingsLayout() {
 	const activeRoot = projects.find((p) => p.id === activeProjectId)?.root_path ?? null;
 	const projectId = scope === 'project' ? activeProjectId : null;
 	const document = useSettingsDocument(scope, projectId);
-	const activeId = sectionIdFromPath(
-		useRouterState({ select: (state) => state.location.pathname })
-	);
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
+	const activeId = sectionIdFromPath(pathname);
 	const overrides = useMemo(
 		() => new Set(scope === 'project' ? (document.result?.overrides ?? []) : []),
 		[scope, document.result]
@@ -76,6 +75,15 @@ function SettingsLayout() {
 	}
 
 	const iykeLine = settingsIykeLine(activeId, scope);
+
+	// D-06 (Actions, menus and keys, WP-57) is its own pane-hosted full-bleed
+	// surface with its own header and tab bar — it does not fit the generic
+	// SettingsSectionHeader (bound to SETTINGS_SECTIONS) or the left section
+	// nav, so it renders outside this shell. D-03 Workspace links out to it
+	// instead of listing it as a section.
+	if (pathname.startsWith('/settings/actions')) {
+		return <Outlet />;
+	}
 
 	return (
 		<SettingsSectionProvider value={context}>

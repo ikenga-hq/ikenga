@@ -16,6 +16,9 @@ import { queryClient } from '@/lib/query-client';
 import { initDefaultCwd } from '@/lib/shell/default-cwd';
 import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { startActionsStore } from '@/lib/actions/store';
+import { installKeyDispatcher, startOsShortcutSync } from '@/lib/keymap/dispatcher';
+import { isTauri } from '@/lib/transport';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
 import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
@@ -53,6 +56,19 @@ export async function bootPrimary(): Promise<void> {
 
 	// Install native menu best-effort (Mac-only; silently no-ops elsewhere).
 	void installNativeMenu();
+
+	// WP-54 (DEC-56): the one key dispatcher — every frame key fires through
+	// the registry — and the effective model it reads, booted once here at
+	// the app root so `getKeymap()` is the effective keymap (personal /
+	// project rules, package grants) before any surface mounts. The primary
+	// window also owns the OS-wide shortcuts (G-ACTIONS §6): it pushes the
+	// effective default + personal OS rules to `lib.rs` and re-pushes on
+	// every change.
+	installKeyDispatcher();
+	void startActionsStore().catch((err) => {
+		console.warn('[boot] actions model did not load; keys stay on the defaults', err);
+	});
+	if (isTauri()) startOsShortcutSync();
 
 	// Resolve $HOME once so `defaultCwd()` (used by terminal/session
 	// fallbacks) can return it synchronously. Fire-and-forget — failure leaves

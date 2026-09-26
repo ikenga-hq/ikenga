@@ -10,11 +10,9 @@ import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
 import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
-import {
-	evaluateTerminalKey,
-	getDefaultKeybindings,
-	type TerminalKeybindings,
-} from './keybindings';
+import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
+import { eventMatchesCombo, strokesFromEvent } from '@/lib/keymap/platform';
+import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
 import { registerPathLinks } from './path-links';
 import { setupSemanticPrompts, type SemanticPromptsManager } from './osc133';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
@@ -81,8 +79,6 @@ interface Props {
 	nudgeOnAttach?: boolean;
 	/** Configurable scrollback lines (defaults to 10,000). */
 	scrollback?: number;
-	/** Custom terminal keybinding overrides (T-11). */
-	keybindings?: Partial<TerminalKeybindings>;
 }
 
 const DARK_THEME: ITheme = {
@@ -136,6 +132,22 @@ const LIGHT_THEME: ITheme = {
 function isDarkMode(): boolean {
 	if (typeof document === 'undefined') return true;
 	return document.documentElement.classList.contains('dark');
+}
+
+/**
+ * On Windows/Linux a plain Ctrl+<letter> (and Ctrl+\, Ctrl+[, Ctrl+]) is a
+ * C0 control character the PTY relies on — ^B is tmux's prefix, ^\ is
+ * SIGQUIT. When a *default* frame rule (`explorer.toggle`'s `mod+b`,
+ * `pane.split-right`'s `mod+\`, both `always`) claims one while the terminal
+ * has focus, the PTY keeps it, as it always has; only a rule the user bound
+ * in their own personal file wins over the PTY — a project's keybindings
+ * (someone else's repo, even once trusted) never take ^C / ^B / ^\ away
+ * from the shell. macOS frame keys use ⌘, which never reaches the PTY.
+ */
+function ptyKeepsKey(e: KeyboardEvent, peek: KeyPeek, mac: boolean): boolean {
+	if (mac || peek.chord || !peek.winner) return false;
+	if (peek.winner.source === 'personal') return false;
+	return strokesFromEvent(e).some((stroke) => /^ctrl\+([a-z]|\\|\[|\])$/.test(stroke));
 }
 
 function isMac(): boolean {
@@ -384,7 +396,6 @@ export function XTermHost({
 	focused,
 	nudgeOnAttach,
 	scrollback,
-	keybindings,
 }: Props) {
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -403,12 +414,10 @@ export function XTermHost({
 	const onExitRef = useRef(onExit);
 	const onPtyIdRef = useRef(onPtyId);
 	const focusedRef = useRef(focused);
-	const keybindingsRef = useRef(keybindings);
 	onStatusRef.current = onStatus;
 	onExitRef.current = onExit;
 	onPtyIdRef.current = onPtyId;
 	focusedRef.current = focused;
-	keybindingsRef.current = keybindings;
 	const status = (s: string) => onStatusRef.current?.(s);
 	const exit = (code: number | null) => onExitRef.current?.(code);
 
@@ -862,9 +871,12 @@ export function XTermHost({
 		term.attachCustomKeyEventHandler((e) => {
 			if (e.type !== 'keydown') return true;
 			const mac = isMac();
-			const meta = mac ? e.metaKey : e.ctrlKey;
 
-			const action = evaluateTerminalKey(e, mac, keybindingsRef.current);
+			// The terminal's own keys are the hosted `terminal.*` registry
+			// commands (G-ACTIONS §4.6, WP-54): their keys come from the
+			// effective keymap (rebindable in `keybindings.json`), and this
+			// hook — their owner — fires them.
+			const action = evaluateTerminalKey(e, { mac });
 			if (action === 'copy') {
 				const sel = term.getSelection();
 				if (sel) {
@@ -896,55 +908,65 @@ export function XTermHost({
 			// Windows/Linux conveniences on top of the Ctrl+Shift defaults,
 			// matching Windows Terminal: plain Ctrl+C copies only when there is a
 			// selection (otherwise it stays SIGINT), and plain Ctrl+V pastes.
-			if (!mac && e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
-				const k = e.key.toLowerCase();
-				if (k === 'c' && term.hasSelection()) {
-					writeClipboardText(term.getSelection()).catch(() => {});
-					term.clearSelection();
-					return false;
-				}
-				if (k === 'v') {
-					e.preventDefault();
-					pasteNow();
-					return false;
-				}
+			// Widget-local PTY conventions, not registry commands: they depend on
+			// the selection and on what the PTY would otherwise receive.
+			if (!mac && eventMatchesCombo(e, 'ctrl+c', false) && term.hasSelection()) {
+				writeClipboardText(term.getSelection()).catch(() => {});
+				term.clearSelection();
+				return false;
+			}
+			if (!mac && eventMatchesCombo(e, 'ctrl+v', false)) {
+				e.preventDefault();
+				pasteNow();
+				return false;
 			}
 
 			if (action === 'find') {
+				// The terminal owns its own keys (find, clear, select all, the
+				// prompt jumps): stop the browser default so a native menu
+				// accelerator on the same key (macOS ⌘K → the palette) doesn't
+				// also fire. DEC-58's dedupe is per command, so it can't catch
+				// two different commands.
+				e.preventDefault();
 				setSearchOpen(true);
 				setTimeout(() => searchInputRef.current?.focus(), 0);
 				return false;
 			}
 
 			if (action === 'clear') {
+				e.preventDefault();
 				term.clear();
 				return false;
 			}
 
 			if (action === 'selectAll') {
+				e.preventDefault();
 				term.selectAll();
 				return false;
 			}
 
 			if (action === 'jumpToPrevPrompt') {
+				e.preventDefault();
 				semanticPromptsRef.current?.jumpToPrevPrompt();
 				return false;
 			}
 
 			if (action === 'jumpToNextPrompt') {
+				e.preventDefault();
 				semanticPromptsRef.current?.jumpToNextPrompt();
 				return false;
 			}
 
-			// Zoom chords belong to the app, not the PTY. xterm's handler runs
-			// on its own textarea and therefore *before* the window-level zoom
-			// listener in `lib/window/zoom.ts`; without this, Ctrl+- and
-			// friends get encoded and shipped to the shell running inside the
-			// terminal. Returning false only stops xterm from consuming the
-			// key — the event still bubbles to window, where zoom picks it up.
-			if (meta && !e.altKey && ['=', '+', 'Add', '-', '_', 'Subtract', '0'].includes(e.key)) {
-				return false;
-			}
+			// Frame keys belong to the one key dispatcher (WP-54). xterm runs
+			// this handler on its own textarea, *before* the window listener,
+			// and a key xterm consumes is encoded for the PTY and stopped there.
+			// So when the dispatcher claims this key — a frame command whose
+			// `when` holds inside the terminal (zoom, ⌘B, Alt+1…6, …) or a chord
+			// stroke — xterm skips it (`return false`) and the event bubbles to
+			// the window, where the dispatcher fires it. This replaces the old
+			// zoom-only special case with the registry's answer.
+			const peek = peekKeypress(e);
+			if (peek.claimed && !ptyKeepsKey(e, peek, mac)) return false;
 
 			// Shift+Enter — soft newline instead of submit.
 			//
@@ -956,7 +978,7 @@ export function XTermHost({
 			// distinguishable key: readline-style consumers treat it as a
 			// literal newline in the buffer rather than end-of-input. This is
 			// the same distinction `/terminal-setup` configures in iTerm2 and
-			// VS Code.
+			// VS Code. Widget-local (a PTY encoding, not a command).
 			//
 			// `term.input()` (not `pty.write()`) so this routes through the
 			// terminal's own onData path — that keeps it correct on the
@@ -969,15 +991,13 @@ export function XTermHost({
 			// behind our LF. The visible symptom was a newline appearing and
 			// the app submitting a frame later. Suppress the default so LF is
 			// the only thing that reaches the PTY.
-			if (e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Enter') {
+			if (eventMatchesCombo(e, 'shift+enter', mac)) {
 				e.preventDefault();
 				term.input('\n');
 				return false;
 			}
 
 			// Plain Ctrl+C on linux still goes to PTY (xterm default — SIGINT).
-			// No special handling needed; meta-only branch above is mac-only.
-			void meta;
 			return true;
 		});
 
@@ -1208,11 +1228,6 @@ export function XTermHost({
 		setContextMenu({ x: e.clientX, y: e.clientY });
 	};
 
-	const effectiveKeybindings = {
-		...getDefaultKeybindings(isMac()),
-		...keybindings,
-	};
-
 	if (!spec && !pty) {
 		return <div className="empty">No PTY. Spawn one above.</div>;
 	}
@@ -1275,7 +1290,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Copy</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.copy}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{terminalKeyLabel('copy')}</span>
 					</button>
 					<button
 						type="button"
@@ -1304,7 +1319,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Paste</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.paste}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{terminalKeyLabel('paste')}</span>
 					</button>
 					<button
 						type="button"
@@ -1326,7 +1341,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Select All</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.selectAll}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{terminalKeyLabel('selectAll')}</span>
 					</button>
 					<div style={{ height: 1, background: 'rgba(127,127,127,0.2)', margin: '2px 0' }} />
 					<button
@@ -1349,7 +1364,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Clear Terminal</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.clear}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{terminalKeyLabel('clear')}</span>
 					</button>
 					<button
 						type="button"
@@ -1372,7 +1387,7 @@ export function XTermHost({
 						}}
 					>
 						<span>Find…</span>
-						<span style={{ fontSize: 10, opacity: 0.6 }}>{effectiveKeybindings.find}</span>
+						<span style={{ fontSize: 10, opacity: 0.6 }}>{terminalKeyLabel('find')}</span>
 					</button>
 				</div>
 			)}

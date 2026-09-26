@@ -27,7 +27,17 @@
 //   · engine — the Companion's next-dispatch target, else the default engine
 
 import { useQuery } from '@tanstack/react-query';
-import { Folder, GitBranch, HelpCircle, Package, ShieldCheck } from 'lucide-react';
+import { Folder, GitBranch, HelpCircle, MoreHorizontal, Package, ShieldCheck } from 'lucide-react';
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
+import { MenuRunNoticeHost } from '@/shell/menu/run-notice';
 import {
 	Fragment,
 	type KeyboardEvent as ReactKeyboardEvent,
@@ -205,6 +215,12 @@ export function StatusBar() {
 	const cost = runIds.reduce((sum, id) => sum + (snaps[id]?.cost?.total_cost_usd ?? 0), 0);
 	const shortcutsKey = labelFor('shortcuts.open');
 
+	// The status bar's right-group menu (G-ACTIONS §1.3 `status`): no shipped
+	// default (§15 A-7) — this renders only what a package, personal or
+	// project override places here, same as every other data-driven menu.
+	const statusMenu = useEffectiveMenu('status');
+	const statusMenuRows = resolveMenuItems(statusMenu);
+
 	// Ngwa: up to three deep-link segments, zero segments dropped (§6A.7).
 	const ngwaSegments = [
 		{
@@ -233,6 +249,7 @@ export function StatusBar() {
 		approvals > 0 && 'permissions',
 		runs > 0 && 'runs',
 		'shortcuts',
+		statusMenuRows.length > 0 && 'status-menu',
 	].filter((v): v is string => typeof v === 'string');
 
 	const [roving, setRoving] = useState<string | null>(null);
@@ -382,11 +399,49 @@ export function StatusBar() {
 					<HelpCircle aria-hidden className="h-3 w-3" />
 					<span className="font-mono">{shortcutsKey}</span>
 				</SegButton>
+				{statusMenuRows.length > 0 && (
+					<DropdownMenu>
+						<DropdownMenuTrigger asChild>
+							<button
+								type="button"
+								data-seg="status-menu"
+								tabIndex={rovingId === 'status-menu' ? 0 : -1}
+								aria-label="More status bar actions"
+								className={cn(BUTTON)}
+							>
+								<MoreHorizontal aria-hidden className="h-3 w-3" />
+							</button>
+						</DropdownMenuTrigger>
+						<DropdownMenuContent align="end">
+							{statusMenuRows.map((row, i) =>
+								row.kind === 'separator' ? (
+									// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+									<DropdownMenuSeparator key={`sep-${i}`} />
+								) : (
+									<DropdownMenuItem
+										key={row.id}
+										data-action={row.dataAction}
+										disabled={row.disabled}
+										title={row.disabledReason}
+										variant={row.danger ? 'destructive' : undefined}
+										onSelect={row.run}
+									>
+										{row.icon}
+										{row.label}
+									</DropdownMenuItem>
+								)
+							)}
+						</DropdownMenuContent>
+					</DropdownMenu>
+				)}
 			</span>
 
 			<span role="status" aria-live="polite" className="sr-only">
 				{liveText}
 			</span>
+			{/* WP-55: where a menu-run action's refusal / failure is shown (and
+			    the trust sheet it may open). Always in the frame, like this bar. */}
+			<MenuRunNoticeHost />
 		</div>
 	);
 }

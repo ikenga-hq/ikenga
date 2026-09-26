@@ -13,13 +13,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { IconButton } from '@/components/ui/icon-button';
 import { Input } from '@/components/ui/input';
-import {
-	ContextMenu,
-	ContextMenuContent,
-	ContextMenuItem,
-	ContextMenuSeparator,
-	ContextMenuTrigger,
-} from '@/components/ui/context-menu';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { formatPaneAddressForDisplay, parsePaneAddress } from '@/lib/panes/pane-address';
 import { resolveArtifactAddress } from '@/lib/panes/pane-address-resolver';
 import type { LeafNode, PaneId, PaneView } from '@/lib/panes/types';
@@ -134,6 +128,22 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 	// new pane" items that only make sense with a sibling tab to move past.
 	const soleTab = leaf?.tabs[0];
 	const isSoleTabPinned = Boolean(soleTab?.pinned);
+	const soleTabPath = soleTab?.kind === 'artifact' || soleTab?.kind === 'route' ? soleTab.path : undefined;
+	// `address` (G-ACTIONS §1.3), resolved only while the menu is open. The
+	// default contents carry no applicability for "Pin to sidebar…"; it has a
+	// handler (and so renders) only on an artifact tab, as shipped.
+	const addressMenuHandlers: Record<string, () => void> = {
+		...(soleTab?.kind === 'artifact' ? { 'pin-sidebar': () => setPinDialogOpen(true) } : {}),
+		'tab.toggle-pin': () => {
+			if (leaf) toggleTabPinned(leaf.id, 0);
+		},
+		...(soleTabPath !== undefined
+			? { 'copy-path': () => void writeClipboardText(soleTabPath).catch(() => {}) }
+			: {}),
+		'tab.close': () => {
+			if (leaf) closeTab(leaf.id, 0);
+		},
+	};
 
 	return (
 		<div
@@ -166,8 +176,24 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 					<RefreshCw className="h-3.5 w-3.5" />
 				</IconButton>
 			)}
-			<ContextMenu>
-				<ContextMenuTrigger asChild disabled={!mergedTools || !leaf}>
+			<EffectiveContextMenu
+				menuId="address"
+				triggerDisabled={!mergedTools || !leaf || !soleTab}
+				target={{ resource: soleTabPath, paneKind: soleTab?.kind }}
+				conditions={{
+					'artifact-tab': soleTab?.kind === 'artifact',
+					'artifact-or-route-tab': soleTabPath !== undefined,
+				}}
+				disabled={(id) => (id === 'tab.close' ? isSoleTabPinned : false)}
+				labels={{
+					'pin-sidebar': 'Pin to sidebar…',
+					'tab.toggle-pin': isSoleTabPinned ? 'Unpin tab' : 'Pin tab',
+					'copy-path': 'Copy path',
+					'tab.close': 'Close',
+				}}
+				handlers={addressMenuHandlers}
+				builtinsNeedHandler
+			>
 					<Input
 						ref={inputRef}
 						type="text"
@@ -209,40 +235,7 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 							invalid && 'border-destructive ring-2 ring-destructive/40'
 						)}
 					/>
-				</ContextMenuTrigger>
-				{mergedTools && leaf && soleTab && (
-					<ContextMenuContent>
-						{soleTab.kind === 'artifact' && (
-							<>
-								<ContextMenuItem onSelect={() => setPinDialogOpen(true)}>
-									Pin to sidebar…
-								</ContextMenuItem>
-								<ContextMenuSeparator />
-							</>
-						)}
-						<ContextMenuItem onSelect={() => toggleTabPinned(leaf.id, 0)}>
-							{isSoleTabPinned ? 'Unpin tab' : 'Pin tab'}
-						</ContextMenuItem>
-						{(soleTab.kind === 'artifact' || soleTab.kind === 'route') && (
-							<>
-								<ContextMenuSeparator />
-								<ContextMenuItem
-									onSelect={() => void writeClipboardText(soleTab.path).catch(() => {})}
-								>
-									Copy path
-								</ContextMenuItem>
-							</>
-						)}
-						<ContextMenuSeparator />
-						<ContextMenuItem
-							disabled={isSoleTabPinned}
-							onSelect={() => closeTab(leaf.id, 0)}
-						>
-							Close
-						</ContextMenuItem>
-					</ContextMenuContent>
-				)}
-			</ContextMenu>
+			</EffectiveContextMenu>
 			{view.kind === 'artifact' && (
 				<>
 					<IconButton

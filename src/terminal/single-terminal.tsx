@@ -1,11 +1,9 @@
-import { listen } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 import { TerminalSquare } from 'lucide-react';
 import { EmptyState } from '@/components/states';
 import { defaultShellArgv } from '@/lib/platform';
 import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
 import { buildClaudeWrappedCmd, type AgentWrapOpts } from './claude-wrap';
-import { type HookEventPayload } from './tool-call-feed';
 import type { Pty } from './pty-bridge';
 import { getPty } from './pty-registry';
 import { makeTerminalId, openTabPty, useTerminalStore, type TerminalTab } from './session-store';
@@ -90,32 +88,8 @@ export function SingleTerminal({ sessionId, isFocused, nudgeOnAttach }: SingleTe
 		}
 	}, [tab?.status, pty, sessionId, setPtyId]);
 
-	// Capture the claude session id from the SessionStart hook so we can resume
-	// after a full app restart. Filter by `ikenga_terminal_id` so this terminal
-	// only reacts to its own claude session.
-	useEffect(() => {
-		let unlisten: (() => void) | undefined;
-		listen<HookEventPayload>('hooks://event', (event) => {
-			const p = event.payload;
-			if (!p || p.ikenga_terminal_id !== sessionId) return;
-
-			if (p.hook_event_name === 'SessionStart' && p.session_id) {
-				setClaudeSessionId(sessionId, p.session_id);
-			} else if (p.hook_event_name === 'SessionEnd') {
-				// The claude session itself ended; the PTY may keep going but we
-				// no longer have a conversation to resume.
-				setClaudeSessionId(sessionId, null);
-			}
-		})
-			.then((fn) => {
-				unlisten = fn;
-			})
-			.catch(() => {});
-
-		return () => {
-			if (unlisten) unlisten();
-		};
-	}, [sessionId, setClaudeSessionId]);
+	// The claude session id (SessionStart / SessionEnd) is captured by the
+	// store-level hooks listener in session-store.ts, mounted or not.
 
 	if (!tab) {
 		return <Centered text={`Terminal session ${sessionId.slice(0, 8)}… not found.`} />;

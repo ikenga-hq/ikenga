@@ -59,6 +59,46 @@ where
     }
 }
 
+/// Same as [`request`], but targets one window (`emit_to`) instead of
+/// broadcasting to every window (`emit`). WP-62 review (S7): the actions/keys
+/// write round trips have exactly one real listener —
+/// `use-iyke-shell-sync.ts`, mounted once inside the main window's
+/// `<Workspace />` — so a broadcast needlessly wakes every detached window's
+/// webview too.
+pub async fn request_to<T, P>(
+    app: &AppHandle,
+    pending: &Pending<T>,
+    window_label: &str,
+    event: &str,
+    timeout: Duration,
+    build_payload: impl FnOnce(&str) -> P,
+) -> Result<T>
+where
+    P: Serialize + Clone,
+{
+    let request_id = Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<T>();
+    {
+        let mut map = pending.lock().await;
+        map.insert(request_id.clone(), tx);
+    }
+
+    let payload = build_payload(&request_id);
+    if let Err(e) = app.emit_to(window_label, event, &payload) {
+        pending.lock().await.remove(&request_id);
+        return Err(anyhow!("emit_to {window_label} {event}: {e}"));
+    }
+
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(anyhow!("{event} sender dropped")),
+        Err(_) => {
+            pending.lock().await.remove(&request_id);
+            Err(anyhow!("{event} timed out after {}ms", timeout.as_millis()))
+        }
+    }
+}
+
 /// Resolve the oneshot for a given request_id. Called by the FE-callback
 /// Tauri commands. Returns an error if no pending entry matches.
 pub async fn resolve<T>(pending: &Pending<T>, request_id: &str, value: T) -> Result<()> {
