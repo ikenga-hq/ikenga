@@ -1292,6 +1292,11 @@ pub fn run() {
             iyke_endpoint,
             iyke_set_shell,
             iyke::handlers::iyke_set_frame,
+            // WP-62: the `iyke` actions/menus/keys surface — FE→Rust
+            // effective-model mirror push + the write/query round-trip
+            // callback (`src-tauri/src/iyke/actions_routes.rs`).
+            iyke::actions_routes::iyke_set_actions_frame,
+            iyke::actions_routes::iyke_actions_request_done,
             iyke_log_push,
             iyke_network_push,
             iyke_dom_done,
