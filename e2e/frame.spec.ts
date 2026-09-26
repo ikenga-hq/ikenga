@@ -627,8 +627,9 @@ test.describe('D-01 conformance (WP-12)', () => {
 		// (D-08 native-menu-win).
 		const isMac = await page.evaluate(() => /Mac/i.test(navigator.platform));
 		expect(titleRow).toBe(isMac ? 2 : 3);
-		// Rail has exactly 8 items (Project, Chi, Ngwa, 3 pins, Settings, Project switcher)
-		expect(rail).toBe(8);
+		// Rail has exactly 7 items (Project, Chi, Ngwa, 3 pins, Settings). The
+		// project switcher is the title-row chip only (D-01 v4 #projChip).
+		expect(rail).toBe(7);
 		// Pane chrome on single resting pane
 		expect(paneChrome).toBeLessThanOrEqual(10);
 		// Status bar: zero counts hidden
