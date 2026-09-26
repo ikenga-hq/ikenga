@@ -74,7 +74,9 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(settingsNav).toBeVisible();
 		await expect(settingsNav.getByText('Appearance', { exact: true })).toBeVisible();
 		await expect(page.getByRole('navigation', { name: 'Explorer sidebar' })).toBeVisible();
-		await expect(page.getByText('Appearance', { exact: true })).toHaveCount(1);
+		// Listed once across every nav landmark (the tab and the page heading
+		// also say "Appearance"; those aren't navigation).
+		await expect(page.getByRole('navigation').getByText('Appearance', { exact: true })).toHaveCount(1);
 
 		// Record (not assert) which host commands had no canned answer, so a
 		// spec author can see what to add to the fixture when the frame grows.
@@ -525,7 +527,9 @@ test.describe('three-noun routes (WP-10)', () => {
 		// Navigate to /project/dashboard
 		await addressInput.fill('/project/dashboard');
 		await addressInput.press('Enter');
-		await expect(page.locator('.home-greeting')).toBeVisible();
+		// Exactly one greeting: the D-04 daily address when it shows, else the
+		// Obi canvas's own greeting widget — never both.
+		await expect(page.locator('[data-state="daily-address"], .home-greeting')).toHaveCount(1);
 
 		// Legacy redirect /packages -> /ngwa/installed
 		await addressInput.fill('/packages');
