@@ -24,9 +24,18 @@
 
 import type { WhenClause } from './when';
 
-/** The layer a rule comes from (G-ACTIONS §2.1). `user` is the personal
- *  layer (`~/.ikenga/keybindings.json`); WP-52 owns this union from 12c. */
-export type KeymapSource = 'default' | 'package' | 'user' | 'project';
+/** The layer a rule comes from (G-ACTIONS §2.1), lowest first: `default` <
+ *  `package` < `personal` (`~/.ikenga/keybindings.json`) < `project`
+ *  (`<project>/.ikenga/keybindings.json`). WP-52 renamed the pre-12c `user`
+ *  member to `personal` so the union reads like the layer names. */
+export type KeymapSource = 'default' | 'package' | 'personal' | 'project';
+
+/** Where a file rule came from: the scope's `keybindings.json` and its
+ *  index in `bindings` — what the Keys tab resets / edits (WP-52). */
+export interface KeymapRuleOrigin {
+	scope: 'personal' | 'project';
+	index: number;
+}
 
 /** `app` — dispatched in the webview; `os` — registered with
  *  `tauri-plugin-global-shortcut` and fires with Ikenga unfocused (DEC-60,
@@ -54,6 +63,11 @@ export interface KeymapEntry {
 	 *  (`terminal.clear`'s non-mac chord, which is a different combo, not the
 	 *  same one platform-gated). */
 	platformOnly?: 'mac' | 'other';
+	/** Set on `personal` / `project` rules merged from a file (WP-52). */
+	origin?: KeymapRuleOrigin;
+	/** Set on a `package` rule: the pkg whose key request was granted
+	 *  (G-ACTIONS §7.4). */
+	pkgId?: string;
 	/**
 	 * @deprecated Documentation only — `conflicts()` no longer reads it.
 	 * Under DEC-59 a same-key pair with different normalized `when`s is
