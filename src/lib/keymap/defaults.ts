@@ -1,51 +1,65 @@
-// Phase 1 default bindings — the read-only seed of the registry. User and
-// project overrides (`~/.ikenga/keybindings.json`, `<project>/.ikenga/keybindings.json`)
-// are Phase 6 (§6A.5); nothing here reads them yet.
+// Default bindings — the `default` layer of the registry (G-ACTIONS §2.1).
+// The package / personal / project layers (manifest key requests,
+// `~/.ikenga/keybindings.json`, `<project>/.ikenga/keybindings.json`) are
+// merged on top of this by the effective model (WP-52); nothing here reads
+// them.
 //
 // Every entry is a binding that exists in the shipped app today (`source:
 // 'default'`), ported from the `keydown` handlers this registry replaces as
 // the label source (`workspace.tsx`, `activity-bar.tsx`) plus
-// `native-menu.ts`'s accelerators. Commands whose *handler* still lives in an
-// untouched file (`workspace.tsx` — owned by WP-20; `terminal/keybindings.ts`
-// — do-not-touch) are still registered here so `labelFor()` and `conflicts()`
-// have one source of truth for their key hints, even though nothing here
-// fires them. `rail.*` gets a live `useKey()` listener wired through this
-// registry (`activity-bar.tsx`). `palette.open` has its own listener
-// (`command-palette.tsx`) rather than `useKey()`, because closing the palette
-// must bypass the `not-input` guard that opening it observes — the palette's
-// own search input is itself a typing target, and ⌘K has always closed it
-// from there.
+// `native-menu.ts`'s accelerators. Commands whose *handler* still lives in
+// its own listener (`workspace.tsx`, `terminal/keybindings.ts` — both WP-54's
+// to migrate) are registered here so `labelFor()` and `conflicts()` have one
+// source of truth for their key hints, even though nothing here fires them.
+// `palette.open` has its own listener (`command-palette.tsx`) because closing
+// the palette must bypass the `!inputFocus` guard that opening it observes —
+// the palette's own search input is itself a typing target, and ⌘K has
+// always closed it from there (G-ACTIONS §4.6: WP-54 adds `palette.close`).
+//
+// `when` values are DEC-62 expressions (`when.ts`). The pre-v2 words map
+// one-to-one (§4.4): `global` → `always`, `not-input` → `!inputFocus`,
+// `terminal-focus` → `terminalFocus`. WP-54 applies the DEC-64 re-keys, the
+// `dispatchFocus` Companion keys, the palette close keys and the three
+// `scope: 'os'` entries; this file only carries the language migration.
 
 import type { WhenClause } from './when';
 
+/** The layer a rule comes from (G-ACTIONS §2.1). `user` is the personal
+ *  layer (`~/.ikenga/keybindings.json`); WP-52 owns this union from 12c. */
+export type KeymapSource = 'default' | 'package' | 'user' | 'project';
+
+/** `app` — dispatched in the webview; `os` — registered with
+ *  `tauri-plugin-global-shortcut` and fires with Ikenga unfocused (DEC-60,
+ *  §6). OS rules are their own conflict space (§5). */
+export type KeymapScope = 'app' | 'os';
+
 export interface KeymapEntry {
-	/** Stable command id, e.g. `rail.app`. Namespaced by owning surface. */
+	/** Stable command id, e.g. `rail.project` (the action id, §10). */
 	command: string;
-	/** Combo string — see `platform.ts` for grammar. */
+	/** Key sequence — see `platform.ts` for the grammar. One stroke, or a
+	 *  two-stroke chord (`mod+k mod+r`). */
 	key: string;
+	/** DEC-62 expression (`when.ts`). `always` fires even in text inputs;
+	 *  `!inputFocus` is the "no focus condition" default. */
 	when: WhenClause;
-	source: 'default' | 'user' | 'project';
-	/** Human label for the Shortcuts view / `?` overlay (Phase 1 doesn't ship
-	 *  the overlay itself — WP-09 — but the data belongs with the binding). */
+	source: KeymapSource;
+	/** Default `'app'`. `'os'` only in the default and personal layers. */
+	scope?: KeymapScope;
+	/** Human label for the Shortcuts view / `?` overlay. */
 	label: string;
-	/** Restricts a binding to a platform for `conflicts()` purposes — the
-	 *  native menu (and a handful of mac-only combos that collide with a
-	 *  terminal binding once `mod` resolves to the literal Ctrl key) only
-	 *  apply on macOS; `'other'` is the mirror case (`terminal.clear`'s
-	 *  non-mac chord, which is a different combo, not the same one platform-
-	 *  gated). */
+	/** Restricts a binding to one platform family (the `platform` field of
+	 *  `keybindings.json`, §1.5) — the native menu (and a handful of mac-only
+	 *  combos that collide with a terminal binding once `mod` resolves to the
+	 *  literal Ctrl key) only apply on macOS; `'other'` is the mirror case
+	 *  (`terminal.clear`'s non-mac chord, which is a different combo, not the
+	 *  same one platform-gated). */
 	platformOnly?: 'mac' | 'other';
 	/**
-	 * Command ids this entry is documented to fire *alongside* on the same
-	 * resolved key — a real, shipped parallel-fire, not a clash `conflicts()`
-	 * should report and not something to hide by fudging `when`. Checked in
-	 * either direction (declaring it on one side of the pair is enough).
-	 * Today's two: the mac `⌘T` OS-menu accelerator racing the in-app
-	 * `not-input` listener (both fire; the menu doesn't preventDefault a DOM
-	 * listener), and non-mac `Ctrl+1..6` driving both the rail and pane-focus
-	 * listeners (neither calls `stopPropagation`). Both predate this
-	 * registry — recorded here, not fixed, since WP-08 is behaviour-
-	 * preserving (WP-03 owns any real rail remap).
+	 * @deprecated Documentation only — `conflicts()` no longer reads it.
+	 * Under DEC-59 a same-key pair with different normalized `when`s is
+	 * *precedence*, reported separately, never a clash, so no suppression
+	 * table is needed. It still records the shipped parallel-fires (both
+	 * listeners run today) that DEC-64 re-keys in WP-54, which deletes it.
 	 */
 	knownOverlap?: string[];
 }
@@ -56,14 +70,15 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	// release (§2 "Retired", §7 Q2) — no entry, so nothing fires and nothing
 	// can be labelled with them.
 	// `knownOverlap` on rail.project..rail.ngwa: on non-mac, `mod+N` resolves
-	// to the literal `ctrl+N` that `pane.focus-N` (global, workspace.tsx) is
+	// to the literal `ctrl+N` that `pane.focus-N` (`always`, workspace.tsx) is
 	// also bound to. Both are live `window` keydown listeners and neither
 	// calls `stopPropagation`, so a non-mac Ctrl+1 both switches the rail AND
-	// focuses pane 1 — a shipped parallel-fire, not a clash.
+	// focuses pane 1 today. Under DEC-59 the pair is precedence (different
+	// `when`); DEC-64 re-keys pane focus to Alt+1–6 in WP-54.
 	{
 		command: 'rail.project',
 		key: 'mod+1',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Rail → Project',
 		knownOverlap: ['pane.focus-1'],
@@ -71,7 +86,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'rail.chi',
 		key: 'mod+2',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Rail → Chi',
 		knownOverlap: ['pane.focus-2'],
@@ -79,7 +94,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'rail.ngwa',
 		key: 'mod+3',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Rail → Ngwa',
 		knownOverlap: ['pane.focus-3'],
@@ -87,7 +102,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'rail.settings',
 		key: 'mod+,',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Rail → Settings',
 	},
@@ -96,7 +111,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'palette.open',
 		key: 'mod+k',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Command palette',
 	},
@@ -105,7 +120,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'palette.projects',
 		key: 'mod+p',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Project switcher',
 	},
@@ -113,7 +128,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'ngwa.create',
 		key: 'mod+n',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Ngwa → Create',
 		knownOverlap: ['menu.new-session'],
@@ -128,7 +143,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'terminal.clear',
 		key: 'mod+k',
-		when: 'terminal-focus',
+		when: 'terminalFocus',
 		source: 'default',
 		label: 'Clear terminal',
 		platformOnly: 'mac',
@@ -136,7 +151,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'terminal.clear',
 		key: 'ctrl+shift+k',
-		when: 'terminal-focus',
+		when: 'terminalFocus',
 		source: 'default',
 		label: 'Clear terminal',
 		platformOnly: 'other',
@@ -148,38 +163,38 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'pane.new-shell-terminal',
 		key: 'ctrl+t',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'New terminal',
 	},
 	{
 		command: 'pane.new-claude-terminal',
 		key: 'ctrl+shift+t',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'New Claude terminal',
 	},
 	{
 		command: 'pane.new-artifact',
 		key: 'mod+shift+n',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'New artifact',
 	},
-	// `when: 'global'`, not `'not-input'`: workspace.tsx's `\\` branch has no
-	// `inEditable` guard, so these fire while typing too — matching the
+	// `when: 'always'`, not `'!inputFocus'`: workspace.tsx's `\\` branch has
+	// no `inEditable` guard, so these fire while typing too — matching the
 	// shipped handler, not the guard the other pane bindings actually have.
 	{
 		command: 'pane.split-right',
 		key: 'mod+\\',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Split right',
 	},
 	{
 		command: 'pane.split-down',
 		key: 'mod+shift+\\',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Split down',
 	},
@@ -188,11 +203,11 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	// lives there; registered here purely as the label/conflicts source of
 	// truth (DEC-26: Explorer toggle registered once, here). `when` mirrors
 	// each handler's actual `inEditable` guard exactly — several of these
-	// (explorer.toggle, pane.focus-N) have none, so they're `global`. ---
+	// (explorer.toggle, pane.focus-N) have none, so they're `always`. ---
 	{
 		command: 'explorer.toggle',
 		key: 'mod+b',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Toggle Explorer',
 	},
@@ -203,7 +218,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'palette.views',
 		key: 'mod+t',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Command palette (views)',
 		platformOnly: 'mac',
@@ -216,7 +231,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'pane.reopen',
 		key: 'mod+shift+t',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Reopen last closed tab',
 		platformOnly: 'mac',
@@ -224,63 +239,63 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'palette.switcher',
 		key: 'mod+shift+p',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Open tabs switcher',
 	},
 	{
 		command: 'pane.close',
 		key: 'mod+w',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Close pane',
 	},
 	{
 		command: 'tab.close',
 		key: 'mod+shift+w',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Close tab',
 	},
 	{
 		command: 'pane.focus-1',
 		key: 'ctrl+1',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 1',
 	},
 	{
 		command: 'pane.focus-2',
 		key: 'ctrl+2',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 2',
 	},
 	{
 		command: 'pane.focus-3',
 		key: 'ctrl+3',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 3',
 	},
 	{
 		command: 'pane.focus-4',
 		key: 'ctrl+4',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 4',
 	},
 	{
 		command: 'pane.focus-5',
 		key: 'ctrl+5',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 5',
 	},
 	{
 		command: 'pane.focus-6',
 		key: 'ctrl+6',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Focus pane 6',
 	},
@@ -291,32 +306,32 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	// dispatch input's own `onKeyDown` (they only mean anything while it holds
 	// focus); they are registered so the hint row reads them from here.
 	// ⌘⇧A (spec §2 "focus the dispatch input") is NOT bound: on macOS it is
-	// already `session.switch-adapter` (a `global` native-menu accelerator).
+	// already `session.switch-adapter` (an `always` native-menu accelerator).
 	{
 		command: 'companion.toggle',
 		key: 'mod+j',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Toggle Companion',
 	},
 	{
 		command: 'companion.send',
 		key: 'enter',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Companion → send to target',
 	},
 	{
 		command: 'companion.new-run',
 		key: 'shift+enter',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Companion → start a new run',
 	},
 	{
 		command: 'companion.persistent-run',
 		key: 'alt+enter',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Companion → start a persistent run',
 	},
@@ -324,17 +339,16 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	// --- Native menu (src/shell/native-menu.ts) — macOS-only. These are OS
 	// Menu accelerators, not a DOM `keydown` listener: the platform menu bar
 	// fires them regardless of which element has focus in the webview, so
-	// `when: 'global'` (not `'not-input'`) is what actually ships. `global`
-	// overlaps every other `when` for `conflicts()` purposes, so
-	// `menu.new-terminal` (⌘T) DOES flag against `palette.views` (also ⌘T,
-	// `not-input`) unless declared via `knownOverlap` below — which is the
-	// honest description: the OS accelerator fires unconditionally, in
-	// parallel with (not instead of) whatever the in-app `not-input`
-	// listener does, and today's app ships exactly that double-fire.
+	// `when: 'always'` (not `'!inputFocus'`) is what actually ships. Under
+	// DEC-59, `menu.new-terminal` (⌘T, `always`) vs `palette.views` (⌘T,
+	// `!inputFocus`) is *precedence* — listed by `conflicts()` separately,
+	// never a clash. Today both fire (the OS accelerator does not stop the DOM
+	// listener); DEC-58's accelerator dedupe and the DEC-64 re-key land in
+	// WP-54.
 	{
 		command: 'menu.new-session',
 		key: 'mod+n',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'New Session',
 		platformOnly: 'mac',
@@ -343,7 +357,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'menu.open-file',
 		key: 'mod+o',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Open File…',
 		platformOnly: 'mac',
@@ -351,7 +365,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'menu.open-project-folder',
 		key: 'mod+shift+o',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Open Project Folder…',
 		platformOnly: 'mac',
@@ -359,7 +373,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'menu.new-terminal',
 		key: 'mod+t',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'New Terminal (menu)',
 		platformOnly: 'mac',
@@ -368,7 +382,7 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'session.switch-adapter',
 		key: 'mod+shift+a',
-		when: 'global',
+		when: 'always',
 		source: 'default',
 		label: 'Switch Adapter (coming soon)',
 		platformOnly: 'mac',
@@ -380,19 +394,19 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	// (command-palette.tsx), next to `palette.open`'s, because the palette's
 	// open state is owned there. `?` is matched on `e.key` with Shift ignored
 	// (it needs Shift on some layouts and not on others), so it is not wired
-	// through `useKey()`; both are `not-input` — `?` must type a literal `?`
+	// through `useKey()`; both are `!inputFocus` — `?` must type a literal `?`
 	// into a text field, and `⌘/` is "toggle comment" inside code editors. ---
 	{
 		command: 'shortcuts.open',
 		key: 'mod+/',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Keyboard shortcuts',
 	},
 	{
 		command: 'shortcuts.open-quick',
 		key: '?',
-		when: 'not-input',
+		when: '!inputFocus',
 		source: 'default',
 		label: 'Keyboard shortcuts (outside text fields)',
 	},
