@@ -9,7 +9,7 @@
 // outer `.surface` wrapper still says `keys` (item 19 mount contract — it has
 // no way to know about clashes), so both attributes are in the DOM at once.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, FileText, RotateCcw, Search, Shield, X } from 'lucide-react';
 import { useSearch } from '@tanstack/react-router';
 import { Button } from '@/components/ui/button';
@@ -29,7 +29,7 @@ import {
 } from '@/lib/actions/store';
 import { chordsByPrefix, chordPrefixDelays } from '@/lib/keymap/chord';
 import { getOsShortcutStatuses, subscribeOsShortcutStatuses } from '@/lib/keymap/dispatcher';
-import { isMacPlatform, resolveCombo, splitKeySequence, validateKeySequence } from '@/lib/keymap/platform';
+import { formatKeyLabel, isMacPlatform, resolveCombo, splitKeySequence, validateKeySequence } from '@/lib/keymap/platform';
 import type { KeymapPlatform } from '@/lib/keymap/registry';
 import { NgwaTrustSheet } from '@/shell/ngwa/ngwa-trust-sheet';
 import { KeyRecorder } from '../shared/key-recorder';
@@ -38,12 +38,14 @@ import type { ActionsSurfaceProps } from '../types';
 import {
 	buildKeyRows,
 	conflictsForRow,
+	isScopeOverride,
 	type KeyRow,
 	matchesKey,
 	matchesQuery,
 	otherEntry,
 	whenLabel,
 } from './rows';
+import './keys.css';
 
 function actionsErrorMessage(err: unknown): string {
 	if (
@@ -100,7 +102,7 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 	const mac = previewPlatform === 'mac';
 	const osStatuses = useOsShortcutStatuses();
 
-	const rows = useMemo(() => buildKeyRows(model, previewPlatform), [model, previewPlatform]);
+	const rows = useMemo(() => buildKeyRows(model, previewPlatform, scope), [model, previewPlatform, scope]);
 	const conflicts = model.keymap.conflicts[previewPlatform];
 
 	// DEC-57: the rows the palette-delay warning marks — a single-stroke
@@ -112,10 +114,18 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 	}, [rows, mac]);
 
 	// Deep link from the Actions detail pane's Rebind… button (`?action=<id>`).
+	// Applied once per id: `rows` gets a new reference on every model publish
+	// (including the one this same edit triggers on save), so gating only on
+	// `search.action` unchanged would reopen the recorder right after a
+	// successful commit. The ref remembers which id this surface already
+	// acted on; it's set only once the row actually exists to act on.
+	const consumedDeepLinkRef = useRef<string | null>(null);
 	useEffect(() => {
-		if (!search?.action) return;
+		if (!search?.action || consumedDeepLinkRef.current === search.action) return;
 		const target = rows.find((r) => r.command === search.action && r.kind !== 'held');
-		if (target) setEditingRowId(target.rowId);
+		if (!target) return;
+		consumedDeepLinkRef.current = search.action;
+		setEditingRowId(target.rowId);
 	}, [search?.action, rows]);
 
 	const filtered = useMemo(() => {
@@ -124,7 +134,10 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 	}, [rows, textQuery, keyQuery, previewPlatform]);
 
 	const boundCount = rows.filter((r) => r.kind === 'bound').length;
-	const yoursCount = rows.filter((r) => r.kind === 'bound' && (r.source === 'personal' || r.source === 'project')).length;
+	// D-06's own "N changed" footer count (`actions.html:~3454`) — only this
+	// scope's own overrides, the same gate `isScopeOverride` uses for the
+	// row's "changed" chip and its Reset button (WP-60 review, HIGH).
+	const changedCount = rows.filter((r) => isScopeOverride(r, scope)).length;
 	// `conflicts()` already yields each clashing pair once (`i < j` over the
 	// same-key group), so its length is the pair count directly.
 	const clashCount = conflicts.clashes.length;
@@ -139,11 +152,35 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 		return osStatuses.find((s) => s.command === row.command && s.key === row.key);
 	}
 
+	// DEC-57: the palette-delay warning — only once the write it warns about
+	// has actually landed (WP-60 review, conformance: a warning for a write
+	// that then throws would be a lie), so every call site awaits its store
+	// call first and only then asks this whether to warn.
+	function chordDelayWarning(row: KeyRow, combo: string, excludeEntry: EffectiveKeymapEntry | undefined): string | null {
+		if (validateKeySequence(combo) !== null) return null;
+		const strokes = splitKeySequence(combo);
+		if (strokes.length !== 2) return null;
+		const firstResolved = resolveCombo(strokes[0], mac);
+		const others = rows
+			.filter((r): r is KeyRow & { entry: EffectiveKeymapEntry } => r.kind === 'bound' && !!r.entry && r.entry !== excludeEntry)
+			.map((r) => r.entry);
+		const already = (chordsByPrefix(others, mac).get(firstResolved)?.length ?? 0) > 0;
+		if (already) return null;
+		return `${row.label} now starts with a chord: ${formatKeyLabel(firstResolved, { mac })} waits up to 900 ms for a second key — this delays every other command on that stroke, including the command palette.`;
+	}
+
 	async function commitRecord(row: KeyRow, combo: string) {
 		setRowError(null);
 		try {
 			if (row.kind === 'requested') {
-				if (combo) await addKeybinding(scope, { key: combo, command: row.command });
+				if (combo) {
+					// §7.3's derived `when` — kept on the bind request path too
+					// (WP-60 review, MEDIUM), same as the request already carries.
+					const when = row.request?.when;
+					await addKeybinding(scope, { key: combo, command: row.command, ...(when && when !== 'always' ? { when } : {}) });
+					const warning = chordDelayWarning(row, combo, undefined);
+					if (warning) setNotice(warning);
+				}
 				setEditingRowId(null);
 				return;
 			}
@@ -154,24 +191,9 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 				setEditingRowId(null);
 				return;
 			}
-			// DEC-57: warn the moment this rebind creates the *first* chord for
-			// this prefix — before it, that stroke resolved at once.
-			if (validateKeySequence(combo) === null) {
-				const strokes = splitKeySequence(combo);
-				if (strokes.length === 2) {
-					const firstResolved = resolveCombo(strokes[0], mac);
-					const others = rows
-						.filter((r): r is KeyRow & { entry: EffectiveKeymapEntry } => r.kind === 'bound' && !!r.entry && r.entry !== entry)
-						.map((r) => r.entry);
-					const already = (chordsByPrefix(others, mac).get(firstResolved)?.length ?? 0) > 0;
-					if (!already) {
-						setNotice(
-							`${row.label} now starts with a chord: ${firstResolved.toUpperCase()} waits up to 900 ms for a second key — this delays every other command on that stroke, including the command palette.`
-						);
-					}
-				}
-			}
 			await rebindKey(scope, entry, combo);
+			const warning = chordDelayWarning(row, combo, entry);
+			if (warning) setNotice(warning);
 			setEditingRowId(null);
 		} catch (err) {
 			setRowError({ rowId: row.rowId, message: actionsErrorMessage(err) });
@@ -243,7 +265,8 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 		setKeyQuery(combo);
 		setTextQuery('');
 		const holder = keyHolder(combo, previewPlatform);
-		setNotice(holder ? `${combo.toUpperCase()} is taken` : `${combo.toUpperCase()} is free`);
+		const label = formatKeyLabel(combo, { mac });
+		setNotice(holder ? `${label} is taken` : `${label} is free`);
 	}
 
 	useEffect(() => {
@@ -251,6 +274,19 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 		const t = setTimeout(() => setNotice(null), 5000);
 		return () => clearTimeout(t);
 	}, [notice]);
+
+	// D-06's Edit auto-starts the recorder (WP-60 review, conformance):
+	// there is no imperative handle on the shared `KeyRecorder` to start it
+	// with, so — the same trick the design's own vanilla-JS renderer uses
+	// (`makeRecorder(rec, …); setTimeout(() => rec.click(), 0)`) — this finds
+	// the one recorder button that just mounted for the row now editing and
+	// clicks it once, in effect (never touches `shared/key-recorder.tsx`).
+	const tableRef = useRef<HTMLTableElement>(null);
+	useEffect(() => {
+		if (!editingRowId) return;
+		const btn = tableRef.current?.querySelector<HTMLButtonElement>('[data-active-recorder] button.rec');
+		btn?.click();
+	}, [editingRowId]);
 
 	const dataState = hasClash ? 'conflict' : 'keys';
 
@@ -332,7 +368,7 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 			)}
 
 			<div className="sc" style={{ flex: 1, minHeight: 0 }}>
-				<table className="keys">
+				<table className="keys" ref={tableRef}>
 					<thead>
 						<tr>
 							<th>Command</th>
@@ -364,6 +400,7 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 									row={row}
 									mac={mac}
 									hard={hard}
+									isOverride={isScopeOverride(row, scope)}
 									clashes={rc.clashes}
 									precedence={rc.precedence}
 									editing={editing}
@@ -400,7 +437,7 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 				<FileText className="h-3.5 w-3.5" />
 				<span>
 					One registry — <span className="mono">{keybindingsPathLabel(scope, model.projectRoot)}</span> overrides the
-					built-in map. {boundCount} bindings · {yoursCount} yours · {clashCount} conflict{clashCount === 1 ? '' : 's'}{' '}
+					built-in map. {boundCount} bindings · {changedCount} changed · {clashCount} conflict{clashCount === 1 ? '' : 's'}{' '}
 					· chords such as <span className="mono">⌘K ⌘R</span> are supported.
 				</span>
 			</div>
@@ -420,6 +457,7 @@ interface KeyTableRowProps {
 	row: KeyRow;
 	mac: boolean;
 	hard: boolean;
+	isOverride: boolean;
 	clashes: ReturnType<typeof conflictsForRow>['clashes'];
 	precedence: ReturnType<typeof conflictsForRow>['precedence'];
 	editing: boolean;
@@ -445,6 +483,7 @@ function KeyTableRow({
 	row,
 	mac,
 	hard,
+	isOverride,
 	clashes,
 	precedence,
 	editing,
@@ -466,7 +505,6 @@ function KeyTableRow({
 	onTrust,
 }: KeyTableRowProps) {
 	const rowClass = editing ? 'editing' : hard ? 'clash' : row.kind === 'held' ? 'held' : '';
-	const isOverride = row.kind === 'bound' && (row.source === 'personal' || row.source === 'project');
 	// Bound once so every reference below (including inside the `onClick`
 	// closures) narrows to `EffectiveKeymapEntry`, not `EffectiveKeymapEntry |
 	// undefined` — TS does not keep `row.entry`'s narrowing across a closure.
@@ -479,9 +517,10 @@ function KeyTableRow({
 					{row.command !== row.label && <span className="cmdid mono">{row.command}</span>}
 					{row.kind === 'requested' && <span className="pchip">requested</span>}
 					{row.kind === 'held' && <span className="pchip danger">held until trusted</span>}
-					{isOverride && <span className="pchip">yours</span>}
+					{row.kind === 'unbound' && <span className="pchip">unbound here</span>}
+					{isOverride && <span className="newchip">changed</span>}
 				</td>
-				<td className="c-key">
+				<td className="c-key" data-active-recorder={editing || undefined}>
 					{row.kind === 'requested' ? (
 						editing ? (
 							<KeyRecorder size="sm" onRecord={onRecord} onCancel={onCancelEdit} />
@@ -495,6 +534,13 @@ function KeyTableRow({
 								)}
 							</span>
 						)
+					) : row.kind === 'unbound' ? (
+						<span className="reqkey">
+							<Kbd combo={null} mac={mac} empty="unbound" />
+							<span className="heldby">
+								was <Kbd combo={row.key} mac={mac} />
+							</span>
+						</span>
 					) : editing ? (
 						<KeyRecorder size="sm" value={row.key} onRecord={onRecord} onCancel={onCancelEdit} />
 					) : (
@@ -518,9 +564,7 @@ function KeyTableRow({
 						</span>
 						{row.osWide && <span className="pchip">OS-wide</span>}
 						{osStatus && !osStatus.registered && (
-							<span className="pchip danger" title={osStatus.reason ?? undefined}>
-								not registered
-							</span>
+							<span className="pchip danger">not registered{osStatus.reason ? `: ${osStatus.reason}` : ''}</span>
 						)}
 					</span>
 				</td>
@@ -535,6 +579,10 @@ function KeyTableRow({
 								Bind a key…
 							</button>
 						)
+					) : row.kind === 'unbound' ? (
+						<button type="button" className="chip" onClick={onReset}>
+							Reset
+						</button>
 					) : (
 						<>
 							<button type="button" className="chip" disabled={!canEdit} onClick={editing ? onCancelEdit : onStartEdit}>
@@ -581,7 +629,12 @@ function KeyTableRow({
 								)}
 							</span>
 							<span className="rt">
-								<button type="button" className="chip" onClick={() => onUnbindOther(otherEntry(clashes[0], clashEntry))}>
+								<button
+									type="button"
+									className="chip"
+									disabled={!canEdit}
+									onClick={() => onUnbindOther(otherEntry(clashes[0], clashEntry))}
+								>
 									Unbind the other
 								</button>
 								{restricting ? (
@@ -593,20 +646,26 @@ function KeyTableRow({
 											onChange={(e) => setRestrictValue(e.target.value)}
 											placeholder="a narrower when, e.g. filesFocus"
 											aria-label="Restrict this binding's when"
+											disabled={!canEdit}
 										/>
-										<button type="button" className="chip" onClick={onSubmitRestrict}>
+										<button type="button" className="chip" disabled={!canEdit} onClick={onSubmitRestrict}>
 											Save
 										</button>
-										<button type="button" className="chip" onClick={onCancelRestrict}>
+										<button type="button" className="chip" disabled={!canEdit} onClick={onCancelRestrict}>
 											Cancel
 										</button>
 									</>
 								) : (
-									<button type="button" className="chip" onClick={onStartRestrict}>
-										Restrict to…
-									</button>
+									// E_OS_WHEN (§6): an OS row's `when` is ignored — always
+									// `always` — so "restrict to a narrower when" can never
+									// apply to it (WP-60 review, conformance).
+									!row.osWide && (
+										<button type="button" className="chip" disabled={!canEdit} onClick={onStartRestrict}>
+											Restrict to…
+										</button>
+									)
 								)}
-								<button type="button" className="chip" onClick={onStartEdit}>
+								<button type="button" className="chip" disabled={!canEdit} onClick={onStartEdit}>
 									Choose another key
 								</button>
 							</span>

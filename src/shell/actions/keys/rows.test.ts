@@ -17,7 +17,7 @@ import type {
 	TrustState,
 	UserAction,
 } from '@/lib/actions/types';
-import { buildKeyRows, conflictsForRow, matchesKey, matchesQuery, otherEntry, whenLabel } from './rows';
+import { buildKeyRows, conflictsForRow, isScopeOverride, matchesKey, matchesQuery, otherEntry, whenLabel } from './rows';
 
 // ─── Fixtures (mirrors `src/lib/actions/merge.test.ts`) ────────────────────
 
@@ -94,7 +94,7 @@ function model(input: Partial<MergeInput> = {}) {
 describe('buildKeyRows', () => {
 	it('with no files and no packages, every row is `bound` and comes from the defaults', () => {
 		const m = model();
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		expect(rows.length).toBeGreaterThan(0);
 		expect(rows.every((r) => r.kind === 'bound')).toBe(true);
 		expect(rows.every((r) => r.source === 'default')).toBe(true);
@@ -105,7 +105,7 @@ describe('buildKeyRows', () => {
 			// `mod+b` is `explorer.toggle`'s default — nothing frees it.
 			packages: [pkgAction({ pkgId: 'com.x', localId: 'stage', keyRequest: 'mod+b' })],
 		});
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const requested = rows.find((r) => r.command === 'com.x:stage');
 		expect(requested?.kind).toBe('requested');
 		expect(requested?.key).toBeNull();
@@ -117,7 +117,7 @@ describe('buildKeyRows', () => {
 		const m = model({
 			packages: [pkgAction({ pkgId: 'com.x', localId: 'stage', keyRequest: 'mod+shift+g' })],
 		});
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const bound = rows.find((r) => r.command === 'com.x:stage');
 		expect(bound?.kind).toBe('bound');
 		expect(bound?.key).toBe('mod+shift+g');
@@ -130,7 +130,7 @@ describe('buildKeyRows', () => {
 			{ key: 'mod+w', command: '-pane.close' },
 		];
 		const m = model({ files: makeFiles({ projectBindings, projectTrust: 'untrusted' }) });
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const held = rows.filter((r) => r.kind === 'held');
 		expect(held).toHaveLength(2);
 		expect(held.map((r) => r.command)).toEqual(['delete', 'pane.close']);
@@ -148,7 +148,7 @@ describe('buildKeyRows', () => {
 				projectTrust: 'trusted',
 			}),
 		});
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		expect(rows.some((r) => r.kind === 'held')).toBe(false);
 		const bound = rows.find((r) => r.command === 'ours');
 		expect(bound).toMatchObject({ kind: 'bound', source: 'project', key: 'mod+shift+u' });
@@ -174,7 +174,7 @@ describe('whenLabel', () => {
 describe('matchesQuery / matchesKey', () => {
 	it('matchesQuery is a case-insensitive substring match over label, command, key and when', () => {
 		const m = model();
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const row = rows.find((r) => r.command === 'explorer.toggle');
 		expect(row).toBeDefined();
 		if (!row) return;
@@ -185,7 +185,7 @@ describe('matchesQuery / matchesKey', () => {
 
 	it('matchesKey compares canonical, platform-resolved sequences, not spelling', () => {
 		const m = model();
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const row = rows.find((r) => r.command === 'explorer.toggle');
 		expect(row).toBeDefined();
 		if (!row) return;
@@ -210,7 +210,7 @@ describe('conflictsForRow / otherEntry', () => {
 				personalBindings: [{ key: 'mod+b', command: 'mine' }],
 			}),
 		});
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const conflicts = m.keymap.conflicts.mac;
 		const mine = rows.find((r) => r.command === 'mine');
 		expect(mine).toBeDefined();
@@ -223,12 +223,89 @@ describe('conflictsForRow / otherEntry', () => {
 
 	it('a row with no clash returns empty arrays', () => {
 		const m = model();
-		const rows = buildKeyRows(m, 'mac');
+		const rows = buildKeyRows(m, 'mac', 'personal');
 		const row = rows.find((r) => r.command === 'pane.close');
 		expect(row).toBeDefined();
 		if (!row) return;
 		const rc = conflictsForRow(row, m.keymap.conflicts.mac);
 		expect(rc.clashes).toEqual([]);
 		expect(rc.precedence).toEqual([]);
+	});
+});
+
+// ─── isScopeOverride (WP-60 review, HIGH) ───────────────────────────────────
+// Reset must never touch a scope other than the one selected in the Keys
+// tab: `resetKeyOverride(scope, …)` edits only that scope's own file, so
+// gating "yours"/Reset on `row.source` alone (the layer that *wrote* the
+// effective entry, not which scope's file the UI currently has open) could
+// silently rewrite the wrong file.
+
+describe('isScopeOverride', () => {
+	it('is true only for the scope whose own file wrote the override, not the layer name alone', () => {
+		const m = model({
+			files: makeFiles({
+				personalActions: { version: 1, actions: [userAction('mine', 'personal')] },
+				personalBindings: [{ key: 'mod+shift+u', command: 'mine' }],
+			}),
+		});
+		const rows = buildKeyRows(m, 'mac', 'personal');
+		const row = rows.find((r) => r.command === 'mine');
+		expect(row).toBeDefined();
+		if (!row) return;
+		// The scope that actually wrote it — Reset is safe here.
+		expect(isScopeOverride(row, 'personal')).toBe(true);
+		// The same row with the Keys tab's *other* scope selected:
+		// `resetKeyOverride('project', …)` would edit the project file, which
+		// never had this rule, so Reset must not be offered.
+		expect(isScopeOverride(row, 'project')).toBe(false);
+	});
+
+	it('is false for a default (built-in) row in either scope', () => {
+		const m = model();
+		const rows = buildKeyRows(m, 'mac', 'personal');
+		const row = rows.find((r) => r.command === 'pane.close');
+		expect(row).toBeDefined();
+		if (!row) return;
+		expect(isScopeOverride(row, 'personal')).toBe(false);
+		expect(isScopeOverride(row, 'project')).toBe(false);
+	});
+});
+
+// ─── `unbound` rows from negative rules (WP-60 review, MEDIUM, §1.5) ───────
+// A negative rule that removes something had no row at all before this fix
+// — invisible in the table, so the only way to undo it was to hand-edit the
+// JSON file (or wipe every override with Reset all).
+
+describe('buildKeyRows — unbound rows', () => {
+	it('a negative rule that actually removes a binding gets its own `unbound` row, scoped to the file that wrote it', () => {
+		const m = model({
+			files: makeFiles({
+				// `mod+b` is `explorer.toggle`'s default (`when: 'always'`) — an
+				// unqualified negative rule on the same key removes it (§1.5).
+				personalBindings: [{ key: 'mod+b', command: '-explorer.toggle' }],
+			}),
+		});
+		const personalRows = buildKeyRows(m, 'mac', 'personal');
+		const unbound = personalRows.find((r) => r.kind === 'unbound' && r.command === 'explorer.toggle');
+		expect(unbound).toBeDefined();
+		expect(unbound?.key).toBe('mod+b');
+		expect(unbound?.source).toBe('personal');
+		// The default binding is actually gone, not merely shadowed.
+		expect(personalRows.some((r) => r.kind === 'bound' && r.command === 'explorer.toggle')).toBe(false);
+
+		// The Keys tab viewing `project` scope must not surface personal's own
+		// negative rule — there is nothing of project's to Reset here.
+		const projectRows = buildKeyRows(m, 'mac', 'project');
+		expect(projectRows.some((r) => r.kind === 'unbound')).toBe(false);
+	});
+
+	it('a negative rule that removes nothing (already `W_NEGATIVE_NOOP`) gets no row', () => {
+		const m = model({
+			files: makeFiles({
+				personalBindings: [{ key: 'mod+z', command: '-explorer.toggle' }],
+			}),
+		});
+		const rows = buildKeyRows(m, 'mac', 'personal');
+		expect(rows.some((r) => r.kind === 'unbound')).toBe(false);
 	});
 });

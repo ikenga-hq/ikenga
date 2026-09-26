@@ -7,15 +7,26 @@
 // equality — it reads `model.keymap.conflicts[platform]`, which is already
 // computed over normalized `when`s (WP-49/52).
 
-import type { EffectiveAction, EffectiveModel, HeldKeybinding, KeyHolder, PackageKeyRequest } from '@/lib/actions/store';
+import type {
+	ActionsScope,
+	EffectiveAction,
+	EffectiveModel,
+	HeldKeybinding,
+	KeybindingRule,
+	KeyHolder,
+	NegativeRuleResult,
+	PackageKeyRequest,
+} from '@/lib/actions/store';
 import type { KeymapConflictPair, KeymapConflicts, KeymapPlatform } from '@/lib/keymap/registry';
 import { comparableKeySequence, entriesForPlatform, type EffectiveKeymapEntry } from '@/lib/keymap/registry';
 
-export type KeyRowKind = 'bound' | 'requested' | 'held';
+export type KeyRowKind = 'bound' | 'requested' | 'held' | 'unbound';
 
 /** One row of the Keys table. `kind` decides which fields are set:
  *  `bound` → `entry`; `requested` → `request` (+ `heldBy` when lost);
- *  `held` → `held` (DEC-65, never in `entries`). */
+ *  `held` → `held` (DEC-65, never in `entries`); `unbound` → `negative`, a
+ *  scope's own negative rule that actually removes something (§1.5) — the
+ *  only way that rule is otherwise visible is the raw JSON file. */
 export interface KeyRow {
 	kind: KeyRowKind;
 	rowId: string;
@@ -31,15 +42,31 @@ export interface KeyRow {
 	request?: PackageKeyRequest;
 	heldBy?: KeyHolder;
 	held?: HeldKeybinding;
+	negative?: NegativeRuleResult;
 }
 
-function heldCommand(rule: HeldKeybinding['rule']): string {
+function heldCommand(rule: KeybindingRule): string {
 	return rule.command.startsWith('-') ? rule.command.slice(1) : rule.command;
 }
 
+/** Whether `row` is an override the given `scope` itself wrote (its own
+ *  `keybindings.json`) — the only case a Reset is safe to show:
+ *  `resetKeyOverride(scope, …)` (`@/lib/actions/store`) edits only that
+ *  scope's own file, so gating on `row.source` alone (which layer wrote the
+ *  *effective* entry, not which scope's file the UI is currently editing)
+ *  could offer Reset for another scope's override and silently touch the
+ *  wrong file (WP-60 review, HIGH). */
+export function isScopeOverride(row: KeyRow, scope: ActionsScope): boolean {
+	return row.kind === 'bound' && row.entry?.origin?.scope === scope;
+}
+
 /** Builds every row for `platform` — bound entries first (merge order),
- *  then package requests that never got their key, then held project rules. */
-export function buildKeyRows(model: EffectiveModel, platform: KeymapPlatform): KeyRow[] {
+ *  then package requests that never got their key, then `scope`'s own
+ *  negative rules that remove something (`unbound`), then held project
+ *  rules. `scope` is the tab's currently-edited scope (personal/project) —
+ *  negatives are scoped to it (WP-60 review, MEDIUM) so a resettable
+ *  "unbound here" row never mixes the other scope's file in. */
+export function buildKeyRows(model: EffectiveModel, platform: KeymapPlatform, scope: ActionsScope): KeyRow[] {
 	const rows: KeyRow[] = [];
 
 	for (const entry of entriesForPlatform(model.keymap.entries, platform)) {
@@ -77,6 +104,28 @@ export function buildKeyRows(model: EffectiveModel, platform: KeymapPlatform): K
 			osWide: false,
 			request,
 			heldBy: status.status === 'held' ? status.heldBy : undefined,
+		});
+	}
+
+	// §1.5 "unbound here": a negative rule this scope wrote that actually
+	// removes a survivor (`removed > 0` — a no-op negative is already
+	// `W_NEGATIVE_NOOP` in `issues`, not worth its own row). Reset calls
+	// `resetKeyOverride(scope, command)`, same as any other override.
+	for (const negative of model.keymap.negatives) {
+		if (negative.scope !== scope || negative.removed === 0) continue;
+		const command = heldCommand(negative.rule);
+		const action = model.actionById.get(command);
+		rows.push({
+			kind: 'unbound',
+			rowId: `unbound:${negative.scope}:${negative.index}`,
+			command,
+			label: action?.name ?? command,
+			action,
+			key: negative.rule.key,
+			when: negative.rule.when ?? 'always',
+			source: negative.scope,
+			osWide: negative.rule.scope === 'os',
+			negative,
 		});
 	}
 
