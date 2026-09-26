@@ -14,6 +14,8 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { viewLabel, viewSubtitle } from './pane-views';
 import { viewWorkspace } from './tab-workspace';
@@ -41,6 +43,8 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	// Names terminal tabs by what they're running and where — `claude · shell`
 	// rather than N tabs all reading "Terminal".
 	const resolveTerminal = useTerminalTitles();
+
+	const tabMenu = useEffectiveMenu('tab');
 
 	// Close every closable (non-pinned) tab except `keepIdx`. Read fresh state
 	// and close in DESCENDING index order so earlier closes never shift the
@@ -207,69 +211,60 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 									}
 								/>
 							</ContextMenuTrigger>
-							<ContextMenuContent>
-								{tab.kind === 'artifact' && (
-									<>
-										<ContextMenuItem onSelect={() => setPinPath(tab.path)}>
-											Pin to sidebar…
-										</ContextMenuItem>
-										<ContextMenuSeparator />
-									</>
-								)}
-								<ContextMenuItem onSelect={() => toggleTabPinned(leaf.id, idx)}>
-									{isPinned ? 'Unpin tab' : 'Pin tab'}
-								</ContextMenuItem>
-								<ContextMenuSeparator />
-								{/* §6A.10 — the single-pointer alternative to drag-reorder
-								    that WCAG 2.5.7 requires (roving-tablist ⌃⇧←/→ is the
-								    keyboard one; a keyboard alternative alone doesn't
-								    satisfy 2.5.7, so this menu path is the pointer one). */}
-								<ContextMenuItem disabled={idx === 0} onSelect={() => reorderTab(leaf.id, idx, idx - 1)}>
-									Move left
-								</ContextMenuItem>
-								<ContextMenuItem
-									disabled={idx === leaf.tabs.length - 1}
-									onSelect={() => reorderTab(leaf.id, idx, idx + 1)}
-								>
-									Move right
-								</ContextMenuItem>
-								{/* §6A.2 — the only tab-level path to a split: moving the
-								    tab to a new pane is a move whose side effect is a
-								    split. Split itself isn't offered here (⋯ menu, drag,
-								    ⌘\ / ⌘⇧\ only). Needs a second tab in this leaf — moving
-								    a leaf's only tab would just close the leaf it came
-								    from with nothing left to keep (pane-reducer.ts guard). */}
-								<ContextMenuItem
-									disabled={leaf.tabs.length < 2}
-									onSelect={() => moveTab(leaf.id, idx, leaf.id, 'right')}
-								>
-									Move to new pane (right)
-								</ContextMenuItem>
-								<ContextMenuItem
-									disabled={leaf.tabs.length < 2}
-									onSelect={() => moveTab(leaf.id, idx, leaf.id, 'bottom')}
-								>
-									Move to new pane (down)
-								</ContextMenuItem>
-								{(tab.kind === 'artifact' || tab.kind === 'route') && (
-									<>
-										<ContextMenuSeparator />
-										<ContextMenuItem
-											onSelect={() => void writeClipboardText(tab.path).catch(() => {})}
-										>
-											Copy path
-										</ContextMenuItem>
-									</>
-								)}
-								<ContextMenuSeparator />
-								<ContextMenuItem disabled={isPinned} onSelect={() => closeTab(leaf.id, idx)}>
-									Close
-								</ContextMenuItem>
-								<ContextMenuItem onSelect={() => closeOthers(idx)}>Close others</ContextMenuItem>
-								<ContextMenuItem onSelect={() => closeToRight(idx)}>
-									Close to the right
-								</ContextMenuItem>
-							</ContextMenuContent>
+							{(() => {
+								const rows = resolveMenuItems(tabMenu, {
+									conditions: { 'artifact-tab': tab.kind === 'artifact' },
+									// §6A.10 — the single-pointer alternative to drag-reorder
+									// that WCAG 2.5.7 requires.
+									disabled: (id) =>
+										id === 'tab.move-left'
+											? idx === 0
+											: id === 'tab.move-right'
+												? idx === leaf.tabs.length - 1
+												: id === 'tab.move-to-new-pane-right' || id === 'tab.move-to-new-pane-down'
+													? leaf.tabs.length < 2
+													: id === 'tab.close'
+														? isPinned
+														: false,
+									handlers: {
+										'pin-sidebar': () => {
+											if (tab.kind === 'artifact') setPinPath(tab.path);
+										},
+										'tab.toggle-pin': () => toggleTabPinned(leaf.id, idx),
+										'tab.move-left': () => reorderTab(leaf.id, idx, idx - 1),
+										'tab.move-right': () => reorderTab(leaf.id, idx, idx + 1),
+										'tab.move-to-new-pane-right': () => moveTab(leaf.id, idx, leaf.id, 'right'),
+										'tab.move-to-new-pane-down': () => moveTab(leaf.id, idx, leaf.id, 'bottom'),
+										'copy-path': () => {
+											if (tab.kind === 'artifact' || tab.kind === 'route') {
+												void writeClipboardText(tab.path).catch(() => {});
+											}
+										},
+										'tab.close': () => closeTab(leaf.id, idx),
+										'tab.close-others': () => closeOthers(idx),
+										'tab.close-to-right': () => closeToRight(idx),
+									},
+								});
+								return (
+									<ContextMenuContent>
+										{rows.map((row, i) =>
+											row.kind === 'separator' ? (
+												// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+												<ContextMenuSeparator key={`sep-${i}`} />
+											) : (
+												<ContextMenuItem
+													key={row.id}
+													disabled={row.disabled}
+													variant={row.danger ? 'destructive' : undefined}
+													onSelect={row.run}
+												>
+													{row.id === 'tab.toggle-pin' ? (isPinned ? 'Unpin tab' : 'Pin tab') : row.label}
+												</ContextMenuItem>
+											)
+										)}
+									</ContextMenuContent>
+								);
+							})()}
 						</ContextMenu>
 					);
 				})}

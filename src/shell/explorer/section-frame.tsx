@@ -1,6 +1,6 @@
 import type React from 'react';
 import type { ReactNode } from 'react';
-import { ChevronDown, ChevronRight, EyeOff, ArrowUp, ArrowDown, FoldVertical } from 'lucide-react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import {
 	ContextMenu,
 	ContextMenuContent,
@@ -8,6 +8,8 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import type { ExplorerSectionDefinition, ExplorerSectionContext } from './section-registry';
 
 interface SectionFrameProps {
@@ -54,6 +56,18 @@ export function SectionFrame({
 
 	const ariaLabel = `${section.title}${count !== undefined ? `, ${count} items` : ''}`;
 
+	const sectionMenu = useEffectiveMenu(`section/${section.id}`);
+	const menuRows = resolveMenuItems(sectionMenu, {
+		handlers: {
+			'section.collapse-others': () => onCollapseOthers?.(),
+			'section.hide': () => onHideSection?.(),
+			'section.move-up': () => onMoveUp?.(),
+			'section.move-down': () => onMoveDown?.(),
+		},
+		disabled: (id) =>
+			id === 'section.move-up' ? !canMoveUp : id === 'section.move-down' ? !canMoveDown : false,
+	});
+
 	return (
 		<div className="flex flex-col border-b border-border last:border-b-0" data-explorer-section={section.id}>
 			<ContextMenu>
@@ -87,26 +101,20 @@ export function SectionFrame({
 						)}
 					</button>
 				</ContextMenuTrigger>
-				<ContextMenuContent>
-					<ContextMenuItem onSelect={() => onCollapseOthers?.()}>
-						<FoldVertical className="h-3.5 w-3.5 mr-2" />
-						Collapse others
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem onSelect={() => onHideSection?.()}>
-						<EyeOff className="h-3.5 w-3.5 mr-2" />
-						Hide section
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem disabled={!canMoveUp} onSelect={() => onMoveUp?.()}>
-						<ArrowUp className="h-3.5 w-3.5 mr-2" />
-						Move up
-					</ContextMenuItem>
-					<ContextMenuItem disabled={!canMoveDown} onSelect={() => onMoveDown?.()}>
-						<ArrowDown className="h-3.5 w-3.5 mr-2" />
-						Move down
-					</ContextMenuItem>
-				</ContextMenuContent>
+				{menuRows.length > 0 && (
+					<ContextMenuContent>
+						{menuRows.map((row, i) =>
+							row.kind === 'separator' ? (
+								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+								<ContextMenuSeparator key={`sep-${i}`} />
+							) : (
+								<ContextMenuItem key={row.id} disabled={row.disabled} onSelect={row.run}>
+									{row.label}
+								</ContextMenuItem>
+							)
+						)}
+					</ContextMenuContent>
+				)}
 			</ContextMenu>
 			{isOpen && (
 				<div className="flex-1 min-h-0 bg-background/50">

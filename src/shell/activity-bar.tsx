@@ -36,7 +36,7 @@ import {
 	Store,
 	Trash2,
 } from 'lucide-react';
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	ContextMenu,
@@ -45,6 +45,8 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import {
 	Dialog,
 	DialogContent,
@@ -497,6 +499,17 @@ function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps)
 	);
 }
 
+const NGWA_MENU_ICON: Readonly<Record<string, LucideIcon>> = {
+	'ngwa.installed': Package,
+	'ngwa.store': Store,
+	'ngwa.health': HeartPulse,
+};
+const NGWA_MENU_ROUTE: Readonly<Record<string, string>> = {
+	'ngwa.installed': NGWA_MENU[0].to,
+	'ngwa.store': NGWA_MENU[1].to,
+	'ngwa.health': NGWA_MENU[2].to,
+};
+
 function NgwaMenuWrap({
 	onPick,
 	children,
@@ -504,17 +517,35 @@ function NgwaMenuWrap({
 	onPick: (to: string) => void;
 	children: React.ReactNode;
 }) {
+	const menu = useEffectiveMenu('rail-ngwa');
+	const rows = resolveMenuItems(menu, {
+		handlers: {
+			'ngwa.installed': () => onPick(NGWA_MENU_ROUTE['ngwa.installed']),
+			'ngwa.store': () => onPick(NGWA_MENU_ROUTE['ngwa.store']),
+			'ngwa.health': () => onPick(NGWA_MENU_ROUTE['ngwa.health']),
+		},
+	});
 	return (
 		<ContextMenu>
 			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				{NGWA_MENU.map(({ label, to, Icon }) => (
-					<ContextMenuItem key={to} onSelect={() => onPick(to)}>
-						<Icon className="h-3.5 w-3.5" />
-						{label}
-					</ContextMenuItem>
-				))}
-			</ContextMenuContent>
+			{rows.length > 0 && (
+				<ContextMenuContent>
+					{rows.map((row, i) =>
+						row.kind === 'separator' ? (
+							// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+							<ContextMenuSeparator key={`sep-${i}`} />
+						) : (
+							<ContextMenuItem key={row.id} onSelect={row.run}>
+								{(() => {
+									const Icon = NGWA_MENU_ICON[row.id];
+									return Icon ? <Icon className="h-3.5 w-3.5" /> : null;
+								})()}
+								{row.label}
+							</ContextMenuItem>
+						)
+					)}
+				</ContextMenuContent>
+			)}
 		</ContextMenu>
 	);
 }
@@ -776,49 +807,72 @@ function PinContextWrap({
 
 	const otherSections = allSections.filter((s) => s.id !== pin.sectionId);
 
+	const railMenu = useEffectiveMenu('rail');
+	const rows = resolveMenuItems(railMenu, {
+		conditions: { 'sectioned-pin': pin.sectionId !== null },
+		disabled: (id) =>
+			id === 'rail.pin-move-up' ? index === 0 : id === 'rail.pin-move-down' ? index >= siblings.length - 1 : false,
+		handlers: {
+			'rail.pin-open': () => onOpen(pin),
+			'rail.pin-move-up': () => void moveBy(-1),
+			'rail.pin-move-down': () => void moveBy(1),
+			'rail.pin-no-section': () => void moveTo(null),
+			'rail.unpin': () => void removePin(pin.id),
+		},
+	});
+
 	return (
 		<ContextMenu>
 			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				<ContextMenuItem onSelect={() => onOpen(pin)}>
-					<PinGlyph className="h-3.5 w-3.5" />
-					Open {pin.label}
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				<ContextMenuItem disabled={index === 0} onSelect={() => void moveBy(-1)}>
-					<ArrowUp className="h-3.5 w-3.5" />
-					Move up
-				</ContextMenuItem>
-				<ContextMenuItem disabled={index >= siblings.length - 1} onSelect={() => void moveBy(1)}>
-					<ArrowDown className="h-3.5 w-3.5" />
-					Move down
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				{otherSections.length > 0 && (
-					<>
-						<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-							Move to
-						</div>
-						{otherSections.map((s) => (
-							<ContextMenuItem key={s.id} onSelect={() => moveTo(s.id)}>
-								<SquareDashed className="h-3.5 w-3.5" />
-								{s.label}
+			{rows.length > 0 && (
+				<ContextMenuContent>
+					{rows.map((row, i) => {
+						if (row.kind === 'separator') {
+							// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+							return <ContextMenuSeparator key={`sep-${i}`} />;
+						}
+						if (row.display === 'submenu') {
+							// `rail.pin-move-to-section` (§1.3): a flat, header-divided
+							// list of the other sections — not a nested flyout.
+							return otherSections.length > 0 ? (
+								<Fragment key={row.id}>
+									<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+										Move to
+									</div>
+									{otherSections.map((s) => (
+										<ContextMenuItem key={s.id} onSelect={() => void moveTo(s.id)}>
+											<SquareDashed className="h-3.5 w-3.5" />
+											{s.label}
+										</ContextMenuItem>
+									))}
+								</Fragment>
+							) : null;
+						}
+						if (row.id === 'rail.pin-open') {
+							return (
+								<ContextMenuItem key={row.id} onSelect={row.run}>
+									<PinGlyph className="h-3.5 w-3.5" />
+									Open {pin.label}
+								</ContextMenuItem>
+							);
+						}
+						return (
+							<ContextMenuItem
+								key={row.id}
+								disabled={row.disabled}
+								variant={row.danger ? 'destructive' : undefined}
+								onSelect={row.run}
+							>
+								{row.id === 'rail.pin-move-up' && <ArrowUp className="h-3.5 w-3.5" />}
+								{row.id === 'rail.pin-move-down' && <ArrowDown className="h-3.5 w-3.5" />}
+								{row.id === 'rail.pin-no-section' && <SquareDashed className="h-3.5 w-3.5" />}
+								{row.id === 'rail.unpin' && <PinOff className="h-3.5 w-3.5" />}
+								{row.label}
 							</ContextMenuItem>
-						))}
-					</>
-				)}
-				{pin.sectionId !== null && (
-					<ContextMenuItem onSelect={() => moveTo(null)}>
-						<SquareDashed className="h-3.5 w-3.5" />
-						No section
-					</ContextMenuItem>
-				)}
-				{(otherSections.length > 0 || pin.sectionId !== null) && <ContextMenuSeparator />}
-				<ContextMenuItem variant="destructive" onSelect={() => removePin(pin.id)}>
-					<PinOff className="h-3.5 w-3.5" />
-					Unpin
-				</ContextMenuItem>
-			</ContextMenuContent>
+						);
+					})}
+				</ContextMenuContent>
+			)}
 		</ContextMenu>
 	);
 }
@@ -869,38 +923,53 @@ function SectionContextWrap({ section, pinCount, children }: SectionContextWrapP
 		setConfirmDelete(false);
 	}
 
+	const sectionMenu = useEffectiveMenu('rail-section');
+	const rows = resolveMenuItems(sectionMenu, {
+		handlers: {
+			'rail.section-rename': () => {
+				setDraftLabel(section.label);
+				setRenameError(null);
+				setRenameOpen(true);
+			},
+			'rail.section-manage': () => usePaneStore.getState().navigateFocused('/settings/activity-bar'),
+			'rail.section-delete': () => setConfirmDelete(true),
+		},
+	});
+	const SECTION_MENU_ICON: Readonly<Record<string, LucideIcon>> = {
+		'rail.section-rename': Pencil,
+		'rail.section-manage': Settings2,
+		'rail.section-delete': Trash2,
+	};
+
 	return (
 		<>
 			<ContextMenu>
 				<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-				<ContextMenuContent>
-					<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-						Section · {section.label}
-					</div>
-					<ContextMenuItem
-						onSelect={() => {
-							setDraftLabel(section.label);
-							setRenameError(null);
-							setRenameOpen(true);
-						}}
-					>
-						<Pencil className="h-3.5 w-3.5" />
-						Rename…
-					</ContextMenuItem>
-					<ContextMenuItem
-						onSelect={() => {
-							usePaneStore.getState().navigateFocused('/settings/activity-bar');
-						}}
-					>
-						<Settings2 className="h-3.5 w-3.5" />
-						Manage in Settings
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
-						<Trash2 className="h-3.5 w-3.5" />
-						Delete section…
-					</ContextMenuItem>
-				</ContextMenuContent>
+				{rows.length > 0 && (
+					<ContextMenuContent>
+						<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+							Section · {section.label}
+						</div>
+						{rows.map((row, i) =>
+							row.kind === 'separator' ? (
+								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+								<ContextMenuSeparator key={`sep-${i}`} />
+							) : (
+								<ContextMenuItem
+									key={row.id}
+									variant={row.danger ? 'destructive' : undefined}
+									onSelect={row.run}
+								>
+									{(() => {
+										const Icon = SECTION_MENU_ICON[row.id];
+										return Icon ? <Icon className="h-3.5 w-3.5" /> : null;
+									})()}
+									{row.label}
+								</ContextMenuItem>
+							)
+						)}
+					</ContextMenuContent>
+				)}
 			</ContextMenu>
 
 			<Dialog open={renameOpen} onOpenChange={setRenameOpen}>

@@ -1,10 +1,9 @@
 // WP-46 — Windows/Linux native-menu parity (D-08 `native-menu-win`).
 //
 // macOS gets a real OS menu bar (`native-menu.ts`). Windows and Linux get no
-// native app menu at all today (confirmed: `native-menu.ts`'s
-// `installNativeMenu()` bails unless `isMac`) — the design's fix is a `≡`
-// button at the far left of the title row that opens the SAME tree
-// (`./tree.tsx`) as an in-app cascading menu, one submenu per top-level entry.
+// native app menu at all today — the design's fix is a `≡` button at the far
+// left of the title row that opens the SAME tree (`./tree.tsx`) as an in-app
+// cascading menu, one submenu per top-level entry.
 //
 // Predefined items (Undo/Redo/…/Minimize/Maximize/Fullscreen/About/Quit) have
 // no OS menu to delegate to here, so this file gives each a best-effort
@@ -13,6 +12,13 @@
 // a native edit menu) and `@tauri-apps/api/window` / `plugin-process` for
 // window/app lifecycle. "Hide" has no Windows/Linux analogue and is filtered
 // out (`macOnly`).
+//
+// WP-55 (menus render from data): every action leaf reads
+// `getEffectiveMenu('native/<top>')` through `useEffectiveModel()` (one hook
+// at the top, so this stays inside the rules of hooks despite `MENU_TREE`
+// being walked in a `.map()`) — reordering, hiding and package/user appends
+// in `actions.json` reach this menu the same way they reach the mac one,
+// simply by this being an ordinary React re-render.
 
 import { Menu as MenuIcon } from 'lucide-react';
 import {
@@ -27,9 +33,10 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { IconButton } from '@/components/ui/icon-button';
+import { useEffectiveModel } from '@/lib/actions/store';
 import { isMac } from '@/lib/platform';
 import { isTauri } from '@/lib/transport';
-import { cascadeKeyLabel, goto, MENU_TREE, type MenuLeaf, type PredefinedKind } from './tree';
+import { activateActionId, cascadeKeyLabel, goto, MENU_TREE, resolveMenuTree, type PredefinedKind } from './tree';
 
 const EXEC_COMMAND: Partial<Record<PredefinedKind, string>> = {
 	undo: 'undo',
@@ -78,19 +85,6 @@ async function runPredefined(kind: PredefinedKind): Promise<void> {
 	}
 }
 
-function activate(leaf: MenuLeaf): void {
-	if (leaf.action) {
-		leaf.action();
-		return;
-	}
-	if (leaf.predefined) {
-		void runPredefined(leaf.predefined);
-		return;
-	}
-	// Structure-only item — no registry id and no in-scope handler (see the
-	// comment above it in tree.tsx for why). Selecting it does nothing.
-}
-
 /**
  * The `≡` button + cascading menu — mounted at the far left of the title row
  * on Windows/Linux only. `mac` defaults to the live platform but is
@@ -99,6 +93,10 @@ function activate(leaf: MenuLeaf): void {
  * override pattern `findEntry`/`conflicts` already use in `registry.ts`.
  */
 export function NativeMenuCascade({ mac }: { mac?: boolean } = {}) {
+	// Read once at the top (rules of hooks) — `resolveMenuTree` below reads the
+	// same started model without its own hook per menu.
+	useEffectiveModel();
+
 	if (mac ?? isMac) return null;
 
 	return (
@@ -119,15 +117,26 @@ export function NativeMenuCascade({ mac }: { mac?: boolean } = {}) {
 						<DropdownMenuSub key={menu.id}>
 							<DropdownMenuSubTrigger>{menu.label}</DropdownMenuSubTrigger>
 							<DropdownMenuSubContent className="w-64">
-								{menu.items.map((entry, idx) => {
+								{resolveMenuTree(menu).map((entry, idx) => {
 									if (entry.kind === 'separator') {
 										// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers, stable per menu
 										return <DropdownMenuSeparator key={`sep-${idx}`} />;
 									}
-									if (entry.macOnly) return null;
-									const keyLabel = cascadeKeyLabel(entry.commandId);
+									if (entry.source === 'role') {
+										if (entry.macOnly) return null;
+										return (
+											<DropdownMenuItem key={entry.id} onSelect={() => void runPredefined(entry.predefined)}>
+												{entry.label}
+											</DropdownMenuItem>
+										);
+									}
+									const keyLabel = cascadeKeyLabel(entry.id);
 									return (
-										<DropdownMenuItem key={entry.id} onSelect={() => activate(entry)}>
+										<DropdownMenuItem
+											key={entry.id}
+											variant={entry.danger ? 'destructive' : undefined}
+											onSelect={() => activateActionId(entry.id)}
+										>
 											{entry.label}
 											{keyLabel && <DropdownMenuShortcut>{keyLabel}</DropdownMenuShortcut>}
 										</DropdownMenuItem>

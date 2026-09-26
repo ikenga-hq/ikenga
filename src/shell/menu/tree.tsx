@@ -1,34 +1,42 @@
-// WP-46 — the one native-menu tree (D-08 `native-menu` / `native-menu-win`,
-// `drafts/design-spec-D-03-07.md` §D-08). `native-menu.ts` (macOS, real OS
-// menu bar via `@tauri-apps/api/menu`) and `menu/cascade.tsx` (Windows/Linux,
-// the ≡ button's in-app cascading menu) both render THIS data — one
-// definition, two renderers, per WP-46's brief.
+// WP-55 (menus render from data, replacing WP-46's static `MENU_TREE`) — the
+// one native-menu skeleton (D-08 `native-menu` / `native-menu-win`).
+// `native-menu.ts` (macOS, the real OS menu bar) and `menu/cascade.tsx`
+// (Windows/Linux, the ≡ button's in-app cascading menu) both render this
+// data: one definition, two renderers.
 //
-// Every leaf that fires a real action reads its shown key through the WP-08
-// registry (`findEntry` / `labelFor` / `toAccelerator`) — nothing here
-// hard-codes a combo. **No new key bindings ship with this tree** (Phase 6
-// owns rebinding, per WP-46's DoD): a leaf either reuses an existing
-// `DEFAULT_KEYMAP` command id (so its key is whatever that command is already
-// bound to) or has none and renders with no key at all.
+// Every action leaf (everything that isn't a predefined OS role, §9.3) now
+// renders from the effective model — `getEffectiveMenu('native/<top>')`
+// (G-ACTIONS §1.3, §10.4): order, hidden ids, and package/personal/project
+// appends already applied by the merge (WP-52's `menus.ts`). `MENU_TREE`
+// itself only says where that data-driven block sits relative to the
+// predefined roles, which have no id in the effective model and are never
+// reordered (§1.3: "predefined OS roles are fixed", §9.3): `leading` before
+// it, `trailing` after. In every one of the nine menus the two never
+// interleave — a menu is either all predefined (Edit, Window) or all
+// data-driven (File, View, Project, Chi, Ngwa, Help), except Ikenga (About
+// leads; Hide/Quit trail). `resolveMenuTree` builds the one combined,
+// separator-collapsed list both renderers walk.
 //
-// `shipped: true` marks an item (or its direct equivalent) that existed in
-// `native-menu.ts` before this file — see that file's header for the exact
-// shipped/added tally used in the PR body.
+// A default `native/<top>` menu carries no separators of its own (`menus.ts`
+// §1.3) — reordering/hiding through `actions.json` can still add one
+// (`"---"` in a `MenuOverride.items`). The shipped separators inside a
+// same-kind run (e.g. between "Check for Updates…" and "Settings…") are lost
+// to this — a renderer property, not a data one (see the PR body).
 
+import { getEffectiveMenu } from '@/lib/actions/store';
+import { runCommand } from '@/lib/keymap/commands';
 import { findEntry, labelFor } from '@/lib/keymap/registry';
 import { isMacPlatform, toAccelerator } from '@/lib/keymap/platform';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { useCompanionStore } from '@/shell/companion/companion-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
-import { openCommandPalette } from '@/shell/command-palette';
 
 /** OS-predefined items — macOS renders these via Tauri's `PredefinedMenuItem`
  *  (native behaviour, no JS action needed); `menu/cascade.tsx` renders a
  *  best-effort equivalent for Windows/Linux, where no such native menu
- *  exists to delegate to (§D-08 file note: "Windows and Linux get no native
- *  menu at all today"). */
+ *  exists to delegate to. Every role leaf in `MENU_TREE` is one of these —
+ *  every non-predefined leaf is a canonical action id instead (§10.4). */
 export type PredefinedKind =
 	| 'about'
 	| 'hide'
@@ -43,28 +51,15 @@ export type PredefinedKind =
 	| 'maximize'
 	| 'fullscreen';
 
-export interface MenuLeaf {
+export interface MenuRole {
 	kind: 'item';
-	/** Stable id, unique within its menu — used for the mac `MenuItem.new({id})`
-	 *  and the cascade's React key. */
+	/** Stable id, unique within its menu — the mac `MenuItem.new({id})` and
+	 *  the cascade's React key. */
 	id: string;
 	label: string;
-	/** WP-08 registry command id. When present, BOTH renderers read the shown
-	 *  key from here (`toAccelerator` / `labelFor`) instead of a literal. */
-	commandId?: string;
-	/** Existed (or had a direct equivalent) in `native-menu.ts` before WP-46. */
-	shipped: boolean;
-	/** OS-predefined behaviour — see `PredefinedKind` above. */
-	predefined?: PredefinedKind;
-	/** Real, already-shipped action to run on activation — a store call or
-	 *  navigation, never a newly-invented dead `CustomEvent` (WP-08's own
-	 *  DoD deleted two of those; see `native-menu.ts` header for the ones
-	 *  already shipped that this file deliberately leaves untouched).
-	 *  Omitted for items with no real, in-scope handler today — the PR body
-	 *  lists these as structure-only. */
-	action?: () => void;
-	/** True when the item only makes sense on macOS (e.g. "Hide", which has
-	 *  no Windows/Linux equivalent) — `menu/cascade.tsx` skips these. */
+	predefined: PredefinedKind;
+	/** True only for "Hide" — no Windows/Linux analogue (`menu/cascade.tsx`
+	 *  skips these). */
 	macOnly?: boolean;
 }
 
@@ -72,7 +67,7 @@ export interface MenuSeparator {
 	kind: 'separator';
 }
 
-export type MenuEntry = MenuLeaf | MenuSeparator;
+export type MenuEntry = MenuRole | MenuSeparator;
 
 export interface MenuDef {
 	id: string;
@@ -80,12 +75,27 @@ export interface MenuDef {
 	/** Ikenga app menu renders bold on mac (matches every other Mac app's
 	 *  first menu). No effect in the cascade. */
 	bold?: boolean;
-	items: MenuEntry[];
+	/** Predefined roles before the data-driven action block. */
+	leading: MenuEntry[];
+	/** Predefined roles after it. */
+	trailing: MenuEntry[];
 }
+
+/** One resolved leaf of the data-driven action block — a canonical id
+ *  (G-ACTIONS §10) with its effective name and danger flag. */
+export interface MenuActionLeaf {
+	kind: 'item';
+	source: 'action';
+	id: string;
+	label: string;
+	danger: boolean;
+}
+
+export type ResolvedMenuEntry = (MenuRole & { source: 'role' }) | MenuActionLeaf | MenuSeparator;
 
 const sep: MenuSeparator = { kind: 'separator' };
 
-function item(def: Omit<MenuLeaf, 'kind'>): MenuLeaf {
+function role(def: Omit<MenuRole, 'kind'>): MenuRole {
 	return { kind: 'item', ...def };
 }
 
@@ -108,264 +118,167 @@ function newSessionTab(engine: 'terminal' | 'claude'): void {
 	usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
 }
 
+const EVT = {
+	openFile: 'cmd:open-file',
+	openProjectFolder: 'cmd:open-project-folder',
+	switchAdapter: 'cmd:switch-adapter',
+} as const;
+
+function emit(name: string) {
+	window.dispatchEvent(new CustomEvent(name));
+}
+
+/** Canonical action ids with no other owner in the app (workspace.tsx, the
+ *  rail, the palette and `zoom.*`/`terminal.*` already own the rest, per
+ *  `commands.ts`'s header) — the native menu / cascade is their one caller,
+ *  so it runs them directly rather than through a `registerCommand` no one
+ *  else would ever exercise. Every other action leaf falls back to
+ *  `runCommand` (WP-53's runner / WP-54's command table), so a package or
+ *  user action placed at `native/<top>` (§1.3) still fires correctly. */
+const NATIVE_ONLY_ACTIONS: Readonly<Record<string, () => void>> = {
+	'menu.new-session': () => newSessionTab('claude'),
+	'menu.open-file': () => emit(EVT.openFile),
+	'menu.open-project-folder': () => emit(EVT.openProjectFolder),
+	'menu.new-terminal': () => newSessionTab('terminal'),
+	'session.switch-adapter': () => emit(EVT.switchAdapter),
+	'project.project-settings': () => goto('/settings/projects'),
+	'chi.permission-inbox': () => goto('/outbox/approvals'),
+	'chi.runs': () => goto('/automations?view=runs'),
+	'ngwa.installed': () => goto('/ngwa/installed'),
+	'ngwa.store': () => goto('/ngwa/store'),
+	'ngwa.health': () => goto('/ngwa/health'),
+	'ikenga.check-updates': () => goto('/settings/about'),
+	'help.docs': () => {
+		window.open('https://royalti.io/docs', '_blank');
+	},
+	'help.feedback': () => {
+		window.open('mailto:feedback@royalti.io?subject=Royalti%20PA%20Feedback', '_blank');
+	},
+	// `explorer.toggle` / `companion.toggle` / `pane.split-right` /
+	// `pane.split-down` are owned by `workspace.tsx`'s `useCommands` (real
+	// store calls); `palette.open` / `palette.projects` / `shortcuts.open` by
+	// `command-palette.tsx`; `rail.settings` / `ngwa.create` by the rail. All
+	// reached the same way — through `runCommand`, below — once `workspace.tsx`
+	// mounts (every window that shows a native menu also mounts it).
+};
+
+/** Activate a canonical action id — a local handler for the ids nothing else
+ *  in the app owns, else the WP-53/WP-54 command table. Both renderers call
+ *  this for every non-`predefined` leaf. */
+export function activateActionId(id: string): void {
+	const local = NATIVE_ONLY_ACTIONS[id];
+	if (local) {
+		local();
+		return;
+	}
+	runCommand({ command: id, source: 'menu' });
+}
+
 export const MENU_TREE: MenuDef[] = [
-	// Every item here is `new` — there is no app-level "Ikenga" menu in
-	// today's `native-menu.ts` at all (its `Menu.new()` starts at File).
 	{
 		id: 'ikenga',
 		label: 'Ikenga',
 		bold: true,
-		items: [
-			item({ id: 'about', label: 'About Ikenga', shipped: false, predefined: 'about' }),
-			item({
-				id: 'check-updates',
-				label: 'Check for Updates…',
-				shipped: false,
-				action: () => goto('/settings/about'),
-			}),
-			sep,
-			item({
-				id: 'settings',
-				label: 'Settings…',
-				commandId: 'rail.settings',
-				shipped: false,
-				action: () => goto('/settings/appearance'),
-			}),
-			sep,
-			item({ id: 'hide', label: 'Hide Ikenga', shipped: false, predefined: 'hide', macOnly: true }),
-			item({ id: 'quit', label: 'Quit Ikenga', shipped: false, predefined: 'quit' }),
+		leading: [role({ id: 'about', label: 'About Ikenga', predefined: 'about' })],
+		trailing: [
+			role({ id: 'hide', label: 'Hide Ikenga', predefined: 'hide', macOnly: true }),
+			role({ id: 'quit', label: 'Quit Ikenga', predefined: 'quit' }),
 		],
 	},
-	{
-		id: 'file',
-		label: 'File',
-		items: [
-			// `menu.new-session` is a pre-existing keymap id whose shipped
-			// action was a `CustomEvent` nothing listens for (see
-			// native-menu.ts header) — fixed here to actually start a session,
-			// the same call `workspace.tsx`'s ⌃⇧T branch makes. Unaccelerated since DEC-64.
-			item({
-				id: 'new-session',
-				label: 'New Session',
-				commandId: 'menu.new-session',
-				shipped: true,
-				action: () => newSessionTab('claude'),
-			}),
-			// Unchanged — same commandId, same dead-event dispatch
-			// (`native-menu.ts` still owns `EVT`); no confidently-real
-			// replacement action identified (see native-menu.ts header).
-			item({ id: 'open-file', label: 'Open File…', commandId: 'menu.open-file', shipped: true }),
-			item({
-				id: 'open-project',
-				label: 'Open Project Folder…',
-				commandId: 'menu.open-project-folder',
-				shipped: true,
-			}),
-			sep,
-			// "New Tab" and "Screenshot pane…" (design's File menu) have no
-			// registry id and no existing app-wide action — omitted, see PR body.
-			item({
-				id: 'close-tab',
-				label: 'Close Tab',
-				commandId: 'tab.close',
-				shipped: false,
-				action: () => usePaneStore.getState().closeActiveTab(),
-			}),
-		],
-	},
+	{ id: 'file', label: 'File', leading: [], trailing: [] },
 	{
 		id: 'edit',
 		label: 'Edit',
-		items: [
-			item({ id: 'undo', label: 'Undo', shipped: true, predefined: 'undo' }),
-			item({ id: 'redo', label: 'Redo', shipped: true, predefined: 'redo' }),
+		leading: [
+			role({ id: 'undo', label: 'Undo', predefined: 'undo' }),
+			role({ id: 'redo', label: 'Redo', predefined: 'redo' }),
 			sep,
-			item({ id: 'cut', label: 'Cut', shipped: true, predefined: 'cut' }),
-			item({ id: 'copy', label: 'Copy', shipped: true, predefined: 'copy' }),
-			item({ id: 'paste', label: 'Paste', shipped: true, predefined: 'paste' }),
-			item({ id: 'select-all', label: 'Select All', shipped: true, predefined: 'selectAll' }),
+			role({ id: 'cut', label: 'Cut', predefined: 'cut' }),
+			role({ id: 'copy', label: 'Copy', predefined: 'copy' }),
+			role({ id: 'paste', label: 'Paste', predefined: 'paste' }),
+			role({ id: 'select-all', label: 'Select All', predefined: 'selectAll' }),
 		],
+		trailing: [],
 	},
-	{
-		id: 'view',
-		label: 'View',
-		items: [
-			// `explorer.toggle` / `pane.split-right` / `pane.split-down` /
-			// `companion.toggle` are registered in DEFAULT_KEYMAP today purely
-			// as label/conflicts sources (DEC-26); this is their first real
-			// menu-driven trigger, calling the exact store methods their own
-			// `useKey()`/`workspace.tsx` listeners call.
-			item({
-				id: 'toggle-explorer',
-				label: 'Toggle Explorer',
-				commandId: 'explorer.toggle',
-				shipped: false,
-				action: () => useShellStore.getState().toggleSidebar(),
-			}),
-			item({
-				id: 'command-palette',
-				label: 'Command Palette',
-				commandId: 'palette.open',
-				// Shipped as a menu item — but see native-menu.ts header: its
-				// action dispatched a `CustomEvent` nothing ever listened for.
-				// Fixed here to call the same `openCommandPalette()` every
-				// other piece of frame chrome (title row, status bar) uses.
-				shipped: true,
-				action: () => openCommandPalette('all'),
-			}),
-			sep,
-			item({
-				id: 'toggle-companion',
-				label: 'Toggle Companion',
-				commandId: 'companion.toggle',
-				shipped: false,
-				action: () => useCompanionStore.getState().cycleState(),
-			}),
-			item({
-				id: 'split-right',
-				label: 'Split Right',
-				commandId: 'pane.split-right',
-				shipped: false,
-				action: () => usePaneStore.getState().splitFocused('horizontal'),
-			}),
-			item({
-				id: 'split-down',
-				label: 'Split Down',
-				commandId: 'pane.split-down',
-				shipped: false,
-				action: () => usePaneStore.getState().splitFocused('vertical'),
-			}),
-			// "Zoom In/Out/Reset Zoom" (design's View menu) have no app-wide
-			// registry id or handler — the only zoom today is per-renderer
-			// (D-08 `renderers`), not a frame-level command. Omitted.
-		],
-	},
-	{
-		id: 'project',
-		label: 'Project',
-		items: [
-			item({
-				id: 'switch-project',
-				label: 'Switch Project…',
-				commandId: 'palette.projects',
-				shipped: false,
-				action: () => openCommandPalette('projects'),
-			}),
-			sep,
-			item({
-				id: 'project-settings',
-				label: 'Project Settings…',
-				shipped: false,
-				action: () => goto('/settings/projects'),
-			}),
-			// "Open Recent" and "Reveal in Files" (design's Project menu) have
-			// no existing app-wide action — `artifacts.tsx`'s own "Reveal in
-			// Files" row is itself a stub (`run: () => {}`). "Reset Layout" has
-			// no reset entry point in `layout-state.ts` today. All three omitted.
-		],
-	},
-	{
-		// Renamed from the shipped "Session" menu (design-spec D-08 note).
-		id: 'chi',
-		label: 'Chi',
-		items: [
-			// Same dead-event-to-real-action fix as File → New Session above,
-			// using the plain-terminal branch of the same helper.
-			item({
-				id: 'new-terminal',
-				label: 'New Terminal',
-				commandId: 'menu.new-terminal',
-				shipped: true,
-				action: () => newSessionTab('terminal'),
-			}),
-			// Unchanged — genuinely a not-yet-built feature ("coming soon"),
-			// not a bug to fix.
-			item({
-				id: 'switch-adapter',
-				label: 'Switch Adapter (coming soon)',
-				commandId: 'session.switch-adapter',
-				shipped: true,
-			}),
-			sep,
-			item({
-				id: 'permission-inbox',
-				label: 'Permission Inbox',
-				shipped: false,
-				action: () => goto('/outbox/approvals'),
-			}),
-			item({ id: 'runs', label: 'Runs', shipped: false, action: () => goto('/automations?view=runs') }),
-			// "Dispatch…" (design's Chi menu) would need the rail's `enterMode()`
-			// side effects (sidebar collapse + focusCompanion, activity-bar.tsx,
-			// do-not-touch) to behave as the label promises — omitted rather
-			// than shipping a half-behaving click.
-		],
-	},
-	{
-		id: 'ngwa',
-		label: 'Ngwa',
-		items: [
-			item({ id: 'installed', label: 'Installed', shipped: false, action: () => goto('/ngwa/installed') }),
-			item({ id: 'store', label: 'Store', shipped: false, action: () => goto('/ngwa/store') }),
-			item({ id: 'health', label: 'Health', shipped: false, action: () => goto('/ngwa/health') }),
-			sep,
-			// "Install from folder…" is the closest existing surface to
-			// `ngwa.create` (the in-shell scaffolding wizard) — reused rather
-			// than left unbound. ⌘N is `ngwa.create`'s alone (DEC-64: File →
-			// New Session lost it and stays unaccelerated).
-			item({
-				id: 'install-from-folder',
-				label: 'Install from folder…',
-				commandId: 'ngwa.create',
-				shipped: false,
-				action: () => goto('/ngwa/create'),
-			}),
-			// "Check for package updates" has no existing action — /ngwa/health
-			// has no "updates" section (only violations/sidecars/cron/data/
-			// engines) so it isn't a fair stand-in. Omitted.
-		],
-	},
+	{ id: 'view', label: 'View', leading: [], trailing: [] },
+	{ id: 'project', label: 'Project', leading: [], trailing: [] },
+	{ id: 'chi', label: 'Chi', leading: [], trailing: [] },
+	{ id: 'ngwa', label: 'Ngwa', leading: [], trailing: [] },
 	{
 		id: 'window',
 		label: 'Window',
-		items: [
-			item({ id: 'minimize', label: 'Minimize', shipped: true, predefined: 'minimize' }),
-			item({ id: 'maximize', label: 'Maximize', shipped: true, predefined: 'maximize' }),
-			item({ id: 'fullscreen', label: 'Fullscreen', shipped: true, predefined: 'fullscreen' }),
+		leading: [
+			role({ id: 'minimize', label: 'Minimize', predefined: 'minimize' }),
+			role({ id: 'maximize', label: 'Maximize', predefined: 'maximize' }),
+			role({ id: 'fullscreen', label: 'Fullscreen', predefined: 'fullscreen' }),
 		],
+		trailing: [],
 	},
-	{
-		id: 'help',
-		label: 'Help',
-		items: [
-			// Unchanged — already real (external link / mailto).
-			item({ id: 'docs', label: 'Docs', shipped: true }),
-			item({ id: 'feedback', label: 'Send Feedback', shipped: true }),
-			sep,
-			item({
-				id: 'shortcuts',
-				label: 'Keyboard Shortcuts',
-				commandId: 'shortcuts.open',
-				shipped: false,
-				action: () => openCommandPalette('shortcuts'),
-			}),
-			// "Cultural attribution" (design's Help menu) has no existing
-			// content/route to open — omitted.
-		],
-	},
+	{ id: 'help', label: 'Help', leading: [], trailing: [] },
 ];
 
-/** Mac accelerator string (`CmdOrCtrl+Shift+X`) for a leaf's `commandId`, or
- *  `undefined` for a leaf with none / an unresolved id (menu construction
- *  never throws on a stale id). */
+/** The data-driven action block for one `native/<top>` menu (§1.3: "list
+ *  their action leaves only... interleaved by the renderer"). Pure — reads
+ *  the effective model directly, no hook, so `native-menu.ts`'s imperative
+ *  Tauri-menu rebuild can call it as readily as a React render. */
+export function resolveActionBlock(menuId: string): (MenuActionLeaf | MenuSeparator)[] {
+	const menu = getEffectiveMenu(menuId);
+	if (!menu) return [];
+	const out: (MenuActionLeaf | MenuSeparator)[] = [];
+	for (const entry of menu.items) {
+		out.push(
+			entry.kind === 'separator'
+				? { kind: 'separator' }
+				: {
+						kind: 'item',
+						source: 'action',
+						id: entry.id,
+						label: entry.action.name || entry.id,
+						danger: entry.action.danger,
+					}
+		);
+	}
+	return out;
+}
+
+function collapseResolvedSeparators(entries: ResolvedMenuEntry[]): ResolvedMenuEntry[] {
+	const out: ResolvedMenuEntry[] = [];
+	for (const e of entries) {
+		if (e.kind === 'separator' && (out.length === 0 || out[out.length - 1].kind === 'separator')) continue;
+		out.push(e);
+	}
+	while (out.length > 0 && out[out.length - 1].kind === 'separator') out.pop();
+	return out;
+}
+
+/** One top menu's full leaf list: the static role skeleton around the
+ *  data-driven action block, separators collapsed. */
+export function resolveMenuTree(menu: MenuDef): ResolvedMenuEntry[] {
+	const actions = resolveActionBlock(`native/${menu.id}`);
+	const out: ResolvedMenuEntry[] = menu.leading.map((e) =>
+		e.kind === 'separator' ? e : { ...e, source: 'role' as const }
+	);
+	if (actions.length > 0) {
+		if (out.length > 0 && out[out.length - 1].kind !== 'separator') out.push(sep);
+		out.push(...actions);
+		if (menu.trailing.length > 0) out.push(sep);
+	}
+	for (const e of menu.trailing) out.push(e.kind === 'separator' ? e : { ...e, source: 'role' as const });
+	return collapseResolvedSeparators(out);
+}
+
+/** Mac accelerator string (`CmdOrCtrl+Shift+X`) for a canonical action id, or
+ *  `undefined` for one with no binding (menu construction never throws on a
+ *  stale id). */
 export function macAccelerator(commandId: string | undefined): string | undefined {
 	if (!commandId) return undefined;
 	const entry = findEntry(commandId);
 	return entry ? toAccelerator(entry.key) : undefined;
 }
 
-/** Human-readable key hint for a leaf's `commandId` (⌘ glyphs on macOS,
+/** Human-readable key hint for a canonical action id (⌘ glyphs on macOS,
  *  spelled-out Ctrl/Alt/Shift elsewhere — `labelFor` already branches on the
- *  live platform), or `''` for a leaf with none.
+ *  live platform), or `''` for one with none.
  *
  *  `findEntry`'s fallback (used by `macAccelerator` and the native macOS
  *  menu, where it's always correct) returns the *other* platform's entry
@@ -382,17 +295,4 @@ export function cascadeKeyLabel(commandId: string | undefined, opts?: { mac?: bo
 	if (!entry) return '';
 	if (entry.platformOnly && entry.platformOnly !== (mac ? 'mac' : 'other')) return '';
 	return labelFor(commandId, { mac });
-}
-
-/** Every `commandId` used anywhere in `MENU_TREE` — the seam `tree.test.ts`
- *  uses to prove each one resolves in the WP-08 registry (self-verifiable
- *  DoD: no menu item claims a key the registry doesn't actually have). */
-export function allMenuCommandIds(): string[] {
-	const ids: string[] = [];
-	for (const menu of MENU_TREE) {
-		for (const entry of menu.items) {
-			if (entry.kind === 'item' && entry.commandId) ids.push(entry.commandId);
-		}
-	}
-	return ids;
 }

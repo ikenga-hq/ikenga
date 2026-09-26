@@ -20,6 +20,8 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import { formatPaneAddressForDisplay, parsePaneAddress } from '@/lib/panes/pane-address';
 import { resolveArtifactAddress } from '@/lib/panes/pane-address-resolver';
 import type { LeafNode, PaneId, PaneView } from '@/lib/panes/types';
@@ -134,6 +136,24 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 	// new pane" items that only make sense with a sibling tab to move past.
 	const soleTab = leaf?.tabs[0];
 	const isSoleTabPinned = Boolean(soleTab?.pinned);
+	const addressMenu = useEffectiveMenu('address');
+	const addressMenuRows = resolveMenuItems(addressMenu, {
+		conditions: {
+			'artifact-tab': soleTab?.kind === 'artifact',
+			'artifact-or-route-tab': soleTab?.kind === 'artifact' || soleTab?.kind === 'route',
+		},
+		disabled: (id) => (id === 'tab.close' ? isSoleTabPinned : false),
+		handlers: {
+			'pin-sidebar': () => setPinDialogOpen(true),
+			'tab.toggle-pin': () => leaf && toggleTabPinned(leaf.id, 0),
+			'copy-path': () => {
+				if (soleTab?.kind === 'artifact' || soleTab?.kind === 'route') {
+					void writeClipboardText(soleTab.path).catch(() => {});
+				}
+			},
+			'tab.close': () => leaf && closeTab(leaf.id, 0),
+		},
+	});
 
 	return (
 		<div
@@ -210,36 +230,18 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 						)}
 					/>
 				</ContextMenuTrigger>
-				{mergedTools && leaf && soleTab && (
+				{mergedTools && leaf && soleTab && addressMenuRows.length > 0 && (
 					<ContextMenuContent>
-						{soleTab.kind === 'artifact' && (
-							<>
-								<ContextMenuItem onSelect={() => setPinDialogOpen(true)}>
-									Pin to sidebar…
+						{addressMenuRows.map((row, i) =>
+							row.kind === 'separator' ? (
+								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+								<ContextMenuSeparator key={`sep-${i}`} />
+							) : (
+								<ContextMenuItem key={row.id} disabled={row.disabled} onSelect={row.run}>
+									{row.id === 'tab.toggle-pin' ? (isSoleTabPinned ? 'Unpin tab' : 'Pin tab') : row.label}
 								</ContextMenuItem>
-								<ContextMenuSeparator />
-							</>
+							)
 						)}
-						<ContextMenuItem onSelect={() => toggleTabPinned(leaf.id, 0)}>
-							{isSoleTabPinned ? 'Unpin tab' : 'Pin tab'}
-						</ContextMenuItem>
-						{(soleTab.kind === 'artifact' || soleTab.kind === 'route') && (
-							<>
-								<ContextMenuSeparator />
-								<ContextMenuItem
-									onSelect={() => void writeClipboardText(soleTab.path).catch(() => {})}
-								>
-									Copy path
-								</ContextMenuItem>
-							</>
-						)}
-						<ContextMenuSeparator />
-						<ContextMenuItem
-							disabled={isSoleTabPinned}
-							onSelect={() => closeTab(leaf.id, 0)}
-						>
-							Close
-						</ContextMenuItem>
 					</ContextMenuContent>
 				)}
 			</ContextMenu>

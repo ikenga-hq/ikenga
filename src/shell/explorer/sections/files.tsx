@@ -5,7 +5,6 @@ import {
 	Folder,
 	FileText,
 	AlertCircle,
-	Grid3x3,
 	RefreshCw,
 	Pencil,
 	Trash2,
@@ -41,6 +40,8 @@ import {
 import { useGitStatus } from '@/lib/shell/use-git-status';
 import { handToChi } from '@/shell/companion/companion-store';
 import { EmptyState } from '@/components/states';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -257,6 +258,30 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 	const fileGitStatus = entry.isDir ? undefined : gitStatus?.files.get(entry.path);
 	const isDirtyFolder = entry.isDir ? gitStatus?.dirtyFolders.has(entry.path) : false;
 
+	const filesMenu = useEffectiveMenu('files');
+	const menuRows = useMemo(
+		() =>
+			resolveMenuItems(filesMenu, {
+				conditions: { file: !entry.isDir, dir: entry.isDir },
+				handlers: {
+					open: () => openFile(),
+					'open-to-side': () => openArtifactInSplit(entry.path, 'right'),
+					'open-below': () => openArtifactInSplit(entry.path, 'bottom'),
+					'pin-sidebar': () => setPinOpen(true),
+					'files.open-as-artifact-grid': () => void openArtifactGrid(activeProjectId, entry.path),
+					'open-terminal-here': () => openTerminalAt(terminalCwd),
+					'open-terminal-side': () => openTerminalAt(terminalCwd, 'right'),
+					'open-terminal-below': () => openTerminalAt(terminalCwd, 'bottom'),
+					'hand-to-chi': () => handToChi(entry.path),
+					'copy-path': copyPath,
+					'copy-name': () => void writeClipboardText(entry.name).catch(() => {}),
+					rename: () => startRename(),
+					delete: () => void handleDelete(),
+				},
+			}),
+		[filesMenu, entry.isDir, entry.path, entry.name, openFile, copyPath, activeProjectId, terminalCwd, startRename, handleDelete]
+	);
+
 	return (
 		<div>
 			<ContextMenu>
@@ -363,51 +388,28 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 						)}
 					</ListRow>
 				</ContextMenuTrigger>
-				<ContextMenuContent>
-					{!entry.isDir && (
-						<>
-							<ContextMenuItem onSelect={() => openFile()}>Open</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openArtifactInSplit(entry.path, 'right')}>
-								Open to the Side
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openArtifactInSplit(entry.path, 'bottom')}>
-								Open Below
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-							<ContextMenuItem onSelect={() => setPinOpen(true)}>Pin to Sidebar…</ContextMenuItem>
-							<ContextMenuSeparator />
-						</>
-					)}
-					{entry.isDir && (
-						<>
-							<ContextMenuItem onSelect={() => void openArtifactGrid(activeProjectId, entry.path)}>
-								<Grid3x3 className="h-3.5 w-3.5" />
-								Open as Artifact Grid
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd)}>
-								Open in Terminal
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd, 'right')}>
-								Open in Terminal to the Side
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd, 'bottom')}>
-								Open in Terminal Below
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-						</>
-					)}
-					<ContextMenuItem onSelect={() => handToChi(entry.path)}>Hand to Chi</ContextMenuItem>
-					<ContextMenuItem onSelect={copyPath}>Copy Path</ContextMenuItem>
-					<ContextMenuItem onSelect={() => void writeClipboardText(entry.name).catch(() => {})}>
-						Copy Name
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem onSelect={() => startRename()}>Rename…</ContextMenuItem>
-					<ContextMenuItem variant="destructive" onSelect={() => void handleDelete()}>
-						Move to Trash
-					</ContextMenuItem>
-				</ContextMenuContent>
+				{menuRows.length > 0 && (
+					<ContextMenuContent>
+						{menuRows.map((row, i) =>
+							row.kind === 'separator' ? (
+								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+								<ContextMenuSeparator key={`sep-${i}`} />
+							) : (
+								<ContextMenuItem
+									key={row.id}
+									disabled={row.disabled}
+									variant={row.danger ? 'destructive' : undefined}
+									onSelect={row.run}
+								>
+									{row.label}
+									{row.shortcut && (
+										<span className="ml-auto pl-4 text-[10px] text-muted-foreground">{row.shortcut}</span>
+									)}
+								</ContextMenuItem>
+							)
+						)}
+					</ContextMenuContent>
+				)}
 			</ContextMenu>
 			{pinOpen && (
 				<PinArtifactDialog
@@ -825,6 +827,18 @@ export function FilesSection(_ctx: { projectId: string }) {
 		scrollSaveRef.current = window.setTimeout(() => setScrollTop(top), 150);
 	}, [setScrollTop]);
 
+	const viewMenu = useEffectiveMenu('files-view');
+	const viewRows = resolveMenuItems(viewMenu, {
+		handlers: {
+			'explorer.toggle-hidden': () => setShowHidden(!showHidden),
+			'files.toggle-ignored': () => setShowIgnored(!showIgnored),
+		},
+	});
+	const viewChecked: Record<string, boolean> = {
+		'explorer.toggle-hidden': showHidden,
+		'files.toggle-ignored': showIgnored,
+	};
+
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex items-center justify-between border-b border-border px-3 py-1.5">
@@ -843,19 +857,20 @@ export function FilesSection(_ctx: { projectId: string }) {
 						</button>
 					</DropdownMenuTrigger>
 					<DropdownMenuContent align="end" className="w-56">
-						<DropdownMenuCheckboxItem
-							checked={showHidden}
-							onCheckedChange={(v) => setShowHidden(Boolean(v))}
-						>
-							Show hidden files
-							<span className="ml-auto text-[10px] text-muted-foreground">⌘.</span>
-						</DropdownMenuCheckboxItem>
-						<DropdownMenuCheckboxItem
-							checked={showIgnored}
-							onCheckedChange={(v) => setShowIgnored(Boolean(v))}
-						>
-							Show ignored folders
-						</DropdownMenuCheckboxItem>
+						{viewRows.map((row) =>
+							row.kind === 'separator' ? null : (
+								<DropdownMenuCheckboxItem
+									key={row.id}
+									checked={viewChecked[row.id] ?? false}
+									onCheckedChange={() => row.run()}
+								>
+									{row.label}
+									{row.shortcut && (
+										<span className="ml-auto text-[10px] text-muted-foreground">{row.shortcut}</span>
+									)}
+								</DropdownMenuCheckboxItem>
+							)
+						)}
 					</DropdownMenuContent>
 				</DropdownMenu>
 			</div>

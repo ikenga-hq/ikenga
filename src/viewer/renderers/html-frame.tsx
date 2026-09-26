@@ -18,8 +18,11 @@ import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
+	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import { pickViewerRoot } from '../lib/relative-root';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
@@ -190,6 +193,23 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 	// to the pin composer on every right-click.
 	const [menu, setMenu] = useState<{ x: number; y: number; pick: PickResult } | null>(null);
 	const replaceView = usePaneStore((s) => s.replaceActiveViewAndPushHistory);
+	const viewerFrameMenu = useEffectiveMenu('viewer-frame');
+	const viewerFrameRows = resolveMenuItems(viewerFrameMenu, {
+		conditions: { 'html-in-pane': Boolean(paneId && isHtmlPath(path)) },
+		handlers: {
+			'viewer.add-pin': () => menu && setPick(menu.pick),
+			'copy-path': () => void writeClipboardText(path).catch(() => {}),
+			'viewer.open-in-studio': () =>
+				paneId && replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' }),
+			'viewer.reload': () => {
+				try {
+					iframeRef.current?.contentWindow?.location.reload();
+				} catch {
+					/* cross-origin or detached — ignore */
+				}
+			},
+		},
+	});
 
 	// Send a message to the child iframe. The frame is sandboxed to an opaque
 	// origin, so `targetOrigin` must be `'*'`: there is no origin string that
@@ -332,34 +352,18 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 						style={{ left: menu?.x ?? 0, top: menu?.y ?? 0 }}
 					/>
 				</DropdownMenuTrigger>
-				{menu && (
+				{menu && viewerFrameRows.length > 0 && (
 					<DropdownMenuContent align="start" sideOffset={0}>
-						<DropdownMenuItem onSelect={() => setPick(menu.pick)}>
-							Add pin / comment here…
-						</DropdownMenuItem>
-						<DropdownMenuItem onSelect={() => void writeClipboardText(path).catch(() => {})}>
-							Copy path
-						</DropdownMenuItem>
-						{paneId && isHtmlPath(path) && (
-							<DropdownMenuItem
-								onSelect={() =>
-									replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' })
-								}
-							>
-								Open in Studio
-							</DropdownMenuItem>
+						{viewerFrameRows.map((row, i) =>
+							row.kind === 'separator' ? (
+								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+								<DropdownMenuSeparator key={`sep-${i}`} />
+							) : (
+								<DropdownMenuItem key={row.id} onSelect={row.run}>
+									{row.label}
+								</DropdownMenuItem>
+							)
 						)}
-						<DropdownMenuItem
-							onSelect={() => {
-								try {
-									iframeRef.current?.contentWindow?.location.reload();
-								} catch {
-									/* cross-origin or detached — ignore */
-								}
-							}}
-						>
-							Reload
-						</DropdownMenuItem>
 					</DropdownMenuContent>
 				)}
 			</DropdownMenu>

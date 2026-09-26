@@ -6,8 +6,12 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { pkgKernelStatus, pkgPreviewManifest } from '@/lib/tauri-cmd';
 import { workflowGraphsFromManifest } from '@/shell/ngwa/use-pkg-workflow-graphs';
 import { cronToWords } from '@/shell/automations/cron-words';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
+// WP-04 stub array — real menu content is `getEffectiveMenu('automations')`
+// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
+// `contextMenu` field (out of this WP's FILES list; see the PR report).
 export const automationsContextMenu = [
 	{ id: 'run-now', label: 'Run now', run: () => {} },
 	{ id: 'pause-resume', label: 'Pause / Resume', run: () => {} },
@@ -129,24 +133,48 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 		);
 	}
 
+	const openNgwa = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
+	}, []);
+
+	const openRuns = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/automations?view=runs' });
+	}, []);
+
 	return (
 		<div className="py-1">
 			{items.map((item) => (
-				<ListRow
+				<EffectiveContextMenu
 					key={item.id}
-					size="sm"
-					onActivate={openAutomations}
-					title={item.name}
-					className="w-full gap-1.5 px-2"
+					menuId="automations"
+					handlers={{
+						// No per-item trigger/pause or definition-file endpoint
+						// exists yet (Ngwa's `workflows[]` / `cron[]` registries are
+						// read-only lists) — these open the surface that owns it.
+						'run-now': openAutomations,
+						'pause-resume': openAutomations,
+						'open-definition': openAutomations,
+						'open-last-log': openRuns,
+						'open-in-ngwa': openNgwa,
+					}}
 				>
-					{item.kind === 'workflow' ? (
-						<GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					) : (
-						<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					)}
-					<span className="flex-1 truncate text-xs">{item.name}</span>
-					<span className="text-[10px] text-muted-foreground font-mono">{item.schedule}</span>
-				</ListRow>
+					<ListRow
+						size="sm"
+						onActivate={openAutomations}
+						title={item.name}
+						className="w-full gap-1.5 px-2"
+					>
+						{item.kind === 'workflow' ? (
+							<GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						) : (
+							<Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						)}
+						<span className="flex-1 truncate text-xs">{item.name}</span>
+						<span className="text-[10px] text-muted-foreground font-mono">{item.schedule}</span>
+					</ListRow>
+				</EffectiveContextMenu>
 			))}
 		</div>
 	);

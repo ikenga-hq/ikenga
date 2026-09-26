@@ -33,8 +33,6 @@
 //                           native surface on its previous page.
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Ban, Bolt, PinOff, RefreshCw, Settings, Shield } from 'lucide-react';
-import { DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneId, PaneView } from '@/lib/panes/types';
@@ -46,6 +44,7 @@ import {
 import { useKeepBlocking } from '@/lib/pkg/pkg-blocked-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { pkgKernelStatus, pkgSupervisorRestart } from '@/lib/tauri-cmd';
+import type { MenuItemCondition } from '@/lib/actions/store';
 
 interface SupervisorRegistry {
 	entries?: Array<{ pkg_id: string }>;
@@ -60,15 +59,22 @@ export function usePkgIdForPane(paneId: PaneId): string | null {
 	});
 }
 
-export function PkgPaneMenuItems({
-	paneId,
-	pkgId,
-	onReload,
-}: {
-	paneId: PaneId;
-	pkgId: string;
-	onReload: () => void;
-}) {
+/**
+ * The pkg branch of the pane `⋯` menu (§1.3's `pane` menu, `pkg-*`
+ * conditions) as conditions + handlers `pane-toolbar.tsx` folds into its own
+ * `resolveMenuItems('pane', ...)` call — the whole menu (pkg branch, artifact
+ * branch and the plain items) resolves and renders from one effective menu,
+ * so reordering/hiding in `actions.json` reaches every branch, not just the
+ * plain items.
+ */
+export function usePkgPaneMenuData(
+	paneId: PaneId,
+	pkgId: string | null,
+	onReload: () => void
+): {
+	conditions: Partial<Record<MenuItemCondition, boolean>>;
+	handlers: Record<string, () => void>;
+} {
 	const addTab = usePaneStore((s) => s.addTab);
 	// Same key + staleness as `useWebviewRoute` (pane-views.tsx) so the pane
 	// chrome shares one kernel-status read.
@@ -78,80 +84,46 @@ export function PkgPaneMenuItems({
 		staleTime: Infinity,
 	});
 	const supervised = Boolean(
-		(status?.registries?.sidecar_supervisor as SupervisorRegistry | undefined)?.entries?.some(
-			(e) => e.pkg_id === pkgId
-		)
+		pkgId &&
+			(status?.registries?.sidecar_supervisor as SupervisorRegistry | undefined)?.entries?.some(
+				(e) => e.pkg_id === pkgId
+			)
 	);
 	const pin = usePinsStore((s) =>
-		s.pins.find(
-			(p) =>
-				(p.kind === 'pkg-route' || p.kind === 'route') && pkgIdFromRoutePath(p.target) === pkgId
-		)
+		pkgId
+			? s.pins.find(
+					(p) => (p.kind === 'pkg-route' || p.kind === 'route') && pkgIdFromRoutePath(p.target) === pkgId
+				)
+			: undefined
 	);
 	const removePin = usePinsStore((s) => s.removePin);
-	const keepBlocking = useKeepBlocking(pkgId, paneId);
+	const keepBlocking = useKeepBlocking(pkgId ?? '', paneId);
 
 	const openRoute = (path: string) => addTab(paneId, { kind: 'route', path });
 
-	return (
-		<>
-			{keepBlocking && (
-				<DropdownMenuItem onSelect={keepBlocking} data-action="pkg.keep-blocking">
-					<Ban className="h-3.5 w-3.5" />
-					Keep blocking
-				</DropdownMenuItem>
-			)}
-			<DropdownMenuItem onSelect={onReload} data-action="pkg.reload-view">
-				<RefreshCw className="h-3.5 w-3.5" />
-				Reload view
-			</DropdownMenuItem>
-			<DropdownMenuItem
-				onSelect={() => openRoute(itemDetailPath(pkgId))}
-				data-action="pkg.view-permissions"
-			>
-				<Shield className="h-3.5 w-3.5" />
-				View permissions
-			</DropdownMenuItem>
-			<DropdownMenuItem
-				onSelect={() => openRoute(itemDetailPath(pkgId))}
-				data-action="pkg.package-settings"
-			>
-				<Settings className="h-3.5 w-3.5" />
-				Package settings
-			</DropdownMenuItem>
-			{supervised && (
-				<DropdownMenuItem
-					onSelect={() => {
-						pkgSupervisorRestart(pkgId).catch((e) =>
-							console.warn(`[pkg-pane-menu] restart sidecar for ${pkgId} failed:`, e)
-						);
-					}}
-					data-action="pkg.restart-sidecar"
-				>
-					<Bolt className="h-3.5 w-3.5" />
-					Restart sidecar
-				</DropdownMenuItem>
-			)}
-			<DropdownMenuSeparator />
-			{pin && (
-				<DropdownMenuItem
-					onSelect={() => {
-						removePin(pin.id).catch(() => {});
-					}}
-					data-action="pkg.unpin"
-				>
-					<PinOff className="h-3.5 w-3.5" />
-					Unpin
-				</DropdownMenuItem>
-			)}
-			<DropdownMenuItem
-				onSelect={() => openRoute(VIOLATION_LOG_PATH)}
-				data-action="pkg.report-violation-log"
-			>
-				<AlertTriangle className="h-3.5 w-3.5" />
-				Report violation log
-			</DropdownMenuItem>
-			<DropdownMenuSeparator />
-		</>
-	);
+	if (!pkgId) return { conditions: { 'pkg-pane': false }, handlers: {} };
+
+	return {
+		conditions: {
+			'pkg-pane': true,
+			'pkg-blocking': Boolean(keepBlocking),
+			'pkg-supervised': supervised,
+			'pkg-pinned': Boolean(pin),
+		},
+		handlers: {
+			'pkg.keep-blocking': () => keepBlocking?.(),
+			'pkg.reload-view': onReload,
+			'pkg.view-permissions': () => openRoute(itemDetailPath(pkgId)),
+			'pkg.package-settings': () => openRoute(itemDetailPath(pkgId)),
+			'pkg.restart-sidecar': () => {
+				pkgSupervisorRestart(pkgId).catch((e) =>
+					console.warn(`[pkg-pane-menu] restart sidecar for ${pkgId} failed:`, e)
+				);
+			},
+			'pkg.unpin': () => {
+				if (pin) removePin(pin.id).catch(() => {});
+			},
+			'pkg.report-violation-log': () => openRoute(VIOLATION_LOG_PATH),
+		},
+	};
 }

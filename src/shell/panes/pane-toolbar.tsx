@@ -1,34 +1,13 @@
-import {
-	ArrowLeft,
-	ArrowRight,
-	Camera,
-	Code2,
-	ExternalLink,
-	FolderOpen,
-	History,
-	Link as LinkIcon,
-	Monitor,
-	MoreHorizontal,
-	Pin as PinIcon,
-	RefreshCw,
-	RotateCcw,
-	Send,
-	Smartphone,
-	SplitSquareHorizontal,
-	SplitSquareVertical,
-	Tablet,
-	X,
-	ZoomIn,
-	ZoomOut,
-} from 'lucide-react';
-import { labelFor } from '@/lib/keymap/registry';
+import { MoreHorizontal, RefreshCw } from 'lucide-react';
 import type { PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { hasAddressBar } from '@/lib/panes/pane-address';
 import { IconButton } from '@/components/ui/icon-button';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
 import { useWebviewRoute } from './pane-views';
-import { PkgPaneMenuItems, usePkgIdForPane } from './pkg-pane-menu';
+import { usePkgIdForPane, usePkgPaneMenuData } from './pkg-pane-menu';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -43,12 +22,22 @@ import {
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { openExternalUrl, writeClipboardText } from '@/lib/transport';
 import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
-import { useState } from 'react';
+import { type ReactNode, useState } from 'react';
 import { cn } from '@/components/ui/utils';
+import { labelFor } from '@/lib/keymap/registry';
 import { handToChi } from '@/shell/companion/companion-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
+
+// The viewer-zoom row ids show the window-level `zoom.*` key labels, not
+// their own (they have none — the effective keymap binds the shared
+// per-window zoom commands, per G-ACTIONS §1.3's rendering-rule note).
+const ZOOM_SHORTCUT_COMMAND: Readonly<Record<string, string>> = {
+	'viewer.zoom-in': 'zoom.in',
+	'viewer.zoom-out': 'zoom.out',
+	'viewer.zoom-reset': 'zoom.reset',
+};
 
 interface PaneToolbarProps {
 	paneId: PaneId;
@@ -126,7 +115,6 @@ export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: Pane
 	});
 
 	const splitDisabled = !canSplit;
-	const splitTitle = splitDisabled ? 'Max 6 panes' : undefined;
 	const closeDisabled = leafCount <= 1;
 	const canCopyPath = Boolean(activeTab && hasAddressBar(activeTab));
 	// WP-45: pkg views get the D-08 `pkg-view` menu branch.
@@ -145,6 +133,65 @@ export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: Pane
 	const alreadyPinned = usePinsStore((s) =>
 		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
 	);
+
+	const artifactOrRouteTab = canCopyPath && (activeTab?.kind === 'artifact' || activeTab?.kind === 'route');
+	const pkgMenuData = usePkgPaneMenuData(paneId, pkgId, reload);
+	const paneMenu = useEffectiveMenu('pane');
+	const paneMenuRows = resolveMenuItems(paneMenu, {
+		conditions: {
+			history: Boolean(history),
+			'artifact-tab': isArtifact,
+			'artifact-or-route-tab': artifactOrRouteTab,
+			...pkgMenuData.conditions,
+		},
+		disabled: (id) =>
+			id === 'pane.back'
+				? !history?.canGoBack
+				: id === 'pane.forward'
+					? !history?.canGoForward
+					: id === 'pane.split-right' || id === 'pane.split-down'
+						? splitDisabled
+						: id === 'viewer.open-in-browser' || id === 'viewer.copy-url'
+							? !isHtmlArtifact
+							: id === 'viewer.pin-to-artifacts'
+								? alreadyPinned
+								: id === 'pane.close'
+									? closeDisabled
+									: false,
+		handlers: {
+			'pane.back': () => history?.back(),
+			'pane.forward': () => history?.forward(),
+			...pkgMenuData.handlers,
+			'pane.split-right': () => splitPane(paneId, 'horizontal'),
+			'pane.split-down': () => splitPane(paneId, 'vertical'),
+			'copy-path': () => {
+				if (activeTab && (activeTab.kind === 'artifact' || activeTab.kind === 'route')) {
+					void writeClipboardText(activeTab.path).catch(() => {});
+				}
+			},
+			'viewer.open-in-browser': () =>
+				artifactPath &&
+				void resolveHtmlViewerUrl(artifactPath).then((url) => openExternalUrl(url)).catch(() => {}),
+			'viewer.toggle-source': () =>
+				setVariant(paneId, viewerState.variant === 'source' ? 'default' : 'source'),
+			'reveal-files': () => artifactPath && revealPath(artifactPath),
+			'viewer.copy-url': () =>
+				artifactPath &&
+				void resolveHtmlViewerUrl(artifactPath).then((url) => writeClipboardText(url)).catch(() => {}),
+			'viewer.zoom-in': () => zoomBy(paneId, 10),
+			'viewer.zoom-out': () => zoomBy(paneId, -10),
+			'viewer.zoom-reset': () => resetZoom(paneId),
+			'viewer.device-phone': () => setDevice(paneId, '390'),
+			'viewer.device-tablet': () => setDevice(paneId, '768'),
+			'viewer.device-full': () => setDevice(paneId, 'full'),
+			'pane.screenshot': () => void screenshotPane(paneId).catch(() => {}),
+			'viewer.pin-to-artifacts': () => onPinToArtifacts?.(),
+			'hand-to-chi': () => artifactPath && handToChi(artifactPath),
+			'viewer.toggle-history': () =>
+				setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history'),
+			'pane.close': () => closePane(paneId),
+		},
+	});
 
 	return (
 		<div
@@ -176,161 +223,73 @@ export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: Pane
 					</IconButton>
 				</DropdownMenuTrigger>
 				<DropdownMenuContent align="end" className="w-64">
-					{history && (
-						<>
-							<DropdownMenuItem disabled={!history.canGoBack} onSelect={() => history.back()}>
-								<ArrowLeft className="h-3.5 w-3.5" />
-								Back
-							</DropdownMenuItem>
-							<DropdownMenuItem disabled={!history.canGoForward} onSelect={() => history.forward()}>
-								<ArrowRight className="h-3.5 w-3.5" />
-								Forward
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-						</>
-					)}
-					{/* WP-45: the pkg branch leads, per the design's pkgDotsMenu() order. */}
-					{pkgId && <PkgPaneMenuItems paneId={paneId} pkgId={pkgId} onReload={reload} />}
-					<DropdownMenuItem
-						disabled={splitDisabled}
-						title={splitTitle}
-						onSelect={() => splitPane(paneId, 'horizontal')}
-					>
-						<SplitSquareHorizontal className="h-3.5 w-3.5" />
-						Split right
-						<DropdownMenuShortcut>{labelFor('pane.split-right')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
-					<DropdownMenuItem
-						disabled={splitDisabled}
-						title={splitTitle}
-						onSelect={() => splitPane(paneId, 'vertical')}
-					>
-						<SplitSquareVertical className="h-3.5 w-3.5" />
-						Split down
-						<DropdownMenuShortcut>{labelFor('pane.split-down')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
-					{canCopyPath && activeTab && (activeTab.kind === 'artifact' || activeTab.kind === 'route') && (
-						<>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem
-								onSelect={() => void writeClipboardText(activeTab.path).catch(() => {})}
-							>
-								Copy path
-							</DropdownMenuItem>
-						</>
-					)}
-					{isArtifact && artifactPath && (
-						<>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem
-								disabled={!isHtmlArtifact}
-								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
-								onSelect={() =>
-									void resolveHtmlViewerUrl(artifactPath)
-										.then((url) => openExternalUrl(url))
-										.catch(() => {})
+					{(() => {
+						const out: ReactNode[] = [];
+						let radioOpen = false;
+						paneMenuRows.forEach((row, i) => {
+							if (row.kind === 'separator') {
+								if (radioOpen) {
+									radioOpen = false;
 								}
-							>
-								<ExternalLink className="h-3.5 w-3.5" />
-								Open in browser
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								onSelect={() => setVariant(paneId, viewerState.variant === 'source' ? 'default' : 'source')}
-							>
-								<Code2 className="h-3.5 w-3.5" />
-								{viewerState.variant === 'source' ? 'Close source' : 'Open source'}
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => revealPath(artifactPath)}>
-								<FolderOpen className="h-3.5 w-3.5" />
-								Reveal in Files
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								disabled={!isHtmlArtifact}
-								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
-								onSelect={() =>
-									void resolveHtmlViewerUrl(artifactPath)
-										.then((url) => writeClipboardText(url))
-										.catch(() => {})
+								out.push(<DropdownMenuSeparator key={`sep-${i}`} />);
+								return;
+							}
+							if (row.display === 'radio') {
+								if (!radioOpen) {
+									radioOpen = true;
+									out.push(
+										<DropdownMenuLabel
+											key="device-width-label"
+											className="px-2 py-1 text-[10px] uppercase text-muted-foreground"
+										>
+											Device width
+										</DropdownMenuLabel>
+									);
+									out.push(
+										<DropdownMenuRadioGroup
+											key="device-width-group"
+											value={viewerState.device}
+											onValueChange={(v) => setDevice(paneId, v as DeviceWidth)}
+										>
+											{paneMenuRows
+												.filter((r) => r.kind === 'item' && r.display === 'radio')
+												.map((r) => {
+													const item = r as Extract<typeof r, { kind: 'item' }>;
+													return (
+														<DropdownMenuRadioItem
+															key={item.id}
+															value={
+																item.id === 'viewer.device-phone'
+																	? '390'
+																	: item.id === 'viewer.device-tablet'
+																		? '768'
+																		: 'full'
+															}
+														>
+															{item.label}
+														</DropdownMenuRadioItem>
+													);
+												})}
+										</DropdownMenuRadioGroup>
+									);
 								}
-							>
-								<LinkIcon className="h-3.5 w-3.5" />
-								Copy viewer URL
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={() => zoomBy(paneId, 10)}>
-								<ZoomIn className="h-3.5 w-3.5" />
-								Zoom in
-								<DropdownMenuShortcut>⌘+</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => zoomBy(paneId, -10)}>
-								<ZoomOut className="h-3.5 w-3.5" />
-								Zoom out
-								<DropdownMenuShortcut>⌘−</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => resetZoom(paneId)}>
-								<RotateCcw className="h-3.5 w-3.5" />
-								Reset zoom ({viewerState.zoom}%)
-								<DropdownMenuShortcut>⌘0</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-							<DropdownMenuLabel className="px-2 py-1 text-[10px] uppercase text-muted-foreground">
-								Device width
-							</DropdownMenuLabel>
-							<DropdownMenuRadioGroup
-								value={viewerState.device}
-								onValueChange={(v) => setDevice(paneId, v as DeviceWidth)}
-							>
-								<DropdownMenuRadioItem value="390">
-									<Smartphone className="h-3.5 w-3.5" />
-									390 · phone
-								</DropdownMenuRadioItem>
-								<DropdownMenuRadioItem value="768">
-									<Tablet className="h-3.5 w-3.5" />
-									768 · tablet
-								</DropdownMenuRadioItem>
-								<DropdownMenuRadioItem value="full">
-									<Monitor className="h-3.5 w-3.5" />
-									Full width
-								</DropdownMenuRadioItem>
-							</DropdownMenuRadioGroup>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={() => void screenshotPane(paneId).catch(() => {})}>
-								<Camera className="h-3.5 w-3.5" />
-								Screenshot
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								disabled={alreadyPinned}
-								title={alreadyPinned ? 'Already pinned' : undefined}
-								onSelect={() => onPinToArtifacts?.()}
-							>
-								<PinIcon className="h-3.5 w-3.5" />
-								Pin to Artifacts
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => handToChi(artifactPath)}>
-								<Send className="h-3.5 w-3.5" />
-								Hand to Chi
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								onSelect={() =>
-									setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history')
-								}
-							>
-								<History className="h-3.5 w-3.5" />
-								{viewerState.variant === 'history' ? 'Close version history' : 'Version history'}
-							</DropdownMenuItem>
-						</>
-					)}
-					<DropdownMenuSeparator />
-					<DropdownMenuItem
-						disabled={closeDisabled}
-						title={closeDisabled ? 'Cannot close last pane' : undefined}
-						onSelect={() => closePane(paneId)}
-						variant="destructive"
-					>
-						<X className="h-3.5 w-3.5" />
-						Close pane
-						<DropdownMenuShortcut>{labelFor('pane.close')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
+								return;
+							}
+							const shortcut = ZOOM_SHORTCUT_COMMAND[row.id] ? labelFor(ZOOM_SHORTCUT_COMMAND[row.id]) : row.shortcut;
+							out.push(
+								<DropdownMenuItem
+									key={row.id}
+									disabled={row.disabled}
+									variant={row.danger ? 'destructive' : undefined}
+									onSelect={row.run}
+								>
+									{row.label}
+									{shortcut && <DropdownMenuShortcut>{shortcut}</DropdownMenuShortcut>}
+								</DropdownMenuItem>
+							);
+						});
+						return out;
+					})()}
 				</DropdownMenuContent>
 			</DropdownMenu>
 		</div>
