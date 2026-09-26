@@ -28,6 +28,8 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { IconButton } from '@/components/ui/icon-button';
 import { cn } from '@/components/ui/utils';
 import { useFocusTrap } from '@/lib/a11y/focus';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { extractManifestJson } from '@/lib/artifact/manifest-from-file';
 import { writeManifestIntoHtml } from '@/lib/artifact/manifest-write';
 import { routeOutcomeLabel, routePin } from '@/lib/artifact/route-pin';
@@ -175,16 +177,10 @@ export function StudioLoupe({ path, paneId, attachedTerminalId }: StudioLoupePro
 		[path]
 	);
 
-	const onKeyDown = useCallback(
-		(e: React.KeyboardEvent<HTMLDivElement>) => {
-			const isSave = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's';
-			if (isSave) {
-				e.preventDefault();
-				void save();
-			}
-		},
-		[save]
-	);
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from a local ⌘S `onKeyDown` to
+	// the registry `studio.loupe-save` command, scoped by the new `loupeFocus`
+	// key (B-21) marked on the pane root below.
+	useCommands({ 'studio.loupe-save': () => void save() });
 
 	const updateManifest = useCallback(
 		(next: ArtifactManifest, opts: { save?: boolean } = {}) => {
@@ -223,7 +219,7 @@ export function StudioLoupe({ path, paneId, attachedTerminalId }: StudioLoupePro
 	return (
 		<div
 			className="flex h-full w-full flex-col bg-background"
-			onKeyDown={onKeyDown}
+			{...focusMarkerProps('loupe')}
 			data-pane-id={paneId}
 			role="application"
 			aria-label="Artifact Studio"

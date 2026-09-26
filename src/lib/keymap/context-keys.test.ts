@@ -42,7 +42,7 @@ afterEach(() => {
 });
 
 describe('vocabulary (§4.3)', () => {
-	it('is exactly the frozen DEC-62 keys plus the five freeze additions', () => {
+	it('is exactly the frozen DEC-62 keys plus the freeze additions and WP-56\'s B-21 additions', () => {
 		expect(Object.keys(CONTEXT_KEYS).sort()).toEqual(
 			[
 				'inputFocus',
@@ -59,6 +59,12 @@ describe('vocabulary (§4.3)', () => {
 				'ngwaItemKind',
 				'dispatchFocus',
 				'paletteOpen',
+				// WP-56 (B-21 additive rule, G-ACTIONS §10.2 "Reserved for WP-56").
+				'permissionCardFocus',
+				'approveGateFocus',
+				'loupeFocus',
+				'pinComposerFocus',
+				'markdownEditorFocus',
 			].sort()
 		);
 		expect(isKnownContextKey('ngwaItemKind')).toBe(true);
@@ -78,6 +84,11 @@ describe('vocabulary (§4.3)', () => {
 				'ngwaItemFocus',
 				'dispatchFocus',
 				'paletteOpen',
+				'permissionCardFocus',
+				'approveGateFocus',
+				'loupeFocus',
+				'pinComposerFocus',
+				'markdownEditorFocus',
 			].sort()
 		);
 	});

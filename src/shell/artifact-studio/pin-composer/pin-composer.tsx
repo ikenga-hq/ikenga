@@ -23,6 +23,8 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { routeOutcomeLabel, routePin } from '@/lib/artifact/route-pin';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { commentCreate, pinScreenshotWrite } from '@/lib/tauri-cmd';
 import {
 	readArtifactSink,
@@ -134,6 +136,12 @@ export function PinComposer({
 		}
 	};
 
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from a local ⌘↵ `onKeyDown` on
+	// the textarea to the registry `studio.pin-submit` command, scoped by the
+	// new `pinComposerFocus` key (B-21). Radix unmounts the textarea (and so
+	// the marker) while the dialog is closed, so this never fires then.
+	useCommands({ 'studio.pin-submit': () => void submit() });
+
 	return (
 		<Dialog
 			open={open && pick !== null}
@@ -175,12 +183,7 @@ export function PinComposer({
 					rows={4}
 					disabled={busy}
 					className="w-full resize-none rounded border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-					onKeyDown={(e) => {
-						if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-							e.preventDefault();
-							void submit();
-						}
-					}}
+					{...focusMarkerProps('pin-composer')}
 				/>
 
 				{error && <p className="text-xs text-destructive">{error}</p>}

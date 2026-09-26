@@ -3,6 +3,8 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { AlertCircle, Loader2, RefreshCw } from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { Markdown } from '@/components/markdown';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { fsListenWatch, fsRead, fsUnwatch, fsWatch, fsWriteText } from '@/lib/tauri-cmd';
 import type { UnlistenFn } from '@/lib/transport';
 import { MarkdownToolbar, type SaveState } from './markdown-toolbar';
@@ -135,28 +137,28 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 		}
 	}, [draft]);
 
-	// ── Keyboard: ⌘/Ctrl + S / B / I while editing ───────────────────────────
-	const saveRef = useRef(save);
-	saveRef.current = save;
-	useEffect(() => {
-		if (mode !== 'edit') return;
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (!(e.metaKey || e.ctrlKey)) return;
-			const k = e.key.toLowerCase();
-			if (k === 's') {
-				e.preventDefault();
-				void saveRef.current();
-			} else if (k === 'b' && editorRef.current?.view()?.hasFocus) {
-				e.preventDefault();
-				onWrap('**');
-			} else if (k === 'i' && editorRef.current?.view()?.hasFocus) {
-				e.preventDefault();
-				onWrap('_');
-			}
-		};
-		window.addEventListener('keydown', onKeyDown);
-		return () => window.removeEventListener('keydown', onKeyDown);
-	}, [mode, onWrap]);
+	// ── Keyboard: ⌘S save · ⌘B/⌘I bold/italic while editing ──────────────────
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from a window-level `keydown`
+	// listener to registry commands (`markdown.save/bold/italic`), scoped by
+	// the new `markdownEditorFocus` key (B-21, marked on the edit container
+	// below) instead of the `mode === 'edit'` closure guard. Bold/italic keep
+	// their extra CodeMirror-focus check — the marker only says the editor
+	// pane has DOM focus, not that the CodeMirror view specifically does.
+	// `markdown.bold` shares `mod+b` with `explorer.toggle` (`always`) by
+	// precedence, not a clash (DEC-59, §2.3): `markdownEditorFocus` is more
+	// specific and wins while it holds.
+	useCommands(
+		{
+			'markdown.save': () => void save(),
+			'markdown.bold': () => {
+				if (editorRef.current?.view()?.hasFocus) onWrap('**');
+			},
+			'markdown.italic': () => {
+				if (editorRef.current?.view()?.hasFocus) onWrap('_');
+			},
+		},
+		{ enabled: mode === 'edit' }
+	);
 
 	// ── Warn before losing unsaved edits on app close / reload ───────────────
 	useEffect(() => {
@@ -253,7 +255,7 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 	}
 
 	return (
-		<div className="flex h-full w-full flex-col">
+		<div className="flex h-full w-full flex-col" {...focusMarkerProps('markdown-editor')}>
 			<MarkdownToolbar
 				mode={mode}
 				dirty={dirty}

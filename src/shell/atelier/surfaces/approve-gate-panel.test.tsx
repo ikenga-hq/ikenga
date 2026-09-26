@@ -4,6 +4,7 @@
 
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isMacPlatform } from '@/lib/keymap/platform';
 import {
 	deriveWorkerHealth,
 	type PausedDraftView,
@@ -14,6 +15,11 @@ import { ApproveGatePanel } from './approve-gate-panel';
 import { APPROVE_GATE_FIXTURES } from './approve-gate-panel.fixtures';
 
 afterEach(cleanup);
+
+// WP-56: J/K and ⌘S/⌘↵ now fire through the registry (`approve-gate.*`,
+// `approveGateFocus`), which resolves `mod` per-platform (§3.1) rather than
+// the old handler's platform-agnostic `e.metaKey || e.ctrlKey`.
+const MOD = isMacPlatform() ? { metaKey: true } : { ctrlKey: true };
 
 function setup(
 	over: Partial<Record<'onApprove' | 'onReject' | 'onEdit', ReturnType<typeof vi.fn>>> = {}
@@ -78,7 +84,7 @@ describe('ApproveGatePanel', () => {
 		fireEvent.change(screen.getByLabelText('Email subject'), {
 			target: { value: 'Re: Catalog import — updated' },
 		});
-		fireEvent.keyDown(screen.getByLabelText('Email body'), { key: 's', metaKey: true });
+		fireEvent.keyDown(screen.getByLabelText('Email body'), { key: 's', ...MOD });
 		expect(h.onEdit).toHaveBeenCalled();
 		expect(screen.getByText(/Saved/)).toBeTruthy();
 	});
