@@ -3,6 +3,7 @@
 //! in `src/lib/tauri-cmd.ts` mirror this, so later phases just fill in the
 //! Rust side.
 
+pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;
 pub mod agent_ops;
@@ -53,6 +54,7 @@ pub mod trust;
 pub mod viewer;
 pub mod window;
 
+pub use action_exec::{action_exec, action_git_branch};
 pub use actions::{
     actions_open_file, actions_read_files, actions_trust_grant, actions_trust_revoke,
     actions_trust_status, actions_write, keybindings_write,

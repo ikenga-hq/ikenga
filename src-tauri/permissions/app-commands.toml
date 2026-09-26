@@ -36,6 +36,8 @@ frontend from the trusted local viewer-server. Deliberately NOT granted to
 `pkg-*` webviews, which mount arbitrary third-party partner portals.
 """
 commands.allow = [
+  "action_exec",
+  "action_git_branch",
   "actions_open_file",
   "actions_read_files",
   "actions_trust_grant",
