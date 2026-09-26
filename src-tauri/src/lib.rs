@@ -42,6 +42,9 @@ pub mod server;
 pub mod settings;
 
 // --- Desktop-only ---
+// WP-50: actions.json / keybindings.json file layer + project-trust record.
+#[cfg(feature = "desktop")]
+pub mod actions;
 #[cfg(feature = "desktop")]
 mod agent_detect;
 #[cfg(feature = "desktop")]
@@ -91,6 +94,11 @@ use tokio::sync::Mutex;
 use commands::db::PaDb;
 #[cfg(feature = "desktop")]
 use commands::screenshot::new_pending as new_screenshot_pending;
+#[cfg(feature = "desktop")]
+use commands::{
+    actions_open_file, actions_read_files, actions_trust_grant, actions_trust_revoke,
+    actions_trust_status, actions_write, keybindings_write,
+};
 #[cfg(feature = "desktop")]
 use commands::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
@@ -458,6 +466,30 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = manager.refresh_watch().await {
                             tracing::warn!("[settings] project watcher refresh failed: {e}");
+                        }
+                    });
+                });
+            }
+
+            // WP-50: actions.json / keybindings.json watchers (personal +
+            // active project, `actions://changed`) and the trust record.
+            let actions_manager = Arc::new(actions::ActionsManager::new(
+                app.handle().clone(),
+                pa_db.clone(),
+                data_dir.clone(),
+            ));
+            if let Err(e) = tauri::async_runtime::block_on(actions_manager.refresh_watch()) {
+                tracing::warn!("[actions] watcher initialization failed: {e}");
+            }
+            app.manage(actions_manager.clone());
+            {
+                use tauri::Listener;
+                let app_for_actions = app.handle().clone();
+                app_for_actions.listen("projects:active-changed", move |_evt| {
+                    let manager = actions_manager.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = manager.refresh_watch().await {
+                            tracing::warn!("[actions] project watcher refresh failed: {e}");
                         }
                     });
                 });
@@ -1187,6 +1219,14 @@ pub fn run() {
             settings_read_file,
             settings_write_field,
             settings_open_file,
+            // actions — WP-50 actions.json / keybindings.json + project trust
+            actions_read_files,
+            actions_write,
+            keybindings_write,
+            actions_open_file,
+            actions_trust_status,
+            actions_trust_grant,
+            actions_trust_revoke,
             // notifications — WP-40 aggregation table (D-07 notification centre)
             notifications_list,
             notifications_unread_count,
