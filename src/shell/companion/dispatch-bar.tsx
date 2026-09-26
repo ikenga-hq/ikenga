@@ -4,6 +4,8 @@
 
 import { SendHorizontal } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { resolveHostedKeypress } from '@/lib/keymap/dispatcher';
 import { labelFor } from '@/lib/keymap/registry';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useCompanionStore } from './companion-store';
@@ -19,6 +21,13 @@ const recall = new Map<string, string[]>();
 function targetKey(t: CompanionTarget): string {
 	return t.kind === 'session' ? `session:${t.session_id}` : `${t.kind}:${t.engine_id ?? ''}`;
 }
+
+/** Hosted command → dispatch mode (§4.6). */
+const DISPATCH_MODE: Readonly<Record<string, 'target' | 'new' | 'persistent'>> = {
+	'companion.send': 'target',
+	'companion.new-run': 'new',
+	'companion.persistent-run': 'persistent',
+};
 
 export function DispatchBar() {
 	const target = useShellStore((s) => s.companion.activeTarget);
@@ -85,9 +94,17 @@ export function DispatchBar() {
 	}
 
 	function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-		if (e.key === 'Enter') {
+		// The three dispatch keys are hosted registry commands (G-ACTIONS §4.6,
+		// A-2): `companion.send` / `new-run` / `persistent-run`, `when:
+		// dispatchFocus`. Their keys come from the effective keymap (so a
+		// rebind in `keybindings.json` changes what sends), and this input —
+		// their owner — fires them; the frame dispatcher never does, and
+		// leaves a keystroke they claim alone.
+		const hosted = resolveHostedKeypress(e.nativeEvent, 'dispatch');
+		const mode = hosted ? DISPATCH_MODE[hosted.command] : undefined;
+		if (mode) {
 			e.preventDefault();
-			void dispatch(e.altKey ? 'persistent' : e.shiftKey ? 'new' : 'target');
+			void dispatch(mode);
 			return;
 		}
 		if (e.key === 'ArrowUp' && !draft) {
@@ -133,6 +150,7 @@ export function DispatchBar() {
 					placeholder="Dispatch an instruction…"
 					aria-label="Dispatch an instruction"
 					data-companion-dispatch=""
+					{...focusMarkerProps('dispatch')}
 					className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-[var(--fg-muted)] disabled:cursor-not-allowed"
 					style={{ color: 'var(--fg)' }}
 				/>

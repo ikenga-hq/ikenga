@@ -2572,6 +2572,14 @@ export interface IykeKeymapEntry {
 	/** Platform-resolved key hint (`⌘K` on macOS, `Ctrl+K` elsewhere). */
 	key_label: string;
 	platform_only?: 'mac' | 'other';
+	/** WP-62 review (S3, DEC-65): `held` for a project rule dropped from the
+	 *  effective keymap while its project's keybindings are untrusted — it
+	 *  fires nothing and holds no key (G-ACTIONS §2.2 step 0). Absent =
+	 *  `active`, the pre-existing rows every consumer already expects. */
+	status?: 'active' | 'held';
+	/** The trust state holding the rule (`untrusted`, `changed`, or
+	 *  `unknown`); present only when `status: "held"`. */
+	trust?: string;
 }
 
 /** WP-28: one `GET /iyke/explorer/sections` row — mirrors
@@ -2603,6 +2611,69 @@ export async function iykeSetFrame(args: {
 	});
 }
 
+/** WP-62: one mirrored effective action row served by `GET /iyke/actions` —
+ *  opaque to Rust (`src-tauri/src/iyke/actions_routes.rs` stores it as
+ *  `serde_json::Value`, same convention as `ShellSnapshot.panes`). This FE
+ *  interface is the schema. */
+export interface IykeActionMirror {
+	id: string;
+	name: string;
+	icon?: string;
+	description: string;
+	source: 'builtin' | 'package' | 'personal' | 'project';
+	run_kind: string;
+	placements: string[];
+	locked: boolean;
+	hosted: boolean;
+	danger: boolean;
+	pkg_id?: string;
+	/** WP-62 review (S3, DEC-55): a project action's trust state
+	 *  (`ActionTrust.state`), fail-closed to `untrusted` when the trust
+	 *  record has no entry for it yet. Absent for every other source. */
+	trust_state?: string;
+}
+
+export interface IykeMenuMirrorItem {
+	kind: 'action' | 'separator';
+	id?: string;
+	name?: string;
+	source?: string;
+	when?: string;
+}
+
+/** WP-62: one mirrored effective menu served by `GET /iyke/menus/:id`. */
+export interface IykeMenuMirror {
+	id: string;
+	items: IykeMenuMirrorItem[];
+	hidden: string[];
+}
+
+/**
+ * WP-62: push the effective actions/menus mirror `GET /iyke/actions` and
+ * `GET /iyke/menus/:id` read from. Same partial-update convention as
+ * `iykeSetFrame` — an omitted field leaves the stored value untouched.
+ */
+export async function iykeSetActionsFrame(args: {
+	actions?: IykeActionMirror[] | null;
+	menus?: Record<string, IykeMenuMirror> | null;
+}): Promise<void> {
+	return invoke('iyke_set_actions_frame', {
+		actions: args.actions ?? null,
+		menus: args.menus ?? null,
+	});
+}
+
+/**
+ * WP-62: FE → Rust callback resolving one of the `iyke://actions-set-request`
+ * / `iyke://actions-import-request` / `iyke://keys-set-request` /
+ * `iyke://keys-resolve-request` round trips (`rpc.rs`'s generic
+ * pending/oneshot pattern, `actions_routes.rs`). `result` is opaque JSON
+ * handed straight back as the HTTP response body.
+ */
+export async function iykeActionsRequestDone(requestId: string, result: unknown): Promise<void> {
+	return invoke('iyke_actions_request_done', { requestId, result });
+}
+
 // ─── Screenshots ──────────────────────────────────────────────────────────────
 
 export interface ScreenshotResult {
@@ -2614,6 +2685,30 @@ export interface ScreenshotResult {
 
 export async function screenshotWindow(outPath?: string): Promise<ScreenshotResult> {
 	return invoke('screenshot_window', { outPath: outPath ?? null });
+}
+
+// ─── OS-wide shortcuts (G-ACTIONS §6, DEC-60; WP-54) ─────────────────────────
+
+/** One effective OS rule: an action id and its key in the registry grammar
+ *  (`alt+space`, `ctrl+alt+shift+s`). */
+export interface OsShortcutRuleArg {
+	command: string;
+	key: string;
+}
+
+/** Per-rule registration result; `reason` is set when `registered` is false. */
+export interface OsShortcutStatusResult {
+	command: string;
+	key: string;
+	registered: boolean;
+	reason: string | null;
+}
+
+/** Replace the OS-wide shortcuts `lib.rs` registers with `rules` (the
+ *  effective default + personal `scope: "os"` rules). Tolerant per rule: one
+ *  failure is reported in its status and never blocks the others. */
+export async function osShortcutsApply(rules: OsShortcutRuleArg[]): Promise<OsShortcutStatusResult[]> {
+	return invoke<OsShortcutStatusResult[]>('os_shortcuts_apply', { rules });
 }
 
 export async function screenshotPane(paneId: string, outPath?: string): Promise<ScreenshotResult> {

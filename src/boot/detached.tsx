@@ -15,7 +15,9 @@ import { createRoot } from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 
 import { queryClient } from '@/lib/query-client';
+import { startActionsStore } from '@/lib/actions/store';
 import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
+import { installKeyDispatcher } from '@/lib/keymap/dispatcher';
 import { windowContext } from '@/lib/window/window-context';
 import { DetachedRoot } from '@/shell/detached/detached-root';
 
@@ -34,6 +36,13 @@ export function bootDetached(): void {
 	// theme — the call catches its own rejection.
 	installIkengaDomSync();
 	void useIkengaStore.getState().hydrateAppearanceFromRust();
+
+	// WP-54 (DEC-56): this window's key dispatcher (zoom and whatever the
+	// mounted surfaces register) over the effective keymap. The model load
+	// is best-effort for the same capability reason as above; without it the
+	// keys stay on the defaults.
+	installKeyDispatcher();
+	void startActionsStore().catch(() => {});
 
 	createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
