@@ -5,7 +5,16 @@
 // `actions`, the Menus tab deletes `menus`, the Keys tab deletes `bindings`;
 // never writes a default back).
 
-import { Check, Copy, Download, Ellipsis, ExternalLink, FileText, RotateCcw, Sparkles } from 'lucide-react';
+import {
+	Check,
+	Copy,
+	Download,
+	Ellipsis,
+	ExternalLink,
+	FileText,
+	RotateCcw,
+	Sparkles,
+} from 'lucide-react';
 import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 
@@ -17,7 +26,7 @@ import {
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { confirm as confirmDialog, message as messageDialog } from '@/lib/transport/dialog-shim';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { openActionsFile } from '@/lib/actions/client';
 import {
 	ActionsFileNotWritableError,
@@ -34,7 +43,12 @@ import { handToChi } from '@/shell/companion/companion-store';
 import type { ActionsTabId } from './types';
 
 function fileBaseName(root: string | null): string {
-	return root?.replace(/[/\\]+$/, '').split(/[\\/]/).pop() ?? 'project';
+	return (
+		root
+			?.replace(/[/\\]+$/, '')
+			.split(/[\\/]/)
+			.pop() ?? 'project'
+	);
 }
 
 export function actionsPathLabel(scope: ActionsScope, projectRoot: string | null): string {
@@ -119,16 +133,6 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 		void navigate({ to: '/settings/actions/$tab', params: { tab: 'import' } });
 	}
 
-	async function handleExport() {
-		// WP-61's own surface owns a real export; until then, say so rather
-		// than silently doing nothing behind the menu item (blocker 2's spirit
-		// — a write-shaped action always tells the user what happened).
-		await messageDialog('Exporting a scope lands with the Import tab (WP-61). Nothing was written.', {
-			title: 'Export this scope…',
-			kind: 'info',
-		});
-	}
-
 	async function handleResetTab() {
 		const label = TAB_LABEL[tab];
 		if (tab === 'actions') {
@@ -138,7 +142,11 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 			// exactly how many, before the user confirms a delete.
 			const ok = await confirmDialog(
 				`This deletes the ${n} action${n === 1 ? '' : 's'} you've written at ${scope} scope from ${pathLabel}. Built-in and package actions are not affected.`,
-				{ title: `Reset ${label}`, kind: 'warning', okLabel: `Delete ${n} action${n === 1 ? '' : 's'}` }
+				{
+					title: `Reset ${label}`,
+					kind: 'warning',
+					okLabel: `Delete ${n} action${n === 1 ? '' : 's'}`,
+				}
 			);
 			if (!ok) return;
 			setWriteError(null);
@@ -150,11 +158,14 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 			return;
 		}
 		const file = tab === 'keys' ? keybindingsPathLabel(scope, model.projectRoot) : pathLabel;
-		const ok = await confirmDialog(`Reset the ${label} tab at ${scope} scope? This rewrites ${file}.`, {
-			title: `Reset ${label}`,
-			kind: 'warning',
-			okLabel: 'Reset',
-		});
+		const ok = await confirmDialog(
+			`Reset the ${label} tab at ${scope} scope? This rewrites ${file}.`,
+			{
+				title: `Reset ${label}`,
+				kind: 'warning',
+				okLabel: 'Reset',
+			}
+		);
 		if (!ok) return;
 		setWriteError(null);
 		try {
@@ -169,7 +180,10 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 		<div className="vhead-wrap">
 			<div className="vhead">
 				<h1>
-					Actions, menus and keys <span className="newchip" title="Not in the shipped shell">new</span>
+					Actions, menus and keys{' '}
+					<span className="newchip" title="Not in the shipped shell">
+						new
+					</span>
 				</h1>
 				<span className="filepath">{pathLabel}</span>
 				<span className="rt">
@@ -179,17 +193,32 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 						projectAvailable={!!model.projectRoot}
 						ariaLabel="Actions scope"
 					/>
-					<Button variant="outline" size="sm" className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs" onClick={handleBriefChi}>
+					<Button
+						variant="outline"
+						size="sm"
+						className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs"
+						onClick={handleBriefChi}
+					>
 						<Sparkles className="h-3 w-3" />
 						Brief a Chi to make an action
 					</Button>
-					<Button variant="outline" size="sm" className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs" onClick={() => void handleOpenFile()}>
+					<Button
+						variant="outline"
+						size="sm"
+						className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs"
+						onClick={() => void handleOpenFile()}
+					>
 						<ExternalLink className="h-3 w-3" />
 						Open file
 					</Button>
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>
-							<Button variant="ghost" size="icon" className="min-h-[var(--btn-h-sm)] min-w-[var(--btn-h-sm)]" aria-label="More">
+							<Button
+								variant="ghost"
+								size="icon"
+								className="min-h-[var(--btn-h-sm)] min-w-[var(--btn-h-sm)]"
+								aria-label="More"
+							>
 								<Ellipsis className="h-3.5 w-3.5" />
 							</Button>
 						</DropdownMenuTrigger>
@@ -197,10 +226,6 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 							<DropdownMenuItem onSelect={() => handleImport()}>
 								<Download className="mr-2 h-3.5 w-3.5" />
 								Import actions…
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => void handleExport()}>
-								<FileText className="mr-2 h-3.5 w-3.5" />
-								Export this scope…
 							</DropdownMenuItem>
 							<DropdownMenuSeparator />
 							<DropdownMenuItem
@@ -216,18 +241,26 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 								)}
 								<div className="flex min-w-0 flex-col">
 									<span>{copied ? 'Copied!' : 'Copy as iyke'}</span>
-									<span className="truncate font-mono text-[10px] text-muted-foreground">{iykeLine}</span>
+									<span className="truncate font-mono text-[10px] text-muted-foreground">
+										{iykeLine}
+									</span>
 								</div>
 							</DropdownMenuItem>
 							<DropdownMenuItem onSelect={() => void handleOpenFile()}>
 								<FileText className="mr-2 h-3.5 w-3.5" />
 								<div className="flex min-w-0 flex-col">
 									<span>Open file</span>
-									<span className="truncate font-mono text-[10px] text-muted-foreground">{pathLabel}</span>
+									<span className="truncate font-mono text-[10px] text-muted-foreground">
+										{pathLabel}
+									</span>
 								</div>
 							</DropdownMenuItem>
 							<DropdownMenuSeparator />
-							<DropdownMenuItem variant="destructive" disabled={!canReset} onSelect={() => void handleResetTab()}>
+							<DropdownMenuItem
+								variant="destructive"
+								disabled={!canReset}
+								onSelect={() => void handleResetTab()}
+							>
 								<RotateCcw className="mr-2 h-3.5 w-3.5" />
 								Reset this tab
 							</DropdownMenuItem>

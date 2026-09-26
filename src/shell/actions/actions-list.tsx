@@ -8,7 +8,22 @@ import { useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { Search, X } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
-import { bindingsFor, type ActionsScope, type EffectiveAction, type EffectiveModel } from '@/lib/actions/store';
+import {
+	bindingsFor,
+	deleteUserAction,
+	hideAction,
+	type ActionsScope,
+	type EffectiveAction,
+	type EffectiveModel,
+} from '@/lib/actions/store';
+import {
+	ContextMenu,
+	ContextMenuContent,
+	ContextMenuItem,
+	ContextMenuSeparator,
+	ContextMenuTrigger,
+} from '@/components/ui/context-menu';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { ActionIcon } from './shared/action-icon';
 import { Kbd } from './shared/kbd';
 import { placementCategory, placementCategoryLabel, placementIndex } from './shared/menu-label';
@@ -27,7 +42,11 @@ interface Facets {
 
 const DEFAULT_FACETS: Facets = { source: null, scope: null, placement: null, search: '' };
 
-const SOURCE_LABEL: Record<SourceFacet, string> = { builtin: 'Built-in', package: 'Package', yours: 'Yours' };
+const SOURCE_LABEL: Record<SourceFacet, string> = {
+	builtin: 'Built-in',
+	package: 'Package',
+	yours: 'Yours',
+};
 
 function sourceBucket(action: EffectiveAction): SourceFacet {
 	if (action.source === 'builtin') return 'builtin';
@@ -49,7 +68,11 @@ function matchesScope(action: EffectiveAction, facet: ScopeFacet | null): boolea
 	return facet === null || scopeBucket(action) === facet;
 }
 
-function matchesPlacement(_action: EffectiveAction, facet: string | null, placements: readonly string[]): boolean {
+function matchesPlacement(
+	_action: EffectiveAction,
+	facet: string | null,
+	placements: readonly string[]
+): boolean {
 	if (facet === null) return true;
 	return placements.some((at) => placementCategory(at) === facet);
 }
@@ -70,7 +93,53 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 	const navigate = useNavigate();
 	const [facets, setFacets] = useState<Facets>(DEFAULT_FACETS);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [rowError, setRowError] = useState<string | null>(null);
 	const rowRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+	// D-06 `actionMenu`: the row context menu. Delete (your own) and Hide
+	// everywhere (built-in / package) both confirm first and surface a write
+	// error instead of swallowing it.
+	const rowMenu = {
+		edit: (id: string) =>
+			void navigate({
+				to: '/settings/actions/$tab',
+				params: { tab: 'editor' },
+				search: { action: id },
+			}),
+		rebind: (id: string) =>
+			void navigate({
+				to: '/settings/actions/$tab',
+				params: { tab: 'keys' },
+				search: { action: id },
+			}),
+		showInMenus: (id: string) =>
+			void navigate({
+				to: '/settings/actions/$tab',
+				params: { tab: 'menus' },
+				search: { action: id },
+			}),
+		async remove(action: EffectiveAction) {
+			setRowError(null);
+			const own = action.source === 'personal' || action.source === 'project';
+			const ok = await confirmDialog(
+				own
+					? `Delete "${action.name}" from your ${action.source} actions.json? Its keybindings stay until you reset them.`
+					: `Hide "${action.name}" from every menu at ${scope} scope? Its key still fires.`,
+				{
+					title: own ? 'Delete action' : 'Hide everywhere',
+					kind: 'warning',
+					okLabel: own ? 'Delete' : 'Hide',
+				}
+			);
+			if (!ok) return;
+			try {
+				if (own) await deleteUserAction(action.source as ActionsScope, action.id);
+				else await hideAction(scope, action.id);
+			} catch (err) {
+				setRowError(err instanceof Error ? err.message : String(err));
+			}
+		},
+	};
 
 	const actions = model.actions;
 
@@ -91,7 +160,8 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 
 	const placementCategories = useMemo(() => {
 		const set = new Set<string>();
-		for (const [, menuIds] of placements) for (const menuId of menuIds) set.add(placementCategory(menuId));
+		for (const [, menuIds] of placements)
+			for (const menuId of menuIds) set.add(placementCategory(menuId));
 		return Array.from(set).sort();
 	}, [placements]);
 
@@ -99,7 +169,8 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 		const matchExcept = (a: EffectiveAction, except: keyof Facets) => {
 			if (except !== 'source' && !matchesSource(a, facets.source)) return false;
 			if (except !== 'scope' && !matchesScope(a, facets.scope)) return false;
-			if (except !== 'placement' && !matchesPlacement(a, facets.placement, placementsFor(a.id))) return false;
+			if (except !== 'placement' && !matchesPlacement(a, facets.placement, placementsFor(a.id)))
+				return false;
 			if (except !== 'search' && !matchesSearch(a, facets.search)) return false;
 			return true;
 		};
@@ -138,7 +209,10 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 	}, [filtered, selectedId]);
 
 	const hasActiveFilters =
-		facets.source !== null || facets.scope !== null || facets.placement !== null || facets.search.trim() !== '';
+		facets.source !== null ||
+		facets.scope !== null ||
+		facets.placement !== null ||
+		facets.search.trim() !== '';
 
 	function focusRow(index: number) {
 		rowRefs.current[index]?.focus();
@@ -146,7 +220,10 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 
 	function onListKeyDown(e: KeyboardEvent<HTMLDivElement>) {
 		if (filtered.length === 0) return;
-		const current = Math.max(0, filtered.findIndex((a) => a.id === activeAction?.id));
+		const current = Math.max(
+			0,
+			filtered.findIndex((a) => a.id === activeAction?.id)
+		);
 		let next = current;
 		if (e.key === 'ArrowDown') next = Math.min(filtered.length - 1, current + 1);
 		else if (e.key === 'ArrowUp') next = Math.max(0, current - 1);
@@ -262,6 +339,11 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 						aria-label="Actions"
 						onKeyDown={onListKeyDown}
 					>
+						{rowError && (
+							<p className="cempty" role="alert" style={{ color: 'var(--danger)' }}>
+								{rowError}
+							</p>
+						)}
 						{filtered.length === 0 && <div className="empty">Nothing matches these facets.</div>}
 						{filtered.map((action, index) => (
 							<ActionRow
@@ -274,6 +356,7 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 								places={placementsFor(action.id)}
 								isSelected={activeAction?.id === action.id}
 								onSelect={() => setSelectedId(action.id)}
+								menu={rowMenu}
 							/>
 						))}
 					</div>
@@ -287,13 +370,18 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 						projectId={model.projectId}
 						projectRoot={model.projectRoot}
 						onEdit={(id) =>
-							void navigate({ to: '/settings/actions/$tab', params: { tab: 'editor' }, search: { action: id } })
-						}
-						onTestRun={(id) =>
-							void navigate({ to: '/settings/actions/$tab', params: { tab: 'editor' }, search: { action: id } })
+							void navigate({
+								to: '/settings/actions/$tab',
+								params: { tab: 'editor' },
+								search: { action: id },
+							})
 						}
 						onRebind={(id) =>
-							void navigate({ to: '/settings/actions/$tab', params: { tab: 'keys' }, search: { action: id } })
+							void navigate({
+								to: '/settings/actions/$tab',
+								params: { tab: 'keys' },
+								search: { action: id },
+							})
 						}
 					/>
 				) : (
@@ -313,6 +401,7 @@ function ActionRow({
 	isSelected,
 	onSelect,
 	setRef,
+	menu,
 }: {
 	action: EffectiveAction;
 	keyCombo: string | null;
@@ -320,45 +409,71 @@ function ActionRow({
 	isSelected: boolean;
 	onSelect: () => void;
 	setRef: (el: HTMLButtonElement | null) => void;
+	menu: {
+		edit: (id: string) => void;
+		rebind: (id: string) => void;
+		showInMenus: (id: string) => void;
+		remove: (action: EffectiveAction) => Promise<void>;
+	};
 }) {
+	const own = action.source === 'personal' || action.source === 'project';
 	const shown = places.slice(0, 2);
 	const more = places.length - shown.length;
 	const sourceLabel =
 		action.source === 'builtin' ? 'Built-in' : action.source === 'package' ? 'Package' : 'Yours';
 
 	return (
-		<button
-			ref={setRef}
-			type="button"
-			role="option"
-			aria-selected={isSelected}
-			tabIndex={isSelected ? 0 : -1}
-			data-id={action.id}
-			data-source={action.source}
-			className={`irow ${isSelected ? 'sel' : ''}`}
-			onClick={onSelect}
-		>
-			<ActionIcon icon={action.icon} className="h-3.5 w-3.5 shrink-0" />
-			<span className="nm">{action.name}</span>
-			<span className="tail">
-				<span className="c-runs">{runText(action)}</span>
-				<span className="c-places">
-					{shown.map((at) => (
-						<span key={at} className="pchip">
-							{placementCategoryLabel(placementCategory(at))}
+		<ContextMenu>
+			<ContextMenuTrigger asChild>
+				<button
+					ref={setRef}
+					type="button"
+					role="option"
+					aria-selected={isSelected}
+					tabIndex={isSelected ? 0 : -1}
+					data-id={action.id}
+					data-source={action.source}
+					className={`irow ${isSelected ? 'sel' : ''}`}
+					onClick={onSelect}
+				>
+					<ActionIcon icon={action.icon} className="h-3.5 w-3.5 shrink-0" />
+					<span className="nm">{action.name}</span>
+					<span className="tail">
+						<span className="c-runs">{runText(action)}</span>
+						<span className="c-places">
+							{shown.map((at) => (
+								<span key={at} className="pchip">
+									{placementCategoryLabel(placementCategory(at))}
+								</span>
+							))}
+							{more > 0 && <span className="pchip more">+{more}</span>}
+							{places.length === 0 && <span className="pchip none">—</span>}
 						</span>
-					))}
-					{more > 0 && <span className="pchip more">+{more}</span>}
-					{places.length === 0 && <span className="pchip none">—</span>}
-				</span>
-				<span className="c-key">
-					<Kbd combo={keyCombo} />
-				</span>
-				<span className={`kind k-${action.source} c-src`}>
-					<span className="src-dot" aria-hidden="true" />
-					{sourceLabel}
-				</span>
-			</span>
-		</button>
+						<span className="c-key">
+							<Kbd combo={keyCombo} />
+						</span>
+						<span className={`kind k-${action.source} c-src`}>
+							<span className="src-dot" aria-hidden="true" />
+							{sourceLabel}
+						</span>
+					</span>
+				</button>
+			</ContextMenuTrigger>
+			<ContextMenuContent>
+				{own && <ContextMenuItem onSelect={() => menu.edit(action.id)}>Edit</ContextMenuItem>}
+				<ContextMenuItem onSelect={() => menu.rebind(action.id)}>Rebind…</ContextMenuItem>
+				<ContextMenuItem onSelect={() => menu.showInMenus(action.id)}>
+					Show in menus
+				</ContextMenuItem>
+				{!action.locked && (
+					<>
+						<ContextMenuSeparator />
+						<ContextMenuItem variant="destructive" onSelect={() => void menu.remove(action)}>
+							{own ? 'Delete…' : 'Hide everywhere…'}
+						</ContextMenuItem>
+					</>
+				)}
+			</ContextMenuContent>
+		</ContextMenu>
 	);
 }

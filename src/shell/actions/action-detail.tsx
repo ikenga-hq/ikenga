@@ -14,6 +14,10 @@ import {
 	LockedActionError,
 } from '@/lib/actions/store';
 import { openActionsFile } from '@/lib/actions/client';
+import { runAction, type RunOutcome } from '@/lib/actions/runner';
+import { iykePath } from '@/lib/actions/runner/iyke';
+import { runMenuAction } from '@/shell/menu/resolve';
+import { surfaceRunOutcome } from '@/shell/menu/run-notice';
 import { ActionIcon } from './shared/action-icon';
 import { Kbd } from './shared/kbd';
 import { JsonPreview } from './shared/json-preview';
@@ -35,7 +39,6 @@ export interface ActionDetailProps {
 	projectId: string | null;
 	projectRoot: string | null;
 	onEdit: (actionId: string) => void;
-	onTestRun: (actionId: string) => void;
 	onRebind: (actionId: string) => void;
 }
 
@@ -47,7 +50,11 @@ function fileScopeFor(action: EffectiveAction, scope: ActionsScope): ActionsScop
 	return scope;
 }
 
-function sourceFileLine(action: EffectiveAction, scope: ActionsScope, projectRoot: string | null): string {
+function sourceFileLine(
+	action: EffectiveAction,
+	scope: ActionsScope,
+	projectRoot: string | null
+): string {
 	if (action.source === 'builtin') return 'shell built-in';
 	if (action.source === 'package') return `${action.pkgId ?? 'package'} · manifest.json`;
 	return actionsPathLabel(fileScopeFor(action, scope), projectRoot);
@@ -72,17 +79,59 @@ export function ActionDetail({
 	projectId,
 	projectRoot,
 	onEdit,
-	onTestRun,
 	onRebind,
 }: ActionDetailProps) {
 	const [activeTab, setActiveTab] = useState<DetailTab>('overview');
 	const [actionError, setActionError] = useState<string | null>(null);
-	// An error belongs to the action it happened on — clear it on selection.
-	useEffect(() => setActionError(null), [action.id]);
+	const [testNote, setTestNote] = useState<string | null>(null);
+	const [testing, setTesting] = useState(false);
+	// An error or a test result belongs to the action it happened on — clear
+	// both on selection.
+	useEffect(() => {
+		setActionError(null);
+		setTestNote(null);
+	}, [action.id]);
 	const fileScope = fileScopeFor(action, scope);
 	const bindings = bindingsFor(action.id);
 	const summary = runSummary(action);
 	const file = sourceFileLine(action, scope, projectRoot);
+
+	// Test run, in place (D-06 `dacts`). Your own actions follow the Round 42
+	// rule — a test run never changes state: `shell` and `iyke` POST preview,
+	// the other kinds run for real. A built-in or package action has no
+	// dry-run form, so it runs exactly as its menu item would.
+	async function handleTestRun() {
+		setActionError(null);
+		setTestNote(null);
+		const user = action.userAction;
+		if (!user || (action.source !== 'personal' && action.source !== 'project')) {
+			runMenuAction(action.id);
+			setTestNote('Ran it the way its menu item does.');
+			return;
+		}
+		const run = user.run;
+		if (run.kind === 'iyke' && (run.method ?? 'POST') === 'POST') {
+			setTestNote(`Preview only: this would POST to ${iykePath(run.route)}. Nothing was sent.`);
+			return;
+		}
+		setTesting(true);
+		try {
+			const outcome = await runAction(
+				{ id: action.id, name: action.name, run, scope: action.source },
+				{ testRun: true, projectId: action.source === 'project' ? projectId : null }
+			);
+			const note = describeTestOutcome(outcome);
+			if (note) setTestNote(note);
+			else {
+				setActionError('message' in outcome ? outcome.message : 'The test run did not complete.');
+				surfaceRunOutcome(outcome);
+			}
+		} catch (err) {
+			setActionError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setTesting(false);
+		}
+	}
 
 	async function handleOpenFile() {
 		setActionError(null);
@@ -111,10 +160,17 @@ export function ActionDetail({
 					<h2>{action.name}</h2>
 					<span className="v">{action.id}</span>
 					<span className={`kind k-${action.source}`}>
-						{action.source === 'builtin' ? 'Built-in' : action.source === 'package' ? 'Package' : 'Yours'}
+						{action.source === 'builtin'
+							? 'Built-in'
+							: action.source === 'package'
+								? 'Package'
+								: 'Yours'}
 					</span>
 					{action.locked && (
-						<span className="badge" title="Locked: can be reordered/rebound, never edited or hidden">
+						<span
+							className="badge"
+							title="Locked: can be reordered/rebound, never edited or hidden"
+						>
 							<Lock className="h-3 w-3" /> locked
 						</span>
 					)}
@@ -123,7 +179,9 @@ export function ActionDetail({
 					<span>
 						Run: <b>{summary.label}</b>
 					</span>
-					<span>Key {bindings.length > 0 ? <Kbd combo={bindings[0].key} /> : <Kbd combo={null} />}</span>
+					<span>
+						Key {bindings.length > 0 ? <Kbd combo={bindings[0].key} /> : <Kbd combo={null} />}
+					</span>
 					<span className="mono">{file}</span>
 				</div>
 				{action.description && (
@@ -155,17 +213,26 @@ export function ActionDetail({
 					<button
 						type="button"
 						className="chip"
-						title="Pending — routes to the Editor tab until WP-58/WP-53 land"
-						onClick={() => onTestRun(action.id)}
+						disabled={testing}
+						onClick={() => void handleTestRun()}
 					>
-						<Play className="h-3 w-3" /> Test run <span className="pending">(pending)</span>
+						<Play className="h-3 w-3" /> Test run
 					</button>
 					<button type="button" className="chip" onClick={() => void handleOpenFile()}>
 						<ExternalLink className="h-3 w-3" /> Open file
 					</button>
 				</div>
+				{testNote && (
+					<p className="cempty" role="status" style={{ marginTop: 'var(--space-2)' }}>
+						{testNote}
+					</p>
+				)}
 				{actionError && (
-					<p className="cempty" style={{ color: 'var(--danger)', marginTop: 'var(--space-2)' }} role="alert">
+					<p
+						className="cempty"
+						style={{ color: 'var(--danger)', marginTop: 'var(--space-2)' }}
+						role="alert"
+					>
 						{actionError}
 					</p>
 				)}
@@ -214,7 +281,9 @@ export function ActionDetail({
 						</div>
 						<div className="drow">
 							<span className="k2">When</span>
-							<span className="val mono">{action.placements.find((p) => p.when)?.when ?? 'always'}</span>
+							<span className="val mono">
+								{action.placements.find((p) => p.when)?.when ?? 'always'}
+							</span>
 						</div>
 						<div className="drow">
 							<span className="k2">Scope</span>
@@ -229,7 +298,11 @@ export function ActionDetail({
 						<div className="drow">
 							<span className="k2">Source</span>
 							<span className="val">
-								{action.source === 'builtin' ? 'Built-in' : action.source === 'package' ? 'Package' : 'Yours'}
+								{action.source === 'builtin'
+									? 'Built-in'
+									: action.source === 'package'
+										? 'Package'
+										: 'Yours'}
 								{action.pkgId ? ` · ${action.pkgId}` : ''}
 							</span>
 						</div>
@@ -255,10 +328,27 @@ export function ActionDetail({
 				{activeTab === 'json' && (
 					<JsonPreview
 						value={jsonShape(action)}
-						caption={action.userAction ? undefined : 'Not stored in a file — derived from the effective model.'}
+						caption={
+							action.userAction
+								? undefined
+								: 'Not stored in a file — derived from the effective model.'
+						}
 					/>
 				)}
 			</div>
 		</aside>
 	);
+}
+
+/** A test run's result in one line, or null when it failed or was refused
+ *  (those surface as an error, and a trust refusal opens the trust sheet). */
+function describeTestOutcome(outcome: RunOutcome): string | null {
+	switch (outcome.status) {
+		case 'preview':
+			return `Preview only: this would run \`${outcome.command}\`${outcome.cwd ? ` in ${outcome.cwd}` : ''}. Nothing ran.`;
+		case 'done':
+			return outcome.runId ? `Sent. Run ${outcome.runId}.` : 'Ran.';
+		default:
+			return null;
+	}
 }

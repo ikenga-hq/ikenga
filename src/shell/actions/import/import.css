@@ -118,7 +118,7 @@
 }
 
 .view-acts .imp-row.add .imp-sign {
-	color: var(--on-live);
+	color: var(--on-live, var(--live));
 }
 
 .view-acts .imp-row.skip {
@@ -134,7 +134,7 @@
 }
 
 .view-acts .imp-row.clash .imp-sign {
-	color: var(--on-danger);
+	color: var(--on-danger, var(--danger));
 }
 
 .view-acts .imp-row .imp-mid {
