@@ -197,7 +197,7 @@ export const NON_CLAUDE_AGENT_REASON =
 	'That terminal runs an agent other than Claude Code, which reports no liveness — an action never types into it. Pick a Claude session or a new run.';
 
 export const PERMISSION_PENDING_REASON =
-	'That terminal is waiting on a permission request — typing into it now would answer it. Decide the request first.';
+	'That terminal is waiting on a permission request — typing into it now would answer it. Decide the request, or send the agent a message, first.';
 
 export const BANG_PROMPT_REASON =
 	'The prompt starts a line with "!", which the agent runs as a shell command — refused.';
