@@ -379,9 +379,10 @@ const ACCELERATOR_KEYS: Record<string, string> = {
 
 /** Tauri `accelerator` syntax (`CmdOrCtrl+Shift+X`) for native-menu items.
  *  A native accelerator cannot express a chord, so a two-stroke sequence
- *  returns `''` (the item shows no accelerator; the registry still fires it). */
-export function toAccelerator(combo: string): string {
-	if (isChordSequence(combo)) return '';
+ *  returns `undefined` (the item shows no accelerator; the registry still
+ *  fires it) — Tauri rejects an empty-string `accelerator`. */
+export function toAccelerator(combo: string): string | undefined {
+	if (isChordSequence(combo)) return undefined;
 	const { mods, key } = parseCombo(combo);
 	const parts: string[] = [];
 	if (mods.has('mod')) parts.push('CmdOrCtrl');

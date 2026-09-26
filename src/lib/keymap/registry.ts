@@ -115,6 +115,27 @@ export interface KeymapConflicts {
 	precedence: KeymapConflictPair[];
 }
 
+/** `shift+/` and `shift+=` name the same physical key as the shipped `?` /
+ *  `plus` spellings (§3.1's one exception — `strokesFromEvent` matches both
+ *  spellings to one event). `conflicts()` canonicalizes a resolved stroke to
+ *  that shared spelling before grouping by key, so `?` vs `shift+/` (and
+ *  `mod+plus` vs `mod+shift+=`) still group together instead of silently
+ *  missing a same-`when` clash. */
+function canonicalizeConflictStroke(stroke: string): string {
+	const parts = stroke.split('+');
+	const key = parts[parts.length - 1];
+	const mods = parts.slice(0, -1);
+	if (!mods.includes('shift')) return stroke;
+	const rest = mods.filter((m) => m !== 'shift');
+	if (key === '/') return [...rest, '?'].join('+');
+	if (key === '=') return [...rest, 'plus'].join('+');
+	return stroke;
+}
+
+function canonicalizeConflictKey(resolvedKeySequence: string): string {
+	return resolvedKeySequence.split(' ').map(canonicalizeConflictStroke).join(' ');
+}
+
 function safeNormalize(when: string | undefined): string {
 	try {
 		return normalizeWhen(when);
@@ -151,7 +172,7 @@ export function conflicts(opts?: {
 
 	const byKey = new Map<string, Array<{ entry: KeymapEntry; when: string; scope: KeymapScope }>>();
 	for (const entry of relevant) {
-		const key = resolveKeySequence(entry.key, mac);
+		const key = canonicalizeConflictKey(resolveKeySequence(entry.key, mac));
 		const scope = entry.scope ?? 'app';
 		// OS rules ignore focus: their `when` is always TRUE (§6, `E_OS_WHEN`).
 		const when = scope === 'os' ? '' : safeNormalize(entry.when);

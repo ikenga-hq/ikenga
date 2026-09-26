@@ -163,6 +163,20 @@ describe('chord mode outcomes', () => {
 		expect(t.timeouts).toEqual([]);
 	});
 
+	it('a bare modifier keydown (no strokes) does not cancel a pending chord', () => {
+		const t = makeMachine([PALETTE, RELEASE]);
+		t.machine.press(['meta+k'], {}, 'palette.open');
+		expect(t.machine.press([], {})).toEqual({ type: 'pending', first: 'meta+k' });
+		expect(t.machine.isPending).toBe(true);
+		expect(t.cleared).toEqual([]);
+		expect(t.machine.press(['meta+r'], {}).type).toBe('chord');
+	});
+
+	it('a bare modifier keydown outside chord mode is a no-op', () => {
+		const { machine } = makeMachine([PALETTE, RELEASE]);
+		expect(machine.press([], {})).toEqual({ type: 'none' });
+	});
+
 	it('matches any candidate stroke of the second event', () => {
 		const t = makeMachine([PALETTE, { key: 'mod+k ?', command: 'help.chord' }]);
 		t.machine.press(['meta+k'], {});

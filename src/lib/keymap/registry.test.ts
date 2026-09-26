@@ -138,6 +138,24 @@ describe('conflicts() — DEC-59', () => {
 		expect(r.clashes[0].key).toBe('meta+k meta+r');
 	});
 
+	it('canonicalizes shifted-glyph spellings so `?` and `shift+/` group (and clash) together', () => {
+		const entries = [entry({ command: 'a', key: '?', when: 'always' }), entry({ command: 'b', key: 'shift+/', when: 'always' })];
+		const r = conflicts({ platform: 'mac', entries });
+		expect(r.clashes).toHaveLength(1);
+		expect(r.clashes[0].key).toBe('?');
+		expect([r.clashes[0].a.command, r.clashes[0].b.command].sort()).toEqual(['a', 'b']);
+	});
+
+	it('canonicalizes `mod+plus` and `mod+shift+=` the same way', () => {
+		const entries = [
+			entry({ command: 'a', key: 'mod+plus', when: 'always' }),
+			entry({ command: 'b', key: 'mod+shift+=', when: 'always' }),
+		];
+		const r = conflicts({ platform: 'mac', entries });
+		expect(r.clashes).toHaveLength(1);
+		expect(r.clashes[0].key).toBe('meta+plus');
+	});
+
 	it('treats OS scope as its own space: OS vs OS clash, OS vs app is precedence with the OS rule first', () => {
 		const os1 = entry({ command: 'os.summon', key: 'alt+space', when: 'always', scope: 'os' });
 		const os2 = entry({ command: 'os.other', key: 'alt+space', when: 'always', scope: 'os' });

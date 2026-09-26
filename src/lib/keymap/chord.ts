@@ -175,6 +175,10 @@ export class ChordMachine<T = unknown> {
 		evalOpts?: EvalOptions
 	): ChordOutcome<T> {
 		const pending = this.pendingState;
+		// A bare modifier keydown (e.g. releasing ⌘ after ⌘K) resolves to no
+		// strokes at all (`strokesFromEvent`). It must not cancel a pending
+		// chord — leave the timer running and report `pending` unchanged.
+		if (strokes.length === 0) return pending ? { type: 'pending', first: pending.first } : { type: 'none' };
 		if (pending) {
 			this.clearTimer(pending.timer);
 			this.pendingState = null;

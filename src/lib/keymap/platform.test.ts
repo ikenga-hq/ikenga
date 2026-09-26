@@ -175,6 +175,6 @@ describe('display', () => {
 		expect(toAccelerator('mod+shift+o')).toBe('CmdOrCtrl+Shift+O');
 		expect(toAccelerator('mod+alt+arrowup')).toBe('CmdOrCtrl+Alt+Up');
 		expect(toAccelerator('mod+plus')).toBe('CmdOrCtrl+Plus');
-		expect(toAccelerator('mod+k mod+r')).toBe('');
+		expect(toAccelerator('mod+k mod+r')).toBeUndefined();
 	});
 });
