@@ -140,7 +140,12 @@ export function PinComposer({
 	// the textarea to the registry `studio.pin-submit` command, scoped by the
 	// new `pinComposerFocus` key (B-21). Radix unmounts the textarea (and so
 	// the marker) while the dialog is closed, so this never fires then.
-	useCommands({ 'studio.pin-submit': () => void submit() });
+	//
+	// Fix round 1: every `HtmlFrame` mounts a `PinComposer`, so without a
+	// mount-time gate the last-mounted one's registration always wins
+	// (`registerCommand`'s stack), stealing ⌘↵ from whichever composer is
+	// actually open. Register the handler only while this one is open.
+	useCommands({ 'studio.pin-submit': () => void submit() }, { enabled: open && pick !== null });
 
 	return (
 		<Dialog

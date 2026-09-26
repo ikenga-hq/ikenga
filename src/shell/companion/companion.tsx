@@ -325,6 +325,9 @@ export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
 	// last-mounted row's closure).
 	const resolveFocused = (decision: 'allow' | 'deny') => {
 		const el = document.activeElement;
+		// Fix round 1: a focused button (Allow once / Always / Deny) handles
+		// its own Enter/Space — A/D must not also act behind its back.
+		if (el instanceof HTMLButtonElement) return;
 		const id = el instanceof Element ? el.closest('[data-permission-card]')?.getAttribute('data-permission-card') : null;
 		if (!id) return;
 		const card = cards.find((c) => c.id === id);

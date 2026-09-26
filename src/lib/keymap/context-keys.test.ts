@@ -65,6 +65,8 @@ describe('vocabulary (§4.3)', () => {
 				'loupeFocus',
 				'pinComposerFocus',
 				'markdownEditorFocus',
+				// Fix round 1 (B-21): narrower than approveGateFocus (detail pane only).
+				'approveGateDetailFocus',
 			].sort()
 		);
 		expect(isKnownContextKey('ngwaItemKind')).toBe(true);
@@ -89,6 +91,7 @@ describe('vocabulary (§4.3)', () => {
 				'loupeFocus',
 				'pinComposerFocus',
 				'markdownEditorFocus',
+				'approveGateDetailFocus',
 			].sort()
 		);
 	});

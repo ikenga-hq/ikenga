@@ -175,6 +175,7 @@ describe('DEC-58 single fire (native menu ↔ dispatcher)', () => {
 					paletteOpen: false,
 					permissionCardFocus: false,
 					approveGateFocus: false,
+					approveGateDetailFocus: false,
 					loupeFocus: false,
 					pinComposerFocus: false,
 					markdownEditorFocus: false,

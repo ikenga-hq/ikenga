@@ -146,7 +146,10 @@ describe('merge order (DEC-59, §2.1)', () => {
 			}),
 		});
 		const candidates = onKey(m.keymap.entries, 'mod+b', 'mac');
-		expect(candidates.map((e) => e.command)).toEqual(['explorer.toggle', 'mine', 'ours']);
+		// WP-56 added `markdown.bold` on the same key (`when: markdownEditorFocus`,
+		// DEC-59 precedence over `explorer.toggle`'s `always`) — it's a fourth
+		// default-layer candidate on `mod+b`, not part of this test's clash.
+		expect(candidates.map((e) => e.command)).toEqual(['explorer.toggle', 'markdown.bold', 'mine', 'ours']);
 		expect(resolveKeypressWinner(candidates, m.keymap.entries)?.command).toBe('ours');
 		// explorer.toggle is `always`; the file rules default to `always` too.
 		expect(m.keymap.conflicts.mac.clashes.length).toBeGreaterThan(0);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { type FocusEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { AlertCircle, Loader2, RefreshCw } from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
@@ -147,6 +147,17 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 	// `markdown.bold` shares `mod+b` with `explorer.toggle` (`always`) by
 	// precedence, not a clash (DEC-59, §2.3): `markdownEditorFocus` is more
 	// specific and wins while it holds.
+	//
+	// Fix round 1: `commands.ts` keys a handler stack by command id only —
+	// with two markdown editors open in a split, the last-mounted one always
+	// wins ⌘S/⌘B/⌘I regardless of which pane the user is actually in. Track
+	// focus-within on this root and register only while it holds (and only
+	// in edit mode, as before).
+	const [focusWithin, setFocusWithin] = useState(false);
+	const handleFocusWithinCapture = useCallback(() => setFocusWithin(true), []);
+	const handleBlurWithinCapture = useCallback((e: FocusEvent<HTMLDivElement>) => {
+		if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusWithin(false);
+	}, []);
 	useCommands(
 		{
 			'markdown.save': () => void save(),
@@ -157,7 +168,7 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 				if (editorRef.current?.view()?.hasFocus) onWrap('_');
 			},
 		},
-		{ enabled: mode === 'edit' }
+		{ enabled: mode === 'edit' && focusWithin }
 	);
 
 	// ── Warn before losing unsaved edits on app close / reload ───────────────
@@ -255,7 +266,17 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 	}
 
 	return (
-		<div className="flex h-full w-full flex-col" {...focusMarkerProps('markdown-editor')}>
+		<div
+			className="flex h-full w-full flex-col"
+			// Fix round 1: only in edit mode — this wrapper renders in preview
+			// mode too, and `markdown.bold`'s `when: markdownEditorFocus`
+			// outranking `explorer.toggle` on `mod+b` there (DEC-59 specificity)
+			// but the handler being `enabled: mode === 'edit'`-gated meant ⌘B did
+			// nothing at all in preview instead of falling through to Explorer.
+			{...(mode === 'edit' ? focusMarkerProps('markdown-editor') : {})}
+			onFocusCapture={handleFocusWithinCapture}
+			onBlurCapture={handleBlurWithinCapture}
+		>
 			<MarkdownToolbar
 				mode={mode}
 				dirty={dirty}

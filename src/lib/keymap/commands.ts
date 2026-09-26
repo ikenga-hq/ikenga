@@ -226,7 +226,16 @@ export function menuItemAction(commandId: string | undefined, action: () => void
 
 /** Who fires each default command (see the header). `commands.test.ts`
  *  proves every default command has exactly one owner. */
-export type CommandOwner = 'window' | 'workspace' | 'palette' | 'rail' | 'terminal' | 'dispatch-input' | 'native-menu' | 'os';
+export type CommandOwner =
+	| 'window'
+	| 'workspace'
+	| 'palette'
+	| 'rail'
+	| 'terminal'
+	| 'dispatch-input'
+	| 'native-menu'
+	| 'os'
+	| 'widget';
 
 export function ownerOf(command: string): CommandOwner | null {
 	if (command.startsWith('zoom.')) return 'window';
@@ -246,6 +255,17 @@ export function ownerOf(command: string): CommandOwner | null {
 		command === 'companion.focus-dispatch'
 	) {
 		return 'workspace';
+	}
+	// WP-56: widget-local commands registered by the surface that owns the
+	// focused element (permission card, approve gate, Studio loupe/pin
+	// composer, markdown editor) — never hosted, so never in §4.6's table.
+	if (
+		command.startsWith('companion.permission-') ||
+		command.startsWith('approve-gate.') ||
+		command.startsWith('studio.') ||
+		command.startsWith('markdown.')
+	) {
+		return 'widget';
 	}
 	return null;
 }

@@ -486,7 +486,10 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 				/>
 
 				{/* ── Right: draft editor ─────────────────────────────────────────────── */}
-				<div className="ob-detail">
+				{/* Fix round 1: ⌘S / ⌘↵ pre-WP-56 only listened here (`.ob-detail`), not
+				    across the whole section — `approveGateDetailFocus` restores that scope
+				    (defaults.ts); J/K stay section-wide on `approveGateFocus`. */}
+				<div className="ob-detail" {...focusMarkerProps('approve-gate-detail')}>
 					{selected ? (
 						<>
 							<div className="ob-detail-toolbar">

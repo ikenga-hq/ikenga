@@ -287,6 +287,17 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'Allow the focused permission request',
 	},
+	// Fix round 1: the pre-registry handler matched `e.key.toLowerCase()`, so
+	// Shift+A also allowed (same as plain A); this restores that (§3.1:
+	// shifted-letter variant alongside the unshifted key, as `zoom.out` does
+	// above for ⌘⇧-).
+	{
+		command: 'companion.permission-allow',
+		key: 'shift+a',
+		when: 'permissionCardFocus',
+		source: 'default',
+		label: 'Allow the focused permission request',
+	},
 	{
 		command: 'companion.permission-deny',
 		key: 'd',
@@ -311,14 +322,16 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{
 		command: 'approve-gate.save',
 		key: 'mod+s',
-		when: 'approveGateFocus',
+		// Fix round 1: narrower than `approveGateFocus` — pre-WP-56 this only
+		// fired while the detail pane had focus, not the whole section.
+		when: 'approveGateDetailFocus',
 		source: 'default',
 		label: 'Save draft (approve gate)',
 	},
 	{
 		command: 'approve-gate.approve',
 		key: 'mod+enter',
-		when: 'approveGateFocus',
+		when: 'approveGateDetailFocus',
 		source: 'default',
 		label: 'Approve & send (approve gate)',
 	},
