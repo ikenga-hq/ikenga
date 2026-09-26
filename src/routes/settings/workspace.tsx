@@ -1,5 +1,5 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { Sparkles } from 'lucide-react';
+import { Link, createFileRoute, useNavigate } from '@tanstack/react-router';
+import { ArrowRight, Sparkles } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -92,6 +92,17 @@ function WorkspacePage() {
 					</Button>
 				</div>
 			</section>
+
+			{/* D-06 link-out (WP-57): Actions, menus and keys live in their own
+			    pane-hosted surface, not a Workspace field. */}
+			<Link
+				to="/settings/actions/$tab"
+				params={{ tab: 'actions' }}
+				className="flex items-center justify-between rounded-lg border border-[var(--border-soft)] bg-card px-4 py-3 text-sm text-foreground transition-colors hover:bg-accent/40"
+			>
+				<span>Actions, menus and keys</span>
+				<ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />
+			</Link>
 		</div>
 	);
 }
