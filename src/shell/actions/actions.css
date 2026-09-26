@@ -59,6 +59,24 @@
 	flex-wrap: wrap;
 }
 
+/* Blocker 2: the write-error banner under the header, shown when a reset or
+   an "Open file" fails instead of the failure being swallowed silently. */
+.view-acts .vhead-wrap {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+}
+
+.view-acts .vhead-error {
+	flex: none;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: var(--danger-soft);
+	color: var(--danger);
+	font-size: var(--text-caption);
+	line-height: var(--lead-caption);
+}
+
 /* ── iyke footer line (product principle 5) ── */
 
 .view-acts .iykeline {
@@ -74,9 +92,11 @@
 	color: var(--fg-muted);
 }
 
+/* Item 17: the "iyke" label reads muted and regular weight — the command
+   text after it (not this label) carries the emphasis. */
 .view-acts .iykeline b {
-	color: var(--fg);
-	font-weight: 600;
+	color: var(--fg-muted);
+	font-weight: 400;
 }
 
 .view-acts .iykeline .cp {
@@ -93,6 +113,26 @@
 .view-acts .iykeline .cp:hover {
 	color: var(--fg);
 	background: var(--bg-raised);
+}
+
+/* ── Issues banner (blocker 5) — per-file validation errors + model issues ── */
+
+.view-acts .issuesbanner {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: color-mix(in srgb, var(--warning) 16%, var(--bg-surface));
+	color: var(--fg);
+	font-size: var(--text-caption);
+	line-height: var(--lead-caption);
+}
+
+.view-acts .issuesbanner-row::before {
+	content: '⚠ ';
+	color: var(--warning);
 }
 
 /* ── Actions list — runs / key / source columns ── */
@@ -162,6 +202,55 @@ kbd.kbd {
 	line-height: 1.5;
 }
 
+/* Item 10: an unbound key renders as a dashed "unbound" kbd, not plain text. */
+kbd.kbd.kbd-none {
+	color: var(--fg-muted);
+	background: transparent;
+	border-style: dashed;
+	border-color: var(--border-strong);
+}
+
+/* ── list row: Placements chips column, Source dot (items 10) ── */
+
+.view-acts .irow .tail .c-places {
+	width: 148px;
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	overflow: hidden;
+}
+
+.view-acts .lhead .c-places {
+	flex: none;
+	width: 148px;
+	text-align: right;
+}
+
+.view-acts .pchip {
+	font-size: 10px;
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-pill);
+	padding: 0 5px;
+	white-space: nowrap;
+}
+
+.view-acts .pchip.none {
+	background: transparent;
+	border-color: transparent;
+}
+
+.view-acts .src-dot {
+	display: inline-block;
+	width: 5px;
+	height: 5px;
+	border-radius: var(--radius-pill);
+	background: currentColor;
+	margin-right: 2px;
+}
+
 /* ── key recorder (shared/key-recorder.tsx) ── */
 
 .rec {
@@ -199,6 +288,16 @@ kbd.kbd {
 
 .rec .lbl.recording {
 	color: var(--primary);
+	font-weight: 500;
+}
+
+.rec[data-invalid] {
+	border-color: var(--danger);
+	background: var(--danger-soft);
+}
+
+.rec .lbl.invalid {
+	color: var(--danger);
 	font-weight: 500;
 }
 
@@ -248,8 +347,46 @@ kbd.kbd {
 	margin-top: 0;
 }
 
-/* ── Empty state (uses the shared EmptyState primitive) ── */
+/* ── Empty state (item 15/17) ──
+   Item 17: this rule used to target `.surface[data-state='empty']`, but
+   `data-state` lived on the EmptyState primitive's own root, never on
+   `.surface` — the rule never matched anything. `data-state` now lives on
+   the `.surface` wrapper itself (`shell.tsx`, one attribute per state, for
+   every tab) so this actually applies. */
 
 .view-acts .surface[data-state='empty'] {
 	background: var(--bg-base);
+}
+
+.view-acts .emptyview {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-3);
+	padding: var(--space-8);
+	text-align: center;
+}
+
+.view-acts .emptyview h2 {
+	font-family: var(--font-display);
+	font-size: var(--text-h2);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin: 0;
+}
+
+.view-acts .emptyview .note {
+	max-width: 52ch;
+	color: var(--fg-muted);
+	font-size: var(--text-body);
+	line-height: var(--lead-body);
+}
+
+.view-acts .emptyview .note.mono {
+	font-family: var(--font-mono);
+	font-size: var(--text-caption);
+	max-width: 60ch;
 }

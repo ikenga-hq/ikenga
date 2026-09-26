@@ -13,15 +13,20 @@ export interface KbdProps {
 	combo?: string | null;
 	/** Overrides the live platform — the Keys tab's mac/Windows preview toggle. */
 	mac?: boolean;
-	/** Rendered in place of a kbd tag when `combo` is empty. Default `'—'`. */
+	/** Text of the dashed "unbound" kbd shown when `combo` is empty (D-06
+	 *  `kbd(a.key)`: `<kbd class="key none">unbound</kbd>`). Default `'unbound'`. */
 	empty?: string;
 	className?: string;
 }
 
-/** One key sequence as `<kbd>` chip(s) — a chord renders as two chips. */
-export function Kbd({ combo, mac, empty = '—', className }: KbdProps) {
+/** One key sequence as `<kbd>` chip(s) — a chord renders as two chips. An
+ *  unset key still renders as a `<kbd>` (dashed, muted), not plain text, so
+ *  the Key column keeps one visual shape whether bound or not. */
+export function Kbd({ combo, mac, empty = 'unbound', className }: KbdProps) {
 	if (!combo) {
-		return <span className={cn('meta', className)}>{empty}</span>;
+		return (
+			<kbd className={cn('kbd kbd-none', className)}>{empty}</kbd>
+		);
 	}
 	const label = formatKeyLabel(combo, { mac: mac ?? isMacPlatform() });
 	const strokes = label.split(' ');

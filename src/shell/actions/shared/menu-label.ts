@@ -3,6 +3,34 @@
 // Actions tab's Placement facet/chips and the detail pane's placement list.
 // Not authoritative — `menus.ts` / the effective model own real menu
 // contents; this only labels an id for display.
+//
+// Review round 1 blocker 3: a built-in's `EffectiveAction.placements` is
+// always `[]` (the registry never serializes built-in placements — they come
+// entirely from the §1.3 default menu contents), so the Placement facet, its
+// counts, the row chips and the detail pane must all derive menu membership
+// from `model.menus` (the frozen API: `ids` + `get(id).items`) instead of
+// reading `action.placements` directly — that only ever reflects a
+// personal/project action's own placements.
+
+import type { EffectiveModel } from '@/lib/actions/store';
+
+/** Every menu id an action is currently visible in (hidden ids already
+ *  excluded — `EffectiveMenu.items` is "hidden ids removed"), built once per
+ *  model render rather than re-scanned per action. */
+export function placementIndex(model: EffectiveModel): ReadonlyMap<string, string[]> {
+	const map = new Map<string, string[]>();
+	for (const menuId of model.menus.ids) {
+		const menu = model.menus.get(menuId);
+		if (!menu) continue;
+		for (const item of menu.items) {
+			if (item.kind !== 'action') continue;
+			const list = map.get(item.id);
+			if (list) list.push(menuId);
+			else map.set(item.id, [menuId]);
+		}
+	}
+	return map;
+}
 
 const MENU_LABELS: Readonly<Record<string, string>> = {
 	files: 'Files',
