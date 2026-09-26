@@ -26,27 +26,39 @@ import { queryKeys } from '@/lib/query-keys';
 import { ListRow, RowAction } from '@/components/ui/list-row';
 import { cn } from '@/components/ui/utils';
 import {
-	ContextMenu,
-	ContextMenuContent,
-	ContextMenuItem,
-	ContextMenuSeparator,
-	ContextMenuTrigger,
-} from '@/components/ui/context-menu';
-import {
 	DropdownMenu,
 	DropdownMenuCheckboxItem,
 	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuShortcut,
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useGitStatus } from '@/lib/shell/use-git-status';
 import { handToChi } from '@/shell/companion/companion-store';
 import { EmptyState } from '@/components/states';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
+import { resolveMenuItems } from '@/shell/menu/resolve';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
 // that can each hold tens of thousands of entries. Toggle off via the
 // "Show ignored folders" view option (still lazy on expand).
 const IGNORED_DIRS = new Set(['node_modules', 'target', 'dist', 'build', 'out']);
+
+// `files` menu (G-ACTIONS §1.3): the row-kind applicability flags, and the
+// shipped presentation the effective model doesn't carry.
+const FILE_ROW = { file: true, dir: false } as const;
+const DIR_ROW = { file: false, dir: true } as const;
+const FILES_MENU_LABELS: Readonly<Record<string, string>> = {
+	// Shipped wording on a directory row (the registry name is the id's).
+	'open-terminal-here': 'Open in Terminal',
+};
+const FILES_MENU_ICONS = {
+	'files.open-as-artifact-grid': <Grid3x3 className="h-3.5 w-3.5" />,
+};
 
 interface SortOptions {
 	showHidden: boolean;
@@ -221,7 +233,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 	}, [renameValue, entry.path, entry.name, prune, qc]);
 
 	const handleDelete = useCallback(async () => {
-		const ok = window.confirm(`Move "${entry.name}" to trash?`);
+		const ok = await confirmDialog(`Move "${entry.name}" to trash?`, { title: 'Move to Trash', kind: 'warning' });
 		if (!ok) return;
 		try {
 			await fsTrash(entry.path);
@@ -257,10 +269,36 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 	const fileGitStatus = entry.isDir ? undefined : gitStatus?.files.get(entry.path);
 	const isDirtyFolder = entry.isDir ? gitStatus?.dirtyFolders.has(entry.path) : false;
 
+	// The `files` menu (G-ACTIONS §1.3) — resolved only while this row's menu
+	// is open (`EffectiveContextMenu`). The target is this row: a placement
+	// `when` (a package's `file` glob) reads its path, and a user action run
+	// from here gets it as `file.path`.
+	const menuHandlers = {
+		open: () => openFile(),
+		'open-to-side': () => openArtifactInSplit(entry.path, 'right'),
+		'open-below': () => openArtifactInSplit(entry.path, 'bottom'),
+		'pin-sidebar': () => setPinOpen(true),
+		'files.open-as-artifact-grid': () => void openArtifactGrid(activeProjectId, entry.path),
+		'open-terminal-here': () => openTerminalAt(terminalCwd),
+		'open-terminal-side': () => openTerminalAt(terminalCwd, 'right'),
+		'open-terminal-below': () => openTerminalAt(terminalCwd, 'bottom'),
+		'hand-to-chi': () => handToChi(entry.path),
+		'copy-path': copyPath,
+		'copy-name': () => void writeClipboardText(entry.name).catch(() => {}),
+		rename: () => startRename(),
+		delete: () => void handleDelete(),
+	};
+
 	return (
 		<div>
-			<ContextMenu>
-				<ContextMenuTrigger asChild>
+			<EffectiveContextMenu
+				menuId="files"
+				target={{ resource: entry.path }}
+				conditions={entry.isDir ? DIR_ROW : FILE_ROW}
+				handlers={menuHandlers}
+				labels={FILES_MENU_LABELS}
+				icons={FILES_MENU_ICONS}
+			>
 					<ListRow
 						ref={rowRef}
 						size="sm"
@@ -362,53 +400,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 							</span>
 						)}
 					</ListRow>
-				</ContextMenuTrigger>
-				<ContextMenuContent>
-					{!entry.isDir && (
-						<>
-							<ContextMenuItem onSelect={() => openFile()}>Open</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openArtifactInSplit(entry.path, 'right')}>
-								Open to the Side
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openArtifactInSplit(entry.path, 'bottom')}>
-								Open Below
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-							<ContextMenuItem onSelect={() => setPinOpen(true)}>Pin to Sidebar…</ContextMenuItem>
-							<ContextMenuSeparator />
-						</>
-					)}
-					{entry.isDir && (
-						<>
-							<ContextMenuItem onSelect={() => void openArtifactGrid(activeProjectId, entry.path)}>
-								<Grid3x3 className="h-3.5 w-3.5" />
-								Open as Artifact Grid
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd)}>
-								Open in Terminal
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd, 'right')}>
-								Open in Terminal to the Side
-							</ContextMenuItem>
-							<ContextMenuItem onSelect={() => openTerminalAt(terminalCwd, 'bottom')}>
-								Open in Terminal Below
-							</ContextMenuItem>
-							<ContextMenuSeparator />
-						</>
-					)}
-					<ContextMenuItem onSelect={() => handToChi(entry.path)}>Hand to Chi</ContextMenuItem>
-					<ContextMenuItem onSelect={copyPath}>Copy Path</ContextMenuItem>
-					<ContextMenuItem onSelect={() => void writeClipboardText(entry.name).catch(() => {})}>
-						Copy Name
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem onSelect={() => startRename()}>Rename…</ContextMenuItem>
-					<ContextMenuItem variant="destructive" onSelect={() => void handleDelete()}>
-						Move to Trash
-					</ContextMenuItem>
-				</ContextMenuContent>
-			</ContextMenu>
+			</EffectiveContextMenu>
 			{pinOpen && (
 				<PinArtifactDialog
 					open
@@ -710,6 +702,69 @@ export const filesDirectoryContextMenu = [
 
 export const filesContextMenu = filesFileContextMenu;
 
+/** The `files-view` menu (G-ACTIONS §1.3) — the Files "View options" `⋯`.
+ *  Mounted only while that dropdown is open. Its two default items are
+ *  checkboxes; a user / package item appended to the menu renders plain. */
+function FilesViewMenuItems({
+	showHidden,
+	showIgnored,
+	setShowHidden,
+	setShowIgnored,
+}: {
+	showHidden: boolean;
+	showIgnored: boolean;
+	setShowHidden: (v: boolean) => void;
+	setShowIgnored: (v: boolean) => void;
+}) {
+	const viewMenu = useEffectiveMenu('files-view');
+	const rows = resolveMenuItems(viewMenu, {
+		handlers: {
+			'explorer.toggle-hidden': () => setShowHidden(!showHidden),
+			'files.toggle-ignored': () => setShowIgnored(!showIgnored),
+		},
+		// Shipped wording.
+		labels: { 'files.toggle-ignored': 'Show ignored folders' },
+	});
+	const checked: Record<string, boolean> = {
+		'explorer.toggle-hidden': showHidden,
+		'files.toggle-ignored': showIgnored,
+	};
+	return (
+		<>
+			{rows.map((row, i) =>
+				row.kind === 'separator' ? (
+					// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+					<DropdownMenuSeparator key={`sep-${i}`} />
+				) : row.display === 'checkbox' ? (
+					<DropdownMenuCheckboxItem
+						key={row.id}
+						data-action={row.dataAction}
+						checked={checked[row.id] ?? false}
+						disabled={row.disabled}
+						onCheckedChange={() => row.run()}
+					>
+						{row.label}
+						{row.shortcut && <span className="ml-auto text-[10px] text-muted-foreground">{row.shortcut}</span>}
+					</DropdownMenuCheckboxItem>
+				) : (
+					<DropdownMenuItem
+						key={row.id}
+						data-action={row.dataAction}
+						disabled={row.disabled}
+						title={row.disabledReason}
+						variant={row.danger ? 'destructive' : undefined}
+						onSelect={row.run}
+					>
+						{row.icon}
+						{row.label}
+						{row.shortcut && <DropdownMenuShortcut>{row.shortcut}</DropdownMenuShortcut>}
+					</DropdownMenuItem>
+				)
+			)}
+		</>
+	);
+}
+
 export function FilesSection(_ctx: { projectId: string }) {
 	const activeProject = useShellStore((s) => s.activeProject);
 	const roots = useMemo(() => {
@@ -843,19 +898,12 @@ export function FilesSection(_ctx: { projectId: string }) {
 						</button>
 					</DropdownMenuTrigger>
 					<DropdownMenuContent align="end" className="w-56">
-						<DropdownMenuCheckboxItem
-							checked={showHidden}
-							onCheckedChange={(v) => setShowHidden(Boolean(v))}
-						>
-							Show hidden files
-							<span className="ml-auto text-[10px] text-muted-foreground">⌘.</span>
-						</DropdownMenuCheckboxItem>
-						<DropdownMenuCheckboxItem
-							checked={showIgnored}
-							onCheckedChange={(v) => setShowIgnored(Boolean(v))}
-						>
-							Show ignored folders
-						</DropdownMenuCheckboxItem>
+						<FilesViewMenuItems
+							showHidden={showHidden}
+							showIgnored={showIgnored}
+							setShowHidden={setShowHidden}
+							setShowIgnored={setShowIgnored}
+						/>
 					</DropdownMenuContent>
 				</DropdownMenu>
 			</div>

@@ -1,11 +1,16 @@
 import { useCallback } from 'react';
 import { FileEdit } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { listScratchpads } from '@/lib/iyke/memory';
+import { deleteScratchpad, listScratchpads } from '@/lib/iyke/memory';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
+// WP-04 stub array — real menu content is `getEffectiveMenu('scratchpads')`
+// below (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused
+// `contextMenu` field (out of this WP's FILES list; see the PR report).
 export const scratchpadsContextMenu = [
 	{ id: 'open', label: 'Open', run: () => {} },
 	{ id: 'open-side', label: 'Open to the Side', run: () => {} },
@@ -15,8 +20,10 @@ export const scratchpadsContextMenu = [
 
 export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 	const scope = `project:${projectId}`;
+	const qc = useQueryClient();
+	const queryKey = ['explorer-scratchpads', projectId];
 	const query = useQuery({
-		queryKey: ['explorer-scratchpads', projectId],
+		queryKey,
 		queryFn: async () => {
 			try {
 				const res = await listScratchpads(scope);
@@ -34,6 +41,27 @@ export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 		const { focusedId, addTab } = usePaneStore.getState();
 		addTab(focusedId, { kind: 'scratchpad', scope, name });
 	}, [scope]);
+
+	const openScratchpadSplit = useCallback(
+		(name: string) => {
+			const { focusedId, placeView } = usePaneStore.getState();
+			placeView(focusedId, { kind: 'scratchpad', scope, name }, 'right');
+		},
+		[scope]
+	);
+
+	const removeScratchpad = useCallback(
+		async (name: string) => {
+			const ok = await confirmDialog(`Delete scratchpad "${name}"?`, { title: 'Delete scratchpad', kind: 'warning' });
+			if (!ok) return;
+			try {
+				await deleteScratchpad(name, scope);
+			} finally {
+				void qc.invalidateQueries({ queryKey });
+			}
+		},
+		[scope, qc, queryKey]
+	);
 
 	const openScratchpadsPage = useCallback(() => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -61,16 +89,29 @@ export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 	return (
 		<div className="py-1">
 			{items.map((sp) => (
-				<ListRow
+				<EffectiveContextMenu
 					key={sp.name}
-					size="sm"
-					onActivate={() => openScratchpad(sp.name)}
-					title={sp.name}
-					className="w-full gap-1.5 px-2"
+					menuId="scratchpads"
+					// A-9: `rename` is left out — the memory API has no rename, so it
+					// was read + write + delete (not atomic, and it could overwrite
+					// an existing scratchpad of the new name) behind `window.prompt`.
+					builtinsNeedHandler
+					handlers={{
+						open: () => openScratchpad(sp.name),
+						'open-to-side': () => openScratchpadSplit(sp.name),
+						delete: () => void removeScratchpad(sp.name),
+					}}
 				>
-					<FileEdit className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					<span className="flex-1 truncate text-xs">{sp.name}</span>
-				</ListRow>
+					<ListRow
+						size="sm"
+						onActivate={() => openScratchpad(sp.name)}
+						title={sp.name}
+						className="w-full gap-1.5 px-2"
+					>
+						<FileEdit className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						<span className="flex-1 truncate text-xs">{sp.name}</span>
+					</ListRow>
+				</EffectiveContextMenu>
 			))}
 		</div>
 	);

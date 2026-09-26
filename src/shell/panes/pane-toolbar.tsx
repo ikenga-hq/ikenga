@@ -21,14 +21,20 @@ import {
 	ZoomIn,
 	ZoomOut,
 } from 'lucide-react';
-import { labelFor } from '@/lib/keymap/registry';
 import type { PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { hasAddressBar } from '@/lib/panes/pane-address';
 import { IconButton } from '@/components/ui/icon-button';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems, type RenderableMenuItem } from '@/shell/menu/resolve';
 import { useWebviewRoute } from './pane-views';
-import { PkgPaneMenuItems, usePkgIdForPane } from './pkg-pane-menu';
+import {
+	NO_PKG_PANE_MENU,
+	PkgPaneMenuDataProvider,
+	type PkgPaneMenuData,
+	usePkgIdForPane,
+} from './pkg-pane-menu';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -43,12 +49,48 @@ import {
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { openExternalUrl, writeClipboardText } from '@/lib/transport';
 import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
-import { useState } from 'react';
+import { type ReactNode, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { handToChi } from '@/shell/companion/companion-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
+
+// No shortcut on the viewer-zoom rows: the shipped `⌘+` / `⌘−` / `⌘0` labels
+// belonged to the window-level `zoom.*` keys, not to these items (G-ACTIONS
+// §1.3 rendering rule, §10.2); every row's label comes from the registry.
+
+// The `pane` menu's shipped glyphs (`data-action` = the id).
+const PANE_MENU_ICONS: Readonly<Record<string, ReactNode>> = {
+	'pane.back': <ArrowLeft className="h-3.5 w-3.5" />,
+	'pane.forward': <ArrowRight className="h-3.5 w-3.5" />,
+	'pane.split-right': <SplitSquareHorizontal className="h-3.5 w-3.5" />,
+	'pane.split-down': <SplitSquareVertical className="h-3.5 w-3.5" />,
+	'viewer.open-in-browser': <ExternalLink className="h-3.5 w-3.5" />,
+	'viewer.toggle-source': <Code2 className="h-3.5 w-3.5" />,
+	'reveal-files': <FolderOpen className="h-3.5 w-3.5" />,
+	'viewer.copy-url': <LinkIcon className="h-3.5 w-3.5" />,
+	'viewer.zoom-in': <ZoomIn className="h-3.5 w-3.5" />,
+	'viewer.zoom-out': <ZoomOut className="h-3.5 w-3.5" />,
+	'viewer.zoom-reset': <RotateCcw className="h-3.5 w-3.5" />,
+	'viewer.device-phone': <Smartphone className="h-3.5 w-3.5" />,
+	'viewer.device-tablet': <Tablet className="h-3.5 w-3.5" />,
+	'viewer.device-full': <Monitor className="h-3.5 w-3.5" />,
+	'pane.screenshot': <Camera className="h-3.5 w-3.5" />,
+	'viewer.pin-to-artifacts': <PinIcon className="h-3.5 w-3.5" />,
+	'hand-to-chi': <Send className="h-3.5 w-3.5" />,
+	'viewer.toggle-history': <History className="h-3.5 w-3.5" />,
+	'pane.close': <X className="h-3.5 w-3.5" />,
+};
+
+// The Device width radio group's values, per item id.
+const DEVICE_VALUE: Readonly<Record<string, DeviceWidth>> = {
+	'viewer.device-phone': '390',
+	'viewer.device-tablet': '768',
+	'viewer.device-full': 'full',
+};
+
+const HTML_ONLY_REASON = 'Only HTML artifacts are served over HTTP';
 
 interface PaneToolbarProps {
 	paneId: PaneId;
@@ -114,37 +156,14 @@ const PANE_TOOLS_FOCUS = 'focus-visible:ring-[color-mix(in_srgb,var(--fg)_65%,tr
 // while *that pane* is hovered or contains focus. The parent `Pane` sets
 // `group/pane` + `data-focused` on its root so this can react to either.
 export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: PaneToolbarProps) {
-	const splitPane = usePaneStore((s) => s.splitPane);
-	const closePane = usePaneStore((s) => s.closePane);
 	const refreshPane = usePaneStore((s) => s.refreshPane);
-	const revealPath = usePaneStore((s) => s.revealPath);
-	const canSplit = usePaneStore((s) => s.canSplit());
-	const leafCount = usePaneStore((s) => s.leafCount());
 	const activeTab = usePaneStore((s) => {
 		const leaf = findLeaf(s.root, paneId);
 		return leaf?.tabs[leaf.activeTabIdx];
 	});
-
-	const splitDisabled = !canSplit;
-	const splitTitle = splitDisabled ? 'Max 6 panes' : undefined;
-	const closeDisabled = leafCount <= 1;
-	const canCopyPath = Boolean(activeTab && hasAddressBar(activeTab));
 	// WP-45: pkg views get the D-08 `pkg-view` menu branch.
 	const pkgId = usePkgIdForPane(paneId);
 	const reload = () => (onRefresh ? onRefresh() : refreshPane(paneId));
-
-	// D-08 artifact `⋯` menu (designs/pane-chrome.html?state=artifact).
-	const artifactPath = activeTab?.kind === 'artifact' ? activeTab.path : undefined;
-	const isArtifact = artifactPath !== undefined;
-	const isHtmlArtifact = Boolean(artifactPath && isHtmlArtifactPath(artifactPath));
-	const viewerState = useViewerPaneState((s) => s.forPane(paneId));
-	const zoomBy = useViewerPaneState((s) => s.zoomBy);
-	const resetZoom = useViewerPaneState((s) => s.resetZoom);
-	const setDevice = useViewerPaneState((s) => s.setDevice);
-	const setVariant = useViewerPaneState((s) => s.setVariant);
-	const alreadyPinned = usePinsStore((s) =>
-		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
-	);
 
 	return (
 		<div
@@ -176,165 +195,220 @@ export function PaneTools({ paneId, onRefresh, history, onPinToArtifacts }: Pane
 					</IconButton>
 				</DropdownMenuTrigger>
 				<DropdownMenuContent align="end" className="w-64">
-					{history && (
-						<>
-							<DropdownMenuItem disabled={!history.canGoBack} onSelect={() => history.back()}>
-								<ArrowLeft className="h-3.5 w-3.5" />
-								Back
-							</DropdownMenuItem>
-							<DropdownMenuItem disabled={!history.canGoForward} onSelect={() => history.forward()}>
-								<ArrowRight className="h-3.5 w-3.5" />
-								Forward
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-						</>
+					{/* Mounted only while the menu is open (Radix mounts content
+					    lazily): no menu resolution, pkg kernel-status query or
+					    viewer/pins subscription for a closed menu. */}
+					{pkgId ? (
+						<PkgPaneMenuDataProvider paneId={paneId} pkgId={pkgId} onReload={reload}>
+							{(pkg) => (
+								<PaneMenuBody
+									paneId={paneId}
+									history={history}
+									onPinToArtifacts={onPinToArtifacts}
+									pkg={pkg}
+								/>
+							)}
+						</PkgPaneMenuDataProvider>
+					) : (
+						<PaneMenuBody
+							paneId={paneId}
+							history={history}
+							onPinToArtifacts={onPinToArtifacts}
+							pkg={NO_PKG_PANE_MENU}
+						/>
 					)}
-					{/* WP-45: the pkg branch leads, per the design's pkgDotsMenu() order. */}
-					{pkgId && <PkgPaneMenuItems paneId={paneId} pkgId={pkgId} onReload={reload} />}
-					<DropdownMenuItem
-						disabled={splitDisabled}
-						title={splitTitle}
-						onSelect={() => splitPane(paneId, 'horizontal')}
-					>
-						<SplitSquareHorizontal className="h-3.5 w-3.5" />
-						Split right
-						<DropdownMenuShortcut>{labelFor('pane.split-right')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
-					<DropdownMenuItem
-						disabled={splitDisabled}
-						title={splitTitle}
-						onSelect={() => splitPane(paneId, 'vertical')}
-					>
-						<SplitSquareVertical className="h-3.5 w-3.5" />
-						Split down
-						<DropdownMenuShortcut>{labelFor('pane.split-down')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
-					{canCopyPath && activeTab && (activeTab.kind === 'artifact' || activeTab.kind === 'route') && (
-						<>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem
-								onSelect={() => void writeClipboardText(activeTab.path).catch(() => {})}
-							>
-								Copy path
-							</DropdownMenuItem>
-						</>
-					)}
-					{isArtifact && artifactPath && (
-						<>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem
-								disabled={!isHtmlArtifact}
-								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
-								onSelect={() =>
-									void resolveHtmlViewerUrl(artifactPath)
-										.then((url) => openExternalUrl(url))
-										.catch(() => {})
-								}
-							>
-								<ExternalLink className="h-3.5 w-3.5" />
-								Open in browser
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								onSelect={() => setVariant(paneId, viewerState.variant === 'source' ? 'default' : 'source')}
-							>
-								<Code2 className="h-3.5 w-3.5" />
-								{viewerState.variant === 'source' ? 'Close source' : 'Open source'}
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => revealPath(artifactPath)}>
-								<FolderOpen className="h-3.5 w-3.5" />
-								Reveal in Files
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								disabled={!isHtmlArtifact}
-								title={isHtmlArtifact ? undefined : 'Only HTML artifacts are served over HTTP'}
-								onSelect={() =>
-									void resolveHtmlViewerUrl(artifactPath)
-										.then((url) => writeClipboardText(url))
-										.catch(() => {})
-								}
-							>
-								<LinkIcon className="h-3.5 w-3.5" />
-								Copy viewer URL
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={() => zoomBy(paneId, 10)}>
-								<ZoomIn className="h-3.5 w-3.5" />
-								Zoom in
-								<DropdownMenuShortcut>⌘+</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => zoomBy(paneId, -10)}>
-								<ZoomOut className="h-3.5 w-3.5" />
-								Zoom out
-								<DropdownMenuShortcut>⌘−</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => resetZoom(paneId)}>
-								<RotateCcw className="h-3.5 w-3.5" />
-								Reset zoom ({viewerState.zoom}%)
-								<DropdownMenuShortcut>⌘0</DropdownMenuShortcut>
-							</DropdownMenuItem>
-							<DropdownMenuSeparator />
-							<DropdownMenuLabel className="px-2 py-1 text-[10px] uppercase text-muted-foreground">
-								Device width
-							</DropdownMenuLabel>
-							<DropdownMenuRadioGroup
-								value={viewerState.device}
-								onValueChange={(v) => setDevice(paneId, v as DeviceWidth)}
-							>
-								<DropdownMenuRadioItem value="390">
-									<Smartphone className="h-3.5 w-3.5" />
-									390 · phone
-								</DropdownMenuRadioItem>
-								<DropdownMenuRadioItem value="768">
-									<Tablet className="h-3.5 w-3.5" />
-									768 · tablet
-								</DropdownMenuRadioItem>
-								<DropdownMenuRadioItem value="full">
-									<Monitor className="h-3.5 w-3.5" />
-									Full width
-								</DropdownMenuRadioItem>
-							</DropdownMenuRadioGroup>
-							<DropdownMenuSeparator />
-							<DropdownMenuItem onSelect={() => void screenshotPane(paneId).catch(() => {})}>
-								<Camera className="h-3.5 w-3.5" />
-								Screenshot
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								disabled={alreadyPinned}
-								title={alreadyPinned ? 'Already pinned' : undefined}
-								onSelect={() => onPinToArtifacts?.()}
-							>
-								<PinIcon className="h-3.5 w-3.5" />
-								Pin to Artifacts
-							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => handToChi(artifactPath)}>
-								<Send className="h-3.5 w-3.5" />
-								Hand to Chi
-							</DropdownMenuItem>
-							<DropdownMenuItem
-								onSelect={() =>
-									setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history')
-								}
-							>
-								<History className="h-3.5 w-3.5" />
-								{viewerState.variant === 'history' ? 'Close version history' : 'Version history'}
-							</DropdownMenuItem>
-						</>
-					)}
-					<DropdownMenuSeparator />
-					<DropdownMenuItem
-						disabled={closeDisabled}
-						title={closeDisabled ? 'Cannot close last pane' : undefined}
-						onSelect={() => closePane(paneId)}
-						variant="destructive"
-					>
-						<X className="h-3.5 w-3.5" />
-						Close pane
-						<DropdownMenuShortcut>{labelFor('pane.close')}</DropdownMenuShortcut>
-					</DropdownMenuItem>
 				</DropdownMenuContent>
 			</DropdownMenu>
 		</div>
 	);
+}
+
+/** The pane `⋯` menu (G-ACTIONS §1.3 `pane`), resolved from the effective
+ *  model while it is open. */
+function PaneMenuBody({
+	paneId,
+	history,
+	onPinToArtifacts,
+	pkg,
+}: Pick<PaneToolbarProps, 'paneId' | 'history' | 'onPinToArtifacts'> & { pkg: PkgPaneMenuData }) {
+	const splitPane = usePaneStore((s) => s.splitPane);
+	const closePane = usePaneStore((s) => s.closePane);
+	const revealPath = usePaneStore((s) => s.revealPath);
+	const canSplit = usePaneStore((s) => s.canSplit());
+	const leafCount = usePaneStore((s) => s.leafCount());
+	const activeTab = usePaneStore((s) => {
+		const leaf = findLeaf(s.root, paneId);
+		return leaf?.tabs[leaf.activeTabIdx];
+	});
+
+	const splitDisabled = !canSplit;
+	const closeDisabled = leafCount <= 1;
+	const canCopyPath = Boolean(activeTab && hasAddressBar(activeTab));
+	const tabPath =
+		activeTab && (activeTab.kind === 'artifact' || activeTab.kind === 'route') ? activeTab.path : undefined;
+
+	// D-08 artifact `⋯` menu (designs/pane-chrome.html?state=artifact).
+	const artifactPath = activeTab?.kind === 'artifact' ? activeTab.path : undefined;
+	const isArtifact = artifactPath !== undefined;
+	const isHtmlArtifact = Boolean(artifactPath && isHtmlArtifactPath(artifactPath));
+	const viewerState = useViewerPaneState((s) => s.forPane(paneId));
+	const zoomBy = useViewerPaneState((s) => s.zoomBy);
+	const resetZoom = useViewerPaneState((s) => s.resetZoom);
+	const setDevice = useViewerPaneState((s) => s.setDevice);
+	const setVariant = useViewerPaneState((s) => s.setVariant);
+	const alreadyPinned = usePinsStore((s) =>
+		artifactPath ? (s.pins.some((p) => p.target === artifactPath) ?? false) : false
+	);
+
+	const paneMenu = useEffectiveMenu('pane');
+	const rows = resolveMenuItems(paneMenu, {
+		target: { resource: tabPath, paneKind: activeTab?.kind },
+		conditions: {
+			history: Boolean(history),
+			'artifact-tab': isArtifact,
+			'artifact-or-route-tab': canCopyPath && tabPath !== undefined,
+			...pkg.conditions,
+		},
+		disabled: (id) => {
+			switch (id) {
+				case 'pane.back':
+					return !history?.canGoBack;
+				case 'pane.forward':
+					return !history?.canGoForward;
+				case 'pane.split-right':
+				case 'pane.split-down':
+					return splitDisabled ? 'Max 6 panes' : false;
+				case 'viewer.open-in-browser':
+				case 'viewer.copy-url':
+					return isHtmlArtifact ? false : HTML_ONLY_REASON;
+				case 'viewer.pin-to-artifacts':
+					return alreadyPinned ? 'Already pinned' : false;
+				case 'pane.close':
+					return closeDisabled ? 'Cannot close last pane' : false;
+				default:
+					return false;
+			}
+		},
+		// Shipped wording, dynamic labels included.
+		labels: {
+			'pane.back': 'Back',
+			'pane.forward': 'Forward',
+			'pane.split-right': 'Split right',
+			'pane.split-down': 'Split down',
+			'copy-path': 'Copy path',
+			'viewer.toggle-source': viewerState.variant === 'source' ? 'Close source' : 'Open source',
+			'viewer.zoom-in': 'Zoom in',
+			'viewer.zoom-out': 'Zoom out',
+			'viewer.zoom-reset': `Reset zoom (${viewerState.zoom}%)`,
+			'pane.screenshot': 'Screenshot',
+			'viewer.toggle-history': viewerState.variant === 'history' ? 'Close version history' : 'Version history',
+			'pane.close': 'Close pane',
+		},
+		icons: { ...PANE_MENU_ICONS, ...pkg.icons },
+		destructive: ['pane.close'],
+		handlers: {
+			'pane.back': () => history?.back(),
+			'pane.forward': () => history?.forward(),
+			...pkg.handlers,
+			'pane.split-right': () => splitPane(paneId, 'horizontal'),
+			'pane.split-down': () => splitPane(paneId, 'vertical'),
+			'copy-path': () => {
+				if (tabPath !== undefined) void writeClipboardText(tabPath).catch(() => {});
+			},
+			'viewer.open-in-browser': () => {
+				if (artifactPath)
+					void resolveHtmlViewerUrl(artifactPath)
+						.then((url) => openExternalUrl(url))
+						.catch(() => {});
+			},
+			'viewer.toggle-source': () => setVariant(paneId, viewerState.variant === 'source' ? 'default' : 'source'),
+			'reveal-files': () => {
+				if (artifactPath) revealPath(artifactPath);
+			},
+			'viewer.copy-url': () => {
+				if (artifactPath)
+					void resolveHtmlViewerUrl(artifactPath)
+						.then((url) => writeClipboardText(url))
+						.catch(() => {});
+			},
+			'viewer.zoom-in': () => zoomBy(paneId, 10),
+			'viewer.zoom-out': () => zoomBy(paneId, -10),
+			'viewer.zoom-reset': () => resetZoom(paneId),
+			'viewer.device-phone': () => setDevice(paneId, '390'),
+			'viewer.device-tablet': () => setDevice(paneId, '768'),
+			'viewer.device-full': () => setDevice(paneId, 'full'),
+			'pane.screenshot': () => void screenshotPane(paneId).catch(() => {}),
+			'viewer.pin-to-artifacts': () => onPinToArtifacts?.(),
+			'hand-to-chi': () => {
+				if (artifactPath) handToChi(artifactPath);
+			},
+			'viewer.toggle-history': () =>
+				setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history'),
+			'pane.close': () => closePane(paneId),
+		},
+	});
+
+	// Adjacent `viewer.device-*` rows render as one "Device width" radio group
+	// (§1.3 rendering rule); every other row is a plain item.
+	const out: ReactNode[] = [];
+	for (let i = 0; i < rows.length; i++) {
+		const row = rows[i];
+		if (row.kind === 'separator') {
+			out.push(<DropdownMenuSeparator key={`sep-${i}`} />);
+			continue;
+		}
+		if (row.display === 'radio' && DEVICE_VALUE[row.id]) {
+			const group: RenderableMenuItem[] = [];
+			while (i < rows.length) {
+				const next = rows[i];
+				if (next.kind !== 'item' || next.display !== 'radio' || !DEVICE_VALUE[next.id]) break;
+				group.push(next);
+				i++;
+			}
+			i--;
+			out.push(
+				<DropdownMenuLabel
+					key={`device-width-label-${group[0].id}`}
+					className="px-2 py-1 text-[10px] uppercase text-muted-foreground"
+				>
+					Device width
+				</DropdownMenuLabel>,
+				<DropdownMenuRadioGroup
+					key={`device-width-group-${group[0].id}`}
+					value={viewerState.device}
+					onValueChange={(v) => setDevice(paneId, v as DeviceWidth)}
+				>
+					{group.map((item) => (
+						<DropdownMenuRadioItem
+							key={item.id}
+							value={DEVICE_VALUE[item.id]}
+							data-action={item.dataAction}
+							disabled={item.disabled}
+						>
+							{item.icon}
+							{item.label}
+						</DropdownMenuRadioItem>
+					))}
+				</DropdownMenuRadioGroup>
+			);
+			continue;
+		}
+		out.push(
+			<DropdownMenuItem
+				key={row.id}
+				data-action={row.dataAction}
+				disabled={row.disabled}
+				title={row.disabledReason}
+				variant={row.danger ? 'destructive' : undefined}
+				onSelect={row.run}
+			>
+				{row.icon}
+				{row.label}
+				{row.shortcut && <DropdownMenuShortcut>{row.shortcut}</DropdownMenuShortcut>}
+			</DropdownMenuItem>
+		);
+	}
+	return <>{out}</>;
 }
 
 // Kept as a pre-existing, always-visible control (not part of the §6A.1

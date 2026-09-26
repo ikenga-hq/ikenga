@@ -1,11 +1,16 @@
 import { useCallback } from 'react';
 import { CheckSquare, Square } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { listTodos, type Todo } from '@/lib/iyke/memory';
+import { completeTodo, listTodos, updateTodo, type Todo } from '@/lib/iyke/memory';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
+import { handToChi } from '@/shell/companion/companion-store';
 import type { ExplorerSectionContext } from '../section-registry';
 
+// WP-04 stub array — real menu content is `getEffectiveMenu('todos')` below
+// (G-ACTIONS §1.3). Kept for `section-registry.ts`'s unused `contextMenu`
+// field (out of this WP's FILES list; see the PR report).
 export const todosContextMenu = [
 	{ id: 'toggle-done', label: 'Toggle done', run: () => {} },
 	{ id: 'open-source', label: 'Open source file', run: () => {} },
@@ -13,8 +18,10 @@ export const todosContextMenu = [
 ];
 
 export function TodosSection({ projectId }: ExplorerSectionContext) {
+	const qc = useQueryClient();
+	const queryKey = ['explorer-todos', projectId];
 	const query = useQuery<Todo[]>({
-		queryKey: ['explorer-todos', projectId],
+		queryKey,
 		queryFn: async () => {
 			try {
 				const res = await listTodos({ scope: `project:${projectId}` });
@@ -27,6 +34,18 @@ export function TodosSection({ projectId }: ExplorerSectionContext) {
 	});
 
 	const todos = query.data ?? [];
+
+	const toggleDone = useCallback(
+		async (todo: Todo) => {
+			try {
+				if (todo.status === 'done') await updateTodo({ id: todo.id, status: 'open' });
+				else await completeTodo(todo.id);
+			} finally {
+				void qc.invalidateQueries({ queryKey });
+			}
+		},
+		[qc, queryKey]
+	);
 
 	const openTodos = useCallback(() => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -54,20 +73,31 @@ export function TodosSection({ projectId }: ExplorerSectionContext) {
 	return (
 		<div className="py-1">
 			{todos.map((todo) => (
-				<ListRow
+				<EffectiveContextMenu
 					key={todo.id}
-					size="sm"
-					onActivate={openTodos}
-					title={todo.title}
-					className="w-full gap-1.5 px-2"
+					menuId="todos"
+					// A-9: `open-source` is left out — todos carry no source-file
+					// reference, so it could only open the Todos page.
+					builtinsNeedHandler
+					handlers={{
+						'toggle-done': () => void toggleDone(todo),
+						'hand-to-chi': () => handToChi(todo.title),
+					}}
 				>
-					{todo.status === 'done' ? (
-						<CheckSquare className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
-					) : (
-						<Square className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-					)}
-					<span className="flex-1 truncate text-xs">{todo.title}</span>
-				</ListRow>
+					<ListRow
+						size="sm"
+						onActivate={openTodos}
+						title={todo.title}
+						className="w-full gap-1.5 px-2"
+					>
+						{todo.status === 'done' ? (
+							<CheckSquare className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+						) : (
+							<Square className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+						)}
+						<span className="flex-1 truncate text-xs">{todo.title}</span>
+					</ListRow>
+				</EffectiveContextMenu>
 			))}
 		</div>
 	);

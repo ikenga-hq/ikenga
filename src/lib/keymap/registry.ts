@@ -14,9 +14,16 @@
 // `setEffectiveKeymap()`; until the model has loaded (and in tests that never
 // start it) it is the defaults. Callers never read `DEFAULT_KEYMAP` directly.
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { type ContextKeys, getContextKeys, getEvalOptions } from './context-keys';
 import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapScope, type KeymapSource } from './defaults';
+// WP-55: `useKey` registers in the one dispatcher's command table instead of
+// listening for `keydown` itself (Round 42 hand-off 2) — see `useKey`'s own
+// doc comment. `dispatcher.ts` imports back from this module (for
+// `getKeymap` / `resolveKeypress` / …), used only inside its functions and
+// never at module-eval time, so this import cycle is safe (ESM live bindings).
+import { type CommandInvocation, registerCommand, runCommand } from './commands';
+import { installKeyDispatcher } from './dispatcher';
 import {
 	canonicalizeKeySequence,
 	eventMatchesCombo,
@@ -363,17 +370,22 @@ function comparableOrNull(seq: string, platform: KeymapPlatform): string | null 
 
 /**
  * Fire `handler` when `command`'s bound key is pressed and its `when` holds
- * against the live context (`context-keys.ts`). Centralises the guard every
- * frame shortcut needs (D3): a `!inputFocus` rule never fires while an
- * `input` / `textarea` / `contenteditable` holds focus, and an IME
- * composition or Dead-key event never matches (`strokesFromEvent`). No-ops
- * (and warns) for a command with no registry entry, and no-ops silently for
- * a hosted command (§4.6) — its owner fires it. Single strokes only; chords
- * go through the dispatcher's chord machine (WP-54, `chord.ts`). Every
- * keydown is resolved with `resolveKeypress()` over the effective keymap,
- * and the handler fires only when `command` is the §2.3 winner — so two
- * commands on one key never both fire (DEC-58), and a rebind takes effect
- * without remounting.
+ * against the live context (`context-keys.ts`). No-ops (and warns) for a
+ * command with no registry entry, and no-ops silently for a hosted command
+ * (§4.6) — its owner fires it.
+ *
+ * WP-55 (Round 42 hand-off 2): this used to be its own `window.addEventListener`
+ * — a second firing path alongside the one key dispatcher (WP-54,
+ * `dispatcher.ts`), so an unbind or a rebind here could go stale independent
+ * of the registry. It now registers `command` in the command table
+ * (`commands.ts`) that the one dispatcher runs: the dispatcher resolves and
+ * dedupes every keydown (D3's `!inputFocus` guard, IME / Dead-key exclusion,
+ * and DEC-58 single fire all still apply, since they live in the dispatcher
+ * itself), and this only turns its `CommandInvocation` back into the plain
+ * `(e: KeyboardEvent) => void` shape callers already expect. An invocation
+ * with no keydown (a menu click, the palette, a chord timeout) is not this
+ * hook's to answer: it passes straight through to the registration beneath
+ * it — the command's real owner — so a `useKey` never shadows it.
  */
 export function useKey(
 	command: string,
@@ -381,23 +393,37 @@ export function useKey(
 	opts?: { enabled?: boolean }
 ): void {
 	const enabled = opts?.enabled ?? true;
+	const handlerRef = useRef(handler);
+	handlerRef.current = handler;
+	const hosted = isHostedCommand(command);
+	const known = getKeymap().some((e) => e.command === command) || DEFAULT_KEYMAP.some((e) => e.command === command);
+	const active = enabled && !hosted && known;
 	useEffect(() => {
-		if (!enabled) return;
-		if (isHostedCommand(command)) return;
-		if (!getKeymap().some((e) => e.command === command) && !DEFAULT_KEYMAP.some((e) => e.command === command)) {
-			console.warn(`[keymap] useKey: no registry entry for "${command}"`);
-			return;
+		if (enabled && !hosted && !known) console.warn(`[keymap] useKey: no registry entry for "${command}"`);
+	}, [command, enabled, hosted, known]);
+	useEffect(() => {
+		if (!active) return;
+		installKeyDispatcher();
+		let off = registerCommand(command, own);
+		function own(invocation: CommandInvocation): void {
+			if (invocation.event) {
+				handlerRef.current(invocation.event);
+				return;
+			}
+			// No keydown (a menu click, the palette, a chord timeout): this
+			// registration only answers keys, so it must not shadow the
+			// command's real owner. Step aside, let the command table reach
+			// the registration beneath (or the effective-action fallback),
+			// then take the top of the stack back.
+			off();
+			try {
+				runCommand(invocation);
+			} finally {
+				off = registerCommand(command, own);
+			}
 		}
-		function onKey(e: KeyboardEvent) {
-			const { winner } = resolveKeypress(e);
-			if (!winner || winner.command !== command) return;
-			e.preventDefault();
-			handler(e);
-		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [command, handler, enabled]);
+		return () => off();
+	}, [command, active]);
 }
 
 /**
