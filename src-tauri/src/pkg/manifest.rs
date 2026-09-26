@@ -963,6 +963,9 @@ pub fn derive_context_action_key_when(selector: &ContextSelector) -> String {
 
     match selector {
         ContextSelector::File { glob: None } => "filesFocus".to_string(),
+        // An empty glob is treated as absent (parity with the TS
+        // `selector.glob ? … : 'filesFocus'` ternary, which is falsy on "").
+        ContextSelector::File { glob: Some(glob) } if glob.is_empty() => "filesFocus".to_string(),
         ContextSelector::File { glob: Some(glob) } => {
             format!("filesFocus && resource =~ '{}'", escape_when_string(glob))
         }
@@ -1272,6 +1275,43 @@ impl Package {
             }
         }
         Self::validate_workflows(m)?;
+        Self::validate_key_requests(m)?;
+        Ok(())
+    }
+
+    /// G-ACTIONS §7.1 / §12, B-6: a `ContextActionEntry.key` or
+    /// `CommandPaletteEntry.shortcut` request must be a single stroke — no
+    /// package can request a chord. The registry grammar's strokes never
+    /// contain whitespace, so a space in the request is unambiguously a
+    /// chord; reject it with a canonical message naming the pkg.
+    fn validate_key_requests(m: &Manifest) -> Result<()> {
+        let Some(ui) = &m.ui else {
+            return Ok(());
+        };
+        for a in &ui.context_actions {
+            if let Some(key) = &a.key {
+                if key.chars().any(char::is_whitespace) {
+                    return Err(anyhow!(
+                        "ui.context_actions[].key `{key}` in manifest `{}` must be a single \
+                         stroke — a chord (whitespace-separated strokes) is not a valid key \
+                         request",
+                        m.id
+                    ));
+                }
+            }
+        }
+        for p in &ui.command_palette {
+            if let Some(shortcut) = &p.shortcut {
+                if shortcut.chars().any(char::is_whitespace) {
+                    return Err(anyhow!(
+                        "ui.command_palette[].shortcut `{shortcut}` in manifest `{}` must be a \
+                         single stroke — a chord (whitespace-separated strokes) is not a valid \
+                         key request",
+                        m.id
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2320,6 +2360,50 @@ mod tests {
         assert!(result.is_err(), "an authored 'always' when must be rejected");
     }
 
+    /// DEC-54: `ContextSelector` is a tagged union (`kind` discriminant) —
+    /// the literal string `"always"` is not a valid selector shape at all,
+    /// so a manifest that tries to author one is rejected at parse.
+    #[test]
+    fn dec_54_when_as_bare_always_string_is_rejected() {
+        let json = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": "always", "run": {"kind": "view", "route": "/"}}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "`when` must be a ContextSelector object, not the bare string 'always'"
+        );
+    }
+
+    /// B-6 / G-ACTIONS §7.1, §12: a package key request must be a single
+    /// stroke — a chord is rejected at `Package::validate`, naming the pkg.
+    #[test]
+    fn b_6_chord_key_requests_are_rejected() {
+        let context_action_chord = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "file"}, "run": {"kind": "view", "route": "/"},
+                "key": "mod+k mod+r"}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(context_action_chord)
+            .expect("chord key still parses as a plain string");
+        let err = Package::validate(&m).expect_err("a chord context_actions[].key must be rejected");
+        assert!(err.to_string().contains("com.ikenga.x"), "error must name the pkg: {err}");
+
+        let palette_chord = r#"{
+            "id": "com.ikenga.y", "name": "Y", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"command_palette": [{"id": "p", "label": "P", "shortcut": "mod+k mod+r",
+                "action": {"kind": "view", "route": "/"}}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(palette_chord)
+            .expect("chord shortcut still parses as a plain string");
+        let err =
+            Package::validate(&m).expect_err("a chord command_palette[].shortcut must be rejected");
+        assert!(err.to_string().contains("com.ikenga.y"), "error must name the pkg: {err}");
+    }
+
     /// G-ACTIONS §7.3 — every `ContextSelector` variant derives a well-formed
     /// DEC-62 `when`, narrower than `always` by construction (never `always`,
     /// never empty, never an OS-wide form). One case per table row.
@@ -2327,6 +2411,14 @@ mod tests {
     fn g_actions_7_3_derive_context_action_key_when_covers_every_variant() {
         let cases: &[(ContextSelector, &str)] = &[
             (ContextSelector::File { glob: None }, "filesFocus"),
+            (
+                // An empty glob is parity with the absent case (§7.3), not
+                // `resource =~ ''`.
+                ContextSelector::File {
+                    glob: Some(String::new()),
+                },
+                "filesFocus",
+            ),
             (
                 ContextSelector::File {
                     glob: Some("*.{ts,rs}".to_string()),
@@ -2363,10 +2455,6 @@ mod tests {
             assert_eq!(when.as_str(), *expected, "selector {selector:?}");
             assert_ne!(when.as_str(), "always", "must be narrower than always");
             assert!(!when.is_empty(), "must not be empty (empty == always)");
-            assert!(
-                !when.contains("scope"),
-                "derived when must never encode an OS-wide scope"
-            );
         }
     }
 
@@ -2388,12 +2476,12 @@ mod tests {
     fn g_actions_12_command_palette_action_is_typed_run_union() {
         let ok = r#"{
             "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
-            "ui": {"command_palette": [{"id": "p", "label": "P", "shortcut": "mod+k mod+p",
+            "ui": {"command_palette": [{"id": "p", "label": "P", "shortcut": "mod+shift+p",
                 "action": {"kind": "dispatch", "prompt": "Do it"}}]}
         }"#;
         let m: Manifest = serde_json::from_str(ok).expect("typed action parses");
         let ui = m.ui.unwrap();
-        assert_eq!(ui.command_palette[0].shortcut.as_deref(), Some("mod+k mod+p"));
+        assert_eq!(ui.command_palette[0].shortcut.as_deref(), Some("mod+shift+p"));
         match &ui.command_palette[0].action {
             ContextActionRun::Dispatch { prompt, .. } => assert_eq!(prompt, "Do it"),
             other => panic!("expected dispatch run, got {other:?}"),

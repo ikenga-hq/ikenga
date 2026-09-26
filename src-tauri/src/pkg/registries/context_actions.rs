@@ -34,6 +34,10 @@ pub struct ContextActionRegistryEntry {
     pub when: ContextSelector,
     /// Effect — `{kind: dispatch, prompt, target?}` or `{kind: view, route}`.
     pub run: ContextActionRun,
+    /// DEC-54 key request (G-ACTIONS §7.1), verbatim from the manifest.
+    /// `None` when the pkg made no request. WP-52's effective-keymap merge
+    /// derives the request's `when` and decides whether it is granted.
+    pub key: Option<String>,
 }
 
 #[derive(Default)]
@@ -89,6 +93,7 @@ impl Registry for ContextActionsRegistry {
                 label: a.label.clone(),
                 when: a.when.clone(),
                 run: a.run.clone(),
+                key: a.key.clone(),
             });
         }
 
@@ -176,6 +181,7 @@ mod tests {
                     prompt: "Blame {{file.path}}".into(),
                     target: None,
                 },
+                key: None,
             }],
         );
         reg.register(&pkg).unwrap();
@@ -207,6 +213,7 @@ mod tests {
                 run: ContextActionRun::View {
                     route: "/pkg/com.ikenga.tasks/".into(),
                 },
+                key: None,
             }],
         );
         reg.register(&pkg).unwrap();
