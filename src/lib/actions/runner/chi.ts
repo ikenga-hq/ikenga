@@ -14,12 +14,18 @@
 // rebind to its `chi_run` shape.
 //
 // A PTY inject has no Chi run behind it, so `runId` is `null` there
-// (`via: 'pty'`). The manifest `dispatch` kind and built-in "Hand to Chi"
-// stay fill-only and never come through here.
+// (`via: 'pty'`). It is only allowed into an AGENT terminal (a `wrap` spec —
+// the same test `resolve-target.ts` uses for its context line): an action
+// run never types into a plain shell, where `text + "\r"` would execute as a
+// command and bypass the DEC-55 gate for an untrusted project `chi` action.
+// A plain-shell active target is refused with `no-target`. The manifest
+// `dispatch` kind and built-in "Hand to Chi" stay fill-only and never come
+// through here.
 
 import { chiResume, chiRun, type ChiRunResult } from '@/lib/tauri-cmd';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
+import { useTerminalStore } from '@/terminal/session-store';
 import type { ChiTarget } from '../types';
 
 export interface ChiSendRequest {
@@ -68,6 +74,16 @@ export function companionTargetFor(target: ChiTarget, engineId?: string): Compan
 	}
 }
 
+/** Whether terminal `sessionId` runs an agent TUI (a `wrap` spec) rather
+ *  than a shell. Mirrors `resolve-target.ts`'s (unexported) check. */
+export function isAgentTerminal(sessionId: string): boolean {
+	const tab = useTerminalStore.getState().tabs.find((t) => t.id === sessionId);
+	return Boolean(tab?.spec.wrap);
+}
+
+export const PLAIN_TERMINAL_REASON =
+	'The Companion target is a plain terminal — an action only dispatches to an agent. Pick an agent session or a new run.';
+
 function settled(result: ChiRunResult): string {
 	if (result.status === 'failed' && result.error) throw new Error(result.error);
 	return result.run_id;
@@ -81,6 +97,10 @@ export async function send(request: ChiSendRequest): Promise<ChiSendResult> {
 		case 'none':
 			throw new ChiUnavailableError('no-engine', resolved.disabledReason ?? 'No Chi target is available');
 		case 'pty':
+			// DEC-55: never type into a raw shell — only into an agent terminal.
+			if (target.kind !== 'session' || !isAgentTerminal(target.session_id)) {
+				throw new ChiUnavailableError('no-target', PLAIN_TERMINAL_REASON);
+			}
 			// The dispatch path's own PTY write (context line omitted: the
 			// action's template is the whole message).
 			await resolved.send(request.prompt);

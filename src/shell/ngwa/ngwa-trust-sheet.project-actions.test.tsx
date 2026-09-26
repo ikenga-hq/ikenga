@@ -108,10 +108,40 @@ describe('NgwaTrustSheet — project-actions mode (WP-53)', () => {
 		mocks.actionsTrustGrant.mockResolvedValue(status);
 		const onApproved = renderSheet();
 		await screen.findByText(/Keybindings held until trusted/);
+		// Held keybindings are opt-in: tick them.
+		fireEvent.click(screen.getByRole('checkbox', { name: 'Trust these keybindings' }));
 		fireEvent.click(screen.getByRole('button', { name: /Trust$/ }));
 		await waitFor(() => expect(onApproved).toHaveBeenCalled());
 		expect(mocks.actionsTrustGrant).toHaveBeenCalledWith(
 			{ actions: [{ id: 'refresh-pulse', hash: 'h-refresh' }], keybindings: status.keybindings.hash },
+			'p1'
+		);
+	});
+
+	it('pre-checks only the refused action; other actions and held keybindings start unchecked', async () => {
+		const status = await trustStatus();
+		status.actions.push({
+			id: 'deploy',
+			name: 'Deploy',
+			kind: 'shell',
+			run: { kind: 'shell', command: 'scripts/deploy.sh' },
+			hash: 'h-deploy',
+			state: 'untrusted',
+		});
+		mocks.actionsTrustStatus.mockResolvedValue(status);
+		mocks.readActionsFiles.mockResolvedValue(files(BINDINGS));
+		mocks.actionsTrustGrant.mockResolvedValue(status);
+		renderSheet();
+		await screen.findByText(/Keybindings held until trusted/);
+		expect((screen.getByRole('checkbox', { name: 'Trust Refresh pulse snapshots' }) as HTMLInputElement).checked).toBe(
+			true
+		);
+		expect((screen.getByRole('checkbox', { name: 'Trust Deploy' }) as HTMLInputElement).checked).toBe(false);
+		expect((screen.getByRole('checkbox', { name: 'Trust these keybindings' }) as HTMLInputElement).checked).toBe(false);
+		fireEvent.click(screen.getByRole('button', { name: /Trust$/ }));
+		await waitFor(() => expect(mocks.actionsTrustGrant).toHaveBeenCalled());
+		expect(mocks.actionsTrustGrant).toHaveBeenCalledWith(
+			{ actions: [{ id: 'refresh-pulse', hash: 'h-refresh' }], keybindings: null },
 			'p1'
 		);
 	});

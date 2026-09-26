@@ -1,9 +1,8 @@
 // WP-13 · WP-18b: one skill-action button.
 //
-// Dispatch was the shell's reusable New-Session dialog (`openSessionDialog`,
-// the `host.openSessionDialog` verb's core). With the terminal surface removed,
-// dispatchAction is a no-op stub; the skill-action surface remains visible as
-// a placeholder while agents move to the CLI/MCP surface.
+// Dispatch goes through `dispatchAction` (WP-53): `confirm` / `approve` /
+// setup seed the Companion dispatch bar (seed → review → send); only `auto`
+// sends. A dispatch that could not run shows its reason inline.
 //
 // Dispatchable modes: `confirm` (seed → review → send) and `approve` (run →
 // pause at the approve gate). WP-18b adds the well-known `setup` action: it
@@ -41,6 +40,8 @@ export function ActionButton({ action }: { action: SkillAction }) {
 					setNote('Scope denied');
 				} else if (res.reason === 'not-implemented') {
 					setNote('Action dispatch removed');
+				} else if (res.reason === 'unavailable' || res.reason === 'failed') {
+					setNote(res.message ?? (res.reason === 'failed' ? 'Dispatch failed' : 'Unavailable'));
 				}
 			}
 		} catch (e) {

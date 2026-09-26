@@ -153,9 +153,10 @@ export function bindingsHash(bindings: KeybindingRule[] | undefined): Promise<st
 
 // --- the gate ------------------------------------------------------------------
 
-/** DEC-55: whether a run of this kind from this scope needs trust. */
+/** DEC-55: whether a run of this kind from this scope needs trust. Only
+ *  `personal` is exempt — an unexpected scope is gated (fail-closed). */
 export function isTrustGated(scope: ActionsScope, kind: ActionRunKind): boolean {
-	return scope === 'project' && GATED_RUN_KINDS.includes(kind);
+	return scope !== 'personal' && GATED_RUN_KINDS.includes(kind);
 }
 
 export type TrustRefusal = 'untrusted' | 'changed' | 'trust-unavailable';

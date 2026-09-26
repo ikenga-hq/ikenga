@@ -10,7 +10,7 @@ vi.mock('@/lib/tauri-cmd', () => ({
 	listen: listenMock,
 }));
 
-import type { ActionRun, ActionsTrustStatus, ActionTrust } from '../types';
+import type { ActionRun, ActionsScope, ActionsTrustStatus, ActionTrust } from '../types';
 import {
 	bindingsHash,
 	canonicalJson,
@@ -88,6 +88,12 @@ describe('checkActionTrust (DEC-55)', () => {
 		}
 		expect(isTrustGated('project', 'chi')).toBe(false);
 		expect(isTrustGated('project', 'open')).toBe(false);
+	});
+
+	it('fails closed on an unexpected scope', () => {
+		const odd = 'package' as unknown as ActionsScope;
+		expect(isTrustGated(odd, 'shell')).toBe(true);
+		expect(isTrustGated(undefined as unknown as ActionsScope, 'iyke')).toBe(true);
 	});
 
 	it('does not read trust for an ungated run', async () => {

@@ -405,8 +405,10 @@ function ProjectActionsTrustSheet({
 	const qc = useQueryClient();
 	const queryKey = ['actions', 'trust-sheet', target.projectId ?? null] as const;
 	const query = useQuery({ queryKey, queryFn: () => loadProjectTrust(target.projectId ?? null) });
-	const [excluded, setExcluded] = useState<Set<string>>(() => new Set());
-	const [skipKeybindings, setSkipKeybindings] = useState(false);
+	// Only the refused action(s) that opened the sheet start checked; every
+	// other untrusted action and the held keybindings are opt-in.
+	const [selected, setSelected] = useState<Set<string>>(() => new Set(target.actionIds ?? []));
+	const [skipKeybindings, setSkipKeybindings] = useState(true);
 	const [actionError, setActionError] = useState<string | null>(null);
 
 	// A file edit or a trust change elsewhere re-reads what is shown.
@@ -438,7 +440,7 @@ function ProjectActionsTrustSheet({
 	const grant = useMutation({
 		mutationFn: async () => {
 			if (!data) return;
-			const actions = pending.filter((entry) => !excluded.has(entry.id));
+			const actions = pending.filter((entry) => selected.has(entry.id));
 			const keybindingsHash =
 				keybindingsHeld && !skipKeybindings && data.bindingsMatch ? (kb?.hash ?? null) : null;
 			await trustShown(target.projectId ?? null, { actions, keybindingsHash });
@@ -454,7 +456,7 @@ function ProjectActionsTrustSheet({
 		},
 	});
 
-	const chosenActions = pending.filter((entry) => !excluded.has(entry.id)).length;
+	const chosenActions = pending.filter((entry) => selected.has(entry.id)).length;
 	const chosenKeybindings = keybindingsHeld && !skipKeybindings && Boolean(data?.bindingsMatch);
 	const nothingChosen = chosenActions === 0 && !chosenKeybindings;
 	const title = target.projectName ? `Trust project actions · ${target.projectName}` : 'Trust project actions';
@@ -526,12 +528,12 @@ function ProjectActionsTrustSheet({
 											<input
 												type="checkbox"
 												className="mt-1"
-												checked={!excluded.has(entry.id)}
+												checked={selected.has(entry.id)}
 												onChange={(e) => {
-													const next = new Set(excluded);
-													if (e.target.checked) next.delete(entry.id);
-													else next.add(entry.id);
-													setExcluded(next);
+													const next = new Set(selected);
+													if (e.target.checked) next.add(entry.id);
+													else next.delete(entry.id);
+													setSelected(next);
 												}}
 												aria-label={`Trust ${entry.name ?? entry.id}`}
 											/>

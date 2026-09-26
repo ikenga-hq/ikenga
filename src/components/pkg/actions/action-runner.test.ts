@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { runActionMock } = vi.hoisted(() => ({ runActionMock: vi.fn() }));
+const { runActionMock, handToChiMock } = vi.hoisted(() => ({ runActionMock: vi.fn(), handToChiMock: vi.fn() }));
 
 vi.mock('@/lib/actions/runner', () => ({ runAction: runActionMock }));
+vi.mock('@/shell/companion/companion-store', () => ({ handToChi: handToChiMock }));
 
 import type { SkillAction } from '@/lib/tauri-cmd';
 import { dispatchAction, skillActionPrompt, toDispatchResult } from './action-runner';
@@ -22,10 +23,28 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
-describe('dispatchAction delegates to the WP-53 runner', () => {
-	it('sends a chi dispatch invoking the skill, ungated, and returns the run id', async () => {
+describe('dispatchAction', () => {
+	it('confirm and approve FILL the Companion dispatch bar and send nothing', async () => {
+		for (const uxMode of ['confirm', 'approve'] as const) {
+			await expect(dispatchAction(skillAction({ uxMode }))).resolves.toEqual({ ok: true, filled: true });
+		}
+		expect(handToChiMock).toHaveBeenCalledTimes(2);
+		expect(handToChiMock).toHaveBeenCalledWith('/release-status report');
+		expect(runActionMock).not.toHaveBeenCalled();
+	});
+
+	it('setup fills too (seed → review → send), interview flag included', async () => {
+		await expect(
+			dispatchAction(skillAction({ verb: 'setup', name: 'setup', uxMode: 'streaming' }), { interview: true })
+		).resolves.toEqual({ ok: true, filled: true });
+		expect(handToChiMock).toHaveBeenCalledWith('/release-status setup --interview');
+		expect(runActionMock).not.toHaveBeenCalled();
+	});
+
+	it('only auto SENDS a chi dispatch invoking the skill, ungated, and returns the run id', async () => {
 		runActionMock.mockResolvedValue({ status: 'done', kind: 'chi', testRun: false, runId: 'run-7' });
-		await expect(dispatchAction(skillAction())).resolves.toEqual({ ok: true, runId: 'run-7' });
+		await expect(dispatchAction(skillAction({ uxMode: 'auto' }))).resolves.toEqual({ ok: true, runId: 'run-7' });
+		expect(handToChiMock).not.toHaveBeenCalled();
 		expect(runActionMock).toHaveBeenCalledWith({
 			id: 'com.x.release:release-status:report',
 			name: 'Report',
@@ -46,6 +65,7 @@ describe('dispatchAction delegates to the WP-53 runner', () => {
 			reason: 'not-implemented',
 		});
 		expect(runActionMock).not.toHaveBeenCalled();
+		expect(handToChiMock).not.toHaveBeenCalled();
 	});
 
 	it('maps runner outcomes', () => {

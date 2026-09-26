@@ -1,14 +1,15 @@
 // WP-53 — `{{name}}` interpolation over the six run variables (G-ACTIONS
 // §8.2, DEC-63.4), escaped by the context the value lands in:
 //
-//   • shell  — each value becomes ONE argument, quoted for the executing
-//              shell (POSIX single quotes; PowerShell single quotes on
-//              Windows, which is what `action_exec` runs there). Never spliced
-//              raw, so `{{file.path}}` of `a'; rm -rf ~ #` stays one word.
 //   • uri    — percent-encoded as a URI component, except when the whole
 //              template is a single variable (then the value is the URL).
 //   • raw    — as-is (`chi` / `skill` prompts; `iyke` values travel in the
 //              JSON body instead and never touch the route).
+//
+// `shell` is NOT interpolated here: values never become command text. Rust
+// (`action_exec.rs`) passes each value as an environment variable and
+// rewrites each `{{var}}` to the shell's reference to it; the frontend only
+// substitutes raw text for DISPLAY (confirm prompt, Test-run preview).
 //
 // The scanner mirrors the Rust validator's `template_variables`
 // (`src-tauri/src/actions/schema.rs`): `{{` up to the next `}}`, the name
@@ -23,7 +24,7 @@ import { RUN_VARIABLES, type RunVariable } from '../types';
 export type RunVariables = Record<RunVariable, string>;
 
 /** Where interpolated values land — decides the escaping. */
-export type InterpolationMode = 'shell-posix' | 'shell-powershell' | 'uri' | 'raw';
+export type InterpolationMode = 'uri' | 'raw';
 
 export class UnknownVariableError extends Error {
 	readonly variable: string;
@@ -80,26 +81,8 @@ export function templateVariables(template: string): string[] {
 		.filter((name): name is string => name !== null);
 }
 
-/** POSIX `sh`: single-quote, and close-escape-reopen every `'`. */
-export function quotePosix(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-/**
- * PowerShell verbatim string. PowerShell also treats the typographic single
- * quotes (U+2018..U+201B) as quote characters, so each of them is doubled
- * too — otherwise `‘` would end the string.
- */
-export function quotePowerShell(value: string): string {
-	return `'${value.replace(/['‘’‚‛]/g, (quote) => quote + quote)}'`;
-}
-
 function escapeFor(mode: InterpolationMode, value: string): string {
 	switch (mode) {
-		case 'shell-posix':
-			return quotePosix(value);
-		case 'shell-powershell':
-			return quotePowerShell(value);
 		case 'uri':
 			return encodeURIComponent(value);
 		case 'raw':

@@ -1,28 +1,50 @@
-// WP-53 — the `shell` run kind (G-ACTIONS §8.1): interpolate the command
-// with every value quoted as one argument for the executing shell (§8.2),
-// resolve `cwd` (default `{{project.root}}`, else the home directory), and
-// run it headless through `action_exec` (`src-tauri/src/commands/action_exec.rs`).
+// WP-53 — the `shell` run kind (G-ACTIONS §8.1), run headless through
+// `action_exec` (`src-tauri/src/commands/action_exec.rs`).
 //
-// `action_exec` runs `/bin/sh -c` on macOS / Linux and PowerShell on
-// Windows; `shellFlavor()` picks the matching quoting. Test run (WP-58)
-// NEVER executes: it returns the interpolated command for display.
+// The frontend never builds shell text. It sends the action's identity —
+// `scope`, `actionId`, the canonical-`run` hash it gated on — and the six
+// variable values. Rust loads the pinned `run` from the in-force document
+// (a project action must be trusted at that hash; a personal one must exist
+// in the personal file at that hash), passes every value as an environment
+// variable (`IKENGA_FILE_PATH`, …) and rewrites each `{{var}}` to the host
+// shell's reference to it, so a value is never re-parsed (§8.2). Rust also
+// owns the shell (`/bin/sh` on unix, PowerShell `-EncodedCommand` on
+// Windows), so there is no quoting flavour to keep in sync here.
+//
+// `previewShellRun` substitutes values raw, for DISPLAY only (the confirm
+// prompt and the WP-58 Test-run preview, which never executes).
 
 import { invoke } from '@/lib/tauri-cmd';
 import type { ActionRun, ActionsScope } from '../types';
-import { interpolate, type InterpolationMode, type RunVariables } from './interpolate';
+import { interpolate, type RunVariables } from './interpolate';
 
 export type ShellRun = Extract<ActionRun, { kind: 'shell' }>;
 
 export interface ActionExecRequest {
-	command: string;
-	cwd: string | null;
 	scope: ActionsScope;
 	projectId: string | null;
-	/** Required for a project action: Rust re-checks its trust pin. */
-	actionId: string | null;
-	runHash: string | null;
+	actionId: string;
+	/** SHA-256 of the canonical `run` JSON the gate checked (B-14). */
+	runHash: string;
+	/** The six values by variable name; they become environment variables. */
+	variables: RunVariables;
 	timeoutSecs?: number | null;
 }
+
+/** Why `action_exec` spawned nothing (see the Rust module note). */
+export type ActionExecRefusal =
+	| 'untrusted'
+	| 'changed'
+	| 'trust-unavailable'
+	| 'unavailable'
+	| 'not-found'
+	| 'not-shell'
+	| 'unknown-scope'
+	| 'unknown-variable'
+	| 'variable-in-single-quotes'
+	| 'variable-after-escape'
+	| 'invalid-variable'
+	| 'invalid-cwd';
 
 export interface ActionExecResult {
 	ok: boolean;
@@ -35,23 +57,11 @@ export interface ActionExecResult {
 	cwd: string;
 	shell: 'sh' | 'powershell' | '';
 	error: string | null;
-}
-
-export type ShellFlavor = 'posix' | 'powershell';
-
-/** The shell `action_exec` runs on this platform. */
-export function shellFlavor(
-	platform: string = typeof navigator === 'undefined' ? '' : navigator.platform || navigator.userAgent
-): ShellFlavor {
-	return /win/i.test(platform) && !/darwin|mac/i.test(platform) ? 'powershell' : 'posix';
-}
-
-function modeFor(flavor: ShellFlavor): InterpolationMode {
-	return flavor === 'powershell' ? 'shell-powershell' : 'shell-posix';
+	refusal: ActionExecRefusal | null;
 }
 
 export interface PreparedShellRun {
-	/** The command exactly as it will run. */
+	/** The command with values substituted raw — for display, never run. */
 	command: string;
 	/** Absolute cwd, or null = the home directory (resolved in Rust). */
 	cwd: string | null;
@@ -59,16 +69,11 @@ export interface PreparedShellRun {
 }
 
 /**
- * Interpolates `command` (quoted) and `cwd`. `cwd` is a path, not a shell
- * word, so its values are spliced raw: it never reaches a shell, only
- * `current_dir`. Throws `UnknownVariableError`.
+ * What a `shell` run will do, for the confirm prompt and Test-run preview.
+ * Throws `UnknownVariableError`. The executed command is built in Rust.
  */
-export function prepareShellRun(
-	run: ShellRun,
-	variables: RunVariables,
-	flavor: ShellFlavor = shellFlavor()
-): PreparedShellRun {
-	const command = interpolate(run.command, variables, modeFor(flavor));
+export function previewShellRun(run: ShellRun, variables: RunVariables): PreparedShellRun {
+	const command = interpolate(run.command, variables, 'raw');
 	const cwdTemplate = run.cwd ?? '{{project.root}}';
 	const cwd = interpolate(cwdTemplate, variables, 'raw').trim();
 	return { command, cwd: cwd === '' ? null : cwd, confirm: run.confirm === true };

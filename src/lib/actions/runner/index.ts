@@ -33,21 +33,14 @@ import {
 } from './interpolate';
 import { callIyke, iykeRequest, type IykeCallResult } from './iyke';
 import { classifyOpenUrl, openTarget, type OpenTarget } from './open';
-import {
-	actionExec,
-	actionGitBranch,
-	prepareShellRun,
-	shellFlavor as detectShellFlavor,
-	type ActionExecResult,
-	type ShellFlavor,
-} from './shell';
+import { actionExec, actionGitBranch, previewShellRun, type ActionExecResult } from './shell';
 import { isValidSkillName, runSkill } from './skill';
-import { checkActionTrust, type TrustRefusal } from './trust';
+import { checkActionTrust, runHash, type TrustRefusal } from './trust';
 import { workflowDisabled } from './workflow';
 
 export { canonicalJson, checkActionTrust, isTrustGated, onTrustChanged, runHash } from './trust';
-export { interpolate, quotePosix, quotePowerShell, templateVariables } from './interpolate';
-export type { ActionExecResult } from './shell';
+export { interpolate, templateVariables } from './interpolate';
+export type { ActionExecRefusal, ActionExecResult } from './shell';
 export type { ChiSendResult } from './chi';
 
 // --- inputs ----------------------------------------------------------------------
@@ -64,7 +57,8 @@ export interface RunnableAction {
 export interface ConfirmRequest {
 	actionId: string;
 	name: string;
-	/** The exact command that will run. */
+	/** The command with its values filled in, for reading. (At run time each
+	 *  value is an environment variable — never spliced into the text.) */
 	command: string;
 	/** Null = the home directory. */
 	cwd: string | null;
@@ -82,8 +76,6 @@ export interface RunContext {
 	testRun?: boolean;
 	/** `shell` `confirm: true`. Default: `window.confirm`. */
 	confirm?: (request: ConfirmRequest) => boolean | Promise<boolean>;
-	/** Override the quoting / shell (tests). */
-	shellFlavor?: ShellFlavor;
 }
 
 // --- outcomes --------------------------------------------------------------------
@@ -98,6 +90,10 @@ export type RunRefusalReason =
 	| 'invalid-url'
 	| 'unknown-variable'
 	| 'unknown-kind'
+	| 'variable-in-single-quotes'
+	| 'variable-after-escape'
+	/** `action_exec` refused for another reason (not found, bad cwd, …). */
+	| 'exec-refused'
 	| 'cancelled';
 
 /** What to open when a run is refused by the trust gate: WP-18's sheet in
@@ -252,6 +248,27 @@ function defaultConfirm(request: ConfirmRequest): boolean {
 	);
 }
 
+/** Maps `action_exec`'s typed refusal onto a run outcome. */
+function execRefusal(exec: ActionExecResult, projectId: string | null, actionId: string): RunOutcome {
+	const message = exec.error ?? 'The command was refused.';
+	switch (exec.refusal) {
+		case 'untrusted':
+		case 'changed':
+		case 'trust-unavailable':
+			return refused('shell', exec.refusal, message, {
+				mode: 'project-actions',
+				projectId,
+				actionIds: [actionId],
+			});
+		case 'variable-in-single-quotes':
+		case 'variable-after-escape':
+		case 'unknown-variable':
+			return refused('shell', exec.refusal, message);
+		default:
+			return refused('shell', 'exec-refused', message);
+	}
+}
+
 function chiRefusal(kind: ActionRunKind, testRun: boolean, err: unknown): RunOutcome {
 	if (err instanceof ChiUnavailableError) return refused(kind, err.reason, err.message);
 	return { status: 'failed', kind, testRun, message: errorText(err) };
@@ -331,7 +348,7 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 			}
 
 			case 'shell': {
-				const prepared = prepareShellRun(run, variables, ctx.shellFlavor ?? detectShellFlavor());
+				const prepared = previewShellRun(run, variables);
 				if (testRun) {
 					return {
 						status: 'preview',
@@ -347,15 +364,17 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 					const yes = await ask({ actionId: action.id, name, command: prepared.command, cwd: prepared.cwd });
 					if (!yes) return refused(run.kind, 'cancelled', 'Cancelled.');
 				}
+				// No command text crosses: Rust loads the pinned `run` for this
+				// id, re-checks the hash (and, for a project action, its trust)
+				// and passes the values as environment variables (§8.2).
 				const exec = await actionExec({
-					command: prepared.command,
-					cwd: prepared.cwd,
 					scope: action.scope,
 					projectId: projectId ?? null,
-					actionId: action.scope === 'project' ? action.id : null,
-					// The hash the gate checked; Rust re-checks it (defense in depth).
-					runHash: action.scope === 'project' ? gateHash : null,
+					actionId: action.id,
+					runHash: gateHash ?? (await runHash(run)),
+					variables,
 				});
+				if (exec.refusal) return execRefusal(exec, projectId ?? null, action.id);
 				if (exec.ok) return { status: 'done', kind: run.kind, testRun, exec };
 				const message =
 					exec.error ??

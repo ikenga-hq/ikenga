@@ -5,8 +5,6 @@ import {
 	emptyRunVariables,
 	interpolate,
 	mentionsVariable,
-	quotePosix,
-	quotePowerShell,
 	templateVariables,
 	UnknownVariableError,
 	type RunVariables,
@@ -39,23 +37,13 @@ describe('interpolate (G-ACTIONS §8.2)', () => {
 
 	it('a missing value interpolates as empty', () => {
 		expect(interpolate('x{{branch}}y', {}, 'raw')).toBe('xy');
-		expect(interpolate('echo {{branch}}', {}, 'shell-posix')).toBe("echo ''");
+		expect(interpolate('echo {{branch}}', {}, 'uri')).toBe('echo ');
 	});
 
-	it('shell: each value is one POSIX-quoted argument, never spliced raw', () => {
-		const hostile = `a'; rm -rf ~ #$(whoami)\`id\``;
-		const out = interpolate('cat {{file.path}}', vars({ 'file.path': hostile }), 'shell-posix');
-		expect(out).toBe(`cat ${quotePosix(hostile)}`);
-		expect(out).toBe(`cat 'a'\\''; rm -rf ~ #$(whoami)\`id\`'`);
-		expect(interpolate('ls {{project.root}}', vars({ 'project.root': '/a b' }), 'shell-posix')).toBe("ls '/a b'");
-	});
-
-	it('shell: PowerShell quoting doubles straight and typographic single quotes', () => {
-		expect(quotePowerShell(`it's`)).toBe(`'it''s'`);
-		expect(quotePowerShell('a\u2019b')).toBe(`'a\u2019\u2019b'`);
-		expect(interpolate('Get-Item {{file.path}}', vars({ 'file.path': "C:\\x'; calc" }), 'shell-powershell')).toBe(
-			"Get-Item 'C:\\x''; calc'"
-		);
+	it('has no shell modes: shell values travel as env vars in Rust, never as text', () => {
+		// Display-only raw substitution is all the frontend does for `shell`.
+		const hostile = `a'; rm -rf ~ #$(whoami)`;
+		expect(interpolate('cat {{file.path}}', vars({ 'file.path': hostile }), 'raw')).toBe(`cat ${hostile}`);
 	});
 
 	it('uri: percent-encodes values, except a url that is one variable', () => {
