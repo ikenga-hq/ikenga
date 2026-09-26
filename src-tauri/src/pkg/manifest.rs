@@ -41,6 +41,15 @@ use serde::{Deserialize, Serialize};
 /// fails validation with a canonical message naming `ui.views[]`. The
 /// `NavEntry` wire shape survives, but only as the activity-bar registry's
 /// snapshot type, sourced from `ui.views[]`.
+///
+/// v5 (WP-51, G-PKG-KEY / G-ACTIONS §7, §12): added an optional
+/// `ContextActionEntry.key` (a DEC-54 key request) and typed
+/// `CommandPaletteEntry.action` as `ContextActionRun` (was
+/// `serde_json::Value`). Both additive on the same api 5 — no bump — but
+/// `ContextActionEntry` is `deny_unknown_fields`, so a manifest declaring
+/// `key` is rejected by every parser that predates this change, whatever
+/// `ikenga_api` it declares (same caveat class as `workflows[]` above; see
+/// `plans/shell-ux-rearchitecture/drafts/g-manifest-v5.md` §11).
 pub const IKENGA_API_VERSION: u32 = 5;
 
 /// Smallest supported manifest version. Packages with older `ikenga_api` are
@@ -904,8 +913,9 @@ pub enum ContextSelector {
 #[serde(tag = "kind")]
 pub enum ContextActionRun {
     /// "Hand to Chi" — fills the Companion dispatch bar. `prompt` is a
-    /// template over the D-06 variable set ({{file.path}}, {{selection}},
-    /// {{project.root}}, {{pane.url}}, {{branch}}).
+    /// template over the six-variable D-06 set ({{file.path}}, {{file.name}},
+    /// {{selection}}, {{project.root}}, {{pane.url}}, {{branch}}) —
+    /// `{{file.name}}` added additively by WP-51 (DEC-63.4, G-ACTIONS §8.2).
     #[serde(rename = "dispatch")]
     Dispatch {
         prompt: String,
@@ -926,6 +936,51 @@ pub struct ContextActionEntry {
     pub label: String,
     pub when: ContextSelector,
     pub run: ContextActionRun,
+    /// A DEC-54 key request (G-PKG-KEY, `plans/shell-ux-rearchitecture/drafts/
+    /// actions-schema.md` §7, WP-51). A single stroke in the registry key
+    /// grammar — never a chord. The request's `when` is NOT authored here: it
+    /// is derived deterministically from `when` above (the `ContextSelector`)
+    /// per G-ACTIONS §7.3 (`derive_context_action_key_when`), and is always
+    /// narrower than `always` and never OS-wide. Granted only if the key is
+    /// free at merge time (G-ACTIONS §7.4, WP-52's effective model);
+    /// otherwise the action arrives unbound. This struct is
+    /// `deny_unknown_fields`, so any shell parser that predates this field
+    /// rejects a manifest declaring `key` outright, whatever `ikenga_api` it
+    /// declares — see the module doc comment and g-manifest-v5 §11.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+/// G-ACTIONS §7.3 — derives a `ContextActionEntry.key` request's `when`
+/// (DEC-62 form) from its `ContextSelector`. Every arm is narrower than
+/// `always` by construction, so the result is always a well-formed `when`
+/// `conflicts()` (WP-49/WP-52) can compare. This is the key `when` only —
+/// never used for menu-visibility placement `when` (§7.3a, WP-52).
+pub fn derive_context_action_key_when(selector: &ContextSelector) -> String {
+    fn escape_when_string(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('\'', "\\'")
+    }
+
+    match selector {
+        ContextSelector::File { glob: None } => "filesFocus".to_string(),
+        ContextSelector::File { glob: Some(glob) } => {
+            format!("filesFocus && resource =~ '{}'", escape_when_string(glob))
+        }
+        ContextSelector::Artifact => "paneKind == 'artifact'".to_string(),
+        ContextSelector::Session => "sessionFocus".to_string(),
+        ContextSelector::NgwaItem { kinds } => match kinds {
+            None => "ngwaItemFocus".to_string(),
+            Some(kinds) if kinds.is_empty() => "ngwaItemFocus".to_string(),
+            Some(kinds) => {
+                let clause = kinds
+                    .iter()
+                    .map(|k| format!("ngwaItemKind == '{}'", escape_when_string(k)))
+                    .collect::<Vec<_>>()
+                    .join(" || ");
+                format!("ngwaItemFocus && ({clause})")
+            }
+        },
+    }
 }
 
 /// `ui.widgets[].span` — fixed-grid width (G-MANIFEST-V5 §8 Q7). No
@@ -1049,13 +1104,27 @@ pub struct NavEntry {
     pub route: String,
 }
 
+/// `ui.command_palette[]` entry. `action` is typed per G-ACTIONS §12 (G-70,
+/// WP-51) as the same package run union as `ContextActionEntry.run` — was
+/// `serde_json::Value` pending Phase 6's action model (G-MANIFEST-V5 §8 Q3).
+/// Strict, not tolerant: a sweep of `ikenga-pkgs/` (57 manifests) and
+/// `ikenga-registry/` (30 catalog entries) at the G-ACTIONS freeze found zero
+/// uses of `command_palette`, so there is no published payload this narrows.
+/// Unlike `ContextActionEntry.key`, this needs no older-shell caveat for
+/// *acceptance*: pre-WP-51 parsers already accept any `action` value and
+/// simply ignore `shortcut`, so a manifest valid under this type still loads
+/// on them — the type only narrows what new shells accept.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandPaletteEntry {
     pub id: String,
     pub label: String,
+    /// A DEC-54 key request (G-ACTIONS §12), handled exactly like
+    /// `ContextActionEntry.key`: single stroke, grant-if-free, rebindable.
+    /// Its derived `when` is always `!inputFocus`.
     #[serde(default)]
     pub shortcut: Option<String>,
-    pub action: serde_json::Value, // typed later when the palette registry lands
+    pub action: ContextActionRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2134,6 +2203,12 @@ mod tests {
                 r#"{"id":"a","label":"A","when":{"kind":"session"},"run":{"kind":"view","route":"/"},"bogus":1}"#,
             ),
             ("widgets", r#"{"id":"w","title":"W","route":"/","bogus":1}"#),
+            (
+                // WP-51: CommandPaletteEntry gained `deny_unknown_fields` when
+                // `action` was typed per G-ACTIONS §12.
+                "command_palette",
+                r#"{"id":"p","label":"P","action":{"kind":"view","route":"/"},"bogus":1}"#,
+            ),
         ] {
             let json = format!(
                 r#"{{"id":"com.ikenga.x","name":"X","version":"0.1.0","ikenga_api":"5",
@@ -2189,6 +2264,148 @@ mod tests {
         }"#;
         let result: Result<Manifest, _> = serde_json::from_str(bad);
         assert!(result.is_err(), "unknown span must be rejected");
+    }
+
+    /// WP-51 / G-PKG-KEY: `ContextActionEntry.key` is optional, parses as a
+    /// plain string, and round-trips. Absence still parses (additive).
+    #[test]
+    fn v5_context_action_key_optional_and_parses() {
+        let with_key = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "file", "glob": "*.rs"},
+                "run": {"kind": "view", "route": "/"},
+                "key": "mod+shift+e"}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(with_key).expect("key parses");
+        assert_eq!(
+            m.ui.unwrap().context_actions[0].key.as_deref(),
+            Some("mod+shift+e")
+        );
+
+        let without_key = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "session"},
+                "run": {"kind": "view", "route": "/"}}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(without_key).expect("no key parses");
+        assert_eq!(m.ui.unwrap().context_actions[0].key, None);
+    }
+
+    /// DEC-54, G-ACTIONS §7.1: a package key request can never author
+    /// `"always"` or an OS-wide scope — `ContextActionEntry` has no `when`
+    /// string field and no `scope` field, only the `ContextSelector` `when`
+    /// (already narrower than `always` by construction, §7.3) and the bare
+    /// `key` string. `deny_unknown_fields` rejects any attempt to smuggle
+    /// one in alongside `key`.
+    #[test]
+    fn g_actions_7_1_key_request_cannot_author_always_or_os_scope() {
+        let with_scope = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "file"}, "run": {"kind": "view", "route": "/"},
+                "key": "mod+shift+e", "scope": "os"}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(with_scope);
+        assert!(result.is_err(), "an OS-scope request must be rejected");
+
+        let with_when = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"context_actions": [{"id": "a", "label": "A",
+                "when": {"kind": "file"}, "run": {"kind": "view", "route": "/"},
+                "key": "mod+shift+e", "when_override": "always"}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(with_when);
+        assert!(result.is_err(), "an authored 'always' when must be rejected");
+    }
+
+    /// G-ACTIONS §7.3 — every `ContextSelector` variant derives a well-formed
+    /// DEC-62 `when`, narrower than `always` by construction (never `always`,
+    /// never empty, never an OS-wide form). One case per table row.
+    #[test]
+    fn g_actions_7_3_derive_context_action_key_when_covers_every_variant() {
+        let cases: &[(ContextSelector, &str)] = &[
+            (ContextSelector::File { glob: None }, "filesFocus"),
+            (
+                ContextSelector::File {
+                    glob: Some("*.{ts,rs}".to_string()),
+                },
+                "filesFocus && resource =~ '*.{ts,rs}'",
+            ),
+            (ContextSelector::Artifact, "paneKind == 'artifact'"),
+            (ContextSelector::Session, "sessionFocus"),
+            (
+                ContextSelector::NgwaItem { kinds: None },
+                "ngwaItemFocus",
+            ),
+            (
+                ContextSelector::NgwaItem {
+                    kinds: Some(vec![]),
+                },
+                "ngwaItemFocus",
+            ),
+            (
+                ContextSelector::NgwaItem {
+                    kinds: Some(vec!["task".to_string()]),
+                },
+                "ngwaItemFocus && (ngwaItemKind == 'task')",
+            ),
+            (
+                ContextSelector::NgwaItem {
+                    kinds: Some(vec!["task".to_string(), "note".to_string()]),
+                },
+                "ngwaItemFocus && (ngwaItemKind == 'task' || ngwaItemKind == 'note')",
+            ),
+        ];
+        for (selector, expected) in cases {
+            let when = derive_context_action_key_when(selector);
+            assert_eq!(when.as_str(), *expected, "selector {selector:?}");
+            assert_ne!(when.as_str(), "always", "must be narrower than always");
+            assert!(!when.is_empty(), "must not be empty (empty == always)");
+            assert!(
+                !when.contains("scope"),
+                "derived when must never encode an OS-wide scope"
+            );
+        }
+    }
+
+    /// A glob containing a single quote is escaped, not injected raw, into
+    /// the derived `when` string (grammar §4.1 string-escaping rule).
+    #[test]
+    fn g_actions_7_3_derive_context_action_key_when_escapes_quotes() {
+        let selector = ContextSelector::File {
+            glob: Some("it's/*.rs".to_string()),
+        };
+        let when = derive_context_action_key_when(&selector);
+        assert_eq!(when, r"filesFocus && resource =~ 'it\'s/*.rs'");
+    }
+
+    /// G-ACTIONS §12 (G-70): `CommandPaletteEntry.action` is typed as the
+    /// package run union, not `serde_json::Value` — a `dispatch`/`view`
+    /// payload parses, and an unrelated run kind is rejected.
+    #[test]
+    fn g_actions_12_command_palette_action_is_typed_run_union() {
+        let ok = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"command_palette": [{"id": "p", "label": "P", "shortcut": "mod+k mod+p",
+                "action": {"kind": "dispatch", "prompt": "Do it"}}]}
+        }"#;
+        let m: Manifest = serde_json::from_str(ok).expect("typed action parses");
+        let ui = m.ui.unwrap();
+        assert_eq!(ui.command_palette[0].shortcut.as_deref(), Some("mod+k mod+p"));
+        match &ui.command_palette[0].action {
+            ContextActionRun::Dispatch { prompt, .. } => assert_eq!(prompt, "Do it"),
+            other => panic!("expected dispatch run, got {other:?}"),
+        }
+
+        let bad = r#"{
+            "id": "com.ikenga.x", "name": "X", "version": "0.1.0", "ikenga_api": "5",
+            "ui": {"command_palette": [{"id": "p", "label": "P",
+                "action": {"kind": "shell", "command": "rm -rf /"}}]}
+        }"#;
+        let result: Result<Manifest, _> = serde_json::from_str(bad);
+        assert!(result.is_err(), "unknown/unsupported run kind must be rejected");
     }
 
     /// `order` accepts ints and integral floats (`z.number().int()` parity),
