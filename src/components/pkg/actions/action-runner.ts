@@ -1,16 +1,25 @@
 // ActionRunner (WP-5 · WP-18b) — central dispatch for skill-action `ux_mode`s.
 //
-// With the terminal surface removed, dispatch is a clean no-op stub. The
-// skill-action button surface remains visible (with its mode badges / setup
-// labels) while Chi agents move to the CLI/MCP invocation layer.
+// WP-53: `dispatchAction` delegates to the action runner
+// (`src/lib/actions/runner`). A skill action is a Chi dispatch invoking its
+// skill (`/<skill> <verb>`, the runner's `skill` path) to the Companion's
+// active target; it SENDS and resolves with the run id (DEC-63.3). A
+// package's skill actions are package content, covered by the package's own
+// Ngwa trust — the DEC-55 project-file gate does not apply (G-ACTIONS §8.3:
+// package actions are never gated), so they run as an ungated source.
 
+import { runAction, type RunOutcome } from '@/lib/actions/runner';
+import { skillPrompt } from '@/lib/actions/runner/chi';
 import type { SkillAction } from '@/lib/tauri-cmd';
 
-/** Sunset result — the New-Session dialog is gone, so all dispatches fail with
- *  a clean `not-implemented` reason. */
+/** Result of a dispatch. `ok` = the Chi dispatch was sent (`runId` is
+ *  null when it was typed into a live terminal). */
 export interface OpenSessionDialogResult {
 	ok: boolean;
-	reason?: 'scope-denied' | 'cancelled' | 'not-implemented';
+	reason?: 'scope-denied' | 'cancelled' | 'not-implemented' | 'unavailable' | 'failed';
+	/** Why it did not run (`unavailable` / `failed`). */
+	message?: string;
+	runId?: string | null;
 }
 
 const DISPATCHABLE_UX_MODES = ['confirm', 'approve'] as const;
@@ -31,18 +40,49 @@ export function isDispatchable(action: SkillAction): boolean {
 	return (DISPATCHABLE_UX_MODES as readonly string[]).includes(action.uxMode);
 }
 
-/** Options for a dispatch. `interview` was the setup flow modifier — retained
- *  in the signature so callers don't need to change, but ignored now that
- *  dispatch is a stub. */
+/** Options for a dispatch. `interview` forces the setup interview flow
+ *  (§5) instead of the ai-infer default; ignored for non-setup actions. */
 export interface DispatchOptions {
 	interview?: boolean;
 }
 
-/** Dispatch a skill action. With the terminal surface removed, this always resolves
- *  to a `not-implemented` result so callers can show a graceful placeholder. */
+/** The prompt a skill action dispatches: its skill, then its verb. */
+export function skillActionPrompt(action: SkillAction, opts: DispatchOptions = {}): string {
+	const verb = action.verb && action.verb !== action.skill ? action.verb : '';
+	const args = [verb, isSetupAction(action) && opts.interview ? '--interview' : '']
+		.filter(Boolean)
+		.join(' ');
+	return skillPrompt(action.skill, args || undefined);
+}
+
+export function toDispatchResult(outcome: RunOutcome): OpenSessionDialogResult {
+	switch (outcome.status) {
+		case 'done':
+			return { ok: true, runId: outcome.runId ?? null };
+		case 'refused':
+			return outcome.reason === 'cancelled'
+				? { ok: false, reason: 'cancelled' }
+				: { ok: false, reason: 'unavailable', message: outcome.message };
+		case 'failed':
+			return { ok: false, reason: 'failed', message: outcome.message };
+		case 'preview':
+			return { ok: false, reason: 'not-implemented' };
+	}
+}
+
+/** Dispatch a skill action through the WP-53 runner. Disabled modes never
+ *  dispatch (`isDispatchable`). */
 export async function dispatchAction(
-	_action: SkillAction,
-	_opts: DispatchOptions = {}
+	action: SkillAction,
+	opts: DispatchOptions = {}
 ): Promise<OpenSessionDialogResult> {
-	return { ok: false, reason: 'not-implemented' };
+	if (!isDispatchable(action)) return { ok: false, reason: 'not-implemented' };
+	const outcome = await runAction({
+		id: `${action.pkgId}:${action.skill}:${action.verb}`,
+		name: action.name,
+		run: { kind: 'chi', target: 'active', prompt: skillActionPrompt(action, opts) },
+		// Package content: not a project file, so never DEC-55-gated.
+		scope: 'personal',
+	});
+	return toDispatchResult(outcome);
 }
