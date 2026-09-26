@@ -93,7 +93,7 @@ function files(opts: {
 		},
 		project: {
 			scope: 'project',
-			actions: fileState('actions', 'project', null),
+			actions: fileState<ActionsDocument>('actions', 'project', null),
 			keybindings: fileState('keybindings', 'project', kb(opts.projectBindings)),
 		},
 		projectId: 'p1',
