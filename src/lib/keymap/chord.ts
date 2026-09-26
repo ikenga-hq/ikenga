@@ -41,8 +41,8 @@ function resolvedStrokes(b: ChordBinding, mac: boolean): string[] {
 }
 
 /** Chords grouped by their resolved first stroke. */
-export function chordsByPrefix(bindings: readonly ChordBinding[], mac: boolean): Map<string, ChordBinding[]> {
-	const out = new Map<string, ChordBinding[]>();
+export function chordsByPrefix<B extends ChordBinding>(bindings: readonly B[], mac: boolean): Map<string, B[]> {
+	const out = new Map<string, B[]>();
 	for (const b of bindings) {
 		const strokes = resolvedStrokes(b, mac);
 		if (strokes.length !== 2) continue;
@@ -89,7 +89,7 @@ export function chordPrefixDelays<B extends ChordBinding>(
 	bindings: readonly B[],
 	mac: boolean
 ): Array<{ binding: B; chords: B[] }> {
-	const byPrefix = chordsByPrefix(bindings, mac) as Map<string, B[]>;
+	const byPrefix = chordsByPrefix(bindings, mac);
 	const out: Array<{ binding: B; chords: B[] }> = [];
 	for (const b of bindings) {
 		const strokes = resolvedStrokes(b, mac);

@@ -72,8 +72,9 @@ export function findEntry(
 	const mac = opts?.mac ?? isMacPlatform();
 	const platform: KeymapPlatform = mac ? 'mac' : 'other';
 	let candidates = (opts?.entries ?? getKeymap()).filter((e) => e.command === command);
-	if (opts?.scope) {
-		const scoped = candidates.filter((e) => (e.scope ?? 'app') === opts.scope);
+	const scope = opts?.scope;
+	if (scope) {
+		const scoped = candidates.filter((e) => (e.scope ?? 'app') === scope);
 		if (scoped.length > 0) candidates = scoped;
 	}
 	return candidates.find((e) => !e.platformOnly || e.platformOnly === platform) ?? candidates[0];
