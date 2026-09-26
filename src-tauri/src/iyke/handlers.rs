@@ -2256,7 +2256,7 @@ mod tests {
         };
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["bridge_api"], serde_json::json!(super::BRIDGE_API));
-        assert_eq!(super::BRIDGE_API, 3, "bump the FE `BRIDGE_API` mirror when this changes");
+        assert_eq!(super::BRIDGE_API, 4, "bump the FE `BRIDGE_API` mirror when this changes");
         assert_eq!(
             v["active_project"],
             serde_json::json!({

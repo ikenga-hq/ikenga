@@ -85,9 +85,11 @@ pub fn actions_frame_mirror() -> &'static ActionsFrameMirror {
 }
 
 /// Shared pending map for the four write/query round trips below. Every
-/// request mints its own UUID (`rpc::request`), so one map safely serves
+/// request mints its own UUID (`rpc::request_to`), so one map safely serves
 /// all four call sites — not worth a dedicated `IykeRpc` field each for a
 /// handful of callers, unlike the high-traffic DOM/query-cache RPCs.
+/// WP-62 review (S7): these all target the main window (`request_to`), never
+/// a broadcast `emit` — the only real listener is `use-iyke-shell-sync.ts`.
 pub fn actions_pending() -> &'static Pending<Value> {
     static PENDING: std::sync::OnceLock<Pending<Value>> = std::sync::OnceLock::new();
     PENDING.get_or_init(new_pending)
@@ -125,22 +127,32 @@ fn unavailable(what: &str) -> (StatusCode, String) {
     )
 }
 
-/// A round trip's FE reply is `{ ok: bool, error?: string, ...rest }`
-/// (`use-iyke-shell-sync.ts`). `ok: true` passes the whole payload back as
-/// the response body; `ok: false` becomes a 422 with the FE's message —
-/// the same `ActionsValidationError` text the D-06 UI would show.
-fn write_result_to_response(result: Value) -> Result<Json<Value>, (StatusCode, String)> {
+/// A round trip's FE reply is `{ ok: bool, error?: string, validation?:
+/// {errors, warnings}, ...rest }` (`use-iyke-shell-sync.ts`). `ok: true`
+/// passes the whole payload back as the response body (including `warnings`
+/// on a successful write, S5). `ok: false` becomes a JSON 422 body carrying
+/// the full `validation.errors` / `.warnings` (G-ACTIONS §1.6) the FE
+/// attached — not just `.error`'s flattened message — so a caller can act on
+/// the structured issue list the D-06 UI itself would show; a failure that
+/// never reached the validator (an unrecognized scope, a thrown non-Error)
+/// falls back to a single synthesized error entry built from `.error`.
+fn write_result_to_response(result: Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
     if ok {
-        Ok(Json(result))
-    } else {
-        let message = result
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("write refused by the actions/keybindings validator")
-            .to_string();
-        Err((StatusCode::UNPROCESSABLE_ENTITY, message))
+        return Ok(Json(result));
     }
+    let body = match result.get("validation") {
+        Some(validation) => validation.clone(),
+        None => {
+            let message = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("write refused by the actions/keybindings validator")
+                .to_string();
+            serde_json::json!({ "errors": [{ "code": "E_UNKNOWN", "path": "", "message": message }], "warnings": [] })
+        }
+    };
+    Err((StatusCode::UNPROCESSABLE_ENTITY, Json(body)))
 }
 
 // --- GET /iyke/actions -------------------------------------------------------
@@ -240,10 +252,11 @@ pub struct ActionsSetBody {
 pub async fn post_actions_set(
     Extension(app): Extension<AppHandle>,
     JsonBody(body): JsonBody<ActionsSetBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let result = rpc::request(
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = rpc::request_to(
         &app,
         actions_pending(),
+        "main",
         "iyke://actions-set-request",
         REQUEST_TIMEOUT,
         move |request_id| {
@@ -255,7 +268,12 @@ pub async fn post_actions_set(
         },
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        )
+    })?;
     write_result_to_response(result)
 }
 
@@ -264,11 +282,20 @@ pub async fn post_actions_set(
 #[derive(Deserialize)]
 pub struct ActionsImportBody {
     pub scope: String,
-    /// A batch of `UserAction` documents, upserted one at a time
-    /// (`saveUserAction` per item) so one invalid action doesn't sink the
-    /// rest — same "never override an existing binding without saying so"
-    /// spirit as WP-61's import, scaled down to what a CLI batch needs.
+    /// A batch of `UserAction` documents. An id already present in `scope`'s
+    /// own file is skipped unless `overwrite` — D-06 import's add/skip
+    /// behaviour (G-ACTIONS §1.6), scaled down to what a CLI batch needs.
     pub actions: Vec<Value>,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// Each item is its own FE `saveUserAction` round trip (the frozen
+/// G-ACTIONS-API exposes no batch upsert — WP-62 review, recorded drift), so
+/// the event itself needs more than the baseline [`REQUEST_TIMEOUT`] for a
+/// batch of any size.
+fn import_timeout(item_count: usize) -> Duration {
+    REQUEST_TIMEOUT + Duration::from_millis(250 * item_count as u64)
 }
 
 /// `POST /iyke/actions/import` — upserts a batch of user actions.
@@ -276,16 +303,19 @@ pub async fn post_actions_import(
     Extension(app): Extension<AppHandle>,
     JsonBody(body): JsonBody<ActionsImportBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let result = rpc::request(
+    let timeout = import_timeout(body.actions.len());
+    let result = rpc::request_to(
         &app,
         actions_pending(),
+        "main",
         "iyke://actions-import-request",
-        REQUEST_TIMEOUT,
+        timeout,
         move |request_id| {
             serde_json::json!({
                 "request_id": request_id,
                 "scope": body.scope,
                 "actions": body.actions,
+                "overwrite": body.overwrite,
             })
         },
     )
@@ -329,10 +359,11 @@ pub struct KeysSetBody {
 pub async fn post_keys_set(
     Extension(app): Extension<AppHandle>,
     JsonBody(body): JsonBody<KeysSetBody>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let result = rpc::request(
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = rpc::request_to(
         &app,
         actions_pending(),
+        "main",
         "iyke://keys-set-request",
         REQUEST_TIMEOUT,
         move |request_id| {
@@ -348,7 +379,12 @@ pub async fn post_keys_set(
         },
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        )
+    })?;
     write_result_to_response(result)
 }
 
@@ -371,9 +407,10 @@ pub async fn get_keys_resolve(
     Extension(app): Extension<AppHandle>,
     Query(q): Query<KeysResolveQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let result = rpc::request(
+    let result = rpc::request_to(
         &app,
         actions_pending(),
+        "main",
         "iyke://keys-resolve-request",
         REQUEST_TIMEOUT,
         move |request_id| {
@@ -393,6 +430,12 @@ pub async fn get_keys_resolve(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn import_timeout_scales_with_item_count() {
+        assert_eq!(import_timeout(0), REQUEST_TIMEOUT);
+        assert!(import_timeout(100) > REQUEST_TIMEOUT);
+    }
 
     #[tokio::test]
     async fn actions_mirror_is_503_until_pushed() {
@@ -422,17 +465,50 @@ mod tests {
         assert!(ok.is_ok());
 
         let err = write_result_to_response(json!({"ok": false, "error": "E_ID_GRAMMAR: bad id"}));
-        let (status, message) = err.unwrap_err();
+        let (status, Json(body)) = err.unwrap_err();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let message = body["errors"][0]["message"].as_str().unwrap();
         assert!(message.contains("E_ID_GRAMMAR"));
     }
 
     #[test]
     fn write_result_defaults_message_when_error_field_absent() {
         let err = write_result_to_response(json!({"ok": false}));
-        let (status, message) = err.unwrap_err();
+        let (status, Json(body)) = err.unwrap_err();
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let message = body["errors"][0]["message"].as_str().unwrap();
         assert!(message.contains("refused"));
+    }
+
+    #[test]
+    fn write_result_sends_the_full_validation_body_on_refusal() {
+        // S5: the FE's `ActionsValidationError.validation` — full
+        // `{errors, warnings}` (G-ACTIONS §1.6) — not just a flattened
+        // `.message` string.
+        let err = write_result_to_response(json!({
+            "ok": false,
+            "error": "personal/actions.json: E_ID_GRAMMAR at /actions/0/id: bad id",
+            "validation": {
+                "errors": [{"code": "E_ID_GRAMMAR", "path": "/actions/0/id", "message": "bad id"}],
+                "warnings": [{"code": "W_UNKNOWN_ICON", "path": "/actions/0/icon", "message": "unknown icon"}]
+            }
+        }));
+        let (status, Json(body)) = err.unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["errors"][0]["code"], "E_ID_GRAMMAR");
+        assert_eq!(body["warnings"][0]["code"], "W_UNKNOWN_ICON");
+    }
+
+    #[test]
+    fn write_result_passes_warnings_through_on_success() {
+        // S5: warnings are reported on a successful write too, not just a
+        // refused one.
+        let ok = write_result_to_response(json!({
+            "ok": true,
+            "warnings": [{"code": "W_UNKNOWN_ICON", "path": "/actions/0/icon", "message": "unknown icon"}]
+        }))
+        .unwrap();
+        assert_eq!(ok.0["warnings"][0]["code"], "W_UNKNOWN_ICON");
     }
 
     #[tokio::test]

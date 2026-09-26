@@ -13,6 +13,7 @@ export type { KeymapEntry, KeypressResolution } from '@/lib/keymap/registry';
 export {
 	ActionsValidationError,
 	addKeybinding,
+	getEffectiveKeymap,
 	getEffectiveModel,
 	saveUserAction,
 	subscribeEffectiveModel,
@@ -20,8 +21,17 @@ export {
 export type {
 	ActionsScope,
 	EffectiveAction,
+	EffectiveKeymap,
 	EffectiveMenu,
 	EffectiveModel,
+	HeldKeybinding,
 	KeybindingRule,
 	UserAction,
 } from '@/lib/actions/store';
+
+// WP-62 review (S3): project-action trust state is not part of the merged
+// `EffectiveModel` — it's WP-50's own record (`ActionsTrustStatus`), read
+// through the file-layer client rather than the store. Read-only, same
+// "share one code path" spirit as the store re-exports above.
+export { actionsTrustStatus } from '@/lib/actions/client';
+export type { ActionTrust, ActionsTrustStatus, TrustState, Validation } from '@/lib/actions/client';

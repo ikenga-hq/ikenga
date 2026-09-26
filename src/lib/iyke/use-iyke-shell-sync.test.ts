@@ -144,11 +144,42 @@ describe('useIykeShellSync — WP-21 frame push', () => {
 	});
 
 	it('keymapPayload omits platform_only when the entry has none', () => {
-		const [row] = keymapPayload([
-			{ command: 'x.y', key: 'mod+k', when: 'global', source: 'default', label: 'X' },
-		]);
+		const [row] = keymapPayload({
+			entries: [{ command: 'x.y', key: 'mod+k', when: 'global', source: 'default', label: 'X' }],
+			held: [],
+		});
 		expect(row).not.toHaveProperty('platform_only');
+		expect(row).not.toHaveProperty('status');
 		expect(row.key_label).toBe(formatKeyLabel('mod+k'));
+	});
+
+	it('keymapPayload (S3, DEC-65) projects held project rules with status "held" and their trust', () => {
+		const [row] = keymapPayload({
+			entries: [],
+			held: [
+				{
+					index: 0,
+					rule: { key: 'mod+shift+d', command: 'delete', when: 'filesFocus' },
+					trust: 'untrusted',
+				},
+			],
+		});
+		expect(row).toMatchObject({
+			command: 'delete',
+			key: 'mod+shift+d',
+			source: 'project',
+			status: 'held',
+			trust: 'untrusted',
+		});
+	});
+
+	it('keymapPayload strips the negative-rule prefix from a held command', () => {
+		const [row] = keymapPayload({
+			entries: [],
+			held: [{ index: 1, rule: { key: 'mod+w', command: '-pane.close' }, trust: 'changed' }],
+		});
+		expect(row.command).toBe('pane.close');
+		expect(row.trust).toBe('changed');
 	});
 
 	it('logs, never throws, when the push fails', async () => {
@@ -232,6 +263,24 @@ describe('actionsMirrorPayload / menusMirrorPayload — WP-62 mirror projection'
 		expect(row.source).toBe('package');
 	});
 
+	it('never adds trust_state for a non-project action', () => {
+		const [row] = actionsMirrorPayload([fakeAction()]);
+		expect(row).not.toHaveProperty('trust_state');
+	});
+
+	it('(S3, DEC-55) reports a project action\'s trust state from the map, fail-closed to "untrusted"', () => {
+		const trust = new Map([['refresh-pulse', 'trusted' as const]]);
+		const [trusted, unknownYet] = actionsMirrorPayload(
+			[
+				fakeAction({ id: 'refresh-pulse', source: 'project' }),
+				fakeAction({ id: 'not-yet-scanned', source: 'project' }),
+			],
+			trust
+		);
+		expect(trusted.trust_state).toBe('trusted');
+		expect(unknownYet.trust_state).toBe('untrusted');
+	});
+
 	it('projects every menu id the model reports, collapsing action items to {id, name, source}', () => {
 		const model = {
 			menus: {
@@ -283,5 +332,23 @@ describe('actionsMirrorPayload / menusMirrorPayload — WP-62 mirror projection'
 			},
 		]);
 		expect(mirror['empty-menu']).toEqual({ id: 'empty-menu', items: [], hidden: [] });
+	});
+
+	it('(S6) folds extraIds in even when menus.ids omits them, skipping ones .get() still can\'t resolve', () => {
+		const model = {
+			menus: {
+				ids: ['files'],
+				get: (id: string) => {
+					if (id === 'files') return { id: 'files', items: [], hidden: [], overrides: {} };
+					if (id === 'section/scratchpads') {
+						return { id: 'section/scratchpads', items: [], hidden: [], overrides: {} };
+					}
+					return null;
+				},
+			},
+		} as unknown as EffectiveModel;
+
+		const mirror = menusMirrorPayload(model, ['section/scratchpads', 'section/uninstalled-pkg']);
+		expect(Object.keys(mirror).sort()).toEqual(['files', 'section/scratchpads']);
 	});
 });

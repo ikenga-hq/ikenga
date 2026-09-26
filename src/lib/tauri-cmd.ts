@@ -2572,6 +2572,14 @@ export interface IykeKeymapEntry {
 	/** Platform-resolved key hint (`⌘K` on macOS, `Ctrl+K` elsewhere). */
 	key_label: string;
 	platform_only?: 'mac' | 'other';
+	/** WP-62 review (S3, DEC-65): `held` for a project rule dropped from the
+	 *  effective keymap while its project's keybindings are untrusted — it
+	 *  fires nothing and holds no key (G-ACTIONS §2.2 step 0). Absent =
+	 *  `active`, the pre-existing rows every consumer already expects. */
+	status?: 'active' | 'held';
+	/** The trust state holding the rule (`untrusted`, `changed`, or
+	 *  `unknown`); present only when `status: "held"`. */
+	trust?: string;
 }
 
 /** WP-28: one `GET /iyke/explorer/sections` row — mirrors
@@ -2619,6 +2627,10 @@ export interface IykeActionMirror {
 	hosted: boolean;
 	danger: boolean;
 	pkg_id?: string;
+	/** WP-62 review (S3, DEC-55): a project action's trust state
+	 *  (`ActionTrust.state`), fail-closed to `untrusted` when the trust
+	 *  record has no entry for it yet. Absent for every other source. */
+	trust_state?: string;
 }
 
 export interface IykeMenuMirrorItem {
