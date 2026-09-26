@@ -13,12 +13,9 @@
 // (defaults to the live platform) so `title-row.test.tsx` can exercise both
 // branches without depending on the module-load-time `isMac` constant.
 //
-// The project chip is a new component with the same behaviour as the rail's
-// `ProjectIndicator` (`activity-bar.tsx`, owned by WP-03): same store
-// selectors, same sort, same optimistic `setActiveProject` with the store's
-// own rollback. DUPLICATION NOTE — the popover list is intentionally a copy
-// until the rail indicator is removed; fold the two into one
-// `ProjectSwitcherList` in the cleanup that deletes the rail copy.
+// The project chip is the one project switcher (the rail-foot
+// `ProjectIndicator` it was copied from is gone): store selectors, sort, and
+// an optimistic `setActiveProject` with the store's own rollback.
 //
 // The branch chip reads the active project's repo through the git pkg's
 // `repo.snapshot` sidecar method — the same `pkgSidecarCall` path the

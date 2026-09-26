@@ -699,23 +699,32 @@ function Greeting() {
  *  'file']`) keep this in step. */
 const PERSONAL_SETTINGS_QK = ['settings', 'file', 'personal', null] as const;
 
-export function DailyAddress() {
+/** Whether the daily address renders right now: not dismissed today, and
+ *  the Workspace setting is on. The dashboard also reads this so the Obi
+ *  canvas can drop its own greeting while the address is up (D-04 has one
+ *  greeting, not two). */
+export function useDailyAddressShown(): boolean {
 	const dismissedOn = useShellStore((s) => s.dailyAddressDismissedOn);
-	const setDismissed = useShellStore((s) => s.setDailyAddressDismissed);
-	const navigateFocused = usePaneStore((s) => s.navigateFocused);
-	const navigate = useNavigate();
-	const today = todayLocalDate();
 	const settings = useQuery({
 		queryKey: PERSONAL_SETTINGS_QK,
 		queryFn: () => readSettingsFile({ scope: 'personal', projectId: null }),
 		staleTime: 15_000,
 	});
-
-	if (dismissedOn === today) return null;
+	if (dismissedOn === todayLocalDate()) return false;
 	// Wait for the setting rather than flash an address the user turned off.
 	// A read failure falls back to the default (on).
-	if (settings.isLoading) return null;
-	if (!isDailyAddressEnabled(settings.data?.effective)) return null;
+	if (settings.isLoading) return false;
+	return isDailyAddressEnabled(settings.data?.effective);
+}
+
+export function DailyAddress() {
+	const setDismissed = useShellStore((s) => s.setDailyAddressDismissed);
+	const navigateFocused = usePaneStore((s) => s.navigateFocused);
+	const navigate = useNavigate();
+	const today = todayLocalDate();
+	const shown = useDailyAddressShown();
+
+	if (!shown) return null;
 
 	return (
 		<section

@@ -72,13 +72,9 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 					timestamp: Date.now(),
 				};
 
+				// No OS toast here: WP-40 records this ask as a `permission`
+				// notification row, and the notification centre's toast is its copy.
 				setRequests((prev) => [newEntry, ...prev]);
-
-				// Trigger OS toast notification
-				sendNotification({
-					title: 'Chi Permission Request',
-					body: `Approval required for tool ${p.tool_name || 'action'}`,
-				});
 			} else if (p.hook_event_name === 'PreToolUse' && p.held && p.request_id) {
 				const newEntry: PermissionRequestEntry = {
 					id: p.request_id,
@@ -91,12 +87,8 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 					timestamp: Date.now(),
 				};
 
+				// Held gate: also a WP-40 `permission` row — no second OS toast.
 				setRequests((prev) => [newEntry, ...prev]);
-
-				sendNotification({
-					title: 'Tool Use Request',
-					body: `Claude wants to use ${p.tool_name || 'a tool'} — approve?`,
-				});
 			} else if (p.hook_event_name === 'Notification') {
 				// Not Stop: WP-40 now registers it, and a raw OS toast every turn end would bypass the notification centre's mute.
 				sendNotification({

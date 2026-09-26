@@ -50,10 +50,10 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(pinButton).toHaveAttribute('aria-label', pin.label);
 		await expect(rail.locator(`[data-section="${pin.sectionId}"]`)).toBeVisible();
 
-		// Active-project indicator reflects project_list + project_get_active.
+		// One project switcher: the title-row chip. The rail-foot copy is gone.
 		await expect(
 			rail.getByRole('button', { name: new RegExp(`^Project: ${MOCK_PROJECTS[0]!.display_name}`) })
-		).toBeVisible();
+		).toHaveCount(0);
 
 		// ── Sidebar ─────────────────────────────────────────────────────────
 		// Region only: its title follows the active mode, which is in flux.
@@ -67,12 +67,16 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(main.locator('[data-pane-id][data-focused="true"]')).toHaveCount(1);
 		await expect(panes.first().getByRole('button', { name: 'New tab' })).toBeVisible();
 
-		// Rail → sidebar wiring. Settings is a CoreMode on both sides of v16
-		// (g-state.md); the other modes' sidebar bodies are interim until WP-04.
+		// Rail → Settings: the section nav lives inside the pane (D-03) and the
+		// sidebar stays the Explorer — the nine sections are listed once.
 		await rail.getByRole('button', { name: 'Settings', exact: true }).click();
-		const settingsNav = page.getByRole('navigation', { name: 'Settings navigation' });
+		const settingsNav = page.getByRole('navigation', { name: 'Settings sections' });
 		await expect(settingsNav).toBeVisible();
 		await expect(settingsNav.getByText('Appearance', { exact: true })).toBeVisible();
+		await expect(page.getByRole('navigation', { name: 'Explorer sidebar' })).toBeVisible();
+		// Listed once across every nav landmark (the tab and the page heading
+		// also say "Appearance"; those aren't navigation).
+		await expect(page.getByRole('navigation').getByText('Appearance', { exact: true })).toHaveCount(1);
 
 		// Record (not assert) which host commands had no canned answer, so a
 		// spec author can see what to add to the fixture when the frame grows.
@@ -523,7 +527,9 @@ test.describe('three-noun routes (WP-10)', () => {
 		// Navigate to /project/dashboard
 		await addressInput.fill('/project/dashboard');
 		await addressInput.press('Enter');
-		await expect(page.locator('.home-greeting')).toBeVisible();
+		// Exactly one greeting: the D-04 daily address when it shows, else the
+		// Obi canvas's own greeting widget — never both.
+		await expect(page.locator('[data-state="daily-address"], .home-greeting')).toHaveCount(1);
 
 		// Legacy redirect /packages -> /ngwa/installed
 		await addressInput.fill('/packages');
@@ -621,8 +627,9 @@ test.describe('D-01 conformance (WP-12)', () => {
 		// (D-08 native-menu-win).
 		const isMac = await page.evaluate(() => /Mac/i.test(navigator.platform));
 		expect(titleRow).toBe(isMac ? 2 : 3);
-		// Rail has exactly 8 items (Project, Chi, Ngwa, 3 pins, Settings, Project switcher)
-		expect(rail).toBe(8);
+		// Rail has exactly 7 items (Project, Chi, Ngwa, 3 pins, Settings). The
+		// project switcher is the title-row chip only (D-01 v4 #projChip).
+		expect(rail).toBe(7);
 		// Pane chrome on single resting pane
 		expect(paneChrome).toBeLessThanOrEqual(10);
 		// Status bar: zero counts hidden

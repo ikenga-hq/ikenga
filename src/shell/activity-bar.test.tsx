@@ -235,7 +235,7 @@ describe('keyboard (R2)', () => {
 
 		press({ key: '3', ...MOD });
 		expect(shell.useShellStore.getState().activeMode).toBe('ngwa');
-		expect(panes.usePaneStore.getState().navigateFocused).toHaveBeenLastCalledWith('/claude');
+		expect(panes.usePaneStore.getState().navigateFocused).toHaveBeenLastCalledWith('/ngwa/installed');
 
 		press({ key: ',', ...MOD });
 		expect(shell.useShellStore.getState().activeMode).toBe('settings');
