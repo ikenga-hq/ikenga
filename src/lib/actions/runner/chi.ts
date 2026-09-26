@@ -29,7 +29,9 @@
 //   fail-closed (`isAgentLive`): a `SessionStart` id is recorded, no
 //   `SessionEnd` / PTY exit since, PTY running. Other engines' wraps send no
 //   liveness signal, so they are never injected into (`no-target`).
-// - Not while that terminal has a pending permission request: the inject's
+// - Not while that terminal shows a permission prompt — Claude's own
+//   in-terminal `PermissionRequest` (tracked per tab by the store's hooks
+//   listener) or a held `PreToolUse` in the Companion queue: the inject's
 //   trailing Enter would answer it (`permission-pending`).
 // - The injected text comes with every C0 control character (bar tab)
 //   stripped from each variable value before interpolation (`ptyPrompt`,
@@ -137,10 +139,17 @@ export function isNonClaudeAgent(sessionId: string): boolean {
 	return Boolean(wrap) && (wrap?.engine ?? 'claude') !== 'claude';
 }
 
-/** Whether terminal `sessionId` has a pending permission request in the
- *  Companion's queue (fed from the hooks bus). A pending card with no
- *  terminal id could be this one, so it counts too (fail-closed). */
+/** Whether terminal `sessionId` shows a permission prompt — fail-closed,
+ *  either source counts:
+ *  - the store's per-tab `permissionPending` (the store-level hooks
+ *    listener): Claude Code's own in-terminal `PermissionRequest`, which
+ *    Rust emits with no `request_id` and so never reaches the Companion
+ *    queue, and a held `PreToolUse`;
+ *  - a pending card in the Companion's queue (held `PreToolUse` asks). A
+ *    pending card with no terminal id could be this one, so it counts too. */
 export function hasPendingPermission(sessionId: string): boolean {
+	const tab = useTerminalStore.getState().tabs.find((t) => t.id === sessionId);
+	if (tab?.permissionPending === true) return true;
 	return useCompanionStore
 		.getState()
 		.permissions.some((p) => p.status === 'pending' && (p.sessionId === undefined || p.sessionId === sessionId));

@@ -322,7 +322,10 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 	const previewOnly = testRun && run.kind === 'shell';
 
 	// A package action is package content (covered by its own Ngwa trust):
-	// never DEC-55-gated (§8.3), and only a Chi dispatch.
+	// never DEC-55-gated (§8.3), and only a Chi dispatch. This literal
+	// `'package'` check is the one scope exemption that bypasses
+	// `isTrustGated`; every other scope — an unexpected one included —
+	// goes through the gate below.
 	const isPackage = action.scope === 'package';
 	if (isPackage && !PACKAGE_RUN_KINDS.includes(run.kind)) {
 		return refused(run.kind, 'package-kind', `A package action can only dispatch to Chi, not run “${run.kind}”.`);

@@ -330,6 +330,108 @@ describe('chi adapter (Mock contract 3)', () => {
 			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
 		});
 
+		describe("Claude's own in-terminal permission prompt (N3)", () => {
+			const bash = { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } };
+			const ask = () =>
+				applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'PermissionRequest', session_id: 'c-s1', ...bash });
+			const blocked = () =>
+				expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+					reason: 'permission-pending',
+				});
+
+			it('a native PermissionRequest (no request_id) blocks the inject', async () => {
+				const ptySend = agentActive();
+				ask();
+				// Not in the Companion queue — only the per-tab flag knows.
+				expect(useCompanionStore.getState().permissions).toEqual([]);
+				expect(useTerminalStore.getState().tabs[0].permissionPending).toBe(true);
+				await blocked();
+				expect(ptySend).not.toHaveBeenCalled();
+			});
+
+			it('a held PreToolUse blocks the inject too', async () => {
+				const ptySend = agentActive();
+				applyAgentHook({
+					ikenga_terminal_id: 's1',
+					hook_event_name: 'PreToolUse',
+					tool_use_id: 'toolu_1',
+					request_id: 'r1',
+					held: true,
+					...bash,
+				});
+				await blocked();
+				applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'PostToolUse', tool_use_id: 'toolu_1', ...bash });
+				await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
+				expect(ptySend).toHaveBeenCalledTimes(1);
+			});
+
+			for (const event of ['PostToolUse', 'PostToolUseFailure', 'Stop', 'SessionEnd', 'UserPromptSubmit']) {
+				it(`${event} clears it`, async () => {
+					const ptySend = agentActive();
+					ask();
+					await blocked();
+					applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: event, tool_use_id: 'toolu_9', ...bash });
+					expect(useTerminalStore.getState().tabs[0].permissionPending).toBe(false);
+					if (event === 'SessionEnd') {
+						// The agent is gone too — unblocked from the prompt, refused as not live.
+						await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+							reason: 'no-target',
+						});
+						expect(ptySend).not.toHaveBeenCalled();
+					} else {
+						await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({
+							via: 'pty',
+						});
+					}
+				});
+			}
+
+			it('another tool call finishing (parallel call) does not clear it', async () => {
+				agentActive();
+				ask();
+				applyAgentHook({
+					ikenga_terminal_id: 's1',
+					hook_event_name: 'PostToolUse',
+					tool_use_id: 'toolu_2',
+					tool_name: 'Read',
+					tool_input: { file_path: '/proj/a.ts' },
+				});
+				await blocked();
+			});
+
+			it("another terminal's prompt does not block this one", async () => {
+				agentActive();
+				applyAgentHook({ ikenga_terminal_id: 'other', hook_event_name: 'PermissionRequest', ...bash });
+				await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
+			});
+
+			it('PTY exit clears it, and a respawn starts clean', () => {
+				agentActive();
+				ask();
+				useTerminalStore.getState().setStatus('s1', 'exited', 0);
+				expect(useTerminalStore.getState().tabs[0]).toMatchObject({ permissionPending: false, agentLive: false });
+				ask();
+				useTerminalStore.getState().setStatus('s1', 'spawning');
+				expect(useTerminalStore.getState().tabs[0]).toMatchObject({ permissionPending: false, agentLive: false });
+			});
+		});
+
+		it('ignores a late SessionStart once the PTY has exited', async () => {
+			const ptySend = agentActive({ claudeSessionId: undefined, agentLive: undefined });
+			useTerminalStore.getState().setStatus('s1', 'exited', 0);
+			applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'SessionStart', session_id: 'c-late' });
+			expect(useTerminalStore.getState().tabs[0]).toMatchObject({ claudeSessionId: undefined, agentLive: false });
+			// A respawn clears liveness; SessionStart counts again once running.
+			useTerminalStore.getState().setStatus('s1', 'spawning');
+			applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'SessionStart', session_id: 'c-early' });
+			expect(useTerminalStore.getState().tabs[0].agentLive).toBe(false);
+			useTerminalStore.getState().setStatus('s1', 'running');
+			applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'SessionStart', session_id: 'c-new' });
+			expect(useTerminalStore.getState().tabs[0]).toMatchObject({ claudeSessionId: 'c-new', agentLive: true });
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
+			expect(ptySend).toHaveBeenCalledTimes(1);
+		});
+
 		it('a package chi / skill never types into a PTY', async () => {
 			const ptySend = agentActive();
 			await expect(send({ prompt: 'x', target: 'active', scope: 'package' })).rejects.toMatchObject({

@@ -153,8 +153,12 @@ export function bindingsHash(bindings: KeybindingRule[] | undefined): Promise<st
 
 // --- the gate ------------------------------------------------------------------
 
-/** DEC-55: whether a run of this kind from this scope needs trust. Only
- *  `personal` is exempt — an unexpected scope is gated (fail-closed). */
+/** DEC-55: whether a run of this kind from an actions-file scope needs
+ *  trust. Among the scopes that reach it only `personal` is exempt — an
+ *  unexpected scope is gated (fail-closed). A `package` action never
+ *  reaches it: `runAction` (index.ts) handles that literal scope in its own
+ *  branch first, which refuses every kind but `chi` / `skill` (package
+ *  content, covered by its Ngwa trust — §8.3) and skips this gate. */
 export function isTrustGated(scope: ActionsScope, kind: ActionRunKind): boolean {
 	return scope !== 'personal' && GATED_RUN_KINDS.includes(kind);
 }

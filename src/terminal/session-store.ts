@@ -47,6 +47,12 @@ export interface TerminalTab {
 	 *  never persisted, so a restored tab reads not-live until a fresh
 	 *  `SessionStart`. The WP-53 action runner injects only while it is true. */
 	agentLive?: boolean;
+	/** True while this tab shows a permission prompt the agent is waiting
+	 *  on: Claude Code's own `PermissionRequest` or a held `PreToolUse`
+	 *  (the store-level hooks listener below). In memory only — never
+	 *  persisted. The WP-53 action runner never injects while it is true:
+	 *  the inject's trailing Enter would answer the prompt. */
+	permissionPending?: boolean;
 	ptyId: string | null;
 	mode?: 'persistent' | 'ephemeral';
 	status: 'spawning' | 'running' | 'exited' | 'error';
@@ -442,7 +448,11 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 								...t,
 								status,
 								exitCode,
-								...(status === 'exited' || status === 'error' ? { agentLive: false } : {}),
+								// PTY exit ends the agent and any prompt; a (re)spawn
+								// starts from neither until its own hooks say so.
+								...(status === 'exited' || status === 'error' || status === 'spawning'
+									? { agentLive: false, permissionPending: false }
+									: {}),
 								wasRunning:
 									status === 'running' || status === 'spawning'
 										? true
@@ -610,27 +620,103 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 	};
 });
 
-// --- agent liveness (hooks bus) ---------------------------------------------
+// --- agent liveness + pending permission prompts (hooks bus) --------------
+
+/** The hook payload fields this listener reads; a held `PreToolUse` also
+ *  carries `request_id` + `held` (`iyke/hooks.rs`). */
+export type AgentHookPayload = HookEventPayload & { request_id?: string; held?: boolean };
+
+/** One prompt still up in a tab, matched against the tool call that
+ *  finishes it the way `notifications/producers.rs::PendingPrompt` does:
+ *  by `tool_use_id` when both sides carry one, else tool name + input. */
+interface PendingPrompt {
+	toolUseId?: string;
+	fingerprint: string;
+}
+
+/** Pending prompts per tab id. Only meaningful while the tab's
+ *  `permissionPending` is true: `setStatus` clears the flag on PTY exit /
+ *  respawn, and the next prompt then starts a fresh list. */
+const pendingPrompts = new Map<string, PendingPrompt[]>();
+
+/** Bound per tab, as `MAX_PROMPTS_PER_TERMINAL` in `producers.rs`. */
+const MAX_PROMPTS_PER_TAB = 32;
+
+function pendingPrompt(p: AgentHookPayload): PendingPrompt {
+	return {
+		...(p.tool_use_id ? { toolUseId: p.tool_use_id } : {}),
+		fingerprint: `${p.tool_name ?? ''}:${JSON.stringify(p.tool_input ?? null)}`,
+	};
+}
+
+function promptMatches(a: PendingPrompt, b: PendingPrompt): boolean {
+	return a.toolUseId && b.toolUseId ? a.toolUseId === b.toolUseId : a.fingerprint === b.fingerprint;
+}
+
+function setPermissionPending(tabId: string, pending: boolean): void {
+	if (!pending) pendingPrompts.delete(tabId);
+	useTerminalStore.setState((s) => ({
+		tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, permissionPending: pending } : t)),
+	}));
+}
+
+/** Hook events that report one tool call as done (`producers.rs::finishes_terminal_tool`). */
+const FINISHES_TOOL = new Set(['PostToolUse', 'PostToolUseFailure']);
+/** Hook events Claude cannot reach while a prompt is up — they end every
+ *  prompt in the tab (`producers.rs::ends_terminal_permissions`). */
+const ENDS_PROMPTS = new Set(['Stop', 'SessionEnd', 'UserPromptSubmit']);
 
 /**
  * Records one Claude Code hook event against the tab it came from
- * (`ikenga_terminal_id`): `SessionStart` stores the session id and marks the
- * agent live, `SessionEnd` clears both. Store-level, so a tab that no pane
- * currently mounts is tracked too. PTY exit clears them via `openTabPty`'s
- * `onExit` / `setStatus`. There is no separate agent-process-exit signal: a
- * `claude` killed without a `SessionEnd` stays live until the PTY exits.
+ * (`ikenga_terminal_id`). Store-level, so a tab that no pane currently
+ * mounts is tracked too.
+ *
+ * - Liveness: `SessionStart` stores the session id and marks the agent live
+ *   — only while the tab's PTY is `running` (a late `SessionStart` after
+ *   the PTY exited is ignored); `SessionEnd` clears both. PTY exit and
+ *   respawn clear them via `setStatus`. There is no separate
+ *   agent-process-exit signal: a `claude` killed without a `SessionEnd`
+ *   stays live until the PTY exits.
+ * - Permission prompts (mirrors Rust's `terminal_prompts`, `iyke/hooks.rs`):
+ *   `PermissionRequest` (Claude's own in-terminal Yes/No — sent with no
+ *   `request_id`, so the Companion queue never sees it) and a held
+ *   `PreToolUse` set `permissionPending`. `PostToolUse` /
+ *   `PostToolUseFailure` of the very tool call a prompt asked about
+ *   removes that prompt (a parallel call finishing does not count);
+ *   `Stop` / `SessionEnd` / `UserPromptSubmit` clear them all; PTY exit and
+ *   respawn clear them via `setStatus`.
  */
-export function applyAgentHook(p: HookEventPayload | null | undefined): void {
+export function applyAgentHook(p: AgentHookPayload | null | undefined): void {
 	const tabId = p?.ikenga_terminal_id;
 	if (!p || !tabId) return;
 	const store = useTerminalStore.getState();
-	if (!store.tabs.some((t) => t.id === tabId)) return;
-	if (p.hook_event_name === 'SessionStart' && p.session_id) {
-		store.setClaudeSessionId(tabId, p.session_id);
-	} else if (p.hook_event_name === 'SessionEnd') {
+	const tab = store.tabs.find((t) => t.id === tabId);
+	if (!tab) return;
+	const event = p.hook_event_name ?? '';
+
+	if (event === 'SessionStart' && p.session_id) {
+		if (tab.status === 'running') store.setClaudeSessionId(tabId, p.session_id);
+	} else if (event === 'SessionEnd') {
 		// The claude session ended; the PTY may keep going (the wrap's
 		// fallback shell) but there is no agent and nothing to resume.
 		store.setClaudeSessionId(tabId, null);
+	}
+
+	if (event === 'PermissionRequest' || (event === 'PreToolUse' && (p.held === true || Boolean(p.request_id)))) {
+		const list = tab.permissionPending ? (pendingPrompts.get(tabId) ?? []) : [];
+		if (list.length >= MAX_PROMPTS_PER_TAB) list.shift();
+		list.push(pendingPrompt(p));
+		pendingPrompts.set(tabId, list);
+		setPermissionPending(tabId, true);
+	} else if (FINISHES_TOOL.has(event)) {
+		if (!tab.permissionPending) return;
+		const done = pendingPrompt(p);
+		const list = pendingPrompts.get(tabId) ?? [];
+		const at = list.findIndex((q) => promptMatches(q, done));
+		if (at >= 0) list.splice(at, 1);
+		if (list.length === 0) setPermissionPending(tabId, false);
+	} else if (ENDS_PROMPTS.has(event)) {
+		if (tab.permissionPending) setPermissionPending(tabId, false);
 	}
 }
 
@@ -639,7 +725,7 @@ let agentHookListener: Promise<unknown> | null = null;
 /** Installs the one store-level `hooks://event` listener. Idempotent. */
 export function installAgentHookListener(): void {
 	if (agentHookListener) return;
-	agentHookListener = listen<HookEventPayload>('hooks://event', (event) =>
+	agentHookListener = listen<AgentHookPayload>('hooks://event', (event) =>
 		applyAgentHook(event.payload)
 	).catch(() => {
 		agentHookListener = null;
