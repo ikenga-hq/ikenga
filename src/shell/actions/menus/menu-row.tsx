@@ -10,7 +10,7 @@
 // D-06's static `menus` screenshot pixel-for-pixel.
 
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, Lock, X } from 'lucide-react';
+import { ChevronDown, ChevronUp, Eye, EyeOff, GripVertical, Shield, X } from 'lucide-react';
 import { ActionIcon } from '../shared/action-icon';
 import { Kbd } from '../shared/kbd';
 import type { MenuRow } from './menu-model';
@@ -137,7 +137,12 @@ export function MenuRowView({
 				</span>
 				{locked && (
 					<span className="lock" title="Locked — may be reordered, never hidden">
-						<Lock className="h-3 w-3" aria-hidden="true" />
+						<Shield className="h-3 w-3" aria-hidden="true" />
+					</span>
+				)}
+				{row.hiddenElsewhere && !row.hiddenHere && (
+					<span className="hiddenelsewhere" title={`Hidden at the ${row.hiddenElsewhere} scope — unhide it there`}>
+						Hidden ({row.hiddenElsewhere})
 					</span>
 				)}
 				<button
@@ -147,9 +152,11 @@ export function MenuRowView({
 					title={
 						locked
 							? 'Locked — it may be reordered, never hidden. Its key is unaffected either way.'
-							: row.hidden
-								? `Show ${action.name} in this menu`
-								: `Hide ${action.name} from this menu — its key still fires (DEC-58)`
+							: row.hiddenElsewhere && !row.hiddenHere
+								? `Hidden at the ${row.hiddenElsewhere} scope — unhide it there`
+								: row.hidden
+									? `Show ${action.name} in this menu`
+									: `Hide ${action.name} from this menu — its key still fires (DEC-58)`
 					}
 					aria-label={`${row.hidden ? 'Show' : 'Hide'} ${action.name}`}
 					aria-pressed={row.hidden}

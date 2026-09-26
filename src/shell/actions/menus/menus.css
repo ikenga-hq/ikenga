@@ -49,6 +49,27 @@
 	color: var(--fg-muted);
 }
 
+/* D-06's ten-entry place list (§ minor "don't list empty ids flat"):
+ * "Explorer section ⋯" and "Native menu" are one row each, with a picker
+ * for the concrete `section/<id>` / `native/<top>` underneath. */
+.view-acts .menulist .mrow-group {
+	border-bottom: 1px solid var(--border-soft);
+}
+.view-acts .menulist .mrow-group .mrow {
+	border-bottom: none;
+}
+.view-acts .menulist .mrow-group-pick {
+	display: block;
+	width: calc(100% - var(--space-3) * 2);
+	margin: 0 var(--space-3) var(--space-2);
+	padding: 2px var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	background: var(--bg-surface);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+}
+
 .view-acts .treecol {
 	flex: 1 1 0;
 	min-width: 0;
@@ -144,6 +165,9 @@
 	cursor: grab;
 	display: grid;
 	place-items: center;
+	/* Review round 1 major 8: without this, touch browsers treat a drag from
+	 * the grip as a scroll/refresh gesture and fight the pointer capture. */
+	touch-action: none;
 }
 .view-acts .itemrow .grip:active {
 	cursor: grabbing;
@@ -182,6 +206,14 @@
 		transition: opacity 120ms ease;
 	}
 }
+/* Review round 1 minor ("controls meet the 44px target through the shared
+ * density tokens"): NOT applied to these two. `.itemrow`'s `min-height` is
+ * itself density-driven (`--row-h`, 36/28/44px) and D-06's idle screenshot
+ * shows the eye at this row height — sizing `.eye`/`.movebtn` off
+ * `--btn-h-lg` (40/34/44px) would overflow a comfortable/compact row and
+ * break the pixel match this tab's DoD requires. Left as a fixed 24px,
+ * matching the drawn row; revisit once `--row-h` and the button tokens are
+ * reconciled (tracked as drift in the report). */
 .view-acts .itemrow .movebtn,
 .view-acts .itemrow .eye {
 	width: 24px;
@@ -214,6 +246,12 @@
 	flex: none;
 	display: grid;
 	place-items: center;
+}
+.view-acts .itemrow .hiddenelsewhere {
+	flex: none;
+	font-size: var(--text-micro);
+	color: var(--fg-faint);
+	white-space: nowrap;
 }
 
 .reordering,

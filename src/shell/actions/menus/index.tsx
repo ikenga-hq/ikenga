@@ -8,6 +8,23 @@
 // "unsaved" draft — the effective model re-merges on `actions://changed`
 // (the write itself, or a concurrent on-disk edit) and this surface just
 // re-renders from it, same as `actions-list.tsx` / `action-detail.tsx`.
+//
+// Review round 1 major 5 ("serialize writes ... build each write from
+// getEffectiveMenu / this scope's override at commit time, never from stale
+// rows"): a structural write (reorder, add action, add/remove separator)
+// goes through `queueRowsWrite` below — a local promise chain (one write in
+// flight at a time) that, when its turn comes, re-fetches the *live*
+// effective model and rebuilds `rows` from *that*, then re-applies the
+// intended change (a pure `MenuRow[] -> MenuRow[] | null` from
+// `menu-model.ts`, keyed by row id/anchor, never a raw index) before
+// writing. That's what keeps two rapid edits (a drag immediately followed
+// by a hide) from one clobbering the other with a payload built from
+// whatever `rows` this component had rendered several edits ago.
+// `hideAction`/`unhideAction`/`resetMenuOverride` don't need this — they
+// already read+merge fresh inside the store's own serialized edit queue
+// (G-ACTIONS-API) — but are still routed through the same local queue so
+// this surface never has more than one write outstanding at once, matching
+// the review's "queue or pending guard".
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Info, Minus, Plus } from 'lucide-react';
@@ -18,6 +35,7 @@ import {
 	ActionsFileNotWritableError,
 	ActionsValidationError,
 	bindingsFor,
+	getEffectiveModel,
 	hideAction,
 	LockedActionError,
 	LowerScopeOverrideError,
@@ -29,7 +47,18 @@ import { actionsPathLabel } from '../header';
 import { menuLabel } from '../shared/menu-label';
 import type { ActionsSurfaceProps } from '../types';
 import { AddActionDialog } from './add-action-dialog';
-import { buildMenuRows, type MenuRow, menuRowActionIds, moveRow, rowsToOverridePayload } from './menu-model';
+import {
+	appendActionRow,
+	buildMenuRows,
+	insertSeparator,
+	type MenuRow,
+	menuRowActionIds,
+	moveRow,
+	moveRowAfter,
+	removeRowByKey,
+	rowsToOverridePayload,
+	separatorWouldCollapse,
+} from './menu-model';
 import { MenuList } from './menu-list';
 import { MenuPreview, previewNote } from './menu-preview';
 import { MenuTree } from './menu-tree';
@@ -51,18 +80,32 @@ function writeErrorMessage(err: unknown): string {
 export function MenusSurface({ scope, model, onNavigate }: ActionsSurfaceProps) {
 	const search = useSearch({ strict: false }) as { action?: string };
 	const menuIds = model.menus.ids;
-	const [selectedMenuId, setSelectedMenuId] = useState<string | null>(menuIds[0] ?? null);
+	const [selectedMenuId, setSelectedMenuId] = useState<string | null>(menuIds.includes('files') ? 'files' : (menuIds[0] ?? null));
 	const [writeError, setWriteError] = useState<string | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
 	const [addOpen, setAddOpen] = useState(false);
 	const [highlightId, setHighlightId] = useState<string | null>(null);
+	const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
 	const dispatchedForRef = useRef<string | null>(null);
+	const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
 
 	// Keep a valid selection as the model reshapes (a package/project change
 	// can add or remove `section/<id>` menus from `model.menus.ids`).
 	useEffect(() => {
 		if (selectedMenuId && menuIds.includes(selectedMenuId)) return;
-		setSelectedMenuId(menuIds[0] ?? null);
+		setSelectedMenuId(menuIds.includes('files') ? 'files' : (menuIds[0] ?? null));
 	}, [menuIds, selectedMenuId]);
+
+	useEffect(() => {
+		setFocusedIndex(null);
+		setNotice(null);
+	}, [selectedMenuId]);
+
+	useEffect(() => {
+		if (!notice) return;
+		const t = setTimeout(() => setNotice(null), 6000);
+		return () => clearTimeout(t);
+	}, [notice]);
 
 	// Deep link (`?action=<id>`, the mount contract's `onNavigate` counterpart
 	// from the Actions detail pane's "Show in menus"-style journeys): jump to
@@ -85,7 +128,7 @@ export function MenusSurface({ scope, model, onNavigate }: ActionsSurfaceProps) 
 	}, [search.action, menuIds, model.menus]);
 
 	const menu = selectedMenuId ? model.menus.get(selectedMenuId) : null;
-	const rows = useMemo(() => buildMenuRows(menu, model.actionById), [menu, model.actionById]);
+	const rows = useMemo(() => buildMenuRows(menu, model.actionById, scope), [menu, model.actionById, scope]);
 
 	const keyById = useMemo(() => {
 		const map = new Map<string, string | null>();
@@ -102,62 +145,122 @@ export function MenusSurface({ scope, model, onNavigate }: ActionsSurfaceProps) 
 		return model.actions.filter((a) => !present.has(a.id));
 	}, [rows, model.actions]);
 
-	async function commit(nextRows: readonly MenuRow[]) {
-		if (!selectedMenuId) return;
-		setWriteError(null);
-		try {
-			await setMenuOverride(scope, selectedMenuId, rowsToOverridePayload(nextRows));
-		} catch (err) {
-			setWriteError(writeErrorMessage(err));
-		}
+	/** Runs `task` strictly after every write already queued (Major 5's
+	 *  "one write in flight at a time"). Errors are swallowed here — each
+	 *  `task` reports its own via `setWriteError` — so the chain itself never
+	 *  rejects and stalls every write after it. */
+	function enqueue(task: () => Promise<void>) {
+		writeQueueRef.current = writeQueueRef.current.then(task, task);
 	}
 
-	function onReorder(from: number, to: number) {
-		const next = moveRow(rows, from, to);
-		if (next !== rows) void commit(next);
+	/** Structural writes (reorder, add/remove separator, add action):
+	 *  `transform` runs against the *live* model at write time, not the rows
+	 *  this render closed over (Major 5). `null` means "nothing to write"
+	 *  (the target row/anchor is gone, or the change is no longer valid) —
+	 *  a silent, safe no-op. */
+	function queueRowsWrite(transform: (freshRows: MenuRow[]) => MenuRow[] | null) {
+		const menuId = selectedMenuId;
+		if (!menuId) return;
+		enqueue(async () => {
+			const freshModel = getEffectiveModel();
+			const freshMenu = freshModel.menus.get(menuId);
+			if (!freshMenu) return;
+			const freshRows = buildMenuRows(freshMenu, freshModel.actionById, scope);
+			const next = transform(freshRows);
+			if (!next) return;
+			setWriteError(null);
+			try {
+				await setMenuOverride(scope, menuId, rowsToOverridePayload(next, freshMenu.overrides[scope]));
+			} catch (err) {
+				setWriteError(writeErrorMessage(err));
+			}
+		});
 	}
 
-	async function onToggleHidden(row: Extract<MenuRow, { kind: 'action' }>) {
-		if (!selectedMenuId) return;
-		setWriteError(null);
-		try {
-			if (row.hidden) await unhideAction(scope, row.id, [selectedMenuId]);
-			else await hideAction(scope, row.id, [selectedMenuId]);
-		} catch (err) {
-			setWriteError(writeErrorMessage(err));
+	/** `false` rejects the move outright (nothing queued) — `menu-tree.tsx`
+	 *  only announces/refocuses when this returns `true`. */
+	function onReorder(from: number, to: number): boolean {
+		if (to < 0 || to >= rows.length || from === to || from < 0 || from >= rows.length) return false;
+		const moved = rows[from];
+		const preview = moveRow(rows, from, to);
+		if (moved.kind === 'separator' && separatorWouldCollapse(preview, to)) {
+			setNotice("A separator can't be first, last, or next to another separator.");
+			return false;
 		}
+		const movedKey = moved.key;
+		const afterKey = preview[to - 1]?.key ?? null;
+		queueRowsWrite((freshRows) => moveRowAfter(freshRows, movedKey, afterKey));
+		return true;
+	}
+
+	function onToggleHidden(row: Extract<MenuRow, { kind: 'action' }>) {
+		if (!selectedMenuId) return;
+		if (row.locked) {
+			setNotice(`"${row.action.name}" is locked — it may move, but not be hidden.`);
+			return;
+		}
+		if (row.hiddenElsewhere && !row.hiddenHere) {
+			setNotice(`"${row.action.name}" is hidden at the ${row.hiddenElsewhere} scope — unhide it there.`);
+			return;
+		}
+		const menuId = selectedMenuId;
+		const wantHidden = !row.hiddenHere;
+		const id = row.id;
+		enqueue(async () => {
+			setWriteError(null);
+			try {
+				if (wantHidden) await hideAction(scope, id, [menuId]);
+				else await unhideAction(scope, id, [menuId]);
+			} catch (err) {
+				setWriteError(writeErrorMessage(err));
+			}
+		});
 	}
 
 	function onRemoveSeparator(index: number) {
-		void commit(rows.filter((_, i) => i !== index));
+		const key = rows[index]?.key;
+		if (!key) return;
+		queueRowsWrite((freshRows) => removeRowByKey(freshRows, key));
 	}
 
 	function onAddSeparator() {
-		void commit([...rows, { kind: 'separator', key: `sep-${rows.length}-${Date.now()}` }]);
+		const afterKey = focusedIndex != null ? (rows[focusedIndex]?.key ?? null) : null;
+		const preview = insertSeparator(rows, afterKey);
+		if (!preview) {
+			setNotice("Can't add a separator there — it would collapse (no leading, trailing or doubled separators).");
+			return;
+		}
+		queueRowsWrite((freshRows) => insertSeparator(freshRows, afterKey));
 	}
 
 	function onAddAction(actionId: string) {
 		const action = model.actionById.get(actionId);
 		if (!action) return;
-		void commit([...rows, { kind: 'action', key: actionId, id: actionId, action, hidden: false, locked: action.locked }]);
+		queueRowsWrite((freshRows) => {
+			const freshAction = getEffectiveModel().actionById.get(actionId) ?? action;
+			return appendActionRow(freshRows, freshAction);
+		});
 		setAddOpen(false);
 	}
 
 	async function onResetMenu() {
 		if (!selectedMenuId) return;
-		const label = menuLabel(selectedMenuId);
+		const menuId = selectedMenuId;
+		const label = menuLabel(menuId);
 		const file = actionsPathLabel(scope, model.projectRoot);
 		const ok = await confirmDialog(
 			`This removes your customization of the "${label}" menu at ${scope} scope from ${file}. Its default order and visibility return.`,
 			{ title: `Reset ${label}`, kind: 'warning', okLabel: 'Reset' }
 		);
 		if (!ok) return;
-		setWriteError(null);
-		try {
-			await resetMenuOverride(scope, selectedMenuId);
-		} catch (err) {
-			setWriteError(writeErrorMessage(err));
-		}
+		enqueue(async () => {
+			setWriteError(null);
+			try {
+				await resetMenuOverride(scope, menuId);
+			} catch (err) {
+				setWriteError(writeErrorMessage(err));
+			}
+		});
 	}
 
 	if (!selectedMenuId || !menu) {
@@ -173,6 +276,11 @@ export function MenusSurface({ scope, model, onNavigate }: ActionsSurfaceProps) 
 			{writeError && (
 				<div className="issuesbanner" role="alert">
 					<div className="issuesbanner-row">{writeError}</div>
+				</div>
+			)}
+			{notice && !writeError && (
+				<div className="issuesbanner" role="status">
+					<div className="issuesbanner-row">{notice}</div>
 				</div>
 			)}
 			<div className="menuwrap">
@@ -199,17 +307,18 @@ export function MenusSurface({ scope, model, onNavigate }: ActionsSurfaceProps) 
 						rows={rows}
 						keyById={keyById}
 						onReorder={onReorder}
-						onToggleHidden={(row) => void onToggleHidden(row)}
+						onToggleHidden={onToggleHidden}
 						onRemoveSeparator={onRemoveSeparator}
 						highlightId={highlightId}
 						onOpenEditor={(actionId) => onNavigate('editor', { action: actionId })}
+						onRowFocus={setFocusedIndex}
 					/>
 					<div className="mfoot">
 						<Info className="h-3 w-3" aria-hidden="true" />
 						<span>
 							Drag a handle to reorder, or focus a row and press <span style={{ fontFamily: 'var(--font-mono)' }}>⌥↑</span> /{' '}
 							<span style={{ fontFamily: 'var(--font-mono)' }}>⌥↓</span> — or use the up/down buttons beside the handle. Locked items
-							may move but not hide.
+							may move but not hide. Hiding never unbinds a key — it still fires either way.
 						</span>
 					</div>
 				</div>
