@@ -49,7 +49,7 @@ function matchesScope(action: EffectiveAction, facet: ScopeFacet | null): boolea
 	return facet === null || scopeBucket(action) === facet;
 }
 
-function matchesPlacement(action: EffectiveAction, facet: string | null, placements: readonly string[]): boolean {
+function matchesPlacement(_action: EffectiveAction, facet: string | null, placements: readonly string[]): boolean {
 	if (facet === null) return true;
 	return placements.some((at) => placementCategory(at) === facet);
 }
