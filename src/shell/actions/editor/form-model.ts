@@ -285,7 +285,10 @@ export function formFromAction(action: EffectiveAction, keyEntry: KeymapEntry | 
 		}
 	}
 
-	for (const placement of action.userAction?.placements ?? action.placements) {
+	// A built-in's resolved placements carry `at: string`; the round-trip
+	// check reads them through the stored `Placement` shape.
+	const placements = (action.userAction?.placements ?? action.placements) as readonly Placement[];
+	for (const placement of placements) {
 		if (!isRoundTrippablePlacement(placement)) {
 			form.extraPlacements.push(placement);
 			continue;

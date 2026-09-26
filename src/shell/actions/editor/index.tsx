@@ -310,8 +310,9 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 
 	if (refuseEdit && targetAction) {
 		return (
-			<div className="edrefuse" data-state="editor">
+			<div className="edrefuse">
 				<EmptyState
+					data-state="editor"
 					icon={Lock}
 					heading={`"${targetAction.name}" is a built-in`}
 					body="Built-in and package actions can't be edited here — hide them from a menu, or rebind their key, from the Actions and Keys tabs."
@@ -323,8 +324,9 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 
 	if (notFound) {
 		return (
-			<div className="edrefuse" data-state="editor">
+			<div className="edrefuse">
 				<EmptyState
+					data-state="editor"
 					icon={FileCode}
 					heading="That action no longer exists"
 					body={`No action with id "${actionId}" is in force. It may have been deleted or reset.`}
