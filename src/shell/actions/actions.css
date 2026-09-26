@@ -1,0 +1,403 @@
+/* D-06 · Actions, menus and keys (WP-57) — additions on top of `ngwa.css`'s
+   shared `.view-ngwa` scaffold (`.facetbar`/`.chip`/`.split`/`.listcol`/
+   `.detailcol`/`.lhead`/`.irow`/`.surface`/`.ntabs`/`.dhead`/`.dtabs`/
+   `.dbody`). The route root carries both `view-ngwa view-acts`, same as
+   `designs/actions.html`'s `class="view-ngwa view-acts"` — Actions is built
+   as the same shape of screen as Ngwa Installed (FORM COMES FROM, actions.html
+   header comment): a faceted list + detail pane. Rules here are scoped under
+   `.view-acts` and only cover what `ngwa.css` does not already have.
+*/
+
+/* ── Header (`vhead`) — file path, scope switch, header actions ── */
+
+.view-acts .vhead {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	padding: var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	flex-wrap: wrap;
+	row-gap: var(--space-2);
+}
+
+.view-acts .vhead h1 {
+	font-family: var(--font-display);
+	font-size: var(--text-h3);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: none;
+}
+
+.view-acts .newchip {
+	font-size: 10px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	font-weight: 600;
+	color: var(--achievement);
+	background: var(--achievement-soft);
+	border-radius: var(--radius-xs);
+	padding: 1px 6px;
+}
+
+.view-acts .filepath {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	white-space: nowrap;
+	background: var(--bg-sunken);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: 2px var(--space-2);
+}
+
+.view-acts .vhead .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+
+/* Blocker 2: the write-error banner under the header, shown when a reset or
+   an "Open file" fails instead of the failure being swallowed silently. */
+.view-acts .vhead-wrap {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+}
+
+.view-acts .vhead-error {
+	flex: none;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: var(--danger-soft);
+	color: var(--danger);
+	font-size: var(--text-caption);
+	line-height: var(--lead-caption);
+}
+
+/* ── iyke footer line (product principle 5) ── */
+
+.view-acts .iykeline {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-1) var(--space-3);
+	border-top: 1px solid var(--border-soft);
+	background: var(--bg-surface);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+/* Item 17: the "iyke" label reads muted and regular weight — the command
+   text after it (not this label) carries the emphasis. */
+.view-acts .iykeline b {
+	color: var(--fg-muted);
+	font-weight: 400;
+}
+
+.view-acts .iykeline .cp {
+	margin-left: auto;
+	background: transparent;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+	padding: 1px 6px;
+	cursor: pointer;
+}
+
+.view-acts .iykeline .cp:hover {
+	color: var(--fg);
+	background: var(--bg-raised);
+}
+
+/* ── Issues banner (blocker 5) — per-file validation errors + model issues ── */
+
+.view-acts .issuesbanner {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	background: color-mix(in srgb, var(--warning) 16%, var(--bg-surface));
+	color: var(--fg);
+	font-size: var(--text-caption);
+	line-height: var(--lead-caption);
+}
+
+.view-acts .issuesbanner-row::before {
+	content: '⚠ ';
+	color: var(--warning);
+}
+
+/* ── Actions list — runs / key / source columns ── */
+
+.view-acts .lhead .c-runs {
+	margin-left: auto;
+}
+
+.view-acts .lhead .c-runs,
+.view-acts .lhead .c-key,
+.view-acts .lhead .c-src {
+	flex: none;
+	width: 84px;
+	text-align: right;
+}
+
+.view-acts .irow .tail .c-runs,
+.view-acts .irow .tail .c-src {
+	width: 84px;
+	flex: none;
+	text-align: right;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .irow .tail .c-key {
+	width: 84px;
+	flex: none;
+	display: flex;
+	justify-content: flex-end;
+}
+
+.view-acts .kind.k-builtin {
+	color: var(--fg-muted);
+}
+
+.view-acts .kind.k-package {
+	color: var(--info);
+}
+
+.view-acts .kind.k-personal {
+	color: var(--success);
+}
+
+.view-acts .kind.k-project {
+	color: var(--primary);
+}
+
+/* ── kbd chips (shared/kbd.tsx) ── */
+
+.kbdrow {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	flex: none;
+}
+
+kbd.kbd {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+	line-height: 1.5;
+}
+
+/* Item 10: an unbound key renders as a dashed "unbound" kbd, not plain text. */
+kbd.kbd.kbd-none {
+	color: var(--fg-muted);
+	background: transparent;
+	border-style: dashed;
+	border-color: var(--border-strong);
+}
+
+/* ── list row: Placements chips column, Source dot (items 10) ── */
+
+.view-acts .irow .tail .c-places {
+	width: 148px;
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	overflow: hidden;
+}
+
+.view-acts .lhead .c-places {
+	flex: none;
+	width: 148px;
+	text-align: right;
+}
+
+.view-acts .pchip {
+	font-size: 10px;
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-pill);
+	padding: 0 5px;
+	white-space: nowrap;
+}
+
+.view-acts .pchip.none {
+	background: transparent;
+	border-color: transparent;
+}
+
+.view-acts .src-dot {
+	display: inline-block;
+	width: 5px;
+	height: 5px;
+	border-radius: var(--radius-pill);
+	background: currentColor;
+	margin-right: 2px;
+}
+
+/* ── key recorder (shared/key-recorder.tsx) ── */
+
+.rec {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+	height: 26px;
+	padding: 0 var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+	color: var(--fg);
+	font-size: var(--text-caption);
+	cursor: pointer;
+}
+
+.rec.sm {
+	height: 22px;
+	font-size: var(--text-micro);
+}
+
+.rec:hover {
+	border-color: var(--border-strong);
+}
+
+.rec[data-recording] {
+	border-color: var(--primary);
+	background: var(--primary-soft);
+	color: var(--primary);
+}
+
+.rec .lbl.empty {
+	color: var(--fg-muted);
+}
+
+.rec .lbl.recording {
+	color: var(--primary);
+	font-weight: 500;
+}
+
+.rec[data-invalid] {
+	border-color: var(--danger);
+	background: var(--danger-soft);
+}
+
+.rec .lbl.invalid {
+	color: var(--danger);
+	font-weight: 500;
+}
+
+/* ── JSON preview (shared/json-preview.tsx) ── */
+
+.json-preview .jp-caption {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-bottom: var(--space-1);
+}
+
+.json-preview .fm .jp-key {
+	color: var(--primary);
+}
+
+.json-preview .fm .jp-val {
+	color: var(--fg);
+}
+
+/* ── Detail pane — run body, placements ── */
+
+.view-acts .runbody {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-1);
+	margin-bottom: var(--space-3);
+}
+
+.view-acts .placechips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--space-1);
+	margin-top: var(--space-1);
+}
+
+.view-acts .dbody .subhead {
+	margin: var(--space-3) 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .dbody .subhead.first {
+	margin-top: 0;
+}
+
+/* ── Empty state (item 15/17) ──
+   Item 17: this rule used to target `.surface[data-state='empty']`, but
+   `data-state` lived on the EmptyState primitive's own root, never on
+   `.surface` — the rule never matched anything. `data-state` now lives on
+   the `.surface` wrapper itself (`shell.tsx`, one attribute per state, for
+   every tab) so this actually applies. */
+
+.view-acts .surface[data-state='empty'] {
+	background: var(--bg-base);
+}
+
+.view-acts .emptyview {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-3);
+	padding: var(--space-8);
+	text-align: center;
+}
+
+.view-acts .emptyview h2 {
+	font-family: var(--font-display);
+	font-size: var(--text-h2);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	margin: 0;
+}
+
+.view-acts .emptyview .note {
+	max-width: 52ch;
+	color: var(--fg-muted);
+	font-size: var(--text-body);
+	line-height: var(--lead-body);
+}
+
+.view-acts .emptyview .note.mono {
+	font-family: var(--font-mono);
+	font-size: var(--text-caption);
+	max-width: 60ch;
+}
+
+/* Test run is offered on every action but lands with WP-58/WP-53 — say so in
+   the control itself, not only its tooltip (item 12). */
+.view-acts .dacts .chip .pending {
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}

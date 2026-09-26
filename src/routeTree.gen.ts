@@ -60,6 +60,7 @@ import { Route as ProjectDashboardRouteImport } from './routes/project/dashboard
 import { Route as ProjectsNewArtifactRouteImport } from './routes/projects/new-artifact'
 import { Route as SettingsIndexRouteImport } from './routes/settings/index'
 import { Route as SettingsAboutRouteImport } from './routes/settings/about'
+import { Route as SettingsActionsRouteImport } from './routes/settings/actions'
 import { Route as SettingsActivityBarRouteImport } from './routes/settings/activity-bar'
 import { Route as SettingsAgentRouteImport } from './routes/settings/agent'
 import { Route as SettingsAppearanceRouteImport } from './routes/settings/appearance'
@@ -82,6 +83,7 @@ import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-k
 import { Route as NgwaItemItemIdRouteImport } from './routes/ngwa/item.$itemId'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
 import { Route as PkgPkgIdSplatRouteImport } from './routes/pkg/$pkgId/$'
+import { Route as SettingsActionsTabRouteImport } from './routes/settings/actions.$tab'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -338,6 +340,11 @@ const SettingsAboutRoute = SettingsAboutRouteImport.update({
   path: '/about',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsActionsRoute = SettingsActionsRouteImport.update({
+  id: '/actions',
+  path: '/actions',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const SettingsActivityBarRoute = SettingsActivityBarRouteImport.update({
   id: '/activity-bar',
   path: '/activity-bar',
@@ -448,6 +455,11 @@ const PkgPkgIdSplatRoute = PkgPkgIdSplatRouteImport.update({
   path: '/$',
   getParentRoute: () => PkgPkgIdRouteRoute,
 } as any)
+const SettingsActionsTabRoute = SettingsActionsTabRouteImport.update({
+  id: '/$tab',
+  path: '/$tab',
+  getParentRoute: () => SettingsActionsRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -496,6 +508,7 @@ export interface FileRoutesByFullPath {
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
   '/settings/about': typeof SettingsAboutRoute
+  '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
@@ -522,6 +535,7 @@ export interface FileRoutesByFullPath {
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
+  '/settings/actions/$tab': typeof SettingsActionsTabRoute
   '/pkg/$pkgId/': typeof PkgPkgIdIndexRoute
 }
 export interface FileRoutesByTo {
@@ -568,6 +582,7 @@ export interface FileRoutesByTo {
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
   '/settings/about': typeof SettingsAboutRoute
+  '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
@@ -594,6 +609,7 @@ export interface FileRoutesByTo {
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
+  '/settings/actions/$tab': typeof SettingsActionsTabRoute
   '/pkg/$pkgId': typeof PkgPkgIdIndexRoute
 }
 export interface FileRoutesById {
@@ -644,6 +660,7 @@ export interface FileRoutesById {
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
   '/settings/about': typeof SettingsAboutRoute
+  '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
@@ -670,6 +687,7 @@ export interface FileRoutesById {
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
   '/pkg/$pkgId/$': typeof PkgPkgIdSplatRoute
+  '/settings/actions/$tab': typeof SettingsActionsTabRoute
   '/pkg/$pkgId/': typeof PkgPkgIdIndexRoute
 }
 export interface FileRouteTypes {
@@ -721,6 +739,7 @@ export interface FileRouteTypes {
     | '/project/dashboard'
     | '/projects/new-artifact'
     | '/settings/about'
+    | '/settings/actions'
     | '/settings/activity-bar'
     | '/settings/agent'
     | '/settings/appearance'
@@ -747,6 +766,7 @@ export interface FileRouteTypes {
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
+    | '/settings/actions/$tab'
     | '/pkg/$pkgId/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -793,6 +813,7 @@ export interface FileRouteTypes {
     | '/project/dashboard'
     | '/projects/new-artifact'
     | '/settings/about'
+    | '/settings/actions'
     | '/settings/activity-bar'
     | '/settings/agent'
     | '/settings/appearance'
@@ -819,6 +840,7 @@ export interface FileRouteTypes {
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
+    | '/settings/actions/$tab'
     | '/pkg/$pkgId'
   id:
     | '__root__'
@@ -868,6 +890,7 @@ export interface FileRouteTypes {
     | '/project/dashboard'
     | '/projects/new-artifact'
     | '/settings/about'
+    | '/settings/actions'
     | '/settings/activity-bar'
     | '/settings/agent'
     | '/settings/appearance'
@@ -894,6 +917,7 @@ export interface FileRouteTypes {
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
     | '/pkg/$pkgId/$'
+    | '/settings/actions/$tab'
     | '/pkg/$pkgId/'
   fileRoutesById: FileRoutesById
 }
@@ -1297,6 +1321,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsAboutRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/actions': {
+      id: '/settings/actions'
+      path: '/actions'
+      fullPath: '/settings/actions'
+      preLoaderRoute: typeof SettingsActionsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/settings/activity-bar': {
       id: '/settings/activity-bar'
       path: '/activity-bar'
@@ -1451,6 +1482,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PkgPkgIdSplatRouteImport
       parentRoute: typeof PkgPkgIdRouteRoute
     }
+    '/settings/actions/$tab': {
+      id: '/settings/actions/$tab'
+      path: '/$tab'
+      fullPath: '/settings/actions/$tab'
+      preLoaderRoute: typeof SettingsActionsTabRouteImport
+      parentRoute: typeof SettingsActionsRoute
+    }
   }
 }
 
@@ -1500,8 +1538,21 @@ const OutboxRouteRouteWithChildren = OutboxRouteRoute._addFileChildren(
   OutboxRouteRouteChildren,
 )
 
+interface SettingsActionsRouteChildren {
+  SettingsActionsTabRoute: typeof SettingsActionsTabRoute
+}
+
+const SettingsActionsRouteChildren: SettingsActionsRouteChildren = {
+  SettingsActionsTabRoute: SettingsActionsTabRoute,
+}
+
+const SettingsActionsRouteWithChildren = SettingsActionsRoute._addFileChildren(
+  SettingsActionsRouteChildren,
+)
+
 interface SettingsRouteRouteChildren {
   SettingsAboutRoute: typeof SettingsAboutRoute
+  SettingsActionsRoute: typeof SettingsActionsRouteWithChildren
   SettingsActivityBarRoute: typeof SettingsActivityBarRoute
   SettingsAgentRoute: typeof SettingsAgentRoute
   SettingsAppearanceRoute: typeof SettingsAppearanceRoute
@@ -1525,6 +1576,7 @@ interface SettingsRouteRouteChildren {
 
 const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsAboutRoute: SettingsAboutRoute,
+  SettingsActionsRoute: SettingsActionsRouteWithChildren,
   SettingsActivityBarRoute: SettingsActivityBarRoute,
   SettingsAgentRoute: SettingsAgentRoute,
   SettingsAppearanceRoute: SettingsAppearanceRoute,
