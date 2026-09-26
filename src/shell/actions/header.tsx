@@ -42,6 +42,11 @@ export function actionsPathLabel(scope: ActionsScope, projectRoot: string | null
 	return `${fileBaseName(projectRoot)}/.ikenga/actions.json`;
 }
 
+/** The Keys tab writes `keybindings.json`, not `actions.json` (§1.1). */
+function keybindingsPathLabel(scope: ActionsScope, projectRoot: string | null): string {
+	return actionsPathLabel(scope, projectRoot).replace(/actions\.json$/, 'keybindings.json');
+}
+
 /** Blocker 2: every write in this header goes through this instead of a bare
  *  `.catch(() => {})` — `ActionsFileNotWritableError`, `ActionsValidationError`
  *  and `LowerScopeOverrideError` (all re-exported from `@/lib/actions/store`,
@@ -133,7 +138,7 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 			// exactly how many, before the user confirms a delete.
 			const ok = await confirmDialog(
 				`This deletes the ${n} action${n === 1 ? '' : 's'} you've written at ${scope} scope from ${pathLabel}. Built-in and package actions are not affected.`,
-				{ title: `Reset ${label}`, kind: 'warning' }
+				{ title: `Reset ${label}`, kind: 'warning', okLabel: `Delete ${n} action${n === 1 ? '' : 's'}` }
 			);
 			if (!ok) return;
 			setWriteError(null);
@@ -144,9 +149,11 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 			}
 			return;
 		}
-		const ok = await confirmDialog(`Reset the ${label} tab at ${scope} scope? This rewrites ${pathLabel}.`, {
+		const file = tab === 'keys' ? keybindingsPathLabel(scope, model.projectRoot) : pathLabel;
+		const ok = await confirmDialog(`Reset the ${label} tab at ${scope} scope? This rewrites ${file}.`, {
 			title: `Reset ${label}`,
 			kind: 'warning',
+			okLabel: 'Reset',
 		});
 		if (!ok) return;
 		setWriteError(null);

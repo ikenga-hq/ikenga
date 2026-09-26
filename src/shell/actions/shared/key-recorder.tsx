@@ -139,6 +139,12 @@ export function KeyRecorder({
 				finish('');
 				return;
 			}
+			// A held key auto-repeats: swallow it, or it would chord with itself.
+			if (e.repeat) {
+				e.preventDefault();
+				e.stopPropagation();
+				return;
+			}
 			const strokes = strokesFromEvent(e);
 			if (strokes.length === 0) return; // modifier-only, IME, Dead key — keep waiting
 			e.preventDefault();

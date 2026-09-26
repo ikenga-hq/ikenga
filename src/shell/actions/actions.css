@@ -49,6 +49,10 @@
 	font-size: var(--text-micro);
 	color: var(--fg-muted);
 	white-space: nowrap;
+	background: var(--bg-sunken);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: 2px var(--space-2);
 }
 
 .view-acts .vhead .rt {
@@ -389,4 +393,11 @@ kbd.kbd.kbd-none {
 	font-family: var(--font-mono);
 	font-size: var(--text-caption);
 	max-width: 60ch;
+}
+
+/* Test run is offered on every action but lands with WP-58/WP-53 — say so in
+   the control itself, not only its tooltip (item 12). */
+.view-acts .dacts .chip .pending {
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
 }

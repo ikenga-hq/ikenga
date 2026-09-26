@@ -4,7 +4,7 @@
 // pane (`shell/ngwa/ngwa-detail-pane.tsx`): a `dhead` (title/badge/meta) over
 // `dtabs`/`dbody`.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ExternalLink, Keyboard, Lock, Pencil, Play } from 'lucide-react';
 import {
 	type ActionsScope,
@@ -30,16 +30,27 @@ export interface ActionDetailProps {
 	 *  `[]`) — not `action.placements`. */
 	placements: readonly string[];
 	scope: ActionsScope;
+	/** The active project's id (null outside a project), whatever the header
+	 *  scope — a project action opens the project file even from Personal. */
 	projectId: string | null;
 	projectRoot: string | null;
+	onEdit: (actionId: string) => void;
 	onTestRun: (actionId: string) => void;
 	onRebind: (actionId: string) => void;
+}
+
+/** The file that holds this action: a user action lives at its own layer's
+ *  scope (not the header's); a built-in or package action's override goes to
+ *  the header scope's file. */
+function fileScopeFor(action: EffectiveAction, scope: ActionsScope): ActionsScope {
+	if (action.source === 'personal' || action.source === 'project') return action.source;
+	return scope;
 }
 
 function sourceFileLine(action: EffectiveAction, scope: ActionsScope, projectRoot: string | null): string {
 	if (action.source === 'builtin') return 'shell built-in';
 	if (action.source === 'package') return `${action.pkgId ?? 'package'} · manifest.json`;
-	return actionsPathLabel(scope, projectRoot);
+	return actionsPathLabel(fileScopeFor(action, scope), projectRoot);
 }
 
 function jsonShape(action: EffectiveAction): unknown {
@@ -60,11 +71,15 @@ export function ActionDetail({
 	scope,
 	projectId,
 	projectRoot,
+	onEdit,
 	onTestRun,
 	onRebind,
 }: ActionDetailProps) {
 	const [activeTab, setActiveTab] = useState<DetailTab>('overview');
 	const [actionError, setActionError] = useState<string | null>(null);
+	// An error belongs to the action it happened on — clear it on selection.
+	useEffect(() => setActionError(null), [action.id]);
+	const fileScope = fileScopeFor(action, scope);
 	const bindings = bindingsFor(action.id);
 	const summary = runSummary(action);
 	const file = sourceFileLine(action, scope, projectRoot);
@@ -72,7 +87,7 @@ export function ActionDetail({
 	async function handleOpenFile() {
 		setActionError(null);
 		try {
-			await openActionsFile('actions', scope, projectId);
+			await openActionsFile('actions', fileScope, fileScope === 'project' ? projectId : null);
 		} catch (err) {
 			setActionError(err instanceof Error ? err.message : String(err));
 		}
@@ -120,7 +135,7 @@ export function ActionDetail({
 				<div className="dacts">
 					{action.editable ? (
 						<>
-							<button type="button" className="chip" onClick={() => onRebind(action.id)}>
+							<button type="button" className="chip" onClick={() => onEdit(action.id)}>
 								<Pencil className="h-3 w-3" /> Edit
 							</button>
 							<button type="button" className="chip" onClick={() => onRebind(action.id)}>
@@ -143,7 +158,7 @@ export function ActionDetail({
 						title="Pending — routes to the Editor tab until WP-58/WP-53 land"
 						onClick={() => onTestRun(action.id)}
 					>
-						<Play className="h-3 w-3" /> Test run
+						<Play className="h-3 w-3" /> Test run <span className="pending">(pending)</span>
 					</button>
 					<button type="button" className="chip" onClick={() => void handleOpenFile()}>
 						<ExternalLink className="h-3 w-3" /> Open file

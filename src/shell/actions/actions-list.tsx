@@ -284,8 +284,11 @@ export function ActionsListSurface({ model, scope }: ActionsListSurfaceProps) {
 						action={activeAction}
 						placements={placementsFor(activeAction.id)}
 						scope={scope}
-						projectId={scope === 'project' ? model.projectId : null}
+						projectId={model.projectId}
 						projectRoot={model.projectRoot}
+						onEdit={(id) =>
+							void navigate({ to: '/settings/actions/$tab', params: { tab: 'editor' }, search: { action: id } })
+						}
 						onTestRun={(id) =>
 							void navigate({ to: '/settings/actions/$tab', params: { tab: 'editor' }, search: { action: id } })
 						}

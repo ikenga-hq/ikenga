@@ -11,9 +11,10 @@
 import { useMemo, useState } from 'react';
 import { Terminal } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
-import { LoadingState } from '@/components/states';
-import { useActionsStore, useEffectiveModel } from '@/lib/actions/store';
-import type { ActionsScope } from '@/lib/actions/types';
+import { ErrorState, LoadingState } from '@/components/states';
+import { refreshActionsModel, useActionsStore, useEffectiveModel } from '@/lib/actions/store';
+import type { ActionsScope } from '@/lib/actions/store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import type { ActionsSurfaceProps, ActionsTabId, VisibleActionsTabId } from './types';
 import { isVisibleActionsTab } from './types';
 import { ActionsHeader } from './header';
@@ -66,6 +67,9 @@ export function ActionsShell({ tab }: ActionsShellProps) {
 	// yet) must show loading, not flash `empty` first just because it also
 	// has zero personal/project actions.
 	const stillLoading = (status === 'idle' || status === 'loading') && model.files === null;
+	// The first read failed: nothing was read, so neither `empty` nor the
+	// list is true. (A failed *re*-read keeps the last model — blocker 5.)
+	const neverRead = status === 'error' && model.files === null;
 
 	const iykeCommand = iykeCommandFor(tab, scope);
 
@@ -91,6 +95,20 @@ export function ActionsShell({ tab }: ActionsShellProps) {
 		if (stillLoading) {
 			return <LoadingState data-state="loading" fill heading="Reading actions and keybindings…" />;
 		}
+		if (neverRead) {
+			return (
+				<ErrorState
+					data-state="error"
+					fill
+					heading="Couldn't read your actions and keybindings"
+					body={error ?? undefined}
+					action={{
+						label: 'Try again',
+						onClick: () => void refreshActionsModel(useShellStore.getState().activeProject?.id ?? null),
+					}}
+				/>
+			);
+		}
 		if (tab === 'actions') {
 			return hasUserActions ? <ActionsListSurface model={model} scope={scope} /> : <EmptyActionsState model={model} />;
 		}
@@ -103,7 +121,7 @@ export function ActionsShell({ tab }: ActionsShellProps) {
 	// Every surface's `data-state` names the D-06 state it renders — the one
 	// attribute the conformance pass (and `actions.css`'s empty-state rule,
 	// item 17) greps for.
-	const dataState = stillLoading ? 'loading' : tab === 'actions' ? (hasUserActions ? 'actions' : 'empty') : tab;
+	const dataState = stillLoading ? 'loading' : neverRead ? 'error' : tab === 'actions' ? (hasUserActions ? 'actions' : 'empty') : tab;
 	// `import` is routable but not one of the 1–4 tabs (item 19) — no tab
 	// bar entry highlights while it's the active surface.
 	const visibleTab: VisibleActionsTabId | null = isVisibleActionsTab(tab) ? tab : null;

@@ -59,12 +59,33 @@ describe('KeyRecorder — chord (DEC-57)', () => {
 });
 
 describe('KeyRecorder — both platform modifiers held', () => {
+	beforeEach(() => vi.useFakeTimers());
+	afterEach(() => vi.useRealTimers());
+
 	it('records the literal ctrl+meta, never mod+ctrl or mod+meta', () => {
 		const onRecord = vi.fn();
 		render(<KeyRecorder onRecord={onRecord} />);
 		fireEvent.click(screen.getByRole('button'));
 		press('t', { ctrlKey: true, metaKey: true });
+		// A single stroke commits once the chord window elapses.
+		vi.advanceTimersByTime(900);
 		expect(onRecord).toHaveBeenCalledWith('ctrl+meta+t');
+	});
+});
+
+describe('KeyRecorder — auto-repeat', () => {
+	beforeEach(() => vi.useFakeTimers());
+	afterEach(() => vi.useRealTimers());
+
+	it('ignores a held key auto-repeating, so it never chords with itself', () => {
+		const onRecord = vi.fn();
+		render(<KeyRecorder onRecord={onRecord} />);
+		fireEvent.click(screen.getByRole('button'));
+		press('e', { ctrlKey: true });
+		press('e', { ctrlKey: true, repeat: true });
+		vi.advanceTimersByTime(900);
+		expect(onRecord).toHaveBeenCalledTimes(1);
+		expect(onRecord).toHaveBeenCalledWith('mod+e');
 	});
 });
 
