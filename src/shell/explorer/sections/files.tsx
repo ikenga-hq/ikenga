@@ -787,7 +787,6 @@ export function FilesSection(_ctx: { projectId: string }) {
 	const showIgnored = useFilesStore((s) => s.showIgnored);
 	const setShowHidden = useFilesStore((s) => s.setShowHidden);
 	const setShowIgnored = useFilesStore((s) => s.setShowIgnored);
-	const toggleShowHidden = useFilesStore((s) => s.toggleShowHidden);
 	const scrollerRef = useRef<HTMLDivElement | null>(null);
 
 	// Index of the open root; headers at/above it stick to the top, those below
@@ -840,23 +839,12 @@ export function FilesSection(_ctx: { projectId: string }) {
 		reveal(root, ancestors, path);
 	}, [revealRequest, roots, reveal]);
 
-	// Cmd+. (Mac) / Ctrl+. (Linux/Windows) → toggle hidden files. Matches the
-	// Finder convention. Bare `.` (no modifier) is left alone so users can
-	// still type into rename inputs and search boxes. Scoped to keypresses
-	// outside text inputs, same gating as the activity-bar shortcuts.
-	useEffect(() => {
-		function onKey(e: KeyboardEvent) {
-			const mod = e.metaKey || e.ctrlKey;
-			if (!mod || e.shiftKey || e.altKey) return;
-			if (e.key !== '.') return;
-			const target = e.target as HTMLElement | null;
-			if (target?.matches('input, textarea, [contenteditable="true"]')) return;
-			e.preventDefault();
-			toggleShowHidden();
-		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-	}, [toggleShowHidden]);
+	// Fix round 1 (item 10): `explorer.toggle-hidden` (⌘. / Ctrl+., DEC-26,
+	// `defaults.ts`) already fires through the registry — `workspace.tsx`
+	// registers its handler (`useFilesStore.getState().toggleShowHidden()`).
+	// This section's own raw window listener duplicated that: with focus in
+	// the Explorer both fired on the same keypress and the two toggles
+	// cancelled out. The dispatcher is the only path now.
 
 	// Restore the tree scroll once on hydrate. Re-apply after a beat so
 	// late-resolving queries that grow the tree don't clobber it. Reveal-on-open

@@ -80,6 +80,13 @@ function ctx(partial: Partial<ContextKeys> = {}): ContextKeys {
 		ngwaItemKind: undefined,
 		dispatchFocus: false,
 		paletteOpen: false,
+		// WP-56 (B-21 additive rule, G-ACTIONS §10.2 "Reserved for WP-56").
+		permissionCardFocus: false,
+		approveGateFocus: false,
+		loupeFocus: false,
+		pinComposerFocus: false,
+		markdownEditorFocus: false,
+		approveGateDetailFocus: false,
 		...partial,
 	};
 }
@@ -404,13 +411,14 @@ describe('the other §10.2 additions', () => {
 		]);
 	});
 
-	it('zoom works while typing (`always`), including ⌘+ / numpad +', () => {
+	it('zoom works while typing (`always`), including ⌘+ / numpad + and the restored ⌘⇧- (Round 42 hand-off)', () => {
 		const h = harness({ platform: 'other', context: { inputFocus: true } });
 		h.press(mod('other', '='));
 		h.press(mod('other', '+', { shiftKey: true, code: 'Equal' }));
 		h.press(mod('other', '-'));
+		h.press(mod('other', '_', { shiftKey: true, code: 'Minus' }));
 		h.press(mod('other', '0'));
-		expect(h.fired).toEqual(['zoom.in', 'zoom.in', 'zoom.out', 'zoom.reset']);
+		expect(h.fired).toEqual(['zoom.in', 'zoom.in', 'zoom.out', 'zoom.out', 'zoom.reset']);
 	});
 });
 

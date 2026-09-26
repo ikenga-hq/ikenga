@@ -12,6 +12,8 @@ import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { EmptyState } from '@/components/states';
 import { LoreTerm } from '@/components/lore/lore-term';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { findEntry, labelFor } from '@/lib/keymap/registry';
 import { useDragState } from '@/lib/panes/drag-state';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -315,6 +317,28 @@ const DECISION_TEXT: Record<PermissionDecision, string> = {
 };
 
 export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
+	const resolve = useCompanionStore((s) => s.resolvePermission);
+	// A/D allow/deny the *focused* card (spec §2) — one pair of registry
+	// commands for the whole list (WP-56, G-ACTIONS §10.2/§10.6), reading
+	// which card holds focus at fire time rather than one handler per row
+	// (`useCommands`'s per-command stack would only ever run the
+	// last-mounted row's closure).
+	const resolveFocused = (decision: 'allow' | 'deny') => {
+		const el = document.activeElement;
+		// Fix round 1: a focused button (Allow once / Always / Deny) handles
+		// its own Enter/Space — A/D must not also act behind its back.
+		if (el instanceof HTMLButtonElement) return;
+		const id = el instanceof Element ? el.closest('[data-permission-card]')?.getAttribute('data-permission-card') : null;
+		if (!id) return;
+		const card = cards.find((c) => c.id === id);
+		if (!card || card.status !== 'pending') return;
+		resolve(id, decision);
+	};
+	useCommands({
+		'companion.permission-allow': () => resolveFocused('allow'),
+		'companion.permission-deny': () => resolveFocused('deny'),
+	});
+
 	if (cards.length === 0) {
 		return (
 			<EmptyState
@@ -341,32 +365,16 @@ export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
 }
 
 function PermissionCard({ card }: { card: PermissionCardEntry }) {
-	const resolve = useCompanionStore((s) => s.resolvePermission);
 	const undo = useCompanionStore((s) => s.undoPermission);
-	const ref = useRef<HTMLFieldSetElement | null>(null);
-
-	function onKeyDown(e: React.KeyboardEvent) {
-		// Single letters only while the card itself holds focus (spec §2).
-		if (card.status !== 'pending' || e.target !== ref.current) return;
-		if (e.metaKey || e.ctrlKey || e.altKey) return;
-		const k = e.key.toLowerCase();
-		if (k === 'a') {
-			e.preventDefault();
-			resolve(card.id, 'allow');
-		} else if (k === 'd') {
-			e.preventDefault();
-			resolve(card.id, 'deny');
-		}
-	}
+	const resolve = useCompanionStore((s) => s.resolvePermission);
 
 	const title = card.kind === 'tool_use' ? `Tool use: ${card.toolName}` : card.toolName;
 	return (
 		<fieldset
-			ref={ref}
 			// biome-ignore lint/a11y/noNoninteractiveTabindex: the card is the focus target for A / D (spec §2)
 			tabIndex={0}
 			aria-label={`Permission request: ${title}`}
-			onKeyDown={onKeyDown}
+			{...focusMarkerProps('permission-card')}
 			data-permission-card={card.id}
 			data-status={card.status}
 			className={cn(

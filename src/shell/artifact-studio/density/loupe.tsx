@@ -20,7 +20,7 @@ import {
 	TreePine,
 	X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type FocusEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
@@ -28,6 +28,8 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { IconButton } from '@/components/ui/icon-button';
 import { cn } from '@/components/ui/utils';
 import { useFocusTrap } from '@/lib/a11y/focus';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { extractManifestJson } from '@/lib/artifact/manifest-from-file';
 import { writeManifestIntoHtml } from '@/lib/artifact/manifest-write';
 import { routeOutcomeLabel, routePin } from '@/lib/artifact/route-pin';
@@ -175,16 +177,21 @@ export function StudioLoupe({ path, paneId, attachedTerminalId }: StudioLoupePro
 		[path]
 	);
 
-	const onKeyDown = useCallback(
-		(e: React.KeyboardEvent<HTMLDivElement>) => {
-			const isSave = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's';
-			if (isSave) {
-				e.preventDefault();
-				void save();
-			}
-		},
-		[save]
-	);
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from a local ⌘S `onKeyDown` to
+	// the registry `studio.loupe-save` command, scoped by the new `loupeFocus`
+	// key (B-21) marked on the pane root below.
+	//
+	// Fix round 1: `commands.ts` picks the winning *entry* by `when`, but a
+	// command's registered *handler* is a plain stack keyed by command id —
+	// with two loupes open (a split), the last-mounted one always wins ⌘S
+	// regardless of which pane has focus. Register only while this loupe's
+	// root has focus (mirrors `loupeFocus`'s own focus-within read).
+	const [focusWithin, setFocusWithin] = useState(false);
+	const handleFocusWithinCapture = useCallback(() => setFocusWithin(true), []);
+	const handleBlurWithinCapture = useCallback((e: FocusEvent<HTMLDivElement>) => {
+		if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusWithin(false);
+	}, []);
+	useCommands({ 'studio.loupe-save': () => void save() }, { enabled: focusWithin });
 
 	const updateManifest = useCallback(
 		(next: ArtifactManifest, opts: { save?: boolean } = {}) => {
@@ -223,10 +230,12 @@ export function StudioLoupe({ path, paneId, attachedTerminalId }: StudioLoupePro
 	return (
 		<div
 			className="flex h-full w-full flex-col bg-background"
-			onKeyDown={onKeyDown}
+			{...focusMarkerProps('loupe')}
 			data-pane-id={paneId}
 			role="application"
 			aria-label="Artifact Studio"
+			onFocusCapture={handleFocusWithinCapture}
+			onBlurCapture={handleBlurWithinCapture}
 		>
 			<StudioChrome
 				path={path}

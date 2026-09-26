@@ -26,6 +26,8 @@ import {
 } from 'react';
 import './approve-gate-panel.css';
 import { CHANNEL_LABEL, type DraftChannel, type PausedDraft } from '@ikenga/contract';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import {
 	type DeliveryChipState,
 	deliveryChipState,
@@ -310,36 +312,21 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		else if (e.key === 'ArrowRight') setListWidth((w) => (w ?? LIST_W_DEFAULT) + 24);
 	}, []);
 
-	// ── keyboard: ⌘S save · ⌘↵ approve ──────────────────────────
-	// Plain function (not memoized): it calls the un-memoized `save`, so it must re-read each render.
-	const onDetailKeyDown = (e: ReactKeyboardEvent) => {
-		if (!selected) return;
-		const meta = e.metaKey || e.ctrlKey;
-		if (!meta) return;
-		if (e.key === 's') {
-			e.preventDefault();
-			save(selected);
-		} else if (e.key === 'Enter') {
-			e.preventDefault();
-			startApprove(selected);
-		}
-	};
-
-	// ── J/K on the surface (only when focus isn't in a text field) ────────────────────────────────
-	const onSurfaceKeyDown = useCallback(
-		(e: ReactKeyboardEvent) => {
-			const tag = (e.target as HTMLElement)?.tagName;
-			if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-			if (e.key === 'j') {
-				e.preventDefault();
-				move(1); // Next (j = down, vim convention)
-			} else if (e.key === 'k') {
-				e.preventDefault();
-				move(-1); // Previous (k = up, vim convention)
-			}
+	// ── keyboard: ⌘S save · ⌘↵ approve · J/K navigate ──────────────────────
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from local `onKeyDown` handlers
+	// to registry commands scoped by the new `approveGateFocus` key (B-21).
+	// J/K exclude text inputs via `!inputFocus` in the registry `when`
+	// (`defaults.ts`); ⌘S/⌘↵ fire even while editing a field, as before.
+	useCommands({
+		'approve-gate.next': () => move(1), // Next (j = down, vim convention)
+		'approve-gate.prev': () => move(-1), // Previous (k = up, vim convention)
+		'approve-gate.save': () => {
+			if (selected) save(selected);
 		},
-		[move]
-	);
+		'approve-gate.approve': () => {
+			if (selected) startApprove(selected);
+		},
+	});
 
 	const selectedIndex = selected ? flat.findIndex((d) => d.id === selected.id) : -1;
 	const consequence = selected ? consequenceStrings(selected) : null;
@@ -348,7 +335,7 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 		listWidth != null ? ({ '--list-w': `${listWidth}px` } as CSSProperties) : undefined;
 
 	return (
-		<section className="ob-surface" aria-label="Draft approvals" onKeyDown={onSurfaceKeyDown}>
+		<section className="ob-surface" aria-label="Draft approvals" {...focusMarkerProps('approve-gate')}>
 			{health && shouldShowHealthStrip(health) && <DeliveryHealthStrip health={health} />}
 			<div className="ob-split" ref={splitRef} style={splitStyle}>
 				{/* ── Left: draft queue ─────────────────────────────────────────────── */}
@@ -499,8 +486,10 @@ export function ApproveGatePanel(props: ApproveGatePanelProps) {
 				/>
 
 				{/* ── Right: draft editor ─────────────────────────────────────────────── */}
-				{/* biome-ignore lint/a11y/noStaticElementInteractions: editor-scoped ⌘S/⌘↵/⌘K shortcuts */}
-				<div className="ob-detail" onKeyDown={onDetailKeyDown}>
+				{/* Fix round 1: ⌘S / ⌘↵ pre-WP-56 only listened here (`.ob-detail`), not
+				    across the whole section — `approveGateDetailFocus` restores that scope
+				    (defaults.ts); J/K stay section-wide on `approveGateFocus`. */}
+				<div className="ob-detail" {...focusMarkerProps('approve-gate-detail')}>
 					{selected ? (
 						<>
 							<div className="ob-detail-toolbar">
