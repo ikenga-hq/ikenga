@@ -281,7 +281,36 @@ describe('runAction — chi / skill', () => {
 			{ variables: { 'file.path': "/p/it's.ts" } }
 		);
 		expect(outcome).toMatchObject({ status: 'done', kind: 'chi', runId: 'run-1', via: 'chi-run' });
-		expect(mocks.send).toHaveBeenCalledWith({ prompt: "Explain /p/it's.ts", target: 'engine', engineId: 'gemini' });
+		expect(mocks.send).toHaveBeenCalledWith({
+			prompt: "Explain /p/it's.ts",
+			ptyPrompt: "Explain /p/it's.ts",
+			target: 'engine',
+			engineId: 'gemini',
+			scope: 'personal',
+		});
+	});
+
+	it('chi carries its scope and a control-stripped PTY prompt (DEC-55)', async () => {
+		trustStatus = status([]);
+		await runAction(action({ kind: 'chi', target: 'active', prompt: 'Explain {{selection}}' }, 'project'), {
+			variables: { selection: 'a\r\n!rm -rf ~' },
+		});
+		expect(mocks.send).toHaveBeenCalledWith({
+			// A headless run gets the value raw (§8.2)…
+			prompt: 'Explain a\r\n!rm -rf ~',
+			// …a PTY inject only ever the stripped one.
+			ptyPrompt: 'Explain a !rm -rf ~',
+			target: 'active',
+			scope: 'project',
+		});
+	});
+
+	it('a PTY refusal surfaces as a typed reason', async () => {
+		mocks.send.mockRejectedValueOnce(new ChiUnavailableError('bang-prompt', 'refused'));
+		expect(await runAction(action({ kind: 'chi', target: 'active', prompt: '!ls' }))).toMatchObject({
+			status: 'refused',
+			reason: 'bang-prompt',
+		});
 	});
 
 	it('chi test run still sends and shows the run id', async () => {
@@ -306,11 +335,18 @@ describe('runAction — chi / skill', () => {
 			kind: 'skill',
 			runId: 'run-2',
 		});
-		expect(mocks.invokeSkill).toHaveBeenCalledWith({ skill: 'release-status', target: 'active' });
+		expect(mocks.invokeSkill).toHaveBeenCalledWith({ skill: 'release-status', target: 'active', scope: 'personal' });
 		expect(await runAction(action({ kind: 'skill', skill: 'two words' }))).toMatchObject({
 			status: 'refused',
 			reason: 'invalid-skill',
 		});
+	});
+
+	it('a trusted project skill carries scope "project" to the adapter (no PTY inject)', async () => {
+		const run: ActionRun = { kind: 'skill', skill: 'release-status' };
+		trustStatus = status([await trusted('sk', run)]);
+		expect(await runAction(action(run, 'project', 'sk'))).toMatchObject({ status: 'done', kind: 'skill' });
+		expect(mocks.invokeSkill).toHaveBeenCalledWith({ skill: 'release-status', target: 'active', scope: 'project' });
 	});
 });
 

@@ -19,19 +19,43 @@
 //! call app commands can already spawn a PTY), but no runner bug can run a
 //! command other than the one pinned and trusted.
 //!
-//! **Variables never touch the command text (§8.2).** Each value is passed
-//! as an environment variable on the child (`IKENGA_FILE_PATH`,
+//! **Values are never parsed by the launching shell (§8.2).** Each value is
+//! passed as an environment variable on the child (`IKENGA_FILE_PATH`,
 //! `IKENGA_FILE_NAME`, `IKENGA_SELECTION`, `IKENGA_PROJECT_ROOT`,
 //! `IKENGA_PANE_URL`, `IKENGA_BRANCH`) and each `{{var}}` is rewritten to the
 //! shell's own reference to it — POSIX `"${IKENGA_X}"` bare / `${IKENGA_X}`
-//! inside `"…"`, PowerShell `${env:IKENGA_X}` — so the shell expands the
-//! value and never re-parses it: `$(…)`, backticks, `;`, quotes and newlines
-//! in a value are inert. The template's quote state is tracked while
-//! scanning (POSIX `'` `"` `\`; PowerShell `'` `"` and backtick, typographic
-//! quotes included): inside single quotes no reference expands, so a
-//! variable there is refused (`variable-in-single-quotes`), as is one right
-//! after an escape character (`variable-after-escape`). A mis-tracked quote
-//! can only make a reference literal or unquoted — never execute a value.
+//! inside `"…"`, PowerShell `${env:IKENGA_X}` — so the shell Rust launches
+//! expands the value and never re-parses it: `$(…)`, backticks, `;`, quotes
+//! and newlines in a value are inert to it. The template's quote state is
+//! tracked while scanning (POSIX `'` `"` `\`; PowerShell `'` `"` and
+//! backtick, typographic quotes included): inside single quotes no
+//! reference expands, so a variable there is refused
+//! (`variable-in-single-quotes`), as is one right after an escape character
+//! (`variable-after-escape`). A mis-tracked quote can only make a reference
+//! literal or unquoted — never execute a value in the launching shell.
+//!
+//! That guarantee stops at the launching shell. A template that hands the
+//! value to a second parser — `eval`, `sh -c "…"`, `cmd /c …`,
+//! `ssh host …`, a script that splices its argument into a command — is the
+//! author's responsibility; the trust sheet shows the exact command text
+//! before a project action is trusted.
+//!
+//! **Windows re-parses by default.** PowerShell 5.1 passes a native
+//! argument without escaping an embedded `"`, and when the command resolves
+//! to a `.cmd`/`.bat` shim (npm, pnpm, yarn, `code`, any `cmd /c …`)
+//! `cmd.exe` re-parses the whole line — so a file named `x&calc&.js` would
+//! run `calc` (the BatBadBut class). On Windows, therefore, only the
+//! variables the command names are set (the rest are `""`, so a batch file
+//! reading `%IKENGA_…%` cannot pick one up), and a run is refused
+//! (`unsafe-value-for-windows`, naming the variable, never the value) when a
+//! named value holds any of `"` `&` `|` `<` `>` `^` `%` `!`, CR, LF or NUL.
+//! On POSIX only a NUL is refused (`invalid-variable`); values stay
+//! env-only.
+//!
+//! **`project.root` is pinned for project runs.** For `scope: "project"`
+//! the value (and so the default `cwd`) is the trust status's own project
+//! root; the caller's `project.root` is ignored.
+//!
 //! `cwd` is not a shell context: its values are substituted directly, and a
 //! NUL or newline in the result is refused.
 //!
@@ -114,7 +138,7 @@ pub struct ActionExecResult {
     /// `changed`, `trust-unavailable`, `unavailable`, `not-found`,
     /// `not-shell`, `unknown-scope`, `unknown-variable`,
     /// `variable-in-single-quotes`, `variable-after-escape`,
-    /// `invalid-variable`, `invalid-cwd`).
+    /// `invalid-variable`, `unsafe-value-for-windows`, `invalid-cwd`).
     pub refusal: Option<String>,
 }
 
@@ -452,6 +476,62 @@ pub fn variable_env(
         .collect()
 }
 
+/// Characters `cmd.exe` re-parses when PowerShell hands a `.cmd`/`.bat`
+/// target the line (see the module note), plus CR, LF and NUL.
+pub const WINDOWS_UNSAFE_CHARS: [char; 11] =
+    ['"', '&', '|', '<', '>', '^', '%', '!', '\r', '\n', '\0'];
+
+/// The Windows environment for `template` (module note): a variable the
+/// command does not name is passed as `""`; a named one whose value holds a
+/// `WINDOWS_UNSAFE_CHARS` character refuses the run with
+/// `unsafe-value-for-windows`, naming the variable and never the value.
+pub fn windows_env(
+    template: &str,
+    env: Vec<(&'static str, String)>,
+) -> Result<Vec<(&'static str, String)>, Refusal> {
+    let (parts, _) = segments(template);
+    let named: Vec<&'static str> = parts
+        .iter()
+        .filter_map(|(_, name)| env_name(name))
+        .collect();
+    env.into_iter()
+        .map(|(key, value)| {
+            if !named.contains(&key) {
+                return Ok((key, String::new()));
+            }
+            if value.chars().any(|c| WINDOWS_UNSAFE_CHARS.contains(&c)) {
+                let name = RUN_VARIABLES
+                    .iter()
+                    .find(|(_, env)| *env == key)
+                    .map(|(name, _)| *name)
+                    .unwrap_or(key);
+                return Err(Refusal::new(
+                    "unsafe-value-for-windows",
+                    format!(
+                        "`{{{{{name}}}}}` holds a character cmd.exe would re-parse \
+                         (\" & | < > ^ % ! or a line break); on Windows such a value \
+                         is refused"
+                    ),
+                ));
+            }
+            Ok((key, value))
+        })
+        .collect()
+}
+
+/// The variables a run executes with: for a project run `project.root` is
+/// the trust status's own root (`pinned_root`), whatever the caller sent.
+pub fn with_pinned_root(
+    variables: &HashMap<String, String>,
+    pinned_root: Option<&str>,
+) -> HashMap<String, String> {
+    let mut out = variables.clone();
+    if let Some(root) = pinned_root {
+        out.insert("project.root".to_string(), root.to_string());
+    }
+    out
+}
+
 /// Interpolates the `cwd` template. It never reaches a shell (only
 /// `current_dir`), so values are substituted directly; a NUL or newline in
 /// the result is refused. `None` = the home directory.
@@ -639,6 +719,10 @@ pub async fn exec(
     let flavor = ShellFlavor::host();
     let prepared = rewrite_command(&run.command, flavor).and_then(|command| {
         let env = variable_env(variables)?;
+        let env = match flavor {
+            ShellFlavor::PowerShell => windows_env(&run.command, env)?,
+            ShellFlavor::Posix => env,
+        };
         let cwd = interpolate_cwd(run.cwd.as_deref(), variables)?;
         Ok((command, env, cwd))
     });
@@ -702,11 +786,12 @@ pub async fn exec(
     result
 }
 
-/// Loads the pinned run for `request` (see the module note).
+/// Loads the pinned run for `request` (see the module note), plus — for a
+/// project run — the trust status's own project root.
 async fn load_pinned(
     manager: &ActionsManager,
     request: &ActionExecRequest,
-) -> Result<PinnedShellRun, Refusal> {
+) -> Result<(PinnedShellRun, Option<String>), Refusal> {
     match request.scope.as_str() {
         "project" => {
             let status = manager
@@ -718,7 +803,9 @@ async fn load_pinned(
                         format!("project trust could not be read: {e}"),
                     )
                 })?;
-            check_project_shell_trust(&status.actions, &request.action_id, &request.run_hash)
+            let run =
+                check_project_shell_trust(&status.actions, &request.action_id, &request.run_hash)?;
+            Ok((run, Some(status.project_root)))
         }
         "personal" => {
             let files = manager
@@ -730,11 +817,12 @@ async fn load_pinned(
                         format!("personal actions could not be read: {e}"),
                     )
                 })?;
-            check_personal_shell(
+            let run = check_personal_shell(
                 files.personal.actions.document.as_ref(),
                 &request.action_id,
                 &request.run_hash,
-            )
+            )?;
+            Ok((run, None))
         }
         other => Err(Refusal::new(
             "unknown-scope",
@@ -751,10 +839,11 @@ pub async fn action_exec(
 ) -> Result<ActionExecResult, String> {
     let manager: &ActionsManager = manager.inner().as_ref();
     let result = match load_pinned(manager, &request).await {
-        Ok(run) => {
+        Ok((run, pinned_root)) => {
+            let variables = with_pinned_root(&request.variables, pinned_root.as_deref());
             exec(
                 &run,
-                &request.variables,
+                &variables,
                 request.timeout_secs,
                 crate::platform::home_dir(),
             )
@@ -996,6 +1085,66 @@ mod tests {
                 .reason,
             "invalid-variable"
         );
+    }
+
+    fn windows_env_for(
+        template: &str,
+        pairs: &[(&str, &str)],
+    ) -> Result<Vec<(&'static str, String)>, Refusal> {
+        windows_env(template, variable_env(&vars(pairs)).unwrap())
+    }
+
+    #[test]
+    fn windows_refuses_cmd_metacharacters_in_named_values() {
+        for hostile in ["x&calc&.js", "a\"b", "%PATH%", "a|b", "a^b", "a!b", "a\r\nb"] {
+            let refusal = windows_env_for("npm run lint {{file.path}}", &[("file.path", hostile)])
+                .unwrap_err();
+            assert_eq!(refusal.reason, "unsafe-value-for-windows", "{hostile:?}");
+            // Names the variable, never the value.
+            assert!(refusal.message.contains("{{file.path}}"));
+            assert!(!refusal.message.contains(hostile));
+        }
+    }
+
+    #[test]
+    fn windows_passes_clean_values_and_blanks_unnamed_ones() {
+        let env = windows_env_for(
+            "npm run lint {{file.path}}",
+            &[
+                ("file.path", "C:\\w\\src\\a b.ts"),
+                // Not named by the command: blanked, so it cannot refuse the run
+                // or reach a batch file's `%IKENGA_SELECTION%`.
+                ("selection", "x&calc"),
+            ],
+        )
+        .unwrap();
+        let get = |key: &str| env.iter().find(|(k, _)| *k == key).unwrap().1.clone();
+        assert_eq!(get("IKENGA_FILE_PATH"), "C:\\w\\src\\a b.ts");
+        assert_eq!(get("IKENGA_SELECTION"), "");
+        assert_eq!(env.len(), RUN_VARIABLES.len());
+    }
+
+    #[test]
+    fn posix_refuses_nul_only() {
+        let env = variable_env(&vars(&[("file.path", "x&calc&\"%PATH%\n!")])).unwrap();
+        assert_eq!(
+            env.iter().find(|(k, _)| *k == "IKENGA_FILE_PATH").unwrap().1,
+            "x&calc&\"%PATH%\n!"
+        );
+        let refusal = variable_env(&vars(&[("selection", "a\0b")])).unwrap_err();
+        assert_eq!(refusal.reason, "invalid-variable");
+    }
+
+    #[test]
+    fn project_root_is_pinned_over_the_caller_value() {
+        let given = vars(&[("project.root", "/evil"), ("file.path", "/w/a")]);
+        let pinned = with_pinned_root(&given, Some("/w"));
+        assert_eq!(pinned["project.root"], "/w");
+        assert_eq!(pinned["file.path"], "/w/a");
+        // The default cwd follows the pinned root.
+        assert_eq!(interpolate_cwd(None, &pinned).unwrap().as_deref(), Some("/w"));
+        // A personal run keeps the caller's value.
+        assert_eq!(with_pinned_root(&given, None)["project.root"], "/evil");
     }
 
     #[test]

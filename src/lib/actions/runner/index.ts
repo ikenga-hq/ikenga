@@ -22,7 +22,7 @@ import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { ActionRun, ActionRunKind, ActionsScope, RunVariable, UserAction } from '../types';
-import { ChiUnavailableError, send as chiSend, type ChiSendResult } from './chi';
+import { ChiUnavailableError, ptySafeVariables, send as chiSend, type ChiSendResult } from './chi';
 import {
 	basename,
 	emptyRunVariables,
@@ -85,6 +85,10 @@ export type RunRefusalReason =
 	| 'no-workflow-runner'
 	| 'no-engine'
 	| 'no-target'
+	/** A PTY inject whose text starts a line with `!` (Claude Code bash mode). */
+	| 'bang-prompt'
+	/** Windows: a value the command names holds a `cmd.exe` metacharacter. */
+	| 'unsafe-value-for-windows'
 	| 'invalid-skill'
 	| 'invalid-route'
 	| 'invalid-url'
@@ -263,6 +267,7 @@ function execRefusal(exec: ActionExecResult, projectId: string | null, actionId:
 		case 'variable-in-single-quotes':
 		case 'variable-after-escape':
 		case 'unknown-variable':
+		case 'unsafe-value-for-windows':
 			return refused('shell', exec.refusal, message);
 		default:
 			return refused('shell', 'exec-refused', message);
@@ -323,11 +328,16 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 
 			case 'chi': {
 				const prompt = interpolate(run.prompt, variables, 'raw');
+				// What a PTY inject types: control characters stripped from each
+				// value before interpolation (`chi.ts` module note).
+				const ptyPrompt = interpolate(run.prompt, ptySafeVariables(variables), 'raw');
 				try {
 					const sent = await chiSend({
 						prompt,
+						ptyPrompt,
 						target: run.target,
 						...(run.engineId ? { engineId: run.engineId } : {}),
+						scope: action.scope,
 					});
 					return { status: 'done', kind: run.kind, testRun, runId: sent.runId, via: sent.via };
 				} catch (err) {
@@ -340,7 +350,7 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 					return refused(run.kind, 'invalid-skill', `“${run.skill}” is not a valid skill name.`);
 				}
 				try {
-					const sent = await runSkill(run);
+					const sent = await runSkill(run, action.scope);
 					return { status: 'done', kind: run.kind, testRun, runId: sent.runId, via: sent.via };
 				} catch (err) {
 					return chiRefusal(run.kind, testRun, err);

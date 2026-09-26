@@ -14,26 +14,47 @@
 // rebind to its `chi_run` shape.
 //
 // A PTY inject has no Chi run behind it, so `runId` is `null` there
-// (`via: 'pty'`). It is only allowed into an AGENT terminal (a `wrap` spec —
-// the same test `resolve-target.ts` uses for its context line): an action
-// run never types into a plain shell, where `text + "\r"` would execute as a
-// command and bypass the DEC-55 gate for an untrusted project `chi` action.
-// A plain-shell active target is refused with `no-target`. The manifest
-// `dispatch` kind and built-in "Hand to Chi" stay fill-only and never come
-// through here.
+// (`via: 'pty'`). A PTY inject is a keystroke stream into a TUI — Claude
+// Code's `!` bash mode runs a leading `!` line as a shell command with no
+// permission prompt, and a wrap tab whose agent has exited is a plain shell
+// (`claude-wrap.ts` falls back to `exec "${SHELL:-bash}" -i`) — so it is
+// held to these rules (DEC-55):
+//
+// - Only a PERSONAL action may inject. A project (or any non-personal)
+//   `chi` / `skill` runs headless only (`chi_run` / `chi_resume`); an
+//   `active` target that resolves to a PTY is unavailable to it
+//   (`no-target`).
+// - Only into an AGENT terminal (a `wrap` spec — the same test
+//   `resolve-target.ts` uses for its context line), never a plain shell,
+//   and not one whose Claude session has ended (`claudeSessionId === null`
+//   after the `SessionEnd` hook; see `agentExited`).
+// - The injected text comes with every C0 control character (bar tab)
+//   stripped from each variable value before interpolation (`ptyPrompt`,
+//   built by the runner with `ptySafeVariables`), and a text whose first
+//   non-space character is `!`, or with a line starting (after spaces) with
+//   `!`, is refused (`bang-prompt`).
+//
+// The manifest `dispatch` kind and built-in "Hand to Chi" stay fill-only
+// and never come through here.
 
 import { chiResume, chiRun, type ChiRunResult } from '@/lib/tauri-cmd';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
 import { useTerminalStore } from '@/terminal/session-store';
-import type { ChiTarget } from '../types';
+import type { ActionsScope, ChiTarget } from '../types';
+import type { RunVariables } from './interpolate';
 
 export interface ChiSendRequest {
-	/** Final text (already interpolated, raw — §8.2). */
+	/** Final text (already interpolated, raw — §8.2); what a headless run gets. */
 	prompt: string;
+	/** The same template interpolated with `ptySafeVariables` — what a PTY
+	 *  inject types. Default: `prompt` (a text with no variables). */
+	ptyPrompt?: string;
 	target: ChiTarget;
 	/** Required iff `target === 'engine'`. */
 	engineId?: string;
+	/** Where the action is defined. Only `personal` may inject into a PTY. */
+	scope: ActionsScope;
 }
 
 export interface ChiSkillRequest {
@@ -42,6 +63,7 @@ export interface ChiSkillRequest {
 	args?: string;
 	target: ChiTarget;
 	engineId?: string;
+	scope: ActionsScope;
 }
 
 export interface ChiSendResult {
@@ -51,10 +73,12 @@ export interface ChiSendResult {
 }
 
 /** Nothing to send to — the typed reason the runner reports. */
-export class ChiUnavailableError extends Error {
-	readonly reason: 'no-engine' | 'no-target';
+export type ChiUnavailableReason = 'no-engine' | 'no-target' | 'bang-prompt';
 
-	constructor(reason: 'no-engine' | 'no-target', message: string) {
+export class ChiUnavailableError extends Error {
+	readonly reason: ChiUnavailableReason;
+
+	constructor(reason: ChiUnavailableReason, message: string) {
 		super(message);
 		this.name = 'ChiUnavailableError';
 		this.reason = reason;
@@ -81,6 +105,62 @@ export function isAgentTerminal(sessionId: string): boolean {
 	return Boolean(tab?.spec.wrap);
 }
 
+/**
+ * Whether the agent in wrap tab `sessionId` has exited, leaving the wrap's
+ * fallback shell. The only signal the terminal store carries is Claude
+ * Code's `SessionEnd` hook, which `single-terminal.tsx` records as
+ * `claudeSessionId: null` (a fresh tab has `undefined` until `SessionStart`
+ * sets the id). Other engines' wraps (gemini, codex, …) send no hook, so
+ * for them this cannot tell — they fall through as live.
+ */
+export function agentExited(sessionId: string): boolean {
+	const tab = useTerminalStore.getState().tabs.find((t) => t.id === sessionId);
+	const wrap = tab?.spec.wrap;
+	if (!tab || !wrap) return false;
+	return (wrap.engine ?? 'claude') === 'claude' && tab.claudeSessionId === null;
+}
+
+/** C0 controls except tab (CR and LF included), plus DEL and C1. */
+function isPtyControl(code: number): boolean {
+	return (code < 0x20 && code !== 0x09) || (code >= 0x7f && code <= 0x9f);
+}
+
+/** A value made safe to type into a TUI (what a PTY inject strips from each
+ *  variable value): a run of line breaks becomes one space, every other
+ *  control character is dropped. */
+export function stripPtyControls(value: string): string {
+	let out = '';
+	for (const ch of value.replace(/[\r\n]+/g, ' ')) {
+		if (!isPtyControl(ch.codePointAt(0) ?? 0)) out += ch;
+	}
+	return out;
+}
+
+/** Every value through `stripPtyControls` — the set a `ptyPrompt` is
+ *  interpolated with (before interpolation, so the template's own line
+ *  breaks survive and are still checked by `isBangPrompt`). */
+export function ptySafeVariables(values: RunVariables): RunVariables {
+	const out = { ...values };
+	for (const name of Object.keys(out) as (keyof RunVariables)[]) out[name] = stripPtyControls(out[name]);
+	return out;
+}
+
+/** Claude Code bash mode: a line whose first non-space character is `!`. */
+const BANG_RE = /(^\s*|[\r\n][ \t]*)!/;
+
+export function isBangPrompt(text: string): boolean {
+	return BANG_RE.test(text);
+}
+
+export const PTY_SCOPE_REASON =
+	'A project action never types into a terminal — set its target to "new" or "engine", or pick a headless Companion target.';
+
+export const AGENT_EXITED_REASON =
+	'The agent in that terminal has exited — its tab is a plain shell now. Pick an agent session or a new run.';
+
+export const BANG_PROMPT_REASON =
+	'The prompt starts a line with "!", which the agent runs as a shell command — refused.';
+
 export const PLAIN_TERMINAL_REASON =
 	'The Companion target is a plain terminal — an action only dispatches to an agent. Pick an agent session or a new run.';
 
@@ -96,15 +176,21 @@ export async function send(request: ChiSendRequest): Promise<ChiSendResult> {
 	switch (resolved.kind) {
 		case 'none':
 			throw new ChiUnavailableError('no-engine', resolved.disabledReason ?? 'No Chi target is available');
-		case 'pty':
-			// DEC-55: never type into a raw shell — only into an agent terminal.
+		case 'pty': {
+			// DEC-55 (module note): personal only, agent terminal only, a live
+			// agent, no control characters from values, no `!` line.
+			if (request.scope !== 'personal') throw new ChiUnavailableError('no-target', PTY_SCOPE_REASON);
 			if (target.kind !== 'session' || !isAgentTerminal(target.session_id)) {
 				throw new ChiUnavailableError('no-target', PLAIN_TERMINAL_REASON);
 			}
+			if (agentExited(target.session_id)) throw new ChiUnavailableError('no-target', AGENT_EXITED_REASON);
+			const text = request.ptyPrompt ?? request.prompt;
+			if (isBangPrompt(text)) throw new ChiUnavailableError('bang-prompt', BANG_PROMPT_REASON);
 			// The dispatch path's own PTY write (context line omitted: the
 			// action's template is the whole message).
-			await resolved.send(request.prompt);
+			await resolved.send(text);
 			return { runId: null, via: 'pty' };
+		}
 		case 'chi-resume': {
 			if (target.kind !== 'session') throw new ChiUnavailableError('no-target', 'No session to resume');
 			return { runId: settled(await chiResume(target.session_id, request.prompt)), via: 'chi-resume' };
@@ -142,9 +228,13 @@ export async function invokeSkill(request: ChiSkillRequest): Promise<ChiSendResu
 	if (!SKILL_NAME_RE.test(request.skill)) {
 		throw new ChiUnavailableError('no-target', `“${request.skill}” is not a valid skill name`);
 	}
+	const prompt = skillPrompt(request.skill, request.args);
 	return send({
-		prompt: skillPrompt(request.skill, request.args),
+		prompt,
+		// `args` is free text: it gets the same PTY treatment as a value.
+		ptyPrompt: skillPrompt(request.skill, request.args === undefined ? undefined : stripPtyControls(request.args)),
 		target: request.target,
 		...(request.engineId ? { engineId: request.engineId } : {}),
+		scope: request.scope,
 	});
 }

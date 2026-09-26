@@ -44,6 +44,7 @@ export type ActionExecRefusal =
 	| 'variable-in-single-quotes'
 	| 'variable-after-escape'
 	| 'invalid-variable'
+	| 'unsafe-value-for-windows'
 	| 'invalid-cwd';
 
 export interface ActionExecResult {
