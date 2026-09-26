@@ -96,8 +96,8 @@ use commands::db::PaDb;
 use commands::screenshot::new_pending as new_screenshot_pending;
 #[cfg(feature = "desktop")]
 use commands::{
-    actions_open_file, actions_read_files, actions_trust_grant, actions_trust_revoke,
-    actions_trust_status, actions_write, keybindings_write,
+    action_exec, action_git_branch, actions_open_file, actions_read_files, actions_trust_grant,
+    actions_trust_revoke, actions_trust_status, actions_write, keybindings_write,
 };
 #[cfg(feature = "desktop")]
 use commands::{
@@ -1227,6 +1227,9 @@ pub fn run() {
             actions_trust_status,
             actions_trust_grant,
             actions_trust_revoke,
+            // action runner — WP-53 `shell` run kind + `{{branch}}`
+            action_exec,
+            action_git_branch,
             // notifications — WP-40 aggregation table (D-07 notification centre)
             notifications_list,
             notifications_unread_count,
