@@ -177,7 +177,9 @@ describe('merge order (DEC-59, §2.1)', () => {
 				projectBindings: [{ key: 'ctrl+alt+x', command: 'os.summon', scope: 'os' }],
 			}),
 		});
-		const os = m.keymap.entries.filter((e) => e.scope === 'os');
+		// The default `os.*` rules (WP-54) are not file rules; only the
+		// personal one of the two file rules survives.
+		const os = m.keymap.entries.filter((e) => e.scope === 'os' && e.source !== 'default');
 		expect(os.map((e) => [e.source, e.key])).toEqual([['personal', 'ctrl+alt+space']]);
 	});
 });
@@ -491,7 +493,9 @@ describe('package key requests (DEC-54, §7.4, §12)', () => {
 			}),
 			packages: [
 				pkgAction({ pkgId: 'com.a', localId: 'r', keyRequest: 'mod+r' }),
-				pkgAction({ pkgId: 'com.b', localId: 'c', keyRequest: 'mod+c' }),
+				// ⌘Z: a native role, bound by no default (⌘C is now the hosted
+				// `terminal.copy` on macOS, WP-54).
+				pkgAction({ pkgId: 'com.b', localId: 'c', keyRequest: 'mod+z' }),
 				pkgAction({ pkgId: 'com.c', localId: 's', keyRequest: 'ctrl+alt+space' }),
 				pkgAction({ pkgId: 'com.d', localId: 'h', keyRequest: 'mod+h' }),
 			],

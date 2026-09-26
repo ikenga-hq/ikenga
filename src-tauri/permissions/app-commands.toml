@@ -176,6 +176,7 @@ commands.allow = [
   "oba_set_auto_update",
   "oba_unlink_one",
   "oba_update",
+  "os_shortcuts_apply",
   "os_username",
   "pa_actions_commit",
   "pa_actions_list",

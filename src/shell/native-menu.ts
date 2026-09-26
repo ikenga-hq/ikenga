@@ -51,6 +51,7 @@
 // was identified (see `tree.tsx`); `Switch Adapter (coming soon)` is left
 // alone because it's a genuine not-yet-built feature, not a bug.
 
+import { menuItemAction } from '@/lib/keymap/commands';
 import { isMac } from '@/lib/platform';
 import { isTauri } from '@/lib/transport';
 import { MENU_TREE, macAccelerator, type MenuDef, type MenuLeaf, type PredefinedKind } from './menu/tree';
@@ -156,7 +157,12 @@ export async function installNativeMenu(): Promise<void> {
 				// A structure-only item (no registry id, no real handler — see
 				// the header comment for the full omitted-vs-added tally) still
 				// renders so the tree matches D-08; it just does nothing on click.
-				action: action ?? (() => {}),
+				// DEC-58 (WP-54): the accelerator stays visible, but one press
+				// reaches the command once — if the key dispatcher already ran
+				// this command for the same press (or runs it right after), the
+				// second path is dropped (`claimSingleFire`), so the registry
+				// stays the one firing path.
+				action: menuItemAction(leaf.commandId, action ?? (() => {})),
 			});
 		}
 

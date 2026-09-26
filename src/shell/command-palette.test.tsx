@@ -1,13 +1,14 @@
 import { act, renderHook } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import { isMacPlatform } from '@/lib/keymap/platform';
 import { useCommandPalette } from './command-palette';
 
-// D3 (real listener, not just the useKey() mechanism): the palette's own
-// ⌘K handler is bespoke rather than routed through `useKey()` (see the
-// header comment in `src/lib/keymap/defaults.ts`) because closing it must
-// bypass the `not-input` guard that opening it observes — the palette's own
-// cmdk search input is itself a typing target. These tests exercise that
-// real listener directly.
+// D3 through the real dispatcher (WP-54): ⌘K is two registry commands with
+// mutually exclusive `when`s — `palette.open` (`!inputFocus && !paletteOpen`)
+// and `palette.close` (`paletteOpen`, G-ACTIONS §4.6) — so opening observes
+// the typing guard while closing still works from the palette's own cmdk
+// search input, which is itself a typing target. `useCommandPalette()`
+// registers both and installs the one window listener these events reach.
 
 function fireKeydown(init: KeyboardEventInit, target: EventTarget) {
 	const event = new KeyboardEvent('keydown', { ...init, cancelable: true, bubbles: true });
@@ -15,9 +16,11 @@ function fireKeydown(init: KeyboardEventInit, target: EventTarget) {
 	return event;
 }
 
-const MOD_K: KeyboardEventInit = { key: 'k', metaKey: true, ctrlKey: true };
+// `mod+k`: ⌘K on macOS, Ctrl+K elsewhere (jsdom is not macOS). The event
+// carries exactly that modifier — the registry matches the exact stroke.
+const MOD_K: KeyboardEventInit = isMacPlatform() ? { key: 'k', metaKey: true } : { key: 'k', ctrlKey: true };
 
-describe('useCommandPalette() — ⌘K listener', () => {
+describe('useCommandPalette() — ⌘K through the dispatcher', () => {
 	it('does not open while typing in an <input>', () => {
 		const { result } = renderHook(() => useCommandPalette());
 		const input = document.createElement('input');

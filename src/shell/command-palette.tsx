@@ -22,7 +22,9 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CommandRow, type CommandRowProps } from '@/components/ui/command-row';
 import { useFocusReturn, useFocusTrap } from '@/lib/a11y/focus';
-import { findEntry, isTypingTarget, labelFor } from '@/lib/keymap/registry';
+import { setPaletteOpen } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
+import { labelFor } from '@/lib/keymap/registry';
 import { eventMatchesCombo, isMacPlatform } from '@/lib/keymap/platform';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -731,15 +733,18 @@ interface PaletteState {
 }
 
 /**
- * Wires ⌘K / Ctrl+K to open the palette in 'all' mode. Other entry
- * points (⌘T views, ⌘P switcher) live in `Workspace` and call
- * `setOpen(true, mode)` on the returned controller.
+ * The palette's open state and its keys. Every palette key is a registry
+ * command (`defaults.ts`) fired by the one key dispatcher (WP-54, DEC-56);
+ * this hook registers what each does while it is mounted and publishes the
+ * open state as the `paletteOpen` context key, which is what lets
+ * `palette.close` / `palette.toggle-shortcuts` fire from inside the palette's
+ * own search input while `palette.open` / `shortcuts.open` stay
+ * `!inputFocus && !paletteOpen` (G-ACTIONS §4.6).
  */
 export function useCommandPalette() {
 	const [state, setState] = useState<PaletteState>({ open: false, mode: 'all' });
-	const navigateFocused = usePaneStore((s) => s.navigateFocused);
-	// Read synchronously inside the keydown handler so the *close* branch
-	// below doesn't depend on a stale closure over `state.open`.
+	// Read synchronously inside command handlers so a toggle never acts on a
+	// stale closure over `state`.
 	const openRef = useRef(state.open);
 	useEffect(() => {
 		openRef.current = state.open;
@@ -748,6 +753,13 @@ export function useCommandPalette() {
 	useEffect(() => {
 		modeRef.current = state.mode;
 	}, [state.mode]);
+
+	// `paletteOpen` (§4.3) — published before paint so the very next key
+	// already resolves against it; cleared when the hook unmounts.
+	useLayoutEffect(() => {
+		setPaletteOpen(state.open);
+	}, [state.open]);
+	useEffect(() => () => setPaletteOpen(false), []);
 
 	// Other frame chrome (title-row project chip, status-bar shortcuts item)
 	// opens the palette through `openCommandPalette()`.
@@ -760,71 +772,41 @@ export function useCommandPalette() {
 		return () => window.removeEventListener(PALETTE_OPEN_EVENT, onOpen);
 	}, []);
 
-	// WP-09 — `?` and `⌘/` open the grouped Shortcuts view (§2, §6A.5).
-	// Registry-driven: the combos come from `shortcuts.open` /
-	// `shortcuts.open-quick`, never a literal here. Both respect `not-input`
-	// for *opening*; like ⌘K, `⌘/` still toggles from inside the palette's own
-	// input once the palette is open (the input is a typing target), and `?`
-	// closes the view when focus is not in its filter field.
-	useEffect(() => {
-		const mac = isMacPlatform();
-		function onKey(e: KeyboardEvent) {
-			const slash = findEntry('shortcuts.open');
-			const quick = findEntry('shortcuts.open-quick');
-			const typing = isTypingTarget(e.target);
-			if (slash && eventMatchesCombo(e, slash.key, mac)) {
-				if (openRef.current) {
-					e.preventDefault();
-					setState({ open: true, mode: modeRef.current === 'shortcuts' ? 'all' : 'shortcuts' });
-				} else if (!typing) {
-					e.preventDefault();
-					setState({ open: true, mode: 'shortcuts' });
-				}
-				return;
-			}
-			if (quick && e.key === quick.key && !e.metaKey && !e.ctrlKey && !e.altKey && !typing) {
-				e.preventDefault();
-				if (openRef.current && modeRef.current === 'shortcuts') {
-					setState({ open: false, mode: 'all' });
-				} else {
-					setState({ open: true, mode: 'shortcuts' });
-				}
-			}
-		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-	}, []);
+	// The palette's commands. `?` (`shortcuts.open-quick`) toggles the
+	// Shortcuts view as shipped; `⌘/` opens it and, once the palette is
+	// open, flips between Shortcuts and All. ⌘T / ⌘P / ⌘⇧P open the other
+	// modes (they used to live in `Workspace`'s listener).
+	useCommands({
+		'palette.open': () => setState({ open: true, mode: 'all' }),
+		'palette.close': () => setState((s) => ({ open: false, mode: s.mode })),
+		'palette.views': () => setState({ open: true, mode: 'views' }),
+		'palette.projects': () => setState({ open: true, mode: 'projects' }),
+		'palette.switcher': () => setState({ open: true, mode: 'switcher' }),
+		'palette.toggle-shortcuts': () =>
+			setState({ open: true, mode: modeRef.current === 'shortcuts' ? 'all' : 'shortcuts' }),
+		'shortcuts.open': () => setState({ open: true, mode: 'shortcuts' }),
+		'shortcuts.open-quick': () => {
+			if (openRef.current && modeRef.current === 'shortcuts') setState({ open: false, mode: 'all' });
+			else setState({ open: true, mode: 'shortcuts' });
+		},
+	});
 
 	// Return focus to the trigger element when the palette closes (Esc, scrim
 	// click, row select). cmdk manages its own internal focus while open but
 	// leaves focus orphaned on the unmounted panel at close (WCAG 2.4.3).
 	useFocusReturn(state.open);
 
+	// Escape closes the open palette — widget-local (§4.6: "Escape stays
+	// widget-local"), not a registry command.
 	useEffect(() => {
+		if (!state.open) return;
+		const mac = isMacPlatform();
 		function onKey(e: KeyboardEvent) {
-			const mod = e.metaKey || e.ctrlKey;
-			const key = e.key.toLowerCase();
-			if (mod && key === 'k') {
-				// `palette.open` (mod+k, not-input) is guarded the same way every
-				// other frame shortcut is (D3): typing in a text field never opens
-				// the palette out from under the caret. But that guard must not
-				// apply to *closing* it — the palette's own cmdk search input is
-				// itself a typing target, and ⌘K has always toggled it closed
-				// from there (spec §2, "⌘K should work as today").
-				if (openRef.current) {
-					e.preventDefault();
-					setState((s) => ({ open: false, mode: s.mode }));
-				} else if (!isTypingTarget(e.target)) {
-					e.preventDefault();
-					setState({ open: true, mode: 'all' });
-				}
-			} else if (e.key === 'Escape') {
-				setState({ open: false, mode: 'all' });
-			}
+			if (eventMatchesCombo(e, 'escape', mac)) setState({ open: false, mode: 'all' });
 		}
 		window.addEventListener('keydown', onKey);
 		return () => window.removeEventListener('keydown', onKey);
-	}, [navigateFocused]);
+	}, [state.open]);
 
 	return {
 		open: state.open,

@@ -143,7 +143,7 @@ export const MENU_TREE: MenuDef[] = [
 			// `menu.new-session` is a pre-existing keymap id whose shipped
 			// action was a `CustomEvent` nothing listens for (see
 			// native-menu.ts header) — fixed here to actually start a session,
-			// the same call `workspace.tsx`'s ⌃⇧T branch makes. Key unchanged.
+			// the same call `workspace.tsx`'s ⌃⇧T branch makes. Unaccelerated since DEC-64.
 			item({
 				id: 'new-session',
 				label: 'New Session',
@@ -310,8 +310,8 @@ export const MENU_TREE: MenuDef[] = [
 			sep,
 			// "Install from folder…" is the closest existing surface to
 			// `ngwa.create` (the in-shell scaffolding wizard) — reused rather
-			// than left unbound. Its ⌘N is a documented parallel-fire with
-			// File → New Session (`knownOverlap`, defaults.ts) on mac already.
+			// than left unbound. ⌘N is `ngwa.create`'s alone (DEC-64: File →
+			// New Session lost it and stays unaccelerated).
 			item({
 				id: 'install-from-folder',
 				label: 'Install from folder…',
