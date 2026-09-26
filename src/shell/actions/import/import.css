@@ -1,0 +1,217 @@
+/* WP-61 — Import surface (D-06 `import` state) own stylesheet.
+   Moved out of the shared `../actions.css` (fix round 1, item 1): every
+   `imp-*` rule below is scoped to this folder alone — nobody else references
+   the `imp-*` prefix — so it has no business living in the file every
+   wave-12e tab shares. Imported once, from `./index.tsx`.
+   Namespaced `imp-*` (not the design mock's bare `srccol`/`diffrow`/…) so a
+   sibling wave-12e tab adding its own footer/list bar to the shared
+   `actions.css` never collides with these on name, only ever on line
+   position. */
+
+.view-acts .imp-root {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+
+.view-acts .imp-wrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+}
+
+.view-acts .imp-srccol {
+	width: 268px;
+	flex: none;
+	border-right: 1px solid var(--border);
+	background: var(--bg-surface);
+	min-height: 0;
+	overflow-y: auto;
+}
+
+.view-acts .imp-srcrow {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+	width: 100%;
+	text-align: left;
+	padding: var(--space-3);
+	border: none;
+	border-bottom: 1px solid var(--border-soft);
+	background: transparent;
+	color: var(--fg);
+	cursor: pointer;
+}
+
+.view-acts .imp-srcrow:hover {
+	background: var(--bg-raised);
+}
+
+.view-acts .imp-srcrow[aria-selected='true'] {
+	background: var(--primary-soft);
+	color: var(--primary);
+	box-shadow: inset 2px 0 0 var(--primary);
+}
+
+.view-acts .imp-srcrow .imp-srclabel {
+	display: block;
+	color: var(--fg);
+}
+
+.view-acts .imp-srcrow[aria-selected='true'] .imp-srclabel {
+	color: var(--primary);
+}
+
+.view-acts .imp-srcrow .imp-srcsub {
+	display: block;
+	margin-top: 2px;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-acts .imp-diffcol {
+	flex: 1 1 0;
+	min-width: 0;
+	min-height: 0;
+	overflow-y: auto;
+	padding: var(--space-3);
+}
+
+.view-acts .imp-subhead {
+	margin: 0 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .imp-lead {
+	margin: 0 0 var(--space-3);
+	font-size: var(--text-caption);
+	color: var(--fg-muted);
+}
+
+.view-acts .imp-row {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+	padding: var(--space-2);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	margin-bottom: var(--space-1);
+	background: var(--bg-surface);
+	font-size: var(--text-caption);
+}
+
+.view-acts .imp-row .imp-sign {
+	font-family: var(--font-mono);
+	font-weight: 600;
+	flex: none;
+	width: 14px;
+	text-align: center;
+}
+
+.view-acts .imp-row.add {
+	border-color: color-mix(in srgb, var(--live) 34%, var(--border-soft));
+}
+
+.view-acts .imp-row.add .imp-sign {
+	color: var(--on-live);
+}
+
+.view-acts .imp-row.skip {
+	opacity: 0.7;
+}
+
+.view-acts .imp-row.skip .imp-sign {
+	color: var(--fg-faint);
+}
+
+.view-acts .imp-row.clash {
+	border-color: color-mix(in srgb, var(--danger) 40%, var(--border-soft));
+}
+
+.view-acts .imp-row.clash .imp-sign {
+	color: var(--on-danger);
+}
+
+.view-acts .imp-row .imp-mid {
+	flex: 1;
+	min-width: 0;
+}
+
+.view-acts .imp-row .imp-title {
+	display: block;
+	color: var(--fg);
+	font-weight: 600;
+}
+
+.view-acts .imp-row .imp-detail {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 2px;
+}
+
+.view-acts .imp-empty {
+	padding: var(--space-4);
+	color: var(--fg-muted);
+	font-size: var(--text-caption);
+	text-align: center;
+}
+
+.view-acts .imp-formfoot {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	padding: var(--space-3) var(--space-4);
+	border-top: 1px solid var(--border);
+	background: var(--bg-surface);
+	flex-wrap: wrap;
+}
+
+.view-acts .imp-hint {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-left: auto;
+	max-width: 52ch;
+	text-align: right;
+	line-height: 1.45;
+}
+
+.view-acts .imp-paste textarea {
+	width: 100%;
+	min-height: 220px;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	background: var(--bg-surface);
+	color: var(--fg);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: var(--space-2);
+	resize: vertical;
+}
+
+.view-acts .imp-paste-actions {
+	display: flex;
+	gap: var(--space-2);
+	margin-top: var(--space-2);
+}
+
+.view-acts .imp-relink {
+	background: none;
+	border: none;
+	padding: 0;
+	color: var(--primary);
+	font-size: inherit;
+	cursor: pointer;
+	text-decoration: underline;
+}
+
+.view-acts .imp-relink:hover {
+	color: var(--primary);
+	opacity: 0.85;
+}
