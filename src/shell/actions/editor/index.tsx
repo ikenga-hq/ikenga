@@ -13,7 +13,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useSearch } from '@tanstack/react-router';
-import { ChevronLeft, FileCode, Keyboard, Lock, ShieldAlert } from 'lucide-react';
+import { ChevronLeft, FileCode, Lock, ShieldAlert, Terminal, X } from 'lucide-react';
 import { EmptyState } from '@/components/states';
 import {
 	ActionsFileNotWritableError,
@@ -23,11 +23,13 @@ import {
 	LowerScopeOverrideError,
 	rebindKey,
 	saveUserAction,
+	type ActionsScope,
 	unbindKey,
 } from '@/lib/actions/store';
 import { actionsTrustStatus, GATED_RUN_KINDS, type ActionTrust } from '@/lib/actions/client';
-import { runAction, type RunOutcome } from '@/lib/actions/runner';
-import { isMacPlatform } from '@/lib/keymap/platform';
+import { gatherRunVariables, runAction, type RunOutcome } from '@/lib/actions/runner';
+import { iykePath } from '@/lib/actions/runner/iyke';
+import { formatKeyLabel, isMacPlatform } from '@/lib/keymap/platform';
 import { tryParseWhen } from '@/lib/keymap/when';
 import { NgwaTrustSheet } from '@/shell/ngwa/ngwa-trust-sheet';
 import { ActionIcon } from '../shared/action-icon';
@@ -35,7 +37,6 @@ import { actionsPathLabel } from '../header';
 import type { ActionsSurfaceProps } from '../types';
 import { ACTION_ICON_CHOICES } from './icons';
 import {
-	buildKeybindingRule,
 	buildUserAction,
 	derivedKeyWhen,
 	effectiveKeyWhen,
@@ -43,6 +44,8 @@ import {
 	findEditorConflict,
 	formFromAction,
 	missingRunField,
+	planKeybindingWrite,
+	PLACEMENT_IDS,
 	runRequiresField,
 	slug,
 	suggestedRestriction,
@@ -57,6 +60,23 @@ import './editor.css';
 function keybindingsPathLabel(scope: 'personal' | 'project', projectRoot: string | null): string {
 	return actionsPathLabel(scope, projectRoot).replace(/actions\.json$/, 'keybindings.json');
 }
+
+/** A Test run of `iyke` `POST` would mutate through the bridge (§8.1: the
+ *  six variables go straight into the request body) — Round 42's decision
+ *  keeps every Test run non-mutating, so this previews the method, route
+ *  and body locally instead of ever calling the runner. `GET` reads, so it
+ *  may run for real; `shell` previews inside the runner itself (already
+ *  `testRun`-aware); `chi` / `skill` send and show the run id; `open` /
+ *  `view` / `workflow` just run. */
+interface IykeTestPreview {
+	status: 'iyke-preview';
+	method: 'POST';
+	route: string;
+	path: string | null;
+	body: Record<string, string>;
+}
+
+type EditorTestOutcome = RunOutcome | IykeTestPreview;
 
 function errorMessage(err: unknown): string {
 	if (
@@ -78,27 +98,43 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 	const refuseEdit = targetAction ? !targetAction.editable : false;
 
 	const [form, setForm] = useState<EditorFormState>(emptyForm);
+	// D-06's own Personal / Project segment (item 1 of the Round-42 review):
+	// the editor's write target, independent of the header's Personal /
+	// Project switch (`scope`, still read once below as the fallback for a
+	// brand-new action). Read and written everywhere a write happens — the
+	// save, the key writes, `PreviewPane`, the file-path labels, the trust
+	// effect — never the header's `scope` directly.
+	const [writeScope, setWriteScope] = useState<ActionsScope>(scope);
 	const [saveError, setSaveError] = useState<string | null>(null);
 	const [savedAt, setSavedAt] = useState<number | null>(null);
 	const [saving, setSaving] = useState(false);
 	const [unbindPending, setUnbindPending] = useState(false);
 	const [unbindError, setUnbindError] = useState<string | null>(null);
 	const [testing, setTesting] = useState(false);
-	const [testResult, setTestResult] = useState<RunOutcome | null>(null);
+	const [testResult, setTestResult] = useState<EditorTestOutcome | null>(null);
 	const [trustEntry, setTrustEntry] = useState<ActionTrust | null>(null);
 	const [trustSheetOpen, setTrustSheetOpen] = useState(false);
 
 	// Loads (or resets) the form when the target action changes — keyed on
 	// its id (a stable primitive), never on the `EffectiveAction` object
 	// itself, which is a new reference on every re-merge and would otherwise
-	// wipe in-progress edits every time the store republishes.
+	// wipe in-progress edits every time the store republishes. `writeScope`'s
+	// initial value is the loaded action's own `source` when it has one
+	// (personal/project — moving scopes is a deliberate re-save, never
+	// silently re-derived from the header once loaded); otherwise the
+	// header's current `scope`, read once here on purpose — flipping the
+	// header switch later must not blow away an in-progress choice.
 	useEffect(() => {
 		if (refuseEdit) return;
 		if (targetAction) {
 			const entry = bindingsFor(targetAction.id)[0] ?? null;
 			setForm(formFromAction(targetAction, entry));
+			setWriteScope(
+				targetAction.source === 'personal' || targetAction.source === 'project' ? targetAction.source : scope
+			);
 		} else if (!actionId) {
 			setForm(emptyForm());
+			setWriteScope(scope);
 		}
 		setSaveError(null);
 		setSavedAt(null);
@@ -122,32 +158,42 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 	);
 
 	const conflict = useMemo(
-		() => findEditorConflict(model.keymap.entries, testId, form, platform),
-		[model.keymap.entries, testId, form, platform]
+		() => findEditorConflict(model.keymap.entries, testId, form, platform, model.keymap.held),
+		[model.keymap.entries, model.keymap.held, testId, form, platform]
 	);
 
 	const whenCheck = tryParseWhen(effectiveKeyWhen(form));
 
-	const duplicateOf =
-		!targetAction && testId ? (model.actionById.get(testId)?.name ?? null) : null;
+	// Gated on `!form.idTouched`, not `!targetAction`: once a save lands,
+	// `handleSave` sets `idTouched` (below) but the deep-link `?action=` in
+	// the URL doesn't change, so `targetAction` stays `undefined` for a
+	// brand-new action even after it exists — a second Save would otherwise
+	// see its own freshly-merged id and refuse itself as a duplicate.
+	const duplicateOf = !form.idTouched && testId ? (model.actionById.get(testId)?.name ?? null) : null;
 
+	// Debounced: `form.id` tracks the live name slug for an untouched (brand
+	// new) action, so typing a name would otherwise fire this network read
+	// on every keystroke.
 	useEffect(() => {
 		let cancelled = false;
-		if (scope !== 'project' || !model.projectId || !form.id || !GATED_RUN_KINDS.includes(form.runType)) {
+		if (writeScope !== 'project' || !model.projectId || !form.id || !GATED_RUN_KINDS.includes(form.runType)) {
 			setTrustEntry(null);
 			return;
 		}
-		actionsTrustStatus(model.projectId)
-			.then((status) => {
-				if (!cancelled) setTrustEntry(status.actions.find((a) => a.id === form.id) ?? null);
-			})
-			.catch(() => {
-				if (!cancelled) setTrustEntry(null);
-			});
+		const timer = setTimeout(() => {
+			actionsTrustStatus(model.projectId)
+				.then((status) => {
+					if (!cancelled) setTrustEntry(status.actions.find((a) => a.id === form.id) ?? null);
+				})
+				.catch(() => {
+					if (!cancelled) setTrustEntry(null);
+				});
+		}, 400);
 		return () => {
 			cancelled = true;
+			clearTimeout(timer);
 		};
-	}, [scope, model, form.id, form.runType]);
+	}, [writeScope, model, form.id, form.runType]);
 
 	function update<K extends keyof EditorFormState>(key: K, value: EditorFormState[K]) {
 		setForm((f) => ({ ...f, [key]: value }));
@@ -180,22 +226,25 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		const finalForm: EditorFormState = { ...form, id: testId, idTouched: true };
 		setSaving(true);
 		try {
-			await saveUserAction(scope, buildUserAction(finalForm, scope));
-			const rule = buildKeybindingRule(finalForm);
-			if (rule) {
+			await saveUserAction(writeScope, buildUserAction(finalForm, writeScope));
+			// The same plan `PreviewPane` renders (`planKeybindingWrite`) decides
+			// which store call happens — the two can never diverge on what's
+			// about to land in `keybindings.json`.
+			const plan = planKeybindingWrite(finalForm, referenceKeyEntry, writeScope);
+			if (plan.action === 'add') {
+				await addKeybinding(writeScope, plan.rules[0]);
+			} else if (plan.action === 'rebind' && referenceKeyEntry) {
 				// Always pass an explicit `when` (never `rule.when`, which is
 				// `undefined` for the "always" default) — `rebindKey` falls back to
 				// the OLD entry's `when` on `undefined`, which would silently keep
 				// a stale restriction instead of clearing it back to "always".
-				if (referenceKeyEntry) {
-					await rebindKey(scope, referenceKeyEntry, rule.key, { when: effectiveKeyWhen(finalForm) });
-				} else {
-					await addKeybinding(scope, rule);
-				}
-			} else if (referenceKeyEntry) {
-				await unbindKey(scope, referenceKeyEntry);
+				await rebindKey(writeScope, referenceKeyEntry, finalForm.key, { when: effectiveKeyWhen(finalForm) });
+			} else if (plan.action === 'unbind' && referenceKeyEntry) {
+				await unbindKey(writeScope, referenceKeyEntry);
 			}
-			setForm(finalForm);
+			// Merge, don't replace: whatever was typed during the two awaits
+			// above stays — only the id/idTouched this save settled are pinned.
+			setForm((f) => ({ ...f, id: finalForm.id, idTouched: true }));
 			setSavedAt(Date.now());
 		} catch (err) {
 			setSaveError(errorMessage(err));
@@ -208,13 +257,25 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		onNavigate('actions', targetAction ? { action: targetAction.id } : undefined);
 	}
 
+	// Round 42's Test-run rule (also in the footer's Test run button title):
+	// `shell` only ever previews (the runner is already `testRun`-aware);
+	// `iyke` `POST` previews here instead, since sending it would mutate;
+	// `iyke` `GET`, `chi`, `skill`, `open` and `workflow` run for real —
+	// testing an agent action means sending it, and nothing else here
+	// mutates through the bridge or touches `actions.json` / `keybindings.json`.
 	async function handleTestRun() {
 		setTestResult(null);
 		setTesting(true);
 		try {
+			const run = buildRunSafe();
+			if (run.kind === 'iyke' && (run.method ?? 'POST') === 'POST') {
+				const body = await gatherRunVariables(run);
+				setTestResult({ status: 'iyke-preview', method: 'POST', route: run.route, path: iykePath(run.route), body });
+				return;
+			}
 			const outcome = await runAction(
-				{ id: testId, name: form.name || testId, run: buildRunSafe(), scope },
-				{ testRun: true, projectId: scope === 'project' ? model.projectId : null }
+				{ id: testId, name: form.name || testId, run, scope: writeScope },
+				{ testRun: true, projectId: writeScope === 'project' ? model.projectId : null }
 			);
 			setTestResult(outcome);
 		} finally {
@@ -226,7 +287,7 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		// `runAction` reads `action.run` verbatim — build it fresh from the
 		// live form so Test run always reflects exactly what's on screen,
 		// saved or not (§8.2: Test run never writes).
-		return buildUserAction(form, scope).run;
+		return buildUserAction(form, writeScope).run;
 	}
 
 	async function handleUnbindOther() {
@@ -234,7 +295,7 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		setUnbindError(null);
 		setUnbindPending(true);
 		try {
-			await unbindKey(scope, conflict.other);
+			await unbindKey(writeScope, conflict.other);
 		} catch (err) {
 			setUnbindError(errorMessage(err));
 		} finally {
@@ -251,7 +312,6 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		return (
 			<div className="edrefuse" data-state="editor">
 				<EmptyState
-					data-state="editor"
 					icon={Lock}
 					heading={`"${targetAction.name}" is a built-in`}
 					body="Built-in and package actions can't be edited here — hide them from a menu, or rebind their key, from the Actions and Keys tabs."
@@ -265,7 +325,6 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		return (
 			<div className="edrefuse" data-state="editor">
 				<EmptyState
-					data-state="editor"
 					icon={FileCode}
 					heading="That action no longer exists"
 					body={`No action with id "${actionId}" is in force. It may have been deleted or reset.`}
@@ -275,8 +334,18 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		);
 	}
 
-	const actionsPath = actionsPathLabel(scope, model.projectRoot);
-	const keybindingsPath = keybindingsPathLabel(scope, model.projectRoot);
+	const actionsPath = actionsPathLabel(writeScope, model.projectRoot);
+	const keybindingsPath = keybindingsPathLabel(writeScope, model.projectRoot);
+	const placementCount = PLACEMENT_IDS.filter((id) => form.placements[id]).length + form.extraPlacements.length;
+	// D-06 item 1: moving an existing action to another scope is a save at
+	// the new scope, not a move — the old file keeps its copy until it's
+	// deleted there.
+	const movingFrom =
+		targetAction &&
+		(targetAction.source === 'personal' || targetAction.source === 'project') &&
+		targetAction.source !== writeScope
+			? targetAction.source
+			: null;
 
 	return (
 		<div className="edroot" data-state="editor">
@@ -365,7 +434,7 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 							openUrl={form.openUrl}
 							onChangeOpenUrl={(v) => update('openUrl', v)}
 						/>
-						{scope === 'project' && GATED_RUN_KINDS.includes(form.runType) && (
+						{writeScope === 'project' && GATED_RUN_KINDS.includes(form.runType) && (
 							<div className="q">
 								<span className="lab">Project trust</span>
 								{trustEntry ? (
@@ -422,52 +491,101 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 
 						<div className="subhead">Scope</div>
 						<div className="q">
-							<span className="hint">
-								<Keyboard className="h-3 w-3" style={{ display: 'inline', verticalAlign: '-2px' }} /> Set from the header's
-								Personal / Project switch above.
-							</span>
-							<div className="field" style={{ marginTop: 'var(--space-2)' }}>
-								<input type="text" readOnly value={scope === 'project' ? 'Project' : 'Personal'} />
+							<div className="seg" role="group" aria-label="Scope">
+								<button
+									type="button"
+									className={writeScope === 'personal' ? 'on' : ''}
+									onClick={() => setWriteScope('personal')}
+								>
+									Personal
+								</button>
+								<button
+									type="button"
+									className={writeScope === 'project' ? 'on' : ''}
+									disabled={!model.projectRoot}
+									onClick={() => setWriteScope('project')}
+								>
+									Project
+								</button>
 							</div>
 							<span className="hint" style={{ display: 'block', marginTop: 'var(--space-2)' }}>
 								Writes to <span className="mono">{actionsPath}</span>
-								{scope === 'project' ? ' — committed, so your team gets it too.' : ' — this machine, every project.'}
+								{writeScope === 'project' ? ' — committed, so your team gets it too.' : ' — this machine, every project.'}
 							</span>
+							{movingFrom && (
+								<span className="hint" style={{ display: 'block', marginTop: 'var(--space-2)' }} role="alert">
+									Saving here creates a copy at {writeScope === 'project' ? 'Project' : 'Personal'} scope — the{' '}
+									{movingFrom === 'project' ? 'Project' : 'Personal'} copy at{' '}
+									<span className="mono">{actionsPathLabel(movingFrom, model.projectRoot)}</span> stays until you
+									delete it there.
+								</span>
+							)}
 						</div>
 					</div>
 				</div>
 			</div>
 
 			<div className="edside">
-				<PreviewPane form={form} model={model} scope={scope} actionsPath={actionsPath} keybindingsPath={keybindingsPath} />
+				<PreviewPane
+					form={form}
+					model={model}
+					scope={writeScope}
+					referenceKeyEntry={referenceKeyEntry}
+					actionsPath={actionsPath}
+					keybindingsPath={keybindingsPath}
+				/>
 			</div>
 			</div>
 
 			{testResult && (
-				<div className={`testresult tr-${testResult.status}`} role={testResult.status === 'failed' || testResult.status === 'refused' ? 'alert' : 'status'}>
-					{testResult.status === 'preview' && (
-						<>
-							Not run — <span className="mono">{testResult.command}</span> in{' '}
-							<span className="mono">{testResult.cwd ?? '~'}</span>
-							{testResult.confirm ? ' (would ask to confirm first)' : ''}
-						</>
-					)}
-					{testResult.status === 'done' && (
-						<>
-							Ran{testResult.runId ? ` · run ${testResult.runId}` : ''}
-							{testResult.exec ? ` · exit ${testResult.exec.exitCode ?? 0}` : ''}
-						</>
-					)}
-					{testResult.status === 'failed' && <>Failed — {testResult.message}</>}
-					{testResult.status === 'refused' && (
-						<>
-							Refused — {testResult.message}
-							{testResult.trustSheet && (
-								<button type="button" className="btn" style={{ marginLeft: 'var(--space-2)' }} onClick={() => setTrustSheetOpen(true)}>
-									Trust this project…
-								</button>
-							)}
-						</>
+				<div className="eddrawer" role="region" aria-label="Test run output">
+					<header>
+						<Terminal className="h-3 w-3" />
+						<span>Test run</span>
+						<span className="nm2">{form.name || testId}</span>
+						<button type="button" aria-label="Close output" onClick={() => setTestResult(null)}>
+							<X className="h-3 w-3" />
+						</button>
+					</header>
+					<pre role={testResult.status === 'failed' || testResult.status === 'refused' ? 'alert' : 'status'}>
+						{testResult.status === 'preview' && (
+							<>
+								Not run — <b>{testResult.command}</b> in <b>{testResult.cwd ?? '~'}</b>
+								{testResult.confirm ? ' (would ask to confirm first)' : ''}
+								{'\n\n'}note a test run never writes actions.json.
+							</>
+						)}
+						{testResult.status === 'iyke-preview' && (
+							<>
+								Not sent — <b>{testResult.method}</b> <b>{testResult.path ?? testResult.route}</b>
+								{'\n'}body {JSON.stringify(testResult.body)}
+								{'\n\n'}note a test run never writes actions.json or keybindings.json — a POST route mutates, so it only
+								previews here.
+							</>
+						)}
+						{testResult.status === 'done' && (
+							<>
+								Ran{testResult.runId ? ` · run ${testResult.runId}` : ''}
+								{testResult.exec ? ` · exit ${testResult.exec.exitCode ?? 0}` : ''}
+							</>
+						)}
+						{testResult.status === 'failed' && (
+							<>
+								<span className="e">Failed</span> — {testResult.message}
+							</>
+						)}
+						{testResult.status === 'refused' && (
+							<>
+								<span className="e">Refused</span> — {testResult.message}
+							</>
+						)}
+					</pre>
+					{testResult.status === 'refused' && testResult.trustSheet && (
+						<div className="acts" style={{ padding: '0 var(--space-3) var(--space-2)' }}>
+							<button type="button" className="btn" onClick={() => setTrustSheetOpen(true)}>
+								Trust this project…
+							</button>
+						</div>
 					)}
 				</div>
 			)}
@@ -482,16 +600,28 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 				<button type="button" className="btn primary lg" disabled={saving} onClick={() => void handleSave()}>
 					Save action
 				</button>
-				<button type="button" className="btn lg" disabled={testing} onClick={() => void handleTestRun()}>
+				{savedAt && (
+					<span className="hint" style={{ color: 'var(--success)' }}>
+						Saved to {actionsPath}
+						{form.key ? ` and ${keybindingsPath}` : ''}.
+					</span>
+				)}
+				<button
+					type="button"
+					className="btn lg"
+					disabled={testing}
+					title="Test run never writes actions.json or keybindings.json: shell only previews, iyke POST previews here, and iyke GET / chi / skill / open / workflow run for real."
+					onClick={() => void handleTestRun()}
+				>
 					Test run
 				</button>
 				<button type="button" className="btn lg ghost" onClick={handleCancel}>
 					<ChevronLeft className="h-3 w-3" /> Cancel
 				</button>
 				<span className="hintline">
-					{savedAt
-						? `Saved to ${actionsPath}${form.key ? ` and ${keybindingsPath}` : ''}.`
-						: 'Test run never writes actions.json or keybindings.json. It sends chi, runs iyke/skill for real, and only previews shell without running it.'}
+					Scope <b className="mono">{writeScope === 'project' ? 'Project' : 'Personal'}</b> · {placementCount} placement
+					{placementCount === 1 ? '' : 's'} ·{' '}
+					{form.key ? `key ${formatKeyLabel(form.key, { mac: platform === 'mac' })}` : 'no key'}
 				</span>
 			</div>
 
@@ -501,7 +631,7 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 					onOpenChange={setTrustSheetOpen}
 					item={null}
 					mode="project-actions"
-					projectActions={{ projectId: scope === 'project' ? model.projectId : null, actionIds: [testId] }}
+					projectActions={{ projectId: writeScope === 'project' ? model.projectId : null, actionIds: [testId] }}
 					onApproved={() => setTrustSheetOpen(false)}
 				/>
 			)}

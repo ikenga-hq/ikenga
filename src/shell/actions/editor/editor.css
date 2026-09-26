@@ -25,6 +25,101 @@
 	min-height: 0;
 	display: flex;
 	flex-direction: column;
+	position: relative;
+}
+
+/* The Test run output drawer (D-06 `.drawer`, `actions.html:1270-1290`) —
+   conformance item 6: Test run's outcome is a drawer over the pane, never
+   the inline `.testresult` line the pre-review build showed. Absolutely
+   positioned against `.edroot` (`position: relative` above), same as D-06's
+   own `.drawer` against `.win`. */
+.view-acts .eddrawer {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	z-index: 8;
+	max-height: 45%;
+	background: var(--bg-sunken);
+	border-top: 1px solid var(--border-strong);
+	box-shadow: var(--shadow-3);
+	display: flex;
+	flex-direction: column;
+	animation: eddrawerin var(--motion-base) var(--ease-calm);
+}
+
+@keyframes eddrawerin {
+	from {
+		transform: translateY(12px);
+		opacity: 0;
+	}
+	to {
+		transform: none;
+		opacity: 1;
+	}
+}
+
+.view-acts .eddrawer header {
+	height: 26px;
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-micro);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .eddrawer header .nm2 {
+	font-family: var(--font-mono);
+	letter-spacing: 0;
+	text-transform: none;
+	color: var(--fg-muted);
+}
+
+.view-acts .eddrawer header button {
+	margin-left: auto;
+	width: 20px;
+	height: 20px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border: none;
+	background: transparent;
+	color: var(--fg-muted);
+	cursor: pointer;
+	border-radius: var(--radius-sm);
+}
+
+.view-acts .eddrawer header button:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .eddrawer pre {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	margin: 0;
+	padding: var(--space-2) var(--space-3);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	line-height: 1.7;
+	color: var(--fg-muted);
+	white-space: pre-wrap;
+}
+
+.view-acts .eddrawer pre b {
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.view-acts .eddrawer pre .e {
+	color: var(--danger);
+	font-weight: 500;
 }
 
 /* D-06 does not special-case a narrow pane for the editor split (its own
@@ -364,7 +459,8 @@
 	font-weight: 600;
 }
 
-.view-acts .conflictbox .acts {
+.view-acts .conflictbox .acts,
+.view-acts .eddrawer .acts {
 	display: flex;
 	gap: var(--space-2);
 	margin-top: var(--space-2);

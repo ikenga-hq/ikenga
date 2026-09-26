@@ -19,8 +19,14 @@ import type {
 	Placement,
 	UserAction,
 } from '@/lib/actions/client';
-import type { ActionsScope, EffectiveAction, EffectiveKeymapEntry } from '@/lib/actions/store';
+import type {
+	ActionsScope,
+	EffectiveAction,
+	EffectiveKeymapEntry,
+	HeldKeybinding,
+} from '@/lib/actions/store';
 import { conflicts, type KeymapPlatform } from '@/lib/keymap/registry';
+import { normalizeWhen } from '@/lib/keymap/when';
 
 /** `EffectiveKeymapEntry` is `KeymapEntry` (`registry.ts`'s G-ACTIONS-API
  *  alias) — named locally so this file reads in keymap terms. */
@@ -151,6 +157,11 @@ export interface EditorFormState {
 	filesGlob: string;
 	sectionId: string;
 	nativeTop: string;
+	/** Placements from the loaded action this editor can't fully model — an
+	 *  id outside the frozen ten, or a `files` entry whose `when` isn't the
+	 *  one glob shape it derives from `filesGlob` — carried through verbatim
+	 *  on re-save instead of silently dropped (conformance §1.3/§8). */
+	extraPlacements: Placement[];
 
 	/** Canonical form (`@/lib/keymap/platform`), or `''` for unbound. */
 	key: string;
@@ -193,6 +204,7 @@ export function emptyForm(): EditorFormState {
 		filesGlob: '',
 		sectionId: 'automations',
 		nativeTop: 'file',
+		extraPlacements: [],
 		key: '',
 		whenTouched: false,
 		whenValue: 'always',
@@ -215,6 +227,28 @@ function applyPlacement(form: EditorFormState, at: string): void {
 	if ((PLACEMENT_IDS as readonly string[]).includes(at)) {
 		form.placements[at as PlacementId] = true;
 	}
+}
+
+/** Whether `placement` is exactly the shape this editor can round-trip
+ *  through its own fields — a bare `{ at }` for any known id, or `files`
+ *  with a `when` of precisely `resource =~ '<glob>'` (nothing else, no
+ *  extra clause) for the one glob field. Anything else — an id outside the
+ *  frozen ten, or a `files` `when` this form can't rebuild byte-for-byte —
+ *  is not, and is kept in `extraPlacements` instead of being reshaped (or
+ *  silently dropped) by `buildPlacements`. */
+const FILES_GLOB_WHEN = /^resource\s*=~\s*'([^']*)'$/;
+
+function isRoundTrippablePlacement(placement: Placement): boolean {
+	const known =
+		(PLACEMENT_IDS as readonly string[]).includes(placement.at) ||
+		placement.at.startsWith('section/') ||
+		placement.at.startsWith('native/');
+	if (!known) return false;
+	const keys = Object.keys(placement);
+	if (placement.at === 'files' && typeof placement.when === 'string') {
+		return keys.length === 2 && FILES_GLOB_WHEN.test(placement.when);
+	}
+	return keys.length === 1 && keys[0] === 'at';
 }
 
 /** Loads an existing personal/project action (and its current key, if any)
@@ -252,9 +286,13 @@ export function formFromAction(action: EffectiveAction, keyEntry: KeymapEntry | 
 	}
 
 	for (const placement of action.userAction?.placements ?? action.placements) {
+		if (!isRoundTrippablePlacement(placement)) {
+			form.extraPlacements.push(placement);
+			continue;
+		}
 		applyPlacement(form, placement.at);
 		if (placement.at === 'files' && typeof placement.when === 'string') {
-			const m = placement.when.match(/=~\s*'([^']*)'/);
+			const m = placement.when.match(FILES_GLOB_WHEN);
 			if (m) form.filesGlob = m[1];
 		}
 	}
@@ -314,6 +352,9 @@ export function buildPlacements(form: EditorFormState): Placement[] {
 			out.push({ at });
 		}
 	}
+	// Whatever this form can't model — an unknown id, or a `files` `when`
+	// that isn't the one glob shape — round-trips verbatim (§1.3/§8).
+	out.push(...form.extraPlacements);
 	return out;
 }
 
@@ -348,6 +389,78 @@ export function buildKeybindingRule(form: EditorFormState): KeybindingRule | nul
 	if (!form.key) return null;
 	const when = effectiveKeyWhen(form);
 	return { key: form.key, command: form.id, ...(when !== 'always' ? { when } : {}) };
+}
+
+// ─── What Save actually writes to keybindings.json (§1.5, §11) ─────────────
+//
+// `rebindKey` / `unbindKey` (`@/lib/actions/store`) edit the reference
+// entry's own rule in place when it's already `scope`'s, or otherwise append
+// one negative rule for the old key plus one positive rule for the new one.
+// `planKeybindingWrite` is the one place that works out which of those
+// happens and what the stored `when` normalizes to (omitted for "always",
+// same as `store.ts`'s own `storedWhen`) — `index.tsx`'s Save and
+// `PreviewPane`'s "It writes" box both read it, so a save can never write
+// something the preview didn't just show.
+
+/** The `when` a writer stores for a rule: omitted for "always" (§1.5) —
+ *  mirrors `store.ts`'s own `storedWhen`, which this file can't import
+ *  (it's not part of the frozen G-ACTIONS-API surface), so the two are kept
+ *  in sync by hand against the same contract section. */
+function storedWhenFor(when: string | undefined): string | undefined {
+	try {
+		const normalized = normalizeWhen(when);
+		return normalized ? normalized : undefined;
+	} catch {
+		return when || undefined;
+	}
+}
+
+/** The negative rule that removes exactly `entry`, same shape as `store.ts`'s
+ *  `negativeFor` (§1.5): the old key, `-command`, the entry's own `when` /
+ *  `scope` / `platform` carried over untouched. */
+function negativeRuleFor(entry: KeymapEntry): KeybindingRule {
+	const when = storedWhenFor(entry.when);
+	return {
+		key: entry.key,
+		command: `-${entry.command}`,
+		...(when ? { when } : {}),
+		...(entry.scope === 'os' ? { scope: 'os' as const } : {}),
+		...(entry.platformOnly ? { platform: entry.platformOnly } : {}),
+	};
+}
+
+export interface KeybindingWritePlan {
+	/** What `index.tsx`'s Save should call: nothing, `addKeybinding`,
+	 *  `rebindKey`, or `unbindKey`. */
+	action: 'none' | 'add' | 'rebind' | 'unbind';
+	/** The rule(s) that land in `keybindings.json` — zero (a same-scope
+	 *  unbind, or nothing to do), one (a fresh bind, or an in-place edit),
+	 *  or two (a cross-scope rebind/unbind: the negative for the old key,
+	 *  then the positive for the new one, in write order, §1.5). */
+	rules: KeybindingRule[];
+}
+
+/**
+ * Predicts exactly what saving `form` at `scope` does to `keybindings.json`,
+ * given the reference entry (`bindingsFor(form.id)[0]`, any scope) that
+ * `rebindKey` / `unbindKey` would edit or displace.
+ */
+export function planKeybindingWrite(
+	form: EditorFormState,
+	referenceKeyEntry: KeymapEntry | null,
+	scope: ActionsScope
+): KeybindingWritePlan {
+	const ownAtScope = referenceKeyEntry?.origin?.scope === scope;
+	if (!form.key) {
+		if (!referenceKeyEntry) return { action: 'none', rules: [] };
+		if (ownAtScope) return { action: 'unbind', rules: [] };
+		return { action: 'unbind', rules: [negativeRuleFor(referenceKeyEntry)] };
+	}
+	const when = storedWhenFor(effectiveKeyWhen(form));
+	const rule: KeybindingRule = { key: form.key, command: form.id, ...(when ? { when } : {}) };
+	if (!referenceKeyEntry) return { action: 'add', rules: [rule] };
+	if (ownAtScope) return { action: 'rebind', rules: [rule] };
+	return { action: 'rebind', rules: [negativeRuleFor(referenceKeyEntry), rule] };
 }
 
 // ─── Required-field validation (the server re-validates; this is only the
@@ -399,18 +512,37 @@ export interface EditorConflict {
 	other: KeymapEntry;
 }
 
+/** DEC-65's held project rules (`model.keymap.held`) sit outside `entries`
+ *  and outside `conflicts()` until the project is trusted — but the key they
+ *  ask for is still spoken for: recorder that key today and the same clash
+ *  appears the moment they're trusted. Negative rules (`-command`) claim
+ *  nothing, so only the positive ones are turned into synthetic entries. */
+function heldConflictEntries(held: readonly HeldKeybinding[]): KeymapEntry[] {
+	return held
+		.filter((h) => !h.rule.command.startsWith('-'))
+		.map((h) => ({
+			command: h.rule.command,
+			key: h.rule.key,
+			when: h.rule.when ?? 'always',
+			source: 'project',
+			label: h.rule.command,
+		}));
+}
+
 /**
  * Whether saving `form`'s key (at `platform`) would clash with something
  * else in the effective keymap, per the one DEC-59 rule — reuses
  * `conflicts()` (`@/lib/keymap/registry`) rather than re-deriving the rule,
  * so this can never drift from what `conflicts()` reports elsewhere (the
- * Keys tab, `resolveKeypress`).
+ * Keys tab, `resolveKeypress`). `held` (DEC-65) is checked too, so a
+ * project's not-yet-trusted rule for the same key still surfaces here.
  */
 export function findEditorConflict(
 	entries: readonly KeymapEntry[],
 	actionId: string,
 	form: EditorFormState,
-	platform: KeymapPlatform
+	platform: KeymapPlatform,
+	held: readonly HeldKeybinding[] = []
 ): EditorConflict | null {
 	if (!form.key) return null;
 	// Drop this action's own existing binding(s) first — comparing the draft
@@ -423,7 +555,7 @@ export function findEditorConflict(
 		source: 'personal',
 		label: form.name || actionId,
 	};
-	const result = conflicts({ entries: [...base, draft], platform });
+	const result = conflicts({ entries: [...base, ...heldConflictEntries(held), draft], platform });
 	const hit = result.clashes.find((pair) => pair.a.command === actionId || pair.b.command === actionId);
 	if (!hit) return null;
 	return { other: hit.a.command === actionId ? hit.b : hit.a };

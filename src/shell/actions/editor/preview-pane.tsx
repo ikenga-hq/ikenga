@@ -4,15 +4,15 @@
 // no `"key"` inside the action, `command` is the bare id not `action:<id>`,
 // `keybindings.json`'s top level is `{ bindings: [...] }` not a bare array).
 
-import type { ActionsScope, EffectiveModel } from '@/lib/actions/store';
+import type { ActionsScope, EffectiveKeymapEntry, EffectiveModel } from '@/lib/actions/store';
 import { ActionIcon } from '../shared/action-icon';
 import { Kbd } from '../shared/kbd';
 import { JsonPreview } from '../shared/json-preview';
 import { menuLabel } from '../shared/menu-label';
 import {
-	buildKeybindingRule,
 	buildUserAction,
 	menuIdForPlacement,
+	planKeybindingWrite,
 	PLACEMENT_IDS,
 	type EditorFormState,
 } from './form-model';
@@ -21,11 +21,15 @@ export interface PreviewPaneProps {
 	form: EditorFormState;
 	model: EffectiveModel;
 	scope: ActionsScope;
+	/** `bindingsFor(form.id)[0]` — the same reference `index.tsx`'s Save
+	 *  passes to `rebindKey` / `unbindKey`, so `planKeybindingWrite` here
+	 *  predicts exactly what that save will do. */
+	referenceKeyEntry: EffectiveKeymapEntry | null;
 	actionsPath: string;
 	keybindingsPath: string;
 }
 
-export function PreviewPane({ form, model, scope, actionsPath, keybindingsPath }: PreviewPaneProps) {
+export function PreviewPane({ form, model, scope, referenceKeyEntry, actionsPath, keybindingsPath }: PreviewPaneProps) {
 	const draftId = form.id || 'untitled';
 	const checkedIds = PLACEMENT_IDS.filter((id) => form.placements[id]);
 	const previewMenuId = checkedIds
@@ -33,7 +37,9 @@ export function PreviewPane({ form, model, scope, actionsPath, keybindingsPath }
 		.find((menuId) => model.menus.get(menuId) !== null);
 
 	const menu = previewMenuId ? model.menus.get(previewMenuId) : null;
-	const rule = buildKeybindingRule(form);
+	// What Save will actually write (§1.5, §11) — never re-derived
+	// separately, so this preview and the save path can't disagree (item 3).
+	const plan = planKeybindingWrite(form, referenceKeyEntry, scope);
 	const actionJson = buildUserAction(form, scope);
 
 	return (
@@ -42,17 +48,19 @@ export function PreviewPane({ form, model, scope, actionsPath, keybindingsPath }
 			<div className="menupreview" style={{ borderTop: 0, borderRadius: 'var(--radius-md)' }}>
 				{menu ? (
 					<div className="menu inline" role="presentation">
-						{menu.items.map((item, i) =>
-							item.kind === 'separator' ? (
-								// biome-ignore lint/suspicious/noArrayIndexKey: a static default-order list never reorders
-								<div key={i} className="msep" />
-							) : (
-								<div key={item.id} className="mitem">
-									<ActionIcon icon={item.action.icon} className="h-3.5 w-3.5" />
-									<span>{item.action.name}</span>
-								</div>
-							)
-						)}
+						{menu.items
+							.filter((item) => item.kind === 'separator' || item.action.id !== form.id)
+							.map((item, i) =>
+								item.kind === 'separator' ? (
+									// biome-ignore lint/suspicious/noArrayIndexKey: a static default-order list never reorders
+									<div key={i} className="msep" />
+								) : (
+									<div key={item.id} className="mitem">
+										<ActionIcon icon={item.action.icon} className="h-3.5 w-3.5" />
+										<span>{item.action.name}</span>
+									</div>
+								)
+							)}
 						<div className="mitem isnew">
 							<ActionIcon icon={form.icon} className="h-3.5 w-3.5" />
 							<span>{form.name || '(untitled)'}</span>
@@ -85,10 +93,13 @@ export function PreviewPane({ form, model, scope, actionsPath, keybindingsPath }
 				</h4>
 				<JsonPreview value={actionJson} />
 			</div>
-			{rule && (
+			{plan.rules.length > 0 && (
 				<div className="jsonbox" style={{ marginTop: 'var(--space-3)' }}>
 					<h4>{keybindingsPath}</h4>
-					<JsonPreview value={{ bindings: [rule] }} caption={`the rule for "${draftId}" — the rest of the file is untouched`} />
+					<JsonPreview
+						value={{ bindings: plan.rules }}
+						caption={`the rule${plan.rules.length > 1 ? 's' : ''} for "${draftId}" — the rest of the file is untouched`}
+					/>
 				</div>
 			)}
 		</>

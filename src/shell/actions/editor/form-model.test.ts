@@ -4,7 +4,7 @@
 // six variables).
 
 import { describe, expect, it } from 'vitest';
-import type { EffectiveKeymapEntry } from '@/lib/actions/store';
+import type { EffectiveKeymapEntry, HeldKeybinding } from '@/lib/actions/store';
 import {
 	buildKeybindingRule,
 	buildPlacements,
@@ -14,7 +14,9 @@ import {
 	effectiveKeyWhen,
 	emptyForm,
 	findEditorConflict,
+	formFromAction,
 	missingRunField,
+	planKeybindingWrite,
 	slug,
 	suggestedRestriction,
 	type EditorFormState,
@@ -112,6 +114,58 @@ describe('buildPlacements (§1.3 — the full menu id, never D-06\'s bare "secti
 			nativeTop: 'chi',
 		});
 		expect(buildPlacements(form)).toEqual([{ at: 'section/ngwa-project' }, { at: 'native/chi' }]);
+	});
+
+	it('round-trips extraPlacements verbatim, after the checked ones', () => {
+		const form = withForm({
+			placements: { ...emptyForm().placements, palette: true },
+			extraPlacements: [{ at: 'files', when: 'filesFocus && resource =~ \'*.ts\'' }, { at: 'pkg:example:custom' }],
+		});
+		expect(buildPlacements(form)).toEqual([
+			{ at: 'palette' },
+			{ at: 'files', when: "filesFocus && resource =~ '*.ts'" },
+			{ at: 'pkg:example:custom' },
+		]);
+	});
+});
+
+describe('formFromAction — unknown placements and non-glob `when` round-trip (§1.3/§8, fix 8)', () => {
+	function fixtureAction(placements: { at: string; when?: string }[]): Parameters<typeof formFromAction>[0] {
+		return {
+			id: 'x',
+			name: 'X',
+			description: '',
+			source: 'personal',
+			run: { kind: 'open', url: '/x' },
+			placements,
+			locked: false,
+			danger: false,
+			hosted: false,
+			osOnly: false,
+			editable: true,
+			// biome-ignore lint/suspicious/noExplicitAny: a minimal test double for the frozen EffectiveAction shape
+		} as any;
+	}
+
+	it('recognizes a `files` placement with the one glob shape', () => {
+		const form = formFromAction(fixtureAction([{ at: 'files', when: "resource =~ '*.ts'" }]), null);
+		expect(form.placements.files).toBe(true);
+		expect(form.filesGlob).toBe('*.ts');
+		expect(form.extraPlacements).toEqual([]);
+	});
+
+	it('keeps an unknown placement id verbatim instead of dropping it', () => {
+		const custom = { at: 'pkg:example:custom' };
+		const form = formFromAction(fixtureAction([custom]), null);
+		expect(form.extraPlacements).toEqual([custom]);
+	});
+
+	it('keeps a `files` placement whose `when` is not the plain glob shape', () => {
+		const custom = { at: 'files', when: "filesFocus && resource =~ '*.ts'" };
+		const form = formFromAction(fixtureAction([custom]), null);
+		expect(form.placements.files).toBe(false);
+		expect(form.filesGlob).toBe('');
+		expect(form.extraPlacements).toEqual([custom]);
 	});
 });
 
@@ -211,6 +265,83 @@ describe('findEditorConflict (DEC-59, §5 — never string equality)', () => {
 		const form = withForm({ key: 'mod+shift+e' });
 		const conflict = findEditorConflict(entries, 'explain-file', form, 'mac');
 		expect(conflict?.other.command).toBe('other.command');
+	});
+
+	it('flags a clash against a DEC-65 held project rule, not just live entries (fix 8)', () => {
+		const held: HeldKeybinding[] = [
+			{ index: 0, rule: { key: 'mod+shift+e', command: 'held.command' }, trust: 'untrusted' },
+		];
+		const form = withForm({ key: 'mod+shift+e' });
+		const conflict = findEditorConflict([], 'explain-file', form, 'mac', held);
+		expect(conflict?.other.command).toBe('held.command');
+	});
+
+	it('ignores a held negative rule — it claims nothing', () => {
+		const held: HeldKeybinding[] = [
+			{ index: 0, rule: { key: 'mod+shift+e', command: '-other' }, trust: 'untrusted' },
+		];
+		const form = withForm({ key: 'mod+shift+e' });
+		expect(findEditorConflict([], 'explain-file', form, 'mac', held)).toBeNull();
+	});
+});
+
+describe('planKeybindingWrite (§1.5, §11 — matches rebindKey/addKeybinding/unbindKey exactly)', () => {
+	function refEntry(over: Partial<EffectiveKeymapEntry> = {}): EffectiveKeymapEntry {
+		return { command: 'x', key: 'mod+e', when: 'always', source: 'personal', label: '', ...over };
+	}
+
+	it('adds a fresh rule when there is no reference entry', () => {
+		const form = withForm({ id: 'x', key: 'mod+shift+e' });
+		expect(planKeybindingWrite(form, null, 'personal')).toEqual({
+			action: 'add',
+			rules: [{ key: 'mod+shift+e', command: 'x' }],
+		});
+	});
+
+	it('omits `when` for "always", normalized — not a raw string check', () => {
+		const form = withForm({ id: 'x', key: 'mod+shift+e', whenTouched: true, whenValue: 'true' });
+		const plan = planKeybindingWrite(form, null, 'personal');
+		expect(plan.rules[0]).not.toHaveProperty('when');
+	});
+
+	it('edits in place when the reference entry is already this scope\'s own rule', () => {
+		const entry = refEntry({ origin: { scope: 'personal', index: 0 } });
+		const form = withForm({ id: 'x', key: 'mod+shift+x' });
+		expect(planKeybindingWrite(form, entry, 'personal')).toEqual({
+			action: 'rebind',
+			rules: [{ key: 'mod+shift+x', command: 'x' }],
+		});
+	});
+
+	it('appends a negative-plus-positive pair when the reference entry is another scope\'s', () => {
+		const entry = refEntry({ origin: { scope: 'project', index: 0 } });
+		const form = withForm({ id: 'x', key: 'mod+shift+x' });
+		expect(planKeybindingWrite(form, entry, 'personal')).toEqual({
+			action: 'rebind',
+			rules: [
+				{ key: 'mod+e', command: '-x' },
+				{ key: 'mod+shift+x', command: 'x' },
+			],
+		});
+	});
+
+	it('unbinds in place with no rule when the key is cleared and the reference is this scope\'s own', () => {
+		const entry = refEntry({ origin: { scope: 'personal', index: 0 } });
+		const form = withForm({ id: 'x', key: '' });
+		expect(planKeybindingWrite(form, entry, 'personal')).toEqual({ action: 'unbind', rules: [] });
+	});
+
+	it('unbinds with a negative rule when clearing another scope\'s reference', () => {
+		const entry = refEntry({ origin: { scope: 'project', index: 0 } });
+		const form = withForm({ id: 'x', key: '' });
+		expect(planKeybindingWrite(form, entry, 'personal')).toEqual({
+			action: 'unbind',
+			rules: [{ key: 'mod+e', command: '-x' }],
+		});
+	});
+
+	it('does nothing with no key and no reference entry', () => {
+		expect(planKeybindingWrite(withForm({ id: 'x' }), null, 'personal')).toEqual({ action: 'none', rules: [] });
 	});
 });
 
