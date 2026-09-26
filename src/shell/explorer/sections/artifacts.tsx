@@ -1,9 +1,11 @@
 import { useCallback } from 'react';
-import { FileCode } from 'lucide-react';
+import { FileCode, Layers } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { loadRecentArtifacts, type RecentArtifact } from '@/lib/shell/artifact-grid-recent-artifacts';
+import { handToChi } from '@/shell/companion/companion-store';
+import { EmptyState } from '@/components/states';
 import type { ExplorerSectionContext } from '../section-registry';
 
 export const artifactsContextMenu = [
@@ -39,19 +41,16 @@ export function ArtifactsSection({ projectId }: ExplorerSectionContext) {
 
 	if (artifacts.length === 0) {
 		return (
-			<div className="p-4 text-center">
-				<h3 className="text-sm font-semibold">Nothing built yet</h3>
-				<p className="text-xs text-muted-foreground mt-1 mb-3">
-					Artifacts are the .html your agents write. The first one appears here the moment it lands on disk.
-				</p>
-				<button
-					type="button"
-					className="text-xs bg-primary text-primary-foreground px-3 py-1.5 rounded hover:bg-primary/90 transition-colors"
-					onClick={() => { /* stubbed: Ask a Chi to build one */ }}
-				>
-					Ask a Chi to build one
-				</button>
-			</div>
+			<EmptyState
+				data-state="explorer-artifacts-empty"
+				icon={Layers}
+				heading="Nothing built yet"
+				body="Artifacts are the .html your agents write. The first one appears here the moment it lands on disk."
+				action={{
+					label: 'Ask a Chi to build one',
+					onClick: () => handToChi('Build me an artifact: '),
+				}}
+			/>
 		);
 	}
 

@@ -1,5 +1,49 @@
 # ikenga-desktop
 
+## 0.14.0
+
+### Minor Changes
+
+- a9cd840: **Phase 5b: flows, viewer and pane chrome.**
+  
+  - **Onboarding (D-04).** Consecration is rebuilt as seven steps: welcome, engine, project, equipment, look, shortcuts, done. It has a step rail, resume/offline/engine-none states, and a Personal/Project scope switch. It never scaffolds into `~/.claude/` implicitly.
+  - **Daily address.** It sits on the Project dashboard. It shows project-scoped runs and unresolved permissions, is dismissible once a day, and has a real Workspace setting.
+  - **Notifications.** A notifications table (`shell_notifications`, migration 0066) records permission, run, update and violation rows. Rows keep a resolved state that is separate from read. Terminal prompts resolve on `Stop`, `PostToolUseFailure` and the next `UserPromptSubmit`. Per-kind mutes live in `settings.json`. The status-bar bell and a notification centre show the rows, toasts are text-only copies of them, and the iyke bridge serves `GET /iyke/notifications`.
+  - **Updater (D-07).** One updater flow covers the app and packages: release notes, status-bar progress, restart with a live-session warning, and a package batch that holds any update requesting a new permission for review *before* installing it.
+  - **Automations and restore (D-07).** There is a `/automations` view. A restore wizard covers the whole restore, from picking the file to done, and lists secret names only. Shared Empty, Loading, Error and Offline states each offer exactly one next action.
+  - **Viewer and panes (D-08).** The artifact viewer gets new chrome, variants, and CSV and JSON renderers. Package panes get states for loading, consent, crashed, sidecar-down and blocked, with a working "Allow host…". Native menu parity: the macOS tree, plus a `≡` cascade on Windows/Linux, with keys taken from the keymap registry.
+  - **New commands:** `notifications_*`, `pkg_trust_preview_incoming` and `secrets_index_names`. Each has its ACL entry.
+
+## 0.13.0
+
+### Minor Changes
+
+- f86a32f: **Phase 5a: settings shell + secrets unlock.** Settings is rebuilt on the
+  `urn:ikenga:settings:v1` contract (`~/.ikenga/settings.json` personal +
+  `<root>/.ikenga/settings.json` project, KV migration with durable markers),
+  collapsing 15 legacy routes into the D-03 nine-section shell with
+  Personal/Project scope switching, cross-section search, project-override
+  markers with revert, Open file / Copy as iyke, and reset-section. Legacy
+  routes (`/settings/activity-bar`, `agent`, `artifact-grid`, `backup`,
+  `onboarding`, `packages`, `pkg-audit`, `pkg-health`, `data-health`,
+  `terminal`) redirect. Secrets gain a passphrase-gated encrypted layer
+  (Argon2id + AES-256-GCM) with set/rotate/unlock/lock commands, idle
+  re-lock, a global unlock sheet, Linux Secret Service as the authoritative
+  backend with keyutils as a read-only fallback, hardened Stronghold
+  migration rollback, and redacted-only reveal in the UI. New commands:
+  `secrets_set_passphrase`, `secrets_unlock`, `secrets_lock`,
+  `secrets_lock_state`; `secrets_vault_status` now reports
+  `locked/configured/idle_timeout_secs/last_activity_unix_ms`; the iyke
+  bridge gains `GET /iyke/secrets/lock-state`.
+- 8504409: **BREAKING: `ui.nav` removed (DEC-37 cutover).** The `ui.nav` → `ui.views`
+  alias had a one-release lifetime (G-MANIFEST-V5 §4) and v0.12.0 was the
+  soft-warn release, so the Rust manifest parser now rejects `ui.nav` outright
+  with a canonical message naming `ui.views[]`. `Manifest::apply_nav_views_alias`,
+  `NavAliasOutcome` and `normalize_nav_route` are gone; `Package::load` does no
+  post-parse fixup. The `NavEntry` wire shape survives on the activity-bar
+  registry snapshot (pkg-mode sidebar + WP-22 pin seed read it), sourced from
+  `ui.views[]`.
+
 ## 0.12.0
 
 ### Minor Changes

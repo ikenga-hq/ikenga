@@ -7,9 +7,10 @@
 // `companion.conformance.test.ts` enforces that for everything under this
 // directory.
 
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, ShieldCheck } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/components/ui/utils';
+import { EmptyState } from '@/components/states';
 import { LoreTerm } from '@/components/lore/lore-term';
 import { findEntry, labelFor } from '@/lib/keymap/registry';
 import { useDragState } from '@/lib/panes/drag-state';
@@ -316,9 +317,18 @@ const DECISION_TEXT: Record<PermissionDecision, string> = {
 export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
 	if (cards.length === 0) {
 		return (
-			<p className="px-3 pb-2 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
-				No requests waiting. Chi will ask here.
-			</p>
+			<EmptyState
+				data-state="companion-no-permissions"
+				icon={ShieldCheck}
+				heading="Nothing waiting"
+				body="Permission requests land here. An empty inbox is the ordinary state, not a problem."
+				fill={false}
+				className="min-h-0 gap-1.5 p-3 pb-2"
+				action={{
+					label: 'See what is allowed',
+					onClick: () => usePaneStore.getState().navigateFocused('/packages'),
+				}}
+			/>
 		);
 	}
 	return (

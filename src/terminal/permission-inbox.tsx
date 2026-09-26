@@ -97,7 +97,8 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 					title: 'Tool Use Request',
 					body: `Claude wants to use ${p.tool_name || 'a tool'} — approve?`,
 				});
-			} else if (p.hook_event_name === 'Notification' || p.hook_event_name === 'Stop') {
+			} else if (p.hook_event_name === 'Notification') {
+				// Not Stop: WP-40 now registers it, and a raw OS toast every turn end would bypass the notification centre's mute.
 				sendNotification({
 					title: 'Ikenga Assistant Update',
 					body: p.prompt || 'Assistant finished execution turn',

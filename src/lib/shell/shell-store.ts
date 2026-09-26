@@ -12,6 +12,7 @@ import type {
 	SettingsFileResult,
 	SettingsOnboarding,
 	SettingsPersonalField,
+	SettingsScope,
 	SettingsWriteEntry,
 	SettingsWriteOptions,
 } from '@/lib/settings/types';
@@ -194,14 +195,34 @@ function normalizeOnboarding(value: unknown): OnboardingState {
 	const defaults = createDefaultOnboardingState();
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return defaults;
 	const record = value as Record<string, unknown>;
+	// `{...defaults.steps, ...record.steps}` merges by key — a persisted blob
+	// keyed on the pre-WP-38 step ids (agent/roots/packages/connectors/
+	// scaffolding/appearance/summary) has no overlapping keys with the new
+	// defaults, so every new-id step stays freshly `{status:'pending'}` and
+	// the stale keys just ride along unused. Safe by construction; no crash
+	// even without the version check below.
 	const steps =
 		record.steps && typeof record.steps === 'object' && !Array.isArray(record.steps)
 			? { ...defaults.steps, ...(record.steps as Record<string, OnboardingStepRecord>) }
 			: defaults.steps;
+	// WP-38 (ONBOARDING_STATE_VERSION 2 → 3): a persisted blob stamped with an
+	// older version predates the step-id re-map, so `activeIndex` (an index
+	// into the *old* 8-step order) and `selectedAgentId` no longer point at
+	// anything meaningful against the new 7-step `ONBOARDING_STEPS`. Reset
+	// just the wizard's own position bookkeeping — `startedAt`/`completedAt`
+	// survive (an already-finished user must not be resurrected into the
+	// wizard; `route.tsx`'s `beforeLoad` already redirects on `completedAt`),
+	// and every actual settings write from the old steps lives outside this
+	// object entirely, so nothing the shipped wizard wrote is lost.
+	const staleVersion = typeof record.version !== 'number' || record.version < ONBOARDING_STATE_VERSION;
 	return {
 		...defaults,
 		...record,
 		steps,
+		version: ONBOARDING_STATE_VERSION,
+		activeIndex: staleVersion ? 0 : clampActiveIndex(Number(record.activeIndex)),
+		mode: staleVersion ? 'first_run' : ((record.mode as OnboardingState['mode']) ?? 'first_run'),
+		selectedAgentId: staleVersion ? null : ((record.selectedAgentId as string | null) ?? null),
 		loreGlossSeen: Array.isArray(record.loreGlossSeen)
 			? record.loreGlossSeen.filter((term): term is string => typeof term === 'string')
 			: [],
@@ -216,8 +237,11 @@ function rootSettingsEntry(
 	projectId: string,
 	value: string[],
 	project: Project | undefined,
+	scope?: SettingsScope,
 ): SettingsWriteEntry {
-	if (projectCanWriteSettings(project)) {
+	// An explicit scope (the D-04 consecration's Personal / Project switch)
+	// wins; project scope still needs a writable root to land in.
+	if (scope !== 'personal' && projectCanWriteSettings(project)) {
 		return { scope: 'project', field: 'projects.extraRoots', value, projectId };
 	}
 	return { scope: 'personal', field: 'projects.extraRoots', value };
@@ -568,15 +592,23 @@ export function restoreV15Backup(
 // Step bodies are filled in by Phase 4+; Phase 3 just lays down the shape +
 // migration + chrome.
 
+// WP-38 (D-04 consecration re-map): the shipped 8-step id set
+// (welcome/agent/roots/packages/connectors/scaffolding/appearance/summary)
+// is retired in favour of D-04's 7 steps, mapped onto the three nouns
+// (Chi/Obi/Ngwa). See `plans/shell-ux-rearchitecture/designs/onboarding.html`
+// header comment "OLD → NEW" for the full per-step mapping and the PR body
+// of the WP-38 PR for the write-map table. Old id → new id:
+//   welcome → welcome · agent → engine · roots → project
+//   packages + connectors + scaffolding → equipment (merged)
+//   appearance → look · summary → done · (new) → shortcuts
 export type OnboardingStepId =
 	| 'welcome'
-	| 'agent'
-	| 'roots'
-	| 'packages'
-	| 'connectors' // dynamic; substeps are derived (Phase 5)
-	| 'scaffolding'
-	| 'appearance'
-	| 'summary';
+	| 'engine'
+	| 'project'
+	| 'equipment' // dynamic; merges the old packages/connectors/scaffolding steps
+	| 'look'
+	| 'shortcuts' // new — no shipped equivalent (D-04)
+	| 'done';
 
 export type OnboardingStatus = 'pending' | 'in_progress' | 'completed' | 'skipped';
 
@@ -605,28 +637,44 @@ export interface OnboardingState {
 }
 
 // Canonical step order. Source of truth for activeIndex math + stepper UI.
+// D-04 order: welcome → engine → project → equipment → look → shortcuts → done.
 export const ONBOARDING_STEPS: readonly OnboardingStepId[] = Object.freeze([
 	'welcome',
-	'agent',
-	'roots',
-	'packages',
-	'connectors',
-	'scaffolding',
-	'appearance',
-	'summary',
+	'engine',
+	'project',
+	'equipment',
+	'look',
+	'shortcuts',
+	'done',
 ]);
 
-// Steps the user is allowed to skip. Welcome/Summary are not skippable
-// (they're framing), agent/roots/packages are required to actually use
-// the shell. The rest are optional.
+// Steps the user is allowed to skip. Per D-04's footer rule (`designs/
+// onboarding.html`: `$('#btnSkip').hidden = (S.step === 'welcome' || S.step
+// === 'done')`), Skip is available on every step except the first and last —
+// a deliberate widening from the shipped wizard, where `agent`/`roots`/
+// `packages` were not skippable. The shell is engine- and project-optional
+// (D-04 `engine-none` / "Start empty"), so this now matches product intent.
 export const OPTIONAL_ONBOARDING_STEPS: ReadonlySet<OnboardingStepId> = new Set<OnboardingStepId>([
-	'connectors',
-	'scaffolding',
-	'appearance',
+	'engine',
+	'project',
+	'equipment',
+	'look',
+	'shortcuts',
 ]);
 
-/** Bump when the OnboardingState shape changes in a way that needs migration. */
-export const ONBOARDING_STATE_VERSION = 2;
+/**
+ * Bump when the OnboardingState shape changes in a way that needs migration.
+ * v3 (WP-38): `OnboardingStepId` renamed/re-mapped (see the union's doc
+ * comment above). Nothing here touches `migrateShellStore` — the outer
+ * Zustand persist migration stays WP-40's alone (v17→v18 on 5b, per
+ * `05-tracking.md` §File ownership). Instead `normalizeOnboarding` below
+ * detects a stale `version` on rehydrate and resets just the wizard's own
+ * position bookkeeping (`activeIndex`/`mode`/`selectedAgentId`) to safe
+ * defaults — every actual *setting* the old wizard wrote (userName, extra
+ * roots, appearance, defaultEngineId, vault entries, scaffolded files) lives
+ * outside `onboarding.steps` and is untouched by this reset.
+ */
+export const ONBOARDING_STATE_VERSION = 3;
 
 function freshStepRecord(): OnboardingStepRecord {
 	return { status: 'pending' };
@@ -687,8 +735,10 @@ interface ShellState {
 	projectExtraRoots: Record<string, string[]>;
 	/** Persisted; v15 fileRoots ∪ claudeProjectRoots, written once by migrate. */
 	carriedRoots: string[];
-	/** Trims, dedupes, recomputes `activeProject`. */
-	setProjectExtraRoots: (projectId: string, roots: string[]) => void;
+	/** Trims, dedupes, recomputes `activeProject`. `scope` pins which
+	 *  settings.json the write lands in (the consecration's scope switch);
+	 *  omitted, it follows `rootSettingsEntry`'s project-if-writable rule. */
+	setProjectExtraRoots: (projectId: string, roots: string[], scope?: SettingsScope) => void;
 
 	// ─── Explorer sections (G-STATE) ─────────────────────────────────────
 	explorerSections: ExplorerSectionState[];
@@ -725,8 +775,11 @@ interface ShellState {
 
 	// ─── Default engine agent ────────────────────────────────────────────
 	// Which engine adapter pkg drives terminal sessions. Mirrors the
-	// agent step's `selectedAgentId` after onboarding completes; left
-	// null when the user picks offline mode.
+	// onboarding `engine` step's `selectedAgentId` (WP-38 wires the write —
+	// the pre-rename `agent` step recorded the choice on `onboarding.
+	// selectedAgentId` only and never actually called `setDefaultEngineId`
+	// despite this comment; see the WP-38 PR write-map); left null when the
+	// user picks offline mode.
 	defaultEngineId: string | null;
 	setDefaultEngineId: (id: string | null) => void;
 
@@ -797,6 +850,21 @@ interface ShellState {
 	/** Pull the project list + active project id from Rust. Safe to call
 	 *  multiple times; rejects silently in non-Tauri test environments. */
 	refreshProjects: () => Promise<void>;
+
+	// ─── Daily address (WP-39, D-04 `daily-address`) ─────────────────────
+	// Plain Zustand-persisted state — deliberately NOT routed through the
+	// settings.json client (unlike userName/sidebarCollapsed/etc above):
+	// this value changes at most once a day and both proposed persistence
+	// homes are equally valid per the WP-39 brief, so the one with no
+	// migrate-arm and no Rust/schema surface wins. Local date (YYYY-MM-DD)
+	// the day-start summary was last dismissed on the Project dashboard;
+	// `null` (or any date other than today) shows it. Included in the
+	// persisted blob by construction (absent from `NOT_PERSISTED` below) —
+	// no `migrateShellStore` version bump, a fresh install simply defaults
+	// to `null` via the same `{...current, ...blob}` merge every other
+	// additive field here relies on.
+	dailyAddressDismissedOn: string | null;
+	setDailyAddressDismissed: (date: string | null) => void;
 }
 
 /** Store keys kept out of the persisted blob (g-state.md §3). */
@@ -857,7 +925,7 @@ export function migrateShellStore(persisted: unknown, version: number): unknown 
 
 		if (hadLegacyAgent || legacyAgentId) {
 			if (hadLegacyAgent) {
-				next.steps.agent = {
+				next.steps.engine = {
 					status: 'completed',
 					completedAt: Date.now(),
 					payload: legacyAgentId ? { agentId: legacyAgentId } : undefined,
@@ -1097,7 +1165,7 @@ export const useShellStore = create<ShellState>()(
 			activeProject: { id: 'default', root_path: null, extra_roots: [] },
 			projectExtraRoots: {},
 			carriedRoots: [],
-			setProjectExtraRoots: (projectId, roots) => {
+			setProjectExtraRoots: (projectId, roots, scope) => {
 				const s = get();
 				const project = s.projects.find((entry) => entry.id === projectId);
 				if (project?.archived_at != null) return;
@@ -1117,7 +1185,7 @@ export const useShellStore = create<ShellState>()(
 				enqueueSettingsWrite(
 					'projects.extraRoots',
 					() =>
-						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project)),
+						writeSettingsField(rootSettingsEntry(projectId, nextRoots, project, scope)),
 					() => {
 						const current = get();
 						if (JSON.stringify(current.projectExtraRoots[projectId] ?? []) !== JSON.stringify(nextRoots)) return;
@@ -1248,6 +1316,9 @@ export const useShellStore = create<ShellState>()(
 					if (get().claudeBrowserMode === claudeBrowserMode) set({ claudeBrowserMode: previous });
 				});
 			},
+
+			dailyAddressDismissedOn: null,
+			setDailyAddressDismissed: (date) => set({ dailyAddressDismissedOn: date }),
 
 			// ─── Onboarding actions ────────────────────────────────────────
 			onboarding: createDefaultOnboardingState(),

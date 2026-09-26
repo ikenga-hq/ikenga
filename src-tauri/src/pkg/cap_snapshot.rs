@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use crate::pkg::manifest::Manifest;
+use crate::pkg::manifest::{CapabilitiesBlock, Manifest, Permissions};
 
 /// One stored snapshot row.
 #[derive(Debug, Clone, Serialize)]
@@ -34,7 +34,20 @@ pub struct Snapshot {
 /// `Value`) so equality checks are cheap and the on-disk format is
 /// stable.
 pub fn normalize(manifest: &Manifest) -> String {
-    let perms = &manifest.permissions;
+    normalize_parts(manifest.capabilities.as_ref(), &manifest.permissions)
+}
+
+/// Same normalization as [`normalize`], but takes the `capabilities` +
+/// `permissions` blocks directly instead of a full [`Manifest`]. Used by
+/// the updater's pre-install capability diff (`pkg_trust_preview_incoming`),
+/// which only has the incoming version's manifest fields fetched from the
+/// registry — not an on-disk `Package` to load — to compare against the
+/// last-approved snapshot.
+pub fn normalize_parts(
+    capabilities: Option<&CapabilitiesBlock>,
+    permissions: &Permissions,
+) -> String {
+    let perms = permissions;
     let mut shell_execute = perms.shell_execute.clone();
     let mut fs_read = perms.fs_read.clone();
     let mut fs_write = perms.fs_write.clone();
@@ -63,7 +76,7 @@ pub fn normalize(manifest: &Manifest) -> String {
     // capabilities block — present as parsed Option<CapabilitiesBlock>.
     // Round-trip through serde_json so the keys land in the same order as
     // the struct definition; nulls are dropped naturally.
-    let capabilities = match &manifest.capabilities {
+    let capabilities = match capabilities {
         Some(c) => serde_json::to_value(c).unwrap_or(json!({})),
         None => json!(null),
     };
@@ -184,6 +197,25 @@ mod tests {
             signature: None,
             workflows: vec![],
         }
+    }
+
+    #[test]
+    fn normalize_parts_matches_normalize_for_the_same_manifest() {
+        let mut m = minimal_manifest();
+        m.permissions.fs_write.push("$home/Movies/**".into());
+        m.capabilities = Some(crate::pkg::manifest::CapabilitiesBlock {
+            supabase: Some(crate::pkg::manifest::SupabaseCapability { required: true }),
+            sqlite: None,
+            webview: None,
+            agent_ops: None,
+            http: None,
+            secrets: None,
+            invoke: None,
+        });
+        assert_eq!(
+            normalize(&m),
+            normalize_parts(m.capabilities.as_ref(), &m.permissions)
+        );
     }
 
     #[test]

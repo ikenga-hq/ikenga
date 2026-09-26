@@ -25,6 +25,7 @@ pub mod ide_ws;
 pub mod layout;
 pub mod mcp;
 pub mod memory;
+pub mod notifications;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg_db;

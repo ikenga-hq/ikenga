@@ -14,6 +14,8 @@ import { RailSlot } from './slots/rail-slot';
 import { SidebarSlot } from './slots/sidebar-slot';
 import { StatusBarSlot } from './slots/status-bar-slot';
 import { TitleRowSlot } from './slots/title-row-slot';
+import { PostRestartUpdateToast } from './updater/post-restart-toast';
+import { UpdateSheet } from './updater/update-sheet';
 import { useWorkspaceEffects } from './workspace-effects';
 
 export function Workspace() {
@@ -150,6 +152,13 @@ export function Workspace() {
 		<div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
 			<TitleRowSlot />
 			<BannerSlot />
+			{/* WP-41 (D-07 update-flow) — the one sheet + the post-restart toast,
+			 * mounted once here rather than inside <BannerSlot />: both need to
+			 * render regardless of which (or whether any) update banner is the
+			 * one currently shown, so they can't live inside the eligibility-gated
+			 * banner wrappers. See src/shell/updater/. */}
+			<UpdateSheet />
+			<PostRestartUpdateToast />
 			<div className="flex min-h-0 flex-1">
 				<RailSlot />
 				<PanelGroup

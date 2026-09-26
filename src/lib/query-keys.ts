@@ -15,9 +15,31 @@ export const queryKeys = {
 		list: (projectDir?: string | null) => ['claude_sessions', 'list', projectDir ?? 'all'] as const,
 		detail: (sessionId: string) => ['claude_sessions', 'detail', sessionId] as const,
 	},
+	// WP-40 notification aggregation table. Every mutation and every
+	// `notifications://changed` event invalidates `all`.
+	notifications: {
+		all: ['notifications'] as const,
+		list: (filter: {
+			unreadOnly?: boolean;
+			kinds?: readonly string[];
+			limit?: number;
+			includeMuted?: boolean;
+		} = {}) =>
+			[
+				'notifications',
+				'list',
+				filter.unreadOnly ?? false,
+				[...(filter.kinds ?? [])].sort().join(',') || 'all',
+				filter.limit ?? null,
+				filter.includeMuted ?? false,
+			] as const,
+		unreadCount: () => ['notifications', 'unread-count'] as const,
+		muteState: () => ['notifications', 'mute-state'] as const,
+	},
 	secrets: {
 		all: ['secrets'] as const,
 		vaultStatus: () => ['secrets', 'vault-status'] as const,
+		lockState: () => ['secrets', 'lock-state'] as const,
 		keys: () => ['secrets', 'keys'] as const,
 	},
 	fs: {
@@ -60,5 +82,10 @@ export const queryKeys = {
 		inbox: () => ['home', 'inbox'] as const,
 		finance: () => ['home', 'finance'] as const,
 		boardsPkgStatus: () => ['home', 'boards', 'pkg-status'] as const,
+	},
+	// WP-39 — the Project dashboard's daily address widget row.
+	dailyAddress: {
+		runs: () => ['daily-address', 'runs'] as const,
+		todos: (projectId: string) => ['daily-address', 'todos', projectId] as const,
 	},
 } as const;

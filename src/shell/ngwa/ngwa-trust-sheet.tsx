@@ -37,6 +37,11 @@ export interface NgwaTrustSheetProps {
 	addedPermissions?: string[];
 	violationScopeKind?: string | null;
 	violationTarget?: string | null;
+	/** Violation mode only: grant just the violating line instead of the
+	 *  pkg-wide sensitive-perms set (WP-45 "Allow host…" →
+	 *  `pkg_webview_allow_origin`). The sheet then shows only that line, hides
+	 *  "Revoke trust", and its primary button runs `run`. */
+	violationGrant?: { label: string; pendingLabel: string; run: () => Promise<void> };
 	onApproved?: () => void;
 	onDenied?: () => void;
 }
@@ -50,15 +55,21 @@ export function NgwaTrustSheet({
 	addedPermissions = [],
 	violationScopeKind,
 	violationTarget,
+	violationGrant,
 	onApproved,
 	onDenied,
 }: NgwaTrustSheetProps) {
+	const scopedGrant = mode === 'violation' ? violationGrant : undefined;
 	const qc = useQueryClient();
 	const [actionError, setActionError] = useState<string | null>(null);
 
 	const grantMutation = useMutation({
 		mutationFn: async () => {
 			if (!item) return;
+			if (scopedGrant) {
+				await scopedGrant.run();
+				return;
+			}
 			await pkgTrustGrant(item.id, item.version ?? '0.0.0');
 		},
 		onSuccess: () => {
@@ -191,6 +202,7 @@ export function NgwaTrustSheet({
 					)}
 
 					{/* ── Standard Sensitive Permissions List ── */}
+					{!scopedGrant && (
 					<div className="mb-4">
 						<div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
 							Declared sensitive capabilities ({totalSensitive})
@@ -241,10 +253,13 @@ export function NgwaTrustSheet({
 							</div>
 						)}
 					</div>
+					)}
 
 					<div className="text-xs text-muted-foreground bg-muted/20 p-2.5 rounded border border-border">
 						<Shield className="h-3.5 w-3.5 inline mr-1 text-primary" />
-						Approval grants these capabilities to the package runtime. Consent can be revoked at any time.
+						{scopedGrant
+							? 'Approval grants only the target above, on top of what the package declares. Nothing else changes.'
+							: 'Approval grants these capabilities to the package runtime. Consent can be revoked at any time.'}
 					</div>
 				</div>
 
@@ -258,7 +273,8 @@ export function NgwaTrustSheet({
 						Cancel
 					</button>
 
-					{item.trust.state === 'granted' || item.trust.state === 'auto_granted' ? (
+					{!scopedGrant &&
+					(item.trust.state === 'granted' || item.trust.state === 'auto_granted') ? (
 						<button
 							type="button"
 							className="btn danger"
@@ -276,7 +292,11 @@ export function NgwaTrustSheet({
 						onClick={() => grantMutation.mutate()}
 					>
 						<Check className="h-3.5 w-3.5 mr-1" />
-						{grantMutation.isPending
+						{scopedGrant
+							? grantMutation.isPending
+								? scopedGrant.pendingLabel
+								: scopedGrant.label
+							: grantMutation.isPending
 							? 'Approving…'
 							: mode === 'update'
 								? 'Approve update'

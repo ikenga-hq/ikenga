@@ -40,6 +40,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { useGitStatus } from '@/lib/shell/use-git-status';
 import { handToChi } from '@/shell/companion/companion-store';
+import { EmptyState } from '@/components/states';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -860,15 +861,16 @@ export function FilesSection(_ctx: { projectId: string }) {
 			</div>
 			<div ref={scrollerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-auto">
 				{roots.length === 0 && (
-					<div className="p-4 text-center">
-					  <h3 className="text-sm font-semibold">No project open</h3>
-					  <p className="text-xs text-muted-foreground mt-1 mb-3">
-					    Files, artifacts and sessions are all scoped to a project. Open one and every section fills.
-					  </p>
-					  <button className="text-xs bg-primary text-primary-foreground px-3 py-1.5 rounded">
-					    Open a folder…
-					  </button>
-					</div>
+					<EmptyState
+						data-state="explorer-files-empty"
+						icon={Folder}
+						heading="No project open"
+						body="Files, artifacts and sessions are all scoped to a project. Open one and every section fills."
+						action={{
+							label: 'Open a folder…',
+							onClick: () => usePaneStore.getState().navigateFocused('/settings/projects'),
+						}}
+					/>
 				)}
 				{roots.map((root, i) => (
 					<RootSection

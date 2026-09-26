@@ -21,6 +21,14 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	paActionsList: mocks.paActionsList,
 	pkgSidecarCall: mocks.pkgSidecarCall,
+	// WP-40b: the bell slot now mounts `NotificationsBell` (badge count via
+	// `notificationsUnreadCount`) and `NotificationToastBridge`
+	// (`useNotificationsLiveSync` → this module's own `listen`, which is a
+	// distinct function from `@/lib/transport`'s `listen` mocked below and
+	// so needs its own stub — real `getTransport().listen()` has no Tauri
+	// bridge to talk to in jsdom and would otherwise reject unhandled).
+	notificationsUnreadCount: () => Promise.resolve({ total: 0, byKind: {} }),
+	listen: () => Promise.resolve(() => {}),
 }));
 vi.mock('@/lib/pkgs/use-derived', async (orig) => ({
 	...(await orig<typeof import('@/lib/pkgs/use-derived')>()),
@@ -128,10 +136,13 @@ describe('<StatusBar /> — zero hides (T2)', () => {
 		// Always present: the read-only project item and the shortcuts button.
 		expect(seg('project')?.textContent).toContain('Default');
 		expect(seg('shortcuts')).not.toBeNull();
-		// The Phase 5 notifications bell has a named, empty slot.
+		// WP-40b fills the bell slot: the bell is always present, with no count
+		// badge at zero.
 		const bell = screen.getByTestId('status-bar').querySelector('[data-slot="notifications-bell"]');
 		expect(bell).not.toBeNull();
-		expect(bell?.childNodes).toHaveLength(0);
+		expect(bell?.querySelector('button[data-seg="notifications"]')?.getAttribute('aria-label')).toBe(
+			'Notifications, none unread'
+		);
 	});
 
 	it('hides each Ngwa segment independently and deep-links the rest', async () => {
@@ -202,6 +213,7 @@ describe('<StatusBar /> — keyboard (T6)', () => {
 		expect(buttons.map((b) => b.dataset.seg)).toEqual([
 			'ngwa-installed',
 			'ngwa-updates',
+			'notifications',
 			'permissions',
 			'shortcuts',
 		]);

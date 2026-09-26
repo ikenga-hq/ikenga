@@ -58,6 +58,7 @@ use super::memory::{
     post_timer_cancel, post_timer_schedule, post_todo_complete, post_todo_create, post_todo_update,
     TimerScheduler,
 };
+use super::notifications::get_notifications;
 use super::pa_actions::post_pa_actions_pause;
 use super::permissions_audit::get_violations_list;
 use super::pkg_dispatch::pkg_dispatch;
@@ -65,7 +66,9 @@ use super::projects::{
     get_project_active, get_project_list, post_project_archive, post_project_create,
     post_project_set_active, post_project_update,
 };
-use super::secrets::{get_secret, get_secret_list, post_secret_delete, post_secret_set};
+use super::secrets::{
+    get_secret, get_secret_list, get_secret_lock_state, post_secret_delete, post_secret_set,
+};
 use super::state::IykeState;
 use super::statusline::{get_statusline_snapshot, post_statusline_event};
 use super::tasks::{get_task_list, post_task_complete, post_task_create, post_task_update};
@@ -258,12 +261,15 @@ pub async fn serve(
         // Runtime-ACL violations (2026-05-15). Read-only by design — clearing
         // is a human action via Settings → Pkgs only.
         .route("/iyke/violations/list", get(get_violations_list))
+        // WP-40: read-only notifications view (`iyke notifications list`).
+        .route("/iyke/notifications", get(get_notifications))
         .route("/iyke/layout/get", get(get_layout))
         .route("/iyke/layout/reset", post(post_layout_reset))
         .route("/iyke/secret/get", get(get_secret))
         .route("/iyke/secret/list", get(get_secret_list))
         .route("/iyke/secret/set", post(post_secret_set))
         .route("/iyke/secret/delete", post(post_secret_delete))
+        .route("/iyke/secrets/lock-state", get(get_secret_lock_state))
         // Memory primitives (Phase 1 — DESIGN.md §4-6).
         .route("/iyke/scratchpad/write", post(post_scratchpad_write))
         .route("/iyke/scratchpad/append", post(post_scratchpad_append))

@@ -41,13 +41,12 @@ import { Route as NgwaInstalledRouteImport } from './routes/ngwa/installed'
 import { Route as NgwaScopesRouteImport } from './routes/ngwa/scopes'
 import { Route as NgwaStoreRouteImport } from './routes/ngwa/store'
 import { Route as OnboardingIndexRouteImport } from './routes/onboarding/index'
-import { Route as OnboardingAgentRouteImport } from './routes/onboarding/agent'
-import { Route as OnboardingAppearanceRouteImport } from './routes/onboarding/appearance'
-import { Route as OnboardingConnectorsRouteImport } from './routes/onboarding/connectors'
-import { Route as OnboardingPackagesRouteImport } from './routes/onboarding/packages'
-import { Route as OnboardingRootsRouteImport } from './routes/onboarding/roots'
-import { Route as OnboardingScaffoldingRouteImport } from './routes/onboarding/scaffolding'
-import { Route as OnboardingSummaryRouteImport } from './routes/onboarding/summary'
+import { Route as OnboardingDoneRouteImport } from './routes/onboarding/done'
+import { Route as OnboardingEngineRouteImport } from './routes/onboarding/engine'
+import { Route as OnboardingEquipmentRouteImport } from './routes/onboarding/equipment'
+import { Route as OnboardingLookRouteImport } from './routes/onboarding/look'
+import { Route as OnboardingProjectRouteImport } from './routes/onboarding/project'
+import { Route as OnboardingShortcutsRouteImport } from './routes/onboarding/shortcuts'
 import { Route as OnboardingWelcomeRouteImport } from './routes/onboarding/welcome'
 import { Route as OutboxApprovalsRouteImport } from './routes/outbox/approvals'
 import { Route as OutboxEmailRouteImport } from './routes/outbox/email'
@@ -67,15 +66,18 @@ import { Route as SettingsAppearanceRouteImport } from './routes/settings/appear
 import { Route as SettingsArtifactGridRouteImport } from './routes/settings/artifact-grid'
 import { Route as SettingsBackupRouteImport } from './routes/settings/backup'
 import { Route as SettingsDataHealthRouteImport } from './routes/settings/data-health'
+import { Route as SettingsEnginesRouteImport } from './routes/settings/engines'
 import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
 import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
 import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
+import { Route as SettingsPeopleRouteImport } from './routes/settings/people'
 import { Route as SettingsPkgAuditRouteImport } from './routes/settings/pkg-audit'
 import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-health'
 import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
 import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
 import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
 import { Route as SettingsTerminalRouteImport } from './routes/settings/terminal'
+import { Route as SettingsWorkspaceRouteImport } from './routes/settings/workspace'
 import { Route as ArtifactsByKindKindRouteImport } from './routes/artifacts/by-kind.$kind'
 import { Route as NgwaItemItemIdRouteImport } from './routes/ngwa/item.$itemId'
 import { Route as PkgPkgIdIndexRouteImport } from './routes/pkg/$pkgId/index'
@@ -241,39 +243,34 @@ const OnboardingIndexRoute = OnboardingIndexRouteImport.update({
   path: '/',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingAgentRoute = OnboardingAgentRouteImport.update({
-  id: '/agent',
-  path: '/agent',
+const OnboardingDoneRoute = OnboardingDoneRouteImport.update({
+  id: '/done',
+  path: '/done',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingAppearanceRoute = OnboardingAppearanceRouteImport.update({
-  id: '/appearance',
-  path: '/appearance',
+const OnboardingEngineRoute = OnboardingEngineRouteImport.update({
+  id: '/engine',
+  path: '/engine',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingConnectorsRoute = OnboardingConnectorsRouteImport.update({
-  id: '/connectors',
-  path: '/connectors',
+const OnboardingEquipmentRoute = OnboardingEquipmentRouteImport.update({
+  id: '/equipment',
+  path: '/equipment',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingPackagesRoute = OnboardingPackagesRouteImport.update({
-  id: '/packages',
-  path: '/packages',
+const OnboardingLookRoute = OnboardingLookRouteImport.update({
+  id: '/look',
+  path: '/look',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingRootsRoute = OnboardingRootsRouteImport.update({
-  id: '/roots',
-  path: '/roots',
+const OnboardingProjectRoute = OnboardingProjectRouteImport.update({
+  id: '/project',
+  path: '/project',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
-const OnboardingScaffoldingRoute = OnboardingScaffoldingRouteImport.update({
-  id: '/scaffolding',
-  path: '/scaffolding',
-  getParentRoute: () => OnboardingRouteRoute,
-} as any)
-const OnboardingSummaryRoute = OnboardingSummaryRouteImport.update({
-  id: '/summary',
-  path: '/summary',
+const OnboardingShortcutsRoute = OnboardingShortcutsRouteImport.update({
+  id: '/shortcuts',
+  path: '/shortcuts',
   getParentRoute: () => OnboardingRouteRoute,
 } as any)
 const OnboardingWelcomeRoute = OnboardingWelcomeRouteImport.update({
@@ -371,6 +368,11 @@ const SettingsDataHealthRoute = SettingsDataHealthRouteImport.update({
   path: '/data-health',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsEnginesRoute = SettingsEnginesRouteImport.update({
+  id: '/engines',
+  path: '/engines',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const SettingsIntegrationsRoute = SettingsIntegrationsRouteImport.update({
   id: '/integrations',
   path: '/integrations',
@@ -384,6 +386,11 @@ const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
 const SettingsPackagesRoute = SettingsPackagesRouteImport.update({
   id: '/packages',
   path: '/packages',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsPeopleRoute = SettingsPeopleRouteImport.update({
+  id: '/people',
+  path: '/people',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const SettingsPkgAuditRoute = SettingsPkgAuditRouteImport.update({
@@ -414,6 +421,11 @@ const SettingsStorageRoute = SettingsStorageRouteImport.update({
 const SettingsTerminalRoute = SettingsTerminalRouteImport.update({
   id: '/terminal',
   path: '/terminal',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsWorkspaceRoute = SettingsWorkspaceRouteImport.update({
+  id: '/workspace',
+  path: '/workspace',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const ArtifactsByKindKindRoute = ArtifactsByKindKindRouteImport.update({
@@ -468,13 +480,12 @@ export interface FileRoutesByFullPath {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -491,15 +502,18 @@ export interface FileRoutesByFullPath {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi/': typeof ChiIndexRoute
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
@@ -538,13 +552,12 @@ export interface FileRoutesByTo {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -561,15 +574,18 @@ export interface FileRoutesByTo {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi': typeof ChiIndexRoute
   '/ngwa': typeof NgwaIndexRoute
   '/onboarding': typeof OnboardingIndexRoute
@@ -612,13 +628,12 @@ export interface FileRoutesById {
   '/ngwa/installed': typeof NgwaInstalledRoute
   '/ngwa/scopes': typeof NgwaScopesRoute
   '/ngwa/store': typeof NgwaStoreRoute
-  '/onboarding/agent': typeof OnboardingAgentRoute
-  '/onboarding/appearance': typeof OnboardingAppearanceRoute
-  '/onboarding/connectors': typeof OnboardingConnectorsRoute
-  '/onboarding/packages': typeof OnboardingPackagesRoute
-  '/onboarding/roots': typeof OnboardingRootsRoute
-  '/onboarding/scaffolding': typeof OnboardingScaffoldingRoute
-  '/onboarding/summary': typeof OnboardingSummaryRoute
+  '/onboarding/done': typeof OnboardingDoneRoute
+  '/onboarding/engine': typeof OnboardingEngineRoute
+  '/onboarding/equipment': typeof OnboardingEquipmentRoute
+  '/onboarding/look': typeof OnboardingLookRoute
+  '/onboarding/project': typeof OnboardingProjectRoute
+  '/onboarding/shortcuts': typeof OnboardingShortcutsRoute
   '/onboarding/welcome': typeof OnboardingWelcomeRoute
   '/outbox/approvals': typeof OutboxApprovalsRoute
   '/outbox/email': typeof OutboxEmailRoute
@@ -635,15 +650,18 @@ export interface FileRoutesById {
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
+  '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
+  '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
   '/settings/storage': typeof SettingsStorageRoute
   '/settings/terminal': typeof SettingsTerminalRoute
+  '/settings/workspace': typeof SettingsWorkspaceRoute
   '/chi/': typeof ChiIndexRoute
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
@@ -687,13 +705,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -710,15 +727,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi/'
     | '/ngwa/'
     | '/onboarding/'
@@ -757,13 +777,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -780,15 +799,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi'
     | '/ngwa'
     | '/onboarding'
@@ -830,13 +852,12 @@ export interface FileRouteTypes {
     | '/ngwa/installed'
     | '/ngwa/scopes'
     | '/ngwa/store'
-    | '/onboarding/agent'
-    | '/onboarding/appearance'
-    | '/onboarding/connectors'
-    | '/onboarding/packages'
-    | '/onboarding/roots'
-    | '/onboarding/scaffolding'
-    | '/onboarding/summary'
+    | '/onboarding/done'
+    | '/onboarding/engine'
+    | '/onboarding/equipment'
+    | '/onboarding/look'
+    | '/onboarding/project'
+    | '/onboarding/shortcuts'
     | '/onboarding/welcome'
     | '/outbox/approvals'
     | '/outbox/email'
@@ -853,15 +874,18 @@ export interface FileRouteTypes {
     | '/settings/artifact-grid'
     | '/settings/backup'
     | '/settings/data-health'
+    | '/settings/engines'
     | '/settings/integrations'
     | '/settings/onboarding'
     | '/settings/packages'
+    | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
     | '/settings/projects'
     | '/settings/secrets'
     | '/settings/storage'
     | '/settings/terminal'
+    | '/settings/workspace'
     | '/chi/'
     | '/ngwa/'
     | '/onboarding/'
@@ -1140,53 +1164,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OnboardingIndexRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/agent': {
-      id: '/onboarding/agent'
-      path: '/agent'
-      fullPath: '/onboarding/agent'
-      preLoaderRoute: typeof OnboardingAgentRouteImport
+    '/onboarding/done': {
+      id: '/onboarding/done'
+      path: '/done'
+      fullPath: '/onboarding/done'
+      preLoaderRoute: typeof OnboardingDoneRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/appearance': {
-      id: '/onboarding/appearance'
-      path: '/appearance'
-      fullPath: '/onboarding/appearance'
-      preLoaderRoute: typeof OnboardingAppearanceRouteImport
+    '/onboarding/engine': {
+      id: '/onboarding/engine'
+      path: '/engine'
+      fullPath: '/onboarding/engine'
+      preLoaderRoute: typeof OnboardingEngineRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/connectors': {
-      id: '/onboarding/connectors'
-      path: '/connectors'
-      fullPath: '/onboarding/connectors'
-      preLoaderRoute: typeof OnboardingConnectorsRouteImport
+    '/onboarding/equipment': {
+      id: '/onboarding/equipment'
+      path: '/equipment'
+      fullPath: '/onboarding/equipment'
+      preLoaderRoute: typeof OnboardingEquipmentRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/packages': {
-      id: '/onboarding/packages'
-      path: '/packages'
-      fullPath: '/onboarding/packages'
-      preLoaderRoute: typeof OnboardingPackagesRouteImport
+    '/onboarding/look': {
+      id: '/onboarding/look'
+      path: '/look'
+      fullPath: '/onboarding/look'
+      preLoaderRoute: typeof OnboardingLookRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/roots': {
-      id: '/onboarding/roots'
-      path: '/roots'
-      fullPath: '/onboarding/roots'
-      preLoaderRoute: typeof OnboardingRootsRouteImport
+    '/onboarding/project': {
+      id: '/onboarding/project'
+      path: '/project'
+      fullPath: '/onboarding/project'
+      preLoaderRoute: typeof OnboardingProjectRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
-    '/onboarding/scaffolding': {
-      id: '/onboarding/scaffolding'
-      path: '/scaffolding'
-      fullPath: '/onboarding/scaffolding'
-      preLoaderRoute: typeof OnboardingScaffoldingRouteImport
-      parentRoute: typeof OnboardingRouteRoute
-    }
-    '/onboarding/summary': {
-      id: '/onboarding/summary'
-      path: '/summary'
-      fullPath: '/onboarding/summary'
-      preLoaderRoute: typeof OnboardingSummaryRouteImport
+    '/onboarding/shortcuts': {
+      id: '/onboarding/shortcuts'
+      path: '/shortcuts'
+      fullPath: '/onboarding/shortcuts'
+      preLoaderRoute: typeof OnboardingShortcutsRouteImport
       parentRoute: typeof OnboardingRouteRoute
     }
     '/onboarding/welcome': {
@@ -1322,6 +1339,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsDataHealthRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/engines': {
+      id: '/settings/engines'
+      path: '/engines'
+      fullPath: '/settings/engines'
+      preLoaderRoute: typeof SettingsEnginesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/settings/integrations': {
       id: '/settings/integrations'
       path: '/integrations'
@@ -1341,6 +1365,13 @@ declare module '@tanstack/react-router' {
       path: '/packages'
       fullPath: '/settings/packages'
       preLoaderRoute: typeof SettingsPackagesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/people': {
+      id: '/settings/people'
+      path: '/people'
+      fullPath: '/settings/people'
+      preLoaderRoute: typeof SettingsPeopleRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
     '/settings/pkg-audit': {
@@ -1385,6 +1416,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsTerminalRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/workspace': {
+      id: '/settings/workspace'
+      path: '/workspace'
+      fullPath: '/settings/workspace'
+      preLoaderRoute: typeof SettingsWorkspaceRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/artifacts/by-kind/$kind': {
       id: '/artifacts/by-kind/$kind'
       path: '/artifacts/by-kind/$kind'
@@ -1417,25 +1455,23 @@ declare module '@tanstack/react-router' {
 }
 
 interface OnboardingRouteRouteChildren {
-  OnboardingAgentRoute: typeof OnboardingAgentRoute
-  OnboardingAppearanceRoute: typeof OnboardingAppearanceRoute
-  OnboardingConnectorsRoute: typeof OnboardingConnectorsRoute
-  OnboardingPackagesRoute: typeof OnboardingPackagesRoute
-  OnboardingRootsRoute: typeof OnboardingRootsRoute
-  OnboardingScaffoldingRoute: typeof OnboardingScaffoldingRoute
-  OnboardingSummaryRoute: typeof OnboardingSummaryRoute
+  OnboardingDoneRoute: typeof OnboardingDoneRoute
+  OnboardingEngineRoute: typeof OnboardingEngineRoute
+  OnboardingEquipmentRoute: typeof OnboardingEquipmentRoute
+  OnboardingLookRoute: typeof OnboardingLookRoute
+  OnboardingProjectRoute: typeof OnboardingProjectRoute
+  OnboardingShortcutsRoute: typeof OnboardingShortcutsRoute
   OnboardingWelcomeRoute: typeof OnboardingWelcomeRoute
   OnboardingIndexRoute: typeof OnboardingIndexRoute
 }
 
 const OnboardingRouteRouteChildren: OnboardingRouteRouteChildren = {
-  OnboardingAgentRoute: OnboardingAgentRoute,
-  OnboardingAppearanceRoute: OnboardingAppearanceRoute,
-  OnboardingConnectorsRoute: OnboardingConnectorsRoute,
-  OnboardingPackagesRoute: OnboardingPackagesRoute,
-  OnboardingRootsRoute: OnboardingRootsRoute,
-  OnboardingScaffoldingRoute: OnboardingScaffoldingRoute,
-  OnboardingSummaryRoute: OnboardingSummaryRoute,
+  OnboardingDoneRoute: OnboardingDoneRoute,
+  OnboardingEngineRoute: OnboardingEngineRoute,
+  OnboardingEquipmentRoute: OnboardingEquipmentRoute,
+  OnboardingLookRoute: OnboardingLookRoute,
+  OnboardingProjectRoute: OnboardingProjectRoute,
+  OnboardingShortcutsRoute: OnboardingShortcutsRoute,
   OnboardingWelcomeRoute: OnboardingWelcomeRoute,
   OnboardingIndexRoute: OnboardingIndexRoute,
 }
@@ -1472,15 +1508,18 @@ interface SettingsRouteRouteChildren {
   SettingsArtifactGridRoute: typeof SettingsArtifactGridRoute
   SettingsBackupRoute: typeof SettingsBackupRoute
   SettingsDataHealthRoute: typeof SettingsDataHealthRoute
+  SettingsEnginesRoute: typeof SettingsEnginesRoute
   SettingsIntegrationsRoute: typeof SettingsIntegrationsRoute
   SettingsOnboardingRoute: typeof SettingsOnboardingRoute
   SettingsPackagesRoute: typeof SettingsPackagesRoute
+  SettingsPeopleRoute: typeof SettingsPeopleRoute
   SettingsPkgAuditRoute: typeof SettingsPkgAuditRoute
   SettingsPkgHealthRoute: typeof SettingsPkgHealthRoute
   SettingsProjectsRoute: typeof SettingsProjectsRoute
   SettingsSecretsRoute: typeof SettingsSecretsRoute
   SettingsStorageRoute: typeof SettingsStorageRoute
   SettingsTerminalRoute: typeof SettingsTerminalRoute
+  SettingsWorkspaceRoute: typeof SettingsWorkspaceRoute
   SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
@@ -1492,15 +1531,18 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsArtifactGridRoute: SettingsArtifactGridRoute,
   SettingsBackupRoute: SettingsBackupRoute,
   SettingsDataHealthRoute: SettingsDataHealthRoute,
+  SettingsEnginesRoute: SettingsEnginesRoute,
   SettingsIntegrationsRoute: SettingsIntegrationsRoute,
   SettingsOnboardingRoute: SettingsOnboardingRoute,
   SettingsPackagesRoute: SettingsPackagesRoute,
+  SettingsPeopleRoute: SettingsPeopleRoute,
   SettingsPkgAuditRoute: SettingsPkgAuditRoute,
   SettingsPkgHealthRoute: SettingsPkgHealthRoute,
   SettingsProjectsRoute: SettingsProjectsRoute,
   SettingsSecretsRoute: SettingsSecretsRoute,
   SettingsStorageRoute: SettingsStorageRoute,
   SettingsTerminalRoute: SettingsTerminalRoute,
+  SettingsWorkspaceRoute: SettingsWorkspaceRoute,
   SettingsIndexRoute: SettingsIndexRoute,
 }
 

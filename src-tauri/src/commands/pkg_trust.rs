@@ -19,7 +19,7 @@ use crate::commands::db::PaDb;
 use crate::commands::pkg::KernelState;
 use crate::pkg::cap_snapshot;
 use crate::pkg::kernel::InstalledSummary;
-use crate::pkg::manifest::Package;
+use crate::pkg::manifest::{CapabilitiesBlock, Package, Permissions};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrustReview {
@@ -100,6 +100,80 @@ pub(crate) async fn pending_trust_reviews(
     }
     out.sort_by(|a, b| a.pkg_id.cmp(&b.pkg_id));
     Ok(out)
+}
+
+/// Diff an incoming (not-yet-installed) version's `capabilities` +
+/// `permissions` against what's already approved for `pkg_id`, without
+/// installing anything (WP-41-F1). Powers the updater batch
+/// (`use-update-pkgs.ts`): `install_from_path` unconditionally records the
+/// installed manifest as implicitly approved, so by the time a caller could
+/// check `pkg_trust_list_pending` after installing, the snapshot already
+/// matches — the diff has to happen BEFORE the install runs instead.
+///
+/// `capabilities_json` / `permissions_json` are the raw `capabilities` /
+/// `permissions` blocks from the incoming manifest (the registry's fetched
+/// pkg detail is manifest-shaped — see `pkg-install-sheet.tsx`'s
+/// `extractElevatedCaps`), passed as JSON strings from the FE since it has
+/// no typed `Manifest` to hand over. Returns `None` when there's nothing to
+/// flag: no capability/permission change, or the pkg isn't installed yet
+/// and has no prior snapshot to diff against (nothing to protect from a
+/// first install).
+#[tauri::command]
+pub async fn pkg_trust_preview_incoming(
+    db: State<'_, Arc<PaDb>>,
+    kernel: State<'_, KernelState>,
+    pkg_id: String,
+    manifest_version: String,
+    capabilities_json: Option<String>,
+    permissions_json: Option<String>,
+) -> Result<Option<TrustReview>, String> {
+    let capabilities: Option<CapabilitiesBlock> = match capabilities_json.as_deref() {
+        Some(s) if !s.is_empty() && s != "null" => Some(
+            serde_json::from_str(s).map_err(|e| format!("parse incoming capabilities: {e}"))?,
+        ),
+        _ => None,
+    };
+    let permissions: Permissions = match permissions_json.as_deref() {
+        Some(s) if !s.is_empty() && s != "null" => {
+            serde_json::from_str(s).map_err(|e| format!("parse incoming permissions: {e}"))?
+        }
+        _ => Permissions::default(),
+    };
+    let new_norm = cap_snapshot::normalize_parts(capabilities.as_ref(), &permissions);
+
+    let pool = db.ensure_pool().await?;
+    let old_norm = match cap_snapshot::fetch(&pool, &pkg_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?
+    {
+        Some(snap) => snap.manifest_capabilities_json,
+        None => {
+            // No snapshot on file — fall back to the currently-installed
+            // manifest's own capabilities as the closest stand-in for "what
+            // the user already has". Not installed at all yet → nothing to
+            // diff against, so don't park a first install.
+            let Some(installed) = kernel.0.installed_summary(&pkg_id) else {
+                return Ok(None);
+            };
+            let pkg = Package::load(Path::new(&installed.install_path))
+                .map_err(|e| format!("reload manifest: {e:#}"))?;
+            cap_snapshot::normalize(&pkg.manifest)
+        }
+    };
+
+    if !cap_snapshot::capabilities_changed(&old_norm, &new_norm) {
+        return Ok(None);
+    }
+
+    Ok(Some(TrustReview {
+        pkg_id,
+        manifest_version,
+        old_capabilities: old_norm,
+        new_capabilities: new_norm,
+        // Not yet approved at all — there's no prior-approval timestamp to
+        // show for a diff that hasn't been through the review UI yet.
+        prior_approved_at_ms: 0,
+    }))
 }
 
 /// Approve the current manifest's capability set: write a new explicit

@@ -1,6 +1,6 @@
 [package]
 name = "ikenga-desktop"
-version = "0.12.0"
+version = "0.14.0"
 description = "PA Desktop — Tauri + xterm + portable-pty"
 authors = ["Ikenga"]
 edition = "2021"
@@ -83,6 +83,14 @@ glob = "0.3"
 trash = "5"
 hex = "0.4"
 rand = "0.8"
+rust-argon2 = "=2.1.0"
+# `zeroize` on aes-gcm wipes its GHASH key derivation; the AES round keys are
+# wiped only by `aes`'s own `zeroize` feature, enabled here via feature
+# unification (same aes 0.8 that aes-gcm already pulls in).
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+zeroize = "1.9"
+dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
