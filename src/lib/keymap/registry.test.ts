@@ -185,8 +185,16 @@ describe('conflicts() — DEC-59', () => {
 
 	it('no longer reads `knownOverlap` (the pairwise overlap table is gone)', () => {
 		const stripped = getKeymap().map((e) => ({ ...e, knownOverlap: undefined }));
-		expect(conflicts({ platform: 'mac', entries: stripped })).toEqual(conflicts({ platform: 'mac' }));
-		expect(conflicts({ platform: 'other', entries: stripped })).toEqual(conflicts({ platform: 'other' }));
+		// The result carries the entries themselves, so compare it with the
+		// field dropped — what must match is which pairs are reported.
+		const shape = (r: unknown) =>
+			JSON.parse(JSON.stringify(r, (k, v) => (k === 'knownOverlap' ? undefined : v)));
+		expect(shape(conflicts({ platform: 'mac', entries: stripped }))).toEqual(
+			shape(conflicts({ platform: 'mac' }))
+		);
+		expect(shape(conflicts({ platform: 'other', entries: stripped }))).toEqual(
+			shape(conflicts({ platform: 'other' }))
+		);
 	});
 });
 
