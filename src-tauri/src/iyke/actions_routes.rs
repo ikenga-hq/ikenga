@@ -100,7 +100,10 @@ pub fn actions_pending() -> &'static Pending<Value> {
 /// `GET /iyke/menus/:id` never serve a stale merge after a file edit,
 /// a package install, or a project switch.
 #[tauri::command]
-pub async fn iyke_set_actions_frame(actions: Option<Value>, menus: Option<Value>) -> Result<(), String> {
+pub async fn iyke_set_actions_frame(
+    actions: Option<Value>,
+    menus: Option<Value>,
+) -> Result<(), String> {
     actions_frame_mirror().set(actions, menus).await;
     Ok(())
 }
@@ -298,11 +301,26 @@ fn import_timeout(item_count: usize) -> Duration {
     REQUEST_TIMEOUT + Duration::from_millis(250 * item_count as u64)
 }
 
+/// The largest batch one import takes. Its timeout (10 s + 200 × 250 ms =
+/// 60 s) stays under the CLI's 65 s POST timeout, so the caller can never be
+/// told "timed out" while the shell is still writing items. Bigger imports
+/// are refused whole, before anything is written; split them.
+pub const MAX_IMPORT_ITEMS: usize = 200;
+
 /// `POST /iyke/actions/import` — upserts a batch of user actions.
 pub async fn post_actions_import(
     Extension(app): Extension<AppHandle>,
     JsonBody(body): JsonBody<ActionsImportBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    if body.actions.len() > MAX_IMPORT_ITEMS {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "an import takes at most {MAX_IMPORT_ITEMS} actions ({} sent) — nothing was written; split the file",
+                body.actions.len()
+            ),
+        ));
+    }
     let timeout = import_timeout(body.actions.len());
     let result = rpc::request_to(
         &app,
@@ -435,6 +453,8 @@ mod tests {
     fn import_timeout_scales_with_item_count() {
         assert_eq!(import_timeout(0), REQUEST_TIMEOUT);
         assert!(import_timeout(100) > REQUEST_TIMEOUT);
+        // The largest batch still answers inside the CLI's 65 s POST timeout.
+        assert!(import_timeout(MAX_IMPORT_ITEMS) < Duration::from_secs(65));
     }
 
     #[tokio::test]
@@ -447,7 +467,10 @@ mod tests {
     async fn actions_mirror_partial_update_keeps_menus() {
         let mirror = ActionsFrameMirror::default();
         mirror
-            .set(Some(json!([{"id": "a"}])), Some(json!({"files": {"id": "files"}})))
+            .set(
+                Some(json!([{"id": "a"}])),
+                Some(json!({"files": {"id": "files"}})),
+            )
             .await;
         // A push with actions only (menus: None) must not clobber menus —
         // same partial-update contract as `handlers::FrameMirror`.
@@ -524,7 +547,9 @@ mod tests {
                 None,
             )
             .await;
-        let Json(personal_only) = actions_list_response(&mirror, Some("personal")).await.unwrap();
+        let Json(personal_only) = actions_list_response(&mirror, Some("personal"))
+            .await
+            .unwrap();
         assert_eq!(personal_only["count"], 1);
         let Json(all) = actions_list_response(&mirror, None).await.unwrap();
         assert_eq!(all["count"], 3);
@@ -543,7 +568,9 @@ mod tests {
         mirror
             .set(None, Some(json!({"files": {"id": "files", "items": []}})))
             .await;
-        let err = menu_response(&mirror, "nonexistent-menu-id").await.unwrap_err();
+        let err = menu_response(&mirror, "nonexistent-menu-id")
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 

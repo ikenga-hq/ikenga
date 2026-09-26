@@ -192,6 +192,15 @@ pub struct KeymapEntryInfo {
     pub key_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_only: Option<String>,
+    /// WP-62 (DEC-65): `"held"` for a project rule an untrusted project's
+    /// `keybindings.json` asked for — it fires nothing until trusted. Absent
+    /// on working rows. Without these two fields serde would drop them and
+    /// `iyke keys list` would show a held rule as a working binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The trust state holding a `held` row (`untrusted`, `changed`, `unknown`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
 }
 
 /// WP-28: one `GET /iyke/explorer/sections` row — mirrors the FE store's
@@ -2231,6 +2240,8 @@ mod tests {
                 label: "Command palette".into(),
                 key_label: "Ctrl+K".into(),
                 platform_only: None,
+                status: None,
+                trust: None,
             },
             super::KeymapEntryInfo {
                 command: "terminal.clear".into(),
@@ -2240,8 +2251,35 @@ mod tests {
                 label: "Clear terminal".into(),
                 key_label: "⌘K".into(),
                 platform_only: Some("mac".into()),
+                status: None,
+                trust: None,
             },
         ]
+    }
+
+    /// WP-62 review: a held project rule keeps `status` / `trust` through
+    /// the FE → Rust frame and back out of `GET /iyke/keys`.
+    #[test]
+    fn held_keymap_row_round_trips_status_and_trust() {
+        let raw = serde_json::json!({
+            "command": "pane.close",
+            "key": "mod+shift+g",
+            "when": "",
+            "source": "project",
+            "label": "pane.close",
+            "key_label": "Ctrl+Shift+G",
+            "status": "held",
+            "trust": "untrusted",
+        });
+        let row: super::KeymapEntryInfo = serde_json::from_value(raw).expect("held row parses");
+        assert_eq!(row.status.as_deref(), Some("held"));
+        assert_eq!(row.trust.as_deref(), Some("untrusted"));
+        let out = serde_json::to_value(&row).expect("serializes");
+        assert_eq!(out["status"], "held");
+        assert_eq!(out["trust"], "untrusted");
+        // A working row carries neither field on the wire.
+        let working = serde_json::to_value(&sample_keys()[0]).expect("serializes");
+        assert!(working.get("status").is_none() && working.get("trust").is_none());
     }
 
     #[test]

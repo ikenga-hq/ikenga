@@ -197,7 +197,9 @@ export function keymapPayload(
 function heldKeymapRow(h: HeldKeybinding): IykeKeymapEntry {
 	const command = h.rule.command.startsWith('-') ? h.rule.command.slice(1) : h.rule.command;
 	return {
-		command,
+		// Keep a removal rule's leading `-`: a held `-pane.close` asks to
+		// unbind, and must not read as a new binding.
+		command: h.rule.command,
 		key: h.rule.key,
 		when: h.rule.when ?? '',
 		source: 'project',
@@ -498,7 +500,12 @@ async function handleKeysSetRequest(payload: KeysSetRequestPayload): Promise<voi
 			...(payload.scope === 'project' ? { held: true } : {}),
 		});
 	} catch (err) {
-		await reportRequestResult(payload.request_id, { ok: false, error: requestErrorMessage(err) });
+		await reportRequestResult(payload.request_id, {
+			ok: false,
+			error: requestErrorMessage(err),
+			// S5: the full §1.6 validation, same as the action writes.
+			...(err instanceof ActionsValidationError ? { validation: err.validation } : {}),
+		});
 	}
 }
 
