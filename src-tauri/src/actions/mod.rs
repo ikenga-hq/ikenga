@@ -33,7 +33,7 @@ use crate::settings::SettingsScope;
 use self::schema::{FileKind, ValidateContext, Validation};
 use self::scope::{FileState, RawRead};
 use self::trust::{ActionTrust, GrantAction, KeybindingsTrust, TrustStore};
-use self::watch::ActionsWatcher;
+use self::watch::{ActionsWatcher, ChangeReason};
 
 /// Both files of one scope.
 #[derive(Clone, Debug, Serialize)]
@@ -74,17 +74,32 @@ pub struct ActionsWriteResult {
 }
 
 /// `actions_trust_status`.
+///
+/// Computed from the same **in-force** documents `actions_read_files`
+/// serves: while a project file on disk is malformed, the last valid
+/// document read this session stays in force (§1.1) and is what the status
+/// describes (`*_stale: true`, the problem in `*_error`).
+///
+/// **Fail closed:** an action id missing from `actions` is untrusted. A
+/// consumer (WP-53's run gate) must refuse a gated run whose id it cannot
+/// find here, never treat "not listed" as "not gated".
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustStatus {
     pub project_id: String,
     pub project_root: String,
-    /// Every project action with its pin state. Empty when the project's
-    /// `actions.json` is absent or invalid (see `actions_error`).
+    /// Every project action in force with its pin state. Empty when the
+    /// project's `actions.json` is absent, or malformed with no last valid
+    /// document this session (see `actions_error`).
     pub actions: Vec<ActionTrust>,
+    /// A problem with the file on disk (invalid, linked, I/O).
     pub actions_error: Option<String>,
+    /// `actions` describes the last valid document, not the file on disk.
+    pub actions_stale: bool,
     pub keybindings: KeybindingsTrust,
     pub keybindings_error: Option<String>,
+    /// `keybindings` describes the last valid document, not the file on disk.
+    pub keybindings_stale: bool,
 }
 
 /// `actions_trust_grant` request. Each hash is the one the user was shown;
@@ -122,9 +137,57 @@ pub struct ActionsManager {
     watcher: ActionsWatcher,
     write_lock: AsyncMutex<()>,
     trust_lock: AsyncMutex<()>,
+    /// Serializes whole watcher refreshes (boot and `projects:active-changed`
+    /// may overlap), so the last resolved project is the one watched.
+    refresh_lock: AsyncMutex<()>,
     /// Last valid document per path — what stays in force while the file
     /// on disk is malformed (§1.1).
-    last_valid: Mutex<HashMap<PathBuf, Value>>,
+    last_valid: LastValid,
+}
+
+/// The §1.1 stale fallback: the last valid document read (or written) this
+/// session per path. `actions_read_files` and the trust status both resolve
+/// the document in force through it, so they cannot disagree.
+#[derive(Default)]
+struct LastValid(Mutex<HashMap<PathBuf, Value>>);
+
+impl LastValid {
+    fn remember(&self, path: &Path, raw: &RawRead) {
+        let Ok(mut cache) = self.0.lock() else {
+            return;
+        };
+        if !raw.present && raw.error.is_none() {
+            cache.remove(path);
+        } else if let Some(document) = scope::valid_document(raw) {
+            cache.insert(path.to_path_buf(), document.clone());
+        }
+    }
+
+    fn insert(&self, path: &Path, document: Value) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.insert(path.to_path_buf(), document);
+        }
+    }
+
+    /// Remembers `raw`, then returns the document in force for `path`: the
+    /// file when valid, nothing when absent, else the last valid document
+    /// (`stale: true`), or nothing if there was none this session.
+    fn in_force(&self, path: &Path, raw: &RawRead) -> (Option<Value>, bool) {
+        self.remember(path, raw);
+        if let Some(document) = scope::valid_document(raw) {
+            return (Some(document.clone()), false);
+        }
+        if !raw.present && raw.error.is_none() {
+            return (None, false);
+        }
+        let fallback = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(path).cloned());
+        let stale = fallback.is_some();
+        (fallback, stale)
+    }
 }
 
 impl ActionsManager {
@@ -138,7 +201,8 @@ impl ActionsManager {
             trust: TrustStore::new(&app_data_dir),
             write_lock: AsyncMutex::new(()),
             trust_lock: AsyncMutex::new(()),
-            last_valid: Mutex::new(HashMap::new()),
+            refresh_lock: AsyncMutex::new(()),
+            last_valid: LastValid::default(),
         }
     }
 
@@ -146,6 +210,7 @@ impl ActionsManager {
     /// `.ikenga/` directories. Called at boot and on
     /// `projects:active-changed`.
     pub async fn refresh_watch(&self) -> Result<(), String> {
+        let _guard = self.refresh_lock.lock().await;
         let mut targets = vec![(
             scope::ikenga_dir(&self.home),
             SettingsScope::Personal,
@@ -181,17 +246,6 @@ impl ActionsManager {
         }
     }
 
-    fn remember(&self, path: &Path, raw: &RawRead) {
-        let Ok(mut cache) = self.last_valid.lock() else {
-            return;
-        };
-        if !raw.present && raw.error.is_none() {
-            cache.remove(path);
-        } else if let Some(document) = scope::valid_document(raw) {
-            cache.insert(path.to_path_buf(), document.clone());
-        }
-    }
-
     fn file_state(
         &self,
         kind: FileKind,
@@ -199,19 +253,7 @@ impl ActionsManager {
         path: &Path,
         raw: RawRead,
     ) -> FileState {
-        self.remember(path, &raw);
-        let valid = scope::valid_document(&raw).is_some();
-        let (document, stale) = if valid || (!raw.present && raw.error.is_none()) {
-            (raw.document.clone().filter(|_| valid), false)
-        } else {
-            let fallback = self
-                .last_valid
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(path).cloned());
-            let stale = fallback.is_some();
-            (fallback, stale)
-        };
+        let (document, stale) = self.last_valid.in_force(path, &raw);
         FileState {
             kind,
             scope,
@@ -347,11 +389,10 @@ impl ActionsManager {
         };
         let validation = scope::write_validated(&path, ctx, &document)?;
         let written = validation.is_ok();
+        // No emit here: the directory watcher sees the atomic rename and
+        // emits `actions://changed` once (a manual emit doubled it).
         if written {
-            if let Ok(mut cache) = self.last_valid.lock() {
-                cache.insert(path.clone(), document);
-            }
-            watch::emit_change(&self.app, &path, kind, scope);
+            self.last_valid.insert(&path, document);
         }
         Ok(ActionsWriteResult {
             written,
@@ -387,7 +428,10 @@ impl ActionsManager {
     }
 
     /// Creates the file with an empty valid skeleton when absent, then opens
-    /// it with the OS handler. Returns the path.
+    /// it with the OS handler. Returns the path. A symlinked / reparse-point
+    /// file or `.ikenga/` directory is refused before anything is written or
+    /// opened: the OS opener follows links, so a project's
+    /// `.ikenga/actions.json` pointing at a `.command` / `.app` would run it.
     pub async fn open_file(
         &self,
         kind: FileKind,
@@ -397,7 +441,8 @@ impl ActionsManager {
         let _guard = self.write_lock.lock().await;
         let project = self.resolve_project(project_id).await?;
         let path = self.path_for(kind, scope, Some(&project))?;
-        if !path.exists() {
+        let refuse = |error: String| format!("refusing to open {}: {error}", path.display());
+        if !scope::present_unlinked(&path).map_err(refuse)? {
             let ctx = ValidateContext {
                 kind,
                 scope,
@@ -408,6 +453,9 @@ impl ActionsManager {
                 return Err(validation.summary());
             }
         }
+        // Re-checked right before the hand-off: the file is the project's to
+        // replace at any time.
+        scope::present_unlinked(&path).map_err(refuse)?;
         open_path(&path)?;
         Ok(path.to_string_lossy().into_owned())
     }
@@ -431,8 +479,11 @@ impl ActionsManager {
         let root = project.root.as_ref().expect("checked by project_with_root");
         let pins = record.project(id, &root_text);
 
+        // The same in-force documents `read_files` serves: a malformed file
+        // keeps its last valid document in force (§1.1), and so its trust.
+        let actions_path = scope::project_file(root, FileKind::Actions);
         let actions_read = scope::read_raw(
-            &scope::project_file(root, FileKind::Actions),
+            &actions_path,
             ValidateContext {
                 kind: FileKind::Actions,
                 scope: SettingsScope::Project,
@@ -440,12 +491,15 @@ impl ActionsManager {
             },
         );
         let actions_error = read_problem(&actions_read);
-        let actions = scope::valid_document(&actions_read)
+        let (actions_doc, actions_stale) = self.last_valid.in_force(&actions_path, &actions_read);
+        let actions = actions_doc
+            .as_ref()
             .map(|document| trust::action_trust(document, pins))
             .unwrap_or_default();
 
+        let keys_path = scope::project_file(root, FileKind::Keybindings);
         let keys_read = scope::read_raw(
-            &scope::project_file(root, FileKind::Keybindings),
+            &keys_path,
             ValidateContext {
                 kind: FileKind::Keybindings,
                 scope: SettingsScope::Project,
@@ -453,17 +507,18 @@ impl ActionsManager {
             },
         );
         let keybindings_error = read_problem(&keys_read);
-        // An invalid file is not in force, so nothing of it is trusted or
-        // held; report it as absent with the error alongside.
-        let keybindings = trust::keybindings_trust(scope::valid_document(&keys_read), pins);
+        let (keys_doc, keybindings_stale) = self.last_valid.in_force(&keys_path, &keys_read);
+        let keybindings = trust::keybindings_trust(keys_doc.as_ref(), pins);
 
         Ok(TrustStatus {
             project_id: id.to_string(),
             project_root: root_text,
             actions,
             actions_error,
+            actions_stale,
             keybindings,
             keybindings_error,
+            keybindings_stale,
         })
     }
 
@@ -493,16 +548,42 @@ impl ActionsManager {
                 return Err(format!("the project keybindings.json is not valid: {error}"));
             }
         }
+        // Pins for actions the file no longer defines are pruned only
+        // against a valid `actions.json` on disk: a momentarily malformed
+        // (or stale) one must not wipe every action pin on a keybindings-only
+        // grant.
+        let actions_valid = status.actions_error.is_none() && !status.actions_stale;
         let entry = record.project_mut(&status.project_id, &status.project_root);
         trust::apply_grant(
             entry,
             &status.actions,
+            actions_valid,
             &status.keybindings,
             &request.actions,
             request.keybindings.as_deref(),
         )?;
         self.trust.save(&record)?;
+        let files = trust_files(!request.actions.is_empty(), request.keybindings.is_some());
+        self.emit_trust_change(&project, &files);
         self.status_for(&project, &record)
+    }
+
+    /// DEC-55 / DEC-65: a grant or revoke changes which project rules and
+    /// runs are in force without touching either file, so the watcher never
+    /// sees it; tell the client to re-read.
+    fn emit_trust_change(&self, project: &ResolvedProject, files: &[FileKind]) {
+        let Some(root) = project.root.as_ref() else {
+            return;
+        };
+        for kind in files {
+            watch::emit_change(
+                &self.app,
+                &scope::project_file(root, *kind),
+                *kind,
+                SettingsScope::Project,
+                Some(ChangeReason::Trust),
+            );
+        }
     }
 
     pub async fn trust_revoke(
@@ -515,6 +596,14 @@ impl ActionsManager {
         let mut record = self.trust.load()?;
         let (id, _) = Self::project_with_root(&project)?;
         let everything = request.action_ids.is_none() && request.keybindings.is_none();
+        let files = if everything {
+            trust_files(true, true)
+        } else {
+            trust_files(
+                request.action_ids.as_ref().is_some_and(|ids| !ids.is_empty()),
+                request.keybindings == Some(true),
+            )
+        };
         if everything {
             record.projects.remove(id);
         } else if let Some(entry) = record.projects.get_mut(id) {
@@ -526,8 +615,21 @@ impl ActionsManager {
             }
         }
         self.trust.save(&record)?;
+        self.emit_trust_change(&project, &files);
         self.status_for(&project, &record)
     }
+}
+
+/// The files a trust change touched, for `actions://changed`.
+fn trust_files(actions: bool, keybindings: bool) -> Vec<FileKind> {
+    let mut files = Vec::new();
+    if actions {
+        files.push(FileKind::Actions);
+    }
+    if keybindings {
+        files.push(FileKind::Keybindings);
+    }
+    files
 }
 
 fn read_problem(read: &RawRead) -> Option<String> {
@@ -563,4 +665,70 @@ fn open_path(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("open {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actions::trust::TrustState;
+
+    fn keys_ctx() -> ValidateContext<'static> {
+        ValidateContext {
+            kind: FileKind::Keybindings,
+            scope: SettingsScope::Project,
+            user_action_ids: None,
+        }
+    }
+
+    /// §1.1 + DEC-65: while the project keybindings file is malformed, its
+    /// last valid rules stay in force, so the trust status must describe
+    /// them (held, untrusted) — not report "absent", which would let a
+    /// consumer treat the in-force rules as having nothing to hold.
+    #[test]
+    fn a_malformed_file_keeps_its_last_valid_document_and_trust_in_force() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = scope::project_file(temp.path(), FileKind::Keybindings);
+        let good = serde_json::json!({ "version": 1, "bindings": [ { "key": "mod+shift+r", "command": "refresh-pulse" } ] });
+        assert!(scope::write_validated(&path, keys_ctx(), &good).unwrap().is_ok());
+        let cache = LastValid::default();
+
+        let (document, stale) = cache.in_force(&path, &scope::read_raw(&path, keys_ctx()));
+        assert!(!stale);
+        let valid_hash = trust::keybindings_trust(document.as_ref(), None).hash;
+
+        std::fs::write(&path, b"{ \"version\": 1, ").unwrap();
+        let raw = scope::read_raw(&path, keys_ctx());
+        assert!(read_problem(&raw).is_some());
+        let (document, stale) = cache.in_force(&path, &raw);
+        assert!(stale);
+        let status = trust::keybindings_trust(document.as_ref(), None);
+        assert_eq!(status.state, TrustState::Untrusted);
+        assert!(status.held());
+        assert_eq!(status.hash, valid_hash);
+
+        // Deleting the file clears the fallback: absent is empty.
+        std::fs::remove_file(&path).unwrap();
+        let (document, stale) = cache.in_force(&path, &scope::read_raw(&path, keys_ctx()));
+        assert!(document.is_none());
+        assert!(!stale);
+    }
+
+    #[test]
+    fn a_malformed_file_with_no_prior_valid_read_has_nothing_in_force() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = scope::project_file(temp.path(), FileKind::Keybindings);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not json").unwrap();
+        let (document, stale) =
+            LastValid::default().in_force(&path, &scope::read_raw(&path, keys_ctx()));
+        assert!(document.is_none());
+        assert!(!stale);
+    }
+
+    #[test]
+    fn trust_changes_name_only_the_files_they_touch() {
+        assert_eq!(trust_files(false, true), vec![FileKind::Keybindings]);
+        assert_eq!(trust_files(true, true), vec![FileKind::Actions, FileKind::Keybindings]);
+        assert!(trust_files(false, false).is_empty());
+    }
 }

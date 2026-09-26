@@ -2,7 +2,10 @@
 //! project's (`<root>/.ikenga/`) directories. An on-disk change to
 //! `actions.json` or `keybindings.json` emits `actions://changed` with
 //! `{ path, file, scope }` (G-ACTIONS §1.1); the effective model re-merges
-//! on it without a restart. `settings.json` changes in the same directory are
+//! on it without a restart. The watcher is the only emitter for file
+//! writes (a successful `actions_write` is seen here ~250 ms later); the
+//! manager emits directly only for trust grants / revokes (`reason:
+//! "trust"`), which change what is in force without touching either file. `settings.json` changes in the same directory are
 //! the settings watcher's and are ignored here.
 
 use std::collections::HashMap;
@@ -28,15 +31,32 @@ pub struct ActionsChangeEvent {
     pub path: String,
     pub file: FileKind,
     pub scope: SettingsScope,
+    /// Absent for an on-disk change; `trust` when a grant / revoke changed
+    /// what of the file is in force (DEC-55 / DEC-65).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ChangeReason>,
 }
 
-pub fn emit_change(app: &AppHandle, path: &Path, file: FileKind, scope: SettingsScope) {
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeReason {
+    Trust,
+}
+
+pub fn emit_change(
+    app: &AppHandle,
+    path: &Path,
+    file: FileKind,
+    scope: SettingsScope,
+    reason: Option<ChangeReason>,
+) {
     let _ = app.emit(
         CHANGED_EVENT,
         ActionsChangeEvent {
             path: path.to_string_lossy().into_owned(),
             file,
             scope,
+            reason,
         },
     );
 }
@@ -68,44 +88,53 @@ impl ActionsWatcher {
     /// drops watchers no longer wanted, adds new ones. A directory whose
     /// parent (home or project root) exists is created so a first save is
     /// seen, as the settings watcher does for the same directory.
+    ///
+    /// The whole update — drop, then add — runs under one lock span, so two
+    /// overlapping refreshes (boot and an early `projects:active-changed`)
+    /// cannot interleave; the caller also serializes whole refreshes
+    /// (`ActionsManager::refresh_watch`) so the last resolved project wins.
     pub fn set_targets(&self, targets: &[(PathBuf, SettingsScope)]) -> Result<(), String> {
-        {
-            let mut watchers = self
-                .watchers
-                .lock()
-                .map_err(|_| "actions watcher lock poisoned")?;
-            watchers.retain(|dir, (scope, _)| {
-                targets
-                    .iter()
-                    .any(|(target, target_scope)| target == dir && target_scope == scope)
-            });
-        }
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| "actions watcher lock poisoned")?;
+        watchers.retain(|dir, (scope, _)| {
+            targets
+                .iter()
+                .any(|(target, target_scope)| target == dir && target_scope == scope)
+        });
         let mut first_error = None;
         for (dir, scope) in targets {
-            if let Err(error) = self.watch_dir(dir, *scope) {
-                tracing::warn!("[actions] watch {} failed: {error}", dir.display());
-                first_error.get_or_insert(error);
+            if watchers.contains_key(dir) {
+                continue;
+            }
+            match self.watch_dir(dir, *scope) {
+                Ok(Some(debouncer)) => {
+                    watchers.insert(dir.clone(), (*scope, debouncer));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("[actions] watch {} failed: {error}", dir.display());
+                    first_error.get_or_insert(error);
+                }
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
-    fn watch_dir(&self, dir: &Path, scope: SettingsScope) -> Result<(), String> {
-        {
-            let watchers = self
-                .watchers
-                .lock()
-                .map_err(|_| "actions watcher lock poisoned")?;
-            if watchers.contains_key(dir) {
-                return Ok(());
-            }
-        }
+    /// Creates the debounced watcher for one directory; the caller holds the
+    /// map lock and inserts it. `None` when the root itself is missing.
+    fn watch_dir(
+        &self,
+        dir: &Path,
+        scope: SettingsScope,
+    ) -> Result<Option<Debouncer<RecommendedWatcher>>, String> {
         if !dir.exists() {
             let Some(root) = dir.parent() else {
-                return Ok(());
+                return Ok(None);
             };
             if !root.is_dir() {
-                return Ok(());
+                return Ok(None);
             }
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("create actions directory {}: {e}", dir.display()))?;
@@ -128,7 +157,7 @@ impl ActionsWatcher {
                         continue;
                     }
                     seen.push(kind);
-                    emit_change(&app, &event.path, kind, scope);
+                    emit_change(&app, &event.path, kind, scope, None);
                 }
             })
             .map_err(|error| format!("create actions watcher: {error}"))?;
@@ -136,12 +165,7 @@ impl ActionsWatcher {
             .watcher()
             .watch(dir, notify::RecursiveMode::NonRecursive)
             .map_err(|error| format!("watch {}: {error}", dir.display()))?;
-        let mut watchers = self
-            .watchers
-            .lock()
-            .map_err(|_| "actions watcher lock poisoned")?;
-        watchers.insert(dir.to_path_buf(), (scope, debouncer));
-        Ok(())
+        Ok(Some(debouncer))
     }
 }
 
@@ -169,6 +193,7 @@ mod tests {
             path: "/p/.ikenga/keybindings.json".into(),
             file: FileKind::Keybindings,
             scope: SettingsScope::Project,
+            reason: None,
         };
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
@@ -178,5 +203,10 @@ mod tests {
                 "scope": "project"
             })
         );
+        let trust = ActionsChangeEvent {
+            reason: Some(ChangeReason::Trust),
+            ..event
+        };
+        assert_eq!(serde_json::to_value(&trust).unwrap()["reason"], "trust");
     }
 }

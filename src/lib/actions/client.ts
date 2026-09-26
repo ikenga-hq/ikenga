@@ -123,8 +123,10 @@ export async function actionsTrustRevoke(
 }
 
 /**
- * Subscribes to `actions://changed` (on-disk edits, 250 ms debounced in
- * Rust, and every successful write). Bursts are coalesced into one callback.
+ * Subscribes to `actions://changed`: on-disk edits, 250 ms debounced by the
+ * Rust watcher (which is also how a successful write is announced — once,
+ * not by the write command), and trust grants / revokes (`reason: 'trust'`).
+ * Bursts are coalesced into one callback.
  */
 export function watchActionsFiles(
 	onChange: (events: ActionsChangeEvent[]) => void | Promise<void>

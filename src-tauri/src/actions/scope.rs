@@ -122,6 +122,14 @@ pub fn collect_action_ids<'a>(documents: impl IntoIterator<Item = &'a Value>) ->
         .collect()
 }
 
+/// Whether the file exists, after the substrate's link check: a symlinked /
+/// reparse-point file or `.ikenga/` parent is an error (a dangling link
+/// included). For callers that hand the path to something that follows
+/// links, such as the OS opener.
+pub fn present_unlinked(path: &Path) -> Result<bool, String> {
+    read_document_bytes(path, ACTIONS_DOCUMENT).map(|bytes| bytes.is_some())
+}
+
 /// Validates and writes one document. Returns the validation; on any error
 /// nothing is written and the file is untouched.
 pub fn write_validated(
@@ -217,6 +225,7 @@ mod tests {
         assert!(read.document.is_none());
         assert!(read.validation.is_ok());
         assert!(read.error.is_none());
+        assert!(!present_unlinked(&personal_file(temp.path(), FileKind::Actions)).unwrap());
     }
 
     #[cfg(unix)]
@@ -232,6 +241,12 @@ mod tests {
         let c = ctx(FileKind::Actions, SettingsScope::Project);
         assert!(read_raw(&path, c).error.is_some());
         assert!(write_validated(&path, c, &json!({ "version": 1 })).is_err());
+        assert!(present_unlinked(&path).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), br#"{"version":1}"#);
+        // A dangling link is refused too, not treated as absent.
+        let dangling = project_file(&temp.path().join("q"), FileKind::Actions);
+        std::fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+        symlink(temp.path().join("missing.command"), &dangling).unwrap();
+        assert!(present_unlinked(&dangling).is_err());
     }
 }

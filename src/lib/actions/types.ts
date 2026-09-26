@@ -208,13 +208,29 @@ export interface ActionTrust {
 	state: TrustState;
 }
 
+/**
+ * Trust of the project's files, computed from the same in-force documents
+ * `actions_read_files` serves: while a file on disk is malformed its last
+ * valid document stays in force (§1.1) and is what this describes
+ * (`*Stale: true`, the problem in `*Error`).
+ *
+ * **Fail closed:** an action id missing from `actions` is untrusted. A run
+ * gate (WP-53) must refuse a gated run whose id it cannot find here — never
+ * read "not listed" as "not gated".
+ */
 export interface ActionsTrustStatus {
 	projectId: string;
 	projectRoot: string;
+	/** Every project action in force; an id not listed here is untrusted. */
 	actions: ActionTrust[];
+	/** A problem with `actions.json` on disk (invalid, linked, I/O). */
 	actionsError: string | null;
+	/** `actions` describes the last valid document, not the file on disk. */
+	actionsStale: boolean;
 	keybindings: KeybindingsTrust;
 	keybindingsError: string | null;
+	/** `keybindings` describes the last valid document, not the file on disk. */
+	keybindingsStale: boolean;
 }
 
 export interface ActionsTrustGrant {
@@ -233,4 +249,10 @@ export interface ActionsChangeEvent {
 	path: string;
 	file: ActionsFileKind;
 	scope: ActionsScope;
+	/**
+	 * Absent for an on-disk change (the watcher's; a successful write is
+	 * seen that way too). `trust` when a grant / revoke changed what of the
+	 * project file is in force without touching it (DEC-55 / DEC-65).
+	 */
+	reason?: 'trust';
 }
