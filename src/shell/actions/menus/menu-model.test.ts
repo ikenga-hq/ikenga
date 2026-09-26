@@ -227,6 +227,12 @@ describe('menuRowActionIds', () => {
 });
 
 describe('rowsToOverridePayload (review round 1 blocking 3)', () => {
+	it('keeps any extra key on the scope override (verify round)', () => {
+		const rows = [actionRow('open')];
+		const payload = rowsToOverridePayload(rows, { items: [], note: 'kept' } as never);
+		expect((payload as Record<string, unknown>).note).toBe('kept');
+	});
+
 	it('writes separators as "---" and only this-scope-hidden ids into `hidden`, with no base to fold in', () => {
 		const rows = [actionRow('open'), { kind: 'separator' as const, key: 'sep-1' }, actionRow('explain-file', { hidden: true, hiddenHere: true })];
 		expect(rowsToOverridePayload(rows, undefined)).toEqual({

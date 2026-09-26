@@ -250,5 +250,7 @@ export function rowsToOverridePayload(rows: readonly MenuRow[], base: MenuOverri
 	const hiddenHere = rows.filter(isActionRow).filter((row) => row.hiddenHere).map((row) => row.id);
 	const hiddenHereSet = new Set(hiddenHere);
 	const preserved = (base?.hidden ?? []).filter((id) => typeof id === 'string' && !rowIds.has(id) && !hiddenHereSet.has(id));
-	return { items, hidden: [...hiddenHere, ...preserved] };
+	// Any other key on this scope's own override rides along untouched (§1.4
+	// writers never drop what they don't understand).
+	return { ...base, items, hidden: [...hiddenHere, ...preserved] };
 }
