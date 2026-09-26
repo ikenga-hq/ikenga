@@ -57,7 +57,8 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/components/ui/utils';
 import { useIkengaStore } from '@/lib/ikenga/theme-store';
-import { labelFor, useKey } from '@/lib/keymap/registry';
+import { useCommands } from '@/lib/keymap/dispatcher';
+import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	type PkgActivityBarEntry,
@@ -279,14 +280,17 @@ export function ActivityBar() {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
 
-	// Each binding is a registry entry with `when: 'not-input'` (defaults.ts);
-	// `useKey()` owns the typing-target guard. A key always enters its mode —
-	// the collapse toggle is a pointer affordance only.
-	useKey('rail.project', () => enterMode('project'));
-	useKey('rail.chi', () => enterMode('chi'));
-	useKey('rail.ngwa', () => enterMode('ngwa'));
-	useKey('rail.settings', () => enterMode('settings'));
-	useKey('ngwa.create', () => navigateInNgwa('/ngwa/create'));
+	// Each key is a registry command (`defaults.ts`, `!inputFocus`) fired by
+	// the one key dispatcher (WP-54), which owns the typing guard and every
+	// rebind; the rail only says what each does. A key always enters its
+	// mode — the collapse toggle is a pointer affordance only.
+	useCommands({
+		'rail.project': () => enterMode('project'),
+		'rail.chi': () => enterMode('chi'),
+		'rail.ngwa': () => enterMode('ngwa'),
+		'rail.settings': () => enterMode('settings'),
+		'ngwa.create': () => navigateInNgwa('/ngwa/create'),
+	});
 
 	const hasAnyPins =
 		hydrated &&
