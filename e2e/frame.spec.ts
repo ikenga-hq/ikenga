@@ -50,10 +50,10 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(pinButton).toHaveAttribute('aria-label', pin.label);
 		await expect(rail.locator(`[data-section="${pin.sectionId}"]`)).toBeVisible();
 
-		// Active-project indicator reflects project_list + project_get_active.
+		// One project switcher: the title-row chip. The rail-foot copy is gone.
 		await expect(
 			rail.getByRole('button', { name: new RegExp(`^Project: ${MOCK_PROJECTS[0]!.display_name}`) })
-		).toBeVisible();
+		).toHaveCount(0);
 
 		// ── Sidebar ─────────────────────────────────────────────────────────
 		// Region only: its title follows the active mode, which is in flux.
@@ -67,12 +67,14 @@ test.describe('frame smoke (current frame)', () => {
 		await expect(main.locator('[data-pane-id][data-focused="true"]')).toHaveCount(1);
 		await expect(panes.first().getByRole('button', { name: 'New tab' })).toBeVisible();
 
-		// Rail → sidebar wiring. Settings is a CoreMode on both sides of v16
-		// (g-state.md); the other modes' sidebar bodies are interim until WP-04.
+		// Rail → Settings: the section nav lives inside the pane (D-03) and the
+		// sidebar stays the Explorer — the nine sections are listed once.
 		await rail.getByRole('button', { name: 'Settings', exact: true }).click();
-		const settingsNav = page.getByRole('navigation', { name: 'Settings navigation' });
+		const settingsNav = page.getByRole('navigation', { name: 'Settings sections' });
 		await expect(settingsNav).toBeVisible();
 		await expect(settingsNav.getByText('Appearance', { exact: true })).toBeVisible();
+		await expect(page.getByRole('navigation', { name: 'Explorer sidebar' })).toBeVisible();
+		await expect(page.getByText('Appearance', { exact: true })).toHaveCount(1);
 
 		// Record (not assert) which host commands had no canned answer, so a
 		// spec author can see what to add to the fixture when the frame grows.

@@ -5,17 +5,18 @@
 // Opened on project switch and via ⌘1 / `iyke go /project/dashboard`.
 
 import { createFileRoute } from '@tanstack/react-router';
-import { DailyAddress } from '@/shell/home/daily-address';
+import { DailyAddress, useDailyAddressShown } from '@/shell/home/daily-address';
 import { Home } from '@/shell/home/home';
 
 function ProjectDashboardRoute() {
+	const addressShown = useDailyAddressShown();
 	return (
 		<div className="flex h-full flex-col overflow-hidden">
 			<div className="shrink-0 px-4 pt-4">
 				<DailyAddress />
 			</div>
 			<div className="min-h-0 flex-1">
-				<Home />
+				<Home hideGreeting={addressShown} />
 			</div>
 		</div>
 	);

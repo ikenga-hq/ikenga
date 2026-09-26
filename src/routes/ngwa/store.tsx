@@ -20,7 +20,7 @@ const searchSchema = z.object({
 });
 
 function NgwaStorePage() {
-	const { items, storeCatalog, isLoading, error } = useNgwaSnapshot();
+	const { items, storeCatalog, isLoading, error, refetch } = useNgwaSnapshot();
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
@@ -29,6 +29,7 @@ function NgwaStorePage() {
 				catalog={storeCatalog}
 				isLoading={isLoading}
 				error={error}
+				onRetry={refetch}
 			/>
 		</div>
 	);

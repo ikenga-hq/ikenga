@@ -133,6 +133,20 @@ describe('WP-04 Explorer DoD and Invariants', () => {
 		expect(screen.getByRole('button', { name: /Views/ })).toBeTruthy();
 	});
 
+	it('`only` pins the Explorer to one section, open even when collapsed in the store (D-01 Chi/Ngwa)', () => {
+		render(
+			<QueryClientProvider client={queryClient}>
+				<Explorer only="ngwa-project" />
+			</QueryClientProvider>
+		);
+
+		const header = screen.getByRole('button', { name: /Ngwa · project/ });
+		expect(header.getAttribute('aria-expanded')).toBe('true');
+		expect(screen.queryByRole('button', { name: /^Files/ })).toBeNull();
+		expect(screen.queryByRole('button', { name: /Sessions/ })).toBeNull();
+		expect(screen.getByRole('region', { name: 'Ngwa · project section' })).toBeTruthy();
+	});
+
 	it('DoD 2: badges show only when non-zero (§6A.8)', () => {
 		const ctx = { projectId: 'royalti-co' };
 		const sectionDefWithZero = {

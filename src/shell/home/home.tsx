@@ -869,7 +869,9 @@ function applyRecord(layout: WidgetPlacement[], rec: Record<ItemId, Placement>):
 	});
 }
 
-export function Home() {
+/** `hideGreeting`: the D-04 daily address above the canvas is the greeting
+ *  while it shows, so the canvas's own greeting widget steps aside. */
+export function Home({ hideGreeting = false }: { hideGreeting?: boolean } = {}) {
 	// Acknowledge partOfDay so its import survives tree-shaking under noUnused.
 	void partOfDay;
 
@@ -937,7 +939,7 @@ export function Home() {
 	return (
 		<Canvas<WidgetPlacement>
 			ref={canvasHandle}
-			items={layout}
+			items={hideGreeting ? layout.filter((w) => w.kind !== 'greeting') : layout}
 			itemId={(w) => w.id as ItemId}
 			itemKind={(w) => w.kind}
 			layout={layoutRecord}
