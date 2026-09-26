@@ -52,19 +52,29 @@ describe('conflicts() — DEC-59', () => {
 	});
 
 	it('lists the defaults\' same-key pairs as precedence, separately (macOS)', () => {
-		// ⌘K palette vs hosted terminal clear; ⌘N Create vs the native New
-		// Session accelerator; ⌘T views palette vs the native New Terminal
-		// accelerator (the latter two are re-keyed by DEC-64 in WP-54).
+		// G-ACTIONS §5: ⌘K — palette open / close / hosted terminal clear;
+		// ⌘/ — Shortcuts open vs the open palette's toggle. The three DEC-64
+		// pairs (⌘N, ⌘T, Ctrl+1–3) are gone (WP-54).
 		expect(pairCommands(conflicts({ platform: 'mac' }).precedence)).toEqual(
-			['menu.new-session + ngwa.create', 'menu.new-terminal + palette.views', 'palette.open + terminal.clear'].sort()
+			[
+				'palette.close + palette.open',
+				'palette.close + terminal.clear',
+				'palette.open + terminal.clear',
+				'palette.toggle-shortcuts + shortcuts.open',
+			].sort()
 		);
 	});
 
 	it('lists the defaults\' same-key pairs as precedence, separately (Windows/Linux)', () => {
-		// Ctrl+1..3: rail (!inputFocus) vs pane focus (always) — DEC-64 moves
-		// pane focus to Alt+1–6 in WP-54.
+		// Ctrl+K open / close; Ctrl+/ open / toggle; Ctrl+Shift+A hosted
+		// terminal select-all vs focus-dispatch. Pane focus moved to Alt+1–6
+		// (DEC-64), so Ctrl+1–3 is the rail's alone.
 		expect(pairCommands(conflicts({ platform: 'other' }).precedence)).toEqual(
-			['pane.focus-1 + rail.project', 'pane.focus-2 + rail.chi', 'pane.focus-3 + rail.ngwa'].sort()
+			[
+				'palette.close + palette.open',
+				'palette.toggle-shortcuts + shortcuts.open',
+				'companion.focus-dispatch + terminal.select-all',
+			].sort()
 		);
 	});
 
@@ -223,7 +233,8 @@ describe('defaults — DEC-62 `when` values and the new fields', () => {
 	it('carries the `source` and (defaulted) `scope` fields', () => {
 		for (const e of DEFAULT_KEYMAP) {
 			expect(e.source).toBe('default');
-			expect(e.scope ?? 'app').toBe('app');
+			// DEC-60 (WP-54): the `os.*` rows are the only OS-wide defaults.
+			expect(e.scope ?? 'app', e.command).toBe(e.command.startsWith('os.') ? 'os' : 'app');
 		}
 	});
 

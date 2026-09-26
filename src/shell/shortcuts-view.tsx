@@ -28,6 +28,8 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'terminal', label: 'Terminal', namespaces: ['terminal'] },
 		{ id: 'ngwa', label: 'Ngwa', namespaces: ['ngwa'] },
 		{ id: 'menu', label: 'Menu bar', namespaces: ['menu'] },
+		// WP-54 defaults: window zoom and the OS-wide `os.*` shortcuts.
+		{ id: 'window', label: 'Window', namespaces: ['zoom', 'os'] },
 		{ id: 'help', label: 'Help', namespaces: ['shortcuts'] },
 	];
 

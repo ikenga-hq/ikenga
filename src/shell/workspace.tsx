@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { PanelGroup } from 'react-resizable-panels';
+import { useCommands } from '@/lib/keymap/dispatcher';
+import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { useFilesStore } from '@/lib/shell/files-store';
 import { persistPanelSizes } from '@/lib/shell/panel-sizes';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
@@ -17,6 +20,62 @@ import { TitleRowSlot } from './slots/title-row-slot';
 import { PostRestartUpdateToast } from './updater/post-restart-toast';
 import { UpdateSheet } from './updater/update-sheet';
 import { useWorkspaceEffects } from './workspace-effects';
+
+/** New terminal tab in the focused pane (⌃T / ⌃⇧T). */
+function addTerminalTab(claude: boolean): void {
+	const sessionId = claude ? createClaudeTerminalSession() : createTerminalSession();
+	const { focusedId, addTab } = usePaneStore.getState();
+	addTab(focusedId, { kind: 'terminal', sessionId });
+}
+
+/** Previous / next tab of the focused pane, wrapping (`pane.tab-prev/next`). */
+function cycleFocusedTab(delta: 1 | -1): void {
+	const { root, focusedId, switchTab } = usePaneStore.getState();
+	const leaf = findLeaf(root, focusedId);
+	if (!leaf || leaf.tabs.length < 2) return;
+	const n = leaf.tabs.length;
+	switchTab(focusedId, (((leaf.activeTabIdx + delta) % n) + n) % n);
+}
+
+/** Move pane focus to the previous / next leaf in reading (DFS) order —
+ *  the same order ⌃1…⌃6 / Alt+1…6 number panes (`pane.focus-up/down`). */
+function moveFocusedPane(delta: 1 | -1): void {
+	const { root, focusedId, focusPane } = usePaneStore.getState();
+	const ids = getLeafIdsInOrder(root);
+	const i = ids.indexOf(focusedId);
+	const next = ids[i + delta];
+	if (i >= 0 && next) focusPane(next);
+}
+
+/** The workspace's command handlers (the `workspace` owner in
+ *  `lib/keymap/commands.ts`). */
+export const WORKSPACE_COMMANDS: Readonly<Record<string, () => void>> = {
+	'explorer.toggle': () => useShellStore.getState().toggleSidebar(),
+	'explorer.toggle-hidden': () => useFilesStore.getState().toggleShowHidden(),
+	'pane.split-right': () => usePaneStore.getState().splitFocused('horizontal'),
+	'pane.split-down': () => usePaneStore.getState().splitFocused('vertical'),
+	'pane.new-shell-terminal': () => addTerminalTab(false),
+	'pane.new-claude-terminal': () => addTerminalTab(true),
+	// ⌘⇧N — the artifact creation wizard, mounted by the
+	// /projects/new-artifact route (plans/shell/2026-05-17-projects-and-
+	// artifact-wizard.md, D8).
+	'pane.new-artifact': () => usePaneStore.getState().navigateFocused('/projects/new-artifact'),
+	'pane.reopen': () => usePaneStore.getState().reopenLastClosed(),
+	'pane.close': () => usePaneStore.getState().closeFocusedPane(),
+	'tab.close': () => usePaneStore.getState().closeActiveTab(),
+	'pane.focus-1': () => usePaneStore.getState().focusByIndex(0),
+	'pane.focus-2': () => usePaneStore.getState().focusByIndex(1),
+	'pane.focus-3': () => usePaneStore.getState().focusByIndex(2),
+	'pane.focus-4': () => usePaneStore.getState().focusByIndex(3),
+	'pane.focus-5': () => usePaneStore.getState().focusByIndex(4),
+	'pane.focus-6': () => usePaneStore.getState().focusByIndex(5),
+	'pane.tab-prev': () => cycleFocusedTab(-1),
+	'pane.tab-next': () => cycleFocusedTab(1),
+	'pane.focus-up': () => moveFocusedPane(-1),
+	'pane.focus-down': () => moveFocusedPane(1),
+	'companion.toggle': () => useCompanionStore.getState().cycleState(),
+	'companion.focus-dispatch': () => useCompanionStore.getState().focusDispatch(),
+};
 
 export function Workspace() {
 	const [initialSizes, setInitialSizes] = useState<[number, number] | null>(null);
@@ -37,104 +96,13 @@ export function Workspace() {
 		persistPanelSizes(sizes);
 	};
 
-	// Keyboard map (workspace-level). See Phase 12 spec § Keybinding history
-	// for the rationale behind ⌘W / ⌘T moving from PR-A bindings.
-	//   ⌘B           → toggle nav rail
-	//   ⌘\           → split focused pane right
-	//   ⌘⇧\          → split focused pane down
-	//   ⌘W           → close focused PANE
-	//   ⌘⇧W          → close active tab
-	//   ⌘T           → command palette (views mode)
-	//   ⌘⇧T          → reopen last-closed view (depth 10)
-	//   ⌘P           → command palette (project switcher — Phase 0)
-	//   ⌃T           → new bash terminal in focused pane
-	//   ⌃⇧T          → new claude terminal in focused pane
-	//   ⌃1 .. ⌃6     → focus pane N (DFS leaf order)
-	//
-	// On non-Mac platforms there's no Cmd key, so `mod` matches Ctrl. That
-	// means ⌃T (terminal) and ⌘T (palette) collide on Linux/Win; the
-	// ctrlOnly branch fires first and "new bash terminal" wins. Use ⌘K to
-	// open the palette in "all" mode on those platforms — same end result.
-	useEffect(() => {
-		function onKey(e: KeyboardEvent) {
-			const target = e.target as HTMLElement | null;
-			const inEditable = !!target?.matches('input, textarea, [contenteditable="true"]');
-			const mod = e.metaKey || e.ctrlKey;
-			const ctrlOnly = e.ctrlKey && !e.metaKey;
-
-			if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b') {
-				e.preventDefault();
-				useShellStore.getState().toggleSidebar();
-				return;
-			}
-			if (mod && !e.altKey && e.key === '\\') {
-				e.preventDefault();
-				usePaneStore.getState().splitFocused(e.shiftKey ? 'vertical' : 'horizontal');
-				return;
-			}
-			if (e.key.toLowerCase() === 't' && !inEditable) {
-				// ⌃T / ⌃⇧T → new terminal (matches ctrlOnly first so Linux Ctrl-T
-				// still creates a terminal even though `mod` would match too).
-				if (ctrlOnly && !e.altKey) {
-					e.preventDefault();
-					const sessionId = e.shiftKey ? createClaudeTerminalSession() : createTerminalSession();
-					const focusedId = usePaneStore.getState().focusedId;
-					usePaneStore.getState().addTab(focusedId, { kind: 'terminal', sessionId });
-					return;
-				}
-				// ⌘T → palette views; ⌘⇧T → reopen.
-				if (mod && !e.altKey) {
-					e.preventDefault();
-					if (e.shiftKey) {
-						usePaneStore.getState().reopenLastClosed();
-					} else {
-						palette.setOpen(true, 'views');
-					}
-					return;
-				}
-			}
-			if (mod && !e.altKey && e.key.toLowerCase() === 'p' && !inEditable) {
-				// ⌘P → project switcher (Phase 0 projects-first-class).
-				// ⌘⇧P keeps the legacy "open tabs" switcher available — both
-				// open the same palette in different modes.
-				e.preventDefault();
-				palette.setOpen(true, e.shiftKey ? 'switcher' : 'projects');
-				return;
-			}
-			// ⌘⇧N — open the artifact creation wizard from anywhere (Phase C
-			// of plans/shell/2026-05-17-projects-and-artifact-wizard.md, D8).
-			// The wizard is mounted by the /projects/new-artifact route, so
-			// we just navigate the focused pane there.
-			if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'n' && !inEditable) {
-				e.preventDefault();
-				usePaneStore.getState().navigateFocused('/projects/new-artifact');
-				return;
-			}
-			// Don't intercept ⌘W while typing.
-			if (mod && !e.altKey && e.key.toLowerCase() === 'w' && !inEditable) {
-				e.preventDefault();
-				if (e.shiftKey) {
-					usePaneStore.getState().closeActiveTab();
-				} else {
-					usePaneStore.getState().closeFocusedPane();
-				}
-				return;
-			}
-			if (ctrlOnly && !e.shiftKey && !e.altKey && /^[1-6]$/.test(e.key)) {
-				e.preventDefault();
-				usePaneStore.getState().focusByIndex(parseInt(e.key, 10) - 1);
-				return;
-			}
-			// ⌘J — toggle the Companion (strip ↔ expanded); keymap `companion.toggle`.
-			if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j' && !inEditable) {
-				e.preventDefault();
-				useCompanionStore.getState().cycleState();
-				return;
-			}
-		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-	}, [palette]);
+	// Keyboard map (workspace-level): every pane / tab / Explorer / Companion
+	// key is a registry command (`defaults.ts`) fired by the one key
+	// dispatcher (WP-54, DEC-56) — rebindable in `keybindings.json`, never
+	// matched here. This only registers what each command does, for as long
+	// as the workspace is mounted. The palette's own keys (⌘K, ⌘P, ⌘T, …)
+	// are registered by `useCommandPalette()`.
+	useCommands(WORKSPACE_COMMANDS);
 
 	if (!initialSizes) {
 		return (
