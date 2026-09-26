@@ -5,8 +5,8 @@
 // action's scope travels with it, so a non-personal skill never types into
 // a PTY (`chi.ts` module note).
 
-import type { ActionRun, ActionsScope, ChiTarget } from '../types';
-import { invokeSkill, SKILL_NAME_RE, type ChiSendResult, type ChiSkillRequest } from './chi';
+import type { ActionRun, ChiTarget } from '../types';
+import { invokeSkill, SKILL_NAME_RE, type ChiSendResult, type ChiSkillRequest, type RunScope } from './chi';
 
 export type SkillRun = Extract<ActionRun, { kind: 'skill' }>;
 
@@ -17,13 +17,13 @@ export function isValidSkillName(skill: string): boolean {
 	return SKILL_NAME_RE.test(skill);
 }
 
-export function skillRequest(run: SkillRun, scope: ActionsScope): ChiSkillRequest {
+export function skillRequest(run: SkillRun, scope: RunScope): ChiSkillRequest {
 	return { skill: run.skill.trim(), target: SKILL_TARGET, scope };
 }
 
 export function runSkill(
 	run: SkillRun,
-	scope: ActionsScope,
+	scope: RunScope,
 	adapter: (request: ChiSkillRequest) => Promise<ChiSendResult> = invokeSkill
 ): Promise<ChiSendResult> {
 	return adapter(skillRequest(run, scope));

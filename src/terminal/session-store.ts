@@ -10,6 +10,7 @@
  */
 
 import { create } from 'zustand';
+import { listen } from '@/lib/transport';
 import { ptyTerminalList, settingsGet, type TerminalDescriptor } from '@/lib/tauri-cmd';
 import { RESUME_TERMINALS_KEY } from '@/lib/shell-profiles';
 import type { AgentWrapOpts } from './claude-wrap';
@@ -18,6 +19,7 @@ import { Pty } from './pty-bridge';
 import { attachCapture } from './pty-output-buffer';
 import { acquirePty, disposePty, getPty } from './pty-registry';
 import { buildSpawnOpts } from './spawn-opts';
+import type { HookEventPayload } from './tool-call-feed';
 
 const STORAGE_KEY = 'terminal.tabs';
 const SQL_DB_URL = 'sqlite:ikenga-terminal.sqlite';
@@ -40,6 +42,11 @@ export interface TerminalTab {
 	/** Claude session id captured from the `SessionStart` hook. Used to resume
 	 *  the conversation after an app restart. */
 	claudeSessionId?: string | null;
+	/** True between this tab's Claude `SessionStart` and its `SessionEnd` /
+	 *  PTY exit (the store-level hooks listener below). In memory only —
+	 *  never persisted, so a restored tab reads not-live until a fresh
+	 *  `SessionStart`. The WP-53 action runner injects only while it is true. */
+	agentLive?: boolean;
 	ptyId: string | null;
 	mode?: 'persistent' | 'ephemeral';
 	status: 'spawning' | 'running' | 'exited' | 'error';
@@ -61,6 +68,8 @@ interface TerminalState {
 	setPtyId: (id: string, ptyId: string | null, mode?: 'persistent' | 'ephemeral') => void;
 	setMode: (id: string, mode: 'persistent' | 'ephemeral') => void;
 	setStatus: (id: string, status: TerminalTab['status'], exitCode?: number | null) => void;
+	/** A string id marks the agent live (`SessionStart`); `null` marks it
+	 *  ended (`SessionEnd`, PTY exit, restart). */
 	setClaudeSessionId: (id: string, sessionId: string | null) => void;
 	updateCwd: (id: string, cwd: string) => void;
 
@@ -433,6 +442,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 								...t,
 								status,
 								exitCode,
+								...(status === 'exited' || status === 'error' ? { agentLive: false } : {}),
 								wasRunning:
 									status === 'running' || status === 'spawning'
 										? true
@@ -448,7 +458,11 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 
 		setClaudeSessionId: (id, sessionId) => {
 			set((s) => ({
-				tabs: s.tabs.map((t) => (t.id === id ? { ...t, claudeSessionId: sessionId } : t)),
+				tabs: s.tabs.map((t) =>
+					t.id === id
+						? { ...t, claudeSessionId: sessionId, agentLive: typeof sessionId === 'string' }
+						: t
+				),
 			}));
 			persistDebounced();
 		},
@@ -595,6 +609,44 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		},
 	};
 });
+
+// --- agent liveness (hooks bus) ---------------------------------------------
+
+/**
+ * Records one Claude Code hook event against the tab it came from
+ * (`ikenga_terminal_id`): `SessionStart` stores the session id and marks the
+ * agent live, `SessionEnd` clears both. Store-level, so a tab that no pane
+ * currently mounts is tracked too. PTY exit clears them via `openTabPty`'s
+ * `onExit` / `setStatus`. There is no separate agent-process-exit signal: a
+ * `claude` killed without a `SessionEnd` stays live until the PTY exits.
+ */
+export function applyAgentHook(p: HookEventPayload | null | undefined): void {
+	const tabId = p?.ikenga_terminal_id;
+	if (!p || !tabId) return;
+	const store = useTerminalStore.getState();
+	if (!store.tabs.some((t) => t.id === tabId)) return;
+	if (p.hook_event_name === 'SessionStart' && p.session_id) {
+		store.setClaudeSessionId(tabId, p.session_id);
+	} else if (p.hook_event_name === 'SessionEnd') {
+		// The claude session ended; the PTY may keep going (the wrap's
+		// fallback shell) but there is no agent and nothing to resume.
+		store.setClaudeSessionId(tabId, null);
+	}
+}
+
+let agentHookListener: Promise<unknown> | null = null;
+
+/** Installs the one store-level `hooks://event` listener. Idempotent. */
+export function installAgentHookListener(): void {
+	if (agentHookListener) return;
+	agentHookListener = listen<HookEventPayload>('hooks://event', (event) =>
+		applyAgentHook(event.payload)
+	).catch(() => {
+		agentHookListener = null;
+	});
+}
+
+if (typeof window !== 'undefined') installAgentHookListener();
 
 // Immediate close-flush on beforeunload (issue #133): ensures pending tab state is written on app exit
 if (typeof window !== 'undefined') {

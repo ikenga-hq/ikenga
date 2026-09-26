@@ -32,7 +32,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { ActionRun, ActionsTrustStatus, ActionTrust } from '../types';
 import { ChiUnavailableError } from './chi';
-import { runAction, type RunnableAction } from './index';
+import { runAction, UNSAFE_WINDOWS_VALUE_MESSAGE, type RunnableAction, type RunScope } from './index';
 import { emptyRunVariables } from './interpolate';
 import { runHash } from './trust';
 
@@ -55,7 +55,7 @@ async function trusted(id: string, run: ActionRun, state: ActionTrust['state'] =
 	return { id, name: id, kind: run.kind, run, hash: await runHash(run), state };
 }
 
-function action(run: ActionRun, scope: 'personal' | 'project' = 'personal', id = 'act'): RunnableAction {
+function action(run: ActionRun, scope: RunScope = 'personal', id = 'act'): RunnableAction {
 	return { id, name: 'Act', run, scope };
 }
 
@@ -149,6 +149,28 @@ describe('runAction — shell', () => {
 			status: 'refused',
 			reason: 'variable-in-single-quotes',
 		});
+	});
+
+	it('a Windows %/! value refusal tells the user such paths cannot be passed', async () => {
+		mocks.invoke.mockImplementationOnce(async () => ({
+			...EXEC_OK,
+			ok: false,
+			exitCode: null,
+			stdout: '',
+			error: 'unsafe value',
+			refusal: 'unsafe-value-for-windows',
+		}));
+		const outcome = await runAction(action({ kind: 'shell', command: 'type {{file.path}}' }), {
+			variables: { 'file.path': 'C:\\100%\\a!.txt' },
+		});
+		expect(outcome).toMatchObject({
+			status: 'refused',
+			reason: 'unsafe-value-for-windows',
+			message: UNSAFE_WINDOWS_VALUE_MESSAGE,
+		});
+		expect(UNSAFE_WINDOWS_VALUE_MESSAGE).toMatch(/%/);
+		expect(UNSAFE_WINDOWS_VALUE_MESSAGE).toMatch(/!/);
+		expect(UNSAFE_WINDOWS_VALUE_MESSAGE).toMatch(/Windows/);
 	});
 
 	it('confirm: a declined prompt runs nothing', async () => {
@@ -347,6 +369,37 @@ describe('runAction — chi / skill', () => {
 		trustStatus = status([await trusted('sk', run)]);
 		expect(await runAction(action(run, 'project', 'sk'))).toMatchObject({ status: 'done', kind: 'skill' });
 		expect(mocks.invokeSkill).toHaveBeenCalledWith({ skill: 'release-status', target: 'active', scope: 'project' });
+	});
+});
+
+describe('runAction — package scope (N2)', () => {
+	it('a package chi / skill is never gated and carries scope "package" (no PTY inject)', async () => {
+		// Trust status unreadable: a gated run would refuse (fail-closed).
+		trustStatus = new Error('no trust');
+		expect(await runAction(action({ kind: 'chi', target: 'active', prompt: '/s v' }, 'package'))).toMatchObject({
+			status: 'done',
+			kind: 'chi',
+		});
+		expect(mocks.send).toHaveBeenCalledWith(expect.objectContaining({ target: 'active', scope: 'package' }));
+		expect(await runAction(action({ kind: 'skill', skill: 'release-status' }, 'package'))).toMatchObject({
+			status: 'done',
+			kind: 'skill',
+		});
+		expect(mocks.invokeSkill).toHaveBeenCalledWith({ skill: 'release-status', target: 'active', scope: 'package' });
+		expect(mocks.invoke).not.toHaveBeenCalledWith('actions_trust_status', expect.anything());
+	});
+
+	it('a package action of any other kind is refused before it runs', async () => {
+		for (const run of [
+			{ kind: 'shell', command: 'make' },
+			{ kind: 'iyke', route: '/pane/navigate' },
+			{ kind: 'open', url: 'https://example.com' },
+		] as ActionRun[]) {
+			expect(await runAction(action(run, 'package'))).toMatchObject({ status: 'refused', reason: 'package-kind' });
+		}
+		expect(execCalls()).toHaveLength(0);
+		expect(mocks.iykeFetch).not.toHaveBeenCalled();
+		expect(mocks.openExternalUrl).not.toHaveBeenCalled();
 	});
 });
 

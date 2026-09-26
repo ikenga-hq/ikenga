@@ -20,14 +20,17 @@
 // (`claude-wrap.ts` falls back to `exec "${SHELL:-bash}" -i`) — so it is
 // held to these rules (DEC-55):
 //
-// - Only a PERSONAL action may inject. A project (or any non-personal)
-//   `chi` / `skill` runs headless only (`chi_run` / `chi_resume`); an
-//   `active` target that resolves to a PTY is unavailable to it
-//   (`no-target`).
-// - Only into an AGENT terminal (a `wrap` spec — the same test
-//   `resolve-target.ts` uses for its context line), never a plain shell,
-//   and not one whose Claude session has ended (`claudeSessionId === null`
-//   after the `SessionEnd` hook; see `agentExited`).
+// - Only a PERSONAL action may inject. A project or package (or any
+//   non-personal) `chi` / `skill` runs headless only (`chi_run` /
+//   `chi_resume`); an `active` target that resolves to a PTY is unavailable
+//   to it (`no-target`).
+// - Only into a CLAUDE agent terminal (a `wrap` spec with engine `claude`),
+//   never a plain shell, and only while the store says its agent is live —
+//   fail-closed (`isAgentLive`): a `SessionStart` id is recorded, no
+//   `SessionEnd` / PTY exit since, PTY running. Other engines' wraps send no
+//   liveness signal, so they are never injected into (`no-target`).
+// - Not while that terminal has a pending permission request: the inject's
+//   trailing Enter would answer it (`permission-pending`).
 // - The injected text comes with every C0 control character (bar tab)
 //   stripped from each variable value before interpolation (`ptyPrompt`,
 //   built by the runner with `ptySafeVariables`), and a text whose first
@@ -39,10 +42,16 @@
 
 import { chiResume, chiRun, type ChiRunResult } from '@/lib/tauri-cmd';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
+import { useCompanionStore } from '@/shell/companion/companion-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
 import { useTerminalStore } from '@/terminal/session-store';
 import type { ActionsScope, ChiTarget } from '../types';
 import type { RunVariables } from './interpolate';
+
+/** Where a runnable action comes from: a personal / project actions file,
+ *  or a package's skill actions (package content — never DEC-55-gated,
+ *  never PTY-injected). */
+export type RunScope = ActionsScope | 'package';
 
 export interface ChiSendRequest {
 	/** Final text (already interpolated, raw — §8.2); what a headless run gets. */
@@ -54,7 +63,7 @@ export interface ChiSendRequest {
 	/** Required iff `target === 'engine'`. */
 	engineId?: string;
 	/** Where the action is defined. Only `personal` may inject into a PTY. */
-	scope: ActionsScope;
+	scope: RunScope;
 }
 
 export interface ChiSkillRequest {
@@ -63,7 +72,7 @@ export interface ChiSkillRequest {
 	args?: string;
 	target: ChiTarget;
 	engineId?: string;
-	scope: ActionsScope;
+	scope: RunScope;
 }
 
 export interface ChiSendResult {
@@ -73,7 +82,7 @@ export interface ChiSendResult {
 }
 
 /** Nothing to send to — the typed reason the runner reports. */
-export type ChiUnavailableReason = 'no-engine' | 'no-target' | 'bang-prompt';
+export type ChiUnavailableReason = 'no-engine' | 'no-target' | 'bang-prompt' | 'permission-pending';
 
 export class ChiUnavailableError extends Error {
 	readonly reason: ChiUnavailableReason;
@@ -106,18 +115,35 @@ export function isAgentTerminal(sessionId: string): boolean {
 }
 
 /**
- * Whether the agent in wrap tab `sessionId` has exited, leaving the wrap's
- * fallback shell. The only signal the terminal store carries is Claude
- * Code's `SessionEnd` hook, which `single-terminal.tsx` records as
- * `claudeSessionId: null` (a fresh tab has `undefined` until `SessionStart`
- * sets the id). Other engines' wraps (gemini, codex, …) send no hook, so
- * for them this cannot tell — they fall through as live.
+ * Whether the Claude agent in wrap tab `sessionId` is live — fail-closed.
+ * True only when the tab is a Claude wrap, its `SessionStart` id is
+ * recorded (`typeof claudeSessionId === 'string'`), the store marks the
+ * agent live (set on `SessionStart`, cleared on `SessionEnd`, PTY exit and
+ * restart; never restored from disk) and the PTY is running. A never-started
+ * agent (`undefined` id), a stale id after an exit, or a restored tab all
+ * read not-live.
  */
-export function agentExited(sessionId: string): boolean {
+export function isAgentLive(sessionId: string): boolean {
 	const tab = useTerminalStore.getState().tabs.find((t) => t.id === sessionId);
 	const wrap = tab?.spec.wrap;
-	if (!tab || !wrap) return false;
-	return (wrap.engine ?? 'claude') === 'claude' && tab.claudeSessionId === null;
+	if (!tab || !wrap || (wrap.engine ?? 'claude') !== 'claude') return false;
+	return typeof tab.claudeSessionId === 'string' && tab.agentLive === true && tab.status === 'running';
+}
+
+/** Whether wrap tab `sessionId` runs an engine other than Claude — no
+ *  liveness signal, so never injectable. */
+export function isNonClaudeAgent(sessionId: string): boolean {
+	const wrap = useTerminalStore.getState().tabs.find((t) => t.id === sessionId)?.spec.wrap;
+	return Boolean(wrap) && (wrap?.engine ?? 'claude') !== 'claude';
+}
+
+/** Whether terminal `sessionId` has a pending permission request in the
+ *  Companion's queue (fed from the hooks bus). A pending card with no
+ *  terminal id could be this one, so it counts too (fail-closed). */
+export function hasPendingPermission(sessionId: string): boolean {
+	return useCompanionStore
+		.getState()
+		.permissions.some((p) => p.status === 'pending' && (p.sessionId === undefined || p.sessionId === sessionId));
 }
 
 /** C0 controls except tab (CR and LF included), plus DEL and C1. */
@@ -153,10 +179,16 @@ export function isBangPrompt(text: string): boolean {
 }
 
 export const PTY_SCOPE_REASON =
-	'A project action never types into a terminal — set its target to "new" or "engine", or pick a headless Companion target.';
+	'Only a personal action types into a terminal — a project or package action runs headless. Set its target to "new" or "engine", or pick a headless Companion target.';
 
-export const AGENT_EXITED_REASON =
-	'The agent in that terminal has exited — its tab is a plain shell now. Pick an agent session or a new run.';
+export const AGENT_NOT_LIVE_REASON =
+	'The agent in that terminal is not running (not started yet, or exited — the tab may be a plain shell now). Pick an agent session or a new run.';
+
+export const NON_CLAUDE_AGENT_REASON =
+	'That terminal runs an agent other than Claude Code, which reports no liveness — an action never types into it. Pick a Claude session or a new run.';
+
+export const PERMISSION_PENDING_REASON =
+	'That terminal is waiting on a permission request — typing into it now would answer it. Decide the request first.';
 
 export const BANG_PROMPT_REASON =
 	'The prompt starts a line with "!", which the agent runs as a shell command — refused.';
@@ -177,13 +209,20 @@ export async function send(request: ChiSendRequest): Promise<ChiSendResult> {
 		case 'none':
 			throw new ChiUnavailableError('no-engine', resolved.disabledReason ?? 'No Chi target is available');
 		case 'pty': {
-			// DEC-55 (module note): personal only, agent terminal only, a live
-			// agent, no control characters from values, no `!` line.
+			// DEC-55 (module note): personal only, a live Claude agent terminal
+			// only, no pending permission, no control characters from values,
+			// no `!` line.
 			if (request.scope !== 'personal') throw new ChiUnavailableError('no-target', PTY_SCOPE_REASON);
 			if (target.kind !== 'session' || !isAgentTerminal(target.session_id)) {
 				throw new ChiUnavailableError('no-target', PLAIN_TERMINAL_REASON);
 			}
-			if (agentExited(target.session_id)) throw new ChiUnavailableError('no-target', AGENT_EXITED_REASON);
+			if (isNonClaudeAgent(target.session_id)) {
+				throw new ChiUnavailableError('no-target', NON_CLAUDE_AGENT_REASON);
+			}
+			if (!isAgentLive(target.session_id)) throw new ChiUnavailableError('no-target', AGENT_NOT_LIVE_REASON);
+			if (hasPendingPermission(target.session_id)) {
+				throw new ChiUnavailableError('permission-pending', PERMISSION_PENDING_REASON);
+			}
 			const text = request.ptyPrompt ?? request.prompt;
 			if (isBangPrompt(text)) throw new ChiUnavailableError('bang-prompt', BANG_PROMPT_REASON);
 			// The dispatch path's own PTY write (context line omitted: the

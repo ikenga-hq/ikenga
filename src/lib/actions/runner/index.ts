@@ -2,7 +2,10 @@
 // kinds of a personal / project action (G-ACTIONS §8.1), with the six
 // variables (§8.2), `confirm`, Test run, and the DEC-55 project-trust gate
 // (§8.3). WP-55 (menus) and WP-58 (Test run) call this; package actions
-// (`dispatch` fill-only, `view`) and built-ins never come through here.
+// (`dispatch` fill-only, `view`) and built-ins never come through here. The
+// one package caller is a package skill action's `auto` send
+// (`action-runner.ts`), as scope `package`: never gated (§8.3), `chi` /
+// `skill` only, and never typed into a PTY (`chi.ts`).
 //
 // Every run ends in one typed outcome — never a throw:
 //   done     it executed (`chi` / `skill`: the run id, DEC-63.3)
@@ -22,7 +25,13 @@ import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { ActionRun, ActionRunKind, ActionsScope, RunVariable, UserAction } from '../types';
-import { ChiUnavailableError, ptySafeVariables, send as chiSend, type ChiSendResult } from './chi';
+import {
+	ChiUnavailableError,
+	ptySafeVariables,
+	send as chiSend,
+	type ChiSendResult,
+	type RunScope,
+} from './chi';
 import {
 	basename,
 	emptyRunVariables,
@@ -41,7 +50,7 @@ import { workflowDisabled } from './workflow';
 export { canonicalJson, checkActionTrust, isTrustGated, onTrustChanged, runHash } from './trust';
 export { interpolate, templateVariables } from './interpolate';
 export type { ActionExecRefusal, ActionExecResult } from './shell';
-export type { ChiSendResult } from './chi';
+export type { ChiSendResult, RunScope } from './chi';
 
 // --- inputs ----------------------------------------------------------------------
 
@@ -50,8 +59,9 @@ export interface RunnableAction {
 	id: string;
 	name?: string;
 	run: ActionRun;
-	/** Where the action is defined — decides the trust gate. */
-	scope: ActionsScope;
+	/** Where the action is defined — decides the trust gate. `package`:
+	 *  package content, never gated, `chi` / `skill` only, never a PTY. */
+	scope: RunScope;
 }
 
 export interface ConfirmRequest {
@@ -87,6 +97,10 @@ export type RunRefusalReason =
 	| 'no-target'
 	/** A PTY inject whose text starts a line with `!` (Claude Code bash mode). */
 	| 'bang-prompt'
+	/** A PTY inject into a terminal with a pending permission request. */
+	| 'permission-pending'
+	/** A package action of a kind other than `chi` / `skill`. */
+	| 'package-kind'
 	/** Windows: a value the command names holds a `cmd.exe` metacharacter. */
 	| 'unsafe-value-for-windows'
 	| 'invalid-skill'
@@ -252,6 +266,14 @@ function defaultConfirm(request: ConfirmRequest): boolean {
 	);
 }
 
+/** What a Windows user reads when `action_exec` refuses a value (`%` / `!`
+ *  expand inside `cmd.exe` even quoted). */
+export const UNSAFE_WINDOWS_VALUE_MESSAGE =
+	'On Windows, a value containing % or ! (for example a file path with one in its name) can’t be passed to a command as a variable — cmd.exe would expand it. Rename the file or folder, or run the action on another path.';
+
+/** Kinds a package action may run (G-ACTIONS §8.1: a package's skill actions). */
+const PACKAGE_RUN_KINDS: readonly ActionRunKind[] = ['chi', 'skill'];
+
 /** Maps `action_exec`'s typed refusal onto a run outcome. */
 function execRefusal(exec: ActionExecResult, projectId: string | null, actionId: string): RunOutcome {
 	const message = exec.error ?? 'The command was refused.';
@@ -264,10 +286,11 @@ function execRefusal(exec: ActionExecResult, projectId: string | null, actionId:
 				projectId,
 				actionIds: [actionId],
 			});
+		case 'unsafe-value-for-windows':
+			return refused('shell', exec.refusal, UNSAFE_WINDOWS_VALUE_MESSAGE);
 		case 'variable-in-single-quotes':
 		case 'variable-after-escape':
 		case 'unknown-variable':
-		case 'unsafe-value-for-windows':
 			return refused('shell', exec.refusal, message);
 		default:
 			return refused('shell', 'exec-refused', message);
@@ -298,10 +321,17 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 	// nothing executes, so there is nothing to trust yet.
 	const previewOnly = testRun && run.kind === 'shell';
 
+	// A package action is package content (covered by its own Ngwa trust):
+	// never DEC-55-gated (§8.3), and only a Chi dispatch.
+	const isPackage = action.scope === 'package';
+	if (isPackage && !PACKAGE_RUN_KINDS.includes(run.kind)) {
+		return refused(run.kind, 'package-kind', `A package action can only dispatch to Chi, not run “${run.kind}”.`);
+	}
+
 	// DEC-55 gate — fail-closed, against the in-force trust status.
 	let gateHash: string | null = null;
-	if (!previewOnly) {
-		const trust = await checkActionTrust({ id: action.id, run, scope: action.scope }, projectId);
+	if (!previewOnly && !isPackage) {
+		const trust = await checkActionTrust({ id: action.id, run, scope: action.scope as ActionsScope }, projectId);
 		if (!trust.ok) {
 			return refused(run.kind, trust.reason, trust.message, {
 				mode: 'project-actions',
@@ -378,7 +408,7 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 				// id, re-checks the hash (and, for a project action, its trust)
 				// and passes the values as environment variables (§8.2).
 				const exec = await actionExec({
-					scope: action.scope,
+					scope: action.scope as ActionsScope,
 					projectId: projectId ?? null,
 					actionId: action.id,
 					runHash: gateHash ?? (await runHash(run)),

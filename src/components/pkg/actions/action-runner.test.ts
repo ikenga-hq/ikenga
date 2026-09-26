@@ -41,7 +41,7 @@ describe('dispatchAction', () => {
 		expect(runActionMock).not.toHaveBeenCalled();
 	});
 
-	it('only auto SENDS a chi dispatch invoking the skill, ungated, and returns the run id', async () => {
+	it('only auto SENDS a chi dispatch invoking the skill, as scope "package" (ungated, never PTY), and returns the run id', async () => {
 		runActionMock.mockResolvedValue({ status: 'done', kind: 'chi', testRun: false, runId: 'run-7' });
 		await expect(dispatchAction(skillAction({ uxMode: 'auto' }))).resolves.toEqual({ ok: true, runId: 'run-7' });
 		expect(handToChiMock).not.toHaveBeenCalled();
@@ -49,7 +49,8 @@ describe('dispatchAction', () => {
 			id: 'com.x.release:release-status:report',
 			name: 'Report',
 			run: { kind: 'chi', target: 'active', prompt: '/release-status report' },
-			scope: 'personal',
+			// Package content: its own scope, so the runner never types it into a PTY.
+			scope: 'package',
 		});
 	});
 

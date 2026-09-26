@@ -17,7 +17,8 @@ vi.mock('@/shell/companion/resolve-target', () => ({
 }));
 
 import { useShellStore } from '@/lib/shell/shell-store';
-import { useTerminalStore, type TerminalTab } from '@/terminal/session-store';
+import { useCompanionStore, type PermissionCardEntry } from '@/shell/companion/companion-store';
+import { applyAgentHook, useTerminalStore, type TerminalTab } from '@/terminal/session-store';
 import {
 	ChiUnavailableError,
 	companionTargetFor,
@@ -30,6 +31,7 @@ import {
 } from './chi';
 import { emptyRunVariables } from './interpolate';
 
+/** An agent tab is a live Claude wrap (its `SessionStart` recorded). */
 function terminalTab(id: string, agent: boolean): TerminalTab {
 	return {
 		id,
@@ -37,6 +39,7 @@ function terminalTab(id: string, agent: boolean): TerminalTab {
 		spec: agent
 			? { cwd: '/proj', cmd: ['claude'], wrap: {} }
 			: { cwd: '/proj', cmd: ['bash'] },
+		...(agent ? { claudeSessionId: `c-${id}`, agentLive: true } : {}),
 		ptyId: `pty-${id}`,
 		status: 'running',
 		exitCode: null,
@@ -50,6 +53,7 @@ beforeEach(() => {
 		activeProject: { id: 'p1', root_path: '/proj', extra_roots: [] },
 		companion: { activeTarget: { kind: 'new', engine_id: null } },
 	});
+	useCompanionStore.setState({ permissions: [] });
 });
 
 afterEach(() => {
@@ -228,15 +232,113 @@ describe('chi adapter (Mock contract 3)', () => {
 			expect(ptySend).toHaveBeenCalledWith('/review a.ts b.ts');
 		});
 
-		it('refuses a Claude wrap tab whose session has ended (SessionEnd → null)', async () => {
-			const ptySend = agentActive({ claudeSessionId: null });
+		it('refuses a Claude wrap whose agent never started (claudeSessionId undefined)', async () => {
+			const ptySend = agentActive({ claudeSessionId: undefined, agentLive: undefined });
 			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
 				reason: 'no-target',
 			});
 			expect(ptySend).not.toHaveBeenCalled();
-			// Before SessionStart (undefined) or with a live id it still injects.
-			agentActive({ claudeSessionId: 'c-1' });
+		});
+
+		it('refuses a stale id after an exit event (SessionEnd, PTY exit, restored tab)', async () => {
+			const sends: ReturnType<typeof agentActive>[] = [];
+			// SessionEnd → null.
+			sends.push(agentActive({ claudeSessionId: null, agentLive: false }));
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'no-target',
+			});
+			// PTY exited: the old id may still be set, but the store marks it exited.
+			sends.push(agentActive());
+			useTerminalStore.getState().setStatus('s1', 'exited', 0);
+			expect(useTerminalStore.getState().tabs[0].claudeSessionId).toBe('c-s1');
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'no-target',
+			});
+			// A restored tab keeps its persisted id but is not live until a fresh SessionStart.
+			sends.push(agentActive({ claudeSessionId: 'c-old', agentLive: undefined }));
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'no-target',
+			});
+			for (const ptySend of sends) expect(ptySend).not.toHaveBeenCalled();
+		});
+
+		it('records SessionStart / SessionEnd for a tab no pane mounts (store-level listener)', async () => {
+			const ptySend = agentActive({ claudeSessionId: undefined, agentLive: undefined });
+			applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'SessionStart', session_id: 'c-new' });
+			expect(useTerminalStore.getState().tabs[0]).toMatchObject({ claudeSessionId: 'c-new', agentLive: true });
 			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
+			applyAgentHook({ ikenga_terminal_id: 's1', hook_event_name: 'SessionEnd', session_id: 'c-new' });
+			expect(useTerminalStore.getState().tabs[0]).toMatchObject({ claudeSessionId: null, agentLive: false });
+			await expect(send({ prompt: 'y', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'no-target',
+			});
+			// Another terminal's hook does not touch this tab.
+			applyAgentHook({ ikenga_terminal_id: 'other', hook_event_name: 'SessionStart', session_id: 'c-x' });
+			expect(useTerminalStore.getState().tabs[0].agentLive).toBe(false);
+			expect(ptySend).toHaveBeenCalledTimes(1);
+		});
+
+		it('refuses a non-Claude wrap (no liveness signal)', async () => {
+			for (const engine of ['gemini', 'codex', 'antigravity'] as const) {
+				const ptySend = agentActive({
+					spec: { cwd: '/proj', cmd: [engine], wrap: { engine } },
+					claudeSessionId: 'c-s1',
+					agentLive: true,
+				});
+				await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+					reason: 'no-target',
+					message: expect.stringContaining('other than Claude'),
+				});
+				expect(ptySend).not.toHaveBeenCalled();
+			}
+		});
+
+		it('injects into a live Claude wrap', async () => {
+			const ptySend = agentActive();
+			await expect(send({ prompt: 'hello', target: 'active', scope: 'personal' })).resolves.toEqual({
+				runId: null,
+				via: 'pty',
+			});
+			expect(ptySend).toHaveBeenCalledWith('hello');
+		});
+
+		it('refuses while that terminal has a pending permission request', async () => {
+			const ptySend = agentActive();
+			const card = (patch: Partial<PermissionCardEntry>): PermissionCardEntry => ({
+				id: 'req-1',
+				kind: 'permission',
+				toolName: 'Bash',
+				arrivedAt: 0,
+				status: 'pending',
+				sessionId: 's1',
+				...patch,
+			});
+			useCompanionStore.setState({ permissions: [card({})] });
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'permission-pending',
+			});
+			// A pending card with no terminal id could be this one — also refused.
+			useCompanionStore.setState({ permissions: [card({ sessionId: undefined })] });
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).rejects.toMatchObject({
+				reason: 'permission-pending',
+			});
+			expect(ptySend).not.toHaveBeenCalled();
+			// Another terminal's ask, or a decided one, does not block.
+			useCompanionStore.setState({
+				permissions: [card({ sessionId: 's2' }), card({ id: 'req-2', status: 'resolved' })],
+			});
+			await expect(send({ prompt: 'x', target: 'active', scope: 'personal' })).resolves.toMatchObject({ via: 'pty' });
+		});
+
+		it('a package chi / skill never types into a PTY', async () => {
+			const ptySend = agentActive();
+			await expect(send({ prompt: 'x', target: 'active', scope: 'package' })).rejects.toMatchObject({
+				reason: 'no-target',
+			});
+			await expect(invokeSkill({ skill: 'release-status', target: 'active', scope: 'package' })).rejects.toMatchObject(
+				{ reason: 'no-target' }
+			);
+			expect(ptySend).not.toHaveBeenCalled();
 		});
 	});
 });

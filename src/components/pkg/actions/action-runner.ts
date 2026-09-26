@@ -13,7 +13,9 @@
 //
 // A package's skill actions are package content, covered by the package's
 // own Ngwa trust — the DEC-55 project-file gate does not apply (G-ACTIONS
-// §8.3: package actions are never gated), so a send runs as an ungated source.
+// §8.3: package actions are never gated). A send runs as scope `package`:
+// ungated, but — like a project action — never typed into a terminal (a
+// headless Chi run only; `runner/chi.ts`). Package `dispatch` stays fill-only.
 
 import { runAction, type RunOutcome } from '@/lib/actions/runner';
 import { skillPrompt } from '@/lib/actions/runner/chi';
@@ -102,8 +104,8 @@ export async function dispatchAction(
 		id: `${action.pkgId}:${action.skill}:${action.verb}`,
 		name: action.name,
 		run: { kind: 'chi', target: 'active', prompt },
-		// Package content: not a project file, so never DEC-55-gated.
-		scope: 'personal',
+		// Package content: never DEC-55-gated, never PTY-injected.
+		scope: 'package',
 	});
 	return toDispatchResult(outcome);
 }
