@@ -76,11 +76,11 @@ export function TodosSection({ projectId }: ExplorerSectionContext) {
 				<EffectiveContextMenu
 					key={todo.id}
 					menuId="todos"
+					// A-9: `open-source` is left out — todos carry no source-file
+					// reference, so it could only open the Todos page.
+					builtinsNeedHandler
 					handlers={{
 						'toggle-done': () => void toggleDone(todo),
-						// Todos carry no source-file reference — the Todos page is
-						// the closest surface that shows where one came from.
-						'open-source': openTodos,
 						'hand-to-chi': () => handToChi(todo.title),
 					}}
 				>

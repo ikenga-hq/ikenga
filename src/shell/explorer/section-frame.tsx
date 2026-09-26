@@ -1,16 +1,21 @@
 import type React from 'react';
 import type { ReactNode } from 'react';
-import { ChevronDown, ChevronRight } from 'lucide-react';
-import {
-	ContextMenu,
-	ContextMenuContent,
-	ContextMenuItem,
-	ContextMenuSeparator,
-	ContextMenuTrigger,
-} from '@/components/ui/context-menu';
-import { useEffectiveMenu } from '@/lib/actions/store';
-import { resolveMenuItems } from '@/shell/menu/resolve';
+import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, EyeOff, FoldVertical } from 'lucide-react';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionDefinition, ExplorerSectionContext } from './section-registry';
+
+// Shipped presentation of the section-header menu (the registry names read
+// "Move section up/down" for the Actions tab; the menu keeps its wording).
+const SECTION_MENU_LABELS: Readonly<Record<string, string>> = {
+	'section.move-up': 'Move up',
+	'section.move-down': 'Move down',
+};
+const SECTION_MENU_ICONS = {
+	'section.collapse-others': <FoldVertical className="h-3.5 w-3.5 mr-2" />,
+	'section.hide': <EyeOff className="h-3.5 w-3.5 mr-2" />,
+	'section.move-up': <ArrowUp className="h-3.5 w-3.5 mr-2" />,
+	'section.move-down': <ArrowDown className="h-3.5 w-3.5 mr-2" />,
+};
 
 interface SectionFrameProps {
 	section: ExplorerSectionDefinition;
@@ -56,22 +61,25 @@ export function SectionFrame({
 
 	const ariaLabel = `${section.title}${count !== undefined ? `, ${count} items` : ''}`;
 
-	const sectionMenu = useEffectiveMenu(`section/${section.id}`);
-	const menuRows = resolveMenuItems(sectionMenu, {
-		handlers: {
-			'section.collapse-others': () => onCollapseOthers?.(),
-			'section.hide': () => onHideSection?.(),
-			'section.move-up': () => onMoveUp?.(),
-			'section.move-down': () => onMoveDown?.(),
-		},
-		disabled: (id) =>
-			id === 'section.move-up' ? !canMoveUp : id === 'section.move-down' ? !canMoveDown : false,
-	});
+	// `section/<id>` (G-ACTIONS §1.3), resolved only while the menu is open.
+	const menuHandlers = {
+		'section.collapse-others': () => onCollapseOthers?.(),
+		'section.hide': () => onHideSection?.(),
+		'section.move-up': () => onMoveUp?.(),
+		'section.move-down': () => onMoveDown?.(),
+	};
+	const menuDisabled = (id: string) =>
+		id === 'section.move-up' ? !canMoveUp : id === 'section.move-down' ? !canMoveDown : false;
 
 	return (
 		<div className="flex flex-col border-b border-border last:border-b-0" data-explorer-section={section.id}>
-			<ContextMenu>
-				<ContextMenuTrigger asChild>
+			<EffectiveContextMenu
+				menuId={`section/${section.id}`}
+				handlers={menuHandlers}
+				disabled={menuDisabled}
+				labels={SECTION_MENU_LABELS}
+				icons={SECTION_MENU_ICONS}
+			>
 					<button
 						type="button"
 						data-explorer-row="header"
@@ -100,22 +108,7 @@ export function SectionFrame({
 							</span>
 						)}
 					</button>
-				</ContextMenuTrigger>
-				{menuRows.length > 0 && (
-					<ContextMenuContent>
-						{menuRows.map((row, i) =>
-							row.kind === 'separator' ? (
-								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
-								<ContextMenuSeparator key={`sep-${i}`} />
-							) : (
-								<ContextMenuItem key={row.id} disabled={row.disabled} onSelect={row.run}>
-									{row.label}
-								</ContextMenuItem>
-							)
-						)}
-					</ContextMenuContent>
-				)}
-			</ContextMenu>
+			</EffectiveContextMenu>
 			{isOpen && (
 				<div className="flex-1 min-h-0 bg-background/50">
 					{children}

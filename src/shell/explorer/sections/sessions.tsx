@@ -25,8 +25,6 @@ export const sessionsContextMenu = [
 
 export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const tabs = useTerminalStore((s) => s.tabs);
-	const renameTab = useTerminalStore((s) => s.rename);
-	const removeTab = useTerminalStore((s) => s.remove);
 
 	const openSession = useCallback((sessionId: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -71,17 +69,17 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 					<EffectiveContextMenu
 						key={tab.id}
 						menuId="session"
+						// A-9: `rename` (it needed `window.prompt`; no dialog-shim
+						// prompt exists) and `kill-session` (removing the tab entry
+						// doesn't kill its PTY, and there is no tab→PTY kill API) are
+						// left out until they have real handlers.
+						builtinsNeedHandler
 						handlers={{
 							open: () => openSession(tab.id),
 							'open-to-side': () => openSessionSplit(tab.id),
 							'make-dispatch': () =>
 								useShellStore.getState().setCompanionTarget({ kind: 'session', session_id: tab.id }),
 							'hand-to-chi': () => handToChi(tab.title || tab.id),
-							rename: () => {
-								const next = window.prompt('Rename session', tab.title || tab.id);
-								if (next && next.trim()) renameTab(tab.id, next.trim());
-							},
-							'kill-session': () => removeTab(tab.id),
 						}}
 					>
 						<ListRow

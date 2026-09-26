@@ -24,8 +24,8 @@
 // to this — a renderer property, not a data one (see the PR body).
 
 import { getEffectiveMenu } from '@/lib/actions/store';
-import { runCommand } from '@/lib/keymap/commands';
 import { findEntry, labelFor } from '@/lib/keymap/registry';
+import { runMenuAction } from './resolve';
 import { isMacPlatform, toAccelerator } from '@/lib/keymap/platform';
 import { modeForRoute } from '@/lib/shell/mode-routes';
 import { useShellStore } from '@/lib/shell/shell-store';
@@ -163,15 +163,17 @@ const NATIVE_ONLY_ACTIONS: Readonly<Record<string, () => void>> = {
 };
 
 /** Activate a canonical action id — a local handler for the ids nothing else
- *  in the app owns, else the WP-53/WP-54 command table. Both renderers call
- *  this for every non-`predefined` leaf. */
+ *  in the app owns, else `runMenuAction`: a built-in through the WP-54
+ *  command table (its registered owner), a personal / project action through
+ *  the WP-53 runner with its outcome surfaced, a package action through its
+ *  own run. Both renderers call this for every non-`predefined` leaf. */
 export function activateActionId(id: string): void {
 	const local = NATIVE_ONLY_ACTIONS[id];
 	if (local) {
 		local();
 		return;
 	}
-	runCommand({ command: id, source: 'menu' });
+	runMenuAction(id);
 }
 
 export const MENU_TREE: MenuDef[] = [

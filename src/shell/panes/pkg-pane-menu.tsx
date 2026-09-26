@@ -32,7 +32,9 @@
 //                           `pkg-blocked` (`pkg-blocked-store`): restores the
 //                           native surface on its previous page.
 
+import type { ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { AlertTriangle, Ban, Bolt, PinOff, RefreshCw, Settings, Shield } from 'lucide-react';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneId, PaneView } from '@/lib/panes/types';
@@ -59,6 +61,27 @@ export function usePkgIdForPane(paneId: PaneId): string | null {
 	});
 }
 
+/** What the pkg branch adds to the pane menu's `resolveMenuItems` call. */
+export interface PkgPaneMenuData {
+	conditions: Partial<Record<MenuItemCondition, boolean>>;
+	handlers: Record<string, () => void>;
+	icons: Record<string, ReactNode>;
+}
+
+/** A pane that shows no pkg: the pkg branch is skipped. */
+export const NO_PKG_PANE_MENU: PkgPaneMenuData = { conditions: { 'pkg-pane': false }, handlers: {}, icons: {} };
+
+/** The shipped glyphs of the pkg branch (`data-action` = the id, verbatim). */
+const PKG_MENU_ICONS: Record<string, ReactNode> = {
+	'pkg.keep-blocking': <Ban className="h-3.5 w-3.5" />,
+	'pkg.reload-view': <RefreshCw className="h-3.5 w-3.5" />,
+	'pkg.view-permissions': <Shield className="h-3.5 w-3.5" />,
+	'pkg.package-settings': <Settings className="h-3.5 w-3.5" />,
+	'pkg.restart-sidecar': <Bolt className="h-3.5 w-3.5" />,
+	'pkg.unpin': <PinOff className="h-3.5 w-3.5" />,
+	'pkg.report-violation-log': <AlertTriangle className="h-3.5 w-3.5" />,
+};
+
 /**
  * The pkg branch of the pane `⋯` menu (§1.3's `pane` menu, `pkg-*`
  * conditions) as conditions + handlers `pane-toolbar.tsx` folds into its own
@@ -66,15 +89,12 @@ export function usePkgIdForPane(paneId: PaneId): string | null {
  * branch and the plain items) resolves and renders from one effective menu,
  * so reordering/hiding in `actions.json` reaches every branch, not just the
  * plain items.
+ *
+ * Only ever called for a pkg pane, and only while the `⋯` menu is open
+ * (`PkgPaneMenuDataProvider`): the kernel-status query needs a
+ * `QueryClient`, which a non-pkg pane never asks for.
  */
-export function usePkgPaneMenuData(
-	paneId: PaneId,
-	pkgId: string | null,
-	onReload: () => void
-): {
-	conditions: Partial<Record<MenuItemCondition, boolean>>;
-	handlers: Record<string, () => void>;
-} {
+export function usePkgPaneMenuData(paneId: PaneId, pkgId: string, onReload: () => void): PkgPaneMenuData {
 	const addTab = usePaneStore((s) => s.addTab);
 	// Same key + staleness as `useWebviewRoute` (pane-views.tsx) so the pane
 	// chrome shares one kernel-status read.
@@ -84,24 +104,19 @@ export function usePkgPaneMenuData(
 		staleTime: Infinity,
 	});
 	const supervised = Boolean(
-		pkgId &&
-			(status?.registries?.sidecar_supervisor as SupervisorRegistry | undefined)?.entries?.some(
-				(e) => e.pkg_id === pkgId
-			)
+		(status?.registries?.sidecar_supervisor as SupervisorRegistry | undefined)?.entries?.some(
+			(e) => e.pkg_id === pkgId
+		)
 	);
 	const pin = usePinsStore((s) =>
-		pkgId
-			? s.pins.find(
-					(p) => (p.kind === 'pkg-route' || p.kind === 'route') && pkgIdFromRoutePath(p.target) === pkgId
-				)
-			: undefined
+		s.pins.find(
+			(p) => (p.kind === 'pkg-route' || p.kind === 'route') && pkgIdFromRoutePath(p.target) === pkgId
+		)
 	);
 	const removePin = usePinsStore((s) => s.removePin);
-	const keepBlocking = useKeepBlocking(pkgId ?? '', paneId);
+	const keepBlocking = useKeepBlocking(pkgId, paneId);
 
 	const openRoute = (path: string) => addTab(paneId, { kind: 'route', path });
-
-	if (!pkgId) return { conditions: { 'pkg-pane': false }, handlers: {} };
 
 	return {
 		conditions: {
@@ -125,5 +140,22 @@ export function usePkgPaneMenuData(
 			},
 			'pkg.report-violation-log': () => openRoute(VIOLATION_LOG_PATH),
 		},
+		icons: PKG_MENU_ICONS,
 	};
+}
+
+/** Runs `usePkgPaneMenuData` and hands the result to `children` — mounted
+ *  inside the open `⋯` menu, for pkg panes only. */
+export function PkgPaneMenuDataProvider({
+	paneId,
+	pkgId,
+	onReload,
+	children,
+}: {
+	paneId: PaneId;
+	pkgId: string;
+	onReload: () => void;
+	children: (data: PkgPaneMenuData) => ReactNode;
+}) {
+	return <>{children(usePkgPaneMenuData(paneId, pkgId, onReload))}</>;
 }

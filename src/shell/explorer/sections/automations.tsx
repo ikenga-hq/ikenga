@@ -115,6 +115,16 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 		addTab(focusedId, { kind: 'route', path: '/automations' });
 	}, []);
 
+	const openNgwa = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
+	}, []);
+
+	const openRuns = useCallback(() => {
+		const { focusedId, addTab } = usePaneStore.getState();
+		addTab(focusedId, { kind: 'route', path: '/automations?view=runs' });
+	}, []);
+
 	if (items.length === 0) {
 		return (
 			<div className="p-4 text-center">
@@ -133,29 +143,18 @@ export function AutomationsSection({ projectId }: ExplorerSectionContext) {
 		);
 	}
 
-	const openNgwa = useCallback(() => {
-		const { focusedId, addTab } = usePaneStore.getState();
-		addTab(focusedId, { kind: 'route', path: '/ngwa/installed' });
-	}, []);
-
-	const openRuns = useCallback(() => {
-		const { focusedId, addTab } = usePaneStore.getState();
-		addTab(focusedId, { kind: 'route', path: '/automations?view=runs' });
-	}, []);
-
 	return (
 		<div className="py-1">
 			{items.map((item) => (
 				<EffectiveContextMenu
 					key={item.id}
 					menuId="automations"
+					// A-9: `run-now`, `pause-resume` and `open-definition` are left
+					// out — Ngwa's `workflows[]` / `cron[]` registries are read-only
+					// lists with no per-item trigger, pause or definition-file
+					// endpoint, and a row that only navigates is not that behaviour.
+					builtinsNeedHandler
 					handlers={{
-						// No per-item trigger/pause or definition-file endpoint
-						// exists yet (Ngwa's `workflows[]` / `cron[]` registries are
-						// read-only lists) — these open the surface that owns it.
-						'run-now': openAutomations,
-						'pause-resume': openAutomations,
-						'open-definition': openAutomations,
 						'open-last-log': openRuns,
 						'open-in-ngwa': openNgwa,
 					}}

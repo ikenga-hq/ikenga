@@ -22,6 +22,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useEffectiveMenu } from '@/lib/actions/store';
+import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { pickViewerRoot } from '../lib/relative-root';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
@@ -193,23 +194,24 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 	// to the pin composer on every right-click.
 	const [menu, setMenu] = useState<{ x: number; y: number; pick: PickResult } | null>(null);
 	const replaceView = usePaneStore((s) => s.replaceActiveViewAndPushHistory);
-	const viewerFrameMenu = useEffectiveMenu('viewer-frame');
-	const viewerFrameRows = resolveMenuItems(viewerFrameMenu, {
-		conditions: { 'html-in-pane': Boolean(paneId && isHtmlPath(path)) },
-		handlers: {
-			'viewer.add-pin': () => menu && setPick(menu.pick),
-			'copy-path': () => void writeClipboardText(path).catch(() => {}),
-			'viewer.open-in-studio': () =>
-				paneId && replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' }),
-			'viewer.reload': () => {
-				try {
-					iframeRef.current?.contentWindow?.location.reload();
-				} catch {
-					/* cross-origin or detached — ignore */
-				}
-			},
+	// `viewer-frame` (G-ACTIONS §1.3) handlers; the menu itself resolves in
+	// `ViewerFrameMenuItems`, mounted only while it is open.
+	const viewerFrameHandlers: Record<string, () => void> = {
+		'viewer.add-pin': () => {
+			if (menu) setPick(menu.pick);
 		},
-	});
+		'copy-path': () => void writeClipboardText(path).catch(() => {}),
+		'viewer.open-in-studio': () => {
+			if (paneId) replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' });
+		},
+		'viewer.reload': () => {
+			try {
+				iframeRef.current?.contentWindow?.location.reload();
+			} catch {
+				/* cross-origin or detached — ignore */
+			}
+		},
+	};
 
 	// Send a message to the child iframe. The frame is sandboxed to an opaque
 	// origin, so `targetOrigin` must be `'*'`: there is no origin string that
@@ -352,18 +354,14 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 						style={{ left: menu?.x ?? 0, top: menu?.y ?? 0 }}
 					/>
 				</DropdownMenuTrigger>
-				{menu && viewerFrameRows.length > 0 && (
+				{menu && (
 					<DropdownMenuContent align="start" sideOffset={0}>
-						{viewerFrameRows.map((row, i) =>
-							row.kind === 'separator' ? (
-								// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
-								<DropdownMenuSeparator key={`sep-${i}`} />
-							) : (
-								<DropdownMenuItem key={row.id} onSelect={row.run}>
-									{row.label}
-								</DropdownMenuItem>
-							)
-						)}
+						<ViewerFrameMenuItems
+							path={path}
+							paneId={paneId}
+							htmlInPane={Boolean(paneId && isHtmlPath(path))}
+							handlers={viewerFrameHandlers}
+						/>
 					</DropdownMenuContent>
 				)}
 			</DropdownMenu>
@@ -392,5 +390,55 @@ function OpenInStudioButton({ paneId, path }: OpenInStudioButtonProps) {
 			<Pencil className="h-3 w-3" />
 			Open in Studio
 		</button>
+	);
+}
+
+/** The `viewer-frame` menu (G-ACTIONS §1.3), resolved while it is open. Its
+ *  target is this artifact (`resource`) in its pane (`paneKind`). */
+function ViewerFrameMenuItems({
+	path,
+	paneId,
+	htmlInPane,
+	handlers,
+}: {
+	path: string;
+	paneId?: string;
+	htmlInPane: boolean;
+	handlers: Record<string, () => void>;
+}) {
+	const paneKind = usePaneStore((s) => {
+		if (!paneId) return undefined;
+		const leaf = findLeaf(s.root, paneId);
+		return leaf?.tabs[leaf.activeTabIdx]?.kind;
+	});
+	const viewerFrameMenu = useEffectiveMenu('viewer-frame');
+	const rows = resolveMenuItems(viewerFrameMenu, {
+		target: { resource: path, paneKind },
+		conditions: { 'html-in-pane': htmlInPane },
+		handlers,
+		// Shipped wording.
+		labels: { 'copy-path': 'Copy path' },
+	});
+	return (
+		<>
+			{rows.map((row, i) =>
+				row.kind === 'separator' ? (
+					// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+					<DropdownMenuSeparator key={`sep-${i}`} />
+				) : (
+					<DropdownMenuItem
+						key={row.id}
+						data-action={row.dataAction}
+						disabled={row.disabled}
+						title={row.disabledReason}
+						variant={row.danger ? 'destructive' : undefined}
+						onSelect={row.run}
+					>
+						{row.icon}
+						{row.label}
+					</DropdownMenuItem>
+				)
+			)}
+		</>
 	);
 }

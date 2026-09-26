@@ -213,6 +213,11 @@ const PALETTE_MENU_ICON: Readonly<Record<string, LucideIcon>> = {
 	'shortcuts.open': Keyboard,
 };
 
+// Search keywords the shipped rows carried beyond their label.
+const PALETTE_MENU_SEARCH: Readonly<Record<string, string>> = {
+	'shortcuts.open': 'keyboard shortcuts keys bindings help',
+};
+
 /** `onShowShortcuts` switches the open palette to its Shortcuts view. It is
  *  injected so this module never imports `command-palette.tsx` (which
  *  imports this one). */
@@ -254,7 +259,7 @@ export function ManageGroup({ onShowShortcuts }: { onShowShortcuts: () => void }
 					<CommandRow
 						key={row.id}
 						size="md"
-						value={row.label}
+						value={PALETTE_MENU_SEARCH[row.id] ?? row.label}
 						Icon={PALETTE_MENU_ICON[row.id] ?? Sparkles}
 						label={row.label}
 						shortcut={row.shortcut || undefined}

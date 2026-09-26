@@ -5,6 +5,8 @@ import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { pkgKernelStatus, pkgSetEnabled, pkgUninstall, type PkgInstalledSummary } from '@/lib/tauri-cmd';
 import { itemDetailPath } from '@/lib/pkg/pkg-view-state';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
+import type { NgwaSnapshot } from '@ikenga/contract';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
@@ -18,6 +20,10 @@ export const ngwaProjectContextMenu = [
 	{ id: 'disable', label: 'Disable', run: () => {} },
 	{ id: 'uninstall', label: 'Uninstall…', run: () => {} },
 ];
+
+/** `ngwaSnapshotQueryKey` (`lib/ngwa/use-ngwa-snapshot.ts`), inlined so this
+ *  section doesn't pull the snapshot hook's registry join into its graph. */
+const NGWA_SNAPSHOT_QUERY_KEY = ['ngwa', 'snapshot'] as const;
 
 export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 	const query = useQuery<PkgInstalledSummary[]>({
@@ -36,6 +42,16 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 	});
 
 	const pkgs = query.data ?? [];
+	const qc = useQueryClient();
+
+	/** The row's Ngwa item kind (§1.3 menu context, `ngwaItemKind`) from the
+	 *  cached Ngwa snapshot — read, never fetched (a cold scan is slow); a
+	 *  package placement's `ngwa-item` kinds show once the snapshot is known. */
+	const ngwaKindOf = useCallback(
+		(pkgId: string): string | undefined =>
+			qc.getQueryData<NgwaSnapshot>(NGWA_SNAPSHOT_QUERY_KEY)?.items.find((i) => i.id === pkgId)?.kind,
+		[qc]
+	);
 
 	const openPkg = useCallback((pkgId: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -70,31 +86,31 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 		);
 	}
 
-	const qc = useQueryClient();
-
 	return (
 		<div className="py-1">
 			{pkgs.map((pkg) => (
 				<EffectiveContextMenu
 					key={pkg.id}
 					menuId="ngwa-project"
+					target={{ ngwaItemKind: ngwaKindOf(pkg.id) }}
+					// A-9: `open-definition` and `change-scope` are left out — no
+					// definition-file viewer or scope-change endpoint exists, and a
+					// row that only opens the detail page is not that behaviour.
+					builtinsNeedHandler
 					handlers={{
 						'open-detail': () => openDetail(pkg.id),
-						// No standalone definition-file viewer exists yet — the item
-						// detail page is the closest surface that shows it.
-						'open-definition': () => openDetail(pkg.id),
-						// No scope-change endpoint exists yet — same stand-in.
-						'change-scope': () => openDetail(pkg.id),
 						disable: () => {
 							void pkgSetEnabled(pkg.id, false).then(() =>
 								qc.invalidateQueries({ queryKey: ['explorer-ngwa-project', projectId] })
 							);
 						},
 						uninstall: () => {
-							if (!window.confirm(`Uninstall "${pkg.id}"?`)) return;
-							void pkgUninstall(pkg.id).then(() =>
-								qc.invalidateQueries({ queryKey: ['explorer-ngwa-project', projectId] })
-							);
+							void (async () => {
+								const ok = await confirmDialog(`Uninstall "${pkg.id}"?`, { title: 'Uninstall', kind: 'warning' });
+								if (!ok) return;
+								await pkgUninstall(pkg.id);
+								await qc.invalidateQueries({ queryKey: ['explorer-ngwa-project', projectId] });
+							})().catch(() => {});
 						},
 					}}
 				>

@@ -70,6 +70,7 @@ export function ArtifactsSection({ projectId }: ExplorerSectionContext) {
 				<EffectiveContextMenu
 					key={art.path}
 					menuId="artifacts"
+					target={{ resource: art.path }}
 					handlers={{
 						'open-loupe': () => {
 							const { focusedId, addTab } = usePaneStore.getState();

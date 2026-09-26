@@ -37,6 +37,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { resolveMenuItems } from '@/shell/menu/resolve';
+import { MenuRunNoticeHost } from '@/shell/menu/run-notice';
 import {
 	Fragment,
 	type KeyboardEvent as ReactKeyboardEvent,
@@ -417,7 +418,15 @@ export function StatusBar() {
 									// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
 									<DropdownMenuSeparator key={`sep-${i}`} />
 								) : (
-									<DropdownMenuItem key={row.id} onSelect={row.run}>
+									<DropdownMenuItem
+										key={row.id}
+										data-action={row.dataAction}
+										disabled={row.disabled}
+										title={row.disabledReason}
+										variant={row.danger ? 'destructive' : undefined}
+										onSelect={row.run}
+									>
+										{row.icon}
 										{row.label}
 									</DropdownMenuItem>
 								)
@@ -430,6 +439,9 @@ export function StatusBar() {
 			<span role="status" aria-live="polite" className="sr-only">
 				{liveText}
 			</span>
+			{/* WP-55: where a menu-run action's refusal / failure is shown (and
+			    the trust sheet it may open). Always in the frame, like this bar. */}
+			<MenuRunNoticeHost />
 		</div>
 	);
 }

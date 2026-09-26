@@ -7,21 +7,27 @@ import { findLeaf } from '@/lib/panes/pane-reducer';
 import { useDragState } from '@/lib/panes/drag-state';
 import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { TabStrip, Tab } from '@/components/ui/tab-strip';
-import {
-	ContextMenu,
-	ContextMenuContent,
-	ContextMenuItem,
-	ContextMenuSeparator,
-	ContextMenuTrigger,
-} from '@/components/ui/context-menu';
-import { useEffectiveMenu } from '@/lib/actions/store';
-import { resolveMenuItems } from '@/shell/menu/resolve';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
 import { viewLabel, viewSubtitle } from './pane-views';
 import { viewWorkspace } from './tab-workspace';
 import { NewTabMenu, useAnchorRect } from './new-tab-menu';
 import { PinArtifactDialog } from './pin-artifact-dialog';
 import { cn } from '@/components/ui/utils';
+
+// Shipped wording of the tab menu (the registry names are longer, for the
+// Actions tab); the toggle-pin label is per tab, below.
+const TAB_MENU_LABELS: Readonly<Record<string, string>> = {
+	'pin-sidebar': 'Pin to sidebar…',
+	'tab.move-left': 'Move left',
+	'tab.move-right': 'Move right',
+	'tab.move-to-new-pane-right': 'Move to new pane (right)',
+	'tab.move-to-new-pane-down': 'Move to new pane (down)',
+	'copy-path': 'Copy path',
+	'tab.close': 'Close',
+	'tab.close-others': 'Close others',
+	'tab.close-to-right': 'Close to the right',
+};
 
 interface PaneTabStripProps {
 	leaf: LeafNode;
@@ -43,8 +49,6 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	// Names terminal tabs by what they're running and where — `claude · shell`
 	// rather than N tabs all reading "Terminal".
 	const resolveTerminal = useTerminalTitles();
-
-	const tabMenu = useEffectiveMenu('tab');
 
 	// Close every closable (non-pinned) tab except `keepIdx`. Read fresh state
 	// and close in DESCENDING index order so earlier closes never shift the
@@ -169,10 +173,51 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 					const isPinned = Boolean(tab.pinned);
 					const ws = viewWorkspace(tab);
 					const label = viewLabel(tab, resolveTerminal);
+					const tabPath = tab.kind === 'artifact' || tab.kind === 'route' ? tab.path : undefined;
 					return (
-						<ContextMenu key={`${idx}-${tab.kind}`}>
-							<ContextMenuTrigger asChild>
-								<Tab
+						<EffectiveContextMenu
+							key={`${idx}-${tab.kind}`}
+							menuId="tab"
+							target={{
+								resource: tabPath,
+								paneKind: tab.kind,
+							}}
+							conditions={{ 'artifact-tab': tab.kind === 'artifact' }}
+							// §6A.10 — the single-pointer alternative to drag-reorder
+							// that WCAG 2.5.7 requires; §6A.2 — moving a leaf's only tab
+							// to a new pane would just close the leaf it came from.
+							disabled={(id) =>
+								id === 'tab.move-left'
+									? idx === 0
+									: id === 'tab.move-right'
+										? idx === leaf.tabs.length - 1
+										: id === 'tab.move-to-new-pane-right' || id === 'tab.move-to-new-pane-down'
+											? leaf.tabs.length < 2
+											: id === 'tab.close'
+												? isPinned
+												: false
+							}
+							labels={{ ...TAB_MENU_LABELS, 'tab.toggle-pin': isPinned ? 'Unpin tab' : 'Pin tab' }}
+							handlers={{
+								'pin-sidebar': () => {
+									if (tab.kind === 'artifact') setPinPath(tab.path);
+								},
+								'tab.toggle-pin': () => toggleTabPinned(leaf.id, idx),
+								'tab.move-left': () => reorderTab(leaf.id, idx, idx - 1),
+								'tab.move-right': () => reorderTab(leaf.id, idx, idx + 1),
+								'tab.move-to-new-pane-right': () => moveTab(leaf.id, idx, leaf.id, 'right'),
+								'tab.move-to-new-pane-down': () => moveTab(leaf.id, idx, leaf.id, 'bottom'),
+								// Copy path only where the tab has one (artifact / route), as shipped.
+								...(tabPath !== undefined
+									? { 'copy-path': () => void writeClipboardText(tabPath).catch(() => {}) }
+									: {}),
+								'tab.close': () => closeTab(leaf.id, idx),
+								'tab.close-others': () => closeOthers(idx),
+								'tab.close-to-right': () => closeToRight(idx),
+							}}
+							builtinsNeedHandler
+						>
+							<Tab
 									index={idx}
 									active={isActive}
 									ws={ws}
@@ -210,62 +255,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 													})
 									}
 								/>
-							</ContextMenuTrigger>
-							{(() => {
-								const rows = resolveMenuItems(tabMenu, {
-									conditions: { 'artifact-tab': tab.kind === 'artifact' },
-									// §6A.10 — the single-pointer alternative to drag-reorder
-									// that WCAG 2.5.7 requires.
-									disabled: (id) =>
-										id === 'tab.move-left'
-											? idx === 0
-											: id === 'tab.move-right'
-												? idx === leaf.tabs.length - 1
-												: id === 'tab.move-to-new-pane-right' || id === 'tab.move-to-new-pane-down'
-													? leaf.tabs.length < 2
-													: id === 'tab.close'
-														? isPinned
-														: false,
-									handlers: {
-										'pin-sidebar': () => {
-											if (tab.kind === 'artifact') setPinPath(tab.path);
-										},
-										'tab.toggle-pin': () => toggleTabPinned(leaf.id, idx),
-										'tab.move-left': () => reorderTab(leaf.id, idx, idx - 1),
-										'tab.move-right': () => reorderTab(leaf.id, idx, idx + 1),
-										'tab.move-to-new-pane-right': () => moveTab(leaf.id, idx, leaf.id, 'right'),
-										'tab.move-to-new-pane-down': () => moveTab(leaf.id, idx, leaf.id, 'bottom'),
-										'copy-path': () => {
-											if (tab.kind === 'artifact' || tab.kind === 'route') {
-												void writeClipboardText(tab.path).catch(() => {});
-											}
-										},
-										'tab.close': () => closeTab(leaf.id, idx),
-										'tab.close-others': () => closeOthers(idx),
-										'tab.close-to-right': () => closeToRight(idx),
-									},
-								});
-								return (
-									<ContextMenuContent>
-										{rows.map((row, i) =>
-											row.kind === 'separator' ? (
-												// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
-												<ContextMenuSeparator key={`sep-${i}`} />
-											) : (
-												<ContextMenuItem
-													key={row.id}
-													disabled={row.disabled}
-													variant={row.danger ? 'destructive' : undefined}
-													onSelect={row.run}
-												>
-													{row.id === 'tab.toggle-pin' ? (isPinned ? 'Unpin tab' : 'Pin tab') : row.label}
-												</ContextMenuItem>
-											)
-										)}
-									</ContextMenuContent>
-								);
-							})()}
-						</ContextMenu>
+							</EffectiveContextMenu>
 					);
 				})}
 			</TabStrip>

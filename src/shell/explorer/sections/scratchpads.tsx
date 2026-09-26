@@ -3,7 +3,8 @@ import { FileEdit } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { deleteScratchpad, listScratchpads, readScratchpad, writeScratchpad } from '@/lib/iyke/memory';
+import { deleteScratchpad, listScratchpads } from '@/lib/iyke/memory';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionContext } from '../section-registry';
 
@@ -49,24 +50,10 @@ export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 		[scope]
 	);
 
-	const renameScratchpad = useCallback(
-		async (name: string) => {
-			const next = window.prompt('Rename scratchpad', name);
-			if (!next || !next.trim() || next.trim() === name) return;
-			try {
-				const existing = await readScratchpad(name, scope);
-				await writeScratchpad(next.trim(), existing?.body ?? '', scope);
-				await deleteScratchpad(name, scope);
-			} finally {
-				void qc.invalidateQueries({ queryKey });
-			}
-		},
-		[scope, qc, queryKey]
-	);
-
 	const removeScratchpad = useCallback(
 		async (name: string) => {
-			if (!window.confirm(`Delete scratchpad "${name}"?`)) return;
+			const ok = await confirmDialog(`Delete scratchpad "${name}"?`, { title: 'Delete scratchpad', kind: 'warning' });
+			if (!ok) return;
 			try {
 				await deleteScratchpad(name, scope);
 			} finally {
@@ -105,10 +92,13 @@ export function ScratchpadsSection({ projectId }: ExplorerSectionContext) {
 				<EffectiveContextMenu
 					key={sp.name}
 					menuId="scratchpads"
+					// A-9: `rename` is left out — the memory API has no rename, so it
+					// was read + write + delete (not atomic, and it could overwrite
+					// an existing scratchpad of the new name) behind `window.prompt`.
+					builtinsNeedHandler
 					handlers={{
 						open: () => openScratchpad(sp.name),
 						'open-to-side': () => openScratchpadSplit(sp.name),
-						rename: () => void renameScratchpad(sp.name),
 						delete: () => void removeScratchpad(sp.name),
 					}}
 				>

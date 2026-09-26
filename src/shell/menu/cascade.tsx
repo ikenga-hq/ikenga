@@ -134,6 +134,7 @@ export function NativeMenuCascade({ mac }: { mac?: boolean } = {}) {
 									return (
 										<DropdownMenuItem
 											key={entry.id}
+											data-action={entry.id}
 											variant={entry.danger ? 'destructive' : undefined}
 											onSelect={() => activateActionId(entry.id)}
 										>
