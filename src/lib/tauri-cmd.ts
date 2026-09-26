@@ -2603,6 +2603,65 @@ export async function iykeSetFrame(args: {
 	});
 }
 
+/** WP-62: one mirrored effective action row served by `GET /iyke/actions` —
+ *  opaque to Rust (`src-tauri/src/iyke/actions_routes.rs` stores it as
+ *  `serde_json::Value`, same convention as `ShellSnapshot.panes`). This FE
+ *  interface is the schema. */
+export interface IykeActionMirror {
+	id: string;
+	name: string;
+	icon?: string;
+	description: string;
+	source: 'builtin' | 'package' | 'personal' | 'project';
+	run_kind: string;
+	placements: string[];
+	locked: boolean;
+	hosted: boolean;
+	danger: boolean;
+	pkg_id?: string;
+}
+
+export interface IykeMenuMirrorItem {
+	kind: 'action' | 'separator';
+	id?: string;
+	name?: string;
+	source?: string;
+	when?: string;
+}
+
+/** WP-62: one mirrored effective menu served by `GET /iyke/menus/:id`. */
+export interface IykeMenuMirror {
+	id: string;
+	items: IykeMenuMirrorItem[];
+	hidden: string[];
+}
+
+/**
+ * WP-62: push the effective actions/menus mirror `GET /iyke/actions` and
+ * `GET /iyke/menus/:id` read from. Same partial-update convention as
+ * `iykeSetFrame` — an omitted field leaves the stored value untouched.
+ */
+export async function iykeSetActionsFrame(args: {
+	actions?: IykeActionMirror[] | null;
+	menus?: Record<string, IykeMenuMirror> | null;
+}): Promise<void> {
+	return invoke('iyke_set_actions_frame', {
+		actions: args.actions ?? null,
+		menus: args.menus ?? null,
+	});
+}
+
+/**
+ * WP-62: FE → Rust callback resolving one of the `iyke://actions-set-request`
+ * / `iyke://actions-import-request` / `iyke://keys-set-request` /
+ * `iyke://keys-resolve-request` round trips (`rpc.rs`'s generic
+ * pending/oneshot pattern, `actions_routes.rs`). `result` is opaque JSON
+ * handed straight back as the HTTP response body.
+ */
+export async function iykeActionsRequestDone(requestId: string, result: unknown): Promise<void> {
+	return invoke('iyke_actions_request_done', { requestId, result });
+}
+
 // ─── Screenshots ──────────────────────────────────────────────────────────────
 
 export interface ScreenshotResult {

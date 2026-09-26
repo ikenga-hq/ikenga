@@ -17,6 +17,10 @@ use tauri::AppHandle;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
+use super::actions_routes::{
+    get_actions_list, get_keys_resolve, get_menu, post_actions_import, post_actions_set,
+    post_keys_set,
+};
 use super::auth::{require_token, AuthState};
 use super::browser_handlers::{
     get_browser_list, get_browser_profiles, get_browser_targets, post_browser_back,
@@ -116,7 +120,21 @@ pub async fn serve(
     let authed = Router::new()
         .route("/iyke/state", get(get_state))
         // WP-21: keymap registry as last pushed by the FE (503 before push).
+        // WP-62 adds `?search=` (substring filter, `iyke keys list --search`).
         .route("/iyke/keys", get(get_keys))
+        // WP-62: the `iyke` surface for actions, menus and keys (D-06 footer
+        // lines). Reads mirror the FE's effective model (503 before the
+        // first push, same convention as `/iyke/keys`); writes round-trip
+        // into the FE so the CLI shares the UI's one WP-50 validator path.
+        .route("/iyke/actions", get(get_actions_list))
+        .route("/iyke/actions/set", post(post_actions_set))
+        .route("/iyke/actions/import", post(post_actions_import))
+        // `*menu_id` (not `:menu_id`): menu ids can contain `/`
+        // (`section/<id>`, `native/<top>` — G-ACTIONS §1.3), so this needs a
+        // tail wildcard, not a single path segment.
+        .route("/iyke/menus/*menu_id", get(get_menu))
+        .route("/iyke/keys/set", post(post_keys_set))
+        .route("/iyke/keys/resolve", get(get_keys_resolve))
         .route("/iyke/go", post(post_go))
         .route("/iyke/mode", post(post_mode))
         .route("/iyke/sidebar", post(post_sidebar))

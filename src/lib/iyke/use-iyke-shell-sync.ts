@@ -5,13 +5,36 @@ import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneId, PaneNode, PaneView } from '@/lib/panes/types';
 import { type ActiveProject, useShellStore } from '@/lib/shell/shell-store';
-import { type IykeKeymapEntry, iykeSetFrame } from '@/lib/tauri-cmd';
+import {
+	type IykeActionMirror,
+	type IykeKeymapEntry,
+	type IykeMenuMirror,
+	type IykeMenuMirrorItem,
+	iykeActionsRequestDone,
+	iykeSetActionsFrame,
+	iykeSetFrame,
+	listen,
+} from '@/lib/tauri-cmd';
 import { type TerminalTab, useTerminalStore } from '@/terminal/session-store';
 import { formatTerminalTitle } from '@/terminal/terminal-title';
 
 import { setShell } from './client';
 import { getIframe, IFRAME_STATE_EVENT } from './iframe-registry';
-import { type KeymapEntry, listKeymap } from './keymap-bridge';
+import {
+	ActionsValidationError,
+	addKeybinding,
+	type ActionsScope,
+	type EffectiveAction,
+	type EffectiveModel,
+	type KeymapEntry,
+	listKeymap,
+	getEffectiveModel,
+	resolveKeypress,
+	saveUserAction,
+	subscribeEffectiveModel,
+	subscribeKeymap,
+	type UserAction,
+} from './keymap-bridge';
 
 /**
  * Bridge between React shell state and the Iyke Rust mirror. Mounted
@@ -65,13 +88,65 @@ export function useIykeShellSync(): void {
 		pushActiveProject(activeProject);
 	}, [activeProject]);
 
-	// WP-21: `GET /iyke/keys`. Phase 1's keymap is defaults-only and never
-	// changes at runtime, so it is pushed once when the workspace mounts.
-	// Phase 6 overrides will need to re-push on change.
+	// WP-21: `GET /iyke/keys`. Phase 1's keymap was defaults-only and never
+	// changed at runtime, so a boot-only push was enough. Phase 6 overrides
+	// (personal/project keybindings, package grants, trust changes) mutate
+	// the effective keymap at runtime, so WP-62 re-sends it on every
+	// `subscribeKeymap()` notification, not just once at mount.
 	useEffect(() => {
-		iykeSetFrame({ keymap: keymapPayload() }).catch((err) => {
-			console.warn('[iyke] set_frame (keymap) failed:', err);
-		});
+		const push = () => {
+			iykeSetFrame({ keymap: keymapPayload() }).catch((err) => {
+				console.warn('[iyke] set_frame (keymap) failed:', err);
+			});
+		};
+		push();
+		return subscribeKeymap(push);
+	}, []);
+
+	// WP-62: `GET /iyke/actions` + `GET /iyke/menus/:id`. Pushes a projection
+	// of the effective model (G-ACTIONS-API) on every `subscribeEffectiveModel`
+	// notification — file edits, package install/uninstall/reload, project
+	// switch — so the `iyke` surface never serves a merge older than what the
+	// D-06 UI itself would show.
+	useEffect(() => {
+		const push = (model: EffectiveModel) => {
+			iykeSetActionsFrame({
+				actions: actionsMirrorPayload(model.actions),
+				menus: menusMirrorPayload(model),
+			}).catch((err) => {
+				console.warn('[iyke] set_actions_frame failed:', err);
+			});
+		};
+		push(getEffectiveModel());
+		return subscribeEffectiveModel(push);
+	}, []);
+
+	// WP-62: the write/query round trips `src-tauri/src/iyke/actions_routes.rs`
+	// emits for `POST /iyke/actions/set|import`, `POST /iyke/keys/set` and
+	// `GET /iyke/keys/resolve`. Each listener calls the same G-ACTIONS-API
+	// function the D-06 UI calls, then reports back through
+	// `iyke_actions_request_done` so the CLI and the UI share one code path
+	// into the one WP-50 validator.
+	useEffect(() => {
+		const unlistenPromises = [
+			listen<ActionsSetRequestPayload>('iyke://actions-set-request', (e) => {
+				void handleActionsSetRequest(e.payload);
+			}),
+			listen<ActionsImportRequestPayload>('iyke://actions-import-request', (e) => {
+				void handleActionsImportRequest(e.payload);
+			}),
+			listen<KeysSetRequestPayload>('iyke://keys-set-request', (e) => {
+				void handleKeysSetRequest(e.payload);
+			}),
+			listen<KeysResolveRequestPayload>('iyke://keys-resolve-request', (e) => {
+				void handleKeysResolveRequest(e.payload);
+			}),
+		];
+		return () => {
+			for (const p of unlistenPromises) {
+				p.then((unlisten) => unlisten()).catch(() => {});
+			}
+		};
 	}, []);
 
 	// WP-28: `GET /iyke/explorer/sections`. `explorerSections` is replaced
@@ -110,6 +185,161 @@ export function keymapPayload(entries: KeymapEntry[] = listKeymap()): IykeKeymap
 		key_label: formatKeyLabel(e.key),
 		...(e.platformOnly ? { platform_only: e.platformOnly } : {}),
 	}));
+}
+
+// ─── WP-62: `iyke` actions / menus / keys mirror + write round trips ────────
+
+/** The rows `GET /iyke/actions` serves — a flattened projection of
+ *  `EffectiveAction[]` (G-ACTIONS-API). Opaque to Rust beyond this shape
+ *  (`IykeActionMirror`, `src/lib/tauri-cmd.ts`). */
+export function actionsMirrorPayload(actions: EffectiveAction[]): IykeActionMirror[] {
+	return actions.map((a) => ({
+		id: a.id,
+		name: a.name,
+		...(a.icon ? { icon: a.icon } : {}),
+		description: a.description,
+		source: a.source,
+		run_kind: a.run.kind,
+		placements: a.placements.map((p) => p.at),
+		locked: a.locked,
+		hosted: a.hosted,
+		danger: a.danger,
+		...(a.pkgId ? { pkg_id: a.pkgId } : {}),
+	}));
+}
+
+/** The rows `GET /iyke/menus/:id` serves — every menu id the effective
+ *  model currently knows, keyed the same way `EffectiveMenus.get()` is. */
+export function menusMirrorPayload(model: EffectiveModel): Record<string, IykeMenuMirror> {
+	const out: Record<string, IykeMenuMirror> = {};
+	for (const id of model.menus.ids) {
+		const menu = model.menus.get(id);
+		if (!menu) continue;
+		const items: IykeMenuMirrorItem[] = menu.items.map((item) =>
+			item.kind === 'separator'
+				? { kind: 'separator' }
+				: {
+						kind: 'action',
+						id: item.id,
+						name: item.action.name,
+						source: item.action.source,
+						...(item.when ? { when: item.when } : {}),
+					}
+		);
+		out[id] = { id: menu.id, items, hidden: [...menu.hidden] };
+	}
+	return out;
+}
+
+interface ActionsSetRequestPayload {
+	request_id: string;
+	scope: ActionsScope;
+	action: UserAction;
+}
+
+interface ActionsImportRequestPayload {
+	request_id: string;
+	scope: ActionsScope;
+	actions: UserAction[];
+}
+
+interface KeysSetRequestPayload {
+	request_id: string;
+	scope: ActionsScope;
+	key: string;
+	command: string;
+	when?: string | null;
+	key_scope?: 'app' | 'os' | null;
+	platform?: 'mac' | 'other' | null;
+}
+
+interface KeysResolveRequestPayload {
+	request_id: string;
+	key: string;
+	platform?: 'mac' | 'other' | null;
+}
+
+/** `ActionsValidationError` carries the WP-50 validator's own message
+ *  (`{code} at {path}: {message}`); anything else falls back to its own
+ *  `.message` (or a generic string) so a thrown non-Error still reports. */
+function requestErrorMessage(err: unknown): string {
+	if (err instanceof ActionsValidationError) return err.message;
+	if (err instanceof Error) return err.message;
+	return String(err);
+}
+
+async function reportRequestResult(requestId: string, result: unknown): Promise<void> {
+	try {
+		await iykeActionsRequestDone(requestId, result);
+	} catch (err) {
+		console.warn('[iyke] actions_request_done failed:', err);
+	}
+}
+
+/** `POST /iyke/actions/set` round trip: `saveUserAction`, the same call the
+ *  D-06 Editor tab's Save button makes. */
+async function handleActionsSetRequest(payload: ActionsSetRequestPayload): Promise<void> {
+	try {
+		// The nested `action.scope` must agree with the outer file scope
+		// (`E_SCOPE_MISMATCH`, G-ACTIONS §1.2) — set it from the wrapper so a
+		// caller that only set one of the two still gets a consistent write.
+		await saveUserAction(payload.scope, { ...payload.action, scope: payload.scope });
+		await reportRequestResult(payload.request_id, { ok: true });
+	} catch (err) {
+		await reportRequestResult(payload.request_id, { ok: false, error: requestErrorMessage(err) });
+	}
+}
+
+/** `POST /iyke/actions/import` round trip: `saveUserAction` per item, so one
+ *  invalid action in a batch doesn't sink the rest. */
+async function handleActionsImportRequest(payload: ActionsImportRequestPayload): Promise<void> {
+	let added = 0;
+	const errors: Array<{ id: string | null; error: string }> = [];
+	for (const action of payload.actions) {
+		try {
+			await saveUserAction(payload.scope, { ...action, scope: payload.scope });
+			added += 1;
+		} catch (err) {
+			errors.push({ id: action?.id ?? null, error: requestErrorMessage(err) });
+		}
+	}
+	await reportRequestResult(payload.request_id, {
+		ok: true,
+		added,
+		skipped: errors.length,
+		errors,
+	});
+}
+
+/** `POST /iyke/keys/set` round trip: `addKeybinding` — adds one positive
+ *  rule (never a full rebind with a paired negative rule; see WP-62's
+ *  report for this as a recorded, deliberate scope limitation). */
+async function handleKeysSetRequest(payload: KeysSetRequestPayload): Promise<void> {
+	try {
+		await addKeybinding(payload.scope, {
+			key: payload.key,
+			command: payload.command,
+			...(payload.when ? { when: payload.when } : {}),
+			...(payload.key_scope ? { scope: payload.key_scope } : {}),
+			...(payload.platform ? { platform: payload.platform } : {}),
+		});
+		await reportRequestResult(payload.request_id, { ok: true });
+	} catch (err) {
+		await reportRequestResult(payload.request_id, { ok: false, error: requestErrorMessage(err) });
+	}
+}
+
+/** `GET /iyke/keys/resolve` round trip: the live `resolveKeypress()` winner
+ *  for a key sequence — the hand-off's "what fires here" query. Never
+ *  throws (an unparsable key just resolves to no candidates), so this
+ *  reports straight through with no `ok`/`error` envelope. */
+async function handleKeysResolveRequest(payload: KeysResolveRequestPayload): Promise<void> {
+	const resolution = resolveKeypress(
+		{ key: payload.key },
+		undefined,
+		payload.platform ?? undefined
+	);
+	await reportRequestResult(payload.request_id, resolution);
 }
 
 function pushShellState(
