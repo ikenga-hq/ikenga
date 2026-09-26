@@ -222,6 +222,24 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'Show hidden files',
 	},
+	// WP-56 (PR #209 leftover, off-list, G-ACTIONS §10.2/§10.6): was
+	// `explorer.tsx:87`'s own keydown branch. `explorerFocus` is the existing
+	// §4.3 key, already backed by `[data-explorer-section]` — no new focus
+	// key needed for this one.
+	{
+		command: 'explorer.section-prev',
+		key: 'mod+shift+[',
+		when: 'explorerFocus',
+		source: 'default',
+		label: 'Previous Explorer section',
+	},
+	{
+		command: 'explorer.section-next',
+		key: 'mod+shift+]',
+		when: 'explorerFocus',
+		source: 'default',
+		label: 'Next Explorer section',
+	},
 
 	// --- Companion (src/shell/companion/, WP-06). ⌘⇧A focuses the dispatch
 	// input (DEC-63.2; `session.switch-adapter` moved off it to no key). The
@@ -256,6 +274,105 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		when: 'dispatchFocus',
 		source: 'default',
 		label: 'Companion → start a persistent run',
+	},
+
+	// --- WP-56: PR #209's leftover widget-local handlers, migrated to
+	// registry commands with scoped `when`s (G-ACTIONS §10.2 "Reserved for
+	// WP-56", §10.6). Each `<area>Focus` key below is new, added additively
+	// under B-21 — none changes an existing evaluation.
+	{
+		command: 'companion.permission-allow',
+		key: 'a',
+		when: 'permissionCardFocus',
+		source: 'default',
+		label: 'Allow the focused permission request',
+	},
+	// Fix round 1: the pre-registry handler matched `e.key.toLowerCase()`, so
+	// Shift+A also allowed (same as plain A); this restores that (§3.1:
+	// shifted-letter variant alongside the unshifted key, as `zoom.out` does
+	// above for ⌘⇧-).
+	{
+		command: 'companion.permission-allow',
+		key: 'shift+a',
+		when: 'permissionCardFocus',
+		source: 'default',
+		label: 'Allow the focused permission request',
+	},
+	{
+		command: 'companion.permission-deny',
+		key: 'd',
+		when: 'permissionCardFocus',
+		source: 'default',
+		label: 'Deny the focused permission request',
+	},
+	{
+		command: 'approve-gate.next',
+		key: 'j',
+		when: 'approveGateFocus && !inputFocus',
+		source: 'default',
+		label: 'Next draft (approve gate)',
+	},
+	{
+		command: 'approve-gate.prev',
+		key: 'k',
+		when: 'approveGateFocus && !inputFocus',
+		source: 'default',
+		label: 'Previous draft (approve gate)',
+	},
+	{
+		command: 'approve-gate.save',
+		key: 'mod+s',
+		// Fix round 1: narrower than `approveGateFocus` — pre-WP-56 this only
+		// fired while the detail pane had focus, not the whole section.
+		when: 'approveGateDetailFocus',
+		source: 'default',
+		label: 'Save draft (approve gate)',
+	},
+	{
+		command: 'approve-gate.approve',
+		key: 'mod+enter',
+		when: 'approveGateDetailFocus',
+		source: 'default',
+		label: 'Approve & send (approve gate)',
+	},
+	{
+		command: 'studio.loupe-save',
+		key: 'mod+s',
+		when: 'loupeFocus',
+		source: 'default',
+		label: 'Save (Studio loupe)',
+	},
+	{
+		command: 'studio.pin-submit',
+		key: 'mod+enter',
+		when: 'pinComposerFocus',
+		source: 'default',
+		label: 'Add pin (pin composer)',
+	},
+	{
+		command: 'markdown.save',
+		key: 'mod+s',
+		when: 'markdownEditorFocus',
+		source: 'default',
+		label: 'Save (markdown editor)',
+	},
+	// Precedence, not a clash (DEC-59, §2.3): `explorer.toggle` also holds
+	// `mod+b` with `when: 'always'` (specificity 0). `markdownEditorFocus`
+	// (specificity 1) outranks it, so this wins while the markdown editor has
+	// focus and `explorer.toggle` wins everywhere else — no re-key needed.
+	{
+		command: 'markdown.bold',
+		key: 'mod+b',
+		when: 'markdownEditorFocus',
+		source: 'default',
+		label: 'Bold (markdown editor)',
+	},
+	{
+		command: 'markdown.italic',
+		key: 'mod+i',
+		when: 'markdownEditorFocus',
+		source: 'default',
+		label: 'Italic (markdown editor)',
 	},
 
 	// --- Native menu (src/shell/native-menu.ts) — macOS-only accelerators.
@@ -314,6 +431,12 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{ command: 'zoom.in', key: 'mod+=', when: 'always', source: 'default', label: 'Zoom in' },
 	{ command: 'zoom.in', key: 'mod+plus', when: 'always', source: 'default', label: 'Zoom in' },
 	{ command: 'zoom.out', key: 'mod+-', when: 'always', source: 'default', label: 'Zoom out' },
+	// Round 42 hand-off (WP-54 review): the pre-registry handler matched
+	// `e.key === '-' || '_' || 'Subtract'` under `mod`, so ⌘⇧- (which produces
+	// `_` on a US layout) also zoomed out. The registry row above only ever
+	// carried `mod+-`; this restores the shifted variant (§3.1: shifted
+	// punctuation names the unshifted key).
+	{ command: 'zoom.out', key: 'mod+shift+-', when: 'always', source: 'default', label: 'Zoom out' },
 	{ command: 'zoom.reset', key: 'mod+0', when: 'always', source: 'default', label: 'Reset zoom' },
 
 	// --- OS-wide (§6, DEC-60) — registered by `lib.rs` from the effective

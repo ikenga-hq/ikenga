@@ -1,4 +1,5 @@
 import { useState, useRef, useCallback, type KeyboardEvent } from 'react';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { ExplorerHeader } from './explorer-header';
 import { builtInSections } from './section-registry';
@@ -82,24 +83,36 @@ export function Explorer() {
 		return headers.filter((el) => el.offsetParent !== null);
 	}, []);
 
-	const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-		// ⌘⇧[ / ⌘⇧] → previous / next section header (spec §6.3)
-		if ((e.key === '[' || e.key === ']') && (e.metaKey || e.ctrlKey) && e.shiftKey) {
-			e.preventDefault();
+	// WP-56 (G-ACTIONS §10.2/§10.6, off-list): ⌘⇧[ / ⌘⇧] → previous / next
+	// section header (spec §6.3), migrated from the `handleKeyDown` branch
+	// below to the registry `explorer.section-prev/next` commands. Scoped by
+	// the existing `explorerFocus` key (§4.3) — already backed by the
+	// `[data-explorer-section]` fallback marker, so no new focus key is
+	// needed for this one.
+	const moveSectionHeaderFocus = useCallback(
+		(direction: 1 | -1) => {
 			const headers = getSectionHeaders();
 			if (headers.length === 0) return;
 			const currentFocused = document.activeElement as HTMLElement | null;
 			const currentIndex = headers.findIndex((h) => h === currentFocused || h.contains(currentFocused));
-			if (e.key === '[') {
-				const prevIndex = currentIndex > 0 ? currentIndex - 1 : headers.length - 1;
-				headers[prevIndex]?.focus();
-			} else {
-				const nextIndex = currentIndex < headers.length - 1 ? currentIndex + 1 : 0;
-				headers[nextIndex]?.focus();
-			}
-			return;
-		}
+			const nextIndex =
+				direction === -1
+					? currentIndex > 0
+						? currentIndex - 1
+						: headers.length - 1
+					: currentIndex < headers.length - 1
+						? currentIndex + 1
+						: 0;
+			headers[nextIndex]?.focus();
+		},
+		[getSectionHeaders]
+	);
+	useCommands({
+		'explorer.section-prev': () => moveSectionHeaderFocus(-1),
+		'explorer.section-next': () => moveSectionHeaderFocus(1),
+	});
 
+	const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
 		const visibleRows = getVisibleRows();
 		if (visibleRows.length === 0) return;
 

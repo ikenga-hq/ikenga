@@ -27,6 +27,10 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'companion', label: 'Companion', namespaces: ['dock', 'companion', 'session'] },
 		{ id: 'terminal', label: 'Terminal', namespaces: ['terminal'] },
 		{ id: 'ngwa', label: 'Ngwa', namespaces: ['ngwa'] },
+		// WP-56: leftover widget-local handlers migrated to registry commands.
+		{ id: 'approve-gate', label: 'Approve gate', namespaces: ['approve-gate'] },
+		{ id: 'studio', label: 'Artifact studio', namespaces: ['studio'] },
+		{ id: 'markdown', label: 'Markdown editor', namespaces: ['markdown'] },
 		{ id: 'menu', label: 'Menu bar', namespaces: ['menu'] },
 		// WP-54 defaults: window zoom and the OS-wide `os.*` shortcuts.
 		{ id: 'window', label: 'Window', namespaces: ['zoom', 'os'] },

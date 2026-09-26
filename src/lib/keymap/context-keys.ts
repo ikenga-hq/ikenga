@@ -41,6 +41,18 @@ export const CONTEXT_KEYS = {
 	// Added at the freeze for owner widgets (B-21 additive rule).
 	dispatchFocus: 'boolean',
 	paletteOpen: 'boolean',
+	// Added by WP-56 under the same B-21 additive rule, for its migrated
+	// leftover handlers (G-ACTIONS §10.2 "Reserved for WP-56").
+	permissionCardFocus: 'boolean',
+	approveGateFocus: 'boolean',
+	loupeFocus: 'boolean',
+	pinComposerFocus: 'boolean',
+	markdownEditorFocus: 'boolean',
+	// Fix round 1 (B-21): narrower than `approveGateFocus` (the whole
+	// section, incl. the draft queue) — true only inside the detail pane,
+	// matching the pre-WP-56 scoping of ⌘S / ⌘↵ (`onDetailKeyDown` was on
+	// `.ob-detail` alone; J/K stayed section-wide).
+	approveGateDetailFocus: 'boolean',
 } as const;
 
 export type ContextKeyName = keyof typeof CONTEXT_KEYS;
@@ -61,6 +73,12 @@ export const FOCUS_CONTEXT_KEYS: readonly ContextKeyName[] = [
 	'ngwaItemFocus',
 	'dispatchFocus',
 	'paletteOpen',
+	'permissionCardFocus',
+	'approveGateFocus',
+	'loupeFocus',
+	'pinComposerFocus',
+	'markdownEditorFocus',
+	'approveGateDetailFocus',
 ];
 
 /** The snapshot shape. Every key is present; `undefined` means "no value". */
@@ -74,7 +92,20 @@ export const CTX_RESOURCE_ATTR = 'data-ctx-resource';
 /** `NgwaKind` of a focused Ngwa item row. */
 export const CTX_NGWA_KIND_ATTR = 'data-ctx-ngwa-kind';
 
-export type FocusArea = 'explorer' | 'files' | 'pane' | 'session' | 'ngwa-item' | 'dispatch' | 'terminal';
+export type FocusArea =
+	| 'explorer'
+	| 'files'
+	| 'pane'
+	| 'session'
+	| 'ngwa-item'
+	| 'dispatch'
+	| 'terminal'
+	| 'permission-card'
+	| 'approve-gate'
+	| 'approve-gate-detail'
+	| 'loupe'
+	| 'pin-composer'
+	| 'markdown-editor';
 
 /** Spread onto a surface's root: `<div {...focusMarkerProps('dispatch')}>`. */
 export function focusMarkerProps(...areas: FocusArea[]): { [CTX_FOCUS_ATTR]: string } {
@@ -210,6 +241,12 @@ export function computeContextKeys(inputs: ContextInputs): ContextKeys {
 		ngwaItemKind: ngwaItemFocus ? attrWithin(el, CTX_NGWA_KIND_ATTR) : undefined,
 		dispatchFocus: isFocusWithin(el, 'dispatch'),
 		paletteOpen: inputs.paletteOpen,
+		permissionCardFocus: isFocusWithin(el, 'permission-card'),
+		approveGateFocus: isFocusWithin(el, 'approve-gate'),
+		approveGateDetailFocus: isFocusWithin(el, 'approve-gate-detail'),
+		loupeFocus: isFocusWithin(el, 'loupe'),
+		pinComposerFocus: isFocusWithin(el, 'pin-composer'),
+		markdownEditorFocus: isFocusWithin(el, 'markdown-editor'),
 	};
 }
 

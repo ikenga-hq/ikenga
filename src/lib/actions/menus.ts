@@ -92,11 +92,26 @@ export const DEFAULT_MENUS: Readonly<Record<string, readonly DefaultMenuEntry[]>
 		S,
 		i('hand-to-chi'),
 	],
-	session: [i('open'), i('open-to-side'), i('make-dispatch'), S, i('hand-to-chi'), S, i('rename'), i('kill-session')],
-	automations: [i('run-now'), i('pause-resume'), i('open-definition'), i('open-last-log'), i('open-in-ngwa')],
-	'ngwa-project': [i('open-detail'), i('open-definition'), i('change-scope'), i('disable'), i('uninstall')],
-	scratchpads: [i('open'), i('open-to-side'), i('rename'), i('delete')],
-	todos: [i('toggle-done'), i('open-source'), i('hand-to-chi')],
+	// A-9 (Round 42 WP-54 review hand-off, §10.3): `rename` and `kill-session`
+	// have no real handler (`sessions.tsx` — no dialog-shim prompt, no
+	// tab→PTY kill API) and are omitted here until they do; Hiding a stub is
+	// not the fix, since a hidden id still ships as if it were real.
+	session: [i('open'), i('open-to-side'), i('make-dispatch'), S, i('hand-to-chi')],
+	// A-9: `run-now`, `pause-resume` and `open-definition` have no real
+	// handler (`automations.tsx` — the `workflows[]`/`cron[]` registries are
+	// read-only lists with no per-item trigger, pause or definition-file
+	// endpoint).
+	automations: [i('open-last-log'), i('open-in-ngwa')],
+	// A-9: `open-definition` and `change-scope` have no real handler
+	// (`ngwa-project.tsx` — no definition-file viewer or scope-change
+	// endpoint).
+	'ngwa-project': [i('open-detail'), i('disable'), i('uninstall')],
+	// A-9: `rename` has no real handler (`scratchpads.tsx` — the memory API
+	// has no rename endpoint).
+	scratchpads: [i('open'), i('open-to-side'), i('delete')],
+	// A-9: `open-source` has no real handler (`todos.tsx` — todos carry no
+	// source-file reference).
+	todos: [i('toggle-done'), i('hand-to-chi')],
 	views: [i('open'), i('open-to-side'), i('pin-rail'), i('open-in-ngwa')],
 	tab: [
 		c('pin-sidebar', 'artifact-tab'),

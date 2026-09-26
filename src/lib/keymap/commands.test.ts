@@ -173,6 +173,12 @@ describe('DEC-58 single fire (native menu ↔ dispatcher)', () => {
 					ngwaItemKind: undefined,
 					dispatchFocus: false,
 					paletteOpen: false,
+					permissionCardFocus: false,
+					approveGateFocus: false,
+					approveGateDetailFocus: false,
+					loupeFocus: false,
+					pinComposerFocus: false,
+					markdownEditorFocus: false,
 				}),
 			getEvalOptions: () => ({}),
 			run: (invocation) => {
