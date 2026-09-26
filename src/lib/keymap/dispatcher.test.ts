@@ -49,8 +49,8 @@ function personalFiles(bindings: KeybindingRule[], actions?: ActionsDocument): A
 		},
 		project: {
 			scope: 'project',
-			actions: fileState('actions', 'project', null),
-			keybindings: fileState('keybindings', 'project', null),
+			actions: fileState<ActionsDocument>('actions', 'project', null),
+			keybindings: fileState<KeybindingsDocument>('keybindings', 'project', null),
 		},
 		projectId: 'p1',
 		projectRoot: '/work/p1',

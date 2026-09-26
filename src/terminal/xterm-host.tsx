@@ -139,13 +139,14 @@ function isDarkMode(): boolean {
  * C0 control character the PTY relies on — ^B is tmux's prefix, ^\ is
  * SIGQUIT. When a *default* frame rule (`explorer.toggle`'s `mod+b`,
  * `pane.split-right`'s `mod+\`, both `always`) claims one while the terminal
- * has focus, the PTY keeps it, as it always has; a rule the user bound
- * (personal / project layer) wins over the PTY. macOS frame keys use ⌘,
- * which never reaches the PTY.
+ * has focus, the PTY keeps it, as it always has; only a rule the user bound
+ * in their own personal file wins over the PTY — a project's keybindings
+ * (someone else's repo, even once trusted) never take ^C / ^B / ^\ away
+ * from the shell. macOS frame keys use ⌘, which never reaches the PTY.
  */
 function ptyKeepsKey(e: KeyboardEvent, peek: KeyPeek, mac: boolean): boolean {
 	if (mac || peek.chord || !peek.winner) return false;
-	if (peek.winner.source === 'personal' || peek.winner.source === 'project') return false;
+	if (peek.winner.source === 'personal') return false;
 	return strokesFromEvent(e).some((stroke) => /^ctrl\+([a-z]|\\|\[|\])$/.test(stroke));
 }
 
@@ -921,27 +922,37 @@ export function XTermHost({
 			}
 
 			if (action === 'find') {
+				// The terminal owns its own keys (find, clear, select all, the
+				// prompt jumps): stop the browser default so a native menu
+				// accelerator on the same key (macOS ⌘K → the palette) doesn't
+				// also fire. DEC-58's dedupe is per command, so it can't catch
+				// two different commands.
+				e.preventDefault();
 				setSearchOpen(true);
 				setTimeout(() => searchInputRef.current?.focus(), 0);
 				return false;
 			}
 
 			if (action === 'clear') {
+				e.preventDefault();
 				term.clear();
 				return false;
 			}
 
 			if (action === 'selectAll') {
+				e.preventDefault();
 				term.selectAll();
 				return false;
 			}
 
 			if (action === 'jumpToPrevPrompt') {
+				e.preventDefault();
 				semanticPromptsRef.current?.jumpToPrevPrompt();
 				return false;
 			}
 
 			if (action === 'jumpToNextPrompt') {
+				e.preventDefault();
 				semanticPromptsRef.current?.jumpToNextPrompt();
 				return false;
 			}

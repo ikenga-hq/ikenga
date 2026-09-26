@@ -1504,12 +1504,19 @@ struct OsShortcutStatus {
 }
 
 /// The shortcuts currently registered with the OS and the command each runs.
-/// A std mutex: every access (the plugin handler, boot, the sync
-/// `os_shortcuts_apply` command) runs on the main thread and never awaits.
+///
+/// `bound` is only ever held for a copy-in / copy-out, never across an OS
+/// (un)register call: on Linux/X11 global-hotkey runs the plugin handler on
+/// its own thread, and that handler reads `bound` (`command_for`) while a
+/// `register` from another thread waits on that same thread — holding
+/// `bound` across `register` would deadlock the moment an OS shortcut is
+/// pressed during a re-apply. `apply` serializes whole re-applies instead;
+/// the handler never takes it.
 #[cfg(feature = "desktop")]
 #[derive(Default)]
 struct OsShortcuts {
     bound: std::sync::Mutex<Vec<(tauri_plugin_global_shortcut::Shortcut, String)>>,
+    apply: std::sync::Mutex<()>,
 }
 
 #[cfg(feature = "desktop")]
@@ -1681,6 +1688,16 @@ fn parse_os_key(key: &str) -> Result<tauri_plugin_global_shortcut::Shortcut, Str
         modifiers |= flag;
     }
     let code = os_key_code(name).ok_or_else(|| format!("`{name}` cannot be an OS-wide key"))?;
+    // A bare key would be taken from every app on the machine. Only the
+    // function keys may go without a modifier.
+    let function_key = name.len() > 1
+        && name.starts_with('f')
+        && name[1..].chars().all(|c| c.is_ascii_digit());
+    if modifiers.is_empty() && !function_key {
+        return Err(format!(
+            "`{name}` needs a modifier to be OS-wide (it would take the key from every app)"
+        ));
+    }
     let modifiers = if modifiers.is_empty() {
         None
     } else {
@@ -1724,8 +1741,11 @@ fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<O
             .map(|rule| status(rule, Some("OS shortcuts are not initialised".to_string())))
             .collect();
     };
-    let mut bound = state.bound.lock().unwrap_or_else(|p| p.into_inner());
-    for (shortcut, command) in bound.drain(..) {
+    let _applying = state.apply.lock().unwrap_or_else(|p| p.into_inner());
+    // Take the old set and release `bound` before touching the OS (see
+    // `OsShortcuts`): the handler may need it while we (un)register.
+    let old = std::mem::take(&mut *state.bound.lock().unwrap_or_else(|p| p.into_inner()));
+    for (shortcut, command) in old {
         if let Err(e) = app.global_shortcut().unregister(shortcut) {
             // `log::` macros are dropped in this crate (no log→tracing
             // bridge); use tracing so the warning actually emits.
@@ -1733,6 +1753,7 @@ fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<O
         }
     }
 
+    let mut bound: Vec<(tauri_plugin_global_shortcut::Shortcut, String)> = Vec::new();
     let mut out = Vec::with_capacity(rules.len());
     for rule in rules {
         if let Some(reason) = os_command_refusal(&rule.command) {
@@ -1766,6 +1787,7 @@ fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<O
             }
         }
     }
+    *state.bound.lock().unwrap_or_else(|p| p.into_inner()) = bound;
     out
 }
 
@@ -1775,7 +1797,25 @@ fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<O
 /// where the OS registration has to happen.
 #[cfg(feature = "desktop")]
 #[tauri::command]
-fn os_shortcuts_apply(app: tauri::AppHandle, rules: Vec<OsShortcutRule>) -> Vec<OsShortcutStatus> {
+fn os_shortcuts_apply(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    rules: Vec<OsShortcutRule>,
+) -> Vec<OsShortcutStatus> {
+    // Only the primary window computes the effective default + personal OS
+    // rules (DEC-60). Detached windows share `allow-app-commands`, so refuse
+    // them here rather than trust the capability set.
+    if window.label() != "main" {
+        return rules
+            .into_iter()
+            .map(|rule| OsShortcutStatus {
+                command: rule.command,
+                key: rule.key,
+                registered: false,
+                reason: Some("only the main window applies OS shortcuts".to_string()),
+            })
+            .collect();
+    }
     apply_os_shortcuts(&app, &rules)
 }
 
