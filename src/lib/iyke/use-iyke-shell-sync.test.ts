@@ -173,12 +173,14 @@ describe('useIykeShellSync — WP-21 frame push', () => {
 		});
 	});
 
-	it('keymapPayload strips the negative-rule prefix from a held command', () => {
+	it('keymapPayload keeps a held removal rule's `-` so it never reads as a new binding', () => {
 		const [row] = keymapPayload({
 			entries: [],
 			held: [{ index: 1, rule: { key: 'mod+w', command: '-pane.close' }, trust: 'changed' }],
 		});
-		expect(row.command).toBe('pane.close');
+		expect(row.command).toBe('-pane.close');
+		expect(row.label).toBe('pane.close');
+		expect(row.status).toBe('held');
 		expect(row.trust).toBe('changed');
 	});
 
