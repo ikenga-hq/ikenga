@@ -4,7 +4,12 @@ import { ExplorerHeader } from './explorer-header';
 import { builtInSections } from './section-registry';
 import { SectionFrame } from './section-frame';
 
-export function Explorer() {
+/**
+ * `only` pins the Explorer to one built-in section, always open, with no
+ * header or reorder/hide affordances. D-01 gives the Chi and Ngwa rail
+ * modes that body: Chi shows `sessions`, Ngwa shows `ngwa-project`.
+ */
+export function Explorer({ only }: { only?: string } = {}) {
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const explorerSections = useShellStore((s) => s.explorerSections);
 	const setExplorerSectionCollapsed = useShellStore((s) => s.setExplorerSectionCollapsed);
@@ -16,7 +21,9 @@ export function Explorer() {
 	const typeaheadBuffer = useRef<string>('');
 	const typeaheadTimer = useRef<number | null>(null);
 
-	const visibleSections = explorerSections.filter((sec) => !hiddenSectionIds.has(sec.id));
+	const visibleSections = only
+		? [{ id: only, collapsed: false }]
+		: explorerSections.filter((sec) => !hiddenSectionIds.has(sec.id));
 
 	const handleSectionToggle = (sectionId: string, exclusive: boolean) => {
 		const currentlyOpen = visibleSections.filter((s) => !s.collapsed).map((s) => s.id);
@@ -177,21 +184,39 @@ export function Explorer() {
 	};
 
 	const context = { projectId: activeProjectId };
+	const regionLabel = only
+		? `${builtInSections.find((d) => d.id === only)?.title ?? only} section`
+		: 'Explorer sections';
 
 	return (
 		<div className="flex flex-col h-full bg-background text-foreground">
-			<ExplorerHeader />
+			{!only && <ExplorerHeader />}
 			<div
 				className="flex-1 overflow-y-auto focus:outline-none"
 				ref={containerRef}
 				tabIndex={0}
 				onKeyDown={handleKeyDown}
 				role="region"
-				aria-label="Explorer sections"
+				aria-label={regionLabel}
 			>
 				{visibleSections.map((sec, idx) => {
 					const def = builtInSections.find((d) => d.id === sec.id);
 					if (!def) return null;
+					if (only) {
+						return (
+							<SectionFrame
+								key={sec.id}
+								section={def}
+								context={context}
+								isOpen
+								onToggle={() => {}}
+								canMoveUp={false}
+								canMoveDown={false}
+							>
+								{def.render(context)}
+							</SectionFrame>
+						);
+					}
 					return (
 						<SectionFrame
 							key={sec.id}

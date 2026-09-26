@@ -1,60 +1,26 @@
-import type React from 'react';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { SettingsMode } from './sidebar-modes/settings-mode';
 import { Explorer } from './explorer/explorer';
+
+/** D-01: the section each rail mode's sidebar is pinned to. Project shows the
+ *  whole Explorer (no entry). */
+const MODE_SECTION = {
+	chi: 'sessions',
+	ngwa: 'ngwa-project',
+} as const;
 
 export function Sidebar() {
 	const activeMode = useShellStore((s) => s.activeMode);
+	const only = activeMode === 'chi' || activeMode === 'ngwa' ? MODE_SECTION[activeMode] : undefined;
 
-	if (activeMode === 'chi' || activeMode === 'ngwa') {
-		return null;
-	}
-
-	switch (activeMode) {
-		case 'settings':
-			return renderSidebar('Settings', <SettingsMode />);
-		case 'project':
-		default:
-			return (
-				<nav
-					aria-label="Explorer sidebar"
-					className="flex h-full flex-col border-r border-border bg-card"
-				>
-					<Explorer />
-				</nav>
-			);
-	}
-}
-
-/** The sidebar chrome — workspace-tinted head + scrollable body. */
-function renderSidebar(title: string, body: React.ReactNode) {
+	// Settings has no sidebar of its own: D-03 puts the section nav inside the
+	// pane (`shell/settings/nav.tsx`), so the sidebar stays the Explorer rather
+	// than listing the same nine sections a second time.
 	return (
 		<nav
-			aria-label={`${title} sidebar`}
+			aria-label="Explorer sidebar"
 			className="flex h-full flex-col border-r border-border bg-card"
-			style={{
-				['--ikenga-sidebar-tint' as string]: 'var(--tint-bg-active, var(--bg-surface))',
-			}}
 		>
-			<div
-				className="flex h-12 shrink-0 items-center border-b border-border-soft px-4"
-				style={{
-					background:
-						'linear-gradient(180deg, var(--tint-bg-active, var(--bg-surface)) 0%, var(--bg-surface) 100%)',
-				}}
-			>
-				<span
-					className="text-sm font-medium tracking-tight"
-					style={{
-						color: 'var(--fg)',
-						fontFamily: 'var(--font-display)',
-						fontSize: 'var(--text-h3)',
-					}}
-				>
-					{title}
-				</span>
-			</div>
-			<div className="flex-1 overflow-hidden">{body}</div>
+			<Explorer only={only} />
 		</nav>
 	);
 }
