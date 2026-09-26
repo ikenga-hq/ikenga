@@ -16,8 +16,13 @@ import {
 	splitKeySequence,
 	validateKeySequence,
 } from '@/lib/keymap/platform';
-import { contextKeysOf, normalizeWhen, tryParseWhen } from '@/lib/keymap/when';
-import { type ImportDiffRow, VSCODE_COMMAND_MAP, VSCODE_WHEN_KEY_MAP } from './vscode-map';
+import { contextKeysOf, normalizeAst, serializeWhen, tryParseWhen, type WhenNode } from '@/lib/keymap/when';
+import {
+	type ImportDiffRow,
+	MAX_IMPORT_FILE_BYTES,
+	VSCODE_COMMAND_MAP,
+	VSCODE_WHEN_KEY_MAP,
+} from './vscode-map';
 
 // ─── JSONC-tolerant read (input only, §1.1) ─────────────────────────────────
 
@@ -64,9 +69,49 @@ function stripJsonComments(input: string): string {
 	return out;
 }
 
-/** Trailing commas before a closing `}` / `]` — the other half of "JSONC". */
+/** Trailing commas before a closing `}` / `]` — the other half of "JSONC".
+ *  A tiny string-aware scan (fix round 1, item "low" — the `,` before `]`
+ *  inside `"when": "resource =~ '*.ts,*.rs]'"` must never be read as a
+ *  trailing comma just because a literal `]` follows it inside the string),
+ *  the same string-tracking approach `stripJsonComments` above already uses. */
 function stripTrailingCommas(input: string): string {
-	return input.replace(/,(\s*[}\]])/g, '$1');
+	let out = '';
+	let i = 0;
+	const n = input.length;
+	let inString = false;
+	while (i < n) {
+		const c = input[i];
+		if (inString) {
+			out += c;
+			if (c === '\\' && i + 1 < n) {
+				out += input[i + 1];
+				i += 2;
+				continue;
+			}
+			if (c === '"') inString = false;
+			i++;
+			continue;
+		}
+		if (c === '"') {
+			inString = true;
+			out += c;
+			i++;
+			continue;
+		}
+		if (c === ',') {
+			// Look ahead past whitespace for a closing `}` / `]` — outside a
+			// string, so this never fires on a comma that sits inside one.
+			let j = i + 1;
+			while (j < n && /\s/.test(input[j])) j++;
+			if (j < n && (input[j] === '}' || input[j] === ']')) {
+				i++;
+				continue;
+			}
+		}
+		out += c;
+		i++;
+	}
+	return out;
 }
 
 export interface VSCodeRawRule {
@@ -78,8 +123,12 @@ export interface VSCodeRawRule {
 
 /** Parses a VS Code `keybindings.json` body. Throws a message meant to be
  *  shown verbatim (never `ActionsValidationError` — this is a foreign file,
- *  not one of ours). */
+ *  not one of ours). Refuses anything over `MAX_IMPORT_FILE_BYTES` before
+ *  doing any comment-stripping or parsing work (fix round 1, item 8). */
 export function parseVSCodeKeybindingsText(text: string): VSCodeRawRule[] {
+	if (text.length > MAX_IMPORT_FILE_BYTES) {
+		return refuseOversized(text.length);
+	}
 	const stripped = stripTrailingCommas(stripJsonComments(text));
 	let parsed: unknown;
 	try {
@@ -93,9 +142,18 @@ export function parseVSCodeKeybindingsText(text: string): VSCodeRawRule[] {
 	return parsed as VSCodeRawRule[];
 }
 
+function refuseOversized(bytes: number): never {
+	const mib = (bytes / (1024 * 1024)).toFixed(1);
+	throw new Error(`this file is ${mib} MiB — imports are capped at ${MAX_IMPORT_FILE_BYTES / (1024 * 1024)} MiB`);
+}
+
 // ─── Key grammar translation ─────────────────────────────────────────────────
 
-const VSCODE_NAMED_KEYS: Readonly<Record<string, string>> = {
+function frozenTable<V>(entries: Readonly<Record<string, V>>): Readonly<Record<string, V>> {
+	return Object.assign(Object.create(null) as Record<string, V>, entries);
+}
+
+const VSCODE_NAMED_KEYS: Readonly<Record<string, string>> = frozenTable({
 	up: 'arrowup',
 	down: 'arrowdown',
 	left: 'arrowleft',
@@ -114,31 +172,65 @@ const VSCODE_NAMED_KEYS: Readonly<Record<string, string>> = {
 	home: 'home',
 	end: 'end',
 	insert: 'insert',
-};
+});
 
-const VSCODE_MODIFIER_ALIASES: Readonly<Record<string, 'ctrl' | 'meta' | 'alt' | 'shift'>> = {
+type ModToken = 'ctrl' | 'cmd' | 'winmeta' | 'alt' | 'shift';
+
+const VSCODE_MODIFIER_ALIASES: Readonly<Record<string, ModToken>> = frozenTable({
 	ctrl: 'ctrl',
 	control: 'ctrl',
-	cmd: 'meta',
-	command: 'meta',
-	win: 'meta',
-	windows: 'meta',
-	meta: 'meta',
-	super: 'meta',
+	cmd: 'cmd',
+	command: 'cmd',
+	win: 'winmeta',
+	windows: 'winmeta',
+	meta: 'winmeta',
+	super: 'winmeta',
 	alt: 'alt',
 	option: 'alt',
 	shift: 'shift',
-};
+});
+
+/** The platform a VS Code `keybindings.json` was exported from (fix round 1,
+ *  item 6). VS Code writes one consistent modifier vocabulary for the whole
+ *  file — `cmd` on macOS, `ctrl`/`win` elsewhere — so one `cmd` token
+ *  anywhere in the file settles it. */
+export type VSCodeSourcePlatform = 'mac' | 'other';
+
+/** Scans every rule's `key` for a `cmd` / `command` token. Absent = `other`
+ *  (Windows/Linux): the far more common source for an *imported* file, and
+ *  the safe default (§3.1 `ctrl` never silently becomes `mod` on a real mac
+ *  file only because this guessed wrong — it only matters when the file
+ *  mixes vocabularies, which a real VS Code export never does). */
+export function detectVSCodeSourcePlatform(rules: readonly VSCodeRawRule[]): VSCodeSourcePlatform {
+	for (const raw of rules) {
+		if (typeof raw.key !== 'string') continue;
+		for (const stroke of splitKeySequence(raw.key)) {
+			for (const tok of stroke.split('+').map((p) => p.trim().toLowerCase())) {
+				if (tok === 'cmd' || tok === 'command') return 'mac';
+			}
+		}
+	}
+	return 'other';
+}
 
 /** One VS Code stroke (`ctrl+k`, `cmd+shift+p`) to our storage grammar
  *  (§3.1), or `null` when it uses a modifier or key token this import
  *  doesn't recognize (numpad keys, `OEM_*` names, … — left "not imported"
- *  rather than guessed at). `ctrl` and `cmd`/`win`/`meta` each fold onto the
- *  platform-primary `mod` on their own; holding both together is the one
- *  case that must stay literal (`mod` can never combine with `ctrl`/`meta`,
- *  §3.1) — the same rule `key-recorder.tsx`'s `toCanonical` applies to a
- *  live keypress. */
-function translateVSCodeStroke(stroke: string): string | null {
+ *  rather than guessed at).
+ *
+ *  Modifier folding is platform-aware (fix round 1, item 6): `mod` is only
+ *  ever the *source* file's own platform-primary modifier — `cmd` on a mac
+ *  file, `ctrl` on a Windows/Linux file — and the other physical modifier on
+ *  that platform (mac `ctrl`; Windows/Linux `win`/`meta`) always comes out
+ *  literal, exactly like a live keypress (`key-recorder.tsx`'s `toCanonical`,
+ *  §3.1: `mod` can never combine with `ctrl` or `meta`). When both the
+ *  primary and the platform's literal modifier are held together, `mod`
+ *  can't represent either any more, so both come out literal — the same
+ *  rule that already made `ctrl+cmd+p` (a mac file) translate to
+ *  `ctrl+meta+p` rather than something `mod` could combine with. `meta` is
+ *  never silently folded into `mod` on Windows/Linux, and never silently
+ *  dropped on either platform. */
+function translateVSCodeStroke(stroke: string, platform: VSCodeSourcePlatform): string | null {
 	const parts = stroke
 		.trim()
 		.toLowerCase()
@@ -150,20 +242,22 @@ function translateVSCodeStroke(stroke: string): string | null {
 	const modTokens = parts.slice(0, -1);
 
 	let ctrl = false;
-	let meta = false;
+	let cmd = false;
+	let winMeta = false;
 	let alt = false;
 	let shift = false;
 	for (const tok of modTokens) {
-		const resolved = VSCODE_MODIFIER_ALIASES[tok];
+		const resolved = Object.hasOwn(VSCODE_MODIFIER_ALIASES, tok) ? VSCODE_MODIFIER_ALIASES[tok] : undefined;
 		if (!resolved) return null;
 		if (resolved === 'ctrl') ctrl = true;
-		else if (resolved === 'meta') meta = true;
+		else if (resolved === 'cmd') cmd = true;
+		else if (resolved === 'winmeta') winMeta = true;
 		else if (resolved === 'alt') alt = true;
 		else shift = true;
 	}
 
 	let key: string | null = null;
-	if (VSCODE_NAMED_KEYS[rawKey]) {
+	if (Object.hasOwn(VSCODE_NAMED_KEYS, rawKey)) {
 		key = VSCODE_NAMED_KEYS[rawKey];
 	} else if (/^f([1-9]|1\d|2[0-4])$/.test(rawKey)) {
 		key = rawKey;
@@ -172,12 +266,33 @@ function translateVSCodeStroke(stroke: string): string | null {
 	}
 	if (!key) return null;
 
-	const out: string[] = [];
-	if (ctrl && meta) {
-		out.push('ctrl', 'meta');
-	} else if (ctrl || meta) {
-		out.push('mod');
+	// literalMods collects every modifier that must stay literal — never
+	// folded onto `mod` — on this platform.
+	const literalMods: string[] = [];
+	if (platform === 'mac') {
+		if (ctrl) literalMods.push('ctrl');
+		if (winMeta) literalMods.push('meta');
+	} else {
+		if (winMeta) literalMods.push('meta');
+		// An atypical literal `cmd` token in a Windows/Linux file: kept
+		// literal too, same rule as `win`/`meta` — never silently `mod`.
+		if (cmd) literalMods.push('meta');
 	}
+
+	const out: string[] = [];
+	const primaryHeld = platform === 'mac' ? cmd : ctrl;
+	if (primaryHeld) {
+		if (literalMods.length > 0) {
+			// The primary modifier is held alongside another literal one —
+			// `mod` can't combine with either, so the primary comes out in
+			// its own literal form too: `cmd` → `meta` on mac, `ctrl` stays
+			// `ctrl` on Windows/Linux (it already is the literal form).
+			literalMods.push(platform === 'mac' ? 'meta' : 'ctrl');
+		} else {
+			out.push('mod');
+		}
+	}
+	out.push(...literalMods);
 	if (alt) out.push('alt');
 	if (shift) out.push('shift');
 	out.push(key);
@@ -188,10 +303,10 @@ function translateVSCodeStroke(stroke: string): string | null {
  *  by one space — the same chord separator as ours) to our storage grammar.
  *  `null` when any stroke is untranslatable, or the result isn't a valid
  *  sequence (more than two strokes, etc.). */
-export function translateVSCodeKey(vsCodeKey: string): string | null {
+export function translateVSCodeKey(vsCodeKey: string, platform: VSCodeSourcePlatform): string | null {
 	const strokes = splitKeySequence(vsCodeKey);
 	if (strokes.length === 0 || strokes.length > 2) return null;
-	const translated = strokes.map(translateVSCodeStroke);
+	const translated = strokes.map((s) => translateVSCodeStroke(s, platform));
 	if (translated.some((s) => s === null)) return null;
 	const joined = (translated as string[]).join(' ');
 	return validateKeySequence(joined) === null ? joined : null;
@@ -200,6 +315,36 @@ export function translateVSCodeKey(vsCodeKey: string): string | null {
 // ─── `when` translation (the "G-ACTIONS `when` subset") ─────────────────────
 
 export type WhenTranslation = { ok: true; when: string | undefined } | { ok: false; reason: string };
+
+/** Renames every context key named in a `when` AST through `map`, leaving
+ *  every literal comparison value (`eq`/`ne`'s `value`, `glob`'s `pattern`)
+ *  untouched. Fix round 1, "low" item: the substitution used to be a
+ *  `String.replace` over the raw text, which could rewrite a context-key
+ *  name that happened to also appear *inside* a quoted string literal
+ *  (`resource =~ 'sideBarFocus.ts'`) — walking the already-parsed AST and
+ *  touching only `key` fields makes that impossible by construction, no
+ *  separate tokenizer needed since `tryParseWhen` already is one. */
+function substituteContextKeys(node: WhenNode, map: Readonly<Record<string, string>>): WhenNode {
+	switch (node.type) {
+		case 'true':
+		case 'false':
+			return node;
+		case 'key':
+			return { type: 'key', key: map[node.key] ?? node.key };
+		case 'eq':
+			return { type: 'eq', key: map[node.key] ?? node.key, value: node.value };
+		case 'ne':
+			return { type: 'ne', key: map[node.key] ?? node.key, value: node.value };
+		case 'glob':
+			return { type: 'glob', key: map[node.key] ?? node.key, pattern: node.pattern };
+		case 'not':
+			return { type: 'not', operand: substituteContextKeys(node.operand, map) };
+		case 'and':
+			return { type: 'and', operands: node.operands.map((o) => substituteContextKeys(o, map)) };
+		case 'or':
+			return { type: 'or', operands: node.operands.map((o) => substituteContextKeys(o, map)) };
+	}
+}
 
 /**
  * Translates a VS Code `when` clause into DEC-62 form, or reports it as
@@ -219,7 +364,7 @@ export function translateVSCodeWhen(clause: string | undefined | null): WhenTran
 	if (!parsed.ok) return { ok: false, reason: `the \`when\` clause doesn't parse: ${parsed.error.message}` };
 
 	const keys = contextKeysOf(parsed.ast);
-	const unmapped = keys.filter((k) => !VSCODE_WHEN_KEY_MAP[k]);
+	const unmapped = keys.filter((k) => !Object.hasOwn(VSCODE_WHEN_KEY_MAP, k));
 	if (unmapped.length > 0) {
 		return {
 			ok: false,
@@ -227,12 +372,9 @@ export function translateVSCodeWhen(clause: string | undefined | null): WhenTran
 		};
 	}
 
-	let substituted = trimmed;
-	for (const key of keys) {
-		substituted = substituted.replace(new RegExp(`\\b${key}\\b`, 'g'), VSCODE_WHEN_KEY_MAP[key]);
-	}
 	try {
-		const normalized = normalizeWhen(substituted);
+		const substituted = substituteContextKeys(parsed.ast, VSCODE_WHEN_KEY_MAP);
+		const normalized = serializeWhen(normalizeAst(substituted));
 		return { ok: true, when: normalized === '' ? undefined : normalized };
 	} catch (err) {
 		return { ok: false, reason: `the translated \`when\` clause didn't normalize: ${err instanceof Error ? err.message : String(err)}` };
@@ -253,6 +395,12 @@ export interface VSCodeImportRow extends ImportDiffRow {
  * table is checked in, unmapped commands are skipped with a reason").
  */
 export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRow[] {
+	const platform = detectVSCodeSourcePlatform(rules);
+	// Fix round 1, item 4: two rows in the *same* import both asking for a
+	// key that was free in the effective model at the start of this diff —
+	// the second one can't have it either, since Add can only write it once.
+	const claimedInThisImport = new Map<string, string>();
+
 	return rules.map((raw, i): VSCodeImportRow => {
 		const rawCommand = typeof raw.command === 'string' ? raw.command : null;
 		const rawKey = typeof raw.key === 'string' ? raw.key : null;
@@ -265,7 +413,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 		if (rawCommand.startsWith('-')) {
 			return { kind: 'skip', key, title, detail: 'removes a VS Code default binding — nothing to import' };
 		}
-		if (!(rawCommand in VSCODE_COMMAND_MAP)) {
+		if (!Object.hasOwn(VSCODE_COMMAND_MAP, rawCommand)) {
 			return {
 				kind: 'skip',
 				key,
@@ -277,7 +425,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 		if (mappedId === null) {
 			return { kind: 'skip', key, title, detail: `no Ikenga equivalent for \`${rawCommand}\`` };
 		}
-		const translatedKey = translateVSCodeKey(rawKey);
+		const translatedKey = translateVSCodeKey(rawKey, platform);
 		if (!translatedKey) {
 			return { kind: 'skip', key, title, detail: `\`${rawKey}\` doesn't translate to a supported key combination` };
 		}
@@ -286,15 +434,31 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 			return { kind: 'skip', key, title, detail: `${whenResult.reason} — not imported` };
 		}
 
+		const claimedBy = claimedInThisImport.get(translatedKey);
+		if (claimedBy) {
+			return {
+				kind: 'clash',
+				key,
+				title,
+				detail: `asks for a key already taken by ${claimedBy} earlier in this import — imports unbound`,
+			};
+		}
+
 		// §7.4's "held" is agnostic to *what* holds the key (rule 1: "whatever
-		// its command") — G-ACTIONS §10.5's own worked example classifies VS
+		// its when") — G-ACTIONS §10.5's own worked example classifies VS
 		// Code's "Toggle sidebar" as "imports unbound (`mod+b` held by
 		// `explorer.toggle`)" even though `explorer.toggle` is exactly the id
-		// this row maps onto, so this never special-cases "held by the same
-		// command I'm about to bind" as a no-op skip — any holder is a clash.
+		// this row maps onto. Held-by-the-same-id it is about to bind is the
+		// harmless case, though (orchestrator decision, fix round 1 item 7,
+		// matching `package.ts`'s identical rule): it is reported `skip`
+		// ("already bound"), not `clash` — both mean nothing is written, so
+		// this changes only how the row reads, not what happens on Add.
 		const holder = keyHolder(translatedKey);
 		if (holder) {
 			const holderCommand = 'command' in holder ? holder.command : null;
+			if (holderCommand === mappedId) {
+				return { kind: 'skip', key, title, detail: `already bound to \`${mappedId}\`` };
+			}
 			const heldByLabel = holderCommand ?? 'a predefined system shortcut';
 			return {
 				kind: 'clash',
@@ -304,6 +468,7 @@ export function buildVSCodeDiff(rules: readonly VSCodeRawRule[]): VSCodeImportRo
 			};
 		}
 
+		claimedInThisImport.set(translatedKey, `\`${title}\``);
 		const rule: KeybindingRule = { key: translatedKey, command: mappedId, ...(whenResult.when ? { when: whenResult.when } : {}) };
 		return {
 			kind: 'add',

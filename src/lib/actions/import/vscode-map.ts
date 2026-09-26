@@ -2,6 +2,19 @@
 // (G-ACTIONS §1.2, §5, §10). None of this is authored by a user; it ships
 // with the shell and is versioned like any other source file.
 //
+// Every table below is built on a `null` prototype (fix round 1, item 2):
+// every lookup in this file is keyed by attacker-controlled input (a VS Code
+// `command` string, a `when` context-key name, an `icon` string from a
+// foreign or teammate file), so a plain `{}` literal's inherited
+// `Object.prototype` members (`constructor`, `toString`, `hasOwnProperty`,
+// and `__proto__` via its accessor) would otherwise resolve as truthy /
+// defined "hits" for those exact strings. `TABLE[k]` and `k in TABLE` are
+// both safe against a null-prototype object — there is no prototype chain
+// left for either to walk.
+function frozenTable<V>(entries: Readonly<Record<string, V>>): Readonly<Record<string, V>> {
+	return Object.assign(Object.create(null) as Record<string, V>, entries);
+}
+
 // ── VS Code command → Ikenga id map (the "id-map core") ─────────────────────
 // Scope decision (user, 2026-09-26, `04-discussion.md` Round 42): the VS Code
 // import maps only this small, frozen core — every other VS Code `command`
@@ -11,34 +24,38 @@
 // Ikenga equivalent (shown with that reason, not "unrecognized") — the
 // `workbench.action.terminal.new` row is G-ACTIONS §10.5's own worked
 // example ("skipped, no equivalent").
-export const VSCODE_COMMAND_MAP: Readonly<Record<string, string | null>> = {
+//
+// Fix round 1, item 11 (§10 "core only"): this is now exactly G-ACTIONS
+// §10.5's three "(none) VS Code …" id-map-core rows, no more — the fourth
+// entry a first draft added (`workbench.action.showCommands` →
+// `palette.open`) is not one of them and was removed; a VS Code file binding
+// that command now falls through to "not in the frozen VS Code command map".
+export const VSCODE_COMMAND_MAP: Readonly<Record<string, string | null>> = frozenTable({
 	// "Go to file…" → the built-in Project switcher (G-ACTIONS §10.5 D-06 ids
 	// table: "(none) VS Code 'Go to file…' maps onto `palette.projects`").
 	'workbench.action.quickOpen': 'palette.projects',
 	// "Toggle sidebar" → `explorer.toggle` (§10.2: "VS Code 'Toggle sidebar'
 	// import loses to it" — `mod+b` is already held by the default).
 	'workbench.action.toggleSidebarVisibility': 'explorer.toggle',
-	// The Command Palette itself.
-	'workbench.action.showCommands': 'palette.open',
 	// §10.5's own "no equivalent" example.
 	'workbench.action.terminal.new': null,
-};
+});
 
 /** A VS Code `when` context key this import recognizes, mapped onto its
  *  DEC-62 (G-ACTIONS §4.3) equivalent. Deliberately tiny: the id-map core's
- *  four commands ship with no `when` in VS Code's own defaults, so this
+ *  three commands ship with no `when` in VS Code's own defaults, so this
  *  table mostly exists to prove the parser's `when`-subset claim rather than
  *  to cover VS Code's full context-key surface. Anything not listed here
  *  makes the row's `when` "unsupported" (§15 A — the row is skipped with a
  *  reason, never silently widened to `always`). */
-export const VSCODE_WHEN_KEY_MAP: Readonly<Record<string, string>> = {
+export const VSCODE_WHEN_KEY_MAP: Readonly<Record<string, string>> = frozenTable({
 	terminalFocus: 'terminalFocus',
 	editorTextFocus: 'inputFocus',
 	editorFocus: 'inputFocus',
 	sideBarFocus: 'explorerFocus',
 	explorerViewletFocus: 'explorerFocus',
 	explorerViewletVisible: 'explorerFocus',
-};
+});
 
 /** G-ACTIONS §1.2: "D-06's glyph ids (`chi`, `bolt`, `refresh`, §11.7) are
  *  not Lucide names; WP-61's import maps them through an alias table it
@@ -46,12 +63,12 @@ export const VSCODE_WHEN_KEY_MAP: Readonly<Record<string, string>> = {
  *  Applied to every icon string an import candidate carries before it is
  *  written, so a value copied from a D-06-style export doesn't collapse to
  *  the generic fallback for no reason. */
-export const ICON_GLYPH_ALIASES: Readonly<Record<string, string>> = {
+export const ICON_GLYPH_ALIASES: Readonly<Record<string, string>> = frozenTable({
 	bolt: 'zap',
 	chi: 'send',
 	refresh: 'refresh-cw',
 	term: 'terminal',
-};
+});
 
 /** Resolves a candidate's `icon` field through the alias table above. Passes
  *  through anything not in the table unchanged — `ActionIcon` (shared, WP-57)
@@ -59,8 +76,16 @@ export const ICON_GLYPH_ALIASES: Readonly<Record<string, string>> = {
  *  Lucide icon after this. */
 export function resolveImportIcon(icon: string | undefined | null): string | undefined {
 	if (!icon) return undefined;
-	return ICON_GLYPH_ALIASES[icon] ?? icon;
+	return Object.hasOwn(ICON_GLYPH_ALIASES, icon) ? ICON_GLYPH_ALIASES[icon] : icon;
 }
+
+/** Fix round 1, item 8: refuse an import source file over this size before
+ *  ever parsing it — a `keybindings.json` or teammate `actions.json` this
+ *  large is not a file anyone hand-authored, and JSONC comment-stripping is
+ *  quadratic-ish enough on pathological input to be worth refusing early
+ *  with a clear message instead of hanging the Import surface. 1 MiB is
+ *  generous: the shipped `defaults.ts` (37 entries) round-trips at a few KB. */
+export const MAX_IMPORT_FILE_BYTES = 1024 * 1024;
 
 /** One row of an Import diff (G-ACTIONS §5 "Import is a writer, not a
  *  layer"; the routine brief: "add, skip … or clash"). `clash` never means

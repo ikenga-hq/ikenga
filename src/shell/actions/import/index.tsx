@@ -10,6 +10,15 @@
 // `@/lib/actions/import/{package,vscode,project}.ts` module (frozen tables in
 // `vscode-map.ts`); this file is only the surface that picks a source, shows
 // its diff, and calls the matching `apply*Import`.
+//
+// Fix round 1, item 5 ("Partial Add"): the VS Code and teammate diffs are
+// *derived* (`useMemo`) from the raw parsed input plus the live `model` prop,
+// never held as their own independently-set state. So if `handleAdd` throws
+// partway through a multi-row apply, the next render — once `model` reflects
+// whatever did get written (the shared store re-merges on `actions://
+// changed`, same as `packageRows` already relied on) — recomputes the same
+// diff against the fresh model: rows already written now read `skip`
+// ("already bound"), and pressing Add again only ever touches what's left.
 
 import { useMemo, useState } from 'react';
 import { Box, Download, TriangleAlert, Users } from 'lucide-react';
@@ -23,14 +32,16 @@ import {
 	applyVSCodeImport,
 	parseVSCodeKeybindingsText,
 	type VSCodeImportRow,
+	type VSCodeRawRule,
 } from '@/lib/actions/import/vscode';
 import {
 	buildProjectDiff,
 	applyProjectImport,
 	readTeammateProjectFile,
-	type ProjectImportDiff,
+	type TeammateProjectSource,
 } from '@/lib/actions/import/project';
-import type { ImportDiffRow } from '@/lib/actions/import/vscode-map';
+import { MAX_IMPORT_FILE_BYTES, type ImportDiffRow } from '@/lib/actions/import/vscode-map';
+import './import.css';
 
 type SourceId = 'pkg' | 'vscode' | 'team';
 
@@ -39,6 +50,21 @@ const SOURCES: ReadonlyArray<{ id: SourceId; label: string; sub: string; Icon: t
 	{ id: 'vscode', label: 'From VS Code keybindings', sub: 'A keybindings.json file you choose', Icon: Download },
 	{ id: 'team', label: "From a teammate's project file", sub: 'Another checkout’s .ikenga/actions.json', Icon: Users },
 ];
+
+/** Fix round 1, item 9: `fs_read` only reads paths under the allowlist
+ *  (`src-tauri/src/commands/fs.rs` → `resolve_allowlisted`), and a real VS
+ *  Code `keybindings.json` usually lives under the OS's own app-data
+ *  directory (`~/Library/Application Support/Code/User/…`, `~/.config/
+ *  Code/User/…`), outside it. There is no dialog-granted read path to fall
+ *  back to here: the main window's `plugin-fs` scope is intentionally empty
+ *  (`tauri-cmd.ts`'s own "FS" section header), and `@tauri-apps/plugin-
+ *  dialog`'s `open()` returns only a path, never file content — so picking a
+ *  file through the native dialog grants no extra read access on its own.
+ *  The only fallback left is letting the user paste the file's JSON
+ *  directly, so that is what this does; `resolve_allowlisted`'s own error
+ *  text ("path outside allowlist: …") is matched to offer it precisely when
+ *  that's the reason the read failed, not for any other read error. */
+const ALLOWLIST_ERROR_PATTERN = /outside allowlist/i;
 
 function DiffRowView({ row }: { row: ImportDiffRow }) {
 	const sign = row.kind === 'add' ? '+' : row.kind === 'skip' ? '·' : '!';
@@ -59,6 +85,10 @@ function countAdds(rows: readonly ImportDiffRow[]): number {
 	return rows.filter((r) => r.kind === 'add').length;
 }
 
+function WhatWillBeAdded() {
+	return <div className="imp-subhead">What will be added</div>;
+}
+
 export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps) {
 	const [source, setSource] = useState<SourceId>('pkg');
 	const [applying, setApplying] = useState(false);
@@ -68,17 +98,40 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 	const packageRows = useMemo<PackageImportRow[]>(() => buildPackageDiff(model), [model]);
 
 	// ── "From VS Code keybindings" — the user picks a file, then we diff. ───
+	// The diff is derived from the raw parsed rules + the live model (item 5)
+	// rather than held as its own state.
 	const [vsCodePath, setVsCodePath] = useState<string | null>(null);
-	const [vsCodeRows, setVsCodeRows] = useState<VSCodeImportRow[] | null>(null);
+	const [vsCodeRawRules, setVsCodeRawRules] = useState<VSCodeRawRule[] | null>(null);
 	const [vsCodeError, setVsCodeError] = useState<string | null>(null);
 	const [vsCodeLoading, setVsCodeLoading] = useState(false);
+	const [vsCodePasteMode, setVsCodePasteMode] = useState(false);
+	const [vsCodePasteText, setVsCodePasteText] = useState('');
+	const vsCodeRows = useMemo<VSCodeImportRow[] | null>(
+		() => (vsCodeRawRules ? buildVSCodeDiff(vsCodeRawRules) : null),
+		[vsCodeRawRules, model]
+	);
 
 	// ── "From a teammate's project file" — same shape, project-scope only. ──
 	const [teamPath, setTeamPath] = useState<string | null>(null);
-	const [teamDiff, setTeamDiff] = useState<ProjectImportDiff | null>(null);
+	const [teamSource, setTeamSource] = useState<TeammateProjectSource | null>(null);
 	const [teamError, setTeamError] = useState<string | null>(null);
 	const [teamLoading, setTeamLoading] = useState(false);
 	const projectAvailable = Boolean(model.projectRoot);
+	const teamDiff = useMemo(() => (teamSource ? buildProjectDiff(teamSource, model) : null), [teamSource, model]);
+
+	function resetVSCodeSource() {
+		setVsCodePath(null);
+		setVsCodeRawRules(null);
+		setVsCodeError(null);
+		setVsCodePasteMode(false);
+		setVsCodePasteText('');
+	}
+
+	function resetTeamSource() {
+		setTeamPath(null);
+		setTeamSource(null);
+		setTeamError(null);
+	}
 
 	async function pickVSCodeFile() {
 		setVsCodeError(null);
@@ -92,16 +145,44 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		setVsCodeLoading(true);
 		try {
 			const bytes = (await fsRead(path)).bytes;
+			if (bytes.length > MAX_IMPORT_FILE_BYTES) {
+				throw new Error(
+					`this file is ${(bytes.length / (1024 * 1024)).toFixed(1)} MiB — imports are capped at ${MAX_IMPORT_FILE_BYTES / (1024 * 1024)} MiB`
+				);
+			}
 			const text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes));
 			const rules = parseVSCodeKeybindingsText(text);
 			setVsCodePath(path);
-			setVsCodeRows(buildVSCodeDiff(rules));
+			setVsCodeRawRules(rules);
+			setVsCodePasteMode(false);
 		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
 			setVsCodePath(null);
-			setVsCodeRows(null);
-			setVsCodeError(err instanceof Error ? err.message : String(err));
+			setVsCodeRawRules(null);
+			if (ALLOWLIST_ERROR_PATTERN.test(message)) {
+				// Fallback used: paste, not the dialog's own read (unavailable
+				// here — see the module note above).
+				setVsCodePasteMode(true);
+				setVsCodeError(
+					"That file is outside Ikenga's allowed folders (Settings → Storage → File roots) and can't be read directly — paste its JSON below instead."
+				);
+			} else {
+				setVsCodeError(message);
+			}
 		} finally {
 			setVsCodeLoading(false);
+		}
+	}
+
+	function applyPastedVSCodeJson() {
+		setVsCodeError(null);
+		try {
+			const rules = parseVSCodeKeybindingsText(vsCodePasteText);
+			setVsCodePath('(pasted)');
+			setVsCodeRawRules(rules);
+			setVsCodePasteMode(false);
+		} catch (err) {
+			setVsCodeError(err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -116,12 +197,12 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		if (!path) return;
 		setTeamLoading(true);
 		try {
-			const teamSource = await readTeammateProjectFile(path);
+			const teamFileSource = await readTeammateProjectFile(path);
 			setTeamPath(path);
-			setTeamDiff(buildProjectDiff(teamSource, model));
+			setTeamSource(teamFileSource);
 		} catch (err) {
 			setTeamPath(null);
-			setTeamDiff(null);
+			setTeamSource(null);
 			setTeamError(err instanceof Error ? err.message : String(err));
 		} finally {
 			setTeamLoading(false);
@@ -148,6 +229,10 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 			}
 			onNavigate('actions');
 		} catch (err) {
+			// Item 5: deliberately not clearing `vsCodeRawRules` / `teamSource`
+			// here — the diff for whichever rows are left stays on screen,
+			// recomputed against the model once it reflects what did get
+			// written, so a second Add only retries what's left.
 			setError(err instanceof Error ? err.message : String(err));
 		} finally {
 			setApplying(false);
@@ -161,6 +246,7 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 			}
 			return (
 				<>
+					<WhatWillBeAdded />
 					<p className="imp-lead">Reviewed against your {model.keymap.entries.length} bindings. Nothing is written until you add.</p>
 					{packageRows.map((row) => (
 						<DiffRowView key={row.key} row={row} />
@@ -170,6 +256,31 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		}
 		if (source === 'vscode') {
 			if (vsCodeLoading) return <div className="imp-empty">Reading…</div>;
+			if (vsCodePasteMode) {
+				return (
+					<div className="imp-paste">
+						{vsCodeError && (
+							<p className="imp-lead" role="alert">
+								{vsCodeError}
+							</p>
+						)}
+						<textarea
+							value={vsCodePasteText}
+							onChange={(e) => setVsCodePasteText(e.target.value)}
+							placeholder="Paste the contents of your keybindings.json here…"
+							spellCheck={false}
+						/>
+						<div className="imp-paste-actions">
+							<Button size="sm" onClick={applyPastedVSCodeJson} disabled={vsCodePasteText.trim().length === 0}>
+								Use this JSON
+							</Button>
+							<Button variant="ghost" size="sm" onClick={resetVSCodeSource}>
+								Cancel
+							</Button>
+						</div>
+					</div>
+				);
+			}
 			if (vsCodeError) {
 				return (
 					<div className="imp-empty" role="alert">
@@ -189,9 +300,13 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 			}
 			return (
 				<>
+					<WhatWillBeAdded />
 					<p className="imp-lead">
 						{vsCodePath} · maps the frozen id-map core onto your {scope} keybindings. Everything else is shown as not
-						imported.
+						imported.{' '}
+						<button type="button" className="imp-relink" onClick={resetVSCodeSource}>
+							Choose a different file…
+						</button>
 					</p>
 					{vsCodeRows.map((row) => (
 						<DiffRowView key={row.key} row={row} />
@@ -223,9 +338,13 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		}
 		return (
 			<>
+				<WhatWillBeAdded />
 				<p className="imp-lead">
 					{teamPath} · lands as project actions and keybindings — actions run once this project is trusted (DEC-55);
-					keybindings are held until this project's keybindings are trusted (DEC-65).
+					keybindings are held until this project's keybindings are trusted (DEC-65).{' '}
+					<button type="button" className="imp-relink" onClick={resetTeamSource}>
+						Choose a different file…
+					</button>
 				</p>
 				{teamDiff.actionRows.length > 0 && <div className="imp-subhead">Actions</div>}
 				{teamDiff.actionRows.map((row) => (
@@ -272,10 +391,10 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 				</div>
 			)}
 			<div className="imp-formfoot">
-				<Button size="lg" disabled={addCount === 0 || applying} onClick={() => void handleAdd()}>
-					{applying ? 'Adding…' : `Add ${addCount} ${addCount === 1 ? 'item' : 'items'}`}
+				<Button size="lg" className="min-h-[var(--btn-h-lg)]" disabled={addCount === 0 || applying} onClick={() => void handleAdd()}>
+					{applying ? 'Adding…' : `Add ${addCount} ${addCount === 1 ? 'action' : 'actions'}`}
 				</Button>
-				<Button variant="ghost" size="lg" onClick={() => onNavigate('actions')}>
+				<Button variant="ghost" size="lg" className="min-h-[var(--btn-h-lg)]" onClick={() => onNavigate('actions')}>
 					Cancel
 				</Button>
 				<span className="imp-hint">Nothing is written until you add. Conflicts keep your binding and import unbound.</span>

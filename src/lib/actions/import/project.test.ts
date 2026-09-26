@@ -74,8 +74,54 @@ describe('buildProjectDiff — bindings', () => {
 		expect(diff.bindingRows[0].kind).toBe('clash');
 	});
 
-	it('always adds a negative rule (unbinding never overrides anything)', () => {
+	it('skips a negative rule — a teammate import never removes a binding (fix round 1, item 3)', () => {
 		const diff = buildProjectDiff(source({ bindings: [{ key: 'mod+w', command: '-pane.close' }] }), fakeModel());
+		expect(diff.bindingRows[0].kind).toBe('skip');
+		expect(diff.bindingRows[0].detail).toMatch(/removes a binding/);
+	});
+
+	it('skips a project `scope: "os"` rule (DEC-60 — only the personal file may be OS-wide)', () => {
+		const diff = buildProjectDiff(
+			source({ bindings: [{ key: 'alt+space', command: 'os.summon', scope: 'os' }] }),
+			fakeModel()
+		);
+		expect(diff.bindingRows[0].kind).toBe('skip');
+		expect(diff.bindingRows[0].detail).toMatch(/personal file/);
+	});
+
+	it('skips an invalid key with a reason, before ever checking who holds it', () => {
+		const diff = buildProjectDiff(source({ bindings: [{ key: 'ctrl+meta+shift+unknownkey', command: 'release-status' }] }), fakeModel());
+		expect(diff.bindingRows[0].kind).toBe('skip');
+		expect(diff.bindingRows[0].detail).toMatch(/invalid key/);
+	});
+
+	it('strips a stray `action:` prefix from the command (§10.1)', () => {
+		const diff = buildProjectDiff(source({ bindings: [{ key: 'mod+alt+shift+f18', command: 'action:release-status' }] }), fakeModel());
 		expect(diff.bindingRows[0].kind).toBe('add');
+		expect(diff.bindingRows[0].write?.command).toBe('release-status');
+	});
+
+	it('skips the second of two rows in the same import asking for the same free key', () => {
+		const diff = buildProjectDiff(
+			source({
+				bindings: [
+					{ key: 'mod+alt+shift+f17', command: 'release-status' },
+					{ key: 'mod+alt+shift+f17', command: 'explain-file' },
+				],
+			}),
+			fakeModel()
+		);
+		expect(diff.bindingRows[0].kind).toBe('add');
+		expect(diff.bindingRows[1].kind).toBe('clash');
+		expect(diff.bindingRows[1].detail).toMatch(/earlier in this import/);
+	});
+
+	it('reports "already bound", not a clash, when the key is held by the same command (fix round 1, item 7)', () => {
+		// `keyHolder` reads the DEFAULT-only keymap (see the file header note),
+		// so this uses a default-layer command — `mod+b` is `explorer.toggle`'s
+		// own default key (G-ACTIONS §10.2) — as the "same id" under test.
+		const diff = buildProjectDiff(source({ bindings: [{ key: 'mod+b', command: 'explorer.toggle' }] }), fakeModel());
+		expect(diff.bindingRows[0].kind).toBe('skip');
+		expect(diff.bindingRows[0].detail).toBe('already bound');
 	});
 });
