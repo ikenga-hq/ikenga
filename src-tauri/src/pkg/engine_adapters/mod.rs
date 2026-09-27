@@ -8,7 +8,10 @@ pub mod claude_code;
 pub mod codex;
 pub mod gemini;
 mod symlink;
-pub(crate) mod transcoder;
+// The MD → TOML transcoder lives in the ungated `server::shared::transcoder`
+// (WP-19 slice 7) so the daemon's cross-engine copy runs the same code;
+// re-exported here so `engine_adapters::transcoder::*` paths keep resolving.
+pub(crate) use crate::server::shared::transcoder;
 
 #[cfg(test)]
 mod test_util;

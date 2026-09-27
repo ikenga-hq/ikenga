@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{Map, Value};
 
-use crate::commands::engine_layout::{
+use crate::server::shared::engine_layout::{
     engine_layout_by_id, ConfigFormat, EngineId, KindLayout, PrimitiveKind,
 };
 
@@ -1277,7 +1277,7 @@ mod tests {
         }
     }
 
-    use crate::commands::engine_layout::EngineId;
+    use crate::server::shared::engine_layout::EngineId;
 
     /// Claude hooks still route through the JSON path under the engine-aware API
     /// — proving the Phase-1 behaviour is preserved when threaded by `EngineId`.

@@ -698,6 +698,53 @@ pub async fn rpc_handler(
         "list_agent_projects" => rpc_claude::list_agent_projects(&state, &payload.args).await,
         "engine_layout" => rpc_claude::engine_layout(),
         "terminal_detect_shells" => rpc_claude::terminal_detect_shells(),
+
+        // --- Ngwa vault: store, primitives, Ọba registry (WP-19 slice 7) ---
+        //
+        // Bodies in `server::rpc_claude`, over `server::shared::claude_store`
+        // — the `*_in` bodies the desktop commands call — against the router
+        // home and store (G-PRINCIPAL single-user seam: under topology B each
+        // principal's daemon has its own HOME, so its own vault). Confined:
+        // no symlink planted in a scope can turn a copy, write or delete into
+        // one outside the vault or inside `--data-dir`; relink / unlink name
+        // only placements in a known scope; an import source and a new master
+        // must pass the fs allowlist. Left allowlisted: the git / npx
+        // installers and updaters (they spawn, WP-18b) and `oba_install_local`
+        // (an unconfined read source) — see `desktop_only.toml`.
+        "claude_store_list" => rpc_claude::claude_store_list(&state, &payload.args).await,
+        "claude_store_import" => rpc_claude::claude_store_import(&state, &payload.args).await,
+        "claude_primitive_enable" => {
+            rpc_claude::claude_primitive_enable(&state, &payload.args).await
+        }
+        "claude_primitive_enable_for" => {
+            rpc_claude::claude_primitive_enable_for(&state, &payload.args).await
+        }
+        "claude_primitive_disable" => {
+            rpc_claude::claude_primitive_disable(&state, &payload.args).await
+        }
+        "claude_primitive_disable_for" => {
+            rpc_claude::claude_primitive_disable_for(&state, &payload.args).await
+        }
+        "claude_primitive_remove" => {
+            rpc_claude::claude_primitive_remove(&state, &payload.args).await
+        }
+        "claude_primitive_remove_for" => {
+            rpc_claude::claude_primitive_remove_for(&state, &payload.args).await
+        }
+        "claude_primitive_copy" => rpc_claude::claude_primitive_copy(&state, &payload.args).await,
+        "claude_primitive_move" => rpc_claude::claude_primitive_move(&state, &payload.args).await,
+        "claude_primitive_copy_batch" => {
+            rpc_claude::claude_primitive_copy_batch(&state, &payload.args).await
+        }
+        "oba_backfill_registry" => rpc_claude::oba_backfill_registry(&state).await,
+        "oba_dependents" => rpc_claude::oba_dependents(&state, &payload.args).await,
+        "oba_forget" => rpc_claude::oba_forget(&state, &payload.args),
+        "oba_missing_requires" => rpc_claude::oba_missing_requires(&state, &payload.args).await,
+        "oba_safe_delete" => rpc_claude::oba_safe_delete(&state, &payload.args).await,
+        "oba_set_auto_update" => rpc_claude::oba_set_auto_update(&state, &payload.args).await,
+        "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
+        "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
+
         // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---
         //
         // Bodies in `server::rpc_files`, over `server::shared::{fs, actions}`

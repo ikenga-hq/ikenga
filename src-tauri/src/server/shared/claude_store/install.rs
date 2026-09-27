@@ -18,6 +18,14 @@
 //! The fetch always lands in a disposable staging dir first; only an atomic swap
 //! promotes it into the vault, so a failed/interrupted fetch never leaves a
 //! half-written canonical and never mutates `registry.json`.
+//!
+//! Lives in the ungated `server::shared::claude_store` (WP-19 slice 7) with
+//! the rest of the store. Only the two pure registry commands here —
+//! [`oba_missing_requires_in`] and [`oba_set_auto_update_in`] — are served by
+//! the daemon; everything that fetches (git / npx) is reached only from the
+//! desktop's `commands::claude_store` wrappers, so in the headless build it
+//! is compiled but dead.
+#![cfg_attr(not(feature = "desktop"), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
@@ -30,16 +38,12 @@ use super::{
     atomic_copy_dir, atomic_copy_file, read_description, store_path_for, validate_name,
     ClaudeStoreEntry, ClaudeStoreMutation, Kind, ProvenanceSource, RegistryProvenance,
 };
-use crate::commands::claude_config::{mtime_ms, store_root};
-
-use std::sync::Arc;
-
-use tauri::State;
+use crate::server::shared::claude_config::{mtime_ms, store_root};
 
 use super::resolve::{
     collect_satisfied, resolve_install_loop_core, resolve_requires_core, PrimitiveRef, RequiresGraph,
 };
-use crate::commands::db::PaDb;
+use crate::db::PaDb;
 use crate::pkg::manifest::RequiresEntry;
 
 /// Result of an update check — current (recorded) vs latest (remote) version.
@@ -984,12 +988,14 @@ fn set_auto_update_core(
     Ok(enabled)
 }
 
-// ─── Tauri commands (thin: resolve the real store root, delegate to core) ─────
+// ─── Command bodies (thin: resolve the real store root, delegate to core) ─────
+//
+// The desktop's `#[tauri::command]` wrappers of the same names live in
+// `commands::claude_store` and call these.
 
 /// Install a primitive from a git remote into the vault as a managed canonical.
-#[tauri::command]
 #[allow(non_snake_case)]
-pub async fn oba_install_git(
+pub(crate) async fn oba_install_git(
     kind: String,
     name: String,
     url: String,
@@ -1013,9 +1019,8 @@ pub async fn oba_install_git(
 /// `fromCatalog` records that the install was discovered through the recommended
 /// catalog (Phase 3) — set by the catalog Install path, omitted/false for a
 /// direct npx install.
-#[tauri::command]
 #[allow(non_snake_case)]
-pub async fn oba_install_npx(
+pub(crate) async fn oba_install_npx(
     kind: String,
     name: String,
     spec: String,
@@ -1044,8 +1049,7 @@ pub async fn oba_install_npx(
 /// independent of the skill's own frontmatter name — so a local dir whose
 /// SKILL.md is named `mail` can be installed as `skill-mail` to satisfy a pkg's
 /// `requires:{kind:"skill",name:"skill-mail"}` edge.
-#[tauri::command]
-pub async fn oba_install_local(
+pub(crate) async fn oba_install_local(
     kind: String,
     name: String,
     path: String,
@@ -1073,9 +1077,8 @@ pub async fn oba_install_local(
 /// members (so it doubles as the update path). `scope` is accepted for forward
 /// compatibility with WP-21 placement but is unused here (store population only).
 /// `fromCatalog` records catalog discovery (Phase 3).
-#[tauri::command]
 #[allow(non_snake_case)]
-pub async fn oba_install_bundle(
+pub(crate) async fn oba_install_bundle(
     name: String,
     spec: String,
     scope: Option<String>,
@@ -1094,16 +1097,14 @@ pub async fn oba_install_bundle(
 }
 
 /// Check whether a git/npx-installed primitive is behind its remote.
-#[tauri::command]
-pub async fn oba_check_update(kind: String, name: String) -> Result<UpdateStatus, String> {
+pub(crate) async fn oba_check_update(kind: String, name: String) -> Result<UpdateStatus, String> {
     let k = Kind::parse(&kind)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
     check_update_core(&store, k, &name)
 }
 
 /// Re-fetch a managed primitive into its existing canonical in place (no relink).
-#[tauri::command]
-pub async fn oba_update(kind: String, name: String) -> Result<ClaudeStoreEntry, String> {
+pub(crate) async fn oba_update(kind: String, name: String) -> Result<ClaudeStoreEntry, String> {
     let k = Kind::parse(&kind)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
     update_core(&store, k, &name)
@@ -1113,22 +1114,21 @@ pub async fn oba_update(kind: String, name: String) -> Result<ClaudeStoreEntry, 
 /// remote (FE-driven: called on the Ọba/catalog surface mount). Per-entry errors
 /// are collected, never abort the batch. Returns a summary of updated / current /
 /// errored entries.
-#[tauri::command]
-pub async fn oba_auto_update_all() -> Result<AutoUpdateSummary, String> {
+pub(crate) async fn oba_auto_update_all() -> Result<AutoUpdateSummary, String> {
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
     Ok(auto_update_all_core(&store))
 }
 
 /// Phase 3 — toggle the per-entry auto-update opt-in and persist it to
 /// `registry.json`. Returns the new flag value.
-#[tauri::command]
-pub async fn oba_set_auto_update(
+pub(crate) async fn oba_set_auto_update_in(
+    v: &super::Vault<'_>,
     kind: String,
     name: String,
     enabled: bool,
 ) -> Result<bool, String> {
     let k = Kind::parse(&kind)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
+    let store = v.store()?;
     set_auto_update_core(&store, k, &name, enabled)
 }
 
@@ -1430,10 +1430,9 @@ fn missing_requires_core(
 /// source; the missing closure auto-installs transactionally (rolled back with
 /// the target on any failure). Returns the target + the installed closure
 /// (enable order) + already-satisfied deps (consent UX).
-#[tauri::command]
 #[allow(non_snake_case)]
-pub async fn oba_install_with_deps(
-    db: State<'_, Arc<PaDb>>,
+pub(crate) async fn oba_install_with_deps(
+    db: &PaDb,
     kind: String,
     name: String,
     source: String,
@@ -1445,7 +1444,7 @@ pub async fn oba_install_with_deps(
     let k = Kind::parse(&kind)?;
     let src = parse_source(&source)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    let scope_roots = super::all_scope_roots(&db).await;
+    let scope_roots = super::all_scope_roots(db).await;
     install_with_deps_core(
         &store,
         &scope_roots,
@@ -1462,16 +1461,16 @@ pub async fn oba_install_with_deps(
 /// Re-verify a primitive's `requires` at enable time: return the recorded deps
 /// that are no longer present (the FE offers to re-fetch them). WP-14
 /// re-verify-at-enable.
-#[tauri::command]
-pub async fn oba_missing_requires(
-    db: State<'_, Arc<PaDb>>,
+pub(crate) async fn oba_missing_requires_in(
+    v: &super::Vault<'_>,
+    db: &PaDb,
     kind: String,
     name: String,
 ) -> Result<Vec<RequiresEntry>, String> {
     let k = Kind::parse(&kind)?;
     validate_name(&name)?;
-    let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    let scope_roots = super::all_scope_roots(&db).await;
+    let store = v.store()?;
+    let scope_roots = super::all_scope_roots_in(db, v.home_opt()).await;
     Ok(missing_requires_core(&store, &scope_roots, k, &name))
 }
 
@@ -1504,7 +1503,7 @@ pub struct PkgRequiresResult {
 /// pkg's `scope` via the unified placement layer. Dedups vs store ∪ external.
 /// Empty `requires` ⇒ a no-op (returns empty result). Used by `pkg_install_*`.
 pub async fn resolve_pkg_requires(
-    db: &Arc<PaDb>,
+    db: &PaDb,
     requires: &[RequiresEntry],
     catalog: &[CatalogEntryRef],
     scope: &str,

@@ -1,5 +1,5 @@
 //! AppHandle-free cores shared by the desktop `#[tauri::command]` wrappers
-//! and the daemon's `/api/rpc` arms (WP-19 slices 2–6).
+//! and the daemon's `/api/rpc` arms (WP-19 slices 2–7).
 //!
 //! Same house pattern as `crate::db`, `crate::secrets_env` and `pkg::status`:
 //! the logic lives here, compiled into both binaries; the desktop command in
@@ -24,6 +24,7 @@ pub mod chi;
 pub mod chi_liveness;
 pub mod claude_config;
 pub mod claude_sessions;
+pub mod claude_store;
 pub mod comments;
 pub mod data_health;
 pub mod engine_layout;
@@ -40,3 +41,4 @@ pub mod settings_cascade;
 pub mod shell_detect;
 pub mod studio_threads;
 pub mod supabase_config;
+pub mod transcoder;

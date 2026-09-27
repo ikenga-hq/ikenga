@@ -116,6 +116,13 @@ pub struct AppState {
     /// `home`, and project roots checked against `path_guard`. `None` without
     /// a data dir or a home; those arms then say which is missing.
     pub(crate) actions: Option<Arc<shared::actions::ActionsManager>>,
+    /// The Ngwa store root the vault arms (`claude_store_*`,
+    /// `claude_primitive_*`, `oba_*`; see `server::rpc_claude`) work in: the
+    /// daemon PROCESS's `pkg::skill_actions::store_root()` in production, a
+    /// temp dir in tests. `None` when the platform data dir cannot be
+    /// resolved; those arms then answer the desktop's "cannot resolve store
+    /// root". Single-user seam (G-PRINCIPAL / WP-20), same as `home`.
+    pub(crate) store: Option<PathBuf>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -289,6 +296,55 @@ pub(crate) fn router_with(
     home: Option<PathBuf>,
     path_guard: rpc_shell::PathGuard,
 ) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        shutdown_tx,
+        home,
+        path_guard,
+        // G-PRINCIPAL seam: the daemon process's own store.
+        crate::pkg::skill_actions::store_root(),
+    )
+}
+
+/// [`router_with`] with the Ngwa store root made explicit too, so the vault
+/// arms' tests work in a temp store instead of the real user's.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn router_with_store(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+    store: Option<PathBuf>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        None,
+        home,
+        path_guard,
+        store,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_router(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+    store: Option<PathBuf>,
+) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
     // daemon.json, …) or the per-user discovery file, both of which hold the
@@ -338,6 +394,7 @@ pub(crate) fn router_with(
         home,
         path_guard,
         actions,
+        store,
         shutdown_tx,
     });
 

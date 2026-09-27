@@ -32,6 +32,11 @@
 //! `~/.claude/projects`: a session id is never a path, and a log that
 //! canonicalizes outside that dir is refused (`claude_sessions::read_session`).
 //!
+//! **The Ngwa vault (WP-19 slice 7).** The store / primitive / Ọba registry
+//! arms (`claude_store_*`, `claude_primitive_*`, `oba_*`) run the desktop's
+//! bodies (`server::shared::claude_store`) against the router home and store,
+//! confined to the vault — see the section comment above those arms.
+//!
 //! **No events, nothing spawned.** The desktop's `claude-config:changed`
 //! watchers (`claude_config_watch` / `_unwatch`) stay desktop-only: there is
 //! no event channel here. Nothing in this module starts a process; on Windows
@@ -46,6 +51,7 @@ use super::rpc_local::{pa_db, respond};
 use super::rpc_shell::targ;
 use super::shared::claude_config::{self, ClaudeConfig, ScanError};
 use super::shared::claude_sessions::{self, projects_root_in};
+use super::shared::claude_store::{self, DaemonChecks, Vault};
 use super::shared::projects::FsReach;
 use super::shared::{agent_config, agent_projects, engine_layout, settings_cascade, shell_detect};
 use super::AppState;
@@ -386,6 +392,321 @@ pub(super) fn terminal_detect_shells() -> RpcResponse {
         )
     }
 }
+
+// ─── The Ngwa vault: store, primitives, Ọba registry (WP-19 slice 7) ─────────
+//
+// The bodies are `server::shared::claude_store`'s `*_in` functions — the ones
+// the desktop's `#[tauri::command]`s call — run against a daemon `Vault`:
+//
+// * **Whose vault (G-PRINCIPAL / WP-20).** The router home (the `workspace`
+//   scope, the user-tier engine dirs) and `state.store` (the daemon PROCESS's
+//   `store_root()` in production): single-user seam — under topology B each
+//   principal's daemon has its own HOME and so its own vault. The merge
+//   engine's user-tier settings files (`~/.claude.json`, `~/.codex/…`) resolve
+//   against the process home, which is the router home in production.
+// * **Confined** (`claude_store::confine`): the desktop trusts symlinks because
+//   its caller is the user's own renderer on the same uid; a token holder is
+//   not. Every copy source (and every entry of a copied skill dir) must
+//   resolve inside the vault — the store, or a known scope's `.claude` /
+//   `.agents` / `.gemini` / `.codex` — and outside the daemon's data dir;
+//   every node created, replaced or deleted must sit there too; a relink /
+//   unlink names only placements in a known scope's dependents-scan dirs; an
+//   import source and a relink's new master must pass the fs allowlist
+//   (`PathGuard`). Deletes stay `lstat`-first: a link is unlinked, never
+//   followed. Caller paths expand only `~`, never `$VAR`.
+// * **Needs `--data-dir`.** Each arm whose desktop command takes the
+//   database, plus relink / unlink (whose confinement needs the scope list),
+//   refuses without one. `claude_store_import`, `oba_forget` and
+//   `oba_set_auto_update` touch only the store.
+// * **Not served:** the git / npx installers, `oba_update`,
+//   `oba_check_update`, `oba_auto_update_all` (they spawn; WP-18b) and
+//   `oba_install_local` (an unconfined, symlink-following read source with no
+//   FE caller) — see `desktop_only.toml`.
+
+/// Bind `$v` to the daemon's [`Vault`] for `$state`: its router home and
+/// store, confined by its `PathGuard` (the checks borrow `$state`).
+macro_rules! daemon_vault {
+    ($state:expr, $v:ident) => {
+        let reserved = |p: &Path| $state.path_guard.check_reserved(p);
+        let allowlisted = |p: &Path| $state.path_guard.check(p);
+        let $v = Vault::daemon(
+            $state.home.clone(),
+            $state.store.clone(),
+            DaemonChecks {
+                reserved: &reserved,
+                allowlisted: &allowlisted,
+            },
+        );
+    };
+}
+
+pub(super) async fn claude_store_list(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let kind: Option<String> = targ(args, &["kind"])?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_store_list_in(&v, db, kind).await
+    }
+    .await;
+    respond("claude_store_list", r)
+}
+
+pub(super) async fn claude_store_import(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let kind: String = targ(args, &["kind"])?;
+        let name: String = targ(args, &["name"])?;
+        let source_path: String = targ(args, &["sourcePath", "source_path"])?;
+        daemon_vault!(state, v);
+        claude_store::claude_store_import_in(&v, kind, name, source_path).await
+    }
+    .await;
+    respond("claude_store_import", r)
+}
+
+pub(super) async fn claude_primitive_enable(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name, scope) = kind_name_scope(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_enable_in(&v, db, kind, name, scope).await
+    }
+    .await;
+    respond("claude_primitive_enable", r)
+}
+
+pub(super) async fn claude_primitive_disable(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name, scope) = kind_name_scope(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_disable_in(&v, db, kind, name, scope).await
+    }
+    .await;
+    respond("claude_primitive_disable", r)
+}
+
+pub(super) async fn claude_primitive_remove(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name, scope) = kind_name_scope(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_remove_in(&v, db, kind, name, scope).await
+    }
+    .await;
+    respond("claude_primitive_remove", r)
+}
+
+pub(super) async fn claude_primitive_copy(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name, from, to, overwrite) = copy_args(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_copy_in(&v, db, kind, name, from, to, overwrite).await
+    }
+    .await;
+    respond("claude_primitive_copy", r)
+}
+
+pub(super) async fn claude_primitive_move(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name, from, to, overwrite) = copy_args(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_move_in(&v, db, kind, name, from, to, overwrite).await
+    }
+    .await;
+    respond("claude_primitive_move", r)
+}
+
+pub(super) async fn claude_primitive_enable_for(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (engine, kind, name, scope, hook_file) = engine_args(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_enable_for_in(&v, db, engine, kind, name, scope, hook_file)
+            .await
+    }
+    .await;
+    respond("claude_primitive_enable_for", r)
+}
+
+pub(super) async fn claude_primitive_disable_for(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (engine, kind, name, scope, hook_file) = engine_args(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_disable_for_in(&v, db, engine, kind, name, scope, hook_file)
+            .await
+    }
+    .await;
+    respond("claude_primitive_disable_for", r)
+}
+
+pub(super) async fn claude_primitive_remove_for(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (engine, kind, name, scope, hook_file) = engine_args(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_remove_for_in(&v, db, engine, kind, name, scope, hook_file)
+            .await
+    }
+    .await;
+    respond("claude_primitive_remove_for", r)
+}
+
+pub(super) async fn claude_primitive_copy_batch(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let from_engine: String = targ(args, &["fromEngine", "from_engine"])?;
+        let kind: String = targ(args, &["kind"])?;
+        let name: String = targ(args, &["name"])?;
+        let from_scope: String = targ(args, &["fromScope", "from_scope"])?;
+        let destinations: Vec<claude_store::NgwaCopyDestination> = targ(args, &["destinations"])?;
+        let is_move: bool = targ(args, &["move"])?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::claude_primitive_copy_batch_in(
+            &v,
+            db,
+            from_engine,
+            kind,
+            name,
+            from_scope,
+            destinations,
+            is_move,
+        )
+        .await
+    }
+    .await;
+    respond("claude_primitive_copy_batch", r)
+}
+
+pub(super) async fn oba_dependents(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::oba_dependents_in(&v, db, kind, name).await
+    }
+    .await;
+    respond("oba_dependents", r)
+}
+
+pub(super) async fn oba_safe_delete(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::oba_safe_delete_in(&v, db, kind, name).await
+    }
+    .await;
+    respond("oba_safe_delete", r)
+}
+
+pub(super) async fn oba_relink_dependents(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let dependents: Vec<String> = targ(args, &["dependents"])?;
+        let new_master: String = targ(args, &["newMaster", "new_master"])?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::oba_relink_dependents_in(&v, Some(db), dependents, new_master).await
+    }
+    .await;
+    respond("oba_relink_dependents", r)
+}
+
+pub(super) async fn oba_unlink_one(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::oba_unlink_one_in(&v, Some(db), path).await
+    }
+    .await;
+    respond("oba_unlink_one", r)
+}
+
+pub(super) fn oba_forget(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let (kind, name) = kind_name(args)?;
+        daemon_vault!(state, v);
+        claude_store::oba_forget_in(&v, kind, name)
+    })();
+    respond("oba_forget", r)
+}
+
+pub(super) async fn oba_backfill_registry(state: &AppState) -> RpcResponse {
+    let r = async {
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::oba_backfill_registry_in(&v, db).await
+    }
+    .await;
+    respond("oba_backfill_registry", r)
+}
+
+pub(super) async fn oba_missing_requires(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let db = pa_db(state)?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_missing_requires_in(&v, db, kind, name).await
+    }
+    .await;
+    respond("oba_missing_requires", r)
+}
+
+pub(super) async fn oba_set_auto_update(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let (kind, name) = kind_name(args)?;
+        let enabled: bool = targ(args, &["enabled"])?;
+        daemon_vault!(state, v);
+        claude_store::install::oba_set_auto_update_in(&v, kind, name, enabled).await
+    }
+    .await;
+    respond("oba_set_auto_update", r)
+}
+
+fn kind_name(args: &Value) -> Result<(String, String), String> {
+    Ok((targ(args, &["kind"])?, targ(args, &["name"])?))
+}
+
+fn kind_name_scope(args: &Value) -> Result<(String, String, String), String> {
+    let (kind, name) = kind_name(args)?;
+    Ok((kind, name, targ(args, &["scope"])?))
+}
+
+type CopyArgs = (String, String, String, String, Option<bool>);
+
+fn copy_args(args: &Value) -> Result<CopyArgs, String> {
+    let (kind, name) = kind_name(args)?;
+    Ok((
+        kind,
+        name,
+        targ(args, &["fromScope", "from_scope"])?,
+        targ(args, &["toScope", "to_scope"])?,
+        targ(args, &["overwrite"])?,
+    ))
+}
+
+type EngineArgs = (String, String, String, String, Option<String>);
+
+fn engine_args(args: &Value) -> Result<EngineArgs, String> {
+    let engine: String = targ(args, &["engine"])?;
+    let (kind, name, scope) = kind_name_scope(args)?;
+    Ok((
+        engine,
+        kind,
+        name,
+        scope,
+        targ(args, &["hookFile", "hook_file"])?,
+    ))
+}
+
+/// Router tests for the vault arms above (a file of their own: the fixture is
+/// a whole temp vault — home, store, data dir with a project row).
+#[cfg(test)]
+#[path = "rpc_claude_vault_tests.rs"]
+mod vault_tests;
 
 #[cfg(test)]
 mod tests {
