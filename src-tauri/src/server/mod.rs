@@ -30,7 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::engines::EngineRegistry;
 use crate::pty::PtyManager;
@@ -54,6 +54,10 @@ pub struct ServerConfig {
     pub allowed_origins: Vec<String>,
     /// Idle timeout in seconds before server automatically shuts down when no sessions are active.
     pub idle_timeout_secs: Option<u64>,
+    /// Session-executor tier (`IKENGA_EXECUTOR_TIER` / `--executor-tier`,
+    /// default `t0`). Probed first thing in `run_server`; a tier this build
+    /// can't honour stops the server from starting (DEC-R9-1).
+    pub executor_tier: crate::executor::ExecutorTier,
 }
 
 #[derive(Clone)]
@@ -262,6 +266,26 @@ async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> i
 }
 
 pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
+    // Executor tier first, before anything is created, bound or written: a
+    // tier the host can't honour means this server must not start at all.
+    // Refuse, don't fall back (ADR-023 / DEC-R9-1) — an operator who asked for
+    // per-user isolation and quietly got a shared uid is worse off than one
+    // whose server wouldn't boot.
+    let executor = match crate::executor::install(config.executor_tier) {
+        Ok(caps) => caps,
+        Err(refusal) => {
+            error!(
+                "executor tier {} refused: {refusal}",
+                config.executor_tier
+            );
+            return Err(refusal.into());
+        }
+    };
+    info!(
+        "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
+        executor.tier, executor.pty, executor.piped, executor.principal_isolation
+    );
+
     health::init_uptime();
 
     // Fail closed: an operator who forgets `--auth-token` gets a generated
@@ -447,4 +471,83 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     pty_manager.drain_all();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::{ExecutorTier, Refusal};
+
+    fn config(executor_tier: ExecutorTier) -> ServerConfig {
+        ServerConfig {
+            // Unparseable on purpose: if the executor probe ever stopped
+            // running first, `run_server` would fail on the address instead —
+            // with a non-`Refusal` error, so the test still catches it — and
+            // it could never bind a port or write the daemon discovery file.
+            host: "wp18.invalid".into(),
+            port: 0,
+            static_dir: PathBuf::from("no-spa-here"),
+            pkgs_dir: None,
+            data_dir: None,
+            auth_token: Some("tok".into()),
+            allowed_origins: vec![],
+            idle_timeout_secs: None,
+            executor_tier,
+        }
+    }
+
+    /// DEC-R9-1: a tier this build can't honour stops the server from
+    /// starting, with the typed refusal — it never falls back to T0.
+    #[tokio::test]
+    async fn refuses_to_start_on_an_unimplemented_executor_tier() {
+        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                run_server(config(tier)),
+            )
+            .await
+            .expect("a refusal is immediate, not a running server")
+            .expect_err("an unimplemented tier must not start");
+            assert_eq!(
+                err.downcast_ref::<Refusal>(),
+                Some(&Refusal::NotImplemented { tier }),
+                "expected the typed executor refusal, got: {err:#}"
+            );
+        }
+        assert_eq!(
+            crate::executor::current().tier(),
+            ExecutorTier::T0,
+            "a refused tier must not be installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_executor_tier() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let router = create_router(
+            config(ExecutorTier::T0),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            None,
+            None,
+        );
+        let res = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["executor"]["tier"], "t0");
+        assert_eq!(json["executor"]["principal_isolation"], false);
+    }
 }

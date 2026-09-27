@@ -30,7 +30,7 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(feature = "desktop")]
 use base64::Engine;
 use dashmap::DashMap;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{MasterPty, PtySize};
 use serde::Serialize;
 // The Tauri sink is one of two ways a session's bytes leave this module; the
 // other is the `Custom` callback pair the daemon uses. Only the former needs a
@@ -39,6 +39,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
+
+use crate::executor::SpawnSpec;
 
 const CHUNK_SIZE: usize = 8 * 1024;
 const FLUSH_INTERVAL_MS: u64 = 8; // ≈120 Hz
@@ -503,16 +505,6 @@ impl PtyManager {
             SinkSpec::Custom(data, exit) => (data, exit),
         };
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: opts.rows.max(1),
-                cols: opts.cols.max(1),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("openpty")?;
-
         let resolved_cwd = shellexpand::full(&opts.cwd)
             .map(|c| c.into_owned())
             .unwrap_or(opts.cwd.clone());
@@ -522,11 +514,14 @@ impl PtyManager {
         #[cfg(not(windows))]
         let (exec_bin, exec_args) = (opts.cmd[0].clone(), opts.cmd[1..].to_vec());
 
-        let mut builder = CommandBuilder::new(&exec_bin);
+        // Built as a `SpawnSpec` and handed to the session executor (WP-18).
+        // Every env / cwd / PATH decision below stays HERE; the T0 executor
+        // replays the same `CommandBuilder` calls in the same order.
+        let mut builder = SpawnSpec::new(&exec_bin);
         if !exec_args.is_empty() {
             builder.args(&exec_args);
         }
-        builder.cwd(&resolved_cwd);
+        builder.current_dir(&resolved_cwd);
 
         // Inherit the parent environment so `claude` (and friends installed in
         // user-local bins) resolve.
@@ -598,7 +593,19 @@ impl PtyManager {
         // Shell integration hooks (OSC 133 semantic prompts, WP-08 / T-10)
         shell_integration::inject_shell_integration(&mut builder, &exec_bin, &opts.env);
 
-        let mut child = pair.slave.spawn_command(builder).context("spawn child")?;
+        // `openpty` + `slave.spawn_command`, via the executor. `pair` is bound
+        // whole so the slave handle lives to the end of this function exactly
+        // as it did when `openpty` was called inline.
+        let pair = crate::executor::current().spawn_pty(
+            builder,
+            PtySize {
+                rows: opts.rows.max(1),
+                cols: opts.cols.max(1),
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )?;
+        let mut child = pair.child;
         let child_pid = child.process_id();
         let child_killer = child.clone_killer();
 

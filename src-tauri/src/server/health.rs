@@ -22,6 +22,10 @@ pub struct HealthResponse {
     pub version: &'static str,
     pub status: &'static str,
     pub uptime_secs: u64,
+    /// The session-executor tier every spawn on this server goes through, and
+    /// what it honours (ADR-023, WP-18). Read from the executor actually
+    /// installed, not from config, so it can't claim a tier spawns don't get.
+    pub executor: crate::executor::Capabilities,
 }
 
 pub async fn health_handler() -> impl IntoResponse {
@@ -38,5 +42,6 @@ pub async fn health_handler() -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION"),
         status: "ready",
         uptime_secs: uptime,
+        executor: crate::executor::current().capabilities(),
     })
 }

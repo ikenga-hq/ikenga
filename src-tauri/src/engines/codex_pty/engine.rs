@@ -37,7 +37,6 @@
 //!   turn boundaries, so no timer is needed.
 
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
@@ -47,12 +46,11 @@ use agent_client_protocol::schema::{
 };
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::engines::codex_pty::parser::{parse_event, to_session_updates, ParsedEvent};
-#[cfg(windows)]
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pty::PtyManager;
 
 /// Default codex executable name. Resolved via `$PATH` at spawn time.
@@ -175,6 +173,11 @@ impl CodexPtyEngine {
         // Build the per-turn command. `codex exec` reads the prompt from
         // stdin when given `-` as the positional arg. `--skip-git-repo-check`
         // makes the spawn predictable inside arbitrary project dirs
+        //
+        // Built as a `SpawnSpec` and spawned through the session executor
+        // (WP-18); the T0 executor replays it onto a `tokio::process::Command`
+        // unchanged. No `current_dir`: codex gets its cwd from `--cd`, and the
+        // child inherits the host's working directory as it always has.
         let mut cmd = {
             #[cfg(windows)]
             {
@@ -188,24 +191,19 @@ impl CodexPtyEngine {
                         .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
                         .unwrap_or(false);
                     if is_batch {
-                        let mut c = Command::new("cmd.exe");
+                        let mut c = SpawnSpec::new("cmd.exe");
                         c.arg("/c").arg(p);
-                        c.no_console_window();
                         c
                     } else {
-                        let mut c = Command::new(p);
-                        c.no_console_window();
-                        c
+                        SpawnSpec::new(p)
                     }
                 } else {
-                    let mut c = Command::new(DEFAULT_CODEX_CMD);
-                    c.no_console_window();
-                    c
+                    SpawnSpec::new(DEFAULT_CODEX_CMD)
                 }
             }
             #[cfg(not(windows))]
             {
-                Command::new(DEFAULT_CODEX_CMD)
+                SpawnSpec::new(DEFAULT_CODEX_CMD)
             }
         };
         if let Some(resume) = &resume_id {
@@ -214,16 +212,23 @@ impl CodexPtyEngine {
             cmd.args(["exec", "--json"]);
         }
         cmd.args(["--skip-git-repo-check", "--cd", &cwd, "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
             // Augmented PATH so codex (and any node it shells out to) resolves
             // under nvm/npm/homebrew when the app has a thin GUI $PATH
             // (ADR-013 §Addendum Decision 2).
-            .env("PATH", crate::runtime::augmented_path())
-            .kill_on_drop(true);
+            .env("PATH", crate::runtime::augmented_path());
+        let piped = PipedOpts {
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            // A no-op off Windows, which is what the old `#[cfg(windows)]`-only
+            // call amounted to.
+            no_console_window: true,
+        };
 
-        let mut child = cmd.spawn().map_err(|e| format!("spawn codex exec: {e}"))?;
+        let mut child = crate::executor::current()
+            .spawn_piped(cmd, piped)
+            .map_err(|e| format!("spawn codex exec: {e}"))?;
 
         // Write the prompt to stdin and close it so codex knows the user
         // input is complete.

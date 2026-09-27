@@ -25,7 +25,6 @@
 //! they migrate.
 
 use std::collections::{HashMap, HashSet};
-use std::process::Stdio;
 use std::sync::Arc;
 // Only the unix shutdown path (and tests) use this.
 #[cfg_attr(windows, allow(unused_imports))]
@@ -34,11 +33,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, Mutex};
 
-#[cfg(windows)]
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 use crate::claude::{
     artifact_watcher::ArtifactWatcher, event::ChatEvent, stream_parser::StreamParser,
@@ -515,6 +513,10 @@ pub async fn spawn_streaming(
 
     let opts = session.opts.lock().await.clone();
     let project_dir = session.claude_project_dir.lock().await.clone();
+    // Built as a `SpawnSpec` and spawned through the session executor
+    // (WP-18). Program resolution, args, cwd and env are all decided here,
+    // exactly as before; the T0 executor replays them onto a
+    // `tokio::process::Command` unchanged.
     let mut command = {
         #[cfg(windows)]
         {
@@ -528,24 +530,19 @@ pub async fn spawn_streaming(
                     .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
                     .unwrap_or(false);
                 if is_batch {
-                    let mut cmd = Command::new("cmd.exe");
+                    let mut cmd = SpawnSpec::new("cmd.exe");
                     cmd.arg("/c").arg(p);
-                    cmd.no_console_window();
                     cmd
                 } else {
-                    let mut cmd = Command::new(p);
-                    cmd.no_console_window();
-                    cmd
+                    SpawnSpec::new(p)
                 }
             } else {
-                let mut cmd = Command::new("claude");
-                cmd.no_console_window();
-                cmd
+                SpawnSpec::new("claude")
             }
         }
         #[cfg(not(windows))]
         {
-            Command::new("claude")
+            SpawnSpec::new("claude")
         }
     };
     command
@@ -574,14 +571,18 @@ pub async fn spawn_streaming(
         .arg("stream-json")
         .arg("--verbose")
         .current_dir(&resolved_cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         // Augmented PATH so `claude` (and node it shells out to) resolves
         // under nvm/npm/homebrew even from a thin GUI $PATH (ADR-013 §Addendum
         // Decision 2). Set before the layered project `.env` below so an
         // explicit `PATH=` in a project `.env` still wins.
-        .env("PATH", crate::runtime::augmented_path())
+        .env("PATH", crate::runtime::augmented_path());
+    let piped = PipedOpts {
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        // Windows console-flash suppression; a no-op elsewhere, which is what
+        // the old `#[cfg(windows)]`-only call amounted to.
+        no_console_window: true,
         // Anti-orphan backstop: if the `StreamingChild` is dropped without
         // anyone calling `cancel_streaming` / `kill_all_streaming` (e.g. the
         // process is tearing down), tokio SIGKILLs the child on drop.
@@ -594,7 +595,8 @@ pub async fn spawn_streaming(
         // EOF, which by definition runs after the child's stdout has closed.
         // Keep this flag — removing it would trade a real orphan risk for
         // nothing.
-        .kill_on_drop(true);
+        kill_on_drop: true,
+    };
     // D-13 (`plans/2026-07-18-transcripts-and-terminal-architecture/07-retire-the-overlay.md`):
     // this spawn deliberately sets NO `CLAUDE_CONFIG_DIR` and passes NO
     // `--mcp-config` / `--strict-mcp-config`. The child uses claude's own
@@ -622,7 +624,7 @@ pub async fn spawn_streaming(
     }
     // Phase 7 (projects-first-class): layer workspace + project `.env`
     // files into the claude child env. Process env is already inherited
-    // by `Command::new` so we only add the additive layers — workspace
+    // by the spawned child so we only add the additive layers — workspace
     // first, then project's `.env`, then `.env.local` (last wins). The
     // project root is whatever the session was spawned with (`cwd`),
     // resolved through tilde-expansion above.
@@ -655,8 +657,8 @@ pub async fn spawn_streaming(
             .arg(budget.to_string());
     }
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::executor::current()
+        .spawn_piped(command, piped)
         .map_err(|e| format!("spawn streaming claude: {e}"))?;
     let mut stdin = child
         .stdin
@@ -1133,6 +1135,8 @@ pub async fn cancel_streaming(session: Arc<Session>) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use tokio::process::Command;
 
     #[test]
     fn control_response_envelope_wraps_allow_body() {

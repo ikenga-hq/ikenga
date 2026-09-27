@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{
@@ -17,10 +16,10 @@ use agent_client_protocol::schema::{
 #[cfg(feature = "desktop")]
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex as TokioMutex;
 
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 /// Default antigravity CLI binary name.
 const DEFAULT_AGY_CMD: &str = "agy";
@@ -276,8 +275,10 @@ impl AntigravityEngine {
                 })
                 .unwrap_or_else(|_| PathBuf::from(DEFAULT_AGY_CMD));
 
-        let mut cmd = Command::new(cmd_binary);
-        cmd.no_console_window();
+        // Built as a `SpawnSpec` and spawned through the session executor
+        // (WP-18); the T0 executor replays it onto a `tokio::process::Command`
+        // unchanged.
+        let mut cmd = SpawnSpec::new(cmd_binary);
         cmd.arg("-p")
             .arg(text)
             .arg("--output-format")
@@ -297,17 +298,20 @@ impl AntigravityEngine {
             cmd.arg("--mode").arg(m);
         }
 
-        // The prompt goes in on argv, so the child has no use for stdin.
-        // Leaving it as an open pipe we never write to and never close risks
-        // the CLI blocking forever on a read that can't complete.
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("PATH", crate::runtime::augmented_path())
-            .kill_on_drop(true);
+        cmd.env("PATH", crate::runtime::augmented_path());
+        let piped = PipedOpts {
+            // The prompt goes in on argv, so the child has no use for stdin.
+            // Leaving it as an open pipe we never write to and never close
+            // risks the CLI blocking forever on a read that can't complete.
+            stdin: StdioMode::Null,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            no_console_window: true,
+        };
 
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::executor::current()
+            .spawn_piped(cmd, piped)
             .map_err(|e| format!("spawn antigravity CLI: {e}"))?;
 
         // Drain stderr into a bounded buffer. It is the only place the CLI

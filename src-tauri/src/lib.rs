@@ -17,6 +17,9 @@
 // two #[tauri::command] wrappers and re-exports PaDb.
 pub mod db;
 pub mod engines;
+// `SessionExecutor` + tier probe (ADR-023, WP-18). Headless on purpose: the
+// daemon installs its executor at boot and every in-scope spawn goes through it.
+pub mod executor;
 mod fs_roots;
 // The watcher pool is sink-driven (`fs_watch::FsEventSink`), so nothing in
 // it needs an `AppHandle`. The desktop emit-backed sink is the one piece
