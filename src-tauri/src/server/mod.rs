@@ -12,6 +12,7 @@
 //! explicitly on every protected route rather than left to the browser.
 
 pub mod chat_ws;
+pub mod discovery;
 pub mod fs_ws;
 pub mod health;
 pub mod pkg_static;
@@ -412,19 +413,25 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         info!("token is the configured one; read it from the env file, not from this log");
     }
 
-    // Write daemon discovery metadata file
-    let temp_meta_path = std::env::temp_dir().join("ikenga-daemon.json");
+    // Write daemon discovery metadata files. They carry the bearer token, so
+    // they are owner-only and the temp copy is per user (`discovery.rs`).
+    let temp_meta_path = discovery::user_temp_path();
     let daemon_meta = serde_json::json!({
         "pid": std::process::id(),
         "host": config.host,
         "port": config.port,
         "token": token,
         "version": env!("CARGO_PKG_VERSION"),
-    });
-    let _ = std::fs::write(&temp_meta_path, daemon_meta.to_string());
+    })
+    .to_string();
+    if let Err(e) = discovery::write_private(&temp_meta_path, &daemon_meta) {
+        warn!("could not write discovery file {}: {e}", temp_meta_path.display());
+    }
     let data_dir_meta = config.data_dir.as_ref().map(|d| d.join("daemon.json"));
     if let Some(ref path) = data_dir_meta {
-        let _ = std::fs::write(path, daemon_meta.to_string());
+        if let Err(e) = discovery::write_private(path, &daemon_meta) {
+            warn!("could not write discovery file {}: {e}", path.display());
+        }
     }
 
     let shutdown_signal = {
