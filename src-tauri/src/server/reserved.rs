@@ -15,7 +15,8 @@
 //! every allowlist check, so every arm that resolves a caller path through
 //! the guard — `fs_read` / `fs_write` / `fs_list` / `fs_mkdir` / `fs_exists`,
 //! `fs_kind` / `fs_mime` / `fs_search` / `fs_rename`, the project-root and
-//! claude-config arms, the actions `RootGuard`, `/ws/fs` watches — refuses
+//! claude-config arms, the actions `RootGuard`, the atelier and
+//! `action_git_branch` arms, `/ws/fs` watches — refuses
 //! them. The desktop (`commands::fs` via `resolve_allowlisted`) does not use
 //! this; its `app_data_dir` is its own business.
 //!

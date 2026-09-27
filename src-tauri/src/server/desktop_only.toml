@@ -29,10 +29,6 @@
 tag = "WP-18b"
 reason = "exec() (action_exec.rs) spawns a pinned headless shell command via executor::current().spawn_piped (new_process_group, so the timeout kill_tree reaches the whole group); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
-[action_git_branch]
-tag = "WP-19"
-reason = "git_branch_at reads `.git/HEAD` via std::fs directly, comment states \"no subprocess\"; pure read."
-
 [actions_open_file]
 tag = "desktop-only-forever"
 reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — native open-in-OS-app, same as settings_open_file."
@@ -72,14 +68,6 @@ reason = "Verifies the one global PIN/passphrase (verify_secret) against one sha
 [app_lock_unlock_biometric]
 tag = "WP-20"
 reason = "OS-credential op (biometric_support/OS biometrics) explicitly named under WP-20; also single global state."
-
-[atelier_file_read]
-tag = "WP-19"
-reason = "Plain std::fs::read_to_string under project_root/.atelier; no spawn, similar to fs_read parity."
-
-[atelier_file_write]
-tag = "WP-19"
-reason = "Atomic std::fs write+rename under .atelier; no spawn, fs-parity write."
 
 [backup_export]
 tag = "WP-19"
@@ -287,30 +275,6 @@ reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same
 tag = "desktop-only-forever"
 reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
 
-[pa_actions_commit]
-tag = "WP-19"
-reason = "Flips the row to committed, then fire-and-forget reqwest POST to the local agent-ops daemon (HTTP client, not a spawn)."
-
-[pa_actions_list]
-tag = "WP-19"
-reason = "SELECT over pa_action_drafts by ACTIVE_STATUSES; plain DB read."
-
-[pa_actions_pause]
-tag = "WP-19"
-reason = "Inserts approve-gate draft rows into pa_action_drafts; no spawn, agent-ops style DB write."
-
-[pa_actions_reject]
-tag = "WP-19"
-reason = "UPDATE row to rejected + emits event; plain DB write, no spawn."
-
-[pa_actions_retry]
-tag = "WP-19"
-reason = "Resets a failed draft row's status/attempts; plain DB write."
-
-[pa_actions_update]
-tag = "WP-19"
-reason = "UPDATE edited_json/status on a draft row; plain DB write."
-
 [pin_screenshot_write]
 tag = "WP-19"
 reason = "Decodes an FE-supplied base64 PNG and writes it under app_data_dir/pin-screenshots; no native capture or spawn."
@@ -322,10 +286,6 @@ reason = "Mutates in-memory ActivityBarRegistry badge state + emits an event; da
 [pkg_content_url]
 tag = "WP-19"
 reason = "server.mint(&pkg_id) allocates a token/URL on the desktop pkg_content server; the daemon mounts via pkg_content_html."
-
-[pkg_db_diag]
-tag = "WP-19"
-reason = "Pure sqlx SELECT COUNT/id diagnostics against pkg_installed table; db parity bucket."
 
 [pkg_dev_register]
 tag = "WP-18b"
@@ -378,14 +338,6 @@ reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §
 [pkg_mcp_call]
 tag = "WP-18b"
 reason = "Dispatches to pkg::mcp_runtime::call_tool, which spawns the pkg's MCP server per call; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[pkg_permission_violations_clear]
-tag = "WP-19"
-reason = "Plain sqlx DELETE over pkg_permission_violations; no spawn."
-
-[pkg_permission_violations_list]
-tag = "WP-19"
-reason = "Plain sqlx SELECT over pkg_permission_violations table; no spawn."
 
 [pkg_preview_manifest]
 tag = "WP-19"
