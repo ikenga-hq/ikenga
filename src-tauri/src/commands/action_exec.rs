@@ -874,30 +874,9 @@ pub async fn action_exec(
 }
 
 /// The branch checked out at `root`, read from `.git/HEAD` (no subprocess).
-/// `None` when `root` is not a git work tree or HEAD is detached.
-pub fn git_branch_at(root: &Path) -> Option<String> {
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_dir() {
-        dot_git
-    } else {
-        // A worktree / submodule: `.git` is a file `gitdir: <path>`.
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let target = text
-            .lines()
-            .find_map(|line| line.strip_prefix("gitdir:"))?
-            .trim();
-        let path = PathBuf::from(target);
-        if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        }
-    };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    head.trim()
-        .strip_prefix("ref: refs/heads/")
-        .map(str::to_string)
-}
+/// `None` when `root` is not a git work tree or HEAD is detached. Lives in
+/// `server::shared::git` (WP-19 slice 6), which the daemon serves too.
+pub use crate::server::shared::git::git_branch_at;
 
 /// `{{branch}}` (§8.2): the current git branch at `root`, `null` if none.
 #[tauri::command]

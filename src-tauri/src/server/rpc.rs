@@ -721,6 +721,33 @@ pub async fn rpc_handler(
         "actions_trust_grant" => rpc_files::actions_trust_grant(&state, &payload.args).await,
         "actions_trust_revoke" => rpc_files::actions_trust_revoke(&state, &payload.args).await,
 
+        // --- Approve gate, atelier files, `{{branch}}`, pkg DB audit /
+        //     diagnostics (WP-19 slice 6) ---
+        //
+        // Bodies in `server::rpc_local` (over `server::shared::{pa_actions,
+        // pkg_db}`, the daemon's `ikenga.db`) and `server::rpc_files` (over
+        // `server::shared::{atelier, git}`, every caller root through the fs
+        // allowlist and refused inside the daemon's own state). No
+        // `pa-action-*` events (no event channel). Commit / retry wake the
+        // mutation worker with the hardcoded `mutation:send-worker` only —
+        // `agent_ops_run_now` itself stays allowlisted.
+        "pa_actions_pause" => rpc_local::pa_actions_pause(&state, &payload.args).await,
+        "pa_actions_list" => rpc_local::pa_actions_list(&state, &payload.args).await,
+        "pa_actions_update" => rpc_local::pa_actions_update(&state, &payload.args).await,
+        "pa_actions_commit" => rpc_local::pa_actions_commit(&state, &payload.args).await,
+        "pa_actions_retry" => rpc_local::pa_actions_retry(&state, &payload.args).await,
+        "pa_actions_reject" => rpc_local::pa_actions_reject(&state, &payload.args).await,
+        "pkg_permission_violations_list" => {
+            rpc_local::pkg_permission_violations_list(&state, &payload.args).await
+        }
+        "pkg_permission_violations_clear" => {
+            rpc_local::pkg_permission_violations_clear(&state, &payload.args).await
+        }
+        "pkg_db_diag" => rpc_local::pkg_db_diag(&state).await,
+        "atelier_file_read" => rpc_files::atelier_file_read(&state, &payload.args),
+        "atelier_file_write" => rpc_files::atelier_file_write(&state, &payload.args),
+        "action_git_branch" => rpc_files::action_git_branch(&state, &payload.args).await,
+
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");

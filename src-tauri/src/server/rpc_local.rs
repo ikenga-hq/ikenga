@@ -1,7 +1,8 @@
 //! `/api/rpc` bodies for the local-state commands served in WP-19 slice 2
 //! (Supabase config, env-backed secret names, settings, data health, backup
-//! list/delete and pkg settings) and slice 3 (the chi run-cache reads, the
-//! agent-ops job files, the OS-username fallback).
+//! list/delete and pkg settings), slice 3 (the chi run-cache reads, the
+//! agent-ops job files, the OS-username fallback) and slice 6 (the approve-gate
+//! draft queue, the pkg permission-violation audit, `pkg_db_diag`).
 //!
 //! The arm *names* stay in `rpc.rs`'s dispatch `match` (the parity ratchet
 //! reads them there); the arms delegate here. Every body calls the same core
@@ -29,10 +30,12 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use super::rpc::RpcResponse;
+use super::rpc_shell::targ;
 use super::shared::chi::OutputFiles;
 use super::shared::settings::{SettingsManager, SettingsScope};
 use super::shared::{
-    agent_ops, backups, chi, chi_liveness, data_health, identity, supabase_config,
+    agent_ops, backups, chi, chi_liveness, data_health, identity, pa_actions, pkg_db,
+    supabase_config,
 };
 use super::AppState;
 use crate::db::PaDb;
@@ -396,7 +399,8 @@ pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
 // be the calling principal's home. Each core resolves `{ ok, ... }` exactly
 // as the desktop command does (a missing home is its `io_error`), so these
 // are RPC successes carrying that value. `agent_ops_run_now` is not served
-// (see `desktop_only.toml`).
+// (see `desktop_only.toml`); the approve gate's hardcoded mutation-worker wake
+// below is the only daemon caller of `agent_ops::run_now`.
 
 pub(super) async fn agent_ops_list_jobs(state: &AppState) -> RpcResponse {
     respond(
@@ -455,6 +459,129 @@ pub(super) async fn agent_ops_set_enabled(state: &AppState, args: &Value) -> Rpc
 /// principal's username, not the daemon's.
 pub(super) fn os_username() -> RpcResponse {
     RpcResponse::success(identity::os_username())
+}
+
+// ─── Approve gate + pkg DB audit / diagnostics (WP-19 slice 6) ──────────────
+//
+// Over `server::shared::{pa_actions, pkg_db}` — the cores the desktop commands
+// call — and the daemon's `ikenga.db`; without `--data-dir` each is `NO_DB`.
+//
+// **No events.** After the same writes the desktop emits `pa-action-paused`,
+// `pa-action-committed`, `pa-action-retried` and `pa-action-rejected`. The
+// daemon has no event channel (the web transport's `listen()` is a no-op), so
+// these arms change the same rows and emit nothing; `/outbox/approvals` polls
+// `pa_actions_list`, and the FE invalidates on each call's own result.
+//
+// **The wake.** Commit and retry then wake the mutation worker the way the
+// desktop does: a detached, fire-and-forget POST to the local agent-ops
+// daemon's run-now for `pa_actions::SEND_WORKER_JOB` — the literal, never a
+// caller's id — rooted at the router home (`state.home`, the seam the agent-ops
+// arms use). The RPC answer neither waits on nor depends on it; no home or no
+// `daemon.lock` means no call, and the worker's poll catches up.
+
+/// [`respond`], without doubling a prefix the desktop's error already carries
+/// (`"pa_actions_pause: drafts cannot be empty"`).
+pub(super) fn respond_named<T: serde::Serialize>(
+    cmd: &str,
+    result: Result<T, String>,
+) -> RpcResponse {
+    match result {
+        Err(e) if e.starts_with(&format!("{cmd}: ")) => RpcResponse::error(e),
+        r => respond(cmd, r),
+    }
+}
+
+pub(super) async fn pa_actions_pause(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let batch_id: String = targ(args, &["batchId", "batch_id"])?;
+        let action_id: String = targ(args, &["actionId", "action_id"])?;
+        let drafts: Vec<pa_actions::PaPauseDraftInput> = targ(args, &["drafts"])?;
+        pa_actions::pause(pa_db(state)?, &batch_id, &action_id, &drafts).await
+    }
+    .await;
+    respond_named("pa_actions_pause", r)
+}
+
+pub(super) async fn pa_actions_list(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let status: Option<String> = targ(args, &["status"])?;
+        pa_actions::list(pa_db(state)?, status.as_deref()).await
+    }
+    .await;
+    respond("pa_actions_list", r)
+}
+
+pub(super) async fn pa_actions_update(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let draft_id: String = targ(args, &["draftId", "draft_id"])?;
+        // Tauri's `patch: Value` takes JSON null as a value; read it raw.
+        let patch = args
+            .get("patch")
+            .cloned()
+            .ok_or_else(|| "`patch` is required".to_string())?;
+        pa_actions::update(pa_db(state)?, &draft_id, &patch).await
+    }
+    .await;
+    respond("pa_actions_update", r)
+}
+
+pub(super) async fn pa_actions_commit(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let draft_id: String = targ(args, &["draftId", "draft_id"])?;
+        // The returned row is the desktop's `pa-action-committed` payload;
+        // there is no channel to emit it on here.
+        pa_actions::commit(pa_db(state)?, &draft_id).await?;
+        drop(pa_actions::wake_send_worker(state.home.clone()));
+        Ok(())
+    }
+    .await;
+    respond("pa_actions_commit", r)
+}
+
+pub(super) async fn pa_actions_retry(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let draft_id: String = targ(args, &["draftId", "draft_id"])?;
+        pa_actions::retry(pa_db(state)?, &draft_id).await?;
+        drop(pa_actions::wake_send_worker(state.home.clone()));
+        Ok(())
+    }
+    .await;
+    respond("pa_actions_retry", r)
+}
+
+pub(super) async fn pa_actions_reject(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let draft_id: String = targ(args, &["draftId", "draft_id"])?;
+        pa_actions::reject(pa_db(state)?, &draft_id).await
+    }
+    .await;
+    respond("pa_actions_reject", r)
+}
+
+pub(super) async fn pkg_permission_violations_list(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let pkg_id: Option<String> = targ(args, &["pkgId", "pkg_id"])?;
+        let limit: Option<i64> = targ(args, &["limit"])?;
+        pkg_db::violations_list(pa_db(state)?, pkg_id, limit).await
+    }
+    .await;
+    respond("pkg_permission_violations_list", r)
+}
+
+pub(super) async fn pkg_permission_violations_clear(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let pkg_id: String = targ(args, &["pkgId", "pkg_id"])?;
+        pkg_db::violations_clear(pa_db(state)?, &pkg_id).await
+    }
+    .await;
+    respond("pkg_permission_violations_clear", r)
+}
+
+/// Every field is the daemon's `PaDb`'s — its `ikenga.db` path and that
+/// file's `pkg_installed` — exactly as the desktop fills them from its own.
+pub(super) async fn pkg_db_diag(state: &AppState) -> RpcResponse {
+    let r = async { pkg_db::db_diag(pa_db(state)?).await }.await;
+    respond("pkg_db_diag", r)
 }
 
 #[cfg(test)]
@@ -1720,6 +1847,464 @@ mod tests {
             let name = got.as_str().expect("a string");
             assert!(!name.is_empty());
             assert_eq!(name, identity::os_username());
+        }
+    }
+
+    mod slice6 {
+        //! The approve-gate queue, the pkg violation audit and `pkg_db_diag`
+        //! over `/api/rpc`, against the router's temp `--data-dir`. Nothing
+        //! here reaches the network: the router home has no
+        //! `~/.agent-ops/daemon.lock`, so the commit / retry wake stops at the
+        //! lock read (asserted below through the same helper the arms spawn).
+
+        use super::*;
+        use crate::server::shared::{pa_actions, pkg_db};
+
+        fn draft(id: &str, scheduled_at: Option<&str>) -> Value {
+            json!({
+                "id": id,
+                "channel": "email",
+                "scheduledAt": scheduled_at,
+                "payload": { "subject": format!("s-{id}"), "body": "b" }
+            })
+        }
+
+        async fn status_of(db: &PaDb, id: &str) -> (String, Option<String>, Option<String>) {
+            let pool = db.ensure_pool().await.unwrap();
+            sqlx::query_as(
+                "SELECT status, committed_at, edited_json FROM pa_action_drafts WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+
+        async fn set_status(db: &PaDb, id: &str, status: &str) {
+            let pool = db.ensure_pool().await.unwrap();
+            sqlx::query(
+                "UPDATE pa_action_drafts SET status = ?, claimed_at = 'x', error_text = 'boom' \
+                 WHERE id = ?",
+            )
+            .bind(status)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        /// The rows' ids, sorted: `created_at` has one-second resolution, so
+        /// rows paused in the same second have no defined order.
+        fn ids(rows: &Value) -> Vec<String> {
+            let mut ids: Vec<String> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        #[tokio::test]
+        async fn every_arm_without_data_dir_is_no_db() {
+            let r = bare(None);
+            for (cmd, args) in [
+                (
+                    "pa_actions_pause",
+                    json!({ "batchId": "b", "actionId": "a", "drafts": [draft("d", None)] }),
+                ),
+                ("pa_actions_list", json!({})),
+                ("pa_actions_update", json!({ "draftId": "d", "patch": {} })),
+                ("pa_actions_commit", json!({ "draftId": "d" })),
+                ("pa_actions_retry", json!({ "draftId": "d" })),
+                ("pa_actions_reject", json!({ "draftId": "d" })),
+                ("pkg_permission_violations_list", json!({})),
+                ("pkg_permission_violations_clear", json!({ "pkgId": "p" })),
+                ("pkg_db_diag", json!({})),
+            ] {
+                let e = err(&r, cmd, args).await;
+                assert_eq!(e, format!("{cmd}: {}", crate::server::rpc::NO_DB), "{cmd}");
+            }
+        }
+
+        /// pause → list → update → commit, and reject, in the desktop shape.
+        #[tokio::test]
+        async fn the_gate_lifecycle_matches_the_desktop() {
+            let d = daemon();
+            let r = &d.router;
+            let n = ok(
+                r,
+                "pa_actions_pause",
+                json!({
+                    "batchId": "b1",
+                    "actionId": "mail.send",
+                    "drafts": [draft("d1", Some("2026-06-09T07:00:00+01:00")), draft("d2", None)]
+                }),
+            )
+            .await;
+            assert_eq!(n, 2);
+            // The snake_case spelling lands too.
+            let n = ok(
+                r,
+                "pa_actions_pause",
+                json!({ "batch_id": "b2", "action_id": "mail.send", "drafts": [draft("d3", None)] }),
+            )
+            .await;
+            assert_eq!(n, 1);
+
+            let listed = ok(r, "pa_actions_list", json!({})).await;
+            assert_eq!(ids(&listed), ["d1", "d2", "d3"]);
+            let d1 = listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "d1")
+                .unwrap();
+            assert_eq!(d1["batchId"], "b1");
+            assert_eq!(d1["actionId"], "mail.send");
+            assert_eq!(d1["status"], "awaiting");
+            assert_eq!(d1["attempts"], 0);
+            // Normalised to SQLite UTC at pause time (DEC-10).
+            assert_eq!(d1["scheduledAt"], "2026-06-09 06:00:00");
+            let payload: Value = serde_json::from_str(d1["payloadJson"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["subject"], "s-d1");
+            // Shape parity: the core the desktop command calls, same db.
+            let direct = pa_actions::list(&d.db, None).await.unwrap();
+            assert_eq!(listed, serde_json::to_value(&direct).unwrap());
+            assert_eq!(
+                ok(r, "pa_actions_list", json!({ "status": null })).await,
+                listed
+            );
+
+            // update: awaiting → edited, edits stored verbatim.
+            let patch = json!({ "subject": "better" });
+            assert_eq!(
+                ok(
+                    r,
+                    "pa_actions_update",
+                    json!({ "draftId": "d1", "patch": patch })
+                )
+                .await,
+                Value::Null
+            );
+            let (status, _, edited) = status_of(&d.db, "d1").await;
+            assert_eq!(status, "edited");
+            assert_eq!(edited.as_deref(), Some(r#"{"subject":"better"}"#));
+            ok(
+                r,
+                "pa_actions_update",
+                json!({ "draft_id": "d1", "patch": { "body": "b2" } }),
+            )
+            .await;
+            assert_eq!(status_of(&d.db, "d1").await.0, "edited");
+
+            // commit (both spellings), the DB transition is the desktop's.
+            assert_eq!(
+                ok(r, "pa_actions_commit", json!({ "draftId": "d1" })).await,
+                Value::Null
+            );
+            let (status, committed_at, _) = status_of(&d.db, "d1").await;
+            assert_eq!(status, "committed");
+            assert!(committed_at.is_some());
+            ok(r, "pa_actions_commit", json!({ "draft_id": "d2" })).await;
+            assert_eq!(status_of(&d.db, "d2").await.0, "committed");
+
+            // reject (both spellings); rejected rows leave the default list.
+            ok(r, "pa_actions_reject", json!({ "draftId": "d3" })).await;
+            ok(r, "pa_actions_reject", json!({ "draft_id": "d2" })).await;
+            assert_eq!(ids(&ok(r, "pa_actions_list", json!({})).await), ["d1"]);
+            let rejected = ok(r, "pa_actions_list", json!({ "status": "rejected" })).await;
+            assert_eq!(ids(&rejected), ["d2", "d3"]);
+            let direct = pa_actions::list(&d.db, Some("rejected")).await.unwrap();
+            assert_eq!(rejected, serde_json::to_value(&direct).unwrap());
+
+            // The wake the commit spawned: no lock under the router home, so
+            // it stopped at the lock read — no POST was attempted.
+            let wake = pa_actions::wake_send_worker(Some(d.home.clone()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(wake["code"], "daemon_down");
+            assert!(
+                wake["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("read daemon.lock"),
+                "{wake}"
+            );
+            assert!(!d.home.join(".agent-ops").exists());
+        }
+
+        #[tokio::test]
+        async fn retry_requeues_only_a_failed_row() {
+            let d = daemon();
+            let r = &d.router;
+            ok(
+                r,
+                "pa_actions_pause",
+                json!({ "batchId": "b", "actionId": "a", "drafts": [draft("f", None)] }),
+            )
+            .await;
+            let e = err(r, "pa_actions_retry", json!({ "draftId": "f" })).await;
+            assert_eq!(
+                e,
+                "pa_actions_retry: draft f not found or not in failed state"
+            );
+
+            set_status(&d.db, "f", "failed").await;
+            assert_eq!(
+                ok(r, "pa_actions_retry", json!({ "draftId": "f" })).await,
+                Value::Null
+            );
+            let row = &ok(r, "pa_actions_list", json!({})).await[0];
+            assert_eq!(row["status"], "committed");
+            assert_eq!(row["claimedAt"], Value::Null);
+            assert_eq!(row["errorText"], Value::Null);
+            assert!(row["committedAt"].is_string());
+
+            set_status(&d.db, "f", "failed").await;
+            ok(r, "pa_actions_retry", json!({ "draft_id": "f" })).await;
+            assert_eq!(status_of(&d.db, "f").await.0, "committed");
+            // Failed rows can be rejected too (the desktop's clause).
+            set_status(&d.db, "f", "failed").await;
+            ok(r, "pa_actions_reject", json!({ "draftId": "f" })).await;
+            assert_eq!(status_of(&d.db, "f").await.0, "rejected");
+        }
+
+        /// Each command's status guard answers exactly as the desktop's.
+        #[tokio::test]
+        async fn the_status_guards_are_the_desktops() {
+            let d = daemon();
+            let r = &d.router;
+            ok(
+                r,
+                "pa_actions_pause",
+                json!({ "batchId": "b", "actionId": "a", "drafts": [
+                    draft("rej", None), draft("com", None), draft("snd", None)
+                ] }),
+            )
+            .await;
+            ok(r, "pa_actions_reject", json!({ "draftId": "rej" })).await;
+            ok(r, "pa_actions_commit", json!({ "draftId": "com" })).await;
+            set_status(&d.db, "snd", "sending").await;
+
+            for (cmd, id, why) in [
+                ("pa_actions_commit", "rej", "not found or not committable"),
+                ("pa_actions_commit", "com", "not found or not committable"),
+                ("pa_actions_commit", "snd", "not found or not committable"),
+                ("pa_actions_update", "rej", "not found or not editable"),
+                ("pa_actions_update", "com", "not found or not editable"),
+                (
+                    "pa_actions_retry",
+                    "rej",
+                    "not found or not in failed state",
+                ),
+                (
+                    "pa_actions_retry",
+                    "com",
+                    "not found or not in failed state",
+                ),
+                ("pa_actions_reject", "rej", "not found or already terminal"),
+                ("pa_actions_reject", "snd", "not found or already terminal"),
+                // Unknown ids: the same desktop errors.
+                ("pa_actions_commit", "nope", "not found or not committable"),
+                ("pa_actions_update", "nope", "not found or not editable"),
+                (
+                    "pa_actions_retry",
+                    "nope",
+                    "not found or not in failed state",
+                ),
+                ("pa_actions_reject", "nope", "not found or already terminal"),
+            ] {
+                let e = err(r, cmd, json!({ "draftId": id, "patch": {} })).await;
+                assert_eq!(e, format!("{cmd}: draft {id} {why}"), "{cmd} {id}");
+            }
+            // Nothing moved.
+            assert_eq!(status_of(&d.db, "rej").await.0, "rejected");
+            assert_eq!(status_of(&d.db, "com").await.0, "committed");
+            assert_eq!(status_of(&d.db, "snd").await.0, "sending");
+            // A committed row is still rejectable (the worker has not claimed it).
+            ok(r, "pa_actions_reject", json!({ "draftId": "com" })).await;
+            assert_eq!(status_of(&d.db, "com").await.0, "rejected");
+        }
+
+        #[tokio::test]
+        async fn pause_refusals_are_the_desktops_and_atomic() {
+            let d = daemon();
+            let r = &d.router;
+            // The desktop's own string, not "pa_actions_pause: pa_actions_pause: …".
+            let e = err(
+                r,
+                "pa_actions_pause",
+                json!({ "batchId": "b", "actionId": "a", "drafts": [] }),
+            )
+            .await;
+            assert_eq!(e, "pa_actions_pause: drafts cannot be empty");
+            // A duplicate id fails the insert and rolls the whole batch back.
+            let e = err(
+                r,
+                "pa_actions_pause",
+                json!({ "batchId": "b", "actionId": "a", "drafts": [draft("x", None), draft("x", None)] }),
+            )
+            .await;
+            assert!(e.starts_with("pa_actions_pause: insert draft x: "), "{e}");
+            assert_eq!(ok(r, "pa_actions_list", json!({})).await, json!([]));
+
+            let e = err(
+                r,
+                "pa_actions_pause",
+                json!({ "actionId": "a", "drafts": [] }),
+            )
+            .await;
+            assert!(e.contains("`batchId` is required"), "{e}");
+            let e = err(
+                r,
+                "pa_actions_pause",
+                json!({ "batchId": "b", "actionId": "a", "drafts": [{ "id": "y" }] }),
+            )
+            .await;
+            assert!(e.contains("invalid `drafts`"), "{e}");
+            let e = err(r, "pa_actions_update", json!({ "draftId": "x" })).await;
+            assert!(e.contains("`patch` is required"), "{e}");
+            let e = err(r, "pa_actions_commit", json!({})).await;
+            assert!(e.contains("`draftId` is required"), "{e}");
+        }
+
+        // ── pkg permission violations / pkg_db_diag ─────────────────────────
+
+        async fn violation(db: &PaDb, pkg: &str, attempted: &str, at: i64) {
+            let pool = db.ensure_pool().await.unwrap();
+            sqlx::query(
+                "INSERT INTO pkg_permission_violations
+                 (pkg_id, scope_kind, attempted, declared, occurred_at)
+                 VALUES (?, 'shell.execute', ?, 'git', ?)",
+            )
+            .bind(pkg)
+            .bind(attempted)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn violations_list_and_clear_in_the_desktop_shape() {
+            let d = daemon();
+            let r = &d.router;
+            assert_eq!(
+                ok(r, "pkg_permission_violations_list", json!({})).await,
+                json!([])
+            );
+            violation(&d.db, "p1", "a", 1).await;
+            violation(&d.db, "p2", "b", 2).await;
+            violation(&d.db, "p1", "c", 3).await;
+
+            let all = ok(
+                r,
+                "pkg_permission_violations_list",
+                json!({ "pkgId": null, "limit": null }),
+            )
+            .await;
+            let attempted: Vec<&str> = all
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["attempted"].as_str().unwrap())
+                .collect();
+            assert_eq!(attempted, ["c", "b", "a"], "newest first");
+            assert_eq!(all[0]["pkg_id"], "p1");
+            assert_eq!(all[0]["scope_kind"], "shell.execute");
+            let direct = pkg_db::violations_list(&d.db, None, None).await.unwrap();
+            assert_eq!(all, serde_json::to_value(&direct).unwrap());
+
+            let camel = ok(
+                r,
+                "pkg_permission_violations_list",
+                json!({ "pkgId": "p1", "limit": 1 }),
+            )
+            .await;
+            let snake = ok(
+                r,
+                "pkg_permission_violations_list",
+                json!({ "pkg_id": "p1", "limit": 1 }),
+            )
+            .await;
+            assert_eq!(camel, snake);
+            assert_eq!(camel.as_array().unwrap().len(), 1);
+            assert_eq!(camel[0]["attempted"], "c");
+            // The desktop's clamp: 0 → 1.
+            let clamped = ok(r, "pkg_permission_violations_list", json!({ "limit": 0 })).await;
+            assert_eq!(clamped.as_array().unwrap().len(), 1);
+            let e = err(r, "pkg_permission_violations_list", json!({ "limit": 1.5 })).await;
+            assert!(e.contains("invalid `limit`"), "{e}");
+
+            // Unknown pkg: 0 deleted — the desktop's answer, not an error.
+            assert_eq!(
+                ok(
+                    r,
+                    "pkg_permission_violations_clear",
+                    json!({ "pkgId": "nope" })
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                ok(
+                    r,
+                    "pkg_permission_violations_clear",
+                    json!({ "pkgId": "p1" })
+                )
+                .await,
+                2
+            );
+            assert_eq!(
+                ok(
+                    r,
+                    "pkg_permission_violations_clear",
+                    json!({ "pkg_id": "p2" })
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                ok(r, "pkg_permission_violations_list", json!({})).await,
+                json!([])
+            );
+            let e = err(r, "pkg_permission_violations_clear", json!({})).await;
+            assert!(e.contains("`pkgId` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn pkg_db_diag_reports_the_daemons_own_db() {
+            let d = daemon();
+            let r = &d.router;
+            let empty = ok(r, "pkg_db_diag", json!({})).await;
+            assert_eq!(
+                empty,
+                json!({
+                    "db_path": d.data.join("ikenga.db").display().to_string(),
+                    "pkg_installed_count": 0,
+                    "ids": [],
+                })
+            );
+            let pool = d.db.ensure_pool().await.unwrap();
+            for id in ["com.b", "com.a"] {
+                sqlx::query(
+                    "INSERT INTO pkg_installed
+                     (id, version, ikenga_api, manifest_json, install_path, installed_at)
+                     VALUES (?, '1.0.0', '1', '{}', '/x', 0)",
+                )
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let diag = ok(r, "pkg_db_diag", json!({})).await;
+            assert_eq!(diag["pkg_installed_count"], 2);
+            assert_eq!(diag["ids"], json!(["com.a", "com.b"]));
+            let direct = pkg_db::db_diag(&d.db).await.unwrap();
+            assert_eq!(diag, serde_json::to_value(&direct).unwrap());
         }
     }
 }

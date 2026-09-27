@@ -7,10 +7,13 @@
 //! (`<home>/.atelier/skill-agent-ops/jobs.json`), the agent-ops daemon's
 //! `<home>/.agent-ops/daemon.lock` and per-run tail files
 //! (`<home>/.agent-ops/runs/`), and its runtime state file (see
-//! [`jobs_state_path`]). None of it spawns, signals or talks to the agent-ops
-//! daemon — `agent_ops_run_now`, which POSTs to that daemon, stays in
-//! `commands::agent_ops` and is not served (its job-id rule,
-//! [`trigger_path_segment`], lives here next to the `tail_run` one it builds on).
+//! [`jobs_state_path`]). None of it spawns or signals the agent-ops daemon;
+//! [`run_now`] is the one thing here that talks to it (a loopback POST of the
+//! lock's secret to its run-now endpoint). The desktop's `agent_ops_run_now`
+//! command delegates to it with a caller-chosen job id; the daemon does NOT
+//! serve that verb (it would let any token holder fire any host job) and
+//! calls `run_now` only for the approve gate's hardcoded mutation-worker wake
+//! (`shared::pa_actions::wake_send_worker`, WP-19 slice 6).
 //!
 //! The desktop passes `platform::home_dir()`. The headless daemon passes its
 //! router's home seam (`server::router_with_home`), which is the daemon
@@ -78,7 +81,6 @@ fn marker_file_name(job_id: &str) -> Option<String> {
 /// daemon's trigger URL: everything except RFC 3986 unreserved (`A-Z a-z 0-9
 /// - . _ ~`) and `:` (a legal `pchar`, and the `ns:name` separator real ids
 /// use — left literal so a valid id's URL is byte-identical to before).
-#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 const TRIGGER_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
@@ -97,7 +99,6 @@ const TRIGGER_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPH
 /// (no pre-encoded ids: `%2e%2e` / `%2f` would be decoded by the daemon's
 /// router), and any control character. What is left is percent-encoded
 /// (non-ASCII as its UTF-8 bytes) so nothing in it can act as a delimiter.
-#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) fn trigger_path_segment(job_id: &str) -> Result<String, &'static str> {
     if job_id == "." || job_id == ".." {
         return Err("job id is a dot segment");
@@ -139,11 +140,8 @@ fn jobs_state_path(home_dir: Option<&Path>) -> Result<PathBuf, String> {
 #[derive(Deserialize)]
 pub(crate) struct DaemonLock {
     pub(crate) pid: u32,
-    /// `port` / `secret` are read only by the desktop's `agent_ops_run_now`
-    /// (not served), so the daemon build never reads them.
-    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+    /// `port` / `secret` are read only by [`run_now`].
     pub(crate) port: u16,
-    #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     pub(crate) secret: String,
 }
 
@@ -179,6 +177,82 @@ pub(crate) fn err_value(code: &str, status: Option<u16>, error: impl Into<String
         "status": status,
         "error": error.into(),
     })
+}
+
+// ─── run-now ─────────────────────────────────────────────────────────────────
+
+/// POST the agent-ops daemon's localhost trigger endpoint to fire an
+/// out-of-schedule run of `job_id`, with the `{ port, secret }` from
+/// `<home>/.agent-ops/daemon.lock`. Always resolves `Ok(Value)` carrying a
+/// `{ ok, ... }` payload (incl. typed `code` on failure) so the FE always has
+/// a structured result to render; only a genuinely unexpected internal error
+/// returns `Err`.
+///
+/// The body of the desktop's `agent_ops_run_now` (which passes
+/// `platform::home_dir()`), moved here unchanged in WP-19 slice 6 so the
+/// daemon's approve-gate arms can wake the mutation worker rooted at the
+/// router home. The daemon never passes a caller-supplied `job_id`.
+pub(crate) async fn run_now(home_dir: Option<&Path>, job_id: &str) -> Result<Value, String> {
+    // SECURITY: the id becomes a path segment of a POST that carries the
+    // daemon's secret. Validate + encode it before reading the lock or touching
+    // the network, so a crafted id (`../x`, `a?b`, `%2e%2e`, …) can never steer
+    // the secret-bearing request to another path.
+    let segment = match trigger_path_segment(job_id) {
+        Ok(s) => s,
+        Err(why) => return Ok(err_value("error", None, format!("invalid job id: {why}"))),
+    };
+
+    let lock = match read_daemon_lock(home_dir).await {
+        Ok(l) => l,
+        Err(e) => return Ok(err_value("daemon_down", None, e)),
+    };
+
+    let url = format!("http://127.0.0.1:{}/jobs/{}/trigger", lock.port, segment);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        // Auth secret (timing-safe compared on the daemon).
+        .header("x-agent-ops-token", &lock.secret)
+        // Non-CORS-safelisted presence header — the daemon's DNS-rebinding
+        // defense (rejects any request lacking it with 403). Value is ignored.
+        .header("x-agent-ops-trigger", "1")
+        .header("content-type", "application/json")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(r) => r,
+        // Connection refused / timeout → daemon not actually listening.
+        Err(e) => {
+            return Ok(err_value(
+                "daemon_down",
+                None,
+                format!("trigger POST failed: {e}"),
+            ))
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let message = parsed
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| body.clone());
+
+    if (200..300).contains(&status) {
+        return Ok(json!({ "ok": true, "status": status, "message": message }));
+    }
+    let code = match status {
+        401 => "unauthorized",
+        403 | 405 => "forbidden",
+        404 => "not_found",
+        409 => "disabled",
+        _ => "error",
+    };
+    Ok(err_value(code, Some(status), message))
 }
 
 // ─── set-enabled ─────────────────────────────────────────────────────────────

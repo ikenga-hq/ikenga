@@ -26,15 +26,16 @@
 //! error occurs. The caller (FE) is responsible for parsing and validation; an
 //! absent or malformed file causes the consuming pkg to fall back to its static
 //! defaults.
+//!
+//! WP-19 slice 6: the bodies live in `server::shared::atelier` (as
+//! `Reach::Follow`, byte-identical to before), which the headless daemon
+//! serves too — confined there to its fs allowlist and the canonical root,
+//! since a remote caller's `project_root` has no such provenance.
 
-use std::path::PathBuf;
+use crate::server::shared::atelier::{self, Reach};
 
-/// A single path segment (`skill` or `file`) is safe iff it is non-empty and
-/// contains no path separator or `..` traversal sequence. Normal filenames with
-/// dots (`roster.json`) are allowed; only traversal is blocked.
-fn is_safe_segment(seg: &str) -> bool {
-    !seg.is_empty() && !seg.contains('/') && !seg.contains('\\') && !seg.contains("..")
-}
+#[cfg(test)]
+use crate::server::shared::atelier::is_safe_segment;
 
 /// Read `<project_root>/.atelier/<skill>/<file>`.
 ///
@@ -48,36 +49,9 @@ pub async fn atelier_file_read(
     skill: String,
     file: String,
 ) -> Option<String> {
-    let root = project_root.as_deref().filter(|s| !s.is_empty())?;
-    if !is_safe_segment(&skill) || !is_safe_segment(&file) {
-        tracing::warn!(
-            skill = %skill,
-            file = %file,
-            "atelier_file_read: rejected unsafe path segment"
-        );
-        return None;
-    }
-    let path = PathBuf::from(root).join(".atelier").join(&skill).join(&file);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => Some(contents),
-        Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                // Log unexpected errors (permissions, etc.) but still return
-                // None — the FE static fallback handles it gracefully.
-                tracing::debug!(
-                    path = %path.display(),
-                    error = %e,
-                    "atelier_file_read: could not read file"
-                );
-            }
-            None
-        }
-    }
+    // `Reach::Follow` never errs: every failure is already `Ok(None)`.
+    atelier::read(project_root.as_deref(), &skill, &file, Reach::Follow).unwrap_or(None)
 }
-
-/// Monotonic sequence appended to temp filenames so two concurrent writes to
-/// the same target from this process never collide on the temp path.
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Atomically write `<project_root>/.atelier/<skill>/<file>` with `content`.
 ///
@@ -109,43 +83,14 @@ pub async fn atelier_file_write(
     file: String,
     content: String,
 ) -> Result<String, String> {
-    let root = project_root
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "atelier_file_write: no project root configured".to_string())?;
-    if !is_safe_segment(&skill) || !is_safe_segment(&file) {
-        tracing::warn!(
-            skill = %skill,
-            file = %file,
-            "atelier_file_write: rejected unsafe path segment"
-        );
-        return Err(format!(
-            "atelier_file_write: unsafe path segment (skill={skill:?}, file={file:?})"
-        ));
-    }
-    let dir = PathBuf::from(root).join(".atelier").join(&skill);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("atelier_file_write: could not create {}: {e}", dir.display()))?;
-    let path = dir.join(&file);
-
-    // Atomic commit: write to a hidden, uniquely-named sibling then rename over
-    // the target. `.file.tmp-<pid>-<seq>` is itself a plain filename (no
-    // separators — `file` already passed is_safe_segment), so it stays inside
-    // the locked directory.
-    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{file}.tmp-{}-{seq}", std::process::id()));
-    std::fs::write(&tmp, content.as_bytes())
-        .map_err(|e| format!("atelier_file_write: could not write temp file: {e}"))?;
-    match std::fs::rename(&tmp, &path) {
-        Ok(()) => Ok(path.to_string_lossy().into_owned()),
-        Err(e) => {
-            // Best-effort cleanup so a failed commit doesn't litter the dir.
-            let _ = std::fs::remove_file(&tmp);
-            Err(format!("atelier_file_write: could not commit write: {e}"))
-        }
-    }
+    atelier::write(
+        project_root.as_deref(),
+        &skill,
+        &file,
+        &content,
+        Reach::Follow,
+    )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

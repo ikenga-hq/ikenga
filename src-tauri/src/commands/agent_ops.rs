@@ -20,12 +20,13 @@
 //!
 //! WP-19 slice 3: every command but run-now is a thin wrapper over
 //! `server::shared::agent_ops`, which the headless daemon serves too, rooted
-//! at `platform::home_dir()` here.
+//! at `platform::home_dir()` here. Slice 6 moved run-now's body there too
+//! (`agent_ops::run_now`), so the daemon's approve-gate arms can wake the
+//! mutation worker; the `agent_ops_run_now` verb itself stays desktop-only.
 
-use serde_json::{json, Value};
-use std::time::Duration;
+use serde_json::Value;
 
-use crate::server::shared::agent_ops::{self, err_value, read_daemon_lock};
+use crate::server::shared::agent_ops;
 
 // ─── run-now ─────────────────────────────────────────────────────────────────
 
@@ -35,66 +36,7 @@ use crate::server::shared::agent_ops::{self, err_value, read_daemon_lock};
 /// a genuinely unexpected internal error returns `Err`.
 #[tauri::command]
 pub async fn agent_ops_run_now(job_id: String) -> Result<Value, String> {
-    // SECURITY: the id becomes a path segment of a POST that carries the
-    // daemon's secret. Validate + encode it before reading the lock or touching
-    // the network, so a crafted id (`../x`, `a?b`, `%2e%2e`, …) can never steer
-    // the secret-bearing request to another path.
-    let segment = match agent_ops::trigger_path_segment(&job_id) {
-        Ok(s) => s,
-        Err(why) => return Ok(err_value("error", None, format!("invalid job id: {why}"))),
-    };
-
-    let lock = match read_daemon_lock(crate::platform::home_dir().as_deref()).await {
-        Ok(l) => l,
-        Err(e) => return Ok(err_value("daemon_down", None, e)),
-    };
-
-    let url = format!("http://127.0.0.1:{}/jobs/{}/trigger", lock.port, segment);
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        // Auth secret (timing-safe compared on the daemon).
-        .header("x-agent-ops-token", &lock.secret)
-        // Non-CORS-safelisted presence header — the daemon's DNS-rebinding
-        // defense (rejects any request lacking it with 403). Value is ignored.
-        .header("x-agent-ops-trigger", "1")
-        .header("content-type", "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-
-    let resp = match resp {
-        Ok(r) => r,
-        // Connection refused / timeout → daemon not actually listening.
-        Err(e) => {
-            return Ok(err_value(
-                "daemon_down",
-                None,
-                format!("trigger POST failed: {e}"),
-            ))
-        }
-    };
-
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-    let message = parsed
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| body.clone());
-
-    if (200..300).contains(&status) {
-        return Ok(json!({ "ok": true, "status": status, "message": message }));
-    }
-    let code = match status {
-        401 => "unauthorized",
-        403 | 405 => "forbidden",
-        404 => "not_found",
-        409 => "disabled",
-        _ => "error",
-    };
-    Ok(err_value(code, Some(status), message))
+    agent_ops::run_now(crate::platform::home_dir().as_deref(), &job_id).await
 }
 
 // ─── config + tail (shared with the daemon) ──────────────────────────────────
