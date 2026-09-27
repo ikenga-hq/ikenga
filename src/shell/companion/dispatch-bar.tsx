@@ -9,7 +9,8 @@ import { resolveHostedKeypress } from '@/lib/keymap/dispatcher';
 import { labelFor } from '@/lib/keymap/registry';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useCompanionStore } from './companion-store';
-import { currentDispatchContext, resolveTarget } from './resolve-target';
+import { currentDispatchContext, resolveTarget, targetEngineId } from './resolve-target';
+import { SeatNoticeHost } from './seat-notice-host';
 import { TargetPicker } from './target-picker';
 
 /** Below this, a send shows no loading state at all (spec §1.2: no flash). */
@@ -19,7 +20,16 @@ const LOADING_DELAY_MS = 150;
 const recall = new Map<string, string[]>();
 
 function targetKey(t: CompanionTarget): string {
-	return t.kind === 'session' ? `session:${t.session_id}` : `${t.kind}:${t.engine_id ?? ''}`;
+	switch (t.kind) {
+		case 'session':
+			return `session:${t.session_id}`;
+		// G-SEATS §9.1: keyed by seat, so recall survives a change of session.
+		case 'seat':
+			return `seat:${t.seat_id}`;
+		case 'new':
+		case 'persistent':
+			return `${t.kind}:${t.engine_id ?? ''}`;
+	}
 }
 
 /** Hosted command → dispatch mode (§4.6). */
@@ -65,7 +75,7 @@ export function DispatchBar() {
 	async function dispatch(mode: 'target' | 'new' | 'persistent') {
 		const text = draft.trim();
 		if (!text || busy) return;
-		const engineId = target.kind === 'session' ? null : target.engine_id;
+		const engineId = targetEngineId(target);
 		const effective: CompanionTarget =
 			mode === 'target'
 				? target
@@ -183,6 +193,7 @@ export function DispatchBar() {
 					{error}
 				</p>
 			)}
+			<SeatNoticeHost />
 		</div>
 	);
 }

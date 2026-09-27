@@ -99,6 +99,10 @@ export type RunRefusalReason =
 	| 'bang-prompt'
 	/** A PTY inject into a terminal with a pending permission request. */
 	| 'permission-pending'
+	/** G-SEATS §9.1: a `seat` target names no seat. */
+	| 'no-seat'
+	/** G-SEATS §9.1: another client holds the seat (or took it over). */
+	| 'seat-held'
 	/** A package action of a kind other than `chi` / `skill`. */
 	| 'package-kind'
 	/** Windows: a value the command names holds a `cmd.exe` metacharacter. */
@@ -370,6 +374,9 @@ export async function runAction(action: RunnableAction | UserAction, ctx: RunCon
 						ptyPrompt,
 						target: run.target,
 						...(run.engineId ? { engineId: run.engineId } : {}),
+						...(run.seat ? { seat: run.seat } : {}),
+						// A project action's bare seat name resolves in its own project.
+						...(run.target === 'seat' && action.scope === 'project' ? { projectId } : {}),
 						scope: action.scope,
 					});
 					return { status: 'done', kind: run.kind, testRun, runId: sent.runId, via: sent.via };

@@ -11,10 +11,21 @@ export const ACTIONS_CHANGED_EVENT = 'actions://changed';
 
 // --- actions.json (§1.2–§1.4, §8.1) ------------------------------------------
 
-export type ChiTarget = 'active' | 'new' | 'engine';
+/** G-SEATS §9.1 (G-ACTIONS §8.1, amended additively in Round 46): `seat`
+ *  addresses a Chi seat by name. */
+export type ChiTarget = 'active' | 'new' | 'engine' | 'seat';
 
 export type ActionRun =
-	| { kind: 'chi'; target: ChiTarget; engineId?: string; prompt: string }
+	| {
+			kind: 'chi';
+			target: ChiTarget;
+			/** Required iff `target === 'engine'`. */
+			engineId?: string;
+			/** Required iff `target === 'seat'`: `<name>` (in the active project;
+			 *  a project action's own project) or `<project>/<name>`. */
+			seat?: string;
+			prompt: string;
+	  }
 	| { kind: 'shell'; command: string; cwd?: string; confirm?: boolean }
 	| { kind: 'iyke'; route: string; method?: 'GET' | 'POST' }
 	| { kind: 'skill'; skill: string }
