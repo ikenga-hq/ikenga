@@ -225,6 +225,7 @@ impl CodexPtyEngine {
             // call amounted to.
             no_console_window: true,
             detached: false,
+            new_process_group: false,
         };
 
         let mut child = crate::executor::current()

@@ -530,7 +530,7 @@ pub fn resolve_grant(presented: &str) -> Option<Grant> {
 ///
 /// No-op when the bridge URL isn't published yet; the pkg then sees no
 /// accessor, which is exactly the pre-WP-23 behaviour.
-pub fn inject_env(cmd: &mut tokio::process::Command, pkg_id: &str, install_path: &Path) {
+pub fn inject_env(cmd: &mut crate::executor::SpawnSpec, pkg_id: &str, install_path: &Path) {
     let Some(url) = bridge_url() else {
         return;
     };

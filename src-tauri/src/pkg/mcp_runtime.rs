@@ -20,18 +20,16 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 use tokio::time::timeout;
 
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::manifest::McpServer;
-use crate::platform::NoConsoleWindow;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "ikenga-desktop";
@@ -96,10 +94,9 @@ pub async fn call_tool(
         ));
     }
 
-    let mut cmd = Command::new(crate::runtime::resolve_command(&server.command));
+    let mut cmd = SpawnSpec::new(crate::runtime::resolve_command(&server.command));
     cmd.args(&server.args);
     cmd.current_dir(install_path);
-    cmd.no_console_window();
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -113,13 +110,18 @@ pub async fn call_tool(
     for (k, v) in &server.env {
         cmd.env(k, v);
     }
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
+    let opts = PipedOpts {
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::executor::current()
+        .spawn_piped(cmd, opts)
         .with_context(|| format!("spawn `{} {:?}`", server.command, server.args))?;
 
     let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;

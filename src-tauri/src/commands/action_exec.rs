@@ -67,19 +67,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use crate::actions::trust::{run_hash, ActionTrust, TrustState};
 use crate::actions::ActionsManager;
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 /// Default wall clock for one run; a caller may ask for up to `MAX_TIMEOUT_SECS`.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -613,41 +611,48 @@ fn clamp_timeout(requested: Option<u64>) -> u64 {
         .min(MAX_TIMEOUT_SECS)
 }
 
-/// The host shell running `command` (already rewritten for `ShellFlavor::host()`).
-fn shell_command(command: &str, cwd: &Path, env: &[(&'static str, String)]) -> Command {
+/// The host shell running `command` (already rewritten for `ShellFlavor::host()`),
+/// as a spec + opts for the executor seam (WP-18b, ADR-023).
+///
+/// `new_process_group`: the shell leads its own process group on Unix, so a
+/// timeout can stop the whole tree (`kill_tree` signals `-pid`). A no-op on
+/// Windows, where `kill_tree` walks the tree with `taskkill /T` instead —
+/// exactly the pre-executor split.
+fn shell_command(
+    command: &str,
+    cwd: &Path,
+    env: &[(&'static str, String)],
+) -> (SpawnSpec, PipedOpts) {
     #[cfg(windows)]
-    let std_cmd = {
-        let mut cmd = std::process::Command::new("powershell.exe");
-        cmd.args([
+    let mut spec = {
+        let mut spec = SpawnSpec::new("powershell.exe");
+        spec.args([
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
             encode_powershell(&powershell_script(command)).as_str(),
         ]);
-        cmd
+        spec
     };
     #[cfg(not(windows))]
-    let std_cmd = {
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(command);
-        #[cfg(unix)]
-        {
-            // Own process group, so a timeout can stop the whole tree.
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        cmd
+    let mut spec = {
+        let mut spec = SpawnSpec::new("/bin/sh");
+        spec.arg("-c").arg(command);
+        spec
     };
-    let mut cmd = Command::from(std_cmd);
-    cmd.current_dir(cwd)
+    spec.current_dir(cwd)
         .env("PATH", crate::runtime::augmented_path())
-        .envs(env.iter().map(|(key, value)| (*key, value.as_str())))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .no_console_window();
-    cmd
+        .envs(env.iter().map(|(key, value)| (*key, value.as_str())));
+    let opts = PipedOpts {
+        stdin: StdioMode::Null,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        no_console_window: true,
+        detached: false,
+        new_process_group: true,
+    };
+    (spec, opts)
 }
 
 type Captured = Arc<Mutex<(Vec<u8>, bool)>>;
@@ -695,6 +700,12 @@ async fn kill_tree(pid: Option<u32>) {
     if let Some(pid) = pid {
         // `/T` walks the shell's descendants; it must run while the shell is
         // still alive, i.e. before `child.kill()`.
+        use crate::platform::NoConsoleWindow;
+        use std::process::Stdio;
+        use tokio::process::Command;
+
+        // Not executor-routed: a Windows-only tree kill aimed at a child the
+        // executor already spawned — a signal, not a session spawn.
         let pid = pid.to_string();
         let mut cmd = Command::new("taskkill");
         cmd.args(["/T", "/F", "/PID", pid.as_str()])
@@ -735,14 +746,14 @@ pub async fn exec(
         Err(error) => return ActionExecResult::refused(Refusal::new("invalid-cwd", error)),
     };
     let shell = flavor.name();
-    let mut cmd = shell_command(&command, &cwd, &env);
+    let (spec, opts) = shell_command(&command, &cwd, &env);
     let mut result = ActionExecResult {
         cwd: cwd.display().to_string(),
         shell: shell.to_string(),
         ..Default::default()
     };
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::executor::current().spawn_piped(spec, opts) {
         Ok(child) => child,
         Err(e) => {
             result.error = Some(format!("could not start {shell}: {e}"));
@@ -1303,6 +1314,58 @@ mod tests {
         assert_eq!(result.refusal.as_deref(), Some("variable-in-single-quotes"));
         assert!(result.stdout.is_empty());
         assert_eq!(result.exit_code, None);
+    }
+
+    /// WP-18b regression: the timeout path, now spawned through the
+    /// executor seam with `new_process_group`, still kills a *grandchild*
+    /// (a backgrounded job of the shell), not just the shell itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_timeout_kills_a_grandchild_through_the_executor() {
+        let result = exec(
+            &tmp_run("sleep 30 & echo $!; wait"),
+            &HashMap::new(),
+            Some(1),
+            None,
+        )
+        .await;
+        assert!(result.timed_out, "{result:?}");
+        let pid: i32 = result
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("grandchild pid on stdout: {:?}", result.stdout));
+
+        // Gone, or a zombie nobody has reaped yet (re-parented orphans in a
+        // container without an init that reaps).
+        let dead = || {
+            #[cfg(target_os = "linux")]
+            {
+                match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                    Err(_) => true,
+                    Ok(stat) => stat
+                        .rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                        .unwrap_or(false),
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                unsafe { libc::kill(pid, 0) != 0 }
+            }
+        };
+        let mut killed = dead();
+        for _ in 0..40 {
+            if killed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            killed = dead();
+        }
+        if !killed {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(killed, "timeout must kill the shell's whole process group");
     }
 
     #[cfg(unix)]

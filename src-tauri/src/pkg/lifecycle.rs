@@ -62,7 +62,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, RwLock};
@@ -73,13 +72,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::timeout;
 
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::manifest::{McpServer, Package, SettingsField};
 use crate::pkg::registry::Registry;
-use crate::platform::NoConsoleWindow;
 
 /// Per-call wallclock cap for `tools/call` against a supervised child.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1001,8 +1000,8 @@ impl SupervisedSidecar {
     }
 
     /// Drop the active child entry, closing its stdin channel so the
-    /// writer task exits. The kill_on_drop flag on Command makes sure the
-    /// OS process is reaped if it hasn't exited yet.
+    /// writer task exits. The spawn's `kill_on_drop` (`PipedOpts`) makes
+    /// sure the OS process is reaped if it hasn't exited yet.
     async fn tear_down_active(&self) {
         let active = self.active.lock().expect("active lock poisoned").take();
         if let Some(a) = active {
@@ -1079,10 +1078,11 @@ impl SupervisedSidecar {
             ));
         }
 
-        let mut cmd = Command::new(crate::runtime::resolve_command(&self.server.command));
+        // WP-18b: built as a `SpawnSpec` and spawned through the executor
+        // seam (ADR-023) below; the env layering order is unchanged.
+        let mut cmd = SpawnSpec::new(crate::runtime::resolve_command(&self.server.command));
         cmd.args(&self.server.args);
         cmd.current_dir(&self.install_path);
-        cmd.no_console_window();
 
         // Phase 5 (projects-first-class): inject IKENGA_PROJECT_ID +
         // IKENGA_PROJECT_ROOT before the manifest-declared env so a pkg
@@ -1110,7 +1110,7 @@ impl SupervisedSidecar {
                 // the manifest-declared env, so the manifest can still
                 // override either. workspace.env lives in app_data_dir;
                 // project files live at project root. Process env is
-                // already inherited by `Command::new`.
+                // inherited (the spec does not `env_clear`).
                 if let Some(app) = self.app.as_ref() {
                     let app_data = {
                         use tauri::Manager;
@@ -1162,13 +1162,18 @@ impl SupervisedSidecar {
         for (k, v) in &self.server.env {
             cmd.env(k, v);
         }
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
+        let opts = PipedOpts {
+            stdin: StdioMode::Piped,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Piped,
+            kill_on_drop: true,
+            no_console_window: true,
+            detached: false,
+            new_process_group: false,
+        };
 
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::executor::current()
+            .spawn_piped(cmd, opts)
             .with_context(|| format!("spawn `{} {:?}`", self.server.command, self.server.args))?;
 
         let pid = child.id().unwrap_or(0);

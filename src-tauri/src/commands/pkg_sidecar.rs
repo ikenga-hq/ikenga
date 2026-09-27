@@ -14,18 +14,16 @@
 //! Iframe-origin to pkg_id resolution lives in the AppBridge wrapper that
 //! ultimately calls this.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use crate::commands::pkg::KernelState;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::registries::SidecarsRegistry;
-use crate::platform::NoConsoleWindow;
 
 /// Tauri-state wrapper so commands can resolve sidecar paths without going
 /// through the kernel snapshot.
@@ -94,21 +92,25 @@ pub async fn pkg_sidecar_call(
         args
     );
 
-    let mut cmd = Command::new(&entry.bin_path);
+    let mut cmd = SpawnSpec::new(&entry.bin_path);
     cmd.args(&args);
     cmd.current_dir(&install_path);
-    cmd.no_console_window();
     // WP-23 (D-18): hand this pkg its scoped database accessor —
     // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the
     // two `/iyke/pkg-db/*` routes, enforced against this pkg's own
     // `permissions["sqlite.tables"]`. See `pkg::db_scope`.
     crate::pkg::db_scope::inject_env(&mut cmd, &pkg_id, &install_path);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
+    let opts = PipedOpts {
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::executor::current().spawn_piped(cmd, opts) {
         Ok(c) => c,
         Err(e) => {
             return Ok(err(format!("spawn `{}`: {e}", entry.bin_path.display())));
@@ -186,9 +188,13 @@ fn err(msg: String) -> PkgSidecarCallResult {
 
 #[cfg(test)]
 mod tests {
-    // The only test here is unix-gated, so nothing consumes this elsewhere.
+    // The only test here is unix-gated, so nothing consumes these elsewhere.
+    // (The call site itself now spawns through `executor::current()`, which
+    // the executor's own tests cover; this keeps the raw-primitive check.)
     #[cfg_attr(not(unix), allow(unused_imports))]
-    use super::*;
+    use std::process::Stdio;
+    #[cfg_attr(not(unix), allow(unused_imports))]
+    use tokio::process::Command;
 
     /// Sanity-check the spawn primitives that pkg_sidecar_call uses end-to-
     /// end against `/bin/echo`. Doesn't go through the Tauri command path

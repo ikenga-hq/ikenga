@@ -27,7 +27,7 @@
 
 [action_exec]
 tag = "WP-18b"
-reason = "exec() (action_exec.rs) cmd.spawn()s a pinned headless shell command — a desktop-only spawn site; needs executor::current()."
+reason = "exec() (action_exec.rs) spawns a pinned headless shell command via executor::current().spawn_piped (new_process_group, so the timeout kill_tree reaches the whole group); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [action_git_branch]
 tag = "WP-19"
@@ -159,15 +159,15 @@ reason = "Phase 0.5 debug harness pinging the primary native webview window via 
 
 [chi_cancel]
 tag = "WP-18b"
-reason = "Kills the spawned chi child (child.start_kill()) and/or the detached chi-runner process group by pid — controls the same non-executor chi engine spawn site."
+reason = "Kills the chi engine child (child.start_kill()) and/or the detached chi-runner process group by pid — controls the chi_run spawns (both executor-routed since WP-18b); rpc.rs arm still pending."
 
 [chi_resume]
 tag = "WP-18b"
-reason = "resume_chi_run re-spawns the engine child through the same non-executor-gated chi spawn path as chi_run."
+reason = "resume_chi_run re-spawns the engine child through the same executor-routed path as chi_run (build_engine_command SpawnSpec -> executor::current().spawn_piped); rpc.rs arm still pending."
 
 [chi_run]
 tag = "WP-18b"
-reason = "spawn_chi_run spawns the in-process engine child via chi's own Command::new (no executor::current() routing); only the persistent path's detached chi-runner goes through the executor so far."
+reason = "spawn_chi_run spawns the in-process engine child via executor::current().spawn_piped (build_engine_command -> SpawnSpec), or for persistent runs a detached chi-runner (PipedOpts::detached); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [claude_asset_list_pins]
 tag = "WP-19"
@@ -283,7 +283,7 @@ reason = "sqlx UPDATE recording which sink a comment was routed to; DB write onl
 
 [comment_route]
 tag = "WP-18b"
-reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) — a WP-18b desktop-only spawn site."
+reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) through executor::current(); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [comment_set_status]
 tag = "WP-19"
@@ -299,7 +299,7 @@ reason = "Reads a caller-supplied free-form src_dir with no containment, and int
 
 [detect_agent]
 tag = "WP-18b"
-reason = "agents::detect_by_id runs the same probe_version Command::new(exec)/wsl.exe spawn as detect_agents for a single agent id."
+reason = "agents::detect_by_id runs the same probe_version spawn as detect_agents for one agent id; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [detect_agent_config]
 tag = "WP-19"
@@ -307,7 +307,7 @@ reason = "config_claude::build_inventory only counts files under .claude/.gemini
 
 [detect_agents]
 tag = "WP-18b"
-reason = "agents::detect_all -> probe_version does Command::new(exec) to run each detected CLI's --version (agent-detect spawn site)."
+reason = "agents::detect_all -> probe_version runs each detected CLI's --version; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [detect_system]
 tag = "WP-19"
@@ -487,7 +487,7 @@ reason = "scan_external_masters walks dirs + resolves symlinks, then registry::s
 
 [oba_check_update]
 tag = "WP-18b"
-reason = "check_update_core calls git_ls_remote_sha (install.rs:141), which Command::new(\"git\")s ls-remote — desktop spawn site."
+reason = "check_update_core calls git_ls_remote_sha, which runs `git ls-remote`; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
 
 [oba_dependents]
 tag = "WP-19"
@@ -499,11 +499,11 @@ reason = "registry::forget + registry::save is a JSON edit; no spawn, no fs dele
 
 [oba_install_bundle]
 tag = "WP-18b"
-reason = "install_bundle_core->fetch_fn is npx_skills_add_all (install.rs:201), spawning `npx` for the whole bundle."
+reason = "install_bundle_core->fetch_fn is npx_skills_add_all, spawning `npx` for the whole bundle; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
 
 [oba_install_git]
 tag = "WP-18b"
-reason = "install_core->fetch_and_adopt spawns `git clone` (install.rs:93 run()/:110 git_clone) — desktop spawn site, needs executor::current()."
+reason = "install_core->fetch_and_adopt spawns `git clone` (install.rs git_clone -> run()); executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
 
 [oba_install_local]
 tag = "WP-19"
@@ -511,7 +511,7 @@ reason = "ProvenanceSource::Local branch (install.rs:422-436) is a directory cop
 
 [oba_install_npx]
 tag = "WP-18b"
-reason = "install_core->fetch_and_adopt calls npx_skills_add (install.rs:169), which Command::new(\"npx\")s — desktop spawn site."
+reason = "install_core->fetch_and_adopt calls npx_skills_add, which runs `npx`; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
 
 [oba_install_with_deps]
 tag = "WP-18b"
@@ -627,7 +627,7 @@ reason = "Downloads/untars then calls materialize_npm_deps + kernel.install_from
 
 [pkg_invoke]
 tag = "WP-18b"
-reason = "Plan §j spawn-site table: pkg_invoke.rs:141 does Command::new(&command) for manifest-declared one-shot CLI invocation, desktop only."
+reason = "Plan §j spawn-site table: pkg_invoke runs a manifest-declared one-shot CLI; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [pkg_is_trusted_for_elevated]
 tag = "WP-19"
@@ -635,7 +635,7 @@ reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §
 
 [pkg_mcp_call]
 tag = "WP-18b"
-reason = "Dispatches to pkg::mcp_runtime::call_tool which Command::new(resolve_command(...)) spawns the pkg's MCP server per call (mcp_runtime.rs:99)."
+reason = "Dispatches to pkg::mcp_runtime::call_tool, which spawns the pkg's MCP server per call; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [pkg_permission_violations_clear]
 tag = "WP-19"
@@ -671,11 +671,11 @@ reason = "pkg_settings.pkg_id REFERENCES pkg_installed(id) and sqlx enforces for
 
 [pkg_sidecar_call]
 tag = "WP-18b"
-reason = "Plan §j: pkg_sidecar.rs:97 Command::new(&entry.bin_path) spawns the manifest-declared sidecar binary per call."
+reason = "Plan §j: pkg_sidecar_call spawns the manifest-declared sidecar binary per call; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [pkg_sidecar_rpc_send]
 tag = "WP-18b"
-reason = "Streaming sidecar variant; plan §j lists pkg_sidecar_stream.rs:184 as its Command::new spawn site."
+reason = "Streaming sidecar variant (pkg_sidecar_stream.rs); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [pkg_sidecar_rpc_shutdown]
 tag = "WP-18b"
@@ -855,7 +855,7 @@ reason = "Read-only engine install-state info for the create form."
 
 [seats_fill]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run, the same non-executor chi spawn path as chi_run."
+reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run, the same executor-routed chi spawn path as chi_run; rpc.rs arm still pending."
 
 [seats_get]
 tag = "WP-19"
@@ -891,7 +891,7 @@ reason = "Routing decision only; doc comment 'Never resumes or starts anything',
 
 [seats_resume]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same non-executor engine spawn path as chi_resume."
+reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same executor-routed engine spawn path as chi_resume; rpc.rs arm still pending."
 
 [secrets_lock]
 tag = "WP-20"

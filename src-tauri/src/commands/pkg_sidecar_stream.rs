@@ -25,18 +25,17 @@
 //! sidecar `name` to a single `pkg_id`; cross-pkg invocation is refused.
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::commands::pkg::KernelState;
 use crate::commands::pkg_sidecar::SidecarsRegistryState;
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 /// Key into the streaming map: `(pkg_id, sidecar_name)`.
 type StreamKey = (String, String);
@@ -181,17 +180,25 @@ fn spawn_streaming_child_sync(
         bin_path.display()
     );
 
-    let mut cmd = Command::new(&bin_path);
+    let mut cmd = SpawnSpec::new(&bin_path);
     cmd.current_dir(&install_path);
-    cmd.no_console_window();
     // WP-23 (D-18): hand this pkg its scoped database accessor —
     // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the
     // two `/iyke/pkg-db/*` routes, enforced against this pkg's own
     // `permissions["sqlite.tables"]`. See `pkg::db_scope`.
     crate::pkg::db_scope::inject_env(&mut cmd, &key.0, &install_path);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let opts = PipedOpts {
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        // Unchanged from the inline spawn, which never set it: the handle
+        // moves into the exit-watcher task below, and the child is ended by
+        // stdin EOF when its map slot is dropped.
+        kill_on_drop: false,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
     // F-9: inject this pkg's settings-declared secret env (e.g. FAL_KEY),
     // resolved from Stronghold under the pkg's own scope. Best-effort — a
@@ -215,8 +222,8 @@ fn spawn_streaming_child_sync(
         ),
     }
 
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::executor::current()
+        .spawn_piped(cmd, opts)
         .map_err(|e| format!("spawn `{}`: {e}", bin_path.display()))?;
     let pid = child.id().unwrap_or(0);
 
