@@ -180,6 +180,16 @@ beforeEach(() => {
 	m.seatsList.mockReset();
 	useSeatNotice.setState({ notice: null });
 	useDetachedSurfaces.setState({ surfaceToWindow: {} });
+	// Project first: switching it resets the Companion target and the rail
+	// selection (companion-store's project subscription), which the first
+	// test in the file would otherwise see.
+	useShellStore.setState({
+		activeProjectId: PROJECT,
+		activeProject: { id: PROJECT, root_path: '/w', extra_roots: [] },
+		projects: [],
+		defaultEngineId: 'claude-code',
+	});
+	useShellStore.setState({ companion: { activeTarget: { kind: 'seat', seat_id: 'seat-lead' } } });
 	useCompanionStore.setState({
 		state: 'expanded',
 		tabs: [],
@@ -192,13 +202,6 @@ beforeEach(() => {
 		pickerPending: false,
 		permissions: [],
 		quietSince: null,
-	});
-	useShellStore.setState({
-		activeProjectId: PROJECT,
-		activeProject: { id: PROJECT, root_path: '/w', extra_roots: [] },
-		projects: [],
-		companion: { activeTarget: { kind: 'seat', seat_id: 'seat-lead' } },
-		defaultEngineId: 'claude-code',
 	});
 	useTerminalStore.setState({
 		tabs: [tab('term-1', 'codex', 1), tab('term-2', 'claude', 2), tab('term-3', 'claude', 3), tab('term-4', 'claude', 4)],

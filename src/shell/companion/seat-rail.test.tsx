@@ -189,6 +189,8 @@ beforeEach(() => {
 	m.chiList.mockReset().mockResolvedValue([]);
 	m.attachRunTerminal.mockClear();
 	useSeatNotice.setState({ notice: null });
+	// A previous test's Pop out leaves its surface marked detached.
+	useDetachedSurfaces.setState({ surfaceToWindow: {} });
 	useCompanionStore.setState({
 		state: 'collapsed',
 		tabs: [],
