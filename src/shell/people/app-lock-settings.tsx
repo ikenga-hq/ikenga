@@ -142,7 +142,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 						placeholder={String(DEFAULT_IDLE_MINUTES)}
 						className="w-10 bg-transparent font-mono text-[var(--text-caption,12px)] text-[var(--fg)] outline-none"
 					/>
-					<span className="font-mono text-[10px] text-[var(--fg-muted)]">min</span>
+					<span className="font-mono text-[11px] text-[var(--fg-muted)]">min</span>
 				</span>
 				{noSecret && <Kv>Set a PIN below first.</Kv>}
 			</PeopleRow>

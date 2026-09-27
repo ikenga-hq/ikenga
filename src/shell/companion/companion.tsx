@@ -570,7 +570,7 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 				<pre
 					// biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable region must be keyboard-reachable
 					tabIndex={0}
-					className="mt-1.5 max-h-24 overflow-auto rounded p-2 font-mono text-[10px]"
+					className="mt-1.5 max-h-24 overflow-auto rounded p-2 font-mono text-[11px]"
 					style={{ background: 'var(--bg-sunken)', color: 'var(--fg-muted)' }}
 				>
 					{JSON.stringify(card.toolInput, null, 2)}
