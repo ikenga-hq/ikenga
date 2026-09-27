@@ -318,7 +318,7 @@ async function readResumeSetting(): Promise<boolean> {
  * rehydrate auto-resume and any number of SingleTerminal mounts/re-renders
  * share one PTY instead of each opening their own.
  */
-export function openTabPty(tab: TerminalTab): Promise<Pty> {
+export function openTabPty(tab: TerminalTab, opts: { forceEphemeral?: boolean } = {}): Promise<Pty> {
 	const attachId = tab.ptyId;
 	return acquirePty(
 		tab.id,
@@ -328,7 +328,10 @@ export function openTabPty(tab: TerminalTab): Promise<Pty> {
 			// their hooks to the live bridge. Failure is non-fatal: the session
 			// falls back to running without live telemetry.
 			await loadClaudeSettingsPath().catch(() => {});
-			return Pty.spawn(buildSpawnOpts(tab, tab.id));
+			const spawnOpts = buildSpawnOpts(tab, tab.id);
+			// `forceEphemeral`: an in-process PTY Rust can see (a seat's terminal,
+			// G-SEATS P-10), never the daemon.
+			return Pty.spawn(opts.forceEphemeral ? { ...spawnOpts, forceEphemeral: true } : spawnOpts);
 		},
 		(pty) => {
 			const store = useTerminalStore.getState();

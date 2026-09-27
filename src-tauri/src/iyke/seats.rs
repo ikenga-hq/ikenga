@@ -3284,7 +3284,12 @@ pub(crate) async fn capture_core(
 
 /// After a queued text went out: bump `last_active_at` and copy the run's
 /// current `external_id` / `cwd` from `chi_cache` (§1.1).
-async fn touch_after_send(pool: &SqlitePool, seat_id: &str, now: i64) -> Result<(), SeatError> {
+/// Also the WP-70 bridge's idle-run send, through `send_idle_core`.
+pub(crate) async fn touch_after_send(
+    pool: &SqlitePool,
+    seat_id: &str,
+    now: i64,
+) -> Result<(), SeatError> {
     let refreshed = sqlx::query(
         "UPDATE iyke_seats SET last_active_at = ?,
                 external_id = COALESCE(
@@ -3312,6 +3317,94 @@ async fn touch_after_send(pool: &SqlitePool, seat_id: &str, now: i64) -> Result<
     Ok(())
 }
 
+/// §1.1: a send through the seat bumps `last_active_at` and nothing else.
+/// WP-70: the bridge's pty-route send, which has no run to refresh from.
+pub(crate) async fn touch_last_active(
+    pool: &SqlitePool,
+    seat_id: &str,
+    now: i64,
+) -> Result<(), SeatError> {
+    sqlx::query("UPDATE iyke_seats SET last_active_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(seat_id.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// What the WP-70 bridge's idle-run send did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IdleSend {
+    /// The text went out through the `chi_resume` core; the run it continued.
+    Sent { run_id: String },
+    /// Since `seats_resolve`, the run went busy or a text was queued ahead of
+    /// this one: nothing was sent, and the caller queues it (§4.5).
+    Queue,
+}
+
+/// WP-70 `/iyke/seats/send`, idle-run route. Under the seat's mutex, re-checks
+/// what `seats_resolve` saw — the caller's hold, the seat still on `run_id`,
+/// the run not in flight, the §4.5 slot empty — and only then calls `send`
+/// (the `chi_resume` core), so two concurrent sends never start two turns on
+/// one run and a direct send never overtakes a queued text (§4.5). A busy run
+/// or a full slot answers `Queue`; the caller then calls `seats_queue` (which
+/// takes the mutex itself). After a send, §1.1's bump and §10's `updated`.
+pub(crate) async fn send_idle_core<F, Fut>(
+    pool: &SqlitePool,
+    seat_id: &str,
+    run_id: &str,
+    actor: &SeatActor,
+    send: F,
+) -> Result<(IdleSend, Effects), SeatError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<String, SeatError>>,
+{
+    let _guard = store().lock_one(seat_id).await;
+    let row = fetch_seat(pool, seat_id)
+        .await?
+        .ok_or_else(SeatError::seat_not_found)?;
+    // `seats_resolve` already applied the hold change; this only refuses a
+    // hold or takeover that landed since.
+    match hold_gate(&row, actor, now_ms(), false) {
+        Err(r) => return Err(refuse(pool, &row.id, r).await),
+        Ok(HoldChange::TakeOver { from }) => {
+            return Err(SeatError::conflict(format!(
+                "{from} took {} while sending; nothing was sent — retry",
+                row.name
+            )))
+        }
+        Ok(_) => {}
+    }
+    if row.session_kind.as_deref() != Some("run") || row.session_ref.as_deref() != Some(run_id) {
+        return Err(SeatError::conflict(format!(
+            "{} changed while sending; nothing was sent — retry",
+            row.name
+        )));
+    }
+    let busy = match fetch_chi(pool, run_id).await? {
+        Some(c) => matches!(c.status.as_str(), "queued" | "running"),
+        None => {
+            return Err(SeatError::conflict(format!(
+                "run {run_id} of {} is gone; nothing was sent",
+                row.name
+            )))
+        }
+    };
+    if busy || store().queued(&row.id).is_some() {
+        return Ok((IdleSend::Queue, Effects::default()));
+    }
+    let sent = send().await?;
+    let mut effects = Effects::default();
+    // The text is already out, so a failed bump is only logged.
+    match touch_after_send(pool, &row.id, now_ms()).await {
+        Ok(()) => effects.events.push(changed(&row, vec!["updated"], None)),
+        Err(e) => log::warn!(target: "ikenga::seats", "send: touch {}: {e}", row.id),
+    }
+    Ok((IdleSend::Sent { run_id: sent }, effects))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tauri glue: the live world, engine calls, listener, poller
 // ═══════════════════════════════════════════════════════════════════════
@@ -3334,6 +3427,45 @@ async fn refreshed_view(
         .ok_or_else(SeatError::seat_not_found)?;
     let world = tauri_world(app, pool, std::slice::from_ref(&row), false).await;
     view_of(pool, &world, row).await
+}
+
+async fn app_pool(app: &AppHandle) -> Result<SqlitePool, SeatError> {
+    let db = app
+        .try_state::<Arc<PaDb>>()
+        .ok_or_else(|| SeatError::internal("the database is not ready"))?;
+    pool_of(&db).await
+}
+
+/// WP-70 bridge: a PTY write through the seat went out (§7.2 pty route).
+/// Bumps `last_active_at` (§1.1) and emits `updated` (§10).
+pub(crate) async fn note_pty_send(app: &AppHandle, seat_id: &str) -> Result<(), SeatError> {
+    let pool = app_pool(app).await?;
+    touch_last_active(&pool, seat_id, now_ms()).await?;
+    if let Some(row) = fetch_seat(&pool, seat_id).await? {
+        let _ = app.emit(
+            SEATS_CHANGED_EVENT,
+            &changed(&row, vec!["updated"], None),
+        );
+    }
+    Ok(())
+}
+
+/// WP-70 bridge glue for `send_idle_core`: emits its §10 events.
+pub(crate) async fn send_idle<F, Fut>(
+    app: &AppHandle,
+    seat_id: &str,
+    run_id: &str,
+    actor: &SeatActor,
+    send: F,
+) -> Result<IdleSend, SeatError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<String, SeatError>>,
+{
+    let pool = app_pool(app).await?;
+    let (outcome, effects) = send_idle_core(&pool, seat_id, run_id, actor, send).await?;
+    emit_effects(app, effects);
+    Ok(outcome)
 }
 
 /// Build the world derivation reads, for `rows` (openrouter threads and
@@ -5659,5 +5791,107 @@ mod tests {
         assert_eq!(SeatError::seat_not_found().http_status(), 404);
         assert_eq!(SeatError::engine_failed("x".into()).http_status(), 502);
         assert_eq!(SeatError::resuming("a").http_status(), 409);
+    }
+
+    // ── WP-70 bridge sends ──────────────────────────────────────────────
+
+    async fn must_not_send(why: &'static str) -> Result<String, SeatError> {
+        panic!("{why}")
+    }
+
+    #[tokio::test]
+    async fn touch_last_active_bumps_any_seat() {
+        let pool = pool().await;
+        let s = create(&pool, "lead", "claude-code").await;
+        touch_last_active(&pool, &s, 9_999_999_999_999).await.unwrap();
+        assert_eq!(row(&pool, &s).await.last_active_at, 9_999_999_999_999);
+    }
+
+    #[tokio::test]
+    async fn send_idle_sends_once_and_bumps_the_seat() {
+        let pool = pool().await;
+        let s = create(&pool, "nightly", "claude-code").await;
+        insert_run(&pool, "run-i", "claude-code", "done", Some("conv-i")).await;
+        set_session(&pool, &s, "run", "run-i", Some("conv-i")).await;
+        let before = row(&pool, &s).await.last_active_at;
+        let (out, effects) = send_idle_core(&pool, &s, "run-i", &ui(), || async {
+            Ok::<_, SeatError>("run-i".to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            IdleSend::Sent {
+                run_id: "run-i".into()
+            }
+        );
+        assert_eq!(effects.events.len(), 1);
+        assert_eq!(effects.events[0].kinds, vec!["updated"]);
+        assert!(row(&pool, &s).await.last_active_at >= before);
+    }
+
+    #[tokio::test]
+    async fn send_idle_queues_when_the_run_went_busy_or_a_text_waits() {
+        let pool = pool().await;
+        let s = create(&pool, "nightly", "claude-code").await;
+        insert_run(&pool, "run-b", "claude-code", "running", Some("conv-b")).await;
+        set_session(&pool, &s, "run", "run-b", Some("conv-b")).await;
+        let (out, _) = send_idle_core(&pool, &s, "run-b", &ui(), || {
+            must_not_send("a busy run is never resumed over (§4.5)")
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, IdleSend::Queue);
+
+        sqlx::query("UPDATE chi_cache SET status = 'done' WHERE run_id = 'run-b'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        store().enqueue(
+            &s,
+            QueuedText {
+                prompt: "first".into(),
+                since: 0,
+                client: "ui".into(),
+            },
+        );
+        let (out, _) = send_idle_core(&pool, &s, "run-b", &ui(), || {
+            must_not_send("a direct send never overtakes a queued text (§4.5)")
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, IdleSend::Queue);
+        store().dequeue(&s);
+    }
+
+    #[tokio::test]
+    async fn send_idle_refuses_a_seat_that_moved_or_is_held() {
+        let pool = pool().await;
+        let s = create(&pool, "nightly", "claude-code").await;
+        insert_run(&pool, "run-m", "claude-code", "done", Some("conv-m")).await;
+        insert_run(&pool, "run-n", "claude-code", "done", Some("conv-n")).await;
+        set_session(&pool, &s, "run", "run-n", Some("conv-n")).await;
+        let e = send_idle_core(&pool, &s, "run-m", &ui(), || {
+            must_not_send("nothing is sent to a run the seat no longer holds")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, "conflict");
+
+        sqlx::query(
+            "UPDATE iyke_seats SET hold_client = 'orchestrator', hold_since = 0,
+                    hold_expires_at = ? WHERE id = ?",
+        )
+        .bind(now_ms() + 60_000)
+        .bind(s.clone())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let e = send_idle_core(&pool, &s, "run-n", &ui(), || {
+            must_not_send("a hold taken since resolve is honoured")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, "seat_held");
     }
 }

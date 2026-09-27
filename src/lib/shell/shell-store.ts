@@ -537,7 +537,10 @@ export function createDefaultExplorerSections(): ExplorerSectionState[] {
 export type CompanionTarget =
 	| { kind: 'session'; session_id: string }
 	| { kind: 'new'; engine_id: string | null }
-	| { kind: 'persistent'; engine_id: string | null };
+	| { kind: 'persistent'; engine_id: string | null }
+	/** G-SEATS §9.1 (P-2 spelling). Not persisted (`companion` is in
+	 *  `NOT_PERSISTED`); a project switch resets it (P-3). */
+	| { kind: 'seat'; seat_id: string };
 
 // ─── v15 backup / rollback (g-state.md §4) ────────────────────────────────
 const SHELL_STORE_BASE_KEY = 'shell-store';
