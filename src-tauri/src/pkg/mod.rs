@@ -16,7 +16,8 @@
 //! So do the read-side pieces the daemon's `pkg_kernel_status` /
 //! `list_skill_actions` arms need (WP-19): `status` (the wire shape and
 //! `assemble_status`, shared with `Kernel::status`), `source` (pure serde),
-//! `skill_actions` (std + serde_yaml fs reads), and — from `registries` —
+//! `skill_actions` (std + serde_yaml fs reads), `settings_values` (the
+//! `pkg_settings` table + schema-default merge), and — from `registries` —
 //! ONLY `ui_routes`. Every other registry stays desktop-gated inside
 //! `registries/mod.rs`.
 //!
@@ -60,6 +61,9 @@ pub mod npm_install;
 pub mod permissions_check;
 pub mod registries;
 pub mod registry;
+// `pkg_settings` table read/upsert + schema-default merge, shared by the
+// desktop `pkg_settings_*` commands and the daemon's RPC arms (WP-19).
+pub mod settings_values;
 #[cfg(feature = "desktop")]
 pub mod signature;
 pub mod skill_actions;

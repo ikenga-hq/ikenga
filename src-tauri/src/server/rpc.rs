@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::rpc_local;
 use super::AppState;
 use crate::pty::SpawnOpts;
 
@@ -73,7 +74,7 @@ fn resolve_path(input: &str) -> Result<std::path::PathBuf, String> {
 /// Returned when the daemon was started without `--data-dir`, so there is no
 /// `ikenga.db` to open. Says which flag is missing rather than "unknown
 /// command", which would read as unimplemented.
-const NO_DB: &str =
+pub(super) const NO_DB: &str =
     "no database: the daemon was started without --data-dir, so there is no ikenga.db to open";
 
 /// Pull `(sql, params)` out of an RPC payload, accepting **both** spellings the
@@ -596,6 +597,31 @@ pub async fn rpc_handler(
             "{cmd} {}",
             crate::secrets_env::WRITE_REFUSAL
         )),
+        // Desktop: the names in `secrets-index.json`. Daemon: the names of
+        // its own namespace — same `string[]` shape, daemon-true content.
+        // Needs no `--data-dir`: the namespace is process environment.
+        // (`secrets_lock_state` stays allowlisted; see `desktop_only.toml`.)
+        "secrets_index_names" => RpcResponse::success(crate::secrets_env::list_keys()),
+
+        // --- Local state (WP-19 slice 2) ---
+        //
+        // Bodies live in `server::rpc_local`, over the same cores the desktop
+        // commands call (`server::shared::*`, `pkg::settings_values`), rooted
+        // at `--data-dir`. Each errors, naming the flag, without one.
+        "supabase_config_get" => rpc_local::supabase_config_get(&state),
+        "supabase_config_set" => rpc_local::supabase_config_set(&state, &payload.args),
+        "supabase_config_clear" => rpc_local::supabase_config_clear(&state),
+        "settings_get" => rpc_local::settings_get(&state, &payload.args).await,
+        "settings_set" => rpc_local::settings_set(&state, &payload.args).await,
+        "settings_get_all" => rpc_local::settings_get_all(&state).await,
+        "settings_clear_all" => rpc_local::settings_clear_all(&state).await,
+        "settings_read_file" => rpc_local::settings_read_file(&state, &payload.args).await,
+        "settings_write_field" => rpc_local::settings_write_field(&state, &payload.args).await,
+        "data_health_scan" => rpc_local::data_health_scan(&state).await,
+        "data_health_db_size" => rpc_local::data_health_db_size(&state),
+        "backup_list" => rpc_local::backup_list(&state),
+        "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
+        "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
         other => {

@@ -1,7 +1,7 @@
 //! The daemon's read-only index of the pkgs under `--pkgs-dir` (WP-19).
 //!
-//! Backs the `pkg_kernel_status`, `list_skill_actions` and
-//! `list_all_skill_actions` RPC arms. Built once, in `create_router`, from the
+//! Backs the `pkg_kernel_status`, `list_skill_actions`,
+//! `list_all_skill_actions` and `pkg_settings_get` RPC arms. Built once, in `create_router`, from the
 //! same directory walk that feeds [`super::PkgStaticService`], so the two can
 //! never disagree about which directories are pkgs.
 //!
@@ -44,12 +44,13 @@
 //! included: status reports what is installed. Whether the daemon can *serve*
 //! an iframe bundle is `PkgStaticService`'s concern, not this one's.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
 
-use crate::pkg::manifest::{Package, IKENGA_API_VERSION};
+use crate::pkg::manifest::{Package, SettingsField, IKENGA_API_VERSION};
 use crate::pkg::registries::UiRoutesRegistry;
 use crate::pkg::registry::Registry;
 use crate::pkg::skill_actions::{list_actions_for_pkg, SkillAction};
@@ -137,11 +138,17 @@ pub struct PkgIndex {
     /// Sorted by id so `pkg_kernel_status` is stable across calls.
     installed: Vec<InstalledSummary>,
     ui_routes: UiRoutesRegistry,
+    /// `pkg_id` → declared `settings.schema`, captured at index time the way
+    /// the desktop `SettingsRegistry` captures it at register time — through
+    /// the same `settings_values::declared_schema`, and only for pkgs that go
+    /// live (compatible + registered).
+    settings_schemas: HashMap<String, Vec<SettingsField>>,
 }
 
 impl PkgIndex {
     pub fn from_packages(pkgs: &[Package]) -> Self {
         let ui_routes = UiRoutesRegistry::new();
+        let mut settings_schemas = HashMap::new();
         let mut installed: Vec<InstalledSummary> = Vec::with_capacity(pkgs.len());
         for pkg in pkgs {
             let compatible = pkg.is_compatible();
@@ -157,6 +164,9 @@ impl PkgIndex {
                         pkg.manifest.id
                     );
                     continue;
+                }
+                if let Some(schema) = crate::pkg::settings_values::declared_schema(pkg) {
+                    settings_schemas.insert(pkg.manifest.id.clone(), schema);
                 }
             } else {
                 warn!(
@@ -195,7 +205,16 @@ impl PkgIndex {
         Self {
             installed,
             ui_routes,
+            settings_schemas,
         }
+    }
+
+    /// The declared settings schema for `pkg_id`, or `None` — for a pkg that
+    /// declares none, and for one the index doesn't have (unknown or not
+    /// live). `None` is what the desktop `SettingsRegistry::schema_for` gives
+    /// in both cases too; `pkg_settings_get` then reports `schema: null`.
+    pub fn settings_schema(&self, pkg_id: &str) -> Option<Vec<SettingsField>> {
+        self.settings_schemas.get(pkg_id).cloned()
     }
 
     /// Rows for every discovered pkg.
@@ -287,6 +306,45 @@ mod tests {
 
         assert!(scan(None).is_empty());
         assert!(scan(Some(&root.join("missing"))).is_empty());
+    }
+
+    /// `settings_schema` holds what the desktop `SettingsRegistry` would: the
+    /// declared fields of live pkgs only — none for an empty block, an
+    /// incompatible pkg, or an unknown id.
+    #[test]
+    fn settings_schema_mirrors_the_desktop_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let settings =
+            r#","settings":{"schema":[{"key":"k","type":"string","label":"K","default":"d"}]}"#;
+        write_manifest(root, "live", &manifest("com.test.live", "1", settings));
+        write_manifest(
+            root,
+            "future",
+            &manifest("com.test.future", "999", settings),
+        );
+        write_manifest(
+            root,
+            "empty",
+            &manifest("com.test.empty", "1", r#","settings":{"schema":[]}"#),
+        );
+
+        let pkgs = scan(Some(root));
+        let index = PkgIndex::from_packages(&pkgs);
+        let live = pkgs
+            .iter()
+            .find(|p| p.manifest.id == "com.test.live")
+            .unwrap();
+        let schema = index.settings_schema("com.test.live").expect("declared");
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].key, "k");
+        assert_eq!(
+            serde_json::to_value(&schema).unwrap(),
+            serde_json::to_value(crate::pkg::settings_values::declared_schema(live)).unwrap()
+        );
+        for id in ["com.test.future", "com.test.empty", "com.test.unknown"] {
+            assert!(index.settings_schema(id).is_none(), "{id}");
+        }
     }
 
     #[test]
