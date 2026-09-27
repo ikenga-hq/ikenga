@@ -53,15 +53,15 @@ impl Registry for SettingsRegistry {
     }
 
     fn register(&self, pkg: &Package) -> Result<()> {
-        let block = match &pkg.manifest.settings {
-            Some(b) if !b.schema.is_empty() => b,
-            _ => return Ok(()),
+        // Same rule the daemon's pkg index applies to the same manifest.
+        let Some(schema) = crate::pkg::settings_values::declared_schema(pkg) else {
+            return Ok(());
         };
         let mut map = self
             .schemas
             .write()
             .map_err(|_| anyhow!("settings registry lock poisoned"))?;
-        map.insert(pkg.manifest.id.clone(), block.schema.clone());
+        map.insert(pkg.manifest.id.clone(), schema);
         Ok(())
     }
 

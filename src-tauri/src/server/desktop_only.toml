@@ -161,21 +161,13 @@ reason = "Plain std::fs::read_to_string under project_root/.atelier; no spawn, s
 tag = "WP-19"
 reason = "Atomic std::fs write+rename under .atelier; no spawn, fs-parity write."
 
-[backup_delete]
-tag = "WP-19"
-reason = "Removes a backup file after canonical-path containment check; plain fs, no spawn."
-
 [backup_export]
 tag = "WP-19"
-reason = "VACUUM INTO + zip write, optional Stronghold-derived secrets via SecretsLock; no process spawn, db/secrets parity."
+reason = "Writes a zip to a caller-supplied free-form dest_path with no containment (a remote client could write anywhere the daemon can); include_secrets reads the desktop Stronghold vault via SecretsLock, which has no daemon analog (IKENGA_SECRET_* env is read-only)."
 
 [backup_import]
 tag = "WP-19"
-reason = "Reads/validates a .ikbak zip, stages import; plain fs/db, no spawn."
-
-[backup_list]
-tag = "WP-19"
-reason = "Lists .ikbak files in app_data_dir via std::fs::read_dir; no spawn."
+reason = "Reads a caller-supplied free-form src_path with no containment, and what it stages (staged-restore/ + RESTORE_PENDING) is only ever applied by desktop lib.rs .setup() on the next launch after a relaunch; the daemon has no apply step."
 
 [bg_spike_reply]
 tag = "desktop-only-forever"
@@ -325,21 +317,13 @@ reason = "RouteSink::Chi calls spawn_chi_run, whose persistent path launches tmu
 tag = "WP-19"
 reason = "sqlx UPDATE of comment status column; no spawn."
 
-[data_health_db_size]
-tag = "WP-19"
-reason = "Reads sqlite file sizes via fs metadata/pragma; no spawn."
-
-[data_health_scan]
-tag = "WP-19"
-reason = "kernel/db orphan-row scan (SELECT-only per OrphanReport); no spawn."
-
 [db_export_ndjson]
 tag = "WP-19"
-reason = "Dumps every pa.db table to NDJSON files via sqlx SELECT; no spawn."
+reason = "Writes one NDJSON file per table into a caller-supplied free-form dest_dir with no containment check; needs a contained destination before a remote client may drive it."
 
 [db_import_ndjson]
 tag = "WP-19"
-reason = "Reads NDJSON files and INSERT OR REPLACEs rows via sqlx; no spawn."
+reason = "Reads a caller-supplied free-form src_dir with no containment, and interpolates each file's stem into SQL as the table name (INSERT OR REPLACE INTO \"{stem}\"); needs containment + a table allowlist first."
 
 [detect_agent]
 tag = "WP-18b"
@@ -713,13 +697,9 @@ reason = "kernel.set_enabled registers/unregisters all registries incl. SidecarS
 tag = "WP-19"
 reason = "kernel.set_scope only UPDATEs pkg_installed.project_id and the in-memory map; no registry (re)register/spawn touched."
 
-[pkg_settings_get]
-tag = "WP-19"
-reason = "Reads pkg_settings table + manifest schema defaults, merges JSON; pure db/config read."
-
 [pkg_settings_set]
 tag = "WP-19"
-reason = "Upserts a row into pkg_settings via sqlx; config write, no spawn."
+reason = "pkg_settings.pkg_id REFERENCES pkg_installed(id) and sqlx enforces foreign keys, so the upsert needs an installed row; the daemon installs nothing (its pkgs are a read-only --pkgs-dir index), so every set would fail. Needs a decision on how daemon-indexed pkgs own pkg_settings rows."
 
 [pkg_sidecar_call]
 tag = "WP-18b"
@@ -945,17 +925,13 @@ reason = "Routing decision only; doc comment 'Never resumes or starts anything',
 tag = "WP-18b"
 reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same non-executor tmux/engine spawn path as chi_resume."
 
-[secrets_index_names]
-tag = "WP-19"
-reason = "SecretIndex::load reads secrets-index.json names only (no value, no vault unlock needed); pure read parity gap."
-
 [secrets_lock]
 tag = "WP-20"
 reason = "unlock.lock() re-locks the one shared vault DEK app-wide; same single-tenant unlock-layer gap as secrets_unlock."
 
 [secrets_lock_state]
 tag = "WP-20"
-reason = "Reads/advances the single shared UnlockState's idle expiry; no principal dimension in the unlock layer."
+reason = "The daemon has no passphrase/lock layer. The only literally-true LockState is {configured:false, locked:false}, but the already-served secrets_vault_status reports configured:true (so the FE shows env secrets as readable); serving false would contradict it and steer the FE into the set-passphrase flow the daemon refuses. Settle `configured` for the env namespace for both commands together."
 
 [secrets_set_passphrase]
 tag = "WP-20"
@@ -993,33 +969,9 @@ reason = "Forwards a tool result over the existing executor-managed session's st
 tag = "desktop-only-forever"
 reason = "macOS dock-tile badge control (module doc); explicit dock/OS-shell integration, currently a stub no-op."
 
-[settings_clear_all]
-tag = "WP-19"
-reason = "manager.clear_all deletes rows + a personal file via remove_file_if_exists; no process spawn."
-
-[settings_get]
-tag = "WP-19"
-reason = "manager.get_legacy reads SettingsManager's sqlite-backed kv table; no spawn, settings/config-reads bucket."
-
-[settings_get_all]
-tag = "WP-19"
-reason = "manager.get_all reads the full kv map; no spawn."
-
 [settings_open_file]
 tag = "desktop-only-forever"
 reason = "manager.open_file calls open_path (settings/mod.rs:1026), which spawns explorer.exe/`open`/xdg-open — native open-in-OS-app."
-
-[settings_read_file]
-tag = "WP-19"
-reason = "manager.read resolves+reads a settings.json doc from disk; no spawn."
-
-[settings_set]
-tag = "WP-19"
-reason = "manager.set_legacy writes the same sqlite kv table; no spawn."
-
-[settings_write_field]
-tag = "WP-19"
-reason = "manager.write_field patches a settings.json doc on disk; no spawn."
 
 [spike_grant_fs_read]
 tag = "desktop-only-forever"
@@ -1052,18 +1004,6 @@ reason = "sqlx SELECT/INSERT on studio threads table; no spawn in studio_threads
 [studio_thread_list_recent]
 tag = "WP-19"
 reason = "sqlx SELECT recent studio threads; no spawn."
-
-[supabase_config_clear]
-tag = "WP-19"
-reason = "Deletes supabase.json via std::fs::remove_file; no spawn."
-
-[supabase_config_get]
-tag = "WP-19"
-reason = "Reads app_data_dir/supabase.json; plain fs, settings/config read parity."
-
-[supabase_config_set]
-tag = "WP-19"
-reason = "Writes supabase.json (url/anon/service_role_key) via fs; no spawn, config write."
 
 [terminal_detect_shells]
 tag = "WP-19"

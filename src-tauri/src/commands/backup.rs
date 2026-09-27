@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -57,6 +57,11 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::commands::db::PaDb;
 use crate::commands::secrets::{self, SecretsLock};
+// List/delete and the bundle-manifest types are shared with the daemon's RPC
+// arms; re-exported so every existing `commands::backup::…` path still works.
+use crate::server::shared::backups as shared;
+use crate::server::shared::backups::{read_manifest, read_zip_bytes};
+pub use crate::server::shared::backups::{BackupManifest, BackupSummary, PathMode, PathWarning};
 
 const BACKUP_FORMAT_VERSION: u32 = 3;
 const BACKUP_SCHEMA_VERSION: i64 = 7;
@@ -126,47 +131,8 @@ pub struct PkgEntry {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PathMode {
-    Raw,
-    Tokenized,
-    Bundled,
-}
-
-impl Default for PathMode {
-    fn default() -> Self {
-        PathMode::Raw
-    }
-}
-
-/// Recorded for any path that couldn't be tokenized (lives outside `$HOME`).
-/// The UI surfaces these so users know the restore target may not see those
-/// files. We don't fail the export over them — the user already chose
-/// tokenized knowing same-machine recovery still works.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PathWarning {
-    pub table: String,
-    pub column: String,
-    pub value: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BackupManifest {
-    pub format_version: u32,
-    pub schema_version: i64,
-    pub created_at: String,
-    pub hostname: String,
-    pub username: String,
-    pub path_mode: PathMode,
-    pub home_dir: Option<String>, // export-time $HOME, present iff path_mode == tokenized
-    pub has_secrets: bool,
-    pub pkg_count: u32,
-    #[serde(default)]
-    pub path_warnings: Vec<PathWarning>,
-}
-
+// `BackupManifest` itself is defined in `server::shared::backups` (list needs
+// it on the daemon too); only the export-time constructor lives here.
 impl BackupManifest {
     fn new(
         path_mode: PathMode,
@@ -188,17 +154,6 @@ impl BackupManifest {
             path_warnings,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct BackupSummary {
-    pub path: String,
-    pub created_at: String,
-    pub size_bytes: u64,
-    pub schema_version: i64,
-    pub has_secrets: bool,
-    pub pkg_count: u32,
-    pub path_mode: PathMode,
 }
 
 #[derive(Debug, Serialize)]
@@ -486,44 +441,7 @@ pub async fn backup_import<R: tauri::Runtime>(
 pub async fn backup_list<R: tauri::Runtime>(
     app: AppHandle<R>,
 ) -> Result<Vec<BackupSummary>, String> {
-    let dir = local_backups_dir(&app)?;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| format!("read backups dir: {e}"))? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("ikbak") {
-            continue;
-        }
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        match read_manifest(&path) {
-            Ok(m) => out.push(BackupSummary {
-                path: path.to_string_lossy().into_owned(),
-                created_at: m.created_at,
-                size_bytes: size,
-                schema_version: m.schema_version,
-                has_secrets: m.has_secrets,
-                pkg_count: m.pkg_count,
-                path_mode: m.path_mode,
-            }),
-            Err(_) => out.push(BackupSummary {
-                path: path.to_string_lossy().into_owned(),
-                created_at: String::new(),
-                size_bytes: size,
-                schema_version: 0,
-                has_secrets: false,
-                pkg_count: 0,
-                path_mode: PathMode::Raw,
-            }),
-        }
-    }
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(out)
+    shared::list(&local_backups_dir(&app)?)
 }
 
 #[tauri::command]
@@ -531,17 +449,7 @@ pub async fn backup_delete<R: tauri::Runtime>(
     app: AppHandle<R>,
     path: String,
 ) -> Result<(), String> {
-    let target = PathBuf::from(&path);
-    let allowed = local_backups_dir(&app)?;
-    let canon_target = fs::canonicalize(&target).map_err(|e| format!("canon target: {e}"))?;
-    let canon_allowed = fs::canonicalize(&allowed).map_err(|e| format!("canon allowed: {e}"))?;
-    if !canon_target.starts_with(&canon_allowed) {
-        return Err(format!(
-            "refusing to delete file outside backups dir: {}",
-            target.display()
-        ));
-    }
-    fs::remove_file(&canon_target).map_err(|e| format!("delete: {e}"))
+    shared::delete(&local_backups_dir(&app)?, &path)
 }
 
 // ─── one-time db-file rename (pa.db → ikenga.db) ─────────────────────────────
@@ -1310,11 +1218,6 @@ async fn read_installed_pkgs(db_path: &Path) -> Result<Vec<PkgEntry>, String> {
     }
 }
 
-fn read_manifest(zip_path: &Path) -> Result<BackupManifest, String> {
-    let bytes = read_zip_bytes(zip_path, "manifest.json")?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("parse manifest: {e}"))
-}
-
 fn read_pkgs_from_zip(zip_path: &Path) -> Result<Vec<PkgEntry>, String> {
     match read_zip_bytes(zip_path, "installed-pkgs.json") {
         Ok(bytes) => {
@@ -1322,17 +1225,6 @@ fn read_pkgs_from_zip(zip_path: &Path) -> Result<Vec<PkgEntry>, String> {
         }
         Err(_) => Ok(Vec::new()), // tolerate older bundles without the file
     }
-}
-
-fn read_zip_bytes(zip_path: &Path, name: &str) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(zip_path).map_err(|e| format!("open zip: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
-    let mut entry = archive.by_name(name).map_err(|e| format!("{name}: {e}"))?;
-    let mut buf = Vec::new();
-    entry
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("read {name}: {e}"))?;
-    Ok(buf)
 }
 
 fn extract_app_db(zip_path: &Path, dest: &Path) -> Result<(), String> {
@@ -1367,7 +1259,7 @@ fn local_backups_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, S
         .path()
         .app_local_data_dir()
         .map_err(|e| format!("app_local_data_dir: {e}"))?
-        .join("backups");
+        .join(shared::BACKUPS_DIR);
     Ok(dir)
 }
 

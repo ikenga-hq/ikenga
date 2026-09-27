@@ -359,12 +359,9 @@ pub fn pkg_health_remove_all(
 // no row exists yet — handy for first-launch reads before defaults have
 // been seeded by `register()` (rare, but cheap insurance).
 
-#[derive(serde::Serialize)]
-pub struct PkgSettingsSnapshot {
-    pub pkg_id: String,
-    pub schema: serde_json::Value,
-    pub values: serde_json::Value,
-}
+// The table read + merge is `crate::pkg::settings_values`, shared with the
+// daemon (which takes the schema from its `--pkgs-dir` manifest index).
+pub use crate::pkg::settings_values::PkgSettingsSnapshot;
 
 #[tauri::command]
 pub fn pkg_settings_get(
@@ -374,43 +371,8 @@ pub fn pkg_settings_get(
 ) -> Result<PkgSettingsSnapshot, String> {
     let schema = settings.0.schema_for(&pkg_id);
     let db_clone = db.inner().clone();
-    let pkg_for_query = pkg_id.clone();
-    let stored: serde_json::Map<String, serde_json::Value> =
-        tauri::async_runtime::block_on(async move {
-            let pool = db_clone.ensure_pool().await?;
-            let rows: Vec<(String, String)> =
-                sqlx::query_as("SELECT key, value_json FROM pkg_settings WHERE pkg_id = ?")
-                    .bind(&pkg_for_query)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| format!("read pkg_settings: {e}"))?;
-            let mut obj = serde_json::Map::new();
-            for (k, vj) in rows {
-                let v: serde_json::Value =
-                    serde_json::from_str(&vj).unwrap_or(serde_json::Value::String(vj));
-                obj.insert(k, v);
-            }
-            Ok::<_, String>(obj)
-        })?;
-
-    // Merge: schema defaults provide the baseline, stored rows override.
-    // Lets `pkg_settings_get` return a complete shape from first-launch even
-    // before the user has set anything (registry doesn't pre-seed because the
-    // pkg_settings.pkg_id FK isn't satisfied until kernel persists install).
-    let mut merged = serde_json::Map::new();
-    if let Some(fields) = &schema {
-        for f in fields {
-            merged.insert(f.key.clone(), f.default.clone());
-        }
-    }
-    for (k, v) in stored {
-        merged.insert(k, v);
-    }
-
-    Ok(PkgSettingsSnapshot {
-        pkg_id,
-        schema: serde_json::to_value(schema).unwrap_or(serde_json::Value::Null),
-        values: serde_json::Value::Object(merged),
+    tauri::async_runtime::block_on(async move {
+        crate::pkg::settings_values::get(&db_clone, pkg_id, schema).await
     })
 }
 
@@ -744,27 +706,9 @@ pub fn pkg_settings_set(
     value: serde_json::Value,
 ) -> Result<(), String> {
     let db_clone = db.inner().clone();
-    let value_json = serde_json::to_string(&value).map_err(|e| format!("serialize value: {e}"))?;
-    let now = chrono::Utc::now().timestamp_millis();
     tauri::async_runtime::block_on(async move {
-        let pool = db_clone.ensure_pool().await?;
-        sqlx::query(
-            "INSERT INTO pkg_settings (pkg_id, key, value_json, updated_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(pkg_id, key) DO UPDATE SET
-               value_json = excluded.value_json,
-               updated_at = excluded.updated_at",
-        )
-        .bind(&pkg_id)
-        .bind(&key)
-        .bind(&value_json)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .map_err(|e| format!("upsert pkg_settings: {e}"))?;
-        Ok::<_, String>(())
-    })?;
-    Ok(())
+        crate::pkg::settings_values::set(&db_clone, &pkg_id, &key, &value).await
+    })
 }
 
 // ─── activity-bar badge (WP-11) ───────────────────────────────────────────────

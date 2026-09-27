@@ -19,6 +19,8 @@ pub mod pkg_index;
 pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
+mod rpc_local;
+pub mod shared;
 pub mod static_files;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
@@ -90,6 +92,10 @@ pub struct AppState {
     /// in it (not only the iframe-serveable ones `pkg_static` keeps); empty
     /// without `--pkgs-dir`. See `server::pkg_index`.
     pub pkg_index: Arc<PkgIndex>,
+    /// The settings manager behind the `settings_*` arms, rooted at
+    /// `--data-dir` (see `server::rpc_local::DaemonSettings`). `None` without
+    /// a data dir or without a home; those arms then say which is missing.
+    pub(crate) settings: Option<Arc<rpc_local::DaemonSettings>>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -214,6 +220,30 @@ pub fn create_router(
     pa_db: Option<Arc<crate::db::PaDb>>,
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 ) -> Router {
+    // Single-user seam (G-PRINCIPAL / WP-20): the personal settings file is
+    // `<home>/.ikenga/settings.json` for the daemon PROCESS's home
+    // (`platform::home_dir` reads HOME / USERPROFILE), shared by every caller
+    // holding the token — the same seam as `fs_home` and the Ngwa store.
+    router_with_home(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        shutdown_tx,
+        crate::platform::home_dir(),
+    )
+}
+
+/// [`create_router`] with the settings home made explicit, so tests never
+/// resolve (or clear) the real user's `~/.ikenga/settings.json`.
+pub(crate) fn router_with_home(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    home: Option<PathBuf>,
+) -> Router {
     let (default_tx, _) = tokio::sync::broadcast::channel(4);
     let shutdown_tx = shutdown_tx.unwrap_or(default_tx);
     let spa_service = SpaStaticService::new(&config.static_dir);
@@ -224,6 +254,14 @@ pub fn create_router(
     let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
     let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
     let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
+    let settings = match (&pa_db, &config.data_dir, home) {
+        (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
+            db.clone(),
+            dir.clone(),
+            home,
+        ))),
+        _ => None,
+    };
     let allowed_origins = config.allowed_origins.clone();
     let state = Arc::new(AppState {
         config,
@@ -233,6 +271,7 @@ pub fn create_router(
         pa_db,
         pkg_static,
         pkg_index,
+        settings,
         shutdown_tx,
     });
 
