@@ -18,6 +18,7 @@ pub mod health;
 pub mod pkg_index;
 pub mod pkg_static;
 pub mod pty_ws;
+mod reserved;
 pub mod rpc;
 mod rpc_claude;
 mod rpc_files;
@@ -272,7 +273,7 @@ pub(crate) fn router_with_home(
         pa_db,
         shutdown_tx,
         home,
-        rpc_shell::PathGuard::Allowlist,
+        rpc_shell::PathGuard::allowlist(),
     )
 }
 
@@ -288,6 +289,15 @@ pub(crate) fn router_with(
     home: Option<PathBuf>,
     path_guard: rpc_shell::PathGuard,
 ) -> Router {
+    // Whatever the allowlist covers, no caller path reaches this daemon's own
+    // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
+    // daemon.json, …) or the per-user discovery file, both of which hold the
+    // token or would widen the boundary. Attached here so every router —
+    // tests included — refuses its own data dir. See `server::reserved`.
+    let path_guard = path_guard.reserving(reserved::Reserved::new(
+        config.data_dir.clone(),
+        vec![discovery::user_temp_path()],
+    ));
     let (default_tx, _) = tokio::sync::broadcast::channel(4);
     let shutdown_tx = shutdown_tx.unwrap_or(default_tx);
     let spa_service = SpaStaticService::new(&config.static_dir);

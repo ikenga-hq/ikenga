@@ -165,6 +165,8 @@ pub(super) async fn claude_config_read_file(state: &AppState, args: &Value) -> R
         let canonical = path
             .canonicalize()
             .map_err(|e| format!("read failed: {e}"))?;
+        // Whichever base admits it, never the daemon's own state.
+        state.path_guard.check_reserved(&canonical)?;
         let under = |base: Option<PathBuf>| {
             base.and_then(|b| b.canonicalize().ok())
                 .is_some_and(|b| canonical.starts_with(b))
@@ -555,7 +557,7 @@ mod tests {
             with_data.then(|| db.clone()),
             None,
             with_home.then(|| home.clone()),
-            PathGuard::Roots(Arc::new(roots)),
+            PathGuard::roots(Arc::new(roots)),
         );
         Daemon {
             _tmp: tmp,

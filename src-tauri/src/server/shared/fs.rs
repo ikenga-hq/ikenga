@@ -73,6 +73,31 @@ pub async fn search(
     show_ignored: bool,
     limit: Option<usize>,
 ) -> Result<FsSearchResult, String> {
+    search_skipping(
+        resolve,
+        root,
+        query,
+        show_hidden,
+        show_ignored,
+        limit,
+        |_| false,
+    )
+    .await
+}
+
+/// [`search`], leaving out every entry `skip` names: it is neither matched
+/// nor, if a directory, descended. The desktop passes nothing (via
+/// [`search`]); the daemon skips its own data dir and discovery file, which
+/// every other daemon arm refuses (`server::reserved`).
+pub async fn search_skipping(
+    resolve: Resolve<'_>,
+    root: &str,
+    query: &str,
+    show_hidden: bool,
+    show_ignored: bool,
+    limit: Option<usize>,
+    skip: impl Fn(&std::fs::DirEntry) -> bool + Send + 'static,
+) -> Result<FsSearchResult, String> {
     let resolved = resolve(root)?;
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
@@ -96,6 +121,9 @@ pub async fn search(
                 Err(_) => continue,
             };
             for entry in rd.flatten() {
+                if skip(&entry) {
+                    continue;
+                }
                 let name = match entry.file_name().into_string() {
                     Ok(n) => n,
                     Err(_) => continue,

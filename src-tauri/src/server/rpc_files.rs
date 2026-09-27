@@ -15,7 +15,9 @@
 //! **Paths.** Every caller path goes through the daemon's `PathGuard`, which
 //! resolves it exactly as the desktop's `resolve_allowlisted` does and checks
 //! the canonical result against the fs allowlist (`<data-dir>/fs_roots.json`)
-//! — the boundary the served `fs_read` / `fs_write` use. The actions arms take
+//! — the boundary the served `fs_read` / `fs_write` use — and then refuses the
+//! daemon's own state (`--data-dir`, the discovery file) even when the
+//! allowlist covers it (`server::reserved`). The actions arms take
 //! no path: they read and write `<home>/.ikenga/{actions,keybindings}.json`
 //! (the daemon PROCESS's home — the same single-user seam as the personal
 //! `settings.json`, G-PRINCIPAL topology B) and `<root>/.ikenga/…` for the
@@ -87,9 +89,12 @@ pub(super) fn fs_mime(state: &AppState, args: &Value) -> RpcResponse {
     respond("fs_mime", r)
 }
 
-/// The root must be inside the allowlist; the walk never follows a symlinked
-/// directory out of it (see `shared::fs::search`). Same caps as the desktop:
-/// `limit` (default 500, minimum 1), early stop with `truncated`.
+/// The root must be inside the allowlist (and not the daemon's own state);
+/// the walk never follows a symlinked directory out of it (see
+/// `shared::fs::search`) and never matches or descends into the data dir or
+/// the discovery file, even when the root is an ancestor of them. Same caps
+/// as the desktop: `limit` (default 500, minimum 1), early stop with
+/// `truncated`.
 pub(super) async fn fs_search(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let root: String = targ(args, &["root"])?;
@@ -98,13 +103,25 @@ pub(super) async fn fs_search(state: &AppState, args: &Value) -> RpcResponse {
         let show_ignored: bool = targ(args, &["showIgnored", "show_ignored"])?;
         let limit: Option<usize> = targ(args, &["limit"])?;
         state.path_guard.ready()?;
-        shared_fs::search(
+        // Resolved once per walk; every entry is then canonical (the root is,
+        // and the walk follows no symlink), so the per-entry check is a prefix
+        // compare plus, for a directory, its inode.
+        let reserved = state.path_guard.reserved_snapshot();
+        shared_fs::search_skipping(
             &resolver(state),
             &root,
             &query,
             show_hidden,
             show_ignored,
             limit,
+            move |entry| {
+                let dir_meta = entry
+                    .file_type()
+                    .is_ok_and(|t| t.is_dir())
+                    .then(|| entry.metadata().ok())
+                    .flatten();
+                reserved.skips_entry(&entry.path(), dir_meta.as_ref())
+            },
         )
         .await
     }
@@ -304,7 +321,7 @@ mod tests {
         )
         .unwrap();
         let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
-        let guard = PathGuard::Roots(Arc::new(roots));
+        let guard = PathGuard::roots(Arc::new(roots));
         let db = Arc::new(PaDb::new(data.join("ikenga.db")));
         let router = router_with(
             config(Some(data.clone())),
@@ -340,7 +357,7 @@ mod tests {
             None,
             None,
             None,
-            PathGuard::Allowlist,
+            PathGuard::allowlist(),
         )
     }
 
