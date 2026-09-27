@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::claude::event::ChatEvent;
@@ -28,8 +28,7 @@ use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
 use crate::engines::codex_pty::parser as codex_parser;
 use crate::engines::{EngineHandle, EngineRegistryState, OpenRouterHttpEngineState};
-#[cfg(windows)]
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 /// Cache state. Lives in `app_data_dir` and is `.manage()`d in `lib.rs`.
 #[derive(Clone, Debug)]
@@ -629,11 +628,27 @@ fn to_wsl_path(p: &str) -> String {
     p.to_string()
 }
 
-/// Build the piped engine command for `launch` with `args`. `set_cwd` is
-/// false for engines that take the directory as a flag instead (codex `--cd`);
-/// a WSL launch always passes `--cd` to `wsl.exe`.
-fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bool) -> Command {
-    let mut cmd = match launch {
+/// Stdio wiring for every in-process engine child: all three streams piped
+/// (the run task writes the prompt to stdin and reads stdout/stderr),
+/// `kill_on_drop` off (tokio's default, which the inline spawn never
+/// changed — cancel goes through `ChiRunHandle`), console flash suppressed on
+/// Windows (a no-op elsewhere, as the old `#[cfg(windows)]` call was).
+const ENGINE_PIPED_OPTS: PipedOpts = PipedOpts {
+    stdin: StdioMode::Piped,
+    stdout: StdioMode::Piped,
+    stderr: StdioMode::Piped,
+    kill_on_drop: false,
+    no_console_window: true,
+    detached: false,
+    new_process_group: false,
+};
+
+/// Build the engine spawn spec for `launch` with `args`; spawned with
+/// [`ENGINE_PIPED_OPTS`]. `set_cwd` is false for engines that take the
+/// directory as a flag instead (codex `--cd`); a WSL launch always passes
+/// `--cd` to `wsl.exe`.
+fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bool) -> SpawnSpec {
+    let mut spec = match launch {
         EngineLaunch::Native(path) => {
             let is_batch = cfg!(windows)
                 && path
@@ -641,15 +656,16 @@ fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bo
                     .and_then(|e| e.to_str())
                     .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
                     .unwrap_or(false);
-            let mut cmd = if is_batch {
-                let mut cmd = Command::new("cmd.exe");
-                cmd.arg("/c").arg(path);
-                cmd
+            let mut spec = if is_batch {
+                let mut spec = SpawnSpec::new("cmd.exe");
+                spec.arg("/c").arg(path);
+                spec
             } else {
-                Command::new(path)
+                SpawnSpec::new(path)
             };
-            cmd.args(args).env("PATH", crate::runtime::augmented_path());
-            cmd
+            spec.args(args)
+                .env("PATH", crate::runtime::augmented_path());
+            spec
         }
         EngineLaunch::Wsl { binary } => {
             let script = std::iter::once(binary.as_str())
@@ -657,8 +673,8 @@ fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bo
                 .map(sh_quote)
                 .collect::<Vec<_>>()
                 .join(" ");
-            let mut cmd = Command::new("wsl.exe");
-            cmd.args([
+            let mut spec = SpawnSpec::new("wsl.exe");
+            spec.args([
                 "--cd",
                 &cwd.replace('\\', "/"),
                 "-e",
@@ -667,18 +683,13 @@ fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bo
                 "-c",
                 &script,
             ]);
-            cmd
+            spec
         }
     };
     if set_cwd {
-        cmd.current_dir(cwd);
+        spec.current_dir(cwd);
     }
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    cmd.no_console_window();
-    cmd
+    spec
 }
 
 /// Return the command for the requested engine.
@@ -689,7 +700,7 @@ fn build_engine_command(
     model: Option<&str>,
     mode: Option<&str>,
     resume_id: Option<&str>,
-) -> Result<Command, String> {
+) -> Result<SpawnSpec, String> {
     build_engine_command_with(
         &HostResolver,
         engine_id,
@@ -709,7 +720,7 @@ fn build_engine_command_with(
     model: Option<&str>,
     mode: Option<&str>,
     resume_id: Option<&str>,
-) -> Result<Command, String> {
+) -> Result<SpawnSpec, String> {
     let s = |v: &str| v.to_string();
     match engine_id {
         "claude-code" => {
@@ -807,9 +818,10 @@ fn build_engine_command_with(
     }
 }
 
-/// Spawns the engine child and returns the (child, stdin, stdout, stderr).
+/// Spawns the engine child through the session executor and returns the
+/// (child, stdin, stdout, stderr).
 fn spawn_engine_child(
-    mut cmd: Command,
+    spec: SpawnSpec,
 ) -> Result<
     (
         Child,
@@ -819,7 +831,9 @@ fn spawn_engine_child(
     ),
     String,
 > {
-    let mut child = cmd.spawn().map_err(|e| format!("spawn engine: {e}"))?;
+    let mut child = crate::executor::current()
+        .spawn_piped(spec, ENGINE_PIPED_OPTS)
+        .map_err(|e| format!("spawn engine: {e}"))?;
     let stdin = child
         .stdin
         .take()
@@ -1138,7 +1152,7 @@ const OPENROUTER_FLUSH_BYTES: usize = 512;
 async fn spawn_engine_or_fail(
     db: &PaDb,
     run_id: &str,
-    cmd: Result<Command, String>,
+    cmd: Result<SpawnSpec, String>,
 ) -> Result<EngineChild, String> {
     match cmd.and_then(spawn_engine_child) {
         Ok(child) => Ok(child),
@@ -2450,12 +2464,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cmd.as_std().get_program(), "agy");
-        let args: Vec<&str> = cmd
-            .as_std()
-            .get_args()
-            .map(|s| s.to_str().unwrap())
-            .collect();
+        assert_eq!(cmd.program, "agy");
+        let args: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(
             args,
             vec![
@@ -2486,12 +2496,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cmd.as_std().get_program(), "opencode");
-        let args: Vec<&str> = cmd
-            .as_std()
-            .get_args()
-            .map(|s| s.to_str().unwrap())
-            .collect();
+        assert_eq!(cmd.program, "opencode");
+        let args: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(
             args,
             vec!["run", "-p", "fix the bug", "--model", "claude-3-7-sonnet",]
@@ -2511,12 +2517,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cmd.as_std().get_program(), "pi");
-        let args: Vec<&str> = cmd
-            .as_std()
-            .get_args()
-            .map(|s| s.to_str().unwrap())
-            .collect();
+        assert_eq!(cmd.program, "pi");
+        let args: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
         assert_eq!(
             args,
             vec!["-p", "refactor this file", "--model", "claude-3-7-sonnet",]
@@ -2554,9 +2556,9 @@ mod tests {
         }
     }
 
-    fn args_of(cmd: &Command) -> Vec<String> {
-        cmd.as_std()
-            .get_args()
+    fn args_of(cmd: &SpawnSpec) -> Vec<String> {
+        cmd.args
+            .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect()
     }
@@ -2614,7 +2616,7 @@ mod tests {
             Some("sess-1"),
         )
         .unwrap();
-        assert_eq!(cmd.as_std().get_program(), "wsl.exe");
+        assert_eq!(cmd.program, "wsl.exe");
         let args = args_of(&cmd);
         assert_eq!(
             &args[..6],
@@ -2642,6 +2644,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args_of(&cmd)[6], r"'pi' '-p' 'it'\''s $HOME; rm -rf /'");
+    }
+
+    /// The spec carries exactly what the inline tokio `Command` used to set:
+    /// augmented `PATH` on a native launch, cwd unless the engine takes it
+    /// as a flag (codex `--cd`), and no other env.
+    #[test]
+    fn engine_spec_keeps_path_and_the_set_cwd_split() {
+        let claude = build_engine_command_with(
+            &FakeResolver::native(&["claude"]),
+            "claude-code",
+            "",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(claude.cwd, Some(PathBuf::from("/tmp")));
+        assert!(!claude.env.clear);
+        assert_eq!(
+            claude.env.vars,
+            vec![(
+                "PATH".into(),
+                crate::runtime::augmented_path().to_os_string()
+            )]
+        );
+
+        let codex = build_engine_command_with(
+            &FakeResolver::native(&["codex"]),
+            "codex",
+            "",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(codex.cwd, None);
+        assert_eq!(codex.env.vars.len(), 1);
+
+        // WSL: cwd is set on the host side too; wsl.exe gets no PATH override.
+        let wsl = build_engine_command_with(
+            &FakeResolver::wsl(&["pi"]),
+            "pi",
+            "",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(wsl.cwd, Some(PathBuf::from("/tmp")));
+        assert!(wsl.env.vars.is_empty());
+
+        assert_eq!(
+            ENGINE_PIPED_OPTS,
+            PipedOpts {
+                stdin: StdioMode::Piped,
+                stdout: StdioMode::Piped,
+                stderr: StdioMode::Piped,
+                kill_on_drop: false,
+                no_console_window: true,
+                detached: false,
+                new_process_group: false,
+            }
+        );
+    }
+
+    /// The executor-routed spawn hands back all three pipes, wired to the
+    /// child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_engine_child_pipes_all_three_streams() {
+        let mut spec = SpawnSpec::new("/bin/sh");
+        spec.args(["-c", "cat; echo err >&2"]);
+        let (mut child, mut stdin, mut stdout, stderr) = spawn_engine_child(spec).unwrap();
+        stdin.write_all(b"ping").await.unwrap();
+        drop(stdin);
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).await.unwrap();
+        let mut err = String::new();
+        stderr
+            .expect("stderr piped")
+            .read_to_string(&mut err)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(out, "ping");
+        assert_eq!(err.trim(), "err");
     }
 
     #[test]
@@ -2703,7 +2794,7 @@ mod tests {
         cache_update_status(&db, &run_id, "running", None)
             .await
             .unwrap();
-        let bogus = Command::new("ikenga-definitely-not-a-real-binary");
+        let bogus = SpawnSpec::new("ikenga-definitely-not-a-real-binary");
         let err = spawn_engine_or_fail(&db, &run_id, Ok(bogus))
             .await
             .unwrap_err();
