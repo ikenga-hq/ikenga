@@ -13,16 +13,11 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::commands::db::PaDb;
-use crate::notifications::{
-    self, mute, producers, ListQuery, Notification, NotificationKind, UnreadCount,
-};
+use crate::notifications::{self, mute, ops, producers, Notification, UnreadCount};
 use crate::settings::SettingsManager;
 
-fn parse_kinds(kinds: Option<Vec<String>>) -> Result<Option<Vec<NotificationKind>>, String> {
-    kinds
-        .map(|ks| ks.iter().map(|k| NotificationKind::parse(k)).collect())
-        .transpose()
-}
+// The bodies live in `crate::server::shared::notifications::ops` (WP-19
+// slice 4), shared with the daemon's `/api/rpc` arms; these stay thin.
 
 /// List notifications, newest first. Muted kinds are hidden unless
 /// `includeMuted` is true.
@@ -36,20 +31,14 @@ pub async fn notifications_list(
     before: Option<i64>,
     include_muted: Option<bool>,
 ) -> Result<Vec<Notification>, String> {
-    let exclude = if include_muted.unwrap_or(false) {
-        Vec::new()
-    } else {
-        mute::muted_kinds(settings.inner())
-    };
-    let query = ListQuery {
-        unread_only: unread_only.unwrap_or(false),
-        kinds: parse_kinds(kinds)?,
-        exclude,
+    let args = ops::ListArgs {
+        unread_only,
+        kinds,
         limit,
         before,
+        include_muted,
     };
-    let pool = db.ensure_pool().await?;
-    notifications::list(&pool, &query).await
+    ops::list(&db, || Ok(mute::muted_kinds(settings.inner())), args).await
 }
 
 /// Unread total + per-kind counts, muted kinds excluded. Backs the bell badge
@@ -60,8 +49,7 @@ pub async fn notifications_unread_count(
     settings: State<'_, Arc<SettingsManager>>,
 ) -> Result<UnreadCount, String> {
     let muted = mute::muted_kinds(settings.inner());
-    let pool = db.ensure_pool().await?;
-    notifications::unread_count(&pool, &muted).await
+    ops::unread_count(&db, &muted).await
 }
 
 /// Mark rows read. Returns how many changed.
@@ -70,8 +58,7 @@ pub async fn notifications_mark_read(
     db: State<'_, Arc<PaDb>>,
     ids: Vec<i64>,
 ) -> Result<u64, String> {
-    let pool = db.ensure_pool().await?;
-    notifications::mark_read(&pool, &ids).await
+    ops::mark_read(&db, &ids).await
 }
 
 /// Mark every unread row read (optionally one kind). Muted rows included —
@@ -81,9 +68,7 @@ pub async fn notifications_mark_all_read(
     db: State<'_, Arc<PaDb>>,
     kind: Option<String>,
 ) -> Result<u64, String> {
-    let kind = kind.as_deref().map(NotificationKind::parse).transpose()?;
-    let pool = db.ensure_pool().await?;
-    notifications::mark_all_read(&pool, kind).await
+    ops::mark_all_read(&db, kind).await
 }
 
 /// Current mute state (muted kinds + which kinds can be muted).
@@ -91,9 +76,7 @@ pub async fn notifications_mark_all_read(
 pub async fn notifications_mute_state(
     settings: State<'_, Arc<SettingsManager>>,
 ) -> Result<mute::MuteState, String> {
-    Ok(mute::MuteState::from_muted(mute::muted_kinds(
-        settings.inner(),
-    )))
+    Ok(ops::mute_state(settings.inner()))
 }
 
 /// Mute one kind (writes settings.json). `permission` and `violation` are
@@ -105,18 +88,7 @@ pub async fn notifications_mute_kind(
     settings: State<'_, Arc<SettingsManager>>,
     kind: String,
 ) -> Result<mute::MuteState, String> {
-    let kind = NotificationKind::parse(&kind)?;
-    let state = mute::set_muted(settings.inner(), kind, true).await?;
-    // Best-effort: without it, un-muting just marks nothing read.
-    match db.ensure_pool().await {
-        Ok(pool) => {
-            if let Err(e) = mute::note_muted(&pool, kind).await {
-                log::warn!(target: "ikenga::notifications", "{e}");
-            }
-        }
-        Err(e) => log::warn!(target: "ikenga::notifications", "no db pool: {e}"),
-    }
-    Ok(state)
+    ops::mute_kind(&db, settings.inner(), kind).await
 }
 
 /// Unmute one kind. Only rows of that kind recorded while it was muted
@@ -129,13 +101,7 @@ pub async fn notifications_unmute_kind(
     settings: State<'_, Arc<SettingsManager>>,
     kind: String,
 ) -> Result<mute::MuteState, String> {
-    let kind = NotificationKind::parse(&kind)?;
-    let was_muted = mute::muted_kinds(settings.inner()).contains(&kind);
-    if was_muted {
-        let pool = db.ensure_pool().await?;
-        mute::clear_muted_backlog(&pool, kind).await?;
-    }
-    mute::set_muted(settings.inner(), kind, false).await
+    ops::unmute_kind(&db, settings.inner(), kind).await
 }
 
 /// `update` producer for the two update checks that live in the webview:
@@ -210,16 +176,7 @@ pub fn spawn_boot_update_sweep(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_kinds_accepts_known_and_rejects_unknown() {
-        assert_eq!(parse_kinds(None).unwrap(), None);
-        assert_eq!(
-            parse_kinds(Some(vec!["update".into(), "run_failed".into()])).unwrap(),
-            Some(vec![NotificationKind::Update, NotificationKind::RunFailed])
-        );
-        assert!(parse_kinds(Some(vec!["toast".into()])).is_err());
-    }
+    use crate::notifications::NotificationKind;
 
     /// The command-level `update` path: what the FE's two update checks call.
     #[tokio::test]

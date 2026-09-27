@@ -49,7 +49,7 @@ const NO_HOME_SETTINGS: &str =
 // ─── argument helpers ────────────────────────────────────────────────────────
 
 /// The first of `names` present in `args` with a non-null value.
-fn arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a Value> {
+pub(super) fn arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names
         .iter()
         .find_map(|name| args.get(*name).filter(|v| !v.is_null()))
@@ -57,7 +57,7 @@ fn arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a Value> {
 
 /// An optional string argument; present-but-not-a-string is a caller error,
 /// as it is when Tauri deserializes an `Option<String>`.
-fn opt_str(args: &Value, names: &[&str]) -> Result<Option<String>, String> {
+pub(super) fn opt_str(args: &Value, names: &[&str]) -> Result<Option<String>, String> {
     match arg(args, names) {
         None => Ok(None),
         Some(Value::String(s)) => Ok(Some(s.clone())),
@@ -65,7 +65,7 @@ fn opt_str(args: &Value, names: &[&str]) -> Result<Option<String>, String> {
     }
 }
 
-fn req_str(args: &Value, names: &[&str]) -> Result<String, String> {
+pub(super) fn req_str(args: &Value, names: &[&str]) -> Result<String, String> {
     opt_str(args, names)?.ok_or_else(|| format!("`{}` is required", names[0]))
 }
 
@@ -105,14 +105,14 @@ fn req_bool(args: &Value, names: &[&str]) -> Result<bool, String> {
 }
 
 /// `Ok(v)` → success with `v`'s JSON; `Err(e)` → `"<cmd>: <e>"`.
-fn respond<T: serde::Serialize>(cmd: &str, result: Result<T, String>) -> RpcResponse {
+pub(super) fn respond<T: serde::Serialize>(cmd: &str, result: Result<T, String>) -> RpcResponse {
     match result {
         Ok(v) => RpcResponse::success(v),
         Err(e) => RpcResponse::error(format!("{cmd}: {e}")),
     }
 }
 
-fn data_dir<'a>(state: &'a AppState, missing: &str) -> Result<&'a Path, String> {
+pub(super) fn data_dir<'a>(state: &'a AppState, missing: &str) -> Result<&'a Path, String> {
     state
         .config
         .data_dir
@@ -120,7 +120,7 @@ fn data_dir<'a>(state: &'a AppState, missing: &str) -> Result<&'a Path, String> 
         .ok_or_else(|| missing.to_string())
 }
 
-fn pa_db(state: &AppState) -> Result<&PaDb, String> {
+pub(super) fn pa_db(state: &AppState) -> Result<&PaDb, String> {
     state
         .pa_db
         .as_deref()
@@ -189,7 +189,7 @@ impl DaemonSettings {
     }
 }
 
-async fn settings(state: &AppState) -> Result<&SettingsManager, String> {
+pub(super) async fn settings(state: &AppState) -> Result<&SettingsManager, String> {
     match &state.settings {
         Some(s) => Ok(s.manager().await),
         None if state.config.data_dir.is_none() || state.pa_db.is_none() => {

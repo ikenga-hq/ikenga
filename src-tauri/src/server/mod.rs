@@ -20,6 +20,7 @@ pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
 mod rpc_local;
+mod rpc_shell;
 pub mod shared;
 pub mod static_files;
 
@@ -102,6 +103,10 @@ pub struct AppState {
     /// arms then answer the desktop's "home directory not found".
     /// Single-user seam (G-PRINCIPAL / WP-20), same as `settings` above.
     pub(crate) home: Option<PathBuf>,
+    /// The allowlist the project filesystem arms check caller paths against
+    /// (see `server::rpc_shell::PathGuard`): the process-global `fs_roots`
+    /// set in production, a local one in tests.
+    pub(crate) path_guard: rpc_shell::PathGuard,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -252,6 +257,29 @@ pub(crate) fn router_with_home(
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     home: Option<PathBuf>,
 ) -> Router {
+    router_with(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        shutdown_tx,
+        home,
+        rpc_shell::PathGuard::Allowlist,
+    )
+}
+
+/// [`router_with_home`] with the path allowlist made explicit too, so tests
+/// can check the project filesystem arms against a local root set instead of
+/// installing the process-global one (a `OnceLock`).
+pub(crate) fn router_with(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+) -> Router {
     let (default_tx, _) = tokio::sync::broadcast::channel(4);
     let shutdown_tx = shutdown_tx.unwrap_or(default_tx);
     let spa_service = SpaStaticService::new(&config.static_dir);
@@ -281,6 +309,7 @@ pub(crate) fn router_with_home(
         pkg_index,
         settings,
         home,
+        path_guard,
         shutdown_tx,
     });
 
