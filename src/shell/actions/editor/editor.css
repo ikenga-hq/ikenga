@@ -411,6 +411,12 @@
 	border-color: var(--agent);
 }
 
+/* WP-71a: the seat chip matching the Seat field (`aria-pressed`). */
+.view-acts .varchip[aria-pressed='true'] {
+	border-color: var(--primary);
+	color: var(--fg);
+}
+
 .view-acts .iconpick {
 	display: flex;
 	flex-wrap: wrap;

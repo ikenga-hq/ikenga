@@ -47,8 +47,10 @@ interface TerminalViewProps {
  * What a Pop out toast calls this terminal (D-09 `popOut`: the seat's name,
  * else the session's): the active project's seat whose session it is (its
  * own terminal, or a tmux client attached to its run), else `session N`.
- * Mirrors the seat menu's private `returnedName`, read from the roster cache
- * only (a Pop out never waits on a fetch).
+ * Mirrors the seat menu's private `returnedName`/`seatOfTerminal`, read from
+ * the roster cache only (a Pop out never waits on a fetch). Keep the two in
+ * step: WP-71 (which may edit `companion/`) should export `returnedName` from
+ * `seat-menu.tsx` and delete this copy.
  */
 export function popOutName(terminalId: string): string {
 	const seats = cachedSeats(useShellStore.getState().activeProject.id) ?? [];
@@ -230,9 +232,13 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 					</IconButton>
 
 					{ptyId && (
+						// Disabled up front when the terminal isn't running, as the
+						// seat menu's Pop out is: `popOutTerminal` refuses it anyway,
+						// so its refusal toast stays a fallback, not the normal path.
 						<IconButton
 							onClick={handlePopOut}
-							title="Pop out — open this terminal in a detached window"
+							disabled={tab?.status !== 'running'}
+							title={tab?.status === 'running' ? 'Pop out to Window 2' : 'Its terminal isn’t running'}
 							aria-label="Pop out terminal"
 						>
 							<ArrowUpRight className="h-3.5 w-3.5" />

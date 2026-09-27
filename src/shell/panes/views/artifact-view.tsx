@@ -160,7 +160,7 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 			<div className="absolute right-2 top-1 z-10">
 				<IconButton
 					onClick={handlePopOut}
-					title="Pop out — open this file in a detached viewer window"
+					title="Pop out to Window 2"
 					aria-label="Pop out viewer"
 					className="bg-background/80 backdrop-blur-sm"
 				>

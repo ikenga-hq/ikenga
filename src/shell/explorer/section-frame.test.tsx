@@ -8,6 +8,7 @@ import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { __resetBoardUiForTests } from '@/shell/chi-board/board-ui';
 import { useTerminalStore } from '@/terminal/session-store';
 import { SectionFrame } from './section-frame';
@@ -50,6 +51,13 @@ function seatsLink(): HTMLButtonElement {
 // Round 52: every shared store a test touches is reset here, so no test
 // inherits another's panes, terminals or board focus request.
 beforeEach(() => {
+	// The active project first: Sessions (Start a session, the Seats link)
+	// reads it, and its switch resets Companion state.
+	useShellStore.setState({
+		activeProjectId: 'royalti-co',
+		activeProject: { id: 'royalti-co', root_path: '/w', extra_roots: [] },
+		projects: [],
+	});
 	queryClient.clear();
 	__resetBoardUiForTests();
 	useTerminalStore.setState({ tabs: [] } as never);
