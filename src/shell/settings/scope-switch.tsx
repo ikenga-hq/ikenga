@@ -28,7 +28,7 @@ export function SettingsScopeSwitch({
 	// 44px hit-target floor in spacious density (tokens.css
 	// `[data-density='spacious']`; D-03 44px targets, WP-35 DoD).
 	const buttonClass =
-		'min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary';
+		'min-h-[var(--tab-h)] rounded px-2 py-1 text-xs transition-colors outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary';
 	const stateClass = (on: boolean) =>
 		on ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground';
 	return (

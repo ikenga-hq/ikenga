@@ -112,7 +112,7 @@ function SettingsLayout() {
 							<span className="truncate text-foreground">{iykeLine}</span>
 							<button
 								type="button"
-								className="ml-auto shrink-0 rounded p-1 outline-none transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+								className="ml-auto shrink-0 rounded p-1 outline-none transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary"
 								aria-label="Copy the iyke command"
 								onClick={() => void navigator.clipboard.writeText(iykeLine).catch(() => {})}
 							>
