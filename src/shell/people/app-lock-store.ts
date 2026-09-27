@@ -33,7 +33,7 @@ interface AppLockStore {
 	refresh: () => Promise<AppLockStatus | null>;
 }
 
-export const useAppLockStore = create<AppLockStore>((set) => ({
+export const useAppLockStore = create<AppLockStore>()((set, get) => ({
 	status: null,
 	setStatus: (status) => set({ status }),
 	refresh: async () => {
@@ -44,7 +44,7 @@ export const useAppLockStore = create<AppLockStore>((set) => ({
 		} catch {
 			// Not a Tauri window, or the command isn't registered in this
 			// build. Keep whatever we had rather than dropping a live lock.
-			return useAppLockStore.getState().status;
+			return get().status;
 		}
 	},
 }));
