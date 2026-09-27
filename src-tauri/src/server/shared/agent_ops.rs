@@ -9,7 +9,8 @@
 //! (`<home>/.agent-ops/runs/`), and its runtime state file (see
 //! [`jobs_state_path`]). None of it spawns, signals or talks to the agent-ops
 //! daemon — `agent_ops_run_now`, which POSTs to that daemon, stays in
-//! `commands::agent_ops` and is not served.
+//! `commands::agent_ops` and is not served (its job-id rule,
+//! [`trigger_path_segment`], lives here next to the `tail_run` one it builds on).
 //!
 //! The desktop passes `platform::home_dir()`. The headless daemon passes its
 //! router's home seam (`server::router_with_home`), which is the daemon
@@ -71,6 +72,43 @@ fn marker_file_name(job_id: &str) -> Option<String> {
         (Some(std::path::Component::Normal(_)), None) => Some(name),
         _ => None,
     }
+}
+
+/// Characters percent-encoded when a job id becomes ONE path segment of the
+/// daemon's trigger URL: everything except RFC 3986 unreserved (`A-Z a-z 0-9
+/// - . _ ~`) and `:` (a legal `pchar`, and the `ns:name` separator real ids
+/// use — left literal so a valid id's URL is byte-identical to before).
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+const TRIGGER_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b':');
+
+/// Validate a caller-supplied job id and encode it as a single path segment
+/// of `http://127.0.0.1:<port>/jobs/<segment>/trigger`, or say why not.
+///
+/// SECURITY: `agent_ops_run_now` sends the daemon's secret with that POST, so
+/// the id must not be able to steer it to another path, query or fragment.
+/// Refused: anything [`marker_file_name`] refuses (empty, `/`, `\`, NUL, a
+/// non-plain name — the same plain-name rule `tail_run` applies), a `.` / `..`
+/// dot segment (URL parsers collapse those, `%2e%2e` included), `?`, `#`, `%`
+/// (no pre-encoded ids: `%2e%2e` / `%2f` would be decoded by the daemon's
+/// router), and any control character. What is left is percent-encoded
+/// (non-ASCII as its UTF-8 bytes) so nothing in it can act as a delimiter.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub(crate) fn trigger_path_segment(job_id: &str) -> Result<String, &'static str> {
+    if job_id == "." || job_id == ".." {
+        return Err("job id is a dot segment");
+    }
+    if job_id.contains(['?', '#', '%']) || job_id.chars().any(char::is_control) {
+        return Err("job id contains a URL delimiter or control character");
+    }
+    if marker_file_name(job_id).is_none() {
+        return Err("job id is not a plain name");
+    }
+    Ok(percent_encoding::utf8_percent_encode(job_id, TRIGGER_SEGMENT).to_string())
 }
 
 /// Project-scoped job config the skill + daemon read new-wins. Under $HOME.
@@ -721,6 +759,60 @@ mod tests {
         assert_eq!(marker_file_name("..").as_deref(), Some("...marker.json"));
         for bad in ["", "../x", "a/b", "/etc/x", "..\\x", "a\\b", "a\0b"] {
             assert_eq!(marker_file_name(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn trigger_path_segment_encodes_real_ids_and_refuses_steering() {
+        // Real ids pass through byte-identical (`:` stays literal).
+        assert_eq!(
+            trigger_path_segment("ns:nightly").as_deref(),
+            Ok("ns:nightly")
+        );
+        assert_eq!(
+            trigger_path_segment("daily-digest_v2.1~x").as_deref(),
+            Ok("daily-digest_v2.1~x")
+        );
+        // Unicode / spaces / sub-delims are allowed but encoded in-segment.
+        assert_eq!(
+            trigger_path_segment("caf\u{e9} job").as_deref(),
+            Ok("caf%C3%A9%20job")
+        );
+        assert_eq!(
+            trigger_path_segment("a;b=c&d").as_deref(),
+            Ok("a%3Bb%3Dc%26d")
+        );
+        // Dotted but not a dot segment: still one plain name.
+        assert_eq!(trigger_path_segment("...").as_deref(), Ok("..."));
+
+        for bad in [
+            "", ".", "..", "../x", "..\\x", "a/b", "/abs", "/", "a\\b", "a?b", "a#b", "?", "#",
+            "%2e%2e", "%2F", "a%b", "a\0b", "a\nb", "a\rb", "a\tb", "a\u{7f}b",
+        ] {
+            assert!(
+                trigger_path_segment(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+
+        // Whatever passes lands as exactly one segment of the trigger URL.
+        for id in [
+            "ns:x",
+            "caf\u{e9}",
+            "a b",
+            "x@y",
+            "a+b",
+            "[v6]",
+            "a'b\"c",
+            "...",
+        ] {
+            let seg = trigger_path_segment(id).unwrap();
+            let url = format!("http://127.0.0.1:1/jobs/{seg}/trigger");
+            let parsed = url::Url::parse(&url).unwrap();
+            let segs: Vec<_> = parsed.path_segments().unwrap().collect();
+            assert_eq!(segs, ["jobs", seg.as_str(), "trigger"], "{id:?}");
+            assert_eq!(parsed.query(), None, "{id:?}");
+            assert_eq!(parsed.fragment(), None, "{id:?}");
         }
     }
 }

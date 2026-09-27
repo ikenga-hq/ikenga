@@ -35,12 +35,21 @@ use crate::server::shared::agent_ops::{self, err_value, read_daemon_lock};
 /// a genuinely unexpected internal error returns `Err`.
 #[tauri::command]
 pub async fn agent_ops_run_now(job_id: String) -> Result<Value, String> {
+    // SECURITY: the id becomes a path segment of a POST that carries the
+    // daemon's secret. Validate + encode it before reading the lock or touching
+    // the network, so a crafted id (`../x`, `a?b`, `%2e%2e`, …) can never steer
+    // the secret-bearing request to another path.
+    let segment = match agent_ops::trigger_path_segment(&job_id) {
+        Ok(s) => s,
+        Err(why) => return Ok(err_value("error", None, format!("invalid job id: {why}"))),
+    };
+
     let lock = match read_daemon_lock(crate::platform::home_dir().as_deref()).await {
         Ok(l) => l,
         Err(e) => return Ok(err_value("daemon_down", None, e)),
     };
 
-    let url = format!("http://127.0.0.1:{}/jobs/{}/trigger", lock.port, job_id);
+    let url = format!("http://127.0.0.1:{}/jobs/{}/trigger", lock.port, segment);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
