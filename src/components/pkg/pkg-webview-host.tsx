@@ -31,7 +31,7 @@ import {
 } from '@/lib/pkg/pkg-view-state';
 import { usePkgBlockedStore } from '@/lib/pkg/pkg-blocked-store';
 import { PkgBlockedState, PkgBlockedTrustSheet, useAllowHostSheet } from './pkg-view-states';
-import { useAppLocked } from '@/shell/people/app-lock-store';
+import { useAppLocked, useAppLockStore } from '@/shell/people/app-lock-store';
 
 import {
 	pkgWebviewCreate,
@@ -157,8 +157,13 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 			await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 			if (dropped) return;
 
-			const rect = measureRect(el) ?? { x: 0, y: 0, w: 0, h: 0 };
-			parkedRef.current = false;
+			// WP-72: if the app is locked at create time (a launch lock, or a
+			// pane mounting under the lock), create the surface already parked,
+			// so a partner page never draws above the lock overlay for a frame.
+			// The park effect below unparks it at the live rect on unlock.
+			const lockedNow = useAppLockStore.getState().status?.locked === true;
+			const rect = lockedNow ? PARKED_RECT : (measureRect(el) ?? { x: 0, y: 0, w: 0, h: 0 });
+			parkedRef.current = lockedNow;
 
 			try {
 				await pkgWebviewCreate(pkgId, paneId, source, rect, partition ?? null);

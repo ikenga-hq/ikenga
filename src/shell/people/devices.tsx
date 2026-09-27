@@ -91,7 +91,7 @@ function NotABoundary() {
 			aria-label="Not a security boundary"
 			className="flex items-start gap-3 rounded-[var(--radius-md,6px)] border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2.5"
 		>
-			<ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[var(--warning)]" aria-hidden />
+			<ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[var(--achievement,var(--warning))]" aria-hidden />
 			<div className="min-w-0 space-y-1">
 				<div className="flex flex-wrap items-center gap-2">
 					<StatusChip tone="warn">Not a security boundary</StatusChip>

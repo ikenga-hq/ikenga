@@ -106,7 +106,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 		<>
 			<PeopleRow
 				label="Lock when idle"
-				sub="Locks the window. Sessions and runs keep going underneath."
+				sub="Locks the window. Sessions and runs keep going underneath. Typing or clicking inside a native pkg webview (a partner site) doesn't count as activity, so a long stretch in one can lock."
 			>
 				<span className="inline-flex items-center gap-2">
 					<Switch
@@ -199,7 +199,10 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 			</PeopleRow>
 
 			{error && (
-				<div role="alert" className="border-t border-[var(--border-soft)] py-2 text-[var(--text-micro)] text-[var(--danger)]">
+				<div
+					role="alert"
+					className="border-t border-[var(--border-soft)] py-2 text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]"
+				>
 					{error}
 				</div>
 			)}
@@ -293,7 +296,20 @@ function SecretRow({
 	return (
 		<PeopleRow
 			label="PIN or passphrase"
-			sub="What unlocks the lock screen. At least 4 characters. Stored as an argon2id hash on this device only."
+			sub={
+				<>
+					What unlocks the lock screen. At least 4 characters. Stored as an argon2id hash on this
+					device only.
+					{status.configPath && (
+						<>
+							{' '}
+							Forgot it? Quit Ikenga and delete{' '}
+							<span className="font-mono break-all">{status.configPath}</span>. The lock is a privacy
+							screen, not a security boundary.
+						</>
+					)}
+				</>
+			}
 			top={mode !== 'idle'}
 		>
 			{mode === 'idle' && (
@@ -356,7 +372,7 @@ function SecretRow({
 			)}
 
 			{error && (
-				<span role="alert" className="basis-full text-[var(--text-micro)] text-[var(--danger)]">
+				<span role="alert" className="basis-full text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]">
 					{error}
 				</span>
 			)}

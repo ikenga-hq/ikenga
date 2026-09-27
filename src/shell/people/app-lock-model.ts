@@ -12,8 +12,10 @@ export const MIN_IDLE_MINUTES = 1;
 export const MAX_IDLE_MINUTES = 24 * 60;
 export const DEFAULT_IDLE_MINUTES = 15;
 
-/** How often a window may report activity to Rust. The idle window is at
- *  least a minute, so a 30 s throttle can make a lock land at most 30 s late
+/** How often a window may report activity to Rust. The first input in a
+ *  window is sent at once; later input in the same window is sent once, when
+ *  the window ends (a trailing send). Rust's last-activity time is therefore
+ *  never older than the real last input, so a lock can land at most 30 s late
  *  and never early. */
 export const ACTIVITY_THROTTLE_MS = 30_000;
 
@@ -86,4 +88,10 @@ export function retryLine(ms: number): string {
 /** Throttle gate for activity reports. */
 export function shouldReportActivity(lastSentMs: number | null, nowMs: number): boolean {
 	return lastSentMs === null || nowMs - lastSentMs >= ACTIVITY_THROTTLE_MS;
+}
+
+/** How long until the trailing send for a throttle window that began at
+ *  `lastSentMs`. */
+export function trailingDelay(lastSentMs: number, nowMs: number): number {
+	return Math.max(0, lastSentMs + ACTIVITY_THROTTLE_MS - nowMs);
 }

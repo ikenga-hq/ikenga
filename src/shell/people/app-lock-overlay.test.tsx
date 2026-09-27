@@ -74,7 +74,8 @@ describe('AppLockOverlay', () => {
 		expect(root.contains(lock)).toBe(false);
 		expect(root.hasAttribute('inert')).toBe(true);
 		expect(screen.getByText('ned-desktop · locked after 15 min idle')).toBeTruthy();
-		expect(screen.getByText(/not a security boundary/)).toBeTruthy();
+		// The recovery path lives in Profile › App lock, never on the lock itself.
+		expect(screen.queryByText(/app-lock\.json/)).toBeNull();
 	});
 
 	it('shows the wrong-PIN line and stays locked', async () => {

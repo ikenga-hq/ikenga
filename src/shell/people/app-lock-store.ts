@@ -9,13 +9,21 @@
 //   - on focus and visibility, refetch, because `app_lock_status` also runs
 //     the idle check, so a laptop waking from sleep locks at once;
 //   - on pointer, key or wheel input, call `app_lock_touch`, at most once per
-//     `ACTIVITY_THROTTLE_MS`, and never while locked.
+//     `ACTIVITY_THROTTLE_MS` plus one trailing send at the end of the window
+//     if input came after the last send, and never while locked;
+//   - input inside a pkg iframe counts too. The iframes are same-origin
+//     (`sandbox="allow-scripts allow-same-origin"` + srcDoc), so when focus
+//     moves into one the same listeners are attached to its window.
+//
+// Known gap: native pkg webviews (`pkg-webview-host.tsx`) are separate OS
+// webviews, so input inside them never reaches this window. The idle-lock
+// row in Profile › App lock says so.
 
 import { create } from 'zustand';
 
 import { type AppLockStatus, appLockStatus, appLockTouch, onAppLockChanged } from '@/lib/tauri-cmd';
 
-import { shouldReportActivity } from './app-lock-model';
+import { shouldReportActivity, trailingDelay } from './app-lock-model';
 
 interface AppLockStore {
 	/** `null` until loaded, in a remote web session, or when the command is
@@ -85,31 +93,93 @@ function install(): () => void {
 		.catch(() => {});
 
 	let lastSent: number | null = null;
-	const onActivity = () => {
+	// Input arrived after `lastSent`, inside the current throttle window.
+	let pending = false;
+	let trailing: ReturnType<typeof setTimeout> | null = null;
+	const reporting = () => {
 		const status = useAppLockStore.getState().status;
-		if (!status || status.locked || !status.idleEnabled) return;
-		const now = Date.now();
-		if (!shouldReportActivity(lastSent, now)) return;
+		return Boolean(status && !status.locked && status.idleEnabled);
+	};
+	const send = (now: number) => {
 		lastSent = now;
+		pending = false;
 		appLockTouch().catch(() => {});
+	};
+	const flushTrailing = () => {
+		trailing = null;
+		if (pending && reporting()) send(Date.now());
+		pending = false;
+	};
+	const onActivity = () => {
+		if (disposed || !reporting()) return;
+		const now = Date.now();
+		if (shouldReportActivity(lastSent, now)) {
+			send(now);
+			return;
+		}
+		pending = true;
+		if (trailing === null && lastSent !== null) {
+			trailing = setTimeout(flushTrailing, trailingDelay(lastSent, now));
+		}
 	};
 	const onWake = () => {
 		if (document.visibilityState === 'hidden') return;
 		void useAppLockStore.getState().refresh();
 	};
 
-	for (const type of ACTIVITY_EVENTS) {
-		window.addEventListener(type, onActivity, { capture: true, passive: true });
-	}
+	const listenOn = (target: Window) => {
+		for (const type of ACTIVITY_EVENTS) {
+			target.addEventListener(type, onActivity, { capture: true, passive: true });
+		}
+	};
+	const unlistenOn = (target: Window) => {
+		for (const type of ACTIVITY_EVENTS) {
+			target.removeEventListener(type, onActivity, { capture: true });
+		}
+	};
+
+	// Same-origin pkg iframes: focus moving into one blurs this window with the
+	// iframe as `activeElement`. That move is itself input (a click or Tab), and
+	// from then on the iframe's own window reports through the same listeners.
+	// A new srcDoc means a new window; the next focus-in attaches to it. Held
+	// weakly so a removed frame's window can be collected; its listeners go with
+	// it, and after teardown `onActivity` ignores any that are left.
+	const frameWindows = new WeakSet<Window>();
+	const onBlur = () => {
+		setTimeout(() => {
+			if (disposed || !document.hasFocus()) return;
+			const el = document.activeElement;
+			if (!(el instanceof HTMLIFrameElement)) return;
+			onActivity();
+			let win: Window | null = null;
+			try {
+				win = el.contentWindow;
+				// Throws for a cross-origin frame; skip those.
+				void win?.document;
+			} catch {
+				return;
+			}
+			if (!win || frameWindows.has(win)) return;
+			frameWindows.add(win);
+			try {
+				listenOn(win);
+			} catch {
+				frameWindows.delete(win);
+			}
+		}, 0);
+	};
+
+	listenOn(window);
+	window.addEventListener('blur', onBlur);
 	window.addEventListener('focus', onWake);
 	document.addEventListener('visibilitychange', onWake);
 
 	return () => {
 		disposed = true;
 		unlisten?.();
-		for (const type of ACTIVITY_EVENTS) {
-			window.removeEventListener(type, onActivity, { capture: true });
-		}
+		if (trailing !== null) clearTimeout(trailing);
+		unlistenOn(window);
+		window.removeEventListener('blur', onBlur);
 		window.removeEventListener('focus', onWake);
 		document.removeEventListener('visibilitychange', onWake);
 	};

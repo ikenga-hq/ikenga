@@ -9,6 +9,7 @@ import {
 	retryLine,
 	secretProblem,
 	shouldReportActivity,
+	trailingDelay,
 	unlockMethodOptions,
 } from './app-lock-model';
 
@@ -86,6 +87,12 @@ describe('activity throttle and retry copy', () => {
 		expect(shouldReportActivity(null, 0)).toBe(true);
 		expect(shouldReportActivity(0, ACTIVITY_THROTTLE_MS - 1)).toBe(false);
 		expect(shouldReportActivity(0, ACTIVITY_THROTTLE_MS)).toBe(true);
+	});
+
+	it('schedules the trailing send for the end of the throttle window', () => {
+		expect(trailingDelay(1_000, 1_000)).toBe(ACTIVITY_THROTTLE_MS);
+		expect(trailingDelay(1_000, 21_000)).toBe(ACTIVITY_THROTTLE_MS - 20_000);
+		expect(trailingDelay(0, ACTIVITY_THROTTLE_MS + 5)).toBe(0);
 	});
 
 	it('rounds the wait up to whole seconds', () => {

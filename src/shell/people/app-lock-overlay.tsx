@@ -56,6 +56,19 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 		return () => clearInterval(t);
 	}, [retryUntil]);
 
+	// When the wait ends: drop the stale "Wait 30 s" line and give the field
+	// focus back. While waiting the field and buttons were disabled, so nothing
+	// on the lock could hold focus. This is DOM focus only; it never asks the
+	// OS for focus.
+	const wasWaiting = useRef(waiting);
+	useEffect(() => {
+		if (wasWaiting.current && !waiting) {
+			setError(null);
+			inputRef.current?.focus({ preventScroll: true });
+		}
+		wasWaiting.current = waiting;
+	}, [waiting]);
+
 	useInertAppRoot(container !== null);
 	useFocusKeeper(rootRef, inputRef, container !== null);
 
@@ -134,7 +147,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 			<form className="flex w-[380px] max-w-full flex-col gap-3" onSubmit={submit}>
 				<span
 					className={
-						'flex h-[var(--btn-h-lg,40px)] items-center rounded-[var(--radius-sm)] border bg-[var(--bg-sunken)] px-3 ' +
+						'flex h-[var(--btn-h-lg,40px)] items-center rounded-[var(--radius-sm)] border bg-[var(--bg-sunken)] px-3 focus-within:shadow-[0_0_0_2px_var(--primary-soft)] ' +
 						(error && !waiting
 							? 'border-[var(--danger)]'
 							: 'border-[var(--border)] focus-within:border-[var(--primary)]')
@@ -161,7 +174,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 				<div
 					id="app-lock-error"
 					role="alert"
-					className="min-h-4 text-[var(--text-micro)] text-[var(--danger)]"
+					className="min-h-4 text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]"
 				>
 					{errorLine}
 				</div>
@@ -197,13 +210,6 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 				Locking hides the window; it does not stop Chi, and it does not lock the vault — that has
 				its own lock in Settings › Secrets.
 			</p>
-			{status.configPath && (
-				<p className="m-0 max-w-[60ch] text-center text-[10px] leading-relaxed text-[var(--fg-faint)]">
-					Forgot it? Quit Ikenga and delete{' '}
-					<span className="font-mono break-all">{status.configPath}</span>. This lock is a privacy
-					screen, not a security boundary.
-				</p>
-			)}
 		</div>,
 		container
 	);

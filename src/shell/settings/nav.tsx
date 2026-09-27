@@ -34,7 +34,13 @@ export interface SettingsFieldMeta {
 	label: string;
 	help?: string;
 	keywords?: string;
+	/** Where a search hit lands when it isn't the section's own route (D-05's
+	 *  Profile tab lives under People at `/settings/profile`, WP-72). */
+	route?: SettingsFieldRoute;
 }
+
+/** Sub-routes a settings search hit can land on. */
+export type SettingsFieldRoute = '/settings/profile' | '/settings/devices';
 
 export interface SettingsSectionMeta {
 	id: SettingsSectionId;
@@ -137,11 +143,22 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		description: 'Who this workspace is shared with, and on which devices.',
 		fields: [
 			{ field: null, label: 'Members' },
-			{ field: null, label: 'Devices', help: 'remote access, tailnet address, bearer token' },
+			{
+				field: null,
+				label: 'Devices',
+				help: 'remote access, tailnet address, bearer token',
+				route: '/settings/devices',
+			},
 			{ field: null, label: 'Pending invites' },
 			// WP-72 (D-05 local surfaces): /settings/profile.
-			{ field: null, label: 'Profile', help: 'display name, OS user' },
-			{ field: null, label: 'App lock', help: 'lock when idle, PIN, lock now', keywords: 'passcode' },
+			{ field: null, label: 'Profile', help: 'display name, OS user', route: '/settings/profile' },
+			{
+				field: null,
+				label: 'App lock',
+				help: 'lock when idle, PIN, lock now',
+				keywords: 'passcode',
+				route: '/settings/profile',
+			},
 		],
 	},
 	{

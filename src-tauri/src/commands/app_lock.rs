@@ -16,9 +16,17 @@
 //!   activity with `app_lock_touch`, throttled, and the ticker below locks
 //!   once the configured minutes pass with none.
 //!
-//! When idle lock is on and a PIN is set, the app also starts locked
-//! (`LockReason::Launch`). Without that, quit and relaunch would get past the
-//! lock in three seconds.
+//! The lock itself is persisted too: `app-lock.json` carries a `lock` record
+//! (locked, reason, wrong-entry count, wait deadline, backoff round), written
+//! whenever the app locks, unlocks or takes a wrong entry. So quitting or
+//! crashing while locked relaunches locked, and a relaunch doesn't reset the
+//! wrong-entry wait. When idle lock is on and a PIN is set, the app also
+//! starts locked (`LockReason::Launch`) even if it was unlocked at quit.
+//! Without that, quit and relaunch would get past the idle lock.
+//!
+//! Wrong entries: after every `MAX_ATTEMPTS` misses the wait grows through
+//! `BACKOFF_STEPS_MS` (30 s, 1 min, 5 min, then 15 min each round) and only
+//! resets on a successful unlock.
 //!
 //! ## Per-OS biometric path — the WP-72 decision
 //!
@@ -88,7 +96,8 @@ pub const DEFAULT_IDLE_MINUTES: u32 = 15;
 /// Wrong entries allowed before a wait. D-05's copy: "Two attempts left
 /// before a 30 s wait."
 pub const MAX_ATTEMPTS: u32 = 3;
-pub const BACKOFF_MS: u64 = 30_000;
+/// The wait after each round of `MAX_ATTEMPTS` misses. The last step repeats.
+pub const BACKOFF_STEPS_MS: [u64; 4] = [30_000, 60_000, 5 * 60_000, 15 * 60_000];
 const IDLE_TICK: Duration = Duration::from_secs(10);
 
 const SECRET_VERSION: u32 = 1;
@@ -152,8 +161,8 @@ pub struct AppLockStatus {
     pub host: String,
     /// e.g. `Linux 6.8.0`, `Windows 10.0.22631`, `macOS 14.5.0`.
     pub os: String,
-    /// Absolute path of `app-lock.json`: the recovery path shown on the lock
-    /// screen.
+    /// Absolute path of `app-lock.json`: the recovery path shown in
+    /// Profile › App lock (never on the lock screen itself).
     pub config_path: Option<String>,
 }
 
@@ -189,6 +198,34 @@ struct AppLockConfig {
     secret: Option<SecretRecord>,
 }
 
+/// The lock itself, persisted beside the config (`"lock"` in `app-lock.json`)
+/// so a relaunch can't clear it or the wrong-entry wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct LockRecord {
+    locked: bool,
+    reason: Option<LockReason>,
+    locked_at_ms: Option<u64>,
+    failed_attempts: u32,
+    retry_at_ms: Option<u64>,
+    backoff_round: u32,
+}
+
+/// Read side of the file's `lock` record. `AppLockConfig` ignores the key.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LockFileIn {
+    lock: LockRecord,
+}
+
+/// Write side: the config's keys, flattened, plus the `lock` record.
+#[derive(Serialize)]
+struct ConfigFileOut<'a> {
+    #[serde(flatten)]
+    config: &'a AppLockConfig,
+    lock: LockRecord,
+}
+
 impl Default for AppLockConfig {
     fn default() -> Self {
         Self {
@@ -212,6 +249,9 @@ struct Inner {
     last_activity_ms: u64,
     failed_attempts: u32,
     retry_at_ms: Option<u64>,
+    /// How many full rounds of wrong entries have run since the last unlock.
+    /// Picks the next wait from `BACKOFF_STEPS_MS`.
+    backoff_round: u32,
     /// An unlock is being verified off-thread; a second one waits its turn.
     verifying: bool,
 }
@@ -230,19 +270,39 @@ enum UnlockGate {
 
 impl Inner {
     fn load(&mut self, path: PathBuf, now: u64) {
-        self.config = match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<AppLockConfig>(&bytes) {
-                Ok(config) => sanitize(config),
-                Err(error) => {
-                    log::warn!("[app-lock] {} is unreadable, using defaults: {error}", path.display());
-                    AppLockConfig::default()
-                }
-            },
-            Err(_) => AppLockConfig::default(),
+        let (config, record) = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let config = match serde_json::from_slice::<AppLockConfig>(&bytes) {
+                    Ok(config) => sanitize(config),
+                    Err(error) => {
+                        log::warn!("[app-lock] {} is unreadable, using defaults: {error}", path.display());
+                        AppLockConfig::default()
+                    }
+                };
+                let record = serde_json::from_slice::<LockFileIn>(&bytes)
+                    .map(|file| file.lock)
+                    .unwrap_or_default();
+                (config, record)
+            }
+            Err(_) => (AppLockConfig::default(), LockRecord::default()),
         };
+        self.config = config;
         self.path = Some(path);
         self.last_activity_ms = now;
-        if self.config.idle_enabled && self.config.secret.is_some() {
+        // No PIN on record: nothing could unlock, so nothing restores.
+        if self.config.secret.is_none() {
+            return;
+        }
+        let longest_wait = BACKOFF_STEPS_MS[BACKOFF_STEPS_MS.len() - 1];
+        self.failed_attempts = record.failed_attempts.min(MAX_ATTEMPTS - 1);
+        // Capped, so a clock that jumped back can't park the lock for good.
+        self.retry_at_ms = record.retry_at_ms.map(|at| at.min(now + longest_wait));
+        self.backoff_round = record.backoff_round;
+        if record.locked {
+            self.locked = true;
+            self.reason = Some(record.reason.unwrap_or(LockReason::Launch));
+            self.locked_at_ms = Some(record.locked_at_ms.unwrap_or(now));
+        } else if self.config.idle_enabled {
             self.set_locked(LockReason::Launch, now);
         }
     }
@@ -251,6 +311,7 @@ impl Inner {
         self.locked = true;
         self.reason = Some(reason);
         self.locked_at_ms = Some(now);
+        self.persist();
     }
 
     fn set_unlocked(&mut self, now: u64) {
@@ -259,7 +320,31 @@ impl Inner {
         self.locked_at_ms = None;
         self.failed_attempts = 0;
         self.retry_at_ms = None;
+        self.backoff_round = 0;
         self.last_activity_ms = now;
+        self.persist();
+    }
+
+    fn lock_record(&self) -> LockRecord {
+        LockRecord {
+            locked: self.locked,
+            reason: self.reason,
+            locked_at_ms: self.locked_at_ms,
+            failed_attempts: self.failed_attempts,
+            retry_at_ms: self.retry_at_ms,
+            backoff_round: self.backoff_round,
+        }
+    }
+
+    /// Write the lock record through. A failed write is logged, never fatal:
+    /// the in-memory lock still holds for this run.
+    fn persist(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        if let Err(error) = self.save() {
+            log::warn!("[app-lock] could not persist the lock state: {error}");
+        }
     }
 
     fn touch(&mut self, now: u64) {
@@ -324,19 +409,23 @@ impl Inner {
         }
         self.failed_attempts += 1;
         if self.failed_attempts >= MAX_ATTEMPTS {
+            let wait = backoff_ms(self.backoff_round);
             self.failed_attempts = 0;
-            self.retry_at_ms = Some(now + BACKOFF_MS);
-            return Some(format!("Wrong PIN. Wait {} s before trying again.", BACKOFF_MS / 1000));
+            self.backoff_round = self.backoff_round.saturating_add(1);
+            self.retry_at_ms = Some(now + wait);
+            self.persist();
+            return Some(format!("Wrong PIN. Wait {} before trying again.", wait_label(wait)));
         }
+        self.persist();
         let left = MAX_ATTEMPTS - self.failed_attempts;
         Some(format!(
-            "Wrong PIN. {} before a {} s wait.",
+            "Wrong PIN. {} before a {} wait.",
             match left {
                 1 => "One attempt left".to_string(),
                 2 => "Two attempts left".to_string(),
                 n => format!("{n} attempts left"),
             },
-            BACKOFF_MS / 1000
+            wait_label(backoff_ms(self.backoff_round))
         ))
     }
 
@@ -362,8 +451,27 @@ impl Inner {
         let Some(path) = self.path.as_ref() else {
             return Err("app lock is not configured yet (no data directory)".into());
         };
-        let json = serde_json::to_vec_pretty(&self.config).map_err(|e| format!("serialize: {e}"))?;
+        let file = ConfigFileOut {
+            config: &self.config,
+            lock: self.lock_record(),
+        };
+        let json = serde_json::to_vec_pretty(&file).map_err(|e| format!("serialize: {e}"))?;
         write_private_atomic(path, &json).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+}
+
+/// The wait after wrong-entry round `round` (0-based).
+fn backoff_ms(round: u32) -> u64 {
+    let index = (round as usize).min(BACKOFF_STEPS_MS.len() - 1);
+    BACKOFF_STEPS_MS[index]
+}
+
+/// "30 s", "1 min", "15 min".
+fn wait_label(ms: u64) -> String {
+    if ms < 60_000 {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{} min", ms / 60_000)
     }
 }
 
@@ -925,11 +1033,75 @@ mod tests {
         assert!(matches!(inner.begin_unlock(30), UnlockGate::Check(_)));
         assert!(inner.finish_unlock(false, 30).unwrap().contains("Wait 30 s"));
 
-        assert_eq!(inner.begin_unlock(40), UnlockGate::Wait(BACKOFF_MS - 10));
-        assert!(matches!(inner.begin_unlock(30 + BACKOFF_MS), UnlockGate::Check(_)));
-        assert_eq!(inner.finish_unlock(true, 30 + BACKOFF_MS), None);
+        let first = BACKOFF_STEPS_MS[0];
+        assert_eq!(inner.begin_unlock(40), UnlockGate::Wait(first - 10));
+        assert!(matches!(inner.begin_unlock(30 + first), UnlockGate::Check(_)));
+        assert_eq!(inner.finish_unlock(true, 30 + first), None);
         assert!(!inner.locked);
         assert_eq!(inner.failed_attempts, 0);
+        assert_eq!(inner.backoff_round, 0);
+    }
+
+    #[test]
+    fn the_wait_grows_each_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut inner = inner_with_secret(dir.path(), false);
+        inner.lock(LockReason::Manual, 0).unwrap();
+        let mut now = 0;
+        for (round, step) in [30_000u64, 60_000, 300_000, 900_000, 900_000].iter().enumerate() {
+            let mut last = None;
+            for _ in 0..MAX_ATTEMPTS {
+                assert!(matches!(inner.begin_unlock(now), UnlockGate::Check(_)), "round {round}");
+                last = inner.finish_unlock(false, now);
+            }
+            assert_eq!(inner.retry_at_ms, Some(now + step), "round {round}");
+            assert!(last.unwrap().starts_with("Wrong PIN. Wait"));
+            now += step;
+        }
+        assert!(matches!(inner.begin_unlock(now), UnlockGate::Check(_)));
+        inner.finish_unlock(true, now);
+        assert_eq!(inner.backoff_round, 0);
+    }
+
+    #[test]
+    fn a_manual_lock_survives_a_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        let mut inner = inner_with_secret(dir.path(), false);
+        inner.save().unwrap();
+        inner.lock(LockReason::Manual, 1_000).unwrap();
+
+        let mut relaunched = Inner::default();
+        relaunched.load(path.clone(), 9_000);
+        assert!(relaunched.locked, "idle lock is off, but the manual lock was persisted");
+        assert_eq!(relaunched.reason, Some(LockReason::Manual));
+        assert_eq!(relaunched.locked_at_ms, Some(1_000));
+
+        // Unlocking writes through too.
+        assert!(matches!(relaunched.begin_unlock(9_500), UnlockGate::Check(_)));
+        relaunched.finish_unlock(true, 9_500);
+        let mut again = Inner::default();
+        again.load(path, 10_000);
+        assert!(!again.locked);
+    }
+
+    #[test]
+    fn the_wrong_entry_wait_survives_a_relaunch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILENAME);
+        let mut inner = inner_with_secret(dir.path(), false);
+        inner.save().unwrap();
+        inner.lock(LockReason::Manual, 0).unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            assert!(matches!(inner.begin_unlock(100), UnlockGate::Check(_)));
+            inner.finish_unlock(false, 100);
+        }
+
+        let mut relaunched = Inner::default();
+        relaunched.load(path, 200);
+        assert!(relaunched.locked);
+        assert_eq!(relaunched.backoff_round, 1);
+        assert_eq!(relaunched.begin_unlock(200), UnlockGate::Wait(100 + BACKOFF_STEPS_MS[0] - 200));
     }
 
     #[test]

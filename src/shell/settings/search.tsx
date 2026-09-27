@@ -1,4 +1,4 @@
-import type { SettingsSectionId } from '@/shell/settings/nav';
+import type { SettingsFieldRoute, SettingsSectionId } from '@/shell/settings/nav';
 import { SETTINGS_SECTIONS } from '@/shell/settings/nav';
 
 export interface SettingsSearchHit {
@@ -8,6 +8,8 @@ export interface SettingsSearchHit {
 	label: string;
 	hayLabel: string;
 	group: string;
+	/** Set when the hit lands on a sub-route rather than `/settings/<section>`. */
+	route?: SettingsFieldRoute;
 }
 
 function searchableHits(): SettingsSearchHit[] {
@@ -21,6 +23,7 @@ function searchableHits(): SettingsSearchHit[] {
 				label: meta.label,
 				hayLabel: meta.label,
 				group: [meta.help ?? '', meta.keywords ?? ''].join(' '),
+				route: meta.route,
 			});
 		}
 	}
@@ -54,7 +57,7 @@ function Marked({ text, query }: { text: string; query: string }) {
 
 interface SettingsSearchResultsProps {
 	query: string;
-	onGo: (sectionId: SettingsSectionId) => void;
+	onGo: (sectionId: SettingsSectionId, route?: SettingsFieldRoute) => void;
 }
 
 export function SettingsSearchResults({ query, onGo }: SettingsSearchResultsProps) {
@@ -77,7 +80,7 @@ export function SettingsSearchResults({ query, onGo }: SettingsSearchResultsProp
 						<li key={`${hit.sectionId}:${hit.field ?? hit.label}`}>
 							<button
 								type="button"
-								onClick={() => onGo(hit.sectionId)}
+								onClick={() => onGo(hit.sectionId, hit.route)}
 								className="flex w-full items-center gap-3 px-4 py-2.5 text-left outline-none transition-colors focus-visible:bg-accent hover:bg-accent/50"
 							>
 								<span className="w-32 shrink-0 truncate font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
