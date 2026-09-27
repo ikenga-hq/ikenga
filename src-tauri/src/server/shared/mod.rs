@@ -1,5 +1,5 @@
 //! AppHandle-free cores shared by the desktop `#[tauri::command]` wrappers
-//! and the daemon's `/api/rpc` arms (WP-19 slice 2).
+//! and the daemon's `/api/rpc` arms (WP-19 slices 2 and 3).
 //!
 //! Same house pattern as `crate::db`, `crate::secrets_env` and `pkg::status`:
 //! the logic lives here, compiled into both binaries; the desktop command in
@@ -13,7 +13,11 @@
 //! `server` is an ungated module in both builds. Nothing here depends on the
 //! HTTP server — no axum, no `AppState`.
 
+pub mod agent_ops;
 pub mod backups;
+pub mod chi;
+pub mod chi_liveness;
 pub mod data_health;
+pub mod identity;
 pub mod settings;
 pub mod supabase_config;
