@@ -5,7 +5,7 @@ import { useNotificationsLiveSync } from '@/lib/queries/notifications';
 import type { NotificationKind, NotificationRow } from '@/lib/tauri-cmd';
 
 export type FloatingToastChipVariant = 'progress' | 'error' | 'notice' | 'info';
-export type FloatingToastChipAnchor = 'viewport-top' | 'pane-corner';
+export type FloatingToastChipAnchor = 'viewport-top' | 'viewport-bottom-right' | 'pane-corner';
 
 // Border color per variant — replaces the hand-rolled `border-amber-500/40`
 // bypass with the Dusk Wood gold (`--achievement`) for the in-progress / notice
@@ -27,6 +27,8 @@ const VARIANT_ROLE: Record<FloatingToastChipVariant, 'status' | 'alert'> = {
 
 const WRAP: Record<FloatingToastChipAnchor, string> = {
 	'viewport-top': 'pointer-events-none fixed inset-x-0 top-2 z-40 flex justify-center',
+	// 06 §5.5: bottom-right, above the status bar.
+	'viewport-bottom-right': 'pointer-events-none fixed bottom-8 right-3 z-40 flex justify-end',
 	'pane-corner': 'pointer-events-none absolute right-1.5 top-1.5 z-10 flex',
 };
 
@@ -97,7 +99,8 @@ export function FloatingToastChip({
 			<div
 				className={cn(
 					floatingChipPill(anchor),
-					'animate-in fade-in slide-in-from-top-2 motion-reduce:animate-none',
+					'animate-in fade-in motion-reduce:animate-none',
+					anchor === 'viewport-bottom-right' ? 'slide-in-from-bottom-2' : 'slide-in-from-top-2',
 					className
 				)}
 				style={{ borderColor: VARIANT_BORDER[variant] }}
