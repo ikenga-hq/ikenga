@@ -53,7 +53,7 @@ import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
 import { __resetCompanionTimersForTests, useCompanionStore } from '@/shell/companion/companion-store';
-import { __resetSeatUndoForTests, useSeatUi } from '@/shell/companion/seat-actions';
+import { __resetSeatUndoForTests, openSeatBoard, useSeatUi } from '@/shell/companion/seat-actions';
 import { UNREPORTED } from '@/shell/companion/seat-model';
 import { useSeatNotice } from '@/shell/companion/seat-notice';
 import {
@@ -70,7 +70,7 @@ import {
 	openBoard,
 	useBoardUi,
 } from './board-store';
-import { MOVED_MS, SeatBoard } from './seat-board';
+import { MOVED_MS, opensInPane, SeatBoard } from './seat-board';
 import { SessionsSection } from '@/shell/explorer/sections/sessions';
 
 const PROJECT = 'royalti-co';
@@ -384,6 +384,32 @@ describe('the rail’s menu and actions, from the board', () => {
 		fireEvent.click(screen.getByRole('menuitem', { name: /Rename…/ }));
 		expect(useCompanionStore.getState().state).toBe('expanded');
 		expect(useSeatUi.getState().renaming).toBe('seat-review');
+		// Not a pane-opening item: pane focus stays on the board's pane.
+		expect(usePaneStore.getState().focusedId).toBe('L2');
+	});
+
+	it('only the items that open something in a pane move pane focus off the board', async () => {
+		expect(opensInPane('Open in pane')).toBe(true);
+		expect(opensInPane('Open in pane — back to main window')).toBe(true);
+		expect(opensInPane('Open scratchpad')).toBe(true);
+		expect(opensInPane('Move to pane')).toBe(true);
+		for (const label of [
+			'All seats',
+			'Make dispatch target',
+			'Copy address',
+			'Copy as iyke',
+			'Rename…',
+			'Pop out',
+			'End session',
+			'Remove seat…',
+		]) {
+			expect(opensInPane(label)).toBe(false);
+		}
+		await mountBoard();
+		fireEvent.contextMenu(row('seat:seat-review'));
+		fireEvent.click(screen.getByRole('menuitem', { name: /Make dispatch target/ }));
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-review' });
+		expect(usePaneStore.getState().focusedId).toBe('L2');
 	});
 
 	it('Remove seat… asks the rail’s confirm; with the Companion hidden the board hosts it', async () => {
@@ -392,6 +418,7 @@ describe('the rail’s menu and actions, from the board', () => {
 		fireEvent.contextMenu(row('seat:seat-docs'));
 		fireEvent.click(screen.getByRole('menuitem', { name: /Remove seat…/ }));
 		expect(useSeatUi.getState().confirmRemove).toBe('seat-docs');
+		expect(usePaneStore.getState().focusedId).toBe('L2');
 		expect(await screen.findByRole('button', { name: 'Keep it' })).toBeTruthy();
 	});
 
@@ -490,6 +517,28 @@ describe('entry points', () => {
 		await mountBoard();
 		act(() => openBoard());
 		await waitFor(() => expect(document.activeElement).toBe(row('seat:seat-lead')));
+	});
+
+	it('the rail’s ⊞ / All seats (openSeatBoard) asks for focus too — a mounted board takes it', async () => {
+		await mountBoard();
+		(document.activeElement as HTMLElement | null)?.blur();
+		act(() => openSeatBoard());
+		await waitFor(() => expect(document.activeElement).toBe(row('seat:seat-lead')));
+		expect(useBoardUi.getState().focusPending).toBe(false);
+	});
+
+	it('a request made while the board has no rows is consumed, not left to steal focus later', async () => {
+		useTerminalStore.setState({ tabs: [] } as never);
+		act(() => openSeatBoard());
+		const r = await mountBoard([]);
+		await waitFor(() => expect(useBoardUi.getState().focusPending).toBe(false));
+		r.unmount();
+		queryClient.clear();
+		useTerminalStore.setState({ tabs: [tab('term-3', 'claude', 3)] } as never);
+		await mountBoard();
+		expect(row('seat:seat-lead')).toBeTruthy();
+		// No new request: the remount leaves focus where it was.
+		expect(document.activeElement).toBe(document.body);
 	});
 
 	it('the Explorer Sessions header’s "Seats" link opens the board, and reads as current while it shows', () => {

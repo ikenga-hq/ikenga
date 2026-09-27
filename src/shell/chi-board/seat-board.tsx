@@ -856,26 +856,18 @@ export function SeatBoard() {
 		railAtFormOpen.current = null;
 	}, [formOpen, railKey]);
 
-	// Keyboard focus lands on the selected row: when an entry point asks for
-	// it (`requestBoardFocus`), and when the board opens from the rail's ⊞ /
-	// a fresh window (focus is nowhere useful yet). Never from a text field.
+	// Keyboard focus lands on the selected row when an entry point asks for it
+	// (`requestBoardFocus`, which every entry point sends through
+	// `openSeatBoard()` — the rail's ⊞ and *All seats* included). Once the
+	// roster is ready the request is always consumed, so a request made while
+	// the board had no rows can't steal focus on a later remount.
 	const ready = state === 'ready';
 	// biome-ignore lint/correctness/useExhaustiveDependencies: only a request matters; the tab stop is read at that moment
 	useEffect(() => {
-		if (!ready || !tabStopKey) return;
-		if (consumeBoardFocus()) setTimeout(() => focusRow(tabStopKey), 0);
+		if (!ready) return;
+		const want = consumeBoardFocus();
+		if (want && tabStopKey) setTimeout(() => focusRow(tabStopKey), 0);
 	}, [ready, focusRequest]);
-	const mountedFocus = useRef(false);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: once, the first time the roster is ready
-	useEffect(() => {
-		if (!ready || mountedFocus.current) return;
-		mountedFocus.current = true;
-		const ae = document.activeElement as HTMLElement | null;
-		const idle = !ae || ae === document.body || ae.getAttribute('aria-label') === 'All seats';
-		if (idle && tabStopKey && usePaneStore.getState().focusedId === boardPaneId) {
-			setTimeout(() => focusRow(tabStopKey), 0);
-		}
-	}, [ready]);
 
 	const openMenu = useCallback((key: string, x: number, y: number) => {
 		returnFocusRef.current = key;
@@ -1158,10 +1150,22 @@ export function SeatBoard() {
 	);
 }
 
-/** The rail's own seat / session menu, opened from the board. Every item is
- *  pointed at the pane beside the board first, and *Rename…* brings the
- *  Companion forward: the rename field is the rail's (D-09 "Rename… goes to
- *  the rail's inline rename and the board follows"). */
+/** The rail's items that place a view in "the focused pane" — asked from the
+ *  board, they are pointed at the pane beside it first. *All seats* is not
+ *  one: the board is already open, and the pane store's cross-pane reuse
+ *  lands it back on the board's own tab. Every other item (target, copy,
+ *  rename, end, remove, pop out) leaves pane focus alone — moving it would
+ *  make the router follow the other pane for nothing (and leave focus there
+ *  when the item hands focus on, as Rename… and Remove seat… do). */
+export function opensInPane(label: string): boolean {
+	return label.startsWith('Open in pane') || label === 'Open scratchpad' || label === 'Move to pane';
+}
+
+/** The rail's own seat / session menu, opened from the board. Only the items
+ *  that open something in a pane are pointed at the pane beside the board
+ *  (`opensInPane`), and *Rename…* brings the Companion forward: the rename
+ *  field is the rail's (D-09 "Rename… goes to the rail's inline rename and
+ *  the board follows"). */
 function BoardMenu({
 	menu,
 	rows,
@@ -1196,14 +1200,25 @@ function BoardMenu({
 	}
 	const wrapped = items.map((item): SeatMenuItem => {
 		if (item.sep) return item;
-		return {
-			...item,
-			run: () => {
-				focusBesideBoard(boardPaneId);
-				if (item.label === 'Rename…') useCompanionStore.getState().setState('expanded');
-				item.run();
-			},
-		};
+		if (opensInPane(item.label)) {
+			return {
+				...item,
+				run: () => {
+					focusBesideBoard(boardPaneId);
+					item.run();
+				},
+			};
+		}
+		if (item.label === 'Rename…') {
+			return {
+				...item,
+				run: () => {
+					useCompanionStore.getState().setState('expanded');
+					item.run();
+				},
+			};
+		}
+		return item;
 	});
 	return <SeatMenu label={label} x={menu.x} y={menu.y} items={wrapped} onClose={onClose} />;
 }

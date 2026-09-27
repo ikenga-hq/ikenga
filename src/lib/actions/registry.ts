@@ -134,13 +134,6 @@ const BUILTIN_NAMES: ReadonlyArray<readonly [string, string, boolean?]> = [
 	['section.move-down', 'Move section down'],
 	// Companion
 	['companion.focus-dispatch', 'Focus the dispatch input'],
-	// Chi seats and People (WP-68): the additive G-ACTIONS §10.2 ids G-SEATS
-	// §12.1 records — `chi.board` (`mod+2`, `dispatchFocus`, the precedence
-	// pair with `rail.chi`) and WP-72's `people.lock-now` (`mod+shift+l`).
-	// Both have a DK entry, whose label names them first; the rows keep the
-	// id map's catalog complete in one place.
-	['chi.board', 'Chi → Seat board'],
-	['people.lock-now', 'Lock now'],
 	// Native-menu commands with no DK entry. The first three lost their key
 	// when WP-54 applied DEC-64 / DEC-63.2 (§2.4, §10.2: unbound, their
 	// `MENU_TREE` leaves stay unaccelerated) — named here so they stay
