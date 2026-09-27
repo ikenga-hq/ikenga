@@ -923,6 +923,21 @@ async fn openrouter_one_off_task(
     prompt: String,
     model: Option<String>,
 ) {
+    // A cancel that landed before this task started must win: `run_prompt`
+    // clears the adapter's own cancel flag on entry, so without this check
+    // the request would still go out (and spend tokens) under a row that
+    // says `cancelled`.
+    if cancelled.load(Ordering::SeqCst) {
+        let file_error = write_output_file(&output_path, "", None)
+            .await
+            .err()
+            .map(|e| format!("write output file: {e}"));
+        cache_update_done(&db, &run_id, "cancelled", file_error.as_deref(), false, None)
+            .await
+            .ok();
+        return;
+    }
+
     let shared = Arc::new(std::sync::Mutex::new(OpenRouterOutputBuffer {
         text: String::new(),
         flushed: 0,
@@ -950,9 +965,18 @@ async fn openrouter_one_off_task(
     };
     let cb_ref: &(dyn Fn(SessionUpdate) + Send + Sync) = &cb;
 
-    let result = engine
-        .run_prompt(&thread_id, &prompt, model.as_deref(), Some(cb_ref))
-        .await;
+    // A panic in the adapter or the callback must still close the row;
+    // otherwise it stays `running` forever and no WP-40 notification fires.
+    use futures_util::FutureExt as _;
+    let result = std::panic::AssertUnwindSafe(engine.run_prompt(
+        &thread_id,
+        &prompt,
+        model.as_deref(),
+        Some(cb_ref),
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| Err("openrouter turn panicked".to_string()));
 
     let output = {
         let mut buf = shared.lock().expect("output buffer poisoned");
@@ -1706,6 +1730,12 @@ pub async fn chi_resume(
     // transcript is gone — the same honesty rule the adapter enforces over
     // ACP in `handle_load_session`.
     if row.engine_id == "openrouter" {
+        // One turn at a time per thread: a second resume while a turn is in
+        // flight would share the adapter session, lose the first turn's abort
+        // slot and write the same output file and cache row twice.
+        if matches!(row.status.as_str(), "running" | "queued") {
+            return Err(format!("chi run {run_id} is still in progress"));
+        }
         let Some(engine) = openrouter_adapter(&app).await else {
             return Err(
                 "openrouter engine is not registered; restart the shell to resume its runs"
