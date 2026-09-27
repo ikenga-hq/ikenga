@@ -35,6 +35,7 @@ pub mod pkg_trust;
 pub mod playwright_proxy;
 pub mod projects;
 pub mod rpc;
+pub mod seat_routes;
 pub mod seats;
 pub mod secrets;
 pub mod server;

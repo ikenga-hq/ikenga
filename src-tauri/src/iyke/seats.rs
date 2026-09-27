@@ -3284,7 +3284,12 @@ pub(crate) async fn capture_core(
 
 /// After a queued text went out: bump `last_active_at` and copy the run's
 /// current `external_id` / `cwd` from `chi_cache` (§1.1).
-async fn touch_after_send(pool: &SqlitePool, seat_id: &str, now: i64) -> Result<(), SeatError> {
+/// Also called by the WP-70 bridge's `/iyke/seats/send` after an idle-run send.
+pub(crate) async fn touch_after_send(
+    pool: &SqlitePool,
+    seat_id: &str,
+    now: i64,
+) -> Result<(), SeatError> {
     let refreshed = sqlx::query(
         "UPDATE iyke_seats SET last_active_at = ?,
                 external_id = COALESCE(
