@@ -22,6 +22,8 @@ import { isTauri } from '@/lib/transport';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
 import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
+import { AppLockOverlay } from '@/shell/people/app-lock-overlay';
+import { useAppLockStore } from '@/shell/people/app-lock-store';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { FilepickerModal } from '@/components/ui/filepicker-modal';
 import { ReauthOverlay } from '@/components/ui/reauth-overlay';
@@ -98,6 +100,11 @@ export async function bootPrimary(): Promise<void> {
 	// window:// lifecycle bus.
 	initDetachedSurfaceTracking();
 
+	// WP-72: read the app lock before the first paint, so a launch lock
+	// (idle lock on + a PIN set) never shows the workspace for a frame.
+	// `refresh` swallows its own failure (no lock outside Tauri).
+	await useAppLockStore.getState().refresh();
+
 	createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
 			<ErrorBoundary>
@@ -107,6 +114,8 @@ export async function bootPrimary(): Promise<void> {
 					</SecretsUnlockSheetProvider>
 					<FilepickerModal />
 					<ReauthOverlay />
+					{/* WP-72: D-05 app lock. Last, so it covers everything above. */}
+					<AppLockOverlay />
 					{import.meta.env?.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}
 				</QueryClientProvider>
 			</ErrorBoundary>

@@ -20,6 +20,7 @@ import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { installKeyDispatcher } from '@/lib/keymap/dispatcher';
 import { windowContext } from '@/lib/window/window-context';
 import { DetachedRoot } from '@/shell/detached/detached-root';
+import { AppLockOverlay } from '@/shell/people/app-lock-overlay';
 
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 
@@ -49,6 +50,8 @@ export function bootDetached(): void {
 			<ErrorBoundary>
 				<QueryClientProvider client={queryClient}>
 					<DetachedRoot ctx={ctx} />
+					{/* WP-72: a popped-out surface locks with the main window. */}
+					<AppLockOverlay />
 				</QueryClientProvider>
 			</ErrorBoundary>
 		</React.StrictMode>

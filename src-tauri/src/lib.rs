@@ -102,6 +102,12 @@ use commands::{
     action_exec, action_git_branch, actions_open_file, actions_read_files, actions_trust_grant,
     actions_trust_revoke, actions_trust_status, actions_write, keybindings_write,
 };
+// WP-72: app lock (D-05 `locked`).
+#[cfg(feature = "desktop")]
+use commands::{
+    app_lock_clear_secret, app_lock_configure, app_lock_lock, app_lock_set_secret,
+    app_lock_status, app_lock_touch, app_lock_unlock, app_lock_unlock_biometric, AppLockState,
+};
 #[cfg(feature = "desktop")]
 use commands::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
@@ -351,6 +357,15 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| format!("app_data_dir: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
+
+            // WP-72: app lock. Rust owns the lock so a webview reload can't
+            // clear it and every window shows the same state. Loads
+            // `app-lock.json`; starts locked when idle lock is on (see
+            // `commands/app_lock.rs`). The ticker locks on idle.
+            let app_lock = AppLockState::new();
+            app_lock.configure(data_dir.join(commands::app_lock::CONFIG_FILENAME));
+            app.manage(app_lock);
+            commands::app_lock::spawn_idle_ticker(app.handle().clone());
 
             let secrets_ready = match app.state::<SecretsLock>().configure_data_dir(&data_dir) {
                 Ok(()) => true,
@@ -1203,6 +1218,15 @@ pub fn run() {
             oba_auto_update_all,
             oba_set_auto_update,
             os_username,
+            // app lock (WP-72, D-05 `locked`)
+            app_lock_status,
+            app_lock_touch,
+            app_lock_lock,
+            app_lock_unlock,
+            app_lock_unlock_biometric,
+            app_lock_configure,
+            app_lock_set_secret,
+            app_lock_clear_secret,
             // OS-wide shortcuts from the effective keymap (WP-54, G-ACTIONS §6)
             os_shortcuts_apply,
             // Ngwa Phase-2 cross-system — G-ADAPTER engine layout descriptor

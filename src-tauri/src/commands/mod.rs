@@ -7,6 +7,8 @@ pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;
 pub mod agent_ops;
+// WP-72: app lock (D-05 `locked`) — idle / Lock now / PIN unlock.
+pub mod app_lock;
 pub mod backup;
 #[cfg(debug_assertions)]
 pub mod bg_spike;
@@ -67,6 +69,10 @@ pub use activity_bar::{
 pub use agent_ops::{
     agent_ops_delete_job, agent_ops_list_jobs, agent_ops_run_now, agent_ops_set_enabled,
     agent_ops_tail_run, agent_ops_upsert_job,
+};
+pub use app_lock::{
+    app_lock_clear_secret, app_lock_configure, app_lock_lock, app_lock_set_secret,
+    app_lock_status, app_lock_touch, app_lock_unlock, app_lock_unlock_biometric, AppLockState,
 };
 pub use backup::{
     backup_delete, backup_export, backup_import, backup_list, db_export_ndjson, db_import_ndjson,

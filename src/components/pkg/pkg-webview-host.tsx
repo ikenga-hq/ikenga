@@ -31,6 +31,7 @@ import {
 } from '@/lib/pkg/pkg-view-state';
 import { usePkgBlockedStore } from '@/lib/pkg/pkg-blocked-store';
 import { PkgBlockedState, PkgBlockedTrustSheet, useAllowHostSheet } from './pkg-view-states';
+import { useAppLocked } from '@/shell/people/app-lock-store';
 
 import {
 	pkgWebviewCreate,
@@ -106,6 +107,9 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 	// leaves it there until the block is resolved.
 	const parkedRef = useRef(false);
 	const registerKeepBlocking = usePkgBlockedStore((s) => s.register);
+	// WP-72: the native surface floats above the DOM, so the app-lock overlay
+	// can't cover it. Park it while the app is locked, like a blocked pane.
+	const appLocked = useAppLocked();
 
 	// Subscribed before the mount effect's first-frame wait resolves, so a
 	// create-time rejection is caught. Covers both cases: a create that the
@@ -195,12 +199,13 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 	// from the pane ⋯ menu.
 	useEffect(() => {
 		if (!mounted) return;
-		if (blocked && !parkedRef.current) {
+		const park = Boolean(blocked) || appLocked;
+		if (park && !parkedRef.current) {
 			parkedRef.current = true;
 			pkgWebviewSetRect(pkgId, paneId, PARKED_RECT).catch((e) => {
 				console.warn(`[pkg-webview-host] park failed for ${pkgId}/${paneId}:`, e);
 			});
-		} else if (!blocked && parkedRef.current) {
+		} else if (!park && parkedRef.current) {
 			parkedRef.current = false;
 			const el = placeholderRef.current;
 			const rect = el ? measureRect(el) : null;
@@ -210,7 +215,7 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 				});
 			}
 		}
-	}, [blocked, mounted, pkgId, paneId]);
+	}, [blocked, appLocked, mounted, pkgId, paneId]);
 
 	// "Keep blocking" (pane ⋯ menu) — only for a live, parked pane: drops the
 	// state and brings the previous page back.

@@ -783,6 +783,115 @@ export async function secretsLockState(): Promise<SecretsLockState> {
 	return invoke('secrets_lock_state');
 }
 
+// ── app lock (WP-72, D-05 `locked`) ─────────────────────────────────────────
+// Mirrors `src-tauri/src/commands/app_lock.rs`. Rust owns the lock, so a
+// webview reload can't clear it and every window sees one state. It is not the
+// vault lock above. Desktop only: in a remote web session (a browser tab on the
+// daemon) `appLockStatus` resolves `null` and the rest are never reached.
+
+export type AppLockMethod = 'pin' | 'os';
+export type AppLockReason = 'idle' | 'manual' | 'launch';
+
+export interface AppLockBiometric {
+	kind: 'windows-hello' | 'touch-id' | 'none';
+	/** "Windows Hello", "Touch ID", or "" on Linux. */
+	label: string;
+	available: boolean;
+	/** Why it isn't available; empty when it is. */
+	reason: string;
+}
+
+export interface AppLockStatus {
+	locked: boolean;
+	reason: AppLockReason | null;
+	lockedAtMs: number | null;
+	idleEnabled: boolean;
+	idleMinutes: number;
+	method: AppLockMethod;
+	/** A PIN / passphrase is set. Nothing can lock without one. */
+	secretSet: boolean;
+	biometric: AppLockBiometric;
+	/** Milliseconds left in the wrong-entry wait, if one is running. */
+	retryInMs: number | null;
+	attemptsLeft: number;
+	/** OS hostname. */
+	host: string;
+	/** e.g. `Linux 6.8.0`, `Windows 10.0.22631`. */
+	os: string;
+	/** Absolute path of `app-lock.json`, the recovery path. */
+	configPath: string | null;
+}
+
+export interface AppLockUnlockOutcome {
+	ok: boolean;
+	/** The line D-05 shows under the field, e.g. "Wrong PIN. Two attempts left…". */
+	error: string | null;
+	status: AppLockStatus;
+}
+
+/** Fires (empty payload) when the lock or its config changes; refetch the status. */
+export const APP_LOCK_CHANGED_EVENT = 'app-lock://changed';
+
+/** The lock state and config. `null` in a remote web session. Also runs the
+ *  idle check, so a window waking from sleep sees an overdue lock at once. */
+export async function appLockStatus(): Promise<AppLockStatus | null> {
+	if (isRemoteWebSession()) return null;
+	return invoke<AppLockStatus>('app_lock_status');
+}
+
+/** Report user activity (throttled by the caller). Ignored while locked. */
+export async function appLockTouch(): Promise<void> {
+	if (isRemoteWebSession()) return;
+	return invoke('app_lock_touch');
+}
+
+/** Lock now. Rejects when no PIN is set (nothing could unlock it). */
+export async function appLockLock(): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_lock');
+}
+
+/** Unlock with the PIN / passphrase. A wrong entry resolves `ok: false`. */
+export async function appLockUnlock(secret: string): Promise<AppLockUnlockOutcome> {
+	return invoke<AppLockUnlockOutcome>('app_lock_unlock', { secret });
+}
+
+/** Unlock with OS biometrics. Refused on this build (`biometric.available` is
+ *  false everywhere, see the Rust module header); the path is kept for the
+ *  follow-up. */
+export async function appLockUnlockBiometric(): Promise<AppLockUnlockOutcome> {
+	return invoke<AppLockUnlockOutcome>('app_lock_unlock_biometric');
+}
+
+export async function appLockConfigure(opts: {
+	idleEnabled: boolean;
+	idleMinutes: number;
+	method: AppLockMethod;
+}): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_configure', {
+		idleEnabled: opts.idleEnabled,
+		idleMinutes: opts.idleMinutes,
+		method: opts.method,
+	});
+}
+
+/** Set the PIN / passphrase, or change it (`current` required once one exists). */
+export async function appLockSetSecret(
+	next: string,
+	current?: string | null
+): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_set_secret', { current: current ?? null, next });
+}
+
+/** Remove the PIN. Also turns idle lock off. */
+export async function appLockClearSecret(current: string): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_clear_secret', { current });
+}
+
+export function onAppLockChanged(callback: () => void): Promise<UnlistenFn> {
+	if (isRemoteWebSession()) return Promise.resolve(() => {});
+	return listen<unknown>(APP_LOCK_CHANGED_EVENT, () => callback());
+}
+
 export async function secretsVaultStatus(): Promise<VaultStatus> {
 	const raw = await invoke<{
 		available?: boolean;

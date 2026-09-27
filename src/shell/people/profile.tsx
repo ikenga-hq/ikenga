@@ -1,0 +1,117 @@
+// Profile tab — D-05 `profile` (`designs/people.html?state=profile`), WP-72.
+//
+// The local profile, which is always there, and the App lock block. The
+// design's Account block is left out on purpose. It belongs to
+// `profile-account` / `sign-in`, which G-98 gives to WP-76, and only if
+// G-ACCESS keeps an account. A local-only shell has nothing to sign in to.
+//
+// Display name is the existing onboarding name (`useShellStore().userName`,
+// persisted as `workspace.userName`). "OS user" is what the shipped shell
+// knows about you: the OS username (`os_username`) plus the host and OS that
+// `app_lock_status` reports.
+
+import { useEffect, useId, useState } from 'react';
+
+import { osUsername } from '@/lib/tauri-cmd';
+import { useShellStore } from '@/lib/shell/shell-store';
+
+import { AppLockBlock } from './app-lock-settings';
+import { startAppLockSync, useAppLockStore } from './app-lock-store';
+import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
+
+export function ProfileTab() {
+	return (
+		<div data-state="profile" className="mx-auto w-full max-w-[720px] space-y-4 px-6 py-6">
+			<PeopleHeader tab="profile" />
+			<LocalProfileBlock />
+			<AppLockBlock />
+		</div>
+	);
+}
+
+/** First letter of the name, for the avatar. */
+export function avatarInitial(name: string, fallback: string): string {
+	const source = name.trim() || fallback.trim();
+	const first = Array.from(source)[0];
+	return first ? first.toUpperCase() : '?';
+}
+
+function LocalProfileBlock() {
+	useEffect(() => startAppLockSync(), []);
+	const userName = useShellStore((s) => s.userName);
+	const setUserName = useShellStore((s) => s.setUserName);
+	const status = useAppLockStore((s) => s.status);
+	const [draft, setDraft] = useState(userName);
+	const [osUser, setOsUser] = useState<string | null>(null);
+	const nameId = useId();
+
+	useEffect(() => setDraft(userName), [userName]);
+	useEffect(() => {
+		let cancelled = false;
+		osUsername()
+			.then((name) => {
+				if (!cancelled) setOsUser(name);
+			})
+			.catch(() => {
+				if (!cancelled) setOsUser(null);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+
+	const commit = () => {
+		if (draft.trim() !== userName) setUserName(draft);
+	};
+
+	const osLine = [status?.host, status?.os].filter(Boolean).join(' · ');
+
+	return (
+		<PeopleBlock title="Local profile" right={<Kv>always present</Kv>}>
+			<div className="flex items-start gap-3 py-3">
+				<div
+					aria-hidden
+					className="grid h-10 w-10 flex-none place-items-center rounded-full bg-[var(--primary-soft)] font-semibold text-[var(--fg)]"
+					style={{ fontFamily: 'var(--font-display)' }}
+				>
+					{avatarInitial(draft, osUser ?? '')}
+				</div>
+				<div className="min-w-0 flex-1">
+					<PeopleRow
+						label="Display name"
+						htmlFor={nameId}
+						sub="Shown on your own devices. Nothing leaves this machine: there is no account."
+					>
+						<input
+							id={nameId}
+							type="text"
+							value={draft}
+							onChange={(e) => setDraft(e.target.value)}
+							onBlur={commit}
+							onKeyDown={(e) => {
+								if (e.key === 'Enter') {
+									e.preventDefault();
+									commit();
+								} else if (e.key === 'Escape') {
+									e.preventDefault();
+									setDraft(userName);
+								}
+							}}
+							placeholder={osUser ?? 'Your name'}
+							className="h-7 w-[240px] max-w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
+						/>
+					</PeopleRow>
+					<PeopleRow
+						label="OS user"
+						sub="Read from the operating system. This is all the shell knows about you."
+					>
+						<Kv>
+							<b className="font-medium text-[var(--fg)]">{osUser ?? '—'}</b>
+							{osLine && ` · ${osLine}`}
+						</Kv>
+					</PeopleRow>
+				</div>
+			</div>
+		</PeopleBlock>
+	);
+}
