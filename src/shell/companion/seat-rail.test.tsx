@@ -496,6 +496,17 @@ describe('coming back from Window 2 (D-09 moveBack / closeWin2)', () => {
 		);
 	});
 
+	it('Window 2 closing counts a viewer pane too — alone it still speaks', async () => {
+		m.windowJoinSurface.mockResolvedValue('detached-w2');
+		await popOutSurface('viewer:/w/notes.md', { projectId: PROJECT, kind: 'viewer' });
+		useSeatNotice.setState({ notice: null });
+		handleSurfacesReturned({ label: 'detached-w2', surfaceIds: ['viewer:/w/notes.md'], reason: 'window-closed' });
+		expect(leafTabs()).toEqual(['term-3']);
+		expect(useSeatNotice.getState().notice?.message).toBe(
+			'Window 2 closed — 1 pane returned to the main window; addresses unchanged'
+		);
+	});
+
 	it('Window 2 ⋯ → Make dispatch target selects the surface’s seat', () => {
 		handleMakeTargetRequest('terminal:pty-term-3');
 		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'seat', seat_id: 'seat-lead' });

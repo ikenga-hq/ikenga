@@ -144,8 +144,9 @@ export interface EditorFormState {
 	chiTarget: ChiTarget;
 	chiEngineId: string;
 	/** G-SEATS §9.1 `seat` (`<name>` / `<project>/<name>`), required iff
-	 *  `chiTarget === 'seat'`. No field edits it yet (a follow-up); it is
-	 *  carried through so saving a seat action keeps it valid. */
+	 *  `chiTarget === 'seat'` (`missingRunFieldName`). WP-71a: the Run
+	 *  section's seat field edits it (`run-fields.tsx`); it is written only
+	 *  while the target is `seat` (`buildRun`). */
 	chiSeat: string;
 	chiPrompt: string;
 	shellCommand: string;
@@ -496,22 +497,49 @@ export function runRequiresField(kind: ActionRunKind): string | null {
 }
 
 export function missingRunField(form: EditorFormState): boolean {
+	return missingRunFieldName(form) !== null;
+}
+
+/**
+ * What the run is missing, as Save's error names it ("This run kind needs
+ * <it>."), or `null` when nothing required is blank. The run kind's own
+ * field first (`runRequiresField`); then, for a `chi` run aimed at a seat,
+ * the seat (WP-71a, G-SEATS §9.1: required iff `target === 'seat'`, the
+ * same rule `actions/schema.rs` enforces on write).
+ */
+export function missingRunFieldName(form: EditorFormState): string | null {
 	switch (form.runType) {
 		case 'chi':
-			return !form.chiPrompt.trim();
+			if (!form.chiPrompt.trim()) return runRequiresField('chi');
+			if (form.chiTarget === 'seat' && !form.chiSeat.trim()) return 'a seat';
+			return null;
 		case 'shell':
-			return !form.shellCommand.trim();
+			return form.shellCommand.trim() ? null : runRequiresField('shell');
 		case 'iyke':
-			return !form.iykeRoute.trim();
+			return form.iykeRoute.trim() ? null : runRequiresField('iyke');
 		case 'skill':
-			return !form.skillName.trim();
+			return form.skillName.trim() ? null : runRequiresField('skill');
 		case 'workflow':
-			return !form.workflowName.trim();
+			return form.workflowName.trim() ? null : runRequiresField('workflow');
 		case 'open':
-			return !form.openUrl.trim();
+			return form.openUrl.trim() ? null : runRequiresField('open');
 		default:
-			return false;
+			return null;
 	}
+}
+
+/**
+ * WP-71a: the seat suggestions the Run section offers for a `seat` target —
+ * the active project's roster (`seats_list`), by bare name (§9.1: a bare name
+ * resolves in the active project), in roster order, without duplicates.
+ * Free text (`<project>/<name>`) is still accepted by the field itself.
+ */
+export function seatSuggestions(seats: readonly { name: string }[] | undefined): string[] {
+	const out: string[] = [];
+	for (const seat of seats ?? []) {
+		if (seat.name && !out.includes(seat.name)) out.push(seat.name);
+	}
+	return out;
 }
 
 // ─── The DEC-59 inline conflict card (§5) ───────────────────────────────────

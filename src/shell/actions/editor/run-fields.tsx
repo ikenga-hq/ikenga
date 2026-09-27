@@ -8,10 +8,14 @@ import type { ActionRunKind, ChiTarget } from '@/lib/actions/client';
 import { RUN_VARIABLES } from '@/lib/actions/client';
 import { RUN_TYPES } from './form-model';
 
+// D-06 draws the first three; WP-71a adds G-SEATS §9.1's `seat` target
+// (`ChiTarget` gained it additively) so a seat action can be made here
+// instead of by hand in `actions.json`.
 const CHI_TARGETS: readonly { id: ChiTarget; label: string }[] = [
 	{ id: 'active', label: 'Active session' },
 	{ id: 'new', label: 'New session' },
 	{ id: 'engine', label: 'Pick engine' },
+	{ id: 'seat', label: 'Seat' },
 ];
 
 export interface RunFieldsProps {
@@ -22,6 +26,11 @@ export interface RunFieldsProps {
 	onChangeChiTarget: (target: ChiTarget) => void;
 	chiEngineId: string;
 	onChangeChiEngineId: (value: string) => void;
+	/** G-SEATS §9.1 `seat`: `<name>` or `<project>/<name>`. */
+	chiSeat: string;
+	onChangeChiSeat: (value: string) => void;
+	/** The active project's seat names (`seatSuggestions`), offered as chips. */
+	seatSuggestions: readonly string[];
 	chiPrompt: string;
 	onChangeChiPrompt: (value: string) => void;
 
@@ -131,6 +140,37 @@ export function RunFields(props: RunFieldsProps) {
 										onChange={(e) => props.onChangeChiEngineId(e.target.value)}
 									/>
 								</div>
+							)}
+							{props.chiTarget === 'seat' && (
+								<>
+									<div className="field" style={{ marginTop: 'var(--space-2)' }}>
+										<input
+											id="edSeat"
+											type="text"
+											aria-label="Seat"
+											placeholder="seat name, e.g. lead — or project/lead"
+											autoComplete="off"
+											spellCheck={false}
+											value={props.chiSeat}
+											onChange={(e) => props.onChangeChiSeat(e.target.value)}
+										/>
+									</div>
+									{props.seatSuggestions.length > 0 && (
+										<div className="varchips" role="group" aria-label="Seats in this project">
+											{props.seatSuggestions.map((name) => (
+												<button
+													key={name}
+													type="button"
+													className="varchip"
+													aria-pressed={props.chiSeat.trim() === name}
+													onClick={() => props.onChangeChiSeat(name)}
+												>
+													@{name}
+												</button>
+											))}
+										</div>
+									)}
+								</>
 							)}
 						</div>
 					</>

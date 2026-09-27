@@ -31,6 +31,8 @@ import { gatherRunVariables, runAction, type RunOutcome } from '@/lib/actions/ru
 import { iykePath } from '@/lib/actions/runner/iyke';
 import { formatKeyLabel, isMacPlatform } from '@/lib/keymap/platform';
 import { tryParseWhen } from '@/lib/keymap/when';
+import { useSeats } from '@/lib/queries/seats';
+import { useShellStore } from '@/lib/shell/shell-store';
 import { NgwaTrustSheet } from '@/shell/ngwa/ngwa-trust-sheet';
 import { ActionIcon } from '../shared/action-icon';
 import { actionsPathLabel } from '../header';
@@ -43,10 +45,10 @@ import {
 	emptyForm,
 	findEditorConflict,
 	formFromAction,
-	missingRunField,
+	missingRunFieldName,
 	planKeybindingWrite,
 	PLACEMENT_IDS,
-	runRequiresField,
+	seatSuggestions,
 	slug,
 	suggestedRestriction,
 	type EditorFormState,
@@ -195,6 +197,14 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		};
 	}, [writeScope, model, form.id, form.runType]);
 
+	// WP-71a: a `seat` target's field offers the active project's seats (§9.1:
+	// a bare name resolves there). Read only while that field shows.
+	const activeProjectId = useShellStore((s) => s.activeProject.id);
+	const seatsQuery = useSeats(activeProjectId || null, {
+		enabled: form.runType === 'chi' && form.chiTarget === 'seat',
+	});
+	const seatNames = useMemo(() => seatSuggestions(seatsQuery.data), [seatsQuery.data]);
+
 	function update<K extends keyof EditorFormState>(key: K, value: EditorFormState[K]) {
 		setForm((f) => ({ ...f, [key]: value }));
 		setSavedAt(null);
@@ -211,8 +221,9 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 			setSaveError('Give it a name first.');
 			return;
 		}
-		if (missingRunField(form)) {
-			setSaveError(`This run kind needs ${runRequiresField(form.runType)}.`);
+		const missing = missingRunFieldName(form);
+		if (missing) {
+			setSaveError(`This run kind needs ${missing}.`);
 			return;
 		}
 		if (duplicateOf) {
@@ -417,6 +428,9 @@ export function EditorSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 							onChangeChiTarget={(v) => update('chiTarget', v)}
 							chiEngineId={form.chiEngineId}
 							onChangeChiEngineId={(v) => update('chiEngineId', v)}
+							chiSeat={form.chiSeat}
+							onChangeChiSeat={(v) => update('chiSeat', v)}
+							seatSuggestions={seatNames}
 							chiPrompt={form.chiPrompt}
 							onChangeChiPrompt={(v) => update('chiPrompt', v)}
 							shellCommand={form.shellCommand}
