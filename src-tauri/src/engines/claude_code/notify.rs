@@ -135,8 +135,10 @@ fn short_thread(thread_id: &str) -> String {
 
 /// One-line summary of a tool's input for use as a notification body. We
 /// keep it conservative: prefer well-known fields (command, path, url,
-/// question) and fall back to a generic "(tap to review)".
-fn short_summary_of_input(tool_input: Option<&Value>) -> String {
+/// question) and fall back to a generic "(tap to review)". Also used by the
+/// WP-40 permission producers (`notifications::producers`) so a persisted
+/// notification row and the OS notification describe a tool call identically.
+pub(crate) fn short_summary_of_input(tool_input: Option<&Value>) -> String {
     let Some(input) = tool_input else {
         return "(tap to review)".into();
     };

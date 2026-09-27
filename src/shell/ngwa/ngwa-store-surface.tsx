@@ -14,6 +14,7 @@ import {
 	Check,
 	ChevronDown,
 } from 'lucide-react';
+import { LoadingState, OfflineState } from '@/components/states';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
 import type { NgwaItem } from '@ikenga/contract';
 import { kindIcon } from './ngwa-list';
@@ -24,6 +25,8 @@ export interface NgwaStoreSurfaceProps {
 	catalog: NgwaStoreEntry[];
 	isLoading?: boolean;
 	error?: Error | null;
+	/** D-07 offline state's one next action. */
+	onRetry?: () => void;
 	onInstall?: (entry: NgwaStoreEntry, scope: 'personal' | 'project') => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
 	onUpdateAll?: (entries: NgwaStoreEntry[]) => void;
@@ -48,6 +51,7 @@ export function NgwaStoreSurface({
 	catalog,
 	isLoading = false,
 	error = null,
+	onRetry,
 	onInstall,
 	onUpdate,
 	onUpdateAll,
@@ -200,18 +204,17 @@ export function NgwaStoreSurface({
 				<div className="listcol">
 					<div className="sc flex-1 min-h-0" data-slist>
 						{isLoading && (
-							<div className="empty">
-								<span className="emberbar">
-									<i />
-									Loading registry catalog…
-								</span>
-							</div>
+							<LoadingState data-state="ngwa-store-loading" fill heading="Fetching the index" />
 						)}
 
-						{error && (
-							<div className="empty text-destructive">
-								Failed to load registry: {String(error)}
-							</div>
+						{!isLoading && error && (
+							<OfflineState
+								data-state="ngwa-store-offline"
+								fill
+								heading="Registry unreachable"
+								body="Everything installed still runs. Only browsing and installing new packages needs the network."
+								action={onRetry ? { label: 'Retry', onClick: onRetry } : undefined}
+							/>
 						)}
 
 						{!isLoading && !error && filtered.length === 0 && (

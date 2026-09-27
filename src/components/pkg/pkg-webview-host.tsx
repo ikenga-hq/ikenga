@@ -20,8 +20,17 @@
 // destroy the orphan it created. We use the same `dropped` flag pattern
 // `PkgIframeHost` uses.
 
-import { listen, type UnlistenFn } from '@/lib/transport';
+import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect, useRef, useState } from 'react';
+
+import {
+	blockedInfoFromNavigation,
+	NAVIGATION_BLOCKED_EVENT,
+	type NavigationBlockedEvent,
+	type PkgBlockedInfo,
+} from '@/lib/pkg/pkg-view-state';
+import { usePkgBlockedStore } from '@/lib/pkg/pkg-blocked-store';
+import { PkgBlockedState, PkgBlockedTrustSheet, useAllowHostSheet } from './pkg-view-states';
 
 import {
 	pkgWebviewCreate,
@@ -71,6 +80,13 @@ function measureRect(el: HTMLElement): PkgWebviewRect | null {
 	};
 }
 
+/** Where a live webview is parked while its pane shows `pkg-blocked`: a 1×1
+ *  surface far off-screen, via the existing `pkg_webview_set_rect` (there is
+ *  no visibility command). The native surface floats above the React tree,
+ *  so it has to move out of the way for the state to be seen. Best-effort on
+ *  Wayland, where the compositor ignores client positioning. */
+const PARKED_RECT: PkgWebviewRect = { x: -10000, y: -10000, w: 1, h: 1 };
+
 function rectsEqual(a: PkgWebviewRect | null, b: PkgWebviewRect | null): boolean {
 	if (!a || !b) return a === b;
 	return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
@@ -80,8 +96,47 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 	const placeholderRef = useRef<HTMLDivElement>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [mounted, setMounted] = useState(false);
+	// WP-45 `pkg-blocked`: set from the kernel's `pkg://navigation-blocked`
+	// broadcast (`pkg/webview.rs::emit_if_origin_blocked`) for this pane.
+	const [blocked, setBlocked] = useState<PkgBlockedInfo | null>(null);
+	const allowHost = useAllowHostSheet();
+	// Bumped to re-run the mount effect after a create-time block was allowed.
+	const [mountKey, setMountKey] = useState(0);
+	// True while the live surface sits at PARKED_RECT; the reposition effect
+	// leaves it there until the block is resolved.
+	const parkedRef = useRef(false);
+	const registerKeepBlocking = usePkgBlockedStore((s) => s.register);
+
+	// Subscribed before the mount effect's first-frame wait resolves, so a
+	// create-time rejection is caught. Covers both cases: a create that the
+	// origin boundary refused (no surface), and a navigation refused on a
+	// live pane — the design's case — where the surface is parked (below) so
+	// the pane can show `pkg-blocked` in its place.
+	useEffect(() => {
+		if (!isTauri()) return;
+		let unlisten: UnlistenFn | null = null;
+		let cancelled = false;
+		listen<NavigationBlockedEvent>(NAVIGATION_BLOCKED_EVENT, (ev) => {
+			if (cancelled) return;
+			if (ev.payload?.pkgId !== pkgId || ev.payload?.paneId !== paneId) return;
+			setBlocked(blockedInfoFromNavigation(ev.payload));
+		})
+			.then((fn) => {
+				if (cancelled) {
+					fn();
+					return;
+				}
+				unlisten = fn;
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+			unlisten?.();
+		};
+	}, [pkgId, paneId]);
 
 	// Mount effect — create the webview at the placeholder's initial rect.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: mountKey is a trigger-only dep — bumping it re-creates after "Allow host…" lifted a create-time block.
 	useEffect(() => {
 		const el = placeholderRef.current;
 		if (!el) return;
@@ -99,6 +154,7 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 			if (dropped) return;
 
 			const rect = measureRect(el) ?? { x: 0, y: 0, w: 0, h: 0 };
+			parkedRef.current = false;
 
 			try {
 				await pkgWebviewCreate(pkgId, paneId, source, rect, partition ?? null);
@@ -131,7 +187,54 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 		// doesn't re-create on URL changes (navigation goes through the pkg's
 		// MCP server). pkgId / paneId changes effectively mean a different
 		// webview, so re-create.
-	}, [pkgId, paneId, source, partition]);
+	}, [pkgId, paneId, source, partition, mountKey]);
+
+	// WP-45 `pkg-blocked` on a live pane: park the native surface while the
+	// state shows, restore it (at the placeholder's current rect, on its
+	// previous page) when the block is resolved — allowed, or kept blocked
+	// from the pane ⋯ menu.
+	useEffect(() => {
+		if (!mounted) return;
+		if (blocked && !parkedRef.current) {
+			parkedRef.current = true;
+			pkgWebviewSetRect(pkgId, paneId, PARKED_RECT).catch((e) => {
+				console.warn(`[pkg-webview-host] park failed for ${pkgId}/${paneId}:`, e);
+			});
+		} else if (!blocked && parkedRef.current) {
+			parkedRef.current = false;
+			const el = placeholderRef.current;
+			const rect = el ? measureRect(el) : null;
+			if (rect) {
+				pkgWebviewSetRect(pkgId, paneId, rect).catch((e) => {
+					console.warn(`[pkg-webview-host] unpark failed for ${pkgId}/${paneId}:`, e);
+				});
+			}
+		}
+	}, [blocked, mounted, pkgId, paneId]);
+
+	// "Keep blocking" (pane ⋯ menu) — only for a live, parked pane: drops the
+	// state and brings the previous page back.
+	useEffect(() => {
+		if (!blocked || !mounted) return;
+		return registerKeepBlocking(pkgId, paneId, () => setBlocked(null));
+	}, [blocked, mounted, pkgId, paneId, registerKeepBlocking]);
+
+	// After "Allow host…" granted the origin: re-attempt the blocked load.
+	const onHostAllowed = () => {
+		const target = blocked?.target;
+		setBlocked(null);
+		if (mounted) {
+			if (target) {
+				pkgWebviewNavigate(pkgId, paneId, target).catch((e) => {
+					// A repeat block re-emits `pkg://navigation-blocked`.
+					console.warn(`[pkg-webview-host] navigate after allow failed for ${pkgId}/${paneId}:`, e);
+				});
+			}
+		} else {
+			setError(null);
+			setMountKey((k) => k + 1);
+		}
+	};
 
 	// Dev-mode: `Kernel::reload_pkg` emits `pkg-reloaded` after re-registering.
 	// For child webviews we deliberately do NOT destroy + re-create — that
@@ -177,7 +280,7 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 
 		const flush = () => {
 			rafId = null;
-			if (disposed) return;
+			if (disposed || parkedRef.current) return;
 			const next = measureRect(el);
 			if (!next) return;
 			if (rectsEqual(next, lastRect)) return;
@@ -207,7 +310,7 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 		};
 	}, [mounted, pkgId, paneId]);
 
-	if (error) {
+	if (error && !blocked) {
 		return (
 			<div className="p-4 text-sm text-red-500">
 				<div className="font-semibold">Failed to mount package webview</div>
@@ -229,7 +332,21 @@ export function PkgWebviewHost({ pkgId, paneId, source, partition }: PkgWebviewH
 			data-pkg-pane-id={paneId}
 			style={{ position: 'relative', width: '100%', height: '100%' }}
 		>
-			{!mounted && (
+			{blocked && (
+				// Inside the placeholder so its element (and the reposition
+				// observer on it) survives the block.
+				<div className="absolute inset-0">
+					<PkgBlockedState pkgId={pkgId} blocked={blocked} onAllowHost={allowHost.openSheet} />
+					<PkgBlockedTrustSheet
+						pkgId={pkgId}
+						blocked={blocked}
+						open={allowHost.open}
+						onOpenChange={allowHost.setOpen}
+						onApproved={onHostAllowed}
+					/>
+				</div>
+			)}
+			{!mounted && !blocked && (
 				<div className="p-4 text-xs opacity-60" style={{ pointerEvents: 'none' }}>
 					Mounting browser…
 				</div>

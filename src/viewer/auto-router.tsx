@@ -9,6 +9,8 @@ import { MarkdownView } from './renderers/markdown-view';
 import { VideoView } from './renderers/video-view';
 import { AudioView } from './renderers/audio-view';
 import { PenView } from './renderers/pen-view';
+import { CsvView } from './renderers/csv-view';
+import { JsonView } from './renderers/json-view';
 import { UnknownView } from './renderers/unknown-view';
 
 // Heavy renderers — code-split out of the main bundle. Each pulls a
@@ -16,9 +18,12 @@ import { UnknownView } from './renderers/unknown-view';
 // sessions never touch. Default-export shims live alongside each
 // renderer so React.lazy can pick them up without touching the named
 // export consumers elsewhere.
-const CodeView = lazy(() => import('./renderers/code-view').then((m) => ({ default: m.CodeView })));
-const PdfView = lazy(() => import('./renderers/pdf-view').then((m) => ({ default: m.PdfView })));
-const XlsxView = lazy(() => import('./renderers/xlsx-view').then((m) => ({ default: m.XlsxView })));
+// Exported (in addition to lazy-loaded) so `auto-router.test.ts` can assert
+// `pickRenderer` returns the exact same reference — otherwise these three
+// have no externally-visible identity to compare against.
+export const CodeView = lazy(() => import('./renderers/code-view').then((m) => ({ default: m.CodeView })));
+export const PdfView = lazy(() => import('./renderers/pdf-view').then((m) => ({ default: m.PdfView })));
+export const XlsxView = lazy(() => import('./renderers/xlsx-view').then((m) => ({ default: m.XlsxView })));
 
 interface ViewerRouterProps {
 	path: string;
@@ -38,7 +43,10 @@ interface ViewerRouterProps {
 
 type Renderer = React.ComponentType<{ path: string }>;
 
-function pickRenderer(mime: string, path: string): Renderer {
+/** Exported for `auto-router.test.ts` — mime/extension → renderer is pure
+ *  dispatch logic and the highest-risk part of a router change (a
+ *  mis-ordered branch silently mis-routes a whole file class). */
+export function pickRenderer(mime: string, path: string): Renderer {
 	const lower = path.toLowerCase();
 	if (mime === 'text/html' || lower.endsWith('.html') || lower.endsWith('.htm')) return HtmlFrame;
 	if (mime === 'application/pdf' || lower.endsWith('.pdf')) return PdfView;
@@ -51,9 +59,16 @@ function pickRenderer(mime: string, path: string): Renderer {
 	if (lower.endsWith('.pen')) return PenView;
 	if (mime === 'text/markdown' || lower.endsWith('.md') || lower.endsWith('.mdx'))
 		return MarkdownView;
+	// JSON Lines is many JSON documents, one per line — not a single tree, so
+	// it stays in CodeView (checked first: it shares `application/json` with
+	// `.json` in the extension table). A lone `.json`/`.json5` (or a resolved
+	// `application/json` mime) gets the collapsible tree.
+	if (lower.endsWith('.jsonl')) return CodeView;
+	if (mime === 'application/json' || lower.endsWith('.json') || lower.endsWith('.json5')) return JsonView;
+	if (mime === 'text/csv' || mime === 'text/tab-separated-values' || lower.endsWith('.csv') || lower.endsWith('.tsv'))
+		return CsvView;
 	if (
 		mime.startsWith('text/') ||
-		mime === 'application/json' ||
 		mime === 'application/yaml' ||
 		mime === 'application/toml' ||
 		mime === 'application/xml'

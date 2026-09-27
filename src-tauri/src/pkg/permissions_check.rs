@@ -92,6 +92,19 @@ pub async fn record_violation(
     .execute(pool)
     .await
     .map_err(|e| anyhow!("insert pkg_permission_violations: {e}"))?;
+    // WP-40 `violation` producer. Every denial path funnels through this
+    // helper (shell.execute, http.fetch, capabilities.secrets/invoke), so one
+    // call here covers them all. Best-effort: a failed notification write
+    // never turns a recorded denial into an error.
+    crate::notifications::record_best_effort(
+        pool,
+        crate::notifications::producers::violation(
+            &denial.pkg_id,
+            scope_kind,
+            &denial.command,
+        ),
+    )
+    .await;
     Ok(())
 }
 
@@ -149,5 +162,41 @@ mod tests {
     fn declared_preserves_order() {
         let err = check_shell_execute("p", &s(&["a", "b", "c"]), "x").unwrap_err();
         assert_eq!(err.declared, "a,b,c");
+    }
+
+    /// WP-40: `record_violation` is the `violation` producer. Repeated denials
+    /// of the same target fold into one unread row with a denial count.
+    #[tokio::test]
+    async fn record_violation_produces_a_folded_violation_notification() {
+        use crate::notifications::{self, ListQuery, NotificationKind};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::commands::db::PaDb::new(tmp.path().join("ikenga.db"));
+        let pool = db.ensure_pool().await.unwrap();
+        let denial = check_shell_execute("com.ikenga.pkg-browser", &s(&["bun"]), "ffmpeg")
+            .unwrap_err();
+        for _ in 0..3 {
+            record_violation(&pool, "shell.execute", &denial).await.unwrap();
+        }
+
+        let rows = notifications::list(
+            &pool,
+            &ListQuery {
+                kinds: Some(vec![NotificationKind::Violation]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "three denials fold into one unread row");
+        assert_eq!(rows[0].count, 3);
+        assert_eq!(rows[0].title, "pkg-browser was blocked from spawning ffmpeg");
+        assert_eq!(
+            notifications::unread_count(&pool, &[]).await.unwrap().total,
+            1
+        );
+        // Violation can never be muted, so a caller passing it as muted is the
+        // only way to hide it — the command layer never does (see mute.rs).
+        assert!(!NotificationKind::Violation.is_mutable());
     }
 }

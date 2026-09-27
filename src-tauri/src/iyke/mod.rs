@@ -11,6 +11,7 @@
 //! handlers (go, mode, open, split, focus, close) and the CLI/MCP packages
 //! land in Day 2/3.
 
+pub mod actions_routes;
 pub mod auth;
 pub mod browser_handlers;
 pub mod browser_rpc;
@@ -25,6 +26,7 @@ pub mod ide_ws;
 pub mod layout;
 pub mod mcp;
 pub mod memory;
+pub mod notifications;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg_db;

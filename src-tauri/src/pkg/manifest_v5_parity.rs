@@ -390,7 +390,8 @@ fn context_actions_snapshot_wire_shape_and_tagged_unions() {
     let first = &entries[0];
     assert_eq!(
         sorted_keys(first),
-        vec!["id", "label", "pkg_id", "qualified_id", "run", "when"]
+        // `key` (WP-51, G-PKG-KEY) rides along so WP-52 can read the request.
+        vec!["id", "key", "label", "pkg_id", "qualified_id", "run", "when"]
     );
     assert_eq!(
         first["when"],

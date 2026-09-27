@@ -8,16 +8,20 @@
 //   - lastCheckedAt: epoch ms of the last successful check
 //   - checking: true while a check is in flight
 //
-// Hook is intended to be used at multiple call sites (banner + About page +
-// mission-control tile) — each instance maintains its own state, but the
-// underlying Tauri command is the same global. The 6h auto-check fires from
-// the banner instance mounted in workspace.tsx; pass `{ autoPoll: false }`
-// from secondary call sites so only the banner owns the timer.
+// Hook is used at multiple call sites (banner + About page + the WP-41
+// update sheet's Shell tab + the status bar's progress segment). WP-41 made
+// the state a shared store (`updater-store.ts`) rather than per-instance
+// `useState`: a download the banner starts has to show up as "downloading"
+// in the sheet the same click opens, and in the status bar — three separate
+// component trees that all need to agree on one live download. The 6h
+// auto-check still fires from the banner instance mounted in workspace.tsx;
+// pass `{ autoPoll: false }` from secondary call sites so only the banner
+// owns the timer (now a module-level guard in `updater-store.ts`, so this is
+// belt-and-suspenders rather than load-bearing).
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { checkForUpdate, installUpdate, restartApp, type UpdateInfo } from '@/lib/updater/updater';
-
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+import { useEffect } from 'react';
+import type { UpdateInfo } from '@/lib/updater/updater';
+import { ensureUpdaterPolling, useUpdaterStore } from '@/lib/updater/updater-store';
 
 export type UpdaterState = {
 	available: UpdateInfo | null;
@@ -53,79 +57,33 @@ export interface UseUpdaterOptions {
 export function useUpdater(options?: UseUpdaterOptions): UpdaterState {
 	const autoPoll = options?.autoPoll ?? true;
 	const enabled = options?.enabled ?? true;
-	const [available, setAvailable] = useState<UpdateInfo | null>(null);
-	const [installing, setInstalling] = useState(false);
-	const [installed, setInstalled] = useState(false);
-	const [bytesDownloaded, setBytesDownloaded] = useState(0);
-	const [totalBytes, setTotalBytes] = useState<number | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [checking, setChecking] = useState(false);
-	const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null);
 
-	const check = useCallback(async () => {
-		setChecking(true);
-		try {
-			const info = await checkForUpdate();
-			setAvailable(info);
-			setLastCheckedAt(Date.now());
-		} finally {
-			setChecking(false);
-		}
-	}, []);
+	// Subscribes to the whole store — this hook has a handful of call sites,
+	// not a hot list render, so the simplicity of "re-render on any updater
+	// state change" outweighs the value of field-level selectors here.
+	const state = useUpdaterStore();
 
-	const install = useCallback(async () => {
-		if (!available) return;
-		setInstalling(true);
-		setInstalled(false);
-		setError(null);
-		try {
-			await installUpdate(available, (b, t) => {
-				setBytesDownloaded(b);
-				setTotalBytes(t);
-			});
-			// Install done — hold here, always. The relaunch is a separate,
-			// deliberate step: it doesn't just avoid the mid-flow teardown
-			// (see updater.ts), it protects unsaved work in terminals and pkg
-			// panes that a surprise restart would throw away.
-			setInstalling(false);
-			setInstalled(true);
-		} catch (e) {
-			setError(e instanceof Error ? e.message : String(e));
-			setInstalling(false);
-		}
-	}, [available]);
-
-	const restart = useCallback(async () => {
-		try {
-			await restartApp();
-		} catch (e) {
-			setError(e instanceof Error ? e.message : String(e));
-		}
-	}, []);
-
-	const intervalRef = useRef<number | null>(null);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: deliberately only
+	// on mount / when `enabled` or `autoPoll` change — `state.check` is a stable
+	// store action, and re-running this effect on every store update
+	// (available/installing/…) would re-trigger the boot check in a loop.
 	useEffect(() => {
 		if (!enabled) return;
-		void check();
-		if (autoPoll) {
-			intervalRef.current = window.setInterval(() => void check(), CHECK_INTERVAL_MS);
-		}
-		return () => {
-			if (intervalRef.current !== null) window.clearInterval(intervalRef.current);
-		};
-	}, [check, autoPoll, enabled]);
+		void state.check();
+		if (autoPoll) ensureUpdaterPolling();
+	}, [enabled, autoPoll]);
 
 	return {
-		available,
-		installing,
-		installed,
-		bytesDownloaded,
-		totalBytes,
-		error,
-		checking,
-		lastCheckedAt,
-		check,
-		install,
-		restart,
+		available: state.available,
+		installing: state.installing,
+		installed: state.installed,
+		bytesDownloaded: state.bytesDownloaded,
+		totalBytes: state.totalBytes,
+		error: state.error,
+		checking: state.checking,
+		lastCheckedAt: state.lastCheckedAt,
+		check: state.check,
+		install: state.install,
+		restart: state.restart,
 	};
 }

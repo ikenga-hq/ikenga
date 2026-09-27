@@ -38,6 +38,16 @@ export interface TrustReviewModalProps {
 	initialReviews?: PkgTrustReview[];
 	/** Called after any successful Approve / Reject so the banner can refresh. */
 	onChange?: () => void;
+	/**
+	 * Override the default Approve action (`pkgTrustApprove`, which assumes
+	 * the pkg is already installed-but-parked at boot). Pass this for a row
+	 * parked BEFORE install (the updater's pre-install capability diff,
+	 * WP-41-F1) — approving there must install the pkg, not resume a
+	 * registered row that doesn't exist yet.
+	 */
+	onApprove?: (pkgId: string) => Promise<void>;
+	/** Override the default Reject action (`pkgTrustReject`, which uninstalls). */
+	onReject?: (pkgId: string) => Promise<void>;
 }
 
 export function TrustReviewModal({
@@ -45,12 +55,29 @@ export function TrustReviewModal({
 	onOpenChange,
 	initialReviews,
 	onChange,
+	onApprove,
+	onReject,
 }: TrustReviewModalProps) {
 	const [reviews, setReviews] = useState<PkgTrustReview[]>(initialReviews ?? []);
 	const [pendingId, setPendingId] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 
+	// `onApprove` / `onReject` mean the caller owns the review list — rows
+	// parked before install never reach `pkg_trust_list_pending` (that only
+	// lists pkgs the KERNEL parked at boot), so there's nothing to refetch.
+	const controlled = onApprove !== undefined || onReject !== undefined;
+
+	// Stay in sync with a caller-supplied list across re-renders. This
+	// component doesn't remount between opens for every caller (the updater
+	// sheet keeps it mounted while its own `needsApproval` state changes),
+	// so without this `reviews` would freeze at whatever `initialReviews`
+	// looked like the first time the component happened to mount.
+	useEffect(() => {
+		if (initialReviews) setReviews(initialReviews);
+	}, [initialReviews]);
+
 	const refresh = useCallback(async () => {
+		if (controlled) return;
 		try {
 			const next = await pkgTrustListPending();
 			setReviews(next);
@@ -60,7 +87,7 @@ export function TrustReviewModal({
 		} catch (e) {
 			setError(String(e));
 		}
-	}, [onOpenChange]);
+	}, [onOpenChange, controlled]);
 
 	useEffect(() => {
 		if (open && !initialReviews) {
@@ -73,7 +100,11 @@ export function TrustReviewModal({
 			setPendingId(pkgId);
 			setError(null);
 			try {
-				await pkgTrustApprove(pkgId);
+				if (onApprove) {
+					await onApprove(pkgId);
+				} else {
+					await pkgTrustApprove(pkgId);
+				}
 				onChange?.();
 				await refresh();
 			} catch (e) {
@@ -82,7 +113,7 @@ export function TrustReviewModal({
 				setPendingId(null);
 			}
 		},
-		[onChange, refresh]
+		[onApprove, onChange, refresh]
 	);
 
 	const handleReject = useCallback(
@@ -90,7 +121,11 @@ export function TrustReviewModal({
 			setPendingId(pkgId);
 			setError(null);
 			try {
-				await pkgTrustReject(pkgId);
+				if (onReject) {
+					await onReject(pkgId);
+				} else {
+					await pkgTrustReject(pkgId);
+				}
 				onChange?.();
 				await refresh();
 			} catch (e) {
@@ -99,7 +134,7 @@ export function TrustReviewModal({
 				setPendingId(null);
 			}
 		},
-		[onChange, refresh]
+		[onReject, onChange, refresh]
 	);
 
 	return (
@@ -108,8 +143,11 @@ export function TrustReviewModal({
 				<DialogHeader>
 					<DialogTitle>Capability review</DialogTitle>
 					<DialogDescription>
-						These packages declared new or changed capabilities since you last approved them. Review
-						the diff and approve (resume the package) or reject (uninstall it).
+						{controlled
+							? 'This update declares new or changed capabilities. Review the diff and approve ' +
+								'(installs this version) or reject (skip it — nothing is installed).'
+							: 'These packages declared new or changed capabilities since you last approved ' +
+								'them. Review the diff and approve (resume the package) or reject (uninstall it).'}
 					</DialogDescription>
 				</DialogHeader>
 

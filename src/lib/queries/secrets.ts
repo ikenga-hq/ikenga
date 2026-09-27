@@ -1,19 +1,24 @@
 import { queryOptions, useMutation, useQueryClient } from '@tanstack/react-query';
 
+import { queryKeys } from '@/lib/query-keys';
 import {
-	type VaultScope,
-	type VaultStatus,
+	type SecretsLockState,
 	secretsDelete,
 	secretsDeleteScoped,
 	secretsListKeys,
 	secretsListKeysScoped,
+	secretsLock,
+	secretsLockState,
 	secretsSet,
+	secretsSetPassphrase,
 	secretsSetScoped,
+	secretsUnlock,
 	secretsVaultStatus,
+	type VaultScope,
+	type VaultStatus,
 } from '@/lib/tauri-cmd';
-import { queryKeys } from '@/lib/query-keys';
 
-export type { VaultStatus };
+export type { SecretsLockState, VaultStatus };
 
 export function vaultStatusQueryOptions() {
 	return queryOptions({
@@ -22,6 +27,57 @@ export function vaultStatusQueryOptions() {
 		staleTime: 30_000,
 	});
 }
+
+export function secretsLockStateQueryOptions() {
+	return queryOptions({
+		queryKey: queryKeys.secrets.lockState(),
+		queryFn: () => secretsLockState(),
+		staleTime: 5_000,
+	});
+}
+
+export function useSetSecretsPassphrase() {
+	const qc = useQueryClient();
+	return useMutation<
+		SecretsLockState,
+		Error,
+		{ passphrase: string; currentPassphrase?: string | null }
+	>({
+		mutationFn: ({ passphrase, currentPassphrase }) =>
+			secretsSetPassphrase(passphrase, currentPassphrase),
+		onSuccess: (state) => {
+			qc.setQueryData(queryKeys.secrets.lockState(), state);
+			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
+		},
+	});
+}
+
+export function useUnlockSecrets() {
+	const qc = useQueryClient();
+	return useMutation<SecretsLockState, Error, string>({
+		mutationFn: secretsUnlock,
+		onSuccess: (state) => {
+			qc.setQueryData(queryKeys.secrets.lockState(), state);
+			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
+		},
+	});
+}
+
+export function useLockSecrets() {
+	const qc = useQueryClient();
+	return useMutation<SecretsLockState, Error, void>({
+		mutationFn: () => secretsLock(),
+		onSuccess: (state) => {
+			qc.setQueryData(queryKeys.secrets.lockState(), state);
+			qc.invalidateQueries({ queryKey: queryKeys.secrets.all });
+		},
+	});
+}
+
+export const vaultLockStateQueryOptions = secretsLockStateQueryOptions;
+export const useSetSecretPassphrase = useSetSecretsPassphrase;
+export const useUnlockSecret = useUnlockSecrets;
+export const useLockSecret = useLockSecrets;
 
 export function vaultKeysQueryOptions() {
 	return queryOptions({

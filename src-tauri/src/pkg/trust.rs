@@ -55,6 +55,14 @@ pub const STUDIO_PROJECT_SCOPE_KIND: &str = "__studio_project";
 /// pkg id is a constant rather than a parameter.
 pub const STUDIO_PKG_ID: &str = "com.ikenga.studio";
 
+/// Sentinel scope_kind for a user-granted child-webview origin (WP-45, D-08
+/// `pkg-blocked` → "Allow host…"). `scope_value` is the serialized origin
+/// (`https://fal.media`). Additive only: it widens the manifest's declared
+/// `capabilities.webview.allowed_origins` by exactly that origin, it never
+/// narrows it, and the manifest itself is not touched. Rows are dropped with
+/// the pkg's other grants on unregister/uninstall (`registries::permissions`).
+pub const WEBVIEW_ORIGIN_SCOPE_KIND: &str = "__webview_origin";
+
 /// Plain-English summary of one declared permission set, for the trust
 /// dialog and the `iyke_pkg_trust_*` MCP tools. Lists only the entries
 /// that triggered the trust requirement, not the full perms block.
@@ -476,6 +484,46 @@ pub async fn record_studio_project_grant(pool: &SqlitePool, canonical_path: &str
     .await
     .context("insert studio project grant")?;
     Ok(())
+}
+
+/// Record a user grant of one child-webview origin for `pkg_id` (WP-45).
+/// Idempotent under the PRIMARY KEY — re-granting bumps `granted_at`.
+/// `origin` MUST already be normalized (`WebviewPanesRegistry::grant_origin`
+/// returns the normalized form).
+pub async fn record_webview_origin_grant(
+    pool: &SqlitePool,
+    pkg_id: &str,
+    origin: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT OR REPLACE INTO pkg_permissions_granted
+            (pkg_id, scope_kind, scope_value, granted_at, version, trust_state)
+            VALUES (?, ?, ?, ?, NULL, 'granted')",
+    )
+    .bind(pkg_id)
+    .bind(WEBVIEW_ORIGIN_SCOPE_KIND)
+    .bind(origin)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("insert webview origin grant")?;
+    Ok(())
+}
+
+/// Every child-webview origin the user granted `pkg_id` (WP-45).
+pub async fn webview_origin_grants(pool: &SqlitePool, pkg_id: &str) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT scope_value
+           FROM pkg_permissions_granted
+          WHERE pkg_id = ? AND scope_kind = ? AND trust_state = 'granted'",
+    )
+    .bind(pkg_id)
+    .bind(WEBVIEW_ORIGIN_SCOPE_KIND)
+    .fetch_all(pool)
+    .await
+    .context("read webview origin grants")?;
+    Ok(rows.into_iter().map(|(v,)| v).collect())
 }
 
 /// Mark all granted rows for this pkg as revoked. Subsequent evaluate()

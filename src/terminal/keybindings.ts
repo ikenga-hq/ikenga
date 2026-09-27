@@ -1,10 +1,22 @@
 /**
- * Terminal Keybinding Engine (T-11)
+ * Terminal keybindings (T-11) — read from the registry (WP-54, DEC-56).
  *
- * Provides configurable action-to-chord mappings for terminal keystrokes,
- * with platform-aware defaults (macOS Cmd-based chords vs Windows/Linux
- * Ctrl+Shift chords to avoid clashing with standard PTY control codes like SIGINT).
+ * The terminal's actions are the hosted `terminal.*` commands of the one
+ * keymap (G-ACTIONS §4.6, §10.2): `defaults.ts` holds their platform defaults
+ * (⌘-based on macOS; Ctrl+Shift-based on Windows/Linux, so plain Ctrl+C /
+ * Ctrl+V stay SIGINT / literal for the PTY), and a personal or project
+ * `keybindings.json` rule rebinds them like any other key — one grammar, no
+ * private chord table. The xterm hook stays their owner: it asks
+ * `evaluateTerminalKey()` which action a keydown is, and fires it itself; the
+ * frame dispatcher never does. The terminal still owns ⌘K while it has focus
+ * (`terminal.clear`, DEC-57).
  */
+
+import { type ContextKeys, getContextKeys, getEvalOptions } from '@/lib/keymap/context-keys';
+import type { KeymapEntry } from '@/lib/keymap/defaults';
+import { eventMatchesCombo, isMacPlatform } from '@/lib/keymap/platform';
+import { entriesForPlatform, getKeymap, labelFor, resolveKeypressWinner } from '@/lib/keymap/registry';
+import { evaluateWhen, type WhenContext } from '@/lib/keymap/when';
 
 export type TerminalAction =
 	| 'copy'
@@ -15,125 +27,59 @@ export type TerminalAction =
 	| 'jumpToPrevPrompt'
 	| 'jumpToNextPrompt';
 
-export interface TerminalKeybindings {
-	copy: string;
-	paste: string;
-	find: string;
-	clear: string;
-	selectAll: string;
-	jumpToPrevPrompt: string;
-	jumpToNextPrompt: string;
+/** Terminal action → its registry command (§10.2). */
+export const TERMINAL_COMMANDS: Readonly<Record<TerminalAction, string>> = {
+	copy: 'terminal.copy',
+	paste: 'terminal.paste',
+	find: 'terminal.find',
+	clear: 'terminal.clear',
+	selectAll: 'terminal.select-all',
+	jumpToPrevPrompt: 'terminal.prev-prompt',
+	jumpToNextPrompt: 'terminal.next-prompt',
+};
+
+const ACTION_BY_COMMAND: ReadonlyMap<string, TerminalAction> = new Map(
+	(Object.entries(TERMINAL_COMMANDS) as Array<[TerminalAction, string]>).map(([action, command]) => [command, action])
+);
+
+/** The terminal action a registry command names, or null. */
+export function terminalActionFor(command: string): TerminalAction | null {
+	return ACTION_BY_COMMAND.get(command) ?? null;
 }
 
-export const DEFAULT_MAC_KEYBINDINGS: TerminalKeybindings = {
-	copy: 'Cmd+C',
-	paste: 'Cmd+V',
-	find: 'Cmd+F',
-	clear: 'Cmd+K',
-	selectAll: 'Cmd+A',
-	jumpToPrevPrompt: 'Cmd+Up',
-	jumpToNextPrompt: 'Cmd+Down',
-};
-
-export const DEFAULT_LINUX_WIN_KEYBINDINGS: TerminalKeybindings = {
-	copy: 'Ctrl+Shift+C',
-	paste: 'Ctrl+Shift+V',
-	find: 'Ctrl+Shift+F',
-	clear: 'Ctrl+Shift+K',
-	selectAll: 'Ctrl+Shift+A',
-	jumpToPrevPrompt: 'Ctrl+Up',
-	jumpToNextPrompt: 'Ctrl+Down',
-};
-
-export function getDefaultKeybindings(isMac: boolean): TerminalKeybindings {
-	return isMac ? DEFAULT_MAC_KEYBINDINGS : DEFAULT_LINUX_WIN_KEYBINDINGS;
+export interface TerminalKeyOptions {
+	/** The effective keymap (default: `getKeymap()`). */
+	entries?: readonly KeymapEntry[];
+	/** Default: the live platform. */
+	mac?: boolean;
+	/** Context the `when`s evaluate against (default: the live context of the
+	 *  event's target — inside the xterm host, so `terminalFocus` holds). */
+	ctx?: ContextKeys | WhenContext;
 }
 
 /**
- * Checks if a native KeyboardEvent matches a string chord specification like
- * "Ctrl+Shift+C", "Cmd+V", "Ctrl+L", etc.
+ * The terminal action a keydown fires, or null: the §2.3 winner among the
+ * effective `terminal.*` rules whose key matches and whose `when` holds.
+ * IME composition and Dead keys never match (`strokesFromEvent`).
  */
-export function matchesChord(e: KeyboardEvent, chord: string, isMac: boolean): boolean {
-	const parts = chord.split('+').map((p) => p.trim().toLowerCase());
-	if (parts.length === 0) return false;
-
-	let targetKey = parts[parts.length - 1];
-	if (targetKey === 'arrowup') targetKey = 'up';
-	if (targetKey === 'arrowdown') targetKey = 'down';
-	if (targetKey === 'arrowleft') targetKey = 'left';
-	if (targetKey === 'arrowright') targetKey = 'right';
-
-	const modifiers = new Set(parts.slice(0, parts.length - 1));
-
-	let eventKey = e.key.toLowerCase();
-	if (eventKey === 'arrowup') eventKey = 'up';
-	if (eventKey === 'arrowdown') eventKey = 'down';
-	if (eventKey === 'arrowleft') eventKey = 'left';
-	if (eventKey === 'arrowright') eventKey = 'right';
-
-	if (eventKey !== targetKey) return false;
-
-	const requiresShift = modifiers.has('shift');
-	const requiresAlt = modifiers.has('alt') || modifiers.has('option');
-	const requiresCtrl = modifiers.has('ctrl') || modifiers.has('control');
-	const requiresMeta = modifiers.has('meta') || modifiers.has('super');
-	const requiresCmd = modifiers.has('cmd') || modifiers.has('command');
-
-	// Shift
-	if (e.shiftKey !== requiresShift) return false;
-
-	// Alt / Option
-	if (e.altKey !== requiresAlt) return false;
-
-	// Cmd modifier resolves to metaKey on macOS and ctrlKey on Windows/Linux
-	if (requiresCmd) {
-		if (isMac) {
-			if (!e.metaKey) return false;
-		} else {
-			if (!e.ctrlKey) return false;
-		}
-	} else {
-		if (requiresMeta && !e.metaKey) return false;
-		if (!requiresMeta && e.metaKey) return false;
-
-		if (requiresCtrl && !e.ctrlKey) return false;
-		if (!requiresCtrl && e.ctrlKey) return false;
-	}
-
-	return true;
-}
-
-/**
- * Evaluates a KeyboardEvent against configured keybindings and returns the
- * matching action if any.
- */
-export function evaluateTerminalKey(
-	e: KeyboardEvent,
-	isMac: boolean,
-	customConfig?: Partial<TerminalKeybindings>
-): TerminalAction | null {
+export function evaluateTerminalKey(e: KeyboardEvent, opts: TerminalKeyOptions = {}): TerminalAction | null {
 	if (e.type !== 'keydown') return null;
+	const mac = opts.mac ?? isMacPlatform();
+	const entries = opts.entries ?? getKeymap();
+	const ctx = opts.ctx ?? getContextKeys(e.target);
+	const evalOpts = getEvalOptions();
+	const hits = entriesForPlatform(entries, mac ? 'mac' : 'other').filter(
+		(entry) =>
+			(entry.scope ?? 'app') === 'app' &&
+			terminalActionFor(entry.command) !== null &&
+			eventMatchesCombo(e, entry.key, mac) &&
+			evaluateWhen(entry.when, ctx, evalOpts)
+	);
+	const winner = hits.length > 0 ? resolveKeypressWinner(hits, entries) : null;
+	return winner ? terminalActionFor(winner.command) : null;
+}
 
-	const effective = {
-		...getDefaultKeybindings(isMac),
-		...customConfig,
-	};
-
-	const actions: TerminalAction[] = [
-		'copy',
-		'paste',
-		'find',
-		'clear',
-		'selectAll',
-		'jumpToPrevPrompt',
-		'jumpToNextPrompt',
-	];
-	for (const action of actions) {
-		const chord = effective[action];
-		if (chord && matchesChord(e, chord, isMac)) {
-			return action;
-		}
-	}
-
-	return null;
+/** The key hint for a terminal action (context menu), from the registry. */
+export function terminalKeyLabel(action: TerminalAction, opts?: { mac?: boolean }): string {
+	return labelFor(TERMINAL_COMMANDS[action], opts);
 }

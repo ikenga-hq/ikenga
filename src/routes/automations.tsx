@@ -1,23 +1,25 @@
-// /automations — Schedules and agent runs (WP-10).
+// /automations — Native automations surface (WP-42, D-07 `schedules` state).
 //
-// Central surface for automations (schedules, cron jobs, background runs).
-// Absorbs legacy /cron and /agent-runs. Deep-links into com.ikenga.agent-ops
-// if installed, or renders native automations landing.
+// Replaces the pre-WP-42 landing (which only rendered "Nothing scheduled"
+// and auto-navigated away into com.ikenga.agent-ops's iframe on `?view=`).
+// The native view now lists schedules from all three sources
+// (`src/shell/automations/use-automations.ts`); the agent-ops deep-link is
+// preserved two ways: an explicit "Open in agent-ops" button when the pkg is
+// installed, and — for anything that already bookmarked `?view=schedule` /
+// `?view=runs` — the same auto-navigate-into-the-pkg behavior as before.
 
 import { createFileRoute } from '@tanstack/react-router';
-import { Clock, Plus } from 'lucide-react';
 import { useEffect } from 'react';
 import { z } from 'zod';
 
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgMenuStore } from '@/lib/pkg/pkg-menu-store';
 import { pkgKernelStatus } from '@/lib/tauri-cmd';
-import { Button } from '@/components/ui/button';
+import { AutomationsView } from '@/shell/automations/automations-view';
 
 const AGENT_OPS_PKG_ID = 'com.ikenga.agent-ops';
 const SCHEDULE_PATH = `/pkg/${AGENT_OPS_PKG_ID}/schedule`;
 const RUNS_PATH = `/pkg/${AGENT_OPS_PKG_ID}/runs`;
-const PKG_ROOT = `/pkg/${AGENT_OPS_PKG_ID}/`;
 
 const automationsSearchSchema = z.object({
 	view: z.enum(['schedule', 'runs']).optional(),
@@ -27,7 +29,11 @@ function AutomationsPage() {
 	const search = Route.useSearch();
 	const navigateFocused = usePaneStore((s) => s.navigateFocused);
 
+	// Bookmarked `?view=` deep links still jump straight into the agent-ops
+	// pkg iframe, same as the pre-WP-42 landing did. Fresh navigation to
+	// `/automations` (no `view`) renders the native list instead.
 	useEffect(() => {
+		if (!search.view) return;
 		let cancelled = false;
 		(async () => {
 			try {
@@ -37,18 +43,16 @@ function AutomationsPage() {
 				};
 				const entries = reg.entries ?? [];
 				const pkgRoutes = entries.filter((e) => e.pkg_id === AGENT_OPS_PKG_ID);
-				if (cancelled || pkgRoutes.length === 0) {
-					return;
-				}
+				if (cancelled || pkgRoutes.length === 0) return;
 				const targetSubPath = search.view === 'runs' ? '/runs' : '/schedule';
 				const hasTarget = pkgRoutes.some((e) => e.path === targetSubPath);
-				usePkgMenuStore.getState().setActiveFeature(
-					AGENT_OPS_PKG_ID,
-					search.view === 'runs' ? 'v:runs' : 'v:schedule'
-				);
-				navigateFocused(hasTarget ? (search.view === 'runs' ? RUNS_PATH : SCHEDULE_PATH) : PKG_ROOT);
+				if (!hasTarget) return;
+				usePkgMenuStore
+					.getState()
+					.setActiveFeature(AGENT_OPS_PKG_ID, search.view === 'runs' ? 'v:runs' : 'v:schedule');
+				navigateFocused(search.view === 'runs' ? RUNS_PATH : SCHEDULE_PATH);
 			} catch {
-				// pkg not installed or kernel unreachable — fallback to landing
+				// pkg not installed or kernel unreachable — fall through to the native view
 			}
 		})();
 		return () => {
@@ -56,36 +60,7 @@ function AutomationsPage() {
 		};
 	}, [navigateFocused, search.view]);
 
-	return (
-		<div className="flex h-full flex-col bg-background text-foreground">
-			<div className="border-b border-border px-6 py-4 flex items-center justify-between">
-				<div className="flex items-center gap-2.5">
-					<Clock className="h-5 w-5 text-primary" />
-					<h1 className="text-lg font-semibold">Automations</h1>
-				</div>
-			</div>
-
-			<div className="flex-1 overflow-y-auto p-6">
-				<div className="mx-auto max-w-2xl text-center py-16">
-					<Clock className="mx-auto h-12 w-12 text-muted-foreground/40 mb-4" />
-					<h2 className="text-lg font-medium text-foreground mb-2">Nothing scheduled</h2>
-					<p className="text-sm text-muted-foreground mb-6 max-w-md mx-auto">
-						A schedule runs a skill, a workflow or a command on a clock, whether or not you are watching.
-					</p>
-					<Button
-						type="button"
-						size="sm"
-						onClick={() => {
-							// Open command palette or trigger new automation schedule
-						}}
-					>
-						<Plus className="mr-1.5 h-4 w-4" />
-						New schedule
-					</Button>
-				</div>
-			</div>
-		</div>
-	);
+	return <AutomationsView />;
 }
 
 export const Route = createFileRoute('/automations')({

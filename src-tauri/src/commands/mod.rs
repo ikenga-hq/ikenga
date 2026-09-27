@@ -3,6 +3,8 @@
 //! in `src/lib/tauri-cmd.ts` mirror this, so later phases just fill in the
 //! Rust side.
 
+pub mod action_exec;
+pub mod actions;
 pub mod activity_bar;
 pub mod agent_ops;
 pub mod backup;
@@ -23,6 +25,7 @@ pub mod fs_roots;
 pub mod identity;
 pub mod iyke;
 pub mod ngwa;
+pub mod notifications;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -51,6 +54,11 @@ pub mod trust;
 pub mod viewer;
 pub mod window;
 
+pub use action_exec::{action_exec, action_git_branch};
+pub use actions::{
+    actions_open_file, actions_read_files, actions_trust_grant, actions_trust_revoke,
+    actions_trust_status, actions_write, keybindings_write,
+};
 pub use activity_bar::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
     activity_pins_resolve_artifact, activity_pins_touch_open, activity_sections_create,
@@ -104,6 +112,11 @@ pub use iyke::{
     iyke_terminal_spawn_done, iyke_wait_done, IykeRuntimeState,
 };
 pub use ngwa::ngwa_snapshot;
+pub use notifications::{
+    notifications_list, notifications_mark_all_read, notifications_mark_read,
+    notifications_mute_kind, notifications_mute_state, notifications_record_update,
+    notifications_unmute_kind, notifications_unread_count,
+};
 pub use pa_actions::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update,
@@ -130,10 +143,12 @@ pub use pkg_sidecar_stream::{
     StreamingSidecarManagerState,
 };
 pub use pkg_studio::pkg_studio_request_project_access;
-pub use pkg_trust::{pkg_trust_approve, pkg_trust_list_pending, pkg_trust_reject};
+pub use pkg_trust::{
+    pkg_trust_approve, pkg_trust_list_pending, pkg_trust_preview_incoming, pkg_trust_reject,
+};
 pub use pkg_webview::{
-    pkg_webview_clear_session, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate,
-    pkg_webview_set_rect, WebviewPanesState,
+    pkg_webview_allow_origin, pkg_webview_clear_session, pkg_webview_create, pkg_webview_destroy,
+    pkg_webview_navigate, pkg_webview_set_rect, WebviewPanesState,
 };
 pub use projects::{
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory,
@@ -152,8 +167,9 @@ pub use screenshot::{
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, ScreenshotResult,
 };
 pub use secrets::{
-    secrets_delete, secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_set, secrets_set_scoped, secrets_vault_status, SecretsLock,
+    secrets_delete, secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_index_names,
+    secrets_list_keys, secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
+    secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status, SecretsLock,
 };
 pub use settings_kv::{
     settings_clear_all, settings_get, settings_get_all, settings_open_file, settings_read_file,

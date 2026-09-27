@@ -17,6 +17,10 @@ use tauri::AppHandle;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 
+use super::actions_routes::{
+    get_actions_list, get_keys_resolve, get_menu, post_actions_import, post_actions_set,
+    post_keys_set,
+};
 use super::auth::{require_token, AuthState};
 use super::browser_handlers::{
     get_browser_list, get_browser_profiles, get_browser_targets, post_browser_back,
@@ -58,6 +62,7 @@ use super::memory::{
     post_timer_cancel, post_timer_schedule, post_todo_complete, post_todo_create, post_todo_update,
     TimerScheduler,
 };
+use super::notifications::get_notifications;
 use super::pa_actions::post_pa_actions_pause;
 use super::permissions_audit::get_violations_list;
 use super::pkg_dispatch::pkg_dispatch;
@@ -65,7 +70,9 @@ use super::projects::{
     get_project_active, get_project_list, post_project_archive, post_project_create,
     post_project_set_active, post_project_update,
 };
-use super::secrets::{get_secret, get_secret_list, post_secret_delete, post_secret_set};
+use super::secrets::{
+    get_secret, get_secret_list, get_secret_lock_state, post_secret_delete, post_secret_set,
+};
 use super::state::IykeState;
 use super::statusline::{get_statusline_snapshot, post_statusline_event};
 use super::tasks::{get_task_list, post_task_complete, post_task_create, post_task_update};
@@ -113,7 +120,21 @@ pub async fn serve(
     let authed = Router::new()
         .route("/iyke/state", get(get_state))
         // WP-21: keymap registry as last pushed by the FE (503 before push).
+        // WP-62 adds `?search=` (substring filter, `iyke keys list --search`).
         .route("/iyke/keys", get(get_keys))
+        // WP-62: the `iyke` surface for actions, menus and keys (D-06 footer
+        // lines). Reads mirror the FE's effective model (503 before the
+        // first push, same convention as `/iyke/keys`); writes round-trip
+        // into the FE so the CLI shares the UI's one WP-50 validator path.
+        .route("/iyke/actions", get(get_actions_list))
+        .route("/iyke/actions/set", post(post_actions_set))
+        .route("/iyke/actions/import", post(post_actions_import))
+        // `*menu_id` (not `:menu_id`): menu ids can contain `/`
+        // (`section/<id>`, `native/<top>` — G-ACTIONS §1.3), so this needs a
+        // tail wildcard, not a single path segment.
+        .route("/iyke/menus/*menu_id", get(get_menu))
+        .route("/iyke/keys/set", post(post_keys_set))
+        .route("/iyke/keys/resolve", get(get_keys_resolve))
         .route("/iyke/go", post(post_go))
         .route("/iyke/mode", post(post_mode))
         .route("/iyke/sidebar", post(post_sidebar))
@@ -258,12 +279,15 @@ pub async fn serve(
         // Runtime-ACL violations (2026-05-15). Read-only by design — clearing
         // is a human action via Settings → Pkgs only.
         .route("/iyke/violations/list", get(get_violations_list))
+        // WP-40: read-only notifications view (`iyke notifications list`).
+        .route("/iyke/notifications", get(get_notifications))
         .route("/iyke/layout/get", get(get_layout))
         .route("/iyke/layout/reset", post(post_layout_reset))
         .route("/iyke/secret/get", get(get_secret))
         .route("/iyke/secret/list", get(get_secret_list))
         .route("/iyke/secret/set", post(post_secret_set))
         .route("/iyke/secret/delete", post(post_secret_delete))
+        .route("/iyke/secrets/lock-state", get(get_secret_lock_state))
         // Memory primitives (Phase 1 — DESIGN.md §4-6).
         .route("/iyke/scratchpad/write", post(post_scratchpad_write))
         .route("/iyke/scratchpad/append", post(post_scratchpad_append))

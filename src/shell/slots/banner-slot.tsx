@@ -32,7 +32,10 @@ import { ConnectionBanner } from '@/shell/connection-banner';
 import { ConnectorBanner } from '@/shell/connector-banner';
 import { PkgAutoUpdater } from '@/shell/pkg-auto-updater';
 import { TrustReviewBanner } from '@/shell/trust-review-banner';
-import { UpdaterBanner } from '@/shell/updater-banner';
+// WP-41: moved into src/shell/updater/ (absorbed folder) — see that folder's
+// update-sheet.tsx / status-bar-slot.tsx / post-restart-toast.tsx for the
+// rest of the consolidated update-flow surface (mounted in workspace.tsx).
+import { UpdaterBanner } from '@/shell/updater/updater-banner';
 
 export type BannerTier = 'violation' | 'update' | 'info';
 

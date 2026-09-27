@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { type FocusEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { AlertCircle, Loader2, RefreshCw } from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { Markdown } from '@/components/markdown';
+import { focusMarkerProps } from '@/lib/keymap/context-keys';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { fsListenWatch, fsRead, fsUnwatch, fsWatch, fsWriteText } from '@/lib/tauri-cmd';
 import type { UnlistenFn } from '@/lib/transport';
 import { MarkdownToolbar, type SaveState } from './markdown-toolbar';
@@ -135,28 +137,39 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 		}
 	}, [draft]);
 
-	// ── Keyboard: ⌘/Ctrl + S / B / I while editing ───────────────────────────
-	const saveRef = useRef(save);
-	saveRef.current = save;
-	useEffect(() => {
-		if (mode !== 'edit') return;
-		const onKeyDown = (e: KeyboardEvent) => {
-			if (!(e.metaKey || e.ctrlKey)) return;
-			const k = e.key.toLowerCase();
-			if (k === 's') {
-				e.preventDefault();
-				void saveRef.current();
-			} else if (k === 'b' && editorRef.current?.view()?.hasFocus) {
-				e.preventDefault();
-				onWrap('**');
-			} else if (k === 'i' && editorRef.current?.view()?.hasFocus) {
-				e.preventDefault();
-				onWrap('_');
-			}
-		};
-		window.addEventListener('keydown', onKeyDown);
-		return () => window.removeEventListener('keydown', onKeyDown);
-	}, [mode, onWrap]);
+	// ── Keyboard: ⌘S save · ⌘B/⌘I bold/italic while editing ──────────────────
+	// WP-56 (G-ACTIONS §10.2/§10.6): migrated from a window-level `keydown`
+	// listener to registry commands (`markdown.save/bold/italic`), scoped by
+	// the new `markdownEditorFocus` key (B-21, marked on the edit container
+	// below) instead of the `mode === 'edit'` closure guard. Bold/italic keep
+	// their extra CodeMirror-focus check — the marker only says the editor
+	// pane has DOM focus, not that the CodeMirror view specifically does.
+	// `markdown.bold` shares `mod+b` with `explorer.toggle` (`always`) by
+	// precedence, not a clash (DEC-59, §2.3): `markdownEditorFocus` is more
+	// specific and wins while it holds.
+	//
+	// Fix round 1: `commands.ts` keys a handler stack by command id only —
+	// with two markdown editors open in a split, the last-mounted one always
+	// wins ⌘S/⌘B/⌘I regardless of which pane the user is actually in. Track
+	// focus-within on this root and register only while it holds (and only
+	// in edit mode, as before).
+	const [focusWithin, setFocusWithin] = useState(false);
+	const handleFocusWithinCapture = useCallback(() => setFocusWithin(true), []);
+	const handleBlurWithinCapture = useCallback((e: FocusEvent<HTMLDivElement>) => {
+		if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusWithin(false);
+	}, []);
+	useCommands(
+		{
+			'markdown.save': () => void save(),
+			'markdown.bold': () => {
+				if (editorRef.current?.view()?.hasFocus) onWrap('**');
+			},
+			'markdown.italic': () => {
+				if (editorRef.current?.view()?.hasFocus) onWrap('_');
+			},
+		},
+		{ enabled: mode === 'edit' && focusWithin }
+	);
 
 	// ── Warn before losing unsaved edits on app close / reload ───────────────
 	useEffect(() => {
@@ -253,7 +266,17 @@ export function MarkdownView({ path, editable = false, line, col }: MarkdownView
 	}
 
 	return (
-		<div className="flex h-full w-full flex-col">
+		<div
+			className="flex h-full w-full flex-col"
+			// Fix round 1: only in edit mode — this wrapper renders in preview
+			// mode too, and `markdown.bold`'s `when: markdownEditorFocus`
+			// outranking `explorer.toggle` on `mod+b` there (DEC-59 specificity)
+			// but the handler being `enabled: mode === 'edit'`-gated meant ⌘B did
+			// nothing at all in preview instead of falling through to Explorer.
+			{...(mode === 'edit' ? focusMarkerProps('markdown-editor') : {})}
+			onFocusCapture={handleFocusWithinCapture}
+			onBlurCapture={handleBlurWithinCapture}
+		>
 			<MarkdownToolbar
 				mode={mode}
 				dirty={dirty}

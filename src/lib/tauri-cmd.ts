@@ -480,6 +480,211 @@ export async function settingsOpenFile(
 	});
 }
 
+// ─── Notifications (WP-40) ────────────────────────────────────────────────────
+// Mirrors `src-tauri/src/commands/notifications.rs`. The table is written by
+// Rust-side producers (permission / run / violation) plus
+// `notificationsRecordUpdate` for the two webview-side update checks. Live
+// changes arrive on the `notifications://changed` event
+// (`NOTIFICATIONS_CHANGED_EVENT`).
+
+/** Wire names of `notifications::NotificationKind`. */
+export type NotificationKind =
+	| 'permission'
+	| 'run_finished'
+	| 'run_failed'
+	| 'update'
+	| 'violation'
+	| 'invite';
+
+/**
+ * `{ kind, ...params }` for the action kinds producers emit; the centre
+ * (WP-40b) maps each to its buttons. Unlike {@link NotificationAction} this
+ * union has no catch-all, so `switch (a.kind)` narrows the params. Get one
+ * from a row with {@link asKnownNotificationAction}.
+ *
+ * `permission.decide` carries Allow / Deny inline and is only emitted for
+ * the hooks gate (`via: 'hooks'` → `POST /iyke/hooks/decision { requestId,
+ * decision }`). Hide the buttons once the row has `resolvedAt`.
+ * `open.thread` (chat-engine / ACP asks) and `open.terminal` (Claude Code's
+ * own terminal prompt) are open-only: the thread's dialog or the terminal
+ * answers them. Inline Allow / Deny for ACP asks is a follow-up that needs a
+ * real engine resolve path first.
+ */
+export type KnownNotificationAction =
+	| {
+			kind: 'permission.decide';
+			via: 'hooks';
+			requestId: string;
+			terminalId: string | null;
+	  }
+	| { kind: 'open.thread'; threadId: string; requestId: string }
+	| { kind: 'open.terminal'; terminalId: string | null; sessionId: string | null }
+	| {
+			kind: 'open.chi_run';
+			runId: string;
+			status: 'done' | 'failed';
+			/** Artifacts the run produced (absent on rows written before it was recorded). */
+			artifactCount?: number;
+			/** Path of the first artifact, for "Open artifact". */
+			firstArtifactPath?: string | null;
+	  }
+	| { kind: 'open.release_notes'; source: 'shell'; version: string }
+	| { kind: 'open.pkg_updates'; pkgId: string; version: string }
+	| { kind: 'open.violations'; pkgId: string };
+
+export type KnownNotificationActionKind = KnownNotificationAction['kind'];
+
+/** An action kind this build does not know (a newer producer). */
+export interface UnknownNotificationAction {
+	kind: string;
+	[param: string]: unknown;
+}
+
+/**
+ * What a row's `action` may hold: a known action or an unknown one. Checking
+ * `kind` on this type does NOT narrow the params (the unknown member matches
+ * every kind) — narrow with {@link asKnownNotificationAction} first.
+ */
+export type NotificationAction = KnownNotificationAction | UnknownNotificationAction;
+
+// Runtime narrowing lives in a dependency-free module so it can be unit-tested
+// (and used by modules whose tests mock this file) without the Tauri runtime.
+export {
+	asKnownNotificationAction,
+	KNOWN_NOTIFICATION_ACTION_KINDS,
+} from '@/lib/notifications/action-kind';
+
+export interface NotificationRow {
+	id: number;
+	kind: NotificationKind;
+	title: string;
+	body: string | null;
+	action: NotificationAction | null;
+	/** Producer id (`iyke.hooks`, `engine.claude-code`, `chi`, `updater`, `pkg.permissions_check`). */
+	source: string;
+	dedupeKey: string | null;
+	/** Occurrences folded into this row (e.g. violation denials). */
+	count: number;
+	/** First occurrence, unix ms. */
+	createdAt: number;
+	/** Latest occurrence, unix ms — lists sort on this. */
+	updatedAt: number;
+	readAt: number | null;
+	/**
+	 * Unix ms the thing this row asks about was over — a permission decided,
+	 * timed out or answered in its terminal; an update installed. `null` =
+	 * still open. Independent of `readAt` (a row can be read but pending).
+	 * Never offer Allow / Deny on a resolved row. Always sent by Rust;
+	 * optional only so older fixtures still type-check.
+	 */
+	resolvedAt?: number | null;
+}
+
+export interface NotificationsUnreadCount {
+	total: number;
+	/** Muted kinds are absent. Resolved rows never count. */
+	byKind: Partial<Record<NotificationKind, number>>;
+	/**
+	 * `permission` rows still awaiting an answer (unresolved), read or not —
+	 * the daily address's "pending permissions". Always sent by Rust.
+	 */
+	pendingPermissions?: number;
+}
+
+export interface NotificationsMuteState {
+	muted: NotificationKind[];
+	/** Everything but `permission` and `violation`. */
+	mutable: NotificationKind[];
+}
+
+export interface NotificationsListOptions {
+	unreadOnly?: boolean;
+	kinds?: NotificationKind[];
+	limit?: number;
+	/** Cursor: rows with `updatedAt` strictly below this. */
+	before?: number;
+	includeMuted?: boolean;
+}
+
+export type NotificationsChangeReason =
+	| 'created'
+	| 'coalesced'
+	| 'read'
+	| 'read_all'
+	| 'mute_changed';
+
+/** Payload of `notifications://changed`. */
+export interface NotificationsChangedEvent {
+	reason: NotificationsChangeReason;
+	/** Present for `created` / `coalesced`. */
+	notification: NotificationRow | null;
+	/** True when the row's kind is muted — the toast bridge stays quiet. */
+	muted: boolean;
+}
+
+export const NOTIFICATIONS_CHANGED_EVENT = 'notifications://changed';
+
+export async function notificationsList(
+	options: NotificationsListOptions = {},
+): Promise<NotificationRow[]> {
+	return invoke<NotificationRow[]>('notifications_list', {
+		unreadOnly: options.unreadOnly ?? null,
+		kinds: options.kinds ?? null,
+		limit: options.limit ?? null,
+		before: options.before ?? null,
+		includeMuted: options.includeMuted ?? null,
+	});
+}
+
+export async function notificationsUnreadCount(): Promise<NotificationsUnreadCount> {
+	return invoke<NotificationsUnreadCount>('notifications_unread_count');
+}
+
+export async function notificationsMarkRead(ids: number[]): Promise<number> {
+	return invoke<number>('notifications_mark_read', { ids });
+}
+
+export async function notificationsMarkAllRead(kind?: NotificationKind | null): Promise<number> {
+	return invoke<number>('notifications_mark_all_read', { kind: kind ?? null });
+}
+
+export async function notificationsMuteState(): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_state');
+}
+
+export async function notificationsMuteKind(kind: NotificationKind): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_mute_kind', { kind });
+}
+
+export async function notificationsUnmuteKind(
+	kind: NotificationKind,
+): Promise<NotificationsMuteState> {
+	return invoke<NotificationsMuteState>('notifications_unmute_kind', { kind });
+}
+
+export interface NotificationsRecordUpdateArgs {
+	source: 'shell' | 'pkg';
+	version: string;
+	/** Required when `source === 'pkg'`. */
+	pkgId?: string | null;
+	pkgName?: string | null;
+}
+
+/**
+ * `update` producer entry point for the webview-side update checks. Returns
+ * the created row, or `null` when that version was already announced.
+ */
+export async function notificationsRecordUpdate(
+	args: NotificationsRecordUpdateArgs,
+): Promise<NotificationRow | null> {
+	return invoke<NotificationRow | null>('notifications_record_update', {
+		source: args.source,
+		version: args.version,
+		pkgId: args.pkgId ?? null,
+		pkgName: args.pkgName ?? null,
+	});
+}
+
 // ─── Secrets (Stronghold) ─────────────────────────────────────────────────────
 
 export async function secretsGet(key: string): Promise<string | null> {
@@ -496,6 +701,14 @@ export async function secretsDelete(key: string): Promise<void> {
 
 export async function secretsListKeys(): Promise<string[]> {
 	return invoke('secrets_list_keys');
+}
+
+/** Names only, straight from `secrets-index.json` — never the live Stronghold
+ *  store, so it works whether or not the vault is unlocked and never returns
+ *  a value. Used by the restore wizard to say which current keys a vault
+ *  merge would touch without asking the user to unlock the vault first. */
+export async function secretsIndexNames(): Promise<string[]> {
+	return invoke('secrets_index_names');
 }
 
 // ─── Phase 7 — scoped secrets ─────────────────────────────────────────────
@@ -532,35 +745,66 @@ export type VaultStatus = {
 	available: boolean;
 	keychainBackend: string;
 	error: string | null;
-	/** Which store answered: Stronghold (desktop) or `IKENGA_SECRET_*` env
-	 *  vars (headless daemon). See `src-tauri/src/secrets_env.rs`. */
-	mode: 'stronghold' | 'env' | string;
-	/** False when the backing store is read-only — the daemon has no vault by
-	 *  design, so set/delete are refused. Callers MUST gate write affordances
-	 *  on this rather than offering buttons that cannot work. */
+	mode: 'stronghold' | 'keychain' | 'env' | 'unknown' | string;
 	writable: boolean;
+	locked: boolean;
+	configured: boolean;
+	idleTimeoutSecs: number;
+	lastActivityUnixMs: number | null;
 };
 
+export type SecretsLockState = {
+	configured: boolean;
+	locked: boolean;
+	idle_timeout_secs: number;
+	last_activity_unix_ms: number | null;
+};
+
+export async function secretsSetPassphrase(
+	passphrase: string,
+	currentPassphrase?: string | null
+): Promise<SecretsLockState> {
+	return invoke('secrets_set_passphrase', {
+		passphrase,
+		currentPassphrase: currentPassphrase ?? null,
+		oldPassphrase: null,
+	});
+}
+
+export async function secretsUnlock(passphrase: string): Promise<SecretsLockState> {
+	return invoke('secrets_unlock', { passphrase });
+}
+
+export async function secretsLock(): Promise<SecretsLockState> {
+	return invoke('secrets_lock');
+}
+
+export async function secretsLockState(): Promise<SecretsLockState> {
+	return invoke('secrets_lock_state');
+}
+
 export async function secretsVaultStatus(): Promise<VaultStatus> {
-	// Rust returns snake_case `keychain_backend`; normalize.
-	//
-	// `mode` / `writable` are additive (both builds send them today), but the
-	// defaults below are deliberately the desktop answer so an older backend
-	// that predates them degrades to "writable Stronghold" rather than
-	// silently disabling every write button.
 	const raw = await invoke<{
-		available: boolean;
-		keychain_backend: string;
-		error: string | null;
+		available?: boolean;
+		keychain_backend?: string;
+		error?: string | null;
 		mode?: string;
 		writable?: boolean;
+		locked?: boolean;
+		configured?: boolean;
+		idle_timeout_secs?: number;
+		last_activity_unix_ms?: number | null;
 	}>('secrets_vault_status');
 	return {
-		available: raw.available,
-		keychainBackend: raw.keychain_backend,
-		error: raw.error,
-		mode: raw.mode ?? 'stronghold',
-		writable: raw.writable ?? true,
+		available: raw.available === true,
+		keychainBackend: raw.keychain_backend ?? 'unavailable',
+		error: raw.error ?? null,
+		mode: raw.mode ?? 'unknown',
+		writable: raw.writable === true,
+		locked: raw.locked !== false,
+		configured: raw.configured === true,
+		idleTimeoutSecs: raw.idle_timeout_secs ?? 0,
+		lastActivityUnixMs: raw.last_activity_unix_ms ?? null,
 	};
 }
 
@@ -2328,6 +2572,14 @@ export interface IykeKeymapEntry {
 	/** Platform-resolved key hint (`⌘K` on macOS, `Ctrl+K` elsewhere). */
 	key_label: string;
 	platform_only?: 'mac' | 'other';
+	/** WP-62 review (S3, DEC-65): `held` for a project rule dropped from the
+	 *  effective keymap while its project's keybindings are untrusted — it
+	 *  fires nothing and holds no key (G-ACTIONS §2.2 step 0). Absent =
+	 *  `active`, the pre-existing rows every consumer already expects. */
+	status?: 'active' | 'held';
+	/** The trust state holding the rule (`untrusted`, `changed`, or
+	 *  `unknown`); present only when `status: "held"`. */
+	trust?: string;
 }
 
 /** WP-28: one `GET /iyke/explorer/sections` row — mirrors
@@ -2359,6 +2611,69 @@ export async function iykeSetFrame(args: {
 	});
 }
 
+/** WP-62: one mirrored effective action row served by `GET /iyke/actions` —
+ *  opaque to Rust (`src-tauri/src/iyke/actions_routes.rs` stores it as
+ *  `serde_json::Value`, same convention as `ShellSnapshot.panes`). This FE
+ *  interface is the schema. */
+export interface IykeActionMirror {
+	id: string;
+	name: string;
+	icon?: string;
+	description: string;
+	source: 'builtin' | 'package' | 'personal' | 'project';
+	run_kind: string;
+	placements: string[];
+	locked: boolean;
+	hosted: boolean;
+	danger: boolean;
+	pkg_id?: string;
+	/** WP-62 review (S3, DEC-55): a project action's trust state
+	 *  (`ActionTrust.state`), fail-closed to `untrusted` when the trust
+	 *  record has no entry for it yet. Absent for every other source. */
+	trust_state?: string;
+}
+
+export interface IykeMenuMirrorItem {
+	kind: 'action' | 'separator';
+	id?: string;
+	name?: string;
+	source?: string;
+	when?: string;
+}
+
+/** WP-62: one mirrored effective menu served by `GET /iyke/menus/:id`. */
+export interface IykeMenuMirror {
+	id: string;
+	items: IykeMenuMirrorItem[];
+	hidden: string[];
+}
+
+/**
+ * WP-62: push the effective actions/menus mirror `GET /iyke/actions` and
+ * `GET /iyke/menus/:id` read from. Same partial-update convention as
+ * `iykeSetFrame` — an omitted field leaves the stored value untouched.
+ */
+export async function iykeSetActionsFrame(args: {
+	actions?: IykeActionMirror[] | null;
+	menus?: Record<string, IykeMenuMirror> | null;
+}): Promise<void> {
+	return invoke('iyke_set_actions_frame', {
+		actions: args.actions ?? null,
+		menus: args.menus ?? null,
+	});
+}
+
+/**
+ * WP-62: FE → Rust callback resolving one of the `iyke://actions-set-request`
+ * / `iyke://actions-import-request` / `iyke://keys-set-request` /
+ * `iyke://keys-resolve-request` round trips (`rpc.rs`'s generic
+ * pending/oneshot pattern, `actions_routes.rs`). `result` is opaque JSON
+ * handed straight back as the HTTP response body.
+ */
+export async function iykeActionsRequestDone(requestId: string, result: unknown): Promise<void> {
+	return invoke('iyke_actions_request_done', { requestId, result });
+}
+
 // ─── Screenshots ──────────────────────────────────────────────────────────────
 
 export interface ScreenshotResult {
@@ -2370,6 +2685,30 @@ export interface ScreenshotResult {
 
 export async function screenshotWindow(outPath?: string): Promise<ScreenshotResult> {
 	return invoke('screenshot_window', { outPath: outPath ?? null });
+}
+
+// ─── OS-wide shortcuts (G-ACTIONS §6, DEC-60; WP-54) ─────────────────────────
+
+/** One effective OS rule: an action id and its key in the registry grammar
+ *  (`alt+space`, `ctrl+alt+shift+s`). */
+export interface OsShortcutRuleArg {
+	command: string;
+	key: string;
+}
+
+/** Per-rule registration result; `reason` is set when `registered` is false. */
+export interface OsShortcutStatusResult {
+	command: string;
+	key: string;
+	registered: boolean;
+	reason: string | null;
+}
+
+/** Replace the OS-wide shortcuts `lib.rs` registers with `rules` (the
+ *  effective default + personal `scope: "os"` rules). Tolerant per rule: one
+ *  failure is reported in its status and never blocks the others. */
+export async function osShortcutsApply(rules: OsShortcutRuleArg[]): Promise<OsShortcutStatusResult[]> {
+	return invoke<OsShortcutStatusResult[]>('os_shortcuts_apply', { rules });
 }
 
 export async function screenshotPane(paneId: string, outPath?: string): Promise<ScreenshotResult> {
@@ -2678,6 +3017,36 @@ export interface PkgTrustReview {
  */
 export async function pkgTrustListPending(): Promise<PkgTrustReview[]> {
 	return invoke<PkgTrustReview[]>('pkg_trust_list_pending');
+}
+
+export interface PkgTrustPreviewIncomingArgs {
+	pkgId: string;
+	/** The incoming (not-yet-installed) version, for display in the review row. */
+	manifestVersion: string;
+	/** JSON-stringified `capabilities` block from the incoming manifest, if any. */
+	capabilitiesJson?: string;
+	/** JSON-stringified `permissions` block from the incoming manifest, if any. */
+	permissionsJson?: string;
+}
+
+/**
+ * Diff an incoming, not-yet-installed version's `capabilities` +
+ * `permissions` against what's already approved for `pkgId`, without
+ * installing anything (WP-41-F1). `null` means nothing to flag: no
+ * capability/permission change, or the pkg has no prior snapshot to diff
+ * against yet. Powers the updater batch's pre-install park decision —
+ * `install_from_path` always records its own install as implicitly
+ * approved, so the diff has to run before that, not after.
+ */
+export async function pkgTrustPreviewIncoming(
+	args: PkgTrustPreviewIncomingArgs
+): Promise<PkgTrustReview | null> {
+	return invoke<PkgTrustReview | null>('pkg_trust_preview_incoming', {
+		pkgId: args.pkgId,
+		manifestVersion: args.manifestVersion,
+		capabilitiesJson: args.capabilitiesJson ?? null,
+		permissionsJson: args.permissionsJson ?? null,
+	});
 }
 
 /**
@@ -3137,6 +3506,13 @@ export async function pkgWebviewNavigate(
 	url: string
 ): Promise<void> {
 	return invoke('pkg_webview_navigate', { pkgId, paneId, url });
+}
+
+/** WP-45 "Allow host…": grant this pkg's child webviews one extra origin
+ *  beyond its declared `capabilities.webview.allowed_origins` (additive,
+ *  persisted). Accepts a full URL; resolves to the normalized origin. */
+export async function pkgWebviewAllowOrigin(pkgId: string, origin: string): Promise<string> {
+	return invoke('pkg_webview_allow_origin', { pkgId, origin });
 }
 
 export async function pkgWebviewClearSession(pkgId: string, paneId: string): Promise<void> {

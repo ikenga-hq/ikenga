@@ -17,7 +17,19 @@ import {
 	ONBOARDING_STATE_VERSION,
 	ONBOARDING_STEPS,
 	type OnboardingState,
+	type OnboardingStepRecord,
 } from './shell-store';
+
+// WP-38 renamed `OnboardingStepId` (agent/roots/packages/connectors/
+// scaffolding/appearance/summary → engine/project/equipment/look/.../done).
+// WP-47 moved `migrateShellStore`'s legacy v8 arm from the orphaned
+// `steps.agent` key to `steps.engine` (agent → engine is WP-38's own rename
+// map), so a pre-WP-38 onboarded user's engine step reads as completed.
+// Reads stay widened to `Record<string, OnboardingStepRecord>` so the
+// assertions can also prove no stray `.agent` key is written.
+function legacySteps(state: OnboardingState): Record<string, OnboardingStepRecord> {
+	return state.steps as unknown as Record<string, OnboardingStepRecord>;
+}
 
 describe('shell-store onboarding migration', () => {
 	it('seeds a fresh OnboardingState when missing from persisted blob', () => {
@@ -40,7 +52,7 @@ describe('shell-store onboarding migration', () => {
 		}
 	});
 
-	it('migrates legacy `agent_onboarded` + `selected_agent_id` into the agent step', () => {
+	it('migrates legacy `agent_onboarded` + `selected_agent_id` into the engine step', () => {
 		const migrated = migrateShellStore(
 			{
 				activeMode: 'app',
@@ -55,9 +67,10 @@ describe('shell-store onboarding migration', () => {
 		};
 
 		expect(migrated.onboarding.selectedAgentId).toBe('claude-code');
-		expect(migrated.onboarding.steps.agent.status).toBe('completed');
-		expect(typeof migrated.onboarding.steps.agent.completedAt).toBe('number');
-		expect(migrated.onboarding.steps.agent.payload).toEqual({ agentId: 'claude-code' });
+		expect(legacySteps(migrated.onboarding).engine?.status).toBe('completed');
+		expect(typeof legacySteps(migrated.onboarding).engine?.completedAt).toBe('number');
+		expect(legacySteps(migrated.onboarding).engine?.payload).toEqual({ agentId: 'claude-code' });
+		expect(legacySteps(migrated.onboarding).agent).toBeUndefined();
 
 		// Legacy keys are scrubbed so they don't get reused.
 		expect(migrated.agent_onboarded).toBeUndefined();
@@ -66,7 +79,7 @@ describe('shell-store onboarding migration', () => {
 		// Other steps stay pending — the legacy flag wasn't a full-wizard
 		// completion signal.
 		expect(migrated.onboarding.steps.welcome.status).toBe('pending');
-		expect(migrated.onboarding.steps.summary.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).done?.status).toBe('pending');
 		expect(migrated.onboarding.completedAt).toBeNull();
 	});
 
@@ -81,16 +94,17 @@ describe('shell-store onboarding migration', () => {
 
 		expect(migrated.onboarding.selectedAgentId).toBe('codex');
 		// Without the agent_onboarded flag, the step itself isn't marked done.
-		expect(migrated.onboarding.steps.agent.status).toBe('pending');
+		expect(legacySteps(migrated.onboarding).engine?.status).toBe('pending');
 	});
 
 	it('merges over defaults when persisted blob already has a partial onboarding slice', () => {
 		const partial = createDefaultOnboardingState();
 		partial.steps.welcome = { status: 'completed', completedAt: 123 };
 		// Intentionally omit a step from the persisted record to simulate a
-		// future shape that adds a new step the user hasn't seen yet.
+		// future shape that adds a new step the user hasn't seen yet. `shortcuts`
+		// is WP-38's own real example of exactly that (no shipped equivalent).
 		const stepsMinusOne = { ...partial.steps };
-		delete (stepsMinusOne as Record<string, unknown>).scaffolding;
+		delete (stepsMinusOne as Record<string, unknown>).shortcuts;
 		const blob = {
 			activeMode: 'app',
 			onboarding: { ...partial, steps: stepsMinusOne },
@@ -99,7 +113,7 @@ describe('shell-store onboarding migration', () => {
 		const migrated = migrateShellStore(blob, 7) as { onboarding: OnboardingState };
 		expect(migrated.onboarding.steps.welcome.status).toBe('completed');
 		// Missing step got filled in from defaults.
-		expect(migrated.onboarding.steps.scaffolding.status).toBe('pending');
+		expect(migrated.onboarding.steps.shortcuts.status).toBe('pending');
 	});
 
 	it('drops removed telemetry state during v15 migration', () => {

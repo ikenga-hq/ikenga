@@ -32,7 +32,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::pkg::webview::{PaneRect, WebviewPanesRegistry};
+use crate::pkg::webview::{emit_if_origin_blocked, PaneRect, WebviewPanesRegistry};
 
 use super::browser_rpc::{BrowserRpc, ReplyAck, ReplyEnvelope};
 use super::playwright_proxy::PlaywrightProxy;
@@ -367,11 +367,17 @@ pub async fn post_browser_goto(
         return Ok(ok());
     }
     let panes_for_main = panes.clone();
+    let (pkg_id_evt, pane_id_evt) = (body.pkg_id.clone(), body.pane_id.clone());
     on_main(&app, move || {
         panes_for_main.navigate(&body.pkg_id, &body.pane_id, &body.url)
     })
     .await?
-    .map_err(err500)?;
+    .map_err(|e| {
+        // WP-45: an agent-driven navigation the origin boundary rejected is
+        // broadcast to the pane host too, so the pane can show `pkg-blocked`.
+        emit_if_origin_blocked(&app, &pkg_id_evt, &pane_id_evt, &e);
+        err500(e)
+    })?;
     Ok(ok())
 }
 

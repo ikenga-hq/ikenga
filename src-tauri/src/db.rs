@@ -576,6 +576,15 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0065_ngwa_usage_ownership",
         include_str!("../migrations/0065_ngwa_usage_ownership.sql"),
     ),
+    // WP-40 (Phase 5b, D-07): the `notifications` aggregation table behind
+    // the notification centre, daily address and toast bridge. Written by
+    // `crate::notifications::record` from the permission / run / update /
+    // violation emit sites. Per-kind mute lives in settings.json, not here.
+    (
+        66,
+        "0066_notifications",
+        include_str!("../migrations/0066_notifications.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked

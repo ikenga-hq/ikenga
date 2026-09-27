@@ -1,0 +1,692 @@
+/* WP-58 — D-06 Editor tab (`designs/actions.html` `.edwrap`/`.edform`/`.edside`,
+   lines ~1834-1934). Lives in this WP's own folder (not `actions.css`, which
+   the wave 12e ownership note reserves as reuse-only shared ground across
+   WP-58/59/60/61's parallel PRs) and is imported only by `editor/index.tsx`.
+   Every rule is scoped under `.view-acts` per the convention `actions.css`
+   itself sets out, so nothing here leaks into Ngwa or another tab. */
+
+/* `action-detail.tsx` already writes bare `className="mono"` with no rule
+   backing it anywhere in `actions.css` / `ngwa.css` (an existing gap, not
+   this WP's to fix tab-wide) — scoped here so at least this surface's own
+   `.mono` spans (the id caption, the "It writes" file paths) render as
+   monospace rather than silently falling back to body text. */
+.view-acts .edroot .mono {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+/* `.edroot` is this surface's own root (`data-state="editor"`) — a column
+   stack of the row-flex `.edwrap` (form + preview) over the test-run /
+   save-error lines and `.formfoot`, matching D-06's
+   `.surface[data-surface="editor"] > .edwrap, .formfoot` (`actions.html:2202-2212`). */
+.view-acts .edroot {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	position: relative;
+}
+
+/* The Test run output drawer (D-06 `.drawer`, `actions.html:1270-1290`) —
+   conformance item 6: Test run's outcome is a drawer over the pane, never
+   the inline `.testresult` line the pre-review build showed. Absolutely
+   positioned against `.edroot` (`position: relative` above), same as D-06's
+   own `.drawer` against `.win`. */
+.view-acts .eddrawer {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	z-index: 8;
+	max-height: 45%;
+	background: var(--bg-sunken);
+	border-top: 1px solid var(--border-strong);
+	box-shadow: var(--shadow-3);
+	display: flex;
+	flex-direction: column;
+	animation: eddrawerin var(--motion-base) var(--ease-calm);
+}
+
+@keyframes eddrawerin {
+	from {
+		transform: translateY(12px);
+		opacity: 0;
+	}
+	to {
+		transform: none;
+		opacity: 1;
+	}
+}
+
+.view-acts .eddrawer header {
+	height: 26px;
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-micro);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .eddrawer header .nm2 {
+	font-family: var(--font-mono);
+	letter-spacing: 0;
+	text-transform: none;
+	color: var(--fg-muted);
+}
+
+.view-acts .eddrawer header button {
+	margin-left: auto;
+	width: 20px;
+	height: 20px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border: none;
+	background: transparent;
+	color: var(--fg-muted);
+	cursor: pointer;
+	border-radius: var(--radius-sm);
+}
+
+.view-acts .eddrawer header button:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .eddrawer pre {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	margin: 0;
+	padding: var(--space-2) var(--space-3);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	line-height: 1.7;
+	color: var(--fg-muted);
+	white-space: pre-wrap;
+}
+
+.view-acts .eddrawer pre b {
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.view-acts .eddrawer pre .e {
+	color: var(--danger);
+	font-weight: 500;
+}
+
+/* D-06 does not special-case a narrow pane for the editor split (its own
+   narrow-pane block, `actions.html:1681-1719`, covers the Actions tab's
+   `.detailcol`/`.storesheet`/`.sidenote` and the Import/Menus/Keys layouts,
+   not `.edwrap`/`.edcols`) — this stays row-flex unconditionally, same as
+   the design. */
+.view-acts .edwrap {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	overflow: hidden;
+}
+
+.view-acts .edrefuse {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+}
+
+.view-acts .edform {
+	flex: 1 1 0;
+	min-width: 0;
+	min-height: 0;
+	overflow-y: auto;
+	padding: var(--space-4);
+}
+
+.view-acts .edside {
+	width: 41%;
+	min-width: 320px;
+	flex: none;
+	min-height: 0;
+	overflow-y: auto;
+	border-left: 1px solid var(--border);
+	background: var(--bg-surface);
+	padding: var(--space-3);
+}
+
+.view-acts .edcols {
+	display: flex;
+	gap: var(--space-6);
+	align-items: flex-start;
+	flex-wrap: wrap;
+}
+
+.view-acts .edcolA {
+	flex: 1 1 320px;
+	min-width: 0;
+}
+
+.view-acts .edcolB {
+	flex: 1 1 280px;
+	min-width: 0;
+}
+
+.view-acts .edform .subhead {
+	margin: var(--space-4) 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .edform .subhead.first {
+	margin-top: 0;
+}
+
+.view-acts .edside .subhead {
+	margin: var(--space-3) 0 var(--space-2);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+
+.view-acts .edside .subhead.first {
+	margin-top: 0;
+}
+
+.view-acts .edform .q {
+	margin-bottom: var(--space-4);
+}
+
+.view-acts .edform .lab {
+	display: block;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-weight: 500;
+	margin-bottom: 0;
+}
+
+.view-acts .edform .hint {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 2px;
+	line-height: 1.45;
+}
+
+.view-acts .edform .err {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--danger);
+	margin-top: var(--space-1);
+}
+
+.view-acts .edform .field {
+	margin-top: var(--space-2);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 0 var(--space-2);
+	height: var(--input-h);
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+.view-acts .edform .field:focus-within {
+	border-color: var(--primary);
+	box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.view-acts .edform .field.invalid {
+	border-color: var(--danger);
+}
+
+.view-acts .edform .field input,
+.view-acts .edform .field select {
+	flex: 1;
+	min-width: 0;
+	width: 100%;
+	font-size: var(--text-body);
+	color: var(--fg);
+	font-family: var(--font-mono);
+	background: none;
+	border: 0;
+}
+
+.view-acts .edform .field.area {
+	height: auto;
+	padding: var(--space-2);
+	align-items: flex-start;
+}
+
+.view-acts .edform .field.area textarea {
+	flex: 1;
+	min-height: 56px;
+	resize: none;
+	font-size: var(--text-body);
+	color: var(--fg);
+	line-height: var(--lead-body-sm, 1.5);
+	font-family: var(--font-body);
+	background: none;
+	border: 0;
+	width: 100%;
+}
+
+.view-acts .edform .seg {
+	display: inline-flex;
+	margin-top: var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	overflow: hidden;
+}
+
+.view-acts .edform .seg button {
+	height: 26px;
+	padding: 0 var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	border-right: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+
+.view-acts .edform .seg button:last-child {
+	border-right: 0;
+}
+
+.view-acts .edform .seg button:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .edform .seg button.on {
+	background: var(--primary-soft);
+	color: var(--fg);
+}
+
+.view-acts .checks {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	margin-top: var(--space-2);
+}
+
+.view-acts .ck {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+	padding: 3px var(--space-1);
+	border-radius: var(--radius-xs);
+	font-size: var(--text-caption);
+	cursor: pointer;
+}
+
+.view-acts .ck:hover {
+	background: var(--bg-raised);
+}
+
+.view-acts .ck input[type='checkbox'] {
+	appearance: none;
+	width: 14px;
+	height: 14px;
+	flex: none;
+	margin-top: 2px;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-xs);
+	background: var(--bg-sunken);
+	display: grid;
+	place-items: center;
+	cursor: pointer;
+}
+
+.view-acts .ck input[type='checkbox']:checked {
+	background: var(--primary);
+	border-color: var(--primary);
+}
+
+.view-acts .ck input[type='checkbox']:checked::after {
+	content: '';
+	width: 8px;
+	height: 5px;
+	border-left: 2px solid var(--primary-fg);
+	border-bottom: 2px solid var(--primary-fg);
+	transform: rotate(-45deg) translate(1px, -1px);
+}
+
+.view-acts .ck .t1 {
+	color: var(--fg);
+}
+
+.view-acts .ck .t2 {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 1px;
+}
+
+.view-acts .ck .whenfield {
+	margin-left: auto;
+	flex: none;
+}
+
+.view-acts .ck .whenfield input,
+.view-acts .ck .whenfield select {
+	width: 128px;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-xs);
+	height: 20px;
+	padding: 0 5px;
+	color: var(--fg);
+}
+
+.view-acts .varchips {
+	display: flex;
+	gap: var(--space-1);
+	flex-wrap: wrap;
+	margin-top: var(--space-2);
+}
+
+.view-acts .varchip {
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--agent);
+	background: var(--agent-soft);
+	border: 1px solid transparent;
+	border-radius: var(--radius-xs);
+	padding: 1px 5px;
+}
+
+.view-acts .varchip:hover {
+	border-color: var(--agent);
+}
+
+.view-acts .iconpick {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px;
+	margin-top: var(--space-2);
+	max-width: 320px;
+}
+
+.view-acts .iconpick button {
+	width: 26px;
+	height: 26px;
+	display: grid;
+	place-items: center;
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+	border: 1px solid transparent;
+	background: none;
+}
+
+.view-acts .iconpick button:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .iconpick button.on {
+	background: var(--primary-soft);
+	border-color: var(--primary);
+	color: var(--fg);
+}
+
+.view-acts .conflictbox {
+	margin-top: var(--space-2);
+	border: 1px solid var(--danger-soft);
+	border-radius: var(--radius-sm);
+	background: color-mix(in srgb, var(--danger) 6%, var(--bg-raised));
+	padding: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg);
+}
+
+.view-acts .conflictbox .hd {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	color: var(--danger);
+	font-weight: 600;
+}
+
+.view-acts .conflictbox .acts,
+.view-acts .eddrawer .acts {
+	display: flex;
+	gap: var(--space-2);
+	margin-top: var(--space-2);
+	flex-wrap: wrap;
+}
+
+.view-acts .okbox {
+	margin-top: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--success);
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+}
+
+.view-acts .jsonbox {
+	margin-top: var(--space-2);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-md);
+	background: var(--bg-sunken);
+	overflow: hidden;
+}
+
+.view-acts .jsonbox h4 {
+	height: 26px;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 0 var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+	margin: 0;
+}
+
+.view-acts .jsonbox h4 .rt {
+	margin-left: auto;
+	font-family: var(--font-mono);
+	letter-spacing: 0;
+	text-transform: none;
+	color: var(--fg-muted);
+}
+
+.view-acts .jsonbox .json-preview {
+	padding: var(--space-2) var(--space-3);
+}
+
+.view-acts .edside .note {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	line-height: 1.45;
+}
+
+.view-acts .menupreview {
+	display: flex;
+	justify-content: center;
+	padding: var(--space-3);
+	background: var(--bg-sunken);
+	border-radius: var(--radius-md);
+	margin-top: var(--space-2);
+}
+
+.view-acts .menu.inline {
+	position: static;
+	box-shadow: var(--shadow-2);
+	min-width: 220px;
+	max-width: 100%;
+	background: var(--bg-surface);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-sm);
+	padding: var(--space-1);
+	display: flex;
+	flex-direction: column;
+}
+
+.view-acts .menu.inline .mitem {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-1) var(--space-2);
+	border-radius: var(--radius-xs);
+	font-size: var(--text-caption);
+	color: var(--fg);
+}
+
+.view-acts .menu.inline .mitem .k,
+.view-acts .menu.inline .mitem .kbdrow {
+	margin-left: auto;
+}
+
+.view-acts .menu.inline .mitem.isnew {
+	background: color-mix(in srgb, var(--achievement) 13%, transparent);
+	box-shadow: inset 2px 0 0 var(--achievement);
+}
+
+.view-acts .menu.inline .msep {
+	height: 1px;
+	margin: var(--space-1) var(--space-2);
+	background: var(--border-soft);
+}
+
+.view-acts .formfoot {
+	flex: none;
+	padding: var(--space-3) var(--space-4);
+	border-top: 1px solid var(--border);
+	display: flex;
+	align-items: center;
+	gap: var(--space-3);
+	background: var(--bg-surface);
+	flex-wrap: wrap;
+}
+
+.view-acts .formfoot .hintline {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-left: auto;
+	max-width: 52ch;
+	text-align: right;
+	line-height: 1.45;
+}
+
+/* Save / Test run / Cancel — no `.btn` primitive exists yet in this feature
+   (`action-detail.tsx` uses the smaller `.chip`; the header uses shadcn
+   `<Button>`). D-06's own control primitives, ported here for this form's
+   full-width footer and the conflict card's row of three. */
+.view-acts .btn {
+	height: var(--btn-h-sm);
+	padding: 0 var(--space-3);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-micro);
+	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	border: 1px solid var(--border);
+	background: var(--bg-surface);
+	color: var(--fg-muted);
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.view-acts .btn:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+	border-color: var(--border-strong);
+}
+
+.view-acts .btn:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+
+.view-acts .btn.primary {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--primary-fg);
+}
+
+.view-acts .btn.primary:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	border-color: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	color: var(--primary-fg);
+}
+
+.view-acts .btn.ghost {
+	background: transparent;
+}
+
+.view-acts .btn.lg {
+	height: var(--btn-h);
+	padding: 0 var(--space-4);
+	font-size: var(--text-caption);
+}
+
+.view-acts .testresult {
+	flex: none;
+	margin: 0 var(--space-4);
+	padding: var(--space-2) var(--space-3);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-caption);
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: var(--space-1);
+}
+
+.view-acts .testresult.tr-preview {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-acts .testresult.tr-done {
+	background: color-mix(in srgb, var(--success) 12%, var(--bg-raised));
+	color: var(--fg);
+}
+
+.view-acts .testresult.tr-failed,
+.view-acts .testresult.tr-refused {
+	background: var(--danger-soft);
+	color: var(--danger);
+}
+
+.view-acts .trustbadge {
+	display: inline-flex;
+	align-items: center;
+	font-size: var(--text-micro);
+	padding: 2px 6px;
+	border-radius: var(--radius-pill);
+	margin-top: var(--space-2);
+}
+
+.view-acts .trustbadge.ts-trusted {
+	background: color-mix(in srgb, var(--success) 16%, transparent);
+	color: var(--success);
+}
+
+.view-acts .trustbadge.ts-changed {
+	background: color-mix(in srgb, var(--warning) 16%, transparent);
+	color: var(--warning);
+}
+
+.view-acts .trustbadge.ts-untrusted,
+.view-acts .trustbadge.ts-absent {
+	background: var(--danger-soft);
+	color: var(--danger);
+}

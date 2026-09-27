@@ -1,10 +1,16 @@
 import { useState, useRef, useCallback, type KeyboardEvent } from 'react';
+import { useCommands } from '@/lib/keymap/dispatcher';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { ExplorerHeader } from './explorer-header';
 import { builtInSections } from './section-registry';
 import { SectionFrame } from './section-frame';
 
-export function Explorer() {
+/**
+ * `only` pins the Explorer to one built-in section, always open, with no
+ * header or reorder/hide affordances. D-01 gives the Chi and Ngwa rail
+ * modes that body: Chi shows `sessions`, Ngwa shows `ngwa-project`.
+ */
+export function Explorer({ only }: { only?: string } = {}) {
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const explorerSections = useShellStore((s) => s.explorerSections);
 	const setExplorerSectionCollapsed = useShellStore((s) => s.setExplorerSectionCollapsed);
@@ -16,7 +22,9 @@ export function Explorer() {
 	const typeaheadBuffer = useRef<string>('');
 	const typeaheadTimer = useRef<number | null>(null);
 
-	const visibleSections = explorerSections.filter((sec) => !hiddenSectionIds.has(sec.id));
+	const visibleSections = only
+		? [{ id: only, collapsed: false }]
+		: explorerSections.filter((sec) => !hiddenSectionIds.has(sec.id));
 
 	const handleSectionToggle = (sectionId: string, exclusive: boolean) => {
 		const currentlyOpen = visibleSections.filter((s) => !s.collapsed).map((s) => s.id);
@@ -82,24 +90,36 @@ export function Explorer() {
 		return headers.filter((el) => el.offsetParent !== null);
 	}, []);
 
-	const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-		// ⌘⇧[ / ⌘⇧] → previous / next section header (spec §6.3)
-		if ((e.key === '[' || e.key === ']') && (e.metaKey || e.ctrlKey) && e.shiftKey) {
-			e.preventDefault();
+	// WP-56 (G-ACTIONS §10.2/§10.6, off-list): ⌘⇧[ / ⌘⇧] → previous / next
+	// section header (spec §6.3), migrated from the `handleKeyDown` branch
+	// below to the registry `explorer.section-prev/next` commands. Scoped by
+	// the existing `explorerFocus` key (§4.3) — already backed by the
+	// `[data-explorer-section]` fallback marker, so no new focus key is
+	// needed for this one.
+	const moveSectionHeaderFocus = useCallback(
+		(direction: 1 | -1) => {
 			const headers = getSectionHeaders();
 			if (headers.length === 0) return;
 			const currentFocused = document.activeElement as HTMLElement | null;
 			const currentIndex = headers.findIndex((h) => h === currentFocused || h.contains(currentFocused));
-			if (e.key === '[') {
-				const prevIndex = currentIndex > 0 ? currentIndex - 1 : headers.length - 1;
-				headers[prevIndex]?.focus();
-			} else {
-				const nextIndex = currentIndex < headers.length - 1 ? currentIndex + 1 : 0;
-				headers[nextIndex]?.focus();
-			}
-			return;
-		}
+			const nextIndex =
+				direction === -1
+					? currentIndex > 0
+						? currentIndex - 1
+						: headers.length - 1
+					: currentIndex < headers.length - 1
+						? currentIndex + 1
+						: 0;
+			headers[nextIndex]?.focus();
+		},
+		[getSectionHeaders]
+	);
+	useCommands({
+		'explorer.section-prev': () => moveSectionHeaderFocus(-1),
+		'explorer.section-next': () => moveSectionHeaderFocus(1),
+	});
 
+	const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
 		const visibleRows = getVisibleRows();
 		if (visibleRows.length === 0) return;
 
@@ -177,21 +197,39 @@ export function Explorer() {
 	};
 
 	const context = { projectId: activeProjectId };
+	const regionLabel = only
+		? `${builtInSections.find((d) => d.id === only)?.title ?? only} section`
+		: 'Explorer sections';
 
 	return (
 		<div className="flex flex-col h-full bg-background text-foreground">
-			<ExplorerHeader />
+			{!only && <ExplorerHeader />}
 			<div
 				className="flex-1 overflow-y-auto focus:outline-none"
 				ref={containerRef}
 				tabIndex={0}
 				onKeyDown={handleKeyDown}
 				role="region"
-				aria-label="Explorer sections"
+				aria-label={regionLabel}
 			>
 				{visibleSections.map((sec, idx) => {
 					const def = builtInSections.find((d) => d.id === sec.id);
 					if (!def) return null;
+					if (only) {
+						return (
+							<SectionFrame
+								key={sec.id}
+								section={def}
+								context={context}
+								isOpen
+								onToggle={() => {}}
+								canMoveUp={false}
+								canMoveDown={false}
+							>
+								{def.render(context)}
+							</SectionFrame>
+						);
+					}
 					return (
 						<SectionFrame
 							key={sec.id}

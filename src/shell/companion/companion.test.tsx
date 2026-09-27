@@ -9,7 +9,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const handlers: Record<string, (e: { payload: unknown }) => void> = {};
+// Hoisted: `session-store.ts` installs its agent-hook listener at module load,
+// so the mocked `listen` can run before this file's body initialises.
+const { handlers } = vi.hoisted(() => ({
+	handlers: {} as Record<string, (e: { payload: unknown }) => void>,
+}));
 vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
 	listen: vi.fn((channel: string, handler: (e: { payload: unknown }) => void) => {

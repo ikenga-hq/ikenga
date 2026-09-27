@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main-window capability set: pty (custom commands), sql, dialog, os. Sidecar binaries spawn through tokio::process directly (see src-tauri/src/sidecar/), not through tauri-plugin-shell. fs:* perm identifiers are listed with empty allow arrays — no static main-window fs grants; per-pkg fs is granted dynamically by pkg/registries/permissions.rs::add_fs_capabilities, and Rust-side app fs (commands::fs::*) enforces fs_roots.rs on top of the ACL. `allow-app-commands` (see permissions/app-commands.toml) grants the app's own #[tauri::command] surface: since tauri 2.11.2 those are ACL-gated for this window because it loads remote content (http://localhost:<viewer_port>/) — without it every command is rejected (ikenga#140).",
+  "description": "Main-window capability set: pty (custom commands), sql, dialog, os. Sidecar binaries spawn through tokio::process directly (see src-tauri/src/sidecar/), not through tauri-plugin-shell. fs:* perm identifiers are listed with empty allow arrays — no static main-window fs grants; per-pkg fs is granted dynamically by pkg/registries/permissions.rs::add_fs_capabilities, and Rust-side app fs (commands::fs::*) enforces fs_roots.rs on top of the ACL. `allow-app-commands` (see permissions/app-commands.toml) grants the app's own #[tauri::command] surface: since tauri 2.11.2 those are ACL-gated for this window because it loads remote content (http://localhost:<viewer_port>/) — without it every command is rejected (ikenga#140). WP-46 (native-menu parity) added `core:window:allow-minimize` / `allow-toggle-maximize` / `allow-set-fullscreen` and `process:allow-exit`: `core:window:default` only covers reads (see window-detached.json's own note), so the Windows/Linux `≡` cascade menu's Window submenu (Minimize/Maximize/Fullscreen) and Ikenga submenu (Quit) — the in-app equivalents of macOS's native `PredefinedMenuItem`s, which need no ACL grant at all — need these write permissions explicitly. Unverified against the generated schema per DEC-50 (no build this phase); owed at WP-47.",
   "windows": ["main"],
   "remote": {
     "urls": [
@@ -13,6 +13,9 @@
     "core:default",
     "core:event:default",
     "core:window:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-set-fullscreen",
     "core:webview:default",
     "core:webview:allow-set-webview-zoom",
     "dialog:default",
@@ -24,6 +27,7 @@
     "sql:allow-load",
     "updater:default",
     "process:allow-restart",
+    "process:allow-exit",
     "global-shortcut:default",
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-read-text",

@@ -1,5 +1,91 @@
 # ikenga-desktop
 
+## 0.15.1
+
+### Patch Changes
+
+- 3db56cc: Pin `@tauri-apps/api` to `~2.11.0` to match the `tauri` crate (2.11.x, locked in `Cargo.lock`). `@tauri-apps/api` 2.12.0 was published to npm on 2026-09-26. The release workflow installs without a frozen lockfile, so `^2.1.1` picked 2.12.0, Tauri's version check refused the mismatch, and the v0.15.0 build failed on every platform. v0.15.1 ships Phase 6.
+
+## 0.15.0
+
+### Minor Changes
+
+- 42205c9: **Phase 6: actions, menus and keys.** Every menu item, key and shortcut in the shell is now data that you can see, rebind, reorder and extend. It lives in two files at two scopes: `~/.ikenga/{actions,keybindings}.json` for personal, and `<project>/.ikenga/…` for project.
+  
+  - **One key dispatcher.** The registry is the single place keys fire from. It covers the workspace, the rail, the palette, zoom, the terminal chord table and the leftover widget handlers.
+    - Chords wait up to 900 ms, and only when a chord starting with ⌘K is actually bound; otherwise ⌘K opens the palette immediately.
+    - Typing and IME never fire a shortcut.
+    - The macOS menu-bar accelerators are deduplicated, so a key fires once.
+    - **Windows/Linux:** Alt+1–6 now focuses pane N. Ctrl+1–3 still switches the rail.
+  - **OS-wide shortcuts.** Summon, window screenshot and pane screenshot are ordinary keymap rows with `scope: 'os'`. You can rebind them in your personal file. A project or package can never claim an OS-wide key.
+  - **Menus render from data.** The Explorer, tab, pane `⋯`, status bar, rail, palette groups and the native menu (76 items across 8 files) all come from the effective model.
+    - Reorder or hide an item in `actions.json` and it applies live, with no restart. Locked items can move but never hide.
+    - Package actions appear where their manifest places them.
+  - **Your own actions.** There are six run kinds: `chi`, `shell`, `iyke`, `skill`, `workflow` and `open`, plus built-in and package kinds.
+    - **Trust in a project.** In an untrusted project, `shell`, `iyke`, `skill` and `workflow` actions refuse until you trust them in the trust sheet, and editing the command asks again. An untrusted project's keybindings are "held until trusted".
+    - **Test run** previews rather than acts. For `shell`, and for `iyke` actions that send a POST, it shows what would run instead of running it.
+  - **Settings → Actions, menus and keys (D-06).** It has five parts: the Actions list, Editor, Menus, Keys (with conflicts), and Import. Import takes a package, the core of your VS Code `keybindings.json`, or a teammate's project file. An import never overrides a binding you already have.
+  - **`iyke`.** The bridge is now at API level 4, with actions, menus and keys routes. The matching commands (`iyke actions`, `iyke menus` and `iyke keys`) ship in iyke-cli v0.5.0.
+  - **Packages.** A manifest can request a single-stroke `key` on `ui.context_actions[]` (G-PKG-KEY). It is granted only if the key is free. `ui.command_palette[].action` is now typed.
+  - CI now builds against `@ikenga/contract` HEAD again. The pin added during Phase 6 has been removed.
+
+## 0.14.1
+
+### Patch Changes
+
+- df6d123: **Duplicate and blank surfaces from the 0.14 re-architecture.**
+  
+  - **Settings** lists its nine sections once. The nav sits inside the pane (D-03), and the sidebar stays the Explorer.
+  - **Chi and Ngwa sidebars are no longer blank.** Chi shows Sessions and Ngwa shows the project's equipment (D-01). Clicking Ngwa now lands on `/ngwa/installed` instead of `/claude`.
+  - **One project switcher.** The rail-foot copy is gone; the title-row chip does the job.
+  - **One greeting on the Project dashboard.** The Obi canvas hides its own greeting while the daily address shows.
+  - **One toast per permission ask.** The terminal permission inbox no longer fires its own OS notification for asks the notification centre already records.
+  - **The Ngwa Store uses the shared D-07 states.** Loading shows the ember pulse, and the offline state has a Retry. Two unmounted legacy components (`PkgsSurface`, the old Ngwa facet bar) were deleted.
+
+## 0.14.0
+
+### Minor Changes
+
+- a9cd840: **Phase 5b: flows, viewer and pane chrome.**
+  
+  - **Onboarding (D-04).** Consecration is rebuilt as seven steps: welcome, engine, project, equipment, look, shortcuts, done. It has a step rail, resume/offline/engine-none states, and a Personal/Project scope switch. It never scaffolds into `~/.claude/` implicitly.
+  - **Daily address.** It sits on the Project dashboard. It shows project-scoped runs and unresolved permissions, is dismissible once a day, and has a real Workspace setting.
+  - **Notifications.** A notifications table (`shell_notifications`, migration 0066) records permission, run, update and violation rows. Rows keep a resolved state that is separate from read. Terminal prompts resolve on `Stop`, `PostToolUseFailure` and the next `UserPromptSubmit`. Per-kind mutes live in `settings.json`. The status-bar bell and a notification centre show the rows, toasts are text-only copies of them, and the iyke bridge serves `GET /iyke/notifications`.
+  - **Updater (D-07).** One updater flow covers the app and packages: release notes, status-bar progress, restart with a live-session warning, and a package batch that holds any update requesting a new permission for review *before* installing it.
+  - **Automations and restore (D-07).** There is a `/automations` view. A restore wizard covers the whole restore, from picking the file to done, and lists secret names only. Shared Empty, Loading, Error and Offline states each offer exactly one next action.
+  - **Viewer and panes (D-08).** The artifact viewer gets new chrome, variants, and CSV and JSON renderers. Package panes get states for loading, consent, crashed, sidecar-down and blocked, with a working "Allow host…". Native menu parity: the macOS tree, plus a `≡` cascade on Windows/Linux, with keys taken from the keymap registry.
+  - **New commands:** `notifications_*`, `pkg_trust_preview_incoming` and `secrets_index_names`. Each has its ACL entry.
+
+## 0.13.0
+
+### Minor Changes
+
+- f86a32f: **Phase 5a: settings shell + secrets unlock.** Settings is rebuilt on the
+  `urn:ikenga:settings:v1` contract (`~/.ikenga/settings.json` personal +
+  `<root>/.ikenga/settings.json` project, KV migration with durable markers),
+  collapsing 15 legacy routes into the D-03 nine-section shell with
+  Personal/Project scope switching, cross-section search, project-override
+  markers with revert, Open file / Copy as iyke, and reset-section. Legacy
+  routes (`/settings/activity-bar`, `agent`, `artifact-grid`, `backup`,
+  `onboarding`, `packages`, `pkg-audit`, `pkg-health`, `data-health`,
+  `terminal`) redirect. Secrets gain a passphrase-gated encrypted layer
+  (Argon2id + AES-256-GCM) with set/rotate/unlock/lock commands, idle
+  re-lock, a global unlock sheet, Linux Secret Service as the authoritative
+  backend with keyutils as a read-only fallback, hardened Stronghold
+  migration rollback, and redacted-only reveal in the UI. New commands:
+  `secrets_set_passphrase`, `secrets_unlock`, `secrets_lock`,
+  `secrets_lock_state`; `secrets_vault_status` now reports
+  `locked/configured/idle_timeout_secs/last_activity_unix_ms`; the iyke
+  bridge gains `GET /iyke/secrets/lock-state`.
+- 8504409: **BREAKING: `ui.nav` removed (DEC-37 cutover).** The `ui.nav` → `ui.views`
+  alias had a one-release lifetime (G-MANIFEST-V5 §4) and v0.12.0 was the
+  soft-warn release, so the Rust manifest parser now rejects `ui.nav` outright
+  with a canonical message naming `ui.views[]`. `Manifest::apply_nav_views_alias`,
+  `NavAliasOutcome` and `normalize_nav_route` are gone; `Package::load` does no
+  post-parse fixup. The `NavEntry` wire shape survives on the activity-bar
+  registry snapshot (pkg-mode sidebar + WP-22 pin seed read it), sourced from
+  `ui.views[]`.
+
 ## 0.12.0
 
 ### Minor Changes

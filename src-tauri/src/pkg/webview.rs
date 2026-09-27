@@ -218,6 +218,12 @@ pub struct WebviewPanesRegistry {
     /// a non-`main` window needs its own listener watching that window's
     /// geometry, otherwise it would never reposition (multi-window: WP-04).
     parent_listeners: RwLock<HashSet<String>>,
+    /// WP-45: origins the user allowed through "Allow host…" on a
+    /// `pkg-blocked` pane, per pkg. Additive over the manifest's declared
+    /// `allowed_origins` (exact-origin match only). Persisted as
+    /// `trust::WEBVIEW_ORIGIN_SCOPE_KIND` rows and re-seeded by
+    /// `pkg_webview_create`; cleared on unregister.
+    granted_origins: RwLock<HashMap<String, HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -226,6 +232,70 @@ struct PkgCapability {
     partitions: Vec<String>,
     /// `None` = field absent (permissive + warn), `Some(list)` = enforced.
     allowed_origins: Option<Vec<String>>,
+}
+
+/// Tauri event channel for an origin-boundary rejection (WP-45, D-08
+/// `pkg-blocked`). One channel for the whole app; the pane host filters by
+/// `(pkgId, paneId)`. Emitted by the callers that hold an `AppHandle`
+/// (`commands::pkg_webview` create/navigate, the iyke `browser/goto`
+/// handler) via [`emit_if_origin_blocked`] — the registry itself stays
+/// handle-free and its behaviour is unchanged: the same error is still
+/// returned to the caller, the event is only a broadcast of it.
+pub const NAVIGATION_BLOCKED_EVENT: &str = "pkg://navigation-blocked";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationBlockedEvent {
+    pub pkg_id: String,
+    pub pane_id: String,
+    pub url: String,
+    pub origin: String,
+    pub allowed_origins: Vec<String>,
+}
+
+/// Typed form of the "origin not in `allowed_origins`" rejection so callers
+/// can recognise it (`anyhow::Error::downcast_ref`) without matching on the
+/// message. `Display` is byte-identical to the previous `anyhow!` string, so
+/// the error surfaced over IPC does not change.
+#[derive(Debug, Clone)]
+pub struct OriginBlocked {
+    pub url: String,
+    pub origin: String,
+    pub allowed_origins: Vec<String>,
+}
+
+impl std::fmt::Display for OriginBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "origin `{}` is not in `capabilities.webview.allowed_origins` \
+             (declared: {:?})",
+            self.origin,
+            self.allowed_origins.as_slice()
+        )
+    }
+}
+
+impl std::error::Error for OriginBlocked {}
+
+/// Broadcast `pkg://navigation-blocked` when `err` is an [`OriginBlocked`]
+/// rejection; a no-op for every other error. Best-effort — an emit failure
+/// is logged and swallowed, never turned into a second error.
+pub fn emit_if_origin_blocked(app: &AppHandle, pkg_id: &str, pane_id: &str, err: &anyhow::Error) {
+    use tauri::Emitter;
+    let Some(blocked) = err.downcast_ref::<OriginBlocked>() else {
+        return;
+    };
+    let payload = NavigationBlockedEvent {
+        pkg_id: pkg_id.to_string(),
+        pane_id: pane_id.to_string(),
+        url: blocked.url.clone(),
+        origin: blocked.origin.clone(),
+        allowed_origins: blocked.allowed_origins.clone(),
+    };
+    if let Err(e) = app.emit(NAVIGATION_BLOCKED_EVENT, payload) {
+        log::warn!("[pkg_webview] `{pkg_id}` emit navigation-blocked failed: {e}");
+    }
 }
 
 /// Does `origin` satisfy the pkg's declared `allowed_origins`?
@@ -243,6 +313,18 @@ struct PkgCapability {
 fn origin_allowed(origin: &str, allowed: &Option<Vec<String>>) -> bool {
     let Some(list) = allowed else { return true };
     list.iter().any(|pat| origin_matches(origin, pat))
+}
+
+/// `https://fal.media/files/x` or `https://fal.media` → `https://fal.media`.
+/// Only `http`/`https` with a host; anything else (opaque origins, `file:`,
+/// `data:`, a bare `*`) is refused so a grant can never become a wildcard.
+fn normalize_grant_origin(origin_or_url: &str) -> Result<String> {
+    let parsed = url::Url::parse(origin_or_url.trim())
+        .with_context(|| format!("parse origin `{origin_or_url}`"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(anyhow!("only http(s) origins can be allowed (got `{origin_or_url}`)"));
+    }
+    Ok(parsed.origin().unicode_serialization())
 }
 
 fn origin_matches(origin: &str, pat: &str) -> bool {
@@ -341,12 +423,12 @@ impl WebviewPanesRegistry {
                  without an origin boundary. Declare the field to bound navigation."
             );
         }
-        if !origin_allowed(&origin, &cap.allowed_origins) {
-            return Err(anyhow!(
-                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
-                 (declared: {:?})",
-                cap.allowed_origins.as_deref().unwrap_or(&[])
-            ));
+        if !self.origin_permitted(pkg_id, &origin, &cap) {
+            return Err(anyhow::Error::new(OriginBlocked {
+                url: url.to_string(),
+                origin,
+                allowed_origins: cap.allowed_origins.clone().unwrap_or_default(),
+            }));
         }
 
         let data_dir = partition_dir(app, pkg_id, partition)?;
@@ -434,12 +516,12 @@ impl WebviewPanesRegistry {
             .cloned()
             .unwrap_or_default();
         let origin = parsed.origin().unicode_serialization();
-        if !origin_allowed(&origin, &cap.allowed_origins) {
-            return Err(anyhow!(
-                "origin `{origin}` is not in `capabilities.webview.allowed_origins` \
-                 (declared: {:?})",
-                cap.allowed_origins.as_deref().unwrap_or(&[])
-            ));
+        if !self.origin_permitted(pkg_id, &origin, &cap) {
+            return Err(anyhow::Error::new(OriginBlocked {
+                url: url.to_string(),
+                origin,
+                allowed_origins: cap.allowed_origins.clone().unwrap_or_default(),
+            }));
         }
         handle
             .surface
@@ -551,6 +633,53 @@ impl WebviewPanesRegistry {
         }
 
         set_surface_rect(&handle.surface, &handle.label, &handle.parent_label, rect)
+    }
+
+    /// Declared `allowed_origins` OR a user grant for this exact origin.
+    fn origin_permitted(&self, pkg_id: &str, origin: &str, cap: &PkgCapability) -> bool {
+        origin_allowed(origin, &cap.allowed_origins)
+            || self
+                .granted_origins
+                .read()
+                .map(|g| g.get(pkg_id).is_some_and(|set| set.contains(origin)))
+                .unwrap_or(false)
+    }
+
+    /// WP-45 "Allow host…": validate + normalize `origin_or_url` to an
+    /// `http(s)` origin and add it to `pkg_id`'s in-memory grant set. Returns
+    /// the normalized origin for the caller to persist. Refuses pkgs that
+    /// never declared `child_webviews` — there is no webview to widen.
+    pub fn grant_origin(&self, pkg_id: &str, origin_or_url: &str) -> Result<String> {
+        let origin = normalize_grant_origin(origin_or_url)?;
+        let declares_webviews = self
+            .pkg_capabilities
+            .read()
+            .map_err(|_| anyhow!("pkg_capabilities lock poisoned"))?
+            .get(pkg_id)
+            .is_some_and(|c| c.child_webviews);
+        if !declares_webviews {
+            return Err(anyhow!(
+                "pkg `{pkg_id}` is not registered with `capabilities.webview.child_webviews = true`"
+            ));
+        }
+        self.granted_origins
+            .write()
+            .map_err(|_| anyhow!("granted_origins lock poisoned"))?
+            .entry(pkg_id.to_string())
+            .or_default()
+            .insert(origin.clone());
+        Ok(origin)
+    }
+
+    /// Seed `pkg_id`'s grant set from persisted rows (additive: never drops
+    /// an origin granted earlier in this session).
+    pub fn seed_granted_origins(&self, pkg_id: &str, origins: Vec<String>) {
+        if origins.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.granted_origins.write() {
+            g.entry(pkg_id.to_string()).or_default().extend(origins);
+        }
     }
 
     fn lookup(&self, pkg_id: &str, pane_id: &str) -> Option<Arc<PaneHandle>> {
@@ -756,6 +885,9 @@ impl Registry for WebviewPanesRegistry {
             .write()
             .map_err(|_| anyhow!("pkg_capabilities lock poisoned"))?
             .remove(pkg_id);
+        if let Ok(mut g) = self.granted_origins.write() {
+            g.remove(pkg_id);
+        }
         Ok(())
     }
 
@@ -984,7 +1116,67 @@ where
 
 #[cfg(test)]
 mod origin_tests {
-    use super::{origin_allowed, origin_matches};
+    use super::{
+        normalize_grant_origin, origin_allowed, origin_matches, OriginBlocked,
+        WebviewPanesRegistry,
+    };
+
+    #[test]
+    fn grant_origin_normalizes_and_rejects_non_http() {
+        assert_eq!(
+            normalize_grant_origin("https://fal.media/files/x?y=1").unwrap(),
+            "https://fal.media"
+        );
+        assert_eq!(
+            normalize_grant_origin("http://localhost:5173").unwrap(),
+            "http://localhost:5173"
+        );
+        assert!(normalize_grant_origin("*").is_err());
+        assert!(normalize_grant_origin("data:text/html,x").is_err());
+        assert!(normalize_grant_origin("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn grant_origin_refuses_unregistered_pkg() {
+        let reg = WebviewPanesRegistry::new();
+        assert!(reg.grant_origin("com.example.none", "https://fal.media").is_err());
+    }
+
+    #[test]
+    fn seeded_grant_widens_declared_list_by_exact_origin_only() {
+        let reg = WebviewPanesRegistry::new();
+        let cap = super::PkgCapability {
+            child_webviews: true,
+            partitions: vec![],
+            allowed_origins: Some(vec!["https://studio.example.com".into()]),
+        };
+        assert!(!reg.origin_permitted("p", "https://fal.media", &cap));
+        reg.seed_granted_origins("p", vec!["https://fal.media".into()]);
+        assert!(reg.origin_permitted("p", "https://fal.media", &cap));
+        assert!(!reg.origin_permitted("p", "https://cdn.fal.media", &cap));
+        assert!(!reg.origin_permitted("other", "https://fal.media", &cap));
+        assert!(reg.origin_permitted("p", "https://studio.example.com", &cap));
+    }
+
+    #[test]
+    fn origin_blocked_message_is_unchanged_and_downcastable() {
+        // WP-45: the typed error must keep the exact IPC string the FE and
+        // iyke already surface, and be recognisable for the
+        // `pkg://navigation-blocked` broadcast.
+        let err = anyhow::Error::new(OriginBlocked {
+            url: "https://fal.media/files/x".into(),
+            origin: "https://fal.media".into(),
+            allowed_origins: vec!["https://studio.example.com".into()],
+        });
+        assert_eq!(
+            format!("{err:#}"),
+            "origin `https://fal.media` is not in `capabilities.webview.allowed_origins` \
+             (declared: [\"https://studio.example.com\"])"
+        );
+        let blocked = err.downcast_ref::<OriginBlocked>().expect("typed");
+        assert_eq!(blocked.origin, "https://fal.media");
+        assert!(anyhow::anyhow!("other").downcast_ref::<OriginBlocked>().is_none());
+    }
 
     fn list(v: &[&str]) -> Option<Vec<String>> {
         Some(v.iter().map(|s| s.to_string()).collect())

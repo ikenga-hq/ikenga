@@ -1,0 +1,70 @@
+name: Set up the Ikenga workspace
+description: >-
+  Check out @ikenga/contract and @ikenga/tokens beside shell, synthesize the
+  outer pnpm workspace, install, and build the two siblings. Shell's
+  `workspace:*` deps only resolve this way (same layout as release.yml).
+  Expects shell to be checked out at ./shell.
+
+inputs:
+  token:
+    description: Token that can read the sibling repos.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout @ikenga/contract
+      uses: actions/checkout@v6
+      with:
+        repository: ikenga-hq/ikenga-contract
+        path: contract
+        token: ${{ inputs.token }}
+
+    - name: Checkout @ikenga/tokens
+      uses: actions/checkout@v6
+      with:
+        repository: ikenga-hq/ikenga-tokens
+        path: tokens
+        token: ${{ inputs.token }}
+
+    # There is no committed lockfile for this outer workspace, which is why
+    # the install below is --no-frozen-lockfile.
+    - name: Synthesize workspace
+      shell: bash
+      run: |
+        cat > pnpm-workspace.yaml <<'EOF'
+        packages:
+          - shell
+          - contract
+          - tokens
+        EOF
+
+    - name: Install bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 9
+        run_install: false
+
+    - name: Set up Node (for pnpm)
+      uses: actions/setup-node@v6
+      with:
+        node-version: 20
+
+    - name: pnpm install (workspace root)
+      shell: bash
+      run: pnpm install --no-frozen-lockfile
+
+    # contract and tokens gitignore their dist/, and their package mains
+    # point at ./dist — without this step tsc can't resolve @ikenga/* types.
+    - name: Build workspace siblings (contract, tokens)
+      shell: bash
+      run: |
+        for pkg in '@ikenga/contract' '@ikenga/tokens'; do
+          echo "==> pnpm -F $pkg build"
+          pnpm -F "$pkg" build
+        done

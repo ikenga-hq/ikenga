@@ -15,28 +15,26 @@
 // Re-homed out of the rail (see the WP-03 PR's affordance account): the
 // pending-approvals badge → the status bar's permissions segment (WP-09;
 // meanwhile ⌘K → "Approvals"), the theme toggle → a ⌘K palette action
-// (WP-09) and Settings › Appearance. The active-project indicator stays at
-// the rail foot until WP-09 lifts it into the title row.
+// (WP-09) and Settings › Appearance. The active-project switcher lives only
+// in the title row's project chip (WP-09); the rail-foot copy is gone.
 
 import {
 	ArrowDown,
 	ArrowUp,
 	Folder,
-	FolderKanban,
 	HeartPulse,
 	type LucideIcon,
 	Package,
 	Pencil,
 	Pin as PinGlyph,
 	PinOff,
-	Plus,
 	Settings,
 	Settings2,
 	SquareDashed,
 	Store,
 	Trash2,
 } from 'lucide-react';
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, Fragment, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	ContextMenu,
@@ -45,6 +43,9 @@ import {
 	ContextMenuSeparator,
 	ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import { useEffectiveMenu } from '@/lib/actions/store';
+import { resolveMenuItems } from '@/shell/menu/resolve';
+import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import {
 	Dialog,
 	DialogContent,
@@ -53,11 +54,10 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from '@/components/ui/dialog';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { cn } from '@/components/ui/utils';
 import { useIkengaStore } from '@/lib/ikenga/theme-store';
-import { labelFor, useKey } from '@/lib/keymap/registry';
+import { useCommands } from '@/lib/keymap/dispatcher';
+import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
 	type PkgActivityBarEntry,
@@ -73,7 +73,6 @@ import {
 	usePinsStore,
 } from '@/lib/shell/pins-store';
 import { type CoreMode, useShellStore } from '@/lib/shell/shell-store';
-import type { Project } from '@/lib/tauri-cmd';
 import { focusCompanion } from './companion-focus';
 import { PinIcon } from './pin-icon';
 import { RailGloss, type RailGlossTerm } from './rail-gloss';
@@ -146,8 +145,7 @@ const SETTINGS_KEY: RailKeyDef = {
  *  Project and Chi keep whatever the pane shows. */
 const MODE_LANDING: Partial<Record<CoreMode, string>> = {
 	settings: '/settings/appearance',
-	// TODO(WP-10): '/ngwa/installed' (spec §2 ⌘3) once that route exists.
-	ngwa: '/claude',
+	ngwa: '/ngwa/installed', // spec §2 ⌘3
 };
 
 /** Ngwa's context menu (spec §3.1 row 3) — the pointer path to what used to
@@ -279,14 +277,17 @@ export function ActivityBar() {
 		dispatchPinSelection(pin, usePaneStore.getState());
 	}
 
-	// Each binding is a registry entry with `when: 'not-input'` (defaults.ts);
-	// `useKey()` owns the typing-target guard. A key always enters its mode —
-	// the collapse toggle is a pointer affordance only.
-	useKey('rail.project', () => enterMode('project'));
-	useKey('rail.chi', () => enterMode('chi'));
-	useKey('rail.ngwa', () => enterMode('ngwa'));
-	useKey('rail.settings', () => enterMode('settings'));
-	useKey('ngwa.create', () => navigateInNgwa('/ngwa/create'));
+	// Each key is a registry command (`defaults.ts`, `!inputFocus`) fired by
+	// the one key dispatcher (WP-54), which owns the typing guard and every
+	// rebind; the rail only says what each does. A key always enters its
+	// mode — the collapse toggle is a pointer affordance only.
+	useCommands({
+		'rail.project': () => enterMode('project'),
+		'rail.chi': () => enterMode('chi'),
+		'rail.ngwa': () => enterMode('ngwa'),
+		'rail.settings': () => enterMode('settings'),
+		'ngwa.create': () => navigateInNgwa('/ngwa/create'),
+	});
 
 	const hasAnyPins =
 		hydrated &&
@@ -304,7 +305,6 @@ export function ActivityBar() {
 				]
 			: []),
 		SETTINGS_KEY.mode,
-		'project-switcher',
 	];
 	const tabStop = rovingId && itemIds.includes(rovingId) ? rovingId : activeMode;
 	const roving: RovingApi = {
@@ -420,10 +420,6 @@ export function ActivityBar() {
 						badgeCount={0}
 					/>
 
-					{/* Active-project indicator — kept at the rail foot until WP-09
-					    lifts it into the title row (spec §3.1, §6A.4). */}
-					<ProjectIndicator />
-
 					<RailGloss terms={terms} railRef={railRef} />
 				</nav>
 			</TooltipProvider>
@@ -493,6 +489,18 @@ function RailKey({ def, isActive, onSelect, badgeCount, ...rest }: RailKeyProps)
 	);
 }
 
+const NGWA_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'ngwa.installed': <Package className="h-3.5 w-3.5" />,
+	'ngwa.store': <Store className="h-3.5 w-3.5" />,
+	'ngwa.health': <HeartPulse className="h-3.5 w-3.5" />,
+};
+const NGWA_MENU_ROUTE: Readonly<Record<string, string>> = {
+	'ngwa.installed': NGWA_MENU[0].to,
+	'ngwa.store': NGWA_MENU[1].to,
+	'ngwa.health': NGWA_MENU[2].to,
+};
+
+/** `rail-ngwa` (G-ACTIONS §1.3), resolved only while the menu is open. */
 function NgwaMenuWrap({
 	onPick,
 	children,
@@ -501,17 +509,17 @@ function NgwaMenuWrap({
 	children: React.ReactNode;
 }) {
 	return (
-		<ContextMenu>
-			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				{NGWA_MENU.map(({ label, to, Icon }) => (
-					<ContextMenuItem key={to} onSelect={() => onPick(to)}>
-						<Icon className="h-3.5 w-3.5" />
-						{label}
-					</ContextMenuItem>
-				))}
-			</ContextMenuContent>
-		</ContextMenu>
+		<EffectiveContextMenu
+			menuId="rail-ngwa"
+			icons={NGWA_MENU_ICONS}
+			handlers={{
+				'ngwa.installed': () => onPick(NGWA_MENU_ROUTE['ngwa.installed']),
+				'ngwa.store': () => onPick(NGWA_MENU_ROUTE['ngwa.store']),
+				'ngwa.health': () => onPick(NGWA_MENU_ROUTE['ngwa.health']),
+			}}
+		>
+			{children}
+		</EffectiveContextMenu>
 	);
 }
 
@@ -590,147 +598,6 @@ function PinButton({ pin, status, onSelect, ...rest }: PinButtonProps) {
 	);
 }
 
-// ─── Active-project indicator (kept; WP-09 lifts it) ─────────────────────
-
-/** Two-char abbreviation for the activity-bar indicator. Falls back to the
- *  first two visible chars of the display name. */
-function projectAbbrev(p: Project): string {
-	const name = p.display_name.trim();
-	if (!name) return '··';
-	// Prefer initials if the user typed multiple words.
-	const words = name.split(/\s+/).filter(Boolean);
-	if (words.length >= 2) {
-		return (words[0]![0]! + words[1]![0]!).toUpperCase();
-	}
-	return name.slice(0, 2).toUpperCase();
-}
-
-function ProjectIndicator() {
-	const [open, setOpen] = useState(false);
-	const { tabIndexFor, onItemFocus } = useContext(RovingContext);
-	const projects = useShellStore((s) => s.projects);
-	const activeProjectId = useShellStore((s) => s.activeProjectId);
-	const setActiveProject = useShellStore((s) => s.setActiveProject);
-	const active = projects.find((p) => p.id === activeProjectId);
-
-	// Active first, then non-archived (by position then created_at), then
-	// archived last. Mirrors the rule in `/settings/projects` so the popover
-	// reads the same as the settings table.
-	const sorted = projects.slice().sort((a, b) => {
-		if (a.id === activeProjectId) return -1;
-		if (b.id === activeProjectId) return 1;
-		const aArc = a.archived_at != null ? 1 : 0;
-		const bArc = b.archived_at != null ? 1 : 0;
-		if (aArc !== bArc) return aArc - bArc;
-		if (a.position !== b.position) return a.position - b.position;
-		return a.created_at - b.created_at;
-	});
-
-	async function pick(id: string) {
-		setOpen(false);
-		try {
-			await setActiveProject(id);
-		} catch {
-			// Swallowed — the optimistic flip already rolled back in the
-			// store on error. A toast surface lands in a later phase.
-		}
-	}
-
-	function openNewProject() {
-		setOpen(false);
-		usePaneStore.getState().navigateFocused('/settings/projects');
-	}
-
-	const abbrev = active ? projectAbbrev(active) : '··';
-	const color = active?.color ?? '#7c7c7c';
-	const switchHint = labelFor('palette.projects');
-	const title = active
-		? `Project: ${active.display_name}${active.root_path ? `\nRoot: ${active.root_path}` : ''}\n(${switchHint} to switch)`
-		: `No active project (${switchHint} to switch)`;
-
-	return (
-		<Popover open={open} onOpenChange={setOpen}>
-			<PopoverTrigger asChild>
-				<button
-					type="button"
-					title={title}
-					aria-label={title}
-					tabIndex={tabIndexFor('project-switcher')}
-					onFocus={() => onItemFocus('project-switcher')}
-					data-rail-item="project-switcher"
-					className="ikenga-rail-item"
-				>
-					<span
-						aria-hidden
-						className="grid h-6 w-6 place-items-center rounded-md border border-border-soft text-[10px] font-semibold text-white"
-						style={{ background: color }}
-					>
-						{abbrev}
-					</span>
-				</button>
-			</PopoverTrigger>
-			<PopoverContent side="right" align="end" className="w-64 p-2">
-				<div className="px-2 pb-2 pt-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-					Switch project
-				</div>
-				<ul className="flex max-h-72 flex-col overflow-y-auto">
-					{sorted.map((p) => (
-						<li key={p.id}>
-							<button
-								type="button"
-								onClick={() => void pick(p.id)}
-								className={cn(
-									'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors',
-									'hover:bg-accent hover:text-accent-foreground',
-									p.id === activeProjectId && 'bg-accent/60 font-medium',
-									p.archived_at != null && 'opacity-60'
-								)}
-							>
-								<span
-									aria-hidden
-									className="inline-block h-3 w-3 shrink-0 rounded-full border border-border"
-									style={{ background: p.color ?? '#7c7c7c' }}
-								/>
-								{p.icon && <span className="text-sm leading-none">{p.icon}</span>}
-								<span className="flex-1 truncate">{p.display_name}</span>
-								{p.id === activeProjectId && (
-									<span className="text-[10px] uppercase text-muted-foreground">Active</span>
-								)}
-								{p.archived_at != null && (
-									<span className="text-[10px] uppercase text-muted-foreground">Archived</span>
-								)}
-							</button>
-						</li>
-					))}
-					{sorted.length === 0 && (
-						<li className="px-2 py-3 text-center text-xs text-muted-foreground">
-							Loading projects…
-						</li>
-					)}
-				</ul>
-				<div className="mt-2 border-t border-border pt-2">
-					<button
-						type="button"
-						onClick={openNewProject}
-						className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-					>
-						<Plus className="h-3.5 w-3.5" />
-						New project…
-					</button>
-					<button
-						type="button"
-						onClick={openNewProject}
-						className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-					>
-						<FolderKanban className="h-3.5 w-3.5" />
-						Manage projects…
-					</button>
-				</div>
-			</PopoverContent>
-		</Popover>
-	);
-}
-
 // ─── Pin + section context menus (kept) ──────────────────────────────────
 
 interface PinContextWrapProps {
@@ -771,53 +638,112 @@ function PinContextWrap({
 	}
 
 	const otherSections = allSections.filter((s) => s.id !== pin.sectionId);
+	// `rail` (G-ACTIONS §1.3): resolved by `PinMenuBody`, mounted only while
+	// this pin's menu is open.
+	const [open, setOpen] = useState(false);
 
 	return (
-		<ContextMenu>
+		<ContextMenu onOpenChange={setOpen}>
 			<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-			<ContextMenuContent>
-				<ContextMenuItem onSelect={() => onOpen(pin)}>
-					<PinGlyph className="h-3.5 w-3.5" />
-					Open {pin.label}
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				<ContextMenuItem disabled={index === 0} onSelect={() => void moveBy(-1)}>
-					<ArrowUp className="h-3.5 w-3.5" />
-					Move up
-				</ContextMenuItem>
-				<ContextMenuItem disabled={index >= siblings.length - 1} onSelect={() => void moveBy(1)}>
-					<ArrowDown className="h-3.5 w-3.5" />
-					Move down
-				</ContextMenuItem>
-				<ContextMenuSeparator />
-				{otherSections.length > 0 && (
-					<>
-						<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-							Move to
-						</div>
-						{otherSections.map((s) => (
-							<ContextMenuItem key={s.id} onSelect={() => moveTo(s.id)}>
-								<SquareDashed className="h-3.5 w-3.5" />
-								{s.label}
-							</ContextMenuItem>
-						))}
-					</>
-				)}
-				{pin.sectionId !== null && (
-					<ContextMenuItem onSelect={() => moveTo(null)}>
-						<SquareDashed className="h-3.5 w-3.5" />
-						No section
-					</ContextMenuItem>
-				)}
-				{(otherSections.length > 0 || pin.sectionId !== null) && <ContextMenuSeparator />}
-				<ContextMenuItem variant="destructive" onSelect={() => removePin(pin.id)}>
-					<PinOff className="h-3.5 w-3.5" />
-					Unpin
-				</ContextMenuItem>
-			</ContextMenuContent>
+			{open && (
+				<PinMenuBody
+					pin={pin}
+					isFirst={index === 0}
+					isLast={index >= siblings.length - 1}
+					otherSections={otherSections}
+					handlers={{
+						'rail.pin-open': () => onOpen(pin),
+						'rail.pin-move-up': () => void moveBy(-1),
+						'rail.pin-move-down': () => void moveBy(1),
+						'rail.pin-no-section': () => void moveTo(null),
+						'rail.unpin': () => void removePin(pin.id),
+					}}
+					onMoveTo={(sectionId) => void moveTo(sectionId)}
+				/>
+			)}
 		</ContextMenu>
 	);
 }
+
+const PIN_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'rail.pin-open': <PinGlyph className="h-3.5 w-3.5" />,
+	'rail.pin-move-up': <ArrowUp className="h-3.5 w-3.5" />,
+	'rail.pin-move-down': <ArrowDown className="h-3.5 w-3.5" />,
+	'rail.pin-no-section': <SquareDashed className="h-3.5 w-3.5" />,
+	'rail.unpin': <PinOff className="h-3.5 w-3.5" />,
+};
+
+function PinMenuBody({
+	pin,
+	isFirst,
+	isLast,
+	otherSections,
+	handlers,
+	onMoveTo,
+}: {
+	pin: Pin;
+	isFirst: boolean;
+	isLast: boolean;
+	otherSections: readonly Section[];
+	handlers: Record<string, () => void>;
+	onMoveTo: (sectionId: string) => void;
+}) {
+	const railMenu = useEffectiveMenu('rail');
+	const rows = resolveMenuItems(railMenu, {
+		conditions: { 'sectioned-pin': pin.sectionId !== null },
+		disabled: (id) => (id === 'rail.pin-move-up' ? isFirst : id === 'rail.pin-move-down' ? isLast : false),
+		labels: { 'rail.pin-open': `Open ${pin.label}` },
+		icons: PIN_MENU_ICONS,
+		handlers,
+	});
+	if (rows.length === 0) return null;
+	return (
+		<ContextMenuContent>
+			{rows.map((row, i) => {
+				if (row.kind === 'separator') {
+					// biome-ignore lint/suspicious/noArrayIndexKey: separators are unkeyed structural markers
+					return <ContextMenuSeparator key={`sep-${i}`} />;
+				}
+				if (row.display === 'submenu' && row.id === 'rail.pin-move-to-section') {
+					// `rail.pin-move-to-section` (§1.3): a flat, header-divided
+					// list of the other sections — not a nested flyout.
+					return otherSections.length > 0 ? (
+						<Fragment key={row.id}>
+							<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+								Move to
+							</div>
+							{otherSections.map((s) => (
+								<ContextMenuItem key={s.id} data-action={row.dataAction} onSelect={() => onMoveTo(s.id)}>
+									<SquareDashed className="h-3.5 w-3.5" />
+									{s.label}
+								</ContextMenuItem>
+							))}
+						</Fragment>
+					) : null;
+				}
+				return (
+					<ContextMenuItem
+						key={row.id}
+						data-action={row.dataAction}
+						disabled={row.disabled}
+						title={row.disabledReason}
+						variant={row.danger ? 'destructive' : undefined}
+						onSelect={row.run}
+					>
+						{row.icon}
+						{row.label}
+					</ContextMenuItem>
+				);
+			})}
+		</ContextMenuContent>
+	);
+}
+
+const RAIL_SECTION_MENU_ICONS: Readonly<Record<string, React.ReactNode>> = {
+	'rail.section-rename': <Pencil className="h-3.5 w-3.5" />,
+	'rail.section-manage': <Settings2 className="h-3.5 w-3.5" />,
+	'rail.section-delete': <Trash2 className="h-3.5 w-3.5" />,
+};
 
 interface SectionContextWrapProps {
 	section: Section;
@@ -867,37 +793,26 @@ function SectionContextWrap({ section, pinCount, children }: SectionContextWrapP
 
 	return (
 		<>
-			<ContextMenu>
-				<ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-				<ContextMenuContent>
+			<EffectiveContextMenu
+				menuId="rail-section"
+				header={
 					<div className="px-2 pt-1 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
 						Section · {section.label}
 					</div>
-					<ContextMenuItem
-						onSelect={() => {
-							setDraftLabel(section.label);
-							setRenameError(null);
-							setRenameOpen(true);
-						}}
-					>
-						<Pencil className="h-3.5 w-3.5" />
-						Rename…
-					</ContextMenuItem>
-					<ContextMenuItem
-						onSelect={() => {
-							usePaneStore.getState().navigateFocused('/settings/activity-bar');
-						}}
-					>
-						<Settings2 className="h-3.5 w-3.5" />
-						Manage in Settings
-					</ContextMenuItem>
-					<ContextMenuSeparator />
-					<ContextMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
-						<Trash2 className="h-3.5 w-3.5" />
-						Delete section…
-					</ContextMenuItem>
-				</ContextMenuContent>
-			</ContextMenu>
+				}
+				icons={RAIL_SECTION_MENU_ICONS}
+				handlers={{
+					'rail.section-rename': () => {
+						setDraftLabel(section.label);
+						setRenameError(null);
+						setRenameOpen(true);
+					},
+					'rail.section-manage': () => usePaneStore.getState().navigateFocused('/settings/activity-bar'),
+					'rail.section-delete': () => setConfirmDelete(true),
+				}}
+			>
+				{children}
+			</EffectiveContextMenu>
 
 			<Dialog open={renameOpen} onOpenChange={setRenameOpen}>
 				<DialogContent className="sm:max-w-sm">

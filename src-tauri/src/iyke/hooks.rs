@@ -88,6 +88,15 @@ fn get_held_requests() -> &'static Arc<Mutex<HashMap<String, HeldRequest>>> {
     HELD_REQUESTS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
+/// WP-40: in-terminal `PermissionRequest` prompts still waiting, so a
+/// `PostToolUse` resolves only the row of the tool call it was asked about.
+static TERMINAL_PROMPTS: OnceLock<Mutex<crate::notifications::producers::TerminalPrompts>> =
+    OnceLock::new();
+
+fn terminal_prompts() -> &'static Mutex<crate::notifications::producers::TerminalPrompts> {
+    TERMINAL_PROMPTS.get_or_init(Default::default)
+}
+
 fn hold_setting_key(terminal_id: &str) -> String {
     format!("permissions.hold_terminal_{terminal_id}")
 }
@@ -115,6 +124,21 @@ async fn pre_tool_use_gate_enabled(app: &AppHandle, terminal_id: Option<&str>) -
         .flatten();
 
     matches!(row.map(|r| r.0).as_deref(), Some("true") | Some("1"))
+}
+
+/// The app's `PaDb`, if managed yet.
+fn app_db(app: &AppHandle) -> Option<Arc<PaDb>> {
+    app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone())
+}
+
+/// WP-40 `permission` producer for the hooks bus. Best-effort.
+async fn record_permission_notification(
+    app: &AppHandle,
+    new: crate::notifications::NewNotification,
+) {
+    if let Some(db) = app_db(app) {
+        crate::notifications::record_with_db(&db, new).await;
+    }
 }
 
 fn mint_request_id() -> String {
@@ -169,6 +193,25 @@ pub async fn post_hook_event(
 
         let _ = app.emit("hooks://event", &payload);
 
+        // WP-40: the held gate is a permission ask — record it so the
+        // notification centre can offer Allow / Deny while it is held.
+        // Spawned, not awaited: the hold below must start now. Its bound sits
+        // only 5 s under curl's --max-time, and a busy DB write (busy_timeout
+        // is 5 s) must never eat that margin.
+        {
+            let app = app.clone();
+            let new = crate::notifications::producers::permission_from_hook_gate(
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+                payload.ikenga_terminal_id.as_deref(),
+                payload.cwd.as_deref(),
+                &request_id,
+            );
+            tauri::async_runtime::spawn(async move {
+                record_permission_notification(&app, new).await;
+            });
+        }
+
         // Hold the hook response open until the human decides, bounded by
         // `GATE_HOLD_SECS`. That bound is not arbitrary: it must stay strictly
         // below the `curl --max-time` and the Claude Code hook timeout that
@@ -181,6 +224,17 @@ pub async fn post_hook_event(
         let _ = get_held_requests()
             .lock()
             .map(|mut map| map.remove(&request_id));
+
+        // WP-40: answered or timed out, the ask is over — resolve its row
+        // (`resolvedAt`, and read) so the centre does not keep offering a
+        // dead Allow / Deny. Spawned for
+        // the same reason as the record above: never delay the hook reply.
+        if let Some(db) = app_db(&app) {
+            let key = crate::notifications::producers::hook_gate_key(&request_id);
+            tauri::async_runtime::spawn(async move {
+                crate::notifications::resolve_key_with_db(&db, &key).await;
+            });
+        }
 
         let allowed = match decision {
             Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
@@ -228,6 +282,78 @@ pub async fn post_hook_event(
     }
 
     let _ = app.emit("hooks://event", &payload);
+
+    // WP-40: Claude Code's own permission prompt in an Ikenga terminal. The
+    // answer happens in the terminal; the row points there.
+    // Spawned so the hook reply is never held on a DB write.
+    if payload.hook_event_name.as_deref() == Some("PermissionRequest") {
+        if let Ok(mut prompts) = terminal_prompts().lock() {
+            prompts.requested(
+                &crate::notifications::producers::terminal_permission_key(
+                    payload.ikenga_terminal_id.as_deref(),
+                    payload.session_id.as_deref(),
+                ),
+                payload.tool_use_id.as_deref(),
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+            );
+        }
+        let app = app.clone();
+        let new = crate::notifications::producers::permission_from_hook_request(
+            payload.tool_name.as_deref(),
+            payload.tool_input.as_ref(),
+            payload.ikenga_terminal_id.as_deref(),
+            payload.session_id.as_deref(),
+            payload.cwd.as_deref(),
+        );
+        tauri::async_runtime::spawn(async move {
+            record_permission_notification(&app, new).await;
+        });
+    }
+
+    // WP-40: resolve a terminal's pending `PermissionRequest` row once the
+    // prompt is over — on the `PostToolUse` / `PostToolUseFailure` of the
+    // very tool call it asked about (same tool + input fingerprint:
+    // `PermissionRequest` carries no `tool_use_id`; a parallel call finishing
+    // in the same terminal does not count), or on `Stop` / `SessionEnd` / the
+    // terminal's next `UserPromptSubmit`, none of which Claude can reach while
+    // a prompt is up. A denied prompt never gets its `PostToolUse`; the
+    // turn's `Stop` (else the next prompt) resolves it. All of these events
+    // are registered in `hook_settings::HOOK_EVENTS`. No-op when nothing is
+    // pending. Spawned, as above.
+    let event = payload.hook_event_name.as_deref().unwrap_or("");
+    let finishes_tool = crate::notifications::producers::finishes_terminal_tool(event);
+    let resolve_keys = if finishes_tool
+        || crate::notifications::producers::ends_terminal_permissions(event)
+    {
+        let keys = crate::notifications::producers::terminal_permission_keys(
+            payload.ikenga_terminal_id.as_deref(),
+            payload.session_id.as_deref(),
+        );
+        match terminal_prompts().lock() {
+            Ok(mut prompts) if finishes_tool => prompts.tool_finished(
+                &keys,
+                payload.tool_use_id.as_deref(),
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+            ),
+            Ok(mut prompts) => prompts.ended(&keys),
+            // Poisoned: only an end event may still resolve, blindly.
+            Err(_) if !finishes_tool => keys,
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    if !resolve_keys.is_empty() {
+        if let Some(db) = app_db(&app) {
+            tauri::async_runtime::spawn(async move {
+                for key in resolve_keys {
+                    crate::notifications::resolve_key_with_db(&db, &key).await;
+                }
+            });
+        }
+    }
 
     (
         StatusCode::OK,

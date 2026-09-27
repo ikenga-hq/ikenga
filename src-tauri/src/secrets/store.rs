@@ -1,34 +1,92 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use super::unlock::UnlockError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMeta {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreErrorKind {
+    Locked,
+    Unavailable,
+    Invalid,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
+    kind: StoreErrorKind,
     message: String,
     committed: bool,
 }
 
 impl StoreError {
     pub fn uncommitted(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            committed: false,
-        }
+        Self::with_kind(StoreErrorKind::Unknown, message, false)
     }
 
     pub fn committed(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            committed: true,
+        Self::with_kind(StoreErrorKind::Unknown, message, true)
+    }
+
+    pub fn locked() -> Self {
+        Self::with_kind(StoreErrorKind::Locked, "secret store is locked", false)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::with_kind(StoreErrorKind::Unavailable, message, false)
+    }
+
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self::with_kind(StoreErrorKind::Invalid, message, false)
+    }
+
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self::uncommitted(message)
+    }
+
+    pub fn kind(&self) -> StoreErrorKind {
+        self.kind
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self.kind {
+            StoreErrorKind::Locked => "locked",
+            StoreErrorKind::Unavailable => "unavailable",
+            StoreErrorKind::Invalid => "invalid",
+            StoreErrorKind::Unknown => "unknown",
         }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.kind == StoreErrorKind::Locked
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.kind == StoreErrorKind::Unavailable
+    }
+
+    pub fn is_invalid(&self) -> bool {
+        self.kind == StoreErrorKind::Invalid
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.kind == StoreErrorKind::Unknown
     }
 
     pub fn is_committed(&self) -> bool {
         self.committed
+    }
+
+    fn with_kind(kind: StoreErrorKind, message: impl Into<String>, committed: bool) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            committed,
+        }
     }
 }
 
@@ -43,6 +101,20 @@ impl std::error::Error for StoreError {}
 impl From<StoreError> for String {
     fn from(error: StoreError) -> Self {
         error.message
+    }
+}
+
+impl From<UnlockError> for StoreError {
+    fn from(error: UnlockError) -> Self {
+        match error {
+            UnlockError::Locked | UnlockError::NotConfigured => Self::locked(),
+            UnlockError::EnvelopeMissing => {
+                Self::unavailable(UnlockError::EnvelopeMissing.to_string())
+            }
+            UnlockError::WrongPassphrase => Self::unknown("wrong passphrase"),
+            UnlockError::InvalidPassphrase => Self::unavailable("passphrase is invalid"),
+            other => Self::unknown(other.to_string()),
+        }
     }
 }
 
@@ -84,6 +156,23 @@ pub trait SecretsStore: Send + Sync {
 
     fn probe(&self) -> Result<(), StoreError>;
 
+    /// Bring every stored value up to the store's at-rest format. For
+    /// `EncryptedStore` with a configured passphrase this encrypts any
+    /// plaintext value left from before the passphrase was set; plain stores
+    /// have nothing to do. Deliberately has no default body: callers reach it
+    /// through `&dyn SecretsStore`, so a wrapper that forgot to override it
+    /// would silently skip the migration.
+    fn prepare_encryption(&self) -> Result<(), StoreError>;
+
+    /// Report whether the stored data itself shows that a passphrase was
+    /// configured (values in the encrypted at-rest format), latching the
+    /// sticky "configured" state when it does. Run before a first
+    /// `set_passphrase` so a missing envelope can never lead to a fresh DEK
+    /// over existing ciphertext. Plain stores hold no such format and return
+    /// `Ok(false)`. No default body, for the same reason as
+    /// `prepare_encryption`.
+    fn detect_configuration(&self) -> Result<bool, StoreError>;
+
     fn backend_label(&self) -> &'static str;
 
     fn diagnostics(&self) -> Vec<String> {
@@ -104,49 +193,43 @@ impl UnavailableSecretStore {
             reason: reason.into(),
         }
     }
+
+    fn error(&self) -> StoreError {
+        StoreError::unavailable(format!("secret store unavailable: {}", self.reason))
+    }
 }
 
 impl SecretsStore for UnavailableSecretStore {
     fn get(&self, _name: &str) -> Result<Option<String>, StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
     }
 
     fn set(&self, _name: &str, _value: &str) -> Result<(), StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
     }
 
     fn delete(&self, _name: &str) -> Result<(), StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
     }
 
     fn list_meta(&self) -> Result<Vec<SecretMeta>, StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
     }
 
     fn replace_all(&self, _values: &BTreeMap<String, String>) -> Result<usize, StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
     }
 
     fn probe(&self) -> Result<(), StoreError> {
-        Err(StoreError::uncommitted(format!(
-            "secret store unavailable: {}",
-            self.reason
-        )))
+        Err(self.error())
+    }
+
+    fn prepare_encryption(&self) -> Result<(), StoreError> {
+        Err(self.error())
+    }
+
+    fn detect_configuration(&self) -> Result<bool, StoreError> {
+        Err(self.error())
     }
 
     fn backend_label(&self) -> &'static str {
@@ -165,12 +248,40 @@ mod tests {
     #[test]
     fn unavailable_store_fails_all_access_paths() {
         let store = UnavailableSecretStore::new("migration failed");
-        assert!(store.get("workspace::TOKEN").is_err());
-        assert!(store.set("workspace::TOKEN", "value").is_err());
-        assert!(store.delete("workspace::TOKEN").is_err());
-        assert!(store.list_meta().is_err());
-        assert!(store.replace_all(&BTreeMap::new()).is_err());
-        assert!(store.probe().is_err());
+        assert_eq!(
+            store.get("workspace::TOKEN").unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.set("workspace::TOKEN", "value").unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.delete("workspace::TOKEN").unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.list_meta().unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.replace_all(&BTreeMap::new()).unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.probe().unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            store.detect_configuration().unwrap_err().kind(),
+            StoreErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn envelope_missing_maps_to_unavailable() {
+        let error: StoreError = UnlockError::EnvelopeMissing.into();
+        assert_eq!(error.kind(), StoreErrorKind::Unavailable);
     }
 
     #[test]

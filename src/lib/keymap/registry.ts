@@ -3,38 +3,129 @@
 // palette, pane chrome, the native menu, and (later) the Shortcuts view and
 // the Keys editor — reads through here instead of hard-coding a label.
 //
-// Phase 1 ships defaults only (`DEFAULT_KEYMAP`); user (`~/.ikenga/keybindings.json`)
-// and project (`<project>/.ikenga/keybindings.json`) overrides are Phase 6.
-// `getKeymap()` is already the seam a later phase merges onto — callers never
-// read `DEFAULT_KEYMAP` directly.
+// Keymap v2 (WP-49, G-ACTIONS §2–§5): `when` is a DEC-62 expression
+// (`when.ts`) evaluated against the context-key service (`context-keys.ts`);
+// `conflicts()` follows DEC-59 (normalized-`when` comparison, clash vs
+// precedence, OS scope as its own space); chords are handled by `chord.ts`.
+// `getKeymap()` returns the **effective keymap** (WP-52, G-ACTIONS §2.2):
+// defaults < granted package requests < personal < trusted project rules,
+// negative rules applied per platform. The effective model
+// (`src/lib/actions/store.ts`) computes it and publishes it here with
+// `setEffectiveKeymap()`; until the model has loaded (and in tests that never
+// start it) it is the defaults. Callers never read `DEFAULT_KEYMAP` directly.
 
-import { useEffect } from 'react';
-import { DEFAULT_KEYMAP, type KeymapEntry } from './defaults';
-import { eventMatchesCombo, formatKeyLabel, isMacPlatform, resolveCombo } from './platform';
-import { evaluateWhen, type WhenClause } from './when';
+import { useEffect, useRef } from 'react';
+import { type ContextKeys, getContextKeys, getEvalOptions } from './context-keys';
+import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapScope, type KeymapSource } from './defaults';
+// WP-55: `useKey` registers in the one dispatcher's command table instead of
+// listening for `keydown` itself (Round 42 hand-off 2) — see `useKey`'s own
+// doc comment. `dispatcher.ts` imports back from this module (for
+// `getKeymap` / `resolveKeypress` / …), used only inside its functions and
+// never at module-eval time, so this import cycle is safe (ESM live bindings).
+import { type CommandInvocation, registerCommand, runCommand } from './commands';
+import { installKeyDispatcher } from './dispatcher';
+import {
+	canonicalizeKeySequence,
+	eventMatchesCombo,
+	formatKeyLabel,
+	isMacPlatform,
+	resolveKeySequence,
+} from './platform';
+import { evaluateWhen, normalizeWhen, whenSpecificity } from './when';
 
-export type { KeymapEntry } from './defaults';
+export type { KeymapEntry, KeymapRuleOrigin, KeymapScope, KeymapSource } from './defaults';
 export type { WhenClause } from './when';
 export { isTypingTarget } from './when';
 
-/** The active keymap. Phase 1: defaults only — the merge point for Phase 6's
- *  user/project overrides. */
+let effectiveKeymap: KeymapEntry[] | null = null;
+const keymapListeners = new Set<() => void>();
+
+/**
+ * The active keymap: the effective merge of every layer (G-ACTIONS §2.2),
+ * in merge order (default, package, personal, project — the order §2.3's
+ * "latest in merge order" tie-break reads). Entries carry `platformOnly`
+ * narrowed where a negative rule removed a binding on one platform only, so
+ * `entriesForPlatform()` still yields each platform's effective list. Held
+ * project rules (DEC-65) are never in it. Defaults until the effective model
+ * publishes a merge.
+ */
 export function getKeymap(): KeymapEntry[] {
-	return DEFAULT_KEYMAP;
+	return effectiveKeymap ?? DEFAULT_KEYMAP;
 }
 
 /**
- * Looks up `command`'s registry entry. Some commands (`terminal.clear`) have
- * two entries gated by `platformOnly` because the real binding differs by
- * platform, not just by how `mod` resolves — so this prefers the entry that
- * matches the caller's platform (`opts.mac`, defaulting to the live
- * platform) and only falls back to the first entry for a command with no
+ * Publishes the effective keymap (called only by the effective model,
+ * `src/lib/actions/store.ts`); `null` reverts to the defaults. Notifies
+ * `subscribeKeymap` listeners.
+ */
+export function setEffectiveKeymap(entries: KeymapEntry[] | null): void {
+	effectiveKeymap = entries;
+	for (const listener of [...keymapListeners]) {
+		try {
+			listener();
+		} catch (err) {
+			console.warn('[keymap] keymap listener failed:', err);
+		}
+	}
+}
+
+/** Called after every `setEffectiveKeymap()`. Returns an unsubscribe. */
+export function subscribeKeymap(listener: () => void): () => void {
+	keymapListeners.add(listener);
+	return () => {
+		keymapListeners.delete(listener);
+	};
+}
+
+export type KeymapPlatform = 'mac' | 'other';
+
+function livePlatform(): KeymapPlatform {
+	return isMacPlatform() ? 'mac' : 'other';
+}
+
+/** The entries that apply on `platform` (G-ACTIONS §2.2 step 1). */
+export function entriesForPlatform(entries: readonly KeymapEntry[], platform: KeymapPlatform): KeymapEntry[] {
+	return entries.filter((e) => !e.platformOnly || e.platformOnly === platform);
+}
+
+/**
+ * Hosted commands (§4.6): their keys live in the registry (rebindable,
+ * visible to `conflicts()`), but their owner's own listener fires them — the
+ * frame dispatcher and `useKey()` never do. `terminal.*` is hosted by the
+ * xterm hook (DEC-56); the three Companion dispatch keys by the dispatch
+ * input.
+ */
+export const HOSTED_COMMANDS: ReadonlySet<string> = new Set([
+	'companion.send',
+	'companion.new-run',
+	'companion.persistent-run',
+]);
+
+export function isHostedCommand(command: string): boolean {
+	return command.startsWith('terminal.') || HOSTED_COMMANDS.has(command);
+}
+
+/**
+ * Looks up `command`'s registry entry. Some commands (`terminal.clear`,
+ * `os.summon`) have one entry per platform family because the real binding
+ * differs by platform, not just by how `mod` resolves — so this prefers the
+ * entry that matches the caller's platform (`opts.mac`, defaulting to the
+ * live platform), then (when `opts.scope` is given) the entry in that scope,
+ * and only falls back to the first entry for a command with no
  * platform-matching one.
  */
-export function findEntry(command: string, opts?: { mac?: boolean }): KeymapEntry | undefined {
+export function findEntry(
+	command: string,
+	opts?: { mac?: boolean; scope?: KeymapScope; entries?: readonly KeymapEntry[] }
+): KeymapEntry | undefined {
 	const mac = opts?.mac ?? isMacPlatform();
-	const platform = mac ? 'mac' : 'other';
-	const candidates = getKeymap().filter((e) => e.command === command);
+	const platform: KeymapPlatform = mac ? 'mac' : 'other';
+	let candidates = (opts?.entries ?? getKeymap()).filter((e) => e.command === command);
+	const scope = opts?.scope;
+	if (scope) {
+		const scoped = candidates.filter((e) => (e.scope ?? 'app') === scope);
+		if (scoped.length > 0) candidates = scoped;
+	}
 	return candidates.find((e) => !e.platformOnly || e.platformOnly === platform) ?? candidates[0];
 }
 
@@ -47,119 +138,254 @@ export function labelFor(command: string, opts?: { mac?: boolean }): string {
 	return formatKeyLabel(entry.key, opts);
 }
 
-export interface KeymapConflict {
+// ─── Conflicts (DEC-59, G-ACTIONS §5) ──────────────────────────────────────
+
+/** One same-key pair. `key` is the platform-resolved sequence; `whenA` /
+ *  `whenB` are the **normalized** `when`s (`''` = always). */
+export interface KeymapConflictPair {
 	key: string;
-	when: string;
-	commands: string[];
+	a: KeymapEntry;
+	b: KeymapEntry;
+	whenA: string;
+	whenB: string;
+	/** `when` — same key, different normalized `when` (resolved by layer,
+	 *  then specificity, §2.3); `os-over-app` — an OS-wide key also bound
+	 *  in-app, the OS rule (`a`) wins because the OS captures the key first;
+	 *  `clash` — same key, same normalized `when`, same scope. */
+	kind: 'clash' | 'when' | 'os-over-app';
+}
+
+export interface KeymapConflicts {
+	/** Same key + same normalized `when` + same scope, different commands.
+	 *  Reported (Keys tab conflict state), still resolved deterministically. */
+	clashes: KeymapConflictPair[];
+	/** Same key, different normalized `when` (or OS vs app). Shown, never an
+	 *  error. */
+	precedence: KeymapConflictPair[];
+}
+
+/** `shift+/` and `shift+=` name the same physical key as the shipped `?` /
+ *  `plus` spellings (§3.1's one exception — `strokesFromEvent` matches both
+ *  spellings to one event). `conflicts()` canonicalizes a resolved stroke to
+ *  that shared spelling before grouping by key, so `?` vs `shift+/` (and
+ *  `mod+plus` vs `mod+shift+=`) still group together instead of silently
+ *  missing a same-`when` clash. */
+function canonicalizeConflictStroke(stroke: string): string {
+	const parts = stroke.split('+');
+	const key = parts[parts.length - 1];
+	const mods = parts.slice(0, -1);
+	if (!mods.includes('shift')) return stroke;
+	const rest = mods.filter((m) => m !== 'shift');
+	if (key === '/') return [...rest, '?'].join('+');
+	if (key === '=') return [...rest, 'plus'].join('+');
+	return stroke;
+}
+
+function canonicalizeConflictKey(resolvedKeySequence: string): string {
+	return resolvedKeySequence.split(' ').map(canonicalizeConflictStroke).join(' ');
 }
 
 /**
- * Two `when` clauses "overlap" when a single keypress can satisfy both —
- * which is what makes two same-key bindings a real clash instead of
- * precedence. `global` always evaluates true, so it overlaps every clause,
- * including another `global`. The one clause pair that's genuinely mutually
- * exclusive is `not-input` / `terminal-focus`: the terminal's own input
- * surface is itself a typing target, so whichever one applies, the other
- * cannot (§6A.5's documented ⌘K palette-vs-terminal-clear precedence, the
- * motivating example). Any other same-key pairing (including same-clause
- * pairs) overlaps and is a candidate clash.
+ * The comparison form of a key sequence on one platform: canonical modifier
+ * order, `mod` resolved, and the §3.1 `?` / `plus` spellings folded — the
+ * key `conflicts()` groups by, and the one the effective merge matches
+ * negative rules and package key holds on (G-ACTIONS §1.5, §7.4).
  */
-function whenClausesOverlap(a: WhenClause, b: WhenClause): boolean {
-	if (a === b) return true;
-	const pair = [a, b].sort().join('|');
-	return pair !== 'not-input|terminal-focus';
+export function comparableKeySequence(seq: string, platform: KeymapPlatform): string {
+	return canonicalizeConflictKey(resolveKeySequence(canonicalizeKeySequence(seq), platform === 'mac'));
 }
 
-/** True when either entry lists the other in `knownOverlap` — a documented,
- *  shipped parallel-fire `conflicts()` should not report (see `defaults.ts`
- *  for what's declared and why). */
-function isDocumentedOverlap(a: KeymapEntry, b: KeymapEntry): boolean {
-	return Boolean(a.knownOverlap?.includes(b.command) || b.knownOverlap?.includes(a.command));
+function safeNormalize(when: string | undefined): string {
+	try {
+		return normalizeWhen(when);
+	} catch {
+		// An unparsable `when` never fires (`evaluateWhen`); it is compared by
+		// its raw text so two identical broken rules still read as a clash.
+		return `\u27e8invalid\u27e9 ${when ?? ''}`;
+	}
 }
 
 /**
- * A clash is two entries that resolve to the same physical key combo on a
- * given platform, with `when` clauses that overlap (see above), and that
- * aren't a documented parallel-fire pair (`knownOverlap`). Bindings tagged
- * `platformOnly` are only considered on that platform (the native menu only
- * installs on macOS; `terminal.clear`'s non-mac chord only applies there).
+ * DEC-59's one conflict rule, per platform:
+ * - a **clash** is two positive rules with the same platform-resolved key
+ *   sequence and the same **normalized** `when` (never string equality of
+ *   what was typed), bound to different commands, in the same scope; layer
+ *   does not matter for detection;
+ * - the same key with a different normalized `when` is **precedence**;
+ * - OS scope is its own space: OS rules clash only with OS rules (they carry
+ *   no `when`), and an OS key also bound in-app is precedence with the OS
+ *   rule winning;
+ * - a chord and a single stroke sharing a first stroke are neither (they are
+ *   different sequences).
  *
- * `opts.entries` overrides the keymap `conflicts()` groups — the seam
- * `registry.test.ts` uses to prove the detector against a synthetic clash
- * without mutating the real `DEFAULT_KEYMAP` export.
+ * `opts.entries` overrides the keymap it reads — the seam the tests (and the
+ * Keys tab, over the effective keymap) use.
  */
 export function conflicts(opts?: {
-	platform?: 'mac' | 'other';
-	entries?: KeymapEntry[];
-}): KeymapConflict[] {
-	const platform = opts?.platform ?? (isMacPlatform() ? 'mac' : 'other');
+	platform?: KeymapPlatform;
+	entries?: readonly KeymapEntry[];
+}): KeymapConflicts {
+	const platform = opts?.platform ?? livePlatform();
 	const mac = platform === 'mac';
-	const relevant = (opts?.entries ?? getKeymap()).filter(
-		(e) => !e.platformOnly || e.platformOnly === platform
-	);
+	const relevant = entriesForPlatform(opts?.entries ?? getKeymap(), platform);
 
-	const byKey = new Map<string, KeymapEntry[]>();
+	const byKey = new Map<string, Array<{ entry: KeymapEntry; when: string; scope: KeymapScope }>>();
 	for (const entry of relevant) {
-		const combo = resolveCombo(entry.key, mac);
-		const list = byKey.get(combo);
-		if (list) list.push(entry);
-		else byKey.set(combo, [entry]);
+		const key = canonicalizeConflictKey(resolveKeySequence(entry.key, mac));
+		const scope = entry.scope ?? 'app';
+		// OS rules ignore focus: their `when` is always TRUE (§6, `E_OS_WHEN`).
+		const when = scope === 'os' ? '' : safeNormalize(entry.when);
+		const list = byKey.get(key);
+		const row = { entry, when, scope };
+		if (list) list.push(row);
+		else byKey.set(key, [row]);
 	}
 
-	const out: KeymapConflict[] = [];
-	for (const [combo, entries] of byKey) {
-		if (entries.length <= 1) continue;
-
-		// Union-find over entries that actually clash — two entries with the
-		// same key can share a group transitively even if not every pair in
-		// the group clashes directly, mirroring how a real double-fire reads.
-		const parent = entries.map((_, i) => i);
-		function find(i: number): number {
-			while (parent[i] !== i) {
-				parent[i] = parent[parent[i]];
-				i = parent[i];
+	const out: KeymapConflicts = { clashes: [], precedence: [] };
+	for (const [key, rows] of byKey) {
+		for (let i = 0; i < rows.length; i++) {
+			for (let j = i + 1; j < rows.length; j++) {
+				let a = rows[i];
+				let b = rows[j];
+				if (a.entry.command === b.entry.command) continue;
+				if (a.scope !== b.scope) {
+					if (a.scope !== 'os') [a, b] = [b, a];
+					out.precedence.push({ key, a: a.entry, b: b.entry, whenA: a.when, whenB: b.when, kind: 'os-over-app' });
+					continue;
+				}
+				const pair = { key, a: a.entry, b: b.entry, whenA: a.when, whenB: b.when };
+				if (a.when === b.when) out.clashes.push({ ...pair, kind: 'clash' });
+				else out.precedence.push({ ...pair, kind: 'when' });
 			}
-			return i;
-		}
-		function union(i: number, j: number) {
-			const ri = find(i);
-			const rj = find(j);
-			if (ri !== rj) parent[ri] = rj;
-		}
-		for (let i = 0; i < entries.length; i++) {
-			for (let j = i + 1; j < entries.length; j++) {
-				if (!whenClausesOverlap(entries[i].when, entries[j].when)) continue;
-				if (isDocumentedOverlap(entries[i], entries[j])) continue;
-				union(i, j);
-			}
-		}
-
-		const groups = new Map<number, KeymapEntry[]>();
-		entries.forEach((e, i) => {
-			const root = find(i);
-			const list = groups.get(root);
-			if (list) list.push(e);
-			else groups.set(root, [e]);
-		});
-		for (const group of groups.values()) {
-			if (group.length <= 1) continue;
-			out.push({
-				key: combo,
-				when: Array.from(new Set(group.map((e) => e.when))).join('|'),
-				commands: group.map((e) => e.command),
-			});
 		}
 	}
 	return out;
 }
 
+// ─── Keypress resolution (G-ACTIONS §2.3, DEC-58) ─────────────────────────
+
+/** An entry of the effective keymap (`getKeymap()`): same shape as a
+ *  `KeymapEntry`, named for G-ACTIONS-API. */
+export type EffectiveKeymapEntry = KeymapEntry;
+
+/** §2.3: higher layer wins. */
+export const LAYER_RANK: Readonly<Record<KeymapSource, number>> = {
+	default: 0,
+	package: 1,
+	personal: 2,
+	project: 3,
+};
+
+function safeSpecificity(when: string | undefined | null): number {
+	try {
+		return whenSpecificity(when);
+	} catch {
+		return 0;
+	}
+}
+
 /**
- * Fire `handler` when `command`'s bound key is pressed and its `when` clause
- * holds. Centralises the guard every frame shortcut needs (D3): a clause of
- * `not-input` never fires while an `input` / `textarea` / `contenteditable`
- * holds focus. No-ops (and warns) for a command with no registry entry, and
- * no-ops silently for a `terminal-focus` command — that clause is
- * descriptive only (see `when.ts`); it never gets a live listener here.
+ * §2.3 winner among the rules that match a keypress (key sequence matched,
+ * `when` true now, hosted commands already excluded): highest layer, then
+ * the most specific `when`, then the latest in merge order. `keymap` is the
+ * effective list the candidates come from (merge order = index). Exactly
+ * one wins; nothing double-fires (DEC-58).
+ */
+export function resolveKeypressWinner(
+	candidates: readonly KeymapEntry[],
+	keymap: readonly KeymapEntry[]
+): KeymapEntry | null {
+	let best: KeymapEntry | null = null;
+	let bestRank: [number, number, number] = [-1, -1, -1];
+	for (const entry of candidates) {
+		const rank: [number, number, number] = [
+			LAYER_RANK[entry.source] ?? 0,
+			safeSpecificity(entry.when),
+			keymap.indexOf(entry),
+		];
+		if (
+			!best ||
+			rank[0] > bestRank[0] ||
+			(rank[0] === bestRank[0] && rank[1] > bestRank[1]) ||
+			(rank[0] === bestRank[0] && rank[1] === bestRank[1] && rank[2] > bestRank[2])
+		) {
+			best = entry;
+			bestRank = rank;
+		}
+	}
+	return best;
+}
+
+export interface KeypressResolution {
+	/** The one command that fires (§2.3), or null. */
+	winner: EffectiveKeymapEntry | null;
+	/** Every in-app, non-hosted binding matching the key whose `when` holds. */
+	candidates: EffectiveKeymapEntry[];
+}
+
+function isKeyboardEventLike(input: KeyboardEvent | { key: string }): input is KeyboardEvent {
+	return 'ctrlKey' in input || 'metaKey' in input;
+}
+
+/**
+ * The one "winner for a key + context" query (G-ACTIONS §2.3). `input` is a
+ * keydown (matched like the dispatcher: single strokes only, IME / Dead-key
+ * events match nothing) or a key string (`{ key: 'mod+b' }`, compared in
+ * the platform-resolved form; chords allowed). Candidates are the effective
+ * `scope: 'app'` entries on `platform` that match, are not hosted (§4.6)
+ * and whose `when` is true against `ctx` (default: the live context of the
+ * event's target). `entries` overrides the keymap (tests, previews).
+ */
+export function resolveKeypress(
+	input: KeyboardEvent | { key: string },
+	ctx?: ContextKeys,
+	platform?: KeymapPlatform,
+	entries?: readonly EffectiveKeymapEntry[]
+): KeypressResolution {
+	const p = platform ?? livePlatform();
+	const mac = p === 'mac';
+	const keymap = entries ?? getKeymap();
+	const event = isKeyboardEventLike(input) ? input : null;
+	const target = event ? null : comparableOrNull(input.key, p);
+	if (!event && target === null) return { winner: null, candidates: [] };
+	const context = ctx ?? getContextKeys(event?.target ?? null);
+	const evalOptions = getEvalOptions();
+	const candidates = entriesForPlatform(keymap, p).filter((entry) => {
+		if ((entry.scope ?? 'app') !== 'app' || isHostedCommand(entry.command)) return false;
+		const matches = event
+			? eventMatchesCombo(event, entry.key, mac)
+			: comparableOrNull(entry.key, p) === target;
+		return matches && evaluateWhen(entry.when, context, evalOptions);
+	});
+	return { winner: resolveKeypressWinner(candidates, keymap), candidates };
+}
+
+function comparableOrNull(seq: string, platform: KeymapPlatform): string | null {
+	try {
+		return comparableKeySequence(seq, platform);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Fire `handler` when `command`'s bound key is pressed and its `when` holds
+ * against the live context (`context-keys.ts`). No-ops (and warns) for a
+ * command with no registry entry, and no-ops silently for a hosted command
+ * (§4.6) — its owner fires it.
+ *
+ * WP-55 (Round 42 hand-off 2): this used to be its own `window.addEventListener`
+ * — a second firing path alongside the one key dispatcher (WP-54,
+ * `dispatcher.ts`), so an unbind or a rebind here could go stale independent
+ * of the registry. It now registers `command` in the command table
+ * (`commands.ts`) that the one dispatcher runs: the dispatcher resolves and
+ * dedupes every keydown (D3's `!inputFocus` guard, IME / Dead-key exclusion,
+ * and DEC-58 single fire all still apply, since they live in the dispatcher
+ * itself), and this only turns its `CommandInvocation` back into the plain
+ * `(e: KeyboardEvent) => void` shape callers already expect. An invocation
+ * with no keydown (a menu click, the palette, a chord timeout) is not this
+ * hook's to answer: it passes straight through to the registration beneath
+ * it — the command's real owner — so a `useKey` never shadows it.
  */
 export function useKey(
 	command: string,
@@ -167,26 +393,37 @@ export function useKey(
 	opts?: { enabled?: boolean }
 ): void {
 	const enabled = opts?.enabled ?? true;
+	const handlerRef = useRef(handler);
+	handlerRef.current = handler;
+	const hosted = isHostedCommand(command);
+	const known = getKeymap().some((e) => e.command === command) || DEFAULT_KEYMAP.some((e) => e.command === command);
+	const active = enabled && !hosted && known;
 	useEffect(() => {
-		if (!enabled) return;
-		const entry = findEntry(command);
-		if (!entry) {
-			console.warn(`[keymap] useKey: no registry entry for "${command}"`);
-			return;
+		if (enabled && !hosted && !known) console.warn(`[keymap] useKey: no registry entry for "${command}"`);
+	}, [command, enabled, hosted, known]);
+	useEffect(() => {
+		if (!active) return;
+		installKeyDispatcher();
+		let off = registerCommand(command, own);
+		function own(invocation: CommandInvocation): void {
+			if (invocation.event) {
+				handlerRef.current(invocation.event);
+				return;
+			}
+			// No keydown (a menu click, the palette, a chord timeout): this
+			// registration only answers keys, so it must not shadow the
+			// command's real owner. Step aside, let the command table reach
+			// the registration beneath (or the effective-action fallback),
+			// then take the top of the stack back.
+			off();
+			try {
+				runCommand(invocation);
+			} finally {
+				off = registerCommand(command, own);
+			}
 		}
-		if (entry.when === 'terminal-focus') return;
-		const mac = isMacPlatform();
-		function onKey(e: KeyboardEvent) {
-			if (!entry) return;
-			if (!eventMatchesCombo(e, entry.key, mac)) return;
-			if (!evaluateWhen(entry.when, e)) return;
-			e.preventDefault();
-			handler(e);
-		}
-		window.addEventListener('keydown', onKey);
-		return () => window.removeEventListener('keydown', onKey);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [command, handler, enabled]);
+		return () => off();
+	}, [command, active]);
 }
 
 /**

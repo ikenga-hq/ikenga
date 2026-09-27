@@ -133,6 +133,10 @@ pub struct VaultStatus {
     pub error: Option<String>,
     pub mode: String,
     pub writable: bool,
+    pub locked: bool,
+    pub configured: bool,
+    pub idle_timeout_secs: u64,
+    pub last_activity_unix_ms: Option<u64>,
 }
 
 /// The daemon's store is always readable — it is just process environment —
@@ -146,6 +150,10 @@ pub fn status() -> VaultStatus {
         error: None,
         mode: MODE_ENV.to_string(),
         writable: false,
+        locked: false,
+        configured: true,
+        idle_timeout_secs: 0,
+        last_activity_unix_ms: None,
     }
 }
 
@@ -214,9 +222,19 @@ mod tests {
     fn wire_shape_is_a_superset_of_the_desktop_contract() {
         let v = serde_json::to_value(status()).expect("serialize");
         let obj = v.as_object().expect("object");
-        for field in ["available", "keychain_backend", "error", "mode", "writable"] {
+        for field in [
+            "available",
+            "keychain_backend",
+            "error",
+            "mode",
+            "writable",
+            "locked",
+            "configured",
+            "idle_timeout_secs",
+            "last_activity_unix_ms",
+        ] {
             assert!(obj.contains_key(field), "missing field {field}");
         }
-        assert_eq!(obj.len(), 5);
+        assert_eq!(obj.len(), 9);
     }
 }

@@ -37,6 +37,14 @@ import type { OperatorIdentity } from '@ikenga/contract/host-context';
 import { AppBridge, PostMessageTransport } from '@modelcontextprotocol/ext-apps/app-bridge';
 import { useEffect, useRef, useState } from 'react';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
+import { usePkgLifecycle } from '@/lib/pkgs/lifecycle';
+import {
+	blockedInfoFromViolation,
+	HANDSHAKE_AFTER_LOAD_GRACE_MS,
+	HANDSHAKE_OVERLAY_TIMEOUT_MS,
+	isBlockingViolation,
+	type PkgBlockedInfo,
+} from '@/lib/pkg/pkg-view-state';
 import {
 	IFRAME_POOL_ENABLED,
 	type PoolRect,
@@ -74,6 +82,10 @@ import {
 	pkgPreviewManifest,
 	pkgSidecarCall,
 	pkgStudioRequestProjectAccess,
+	pkgSupervisorRestart,
+	type PkgTrustReview,
+	pkgTrustApprove,
+	pkgTrustListPending,
 	ptyWrite,
 	type SqlValue,
 	skillRosterRead,
@@ -87,6 +99,13 @@ import {
 } from '@/lib/transport/shims';
 import { usePaneScope } from '@/shell/panes/pane-scope';
 import { useTerminalStore } from '@/terminal/session-store';
+import {
+	PkgBlockedState,
+	PkgConsentState,
+	PkgCrashedState,
+	PkgLoadingState,
+	PkgSidecarDownStrip,
+} from './pkg-view-states';
 
 // Tauri event payload emitted by `Kernel::reload_pkg`. The FE only cares about
 // `pkg_id` for the host filter; `version` + `registries` are useful for debug
@@ -1166,6 +1185,34 @@ export function PkgIframeHostInner({
 	// re-runs the bridge effect because srcDoc is in its dep array. Net effect:
 	// the iframe remounts cleanly without us tearing down the React tree.
 	const [reloadKey, setReloadKey] = useState(0);
+	// ── WP-45 · D-08 pkg-view states ─────────────────────────────────────
+	// `handshakeDone` flips when the AppBridge fires `initialized` (the view
+	// answered `ui/initialize`) — drives the `pkg-loading` overlay's step
+	// list. `handshakeTimedOut` lets the overlay step aside after
+	// HANDSHAKE_OVERLAY_TIMEOUT_MS so a view that never initialises renders
+	// exactly as it did before (not a crash). `blocked` is set by the CSP
+	// listener (Step 2b); `pendingReview` by the consent probe on error.
+	const [handshakeDone, setHandshakeDone] = useState(false);
+	const [handshakeTimedOut, setHandshakeTimedOut] = useState(false);
+	const [blocked, setBlocked] = useState<PkgBlockedInfo | null>(null);
+	const [pendingReview, setPendingReview] = useState<PkgTrustReview | null>(null);
+	const [consentBusy, setConsentBusy] = useState(false);
+	const [consentError, setConsentError] = useState<string | null>(null);
+	const [sidecarRestarting, setSidecarRestarting] = useState(false);
+	// Ref guard so a double click on Allow can't send two approvals while
+	// the first is in flight (state lags a render behind).
+	const consentBusyRef = useRef(false);
+	// "Boot window closed" — the view initialised OR the loading overlay
+	// stepped aside (load grace / timeout). Readable from the CSP listener
+	// without re-subscribing it on every flip; a script violation only takes
+	// the view down while this is false (`isBlockingViolation`).
+	const handshakeDoneRef = useRef(false);
+	// Supervised-sidecar status (`pkg://lifecycle`, emitted by
+	// `pkg/lifecycle.rs`). Pkgs with no long-lived sidecar never leave
+	// `booting`, so only an `error` shows the strip. Browser builds have no
+	// lifecycle channel — pass null so the hook never calls `listen()`.
+	const sidecar = usePkgLifecycle(isTauri() ? pkgId : null);
+	const reloadView = () => setReloadKey((k) => k + 1);
 	const bridgeRef = useRef<AppBridge | null>(null);
 	// We mint the auth token once per mount and reuse it across re-renders.
 	const authTokenRef = useRef<string>('');
@@ -1325,6 +1372,15 @@ export function PkgIframeHostInner({
 	useEffect(() => {
 		let dropped = false;
 		authTokenRef.current = mintPkgToken();
+		// WP-45: every (re)load starts from `pkg-loading` — clears a prior
+		// crash / block so "Reload view" actually leaves those states.
+		setError(null);
+		setBlocked(null);
+		setPendingReview(null);
+		setHandshakeDone(false);
+		setHandshakeTimedOut(false);
+		handshakeDoneRef.current = false;
+		consentBusyRef.current = false;
 		(async () => {
 			try {
 				const handle = await pkgContentHtml(pkgId, source);
@@ -1489,6 +1545,8 @@ export function PkgIframeHostInner({
 				// here and cast at the boundary.
 			}) as AppBridge['oncalltool'];
 			bridge.addEventListener('initialized', () => {
+				handshakeDoneRef.current = true;
+				setHandshakeDone(true);
 				onInitializedRef.current?.();
 			});
 			bridgeRef.current = bridge;
@@ -1545,6 +1603,84 @@ export function PkgIframeHostInner({
 			teardown?.();
 		};
 	}, [srcDoc, pkgId]);
+
+	// Step 2b (WP-45, `pkg-blocked`): the srcdoc iframe is same-origin, so
+	// CSP violations inside it fire `securitypolicyviolation` on its
+	// document, which the host can observe directly — no kernel event
+	// needed. A navigation-directive violation, or a script block before the
+	// view initialised, replaces the view with `pkg-blocked`; resource-level
+	// violations are logged and the view keeps running (`isBlockingViolation`).
+	useEffect(() => {
+		if (!srcDoc) return;
+		const iframe = iframeRef.current;
+		if (!iframe) return;
+		let doc: Document | null = null;
+		const onViolation = (e: Event) => {
+			const v = e as SecurityPolicyViolationEvent;
+			const info = blockedInfoFromViolation(v);
+			if (isBlockingViolation(v, handshakeDoneRef.current)) {
+				setBlocked(info);
+			} else {
+				console.warn(`[pkg-host] ${pkgId} CSP ${info.scope} blocked ${info.target}`);
+			}
+		};
+		const attach = () => {
+			const next = iframe.contentDocument;
+			if (!next || next === doc) return;
+			doc?.removeEventListener('securitypolicyviolation', onViolation, true);
+			doc = next;
+			doc.addEventListener('securitypolicyviolation', onViolation, true);
+		};
+		attach();
+		iframe.addEventListener('load', attach);
+		return () => {
+			iframe.removeEventListener('load', attach);
+			doc?.removeEventListener('securitypolicyviolation', onViolation, true);
+		};
+	}, [srcDoc, pkgId]);
+
+	// Step 2c (WP-45, `pkg-loading`): let the handshake overlay step aside
+	// if the view never answers `ui/initialize` — after a short grace once
+	// the iframe has loaded (a view that renders without the AppBridge is
+	// not held behind an opaque, input-blocking overlay), and in any case
+	// after HANDSHAKE_OVERLAY_TIMEOUT_MS. Stepping aside also closes the
+	// boot window for the CSP listener.
+	useEffect(() => {
+		if (!srcDoc || handshakeDone) return;
+		const stepAside = () => {
+			handshakeDoneRef.current = true;
+			setHandshakeTimedOut(true);
+		};
+		const t = setTimeout(stepAside, HANDSHAKE_OVERLAY_TIMEOUT_MS);
+		let grace: ReturnType<typeof setTimeout> | null = null;
+		const iframe = iframeRef.current;
+		const onLoad = () => {
+			if (grace === null) grace = setTimeout(stepAside, HANDSHAKE_AFTER_LOAD_GRACE_MS);
+		};
+		iframe?.addEventListener('load', onLoad);
+		return () => {
+			clearTimeout(t);
+			if (grace !== null) clearTimeout(grace);
+			iframe?.removeEventListener('load', onLoad);
+		};
+	}, [srcDoc, handshakeDone]);
+
+	// Step 2d (WP-45, `pkg-consent`): a load failure may be the kernel
+	// holding the pkg for a capability review (`pkg_trust_list_pending`).
+	// Probed only on error so a healthy mount costs no extra IPC.
+	useEffect(() => {
+		if (!error) return;
+		let cancelled = false;
+		pkgTrustListPending()
+			.then((rows) => {
+				if (cancelled) return;
+				setPendingReview(rows.find((r) => r.pkg_id === pkgId) ?? null);
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+		};
+	}, [error, pkgId]);
 
 	// Step 3: push host-context-changed when the resolved appearance flips
 	// (theme / mode / tint / workspace) or the active suite-feature changes.
@@ -1681,17 +1817,55 @@ export function PkgIframeHostInner({
 		};
 	}, [tokenForRevoke]);
 
-	if (error) {
+	const onAllowConsent = () => {
+		if (consentBusyRef.current) return;
+		consentBusyRef.current = true;
+		setConsentBusy(true);
+		setConsentError(null);
+		pkgTrustApprove(pkgId)
+			.then(reloadView)
+			.catch((e) => setConsentError((e as Error).message ?? String(e)))
+			.finally(() => {
+				consentBusyRef.current = false;
+				setConsentBusy(false);
+			});
+	};
+
+	const onRestartSidecar = () => {
+		setSidecarRestarting(true);
+		pkgSupervisorRestart(pkgId)
+			.catch((e) => console.warn(`[pkg-host] restart sidecar for ${pkgId} failed:`, e))
+			.finally(() => setSidecarRestarting(false));
+	};
+
+	// State precedence (D-08): consent > blocked > crashed > loading > view.
+	if (error && pendingReview) {
 		return (
-			<div className="p-4 text-sm text-red-500">
-				<div className="font-semibold">Failed to load package UI</div>
-				<div className="text-xs opacity-80 mt-1">{error}</div>
-			</div>
+			<PkgConsentState
+				pkgId={pkgId}
+				review={pendingReview}
+				onAllow={onAllowConsent}
+				busy={consentBusy}
+				error={consentError}
+			/>
 		);
 	}
 
+	// Iframe blocks are CSP violations from the package's own policy (the
+	// shell injects none), which no host-side grant can lift — so no Allow
+	// host… / trust sheet here; the state's action is Reload view.
+	if (blocked) {
+		return (
+			<PkgBlockedState pkgId={pkgId} blocked={blocked} onReload={reloadView} />
+		);
+	}
+
+	if (error) {
+		return <PkgCrashedState pkgId={pkgId} source={source} error={error} onReload={reloadView} />;
+	}
+
 	if (!srcDoc || !baseUrl) {
-		return <div className="p-4 text-xs opacity-60">Loading package…</div>;
+		return <PkgLoadingState pkgId={pkgId} source={source} phase="fetch" />;
 	}
 
 	// Use srcDoc (not src=) per Tauri #12767: WebKitGTK refuses to render
@@ -1704,17 +1878,30 @@ export function PkgIframeHostInner({
 	return (
 		<div
 			data-iframe-host={pkgId}
+			data-state="pkg-view"
 			style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}
 		>
-			<iframe
-				ref={iframeRef}
-				srcDoc={srcDoc}
-				data-pkg-id={pkgId}
-				className="w-full h-full border-0"
-				style={{ flex: 1, minHeight: 0 }}
-				sandbox="allow-scripts allow-same-origin"
-				title={`Package ${pkgId}`}
-			/>
+			{sidecar.kind === 'error' && (
+				<PkgSidecarDownStrip
+					reason={sidecar.reason}
+					onRestart={onRestartSidecar}
+					busy={sidecarRestarting}
+				/>
+			)}
+			<div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex' }}>
+				<iframe
+					ref={iframeRef}
+					srcDoc={srcDoc}
+					data-pkg-id={pkgId}
+					className="w-full h-full border-0"
+					style={{ flex: 1, minHeight: 0 }}
+					sandbox="allow-scripts allow-same-origin"
+					title={`Package ${pkgId}`}
+				/>
+				{!handshakeDone && !handshakeTimedOut && (
+					<PkgLoadingState pkgId={pkgId} source={source} phase="handshake" overlay />
+				)}
+			</div>
 		</div>
 	);
 }

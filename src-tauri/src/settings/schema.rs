@@ -25,6 +25,8 @@ pub const RESOLVED_DEFAULT_FIELDS: &[&str] = &[
     "workspace.artifact.folderOverrides",
     "workspace.artifact.artifactSinkOverrides",
     "workspace.artifact.showResolved",
+    "workspace.notifications.mutedKinds",
+    "workspace.dailyAddress",
     "storage.screenshotDirectory",
     "about.updates.autoCheck",
     "about.updates.autoInstallApp",
@@ -50,6 +52,9 @@ pub const PERSONAL_ONLY_FIELDS: &[&str] = &[
     "workspace.sidebarCollapsed",
     "workspace.explorerSections",
     "workspace.onboarding",
+    "workspace.notifications",
+    "workspace.notifications.mutedKinds",
+    "workspace.dailyAddress",
     "storage.screenshotDirectory",
     "about.updates",
     "about.updates.autoCheck",
@@ -70,6 +75,14 @@ pub fn is_project_only_field(path: &str) -> bool {
 
 pub fn is_personal_only_field(path: &str) -> bool {
     PERSONAL_ONLY_FIELDS.contains(&path)
+}
+
+/// True for KV rows the settings domain owns: the legacy mirror keys.
+/// Everything else in `settings_kv` (`shell.activeProjectId`, migration
+/// gates, pin/permission flags, unknown future keys) belongs to another
+/// domain owner and survives `settings_clear_all`.
+pub fn is_settings_owned_key(key: &str) -> bool {
+    is_known_legacy_key(key)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,6 +402,14 @@ impl SettingsDocument {
                 validate_field(&format!("about.updates.{key}"), value)?;
             }
         }
+        if let Some(notifications) = self.workspace.get("notifications") {
+            let map = notifications
+                .as_object()
+                .ok_or_else(|| "workspace.notifications must be an object".to_string())?;
+            for (key, value) in map {
+                validate_field(&format!("workspace.notifications.{key}"), value)?;
+            }
+        }
         if let Some(last_agent) = self.workspace.get("lastAgent") {
             let map = last_agent
                 .as_object()
@@ -455,14 +476,15 @@ fn merge_map(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
 fn collect_leaf_paths(prefix: &str, map: &Map<String, Value>, out: &mut Vec<String>) {
     for (key, value) in map {
         let path = format!("{prefix}.{key}");
-        if value.as_array().is_some_and(|items| items.is_empty()) {
-            continue;
-        }
         if let Some(child) = value.as_object() {
             if child.is_empty() {
                 continue;
             }
             collect_leaf_paths(&path, child, out);
+            continue;
+        }
+        if value.as_array().is_some_and(|items| items.is_empty()) {
+            out.push(path);
             continue;
         }
         out.push(path);
@@ -499,6 +521,9 @@ pub fn is_known_field(path: &str) -> bool {
             | "workspace.lastAgent"
             | "workspace.lastAgent.kind"
             | "workspace.lastAgent.customCommand"
+            | "workspace.notifications"
+            | "workspace.notifications.mutedKinds"
+            | "workspace.dailyAddress"
             | "storage.screenshotDirectory"
             | "about.updates"
             | "about.updates.autoCheck"
@@ -546,13 +571,18 @@ fn validate_field(path: &str, value: &Value) -> Result<(), String> {
         "engines.resumeTerminals" => ensure_bool(value, &invalid),
         "workspace.userName" | "storage.screenshotDirectory" => ensure_string(value, &invalid),
         "workspace.claudeBrowserMode" => ensure_enum(value, &["layered", "roots"], &invalid),
-        "workspace.claudeWatchEnabled" | "workspace.sidebarCollapsed" => {
-            ensure_bool(value, &invalid)
-        }
+        "workspace.claudeWatchEnabled"
+        | "workspace.sidebarCollapsed"
+        | "workspace.dailyAddress" => ensure_bool(value, &invalid),
         "workspace.explorerSections" => ensure_array(value, &invalid),
-        "workspace.onboarding" | "workspace.artifact" | "workspace.lastAgent" => {
-            ensure_object(value, &invalid)
-        }
+        "workspace.onboarding"
+        | "workspace.artifact"
+        | "workspace.lastAgent"
+        | "workspace.notifications" => ensure_object(value, &invalid),
+        // WP-40: any string array. Unknown / unmutable kinds are ignored at
+        // read time (`notifications::mute::parse_muted`) so a hand-edited
+        // file never fails to parse over a notification-kind typo.
+        "workspace.notifications.mutedKinds" => ensure_string_array(value, &invalid),
         "workspace.artifact.defaultSink" => {
             ensure_enum(value, &["auto", "terminal", "chi", "clipboard"], &invalid)
         }
@@ -669,6 +699,9 @@ pub fn default_value(path: &str) -> Option<Value> {
         | "workspace.artifact.artifactSinkOverrides"
         | "workspace.artifact.showResolved" => Some(Value::Object(Map::new())),
         "workspace.lastAgent.kind" | "workspace.lastAgent.customCommand" => Some(Value::Null),
+        "workspace.notifications.mutedKinds" => Some(Value::Array(Vec::new())),
+        // WP-39 / D-04: the Project dashboard's day-start summary, on by default.
+        "workspace.dailyAddress" => Some(Value::Bool(true)),
         "storage.screenshotDirectory" => Some(Value::Null),
         "about.updates.autoCheck" => Some(Value::Bool(true)),
         "about.updates.autoInstallApp" => Some(Value::Bool(false)),
@@ -1335,6 +1368,28 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_values_are_overrides_and_content() {
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("projects.extraRoots", Value::Array(Vec::new()))
+            .unwrap();
+        assert!(document.has_content());
+        assert_eq!(document.leaf_paths(), vec!["projects.extraRoots"]);
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("workspace.artifact.folderOverrides", Value::Object(Map::new()))
+            .unwrap();
+        assert!(!document.has_content());
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field("workspace.lastAgent.kind", Value::Null)
+            .unwrap();
+        assert!(document.has_content());
+    }
+
+    #[test]
     fn resolved_defaults_preserve_explicit_null() {
         let mut document = SettingsDocument::default();
         document
@@ -1368,10 +1423,89 @@ mod tests {
             .is_err());
     }
 
+    /// WP-40: per-kind notification mutes live at
+    /// `workspace.notifications.mutedKinds` — personal-only, defaulting to
+    /// `[]`, any string array accepted (kinds are filtered at read time).
+    #[test]
+    fn notification_muted_kinds_field_is_personal_defaulted_and_tolerant() {
+        let path = "workspace.notifications.mutedKinds";
+        assert!(is_known_field(path));
+        assert!(is_personal_only_field(path));
+        assert_eq!(
+            SettingsDocument::default().resolved().get_field(path),
+            Some(&serde_json::json!([]))
+        );
+
+        let mut document = SettingsDocument::default();
+        document
+            .set_field(path, serde_json::json!(["update", "not-a-kind"]))
+            .unwrap();
+        assert_eq!(
+            document.get_field(path),
+            Some(&serde_json::json!(["update", "not-a-kind"]))
+        );
+        assert!(document.set_field(path, serde_json::json!("update")).is_err());
+        assert!(document.set_field(path, serde_json::json!([1])).is_err());
+
+        let parsed = SettingsDocument::parse(
+            br#"{"version":1,"workspace":{"notifications":{"mutedKinds":["invite"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.get_field(path),
+            Some(&serde_json::json!(["invite"]))
+        );
+        assert!(SettingsDocument::parse(
+            br#"{"version":1,"workspace":{"notifications":{"mutedKinds":"invite"}}}"#
+        )
+        .is_err());
+
+        // A project file cannot mute anything.
+        let mut project = SettingsDocument::default();
+        project.set_field(path, serde_json::json!(["update"])).unwrap();
+        assert!(project.project_overlay().get_field(path).is_none());
+    }
+
+    /// WP-39: `workspace.dailyAddress` — personal-only bool, default `true`.
+    #[test]
+    fn daily_address_field_is_personal_bool_defaulting_on() {
+        let path = "workspace.dailyAddress";
+        assert!(is_known_field(path));
+        assert!(is_personal_only_field(path));
+        assert_eq!(
+            SettingsDocument::default().resolved().get_field(path),
+            Some(&serde_json::json!(true))
+        );
+
+        let mut document = SettingsDocument::default();
+        document.set_field(path, serde_json::json!(false)).unwrap();
+        assert_eq!(document.get_field(path), Some(&serde_json::json!(false)));
+        assert!(document.set_field(path, serde_json::json!("off")).is_err());
+        assert!(SettingsDocument::parse(br#"{"version":1,"workspace":{"dailyAddress":"no"}}"#).is_err());
+
+        // A project file cannot turn it off for the user.
+        let mut project = SettingsDocument::default();
+        project.set_field(path, serde_json::json!(false)).unwrap();
+        assert!(project.project_overlay().get_field(path).is_none());
+    }
+
     #[test]
     fn secret_values_are_not_accepted_in_the_settings_document() {
         let with_secret = br#"{"version":1,"secrets":{"token":"do-not-store"}}"#;
         assert!(SettingsDocument::parse(with_secret).is_err());
+    }
+
+    #[test]
+    fn settings_owned_keys_are_exactly_the_legacy_mirror() {
+        assert!(is_settings_owned_key("appearance.theme"));
+        assert!(is_settings_owned_key("artifact-grid.folder./w/a.default-sink"));
+        assert!(is_settings_owned_key("artifact-studio.sink./w/a"));
+        assert!(is_settings_owned_key("artifact-grid:show-resolved:/w/a"));
+        assert!(is_settings_owned_key("artifact-wizard.lastAgent.p1"));
+        assert!(!is_settings_owned_key("shell.activeProjectId"));
+        assert!(!is_settings_owned_key("settings.migrations.file-v1"));
+        assert!(!is_settings_owned_key("settings.migrations.shell-v17"));
+        assert!(!is_settings_owned_key("some.future.domain.key"));
     }
 
     #[test]

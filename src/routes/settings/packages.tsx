@@ -1,7 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router';
-
-import { PkgsSurface } from '@/components/pkg/v2/pkgs-surface';
+import { createFileRoute, redirect } from '@tanstack/react-router';
 
 export const Route = createFileRoute('/settings/packages')({
-	component: PkgsSurface,
+	beforeLoad: () => {
+		throw redirect({ to: '/ngwa/store' });
+	},
 });

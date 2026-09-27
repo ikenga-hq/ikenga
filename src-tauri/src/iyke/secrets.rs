@@ -58,14 +58,22 @@ async fn resolve_scope(
             if id.is_empty() {
                 return Err(err(StatusCode::BAD_REQUEST, "project scope needs an id"));
             }
-            Ok(Scope::project(id))
+            let scope = Scope::project(id);
+            scope
+                .validate()
+                .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
+            Ok(scope)
         }
         Some(s) if s.starts_with("pkg:") => {
             let id = &s["pkg:".len()..];
             if id.is_empty() {
                 return Err(err(StatusCode::BAD_REQUEST, "pkg scope needs an id"));
             }
-            Ok(Scope::pkg(id))
+            let scope = Scope::pkg(id);
+            scope
+                .validate()
+                .map_err(|error| err(StatusCode::BAD_REQUEST, error))?;
+            Ok(scope)
         }
         Some(other) => Err(err(
             StatusCode::BAD_REQUEST,
@@ -75,8 +83,7 @@ async fn resolve_scope(
 }
 
 fn get_lock(app: &AppHandle) -> SecretsLock {
-    let s = app.state::<SecretsLock>();
-    SecretsLock::from_slot(s.0.clone())
+    app.state::<SecretsLock>().inner().clone()
 }
 
 #[derive(Deserialize)]
@@ -170,6 +177,13 @@ pub async fn post_secret_delete(
     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
     .map_err(map_err)?;
     Ok(Json(json!({ "ok": true, "key": body.key, "scope": scope })))
+}
+
+pub async fn get_secret_lock_state(
+    Extension(app): Extension<AppHandle>,
+) -> Result<Json<crate::secrets::LockState>, (StatusCode, String)> {
+    let lock = get_lock(&app);
+    Ok(Json(lock.state()))
 }
 
 #[derive(Deserialize)]

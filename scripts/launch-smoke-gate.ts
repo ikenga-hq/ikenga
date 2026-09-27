@@ -26,8 +26,15 @@
  * and `useIykeBridge` is mounted by Workspace. So on a virgin profile the bridge
  * legitimately does not exist and the probe would fail on a perfectly good
  * build. Phase 1 launches once purely to let the app create and migrate its
- * SQLite database; we then seed `settings_kv['onboarding.state']` as completed
- * and relaunch. Phase 2 is the one that gets probed.
+ * SQLite database and its personal `settings.json`; we then seed onboarding as
+ * completed in both and relaunch. Phase 2 is the one that gets probed.
+ *
+ * Since 5a (WP-32) the shell hydrates onboarding from `settings.json`
+ * (`workspace.onboarding`) *after* the legacy `settings_kv` row, so a KV-only
+ * seed is overwritten by the first-run value phase 1 wrote — that is why the
+ * v0.13.0 and v0.14.0 release gates sat on `/onboarding/welcome`. The app is
+ * launched with `HOME` pointed inside the temp dir, so `~/.ikenga` is a
+ * throwaway too and running the gate locally never touches a real profile.
  *
  * Usage:
  *   bun run scripts/launch-smoke-gate.ts --binary=/path/to/ikenga-desktop
@@ -41,7 +48,7 @@
 
 import { Database } from 'bun:sqlite';
 import { spawn, type Subprocess } from 'bun';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -96,9 +103,21 @@ async function waitForControl(path: string, deadline: number): Promise<ControlJs
 	return null;
 }
 
+/** The throwaway `HOME` the app is launched with (holds `.ikenga/settings.json`). */
+function homeFor(dataHome: string): string {
+	return join(dataHome, 'home');
+}
+
 function launch(binary: string, dataHome: string): Subprocess {
+	const home = homeFor(dataHome);
+	mkdirSync(home, { recursive: true });
 	return spawn([binary], {
-		env: { ...process.env, XDG_DATA_HOME: dataHome, RUST_LOG: process.env.RUST_LOG ?? 'info' },
+		env: {
+			...process.env,
+			HOME: home,
+			XDG_DATA_HOME: dataHome,
+			RUST_LOG: process.env.RUST_LOG ?? 'info',
+		},
 		stdout: 'pipe',
 		stderr: 'pipe',
 	});
@@ -113,22 +132,27 @@ async function stop(proc: Subprocess): Promise<void> {
  * Mark onboarding complete so the relaunch renders Workspace (and therefore
  * mounts the iyke bridge) instead of the edge-to-edge onboarding route.
  *
- * `mode: 'edit'` + a non-null `completedAt` is what `__root.tsx` checks; the
- * shape mirrors a real completed wizard so the store's migration path accepts
- * it rather than falling back to defaults.
+ * A non-null `completedAt` is what `__root.tsx` and `routes/onboarding/route.tsx`
+ * check. The shape mirrors a real completed wizard at the current
+ * `ONBOARDING_STATE_VERSION` (3, WP-38) so `normalizeOnboarding` keeps it
+ * as-is rather than resetting it. Written to both stores the shell reads:
+ * the legacy `settings_kv` row and personal `settings.json`, which wins.
  */
 function seedOnboardingComplete(dataHome: string): void {
 	const db = join(dataHome, IDENTIFIER, 'ikenga.db');
 	if (!existsSync(db)) fail(`app never created its database at ${db}`);
 	const now = Date.now();
-	const state = JSON.stringify({
-		version: 2,
+	const onboarding = {
+		version: 3,
 		startedAt: now,
 		completedAt: now,
 		mode: 'edit',
 		activeIndex: 0,
 		steps: {},
-	});
+		selectedAgentId: null,
+		loreGlossSeen: [],
+	};
+	const state = JSON.stringify(onboarding);
 	const conn = new Database(db);
 	try {
 		conn.run(
@@ -139,6 +163,27 @@ function seedOnboardingComplete(dataHome: string): void {
 	} finally {
 		conn.close();
 	}
+
+	// Personal settings.json — merge into whatever phase 1 wrote so the rest
+	// of the file (schema version, defaults) survives.
+	const dir = join(homeFor(dataHome), '.ikenga');
+	const file = join(dir, 'settings.json');
+	let settings: Record<string, unknown> = { version: 1 };
+	if (existsSync(file)) {
+		try {
+			settings = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+		} catch (err) {
+			fail(`phase 1 wrote an unparseable ${file}: ${String(err)}`);
+		}
+	}
+	const workspace =
+		settings.workspace && typeof settings.workspace === 'object'
+			? (settings.workspace as Record<string, unknown>)
+			: {};
+	settings.workspace = { ...workspace, onboarding };
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(file, `${JSON.stringify(settings, null, 2)}
+`);
 }
 
 /**
@@ -194,7 +239,7 @@ async function probe(control: ControlJson, deadline: number): Promise<void> {
 			'[smoke-gate] INCONCLUSIVE: the app is sitting on the onboarding wizard, ' +
 				'not the workspace. The iyke bridge is demonstrably ALIVE (it published this ' +
 				'route), so this is NOT ikenga#140 — the onboarding seed did not take. Fix the ' +
-				"harness (settings_kv['onboarding.state'] / the shell-store hydration path), " +
+				"harness (settings.json workspace.onboarding + settings_kv['onboarding.state'] / the shell-store hydration path), " +
 				'then re-run. Verdict withheld.'
 		);
 		process.exit(2);

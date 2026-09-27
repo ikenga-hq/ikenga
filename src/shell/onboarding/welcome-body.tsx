@@ -8,6 +8,7 @@
 // aside listing the preflight items as cards. The host wizard chrome
 // supplies the progress bar / header / footer.
 
+import { Link } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { openExternalUrl } from '@/lib/transport';
 
@@ -16,13 +17,16 @@ import { Button } from '@/components/ui/button';
 import { FeedbackState } from '@/components/ui/feedback-state';
 import { Input } from '@/components/ui/input';
 import { quoteOfTheDay } from '@/lib/lore';
-import { useShellStore } from '@/lib/shell/shell-store';
+import { openSettingsFile } from '@/lib/settings/client';
+import { ONBOARDING_STEPS, useShellStore } from '@/lib/shell/shell-store';
 import {
 	type CheckLevel,
 	type SystemCheck,
 	type SystemReport,
 	detectSystem,
 } from '@/lib/tauri-cmd';
+import { WritesNote } from '@/shell/onboarding/footer';
+import { RAIL_COPY } from '@/shell/onboarding/rail';
 
 interface WelcomeBodyProps {
 	/** Pass-through from the wizard chrome — re-rendered onto the
@@ -70,8 +74,8 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 				>
 					<LoreTerm term="Consecration">Consecration</LoreTerm>
 				</p>
-				<h1 className="mb-4 text-4xl font-bold leading-tight tracking-tight">
-					Let's bring your <LoreTerm term="Ikenga">Ikenga</LoreTerm> to life.
+				<h1 className="font-display mb-4 text-4xl font-bold leading-tight tracking-tight">
+					Welcome to your <LoreTerm term="Obi">Obi</LoreTerm>.
 				</h1>
 				<p
 					className="mb-6 max-w-[48ch] text-[15px] leading-[1.55]"
@@ -131,6 +135,51 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 						title="Skip any step you don't need."
 						meta="We'll surface the gap in Settings if it matters later."
 					/>
+				</div>
+
+				<div className="mt-8">
+					<p
+						className="mb-2 text-[11.5px] font-semibold uppercase tracking-[0.04em]"
+						style={{ color: 'var(--fg-faint)' }}
+					>
+						What the consecration asks · {ONBOARDING_STEPS.length - 1} more steps
+					</p>
+					<ol className="grid gap-1.5" data-testid="welcome-ahead-list">
+						{ONBOARDING_STEPS.slice(1).map((id, i) => (
+							<li
+								key={id}
+								className="flex items-center gap-3 text-xs"
+								style={{ color: 'var(--fg-muted)' }}
+							>
+								<span className="font-mono w-5" style={{ color: 'var(--fg-faint)' }}>
+									{i + 2}
+								</span>
+								<span className="font-semibold" style={{ color: 'var(--fg)' }}>
+									{RAIL_COPY[id].nm}
+								</span>
+								<span>{RAIL_COPY[id].sub}</span>
+							</li>
+						))}
+					</ol>
+					<p className="mt-2 text-[11px]" style={{ color: 'var(--fg-faint)' }}>
+						Skip any of them. Nothing here is irreversible, and every answer has a home in Settings.
+					</p>
+				</div>
+
+				<WritesNote
+					stepId="welcome"
+					onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
+				/>
+
+				<div className="mt-4">
+					<Link
+						to="/settings/storage"
+						className="text-xs underline-offset-2 hover:underline"
+						style={{ color: 'var(--primary)' }}
+						data-testid="welcome-restore-link"
+					>
+						Coming from another machine? Restore from backup…
+					</Link>
 				</div>
 			</section>
 

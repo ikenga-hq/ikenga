@@ -45,6 +45,9 @@ pub mod server;
 pub mod settings;
 
 // --- Desktop-only ---
+// WP-50: actions.json / keybindings.json file layer + project-trust record.
+#[cfg(feature = "desktop")]
+pub mod actions;
 #[cfg(feature = "desktop")]
 mod agent_detect;
 #[cfg(feature = "desktop")]
@@ -55,6 +58,10 @@ pub mod commands;
 pub mod env_files;
 #[cfg(feature = "desktop")]
 mod iyke;
+// WP-40: the `notifications` aggregation table, its producers, mute prefs and
+// the `notifications://changed` forwarder.
+#[cfg(feature = "desktop")]
+pub mod notifications;
 #[cfg(feature = "desktop")]
 mod pkg_content;
 #[cfg(feature = "desktop")]
@@ -71,6 +78,9 @@ mod viewer_server;
 // (WP-02) + the window registry / spawn-close-list commands (WP-03).
 #[cfg(feature = "desktop")]
 mod window;
+// WP-37: `#[ignore]`d Phase 5a migration rehearsal against a copy of app data.
+#[cfg(all(test, feature = "desktop"))]
+mod rehearsal_5a;
 
 #[cfg(feature = "desktop")]
 use std::sync::Arc;
@@ -87,6 +97,11 @@ use tokio::sync::Mutex;
 use commands::db::PaDb;
 #[cfg(feature = "desktop")]
 use commands::screenshot::new_pending as new_screenshot_pending;
+#[cfg(feature = "desktop")]
+use commands::{
+    action_exec, action_git_branch, actions_open_file, actions_read_files, actions_trust_grant,
+    actions_trust_revoke, actions_trust_status, actions_write, keybindings_write,
+};
 #[cfg(feature = "desktop")]
 use commands::{
     activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
@@ -108,7 +123,10 @@ use commands::{
     fs_roots_reset, fs_search, fs_trash, fs_unwatch, fs_watch, fs_write, iyke_action_done,
     iyke_dom_done, iyke_dom_query, iyke_endpoint, iyke_log_push, iyke_mcp_info, iyke_network_push,
     iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done, iyke_terminal_spawn_done,
-    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot, oba_auto_update_all,
+    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot,
+    notifications_list, notifications_mark_all_read, notifications_mark_read,
+    notifications_mute_kind, notifications_mute_state, notifications_record_update,
+    notifications_unmute_kind, notifications_unread_count, oba_auto_update_all,
     oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
     oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
     oba_missing_requires, oba_relink_dependents, oba_safe_delete, oba_set_auto_update,
@@ -120,7 +138,7 @@ use commands::{
     pkg_scaffold, pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
     pkg_sidecar_call, pkg_sidecar_rpc_send, pkg_sidecar_rpc_shutdown,
     pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_clear_session,
-    pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
+    pkg_webview_allow_origin, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
     project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
     project_scaffold_claude, project_set_active, project_skills_list, project_update,
     pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
@@ -128,8 +146,9 @@ use commands::{
     runtime_retry_bun_fetch,
     screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
     screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
-    secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_list_keys,
-    secrets_list_keys_scoped, secrets_set, secrets_set_scoped, secrets_vault_status,
+    secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_index_names,
+    secrets_list_keys, secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
+    secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status,
     set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_open_file,
     settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
     spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
@@ -149,8 +168,9 @@ use commands::{
     pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
     pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
     pkg_trust_approve, pkg_trust_grant, pkg_trust_list, pkg_trust_list_pending, pkg_trust_preview,
-    pkg_trust_reject, pkg_trust_revoke, session_cancel, session_destroy, session_destroy_all,
-    session_ensure, session_send, session_tool_result, supabase_config_clear, supabase_config_get,
+    pkg_trust_preview_incoming, pkg_trust_reject, pkg_trust_revoke, session_cancel,
+    session_destroy, session_destroy_all, session_ensure, session_send, session_tool_result,
+    supabase_config_clear, supabase_config_get,
     supabase_config_set, viewer_port, viewer_serve, viewer_stop, IykeRuntimeState,
     ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, SecretsLock,
 };
@@ -332,25 +352,60 @@ pub fn run() {
                 .map_err(|e| format!("app_data_dir: {e}"))?;
             std::fs::create_dir_all(&data_dir)?;
 
-            match secrets::migrate::run(&data_dir) {
-                Ok(_) => {}
+            let secrets_ready = match app.state::<SecretsLock>().configure_data_dir(&data_dir) {
+                Ok(()) => true,
                 Err(error) => {
+                    log::error!("[secrets] unlock state configuration failed: {error}");
                     if let Err(mark_error) = app
                         .state::<SecretsLock>()
-                        .mark_unavailable(error.clone())
+                        .mark_unavailable(error)
                     {
                         log::error!("[secrets] unavailable state failed: {mark_error}");
                     }
-                    if let Err(invalidation_error) =
-                        commands::secrets::invalidate_env_vaults(app.handle())
-                    {
-                        log::error!(
-                            "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
-                        );
-                    }
-                    log::error!("[secrets] migration failed: {error}");
+                    false
                 }
+            };
+
+            if secrets_ready {
+                match secrets::migrate::run(&data_dir) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        if let Err(mark_error) = app
+                            .state::<SecretsLock>()
+                            .mark_unavailable(error.clone())
+                        {
+                            log::error!("[secrets] unavailable state failed: {mark_error}");
+                        }
+                        if let Err(invalidation_error) =
+                            commands::secrets::invalidate_env_vaults(app.handle())
+                        {
+                            log::error!(
+                                "[secrets] env-vault invalidation after migration failure failed: {invalidation_error}"
+                            );
+                        }
+                        log::error!("[secrets] migration failed: {error}");
+                    }
+                }
+            } else if let Err(invalidation_error) =
+                commands::secrets::invalidate_env_vaults(app.handle())
+            {
+                log::error!(
+                    "[secrets] env-vault invalidation after unlock setup failure failed: {invalidation_error}"
+                );
             }
+
+            let idle_lock = app.state::<SecretsLock>().inner().clone();
+            let idle_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if idle_lock.expire_if_idle() {
+                        if let Err(error) = commands::secrets::invalidate_env_vaults(&idle_app) {
+                            log::warn!("[secrets] idle env-vault invalidation failed: {error}");
+                        }
+                    }
+                }
+            });
 
             // User-configurable FS allowlist. Must be installed before the
             // first call to `commands::resolve_allowlisted` (which fs_*,
@@ -402,6 +457,9 @@ pub fn run() {
                 tracing::warn!("[settings] initialization failed: {e}");
             }
             app.manage(settings_manager.clone());
+            // WP-40: relay notification changes to the webview as
+            // `notifications://changed` (muted flag stamped from settings).
+            notifications::spawn_event_forwarder(app.handle().clone());
             {
                 use tauri::Listener;
                 let app_for_settings = app.handle().clone();
@@ -411,6 +469,30 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = manager.refresh_watch().await {
                             tracing::warn!("[settings] project watcher refresh failed: {e}");
+                        }
+                    });
+                });
+            }
+
+            // WP-50: actions.json / keybindings.json watchers (personal +
+            // active project, `actions://changed`) and the trust record.
+            let actions_manager = Arc::new(actions::ActionsManager::new(
+                app.handle().clone(),
+                pa_db.clone(),
+                data_dir.clone(),
+            ));
+            if let Err(e) = tauri::async_runtime::block_on(actions_manager.refresh_watch()) {
+                tracing::warn!("[actions] watcher initialization failed: {e}");
+            }
+            app.manage(actions_manager.clone());
+            {
+                use tauri::Listener;
+                let app_for_actions = app.handle().clone();
+                app_for_actions.listen("projects:active-changed", move |_evt| {
+                    let manager = actions_manager.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = manager.refresh_watch().await {
+                            tracing::warn!("[actions] project watcher refresh failed: {e}");
                         }
                     });
                 });
@@ -471,10 +553,9 @@ pub fn run() {
 
             log::info!("ikenga app data dir: {}", data_dir.display());
 
-            if let Err(e) = register_summon_shortcut(app.handle()) {
-                log::warn!("global shortcut not registered (continuing): {e}");
-            }
-            register_screenshot_shortcuts(app.handle());
+            // OS-wide shortcuts (G-ACTIONS §6): the default `os.*` rules now;
+            // the webview replaces them with the effective set on load.
+            register_default_os_shortcuts(app.handle());
 
             // Iyke (Phase 11): localhost control bridge. Boot synchronously so
             // the server is ready by the time the webview asks for its
@@ -824,6 +905,9 @@ pub fn run() {
             }
             let kernel_arc_for_listener = kernel.clone();
             app.manage(KernelState(kernel));
+            // WP-40: resolve `update` notifications whose version is now
+            // installed (an app update relaunches into this).
+            commands::notifications::spawn_boot_update_sweep(app.handle().clone());
             app.manage(PkgSettingsState(settings_reg));
             app.manage(crate::commands::ActivityBarState(activity_bar_reg.clone()));
             app.manage(PkgContentState(pkg_content_server));
@@ -1105,6 +1189,8 @@ pub fn run() {
             oba_auto_update_all,
             oba_set_auto_update,
             os_username,
+            // OS-wide shortcuts from the effective keymap (WP-54, G-ACTIONS §6)
+            os_shortcuts_apply,
             // Ngwa Phase-2 cross-system — G-ADAPTER engine layout descriptor
             engine_layout,
             // Ngwa Phase-2 — WP-14 unified snapshot (G-NGWA-ITEM)
@@ -1118,7 +1204,12 @@ pub fn run() {
             secrets_set,
             secrets_delete,
             secrets_list_keys,
+            secrets_index_names,
             secrets_vault_status,
+            secrets_set_passphrase,
+            secrets_unlock,
+            secrets_lock,
+            secrets_lock_state,
             // secrets — Phase 7 scoped variants
             secrets_get_scoped,
             secrets_set_scoped,
@@ -1132,6 +1223,26 @@ pub fn run() {
             settings_read_file,
             settings_write_field,
             settings_open_file,
+            // actions — WP-50 actions.json / keybindings.json + project trust
+            actions_read_files,
+            actions_write,
+            keybindings_write,
+            actions_open_file,
+            actions_trust_status,
+            actions_trust_grant,
+            actions_trust_revoke,
+            // action runner — WP-53 `shell` run kind + `{{branch}}`
+            action_exec,
+            action_git_branch,
+            // notifications — WP-40 aggregation table (D-07 notification centre)
+            notifications_list,
+            notifications_unread_count,
+            notifications_mark_read,
+            notifications_mark_all_read,
+            notifications_mute_state,
+            notifications_mute_kind,
+            notifications_unmute_kind,
+            notifications_record_update,
             // projects (phase 0 of projects-first-class plan)
             project_create,
             project_update,
@@ -1160,6 +1271,7 @@ pub fn run() {
             pkg_trust_revoke,
             // trust-review modal (2026-05-15) — capability-diff batch surface
             pkg_trust_list_pending,
+            pkg_trust_preview_incoming,
             pkg_trust_approve,
             pkg_trust_reject,
             // per-folder Studio project-access gate (WP-04)
@@ -1184,6 +1296,11 @@ pub fn run() {
             iyke_endpoint,
             iyke_set_shell,
             iyke::handlers::iyke_set_frame,
+            // WP-62: the `iyke` actions/menus/keys surface — FE→Rust
+            // effective-model mirror push + the write/query round-trip
+            // callback (`src-tauri/src/iyke/actions_routes.rs`).
+            iyke::actions_routes::iyke_set_actions_frame,
+            iyke::actions_routes::iyke_actions_request_done,
             iyke_log_push,
             iyke_network_push,
             iyke_dom_done,
@@ -1217,6 +1334,7 @@ pub fn run() {
             spike_setup_test_file,
             // pkg-browser child webviews
             pkg_webview_create,
+            pkg_webview_allow_origin,
             pkg_webview_destroy,
             pkg_webview_navigate,
             pkg_webview_set_rect,
@@ -1308,6 +1426,12 @@ pub fn run() {
             // in $XDG_RUNTIME_DIR / $TMPDIR, both per-user-volatile, or the
             // per-user %LOCALAPPDATA% on Windows), but keeps the surface tidy.
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                // WP-34: with a passphrase configured, the env-vault files
+                // (including the durable one) are plaintext only while
+                // unlocked — overwrite them and drop the DEK on exit, the
+                // same invalidation an explicit lock performs. No-op without
+                // a passphrase (WP-33 durable-file contract).
+                commands::secrets::wipe_env_vaults_on_exit(_app);
                 commands::secrets::cleanup_runtime_file();
                 #[cfg(feature = "desktop")]
                 {
@@ -1355,117 +1479,451 @@ fn init_logging() {
     }
 }
 
-/// Build the global-shortcut plugin. The handler dispatches by shortcut:
-/// the summon binding toggles window visibility, the screenshot bindings
-/// emit `screenshot://shortcut` events that the FE picks up and routes
-/// back through `screenshot_window` / `screenshot_pane`. Doing the
-/// focused-pane resolution in the FE avoids mirroring `usePaneStore` on
-/// the Rust side just for one handler.
+// ─── OS-wide shortcuts (G-ACTIONS §6, DEC-60; WP-54) ─────────────────────────
+//
+// The three shipped OS-wide shortcuts are the registry's `os.*` commands
+// (`scope: 'os'` entries in `src/lib/keymap/defaults.ts`). What is
+// registered with the OS is the **effective** default + personal OS rules:
+// the defaults below at boot (so summon works before the webview loads),
+// then whatever the primary window pushes through `os_shortcuts_apply` —
+// on load and again whenever a personal `keybindings.json` rebind changes
+// them. Registration stays tolerant per shortcut: one failure is logged and
+// reported in its status (the Keys tab shows "not registered: <reason>") and
+// never blocks the others. The handler dispatches by the bound command, not
+// by a fixed key, so a rebound key runs the same command.
+
+/// One effective OS rule: an action id and its key in the registry grammar
+/// (`alt+space`, `ctrl+alt+shift+s`).
+#[cfg(feature = "desktop")]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OsShortcutRule {
+    command: String,
+    key: String,
+}
+
+/// Per-rule registration result, returned to the webview.
+#[cfg(feature = "desktop")]
+#[derive(Debug, Clone, serde::Serialize)]
+struct OsShortcutStatus {
+    command: String,
+    key: String,
+    registered: bool,
+    reason: Option<String>,
+}
+
+/// The shortcuts currently registered with the OS and the command each runs.
+///
+/// `bound` is only ever held for a copy-in / copy-out, never across an OS
+/// (un)register call: on Linux/X11 global-hotkey runs the plugin handler on
+/// its own thread, and that handler reads `bound` (`command_for`) while a
+/// `register` from another thread waits on that same thread — holding
+/// `bound` across `register` would deadlock the moment an OS shortcut is
+/// pressed during a re-apply. `apply` serializes whole re-applies instead;
+/// the handler never takes it.
+#[cfg(feature = "desktop")]
+#[derive(Default)]
+struct OsShortcuts {
+    bound: std::sync::Mutex<Vec<(tauri_plugin_global_shortcut::Shortcut, String)>>,
+    apply: std::sync::Mutex<()>,
+}
+
+#[cfg(feature = "desktop")]
+impl OsShortcuts {
+    fn command_for(&self, shortcut: &tauri_plugin_global_shortcut::Shortcut) -> Option<String> {
+        let bound = self.bound.lock().unwrap_or_else(|p| p.into_inner());
+        bound
+            .iter()
+            .find(|(bound_shortcut, _)| bound_shortcut == shortcut)
+            .map(|(_, command)| command.clone())
+    }
+}
+
+/// The default-layer OS rules — mirrors `DEFAULT_KEYMAP`'s `scope: 'os'`
+/// entries. `os.summon` on Windows/Linux stays Super+Space as shipped; on
+/// Windows it may collide with the input-language switcher (open question,
+/// `04` Round 37 — flagged, not changed here).
+#[cfg(feature = "desktop")]
+fn default_os_rules() -> Vec<OsShortcutRule> {
+    let summon = if cfg!(target_os = "macos") {
+        "alt+space"
+    } else {
+        "meta+space"
+    };
+    [
+        ("os.summon", summon),
+        ("os.screenshot-window", "ctrl+alt+shift+s"),
+        ("os.screenshot-pane", "ctrl+alt+shift+p"),
+    ]
+    .into_iter()
+    .map(|(command, key)| OsShortcutRule {
+        command: command.to_string(),
+        key: key.to_string(),
+    })
+    .collect()
+}
+
+/// A registry key name (G-ACTIONS §3.1) → the physical key the OS registers.
+/// `plus` and `?` are character keys with no fixed position, so they cannot
+/// be OS-wide.
+#[cfg(feature = "desktop")]
+fn os_key_code(name: &str) -> Option<tauri_plugin_global_shortcut::Code> {
+    use tauri_plugin_global_shortcut::Code;
+    let code = match name {
+        "a" => Code::KeyA,
+        "b" => Code::KeyB,
+        "c" => Code::KeyC,
+        "d" => Code::KeyD,
+        "e" => Code::KeyE,
+        "f" => Code::KeyF,
+        "g" => Code::KeyG,
+        "h" => Code::KeyH,
+        "i" => Code::KeyI,
+        "j" => Code::KeyJ,
+        "k" => Code::KeyK,
+        "l" => Code::KeyL,
+        "m" => Code::KeyM,
+        "n" => Code::KeyN,
+        "o" => Code::KeyO,
+        "p" => Code::KeyP,
+        "q" => Code::KeyQ,
+        "r" => Code::KeyR,
+        "s" => Code::KeyS,
+        "t" => Code::KeyT,
+        "u" => Code::KeyU,
+        "v" => Code::KeyV,
+        "w" => Code::KeyW,
+        "x" => Code::KeyX,
+        "y" => Code::KeyY,
+        "z" => Code::KeyZ,
+        "0" => Code::Digit0,
+        "1" => Code::Digit1,
+        "2" => Code::Digit2,
+        "3" => Code::Digit3,
+        "4" => Code::Digit4,
+        "5" => Code::Digit5,
+        "6" => Code::Digit6,
+        "7" => Code::Digit7,
+        "8" => Code::Digit8,
+        "9" => Code::Digit9,
+        "`" => Code::Backquote,
+        "-" => Code::Minus,
+        "=" => Code::Equal,
+        "[" => Code::BracketLeft,
+        "]" => Code::BracketRight,
+        "\\" => Code::Backslash,
+        ";" => Code::Semicolon,
+        "'" => Code::Quote,
+        "," => Code::Comma,
+        "." => Code::Period,
+        "/" => Code::Slash,
+        "space" => Code::Space,
+        "enter" => Code::Enter,
+        "escape" => Code::Escape,
+        "tab" => Code::Tab,
+        "backspace" => Code::Backspace,
+        "delete" => Code::Delete,
+        "insert" => Code::Insert,
+        "home" => Code::Home,
+        "end" => Code::End,
+        "pageup" => Code::PageUp,
+        "pagedown" => Code::PageDown,
+        "arrowup" => Code::ArrowUp,
+        "arrowdown" => Code::ArrowDown,
+        "arrowleft" => Code::ArrowLeft,
+        "arrowright" => Code::ArrowRight,
+        "f1" => Code::F1,
+        "f2" => Code::F2,
+        "f3" => Code::F3,
+        "f4" => Code::F4,
+        "f5" => Code::F5,
+        "f6" => Code::F6,
+        "f7" => Code::F7,
+        "f8" => Code::F8,
+        "f9" => Code::F9,
+        "f10" => Code::F10,
+        "f11" => Code::F11,
+        "f12" => Code::F12,
+        "f13" => Code::F13,
+        "f14" => Code::F14,
+        "f15" => Code::F15,
+        "f16" => Code::F16,
+        "f17" => Code::F17,
+        "f18" => Code::F18,
+        "f19" => Code::F19,
+        "f20" => Code::F20,
+        "f21" => Code::F21,
+        "f22" => Code::F22,
+        "f23" => Code::F23,
+        "f24" => Code::F24,
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// Parse one stroke of the registry grammar into an OS shortcut. `mod` is ⌘
+/// on macOS and Ctrl elsewhere; `meta` is the literal ⌘ / Win / Super key.
+#[cfg(feature = "desktop")]
+fn parse_os_key(key: &str) -> Result<tauri_plugin_global_shortcut::Shortcut, String> {
+    use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
+
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("empty key".to_string());
+    }
+    if key.contains(' ') {
+        return Err("a chord cannot be an OS-wide shortcut".to_string());
+    }
+    let parts: Vec<&str> = key.split('+').collect();
+    let Some((name, modifier_names)) = parts.split_last() else {
+        return Err("empty key".to_string());
+    };
+    let mut modifiers = Modifiers::empty();
+    for m in modifier_names {
+        let flag = match *m {
+            "mod" => {
+                if cfg!(target_os = "macos") {
+                    Modifiers::SUPER
+                } else {
+                    Modifiers::CONTROL
+                }
+            }
+            "ctrl" => Modifiers::CONTROL,
+            "meta" => Modifiers::SUPER,
+            "alt" => Modifiers::ALT,
+            "shift" => Modifiers::SHIFT,
+            other => return Err(format!("unknown modifier `{other}`")),
+        };
+        modifiers |= flag;
+    }
+    let code = os_key_code(name).ok_or_else(|| format!("`{name}` cannot be an OS-wide key"))?;
+    // A bare key would be taken from every app on the machine. Only the
+    // function keys may go without a modifier.
+    let function_key = name.len() > 1
+        && name.starts_with('f')
+        && name[1..].chars().all(|c| c.is_ascii_digit());
+    if modifiers.is_empty() && !function_key {
+        return Err(format!(
+            "`{name}` needs a modifier to be OS-wide (it would take the key from every app)"
+        ));
+    }
+    let modifiers = if modifiers.is_empty() {
+        None
+    } else {
+        Some(modifiers)
+    };
+    Ok(Shortcut::new(modifiers, code))
+}
+
+/// A command an OS rule may not name (§6): a package action (DEC-54) or a
+/// hosted command, whose owner has no focus while Ikenga is unfocused.
+#[cfg(feature = "desktop")]
+fn os_command_refusal(command: &str) -> Option<&'static str> {
+    if command.contains(':') {
+        return Some("a package action cannot be OS-wide");
+    }
+    if command.starts_with("terminal.")
+        || matches!(
+            command,
+            "companion.send" | "companion.new-run" | "companion.persistent-run"
+        )
+    {
+        return Some("a hosted command cannot be OS-wide");
+    }
+    None
+}
+
+/// Replace every registered OS shortcut with `rules`. Tolerant per rule.
+#[cfg(feature = "desktop")]
+fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<OsShortcutStatus> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    let status = |rule: &OsShortcutRule, reason: Option<String>| OsShortcutStatus {
+        command: rule.command.clone(),
+        key: rule.key.clone(),
+        registered: reason.is_none(),
+        reason,
+    };
+    let Some(state) = app.try_state::<OsShortcuts>() else {
+        return rules
+            .iter()
+            .map(|rule| status(rule, Some("OS shortcuts are not initialised".to_string())))
+            .collect();
+    };
+    let _applying = state.apply.lock().unwrap_or_else(|p| p.into_inner());
+    // Take the old set and release `bound` before touching the OS (see
+    // `OsShortcuts`): the handler may need it while we (un)register.
+    let old = std::mem::take(&mut *state.bound.lock().unwrap_or_else(|p| p.into_inner()));
+    for (shortcut, command) in old {
+        if let Err(e) = app.global_shortcut().unregister(shortcut) {
+            // `log::` macros are dropped in this crate (no log→tracing
+            // bridge); use tracing so the warning actually emits.
+            tracing::warn!("OS shortcut for {command} not unregistered (continuing): {e}");
+        }
+    }
+
+    let mut bound: Vec<(tauri_plugin_global_shortcut::Shortcut, String)> = Vec::new();
+    let mut out = Vec::with_capacity(rules.len());
+    for rule in rules {
+        if let Some(reason) = os_command_refusal(&rule.command) {
+            out.push(status(rule, Some(reason.to_string())));
+            continue;
+        }
+        let shortcut = match parse_os_key(&rule.key) {
+            Ok(shortcut) => shortcut,
+            Err(reason) => {
+                out.push(status(rule, Some(reason)));
+                continue;
+            }
+        };
+        if let Some((_, other)) = bound.iter().find(|(b, _)| *b == shortcut) {
+            let reason = format!("the key is already OS-wide for {other}");
+            out.push(status(rule, Some(reason)));
+            continue;
+        }
+        match app.global_shortcut().register(shortcut) {
+            Ok(()) => {
+                bound.push((shortcut, rule.command.clone()));
+                out.push(status(rule, None));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "OS shortcut {} → {} not registered (continuing): {e}",
+                    rule.key,
+                    rule.command
+                );
+                out.push(status(rule, Some(e.to_string())));
+            }
+        }
+    }
+    *state.bound.lock().unwrap_or_else(|p| p.into_inner()) = bound;
+    out
+}
+
+/// Registers the effective default + personal OS rules the primary window
+/// computed (`startOsShortcutSync`, `src/lib/keymap/dispatcher.ts`),
+/// replacing the previous set. Sync on purpose: it runs on the main thread,
+/// where the OS registration has to happen.
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn os_shortcuts_apply(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    rules: Vec<OsShortcutRule>,
+) -> Vec<OsShortcutStatus> {
+    // Only the primary window computes the effective default + personal OS
+    // rules (DEC-60). Detached windows share `allow-app-commands`, so refuse
+    // them here rather than trust the capability set.
+    if window.label() != "main" {
+        return rules
+            .into_iter()
+            .map(|rule| OsShortcutStatus {
+                command: rule.command,
+                key: rule.key,
+                registered: false,
+                reason: Some("only the main window applies OS shortcuts".to_string()),
+            })
+            .collect();
+    }
+    apply_os_shortcuts(&app, &rules)
+}
+
+/// Run the command an OS shortcut is bound to.
+#[cfg(feature = "desktop")]
+fn run_os_command(app: &tauri::AppHandle, command: &str) {
+    match command {
+        "os.summon" => {
+            // Summon always targets the PRIMARY window — "bring Ikenga to
+            // the front" means the main window, not whatever is focused
+            // (multi-window: intentionally stays "main").
+            if let Some(window) = app.get_webview_window("main") {
+                let visible = window.is_visible().unwrap_or(false);
+                if visible && window.is_focused().unwrap_or(false) {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }
+        "os.screenshot-window" | "os.screenshot-pane" => {
+            // Target the focused window that actually hosts the screenshot
+            // listener (`useScreenshotListener`, mounted only inside
+            // `<Workspace/>`). `focused_listener_window_label` returns a
+            // focused `Workspace`-kind spawned window (Flavor B) if any,
+            // else `None` — deliberately never a `single-surface`/`pane-set`
+            // detached window or a pkg-pane child webview, which have no
+            // listener. `None` → "main", exactly today's behavior; on
+            // WebKitGTK `is_focused` can under-report, which also falls back
+            // to "main" (safe). Detached-window capture also needs the
+            // listener + `capture_window_png` de-"main"'d before it lights
+            // up in practice.
+            let kind = if command == "os.screenshot-window" {
+                "window"
+            } else {
+                "pane-focused"
+            };
+            let target = crate::window::focused_listener_window_label(app)
+                .unwrap_or_else(|| "main".to_string());
+            let _ = crate::window::emit_to_label(
+                app,
+                &target,
+                "screenshot://shortcut",
+                serde_json::json!({ "kind": kind }),
+            );
+        }
+        // Any other action a personal OS rule names (§6): the primary
+        // window's dispatcher runs it through the command table.
+        other => {
+            let _ = crate::window::emit_to_label(
+                app,
+                "main",
+                "keymap://os-command",
+                serde_json::json!({ "command": other }),
+            );
+        }
+    }
+}
+
+/// Build the global-shortcut plugin. The handler looks the pressed shortcut
+/// up in `OsShortcuts` and runs the command it is bound to; the screenshot
+/// commands emit `screenshot://shortcut` events that the FE picks up and
+/// routes back through `screenshot_window` / `screenshot_pane`. Doing the
+/// focused-pane resolution in the FE avoids mirroring `usePaneStore` on the
+/// Rust side just for one handler.
 #[cfg(feature = "desktop")]
 fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
-    use tauri_plugin_global_shortcut::{Builder, Code, Modifiers, Shortcut, ShortcutState};
-
-    let summon = if cfg!(target_os = "macos") {
-        Shortcut::new(Some(Modifiers::ALT), Code::Space)
-    } else {
-        Shortcut::new(Some(Modifiers::SUPER), Code::Space)
-    };
-    let shot_window = Shortcut::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
-        Code::KeyS,
-    );
-    let shot_pane = Shortcut::new(
-        Some(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT),
-        Code::KeyP,
-    );
+    use tauri_plugin_global_shortcut::{Builder, ShortcutState};
 
     Builder::new()
         .with_handler(move |app, shortcut, event| {
             if event.state() != ShortcutState::Pressed {
                 return;
             }
-            if shortcut == &summon {
-                // Summon always targets the PRIMARY window — "bring Ikenga to
-                // the front" means the main window, not whatever is focused
-                // (multi-window: intentionally stays "main").
-                if let Some(window) = app.get_webview_window("main") {
-                    let visible = window.is_visible().unwrap_or(false);
-                    if visible && window.is_focused().unwrap_or(false) {
-                        let _ = window.hide();
-                    } else {
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
-            } else if shortcut == &shot_window {
-                // Target the focused window that actually hosts the screenshot
-                // listener (`useScreenshotListener`, mounted only inside
-                // `<Workspace/>`). `focused_listener_window_label` returns a
-                // focused `Workspace`-kind spawned window (Flavor B) if any,
-                // else `None` — deliberately never a `single-surface`/`pane-set`
-                // detached window or a pkg-pane child webview, which have no
-                // listener. `None` → "main", exactly today's behavior; on
-                // WebKitGTK `is_focused` can under-report, which also falls back
-                // to "main" (safe). Detached-window capture also needs the
-                // listener + `capture_window_png` de-"main"'d before it lights
-                // up in practice.
-                let target = crate::window::focused_listener_window_label(app)
-                    .unwrap_or_else(|| "main".to_string());
-                let _ = crate::window::emit_to_label(
-                    app,
-                    &target,
-                    "screenshot://shortcut",
-                    serde_json::json!({ "kind": "window" }),
-                );
-            } else if shortcut == &shot_pane {
-                let target = crate::window::focused_listener_window_label(app)
-                    .unwrap_or_else(|| "main".to_string());
-                let _ = crate::window::emit_to_label(
-                    app,
-                    &target,
-                    "screenshot://shortcut",
-                    serde_json::json!({ "kind": "pane-focused" }),
-                );
-            }
+            let Some(command) = app
+                .try_state::<OsShortcuts>()
+                .and_then(|state| state.command_for(shortcut))
+            else {
+                return;
+            };
+            run_os_command(app, &command);
         })
         .build()
 }
 
-/// ⌥Space on Mac, Super+Space on Linux. Toggle main window visibility.
+/// Boot: register the default OS rules until the webview pushes the
+/// effective set. Tolerant — a clash on one never kills the others.
 #[cfg(feature = "desktop")]
-fn register_summon_shortcut(
-    app: &tauri::AppHandle,
-) -> Result<(), tauri_plugin_global_shortcut::Error> {
-    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
-
-    let modifiers = if cfg!(target_os = "macos") {
-        Modifiers::ALT
-    } else {
-        Modifiers::SUPER
-    };
-    let shortcut = Shortcut::new(Some(modifiers), Code::Space);
-    app.global_shortcut().register(shortcut)?;
-    Ok(())
-}
-
-/// Ctrl+Alt+Shift+S = window screenshot, Ctrl+Alt+Shift+P = focused-pane
-/// screenshot. The plugin handler dispatches to the correct branch by
-/// matching the `Shortcut` value. Tolerant: each binding is registered
-/// individually so a clash on one doesn't kill the other.
-#[cfg(feature = "desktop")]
-fn register_screenshot_shortcuts(app: &tauri::AppHandle) {
-    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
-
-    let mods = Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT;
-    for (sc, label) in [
-        (Shortcut::new(Some(mods), Code::KeyS), "screenshot:window"),
-        (Shortcut::new(Some(mods), Code::KeyP), "screenshot:pane"),
-    ] {
-        if let Err(e) = app.global_shortcut().register(sc) {
-            // `log::` macros are dropped in this crate (no log→tracing
-            // bridge); use tracing so the warning actually emits.
-            tracing::warn!("{label} shortcut not registered (continuing): {e}");
+fn register_default_os_shortcuts(app: &tauri::AppHandle) {
+    app.manage(OsShortcuts::default());
+    for status in apply_os_shortcuts(app, &default_os_rules()) {
+        if !status.registered {
+            tracing::warn!(
+                "OS shortcut {} → {} not registered (continuing): {}",
+                status.key,
+                status.command,
+                status.reason.unwrap_or_default()
+            );
         }
     }
 }
