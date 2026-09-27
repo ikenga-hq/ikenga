@@ -39,10 +39,30 @@
 //   non-space character is `!`, or with a line starting (after spaces) with
 //   `!`, is refused (`bang-prompt`).
 //
+// A `seat` target (G-SEATS §9.1, WP-66) — an action's `target: "seat"` with
+// a `seat` name, or an `active` target while the Companion targets a seat —
+// resolves with `seats_resolve` (client `ui`, never `takeover`, never
+// `claimResume`), and the guards above apply to the route it returns: a `pty`
+// route gets every DEC-55 rule (so an `agent: 'unreported'` terminal is
+// refused), a vacant seat resumes headless on path H (`seats_resume`,
+// `fallback: 'fresh'`) — which project and package actions may use — and a
+// busy run queues (§4.5).
+//
 // The manifest `dispatch` kind and built-in "Hand to Chi" stay fill-only
 // and never come through here.
 
-import { chiResume, chiRun, type ChiRunResult } from '@/lib/tauri-cmd';
+import {
+	chiResume,
+	chiRun,
+	type ChiRunResult,
+	type SeatActor,
+	type SeatAddress,
+	type SeatRoute,
+	seatsQueue,
+	seatsResolve,
+	seatsResume,
+} from '@/lib/tauri-cmd';
+import { ensureSeatsLiveSync, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
 import { useCompanionStore } from '@/shell/companion/companion-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
@@ -64,6 +84,11 @@ export interface ChiSendRequest {
 	target: ChiTarget;
 	/** Required iff `target === 'engine'`. */
 	engineId?: string;
+	/** Required iff `target === 'seat'`: `<name>` or `<project>/<name>`. */
+	seat?: string;
+	/** The project a bare seat name resolves in: a project action's own
+	 *  project. Default: the active project. */
+	projectId?: string | null;
 	/** Where the action is defined. Only `personal` may inject into a PTY. */
 	scope: RunScope;
 }
@@ -74,6 +99,8 @@ export interface ChiSkillRequest {
 	args?: string;
 	target: ChiTarget;
 	engineId?: string;
+	seat?: string;
+	projectId?: string | null;
 	scope: RunScope;
 }
 
@@ -83,8 +110,16 @@ export interface ChiSendResult {
 	via: 'chi-run' | 'chi-resume' | 'pty';
 }
 
-/** Nothing to send to — the typed reason the runner reports. */
-export type ChiUnavailableReason = 'no-engine' | 'no-target' | 'bang-prompt' | 'permission-pending';
+/** Nothing to send to — the typed reason the runner reports. `no-seat`:
+ *  the seat is unknown; `seat-held`: another client holds it, or took it
+ *  over from this one (G-SEATS §5, §9.1). */
+export type ChiUnavailableReason =
+	| 'no-engine'
+	| 'no-target'
+	| 'bang-prompt'
+	| 'permission-pending'
+	| 'no-seat'
+	| 'seat-held';
 
 export class ChiUnavailableError extends Error {
 	readonly reason: ChiUnavailableReason;
@@ -106,6 +141,10 @@ export function companionTargetFor(target: ChiTarget, engineId?: string): Compan
 		case 'engine':
 			if (!engineId) throw new ChiUnavailableError('no-target', 'A `chi` run with target "engine" needs an engineId');
 			return { kind: 'new', engine_id: engineId };
+		case 'seat':
+			// A seat is addressed by name; `send` resolves it through
+			// `seats_resolve`, never through a Companion target.
+			throw new ChiUnavailableError('no-seat', 'A `chi` run with target "seat" is resolved by name, not mapped');
 	}
 }
 
@@ -210,32 +249,129 @@ function settled(result: ChiRunResult): string {
 	return result.run_id;
 }
 
+/**
+ * The DEC-55 PTY guards (module note) for an inject into terminal
+ * `sessionId`: personal only, a live Claude agent terminal only, no pending
+ * permission, no `!` line. Returns the text to type.
+ */
+function guardPtyInject(request: ChiSendRequest, sessionId: string | null): string {
+	if (request.scope !== 'personal') throw new ChiUnavailableError('no-target', PTY_SCOPE_REASON);
+	if (sessionId === null || !isAgentTerminal(sessionId)) {
+		throw new ChiUnavailableError('no-target', PLAIN_TERMINAL_REASON);
+	}
+	if (isNonClaudeAgent(sessionId)) throw new ChiUnavailableError('no-target', NON_CLAUDE_AGENT_REASON);
+	if (!isAgentLive(sessionId)) throw new ChiUnavailableError('no-target', AGENT_NOT_LIVE_REASON);
+	if (hasPendingPermission(sessionId)) {
+		throw new ChiUnavailableError('permission-pending', PERMISSION_PENDING_REASON);
+	}
+	const text = request.ptyPrompt ?? request.prompt;
+	if (isBangPrompt(text)) throw new ChiUnavailableError('bang-prompt', BANG_PROMPT_REASON);
+	return text;
+}
+
+export const NO_SEAT_REASON = 'That seat does not exist in this project.';
+
+export const SEAT_HELD_REASON =
+	'Another client holds that seat — an action never takes over. Release it, or take it over from the Companion.';
+
+/** §9.1: a bare name resolves in the action's project (a project action)
+ *  or the active one; `<project>/<name>` is used as written. */
+export function seatAddressFor(seat: string, projectId?: string | null): SeatAddress {
+	const trimmed = seat.trim();
+	if (trimmed.includes('/')) return { address: trimmed };
+	const project = projectId ?? useShellStore.getState().activeProject.id;
+	return { address: project ? `${project}/${trimmed}` : trimmed };
+}
+
+/** A `seats_*` rejection as the runner's typed refusal (§9.1). */
+function seatUnavailable(err: unknown): unknown {
+	const seatErr = seatErrorOf(err);
+	if (!seatErr) return err;
+	switch (seatErr.code) {
+		case 'seat_not_found':
+		case 'invalid_address':
+			return new ChiUnavailableError('no-seat', NO_SEAT_REASON);
+		case 'seat_held':
+		case 'seat_taken_over':
+			return new ChiUnavailableError('seat-held', `${SEAT_HELD_REASON} (${seatErr.message})`);
+		case 'agent_not_live':
+			return new ChiUnavailableError('no-target', AGENT_NOT_LIVE_REASON);
+		default:
+			return new Error(seatErr.message);
+	}
+}
+
+/**
+ * §9.1 runner resolution: `seats_resolve` (client `ui`, no takeover, no
+ * claim), then the fail-closed guards on the route. A `seat_not_vacant` /
+ * `seat_resuming` race resolves once more.
+ */
+async function sendToSeat(request: ChiSendRequest, seat: SeatAddress, retried = false): Promise<ChiSendResult> {
+	const actor: SeatActor = { client: UI_SEAT_CLIENT };
+	let route: SeatRoute;
+	try {
+		route = await seatsResolve(seat, actor);
+	} catch (err) {
+		throw seatUnavailable(err);
+	}
+	try {
+		switch (route.route) {
+			case 'pty': {
+				// Every DEC-55 guard, exactly as an `active` target on a PTY; an
+				// `agent: 'unreported'` route is a non-Claude agent — refused.
+				const text = guardPtyInject(request, route.terminal_id);
+				if (route.agent !== 'live') throw new ChiUnavailableError('no-target', NON_CLAUDE_AGENT_REASON);
+				const inject = resolveTarget({ kind: 'session', session_id: route.terminal_id });
+				if (inject.kind !== 'pty') throw new ChiUnavailableError('no-target', AGENT_NOT_LIVE_REASON);
+				await inject.send(text);
+				return { runId: null, via: 'pty' };
+			}
+			case 'chi-resume': {
+				if (route.busy) {
+					// §4.5: never `chi_resume` over a turn in flight — queue. E-4:
+					// subscribe first, so a dropped text is never silent.
+					ensureSeatsLiveSync();
+					await seatsQueue(route.seat.id, request.prompt, actor);
+					return { runId: route.run_id, via: 'chi-resume' };
+				}
+				return { runId: settled(await chiResume(route.run_id, request.prompt)), via: 'chi-resume' };
+			}
+			case 'vacant': {
+				// Path H (headless): resume, or start fresh when it can't (§6.2).
+				const result = await seatsResume(route.seat.id, request.prompt, actor, { fallback: 'fresh' });
+				return { runId: result.run_id, via: result.outcome === 'resumed' ? 'chi-resume' : 'chi-run' };
+			}
+		}
+	} catch (err) {
+		const code = seatErrorOf(err)?.code;
+		if ((code === 'seat_not_vacant' || code === 'seat_resuming') && !retried) {
+			return sendToSeat(request, seat, true);
+		}
+		throw seatUnavailable(err);
+	}
+}
+
 /** Sends `prompt` to the resolved Chi target and returns the run id. */
 export async function send(request: ChiSendRequest): Promise<ChiSendResult> {
+	if (request.target === 'seat') {
+		if (!request.seat?.trim()) {
+			throw new ChiUnavailableError('no-seat', 'A `chi` run with target "seat" needs a seat name');
+		}
+		return sendToSeat(request, seatAddressFor(request.seat, request.projectId));
+	}
 	const target = companionTargetFor(request.target, request.engineId);
+	if (target.kind === 'seat') return sendToSeat(request, { seatId: target.seat_id });
 	const resolved = resolveTarget(target);
 	switch (resolved.kind) {
 		case 'none':
 			throw new ChiUnavailableError('no-engine', resolved.disabledReason ?? 'No Chi target is available');
+		case 'seat':
+			// Unreachable: a seat target went to `sendToSeat` above.
+			throw new ChiUnavailableError('no-seat', NO_SEAT_REASON);
 		case 'pty': {
-			// DEC-55 (module note): personal only, a live Claude agent terminal
-			// only, no pending permission, no control characters from values,
-			// no `!` line.
-			if (request.scope !== 'personal') throw new ChiUnavailableError('no-target', PTY_SCOPE_REASON);
-			if (target.kind !== 'session' || !isAgentTerminal(target.session_id)) {
-				throw new ChiUnavailableError('no-target', PLAIN_TERMINAL_REASON);
-			}
-			if (isNonClaudeAgent(target.session_id)) {
-				throw new ChiUnavailableError('no-target', NON_CLAUDE_AGENT_REASON);
-			}
-			if (!isAgentLive(target.session_id)) throw new ChiUnavailableError('no-target', AGENT_NOT_LIVE_REASON);
-			if (hasPendingPermission(target.session_id)) {
-				throw new ChiUnavailableError('permission-pending', PERMISSION_PENDING_REASON);
-			}
-			const text = request.ptyPrompt ?? request.prompt;
-			if (isBangPrompt(text)) throw new ChiUnavailableError('bang-prompt', BANG_PROMPT_REASON);
-			// The dispatch path's own PTY write (context line omitted: the
-			// action's template is the whole message).
+			// DEC-55 (module note). The dispatch path's own PTY write (context
+			// line omitted: the action's template is the whole message).
+			const text = guardPtyInject(request, target.kind === 'session' ? target.session_id : null);
 			await resolved.send(text);
 			return { runId: null, via: 'pty' };
 		}
@@ -283,6 +419,8 @@ export async function invokeSkill(request: ChiSkillRequest): Promise<ChiSendResu
 		ptyPrompt: skillPrompt(request.skill, request.args === undefined ? undefined : stripPtyControls(request.args)),
 		target: request.target,
 		...(request.engineId ? { engineId: request.engineId } : {}),
+		...(request.seat ? { seat: request.seat } : {}),
+		...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
 		scope: request.scope,
 	});
 }

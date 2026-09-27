@@ -27,6 +27,10 @@ import { attachRemotePty, createDaemonPtySocketOpener } from '../lib/transport/p
 export interface PtySpawnOpts extends RawPtySpawnOpts {
 	/** Human-readable label, e.g. `bash -l`. Used for status messages. */
 	label?: string;
+	/** Skip the pty-daemon and spawn in-process, even when the daemon is up.
+	 *  For a PTY Rust must see — e.g. a Chi seat's terminal (G-SEATS P-10:
+	 *  daemon terminals can't be seated). */
+	forceEphemeral?: boolean;
 }
 
 export type PtyDataHandler = (bytes: Uint8Array) => void;
@@ -311,7 +315,7 @@ export class Pty {
 	 * Spawn a new PTY and start listening on its event streams.
 	 */
 	static async spawn(opts: PtySpawnOpts): Promise<Pty> {
-		const daemonInfo = await getDaemonInfo();
+		const daemonInfo = opts.forceEphemeral ? null : await getDaemonInfo();
 		if (daemonInfo?.available) {
 			try {
 				const res = await fetch(`${daemonInfo.httpUrl}/api/rpc`, {

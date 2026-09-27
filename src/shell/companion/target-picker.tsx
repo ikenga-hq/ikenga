@@ -11,6 +11,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState, OfflineState } from '@/components/states';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
+import { useSeats } from '@/lib/queries/seats';
 import { chiList, type DetectedAgent, detectAgents } from '@/lib/tauri-cmd';
 import { viewLabel } from '@/shell/panes/pane-views';
 import { useTerminalStore } from '@/terminal/session-store';
@@ -28,9 +29,10 @@ interface PickerItem {
 }
 
 function sameTarget(a: CompanionTarget, b: CompanionTarget): boolean {
-	if (a.kind !== b.kind) return false;
 	if (a.kind === 'session' && b.kind === 'session') return a.session_id === b.session_id;
-	if (a.kind !== 'session' && b.kind !== 'session') return a.engine_id === b.engine_id;
+	if (a.kind === 'seat' && b.kind === 'seat') return a.seat_id === b.seat_id;
+	if (a.kind === 'new' && b.kind === 'new') return a.engine_id === b.engine_id;
+	if (a.kind === 'persistent' && b.kind === 'persistent') return a.engine_id === b.engine_id;
 	return false;
 }
 
@@ -38,9 +40,12 @@ function sameTarget(a: CompanionTarget, b: CompanionTarget): boolean {
 export function useTargetLabel(target: CompanionTarget): string {
 	const resolveTerminal = useTerminalTitles();
 	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
+	const projectId = useShellStore((s) => s.activeProject.id);
 	const hasTerminal = useTerminalStore((s) =>
 		target.kind === 'session' ? s.tabs.some((t) => t.id === target.session_id) : false
 	);
+	// G-SEATS §9.4: a seat target labels from the roster cache (`@name`, §1.3).
+	const seats = useSeats(projectId ?? null, { enabled: target.kind === 'seat' });
 	switch (target.kind) {
 		case 'session':
 			return hasTerminal
@@ -50,6 +55,13 @@ export function useTargetLabel(target: CompanionTarget): string {
 			return `New session · ${target.engine_id ?? defaultEngineId ?? 'no engine'}`;
 		case 'persistent':
 			return `Persistent run · ${target.engine_id ?? defaultEngineId ?? 'no engine'}`;
+		case 'seat': {
+			const seat = seats.data?.find((s) => s.id === target.seat_id);
+			if (!seat) return seats.data ? 'Seat removed' : 'Seat…';
+			return seat.status === 'vacant'
+				? `@${seat.name} · ${seat.engine_id} · vacant`
+				: `@${seat.name} · ${seat.engine_id}`;
+		}
 	}
 }
 

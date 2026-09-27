@@ -36,6 +36,7 @@ export function runSummary(action: EffectiveAction): RunSummary {
 				rows: [
 					['target', run.target],
 					...(run.engineId ? ([['engine', run.engineId]] as Array<[string, string]>) : []),
+					...(run.seat ? ([['seat', run.seat]] as Array<[string, string]>) : []),
 					['prompt', run.prompt],
 				],
 			};

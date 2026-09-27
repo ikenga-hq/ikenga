@@ -16,7 +16,8 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { iykeFetch } from '@/lib/iyke/client';
 import type { PaneView } from '@/lib/panes/types';
-import { useShellStore } from '@/lib/shell/shell-store';
+import { cachedSeats } from '@/lib/queries/seats';
+import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { fsRead, fsWriteText } from '@/lib/tauri-cmd';
 import { scopedPersistName } from '@/lib/window/window-context';
 
@@ -380,6 +381,30 @@ export function handToChi(text: string): void {
 	const s = useCompanionStore.getState();
 	s.setDraft(text);
 	s.focusDispatch();
+}
+
+/**
+ * G-SEATS §9.1 / pin P-3: seats are per project (DEC-68), so after a project
+ * switch a seat target whose seat isn't in the new project's roster resets to
+ * the default target. Seat ids are unique across projects, so an unloaded
+ * roster can't hold it either. Every other target is kept.
+ */
+export function targetAfterProjectSwitch(
+	target: CompanionTarget,
+	roster: readonly { id: string }[] | undefined
+): CompanionTarget {
+	if (target.kind !== 'seat') return target;
+	if (roster?.some((seat) => seat.id === target.seat_id)) return target;
+	return { kind: 'new', engine_id: null };
+}
+
+if (typeof useShellStore.subscribe === 'function') {
+	useShellStore.subscribe((state, prev) => {
+		if (!prev || state.activeProject.id === prev.activeProject.id) return;
+		const target = state.companion.activeTarget;
+		const next = targetAfterProjectSwitch(target, cachedSeats(state.activeProject.id));
+		if (next !== target) state.setCompanionTarget(next);
+	});
 }
 
 /** Test seam: drop every pending undo timer. */

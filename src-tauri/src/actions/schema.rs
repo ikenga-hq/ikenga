@@ -1189,8 +1189,9 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
     };
     let known: &[&str] = match kind {
         "chi" => {
-            match object.get("target").and_then(Value::as_str) {
-                Some("active" | "new") => {
+            let target = object.get("target").and_then(Value::as_str);
+            match target {
+                Some("active" | "new" | "seat") => {
                     if object.contains_key("engineId") {
                         v.error(
                             "E_RUN_KIND",
@@ -1203,8 +1204,31 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
                 _ => v.error(
                     "E_RUN_KIND",
                     pointer(path, "target"),
-                    "a `chi` run needs target \"active\", \"new\" or \"engine\"",
+                    "a `chi` run needs target \"active\", \"new\", \"engine\" or \"seat\"",
                 ),
+            }
+            // G-SEATS §9.1: `seat` is required iff target is "seat", and is
+            // `<name>` or `<project>/<name>`.
+            if target == Some("seat") {
+                match object.get("seat") {
+                    Some(Value::String(seat)) if is_chi_seat_ref(seat) => {}
+                    Some(Value::String(_)) => v.error(
+                        "E_FIELD",
+                        pointer(path, "seat"),
+                        "seat must be `<name>` or `<project>/<name>` (lowercase letters, digits and `-`)",
+                    ),
+                    _ => v.error(
+                        "E_RUN_KIND",
+                        pointer(path, "seat"),
+                        "a `chi` run with target \"seat\" needs a string `seat`",
+                    ),
+                }
+            } else if object.contains_key("seat") {
+                v.error(
+                    "E_RUN_KIND",
+                    pointer(path, "seat"),
+                    "seat is only valid with target \"seat\"",
+                );
             }
             match object.get("prompt") {
                 Some(Value::String(_)) => {}
@@ -1214,7 +1238,7 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
                     "a `chi` run needs a string `prompt`",
                 ),
             }
-            &["kind", "target", "engineId", "prompt"]
+            &["kind", "target", "engineId", "seat", "prompt"]
         }
         "shell" => {
             required_string("command", v);
@@ -1269,6 +1293,21 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
                 }
             }
         }
+    }
+}
+
+/// A `chi` run's `seat` value (G-SEATS §9.1): `<name>` or `<project>/<name>`.
+/// The name follows §1.2 and the project the project-slug rule (§3.1) — the
+/// seat store's own validators, so the grammar has one copy (the project-slug
+/// copy is held to `projects.rs` by a test there). Whether the seat exists is
+/// only known at run time (`seats_resolve`).
+fn is_chi_seat_ref(value: &str) -> bool {
+    use crate::iyke::seats::{validate_project_slug, validate_seat_name};
+    match value.split_once('/') {
+        Some((project, name)) => {
+            validate_project_slug(project).is_ok() && validate_seat_name(name).is_ok()
+        }
+        None => validate_seat_name(value).is_ok(),
     }
 }
 
@@ -1677,6 +1716,49 @@ mod tests {
             document["actions"][0]["run"] = run;
             assert!(validate_document(c, &document).is_ok());
         }
+    }
+
+    #[test]
+    fn chi_seat_target_requires_a_seat_field() {
+        // G-SEATS §9.1 / G-ACTIONS §8.1 (amended, Round 46).
+        let c = ctx(FileKind::Actions, SettingsScope::Personal);
+        let mut document = personal_actions();
+        for run in [
+            json!({ "kind": "chi", "target": "seat", "seat": "lead", "prompt": "x" }),
+            json!({ "kind": "chi", "target": "seat", "seat": "royalti-co/lead", "prompt": "{{selection}}" }),
+            json!({ "kind": "chi", "target": "seat", "seat": "a", "prompt": "x" }),
+        ] {
+            document["actions"][0]["run"] = run;
+            let v = validate_document(c, &document);
+            assert!(v.is_ok(), "{:?}", v.errors);
+            // `seat` is a known key: no unknown-key warning.
+            assert!(
+                !v.warnings.iter().any(|w| w.code == "W_UNKNOWN_FIELD"),
+                "{:?}",
+                v.warnings
+            );
+        }
+        // Missing, or not a string.
+        document["actions"][0]["run"] = json!({ "kind": "chi", "target": "seat", "prompt": "x" });
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_RUN_KIND"]);
+        document["actions"][0]["run"] = json!({ "kind": "chi", "target": "seat", "seat": 3, "prompt": "x" });
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_RUN_KIND"]);
+        // Bad grammar.
+        for seat in ["", "Lead", "-lead", "lead-", "a/b/c", "/lead", "proj/", "seat:p/lead", "@lead"] {
+            document["actions"][0]["run"] =
+                json!({ "kind": "chi", "target": "seat", "seat": seat, "prompt": "x" });
+            assert_eq!(
+                codes(&validate_document(c, &document).errors),
+                vec!["E_FIELD"],
+                "seat {seat:?}"
+            );
+        }
+        // `seat` is invalid with any other target; `engineId` is invalid with "seat".
+        document["actions"][0]["run"] = json!({ "kind": "chi", "target": "new", "seat": "lead", "prompt": "x" });
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_RUN_KIND"]);
+        document["actions"][0]["run"] =
+            json!({ "kind": "chi", "target": "seat", "seat": "lead", "engineId": "codex", "prompt": "x" });
+        assert_eq!(codes(&validate_document(c, &document).errors), vec!["E_RUN_KIND"]);
     }
 
     #[test]

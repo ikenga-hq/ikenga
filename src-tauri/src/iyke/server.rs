@@ -70,6 +70,10 @@ use super::projects::{
     get_project_active, get_project_list, post_project_archive, post_project_create,
     post_project_set_active, post_project_update,
 };
+use super::seat_routes::{
+    get_seats_get, get_seats_list, post_seats_clear, post_seats_create, post_seats_fill,
+    post_seats_release, post_seats_resume, post_seats_send,
+};
 use super::secrets::{
     get_secret, get_secret_list, get_secret_lock_state, post_secret_delete, post_secret_set,
 };
@@ -262,6 +266,15 @@ pub async fn serve(
         .route("/iyke/chi/status", get(get_chi_status))
         .route("/iyke/chi/list", get(get_chi_list))
         .route("/iyke/chi/cancel", post(post_chi_cancel))
+        // Chi seats (WP-70, G-SEATS §7.2) — thin calls into `iyke::seats`.
+        .route("/iyke/seats/list", get(get_seats_list))
+        .route("/iyke/seats/get", get(get_seats_get))
+        .route("/iyke/seats/create", post(post_seats_create))
+        .route("/iyke/seats/resume", post(post_seats_resume))
+        .route("/iyke/seats/fill", post(post_seats_fill))
+        .route("/iyke/seats/clear", post(post_seats_clear))
+        .route("/iyke/seats/send", post(post_seats_send))
+        .route("/iyke/seats/release", post(post_seats_release))
         // Claude config (Phase 4 — 4-tier discovery + pins).
         .route("/iyke/claude/assets", get(get_claude_assets_list))
         .route("/iyke/claude/asset/pin", post(post_claude_asset_pin))
