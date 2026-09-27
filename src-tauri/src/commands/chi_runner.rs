@@ -92,6 +92,7 @@ pub(crate) fn spawn_detached_runner(
         kill_on_drop: false,
         no_console_window: true,
         detached: true,
+        new_process_group: false,
     };
     let child = crate::executor::current()
         .spawn_piped(spec, opts)
@@ -604,6 +605,7 @@ mod tests {
                     kill_on_drop: false,
                     no_console_window: true,
                     detached: true,
+                    new_process_group: false,
                 },
             )
             .unwrap()

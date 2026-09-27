@@ -10,14 +10,26 @@
 //! are processed — per-call MCPs and pure UI pkgs don't need a `node_modules`.
 
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::manifest::Manifest;
-use crate::platform::NoConsoleWindow;
 use crate::runtime::augmented_path;
+
+/// `std::process::Command::output()`'s own stdio defaults (stdin null,
+/// stdout + stderr captured), named explicitly for the executor's blocking
+/// path, plus the console-flash suppression the inline spawns applied.
+const OUTPUT_OPTS: PipedOpts = PipedOpts {
+    stdin: StdioMode::Null,
+    stdout: StdioMode::Piped,
+    stderr: StdioMode::Piped,
+    kill_on_drop: false,
+    no_console_window: true,
+    detached: false,
+    new_process_group: false,
+};
 
 /// Minimal `package.json` shape — we only need to read `dependencies`.
 #[derive(Debug, Deserialize)]
@@ -201,12 +213,12 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
     let manifest_backup = write_sanitized_package_json(install_path, &sanitized)
         .context("write sanitized package.json for npm")?;
 
-    let output = Command::new(&npm)
+    let mut npm_spec = SpawnSpec::new(&npm);
+    npm_spec
         .args(["install", "--omit=dev", "--no-audit", "--no-fund"])
         .current_dir(install_path)
-        .env("PATH", search_path)
-        .no_console_window()
-        .output();
+        .env("PATH", search_path);
+    let output = crate::executor::current().spawn_output_blocking(npm_spec, OUTPUT_OPTS);
 
     // Restore the pkg's own package.json before inspecting the result, so a
     // failure can never leave the pkg with our synthesized one on disk.
@@ -231,12 +243,13 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
         .or_else(|_| which::which_in("bun", Some(search_path), std::env::current_dir().unwrap_or_default()))
     {
         log::info!("falling back to bun install for {}", install_path.display());
-        let output = Command::new(&bun)
+        let mut bun_spec = SpawnSpec::new(&bun);
+        bun_spec
             .args(["install", "--production"])
             .current_dir(install_path)
-            .env("PATH", search_path)
-            .no_console_window()
-            .output()
+            .env("PATH", search_path);
+        let output = crate::executor::current()
+            .spawn_output_blocking(bun_spec, OUTPUT_OPTS)
             .context("spawn bun install")?;
 
         if output.status.success() {

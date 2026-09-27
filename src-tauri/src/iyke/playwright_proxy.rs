@@ -27,17 +27,16 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::commands::db::PaDb;
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 /// The installed pkg id whose `install_path` carries the prebuilt sidecar.
 const SIDECAR_PKG_ID: &str = "com.ikenga.sidecar-playwright-browser";
@@ -174,7 +173,7 @@ impl PlaywrightProxy {
             .parent()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf());
-        let mut cmd = Command::new("node");
+        let mut cmd = SpawnSpec::new("node");
         // Augment PATH the same way agent spawns do so an nvm-managed `node`
         // (invisible to the app's inherited GUI-launch PATH) still resolves
         // (WP-A1.5; ADR-013 §Addendum Decision 2).
@@ -182,15 +181,22 @@ impl PlaywrightProxy {
         // HEADFUL so a human can watch / log in / review (Need-1). Autonomous
         // callers opt into headless per-pane via the `headless` field on open.
         cmd.arg(&entry)
-            .env("PATH", crate::runtime::augmented_path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .no_console_window();
+            .env("PATH", crate::runtime::augmented_path());
         if let Some(dir) = &pkg_dir {
             cmd.current_dir(dir);
         }
-        let mut child = match cmd.spawn() {
+        let opts = PipedOpts {
+            // Explicit form of the inline spawn's implicit default: a
+            // tokio `spawn()` with stdin unset inherits it.
+            stdin: StdioMode::Inherit,
+            stdout: StdioMode::Piped,
+            stderr: StdioMode::Inherit,
+            kill_on_drop: true,
+            no_console_window: true,
+            detached: false,
+            new_process_group: false,
+        };
+        let mut child = match crate::executor::current().spawn_piped(cmd, opts) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // `node` not on PATH → precise prerequisite error (WP-A1.5).

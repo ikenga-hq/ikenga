@@ -20,11 +20,10 @@
 //! half-written canonical and never mutates `registry.json`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 
 use super::registry;
 use super::{
@@ -89,14 +88,27 @@ fn ensure_file_based(kind: Kind) -> Result<(), String> {
 
 // ─── git / npx invocation (shell out; public-only) ───────────────────────────
 
+/// `std::process::Command::output()`'s own stdio defaults (stdin null,
+/// stdout + stderr captured), named explicitly for the executor's blocking
+/// path (WP-18b), plus the console-flash suppression the inline spawns
+/// applied.
+const OUTPUT_OPTS: PipedOpts = PipedOpts {
+    stdin: StdioMode::Null,
+    stdout: StdioMode::Piped,
+    stderr: StdioMode::Piped,
+    kill_on_drop: false,
+    no_console_window: true,
+    detached: false,
+    new_process_group: false,
+};
+
 fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, String> {
-    let mut c = Command::new(cmd);
+    let mut c = SpawnSpec::new(cmd);
     c.args(args);
     if let Some(d) = cwd {
         c.current_dir(d);
     }
-    c.no_console_window();
-    c.output().map_err(|e| {
+    crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{cmd}` not found on PATH — install it to use {cmd}-sourced primitives")
         } else {
@@ -167,16 +179,15 @@ fn git_ls_remote_sha(url: &str, ref_: Option<&str>) -> Result<String, String> {
 /// the Claude `skills` CLI writes lands under our isolated tree (never the user's
 /// real `~/.claude`). We adopt the written skill from there.
 fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
-    let mut c = Command::new("npx");
+    let mut c = SpawnSpec::new("npx");
     c.args(["--yes", "skills", "add", spec])
         .current_dir(staging)
         .env("HOME", staging)
         // Node's `os.homedir()` reads %USERPROFILE% on Windows, not $HOME —
         // without this the sandbox is a no-op there and `skills add` writes
         // into the real user profile instead of `staging`.
-        .env("USERPROFILE", staging)
-        .no_console_window();
-    let out = c.output().map_err(|e| {
+        .env("USERPROFILE", staging);
+    let out = crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
         } else {
@@ -199,14 +210,13 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
 /// network/impure edge; the bundle core takes it as an injected fn so the
 /// materialization + members + registry logic stays pure/tempdir-testable.
 fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
-    let mut c = Command::new("npx");
+    let mut c = SpawnSpec::new("npx");
     c.args(["--yes", "skills", "add", spec, "--skill", "*"])
         .current_dir(staging)
         .env("HOME", staging)
         // See npx_skills_add: os.homedir() reads %USERPROFILE% on Windows.
-        .env("USERPROFILE", staging)
-        .no_console_window();
-    let out = c.output().map_err(|e| {
+        .env("USERPROFILE", staging);
+    let out = crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
         } else {

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use regex::Regex;
 use serde::Serialize;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::known::{
@@ -17,8 +16,33 @@ use super::known::{
 // Only `lookup_wsl_executable` reads the family tag directly.
 #[cfg(windows)]
 use super::known::TargetFamily;
-#[cfg(windows)]
-use crate::platform::NoConsoleWindow;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
+
+/// tokio `Command::output()`'s stdio (stdin left unset, so inherited; stdout
+/// + stderr captured), named explicitly for the executor seam (WP-18b), plus
+/// the `kill_on_drop` every probe asked for so a timed-out probe is reaped
+/// with its dropped future. `no_console_window` is a no-op off Windows, which
+/// is what the old Windows-only call amounted to.
+const PROBE_OUTPUT_OPTS: PipedOpts = PipedOpts {
+    stdin: StdioMode::Inherit,
+    stdout: StdioMode::Piped,
+    stderr: StdioMode::Piped,
+    kill_on_drop: true,
+    no_console_window: true,
+    detached: false,
+    new_process_group: false,
+};
+
+/// `tokio::process::Command::output()` through the executor: the spawn
+/// happens when this is called (as `output()`'s does), the wait when the
+/// returned future is polled — so wrapping it in `timeout` behaves exactly
+/// as wrapping `cmd.output()` did.
+fn probe_output(
+    spec: SpawnSpec,
+) -> impl std::future::Future<Output = std::io::Result<std::process::Output>> {
+    let child = crate::executor::current().spawn_piped(spec, PROBE_OUTPUT_OPTS);
+    async { child?.wait_with_output().await }
+}
 
 // Windows cold start: a freshly-installed CLI's first exec can take
 // 500ms-1.7s+ while Defender scans the new binary before letting it run.
@@ -181,10 +205,18 @@ pub(crate) fn wsl_which(name: &str) -> Option<String> {
     if !has_wsl {
         return None;
     }
-    let output = std::process::Command::new("wsl.exe")
-        .args(["bash", "-l", "-c", &format!("which {name}")])
-        .no_console_window()
-        .output()
+    let mut spec = SpawnSpec::new("wsl.exe");
+    spec.args(["bash", "-l", "-c", &format!("which {name}")]);
+    // std `Command::output()`'s stdio (stdin null, stdout + stderr captured)
+    // on the executor's blocking path; this whole chain is sync.
+    let output = crate::executor::current()
+        .spawn_output_blocking(
+            spec,
+            PipedOpts {
+                stdin: StdioMode::Null,
+                ..PROBE_OUTPUT_OPTS
+            },
+        )
         .ok()?;
     if !output.status.success() {
         return None;
@@ -296,7 +328,9 @@ fn is_executable(p: &std::path::Path) -> bool {
     }
 }
 
-fn create_agent_command(exec: &std::path::Path) -> Command {
+/// The spec for running an agent CLI. Console-flash suppression moved to the
+/// opts (`no_console_window: true` everywhere; a no-op off Windows).
+fn create_agent_command(exec: &std::path::Path) -> SpawnSpec {
     #[cfg(windows)]
     {
         let is_batch = exec
@@ -305,19 +339,16 @@ fn create_agent_command(exec: &std::path::Path) -> Command {
             .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
             .unwrap_or(false);
         if is_batch {
-            let mut cmd = Command::new("cmd.exe");
+            let mut cmd = SpawnSpec::new("cmd.exe");
             cmd.arg("/c").arg(exec);
-            cmd.no_console_window();
             cmd
         } else {
-            let mut cmd = Command::new(exec);
-            cmd.no_console_window();
-            cmd
+            SpawnSpec::new(exec)
         }
     }
     #[cfg(not(windows))]
     {
-        Command::new(exec)
+        SpawnSpec::new(exec)
     }
 }
 
@@ -327,17 +358,14 @@ async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> O
         let exec_str = exec.to_string_lossy();
         if let Some(rest) = exec_str.strip_prefix("wsl:") {
             let bin_name = rest.split(':').next().unwrap_or(rest);
-            let mut cmd = Command::new("wsl.exe");
+            let mut cmd = SpawnSpec::new("wsl.exe");
             cmd.args(["bash", "-l", "-c", &format!("{bin_name} {arg}")]);
-            cmd.kill_on_drop(true);
-            cmd.no_console_window();
-            (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+            (timeout(DEFAULT_VERSION_TIMEOUT, probe_output(cmd)).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
         } else {
             let mut cmd = create_agent_command(exec);
             cmd.arg(arg);
             cmd.env("PATH", crate::runtime::augmented_path());
-            cmd.kill_on_drop(true);
-            (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+            (timeout(DEFAULT_VERSION_TIMEOUT, probe_output(cmd)).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
         }
     };
     #[cfg(not(windows))]
@@ -345,8 +373,7 @@ async fn probe_version(exec: &std::path::Path, arg: &str, re: Option<&str>) -> O
         let mut cmd = create_agent_command(exec);
         cmd.arg(arg);
         cmd.env("PATH", crate::runtime::augmented_path());
-        cmd.kill_on_drop(true);
-        (timeout(DEFAULT_VERSION_TIMEOUT, cmd.output()).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
+        (timeout(DEFAULT_VERSION_TIMEOUT, probe_output(cmd)).await, re.unwrap_or(super::known::DEFAULT_VERSION_REGEX))
     };
     let output = output_res.ok()?.ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -481,14 +508,19 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
     let mut child = create_agent_command(exec);
     child
         .args(args)
-        .env("PATH", crate::runtime::augmented_path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .env("PATH", crate::runtime::augmented_path());
+    let opts = PipedOpts {
+        stdin: StdioMode::Piped,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Null,
+        kill_on_drop: true,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
-    let mut spawned = child
-        .spawn()
+    let mut spawned = crate::executor::current()
+        .spawn_piped(child, opts)
         .map_err(|e| format!("spawn `{}` failed: {e}", exec.display()))?;
 
     let stdin = spawned
@@ -604,11 +636,9 @@ async fn probe_auth_exec(
             let bin_name = rest.split(':').next().unwrap_or(cmd);
             let args_joined = args.join(" ");
             let full_cmd = format!("{bin_name} {args_joined}");
-            let mut command = Command::new("wsl.exe");
+            let mut command = SpawnSpec::new("wsl.exe");
             command.args(["bash", "-l", "-c", &full_cmd]);
-            command.kill_on_drop(true);
-            command.no_console_window();
-            let fut = command.output();
+            let fut = probe_output(command);
             match timeout(Duration::from_millis(timeout_ms), fut).await {
                 Ok(Ok(out)) => {
                     if out.status.success() {
@@ -654,8 +684,7 @@ async fn probe_auth_exec(
             let mut command = create_agent_command(&target);
             command.args(args);
             command.env("PATH", crate::runtime::augmented_path());
-            command.kill_on_drop(true);
-            let fut = command.output();
+            let fut = probe_output(command);
             match timeout(Duration::from_millis(timeout_ms), fut).await {
                 Ok(Ok(out)) => {
                     if out.status.success() {
@@ -705,8 +734,7 @@ async fn probe_auth_exec(
         let mut command = create_agent_command(&target);
         command.args(args);
         command.env("PATH", crate::runtime::augmented_path());
-        command.kill_on_drop(true);
-        let fut = command.output();
+        let fut = probe_output(command);
         match timeout(Duration::from_millis(timeout_ms), fut).await {
             Ok(Ok(out)) => {
                 if out.status.success() {
