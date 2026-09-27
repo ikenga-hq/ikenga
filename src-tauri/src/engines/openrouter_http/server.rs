@@ -582,7 +582,7 @@ impl OpenRouterHttpEngine {
             .clone()
     }
 
-    async fn existing_session(&self, thread_id: &str) -> Option<Arc<TokioMutex<OpenRouterSession>>> {
+    pub(crate) async fn existing_session(&self, thread_id: &str) -> Option<Arc<TokioMutex<OpenRouterSession>>> {
         self.sessions.lock().await.get(thread_id).cloned()
     }
 

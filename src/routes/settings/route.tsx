@@ -13,6 +13,7 @@ import {
 	SettingsNav,
 	settingsIykeLine,
 	settingsSection,
+	type SettingsFieldRoute,
 	type SettingsSectionId,
 	type SettingsScopeId,
 } from '@/shell/settings/nav';
@@ -69,9 +70,11 @@ function SettingsLayout() {
 		[scope, projectId, projectRoot, document.result, overrides, document.isLoading, document.refresh]
 	);
 
-	function goToSection(id: SettingsSectionId) {
+	function goToSection(id: SettingsSectionId, route?: SettingsFieldRoute) {
 		setSearch('');
-		void navigate({ to: `/settings/${id}` });
+		// A search hit can land on a sub-route (Profile › App lock, WP-72).
+		if (route) void navigate({ to: route });
+		else void navigate({ to: `/settings/${id}` });
 	}
 
 	const iykeLine = settingsIykeLine(activeId, scope);

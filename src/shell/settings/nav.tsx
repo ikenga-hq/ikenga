@@ -34,7 +34,13 @@ export interface SettingsFieldMeta {
 	label: string;
 	help?: string;
 	keywords?: string;
+	/** Where a search hit lands when it isn't the section's own route (D-05's
+	 *  Profile tab lives under People at `/settings/profile`, WP-72). */
+	route?: SettingsFieldRoute;
 }
+
+/** Sub-routes a settings search hit can land on. */
+export type SettingsFieldRoute = '/settings/profile' | '/settings/devices';
 
 export interface SettingsSectionMeta {
 	id: SettingsSectionId;
@@ -137,8 +143,22 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		description: 'Who this workspace is shared with, and on which devices.',
 		fields: [
 			{ field: null, label: 'Members' },
-			{ field: null, label: 'Devices' },
+			{
+				field: null,
+				label: 'Devices',
+				help: 'remote access, tailnet address, bearer token',
+				route: '/settings/devices',
+			},
 			{ field: null, label: 'Pending invites' },
+			// WP-72 (D-05 local surfaces): /settings/profile.
+			{ field: null, label: 'Profile', help: 'display name, OS user', route: '/settings/profile' },
+			{
+				field: null,
+				label: 'App lock',
+				help: 'lock when idle, PIN, lock now',
+				keywords: 'passcode',
+				route: '/settings/profile',
+			},
 		],
 	},
 	{
@@ -170,8 +190,22 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
 	{ label: 'System', ids: ['storage', 'about'] },
 ];
 
+/**
+ * Routes that render inside another section. D-05's tabs are their own routes
+ * (`/settings/profile`, `/settings/devices`, WP-72) but belong to People, so
+ * the nav highlights People and the header and iyke line say People.
+ */
+const SECTION_ALIASES: Readonly<Record<string, SettingsSectionId>> = {
+	profile: 'people',
+	devices: 'people',
+};
+
 export function settingsSection(id: string | undefined): SettingsSectionMeta {
-	return SETTINGS_SECTIONS.find((section) => section.id === id) ?? SETTINGS_SECTIONS[0];
+	const resolved =
+		id !== undefined && Object.prototype.hasOwnProperty.call(SECTION_ALIASES, id)
+			? SECTION_ALIASES[id]
+			: id;
+	return SETTINGS_SECTIONS.find((section) => section.id === resolved) ?? SETTINGS_SECTIONS[0];
 }
 
 export function settingsIykeLine(sectionId: string, scope: SettingsScopeId): string {

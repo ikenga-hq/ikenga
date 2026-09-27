@@ -585,6 +585,14 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0066_notifications",
         include_str!("../migrations/0066_notifications.sql"),
     ),
+    // WP-65 (G-SEATS §1.4): the Chi seat store. One row per seat, keyed by an
+    // immutable uuid; two partial unique indexes make a session (by ref, and
+    // by engine conversation) sit in at most one seat (DEC-69c).
+    (
+        67,
+        "0067_iyke_seats",
+        include_str!("../migrations/0067_iyke_seats.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked

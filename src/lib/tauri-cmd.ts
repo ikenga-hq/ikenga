@@ -783,6 +783,115 @@ export async function secretsLockState(): Promise<SecretsLockState> {
 	return invoke('secrets_lock_state');
 }
 
+// ── app lock (WP-72, D-05 `locked`) ─────────────────────────────────────────
+// Mirrors `src-tauri/src/commands/app_lock.rs`. Rust owns the lock, so a
+// webview reload can't clear it and every window sees one state. It is not the
+// vault lock above. Desktop only: in a remote web session (a browser tab on the
+// daemon) `appLockStatus` resolves `null` and the rest are never reached.
+
+export type AppLockMethod = 'pin' | 'os';
+export type AppLockReason = 'idle' | 'manual' | 'launch';
+
+export interface AppLockBiometric {
+	kind: 'windows-hello' | 'touch-id' | 'none';
+	/** "Windows Hello", "Touch ID", or "" on Linux. */
+	label: string;
+	available: boolean;
+	/** Why it isn't available; empty when it is. */
+	reason: string;
+}
+
+export interface AppLockStatus {
+	locked: boolean;
+	reason: AppLockReason | null;
+	lockedAtMs: number | null;
+	idleEnabled: boolean;
+	idleMinutes: number;
+	method: AppLockMethod;
+	/** A PIN / passphrase is set. Nothing can lock without one. */
+	secretSet: boolean;
+	biometric: AppLockBiometric;
+	/** Milliseconds left in the wrong-entry wait, if one is running. */
+	retryInMs: number | null;
+	attemptsLeft: number;
+	/** OS hostname. */
+	host: string;
+	/** e.g. `Linux 6.8.0`, `Windows 10.0.22631`. */
+	os: string;
+	/** Absolute path of `app-lock.json`, the recovery path. */
+	configPath: string | null;
+}
+
+export interface AppLockUnlockOutcome {
+	ok: boolean;
+	/** The line D-05 shows under the field, e.g. "Wrong PIN. Two attempts left…". */
+	error: string | null;
+	status: AppLockStatus;
+}
+
+/** Fires (empty payload) when the lock or its config changes; refetch the status. */
+export const APP_LOCK_CHANGED_EVENT = 'app-lock://changed';
+
+/** The lock state and config. `null` in a remote web session. Also runs the
+ *  idle check, so a window waking from sleep sees an overdue lock at once. */
+export async function appLockStatus(): Promise<AppLockStatus | null> {
+	if (isRemoteWebSession()) return null;
+	return invoke<AppLockStatus>('app_lock_status');
+}
+
+/** Report user activity (throttled by the caller). Ignored while locked. */
+export async function appLockTouch(): Promise<void> {
+	if (isRemoteWebSession()) return;
+	return invoke('app_lock_touch');
+}
+
+/** Lock now. Rejects when no PIN is set (nothing could unlock it). */
+export async function appLockLock(): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_lock');
+}
+
+/** Unlock with the PIN / passphrase. A wrong entry resolves `ok: false`. */
+export async function appLockUnlock(secret: string): Promise<AppLockUnlockOutcome> {
+	return invoke<AppLockUnlockOutcome>('app_lock_unlock', { secret });
+}
+
+/** Unlock with OS biometrics. Refused on this build (`biometric.available` is
+ *  false everywhere, see the Rust module header); the path is kept for the
+ *  follow-up. */
+export async function appLockUnlockBiometric(): Promise<AppLockUnlockOutcome> {
+	return invoke<AppLockUnlockOutcome>('app_lock_unlock_biometric');
+}
+
+export async function appLockConfigure(opts: {
+	idleEnabled: boolean;
+	idleMinutes: number;
+	method: AppLockMethod;
+}): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_configure', {
+		idleEnabled: opts.idleEnabled,
+		idleMinutes: opts.idleMinutes,
+		method: opts.method,
+	});
+}
+
+/** Set the PIN / passphrase, or change it (`current` required once one exists). */
+export async function appLockSetSecret(
+	next: string,
+	current?: string | null
+): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_set_secret', { current: current ?? null, next });
+}
+
+/** Remove the PIN. Also turns idle lock off. */
+export async function appLockClearSecret(current: string): Promise<AppLockStatus> {
+	return invoke<AppLockStatus>('app_lock_clear_secret', { current });
+}
+
+export function onAppLockChanged(callback: () => void): Promise<UnlistenFn> {
+	if (isRemoteWebSession()) return Promise.resolve(() => {});
+	return listen<unknown>(APP_LOCK_CHANGED_EVENT, () => callback());
+}
+
 export async function secretsVaultStatus(): Promise<VaultStatus> {
 	const raw = await invoke<{
 		available?: boolean;
@@ -4676,6 +4785,285 @@ export async function chiList(
 /** Cancel a Chi run. */
 export async function chiCancel(runId: string): Promise<ChiRunResult> {
 	return invoke<ChiRunResult>('chi_cancel', { runId });
+}
+
+// ─── Chi seats (G-SEATS §9.2, WP-65) ──────────────────────────────────────────
+// A seat is a named, per-project slot (`seat:<project>/<name>`) that points at
+// one session: a Chi run or an agent terminal. Rust: `src-tauri/src/iyke/seats.rs`.
+// Outputs are snake_case (like `ChiCacheRow`); `invoke` argument keys and
+// nested inputs are camelCase. Status, resume, mount, pad… are derived at read
+// time and never stored. Writes emit `seats://changed` (one event per seat).
+
+/** `seat:<project>/<name>` (canonical), `@<name>`, `<project>/<name>`, `<name>`. */
+export type SeatAddressString = string;
+
+export type SeatSession =
+	| { kind: 'run'; run_id: string; external_id: string | null; cwd: string | null }
+	| { kind: 'terminal'; terminal_id: string; external_id: string | null; cwd: string | null };
+
+export type SeatHold = { client: string; since: number; expires_at: number };
+
+export interface Seat {
+	id: string;
+	project_id: string;
+	name: string;
+	/** Chi engine id (`claude-code`, `codex`, …). Immutable. */
+	engine_id: string;
+	/** `null` after *Clear* or before the first fill; an ended session stays. */
+	session: SeatSession | null;
+	created_at: number;
+	last_active_at: number;
+	/** Present only while unexpired. */
+	hold: SeatHold | null;
+}
+
+export type EngineResume = 'durable' | 'process-local' | 'none';
+
+export type NotResumableReason =
+	| 'no_session'
+	| 'process_local'
+	| 'no_resume_support'
+	| 'no_resume_id'
+	| 'run_missing'
+	| 'engine_unavailable';
+
+export type SeatResume = { resumable: true } | { resumable: false; reason: NotResumableReason };
+
+export type SeatStatus = 'live' | 'idle' | 'run' | 'vacant';
+
+/** §1.6 — what `seatsList` / `seatsGet` return. */
+export interface SeatView extends Seat {
+	/** `seat:${project_id}/${name}` — also the seat's memory scope. */
+	address: string;
+	/** = id; the seat's inbox is `iyke_agent_inbox WHERE agent_id = agent_id`. */
+	agent_id: string;
+	// ── derived ──
+	status: SeatStatus;
+	/** Terminal sessions only. */
+	agent: 'live' | 'starting' | 'unreported' | null;
+	/** Meaningful when `status === 'vacant'`. */
+	resume: SeatResume;
+	/** Static per engine; `process-local` = "not resumable after restart". */
+	engine_resume: EngineResume;
+	mount: { window_label: string; pane_ids: string[] } | null;
+	queued: { since: number } | null;
+	pad: { count: number; latest: { name: string; updated_at: number } | null };
+	inbox_count: number;
+}
+
+/** §5.1. The shell UI is always `client: 'ui'` and never sets `hold`. */
+export type SeatActor = { client: string; hold?: boolean; takeover?: boolean; holdTtlMs?: number };
+
+export type SeatSessionRef =
+	| { kind: 'run'; runId: string }
+	| {
+			kind: 'terminal';
+			terminalId: string;
+			/** Chi engine id. Wrap ids map: `claude` → `claude-code`,
+			 *  `antigravity` → `antigravity-cli`, `codex` → `codex`. */
+			engineId: string;
+			cwd?: string | null;
+			externalId?: string | null;
+	  };
+
+/** `address` accepts any §1.3 iyke form. */
+export type SeatAddress = { seatId: string } | { address: SeatAddressString };
+
+export type SeatRoute =
+	| {
+			route: 'pty';
+			seat: SeatView;
+			terminal_id: string;
+			agent: 'live' | 'unreported';
+			lease_holder: string | null;
+	  }
+	| { route: 'chi-resume'; seat: SeatView; run_id: string; busy: boolean }
+	| { route: 'vacant'; seat: SeatView; resume: SeatResume; claim: string | null };
+
+export type SeatMoveResult = {
+	seat: SeatView;
+	from_seat_ids: string[];
+	/** Set when the move carried a resume claim that had expired or was someone
+	 *  else's (§4.1 path T step 3). The move still bound. */
+	claim_lost?: true;
+};
+
+export type SeatResumeResult = {
+	seat: SeatView;
+	run_id: string;
+	outcome: 'resumed' | 'started-fresh';
+	previous: SeatSession | null;
+	reason?: NotResumableReason;
+};
+
+export type SeatFillResult = { seat: SeatView; run_id: string; previous: SeatSession | null };
+
+export type SeatEngineInfo = {
+	engine_id: string;
+	wrap_id: string | null;
+	engine_resume: EngineResume | null;
+	seatable: boolean;
+	reason?: string;
+};
+
+/** §9.5 — the rejection value of every `seats*` call. */
+export type SeatErrorCode =
+	| 'invalid_seat_name'
+	| 'invalid_address'
+	| 'seat_not_found'
+	| 'project_not_found'
+	| 'seat_name_taken'
+	| 'rename_scope_conflict'
+	| 'engine_mismatch'
+	| 'terminal_not_found'
+	| 'seat_not_vacant'
+	| 'seat_resuming'
+	| 'seat_busy'
+	| 'agent_not_live'
+	| 'conflict'
+	| 'needs_prompt'
+	| 'seat_held'
+	| 'seat_taken_over'
+	| 'not_resumable'
+	| 'engine_unsupported'
+	| 'engine_failed'
+	| 'internal';
+
+export type SeatError = {
+	code: SeatErrorCode;
+	message: string;
+	details?:
+		| { client: string; since: number; expires_at: number } // seat_held
+		| { by: string; at: number } // seat_taken_over
+		| { reason: NotResumableReason } // not_resumable
+		| { engine_id: string }; // engine_unsupported
+};
+
+/** Payload of the `seats://changed` event (§10). Invalidate `seatsList` for
+ *  `project_id`; the event is never a source of truth. */
+export type SeatsChangedEvent = {
+	project_id: string;
+	seat_id: string;
+	kinds: (
+		| 'created'
+		| 'renamed'
+		| 'removed'
+		| 'bound'
+		| 'unbound'
+		| 'cleared'
+		| 'updated'
+		| 'held'
+		| 'released'
+		| 'taken-over'
+		| 'queue-dropped'
+	)[];
+	from_seat_ids?: string[];
+	/** Round 47 erratum E-4: why a §4.5 queued text was dropped instead of
+	 *  sent. Present exactly when `kinds` includes `'queue-dropped'`. */
+	queue_dropped?: 'cleared' | 'removed' | 'no_run' | 'run_missing' | 'send_failed';
+};
+
+export const SEATS_CHANGED_EVENT = 'seats://changed';
+
+/** Every seat of `projectId` (default: the active project), by `created_at`. */
+export async function seatsList(projectId?: string | null): Promise<SeatView[]> {
+	return invoke<SeatView[]>('seats_list', { projectId: projectId ?? null });
+}
+
+export async function seatsGet(seat: SeatAddress): Promise<SeatView> {
+	return invoke<SeatView>('seats_get', { seat });
+}
+
+/** §6.1 capability table with install state, for the create form. */
+export async function seatsEngines(): Promise<SeatEngineInfo[]> {
+	return invoke<SeatEngineInfo[]>('seats_engines');
+}
+
+/** Where a send to this seat goes now. Applies holds; with `claimResume` on a
+ *  vacant seat, takes the 30 s resume claim. Never resumes or starts anything. */
+export async function seatsResolve(
+	seat: SeatAddress,
+	actor: SeatActor,
+	opts?: { claimResume?: boolean }
+): Promise<SeatRoute> {
+	return invoke<SeatRoute>('seats_resolve', { seat, actor, opts: opts ?? null });
+}
+
+export async function seatsCreate(
+	req: {
+		projectId?: string | null;
+		name: string;
+		engineId: string;
+		start: { kind: 'empty' } | { kind: 'session'; session: SeatSessionRef };
+	},
+	actor: SeatActor
+): Promise<SeatMoveResult> {
+	return invoke<SeatMoveResult>('seats_create', { req, actor });
+}
+
+/** DEC-69c: bind `session` to the seat and unbind it from any other, atomically. */
+export async function seatsMove(
+	session: SeatSessionRef,
+	toSeatId: string,
+	actor: SeatActor,
+	opts?: { claim?: string }
+): Promise<SeatMoveResult> {
+	return invoke<SeatMoveResult>('seats_move', { session, toSeatId, actor, opts: opts ?? null });
+}
+
+/** DEC-69a path H: resume a vacant seat with `prompt` as the first turn.
+ *  `fallback: 'fresh'` (dispatch) starts a new session when it can't resume;
+ *  `'refuse'` (explicit resume) rejects with `not_resumable`. */
+export async function seatsResume(
+	seatId: string,
+	prompt: string,
+	actor: SeatActor,
+	opts: { fallback: 'fresh' | 'refuse' }
+): Promise<SeatResumeResult> {
+	return invoke<SeatResumeResult>('seats_resume', { seatId, prompt, actor, opts });
+}
+
+export async function seatsFill(
+	seatId: string,
+	prompt: string,
+	actor: SeatActor,
+	opts?: { persistent?: boolean }
+): Promise<SeatFillResult> {
+	return invoke<SeatFillResult>('seats_fill', { seatId, prompt, actor, opts: opts ?? null });
+}
+
+/** §4.5: park one text for a seat whose run has a turn in flight. */
+export async function seatsQueue(
+	seatId: string,
+	prompt: string,
+	actor: SeatActor
+): Promise<SeatView> {
+	return invoke<SeatView>('seats_queue', { seatId, prompt, actor });
+}
+
+/** DEC-69b: drop the session pointer; the pad and all memory are kept. */
+export async function seatsClear(seatId: string, actor: SeatActor): Promise<SeatView> {
+	return invoke<SeatView>('seats_clear', { seatId, actor });
+}
+
+export async function seatsRename(
+	seatId: string,
+	name: string,
+	actor: SeatActor
+): Promise<SeatView> {
+	return invoke<SeatView>('seats_rename', { seatId, name, actor });
+}
+
+export async function seatsRemove(
+	seatId: string,
+	opts: { removeMemory: boolean },
+	actor: SeatActor
+): Promise<{ seat_id: string }> {
+	return invoke<{ seat_id: string }>('seats_remove', { seatId, opts, actor });
+}
+
+export async function seatsRelease(seatId: string, actor: SeatActor): Promise<SeatView> {
+	return invoke<SeatView>('seats_release', { seatId, actor });
 }
 
 // ─── Ngwa In-Shell Scaffolding (WP-23 / D-02) ─────────────────────────────────

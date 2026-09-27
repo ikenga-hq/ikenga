@@ -34,6 +34,15 @@ describe('settings cross-section search', () => {
 		expect(hits.some((h) => h.sectionId === 'people')).toBe(true);
 	});
 
+	it('lands Profile and App lock hits on /settings/profile, not the People redirect', () => {
+		const hits = searchSettings('app lock');
+		const lock = hits.find((h) => h.label === 'App lock');
+		expect(lock?.route).toBe('/settings/profile');
+		expect(searchSettings('profile').find((h) => h.label === 'Profile')?.route).toBe('/settings/profile');
+		// Section-level hits keep the section route.
+		expect(searchSettings('invite').find((h) => h.label === 'Pending invites')?.route).toBeUndefined();
+	});
+
 	it('returns nothing for a blank query', () => {
 		expect(searchSettings('   ')).toEqual([]);
 	});

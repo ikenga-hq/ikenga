@@ -20,11 +20,13 @@ import { installIkengaDomSync, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { installKeyDispatcher } from '@/lib/keymap/dispatcher';
 import { windowContext } from '@/lib/window/window-context';
 import { DetachedRoot } from '@/shell/detached/detached-root';
+import { AppLockOverlay } from '@/shell/people/app-lock-overlay';
+import { useAppLockStore } from '@/shell/people/app-lock-store';
 
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 
 /** Boot a thin detached single-surface window. */
-export function bootDetached(): void {
+export async function bootDetached(): Promise<void> {
 	const ctx = windowContext();
 
 	// Mirror appearance data-attrs onto <html> before first paint. The theme
@@ -44,11 +46,18 @@ export function bootDetached(): void {
 	installKeyDispatcher();
 	void startActionsStore().catch(() => {});
 
+	// WP-72: read the app lock before the first paint, as `boot/primary.tsx`
+	// does, so a window opened or restored while locked never shows its
+	// surface for a frame. `refresh` swallows its own failure.
+	await useAppLockStore.getState().refresh();
+
 	createRoot(document.getElementById('root')!).render(
 		<React.StrictMode>
 			<ErrorBoundary>
 				<QueryClientProvider client={queryClient}>
 					<DetachedRoot ctx={ctx} />
+					{/* WP-72: a popped-out surface locks with the main window. */}
+					<AppLockOverlay />
 				</QueryClientProvider>
 			</ErrorBoundary>
 		</React.StrictMode>

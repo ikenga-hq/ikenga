@@ -35,6 +35,7 @@ pub mod pkg_trust;
 pub mod playwright_proxy;
 pub mod projects;
 pub mod rpc;
+pub mod seats;
 pub mod secrets;
 pub mod server;
 pub mod state;
@@ -217,6 +218,11 @@ pub async fn start(
     // needs the active project's root, and Claude Code reads
     // `workspaceFolders` to decide which IDE matches the cwd it was started in.
     let workspace_folders = ide_ws::active_workspace_folders(&pa_db).await;
+
+    // G-SEATS §2.5 / §4.5 (WP-65): the seat store's `hooks://event` liveness
+    // listener and its busy-run queue poller. Installed here, at boot, so the
+    // agent-liveness map sees every `SessionStart` from the first terminal.
+    seats::install(&app_handle);
 
     let (url, port, shutdown) = server::serve(
         state.clone(),
