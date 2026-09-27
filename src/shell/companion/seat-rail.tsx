@@ -323,8 +323,12 @@ function rowStyle(selected: boolean): React.CSSProperties {
 		: {};
 }
 
+// Focus is an outline (D-09 `.seat:focus-visible`: 2px --primary, offset -2px),
+// not a ring: a ring is a box-shadow, and the selected row's inline
+// box-shadow (its --primary edge) would hide it — the roving row is always
+// the selected one, so the keyboard user would never see where focus is.
 const ROW_CLASS =
-	'relative flex flex-col justify-center pl-3 pr-2 text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
+	'relative flex flex-col justify-center pl-3 pr-2 text-[var(--fg-muted)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary';
 
 /** F2 / *Rename…* inline: live §1.2 validation; ↵ renames, Esc or a click
  *  elsewhere cancels. `onMessage` reports the line shown under the row. */
