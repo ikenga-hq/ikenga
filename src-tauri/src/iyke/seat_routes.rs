@@ -21,19 +21,27 @@
 //! - an occupied terminal → the `/iyke/terminal/send` write path
 //!   (`PtyManager::controlled_write`), under that PTY's lease;
 //! - a busy run → `seats_queue` (§4.5);
-//! - an idle run → the `chi_resume` core;
+//! - an idle run → the `chi_resume` core, through `seats::send_idle`, which
+//!   re-checks the run under the seat's mutex and queues instead if it went
+//!   busy or a text is already queued (§4.5);
 //! - a vacant seat → `seats_resume` with `fallback: 'fresh'` (path H).
+//!
+//! A pty or idle-run send bumps the seat's `last_active_at` (§1.1) and emits
+//! `seats://changed` (§10); the reply carries the seat's view re-read after it.
 //!
 //! Every POST body takes the §5 actor fields `client`, `hold`, `takeover`
 //! (and optional `hold_ttl_ms`). Errors are the §9.5 `{code, message,
 //! details?}` body at the code's HTTP status (`SeatError::http_status`,
-//! with erratum E-3's `internal` → 500). A body the route can't parse is
-//! `400 invalid_request` — a bridge-only code, never emitted by the store.
+//! with erratum E-3's `internal` → 500). A body or query the route can't
+//! parse — including one axum would reject before the handler (not JSON, no
+//! `Content-Type`) — is `400 invalid_request`: a bridge-only code, never
+//! emitted by the store, pending G-SEATS §17 erratum E-5.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Json as JsonBody, Query},
+    body::Bytes,
+    extract::{rejection::QueryRejection, Query},
     http::StatusCode,
     Extension, Json,
 };
@@ -43,7 +51,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager, State};
 
 use super::seats::{
-    self, CreateSeatReq, NotResumableReason, ResolveOpts, ResumeFallback, ResumeOpts,
+    self, CreateSeatReq, IdleSend, NotResumableReason, ResolveOpts, ResumeFallback, ResumeOpts,
     ResumeOutcome, SeatActor, SeatAddress, SeatError, SeatFillResult, SeatResumeResult, SeatRoute,
     SeatSessionRef, SeatStart, SeatView,
 };
@@ -70,7 +78,8 @@ fn seat_error(code: &'static str, message: impl Into<String>) -> SeatError {
     }
 }
 
-/// A body or query the route can't use. Bridge-only; the store never emits it.
+/// A body or query the route can't use. Bridge-only; the store never emits
+/// it. Not in the frozen §9.5 table: needs G-SEATS §17 erratum E-5.
 fn invalid_request(message: impl Into<String>) -> SeatError {
     seat_error("invalid_request", message)
 }
@@ -237,13 +246,28 @@ pub(crate) fn parse_body<T: DeserializeOwned>(body: Value) -> Result<T, SeatErro
     serde_json::from_value(body).map_err(|e| invalid_request(format!("bad request body: {e}")))
 }
 
+/// Parse raw POST bytes. The routes take `Bytes`, not axum's `Json`, so a
+/// body that isn't JSON (or has no `Content-Type`) gets the §9.5 error body
+/// instead of axum's plain-text rejection.
+pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SeatError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|e| invalid_request(format!("the request body is not JSON: {e}")))?;
+    parse_body(value)
+}
+
+/// A query string axum couldn't parse, as the §9.5 error body.
+fn query_of<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
+    q.map(|Query(q)| q)
+        .map_err(|e| api_err(invalid_request(format!("bad query: {}", e.body_text()))))
+}
+
 /// A `seat` field: any §1.3 iyke form (`<name>`, `@<name>`,
 /// `<project>/<name>`, `seat:<project>/<name>`). The store's resolver does
 /// the parsing; an empty value is refused here.
 pub(crate) fn seat_address(seat: &str) -> Result<SeatAddress, SeatError> {
     let seat = seat.trim();
     if seat.is_empty() {
-        return Err(invalid_request("`seat` must not be empty"));
+        return Err(seat_error("invalid_address", "`seat` must not be empty"));
     }
     Ok(SeatAddress::Address {
         address: seat.to_string(),
@@ -318,6 +342,19 @@ pub(crate) fn find_terminal<'a>(
         .or_else(|| terminals.iter().find(|t| t.pty_id == reference))
 }
 
+/// The PTY a seat's terminal runs in: the newest running PTY whose terminal
+/// id is exactly `terminal_id`. The pty-route write targets this PTY id, never
+/// the terminal id — `PtyManager::resolve_id` also matches a *label* equal to
+/// its target, which any bridge caller can set, so writing by terminal id
+/// could land in another terminal (§7.2: "no weaker guard").
+pub(crate) fn seat_pty_id(terminals: &[TerminalDescriptor], terminal_id: &str) -> Option<String> {
+    terminals
+        .iter()
+        .filter(|t| t.terminal_id == terminal_id)
+        .max_by_key(|t| (t.status == "running", t.created_at))
+        .map(|t| t.pty_id.clone())
+}
+
 /// What a `<ref>` (§7.3: "a terminal id or a run id") is.
 enum RefKind {
     Run {
@@ -374,8 +411,9 @@ async fn classify_ref(
 
 /// The store's session ref for a classified `<ref>`, and the session's
 /// engine. A run's engine is its `chi_cache` engine. A terminal's is read off
-/// its argv, else `fallback_engine` (the caller's `engine`, or the seat's own
-/// engine on a resume); with neither, the caller must name it.
+/// its argv, else `fallback_engine` (create's explicit `engine`; a resume
+/// passes none and refuses such a terminal first); with neither, the caller
+/// must name it.
 fn session_ref_for(
     reference: &str,
     kind: &RefKind,
@@ -415,6 +453,20 @@ async fn get_view(app: &AppHandle, seat: &str) -> Result<SeatView, SeatError> {
     seats::seats_get(app.clone(), db_state(app)?, address).await
 }
 
+/// `seat` re-read by id after a send; a failed re-read keeps `seat`.
+async fn fresh_view(app: &AppHandle, seat: SeatView) -> SeatView {
+    let Ok(db) = db_state(app) else {
+        return seat;
+    };
+    let address = SeatAddress::Id {
+        seat_id: seat.id.clone(),
+    };
+    match seats::seats_get(app.clone(), db, address).await {
+        Ok(view) => view,
+        Err(_) => seat,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Handlers
 // ═══════════════════════════════════════════════════════════════════════
@@ -422,8 +474,9 @@ async fn get_view(app: &AppHandle, seat: &str) -> Result<SeatView, SeatError> {
 /// `GET /iyke/seats/list?project=<id>` — default: the active project.
 pub async fn get_seats_list(
     Extension(app): Extension<AppHandle>,
-    Query(q): Query<ListQuery>,
+    q: Result<Query<ListQuery>, QueryRejection>,
 ) -> ApiResult<Vec<SeatView>> {
+    let q = query_of(q)?;
     let project = q.project.filter(|p| !p.trim().is_empty());
     let db = db_state(&app).map_err(api_err)?;
     seats::seats_list(app.clone(), db, project)
@@ -435,9 +488,9 @@ pub async fn get_seats_list(
 /// `GET /iyke/seats/get?seat=<address>`.
 pub async fn get_seats_get(
     Extension(app): Extension<AppHandle>,
-    Query(q): Query<GetQuery>,
+    q: Result<Query<GetQuery>, QueryRejection>,
 ) -> ApiResult<SeatView> {
-    let seat = q
+    let seat = query_of(q)?
         .seat
         .ok_or_else(|| api_err(invalid_request("missing `seat` query parameter")))?;
     get_view(&app, &seat).await.map(Json).map_err(api_err)
@@ -448,9 +501,9 @@ pub async fn get_seats_get(
 pub async fn post_seats_create(
     Extension(app): Extension<AppHandle>,
     Extension(pty_manager): Extension<Arc<PtyManager>>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<SeatView> {
-    let body: CreateBody = parse_body(body).map_err(api_err)?;
+    let body: CreateBody = parse_json(&body).map_err(api_err)?;
     let reference = create_parts(&body).map_err(api_err)?;
     let explicit_engine = body
         .engine
@@ -468,6 +521,9 @@ pub async fn post_seats_create(
         }
         Some(r) => {
             let kind = classify_ref(&app, &pty_manager, r).await.map_err(api_err)?;
+            // The explicit engine stands in only when the terminal's argv names
+            // none; then the store's §4.3 check has nothing to compare, and
+            // the caller's word is taken for it.
             let (session, session_engine) =
                 session_ref_for(r, &kind, explicit_engine).map_err(api_err)?;
             // The seat's engine is the caller's; the store refuses a session
@@ -505,9 +561,9 @@ pub enum ResumeReply {
 pub async fn post_seats_resume(
     Extension(app): Extension<AppHandle>,
     Extension(pty_manager): Extension<Arc<PtyManager>>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<ResumeReply> {
-    let body: ResumeBody = parse_body(body).map_err(api_err)?;
+    let body: ResumeBody = parse_json(&body).map_err(api_err)?;
     let session = body
         .session
         .as_deref()
@@ -524,8 +580,24 @@ pub async fn post_seats_resume(
     let actor = body.actor.actor();
     if let Some(r) = session {
         let kind = classify_ref(&app, &pty_manager, r).await.map_err(api_err)?;
-        let (session, _) =
-            session_ref_for(r, &kind, Some(view.engine_id.as_str())).map_err(api_err)?;
+        // A terminal whose argv names no engine is refused, never assumed to
+        // run the seat's engine: that would pass the store's §4.3
+        // `engine_mismatch` guard for any shell and seat it.
+        if let RefKind::Terminal {
+            terminal_id,
+            inferred: None,
+        } = &kind
+        {
+            return Err(api_err(seat_error(
+                "conflict",
+                format!(
+                    "can't tell which engine terminal {terminal_id} runs, so it can't be \
+                     seated in {} — seat it from the Ikenga window",
+                    view.name
+                ),
+            )));
+        }
+        let (session, _) = session_ref_for(r, &kind, None).map_err(api_err)?;
         let db = db_state(&app).map_err(api_err)?;
         return seats::seats_move(app.clone(), db, session, view.id.clone(), actor, None)
             .await
@@ -555,9 +627,9 @@ pub async fn post_seats_resume(
 /// with `prompt`; no prompt is `409 needs_prompt`.
 pub async fn post_seats_fill(
     Extension(app): Extension<AppHandle>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<SeatFillResult> {
-    let body: FillBody = parse_body(body).map_err(api_err)?;
+    let body: FillBody = parse_json(&body).map_err(api_err)?;
     let Some(prompt) = prompt_of(body.prompt.clone()) else {
         return Err(api_err(needs_prompt("fill")));
     };
@@ -579,9 +651,9 @@ pub async fn post_seats_fill(
 /// `POST /iyke/seats/clear` `{seat}` — the pad is kept (DEC-69b).
 pub async fn post_seats_clear(
     Extension(app): Extension<AppHandle>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<SeatView> {
-    let body: SeatBody = parse_body(body).map_err(api_err)?;
+    let body: SeatBody = parse_json(&body).map_err(api_err)?;
     let view = get_view(&app, &body.seat).await.map_err(api_err)?;
     let db = db_state(&app).map_err(api_err)?;
     seats::seats_clear(app.clone(), db, view.id.clone(), body.actor.actor())
@@ -594,9 +666,9 @@ pub async fn post_seats_clear(
 /// someone else's needs `takeover` (§5.1).
 pub async fn post_seats_release(
     Extension(app): Extension<AppHandle>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<SeatView> {
-    let body: SeatBody = parse_body(body).map_err(api_err)?;
+    let body: SeatBody = parse_json(&body).map_err(api_err)?;
     let view = get_view(&app, &body.seat).await.map_err(api_err)?;
     let db = db_state(&app).map_err(api_err)?;
     seats::seats_release(app.clone(), db, view.id.clone(), body.actor.actor())
@@ -631,13 +703,6 @@ pub(crate) fn pty_bytes(text: &str) -> Vec<u8> {
     data
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Send to an idle run through the `chi_resume` core (same run id).
 async fn resume_idle_run(
     app: &AppHandle,
@@ -669,15 +734,39 @@ async fn resume_idle_run(
     Ok(result.run_id)
 }
 
+/// §4.5: park the text in the seat's queue slot; the store's poller sends it
+/// when the run finishes its turn.
+async fn queue_send(
+    app: &AppHandle,
+    seat: SeatView,
+    run_id: String,
+    text: String,
+    actor: SeatActor,
+) -> ApiResult<SeatSendResult> {
+    let db = db_state(app).map_err(api_err)?;
+    let seat = seats::seats_queue(app.clone(), db, seat.id.clone(), text, actor)
+        .await
+        .map_err(api_err)?;
+    Ok(Json(SeatSendResult {
+        route: "chi-resume",
+        run_id: Some(run_id),
+        terminal_id: None,
+        outcome: None,
+        reason: None,
+        queued: true,
+        seat,
+    }))
+}
+
 /// `POST /iyke/seats/send` `{seat, text}` — `iyke terminal-send --seat`.
 /// Routes by `seats_resolve` (§7.2); a vacant seat resumes, then sends
 /// (DEC-69a, path H, with the §6.2 fresh fallback).
 pub async fn post_seats_send(
     Extension(app): Extension<AppHandle>,
     Extension(pty_manager): Extension<Arc<PtyManager>>,
-    JsonBody(body): JsonBody<Value>,
+    body: Bytes,
 ) -> ApiResult<SeatSendResult> {
-    let body: SendBody = parse_body(body).map_err(api_err)?;
+    let body: SendBody = parse_json(&body).map_err(api_err)?;
     if body.text.trim().is_empty() {
         return Err(api_err(invalid_request("`text` must not be empty")));
     }
@@ -708,13 +797,23 @@ pub async fn post_seats_send(
                 lease_holder,
                 ..
             } => {
+                // Write to the seat terminal's own PTY, by PTY id: never by
+                // terminal id, which `resolve_id` would also match against
+                // another terminal's label.
+                let pty_id =
+                    seat_pty_id(&pty_manager.list_terminals(), &terminal_id).ok_or_else(|| {
+                        api_err(seat_error(
+                            "terminal_not_found",
+                            format!("terminal {terminal_id:?} is not running in this app"),
+                        ))
+                    })?;
                 // `agent: 'unreported'` behaves exactly as `--label` does:
                 // no new guard, no weaker one (§7.2).
                 pty_manager
                     .controlled_write(
-                        &terminal_id,
+                        &pty_id,
                         &pty_bytes(&body.text),
-                        None,
+                        Some(pty_id.as_str()),
                         Some(actor.client.as_str()),
                         body.lease_token.as_deref(),
                         false,
@@ -726,6 +825,17 @@ pub async fn post_seats_send(
                             lease_holder.as_deref(),
                         ))
                     })?;
+                // §1.1: a send through the seat bumps `last_active_at`. The
+                // text is already out, so a failed bump is only logged.
+                if let Err(e) = seats::note_pty_send(&app, &seat.id).await {
+                    log::warn!(
+                        target: "ikenga::seats",
+                        "send: touch {}: {}",
+                        seat.id,
+                        e.message
+                    );
+                }
+                let seat = fresh_view(&app, seat).await;
                 return Ok(Json(SeatSendResult {
                     route: "pty",
                     run_id: None,
@@ -742,52 +852,40 @@ pub async fn post_seats_send(
                 busy: true,
             } => {
                 // §4.5: never `chi_resume` over a turn in flight — queue.
-                let db = db_state(&app).map_err(api_err)?;
-                let seat = seats::seats_queue(
-                    app.clone(),
-                    db,
-                    seat.id.clone(),
-                    body.text.clone(),
-                    actor.clone(),
-                )
-                .await
-                .map_err(api_err)?;
-                return Ok(Json(SeatSendResult {
-                    route: "chi-resume",
-                    run_id: Some(run_id),
-                    terminal_id: None,
-                    outcome: None,
-                    reason: None,
-                    queued: true,
-                    seat,
-                }));
+                return queue_send(&app, seat, run_id, body.text.clone(), actor.clone()).await;
             }
             SeatRoute::ChiResume {
                 seat,
                 run_id,
                 busy: false,
             } => {
-                let sent = resume_idle_run(&app, run_id, body.text.clone())
+                // The store re-checks the run under the seat's mutex, so two
+                // concurrent sends can't both start a turn and a direct send
+                // never overtakes a queued text (§4.5).
+                let send_app = app.clone();
+                let send_run = run_id.clone();
+                let text = body.text.clone();
+                let send = move || async move { resume_idle_run(&send_app, send_run, text).await };
+                let outcome = seats::send_idle(&app, &seat.id, &run_id, &actor, send)
                     .await
                     .map_err(api_err)?;
-                // §1.1: a send through the seat bumps `last_active_at`. The
-                // text is already out, so a failed bump is only logged.
-                if let Ok(db) = db_state(&app) {
-                    if let Ok(pool) = db.ensure_pool().await {
-                        if let Err(e) = seats::touch_after_send(&pool, &seat.id, now_ms()).await {
-                            log::warn!(target: "ikenga::seats", "send: touch {}: {e}", seat.id);
-                        }
+                return match outcome {
+                    IdleSend::Sent { run_id: sent } => {
+                        let seat = fresh_view(&app, seat).await;
+                        Ok(Json(SeatSendResult {
+                            route: "chi-resume",
+                            run_id: Some(sent),
+                            terminal_id: None,
+                            outcome: None,
+                            reason: None,
+                            queued: false,
+                            seat,
+                        }))
                     }
-                }
-                return Ok(Json(SeatSendResult {
-                    route: "chi-resume",
-                    run_id: Some(sent),
-                    terminal_id: None,
-                    outcome: None,
-                    reason: None,
-                    queued: false,
-                    seat,
-                }));
+                    IdleSend::Queue => {
+                        queue_send(&app, seat, run_id, body.text.clone(), actor.clone()).await
+                    }
+                };
             }
             SeatRoute::Vacant { seat, .. } => {
                 let db = db_state(&app).map_err(api_err)?;
@@ -1035,6 +1133,20 @@ mod tests {
     }
 
     #[test]
+    fn a_body_that_is_not_json_is_a_400_error_body() {
+        let raws: [&[u8]; 4] = [b"", b"not json", b"{\"seat\": ", b"[1, 2]"];
+        for raw in raws {
+            let e = parse_json::<SeatBody>(raw).unwrap_err();
+            assert_eq!(e.code, "invalid_request");
+            assert_eq!(status_for(&e), StatusCode::BAD_REQUEST);
+        }
+        let b: SendBody =
+            parse_json(br#"{"seat": "lead", "text": "hi", "client": "orc"}"#).unwrap();
+        assert_eq!(b.seat, "lead");
+        assert_eq!(b.actor.actor().client, "orc");
+    }
+
+    #[test]
     fn a_missing_or_blank_prompt_is_no_prompt() {
         assert_eq!(prompt_of(None), None);
         assert_eq!(prompt_of(Some("   ".into())), None);
@@ -1066,7 +1178,7 @@ mod tests {
                 other => panic!("expected an address, got {other:?}"),
             }
         }
-        assert_eq!(seat_address("  ").unwrap_err().code, "invalid_request");
+        assert_eq!(seat_address("  ").unwrap_err().code, "invalid_address");
         assert_eq!(
             parse_seat_address("lead").unwrap(),
             ParsedAddress::Bare {
@@ -1122,6 +1234,27 @@ mod tests {
             "tab-2"
         );
         assert!(find_terminal(&terminals, "nope").is_none());
+    }
+
+    #[test]
+    fn a_seat_send_targets_its_terminals_pty_never_a_label_match() {
+        let mut labelled = descriptor("other", "pty-other", "running");
+        // A label equal to the seat's terminal id: `resolve_id` would match
+        // it; the pty route never looks at labels.
+        labelled.label = Some("tab-1".to_string());
+        labelled.created_at = 99;
+        let mut old = descriptor("tab-1", "pty-old", "exited");
+        old.created_at = 50;
+        let mut new = descriptor("tab-1", "pty-new", "running");
+        new.created_at = 10;
+        let terminals = vec![labelled, old, new];
+        assert_eq!(
+            seat_pty_id(&terminals, "tab-1").as_deref(),
+            Some("pty-new"),
+            "a running PTY wins over a newer exited one"
+        );
+        assert_eq!(seat_pty_id(&terminals, "pty-other"), None, "not by PTY id");
+        assert_eq!(seat_pty_id(&terminals, "nope"), None);
     }
 
     #[test]
