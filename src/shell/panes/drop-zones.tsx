@@ -5,7 +5,8 @@
 // pointer-events so the drag controller's hit-test finds it. It reports a
 // pointer-relative zone (4 edges or center) and either dispatches a `moveTab`
 // action (pane-source) or transfers the view from the dock into the pane
-// (dock-source). Pointer events rather than HTML5 DnD: see
+// (dock-source), or hands the drop to an `external` source's `dropAt` (a
+// Chi seat row, WP-67). Pointer events rather than HTML5 DnD: see
 // `lib/panes/pointer-drag.ts`.
 //
 // Edge inset is 25% of the pane's width/height. Outside that ring the
@@ -67,7 +68,8 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 		onDrop: (x, y, el) => {
 			setHoverZone(null);
 			const d = useDragState.getState();
-			if (!d.active || d.srcTabIdx == null) {
+			const external = d.source === 'external' && d.dropAt != null;
+			if (!d.active || (d.srcTabIdx == null && !external)) {
 				d.end();
 				return;
 			}
@@ -80,14 +82,18 @@ export function PaneDropZones({ paneId }: { paneId: PaneId }) {
 			}
 			const mode = zone === 'center' ? 'append' : zone;
 
-			if (d.source === 'pane') {
-				if (d.srcLeafId != null) moveTab(d.srcLeafId, d.srcTabIdx, paneId, mode);
-			} else if (d.source === 'dock') {
+			const srcTabIdx = d.srcTabIdx;
+			if (d.source === 'external') {
+				// WP-67: a seat row — the source places (or re-mounts) what it carries.
+				d.dropAt?.(paneId, mode);
+			} else if (d.source === 'pane' && srcTabIdx != null) {
+				if (d.srcLeafId != null) moveTab(d.srcLeafId, srcTabIdx, paneId, mode);
+			} else if (d.source === 'dock' && srcTabIdx != null) {
 				// Dock → pane: pull the view out of the dock store and place it via
 				// the pane store. Only close from the dock if the placement succeeds.
-				const view = useCompanionStore.getState().tabs[d.srcTabIdx];
+				const view = useCompanionStore.getState().tabs[srcTabIdx];
 				if (view && placeView(paneId, view, mode)) {
-					useCompanionStore.getState().closeTab(d.srcTabIdx);
+					useCompanionStore.getState().closeTab(srcTabIdx);
 				}
 			}
 			d.end();

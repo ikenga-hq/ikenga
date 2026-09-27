@@ -21,11 +21,20 @@ export interface SeatNotice {
 	message: string;
 	variant: 'info' | 'error';
 	action?: SeatNoticeAction;
+	/** How long it stays up; the host's default when absent. WP-67's Undo
+	 *  toasts pass the 8 s undo window (G-SEATS §4.2). */
+	ttlMs?: number;
+}
+
+export interface SeatNoticeOpts {
+	variant?: 'info' | 'error';
+	action?: SeatNoticeAction;
+	ttlMs?: number;
 }
 
 interface SeatNoticeState {
 	notice: SeatNotice | null;
-	show: (message: string, opts?: { variant?: 'info' | 'error'; action?: SeatNoticeAction }) => void;
+	show: (message: string, opts?: SeatNoticeOpts) => void;
 	dismiss: () => void;
 }
 
@@ -40,15 +49,13 @@ export const useSeatNotice = create<SeatNoticeState>((set) => ({
 				message,
 				variant: opts?.variant ?? 'info',
 				...(opts?.action ? { action: opts.action } : {}),
+				...(opts?.ttlMs ? { ttlMs: opts.ttlMs } : {}),
 			},
 		}),
 	dismiss: () => set({ notice: null }),
 }));
 
-export function showSeatNotice(
-	message: string,
-	opts?: { variant?: 'info' | 'error'; action?: SeatNoticeAction }
-): void {
+export function showSeatNotice(message: string, opts?: SeatNoticeOpts): void {
 	useSeatNotice.getState().show(message, opts);
 }
 

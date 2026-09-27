@@ -69,6 +69,7 @@ import {
 	showSeatNotice,
 	vacantDispatchText,
 } from './seat-notice';
+import { seatSessionNumberText, sessionNumber } from './seat-sessions';
 
 /** §5.3 `context` — where the dispatch came from. */
 export interface DispatchContext {
@@ -246,11 +247,10 @@ function errorText(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
-/** The UI's short label for a session in the §6.3 texts (`<N>`). */
+/** The UI's label for a session in the §6.3 texts (`<N>`): its UI number
+ *  (`seat-sessions.ts`, D-09's "session 3"), replacing WP-66's 8-char id. */
 export function seatSessionLabel(session: SeatSession | null | undefined): string {
-	if (!session) return '—';
-	const id = session.external_id ?? (session.kind === 'run' ? session.run_id : session.terminal_id);
-	return id.slice(0, 8);
+	return seatSessionNumberText(session);
 }
 
 function seatTarget(seatId: string): ResolvedTarget {
@@ -450,7 +450,7 @@ async function sendPathT(route: VacantRoute, claim: string, text: string, contex
 			seat.engine_id,
 			resumeId
 				? { outcome: 'resumed', session: seatSessionLabel(previous) }
-				: { outcome: 'started-fresh', reason, session: terminalId.slice(0, 8) }
+				: { outcome: 'started-fresh', reason, session: String(sessionNumber(terminalId)) }
 		)
 	);
 }
@@ -470,9 +470,91 @@ async function sendPathH(route: VacantRoute, text: string, context?: DispatchCon
 			seat.engine_id,
 			result.outcome === 'resumed'
 				? { outcome: 'resumed', session: seatSessionLabel(result.previous) }
-				: { outcome: 'started-fresh', reason: result.reason, session: result.run_id.slice(0, 8) }
+				: {
+						outcome: 'started-fresh',
+						reason: result.reason,
+						session: String(sessionNumber(result.run_id)),
+					}
 		)
 	);
+}
+
+/** The outcome of an explicit *Resume* / *Fill* (WP-67, §9.3). */
+export interface OccupyResult {
+	seat: SeatView;
+	/** The new agent terminal now in the seat. */
+	terminalId: string;
+	/** Whether it resumed a past conversation or started a new one. */
+	outcome: 'resumed' | 'filled';
+	/** The session it resumed, for the toast's `session N`. */
+	previous: SeatSession | null;
+}
+
+/**
+ * §9.3 *Resume session N* / *Fill with a new session* (and the create form's
+ * *new session* / *resume a past session*): `seats_resolve({claimResume})` →
+ * today's agent-terminal spawn with **no prompt** → `seats_move({claim})`.
+ * The same path T a dispatch takes, minus the first turn.
+ *
+ * - `resume` resumes the seat's own last session, or `from` (the create
+ *   form's past session — the move then takes it from its old seat, DEC-69c).
+ *   An explicit resume never falls back to a fresh start (§6.2).
+ * - A seat with no path T (a run-kind seat or a runs-only engine, E-1) has
+ *   no interactive resume: it resumes or fills on its first dispatch (§7.2
+ *   `needs_prompt`), which the thrown message says.
+ */
+export async function occupyVacantSeat(
+	seatId: string,
+	mode: 'resume' | 'fill',
+	opts: { from?: SeatSession | null } = {}
+): Promise<OccupyResult> {
+	const actor: SeatActor = { client: UI_SEAT_CLIENT };
+	let route: SeatRoute;
+	try {
+		route = await seatsResolve({ seatId }, actor, { claimResume: true });
+	} catch (err) {
+		throw new Error(errorText(err));
+	}
+	const seat = route.seat;
+	try {
+		if (route.route !== 'vacant') throw new Error(`@${seat.name} is not vacant any more`);
+		const engine = WRAP_ENGINE_FOR_CHI[seat.engine_id];
+		if (!route.claim || !engine) {
+			throw new Error(
+				`@${seat.name} runs headless — dispatch an instruction to it and it will ${
+					mode === 'resume' ? 'resume' : 'fill'
+				}, then send`
+			);
+		}
+		const from = mode === 'resume' ? (opts.from ?? seat.session) : null;
+		let resumeId: string | null = null;
+		if (mode === 'resume') {
+			if (!opts.from && !route.resume.resumable) {
+				throw new Error(`@${seat.name} can't resume — fill it with a new session instead`);
+			}
+			resumeId = from?.external_id ?? null;
+			if (!resumeId) throw new Error(`@${seat.name}'s last session left no resume id`);
+		}
+		const cwd = from?.cwd ?? useShellStore.getState().activeProject.root_path ?? null;
+		const terminalId = await spawnSeatTerminal({
+			engine,
+			cwd,
+			prompt: null,
+			resumeSessionId: resumeId,
+			title: `@${seat.name}`,
+		});
+		const moved = await seatsMove(
+			{ kind: 'terminal', terminalId, engineId: seat.engine_id, cwd, externalId: resumeId },
+			seat.id,
+			actor,
+			{ claim: route.claim }
+		);
+		return { seat: moved.seat, terminalId, outcome: resumeId ? 'resumed' : 'filled', previous: from };
+	} catch (err) {
+		throw new Error(errorText(err));
+	} finally {
+		void invalidateSeats(seat.project_id);
+	}
 }
 
 /**
@@ -494,7 +576,8 @@ async function sendPathH(route: VacantRoute, text: string, context?: DispatchCon
 async function spawnSeatTerminal(opts: {
 	engine: AgentEngineKind;
 	cwd: string | null;
-	prompt: string;
+	/** The first turn; `null` for Fill / Resume with nothing typed (§9.3). */
+	prompt: string | null;
 	resumeSessionId: string | null;
 	title: string;
 }): Promise<string> {

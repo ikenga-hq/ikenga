@@ -1,20 +1,41 @@
-// The Companion at rest — spec §5.1, #55–#57. A 36 px strip that is ONE
-// button (expand). Top to bottom: expand chevron, attention glyph + count
-// (shield while a permission is pending, otherwise the run pulse, otherwise
-// nothing), and the vertical label `Chi · <state>`. It accepts tab drops.
+// The Companion at rest — spec §5.1, #55–#57, reworked for D-09's `rest`
+// state (WP-67). A 36 px strip that carries one monogram per seat (`le`,
+// `re`, …) with its state dot on the corner and a pending permission as a
+// badge, then the unseated sessions (dashed, `s4`), then the vertical label
+// `Chi · <state>` and the expand button. The two signals that must survive
+// here (D-09 `rest`): a pending permission on a seat, and a run's pulse.
+//
+// A request no seat or session can be pinned on (no terminal id) still shows
+// as the shield glyph, as before. It accepts tab drops.
 
 import { ChevronLeft, ShieldAlert } from 'lucide-react';
+import { cn } from '@/components/ui/utils';
 import { labelFor } from '@/lib/keymap/registry';
 import type { DropTargetProps } from '@/lib/panes/pointer-drag';
-import { cn } from '@/components/ui/utils';
+import type { SeatStatus, SeatView } from '@/lib/tauri-cmd';
+import { atName, seatMonogram, seatSessionRef, stateDotColor } from './seat-model';
+import type { UnseatedSession } from './seat-roster';
+import { sessionName, sessionNumber } from './seat-sessions';
 
 export const COLLAPSED_WIDTH = 36;
 
 export interface CollapsedStripProps {
+	/** Every pending permission request (the label and accessible name). */
 	pendingPermissions: number;
-	/** A session in the Companion is running. */
+	/** A session in the Companion is running (the label, when nothing is pending). */
 	live: boolean;
 	onExpand: () => void;
+	/** The roster's seats, in rail order. */
+	seats?: readonly SeatView[];
+	unseated?: readonly UnseatedSession[];
+	/** Pending requests per session id (terminal id). */
+	pendingBySession?: Readonly<Record<string, number>>;
+	/** Requests pinned on no session — shown as the shield glyph. */
+	pendingUnattributed?: number;
+	/** The selected rail row's key (`seat:<id>` / `session:<id>`). */
+	selectedKey?: string | null;
+	onPickSeat?: (seat: SeatView, toPermission: boolean) => void;
+	onPickSession?: (id: string, toPermission: boolean) => void;
 	dropProps?: DropTargetProps;
 	dropHover?: boolean;
 }
@@ -36,59 +57,160 @@ export function stripAccessibleName(pending: number, live: boolean): string {
 	return `${parts.join(', ')}. Expand${key ? ` (${key})` : ''}.`;
 }
 
+function CornerDot({ status }: { status: SeatStatus }) {
+	return (
+		<span
+			aria-hidden="true"
+			data-dot={status}
+			className={cn(
+				'absolute -bottom-[3px] -right-[3px] size-2 rounded-full',
+				status === 'run' && 'motion-safe:animate-pulse'
+			)}
+			style={{
+				background: status === 'vacant' ? 'var(--bg-base)' : stateDotColor(status),
+				boxShadow:
+					status === 'vacant'
+						? 'inset 0 0 0 1.5px var(--fg-muted), 0 0 0 2px var(--bg-base)'
+						: '0 0 0 2px var(--bg-base)',
+			}}
+		/>
+	);
+}
+
+function Badge({ n }: { n: number }) {
+	return (
+		<span
+			aria-hidden="true"
+			data-attention="permission"
+			className="absolute -right-1.5 -top-1.5 h-[15px] min-w-[15px] rounded-full px-0.5 text-center font-mono text-[11px] leading-[15px]"
+			style={{ background: 'var(--achievement)', color: 'var(--live-fg)', boxShadow: '0 0 0 2px var(--bg-base)' }}
+		>
+			{n}
+		</span>
+	);
+}
+
+const MONO_CLASS =
+	'relative grid size-[26px] place-items-center rounded-[var(--radius-sm)] border font-mono text-[11px] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
+
 export function CollapsedStrip({
 	pendingPermissions,
 	live,
 	onExpand,
+	seats = [],
+	unseated = [],
+	pendingBySession = {},
+	pendingUnattributed,
+	selectedKey = null,
+	onPickSeat,
+	onPickSession,
 	dropProps,
 	dropHover,
 }: CollapsedStripProps) {
+	// Without a per-session breakdown every request is "unattributed".
+	const loose = pendingUnattributed ?? (seats.length || unseated.length ? 0 : pendingPermissions);
+	const monograms = seats.length + unseated.length;
 	return (
 		<aside
 			aria-label="Chi companion"
-			className="flex h-full shrink-0 border-l"
+			data-state="seats-rest"
+			className={cn(
+				'flex h-full shrink-0 flex-col items-center gap-2 border-l py-2',
+				dropHover ? 'bg-[var(--primary-soft)]' : 'bg-[var(--bg-base)]'
+			)}
 			style={{ width: `${COLLAPSED_WIDTH}px`, borderColor: 'var(--border-soft)' }}
 			{...dropProps}
 		>
+			{monograms > 0 && (
+				// biome-ignore lint/a11y/useSemanticElements: a labelled group of buttons, not a form fieldset
+				<div role="group" aria-label="Seats" className="flex flex-col items-center gap-2 pt-1">
+					{seats.map((seat) => {
+						const ref = seatSessionRef(seat);
+						const pending = ref && seat.status !== 'vacant' ? (pendingBySession[ref] ?? 0) : 0;
+						const on = selectedKey === `seat:${seat.id}`;
+						const state =
+							seat.status === 'live' ? 'live' : seat.status === 'run' ? 'run' : seat.status === 'idle' ? 'idle' : 'vacant';
+						const name = `${atName(seat.name)} · ${state}${pending ? ` · ${pending} permission${pending === 1 ? '' : 's'} pending` : ''}${seat.inbox_count && seat.status !== 'vacant' ? ` · inbox ${seat.inbox_count}` : ''}`;
+						return (
+							<button
+								key={seat.id}
+								type="button"
+								data-mono={seat.name}
+								title={name}
+								aria-label={`${name}. Expand the Companion on this seat.`}
+								onClick={() => onPickSeat?.(seat, pending > 0)}
+								className={MONO_CLASS}
+								style={{
+									color: on ? 'var(--fg)' : 'var(--fg-muted)',
+									borderColor: on ? 'var(--primary)' : 'var(--border-soft)',
+									background: 'var(--bg-surface)',
+								}}
+							>
+								{seatMonogram(seat.name)}
+								<CornerDot status={seat.status} />
+								{pending > 0 && <Badge n={pending} />}
+							</button>
+						);
+					})}
+					{seats.length > 0 && unseated.length > 0 && (
+						<span aria-hidden="true" className="h-px w-4" style={{ background: 'var(--border)' }} />
+					)}
+					{unseated.map((u) => {
+						const pending = pendingBySession[u.id] ?? 0;
+						const on = selectedKey === `session:${u.id}`;
+						const liveNow = u.status === 'running' || u.status === 'spawning';
+						const name = `${sessionName(u.id)} · unseated${pending ? ` · ${pending} permission${pending === 1 ? '' : 's'} pending` : ''}`;
+						return (
+							<button
+								key={u.id}
+								type="button"
+								data-mono-session={u.id}
+								title={name}
+								aria-label={`${name}. Expand the Companion on this session.`}
+								onClick={() => onPickSession?.(u.id, pending > 0)}
+								className={cn(MONO_CLASS, 'border-dashed')}
+								style={{
+									color: on ? 'var(--fg)' : 'var(--fg-muted)',
+									borderColor: on ? 'var(--primary)' : 'var(--border-soft)',
+								}}
+							>
+								{`s${sessionNumber(u.id)}`}
+								<CornerDot status={liveNow ? 'live' : 'idle'} />
+								{pending > 0 && <Badge n={pending} />}
+							</button>
+						);
+					})}
+				</div>
+			)}
+			{loose > 0 && (
+				<span className="relative grid size-6 place-items-center" aria-hidden="true" data-attention="permission">
+					<ShieldAlert className="h-4 w-4" style={{ color: 'var(--achievement)' }} />
+					<span
+						className="absolute -right-1 -top-1 min-w-3.5 rounded-full px-0.5 text-center font-mono text-[11px] leading-[14px]"
+						style={{ background: 'var(--achievement)', color: 'var(--bg-base)' }}
+					>
+						{loose}
+					</span>
+				</span>
+			)}
+			{monograms === 0 && loose === 0 && live && (
+				<span className="grid size-6 place-items-center" aria-hidden="true" data-attention="run">
+					<span className="size-2 rounded-full motion-safe:animate-pulse" style={{ background: 'var(--live)' }} />
+				</span>
+			)}
+			<span aria-hidden="true" className="text-[11px] tracking-wider [writing-mode:vertical-rl]" style={{ color: 'var(--fg-muted)' }}>
+				{stripStateLabel(pendingPermissions, live)}
+			</span>
+			<span className="flex-1" />
 			<button
 				type="button"
 				aria-expanded={false}
 				aria-label={stripAccessibleName(pendingPermissions, live)}
+				title={`Expand Companion${labelFor('companion.toggle') ? ` (${labelFor('companion.toggle')})` : ''}`}
 				onClick={onExpand}
-				className={cn(
-					'flex h-full w-full flex-col items-center gap-3 py-2 text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)]',
-					'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
-					dropHover ? 'bg-[var(--primary-soft)]' : 'bg-[var(--bg-base)]'
-				)}
+				className="grid size-6 place-items-center rounded-sm text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
 			>
-				<span className="grid size-6 place-items-center" aria-hidden="true">
-					<ChevronLeft className="h-3.5 w-3.5" />
-				</span>
-				{pendingPermissions > 0 ? (
-					<span
-						className="relative grid size-6 place-items-center"
-						aria-hidden="true"
-						data-attention="permission"
-					>
-						<ShieldAlert className="h-4 w-4" style={{ color: 'var(--achievement)' }} />
-						<span
-							className="absolute -right-1 -top-1 min-w-3.5 rounded-full px-0.5 text-center font-mono text-[9px] leading-[14px]"
-							style={{ background: 'var(--achievement)', color: 'var(--bg-base)' }}
-						>
-							{pendingPermissions}
-						</span>
-					</span>
-				) : live ? (
-					<span className="grid size-6 place-items-center" aria-hidden="true" data-attention="run">
-						<span
-							className="size-2 rounded-full motion-safe:animate-pulse"
-							style={{ background: 'var(--live)' }}
-						/>
-					</span>
-				) : null}
-				<span aria-hidden="true" className="text-[11px] tracking-wider [writing-mode:vertical-rl]">
-					{stripStateLabel(pendingPermissions, live)}
-				</span>
+				<ChevronLeft className="h-3.5 w-3.5" aria-hidden="true" />
 			</button>
 		</aside>
 	);

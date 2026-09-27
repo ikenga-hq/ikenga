@@ -2,10 +2,16 @@
 // `designs/frame-workbench-v4.html`; spec §3.9–§3.12, §5). Was the Dock.
 //
 // It renders STATE, never model prose (ADR-021 / spec §5.4): a dispatch bar
-// (the one text input), session tabs, and panels — permissions, cost, tool
-// feed, runs. Whatever an agent says lives in the terminal pane, never here.
-// `companion.conformance.test.ts` enforces that for everything under this
-// directory.
+// (the one dispatch input), the seat rail (WP-67, D-09 `seats-companion.html`
+// — the session tabs became seats), and panels — permissions, cost, tool
+// feed, runs — scoped to the selected seat. Whatever an agent says lives in
+// the terminal pane, never here. `companion.conformance.test.ts` enforces
+// that for everything under this directory.
+//
+// D-09 state map (G-55 `data-state`): `seats-roster` / `seats-empty` (the
+// rail), `seats-create` (the New-seat form), `seats-vacant` (a vacant seat's
+// panel), `seats-dispatch` (the target picker open), `seats-rest` (the 36 px
+// strip). `popout` is WP-69's.
 
 import { ChevronRight, ShieldCheck } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -19,12 +25,13 @@ import { useDragState } from '@/lib/panes/drag-state';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useDropTarget } from '@/lib/panes/pointer-drag';
 import type { LeafNode, PaneNode, PaneView } from '@/lib/panes/types';
+import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
+import type { DetectedAgent, SeatView } from '@/lib/tauri-cmd';
 import { COMPANION_FOCUS_EVENT } from '@/shell/companion-focus';
 import { listen } from '@/lib/transport';
 import { CostHud } from '@/terminal/cost-hud';
 import { MissionControl } from '@/terminal/mission-control';
-import { useTerminalStore } from '@/terminal/session-store';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
 import { CollapsedStrip } from './collapsed-strip';
 import {
@@ -36,8 +43,16 @@ import {
 	useCompanionStore,
 } from './companion-store';
 import { DispatchBar } from './dispatch-bar';
-import { SessionTabs } from './session-tabs';
-import { useTargetLabel } from './target-picker';
+import { applyTarget, cycleIn, selectSeat, selectSession, useSeatUi } from './seat-actions';
+import { SeatForm } from './seat-form';
+import { atName, costLine, seatSessionRef, UNREPORTED } from './seat-model';
+import { SeatNoticeHost } from './seat-notice-host';
+import { SeatRail, useRailSync } from './seat-rail';
+import { SeatRemoveDialog } from './seat-remove-dialog';
+import { type SeatRoster, useSeatRoster } from './seat-roster';
+import { sessionName, useSessionFigures } from './seat-sessions';
+import { SeatVacantPanel } from './seat-vacant-panel';
+import { cycleTargets, DETECT_AGENTS_KEY, offeredEngines, useTargetLabel } from './target-picker';
 
 /** Window event WP-03's ⌘2 (rail → Chi) dispatches — owned by the rail's
  *  dependency-free seam module; re-exported here for tests and callers. */
@@ -124,6 +139,44 @@ function draggedPaneView(): PaneView | null {
 	return findLeaf(usePaneStore.getState().root, d.srcLeafId)?.tabs[d.srcTabIdx] ?? null;
 }
 
+/** Where a permission card lands after a monogram click (D-09: "clicking
+ *  the lead monogram lands on its permission card"). */
+function focusPermissionFor(sessionId: string | null): void {
+	setTimeout(() => {
+		const id =
+			sessionId && typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+				? CSS.escape(sessionId)
+				: (sessionId ?? '').replace(/["\\]/g, '\\$&');
+		const sel = sessionId
+			? `[data-permission-card][data-permission-session="${id}"]`
+			: '[data-permission-card][data-status="pending"]';
+		document.querySelector<HTMLElement>(sel)?.focus();
+	}, 0);
+}
+
+/** ⌥↑ / ⌥↓ — cycle the dispatch target (D-09 rule 5). Fires anywhere in the
+ *  Companion, including the dispatch input, but never from another text
+ *  field (the New-seat name, a rename). Scoped to the Companion: a global
+ *  binding would be a `defaults.ts` entry, which is WP-68's file. */
+function onCycleKey(e: React.KeyboardEvent, roster: SeatRoster): void {
+	if (!e.altKey || e.metaKey || e.ctrlKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+	const el = e.target as HTMLElement;
+	const isField = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+	if (isField && !el.hasAttribute('data-companion-dispatch')) return;
+	e.preventDefault();
+	const shell = useShellStore.getState();
+	const engines = offeredEngines(
+		shell.defaultEngineId,
+		queryClient.getQueryData<DetectedAgent[]>([...DETECT_AGENTS_KEY])
+	);
+	const next = cycleIn(
+		cycleTargets(roster.seats, roster.unseated, engines),
+		shell.companion.activeTarget,
+		e.key === 'ArrowDown' ? 1 : -1
+	);
+	if (next) applyTarget(next);
+}
+
 export function Companion() {
 	const companionState = useCompanionStore((s) => s.state);
 	const setState = useCompanionStore((s) => s.setState);
@@ -133,21 +186,21 @@ export function Companion() {
 	const pending = useCompanionStore(
 		(s) => s.permissions.filter((p) => p.status === 'pending').length
 	);
-	const tabs = useCompanionStore((s) => s.tabs);
-	const live = useTerminalStore((s) =>
-		tabs.some(
-			(v) =>
-				v.kind === 'terminal' && s.tabs.some((t) => t.id === v.sessionId && t.status === 'running')
-		)
-	);
+	const sel = useCompanionStore((s) => s.railSelection);
+	const form = useSeatUi((s) => s.form);
+	const roster = useSeatRoster();
+	const live =
+		roster.seats.some((s) => s.status === 'live' || s.status === 'run') ||
+		roster.unseated.some((u) => u.status === 'running');
 	const [dropHover, setDropHover] = useState(false);
 
 	usePermissionFeed();
 	useCompanionWindowEvents();
+	useRailSync(roster);
 
 	// Pane → Companion. A session is a reference, not a move: the terminal
 	// stays in its pane (output lives there, ADR-021) and the Companion gains
-	// a session tab for it. Only terminal tabs are sessions.
+	// it as a rail row (unseated, or its seat). Only terminal tabs are sessions.
 	const drop = useDropTarget({
 		accepts: () => draggedPaneView()?.kind === 'terminal',
 		onOver: () => setDropHover(true),
@@ -160,17 +213,38 @@ export function Companion() {
 		},
 	});
 
-	if (companionState === 'hidden') return null;
+	if (companionState === 'hidden') return <SeatNoticeHost />;
+
+	const selectedKey = sel ? (sel.kind === 'seat' ? `seat:${sel.seat_id}` : `session:${sel.session_id}`) : null;
 
 	if (companionState === 'collapsed') {
 		return (
-			<CollapsedStrip
-				pendingPermissions={pending}
-				live={live}
-				onExpand={() => useCompanionStore.getState().focusDispatch()}
-				dropProps={drop}
-				dropHover={dropHover}
-			/>
+			<>
+				<CollapsedStrip
+					pendingPermissions={pending}
+					live={live}
+					onExpand={() => useCompanionStore.getState().focusDispatch()}
+					seats={roster.seats}
+					unseated={roster.unseated}
+					pendingBySession={roster.pendingBySession}
+					pendingUnattributed={roster.pendingUnattributed}
+					selectedKey={selectedKey}
+					onPickSeat={(seat, toPermission) => {
+						setState('expanded');
+						selectSeat(seat);
+						if (toPermission) focusPermissionFor(seatSessionRef(seat));
+					}}
+					onPickSession={(id, toPermission) => {
+						setState('expanded');
+						selectSession(id);
+						if (toPermission) focusPermissionFor(id);
+					}}
+					dropProps={drop}
+					dropHover={dropHover}
+				/>
+				<SeatNoticeHost />
+				<SeatRemoveDialog roster={roster} />
+			</>
 		);
 	}
 
@@ -186,20 +260,38 @@ export function Companion() {
 				background: 'var(--bg-surface)',
 				borderColor: 'var(--border-soft)',
 			}}
+			onKeyDown={(e) => onCycleKey(e, roster)}
 			{...drop}
 		>
 			<CompanionResizeHandle width={width} setWidth={setWidth} />
-			<CompanionHeader onCollapse={() => setState('collapsed')} />
-			<DispatchBar />
-			<SessionTabs />
-			<CompanionPanels />
+			<CompanionHeader onCollapse={() => setState('collapsed')} roster={roster} />
+			<DispatchBar roster={roster} />
+			{form ? (
+				<SeatForm key={form.seatSession ?? 'new'} roster={roster} init={form} />
+			) : (
+				<>
+					<SeatRail roster={roster} />
+					<CompanionPanels roster={roster} />
+				</>
+			)}
+			<SeatNoticeHost />
+			<SeatRemoveDialog roster={roster} />
 		</aside>
 	);
 }
 
-function CompanionHeader({ onCollapse }: { onCollapse: () => void }) {
+function CompanionHeader({ onCollapse, roster }: { onCollapse: () => void; roster: SeatRoster }) {
 	const target = useShellStore((s) => s.companion.activeTarget);
-	const caption = useTargetLabel(target);
+	const sel = useCompanionStore((s) => s.railSelection);
+	const targetLabel = useTargetLabel(target);
+	// D-09: the header names the selected seat (`@lead`) — whose state the
+	// panels below are reading.
+	const selSeat = sel?.kind === 'seat' ? roster.seats.find((s) => s.id === sel.seat_id) : undefined;
+	const caption = selSeat
+		? atName(selSeat.name)
+		: sel?.kind === 'session'
+			? sessionName(sel.session_id)
+			: targetLabel;
 	// ⌘2 is WP-03's `rail.chi`; the hint appears once that binding exists.
 	const chiKey = findEntry('rail.chi') ? labelFor('rail.chi') : '';
 	const toggleKey = labelFor('companion.toggle');
@@ -216,12 +308,12 @@ function CompanionHeader({ onCollapse }: { onCollapse: () => void }) {
 				onClick={() =>
 					document
 						.querySelector<HTMLElement>(
-							'[role="tablist"][aria-label="Sessions"] [aria-selected="true"]'
+							'[role="listbox"][aria-label="Seats and unseated sessions"] [aria-selected="true"]'
 						)
 						?.focus()
 				}
-				className="min-w-0 truncate rounded-sm text-[11px] text-[var(--fg-muted)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-				title="Go to the active session tab"
+				className="min-w-0 truncate rounded-sm font-mono text-[11px] text-[var(--fg-muted)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+				title="Go to the selected seat"
 			>
 				{caption}
 			</button>
@@ -247,13 +339,18 @@ function CompanionHeader({ onCollapse }: { onCollapse: () => void }) {
 
 function Panel({
 	title,
+	scope,
 	count,
+	countTitle,
 	defaultOpen = true,
 	grow,
 	children,
 }: {
 	title: string;
+	/** The seat or session the panel is scoped to (`@lead`), D-09. */
+	scope?: string | null;
 	count?: string;
+	countTitle?: string;
 	defaultOpen?: boolean;
 	grow?: boolean;
 	children: React.ReactNode;
@@ -272,31 +369,88 @@ function Panel({
 				className="flex h-7 w-full items-center gap-2 px-3 text-[var(--fg-muted)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
 			>
 				<span className="text-[11px] font-semibold uppercase tracking-widest">{title}</span>
-				{count && <span className="ml-auto font-mono text-[11px]">{count}</span>}
+				{scope && (
+					<span className="font-mono text-[11px]" style={{ color: 'var(--fg)' }}>
+						{scope}
+					</span>
+				)}
+				{count && (
+					<span className="ml-auto font-mono text-[11px]" title={countTitle}>
+						{count}
+					</span>
+				)}
 			</button>
 			{open && <div className={cn(grow && 'min-h-0 flex-1 overflow-hidden')}>{children}</div>}
 		</section>
 	);
 }
 
-function CompanionPanels() {
+/** Who a session belongs to, in the rail's words: `@lead`, or `session 4`. */
+function ownerLabel(sessionId: string, seats: readonly SeatView[]): string {
+	const seat = seats.find((s) => seatSessionRef(s) === sessionId);
+	return seat ? atName(seat.name) : sessionName(sessionId);
+}
+
+function CompanionPanels({ roster }: { roster: SeatRoster }) {
 	const scope = useCompanionStore((s) => s.panelScopeSessionId);
+	const sel = useCompanionStore((s) => s.railSelection);
 	const permissions = useCompanionStore((s) => s.permissions);
-	const pending = permissions.filter((p) => p.status === 'pending').length;
+	const figures = useSessionFigures(scope);
+	const selSeat = sel?.kind === 'seat' ? roster.seats.find((s) => s.id === sel.seat_id) : undefined;
+	const scopeLabel = selSeat ? atName(selSeat.name) : scope ? sessionName(scope) : null;
+	// G-SEATS §9.1: selecting a seat scopes the permission panel too. A card
+	// with no session id can't be pinned on anyone, so it shows everywhere.
+	const shown = scope ? permissions.filter((p) => !p.sessionId || p.sessionId === scope) : permissions;
+	const pending = shown.filter((p) => p.status === 'pending').length;
+	const elsewhere = new Map<string, number>();
+	if (scope) {
+		for (const p of permissions) {
+			if (p.status !== 'pending' || !p.sessionId || p.sessionId === scope) continue;
+			elsewhere.set(p.sessionId, (elsewhere.get(p.sessionId) ?? 0) + 1);
+		}
+	}
+	const cost = scope ? costLine(figures) : null;
 	// Keyed by scope: the HUDs subscribe once per mount, so a scope change
 	// remounts them rather than reaching into their internals.
 	const scopeKey = scope ?? 'none';
 	return (
 		<div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-			<Panel title="Permissions" count={pending ? `${pending} pending` : 'none pending'}>
+			{selSeat && selSeat.status === 'vacant' && <SeatVacantPanel seat={selSeat} />}
+			<Panel title="Permissions" scope={scopeLabel} count={pending ? `${pending} pending` : 'none pending'}>
 				{/* §5.6 cards only: the scoped PermissionInbox HUD stays in the
 				    terminal host's side panels, not in the Companion. */}
-				<PermissionCards cards={permissions} />
+				<PermissionCards cards={shown} ownerOf={(id) => ownerLabel(id, roster.seats)} />
+				{elsewhere.size > 0 && (
+					<div className="flex flex-wrap gap-2 px-3 pb-3">
+						{[...elsewhere.entries()].map(([sessionId, n]) => (
+							<button
+								key={sessionId}
+								type="button"
+								data-permission-elsewhere={sessionId}
+								onClick={() => {
+									const seat = roster.seats.find((s) => seatSessionRef(s) === sessionId);
+									if (seat) selectSeat(seat);
+									else selectSession(sessionId);
+									focusPermissionFor(sessionId);
+								}}
+								className="inline-flex h-5 items-center gap-1 rounded-[var(--radius-xs)] px-1 text-[11px] hover:bg-[var(--achievement-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+								style={{ color: 'var(--on-achievement)' }}
+							>
+								{`${n} pending on ${ownerLabel(sessionId, roster.seats)}`}
+							</button>
+						))}
+					</div>
+				)}
 			</Panel>
-			<Panel title="Cost">
+			<Panel
+				title="Cost"
+				scope={scopeLabel}
+				count={cost?.text}
+				countTitle={cost?.unreported ? UNREPORTED : undefined}
+			>
 				<CostHud key={scopeKey} sessionId={scope} />
 			</Panel>
-			<Panel title="Tool feed" grow>
+			<Panel title="Tool feed" scope={scopeLabel} grow>
 				<ToolCallFeed key={scopeKey} sessionId={scope} />
 			</Panel>
 			{/* `embedded`: MissionControl drops its own dispatcher and sample
@@ -316,7 +470,14 @@ const DECISION_TEXT: Record<PermissionDecision, string> = {
 	deny: 'Denied',
 };
 
-export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
+export function PermissionCards({
+	cards,
+	ownerOf,
+}: {
+	cards: PermissionCardEntry[];
+	/** `@lead` / `session 4` for a card's session — the card says who asked. */
+	ownerOf?: (sessionId: string) => string;
+}) {
 	const resolve = useCompanionStore((s) => s.resolvePermission);
 	// A/D allow/deny the *focused* card (spec §2) — one pair of registry
 	// commands for the whole list (WP-56, G-ACTIONS §10.2/§10.6), reading
@@ -358,13 +519,17 @@ export function PermissionCards({ cards }: { cards: PermissionCardEntry[] }) {
 	return (
 		<div className="flex flex-col gap-2 px-3 pb-3">
 			{cards.map((card) => (
-				<PermissionCard key={card.id} card={card} />
+				<PermissionCard
+					key={card.id}
+					card={card}
+					owner={card.sessionId && ownerOf ? ownerOf(card.sessionId) : null}
+				/>
 			))}
 		</div>
 	);
 }
 
-function PermissionCard({ card }: { card: PermissionCardEntry }) {
+function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: string | null }) {
 	const undo = useCompanionStore((s) => s.undoPermission);
 	const resolve = useCompanionStore((s) => s.resolvePermission);
 
@@ -376,6 +541,7 @@ function PermissionCard({ card }: { card: PermissionCardEntry }) {
 			aria-label={`Permission request: ${title}`}
 			{...focusMarkerProps('permission-card')}
 			data-permission-card={card.id}
+			data-permission-session={card.sessionId}
 			data-status={card.status}
 			className={cn(
 				'min-w-0 rounded-md border p-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
@@ -383,6 +549,14 @@ function PermissionCard({ card }: { card: PermissionCardEntry }) {
 			)}
 			style={{ borderColor: 'var(--achievement-soft)', background: 'var(--bg-raised)' }}
 		>
+			{owner && (
+				<div className="mb-1 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
+					from{' '}
+					<span className="font-mono" style={{ color: 'var(--fg)' }}>
+						{owner}
+					</span>
+				</div>
+			)}
 			<div className="text-[13px]" style={{ color: 'var(--fg)' }}>
 				<span className="font-mono">{title}</span>
 			</div>

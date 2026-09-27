@@ -6,12 +6,14 @@ import { SendHorizontal } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { resolveHostedKeypress } from '@/lib/keymap/dispatcher';
-import { labelFor } from '@/lib/keymap/registry';
+import { findEntry, labelFor } from '@/lib/keymap/registry';
 import { useSeats } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useCompanionStore } from './companion-store';
 import { currentDispatchContext, resolveTarget, targetEngineId } from './resolve-target';
-import { SeatNoticeHost } from './seat-notice-host';
+import { atName, seatSendHint, seatSessionRef } from './seat-model';
+import type { SeatRoster } from './seat-roster';
+import { sessionName } from './seat-sessions';
 import { TargetPicker } from './target-picker';
 
 /** Below this, a send shows no loading state at all (spec §1.2: no flash). */
@@ -40,7 +42,34 @@ const DISPATCH_MODE: Readonly<Record<string, 'target' | 'new' | 'persistent'>> =
 	'companion.persistent-run': 'persistent',
 };
 
-export function DispatchBar() {
+/** What ↵ does for the current target — the hint row's first item (D-09). */
+export function sendHintFor(target: CompanionTarget, roster: Pick<SeatRoster, 'seats'>): string {
+	switch (target.kind) {
+		case 'seat': {
+			const seat = roster.seats.find((s) => s.id === target.seat_id);
+			if (!seat) return 'send';
+			const ref = seatSessionRef(seat);
+			return seatSendHint(seat, ref ? sessionName(ref) : null);
+		}
+		case 'session':
+			return `send to ${sessionName(target.session_id)}`;
+		case 'new':
+			return `start a ${target.engine_id ?? 'new'} session`;
+		case 'persistent':
+			return 'start a persistent run';
+	}
+}
+
+/** The input's placeholder: `Dispatch to @lead…` for a seat. */
+export function placeholderFor(target: CompanionTarget, roster: Pick<SeatRoster, 'seats'>): string {
+	if (target.kind === 'seat') {
+		const seat = roster.seats.find((s) => s.id === target.seat_id);
+		if (seat) return `Dispatch to ${atName(seat.name)}…`;
+	}
+	return 'Dispatch an instruction…';
+}
+
+export function DispatchBar({ roster }: { roster: SeatRoster }) {
 	const target = useShellStore((s) => s.companion.activeTarget);
 	// Subscribed so a newly-chosen default engine re-enables the input.
 	useShellStore((s) => s.defaultEngineId);
@@ -123,7 +152,8 @@ export function DispatchBar() {
 			void dispatch(mode);
 			return;
 		}
-		if (e.key === 'ArrowUp' && !draft) {
+		// ⌥↑ / ⌥↓ cycle the target (the Companion's handler), never recall.
+		if (e.key === 'ArrowUp' && !draft && !e.altKey) {
 			const stack = recall.get(targetKey(target));
 			const prev = stack?.[stack.length - 1];
 			if (prev) {
@@ -142,6 +172,9 @@ export function DispatchBar() {
 	const sendHint = labelFor('companion.send');
 	const newRunHint = labelFor('companion.new-run');
 	const persistentHint = labelFor('companion.persistent-run');
+	// DEC-67: ⌘2 again from this input opens the seat board — shown once
+	// WP-68's `chi.board` entry exists.
+	const boardHint = findEntry('chi.board') ? labelFor('chi.board') : '';
 
 	return (
 		<div
@@ -149,7 +182,7 @@ export function DispatchBar() {
 			className="shrink-0 border-b px-3 pb-3 pt-2"
 			style={{ borderColor: 'var(--border)' }}
 		>
-			<TargetPicker />
+			<TargetPicker roster={roster} />
 			<div
 				className="flex h-8 items-center gap-2 rounded-md border pl-3 pr-1 focus-within:border-[var(--primary)]"
 				style={{ background: 'var(--bg-sunken)', borderColor: 'var(--border-strong)' }}
@@ -163,7 +196,7 @@ export function DispatchBar() {
 					onKeyDown={onKeyDown}
 					disabled={Boolean(disabledReason)}
 					title={disabledReason}
-					placeholder="Dispatch an instruction…"
+					placeholder={placeholderFor(target, roster)}
 					aria-label="Dispatch an instruction"
 					data-companion-dispatch=""
 					{...focusMarkerProps('dispatch')}
@@ -184,8 +217,8 @@ export function DispatchBar() {
 				</button>
 			</div>
 			<div className="mt-1 flex flex-wrap gap-x-3 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
-				<span>
-					<kbd className="font-mono">{sendHint}</kbd> send
+				<span data-send-hint="">
+					<kbd className="font-mono">{sendHint}</kbd> {sendHintFor(target, roster)}
 				</span>
 				<span>
 					<kbd className="font-mono">{newRunHint}</kbd> new run
@@ -193,13 +226,20 @@ export function DispatchBar() {
 				<span>
 					<kbd className="font-mono">{persistentHint}</kbd> persistent run
 				</span>
+				<span>
+					<kbd className="font-mono">⌥↑↓</kbd> target
+				</span>
+				{boardHint && (
+					<span>
+						<kbd className="font-mono">{boardHint}</kbd> again · all seats
+					</span>
+				)}
 			</div>
 			{error && (
 				<p role="alert" className="mt-1 text-[11px]" style={{ color: 'var(--color-text-danger)' }}>
 					{error}
 				</p>
 			)}
-			<SeatNoticeHost />
 		</div>
 	);
 }
