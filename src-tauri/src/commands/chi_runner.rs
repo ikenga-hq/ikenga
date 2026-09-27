@@ -52,9 +52,15 @@ pub(crate) struct RunnerConf<'a> {
     pub timeout_seconds: Option<u64>,
 }
 
-/// chi-runner next to the current executable (how the bundle ships it), else
-/// on the augmented `PATH`. `None` when neither has it — the caller falls back
-/// to an in-process run.
+/// chi-runner next to the current executable, else on the augmented `PATH`
+/// (which includes `~/.cargo/bin`). `None` when neither has it — the caller
+/// falls back to an in-process run.
+///
+/// NB the app bundle does NOT ship chi-runner today (no `externalBin`, no
+/// release step builds it — it lives in the iyke-cli repo and reaches users
+/// only via `cargo install`), so on a stock install this is `None` unless the
+/// user installed it themselves. The sibling-of-exe probe is where a Tauri
+/// `externalBin` sidecar would land once the release ships one.
 pub(crate) fn resolve_runner_path() -> Option<PathBuf> {
     let file_name = format!("{RUNNER_BINARY}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
@@ -66,6 +72,28 @@ pub(crate) fn resolve_runner_path() -> Option<PathBuf> {
     which::which_in(RUNNER_BINARY, Some(crate::runtime::augmented_path()), ".").ok()
 }
 
+/// Why [`resolve_runner_path`] found nothing, naming exactly where it looked.
+fn runner_not_found(exe: Option<&Path>) -> String {
+    let file_name = format!("{RUNNER_BINARY}{}", std::env::consts::EXE_SUFFIX);
+    let sibling = match exe {
+        Some(exe) => exe.with_file_name(&file_name).display().to_string(),
+        None => "next to the app executable (current_exe unavailable)".to_string(),
+    };
+    format!("{RUNNER_BINARY} not found (looked at {sibling} and on PATH)")
+}
+
+/// The warning a *persistent* run carries when it had to fall back to an
+/// in-process run: loud, honest about the consequence (the run dies with the
+/// app), and actionable. `reason` is `spawn_detached_runner`'s error.
+pub(crate) fn persistent_fallback_warning(reason: &str) -> String {
+    format!(
+        "persistent run fell back to in-process: {reason}. This run will NOT survive \
+         quitting the app. To make persistent runs durable, install {RUNNER_BINARY} \
+         next to the app executable or on PATH (from the iyke-cli repo: \
+         `cargo install --path iyke-cli --bin {RUNNER_BINARY}`)."
+    )
+}
+
 /// Write the conf and spawn chi-runner detached through the executor. Returns
 /// the runner's pid. The `Child` handle is dropped without waiting — the
 /// executor turns `kill_on_drop` off for a detached spawn, so that doesn't end
@@ -74,7 +102,8 @@ pub(crate) fn spawn_detached_runner(
     conf: &RunnerConf<'_>,
     cache_dir: &Path,
 ) -> Result<u32, String> {
-    let runner = resolve_runner_path().ok_or_else(|| format!("{RUNNER_BINARY} not found"))?;
+    let runner = resolve_runner_path()
+        .ok_or_else(|| runner_not_found(std::env::current_exe().ok().as_deref()))?;
 
     let conf_path = cache_dir.join(format!("{}.conf.json", conf.run_id));
     let conf_json = serde_json::to_string(conf).map_err(|e| format!("serialize conf: {e}"))?;
@@ -307,6 +336,57 @@ mod tests {
             "grandchild survived"
         );
         assert!(gone_or_zombie(leader, leader_start), "leader survived");
+    }
+
+    #[test]
+    fn runner_not_found_names_where_it_looked() {
+        let exe = Path::new("/opt/Ikenga/ikenga-desktop");
+        let msg = runner_not_found(Some(exe));
+        let sibling =
+            exe.with_file_name(format!("{RUNNER_BINARY}{}", std::env::consts::EXE_SUFFIX));
+        assert!(msg.contains(&sibling.display().to_string()), "{msg}");
+        assert!(msg.contains("on PATH"), "{msg}");
+        assert!(runner_not_found(None).contains("current_exe unavailable"));
+    }
+
+    #[test]
+    fn persistent_fallback_warning_is_loud_and_actionable() {
+        let w = persistent_fallback_warning("chi-runner not found (looked at /x and on PATH)");
+        assert!(
+            w.contains("looked at /x and on PATH"),
+            "carries the reason: {w}"
+        );
+        assert!(w.contains("NOT survive"), "says what the user loses: {w}");
+        assert!(
+            w.contains("cargo install --path iyke-cli --bin chi-runner"),
+            "says how to fix it: {w}"
+        );
+    }
+
+    /// On a host without chi-runner (CI, a stock install) the detached spawn
+    /// refuses with the where-it-looked reason and writes nothing. Skipped
+    /// where a dev has chi-runner installed.
+    #[test]
+    fn spawn_detached_runner_without_a_runner_names_the_search() {
+        if resolve_runner_path().is_some() {
+            eprintln!("chi-runner installed on this host — skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let conf = RunnerConf {
+            run_id: "r1",
+            engine_id: "claude-code",
+            prompt: "hi",
+            cwd: ".",
+            model: None,
+            mode: None,
+            resume_session_id: None,
+            output_path: "/dev/null",
+            timeout_seconds: None,
+        };
+        let err = spawn_detached_runner(&conf, dir.path()).unwrap_err();
+        assert!(err.starts_with("chi-runner not found (looked at "), "{err}");
+        assert!(!dir.path().join("r1.conf.json").exists(), "no conf written");
     }
 
     #[cfg(unix)]

@@ -5,7 +5,9 @@ name: CI
 #
 #   fast tier  — every non-draft PR, scoped to what changed:
 #                ACL parity always (seconds, no install); typecheck + unit
-#                tests when TS changed; `cargo check` when Rust changed.
+#                tests when TS changed; `cargo check` + the headless
+#                (`--no-default-features` / ikenga-server) build, tests and
+#                link gate when Rust changed.
 #   full tier  — adds `cargo test` and the browser-mode frame e2e. Runs for
 #                PRs into `main` (release PRs), PRs labelled `ci:full`, the
 #                nightly schedule on `main`, and manual dispatch.
@@ -48,6 +50,7 @@ jobs:
     outputs:
       ts: ${{ steps.filter.outputs.ts == 'true' || steps.mode.outputs.full == 'true' }}
       rust: ${{ steps.filter.outputs.rust == 'true' || steps.mode.outputs.full == 'true' }}
+      headless: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.server == 'true' || steps.mode.outputs.full == 'true' }}
       full: ${{ steps.mode.outputs.full }}
     steps:
       - uses: actions/checkout@v6
@@ -88,6 +91,9 @@ jobs:
             rust:
               - 'src-tauri/**'
               - '.github/**'
+            # The headless link gate script the `headless` job runs.
+            server:
+              - 'scripts/server/**'
 
       # Cheapest gate in the pipeline and the one that would have caught
       # ikenga#140. Since tauri 2.11.2, app commands are ACL-gated for the
@@ -234,3 +240,65 @@ jobs:
           IKENGA_CONTRACT_DIR: ${{ github.workspace }}/_siblings/contract
           IKENGA_PKGS_DIR: ${{ github.workspace }}/_siblings/ikenga-pkgs
         run: cargo test --lib --no-fail-fast
+
+  # Headless feature set: the `ikenga-desktop` lib without its default
+  # `desktop` feature, and the `ikenga-server` daemon built on it. The `rust`
+  # job only ever compiles the desktop feature set, which is how
+  # `cargo test --lib --no-default-features` once stopped compiling unseen.
+  #
+  # Fast tier (whenever Rust changed), not full-tier-only like desktop
+  # `cargo test`: without wry/WebKit it is a much smaller build than the
+  # desktop test binary, its lib suite is a fraction of the desktop one, and
+  # it runs in parallel on its own runner — so it adds no wall time to the
+  # `rust` job and none of its target/ to that runner's disk. A headless
+  # break is also invisible to every other fast-tier gate.
+  #
+  # No sibling checkouts: the only tests that read ikenga-contract /
+  # ikenga-pkgs (`pkg::manifest_v5_parity`, `ikenga_pkgs_fleet_*`) are
+  # `#[cfg(feature = "desktop")]`, so they are not compiled here.
+  headless:
+    name: headless build + test + link gate
+    needs: scope
+    if: needs.scope.outputs.headless == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      # Same headers as the `rust` job. Headless still COMPILES the gtk/glib
+      # -sys crates (tauri's muda menu dep pulls them in regardless of
+      # `wry`); it just must not LINK them — which the gate below asserts.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Its own key: a different feature set of the same crates, so sharing
+      # `ci-check` would thrash it. Saved from `main` only, like `rust`.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ci-headless
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo build -p ikenga-server
+        working-directory: src-tauri
+        run: cargo build -p ikenga-server --message-format=short
+
+      # The daemon must not link GTK/WebKit, or it won't start on a server.
+      # Same script deploy.sh gates a release build with.
+      - name: Headless link gate (no GTK/WebKit in ikenga-server)
+        run: scripts/server/check-headless-link.sh src-tauri/target/debug/ikenga-server
+
+      - name: cargo test --lib --no-default-features
+        working-directory: src-tauri
+        run: cargo test --lib --no-default-features --no-fail-fast
+
+      - name: cargo test -p ikenga-server
+        working-directory: src-tauri
+        run: cargo test -p ikenga-server --no-fail-fast
