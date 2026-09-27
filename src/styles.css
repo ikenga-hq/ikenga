@@ -347,6 +347,32 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
+ * WP-71c — the seat rail's "moved" highlight (D-09 `.sgl.moved`, the
+ * `popout` state): a row's Window 2 signal that has just received its seat
+ * pulses twice (v4 `hitpanel`, 1.6 s × 2). The animation wins over the
+ * signal's inline background; under reduced motion it holds the tint instead.
+ * ------------------------------------------------------------------------- */
+@keyframes ikenga-seat-moved {
+	0%,
+	100% {
+		background: var(--bg-raised);
+	}
+	40% {
+		background: var(--primary-soft);
+	}
+}
+
+[data-signal][data-moved='true'] {
+	animation: ikenga-seat-moved 1.6s var(--ease-calm) 2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	[data-signal][data-moved='true'] {
+		background: var(--primary-soft) !important;
+	}
+}
+
+/* ---------------------------------------------------------------------------
  * Global reduced-motion safety-net.
  *
  * Honors `prefers-reduced-motion: reduce` across the chrome — the token-driven

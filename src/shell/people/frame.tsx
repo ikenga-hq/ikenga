@@ -29,7 +29,7 @@ export function PeopleHeader({ tab }: { tab: 'profile' | 'devices' }) {
 			</header>
 			<div className="flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">
 				<SegmentedLinks items={[...PEOPLE_TABS]} ariaLabel="People sections" />
-				<span className="ml-auto font-mono text-[10px] text-[var(--fg-muted)]">
+				<span className="ml-auto font-mono text-[11px] text-[var(--fg-muted)]">
 					/settings/{tab}
 				</span>
 			</div>

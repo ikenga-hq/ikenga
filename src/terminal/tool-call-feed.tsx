@@ -185,7 +185,7 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 			return <Search className="h-3.5 w-3.5 text-purple-400" />;
 		if (lower.includes('fetch') || lower.includes('web'))
 			return <Globe className="h-3.5 w-3.5 text-blue-400" />;
-		return <Activity className="h-3.5 w-3.5 text-zinc-400" />;
+		return <Activity className="h-3.5 w-3.5 text-muted-foreground" />;
 	};
 
 	if (!sessionId) return <NoSessionEmpty title="No session selected — no tool calls to show." />;
@@ -194,20 +194,20 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 		return (
 			<div className="flex h-full flex-col items-center justify-center p-6 text-center text-xs text-muted-foreground font-mono select-none">
 				<Clock className="mb-2 h-6 w-6 text-muted-foreground/40" />
-				<p className="font-semibold text-zinc-300">Live Tool-Call Feed</p>
+				<p className="font-semibold text-foreground">Live Tool-Call Feed</p>
 				<p className="mt-1 text-[11px]">Listening for PreToolUse and PostToolUse events...</p>
 			</div>
 		);
 	}
 
 	return (
-		<div className="flex h-full flex-col overflow-y-auto bg-zinc-950 p-3 text-xs font-mono text-zinc-200 divide-y divide-zinc-800/40 select-none">
+		<div className="flex h-full flex-col overflow-y-auto bg-card p-3 text-xs font-mono text-foreground divide-y divide-border select-none">
 			{calls.map((call) => (
 				<div key={call.tool_use_id} className="py-2.5">
 					<div className="flex items-center justify-between">
 						<div className="flex items-center gap-2">
 							{getToolIcon(call.tool_name)}
-							<span className="font-semibold text-zinc-100">{call.tool_name}</span>
+							<span className="font-semibold text-foreground">{call.tool_name}</span>
 							{call.status === 'running' ? (
 								<span className="flex items-center gap-1 text-[10px] text-amber-400">
 									<Activity className="h-2.5 w-2.5 animate-spin" /> running
@@ -224,12 +224,12 @@ export function ToolCallFeed({ sessionId }: { sessionId?: string | null }) {
 						</div>
 
 						{call.durationMs !== undefined && (
-							<span className="text-[10px] text-zinc-500">{call.durationMs}ms</span>
+							<span className="text-[10px] text-muted-foreground">{call.durationMs}ms</span>
 						)}
 					</div>
 
 					{call.tool_input && (
-						<pre className="mt-1.5 max-h-28 overflow-x-auto rounded bg-zinc-900/80 border border-zinc-800/60 p-2 text-[10px] text-zinc-400">
+						<pre className="mt-1.5 max-h-28 overflow-x-auto rounded bg-muted border border-border p-2 text-[10px] text-muted-foreground">
 							{JSON.stringify(call.tool_input, null, 2)}
 						</pre>
 					)}

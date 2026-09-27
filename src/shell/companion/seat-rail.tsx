@@ -34,6 +34,7 @@ import { UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import type { SeatStatus, SeatView } from '@/lib/tauri-cmd';
 import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { mountSignature, movedToWindow } from '@/shell/chi-board/board-model';
 import { type RunAttachState, useRunAttachedTerminal } from '@/terminal/attach-run';
 import { useTerminalStore } from '@/terminal/session-store';
 import { type RailSelection, useCompanionStore } from './companion-store';
@@ -156,17 +157,21 @@ function Signal({
 	tone = 'plain',
 	icon,
 	title,
+	moved,
 	children,
 }: {
 	tone?: 'plain' | 'ask' | 'inbox' | 'window' | 'hold';
 	icon?: React.ReactNode;
 	title: string;
+	/** D-09 `.sgl.moved`: pulse (the `ikenga-seat-moved` keyframes in styles.css). */
+	moved?: boolean;
 	children: React.ReactNode;
 }) {
 	return (
 		<span
 			title={title}
 			data-signal={tone}
+			data-moved={moved ? 'true' : undefined}
 			className="inline-flex h-[18px] shrink-0 items-center gap-[3px] whitespace-nowrap rounded-full border px-[5px] font-mono text-[11px] [&_svg]:size-[11px]"
 			style={
 				tone === 'ask'
@@ -188,11 +193,17 @@ function Signal({
 	);
 }
 
-/** The mount readout (never part of the address, D-09 rule 2). */
-function mountSignal(mount: Mount, isRun: boolean) {
+/** The mount readout (never part of the address, D-09 rule 2). `moved`: the
+ *  seat has just arrived in Window 2 (D-09 `popout`, `.sgl.moved`). */
+function mountSignal(mount: Mount, isRun: boolean, moved = false) {
 	if (mount.where === 'window') {
 		return (
-			<Signal tone="window" icon={<AppWindow aria-hidden="true" />} title="Popped out to a second window · the address is unchanged">
+			<Signal
+				tone="window"
+				moved={moved}
+				icon={<AppWindow aria-hidden="true" />}
+				title="Popped out to a second window · the address is unchanged"
+			>
 				Window 2
 			</Signal>
 		);
@@ -219,6 +230,44 @@ function useTerminalLive(terminalId: string | null): boolean {
 	return useTerminalStore((s) =>
 		terminalId ? s.tabs.some((t) => t.id === terminalId && t.status === 'running') : false
 	);
+}
+
+/** How long the rail's "moved" highlight runs: D-09's `hitpanel` 1.6 s, twice
+ *  (the board's `MOVED_MS`, so both surfaces settle together). */
+export const RAIL_MOVED_MS = 3_200;
+
+/**
+ * Seats whose mount has just become a second window (D-09 `popout`: after
+ * *Pop out*, the row's Window 2 signal pulses and the rail's root reads
+ * `seats-popout`). The first sighting is never a move: a seat already in
+ * Window 2 when the rail mounts stays plain (the `roster` state). Same rule
+ * as the board's `useMovedRows` (G-93, G-96).
+ */
+export function useMovedSeats(seats: readonly SeatView[]): ReadonlySet<string> {
+	const root = usePaneStore((s) => s.root);
+	const detached = useDetachedSurfaces((s) => s.surfaceToWindow);
+	const tabs = useTerminalStore((s) => s.tabs);
+	const prev = useRef<Map<string, string> | null>(null);
+	const [moved, setMoved] = useState<ReadonlySet<string>>(() => new Set());
+	useEffect(() => {
+		const next = new Map<string, string>();
+		const hits: string[] = [];
+		for (const seat of seats) {
+			const tid = seat.session?.kind === 'terminal' && seat.status !== 'vacant' ? seat.session.terminal_id : null;
+			const ptyId = tid ? (tabs.find((t) => t.id === tid)?.ptyId ?? null) : null;
+			const sig = mountSignature(tid ? mountOfTerminal(tid, root, detached, ptyId) : { where: 'none' });
+			next.set(seat.id, sig);
+			if (prev.current && movedToWindow(prev.current.get(seat.id), sig)) hits.push(seat.id);
+		}
+		prev.current = next;
+		if (hits.length) setMoved((cur) => new Set([...cur, ...hits]));
+	}, [seats, root, detached, tabs]);
+	useEffect(() => {
+		if (moved.size === 0) return;
+		const t = setTimeout(() => setMoved(new Set()), RAIL_MOVED_MS);
+		return () => clearTimeout(t);
+	}, [moved]);
+	return moved;
 }
 
 function RailIykeLine({ cmd }: { cmd: string }) {
@@ -274,8 +323,12 @@ function rowStyle(selected: boolean): React.CSSProperties {
 		: {};
 }
 
+// Focus is an outline (D-09 `.seat:focus-visible`: 2px --primary, offset -2px),
+// not a ring: a ring is a box-shadow, and the selected row's inline
+// box-shadow (its --primary edge) would hide it — the roving row is always
+// the selected one, so the keyboard user would never see where focus is.
 const ROW_CLASS =
-	'relative flex flex-col justify-center pl-3 pr-2 text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring';
+	'relative flex flex-col justify-center pl-3 pr-2 text-[var(--fg-muted)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary';
 
 /** F2 / *Rename…* inline: live §1.2 validation; ↵ renames, Esc or a click
  *  elsewhere cancels. `onMessage` reports the line shown under the row. */
@@ -349,6 +402,7 @@ function SeatRow({
 	takenNames,
 	removingNames,
 	pending,
+	moved,
 	onMenu,
 }: {
 	seat: SeatView;
@@ -358,6 +412,8 @@ function SeatRow({
 	takenNames: string[];
 	removingNames: string[];
 	pending: number;
+	/** Just popped out to Window 2 (D-09 `popout`): its Window 2 signal pulses. */
+	moved: boolean;
 	onMenu: (seat: SeatView, x: number, y: number) => void;
 }) {
 	const terminalId = seat.session?.kind === 'terminal' ? seat.session.terminal_id : null;
@@ -446,7 +502,7 @@ function SeatRow({
 								{String(seat.inbox_count)}
 							</Signal>
 						)}
-						{seat.status !== 'vacant' && mountSignal(mount, seat.session?.kind === 'run')}
+						{seat.status !== 'vacant' && mountSignal(mount, seat.session?.kind === 'run', moved)}
 					</span>
 				)}
 			</div>
@@ -863,6 +919,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 	const roveIdx = selectedIdx >= 0 ? selectedIdx : 0;
 	const takenNames = seats.map((s) => s.name);
 	const empty = state === 'ready' && seats.length === 0;
+	const moved = useMovedSeats(seats);
 
 	const focusKey = useCallback((key: string) => {
 		const el = listRef.current?.querySelector<HTMLElement>(
@@ -960,7 +1017,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 
 	return (
 		<div
-			data-state={empty ? 'seats-empty' : 'seats-roster'}
+			data-state={empty ? 'seats-empty' : moved.size > 0 ? 'seats-popout' : 'seats-roster'}
 			className="flex max-h-[52%] shrink-0 flex-col border-b"
 			style={{ background: 'var(--bg-base)', borderColor: 'var(--border)' }}
 		>
@@ -1008,7 +1065,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 							type="button"
 							data-new-seat=""
 							onClick={() => openSeatForm()}
-							className="h-7 rounded-md bg-[var(--primary)] px-3 text-xs text-[var(--primary-fg)] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+							className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--primary)] bg-[var(--primary)] px-3 text-[11px] font-medium text-[var(--primary-fg)] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
 							New seat
 						</button>
@@ -1017,8 +1074,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 							disabled={!emptySeatTarget}
 							title={emptySeatTarget ? `Seat ${sessionName(emptySeatTarget.id)} — the selected session` : 'No open sessions to seat'}
 							onClick={() => emptySeatTarget && openSeatForm({ seatSession: emptySeatTarget.id })}
-							className="h-7 rounded-md border px-3 text-xs text-[var(--fg)] hover:bg-[var(--bg-raised)] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-							style={{ borderColor: 'var(--border)' }}
+							className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[11px] font-medium text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)] enabled:hover:text-[var(--fg)] disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:bg-transparent disabled:text-[var(--fg-faint)] disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
 							Seat this session…
 						</button>
@@ -1053,6 +1109,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 								takenNames={takenNames}
 								removingNames={removingNames}
 								pending={ref && seat.status !== 'vacant' ? (pendingBySession[ref] ?? 0) : 0}
+								moved={moved.has(seat.id)}
 								onMenu={(s, x, y) => openMenuFor({ kind: 'seat', seatId: s.id, x, y })}
 							/>
 						);

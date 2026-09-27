@@ -95,3 +95,25 @@ export function shouldReportActivity(lastSentMs: number | null, nowMs: number): 
 export function trailingDelay(lastSentMs: number, nowMs: number): number {
 	return Math.max(0, lastSentMs + ACTIVITY_THROTTLE_MS - nowMs);
 }
+
+/** Chi run states that are still going (the rest have ended). */
+const RUN_GOING = new Set(['queued', 'running', 'awaiting_auth']);
+
+/** How many `chi_list` rows are still going. */
+export function countGoingRuns(rows: readonly { status: string }[]): number {
+	return rows.filter((r) => RUN_GOING.has(r.status)).length;
+}
+
+/**
+ * D-05 `locked`'s fine print: "**2 sessions and 1 run are still going**
+ * underneath." `null` counts (the host couldn't say) keep the plain claim.
+ */
+export function stillGoingLine(sessions: number | null, runs: number | null): string {
+	if (sessions === null || runs === null) return 'Sessions and runs keep going';
+	const s = `${sessions} session${sessions === 1 ? '' : 's'}`;
+	const r = `${runs} run${runs === 1 ? '' : 's'}`;
+	if (sessions > 0 && runs > 0) return `${s} and ${r} are still going`;
+	if (sessions > 0) return `${s} ${sessions === 1 ? 'is' : 'are'} still going`;
+	if (runs > 0) return `${r} ${runs === 1 ? 'is' : 'are'} still going`;
+	return 'No sessions or runs are going';
+}

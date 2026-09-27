@@ -88,7 +88,7 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 
 	if (!snapshot) {
 		return (
-			<div className="flex h-7 items-center justify-between border-b border-border/40 bg-zinc-950/80 px-3 text-[11px] text-muted-foreground backdrop-blur font-mono select-none">
+			<div className="flex h-7 items-center justify-between border-b border-border/40 bg-card px-3 text-[11px] text-muted-foreground backdrop-blur font-mono select-none">
 				<div className="flex items-center gap-1.5">
 					<Gauge className="h-3 w-3 text-muted-foreground/60" />
 					<span>HUD: listening for statusline telemetry...</span>
@@ -106,16 +106,16 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 	const fiveHourRate = snapshot.rate_limits?.five_hour?.used_percentage;
 
 	return (
-		<div className="flex h-7 items-center justify-between border-b border-border/40 bg-zinc-950/90 px-3 text-[11px] text-zinc-300 font-mono select-none">
+		<div className="flex h-7 items-center justify-between border-b border-border/40 bg-card px-3 text-[11px] text-foreground font-mono select-none">
 			{/* Left Section: Model, Effort & Thinking */}
 			<div className="flex items-center gap-2 overflow-hidden">
-				<div className="flex items-center gap-1 text-zinc-100 font-medium shrink-0">
+				<div className="flex items-center gap-1 text-foreground font-medium shrink-0">
 					<Cpu className="h-3 w-3 text-sky-400" />
 					<span className="truncate max-w-[130px]">{modelName}</span>
 				</div>
 
 				{effortLevel && (
-					<span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400">
+					<span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
 						effort: {effortLevel}
 					</span>
 				)}
@@ -133,7 +133,7 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 				<div className="flex items-center gap-1.5">
 					<Gauge className="h-3 w-3 text-emerald-400" />
 					<span>CTX: {usedPct}%</span>
-					<div className="h-1.5 w-16 rounded-full bg-zinc-800 overflow-hidden">
+					<div className="h-1.5 w-16 rounded-full bg-muted overflow-hidden">
 						<div
 							className={`h-full transition-all duration-300 ${
 								usedPct > 80 ? 'bg-amber-500' : usedPct > 90 ? 'bg-rose-500' : 'bg-emerald-500'
@@ -155,10 +155,10 @@ export function CostHud({ sessionId }: { sessionId?: string | null }) {
 			<div className="flex items-center gap-2 shrink-0">
 				{fiveHourRate !== undefined && (
 					<div
-						className="flex items-center gap-1 text-zinc-400 text-[10px]"
+						className="flex items-center gap-1 text-muted-foreground text-[10px]"
 						title="5-hour rate limit used"
 					>
-						<ShieldAlert className="h-2.5 w-2.5 text-zinc-400" />
+						<ShieldAlert className="h-2.5 w-2.5 text-muted-foreground" />
 						<span>5h: {Math.round(fiveHourRate)}%</span>
 					</div>
 				)}

@@ -212,7 +212,13 @@ export function CollapsedStrip({
 					<span className="size-2 rounded-full motion-safe:animate-pulse" style={{ background: 'var(--live)' }} />
 				</span>
 			)}
-			<span aria-hidden="true" className="text-[11px] tracking-wider [writing-mode:vertical-rl]" style={{ color: 'var(--fg-muted)' }}>
+			{/* D-01 / D-09 `.reststrip .vert`: mono, uppercase, .14em tracking. */}
+			<span
+				aria-hidden="true"
+				data-strip-label=""
+				className="mt-1 font-mono text-[11px] uppercase tracking-[.14em] [writing-mode:vertical-rl]"
+				style={{ color: 'var(--fg-muted)' }}
+			>
 				{stripStateLabel(pendingPermissions, live)}
 			</span>
 			<span className="flex-1" />

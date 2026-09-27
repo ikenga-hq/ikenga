@@ -23,10 +23,36 @@ import { Fingerprint, ShieldCheck } from 'lucide-react';
 import { type FormEvent, type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
-import { appLockUnlock, appLockUnlockBiometric, type AppLockStatus } from '@/lib/tauri-cmd';
+import {
+	appLockUnlock,
+	appLockUnlockBiometric,
+	type AppLockStatus,
+	chiList,
+	ptyTerminalList,
+} from '@/lib/tauri-cmd';
 
-import { lockMetaLine, retryLine } from './app-lock-model';
+import { countGoingRuns, lockMetaLine, retryLine, stillGoingLine } from './app-lock-model';
 import { startAppLockSync, useAppLockStore } from './app-lock-store';
+
+/** How many sessions and runs are still going, app-wide (every window's
+ *  PTYs, every Chi run), read from the host once when the lock comes up. */
+function useStillGoing(): string {
+	const [counts, setCounts] = useState<{ sessions: number; runs: number } | null>(null);
+	useEffect(() => {
+		let cancelled = false;
+		Promise.resolve()
+			.then(() => Promise.all([ptyTerminalList(), chiList(null, 200)]))
+			.then(([terms, runs]) => {
+				if (cancelled || !Array.isArray(terms) || !Array.isArray(runs)) return;
+				setCounts({ sessions: terms.filter((t) => t.status === 'running').length, runs: countGoingRuns(runs) });
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+	return stillGoingLine(counts?.sessions ?? null, counts?.runs ?? null);
+}
 
 /** Mount at the root of each window. Renders nothing until Rust says locked. */
 export function AppLockOverlay() {
@@ -71,6 +97,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 
 	useInertAppRoot(container !== null);
 	useFocusKeeper(rootRef, inputRef, container !== null);
+	const going = useStillGoing();
 
 	if (!container) return null;
 
@@ -181,7 +208,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 				<button
 					type="submit"
 					disabled={busy || waiting}
-					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
+					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
 				>
 					{busy ? 'Checking…' : 'Unlock'}
 				</button>
@@ -192,7 +219,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 						onClick={() => void tryBiometric()}
 						title={status.biometric.available ? undefined : status.biometric.reason}
 						aria-describedby={status.biometric.available ? undefined : 'app-lock-os-why'}
-						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
+						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
 					>
 						<Fingerprint className="h-4 w-4 shrink-0" aria-hidden />
 						Use {status.biometric.label}
@@ -206,7 +233,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 			</form>
 
 			<p className="m-0 max-w-[52ch] text-center text-[var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
-				<b className="font-medium text-[var(--fg)]">Sessions and runs keep going</b> underneath.
+				<b className="font-medium text-[var(--fg)]">{going}</b> underneath.
 				Locking hides the window; it does not stop Chi, and it does not lock the vault — that has
 				its own lock in Settings › Secrets.
 			</p>

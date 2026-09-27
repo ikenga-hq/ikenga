@@ -255,7 +255,7 @@ export function SettingsNav({ activeId, search, onSearchChange, onSelect }: Sett
 									onClick={() => onSelect(id)}
 									className={cn(
 										'mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors',
-										'font-mono outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
+										'font-mono outline-none focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
 										active
 											? 'bg-accent text-accent-foreground'
 											: 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'

@@ -9,9 +9,10 @@
 // that for everything under this directory.
 //
 // D-09 state map (G-55 `data-state`): `seats-roster` / `seats-empty` (the
-// rail), `seats-create` (the New-seat form), `seats-vacant` (a vacant seat's
-// panel), `seats-dispatch` (the target picker open), `seats-rest` (the 36 px
-// strip). `popout` is WP-69's.
+// rail), `seats-popout` (the rail while a seat's Window 2 signal pulses after
+// *Pop out*, WP-71c), `seats-create` (the New-seat form), `seats-vacant` (a
+// vacant seat's panel), `seats-dispatch` (the target picker open),
+// `seats-rest` (the 36 px strip).
 
 import { ChevronRight, ShieldCheck } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
@@ -569,7 +570,7 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 				<pre
 					// biome-ignore lint/a11y/noNoninteractiveTabindex: scrollable region must be keyboard-reachable
 					tabIndex={0}
-					className="mt-1.5 max-h-24 overflow-auto rounded p-2 font-mono text-[10px]"
+					className="mt-1.5 max-h-24 overflow-auto rounded p-2 font-mono text-[11px]"
 					style={{ background: 'var(--bg-sunken)', color: 'var(--fg-muted)' }}
 				>
 					{JSON.stringify(card.toolInput, null, 2)}

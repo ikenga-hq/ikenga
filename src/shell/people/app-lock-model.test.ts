@@ -4,11 +4,13 @@ import type { AppLockBiometric } from '@/lib/tauri-cmd';
 
 import {
 	ACTIVITY_THROTTLE_MS,
+	countGoingRuns,
 	lockMetaLine,
 	parseIdleMinutes,
 	retryLine,
 	secretProblem,
 	shouldReportActivity,
+	stillGoingLine,
 	trailingDelay,
 	unlockMethodOptions,
 } from './app-lock-model';
@@ -98,5 +100,28 @@ describe('activity throttle and retry copy', () => {
 	it('rounds the wait up to whole seconds', () => {
 		expect(retryLine(29_001)).toBe('Try again in 30 s.');
 		expect(retryLine(1)).toBe('Try again in 1 s.');
+	});
+});
+
+describe('stillGoingLine (D-05 `locked` fine print)', () => {
+	it('reads like the design with both counts', () => {
+		expect(stillGoingLine(2, 1)).toBe('2 sessions and 1 run are still going');
+		expect(stillGoingLine(1, 3)).toBe('1 session and 3 runs are still going');
+	});
+
+	it('agrees in number when only one kind is going', () => {
+		expect(stillGoingLine(1, 0)).toBe('1 session is still going');
+		expect(stillGoingLine(2, 0)).toBe('2 sessions are still going');
+		expect(stillGoingLine(0, 1)).toBe('1 run is still going');
+		expect(stillGoingLine(0, 0)).toBe('No sessions or runs are going');
+	});
+
+	it('keeps the plain claim when the host could not say', () => {
+		expect(stillGoingLine(null, 1)).toBe('Sessions and runs keep going');
+	});
+
+	it('counts queued, running and awaiting-auth runs, not finished ones', () => {
+		const statuses = ['queued', 'running', 'awaiting_auth', 'done', 'failed', 'cancelled', 'timed_out'];
+		expect(countGoingRuns(statuses.map((status) => ({ status })))).toBe(3);
 	});
 });
