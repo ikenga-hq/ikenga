@@ -146,53 +146,23 @@ impl PkgStaticService {
     /// Deliberately forgiving: a directory that isn't a pkg, or a pkg whose
     /// manifest doesn't parse, is skipped with a warning rather than failing
     /// the daemon's startup. An operator with one broken pkg still gets a
-    /// running server.
+    /// running server. The walk itself is [`super::pkg_index::scan`], shared
+    /// with the `pkg_kernel_status` index.
     pub fn discover(pkgs_dir: Option<&Path>) -> Self {
+        Self::from_packages(pkgs_dir, &super::pkg_index::scan(pkgs_dir))
+    }
+
+    /// Build from an already-walked pkg list (`create_router` walks once and
+    /// feeds both this and [`super::pkg_index::PkgIndex`]). `pkgs_dir` is only
+    /// used to name the directory in the startup log.
+    pub fn from_packages(pkgs_dir: Option<&Path>, pkgs: &[Package]) -> Self {
         let Some(dir) = pkgs_dir else {
             return Self::default();
         };
-        if !dir.is_dir() {
-            warn!(
-                "--pkgs-dir {} is not a directory; /pkgs/* will serve nothing",
-                dir.display()
-            );
-            return Self::default();
-        }
 
         let mut roots: HashMap<String, PkgEntry> = HashMap::new();
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("--pkgs-dir {} unreadable: {e}", dir.display());
-                return Self::default();
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            // `.staging-*` / `.backup-*` are the installer's scratch dirs on
-            // desktop; they are never a pkg.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
-            {
-                continue;
-            }
-            if !path.join("manifest.json").is_file() {
-                continue;
-            }
-
-            let pkg = match Package::load(&path) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("[pkg_static] skipping {}: {e:#}", path.display());
-                    continue;
-                }
-            };
+        for pkg in pkgs {
+            let path = pkg.install_path.as_path();
 
             // Same rule the desktop content server applies: only `iframe`
             // routes need bytes served. `component` routes are markers.

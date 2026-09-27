@@ -2318,22 +2318,9 @@ pub(crate) fn is_under_claude_or_store(p: &Path) -> bool {
 /// `store/{agents,skills,commands}/`); WP-01 only needs the root to decide
 /// `in_store`.
 pub(crate) fn store_root() -> Option<PathBuf> {
-    const BUNDLE_ID: &str = "app.ikenga";
-    let dir: PathBuf = if cfg!(target_os = "macos") {
-        let home = std::env::var_os("HOME")?;
-        PathBuf::from(home)
-            .join("Library/Application Support")
-            .join(BUNDLE_ID)
-    } else if cfg!(target_os = "windows") {
-        let appdata = std::env::var_os("APPDATA")?;
-        PathBuf::from(appdata).join(BUNDLE_ID)
-    } else if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        PathBuf::from(xdg).join(BUNDLE_ID)
-    } else {
-        let home = std::env::var_os("HOME")?;
-        PathBuf::from(home).join(".local/share").join(BUNDLE_ID)
-    };
-    Some(dir.join("store"))
+    // Body lives in the ungated `pkg::skill_actions` so the headless daemon's
+    // `list_skill_actions` arm resolves the same store (WP-19).
+    crate::pkg::skill_actions::store_root()
 }
 
 /// True when `target` is the store root itself or sits underneath it.

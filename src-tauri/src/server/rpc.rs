@@ -493,6 +493,43 @@ pub async fn rpc_handler(
         // error on a path that is working exactly as designed.
         "pkg_content_revoke" => RpcResponse::success(true),
 
+        // --- Pkg kernel read parity (WP-19) ---
+        //
+        // Same `assemble_status` the desktop `Kernel::status` calls, over the
+        // daemon's read-only `--pkgs-dir` index, with ONLY the registry the
+        // daemon runs (`ui_routes`). `registries.ui_routes` is always present,
+        // even empty — the FE pkg route resolver reads `.entries` off it.
+        // No args. See `server::pkg_index` for how each row is filled.
+        "pkg_kernel_status" => RpcResponse::success(state.pkg_index.status()),
+        // Resolved against the daemon's own index. An unknown id returns `[]`,
+        // not an error — mirroring the desktop command, which returns
+        // `Vec::new()` for a pkg that isn't installed.
+        //
+        // `store_root()` resolves from the DAEMON PROCESS's env (HOME /
+        // XDG_DATA_HOME): one Ngwa store for every caller. A single-user seam
+        // for WP-20 (G-PRINCIPAL), same as `fs_home`.
+        "list_skill_actions" => {
+            // `pkgId` is what `tauri-cmd.ts` sends (no camel → snake
+            // conversion here); `pkg_id` too, as for `pkg_content_html`.
+            let pkg_id = payload
+                .args
+                .get("pkgId")
+                .or_else(|| payload.args.get("pkg_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if pkg_id.is_empty() {
+                return Json(RpcResponse::error(
+                    "list_skill_actions: `pkgId` is required",
+                ));
+            }
+            let store = crate::pkg::skill_actions::store_root();
+            RpcResponse::success(state.pkg_index.skill_actions(pkg_id, store.as_deref()))
+        }
+        "list_all_skill_actions" => {
+            let store = crate::pkg::skill_actions::store_root();
+            RpcResponse::success(state.pkg_index.all_skill_actions(store.as_deref()))
+        }
+
         // --- Secrets & Vault Commands (G-30) ---
         //
         // There is no vault in the daemon and that is decided, not pending:

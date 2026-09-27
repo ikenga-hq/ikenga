@@ -1808,6 +1808,9 @@ mod tests {
     /// (which would make the next scan skip both files, leaving the new tables
     /// empty) must both be cleared, so the next scan yields the DEC-29 counts:
     /// neither stale rows, nor a mix, nor an empty mirror.
+    // `crate::transcript` is desktop-only; without this the headless
+    // (`--no-default-features`) lib-test build does not compile at all.
+    #[cfg(feature = "desktop")]
     #[tokio::test]
     async fn migration_0065_applies_on_db_with_0064_and_next_scan_is_correct() {
         use crate::transcript::usage::{self, fixtures};

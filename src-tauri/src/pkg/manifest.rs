@@ -2905,6 +2905,8 @@ mod tests {
     ///
     /// Skips (not fails) when the sibling `ikenga-pkgs` checkout is absent —
     /// e.g. a crates.io-style standalone build of this crate.
+    // The contribution registries it registers against are desktop-only.
+    #[cfg(feature = "desktop")]
     #[test]
     fn ikenga_pkgs_fleet_parses_and_registers() {
         use crate::pkg::registries::{

@@ -1,0 +1,1094 @@
+# Tauri commands the headless daemon (`server/rpc.rs`) does NOT serve, and why.
+#
+# Enforced by `src-tauri/src/server/parity.rs` (a `cargo test`, both feature
+# sets): every command in `lib.rs`'s `tauri::generate_handler![...]` must be
+# EITHER served by an arm of `rpc.rs`'s `match payload.cmd.as_str()` OR listed
+# here — never both, never neither. A stale entry (not a Tauri command any
+# more) fails too.
+#
+# One table per command, so TOML itself rejects a duplicate:
+#
+#   [command_name]
+#   tag = "WP-19"
+#   reason = "one line, why it is not served yet / ever"
+#
+# Tags:
+#   WP-19                 pure read / local-file work the daemon can serve; pending.
+#   WP-18b                spawns a process outside the session executor; needs
+#                         executor::current() routing before the daemon may serve it.
+#   WP-20                 touches per-user state (vault, identity) that needs
+#                         principal scoping (G-PRINCIPAL) first.
+#   desktop-only-forever  native window / webview / OS-shell behaviour with no
+#                         daemon or browser meaning.
+#
+# RATCHET: this file only ever shrinks. Serving a command means adding its
+# `rpc.rs` arm AND deleting its table here in the same change. Adding a table
+# is only for a NEW Tauri command, with an honest tag and reason.
+
+[action_exec]
+tag = "WP-18b"
+reason = "exec() (action_exec.rs) cmd.spawn()s a pinned headless shell command — a desktop-only spawn site; needs executor::current()."
+
+[action_git_branch]
+tag = "WP-19"
+reason = "git_branch_at reads `.git/HEAD` via std::fs directly, comment states \"no subprocess\"; pure read."
+
+[actions_open_file]
+tag = "desktop-only-forever"
+reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — native open-in-OS-app, same as settings_open_file."
+
+[actions_read_files]
+tag = "WP-19"
+reason = "manager.read_files reads actions.json/keybindings.json via db+fs; no spawn."
+
+[actions_trust_grant]
+tag = "WP-19"
+reason = "manager.trust_grant writes the project-trust record; no spawn."
+
+[actions_trust_revoke]
+tag = "WP-19"
+reason = "manager.trust_revoke writes/clears the project-trust record; no spawn."
+
+[actions_trust_status]
+tag = "WP-19"
+reason = "manager.trust_status reads the project-trust record from db; no spawn."
+
+[actions_write]
+tag = "WP-19"
+reason = "manager.write validates+atomically writes actions.json; no spawn."
+
+[activity_pins_add]
+tag = "WP-19"
+reason = "sqlx INSERT into pins table; no spawn."
+
+[activity_pins_list]
+tag = "WP-19"
+reason = "sqlx SELECT over the pins table; no spawn in activity_bar.rs."
+
+[activity_pins_remove]
+tag = "WP-19"
+reason = "sqlx DELETE by id from pins table; no spawn."
+
+[activity_pins_reorder]
+tag = "WP-19"
+reason = "sqlx UPDATE of pin ordering; no spawn."
+
+[activity_pins_resolve_artifact]
+tag = "WP-19"
+reason = "Resolves an artifact reference against db/kernel state for a pin; no Command::new in this file."
+
+[activity_pins_touch_open]
+tag = "WP-19"
+reason = "Updates last-opened timestamp on a pin row via sqlx; no spawn."
+
+[activity_sections_create]
+tag = "WP-19"
+reason = "sqlx INSERT into sections table; no spawn."
+
+[activity_sections_list]
+tag = "WP-19"
+reason = "sqlx SELECT over sections table; no spawn."
+
+[activity_sections_remove]
+tag = "WP-19"
+reason = "sqlx DELETE of a section row; no spawn."
+
+[activity_sections_update]
+tag = "WP-19"
+reason = "sqlx UPDATE of a section row; no spawn."
+
+[agent_ops_delete_job]
+tag = "WP-19"
+reason = "Removes a job entry from config file; no spawn."
+
+[agent_ops_list_jobs]
+tag = "WP-19"
+reason = "Reads config file + daemon runtime state file, merges; pure read, no spawn."
+
+[agent_ops_run_now]
+tag = "WP-19"
+reason = "HTTP POST to already-running agent-ops daemon's localhost trigger endpoint; no process spawn."
+
+[agent_ops_set_enabled]
+tag = "WP-19"
+reason = "Atomic rewrite of project-scoped jobs JSON config file; no spawn."
+
+[agent_ops_tail_run]
+tag = "WP-19"
+reason = "Reads a per-run tail file by byte offset; no spawn."
+
+[agent_ops_upsert_job]
+tag = "WP-19"
+reason = "Writes a job entry into project-scoped config file; no spawn."
+
+[app_lock_clear_secret]
+tag = "WP-20"
+reason = "Clears the one shared PIN record after verify_secret; same single-tenant AppLockState as the rest of the family."
+
+[app_lock_configure]
+tag = "WP-20"
+reason = "Writes the one AppLockConfig (idle_enabled/method) shared app-wide; no per-principal config exists."
+
+[app_lock_lock]
+tag = "WP-20"
+reason = "Locks the single shared AppLockState for the whole app; one user's lock would freeze every remote client."
+
+[app_lock_set_secret]
+tag = "WP-20"
+reason = "hash_secret/verify_secret write the single shared PIN record; a per-principal secrets store is a WP-20 prerequisite."
+
+[app_lock_status]
+tag = "WP-20"
+reason = "Reads single global AppLockState (one PIN gates the whole app); needs per-principal state before a multi-user daemon can serve it."
+
+[app_lock_touch]
+tag = "WP-20"
+reason = "Bumps the one global AppLockState.last_activity_ms; single-tenant idle clock, no principal dimension."
+
+[app_lock_unlock]
+tag = "WP-20"
+reason = "Verifies the one global PIN/passphrase (verify_secret) against one shared SecretRecord; needs per-principal secrets first."
+
+[app_lock_unlock_biometric]
+tag = "WP-20"
+reason = "OS-credential op (biometric_support/OS biometrics) explicitly named under WP-20; also single global state."
+
+[atelier_file_read]
+tag = "WP-19"
+reason = "Plain std::fs::read_to_string under project_root/.atelier; no spawn, similar to fs_read parity."
+
+[atelier_file_write]
+tag = "WP-19"
+reason = "Atomic std::fs write+rename under .atelier; no spawn, fs-parity write."
+
+[backup_delete]
+tag = "WP-19"
+reason = "Removes a backup file after canonical-path containment check; plain fs, no spawn."
+
+[backup_export]
+tag = "WP-19"
+reason = "VACUUM INTO + zip write, optional Stronghold-derived secrets via SecretsLock; no process spawn, db/secrets parity."
+
+[backup_import]
+tag = "WP-19"
+reason = "Reads/validates a .ikbak zip, stages import; plain fs/db, no spawn."
+
+[backup_list]
+tag = "WP-19"
+reason = "Lists .ikbak files in app_data_dir via std::fs::read_dir; no spawn."
+
+[bg_spike_reply]
+tag = "desktop-only-forever"
+reason = "Reply half of the same bg_spike_* debug harness; resolves a pending nonce from the native window's eval callback."
+
+[bg_spike_run]
+tag = "desktop-only-forever"
+reason = "Phase 0.5 debug harness pinging the primary native webview window via eval round-trips; explicit 'debug spikes like bg_spike_*' example."
+
+[chi_cancel]
+tag = "WP-18b"
+reason = "Kills the spawned chi child (child.start_kill()) and/or its tmux session — controls the same non-executor chi spawn site."
+
+[chi_list]
+tag = "WP-19"
+reason = "Reads db cache merged with claude_list_sessions; no spawn."
+
+[chi_resume]
+tag = "WP-18b"
+reason = "resume_chi_run re-spawns the engine child through the same non-executor-gated chi spawn path as chi_run."
+
+[chi_run]
+tag = "WP-18b"
+reason = "spawn_chi_run spawns the engine child (and tmux for persistent runs) via chi's own Command::new; no executor::current() routing."
+
+[chi_status]
+tag = "WP-19"
+reason = "Reads cached run row from db + output file; no spawn or process control."
+
+[claude_asset_list_pins]
+tag = "WP-19"
+reason = "Lists claude_asset_preferences rows via sqlx; no spawn."
+
+[claude_asset_pin]
+tag = "WP-19"
+reason = "Upserts a claude_asset_preferences row via sqlx; no spawn."
+
+[claude_asset_unpin]
+tag = "WP-19"
+reason = "Deletes a claude_asset_preferences row via sqlx; no spawn."
+
+[claude_assets_discover]
+tag = "WP-19"
+reason = "discovery::discover does 4-tier asset discovery over db+fs; no spawn."
+
+[claude_config_load]
+tag = "WP-19"
+reason = "scan_all walks .claude dirs in spawn_blocking; no process spawn."
+
+[claude_config_read_file]
+tag = "WP-19"
+reason = "Reads a whitelisted file under .claude/; no spawn."
+
+[claude_config_resolve_cascade]
+tag = "WP-19"
+reason = "Merges settings.json tiers in memory (resolve_settings_cascade); no fs writes or spawn."
+
+[claude_config_unwatch]
+tag = "WP-19"
+reason = "Drops watcher ids via FsWatchManager; no spawn."
+
+[claude_config_watch]
+tag = "WP-19"
+reason = "Registers FsWatchManager watchers on .claude dirs; no spawn."
+
+[claude_list_sessions]
+tag = "WP-19"
+reason = "Scans ~/.claude/projects jsonl files for summaries; pure fs read, no spawn."
+
+[claude_primitive_copy]
+tag = "WP-19"
+reason = "fs copy of a primitive between scopes; no spawn."
+
+[claude_primitive_copy_batch]
+tag = "WP-19"
+reason = "Cross-scope vault copy: fs copy + PaDb registry writes only (claude_store.rs resolve_canonical/atomic_copy_*); no process spawn."
+
+[claude_primitive_disable]
+tag = "WP-19"
+reason = "Removes a symlink-farm entry / merge-engine delegate; no spawn."
+
+[claude_primitive_disable_for]
+tag = "WP-19"
+reason = "Scoped variant of claude_primitive_disable; same fs op, no spawn."
+
+[claude_primitive_enable]
+tag = "WP-19"
+reason = "Creates a symlink-farm entry (or delegates to the JSON merge engine) to enable a store primitive in a scope; no process spawn."
+
+[claude_primitive_enable_for]
+tag = "WP-19"
+reason = "Scoped variant of claude_primitive_enable; same symlink-farm fs op, no spawn."
+
+[claude_primitive_move]
+tag = "WP-19"
+reason = "fs move/rename of a primitive between scopes; no spawn."
+
+[claude_primitive_remove]
+tag = "WP-19"
+reason = "Deletes a primitive from the store; no spawn."
+
+[claude_primitive_remove_for]
+tag = "WP-19"
+reason = "Scoped variant of claude_primitive_remove; same fs op, no spawn."
+
+[claude_read_jsonl]
+tag = "WP-19"
+reason = "Reads one session transcript jsonl file; pure fs read."
+
+[claude_session_list]
+tag = "WP-19"
+reason = "enumerate_claude_sessions scans+summarizes jsonl files; pure fs read."
+
+[claude_store_import]
+tag = "WP-19"
+reason = "import_core copies a file into the store as canonical copy; a plain fs copy, distinct from claude_store/install.rs's npx/git spawns."
+
+[claude_store_list]
+tag = "WP-19"
+reason = "claude_store_list_inner scans store dir + registry.json, overlays provenance; no spawn (no Command::new in claude_store.rs)."
+
+[comment_create]
+tag = "WP-19"
+reason = "sqlx INSERT into artifact_comments; no spawn in comments.rs."
+
+[comment_delete]
+tag = "WP-19"
+reason = "sqlx DELETE from artifact_comments; no spawn."
+
+[comment_get]
+tag = "WP-19"
+reason = "sqlx SELECT one artifact_comments row by id; no spawn."
+
+[comment_list]
+tag = "WP-19"
+reason = "sqlx SELECT list of artifact_comments; no spawn."
+
+[comment_record_routing]
+tag = "WP-19"
+reason = "sqlx UPDATE recording which sink a comment was routed to; DB write only (the actual spawn, if any, happens in comment_route)."
+
+[comment_route]
+tag = "WP-18b"
+reason = "RouteSink::Chi calls spawn_chi_run, whose persistent path launches tmux/chi-runner — a WP-18b desktop-only spawn site."
+
+[comment_set_status]
+tag = "WP-19"
+reason = "sqlx UPDATE of comment status column; no spawn."
+
+[data_health_db_size]
+tag = "WP-19"
+reason = "Reads sqlite file sizes via fs metadata/pragma; no spawn."
+
+[data_health_scan]
+tag = "WP-19"
+reason = "kernel/db orphan-row scan (SELECT-only per OrphanReport); no spawn."
+
+[db_export_ndjson]
+tag = "WP-19"
+reason = "Dumps every pa.db table to NDJSON files via sqlx SELECT; no spawn."
+
+[db_import_ndjson]
+tag = "WP-19"
+reason = "Reads NDJSON files and INSERT OR REPLACEs rows via sqlx; no spawn."
+
+[detect_agent]
+tag = "WP-18b"
+reason = "agents::detect_by_id runs the same probe_version Command::new(exec)/wsl.exe spawn as detect_agents for a single agent id."
+
+[detect_agent_config]
+tag = "WP-19"
+reason = "config_claude::build_inventory only counts files under .claude/.gemini/.codex/.cursor dirs; no Command::new in that module."
+
+[detect_agents]
+tag = "WP-18b"
+reason = "agents::detect_all -> probe_version does Command::new(exec) to run each detected CLI's --version (agent-detect spawn site)."
+
+[detect_system]
+tag = "WP-19"
+reason = "system::build_report is documented 'no subprocesses, no network' (disk-free + writability + vault-ready checks only)."
+
+[dev_bind_port]
+tag = "desktop-only-forever"
+reason = "Debug-only (#[cfg(debug_assertions)]) TcpListener holder for the storyboard sidecar EADDRINUSE smoke test."
+
+[dev_release_port]
+tag = "desktop-only-forever"
+reason = "Companion release for dev_bind_port's debug-only smoke-test port holder; same 'dev ports' desktop-only-forever bucket."
+
+[engine_layout]
+tag = "WP-19"
+reason = "engine_layouts() returns a hardcoded Vec<EngineLayout>; static config data, no db/spawn, settings/config-reads bucket."
+
+[fs_kind]
+tag = "WP-19"
+reason = "Stat-based file/dir/missing discriminator on an allowlisted path; no spawn."
+
+[fs_mime]
+tag = "WP-19"
+reason = "Extension-based mime_guess lookup; no fs read or spawn."
+
+[fs_rename]
+tag = "WP-19"
+reason = "tokio::fs::rename within the allowlist; no spawn."
+
+[fs_roots_add]
+tag = "WP-19"
+reason = "Mutates the persisted fs allowlist config; no spawn."
+
+[fs_roots_remove]
+tag = "WP-19"
+reason = "Mutates the persisted fs allowlist config; no spawn."
+
+[fs_roots_reset]
+tag = "WP-19"
+reason = "Resets the persisted fs allowlist to default; no spawn."
+
+[fs_search]
+tag = "WP-19"
+reason = "Recursive basename search via blocking fs walk (spawn_blocking, not a process spawn)."
+
+[fs_trash]
+tag = "WP-19"
+reason = "Moves a file to OS trash via the `trash` crate call; no process spawn."
+
+[fs_unwatch]
+tag = "WP-19"
+reason = "Releases an fs watcher by id; no spawn."
+
+[fs_watch]
+tag = "WP-19"
+reason = "Registers an FsWatchManager watcher on an allowlisted path; no spawn (daemon already has fs_ws.rs for this shape)."
+
+[iyke_action_done]
+tag = "desktop-only-forever"
+reason = "Resolves a pending click/type/key action performed against the app's own rendered window."
+
+[iyke_actions_request_done]
+tag = "desktop-only-forever"
+reason = "Resolves a pending actions/menus round trip that targets the main native window (per module comment), not remotely meaningful."
+
+[iyke_browser_reply]
+tag = "desktop-only-forever"
+reason = "Reply path for a native child-webview pane, round-tripping via Tauri IPC (child-webview-pane category)."
+
+[iyke_dom_done]
+tag = "desktop-only-forever"
+reason = "Resolves a pending DOM-query oneshot that was requested against the app's own rendered webview (window/webview inspection)."
+
+[iyke_dom_query]
+tag = "desktop-only-forever"
+reason = "Emits iyke://dom-request to the main Tauri window to introspect a rendered pane's DOM tree; meaningless without the native webview."
+
+[iyke_endpoint]
+tag = "desktop-only-forever"
+reason = "Returns the desktop-only iyke bridge's own port/token; iyke is not mounted in the daemon, so it has no daemon-side meaning."
+
+[iyke_log_push]
+tag = "desktop-only-forever"
+reason = "Feeds the FE's own console-log ring buffer for the iyke bridge's /iyke/logs, part of the desktop-only CLI-drives-UI bridge."
+
+[iyke_mcp_info]
+tag = "desktop-only-forever"
+reason = "Resolves the bundled iyke-mcp path via app.path().resource_dir() — a Tauri-bundle-only path with no daemon equivalent."
+
+[iyke_network_push]
+tag = "desktop-only-forever"
+reason = "Feeds the FE's fetch/XHR capture ring buffer for /iyke/network; desktop-only bridge state, no daemon route."
+
+[iyke_query_cache_done]
+tag = "desktop-only-forever"
+reason = "Resolves a pending TanStack query-cache read requested against the app's own webview; part of the desktop CLI-driven-UI bridge."
+
+[iyke_set_actions_frame]
+tag = "desktop-only-forever"
+reason = "Mirrors the shell's effective actions/menus model for the iyke bridge (comment: 'these all target the main window'); desktop-only."
+
+[iyke_set_frame]
+tag = "desktop-only-forever"
+reason = "FE push of shell keymap/explorerSections/activeProject into a mirror read only by the desktop-only iyke HTTP server."
+
+[iyke_set_shell]
+tag = "desktop-only-forever"
+reason = "FE pushes the desktop shell's own sidebar mode/route/panes into the iyke bridge mirror, which only exists in the Tauri app process."
+
+[iyke_terminal_read_done]
+tag = "desktop-only-forever"
+reason = "FE callback resolving a terminal-pane read round trip driven through the native window's own terminal UI (iyke bridge)."
+
+[iyke_terminal_spawn_done]
+tag = "desktop-only-forever"
+reason = "FE callback for CLI-driven terminal-pane creation inside the desktop shell's own UI, not a remote terminal API."
+
+[iyke_wait_done]
+tag = "desktop-only-forever"
+reason = "Resolves a pending wait-for-condition round trip targeting the app's own rendered window."
+
+[keybindings_write]
+tag = "WP-19"
+reason = "Same manager.write path for keybindings.json; no spawn."
+
+[list_agent_projects]
+tag = "WP-19"
+reason = "Same pattern as list_claude_projects, fs::read_dir scan per agent's history dir (e.g. ~/.gemini/antigravity/brain); no spawn."
+
+[list_claude_projects]
+tag = "WP-19"
+reason = "Pure std::fs::read_dir scan of ~/.claude/projects/*.jsonl; no spawn."
+
+[ngwa_snapshot]
+tag = "WP-19"
+reason = "Aggregates kernel status, PaDb, claude_config and trust reads (ngwa_snapshot_inner); explicitly the \"ngwa\" WP-19 bucket, no spawn."
+
+[notifications_list]
+tag = "WP-19"
+reason = "notifications::list queries PaDb sqlite; no spawn."
+
+[notifications_mark_all_read]
+tag = "WP-19"
+reason = "notifications::mark_all_read is a sqlite UPDATE; no spawn."
+
+[notifications_mark_read]
+tag = "WP-19"
+reason = "notifications::mark_read is a sqlite UPDATE; no spawn."
+
+[notifications_mute_kind]
+tag = "WP-19"
+reason = "mute::set_muted writes settings.json + notes db row; no spawn."
+
+[notifications_mute_state]
+tag = "WP-19"
+reason = "mute::MuteState::from_muted reads settings.json mutedKinds; no spawn."
+
+[notifications_record_update]
+tag = "WP-19"
+reason = "producers::update + notifications::record + sweep_installed_updates (notifications.rs:187) are all db/version-compare logic; no spawn."
+
+[notifications_unmute_kind]
+tag = "WP-19"
+reason = "mute::clear_muted_backlog + set_muted are db/settings writes; no spawn."
+
+[notifications_unread_count]
+tag = "WP-19"
+reason = "notifications::unread_count queries PaDb; no spawn."
+
+[oba_auto_update_all]
+tag = "WP-18b"
+reason = "auto_update_all_core loops update_core per opted-in entry, inheriting its git/npx child-process spawns."
+
+[oba_backfill_registry]
+tag = "WP-19"
+reason = "scan_external_masters walks dirs + resolves symlinks, then registry::save; no spawn."
+
+[oba_check_update]
+tag = "WP-18b"
+reason = "check_update_core calls git_ls_remote_sha (install.rs:141), which Command::new(\"git\")s ls-remote — desktop spawn site."
+
+[oba_dependents]
+tag = "WP-19"
+reason = "Live dependents scan via std::fs::read_dir/symlink resolution (scan_live_dependents); pure read, no spawn."
+
+[oba_forget]
+tag = "WP-19"
+reason = "registry::forget + registry::save is a JSON edit; no spawn, no fs deletion of masters."
+
+[oba_install_bundle]
+tag = "WP-18b"
+reason = "install_bundle_core->fetch_fn is npx_skills_add_all (install.rs:201), spawning `npx` for the whole bundle."
+
+[oba_install_git]
+tag = "WP-18b"
+reason = "install_core->fetch_and_adopt spawns `git clone` (install.rs:93 run()/:110 git_clone) — desktop spawn site, needs executor::current()."
+
+[oba_install_local]
+tag = "WP-19"
+reason = "ProvenanceSource::Local branch (install.rs:422-436) is a directory copy only; no git/npx spawn at all."
+
+[oba_install_npx]
+tag = "WP-18b"
+reason = "install_core->fetch_and_adopt calls npx_skills_add (install.rs:169), which Command::new(\"npx\")s — desktop spawn site."
+
+[oba_install_with_deps]
+tag = "WP-18b"
+reason = "install_with_deps_core resolves the closure via install_core per dep, spawning git/npx (same site as oba_install_git/npx)."
+
+[oba_missing_requires]
+tag = "WP-19"
+reason = "missing_requires_core is a pure fs/registry re-verify (no network, no spawn)."
+
+[oba_relink_dependents]
+tag = "WP-19"
+reason = "relink_one just re-points symlinks (std::fs); no spawn, meaningful to a remote client managing the vault."
+
+[oba_safe_delete]
+tag = "WP-19"
+reason = "guarded_delete does fs remove + registry.json rewrite; no child process anywhere in the path."
+
+[oba_set_auto_update]
+tag = "WP-19"
+reason = "set_auto_update_core flips a bool in registry.json; no fetch, no spawn."
+
+[oba_unlink_one]
+tag = "WP-19"
+reason = "unlink_placement is remove_file on a symlink only; no process spawn."
+
+[oba_update]
+tag = "WP-18b"
+reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same git/npx spawn sites as install."
+
+[os_shortcuts_apply]
+tag = "desktop-only-forever"
+reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
+
+[os_username]
+tag = "WP-19"
+reason = "std::env::var(\"USER\"/\"USERNAME\") read only; identity fallback bucket, no spawn."
+
+[pa_actions_commit]
+tag = "WP-19"
+reason = "Flips the row to committed, then fire-and-forget reqwest POST to the local agent-ops daemon (HTTP client, not a spawn)."
+
+[pa_actions_list]
+tag = "WP-19"
+reason = "SELECT over pa_action_drafts by ACTIVE_STATUSES; plain DB read."
+
+[pa_actions_pause]
+tag = "WP-19"
+reason = "Inserts approve-gate draft rows into pa_action_drafts; no spawn, agent-ops style DB write."
+
+[pa_actions_reject]
+tag = "WP-19"
+reason = "UPDATE row to rejected + emits event; plain DB write, no spawn."
+
+[pa_actions_retry]
+tag = "WP-19"
+reason = "Resets a failed draft row's status/attempts; plain DB write."
+
+[pa_actions_update]
+tag = "WP-19"
+reason = "UPDATE edited_json/status on a draft row; plain DB write."
+
+[pin_screenshot_write]
+tag = "WP-19"
+reason = "Decodes an FE-supplied base64 PNG and writes it under app_data_dir/pin-screenshots; no native capture or spawn."
+
+[pkg_activity_bar_set_badge]
+tag = "WP-19"
+reason = "Mutates in-memory ActivityBarRegistry badge state + emits an event; data-only, no native UI or spawn."
+
+[pkg_content_url]
+tag = "WP-19"
+reason = "server.mint(&pkg_id) allocates a token/URL on the desktop pkg_content server; the daemon mounts via pkg_content_html."
+
+[pkg_db_diag]
+tag = "WP-19"
+reason = "Pure sqlx SELECT COUNT/id diagnostics against pkg_installed table; db parity bucket."
+
+[pkg_dev_register]
+tag = "WP-18b"
+reason = "materialize_npm_deps + kernel.install_from_path (InstallSource::Dev) — same npm/SidecarSupervisor spawn path as install."
+
+[pkg_dev_reload]
+tag = "WP-18b"
+reason = "kernel.reload_pkg unregisters (kills) then re-registers (may respawn) SidecarSupervisor entries for the pkg being hot-reloaded."
+
+[pkg_dev_unregister]
+tag = "WP-18b"
+reason = "Calls kernel.uninstall, which walks registries.rev().unregister() incl. SidecarSupervisor::unregister (kills the dev pkg's running child)."
+
+[pkg_discover_workspace]
+tag = "WP-19"
+reason = "kernel.discover_workspace scans a dir for manifest.json files read-only; never mutates registries or spawns."
+
+[pkg_fetch]
+tag = "WP-19"
+reason = "HTTP proxy with capability/trust/SSRF checks via reqwest; no process spawn anywhere in the file."
+
+[pkg_health_remove]
+tag = "WP-19"
+reason = "kernel.purge_install_record deletes a pkg_installed row + child rows via SQL only; no registry spawn touched."
+
+[pkg_health_remove_all]
+tag = "WP-19"
+reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL only; no spawn."
+
+[pkg_health_scan]
+tag = "WP-19"
+reason = "kernel.health_scan is documented read-only, scans pkg_installed rows for broken/orphaned records; no spawn."
+
+[pkg_install_from_path]
+tag = "WP-18b"
+reason = "materialize_npm_deps (npm/bun spawn) then kernel.install_from_path, whose SidecarSupervisor spawns long-lived MCP children."
+
+[pkg_install_from_registry]
+tag = "WP-18b"
+reason = "Downloads/untars then calls materialize_npm_deps + kernel.install_from_path, same SidecarSupervisor/npm spawn path as pkg_install_from_path."
+
+[pkg_invoke]
+tag = "WP-18b"
+reason = "Plan §j spawn-site table: pkg_invoke.rs:141 does Command::new(&command) for manifest-declared one-shot CLI invocation, desktop only."
+
+[pkg_is_trusted_for_elevated]
+tag = "WP-19"
+reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §k names trust.rs as Tauri-only logic pending WP-19, not multi-user."
+
+[pkg_mcp_call]
+tag = "WP-18b"
+reason = "Dispatches to pkg::mcp_runtime::call_tool which Command::new(resolve_command(...)) spawns the pkg's MCP server per call (mcp_runtime.rs:99)."
+
+[pkg_permission_violations_clear]
+tag = "WP-19"
+reason = "Plain sqlx DELETE over pkg_permission_violations; no spawn."
+
+[pkg_permission_violations_list]
+tag = "WP-19"
+reason = "Plain sqlx SELECT over pkg_permission_violations table; no spawn."
+
+[pkg_preview_manifest]
+tag = "WP-19"
+reason = "Package::load(install_path) parses manifest.json to JSON without registering; fs read only."
+
+[pkg_scaffold]
+tag = "WP-19"
+reason = "execute_scaffold writes embedded template files to disk via fs::write only; grepped file has no Command::new."
+
+[pkg_screenshot]
+tag = "WP-19"
+reason = "Reads a manifest-declared screenshot file off disk and base64-encodes it; unrelated to native window capture."
+
+[pkg_set_enabled]
+tag = "WP-18b"
+reason = "kernel.set_enabled registers/unregisters all registries incl. SidecarSupervisor, spawning or killing the pkg's supervised child on toggle."
+
+[pkg_set_scope]
+tag = "WP-19"
+reason = "kernel.set_scope only UPDATEs pkg_installed.project_id and the in-memory map; no registry (re)register/spawn touched."
+
+[pkg_settings_get]
+tag = "WP-19"
+reason = "Reads pkg_settings table + manifest schema defaults, merges JSON; pure db/config read."
+
+[pkg_settings_set]
+tag = "WP-19"
+reason = "Upserts a row into pkg_settings via sqlx; config write, no spawn."
+
+[pkg_sidecar_call]
+tag = "WP-18b"
+reason = "Plan §j: pkg_sidecar.rs:97 Command::new(&entry.bin_path) spawns the manifest-declared sidecar binary per call."
+
+[pkg_sidecar_rpc_send]
+tag = "WP-18b"
+reason = "Streaming sidecar variant; plan §j lists pkg_sidecar_stream.rs:184 as its Command::new spawn site."
+
+[pkg_sidecar_rpc_shutdown]
+tag = "WP-18b"
+reason = "Controls/terminates the same streaming sidecar child spawned by pkg_sidecar_rpc_send (pkg_sidecar_stream.rs family)."
+
+[pkg_studio_request_project_access]
+tag = "desktop-only-forever"
+reason = "prompt_for_access uses app.dialog() (native modal dialog) and blocks on the click; native-dialog category."
+
+[pkg_supervisor_restart]
+tag = "WP-18b"
+reason = "supervisor.restart() kicks/relaunches the SidecarSupervisor's long-lived child (lifecycle.rs spawn site) for a Blocked/Crashed/Parked entry."
+
+[pkg_trust_approve]
+tag = "WP-18b"
+reason = "kernel.resume_after_review -> register(); SidecarSupervisor then spawns the pkg's child process (desktop-only spawn site)."
+
+[pkg_trust_grant]
+tag = "WP-19"
+reason = "trust::grant is a DB row write only (no kernel registry re-register), no spawn."
+
+[pkg_trust_list]
+tag = "WP-19"
+reason = "Reads kernel.list_installed() + trust::evaluate (DB reads); no registry/spawn side effects."
+
+[pkg_trust_list_pending]
+tag = "WP-19"
+reason = "Daemon has no trust machinery; every FE call site catches the error (the review modal shows it, the rest swallow it)."
+
+[pkg_trust_preview]
+tag = "WP-19"
+reason = "Reloads manifest + summarize_sensitive; pure read, no spawn."
+
+[pkg_trust_preview_incoming]
+tag = "WP-19"
+reason = "Diffs incoming manifest capabilities against stored snapshot; pure read/parse, no spawn."
+
+[pkg_trust_reject]
+tag = "WP-18b"
+reason = "kernel.uninstall() unregisters every registry, tearing down SidecarSupervisor/MCP child processes (desktop-only spawn site)."
+
+[pkg_trust_revoke]
+tag = "WP-19"
+reason = "trust::revoke is a plain DB row write, no registry/spawn interaction."
+
+[pkg_uninstall]
+tag = "WP-18b"
+reason = "kernel.uninstall walks registries.unregister(); SidecarSupervisor::unregister kills the pkg's child process."
+
+[pkg_webview_allow_origin]
+tag = "desktop-only-forever"
+reason = "Grants an extra allowed origin on the live child-webview registry; part of the native webview-pane subsystem."
+
+[pkg_webview_clear_session]
+tag = "desktop-only-forever"
+reason = "Clears a native child webview's cookie/session partition via the registry."
+
+[pkg_webview_create]
+tag = "desktop-only-forever"
+reason = "Creates a native child webview (WebviewWindowBuilder on the GTK/NSApplication main loop); child-webview-panes category."
+
+[pkg_webview_destroy]
+tag = "desktop-only-forever"
+reason = "Tears down a native child webview via WebviewPanesRegistry.destroy on the main thread."
+
+[pkg_webview_navigate]
+tag = "desktop-only-forever"
+reason = "Navigates a native child webview pane; child-webview-panes category."
+
+[pkg_webview_set_rect]
+tag = "desktop-only-forever"
+reason = "Repositions/resizes a native child webview pane on the main thread."
+
+[project_archive]
+tag = "WP-19"
+reason = "archive_project marks a PaDb row archived; no spawn."
+
+[project_artifacts_walk]
+tag = "WP-19"
+reason = "Plain std::fs dir walk (walk_dir), no process spawn; a read the daemon could serve for a remote client."
+
+[project_create]
+tag = "WP-19"
+reason = "create_project inserts a PaDb row; no spawn."
+
+[project_get_active]
+tag = "WP-19"
+reason = "get_active_project_id reads PaDb, falls back to default; no spawn."
+
+[project_inventory]
+tag = "WP-19"
+reason = "count_skills/count_commands/count_mcp_servers are std::fs walks of `.claude/`; no spawn."
+
+[project_list]
+tag = "WP-19"
+reason = "list_projects queries PaDb; no spawn."
+
+[project_scaffold_claude]
+tag = "WP-19"
+reason = "write_if_missing/create_dir_all scaffold `.claude/` + CLAUDE.md via std::fs only; no spawn."
+
+[project_set_active]
+tag = "WP-19"
+reason = "set_active_project_id writes PaDb + app.emit broadcast; no process spawn."
+
+[project_skills_list]
+tag = "WP-19"
+reason = "list_skills_in_dir walks skills dirs + parses frontmatter via std::fs; no spawn."
+
+[project_update]
+tag = "WP-19"
+reason = "update_project patches a PaDb row; no spawn."
+
+[pty_attach_arm]
+tag = "desktop-only-forever"
+reason = "Step 2 of the same native window-attach handshake as pty_attach_begin; no daemon/browser meaning."
+
+[pty_attach_begin]
+tag = "desktop-only-forever"
+reason = "Atomic attach handshake for a native window reattaching to an already-running PTY; the 'pty-daemon host attach' desktop case."
+
+[pty_daemon_info]
+tag = "desktop-only-forever"
+reason = "Reports desktop GUI's own bootstrapped/detached local ikenga-server daemon connection info; meaningless once the browser IS the daemon."
+
+[pty_daemon_shutdown]
+tag = "desktop-only-forever"
+reason = "Shuts down the desktop's own locally-launched daemon process; no such indirection exists for a remote daemon."
+
+[runtime_retry_bun_fetch]
+tag = "WP-19"
+reason = "ensure_bun is a reqwest download + zip unpack (no Command::new); prepares the bundled Bun both spawn sites share."
+
+[scaffold_agent_config]
+tag = "WP-19"
+reason = "scaffold::scaffold writes starter agent/skill/command files under <root>/.claude/ etc.; grepped file has no Command::new."
+
+[screenshot_capture_done]
+tag = "desktop-only-forever"
+reason = "FE callback resolving a native-window screenshot capture oneshot with decoded PNG bytes."
+
+[screenshot_capture_failed]
+tag = "desktop-only-forever"
+reason = "FE callback resolving a failed native-window screenshot capture oneshot."
+
+[screenshot_capture_native_crop]
+tag = "desktop-only-forever"
+reason = "FE callback reporting a pane rect so Rust natively crops the captured window image; native-window screenshot mechanism."
+
+[screenshot_get_config]
+tag = "desktop-only-forever"
+reason = "Config surface exists solely for the native-window screenshot feature (platform default dir, override); no independent remote meaning."
+
+[screenshot_pane]
+tag = "desktop-only-forever"
+reason = "Captures a pane within the native app window; same screenshot-of-native-window category."
+
+[screenshot_set_dir]
+tag = "desktop-only-forever"
+reason = "Sets the output directory for native-window screenshots; part of the screenshot-only config surface."
+
+[screenshot_window]
+tag = "desktop-only-forever"
+reason = "Captures the native app window as PNG; explicit 'screenshots of the native window' category."
+
+[seats_clear]
+tag = "WP-19"
+reason = "clear_core mutates seat state in db and emits events; no spawn."
+
+[seats_create]
+tag = "WP-19"
+reason = "create_core inserts a seat db row and emits events via emit_effects; no call_engine/spawn."
+
+[seats_engines]
+tag = "WP-19"
+reason = "Read-only engine install-state info for the create form."
+
+[seats_fill]
+tag = "WP-18b"
+reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run, the same non-executor chi spawn path as chi_run."
+
+[seats_get]
+tag = "WP-19"
+reason = "Read-only single seat view resolved by address."
+
+[seats_list]
+tag = "WP-19"
+reason = "Read-only seat view listing from db; doc comment 'Never writes'."
+
+[seats_move]
+tag = "WP-19"
+reason = "move_core rebinds a session to a seat in db and emits events; no call_engine."
+
+[seats_queue]
+tag = "WP-19"
+reason = "queue_core only enqueues a prompt row in db; actual send is deferred to a background poller, not this command's own spawn."
+
+[seats_release]
+tag = "WP-19"
+reason = "release_core frees a seat's hold in db; no spawn."
+
+[seats_remove]
+tag = "WP-19"
+reason = "remove_core deletes seat row(s) via db; no spawn."
+
+[seats_rename]
+tag = "WP-19"
+reason = "Renames a seat row in db; no spawn."
+
+[seats_resolve]
+tag = "WP-19"
+reason = "Routing decision only; doc comment 'Never resumes or starts anything', no call_engine."
+
+[seats_resume]
+tag = "WP-18b"
+reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same non-executor tmux/engine spawn path as chi_resume."
+
+[secrets_index_names]
+tag = "WP-19"
+reason = "SecretIndex::load reads secrets-index.json names only (no value, no vault unlock needed); pure read parity gap."
+
+[secrets_lock]
+tag = "WP-20"
+reason = "unlock.lock() re-locks the one shared vault DEK app-wide; same single-tenant unlock-layer gap as secrets_unlock."
+
+[secrets_lock_state]
+tag = "WP-20"
+reason = "Reads/advances the single shared UnlockState's idle expiry; no principal dimension in the unlock layer."
+
+[secrets_set_passphrase]
+tag = "WP-20"
+reason = "unlock.set_or_rotate is the ADR-022 KEK/DEK envelope for the ONE shared vault; per-principal secrets store/unlock is WP-20 by definition."
+
+[secrets_unlock]
+tag = "WP-20"
+reason = "unlock.unlock(passphrase) gates the single shared DEK/vault for the whole daemon; needs per-principal unlock state."
+
+[session_cancel]
+tag = "WP-19"
+reason = "Cancels the executor-managed streaming child via cancel_streaming; same already-executor-routed spawn path as session_send."
+
+[session_destroy]
+tag = "WP-19"
+reason = "Removes in-memory session entry + cancel_streaming on the executor-managed session; no desktop-only spawn site."
+
+[session_destroy_all]
+tag = "WP-19"
+reason = "kill_all_streaming() over executor-managed sessions (HMR hygiene); same non-desktop-only spawn path."
+
+[session_ensure]
+tag = "WP-19"
+reason = "Registers a thread in SessionsState; doc comment states 'No process is spawned'."
+
+[session_send]
+tag = "WP-19"
+reason = "Spawns via claude/session.rs SpawnSpec, which already routes through the session executor (WP-18); not a desktop-only site."
+
+[session_tool_result]
+tag = "WP-19"
+reason = "Forwards a tool result over the existing executor-managed session's stdin channel; no new spawn."
+
+[set_dock_badge]
+tag = "desktop-only-forever"
+reason = "macOS dock-tile badge control (module doc); explicit dock/OS-shell integration, currently a stub no-op."
+
+[settings_clear_all]
+tag = "WP-19"
+reason = "manager.clear_all deletes rows + a personal file via remove_file_if_exists; no process spawn."
+
+[settings_get]
+tag = "WP-19"
+reason = "manager.get_legacy reads SettingsManager's sqlite-backed kv table; no spawn, settings/config-reads bucket."
+
+[settings_get_all]
+tag = "WP-19"
+reason = "manager.get_all reads the full kv map; no spawn."
+
+[settings_open_file]
+tag = "desktop-only-forever"
+reason = "manager.open_file calls open_path (settings/mod.rs:1026), which spawns explorer.exe/`open`/xdg-open — native open-in-OS-app."
+
+[settings_read_file]
+tag = "WP-19"
+reason = "manager.read resolves+reads a settings.json doc from disk; no spawn."
+
+[settings_set]
+tag = "WP-19"
+reason = "manager.set_legacy writes the same sqlite kv table; no spawn."
+
+[settings_write_field]
+tag = "WP-19"
+reason = "manager.write_field patches a settings.json doc on disk; no spawn."
+
+[spike_grant_fs_read]
+tag = "desktop-only-forever"
+reason = "Debug ACL spike granting a Tauri dynamic capability scoped to window 'main' (window-specific mechanism)."
+
+[spike_setup_test_file]
+tag = "desktop-only-forever"
+reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: 'Spike'); no independent value."
+
+[studio_message_append]
+tag = "WP-19"
+reason = "sqlx INSERT of a studio message row; no spawn."
+
+[studio_message_list]
+tag = "WP-19"
+reason = "sqlx SELECT list of studio messages; no spawn."
+
+[studio_thread_delete]
+tag = "WP-19"
+reason = "sqlx DELETE of a studio thread row; no spawn."
+
+[studio_thread_get]
+tag = "WP-19"
+reason = "sqlx SELECT single studio thread row; no spawn."
+
+[studio_thread_get_or_create]
+tag = "WP-19"
+reason = "sqlx SELECT/INSERT on studio threads table; no spawn in studio_threads.rs."
+
+[studio_thread_list_recent]
+tag = "WP-19"
+reason = "sqlx SELECT recent studio threads; no spawn."
+
+[supabase_config_clear]
+tag = "WP-19"
+reason = "Deletes supabase.json via std::fs::remove_file; no spawn."
+
+[supabase_config_get]
+tag = "WP-19"
+reason = "Reads app_data_dir/supabase.json; plain fs, settings/config read parity."
+
+[supabase_config_set]
+tag = "WP-19"
+reason = "Writes supabase.json (url/anon/service_role_key) via fs; no spawn, config write."
+
+[terminal_detect_shells]
+tag = "WP-19"
+reason = "Enumerates host shells/WSL distros for the terminal picker; a brief detection probe, not an executor-gated session spawn."
+
+[viewer_port]
+tag = "WP-19"
+reason = "Returns the shared viewer server's already-bound port; read-only, no spawn."
+
+[viewer_serve]
+tag = "WP-19"
+reason = "manager.register() just adds a (token,root) mount to the already-running in-process viewer HTTP server; no process spawn."
+
+[viewer_stop]
+tag = "WP-19"
+reason = "manager.unregister() drops a mount-registry entry; no spawn."
+
+[window_close]
+tag = "desktop-only-forever"
+reason = "Closes a native OS window by label."
+
+[window_list]
+tag = "desktop-only-forever"
+reason = "Lists live native OS windows, reconciled against the OS."
+
+[window_spawn]
+tag = "desktop-only-forever"
+reason = "Spawns a native OS window via WindowRegistry."

@@ -23,11 +23,42 @@
 //! Uses `serde_yaml` — already a direct dependency (frontmatter parsing for
 //! `.claude/agents`/`skills`/`commands`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::pkg::manifest::RequiresEntry;
+
+/// Resolve the Ngwa central store root (`<app_data_dir>/store/`) using the same
+/// platform conventions Tauri uses for `app_data_dir` — env only, no
+/// `AppHandle`. Returns `None` if the platform's data dir can't be resolved.
+///
+/// Canonical home of what `commands::claude_config::store_root` returns (that
+/// one delegates here). It lives in this ungated module so the headless daemon
+/// resolves the same `store/skills/<name>` edges as the desktop.
+///
+/// In the daemon this resolves from the DAEMON PROCESS's env (HOME /
+/// XDG_DATA_HOME / APPDATA): one store for every caller. That is a
+/// single-user seam, same as the daemon's `fs_home`; per-principal store
+/// resolution is WP-20 (G-PRINCIPAL).
+pub fn store_root() -> Option<PathBuf> {
+    const BUNDLE_ID: &str = "app.ikenga";
+    let dir: PathBuf = if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        PathBuf::from(home)
+            .join("Library/Application Support")
+            .join(BUNDLE_ID)
+    } else if cfg!(target_os = "windows") {
+        let appdata = std::env::var_os("APPDATA")?;
+        PathBuf::from(appdata).join(BUNDLE_ID)
+    } else if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(xdg).join(BUNDLE_ID)
+    } else {
+        let home = std::env::var_os("HOME")?;
+        PathBuf::from(home).join(".local/share").join(BUNDLE_ID)
+    };
+    Some(dir.join("store"))
+}
 
 // ---- Contract enums (lockstep with contract/src/action-frontmatter.ts) ------
 //
