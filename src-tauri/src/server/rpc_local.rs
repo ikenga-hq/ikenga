@@ -360,15 +360,29 @@ pub(super) async fn chi_status(state: &AppState, args: &Value) -> RpcResponse {
     respond("chi_status", r)
 }
 
-/// The daemon's `chi_cache` rows. The desktop additionally merges Claude's
-/// JSONL sessions from `~/.claude/projects`; that source
-/// (`claude_list_sessions`) is not served yet, so it is not merged here —
-/// see `shared::chi::list`.
+/// The desktop's `chi_list`: the daemon's `chi_cache` rows merged with
+/// Claude's JSONL sessions (served since WP-19 slice 5b as
+/// `claude_list_sessions`) — `shared::chi::list_merged`, the same core the
+/// desktop command calls. The sessions are read from the router home's
+/// `~/.claude/projects` (the daemon PROCESS's home: single-user seam,
+/// G-PRINCIPAL / WP-20) with `FsReach::Confined`, so a log symlinked out of
+/// that dir is skipped.
 pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let engine_id = opt_str(args, &["engineId", "engine_id"])?;
         let limit = opt_i64(args, &["limit"])?;
-        chi::list(pa_db(state)?, engine_id.as_deref(), limit).await
+        let projects_root = state
+            .home
+            .as_deref()
+            .map(super::shared::claude_sessions::projects_root_in);
+        chi::list_merged(
+            pa_db(state)?,
+            engine_id.as_deref(),
+            limit,
+            projects_root.as_deref(),
+            super::shared::projects::FsReach::Confined,
+        )
+        .await
     }
     .await;
     respond("chi_list", r)

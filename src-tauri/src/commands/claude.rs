@@ -24,11 +24,16 @@ use tauri::{AppHandle, State};
 
 use crate::claude::{
     event::ChatEvent,
-    is_session_jsonl,
-    jsonl_reader::{read_jsonl, summarize, SessionSummary as JsonlSessionSummary},
+    jsonl_reader::read_jsonl,
     projects_root,
     session::{cancel_streaming, send_tool_result, send_user_message, SessionOpts, SessionsState},
 };
+/// `claude_list_sessions`' wire type. Lives in the ungated
+/// `server::shared::claude_sessions` (WP-19 slice 5b) with the scan, so the
+/// daemon arm serializes the same shape.
+pub use crate::server::shared::claude_sessions::SessionSummary;
+use crate::server::shared::claude_sessions::{list_sessions, locate_jsonl_in_roots};
+use crate::server::shared::projects::FsReach;
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -45,118 +50,16 @@ pub struct ClaudeOpts {
     pub cols: Option<u16>,
 }
 
-#[derive(Serialize)]
-pub struct SessionSummary {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    #[serde(rename = "projectDir")]
-    pub project_dir: String,
-    #[serde(rename = "startedAt")]
-    pub started_at: String,
-    #[serde(rename = "lastMessageAt")]
-    pub last_message_at: Option<String>,
-    #[serde(rename = "messageCount")]
-    pub message_count: u64,
-    pub title: Option<String>,
-    pub model: Option<String>,
-}
-
-impl From<JsonlSessionSummary> for SessionSummary {
-    fn from(s: JsonlSessionSummary) -> Self {
-        Self {
-            session_id: s.session_id,
-            project_dir: s.project_dir,
-            started_at: s.started_at,
-            last_message_at: s.last_message_at,
-            message_count: s.message_count,
-            title: s.title,
-            model: s.model,
-        }
-    }
-}
-
 #[tauri::command]
 pub async fn claude_list_sessions(
     #[allow(non_snake_case)] projectDir: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<SessionSummary>, String> {
     let root = projects_root().ok_or_else(|| "HOME unset".to_string())?;
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-
-    // If a project dir is provided, restrict to its slug. Empty string is
-    // treated as "all projects" so the frontend can pass cwd or "" without
-    // branching.
-    let slug_filter = projectDir
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|d| d.replace('/', "-"));
-
-    // Two-phase scan to keep the list view snappy when ~/.claude/projects has
-    // thousands of jsonl files (real numbers: ~9k+). Phase 1 only reads
-    // directory entries + mtime metadata; phase 2 calls `summarize` (which
-    // reads the file contents) on the top-N most recently modified.
-    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let entries = match std::fs::read_dir(&root) {
-        Ok(e) => e,
-        Err(e) => return Err(format!("read projects root: {e}")),
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        if let Some(ref slug) = slug_filter {
-            if dir.file_name().and_then(|n| n.to_str()) != Some(slug.as_str()) {
-                continue;
-            }
-        }
-        let inner = match std::fs::read_dir(&dir) {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-        for file in inner.flatten() {
-            let path = file.path();
-            if !is_session_jsonl(&path) {
-                continue;
-            }
-            let mtime = file
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            candidates.push((path, mtime));
-        }
-    }
-
-    // Newest mtime first. mtime ≈ last_message_at because claude appends to
-    // the jsonl on every envelope it writes.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let take = limit.unwrap_or(usize::MAX);
-    let mut summaries: Vec<SessionSummary> = Vec::with_capacity(take.min(candidates.len()));
-    for (path, _) in candidates.into_iter().take(take) {
-        match summarize(&path) {
-            Ok(Some(s)) => summaries.push(s.into()),
-            Ok(None) => {}
-            Err(e) => log::debug!("summarize {} failed: {e}", path.display()),
-        }
-    }
-
-    // Re-sort by the actual `last_message_at` from the summaries — mtime is a
-    // good predictor but the in-file timestamp is canonical.
-    summaries.sort_by(|a, b| {
-        let key_a = a
-            .last_message_at
-            .as_deref()
-            .unwrap_or(a.started_at.as_str());
-        let key_b = b
-            .last_message_at
-            .as_deref()
-            .unwrap_or(b.started_at.as_str());
-        key_b.cmp(key_a)
-    });
-    Ok(summaries)
+    // The scan (two-phase: mtime sort, then summarize the newest `limit`) is
+    // the shared core the daemon arm also calls; the desktop follows paths as
+    // it always has.
+    list_sessions(&root, projectDir.as_deref(), limit, FsReach::Follow)
 }
 
 #[tauri::command]
@@ -327,23 +230,8 @@ pub(crate) fn locate_jsonl_for_session(app: &AppHandle, session_id: &str) -> Opt
     locate_jsonl_in_roots(&jsonl_projects_roots(app), session_id)
 }
 
-/// Pure helper: scan each `projects/` root's slug dirs for `<session_id>.jsonl`.
-/// First match wins; roots are searched in order (legacy `$HOME` first).
-fn locate_jsonl_in_roots(roots: &[PathBuf], session_id: &str) -> Option<PathBuf> {
-    let target = format!("{session_id}.jsonl");
-    for root in roots {
-        let Ok(rd) = std::fs::read_dir(root) else {
-            continue;
-        };
-        for slug_entry in rd.flatten() {
-            let candidate = slug_entry.path().join(&target);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
+// `locate_jsonl_in_roots` (the pure scan behind `locate_jsonl_for_session`)
+// lives in `server::shared::claude_sessions` with the daemon's confined read.
 
 #[cfg(test)]
 mod jsonl_locator_tests {
@@ -394,5 +282,3 @@ mod jsonl_locator_tests {
         assert_eq!(locate_jsonl_in_roots(&[root], "no-such-session"), None);
     }
 }
-
-

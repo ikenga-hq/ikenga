@@ -109,45 +109,17 @@ reason = "resume_chi_run re-spawns the engine child through the same executor-ro
 tag = "WP-18b"
 reason = "spawn_chi_run spawns the in-process engine child via executor::current().spawn_piped (build_engine_command -> SpawnSpec), or for persistent runs a detached chi-runner (PipedOpts::detached); executor-routed since WP-18b part b, rpc.rs arm still pending."
 
-[claude_asset_list_pins]
-tag = "WP-19"
-reason = "Lists claude_asset_preferences rows via sqlx; no spawn."
-
-[claude_asset_pin]
-tag = "WP-19"
-reason = "Upserts a claude_asset_preferences row via sqlx; no spawn."
-
-[claude_asset_unpin]
-tag = "WP-19"
-reason = "Deletes a claude_asset_preferences row via sqlx; no spawn."
-
 [claude_assets_discover]
 tag = "WP-19"
-reason = "discovery::discover does 4-tier asset discovery over db+fs; no spawn."
-
-[claude_config_load]
-tag = "WP-19"
-reason = "scan_all walks .claude dirs in spawn_blocking; no process spawn."
-
-[claude_config_read_file]
-tag = "WP-19"
-reason = "Reads a whitelisted file under .claude/; no spawn."
-
-[claude_config_resolve_cascade]
-tag = "WP-19"
-reason = "Merges settings.json tiers in memory (resolve_settings_cascade); no fs writes or spawn."
+reason = "discovery::discover reads the live pkg kernel's installed set (app.state::<KernelState>()) for tiers 2 and 4; the daemon runs no kernel (its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could only answer tiers 1 and 3 — a partial tree that would read as complete. Not served in slice 5b."
 
 [claude_config_unwatch]
 tag = "WP-19"
-reason = "Drops watcher ids via FsWatchManager; no spawn."
+reason = "Releases claude_config_watch's watcher ids; nothing to release while claude_config_watch is desktop-only (see its entry). Serve the pair together."
 
 [claude_config_watch]
 tag = "WP-19"
-reason = "Registers FsWatchManager watchers on .claude dirs; no spawn."
-
-[claude_list_sessions]
-tag = "WP-19"
-reason = "Scans ~/.claude/projects jsonl files for summaries; pure fs read, no spawn."
+reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on the Tauri event channel; the daemon has none (the web transport's listen() is a no-op, and /ws/fs is its own subscription protocol, not these watcher ids). Not served in slice 5b; needs an event channel first."
 
 [claude_primitive_copy]
 tag = "WP-19"
@@ -185,21 +157,13 @@ reason = "Deletes a primitive from the store; no spawn."
 tag = "WP-19"
 reason = "Scoped variant of claude_primitive_remove; same fs op, no spawn."
 
-[claude_read_jsonl]
-tag = "WP-19"
-reason = "Reads one session transcript jsonl file; pure fs read."
-
-[claude_session_list]
-tag = "WP-19"
-reason = "enumerate_claude_sessions scans+summarizes jsonl files; pure fs read."
-
 [claude_store_import]
 tag = "WP-19"
 reason = "import_core copies a file into the store as canonical copy; a plain fs copy, distinct from claude_store/install.rs's npx/git spawns."
 
 [claude_store_list]
 tag = "WP-19"
-reason = "claude_store_list_inner scans store dir + registry.json, overlays provenance; no spawn (no Command::new in claude_store.rs)."
+reason = "Pure read (store dir walk + registry.json provenance overlay + enabledIn symlink probes; no spawn), but its types (ClaudeStoreEntry, RegistryFile/RegistryProvenance, Kind) and registry reader live inside the desktop-gated commands::claude_store module tree that the store mutations and oba installer share; extracting that read half into server::shared is its own change. Not served in slice 5b."
 
 [comment_route]
 tag = "WP-18b"
@@ -217,17 +181,13 @@ reason = "Reads a caller-supplied free-form src_dir with no containment, and int
 tag = "WP-18b"
 reason = "agents::detect_by_id runs the same probe_version spawn as detect_agents for one agent id; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
-[detect_agent_config]
-tag = "WP-19"
-reason = "config_claude::build_inventory only counts files under .claude/.gemini/.codex/.cursor dirs; no Command::new in that module."
-
 [detect_agents]
 tag = "WP-18b"
 reason = "agents::detect_all -> probe_version runs each detected CLI's --version; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [detect_system]
 tag = "WP-19"
-reason = "system::build_report is documented 'no subprocesses, no network' (disk-free + writability + vault-ready checks only)."
+reason = "Half of system::build_report is the desktop vault (secret index in app_data_dir + the platform keychain probe via SecretsLock); the daemon has no vault (crate::secrets_env), so secrets_store_ready / vault_key_present and their fix hint would describe a store that does not exist there. Needs a daemon-true report shape first."
 
 [dev_bind_port]
 tag = "desktop-only-forever"
@@ -237,9 +197,6 @@ reason = "Debug-only (#[cfg(debug_assertions)]) TcpListener holder for the story
 tag = "desktop-only-forever"
 reason = "Companion release for dev_bind_port's debug-only smoke-test port holder; same 'dev ports' desktop-only-forever bucket."
 
-[engine_layout]
-tag = "WP-19"
-reason = "engine_layouts() returns a hardcoded Vec<EngineLayout>; static config data, no db/spawn, settings/config-reads bucket."
 
 [fs_roots_add]
 tag = "WP-20"
@@ -329,13 +286,6 @@ reason = "FE callback for CLI-driven terminal-pane creation inside the desktop s
 tag = "desktop-only-forever"
 reason = "Resolves a pending wait-for-condition round trip targeting the app's own rendered window."
 
-[list_agent_projects]
-tag = "WP-19"
-reason = "Same pattern as list_claude_projects, fs::read_dir scan per agent's history dir (e.g. ~/.gemini/antigravity/brain); no spawn."
-
-[list_claude_projects]
-tag = "WP-19"
-reason = "Pure std::fs::read_dir scan of ~/.claude/projects/*.jsonl; no spawn."
 
 [ngwa_snapshot]
 tag = "WP-19"
@@ -639,7 +589,7 @@ reason = "ensure_bun is a reqwest download + zip unpack (no Command::new); prepa
 
 [scaffold_agent_config]
 tag = "WP-19"
-reason = "scaffold::scaffold writes starter agent/skill/command files under <root>/.claude/ etc.; grepped file has no Command::new."
+reason = "Writes the starter tree with create_dir_all / fs::write, which follow symlinks at the target (<root>/.claude/...); a remote caller needs the symlink-refusing FsReach::Confined write path project_scaffold_claude uses before it may drive it. Not served in slice 5b."
 
 [screenshot_capture_done]
 tag = "desktop-only-forever"
@@ -776,10 +726,6 @@ reason = "Debug ACL spike granting a Tauri dynamic capability scoped to window '
 [spike_setup_test_file]
 tag = "desktop-only-forever"
 reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: 'Spike'); no independent value."
-
-[terminal_detect_shells]
-tag = "WP-19"
-reason = "Enumerates host shells/WSL distros for the terminal picker; a brief detection probe, not an executor-gated session spawn."
 
 [viewer_port]
 tag = "WP-19"

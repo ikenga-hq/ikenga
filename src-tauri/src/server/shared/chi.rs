@@ -203,19 +203,109 @@ pub(crate) fn list_limit(limit: Option<i64>) -> i64 {
 }
 
 /// The cached half of `chi_list`: `chi_cache` rows, newest `last_seen_at`
-/// first, optionally one engine's.
-///
-/// The desktop then merges in Claude's on-disk JSONL sessions
-/// (`claude_list_sessions`, `~/.claude/projects`). The daemon does not: that
-/// command is itself not served yet (`desktop_only.toml`), and its reader
-/// (`crate::claude`) is desktop-gated. When it is served, the daemon arm
-/// merges the same way.
+/// first, optionally one engine's. [`list_merged`] is the whole command.
 pub(crate) async fn list(
     db: &PaDb,
     engine_id: Option<&str>,
     limit: Option<i64>,
 ) -> Result<Vec<ChiCacheRow>, String> {
     cache_list(db, engine_id, list_limit(limit)).await
+}
+
+/// `chi_list`, both surfaces: the cache rows ([`list`]) merged with Claude's
+/// on-disk JSONL sessions from `projects_root` (`<home>/.claude/projects`,
+/// via `claude_sessions::list_sessions`) when no engine filter or
+/// `claude-code` is asked for, then sorted newest `last_seen_at` first and
+/// truncated to the limit.
+///
+/// A session whose id matches a cache row's `external_id` refreshes that
+/// row's `last_seen_at` instead of adding a row. A failed session scan (or
+/// no home: `projects_root = None`, the desktop's "HOME unset") is logged at
+/// debug and leaves the cache rows as the answer — as the desktop always has.
+///
+/// The desktop passes its process home's root and `FsReach::Follow`; the
+/// daemon (since WP-19 slice 5b, which serves `claude_list_sessions`) its
+/// router home's root and `FsReach::Confined`.
+pub(crate) async fn list_merged(
+    db: &PaDb,
+    engine_id: Option<&str>,
+    limit: Option<i64>,
+    projects_root: Option<&Path>,
+    reach: super::projects::FsReach,
+) -> Result<Vec<ChiCacheRow>, String> {
+    let mut rows = list(db, engine_id, limit).await?;
+
+    // Merge with Claude JSONL records when no engine filter or claude-code.
+    if engine_id.is_none() || engine_id == Some("claude-code") {
+        let sessions = projects_root
+            .ok_or_else(|| "HOME unset".to_string())
+            .and_then(|root| {
+                super::claude_sessions::list_sessions(
+                    root,
+                    None,
+                    Some(list_limit(limit) as usize),
+                    reach,
+                )
+            });
+        match sessions {
+            Ok(sessions) => merge_claude_sessions(&mut rows, sessions),
+            Err(e) => {
+                log::debug!(target: "ikenga::chi", "claude_list_sessions failed: {e}");
+            }
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        b.last_seen_at
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.last_seen_at.as_deref().unwrap_or(""))
+    });
+
+    rows.truncate(list_limit(limit) as usize);
+    Ok(rows)
+}
+
+/// Fold Claude sessions into `rows` (see [`list_merged`]).
+fn merge_claude_sessions(
+    rows: &mut Vec<ChiCacheRow>,
+    sessions: Vec<super::claude_sessions::SessionSummary>,
+) {
+    let mut seen: std::collections::HashSet<String> =
+        rows.iter().filter_map(|r| r.external_id.clone()).collect();
+    for s in sessions {
+        if seen.contains(&s.session_id) {
+            // Refresh last_seen_at on matching cache rows.
+            for row in rows.iter_mut() {
+                if row.external_id.as_deref() == Some(&s.session_id) {
+                    row.last_seen_at = s.last_message_at.clone().or(Some(s.started_at.clone()));
+                }
+            }
+            continue;
+        }
+        seen.insert(s.session_id.clone());
+        rows.push(ChiCacheRow {
+            run_id: s.session_id.clone(),
+            engine_id: "claude-code".to_string(),
+            external_id: Some(s.session_id.clone()),
+            brief: s.title.clone(),
+            cwd: Some(s.project_dir.clone()),
+            model: s.model.clone(),
+            mode: None,
+            status: "done".to_string(),
+            output_path: None,
+            output_truncated: None,
+            error: None,
+            artifacts: None,
+            parent_id: None,
+            owner: "agent".to_string(),
+            pid: None,
+            started_at: Some(s.started_at.clone()),
+            ended_at: s.last_message_at.clone(),
+            last_seen_at: s.last_message_at.clone().or(Some(s.started_at.clone())),
+            expires_at: None,
+        });
+    }
 }
 
 /// Whether `status` may open a row's output file wherever it points, or only

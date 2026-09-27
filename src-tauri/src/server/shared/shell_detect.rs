@@ -1,4 +1,10 @@
 //! Auto-detection of installed shells and WSL distributions on the host machine.
+//!
+//! Lives in the ungated `server::shared` (WP-19 slice 5b); `crate::terminal`
+//! re-exports it for the desktop's `terminal_detect_shells`. On Unix it only
+//! probes fixed shell paths (`is_file`) and reads `$SHELL` — no process. The
+//! Windows arm runs `wsl.exe -l -q` (`read_wsl_distros_from_wsl_exe`), so the
+//! daemon serves this only on non-Windows hosts; see `server::rpc_claude`.
 
 // Used only by the Windows-only detection fns below.
 #[cfg(windows)]

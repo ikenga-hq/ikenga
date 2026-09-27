@@ -147,7 +147,7 @@ impl PathGuard {
         self.check(&canonical.join(tail))
     }
 
-    fn check(&self, canonical: &Path) -> Result<(), String> {
+    pub(super) fn check(&self, canonical: &Path) -> Result<(), String> {
         let allowed = match self {
             PathGuard::Allowlist => crate::fs_roots::current()
                 .ok_or(NO_ALLOWLIST)?

@@ -18,25 +18,23 @@
 
 pub mod artifact_watcher;
 pub mod discovery;
-pub mod event;
-pub mod jsonl_reader;
 pub mod session;
 pub mod session_browser;
-pub mod stream_parser;
 
-use std::path::{Path, PathBuf};
+// The parsers and the slug / session-log helpers are AppHandle-free and live
+// in the ungated `server::shared::claude_sessions` (WP-19 slice 5b), so the
+// daemon's session arms compile in the headless build. Re-exported so every
+// `crate::claude::{event, jsonl_reader, stream_parser, …}` path still resolves.
+pub use crate::server::shared::claude_sessions::{
+    event, is_session_jsonl, jsonl_reader, slug_to_project_dir, stream_parser,
+};
+
+use std::path::PathBuf;
 
 /// Convert an absolute project dir to the Claude Code on-disk slug.
 #[allow(dead_code)]
 pub fn project_dir_to_slug(project_dir: &str) -> String {
     project_dir.replace('/', "-")
-}
-
-/// Inverse of `project_dir_to_slug` — `-Users-jane-work` →
-/// `/Users/jane/work`. Best-effort; some legacy slugs may have
-/// lost trailing slashes.
-pub fn slug_to_project_dir(slug: &str) -> String {
-    slug.replace('-', "/")
 }
 
 /// Resolve `~/.claude/projects/<slug>` for a given slug.
@@ -51,17 +49,4 @@ pub fn project_log_dir(slug: &str) -> Option<PathBuf> {
 pub fn projects_root() -> Option<PathBuf> {
     let home = crate::platform::home_dir()?;
     Some(home.join(".claude").join("projects"))
-}
-
-/// True for files Claude Code writes as session logs.
-pub fn is_session_jsonl(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-        && path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| {
-                // sessionId is a uuid v4 — 36 chars with 4 hyphens.
-                s.len() == 36 && s.matches('-').count() == 4
-            })
-            .unwrap_or(false)
 }

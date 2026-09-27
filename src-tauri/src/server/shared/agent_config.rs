@@ -7,6 +7,13 @@
 //! starting from (e.g. "12 skills, 3 agents already installed") and so the
 //! "would you like to scaffold config?" step can be skipped on workspaces
 //! that already have one.
+//!
+//! Moved from `agent_detect::config_claude` into the ungated `server::shared`
+//! (WP-19 slice 5b) so the daemon's `detect_agent_config` arm counts with the
+//! same code; `agent_detect` re-exports it as `config_claude`. The home the
+//! global counts read (`~/.claude.json`, `~/.claude/projects`, …) is a
+//! parameter of [`build_inventory_in`]: the desktop passes the process home,
+//! the daemon its router home (single-user seam, G-PRINCIPAL / WP-20).
 
 use std::path::{Path, PathBuf};
 
@@ -23,14 +30,29 @@ pub struct AgentConfigInventory {
     pub project_count: u32,
 }
 
+/// The desktop inventory: global counts under the process home.
 pub fn build_inventory(agent_id: &str, root_path: &str) -> AgentConfigInventory {
-    let root = PathBuf::from(root_path);
+    build_inventory_in(
+        agent_id,
+        Path::new(root_path),
+        crate::platform::home_dir().as_deref(),
+    )
+}
+
+/// [`build_inventory`] with the home made explicit. `root` is counted as
+/// given; its `root_path` field is `root.display()`.
+pub(crate) fn build_inventory_in(
+    agent_id: &str,
+    root: &Path,
+    home: Option<&Path>,
+) -> AgentConfigInventory {
+    let root = root.to_path_buf();
     match agent_id {
-        "claude-code" | "claude" => build_claude_inventory(root),
+        "claude-code" | "claude" => build_claude_inventory(root, home),
         "antigravity-cli" | "antigravity" | "gemini-cli" | "gemini" => {
-            build_antigravity_inventory(root)
+            build_antigravity_inventory(root, home)
         }
-        "codex" | "chatgpt" | "openai" => build_codex_inventory(root),
+        "codex" | "chatgpt" | "openai" => build_codex_inventory(root, home),
         "cursor-agent" | "cursor" => build_cursor_inventory(root),
         _ => AgentConfigInventory {
             root_path: root.display().to_string(),
@@ -44,15 +66,15 @@ pub fn build_inventory(agent_id: &str, root_path: &str) -> AgentConfigInventory 
     }
 }
 
-fn build_claude_inventory(root: PathBuf) -> AgentConfigInventory {
+fn build_claude_inventory(root: PathBuf, home: Option<&Path>) -> AgentConfigInventory {
     let dot_claude = root.join(".claude");
     let config_dir_present = dot_claude.is_dir() || root.join(".claude.json").is_file();
 
     let agent_count = count_markdown_files(&dot_claude.join("agents"));
     let skill_count = count_skill_dirs(&dot_claude.join("skills"));
     let command_count = count_markdown_files(&dot_claude.join("commands"));
-    let mcp_server_count = count_mcp_servers();
-    let project_count = count_projects();
+    let mcp_server_count = count_mcp_servers(home);
+    let project_count = count_projects(home);
 
     AgentConfigInventory {
         root_path: root.display().to_string(),
@@ -65,7 +87,7 @@ fn build_claude_inventory(root: PathBuf) -> AgentConfigInventory {
     }
 }
 
-fn build_antigravity_inventory(root: PathBuf) -> AgentConfigInventory {
+fn build_antigravity_inventory(root: PathBuf, home: Option<&Path>) -> AgentConfigInventory {
     let dot_gemini = root.join(".gemini");
     let dot_agents = root.join(".agents");
     let config_dir_present = dot_gemini.is_dir()
@@ -78,8 +100,8 @@ fn build_antigravity_inventory(root: PathBuf) -> AgentConfigInventory {
         + count_skill_dirs(&dot_agents.join("skills"));
     let command_count = count_markdown_files(&dot_gemini.join("commands"))
         + count_markdown_files(&dot_gemini.join("rules"));
-    let mcp_server_count = count_antigravity_mcp_servers();
-    let project_count = count_antigravity_projects();
+    let mcp_server_count = count_antigravity_mcp_servers(home);
+    let project_count = count_antigravity_projects(home);
 
     AgentConfigInventory {
         root_path: root.display().to_string(),
@@ -92,7 +114,7 @@ fn build_antigravity_inventory(root: PathBuf) -> AgentConfigInventory {
     }
 }
 
-fn build_codex_inventory(root: PathBuf) -> AgentConfigInventory {
+fn build_codex_inventory(root: PathBuf, home: Option<&Path>) -> AgentConfigInventory {
     let dot_codex = root.join(".codex");
     let dot_openai = root.join(".openai");
     let config_dir_present = dot_codex.is_dir() || dot_openai.is_dir();
@@ -100,8 +122,8 @@ fn build_codex_inventory(root: PathBuf) -> AgentConfigInventory {
     let agent_count = count_markdown_files(&dot_codex.join("agents"));
     let skill_count = count_skill_dirs(&dot_codex.join("skills"));
     let command_count = count_markdown_files(&dot_codex.join("commands"));
-    let mcp_server_count = count_codex_mcp_servers();
-    let project_count = count_codex_sessions();
+    let mcp_server_count = count_codex_mcp_servers(home);
+    let project_count = count_codex_sessions(home);
 
     AgentConfigInventory {
         root_path: root.display().to_string(),
@@ -170,8 +192,8 @@ fn count_skill_dirs(dir: &Path) -> u32 {
 }
 
 /// MCP servers configured in `~/.claude.json` under `mcpServers`.
-fn count_mcp_servers() -> u32 {
-    let Some(path) = home_join(".claude.json") else {
+fn count_mcp_servers(home: Option<&Path>) -> u32 {
+    let Some(path) = home_join(home, ".claude.json") else {
         return 0;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -187,13 +209,13 @@ fn count_mcp_servers() -> u32 {
 }
 
 /// MCP servers configured in `~/.gemini/antigravity/mcp_config.json` or `~/.gemini/mcp.json`.
-fn count_antigravity_mcp_servers() -> u32 {
+fn count_antigravity_mcp_servers(home: Option<&Path>) -> u32 {
     for rel in &[
         ".gemini/antigravity/mcp_config.json",
         ".gemini/mcp.json",
         ".config/antigravity/mcp.json",
     ] {
-        if let Some(path) = home_join(rel) {
+        if let Some(path) = home_join(home, rel) {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(m) = v
@@ -211,8 +233,8 @@ fn count_antigravity_mcp_servers() -> u32 {
 }
 
 /// MCP servers configured in `~/.codex/config.json`.
-fn count_codex_mcp_servers() -> u32 {
-    if let Some(path) = home_join(".codex/config.json") {
+fn count_codex_mcp_servers(home: Option<&Path>) -> u32 {
+    if let Some(path) = home_join(home, ".codex/config.json") {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(m) = v.get("mcpServers").and_then(|s| s.as_object()) {
@@ -225,8 +247,8 @@ fn count_codex_mcp_servers() -> u32 {
 }
 
 /// Claude Code per-cwd project histories under `~/.claude/projects/`.
-fn count_projects() -> u32 {
-    let Some(path) = home_join(".claude/projects") else {
+fn count_projects(home: Option<&Path>) -> u32 {
+    let Some(path) = home_join(home, ".claude/projects") else {
         return 0;
     };
     let Ok(rd) = std::fs::read_dir(&path) else {
@@ -242,9 +264,9 @@ fn count_projects() -> u32 {
 }
 
 /// Antigravity conversations / projects in `~/.gemini/antigravity/brain` or app data.
-fn count_antigravity_projects() -> u32 {
+fn count_antigravity_projects(home: Option<&Path>) -> u32 {
     for rel in &[".gemini/antigravity/brain", ".gemini/projects"] {
-        if let Some(path) = home_join(rel) {
+        if let Some(path) = home_join(home, rel) {
             if let Ok(rd) = std::fs::read_dir(&path) {
                 let mut n: u32 = 0;
                 for entry in rd.flatten() {
@@ -262,9 +284,9 @@ fn count_antigravity_projects() -> u32 {
 }
 
 /// Codex sessions under `~/.codex/sessions` or `~/.codex/history`.
-fn count_codex_sessions() -> u32 {
+fn count_codex_sessions(home: Option<&Path>) -> u32 {
     for rel in &[".codex/sessions", ".codex/history"] {
-        if let Some(path) = home_join(rel) {
+        if let Some(path) = home_join(home, rel) {
             if let Ok(rd) = std::fs::read_dir(&path) {
                 let mut n: u32 = 0;
                 for entry in rd.flatten() {
@@ -281,8 +303,8 @@ fn count_codex_sessions() -> u32 {
     0
 }
 
-fn home_join(rel: &str) -> Option<PathBuf> {
-    crate::platform::home_dir().map(|h| h.join(rel))
+fn home_join(home: Option<&Path>, rel: &str) -> Option<PathBuf> {
+    home.map(|h| h.join(rel))
 }
 
 #[cfg(test)]

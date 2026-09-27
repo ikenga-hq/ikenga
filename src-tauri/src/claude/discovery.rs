@@ -751,15 +751,9 @@ pub fn resolve_preferred<'a>(
 
 // ─── Pin storage helpers ───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssetPin {
-    pub scope: String,
-    pub asset_kind: String,
-    pub asset_name: String,
-    pub preferred_tier: String,
-    pub preferred_source: Option<String>,
-    pub updated_at: i64,
-}
+/// Defined in the ungated `server::shared::claude_config` (WP-19 slice 5b) so
+/// the daemon's `claude_asset_list_pins` arm serializes the same type.
+pub use crate::server::shared::claude_config::AssetPin;
 
 /// Load every pin for a scope, indexed by `(kind, name)` so callers can look
 /// up directly.
