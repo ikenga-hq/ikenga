@@ -254,8 +254,14 @@ impl WindowRegistry {
 
     /// *Pop out* joins Window 2 (DEC-69d): put `surface_id` into Window 2 and
     /// return its label, or `Ok(None)` when there is no Window 2 — the caller
-    /// then spawns one. The pick and the add happen in one call, so a Window 2
-    /// that closes in between can't be picked and then missed.
+    /// then spawns one.
+    ///
+    /// The pick and the add are NOT atomic: `window_two` releases the registry
+    /// lock before `add_surface` takes it again, so the picked window can close
+    /// in between. `add_surface` then fails with "not open"; that is treated as
+    /// "that window is gone" — re-pick once, and if the second pick loses the
+    /// same race, report no Window 2 so the caller spawns one instead of
+    /// surfacing an error for a window the user just closed.
     pub fn join_surface(
         &self,
         app: &AppHandle,
@@ -265,11 +271,26 @@ impl WindowRegistry {
         if surface_id.trim().is_empty() {
             return Err(anyhow!("surface id is empty"));
         }
-        let Some(label) = self.window_two(app, active_project) else {
-            return Ok(None);
-        };
-        self.add_surface(app, &label, surface_id)?;
-        Ok(Some(label))
+        for _ in 0..2 {
+            let Some(label) = self.window_two(app, active_project) else {
+                return Ok(None);
+            };
+            match self.add_surface(app, &label, surface_id) {
+                Ok(_) => return Ok(Some(label)),
+                // `label` is never `main` and the id is non-empty, so the only
+                // way `add_surface` fails here is the window closing under us.
+                Err(e) if !self.is_open(app, &label) => {
+                    tracing::debug!("[window] Window 2 `{label}` closed before the join: {e}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `label` is a live spawned window: registered and still open.
+    fn is_open(&self, app: &AppHandle, label: &str) -> bool {
+        app.get_webview_window(label).is_some() && self.inner.read().unwrap().contains_key(label)
     }
 
     /// Add `surface_id` to the live window `label` as a new tab. A surface

@@ -11,6 +11,19 @@
 /** Mirrors Rust `topics::SURFACES_CHANGED`. */
 export const SURFACES_CHANGED_TOPIC = 'window://surfaces-changed';
 
+/**
+ * Window 2 ⋯ → *Make dispatch target* (D-09 `d9Win2` "Pane actions"): the
+ * thin window can't write the primary's shell store, so it asks `main` over
+ * this FE-only topic (`emitTo('main', …)`, payload {@link MakeTargetRequest})
+ * and the primary sets `companion.activeTarget`. No Rust side.
+ */
+export const MAKE_TARGET_TOPIC = 'window://make-target';
+
+export interface MakeTargetRequest {
+	/** The surface whose session should become the dispatch target. */
+	surfaceId: string;
+}
+
 /** Mirrors Rust `registry::SurfacesChanged`. */
 export interface SurfacesChangedPayload {
 	label: string;

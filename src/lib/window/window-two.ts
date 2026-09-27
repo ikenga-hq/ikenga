@@ -2,9 +2,10 @@
 //
 // Window 2 is the most recently focused live non-`main` window that isn't a
 // `Workspace` window bound to another project. Rust picks it and adds the
-// surface in one call (`window_join_surface`), so the chosen window can't
-// close between the pick and the add. When there is no Window 2 the pop-out
-// spawns one exactly as before (`window_spawn`, a thin `single-surface`
+// surface in one call (`window_join_surface`); if the picked window closes
+// before the add lands, Rust re-picks once and otherwise answers "no
+// Window 2", so the pop-out spawns instead of failing. When there is no
+// Window 2 the pop-out spawns one exactly as before (`window_spawn`, a thin `single-surface`
 // window). Joining surfaces the window: a `WebviewWindow` lookup by label,
 // then `unminimize()` + `setFocus()` (research §Phase 7, `02`).
 //
@@ -15,13 +16,31 @@
 import { spawnWindow, windowJoinSurface, windowRemoveSurface } from '@/lib/tauri-cmd';
 import { isTauri } from '@/lib/transport';
 import { clearPendingSurface, markSurfaceDetached, syncDetachedSurfaces } from './detached-surfaces';
-import { PENDING_WINDOW_LABEL } from './surfaces-topic';
+import { MAKE_TARGET_TOPIC, type MakeTargetRequest, PENDING_WINDOW_LABEL } from './surfaces-topic';
 
 export interface PopOutResult {
 	/** The window now holding the surface. */
 	label: string;
 	/** True when it joined an existing Window 2; false when one was spawned. */
 	joined: boolean;
+}
+
+/**
+ * Labels a *Pop out* has put a surface into (joined or spawned) this session.
+ * A window closing speaks as "Window 2" (D-09 `closeWin2`) only when it is one
+ * of these; an ordinary pane / viewer pop-out window closing stays silent, as
+ * it always was.
+ */
+const windowTwoLabels = new Set<string>();
+
+/** Whether `label` has held a Pop out (see `windowTwoLabels`). */
+export function isWindowTwoLabel(label: string): boolean {
+	return windowTwoLabels.has(label);
+}
+
+/** Forget a closed window's label (the close path calls this once handled). */
+export function forgetWindowTwoLabel(label: string): void {
+	windowTwoLabels.delete(label);
 }
 
 /** A fresh detached-window label. Must start `detached-`: that is the
@@ -46,6 +65,7 @@ export async function popOutSurface(
 	try {
 		const joined = await windowJoinSurface(surfaceId, opts.projectId);
 		if (joined) {
+			windowTwoLabels.add(joined);
 			markSurfaceDetached(surfaceId, joined);
 			void focusWindow(joined);
 			return { label: joined, joined: true };
@@ -58,6 +78,7 @@ export async function popOutSurface(
 			project_id: null,
 			layout_key: label,
 		});
+		windowTwoLabels.add(label);
 		markSurfaceDetached(surfaceId, label);
 		return { label, joined: false };
 	} catch (err) {
@@ -96,4 +117,16 @@ export async function focusWindow(label: string): Promise<boolean> {
  */
 export function moveSurfaceBack(label: string, surfaceId: string): Promise<string[]> {
 	return windowRemoveSurface(label, surfaceId, true);
+}
+
+/**
+ * Window 2 ⋯ → *Make dispatch target* (D-09): ask the primary window to make
+ * `surfaceId`'s session the dispatch target (`MAKE_TARGET_TOPIC`). A thin
+ * window never writes the primary's shell store itself.
+ */
+export async function requestMakeTarget(surfaceId: string): Promise<void> {
+	if (!isTauri()) return;
+	const { emitTo } = await import('@tauri-apps/api/event');
+	const payload: MakeTargetRequest = { surfaceId };
+	await emitTo('main', MAKE_TARGET_TOPIC, payload);
 }

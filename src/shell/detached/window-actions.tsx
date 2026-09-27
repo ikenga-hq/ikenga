@@ -1,14 +1,15 @@
 // WP-69 — Window 2 ⋯ (D-09 `popout`, `d9Win2`'s "Pane actions" menu):
-//   Move back to main window · ─ · Close Window 2
+//   Move back to main window · Make dispatch target · ─ · Close Window 2
 //
 // Lazy-loaded by the thin root (Radix menu stays out of the first paint).
 // Minimise / restore are the OS window's own chrome. Closing the window
 // returns every tab to the main window: the primary's detached-surface
 // tracker sees them come back and mounts them (`onSurfacesReturned`).
 //
-// D-09's third item, *Make dispatch target*, is not here: the dispatch
-// target lives in the primary window's shell store, which a thin window
-// can't write (see the WP-69 report).
+// *Make dispatch target*: the dispatch target lives in the primary window's
+// shell store, which a thin window never writes. It asks `main` instead
+// (`requestMakeTarget` → `window://make-target`), and the primary selects
+// the surface's seat, or its session when unseated.
 
 import { MoreHorizontal } from 'lucide-react';
 import { useState } from 'react';
@@ -21,7 +22,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { closeWindow } from '@/lib/tauri-cmd';
-import { moveSurfaceBack } from '@/lib/window/window-two';
+import { moveSurfaceBack, requestMakeTarget } from '@/lib/window/window-two';
 
 export default function WindowActions({ label, surfaceId }: { label: string; surfaceId: string | null }) {
 	const [error, setError] = useState<string | null>(null);
@@ -50,6 +51,16 @@ export default function WindowActions({ label, surfaceId }: { label: string; sur
 					}}
 				>
 					Move back to main window
+				</DropdownMenuItem>
+				<DropdownMenuItem
+					disabled={!surfaceId}
+					onSelect={() => {
+						if (!surfaceId) return;
+						setError(null);
+						void requestMakeTarget(surfaceId).catch(fail);
+					}}
+				>
+					Make dispatch target
 				</DropdownMenuItem>
 				<DropdownMenuSeparator />
 				<DropdownMenuItem

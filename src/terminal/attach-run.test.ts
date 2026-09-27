@@ -20,13 +20,12 @@ vi.mock('./session-store', async (orig) => ({
 import { queryClient } from '@/lib/query-client';
 import {
 	attachRunTerminal,
-	cachedRunTerminalSession,
-	fetchRunTerminalSession,
+	fetchRunAttachState,
 	findRunAttachTerminal,
 	isRunAttachCmd,
 	RUN_LOOKUP_LIMIT,
 	runAttachArgv,
-	runTerminalSessionKey,
+	runSessionOf,
 } from './attach-run';
 import { type TerminalTab, useTerminalStore } from './session-store';
 
@@ -65,28 +64,38 @@ describe('the tmux client argv', () => {
 	});
 });
 
-describe('the run’s tmux session (chi_cache.terminal_session_id)', () => {
-	it('is the row’s terminal_session_id, looked up among the engine’s runs', async () => {
+describe('the run’s attach state (chi_cache.terminal_session_id)', () => {
+	it('is the row’s tmux session, looked up among the engine’s runs', async () => {
 		m.chiList.mockResolvedValue([
-			{ run_id: 'other', terminal_session_id: 'other' },
-			{ run_id: 'run-1', terminal_session_id: 'run-1' },
+			{ run_id: 'other', status: 'running', terminal_session_id: 'other' },
+			{ run_id: 'run-1', status: 'running', terminal_session_id: 'run-1' },
 		]);
-		await expect(fetchRunTerminalSession({ runId: 'run-1', engineId: 'claude-code' })).resolves.toBe('run-1');
+		await expect(fetchRunAttachState({ runId: 'run-1', engineId: 'claude-code' })).resolves.toEqual({
+			kind: 'tmux',
+			session: 'run-1',
+		});
 		expect(m.chiList).toHaveBeenCalledWith('claude-code', RUN_LOOKUP_LIMIT);
 	});
 
-	it('is null for a one-off run or a run no longer cached', async () => {
-		m.chiList.mockResolvedValue([{ run_id: 'run-1' }]);
-		await expect(fetchRunTerminalSession({ runId: 'run-1', engineId: 'x' })).resolves.toBeNull();
-		await expect(fetchRunTerminalSession({ runId: 'gone', engineId: 'x' })).resolves.toBeNull();
+	it('is headless only for a started run with no tmux session', async () => {
+		m.chiList.mockResolvedValue([{ run_id: 'run-1', status: 'running' }]);
+		await expect(fetchRunAttachState({ runId: 'run-1', engineId: 'x' })).resolves.toEqual({ kind: 'headless' });
 	});
 
-	it('reads undefined until fetched, then the cached value', async () => {
-		m.chiList.mockResolvedValue([{ run_id: 'run-1', terminal_session_id: 'run-1' }]);
-		const run = { runId: 'run-1', engineId: 'claude-code' };
-		expect(cachedRunTerminalSession(run)).toBeUndefined();
-		await vi.waitFor(() => expect(queryClient.getQueryData(runTerminalSessionKey(run))).toBe('run-1'));
-		expect(cachedRunTerminalSession(run)).toBe('run-1');
+	it('is pending, not headless, for a queued run that has no session yet', async () => {
+		m.chiList.mockResolvedValue([{ run_id: 'run-1', status: 'queued' }]);
+		await expect(fetchRunAttachState({ runId: 'run-1', engineId: 'x' })).resolves.toEqual({ kind: 'pending' });
+	});
+
+	it('is unknown, not headless, for a run outside the lookup', async () => {
+		m.chiList.mockResolvedValue([]);
+		await expect(fetchRunAttachState({ runId: 'gone', engineId: 'x' })).resolves.toEqual({ kind: 'unknown' });
+	});
+
+	it('names a session only for the tmux state', () => {
+		expect(runSessionOf({ kind: 'tmux', session: 'run-1' })).toBe('run-1');
+		expect(runSessionOf({ kind: 'headless' })).toBeNull();
+		expect(runSessionOf(undefined)).toBeNull();
 	});
 });
 

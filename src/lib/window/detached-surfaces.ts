@@ -39,6 +39,8 @@ import { create } from 'zustand';
 import { listWindows, windowRemoveSurface } from '@/lib/tauri-cmd';
 import {
 	applySurfacesChanged,
+	MAKE_TARGET_TOPIC,
+	type MakeTargetRequest,
 	PENDING_WINDOW_LABEL,
 	returnedByClosedWindows,
 	SURFACES_CHANGED_TOPIC,
@@ -65,6 +67,29 @@ export interface SurfacesReturned {
 }
 
 const returnListeners = new Set<(e: SurfacesReturned) => void>();
+const makeTargetListeners = new Set<(surfaceId: string) => void>();
+
+/** Subscribe to Window 2 ⋯ → *Make dispatch target* requests (primary only).
+ *  Returns an unsubscribe. */
+export function onMakeTargetRequested(cb: (surfaceId: string) => void): () => void {
+	makeTargetListeners.add(cb);
+	return () => {
+		makeTargetListeners.delete(cb);
+	};
+}
+
+/** Deliver one *Make dispatch target* request. Exported for tests. */
+export function handleMakeTargetRequest(req: Partial<MakeTargetRequest> | null | undefined): void {
+	const surfaceId = req?.surfaceId;
+	if (typeof surfaceId !== 'string' || !surfaceId) return;
+	for (const cb of makeTargetListeners) {
+		try {
+			cb(surfaceId);
+		} catch (err) {
+			console.warn('detached-surfaces: make-target listener failed', err);
+		}
+	}
+}
 
 /** Subscribe to surfaces returning to the main window. Returns an unsubscribe. */
 export function onSurfacesReturned(cb: (e: SurfacesReturned) => void): () => void {
@@ -226,6 +251,8 @@ export function initDetachedSurfaceTracking(): void {
 			});
 		}
 	});
+	// Window 2 ⋯ → Make dispatch target (D-09), sent `emitTo('main', …)`.
+	void listen<MakeTargetRequest>(MAKE_TARGET_TOPIC, (ev) => handleMakeTargetRequest(ev.payload));
 }
 
 /**

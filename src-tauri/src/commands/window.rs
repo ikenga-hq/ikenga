@@ -43,9 +43,10 @@ pub fn window_list(
 /// `Workspace` windows bound to a project other than `project_id`) and adds
 /// `surface_id` to it as a tab. Returns that window's label, or `null` when
 /// there is no Window 2 — the caller then spawns one with `window_spawn`.
-/// The pick and the add are one call, so the chosen window can't close in
-/// between. The FE focuses the returned label itself (`WebviewWindow` lookup
-/// by label, then `setFocus`).
+/// The pick and the add are one IPC call but not one lock: if the picked
+/// window closes in between, the registry re-picks once and otherwise returns
+/// `null`, so the caller spawns rather than failing. The FE focuses the
+/// returned label itself (`WebviewWindow` lookup by label, then `setFocus`).
 #[tauri::command]
 pub fn window_join_surface(
     app: AppHandle,

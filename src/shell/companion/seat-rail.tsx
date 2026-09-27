@@ -34,7 +34,7 @@ import { UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import type { SeatStatus, SeatView } from '@/lib/tauri-cmd';
 import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
-import { useRunAttachedTerminal } from '@/terminal/attach-run';
+import { type RunAttachState, useRunAttachedTerminal } from '@/terminal/attach-run';
 import { useTerminalStore } from '@/terminal/session-store';
 import { type RailSelection, useCompanionStore } from './companion-store';
 import {
@@ -624,12 +624,18 @@ function UnseatedRow({
 
 // ─── Menus ──────────────────────────────────────────────────────────────────
 
-export function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, live: boolean): SeatMenuItem[] {
+export function seatMenuItems(
+	seat: SeatView,
+	isTarget: boolean,
+	mount: Mount,
+	live: boolean,
+	run: RunAttachState | undefined
+): SeatMenuItem[] {
 	const vacant = seat.status === 'vacant';
 	const inWindow = mount.where === 'window';
 	// WP-69 (§4.4): a persistent-run seat opens / pops out a terminal attached
 	// to its tmux session; a one-off run stays "headless run — nothing to show".
-	const noPane = seatPaneBlocker(seat, live);
+	const noPane = seatPaneBlocker(seat, live, run);
 	const items: SeatMenuItem[] = [];
 	// §5.5: only while another client holds the seat.
 	if (heldByOther(seat.hold, UI_SEAT_CLIENT)) {
@@ -648,7 +654,7 @@ export function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, l
 			label: inWindow ? 'Open in pane — back to main window' : 'Open in pane',
 			disabled: Boolean(noPane),
 			title: noPane,
-			run: () => openSeatInPane(seat),
+			run: () => openSeatInPane(seat, run),
 		},
 		{
 			label: 'Make dispatch target',
@@ -662,7 +668,7 @@ export function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, l
 			sub: inWindow ? 'in Window 2' : 'to Window 2',
 			disabled: Boolean(noPane) || inWindow,
 			title: inWindow ? 'Already in Window 2' : noPane,
-			run: () => popOutSeat(seat),
+			run: () => popOutSeat(seat, run),
 		},
 		{ label: 'All seats', sub: 'seat board', run: openSeatBoard },
 		{ sep: true },
@@ -780,7 +786,7 @@ function SeatMenuHost({
 	const session = menu.kind === 'session' ? roster.unseated.find((u) => u.id === menu.id) : undefined;
 	// WP-69: a persistent-run seat's mount is its tmux-attached terminal's
 	// (§4.4); subscribing here also re-renders the menu once the run's tmux
-	// session is known (`seatPaneBlocker` reads it from the cache).
+	// session is known (`seatPaneBlocker` takes `runAttach.state`).
 	const runAttach = useRunAttachedTerminal(
 		seat?.session?.kind === 'run' ? { runId: seat.session.run_id, engineId: seat.engine_id } : null
 	);
@@ -797,7 +803,7 @@ function SeatMenuHost({
 				label={`Seat actions for @${seat.name}`}
 				x={menu.x}
 				y={menu.y}
-				items={seatMenuItems(seat, isTarget, mount, live)}
+				items={seatMenuItems(seat, isTarget, mount, live, runAttach.state)}
 				onClose={onClose}
 			/>
 		);

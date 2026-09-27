@@ -79,6 +79,7 @@ import {
 	seatSessionRef,
 	UNREPORTED,
 } from '@/shell/companion/seat-model';
+import { useRunAttachedTerminal } from '@/terminal/attach-run';
 import { formatSeatTime } from '@/shell/companion/seat-notice';
 import { seatMenuItems, sessionMenuItems } from '@/shell/companion/seat-rail';
 import { SeatRemoveDialog } from '@/shell/companion/seat-remove-dialog';
@@ -1182,6 +1183,13 @@ function BoardMenu({
 	const target = useShellStore((s) => s.companion.activeTarget);
 	const tabs = useTerminalStore((s) => s.tabs);
 	const row = rows.find((r) => rowKey(r) === menu.key);
+	// WP-69 (§4.4): a persistent-run seat's Open in pane / Pop out attach to
+	// its tmux session, so the rail's menu builder needs the run's attach state.
+	const runAttach = useRunAttachedTerminal(
+		row?.kind === 'seat' && row.seat.session?.kind === 'run'
+			? { runId: row.seat.session.run_id, engineId: row.seat.engine_id }
+			: null
+	);
 	if (!row) return null;
 	const mount = mounts.get(menu.key) ?? { where: 'none' as const };
 	let label: string;
@@ -1192,7 +1200,7 @@ function BoardMenu({
 		const live = tid ? tabs.some((t) => t.id === tid && t.status === 'running') : false;
 		const isTarget = target.kind === 'seat' && target.seat_id === seat.id;
 		label = `Seat actions for @${seat.name}`;
-		items = seatMenuItems(seat, isTarget, mount, live);
+		items = seatMenuItems(seat, isTarget, mount, live, runAttach.state);
 	} else {
 		const isTarget = target.kind === 'session' && target.session_id === row.session.id;
 		label = `Session actions for ${sessionName(row.session.id)}`;

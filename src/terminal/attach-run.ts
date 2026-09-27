@@ -17,20 +17,25 @@
 // terminal: a daemon-backed PTY is invisible to Rust (P-10), so the mount
 // could never be derived. Closing the tab only detaches the tmux client; the
 // run keeps going. A one-off run (no `terminal_session_id`) has nothing to
-// attach to, and callers say "headless run — nothing to show".
+// attach to, and callers say "headless run — nothing to show"; a queued run
+// or one outside the lookup is not called headless (`RunAttachState`).
 
 import { useQuery } from '@tanstack/react-query';
 
-import { queryClient } from '@/lib/query-client';
 import { chiList } from '@/lib/tauri-cmd';
 import { makeTerminalId, openTabPty, type TerminalTab, useTerminalStore } from './session-store';
 
-/** `chi_list`'s own cap; the run is looked up among its engine's rows. */
+/** `chi_list`'s own cap; the run is looked up among its engine's rows.
+ *  There is no by-run-id read that carries `terminal_session_id` today
+ *  (`chi_status` returns only status / output), so a run outside the newest
+ *  rows reads `unknown` — never mislabelled headless. */
 export const RUN_LOOKUP_LIMIT = 200;
 
-/** How long a run's tmux-session lookup stays fresh. The name never changes
- *  once written, but a queued run gets it only once it is spawned. */
+/** How long a settled lookup stays fresh. The name never changes once
+ *  written. */
 const RUN_SESSION_STALE_MS = 15_000;
+/** A queued run gets its tmux session only once it is spawned: re-read. */
+const RUN_PENDING_POLL_MS = 3_000;
 
 export interface RunRef {
 	runId: string;
@@ -38,37 +43,37 @@ export interface RunRef {
 	engineId: string;
 }
 
+/**
+ * What a run offers to attach to:
+ * - `tmux`: a persistent run's tmux session (`chi_cache.terminal_session_id`);
+ * - `headless`: a started one-off run — nothing to show;
+ * - `pending`: queued, not spawned yet, so whether it gets a session isn't
+ *   known;
+ * - `unknown`: the run isn't among its engine's newest cached rows.
+ */
+export type RunAttachState =
+	| { kind: 'tmux'; session: string }
+	| { kind: 'headless' }
+	| { kind: 'pending' }
+	| { kind: 'unknown' };
+
 export function runTerminalSessionKey(run: RunRef) {
 	return ['chi', 'run-terminal-session', run.engineId, run.runId] as const;
 }
 
-/** `chi_cache.terminal_session_id` for a run: the tmux session name, or
- *  `null` for a one-off (non-persistent) run or a run no longer cached. */
-export async function fetchRunTerminalSession(run: RunRef): Promise<string | null> {
+/** Look the run up in `chi_cache` (see {@link RunAttachState}). */
+export async function fetchRunAttachState(run: RunRef): Promise<RunAttachState> {
 	const rows = await chiList(run.engineId, RUN_LOOKUP_LIMIT);
 	const row = rows.find((r) => r.run_id === run.runId);
-	const session = row?.terminal_session_id?.trim();
-	return session ? session : null;
+	if (!row) return { kind: 'unknown' };
+	const session = row.terminal_session_id?.trim();
+	if (session) return { kind: 'tmux', session };
+	return row.status === 'queued' ? { kind: 'pending' } : { kind: 'headless' };
 }
 
-function runSessionQuery(run: RunRef) {
-	return {
-		queryKey: runTerminalSessionKey(run),
-		queryFn: () => fetchRunTerminalSession(run),
-		staleTime: RUN_SESSION_STALE_MS,
-	};
-}
-
-/**
- * The cached tmux session of `run`, read synchronously: a name, `null` (a
- * one-off run), or `undefined` while it isn't known yet — in which case a
- * fetch is started, and a component subscribed through
- * {@link useRunAttachedTerminal} re-renders when it lands.
- */
-export function cachedRunTerminalSession(run: RunRef): string | null | undefined {
-	const data = queryClient.getQueryData<string | null>(runTerminalSessionKey(run));
-	if (data === undefined) void queryClient.prefetchQuery(runSessionQuery(run)).catch(() => {});
-	return data;
+/** The attach terminal's tmux session, when the state has one. */
+export function runSessionOf(state: RunAttachState | undefined): string | null {
+	return state?.kind === 'tmux' ? state.session : null;
 }
 
 /** The argv of a tmux client on `session` (exact-name target). */
@@ -87,25 +92,30 @@ export function findRunAttachTerminal(tabs: readonly TerminalTab[], session: str
 }
 
 /**
- * Subscribe to a run seat's attach state: its tmux session (`undefined`
- * while loading) and the id of a running terminal already attached to it.
- * `run: null` (not a run seat) returns `{ session: null, terminalId: null }`.
+ * Subscribe to a run seat's attach state (`undefined` while loading) and the
+ * id of a running terminal already attached to its tmux session. `run: null`
+ * (not a run seat) returns `{ state: undefined, terminalId: null }`. The one
+ * read of the lookup: menus take `state` from here rather than touching the
+ * cache during render.
  */
 export function useRunAttachedTerminal(run: RunRef | null): {
-	session: string | null | undefined;
+	state: RunAttachState | undefined;
 	terminalId: string | null;
 } {
 	const q = useQuery({
 		queryKey: run ? runTerminalSessionKey(run) : ['chi', 'run-terminal-session', 'none'],
-		queryFn: () => (run ? fetchRunTerminalSession(run) : Promise.resolve(null)),
+		queryFn: (): Promise<RunAttachState> =>
+			run ? fetchRunAttachState(run) : Promise.resolve<RunAttachState>({ kind: 'unknown' }),
 		enabled: run !== null,
 		staleTime: RUN_SESSION_STALE_MS,
+		refetchInterval: (query) => (query.state.data?.kind === 'pending' ? RUN_PENDING_POLL_MS : false),
 	});
-	const session = run ? q.data : null;
+	const state = run ? q.data : undefined;
+	const session = runSessionOf(state);
 	const terminalId = useTerminalStore((s) =>
 		session ? (findRunAttachTerminal(s.tabs, session)?.id ?? null) : null
 	);
-	return { session, terminalId };
+	return { state, terminalId };
 }
 
 /** One attach in flight per session, so a double click spawns one client. */

@@ -64,12 +64,16 @@ vi.mock('@/shell/panes/pane-views', () => ({
 }));
 
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { seatsQueryKey } from '@/lib/queries/seats';
+import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { popOutSurface } from '@/lib/window/window-two';
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useTerminalStore } from '@/terminal/session-store';
 import { Companion } from './companion';
 import { __resetCompanionTimersForTests, useCompanionStore } from './companion-store';
 import { __resetSeatUndoForTests, clearSeat, removeSeat, useSeatUi } from './seat-actions';
+import { handleMakeTargetRequest, handleSurfacesReturned } from './seat-menu';
 import { useSeatNotice } from './seat-notice';
 import { __resetSessionNumbersForTests, sessionNumber } from './seat-sessions';
 
@@ -402,6 +406,9 @@ describe('the seat menu', () => {
 	});
 
 	it('a one-off run seat: Open in pane and Pop out say "headless run — nothing to show"', async () => {
+		// Started, no tmux session: one-off. (A run missing from the lookup, or
+		// still queued, is not called headless.)
+		m.chiList.mockResolvedValue([{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui' }]);
 		await mountRail();
 		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
 		const menu = screen.getByRole('menu');
@@ -447,6 +454,59 @@ describe('the seat menu', () => {
 		fireEvent.click(within(dialog).getByRole('button', { name: 'Keep it' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 		expect(m.seatsRemove).not.toHaveBeenCalled();
+	});
+});
+
+describe('coming back from Window 2 (D-09 moveBack / closeWin2)', () => {
+	beforeEach(() => {
+		queryClient.setQueryData(seatsQueryKey(PROJECT), roster());
+		useDetachedSurfaces.setState({ surfaceToWindow: {} });
+	});
+
+	function leafTabs(): string[] {
+		const root = usePaneStore.getState().root;
+		return root.type === 'leaf' ? root.tabs.map((t) => (t.kind === 'terminal' ? t.sessionId : t.kind)) : [];
+	}
+
+	it('Move back of a terminal a pane still holds re-shows it there — no second tab', () => {
+		handleSurfacesReturned({ label: 'detached-w2', surfaceIds: ['terminal:pty-term-3'], reason: 'move-back' });
+		expect(leafTabs()).toEqual(['term-3']);
+		expect(usePaneStore.getState().focusedId).toBe('L1');
+		expect(useSeatNotice.getState().notice?.message).toBe(
+			'lead moved to main window · pane 1 of 1 — its address is unchanged'
+		);
+	});
+
+	it('an ordinary pane pop-out closing stays silent and adds nothing', () => {
+		handleSurfacesReturned({ label: 'detached-terminal-x', surfaceIds: ['terminal:pty-term-3'], reason: 'window-closed' });
+		expect(leafTabs()).toEqual(['term-3']);
+		expect(useSeatNotice.getState().notice).toBeNull();
+	});
+
+	it('Window 2 closing re-homes only what no pane holds, and counts what came back', async () => {
+		m.windowJoinSurface.mockResolvedValue('detached-w2');
+		await popOutSurface('terminal:pty-term-4', { projectId: PROJECT });
+		useSeatNotice.setState({ notice: null });
+		handleSurfacesReturned({
+			label: 'detached-w2',
+			surfaceIds: ['terminal:pty-term-3', 'terminal:pty-term-4'],
+			reason: 'window-closed',
+		});
+		expect(leafTabs()).toEqual(['term-3', 'term-4']);
+		expect(useSeatNotice.getState().notice?.message).toBe(
+			'Window 2 closed — 2 panes returned to the main window; addresses unchanged'
+		);
+	});
+
+	it('Window 2 ⋯ → Make dispatch target selects the surface’s seat', () => {
+		handleMakeTargetRequest('terminal:pty-term-3');
+		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
+	});
+
+	it('… or the session itself when it has no seat', () => {
+		handleMakeTargetRequest('terminal:pty-term-4');
+		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'session', session_id: 'term-4' });
 	});
 });
 
