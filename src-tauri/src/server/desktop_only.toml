@@ -97,29 +97,9 @@ reason = "sqlx DELETE of a section row; no spawn."
 tag = "WP-19"
 reason = "sqlx UPDATE of a section row; no spawn."
 
-[agent_ops_delete_job]
-tag = "WP-19"
-reason = "Removes a job entry from config file; no spawn."
-
-[agent_ops_list_jobs]
-tag = "WP-19"
-reason = "Reads config file + daemon runtime state file, merges; pure read, no spawn."
-
 [agent_ops_run_now]
-tag = "WP-19"
-reason = "HTTP POST to already-running agent-ops daemon's localhost trigger endpoint; no process spawn."
-
-[agent_ops_set_enabled]
-tag = "WP-19"
-reason = "Atomic rewrite of project-scoped jobs JSON config file; no spawn."
-
-[agent_ops_tail_run]
-tag = "WP-19"
-reason = "Reads a per-run tail file by byte offset; no spawn."
-
-[agent_ops_upsert_job]
-tag = "WP-19"
-reason = "Writes a job entry into project-scoped config file; no spawn."
+tag = "WP-18b"
+reason = "POSTs the {port, secret} from ~/.agent-ops/daemon.lock to a SEPARATE local agent-ops daemon's /jobs/<id>/trigger endpoint, which then runs the job (a shell command or `claude -p`) outside the session executor; serving it would let any token holder fire host jobs remotely. Held until executor routing + principal scoping (WP-20) decide who may."
 
 [app_lock_clear_secret]
 tag = "WP-20"
@@ -181,10 +161,6 @@ reason = "Phase 0.5 debug harness pinging the primary native webview window via 
 tag = "WP-18b"
 reason = "Kills the chi engine child (child.start_kill()) and/or the detached chi-runner process group by pid — controls the chi_run spawns (both executor-routed since WP-18b); rpc.rs arm still pending."
 
-[chi_list]
-tag = "WP-19"
-reason = "Reads db cache merged with claude_list_sessions; no spawn."
-
 [chi_resume]
 tag = "WP-18b"
 reason = "resume_chi_run re-spawns the engine child through the same executor-routed path as chi_run (build_engine_command SpawnSpec -> executor::current().spawn_piped); rpc.rs arm still pending."
@@ -192,10 +168,6 @@ reason = "resume_chi_run re-spawns the engine child through the same executor-ro
 [chi_run]
 tag = "WP-18b"
 reason = "spawn_chi_run spawns the in-process engine child via executor::current().spawn_piped (build_engine_command -> SpawnSpec), or for persistent runs a detached chi-runner (PipedOpts::detached); executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[chi_status]
-tag = "WP-19"
-reason = "Reads cached run row from db + output file; no spawn or process control."
 
 [claude_asset_list_pins]
 tag = "WP-19"
@@ -471,7 +443,7 @@ reason = "Pure std::fs::read_dir scan of ~/.claude/projects/*.jsonl; no spawn."
 
 [ngwa_snapshot]
 tag = "WP-19"
-reason = "Aggregates kernel status, PaDb, claude_config and trust reads (ngwa_snapshot_inner); explicitly the \"ngwa\" WP-19 bucket, no spawn."
+reason = "ngwa_snapshot_inner needs the live pkg kernel: kernel.status() (registries, sidecars, installed set) and trust evaluation of each installed pkg against app_data_dir, plus a ~/.claude/projects usage scan. The daemon has no kernel, only the read-only --pkgs-dir PkgIndex, so it has no honest snapshot to return."
 
 [notifications_list]
 tag = "WP-19"
@@ -572,10 +544,6 @@ reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same
 [os_shortcuts_apply]
 tag = "desktop-only-forever"
 reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
-
-[os_username]
-tag = "WP-19"
-reason = "std::env::var(\"USER\"/\"USERNAME\") read only; identity fallback bucket, no spawn."
 
 [pa_actions_commit]
 tag = "WP-19"
@@ -727,23 +695,23 @@ reason = "kernel.resume_after_review -> register(); SidecarSupervisor then spawn
 
 [pkg_trust_grant]
 tag = "WP-19"
-reason = "trust::grant is a DB row write only (no kernel registry re-register), no spawn."
+reason = "Resolves the pkg via kernel.installed_summary() and reloads its installed manifest to pin the granted version; the daemon has no kernel install registry (its --pkgs-dir index installs nothing), so there is no installed manifest to grant against."
 
 [pkg_trust_list]
 tag = "WP-19"
-reason = "Reads kernel.list_installed() + trust::evaluate (DB reads); no registry/spawn side effects."
+reason = "Walks kernel.list_installed() and evaluates each pkg against its trust row + app_data_dir; the daemon has no kernel install registry, so it would answer an empty list that reads as \"nothing needs trust\"."
 
 [pkg_trust_list_pending]
 tag = "WP-19"
-reason = "Daemon has no trust machinery; every FE call site catches the error (the review modal shows it, the rest swallow it)."
+reason = "Walks kernel.list_installed() + cap_snapshot rows for capability diffs parked for review; the daemon has no kernel install registry or install-time trust gate, so there is nothing to park. Every FE call site catches the error."
 
 [pkg_trust_preview]
 tag = "WP-19"
-reason = "Reloads manifest + summarize_sensitive; pure read, no spawn."
+reason = "Resolves the pkg via kernel.installed_summary() and summarizes its installed manifest's sensitive perms; the daemon has no kernel install registry, so every call would be \"not installed\"."
 
 [pkg_trust_preview_incoming]
 tag = "WP-19"
-reason = "Diffs incoming manifest capabilities against stored snapshot; pure read/parse, no spawn."
+reason = "Diffs an incoming manifest against the cap_snapshot row, falling back to kernel.installed_summary()'s manifest; only meaningful to the kernel install flow that parks a changed pkg, which the daemon (no kernel, installs nothing) does not have."
 
 [pkg_trust_reject]
 tag = "WP-18b"
@@ -751,7 +719,7 @@ reason = "kernel.uninstall() unregisters every registry, tearing down SidecarSup
 
 [pkg_trust_revoke]
 tag = "WP-19"
-reason = "trust::revoke is a plain DB row write, no registry/spawn interaction."
+reason = "Deletes the pkg_trust row that only the desktop's trust::evaluate reads (elevated-verb gating via resolve_elevated_trust, pkg_mcp, the trust list) — all of which need the kernel's installed set; the daemon has no kernel or trust evaluation, so serving it would write state nothing on the daemon consults. Held with the pkg_trust family until the daemon has a trust model."
 
 [pkg_uninstall]
 tag = "WP-18b"

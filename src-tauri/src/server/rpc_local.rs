@@ -1,6 +1,7 @@
-//! `/api/rpc` bodies for the local-state commands served in WP-19 slice 2:
-//! Supabase config, env-backed secret names, settings, data health, backup
-//! list/delete and pkg settings.
+//! `/api/rpc` bodies for the local-state commands served in WP-19 slice 2
+//! (Supabase config, env-backed secret names, settings, data health, backup
+//! list/delete and pkg settings) and slice 3 (the chi run-cache reads, the
+//! agent-ops job files, the OS-username fallback).
 //!
 //! The arm *names* stay in `rpc.rs`'s dispatch `match` (the parity ratchet
 //! reads them there); the arms delegate here. Every body calls the same core
@@ -28,8 +29,11 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use super::rpc::RpcResponse;
+use super::shared::chi::OutputFiles;
 use super::shared::settings::{SettingsManager, SettingsScope};
-use super::shared::{backups, data_health, supabase_config};
+use super::shared::{
+    agent_ops, backups, chi, chi_liveness, data_health, identity, supabase_config,
+};
 use super::AppState;
 use crate::db::PaDb;
 
@@ -71,6 +75,33 @@ fn opt_bool(args: &Value, names: &[&str]) -> Result<Option<bool>, String> {
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(format!("`{}` must be a boolean", names[0])),
     }
+}
+
+/// An optional integer argument (Tauri's `Option<i64>`): a JSON float or a
+/// string is a caller error, not a silent default.
+fn opt_i64(args: &Value, names: &[&str]) -> Result<Option<i64>, String> {
+    match arg(args, names) {
+        None => Ok(None),
+        Some(v) => v
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("`{}` must be an integer", names[0])),
+    }
+}
+
+/// An optional non-negative integer argument (Tauri's `Option<u64>`).
+fn opt_u64(args: &Value, names: &[&str]) -> Result<Option<u64>, String> {
+    match arg(args, names) {
+        None => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("`{}` must be a non-negative integer", names[0])),
+    }
+}
+
+fn req_bool(args: &Value, names: &[&str]) -> Result<bool, String> {
+    opt_bool(args, names)?.ok_or_else(|| format!("`{}` is required", names[0]))
 }
 
 /// `Ok(v)` → success with `v`'s JSON; `Err(e)` → `"<cmd>: <e>"`.
@@ -293,6 +324,123 @@ pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcRespo
     }
     .await;
     respond("pkg_settings_get", r)
+}
+
+// ─── Chi run cache (reads) ───────────────────────────────────────────────────
+//
+// Only the reads are served. `chi_run` / `chi_resume` / `chi_cancel` spawn or
+// signal engine processes outside the session executor (WP-18b), so this
+// daemon never starts a chi run: its `chi_cache` is normally empty and these
+// answer that honestly — an empty list, or the desktop's "chi run not found".
+
+/// `<data-dir>/chi-cache`, mirroring the desktop's `<app_data_dir>/chi-cache`.
+fn chi_cache_dir(state: &AppState) -> Result<PathBuf, String> {
+    Ok(data_dir(state, super::rpc::NO_DB)?.join(chi::CACHE_DIR))
+}
+
+/// The desktop's read: row + output file + detached-run liveness decision,
+/// nothing written (the reconciliation sweep that persists a detached run's
+/// end is desktop-only). Output files are confined to the cache dir here —
+/// see [`OutputFiles::InCacheDir`].
+pub(super) async fn chi_status(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let run_id = req_str(args, &["runId", "run_id"])?;
+        let db = pa_db(state)?;
+        let cache_dir = chi_cache_dir(state)?;
+        chi::status(
+            db,
+            &cache_dir,
+            &run_id,
+            &chi_liveness::probe_runner,
+            OutputFiles::InCacheDir,
+        )
+        .await
+    }
+    .await;
+    respond("chi_status", r)
+}
+
+/// The daemon's `chi_cache` rows. The desktop additionally merges Claude's
+/// JSONL sessions from `~/.claude/projects`; that source
+/// (`claude_list_sessions`) is not served yet, so it is not merged here —
+/// see `shared::chi::list`.
+pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let engine_id = opt_str(args, &["engineId", "engine_id"])?;
+        let limit = opt_i64(args, &["limit"])?;
+        chi::list(pa_db(state)?, engine_id.as_deref(), limit).await
+    }
+    .await;
+    respond("chi_list", r)
+}
+
+// ─── agent-ops job files ─────────────────────────────────────────────────────
+//
+// Rooted at `state.home` — the router's home seam, the daemon PROCESS's home
+// in production. Single-user seam (G-PRINCIPAL / WP-20): every token holder
+// manages the same `~/.atelier/skill-agent-ops/jobs.json`; under T1 this must
+// be the calling principal's home. Each core resolves `{ ok, ... }` exactly
+// as the desktop command does (a missing home is its `io_error`), so these
+// are RPC successes carrying that value. `agent_ops_run_now` is not served
+// (see `desktop_only.toml`).
+
+pub(super) async fn agent_ops_list_jobs(state: &AppState) -> RpcResponse {
+    respond(
+        "agent_ops_list_jobs",
+        agent_ops::list_jobs(state.home.as_deref()).await,
+    )
+}
+
+pub(super) async fn agent_ops_tail_run(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let job_id = req_str(args, &["jobId", "job_id"])?;
+        let offset = opt_u64(args, &["offset"])?;
+        agent_ops::tail_run(state.home.as_deref(), job_id, offset).await
+    }
+    .await;
+    respond("agent_ops_tail_run", r)
+}
+
+pub(super) async fn agent_ops_upsert_job(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        // Tauri's `job: Value` takes whatever is sent, JSON null included;
+        // the core's own validation answers a bad one.
+        let job = args
+            .get("job")
+            .cloned()
+            .ok_or_else(|| "`job` is required".to_string())?;
+        agent_ops::upsert_job(state.home.as_deref(), job).await
+    }
+    .await;
+    respond("agent_ops_upsert_job", r)
+}
+
+pub(super) async fn agent_ops_delete_job(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let job_id = req_str(args, &["jobId", "job_id"])?;
+        agent_ops::delete_job(state.home.as_deref(), job_id).await
+    }
+    .await;
+    respond("agent_ops_delete_job", r)
+}
+
+pub(super) async fn agent_ops_set_enabled(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let job_id = req_str(args, &["jobId", "job_id"])?;
+        let enabled = req_bool(args, &["enabled"])?;
+        agent_ops::set_enabled(state.home.as_deref(), job_id, enabled).await
+    }
+    .await;
+    respond("agent_ops_set_enabled", r)
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+/// The daemon PROCESS's OS user (the desktop's function, unchanged).
+/// Single-user seam (G-PRINCIPAL / WP-20): under T1 it must be the calling
+/// principal's username, not the daemon's.
+pub(super) fn os_username() -> RpcResponse {
+    RpcResponse::success(identity::os_username())
 }
 
 #[cfg(test)]
@@ -958,5 +1106,606 @@ mod tests {
         let r = bare(None);
         let e = err(&r, "pkg_settings_get", json!({ "pkgId": id })).await;
         assert!(e.contains("--data-dir"), "{e}");
+    }
+
+    // ── Slice 3: chi reads, agent-ops files, identity ───────────────────────
+
+    mod slice3 {
+        use super::*;
+        use crate::server::shared::chi::{self, OutputFiles};
+        use crate::server::shared::chi_liveness::{probe_runner, RUNNER_EXITED_ERROR};
+        use crate::server::shared::identity;
+
+        // ── chi ──────────────────────────────────────────────────────────────
+
+        struct ChiRow<'a> {
+            run_id: &'a str,
+            engine: &'a str,
+            status: &'a str,
+            brief: &'a str,
+            output_path: Option<&'a str>,
+            pid: Option<i64>,
+            last_seen: &'a str,
+        }
+
+        async fn seed_chi(db: &PaDb, row: ChiRow<'_>) {
+            let pool = db.ensure_pool().await.unwrap();
+            sqlx::query(
+                "INSERT INTO chi_cache (
+                    run_id, engine_id, brief, status, output_path, output_truncated,
+                    owner, pid, started_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, 0, 'cli', ?, ?, ?)",
+            )
+            .bind(row.run_id)
+            .bind(row.engine)
+            .bind(row.brief)
+            .bind(row.status)
+            .bind(row.output_path)
+            .bind(row.pid)
+            .bind(row.last_seen)
+            .bind(row.last_seen)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        /// `(status, last_seen_at, ended_at, error)` straight from the table.
+        async fn raw_row(
+            db: &PaDb,
+            run_id: &str,
+        ) -> (String, String, Option<String>, Option<String>) {
+            use sqlx::Row;
+            let pool = db.ensure_pool().await.unwrap();
+            let r = sqlx::query(
+                "SELECT status, last_seen_at, ended_at, error FROM chi_cache WHERE run_id = ?",
+            )
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            (
+                r.get("status"),
+                r.get("last_seen_at"),
+                r.get("ended_at"),
+                r.get("error"),
+            )
+        }
+
+        /// A pid that is certainly not a live chi-runner: a child spawned and
+        /// reaped here. Should the kernel hand the number on, its new holder
+        /// is not `chi-runner`, which the probe reads as `Foreign` — not
+        /// alive — so the verdict is the same.
+        #[cfg(unix)]
+        fn dead_pid() -> i64 {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            i64::from(pid)
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn chi_status_reads_detached_liveness_without_writing() {
+            let d = daemon();
+            let r = &d.router;
+            let cache_dir = d.data.join(chi::CACHE_DIR);
+            std::fs::create_dir_all(&cache_dir).unwrap();
+
+            // Detached, runner gone, status file says done → `done`.
+            let done_file =
+                r#"{"output":"all good","done_at":"t","status":"done","external_id":"sess-1"}"#;
+            std::fs::write(cache_dir.join("r-done.json"), done_file).unwrap();
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-done",
+                    engine: "claude-code",
+                    status: "running",
+                    brief: "the brief",
+                    output_path: Some("r-done.json"), // relative → the cache dir
+                    pid: Some(dead_pid()),
+                    last_seen: "2026-01-01T00:00:00Z",
+                },
+            )
+            .await;
+            // Detached, runner gone, file never reached a terminal status.
+            let crashed_file = r#"{"output":"partial","status":"running"}"#;
+            let crashed_path = cache_dir.join("r-crashed.json");
+            std::fs::write(&crashed_path, crashed_file).unwrap();
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-crashed",
+                    engine: "claude-code",
+                    status: "running",
+                    brief: "b",
+                    output_path: Some(crashed_path.to_str().unwrap()), // absolute, inside
+                    pid: Some(dead_pid()),
+                    last_seen: "2026-01-02T00:00:00Z",
+                },
+            )
+            .await;
+            // In-process run, finished: no pid, row status as stored.
+            std::fs::write(
+                cache_dir.join("r-inproc.json"),
+                r#"{"output":"x","error":"boom","done_at":"t"}"#,
+            )
+            .unwrap();
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-inproc",
+                    engine: "codex",
+                    status: "failed",
+                    brief: "b",
+                    output_path: Some("r-inproc.json"),
+                    pid: None,
+                    last_seen: "2026-01-03T00:00:00Z",
+                },
+            )
+            .await;
+            // No output file at all → the brief stands in, as on desktop.
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-queued",
+                    engine: "codex",
+                    status: "queued",
+                    brief: "just the brief",
+                    output_path: Some("r-queued.json"),
+                    pid: None,
+                    last_seen: "2026-01-04T00:00:00Z",
+                },
+            )
+            .await;
+
+            let before = raw_row(&d.db, "r-done").await;
+
+            let got = ok(r, "chi_status", json!({ "runId": "r-done" })).await;
+            assert_eq!(
+                got,
+                json!({
+                    "run_id": "r-done",
+                    "status": "done",
+                    "output": "all good",
+                    "output_truncated": false,
+                    "error": null,
+                })
+            );
+            // snake_case spelling reads the same.
+            assert_eq!(
+                ok(r, "chi_status", json!({ "run_id": "r-done" })).await,
+                got
+            );
+            // Same JSON as the core the desktop command calls.
+            let direct = chi::status(
+                &d.db,
+                &cache_dir,
+                "r-done",
+                &probe_runner,
+                OutputFiles::AsStored,
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, serde_json::to_value(direct).unwrap());
+
+            let crashed = ok(r, "chi_status", json!({ "runId": "r-crashed" })).await;
+            assert_eq!(crashed["status"], "failed");
+            assert_eq!(crashed["error"], RUNNER_EXITED_ERROR);
+            assert_eq!(crashed["output"], "partial");
+
+            let inproc = ok(r, "chi_status", json!({ "runId": "r-inproc" })).await;
+            assert_eq!(inproc["status"], "failed");
+            assert_eq!(inproc["output"], "x");
+            assert_eq!(inproc["error"], "boom");
+
+            let queued = ok(r, "chi_status", json!({ "runId": "r-queued" })).await;
+            assert_eq!(queued["status"], "queued");
+            assert_eq!(queued["output"], "just the brief");
+
+            // A read, not the sweep: nothing was written back.
+            assert_eq!(raw_row(&d.db, "r-done").await, before);
+            let (status, _, ended, error) = raw_row(&d.db, "r-crashed").await;
+            assert_eq!((status.as_str(), ended, error), ("running", None, None));
+            assert_eq!(
+                std::fs::read_to_string(cache_dir.join("r-done.json")).unwrap(),
+                done_file
+            );
+            assert_eq!(
+                std::fs::read_to_string(&crashed_path).unwrap(),
+                crashed_file
+            );
+        }
+
+        #[tokio::test]
+        async fn chi_status_errors_like_the_desktop_and_names_what_is_missing() {
+            let d = daemon();
+            let r = &d.router;
+
+            // Unknown run: the desktop's error, verbatim after the prefix.
+            let e = err(r, "chi_status", json!({ "runId": "nope" })).await;
+            assert_eq!(e, "chi_status: chi run not found: nope");
+
+            let e = err(r, "chi_status", json!({})).await;
+            assert!(e.contains("`runId` is required"), "{e}");
+
+            // An output_path pointing outside the cache dir is refused, not
+            // read (it would bypass the fs_roots allowlist).
+            let outside = d.root.join("outside.json");
+            std::fs::write(&outside, r#"{"output":"secret"}"#).unwrap();
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-escape",
+                    engine: "codex",
+                    status: "done",
+                    brief: "b",
+                    output_path: Some(outside.to_str().unwrap()),
+                    pid: None,
+                    last_seen: "2026-01-01T00:00:00Z",
+                },
+            )
+            .await;
+            let e = err(r, "chi_status", json!({ "runId": "r-escape" })).await;
+            assert!(e.contains("outside the chi cache dir"), "{e}");
+            assert!(!e.contains("secret"), "{e}");
+            // ...and so is a relative one that climbs out.
+            seed_chi(
+                &d.db,
+                ChiRow {
+                    run_id: "r-climb",
+                    engine: "codex",
+                    status: "done",
+                    brief: "b",
+                    output_path: Some("../../outside.json"),
+                    pid: None,
+                    last_seen: "2026-01-01T00:00:00Z",
+                },
+            )
+            .await;
+            std::fs::create_dir_all(d.data.join(chi::CACHE_DIR)).unwrap();
+            let e = err(r, "chi_status", json!({ "runId": "r-climb" })).await;
+            assert!(e.contains("outside the chi cache dir"), "{e}");
+
+            // No --data-dir: the flag is named, nothing is guessed.
+            let r = bare(Some(d.home.clone()));
+            let e = err(&r, "chi_status", json!({ "runId": "r-escape" })).await;
+            assert!(e.contains("--data-dir"), "{e}");
+            let e = err(&r, "chi_list", json!({})).await;
+            assert!(e.contains("--data-dir"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn chi_list_serves_the_cache_rows_in_the_desktop_shape() {
+            let d = daemon();
+            let r = &d.router;
+
+            // A daemon never starts chi runs: honest and empty.
+            assert_eq!(ok(r, "chi_list", json!({})).await, json!([]));
+
+            for (id, engine, seen) in [
+                ("a", "claude-code", "2026-01-01T00:00:00Z"),
+                ("b", "codex", "2026-01-03T00:00:00Z"),
+                ("c", "claude-code", "2026-01-02T00:00:00Z"),
+            ] {
+                seed_chi(
+                    &d.db,
+                    ChiRow {
+                        run_id: id,
+                        engine,
+                        status: "done",
+                        brief: "b",
+                        output_path: None,
+                        pid: None,
+                        last_seen: seen,
+                    },
+                )
+                .await;
+            }
+            let ids = |v: &Value| -> Vec<String> {
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["run_id"].as_str().unwrap().to_string())
+                    .collect()
+            };
+
+            let all = ok(r, "chi_list", json!({})).await;
+            assert_eq!(ids(&all), ["b", "c", "a"]);
+            let direct = chi::list(&d.db, None, None).await.unwrap();
+            assert_eq!(all, serde_json::to_value(direct).unwrap());
+            // Every `ChiCacheRow` field, snake_case, as the desktop serializes.
+            let mut keys: Vec<_> = all[0].as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                [
+                    "artifacts",
+                    "brief",
+                    "cwd",
+                    "ended_at",
+                    "engine_id",
+                    "error",
+                    "expires_at",
+                    "external_id",
+                    "last_seen_at",
+                    "mode",
+                    "model",
+                    "output_path",
+                    "output_truncated",
+                    "owner",
+                    "parent_id",
+                    "pid",
+                    "run_id",
+                    "started_at",
+                    "status",
+                ]
+            );
+
+            let claude = ok(r, "chi_list", json!({ "engineId": "claude-code" })).await;
+            assert_eq!(ids(&claude), ["c", "a"]);
+            let snake = ok(r, "chi_list", json!({ "engine_id": "claude-code" })).await;
+            assert_eq!(snake, claude);
+            let one = ok(r, "chi_list", json!({ "limit": 1 })).await;
+            assert_eq!(ids(&one), ["b"]);
+            // Clamped to 1..=200 like the desktop, not an error.
+            let zero = ok(r, "chi_list", json!({ "limit": 0 })).await;
+            assert_eq!(ids(&zero), ["b"]);
+
+            let e = err(r, "chi_list", json!({ "limit": "3" })).await;
+            assert!(e.contains("`limit` must be an integer"), "{e}");
+        }
+
+        // ── agent-ops ────────────────────────────────────────────────────────
+
+        fn jobs_file(home: &Path) -> PathBuf {
+            home.join(".atelier/skill-agent-ops/jobs.json")
+        }
+
+        fn runs_dir(home: &Path) -> PathBuf {
+            home.join(".agent-ops/runs")
+        }
+
+        #[tokio::test]
+        async fn agent_ops_jobs_round_trip_under_the_router_home() {
+            let d = daemon();
+            let r = &d.router;
+            let file = jobs_file(&d.home);
+
+            // No config yet: the desktop's io_error value, as a success.
+            let none = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(none["ok"], false);
+            assert_eq!(none["code"], "io_error");
+
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, r#"{ "jobs": [] }"#).unwrap();
+
+            let job = json!({
+                "id": "ns:nightly",
+                "label": "Nightly",
+                "schedule": "0 3 * * *",
+                "command": "echo hi",
+                "mode": "script",
+            });
+            let up = ok(r, "agent_ops_upsert_job", json!({ "job": job })).await;
+            assert_eq!(
+                up,
+                json!({ "ok": true, "jobId": "ns:nightly", "created": true })
+            );
+            let again = ok(r, "agent_ops_upsert_job", json!({ "job": job })).await;
+            assert_eq!(again["created"], false);
+
+            let listed = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(listed["ok"], true);
+            assert_eq!(listed["daemon_up"], false);
+            assert_eq!(listed["daemon_pid"], Value::Null);
+            let jobs = listed["jobs"].as_array().unwrap();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0]["id"], "ns:nightly");
+            assert_eq!(jobs[0]["schedule_dialect"], "5f");
+            assert_eq!(jobs[0]["enabled"], true);
+            // Same value the core (and so the desktop command) produces.
+            let direct = crate::server::shared::agent_ops::list_jobs(Some(&d.home))
+                .await
+                .unwrap();
+            assert_eq!(listed, direct);
+
+            // Both spellings of the id.
+            let off = ok(
+                r,
+                "agent_ops_set_enabled",
+                json!({ "jobId": "ns:nightly", "enabled": false }),
+            )
+            .await;
+            assert_eq!(
+                off,
+                json!({ "ok": true, "jobId": "ns:nightly", "enabled": false })
+            );
+            let listed = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(listed["jobs"][0]["enabled"], false);
+            let on = ok(
+                r,
+                "agent_ops_set_enabled",
+                json!({ "job_id": "ns:nightly", "enabled": true }),
+            )
+            .await;
+            assert_eq!(on["enabled"], true);
+            let missing = ok(
+                r,
+                "agent_ops_set_enabled",
+                json!({ "jobId": "nope", "enabled": true }),
+            )
+            .await;
+            assert_eq!(missing["code"], "not_found");
+            let e = err(r, "agent_ops_set_enabled", json!({ "jobId": "ns:nightly" })).await;
+            assert!(e.contains("`enabled` is required"), "{e}");
+
+            let del = ok(r, "agent_ops_delete_job", json!({ "job_id": "ns:nightly" })).await;
+            assert_eq!(del, json!({ "ok": true, "jobId": "ns:nightly" }));
+            let del = ok(r, "agent_ops_delete_job", json!({ "jobId": "ns:nightly" })).await;
+            assert_eq!(del["code"], "not_found");
+
+            // The `{ jobs: [...] }` shape survived every rewrite.
+            let on_disk: Value =
+                serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            assert_eq!(on_disk, json!({ "jobs": [] }));
+
+            // Validation errors come back as the core's value.
+            let bad = ok(r, "agent_ops_upsert_job", json!({ "job": { "id": "x" } })).await;
+            assert_eq!(bad["ok"], false);
+            let e = err(r, "agent_ops_upsert_job", json!({})).await;
+            assert!(e.contains("`job` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn agent_ops_tail_run_reads_by_offset_and_refuses_escapes() {
+            let d = daemon();
+            let r = &d.router;
+            let runs = runs_dir(&d.home);
+            std::fs::create_dir_all(&runs).unwrap();
+            let tail = runs.join("ns-nightly.1.tail");
+            std::fs::write(&tail, "hello world").unwrap();
+            std::fs::write(
+                runs.join("ns-nightly.marker.json"),
+                json!({
+                    "status": "done",
+                    "startedAtMs": 1,
+                    "mode": "script",
+                    "tailPath": tail.to_str().unwrap(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let all = ok(r, "agent_ops_tail_run", json!({ "jobId": "ns:nightly" })).await;
+            assert_eq!(
+                all,
+                json!({
+                    "ok": true,
+                    "running": false,
+                    "status": "done",
+                    "startedAtMs": 1,
+                    "mode": "script",
+                    "chunk": "hello world",
+                    "nextOffset": 11,
+                    "eof": true,
+                })
+            );
+            let tail_end = ok(
+                r,
+                "agent_ops_tail_run",
+                json!({ "jobId": "ns:nightly", "offset": 6 }),
+            )
+            .await;
+            assert_eq!(tail_end["chunk"], "world");
+            assert_eq!(tail_end["nextOffset"], 11);
+            let snake = ok(
+                r,
+                "agent_ops_tail_run",
+                json!({ "job_id": "ns:nightly", "offset": 6 }),
+            )
+            .await;
+            assert_eq!(snake, tail_end);
+            // Past EOF: empty, the offset held.
+            let past = ok(
+                r,
+                "agent_ops_tail_run",
+                json!({ "jobId": "ns:nightly", "offset": 100 }),
+            )
+            .await;
+            assert_eq!(
+                (past["chunk"].as_str(), past["nextOffset"].as_u64()),
+                (Some(""), Some(100))
+            );
+            // No run on disk for this job: ok, empty, nulls.
+            let never = ok(r, "agent_ops_tail_run", json!({ "jobId": "other" })).await;
+            assert_eq!(
+                (never["ok"].as_bool(), never["status"].is_null()),
+                (Some(true), true)
+            );
+
+            // A marker planted OUTSIDE the runs dir must not be reachable via
+            // the job id — the shared core refuses the id itself.
+            std::fs::write(
+                d.home.join(".agent-ops/evil.marker.json"),
+                json!({ "status": "running", "startedAtMs": 7, "mode": "agent" }).to_string(),
+            )
+            .unwrap();
+            let abs = d.home.join(".agent-ops/evil");
+            for bad in [
+                "../evil",
+                "../../.agent-ops/evil",
+                abs.to_str().unwrap(),
+                "a/b",
+                "..\\evil",
+                "",
+            ] {
+                let got = ok(r, "agent_ops_tail_run", json!({ "jobId": bad })).await;
+                assert_eq!(
+                    got,
+                    json!({
+                        "ok": false,
+                        "code": "io_error",
+                        "status": null,
+                        "error": "job id escapes the runs directory",
+                    }),
+                    "job id {bad:?}"
+                );
+            }
+
+            // A marker whose tailPath escapes is refused too (pre-existing check).
+            let secret = d.home.join("secret.txt");
+            std::fs::write(&secret, "do not read").unwrap();
+            std::fs::write(
+                runs.join("leak.marker.json"),
+                json!({ "status": "done", "mode": "script", "tailPath": secret.to_str().unwrap() })
+                    .to_string(),
+            )
+            .unwrap();
+            let leak = ok(r, "agent_ops_tail_run", json!({ "jobId": "leak" })).await;
+            assert_eq!(leak["code"], "io_error");
+            assert_eq!(leak["error"], "tail path escapes the runs directory");
+
+            let e = err(r, "agent_ops_tail_run", json!({})).await;
+            assert!(e.contains("`jobId` is required"), "{e}");
+            let e = err(
+                r,
+                "agent_ops_tail_run",
+                json!({ "jobId": "ns:nightly", "offset": -1 }),
+            )
+            .await;
+            assert!(e.contains("`offset` must be a non-negative integer"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn agent_ops_without_a_home_answer_the_desktop_io_error() {
+            let r = bare(None);
+            let home_missing = json!({
+                "ok": false,
+                "code": "io_error",
+                "status": null,
+                "error": "home directory not found",
+            });
+            assert_eq!(ok(&r, "agent_ops_list_jobs", json!({})).await, home_missing);
+            assert_eq!(
+                ok(&r, "agent_ops_tail_run", json!({ "jobId": "x" })).await,
+                home_missing
+            );
+            assert_eq!(
+                ok(&r, "agent_ops_delete_job", json!({ "jobId": "x" })).await,
+                home_missing
+            );
+        }
+
+        // ── identity ─────────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn os_username_is_the_daemon_process_user() {
+            let r = bare(None);
+            let got = ok(&r, "os_username", json!({})).await;
+            let name = got.as_str().expect("a string");
+            assert!(!name.is_empty());
+            assert_eq!(name, identity::os_username());
+        }
     }
 }

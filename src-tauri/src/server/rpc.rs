@@ -623,6 +623,23 @@ pub async fn rpc_handler(
         "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
         "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
+        // --- Chi reads, agent-ops files, identity (WP-19 slice 3) ---
+        //
+        // Also bodies in `server::rpc_local`, over `server::shared::{chi,
+        // agent_ops, identity}` — the cores the desktop commands call. The chi
+        // reads need `--data-dir`; the agent-ops arms resolve the router's home
+        // (single-user seam, G-PRINCIPAL / WP-20). Everything that spawns
+        // (`chi_run` / `chi_resume` / `chi_cancel`, `agent_ops_run_now`) stays
+        // desktop-only.
+        "chi_status" => rpc_local::chi_status(&state, &payload.args).await,
+        "chi_list" => rpc_local::chi_list(&state, &payload.args).await,
+        "agent_ops_list_jobs" => rpc_local::agent_ops_list_jobs(&state).await,
+        "agent_ops_tail_run" => rpc_local::agent_ops_tail_run(&state, &payload.args).await,
+        "agent_ops_upsert_job" => rpc_local::agent_ops_upsert_job(&state, &payload.args).await,
+        "agent_ops_delete_job" => rpc_local::agent_ops_delete_job(&state, &payload.args).await,
+        "agent_ops_set_enabled" => rpc_local::agent_ops_set_enabled(&state, &payload.args).await,
+        "os_username" => rpc_local::os_username(),
+
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");
