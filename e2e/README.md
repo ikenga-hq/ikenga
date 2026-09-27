@@ -78,6 +78,7 @@ bundler alias is involved.
   `responses: { cmd: value }`. To make a command reject, use `{ __error: 'msg' }`.
   To answer by one argument's value, use
   `{ __byArg: { key: 'projectId', values: { 'royalti-co': [...] }, fallback: [] } }`.
+  A non-string argument matches by its JSON (SQLite's `values`: `'["terminal.tabs"]'`).
 - Commands with no canned answer resolve to `null` and are recorded.
   `unmockedCommands(page)` lists them, and the smoke spec attaches that list as
   a test annotation.
@@ -107,11 +108,16 @@ bundler alias is involved.
   `-dispatch`, `-rest`) in dark and light, Remove / Clear with their Undo
   (G-102), roving focus, the per-project roster (DEC-68), every `seat:`
   literal against `seat:<project>/<name>` (G-95), the G-93 status-bar nit, and
-  the D-05 local states (`profile`, `devices`, `locked`). The host is
+  the D-05 local states (`profile`, `devices`, `locked`) plus the app
+  lock's idle / Lock now / PIN-unlock behaviour. The host is
   `seatResponses()` from the mock: project `royalti-co` with D-09's four
-  seats. `popout` needs a live PTY and a second OS window, so it is a vitest
-  check (`src/shell/companion/seat-rail.test.tsx`). Light mode is seeded
-  through the theme store's `ikenga.theme` localStorage copy. Set
+  seats, an unlocked app lock and the OS user. `popout` adds
+  `seatTerminalResponses()` (the seats' terminals, rehydrated from the
+  mocked SQLite row `terminal.tabs` and reattached to their PTYs) and pops
+  @review out from its menu; Window 2 itself is a second OS window, which
+  browser mode doesn't draw. `setMockResponse(page, cmd, value)` changes an
+  answer mid-test (the host's state moving under the page). Light mode is
+  seeded through the theme store's `ikenga.theme` localStorage copy. Set
   `IKENGA_E2E_SHOTS=<dir>` to keep the per-state screenshots for a design
   sweep.
 

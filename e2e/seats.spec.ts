@@ -11,15 +11,21 @@
 //             the canonical scratchpad preview; Esc cancels
 //   vacant    @docs: Resume / Fill / Clear, in that order; Clear keeps the
 //             pad and is undoable
-//   popout    covered in vitest (`seat-rail.test.tsx`): a real Pop out needs
-//             a live PTY and a second OS window, which browser mode has not
+//   popout    @review's live terminal (rehydrated from the mocked host) is
+//             popped out from its menu: the rail reads `seats-popout`, the
+//             row's Window 2 signal pulses, the notice says the address is
+//             unchanged (bottom-right, 06 §5.5), and the address itself
+//             does not change
 //   dispatch  the picker lists seats first
 //   rest      the 36 px strip: one monogram per seat, the run pulse on
 //             @nightly
 //
 // Plus: Remove seat… confirms, can be kept, and is undone without a host
 // call (G-102); ↑/↓ rove with a visible outline; switching project switches
-// the roster (DEC-68); the D-05 local states (Profile, Devices, Locked).
+// the roster (DEC-68); the D-05 local states (Profile, Devices, Locked) and
+// the app lock's behaviour: it locks when the host reports idle and on Lock
+// now (Ctrl+Shift+L), and unlocks by PIN (a wrong one keeps it locked).
+// Keeping focus across OS focus changes needs a real OS: owed, not here.
 //
 // Screenshots go to `$IKENGA_E2E_SHOTS` when set, else to the test output
 // dir (gitignored) — the design sweep compares them against the locked
@@ -27,12 +33,16 @@
 
 import { expect, type Page, type TestInfo, test } from '@playwright/test';
 import {
+	emitHostEvent,
 	installTauriMock,
 	invokedCommands,
 	MOCK_APP_LOCK_LOCKED,
+	MOCK_APP_LOCK_UNLOCKED,
 	MOCK_SEAT_PROJECT,
 	type MockResponses,
 	seatResponses,
+	seatTerminalResponses,
+	setMockResponse,
 } from './fixtures/tauri-mock';
 
 /** §3.1: `seat:<project>/<name>`, both halves `[a-z0-9-]`. */
@@ -246,6 +256,43 @@ for (const mode of ['dark', 'light'] as const) {
 			expect(pageErrors).toEqual([]);
 		});
 
+		test(`popout: Pop out moves @review to Window 2; the address is unchanged (${mode})`, async ({
+			page,
+		}, testInfo) => {
+			const pageErrors = await boot(page, { mode, responses: seatTerminalResponses() });
+			await expandCompanion(page);
+			await selectRow(page, 'review');
+			const row = seatRow(page, 'review');
+			// In no pane yet, and a first sighting is never "moved".
+			await expect(row.locator('[data-signal="window"]')).toHaveCount(0);
+			await expect(page.locator('[data-state="seats-roster"]')).toBeVisible();
+
+			await row.click({ button: 'right', position: { x: 24, y: 14 } });
+			const menu = page.getByRole('menu', { name: 'Seat actions for @review' });
+			await menu.getByRole('menuitem', { name: /^Pop out/ }).click();
+
+			await expect(page.locator('[data-state="seats-popout"]')).toBeVisible();
+			const signal = row.locator('[data-signal="window"]');
+			await expect(signal).toHaveText('Window 2');
+			await expect(signal).toHaveAttribute('data-moved', 'true');
+			const toast = page.getByText('review moved to Window 2 — its address is unchanged');
+			await expect(toast).toBeVisible();
+			// 06 §5.5 / D-09: toasts sit bottom-right, above the status bar.
+			const box = await toast.boundingBox();
+			const statusBar = await page.getByRole('toolbar', { name: 'Status bar' }).boundingBox();
+			expect(box && statusBar && box.y + box.height <= statusBar.y).toBe(true);
+			expect(box && box.x > 1440 / 2).toBe(true);
+			// The address is not the mount (D-09 rule 2): same row, same scope.
+			await expect(row).toContainText(`seat:${MOCK_SEAT_PROJECT.id}/review`);
+			expect((await invokedCommands(page)).map((c) => c.cmd)).not.toContain('seats_move');
+			await page.screenshot({ path: shotPath(testInfo, `seats-popout-${mode}.png`) });
+
+			// The highlight settles (RAIL_MOVED_MS); the rail reads roster again.
+			await expect(page.locator('[data-state="seats-roster"]')).toBeVisible({ timeout: 10_000 });
+			await expect(signal).not.toHaveAttribute('data-moved', 'true');
+			expect(pageErrors).toEqual([]);
+		});
+
 		test(`empty: one sentence, New seat and Seat this session… (${mode})`, async ({ page }, testInfo) => {
 			const pageErrors = await boot(page, { mode, seats: [] });
 			await expandCompanion(page);
@@ -341,6 +388,16 @@ for (const mode of ['dark', 'light'] as const) {
 			await expect(profile.getByRole('heading', { name: 'Local profile' })).toBeVisible();
 			await expect(profile.getByRole('heading', { name: 'App lock' })).toBeVisible();
 			await expect(profile.getByRole('heading', { name: 'Account' })).toHaveCount(0);
+			// The App lock block, with a host that has the lock commands.
+			await expect(profile.getByRole('switch', { name: 'Lock when idle' })).toBeVisible();
+			await expect(profile.getByRole('button', { name: /^Lock now/ })).toBeVisible();
+			// The People tabs show keyboard focus as a solid outline.
+			const tab = page.getByRole('navigation', { name: 'People sections' }).getByRole('link').first();
+			await tab.focus();
+			await page.keyboard.press('Shift+Tab');
+			await page.keyboard.press('Tab');
+			await expect(tab).toBeFocused();
+			expect(await tab.evaluate((el) => getComputedStyle(el).outlineStyle)).toBe('solid');
 			await page.screenshot({ path: shotPath(testInfo, `people-profile-${mode}.png`) });
 			expect(pageErrors).toEqual([]);
 		});
@@ -362,14 +419,38 @@ for (const mode of ['dark', 'light'] as const) {
 		test(`locked: the lock covers the app and keeps focus off it (${mode})`, async ({ page }, testInfo) => {
 			const pageErrors = trackPageErrors(page);
 			await seed(page, mode);
-			await installTauriMock(page, { responses: { ...seatResponses(), app_lock_status: MOCK_APP_LOCK_LOCKED } });
+			await installTauriMock(page, {
+				responses: {
+					...seatResponses(),
+					...seatTerminalResponses(),
+					chi_list: [
+						{ run_id: 'e2e-run-nightly', engine_id: 'claude-code', status: 'running', owner: 'ui' },
+						{ run_id: 'e2e-run-old', engine_id: 'claude-code', status: 'done', owner: 'ui' },
+					],
+					app_lock_status: MOCK_APP_LOCK_LOCKED,
+				},
+			});
 			await page.goto('/', { waitUntil: 'domcontentloaded' });
 			const lock = page.locator('[data-state="locked"]');
 			await expect(lock).toBeVisible({ timeout: 60_000 });
 			await expect(page.locator('html')).toHaveAttribute('data-mode', mode);
 			await expect(lock.getByRole('heading', { name: 'Locked' })).toBeVisible();
+			// D-05's fine print counts what keeps going, app-wide.
+			await expect(lock).toContainText('2 sessions and 1 run are still going underneath.');
 			const field = lock.getByRole('textbox', { name: 'PIN or passphrase' });
 			await expect(field).toBeFocused();
+			// Unlock is next, and shows where focus is (D-05 `.btn:focus-visible`):
+			// a solid 2 px outline, not one `outline-none` cancels.
+			await page.keyboard.press('Tab');
+			const unlock = lock.getByRole('button', { name: 'Unlock', exact: true });
+			await expect(unlock).toBeFocused();
+			expect(
+				await unlock.evaluate((el) => {
+					const cs = getComputedStyle(el);
+					return { style: cs.outlineStyle, width: cs.outlineWidth };
+				})
+			).toEqual({ style: 'solid', width: '2px' });
+			await field.focus();
 			// Focus never lands in the app underneath (it is inert): Tab walks
 			// the lock's own controls, and past the last one the page itself
 			// (the browser chrome) — never a frame control.
@@ -387,3 +468,65 @@ for (const mode of ['dark', 'light'] as const) {
 		});
 	});
 }
+
+test.describe('D-05 app lock — behaviour', () => {
+	test('locks when the host reports idle, and on Lock now (Ctrl+Shift+L)', async ({ page }) => {
+		const pageErrors = await boot(page);
+		const lock = page.locator('[data-state="locked"]');
+		await expect(lock).toHaveCount(0);
+
+		// Idle: Rust's ticker locks and emits `app-lock://changed`; the frame
+		// refetches and covers itself.
+		await setMockResponse(page, 'app_lock_status', MOCK_APP_LOCK_LOCKED);
+		await emitHostEvent(page, 'app-lock://changed', null);
+		await expect(lock).toBeVisible();
+		await expect(lock).toContainText('ned-desktop · locked after 15 min idle');
+
+		// Back to unlocked, then Lock now from the keyboard, outside any field.
+		await setMockResponse(page, 'app_lock_status', MOCK_APP_LOCK_UNLOCKED);
+		await emitHostEvent(page, 'app-lock://changed', null);
+		await expect(lock).toHaveCount(0);
+		await setMockResponse(page, 'app_lock_lock', { ...MOCK_APP_LOCK_LOCKED, reason: 'manual' });
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		await page.keyboard.press('Control+Shift+L');
+		await expect(lock).toBeVisible();
+		await expect(lock).toContainText('locked with Lock now');
+		expect((await invokedCommands(page)).map((c) => c.cmd)).toContain('app_lock_lock');
+		expect(pageErrors).toEqual([]);
+	});
+
+	test('unlocks with the PIN; a wrong one keeps it locked', async ({ page }) => {
+		const pageErrors = trackPageErrors(page);
+		await seed(page, 'dark');
+		await installTauriMock(page, {
+			responses: {
+				...seatResponses(),
+				app_lock_status: MOCK_APP_LOCK_LOCKED,
+				app_lock_unlock: {
+					ok: false,
+					error: 'Wrong PIN. Four attempts left.',
+					status: { ...MOCK_APP_LOCK_LOCKED, attemptsLeft: 4 },
+				},
+			},
+		});
+		await page.goto('/', { waitUntil: 'domcontentloaded' });
+		const lock = page.locator('[data-state="locked"]');
+		await expect(lock).toBeVisible({ timeout: 60_000 });
+		const field = lock.getByRole('textbox', { name: 'PIN or passphrase' });
+
+		await field.fill('0000');
+		await field.press('Enter');
+		await expect(lock.getByRole('alert')).toContainText('Wrong PIN');
+		await expect(lock).toBeVisible();
+
+		await setMockResponse(page, 'app_lock_unlock', { ok: true, error: null, status: MOCK_APP_LOCK_UNLOCKED });
+		await setMockResponse(page, 'app_lock_status', MOCK_APP_LOCK_UNLOCKED);
+		await field.fill('2468');
+		await field.press('Enter');
+		await expect(lock).toHaveCount(0);
+		await expect(page.getByRole('main')).toBeVisible();
+		const unlocks = (await invokedCommands(page)).filter((c) => c.cmd === 'app_lock_unlock');
+		expect(unlocks.map((c) => (c.args as { secret: string }).secret)).toEqual(['0000', '2468']);
+		expect(pageErrors).toEqual([]);
+	});
+});

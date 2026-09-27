@@ -26,7 +26,8 @@ import type { Page } from '@playwright/test';
 /** Serialisable command → response table. A value of the shape
  *  `{ __error: 'msg' }` makes the command reject with that message; one of
  *  the shape `{ __byArg: { key, values, fallback } }` answers by the value of
- *  the argument `key` (`values[arg]`, else `fallback`). */
+ *  the argument `key` (`values[arg]`, else `fallback`); a non-string argument
+ *  is matched by its JSON (e.g. SQLite `values` `["terminal.tabs"]`). */
 export type MockResponses = Record<string, unknown>;
 
 export interface TauriMockOptions {
@@ -197,6 +198,8 @@ export const DEFAULT_RESPONSES: MockResponses = {
 	// FS / settings / SQLite passthrough
 	fs_home: '/home/e2e',
 	fs_roots_list: [],
+	// An empty directory (the Explorer's Files section lists the project root).
+	fs_list: [],
 	settings_get_all: MOCK_SETTINGS,
 	settings_get: null,
 	settings_set: null,
@@ -354,14 +357,59 @@ export function seatResponses(seats: unknown[] = MOCK_SEATS): MockResponses {
 		seats_list: { __byArg: { key: 'projectId', values: { [MOCK_SEAT_PROJECT.id]: seats }, fallback: [] } },
 		seats_engines: MOCK_SEAT_ENGINES,
 		settings_get_all: { ...MOCK_SETTINGS, 'agent.defaultEngineId': JSON.stringify('claude-code') },
+		// D-05 `profile`: the OS user line and the App lock block (unlocked).
+		os_username: 'ned',
+		app_lock_status: MOCK_APP_LOCK_UNLOCKED,
 	};
 }
 
-/** `app_lock_status` (WP-72, D-05 `locked`): locked on idle, PIN set, no OS unlock. */
-export const MOCK_APP_LOCK_LOCKED = {
-	locked: true,
-	reason: 'idle',
-	lockedAtMs: NOW,
+/** The seats' live terminals (`lead` e2e-term-3, `review` e2e-term-1), so
+ *  a seat can be popped out (D-09 `popout`). The terminal store rehydrates
+ *  its tabs from SQLite's `layout_state` row `terminal.tabs` and reattaches
+ *  each one whose PTY `pty_terminal_list` still reports. No pane mounts them,
+ *  so no xterm spawns. Merge over `seatResponses()`. */
+export function seatTerminalResponses(): MockResponses {
+	const terms = [
+		{ id: 'e2e-term-3', pty: 'e2e-pty-3', title: 'claude', cmd: ['claude'] },
+		{ id: 'e2e-term-1', pty: 'e2e-pty-1', title: 'codex', cmd: ['codex'] },
+	];
+	const cwd = MOCK_SEAT_PROJECT.root_path;
+	const tabs = terms.map((t) => ({
+		id: t.id,
+		title: t.title,
+		spec: { cwd, cmd: t.cmd },
+		ptyId: null,
+		mode: 'ephemeral',
+		status: 'running',
+		wasRunning: true,
+		exitCode: null,
+		createdAt: NOW,
+		owner: { kind: 'sidepane' },
+	}));
+	return {
+		'plugin:sql|select': {
+			__byArg: { key: 'values', values: { '["terminal.tabs"]': [{ value: JSON.stringify(tabs) }] }, fallback: [] },
+		},
+		pty_terminal_list: terms.map((t) => ({
+			terminal_id: t.id,
+			pty_id: t.pty,
+			title: t.title,
+			label: null,
+			cwd,
+			argv: t.cmd,
+			status: 'running',
+			pid: 4242,
+			foreground_command: null,
+			owner_agent_id: null,
+		})),
+	};
+}
+
+/** `app_lock_status` (WP-72, D-05 `profile`): unlocked, idle lock on at 15 min, PIN set. */
+export const MOCK_APP_LOCK_UNLOCKED = {
+	locked: false,
+	reason: null,
+	lockedAtMs: null,
 	idleEnabled: true,
 	idleMinutes: 15,
 	method: 'pin',
@@ -372,6 +420,14 @@ export const MOCK_APP_LOCK_LOCKED = {
 	host: 'ned-desktop',
 	os: 'Linux 6.8.0',
 	configPath: '/home/e2e/.local/share/app.ikenga/app-lock.json',
+};
+
+/** `app_lock_status` (WP-72, D-05 `locked`): locked on idle, PIN set, no OS unlock. */
+export const MOCK_APP_LOCK_LOCKED = {
+	...MOCK_APP_LOCK_UNLOCKED,
+	locked: true,
+	reason: 'idle',
+	lockedAtMs: NOW,
 };
 
 interface InitPayload {
@@ -437,8 +493,9 @@ function installInPage(payload: InitPayload): void {
 			// value (e.g. `seats_list` by `projectId`), else `fallback`.
 			if (v && typeof v === 'object' && '__byArg' in v) {
 				const spec = v.__byArg as { key: string; values: Record<string, unknown>; fallback?: unknown };
-				const arg = args?.[spec.key];
-				v = typeof arg === 'string' && Object.hasOwn(spec.values, arg) ? spec.values[arg] : spec.fallback;
+				const raw = args?.[spec.key];
+				const arg = typeof raw === 'string' ? raw : raw === undefined ? undefined : JSON.stringify(raw);
+				v = arg !== undefined && Object.hasOwn(spec.values, arg) ? spec.values[arg] : spec.fallback;
 			}
 			if (v && typeof v === 'object' && '__error' in v) throw new Error(String(v.__error));
 			// Fresh copy per call so a consumer mutating a response can't leak
@@ -486,6 +543,11 @@ function installInPage(payload: InitPayload): void {
 	w.__IKENGA_E2E__ = {
 		calls,
 		emit,
+		// Change one canned answer mid-test (e.g. the host's app-lock status
+		// after its idle ticker fires).
+		respond: (cmd: string, value: unknown) => {
+			responses[cmd] = value;
+		},
 		unknownCommands: () => Array.from(unknown).sort(),
 	};
 }
@@ -507,6 +569,12 @@ export async function installTauriMock(page: Page, opts: TauriMockOptions = {}):
 			(route) => route.abort('blockedbyclient')
 		);
 	}
+}
+
+/** Replace one command's canned answer from now on, as the host's state
+ *  changes under the page (pair with `emitHostEvent`). */
+export async function setMockResponse(page: Page, cmd: string, value: unknown): Promise<void> {
+	await page.evaluate(([c, v]) => (window as any).__IKENGA_E2E__.respond(c, v), [cmd, value] as const);
 }
 
 /** Commands the page has invoked so far, in order. */
