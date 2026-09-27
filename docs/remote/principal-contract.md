@@ -4,7 +4,7 @@
 
 WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). This is a contract draft only: nothing here is implemented, and WP-20/21/22 must not start until §13 is signed.
 
-**Grounded against:** `ikenga` `origin/main` at `df5482c` (WP-19 slices 1–3 #298/#301/#304, WP-18b part a #303). PR #305 (WP-18b part b) is **open**, not merged; where this file depends on it, it says so. Line numbers are anchors on `df5482c`. Plan paths (`plans/…`, `docs/adr/…`) are in the workspace meta-repo.
+**Grounded against:** `ikenga` `origin/main` at `a076a87` (WP-19 slices 1–3 #298/#301/#304; WP-18b part a #303; WP-18b part b #305, **merged** at `b569d88`). Nothing under `src-tauri/` changed between `b569d88` and `a076a87` (#306/#307). Line numbers are anchors on `a076a87`. Plan paths (`plans/…`, `docs/adr/…`) are in the workspace meta-repo.
 
 **Conventions.** *must* / *never* are normative. **Locked** = a founder decision this file records and does not reopen. **Proposed** = this file's recommendation, binding only once §13 is signed. Open forks are in §12 with a recommendation each.
 
@@ -27,11 +27,11 @@ WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not again
 
 ### 0.2 What main has today
 
-- `Principal { id: String }` exists but nothing uses it. It is reserved on `SpawnSpec.principal` and "ignored by T0" (`src-tauri/src/executor/mod.rs:48-56`, `:84-85`, `executor/in_process.rs:19`).
+- `Principal { id: String }` exists but nothing uses it. It is reserved on `SpawnSpec.principal` and "ignored by T0" (`src-tauri/src/executor/mod.rs:52-60`, `:88-89`, `executor/in_process.rs:19`).
 - `probe()` passes T0 and refuses T1–T3 with `Refusal::NotImplemented`. It does no host check (`executor/tier.rs:133-151`).
 - `/api/health` reports `executor.principal_isolation` from the **installed** executor (`server/health.rs:25-28`, `:45`). The route is **unauthenticated** (`server/mod.rs:323`).
 - Auth is one bearer secret per daemon (`server/mod.rs:61`), minted if absent (`:359-362`). It is checked in constant time from a `Bearer` header or a `?token=` query (`:155-208`, `ct_eq` `:110`).
-- Spawn routing: #303 put PTYs, the claude/codex/antigravity engines and the detached chi-runner on `executor::current()` (`pty/mod.rs:599`, `claude/session.rs:661`, `engines/codex_pty/engine.rs:230`, `engines/antigravity_acp/server.rs:314`, `commands/chi_runner.rs:97`). **#305 (open)** routes the rest: pkg MCP, sidecars, cron, `pkg_invoke`, installs, the playwright proxy, `action_exec`, `agent_detect` and chi's in-process engine. Until #305 merges, those sites still call `Command::new` directly.
+- Spawn routing: every desktop session spawn goes through `executor::current()` (`executor/mod.rs:260-265`). #303 routed PTYs, the claude/codex/antigravity engines and the detached chi-runner (`pty/mod.rs:599`, `claude/session.rs:662`, `engines/codex_pty/engine.rs:231`, `engines/antigravity_acp/server.rs:315`, `commands/chi_runner.rs:98`). #305 (merged, `b569d88`) routed the rest: pkg MCP (`pkg/mcp_runtime.rs:123`, `pkg/lifecycle.rs:1175`), sidecars (`commands/pkg_sidecar.rs:113`, `pkg_sidecar_stream.rs:225`), `pkg_invoke` (`commands/pkg_invoke.rs:152`), cron (`pkg/registries/cron.rs:364`), installs (`pkg/npm_install.rs:221`, `:251`; `commands/claude_store/install.rs:111`, `:190`, `:219`), the playwright proxy (`iyke/playwright_proxy.rs:199`), `action_exec` (`commands/action_exec.rs:756`), `agent_detect` (`agent_detect/agents.rs:43`, `:212`, `:522`) and chi's in-process engine (`commands/chi.rs:698`). It added `PipedOpts::new_process_group` (`executor/mod.rs:196-201`) and `SessionExecutor::spawn_output_blocking` (`:240-252`).
 
 ### 0.3 Out of scope
 
@@ -46,7 +46,7 @@ Roles, device pairing, invites and the audit-log schema belong to G-ACCESS (WP-7
 WP-22 (OIDC `sub`), WP-21 (secret keys), and G-ACCESS (roles, devices, audit) all key on the id. That way, re-provisioning a host, renaming a user, or adding an IdP never changes the key. UUIDv7 needs no new crate: `uuid` is already a dependency at 1.25 (`src-tauri/Cargo.toml:69`, `Cargo.lock:8526-8527`), and WP-20 only adds the `v7` feature. v7 is time-ordered, which keeps the `accounts` PK index append-mostly. ULID would add a crate for the same property. The uid can't be the id, because a restored or migrated host may renumber it.
 
 ```rust
-// executor/mod.rs — replaces today's `pub struct Principal { pub id: String }` (:53-56).
+// executor/mod.rs — replaces today's `pub struct Principal { pub id: String }` (:57-60).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PrincipalId(uuid::Uuid);          // Display/FromStr/serde = lowercase hyphenated; parse rejects non-v7
 
@@ -61,7 +61,7 @@ pub struct Principal {
     pub shell: PathBuf,     // passwd shell; /bin/sh when the operator sets none
 }
 
-// SpawnSpec keeps its shape: `pub principal: Option<Principal>` (executor/mod.rs:84-85).
+// SpawnSpec keeps its shape: `pub principal: Option<Principal>` (executor/mod.rs:88-89).
 ```
 
 `Principal` is **fully resolved before any spawn** (§9.1). The executor never reads the accounts DB, NSS or `/etc/passwd` on the spawn path.
@@ -96,6 +96,7 @@ Every later credential kind (OIDC login, device grant, PAT) *adds a way to obtai
 - **Unauthenticated routes:** only `/api/health`, `/auth/login` and the static SPA. Today that is `/api/health` and the SPA fallback (`server/mod.rs:322-326`).
 - **Cookie:** `ikenga_session`, `HttpOnly`, `SameSite=Strict`, `Path=/`, `Secure` by default (§12.2 P-3). Expiry `OnInactivity(24h)`.
 - **Staying valid:** `AuthUser::session_auth_hash` is derived from `(password_phc, session_epoch)`. A password change, a disable, or a forced logout bumps the epoch and invalidates every session of that principal on its next request (§6).
+- **Live sockets are revoked too, not just new requests.** A PTY/chat/fs WebSocket authenticates once, at its handshake, so a request-time check alone would let an open socket outlive the revocation. The broker keeps a registry of every open WS keyed by `(principal_id, session_id, session_epoch)` captured at handshake (under B, the proxied socket; under A, the handler's socket). When a principal's `session_epoch` or `disabled_at` no longer matches `accounts.db`, the broker **closes every socket of that principal** carrying the old epoch (WS close `4401`), and `POST /auth/logout` closes the sockets of that one `session_id`. Detection is immediate for changes the broker makes itself (`/auth/password`, logout) and bounded for CLI writes (§7.1): the broker re-checks the epochs of principals with open sockets at least every **2 s** (cheap: `PRAGMA data_version` gates the re-read). Closing the socket does not kill the PTY or run; the owner can reattach after logging in again.
 - **CSRF:** `SameSite=Strict` plus the existing `Origin` gate (`origin_permitted`, `server/mod.rs:131-153`), applied unchanged to every state-changing route and to every WebSocket handshake.
 
 ### 2.3 WebSockets and the `?token=` trick
@@ -177,14 +178,14 @@ Under T1, `--data-dir` (`server/src/main.rs:33-35`) names the **operator root**,
 
 ## 5. The `03` §l seams → T1 fix (under B unless noted)
 
-`03` §l (`plans/remote-access/03-research-internal.md:197-211`) predates WP-19. Rows below are re-anchored on `df5482c` and include every site main now tags `G-PRINCIPAL`. The `WP-20` tags in `engines/openrouter_http`, `claude_store`, `chi.rs:1521`, `db.rs:413` and `skill_actions.rs:546+` belong to **other plans' WP-20s** and are not seams.
+`03` §l (`plans/remote-access/03-research-internal.md:197-211`) predates WP-19. Rows below are re-anchored on `a076a87` and include every site main now tags `G-PRINCIPAL`. The `WP-20` tags in `engines/openrouter_http`, `claude_store`, `chi.rs:1535`, `db.rs:413` and `skill_actions.rs:546+` belong to **other plans' WP-20s** and are not seams.
 
 | # | Seam | Current code | Assumption | T1 fix |
 |---|---|---|---|---|
 | 1 | One token, one `AppState` | `server/mod.rs:52-71`, `:74-107`, `:155-208`, `:359-362` | one secret = one owner | Broker: session → `PrincipalCtx` (§2). Child: today's `AppState`, per-child token (§3). |
 | 2 | Discovery files | `server/discovery.rs:30-44` is **already per-euid** (`$XDG_RUNTIME_DIR` or `ikenga-daemon-<uid>.json`, 0600, `write_private` `:52`). `data_dir.join("daemon.json")` at `mod.rs:495` | one `daemon.json` per daemon | discovery.rs doesn't change. Broker writes `operator/daemon.json`; each child writes its own `<data>/daemon.json`, and its temp copy lands per-uid on its own. `03` §l's "fixed `$TMP/ikenga-daemon.json`" is **stale**. |
 | 3 | `fs_home` | `server/rpc.rs:418-421` | daemon process `HOME` | Child env `HOME=<id>/home`. No code change. |
-| 4 | `platform::home_dir()` → settings/agent-ops home | `server/mod.rs:229-241` (`create_router` doc + call), `AppState.home` `:99-104`, `rpc_local.rs:167-178`, `settings/mod.rs:80`, `:96` | process home | As row 3: resolved once per child, correct by construction. |
+| 4 | `platform::home_dir()` → settings/agent-ops home | `server/mod.rs:229-241` (`create_router` doc + call), `AppState.home` `:99-104`, `rpc_local.rs:167-178` (`DaemonSettings::new`), `server/shared/settings/mod.rs:80` (`SettingsManager.home`), `:96` (`with_notifier`) | process home | As row 3: resolved once per child, correct by construction. |
 | 5 | Ngwa store root | `pkg/skill_actions.rs:38-44` (doc + `store_root`); used at `rpc.rs:508-532` | process env | Child env (`HOME`; `XDG_DATA_HOME` unset). |
 | 6 | agent-ops job files | `server/shared/agent_ops.rs:14-18`; `rpc_local.rs:377-431` | process home | Child home. `agent_ops_run_now` stays unserved until it spawns through the executor (`desktop_only.toml:101-103`). |
 | 7 | `os_username` | `server/shared/identity.rs:13-21`; `rpc_local.rs:438-444`; `rpc.rs:641` | daemon `USER` | Child env `USER=LOGNAME=<unix_name>`. The FE display name should come from `/auth/me.username`, not this. |
@@ -194,7 +195,7 @@ Under T1, `--data-dir` (`server/src/main.rs:33-35`) names the **operator root**,
 | 11 | `pkg_index` / `pkg_static` shared | `mod.rs:258-264`; `AppState` `:86-94`; `pkg_index.rs:10`, `:30`; same-origin caveat `pkg_static.rs:41-48` | every token holder sees every pkg | Shared operator-installed set for v1 (§12 OD-10). **Carried risk, for explicit sign-off:** pkg HTML is same-origin with the SPA, so a framed pkg reaches `window.parent` and acts **as the viewing principal**. Pkgs are operator-installed, hence operator-trusted. It is not a cross-principal leak under B, because each principal's SPA only talks to its own child. |
 | 12 | PTY / chat registries | `pty/mod.rs:362-363`; `pty_ws.rs:61-99` (auto-spawn `cwd: "."` `:75`); `chat_ws.rs:222-280` | one namespace | Per child (B). Under A: owner field + checks (§2.5). Auto-spawn `cwd "."` becomes the principal's home (§9.3). |
 | 13 | Idle timeout | `mod.rs:433-458` counts only PTY sessions (`active_session_count`, `pty/mod.rs:1404`) | daemon-wide clock | Per child. **Pinned:** "active" also counts open WS connections, so an open chat or fs socket isn't reaped. The broker's own process has no idle timeout. |
-| 14 | Executor tier + health | `executor/tier.rs:139-151`; `executor/mod.rs:231-262`; `health.rs:45` | T0 only | §8 (probe), §9 (T1 spawn). `principal_isolation: true` only from a verified probe. |
+| 14 | Executor tier + health | `executor/tier.rs:139-151`; `executor/mod.rs:255-286`; `health.rs:45` | T0 only | §8 (probe), §9 (T1 spawn). `principal_isolation: true` only from a verified probe. |
 | 15 | `IKENGA_SECRET_*` flat namespace | `secrets_env.rs:43`, `:92-104` | operator-global | No change in WP-20. The broker passes `IKENGA_SECRET_*` to children as the operator-default layer (ADR-023 `:45`). They are already readable by any token holder through the `secrets_get` arm, so this adds no exposure. The PTY denylist keeps them out of shells (`pty/mod.rs:199-204`). WP-21 layers the per-principal store on top. |
 | 16 | App-lock / vault unlock | `desktop_only.toml:103-134` (8 `app_lock_*`), `:895-910` (4 `secrets_*` unlock) — 12 tables tagged `WP-20` | one PIN, one DEK | Served per child once WP-21 lands a per-principal store. WP-20 does not unblock these; WP-21 does. |
 | 17 | Token env stripping | `server/src/main.rs:94-116` | the daemon's own children | Broker strips as today. The child receives only its own per-child token, which it strips too. §9.2's allowlist is the belt. |
@@ -300,22 +301,22 @@ The CLI writes `accounts.db` directly in `BEGIN IMMEDIATE` transactions. That is
 
 `create` does four things, and a failure at any step rolls the whole create back:
 1. It opens `BEGIN IMMEDIATE`.
-2. It allocates `unix_uid = max(range_start, MAX(unix_uid over non-adopted rows) + 1)`. Disabled rows count, because uids are never reused. It fails if the result is past `range_end`, or if `getpwuid` / `getgrgid` shows the number already taken by a host user.
+2. It allocates `unix_uid = max(range_start, MAX(unix_uid over non-adopted rows) + 1)`. Disabled rows count, because uids are never reused. It fails if the result is `>= range_end` (`range_end` itself is **permanently reserved** as the §8 probe uid and is never allocated), or if `getpwuid` / `getgrgid` shows the number already taken by a host user.
 3. It mints the UUIDv7, derives `unix_name = "ik-" + lowercase(username)`, validated `^[a-z][a-z0-9-]{0,28}$` (so ≤ 31 chars), and inserts the row.
 4. It provisions: user-private group `gid = uid`, a passwd entry (home `<root>/principals/<id>/home`, the shell), then creates and chowns the §4 dirs.
 
 On success it commits. On any failure it rolls back, removes what it created, and records `provision_failed`.
 
-The default uid range is **20000–29999**, set with `--uid-range`. It sits above distro login users and below 60000, and inside the 65 536 ids a user-namespaced container typically maps.
+The default uid range is **20000–29999**, set with `--uid-range`: 20000–29998 are allocatable and 29999 (`range_end`) is the probe uid. It sits above distro login users and below 60000, and inside the 65 536 ids a user-namespaced container typically maps. `--adopt-unix-user` (§11.2) refuses a host user whose uid or gid equals `range_end`, so no account row ever holds the probe uid.
 
 **Provisioning backend (§12 OD-4):** `groupadd`/`useradd` when they are on `PATH`; otherwise a built-in `/etc/group` + `/etc/passwd` (+ `/etc/shadow` with `!`) writer, using `lckpwdf` and a temp-file rename. That is the G-73 `probe.py` `ensure_user` fallback (`plans/remote-access/verify/2026-09-27-g73-railway/probe.py:69`), and it is required by the floor on images with no `passwd` package. A third mode, `--provisioning external`, has the daemon never write `/etc`. The operator pre-creates users, and `create --adopt-unix-user` maps accounts to them.
 
 ### 7.3 Disable, enable, passwd
 
-- **Disable** sets `disabled_at`, bumps `session_epoch`, and makes the broker stop the principal's child. It kills **every process of that uid**: a helper spawned through the T1 executor as that uid calls `kill(-1, SIGKILL)`. That covers detached chi-runners in their own process groups. It locks the passwd entry (`!` password, shell `/usr/sbin/nologin`) and **keeps** the files, the uid and the `principal_id`.
+- **Disable** sets `disabled_at`, bumps `session_epoch` (which closes every open WebSocket of that principal through the §2.2 socket revocation, independent of the kill below), and makes the broker stop the principal's child. It kills **every process of that uid**: a helper spawned through the T1 executor as that uid calls `kill(-1, SIGKILL)`. That covers detached chi-runners in their own process groups. It locks the passwd entry (`!` password, shell `/usr/sbin/nologin`) and **keeps** the files, the uid and the `principal_id`.
 - **Enable** reverses the lock and restores the shell.
 - There is **no delete in v1**. Purging data is a manual operator act, and the row stays as a tombstone.
-- **Passwd** rehashes, sets `password_changed_at`, bumps `session_epoch`, and writes `password_changed`.
+- **Passwd** rehashes, sets `password_changed_at`, bumps `session_epoch`, and writes `password_changed`. The epoch bump **closes every open PTY/chat/fs WebSocket** of that principal authenticated under the old epoch (§2.2), so a hijacked or stolen-device socket is cut, not only its next HTTP request.
 
 ### 7.4 First admin (§12 OD-7)
 
@@ -334,8 +335,8 @@ The canonical path is `accounts create --admin` from a host or container shell. 
 | 3 | Capabilities | `CapEff` has bit **7** (`CAP_SETUID`), **6** (`CAP_SETGID`), **0** (`CAP_CHOWN`), **5** (`CAP_KILL`) | Decoded from the hex mask, as `probe.py:52-61` does. Railway's `0x800405fb` passes (`04` Round 14 `:37`). |
 | 4 | Observations | Record `NoNewPrivs`, `Seccomp` and the filter count | Not a gate: NNP=1 on the broker does not block `setuid()` by a `CAP_SETUID` holder. The real drop (6) is the proof. Railway: NNP 0, seccomp 2 / 3 filters, drop fine (`:41`). |
 | 5 | Operator root | `<root>`, `operator/`, `principals/` exist or can be created with §4's owners and modes; none is a symlink or group/world-writable; `<root>` is not a T0 layout | |
-| 6 | **Real test drop** | The broker spawns **itself** (`/proc/self/exe __t1-probe-child`) **through the T1 executor** (§9) as the probe principal: uid = gid = `range_end`, no passwd entry needed, home = a fresh root-created `0700` probe dir chowned to that uid. The child must: see `getresuid` / `getresgid` all equal to the probe ids and `getgroups()` empty; get `EPERM` from `setuid(0)`; get `EACCES` opening a root-owned `0700` dir; write a file in its dir whose `st_uid` the parent then confirms is the probe uid; see `NoNewPrivs: 1` if OD-9 = yes. It exits `0`; the parent checks the exit code, removes the probe dir, and times out at 10 s. | This runs the **same code path real spawns use**, not a parallel `fork()`. That avoids fork-in-a-multithreaded-runtime hazards and covers gVisor/fakeroot-style cosmetic uid changes. |
-| 7 | Reconcile | For every non-disabled row, the passwd/group entry matches `(unix_name, uid, gid, home, shell)`. Missing entries are (re)created with the §7.2 backend. | Refuse if a row's uid or name is held by a **different** host entry. `/etc` is a projection of `accounts.db` (§4). |
+| 6 | **Real test drop** | The broker spawns **itself** (`/proc/self/exe __t1-probe-child`) **through the T1 executor** (§9) as the probe principal: uid = gid = `range_end` (reserved, §7.2 — never an account's uid), no passwd entry needed, home = a fresh root-created `0700` probe dir chowned to that uid. **Precondition:** the probe refuses (`ProbeFailed { check: "probe_uid" }`) if `range_end` appears as `unix_uid` or `unix_gid` in `accounts.db` or resolves via `getpwuid` / `getgrgid`, so it never acts as, or chowns for, a live identity. The child must: see `getresuid` / `getresgid` all equal to the probe ids and `getgroups()` empty; get `EPERM` from `setuid(0)`; get `EACCES` opening a root-owned `0700` dir; write a file in its dir whose `st_uid` the parent then confirms is the probe uid; see `NoNewPrivs: 1` if OD-9 = yes. It exits `0`; the parent checks the exit code, removes the probe dir, and times out at 10 s. | This runs the **same code path real spawns use**, not a parallel `fork()`. That avoids fork-in-a-multithreaded-runtime hazards and covers gVisor/fakeroot-style cosmetic uid changes. |
+| 7 | Reconcile | For every non-disabled row, the passwd/group entry matches `(unix_name, uid, gid, home, shell)`. Missing entries are (re)created with the §7.2 backend. | Refuse if a row's uid or name is held by a **different** host entry. `/etc` is a projection of `accounts.db` (§4). Reconcile never writes an entry for the probe uid (no row holds it). |
 
 **Results.**
 - **Health:** `/api/health` is unauthenticated, so it carries only non-sensitive fields: the `Capabilities` shape (`tier.rs:86-96`) unchanged, plus `probe: { ok: true, at: <unix secs> }`. No uids, names, caps masks or paths. The full report goes to the log and `operator/probe.json`.
@@ -365,16 +366,16 @@ Use `std`/`tokio` `CommandExt::gid(p.gid)` + `uid(p.uid)`. The required order is
 ### 9.3 Environment and cwd
 
 - **Env:** `env_clear`, then exactly `HOME=p.home`, `USER=LOGNAME=p.unix_name`, `SHELL=p.shell`, `PATH=<operator --principal-path, default p.home/.local/bin:/usr/local/bin:/usr/bin:/bin>`, `TMPDIR=<data>/tmp` (because `/tmp` is shared across principals), and `LANG`/`LC_*`/`TZ` passed through. Then the spec's own vars.
-- **Deny floor:** the T1 executor **drops** any spec var matching `is_host_only_env` (`pty/mod.rs:199-204`: `IKENGA_AUTH_TOKEN`, `IKENGA_VAULT_KEY`, `IKENGA_PKG_DB_TOKEN`, `IKENGA_SECRET_*`), plus `IKENGA_BOOTSTRAP_*`. The child launcher's per-child token and `IKENGA_SECRET_*` defaults (§5 row 15) are the only exception, and they are listed explicitly. This **amends** `EnvSpec`'s "the executor does not second-guess" (`executor/mod.rs:64-66`) for T1 only: the floor is the executor's job there, because a call site's filter is not a security boundary.
+- **Deny floor:** the T1 executor **drops** any spec var matching `is_host_only_env` (`pty/mod.rs:199-204`: `IKENGA_AUTH_TOKEN`, `IKENGA_VAULT_KEY`, `IKENGA_PKG_DB_TOKEN`, `IKENGA_SECRET_*`), plus `IKENGA_BOOTSTRAP_*`. The child launcher's per-child token and `IKENGA_SECRET_*` defaults (§5 row 15) are the only exception, and they are listed explicitly. This **amends** `EnvSpec`'s "the executor does not second-guess" (`executor/mod.rs:68-70`) for T1 only: the floor is the executor's job there, because a call site's filter is not a security boundary.
 - **cwd:** `None` → `p.home`. The T1 executor never inherits the broker's cwd, which is where `pty_ws.rs:75`'s `"."` would otherwise land.
 
 ### 9.4 Detached chi-runner under T1
 
-Under B the child spawns chi-runner detached as the uid (`commands/chi_runner.rs:97`, `PipedOpts::detached` `executor/mod.rs:180-191`). Its conf and status files live in `<data>/chi-cache/`, owned by the uid. The runner survives the child's idle exit. A broker **restart** under systemd still kills it unless the unit fix recorded at `scripts/server/ikenga-server.service:45-54` is applied (`systemd-run --scope` per runner, or `KillMode=process`; `04` Round 12 `:137`). That fix is owed by the T1 unit variant (§8). Cancel and disable reach the runner by process group (`kill_process_group`, `commands/chi_runner.rs:121`) and by the §7.3 uid-wide kill.
+Under B the child spawns chi-runner detached as the uid (`commands/chi_runner.rs:98`, `PipedOpts::detached` `executor/mod.rs:184-195`). Its conf and status files live in `<data>/chi-cache/`, owned by the uid. The runner survives the child's idle exit. A broker **restart** under systemd still kills it unless the unit fix recorded at `scripts/server/ikenga-server.service:45-54` is applied (`systemd-run --scope` per runner, or `KillMode=process`; `04` Round 12 `:137`). That fix is owed by the T1 unit variant (§8). Cancel and disable reach the runner by process group (`kill_process_group`, `commands/chi_runner.rs:122`) and by the §7.3 uid-wide kill.
 
 ### 9.5 Single interposition point
 
-Every desktop session spawn goes through `executor::current()` once #305 merges. Until then the pkg, install, cron, playwright, `action_exec` and `agent_detect` sites call `Command::new` directly (`pkg/mcp_runtime.rs`, `pkg/lifecycle.rs`, `pkg/registries/cron.rs`, …). Under B those run inside the unprivileged child, so they are isolated anyway. Under A, **T1 must not ship before #305**. #305's deliberate exclusions (`path_fix.rs`, `runtime.rs` boot probe, `pty/daemon_client.rs`, desktop-only-forever) are host-process self-maintenance or desktop-only, and none runs a session.
+As of `b569d88` (#305 merged) every desktop session spawn goes through `executor::current()` (site list in §0.2), so the T1 executor is the single interposition point under either topology. The earlier caveat that topology A must not ship T1 before #305 is **resolved**; under B those sites additionally run inside the already-dropped per-principal child. The non-test `Command::new` sites left on main are host-process self-maintenance or desktop-only helpers — #305's exclusions (`path_fix.rs:116-120`, `runtime.rs` boot probe, `pty/daemon_client.rs`), Windows `taskkill` helpers, file-manager reveal, screenshot-tool probes, `wsl.exe` shell detection — and none runs a session.
 
 ---
 
@@ -402,7 +403,7 @@ Every desktop session spawn goes through `executor::current()` once #305 merges.
 - **I-5** `/api/health` reports `principal_isolation: true` only if the §8 probe passed in this process and the executor is not degraded.
 - **I-6** Under T1, no request reaches an RPC/WS/pkg handler without a `PrincipalCtx`. `?token=` and the operator bearer grant nothing.
 - **I-7** A principal cannot resolve, attach to, signal or read another principal's PTY, thread, run, watch or files. Under B this is enforced by process and uid; under A, by owner checks.
-- **I-8** Bumping `session_epoch` (passwd / disable) invalidates every existing session of that principal on its next request.
+- **I-8** Bumping `session_epoch` (passwd / disable / forced logout) invalidates every existing session of that principal on its next request **and** closes every open PTY/chat/fs WebSocket of that principal authenticated under the old epoch, within 2 s of a CLI write and immediately for a broker-side change (§2.2). Test: open a PTY WS, run `accounts passwd`, assert the socket is closed.
 - **I-9** `<root>/principals/<id>` and everything under it is owned by that uid with no group/other bits. `operator/` is root `0700`. Nothing a principal owns is ever executed by root.
 - **I-10** A T1 boot on a T0-shaped data dir is refused, never auto-migrated.
 
@@ -446,7 +447,7 @@ Self-signup; LDAP/AD; OIDC flows (WP-22); per-principal pkg install or trust (v1
 | Pin | Choice | Reason |
 |---|---|---|
 | **P-1** | `--data-dir` = the operator root under T1 | Deploy files stay unchanged. |
-| **P-2** | uid range 20000–29999 (`--uid-range`); `gid = uid` | Clear of login users and inside the 65 536 ids a user namespace maps. |
+| **P-2** | uid range 20000–29999 (`--uid-range`); `gid = uid`; `range_end` reserved as the probe uid, allocation stops at `range_end - 1` | Clear of login users and inside the 65 536 ids a user namespace maps; the probe never shares a uid with a principal. |
 | **P-3** | Cookie `ikenga_session`; `Secure` on by default; `--insecure-cookie` opt-out for a plain-HTTP tailnet | Tailnet deploys serve HTTP on a tailnet IP (`ikenga-server.service:10-13`, `:34-36`). |
 | **P-4** | Session inactivity 24 h; the session id cycles on login | The session is a shell credential. |
 | **P-5** | `unix_name = "ik-" + username`, immutable | Readable in `ps`; renames never touch `/etc`. |
@@ -462,7 +463,7 @@ Self-signup; LDAP/AD; OIDC flows (WP-22); per-principal pkg install or trust (v1
 | Contradictions review by a separate reviewer | **not yet run** |
 | OD-1…OD-14 answered | **open** |
 | Locked decisions (§0.1) re-opened? | **No** |
-| Depends on #305 merging | Only if OD-1 = A (§9.5) |
+| Depends on #305 (WP-18b part b) | **Resolved**: merged at `b569d88`; no open dependency under either OD-1 option (§9.5) |
 | Recorded in `plans/remote-access/04-discussion.md` | **pending**: the freeze gets its own Round, and shell-ux notes it in its next Round (G-ACCESS waits on this, `plans/shell-ux-rearchitecture/04-discussion.md:147-149`) |
 
 After sign-off, any change to §1–§9 or §11.1 needs a new Round in `04`.
