@@ -1297,31 +1297,17 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
 }
 
 /// A `chi` run's `seat` value (G-SEATS §9.1): `<name>` or `<project>/<name>`.
-/// The name follows §1.2 (1–32 chars of `[a-z0-9-]`, starting and ending with
-/// a letter or digit); the project follows the project-slug rule (§3.1:
-/// 1–64 chars, first `[a-z0-9]`, then `[a-z0-9_-]`). Whether the seat exists
-/// is only known at run time (`seats_resolve`).
+/// The name follows §1.2 and the project the project-slug rule (§3.1) — the
+/// seat store's own validators, so the grammar has one copy (the project-slug
+/// copy is held to `projects.rs` by a test there). Whether the seat exists is
+/// only known at run time (`seats_resolve`).
 fn is_chi_seat_ref(value: &str) -> bool {
-    fn is_seat_name(name: &str) -> bool {
-        let bytes = name.as_bytes();
-        let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-        !bytes.is_empty()
-            && bytes.len() <= 32
-            && edge(bytes[0])
-            && edge(bytes[bytes.len() - 1])
-            && bytes.iter().all(|&b| edge(b) || b == b'-')
-    }
-    fn is_project_slug(project: &str) -> bool {
-        let bytes = project.as_bytes();
-        let first = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-        !bytes.is_empty()
-            && bytes.len() <= 64
-            && first(bytes[0])
-            && bytes.iter().all(|&b| first(b) || b == b'-' || b == b'_')
-    }
+    use crate::iyke::seats::{validate_project_slug, validate_seat_name};
     match value.split_once('/') {
-        Some((project, name)) => is_project_slug(project) && is_seat_name(name),
-        None => is_seat_name(value),
+        Some((project, name)) => {
+            validate_project_slug(project).is_ok() && validate_seat_name(name).is_ok()
+        }
+        None => validate_seat_name(value).is_ok(),
     }
 }
 

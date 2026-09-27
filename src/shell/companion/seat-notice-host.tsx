@@ -1,5 +1,9 @@
 // WP-66 — renders the seat-dispatch notice (`seat-notice.ts`) as the shell's
-// floating toast pill. Mounted once, by the dispatch bar.
+// floating toast pill. Mounted once, by the dispatch bar. A notice raised
+// while the Companion is collapsed or hidden (an E-4 queue-dropped from a
+// runner action, say) stays in the store and shows when the bar mounts;
+// mounting the host at the Companion level is WP-67's (it owns
+// `companion.tsx` / `collapsed-strip.tsx`).
 
 import { AlertTriangle, Info } from 'lucide-react';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';

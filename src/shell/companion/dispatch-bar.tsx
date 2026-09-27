@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { resolveHostedKeypress } from '@/lib/keymap/dispatcher';
 import { labelFor } from '@/lib/keymap/registry';
+import { useSeats } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useCompanionStore } from './companion-store';
 import { currentDispatchContext, resolveTarget, targetEngineId } from './resolve-target';
@@ -43,6 +44,11 @@ export function DispatchBar() {
 	const target = useShellStore((s) => s.companion.activeTarget);
 	// Subscribed so a newly-chosen default engine re-enables the input.
 	useShellStore((s) => s.defaultEngineId);
+	// A seat target reads the roster cache (G-SEATS §9.4): subscribe to it so
+	// a roster that loads or refetches re-resolves the target (and re-enables
+	// an input disabled while the seat wasn't in it yet).
+	const activeProjectId = useShellStore((s) => s.activeProject.id);
+	useSeats(activeProjectId ?? null, { enabled: target.kind === 'seat' });
 	const draft = useCompanionStore((s) => s.draft);
 	const setDraft = useCompanionStore((s) => s.setDraft);
 	const focusPending = useCompanionStore((s) => s.focusPending);

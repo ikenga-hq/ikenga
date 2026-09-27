@@ -17,6 +17,7 @@ const m = vi.hoisted(() => ({
 	cachedSeats: vi.fn(),
 	prefetchSeats: vi.fn(),
 	invalidateSeats: vi.fn(async () => {}),
+	ensureSeatsLiveSync: vi.fn(),
 	openTabPty: vi.fn(async () => ({})),
 	buildAgentWrappedCmd: vi.fn(() => ['/bin/bash', '-i', '-c', 'agent']),
 }));
@@ -38,6 +39,7 @@ vi.mock('@/lib/queries/seats', async (orig) => ({
 	cachedSeats: m.cachedSeats,
 	prefetchSeats: m.prefetchSeats,
 	invalidateSeats: m.invalidateSeats,
+	ensureSeatsLiveSync: m.ensureSeatsLiveSync,
 	onSeatsChanged: vi.fn(() => () => {}),
 }));
 
@@ -55,6 +57,9 @@ vi.mock('@/terminal/session-store', () => ({
 			add: (spec: Record<string, unknown>, _title: string, id: string) => {
 				terminal.tabs.push({ id, spec, status: 'spawning' });
 				return id;
+			},
+			remove: (id: string) => {
+				terminal.tabs = terminal.tabs.filter((t) => t.id !== id);
 			},
 		}),
 		setState: (fn: (s: { tabs: Tab[] }) => { tabs: Tab[] }) => {
@@ -136,11 +141,11 @@ describe('resolveTarget — seat (label from the cache)', () => {
 		await expect(r.send('x')).rejects.toThrow(SEAT_GONE_REASON);
 	});
 
-	it('a roster not loaded yet is fetched, and the target stays sendable', () => {
+	it('a roster not loaded yet keeps the target sendable, and fetches nothing during render', () => {
 		m.cachedSeats.mockReturnValue(undefined);
 		m.cachedSeat.mockReturnValue(undefined);
 		const r = resolveTarget(target);
-		expect(m.prefetchSeats).toHaveBeenCalledWith('royalti-co');
+		expect(m.prefetchSeats).not.toHaveBeenCalled();
 		expect(r.kind).toBe('seat');
 	});
 
@@ -182,6 +187,8 @@ describe('resolveTarget — seat send (route decided at send time)', () => {
 		await resolveTarget(target).send('then deploy');
 		expect(m.chiResume).not.toHaveBeenCalled();
 		expect(m.seatsQueue).toHaveBeenCalledWith('seat-1', 'then deploy', { client: 'ui' });
+		// E-4: subscribed before queueing, so a drop is never silent.
+		expect(m.ensureSeatsLiveSync).toHaveBeenCalled();
 		expect(notice()).toBe('Queued for @nightly — sends when its run finishes');
 	});
 
@@ -204,8 +211,10 @@ describe('resolveTarget — seat send (route decided at send time)', () => {
 				cwd: '/work/docs',
 			})
 		);
+		// In-process PTY: a daemon terminal can't be seated (P-10).
 		expect(m.openTabPty).toHaveBeenCalledWith(
-			expect.objectContaining({ id: 'term-new-0001', claudeSessionId: 'conv-abcdef123' })
+			expect.objectContaining({ id: 'term-new-0001', claudeSessionId: 'conv-abcdef123' }),
+			{ forceEphemeral: true }
 		);
 		// The prompt is dropped from the tab's spec once spawned (no replay on respawn).
 		const tab = terminal.tabs.find((t) => t.id === 'term-new-0001');
@@ -297,6 +306,42 @@ describe('resolveTarget — seat send (route decided at send time)', () => {
 			{ claimResume: true }
 		);
 		expect(m.chiResume).toHaveBeenCalledWith('run-1', 'x');
+	});
+
+	it('path T spawn failure removes the half-made terminal tab', async () => {
+		m.seatsResolve.mockResolvedValue({
+			route: 'vacant',
+			seat: seat(),
+			resume: { resumable: true },
+			claim: 'claim-9',
+		} satisfies SeatRoute);
+		m.openTabPty.mockRejectedValueOnce(new Error('spawn failed'));
+		await expect(resolveTarget(target).send('x')).rejects.toThrow('spawn failed');
+		expect(terminal.tabs.find((t) => t.id === 'term-new-0001')).toBeUndefined();
+		expect(m.seatsMove).not.toHaveBeenCalled();
+	});
+
+	it('no path-T claim is asked for a cached seat on an engine with no terminal wrap', async () => {
+		m.cachedSeat.mockReturnValue(seat({ engine_id: 'openrouter' }));
+		m.seatsResolve.mockResolvedValue({ route: 'chi-resume', seat: seat({ status: 'idle' }), run_id: 'run-1', busy: false });
+		await resolveTarget(target).send('go');
+		expect(m.seatsResolve).toHaveBeenCalledWith({ seatId: 'seat-1' }, { client: 'ui' }, { claimResume: false });
+	});
+
+	it('seat_resuming → "@<name> is being resumed — try again shortly"', async () => {
+		m.seatsResolve.mockRejectedValueOnce({ code: 'seat_resuming', message: 'docs is already being resumed' });
+		await expect(resolveTarget(target).send('x')).rejects.toThrow('@docs is being resumed — try again shortly');
+	});
+
+	it('a seat_held refusal of the write after the resolve gets the §5.2 notice with Take over', async () => {
+		m.seatsResolve.mockResolvedValue({ route: 'chi-resume', seat: seat({ name: 'nightly', status: 'run' }), run_id: 'run-1', busy: true });
+		m.seatsQueue.mockRejectedValueOnce({
+			code: 'seat_held',
+			message: 'held',
+			details: { client: 'iyke-orch', since: 0, expires_at: 1 },
+		});
+		await expect(resolveTarget(target).send('x')).rejects.toThrow(/is held by iyke-orch since .* — Take over to use it/);
+		expect(useSeatNotice.getState().notice?.action?.label).toBe('Take over');
 	});
 
 	it('agent_not_live → "the agent in @<name>\'s terminal isn\'t running yet"', async () => {

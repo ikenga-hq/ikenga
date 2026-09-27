@@ -62,7 +62,7 @@ import {
 	seatsResolve,
 	seatsResume,
 } from '@/lib/tauri-cmd';
-import { seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
+import { ensureSeatsLiveSync, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
 import { useCompanionStore } from '@/shell/companion/companion-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
@@ -328,7 +328,9 @@ async function sendToSeat(request: ChiSendRequest, seat: SeatAddress, retried = 
 			}
 			case 'chi-resume': {
 				if (route.busy) {
-					// §4.5: never `chi_resume` over a turn in flight — queue.
+					// §4.5: never `chi_resume` over a turn in flight — queue. E-4:
+					// subscribe first, so a dropped text is never silent.
+					ensureSeatsLiveSync();
 					await seatsQueue(route.seat.id, request.prompt, actor);
 					return { runId: route.run_id, via: 'chi-resume' };
 				}

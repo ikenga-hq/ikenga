@@ -143,6 +143,10 @@ export interface EditorFormState {
 	runType: ActionRunKind;
 	chiTarget: ChiTarget;
 	chiEngineId: string;
+	/** G-SEATS §9.1 `seat` (`<name>` / `<project>/<name>`), required iff
+	 *  `chiTarget === 'seat'`. No field edits it yet (a follow-up); it is
+	 *  carried through so saving a seat action keeps it valid. */
+	chiSeat: string;
 	chiPrompt: string;
 	shellCommand: string;
 	shellCwd: string;
@@ -191,6 +195,7 @@ export function emptyForm(): EditorFormState {
 		runType: 'chi',
 		chiTarget: 'active',
 		chiEngineId: '',
+		chiSeat: '',
 		chiPrompt: '',
 		shellCommand: '',
 		shellCwd: '',
@@ -268,6 +273,7 @@ export function formFromAction(action: EffectiveAction, keyEntry: KeymapEntry | 
 		if (run.kind === 'chi') {
 			form.chiTarget = run.target;
 			form.chiEngineId = run.engineId ?? '';
+			form.chiSeat = run.seat ?? '';
 			form.chiPrompt = run.prompt;
 		} else if (run.kind === 'shell') {
 			form.shellCommand = run.command;
@@ -319,6 +325,7 @@ export function buildRun(form: EditorFormState): ActionRun {
 				target: form.chiTarget,
 				prompt: form.chiPrompt,
 				...(form.chiTarget === 'engine' && form.chiEngineId.trim() ? { engineId: form.chiEngineId.trim() } : {}),
+				...(form.chiTarget === 'seat' && form.chiSeat.trim() ? { seat: form.chiSeat.trim() } : {}),
 			};
 		case 'shell':
 			return {

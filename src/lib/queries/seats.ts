@@ -11,12 +11,17 @@
 // app's lifetime (idempotent) and invalidates the event's project list. The
 // event is never a source of truth. The same listener turns an E-4
 // `queue-dropped` event into the Companion's notice (G-SEATS §17 E-4).
-// Liveness changes (a PTY exit, a turn finishing) are not seat events; the
-// rail (WP-67) re-reads on those signals. This hook keeps a short staleTime.
+//
+// Liveness changes are not seat events (§10: "WP-66/67 invalidate the seats
+// query on those signals"). An observed roster re-reads when a terminal's
+// PTY status or agent liveness changes in the terminal store (which the
+// store-level `hooks://event` listener keeps current), and polls while one
+// of its seats has a Chi run in flight — there is no run-status event.
 
 import { queryOptions, useQuery } from '@tanstack/react-query';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { queryClient } from '@/lib/query-client';
+import { useTerminalStore } from '@/terminal/session-store';
 import {
 	listen,
 	SEATS_CHANGED_EVENT,
@@ -60,15 +65,38 @@ export function seatsQueryOptions(projectId: string) {
 	});
 }
 
+/** While an observed roster has a run in flight, re-read it this often: a
+ *  run finishing changes the derived status with no seat write (§10). */
+export const SEATS_RUN_POLL_MS = 5_000;
+
+/** One string that changes whenever a terminal's PTY status or agent
+ *  liveness does — the liveness signals §10 names for the terminal side. */
+function terminalLivenessSignature(
+	tabs: ReadonlyArray<{ id: string; status: string; agentLive?: boolean }>
+): string {
+	return tabs.map((t) => `${t.id}:${t.status}:${t.agentLive ? 1 : 0}`).join('|');
+}
+
 /** The roster of `projectId` (`null` → nothing is fetched). */
 export function useSeats(projectId: string | null, opts: { enabled?: boolean } = {}) {
 	const enabled = (opts.enabled ?? true) && Boolean(projectId);
 	useEffect(() => {
 		if (enabled) ensureSeatsLiveSync();
 	}, [enabled]);
+	// §10 liveness: re-read on a PTY exit / agent start or end. The first
+	// render is not a change (the query's own fetch covers it).
+	const liveness = useTerminalStore((s) => terminalLivenessSignature(s.tabs));
+	const seen = useRef(liveness);
+	useEffect(() => {
+		if (seen.current === liveness) return;
+		seen.current = liveness;
+		if (enabled && projectId) void invalidateSeats(projectId);
+	}, [liveness, enabled, projectId]);
 	return useQuery({
 		...seatsQueryOptions(projectId ?? ''),
 		enabled,
+		refetchInterval: (query) =>
+			query.state.data?.some((s) => s.status === 'run') ? SEATS_RUN_POLL_MS : false,
 	});
 }
 

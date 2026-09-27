@@ -52,7 +52,7 @@ import { labelFor } from '@/lib/keymap/registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { paActionsListQueryOptions } from '@/lib/queries/pa-actions';
-import { cachedSeat } from '@/lib/queries/seats';
+import { useSeats } from '@/lib/queries/seats';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { listen } from '@/lib/transport';
 import { useTerminalStore } from '@/terminal/session-store';
@@ -138,9 +138,14 @@ function useStatuslineSnapshots(): Record<string, StatuslineSnapshot> {
 function useNextEngineId(): string | null {
 	const target = useShellStore((s) => s.companion.activeTarget);
 	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
-	// G-SEATS §9.1: a seat target dispatches on the seat's engine (from the
-	// roster cache the Companion keeps).
-	if (target.kind === 'seat') return cachedSeat(target.seat_id)?.engine_id ?? defaultEngineId;
+	const activeProjectId = useShellStore((s) => s.activeProject.id);
+	// G-SEATS §9.1: a seat target dispatches on the seat's engine — read from
+	// a subscribed roster, so the segment updates when it loads.
+	const seats = useSeats(activeProjectId ?? null, { enabled: target.kind === 'seat' });
+	if (target.kind === 'seat') {
+		const seatId = target.seat_id;
+		return seats.data?.find((s) => s.id === seatId)?.engine_id ?? defaultEngineId;
+	}
 	if (target.kind !== 'session' && target.engine_id) return target.engine_id;
 	return defaultEngineId;
 }

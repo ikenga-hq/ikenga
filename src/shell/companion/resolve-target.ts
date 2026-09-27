@@ -31,8 +31,8 @@ import type { PaneNode, PaneView } from '@/lib/panes/types';
 import {
 	cachedSeat,
 	cachedSeats,
+	ensureSeatsLiveSync,
 	invalidateSeats,
-	prefetchSeats,
 	seatErrorOf,
 	UI_SEAT_CLIENT,
 } from '@/lib/queries/seats';
@@ -230,11 +230,14 @@ export function targetEngineId(target: CompanionTarget): string | null {
 
 export const SEAT_GONE_REASON = 'That seat no longer exists';
 
-/** Chi engine id → agent-wrap engine (§4.3 / §6.1). Only these can take path T. */
+/** Chi engine id → agent-wrap engine (§4.3 / §6.1): the `wrap_id` column of
+ *  `iyke/seats.rs::ENGINE_CAPS`, the same test Rust uses to grant a path-T
+ *  claim. Only these can take path T. */
 const WRAP_ENGINE_FOR_CHI: Readonly<Record<string, AgentEngineKind>> = {
 	'claude-code': 'claude',
 	codex: 'codex',
 	'antigravity-cli': 'antigravity',
+	gemini: 'gemini',
 };
 
 function errorText(err: unknown): string {
@@ -253,10 +256,11 @@ export function seatSessionLabel(session: SeatSession | null | undefined): strin
 function seatTarget(seatId: string): ResolvedTarget {
 	const projectId = useShellStore.getState().activeProject.id;
 	const roster = projectId ? cachedSeats(projectId) : undefined;
-	if (roster === undefined) {
-		// Not loaded yet: load it, and let `send` decide (it never reads the cache).
-		if (projectId) prefetchSeats(projectId);
-	} else if (!roster.some((s) => s.id === seatId)) {
+	// A roster not loaded yet stays sendable: `send` decides at send time and
+	// never reads the cache. Loading it is the subscribers' job (`useSeats`
+	// in the dispatch bar / target chip) — nothing is fetched from here, as
+	// this runs during render.
+	if (roster !== undefined && !roster.some((s) => s.id === seatId)) {
 		return {
 			kind: 'none',
 			disabledReason: SEAT_GONE_REASON,
@@ -288,13 +292,17 @@ export async function dispatchToSeat(
 	opts: { takeover?: boolean; retried?: boolean } = {}
 ): Promise<void> {
 	const actor: SeatActor = { client: UI_SEAT_CLIENT };
+	// Fail-safe: never ask for a path-T claim for a seat known to be on an
+	// engine with no terminal wrap (Rust grants none there either, E-1), so a
+	// claim can't be left behind by a path T that can't run.
+	const cachedEngine = cachedSeat(seatId)?.engine_id;
+	const claimResume =
+		cachedEngine === undefined || WRAP_ENGINE_FOR_CHI[cachedEngine] !== undefined;
 	let route: SeatRoute;
 	try {
-		route = await seatsResolve(
-			{ seatId },
-			opts.takeover ? { ...actor, takeover: true } : actor,
-			{ claimResume: true }
-		);
+		route = await seatsResolve({ seatId }, opts.takeover ? { ...actor, takeover: true } : actor, {
+			claimResume,
+		});
 	} catch (err) {
 		throw refusal(err, seatId, text, context);
 	}
@@ -313,7 +321,9 @@ export async function dispatchToSeat(
 			case 'chi-resume': {
 				const prompt = promptWithContext(text, context);
 				if (route.busy) {
-					// §4.5: never `chi_resume` over a turn in flight.
+					// §4.5: never `chi_resume` over a turn in flight. E-4: be
+					// subscribed before queueing, so a dropped text is never silent.
+					ensureSeatsLiveSync();
 					await seatsQueue(seat.id, prompt, actor);
 					showSeatNotice(queuedText(seat.name));
 					return;
@@ -333,7 +343,10 @@ export async function dispatchToSeat(
 		if ((code === 'seat_not_vacant' || code === 'seat_resuming') && !opts.retried) {
 			return dispatchToSeat(seatId, text, context, { retried: true });
 		}
-		throw new Error(errorText(err));
+		// A hold acquired between the resolve and the write refuses the write
+		// the same way (§5.2 / §5.3), with the same notice and *Take over*.
+		// Everything else is typed by `refusal` too (exact texts).
+		throw refusal(err, seatId, text, context);
 	} finally {
 		void invalidateSeats(seat.project_id);
 	}
@@ -366,11 +379,19 @@ function refusal(err: unknown, seatId: string, text: string, context?: DispatchC
 		}
 		case 'agent_not_live':
 			return new Error(agentNotLiveText(name));
+		case 'seat_resuming':
+			// Another dispatch holds the 30 s path-T claim (§4.1, P-12).
+			return new Error(seatResumingText(cachedSeat(seatId)?.name ?? null));
 		case 'seat_not_found':
 			return new Error(SEAT_GONE_REASON);
 		default:
 			return new Error(seatErr.message);
 	}
+}
+
+/** A `seat_resuming` refusal: the seat is mid path T for another dispatch. */
+export function seatResumingText(name: string | null): string {
+	return `${name ? `@${name}` : 'This seat'} is being resumed — try again shortly`;
 }
 
 /** *Take over*: repeat the send with `takeover: true`; on success the
@@ -394,6 +415,8 @@ async function takeOverAndSend(seatId: string, text: string, context?: DispatchC
 async function sendPathT(route: VacantRoute, claim: string, text: string, context?: DispatchContext) {
 	const seat = route.seat;
 	const engine = WRAP_ENGINE_FOR_CHI[seat.engine_id];
+	// Unreachable under E-1 (Rust grants a claim only for a wrap engine); the
+	// claim then lapses by itself after 30 s.
 	if (!engine) throw new Error(`@${seat.name}'s engine (${seat.engine_id}) can't run in a terminal`);
 	const previous = seat.session;
 	const resumeId = route.resume.resumable ? (previous?.external_id ?? null) : null;
@@ -415,7 +438,7 @@ async function sendPathT(route: VacantRoute, claim: string, text: string, contex
 		);
 	} catch (err) {
 		showSeatNotice(
-			`Sent to a new ${seat.engine_id} terminal, but it couldn't be seated in @${seat.name} — ${errorText(err)}`,
+			`Sent to a new ${seat.engine_id} terminal, but it couldn't be seated — @${seat.name} is still vacant (${errorText(err)})`,
 			{ variant: 'error' }
 		);
 		return;
@@ -463,6 +486,10 @@ async function sendPathH(route: VacantRoute, text: string, context?: DispatchCon
  * `SessionStart` does that, so the runner's liveness guard stays
  * fail-closed). The prompt is dropped from the tab's spec once the PTY has
  * spawned, so a later respawn never sends the text a second time.
+ *
+ * The PTY is forced in-process (`forceEphemeral`): a daemon-backed terminal
+ * is invisible to Rust and can't be seated (P-10). A spawn that fails
+ * removes the tab, so no half-made `--resume` terminal is left to respawn.
  */
 async function spawnSeatTerminal(opts: {
 	engine: AgentEngineKind;
@@ -482,7 +509,10 @@ async function spawnSeatTerminal(opts: {
 	const tab = useTerminalStore.getState().tabs.find((t) => t.id === id);
 	if (!tab) throw new Error('Could not create the seat terminal');
 	try {
-		await openTabPty(tab);
+		await openTabPty(tab, { forceEphemeral: true });
+	} catch (err) {
+		useTerminalStore.getState().remove(id);
+		throw err;
 	} finally {
 		useTerminalStore.setState((s) => ({
 			tabs: s.tabs.map((t) =>
