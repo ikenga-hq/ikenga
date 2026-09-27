@@ -4701,6 +4701,26 @@ export async function listWindows(): Promise<WindowDescriptor[]> {
 	return invoke<WindowDescriptor[]>('window_list');
 }
 
+/**
+ * WP-69 (G-SEATS §4.4, DEC-69d): put `surfaceId` into "Window 2" — the most
+ * recently focused live non-`main` window, excluding `Workspace` windows
+ * bound to a project other than `projectId` (pin P-7) — as a new tab.
+ * Resolves to that window's label, or `null` when there is no Window 2 (then
+ * spawn one with {@link spawnWindow}). The caller focuses the label.
+ */
+export async function windowJoinSurface(surfaceId: string, projectId: string | null): Promise<string | null> {
+	return invoke<string | null>('window_join_surface', { surfaceId, projectId });
+}
+
+/**
+ * WP-69: take `surfaceId` out of the detached window `label` (a *Move back to
+ * main window* when `moveBack`). The window closes when it held nothing else.
+ * Resolves to its `surface_set` after the change.
+ */
+export async function windowRemoveSurface(label: string, surfaceId: string, moveBack = false): Promise<string[]> {
+	return invoke<string[]>('window_remove_surface', { label, surfaceId, moveBack });
+}
+
 // ── Chi-first agent surface (plans/2026-08-08-ikenga-chi-first WP-01) ─────────
 
 export type ChiRunStatus =

@@ -159,7 +159,8 @@ use commands::{
     settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
     spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
     studio_thread_get, studio_thread_get_or_create, studio_thread_list_recent,
-    terminal_detect_shells, window_close, window_list, window_spawn, ChiCache, ChiRuntime,
+    terminal_detect_shells, window_close, window_join_surface, window_list, window_remove_surface,
+    window_spawn, ChiCache, ChiRuntime,
     KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState, SidecarsRegistryState,
     StreamingSidecarManager, StreamingSidecarManagerState, WebviewPanesState,
 };
@@ -1128,6 +1129,9 @@ pub fn run() {
             window_spawn,
             window_close,
             window_list,
+            // WP-69: Pop out joins Window 2 (G-SEATS §4.4)
+            window_join_surface,
+            window_remove_surface,
             // fs
             fs_read,
             fs_write,

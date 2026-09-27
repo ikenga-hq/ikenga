@@ -6,24 +6,41 @@
 // iyke │ End session · Remove seat…. *Take over* (Round 45, §5.5) is added
 // only while another client holds the seat, so the resting menu is D-09's.
 //
-// **Pop out** (G-97): this file holds the one call site. Today it calls the
-// pop-out that ships (`spawnWindow`, always a new window); WP-69 changes
-// only what `popOutTerminal` does (join Window 2, DEC-69d) under its scoped
-// exception, and nothing else in the Companion.
+// **Pop out / Open in pane** (G-97, Round 50): this file holds their call
+// sites. WP-69 (DEC-69d, G-SEATS §4.4) made Pop out join "Window 2" — the
+// most recently focused live secondary window — and spawn one only when
+// none is open, and gave a persistent-run seat something to show: a
+// terminal attached to its tmux session (`terminal/attach-run.ts`). A
+// one-off run seat stays disabled ("headless run — nothing to show").
+// Nothing here touches the seat row: its address and dispatch are
+// unchanged (D-09 rule 2).
 
 import { useEffect, useRef } from 'react';
 import { cn } from '@/components/ui/utils';
-import { spawnWindow } from '@/lib/tauri-cmd';
-import { markSurfaceDetached, syncDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { usePaneStore } from '@/lib/panes/pane-store';
+import { cachedSeats } from '@/lib/queries/seats';
+import { activeProjectCwd } from '@/lib/shell/active-project-cwd';
+import { useShellStore } from '@/lib/shell/shell-store';
+import type { SeatView } from '@/lib/tauri-cmd';
+import { onSurfacesReturned, type SurfacesReturned } from '@/lib/window/detached-surfaces';
+import { isDetachedWindow } from '@/lib/window/window-context';
+import { popOutSurface } from '@/lib/window/window-two';
+import { attachRunTerminal, cachedRunTerminalSession, isRunAttachCmd } from '@/terminal/attach-run';
 import { useTerminalStore } from '@/terminal/session-store';
+import { mountOfTerminal, openSessionInPane } from './seat-actions';
 import { showSeatNotice } from './seat-notice';
+import { sessionName } from './seat-sessions';
 
-// ─── Pop out (the single call site, G-97) ───────────────────────────────────
+// ─── Pop out / Open in pane (the call sites, G-97 + Round 50) ──────────────
+
+/** D-09's disabled reason for a one-off run seat (§4.4). */
+export const HEADLESS_RUN_REASON = 'Headless run — nothing to show';
 
 /**
- * Pop a terminal out to a second window. The seat row never changes: the
- * address is not the mount (D-09 rule 2, §4.4). `name` is the seat's name,
- * or the session's label for an unseated one.
+ * Pop a terminal out to Window 2: join it when one is open, else spawn it
+ * (DEC-69d). The seat row never changes: the address is not the mount
+ * (D-09 rule 2, §4.4). `name` is the seat's name, or the session's label
+ * for an unseated one.
  */
 export function popOutTerminal(terminalId: string, name: string): void {
 	const tab = useTerminalStore.getState().tabs.find((t) => t.id === terminalId);
@@ -32,26 +49,124 @@ export function popOutTerminal(terminalId: string, name: string): void {
 		showSeatNotice(`${name}’s terminal isn’t running — nothing to pop out`, { variant: 'error' });
 		return;
 	}
-	const surfaceId = `terminal:${ptyId}`;
-	const label = `detached-terminal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-	// Optimistic, exactly like the pane's own pop-out: the pane swaps to its
-	// placeholder at once instead of briefly duplicating the live terminal.
-	markSurfaceDetached(surfaceId, label);
-	spawnWindow({
-		label,
-		kind: 'single-surface',
-		surface_set: [surfaceId],
-		project_id: null,
-		layout_key: label,
+	ensureReturnNotices();
+	popOutSurface(`terminal:${ptyId}`, {
+		projectId: useShellStore.getState().activeProject.id,
+		kind: 'terminal',
 	})
 		.then(() => showSeatNotice(`${name} moved to Window 2 — its address is unchanged`))
 		.catch((err: unknown) => {
-			void syncDetachedSurfaces();
 			showSeatNotice(`Couldn’t pop out ${name}: ${err instanceof Error ? err.message : String(err)}`, {
 				variant: 'error',
 			});
 		});
 }
+
+/**
+ * Why a seat's *Open in pane* / *Pop out* is disabled, or `''` when it can
+ * run (§4.4). `live` is whether the seat's terminal is running (for a run
+ * seat: its attached terminal, which doesn't matter here).
+ */
+export function seatPaneBlocker(seat: SeatView, live: boolean): string {
+	if (seat.status === 'vacant' || !seat.session) return 'Vacant — resume or fill it first';
+	if (seat.session.kind === 'terminal') return live ? '' : 'Its terminal isn’t running';
+	// A run seat: only a persistent run in flight has a tmux session to attach.
+	const session = cachedRunTerminalSession({ runId: seat.session.run_id, engineId: seat.engine_id });
+	if (session === null) return HEADLESS_RUN_REASON;
+	if (seat.status !== 'run') return 'The run has finished — nothing to attach to';
+	if (session === undefined) return 'Checking the run…';
+	return '';
+}
+
+/** The seat's terminal — for a persistent run, one attached to its tmux
+ *  session (reused when one is running, else spawned now). */
+async function seatTerminal(seat: SeatView): Promise<string> {
+	const s = seat.session;
+	if (!s) throw new Error('the seat is vacant');
+	if (s.kind === 'terminal') return s.terminal_id;
+	const session = cachedRunTerminalSession({ runId: s.run_id, engineId: seat.engine_id });
+	if (!session) throw new Error('headless run — nothing to show');
+	return attachRunTerminal({ session, cwd: s.cwd ?? activeProjectCwd(), title: `${seat.name} · run` });
+}
+
+/** *Pop out* on a seat (§4.4). */
+export function popOutSeat(seat: SeatView): void {
+	void seatTerminal(seat)
+		.then((terminalId) => popOutTerminal(terminalId, seat.name))
+		.catch((err: unknown) =>
+			showSeatNotice(`Couldn’t pop out ${seat.name}: ${err instanceof Error ? err.message : String(err)}`, {
+				variant: 'error',
+			})
+		);
+}
+
+/** *Open in pane* on a seat (§4.4): brings it back from Window 2, focuses
+ *  the pane holding it, or opens it in the focused pane. */
+export function openSeatInPane(seat: SeatView): void {
+	void seatTerminal(seat)
+		.then((terminalId) => openSessionInPane(terminalId))
+		.catch((err: unknown) =>
+			showSeatNotice(`Couldn’t open ${seat.name}: ${err instanceof Error ? err.message : String(err)}`, {
+				variant: 'error',
+			})
+		);
+}
+
+// ─── Coming back from Window 2 (D-09 `moveBack` / `closeWin2`) ──────────────
+
+/** The seat name (or session label) for a returned `terminal:<ptyId>`. */
+function returnedName(terminalId: string): string {
+	const seats = cachedSeats(useShellStore.getState().activeProject.id) ?? [];
+	const tab = useTerminalStore.getState().tabs.find((t) => t.id === terminalId);
+	const seat = seats.find(
+		(st) =>
+			(st.session?.kind === 'terminal' && st.session.terminal_id === terminalId) ||
+			(st.session?.kind === 'run' && tab && isRunAttachCmd(tab.spec.cmd, st.session.run_id))
+	);
+	return seat ? seat.name : sessionName(terminalId);
+}
+
+/**
+ * Surfaces that left Window 2 come back into the main window: each terminal
+ * no pane holds opens in the focused pane (one that a pane still holds just
+ * shows live again there), and the toast says where, D-09's words.
+ */
+export function handleSurfacesReturned(e: SurfacesReturned): void {
+	const terminals = e.surfaceIds
+		.filter((id) => id.startsWith('terminal:'))
+		.map((id) => useTerminalStore.getState().tabs.find((t) => t.ptyId === id.slice('terminal:'.length)))
+		.filter((t): t is NonNullable<typeof t> => Boolean(t));
+	for (const t of terminals) {
+		const panes = usePaneStore.getState();
+		panes.addTab(panes.focusedId, { kind: 'terminal', sessionId: t.id });
+	}
+	if (e.reason === 'window-closed') {
+		const n = e.surfaceIds.length;
+		showSeatNotice(
+			`Window 2 closed — ${n} pane${n === 1 ? '' : 's'} returned to the main window; addresses unchanged`
+		);
+		return;
+	}
+	const t = terminals[0];
+	if (!t) return;
+	const panes = usePaneStore.getState();
+	const m = mountOfTerminal(t.id, panes.root, {}, t.ptyId);
+	const where = m.where === 'main' ? `main window · pane ${m.paneIndex}` : 'the main window';
+	showSeatNotice(`${returnedName(t.id)} moved to ${where} — its address is unchanged`);
+}
+
+let returnNoticesOn = false;
+
+/** Subscribe the Companion to surfaces coming back (once, primary only). */
+export function ensureReturnNotices(): void {
+	if (returnNoticesOn || isDetachedWindow()) return;
+	returnNoticesOn = true;
+	onSurfacesReturned(handleSurfacesReturned);
+}
+
+// The rail imports this module at boot, so returns are handled even for a
+// window popped out from a pane before any seat was.
+ensureReturnNotices();
 
 // ─── The menu ───────────────────────────────────────────────────────────────
 

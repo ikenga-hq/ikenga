@@ -10,7 +10,9 @@
 // window only detaches; the origin pane still owns + kills the PTY.
 //
 // Surface-set id convention: `"terminal:<ptyId>"` (the real PTY id, not the
-// pane/session id), encoded by the pop-out in `pane/views/terminal-view.tsx`.
+// pane/session id), encoded by the pop-out in `pane/views/terminal-view.tsx`
+// and by the seat menu's Pop out (WP-69, which may join it to a window that
+// already holds other tabs; the root hands each tab its own id alone).
 //
 // WORKS (WP-08, live-verified 2026-06-28): pop out a terminal → this window
 // attaches to the shared PTY and renders live; a command run in the origin
@@ -61,7 +63,7 @@ function parsePtyId(surfaces: string[]): string | null {
 	return id.length > 0 ? id : null;
 }
 
-export default function TerminalSurface({ ctx }: DetachedSurfaceProps) {
+export default function TerminalSurface({ ctx, actions }: DetachedSurfaceProps) {
 	const ptyId = parsePtyId(ctx.surfaces);
 	const [pty, setPty] = useState<Pty | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -150,6 +152,8 @@ export default function TerminalSurface({ ctx }: DetachedSurfaceProps) {
 				<span className="truncate" title={title?.tooltip ?? ptyId}>
 					{title?.label ?? `terminal ${ptyId.slice(0, 8)}…`}
 				</span>
+				{/* WP-69: the window's ⋯ at the end of the address row (D-09). */}
+				{actions && <span className="ml-auto flex shrink-0 items-center">{actions}</span>}
 			</header>
 			<div className="min-h-0 flex-1">
 				{pty ? (

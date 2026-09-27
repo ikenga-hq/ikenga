@@ -19,6 +19,11 @@ const m = vi.hoisted(() => ({
 	seatsCreate: vi.fn(),
 	seatsMove: vi.fn(),
 	spawnWindow: vi.fn(async () => 'w2'),
+	// WP-69: Pop out first tries to join Window 2; `null` = none open.
+	windowJoinSurface: vi.fn(async (): Promise<string | null> => null),
+	windowRemoveSurface: vi.fn(async () => [] as string[]),
+	chiList: vi.fn(async (): Promise<unknown[]> => []),
+	attachRunTerminal: vi.fn(async () => 'term-att'),
 }));
 
 vi.mock('@/lib/transport', async (orig) => ({
@@ -38,12 +43,20 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	seatsCreate: m.seatsCreate,
 	seatsMove: m.seatsMove,
 	spawnWindow: m.spawnWindow,
+	windowJoinSurface: m.windowJoinSurface,
+	windowRemoveSurface: m.windowRemoveSurface,
 	listWindows: vi.fn(async () => []),
-	chiList: vi.fn(async () => []),
+	chiList: m.chiList,
 	detectAgents: vi.fn(async () => []),
 	ptyTerminalList: vi.fn(async () => []),
 	settingsGet: vi.fn(async () => null),
 	settingsSet: vi.fn(async () => {}),
+}));
+// WP-69: the tmux attach spawns a real PTY; stand it in (the hooks and the
+// cache reads stay real).
+vi.mock('@/terminal/attach-run', async (orig) => ({
+	...(await orig<typeof import('@/terminal/attach-run')>()),
+	attachRunTerminal: m.attachRunTerminal,
 }));
 vi.mock('@/shell/panes/pane-views', () => ({
 	viewLabel: (v: { kind: string; sessionId?: string; path?: string }) =>
@@ -167,6 +180,10 @@ beforeEach(() => {
 	m.seatsGet.mockReset();
 	m.seatsResolve.mockClear();
 	m.spawnWindow.mockClear();
+	m.windowJoinSurface.mockReset().mockResolvedValue(null);
+	m.windowRemoveSurface.mockClear();
+	m.chiList.mockReset().mockResolvedValue([]);
+	m.attachRunTerminal.mockClear();
 	useSeatNotice.setState({ notice: null });
 	useCompanionStore.setState({
 		state: 'collapsed',
@@ -352,17 +369,71 @@ describe('the seat menu', () => {
 		}
 	});
 
-	it('Pop out calls today’s spawnWindow with the seat’s terminal (G-97)', async () => {
+	it('Pop out with no Window 2 spawns one with the seat’s terminal (DEC-69d)', async () => {
 		await mountRail();
 		fireEvent.contextMenu(screen.getByRole('option', { name: /^@lead/ }));
 		fireEvent.click(screen.getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() => expect(m.windowJoinSurface).toHaveBeenCalledWith('terminal:pty-term-3', PROJECT));
 		await waitFor(() =>
 			expect(m.spawnWindow).toHaveBeenCalledWith(
 				expect.objectContaining({ kind: 'single-surface', surface_set: ['terminal:pty-term-3'] })
 			)
 		);
+		expect((m.spawnWindow.mock.calls[0] as unknown[])[0]).toMatchObject({ label: expect.stringMatching(/^detached-/) });
 		await waitFor(() =>
 			expect(useSeatNotice.getState().notice?.message).toBe('lead moved to Window 2 — its address is unchanged')
+		);
+	});
+
+	it('Pop out with Window 2 open joins it and spawns nothing (DEC-69d)', async () => {
+		m.windowJoinSurface.mockResolvedValue('detached-terminal-w2');
+		m.seatsMove.mockClear();
+		m.seatsClear.mockClear();
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@lead/ }));
+		fireEvent.click(screen.getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() =>
+			expect(useSeatNotice.getState().notice?.message).toBe('lead moved to Window 2 — its address is unchanged')
+		);
+		expect(m.spawnWindow).not.toHaveBeenCalled();
+		// A window operation only: no seat command ran (§4.4).
+		expect(m.seatsMove).not.toHaveBeenCalled();
+		expect(m.seatsClear).not.toHaveBeenCalled();
+	});
+
+	it('a one-off run seat: Open in pane and Pop out say "headless run — nothing to show"', async () => {
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
+		const menu = screen.getByRole('menu');
+		await waitFor(() =>
+			expect(within(menu).getByRole('menuitem', { name: /^Pop out/ }).getAttribute('title')).toBe(
+				'Headless run — nothing to show'
+			)
+		);
+		for (const name of [/^Open in pane/, /^Pop out/]) {
+			expect((within(menu).getByRole('menuitem', { name }) as HTMLButtonElement).disabled).toBe(true);
+		}
+	});
+
+	it('a persistent run seat pops out a terminal attached to its tmux session (§4.4)', async () => {
+		m.chiList.mockResolvedValue([
+			{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui', terminal_session_id: 'run-np' },
+		]);
+		useTerminalStore.setState((st) => ({ tabs: [...st.tabs, tab('term-att', null, 5)] }));
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
+		const menu = screen.getByRole('menu');
+		await waitFor(() =>
+			expect((within(menu).getByRole('menuitem', { name: /^Pop out/ }) as HTMLButtonElement).disabled).toBe(false)
+		);
+		expect((within(menu).getByRole('menuitem', { name: /^Open in pane/ }) as HTMLButtonElement).disabled).toBe(false);
+		fireEvent.click(within(menu).getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() =>
+			expect(m.attachRunTerminal).toHaveBeenCalledWith(expect.objectContaining({ session: 'run-np', cwd: '/w' }))
+		);
+		await waitFor(() => expect(m.windowJoinSurface).toHaveBeenCalledWith('terminal:pty-term-att', PROJECT));
+		await waitFor(() =>
+			expect(useSeatNotice.getState().notice?.message).toBe('nightly moved to Window 2 — its address is unchanged')
 		);
 	});
 

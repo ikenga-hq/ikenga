@@ -1,30 +1,39 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock the Tauri seams the store talks to. `listen` resolves to a no-op
-// unlisten; `listWindows` / `closeWindow` are controllable per-test.
+// unlisten; `listWindows` / `windowRemoveSurface` are controllable per-test.
+// WP-69: a reclaim takes ONE surface out of its window (Rust closes the
+// window only when that was its last surface), so it calls
+// `windowRemoveSurface`, not `closeWindow`.
 vi.mock('@tauri-apps/api/event', () => ({
 	listen: vi.fn(() => Promise.resolve(() => {})),
 }));
 vi.mock('@/lib/tauri-cmd', () => ({
 	listWindows: vi.fn(),
-	closeWindow: vi.fn(() => Promise.resolve()),
+	windowRemoveSurface: vi.fn(() => Promise.resolve([])),
 }));
 // Primary window by default (the tracker no-ops in a detached window).
 vi.mock('./window-context', () => ({ isDetachedWindow: () => false }));
 
 import type { WindowDescriptor } from '@ikenga/contract';
-import { closeWindow, listWindows } from '@/lib/tauri-cmd';
+import { listWindows, windowRemoveSurface } from '@/lib/tauri-cmd';
 import {
 	clearPendingReclaimNudge,
+	clearPendingSurface,
+	handleSurfacesChanged,
 	hasPendingReclaimNudge,
 	markSurfaceDetached,
+	onSurfacesReturned,
 	reclaimSurface,
+	type SurfacesReturned,
 	syncDetachedSurfaces,
 	useDetachedSurfaces,
+	windowSurfaces,
 } from './detached-surfaces';
+import { PENDING_WINDOW_LABEL } from './surfaces-topic';
 
 const mockListWindows = vi.mocked(listWindows);
-const mockCloseWindow = vi.mocked(closeWindow);
+const mockCloseWindow = vi.mocked(windowRemoveSurface);
 
 function descriptor(label: string, surfaces: string[]): WindowDescriptor {
 	return {
@@ -50,7 +59,7 @@ beforeEach(() => {
 	for (const id of NUDGE_IDS) clearPendingReclaimNudge(id);
 	mockListWindows.mockReset();
 	mockCloseWindow.mockReset();
-	mockCloseWindow.mockResolvedValue(undefined);
+	mockCloseWindow.mockResolvedValue([]);
 });
 
 describe('syncDetachedSurfaces', () => {
@@ -102,13 +111,31 @@ describe('markSurfaceDetached', () => {
 });
 
 describe('reclaimSurface', () => {
-	it('closes the hosting window and clears the surface from the map', async () => {
+	it('takes the surface out of its hosting window and clears it from the map', async () => {
 		markSurfaceDetached('viewer:/b.md', 'detached-viewer-1');
 
 		await reclaimSurface('viewer:/b.md');
 
-		expect(mockCloseWindow).toHaveBeenCalledWith('detached-viewer-1');
+		expect(mockCloseWindow).toHaveBeenCalledWith('detached-viewer-1', 'viewer:/b.md');
 		expect(isDetached('viewer:/b.md')).toBe(false);
+	});
+
+	it('WP-69: reclaiming one tab of a two-surface window leaves the other tab there', async () => {
+		markSurfaceDetached('terminal:pty-1', 'detached-w2');
+		markSurfaceDetached('terminal:pty-9', 'detached-w2');
+
+		await reclaimSurface('terminal:pty-1');
+
+		expect(mockCloseWindow).toHaveBeenCalledWith('detached-w2', 'terminal:pty-1');
+		expect(isDetached('terminal:pty-1')).toBe(false);
+		expect(windowSurfaces('detached-w2')).toEqual(['terminal:pty-9']);
+	});
+
+	it('WP-69: no-ops while the surface’s Pop out is still resolving', async () => {
+		markSurfaceDetached('terminal:pty-1', PENDING_WINDOW_LABEL);
+		await reclaimSurface('terminal:pty-1');
+		expect(mockCloseWindow).not.toHaveBeenCalled();
+		expect(isDetached('terminal:pty-1')).toBe(true);
 	});
 
 	it('no-ops when the surface is not detached', async () => {
@@ -202,5 +229,98 @@ describe('pendingReclaimNudge (T-3a reclaim arming)', () => {
 			clearPendingReclaimNudge('terminal:pty-1');
 			expect(hasPendingReclaimNudge('terminal:pty-1')).toBe(false);
 		});
+	});
+});
+
+// WP-69 (G-SEATS §4.4, DEC-69d): a detached window holds several surfaces as
+// tabs; `window://surfaces-changed` carries joins and move-backs.
+describe('multi-surface windows (WP-69)', () => {
+	it('a join adds the surface to the window’s set; both point at one label', () => {
+		markSurfaceDetached('terminal:pty-9', 'detached-w2');
+		markSurfaceDetached('terminal:pty-1', PENDING_WINDOW_LABEL);
+
+		handleSurfacesChanged({
+			label: 'detached-w2',
+			surface_set: ['terminal:pty-9', 'terminal:pty-1'],
+			added: ['terminal:pty-1'],
+			removed: [],
+			move_back: false,
+		});
+
+		const map = useDetachedSurfaces.getState().surfaceToWindow;
+		expect(map['terminal:pty-1']).toBe('detached-w2');
+		expect(windowSurfaces('detached-w2').sort()).toEqual(['terminal:pty-1', 'terminal:pty-9']);
+	});
+
+	it('a move back drops the surface, arms its nudge and announces the return', () => {
+		const seen: SurfacesReturned[] = [];
+		const off = onSurfacesReturned((e) => seen.push(e));
+		markSurfaceDetached('terminal:pty-1', 'detached-w2');
+		markSurfaceDetached('terminal:pty-9', 'detached-w2');
+
+		handleSurfacesChanged({
+			label: 'detached-w2',
+			surface_set: ['terminal:pty-9'],
+			added: [],
+			removed: ['terminal:pty-1'],
+			move_back: true,
+		});
+		off();
+
+		expect(isDetached('terminal:pty-1')).toBe(false);
+		expect(isDetached('terminal:pty-9')).toBe(true);
+		expect(hasPendingReclaimNudge('terminal:pty-1')).toBe(true);
+		expect(seen).toEqual([{ label: 'detached-w2', surfaceIds: ['terminal:pty-1'], reason: 'move-back' }]);
+	});
+
+	it('a plain removal (a reclaim from the primary) announces nothing', () => {
+		const seen: SurfacesReturned[] = [];
+		const off = onSurfacesReturned((e) => seen.push(e));
+		markSurfaceDetached('terminal:pty-1', 'detached-w2');
+		handleSurfacesChanged({
+			label: 'detached-w2',
+			surface_set: [],
+			added: [],
+			removed: ['terminal:pty-1'],
+			move_back: false,
+		});
+		off();
+		expect(seen).toEqual([]);
+	});
+
+	it('a window closing with tabs in it announces every surface it held', async () => {
+		const seen: SurfacesReturned[] = [];
+		const off = onSurfacesReturned((e) => seen.push(e));
+		markSurfaceDetached('terminal:pty-1', 'detached-w2');
+		markSurfaceDetached('terminal:pty-9', 'detached-w2');
+		markSurfaceDetached('viewer:/b.md', 'detached-viewer-1');
+		mockListWindows.mockResolvedValue([descriptor('detached-viewer-1', ['viewer:/b.md'])]);
+
+		await syncDetachedSurfaces();
+		off();
+
+		expect(seen).toHaveLength(1);
+		expect(seen[0].label).toBe('detached-w2');
+		expect(seen[0].reason).toBe('window-closed');
+		expect(seen[0].surfaceIds.sort()).toEqual(['terminal:pty-1', 'terminal:pty-9']);
+	});
+
+	it('a re-sync keeps a provisional Pop out entry the registry doesn’t list yet', async () => {
+		markSurfaceDetached('terminal:pty-1', PENDING_WINDOW_LABEL);
+		mockListWindows.mockResolvedValue([]);
+
+		await syncDetachedSurfaces();
+
+		expect(useDetachedSurfaces.getState().surfaceToWindow['terminal:pty-1']).toBe(PENDING_WINDOW_LABEL);
+		expect(hasPendingReclaimNudge('terminal:pty-1')).toBe(false);
+	});
+
+	it('clearPendingSurface drops only a provisional entry', () => {
+		markSurfaceDetached('terminal:pty-1', PENDING_WINDOW_LABEL);
+		markSurfaceDetached('terminal:pty-9', 'detached-w2');
+		clearPendingSurface('terminal:pty-1');
+		clearPendingSurface('terminal:pty-9');
+		expect(isDetached('terminal:pty-1')).toBe(false);
+		expect(isDetached('terminal:pty-9')).toBe(true);
 	});
 });

@@ -330,7 +330,9 @@ commands.allow = [
   "viewer_serve",
   "viewer_stop",
   "window_close",
+  "window_join_surface",
   "window_list",
+  "window_remove_surface",
   "window_spawn",
 ]
 

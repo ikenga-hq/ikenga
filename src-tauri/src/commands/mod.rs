@@ -190,7 +190,9 @@ pub use studio_threads::{
 pub use supabase_config::{supabase_config_clear, supabase_config_get, supabase_config_set};
 pub use trust::{pkg_trust_grant, pkg_trust_list, pkg_trust_preview, pkg_trust_revoke};
 pub use viewer::{viewer_port, viewer_serve, viewer_stop};
-pub use window::{window_close, window_list, window_spawn};
+pub use window::{
+    window_close, window_join_surface, window_list, window_remove_surface, window_spawn,
+};
 
 // Moved to `crate::path_allow` so the headless daemon can use it without
 // pulling this module (which is entirely `#[tauri::command]` surface).
