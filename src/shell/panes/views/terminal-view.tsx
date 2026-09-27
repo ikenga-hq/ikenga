@@ -20,14 +20,16 @@ import { FeedbackState } from '@/components/ui/feedback-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { findLeaf, getActiveView } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { spawnWindow } from '@/lib/tauri-cmd';
+import { cachedSeats } from '@/lib/queries/seats';
+import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	clearPendingReclaimNudge,
 	hasPendingReclaimNudge,
-	markSurfaceDetached,
-	syncDetachedSurfaces,
 	useIsSurfaceDetached,
 } from '@/lib/window/detached-surfaces';
+import { popOutTerminal } from '@/shell/companion/seat-menu';
+import { sessionName } from '@/shell/companion/seat-sessions';
+import { isRunAttachCmd } from '@/terminal/attach-run';
 import { CostHud } from '@/terminal/cost-hud';
 import { GitLedger } from '@/terminal/git-ledger';
 import { PermissionInbox } from '@/terminal/permission-inbox';
@@ -39,6 +41,24 @@ import { DetachedSurfacePlaceholder } from './detached-placeholder';
 
 interface TerminalViewProps {
 	sessionId: string;
+}
+
+/**
+ * What a Pop out toast calls this terminal (D-09 `popOut`: the seat's name,
+ * else the session's): the active project's seat whose session it is (its
+ * own terminal, or a tmux client attached to its run), else `session N`.
+ * Mirrors the seat menu's private `returnedName`, read from the roster cache
+ * only (a Pop out never waits on a fetch).
+ */
+export function popOutName(terminalId: string): string {
+	const seats = cachedSeats(useShellStore.getState().activeProject.id) ?? [];
+	const tab = useTerminalStore.getState().tabs.find((t) => t.id === terminalId);
+	const seat = seats.find(
+		(st) =>
+			(st.session?.kind === 'terminal' && st.session.terminal_id === terminalId) ||
+			(st.session?.kind === 'run' && tab !== undefined && isRunAttachCmd(tab.spec.cmd, st.session.run_id))
+	);
+	return seat ? seat.name : sessionName(terminalId);
 }
 
 export function TerminalView({ sessionId }: TerminalViewProps) {
@@ -111,24 +131,17 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 		if (reclaimGate.justReclaimed && surfaceId) clearPendingReclaimNudge(surfaceId);
 	}, [reclaimGate.justReclaimed, surfaceId]);
 
+	// WP-71a (DEC-69d, G-SEATS §4.4, D-09 pane ⋯ "Pop out to Window 2"): the
+	// pane's Pop out goes through the seat menu's own call site, so it joins
+	// an open Window 2 and spawns one (`detached-terminal-…`, a
+	// `single-surface` window over `terminal:<ptyId>`) only when none is open.
+	// That path marks the surface detached before the IPC (this pane swaps to
+	// its placeholder at once), un-marks it and re-syncs on failure, and says
+	// so either way with D-09's toast.
 	const handlePopOut = useCallback(() => {
 		if (!ptyId || !surfaceId) return;
-		const label = `detached-terminal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-		// Optimistically mark detached so this pane swaps to the placeholder
-		// immediately instead of briefly duplicating the live terminal.
-		markSurfaceDetached(surfaceId, label);
-		void spawnWindow({
-			label,
-			kind: 'single-surface',
-			surface_set: [surfaceId],
-			project_id: null,
-			layout_key: label,
-		}).catch((e) => {
-			console.warn('pop-out terminal:', e);
-			// Reconcile the optimistic mark if the window never opened.
-			void syncDetachedSurfaces();
-		});
-	}, [ptyId, surfaceId]);
+		popOutTerminal(sessionId, popOutName(sessionId));
+	}, [ptyId, surfaceId, sessionId]);
 
 	if (tab && tab.owner.kind === 'studio') {
 		const ownerPaneId = tab.owner.paneId;
