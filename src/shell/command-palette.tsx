@@ -34,7 +34,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles, type TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
-import { ActionsGroup, ManageGroup } from './palette-actions';
+import { ActionsGroup, ChiGroup, ManageGroup } from './palette-actions';
 import { ShortcutsView } from './shortcuts-view';
 
 export type PaletteMode = 'all' | 'views' | 'switcher' | 'projects' | 'shortcuts';
@@ -263,6 +263,8 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 										{mode === 'all' && (
 											<ManageGroup onShowShortcuts={() => openCommandPalette('shortcuts')} />
 										)}
+
+										{mode === 'all' && <ChiGroup onClose={() => onOpenChange(false)} />}
 
 										{mode === 'all' && (
 											<Command.Group heading="Navigate" className="text-xs text-muted-foreground">

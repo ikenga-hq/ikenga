@@ -25,6 +25,8 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'explorer', label: 'Explorer', namespaces: ['explorer'] },
 		{ id: 'panes', label: 'Panes and tabs', namespaces: ['pane', 'tab'] },
 		{ id: 'companion', label: 'Companion', namespaces: ['dock', 'companion', 'session'] },
+		// WP-68 (D-09 PALETTE): the seat board's key (`chi.board`).
+		{ id: 'chi', label: 'Chi · Seats', namespaces: ['chi'] },
 		{ id: 'terminal', label: 'Terminal', namespaces: ['terminal'] },
 		{ id: 'ngwa', label: 'Ngwa', namespaces: ['ngwa'] },
 		// WP-56: leftover widget-local handlers migrated to registry commands.
@@ -34,6 +36,8 @@ export const SHORTCUT_REGIONS: ReadonlyArray<{ id: string; label: string; namesp
 		{ id: 'menu', label: 'Menu bar', namespaces: ['menu'] },
 		// WP-54 defaults: window zoom and the OS-wide `os.*` shortcuts.
 		{ id: 'window', label: 'Window', namespaces: ['zoom', 'os'] },
+		// WP-68: WP-72's Lock now (`people.lock-now`, D-05 ⌘⇧L).
+		{ id: 'people', label: 'People', namespaces: ['people'] },
 		{ id: 'help', label: 'Help', namespaces: ['shortcuts'] },
 	];
 

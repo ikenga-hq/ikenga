@@ -58,6 +58,10 @@ describe('groupShortcuts() — T5', () => {
 		expect(regionFor('rail.app').label).toBe('Rail');
 		expect(regionFor('tab.close').id).toBe('panes');
 		expect(regionFor('shortcuts.open').id).toBe('help');
+		// WP-68: the D-09 "Chi · Seats" group, and WP-72's Lock now.
+		expect(regionFor('chi.board')).toEqual({ id: 'chi', label: 'Chi · Seats', namespaces: ['chi'] });
+		expect(groups.find((g) => g.id === 'chi')?.rows.map((r) => r.command)).toEqual(['chi.board']);
+		expect(regionFor('people.lock-now').id).toBe('people');
 	});
 
 	it('takes every key label from labelFor()', () => {

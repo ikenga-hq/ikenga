@@ -616,7 +616,7 @@ function UnseatedRow({
 
 // ─── Menus ──────────────────────────────────────────────────────────────────
 
-function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, live: boolean): SeatMenuItem[] {
+export function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, live: boolean): SeatMenuItem[] {
 	const terminalId = seat.session?.kind === 'terminal' ? seat.session.terminal_id : null;
 	const vacant = seat.status === 'vacant';
 	const isRun = seat.session?.kind === 'run';
@@ -703,7 +703,7 @@ function seatMenuItems(seat: SeatView, isTarget: boolean, mount: Mount, live: bo
 	return items;
 }
 
-function sessionMenuItems(session: UnseatedSession, isTarget: boolean, mount: Mount): SeatMenuItem[] {
+export function sessionMenuItems(session: UnseatedSession, isTarget: boolean, mount: Mount): SeatMenuItem[] {
 	const name = sessionName(session.id);
 	const live = session.status === 'running';
 	const inWindow = mount.where === 'window';

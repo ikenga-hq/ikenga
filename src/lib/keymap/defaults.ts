@@ -112,6 +112,32 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 	{ command: 'rail.chi', key: 'mod+2', when: '!inputFocus', source: 'default', label: 'Rail → Chi' },
 	{ command: 'rail.ngwa', key: 'mod+3', when: '!inputFocus', source: 'default', label: 'Rail → Ngwa' },
 	{ command: 'rail.settings', key: 'mod+,', when: '!inputFocus', source: 'default', label: 'Rail → Settings' },
+	// --- Chi seats (WP-68, D-09, DEC-67, G-SEATS §8). ⌘2 keeps `rail.chi`
+	// (expand the Companion, focus dispatch); ⌘2 AGAIN, from the dispatch
+	// input, opens the seat board. A precedence pair with `rail.chi`, never a
+	// clash (G-ACTIONS §5): same key, different normalized `when`, and the two
+	// can never both hold — the dispatch input is an input, so `!inputFocus`
+	// is false wherever `dispatchFocus` is true. An ordinary frame command,
+	// not a hosted one: the dispatch input consumes only its three hosted
+	// keys, so ⌘2 reaches the dispatcher. No `knownOverlap`: pane focus left
+	// `mod+2` with DEC-64. ⌘2 in any other text field does nothing. ⌥↑ / ⌥↓
+	// (cycle the target) stay Companion-local — D-09 draws no global binding.
+	{
+		command: 'chi.board',
+		key: 'mod+2',
+		when: 'dispatchFocus',
+		source: 'default',
+		label: 'Chi → Seat board',
+	},
+	// --- People (WP-72's Lock now, D-05 `people.html` ⌘⇧L; bound here by
+	// WP-68, which owns this file in wave 13e — Round 47 / Round 50).
+	{
+		command: 'people.lock-now',
+		key: 'mod+shift+l',
+		when: '!inputFocus',
+		source: 'default',
+		label: 'Lock now',
+	},
 
 	// --- Command palette (src/shell/command-palette.tsx registers these).
 	// `palette.open` / `shortcuts.open` and `palette.close` /
