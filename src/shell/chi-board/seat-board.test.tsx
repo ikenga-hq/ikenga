@@ -71,7 +71,7 @@ import {
 	useBoardUi,
 } from './board-store';
 import { MOVED_MS, opensInPane, SeatBoard } from './seat-board';
-import { SessionsSection } from '@/shell/explorer/sections/sessions';
+import { SessionsSeatsLink } from '@/shell/explorer/sections/sessions';
 
 const PROJECT = 'royalti-co';
 
@@ -550,7 +550,9 @@ describe('entry points', () => {
 			root: { type: 'leaf', id: 'L1', tabs: [{ kind: 'route', path: '/project/dashboard' }], activeTabIdx: 0 },
 			focusedId: 'L1',
 		});
-		wrap(<SessionsSection projectId={PROJECT} />);
+		// WP-71a: the link lives in the Sessions header row (the registry's
+		// `headerActions`); `section-frame.test.tsx` covers its placement.
+		wrap(<SessionsSeatsLink projectId={PROJECT} />);
 		const link = document.querySelector('[data-explorer-seats-link]') as HTMLButtonElement;
 		expect(link.textContent).toBe('Seats');
 		expect(link.getAttribute('aria-current')).toBeNull();

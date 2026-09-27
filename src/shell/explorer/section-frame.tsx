@@ -1,6 +1,7 @@
 import type React from 'react';
 import type { ReactNode } from 'react';
 import { ArrowDown, ArrowUp, ChevronDown, ChevronRight, EyeOff, FoldVertical } from 'lucide-react';
+import { cn } from '@/components/ui/utils';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import type { ExplorerSectionDefinition, ExplorerSectionContext } from './section-registry';
 
@@ -71,21 +72,32 @@ export function SectionFrame({
 	const menuDisabled = (id: string) =>
 		id === 'section.move-up' ? !canMoveUp : id === 'section.move-down' ? !canMoveDown : false;
 
+	// WP-71a: the section's header-row controls (`headerActions`). D-09 LISTING
+	// (`seats-board.html` `.seclink`) places them absolutely at the right end
+	// of the header, which keeps its right padding clear for them. They are a
+	// sibling of the header button, not a child: a button can't hold another
+	// one, and a click on them must never reach the header's collapse toggle.
+	const headerActions = section.headerActions?.(context);
+
 	return (
 		<div className="flex flex-col border-b border-border last:border-b-0" data-explorer-section={section.id}>
-			<EffectiveContextMenu
-				menuId={`section/${section.id}`}
-				handlers={menuHandlers}
-				disabled={menuDisabled}
-				labels={SECTION_MENU_LABELS}
-				icons={SECTION_MENU_ICONS}
-			>
+			<div className="relative">
+				<EffectiveContextMenu
+					menuId={`section/${section.id}`}
+					handlers={menuHandlers}
+					disabled={menuDisabled}
+					labels={SECTION_MENU_LABELS}
+					icons={SECTION_MENU_ICONS}
+				>
 					<button
 						type="button"
 						data-explorer-row="header"
 						data-explorer-header="true"
 						data-section-id={section.id}
-						className="flex items-center gap-1.5 px-2 py-1.5 hover:bg-accent/50 focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus:outline-none w-full text-left transition-colors min-h-[28px]"
+						className={cn(
+							'flex items-center gap-1.5 pl-2 py-1.5 hover:bg-accent/50 focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus:outline-none w-full text-left transition-colors min-h-[28px]',
+							headerActions ? 'pr-[76px]' : 'pr-2'
+						)}
 						aria-expanded={isOpen}
 						aria-label={ariaLabel}
 						onClick={handleToggle}
@@ -108,7 +120,16 @@ export function SectionFrame({
 							</span>
 						)}
 					</button>
-			</EffectiveContextMenu>
+				</EffectiveContextMenu>
+				{headerActions && (
+					<div
+						className="absolute right-2 top-1 flex items-center gap-1"
+						data-explorer-header-actions={section.id}
+					>
+						{headerActions}
+					</div>
+				)}
+			</div>
 			{isOpen && (
 				<div className="flex-1 min-h-0 bg-background/50">
 					{children}
