@@ -16,7 +16,9 @@ import {
 	findEditorConflict,
 	formFromAction,
 	missingRunField,
+	missingRunFieldName,
 	planKeybindingWrite,
+	seatSuggestions,
 	slug,
 	suggestedRestriction,
 	type EditorFormState,
@@ -226,6 +228,82 @@ describe('missingRunField', () => {
 		expect(missingRunField(withForm({ runType: 'chi', chiPrompt: 'hi' }))).toBe(false);
 		expect(missingRunField(withForm({ runType: 'shell', shellCommand: '  ' }))).toBe(true);
 		expect(missingRunField(withForm({ runType: 'open', openUrl: '/x' }))).toBe(false);
+	});
+});
+
+// WP-71a — the Editor's seat input (G-SEATS §9.1): `seat` is required iff the
+// Chi target is `seat`, is written only then, and round-trips on load.
+describe('seat target', () => {
+	it('names what is missing the way Save says it, prompt first, then the seat', () => {
+		expect(missingRunFieldName(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: '', chiSeat: '' }))).toBe(
+			'a prompt'
+		);
+		expect(missingRunFieldName(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: 'x', chiSeat: '  ' }))).toBe(
+			'a seat'
+		);
+		expect(missingRunField(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: 'x', chiSeat: '' }))).toBe(true);
+		expect(missingRunFieldName(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: 'x', chiSeat: 'lead' }))).toBe(
+			null
+		);
+		// Not required for any other target, even when a stale value is blank.
+		expect(missingRunFieldName(withForm({ runType: 'chi', chiTarget: 'active', chiPrompt: 'x', chiSeat: '' }))).toBe(
+			null
+		);
+		expect(missingRunFieldName(withForm({ runType: 'shell', shellCommand: '' }))).toBe('a command');
+	});
+
+	it('writes `seat` (trimmed) only while the target is `seat`, in either address form', () => {
+		expect(buildRun(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: 'x', chiSeat: ' lead ' }))).toEqual({
+			kind: 'chi',
+			target: 'seat',
+			prompt: 'x',
+			seat: 'lead',
+		});
+		expect(
+			buildRun(withForm({ runType: 'chi', chiTarget: 'seat', chiPrompt: 'x', chiSeat: 'royalti-co/lead' }))
+		).toEqual({ kind: 'chi', target: 'seat', prompt: 'x', seat: 'royalti-co/lead' });
+		// Switching the target away drops it from what is saved.
+		expect(buildRun(withForm({ runType: 'chi', chiTarget: 'new', chiPrompt: 'x', chiSeat: 'lead' }))).toEqual({
+			kind: 'chi',
+			target: 'new',
+			prompt: 'x',
+		});
+	});
+
+	it('loads a saved seat action back into the field', () => {
+		const form = formFromAction(
+			{
+				id: 'ask-lead',
+				name: 'Ask lead',
+				description: '',
+				source: 'personal',
+				run: { kind: 'chi', target: 'seat', seat: 'royalti-co/lead', prompt: '{{selection}}' },
+				placements: [],
+				locked: false,
+				danger: false,
+				hosted: false,
+				osOnly: false,
+				editable: true,
+				// biome-ignore lint/suspicious/noExplicitAny: a minimal test double for the frozen EffectiveAction shape
+			} as any,
+			null
+		);
+		expect(form.chiTarget).toBe('seat');
+		expect(form.chiSeat).toBe('royalti-co/lead');
+		expect(buildRun(form)).toEqual({
+			kind: 'chi',
+			target: 'seat',
+			prompt: '{{selection}}',
+			seat: 'royalti-co/lead',
+		});
+	});
+
+	it('suggests the roster’s seat names, in order, once each', () => {
+		expect(seatSuggestions(undefined)).toEqual([]);
+		expect(seatSuggestions([{ name: 'lead' }, { name: 'review' }, { name: 'lead' }, { name: '' }])).toEqual([
+			'lead',
+			'review',
+		]);
 	});
 });
 

@@ -1,12 +1,10 @@
 import { ArrowUpRight } from 'lucide-react';
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
-import { spawnWindow } from '@/lib/tauri-cmd';
-import {
-	markSurfaceDetached,
-	syncDetachedSurfaces,
-	useIsSurfaceDetached,
-} from '@/lib/window/detached-surfaces';
+import { useShellStore } from '@/lib/shell/shell-store';
+import { useIsSurfaceDetached } from '@/lib/window/detached-surfaces';
+import { popOutSurface } from '@/lib/window/window-two';
+import { showSeatNotice } from '@/shell/companion/seat-notice';
 import { ViewerRouter } from '@/viewer/auto-router';
 import { ArtifactInfoStrip } from '@/viewer/chrome/artifact-info-strip';
 import { ArtifactStoppedPlate } from '@/viewer/chrome/artifact-stopped-plate';
@@ -52,29 +50,28 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 		}
 	}, [path, line, col]);
 
-	// Pop-out: spawn a thin single-surface viewer window for this file.
-	// The path is encoded in the surface_set entry ("viewer:<path>") so the
-	// detached ViewerSurface can extract it from ctx.surfaces[0].
+	// Pop-out. The path is encoded in the surface_set entry ("viewer:<path>")
+	// so the detached ViewerSurface can extract it from ctx.surfaces[0].
 	// First-colon split only, so absolute paths starting with "/" survive.
+	//
+	// WP-71a (DEC-69d, G-SEATS §4.4): Pop out joins an open Window 2, as the
+	// seat menu's does, and spawns a thin `single-surface` viewer window
+	// (`detached-viewer-…`) only when none is open. `popOutSurface` marks the
+	// surface detached before the IPC (this pane swaps to its placeholder at
+	// once) and un-marks it and re-syncs on failure; the failure is said here.
 	const surfaceId = `viewer:${path}`;
 	const isDetached = useIsSurfaceDetached(surfaceId);
 	const handlePopOut = useCallback(() => {
-		const label = `detached-viewer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-		// Optimistically mark detached so this pane swaps to the placeholder
-		// immediately instead of briefly duplicating the viewer.
-		markSurfaceDetached(surfaceId, label);
-		void spawnWindow({
-			label,
-			kind: 'single-surface',
-			surface_set: [surfaceId],
-			project_id: null,
-			layout_key: label,
-		}).catch((e) => {
-			console.warn('pop-out viewer:', e);
-			// Reconcile the optimistic mark if the window never opened.
-			void syncDetachedSurfaces();
-		});
-	}, [surfaceId]);
+		const name = path.split('/').filter(Boolean).pop() ?? path;
+		popOutSurface(surfaceId, { projectId: useShellStore.getState().activeProject.id, kind: 'viewer' })
+			.then(() => showSeatNotice(`${name} moved to Window 2`))
+			.catch((err: unknown) => {
+				console.warn('pop-out viewer:', err);
+				showSeatNotice(`Couldn’t pop out ${name}: ${err instanceof Error ? err.message : String(err)}`, {
+					variant: 'error',
+				});
+			});
+	}, [path, surfaceId]);
 
 	// D-08 chrome state (designs/pane-chrome.html) — zoom / device preset /
 	// which variant (default renderer, source split, history drawer).
@@ -163,7 +160,7 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 			<div className="absolute right-2 top-1 z-10">
 				<IconButton
 					onClick={handlePopOut}
-					title="Pop out — open this file in a detached viewer window"
+					title="Pop out to Window 2"
 					aria-label="Pop out viewer"
 					className="bg-background/80 backdrop-blur-sm"
 				>

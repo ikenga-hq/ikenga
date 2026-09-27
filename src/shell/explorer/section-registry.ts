@@ -13,7 +13,7 @@ import {
 
 import { FilesSection } from './sections/files';
 import { ArtifactsSection } from './sections/artifacts';
-import { SessionsSection } from './sections/sessions';
+import { SessionsSeatsLink, SessionsSection } from './sections/sessions';
 import { NgwaProjectSection } from './sections/ngwa-project';
 import { AutomationsSection } from './sections/automations';
 import { TodosSection } from './sections/todos';
@@ -37,6 +37,14 @@ export interface ExplorerSectionDefinition {
 	badge?: (ctx: ExplorerSectionContext) => string | undefined;
 	count?: (ctx: ExplorerSectionContext) => number | undefined;
 	useCount?: (ctx: ExplorerSectionContext) => number | undefined;
+	/**
+	 * WP-71a: controls for the section's header row, at its right end (D-09
+	 * LISTING draws the Sessions "Seats" link there). `section-frame.tsx`
+	 * renders them beside the header button, never inside it, so clicking one
+	 * doesn't collapse the section. They show whether the section is open or
+	 * collapsed.
+	 */
+	headerActions?: (ctx: ExplorerSectionContext) => React.ReactNode;
 }
 
 export const builtInSections: ExplorerSectionDefinition[] = [
@@ -65,6 +73,7 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		defaultOrder: 2,
 		render: (ctx) => React.createElement(SessionsSection, ctx),
 		useCount: () => useTerminalStore((s) => s.tabs.length),
+		headerActions: (ctx) => React.createElement(SessionsSeatsLink, ctx),
 	},
 	{
 		id: 'ngwa-project',
