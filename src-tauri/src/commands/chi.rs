@@ -766,6 +766,16 @@ async fn openrouter_adapter(app: &AppHandle) -> Option<OpenRouterHttpEngineState
     }
 }
 
+/// Seat-store probe (G-SEATS §2.2, §6.2): does the openrouter adapter still
+/// hold the transcript for `thread_id`? `None` when the adapter is not
+/// registered at all (engine unavailable); `Some(false)` when it is, but the
+/// thread's history is gone (the app restarted). Read-only — it never
+/// registers a session.
+pub(crate) async fn openrouter_holds_thread(app: &AppHandle, thread_id: &str) -> Option<bool> {
+    let engine = openrouter_adapter(app).await?;
+    Some(engine.existing_session(thread_id).await.is_some())
+}
+
 /// Run-start tail shared by `chi_run` (new run) and `chi_resume` (continuing
 /// turn) for the CLI-less engine. Marks the row running, registers the cancel
 /// handle, and spawns the in-process turn task.
@@ -1715,13 +1725,34 @@ pub async fn chi_resume(
     #[allow(non_snake_case)] runId: String,
     prompt: String,
 ) -> Result<ChiRunResult, String> {
-    let run_id = runId;
+    resume_chi_run(
+        &app,
+        db.inner().clone(),
+        cache.inner(),
+        runtime.inner(),
+        runId,
+        prompt,
+    )
+    .await
+}
+
+/// Core of `chi_resume`, callable from other commands without going through
+/// the Tauri command boundary — the seat store's resume and queue paths
+/// (G-SEATS §4.1, §4.5). The body is the command's own, unchanged: the run
+/// keeps its `run_id`.
+pub(crate) async fn resume_chi_run(
+    app: &AppHandle,
+    db: Arc<PaDb>,
+    cache: &ChiCache,
+    runtime: &Arc<ChiRuntime>,
+    run_id: String,
+    prompt: String,
+) -> Result<ChiRunResult, String> {
     let row = cache_get(&db, &run_id)
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
 
-    let db = db.inner().clone();
-    let cache = cache.inner().clone();
+    let cache = cache.clone();
     let output_path = PathBuf::from(row.output_path.as_deref().unwrap_or(""));
 
     // ── CLI-less (in-process) engine path ────────────────────────────────────
@@ -1736,7 +1767,7 @@ pub async fn chi_resume(
         if matches!(row.status.as_str(), "running" | "queued") {
             return Err(format!("chi run {run_id} is still in progress"));
         }
-        let Some(engine) = openrouter_adapter(&app).await else {
+        let Some(engine) = openrouter_adapter(app).await else {
             return Err(
                 "openrouter engine is not registered; restart the shell to resume its runs"
                     .to_string(),
@@ -1750,9 +1781,9 @@ pub async fn chi_resume(
             return Err(e);
         }
         return openrouter_spawn_run(
-            &app,
+            app,
             db,
-            &runtime,
+            runtime,
             run_id,
             output_path,
             &row_into_resume_opts(&row, prompt),

@@ -1,9 +1,12 @@
 //! Memory + coordination bridge endpoints (Phase 1 of
 //! projects-first-class). Implements `pkgs/mcp-iyke/DESIGN.md` §4-6.
 //!
-//! Wire scope is a single string: "workspace" | "pkg:<id>" | "project:<id>".
+//! Wire scope is a single string: "workspace" | "pkg:<id>" | "project:<id>"
+//! | "seat:<project>/<name>" (G-SEATS §3, DEC-68).
 //! `scope` omitted on a write resolves to the active project at request
-//! time (DESIGN.md §1 amendment for the projects-first-class plan).
+//! time (DESIGN.md §1 amendment for the projects-first-class plan). A
+//! `seat:` scope is never expanded from a bare name: callers pass the full
+//! address a seat view reports.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -96,7 +99,7 @@ fn scratchpad_notifier(scope: &str, name: &str) -> Arc<Notify> {
     notifiers.entry(key).or_default().clone()
 }
 
-fn scratchpad_changed(scope: &str, name: &str, version: i64, deleted: bool) {
+pub(crate) fn scratchpad_changed(scope: &str, name: &str, version: i64, deleted: bool) {
     observe_scratchpad_version(version);
     let key = scratchpad_key(scope, name);
     if let Ok(mut tombstones) = scratchpad_tombstones().lock() {
@@ -166,6 +169,21 @@ fn validate_scope(scope: &str) -> Result<(), (StatusCode, String)> {
                 StatusCode::BAD_REQUEST,
                 "invalid project scope".to_string(),
             ));
+        }
+        return Ok(());
+    }
+    // G-SEATS §3.1/§3.2: `seat:<project>/<name>`. Grammar only — `<project>`
+    // stays opaque here, like the `project:` arm (§3.3). The project segment
+    // follows `projects.rs::validate_slug` (shared copy, agreement-tested in
+    // `seats.rs`); the name follows the seat grammar, which admits no `/`.
+    if let Some(rest) = scope.strip_prefix("seat:") {
+        let (project, name) = rest
+            .split_once('/')
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid seat scope"))?;
+        if super::seats::validate_project_slug(project).is_err()
+            || super::seats::validate_seat_name(name).is_err()
+        {
+            return Err(err(StatusCode::BAD_REQUEST, "invalid seat scope"));
         }
         return Ok(());
     }
@@ -1903,5 +1921,52 @@ mod tests {
         assert!(validate_scope("pkg:com.ikenga.iyke").is_ok());
         assert!(validate_scope("nope").is_err());
         assert!(validate_scope("project:").is_err());
+    }
+
+    /// G-SEATS §3.1: `seat:<project>/<name>` — accepted forms and every
+    /// rejection the grammar names (no project, extra `/`, empty segment,
+    /// uppercase, trailing slash), plus the bounds of both segments.
+    #[test]
+    fn seat_scope_grammar_accepts_and_rejects() {
+        for ok in [
+            "seat:royalti-co/lead",
+            "seat:default/review",
+            "seat:a/b",
+            "seat:x_y-z/nightly-2",
+            "seat:0/9",
+        ] {
+            assert!(validate_scope(ok).is_ok(), "should accept {ok:?}");
+        }
+        let long_project = format!("seat:{}/lead", "a".repeat(64));
+        assert!(validate_scope(&long_project).is_ok());
+        let long_name = format!("seat:default/{}", "a".repeat(32));
+        assert!(validate_scope(&long_name).is_ok());
+
+        for bad in [
+            "seat:",
+            "seat:lead",             // no project
+            "seat:/lead",            // empty project
+            "seat:default/",         // trailing slash / empty name
+            "seat:default/lead/",    // trailing slash
+            "seat:default/a/b",      // extra '/'
+            "seat:a/b/c",            // extra '/'
+            "seat:Default/lead",     // uppercase project
+            "seat:default/Lead",     // uppercase name
+            "seat:-bad/lead",        // project must start [a-z0-9]
+            "seat:default/-lead",    // name must start [a-z0-9]
+            "seat:default/lead-",    // name must end [a-z0-9]
+            "seat:default/le_ad",    // '_' not in the seat charset
+            "seat:default/le.ad",    // '.' not in the seat charset
+            "seat:default/le ad",
+            "seat:de.fault/lead",    // '.' not in the project charset
+            "seat",
+            "seats:default/lead",
+        ] {
+            assert!(validate_scope(bad).is_err(), "should reject {bad:?}");
+        }
+        let too_long_project = format!("seat:{}/lead", "a".repeat(65));
+        assert!(validate_scope(&too_long_project).is_err());
+        let too_long_name = format!("seat:default/{}", "a".repeat(33));
+        assert!(validate_scope(&too_long_name).is_err());
     }
 }
