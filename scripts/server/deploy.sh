@@ -52,13 +52,9 @@ cargo build "${CARGO_FLAGS[@]}"
 
 # Fail the build here rather than on the target host. This is the check that
 # would have caught the defect WP-16 fixed.
+# The same gate CI's `headless` job runs on every Rust change.
 echo "==> Verifying the binary links no desktop stack"
-if ldd "$BIN_DIR/ikenga-server" 2>/dev/null | grep -qiE "gtk|webkit|javascriptcore"; then
-  echo "error: ikenga-server links the desktop stack; it will not run headless." >&2
-  ldd "$BIN_DIR/ikenga-server" | grep -iE "gtk|webkit|javascriptcore" >&2
-  exit 1
-fi
-echo "    ok — $(ldd "$BIN_DIR/ikenga-server" | wc -l) shared deps, no GTK/WebKit"
+"$SHELL_DIR/scripts/server/check-headless-link.sh" "$BIN_DIR/ikenga-server"
 
 echo "==> Building frontend SPA"
 (cd "$SHELL_DIR" && bun run build)

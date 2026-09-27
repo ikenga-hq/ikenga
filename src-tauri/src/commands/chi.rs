@@ -1551,7 +1551,12 @@ pub(crate) async fn spawn_chi_run(
     }
 
     // ── Persistent (detached chi-runner) path ────────────────────────────────
-    // Try this first so we never spawn a redundant in-process child.
+    // Try this first so we never spawn a redundant in-process child. When it
+    // can't run, the in-process fallback is NOT durable, and the caller asked
+    // for durability — so the fallback is carried back as a warning in the
+    // result's `error` (status stays `running`: every FE caller only treats
+    // `error` as fatal with `status: "failed"`) instead of passing silently.
+    let mut fallback_warning: Option<String> = None;
     if opts.persistent {
         let conf = chi_runner::RunnerConf {
             run_id: &run_id,
@@ -1588,11 +1593,9 @@ pub(crate) async fn spawn_chi_run(
                 });
             }
             Err(reason) => {
-                log::warn!(
-                    target: "ikenga::chi",
-                    "chi run {run_id}: detached chi-runner unavailable ({reason}), \
-                     falling back to in-process task"
-                );
+                let warning = chi_runner::persistent_fallback_warning(&reason);
+                log::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
+                fallback_warning = Some(warning);
             }
         }
     }
@@ -1669,13 +1672,21 @@ pub(crate) async fn spawn_chi_run(
         }
     });
 
-    Ok(ChiRunResult {
+    Ok(in_process_started(run_id, fallback_warning))
+}
+
+/// The result of an in-process run that started. `fallback_warning` is set
+/// only when a *persistent* run could not go detached (see `spawn_chi_run`):
+/// it rides in `error` while `status` stays `running`, so it is visible to
+/// every caller without changing the result shape or failing the run.
+fn in_process_started(run_id: String, fallback_warning: Option<String>) -> ChiRunResult {
+    ChiRunResult {
         run_id,
         status: "running".to_string(),
         output: None,
         output_truncated: None,
-        error: None,
-    })
+        error: fallback_warning,
+    }
 }
 
 /// Resume an existing Chi session using its engine-native `external_id`.
@@ -2562,6 +2573,24 @@ mod tests {
             args[6]
         );
         assert_eq!(to_wsl_path("/already/linux"), "/already/linux");
+    }
+
+    /// A persistent run that fell back to in-process surfaces the fallback in
+    /// the result — still `running`, so no caller treats it as a failure —
+    /// while a plain in-process run carries no error at all.
+    #[test]
+    fn in_process_start_surfaces_a_persistent_fallback() {
+        let warning = chi_runner::persistent_fallback_warning("chi-runner not found");
+        let r = in_process_started("r1".into(), Some(warning.clone()));
+        assert_eq!(r.status, "running");
+        assert_eq!(r.error.as_deref(), Some(warning.as_str()));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["error"], serde_json::Value::String(warning));
+
+        let plain = in_process_started("r2".into(), None);
+        assert_eq!(plain.status, "running");
+        assert_eq!(plain.error, None);
     }
 
     #[tokio::test]
