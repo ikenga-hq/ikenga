@@ -274,6 +274,23 @@ impl SeatError {
         self
     }
 
+    /// The engine call already succeeded and the bind after it failed: the
+    /// run exists with the caller's text but the seat didn't take it. Carry
+    /// the run id (merged into `details`) so a caller never blindly resends.
+    fn after_engine(mut self, run_id: &str) -> Self {
+        let mut details = match self.details.take() {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        details.insert("run_id".to_string(), json!(run_id));
+        self.details = Some(Value::Object(details));
+        self.message = format!(
+            "{} — the text was already sent as run {run_id}, which is not seated; don't resend it",
+            self.message
+        );
+        self
+    }
+
     /// §9.5 code → HTTP status.
     #[allow(dead_code)] // WP-70's bridge routes are the consumer.
     pub(crate) fn http_status(&self) -> u16 {
@@ -945,13 +962,29 @@ impl SeatStore {
         token
     }
 
-    /// Remove the seat's claim; true when `token` matched a live claim.
-    fn release_claim(&self, seat_id: &str, token: Option<&str>, now: i64) -> bool {
-        let prev = guard(&self.claims).remove(seat_id);
-        match (prev, token) {
-            (Some(c), Some(t)) => c.token == t && c.expires_at > now,
+    /// §9.2 `seats_move` with `claim`: clear the claim `token` names; true
+    /// when it was still live. Another client's live claim is left in place
+    /// (the move still binds; the caller reports `claim_lost`), and an
+    /// expired claim is swept.
+    fn release_claim(&self, seat_id: &str, token: &str, now: i64) -> bool {
+        let mut claims = guard(&self.claims);
+        match claims.get(seat_id) {
+            Some(c) if c.token == token => {
+                let live = c.expires_at > now;
+                claims.remove(seat_id);
+                live
+            }
+            Some(c) if c.expires_at <= now => {
+                claims.remove(seat_id);
+                false
+            }
             _ => false,
         }
+    }
+
+    /// Drop any claim on the seat (Clear, Remove).
+    fn drop_claim(&self, seat_id: &str) {
+        guard(&self.claims).remove(seat_id);
     }
 
     fn queued(&self, seat_id: &str) -> Option<QueuedText> {
@@ -2103,8 +2136,12 @@ async fn bind_session(
         tx.commit().await.map_err(db_err)?;
 
         // After commit: claims, then one event per affected seat.
-        let claim_ok = store().release_claim(dest_id, claim, now);
-        let claim_lost = claim.is_some() && !claim_ok;
+        // Only a move that carries a claim touches claims: a plain move (a
+        // drag, iyke) never wipes another client's live path-T claim.
+        let claim_lost = match claim {
+            Some(token) => !store().release_claim(dest_id, token, now),
+            None => false,
+        };
         let from_seat_ids: Vec<String> = conflicts.iter().map(|c| c.id.clone()).collect();
         let mut effects = Effects::default();
         let base = if create.is_some() {
@@ -2280,8 +2317,12 @@ pub(crate) async fn resolve_core(
     // The claim guards path T (§4.1): a terminal-kind or empty vacant seat the
     // UI refills by spawning a terminal. A run-kind vacant seat goes path H
     // (`seats_resume`), which the seat mutex already serializes and which a
-    // live claim would refuse — so it gets no claim (`claim: null`).
-    let path_t = row.session_kind.as_deref() != Some("run");
+    // live claim would refuse — so it gets no claim (`claim: null`). Nor does
+    // a seat on a runs-only engine (no terminal wrap: openrouter, opencode,
+    // pi): no agent terminal can be spawned for it, so path T is impossible
+    // and its path H must not be refused by its own claim.
+    let path_t = row.session_kind.as_deref() != Some("run")
+        && engine_cap(&row.engine_id).and_then(|c| c.wrap_id).is_some();
     let claim = (derived.hint == RouteHint::None && claim_resume && path_t)
         .then(|| store().take_claim(&row.id, now));
     let seat = build_view(pool, world, row, chi.as_ref()).await?;
@@ -2421,6 +2462,9 @@ pub(crate) async fn move_core(
 /// §4.1 path H, with §6.2's fresh fallback. Runs under the seat's mutex; the
 /// engine call happens with no transaction open, and the seat binds **only
 /// after it returns a run id**. If it fails, nothing is written.
+// The WP-70 bridge and the tests; the Tauri commands take the mutex first
+// and call the `_locked` variant.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn resume_core<F, Fut>(
     pool: &SqlitePool,
     world: &WorldSnapshot,
@@ -2435,6 +2479,25 @@ where
     Fut: Future<Output = Result<String, String>>,
 {
     let _guard = store().lock_one(seat_id).await;
+    resume_locked(pool, world, seat_id, prompt, actor, fallback, engine).await
+}
+
+/// `resume_core` for a caller that already holds the seat's mutex — and so
+/// built `world` after taking it, so the vacancy check never reads liveness
+/// (openrouter thread holds) from before a concurrent resume bound (§4.1).
+pub(crate) async fn resume_locked<F, Fut>(
+    pool: &SqlitePool,
+    world: &WorldSnapshot,
+    seat_id: &str,
+    prompt: String,
+    actor: &SeatActor,
+    fallback: ResumeFallback,
+    engine: F,
+) -> Result<(SeatResumeResult, Effects), SeatError>
+where
+    F: FnOnce(EngineCall) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
     let row = fetch_seat(pool, seat_id)
         .await?
         .ok_or_else(SeatError::seat_not_found)?;
@@ -2501,9 +2564,31 @@ where
         }
     };
 
+    // Check the holds on every seat the bind will unbind *before* the engine
+    // call, so a refusal never follows a sent text.
+    let predicted = BindSpec {
+        kind: "run",
+        session_ref: match &call {
+            EngineCall::ResumeRun { run_id, .. } => run_id.clone(),
+            // A new run id: no other seat can hold it yet.
+            EngineCall::Start { .. } => String::new(),
+        },
+        engine_id: row.engine_id.clone(),
+        external_id: match &call {
+            EngineCall::ResumeRun { .. } => previous.as_ref().and_then(|p| match p {
+                SeatSession::Run { external_id, .. }
+                | SeatSession::Terminal { external_id, .. } => external_id.clone(),
+            }),
+            EngineCall::Start {
+                resume_session_id, ..
+            } => resume_session_id.clone(),
+        },
+        cwd: None,
+    };
+    precheck_unbinds(pool, &row.id, &predicted, actor, now).await?;
+
     let run_id = engine(call).await.map_err(SeatError::engine_failed)?;
-    let spec = run_spec(pool, &run_id, &row.engine_id).await?;
-    let out = bind_session(pool, &row.id, &spec, actor, None, true, None).await?;
+    let out = bind_after_engine(pool, &row, &run_id, actor).await?;
     let seat = view_of(pool, world, out.dest).await?;
     Ok((
         SeatResumeResult {
@@ -2517,8 +2602,44 @@ where
     ))
 }
 
+/// Refuse before an engine call when a seat the following bind would unbind
+/// is held by another client (§5.1) — the bind re-checks under its own locks.
+async fn precheck_unbinds(
+    pool: &SqlitePool,
+    dest_id: &str,
+    predicted: &BindSpec,
+    actor: &SeatActor,
+    now: i64,
+) -> Result<(), SeatError> {
+    for c in fetch_conflicting(pool, dest_id, predicted).await? {
+        if let Err(r) = hold_gate(&c, actor, now, false) {
+            return Err(refuse(pool, &c.id, r).await);
+        }
+    }
+    Ok(())
+}
+
+/// The bind step of path H / fill, once the engine returned `run_id`. Any
+/// failure here carries the run id (`SeatError::after_engine`).
+async fn bind_after_engine(
+    pool: &SqlitePool,
+    row: &SeatRow,
+    run_id: &str,
+    actor: &SeatActor,
+) -> Result<BindOutcome, SeatError> {
+    let bound = async {
+        let spec = run_spec(pool, run_id, &row.engine_id).await?;
+        bind_session(pool, &row.id, &spec, actor, None, true, None).await
+    }
+    .await;
+    bound.map_err(|e| e.after_engine(run_id))
+}
+
 /// §9.2 `seats_fill`: a new run on the seat's engine, in the project root,
 /// bound after the engine call returns. The previous session is unseated.
+// The WP-70 bridge and the tests; the Tauri commands take the mutex first
+// and call the `_locked` variant.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn fill_core<F, Fut>(
     pool: &SqlitePool,
     world: &WorldSnapshot,
@@ -2533,6 +2654,23 @@ where
     Fut: Future<Output = Result<String, String>>,
 {
     let _guard = store().lock_one(seat_id).await;
+    fill_locked(pool, world, seat_id, prompt, actor, persistent, engine).await
+}
+
+/// `fill_core` for a caller that already holds the seat's mutex.
+pub(crate) async fn fill_locked<F, Fut>(
+    pool: &SqlitePool,
+    world: &WorldSnapshot,
+    seat_id: &str,
+    prompt: String,
+    actor: &SeatActor,
+    persistent: bool,
+    engine: F,
+) -> Result<(SeatFillResult, Effects), SeatError>
+where
+    F: FnOnce(EngineCall) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
     let row = fetch_seat(pool, seat_id)
         .await?
         .ok_or_else(SeatError::seat_not_found)?;
@@ -2552,8 +2690,7 @@ where
     })
     .await
     .map_err(SeatError::engine_failed)?;
-    let spec = run_spec(pool, &run_id, &row.engine_id).await?;
-    let out = bind_session(pool, &row.id, &spec, actor, None, true, None).await?;
+    let out = bind_after_engine(pool, &row, &run_id, actor).await?;
     let seat = view_of(pool, world, out.dest).await?;
     Ok((
         SeatFillResult {
@@ -2668,7 +2805,7 @@ pub(crate) async fn clear_core(
         }
     };
     tx.commit().await.map_err(db_err)?;
-    store().release_claim(&row.id, None, now);
+    store().drop_claim(&row.id);
     if let Some(q) = store().dequeue(&row.id) {
         log::warn!(
             target: "ikenga::seats",
@@ -2918,7 +3055,7 @@ pub(crate) async fn remove_core(
     };
     tx.commit().await.map_err(db_err)?;
 
-    store().release_claim(&row.id, None, now);
+    store().drop_claim(&row.id);
     store().dequeue(&row.id);
     store().forget_lock(&row.id);
     let mut effects = Effects::default();
@@ -3002,40 +3139,124 @@ pub(crate) async fn release_core(
 }
 
 /// §2.5: a `SessionStart` on a seated terminal records its resume id.
+///
+/// The conversation may still be recorded on another seat (an ended terminal
+/// that held it, now resumed here): DEC-69c — resuming a past session moves
+/// it — so that seat is unbound in the same transaction, as a §4.3 move
+/// would. The capture is no client's write, so it never overrides a hold: if
+/// that other seat is held, the capture is skipped (logged) and both seats
+/// keep what they had. Returns one event per affected seat (§10).
 pub(crate) async fn capture_core(
     pool: &SqlitePool,
     terminal_id: &str,
     session_id: &str,
-) -> Result<Option<SeatsChangedEvent>, SeatError> {
+) -> Result<Vec<SeatsChangedEvent>, SeatError> {
     let Some(found) = fetch_seat_by_terminal(pool, terminal_id).await? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let _guard = store().lock_one(&found.id).await;
     let Some(row) = fetch_seat(pool, &found.id).await? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     if row.session_kind.as_deref() != Some("terminal")
         || row.session_ref.as_deref() != Some(terminal_id)
         || row.external_id.as_deref() == Some(session_id)
     {
-        return Ok(None);
+        return Ok(Vec::new());
     }
+    let spec = BindSpec {
+        kind: "terminal",
+        session_ref: terminal_id.to_string(),
+        engine_id: row.engine_id.clone(),
+        external_id: Some(session_id.to_string()),
+        cwd: row.session_cwd.clone(),
+    };
+    // Lock the other seats with a bounded wait (the destination's mutex is
+    // already held, as in resume / fill).
+    let mut others: BTreeSet<String> = fetch_conflicting(pool, &row.id, &spec)
+        .await?
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    others.remove(&row.id);
+    let mut _guards = Vec::with_capacity(others.len());
+    for id in &others {
+        let lock = store().lock_for(id);
+        match tokio::time::timeout(EXTRA_LOCK_WAIT, lock.lock_owned()).await {
+            Ok(g) => _guards.push(g),
+            Err(_) => {
+                return Err(SeatError::conflict(
+                    "another change to a seat holding this conversation is in progress",
+                ))
+            }
+        }
+    }
+
+    let now = now_ms();
     let mut tx = begin_write(pool).await?;
-    let res = sqlx::query(
-        "UPDATE iyke_seats SET external_id = ?
-         WHERE id = ? AND session_kind = 'terminal' AND session_ref = ?",
-    )
-    .bind(session_id.to_string())
-    .bind(row.id.clone())
-    .bind(terminal_id.to_string())
-    .execute(&mut *tx)
-    .await;
-    if let Err(e) = res {
+    let conflicts = match fetch_conflicting(&mut *tx, &row.id, &spec).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return Err(e);
+        }
+    };
+    if conflicts.iter().any(|c| !others.contains(&c.id)) {
         let _ = tx.rollback().await;
-        return Err(db_err(e));
+        return Err(SeatError::conflict(
+            "the seats holding this conversation changed during the capture",
+        ));
+    }
+    if let Some(held) = conflicts.iter().find(|c| c.live_hold(now).is_some()) {
+        let _ = tx.rollback().await;
+        log::warn!(
+            target: "ikenga::seats",
+            "resume id {session_id} for {} not recorded: {} holds that conversation and is held",
+            row.address(),
+            held.address()
+        );
+        return Ok(Vec::new());
+    }
+    let written: Result<(), SeatError> = async {
+        for c in &conflicts {
+            sqlx::query(
+                "UPDATE iyke_seats SET session_kind = NULL, session_ref = NULL,
+                        external_id = NULL, session_cwd = NULL
+                 WHERE id = ?",
+            )
+            .bind(c.id.clone())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        sqlx::query(
+            "UPDATE iyke_seats SET external_id = ?
+             WHERE id = ? AND session_kind = 'terminal' AND session_ref = ?",
+        )
+        .bind(session_id.to_string())
+        .bind(row.id.clone())
+        .bind(terminal_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tx.rollback().await;
+        return Err(e);
     }
     tx.commit().await.map_err(db_err)?;
-    Ok(Some(changed(&row, vec!["updated"], None)))
+    let from_seat_ids: Vec<String> = conflicts.iter().map(|c| c.id.clone()).collect();
+    let mut events = vec![changed(
+        &row,
+        vec!["updated"],
+        (!from_seat_ids.is_empty()).then(|| from_seat_ids.clone()),
+    )];
+    for c in &conflicts {
+        events.push(changed(c, vec!["unbound"], None));
+    }
+    Ok(events)
 }
 
 /// After a queued text went out: bump `last_active_at` and copy the run's
@@ -3074,6 +3295,22 @@ async fn touch_after_send(pool: &SqlitePool, seat_id: &str, now: i64) -> Result<
 
 async fn pool_of(db: &PaDb) -> Result<SqlitePool, SeatError> {
     db.ensure_pool().await.map_err(SeatError::internal)
+}
+
+/// Re-derive a seat's view after a bind, with a world probed for the seat's
+/// *new* session (a create or move builds its world before the destination
+/// holds the session, so e.g. a bound openrouter run's thread was never
+/// probed and a `done` run would read vacant instead of idle, §2.2).
+async fn refreshed_view(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    seat_id: &str,
+) -> Result<SeatView, SeatError> {
+    let row = fetch_seat(pool, seat_id)
+        .await?
+        .ok_or_else(SeatError::seat_not_found)?;
+    let world = tauri_world(app, pool, std::slice::from_ref(&row), false).await;
+    view_of(pool, &world, row).await
 }
 
 /// Build the world derivation reads, for `rows` (openrouter threads and
@@ -3262,10 +3499,11 @@ fn on_hook_event(app: &AppHandle, payload: HookPayload) {
                     return;
                 };
                 match capture_core(&pool, &terminal_id, &session_id).await {
-                    Ok(Some(event)) => {
-                        let _ = app.emit(SEATS_CHANGED_EVENT, &event);
+                    Ok(events) => {
+                        for event in events {
+                            let _ = app.emit(SEATS_CHANGED_EVENT, &event);
+                        }
                     }
-                    Ok(None) => {}
                     Err(e) => log::warn!(
                         target: "ikenga::seats",
                         "record resume id for terminal {terminal_id}: {e}"
@@ -3436,8 +3674,13 @@ pub async fn seats_create(
 ) -> Result<SeatMoveResult, SeatError> {
     let pool = pool_of(&db).await?;
     let world = tauri_world(&app, &pool, &[], false).await;
-    let (result, effects) = create_core(&pool, &world, req, &actor).await?;
+    let (mut result, effects) = create_core(&pool, &world, req, &actor).await?;
     emit_effects(&app, effects);
+    // The write committed: a failed re-read keeps the core's view.
+    let seat_id = result.seat.id.clone();
+    if let Ok(view) = refreshed_view(&app, &pool, &seat_id).await {
+        result.seat = view;
+    }
     Ok(result)
 }
 
@@ -3453,7 +3696,7 @@ pub async fn seats_move(
     let pool = pool_of(&db).await?;
     let world = tauri_world(&app, &pool, &[], false).await;
     let claim = opts.and_then(|o| o.claim);
-    let (result, effects) = move_core(
+    let (mut result, effects) = move_core(
         &pool,
         &world,
         &session,
@@ -3463,6 +3706,11 @@ pub async fn seats_move(
     )
     .await?;
     emit_effects(&app, effects);
+    // The write committed: a failed re-read keeps the core's view.
+    let seat_id = result.seat.id.clone();
+    if let Ok(view) = refreshed_view(&app, &pool, &seat_id).await {
+        result.seat = view;
+    }
     Ok(result)
 }
 
@@ -3476,12 +3724,15 @@ pub async fn seats_resume(
     opts: ResumeOpts,
 ) -> Result<SeatResumeResult, SeatError> {
     let pool = pool_of(&db).await?;
+    // Take the seat's mutex before building the world, so the vacancy check
+    // reads liveness from after any resume that raced this one (§4.1).
+    let _guard = store().lock_one(&seat_id).await;
     let row = fetch_seat(&pool, &seat_id)
         .await?
         .ok_or_else(SeatError::seat_not_found)?;
     let world = tauri_world(&app, &pool, std::slice::from_ref(&row), false).await;
     let engine_app = app.clone();
-    let (result, effects) = resume_core(
+    let (mut result, effects) = resume_locked(
         &pool,
         &world,
         &seat_id,
@@ -3492,6 +3743,10 @@ pub async fn seats_resume(
     )
     .await?;
     emit_effects(&app, effects);
+    // The write committed: a failed re-read keeps the core's view.
+    if let Ok(view) = refreshed_view(&app, &pool, &seat_id).await {
+        result.seat = view;
+    }
     Ok(result)
 }
 
@@ -3505,13 +3760,14 @@ pub async fn seats_fill(
     opts: Option<FillOpts>,
 ) -> Result<SeatFillResult, SeatError> {
     let pool = pool_of(&db).await?;
+    let _guard = store().lock_one(&seat_id).await;
     let row = fetch_seat(&pool, &seat_id)
         .await?
         .ok_or_else(SeatError::seat_not_found)?;
     let world = tauri_world(&app, &pool, std::slice::from_ref(&row), false).await;
     let persistent = opts.map(|o| o.persistent).unwrap_or(false);
     let engine_app = app.clone();
-    let (result, effects) = fill_core(
+    let (mut result, effects) = fill_locked(
         &pool,
         &world,
         &seat_id,
@@ -3522,6 +3778,10 @@ pub async fn seats_fill(
     )
     .await?;
     emit_effects(&app, effects);
+    // The write committed: a failed re-read keeps the core's view.
+    if let Ok(view) = refreshed_view(&app, &pool, &seat_id).await {
+        result.seat = view;
+    }
     Ok(result)
 }
 
@@ -4985,14 +5245,79 @@ mod tests {
         move_core(&pool, &w, &term_ref("t8", "claude-code"), &s, &ui(), None)
             .await
             .unwrap();
-        let event = capture_core(&pool, "t8", "sess-1").await.unwrap().unwrap();
-        assert_eq!(event.kinds, vec!["updated"]);
+        let events = capture_core(&pool, "t8", "sess-1").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kinds, vec!["updated"]);
         assert_eq!(row(&pool, &s).await.external_id.as_deref(), Some("sess-1"));
-        assert!(capture_core(&pool, "t8", "sess-1").await.unwrap().is_none());
+        assert!(capture_core(&pool, "t8", "sess-1")
+            .await
+            .unwrap()
+            .is_empty());
         assert!(capture_core(&pool, "unseated", "sess-2")
             .await
             .unwrap()
-            .is_none());
+            .is_empty());
+    }
+
+    /// DEC-69c on the capture path: the conversation a new terminal resumed
+    /// leaves the seat that still recorded it — unless that seat is held.
+    #[tokio::test]
+    async fn capture_moves_the_conversation_off_another_seat() {
+        let pool = pool().await;
+        let old = create(&pool, "old", "claude-code").await;
+        let new = create(&pool, "new", "claude-code").await;
+        set_session(&pool, &old, "terminal", "t-ended", Some("conv-1")).await;
+        let w = world_with(&["t9"]);
+        move_core(&pool, &w, &term_ref("t9", "claude-code"), &new, &ui(), None)
+            .await
+            .unwrap();
+        let events = capture_core(&pool, "t9", "conv-1").await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seat_id, new);
+        assert_eq!(events[0].from_seat_ids, Some(vec![old.clone()]));
+        assert_eq!(events[1].seat_id, old);
+        assert_eq!(events[1].kinds, vec!["unbound"]);
+        assert_eq!(
+            row(&pool, &new).await.external_id.as_deref(),
+            Some("conv-1")
+        );
+        let old_row = row(&pool, &old).await;
+        assert!(old_row.session_kind.is_none() && old_row.external_id.is_none());
+
+        // A held seat keeps its conversation; the capture is skipped.
+        let held = create(&pool, "held", "claude-code").await;
+        let other = create(&pool, "other", "claude-code").await;
+        set_session(&pool, &held, "terminal", "t-gone", Some("conv-2")).await;
+        sqlx::query(
+            "UPDATE iyke_seats SET hold_client = 'iyke', hold_since = ?, hold_expires_at = ?
+             WHERE id = ?",
+        )
+        .bind(now_ms())
+        .bind(now_ms() + 60_000)
+        .bind(held.clone())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let w = world_with(&["t10"]);
+        move_core(
+            &pool,
+            &w,
+            &term_ref("t10", "claude-code"),
+            &other,
+            &ui(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(capture_core(&pool, "t10", "conv-2")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            row(&pool, &held).await.external_id.as_deref(),
+            Some("conv-2")
+        );
+        assert!(row(&pool, &other).await.external_id.is_none());
     }
 
     // ── §2.2 derivation table ───────────────────────────────────────────
@@ -5150,6 +5475,90 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.outcome, ResumeOutcome::Resumed);
+    }
+
+    /// An empty seat on a runs-only engine can only go path H, so resolving
+    /// it with `claimResume` takes no claim and `seats_resume` goes through.
+    #[tokio::test]
+    async fn an_empty_runs_only_seat_gets_no_claim() {
+        let pool = pool().await;
+        let w = WorldSnapshot::default();
+        let s = create(&pool, "scout", "opencode").await;
+        match resolve_core(&pool, &w, &s, &ui(), true).await.unwrap().0 {
+            SeatRoute::Vacant { claim, .. } => assert!(claim.is_none()),
+            other => panic!("expected vacant, got {other:?}"),
+        }
+        assert!(store().live_claim(&s, now_ms()).is_none());
+        let e = resume_core(
+            &pool,
+            &w,
+            &s,
+            "go".into(),
+            &ui(),
+            ResumeFallback::Refuse,
+            never,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.code, "not_resumable",
+            "refused for its session, not a claim"
+        );
+    }
+
+    /// A move without a claim leaves another client's live claim alone; the
+    /// claim-carrying move then clears it and reports nothing lost.
+    #[tokio::test]
+    async fn a_plain_move_keeps_another_clients_claim() {
+        let pool = pool().await;
+        let w = world_with(&["t3", "t4"]);
+        let s = create(&pool, "c2", "claude-code").await;
+        let claim = match resolve_core(&pool, &w, &s, &ui(), true).await.unwrap().0 {
+            SeatRoute::Vacant { claim, .. } => claim.expect("a claim"),
+            other => panic!("expected vacant, got {other:?}"),
+        };
+        let (plain, _) = move_core(
+            &pool,
+            &w,
+            &term_ref("t3", "claude-code"),
+            &s,
+            &actor("iyke"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!plain.claim_lost);
+        assert!(store().live_claim(&s, now_ms()).is_some());
+        let (claimed, _) = move_core(
+            &pool,
+            &w,
+            &term_ref("t4", "claude-code"),
+            &s,
+            &ui(),
+            Some(claim.as_str()),
+        )
+        .await
+        .unwrap();
+        assert!(!claimed.claim_lost);
+        assert!(store().live_claim(&s, now_ms()).is_none());
+    }
+
+    /// A bind that fails after the engine call returned keeps the refusal's
+    /// details and adds the run id, so no caller resends the text blindly.
+    #[test]
+    fn a_failed_bind_after_the_engine_call_carries_the_run_id() {
+        let hold = SeatHold {
+            client: "iyke".into(),
+            since: 1,
+            expires_at: 2,
+        };
+        let e = SeatError::held("lead", &hold).after_engine("run-9");
+        assert_eq!(e.code, "seat_held");
+        let d = e.details.unwrap();
+        assert_eq!(d["run_id"], "run-9");
+        assert_eq!(d["client"], "iyke");
+        let e = SeatError::conflict("busy").after_engine("run-8");
+        assert_eq!(e.details.unwrap(), json!({ "run_id": "run-8" }));
     }
 
     #[test]
