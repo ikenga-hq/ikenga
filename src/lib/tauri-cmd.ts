@@ -4755,7 +4755,8 @@ export interface ChiCacheRow {
 	artifacts?: unknown;
 	parent_id?: string;
 	owner: string;
-	terminal_session_id?: string;
+	/** Detached chi-runner pid (WP-18b); absent for in-process runs. */
+	pid?: number;
 	started_at?: string;
 	ended_at?: string;
 	last_seen_at?: string;

@@ -1,40 +1,32 @@
-// WP-69 (G-SEATS §4.4) — a terminal attached to a persistent Chi run's tmux
-// session, so *Open in pane* and *Pop out* have something to show for a
-// `run` seat.
+// WP-69 (G-SEATS §4.4) — what a `run` seat's *Open in pane* / *Pop out* can
+// show.
 //
-// A persistent run (`chi_run {persistent: true}`) runs `chi-runner` inside a
-// detached tmux session named after the run id, and records that name in
-// `chi_cache.terminal_session_id` (`src-tauri/src/terminal/multiplexer.rs`).
-// Attaching is what `iyke chi attach <run_id>` does: a tmux client on that
-// session. Here the client is an ordinary terminal tab whose argv is
-// `tmux attach-session -t =<session>` (`=` = exact-name match, so `run-1`
-// never attaches to `run-12`). Rust recognises it as the run's mount — a
-// running terminal whose argv carries `tmux` and `=<session>`
-// (`iyke/seats.rs::tmux_mount`) — so the seat's `mount` follows it into a
-// pane or Window 2.
+// WP-18b (ADR-023 D4/D5) retired tmux: a persistent run
+// (`chi_run {persistent: true}`) is now a `chi-runner` spawned detached — its
+// own process group, engine piped, no PTY — recorded by pid in
+// `chi_cache.pid`. There is no terminal session to attach a client to, so
+// every started run, persistent or one-off, is `headless` ("headless run —
+// nothing to show"); a queued run or one outside the lookup is still not
+// called headless (`RunAttachState`).
 //
-// The PTY is forced in-process (`forceEphemeral`), like a seat's own
-// terminal: a daemon-backed PTY is invisible to Rust (P-10), so the mount
-// could never be derived. Closing the tab only detaches the tmux client; the
-// run keeps going. A one-off run (no `terminal_session_id`) has nothing to
-// attach to, and callers say "headless run — nothing to show"; a queued run
-// or one outside the lookup is not called headless (`RunAttachState`).
+// The `tmux` state and the attach helpers below (`runAttachArgv`,
+// `attachRunTerminal`, …) are no longer produced by `fetchRunAttachState`
+// and are kept only so their callers compile unchanged; removing them with
+// the menu paths that consume them is a tracked follow-up.
 
 import { useQuery } from '@tanstack/react-query';
 
 import { chiList } from '@/lib/tauri-cmd';
 import { makeTerminalId, openTabPty, type TerminalTab, useTerminalStore } from './session-store';
 
-/** `chi_list`'s own cap; the run is looked up among its engine's rows.
- *  There is no by-run-id read that carries `terminal_session_id` today
- *  (`chi_status` returns only status / output), so a run outside the newest
- *  rows reads `unknown` — never mislabelled headless. */
+/** `chi_list`'s own cap; the run is looked up among its engine's rows, so a
+ *  run outside the newest rows reads `unknown` — never mislabelled
+ *  headless. */
 export const RUN_LOOKUP_LIMIT = 200;
 
-/** How long a settled lookup stays fresh. The name never changes once
- *  written. */
+/** How long a settled lookup stays fresh. */
 const RUN_SESSION_STALE_MS = 15_000;
-/** A queued run gets its tmux session only once it is spawned: re-read. */
+/** A queued run is re-read until it is spawned. */
 const RUN_PENDING_POLL_MS = 3_000;
 
 export interface RunRef {
@@ -45,10 +37,10 @@ export interface RunRef {
 
 /**
  * What a run offers to attach to:
- * - `tmux`: a persistent run's tmux session (`chi_cache.terminal_session_id`);
- * - `headless`: a started one-off run — nothing to show;
- * - `pending`: queued, not spawned yet, so whether it gets a session isn't
- *   known;
+ * - `tmux`: retired with WP-18b — no longer produced (see the header);
+ * - `headless`: a started run (a one-off, or a detached chi-runner) —
+ *   nothing to show;
+ * - `pending`: queued, not spawned yet;
  * - `unknown`: the run isn't among its engine's newest cached rows.
  */
 export type RunAttachState =
@@ -66,8 +58,6 @@ export async function fetchRunAttachState(run: RunRef): Promise<RunAttachState> 
 	const rows = await chiList(run.engineId, RUN_LOOKUP_LIMIT);
 	const row = rows.find((r) => r.run_id === run.runId);
 	if (!row) return { kind: 'unknown' };
-	const session = row.terminal_session_id?.trim();
-	if (session) return { kind: 'tmux', session };
 	return row.status === 'queued' ? { kind: 'pending' } : { kind: 'headless' };
 }
 

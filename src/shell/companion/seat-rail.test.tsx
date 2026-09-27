@@ -408,7 +408,7 @@ describe('the seat menu', () => {
 	});
 
 	it('a one-off run seat: Open in pane and Pop out say "headless run — nothing to show"', async () => {
-		// Started, no tmux session: one-off. (A run missing from the lookup, or
+		// Started: nothing to attach to. (A run missing from the lookup, or
 		// still queued, is not called headless.)
 		m.chiList.mockResolvedValue([{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui' }]);
 		await mountRail();
@@ -424,26 +424,22 @@ describe('the seat menu', () => {
 		}
 	});
 
-	it('a persistent run seat pops out a terminal attached to its tmux session (§4.4)', async () => {
+	it('a persistent run seat is headless too: a detached chi-runner has no pane (WP-18b)', async () => {
 		m.chiList.mockResolvedValue([
-			{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui', terminal_session_id: 'run-np' },
+			{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui', pid: 4242 },
 		]);
-		useTerminalStore.setState((st) => ({ tabs: [...st.tabs, tab('term-att', null, 5)] }));
 		await mountRail();
 		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
 		const menu = screen.getByRole('menu');
 		await waitFor(() =>
-			expect((within(menu).getByRole('menuitem', { name: /^Pop out/ }) as HTMLButtonElement).disabled).toBe(false)
+			expect(within(menu).getByRole('menuitem', { name: /^Pop out/ }).getAttribute('title')).toBe(
+				'Headless run — nothing to show'
+			)
 		);
-		expect((within(menu).getByRole('menuitem', { name: /^Open in pane/ }) as HTMLButtonElement).disabled).toBe(false);
-		fireEvent.click(within(menu).getByRole('menuitem', { name: /^Pop out/ }));
-		await waitFor(() =>
-			expect(m.attachRunTerminal).toHaveBeenCalledWith(expect.objectContaining({ session: 'run-np', cwd: '/w' }))
-		);
-		await waitFor(() => expect(m.windowJoinSurface).toHaveBeenCalledWith('terminal:pty-term-att', PROJECT));
-		await waitFor(() =>
-			expect(useSeatNotice.getState().notice?.message).toBe('nightly moved to Window 2 — its address is unchanged')
-		);
+		for (const name of [/^Open in pane/, /^Pop out/]) {
+			expect((within(menu).getByRole('menuitem', { name }) as HTMLButtonElement).disabled).toBe(true);
+		}
+		expect(m.attachRunTerminal).not.toHaveBeenCalled();
 	});
 
 	it('Remove seat… confirms first, exactly as drawn', async () => {

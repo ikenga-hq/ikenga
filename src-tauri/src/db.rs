@@ -593,6 +593,13 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0067_iyke_seats",
         include_str!("../migrations/0067_iyke_seats.sql"),
     ),
+    // WP-18b (ADR-023 D4/D5): tmux retires. `chi_cache.pid` holds a detached
+    // chi-runner's pid; `terminal_session_id` (the tmux session) is dropped.
+    (
+        68,
+        "0068_chi_cache_runner_pid",
+        include_str!("../migrations/0068_chi_cache_runner_pid.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -2024,5 +2031,117 @@ mod tests {
             0,
             "external DELETE must be immediately visible to reader pool"
         );
+    }
+
+    /// `chi_cache` column names, in table order.
+    async fn chi_cache_columns(pool: &sqlx::SqlitePool) -> Vec<String> {
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('chi_cache')")
+            .fetch_all(pool)
+            .await
+            .expect("chi_cache columns")
+    }
+
+    /// WP-18b: on a fresh db, 0068 leaves `chi_cache` with `pid` and without
+    /// `terminal_session_id` — and the bundled SQLite supports DROP COLUMN.
+    #[tokio::test]
+    async fn migration_0068_on_fresh_db_swaps_terminal_session_id_for_pid() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let parts: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+        assert!(
+            (parts[0], parts[1]) >= (3, 35),
+            "DROP COLUMN needs SQLite >= 3.35, bundled is {version}"
+        );
+
+        let cols = chi_cache_columns(&pool).await;
+        assert!(cols.iter().any(|c| c == "pid"), "{cols:?}");
+        assert!(!cols.iter().any(|c| c == "terminal_session_id"), "{cols:?}");
+    }
+
+    /// WP-18b: 0068 applies on an install sitting at 0067 whose `chi_cache`
+    /// holds a row with a tmux `terminal_session_id`; the row survives with
+    /// every other column intact and `pid` NULL.
+    #[tokio::test]
+    async fn migration_0068_applies_on_db_at_0067_with_terminal_session_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_67.db");
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 68) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO chi_cache (run_id, engine_id, external_id, status, owner,
+                                    terminal_session_id)
+             VALUES ('run-tmux', 'claude-code', 'sess-1', 'running', 'cli', 'run-tmux')",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        assert!(chi_cache_columns(&raw_pool)
+            .await
+            .iter()
+            .any(|c| c == "terminal_session_id"));
+        drop(raw_pool);
+
+        let db = PaDb::new(db_path);
+        let pool = db.ensure_pool().await.expect("ensure_pool at 0067");
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(applied.contains(&68));
+        assert_eq!(applied.len(), MIGRATIONS.len());
+
+        let cols = chi_cache_columns(&pool).await;
+        assert!(cols.iter().any(|c| c == "pid"), "{cols:?}");
+        assert!(!cols.iter().any(|c| c == "terminal_session_id"), "{cols:?}");
+
+        let (engine, ext, status, pid): (String, Option<String>, String, Option<i64>) =
+            sqlx::query_as(
+                "SELECT engine_id, external_id, status, pid FROM chi_cache WHERE run_id = 'run-tmux'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(engine, "claude-code");
+        assert_eq!(ext.as_deref(), Some("sess-1"));
+        assert_eq!(status, "running");
+        assert_eq!(pid, None);
     }
 }

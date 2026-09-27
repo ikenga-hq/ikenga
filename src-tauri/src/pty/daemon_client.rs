@@ -333,9 +333,7 @@ fn build_daemon_command(
         // app without CREATE_NO_WINDOW, Windows opens a console window for it.
         // CREATE_NEW_PROCESS_GROUP is the Windows analogue of `process_group(0)`
         // above — console Ctrl+C/Ctrl+Break aimed at us doesn't reach the daemon.
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        cmd.creation_flags(crate::platform::DETACHED_PROCESS_FLAGS);
     }
 
     cmd.stdin(std::process::Stdio::null());

@@ -308,6 +308,7 @@ impl AntigravityEngine {
             stderr: StdioMode::Piped,
             kill_on_drop: true,
             no_console_window: true,
+            detached: false,
         };
 
         let mut child = crate::executor::current()

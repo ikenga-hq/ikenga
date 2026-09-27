@@ -1,5 +1,5 @@
-// WP-69 (G-SEATS §4.4) — a terminal attached to a persistent run's tmux
-// session.
+// WP-69 (G-SEATS §4.4) — what a run seat can show. Since WP-18b every
+// started run is headless; the attach helpers are covered until they go.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({
@@ -64,20 +64,19 @@ describe('the tmux client argv', () => {
 	});
 });
 
-describe('the run’s attach state (chi_cache.terminal_session_id)', () => {
-	it('is the row’s tmux session, looked up among the engine’s runs', async () => {
+describe('the run’s attach state', () => {
+	it('is headless for a persistent run: a detached chi-runner has no pane (WP-18b)', async () => {
 		m.chiList.mockResolvedValue([
-			{ run_id: 'other', status: 'running', terminal_session_id: 'other' },
-			{ run_id: 'run-1', status: 'running', terminal_session_id: 'run-1' },
+			{ run_id: 'other', status: 'running', pid: 41 },
+			{ run_id: 'run-1', status: 'running', pid: 42 },
 		]);
 		await expect(fetchRunAttachState({ runId: 'run-1', engineId: 'claude-code' })).resolves.toEqual({
-			kind: 'tmux',
-			session: 'run-1',
+			kind: 'headless',
 		});
 		expect(m.chiList).toHaveBeenCalledWith('claude-code', RUN_LOOKUP_LIMIT);
 	});
 
-	it('is headless only for a started run with no tmux session', async () => {
+	it('is headless for a started one-off run', async () => {
 		m.chiList.mockResolvedValue([{ run_id: 'run-1', status: 'running' }]);
 		await expect(fetchRunAttachState({ runId: 'run-1', engineId: 'x' })).resolves.toEqual({ kind: 'headless' });
 	});

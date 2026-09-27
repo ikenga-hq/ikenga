@@ -36,6 +36,22 @@ EnvironmentFile=/opt/ikenga/.env
 # is defence in depth, not the whole perimeter.
 
 # --- Sandboxing ---
+#
+# KillMode is deliberately left at the default `control-group` today: stopping
+# or restarting the unit kills every process in its cgroup, which is right
+# while the daemon does not serve Chi runs (terminals don't survive a daemon
+# restart by design — ADR-023 D5).
+#
+# When Chi lands on the daemon this must change. A persistent Chi run is a
+# `chi-runner` spawned DETACHED into its own process group (WP-18b) so it
+# outlives a restart — but a process group does NOT escape a systemd cgroup,
+# and `control-group` would kill every runner with the unit. Either launch
+# each detached chi-runner in its own transient scope
+#   systemd-run --scope --collect … chi-runner
+# so it leaves this unit's cgroup, or switch this unit to `KillMode=process`
+# — blunter: then EVERY orphan this unit spawns outlives it, not just runners.
+# See ADR-023 D5 (docs/adr/023-remote-tier-execution-isolation.md in the
+# workspace repo): Chi runs survive a daemon restart, terminals don't.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

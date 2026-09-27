@@ -1077,7 +1077,6 @@ pub(crate) struct TermLive {
     pub pty_id: String,
     pub running: bool,
     pub cwd: String,
-    pub argv: Vec<String>,
     pub lease_holder: Option<String>,
     pub mount: Option<SeatMount>,
 }
@@ -1127,21 +1126,6 @@ impl WorldSnapshot {
             .get(&t.terminal_id)
             .filter(|a| a.pty_id.as_deref().map_or(true, |p| p == t.pty_id))
     }
-
-    /// §4.4: where a terminal attached to the persistent run's tmux session
-    /// is mounted.
-    fn tmux_mount(&self, session: &str) -> Option<SeatMount> {
-        let colon = format!("{session}:");
-        self.terminals
-            .iter()
-            .filter(|t| t.running && t.argv.iter().any(|a| a.contains("tmux")))
-            .find(|t| {
-                t.argv.iter().any(|a| {
-                    a == session || a.starts_with(&colon) || a.ends_with(&format!("={session}"))
-                })
-            })
-            .and_then(|t| t.mount.clone())
-    }
 }
 
 fn mount_of(window_labels: &[String], pane_ids: &[String]) -> Option<SeatMount> {
@@ -1168,7 +1152,6 @@ fn term_live(d: TerminalDescriptor, now: u64) -> TermLive {
         pty_id: d.pty_id,
         running: d.status == "running",
         cwd: d.cwd,
-        argv: d.argv,
         lease_holder,
         mount,
     }
@@ -1237,14 +1220,15 @@ fn seat_from_row(r: &SqliteRow) -> SeatRow {
     }
 }
 
-/// The `chi_cache` fields derivation reads.
+/// The `chi_cache` fields derivation reads. A persistent run is a detached
+/// `chi-runner` (WP-18b) with no pane, so nothing here locates a mount for
+/// it; its runner pid (`chi_cache.pid`) is the chi reconciler's business.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ChiLite {
     pub engine_id: String,
     pub status: String,
     pub external_id: Option<String>,
     pub cwd: Option<String>,
-    pub terminal_session_id: Option<String>,
 }
 
 async fn fetch_seat<'c, E>(ex: E, seat_id: &str) -> Result<Option<SeatRow>, SeatError>
@@ -1326,7 +1310,7 @@ where
     E: sqlx::Executor<'c, Database = Sqlite>,
 {
     let row = sqlx::query(
-        "SELECT engine_id, status, external_id, cwd, terminal_session_id
+        "SELECT engine_id, status, external_id, cwd
          FROM chi_cache WHERE run_id = ?",
     )
     .bind(run_id.to_string())
@@ -1338,7 +1322,6 @@ where
         status: r.get::<Option<String>, _>("status").unwrap_or_default(),
         external_id: r.get("external_id"),
         cwd: r.get("cwd"),
-        terminal_session_id: r.get("terminal_session_id"),
     }))
 }
 
@@ -1526,15 +1509,14 @@ fn derive_run(
         Some(thread.as_str()),
         world,
     );
-    let mount = chi
-        .terminal_session_id
-        .as_deref()
-        .and_then(|s| world.tmux_mount(s));
+    // §4.4: a Chi run is never mounted — a persistent run is a detached
+    // chi-runner with no pane (WP-18b retired the tmux session a terminal
+    // could attach to).
     let occupied = |status: SeatStatus, busy: bool, resume: SeatResume| Derived {
         status,
         agent: None,
         resume,
-        mount: mount.clone(),
+        mount: None,
         session: session.clone(),
         hint: RouteHint::Chi {
             run_id: run_id.to_string(),
@@ -1554,17 +1536,11 @@ fn derive_run(
             if idle {
                 occupied(SeatStatus::Idle, false, resume)
             } else {
-                Derived {
-                    mount: mount.clone(),
-                    ..vacant(resume, session.clone())
-                }
+                vacant(resume, session.clone())
             }
         }
         // failed / cancelled (and anything unknown): the session ended.
-        _ => Derived {
-            mount: mount.clone(),
-            ..vacant(resume, session.clone())
-        },
+        _ => vacant(resume, session.clone()),
     }
 }
 
@@ -4073,6 +4049,7 @@ mod tests {
             include_str!("../../migrations/0016_iyke_memory.sql"),
             include_str!("../../migrations/0059_chi_cache.sql"),
             include_str!("../../migrations/0067_iyke_seats.sql"),
+            include_str!("../../migrations/0068_chi_cache_runner_pid.sql"),
         ] {
             for stmt in split_sql(sql) {
                 sqlx::query(&stmt).execute(&pool).await.unwrap();
@@ -4117,7 +4094,6 @@ mod tests {
             pty_id: format!("pty-{id}"),
             running: true,
             cwd: "/work/default".to_string(),
-            argv: vec!["bash".to_string()],
             lease_holder: None,
             mount: Some(SeatMount {
                 window_label: "main".to_string(),
@@ -4303,7 +4279,6 @@ mod tests {
             status: status.into(),
             external_id: ext.map(str::to_string),
             cwd: None,
-            terminal_session_id: None,
         }
     }
 
