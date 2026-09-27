@@ -29,7 +29,7 @@ import { cn } from '@/components/ui/utils';
 // and selection is always carried by ARIA, never colour alone (WCAG 1.4.1).
 
 const FOCUS_RING =
-	'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary';
+	'outline-none focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary';
 
 export interface SegmentedItem {
 	id: string;

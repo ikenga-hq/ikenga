@@ -597,6 +597,7 @@ pub async fn spawn_streaming(
         // nothing.
         kill_on_drop: true,
         detached: false,
+        new_process_group: false,
     };
     // D-13 (`plans/2026-07-18-transcripts-and-terminal-architecture/07-retire-the-overlay.md`):
     // this spawn deliberately sets NO `CLAUDE_CONFIG_DIR` and passes NO

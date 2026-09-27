@@ -142,7 +142,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 						placeholder={String(DEFAULT_IDLE_MINUTES)}
 						className="w-10 bg-transparent font-mono text-[var(--text-caption,12px)] text-[var(--fg)] outline-none"
 					/>
-					<span className="font-mono text-[10px] text-[var(--fg-muted)]">min</span>
+					<span className="font-mono text-[11px] text-[var(--fg-muted)]">min</span>
 				</span>
 				{noSecret && <Kv>Set a PIN below first.</Kv>}
 			</PeopleRow>
@@ -165,7 +165,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 								title={m.why}
 								onClick={() => !on && void configure({ method: m.id })}
 								className={cn(
-									'h-[26px] border-r border-[var(--border)] px-3 text-[var(--text-micro)] outline-none last:border-r-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--primary)]',
+									'h-[26px] border-r border-[var(--border)] px-3 text-[var(--text-micro)] outline-none last:border-r-0 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--primary)]',
 									'disabled:cursor-not-allowed disabled:opacity-45',
 									on
 										? 'bg-[var(--primary-soft)] text-[var(--fg)]'

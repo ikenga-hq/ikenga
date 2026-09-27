@@ -48,6 +48,8 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { queryKeys } from '@/lib/query-keys';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { Project } from '@/lib/tauri-cmd';
+import { useCompanionStore } from './companion/companion-store';
+import { UNREPORTED } from './companion/seat-model';
 import { APPROVALS_REFETCH_MS, APPROVALS_ROUTE, NGWA_LINKS, StatusBar } from './status-bar';
 
 const PROJECT = {
@@ -109,6 +111,7 @@ beforeEach(() => {
 afterEach(() => {
 	cleanup();
 	vi.useRealTimers();
+	useCompanionStore.setState({ panelScopeSessionId: null });
 });
 
 function seg(id: string) {
@@ -243,5 +246,24 @@ describe('<StatusBar /> — keyboard (T6)', () => {
 		const engine = seg('engine') as HTMLElement;
 		expect(engine.textContent).toContain('claude-code');
 		expect(engine.tagName).toBe('SPAN');
+	});
+});
+
+describe('<StatusBar /> — the selected seat’s cost (G-93)', () => {
+	it('an engine that reported nothing reads one "—" with the tooltip, never "— — ctx"', () => {
+		// D-09 `roster` with @review (codex, idle) selected: its session has no
+		// statusline snapshot, so neither cost nor context is known.
+		useCompanionStore.setState({ panelScopeSessionId: 'term-review' });
+		render(<StatusBar />);
+		const cost = seg('cost') as HTMLElement;
+		expect(cost).not.toBeNull();
+		expect(cost.textContent).toBe('session—');
+		expect(cost.textContent).not.toMatch(/ctx/);
+		expect(cost.getAttribute('title')).toBe(`Cost of the selected session · ${UNREPORTED}`);
+	});
+
+	it('with nothing selected and nothing live, the cost item stays hidden', () => {
+		render(<StatusBar />);
+		expect(seg('cost')).toBeNull();
 	});
 });

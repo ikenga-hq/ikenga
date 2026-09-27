@@ -19,19 +19,17 @@
 //!    the kernel uses for spawn allowlists). Deny → audit + refuse.
 //! 4. Run the named command; return `{ stdout, stderr, exit_code }`.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use crate::commands::db::PaDb;
 use crate::commands::pkg::KernelState;
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::manifest::Package;
 use crate::pkg::permissions_check::{check_shell_execute, record_violation};
-use crate::platform::NoConsoleWindow;
 
 /// Default timeout for one-shot invocations — generous but bounded so a hung
 /// process can't pin a Tauri worker forever.
@@ -138,14 +136,20 @@ pub async fn pkg_invoke(
     }
 
     // (4) Run the named command, capturing stdout/stderr/exit_code.
-    let mut cmd = Command::new(&command);
-    cmd.args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .no_console_window();
+    let mut cmd = SpawnSpec::new(&command);
+    cmd.args(&args);
+    let opts = PipedOpts {
+        stdin: StdioMode::Null,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        // Unchanged from the inline spawn, which never set it.
+        kill_on_drop: false,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
-    let child = match cmd.spawn() {
+    let child = match crate::executor::current().spawn_piped(cmd, opts) {
         Ok(c) => c,
         Err(e) => {
             return Ok(PkgInvokeResult::err(format!(

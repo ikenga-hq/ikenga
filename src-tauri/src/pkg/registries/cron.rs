@@ -15,21 +15,19 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
-use tokio::process::Command;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
+use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
 use crate::pkg::manifest::Package;
 use crate::pkg::registries::SidecarsRegistry;
 use crate::pkg::registry::Registry;
-use crate::platform::NoConsoleWindow;
 
 /// Hard cap on cron-fired sidecar runs. Pollers/sends are quick; if a job
 /// blows past 10 minutes something is wrong and we'd rather kill it than
@@ -349,17 +347,21 @@ async fn run_sidecar_cron(
         entry.bin_path.display()
     );
 
-    let mut cmd = Command::new(&entry.bin_path);
+    let mut cmd = SpawnSpec::new(&entry.bin_path);
     cmd.arg(&subcommand);
     cmd.current_dir(&install_path);
-    cmd.no_console_window();
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
+    let opts = PipedOpts {
+        stdin: StdioMode::Null,
+        stdout: StdioMode::Piped,
+        stderr: StdioMode::Piped,
+        kill_on_drop: true,
+        no_console_window: true,
+        detached: false,
+        new_process_group: false,
+    };
 
     let timeout = std::time::Duration::from_secs(CRON_SIDECAR_TIMEOUT_SECS);
-    let child = match cmd.spawn() {
+    let child = match crate::executor::current().spawn_piped(cmd, opts) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("spawn `{}`: {e}", entry.bin_path.display());

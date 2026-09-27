@@ -2,7 +2,8 @@
 // toast pill. WP-67 mounts it once, at the Companion level (`companion.tsx`),
 // in both the expanded and the collapsed state, so a notice raised while the
 // Companion rests at its strip (an E-4 queue-dropped, a pop-out, an Undo)
-// shows at once instead of waiting for the dispatch bar to mount.
+// shows at once instead of waiting for the dispatch bar to mount. It sits
+// bottom-right, above the status bar (06 §5.5; D-09 draws its toasts there).
 
 import { AlertTriangle, Info } from 'lucide-react';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
@@ -20,6 +21,7 @@ export function SeatNoticeHost() {
 	return (
 		<FloatingToastChip
 			key={notice.seq}
+			anchor="viewport-bottom-right"
 			variant={notice.variant === 'error' ? 'error' : 'info'}
 			icon={notice.variant === 'error' ? <AlertTriangle /> : <Info />}
 			label={notice.message}

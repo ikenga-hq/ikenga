@@ -33,14 +33,15 @@ export function SessionsSeatsLink(_ctx: ExplorerSectionContext) {
 			aria-current={onBoard ? 'page' : undefined}
 			title="All seats — open the seat board (/chi) in the focused pane"
 			className={cn(
-				'inline-flex h-5 items-center gap-1 rounded-sm border bg-card px-2 text-[11px] text-muted-foreground',
+				'inline-flex h-5 items-center gap-1 rounded-sm border bg-card px-2 text-[11px] text-muted-foreground @max-[15rem]/sechead:px-1',
 				'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
 				// D-09 `.seclink[aria-current='page']` outranks its `:hover`.
 				onBoard ? 'border-primary text-foreground' : 'border-border-soft hover:border-[var(--border-strong)]'
 			)}
 		>
 			<LayoutGrid className="h-3 w-3" aria-hidden="true" />
-			Seats
+			{/* Icon-only in a narrow sidebar (section-frame's `sechead` container). */}
+			<span className="@max-[15rem]/sechead:sr-only">Seats</span>
 		</button>
 	);
 }

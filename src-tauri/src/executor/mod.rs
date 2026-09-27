@@ -27,8 +27,12 @@
 //!
 //! `pty::PtyManager::spawn_inner`, `claude::session::spawn_streaming`, the
 //! codex and antigravity engines. Chi's detached `chi-runner` launch
-//! (WP-18b) goes through [`PipedOpts::detached`]; pkg sidecars + MCP and the
-//! secrets surface are later slices.
+//! (WP-18b) goes through [`PipedOpts::detached`]. WP-18b part b routed the
+//! remaining desktop spawns: pkg MCP (per-call + long-lived), pkg sidecars
+//! (one-shot, streaming, invoke, cron), the npm/bun and claude-store
+//! installers ([`SessionExecutor::spawn_output_blocking`]), the playwright
+//! proxy, `action_exec` ([`PipedOpts::new_process_group`]) and the agent
+//! detection probes.
 //!
 //! This module compiles without the `desktop` feature: the daemon needs it.
 
@@ -189,6 +193,12 @@ pub struct PipedOpts {
     /// the default `KillMode=control-group`, stopping the unit still kills a
     /// detached child (see `scripts/server/ikenga-server.service`).
     pub detached: bool,
+    /// Unix: the child leads its own process group (`process_group(0)`), so
+    /// the caller can signal the whole tree as `-pid` (`action_exec`'s
+    /// timeout `kill_tree`). Unlike [`detached`](Self::detached) it does NOT
+    /// force `kill_on_drop` off — the handle keeps whatever was asked for.
+    /// A no-op off Unix.
+    pub new_process_group: bool,
 }
 
 /// A spawned PTY child: what `PtyManager::spawn_inner` used to get from
@@ -226,6 +236,20 @@ pub trait SessionExecutor: Send + Sync {
         spec: SpawnSpec,
         opts: PipedOpts,
     ) -> std::io::Result<tokio::process::Child>;
+
+    /// Run `spec` to completion and collect its output, blocking the calling
+    /// thread — `std::process::Command::output` behind the seam, for call
+    /// chains with no async context (`pkg::npm_install`, the claude-store
+    /// installer). `opts`' stdio modes are applied as given (unset streams
+    /// would otherwise follow `output()`'s defaults, so call sites name all
+    /// three). `kill_on_drop` has no meaning here and is ignored; `detached`
+    /// is refused as `InvalidInput` — waiting on a child that must outlive
+    /// the caller is a contradiction.
+    fn spawn_output_blocking(
+        &self,
+        spec: SpawnSpec,
+        opts: PipedOpts,
+    ) -> std::io::Result<std::process::Output>;
 }
 
 static INSTALLED: OnceLock<Box<dyn SessionExecutor>> = OnceLock::new();

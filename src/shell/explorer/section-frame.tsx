@@ -77,11 +77,14 @@ export function SectionFrame({
 	// of the header, which keeps its right padding clear for them. They are a
 	// sibling of the header button, not a child: a button can't hold another
 	// one, and a click on them must never reach the header's collapse toggle.
+	// The row is the `sechead` container: below 15rem an action drops its text
+	// label (`@max-[15rem]/sechead:sr-only`) and the reserve shrinks with it,
+	// so the section's own title isn't truncated at the default sidebar width.
 	const headerActions = section.headerActions?.(context);
 
 	return (
 		<div className="flex flex-col border-b border-border last:border-b-0" data-explorer-section={section.id}>
-			<div className="relative">
+			<div className="@container/sechead relative">
 				<EffectiveContextMenu
 					menuId={`section/${section.id}`}
 					handlers={menuHandlers}
@@ -96,7 +99,7 @@ export function SectionFrame({
 						data-section-id={section.id}
 						className={cn(
 							'flex items-center gap-1.5 pl-2 py-1.5 hover:bg-accent/50 focus-visible:bg-accent focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring focus:outline-none w-full text-left transition-colors min-h-[28px]',
-							headerActions ? 'pr-[76px]' : 'pr-2'
+							headerActions ? 'pr-[76px] @max-[15rem]/sechead:pr-9' : 'pr-2'
 						)}
 						aria-expanded={isOpen}
 						aria-label={ariaLabel}

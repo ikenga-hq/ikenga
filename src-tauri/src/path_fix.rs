@@ -113,6 +113,10 @@ mod macos {
     fn probe_shell_path() -> Result<Vec<String>, String> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let script = format!(r#"printf '%s' "{START}";printf '%s' "$PATH";printf '%s' "{END}""#);
+        // Not executor-routed (WP-18b): runs from desktop `lib.rs::run()`
+        // before the Tokio runtime exists, to repair the host process's own
+        // PATH (not a session spawn), and needs a std `Child` it can kill on
+        // its own timeout — no `SessionExecutor` method hands one back.
         let mut child = Command::new(&shell)
             .arg("-ilc")
             .arg(&script)

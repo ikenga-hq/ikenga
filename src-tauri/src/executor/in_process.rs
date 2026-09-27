@@ -58,29 +58,59 @@ impl SessionExecutor for InProcessExecutor {
         spec: SpawnSpec,
         opts: PipedOpts,
     ) -> std::io::Result<tokio::process::Child> {
-        let mut cmd = Command::new(&spec.program);
-        if opts.no_console_window {
-            cmd.no_console_window();
-        }
-        cmd.args(&spec.args);
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.stdin(opts.stdin.to_stdio())
-            .stdout(opts.stdout.to_stdio())
-            .stderr(opts.stderr.to_stdio());
-        if spec.env.clear {
-            cmd.env_clear();
-        }
-        for (k, v) in &spec.env.vars {
-            cmd.env(k, v);
-        }
+        let mut cmd = Command::from(std_command(&spec, &opts));
         if opts.detached {
             return spawn_detached(cmd);
         }
         cmd.kill_on_drop(opts.kill_on_drop);
         cmd.spawn()
     }
+
+    fn spawn_output_blocking(
+        &self,
+        spec: SpawnSpec,
+        opts: PipedOpts,
+    ) -> std::io::Result<std::process::Output> {
+        if opts.detached {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "spawn_output_blocking waits for the child; `detached` makes no sense here",
+            ));
+        }
+        std_command(&spec, &opts).output()
+    }
+}
+
+/// The builder calls shared by the tokio ([`SessionExecutor::spawn_piped`])
+/// and blocking ([`SessionExecutor::spawn_output_blocking`]) paths: program,
+/// args, cwd, stdio, env (clear first, then vars in order),
+/// `no_console_window` and `new_process_group`. The async-only knobs
+/// (`kill_on_drop`, `detached`) are applied by the caller on the tokio
+/// wrapper.
+fn std_command(spec: &SpawnSpec, opts: &PipedOpts) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&spec.program);
+    if opts.no_console_window {
+        cmd.no_console_window();
+    }
+    cmd.args(&spec.args);
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.stdin(opts.stdin.to_stdio())
+        .stdout(opts.stdout.to_stdio())
+        .stderr(opts.stderr.to_stdio());
+    if spec.env.clear {
+        cmd.env_clear();
+    }
+    for (k, v) in &spec.env.vars {
+        cmd.env(k, v);
+    }
+    #[cfg(unix)]
+    if opts.new_process_group {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
 }
 
 /// The `PipedOpts::detached` spawn. `kill_on_drop` is forced off: the caller
@@ -133,6 +163,7 @@ mod tests {
             kill_on_drop: true,
             no_console_window: true,
             detached: false,
+            new_process_group: false,
         }
     }
 
@@ -327,6 +358,7 @@ mod tests {
             kill_on_drop: true,
             no_console_window: true,
             detached,
+            new_process_group: false,
         };
         (spec, opts)
     }
@@ -368,5 +400,94 @@ mod tests {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         assert!(killed, "kill_on_drop must still kill a non-detached child");
+    }
+
+    /// WP-18b: `new_process_group` gives the child its own group (so the
+    /// caller can signal `-pid`) WITHOUT detaching it: `kill_on_drop` is
+    /// still honoured when the handle is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_process_group_child_leads_its_group_and_keeps_kill_on_drop() {
+        let (spec, mut opts) = sleeper(false);
+        opts.new_process_group = true;
+        let child = InProcessExecutor.spawn_piped(spec, opts).unwrap();
+        let pid = child.id().expect("pid") as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid, "own process group");
+        assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgid(0) });
+
+        drop(child);
+        let killed = wait_until(|| gone_or_zombie(pid)).await;
+        if !killed {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        assert!(killed, "kill_on_drop must still kill a new-group child");
+    }
+
+    /// The blocking path collects stdout / stderr / status like
+    /// `Command::output`, and applies the spec's env (cleared) and cwd.
+    #[cfg(unix)]
+    #[test]
+    fn output_blocking_collects_output_and_applies_env_and_cwd() {
+        let (_tmp, dir) = canonical_tempdir();
+        let mut spec = SpawnSpec::new("/bin/sh");
+        spec.arg("-c")
+            .arg(
+                r#"printf '%s|%s|%s' "$WP18_PROBE" "$(pwd -P)" "${HOME-unset}"; printf 'oops' 1>&2; exit 7"#,
+            )
+            .env_clear()
+            .env("WP18_PROBE", "first")
+            .env("WP18_PROBE", "blocking")
+            .current_dir(&dir);
+        let out = InProcessExecutor
+            .spawn_output_blocking(spec, piped_all())
+            .unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("blocking|{}|unset", dir.display())
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
+    }
+
+    /// The blocking path shares the flag application, `new_process_group`
+    /// included: the child's pgid is its own pid only when asked for.
+    #[cfg(unix)]
+    #[test]
+    fn output_blocking_honours_new_process_group() {
+        let run = |new_group: bool| {
+            let mut spec = SpawnSpec::new("/bin/sh");
+            spec.arg("-c").arg("echo $$ $(ps -o pgid= -p $$)");
+            let mut opts = piped_all();
+            opts.new_process_group = new_group;
+            let out = InProcessExecutor.spawn_output_blocking(spec, opts).unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut it = text.split_whitespace();
+            let pid: i32 = it.next().expect("pid").parse().unwrap();
+            let pgid: i32 = it.next().expect("pgid").parse().unwrap();
+            (pid, pgid)
+        };
+        let (pid, pgid) = run(true);
+        assert_eq!(pid, pgid, "own group");
+        let (pid, pgid) = run(false);
+        assert_ne!(pid, pgid, "inherits our group");
+        assert_eq!(pgid, unsafe { libc::getpgid(0) });
+    }
+
+    #[test]
+    fn output_blocking_refuses_detached_and_reports_missing_programs() {
+        let mut opts = piped_all();
+        opts.detached = true;
+        let err = InProcessExecutor
+            .spawn_output_blocking(SpawnSpec::new("true"), opts)
+            .expect_err("detached refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = InProcessExecutor
+            .spawn_output_blocking(
+                SpawnSpec::new("ikenga-wp18-definitely-not-a-binary"),
+                piped_all(),
+            )
+            .expect_err("no such program");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

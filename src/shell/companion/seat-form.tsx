@@ -57,11 +57,18 @@ function RadioRow({
 			title={title}
 			onClick={onPick}
 			className={cn(
-				'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0 enabled:hover:bg-[var(--bg-raised)] disabled:cursor-not-allowed',
-				'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+				'flex w-full items-start gap-2 border-b px-3 py-2 text-left last:border-b-0 disabled:cursor-not-allowed',
+				// Focus is an outline: the selected row's inset edge is a box-shadow.
+				'outline-none focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary',
+				!on && 'enabled:hover:bg-[var(--bg-raised)]',
 				sub && 'pl-8'
 			)}
-			style={{ borderColor: 'var(--border-soft)' }}
+			// D-09 `.kindrow.on`: the active tint with a --primary edge.
+			style={
+				on
+					? { borderColor: 'var(--border-soft)', background: 'var(--tint-bg-active)', boxShadow: 'inset 2px 0 0 var(--primary)' }
+					: { borderColor: 'var(--border-soft)' }
+			}
 		>
 			<span
 				aria-hidden="true"
@@ -295,7 +302,12 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 					<span id="seat-form-engine" className="block text-[13px] font-medium" style={{ color: 'var(--fg)' }}>
 						Engine
 					</span>
-					<div role="radiogroup" aria-labelledby="seat-form-engine" className="mt-1 flex flex-wrap gap-1">
+					<div
+						role="radiogroup"
+						aria-labelledby="seat-form-engine"
+						// D-09 `.seg`: one joined control.
+						className="mt-2 inline-flex overflow-hidden rounded-[var(--radius-sm)] border border-[var(--border)]"
+					>
 						{engineList.map((e) => {
 							const on = e.engine_id === engine;
 							const locked = lockedEngine !== null && e.engine_id !== lockedEngine;
@@ -315,10 +327,12 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 									}
 									onClick={() => pickEngine(e.engine_id)}
 									className={cn(
-										'h-7 rounded-md border px-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60',
-										on ? 'border-[var(--primary)] text-[var(--fg)]' : 'text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)]'
+										'h-[26px] border-r border-[var(--border)] px-3 text-[11px] last:border-r-0 disabled:cursor-not-allowed disabled:opacity-60',
+										'outline-none focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary',
+										on
+											? 'bg-[var(--primary-soft)] text-[var(--fg)]'
+											: 'text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)] enabled:hover:text-[var(--fg)]'
 									)}
-									style={on ? { background: 'var(--tint-bg-active)' } : { borderColor: 'var(--border)' }}
 								>
 									{e.engine_id}
 								</button>
@@ -459,19 +473,18 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 					disabled={!canCreate}
 					title={check.ok ? (startOk ? `Create seat @${name.trim()}` : 'Choose what it starts with') : 'Name the seat first'}
 					onClick={() => void create()}
-					className="h-9 rounded-md bg-[var(--primary)] px-4 text-[13px] text-[var(--primary-fg)] hover:opacity-90 disabled:cursor-not-allowed disabled:bg-[var(--bg-raised)] disabled:text-[var(--fg-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					className="h-[var(--btn-h,32px)] rounded-[var(--radius-sm)] border border-[var(--primary)] bg-[var(--primary)] px-4 text-[12px] font-medium text-[var(--primary-fg)] hover:opacity-90 disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:bg-transparent disabled:text-[var(--fg-faint)] disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 				>
 					{busy ? 'Creating…' : 'Create seat'}
 				</button>
 				<button
 					type="button"
 					onClick={() => closeSeatForm()}
-					className="h-9 rounded-md border px-4 text-[13px] text-[var(--fg)] hover:bg-[var(--bg-raised)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-					style={{ borderColor: 'var(--border)' }}
+					className="h-[var(--btn-h,32px)] rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[12px] font-medium text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 				>
 					Cancel
 				</button>
-				<span className="text-[11px]" style={{ color: 'var(--fg-muted)' }}>
+				<span className="ml-auto text-[11px]" style={{ color: 'var(--fg-muted)' }}>
 					Esc cancels
 				</span>
 			</div>
