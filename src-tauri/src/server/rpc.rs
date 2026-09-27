@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::rpc_files;
 use super::rpc_local;
 use super::rpc_shell;
 use super::AppState;
@@ -713,6 +714,29 @@ pub async fn rpc_handler(
         "studio_thread_delete" => rpc_shell::studio_thread_delete(&state, &payload.args).await,
         "studio_message_append" => rpc_shell::studio_message_append(&state, &payload.args).await,
         "studio_message_list" => rpc_shell::studio_message_list(&state, &payload.args).await,
+
+        // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---
+        //
+        // Bodies in `server::rpc_files`, over `server::shared::{fs, actions}`
+        // — the cores the desktop commands call. Every caller path goes
+        // through the fs allowlist (`PathGuard`, the `fs_read` / `fs_write`
+        // boundary); a project's `.ikenga/` files are reached only when its
+        // root is inside it. No `actions://changed` is emitted (no event
+        // channel). Writes never touch the trust record, which lives in
+        // `--data-dir`. Left allowlisted: `fs_trash` (OS trash outside the
+        // allowlist), `fs_roots_*` (would let the token holder redefine the
+        // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
+        // `actions_open_file` (spawns the OS opener).
+        "fs_kind" => rpc_files::fs_kind(&state, &payload.args).await,
+        "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
+        "fs_search" => rpc_files::fs_search(&state, &payload.args).await,
+        "fs_rename" => rpc_files::fs_rename(&state, &payload.args).await,
+        "actions_read_files" => rpc_files::actions_read_files(&state, &payload.args).await,
+        "actions_write" => rpc_files::actions_write(&state, &payload.args).await,
+        "keybindings_write" => rpc_files::keybindings_write(&state, &payload.args).await,
+        "actions_trust_status" => rpc_files::actions_trust_status(&state, &payload.args).await,
+        "actions_trust_grant" => rpc_files::actions_trust_grant(&state, &payload.args).await,
+        "actions_trust_revoke" => rpc_files::actions_trust_revoke(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
         other => {

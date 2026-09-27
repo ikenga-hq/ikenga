@@ -1,0 +1,156 @@
+//! The `fs_kind` / `fs_mime` / `fs_search` / `fs_rename` bodies, shared by
+//! the desktop commands (`commands::fs`) and the daemon's `/api/rpc` arms
+//! (WP-19 slice 5a).
+//!
+//! Each takes the path resolver as an argument instead of calling
+//! `resolve_allowlisted` itself: the desktop passes exactly that (so its
+//! behaviour is unchanged); the daemon passes its `PathGuard`, which expands
+//! and canonicalizes a caller's path the same way (`path_allow::
+//! expand_absolute` + `canonical_for_check`) and checks it against the same
+//! `fs_roots` set — `<data-dir>/fs_roots.json` in production. Canonicalizing
+//! resolves `..` and symlinks before the check, so neither reaches outside the
+//! allowlist.
+
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+
+/// Resolves a caller's path to a canonical path inside the allowlist, or
+/// says why not.
+pub type Resolve<'a> = &'a (dyn Fn(&str) -> Result<PathBuf, String> + Sync);
+
+// Mirror of the JS-side IGNORED_DIRS in files-mode.tsx — folders we skip when
+// `show_ignored` is false. The dot-prefix filter handles `.git`/`.next`/`.cache`
+// separately via `show_hidden`.
+const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out"];
+
+/// The default `fs_search` cap when the caller passes no `limit`.
+pub const DEFAULT_SEARCH_LIMIT: usize = 500;
+
+#[derive(Serialize)]
+pub struct FsSearchResult {
+    pub matches: Vec<String>,
+    pub truncated: bool,
+}
+
+/// `'file' | 'dir' | 'missing'`. `'missing'` is returned both for not-found
+/// and for allowlist-rejected paths so callers can fall back uniformly.
+pub async fn kind(resolve: Resolve<'_>, path: &str) -> &'static str {
+    let resolved = match resolve(path) {
+        Ok(p) => p,
+        Err(_) => return "missing",
+    };
+    match tokio::fs::metadata(&resolved).await {
+        Ok(m) if m.is_dir() => "dir",
+        Ok(m) if m.is_file() => "file",
+        Ok(_) => "missing",
+        Err(_) => "missing",
+    }
+}
+
+/// Extension-based MIME; the path must be allowlisted but need not exist.
+pub fn mime(resolve: Resolve<'_>, path: &str) -> Result<String, String> {
+    let resolved = resolve(path)?;
+    Ok(mime_guess::from_path(&resolved)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string())
+}
+
+/// Recursive basename search rooted at `root`. Case-insensitive substring
+/// match. Honors the same dot-file and ignored-dir rules the JS sorter uses
+/// so search results match what the user would see if they manually expanded
+/// every folder. Capped at `limit` (default [`DEFAULT_SEARCH_LIMIT`]); when
+/// the cap trips, `truncated` is true and the walk stops early.
+///
+/// The walk never leaves `root`: `DirEntry::file_type` does not follow
+/// symlinks, so a symlinked directory is matched by name but not descended.
+pub async fn search(
+    resolve: Resolve<'_>,
+    root: &str,
+    query: &str,
+    show_hidden: bool,
+    show_ignored: bool,
+    limit: Option<usize>,
+) -> Result<FsSearchResult, String> {
+    let resolved = resolve(root)?;
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(FsSearchResult {
+            matches: Vec::new(),
+            truncated: false,
+        });
+    }
+    let cap = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).max(1);
+
+    tokio::task::spawn_blocking(move || {
+        let mut matches: Vec<String> = Vec::new();
+        let mut truncated = false;
+        let mut stack: Vec<PathBuf> = vec![resolved];
+
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                // Permission denied, vanished mid-walk, etc. Skip silently —
+                // search shouldn't surface every unreadable corner.
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                let name = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if !show_hidden && name.starts_with('.') {
+                    continue;
+                }
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let is_dir = ft.is_dir();
+                if is_dir && !show_ignored && IGNORED_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                if name.to_lowercase().contains(&needle) {
+                    matches.push(entry.path().to_string_lossy().to_string());
+                    if matches.len() >= cap {
+                        truncated = true;
+                        return FsSearchResult { matches, truncated };
+                    }
+                }
+                if is_dir {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        FsSearchResult { matches, truncated }
+    })
+    .await
+    .map_err(|e| format!("search join failed: {e}"))
+}
+
+/// Rename `from` to a sibling with the new basename. Both the source and the
+/// resolved destination must be inside the allowlist. The destination must
+/// not already exist. Returns the resolved destination.
+pub async fn rename(resolve: Resolve<'_>, from: &str, to_name: &str) -> Result<String, String> {
+    if to_name.is_empty() || to_name.contains('/') || to_name.contains('\\') {
+        return Err("invalid name".to_string());
+    }
+    let resolved_from = resolve(from)?;
+    let parent = resolved_from
+        .parent()
+        .ok_or_else(|| "source has no parent".to_string())?;
+    let dest = parent.join(to_name);
+    let resolved_dest = resolve(&dest.to_string_lossy())?;
+    if tokio::fs::metadata(&resolved_dest).await.is_ok() {
+        return Err(format!("destination exists: {}", resolved_dest.display()));
+    }
+    tokio::fs::rename(&resolved_from, &resolved_dest)
+        .await
+        .map_err(|e| format!("rename failed: {e}"))?;
+    Ok(path_string(&resolved_dest))
+}
+
+fn path_string(p: &Path) -> String {
+    p.to_string_lossy().to_string()
+}

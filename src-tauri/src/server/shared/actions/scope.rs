@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::settings::scope::{
+use crate::server::shared::settings::scope::{
     ikenga_file, read_document_bytes, write_document_bytes_atomic, IkengaDocument,
 };
-use crate::settings::SettingsScope;
+use crate::server::shared::settings::SettingsScope;
 
 use super::schema::{self, FileKind, ValidateContext, Validation};
 
