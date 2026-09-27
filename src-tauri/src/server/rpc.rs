@@ -15,63 +15,16 @@ use crate::pty::SpawnOpts;
 
 /// Resolve a caller-supplied path against the user's FS allowlist — the same
 /// `fs_roots` boundary `commands::fs` enforces for the desktop app, so a
-/// remote client can reach exactly what a local one can and nothing more.
+/// remote client can reach exactly what a local one can and nothing more —
+/// and refuse the daemon's own state (`--data-dir`, the discovery file)
+/// whatever that allowlist covers (see `server::reserved`).
 ///
 /// `resolve_allowlisted` requires the path's parent to exist, which `mkdir -p`
-/// of a deep new chain does not satisfy; walk up to the nearest existing
-/// ancestor, check *that* against the allowlist, then re-attach the tail.
-fn resolve_path(input: &str) -> Result<std::path::PathBuf, String> {
-    use std::path::{Component, PathBuf};
-
-    if input.is_empty() {
-        return Err("path is required".to_string());
-    }
-    if let Ok(p) = crate::path_allow::resolve_allowlisted(input) {
-        return Ok(p);
-    }
-
-    let expanded = shellexpand::full(input)
-        .map(|c| c.into_owned())
-        .map_err(|e| format!("expand path: {e}"))?;
-    let abs = {
-        let p = PathBuf::from(&expanded);
-        if p.is_absolute() {
-            p
-        } else {
-            std::env::current_dir()
-                .map_err(|e| format!("current_dir: {e}"))?
-                .join(p)
-        }
-    };
-    // `..` would let a canonicalized-ancestor check be re-escaped by the tail
-    // we re-attach, so refuse it outright rather than try to normalise it.
-    if abs.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("path may not contain `..`".to_string());
-    }
-
-    let mut ancestor = abs.as_path();
-    let existing = loop {
-        if ancestor.exists() {
-            break ancestor;
-        }
-        match ancestor.parent() {
-            Some(parent) => ancestor = parent,
-            None => return Err(format!("path outside allowlist: {}", abs.display())),
-        }
-    };
-    let canonical_existing = existing
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
-    let tail = abs
-        .strip_prefix(existing)
-        .map_err(|_| "failed to resolve path".to_string())?;
-    let resolved = canonical_existing.join(tail);
-
-    let roots = crate::fs_roots::current().ok_or("fs_roots not initialized")?;
-    if !roots.is_allowed(&resolved) {
-        return Err(format!("path outside allowlist: {}", resolved.display()));
-    }
-    Ok(resolved)
+/// of a deep new chain does not satisfy, so this goes through
+/// `PathGuard::resolve_deep`: walk up to the nearest existing ancestor, check
+/// *that*, then re-attach the tail. One choke point with the other fs arms.
+fn resolve_path(state: &AppState, input: &str) -> Result<std::path::PathBuf, String> {
+    state.path_guard.resolve_deep(input)
 }
 
 /// Returned when the daemon was started without `--data-dir`, so there is no
@@ -322,7 +275,7 @@ pub async fn rpc_handler(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            match resolve_path(path_str) {
+            match resolve_path(&state, path_str) {
                 Ok(path) => RpcResponse::success(path.exists()),
                 Err(e) => RpcResponse::error(e),
             }
@@ -333,7 +286,7 @@ pub async fn rpc_handler(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            match resolve_path(path_str) {
+            match resolve_path(&state, path_str) {
                 Ok(path) => match tokio::fs::read_to_string(&path).await {
                     Ok(content) => RpcResponse::success(content),
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -352,7 +305,7 @@ pub async fn rpc_handler(
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            match resolve_path(path_str) {
+            match resolve_path(&state, path_str) {
                 Ok(path) => {
                     if let Some(parent) = path.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
@@ -371,7 +324,7 @@ pub async fn rpc_handler(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or(".");
-            let path = match resolve_path(path_str) {
+            let path = match resolve_path(&state, path_str) {
                 Ok(p) => p,
                 Err(e) => return Json(RpcResponse::error(e)),
             };
@@ -400,7 +353,7 @@ pub async fn rpc_handler(
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            match resolve_path(path_str) {
+            match resolve_path(&state, path_str) {
                 Ok(path) => match tokio::fs::create_dir_all(&path).await {
                     Ok(_) => RpcResponse::success(true),
                     Err(e) => RpcResponse::error(e.to_string()),

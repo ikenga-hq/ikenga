@@ -33,10 +33,16 @@
 //! # Security
 //!
 //! `watch` resolves the requested path through the same allowlist the desktop
-//! `fs_watch` command uses, and `fs_watch` then re-checks **every reported
+//! `fs_watch` command uses (via the router's `PathGuard`), and `fs_watch` then re-checks **every reported
 //! event path** before it reaches this sink — see `crate::fs_watch`. Without
 //! that second check a symlink inside a watched root would put out-of-allowlist
 //! filenames and write timing on the wire.
+//!
+//! The daemon's own state is refused on top of the allowlist (see
+//! `server::reserved`): a watch on the data dir, anything inside it, or the
+//! discovery file is refused, and a watch on an ancestor of them drops every
+//! event whose path is inside them — so neither the names nor the write
+//! timing of `fs_roots.json`, `daemon.json`, `ikenga.db`, … reach the client.
 
 use std::sync::Arc;
 
@@ -49,9 +55,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use super::rpc_shell::PathGuard;
 use super::AppState;
 use crate::fs_watch::{FileChange, FsEventSink, FsWatchManager};
-use crate::path_allow::resolve_allowlisted;
 
 /// Cap on live watchers for one socket. Each one is an OS watch plus a
 /// debouncer thread, and nothing in the UI needs more than a handful; the cap
@@ -77,10 +83,22 @@ enum FsControlMessage {
 /// Ships one watcher's changes down one client's socket.
 struct SocketSink {
     tx: mpsc::UnboundedSender<Message>,
+    /// Drops events inside the daemon's own state. `None` only in unit tests
+    /// of the frame shape.
+    guard: Option<PathGuard>,
 }
 
 impl FsEventSink for SocketSink {
     fn emit(&self, watcher_id: &str, change: FileChange) {
+        // `change.path` is canonical (`fs_watch` re-checks every event path
+        // through `check_allowlisted`), so the reserved compare is exact.
+        if self
+            .guard
+            .as_ref()
+            .is_some_and(|g| g.is_reserved(std::path::Path::new(&change.path)))
+        {
+            return;
+        }
         // Unbounded because this runs on the debouncer's thread, which must
         // not block; the pump task drains it. Bounded by the debounce window
         // in practice — one frame per changed path per 250 ms.
@@ -114,7 +132,7 @@ pub async fn fs_ws_handler(
     ws.on_upgrade(move |socket| handle_fs_socket(socket, state))
 }
 
-async fn handle_fs_socket(socket: WebSocket, _state: Arc<AppState>) {
+async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
@@ -135,6 +153,7 @@ async fn handle_fs_socket(socket: WebSocket, _state: Arc<AppState>) {
     let manager = FsWatchManager::new();
     let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink {
         tx: out_tx.clone(),
+        guard: Some(state.path_guard.clone()),
     });
 
     let _ = out_tx.send(Message::Text(
@@ -144,7 +163,9 @@ async fn handle_fs_socket(socket: WebSocket, _state: Arc<AppState>) {
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             Message::Close(_) => break,
-            Message::Text(text) => handle_control(&text, &manager, &sink, &out_tx),
+            Message::Text(text) => {
+                handle_control(&text, &state.path_guard, &manager, &sink, &out_tx)
+            }
             // Binary/ping/pong carry nothing this socket understands. Axum
             // answers pings itself.
             _ => {}
@@ -161,6 +182,7 @@ async fn handle_fs_socket(socket: WebSocket, _state: Arc<AppState>) {
 
 fn handle_control(
     raw: &str,
+    guard: &PathGuard,
     manager: &FsWatchManager,
     sink: &Arc<dyn FsEventSink>,
     out: &mpsc::UnboundedSender<Message>,
@@ -186,10 +208,13 @@ fn handle_control(
                 ));
                 return;
             }
-            let resolved = match resolve_allowlisted(&path) {
+            // The router's guard: the process-global allowlist exactly as
+            // `resolve_allowlisted` applies it, then the daemon's own state —
+            // the allowlist may cover the data dir, a watch inside it may not.
+            let resolved = match guard.resolve(&path) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = out.send(error_frame(req_id.as_deref(), &e.to_string()));
+                    let _ = out.send(error_frame(req_id.as_deref(), &e));
                     return;
                 }
             };
@@ -270,7 +295,7 @@ mod tests {
     #[test]
     fn a_change_frame_carries_the_shape_the_client_reads() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = SocketSink { tx };
+        let sink = SocketSink { tx, guard: None };
         sink.emit(
             "w-1",
             FileChange {
@@ -325,7 +350,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink { tx });
+        let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink { tx, guard: None });
 
         let manager = FsWatchManager::new();
         let id = manager.watch_with_sink(&dir, sink).unwrap();
@@ -346,5 +371,103 @@ mod tests {
 
         manager.unwatch(&id).unwrap();
         assert_eq!(manager.len(), 0);
+    }
+
+    /// A guard whose allowlist is `root/` and whose data dir is `root/data/`
+    /// — the allowlist covers the data dir, which must still be refused.
+    fn reserving_guard() -> (tempfile::TempDir, std::path::PathBuf, PathGuard) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let roots_file = base.join("roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [root.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        let guard = PathGuard::roots(Arc::new(roots)).reserving(
+            crate::server::reserved::Reserved::new(Some(root.join("data")), vec![]),
+        );
+        (tmp, root, guard)
+    }
+
+    fn frames(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(Message::Text(raw)) = rx.try_recv() {
+            out.push(serde_json::from_str(&raw).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn a_watch_inside_the_data_dir_is_refused() {
+        let (_tmp, root, guard) = reserving_guard();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink: Arc<dyn FsEventSink> = Arc::new(SocketSink {
+            tx: tx.clone(),
+            guard: Some(guard.clone()),
+        });
+        let manager = FsWatchManager::new();
+        for path in [
+            root.join("data"),
+            root.join("data/fs_roots.json"),
+            root.join("data/sub"),
+        ] {
+            let frame = json!({ "type": "watch", "reqId": "r", "path": path }).to_string();
+            handle_control(&frame, &guard, &manager, &sink, &tx);
+            let got = frames(&mut rx);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert_eq!(got[0]["type"], "error", "{}: {got:?}", path.display());
+            let message = got[0]["message"].as_str().unwrap();
+            assert!(
+                message.contains(crate::server::reserved::INSIDE_DATA_DIR),
+                "{message}"
+            );
+        }
+        assert_eq!(manager.len(), 0, "no watcher may be opened");
+
+        // The root around it is still watchable.
+        let frame = json!({ "type": "watch", "reqId": "ok", "path": root }).to_string();
+        handle_control(&frame, &guard, &manager, &sink, &tx);
+        let got = frames(&mut rx);
+        assert_eq!(got[0]["type"], "watched", "{got:?}");
+        assert_eq!(manager.len(), 1);
+    }
+
+    /// A watch on an ancestor of the data dir must not relay the names or
+    /// timing of its files.
+    #[test]
+    fn events_inside_the_data_dir_never_reach_the_wire() {
+        let (_tmp, root, guard) = reserving_guard();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = SocketSink {
+            tx,
+            guard: Some(guard),
+        };
+        for inside in ["data", "data/fs_roots.json", "data/backups/new.db"] {
+            sink.emit(
+                "w",
+                FileChange {
+                    kind: crate::fs_watch::ChangeKind::Modify,
+                    path: root.join(inside).to_string_lossy().into_owned(),
+                },
+            );
+        }
+        assert!(frames(&mut rx).is_empty());
+        sink.emit(
+            "w",
+            FileChange {
+                kind: crate::fs_watch::ChangeKind::Create,
+                path: root.join("data-notes.txt").to_string_lossy().into_owned(),
+            },
+        );
+        let got = frames(&mut rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0]["path"],
+            root.join("data-notes.txt").to_string_lossy().as_ref()
+        );
     }
 }

@@ -72,33 +72,68 @@ pub(super) fn targ<T: DeserializeOwned>(args: &Value, names: &[&str]) -> Result<
 
 const NO_ALLOWLIST: &str = "fs allowlist not initialized (the daemon needs --data-dir)";
 
-/// The allowlist the project filesystem arms check a canonical path against.
+/// The allowlist the daemon's filesystem arms check a canonical path against,
+/// plus the daemon's own state no path may reach whatever the allowlist says
+/// (see [`super::reserved`]).
 ///
-/// In production it is the process-global `crate::fs_roots` set the daemon
-/// installs from `<data-dir>/fs_roots.json` at boot — the same boundary the
-/// `fs_*` arms enforce, so these arms reach nothing a token holder could not
-/// already `fs_read`. Tests pass a local root set, because the global is a
-/// `OnceLock` that would pin one set for the whole test binary.
+/// In production the allowlist is the process-global `crate::fs_roots` set
+/// the daemon installs from `<data-dir>/fs_roots.json` at boot — the same
+/// boundary the `fs_*` arms enforce, so these arms reach nothing a token
+/// holder could not already `fs_read`. Tests pass a local root set, because
+/// the global is a `OnceLock` that would pin one set for the whole test
+/// binary. The reserved set is attached by `server::router_with` from the
+/// router's own `--data-dir`, so every router — tests included — has it.
 #[derive(Clone)]
-pub(crate) enum PathGuard {
+pub(crate) struct PathGuard {
+    roots: GuardRoots,
+    reserved: std::sync::Arc<super::reserved::Reserved>,
+}
+
+#[derive(Clone)]
+enum GuardRoots {
     Allowlist,
     #[cfg(test)]
-    Roots(std::sync::Arc<crate::fs_roots::FsRoots>),
+    Local(std::sync::Arc<crate::fs_roots::FsRoots>),
 }
 
 impl PathGuard {
+    /// The process-global `fs_roots` allowlist, nothing reserved yet.
+    pub(crate) fn allowlist() -> Self {
+        Self {
+            roots: GuardRoots::Allowlist,
+            reserved: Default::default(),
+        }
+    }
+
+    /// A local root set (tests), nothing reserved yet.
+    #[cfg(test)]
+    pub(crate) fn roots(roots: std::sync::Arc<crate::fs_roots::FsRoots>) -> Self {
+        Self {
+            roots: GuardRoots::Local(roots),
+            reserved: Default::default(),
+        }
+    }
+
+    /// This guard, refusing `reserved` on every check as well.
+    pub(crate) fn reserving(self, reserved: super::reserved::Reserved) -> Self {
+        Self {
+            reserved: std::sync::Arc::new(reserved),
+            ..self
+        }
+    }
+
     /// Errors, naming the flag, when the production allowlist was never
     /// installed (the daemon was started without `--data-dir`). Arms whose
     /// desktop contract folds a refusal into an answer (`fs_kind`'s
     /// `"missing"`) call this first, so a misconfigured daemon says so
     /// instead of answering "missing" for every path.
     pub(crate) fn ready(&self) -> Result<(), String> {
-        match self {
-            PathGuard::Allowlist => crate::fs_roots::current()
+        match &self.roots {
+            GuardRoots::Allowlist => crate::fs_roots::current()
                 .map(|_| ())
                 .ok_or_else(|| NO_ALLOWLIST.to_string()),
             #[cfg(test)]
-            PathGuard::Roots(_) => Ok(()),
+            GuardRoots::Local(_) => Ok(()),
         }
     }
 
@@ -109,9 +144,65 @@ impl PathGuard {
     /// makes `..` and symlinks unable to leave the allowlist.
     pub(crate) fn resolve(&self, input: &str) -> Result<PathBuf, String> {
         let abs = crate::path_allow::expand_absolute(input).map_err(|e| e.to_string())?;
-        let canonical = crate::path_allow::canonical_for_check(&abs).map_err(|e| e.to_string())?;
+        let canonical = match crate::path_allow::canonical_for_check(&abs) {
+            Ok(c) => c,
+            // A missing parent. Inside the daemon's own state that must read
+            // as the same refusal as everything else there, not "does not
+            // exist" — which would answer whether a subdirectory of the data
+            // dir exists.
+            Err(e) => {
+                if let Some(reason) = super::reserved::lenient_reason(&self.reserved, &abs) {
+                    return Err(format!("{reason}: {}", abs.display()));
+                }
+                return Err(e.to_string());
+            }
+        };
         self.check(&canonical)?;
         Ok(canonical)
+    }
+
+    /// [`Self::resolve`] for the served `fs_exists` / `fs_read` / `fs_write`
+    /// / `fs_list` / `fs_mkdir` arms, which also accept a path whose parent
+    /// does not exist yet (`mkdir -p` of a deep new chain): walk up to the
+    /// nearest existing ancestor, canonicalize *that*, re-attach the missing
+    /// tail, and check the result. `..` is refused on that walk, since a
+    /// re-attached tail is never canonicalized. A path that canonicalizes
+    /// (its leaf or parent exists) and is refused stays refused — the walk
+    /// is only for a missing parent.
+    pub(crate) fn resolve_deep(&self, input: &str) -> Result<PathBuf, String> {
+        use std::path::Component;
+
+        if input.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let abs =
+            crate::path_allow::expand_absolute(input).map_err(|e| format!("expand path: {e}"))?;
+        if let Ok(canonical) = crate::path_allow::canonical_for_check(&abs) {
+            self.check(&canonical)?;
+            return Ok(canonical);
+        }
+        if abs.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err("path may not contain `..`".to_string());
+        }
+        let mut ancestor = abs.as_path();
+        let existing = loop {
+            if ancestor.exists() {
+                break ancestor;
+            }
+            match ancestor.parent() {
+                Some(parent) => ancestor = parent,
+                None => return Err(format!("path outside allowlist: {}", abs.display())),
+            }
+        };
+        let canonical_existing = existing
+            .canonicalize()
+            .map_err(|e| format!("canonicalize {}: {e}", existing.display()))?;
+        let tail = abs
+            .strip_prefix(existing)
+            .map_err(|_| "failed to resolve path".to_string())?;
+        let resolved = canonical_existing.join(tail);
+        self.check(&resolved)?;
+        Ok(resolved)
     }
 
     /// An absolute path, checked by its canonical form (symlinks resolved).
@@ -147,19 +238,50 @@ impl PathGuard {
         self.check(&canonical.join(tail))
     }
 
+    /// The allowlist, then [`Self::check_reserved`]. `canonical` is a
+    /// canonical path, or a canonical ancestor plus a missing tail.
     pub(super) fn check(&self, canonical: &Path) -> Result<(), String> {
-        let allowed = match self {
-            PathGuard::Allowlist => crate::fs_roots::current()
+        let allowed = match &self.roots {
+            GuardRoots::Allowlist => crate::fs_roots::current()
                 .ok_or(NO_ALLOWLIST)?
                 .is_allowed(canonical),
             #[cfg(test)]
-            PathGuard::Roots(roots) => roots.is_allowed(canonical),
+            GuardRoots::Local(roots) => roots.is_allowed(canonical),
         };
-        if allowed {
-            Ok(())
-        } else {
-            Err(format!("path outside allowlist: {}", canonical.display()))
+        if !allowed {
+            return Err(format!("path outside allowlist: {}", canonical.display()));
         }
+        self.check_reserved(canonical)
+    }
+
+    /// Refuse the daemon's own state (the data dir and everything in it, the
+    /// discovery file) whatever the allowlist says, and a path that reaches
+    /// through a symlink canonicalization could not resolve — a dangling
+    /// link, which a write would follow to a target nothing checked (a
+    /// not-yet-existing file inside the data dir, say).
+    pub(crate) fn check_reserved(&self, canonical: &Path) -> Result<(), String> {
+        if super::reserved::through_unresolved_symlink(canonical) {
+            return Err(format!(
+                "path goes through a symlink that does not resolve: {}",
+                canonical.display()
+            ));
+        }
+        match self.reserved.snapshot().reason(canonical) {
+            Some(reason) => Err(format!("{reason}: {}", canonical.display())),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `canonical` is the daemon's own state: the filter form of
+    /// [`Self::check_reserved`], for paths the OS reports (watch events)
+    /// rather than paths a caller asks for — no symlink rule.
+    pub(crate) fn is_reserved(&self, canonical: &Path) -> bool {
+        self.reserved.snapshot().reason(canonical).is_some()
+    }
+
+    /// The reserved set resolved now, for a walk that checks many entries.
+    pub(crate) fn reserved_snapshot(&self) -> super::reserved::Snapshot {
+        self.reserved.snapshot()
     }
 }
 
@@ -845,7 +967,7 @@ mod tests {
             Some(db.clone()),
             None,
             with_home.then(|| home.clone()),
-            PathGuard::Roots(Arc::new(roots)),
+            PathGuard::roots(Arc::new(roots)),
         );
         Daemon {
             _tmp: tmp,
@@ -871,7 +993,7 @@ mod tests {
             None,
             None,
             None,
-            PathGuard::Allowlist,
+            PathGuard::allowlist(),
         )
     }
 
