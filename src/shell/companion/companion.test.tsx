@@ -1,5 +1,6 @@
 // Companion component tests — C2 (collapsed strip), C3 (permission card UI
-// + A/D keys + Undo), C4 (tab drag between the Companion and the pane tree),
+// + A/D keys + Undo), C4 (drag between the Companion's rail and the pane
+// tree — WP-67: the session tabs are now seat-rail rows),
 // C5 (no session → empty states with exactly one action), C7 (⌘2 /
 // `ikenga:companion-focus` focuses the dispatch input), plus the dispatch
 // bar's Enter / ⇧Enter / ⌥Enter routing.
@@ -508,8 +509,8 @@ describe('C12 — one input, no PermissionInbox (ADR-021 / spec §5.4, §5.6)', 
 	});
 });
 
-describe('C4 — tab drag between the Companion and the pane tree', () => {
-	it('drags a session tab out of the Companion into a pane', () => {
+describe('C4 — drag between the Companion rail and the pane tree', () => {
+	it('drags a parked session row out of the Companion into a pane', () => {
 		useCompanionStore.setState({
 			state: 'expanded',
 			tabs: [{ kind: 'terminal', sessionId: 'term-z' }],
@@ -526,7 +527,9 @@ describe('C4 — tab drag between the Companion and the pane tree', () => {
 				<Companion />
 			</div>
 		);
-		const tab = screen.getByRole('tab');
+		// WP-67: a terminal parked by a pane drop is an Unseated rail row.
+		const tab = document.querySelector('[role="option"][data-session="term-z"]') as HTMLElement;
+		expect(tab).not.toBeNull();
 		const zone = screen.getByTestId('drop-zone-L1');
 		// jsdom lays nothing out; give the pane a box so (40, 40) is its centre
 		// zone (move-as-tab), not an edge (split).
@@ -554,7 +557,7 @@ describe('C4 — tab drag between the Companion and the pane tree', () => {
 		expect(useDragState.getState().active).toBe(false);
 	});
 
-	it('drops a pane terminal tab onto the collapsed strip: a session tab, pane keeps it', () => {
+	it('drops a pane terminal tab onto the collapsed strip: a rail row, pane keeps it', () => {
 		wrap(<Companion />);
 		const strip = screen.getByRole('complementary', { name: 'Chi companion' });
 		const source = document.createElement('div');
@@ -605,7 +608,7 @@ describe('C4 — tab drag between the Companion and the pane tree', () => {
 		expect(useCompanionStore.getState().tabs).toEqual([]);
 	});
 
-	it('"Move to pane" in the tab menu is the single-pointer alternative (WCAG 2.5.7)', () => {
+	it('"Move to pane" in the row menu is the single-pointer alternative (WCAG 2.5.7)', () => {
 		useCompanionStore.setState({
 			state: 'expanded',
 			tabs: [{ kind: 'terminal', sessionId: 'term-q' }],
@@ -615,7 +618,7 @@ describe('C4 — tab drag between the Companion and the pane tree', () => {
 			focusedId: 'L1',
 		});
 		wrap(<Companion />);
-		fireEvent.contextMenu(screen.getByRole('tab'));
+		fireEvent.contextMenu(document.querySelector('[role="option"][data-session="term-q"]') as HTMLElement);
 		fireEvent.click(screen.getByRole('menuitem', { name: 'Move to pane' }));
 		const leaf = usePaneStore.getState().root;
 		expect(leaf.type === 'leaf' && leaf.tabs.at(-1)).toEqual({

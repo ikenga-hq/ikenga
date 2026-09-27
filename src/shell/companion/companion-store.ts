@@ -23,6 +23,12 @@ import { scopedPersistName } from '@/lib/window/window-context';
 
 export type CompanionState = 'collapsed' | 'expanded' | 'hidden';
 
+/** WP-67 — which seat-rail row is selected. Selecting a row sets this, the
+ *  dispatch target and the panel scope together (G-SEATS §9.1); a
+ *  *New session on…* / *Persistent run* target moves the chip without
+ *  moving the selection (D-09). Not persisted, like the target. */
+export type RailSelection = { kind: 'seat'; seat_id: string } | { kind: 'session'; session_id: string };
+
 export const COMPANION_MIN_WIDTH = 280;
 export const COMPANION_MAX_WIDTH = 900;
 export const COMPANION_DEFAULT_WIDTH = 372;
@@ -74,6 +80,8 @@ interface CompanionStoreState {
 	 *  show. `null` → their empty state. Not persisted: session ids die with
 	 *  the app, exactly like G-STATE's `activeTarget`. */
 	panelScopeSessionId: string | null;
+	/** The selected seat-rail row (WP-67). Not persisted. */
+	railSelection: RailSelection | null;
 	/** Dispatch input text. Lives here so "Hand to Chi" can pre-fill it. */
 	draft: string;
 	/** Something asked for the dispatch input to take focus; the dispatch bar
@@ -102,6 +110,9 @@ interface CompanionStoreState {
 	appendView: (view: PaneView) => void;
 
 	setPanelScope: (sessionId: string | null) => void;
+	/** Select a seat-rail row: the rail selection, `companion.activeTarget`
+	 *  AND the panel scope (`scope` = the seat's session ref, §9.1). */
+	selectRail: (sel: RailSelection, scope: string | null) => void;
 	setDraft: (text: string) => void;
 	/** Expand and move focus to the dispatch input (⌘2, ⌘J-expand, ⌘⇧A). */
 	focusDispatch: () => void;
@@ -208,6 +219,7 @@ export const useCompanionStore = create<CompanionStoreState>()(
 				activeIdx: 0,
 				width: COMPANION_DEFAULT_WIDTH,
 				panelScopeSessionId: null,
+				railSelection: null,
 				draft: '',
 				focusPending: false,
 				pickerPending: false,
@@ -254,6 +266,7 @@ export const useCompanionStore = create<CompanionStoreState>()(
 					const scope = scopeFor(view);
 					set({ activeIdx: idx, panelScopeSessionId: scope });
 					if (scope) {
+						set({ railSelection: { kind: 'session', session_id: scope } });
 						useShellStore.getState().setCompanionTarget({ kind: 'session', session_id: scope });
 					}
 				},
@@ -274,6 +287,16 @@ export const useCompanionStore = create<CompanionStoreState>()(
 				},
 
 				setPanelScope: (panelScopeSessionId) => set({ panelScopeSessionId }),
+				selectRail: (sel, scope) => {
+					set({ railSelection: sel, panelScopeSessionId: scope });
+					useShellStore
+						.getState()
+						.setCompanionTarget(
+							sel.kind === 'seat'
+								? { kind: 'seat', seat_id: sel.seat_id }
+								: { kind: 'session', session_id: sel.session_id }
+						);
+				},
 				setDraft: (draft) => set({ draft }),
 				focusDispatch: () => set({ state: 'expanded', focusPending: true }),
 				openTargetPicker: () => set({ state: 'expanded', pickerPending: true }),
@@ -403,7 +426,11 @@ if (typeof useShellStore.subscribe === 'function') {
 		if (!prev || state.activeProject.id === prev.activeProject.id) return;
 		const target = state.companion.activeTarget;
 		const next = targetAfterProjectSwitch(target, cachedSeats(state.activeProject.id));
-		if (next !== target) state.setCompanionTarget(next);
+		if (next !== target) {
+			state.setCompanionTarget(next);
+			// WP-67: the rail selection and the panel scope were that seat's too.
+			useCompanionStore.setState({ railSelection: null, panelScopeSessionId: null });
+		}
 	});
 }
 

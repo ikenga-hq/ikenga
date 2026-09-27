@@ -55,7 +55,8 @@ describe('ADR-021 conformance — src/shell/companion/**', () => {
 				'companion-store.ts',
 				'dispatch-bar.tsx',
 				'target-picker.tsx',
-				'session-tabs.tsx',
+				'seat-rail.tsx',
+				'seat-form.tsx',
 				'collapsed-strip.tsx',
 				'resolve-target.ts',
 			])
@@ -89,16 +90,32 @@ describe('ADR-021 conformance — src/shell/companion/**', () => {
 		expect(offenders).toEqual([]);
 	});
 
-	it('the dispatch bar is the only text input in the Companion', () => {
+	// WP-67 (D-09): the seat rail's inline rename (F2) and the New-seat form's
+	// Name field are the locked design's two other text fields. Each is a
+	// one-line NAME field — `<input data-seat-name-field>` — never a prompt:
+	// no textarea, no contentEditable, and nothing dispatches from it. The
+	// dispatch bar stays the only input an instruction is typed into.
+	it('the dispatch bar is the only prompt input in the Companion', () => {
 		const inputs = SOURCES.flatMap(({ file, text }) => {
 			const code = stripComments(text);
+			const all = code.match(/<input\b/g)?.length ?? 0;
+			const nameFields = code.match(/<input\b[^>]*?data-seat-name-field/g)?.length ?? 0;
 			const n =
-				(code.match(/<input\b/g)?.length ?? 0) +
+				all -
+				nameFields +
 				(code.match(/<textarea\b/g)?.length ?? 0) +
 				(code.match(/contentEditable/g)?.length ?? 0);
 			return n ? [`${file}×${n}`] : [];
 		});
 		expect(inputs).toEqual(['dispatch-bar.tsx×1']);
+	});
+
+	it('the only other fields are the seat NAME fields, one per file that needs one', () => {
+		const names = SOURCES.flatMap(({ file, text }) => {
+			const n = stripComments(text).match(/<input\b[^>]*?data-seat-name-field/g)?.length ?? 0;
+			return n ? [`${file}×${n}`] : [];
+		});
+		expect(names.sort()).toEqual(['seat-form.tsx×1', 'seat-rail.tsx×1']);
 	});
 
 	// Mounted children live outside this directory, so the scan above cannot

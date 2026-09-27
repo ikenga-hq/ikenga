@@ -59,6 +59,8 @@ import { useTerminalStore } from '@/terminal/session-store';
 import type { StatuslineSnapshot } from '@/terminal/cost-hud';
 import { openCommandPalette } from './command-palette';
 import { useCompanionStore } from './companion/companion-store';
+import { costLine, UNREPORTED } from './companion/seat-model';
+import { figuresOf } from './companion/seat-sessions';
 import { NotificationsBell } from './notifications/bell';
 import { GIT_BRANCHES_ROUTE, GIT_CHANGES_ROUTE, useGitRepoSummary } from './title-row';
 // WP-41 (D-07 update-flow) — the one status-bar edit this WP makes: swap the
@@ -222,6 +224,12 @@ export function StatusBar() {
 	const violations = pkgs.violations.length;
 	const runs = runIds.length;
 	const cost = runIds.reduce((sum, id) => sum + (snaps[id]?.cost?.total_cost_usd ?? 0), 0);
+	// WP-67 (D-09, G-93): with a seat or session selected in the Companion the
+	// cost item reads THAT session's figures — only what its engine reported,
+	// and a single "—" (with the tooltip) when it reported nothing, never the
+	// mockup's "session — — ctx". With nothing selected it stays the sum.
+	const scope = useCompanionStore((s) => s.panelScopeSessionId);
+	const scoped = scope ? costLine(figuresOf(snaps[scope])) : null;
 	const shortcutsKey = labelFor('shortcuts.open');
 
 	// The status bar's right-group menu (G-ACTIONS §1.3 `status`): no shipped
@@ -389,11 +397,25 @@ export function StatusBar() {
 						<span>{plural(runs, 'run')}</span>
 					</SegButton>
 				)}
-				{cost > 0 && (
-					<ReadOnly id="cost" title="Cost of the live agent sessions">
+				{scoped ? (
+					<ReadOnly
+						id="cost"
+						title={
+							scoped.unreported
+								? `Cost of the selected session · ${UNREPORTED}`
+								: 'Cost of the selected session'
+						}
+					>
 						<span>session</span>
-						<span className="font-mono text-[var(--achievement)]">${cost.toFixed(2)}</span>
+						<span className="font-mono text-[var(--achievement)]">{scoped.text}</span>
 					</ReadOnly>
+				) : (
+					cost > 0 && (
+						<ReadOnly id="cost" title="Cost of the live agent sessions">
+							<span>session</span>
+							<span className="font-mono text-[var(--achievement)]">${cost.toFixed(2)}</span>
+						</ReadOnly>
+					)
 				)}
 				{/* WP-41 (D-07 update-flow, 06-interaction-spec.md §3.13 #90): a live
 				 * shell-update download replaces this segment; otherwise it's the

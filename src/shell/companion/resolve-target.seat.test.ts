@@ -84,6 +84,7 @@ vi.mock('@/lib/panes/pane-store', () => ({
 
 import { resolveTarget, SEAT_GONE_REASON, targetEngineId } from './resolve-target';
 import { useSeatNotice } from './seat-notice';
+import { sessionNumber } from './seat-sessions';
 
 function seat(over: Partial<SeatView> = {}): SeatView {
 	return {
@@ -226,7 +227,8 @@ describe('resolveTarget — seat send (route decided at send time)', () => {
 			{ claim: 'claim-9' }
 		);
 		expect(m.seatsResume).not.toHaveBeenCalled();
-		expect(notice()).toBe('docs was vacant — resumed session conv-abc, then sent');
+		// WP-67: <N> is the UI's session number (D-09 'session 3'), not an id prefix.
+		expect(notice()).toBe(`docs was vacant — resumed session ${sessionNumber('term-a')}, then sent`);
 	});
 
 	it('vacant, not resumable, with a claim → path T starts a new agent and says so (§6.3)', async () => {
