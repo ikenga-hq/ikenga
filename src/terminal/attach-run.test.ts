@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({
 	chiList: vi.fn(async (): Promise<unknown[]> => []),
-	openTabPty: vi.fn(async () => ({})),
+	openTabPty: vi.fn(async (..._args: unknown[]) => ({})),
 }));
 
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
