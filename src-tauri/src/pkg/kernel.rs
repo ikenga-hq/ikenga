@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use serde_json::Value;
 use tauri::AppHandle;
 
 use crate::commands::db::PaDb;
@@ -25,15 +24,10 @@ use super::file_watcher::{self, WatcherHandle};
 use super::manifest::{Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
 use super::registry::Registry;
 use super::source::InstallSource;
-
-/// Status returned by `pkg_kernel_status` — useful for debugging and the
-/// future Settings → Packages page.
-#[derive(Debug, Serialize)]
-pub struct KernelStatus {
-    pub installed: Vec<InstalledSummary>,
-    pub registries: HashMap<String, Value>,
-    pub api_version: u32,
-}
+// Moved to the ungated `pkg::status` so the headless daemon builds the same
+// wire shape; re-exported here so `pkg::kernel::{InstalledSummary, KernelStatus}`
+// keeps resolving for every existing caller.
+pub use super::status::{InstalledSummary, KernelStatus};
 
 /// One entry returned by `Kernel::discover_workspace` — a manifest dir found
 /// in a workspace path. `valid=false` means the dir had a manifest.json but
@@ -48,25 +42,6 @@ pub struct DiscoveredPkg {
     pub error: Option<String>,
     pub installed: bool,
     pub compatible: bool,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct InstalledSummary {
-    pub id: String,
-    pub version: String,
-    pub ikenga_api: String,
-    pub install_path: String,
-    pub enabled: bool,
-    pub installed_at: i64,
-    pub compatible: bool,
-    /// Provenance — recorded at install time, used by the UI for grouping
-    /// and by the kernel to refuse uninstall of `Builtin` pkgs.
-    pub source: InstallSource,
-    /// Scope (Phase 2 of projects-first-class). `Some("default" | "music-2026" | …)`
-    /// means the pkg loads only when that project is active; `None` is the
-    /// workspace scope (always loaded). The Phase 0 bootstrap stamps existing
-    /// rows with `Some("default")` so they remain visible after upgrade.
-    pub project_id: Option<String>,
 }
 
 /// Child tables carrying a `pkg_id` referencing `pkg_installed(id)`. Three
@@ -1679,16 +1654,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .read()
             .map(|g| g.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        let registries = self
-            .registries
-            .iter()
-            .map(|r| (r.name().to_string(), r.snapshot()))
-            .collect();
-        KernelStatus {
-            installed,
-            registries,
-            api_version: IKENGA_API_VERSION,
-        }
+        let registries: Vec<&dyn Registry> = self.registries.iter().map(|r| r.as_ref()).collect();
+        super::status::assemble_status(installed, &registries, IKENGA_API_VERSION)
     }
 
     fn rollback(&self, pkg_id: &str, applied: &[&str]) {

@@ -13,6 +13,13 @@
 //! reads manifests to serve installed pkg bundles read-only
 //! (`server::pkg_static`).
 //!
+//! So do the read-side pieces the daemon's `pkg_kernel_status` /
+//! `list_skill_actions` arms need (WP-19): `status` (the wire shape and
+//! `assemble_status`, shared with `Kernel::status`), `source` (pure serde),
+//! `skill_actions` (std + serde_yaml fs reads), and — from `registries` —
+//! ONLY `ui_routes`. Every other registry stays desktop-gated inside
+//! `registries/mod.rs`.
+//!
 //! Everything else here is desktop-only, and not because of a missing gate —
 //! the kernel holds a non-optional `AppHandle`, `webview.rs` drives real
 //! `tauri::Webview` windows, and lifecycle spawns supervised sidecars. The
@@ -42,7 +49,8 @@ pub mod kernel;
 #[cfg(feature = "desktop")]
 pub mod lifecycle;
 pub mod manifest;
-#[cfg(test)]
+// Registers against the v5 contribution registries, which are desktop-only.
+#[cfg(all(test, feature = "desktop"))]
 mod manifest_v5_parity;
 #[cfg(feature = "desktop")]
 pub mod mcp_runtime;
@@ -50,15 +58,13 @@ pub mod mcp_runtime;
 pub mod npm_install;
 #[cfg(feature = "desktop")]
 pub mod permissions_check;
-#[cfg(feature = "desktop")]
 pub mod registries;
 pub mod registry;
 #[cfg(feature = "desktop")]
 pub mod signature;
-#[cfg(feature = "desktop")]
 pub mod skill_actions;
-#[cfg(feature = "desktop")]
 pub mod source;
+pub mod status;
 #[cfg(feature = "desktop")]
 pub mod trust;
 #[cfg(feature = "desktop")]
@@ -67,11 +73,11 @@ pub mod webview;
 #[cfg(feature = "desktop")]
 pub use engine_adapter::EngineAdaptersRegistry;
 #[cfg(feature = "desktop")]
-pub use kernel::{DiscoveredPkg, InstalledSummary, Kernel, KernelStatus, PkgHealthIssue};
+pub use kernel::{DiscoveredPkg, Kernel, PkgHealthIssue};
 #[cfg(feature = "desktop")]
 pub use lifecycle::SidecarSupervisor;
 #[cfg(feature = "desktop")]
 pub use npm_install::materialize_npm_deps;
 pub use registry::Registry;
-#[cfg(feature = "desktop")]
 pub use source::InstallSource;
+pub use status::{assemble_status, InstalledSummary, KernelStatus};

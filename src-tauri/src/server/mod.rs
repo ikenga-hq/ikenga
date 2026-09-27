@@ -15,10 +15,16 @@ pub mod chat_ws;
 pub mod discovery;
 pub mod fs_ws;
 pub mod health;
+pub mod pkg_index;
 pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
 pub mod static_files;
+
+/// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
+/// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
+#[cfg(test)]
+mod parity;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,6 +42,7 @@ use tracing::{error, info, warn};
 use crate::engines::EngineRegistry;
 use crate::pty::PtyManager;
 pub use health::health_handler;
+pub use pkg_index::PkgIndex;
 pub use pkg_static::PkgStaticService;
 pub use static_files::SpaStaticService;
 
@@ -78,6 +85,11 @@ pub struct AppState {
     /// at router construction; empty when no `--pkgs-dir` was given, in which
     /// case the route exists but 404s. See `server::pkg_static`.
     pub pkg_static: PkgStaticService,
+    /// Read-only index of the same `--pkgs-dir` walk, backing
+    /// `pkg_kernel_status` and the skill-action listings. Every valid pkg is
+    /// in it (not only the iframe-serveable ones `pkg_static` keeps); empty
+    /// without `--pkgs-dir`. See `server::pkg_index`.
+    pub pkg_index: Arc<PkgIndex>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -206,8 +218,12 @@ pub fn create_router(
     let shutdown_tx = shutdown_tx.unwrap_or(default_tx);
     let spa_service = SpaStaticService::new(&config.static_dir);
     // Walked here rather than in `run_server` so that every router — tests
-    // included — gets the same view of `--pkgs-dir`. Logs the ids it found.
-    let pkg_static = PkgStaticService::discover(config.pkgs_dir.as_deref());
+    // included — gets the same view of `--pkgs-dir`. Walked ONCE: the static
+    // server and the status index are built from the same list, so they can
+    // never disagree about which directories are pkgs. Both log what they found.
+    let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
+    let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
+    let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
     let allowed_origins = config.allowed_origins.clone();
     let state = Arc::new(AppState {
         config,
@@ -216,6 +232,7 @@ pub fn create_router(
         engine_registry,
         pa_db,
         pkg_static,
+        pkg_index,
         shutdown_tx,
     });
 
@@ -556,5 +573,174 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["executor"]["tier"], "t0");
         assert_eq!(json["executor"]["principal_isolation"], false);
+    }
+
+    // ── WP-19: pkg-kernel read parity over /api/rpc ─────────────────────────
+
+    /// A router over `pkgs_dir`, and a helper that POSTs one RPC with the
+    /// bearer token and returns the decoded envelope.
+    fn rpc_router(pkgs_dir: Option<PathBuf>) -> Router {
+        let mut cfg = config(ExecutorTier::T0);
+        cfg.pkgs_dir = pkgs_dir;
+        create_router(
+            cfg,
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            None,
+            None,
+        )
+    }
+
+    async fn rpc(router: &Router, body: serde_json::Value) -> serde_json::Value {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let res = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/rpc")
+                    .header("authorization", "Bearer tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Minimal valid pkg with one iframe route — the `pkg_static.rs` test
+    /// shape — plus a `dist/` so it is also iframe-serveable.
+    fn write_iframe_pkg(root: &std::path::Path, id: &str) -> PathBuf {
+        let dir = root.join(id);
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"id":"{id}","name":"T","version":"0.1.0","ikenga_api":"1",
+                    "ui":{{"routes":[{{"path":"/x","kind":"iframe","source":"dist/index.html"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("dist").join("index.html"), "<h1>hi</h1>").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn pkg_kernel_status_reports_the_indexed_pkgs_in_the_desktop_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+
+        let res = rpc(&router, serde_json::json!({ "cmd": "pkg_kernel_status" })).await;
+        assert_eq!(res["ok"], true, "{res}");
+        let data = &res["data"];
+
+        assert_eq!(
+            data["api_version"],
+            crate::pkg::manifest::IKENGA_API_VERSION
+        );
+        let row = &data["installed"][0];
+        assert_eq!(row["id"], "com.test.good");
+        assert_eq!(row["source"]["kind"], "local");
+        assert_eq!(row["enabled"], true);
+        assert_eq!(row["compatible"], true);
+        assert!(row["project_id"].is_null(), "workspace scope");
+
+        let entry = &data["registries"]["ui_routes"]["entries"][0];
+        for key in ["pkg_id", "virtual_path", "path", "kind", "source"] {
+            assert!(
+                entry.get(key).is_some(),
+                "ui_routes entry lacks `{key}`: {entry}"
+            );
+        }
+        assert_eq!(entry["virtual_path"], "pkg://com.test.good/x");
+        assert_eq!(entry["kind"], "iframe");
+        assert_eq!(
+            data["registries"].as_object().unwrap().len(),
+            1,
+            "only the registry the daemon runs may be reported"
+        );
+
+        // Shape-equality with the Tauri side: `Kernel::status` goes through
+        // the same `assemble_status`, so building it here from the same inputs
+        // must reproduce the daemon's payload exactly.
+        let pkg = crate::pkg::manifest::Package::load(&dir).unwrap();
+        let ui = crate::pkg::registries::UiRoutesRegistry::new();
+        crate::pkg::Registry::register(&ui, &pkg).unwrap();
+        let expected = crate::pkg::assemble_status(
+            vec![crate::pkg::InstalledSummary {
+                id: "com.test.good".into(),
+                version: "0.1.0".into(),
+                ikenga_api: "1".into(),
+                install_path: dir.display().to_string(),
+                enabled: true,
+                installed_at: row["installed_at"].as_i64().unwrap(),
+                compatible: true,
+                source: crate::pkg::InstallSource::Local {
+                    path: dir.display().to_string(),
+                },
+                project_id: None,
+            }],
+            &[&ui],
+            crate::pkg::manifest::IKENGA_API_VERSION,
+        );
+        assert_eq!(data, &serde_json::to_value(expected).unwrap());
+    }
+
+    /// No `--pkgs-dir`: nothing installed, but `registries.ui_routes` must
+    /// still be there — the FE route resolver reads `.entries` off it.
+    #[tokio::test]
+    async fn pkg_kernel_status_without_pkgs_dir_keeps_the_ui_routes_key() {
+        let router = rpc_router(None);
+        let res = rpc(&router, serde_json::json!({ "cmd": "pkg_kernel_status" })).await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["data"]["installed"], serde_json::json!([]));
+        assert_eq!(
+            res["data"]["registries"]["ui_routes"],
+            serde_json::json!({ "count": 0, "entries": [] })
+        );
+    }
+
+    /// Both spellings reach the arm (`tauri-cmd.ts` sends `pkgId`); an unknown
+    /// pkg is `[]`, as on desktop — not an error.
+    #[tokio::test]
+    async fn list_skill_actions_accepts_both_spellings_and_unknown_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+
+        for args in [
+            serde_json::json!({ "pkgId": "com.test.good" }),
+            serde_json::json!({ "pkg_id": "com.test.good" }),
+            serde_json::json!({ "pkgId": "com.test.unknown" }),
+        ] {
+            let res = rpc(
+                &router,
+                serde_json::json!({ "cmd": "list_skill_actions", "args": args }),
+            )
+            .await;
+            assert_eq!(res["ok"], true, "{args} → {res}");
+            // The fixture requires no skills, so every case is empty — the
+            // store-backed path is covered in `server::pkg_index` tests.
+            assert_eq!(res["data"], serde_json::json!([]), "{args}");
+        }
+
+        let res = rpc(&router, serde_json::json!({ "cmd": "list_skill_actions" })).await;
+        assert_eq!(res["ok"], false, "a missing pkgId is a caller error");
+
+        let res = rpc(
+            &router,
+            serde_json::json!({ "cmd": "list_all_skill_actions" }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert!(res["data"].is_array());
     }
 }
