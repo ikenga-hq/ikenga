@@ -383,7 +383,7 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 							// value — see the comment on the Personal/Project scope
 							// switch in shell/settings/header.tsx.
 							'inline-flex min-h-[var(--tab-h)] items-center gap-1.5 rounded px-3 py-1 text-xs font-medium transition-colors',
-							'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
+							'outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary',
 							active
 								? 'bg-accent text-accent-foreground'
 								: 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'

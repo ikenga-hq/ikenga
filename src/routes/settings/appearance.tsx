@@ -434,7 +434,7 @@ function SegmentedControl<T extends string>({
 						onClick={() => !item.disabled && onChange(item.value)}
 						className={cn(
 							'inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-xs transition-colors',
-							'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
+							'outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary',
 							active
 								? 'bg-card text-foreground shadow-sm'
 								: 'text-muted-foreground hover:text-foreground',
@@ -479,7 +479,7 @@ function ThemeCard({
 			aria-pressed={active}
 			className={cn(
 				'group flex cursor-pointer flex-col overflow-hidden rounded-md border bg-card text-left transition-colors',
-				'outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
+				'outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary',
 				active
 					? 'border-primary shadow-[inset_0_0_0_1px_var(--primary)]'
 					: 'border-border-soft hover:border-foreground/20'

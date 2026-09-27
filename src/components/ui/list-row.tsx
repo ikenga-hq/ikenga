@@ -23,7 +23,7 @@ import { cn } from '@/components/ui/utils';
 
 export const listRowClass = cva(
 	'group/row relative flex w-full items-center gap-2 text-left transition-colors motion-reduce:transition-none ' +
-		'outline-none focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-primary ' +
+		'outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-[-2px] focus-visible:outline-primary ' +
 		'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
 	{
 		variants: {
