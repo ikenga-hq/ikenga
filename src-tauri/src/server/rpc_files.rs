@@ -2,7 +2,9 @@
 //! be served honestly (`fs_kind`, `fs_mime`, `fs_search`, `fs_rename`) and
 //! the actions / keybindings file layer with its project-trust record
 //! (`actions_read_files`, `actions_write`, `keybindings_write`,
-//! `actions_trust_status`, `actions_trust_grant`, `actions_trust_revoke`).
+//! `actions_trust_status`, `actions_trust_grant`, `actions_trust_revoke`) —
+//! and, from slice 6, the per-project Atelier skill files
+//! (`atelier_file_read` / `atelier_file_write`) and `action_git_branch`.
 //!
 //! Same house pattern as `rpc_local` / `rpc_shell`: the arm *names* stay in
 //! `rpc.rs`'s dispatch `match` (the parity ratchet reads them there) and
@@ -45,7 +47,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::rpc::RpcResponse;
-use super::rpc_local::respond;
+use super::rpc_local::{data_dir, respond, respond_named};
 use super::rpc_shell::{targ, PathGuard};
 use super::shared::actions::schema::FileKind;
 use super::shared::actions::{
@@ -53,6 +55,7 @@ use super::shared::actions::{
 };
 use super::shared::fs as shared_fs;
 use super::shared::settings::SettingsScope;
+use super::shared::{atelier, git};
 use super::AppState;
 
 const NO_DATA_DIR_ACTIONS: &str =
@@ -250,6 +253,91 @@ pub(super) async fn actions_trust_revoke(state: &AppState, args: &Value) -> RpcR
     }
     .await;
     respond("actions_trust_revoke", r)
+}
+
+// ─── atelier files + `{{branch}}` (WP-19 slice 6) ────────────────────────────
+//
+// Bodies in `server::shared::{atelier, git}`, the cores the desktop commands
+// call. The caller's root (`projectRoot`, `root`) goes through the daemon's
+// `PathGuard` — the fs allowlist plus the daemon's own state — before anything
+// under it is touched, and the atelier helpers then stay inside the CANONICAL
+// root (`atelier::Reach::Confined`: a symlink at `.atelier`, `.atelier/<skill>`
+// or the file is refused, the temp file is created exclusively). `skill` /
+// `file` keep the desktop's `is_safe_segment`. Nothing spawns; nothing is
+// emitted. Without `--data-dir` there is no allowlist: `NO_DB`.
+
+/// The allowlist exists (it is loaded from `--data-dir`).
+fn fs_boundary(state: &AppState) -> Result<(), String> {
+    data_dir(state, super::rpc::NO_DB)?;
+    state.path_guard.ready()
+}
+
+/// A root outside the allowlist is an error, never the desktop's `null`
+/// (which would read as "no such file"); an unsafe segment, an absent root or
+/// file is `null`, as on the desktop.
+pub(super) fn atelier_file_read(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let project_root: Option<String> = targ(args, &["projectRoot", "project_root"])?;
+        let skill: String = targ(args, &["skill"])?;
+        let file: String = targ(args, &["file"])?;
+        fs_boundary(state)?;
+        let guard = &state.path_guard;
+        let check = |p: &Path| guard.check_maybe_missing(p);
+        atelier::read(
+            project_root.as_deref(),
+            &skill,
+            &file,
+            atelier::Reach::Confined(&check),
+        )
+    })();
+    respond_named("atelier_file_read", r)
+}
+
+/// The desktop's atomic write and its error strings, confined to the root.
+/// The root must already exist (the desktop would create it).
+pub(super) fn atelier_file_write(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let project_root: Option<String> = targ(args, &["projectRoot", "project_root"])?;
+        let skill: String = targ(args, &["skill"])?;
+        let file: String = targ(args, &["file"])?;
+        let content: String = targ(args, &["content"])?;
+        fs_boundary(state)?;
+        let guard = &state.path_guard;
+        let check = |p: &Path| guard.check_maybe_missing(p);
+        atelier::write(
+            project_root.as_deref(),
+            &skill,
+            &file,
+            &content,
+            atelier::Reach::Confined(&check),
+        )
+    })();
+    respond_named("atelier_file_write", r)
+}
+
+/// `{{branch}}` at `root`. A relative root is the desktop's `null`; a root the
+/// guard refuses is an error. `.git` and the `HEAD` it resolves to (a
+/// worktree's `gitdir:` target included) are read only when their canonical
+/// path is admitted too — otherwise `null`, no branch.
+pub(super) async fn action_git_branch(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let root: String = targ(args, &["root"])?;
+        fs_boundary(state)?;
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Ok(None);
+        }
+        state.path_guard.check_maybe_missing(&root)?;
+        let guard = state.path_guard.clone();
+        let may_read = move |p: &Path| p.canonicalize().is_ok_and(|c| guard.check(&c).is_ok());
+        Ok(
+            tokio::task::spawn_blocking(move || git::git_branch_at_with(&root, &may_read))
+                .await
+                .unwrap_or(None),
+        )
+    }
+    .await;
+    respond("action_git_branch", r)
 }
 
 #[cfg(test)]
@@ -1038,5 +1126,533 @@ mod tests {
             !d.home.join(".ikenga").exists(),
             "no watched dir was created"
         );
+    }
+
+    mod slice6 {
+        //! `atelier_file_read` / `atelier_file_write` and `action_git_branch`:
+        //! every caller root through the daemon's `PathGuard`, the atelier
+        //! helpers confined to the canonical root.
+
+        use super::*;
+        use crate::server::reserved::INSIDE_DATA_DIR;
+        use crate::server::shared::atelier::{self, Reach};
+        use crate::server::shared::git;
+
+        /// A daemon whose allowlist is the whole temp root — so `data/` IS
+        /// inside it (the misconfiguration `server::reserved` exists for).
+        fn over_data_dir() -> (tempfile::TempDir, PathBuf, PathBuf, Router) {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let data = root.join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            let roots_file = root.join("fs_roots.json");
+            std::fs::write(
+                &roots_file,
+                json!({ "roots": [root.to_string_lossy()] }).to_string(),
+            )
+            .unwrap();
+            let guard = PathGuard::roots(Arc::new(
+                crate::fs_roots::FsRoots::load(roots_file).unwrap(),
+            ));
+            let router = router_with(
+                config(Some(data.clone())),
+                Arc::new(PtyManager::new()),
+                Arc::new(EngineRegistry::new()),
+                Some(Arc::new(PaDb::new(root.join("ikenga.db")))),
+                None,
+                None,
+                guard,
+            );
+            (tmp, root, data, router)
+        }
+
+        /// Every regular file and dir under `dir`, relative, sorted.
+        fn tree(dir: &Path) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let p = e.path();
+                    out.push(p.strip_prefix(dir).unwrap().to_string_lossy().into_owned());
+                    if e.file_type().unwrap().is_dir() {
+                        stack.push(p);
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        // ── no data dir ─────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn every_arm_without_data_dir_is_no_db() {
+            let r = bare();
+            for (cmd, args) in [
+                (
+                    "atelier_file_read",
+                    json!({ "projectRoot": "/tmp", "skill": "s", "file": "f" }),
+                ),
+                (
+                    "atelier_file_write",
+                    json!({ "projectRoot": "/tmp", "skill": "s", "file": "f", "content": "x" }),
+                ),
+                ("action_git_branch", json!({ "root": "/tmp" })),
+            ] {
+                let e = err(&r, cmd, args).await;
+                assert_eq!(e, format!("{cmd}: {}", crate::server::rpc::NO_DB), "{cmd}");
+            }
+        }
+
+        // ── atelier ────────────────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn atelier_write_then_read_round_trips_in_the_desktop_shape() {
+            let d = daemon();
+            let r = &d.router;
+            let proj = d.allowed.join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            let body = r#"{"skill":"mail","template_version":1}"#;
+
+            let path = ok(
+                r,
+                "atelier_file_write",
+                json!({ "projectRoot": s(&proj), "skill": "skill-mail", "file": "manifest.json", "content": body }),
+            )
+            .await;
+            let target = proj.join(".atelier/skill-mail/manifest.json");
+            assert_eq!(path, s(&target));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
+
+            let camel = ok(
+                r,
+                "atelier_file_read",
+                json!({ "projectRoot": s(&proj), "skill": "skill-mail", "file": "manifest.json" }),
+            )
+            .await;
+            let snake = ok(
+                r,
+                "atelier_file_read",
+                json!({ "project_root": s(&proj), "skill": "skill-mail", "file": "manifest.json" }),
+            )
+            .await;
+            assert_eq!(camel, body);
+            assert_eq!(camel, snake);
+            // Shape parity with the desktop's core (`Reach::Follow`).
+            let direct = atelier::read(
+                Some(&s(&proj)),
+                "skill-mail",
+                "manifest.json",
+                Reach::Follow,
+            )
+            .unwrap();
+            assert_eq!(camel, json!(direct));
+
+            // Overwrite (snake spelling): second wins, no temp file left.
+            let v2 = r#"{"template_version":2}"#;
+            ok(
+                r,
+                "atelier_file_write",
+                json!({ "project_root": s(&proj), "skill": "skill-mail", "file": "manifest.json", "content": v2 }),
+            )
+            .await;
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), v2);
+            assert_eq!(
+                tree(&proj.join(".atelier")),
+                ["skill-mail", "skill-mail/manifest.json"]
+            );
+
+            // Absent file / absent root / no root: the desktop's null.
+            for args in [
+                json!({ "projectRoot": s(&proj), "skill": "skill-mail", "file": "nope.json" }),
+                json!({ "projectRoot": s(&d.allowed.join("gone")), "skill": "s", "file": "f" }),
+                json!({ "projectRoot": null, "skill": "s", "file": "f" }),
+                json!({ "projectRoot": "", "skill": "s", "file": "f" }),
+            ] {
+                assert_eq!(ok(r, "atelier_file_read", args).await, Value::Null);
+            }
+            // No root: the desktop's exact write error, not double-prefixed.
+            let e = err(
+                r,
+                "atelier_file_write",
+                json!({ "skill": "s", "file": "f", "content": "x" }),
+            )
+            .await;
+            assert_eq!(e, "atelier_file_write: no project root configured");
+            // A root that does not exist is not created.
+            let gone = d.allowed.join("gone");
+            let e = err(
+                r,
+                "atelier_file_write",
+                json!({ "projectRoot": s(&gone), "skill": "s", "file": "f", "content": "x" }),
+            )
+            .await;
+            assert!(
+                e.starts_with("atelier_file_write: project root is not a directory"),
+                "{e}"
+            );
+            assert!(!gone.exists());
+            // A root that is a file: nothing to read, nowhere to write.
+            let file_root = d.allowed.join("plain.txt");
+            std::fs::write(&file_root, "x").unwrap();
+            assert_eq!(
+                ok(
+                    r,
+                    "atelier_file_read",
+                    json!({ "projectRoot": s(&file_root), "skill": "s", "file": "f" }),
+                )
+                .await,
+                Value::Null
+            );
+            let e = err(
+                r,
+                "atelier_file_write",
+                json!({ "projectRoot": s(&file_root), "skill": "s", "file": "f", "content": "x" }),
+            )
+            .await;
+            assert!(
+                e.starts_with("atelier_file_write: project root is not a directory"),
+                "{e}"
+            );
+            let e = err(
+                r,
+                "atelier_file_write",
+                json!({ "projectRoot": s(&proj), "skill": "s", "file": "f" }),
+            )
+            .await;
+            assert!(e.contains("`content` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn atelier_segments_keep_the_desktop_traversal_checks() {
+            let d = daemon();
+            let r = &d.router;
+            let proj = d.allowed.join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            for (skill, file) in [
+                ("..", "manifest.json"),
+                ("a/b", "manifest.json"),
+                ("skill-mail", "../../outside/pwned"),
+                ("skill-mail", "/etc/passwd"),
+                ("skill-mail", "a\\b"),
+                ("", "f"),
+            ] {
+                let e = err(
+                    r,
+                    "atelier_file_write",
+                    json!({ "projectRoot": s(&proj), "skill": skill, "file": file, "content": "pwned" }),
+                )
+                .await;
+                assert_eq!(
+                    e,
+                    format!(
+                        "atelier_file_write: unsafe path segment (skill={skill:?}, file={file:?})"
+                    )
+                );
+                assert_eq!(
+                    ok(
+                        r,
+                        "atelier_file_read",
+                        json!({ "projectRoot": s(&proj), "skill": skill, "file": file }),
+                    )
+                    .await,
+                    Value::Null
+                );
+            }
+            assert!(tree(&proj).is_empty());
+            assert!(tree(&d.outside).is_empty());
+        }
+
+        #[tokio::test]
+        async fn atelier_roots_outside_the_allowlist_are_refused() {
+            let d = daemon();
+            let r = &d.router;
+            std::fs::create_dir_all(d.outside.join(".atelier/s")).unwrap();
+            std::fs::write(d.outside.join(".atelier/s/f"), "secret").unwrap();
+            let mut roots = vec![
+                s(&d.outside),
+                format!("{}/../outside", s(&d.allowed)),
+                "relative/root".to_string(),
+            ];
+            #[cfg(unix)]
+            {
+                symlink(&d.outside, &d.allowed.join("link"));
+                roots.push(s(&d.allowed.join("link")));
+            }
+            for root in roots {
+                let e = err(
+                    r,
+                    "atelier_file_read",
+                    json!({ "projectRoot": root, "skill": "s", "file": "f" }),
+                )
+                .await;
+                assert!(e.starts_with("atelier_file_read: "), "{root}: {e}");
+                let e = err(
+                    r,
+                    "atelier_file_write",
+                    json!({ "projectRoot": root, "skill": "s", "file": "g", "content": "pwned" }),
+                )
+                .await;
+                assert!(e.starts_with("atelier_file_write: "), "{root}: {e}");
+                assert!(
+                    e.contains("outside allowlist")
+                        || e.contains("`..`")
+                        || e.contains("not absolute"),
+                    "{root}: {e}"
+                );
+            }
+            assert_eq!(tree(&d.outside), [".atelier", ".atelier/s", ".atelier/s/f"]);
+        }
+
+        #[tokio::test]
+        async fn atelier_roots_inside_the_data_dir_are_refused() {
+            let (_tmp, root, data, r) = over_data_dir();
+            // A sibling inside the same allowlist root is served…
+            let proj = root.join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            ok(
+                &r,
+                "atelier_file_write",
+                json!({ "projectRoot": s(&proj), "skill": "s", "file": "f", "content": "x" }),
+            )
+            .await;
+            // …the data dir, and anything under it, is not.
+            std::fs::create_dir_all(data.join("inner")).unwrap();
+            for root in [s(&data), s(&data.join("inner"))] {
+                let e = err(
+                    &r,
+                    "atelier_file_write",
+                    json!({ "projectRoot": root, "skill": "s", "file": "f", "content": "pwned" }),
+                )
+                .await;
+                assert!(e.contains(INSIDE_DATA_DIR), "{root}: {e}");
+                let e = err(
+                    &r,
+                    "atelier_file_read",
+                    json!({ "projectRoot": root, "skill": "s", "file": "f" }),
+                )
+                .await;
+                assert!(e.contains(INSIDE_DATA_DIR), "{root}: {e}");
+            }
+            assert_eq!(tree(&data), ["inner"]);
+            // `.atelier` symlinked INTO the data dir from a served root.
+            #[cfg(unix)]
+            {
+                let p2 = root.join("p2");
+                std::fs::create_dir_all(&p2).unwrap();
+                symlink(&data, &p2.join(".atelier"));
+                let e = err(
+                    &r,
+                    "atelier_file_write",
+                    json!({ "projectRoot": s(&p2), "skill": "s", "file": "f", "content": "pwned" }),
+                )
+                .await;
+                assert!(e.contains("refusing to follow a symlink"), "{e}");
+                assert_eq!(tree(&data), ["inner"]);
+            }
+        }
+
+        /// `.atelier`, `.atelier/<skill>` or the file itself linked out of
+        /// the root — live or dangling — is refused, and nothing is created
+        /// where the link points.
+        #[tokio::test]
+        #[cfg(unix)]
+        async fn atelier_never_follows_a_symlink_out_of_the_root() {
+            let d = daemon();
+            let r = &d.router;
+
+            // `.atelier` → outside/.
+            let a = d.allowed.join("a");
+            std::fs::create_dir_all(&a).unwrap();
+            symlink(&d.outside, &a.join(".atelier"));
+            // `.atelier/s` → a sibling INSIDE the allowlist (still out of the root).
+            let b = d.allowed.join("b");
+            let elsewhere = d.allowed.join("elsewhere");
+            std::fs::create_dir_all(b.join(".atelier")).unwrap();
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            symlink(&elsewhere, &b.join(".atelier/s"));
+            // The file itself: a dangling link to a file that does not exist yet.
+            let c = d.allowed.join("c");
+            std::fs::create_dir_all(c.join(".atelier/s")).unwrap();
+            symlink(&d.outside.join("planted"), &c.join(".atelier/s/f"));
+            // `.atelier` dangling.
+            let e_root = d.allowed.join("e");
+            std::fs::create_dir_all(&e_root).unwrap();
+            symlink(&d.outside.join("not-yet"), &e_root.join(".atelier"));
+
+            for root in [&a, &b, &c, &e_root] {
+                let e = err(
+                    r,
+                    "atelier_file_write",
+                    json!({ "projectRoot": s(root), "skill": "s", "file": "f", "content": "pwned" }),
+                )
+                .await;
+                assert!(
+                    e.starts_with(
+                        "atelier_file_write: refusing to follow a symlink out of the project root"
+                    ),
+                    "{}: {e}",
+                    root.display()
+                );
+                let e = err(
+                    r,
+                    "atelier_file_read",
+                    json!({ "projectRoot": s(root), "skill": "s", "file": "f" }),
+                )
+                .await;
+                assert!(
+                    e.contains("refusing to follow a symlink"),
+                    "{}: {e}",
+                    root.display()
+                );
+            }
+            assert!(tree(&d.outside).is_empty(), "{:?}", tree(&d.outside));
+            assert!(tree(&elsewhere).is_empty());
+        }
+
+        // ── action_git_branch ───────────────────────────────────────────────
+
+        fn head(git_dir: &Path, contents: &str) {
+            std::fs::create_dir_all(git_dir).unwrap();
+            std::fs::write(git_dir.join("HEAD"), contents).unwrap();
+        }
+
+        #[tokio::test]
+        async fn git_branch_reads_head_inside_the_allowlist() {
+            let d = daemon();
+            let r = &d.router;
+            let repo = d.allowed.join("repo");
+            head(&repo.join(".git"), "ref: refs/heads/feat/x\n");
+            let got = ok(r, "action_git_branch", json!({ "root": s(&repo) })).await;
+            assert_eq!(got, "feat/x");
+            // Parity with the desktop's core.
+            assert_eq!(got, json!(git::git_branch_at(&repo)));
+
+            // Detached HEAD → null.
+            head(
+                &repo.join(".git"),
+                "0123456789abcdef0123456789abcdef01234567\n",
+            );
+            assert_eq!(
+                ok(r, "action_git_branch", json!({ "root": s(&repo) })).await,
+                Value::Null
+            );
+
+            // A worktree: `.git` is a `gitdir:` file (absolute), and a
+            // submodule-style relative one.
+            let main_git = d.allowed.join("main/.git");
+            head(
+                &main_git.join("worktrees/wt"),
+                "ref: refs/heads/wt-branch\n",
+            );
+            let wt = d.allowed.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::write(
+                wt.join(".git"),
+                format!("gitdir: {}\n", s(&main_git.join("worktrees/wt"))),
+            )
+            .unwrap();
+            let got = ok(r, "action_git_branch", json!({ "root": s(&wt) })).await;
+            assert_eq!(got, "wt-branch");
+            assert_eq!(got, json!(git::git_branch_at(&wt)));
+            head(
+                &main_git.join("modules/sub"),
+                "ref: refs/heads/sub-branch\n",
+            );
+            let sub = d.allowed.join("main/sub");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+            assert_eq!(
+                ok(r, "action_git_branch", json!({ "root": s(&sub) })).await,
+                "sub-branch"
+            );
+
+            // Not a work tree, missing, or relative: the desktop's null.
+            for root in [
+                s(&d.allowed),
+                s(&d.allowed.join("missing")),
+                "relative".to_string(),
+                String::new(),
+            ] {
+                assert_eq!(
+                    ok(r, "action_git_branch", json!({ "root": root })).await,
+                    Value::Null,
+                    "{root}"
+                );
+            }
+            let e = err(r, "action_git_branch", json!({})).await;
+            assert!(e.contains("`root` is required"), "{e}");
+        }
+
+        #[tokio::test]
+        async fn git_branch_refuses_roots_and_gitdirs_the_guard_refuses() {
+            let d = daemon();
+            let r = &d.router;
+            head(&d.outside.join(".git"), "ref: refs/heads/secret\n");
+            let mut roots = vec![s(&d.outside), format!("{}/../outside", s(&d.allowed))];
+            #[cfg(unix)]
+            {
+                symlink(&d.outside, &d.allowed.join("link"));
+                roots.push(s(&d.allowed.join("link")));
+            }
+            for root in roots {
+                let e = err(r, "action_git_branch", json!({ "root": root })).await;
+                assert!(e.starts_with("action_git_branch: "), "{root}: {e}");
+                assert!(
+                    e.contains("outside allowlist") || e.contains("`..`"),
+                    "{root}: {e}"
+                );
+            }
+            // A root inside the allowlist whose `gitdir:` (or `.git` link)
+            // points outside it: not read — no branch.
+            let wt = d.allowed.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::write(
+                wt.join(".git"),
+                format!("gitdir: {}\n", s(&d.outside.join(".git"))),
+            )
+            .unwrap();
+            assert_eq!(
+                ok(r, "action_git_branch", json!({ "root": s(&wt) })).await,
+                Value::Null
+            );
+            // (The desktop reads it: the guard is the daemon's alone.)
+            assert_eq!(git::git_branch_at(&wt).as_deref(), Some("secret"));
+            #[cfg(unix)]
+            {
+                let linked = d.allowed.join("linked");
+                std::fs::create_dir_all(&linked).unwrap();
+                symlink(&d.outside.join(".git"), &linked.join(".git"));
+                assert_eq!(
+                    ok(r, "action_git_branch", json!({ "root": s(&linked) })).await,
+                    Value::Null
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn git_branch_refuses_the_data_dir() {
+            let (_tmp, root, data, r) = over_data_dir();
+            head(&data.join("repo/.git"), "ref: refs/heads/x\n");
+            for p in [s(&data), s(&data.join("repo"))] {
+                let e = err(&r, "action_git_branch", json!({ "root": p })).await;
+                assert!(e.contains(INSIDE_DATA_DIR), "{p}: {e}");
+            }
+            // A served root whose gitdir points into the data dir reads nothing.
+            let wt = root.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            std::fs::write(
+                wt.join(".git"),
+                format!("gitdir: {}\n", s(&data.join("repo/.git"))),
+            )
+            .unwrap();
+            assert_eq!(
+                ok(&r, "action_git_branch", json!({ "root": s(&wt) })).await,
+                Value::Null
+            );
+        }
     }
 }

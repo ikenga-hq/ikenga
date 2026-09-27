@@ -272,38 +272,19 @@ pub fn pkg_screenshot(
     Ok(format!("data:{mime};base64,{}", B64.encode(&bytes)))
 }
 
-/// Diagnostic: returns `(db_path, pkg_installed_count)` straight from the
+/// Diagnostic: `(db_path, pkg_installed_count, ids)` straight from the
 /// kernel's PaDb handle. Used to confirm the kernel is reading the same
-/// SQLite file as external tooling expects.
-#[derive(serde::Serialize)]
-pub struct PkgDbDiag {
-    pub db_path: String,
-    pub pkg_installed_count: i64,
-    pub ids: Vec<String>,
-}
+/// SQLite file as external tooling expects. The queries live in
+/// `server::shared::pkg_db` (WP-19 slice 6), which the daemon serves too.
+pub use crate::server::shared::pkg_db::PkgDbDiag;
 
 #[tauri::command]
 pub fn pkg_db_diag(
     db: tauri::State<'_, std::sync::Arc<crate::commands::db::PaDb>>,
 ) -> Result<PkgDbDiag, String> {
-    let db_path = db.db_path_for_diag().display().to_string();
     let db_clone = db.inner().clone();
-    let (count, ids): (i64, Vec<String>) = tauri::async_runtime::block_on(async move {
-        let pool = db_clone.ensure_pool().await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pkg_installed")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM pkg_installed ORDER BY id")
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>((count, ids))
-    })?;
-    Ok(PkgDbDiag {
-        db_path,
-        pkg_installed_count: count,
-        ids,
+    tauri::async_runtime::block_on(async move {
+        crate::server::shared::pkg_db::db_diag(&db_clone).await
     })
 }
 
