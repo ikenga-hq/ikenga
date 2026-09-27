@@ -9,6 +9,15 @@ use tauri::{AppHandle, State};
 
 use crate::commands::resolve_allowlisted;
 use crate::fs_watch::FsWatchManager;
+use crate::server::shared::fs as shared_fs;
+
+pub use crate::server::shared::fs::FsSearchResult;
+
+/// The desktop's resolver for the shared fs cores: `resolve_allowlisted`
+/// against the process-global root set, error text unchanged.
+fn allowlisted(path: &str) -> Result<std::path::PathBuf, String> {
+    resolve_allowlisted(path).map_err(|e| e.to_string())
+}
 
 #[derive(Serialize)]
 pub struct FileReadResult {
@@ -63,16 +72,7 @@ pub async fn fs_exists(path: String) -> Result<bool, String> {
 /// allowlist-rejected paths so callers can fall back uniformly.
 #[tauri::command]
 pub async fn fs_kind(path: String) -> Result<&'static str, String> {
-    let resolved = match resolve_allowlisted(&path) {
-        Ok(p) => p,
-        Err(_) => return Ok("missing"),
-    };
-    match tokio::fs::metadata(&resolved).await {
-        Ok(m) if m.is_dir() => Ok("dir"),
-        Ok(m) if m.is_file() => Ok("file"),
-        Ok(_) => Ok("missing"),
-        Err(_) => Ok("missing"),
-    }
+    Ok(shared_fs::kind(&allowlisted, &path).await)
 }
 
 /// Cheap MIME lookup that doesn't read file contents. Used by the artifact
@@ -81,11 +81,7 @@ pub async fn fs_kind(path: String) -> Result<&'static str, String> {
 /// `mime_guess` only inspects the extension.
 #[tauri::command]
 pub async fn fs_mime(path: String) -> Result<String, String> {
-    let resolved = resolve_allowlisted(&path).map_err(|e| e.to_string())?;
-    Ok(mime_guess::from_path(&resolved)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string())
+    shared_fs::mime(&allowlisted, &path)
 }
 
 /// Recursive mkdir. Idempotent: succeeds if `path` already exists as a
@@ -170,17 +166,6 @@ fn entry_for(p: &std::path::Path) -> Result<FileEntry, std::io::Error> {
     })
 }
 
-// Mirror of the JS-side IGNORED_DIRS in files-mode.tsx — folders we skip when
-// `show_ignored` is false. The dot-prefix filter handles `.git`/`.next`/`.cache`
-// separately via `show_hidden`.
-const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", "build", "out"];
-
-#[derive(Serialize)]
-pub struct FsSearchResult {
-    pub matches: Vec<String>,
-    pub truncated: bool,
-}
-
 /// Recursive basename search rooted at `root`. Case-insensitive substring
 /// match. Honors the same dot-file and ignored-dir rules the JS sorter uses
 /// so search results match what the user would see if they manually expanded
@@ -194,60 +179,7 @@ pub async fn fs_search(
     #[allow(non_snake_case)] showIgnored: bool,
     limit: Option<usize>,
 ) -> Result<FsSearchResult, String> {
-    let resolved = resolve_allowlisted(&root).map_err(|e| e.to_string())?;
-    let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
-        return Ok(FsSearchResult {
-            matches: Vec::new(),
-            truncated: false,
-        });
-    }
-    let cap = limit.unwrap_or(500).max(1);
-
-    tokio::task::spawn_blocking(move || {
-        let mut matches: Vec<String> = Vec::new();
-        let mut truncated = false;
-        let mut stack: Vec<std::path::PathBuf> = vec![resolved];
-
-        while let Some(dir) = stack.pop() {
-            let rd = match std::fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                // Permission denied, vanished mid-walk, etc. Skip silently —
-                // search shouldn't surface every unreadable corner.
-                Err(_) => continue,
-            };
-            for entry in rd.flatten() {
-                let name = match entry.file_name().into_string() {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                if !showHidden && name.starts_with('.') {
-                    continue;
-                }
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                let is_dir = ft.is_dir();
-                if is_dir && !showIgnored && IGNORED_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-                if name.to_lowercase().contains(&needle) {
-                    matches.push(entry.path().to_string_lossy().to_string());
-                    if matches.len() >= cap {
-                        truncated = true;
-                        return FsSearchResult { matches, truncated };
-                    }
-                }
-                if is_dir {
-                    stack.push(entry.path());
-                }
-            }
-        }
-        FsSearchResult { matches, truncated }
-    })
-    .await
-    .map_err(|e| format!("search join failed: {e}"))
+    shared_fs::search(&allowlisted, &root, &query, showHidden, showIgnored, limit).await
 }
 
 /// Move `path` to the OS trash. Reversible — file can be restored from the
@@ -267,22 +199,7 @@ pub async fn fs_trash(path: String) -> Result<(), String> {
 /// already exist.
 #[tauri::command]
 pub async fn fs_rename(from: String, to_name: String) -> Result<String, String> {
-    if to_name.is_empty() || to_name.contains('/') || to_name.contains('\\') {
-        return Err("invalid name".to_string());
-    }
-    let resolved_from = resolve_allowlisted(&from).map_err(|e| e.to_string())?;
-    let parent = resolved_from
-        .parent()
-        .ok_or_else(|| "source has no parent".to_string())?;
-    let dest = parent.join(&to_name);
-    let resolved_dest = resolve_allowlisted(&dest.to_string_lossy()).map_err(|e| e.to_string())?;
-    if tokio::fs::metadata(&resolved_dest).await.is_ok() {
-        return Err(format!("destination exists: {}", resolved_dest.display()));
-    }
-    tokio::fs::rename(&resolved_from, &resolved_dest)
-        .await
-        .map_err(|e| format!("rename failed: {e}"))?;
-    Ok(resolved_dest.to_string_lossy().to_string())
+    shared_fs::rename(&allowlisted, &from, &to_name).await
 }
 
 #[tauri::command]
