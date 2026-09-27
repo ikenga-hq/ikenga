@@ -152,7 +152,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 	}
 
 	return (
-		<div className="flex h-full flex-col bg-zinc-950 p-3 text-xs font-mono text-zinc-200 select-none overflow-y-auto space-y-2">
+		<div className="flex h-full flex-col bg-card p-3 text-xs font-mono text-foreground select-none overflow-y-auto space-y-2">
 			<div className="flex items-center justify-between gap-2 border-b border-border/40 pb-2">
 				<div className="flex items-center gap-1.5 font-semibold text-amber-400">
 					<Bell className="h-3.5 w-3.5" />
@@ -160,7 +160,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 						Permission Inbox ({requests.filter((r) => r.status === 'pending').length} pending)
 					</span>
 				</div>
-				<label className="flex items-center gap-1.5 text-[10px] text-zinc-400">
+				<label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
 					<input
 						type="checkbox"
 						checked={holdEnabled}
@@ -174,7 +174,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 			{requests.length === 0 ? (
 				<div className="flex h-full flex-col items-center justify-center p-6 text-center text-xs text-muted-foreground font-mono select-none">
 					<ShieldAlert className="mb-2 h-6 w-6 text-muted-foreground/40" />
-					<p className="font-semibold text-zinc-300">Permission Inbox & Notifications</p>
+					<p className="font-semibold text-foreground">Permission Inbox & Notifications</p>
 					<p className="mt-1 text-[11px]">No active permission requests or notifications.</p>
 				</div>
 			) : (
@@ -190,18 +190,18 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 						}`}
 					>
 						<div className="flex items-center justify-between">
-							<span className="font-semibold text-zinc-100">
+							<span className="font-semibold text-foreground">
 								{req.event_type === 'tool_use' ? `Tool use: ${req.tool_name}` : req.tool_name}
 							</span>
-							<span className="text-[10px] text-zinc-500">
+							<span className="text-[10px] text-muted-foreground">
 								{new Date(req.timestamp).toLocaleTimeString()}
 							</span>
 						</div>
 
-						{req.prompt && <p className="mt-1 text-zinc-300">{req.prompt}</p>}
+						{req.prompt && <p className="mt-1 text-foreground">{req.prompt}</p>}
 
 						{req.tool_input && (
-							<pre className="mt-1.5 max-h-24 overflow-x-auto rounded bg-zinc-900/90 p-2 text-[10px] text-zinc-400">
+							<pre className="mt-1.5 max-h-24 overflow-x-auto rounded bg-muted p-2 text-[10px] text-muted-foreground">
 								{JSON.stringify(req.tool_input, null, 2)}
 							</pre>
 						)}
