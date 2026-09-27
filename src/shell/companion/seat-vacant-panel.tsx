@@ -103,7 +103,7 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 							disabled={resumeBlocked !== null}
 							title={resumeBlocked ?? `Resume ${last ?? 'its last session'} in @${seat.name}`}
 							onClick={() => void resumeSeat(seat)}
-							className="h-7 rounded-md bg-[var(--primary)] px-3 text-xs text-[var(--primary-fg)] hover:opacity-90 disabled:cursor-not-allowed disabled:bg-[var(--bg-raised)] disabled:text-[var(--fg-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+							className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--primary)] bg-[var(--primary)] px-3 text-[11px] font-medium text-[var(--primary-fg)] hover:opacity-90 disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:bg-transparent disabled:text-[var(--fg-faint)] disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
 							Resume {last ?? 'session'}
 						</button>
@@ -114,12 +114,11 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 						title={fillBlocked ?? `Start a new ${seat.engine_id} session in @${seat.name}`}
 						onClick={() => void fillSeat(seat)}
 						className={cn(
-							'h-7 rounded-md px-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-[var(--bg-raised)] disabled:text-[var(--fg-muted)]',
+							'h-[26px] rounded-[var(--radius-sm)] border px-3 text-[11px] font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:bg-transparent disabled:text-[var(--fg-faint)] disabled:opacity-45',
 							resumePrimary || fillBlocked
-								? 'border text-[var(--fg)] enabled:hover:bg-[var(--bg-raised)]'
-								: 'bg-[var(--primary)] text-[var(--primary-fg)] hover:opacity-90'
+								? 'border-[var(--border)] bg-[var(--bg-surface)] text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)] enabled:hover:text-[var(--fg)]'
+								: 'border-[var(--primary)] bg-[var(--primary)] text-[var(--primary-fg)] hover:opacity-90'
 						)}
-						style={resumePrimary || fillBlocked ? { borderColor: 'var(--border)' } : undefined}
 					>
 						Fill with a new session
 					</button>
@@ -128,7 +127,7 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 						disabled={!seat.session}
 						title={seat.session ? 'Forget its session history; the scratchpad stays' : 'Already cleared'}
 						onClick={() => clearSeat(seat)}
-						className="h-7 rounded-md px-3 text-xs text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--border)] px-3 text-[11px] font-medium text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)] enabled:hover:text-[var(--fg)] disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:text-[var(--fg-faint)] disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 					>
 						Clear seat
 					</button>

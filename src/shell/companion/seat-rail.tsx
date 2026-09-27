@@ -1065,7 +1065,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 							type="button"
 							data-new-seat=""
 							onClick={() => openSeatForm()}
-							className="h-7 rounded-md bg-[var(--primary)] px-3 text-xs text-[var(--primary-fg)] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+							className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--primary)] bg-[var(--primary)] px-3 text-[11px] font-medium text-[var(--primary-fg)] hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
 							New seat
 						</button>
@@ -1074,8 +1074,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 							disabled={!emptySeatTarget}
 							title={emptySeatTarget ? `Seat ${sessionName(emptySeatTarget.id)} — the selected session` : 'No open sessions to seat'}
 							onClick={() => emptySeatTarget && openSeatForm({ seatSession: emptySeatTarget.id })}
-							className="h-7 rounded-md border px-3 text-xs text-[var(--fg)] hover:bg-[var(--bg-raised)] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-							style={{ borderColor: 'var(--border)' }}
+							className="h-[26px] rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-3 text-[11px] font-medium text-[var(--fg-muted)] enabled:hover:bg-[var(--bg-raised)] enabled:hover:text-[var(--fg)] disabled:cursor-not-allowed disabled:border-[var(--border-soft)] disabled:bg-transparent disabled:text-[var(--fg-faint)] disabled:opacity-45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
 							Seat this session…
 						</button>
