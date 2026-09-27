@@ -8,17 +8,23 @@
 //! "trust"`), which change what is in force without touching either file. `settings.json` changes in the same directory are
 //! the settings watcher's and are ignored here.
 
+//!
+//! **Headless (WP-19 slice 5a).** The signal goes out through an
+//! [`ActionsNotifier`] instead of an `AppHandle`: the desktop's
+//! (`crate::actions`, built in `ActionsManager::new`) emits
+//! [`CHANGED_EVENT`] with exactly the payload it always did; the daemon has no
+//! event channel and passes none, so it starts no watcher and emits nothing.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use notify::RecommendedWatcher;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 
-use crate::settings::SettingsScope;
+use crate::server::shared::settings::SettingsScope;
 
 use super::schema::FileKind;
 
@@ -43,22 +49,23 @@ pub enum ChangeReason {
     Trust,
 }
 
+/// Told every `actions://changed` event. The desktop's emits it to the
+/// webview under [`CHANGED_EVENT`]; see `crate::actions::ActionsManager::new`.
+pub type ActionsNotifier = Arc<dyn Fn(ActionsChangeEvent) + Send + Sync>;
+
 pub fn emit_change(
-    app: &AppHandle,
+    notifier: &ActionsNotifier,
     path: &Path,
     file: FileKind,
     scope: SettingsScope,
     reason: Option<ChangeReason>,
 ) {
-    let _ = app.emit(
-        CHANGED_EVENT,
-        ActionsChangeEvent {
-            path: path.to_string_lossy().into_owned(),
-            file,
-            scope,
-            reason,
-        },
-    );
+    notifier(ActionsChangeEvent {
+        path: path.to_string_lossy().into_owned(),
+        file,
+        scope,
+        reason,
+    });
 }
 
 /// The watched file an event path names, if any. Temp files
@@ -72,14 +79,14 @@ pub fn watched_kind(path: &Path) -> Option<FileKind> {
 
 /// One watcher per watched `.ikenga/` directory.
 pub struct ActionsWatcher {
-    app: AppHandle,
+    notifier: ActionsNotifier,
     watchers: Mutex<HashMap<PathBuf, (SettingsScope, Debouncer<RecommendedWatcher>)>>,
 }
 
 impl ActionsWatcher {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(notifier: ActionsNotifier) -> Self {
         Self {
-            app,
+            notifier,
             watchers: Mutex::new(HashMap::new()),
         }
     }
@@ -144,7 +151,7 @@ impl ActionsWatcher {
         if meta.file_type().is_symlink() {
             return Err(format!("refusing to watch linked directory {}", dir.display()));
         }
-        let app = self.app.clone();
+        let notifier = self.notifier.clone();
         let mut debouncer: Debouncer<RecommendedWatcher> =
             new_debouncer(DEBOUNCE, move |result: DebounceEventResult| {
                 let Ok(events) = result else { return };
@@ -157,7 +164,7 @@ impl ActionsWatcher {
                         continue;
                     }
                     seen.push(kind);
-                    emit_change(&app, &event.path, kind, scope, None);
+                    emit_change(&notifier, &event.path, kind, scope, None);
                 }
             })
             .map_err(|error| format!("create actions watcher: {error}"))?;

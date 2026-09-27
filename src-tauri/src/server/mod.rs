@@ -20,6 +20,7 @@ pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
 mod rpc_claude;
+mod rpc_files;
 mod rpc_local;
 mod rpc_shell;
 pub mod shared;
@@ -108,6 +109,12 @@ pub struct AppState {
     /// (see `server::rpc_shell::PathGuard`): the process-global `fs_roots`
     /// set in production, a local one in tests.
     pub(crate) path_guard: rpc_shell::PathGuard,
+    /// The actions / keybindings manager behind the `actions_*` and
+    /// `keybindings_write` arms (see `server::rpc_files`): the desktop's, with
+    /// no notifier, its trust record in `--data-dir`, the personal files under
+    /// `home`, and project roots checked against `path_guard`. `None` without
+    /// a data dir or a home; those arms then say which is missing.
+    pub(crate) actions: Option<Arc<shared::actions::ActionsManager>>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -299,6 +306,15 @@ pub(crate) fn router_with(
         ))),
         _ => None,
     };
+    let actions = match (&pa_db, &config.data_dir, &home) {
+        (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_files::daemon_actions(
+            db.clone(),
+            dir,
+            home.clone(),
+            path_guard.clone(),
+        ))),
+        _ => None,
+    };
     let allowed_origins = config.allowed_origins.clone();
     let state = Arc::new(AppState {
         config,
@@ -311,6 +327,7 @@ pub(crate) fn router_with(
         settings,
         home,
         path_guard,
+        actions,
         shutdown_tx,
     });
 

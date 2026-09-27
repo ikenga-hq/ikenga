@@ -37,26 +37,6 @@ reason = "git_branch_at reads `.git/HEAD` via std::fs directly, comment states \
 tag = "desktop-only-forever"
 reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — native open-in-OS-app, same as settings_open_file."
 
-[actions_read_files]
-tag = "WP-19"
-reason = "manager.read_files reads actions.json/keybindings.json via db+fs; no spawn."
-
-[actions_trust_grant]
-tag = "WP-19"
-reason = "manager.trust_grant writes the project-trust record; no spawn."
-
-[actions_trust_revoke]
-tag = "WP-19"
-reason = "manager.trust_revoke writes/clears the project-trust record; no spawn."
-
-[actions_trust_status]
-tag = "WP-19"
-reason = "manager.trust_status reads the project-trust record from db; no spawn."
-
-[actions_write]
-tag = "WP-19"
-reason = "manager.write validates+atomically writes actions.json; no spawn."
-
 [agent_ops_run_now]
 tag = "WP-18b"
 reason = "POSTs the {port, secret} from ~/.agent-ops/daemon.lock to a SEPARATE local agent-ops daemon's /jobs/<id>/trigger endpoint, which then runs the job (a shell command or `claude -p`) outside the session executor; serving it would let any token holder fire host jobs remotely. Held until executor routing + principal scoping (WP-20) decide who may."
@@ -217,45 +197,30 @@ reason = "Debug-only (#[cfg(debug_assertions)]) TcpListener holder for the story
 tag = "desktop-only-forever"
 reason = "Companion release for dev_bind_port's debug-only smoke-test port holder; same 'dev ports' desktop-only-forever bucket."
 
-[fs_kind]
-tag = "WP-19"
-reason = "Stat-based file/dir/missing discriminator on an allowlisted path; no spawn."
-
-[fs_mime]
-tag = "WP-19"
-reason = "Extension-based mime_guess lookup; no fs read or spawn."
-
-[fs_rename]
-tag = "WP-19"
-reason = "tokio::fs::rename within the allowlist; no spawn."
 
 [fs_roots_add]
-tag = "WP-19"
-reason = "Mutates the persisted fs allowlist config; no spawn."
+tag = "WP-20"
+reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
 
 [fs_roots_remove]
-tag = "WP-19"
-reason = "Mutates the persisted fs allowlist config; no spawn."
+tag = "WP-20"
+reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
 
 [fs_roots_reset]
-tag = "WP-19"
-reason = "Resets the persisted fs allowlist to default; no spawn."
-
-[fs_search]
-tag = "WP-19"
-reason = "Recursive basename search via blocking fs walk (spawn_blocking, not a process spawn)."
+tag = "WP-20"
+reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
 
 [fs_trash]
-tag = "WP-19"
-reason = "Moves a file to OS trash via the `trash` crate call; no process spawn."
+tag = "desktop-only-forever"
+reason = "trash::delete moves the file into the OS trash (freedesktop: $XDG_DATA_HOME/Trash of the daemon's home, or a .Trash-$uid at the mount top) — outside the fs allowlist, with no daemon verb to list or restore it and no trash UI on a headless host, so over RPC it is a delete that leaves a copy outside the boundary. Not served, and never downgraded to a hard delete."
 
 [fs_unwatch]
-tag = "WP-19"
-reason = "Releases an fs watcher by id; no spawn."
+tag = "desktop-only-forever"
+reason = "Pair of fs_watch: in a remote web session tauri-cmd.ts fsUnwatch releases the watch on the /ws/fs socket (server/fs_ws.rs); an RPC arm would have no watcher of its own to release."
 
 [fs_watch]
-tag = "WP-19"
-reason = "Registers an FsWatchManager watcher on an allowlisted path; no spawn (daemon already has fs_ws.rs for this shape)."
+tag = "desktop-only-forever"
+reason = "A watch needs a push channel; the browser build never sends this verb — tauri-cmd.ts fsWatch goes over the daemon's /ws/fs socket (server/fs_ws.rs, per-event allowlist re-check) in a remote web session. An RPC arm would duplicate it with no way to deliver events."
 
 [iyke_action_done]
 tag = "desktop-only-forever"
@@ -321,9 +286,6 @@ reason = "FE callback for CLI-driven terminal-pane creation inside the desktop s
 tag = "desktop-only-forever"
 reason = "Resolves a pending wait-for-condition round trip targeting the app's own rendered window."
 
-[keybindings_write]
-tag = "WP-19"
-reason = "Same manager.write path for keybindings.json; no spawn."
 
 [ngwa_snapshot]
 tag = "WP-19"

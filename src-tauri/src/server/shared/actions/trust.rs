@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::settings::scope::{read_document_bytes, write_document_bytes_atomic, IkengaDocument};
+use crate::server::shared::settings::scope::{
+    read_document_bytes, write_document_bytes_atomic, IkengaDocument,
+};
 
 use super::schema::GATED_RUN_KINDS;
 

@@ -70,6 +70,8 @@ pub(super) fn targ<T: DeserializeOwned>(args: &Value, names: &[&str]) -> Result<
 
 // ─── path boundary ───────────────────────────────────────────────────────────
 
+const NO_ALLOWLIST: &str = "fs allowlist not initialized (the daemon needs --data-dir)";
+
 /// The allowlist the project filesystem arms check a canonical path against.
 ///
 /// In production it is the process-global `crate::fs_roots` set the daemon
@@ -85,10 +87,70 @@ pub(crate) enum PathGuard {
 }
 
 impl PathGuard {
+    /// Errors, naming the flag, when the production allowlist was never
+    /// installed (the daemon was started without `--data-dir`). Arms whose
+    /// desktop contract folds a refusal into an answer (`fs_kind`'s
+    /// `"missing"`) call this first, so a misconfigured daemon says so
+    /// instead of answering "missing" for every path.
+    pub(crate) fn ready(&self) -> Result<(), String> {
+        match self {
+            PathGuard::Allowlist => crate::fs_roots::current()
+                .map(|_| ())
+                .ok_or_else(|| NO_ALLOWLIST.to_string()),
+            #[cfg(test)]
+            PathGuard::Roots(_) => Ok(()),
+        }
+    }
+
+    /// A caller's path, resolved exactly as the desktop's
+    /// `path_allow::resolve_allowlisted` resolves it (`~` / env expansion,
+    /// absolute, canonicalized — the parent when the leaf does not exist yet),
+    /// then checked against this guard's roots. Canonicalizing first is what
+    /// makes `..` and symlinks unable to leave the allowlist.
+    pub(crate) fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+        let abs = crate::path_allow::expand_absolute(input).map_err(|e| e.to_string())?;
+        let canonical = crate::path_allow::canonical_for_check(&abs).map_err(|e| e.to_string())?;
+        self.check(&canonical)?;
+        Ok(canonical)
+    }
+
+    /// An absolute path, checked by its canonical form (symlinks resolved).
+    /// Used for project roots (the actions `RootGuard`), which the shared
+    /// scope resolver only hands over when they are existing directories; a
+    /// path that does not exist is still handled safely — its nearest
+    /// existing ancestor is canonicalized, the missing tail re-attached, and
+    /// the result checked. `..` is refused outright, since a re-attached tail
+    /// is never canonicalized.
+    pub(crate) fn check_maybe_missing(&self, path: &Path) -> Result<(), String> {
+        use std::path::Component;
+        if !path.is_absolute() {
+            return Err(format!("path is not absolute: {}", path.display()));
+        }
+        if path.components().any(|c| matches!(c, Component::ParentDir)) {
+            return Err(format!("path may not contain `..`: {}", path.display()));
+        }
+        // `symlink_metadata`, not `exists`: a dangling symlink is present, and
+        // must fail to canonicalize below rather than be skipped as missing
+        // (its name would otherwise be re-attached uncanonicalized).
+        let mut ancestor = path;
+        while std::fs::symlink_metadata(ancestor).is_err() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| format!("path outside allowlist: {}", path.display()))?;
+        }
+        let canonical = ancestor
+            .canonicalize()
+            .map_err(|e| format!("canonicalize {}: {e}", ancestor.display()))?;
+        let tail = path
+            .strip_prefix(ancestor)
+            .map_err(|_| format!("failed to resolve {}", path.display()))?;
+        self.check(&canonical.join(tail))
+    }
+
     pub(super) fn check(&self, canonical: &Path) -> Result<(), String> {
         let allowed = match self {
             PathGuard::Allowlist => crate::fs_roots::current()
-                .ok_or("fs allowlist not initialized (the daemon needs --data-dir)")?
+                .ok_or(NO_ALLOWLIST)?
                 .is_allowed(canonical),
             #[cfg(test)]
             PathGuard::Roots(roots) => roots.is_allowed(canonical),

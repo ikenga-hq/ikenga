@@ -72,10 +72,6 @@ const QUEUE_POLL: Duration = Duration::from_secs(2);
 /// move holding that seat and waiting on the destination can't deadlock us.
 const EXTRA_LOCK_WAIT: Duration = Duration::from_secs(5);
 
-/// P-1: seat names are 1–32 chars.
-const SEAT_NAME_MAX: usize = 32;
-/// `projects.rs::validate_slug` bounds.
-const PROJECT_SLUG_MAX: usize = 64;
 
 /// The only engine whose terminal agent reports turns (`SessionStart`,
 /// `UserPromptSubmit`, `Stop`, `SessionEnd`) through the hooks bridge.
@@ -139,50 +135,10 @@ fn now_ms() -> i64 {
 // Grammar (§1.2, §1.3, §3.1)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// §1.2: `[a-z0-9] ( [a-z0-9-]{0,30} [a-z0-9] )?` — 1–32 chars, lowercase
-/// ASCII letters, digits and `-`, starting and ending with a letter or digit.
-/// Every valid seat name is also a valid scratchpad name.
-pub(crate) fn validate_seat_name(name: &str) -> Result<(), String> {
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > SEAT_NAME_MAX {
-        return Err(format!("a seat name is 1–{SEAT_NAME_MAX} characters"));
-    }
-    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    if !bytes.iter().all(|&b| edge(b) || b == b'-') {
-        return Err("a seat name uses only lowercase letters, digits and '-'".to_string());
-    }
-    if !edge(bytes[0]) || !edge(bytes[bytes.len() - 1]) {
-        return Err("a seat name starts and ends with a lowercase letter or digit".to_string());
-    }
-    Ok(())
-}
-
-/// Shared copy of `commands/projects.rs::validate_slug` (private there):
-/// 1–64 chars, first `[a-z0-9]`, then `[a-z0-9_-]`. The test
-/// `project_slug_copy_agrees_with_projects_rs` holds the two together (§3.2).
-pub(crate) fn validate_project_slug(id: &str) -> Result<(), String> {
-    if id.is_empty() || id.len() > PROJECT_SLUG_MAX {
-        return Err(format!(
-            "invalid project id length: {} (1..={PROJECT_SLUG_MAX})",
-            id.len()
-        ));
-    }
-    let mut chars = id.chars();
-    let first = chars.next().unwrap_or(' ');
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Err(format!(
-            "invalid project id {id:?}: must start with [a-z0-9]"
-        ));
-    }
-    for c in chars {
-        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
-            return Err(format!(
-                "invalid project id {id:?}: only [a-z0-9_-] allowed after first char"
-            ));
-        }
-    }
-    Ok(())
-}
+// The two grammar validators live in `server::shared::seat_grammar` (WP-19
+// slice 5a) so the headless G-ACTIONS schema can check a `chi` run's `seat`
+// with the same code; re-exported so every `seats::validate_*` path stands.
+pub(crate) use crate::server::shared::seat_grammar::{validate_project_slug, validate_seat_name};
 
 /// §1.3 canonical address, also the seat's memory scope (§3.1).
 pub(crate) fn seat_address(project_id: &str, name: &str) -> String {

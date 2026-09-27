@@ -20,17 +20,23 @@ use anyhow::{anyhow, Result};
 /// daemon), so this function does not need to thread `tauri::State` through
 /// every fs command + the viewer.
 pub fn resolve_allowlisted(input: &str) -> Result<PathBuf> {
+    check_allowlisted(&expand_absolute(input)?)
+}
+
+/// The input half of [`resolve_allowlisted`]: `~` / env-var expansion, then
+/// made absolute against the process cwd. No allowlist check. Split out so
+/// the daemon's `PathGuard` resolves a caller's path exactly as the desktop
+/// does and only swaps the root set it checks against.
+pub(crate) fn expand_absolute(input: &str) -> Result<PathBuf> {
     let expanded = shellexpand::full(input)
         .map(|c| c.into_owned())
         .map_err(|e| anyhow!("shellexpand failed: {e}"))?;
     let path = PathBuf::from(&expanded);
-    let abs = if path.is_absolute() {
+    Ok(if path.is_absolute() {
         path
     } else {
         std::env::current_dir()?.join(path)
-    };
-
-    check_allowlisted(&abs)
+    })
 }
 
 /// Enforce the allowlist on a path the *operating system* handed us — a
@@ -65,7 +71,7 @@ pub fn check_allowlisted(path: &Path) -> Result<PathBuf> {
 /// we canonicalize the parent and re-attach the filename so the allowlist
 /// check still works. Note that this resolves symlinks: that is the entire
 /// point, since a symlink is how an in-root path reaches out-of-root content.
-fn canonical_for_check(abs: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_for_check(abs: &Path) -> Result<PathBuf> {
     if abs.exists() {
         return Ok(abs.canonicalize()?);
     }

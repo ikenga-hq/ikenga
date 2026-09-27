@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::settings::SettingsScope;
+use crate::server::shared::settings::SettingsScope;
 
 pub const ACTIONS_SCHEMA: &str = "urn:ikenga:actions:v1";
 pub const KEYBINDINGS_SCHEMA: &str = "urn:ikenga:keybindings:v1";
@@ -1302,7 +1302,7 @@ fn validate_run(run: &Value, path: &str, v: &mut Validation) {
 /// copy is held to `projects.rs` by a test there). Whether the seat exists is
 /// only known at run time (`seats_resolve`).
 fn is_chi_seat_ref(value: &str) -> bool {
-    use crate::iyke::seats::{validate_project_slug, validate_seat_name};
+    use crate::server::shared::seat_grammar::{validate_project_slug, validate_seat_name};
     match value.split_once('/') {
         Some((project, name)) => {
             validate_project_slug(project).is_ok() && validate_seat_name(name).is_ok()
