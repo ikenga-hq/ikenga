@@ -316,11 +316,13 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        // Right after spawn the child can still be mid-`execve` (argv not
-        // mapped yet), which reads as `Unverified` — never `Dead`.
+        // Right after spawn the child can still be pre-`execve`: its argv not
+        // mapped yet (`Unverified`), or still the spawning test binary's own
+        // cmdline (`Foreign` — the vfork child shares the parent's memory
+        // until exec). Neither is ever `Dead`; wait for the new image.
         let mut first = probe_pid(pid, "sleep");
         for _ in 0..100 {
-            if first != PidProbe::Unverified {
+            if !matches!(first, PidProbe::Unverified | PidProbe::Foreign) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
