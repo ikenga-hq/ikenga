@@ -571,7 +571,9 @@ describe('rest (D-09 rest state)', () => {
 		useCompanionStore
 			.getState()
 			.receivePermission({ id: 'p1', kind: 'permission', toolName: 'Read', sessionId: 'term-3' });
-		useCompanionStore.setState({ state: 'collapsed' });
+		// Collapsed by the user while a request is pending: §5.2's quiet
+		// period, so the second request below doesn't re-expand the Companion.
+		useCompanionStore.setState({ state: 'collapsed', quietSince: Date.now() });
 		wrap(<Companion />);
 		const strip = await waitFor(() => {
 			const el = document.querySelector('[data-state="seats-rest"]') as HTMLElement | null;
