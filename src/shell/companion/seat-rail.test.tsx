@@ -75,6 +75,7 @@ import { __resetCompanionTimersForTests, useCompanionStore } from './companion-s
 import { __resetSeatUndoForTests, clearSeat, removeSeat, useSeatUi } from './seat-actions';
 import { handleMakeTargetRequest, handleSurfacesReturned } from './seat-menu';
 import { useSeatNotice } from './seat-notice';
+import { RAIL_MOVED_MS } from './seat-rail';
 import { __resetSessionNumbersForTests, sessionNumber } from './seat-sessions';
 
 const PROJECT = 'royalti-co';
@@ -405,6 +406,37 @@ describe('the seat menu', () => {
 		// A window operation only: no seat command ran (§4.4).
 		expect(m.seatsMove).not.toHaveBeenCalled();
 		expect(m.seatsClear).not.toHaveBeenCalled();
+	});
+
+	it('popout: the seat’s Window 2 signal pulses and the rail reads seats-popout, then settles (D-09 `.sgl.moved`)', async () => {
+		await mountRail();
+		const rail = () =>
+			document.querySelector('[data-state="seats-roster"], [data-state="seats-popout"]') as HTMLElement;
+		expect(rail().dataset.state).toBe('seats-roster');
+		vi.useFakeTimers();
+		act(() => useDetachedSurfaces.setState({ surfaceToWindow: { 'terminal:pty-term-3': 'detached-1' } }));
+		const signal = screen.getByRole('option', { name: /^@lead/ }).querySelector('[data-signal="window"]') as HTMLElement;
+		expect(signal).not.toBeNull();
+		expect(signal.textContent).toContain('Window 2');
+		expect(signal.dataset.moved).toBe('true');
+		expect(rail().dataset.state).toBe('seats-popout');
+		act(() => {
+			vi.advanceTimersByTime(RAIL_MOVED_MS + 10);
+		});
+		expect(
+			(screen.getByRole('option', { name: /^@lead/ }).querySelector('[data-signal="window"]') as HTMLElement).dataset.moved
+		).toBeUndefined();
+		expect(rail().dataset.state).toBe('seats-roster');
+	});
+
+	it('a seat already in Window 2 when the rail mounts is not "moved" (the roster state)', async () => {
+		useDetachedSurfaces.setState({ surfaceToWindow: { 'terminal:pty-term-1': 'detached-1' } });
+		await mountRail();
+		const signal = screen.getByRole('option', { name: /^@review/ }).querySelector('[data-signal="window"]') as HTMLElement;
+		expect(signal.textContent).toContain('Window 2');
+		expect(signal.dataset.moved).toBeUndefined();
+		expect(document.querySelector('[data-state="seats-roster"]')).not.toBeNull();
+		expect(document.querySelector('[data-state="seats-popout"]')).toBeNull();
 	});
 
 	it('a one-off run seat: Open in pane and Pop out say "headless run — nothing to show"', async () => {
