@@ -76,6 +76,8 @@ bundler alias is involved.
   projects, one pinned route in one section, one pkg rail entry, completed
   onboarding and empty SQLite. Override a command for one spec with
   `responses: { cmd: value }`. To make a command reject, use `{ __error: 'msg' }`.
+  To answer by one argument's value, use
+  `{ __byArg: { key: 'projectId', values: { 'royalti-co': [...] }, fallback: [] } }`.
 - Commands with no canned answer resolve to `null` and are recorded.
   `unmockedCommands(page)` lists them, and the smoke spec attaches that list as
   a test annotation.
@@ -99,6 +101,19 @@ bundler alias is involved.
   v16, the old rail's Files item stores mode `project` (g-state.md §6 interim
   behaviour), so those titles are in flux until WP-04. WP-20's no-op slot
   refactor has to keep it green without editing it.
+
+- `seats.spec.ts` (WP-71c, Phase 7 Part A): the D-09 seat rail's states by
+  their `data-state` roots (`seats-roster`, `-empty`, `-create`, `-vacant`,
+  `-dispatch`, `-rest`) in dark and light, Remove / Clear with their Undo
+  (G-102), roving focus, the per-project roster (DEC-68), every `seat:`
+  literal against `seat:<project>/<name>` (G-95), the G-93 status-bar nit, and
+  the D-05 local states (`profile`, `devices`, `locked`). The host is
+  `seatResponses()` from the mock: project `royalti-co` with D-09's four
+  seats. `popout` needs a live PTY and a second OS window, so it is a vitest
+  check (`src/shell/companion/seat-rail.test.tsx`). Light mode is seeded
+  through the theme store's `ikenga.theme` localStorage copy. Set
+  `IKENGA_E2E_SHOTS=<dir>` to keep the per-state screenshots for a design
+  sweep.
 
 Each later WP adds `e2e/<area>.spec.ts` for its own browser-mode DoD lines.
 

@@ -24,7 +24,9 @@
 import type { Page } from '@playwright/test';
 
 /** Serialisable command → response table. A value of the shape
- *  `{ __error: 'msg' }` makes the command reject with that message. */
+ *  `{ __error: 'msg' }` makes the command reject with that message; one of
+ *  the shape `{ __byArg: { key, values, fallback } }` answers by the value of
+ *  the argument `key` (`values[arg]`, else `fallback`). */
 export type MockResponses = Record<string, unknown>;
 
 export interface TauriMockOptions {
@@ -249,6 +251,129 @@ export const DEFAULT_RESPONSES: MockResponses = {
 	'plugin:notification|is_permission_granted': false,
 };
 
+// ─── Chi seats (WP-71c, D-09 sample content) ───────────────────────────────
+//
+// `designs/seats-companion.html`'s roster, as `seats_list` would report it
+// (G-SEATS §1.6 `SeatView`): four seats in project `royalti-co`. Not in
+// `DEFAULT_RESPONSES` — the other specs' Companion has no seats (and its
+// resting control count is D-01's); a seat spec merges `SEAT_RESPONSES`.
+
+export const MOCK_SEAT_PROJECT = {
+	id: 'royalti-co',
+	display_name: 'royalti-co',
+	root_path: '/home/e2e/royalti-co',
+	icon: null,
+	color: null,
+	description: null,
+	position: 2,
+	is_default: false,
+	created_at: NOW + 2,
+	archived_at: null,
+};
+
+function mockSeat(over: Record<string, unknown> & { name: string }): Record<string, unknown> {
+	const project = MOCK_SEAT_PROJECT.id;
+	return {
+		id: `seat-${over.name}`,
+		project_id: project,
+		engine_id: 'claude-code',
+		session: null,
+		created_at: NOW,
+		last_active_at: NOW,
+		hold: null,
+		address: `seat:${project}/${over.name}`,
+		agent_id: `seat-${over.name}`,
+		status: 'vacant',
+		agent: null,
+		resume: { resumable: false, reason: 'no_session' },
+		engine_resume: 'durable',
+		mount: null,
+		queued: null,
+		pad: { count: 0, latest: null },
+		inbox_count: 0,
+		...over,
+	};
+}
+
+/** D-09 `roster`: `lead` live, `review` idle (codex), `nightly` a run with
+ *  one inbox item, `docs` vacant and resumable. */
+export const MOCK_SEATS = [
+	mockSeat({
+		name: 'lead',
+		status: 'live',
+		agent: 'live',
+		session: { kind: 'terminal', terminal_id: 'e2e-term-3', external_id: 'c3', cwd: '/home/e2e/royalti-co' },
+		resume: { resumable: true },
+		pad: { count: 3, latest: { name: 'WP-64 brief drafted', updated_at: NOW } },
+	}),
+	mockSeat({
+		name: 'review',
+		engine_id: 'codex',
+		status: 'idle',
+		agent: 'unreported',
+		session: { kind: 'terminal', terminal_id: 'e2e-term-1', external_id: null, cwd: '/home/e2e/royalti-co' },
+		resume: { resumable: true },
+		pad: { count: 1, latest: { name: 'waiting on lead’s diff', updated_at: NOW } },
+	}),
+	mockSeat({
+		name: 'nightly',
+		status: 'run',
+		session: { kind: 'run', run_id: 'e2e-run-nightly', external_id: 'np', cwd: '/home/e2e/royalti-co' },
+		resume: { resumable: true },
+		pad: { count: 2, latest: null },
+		inbox_count: 1,
+	}),
+	mockSeat({
+		name: 'docs',
+		status: 'vacant',
+		session: { kind: 'terminal', terminal_id: 'e2e-term-2', external_id: 'c2', cwd: '/home/e2e/royalti-co' },
+		resume: { resumable: true },
+		pad: { count: 5, latest: { name: 'STATUS.md pass half done', updated_at: NOW } },
+	}),
+];
+
+/** `seats_engines`: D-09's three engines, gemini not installed. */
+export const MOCK_SEAT_ENGINES = [
+	{ engine_id: 'claude-code', wrap_id: 'claude', engine_resume: 'durable', seatable: true },
+	{ engine_id: 'codex', wrap_id: 'codex', engine_resume: 'durable', seatable: true },
+	{
+		engine_id: 'gemini',
+		wrap_id: 'gemini',
+		engine_resume: null,
+		seatable: false,
+		reason: 'not installed — Ngwa → Store',
+	},
+];
+
+/** The host for a seat spec: `royalti-co` active, holding `seats`
+ *  (`MOCK_SEATS` by default; `[]` is D-09 `empty`). */
+export function seatResponses(seats: unknown[] = MOCK_SEATS): MockResponses {
+	return {
+		project_list: [...MOCK_PROJECTS, MOCK_SEAT_PROJECT],
+		project_get_active: MOCK_SEAT_PROJECT,
+		seats_list: { __byArg: { key: 'projectId', values: { [MOCK_SEAT_PROJECT.id]: seats }, fallback: [] } },
+		seats_engines: MOCK_SEAT_ENGINES,
+		settings_get_all: { ...MOCK_SETTINGS, 'agent.defaultEngineId': JSON.stringify('claude-code') },
+	};
+}
+
+/** `app_lock_status` (WP-72, D-05 `locked`): locked on idle, PIN set, no OS unlock. */
+export const MOCK_APP_LOCK_LOCKED = {
+	locked: true,
+	reason: 'idle',
+	lockedAtMs: NOW,
+	idleEnabled: true,
+	idleMinutes: 15,
+	method: 'pin',
+	secretSet: true,
+	biometric: { kind: 'none', label: '', available: false, reason: '' },
+	retryInMs: null,
+	attemptsLeft: 5,
+	host: 'ned-desktop',
+	os: 'Linux 6.8.0',
+	configPath: '/home/e2e/.local/share/app.ikenga/app-lock.json',
+};
+
 interface InitPayload {
 	responses: MockResponses;
 	platform: string;
@@ -307,7 +432,14 @@ function installInPage(payload: InitPayload): void {
 				return null;
 		}
 		if (Object.hasOwn(responses, cmd)) {
-			const v = responses[cmd] as any;
+			let v = responses[cmd] as any;
+			// `{ __byArg: { key, values, fallback } }`: answer by one argument's
+			// value (e.g. `seats_list` by `projectId`), else `fallback`.
+			if (v && typeof v === 'object' && '__byArg' in v) {
+				const spec = v.__byArg as { key: string; values: Record<string, unknown>; fallback?: unknown };
+				const arg = args?.[spec.key];
+				v = typeof arg === 'string' && Object.hasOwn(spec.values, arg) ? spec.values[arg] : spec.fallback;
+			}
 			if (v && typeof v === 'object' && '__error' in v) throw new Error(String(v.__error));
 			// Fresh copy per call so a consumer mutating a response can't leak
 			// into the next caller.
