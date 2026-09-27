@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::debug;
 
+use super::rpc_claude;
 use super::rpc_local;
 use super::rpc_shell;
 use super::AppState;
@@ -713,6 +714,36 @@ pub async fn rpc_handler(
         "studio_thread_delete" => rpc_shell::studio_thread_delete(&state, &payload.args).await,
         "studio_message_append" => rpc_shell::studio_message_append(&state, &payload.args).await,
         "studio_message_list" => rpc_shell::studio_message_list(&state, &payload.args).await,
+
+        // --- Claude config / assets / sessions + detection (WP-19 slice 5b) ---
+        //
+        // Bodies in `server::rpc_claude`, over `server::shared::{claude_config,
+        // claude_sessions, settings_cascade, agent_config, agent_projects,
+        // engine_layout, shell_detect}` — the cores the desktop commands call.
+        // `~/.claude`, `~/.claude/projects` and the Ngwa store are the router
+        // home's (single-user seam, G-PRINCIPAL / WP-20); caller paths are
+        // confined to the fs allowlist, session logs to `~/.claude/projects`.
+        // Nothing spawns and nothing is watched (no event channel): the
+        // `claude_config_watch` pair, discovery, the store, the primitives and
+        // the probing detectors stay in `desktop_only.toml`.
+        "claude_config_load" => rpc_claude::claude_config_load(&state, &payload.args).await,
+        "claude_config_read_file" => {
+            rpc_claude::claude_config_read_file(&state, &payload.args).await
+        }
+        "claude_config_resolve_cascade" => {
+            rpc_claude::claude_config_resolve_cascade(&state, &payload.args)
+        }
+        "claude_asset_pin" => rpc_claude::claude_asset_pin(&state, &payload.args).await,
+        "claude_asset_unpin" => rpc_claude::claude_asset_unpin(&state, &payload.args).await,
+        "claude_asset_list_pins" => rpc_claude::claude_asset_list_pins(&state, &payload.args).await,
+        "claude_list_sessions" => rpc_claude::claude_list_sessions(&state, &payload.args).await,
+        "claude_read_jsonl" => rpc_claude::claude_read_jsonl(&state, &payload.args).await,
+        "claude_session_list" => rpc_claude::claude_session_list(&state, &payload.args).await,
+        "detect_agent_config" => rpc_claude::detect_agent_config(&state, &payload.args),
+        "list_claude_projects" => rpc_claude::list_claude_projects(&state).await,
+        "list_agent_projects" => rpc_claude::list_agent_projects(&state, &payload.args).await,
+        "engine_layout" => rpc_claude::engine_layout(),
+        "terminal_detect_shells" => rpc_claude::terminal_detect_shells(),
 
         // --- Unknown Command Fallback ---
         other => {

@@ -57,7 +57,7 @@ use super::AppState;
 /// command declares, from the first of `names` present with a non-null
 /// value, or from `null` when none is (which an `Option` takes as `None` and
 /// anything else refuses — reported as "required").
-fn targ<T: DeserializeOwned>(args: &Value, names: &[&str]) -> Result<T, String> {
+pub(super) fn targ<T: DeserializeOwned>(args: &Value, names: &[&str]) -> Result<T, String> {
     match arg(args, names) {
         Some(v) => {
             serde_json::from_value(v.clone()).map_err(|e| format!("invalid `{}`: {e}", names[0]))
@@ -85,7 +85,7 @@ pub(crate) enum PathGuard {
 }
 
 impl PathGuard {
-    fn check(&self, canonical: &Path) -> Result<(), String> {
+    pub(super) fn check(&self, canonical: &Path) -> Result<(), String> {
         let allowed = match self {
             PathGuard::Allowlist => crate::fs_roots::current()
                 .ok_or("fs allowlist not initialized (the daemon needs --data-dir)")?

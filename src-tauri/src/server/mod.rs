@@ -19,6 +19,7 @@ pub mod pkg_index;
 pub mod pkg_static;
 pub mod pty_ws;
 pub mod rpc;
+mod rpc_claude;
 mod rpc_local;
 mod rpc_shell;
 pub mod shared;

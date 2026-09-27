@@ -4,7 +4,9 @@
 //! parses records into typed events (`user`, `assistant`, `tool_result`, `progress`, `ai-title`, `summary`),
 //! and emits events over `transcript://{session_id}` bus.
 
-pub mod parser;
+// The line parser moved to the ungated `server::shared::claude_sessions`
+// (WP-19 slice 5b) — the daemon's session browser arm summarizes with it.
+pub use crate::server::shared::claude_sessions::transcript_parser as parser;
 pub mod usage;
 pub mod watcher;
 

@@ -23,7 +23,6 @@ use tokio::sync::Mutex;
 use crate::claude::event::ChatEvent;
 use crate::claude::stream_parser::StreamParser;
 use crate::commands::chi_runner::{self, RunLiveness};
-use crate::commands::claude::claude_list_sessions;
 use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
 use crate::engines::codex_pty::parser as codex_parser;
@@ -1906,66 +1905,16 @@ pub async fn chi_list(
     #[allow(non_snake_case)] engineId: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<ChiCacheRow>, String> {
-    let engine_id = engineId.as_deref();
-    let mut rows = chi_read::list(&db, engine_id, limit).await?;
-
-    // Merge with Claude JSONL records when no engine filter or claude-code.
-    if engine_id.is_none() || engine_id == Some("claude-code") {
-        match claude_list_sessions(None, Some(limit.unwrap_or(50).clamp(1, 200) as usize)).await {
-            Ok(sessions) => {
-                let mut seen: std::collections::HashSet<String> =
-                    rows.iter().filter_map(|r| r.external_id.clone()).collect();
-                for s in sessions {
-                    if seen.contains(&s.session_id) {
-                        // Refresh last_seen_at on matching cache rows.
-                        for row in rows.iter_mut() {
-                            if row.external_id.as_deref() == Some(&s.session_id) {
-                                row.last_seen_at =
-                                    s.last_message_at.clone().or(Some(s.started_at.clone()));
-                            }
-                        }
-                        continue;
-                    }
-                    seen.insert(s.session_id.clone());
-                    rows.push(ChiCacheRow {
-                        run_id: s.session_id.clone(),
-                        engine_id: "claude-code".to_string(),
-                        external_id: Some(s.session_id.clone()),
-                        brief: s.title.clone(),
-                        cwd: Some(s.project_dir.clone()),
-                        model: s.model.clone(),
-                        mode: None,
-                        status: "done".to_string(),
-                        output_path: None,
-                        output_truncated: None,
-                        error: None,
-                        artifacts: None,
-                        parent_id: None,
-                        owner: "agent".to_string(),
-                        pid: None,
-                        started_at: Some(s.started_at.clone()),
-                        ended_at: s.last_message_at.clone(),
-                        last_seen_at: s.last_message_at.clone().or(Some(s.started_at.clone())),
-                        expires_at: None,
-                    });
-                }
-            }
-            Err(e) => {
-                log::debug!(target: "ikenga::chi", "claude_list_sessions failed: {e}");
-            }
-        }
-    }
-
-    rows.sort_by(|a, b| {
-        b.last_seen_at
-            .as_deref()
-            .unwrap_or("")
-            .cmp(a.last_seen_at.as_deref().unwrap_or(""))
-    });
-
-    let limit = limit.unwrap_or(50).clamp(1, 200) as usize;
-    rows.truncate(limit);
-    Ok(rows)
+    // Cache rows + Claude's JSONL sessions from `~/.claude/projects`, sorted
+    // and truncated — the shared core the daemon's `chi_list` arm also calls.
+    chi_read::list_merged(
+        &db,
+        engineId.as_deref(),
+        limit,
+        crate::claude::projects_root().as_deref(),
+        crate::server::shared::projects::FsReach::Follow,
+    )
+    .await
 }
 
 /// Cancel a Chi run. Kills the engine child process.
