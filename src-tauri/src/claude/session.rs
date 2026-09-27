@@ -596,6 +596,7 @@ pub async fn spawn_streaming(
         // Keep this flag — removing it would trade a real orphan risk for
         // nothing.
         kill_on_drop: true,
+        detached: false,
     };
     // D-13 (`plans/2026-07-18-transcripts-and-terminal-architecture/07-retire-the-overlay.md`):
     // this spawn deliberately sets NO `CLAUDE_CONFIG_DIR` and passes NO

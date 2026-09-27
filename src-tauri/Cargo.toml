@@ -215,7 +215,9 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"], optional = true }
 webview2-com = "0.38"
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem"] }
+# Threading + Foundation: the detached chi-runner pid probe
+# (commands/chi_runner.rs — OpenProcess / GetExitCodeProcess).
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading"] }
 
 # Mac-only polish (window vibrancy + dock-tile badge) was removed
 # in the strip-down. The resolved objc2 v0.5 didn't export

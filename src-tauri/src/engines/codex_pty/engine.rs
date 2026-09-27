@@ -224,6 +224,7 @@ impl CodexPtyEngine {
             // A no-op off Windows, which is what the old `#[cfg(windows)]`-only
             // call amounted to.
             no_console_window: true,
+            detached: false,
         };
 
         let mut child = crate::executor::current()

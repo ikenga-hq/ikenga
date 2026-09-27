@@ -75,8 +75,48 @@ impl SessionExecutor for InProcessExecutor {
         for (k, v) in &spec.env.vars {
             cmd.env(k, v);
         }
+        if opts.detached {
+            return spawn_detached(cmd);
+        }
         cmd.kill_on_drop(opts.kill_on_drop);
         cmd.spawn()
+    }
+}
+
+/// The `PipedOpts::detached` spawn. `kill_on_drop` is forced off: the caller
+/// drops the handle on purpose and the child must keep running.
+///
+/// `no_console_window` needs no separate handling here: Windows'
+/// `creation_flags` *replaces* the flags already set, and the detached flag
+/// set includes `CREATE_NO_WINDOW` itself.
+fn spawn_detached(mut cmd: Command) -> std::io::Result<tokio::process::Child> {
+    cmd.kill_on_drop(false);
+
+    #[cfg(unix)]
+    {
+        // Own process group (pgid == pid): out of reach of a signal aimed at
+        // the app's group, and killable as a tree with `kill(-pid, sig)`.
+        cmd.process_group(0);
+        cmd.spawn()
+    }
+
+    #[cfg(windows)]
+    {
+        use crate::platform::{CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS_FLAGS};
+        // Win32 ERROR_ACCESS_DENIED: what CreateProcess returns when the job
+        // the app runs in does not allow breakaway.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        // OWED (Windows live check, WP-18b): the breakaway attempt, its
+        // fallback, and that the detached child outlives the app are
+        // unverified on a real Windows host — written and tested on Linux.
+        cmd.creation_flags(DETACHED_PROCESS_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                cmd.creation_flags(DETACHED_PROCESS_FLAGS);
+                cmd.spawn()
+            }
+            other => other,
+        }
     }
 }
 
@@ -92,6 +132,7 @@ mod tests {
             stderr: StdioMode::Piped,
             kill_on_drop: true,
             no_console_window: true,
+            detached: false,
         }
     }
 
@@ -240,5 +281,92 @@ mod tests {
         let caps = InProcessExecutor.capabilities();
         assert_eq!(caps.tier, ExecutorTier::T0);
         assert!(!caps.principal_isolation);
+    }
+
+    /// True once `pid` no longer runs: gone, or a zombie nobody has reaped
+    /// yet (containers often have no init reaping re-parented orphans).
+    #[cfg(unix)]
+    fn gone_or_zombie(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => true,
+                // `pid (comm) S ...` — the state follows the last `)`.
+                Ok(stat) => stat
+                    .rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                    .unwrap_or(false),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unsafe { libc::kill(pid, 0) != 0 }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        done()
+    }
+
+    #[cfg(unix)]
+    fn sleeper(detached: bool) -> (SpawnSpec, PipedOpts) {
+        let mut spec = SpawnSpec::new("sleep");
+        spec.arg("30");
+        let opts = PipedOpts {
+            stdin: StdioMode::Null,
+            stdout: StdioMode::Null,
+            stderr: StdioMode::Null,
+            // Asked for, and overridden by `detached`.
+            kill_on_drop: true,
+            no_console_window: true,
+            detached,
+        };
+        (spec, opts)
+    }
+
+    /// WP-18b: a detached child leads its own process group and outlives its
+    /// dropped `Child` handle even though `kill_on_drop: true` was asked for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_child_has_its_own_group_and_survives_a_dropped_handle() {
+        let (spec, opts) = sleeper(true);
+        let child = InProcessExecutor.spawn_piped(spec, opts).unwrap();
+        let pid = child.id().expect("pid") as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid, "own process group");
+        assert_ne!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgid(0) });
+
+        drop(child);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let alive = !gone_or_zombie(pid);
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        assert!(
+            alive,
+            "detached child must survive its handle being dropped"
+        );
+    }
+
+    /// Non-detached behaviour is unchanged: the child shares our process
+    /// group and `kill_on_drop` still kills it with the handle.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_detached_child_keeps_kill_on_drop_and_our_group() {
+        let (spec, opts) = sleeper(false);
+        let child = InProcessExecutor.spawn_piped(spec, opts).unwrap();
+        let pid = child.id().expect("pid") as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgid(0) });
+
+        drop(child);
+        let killed = wait_until(|| gone_or_zombie(pid)).await;
+        if !killed {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(killed, "kill_on_drop must still kill a non-detached child");
     }
 }

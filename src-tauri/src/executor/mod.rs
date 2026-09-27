@@ -26,8 +26,9 @@
 //! ## What is in scope (slice 1)
 //!
 //! `pty::PtyManager::spawn_inner`, `claude::session::spawn_streaming`, the
-//! codex and antigravity engines. Chi / tmux, pkg sidecars + MCP, and the
-//! secrets surface are slice 2.
+//! codex and antigravity engines. Chi's detached `chi-runner` launch
+//! (WP-18b) goes through [`PipedOpts::detached`]; pkg sidecars + MCP and the
+//! secrets surface are later slices.
 //!
 //! This module compiles without the `desktop` feature: the daemon needs it.
 
@@ -176,6 +177,18 @@ pub struct PipedOpts {
     /// `platform::NoConsoleWindow` — suppress the Windows console flash. A
     /// no-op off Windows.
     pub no_console_window: bool,
+    /// Start the child detached from the host so it outlives the app (a chi
+    /// run's `chi-runner`, ADR-023 D4/D5). Unix: the child leads its own
+    /// process group (`process_group(0)`), so a signal to the app's group
+    /// doesn't reach it and the whole tree can be signalled as `-pid`.
+    /// Windows: `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, plus
+    /// `CREATE_BREAKAWAY_FROM_JOB` when the parent's job allows it. Forces
+    /// `kill_on_drop` off — dropping the handle must not end the run.
+    ///
+    /// A process group does NOT escape a systemd cgroup: under a unit with
+    /// the default `KillMode=control-group`, stopping the unit still kills a
+    /// detached child (see `scripts/server/ikenga-server.service`).
+    pub detached: bool,
 }
 
 /// A spawned PTY child: what `PtyManager::spawn_inner` used to get from

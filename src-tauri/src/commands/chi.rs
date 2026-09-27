@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::claude::event::ChatEvent;
 use crate::claude::stream_parser::StreamParser;
+use crate::commands::chi_runner::{self, RunLiveness};
 use crate::commands::claude::claude_list_sessions;
 use crate::commands::db::PaDb;
 use crate::engines::claude_code::mode::AcpSessionMode;
@@ -29,7 +30,6 @@ use crate::engines::codex_pty::parser as codex_parser;
 use crate::engines::{EngineHandle, EngineRegistryState, OpenRouterHttpEngineState};
 #[cfg(windows)]
 use crate::platform::NoConsoleWindow;
-use crate::terminal::multiplexer;
 
 /// Cache state. Lives in `app_data_dir` and is `.manage()`d in `lib.rs`.
 #[derive(Clone, Debug)]
@@ -114,10 +114,10 @@ pub struct ChiRunOpts {
     pub parent_id: Option<String>,
     #[serde(rename = "resumeSessionId")]
     pub resume_session_id: Option<String>,
-    /// If true, try to launch via the tmux multiplexer so the session
-    /// survives an app restart. Falls back to in-process if tmux is
-    /// unavailable. The tmux session name is stored in
-    /// `chi_cache.terminal_session_id`.
+    /// If true, launch the run as a detached `chi-runner` (WP-18b) so it
+    /// survives an app restart. Falls back to in-process when chi-runner
+    /// can't be found or spawned. The runner's pid is stored in
+    /// `chi_cache.pid`.
     #[serde(default)]
     pub persistent: bool,
 }
@@ -163,7 +163,8 @@ pub struct ChiCacheRow {
     pub artifacts: Option<serde_json::Value>,
     pub parent_id: Option<String>,
     pub owner: String,
-    pub terminal_session_id: Option<String>,
+    /// The detached chi-runner's pid (WP-18b); `None` for in-process runs.
+    pub pid: Option<i64>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub last_seen_at: Option<String>,
@@ -171,6 +172,11 @@ pub struct ChiCacheRow {
 }
 
 /// On-disk shape for a per-run output file. The cache row points at this file.
+///
+/// In-process runs write `output` / `error` / `done_at`. A detached
+/// chi-runner additionally writes `status` (`running`, then one of `done` /
+/// `failed` / `timed_out`) and the engine's `external_id` — see
+/// `chi_runner::runner_terminal_status`.
 #[derive(Serialize, Deserialize)]
 struct RunOutputFile {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +185,16 @@ struct RunOutputFile {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+}
+
+/// Parse an output file. chi-runner rewrites it in place, so a reader can
+/// catch it half-written: anything unparseable is "no information yet".
+fn parse_output_file(s: &str) -> Option<RunOutputFile> {
+    serde_json::from_str(s).ok()
 }
 
 fn now_iso() -> String {
@@ -216,7 +232,7 @@ fn row_to_cache_row(r: &sqlx::sqlite::SqliteRow) -> Result<ChiCacheRow, String> 
         artifacts,
         parent_id: r.get("parent_id"),
         owner: r.get("owner"),
-        terminal_session_id: r.get("terminal_session_id"),
+        pid: r.get("pid"),
         started_at: r.get("started_at"),
         ended_at: r.get("ended_at"),
         last_seen_at: r.get("last_seen_at"),
@@ -241,7 +257,7 @@ async fn cache_insert(
         "INSERT INTO chi_cache (
             run_id, engine_id, external_id, brief, cwd, model, mode, status,
             output_path, output_truncated, error, artifacts, parent_id, owner,
-            terminal_session_id, started_at, ended_at, last_seen_at, expires_at
+            pid, started_at, ended_at, last_seen_at, expires_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(run_id)
@@ -258,7 +274,7 @@ async fn cache_insert(
     .bind::<Option<String>>(None) // artifacts as JSON string
     .bind(&opts.parent_id)
     .bind(owner)
-    .bind::<Option<String>>(None)
+    .bind::<Option<i64>>(None)
     .bind(&now)
     .bind::<Option<String>>(None)
     .bind(&now)
@@ -274,7 +290,7 @@ async fn cache_get(db: &PaDb, run_id: &str) -> Result<Option<ChiCacheRow>, Strin
     let row = sqlx::query(
         "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
                 output_path, output_truncated, error, artifacts, parent_id, owner,
-                terminal_session_id, started_at, ended_at, last_seen_at, expires_at
+                pid, started_at, ended_at, last_seen_at, expires_at
          FROM chi_cache WHERE run_id = ?",
     )
     .bind(run_id)
@@ -295,7 +311,7 @@ async fn cache_list(
         sqlx::query(
             "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
                     output_path, output_truncated, error, artifacts, parent_id, owner,
-                    terminal_session_id, started_at, ended_at, last_seen_at, expires_at
+                    pid, started_at, ended_at, last_seen_at, expires_at
              FROM chi_cache
              WHERE engine_id = ?
              ORDER BY last_seen_at DESC
@@ -309,7 +325,7 @@ async fn cache_list(
         sqlx::query(
             "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
                     output_path, output_truncated, error, artifacts, parent_id, owner,
-                    terminal_session_id, started_at, ended_at, last_seen_at, expires_at
+                    pid, started_at, ended_at, last_seen_at, expires_at
              FROM chi_cache
              ORDER BY last_seen_at DESC
              LIMIT ?",
@@ -359,6 +375,33 @@ async fn cache_update_external_id(
     Ok(())
 }
 
+/// A run just handed to a detached chi-runner: `running`, with its pid.
+async fn cache_mark_detached(db: &PaDb, run_id: &str, pid: u32) -> Result<(), String> {
+    let pool = db.ensure_pool().await?;
+    sqlx::query(
+        "UPDATE chi_cache SET status = 'running', pid = ?, last_seen_at = ? WHERE run_id = ?",
+    )
+    .bind(i64::from(pid))
+    .bind(now_iso())
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("chi_cache record chi-runner pid: {e}"))?;
+    Ok(())
+}
+
+/// A detached run being resumed in-process: the old runner's pid no longer
+/// describes the run, and the sweep must not judge the new turn by it.
+async fn cache_clear_pid(db: &PaDb, run_id: &str) -> Result<(), String> {
+    let pool = db.ensure_pool().await?;
+    sqlx::query("UPDATE chi_cache SET pid = NULL WHERE run_id = ?")
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("chi_cache clear pid: {e}"))?;
+    Ok(())
+}
+
 async fn cache_update_done(
     db: &PaDb,
     run_id: &str,
@@ -367,40 +410,86 @@ async fn cache_update_done(
     output_truncated: bool,
     artifacts: Option<&serde_json::Value>,
 ) -> Result<(), String> {
+    cache_finish(
+        db,
+        run_id,
+        status,
+        error,
+        output_truncated,
+        artifacts,
+        false,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`cache_update_done`] guarded by the status transition: the row is only
+/// finished (and the notification only produced) while it is still `queued` /
+/// `running`. Returns whether this call made the transition. The detached-run
+/// sweep uses it so a run is notified exactly once however many sweeps, or a
+/// racing `chi_cancel`, see it.
+async fn cache_update_done_if_live(
+    db: &PaDb,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<bool, String> {
+    cache_finish(db, run_id, status, error, false, None, true).await
+}
+
+async fn cache_finish(
+    db: &PaDb,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    output_truncated: bool,
+    artifacts: Option<&serde_json::Value>,
+    only_if_live: bool,
+) -> Result<bool, String> {
     let pool = db.ensure_pool().await?;
     let now = now_iso();
     let ended = now_iso();
     let artifacts_json = artifacts.map(|v| v.to_string());
-    sqlx::query(
+    let sql = if only_if_live {
         "UPDATE chi_cache SET
             status = ?, error = ?, output_truncated = ?, artifacts = ?,
             ended_at = ?, last_seen_at = ?
-         WHERE run_id = ?",
-    )
-    .bind(status)
-    .bind(error)
-    .bind(output_truncated as i64)
-    .bind(artifacts_json)
-    .bind(&ended)
-    .bind(&now)
-    .bind(run_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| format!("chi_cache update done: {e}"))?;
+         WHERE run_id = ? AND status IN ('queued', 'running')"
+    } else {
+        "UPDATE chi_cache SET
+            status = ?, error = ?, output_truncated = ?, artifacts = ?,
+            ended_at = ?, last_seen_at = ?
+         WHERE run_id = ?"
+    };
+    let res = sqlx::query(sql)
+        .bind(status)
+        .bind(error)
+        .bind(output_truncated as i64)
+        .bind(artifacts_json)
+        .bind(&ended)
+        .bind(&now)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("chi_cache update done: {e}"))?;
+    if only_if_live && res.rows_affected() == 0 {
+        return Ok(false);
+    }
     notify_run_terminal(db, run_id, status, error, artifacts).await;
-    Ok(())
+    Ok(true)
 }
 
-/// WP-40 `run_finished` / `run_failed` producer. `cache_update_done` is the
-/// single place a Chi run reaches a terminal status (every engine's one-off
-/// task, spawn failures, stdin failures), so producing here covers them all.
-/// `cancelled` produces nothing (a human did it). Best-effort. The run's
+/// WP-40 `run_finished` / `run_failed` producer. `cache_update_done` (and its
+/// transition-guarded twin `cache_update_done_if_live`) is the single place a
+/// Chi run reaches a terminal status (every engine's one-off task, spawn
+/// failures, stdin failures, and — via [`reconcile_detached_runs`] — detached
+/// chi-runner runs that finish out of process), so producing here covers them
+/// all. `cancelled` produces nothing (a human did it). Best-effort. The run's
 /// artifacts ride along (count + first path) so the row can "Open artifact".
 ///
-/// Not covered (tracked WP-40 follow-ups): tmux-backed persistent runs finish
-/// inside the tmux runner, out of process, and never reach this function;
-/// agent-ops schedules (D-07's "pulse-refresh finished" example rows) have no
-/// in-shell completion signal at all yet.
+/// Not covered (tracked WP-40 follow-up): agent-ops schedules (D-07's
+/// "pulse-refresh finished" example rows) have no in-shell completion signal
+/// at all yet.
 async fn notify_run_terminal(
     db: &PaDb,
     run_id: &str,
@@ -1031,6 +1120,8 @@ fn write_output_file_sync(path: &Path, output: &str, error: Option<&str>) {
         output: Some(output.to_string()),
         error: error.map(|s| s.to_string()),
         done_at: Some(now_iso()),
+        status: None,
+        external_id: None,
     };
     if let Ok(json) = serde_json::to_string(&file) {
         let _ = std::fs::write(path, json);
@@ -1495,6 +1586,8 @@ async fn write_output_file(path: &Path, output: &str, error: Option<&str>) -> Re
         output: Some(output.to_string()),
         error: error.map(|s| s.to_string()),
         done_at: Some(now_iso()),
+        status: None,
+        external_id: None,
     };
     let json = serde_json::to_string(&file).map_err(|e| format!("serialize output: {e}"))?;
     tokio::fs::write(path, json)
@@ -1505,7 +1598,7 @@ async fn write_output_file(path: &Path, output: &str, error: Option<&str>) -> Re
 
 async fn read_output_file(path: &Path) -> Option<RunOutputFile> {
     match tokio::fs::read_to_string(path).await {
-        Ok(s) => serde_json::from_str(&s).ok(),
+        Ok(s) => parse_output_file(&s),
         Err(_) => None,
     }
 }
@@ -1570,8 +1663,8 @@ pub(crate) async fn spawn_chi_run(
     // `openrouter` has no CLI to spawn — the adapter IS the HTTP client
     // (WP-20). Dispatch it in-process through the managed `EngineRegistry`
     // instead of failing binary resolution; the output file + cache contract
-    // stays identical to the CLI readers. Runs before the tmux path because
-    // `spawn_in_tmux` can only launch binaries.
+    // stays identical to the CLI readers. Runs before the detached path
+    // because chi-runner can only launch CLI engines.
     if opts.engine_id == "openrouter" {
         let Some(app) = app else {
             let msg = "openrouter chi runs need the desktop app handle (engine registry + \
@@ -1586,10 +1679,10 @@ pub(crate) async fn spawn_chi_run(
         return openrouter_spawn_run(app, db, runtime, run_id, output_path, &opts, cwd, None).await;
     }
 
-    // ── Persistent (tmux-backed) path ────────────────────────────────────────
+    // ── Persistent (detached chi-runner) path ────────────────────────────────
     // Try this first so we never spawn a redundant in-process child.
-    if opts.persistent && multiplexer::tmux_available() {
-        let conf = multiplexer::RunnerConf {
+    if opts.persistent {
+        let conf = chi_runner::RunnerConf {
             run_id: &run_id,
             engine_id: &opts.engine_id,
             prompt: &opts.prompt,
@@ -1600,22 +1693,20 @@ pub(crate) async fn spawn_chi_run(
             output_path: &output_path.to_string_lossy(),
             timeout_seconds: opts.timeout_seconds.map(|s| s as u64),
         };
-        match multiplexer::spawn_in_tmux(&conf, &cache.cache_dir()) {
-            multiplexer::SpawnResult::Ok { session_name } => {
-                cache_update_status(&db, &run_id, "running", None)
-                    .await
-                    .ok();
-                if let Ok(pool) = db.ensure_pool().await {
-                    sqlx::query("UPDATE chi_cache SET terminal_session_id = ? WHERE run_id = ?")
-                        .bind(&session_name)
-                        .bind(&run_id)
-                        .execute(&pool)
+        match chi_runner::spawn_detached_runner(&conf, &cache.cache_dir()) {
+            Ok(pid) => {
+                if let Err(e) = cache_mark_detached(&db, &run_id, pid).await {
+                    // An unrecorded runner could be neither reconciled nor
+                    // cancelled: take it down rather than leave it orphaned.
+                    let _ = chi_runner::kill_process_group(pid, chi_runner::CANCEL_GRACE).await;
+                    cache_update_done(&db, &run_id, "failed", Some(&e), false, None)
                         .await
                         .ok();
+                    return Err(e);
                 }
                 log::info!(
                     target: "ikenga::chi",
-                    "chi run {run_id} started in tmux session '{session_name}'"
+                    "chi run {run_id} started detached (chi-runner pid {pid})"
                 );
                 return Ok(ChiRunResult {
                     run_id,
@@ -1625,10 +1716,11 @@ pub(crate) async fn spawn_chi_run(
                     error: None,
                 });
             }
-            multiplexer::SpawnResult::Unavailable { reason } => {
+            Err(reason) => {
                 log::warn!(
                     target: "ikenga::chi",
-                    "tmux unavailable ({reason}), falling back to in-process task"
+                    "chi run {run_id}: detached chi-runner unavailable ({reason}), \
+                     falling back to in-process task"
                 );
             }
         }
@@ -1748,9 +1840,31 @@ pub(crate) async fn resume_chi_run(
     run_id: String,
     prompt: String,
 ) -> Result<ChiRunResult, String> {
-    let row = cache_get(&db, &run_id)
+    let mut row = cache_get(&db, &run_id)
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
+
+    // ── A detached (chi-runner) run ──────────────────────────────────────────
+    // The resume runs in-process, so the old runner has to be finished first:
+    // refuse while it still runs (two writers on one output file), otherwise
+    // settle its terminal status now — the sweep may not have seen it yet —
+    // pick up the engine session id it wrote, and drop the pid so the sweep
+    // doesn't judge the new in-process turn by the old runner's exit.
+    if let Some(pid) = row.pid {
+        let path = resolve_output_path(&cache.cache_dir(), row.output_path.as_deref());
+        let seen = observe_detached(pid, path.as_deref(), &chi_runner::probe_runner).await;
+        if seen.liveness == RunLiveness::Running {
+            return Err(format!(
+                "chi run {run_id} is still running (detached chi-runner pid {pid})"
+            ));
+        }
+        let external_id = seen.external_id.clone();
+        apply_detached(&db, &run_id, row.external_id.as_deref(), seen).await?;
+        if row.external_id.is_none() {
+            row.external_id = external_id;
+        }
+        cache_clear_pid(&db, &run_id).await?;
+    }
 
     let cache = cache.clone();
     let output_path = PathBuf::from(row.output_path.as_deref().unwrap_or(""));
@@ -1895,26 +2009,56 @@ pub async fn chi_status(
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
 
-    let output_path = row.output_path.as_deref().map(Path::new).map(|p| {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            cache.cache_dir().join(p)
-        }
-    });
+    let output_path = resolve_output_path(&cache.cache_dir(), row.output_path.as_deref());
+
+    // A live detached run: the row only learns its end from the sweep, so
+    // report what the runner's pid + status file say now (the same decision
+    // the sweep will persist). The pid is probed before the file is read —
+    // see `chi_runner::decide_liveness`.
+    let detached_live = row
+        .pid
+        .filter(|_| matches!(row.status.as_str(), "queued" | "running"))
+        .map(|pid| pid_alive(pid, &chi_runner::probe_runner));
+
     let file = if let Some(path) = output_path {
         read_output_file(&path).await
     } else {
         None
     };
 
+    let (status, decided_error) = match detached_live {
+        Some(alive) => match chi_runner::decide_liveness(
+            alive,
+            file.as_ref().and_then(|f| f.status.as_deref()),
+            file.as_ref().and_then(|f| f.error.as_deref()),
+        ) {
+            RunLiveness::Running => (row.status, None),
+            RunLiveness::Terminal { status, error } => (status.to_string(), error),
+        },
+        None => (row.status, None),
+    };
+
     Ok(ChiRunResult {
         run_id: row.run_id,
-        status: row.status,
+        status,
         output: file.as_ref().and_then(|f| f.output.clone()).or(row.brief),
         output_truncated: row.output_truncated,
-        error: file.and_then(|f| f.error).or(row.error),
+        error: decided_error.or(file.and_then(|f| f.error)).or(row.error),
     })
+}
+
+/// A row's `output_path`, relative paths resolved against the cache dir.
+fn resolve_output_path(cache_dir: &Path, output_path: Option<&str>) -> Option<PathBuf> {
+    output_path
+        .filter(|p| !p.is_empty())
+        .map(Path::new)
+        .map(|p| {
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cache_dir.join(p)
+            }
+        })
 }
 
 /// List cached Chi runs, optionally filtered by engine. Merges with agent-native
@@ -1961,7 +2105,7 @@ pub async fn chi_list(
                         artifacts: None,
                         parent_id: None,
                         owner: "agent".to_string(),
-                        terminal_session_id: None,
+                        pid: None,
                         started_at: Some(s.started_at.clone()),
                         ended_at: s.last_message_at.clone(),
                         last_seen_at: s.last_message_at.clone().or(Some(s.started_at.clone())),
@@ -2020,13 +2164,23 @@ pub async fn chi_cancel(
         }
     }
 
-    // A persistent run lives in a detached tmux session, so killing the local
-    // child leaves the work running. `terminal_session_id` is written by the
-    // spawn path for exactly this purpose; without this the cancel was
-    // cosmetic for persistent runs.
-    if let Some(session_name) = row.terminal_session_id.as_deref() {
-        if multiplexer::session_alive(session_name) {
-            multiplexer::kill_tmux_session(session_name);
+    // A persistent run is a detached chi-runner with no local child handle,
+    // so the kill goes to its recorded pid — its whole process group, so the
+    // engine it spawned goes too. Only when the probe says the pid is still
+    // *our* runner: a dead or reused pid is never signalled. The sweep is
+    // held off this run meanwhile so it can't record the kill as a `failed`.
+    let _cancelling = CancellingGuard::hold(&run_id);
+    if let Some(pid) = row.pid.and_then(|p| u32::try_from(p).ok()) {
+        match chi_runner::probe_runner(pid) {
+            chi_runner::PidProbe::Ours => {
+                chi_runner::kill_process_group(pid, chi_runner::CANCEL_GRACE)
+                    .await
+                    .map_err(|e| format!("kill chi-runner: {e}"))?;
+            }
+            other => log::info!(
+                target: "ikenga::chi",
+                "chi run {run_id}: not signalling pid {pid} ({other:?})"
+            ),
         }
     }
 
@@ -2039,6 +2193,184 @@ pub async fn chi_cancel(
         output_truncated: None,
         error: None,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Detached-run reconciliation (WP-18b, G-88)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Sweep cadence. Same order of magnitude as the seat store's queue poll; the
+/// query is one scan of a small table.
+const DETACHED_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+static SWEEP_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Runs `chi_cancel` is killing right now. The sweep skips them: a runner
+/// seen dead mid-cancel is a cancel, not a failure.
+static CANCELLING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+struct CancellingGuard(String);
+
+impl CancellingGuard {
+    fn hold(run_id: &str) -> Self {
+        if let Ok(mut ids) = CANCELLING.lock() {
+            ids.push(run_id.to_string());
+        }
+        Self(run_id.to_string())
+    }
+
+    fn contains(run_id: &str) -> bool {
+        CANCELLING
+            .lock()
+            .map(|ids| ids.iter().any(|id| id == run_id))
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for CancellingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = CANCELLING.lock() {
+            if let Some(i) = ids.iter().position(|id| *id == self.0) {
+                ids.swap_remove(i);
+            }
+        }
+    }
+}
+
+/// What a detached run looks like from outside: the liveness decision and
+/// the engine session id chi-runner recorded, if any.
+#[derive(Debug)]
+struct DetachedObservation {
+    liveness: RunLiveness,
+    external_id: Option<String>,
+}
+
+fn pid_alive(pid: i64, probe: &(dyn Fn(u32) -> chi_runner::PidProbe + Sync)) -> bool {
+    u32::try_from(pid)
+        .map(|p| probe(p).alive())
+        .unwrap_or(false)
+}
+
+/// Probe `pid`, *then* read the status file — the order the liveness rule
+/// depends on (`chi_runner::decide_liveness`).
+async fn observe_detached(
+    pid: i64,
+    output_path: Option<&Path>,
+    probe: &(dyn Fn(u32) -> chi_runner::PidProbe + Sync),
+) -> DetachedObservation {
+    let alive = pid_alive(pid, probe);
+    let file = match output_path {
+        Some(path) => read_output_file(path).await,
+        None => None,
+    };
+    let liveness = chi_runner::decide_liveness(
+        alive,
+        file.as_ref().and_then(|f| f.status.as_deref()),
+        file.as_ref().and_then(|f| f.error.as_deref()),
+    );
+    DetachedObservation {
+        liveness,
+        external_id: file.and_then(|f| f.external_id).filter(|id| !id.is_empty()),
+    }
+}
+
+/// Fold an observation into the row: record a newly seen engine session id,
+/// and finish a terminal run through the transition-guarded
+/// `cache_update_done_if_live` (which produces the WP-40 notification).
+/// Returns whether this call finished the run.
+async fn apply_detached(
+    db: &PaDb,
+    run_id: &str,
+    row_external_id: Option<&str>,
+    seen: DetachedObservation,
+) -> Result<bool, String> {
+    if let Some(ext) = seen.external_id.as_deref() {
+        if row_external_id != Some(ext) {
+            cache_update_external_id(db, run_id, ext).await?;
+        }
+    }
+    match seen.liveness {
+        RunLiveness::Running => Ok(false),
+        RunLiveness::Terminal { status, error } => {
+            let finished = cache_update_done_if_live(db, run_id, status, error.as_deref()).await?;
+            if finished {
+                log::info!(
+                    target: "ikenga::chi",
+                    "chi run {run_id}: detached run reconciled as {status}"
+                );
+            }
+            Ok(finished)
+        }
+    }
+}
+
+/// G-88: every `queued` / `running` row with a detached runner pid gets the
+/// liveness decision applied; a finished or vanished runner moves the row to
+/// its terminal status exactly once. Returns how many runs it finished.
+async fn reconcile_detached_runs_with(
+    db: &PaDb,
+    cache_dir: &Path,
+    probe: &(dyn Fn(u32) -> chi_runner::PidProbe + Sync),
+) -> Result<usize, String> {
+    let pool = db.ensure_pool().await?;
+    let rows = sqlx::query(
+        "SELECT run_id, pid, output_path, external_id FROM chi_cache
+         WHERE pid IS NOT NULL AND status IN ('queued', 'running')",
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("chi_cache detached runs: {e}"))?;
+
+    let mut finished = 0;
+    for r in rows {
+        let run_id: String = r.get("run_id");
+        if CancellingGuard::contains(&run_id) {
+            continue;
+        }
+        let pid: i64 = r.get("pid");
+        let output_path: Option<String> = r.get("output_path");
+        let external_id: Option<String> = r.get("external_id");
+        let path = resolve_output_path(cache_dir, output_path.as_deref());
+        let seen = observe_detached(pid, path.as_deref(), probe).await;
+        match apply_detached(db, &run_id, external_id.as_deref(), seen).await {
+            Ok(true) => finished += 1,
+            Ok(false) => {}
+            Err(e) => log::warn!(target: "ikenga::chi", "chi run {run_id}: reconcile: {e}"),
+        }
+    }
+    Ok(finished)
+}
+
+/// [`reconcile_detached_runs_with`] against the app's db, cache dir and the
+/// real pid probe.
+pub(crate) async fn reconcile_detached_runs(app: &AppHandle) -> Result<usize, String> {
+    let db = app
+        .try_state::<Arc<PaDb>>()
+        .map(|s| s.inner().clone())
+        .ok_or("PaDb is not managed")?;
+    let cache_dir = app
+        .try_state::<ChiCache>()
+        .map(|s| s.cache_dir())
+        .ok_or("ChiCache is not managed")?;
+    reconcile_detached_runs_with(&db, &cache_dir, &chi_runner::probe_runner).await
+}
+
+/// Start the detached-run sweep: once now (boot — runs that finished or died
+/// while the app was down), then every [`DETACHED_SWEEP_EVERY`]. Idempotent;
+/// called from `iyke::start` next to the seat store's own boot hook.
+pub(crate) fn install_detached_reconciler(app: &AppHandle) {
+    if SWEEP_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Err(e) = reconcile_detached_runs(&app).await {
+                log::warn!(target: "ikenga::chi", "detached run sweep: {e}");
+            }
+            tokio::time::sleep(DETACHED_SWEEP_EVERY).await;
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2568,5 +2900,309 @@ mod tests {
         assert_eq!(file.output.as_deref(), Some("partial"));
         assert!(file.error.is_none());
         std::fs::remove_file(path).ok();
+    }
+
+    // ── WP-18b: detached chi-runner runs ────────────────────────────────
+
+    /// chi-runner's status file parses with its `status` / `external_id`; an
+    /// in-process file still parses; a half-written one is "no info".
+    #[test]
+    fn output_file_parse_reads_runner_fields_and_tolerates_partial_writes() {
+        let runner = parse_output_file(
+            r#"{"output":"hi","error":null,"done_at":"2026-09-27T10:00:00Z","status":"done","external_id":"sess-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(runner.status.as_deref(), Some("done"));
+        assert_eq!(runner.external_id.as_deref(), Some("sess-1"));
+        assert_eq!(runner.output.as_deref(), Some("hi"));
+
+        let in_process = parse_output_file(r#"{"output":"x","done_at":"t"}"#).unwrap();
+        assert_eq!(in_process.status, None);
+        assert_eq!(in_process.external_id, None);
+
+        for partial in [
+            "",
+            "{",
+            r#"{"output":"hel"#,
+            r#"{"status":"do"#,
+            r#"{"status":"done","#,
+        ] {
+            assert!(
+                parse_output_file(partial).is_none(),
+                "{partial:?} must be no-info"
+            );
+        }
+    }
+
+    /// Insert a `running` detached row with `pid`, and (optionally) its
+    /// status file with `contents`.
+    async fn detached_row(
+        db: &PaDb,
+        dir: &Path,
+        run_id: &str,
+        pid: Option<i64>,
+        contents: Option<&str>,
+    ) {
+        let output_path = dir.join(format!("{run_id}.json"));
+        let opts = ChiRunOpts {
+            engine_id: "claude-code".into(),
+            prompt: format!("brief {run_id}"),
+            cwd: Some("/tmp/work".into()),
+            model: None,
+            mode: None,
+            timeout_seconds: None,
+            parent_id: None,
+            resume_session_id: None,
+            persistent: true,
+        };
+        cache_insert(db, run_id, &opts, &output_path, "cli")
+            .await
+            .unwrap();
+        match pid {
+            Some(pid) => cache_mark_detached(db, run_id, pid as u32).await.unwrap(),
+            None => cache_update_status(db, run_id, "running", None)
+                .await
+                .unwrap(),
+        }
+        if let Some(contents) = contents {
+            std::fs::write(&output_path, contents).unwrap();
+        }
+    }
+
+    /// G-88: every branch of the sweep, and each finished run notified once.
+    #[tokio::test]
+    async fn reconcile_detached_runs_finishes_each_run_once_and_notifies_once() {
+        use crate::commands::chi_runner::PidProbe;
+        use crate::notifications::{self, ListQuery, NotificationKind};
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        detached_row(
+            &db,
+            dir,
+            "done",
+            Some(1001),
+            Some(r#"{"output":"ok","status":"done","external_id":"sess-done"}"#),
+        )
+        .await;
+        detached_row(
+            &db,
+            dir,
+            "timed-out",
+            Some(1002),
+            Some(r#"{"status":"timed_out","error":"timed out after 5s"}"#),
+        )
+        .await;
+        detached_row(
+            &db,
+            dir,
+            "crashed",
+            Some(1003),
+            Some(r#"{"status":"running"}"#),
+        )
+        .await;
+        detached_row(
+            &db,
+            dir,
+            "crashed-partial",
+            Some(1004),
+            Some(r#"{"status":"do"#),
+        )
+        .await;
+        detached_row(
+            &db,
+            dir,
+            "reused-pid",
+            Some(1005),
+            Some(r#"{"status":"running"}"#),
+        )
+        .await;
+        detached_row(
+            &db,
+            dir,
+            "alive",
+            Some(1006),
+            Some(r#"{"status":"running","external_id":"sess-alive"}"#),
+        )
+        .await;
+        detached_row(&db, dir, "alive-no-file", Some(1007), None).await;
+        detached_row(&db, dir, "alive-partial", Some(1008), Some(r#"{"outp"#)).await;
+        detached_row(&db, dir, "in-process", None, None).await;
+        detached_row(&db, dir, "being-cancelled", Some(1009), None).await;
+
+        let probe = |pid: u32| match pid {
+            1005 => PidProbe::Foreign,
+            1006 | 1007 => PidProbe::Ours,
+            1008 => PidProbe::Unverified,
+            _ => PidProbe::Dead,
+        };
+        let guard = CancellingGuard::hold("being-cancelled");
+
+        assert_eq!(
+            reconcile_detached_runs_with(&db, dir, &probe)
+                .await
+                .unwrap(),
+            5
+        );
+        // Idempotent: nothing left to transition, nothing re-notified.
+        assert_eq!(
+            reconcile_detached_runs_with(&db, dir, &probe)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let row = |id: &'static str| {
+            let db = &db;
+            async move { cache_get(db, id).await.unwrap().unwrap() }
+        };
+        let done = row("done").await;
+        assert_eq!(
+            (done.status.as_str(), done.error.as_deref()),
+            ("done", None)
+        );
+        assert_eq!(done.external_id.as_deref(), Some("sess-done"));
+        assert!(done.ended_at.is_some());
+        let timed_out = row("timed-out").await;
+        assert_eq!(timed_out.status, "failed");
+        assert_eq!(timed_out.error.as_deref(), Some("timed out after 5s"));
+        for id in ["crashed", "crashed-partial", "reused-pid"] {
+            let r = row(id).await;
+            assert_eq!(r.status, "failed", "{id}");
+            assert_eq!(
+                r.error.as_deref(),
+                Some(chi_runner::RUNNER_EXITED_ERROR),
+                "{id}"
+            );
+        }
+        for id in [
+            "alive",
+            "alive-no-file",
+            "alive-partial",
+            "in-process",
+            "being-cancelled",
+        ] {
+            assert_eq!(row(id).await.status, "running", "{id}");
+        }
+        // A live run's engine session id is picked up before it finishes.
+        assert_eq!(
+            row("alive").await.external_id.as_deref(),
+            Some("sess-alive")
+        );
+
+        // Released: the next sweep may settle it.
+        drop(guard);
+        assert_eq!(
+            reconcile_detached_runs_with(&db, dir, &probe)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let pool = db.ensure_pool().await.unwrap();
+        let rows = notifications::list(&pool, &ListQuery::default())
+            .await
+            .unwrap();
+        let for_run = |id: &str| {
+            rows.iter()
+                .filter(|n| n.action.as_ref().and_then(|a| a["runId"].as_str()) == Some(id))
+                .collect::<Vec<_>>()
+        };
+        let finished = for_run("done");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].kind, NotificationKind::RunFinished);
+        assert_eq!(finished[0].count, 1, "notified exactly once");
+        for id in [
+            "timed-out",
+            "crashed",
+            "crashed-partial",
+            "reused-pid",
+            "being-cancelled",
+        ] {
+            let n = for_run(id);
+            assert_eq!(n.len(), 1, "{id}");
+            assert_eq!(n[0].kind, NotificationKind::RunFailed, "{id}");
+            assert_eq!(n[0].count, 1, "{id} notified exactly once");
+        }
+        for id in ["alive", "alive-no-file", "alive-partial", "in-process"] {
+            assert!(for_run(id).is_empty(), "{id}");
+        }
+    }
+
+    /// End-to-end against a real `chi-runner` (built from iyke-cli): spawn
+    /// detached, record the pid, let the runner fail an unknown engine, and
+    /// reconcile. Ignored by default — needs the binary on PATH:
+    /// `PATH=<dir with chi-runner>:$PATH cargo test --lib detached_chi_runner_smoke -- --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn detached_chi_runner_smoke() {
+        let db = Arc::new(test_db().await);
+        let cache =
+            ChiCache::new(std::env::temp_dir().join(format!("chi-smoke-{}", uuid::Uuid::new_v4())));
+        let runtime = Arc::new(ChiRuntime::new());
+        assert!(
+            chi_runner::resolve_runner_path().is_some(),
+            "chi-runner not on PATH"
+        );
+        let opts = ChiRunOpts {
+            engine_id: "not-a-runner-engine".into(),
+            prompt: "hello".into(),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            model: None,
+            mode: None,
+            timeout_seconds: Some(30),
+            parent_id: None,
+            resume_session_id: None,
+            persistent: true,
+        };
+        let res = spawn_chi_run(db.clone(), &cache, &runtime, None, opts, "cli")
+            .await
+            .unwrap();
+        let row = cache_get(&db, &res.run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "running");
+        assert!(row.pid.is_some(), "detached run records its pid");
+
+        let mut finished = 0;
+        for _ in 0..100 {
+            finished +=
+                reconcile_detached_runs_with(&db, &cache.cache_dir(), &chi_runner::probe_runner)
+                    .await
+                    .unwrap();
+            if finished > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(finished, 1);
+        let row = cache_get(&db, &res.run_id).await.unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(
+            row.error.as_deref(),
+            Some("engine not supported by chi-runner: not-a-runner-engine")
+        );
+    }
+
+    /// The transition guard: a run already finished elsewhere (a cancel, the
+    /// in-process path) is neither overwritten nor re-notified by the sweep.
+    #[tokio::test]
+    async fn guarded_finish_leaves_an_already_finished_run_alone() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        detached_row(&db, tmp.path(), "cancelled", Some(2001), None).await;
+        cache_update_status(&db, "cancelled", "cancelled", None)
+            .await
+            .unwrap();
+
+        assert!(
+            !cache_update_done_if_live(&db, "cancelled", "failed", Some("x"))
+                .await
+                .unwrap()
+        );
+        let r = cache_get(&db, "cancelled").await.unwrap().unwrap();
+        assert_eq!(r.status, "cancelled");
+        assert_eq!(r.error, None);
+        assert_eq!(r.pid, Some(2001));
     }
 }

@@ -71,7 +71,7 @@ pub fn default_shell_argv() -> Vec<String> {
 /// taskkill, wsl.exe, ...) spawned from this GUI process from popping up its
 /// own visible console window. No effect on macOS/Linux.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Windows-only: starts the child as the root of a new process group, the
 /// same isolation `std::os::unix::process::CommandExt::process_group(0)`
@@ -79,6 +79,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// exiting/reloading and doesn't share the parent's Ctrl+C group).
 #[cfg(windows)]
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// Windows-only: lets the child leave the Job Object the parent runs in, so a
+/// job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (some launchers, terminals and
+/// CI runners wrap the app in one) doesn't take a detached child down with it.
+/// Spawning with it fails with `ERROR_ACCESS_DENIED` when the job does not
+/// allow breakaway; callers retry without it (see the executor's detach path).
+#[cfg(windows)]
+pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+/// Windows: the flags a detached child is created with — its own process group
+/// (the `process_group(0)` analogue) and no console window. One definition so
+/// the daemon launch (`pty::daemon_client`) and the executor's `detached` knob
+/// can't drift apart.
+#[cfg(windows)]
+pub const DETACHED_PROCESS_FLAGS: u32 = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
 
 /// Shared helper so every spawn site opts out of the console-flash consistently,
 /// instead of each callsite re-deriving the flag (or forgetting it). Implemented

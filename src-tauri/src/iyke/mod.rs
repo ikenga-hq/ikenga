@@ -224,6 +224,9 @@ pub async fn start(
     // listener and its busy-run queue poller. Installed here, at boot, so the
     // agent-liveness map sees every `SessionStart` from the first terminal.
     seats::install(&app_handle);
+    // WP-18b (G-88): detached chi-runner runs finish out of process; sweep
+    // their pid + status file into `chi_cache` at boot and on a cadence.
+    crate::commands::chi::install_detached_reconciler(&app_handle);
 
     let (url, port, shutdown) = server::serve(
         state.clone(),
