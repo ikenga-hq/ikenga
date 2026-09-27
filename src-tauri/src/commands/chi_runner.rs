@@ -219,8 +219,16 @@ fn identify(pid: i32, needle: &str) -> PidProbe {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => PidProbe::Unverified,
         // Gone between the two reads.
         Err(_) => PidProbe::Dead,
-        // A zombie's cmdline is empty: it has exited, only the reap is left.
-        Ok(bytes) if bytes.is_empty() => PidProbe::Dead,
+        // An empty cmdline means one of two things: a zombie (it has exited,
+        // only the reap is left) or a process caught mid-`execve` — the vfork
+        // parent resumes before the new image's argv is mapped, so a probe
+        // right after spawn can land here. Only the state tells them apart;
+        // a live process we can't name yet is never signalled (not `Ours`),
+        // but it must not read as dead either.
+        Ok(bytes) if bytes.is_empty() => match proc_state(pid) {
+            Some('Z') | Some('X') | None => PidProbe::Dead,
+            Some(_) => PidProbe::Unverified,
+        },
         Ok(bytes) => {
             if String::from_utf8_lossy(&bytes).contains(needle) {
                 PidProbe::Ours
@@ -229,6 +237,14 @@ fn identify(pid: i32, needle: &str) -> PidProbe {
             }
         }
     }
+}
+
+/// The one-letter state from `/proc/<pid>/stat` (`R`, `S`, `Z`, …).
+#[cfg(target_os = "linux")]
+fn proc_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.trim_start().chars().next()
 }
 
 #[cfg(target_os = "macos")]
@@ -459,11 +475,49 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        assert_eq!(probe_pid(pid, "sleep"), PidProbe::Ours);
+        // Right after spawn the child can still be mid-`execve` (argv not
+        // mapped yet), which reads as `Unverified` — never `Dead`.
+        let mut first = probe_pid(pid, "sleep");
+        for _ in 0..100 {
+            if first != PidProbe::Unverified {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            first = probe_pid(pid, "sleep");
+        }
+        assert_eq!(first, PidProbe::Ours);
         assert_eq!(probe_pid(pid, RUNNER_BINARY), PidProbe::Foreign);
         child.kill().await.unwrap();
-        // Reaped by `kill()` (it waits), so the pid is gone.
-        assert_eq!(probe_pid(pid, "sleep"), PidProbe::Dead);
+        // Reaped by `kill()` (it waits), so the pid is gone — unless the
+        // kernel has already handed it to another process. With a small
+        // `pid_max` (32768 in CI containers) and a parallel test suite that
+        // spawns thousands of short-lived children, that happens; a reused
+        // pid is exactly what this probe exists to tell apart, so only
+        // assert `Dead` when nothing holds the pid on either side of the probe.
+        let exists = || unsafe { libc::kill(pid as i32, 0) } == 0;
+        let before = exists();
+        let after_reap = probe_pid(pid, "sleep");
+        if !before && !exists() {
+            assert_eq!(after_reap, PidProbe::Dead);
+        }
+    }
+
+    /// An exited-but-unreaped child (a zombie) reads as `Dead`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_reads_a_zombie_as_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Not reaped yet: wait for it to become a zombie.
+        for _ in 0..200 {
+            if proc_state(pid as i32) == Some('Z') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(proc_state(pid as i32), Some('Z'));
+        assert_eq!(probe_pid(pid, "true"), PidProbe::Dead);
+        child.wait().unwrap();
     }
 
     /// Pid of the first line a child prints.
@@ -479,20 +533,48 @@ mod tests {
         line.trim().parse().unwrap()
     }
 
+    /// A process's kernel start time (`/proc/<pid>/stat` field 22), so a
+    /// later check can tell the same process from a recycled pid — `pid_max`
+    /// is 32768 in CI containers and this suite spawns thousands of children.
     #[cfg(unix)]
-    fn gone_or_zombie(pid: i32) -> bool {
+    fn start_time(pid: i32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, rest) = stat.rsplit_once(')')?;
+            // `rest` starts at field 3 (state), so field 22 is index 19.
+            rest.split_whitespace().nth(19)?.parse().ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+
+    /// Gone, a zombie, or the pid now belongs to a different process.
+    #[cfg(unix)]
+    fn gone_or_zombie(pid: i32, started: Option<u64>) -> bool {
         #[cfg(target_os = "linux")]
         {
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                 Err(_) => true,
-                Ok(stat) => stat
-                    .rsplit_once(')')
-                    .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-                    .unwrap_or(false),
+                Ok(stat) => {
+                    let Some((_, rest)) = stat.rsplit_once(')') else {
+                        return false;
+                    };
+                    let rest = rest.trim_start();
+                    if rest.starts_with('Z') {
+                        return true;
+                    }
+                    let now = rest.split_whitespace().nth(19).and_then(|t| t.parse().ok());
+                    started.is_some() && now != started
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = started;
             unsafe { libc::kill(pid, 0) != 0 }
         }
     }
@@ -536,16 +618,17 @@ mod tests {
         let leader = child.id().unwrap() as i32;
         let grandchild = first_line_pid(&mut child).await;
         assert_eq!(unsafe { libc::getpgid(grandchild) }, leader);
+        let (leader_start, grandchild_start) = (start_time(leader), start_time(grandchild));
 
         kill_process_group(leader as u32, CANCEL_GRACE)
             .await
             .unwrap();
         let _ = child.wait().await;
         assert!(
-            eventually(|| gone_or_zombie(grandchild)).await,
+            eventually(|| gone_or_zombie(grandchild, grandchild_start)).await,
             "grandchild survived"
         );
-        assert!(gone_or_zombie(leader), "leader survived");
+        assert!(gone_or_zombie(leader, leader_start), "leader survived");
     }
 
     /// A group that ignores SIGTERM is SIGKILLed once the grace runs out.
@@ -555,16 +638,17 @@ mod tests {
         let mut child = detached_sh("trap '' TERM; sleep 30 & echo $!; wait");
         let leader = child.id().unwrap() as i32;
         let grandchild = first_line_pid(&mut child).await;
+        let (leader_start, grandchild_start) = (start_time(leader), start_time(grandchild));
 
         kill_process_group(leader as u32, std::time::Duration::from_millis(300))
             .await
             .unwrap();
         let _ = child.wait().await;
         assert!(
-            eventually(|| gone_or_zombie(grandchild)).await,
+            eventually(|| gone_or_zombie(grandchild, grandchild_start)).await,
             "grandchild survived"
         );
-        assert!(gone_or_zombie(leader), "leader survived");
+        assert!(gone_or_zombie(leader, leader_start), "leader survived");
     }
 
     #[cfg(unix)]
