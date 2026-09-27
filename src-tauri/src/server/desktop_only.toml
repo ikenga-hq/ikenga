@@ -1025,9 +1025,17 @@ reason = "manager.unregister() drops a mount-registry entry; no spawn."
 tag = "desktop-only-forever"
 reason = "Closes a native OS window by label."
 
+[window_join_surface]
+tag = "desktop-only-forever"
+reason = "Adds a surface as a tab of the open native Window 2 (WindowRegistry); returns its label, or null so the caller spawns one."
+
 [window_list]
 tag = "desktop-only-forever"
 reason = "Lists live native OS windows, reconciled against the OS."
+
+[window_remove_surface]
+tag = "desktop-only-forever"
+reason = "Takes a surface out of a native OS window's WindowRegistry entry, closing the window when it empties."
 
 [window_spawn]
 tag = "desktop-only-forever"

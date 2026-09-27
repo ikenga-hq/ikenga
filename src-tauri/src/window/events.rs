@@ -57,6 +57,13 @@ pub mod topics {
     // Emitted on every window's `Focused(true/false)` transition (main +
     // detached) so the FE cross-window bus (WP-05/WP-06) can track focus.
     pub const FOCUS_CHANGED: &str = "window://focus-changed";
+    // WP-69 (G-SEATS §4.4): a live detached window's `surface_set` grew (a
+    // Pop out joined Window 2) or shrank (Move back to main window). Emitted
+    // to that window and to `main` only (`registry::emit_surfaces_changed`),
+    // payload `registry::SurfacesChanged`. HOST-ONLY for now: not yet in
+    // `@ikenga/contract`'s `WINDOW_TOPICS`; the FE names it in
+    // `src/lib/window/surfaces-topic.ts` until the contract mirrors it.
+    pub const SURFACES_CHANGED: &str = "window://surfaces-changed";
 }
 
 /// Channels that MUST be window-targeted (`emit_to`) rather than broadcast.

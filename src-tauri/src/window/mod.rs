@@ -6,7 +6,9 @@
 //! TS Zod schema in `@ikenga/contract` at `src/window.ts`.
 //!
 //! The window registry + spawn/close/list lifecycle that consumes this contract
-//! lands in WP-03.
+//! lands in WP-03. WP-69 adds last-focus tracking ("Window 2", G-SEATS P-7)
+//! and add/remove-surface on a live window, so a detached window holds
+//! several surfaces as tabs.
 
 pub mod descriptor;
 pub mod events;
@@ -24,5 +26,5 @@ pub use events::{
 #[allow(unused_imports)]
 pub use registry::{
     emit_focus_changed, emit_to_focused, emit_to_label, focused_listener_window_label,
-    WindowRegistry,
+    pick_window_two, SurfacesChanged, WindowRegistry,
 };

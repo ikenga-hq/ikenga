@@ -422,6 +422,56 @@ describe('the other §10.2 additions', () => {
 	});
 });
 
+// ─── ⌘2 and ⌘2 again: `rail.chi` then `chi.board` (WP-68, G-SEATS §8) ───────
+
+describe('⌘2 again opens the seat board (DEC-67, `chi.board`)', () => {
+	for (const platform of PLATFORMS) {
+		it(`outside an input ⌘2 is rail.chi; inside the dispatch input it is chi.board (${platform})`, () => {
+			const outside = harness({ platform });
+			const a = outside.press(mod(platform, '2'));
+			expect(outside.fired).toEqual(['rail.chi']);
+			expect(a.event.defaultPrevented).toBe(true);
+
+			// The dispatch input is itself an input: `rail.chi`'s `!inputFocus`
+			// is false there, `chi.board`'s `dispatchFocus` true. A frame
+			// command, not a hosted one — the dispatcher fires it.
+			const inDispatch = harness({ platform, context: { dispatchFocus: true, inputFocus: true } });
+			const b = inDispatch.press(mod(platform, '2'));
+			expect(inDispatch.fired).toEqual(['chi.board']);
+			expect(b.handled).toBe(true);
+			expect(b.event.defaultPrevented).toBe(true);
+			expect(inDispatch.dispatcher.hostedWinner(b.event, ctx({ dispatchFocus: true, inputFocus: true }), 'dispatch')).toBeNull();
+		});
+
+		it(`⌘2 in any other text field does nothing (${platform})`, () => {
+			const h = harness({ platform, context: { inputFocus: true } });
+			const { handled, event } = h.press(mod(platform, '2'));
+			expect(h.fired).toEqual([]);
+			expect(handled).toBe(false);
+			expect(event.defaultPrevented).toBe(false);
+		});
+	}
+
+	it('Windows/Linux: Alt+2 is still pane focus, never the board', () => {
+		const h = harness({ platform: 'other', context: { dispatchFocus: true, inputFocus: true } });
+		h.press({ key: '2', altKey: true });
+		expect(h.fired).toEqual(['pane.focus-2']);
+	});
+});
+
+describe('Lock now (`people.lock-now`, D-05 ⌘⇧L)', () => {
+	for (const platform of PLATFORMS) {
+		it(`fires outside a text field, never while typing (${platform})`, () => {
+			const h = harness({ platform });
+			h.press(mod(platform, 'L', { shiftKey: true }));
+			expect(h.fired).toEqual(['people.lock-now']);
+			const typing = harness({ platform, context: { inputFocus: true } });
+			typing.press(mod(platform, 'L', { shiftKey: true }));
+			expect(typing.fired).toEqual([]);
+		});
+	}
+});
+
 // ─── Companion Enter keys: hosted by the dispatch input (A-2, §4.6) ──────────
 
 describe('Companion dispatch keys (hosted, `dispatchFocus`)', () => {

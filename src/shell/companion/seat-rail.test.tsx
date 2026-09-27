@@ -19,6 +19,11 @@ const m = vi.hoisted(() => ({
 	seatsCreate: vi.fn(),
 	seatsMove: vi.fn(),
 	spawnWindow: vi.fn(async () => 'w2'),
+	// WP-69: Pop out first tries to join Window 2; `null` = none open.
+	windowJoinSurface: vi.fn(async (): Promise<string | null> => null),
+	windowRemoveSurface: vi.fn(async () => [] as string[]),
+	chiList: vi.fn(async (): Promise<unknown[]> => []),
+	attachRunTerminal: vi.fn(async () => 'term-att'),
 }));
 
 vi.mock('@/lib/transport', async (orig) => ({
@@ -38,12 +43,20 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	seatsCreate: m.seatsCreate,
 	seatsMove: m.seatsMove,
 	spawnWindow: m.spawnWindow,
+	windowJoinSurface: m.windowJoinSurface,
+	windowRemoveSurface: m.windowRemoveSurface,
 	listWindows: vi.fn(async () => []),
-	chiList: vi.fn(async () => []),
+	chiList: m.chiList,
 	detectAgents: vi.fn(async () => []),
 	ptyTerminalList: vi.fn(async () => []),
 	settingsGet: vi.fn(async () => null),
 	settingsSet: vi.fn(async () => {}),
+}));
+// WP-69: the tmux attach spawns a real PTY; stand it in (the hooks and the
+// cache reads stay real).
+vi.mock('@/terminal/attach-run', async (orig) => ({
+	...(await orig<typeof import('@/terminal/attach-run')>()),
+	attachRunTerminal: m.attachRunTerminal,
 }));
 vi.mock('@/shell/panes/pane-views', () => ({
 	viewLabel: (v: { kind: string; sessionId?: string; path?: string }) =>
@@ -51,12 +64,16 @@ vi.mock('@/shell/panes/pane-views', () => ({
 }));
 
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { seatsQueryKey } from '@/lib/queries/seats';
+import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { popOutSurface } from '@/lib/window/window-two';
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useTerminalStore } from '@/terminal/session-store';
 import { Companion } from './companion';
 import { __resetCompanionTimersForTests, useCompanionStore } from './companion-store';
 import { __resetSeatUndoForTests, clearSeat, removeSeat, useSeatUi } from './seat-actions';
+import { handleMakeTargetRequest, handleSurfacesReturned } from './seat-menu';
 import { useSeatNotice } from './seat-notice';
 import { __resetSessionNumbersForTests, sessionNumber } from './seat-sessions';
 
@@ -167,7 +184,13 @@ beforeEach(() => {
 	m.seatsGet.mockReset();
 	m.seatsResolve.mockClear();
 	m.spawnWindow.mockClear();
+	m.windowJoinSurface.mockReset().mockResolvedValue(null);
+	m.windowRemoveSurface.mockClear();
+	m.chiList.mockReset().mockResolvedValue([]);
+	m.attachRunTerminal.mockClear();
 	useSeatNotice.setState({ notice: null });
+	// A previous test's Pop out leaves its surface marked detached.
+	useDetachedSurfaces.setState({ surfaceToWindow: {} });
 	useCompanionStore.setState({
 		state: 'collapsed',
 		tabs: [],
@@ -352,17 +375,74 @@ describe('the seat menu', () => {
 		}
 	});
 
-	it('Pop out calls today’s spawnWindow with the seat’s terminal (G-97)', async () => {
+	it('Pop out with no Window 2 spawns one with the seat’s terminal (DEC-69d)', async () => {
 		await mountRail();
 		fireEvent.contextMenu(screen.getByRole('option', { name: /^@lead/ }));
 		fireEvent.click(screen.getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() => expect(m.windowJoinSurface).toHaveBeenCalledWith('terminal:pty-term-3', PROJECT));
 		await waitFor(() =>
 			expect(m.spawnWindow).toHaveBeenCalledWith(
 				expect.objectContaining({ kind: 'single-surface', surface_set: ['terminal:pty-term-3'] })
 			)
 		);
+		expect((m.spawnWindow.mock.calls[0] as unknown[])[0]).toMatchObject({ label: expect.stringMatching(/^detached-/) });
 		await waitFor(() =>
 			expect(useSeatNotice.getState().notice?.message).toBe('lead moved to Window 2 — its address is unchanged')
+		);
+	});
+
+	it('Pop out with Window 2 open joins it and spawns nothing (DEC-69d)', async () => {
+		m.windowJoinSurface.mockResolvedValue('detached-terminal-w2');
+		m.seatsMove.mockClear();
+		m.seatsClear.mockClear();
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@lead/ }));
+		fireEvent.click(screen.getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() =>
+			expect(useSeatNotice.getState().notice?.message).toBe('lead moved to Window 2 — its address is unchanged')
+		);
+		expect(m.spawnWindow).not.toHaveBeenCalled();
+		// A window operation only: no seat command ran (§4.4).
+		expect(m.seatsMove).not.toHaveBeenCalled();
+		expect(m.seatsClear).not.toHaveBeenCalled();
+	});
+
+	it('a one-off run seat: Open in pane and Pop out say "headless run — nothing to show"', async () => {
+		// Started, no tmux session: one-off. (A run missing from the lookup, or
+		// still queued, is not called headless.)
+		m.chiList.mockResolvedValue([{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui' }]);
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
+		const menu = screen.getByRole('menu');
+		await waitFor(() =>
+			expect(within(menu).getByRole('menuitem', { name: /^Pop out/ }).getAttribute('title')).toBe(
+				'Headless run — nothing to show'
+			)
+		);
+		for (const name of [/^Open in pane/, /^Pop out/]) {
+			expect((within(menu).getByRole('menuitem', { name }) as HTMLButtonElement).disabled).toBe(true);
+		}
+	});
+
+	it('a persistent run seat pops out a terminal attached to its tmux session (§4.4)', async () => {
+		m.chiList.mockResolvedValue([
+			{ run_id: 'run-np', engine_id: 'claude-code', status: 'running', owner: 'ui', terminal_session_id: 'run-np' },
+		]);
+		useTerminalStore.setState((st) => ({ tabs: [...st.tabs, tab('term-att', null, 5)] }));
+		await mountRail();
+		fireEvent.contextMenu(screen.getByRole('option', { name: /^@nightly/ }));
+		const menu = screen.getByRole('menu');
+		await waitFor(() =>
+			expect((within(menu).getByRole('menuitem', { name: /^Pop out/ }) as HTMLButtonElement).disabled).toBe(false)
+		);
+		expect((within(menu).getByRole('menuitem', { name: /^Open in pane/ }) as HTMLButtonElement).disabled).toBe(false);
+		fireEvent.click(within(menu).getByRole('menuitem', { name: /^Pop out/ }));
+		await waitFor(() =>
+			expect(m.attachRunTerminal).toHaveBeenCalledWith(expect.objectContaining({ session: 'run-np', cwd: '/w' }))
+		);
+		await waitFor(() => expect(m.windowJoinSurface).toHaveBeenCalledWith('terminal:pty-term-att', PROJECT));
+		await waitFor(() =>
+			expect(useSeatNotice.getState().notice?.message).toBe('nightly moved to Window 2 — its address is unchanged')
 		);
 	});
 
@@ -376,6 +456,59 @@ describe('the seat menu', () => {
 		fireEvent.click(within(dialog).getByRole('button', { name: 'Keep it' }));
 		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 		expect(m.seatsRemove).not.toHaveBeenCalled();
+	});
+});
+
+describe('coming back from Window 2 (D-09 moveBack / closeWin2)', () => {
+	beforeEach(() => {
+		queryClient.setQueryData(seatsQueryKey(PROJECT), roster());
+		useDetachedSurfaces.setState({ surfaceToWindow: {} });
+	});
+
+	function leafTabs(): string[] {
+		const root = usePaneStore.getState().root;
+		return root.type === 'leaf' ? root.tabs.map((t) => (t.kind === 'terminal' ? t.sessionId : t.kind)) : [];
+	}
+
+	it('Move back of a terminal a pane still holds re-shows it there — no second tab', () => {
+		handleSurfacesReturned({ label: 'detached-w2', surfaceIds: ['terminal:pty-term-3'], reason: 'move-back' });
+		expect(leafTabs()).toEqual(['term-3']);
+		expect(usePaneStore.getState().focusedId).toBe('L1');
+		expect(useSeatNotice.getState().notice?.message).toBe(
+			'lead moved to main window · pane 1 of 1 — its address is unchanged'
+		);
+	});
+
+	it('an ordinary pane pop-out closing stays silent and adds nothing', () => {
+		handleSurfacesReturned({ label: 'detached-terminal-x', surfaceIds: ['terminal:pty-term-3'], reason: 'window-closed' });
+		expect(leafTabs()).toEqual(['term-3']);
+		expect(useSeatNotice.getState().notice).toBeNull();
+	});
+
+	it('Window 2 closing re-homes only what no pane holds, and counts what came back', async () => {
+		m.windowJoinSurface.mockResolvedValue('detached-w2');
+		await popOutSurface('terminal:pty-term-4', { projectId: PROJECT });
+		useSeatNotice.setState({ notice: null });
+		handleSurfacesReturned({
+			label: 'detached-w2',
+			surfaceIds: ['terminal:pty-term-3', 'terminal:pty-term-4'],
+			reason: 'window-closed',
+		});
+		expect(leafTabs()).toEqual(['term-3', 'term-4']);
+		expect(useSeatNotice.getState().notice?.message).toBe(
+			'Window 2 closed — 2 panes returned to the main window; addresses unchanged'
+		);
+	});
+
+	it('Window 2 ⋯ → Make dispatch target selects the surface’s seat', () => {
+		handleMakeTargetRequest('terminal:pty-term-3');
+		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
+	});
+
+	it('… or the session itself when it has no seat', () => {
+		handleMakeTargetRequest('terminal:pty-term-4');
+		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'session', session_id: 'term-4' });
 	});
 });
 

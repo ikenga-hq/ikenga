@@ -1,0 +1,681 @@
+/* WP-68 — the /chi seat board (D-09 `designs/seats-board.html`, the block
+   "D-09 board additions" plus the v4 / Ngwa atoms it inherits: vhead, split,
+   listcol, detailcol, dhead, drow, state, pchip, iykeline). Every rule is
+   scoped under `.chi-board`, and only var(--*) tokens are used. The `--on-*`
+   text tokens carry fallbacks, as the rail's do (WP-67 review), for a token
+   build that doesn't define them.
+
+   Layout (D-09 "FORM COMES FROM"): a row is two lines in a normal pane (what
+   you scan / where it lives) and one line in a wide one (a container query
+   on the list column); under 600 px of the board's own width the detail
+   column stacks below the list. */
+
+.chi-board {
+	container-type: inline-size;
+	container-name: board;
+	flex: 1;
+	min-height: 0;
+	height: 100%;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg-base);
+	color: var(--fg);
+}
+
+/* ── head ─────────────────────────────────────────────────────────────── */
+.chi-board .vhead {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	padding: var(--space-2) var(--space-3);
+	border-bottom: 1px solid var(--border);
+	background: var(--bg-surface);
+	flex-wrap: wrap;
+}
+.chi-board .vhead h1 {
+	font-size: var(--text-h4);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	color: var(--fg);
+}
+.chi-board .vhead .note {
+	margin-left: var(--space-1);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+.chi-board .vhead .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+}
+
+/* ── buttons (v4 .btn / .iconbtn) ─────────────────────────────────────── */
+.chi-board .btn {
+	height: 22px;
+	padding: 0 var(--space-3);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-micro);
+	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	border: 1px solid var(--border);
+	background: var(--bg-surface);
+	color: var(--fg-muted);
+	white-space: nowrap;
+}
+.chi-board .btn:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+	border-color: var(--border-strong);
+}
+.chi-board .btn:disabled {
+	opacity: 0.45;
+	cursor: not-allowed;
+}
+.chi-board .btn.primary {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--primary-fg);
+}
+.chi-board .btn.primary:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	border-color: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	color: var(--primary-fg);
+}
+.chi-board .btn.ghost {
+	background: transparent;
+}
+.chi-board .btn svg,
+.chi-board .iconbtn svg {
+	width: 13px;
+	height: 13px;
+	flex: none;
+}
+.chi-board .iconbtn {
+	width: 26px;
+	height: 26px;
+	display: grid;
+	place-items: center;
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+	border: 1px solid transparent;
+}
+.chi-board .iconbtn:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+.chi-board .iconbtn:disabled {
+	color: var(--fg-faint);
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+.chi-board .iconbtn.sm {
+	width: 22px;
+	height: 22px;
+}
+.chi-board .btn:focus-visible,
+.chi-board .iconbtn:focus-visible {
+	outline: 2px solid var(--primary);
+	outline-offset: 1px;
+}
+
+/* ── list + detail ────────────────────────────────────────────────────── */
+.chi-board .split {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: row;
+}
+.chi-board .listcol {
+	container-type: inline-size;
+	container-name: seats;
+	flex: 1 1 0;
+	min-width: 0;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+.chi-board .detailcol {
+	width: 288px;
+	min-width: 0;
+	flex: none;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	border-left: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+.chi-board .seatscroll {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+}
+@container board (max-width: 600px) {
+	.chi-board .split {
+		flex-direction: column;
+	}
+	.chi-board .detailcol {
+		width: auto;
+		flex: 0 0 58%;
+		border-left: 0;
+		border-top: 1px solid var(--border);
+	}
+}
+
+/* A row is two lines in a normal pane, one line in a wide one: line 1 is
+   what you scan, line 2 is where the seat lives. */
+.chi-board .sgrid {
+	display: grid;
+	column-gap: var(--space-2);
+	align-items: center;
+	grid-template-columns: 80px minmax(0, 1fr) 72px 38px 44px 40px 22px;
+	grid-template-areas:
+		"name sess state ctx cost pend act"
+		"eng mnt pad pad pad pad pad";
+}
+.chi-board .sgrid > .c-name {
+	grid-area: name;
+}
+.chi-board .sgrid > .c-eng {
+	grid-area: eng;
+}
+.chi-board .sgrid > .c-sess {
+	grid-area: sess;
+}
+.chi-board .sgrid > .c-state {
+	grid-area: state;
+}
+.chi-board .sgrid > .c-ctx {
+	grid-area: ctx;
+}
+.chi-board .sgrid > .c-cost {
+	grid-area: cost;
+}
+.chi-board .sgrid > .c-pend {
+	grid-area: pend;
+}
+.chi-board .sgrid > .c-pad {
+	grid-area: pad;
+}
+.chi-board .sgrid > .c-mnt {
+	grid-area: mnt;
+}
+.chi-board .sgrid > .c-act {
+	grid-area: act;
+	justify-self: end;
+}
+.chi-board .sgrid > * {
+	min-width: 0;
+}
+.chi-board .shead {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	height: 24px;
+	padding: 0 var(--space-3);
+	background: var(--bg-base);
+	border-bottom: 1px solid var(--border-soft);
+	grid-template-rows: 24px;
+	font-size: var(--text-micro);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+.chi-board .shead > * {
+	font-weight: 400;
+}
+.chi-board .shead .c-eng,
+.chi-board .shead .c-mnt,
+.chi-board .shead .c-pad {
+	display: none;
+}
+.chi-board .shead .num {
+	text-align: right;
+}
+.chi-board .shead .c-pend {
+	overflow: visible;
+	white-space: nowrap;
+}
+.chi-board .srow2 {
+	padding: 6px var(--space-3);
+	row-gap: 3px;
+	border-bottom: 1px solid var(--border-soft);
+	cursor: default;
+}
+.chi-board .srow2:hover {
+	background: var(--bg-surface);
+}
+.chi-board .srow2[aria-selected="true"] {
+	background: var(--tint-bg-active);
+	box-shadow: inset 2px 0 0 var(--primary);
+}
+.chi-board .srow2:focus-visible {
+	outline: 2px solid var(--primary);
+	outline-offset: -2px;
+}
+.chi-board .c-name {
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+}
+.chi-board .c-name .nm {
+	font-family: var(--font-mono);
+	font-size: var(--text-body);
+	font-weight: 500;
+	color: var(--fg);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.chi-board .c-name .nm .at {
+	color: var(--fg-muted);
+	font-weight: 400;
+}
+.chi-board .c-name .none {
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+.chi-board .c-name .tgtico {
+	color: var(--on-live, var(--live));
+	flex: none;
+	width: 12px;
+	height: 12px;
+}
+.chi-board .c-sess {
+	font-size: var(--text-body);
+	color: var(--fg);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.chi-board .dim {
+	color: var(--fg-muted);
+}
+.chi-board .c-eng,
+.chi-board .c-mnt,
+.chi-board .c-pad {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	overflow: hidden;
+	white-space: nowrap;
+}
+.chi-board .c-eng svg,
+.chi-board .c-mnt svg,
+.chi-board .c-pad svg {
+	width: 12px;
+	height: 12px;
+	flex: none;
+	color: var(--fg-muted);
+}
+.chi-board .c-eng .t,
+.chi-board .c-mnt .t,
+.chi-board .c-pad .lt {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
+}
+.chi-board .c-mnt .t.long {
+	display: none;
+}
+.chi-board .c-pad .sc2 {
+	font-family: var(--font-mono);
+	color: var(--fg-muted);
+	flex: none;
+}
+.chi-board .c-pad .lt {
+	color: var(--fg);
+}
+.chi-board .c-pad .n {
+	font-family: var(--font-mono);
+	color: var(--fg-muted);
+	flex: none;
+}
+.chi-board .c-pad .btn {
+	margin-left: auto;
+}
+.chi-board .num {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+	display: block;
+}
+.chi-board .num.dim {
+	color: var(--fg-muted);
+}
+.chi-board .pp {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--on-achievement, var(--achievement));
+}
+.chi-board .pp svg {
+	width: 12px;
+	height: 12px;
+}
+.chi-board .pp.inbox {
+	color: var(--on-info, var(--info));
+}
+.chi-board .pp.plain {
+	color: var(--fg-muted);
+}
+.chi-board .c-pend {
+	display: flex;
+	align-items: center;
+	gap: var(--space-1);
+}
+.chi-board .srow2.vac .c-name .nm {
+	color: var(--fg-muted);
+}
+@container seats (min-width: 880px) {
+	.chi-board .sgrid {
+		grid-template-columns:
+			88px 92px minmax(110px, 0.9fr) 84px 44px 50px 60px minmax(150px, 1.4fr)
+			minmax(150px, 1fr) 24px;
+		grid-template-areas: "name eng sess state ctx cost pend pad mnt act";
+	}
+	.chi-board .shead .c-eng,
+	.chi-board .shead .c-mnt,
+	.chi-board .shead .c-pad {
+		display: block;
+	}
+	.chi-board .c-mnt .t.long {
+		display: block;
+	}
+	.chi-board .c-mnt .t.short {
+		display: none;
+	}
+}
+
+/* the Window 2 chip, and its "moved" highlight (G-93, G-96) */
+.chi-board .w2chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 3px;
+	height: 18px;
+	padding: 0 5px;
+	border-radius: var(--radius-pill);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-strong);
+	white-space: nowrap;
+	min-width: 0;
+}
+.chi-board .w2chip[data-moved="true"] {
+	animation: chi-board-moved 1.6s var(--ease-calm) 2;
+}
+@keyframes chi-board-moved {
+	0%,
+	100% {
+		background: var(--bg-raised);
+	}
+	40% {
+		background: var(--primary-soft);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.chi-board .w2chip[data-moved="true"] {
+		animation: none;
+		background: var(--primary-soft);
+	}
+}
+
+/* ── state words (v4 .state + the board's seat states) ────────────────── */
+.chi-board .state {
+	font-size: var(--text-micro);
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--fg-muted);
+	white-space: nowrap;
+}
+.chi-board .state::before {
+	content: "";
+	width: 6px;
+	height: 6px;
+	border-radius: var(--radius-pill);
+	background: var(--live);
+	display: block;
+	flex: none;
+}
+.chi-board .state.s-live {
+	color: var(--on-live, var(--live));
+}
+.chi-board .state.s-idle::before {
+	background: var(--fg-faint);
+}
+.chi-board .state.s-run::before {
+	background: var(--ember);
+}
+@media (prefers-reduced-motion: no-preference) {
+	.chi-board .state.s-run::before {
+		animation: ikenga-ember-dot-pulse 1.8s var(--ease-calm) infinite;
+	}
+}
+.chi-board .state.s-vacant::before {
+	background: transparent;
+	box-shadow: inset 0 0 0 1.5px var(--fg-muted);
+}
+
+/* ── groups, empty ────────────────────────────────────────────────────── */
+.chi-board .bgroup {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	height: 26px;
+	padding: 0 var(--space-3);
+	margin-top: var(--space-3);
+	border-top: 1px solid var(--border-soft);
+	border-bottom: 1px solid var(--border-soft);
+	background: var(--bg-surface);
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+}
+.chi-board .bgroup .n {
+	font-family: var(--font-mono);
+	font-weight: 400;
+	letter-spacing: 0;
+}
+.chi-board .bgroup .h {
+	margin-left: auto;
+	font-weight: 400;
+	letter-spacing: 0;
+	text-transform: none;
+}
+.chi-board .nothing {
+	padding: var(--space-2) var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+.chi-board .bempty {
+	padding: var(--space-6) var(--space-4) var(--space-4);
+	max-width: 62ch;
+}
+.chi-board .bempty p {
+	font-size: var(--text-body);
+	color: var(--fg);
+	line-height: var(--lead-body, 1.5);
+}
+.chi-board .bempty .acts {
+	display: flex;
+	gap: var(--space-2);
+	margin-top: var(--space-3);
+}
+
+/* ── the detail column ────────────────────────────────────────────────── */
+.chi-board .dhead {
+	flex: none;
+	padding: var(--space-3);
+	border-bottom: 1px solid var(--border-soft);
+}
+.chi-board .dtitle {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex-wrap: wrap;
+}
+.chi-board .dtitle h2 {
+	font-size: var(--text-h4);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	color: var(--fg);
+}
+.chi-board .dtitle h2.mono {
+	font-family: var(--font-mono);
+}
+.chi-board .dsub {
+	margin-top: var(--space-2);
+	display: flex;
+	gap: var(--space-3);
+	flex-wrap: wrap;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+.chi-board .dsub b {
+	color: var(--fg);
+	font-weight: 500;
+}
+.chi-board .dacts {
+	margin-top: var(--space-3);
+	display: flex;
+	gap: var(--space-1);
+	flex-wrap: wrap;
+}
+.chi-board .dbody {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: var(--space-3);
+}
+.chi-board .drow {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 28px;
+	padding: var(--space-1) 0;
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-micro);
+}
+.chi-board .drow:last-of-type {
+	border-bottom: 0;
+}
+.chi-board .drow .k2 {
+	width: 82px;
+	flex: none;
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+.chi-board .drow .val {
+	color: var(--fg);
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.chi-board .drow .val.mono {
+	font-family: var(--font-mono);
+}
+.chi-board .drow .val.wrap {
+	white-space: normal;
+	line-height: var(--lead-body-sm, 1.45);
+}
+.chi-board .drow .val.warn {
+	color: var(--on-achievement, var(--achievement));
+}
+.chi-board .drow .rt {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: none;
+}
+.chi-board .promise {
+	margin-top: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	line-height: var(--lead-body-sm, 1.45);
+}
+.chi-board .promise b {
+	color: var(--fg);
+	font-weight: 500;
+	font-family: var(--font-mono);
+}
+.chi-board .pchip {
+	font-size: var(--text-micro);
+	font-family: var(--font-mono);
+	color: var(--fg-muted);
+	background: var(--bg-raised);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-xs);
+	padding: 0 5px;
+	line-height: 16px;
+	white-space: nowrap;
+	flex: none;
+}
+.chi-board .pchip.tgt {
+	color: var(--on-live, var(--live));
+	border-color: var(--live-soft);
+	background: var(--live-soft);
+}
+/* the rail's vacant panel, embedded in the detail column */
+.chi-board .dvacant {
+	margin: calc(var(--space-3) * -1) calc(var(--space-3) * -1) var(--space-2);
+}
+
+/* ── the iyke line (D-06 atom; 11 px, the readability floor) ──────────── */
+.chi-board .iykeline {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 28px;
+	padding: var(--space-1) var(--space-3);
+	border-top: 1px solid var(--border-soft);
+	background: var(--bg-sunken);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+.chi-board .iykeline b {
+	color: var(--fg);
+	font-weight: 600;
+}
+.chi-board .iykeline .cmd {
+	min-width: 0;
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--fg);
+}
+.chi-board .iykeline .cp {
+	margin-left: auto;
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+	border-radius: var(--radius-xs);
+	padding: 0 var(--space-1);
+}
+.chi-board .iykeline .cp:hover {
+	color: var(--fg);
+}
+.chi-board .iykeline .cp:focus-visible {
+	outline: 2px solid var(--primary);
+	outline-offset: 1px;
+}

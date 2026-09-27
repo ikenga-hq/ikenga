@@ -16,9 +16,14 @@
 //   the dispatch input             companion.send / new-run / persistent-run
 //                                                           (hosted, §4.6)
 //   `lib.rs`                       os.*                     (OS-wide, §6)
+//   this file (`FRAME_COMMANDS`)   chi.board, people.lock-now
+//                                                           (built in, WP-68)
 //
 // Registration is a stack per command: the latest mounted owner wins and
 // unmounting restores the previous one (two palettes in a test, a remount).
+// A few frame commands have a built-in handler here (`FRAME_COMMANDS`): it
+// sits under the stack, so it runs when no owner registered one, in every
+// window, with no component to mount.
 // A command with no handler in this window falls back to the effective
 // action behind it — a personal / project action runs through the WP-53
 // runner, a package action through its fill-only / view run — so a user or
@@ -72,10 +77,56 @@ export function registerCommands(handlers: Readonly<Record<string, CommandHandle
 	};
 }
 
-/** The handler that runs `command` now (the latest registration). */
+// ─── Built-in frame commands (WP-68) ──────────────────────────────────────
+
+/**
+ * `chi.board` (G-SEATS §8.1): open `/chi`, the seat board, in the focused
+ * pane — reusing the tab when it is already open — and land keyboard focus
+ * on its selected row. Its `when` (`dispatchFocus`) holds only in the
+ * Companion's dispatch input, so in practice it is ⌘2 pressed a second
+ * time. Not a Companion-store action.
+ */
+function openSeatBoardCommand(): void {
+	void import('@/shell/chi-board/board-store')
+		.then((m) => m.openBoard())
+		.catch((err: unknown) => console.warn('[keymap] could not open the seat board:', err));
+}
+
+/**
+ * `people.lock-now` (D-05 ⌘⇧L, WP-72's Lock now): lock the app now, exactly
+ * as Profile › App lock's *Lock now* button does. With no PIN set nothing
+ * could unlock it, so — like that button — it does nothing.
+ */
+function lockNowCommand(): void {
+	void (async () => {
+		try {
+			const [{ appLockLock }, { useAppLockStore }] = await Promise.all([
+				import('@/lib/tauri-cmd'),
+				import('@/shell/people/app-lock-store'),
+			]);
+			const current = useAppLockStore.getState().status;
+			if (current && (current.locked || !current.secretSet)) return;
+			useAppLockStore.getState().setStatus(await appLockLock());
+		} catch (err) {
+			console.warn('[keymap] Lock now failed:', err);
+		}
+	})();
+}
+
+/** Frame commands whose handler is built in (owner `frame`). Lazy imports
+ *  keep the shell out of the dispatcher's module graph and unit tests, as
+ *  `runEffectiveActionFallback` does. */
+export const FRAME_COMMANDS: Readonly<Record<string, CommandHandler>> = {
+	'chi.board': openSeatBoardCommand,
+	'people.lock-now': lockNowCommand,
+};
+
+/** The handler that runs `command` now: the latest registration, else its
+ *  built-in frame handler. */
 export function getCommandHandler(command: string): CommandHandler | undefined {
 	const stack = table.get(command);
-	return stack ? stack[stack.length - 1] : undefined;
+	if (stack) return stack[stack.length - 1];
+	return Object.hasOwn(FRAME_COMMANDS, command) ? FRAME_COMMANDS[command] : undefined;
 }
 
 export function hasCommandHandler(command: string): boolean {
@@ -235,9 +286,12 @@ export type CommandOwner =
 	| 'dispatch-input'
 	| 'native-menu'
 	| 'os'
-	| 'widget';
+	| 'widget'
+	| 'frame';
 
 export function ownerOf(command: string): CommandOwner | null {
+	// WP-68: built-in handlers in this file (`FRAME_COMMANDS`).
+	if (Object.hasOwn(FRAME_COMMANDS, command)) return 'frame';
 	if (command.startsWith('zoom.')) return 'window';
 	if (command.startsWith('terminal.')) return 'terminal';
 	if (command.startsWith('os.')) return 'os';

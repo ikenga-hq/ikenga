@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import { TerminalSquare } from 'lucide-react';
+import { LayoutGrid, TerminalSquare } from 'lucide-react';
 import { ListRow } from '@/components/ui/list-row';
 import { cn } from '@/components/ui/utils';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -9,7 +9,37 @@ import { createTerminalSession } from '@/terminal/single-terminal';
 import { EmptyState } from '@/components/states';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { handToChi } from '@/shell/companion/companion-store';
+import { boardIsShowing, openBoard } from '@/shell/chi-board/board-store';
 import type { ExplorerSectionContext } from '../section-registry';
+
+/**
+ * WP-68 (D-09): the Sessions header's "Seats" link to the seat board (`/chi`,
+ * the focused pane, one tab). `aria-current="page"` while the board is the
+ * active tab of a pane. The section frame (`section-frame.tsx`) owns the
+ * header row itself, so the link heads the section's body.
+ */
+function SeatsLink() {
+	const onBoard = usePaneStore((s) => boardIsShowing(s.root));
+	return (
+		<div className="flex justify-end px-2 pt-1">
+			<button
+				type="button"
+				data-explorer-seats-link=""
+				onClick={openBoard}
+				aria-current={onBoard ? 'page' : undefined}
+				title="All seats — open the seat board (/chi) in the focused pane"
+				className={cn(
+					'inline-flex h-5 items-center gap-1 rounded-sm border px-2 text-[11px] text-muted-foreground',
+					'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+					onBoard ? 'border-primary text-foreground' : 'border-border-soft'
+				)}
+			>
+				<LayoutGrid className="h-3 w-3" aria-hidden="true" />
+				Seats
+			</button>
+		</div>
+	);
+}
 
 export function SessionsSection(_ctx: ExplorerSectionContext) {
 	const tabs = useTerminalStore((s) => s.tabs);
@@ -32,18 +62,22 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 
 	if (tabs.length === 0) {
 		return (
-			<EmptyState
-				data-state="explorer-sessions-empty"
-				icon={TerminalSquare}
-				heading="No sessions in this project"
-				body="A session is a terminal with an engine in it. Starting one also starts the cost and tool feed."
-				action={{ label: 'Start a session', onClick: handleStartSession }}
-			/>
+			<>
+				<SeatsLink />
+				<EmptyState
+					data-state="explorer-sessions-empty"
+					icon={TerminalSquare}
+					heading="No sessions in this project"
+					body="A session is a terminal with an engine in it. Starting one also starts the cost and tool feed."
+					action={{ label: 'Start a session', onClick: handleStartSession }}
+				/>
+			</>
 		);
 	}
 
 	return (
 		<div className="py-1">
+			<SeatsLink />
 			{tabs.map((tab) => {
 				const isRunning = tab.status === 'running';
 				const isSpawning = tab.status === 'spawning';

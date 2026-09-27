@@ -508,7 +508,9 @@ test.describe('three-noun routes (WP-10)', () => {
 		// Navigate to /chi
 		await addressInput.fill('/chi');
 		await addressInput.press('Enter');
-		await expect(page.getByText('Chi — Companion Dispatch')).toBeVisible();
+		// WP-68: /chi is the seat board (D-09 `seats-board.html`).
+		await expect(page.getByRole('heading', { name: 'Seats', level: 1 })).toBeVisible();
+		await expect(page.locator('.chi-board[data-state^="board-"]')).toBeVisible();
 
 		// Navigate to /ngwa/installed
 		await addressInput.fill('/ngwa/installed');

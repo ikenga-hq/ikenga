@@ -70,6 +70,9 @@ describe('conflicts() — DEC-59', () => {
 				'markdown.save + studio.loupe-save',
 				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
+				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs
+				// `chi.board` (`dispatchFocus`).
+				'chi.board + rail.chi',
 			].sort()
 		);
 	});
@@ -90,8 +93,48 @@ describe('conflicts() — DEC-59', () => {
 				'markdown.save + studio.loupe-save',
 				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
+				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs
+				// `chi.board` (`dispatchFocus`).
+				'chi.board + rail.chi',
 			].sort()
 		);
+	});
+
+	it('chi.board and rail.chi share mod+2 as a precedence pair, never a clash (G-SEATS §8.2)', () => {
+		for (const platform of ['mac', 'other'] as const) {
+			const r = conflicts({ platform });
+			const onModTwo = [...r.clashes, ...r.precedence].filter(
+				(p) => [p.a.command, p.b.command].includes('chi.board')
+			);
+			expect(onModTwo, platform).toHaveLength(1);
+			const pair = onModTwo[0];
+			expect([pair.a.command, pair.b.command].sort(), platform).toEqual(['chi.board', 'rail.chi']);
+			expect(pair.kind, platform).toBe('when');
+			expect(r.precedence, platform).toContain(pair);
+			expect(r.clashes, platform).toEqual([]);
+			// Two different normalized `when`s — and they can never both hold:
+			// the dispatch input is an input.
+			expect([pair.whenA, pair.whenB].sort(), platform).toEqual(
+				[normalizeWhen('!inputFocus'), normalizeWhen('dispatchFocus')].sort()
+			);
+		}
+		// No `knownOverlap` any more: pane focus left mod+2 with DEC-64.
+		expect(findEntry('chi.board')).toMatchObject({ key: 'mod+2', when: 'dispatchFocus', source: 'default' });
+		expect(DEFAULT_KEYMAP.filter((e) => e.key === 'mod+2').map((e) => e.command).sort()).toEqual([
+			'chi.board',
+			'rail.chi',
+		]);
+	});
+
+	it('people.lock-now (mod+shift+l) shares its key with nothing', () => {
+		for (const platform of ['mac', 'other'] as const) {
+			const r = conflicts({ platform });
+			const pairs = [...r.clashes, ...r.precedence].filter((p) =>
+				[p.a.command, p.b.command].includes('people.lock-now')
+			);
+			expect(pairs, platform).toEqual([]);
+		}
+		expect(findEntry('people.lock-now')).toMatchObject({ key: 'mod+shift+l', when: '!inputFocus' });
 	});
 
 	it('reports a synthetic clash: same resolved key AND same normalized `when`', () => {

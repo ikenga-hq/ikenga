@@ -5,6 +5,8 @@ import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneId, PaneNode, PaneView } from '@/lib/panes/types';
 import { type ActiveProject, useShellStore } from '@/lib/shell/shell-store';
+import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { PENDING_WINDOW_LABEL } from '@/lib/window/surfaces-topic';
 import {
 	type IykeActionMirror,
 	type IykeKeymapEntry,
@@ -61,10 +63,13 @@ export function useIykeShellSync(): void {
 	// value right after `/iyke/sidebar` — the exact window a caller polls.
 	const sidebarCollapsed = useShellStore((s) => s.sidebarCollapsed);
 	const terminalTabs = useTerminalStore((s) => s.tabs);
+	// WP-69 (G-SEATS §2.1): a pop-out / join / move back changes where a
+	// terminal is mounted without touching the pane tree.
+	const surfaceToWindow = useDetachedSurfaces((s) => s.surfaceToWindow);
 
 	useEffect(() => {
-		pushShellState(activeMode, sidebarCollapsed, root, focusedId, terminalTabs);
-	}, [activeMode, focusedId, root, sidebarCollapsed, terminalTabs]);
+		pushShellState(activeMode, sidebarCollapsed, root, focusedId, terminalTabs, surfaceToWindow);
+	}, [activeMode, focusedId, root, sidebarCollapsed, terminalTabs, surfaceToWindow]);
 
 	// Re-push when a pkg iframe publishes state (selection etc.) so
 	// `iyke state` reflects it without waiting for a pane-tree mutation.
@@ -77,7 +82,8 @@ export function useIykeShellSync(): void {
 				shell.sidebarCollapsed,
 				panes.root,
 				panes.focusedId,
-				useTerminalStore.getState().tabs
+				useTerminalStore.getState().tabs,
+				useDetachedSurfaces.getState().surfaceToWindow
 			);
 		};
 		window.addEventListener(IFRAME_STATE_EVENT, onState);
@@ -527,12 +533,13 @@ function pushShellState(
 	sidebarCollapsed: boolean,
 	root: PaneNode,
 	focusedId: PaneId,
-	terminalTabs: TerminalTab[]
+	terminalTabs: TerminalTab[],
+	surfaceToWindow: Record<string, string>
 ): void {
 	const focused = findLeaf(root, focusedId);
 	const view = focused?.tabs[focused.activeTabIdx];
 	const route = view?.kind === 'route' ? view.path : null;
-	const panes = buildPanesPayload(root, focusedId, terminalTabs);
+	const panes = buildPanesPayload(root, focusedId, terminalTabs, surfaceToWindow);
 	setShell({ mode: activeMode, route, panes, sidebarCollapsed }).catch((err) => {
 		console.warn('[iyke] set_shell failed:', err);
 	});
@@ -548,6 +555,9 @@ interface LeafSummary {
 		pinned?: boolean;
 		terminalId?: string;
 		ptyId?: string;
+		/** WP-69: the terminal is popped out to this window; the tab is only
+		 *  its placeholder, so it carries no `terminalId` / `ptyId`. */
+		detachedTo?: string;
 	}>;
 	/** Pkg id when the active tab is a /pkg/<id>/ route. */
 	pkg?: string;
@@ -560,10 +570,21 @@ interface PanesPayload {
 	tree: PaneNode;
 }
 
-function buildPanesPayload(
+/**
+ * The pane snapshot Rust reads mounts from (`iyke/terminal.rs::enrich_terminals`
+ * adds `main` to a terminal's `window_labels` for every tab naming it).
+ *
+ * WP-69 (G-SEATS §2.1): a popped-out terminal's tab stays in its pane as the
+ * "popped out" placeholder, so it must not claim the terminal — otherwise
+ * `seats.rs::mount_of` prefers `main` and the seat never reads as popped out.
+ * Such a tab is sent without `terminalId` / `ptyId`, with `detachedTo` naming
+ * the window instead; tab indices are unchanged.
+ */
+export function buildPanesPayload(
 	root: PaneNode,
 	focusedId: PaneId,
-	terminalTabs: TerminalTab[]
+	terminalTabs: TerminalTab[],
+	surfaceToWindow: Record<string, string> = {}
 ): PanesPayload {
 	const ids = getLeafIdsInOrder(root);
 	const leaves: LeafSummary[] = ids.map((id) => {
@@ -580,12 +601,19 @@ function buildPanesPayload(
 			tabs: leaf.tabs.map((t) => {
 				const terminal =
 					t.kind === 'terminal' ? terminalTabs.find((tab) => tab.id === t.sessionId) : null;
+				const label = terminal?.ptyId ? surfaceToWindow[`terminal:${terminal.ptyId}`] : undefined;
+				// A Pop out still resolving has no window yet: keep the pane's claim.
+				const detachedTo = label && label !== PENDING_WINDOW_LABEL ? label : undefined;
 				return {
 					kind: t.kind,
 					title: viewTitle(t, terminal ?? null),
 					...(t.pinned ? { pinned: true } : {}),
-					...(t.kind === 'terminal' ? { terminalId: t.sessionId } : {}),
-					...(terminal?.ptyId ? { ptyId: terminal.ptyId } : {}),
+					...(detachedTo
+						? { detachedTo }
+						: {
+								...(t.kind === 'terminal' ? { terminalId: t.sessionId } : {}),
+								...(terminal?.ptyId ? { ptyId: terminal.ptyId } : {}),
+							}),
 				};
 			}),
 		};

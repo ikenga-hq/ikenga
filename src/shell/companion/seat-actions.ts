@@ -27,6 +27,7 @@ import {
 	seatsResolve,
 } from '@/lib/tauri-cmd';
 import { reclaimSurface, useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { requestBoardFocus } from '@/shell/chi-board/board-ui';
 import { getPty } from '@/terminal/pty-registry';
 import { useTerminalStore } from '@/terminal/session-store';
 import { type RailSelection, useCompanionStore } from './companion-store';
@@ -212,10 +213,13 @@ export function openSeatScratchpad(seat: SeatView): void {
 	});
 }
 
-/** *All seats* ⊞ — the `/chi` seat board (WP-68) in the focused pane; one tab. */
+/** *All seats* ⊞ — the `/chi` seat board (WP-68) in the focused pane; one tab.
+ *  Every entry point lands keyboard focus on the board's selected row (D-09
+ *  ENTRY), so this asks the board for it (`board-ui.ts`, a leaf module). */
 export function openSeatBoard(): void {
 	const panes = usePaneStore.getState();
 	panes.addTab(panes.focusedId, { kind: 'route', path: '/chi' });
+	requestBoardFocus();
 }
 
 export function copyText(text: string, message: string): void {

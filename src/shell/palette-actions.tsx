@@ -24,12 +24,14 @@ import {
 	FileText,
 	FolderOpen,
 	Keyboard,
+	LayoutGrid,
 	type LucideIcon,
 	Mail,
 	MessageSquare,
 	Monitor,
 	Moon,
 	PanelLeft,
+	Plus,
 	RotateCcw,
 	Rows2,
 	Search,
@@ -38,6 +40,7 @@ import {
 	Sun,
 	Target,
 	TrendingUp,
+	UserPlus,
 	Users,
 } from 'lucide-react';
 import { CommandRow } from '@/components/ui/command-row';
@@ -46,6 +49,11 @@ import { type IkengaMode, useIkengaStore } from '@/lib/ikenga/theme-store';
 import { queryKeys } from '@/lib/query-keys';
 import { listAllSkillActions, type SkillAction } from '@/lib/tauri-cmd';
 import { useEffectiveMenu } from '@/lib/actions/store';
+import { labelFor } from '@/lib/keymap/registry';
+import { openBoard } from '@/shell/chi-board/board-store';
+import { openSeatForm } from '@/shell/companion/seat-actions';
+import { type UnseatedSession, useSeatRoster } from '@/shell/companion/seat-roster';
+import { sessionName } from '@/shell/companion/seat-sessions';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 
 // Domain → leading glyph. Presentation-only (the manifest has no per-action
@@ -267,6 +275,65 @@ export function ManageGroup({ onShowShortcuts }: { onShowShortcuts: () => void }
 					/>
 				)
 			)}
+		</Command.Group>
+	);
+}
+
+// ─── WP-68 — the palette "Chi" group (mode `all`, D-09 PALETTE) ─────────────
+//
+// "Chi: Open seat board" opens `/chi` in the focused pane (one tab), the same
+// act as `chi.board` (⌘2 again, from the dispatch input), the rail's "All
+// seats" ⊞ and the Explorer Sessions header's "Seats" link. "New seat" opens
+// the rail's own New-seat form in the Companion. Each closes the palette
+// first and acts a tick later, like `go()`, so the palette's focus return
+// never lands on top of the board's row or the form's name field.
+// "Seat this session…" (D-09 "Chi · Seats" group) opens the same form on the
+// first unseated session the rail's own *Seat this session…* would accept
+// (an engine, running); disabled when there is none.
+
+/** The rail's `sessionMenuItems` rule for *Seat this session…*. */
+export function firstSeatableSession(unseated: readonly UnseatedSession[]): UnseatedSession | null {
+	return unseated.find((u) => u.engineId !== null && u.status === 'running') ?? null;
+}
+
+export function ChiGroup({ onClose }: { onClose: () => void }) {
+	const { unseated } = useSeatRoster();
+	const seatable = firstSeatableSession(unseated);
+	function after(run: () => void) {
+		onClose();
+		setTimeout(run, 0);
+	}
+	return (
+		<Command.Group heading="Chi" className="text-xs text-muted-foreground">
+			<CommandRow
+				size="md"
+				value="Chi: Open seat board seats roster all seats chi board"
+				Icon={LayoutGrid}
+				label="Chi: Open seat board"
+				detail="from dispatch"
+				shortcut={labelFor('chi.board') || undefined}
+				onSelect={() => after(openBoard)}
+			/>
+			<CommandRow
+				size="md"
+				value="New seat chi seats create a seat"
+				Icon={Plus}
+				label="New seat"
+				onSelect={() => after(() => openSeatForm())}
+			/>
+			<CommandRow
+				size="md"
+				value="Seat this session chi seats seat an unseated session"
+				Icon={UserPlus}
+				label="Seat this session…"
+				detail={seatable ? sessionName(seatable.id) : 'no unseated session'}
+				disabled={!seatable}
+				onSelect={() => {
+					if (!seatable) return;
+					const id = seatable.id;
+					after(() => openSeatForm({ seatSession: id }));
+				}}
+			/>
 		</Command.Group>
 	);
 }

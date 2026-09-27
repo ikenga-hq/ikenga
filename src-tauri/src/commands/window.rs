@@ -37,3 +37,41 @@ pub fn window_list(
 ) -> Vec<WindowDescriptor> {
     registry.list_live(&app)
 }
+
+/// WP-69 (G-SEATS §4.4, DEC-69d): *Pop out* joins Window 2. Picks Window 2
+/// (pin P-7: the most recently focused live non-`main` window, excluding
+/// `Workspace` windows bound to a project other than `project_id`) and adds
+/// `surface_id` to it as a tab. Returns that window's label, or `null` when
+/// there is no Window 2 — the caller then spawns one with `window_spawn`.
+/// The pick and the add are one IPC call but not one lock: if the picked
+/// window closes in between, the registry re-picks once and otherwise returns
+/// `null`, so the caller spawns rather than failing. The FE focuses the
+/// returned label itself (`WebviewWindow` lookup by label, then `setFocus`).
+#[tauri::command]
+pub fn window_join_surface(
+    app: AppHandle,
+    registry: State<'_, WindowRegistry>,
+    surface_id: String,
+    project_id: Option<String>,
+) -> Result<Option<String>, String> {
+    registry
+        .join_surface(&app, &surface_id, project_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// WP-69: take `surface_id` out of the detached window `label` — *Move back
+/// to main window* (`move_back: true`), or the primary's *Open in pane* /
+/// "Bring it back" reclaiming one tab of a multi-surface window. The window
+/// closes when it held nothing else. Returns its `surface_set` after.
+#[tauri::command]
+pub fn window_remove_surface(
+    app: AppHandle,
+    registry: State<'_, WindowRegistry>,
+    label: String,
+    surface_id: String,
+    move_back: Option<bool>,
+) -> Result<Vec<String>, String> {
+    registry
+        .remove_surface(&app, &label, &surface_id, move_back.unwrap_or(false))
+        .map_err(|e| e.to_string())
+}

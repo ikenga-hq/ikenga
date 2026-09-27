@@ -2,11 +2,13 @@
 // Targeted tests, run under the DEC-56 exception.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isBuiltinActionId } from '@/lib/actions/registry';
 import {
 	canRunCommand,
 	claimSingleFire,
 	DEDUPE_WINDOW_MS,
 	defaultCommands,
+	FRAME_COMMANDS,
 	getCommandHandler,
 	hasCommandHandler,
 	menuItemAction,
@@ -110,6 +112,41 @@ describe('every default command has exactly one owner', () => {
 			const os = DEFAULT_KEYMAP.some((e) => e.command === command && e.scope === 'os');
 			expect(owner === 'os', command).toBe(os);
 		}
+	});
+});
+
+describe('built-in frame commands (WP-68: chi.board, people.lock-now)', () => {
+	it('each is a default command, owned by `frame`, and a catalogued built-in action', () => {
+		expect(Object.keys(FRAME_COMMANDS).sort()).toEqual(['chi.board', 'people.lock-now']);
+		for (const command of Object.keys(FRAME_COMMANDS)) {
+			expect(defaultCommands(), command).toContain(command);
+			expect(ownerOf(command), command).toBe('frame');
+			expect(isBuiltinActionId(command), command).toBe(true);
+		}
+	});
+
+	it('runs with nothing registered, in any window, without the fallback', () => {
+		setCommandFallback(null);
+		expect(hasCommandHandler('chi.board')).toBe(true);
+		expect(canRunCommand('chi.board')).toBe(true);
+		expect(canRunCommand('people.lock-now')).toBe(true);
+		expect(getCommandHandler('chi.board')).toBe(FRAME_COMMANDS['chi.board']);
+		// Built-ins sit under the stack: they are not "registered".
+		expect(registeredCommands()).toEqual([]);
+	});
+
+	it('a registered owner still wins over the built-in, and unregistering restores it', () => {
+		const mine = vi.fn();
+		const off = registerCommand('chi.board', mine);
+		expect(runCommand({ command: 'chi.board', source: 'palette' })).toBe(true);
+		expect(mine).toHaveBeenCalledTimes(1);
+		off();
+		expect(getCommandHandler('chi.board')).toBe(FRAME_COMMANDS['chi.board']);
+	});
+
+	it('only its own ids — an inherited property name is never a command', () => {
+		expect(getCommandHandler('toString')).toBeUndefined();
+		expect(ownerOf('constructor')).toBeNull();
 	});
 });
 

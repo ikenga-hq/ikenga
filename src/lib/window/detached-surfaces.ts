@@ -14,21 +14,100 @@
 // `useIsSurfaceDetached(surfaceId)` and, when true, renders a "popped out"
 // placeholder instead of the live duplicate.
 //
-// PRIMARY-WINDOW ONLY. A thin detached window mounts exactly one surface and
-// never renders the pop-out-able pane views, so it has nothing to track; the
-// initializer no-ops there.
+// PRIMARY-WINDOW ONLY. A thin detached window never renders the
+// pop-out-able pane views, so it has nothing to track; the initializer
+// no-ops there.
+//
+// WP-69 (G-SEATS §4.4, DEC-69d): a detached window now holds SEVERAL surfaces
+// as tabs — Pop out joins "Window 2" instead of always spawning. The map was
+// already `surfaceId → label`, so many surfaces can point at one label; what
+// changes here:
+//   • `window://surfaces-changed` (a join or a move back) is applied straight
+//     from its payload (`applySurfacesChanged`), no re-list;
+//   • `reclaimSurface` takes ONE surface out of its window
+//     (`windowRemoveSurface`) instead of closing the whole window — Rust
+//     closes the window only when that was its last surface;
+//   • surfaces that come back to the main window (a Move back, or their
+//     window closing) are announced to `onSurfacesReturned` listeners, so the
+//     Companion can mount them and say so (D-09 `moveBack` / `closeWin2`).
 
 import { WINDOW_TOPICS } from '@ikenga/contract';
 import { listen } from '@/lib/transport';
 import { isTauri } from '@/lib/transport';
 import { create } from 'zustand';
 
-import { closeWindow, listWindows } from '@/lib/tauri-cmd';
+import { listWindows, windowRemoveSurface } from '@/lib/tauri-cmd';
+import {
+	applySurfacesChanged,
+	MAKE_TARGET_TOPIC,
+	type MakeTargetRequest,
+	PENDING_WINDOW_LABEL,
+	returnedByClosedWindows,
+	SURFACES_CHANGED_TOPIC,
+	type SurfacesChangedEnvelope,
+	type SurfacesChangedPayload,
+	surfacesOf,
+} from './surfaces-topic';
 import { isDetachedWindow } from './window-context';
 
 interface DetachedSurfacesState {
-	/** `surfaceId` (e.g. `"terminal:<ptyId>"`) → label of the window hosting it. */
+	/** `surfaceId` (e.g. `"terminal:<ptyId>"`) → label of the window hosting it.
+	 *  Several surfaces may share a label: that window shows them as tabs. */
 	surfaceToWindow: Record<string, string>;
+}
+
+/** Why surfaces came back to the main window. */
+export interface SurfacesReturned {
+	/** The detached window they left. */
+	label: string;
+	surfaceIds: string[];
+	/** `move-back`: Window 2 ⋯ → Move back to main window (one surface).
+	 *  `window-closed`: the window closed with them still in it. */
+	reason: 'move-back' | 'window-closed';
+}
+
+const returnListeners = new Set<(e: SurfacesReturned) => void>();
+const makeTargetListeners = new Set<(surfaceId: string) => void>();
+
+/** Subscribe to Window 2 ⋯ → *Make dispatch target* requests (primary only).
+ *  Returns an unsubscribe. */
+export function onMakeTargetRequested(cb: (surfaceId: string) => void): () => void {
+	makeTargetListeners.add(cb);
+	return () => {
+		makeTargetListeners.delete(cb);
+	};
+}
+
+/** Deliver one *Make dispatch target* request. Exported for tests. */
+export function handleMakeTargetRequest(req: Partial<MakeTargetRequest> | null | undefined): void {
+	const surfaceId = req?.surfaceId;
+	if (typeof surfaceId !== 'string' || !surfaceId) return;
+	for (const cb of makeTargetListeners) {
+		try {
+			cb(surfaceId);
+		} catch (err) {
+			console.warn('detached-surfaces: make-target listener failed', err);
+		}
+	}
+}
+
+/** Subscribe to surfaces returning to the main window. Returns an unsubscribe. */
+export function onSurfacesReturned(cb: (e: SurfacesReturned) => void): () => void {
+	returnListeners.add(cb);
+	return () => {
+		returnListeners.delete(cb);
+	};
+}
+
+function announceReturned(e: SurfacesReturned): void {
+	if (e.surfaceIds.length === 0) return;
+	for (const cb of returnListeners) {
+		try {
+			cb(e);
+		} catch (err) {
+			console.warn('detached-surfaces: return listener failed', err);
+		}
+	}
 }
 
 export const useDetachedSurfaces = create<DetachedSurfacesState>(() => ({
@@ -82,6 +161,12 @@ export async function syncDetachedSurfaces(): Promise<void> {
 			if (w.label === 'main') continue;
 			for (const surfaceId of w.surface_set) map[surfaceId] = w.label;
 		}
+		// A Pop out still resolving (join or spawn in flight) isn't in the
+		// registry yet; keep its provisional entry so the origin pane doesn't
+		// flash the live duplicate. `popOutSurface` clears it on failure.
+		for (const [surfaceId, label] of Object.entries(useDetachedSurfaces.getState().surfaceToWindow)) {
+			if (label === PENDING_WINDOW_LABEL && !(surfaceId in map)) map[surfaceId] = label;
+		}
 		// T-3a: any surface that was detached a moment ago and no longer is —
 		// including a reclaim that happened via the OS titlebar close rather
 		// than the in-app "Bring it back" button — just got reclaimed. Arm the
@@ -99,9 +184,33 @@ export async function syncDetachedSurfaces(): Promise<void> {
 			}
 		}
 		useDetachedSurfaces.setState({ surfaceToWindow: map });
+		// WP-69: surfaces whose window closed with them still in it came back
+		// to the main window (D-09 `closeWin2`).
+		const live = new Set(windows.map((w) => w.label));
+		for (const [label, surfaceIds] of Object.entries(returnedByClosedWindows(prev, map, live))) {
+			announceReturned({ label, surfaceIds, reason: 'window-closed' });
+		}
 	} catch (e) {
 		console.warn('detached-surfaces: refresh failed', e);
 	}
+}
+
+/**
+ * WP-69: apply a `window://surfaces-changed` payload — a join (Pop out into
+ * Window 2) or a removal (Move back / a reclaim). Exported for tests.
+ */
+export function handleSurfacesChanged(change: SurfacesChangedPayload): void {
+	const prev = useDetachedSurfaces.getState().surfaceToWindow;
+	const next = applySurfacesChanged(prev, change);
+	const back = change.removed.filter((surfaceId) => !(surfaceId in next));
+	// T-3a: a terminal leaving its window re-mounts inline — arm its nudge,
+	// as the close-driven re-sync above does. Only when it was detached a
+	// moment ago (an optimistic reclaim already armed and cleared it).
+	for (const surfaceId of back) {
+		if (surfaceId in prev && surfaceId.startsWith('terminal:')) pendingReclaimNudge.add(surfaceId);
+	}
+	useDetachedSurfaces.setState({ surfaceToWindow: next });
+	if (change.move_back) announceReturned({ label: change.label, surfaceIds: back, reason: 'move-back' });
 }
 
 let started = false;
@@ -130,6 +239,20 @@ export function initDetachedSurfaceTracking(): void {
 	void syncDetachedSurfaces();
 	void listen(WINDOW_TOPICS.opened, () => void syncDetachedSurfaces());
 	void listen(WINDOW_TOPICS.closed, () => void syncDetachedSurfaces());
+	void listen<SurfacesChangedEnvelope>(SURFACES_CHANGED_TOPIC, (ev) => {
+		const change = ev.payload?.payload;
+		if (change && typeof change.label === 'string' && Array.isArray(change.surface_set)) {
+			handleSurfacesChanged({
+				label: change.label,
+				surface_set: change.surface_set,
+				added: change.added ?? [],
+				removed: change.removed ?? [],
+				move_back: change.move_back === true,
+			});
+		}
+	});
+	// Window 2 ⋯ → Make dispatch target (D-09), sent `emitTo('main', …)`.
+	void listen<MakeTargetRequest>(MAKE_TARGET_TOPIC, (ev) => handleMakeTargetRequest(ev.payload));
 }
 
 /**
@@ -144,15 +267,33 @@ export function markSurfaceDetached(surfaceId: string, label: string): void {
 	}));
 }
 
+/** Drop a provisional (still-resolving) Pop out entry — the failure path of
+ *  `popOutSurface`, before it re-syncs. A real entry is left alone. */
+export function clearPendingSurface(surfaceId: string): void {
+	if (useDetachedSurfaces.getState().surfaceToWindow[surfaceId] !== PENDING_WINDOW_LABEL) return;
+	useDetachedSurfaces.setState((prev) => {
+		const next = { ...prev.surfaceToWindow };
+		delete next[surfaceId];
+		return { surfaceToWindow: next };
+	});
+}
+
+/** The surfaces a detached window holds, in map order (WP-69: one or more). */
+export function windowSurfaces(label: string): string[] {
+	return surfacesOf(useDetachedSurfaces.getState().surfaceToWindow, label);
+}
+
 /**
- * Reclaim a popped-out surface back into the primary window: close its detached
- * window (the underlying PTY / file is unaffected — only the thin
- * window goes away) and drop it from the map so the pane re-mounts the live
- * surface inline. Optimistic, with a reconciling `refresh()` on failure.
+ * Reclaim a popped-out surface back into the primary window: take it out of
+ * its detached window (WP-69: that window keeps its other tabs and closes only
+ * when this was its last surface; the underlying PTY / file is unaffected) and
+ * drop it from the map so the pane re-mounts the live surface inline.
+ * Optimistic, with a reconciling `refresh()` on failure.
  */
 export async function reclaimSurface(surfaceId: string): Promise<void> {
 	const label = useDetachedSurfaces.getState().surfaceToWindow[surfaceId];
-	if (!label) return;
+	// Nothing to reclaim yet while its Pop out is still resolving.
+	if (!label || label === PENDING_WINDOW_LABEL) return;
 	// T-3a: arm the reclaim nudge optimistically, same spirit as the
 	// optimistic map delete below — the pane view should nudge as soon as it
 	// remounts the live surface, not wait on the `window://closed` round trip.
@@ -165,7 +306,7 @@ export async function reclaimSurface(surfaceId: string): Promise<void> {
 		return { surfaceToWindow: next };
 	});
 	try {
-		await closeWindow(label);
+		await windowRemoveSurface(label, surfaceId);
 	} catch (e) {
 		console.warn('detached-surfaces: reclaim failed', e);
 		// The close didn't actually happen — undo the optimistic nudge arm too,

@@ -203,6 +203,10 @@ export const DEFAULT_RESPONSES: MockResponses = {
 	// Host services the frame probes at boot
 	supabase_config_get: null,
 	window_list: [],
+	// WP-69: Pop out joins Window 2 (`null` = none open, so it spawns);
+	// Move back / reclaim returns the window's remaining surface set.
+	window_join_surface: null,
+	window_remove_surface: [],
 	list_all_skill_actions: [],
 	iyke_set_shell: null,
 	iyke_log_push: null,

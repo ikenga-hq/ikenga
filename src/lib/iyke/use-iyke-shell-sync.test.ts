@@ -32,6 +32,7 @@ vi.mock('./client', () => ({ setShell: (args: unknown) => setShell(args) }));
 
 import {
 	actionsMirrorPayload,
+	buildPanesPayload,
 	keymapPayload,
 	menusMirrorPayload,
 	useIykeShellSync,
@@ -352,5 +353,43 @@ describe('actionsMirrorPayload / menusMirrorPayload — WP-62 mirror projection'
 
 		const mirror = menusMirrorPayload(model, ['section/scratchpads', 'section/uninstalled-pkg']);
 		expect(Object.keys(mirror).sort()).toEqual(['files', 'section/scratchpads']);
+	});
+});
+
+describe('buildPanesPayload — WP-69 popped-out placeholders (G-SEATS §2.1)', () => {
+	const terminal = {
+		id: 'term-1',
+		title: 'claude',
+		spec: { cwd: '/w', cmd: ['claude'] },
+		ptyId: 'pty-1',
+		status: 'running' as const,
+		exitCode: null,
+		createdAt: 0,
+		owner: { kind: 'sidepane' as const },
+	};
+	const root = {
+		type: 'leaf' as const,
+		id: 'L1',
+		tabs: [{ kind: 'route' as const, path: '/project' }, { kind: 'terminal' as const, sessionId: 'term-1' }],
+		activeTabIdx: 1,
+	};
+
+	it('a pane tab claims its terminal while it is live here', () => {
+		const tab = buildPanesPayload(root, 'L1', [terminal]).leaves[0].tabs[1];
+		expect(tab).toMatchObject({ kind: 'terminal', terminalId: 'term-1', ptyId: 'pty-1' });
+	});
+
+	it('a popped-out placeholder names the window instead, so Rust reads the mount as that window', () => {
+		const leaf = buildPanesPayload(root, 'L1', [terminal], { 'terminal:pty-1': 'detached-w2' }).leaves[0];
+		expect(leaf.activeTabIdx).toBe(1);
+		expect(leaf.tabs[1]).toMatchObject({ kind: 'terminal', detachedTo: 'detached-w2' });
+		expect(leaf.tabs[1]).not.toHaveProperty('terminalId');
+		expect(leaf.tabs[1]).not.toHaveProperty('ptyId');
+	});
+
+	it('a Pop out still resolving keeps the pane’s claim', () => {
+		const tab = buildPanesPayload(root, 'L1', [terminal], { 'terminal:pty-1': '__window-2-pending__' }).leaves[0]
+			.tabs[1];
+		expect(tab).toMatchObject({ terminalId: 'term-1', ptyId: 'pty-1' });
 	});
 });
