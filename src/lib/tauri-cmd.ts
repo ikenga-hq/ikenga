@@ -4955,8 +4955,12 @@ export type SeatsChangedEvent = {
 		| 'held'
 		| 'released'
 		| 'taken-over'
+		| 'queue-dropped'
 	)[];
 	from_seat_ids?: string[];
+	/** Round 47 erratum E-4: why a §4.5 queued text was dropped instead of
+	 *  sent. Present exactly when `kinds` includes `'queue-dropped'`. */
+	queue_dropped?: 'cleared' | 'removed' | 'no_run' | 'run_missing' | 'send_failed';
 };
 
 export const SEATS_CHANGED_EVENT = 'seats://changed';

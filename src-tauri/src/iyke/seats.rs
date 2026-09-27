@@ -735,6 +735,12 @@ pub struct SeatsChangedEvent {
     pub kinds: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_seat_ids: Option<Vec<String>>,
+    /// Round 47 erratum E-4: set, with kind `queue-dropped`, when a §4.5
+    /// queued text was dropped instead of sent — `cleared`, `removed`,
+    /// `no_run` (the seat no longer holds a run), `run_missing` or
+    /// `send_failed`. A lost queued text is visible, never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_dropped: Option<&'static str>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1865,7 +1871,15 @@ fn changed(
         seat_id: row.id.clone(),
         kinds,
         from_seat_ids: from,
+        queue_dropped: None,
     }
+}
+
+/// E-4: `ev` with the `queue-dropped` kind and its reason added.
+fn with_queue_dropped(mut ev: SeatsChangedEvent, reason: &'static str) -> SeatsChangedEvent {
+    ev.kinds.push("queue-dropped");
+    ev.queue_dropped = Some(reason);
+    ev
 }
 
 fn with_hold_kind(
@@ -2806,7 +2820,8 @@ pub(crate) async fn clear_core(
     };
     tx.commit().await.map_err(db_err)?;
     store().drop_claim(&row.id);
-    if let Some(q) = store().dequeue(&row.id) {
+    let dropped = store().dequeue(&row.id);
+    if let Some(q) = &dropped {
         log::warn!(
             target: "ikenga::seats",
             "cleared {}: dropped the text {} queued for its run",
@@ -2815,9 +2830,12 @@ pub(crate) async fn clear_core(
         );
     }
     let mut effects = Effects::default();
-    effects
-        .events
-        .push(changed(&row, with_hold_kind(vec!["cleared"], kind), None));
+    let ev = changed(&row, with_hold_kind(vec!["cleared"], kind), None);
+    effects.events.push(if dropped.is_some() {
+        with_queue_dropped(ev, "cleared")
+    } else {
+        ev
+    });
     let seat = view_by_id(pool, world, &row.id).await?;
     Ok((seat, effects))
 }
@@ -3056,7 +3074,7 @@ pub(crate) async fn remove_core(
     tx.commit().await.map_err(db_err)?;
 
     store().drop_claim(&row.id);
-    store().dequeue(&row.id);
+    let dropped = store().dequeue(&row.id).is_some();
     store().forget_lock(&row.id);
     let mut effects = Effects::default();
     for (name, updated_at) in pads {
@@ -3069,7 +3087,12 @@ pub(crate) async fn remove_core(
             deleted: true,
         });
     }
-    effects.events.push(changed(&row, vec!["removed"], None));
+    let ev = changed(&row, vec!["removed"], None);
+    effects.events.push(if dropped {
+        with_queue_dropped(ev, "removed")
+    } else {
+        ev
+    });
     Ok((SeatRemoveResult { seat_id: row.id }, effects))
 }
 
@@ -3552,7 +3575,10 @@ async fn drain_queue(app: &AppHandle) {
                     row.address(),
                     queued.client
                 );
-                let _ = app.emit(SEATS_CHANGED_EVENT, &changed(&row, vec!["updated"], None));
+                let _ = app.emit(
+                    SEATS_CHANGED_EVENT,
+                    &with_queue_dropped(changed(&row, vec!["updated"], None), "no_run"),
+                );
                 continue;
             }
         };
@@ -3573,7 +3599,10 @@ async fn drain_queue(app: &AppHandle) {
                     "queue: run {run_id} of {} is gone; dropped the queued text",
                     row.address()
                 );
-                let _ = app.emit(SEATS_CHANGED_EVENT, &changed(&row, vec!["updated"], None));
+                let _ = app.emit(
+                    SEATS_CHANGED_EVENT,
+                    &with_queue_dropped(changed(&row, vec!["updated"], None), "run_missing"),
+                );
                 continue;
             }
         }
@@ -3586,19 +3615,24 @@ async fn drain_queue(app: &AppHandle) {
             },
         )
         .await;
-        match sent {
+        let ev = changed(&row, vec!["updated"], None);
+        let ev = match sent {
             Ok(_) => {
                 if let Err(e) = touch_after_send(&pool, &id, now_ms()).await {
                     log::warn!(target: "ikenga::seats", "queue: touch {id}: {e}");
                 }
+                ev
             }
-            Err(e) => log::warn!(
-                target: "ikenga::seats",
-                "queue: send to {} (run {run_id}) failed: {e}",
-                row.address()
-            ),
-        }
-        let _ = app.emit(SEATS_CHANGED_EVENT, &changed(&row, vec!["updated"], None));
+            Err(e) => {
+                log::warn!(
+                    target: "ikenga::seats",
+                    "queue: send to {} (run {run_id}) failed: {e}",
+                    row.address()
+                );
+                with_queue_dropped(ev, "send_failed")
+            }
+        };
+        let _ = app.emit(SEATS_CHANGED_EVENT, &ev);
     }
 }
 
@@ -4599,6 +4633,27 @@ mod tests {
         assert_eq!(view.pad.count, 1);
         assert_eq!(view.inbox_count, 1);
         assert_eq!(effects.events[0].kinds, vec!["cleared"]);
+    }
+
+    /// Round 47 erratum E-4: clearing a seat with a queued text reports the
+    /// drop on its event instead of only logging it.
+    #[tokio::test]
+    async fn clear_reports_a_dropped_queued_text() {
+        let pool = pool().await;
+        let w = WorldSnapshot::default();
+        let a = create(&pool, "q", "claude-code").await;
+        assert!(store().enqueue(
+            &a,
+            QueuedText {
+                prompt: "later".into(),
+                since: 1,
+                client: "ui".into(),
+            },
+        ));
+        let (_view, effects) = clear_core(&pool, &w, &a, &ui()).await.unwrap();
+        assert_eq!(effects.events[0].kinds, vec!["cleared", "queue-dropped"]);
+        assert_eq!(effects.events[0].queue_dropped, Some("cleared"));
+        assert!(store().queued(&a).is_none());
     }
 
     // ── DEC-69a: resume, then send (§4.1 path H, §6.2) ──────────────────
