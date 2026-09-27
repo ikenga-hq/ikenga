@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::{ContentBlock, PromptResponse, SessionUpdate, StopReason};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::Row;
 use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -44,7 +44,7 @@ impl ChiCache {
 
     /// `<app-data-dir>/chi-cache/`
     pub fn cache_dir(&self) -> PathBuf {
-        self.app_data_dir.join("chi-cache")
+        self.app_data_dir.join(chi_read::CACHE_DIR)
     }
 
     /// Per-run artifact / output tail file.
@@ -138,64 +138,14 @@ fn row_into_resume_opts(row: &ChiCacheRow, prompt: String) -> ChiRunOpts {
     }
 }
 
-#[derive(Serialize)]
-pub struct ChiRunResult {
-    pub run_id: String,
-    pub status: String,
-    pub output: Option<String>,
-    pub output_truncated: Option<bool>,
-    pub error: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct ChiCacheRow {
-    pub run_id: String,
-    pub engine_id: String,
-    pub external_id: Option<String>,
-    pub brief: Option<String>,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    pub mode: Option<String>,
-    pub status: String,
-    pub output_path: Option<String>,
-    pub output_truncated: Option<bool>,
-    pub error: Option<String>,
-    pub artifacts: Option<serde_json::Value>,
-    pub parent_id: Option<String>,
-    pub owner: String,
-    /// The detached chi-runner's pid (WP-18b); `None` for in-process runs.
-    pub pid: Option<i64>,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-    pub last_seen_at: Option<String>,
-    pub expires_at: Option<String>,
-}
-
-/// On-disk shape for a per-run output file. The cache row points at this file.
-///
-/// In-process runs write `output` / `error` / `done_at`. A detached
-/// chi-runner additionally writes `status` (`running`, then one of `done` /
-/// `failed` / `timed_out`) and the engine's `external_id` — see
-/// `chi_runner::runner_terminal_status`.
-#[derive(Serialize, Deserialize)]
-struct RunOutputFile {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub done_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_id: Option<String>,
-}
-
-/// Parse an output file. chi-runner rewrites it in place, so a reader can
-/// catch it half-written: anything unparseable is "no information yet".
-fn parse_output_file(s: &str) -> Option<RunOutputFile> {
-    serde_json::from_str(s).ok()
-}
+/// The run / row shapes and the read path (`cache_get`, the output file,
+/// `chi_status`'s liveness read) live in the ungated `server::shared::chi`
+/// so the daemon's `chi_status` / `chi_list` arms serve the same JSON
+/// (WP-19 slice 3). Re-exported: `iyke::handlers` names them through here.
+pub use crate::server::shared::chi::{ChiCacheRow, ChiRunResult};
+use crate::server::shared::chi::{
+    self as chi_read, cache_get, pid_alive, read_output_file, resolve_output_path, RunOutputFile,
+};
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -206,38 +156,6 @@ fn one_hour_from_now_iso() -> String {
         .checked_add_signed(chrono::TimeDelta::hours(1))
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339()
-}
-
-/// Convert a SQLite row into a `ChiCacheRow`. Explicit typing keeps sqlx happy
-/// when the query is built from a `&'static str`.
-fn row_to_cache_row(r: &sqlx::sqlite::SqliteRow) -> Result<ChiCacheRow, String> {
-    let artifacts: Option<String> = r.try_get("artifacts").ok().flatten();
-    let artifacts = artifacts.and_then(|s| serde_json::from_str(&s).ok());
-
-    let output_truncated: Option<i64> = r.try_get("output_truncated").ok().flatten();
-    let output_truncated = output_truncated.map(|v| v != 0);
-
-    Ok(ChiCacheRow {
-        run_id: r.get("run_id"),
-        engine_id: r.get("engine_id"),
-        external_id: r.get("external_id"),
-        brief: r.get("brief"),
-        cwd: r.get("cwd"),
-        model: r.get("model"),
-        mode: r.get("mode"),
-        status: r.get("status"),
-        output_path: r.get("output_path"),
-        output_truncated,
-        error: r.get("error"),
-        artifacts,
-        parent_id: r.get("parent_id"),
-        owner: r.get("owner"),
-        pid: r.get("pid"),
-        started_at: r.get("started_at"),
-        ended_at: r.get("ended_at"),
-        last_seen_at: r.get("last_seen_at"),
-        expires_at: r.get("expires_at"),
-    })
 }
 
 /// Upsert a cache row from the options. Returns the run_id.
@@ -283,60 +201,6 @@ async fn cache_insert(
     .await
     .map_err(|e| format!("chi_cache insert: {e}"))?;
     Ok(())
-}
-
-async fn cache_get(db: &PaDb, run_id: &str) -> Result<Option<ChiCacheRow>, String> {
-    let pool = db.ensure_pool().await?;
-    let row = sqlx::query(
-        "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
-                output_path, output_truncated, error, artifacts, parent_id, owner,
-                pid, started_at, ended_at, last_seen_at, expires_at
-         FROM chi_cache WHERE run_id = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| format!("chi_cache get: {e}"))?;
-
-    row.as_ref().map(row_to_cache_row).transpose()
-}
-
-async fn cache_list(
-    db: &PaDb,
-    engine_id: Option<&str>,
-    limit: i64,
-) -> Result<Vec<ChiCacheRow>, String> {
-    let pool = db.ensure_pool().await?;
-    let rows = if let Some(engine) = engine_id {
-        sqlx::query(
-            "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
-                    output_path, output_truncated, error, artifacts, parent_id, owner,
-                    pid, started_at, ended_at, last_seen_at, expires_at
-             FROM chi_cache
-             WHERE engine_id = ?
-             ORDER BY last_seen_at DESC
-             LIMIT ?",
-        )
-        .bind(engine)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-    } else {
-        sqlx::query(
-            "SELECT run_id, engine_id, external_id, brief, cwd, model, mode, status,
-                    output_path, output_truncated, error, artifacts, parent_id, owner,
-                    pid, started_at, ended_at, last_seen_at, expires_at
-             FROM chi_cache
-             ORDER BY last_seen_at DESC
-             LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-    }
-    .map_err(|e| format!("chi_cache list: {e}"))?;
-
-    rows.iter().map(row_to_cache_row).collect()
 }
 
 async fn cache_update_status(
@@ -1596,13 +1460,6 @@ async fn write_output_file(path: &Path, output: &str, error: Option<&str>) -> Re
     Ok(())
 }
 
-async fn read_output_file(path: &Path) -> Option<RunOutputFile> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(s) => parse_output_file(&s),
-        Err(_) => None,
-    }
-}
-
 /// Run a Chi. Spawns the engine child in the background and returns the
 /// run id immediately.
 #[tauri::command]
@@ -2004,61 +1861,16 @@ pub async fn chi_status(
     cache: State<'_, ChiCache>,
     #[allow(non_snake_case)] runId: String,
 ) -> Result<ChiRunResult, String> {
-    let run_id = runId;
-    let row = cache_get(&db, &run_id)
-        .await?
-        .ok_or_else(|| format!("chi run not found: {run_id}"))?;
-
-    let output_path = resolve_output_path(&cache.cache_dir(), row.output_path.as_deref());
-
-    // A live detached run: the row only learns its end from the sweep, so
-    // report what the runner's pid + status file say now (the same decision
-    // the sweep will persist). The pid is probed before the file is read —
-    // see `chi_runner::decide_liveness`.
-    let detached_live = row
-        .pid
-        .filter(|_| matches!(row.status.as_str(), "queued" | "running"))
-        .map(|pid| pid_alive(pid, &chi_runner::probe_runner));
-
-    let file = if let Some(path) = output_path {
-        read_output_file(&path).await
-    } else {
-        None
-    };
-
-    let (status, decided_error) = match detached_live {
-        Some(alive) => match chi_runner::decide_liveness(
-            alive,
-            file.as_ref().and_then(|f| f.status.as_deref()),
-            file.as_ref().and_then(|f| f.error.as_deref()),
-        ) {
-            RunLiveness::Running => (row.status, None),
-            RunLiveness::Terminal { status, error } => (status.to_string(), error),
-        },
-        None => (row.status, None),
-    };
-
-    Ok(ChiRunResult {
-        run_id: row.run_id,
-        status,
-        output: file.as_ref().and_then(|f| f.output.clone()).or(row.brief),
-        output_truncated: row.output_truncated,
-        error: decided_error.or(file.and_then(|f| f.error)).or(row.error),
-    })
-}
-
-/// A row's `output_path`, relative paths resolved against the cache dir.
-fn resolve_output_path(cache_dir: &Path, output_path: Option<&str>) -> Option<PathBuf> {
-    output_path
-        .filter(|p| !p.is_empty())
-        .map(Path::new)
-        .map(|p| {
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cache_dir.join(p)
-            }
-        })
+    // The read path (row + output file + detached-run liveness, no writes)
+    // is shared with the daemon's `chi_status` arm.
+    chi_read::status(
+        &db,
+        &cache.cache_dir(),
+        &runId,
+        &chi_runner::probe_runner,
+        chi_read::OutputFiles::AsStored,
+    )
+    .await
 }
 
 /// List cached Chi runs, optionally filtered by engine. Merges with agent-native
@@ -2070,7 +1882,7 @@ pub async fn chi_list(
     limit: Option<i64>,
 ) -> Result<Vec<ChiCacheRow>, String> {
     let engine_id = engineId.as_deref();
-    let mut rows = cache_list(&db, engine_id, limit.unwrap_or(50).clamp(1, 200)).await?;
+    let mut rows = chi_read::list(&db, engine_id, limit).await?;
 
     // Merge with Claude JSONL records when no engine filter or claude-code.
     if engine_id.is_none() || engine_id == Some("claude-code") {
@@ -2245,12 +2057,6 @@ struct DetachedObservation {
     external_id: Option<String>,
 }
 
-fn pid_alive(pid: i64, probe: &(dyn Fn(u32) -> chi_runner::PidProbe + Sync)) -> bool {
-    u32::try_from(pid)
-        .map(|p| probe(p).alive())
-        .unwrap_or(false)
-}
-
 /// Probe `pid`, *then* read the status file — the order the liveness rule
 /// depends on (`chi_runner::decide_liveness`).
 async fn observe_detached(
@@ -2376,6 +2182,7 @@ pub(crate) fn install_detached_reconciler(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::shared::chi::{cache_list, parse_output_file};
 
     async fn test_db() -> PaDb {
         let file_name = format!("ikenga-chi-test-{}.db", uuid::Uuid::new_v4());
@@ -3073,7 +2880,7 @@ mod tests {
             assert_eq!(r.status, "failed", "{id}");
             assert_eq!(
                 r.error.as_deref(),
-                Some(chi_runner::RUNNER_EXITED_ERROR),
+                Some(crate::server::shared::chi_liveness::RUNNER_EXITED_ERROR),
                 "{id}"
             );
         }

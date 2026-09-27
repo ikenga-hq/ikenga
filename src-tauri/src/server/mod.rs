@@ -96,6 +96,12 @@ pub struct AppState {
     /// `--data-dir` (see `server::rpc_local::DaemonSettings`). `None` without
     /// a data dir or without a home; those arms then say which is missing.
     pub(crate) settings: Option<Arc<rpc_local::DaemonSettings>>,
+    /// The home the per-user-file arms resolve against (the agent-ops job
+    /// config, run tails and daemon lock): the router's home seam, i.e. the
+    /// daemon PROCESS's home in production. `None` when it has none; those
+    /// arms then answer the desktop's "home directory not found".
+    /// Single-user seam (G-PRINCIPAL / WP-20), same as `settings` above.
+    pub(crate) home: Option<PathBuf>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -221,7 +227,8 @@ pub fn create_router(
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 ) -> Router {
     // Single-user seam (G-PRINCIPAL / WP-20): the personal settings file is
-    // `<home>/.ikenga/settings.json` for the daemon PROCESS's home
+    // `<home>/.ikenga/settings.json` (and the agent-ops job files live under
+    // `<home>/.agent-ops` / `<home>/.atelier`) for the daemon PROCESS's home
     // (`platform::home_dir` reads HOME / USERPROFILE), shared by every caller
     // holding the token — the same seam as `fs_home` and the Ngwa store.
     router_with_home(
@@ -234,8 +241,9 @@ pub fn create_router(
     )
 }
 
-/// [`create_router`] with the settings home made explicit, so tests never
-/// resolve (or clear) the real user's `~/.ikenga/settings.json`.
+/// [`create_router`] with the home made explicit, so tests never resolve (or
+/// clear) the real user's `~/.ikenga/settings.json`, nor touch their
+/// agent-ops files.
 pub(crate) fn router_with_home(
     config: ServerConfig,
     pty_manager: Arc<PtyManager>,
@@ -254,11 +262,11 @@ pub(crate) fn router_with_home(
     let pkgs = pkg_index::scan(config.pkgs_dir.as_deref());
     let pkg_static = PkgStaticService::from_packages(config.pkgs_dir.as_deref(), &pkgs);
     let pkg_index = Arc::new(PkgIndex::from_packages(&pkgs));
-    let settings = match (&pa_db, &config.data_dir, home) {
+    let settings = match (&pa_db, &config.data_dir, &home) {
         (Some(db), Some(dir), Some(home)) => Some(Arc::new(rpc_local::DaemonSettings::new(
             db.clone(),
             dir.clone(),
-            home,
+            home.clone(),
         ))),
         _ => None,
     };
@@ -272,6 +280,7 @@ pub(crate) fn router_with_home(
         pkg_static,
         pkg_index,
         settings,
+        home,
         shutdown_tx,
     });
 
