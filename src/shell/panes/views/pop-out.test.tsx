@@ -21,7 +21,9 @@ vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
 	listen: vi.fn(() => Promise.resolve(() => {})),
 }));
-vi.mock('@/lib/iyke/client', () => ({ iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })) }));
+vi.mock('@/lib/iyke/client', () => ({
+	iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })),
+}));
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	spawnWindow: m.spawnWindow,
@@ -35,7 +37,9 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 }));
 
 // The live surfaces themselves are out of scope: only the Pop out path is.
-vi.mock('@/terminal/single-terminal', () => ({ SingleTerminal: () => <div data-testid="xterm" /> }));
+vi.mock('@/terminal/single-terminal', () => ({
+	SingleTerminal: () => <div data-testid="xterm" />,
+}));
 vi.mock('@/terminal/cost-hud', () => ({ CostHud: () => null }));
 vi.mock('@/terminal/git-ledger', () => ({ GitLedger: () => null }));
 vi.mock('@/terminal/permission-inbox', () => ({ PermissionInbox: () => null }));
@@ -108,7 +112,12 @@ beforeEach(() => {
 	useDetachedSurfaces.setState({ surfaceToWindow: {} });
 	useTerminalStore.setState({ tabs: [terminalTab('term-3')] } as never);
 	usePaneStore.setState({
-		root: { type: 'leaf', id: 'L1', tabs: [{ kind: 'terminal', sessionId: 'term-3' }], activeTabIdx: 0 },
+		root: {
+			type: 'leaf',
+			id: 'L1',
+			tabs: [{ kind: 'terminal', sessionId: 'term-3' }],
+			activeTabIdx: 0,
+		},
 		focusedId: 'L1',
 	});
 });
@@ -126,7 +135,9 @@ describe('TerminalView Pop out', () => {
 		expect(m.windowJoinSurface).toHaveBeenCalledWith(TERM_SURFACE, PROJECT);
 		expect(m.spawnWindow).not.toHaveBeenCalled();
 		await waitFor(() =>
-			expect(notice()?.message).toMatch(/^session \d+ moved to Window 2 — its address is unchanged$/)
+			expect(notice()?.message).toMatch(
+				/^session \d+ moved to Window 2 — its address is unchanged$/
+			)
 		);
 		// The pane swaps to its "popped out" placeholder, not a live duplicate.
 		expect(screen.queryByTestId('xterm')).toBeNull();
@@ -143,7 +154,9 @@ describe('TerminalView Pop out', () => {
 		queryClient.setQueryData(seatsQueryKey(PROJECT), [lead]);
 		render(<TerminalView sessionId="term-3" />);
 		fireEvent.click(screen.getByRole('button', { name: 'Pop out terminal' }));
-		await waitFor(() => expect(notice()?.message).toBe('lead moved to Window 2 — its address is unchanged'));
+		await waitFor(() =>
+			expect(notice()?.message).toBe('lead moved to Window 2 — its address is unchanged')
+		);
 	});
 
 	it('spawns its own single-surface terminal window only when no Window 2 is open', async () => {
@@ -151,7 +164,11 @@ describe('TerminalView Pop out', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Pop out terminal' }));
 		await waitFor(() => expect(m.spawnWindow).toHaveBeenCalledTimes(1));
 		const d = m.spawnWindow.mock.calls[0][0] as unknown as Record<string, unknown>;
-		expect(d).toMatchObject({ kind: 'single-surface', surface_set: [TERM_SURFACE], project_id: null });
+		expect(d).toMatchObject({
+			kind: 'single-surface',
+			surface_set: [TERM_SURFACE],
+			project_id: null,
+		});
 		expect(d.label).toMatch(/^detached-terminal-/);
 		await waitFor(() => expect(surfaceMap()[TERM_SURFACE]).toBe(d.label));
 	});
@@ -193,7 +210,11 @@ describe('ArtifactView Pop out', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Pop out viewer' }));
 		await waitFor(() => expect(m.spawnWindow).toHaveBeenCalledTimes(1));
 		const d = m.spawnWindow.mock.calls[0][0] as unknown as Record<string, unknown>;
-		expect(d).toMatchObject({ kind: 'single-surface', surface_set: [VIEWER_SURFACE], project_id: null });
+		expect(d).toMatchObject({
+			kind: 'single-surface',
+			surface_set: [VIEWER_SURFACE],
+			project_id: null,
+		});
 		expect(d.label).toMatch(/^detached-viewer-/);
 	});
 

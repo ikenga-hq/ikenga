@@ -62,7 +62,12 @@ beforeEach(() => {
 	__resetBoardUiForTests();
 	useTerminalStore.setState({ tabs: [] } as never);
 	usePaneStore.setState({
-		root: { type: 'leaf', id: 'L1', tabs: [{ kind: 'route', path: '/project/dashboard' }], activeTabIdx: 0 },
+		root: {
+			type: 'leaf',
+			id: 'L1',
+			tabs: [{ kind: 'route', path: '/project/dashboard' }],
+			activeTabIdx: 0,
+		},
 		focusedId: 'L1',
 	});
 });
@@ -110,7 +115,9 @@ describe('SectionFrame headerActions slot', () => {
 		const btn = header(/Acted/);
 		expect(btn.contains(act)).toBe(false);
 		// Same row: both sit in the header wrapper, ahead of the body.
-		expect(act.closest('[data-explorer-header-actions="acted"]')?.parentElement).toBe(btn.parentElement);
+		expect(act.closest('[data-explorer-header-actions="acted"]')?.parentElement).toBe(
+			btn.parentElement
+		);
 		// D-09 `.sechead { padding-right: 76px }` clears room for the link.
 		expect(btn.className).toContain('pr-[76px]');
 	});

@@ -58,7 +58,9 @@ describe('RunFields — seat target', () => {
 	});
 
 	it('shows no seat field for any other target', () => {
-		render(<RunFields {...props({ chiTarget: 'engine', chiSeat: 'lead', seatSuggestions: ['lead'] })} />);
+		render(
+			<RunFields {...props({ chiTarget: 'engine', chiSeat: 'lead', seatSuggestions: ['lead'] })} />
+		);
 		expect(screen.queryByRole('textbox', { name: 'Seat' })).toBeNull();
 		expect(screen.queryByRole('group', { name: 'Seats in this project' })).toBeNull();
 	});
@@ -77,7 +79,14 @@ describe('RunFields — seat target', () => {
 	it('offers the active project’s seats as chips that fill the field', () => {
 		const onChangeChiSeat = vi.fn<(v: string) => void>();
 		render(
-			<RunFields {...props({ chiTarget: 'seat', chiSeat: 'lead', seatSuggestions: ['lead', 'review'], onChangeChiSeat })} />
+			<RunFields
+				{...props({
+					chiTarget: 'seat',
+					chiSeat: 'lead',
+					seatSuggestions: ['lead', 'review'],
+					onChangeChiSeat,
+				})}
+			/>
 		);
 		const chips = screen.getByRole('group', { name: 'Seats in this project' });
 		const lead = screen.getByRole('button', { name: '@lead' });
