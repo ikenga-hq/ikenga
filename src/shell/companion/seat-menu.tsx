@@ -140,8 +140,10 @@ function seatOfTerminal(terminalId: string): SeatView | undefined {
 	);
 }
 
-/** The seat name (or session label) for a returned terminal. */
-function returnedName(terminalId: string): string {
+/** What a toast calls terminal `terminalId` (D-09 `popOut` / `moveBack`):
+ *  its seat's name, else its session label. Read from the roster cache only,
+ *  so a Pop out never waits on a fetch. The pane's own Pop out uses it too. */
+export function terminalToastName(terminalId: string): string {
 	const seat = seatOfTerminal(terminalId);
 	return seat ? seat.name : sessionName(terminalId);
 }
@@ -168,14 +170,16 @@ function mainPaneText(terminal: TerminalTab): string {
  * The toast speaks D-09's words, and only for Window 2: a closed window
  * speaks only when a Pop out put something in it (`isWindowTwoLabel`), so
  * closing an ordinary pane / viewer pop-out stays silent as it always was,
- * and it counts the terminals actually brought back.
+ * and it counts every surface brought back (terminals and viewers).
  */
 export function handleSurfacesReturned(e: SurfacesReturned): void {
 	const terminals = e.surfaceIds
 		.filter((id) => id.startsWith('terminal:'))
 		.map((id) => useTerminalStore.getState().tabs.find((t) => t.ptyId === id.slice('terminal:'.length)))
 		.filter((t): t is NonNullable<typeof t> => Boolean(t));
-	let returned = 0;
+	// Anything else (a viewer) was popped out from a pane, whose placeholder
+	// shows it live again: it came back too, so the count includes it.
+	let returned = e.surfaceIds.filter((id) => !id.startsWith('terminal:')).length;
 	for (const t of terminals) {
 		const panes = usePaneStore.getState();
 		const view = { kind: 'terminal' as const, sessionId: t.id };
@@ -199,7 +203,7 @@ export function handleSurfacesReturned(e: SurfacesReturned): void {
 	}
 	const t = terminals[0];
 	if (!t) return;
-	showSeatNotice(`${returnedName(t.id)} moved to ${mainPaneText(t)} — its address is unchanged`);
+	showSeatNotice(`${terminalToastName(t.id)} moved to ${mainPaneText(t)} — its address is unchanged`);
 }
 
 /**

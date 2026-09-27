@@ -20,16 +20,12 @@ import { FeedbackState } from '@/components/ui/feedback-state';
 import { IconButton } from '@/components/ui/icon-button';
 import { findLeaf, getActiveView } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { cachedSeats } from '@/lib/queries/seats';
-import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	clearPendingReclaimNudge,
 	hasPendingReclaimNudge,
 	useIsSurfaceDetached,
 } from '@/lib/window/detached-surfaces';
-import { popOutTerminal } from '@/shell/companion/seat-menu';
-import { sessionName } from '@/shell/companion/seat-sessions';
-import { isRunAttachCmd } from '@/terminal/attach-run';
+import { popOutTerminal, terminalToastName } from '@/shell/companion/seat-menu';
 import { CostHud } from '@/terminal/cost-hud';
 import { GitLedger } from '@/terminal/git-ledger';
 import { PermissionInbox } from '@/terminal/permission-inbox';
@@ -41,26 +37,6 @@ import { DetachedSurfacePlaceholder } from './detached-placeholder';
 
 interface TerminalViewProps {
 	sessionId: string;
-}
-
-/**
- * What a Pop out toast calls this terminal (D-09 `popOut`: the seat's name,
- * else the session's): the active project's seat whose session it is (its
- * own terminal, or a tmux client attached to its run), else `session N`.
- * Mirrors the seat menu's private `returnedName`/`seatOfTerminal`, read from
- * the roster cache only (a Pop out never waits on a fetch). Keep the two in
- * step: WP-71 (which may edit `companion/`) should export `returnedName` from
- * `seat-menu.tsx` and delete this copy.
- */
-export function popOutName(terminalId: string): string {
-	const seats = cachedSeats(useShellStore.getState().activeProject.id) ?? [];
-	const tab = useTerminalStore.getState().tabs.find((t) => t.id === terminalId);
-	const seat = seats.find(
-		(st) =>
-			(st.session?.kind === 'terminal' && st.session.terminal_id === terminalId) ||
-			(st.session?.kind === 'run' && tab !== undefined && isRunAttachCmd(tab.spec.cmd, st.session.run_id))
-	);
-	return seat ? seat.name : sessionName(terminalId);
 }
 
 export function TerminalView({ sessionId }: TerminalViewProps) {
@@ -142,7 +118,7 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 	// so either way with D-09's toast.
 	const handlePopOut = useCallback(() => {
 		if (!ptyId || !surfaceId) return;
-		popOutTerminal(sessionId, popOutName(sessionId));
+		popOutTerminal(sessionId, terminalToastName(sessionId));
 	}, [ptyId, surfaceId, sessionId]);
 
 	if (tab && tab.owner.kind === 'studio') {
