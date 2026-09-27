@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::rpc_local;
+use super::rpc_shell;
 use super::AppState;
 use crate::pty::SpawnOpts;
 
@@ -639,6 +640,79 @@ pub async fn rpc_handler(
         "agent_ops_delete_job" => rpc_local::agent_ops_delete_job(&state, &payload.args).await,
         "agent_ops_set_enabled" => rpc_local::agent_ops_set_enabled(&state, &payload.args).await,
         "os_username" => rpc_local::os_username(),
+
+        // --- Shell state: notifications, projects, pins, comments, studio
+        //     threads (WP-19 slice 4) ---
+        //
+        // Bodies in `server::rpc_shell`, over `server::shared::{notifications,
+        // projects, activity_bar, comments, studio_threads}` — the cores the
+        // desktop commands call. All need `--data-dir`; the mute half of
+        // notifications also needs the settings home. No events are emitted
+        // (no event channel here). The project filesystem arms stay inside the
+        // fs allowlist and the project root. Left desktop-only:
+        // `notifications_record_update` (its sweep needs the shell version +
+        // pkg kernel), `comment_route` (spawns chi), `pin_screenshot_write`.
+        "notifications_list" => rpc_shell::notifications_list(&state, &payload.args).await,
+        "notifications_unread_count" => rpc_shell::notifications_unread_count(&state).await,
+        "notifications_mark_read" => {
+            rpc_shell::notifications_mark_read(&state, &payload.args).await
+        }
+        "notifications_mark_all_read" => {
+            rpc_shell::notifications_mark_all_read(&state, &payload.args).await
+        }
+        "notifications_mute_state" => rpc_shell::notifications_mute_state(&state).await,
+        "notifications_mute_kind" => {
+            rpc_shell::notifications_mute_kind(&state, &payload.args).await
+        }
+        "notifications_unmute_kind" => {
+            rpc_shell::notifications_unmute_kind(&state, &payload.args).await
+        }
+        "project_list" => rpc_shell::project_list(&state, &payload.args).await,
+        "project_get_active" => rpc_shell::project_get_active(&state).await,
+        "project_create" => rpc_shell::project_create(&state, &payload.args).await,
+        "project_update" => rpc_shell::project_update(&state, &payload.args).await,
+        "project_archive" => rpc_shell::project_archive(&state, &payload.args).await,
+        "project_set_active" => rpc_shell::project_set_active(&state, &payload.args).await,
+        "project_inventory" => rpc_shell::project_inventory(&state, &payload.args).await,
+        "project_skills_list" => rpc_shell::project_skills_list(&state, &payload.args).await,
+        "project_artifacts_walk" => rpc_shell::project_artifacts_walk(&state, &payload.args).await,
+        "project_scaffold_claude" => rpc_shell::project_scaffold_claude(&state, &payload.args),
+        "activity_sections_list" => rpc_shell::activity_sections_list(&state).await,
+        "activity_sections_create" => {
+            rpc_shell::activity_sections_create(&state, &payload.args).await
+        }
+        "activity_sections_update" => {
+            rpc_shell::activity_sections_update(&state, &payload.args).await
+        }
+        "activity_sections_remove" => {
+            rpc_shell::activity_sections_remove(&state, &payload.args).await
+        }
+        "activity_pins_list" => rpc_shell::activity_pins_list(&state).await,
+        "activity_pins_add" => rpc_shell::activity_pins_add(&state, &payload.args).await,
+        "activity_pins_resolve_artifact" => {
+            rpc_shell::activity_pins_resolve_artifact(&state, &payload.args).await
+        }
+        "activity_pins_touch_open" => {
+            rpc_shell::activity_pins_touch_open(&state, &payload.args).await
+        }
+        "activity_pins_remove" => rpc_shell::activity_pins_remove(&state, &payload.args).await,
+        "activity_pins_reorder" => rpc_shell::activity_pins_reorder(&state, &payload.args).await,
+        "comment_create" => rpc_shell::comment_create(&state, &payload.args).await,
+        "comment_get" => rpc_shell::comment_get(&state, &payload.args).await,
+        "comment_list" => rpc_shell::comment_list(&state, &payload.args).await,
+        "comment_record_routing" => rpc_shell::comment_record_routing(&state, &payload.args).await,
+        "comment_set_status" => rpc_shell::comment_set_status(&state, &payload.args).await,
+        "comment_delete" => rpc_shell::comment_delete(&state, &payload.args).await,
+        "studio_thread_get_or_create" => {
+            rpc_shell::studio_thread_get_or_create(&state, &payload.args).await
+        }
+        "studio_thread_get" => rpc_shell::studio_thread_get(&state, &payload.args).await,
+        "studio_thread_list_recent" => {
+            rpc_shell::studio_thread_list_recent(&state, &payload.args).await
+        }
+        "studio_thread_delete" => rpc_shell::studio_thread_delete(&state, &payload.args).await,
+        "studio_message_append" => rpc_shell::studio_message_append(&state, &payload.args).await,
+        "studio_message_list" => rpc_shell::studio_message_list(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
         other => {

@@ -57,46 +57,6 @@ reason = "manager.trust_status reads the project-trust record from db; no spawn.
 tag = "WP-19"
 reason = "manager.write validates+atomically writes actions.json; no spawn."
 
-[activity_pins_add]
-tag = "WP-19"
-reason = "sqlx INSERT into pins table; no spawn."
-
-[activity_pins_list]
-tag = "WP-19"
-reason = "sqlx SELECT over the pins table; no spawn in activity_bar.rs."
-
-[activity_pins_remove]
-tag = "WP-19"
-reason = "sqlx DELETE by id from pins table; no spawn."
-
-[activity_pins_reorder]
-tag = "WP-19"
-reason = "sqlx UPDATE of pin ordering; no spawn."
-
-[activity_pins_resolve_artifact]
-tag = "WP-19"
-reason = "Resolves an artifact reference against db/kernel state for a pin; no Command::new in this file."
-
-[activity_pins_touch_open]
-tag = "WP-19"
-reason = "Updates last-opened timestamp on a pin row via sqlx; no spawn."
-
-[activity_sections_create]
-tag = "WP-19"
-reason = "sqlx INSERT into sections table; no spawn."
-
-[activity_sections_list]
-tag = "WP-19"
-reason = "sqlx SELECT over sections table; no spawn."
-
-[activity_sections_remove]
-tag = "WP-19"
-reason = "sqlx DELETE of a section row; no spawn."
-
-[activity_sections_update]
-tag = "WP-19"
-reason = "sqlx UPDATE of a section row; no spawn."
-
 [agent_ops_run_now]
 tag = "WP-18b"
 reason = "POSTs the {port, secret} from ~/.agent-ops/daemon.lock to a SEPARATE local agent-ops daemon's /jobs/<id>/trigger endpoint, which then runs the job (a shell command or `claude -p`) outside the session executor; serving it would let any token holder fire host jobs remotely. Held until executor routing + principal scoping (WP-20) decide who may."
@@ -261,33 +221,9 @@ reason = "import_core copies a file into the store as canonical copy; a plain fs
 tag = "WP-19"
 reason = "claude_store_list_inner scans store dir + registry.json, overlays provenance; no spawn (no Command::new in claude_store.rs)."
 
-[comment_create]
-tag = "WP-19"
-reason = "sqlx INSERT into artifact_comments; no spawn in comments.rs."
-
-[comment_delete]
-tag = "WP-19"
-reason = "sqlx DELETE from artifact_comments; no spawn."
-
-[comment_get]
-tag = "WP-19"
-reason = "sqlx SELECT one artifact_comments row by id; no spawn."
-
-[comment_list]
-tag = "WP-19"
-reason = "sqlx SELECT list of artifact_comments; no spawn."
-
-[comment_record_routing]
-tag = "WP-19"
-reason = "sqlx UPDATE recording which sink a comment was routed to; DB write only (the actual spawn, if any, happens in comment_route)."
-
 [comment_route]
 tag = "WP-18b"
 reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) through executor::current(); executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[comment_set_status]
-tag = "WP-19"
-reason = "sqlx UPDATE of comment status column; no spawn."
 
 [db_export_ndjson]
 tag = "WP-19"
@@ -445,37 +381,9 @@ reason = "Pure std::fs::read_dir scan of ~/.claude/projects/*.jsonl; no spawn."
 tag = "WP-19"
 reason = "ngwa_snapshot_inner needs the live pkg kernel: kernel.status() (registries, sidecars, installed set) and trust evaluation of each installed pkg against app_data_dir, plus a ~/.claude/projects usage scan. The daemon has no kernel, only the read-only --pkgs-dir PkgIndex, so it has no honest snapshot to return."
 
-[notifications_list]
-tag = "WP-19"
-reason = "notifications::list queries PaDb sqlite; no spawn."
-
-[notifications_mark_all_read]
-tag = "WP-19"
-reason = "notifications::mark_all_read is a sqlite UPDATE; no spawn."
-
-[notifications_mark_read]
-tag = "WP-19"
-reason = "notifications::mark_read is a sqlite UPDATE; no spawn."
-
-[notifications_mute_kind]
-tag = "WP-19"
-reason = "mute::set_muted writes settings.json + notes db row; no spawn."
-
-[notifications_mute_state]
-tag = "WP-19"
-reason = "mute::MuteState::from_muted reads settings.json mutedKinds; no spawn."
-
 [notifications_record_update]
 tag = "WP-19"
-reason = "producers::update + notifications::record + sweep_installed_updates (notifications.rs:187) are all db/version-compare logic; no spawn."
-
-[notifications_unmute_kind]
-tag = "WP-19"
-reason = "mute::clear_muted_backlog + set_muted are db/settings writes; no spawn."
-
-[notifications_unread_count]
-tag = "WP-19"
-reason = "notifications::unread_count queries PaDb; no spawn."
+reason = "Not served in slice 4, where the rest of notifications_* moved: after recording the row it sweeps update rows against the running shell's app.package_info() version and the live pkg kernel's installed set (commands/notifications.rs sweep_installed_updates). The daemon has neither (no shell package_info; its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could record but not honestly resolve; and producers::update lives in the desktop-only notifications::producers (it leans on engines::claude_code)."
 
 [oba_auto_update_all]
 tag = "WP-18b"
@@ -749,46 +657,6 @@ reason = "Navigates a native child webview pane; child-webview-panes category."
 tag = "desktop-only-forever"
 reason = "Repositions/resizes a native child webview pane on the main thread."
 
-[project_archive]
-tag = "WP-19"
-reason = "archive_project marks a PaDb row archived; no spawn."
-
-[project_artifacts_walk]
-tag = "WP-19"
-reason = "Plain std::fs dir walk (walk_dir), no process spawn; a read the daemon could serve for a remote client."
-
-[project_create]
-tag = "WP-19"
-reason = "create_project inserts a PaDb row; no spawn."
-
-[project_get_active]
-tag = "WP-19"
-reason = "get_active_project_id reads PaDb, falls back to default; no spawn."
-
-[project_inventory]
-tag = "WP-19"
-reason = "count_skills/count_commands/count_mcp_servers are std::fs walks of `.claude/`; no spawn."
-
-[project_list]
-tag = "WP-19"
-reason = "list_projects queries PaDb; no spawn."
-
-[project_scaffold_claude]
-tag = "WP-19"
-reason = "write_if_missing/create_dir_all scaffold `.claude/` + CLAUDE.md via std::fs only; no spawn."
-
-[project_set_active]
-tag = "WP-19"
-reason = "set_active_project_id writes PaDb + app.emit broadcast; no process spawn."
-
-[project_skills_list]
-tag = "WP-19"
-reason = "list_skills_in_dir walks skills dirs + parses frontmatter via std::fs; no spawn."
-
-[project_update]
-tag = "WP-19"
-reason = "update_project patches a PaDb row; no spawn."
-
 [pty_attach_arm]
 tag = "desktop-only-forever"
 reason = "Step 2 of the same native window-attach handshake as pty_attach_begin; no daemon/browser meaning."
@@ -948,30 +816,6 @@ reason = "Debug ACL spike granting a Tauri dynamic capability scoped to window '
 [spike_setup_test_file]
 tag = "desktop-only-forever"
 reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: 'Spike'); no independent value."
-
-[studio_message_append]
-tag = "WP-19"
-reason = "sqlx INSERT of a studio message row; no spawn."
-
-[studio_message_list]
-tag = "WP-19"
-reason = "sqlx SELECT list of studio messages; no spawn."
-
-[studio_thread_delete]
-tag = "WP-19"
-reason = "sqlx DELETE of a studio thread row; no spawn."
-
-[studio_thread_get]
-tag = "WP-19"
-reason = "sqlx SELECT single studio thread row; no spawn."
-
-[studio_thread_get_or_create]
-tag = "WP-19"
-reason = "sqlx SELECT/INSERT on studio threads table; no spawn in studio_threads.rs."
-
-[studio_thread_list_recent]
-tag = "WP-19"
-reason = "sqlx SELECT recent studio threads; no spawn."
 
 [terminal_detect_shells]
 tag = "WP-19"
