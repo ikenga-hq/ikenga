@@ -3,6 +3,11 @@
 //! Discovers a running `ikenga-server` daemon or launches one in a detached
 //! process and waits up to [`SPAWN_READY_TIMEOUT`] for it to become healthy. Decouples PTY process lifecycle from the
 //! desktop Tauri GUI window so terminal sessions survive app restarts and reloads.
+//!
+//! The daemon's bearer token opens a shell as this user. It is handed to the
+//! daemon through the environment, never argv, and a running daemon is
+//! adopted only when it is this app's version and accepts the token we hold
+//! (see `init_daemon`, `server::discovery`).
 
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -72,23 +77,12 @@ impl DaemonState {
         if !info.available || info.mode != "persistent" {
             return false;
         }
-        let shutdown_url = format!("{}/api/shutdown", info.http_url);
-        let client = ureq::AgentBuilder::new()
-            .timeout(Duration::from_millis(1500))
-            .build();
-        match client
-            .post(&shutdown_url)
-            .set("Authorization", &format!("Bearer {}", info.token))
-            .call()
-        {
-            Ok(_) => {
-                info!("Sent POST /api/shutdown to daemon at {}", info.http_url);
-                true
-            }
-            Err(e) => {
-                warn!("Failed to send POST /api/shutdown to daemon: {e}");
-                false
-            }
+        if post_shutdown(&info.http_url, &info.token) {
+            info!("Sent POST /api/shutdown to daemon at {}", info.http_url);
+            true
+        } else {
+            warn!("Failed to send POST /api/shutdown to daemon at {}", info.http_url);
+            false
         }
     }
 }
@@ -157,109 +151,172 @@ pub fn find_daemon_binary() -> Option<PathBuf> {
     None
 }
 
+
+/// The version this app expects its daemon to be. The daemon's `/api/health`
+/// reports the same crate's `CARGO_PKG_VERSION`, so equal strings mean the
+/// daemon was built from the release this app shipped with.
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long to wait for an outdated daemon to exit after asking it to.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(3000);
+
 /// Probe health endpoint of daemon.
 pub fn probe_health(http_url: &str, timeout_ms: u64) -> bool {
+    health_version(http_url, timeout_ms).is_some()
+}
+
+/// `GET /api/health` → the reported `version` (empty if the field is absent).
+/// `None` when nothing healthy answers.
+fn health_version(http_url: &str, timeout_ms: u64) -> Option<String> {
     let health_url = format!("{http_url}/api/health");
     let client = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(timeout_ms))
         .build();
-    match client.get(&health_url).call() {
-        Ok(res) => res.status() == 200,
-        Err(_) => false,
+    let res = client.get(&health_url).call().ok()?;
+    if res.status() != 200 {
+        return None;
+    }
+    let json: serde_json::Value = res.into_json().unwrap_or_default();
+    Some(
+        json.get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// What a candidate daemon turned out to be.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    /// Nothing healthy answered.
+    Down,
+    /// Healthy, this app's version, and it accepts our token.
+    Usable,
+    /// Healthy but built from a different release.
+    WrongVersion(String),
+    /// Healthy and current, but our token doesn't open it. Somebody else's
+    /// daemon — possibly another local user's, since 127.0.0.1:4000 is shared
+    /// by every account on the machine.
+    Unauthorized,
+}
+
+/// Decide whether the daemon at `http_url` is one this app may adopt with
+/// `token`. `/api/health` is unauthenticated, so a 200 there proves only that
+/// *a* daemon is listening; the token is checked separately against a
+/// protected route.
+fn probe_candidate(http_url: &str, token: &str, timeout_ms: u64) -> Probe {
+    let Some(version) = health_version(http_url, timeout_ms) else {
+        return Probe::Down;
+    };
+    if version != APP_VERSION {
+        return Probe::WrongVersion(version);
+    }
+    if token.is_empty() || !token_accepted(http_url, token, timeout_ms) {
+        return Probe::Unauthorized;
+    }
+    Probe::Usable
+}
+
+/// Whether `token` passes the daemon's auth middleware. Sends an RPC name no
+/// handler implements, so nothing runs: the middleware answers 401 for a bad
+/// token before dispatch, and anything past it means the token was accepted.
+fn token_accepted(http_url: &str, token: &str, timeout_ms: u64) -> bool {
+    let client = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build();
+    match client
+        .post(&format!("{http_url}/api/rpc"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(serde_json::json!({ "cmd": "ikenga.auth_probe", "args": {} }))
+    {
+        Ok(_) => true,
+        Err(ureq::Error::Status(code, _)) => code != 401 && code != 403,
+        Err(ureq::Error::Transport(_)) => false,
     }
 }
 
-/// Discovers an already running daemon or launches one in a detached process with a 500ms timeout.
-pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
-    let temp_meta = std::env::temp_dir().join("ikenga-daemon.json");
-    let candidate_metas = if let Some(ref dir) = app_data_dir {
-        vec![dir.join("daemon/daemon.json"), temp_meta]
-    } else {
-        vec![temp_meta]
-    };
+/// `POST /api/shutdown` with `token`. True if the daemon acknowledged.
+fn post_shutdown(http_url: &str, token: &str) -> bool {
+    let client = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(1500))
+        .build();
+    client
+        .post(&format!("{http_url}/api/shutdown"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .call()
+        .is_ok()
+}
 
-    // 1. Check for existing running daemon metadata
-    for meta_path in candidate_metas {
-        if meta_path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                    let host = json
-                        .get("host")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("127.0.0.1")
-                        .to_string();
-                    let port = json.get("port").and_then(|v| v.as_u64()).unwrap_or(4000) as u16;
-                    let token = json
-                        .get("token")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let pid = json.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
-                    let http_url = format!("http://{host}:{port}");
-                    let ws_url = format!("ws://{host}:{port}");
-
-                    if probe_health(&http_url, 150) {
-                        info!("Found healthy running ikenga-server daemon at {http_url}");
-                        return DaemonInfo {
-                            available: true,
-                            host,
-                            port,
-                            token,
-                            http_url,
-                            ws_url,
-                            pid,
-                            mode: "persistent".into(),
-                        };
-                    }
-                }
-            }
-        }
+/// Ask an outdated daemon to exit and wait (bounded) until its port is free,
+/// so a fresh one can bind it. Best-effort: if it doesn't go, the spawn below
+/// fails to bind and the app falls back to ephemeral mode rather than
+/// adopting a daemon from another release.
+fn retire_outdated(http_url: &str, token: &str, version: &str) {
+    info!("ikenga-server at {http_url} is v{version}, this app is v{APP_VERSION}; replacing it");
+    if !post_shutdown(http_url, token) {
+        warn!("outdated ikenga-server at {http_url} refused shutdown; it will keep the port");
+        return;
     }
-
-    // Check default port 4000 just in case
-    if probe_health("http://127.0.0.1:4000", 150) {
-        info!("Found running ikenga-server daemon on port 4000 (no metadata file)");
-        return DaemonInfo {
-            available: true,
-            host: "127.0.0.1".into(),
-            port: 4000,
-            token: std::env::var("IKENGA_AUTH_TOKEN").unwrap_or_default(),
-            http_url: "http://127.0.0.1:4000".into(),
-            ws_url: "ws://127.0.0.1:4000".into(),
-            pid: None,
-            mode: "persistent".into(),
-        };
-    }
-
-    // 2. Launch detached daemon if binary exists
-    let binary = match find_daemon_binary() {
-        Some(b) => b,
-        None => {
-            warn!("ikenga-server binary not found; terminal falling back to ephemeral in-process mode");
-            return DaemonInfo::default();
+    let start = Instant::now();
+    while start.elapsed() < SHUTDOWN_WAIT {
+        if !probe_health(http_url, 100) {
+            return;
         }
-    };
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    warn!("outdated ikenga-server at {http_url} did not exit within {}ms", SHUTDOWN_WAIT.as_millis());
+}
 
-    let host = "127.0.0.1".to_string();
-    let port = 4000u16;
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let http_url = format!("http://{host}:{port}");
-    let ws_url = format!("ws://{host}:{port}");
+fn persistent_info(host: String, port: u16, token: String, pid: Option<u32>) -> DaemonInfo {
+    DaemonInfo {
+        available: true,
+        http_url: format!("http://{host}:{port}"),
+        ws_url: format!("ws://{host}:{port}"),
+        host,
+        port,
+        token,
+        pid,
+        mode: "persistent".into(),
+    }
+}
 
-    let mut cmd = std::process::Command::new(&binary);
+/// Discovery files to try, most specific first. Only files `is_trusted`
+/// accepts are ever read (owned by us, owner-only; see `server::discovery`).
+fn candidate_metas(app_data_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(dir) = app_data_dir {
+        v.push(dir.join("daemon/daemon.json"));
+    }
+    v.push(crate::server::discovery::user_temp_path());
+    v
+}
+
+/// The command that launches the detached daemon.
+///
+/// The bearer token travels in `IKENGA_AUTH_TOKEN`, never on the command line:
+/// argv is world-readable (`/proc/<pid>/cmdline` on Linux, `ps` on macOS), and
+/// this token opens a shell as the desktop user. A process's environment is
+/// readable only by the same user (or an administrator), and `ikenga-server`
+/// removes the variable from its own environment right after parsing, so PTY
+/// children don't inherit it either.
+fn build_daemon_command(
+    binary: &Path,
+    host: &str,
+    port: u16,
+    token: &str,
+    daemon_dir: Option<&Path>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(binary);
     cmd.arg("--host")
-        .arg(&host)
+        .arg(host)
         .arg("--port")
         .arg(port.to_string())
-        .arg("--auth-token")
-        .arg(&token)
         .arg("--idle-timeout")
-        .arg("60");
+        .arg("60")
+        .env("IKENGA_AUTH_TOKEN", token);
 
-    if let Some(ref dir) = app_data_dir {
-        let daemon_dir = dir.join("daemon");
-        let _ = std::fs::create_dir_all(&daemon_dir);
-        cmd.arg("--data-dir").arg(daemon_dir);
+    if let Some(dir) = daemon_dir {
+        cmd.arg("--data-dir").arg(dir);
     }
 
     #[cfg(unix)]
@@ -284,6 +341,100 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Discovers an already running daemon or launches one in a detached process
+/// and waits up to [`SPAWN_READY_TIMEOUT`] for it.
+///
+/// A daemon is adopted only if it is this app's version **and** accepts the
+/// token we hold for it. An outdated one (left running across an update) is
+/// shut down and replaced; one we can't authenticate to is left alone.
+pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
+    // 1. Check for existing running daemon metadata
+    for meta_path in candidate_metas(app_data_dir.as_deref()) {
+        if std::fs::symlink_metadata(&meta_path).is_err() {
+            continue;
+        }
+        if !crate::server::discovery::is_trusted(&meta_path) {
+            warn!(
+                "ignoring daemon discovery file {} (a symlink, or not owned by this user)",
+                meta_path.display()
+            );
+            continue;
+        }
+        if crate::server::discovery::tighten(&meta_path) {
+            info!("tightened {} to owner-only; it holds a bearer token", meta_path.display());
+        }
+        let Ok(content) = std::fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let host = json
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1")
+            .to_string();
+        let port = json.get("port").and_then(|v| v.as_u64()).unwrap_or(4000) as u16;
+        let token = json
+            .get("token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let pid = json.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let http_url = format!("http://{host}:{port}");
+
+        match probe_candidate(&http_url, &token, 150) {
+            Probe::Usable => {
+                info!("Found healthy running ikenga-server daemon at {http_url}");
+                return persistent_info(host, port, token, pid);
+            }
+            Probe::WrongVersion(version) => retire_outdated(&http_url, &token, &version),
+            Probe::Unauthorized => {
+                warn!("ikenga-server at {http_url} rejected the token from {}", meta_path.display());
+            }
+            Probe::Down => {}
+        }
+    }
+
+    // A daemon on the default port with no discovery file: only a manually
+    // started one, adoptable only with the token it was given in our env.
+    // Without that token there is nothing to authenticate with, and adopting
+    // it would leave every terminal failing with 401.
+    let env_token = std::env::var("IKENGA_AUTH_TOKEN").unwrap_or_default();
+    if !env_token.is_empty() {
+        let http_url = "http://127.0.0.1:4000";
+        match probe_candidate(http_url, &env_token, 150) {
+            Probe::Usable => {
+                info!("Found running ikenga-server daemon on port 4000 (no metadata file)");
+                return persistent_info("127.0.0.1".into(), 4000, env_token, None);
+            }
+            Probe::WrongVersion(version) => retire_outdated(http_url, &env_token, &version),
+            Probe::Unauthorized | Probe::Down => {}
+        }
+    }
+
+    // 2. Launch detached daemon if binary exists
+    let binary = match find_daemon_binary() {
+        Some(b) => b,
+        None => {
+            warn!("ikenga-server binary not found; terminal falling back to ephemeral in-process mode");
+            return DaemonInfo::default();
+        }
+    };
+
+    let host = "127.0.0.1".to_string();
+    let port = 4000u16;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let http_url = format!("http://{host}:{port}");
+
+    let daemon_dir = app_data_dir.as_ref().map(|dir| dir.join("daemon"));
+    if let Some(ref d) = daemon_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let mut cmd = build_daemon_command(&binary, &host, port, &token, daemon_dir.as_deref());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -299,23 +450,22 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
         SPAWN_READY_TIMEOUT.as_millis()
     );
 
+    // Ready means OUR daemon answers: this version, accepting the token only
+    // this call knows. A bare health 200 isn't enough — if the port is already
+    // taken (another user's daemon, a stale one that wouldn't exit) our child
+    // fails to bind while the other one keeps answering health checks.
     let start = Instant::now();
     while start.elapsed() < SPAWN_READY_TIMEOUT {
-        if probe_health(&http_url, 40) {
+        if let Ok(Some(status)) = child.try_wait() {
+            warn!("ikenga-server exited during startup ({status}); falling back to ephemeral in-process mode");
+            return DaemonInfo::default();
+        }
+        if probe_candidate(&http_url, &token, 40) == Probe::Usable {
             info!(
                 "ikenga-server daemon became ready in {}ms",
                 start.elapsed().as_millis()
             );
-            return DaemonInfo {
-                available: true,
-                host,
-                port,
-                token,
-                http_url,
-                ws_url,
-                pid: Some(pid),
-                mode: "persistent".into(),
-            };
+            return persistent_info(host, port, token, Some(pid));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -329,4 +479,131 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
     // daemon it can't authenticate to.
     let _ = child.kill();
     DaemonInfo::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    const TEST_TOKEN: &str = "test-token-not-a-secret-7f3a";
+
+    #[test]
+    fn spawned_command_carries_the_token_in_env_not_argv() {
+        let cmd = build_daemon_command(
+            Path::new("/opt/ikenga/ikenga-server"),
+            "127.0.0.1",
+            4000,
+            TEST_TOKEN,
+            Some(Path::new("/tmp/ikenga-data/daemon")),
+        );
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(
+            !args.iter().any(|a| a.contains(TEST_TOKEN)),
+            "the bearer token must not appear in the daemon's argv"
+        );
+        assert!(!args.iter().any(|a| a == "--auth-token"), "--auth-token must not be passed");
+
+        let env_token = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "IKENGA_AUTH_TOKEN")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert!(
+            env_token.as_deref() == Some(TEST_TOKEN),
+            "IKENGA_AUTH_TOKEN must carry the token to the daemon"
+        );
+        // The rest of the invocation is unchanged.
+        assert!(args.windows(2).any(|w| w[0] == "--port" && w[1] == "4000"));
+        assert!(args.iter().any(|a| a == "--data-dir"));
+    }
+
+    /// A one-shot stand-in for `ikenga-server`: `/api/health` reports
+    /// `version`, and `/api/rpc` answers 401 unless the bearer token matches.
+    fn fake_daemon(version: &'static str, token: &'static str, requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut authorized = false;
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let lower = line.to_ascii_lowercase();
+                    if lower.starts_with("authorization:") {
+                        authorized = line.trim_end().ends_with(&format!("Bearer {token}"));
+                    }
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body);
+                let (status, payload) = if request_line.starts_with("GET /api/health") {
+                    ("200 OK", format!("{{\"ok\":true,\"version\":\"{version}\"}}"))
+                } else if !authorized {
+                    ("401 Unauthorized", "{}".to_string())
+                } else {
+                    ("200 OK", "{\"ok\":false,\"error\":\"unknown command\"}".to_string())
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_current_daemon_that_accepts_the_token_is_usable() {
+        let url = fake_daemon(APP_VERSION, TEST_TOKEN, 2);
+        assert_eq!(probe_candidate(&url, TEST_TOKEN, 2000), Probe::Usable);
+    }
+
+    #[test]
+    fn a_daemon_from_another_release_is_not_adopted() {
+        let url = fake_daemon("0.0.1-old", TEST_TOKEN, 1);
+        assert_eq!(
+            probe_candidate(&url, TEST_TOKEN, 2000),
+            Probe::WrongVersion("0.0.1-old".into())
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_rejects_our_token_is_not_adopted() {
+        let url = fake_daemon(APP_VERSION, "somebody-elses-token", 2);
+        assert_eq!(probe_candidate(&url, TEST_TOKEN, 2000), Probe::Unauthorized);
+    }
+
+    #[test]
+    fn an_empty_token_is_never_usable() {
+        let url = fake_daemon(APP_VERSION, TEST_TOKEN, 1);
+        assert_eq!(probe_candidate(&url, "", 2000), Probe::Unauthorized);
+    }
+
+    #[test]
+    fn nothing_listening_is_down() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert_eq!(probe_candidate(&format!("http://127.0.0.1:{port}"), TEST_TOKEN, 300), Probe::Down);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_metas_use_the_per_user_temp_path() {
+        let metas = candidate_metas(Some(Path::new("/data")));
+        assert_eq!(metas[0], Path::new("/data/daemon/daemon.json"));
+        assert_eq!(metas[1], crate::server::discovery::user_temp_path());
+        assert_ne!(metas[1], std::env::temp_dir().join("ikenga-daemon.json"));
+    }
 }

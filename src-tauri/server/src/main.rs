@@ -37,6 +37,11 @@ pub struct CliArgs {
     /// Bearer token required on every API and WebSocket route. One is
     /// generated and printed at startup if you don't supply it — the server
     /// never runs unauthenticated.
+    ///
+    /// Prefer the `IKENGA_AUTH_TOKEN` environment variable (or a systemd
+    /// `EnvironmentFile=`) over `--auth-token`: command-line arguments are
+    /// readable by every local user (`/proc/<pid>/cmdline`, `ps`), and this
+    /// token grants a shell. The flag stays for one-off manual runs.
     #[arg(long, env = "IKENGA_AUTH_TOKEN")]
     pub auth_token: Option<String>,
 
