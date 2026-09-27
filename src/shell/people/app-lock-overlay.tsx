@@ -181,7 +181,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 				<button
 					type="submit"
 					disabled={busy || waiting}
-					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
+					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
 				>
 					{busy ? 'Checking…' : 'Unlock'}
 				</button>
@@ -192,7 +192,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 						onClick={() => void tryBiometric()}
 						title={status.biometric.available ? undefined : status.biometric.reason}
 						aria-describedby={status.biometric.available ? undefined : 'app-lock-os-why'}
-						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
+						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
 					>
 						<Fingerprint className="h-4 w-4 shrink-0" aria-hidden />
 						Use {status.biometric.label}
