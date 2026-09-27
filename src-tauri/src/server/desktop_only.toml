@@ -121,50 +121,6 @@ reason = "Releases claude_config_watch's watcher ids; nothing to release while c
 tag = "WP-19"
 reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on the Tauri event channel; the daemon has none (the web transport's listen() is a no-op, and /ws/fs is its own subscription protocol, not these watcher ids). Not served in slice 5b; needs an event channel first."
 
-[claude_primitive_copy]
-tag = "WP-19"
-reason = "fs copy of a primitive between scopes; no spawn."
-
-[claude_primitive_copy_batch]
-tag = "WP-19"
-reason = "Cross-scope vault copy: fs copy + PaDb registry writes only (claude_store.rs resolve_canonical/atomic_copy_*); no process spawn."
-
-[claude_primitive_disable]
-tag = "WP-19"
-reason = "Removes a symlink-farm entry / merge-engine delegate; no spawn."
-
-[claude_primitive_disable_for]
-tag = "WP-19"
-reason = "Scoped variant of claude_primitive_disable; same fs op, no spawn."
-
-[claude_primitive_enable]
-tag = "WP-19"
-reason = "Creates a symlink-farm entry (or delegates to the JSON merge engine) to enable a store primitive in a scope; no process spawn."
-
-[claude_primitive_enable_for]
-tag = "WP-19"
-reason = "Scoped variant of claude_primitive_enable; same symlink-farm fs op, no spawn."
-
-[claude_primitive_move]
-tag = "WP-19"
-reason = "fs move/rename of a primitive between scopes; no spawn."
-
-[claude_primitive_remove]
-tag = "WP-19"
-reason = "Deletes a primitive from the store; no spawn."
-
-[claude_primitive_remove_for]
-tag = "WP-19"
-reason = "Scoped variant of claude_primitive_remove; same fs op, no spawn."
-
-[claude_store_import]
-tag = "WP-19"
-reason = "import_core copies a file into the store as canonical copy; a plain fs copy, distinct from claude_store/install.rs's npx/git spawns."
-
-[claude_store_list]
-tag = "WP-19"
-reason = "Pure read (store dir walk + registry.json provenance overlay + enabledIn symlink probes; no spawn), but its types (ClaudeStoreEntry, RegistryFile/RegistryProvenance, Kind) and registry reader live inside the desktop-gated commands::claude_store module tree that the store mutations and oba installer share; extracting that read half into server::shared is its own change. Not served in slice 5b."
-
 [comment_route]
 tag = "WP-18b"
 reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) through executor::current(); executor-routed since WP-18b part b, rpc.rs arm still pending."
@@ -299,21 +255,9 @@ reason = "Not served in slice 4, where the rest of notifications_* moved: after 
 tag = "WP-18b"
 reason = "auto_update_all_core loops update_core per opted-in entry, inheriting its git/npx child-process spawns."
 
-[oba_backfill_registry]
-tag = "WP-19"
-reason = "scan_external_masters walks dirs + resolves symlinks, then registry::save; no spawn."
-
 [oba_check_update]
 tag = "WP-18b"
 reason = "check_update_core calls git_ls_remote_sha, which runs `git ls-remote`; executor-routed (spawn_output_blocking) since WP-18b part b, rpc.rs arm still pending."
-
-[oba_dependents]
-tag = "WP-19"
-reason = "Live dependents scan via std::fs::read_dir/symlink resolution (scan_live_dependents); pure read, no spawn."
-
-[oba_forget]
-tag = "WP-19"
-reason = "registry::forget + registry::save is a JSON edit; no spawn, no fs deletion of masters."
 
 [oba_install_bundle]
 tag = "WP-18b"
@@ -325,7 +269,7 @@ reason = "install_core->fetch_and_adopt spawns `git clone` (install.rs git_clone
 
 [oba_install_local]
 tag = "WP-19"
-reason = "ProvenanceSource::Local branch (install.rs:422-436) is a directory copy only; no git/npx spawn at all."
+reason = "No spawn, but not servable as-is: `path` is an unconfined read source (no PathGuard / allowlist check, only exists + is_dir), and the Local branch copies the whole located tree into the persisted store with an unchecked atomic_copy_dir, which follows symlinks inside it (std::fs::read) — a remote token holder could lift any directory the daemon uid can read. No FE caller (no tauri-cmd.ts wrapper); only the local iyke CLI bridge (POST /iyke/oba/install-local) uses it. Serve once the source goes through PathGuard as given and canonicalized and escaping links are refused, as claude_store_import's daemon arm does (WP-19 slice 7)."
 
 [oba_install_npx]
 tag = "WP-18b"
@@ -334,26 +278,6 @@ reason = "install_core->fetch_and_adopt calls npx_skills_add, which runs `npx`; 
 [oba_install_with_deps]
 tag = "WP-18b"
 reason = "install_with_deps_core resolves the closure via install_core per dep, spawning git/npx (same site as oba_install_git/npx)."
-
-[oba_missing_requires]
-tag = "WP-19"
-reason = "missing_requires_core is a pure fs/registry re-verify (no network, no spawn)."
-
-[oba_relink_dependents]
-tag = "WP-19"
-reason = "relink_one just re-points symlinks (std::fs); no spawn, meaningful to a remote client managing the vault."
-
-[oba_safe_delete]
-tag = "WP-19"
-reason = "guarded_delete does fs remove + registry.json rewrite; no child process anywhere in the path."
-
-[oba_set_auto_update]
-tag = "WP-19"
-reason = "set_auto_update_core flips a bool in registry.json; no fetch, no spawn."
-
-[oba_unlink_one]
-tag = "WP-19"
-reason = "unlink_placement is remove_file on a symlink only; no process spawn."
 
 [oba_update]
 tag = "WP-18b"
