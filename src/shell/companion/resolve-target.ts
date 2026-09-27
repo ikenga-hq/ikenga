@@ -69,7 +69,8 @@ import {
 	showSeatNotice,
 	vacantDispatchText,
 } from './seat-notice';
-import { seatSessionNumberText, sessionNumber } from './seat-sessions';
+import { flushPendingClear } from './seat-pending';
+import { aliasSessionNumber, seatSessionNumberText, sessionNumber } from './seat-sessions';
 
 /** §5.3 `context` — where the dispatch came from. */
 export interface DispatchContext {
@@ -241,6 +242,18 @@ const WRAP_ENGINE_FOR_CHI: Readonly<Record<string, AgentEngineKind>> = {
 	gemini: 'gemini',
 };
 
+/** The Chi engine can run in an agent terminal (§6.1 wrap id): *Fill* and
+ *  *Resume* can occupy its seat without a first turn. */
+export function engineRunsInTerminal(engineId: string): boolean {
+	return WRAP_ENGINE_FOR_CHI[engineId] !== undefined;
+}
+
+/** A session ref's UI number handle: its terminal id or run id. */
+function refOf(session: SeatSession | null | undefined): string | null {
+	if (!session) return null;
+	return session.kind === 'terminal' ? session.terminal_id : session.run_id;
+}
+
 function errorText(err: unknown): string {
 	const seat = seatErrorOf(err);
 	if (seat) return seat.message;
@@ -292,6 +305,10 @@ export async function dispatchToSeat(
 	opts: { takeover?: boolean; retried?: boolean } = {}
 ): Promise<void> {
 	const actor: SeatActor = { client: UI_SEAT_CLIENT };
+	// A Clear still in its 8 s Undo window commits first (§4.2): the send
+	// starts from the vacant, history-less seat the rail shows, and the
+	// Clear's timer can't later unseat the session this send starts.
+	await flushPendingClear(seatId);
 	// Fail-safe: never ask for a path-T claim for a seat known to be on an
 	// engine with no terminal wrap (Rust grants none there either, E-1), so a
 	// claim can't be left behind by a path T that can't run.
@@ -427,6 +444,8 @@ async function sendPathT(route: VacantRoute, claim: string, text: string, contex
 		prompt: promptWithContext(text, context),
 		resumeSessionId: resumeId,
 		title: `@${seat.name}`,
+		// A resumed conversation keeps its number (D-09: "resumed session 2").
+		numberAs: resumeId ? refOf(previous) : null,
 	});
 	// The text is in the terminal now: from here a failure is reported, not thrown.
 	try {
@@ -464,6 +483,8 @@ async function sendPathH(route: VacantRoute, text: string, context?: DispatchCon
 		{ client: UI_SEAT_CLIENT },
 		{ fallback: 'fresh' }
 	);
+	const resumedRef = result.outcome === 'resumed' ? refOf(result.previous) : null;
+	if (resumedRef) aliasSessionNumber(result.run_id, resumedRef);
 	showSeatNotice(
 		vacantDispatchText(
 			seat.name,
@@ -500,8 +521,11 @@ export interface OccupyResult {
  *   form's past session — the move then takes it from its old seat, DEC-69c).
  *   An explicit resume never falls back to a fresh start (§6.2).
  * - A seat with no path T (a run-kind seat or a runs-only engine, E-1) has
- *   no interactive resume: it resumes or fills on its first dispatch (§7.2
- *   `needs_prompt`), which the thrown message says.
+ *   no interactive resume: it resumes on its first dispatch (§7.2
+ *   `needs_prompt`), which the thrown message says. A run-kind seat on a
+ *   wrap engine can still be *filled*: with no claim to carry, the new
+ *   terminal binds by a plain move (§4.3, always legal). A runs-only engine
+ *   can't hold a terminal at all, so it fills on its first dispatch.
  */
 export async function occupyVacantSeat(
 	seatId: string,
@@ -519,14 +543,18 @@ export async function occupyVacantSeat(
 	try {
 		if (route.route !== 'vacant') throw new Error(`@${seat.name} is not vacant any more`);
 		const engine = WRAP_ENGINE_FOR_CHI[seat.engine_id];
-		if (!route.claim || !engine) {
+		const from = mode === 'resume' ? (opts.from ?? seat.session) : null;
+		// E-1: no claim for a run-kind seat (or a runs-only engine). A *Fill*
+		// on a wrap engine still works — a move is always legal (§4.3) — but
+		// resuming a run is path H, which needs the first turn: dispatch it.
+		const headless = !engine || (!route.claim && mode === 'resume');
+		if (headless) {
 			throw new Error(
 				`@${seat.name} runs headless — dispatch an instruction to it and it will ${
 					mode === 'resume' ? 'resume' : 'fill'
 				}, then send`
 			);
 		}
-		const from = mode === 'resume' ? (opts.from ?? seat.session) : null;
 		let resumeId: string | null = null;
 		if (mode === 'resume') {
 			if (!opts.from && !route.resume.resumable) {
@@ -542,12 +570,14 @@ export async function occupyVacantSeat(
 			prompt: null,
 			resumeSessionId: resumeId,
 			title: `@${seat.name}`,
+			// A resumed conversation keeps its number (D-09: "resumed session 2").
+			numberAs: resumeId ? refOf(from) : null,
 		});
 		const moved = await seatsMove(
 			{ kind: 'terminal', terminalId, engineId: seat.engine_id, cwd, externalId: resumeId },
 			seat.id,
 			actor,
-			{ claim: route.claim }
+			route.claim ? { claim: route.claim } : undefined
 		);
 		return { seat: moved.seat, terminalId, outcome: resumeId ? 'resumed' : 'filled', previous: from };
 	} catch (err) {
@@ -580,8 +610,12 @@ async function spawnSeatTerminal(opts: {
 	prompt: string | null;
 	resumeSessionId: string | null;
 	title: string;
+	/** The session ref whose UI number the new terminal takes (a resume). */
+	numberAs?: string | null;
 }): Promise<string> {
 	const id = makeTerminalId();
+	// Before the tab reaches the store, so no render numbers it first.
+	if (opts.numberAs) aliasSessionNumber(id, opts.numberAs);
 	const cwd = opts.cwd ?? activeProjectCwd();
 	const wrap: AgentWrapOpts = { engine: opts.engine, prompt: opts.prompt, cwd };
 	const cmd = buildAgentWrappedCmd({ ...wrap, terminalId: id, resumeSessionId: opts.resumeSessionId });

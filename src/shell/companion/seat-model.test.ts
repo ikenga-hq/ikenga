@@ -78,6 +78,13 @@ describe('checkSeatName (§1.2, D-09 create)', () => {
 		expect(checkSeatName('lead', taken, { except: 'lead' }).ok).toBe(true);
 		expect(checkSeatName('review', taken, { except: 'lead' }).ok).toBe(false);
 	});
+	it('a seat inside its Remove window still holds its name', () => {
+		expect(checkSeatName('old', taken, { removing: ['old'] })).toMatchObject({
+			ok: false,
+			message: 'old is being removed — Undo it or wait 8 s',
+		});
+		expect(checkSeatName('new', taken, { removing: ['old'] }).ok).toBe(true);
+	});
 });
 
 describe('addresses (§1.3, §6a)', () => {

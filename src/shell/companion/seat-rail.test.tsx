@@ -13,6 +13,7 @@ const m = vi.hoisted(() => ({
 	seatsEngines: vi.fn(),
 	seatsRemove: vi.fn(async () => ({ seat_id: 'x' })),
 	seatsClear: vi.fn(async () => ({})),
+	seatsGet: vi.fn(),
 	seatsRename: vi.fn(async () => ({})),
 	seatsResolve: vi.fn(async () => ({})),
 	seatsCreate: vi.fn(),
@@ -31,6 +32,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	seatsEngines: m.seatsEngines,
 	seatsRemove: m.seatsRemove,
 	seatsClear: m.seatsClear,
+	seatsGet: m.seatsGet,
 	seatsRename: m.seatsRename,
 	seatsResolve: m.seatsResolve,
 	seatsCreate: m.seatsCreate,
@@ -162,6 +164,7 @@ beforeEach(() => {
 	]);
 	m.seatsRemove.mockClear();
 	m.seatsClear.mockClear();
+	m.seatsGet.mockReset();
 	m.seatsResolve.mockClear();
 	m.spawnWindow.mockClear();
 	useSeatNotice.setState({ notice: null });
@@ -181,6 +184,7 @@ beforeEach(() => {
 	useShellStore.setState({
 		activeProjectId: PROJECT,
 		activeProject: { id: PROJECT, root_path: '/w', extra_roots: [] },
+		projects: [],
 		companion: { activeTarget: { kind: 'new', engine_id: null } },
 		defaultEngineId: 'claude-code',
 		onboarding: { ...useShellStore.getState().onboarding, loreGlossSeen: ['chi'] },
@@ -220,6 +224,28 @@ describe('roster (D-09 default state)', () => {
 		expect(lead.textContent).toContain('pane 1');
 		expect(within(rail).getByRole('option', { name: /^@nightly/ }).querySelector('[data-signal="inbox"]')).not.toBeNull();
 		expect(within(rail).getByRole('option', { name: /^@docs/ }).querySelector('[data-status="vacant"]')).not.toBeNull();
+	});
+
+	it('a terminal seated in ANOTHER project is not "Unseated" (§11.2)', async () => {
+		useShellStore.setState({
+			projects: [
+				{ id: PROJECT, root_path: '/w' },
+				{ id: 'other-co', root_path: '/o' },
+			] as never,
+		});
+		const elsewhere = seat({
+			name: 'far',
+			project_id: 'other-co',
+			address: 'seat:other-co/far',
+			status: 'live',
+			session: { kind: 'terminal', terminal_id: 'term-4', external_id: null, cwd: '/o' },
+		});
+		m.seatsList.mockImplementation(async (pid: string) => (pid === 'other-co' ? [elsewhere] : roster()));
+		useCompanionStore.setState({ state: 'expanded' });
+		wrap(<Companion />);
+		await screen.findByRole('option', { name: /^@lead/ });
+		await waitFor(() => expect(queryClient.getQueryData(['seats', 'list', 'other-co'])).toBeDefined());
+		await waitFor(() => expect(document.querySelector('[data-session="term-4"]')).toBeNull());
 	});
 
 	it('selecting a seat targets it AND scopes the panels to its session (§9.1)', async () => {
@@ -378,16 +404,45 @@ describe('Remove / Clear: the 8 s client-side Undo (§4.2)', () => {
 		expect(m.seatsRemove).not.toHaveBeenCalled();
 	});
 
-	it('Clear keeps the pad and is undoable the same way', () => {
+	it('Clear keeps the pad and is undoable the same way', async () => {
 		vi.useFakeTimers();
 		const docs = roster()[3];
+		m.seatsGet.mockResolvedValue(docs);
 		clearSeat(docs);
 		expect(useSeatNotice.getState().notice?.message).toBe(
 			'Cleared docs — session history forgotten; scratchpad seat:royalti-co/docs kept'
 		);
 		expect(useSeatNotice.getState().notice?.ttlMs).toBe(8_000);
-		vi.advanceTimersByTime(8_000);
-		expect(m.seatsClear).toHaveBeenCalledWith('seat-docs', { client: 'ui' });
+		await vi.advanceTimersByTimeAsync(7_999);
+		expect(m.seatsClear).not.toHaveBeenCalled();
+		await vi.advanceTimersByTimeAsync(1);
+		await vi.waitFor(() => expect(m.seatsClear).toHaveBeenCalledWith('seat-docs', { client: 'ui' }));
+	});
+
+	it('Clear never unseats a session started on the seat during its window', async () => {
+		vi.useFakeTimers();
+		const docs = roster()[3];
+		m.seatsGet.mockResolvedValue({
+			...docs,
+			status: 'live',
+			session: { kind: 'terminal', terminal_id: 'term-9', external_id: 'c2', cwd: '/w' },
+		});
+		clearSeat(docs);
+		await vi.advanceTimersByTimeAsync(8_000);
+		await vi.waitFor(() => expect(useSeatUi.getState().clearing['seat-docs']).toBeUndefined());
+		expect(m.seatsClear).not.toHaveBeenCalled();
+	});
+
+	it('Remove inside a Clear window commits the Clear first — no timer left against a gone seat', async () => {
+		vi.useFakeTimers();
+		const docs = roster()[3];
+		m.seatsGet.mockResolvedValue(docs);
+		clearSeat(docs);
+		removeSeat(docs, null);
+		await vi.waitFor(() => expect(m.seatsClear).toHaveBeenCalledTimes(1));
+		await vi.advanceTimersByTimeAsync(8_000);
+		expect(m.seatsClear).toHaveBeenCalledTimes(1);
+		expect(m.seatsRemove).toHaveBeenCalledWith('seat-docs', { removeMemory: true }, { client: 'ui' });
 	});
 });
 
@@ -405,6 +460,22 @@ describe('vacant (D-09 vacant state)', () => {
 		expect(within(panel).getByRole('button', { name: `Resume session ${sessionNumber('term-2')}` })).toBeTruthy();
 		expect(within(panel).getByRole('button', { name: 'Fill with a new session' })).toBeTruthy();
 		expect(within(panel).getByRole('button', { name: 'Clear seat' })).toBeTruthy();
+	});
+
+	it('a run-kind vacant seat can’t Resume without a first turn (E-1) — Fill still works', async () => {
+		const seats = roster();
+		seats[3] = {
+			...seats[3],
+			session: { kind: 'run', run_id: 'run-old', external_id: 'x', cwd: '/w' },
+			resume: { resumable: true },
+		};
+		await mountRail(seats);
+		fireEvent.click(screen.getByRole('option', { name: /^@docs/ }));
+		const resume = await screen.findByRole('button', { name: /^Resume session/ });
+		expect((resume as HTMLButtonElement).disabled).toBe(true);
+		expect(resume.getAttribute('title')).toBe('headless — dispatch an instruction to resume it');
+		const fill = screen.getByRole('button', { name: 'Fill with a new session' }) as HTMLButtonElement;
+		expect(fill.disabled).toBe(false);
 	});
 
 	it('an explicit Resume never falls back: disabled with the reason (§6.2)', async () => {
@@ -458,6 +529,17 @@ describe('empty + create (D-09 empty / create states)', () => {
 		);
 		fireEvent.keyDown(name, { key: 'Escape' });
 		await waitFor(() => expect(document.querySelector('[data-state="seats-create"]')).toBeNull());
+		// Closing returns focus to New seat (D-09 `closeForm`).
+		await waitFor(() => expect(document.activeElement?.hasAttribute('data-new-seat')).toBe(true));
+	});
+
+	it('create: a seat inside its Remove window keeps its name taken', async () => {
+		await mountRail();
+		removeSeat(roster()[3], null);
+		fireEvent.click(await screen.findByRole('button', { name: 'New seat' }));
+		const form = document.querySelector('[data-state="seats-create"]') as HTMLElement;
+		fireEvent.change(within(form).getByRole('textbox'), { target: { value: 'docs' } });
+		expect(form.textContent).toContain('docs is being removed — Undo it or wait 8 s');
 	});
 });
 
@@ -500,6 +582,19 @@ describe('rest (D-09 rest state)', () => {
 		expect(lead.querySelector('[data-attention="permission"]')?.textContent).toBe('1');
 		const nightly = strip.querySelector('[data-mono="nightly"]') as HTMLElement;
 		expect(nightly.querySelector('[data-dot="run"]')?.className).toContain('animate-pulse');
+		// A request on a session with no monogram (a plain terminal) still
+		// shows at rest, as the counted shield.
+		act(() => {
+			useCompanionStore
+				.getState()
+				.receivePermission({ id: 'p2', kind: 'permission', toolName: 'Bash', sessionId: 'term-plain' });
+		});
+		await waitFor(() => {
+			const shield = [...strip.querySelectorAll('[data-attention="permission"]')].find(
+				(el) => !el.closest('[data-mono], [data-mono-session]')
+			);
+			expect(shield?.textContent).toBe('1');
+		});
 		// Clicking a monogram expands on that seat.
 		fireEvent.click(nightly);
 		expect(useCompanionStore.getState().state).toBe('expanded');

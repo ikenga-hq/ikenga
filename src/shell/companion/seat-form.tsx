@@ -16,7 +16,6 @@ import { X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { type SeatEngineInfo, type SeatView, seatsEngines } from '@/lib/tauri-cmd';
-import { useShellStore } from '@/lib/shell/shell-store';
 import { closeSeatForm, copyText, createSeat, type CreateSeatStart, selectSeat, type SeatFormInit } from './seat-actions';
 import { checkSeatName, type CreateStart, engineShort, iykeSeatCreate, seatScope } from './seat-model';
 import type { SeatRoster, UnseatedSession } from './seat-roster';
@@ -88,18 +87,20 @@ function RadioRow({
 }
 
 export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormInit }) {
-	const { seats, unseated, projectId } = roster;
-	const defaultEngineId = useShellStore((s) => s.defaultEngineId);
+	const { seats, unseated, projectId, removingNames } = roster;
 	const engines = useQuery({ queryKey: ['seats', 'engines'], queryFn: seatsEngines, staleTime: 60_000 });
 	const seated = init.seatSession ? unseated.find((u) => u.id === init.seatSession) : undefined;
 	const lockedEngine = seated?.engineId ?? null;
 
 	const engineList: SeatEngineInfo[] = useMemo(() => {
 		if (engines.data?.length) return engines.data;
-		// Until (or unless) the capability table loads, offer the default engine.
-		const id = lockedEngine ?? defaultEngineId ?? 'claude-code';
+		// Until (or unless) the capability table loads, offer claude-code. Not
+		// `defaultEngineId`: that setting holds a pkg id
+		// (`com.ikenga.engine-claude-code`), which `seats_create` would refuse
+		// as `engine_unsupported`.
+		const id = lockedEngine ?? 'claude-code';
 		return [{ engine_id: id, wrap_id: null, engine_resume: null, seatable: true }];
-	}, [engines.data, lockedEngine, defaultEngineId]);
+	}, [engines.data, lockedEngine]);
 
 	const firstSeatable =
 		engineList.find((e) => e.engine_id === 'claude-code' && e.seatable) ?? engineList.find((e) => e.seatable);
@@ -130,10 +131,12 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 		nameRef.current?.focus();
 	}, []);
 
+	// A seat inside its 8 s Remove window is hidden but still holds its name
+	// until the host call lands (`seat_name_taken`), so it isn't free yet.
 	const check = checkSeatName(
 		name,
 		seats.map((s) => s.name),
-		{ project: projectId }
+		{ project: projectId, removing: removingNames }
 	);
 	const past = pastSessionsFor(seats, engine);
 	const open: UnseatedSession[] = unseated.filter((u) => u.engineId === engine && u.status === 'running');
@@ -198,7 +201,8 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 		setError(null);
 		try {
 			const seat = await createSeat({ projectId, name: name.trim(), engineId: engine, hasWrap, start: createStart });
-			closeSeatForm();
+			// Focus follows the selection to the new seat, not back to *New seat*.
+			closeSeatForm({ returnFocus: false });
 			selectSeat(seat);
 		} catch (err) {
 			setError(err instanceof Error ? err.message : String(err));
@@ -227,7 +231,7 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 				</span>
 				<button
 					type="button"
-					onClick={closeSeatForm}
+					onClick={() => closeSeatForm()}
 					aria-label="Cancel (Esc)"
 					title="Cancel (Esc)"
 					className="ml-auto grid size-6 place-items-center rounded-sm text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
@@ -461,7 +465,7 @@ export function SeatForm({ roster, init }: { roster: SeatRoster; init: SeatFormI
 				</button>
 				<button
 					type="button"
-					onClick={closeSeatForm}
+					onClick={() => closeSeatForm()}
 					className="h-9 rounded-md border px-4 text-[13px] text-[var(--fg)] hover:bg-[var(--bg-raised)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 					style={{ borderColor: 'var(--border)' }}
 				>

@@ -7,6 +7,8 @@
 // kept for the app's lifetime, so it never shifts when another session
 // closes. Terminals already in the store are numbered by `createdAt` before
 // any newcomer, so the numbers read in the order the sessions were opened.
+// A terminal or run that resumes an earlier conversation takes that
+// conversation's number (`aliasSessionNumber`), not a new one.
 //
 // Figures (D-09 revision 2): only what an engine reported — the Claude
 // statusline snapshot (`statusline://snapshot`, the feed `CostHud` reads).
@@ -43,6 +45,16 @@ export function sessionNumber(ref: string): number {
 	const n = next++;
 	numbers.set(ref, n);
 	return n;
+}
+
+/**
+ * A resumed conversation keeps its number: `ref` (the new terminal or run
+ * that resumed it) takes `previousRef`'s number (D-09: *Resume session 2*
+ * leaves the seat reading "session 2"). Overwrites any number `ref` got.
+ */
+export function aliasSessionNumber(ref: string, previousRef: string): void {
+	if (ref === previousRef) return;
+	numbers.set(ref, sessionNumber(previousRef));
 }
 
 /** `session 3`. */

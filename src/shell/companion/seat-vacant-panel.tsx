@@ -6,9 +6,14 @@
 //
 // An explicit Resume never falls back to a fresh start (§6.2): when the seat
 // can't resume, the button is disabled and says why, and Fill is the way on.
+//
+// E-1: a seat whose last session was a Chi run resumes only through path H,
+// which needs the first turn — so *Resume* is disabled and says to dispatch.
+// A runs-only engine can't hold a terminal, so *Fill* is disabled the same way.
 
 import { cn } from '@/components/ui/utils';
 import type { SeatView } from '@/lib/tauri-cmd';
+import { engineRunsInTerminal } from './resolve-target';
 import { clearSeat, copyText, fillSeat, openSeatScratchpad, resumeSeat } from './seat-actions';
 import { engineResumeFlag, iykeVacant, notResumableText, padText, seatSessionRef, UNREPORTED } from './seat-model';
 import { formatSeatTime } from './seat-notice';
@@ -44,6 +49,12 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 	const flag = engineResumeFlag(seat.engine_resume);
 	const resumable = seat.resume.resumable;
 	const reason = seat.resume.resumable ? null : notResumableText(seat.resume.reason);
+	const inTerminal = engineRunsInTerminal(seat.engine_id);
+	// Resumable, but only by a dispatch (path H): the button can't do it alone.
+	const resumeHeadless = resumable && (!inTerminal || seat.session?.kind === 'run');
+	const resumeBlocked = reason ?? (resumeHeadless ? 'headless — dispatch an instruction to resume it' : null);
+	const fillBlocked = inTerminal ? null : 'headless — dispatch an instruction to fill it';
+	const resumePrimary = Boolean(seat.session) && resumable && !resumeHeadless;
 	const iyke = iykeVacant(seat.name, Boolean(seat.session) && resumable);
 
 	return (
@@ -89,8 +100,8 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 					{seat.session && (
 						<button
 							type="button"
-							disabled={!resumable}
-							title={reason ?? `Resume ${last ?? 'its last session'} in @${seat.name}`}
+							disabled={resumeBlocked !== null}
+							title={resumeBlocked ?? `Resume ${last ?? 'its last session'} in @${seat.name}`}
 							onClick={() => void resumeSeat(seat)}
 							className="h-7 rounded-md bg-[var(--primary)] px-3 text-xs text-[var(--primary-fg)] hover:opacity-90 disabled:cursor-not-allowed disabled:bg-[var(--bg-raised)] disabled:text-[var(--fg-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 						>
@@ -99,14 +110,16 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 					)}
 					<button
 						type="button"
+						disabled={fillBlocked !== null}
+						title={fillBlocked ?? `Start a new ${seat.engine_id} session in @${seat.name}`}
 						onClick={() => void fillSeat(seat)}
 						className={cn(
-							'h-7 rounded-md px-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-							seat.session && resumable
-								? 'border text-[var(--fg)] hover:bg-[var(--bg-raised)]'
+							'h-7 rounded-md px-3 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:bg-[var(--bg-raised)] disabled:text-[var(--fg-muted)]',
+							resumePrimary || fillBlocked
+								? 'border text-[var(--fg)] enabled:hover:bg-[var(--bg-raised)]'
 								: 'bg-[var(--primary)] text-[var(--primary-fg)] hover:opacity-90'
 						)}
-						style={seat.session && resumable ? { borderColor: 'var(--border)' } : undefined}
+						style={resumePrimary || fillBlocked ? { borderColor: 'var(--border)' } : undefined}
 					>
 						Fill with a new session
 					</button>
@@ -122,7 +135,14 @@ export function SeatVacantPanel({ seat }: { seat: SeatView }) {
 				</div>
 				{reason && seat.session && (
 					<p className="mb-2 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
-						Can’t resume: {reason}. Fill it with a new session instead.
+						Can’t resume: {reason}.{' '}
+						{fillBlocked ? 'Dispatch an instruction to fill it.' : 'Fill it with a new session instead.'}
+					</p>
+				)}
+				{!reason && (resumeHeadless || fillBlocked) && (
+					<p className="mb-2 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
+						@{seat.name} runs headless — dispatch an instruction to it and it will{' '}
+						{resumeHeadless ? 'resume' : 'fill'}, then send.{fillBlocked ? '' : ' Or fill it with a new session.'}
 					</p>
 				)}
 				<div

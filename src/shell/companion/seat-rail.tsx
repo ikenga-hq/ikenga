@@ -162,9 +162,13 @@ function Signal({
 			className="inline-flex h-[18px] shrink-0 items-center gap-[3px] whitespace-nowrap rounded-full border px-[5px] font-mono text-[11px] [&_svg]:size-[11px]"
 			style={
 				tone === 'ask'
-					? { color: 'var(--on-achievement)', background: 'var(--achievement-soft)', borderColor: 'transparent' }
+					? {
+							color: 'var(--on-achievement, var(--achievement))',
+							background: 'var(--achievement-soft)',
+							borderColor: 'transparent',
+						}
 					: tone === 'inbox'
-						? { color: 'var(--on-info)', background: 'var(--info-soft)', borderColor: 'transparent' }
+						? { color: 'var(--on-info, var(--info))', background: 'var(--info-soft)', borderColor: 'transparent' }
 						: tone === 'window'
 							? { color: 'var(--fg)', background: 'var(--bg-raised)', borderColor: 'var(--border-strong)' }
 							: { color: 'var(--fg-muted)', background: 'var(--bg-raised)', borderColor: 'var(--border-soft)' }
@@ -270,16 +274,18 @@ const ROW_CLASS =
 function RenameField({
 	seat,
 	taken,
+	removing,
 	onMessage,
 }: {
 	seat: SeatView;
 	taken: string[];
+	removing: string[];
 	onMessage: (message: string) => void;
 }) {
 	const [value, setValue] = useState(seat.name);
 	const [hostError, setHostError] = useState<string | null>(null);
 	const ref = useRef<HTMLInputElement | null>(null);
-	const check = checkSeatName(value, taken, { except: seat.name });
+	const check = checkSeatName(value, taken, { except: seat.name, removing });
 	useEffect(() => {
 		ref.current?.focus();
 		ref.current?.select();
@@ -333,6 +339,7 @@ function SeatRow({
 	focusable,
 	renaming,
 	takenNames,
+	removingNames,
 	pending,
 	onMenu,
 }: {
@@ -341,6 +348,7 @@ function SeatRow({
 	focusable: boolean;
 	renaming: boolean;
 	takenNames: string[];
+	removingNames: string[];
 	pending: number;
 	onMenu: (seat: SeatView, x: number, y: number) => void;
 }) {
@@ -406,7 +414,7 @@ function SeatRow({
 			<div className="flex h-[30px] min-w-0 items-center gap-2">
 				<StateDot status={seat.status} />
 				{renaming ? (
-					<RenameField seat={seat} taken={takenNames} onMessage={setRenameMsg} />
+					<RenameField seat={seat} taken={takenNames} removing={removingNames} onMessage={setRenameMsg} />
 				) : (
 					<>
 						<span className="max-w-[104px] shrink-0 truncate font-mono text-[13px] font-medium" style={{ color: 'var(--fg)' }}>
@@ -442,7 +450,7 @@ function SeatRow({
 			{(flag || held) && !renaming && (
 				<div className="-mt-1 flex min-w-0 items-center gap-2 pb-1 pl-4 text-[11px]" data-seat-flags="">
 					{held && (
-						<span className="truncate" style={{ color: 'var(--on-achievement)' }} title={held}>
+						<span className="truncate" style={{ color: 'var(--on-achievement, var(--achievement))' }} title={held}>
 							{held}
 						</span>
 					)}
@@ -817,7 +825,7 @@ export function nextAfterRemove(
 }
 
 export function SeatRail({ roster }: { roster: SeatRoster }) {
-	const { seats, unseated, state, error, pendingBySession } = roster;
+	const { seats, unseated, state, error, pendingBySession, removingNames } = roster;
 	const sel = useCompanionStore((s) => s.railSelection);
 	const target = useShellStore((s) => s.companion.activeTarget);
 	const defaultEngine = useShellStore((s) => s.defaultEngineId);
@@ -1027,6 +1035,7 @@ export function SeatRail({ roster }: { roster: SeatRoster }) {
 								focusable={i === roveIdx}
 								renaming={renaming === seat.id}
 								takenNames={takenNames}
+								removingNames={removingNames}
 								pending={ref && seat.status !== 'vacant' ? (pendingBySession[ref] ?? 0) : 0}
 								onMenu={(s, x, y) => openMenuFor({ kind: 'seat', seatId: s.id, x, y })}
 							/>

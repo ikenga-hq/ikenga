@@ -4,13 +4,20 @@
 // "Unseated" group, §11.2: "WP-67 renders the group from sessions with no
 // seat"), and the pending permission count per session.
 //
+// "No seat" means no seat in ANY project: the terminal store is global, so
+// a session seated in another project must not read as unseated here —
+// seating it again would be a §4.3 move that silently vacates that seat.
+// Every known project's roster is read for that (`useQueries`, the same
+// cache entries `useSeats` fills, kept current by `seats://changed`).
+//
 // The seats list is overlaid with the rail's own pending Undo windows:
 // a seat inside its 8 s *Remove* window is hidden, and one inside its *Clear*
 // window reads vacant with no history (§4.2 — the host call is made when the
 // window closes).
 
+import { useQueries } from '@tanstack/react-query';
 import { useMemo } from 'react';
-import { useSeats } from '@/lib/queries/seats';
+import { seatsQueryOptions, useSeats } from '@/lib/queries/seats';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { SeatView } from '@/lib/tauri-cmd';
 import { type TerminalTab, useTerminalStore } from '@/terminal/session-store';
@@ -44,6 +51,8 @@ export interface SeatRoster {
 	pendingBySession: Record<string, number>;
 	/** Pending requests with no session attribution (shown everywhere). */
 	pendingUnattributed: number;
+	/** Names of seats inside their 8 s Remove window: hidden, still taken. */
+	removingNames: string[];
 }
 
 /** A seat inside its Clear window: no session, vacant, nothing to resume. */
@@ -64,6 +73,16 @@ export function seatedTerminalIds(seats: readonly SeatView[]): Set<string> {
 	return out;
 }
 
+/** Every terminal id seated in the given rosters, as one stable string
+ *  (a `useQueries` `combine`, so the hook re-renders only when it changes). */
+function heldElsewhereKey(results: ReadonlyArray<{ data?: SeatView[] }>): string {
+	const ids: string[] = [];
+	for (const r of results) {
+		for (const s of r.data ?? []) if (s.session?.kind === 'terminal') ids.push(s.session.terminal_id);
+	}
+	return ids.sort().join('\n');
+}
+
 /** The engine a terminal runs, in the Chi id space (§4.3). */
 export function terminalEngine(tab: Pick<TerminalTab, 'spec' | 'claudeSessionId'>): string | null {
 	const wrap = tab.spec.wrap?.engine ?? (tab.spec.wrap || tab.claudeSessionId ? 'claude' : null);
@@ -78,6 +97,17 @@ export function useSeatRoster(): SeatRoster {
 	const terminals = useTerminalStore((s) => s.tabs);
 	const parked = useCompanionStore((s) => s.tabs);
 	const permissions = useCompanionStore((s) => s.permissions);
+	const projects = useShellStore((s) => s.projects);
+
+	// The other projects' rosters: their seated terminals are not "unseated".
+	const otherIds = useMemo(
+		() => [...new Set(projects.map((p) => p.id))].filter((id) => id !== projectId),
+		[projects, projectId]
+	);
+	const heldElsewhere = useQueries({
+		queries: otherIds.map((id) => seatsQueryOptions(id)),
+		combine: heldElsewhereKey,
+	});
 
 	const seats = useMemo(
 		() =>
@@ -91,6 +121,7 @@ export function useSeatRoster(): SeatRoster {
 		// Seats inside their Remove window still hold their session until the
 		// host call lands — but the locked rail shows it unseated at once.
 		const held = seatedTerminalIds(seats);
+		for (const id of heldElsewhere ? heldElsewhere.split('\n') : []) held.add(id);
 		const parkedIdx = new Map<string, number>();
 		parked.forEach((v, i) => {
 			if (v.kind === 'terminal' && !parkedIdx.has(v.sessionId)) parkedIdx.set(v.sessionId, i);
@@ -124,7 +155,7 @@ export function useSeatRoster(): SeatRoster {
 			const tb = terminals.find((t) => t.id === b.id)?.createdAt ?? Number.MAX_SAFE_INTEGER;
 			return ta - tb;
 		});
-	}, [seats, terminals, parked]);
+	}, [seats, heldElsewhere, terminals, parked]);
 
 	const { pendingBySession, pendingUnattributed } = useMemo(() => {
 		const by: Record<string, number> = {};
@@ -137,6 +168,11 @@ export function useSeatRoster(): SeatRoster {
 		return { pendingBySession: by, pendingUnattributed: none };
 	}, [permissions]);
 
+	const removingNames = useMemo(
+		() => (query.data ?? []).filter((s) => removing[s.id]).map((s) => s.name),
+		[query.data, removing]
+	);
+
 	const state: RosterState = query.isError ? 'error' : query.data ? 'ready' : 'loading';
 	const error = query.error
 		? query.error instanceof Error
@@ -146,5 +182,5 @@ export function useSeatRoster(): SeatRoster {
 				: String(query.error)
 		: null;
 
-	return { projectId, seats, state, error, unseated, pendingBySession, pendingUnattributed };
+	return { projectId, seats, state, error, unseated, pendingBySession, pendingUnattributed, removingNames };
 }

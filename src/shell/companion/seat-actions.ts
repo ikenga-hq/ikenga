@@ -10,7 +10,7 @@ import { create } from 'zustand';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf, getLeafIdsInOrder, type MoveTabMode } from '@/lib/panes/pane-reducer';
 import type { PaneNode } from '@/lib/panes/types';
-import { cachedSeats, invalidateSeats, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
+import { cachedSeat, cachedSeats, invalidateSeats, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import {
 	chiCancel,
@@ -20,6 +20,7 @@ import {
 	type SeatView,
 	seatsClear,
 	seatsCreate,
+	seatsGet,
 	seatsRelease,
 	seatsRemove,
 	seatsRename,
@@ -32,6 +33,13 @@ import { type RailSelection, useCompanionStore } from './companion-store';
 import { occupyVacantSeat } from './resolve-target';
 import { formatSeatTime, showSeatNotice } from './seat-notice';
 import { atName, SEAT_UNDO_MS, seatSessionRef } from './seat-model';
+import {
+	__resetPendingClearsForTests,
+	armPendingClear,
+	cancelPendingClear,
+	flushPendingClear,
+	hasPendingClear,
+} from './seat-pending';
 import { seatSessionNumberText, sessionName } from './seat-sessions';
 
 const ACTOR: SeatActor = { client: UI_SEAT_CLIENT };
@@ -77,8 +85,15 @@ export function openSeatForm(init: SeatFormInit = {}): void {
 	useCompanionStore.getState().setState('expanded');
 }
 
-export function closeSeatForm(): void {
+/** Close the New-seat form. Focus goes back to the *New seat* button (D-09
+ *  `closeForm`) unless the caller moves it elsewhere (a created seat). */
+export function closeSeatForm(opts: { returnFocus?: boolean } = {}): void {
 	useSeatUi.setState({ form: null });
+	if (opts.returnFocus === false) return;
+	// The rail remounts on the next commit; focus its button then.
+	setTimeout(() => {
+		document.querySelector<HTMLElement>('[data-new-seat]')?.focus();
+	}, 0);
 }
 
 export function startRename(seatId: string): void {
@@ -250,9 +265,11 @@ export async function endUnseatedSession(terminalId: string): Promise<void> {
 
 // ─── Clear / Remove, with the 8 s client-side Undo (§4.2) ──────────────────
 
+/** Pending Removes. Pending Clears live in `seat-pending.ts`, which the
+ *  dispatch path settles before it routes a send. */
 const undoTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-function pendingKey(kind: 'clear' | 'remove', seatId: string): string {
+function pendingKey(kind: 'remove', seatId: string): string {
 	return `${kind}:${seatId}`;
 }
 
@@ -265,22 +282,33 @@ function dropPending(kind: 'clear' | 'remove', seatId: string): void {
 	});
 }
 
-/** *Clear seat*: forget the session history now, keep the scratchpad (DEC-69b). */
+/**
+ * *Clear seat*: forget the session history, keep the scratchpad (DEC-69b).
+ * The host call waits out the 8 s Undo window. A dispatch, *Fill* or
+ * *Remove* inside the window commits it first (`flushPendingClear`); and
+ * when it commits, a seat whose session changed since Clear was pressed
+ * (another client started one) is left alone — Clear never ends up
+ * unseating a session that is newer than the history it was meant to drop.
+ */
 export function clearSeat(seat: SeatView): void {
-	const key = pendingKey('clear', seat.id);
-	if (undoTimers.has(key)) return;
+	if (hasPendingClear(seat.id)) return;
+	const clearedRef = seatSessionRef(seat);
 	useSeatUi.setState((s) => ({ clearing: { ...s.clearing, [seat.id]: true } }));
-	undoTimers.set(
-		key,
-		setTimeout(() => {
-			undoTimers.delete(key);
-			seatsClear(seat.id, ACTOR)
-				.catch(fail)
-				.finally(() => {
-					void invalidateSeats(seat.project_id).finally(() => dropPending('clear', seat.id));
-				});
-		}, SEAT_UNDO_MS)
-	);
+	armPendingClear(seat.id, SEAT_UNDO_MS, async () => {
+		try {
+			const current = await seatsGet({ seatId: seat.id }).catch(() => null);
+			if (current && seatSessionRef(current) !== clearedRef) {
+				showSeatNotice(`${atName(seat.name)} has a new session since you cleared it — left as it is`);
+				return;
+			}
+			await seatsClear(seat.id, ACTOR);
+		} catch (err) {
+			fail(err);
+		} finally {
+			await invalidateSeats(seat.project_id).catch(() => {});
+			dropPending('clear', seat.id);
+		}
+	});
 	showSeatNotice(
 		`Cleared ${seat.name} — session history forgotten; scratchpad ${seat.address} kept`,
 		{
@@ -288,9 +316,7 @@ export function clearSeat(seat: SeatView): void {
 			action: {
 				label: 'Undo',
 				run: () => {
-					const t = undoTimers.get(key);
-					if (t) clearTimeout(t);
-					undoTimers.delete(key);
+					cancelPendingClear(seat.id);
 					dropPending('clear', seat.id);
 				},
 			},
@@ -307,6 +333,9 @@ export function clearSeat(seat: SeatView): void {
 export function removeSeat(seat: SeatView, next: { sel: RailSelection; scope: string | null } | null): void {
 	const key = pendingKey('remove', seat.id);
 	if (undoTimers.has(key)) return;
+	// A Clear still in its window commits now: the user asked for both, and
+	// its timer must not fire against a seat that is gone (`seat_not_found`).
+	void flushPendingClear(seat.id);
 	const companion = useCompanionStore.getState();
 	const target = useShellStore.getState().companion.activeTarget;
 	const wasSelected = companion.railSelection?.kind === 'seat' && companion.railSelection.seat_id === seat.id;
@@ -349,6 +378,7 @@ export function removeSeat(seat: SeatView, next: { sel: RailSelection; scope: st
 export function __resetSeatUndoForTests(): void {
 	for (const t of undoTimers.values()) clearTimeout(t);
 	undoTimers.clear();
+	__resetPendingClearsForTests();
 	useSeatUi.setState({ form: null, renaming: null, removing: {}, clearing: {}, confirmRemove: null });
 }
 
@@ -401,6 +431,8 @@ export async function releaseSeat(seat: SeatView): Promise<void> {
 
 export async function resumeSeat(seat: SeatView): Promise<void> {
 	const label = `session ${seatSessionNumberText(seat.session)}`;
+	// Resuming the history a pending Clear would drop is an implicit Undo.
+	if (cancelPendingClear(seat.id)) dropPending('clear', seat.id);
 	try {
 		const r = await occupyVacantSeat(seat.id, 'resume');
 		selectSeat(r.seat);
@@ -412,6 +444,8 @@ export async function resumeSeat(seat: SeatView): Promise<void> {
 
 export async function fillSeat(seat: SeatView): Promise<void> {
 	try {
+		// Filling inside a Clear window: the history goes first, as the rail shows.
+		await flushPendingClear(seat.id);
 		const r = await occupyVacantSeat(seat.id, 'fill');
 		selectSeat(r.seat);
 		showSeatNotice(`Filled ${atName(seat.name)} with ${sessionName(r.terminalId)}`);
@@ -421,6 +455,18 @@ export async function fillSeat(seat: SeatView): Promise<void> {
 }
 
 // ─── Create (T1 / T2a / T2b) ────────────────────────────────────────────────
+
+/** §4.3: a move unbinds the session from whatever seat held it. Say which,
+ *  so a seat left vacant — possibly in another project — is never silent. */
+export function leftSeatsText(fromSeatIds: readonly string[] | undefined, projectId: string): string {
+	if (!fromSeatIds?.length) return '';
+	const names = fromSeatIds.map((id) => {
+		const s = cachedSeat(id);
+		if (!s) return 'another seat';
+		return s.project_id === projectId ? atName(s.name) : s.address;
+	});
+	return ` — it left ${names.join(', ')}, which is now vacant`;
+}
 
 export type CreateSeatStart =
 	| { kind: 'new' }
@@ -449,7 +495,9 @@ export async function createSeat(req: {
 				ACTOR
 			);
 			const ref = start.session.kind === 'terminal' ? start.session.terminalId : start.session.runId;
-			showSeatNotice(`Seat @${name} created around ${sessionName(ref)} · scratchpad ${r.seat.address}`);
+			showSeatNotice(
+				`Seat @${name} created around ${sessionName(ref)}${leftSeatsText(r.from_seat_ids, projectId)} · scratchpad ${r.seat.address}`
+			);
 			return r.seat;
 		}
 		const past = start.kind === 'resume' ? start.from.session : null;

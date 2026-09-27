@@ -434,7 +434,7 @@ function CompanionPanels({ roster }: { roster: SeatRoster }) {
 									focusPermissionFor(sessionId);
 								}}
 								className="inline-flex h-5 items-center gap-1 rounded-[var(--radius-xs)] px-1 text-[11px] hover:bg-[var(--achievement-soft)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-								style={{ color: 'var(--on-achievement)' }}
+								style={{ color: 'var(--on-achievement, var(--achievement))' }}
 							>
 								{`${n} pending on ${ownerLabel(sessionId, roster.seats)}`}
 							</button>

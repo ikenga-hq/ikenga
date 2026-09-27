@@ -27,12 +27,14 @@ export type SeatNameCheck =
 /**
  * Live validation, in the order the locked form reports it: charset, the
  * hyphen rule, length, then uniqueness ("`<name>` is already a seat").
- * `except` is the seat being renamed (its own name is not a clash).
+ * `except` is the seat being renamed (its own name is not a clash);
+ * `removing` are seats inside their 8 s Remove window — hidden from the
+ * rail, but their names stay taken until the host call lands.
  */
 export function checkSeatName(
 	raw: string,
 	taken: readonly string[],
-	opts: { except?: string; project?: string } = {}
+	opts: { except?: string; project?: string; removing?: readonly string[] } = {}
 ): SeatNameCheck {
 	const name = raw.trim();
 	if (!name) return { ok: false, empty: true, message: '' };
@@ -45,6 +47,9 @@ export function checkSeatName(
 	}
 	if (taken.some((t) => t === name && t !== opts.except)) {
 		return { ok: false, empty: false, message: `${name} is already a seat` };
+	}
+	if (opts.removing?.includes(name) && name !== opts.except) {
+		return { ok: false, empty: false, message: `${name} is being removed — Undo it or wait 8 s` };
 	}
 	// The grammar above is §1.2's, restated; keep the regex as the arbiter.
 	if (!SEAT_NAME_RE.test(name)) return { ok: false, empty: false, message: 'Use a–z, 0–9 and - only' };

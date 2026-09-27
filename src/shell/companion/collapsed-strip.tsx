@@ -5,8 +5,9 @@
 // `Chi · <state>` and the expand button. The two signals that must survive
 // here (D-09 `rest`): a pending permission on a seat, and a run's pulse.
 //
-// A request no seat or session can be pinned on (no terminal id) still shows
-// as the shield glyph, as before. It accepts tab drops.
+// A request no monogram here carries (no terminal id, or a session with no
+// monogram on this strip) still shows as the shield glyph, counted, so the
+// pending signal always survives at rest. It accepts tab drops.
 
 import { ChevronLeft, ShieldAlert } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
@@ -30,7 +31,8 @@ export interface CollapsedStripProps {
 	unseated?: readonly UnseatedSession[];
 	/** Pending requests per session id (terminal id). */
 	pendingBySession?: Readonly<Record<string, number>>;
-	/** Requests pinned on no session — shown as the shield glyph. */
+	/** Requests pinned on no session. The shield glyph shows every request no
+	 *  monogram carries (these, plus any on a session with no monogram). */
 	pendingUnattributed?: number;
 	/** The selected rail row's key (`seat:<id>` / `session:<id>`). */
 	selectedKey?: string | null;
@@ -107,8 +109,21 @@ export function CollapsedStrip({
 	dropProps,
 	dropHover,
 }: CollapsedStripProps) {
-	// Without a per-session breakdown every request is "unattributed".
-	const loose = pendingUnattributed ?? (seats.length || unseated.length ? 0 : pendingPermissions);
+	// What each monogram carries as a badge: a seat shows its session's
+	// requests while it holds one (not vacant); an unseated session shows its own.
+	const seatPending = (seat: SeatView): number => {
+		const ref = seatSessionRef(seat);
+		return ref && seat.status !== 'vacant' ? (pendingBySession[ref] ?? 0) : 0;
+	};
+	const drawn =
+		seats.reduce((n, seat) => n + seatPending(seat), 0) +
+		unseated.reduce((n, u) => n + (pendingBySession[u.id] ?? 0), 0);
+	// Every request no monogram carries — unattributed, or on a session with
+	// no monogram here (a plain terminal, another project's seat, a vacant
+	// seat's old session) — shows as the shield, so none is lost at rest
+	// (D-09 `rest`). Without a per-session breakdown, all of them.
+	const hasBreakdown = pendingUnattributed !== undefined || seats.length > 0 || unseated.length > 0;
+	const loose = hasBreakdown ? Math.max(0, pendingPermissions - drawn) : pendingPermissions;
 	const monograms = seats.length + unseated.length;
 	return (
 		<aside
@@ -125,8 +140,7 @@ export function CollapsedStrip({
 				// biome-ignore lint/a11y/useSemanticElements: a labelled group of buttons, not a form fieldset
 				<div role="group" aria-label="Seats" className="flex flex-col items-center gap-2 pt-1">
 					{seats.map((seat) => {
-						const ref = seatSessionRef(seat);
-						const pending = ref && seat.status !== 'vacant' ? (pendingBySession[ref] ?? 0) : 0;
+						const pending = seatPending(seat);
 						const on = selectedKey === `seat:${seat.id}`;
 						const state =
 							seat.status === 'live' ? 'live' : seat.status === 'run' ? 'run' : seat.status === 'idle' ? 'idle' : 'vacant';
