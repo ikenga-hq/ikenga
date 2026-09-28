@@ -8,7 +8,9 @@ pub mod agents;
 // daemon's `detect_agent_config` arm counts with it.
 pub use crate::server::shared::agent_config as config_claude;
 pub mod known;
-pub mod scaffold;
+// Moved to the ungated `server::shared::agent_scaffold` (WP-19 slice 8); the
+// daemon's `scaffold_agent_config` arm runs it confined.
+pub use crate::server::shared::agent_scaffold as scaffold;
 pub mod system;
 
 use std::path::PathBuf;

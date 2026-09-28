@@ -606,7 +606,8 @@ pub async fn rpc_handler(
         // (no event channel here). The project filesystem arms stay inside the
         // fs allowlist and the project root. Left desktop-only:
         // `notifications_record_update` (its sweep needs the shell version +
-        // pkg kernel), `comment_route` (spawns chi), `pin_screenshot_write`.
+        // pkg kernel), `comment_route` (spawns chi). `pin_screenshot_write`
+        // joined in slice 8 (below).
         "notifications_list" => rpc_shell::notifications_list(&state, &payload.args).await,
         "notifications_unread_count" => rpc_shell::notifications_unread_count(&state).await,
         "notifications_mark_read" => {
@@ -794,6 +795,24 @@ pub async fn rpc_handler(
         "atelier_file_read" => rpc_files::atelier_file_read(&state, &payload.args),
         "atelier_file_write" => rpc_files::atelier_file_write(&state, &payload.args),
         "action_git_branch" => rpc_files::action_git_branch(&state, &payload.args).await,
+
+        // --- Pin screenshots, agent-config scaffold, pkg manifest / workspace
+        //     / scaffold helpers (WP-19 slice 8) ---
+        //
+        // Bodies in `server::rpc_shell` (over `server::shared::{comments,
+        // agent_scaffold}`) and `server::rpc_files` (over `server::shared::
+        // {pkg_workspace, pkg_scaffold}`). `pin_screenshot_write` writes only
+        // under the daemon's own `<data-dir>/pin-screenshots/` with a minted
+        // name, capped in size; every caller path in the rest goes through
+        // the fs allowlist and is refused inside the daemon's state, and every
+        // write goes through `shared::confined_fs` (no symlink followed, live
+        // or dangling). None needs the live pkg kernel; nothing spawns, no
+        // events.
+        "pin_screenshot_write" => rpc_shell::pin_screenshot_write(&state, &payload.args),
+        "scaffold_agent_config" => rpc_shell::scaffold_agent_config(&state, &payload.args),
+        "pkg_preview_manifest" => rpc_files::pkg_preview_manifest(&state, &payload.args),
+        "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
+        "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
         other => {

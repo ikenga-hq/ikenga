@@ -30,7 +30,8 @@
 //! studio thread's `folderPath` — are never opened by any daemon arm; the one
 //! stored path something later opens (a comment's `screenshotPath`, which
 //! `comment_route` hands to an agent) is confined to the data dir's
-//! `pin-screenshots/`.
+//! `pin-screenshots/`, where the daemon's `pin_screenshot_write` (slice 8)
+//! writes under a name it mints itself.
 //!
 //! **Single-user seams (G-PRINCIPAL / WP-20).** Everything here is keyed by
 //! the daemon's `--data-dir` and its process home, not by a principal: one
@@ -213,6 +214,14 @@ impl PathGuard {
     /// the result checked. `..` is refused outright, since a re-attached tail
     /// is never canonicalized.
     pub(crate) fn check_maybe_missing(&self, path: &Path) -> Result<(), String> {
+        self.resolve_maybe_missing(path).map(|_| ())
+    }
+
+    /// [`Self::check_maybe_missing`], returning the path it checked: the
+    /// canonical nearest existing ancestor with the missing tail re-attached.
+    /// A body that then creates under it works on that form, so no symlink in
+    /// the existing part of the caller's spelling is left to follow later.
+    pub(crate) fn resolve_maybe_missing(&self, path: &Path) -> Result<PathBuf, String> {
         use std::path::Component;
         if !path.is_absolute() {
             return Err(format!("path is not absolute: {}", path.display()));
@@ -235,7 +244,9 @@ impl PathGuard {
         let tail = path
             .strip_prefix(ancestor)
             .map_err(|_| format!("failed to resolve {}", path.display()))?;
-        self.check(&canonical.join(tail))
+        let resolved = canonical.join(tail);
+        self.check(&resolved)?;
+        Ok(resolved)
     }
 
     /// The allowlist, then [`Self::check_reserved`]. `canonical` is a
@@ -613,6 +624,40 @@ pub(super) fn project_scaffold_claude(state: &AppState, args: &Value) -> RpcResp
     respond("project_scaffold_claude", r)
 }
 
+/// `scaffold_agent_config` (WP-19 slice 8): the onboarding wizard lays the
+/// provider's starter tree under `<root>/.claude/`. Same boundary as
+/// [`project_scaffold_claude`] — the wizard scaffolds a folder the user just
+/// picked, so the root need only be an existing directory inside the fs
+/// allowlist and outside the daemon's own state ([`scaffold_root`]) — and the
+/// shared body runs from its canonical form with `confined_fs::Reach::Confined`
+/// over the guard: a symlink at `.claude` refuses the call before anything is
+/// written, and no directory or file below it is created through a link
+/// (live or dangling) or outside what the guard admits. The response is the
+/// desktop's `ScaffoldResponse`; its paths are template-relative.
+pub(super) fn scaffold_agent_config(state: &AppState, args: &Value) -> RpcResponse {
+    use super::shared::agent_scaffold::{self, Reach, ScaffoldRequest};
+    let r = (|| {
+        let provider: String = targ(args, &["provider"])?;
+        let root_path: String = targ(args, &["rootPath", "root_path"])?;
+        let profile: String = targ(args, &["profile"])?;
+        let mode: Option<String> = targ(args, &["mode"])?;
+        data_dir(state, super::rpc::NO_DB)?;
+        let root = scaffold_root(state, &root_path)?;
+        let guard = &state.path_guard;
+        let check = |p: &Path| guard.check_maybe_missing(p);
+        agent_scaffold::scaffold_in(
+            ScaffoldRequest {
+                provider,
+                root_path: root,
+                profile,
+                mode,
+            },
+            Reach::Confined(&check),
+        )
+    })();
+    respond("scaffold_agent_config", r)
+}
+
 // ─── Activity-bar pins / sections ────────────────────────────────────────────
 
 pub(super) async fn activity_sections_list(state: &AppState) -> RpcResponse {
@@ -728,9 +773,10 @@ pub(super) async fn activity_pins_reorder(state: &AppState, args: &Value) -> Rpc
 /// A comment's `screenshotPath` is the one stored path something later opens:
 /// `comment_route` (desktop-only) hands it to an agent as "Screenshot: …".
 /// The desktop's comes from `pin_screenshot_write`, under
-/// `<app_data_dir>/pin-screenshots/`; the daemon serves no screenshot write,
-/// so it accepts only an existing file directly in `<data-dir>/pin-screenshots/`
-/// (stored canonical), or none. Blank passes through as the desktop stores it.
+/// `<app_data_dir>/pin-screenshots/`; the daemon's from its own
+/// `pin_screenshot_write` arm, under `<data-dir>/pin-screenshots/`. So it
+/// accepts only an existing file directly in that dir (stored canonical), or
+/// none. Blank passes through as the desktop stores it.
 fn check_screenshot_path(state: &AppState, path: Option<String>) -> Result<Option<String>, String> {
     let Some(raw) = path else { return Ok(None) };
     if raw.trim().is_empty() {
@@ -739,7 +785,7 @@ fn check_screenshot_path(state: &AppState, path: Option<String>) -> Result<Optio
     let dir = data_dir(state, super::rpc::NO_DB)?.join(comments::SCREENSHOTS_DIR);
     let refuse = || {
         format!(
-            "screenshotPath must be a file in {} (the daemon does not serve pin_screenshot_write)",
+            "screenshotPath must be a file in {} (one pin_screenshot_write returned)",
             dir.display()
         )
     };
@@ -774,6 +820,34 @@ pub(super) async fn comment_create(state: &AppState, args: &Value) -> RpcRespons
     }
     .await;
     respond("comment_create", r)
+}
+
+/// `pin_screenshot_write` (WP-19 slice 8): the desktop's decode + PNG check,
+/// written under the daemon's own `<data-dir>/pin-screenshots/` with a
+/// server-minted `<uuid>.png`, so no caller path is involved and the reserved
+/// data-dir refusal (which is for caller paths) does not apply. The returned
+/// path is canonical, which is exactly what [`check_screenshot_path`] admits
+/// for `comment_create`. Capped at `comments::DAEMON_MAX_SCREENSHOT_BYTES`
+/// decoded (the desktop has no cap; see that constant).
+///
+/// Reading it back: the web build's loupe loads a pin's screenshot with
+/// `fsRead(path)`, and the daemon's `fs_read` refuses every path in the data
+/// dir (and answers a string, not the `{ bytes }` the loupe decodes), so a
+/// browser session shows no thumbnail — it falls back to none, as for a
+/// missing file. The path is still stored and handed on by `comment_route`.
+pub(super) fn pin_screenshot_write(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let base64_png: String = targ(args, &["base64Png", "base64_png"])?;
+        let dir = data_dir(state, super::rpc::NO_DB)?;
+        comments::write_screenshot(
+            dir,
+            &base64_png,
+            comments::ShotLimit::Daemon {
+                max_bytes: comments::DAEMON_MAX_SCREENSHOT_BYTES,
+            },
+        )
+    })();
+    respond("pin_screenshot_write", r)
 }
 
 pub(super) async fn comment_get(state: &AppState, args: &Value) -> RpcResponse {

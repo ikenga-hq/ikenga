@@ -212,9 +212,8 @@ pub fn pkg_discover_workspace(
 /// any other declared blocks generically.
 #[tauri::command]
 pub fn pkg_preview_manifest(install_path: String) -> Result<serde_json::Value, String> {
-    let path = PathBuf::from(install_path);
-    let pkg = crate::pkg::manifest::Package::load(&path).map_err(|e| format!("{e:#}"))?;
-    serde_json::to_value(&pkg.manifest).map_err(|e| format!("serialize manifest: {e}"))
+    // Body shared with the daemon arm (WP-19 slice 8).
+    crate::server::shared::pkg_workspace::preview_manifest(&PathBuf::from(install_path))
 }
 
 /// Read a pkg-declared screenshot and return it as a base64 data URL the
