@@ -940,7 +940,13 @@ async fn pkg_scaffold_writes_the_desktop_files() {
     assert!(!written.is_empty());
     for w in written {
         assert!(app.join(w.as_str().unwrap()).is_file(), "{w}");
+        assert!(!w.as_str().unwrap().starts_with("ui-iframe"), "{w}");
     }
+    assert!(
+        std::path::Path::new(res["targetPath"].as_str().unwrap()).is_file(),
+        "targetPath exists: {res}"
+    );
+    assert!(!app.join("ui-iframe").exists());
 
     // Project scope: the project row's root, from the daemon's ikenga.db.
     let proj = f.allowed.join("proj");
@@ -1148,11 +1154,11 @@ async fn pkg_scaffold_never_writes_through_a_planted_link() {
         "ORIGINAL"
     );
 
-    // A link at a template subdirectory (the ui-iframe tree's `src/`, below
-    // the `ui-iframe/` prefix the embedded paths carry).
+    // A link at a template subdirectory (the ui-iframe tree's `src/`, which
+    // lands directly under the folder).
     let app = f.allowed.join("app");
     std::fs::create_dir_all(f.outside.join("src-out")).unwrap();
-    symlink(&f.outside.join("src-out"), &app.join("ui-iframe/src"));
+    symlink(&f.outside.join("src-out"), &app.join("src"));
     let e = err(
         r,
         "pkg_scaffold",

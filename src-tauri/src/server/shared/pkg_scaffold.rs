@@ -280,7 +280,7 @@ pub fn execute_scaffold_in(
 
     if let Some(td_name) = template_dir_name {
         if let Some(td) = PKG_TEMPLATES.get_dir(td_name) {
-            write_embedded_dir(td, folder, params, &pkg_id, &mut files_written, reach)?;
+            write_embedded_dir(td, td.path(), folder, params, &pkg_id, &mut files_written, reach)?;
             return Ok(files_written);
         }
     }
@@ -549,8 +549,14 @@ This document seeds the project context for AI agents working in this repository
     Ok(files_written)
 }
 
+/// Write the embedded template `dir` into `dest`. `root` is the template dir
+/// itself: `include_dir` paths are relative to the `include_dir!` root
+/// (`templates/pkg`), so each file's path still carries the template-dir prefix
+/// (`ui-iframe/manifest.json`), which is stripped so the tree lands directly in
+/// `dest` and `files_written` is relative to it.
 fn write_embedded_dir(
     dir: &Dir<'_>,
+    root: &Path,
     dest: &Path,
     params: &PkgScaffoldParams,
     pkg_id: &str,
@@ -558,7 +564,8 @@ fn write_embedded_dir(
     reach: Reach<'_>,
 ) -> Result<(), String> {
     for file in dir.files() {
-        let rel_path = file.path().to_string_lossy().to_string();
+        let rel = file.path().strip_prefix(root).unwrap_or(file.path());
+        let rel_path = rel.to_string_lossy().to_string();
         let target_rel_path = rel_path.replace("{{slug}}", &params.slug);
         let out_file_path = dest.join(&target_rel_path);
 
@@ -577,7 +584,7 @@ fn write_embedded_dir(
     }
 
     for child in dir.dirs() {
-        write_embedded_dir(child, dest, params, pkg_id, files_written, reach)?;
+        write_embedded_dir(child, root, dest, params, pkg_id, files_written, reach)?;
     }
 
     Ok(())
@@ -700,5 +707,45 @@ mod tests {
 
         let err = execute_scaffold(&params, &folder, &primary).unwrap_err();
         assert!(err.contains("already exists"));
+    }
+
+    /// Template kinds land directly in the folder: `include_dir` paths carry the
+    /// template-dir prefix (`ui-iframe/...`), which must not reach the disk or
+    /// `files_written`, so the reported `manifest.json` really exists.
+    #[test]
+    fn test_template_kind_writes_into_the_folder_without_the_template_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("my-app");
+        let primary = folder.join("manifest.json");
+
+        let params = PkgScaffoldParams {
+            kind: "app".to_string(),
+            name: "My App".to_string(),
+            slug: "my-app".to_string(),
+            description: "An iframe app scaffolded from the ui-iframe template.".to_string(),
+            scope: "personal".to_string(),
+            project_id: None,
+            target_dir: Some(folder.to_string_lossy().to_string()),
+            tools: None,
+            author_name: None,
+            author_key: None,
+        };
+
+        let files = execute_scaffold(&params, &folder, &primary).unwrap();
+        assert!(primary.is_file(), "{} exists", primary.display());
+        assert!(!folder.join("ui-iframe").exists(), "no template-dir prefix on disk");
+        assert!(files.contains(&"manifest.json".to_string()), "{files:?}");
+        assert!(
+            files.iter().all(|f| !f.starts_with("ui-iframe")),
+            "files_written has no template-dir prefix: {files:?}"
+        );
+        // Nested template files keep their structure under the folder.
+        let nested: Vec<&String> = files.iter().filter(|f| f.contains('/')).collect();
+        assert!(!nested.is_empty(), "the template has nested files: {files:?}");
+        for f in &files {
+            assert!(folder.join(f).is_file(), "{f} was written where reported");
+        }
+        let manifest = fs::read_to_string(&primary).unwrap();
+        assert!(manifest.contains("my-app"), "placeholders substituted: {manifest}");
     }
 }
