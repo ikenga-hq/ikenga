@@ -565,6 +565,86 @@ fn remove_primitive(path: &Path, kind: Kind) -> Result<(), String> {
     }
 }
 
+/// Remove only a vault **placement** at `path` — what enable put there — and
+/// never the user's own content. This is the body of every `disable`:
+///
+/// - absent → no-op (idempotent);
+/// - a symlink → unlinked via [`remove_primitive`]. A link holds no data, so this
+///   covers store links and also foreign or dangling ones (the same rule the
+///   enable clobber guard uses when it replaces a link);
+/// - a real file or directory → removed only when it is an unchanged copy of
+///   `store_copy` (the copy a `Mechanism::File` enable made; the same
+///   byte-identity test enable uses for its idempotent no-op). Anything else — a
+///   hand-made skill dir, a copy the user edited, a real entry where the engine
+///   only ever places links (`store_copy == None`) — is refused with
+///   [`not_a_placement`] and left untouched.
+///
+/// `remove` is the explicit destructive verb and keeps calling
+/// [`remove_primitive`] directly.
+fn remove_placement(path: &Path, kind: Kind, store_copy: Option<&Path>) -> Result<(), String> {
+    match occupant(path)? {
+        Occupant::Absent => Ok(()),
+        Occupant::Symlink => remove_primitive(path, kind),
+        Occupant::Real => {
+            let unchanged_copy = store_copy.is_some_and(|src| {
+                if kind.is_dir_primitive() {
+                    same_tree_bytes(src, path)
+                } else {
+                    same_file_bytes(src, path)
+                }
+            });
+            if unchanged_copy {
+                remove_primitive(path, kind)
+            } else {
+                Err(not_a_placement(path))
+            }
+        }
+    }
+}
+
+/// The refusal for a disable that would delete real content. It names the path
+/// and says what to do, so the UI can show it verbatim.
+fn not_a_placement(path: &Path) -> String {
+    format!(
+        "refusing to disable {}: it is a real file or directory, not a vault \
+         placement (a store link, or an unchanged copy of the store entry). \
+         Disable only removes what enable placed. Use remove to delete it on \
+         purpose, or move it out first.",
+        path.display()
+    )
+}
+
+/// True when `copy` is a real tree holding exactly what `src` holds: the same
+/// entry names at every level and identical file bytes. `src` (the store side)
+/// is followed through links, as the copy that enable made was; `copy` must
+/// contain no links at all, since that copy dereferences them.
+fn same_tree_bytes(src: &Path, copy: &Path) -> bool {
+    let (Ok(ms), Ok(mc)) = (std::fs::metadata(src), std::fs::symlink_metadata(copy)) else {
+        return false;
+    };
+    if mc.file_type().is_symlink() || ms.is_dir() != mc.is_dir() {
+        return false;
+    }
+    if !ms.is_dir() {
+        return same_file_bytes(src, copy);
+    }
+    let names = |d: &Path| -> Option<Vec<std::ffi::OsString>> {
+        let mut v = std::fs::read_dir(d)
+            .ok()?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        v.sort();
+        Some(v)
+    };
+    match (names(src), names(copy)) {
+        (Some(a), Some(b)) if a == b => a
+            .iter()
+            .all(|n| same_tree_bytes(&src.join(n), &copy.join(n))),
+        _ => false,
+    }
+}
+
 // ─── WP-04 — dependent-aware safe delete (the incident guardrail) ─────────────
 
 /// The pure safe-delete decision. No filesystem access — the three inputs that
@@ -1514,7 +1594,8 @@ fn place_primitive_with(
 }
 
 /// `claude_primitive_disable` core: drop only the scope-local link. The store
-/// canonical copy is untouched. Idempotent.
+/// canonical copy is untouched. Idempotent. A real file or directory at the
+/// scope path is not a placement and is refused (see [`remove_placement`]).
 #[cfg(test)]
 fn disable_core(scope_claude: &Path, kind: Kind, name: &str) -> Result<(), String> {
     disable_core_with(scope_claude, kind, name, None)
@@ -1537,7 +1618,9 @@ fn disable_core_with(
     if let Some(b) = bounds {
         b.node(&link, "disable")?;
     }
-    remove_primitive(&link, kind)
+    // Claude placements are always links (`place_primitive`), so any real entry
+    // here is the user's own and is refused.
+    remove_placement(&link, kind, None)
 }
 
 // ─── WP-21 — bundle placement / removal (members, not the bundle) ─────────────
@@ -2278,23 +2361,29 @@ fn is_engine_enabled(dest: &Path, store: &Path) -> bool {
     }
 }
 
-/// `disable` for an arbitrary engine — drop only the scope-local node (link or
-/// copied file/dir). The store copy is untouched. Idempotent. Claude routes back
-/// through Phase-1 `disable_core`.
+/// `disable` for an arbitrary engine — drop only the scope-local placement (a
+/// link, or an unchanged copy of the store entry). The store copy is untouched.
+/// Idempotent. A real file or directory that is not an unchanged copy is
+/// refused (see [`remove_placement`]). Claude routes back through Phase-1
+/// `disable_core`.
 #[cfg(test)]
 fn disable_for_core(
     engine: EngineId,
+    store: &Path,
     scope_root: &Path,
     user_home: &Path,
     kind: Kind,
     name: &str,
 ) -> Result<(), String> {
-    disable_for_core_with(engine, scope_root, user_home, kind, name, None)
+    disable_for_core_with(engine, Some(store), scope_root, user_home, kind, name, None)
 }
 
 /// [`disable_for_core`] with the daemon's [`Bounds`] on the node it removes.
+/// `store` is `None` only when no store root resolves; a real entry is then
+/// never recognised as a copy and is refused.
 fn disable_for_core_with(
     engine: EngineId,
+    store: Option<&Path>,
     scope_root: &Path,
     user_home: &Path,
     kind: Kind,
@@ -2316,7 +2405,13 @@ fn disable_for_core_with(
     if let Some(b) = bounds {
         b.node(&dest, "disable")?;
     }
-    remove_primitive(&dest, kind)
+    // Only a `Mechanism::File` enable leaves a real copy behind; a link cell
+    // never does, so a real entry there is the user's own.
+    let store_copy = match cell.mechanism {
+        Mechanism::File => store.map(|st| store_path_for(st, kind, name)).transpose()?,
+        _ => None,
+    };
+    remove_placement(&dest, kind, store_copy.as_deref())
 }
 
 /// `remove` for an arbitrary engine — delete the scope-local entry (link or real
@@ -3086,7 +3181,8 @@ pub(crate) async fn claude_primitive_disable_for_in(
     } else {
         let scope_root = resolve_scope_root_dir(db, &scope, v.home_opt()).await?;
         let user_home = v.home()?;
-        disable_for_core_with(e, &scope_root, &user_home, k, &name, b)?;
+        let store = v.store().ok();
+        disable_for_core_with(e, store.as_deref(), &scope_root, &user_home, k, &name, b)?;
     }
     // WP-04: clear any pin that pointed at the now-removed scope-local primitive.
     let pool = db.ensure_pool().await?;
@@ -4647,6 +4743,77 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// Disable on a copy-on-enable cell removes the copy enable made (unchanged
+    /// bytes) but refuses a copy the user edited, leaving it and the store as is.
+    #[test]
+    fn codex_disable_removes_an_unchanged_copy_but_refuses_an_edited_one() {
+        let (base, store, scope_root, home) = engine_fixture("disable_cx");
+        seed_agent(&store, "planner", "a planner");
+        let enable = || {
+            enable_for_core(
+                EngineId::Codex,
+                &store,
+                &scope_root,
+                &home,
+                "workspace",
+                Kind::Agent,
+                "planner",
+            )
+        };
+        let disable = || {
+            disable_for_core(EngineId::Codex, &store, &scope_root, &home, Kind::Agent, "planner")
+        };
+        let master = store_path_for(&store, Kind::Agent, "planner").unwrap();
+
+        let dest = PathBuf::from(enable().unwrap().path);
+        disable().expect("an unchanged copy is a placement");
+        assert!(std::fs::symlink_metadata(&dest).is_err(), "copy removed");
+        assert!(master.exists(), "store master untouched");
+
+        let dest = PathBuf::from(enable().unwrap().path);
+        std::fs::write(&dest, "edited by hand").unwrap();
+        let err = disable().unwrap_err();
+        assert!(err.contains("not a vault placement"), "{err}");
+        assert_eq!(read(&dest), "edited by hand", "the edited copy is untouched");
+        assert!(master.exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A link-only cell (Gemini skills) never leaves a real dir behind, so a
+    /// real dir at the placement path is the user's own and is refused.
+    #[test]
+    fn engine_disable_refuses_a_real_dir_in_a_link_cell() {
+        let (base, store, scope_root, home) = engine_fixture("disable_gm_real");
+        seed_skill(&store, "myskill", "a skill");
+        let m = enable_for_core(
+            EngineId::Gemini,
+            &store,
+            &scope_root,
+            &home,
+            "workspace",
+            Kind::Skill,
+            "myskill",
+        )
+        .unwrap();
+        let dest = PathBuf::from(&m.path);
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("SKILL.md"), "mine").unwrap();
+
+        let err = disable_for_core(
+            EngineId::Gemini,
+            &store,
+            &scope_root,
+            &home,
+            Kind::Skill,
+            "myskill",
+        )
+        .unwrap_err();
+        assert!(err.contains("not a vault placement"), "{err}");
+        assert_eq!(read(&dest.join("SKILL.md")), "mine");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// `Mechanism::SymlinkDir` on another engine goes through the same guard.
     #[test]
     fn gemini_enable_refuses_to_clobber_a_real_agent_file() {
@@ -4759,6 +4926,121 @@ mod tests {
         let store_dir = store_path_for(&store, Kind::Skill, "s").unwrap();
         assert!(store_dir.join("SKILL.md").exists());
         assert!(store_dir.join("helper.py").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── disable never deletes real content (only placements) ─────────────
+
+    /// The reproduced incident: `~/.claude/skills/foo` is a hand-made real dir
+    /// (imported into the store, so the store has a `foo` too). Disable must
+    /// refuse and leave both the scope dir and the store master intact.
+    #[test]
+    fn disable_refuses_a_real_skill_dir_and_leaves_it_intact() {
+        let (base, store, scope) = fixture("disable_real_dir");
+        seed_skill(&store, "foo", "imported copy");
+        let real = scope_path_for(&scope, Kind::Skill, "foo").unwrap();
+        std::fs::create_dir_all(real.join("refs")).unwrap();
+        std::fs::write(real.join("SKILL.md"), "mine").unwrap();
+        std::fs::write(real.join("refs").join("notes.md"), "my notes").unwrap();
+
+        let err = disable_core(&scope, Kind::Skill, "foo").unwrap_err();
+        assert!(err.contains("not a vault placement"), "{err}");
+        assert!(err.contains(&real.display().to_string()), "names the path: {err}");
+        assert!(!is_symlink(&real), "still a real dir");
+        assert_eq!(read(&real.join("SKILL.md")), "mine");
+        assert_eq!(read(&real.join("refs").join("notes.md")), "my notes");
+        let master = store_path_for(&store, Kind::Skill, "foo").unwrap();
+        assert!(master.join("SKILL.md").exists(), "store master untouched");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same guard for a single-file kind: a real agent file is refused.
+    #[test]
+    fn disable_refuses_a_real_agent_file() {
+        let (base, store, scope) = fixture("disable_real_file");
+        seed_agent(&store, "a", "x");
+        let real = scope_path_for(&scope, Kind::Agent, "a").unwrap();
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "my own agent").unwrap();
+
+        let err = disable_core(&scope, Kind::Agent, "a").unwrap_err();
+        assert!(err.contains("not a vault placement"), "{err}");
+        assert_eq!(read(&real), "my own agent");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A store symlink is still unlinked, and the master (every file in it)
+    /// survives.
+    #[test]
+    fn disable_unlinks_a_store_symlink_and_keeps_the_master() {
+        let (base, store, scope) = fixture("disable_store_link");
+        seed_skill(&store, "s", "x");
+        place_primitive(&store, &scope, "workspace", Kind::Skill, "s").unwrap();
+        let link = scope_path_for(&scope, Kind::Skill, "s").unwrap();
+        assert!(is_symlink(&link));
+
+        disable_core(&scope, Kind::Skill, "s").unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err(), "link removed");
+        let master = store_path_for(&store, Kind::Skill, "s").unwrap();
+        assert!(master.join("SKILL.md").exists());
+        assert!(master.join("helper.py").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A link holds no data, so disable also drops a foreign or dangling link
+    /// (never following it).
+    #[cfg(unix)]
+    #[test]
+    fn disable_drops_a_foreign_link_but_not_its_target() {
+        let (base, _store, scope) = fixture("disable_foreign_link");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("SKILL.md"), "keep").unwrap();
+        let link = scope_path_for(&scope, Kind::Skill, "f").unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        disable_core(&scope, Kind::Skill, "f").unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(read(&elsewhere.join("SKILL.md")), "keep");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// `remove` stays the explicit destructive verb: it still deletes a real
+    /// primitive (its documented contract), unlike disable.
+    #[test]
+    fn remove_still_deletes_a_real_primitive() {
+        let (base, _store, scope) = fixture("remove_real_dir");
+        let real = scope_path_for(&scope, Kind::Skill, "mine").unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("SKILL.md"), "mine").unwrap();
+
+        remove_core(&scope, Kind::Skill, "mine").unwrap();
+        assert!(std::fs::symlink_metadata(&real).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_tree_bytes_matches_only_an_unchanged_real_copy() {
+        let base = unique_tmp("same_tree");
+        let src = base.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.md"), "a").unwrap();
+        std::fs::write(src.join("sub").join("b.md"), "b").unwrap();
+        let copy = base.join("copy");
+        atomic_copy_dir(&src, &copy).unwrap();
+        assert!(same_tree_bytes(&src, &copy), "an unchanged copy matches");
+
+        std::fs::write(copy.join("sub").join("b.md"), "edited").unwrap();
+        assert!(!same_tree_bytes(&src, &copy), "an edited file does not");
+        std::fs::write(copy.join("sub").join("b.md"), "b").unwrap();
+        std::fs::write(copy.join("extra.md"), "x").unwrap();
+        assert!(!same_tree_bytes(&src, &copy), "an extra file does not");
+        std::fs::remove_file(copy.join("extra.md")).unwrap();
+        std::fs::remove_file(copy.join("a.md")).unwrap();
+        std::os::unix::fs::symlink(src.join("a.md"), copy.join("a.md")).unwrap();
+        assert!(!same_tree_bytes(&src, &copy), "a link inside the copy does not");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -5359,7 +5641,7 @@ mod tests {
             .file_type()
             .is_symlink());
 
-        disable_for_core(EngineId::Claude, &scope_root, &base, Kind::Skill, "s").unwrap();
+        disable_for_core(EngineId::Claude, &store, &scope_root, &base, Kind::Skill, "s").unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err(), "link dropped");
         // Store dir + files survive.
         let sdir = store_path_for(&store, Kind::Skill, "s").unwrap();
@@ -5420,7 +5702,7 @@ mod tests {
         assert!(m.link_target.is_some(), "symlink cell reports link_target");
 
         // disable drops the link; store survives.
-        disable_for_core(EngineId::Gemini, &scope_root, &home, Kind::Skill, "myskill").unwrap();
+        disable_for_core(EngineId::Gemini, &store, &scope_root, &home, Kind::Skill, "myskill").unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err());
         assert!(store_path_for(&store, Kind::Skill, "myskill")
             .unwrap()

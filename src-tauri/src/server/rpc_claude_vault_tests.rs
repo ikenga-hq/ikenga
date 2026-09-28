@@ -1335,3 +1335,52 @@ async fn vault_arms_name_what_is_missing() {
         json!(false)
     );
 }
+
+/// The live repro: `~/.claude/skills/tidy` is the user's own real dir and the
+/// store also holds a `tidy` (e.g. after an import). Disable, in both the
+/// Claude and the per-engine form, is refused and deletes nothing; remove is
+/// still the explicit way to delete it.
+#[tokio::test]
+async fn disable_refuses_a_real_dir_that_is_not_a_placement() {
+    let v = vault().await;
+    let r = &v.router;
+    let real = v.claude().join("skills/tidy");
+    write(&real.join("SKILL.md"), "my own skill");
+    write(&real.join("refs/notes.md"), "my notes");
+
+    let e = err(
+        r,
+        "claude_primitive_disable",
+        json!({ "kind": "skill", "name": "tidy", "scope": "workspace" }),
+    )
+    .await;
+    assert!(e.contains("not a vault placement"), "{e}");
+    let e = err(
+        r,
+        "claude_primitive_disable_for",
+        json!({ "engine": "claude", "kind": "skill", "name": "tidy", "scope": "workspace" }),
+    )
+    .await;
+    assert!(e.contains("not a vault placement"), "{e}");
+    assert_eq!(read(&real.join("SKILL.md")), "my own skill");
+    assert_eq!(read(&real.join("refs/notes.md")), "my notes");
+    assert_eq!(read(&v.store.join("skills/tidy/SKILL.md")), SKILL, "store untouched");
+
+    // A store link at the same place is still disabled.
+    std::fs::remove_dir_all(&real).unwrap();
+    ok(
+        r,
+        "claude_primitive_enable",
+        json!({ "kind": "skill", "name": "tidy", "scope": "workspace" }),
+    )
+    .await;
+    assert!(is_link(&real));
+    ok(
+        r,
+        "claude_primitive_disable",
+        json!({ "kind": "skill", "name": "tidy", "scope": "workspace" }),
+    )
+    .await;
+    assert!(!present(&real));
+    assert_eq!(read(&v.store.join("skills/tidy/SKILL.md")), SKILL);
+}

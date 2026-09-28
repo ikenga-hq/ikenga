@@ -1950,7 +1950,10 @@ export async function claudePrimitiveEnable(
  * Disable a store catalog entry in a target scope — the inverse of
  * `claudePrimitiveEnable`. Drops the symlink (file-based) or unmerges the
  * fragment from the scope's settings JSON (hook/mcp). The canonical store copy
- * is untouched. Idempotent.
+ * is untouched. Idempotent. Only a vault placement is removed: a real file or
+ * directory at the scope path (the user's own) rejects with a "not a vault
+ * placement" error and is left intact — `claudePrimitiveRemove` is the explicit
+ * delete.
  *
  * G-CONTRACT: implemented by WP-05 (FE wrapper) against WP-02/03 (Rust).
  */

@@ -1272,7 +1272,11 @@ function RegistrySurface({
 			if (!it) continue;
 			if (action === 'enable')
 				enable.mutate({ kind: it.storeKind, name: it.name, scope: it.scopeKey });
-			else disable.mutate({ kind: it.storeKind, name: it.name, scope: it.scopeKey });
+			// Disable only removes placements. A `local` row is the user's own
+			// file or dir, which the backend refuses too, so a mixed selection
+			// never sends it; link rows (enabled/orphaned/linked) hold no data.
+			else if (it.state !== 'local')
+				disable.mutate({ kind: it.storeKind, name: it.name, scope: it.scopeKey });
 		}
 		setMulti(new Set());
 	}
@@ -1445,6 +1449,12 @@ function RegistrySurface({
 					</tbody>
 				</table>
 			</div>
+
+			{disable.isError && (
+				<div className="ngwa-stword" role="alert" style={{ textTransform: 'none', opacity: 0.7 }}>
+					disable failed: {errText(disable.error)}
+				</div>
+			)}
 
 			{multi.size > 0 && (
 				<div className="ngwa-bulk">
@@ -1867,6 +1877,15 @@ function ItemDetail({
 							{item.mech === 'merge' ? (on ? 'Merged in' : 'Removed') : on ? 'Enabled' : 'Disabled'}
 						</label>
 					)}
+					{disable.isError && (
+						<span
+							className="ngwa-stword"
+							role="alert"
+							style={{ textTransform: 'none', opacity: 0.7 }}
+						>
+							disable failed: {errText(disable.error)}
+						</span>
+					)}
 					{item.state === 'local' && (
 						<button
 							type="button"
@@ -2275,6 +2294,15 @@ function StoreDetail({
 								</label>
 							);
 						})}
+						{disable.isError && (
+							<span
+								className="ngwa-stword"
+								role="alert"
+								style={{ textTransform: 'none', opacity: 0.7 }}
+							>
+								disable failed: {errText(disable.error)}
+							</span>
+						)}
 					</div>
 				</Section>
 			</div>
