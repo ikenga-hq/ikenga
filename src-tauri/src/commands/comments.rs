@@ -2,15 +2,14 @@
 //!
 //! Persistence + lifecycle live in [`crate::server::shared::comments`]
 //! (WP-19 slice 4), shared with the daemon's `/api/rpc` arms; see that
-//! module's doc. What stays here is desktop-only: `pin_screenshot_write`,
-//! which writes under `app_data_dir`. Sink-routing is `comment_route`.
-//! `Comment` is re-exported so existing paths are unchanged.
+//! module's doc. `pin_screenshot_write`'s body joined them in WP-19 slice 8
+//! (`shared::write_screenshot`); only resolving `app_data_dir` stays here.
+//! Sink-routing is `comment_route`. `Comment` is re-exported so existing
+//! paths are unchanged.
 
 use std::sync::Arc;
 
-use base64::Engine;
 use tauri::{AppHandle, Manager, Runtime, State};
-use uuid::Uuid;
 
 use super::db::PaDb;
 use crate::server::shared::comments as shared;
@@ -88,23 +87,15 @@ pub async fn pin_screenshot_write<R: Runtime>(
     app: AppHandle<R>,
     base64_png: String,
 ) -> Result<String, String> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_png.as_bytes())
-        .map_err(|e| format!("base64 decode: {e}"))?;
-    // PNG magic: 89 50 4E 47 0D 0A 1A 0A. Reject anything else early so a
-    // corrupt blob can't poison the screenshots dir with junk files.
-    if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
-        return Err("not a PNG (bad magic)".into());
-    }
+    // Body shared with the daemon arm (WP-19 slice 8), in the order it always
+    // ran: decode + PNG check, then `app_data_dir`, then the write.
+    let limit = shared::ShotLimit::Desktop;
+    let bytes = shared::decode_screenshot(&base64_png, limit)?;
     let dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?
-        .join(shared::SCREENSHOTS_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let path = dir.join(format!("{}.png", Uuid::new_v4()));
-    std::fs::write(&path, &bytes).map_err(|e| format!("write png: {e}"))?;
-    Ok(path.to_string_lossy().into_owned())
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+    shared::store_screenshot(&dir, &bytes, limit)
 }
 
 #[tauri::command]

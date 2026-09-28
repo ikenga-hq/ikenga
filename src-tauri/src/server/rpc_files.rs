@@ -340,6 +340,125 @@ pub(super) async fn action_git_branch(state: &AppState, args: &Value) -> RpcResp
     respond("action_git_branch", r)
 }
 
+// ─── pkg manifests + scaffold (WP-19 slice 8) ────────────────────────────────
+//
+// None of these needs the live pkg kernel: a preview parses one manifest, the
+// workspace scan reads a directory (its `installed` flag comes from the
+// daemon's own `--pkgs-dir` index — the set `pkg_kernel_status` reports), and
+// the scaffold writes embedded templates. Every caller path goes through the
+// guard; the scaffold writes through `confined_fs`.
+
+/// `pkg_preview_manifest`: `installPath` must resolve (canonically) inside the
+/// fs allowlist and outside the daemon's state, and so must the
+/// `manifest.json` it reads — a link there to anywhere the guard refuses is
+/// refused, not followed. Registers nothing. Errors otherwise are the
+/// desktop's (`read …/manifest.json: …`, `parse manifest at …`).
+///
+/// A pkg under `--pkgs-dir` previews only when that dir is inside the fs
+/// allowlist: the index names it, but the guard is the boundary for a path a
+/// caller hands back.
+pub(super) fn pkg_preview_manifest(state: &AppState, args: &Value) -> RpcResponse {
+    use super::shared::pkg_workspace;
+    let r = (|| {
+        let install_path: String = targ(args, &["installPath", "install_path"])?;
+        if install_path.is_empty() {
+            return Err("`installPath` is required".to_string());
+        }
+        fs_boundary(state)?;
+        let dir = state.path_guard.resolve(&install_path)?;
+        if let Ok(manifest) = dir.join("manifest.json").canonicalize() {
+            state.path_guard.check(&manifest)?;
+        }
+        // A missing (or dangling) manifest.json reads nothing: `Package::load`
+        // reports the desktop's own "read …" error for it.
+        pkg_workspace::preview_manifest(&dir)
+    })();
+    respond("pkg_preview_manifest", r)
+}
+
+/// `pkg_discover_workspace`: `workspaceDir`, else the daemon process's
+/// `IKENGA_WORKSPACE_DIR` (the desktop's own fallback, for the daemon's own
+/// env); neither = `[]`, as on the desktop. The dir is resolved through the
+/// guard (a refusal is an error, never an empty list); a missing dir inside
+/// the allowlist is `[]`. A child dir or `manifest.json` that canonicalizes
+/// somewhere the guard refuses reads as absent.
+pub(super) fn pkg_discover_workspace(state: &AppState, args: &Value) -> RpcResponse {
+    use super::shared::pkg_workspace::{self, Reach};
+    let r = (|| {
+        let workspace_dir: Option<String> = targ(args, &["workspaceDir", "workspace_dir"])?;
+        let Some(dir) = workspace_dir.or_else(|| std::env::var("IKENGA_WORKSPACE_DIR").ok()) else {
+            return Ok(Vec::new());
+        };
+        if dir.is_empty() {
+            // The desktop's `PathBuf::from("")` is no directory: nothing read.
+            return Ok(Vec::new());
+        }
+        fs_boundary(state)?;
+        let dir = state.path_guard.resolve_deep(&dir)?;
+        let installed: std::collections::HashSet<String> = state
+            .pkg_index
+            .installed()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let guard = &state.path_guard;
+        let check = |p: &Path| guard.check(p);
+        Ok(pkg_workspace::discover(
+            &dir,
+            &installed,
+            Reach::Confined(&check),
+        ))
+    })();
+    respond("pkg_discover_workspace", r)
+}
+
+/// `pkg_scaffold`: the desktop's destination rules against the router home
+/// (G-PRINCIPAL single-user seam) and the daemon's `ikenga.db` projects. The
+/// destination must be absolute — the desktop's `project` fallback for the
+/// workspace scope is the process cwd (`.`), which the daemon refuses rather
+/// than scaffold into its own working directory — and must pass the guard
+/// (fs allowlist + the daemon's state) as resolved from its canonical nearest
+/// existing ancestor; the write then runs from that form with
+/// `confined_fs::Reach::Confined`. `targetPath` / `targetFolder` in the answer
+/// are that canonical form. `params` is decoded as the desktop's
+/// `PkgScaffoldParams` (camelCase fields — Tauri renames only top-level
+/// argument names).
+pub(super) async fn pkg_scaffold(state: &AppState, args: &Value) -> RpcResponse {
+    use super::shared::pkg_scaffold::{self as scaffold, PkgScaffoldParams, Reach};
+    let r = async {
+        let params: PkgScaffoldParams = targ(args, &["params"])?;
+        fs_boundary(state)?;
+        let db = super::rpc_local::pa_db(state)?;
+        let (folder, primary) =
+            scaffold::resolve_destination_in(db, &params, state.home.as_deref()).await?;
+        if !folder.is_absolute() {
+            return Err(format!(
+                "scaffold destination is not absolute: {} (the daemon will not scaffold into its working directory)",
+                folder.display()
+            ));
+        }
+        let canonical = state.path_guard.resolve_maybe_missing(&folder)?;
+        let primary = canonical.join(
+            primary
+                .strip_prefix(&folder)
+                .map_err(|_| format!("failed to resolve {}", primary.display()))?,
+        );
+        let guard = &state.path_guard;
+        let check = |p: &Path| guard.check_maybe_missing(p);
+        let files =
+            scaffold::execute_scaffold_in(&params, &canonical, &primary, Reach::Confined(&check))?;
+        Ok(scaffold::result(params, &canonical, &primary, files))
+    }
+    .await;
+    respond("pkg_scaffold", r)
+}
+
+/// Router tests for every slice-8 arm (these three, and `rpc_shell`'s
+/// `pin_screenshot_write` / `scaffold_agent_config`), a file of their own.
+#[cfg(test)]
+#[path = "rpc_slice8_tests.rs"]
+mod slice8_tests;
+
 #[cfg(test)]
 mod tests {
     //! House pattern (see `rpc_shell`'s tests): a literal `ServerConfig` →

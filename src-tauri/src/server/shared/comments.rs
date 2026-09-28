@@ -17,9 +17,15 @@
 //! arms (`server::rpc_shell`), WP-19 slice 4. Each takes the `PaDb` its caller
 //! resolved and opens the pool at the same point the command always did, so
 //! both surfaces return the same value or the same error.
+//!
+//! `pin_screenshot_write`'s body is [`write_screenshot`] (WP-19 slice 8): the
+//! desktop passes its `app_data_dir` and [`ShotLimit::Desktop`], the daemon
+//! its `--data-dir` and [`ShotLimit::Daemon`].
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::db::PaDb;
@@ -27,6 +33,96 @@ use crate::db::PaDb;
 /// Leaf under the data dir where `pin_screenshot_write` puts element
 /// screenshots (`$app_data_dir/pin-screenshots/<uuid>.png` on the desktop).
 pub const SCREENSHOTS_DIR: &str = "pin-screenshots";
+
+/// The daemon's cap on one decoded pin screenshot. The desktop has none (its
+/// caller is the user's own renderer over Tauri IPC); the daemon's caller is a
+/// remote token holder, so one call must not be able to fill its disk. 2 MiB
+/// is axum's default request-body limit, which already bounds the base64
+/// that reaches the arm to ~1.5 MiB decoded; the cap is stated here too so it
+/// holds even if that body limit is raised for another route. An element
+/// crop (`captureToPng` of one picked element) is tens to hundreds of KB.
+pub const DAEMON_MAX_SCREENSHOT_BYTES: usize = 2 * 1024 * 1024;
+
+/// How a pin screenshot write is bounded.
+#[derive(Clone, Copy, Debug)]
+pub enum ShotLimit {
+    /// The desktop: no size cap, `fs::write`, the path as joined —
+    /// byte-identical to the command before the move.
+    Desktop,
+    /// The daemon: at most `max_bytes` decoded (refused before decoding when
+    /// the base64 alone is too long), the file created exclusively, and the
+    /// canonical path returned — the form `comment_create` checks and stores.
+    Daemon { max_bytes: usize },
+}
+
+/// `pin_screenshot_write`'s body: decode an FE-supplied base64 PNG and write
+/// it to `<data_dir>/pin-screenshots/<uuid>.png` under a server-minted name.
+/// No caller-supplied path is involved. Returns the file's path.
+pub fn write_screenshot(
+    data_dir: &Path,
+    base64_png: &str,
+    limit: ShotLimit,
+) -> Result<String, String> {
+    let bytes = decode_screenshot(base64_png, limit)?;
+    store_screenshot(data_dir, &bytes, limit)
+}
+
+/// The first half of [`write_screenshot`]: the size cap (daemon), base64
+/// decode and PNG magic check. Errors are the desktop's words.
+pub fn decode_screenshot(base64_png: &str, limit: ShotLimit) -> Result<Vec<u8>, String> {
+    let too_large = |max: usize| format!("screenshot too large: the daemon's cap is {max} bytes");
+    if let ShotLimit::Daemon { max_bytes } = limit {
+        // Padded STANDARD base64 of n bytes is exactly 4 * ceil(n / 3) chars.
+        if base64_png.len() > max_bytes.div_ceil(3) * 4 {
+            return Err(too_large(max_bytes));
+        }
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_png.as_bytes())
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    if let ShotLimit::Daemon { max_bytes } = limit {
+        if bytes.len() > max_bytes {
+            return Err(too_large(max_bytes));
+        }
+    }
+    // PNG magic: 89 50 4E 47 0D 0A 1A 0A. Reject anything else early so a
+    // corrupt blob can't poison the screenshots dir with junk files.
+    if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("not a PNG (bad magic)".into());
+    }
+    Ok(bytes)
+}
+
+/// The second half of [`write_screenshot`]: write decoded `bytes` under a
+/// fresh UUID in `<data_dir>/pin-screenshots/`.
+pub fn store_screenshot(data_dir: &Path, bytes: &[u8], limit: ShotLimit) -> Result<String, String> {
+    let dir = data_dir.join(SCREENSHOTS_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let name = format!("{}.png", uuid::Uuid::new_v4());
+    match limit {
+        ShotLimit::Desktop => {
+            let path = dir.join(name);
+            std::fs::write(&path, &bytes).map_err(|e| format!("write png: {e}"))?;
+            Ok(path.to_string_lossy().into_owned())
+        }
+        ShotLimit::Daemon { .. } => {
+            use std::io::Write as _;
+            let dir = dir.canonicalize().map_err(|e| format!("mkdir: {e}"))?;
+            let path = dir.join(name);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| format!("write png: {e}"))?;
+            if let Err(e) = file.write_all(&bytes) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("write png: {e}"));
+            }
+            Ok(path.to_string_lossy().into_owned())
+        }
+    }
+}
 
 const VALID_STATUSES: &[&str] = &["open", "in_progress", "resolved", "stale"];
 const VALID_SINKS: &[&str] = &["terminal", "sidepane", "both"];

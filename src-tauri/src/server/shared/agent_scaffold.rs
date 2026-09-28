@@ -17,11 +17,24 @@
 //! The Rust side just dispatches by `provider_id`. v1 ships `claude-code`
 //! only; Codex / Gemini / Cursor providers can drop in their own
 //! template tree + match arm later.
+//!
+//! **Where this lives.** The body of `scaffold_agent_config`, shared by the
+//! desktop command (`agent_detect::scaffold_agent_config`, which calls
+//! [`scaffold`] — [`Reach::Follow`], unchanged behaviour and strings) and the
+//! daemon's `/api/rpc` arm (`server::rpc_claude`, WP-19 slice 8), which
+//! calls [`scaffold_in`] with a canonical, `PathGuard`-admitted root and
+//! [`Reach::Confined`]: a symlink at `<root>/.claude` refuses the whole call
+//! before anything is written, and every directory and file below it goes
+//! through `confined_fs` — no link, live or dangling, is followed, and every
+//! node is checked against the guard again. `agent_detect::scaffold`
+//! re-exports this module, so every existing path resolves.
 
 use std::path::{Path, PathBuf};
 
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
+
+pub use super::confined_fs::Reach;
 
 /// Source of truth for the starter templates. Files under
 /// `src-tauri/templates/starter/claude-code/` are baked into the release
@@ -80,9 +93,16 @@ impl ScaffoldMode {
 /// Entry point invoked by the Tauri command. Resolves the template tree
 /// for `provider`, then walks it into `<root_path>/<config_dir>`.
 pub fn scaffold(req: ScaffoldRequest) -> Result<ScaffoldResponse, String> {
+    scaffold_in(req, Reach::Follow)
+}
+
+/// [`scaffold`] with the reach explicit. The daemon passes
+/// [`Reach::Confined`] and a `root_path` it has already canonicalized and
+/// checked against its `PathGuard`.
+pub fn scaffold_in(req: ScaffoldRequest, reach: Reach<'_>) -> Result<ScaffoldResponse, String> {
     let mode = ScaffoldMode::parse(req.mode.as_deref());
     match req.provider.as_str() {
-        "claude-code" => scaffold_claude_code(&req.root_path, &req.profile, mode),
+        "claude-code" => scaffold_claude_code(&req.root_path, &req.profile, mode, reach),
         other => Err(format!("unsupported provider: {other}")),
     }
 }
@@ -91,6 +111,7 @@ fn scaffold_claude_code(
     root_path: &str,
     profile: &str,
     mode: ScaffoldMode,
+    reach: Reach<'_>,
 ) -> Result<ScaffoldResponse, String> {
     // v1 only ships the `starter` profile. Future profiles (music-label,
     // studio) will pick a different sub-dir under `templates/starter/`.
@@ -108,17 +129,44 @@ fn scaffold_claude_code(
     }
 
     let target = root.join(".claude");
-    write_dir(&CLAUDE_CODE_STARTER, &target, mode)
+    if let Reach::Confined(_) = reach {
+        // The whole tree lands under `.claude`: a link there is refused
+        // outright, before anything is created (as `project_scaffold_claude`
+        // refuses one), rather than reported file by file.
+        if std::fs::symlink_metadata(&target)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "refusing to follow a symlink out of the project: {}",
+                target.display()
+            ));
+        }
+    }
+    write_dir(&CLAUDE_CODE_STARTER, &target, mode, reach)
 }
 
 /// Recursively writes `src` into `dest` honouring the conflict mode.
 /// Tracks per-file outcomes for the response.
-fn write_dir(src: &Dir<'_>, dest: &Path, mode: ScaffoldMode) -> Result<ScaffoldResponse, String> {
+fn write_dir(
+    src: &Dir<'_>,
+    dest: &Path,
+    mode: ScaffoldMode,
+    reach: Reach<'_>,
+) -> Result<ScaffoldResponse, String> {
     let mut written: Vec<String> = Vec::new();
     let mut skipped: Vec<ScaffoldFileResult> = Vec::new();
     let mut errors: Vec<ScaffoldFileResult> = Vec::new();
 
-    walk(src, dest, mode, &mut written, &mut skipped, &mut errors);
+    walk(
+        src,
+        dest,
+        mode,
+        reach,
+        &mut written,
+        &mut skipped,
+        &mut errors,
+    );
 
     let files_written = u32::try_from(written.len()).unwrap_or(u32::MAX);
     let message = if errors.is_empty() {
@@ -150,6 +198,7 @@ fn walk(
     src: &Dir<'_>,
     dest: &Path,
     mode: ScaffoldMode,
+    reach: Reach<'_>,
     written: &mut Vec<String>,
     skipped: &mut Vec<ScaffoldFileResult>,
     errors: &mut Vec<ScaffoldFileResult>,
@@ -157,7 +206,7 @@ fn walk(
     // Ensure dest dir exists. Failure here is fatal for the whole subtree
     // — record it and bail on this branch rather than continuing into
     // children that would all fail.
-    if let Err(e) = std::fs::create_dir_all(dest) {
+    if let Err(e) = reach.create_dir_all(dest) {
         errors.push(ScaffoldFileResult {
             path: dest.display().to_string(),
             reason: format!("create_dir_all: {e}"),
@@ -189,7 +238,7 @@ fn walk(
             nested_target
         };
 
-        let exists = target.exists();
+        let exists = reach.exists(&target);
         match (mode, exists) {
             (ScaffoldMode::Augment, true) | (ScaffoldMode::SkipConflicts, true) => {
                 skipped.push(ScaffoldFileResult {
@@ -204,7 +253,7 @@ fn walk(
         // Make sure the parent dir exists for nested files like
         // skills/foo/SKILL.md.
         if let Some(parent) = target.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = reach.create_dir_all(parent) {
                 errors.push(ScaffoldFileResult {
                     path: rel.display().to_string(),
                     reason: format!("create_dir_all parent: {e}"),
@@ -213,7 +262,7 @@ fn walk(
             }
         }
 
-        match std::fs::write(&target, file.contents()) {
+        match reach.write(&target, file.contents()) {
             Ok(()) => written.push(rel.display().to_string()),
             Err(e) => errors.push(ScaffoldFileResult {
                 path: rel.display().to_string(),
@@ -228,7 +277,7 @@ fn walk(
         // name here. Recursing once with the original `dest` would
         // duplicate dir names. Iterate dir contents but keep dest pointed
         // at the same root.
-        walk(dir, dest, mode, written, skipped, errors);
+        walk(dir, dest, mode, reach, written, skipped, errors);
     }
 }
 

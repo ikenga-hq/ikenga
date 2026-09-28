@@ -71,11 +71,11 @@ reason = "OS-credential op (biometric_support/OS biometrics) explicitly named un
 
 [backup_export]
 tag = "WP-19"
-reason = "Writes a zip to a caller-supplied free-form dest_path with no containment (a remote client could write anywhere the daemon can); include_secrets reads the desktop Stronghold vault via SecretsLock, which has no daemon analog (IKENGA_SECRET_* env is read-only)."
+reason = "dest_path is unconfined: PathBuf::from(dest_path) + create_dir_all(parent) + the zip write, no allowlist or data-dir check, so a token holder could write a zip anywhere the daemon can (backup_list / backup_delete are served only because they stay inside <data-dir>/backups). include_secrets also reads the desktop Stronghold vault through SecretsLock, which the daemon has no analog for. Needs a dest confined to <data-dir>/backups and a secrets story first."
 
 [backup_import]
 tag = "WP-19"
-reason = "Reads a caller-supplied free-form src_path with no containment, and what it stages (staged-restore/ + RESTORE_PENDING) is only ever applied by desktop lib.rs .setup() on the next launch after a relaunch; the daemon has no apply step."
+reason = "src_path is unconfined (PathBuf::from(src_path), no allowlist check). And what it produces, staged-restore/pa.db.new + RESTORE_PENDING, is only applied by desktop lib.rs .setup() (apply_staged_restore_if_present, pre-pool) on the next desktop launch; the daemon has no boot-apply step, so a served import would stage a restore that is never applied."
 
 [bg_spike_reply]
 tag = "desktop-only-forever"
@@ -115,11 +115,11 @@ reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine
 
 [db_export_ndjson]
 tag = "WP-19"
-reason = "Writes one NDJSON file per table into a caller-supplied free-form dest_dir with no containment check; needs a contained destination before a remote client may drive it."
+reason = "dest_dir is unconfined (Path::new(&dest_dir), no allowlist or data-dir check): it writes one NDJSON file per table wherever the caller points. It also has no FE caller (no tauri-cmd.ts wrapper; only the wp06 round-trip unit test). Needs a contained destination before a remote client may drive it."
 
 [db_import_ndjson]
 tag = "WP-19"
-reason = "Reads a caller-supplied free-form src_dir with no containment, and interpolates each file's stem into SQL as the table name (INSERT OR REPLACE INTO \"{stem}\"); needs containment + a table allowlist first."
+reason = "src_dir is unconfined (no allowlist check), and import_ndjson_from_dir interpolates each file's filename-derived stem into SQL as the table name (INSERT OR REPLACE INTO \"{table}\" ...) with no check against the real schema, so a crafted filename can break out of the quoted identifier. No FE caller (test-only). Needs containment + a table allowlist first."
 
 [detect_agent]
 tag = "WP-18b"
@@ -237,7 +237,7 @@ reason = "ngwa_snapshot_inner needs the live pkg kernel: kernel.status() (regist
 
 [notifications_record_update]
 tag = "WP-19"
-reason = "Not served in slice 4, where the rest of notifications_* moved: after recording the row it sweeps update rows against the running shell's app.package_info() version and the live pkg kernel's installed set (commands/notifications.rs sweep_installed_updates). The daemon has neither (no shell package_info; its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could record but not honestly resolve; and producers::update lives in the desktop-only notifications::producers (it leans on engines::claude_code)."
+reason = "Not served with the rest of notifications_* (slice 4). It emits nothing, so events are not the blocker: after recording the row it sweeps update rows against the running shell's app.package_info() version and the live pkg kernel's installed set (app.try_state::<KernelState>(), commands/notifications.rs sweep_installed_updates). The daemon has neither (no shell package_info; its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could record 'update available' rows it can never honestly resolve, leaving them stale; and producers::update lives in the desktop-only notifications::producers (it leans on engines::claude_code)."
 
 [oba_auto_update_all]
 tag = "WP-18b"
@@ -275,10 +275,6 @@ reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same
 tag = "desktop-only-forever"
 reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
 
-[pin_screenshot_write]
-tag = "WP-19"
-reason = "Decodes an FE-supplied base64 PNG and writes it under app_data_dir/pin-screenshots; no native capture or spawn."
-
 [pkg_activity_bar_set_badge]
 tag = "WP-19"
 reason = "Mutates in-memory ActivityBarRegistry badge state + emits an event; data-only, no native UI or spawn."
@@ -298,10 +294,6 @@ reason = "kernel.reload_pkg unregisters (kills) then re-registers (may respawn) 
 [pkg_dev_unregister]
 tag = "WP-18b"
 reason = "Calls kernel.uninstall, which walks registries.rev().unregister() incl. SidecarSupervisor::unregister (kills the dev pkg's running child)."
-
-[pkg_discover_workspace]
-tag = "WP-19"
-reason = "kernel.discover_workspace scans a dir for manifest.json files read-only; never mutates registries or spawns."
 
 [pkg_fetch]
 tag = "WP-19"
@@ -338,14 +330,6 @@ reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §
 [pkg_mcp_call]
 tag = "WP-18b"
 reason = "Dispatches to pkg::mcp_runtime::call_tool, which spawns the pkg's MCP server per call; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[pkg_preview_manifest]
-tag = "WP-19"
-reason = "Package::load(install_path) parses manifest.json to JSON without registering; fs read only."
-
-[pkg_scaffold]
-tag = "WP-19"
-reason = "execute_scaffold writes embedded template files to disk via fs::write only; grepped file has no Command::new."
 
 [pkg_screenshot]
 tag = "WP-19"
@@ -461,11 +445,7 @@ reason = "Shuts down the desktop's own locally-launched daemon process; no such 
 
 [runtime_retry_bun_fetch]
 tag = "WP-19"
-reason = "ensure_bun is a reqwest download + zip unpack (no Command::new); prepares the bundled Bun both spawn sites share."
-
-[scaffold_agent_config]
-tag = "WP-19"
-reason = "Writes the starter tree with create_dir_all / fs::write, which follow symlinks at the target (<root>/.claude/...); a remote caller needs the symlink-refusing FsReach::Confined write path project_scaffold_claude uses before it may drive it. Not served in slice 5b."
+reason = "Its only FE-visible effect is the runtime://bun event: ensure_bun(&app, emit) narrates start/progress/ready/error through app.emit, and RuntimeBunChip (src/shell/runtime-bun-chip.tsx) renders null until an event arrives and has no poll fallback. The web transport's listen() is a no-op, so a served retry would run a real multi-second reqwest download + unpack server-side while the button that fired it shows nothing: no progress, no success, no error. ensure_bun is also AppHandle-shaped throughout (app_data_dir destination, SidecarSupervisorState wake). Needs a pollable status (or an event channel) first."
 
 [screenshot_capture_done]
 tag = "desktop-only-forever"
@@ -565,27 +545,27 @@ reason = "unlock.unlock(passphrase) gates the single shared DEK/vault for the wh
 
 [session_cancel]
 tag = "WP-19"
-reason = "Cancels the executor-managed streaming child via cancel_streaming; same already-executor-routed spawn path as session_send."
+reason = "No live FE caller in src/. AppHandle-free itself (cancel_streaming signals the child), but it can only cancel a turn session_send started, and session_send cannot run on the daemon: claude/session.rs emits every ChatEvent through a bare app.emit (emit_events), and the daemon has no AppHandle. Nor does the daemon's /ws/chat/:id have a Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\"), compiled out of ikenga-server). Served alone it would be a permanent no-op. Prerequisite: the on_update callback refactor engines/antigravity_acp already had."
 
 [session_destroy]
 tag = "WP-19"
-reason = "Removes in-memory session entry + cancel_streaming on the executor-managed session; no desktop-only spawn site."
+reason = "No live FE caller in src/. Removes the SessionsState entry + cancel_streaming, which only means something for a session session_send drove, and session_send cannot run on the daemon: claude/session.rs emits through a bare app.emit (emit_events) and the daemon has no AppHandle; its /ws/chat/:id has no Claude Code engine either (EngineHandle::ClaudeCode is cfg(feature=\"desktop\")). Prerequisite: the on_update callback refactor engines/antigravity_acp already had."
 
 [session_destroy_all]
 tag = "WP-19"
-reason = "kill_all_streaming() over executor-managed sessions (HMR hygiene); same non-desktop-only spawn path."
+reason = "No live FE caller in src/ (the doc comment's window-beforeunload caller does not exist: the only beforeunload listeners are terminal/session-store.ts and markdown-view.tsx). kill_all_streaming drains children only session_send starts, and session_send cannot run on the daemon: claude/session.rs emits through a bare app.emit (emit_events), the daemon has no AppHandle, and its /ws/chat/:id has no Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\")). Prerequisite: the on_update callback refactor engines/antigravity_acp already had."
 
 [session_ensure]
 tag = "WP-19"
-reason = "Registers a thread in SessionsState; doc comment states 'No process is spawned'."
+reason = "No live FE caller in src/. It only registers a thread (and an unconfined cwd) in SessionsState, which the daemon never constructs; the turn it prepares for is session_send, which cannot run on the daemon: claude/session.rs emits every ChatEvent through a bare app.emit (emit_events) and reads app.path().app_data_dir() for env layering, and the daemon has no AppHandle. Its /ws/chat/:id has no Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\")). Prerequisite: the on_update callback refactor engines/antigravity_acp already had."
 
 [session_send]
 tag = "WP-19"
-reason = "Spawns via claude/session.rs SpawnSpec, which already routes through the session executor (WP-18); not a desktop-only site."
+reason = "No live FE caller in src/. The spawn is executor-routed (WP-18), but the whole output path is claude/session.rs emit_events' bare app.emit on session://{thread_id} (+ a claude://session/{id} mirror), and the daemon has no AppHandle: served as-is the child would consume the prompt and the caller would never see a reply. The daemon's /ws/chat/:id has no Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\"), compiled out of ikenga-server), and cwd is unconfined. Prerequisite: the on_update callback refactor engines/antigravity_acp already had (then a registry entry + a chat_ws run_turn arm + cwd through PathGuard)."
 
 [session_tool_result]
 tag = "WP-19"
-reason = "Forwards a tool result over the existing executor-managed session's stdin channel; no new spawn."
+reason = "No live FE caller in src/. It answers a tool round-trip mid-turn over the live child's stdin, but the request half reaches the FE only through claude/session.rs emit_events' bare app.emit, and the daemon has no AppHandle; its /ws/chat/:id has no Claude Code engine (EngineHandle::ClaudeCode is cfg(feature=\"desktop\")) and ChatClientMessage has no tool-result shape. Prerequisite: the on_update callback refactor engines/antigravity_acp already had."
 
 [set_dock_badge]
 tag = "desktop-only-forever"
@@ -605,15 +585,15 @@ reason = "Helper solely for the spike_grant_fs_read debug harness (module doc: '
 
 [viewer_port]
 tag = "WP-19"
-reason = "Returns the shared viewer server's already-bound port; read-only, no spawn."
+reason = "The daemon runs no viewer server: ViewerServerManager is constructed only in desktop lib.rs, and ViewerServerManager::start needs a Tauri AppHandle for app.asset_resolver() (its fallback route). Served now it would answer None forever. Needs the viewer routes nested into the daemon router and an AppState field first."
 
 [viewer_serve]
 tag = "WP-19"
-reason = "manager.register() just adds a (token,root) mount to the already-running in-process viewer HTTP server; no process spawn."
+reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so a served register() would hand back a {url, token} for a mount nothing answers: every /__viewer URL 404s against the SPA fallback. rootDir confinement is not the blocker (resolve_allowlisted maps onto PathGuard). Needs the viewer routes nested into the daemon router and an AppState field first."
 
 [viewer_stop]
 tag = "WP-19"
-reason = "manager.unregister() drops a mount-registry entry; no spawn."
+reason = "The daemon runs no viewer server (ViewerServerManager is desktop lib.rs-only; ViewerServerManager::start needs AppHandle's asset_resolver), so there is no mount registry to unregister from. Trivial (a DashMap remove) once the viewer routes and an AppState field exist."
 
 [window_close]
 tag = "desktop-only-forever"

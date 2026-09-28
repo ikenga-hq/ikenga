@@ -29,20 +29,9 @@ use super::source::InstallSource;
 // keeps resolving for every existing caller.
 pub use super::status::{InstalledSummary, KernelStatus};
 
-/// One entry returned by `Kernel::discover_workspace` — a manifest dir found
-/// in a workspace path. `valid=false` means the dir had a manifest.json but
-/// it failed to parse; `error` carries the reason.
-#[derive(Debug, Serialize, Clone)]
-pub struct DiscoveredPkg {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub install_path: String,
-    pub valid: bool,
-    pub error: Option<String>,
-    pub installed: bool,
-    pub compatible: bool,
-}
+// Moved to the ungated `server::shared::pkg_workspace` (WP-19 slice 8) so the
+// daemon's `pkg_discover_workspace` arm returns the same wire shape.
+pub use crate::server::shared::pkg_workspace::DiscoveredPkg;
 
 /// Child tables carrying a `pkg_id` referencing `pkg_installed(id)`. Three
 /// declare `ON DELETE CASCADE` (migration 0007); `pkg_capability_snapshots`
@@ -803,59 +792,24 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// `manifest.json`; entries that fail to parse are reported as
     /// `valid=false` with the error so the FE can show a useful warning
     /// rather than silently dropping them.
+    ///
+    /// The scan itself is `server::shared::pkg_workspace::discover` (WP-19
+    /// slice 8, shared with the daemon); the kernel's part is the installed
+    /// set behind each entry's `installed` flag.
     pub fn discover_workspace(&self, workspace_dir: &Path) -> Vec<DiscoveredPkg> {
-        let mut out = Vec::new();
         if !workspace_dir.is_dir() {
-            return out;
+            return Vec::new();
         }
-        let entries = match std::fs::read_dir(workspace_dir) {
-            Ok(e) => e,
-            Err(err) => {
-                log::warn!(
-                    "[pkg_kernel] discover_workspace: read_dir({}) failed: {err}",
-                    workspace_dir.display()
-                );
-                return out;
-            }
-        };
         let installed_ids: std::collections::HashSet<String> = self
             .installed
             .read()
             .map(|g| g.keys().cloned().collect())
             .unwrap_or_default();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest_path = path.join("manifest.json");
-            if !manifest_path.exists() {
-                continue;
-            }
-            match super::manifest::Package::load(&path) {
-                Ok(pkg) => out.push(DiscoveredPkg {
-                    id: pkg.manifest.id.clone(),
-                    name: pkg.manifest.name.clone(),
-                    version: pkg.manifest.version.clone(),
-                    install_path: path.display().to_string(),
-                    valid: true,
-                    error: None,
-                    installed: installed_ids.contains(&pkg.manifest.id),
-                    compatible: pkg.is_compatible(),
-                }),
-                Err(e) => out.push(DiscoveredPkg {
-                    id: String::new(),
-                    name: String::new(),
-                    version: String::new(),
-                    install_path: path.display().to_string(),
-                    valid: false,
-                    error: Some(format!("{e:#}")),
-                    installed: false,
-                    compatible: false,
-                }),
-            }
-        }
-        out
+        crate::server::shared::pkg_workspace::discover(
+            workspace_dir,
+            &installed_ids,
+            crate::server::shared::pkg_workspace::Reach::Follow,
+        )
     }
 
     /// Auto-install built-in packages bundled with the app on first boot.
