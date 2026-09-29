@@ -1,10 +1,11 @@
 // Ngwa Store Surface component tests (WP-15 / locked D-02).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/react';
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { NgwaStoreSurface } from './ngwa-store-surface';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
+import type { StorePkgVersion } from '@/lib/registry/client';
 
 afterEach(() => {
 	cleanup();
@@ -98,11 +99,57 @@ const mockCatalog: NgwaStoreEntry[] = [
 	},
 ];
 
+/** A registry detail-file version, as `fetchPkgVersionForStore` returns it. */
+function detailVersion(
+	manifest: Record<string, unknown>,
+	extra: Record<string, unknown> = {}
+): StorePkgVersion {
+	return {
+		version: '1.0.0',
+		publishedAt: '2026-09-01T00:00:00Z',
+		tarball: 'https://registry.npmjs.org/x/-/x-1.0.0.tgz',
+		integrity: 'sha512-abc',
+		size: 2_500_000,
+		deps: [],
+		screenshots: [],
+		...extra,
+		manifest: {
+			id: 'com.ikenga.groundwork',
+			name: 'groundwork',
+			version: '1.0.0',
+			ikenga_api: '1',
+			author: { name: 'Royalti', key: 'royalti' },
+			mcp: [],
+			sidecars: [],
+			requires: [],
+			permissions: {},
+			ui: {},
+			...manifest,
+		},
+	} as unknown as StorePkgVersion;
+}
+
+const studioLike = detailVersion({
+	requires: [
+		{ kind: 'bundle', name: 'studio-archetypes', source: 'npx' },
+		{ kind: 'skill', name: 'studio-doctor' },
+	],
+	mcp: [{ name: 'studio', command: 'bun', args: [], env: {} }],
+	permissions: {
+		'shell.execute': ['bun', 'ffmpeg'],
+		net: ['https://esm.sh', 'http://127.0.0.1:*'],
+	},
+});
+
+function selectRow(name: string) {
+	fireEvent.click(screen.getByText(name));
+}
+
 describe('NgwaStoreSurface', () => {
 	it('renders store catalog items', () => {
 		const { container } = renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
-		expect(screen.getAllByText('pkg-tasks').length).toBeGreaterThanOrEqual(1);
-		expect(screen.getAllByText('skill-groundwork').length).toBeGreaterThanOrEqual(1);
+		expect(screen.getByText('@ikenga/pkg-tasks')).toBeDefined();
+		expect(screen.getByText('skill-groundwork')).toBeDefined();
 		expect(container.querySelector('.updates')).not.toBeNull();
 	});
 
@@ -117,46 +164,182 @@ describe('NgwaStoreSurface', () => {
 		const searchInput = screen.getByPlaceholderText('Search the registry…');
 		fireEvent.change(searchInput, { target: { value: 'groundwork' } });
 
-		expect(screen.getAllByText('skill-groundwork').length).toBeGreaterThanOrEqual(1);
-		expect(screen.queryByText('pkg-tasks')).toBeNull();
+		expect(screen.getByText('skill-groundwork')).toBeDefined();
+		expect(screen.queryByText('@ikenga/pkg-tasks')).toBeNull();
+		expect(screen.getByText(/1 of 2 shown/)).toBeDefined();
 	});
 
 	it('filters entries by kind facet chip', () => {
 		const { container } = renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
 		const skillChip = container.querySelector('button[data-kind="skill"]') as HTMLElement;
-		expect(skillChip).toBeDefined();
 		fireEvent.click(skillChip);
 
-		expect(screen.getAllByText('skill-groundwork').length).toBeGreaterThanOrEqual(1);
-		expect(screen.queryByText('pkg-tasks')).toBeNull();
+		expect(screen.getByText('skill-groundwork')).toBeDefined();
+		expect(screen.queryByText('@ikenga/pkg-tasks')).toBeNull();
 	});
 
-	it('handles update and install callbacks', () => {
+	it('shows the empty sheet until a row is picked, and closes back to it', () => {
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} />);
+		expect(
+			screen.getByText(/Pick a row to read its closure, its permissions and its settings/)
+		).toBeDefined();
+
+		selectRow('skill-groundwork');
+		expect(screen.queryByText(/Pick a row to read its closure/)).toBeNull();
+
+		fireEvent.click(screen.getByLabelText('Close sheet'));
+		expect(screen.getByText(/Pick a row to read its closure/)).toBeDefined();
+	});
+
+	it('row Update calls onUpdate; row Install opens the sheet instead of installing', () => {
 		const onUpdate = vi.fn();
 		const onInstall = vi.fn();
 		renderWithClient(
-			<NgwaStoreSurface
-				catalog={mockCatalog}
-				onUpdate={onUpdate}
-				onInstall={onInstall}
-			/>
+			<NgwaStoreSurface catalog={mockCatalog} onUpdate={onUpdate} onInstall={onInstall} />
 		);
 
-		const updateBtn = screen.getByRole('button', { name: /^update/i });
-		fireEvent.click(updateBtn);
+		fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
 		expect(onUpdate).toHaveBeenCalledWith(mockCatalog[0]);
 
-		// Click install dropdown arrow on groundwork
-		const chevronBtn = screen.getByLabelText('Choose install scope');
-		fireEvent.click(chevronBtn);
-
-		const personalOption = screen.getByText(/Personal scope/i);
-		fireEvent.click(personalOption);
-		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'personal');
+		fireEvent.click(screen.getByRole('button', { name: /^install$/i }));
+		expect(onInstall).not.toHaveBeenCalled();
+		expect(screen.getByRole('region', { name: 'Install sheet' }).textContent).toContain(
+			'skill-groundwork'
+		);
 	});
 
-	it('renders the install-scope menu as a styled popover that Escape and outside clicks dismiss', () => {
+	it('rows say "not read" until the detail file is fetched, then show closure and asks', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(studioLike);
+		const { container } = renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} loadDetail={loadDetail} />
+		);
+		const row = container.querySelector('.srow[data-id="skill-groundwork"]') as HTMLElement;
+		expect(row.querySelector('[data-closure]')?.textContent).toBe('closure not read');
+		expect(row.querySelector('[data-asks]')?.textContent).toBe('permissions not read');
+		// Nothing is fetched for rows nobody opened.
+		expect(loadDetail).not.toHaveBeenCalled();
+
+		selectRow('skill-groundwork');
+		await waitFor(() =>
+			expect(row.querySelector('[data-closure]')?.textContent).toBe(
+				'also installs 1 bundle · 1 skill · 1 MCP server'
+			)
+		);
+		expect(row.querySelector('[data-asks]')?.textContent).toBe(
+			'asks: shell.execute · net (2 hosts)'
+		);
+		expect(loadDetail).toHaveBeenCalledTimes(1);
+		expect(loadDetail.mock.calls[0][0]).toBe(mockCatalog[1]);
+		// The other row was never read.
+		const tasks = container.querySelector('.srow[data-id="@ikenga/pkg-tasks"]') as HTMLElement;
+		expect(tasks.querySelector('[data-asks]')?.textContent).toBe('permissions not read');
+	});
+
+	it('fetches the detail for the selected row and renders the requires closure', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(studioLike);
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				activeProjectName="royalti-co"
+			/>
+		);
+		selectRow('skill-groundwork');
+
+		expect(await screen.findByText('Requires — the closure, before you consent')).toBeDefined();
+		const sheet = screen.getByRole('region', { name: 'Install sheet' });
+		const requires = sheet.querySelector('[data-requires]') as HTMLElement;
+		expect(within(requires).getByText('studio-archetypes')).toBeDefined();
+		expect(within(requires).getByText('studio-doctor')).toBeDefined();
+		expect(requires.textContent).toContain('royalti-co · npx');
+		expect(requires.textContent).toContain('royalti-co · catalog');
+		// Header: publisher · pkg id · ikenga_api; footer: size; trust.
+		expect(sheet.textContent).toContain('Royalti');
+		expect(sheet.textContent).toContain('com.ikenga.groundwork');
+		expect(sheet.textContent).toContain('2.4 MB');
+		expect(sheet.textContent).toContain('absent — this manifest carries no ed25519 signature');
+	});
+
+	it('gates Install on every consent box, then installs to the active project', async () => {
+		const onInstall = vi.fn();
+		const loadDetail = vi.fn().mockResolvedValue(studioLike);
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				onInstall={onInstall}
+				activeProjectName="royalti-co"
+			/>
+		);
+		selectRow('skill-groundwork');
+
+		expect(await screen.findByText('Share kola')).toBeDefined();
+		const install = screen.getByRole('button', {
+			name: 'Install to royalti-co',
+		}) as HTMLButtonElement;
+		const boxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+		expect(boxes).toHaveLength(2);
+		expect(install.disabled).toBe(true);
+		expect(install.title).toBe('Tick every consent above first');
+
+		fireEvent.click(boxes[0]);
+		expect(install.disabled).toBe(true);
+		fireEvent.click(boxes[1]);
+		expect(install.disabled).toBe(false);
+
+		fireEvent.click(install);
+		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'project');
+	});
+
+	it('enables Install at once when the manifest asks for nothing', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} loadDetail={loadDetail} onInstall={vi.fn()} />
+		);
+		selectRow('skill-groundwork');
+
+		expect(
+			await screen.findByText(/declares intent and never grants itself anything/)
+		).toBeDefined();
+		expect(screen.queryAllByRole('checkbox')).toHaveLength(0);
+		const install = screen.getByRole('button', {
+			name: 'Install to active project',
+		}) as HTMLButtonElement;
+		expect(install.disabled).toBe(false);
+	});
+
+	it('keeps Install disabled while the manifest is unread', () => {
 		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onInstall={vi.fn()} />);
+		selectRow('skill-groundwork');
+		const install = screen.getByRole('button', { name: /^Install to/ }) as HTMLButtonElement;
+		expect(install.disabled).toBe(true);
+		expect(screen.getByText(/Closure and permissions not read/)).toBeDefined();
+	});
+
+	it('surfaces a detail-fetch failure with a retry', async () => {
+		const loadDetail = vi
+			.fn()
+			.mockRejectedValueOnce(new Error('HTTP 404'))
+			.mockResolvedValueOnce(studioLike);
+		const { container } = renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} loadDetail={loadDetail} onInstall={vi.fn()} />
+		);
+		selectRow('skill-groundwork');
+
+		expect(await screen.findByText(/read the manifest/)).toBeDefined();
+		expect(container.querySelector('[data-state="ngwa-store-detail-error"]')).not.toBeNull();
+		fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+		expect(await screen.findByText('Share kola')).toBeDefined();
+	});
+
+	it('renders the install-scope menu as a styled popover that Escape and outside clicks dismiss', async () => {
+		const onInstall = vi.fn();
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} loadDetail={loadDetail} onInstall={onInstall} />
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
 
 		const chevronBtn = screen.getByLabelText('Choose install scope');
 		fireEvent.click(chevronBtn);
@@ -173,5 +356,23 @@ describe('NgwaStoreSurface', () => {
 		expect(screen.getByRole('menu', { name: 'Install scope' })).toBeDefined();
 		fireEvent.mouseDown(document.body);
 		expect(screen.queryByRole('menu', { name: 'Install scope' })).toBeNull();
+
+		fireEvent.click(chevronBtn);
+		fireEvent.click(screen.getByRole('menuitem', { name: /Install to personal/ }));
+		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'personal');
+	});
+
+	it('Update all opens a review of each update and applies only on confirm', () => {
+		const onUpdateAll = vi.fn();
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdateAll={onUpdateAll} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Update all (1)' }));
+		const dialog = screen.getByRole('dialog');
+		expect(within(dialog).getByText('Review 1 update')).toBeDefined();
+		expect(within(dialog).getByText('@ikenga/pkg-tasks')).toBeDefined();
+		expect(onUpdateAll).not.toHaveBeenCalled();
+
+		fireEvent.click(within(dialog).getByRole('button', { name: 'Update all (1)' }));
+		expect(onUpdateAll).toHaveBeenCalledWith([mockCatalog[0]]);
 	});
 });
