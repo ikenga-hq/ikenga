@@ -154,4 +154,24 @@ describe('NgwaStoreSurface', () => {
 		fireEvent.click(personalOption);
 		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'personal');
 	});
+
+	it('renders the install-scope menu as a styled popover that Escape and outside clicks dismiss', () => {
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onInstall={vi.fn()} />);
+
+		const chevronBtn = screen.getByLabelText('Choose install scope');
+		fireEvent.click(chevronBtn);
+		const menu = screen.getByRole('menu', { name: 'Install scope' });
+		expect(menu.classList.contains('cellpop')).toBe(true);
+		expect(menu.classList.contains('storepop')).toBe(true);
+		expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+		expect(chevronBtn.getAttribute('aria-expanded')).toBe('true');
+
+		fireEvent.keyDown(document, { key: 'Escape' });
+		expect(screen.queryByRole('menu', { name: 'Install scope' })).toBeNull();
+
+		fireEvent.click(chevronBtn);
+		expect(screen.getByRole('menu', { name: 'Install scope' })).toBeDefined();
+		fireEvent.mouseDown(document.body);
+		expect(screen.queryByRole('menu', { name: 'Install scope' })).toBeNull();
+	});
 });
