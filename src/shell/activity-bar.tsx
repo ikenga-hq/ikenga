@@ -71,6 +71,7 @@ import {
 	type Section,
 	useActivityBarPins,
 	usePinsStore,
+	subscribePinPruneOnUninstall,
 } from '@/lib/shell/pins-store';
 import { type CoreMode, useShellStore } from '@/lib/shell/shell-store';
 import { focusCompanion } from './companion-focus';
@@ -219,6 +220,10 @@ export function ActivityBar() {
 	useEffect(() => {
 		void hydratePins();
 	}, [hydratePins]);
+
+	// An uninstalled pkg's pins would open a view that no longer exists: the
+	// kernel emits `pkg-uninstalled`, and the pins pointing into it go.
+	useEffect(() => subscribePinPruneOnUninstall(), []);
 
 	// Mirror activeMode → ikenga.workspace, whose DOM sync is the only writer
 	// of <html data-workspace> (theme-store.ts). The four modes and the four

@@ -7,7 +7,7 @@
 // - Unreadable source banner if any subsystem failed (Gate §2)
 // - Synchronized detail pane
 
-import { useState, useMemo } from 'react';
+import { useCallback, useState, useMemo } from 'react';
 import {
 	AlertTriangle,
 	AppWindow,
@@ -24,6 +24,8 @@ import {
 import type { NgwaItem, NgwaKind } from '@ikenga/contract';
 import { NgwaFacetBar, DEFAULT_FACETS, type NgwaFacetsState } from './ngwa-facet-bar';
 import { NgwaDetailPane } from './ngwa-detail-pane';
+import { NgwaPopMenu, type PopItem } from './ngwa-scope-ops';
+import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 import {
 	formatUsageDisplay,
 	formatUsageTooltip,
@@ -36,9 +38,55 @@ export interface NgwaListProps {
 	unreadableSources?: Array<{ source: string; error: string | null }>;
 	isLoading?: boolean;
 	error?: Error | null;
-	onToggleState?: (item: NgwaItem) => void;
-	onUpdate?: (item: NgwaItem) => void;
-	onHandToChi?: (item: NgwaItem) => void;
+	/** D-02 actions for an item (detail action row + row context menu),
+	 *  built by `useNgwaItemActions`. Omitted => read-only list. */
+	actionsFor?: (item: NgwaItem) => NgwaItemActionSet;
+	/** Double-click a row: open the full-pane item detail (D-08). */
+	onOpenItem?: (item: NgwaItem) => void;
+	/** Result line of the last action. */
+	status?: NgwaActionStatus | null;
+}
+
+/** D-02 row context menu (`rowMenu`): the name as group header, Disable /
+ *  Enable (Space), Move to project / personal, Copy to…, Update, Remove…,
+ *  Open folder (↵), Hand to Chi. */
+export function rowMenuItems(
+	item: NgwaItem,
+	a: NgwaItemActionSet,
+	openCopy: () => void
+): PopItem[] {
+	const act = (x: NgwaAct, extra: Partial<PopItem> = {}): PopItem => ({
+		label: x.label,
+		disabledReason: x.disabledReason,
+		onSelect: x.run,
+		...extra,
+	});
+	return [
+		{ group: true, label: item.display_name || item.name },
+		act(a.toggle, { k: 'Space' }),
+		{ sep: true, label: '' },
+		act(a.moveToProject),
+		act(a.moveToPersonal),
+		{
+			label: 'Copy to…',
+			disabledReason: a.copy.disabledReason,
+			keepOpen: true,
+			onSelect: openCopy,
+		},
+		{ sep: true, label: '' },
+		act(a.update),
+		act(a.remove, { danger: true }),
+		{ sep: true, label: '' },
+		act(a.openFolder, { k: '↵' }),
+		act(a.handToChi),
+	];
+}
+
+interface RowMenu {
+	id: string;
+	x: number;
+	y: number;
+	mode: 'menu' | 'copy';
 }
 
 export function kindIcon(kind: NgwaKind) {
@@ -71,12 +119,14 @@ export function NgwaList({
 	unreadableSources = [],
 	isLoading = false,
 	error = null,
-	onToggleState,
-	onUpdate,
-	onHandToChi,
+	actionsFor,
+	onOpenItem,
+	status = null,
 }: NgwaListProps) {
 	const [facets, setFacets] = useState<NgwaFacetsState>(DEFAULT_FACETS);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [menu, setMenu] = useState<RowMenu | null>(null);
+	const closeMenu = useCallback(() => setMenu(null), []);
 
 	// Filter items according to active facets
 	const filteredItems = useMemo(() => {
@@ -140,6 +190,33 @@ export function NgwaList({
 		return { topLevelItems: top, childMap: children };
 	}, [filteredItems, facets.groupByPkg]);
 
+	const menuItem = menu ? (items.find((i) => i.id === menu.id) ?? null) : null;
+
+	/** Context menu, Space (toggle), ↵ (open folder), double-click (open the
+	 *  item detail) — the D-02 row bindings. */
+	function rowHandlers(item: NgwaItem) {
+		return {
+			onContextMenu: actionsFor
+				? (e: React.MouseEvent) => {
+						e.preventDefault();
+						setSelectedId(item.id);
+						setMenu({ id: item.id, x: e.clientX, y: e.clientY, mode: 'menu' });
+					}
+				: undefined,
+			onKeyDown: actionsFor
+				? (e: React.KeyboardEvent) => {
+						if (e.key !== ' ' && e.key !== 'Enter') return;
+						e.preventDefault();
+						setSelectedId(item.id);
+						const a = actionsFor(item);
+						const act = e.key === ' ' ? a.toggle : a.openFolder;
+						if (act.disabledReason === undefined) act.run();
+					}
+				: undefined,
+			onDoubleClick: onOpenItem ? () => onOpenItem(item) : undefined,
+		};
+	}
+
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
 			{/* ── Unreadable Source Banners (Gate §2) ── */}
@@ -196,6 +273,7 @@ export function NgwaList({
 											item={item}
 											isSelected={activeItem?.id === item.id}
 											onSelect={() => setSelectedId(item.id)}
+											{...rowHandlers(item)}
 										/>
 										{children.map((child) => (
 											<ItemRow
@@ -205,28 +283,50 @@ export function NgwaList({
 												parentName={item.name}
 												isSelected={activeItem?.id === child.id}
 												onSelect={() => setSelectedId(child.id)}
+												{...rowHandlers(child)}
 											/>
 										))}
 									</div>
 								);
 							})}
 					</div>
+					{status && (
+						<div className={`mstatus ${status.tone}`} role="status" data-mstatus>
+							{status.text}
+						</div>
+					)}
 				</div>
 
 				{/* ── Detail Pane ── */}
 				{activeItem ? (
-					<NgwaDetailPane
-						item={activeItem}
-						onToggleState={onToggleState}
-						onUpdate={onUpdate}
-						onHandToChi={onHandToChi}
-					/>
+					<NgwaDetailPane item={activeItem} actions={actionsFor?.(activeItem)} />
 				) : (
 					<aside className="detailcol">
 						<div className="empty">No item selected.</div>
 					</aside>
 				)}
 			</div>
+
+			{/* ── Row context menu (D-02 rowMenu) ── */}
+			{menu && menuItem && actionsFor && (
+				<NgwaPopMenu
+					pop={
+						menu.mode === 'copy'
+							? { id: `copy:${menu.id}`, title: 'Copy to', items: actionsFor(menuItem).copy.targets }
+							: {
+									id: menu.id,
+									title: menuItem.display_name || menuItem.name,
+									items: rowMenuItems(menuItem, actionsFor(menuItem), () =>
+										setMenu((m) => (m ? { ...m, mode: 'copy' } : m))
+									),
+								}
+					}
+					onClose={closeMenu}
+					className="ctxpop"
+					style={{ left: menu.x, top: menu.y }}
+					autoFocus={false}
+				/>
+			)}
 		</div>
 	);
 }
@@ -237,12 +337,18 @@ function ItemRow({
 	parentName,
 	isSelected,
 	onSelect,
+	onContextMenu,
+	onKeyDown,
+	onDoubleClick,
 }: {
 	item: NgwaItem;
 	isChild?: boolean;
 	parentName?: string;
 	isSelected: boolean;
 	onSelect: () => void;
+	onContextMenu?: (e: React.MouseEvent) => void;
+	onKeyDown?: (e: React.KeyboardEvent) => void;
+	onDoubleClick?: () => void;
 }) {
 	const usageText = formatUsageDisplay(item.usage);
 	const usageTooltip = formatUsageTooltip(item.usage);
@@ -258,6 +364,9 @@ function ItemRow({
 				item.state === 'disabled' ? 'off' : ''
 			}`}
 			onClick={onSelect}
+			onContextMenu={onContextMenu}
+			onKeyDown={onKeyDown}
+			onDoubleClick={onDoubleClick}
 		>
 			{kindIcon(item.kind)}
 			<span className="nm">{item.display_name || item.name}</span>

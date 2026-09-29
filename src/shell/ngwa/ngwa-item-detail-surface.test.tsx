@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { NgwaItemDetailSurface } from './ngwa-item-detail-surface';
 import type { NgwaItem } from '@ikenga/contract';
 import * as tauriCmd from '@/lib/tauri-cmd';
+import type { NgwaAct, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 
 vi.mock('@/lib/tauri-cmd', () => ({
 	pkgSettingsGet: vi.fn(),
@@ -107,6 +108,33 @@ function renderWithClient(ui: React.ReactElement) {
 	return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
+function act(label: string, disabledReason?: string): NgwaAct {
+	return { label, disabledReason, run: vi.fn() };
+}
+
+function stubActions(over: Partial<NgwaItemActionSet>): NgwaItemActionSet {
+	const pick = { title: 'Move to', targets: [] };
+	return {
+		toggle: act('Disable'),
+		move: pick,
+		copy: { ...pick, title: 'Copy to' },
+		moveToProject: act('Move to project'),
+		moveToPersonal: act('Move to personal'),
+		update: act('Update', '1.0.0 is the newest published version'),
+		openFolder: act('Open folder'),
+		remove: act('Remove…'),
+		handToChi: act('Hand to Chi'),
+		openView: null,
+		openManifest: act('Open manifest.json'),
+		revealInstallPath: act('Reveal install path'),
+		resetSettings: act('Reset settings to defaults'),
+		copyIyke: act('Copy as iyke'),
+		iyke: 'iyke ngwa item test-item',
+		briefChi: null,
+		...over,
+	};
+}
+
 describe('NgwaItemDetailSurface (WP-17 / D-08)', () => {
 	it('renders package tabs correctly for app/tool/engine/sidecar', () => {
 		const item = makeItem({ id: 'pkg-studio', kind: 'app', display_name: 'Ikenga Studio' });
@@ -185,48 +213,85 @@ describe('NgwaItemDetailSurface (WP-17 / D-08)', () => {
 		expect(screen.getByText('Version status')).toBeDefined();
 	});
 
-	it('triggers toggle state and hand to chi actions', () => {
+	it('D-08 header: a pkg shows Open view · Disable · ⋯ and no Uninstall / Update / Hand to Chi chips', () => {
 		const item = makeItem({
 			id: 'pkg-studio',
 			kind: 'app',
-			state: 'enabled',
+			state: 'update',
+			latest_version: '1.3.0',
+			origin: { ...makeItem({}).origin, source: 'registry' },
 		});
-		const onToggle = vi.fn();
-		const onHandToChi = vi.fn();
+		const actions = stubActions({ openView: act('Open view') });
+		renderWithClient(<NgwaItemDetailSurface item={item} actions={actions} />);
 
-		renderWithClient(
-			<NgwaItemDetailSurface
-				item={item}
-				onToggleState={onToggle}
-				onHandToChi={onHandToChi}
-			/>
+		const header = document.querySelector<HTMLElement>('[data-idacts]') as HTMLElement;
+		const labels = Array.from(header.querySelectorAll('button')).map(
+			(b) => b.getAttribute('aria-label') ?? b.textContent?.trim()
 		);
+		expect(labels).toEqual(['Open view', 'Disable', 'More']);
+		expect(screen.queryByText(/Uninstall/)).toBeNull();
+		expect(screen.queryByText(/Update to/)).toBeNull();
+		expect(screen.queryByText('Hand to Chi')).toBeNull();
 
-		fireEvent.click(screen.getByText('Disable'));
-		expect(onToggle).toHaveBeenCalledWith(item);
-
-		fireEvent.click(screen.getByText('Hand to Chi'));
-		expect(onHandToChi).toHaveBeenCalledWith(item);
+		fireEvent.click(screen.getByRole('button', { name: /Disable/ }));
+		expect(actions.toggle.run).toHaveBeenCalledTimes(1);
+		fireEvent.click(screen.getByRole('button', { name: /Open view/ }));
+		expect(actions.openView?.run).toHaveBeenCalledTimes(1);
 	});
 
-	it('triggers update action when update is available', () => {
+	it('D-08 header: a pkg with no views has no Open view; Enable when disabled', () => {
+		const item = makeItem({ id: 'pkg-x', kind: 'tool', state: 'disabled' });
+		renderWithClient(
+			<NgwaItemDetailSurface item={item} actions={stubActions({ toggle: act('Enable') })} />
+		);
+		expect(screen.queryByRole('button', { name: /Open view/ })).toBeNull();
+		expect(screen.getByRole('button', { name: /Enable/ })).toBeTruthy();
+	});
+
+	it('the ⋯ menu lists itemDotsMenu() with Reset as danger, and runs the picked action', () => {
+		const item = makeItem({ id: 'pkg-studio', kind: 'app' });
+		const actions = stubActions({});
+		renderWithClient(<NgwaItemDetailSurface item={item} actions={actions} />);
+		fireEvent.click(screen.getByRole('button', { name: 'More' }));
+		const menu = screen.getByRole('menu', { name: 'More' });
+		const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+		expect(items.map((b) => b.textContent)).toEqual([
+			'Open manifest.json',
+			'Reveal install path',
+			'Reset settings to defaults',
+			'Copy as iyke',
+		]);
+		expect(items[2].className).toContain('danger');
+		fireEvent.click(items[1]);
+		expect(actions.revealInstallPath.run).toHaveBeenCalledTimes(1);
+		expect(screen.queryByRole('menu')).toBeNull();
+	});
+
+	it('D-08 skill variant: Brief a Chi · ⋯, no Disable', () => {
+		const item = makeItem({ id: 'skill:personal:groundwork', kind: 'skill', name: 'groundwork' });
+		const actions = stubActions({ briefChi: act('Brief a Chi') });
+		renderWithClient(<NgwaItemDetailSurface item={item} actions={actions} />);
+		const header = document.querySelector<HTMLElement>('[data-idacts]') as HTMLElement;
+		const labels = Array.from(header.querySelectorAll('button')).map(
+			(b) => b.getAttribute('aria-label') ?? b.textContent?.trim()
+		);
+		expect(labels).toEqual(['Brief a Chi', 'More']);
+		fireEvent.click(screen.getByRole('button', { name: /Brief a Chi/ }));
+		expect(actions.briefChi?.run).toHaveBeenCalledTimes(1);
+	});
+
+	it('the Versions tab updates through the shared Update action', () => {
 		const item = makeItem({
 			id: 'pkg-studio',
 			kind: 'app',
 			state: 'update',
 			latest_version: '1.3.0',
 		});
-		const onUpdate = vi.fn();
-
-		renderWithClient(
-			<NgwaItemDetailSurface
-				item={item}
-				onUpdate={onUpdate}
-			/>
-		);
-
+		const actions = stubActions({ update: act('Update to 1.3.0') });
+		renderWithClient(<NgwaItemDetailSurface item={item} actions={actions} />);
+		fireEvent.click(screen.getByRole('tab', { name: 'Versions' }));
 		fireEvent.click(screen.getByText('Update to 1.3.0'));
-		expect(onUpdate).toHaveBeenCalledWith(item);
+		expect(actions.update.run).toHaveBeenCalledTimes(1);
 	});
 
 	// ── Flow tab (WP-31 review fix, Round 29) ───────────────────────────────

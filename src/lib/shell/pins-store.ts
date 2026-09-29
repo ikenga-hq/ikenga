@@ -10,6 +10,7 @@
 
 import { useMemo } from 'react';
 import { create } from 'zustand';
+import { listen } from '@/lib/transport';
 import {
 	activityPinsAdd,
 	activityPinsList,
@@ -330,4 +331,67 @@ export function useActivityBarPins() {
 		sectionLessPins,
 		hydrated,
 	};
+}
+
+/** The rail pins that point into pkg `pkgId`: route / pkg-route pins whose
+ *  target is one of its pane paths (`/pkg/<id>` or under `/pkg/<id>/…`), or
+ *  that `pin_on_install` created for it (`manifestId === pkgId`). Artifact /
+ *  file / external pins are never matched — their `manifestId` is an artifact
+ *  id, not a pkg id. */
+export function pinsOfPkg<T extends Pick<Pin, 'kind' | 'target' | 'manifestId'>>(
+	pins: readonly T[],
+	pkgId: string
+): T[] {
+	const root = `/pkg/${pkgId}`;
+	return pins.filter((p) => {
+		if (p.kind !== 'route' && p.kind !== 'pkg-route') return false;
+		if (p.manifestId === pkgId) return true;
+		return (
+			p.target === root ||
+			p.target.startsWith(`${root}/`) ||
+			p.target.startsWith(`${root}?`) ||
+			p.target.startsWith(`${root}#`)
+		);
+	});
+}
+
+/** An uninstalled pkg's views are gone, so its rail pins would open nothing:
+ *  delete them (read from disk, not the in-memory slice, so a pin added before
+ *  the rail hydrated is caught too), then re-read the store. Best-effort —
+ *  one failed removal does not stop the rest. Returns the removed pin ids. */
+export async function prunePinsForUninstalledPkg(pkgId: string): Promise<string[]> {
+	let dead: Pin[];
+	try {
+		dead = pinsOfPkg(await activityPinsList(), pkgId);
+	} catch (err) {
+		console.warn(`[pins] reading pins to prune for ${pkgId} failed:`, err);
+		return [];
+	}
+	const removed: string[] = [];
+	for (const pin of dead) {
+		try {
+			await activityPinsRemove(pin.id);
+			removed.push(pin.id);
+		} catch (err) {
+			console.warn(`[pins] removing pin ${pin.id} of uninstalled ${pkgId} failed:`, err);
+		}
+	}
+	if (removed.length > 0) await usePinsStore.getState().refresh();
+	return removed;
+}
+
+/** Subscribe to the kernel's `pkg-uninstalled` event and prune that pkg's
+ *  pins. Mount once (the rail does). Returns the unsubscribe. */
+export function subscribePinPruneOnUninstall(): () => void {
+	// Caught at once: with no event transport (tests, a browser without the
+	// bridge) `listen` rejects, and that must not surface as an unhandled
+	// rejection long before the rail unmounts.
+	const unlisten = listen<{ pkg_id: string }>('pkg-uninstalled', (ev) => {
+		const id = ev.payload?.pkg_id;
+		if (id) void prunePinsForUninstalledPkg(id);
+	}).catch((err) => {
+		console.warn('[pins] pkg-uninstalled subscription failed:', err);
+		return () => {};
+	});
+	return () => void unlisten.then((fn) => fn());
 }
