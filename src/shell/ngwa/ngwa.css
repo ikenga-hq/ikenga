@@ -327,6 +327,34 @@
 	background: var(--bg-surface);
 }
 
+/* Store install sheet: the right-hand column of the Store split (D-02,
+   frame-workbench-v4.html `.storesheet` / `.sheetbody`). Without a fixed
+   width the aside grew to its content and squeezed .listcol to nothing. */
+.view-ngwa .storesheet {
+	width: 44%;
+	min-width: 320px;
+	flex: none;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	border-left: 1px solid var(--border);
+	background: var(--bg-surface);
+}
+
+.view-ngwa .sheetbody {
+	flex: 1;
+	min-height: 0;
+	padding: var(--space-3);
+}
+
+.view-ngwa .sheetbody .drow {
+	min-height: 24px;
+}
+
+.view-ngwa .sheetbody .subhead {
+	margin: var(--space-3) 0 var(--space-1);
+}
+
 .view-ngwa .lhead {
 	height: 24px;
 	flex: none;
@@ -1185,6 +1213,17 @@
 	border-radius: var(--radius-md);
 	box-shadow: var(--shadow-2);
 	text-align: left;
+}
+
+/* The Store's install-scope popover reuses .cellpop, anchored to the
+   right edge of its Install chip instead of centred under a cell. */
+.view-ngwa .cellpop.storepop {
+	left: auto;
+	right: 0;
+	transform: none;
+	z-index: 90;
+	margin-top: 4px;
+	white-space: nowrap;
 }
 
 .view-ngwa .cellpop .mgroup {

@@ -6,7 +6,7 @@
 // - Install ▾ split dropdown for personal vs project scope
 // - Token-based styling
 
-import { useState, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
 	Download,
 	Search,
@@ -61,6 +61,29 @@ export function NgwaStoreSurface({
 	const [trustFilter, setTrustFilter] = useState('*');
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [openInstallMenuId, setOpenInstallMenuId] = useState<string | null>(null);
+	const installMenuRef = useRef<HTMLDivElement | null>(null);
+
+	// Dismiss the install-scope popover on Escape or a click outside it,
+	// matching the Scopes surface's cell popover.
+	useEffect(() => {
+		if (openInstallMenuId === null) return;
+		function onKey(e: KeyboardEvent) {
+			if (e.key === 'Escape') {
+				e.preventDefault();
+				setOpenInstallMenuId(null);
+			}
+		}
+		function onDown(e: MouseEvent) {
+			if (installMenuRef.current?.contains(e.target as Node)) return;
+			setOpenInstallMenuId(null);
+		}
+		document.addEventListener('keydown', onKey);
+		document.addEventListener('mousedown', onDown);
+		return () => {
+			document.removeEventListener('keydown', onKey);
+			document.removeEventListener('mousedown', onDown);
+		};
+	}, [openInstallMenuId]);
 	const [trustReviewItem, setTrustReviewItem] = useState<NgwaItem | null>(null);
 
 	// Updates available
@@ -265,10 +288,15 @@ export function NgwaStoreSurface({
 													<Check className="h-3 w-3" /> Installed
 												</span>
 											) : (
-												<div className="relative inline-flex">
+												<div
+													className="relative inline-flex"
+													ref={openInstallMenuId === entry.id ? installMenuRef : undefined}
+												>
 													<button
 														type="button"
 														aria-label="Choose install scope"
+														aria-haspopup="menu"
+														aria-expanded={openInstallMenuId === entry.id}
 														className="chip on flex items-center gap-1"
 														onClick={() =>
 															setOpenInstallMenuId(
@@ -281,18 +309,14 @@ export function NgwaStoreSurface({
 													</button>
 													{openInstallMenuId === entry.id && (
 														<div
-															className="menu"
-															style={{
-																position: 'absolute',
-																right: 0,
-																top: '100%',
-																marginTop: '4px',
-																zIndex: 90,
-															}}
+															className="cellpop storepop"
+															role="menu"
+															aria-label="Install scope"
 														>
 															<div className="mgroup">Install Scope</div>
 															<button
 																type="button"
+																role="menuitem"
 																className="mitem"
 																onClick={() => {
 																	setOpenInstallMenuId(null);
@@ -303,6 +327,7 @@ export function NgwaStoreSurface({
 															</button>
 															<button
 																type="button"
+																role="menuitem"
 																className="mitem"
 																onClick={() => {
 																	setOpenInstallMenuId(null);
