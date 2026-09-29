@@ -383,9 +383,15 @@ export async function prunePinsForUninstalledPkg(pkgId: string): Promise<string[
 /** Subscribe to the kernel's `pkg-uninstalled` event and prune that pkg's
  *  pins. Mount once (the rail does). Returns the unsubscribe. */
 export function subscribePinPruneOnUninstall(): () => void {
+	// Caught at once: with no event transport (tests, a browser without the
+	// bridge) `listen` rejects, and that must not surface as an unhandled
+	// rejection long before the rail unmounts.
 	const unlisten = listen<{ pkg_id: string }>('pkg-uninstalled', (ev) => {
 		const id = ev.payload?.pkg_id;
 		if (id) void prunePinsForUninstalledPkg(id);
+	}).catch((err) => {
+		console.warn('[pins] pkg-uninstalled subscription failed:', err);
+		return () => {};
 	});
-	return () => void unlisten.then((fn) => fn()).catch(() => {});
+	return () => void unlisten.then((fn) => fn());
 }
