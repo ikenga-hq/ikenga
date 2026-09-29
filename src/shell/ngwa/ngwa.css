@@ -699,7 +699,7 @@
 }
 
 .view-ngwa .srow.sel {
-	background: var(--primary-soft);
+	background: var(--tint-bg-active);
 	box-shadow: inset 2px 0 0 var(--primary);
 }
 
@@ -1672,3 +1672,378 @@
 }
 
 
+
+/* ── Store install sheet (D-02, frame-workbench-v4.html `.sheetfoot`,
+   `.kola`, `.consent*`, and the atoms the sheet shares with the pane body).
+   Scoped to the Store's rows, strip and sheet so the Installed detail's
+   app-kit `.btn` stays untouched. */
+.view-ngwa .srow .btn,
+.view-ngwa .updates .btn,
+.view-ngwa .storesheet .btn {
+	height: var(--btn-h-sm);
+	padding: 0 var(--space-3);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-micro);
+	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	border: 1px solid var(--border);
+	background: var(--bg-surface);
+	color: var(--fg-muted);
+	white-space: nowrap;
+	cursor: pointer;
+	transition:
+		background var(--motion-fast) var(--ease-calm),
+		border-color var(--motion-fast) var(--ease-calm),
+		color var(--motion-fast) var(--ease-calm);
+}
+
+.view-ngwa .srow .btn:hover:not(:disabled),
+.view-ngwa .updates .btn:hover:not(:disabled),
+.view-ngwa .storesheet .btn:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+	border-color: var(--border-strong);
+}
+
+.view-ngwa .srow .btn:active:not(:disabled),
+.view-ngwa .storesheet .btn:active:not(:disabled) {
+	transform: translateY(1px);
+}
+
+.view-ngwa .srow .btn.primary,
+.view-ngwa .storesheet .btn.primary {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--primary-fg);
+}
+
+.view-ngwa .srow .btn.primary:hover:not(:disabled),
+.view-ngwa .storesheet .btn.primary:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	border-color: color-mix(in srgb, var(--primary) 82%, var(--fg));
+	color: var(--primary-fg);
+}
+
+.view-ngwa .storesheet .btn.ghost {
+	background: transparent;
+}
+
+.view-ngwa .storesheet .btn.lg {
+	height: var(--btn-h);
+	padding: 0 var(--space-4);
+	font-size: var(--text-caption);
+}
+
+.view-ngwa .storesheet .btn.lg.caret {
+	padding: 0 var(--space-2);
+}
+
+.view-ngwa .storesheet .btn[disabled] {
+	opacity: 0.45;
+	cursor: not-allowed;
+	background: transparent;
+	border-color: var(--border-soft);
+	color: var(--fg-faint);
+}
+
+/* loading — an ember pulse inside the control, never a spinner */
+.view-ngwa .storesheet .btn[aria-busy='true'] {
+	color: var(--fg-muted);
+	position: relative;
+	cursor: progress;
+}
+
+.view-ngwa .storesheet .btn[aria-busy='true']::after {
+	content: '';
+	position: absolute;
+	inset: 0;
+	border-radius: inherit;
+	background: var(--ember);
+	opacity: 0.12;
+	animation: ngwa-emberpulse 1.4s var(--ease-calm) infinite;
+	pointer-events: none;
+}
+
+@keyframes ngwa-emberpulse {
+	0%,
+	100% {
+		opacity: 0.05;
+	}
+	50% {
+		opacity: 0.22;
+	}
+}
+
+.view-ngwa .storesheet .emberbar {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .storesheet .emberbar i {
+	width: 7px;
+	height: 7px;
+	border-radius: var(--radius-pill);
+	background: var(--ember);
+	animation: ngwa-emberpulse 1.4s var(--ease-calm) infinite;
+	flex: none;
+	opacity: 0.9;
+}
+
+.view-ngwa .storesheet .iconbtn {
+	width: 26px;
+	height: 26px;
+	display: grid;
+	place-items: center;
+	border-radius: var(--radius-sm);
+	color: var(--fg-muted);
+	border: 1px solid transparent;
+	background: transparent;
+	cursor: pointer;
+}
+
+.view-ngwa .storesheet .iconbtn:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-ngwa .storesheet .dtitle .ico {
+	display: inline-flex;
+	color: var(--fg-muted);
+}
+
+.view-ngwa .storesheet .mono {
+	font-family: var(--font-mono);
+}
+
+.view-ngwa .storesheet .note {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	line-height: var(--lead-body-sm);
+}
+
+.view-ngwa .storesheet .note.bad {
+	color: var(--danger);
+}
+
+.view-ngwa .storesheet .subhead {
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+	margin: var(--space-4) 0 var(--space-1);
+}
+
+.view-ngwa .storesheet .subhead.first {
+	margin-top: 0;
+}
+
+.view-ngwa .storesheet .drow .val.mono {
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .storesheet .yes {
+	color: var(--on-live, var(--live));
+}
+
+.view-ngwa .storesheet .no {
+	color: var(--fg-muted);
+}
+
+.view-ngwa .storesheet .warn {
+	color: var(--on-achievement, var(--achievement));
+}
+
+.view-ngwa .sheetbody .consent {
+	padding: 3px 0;
+}
+
+.view-ngwa .sheetfoot {
+	flex: none;
+	padding: var(--space-3);
+	border-top: 1px solid var(--border);
+	display: flex;
+	gap: var(--space-2);
+	align-items: center;
+	background: var(--bg-raised);
+	flex-wrap: wrap;
+}
+
+.view-ngwa .sheetfoot .installsplit {
+	position: relative;
+	display: inline-flex;
+	gap: var(--space-1);
+}
+
+/* In the sheet foot the scope menu opens upward, over the sheet body. */
+.view-ngwa .cellpop.storepop.up {
+	top: auto;
+	bottom: 100%;
+	margin-top: 0;
+	margin-bottom: 4px;
+}
+
+.view-ngwa .kola {
+	font-family: var(--font-display);
+	font-size: var(--text-h4);
+	font-weight: 600;
+	color: var(--on-achievement, var(--achievement));
+	letter-spacing: -0.01em;
+}
+
+.view-ngwa .consent {
+	display: flex;
+	align-items: flex-start;
+	gap: var(--space-2);
+	padding: var(--space-1) 0;
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-caption);
+}
+
+.view-ngwa .consent:last-of-type {
+	border-bottom: 0;
+}
+
+.view-ngwa .consent .b {
+	color: var(--fg);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+}
+
+.view-ngwa .consent .d {
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+	line-height: 1.45;
+}
+
+.view-ngwa .consent label {
+	display: flex;
+	gap: var(--space-2);
+	align-items: flex-start;
+	cursor: pointer;
+}
+
+.view-ngwa .consent input[type='checkbox'] {
+	appearance: none;
+	width: 14px;
+	height: 14px;
+	flex: none;
+	margin-top: 2px;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-xs);
+	background: var(--bg-sunken);
+	display: grid;
+	place-items: center;
+	cursor: pointer;
+}
+
+.view-ngwa .consent input[type='checkbox']:hover {
+	border-color: var(--achievement);
+}
+
+.view-ngwa .consent input[type='checkbox']:checked {
+	background: var(--achievement);
+	border-color: var(--achievement);
+}
+
+.view-ngwa .consent input[type='checkbox']:checked::after {
+	content: '';
+	width: 8px;
+	height: 5px;
+	border-left: 2px solid var(--bg-sunken);
+	border-bottom: 2px solid var(--bg-sunken);
+	transform: rotate(-45deg) translate(1px, -1px);
+}
+
+.view-ngwa .consentnote {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: var(--space-2);
+}
+
+.view-ngwa .updates .btn[disabled] {
+	opacity: 0.6;
+	cursor: progress;
+}
+
+.view-ngwa .updates .upderr {
+	align-self: center;
+	color: var(--danger);
+	font-size: var(--text-micro);
+	max-width: 48ch;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.view-ngwa .srow .btn[disabled] {
+	opacity: 0.6;
+	cursor: not-allowed;
+}
+
+/* Updates review dialog — portalled outside .view-ngwa. */
+[data-updates-review] .drow {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 28px;
+	padding: var(--space-1) 0;
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-caption);
+}
+
+[data-updates-review] .drow .k2 {
+	flex: 1;
+	min-width: 0;
+	color: var(--fg);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+}
+
+[data-updates-review] .drow .val {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+[data-updates-review] .note {
+	margin-top: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+[data-updates-review] .chip.on {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--primary-fg);
+}
+
+/* Narrow panes: the Store split stacks instead of squeezing (design
+   `.leaf.mid` < 820px, `.leaf.tight` < 330px — here as container queries
+   on the pane leaf's real width). */
+@container pane-leaf (max-width: 819px) {
+	.view-ngwa .storesplit {
+		flex-direction: column;
+	}
+	.view-ngwa .storesplit > .listcol {
+		min-height: 0;
+	}
+	.view-ngwa .storesplit > .storesheet {
+		width: auto;
+		min-width: 0;
+		flex: 0 0 52%;
+		border-left: 0;
+		border-top: 1px solid var(--border);
+	}
+}
+
+@container pane-leaf (max-width: 329px) {
+	.view-ngwa .storesplit > .storesheet {
+		display: none;
+	}
+}

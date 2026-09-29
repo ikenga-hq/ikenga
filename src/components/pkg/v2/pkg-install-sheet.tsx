@@ -15,7 +15,8 @@ import { useCallback, useRef, useState, type KeyboardEvent } from 'react';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
 import { cn } from '@/components/ui/utils';
-import { pkgInstallFromPath, pkgInstallFromRegistry } from '@/lib/tauri-cmd';
+import { pkgInstallFromPath } from '@/lib/tauri-cmd';
+import { runInstallPlan } from '@/lib/registry/install-plan';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import type { PkgRowV2 } from '@/lib/pkgs/use-derived';
 import {
@@ -298,25 +299,14 @@ export function PkgInstallSheet({
 				// ordering — deterministic and immune to index/detail drift.
 				version: isUpdate ? (pkg?.latest ?? undefined) : undefined,
 			});
-			let done = 0;
-			setInstallProgress({ done: 0, total: plan.length, current: plan[0]?.name ?? '' });
-			for (const step of plan) {
-				setInstallProgress({ done, total: plan.length, current: step.name });
-				await pkgInstallFromRegistry({
-					tarball: step.tarball,
-					integrity: step.integrity,
-					pkgId: step.pkgId,
-					sourceUrl: step.tarball,
-					// Publisher key from the signed index entry. The registry
-					// schema doesn't carry per-pkg publisher keys yet (WP-06),
-					// so this reads as undefined today -> installs as untrusted
-					// (no elevated host caps) until keys land. Sourced
-					// defensively so no call-site change is needed then.
-					publisherKey: (step as { publisherKey?: string | null }).publisherKey ?? undefined,
-				});
-				done += 1;
-			}
-			setInstallProgress({ done, total: plan.length, current: pkg?.name ?? '' });
+			const done = await runInstallPlan(plan, {
+				onProgress: (p) =>
+					setInstallProgress({
+						done: p.done,
+						total: p.total,
+						current: p.current || (pkg?.name ?? ''),
+					}),
+			});
 			return done;
 		},
 		onSuccess: async () => {

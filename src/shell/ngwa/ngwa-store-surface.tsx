@@ -1,25 +1,57 @@
 // Ngwa Store Surface (WP-15 / locked D-02).
 //
 // Registry catalog browsing, package installation, and updates:
-// - Updates available banner with "Update all (N)"
-// - Kind & Trust facet chips
-// - Install ▾ split dropdown for personal vs project scope
-// - Token-based styling
+// - Updates strip: "Update all (N)" opens a review of each pending update
+// - Kind & Trust facet chips over the whole (locally filtered) index
+// - Rows carry the closure + asks chips, read from the pkg's detail file
+// - Install sheet: overview, the `requires` closure, per-permission consent
+//   ("Share kola"), trust, settings, and a sticky foot whose Install button
+//   stays disabled until every consent is ticked
+//
+// The registry index only lists name / latest / kind / description, so the
+// closure and permissions come from the per-pkg detail file, fetched lazily
+// for the selected row. Rows that haven't been read say so ("permissions not
+// read") rather than guessing.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { Check, ChevronDown, Download, Search, Shield, X } from 'lucide-react';
+import { ErrorState, LoadingState, OfflineState } from '@/components/states';
 import {
-	Download,
-	Search,
-	Shield,
-	Check,
-	ChevronDown,
-} from 'lucide-react';
-import { LoadingState, OfflineState } from '@/components/states';
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from '@/components/ui/dialog';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
+import {
+	asksLabel,
+	closureLabel,
+	consentGroups,
+	formatBytes,
+	type StoreManifest,
+} from '@/lib/ngwa/store-detail';
+import type { StorePkgVersion } from '@/lib/registry/client';
+import { registryKeys } from '@/lib/registry/use-registry';
 import type { NgwaItem } from '@ikenga/contract';
 import { kindIcon } from './ngwa-list';
 import { NgwaTrustSheet } from './ngwa-trust-sheet';
 import './ngwa.css';
+
+import type { StoreInstallScope } from '@/lib/ngwa/use-store-install';
+
+export type { StoreInstallScope };
+
+/**
+ * Lazily reads one pkg's registry detail file (`pkgs/<short>.json`) and
+ * returns the entry for `entry.latestVersion` (manifest, size, integrity).
+ */
+export type StoreDetailLoader = (
+	entry: NgwaStoreEntry,
+	signal?: AbortSignal
+) => Promise<StorePkgVersion>;
 
 export interface NgwaStoreSurfaceProps {
 	catalog: NgwaStoreEntry[];
@@ -27,9 +59,32 @@ export interface NgwaStoreSurfaceProps {
 	error?: Error | null;
 	/** D-07 offline state's one next action. */
 	onRetry?: () => void;
-	onInstall?: (entry: NgwaStoreEntry, scope: 'personal' | 'project') => void;
-	onUpdate?: (entry: NgwaStoreEntry) => void;
-	onUpdateAll?: (entries: NgwaStoreEntry[]) => void;
+	/**
+	 * Detail-file loader for the selected row. Absent (e.g. the index hasn't
+	 * loaded) → the sheet can't read the closure or permissions, so Install
+	 * stays disabled.
+	 */
+	loadDetail?: StoreDetailLoader;
+	/** Display name of the active project — the default install target. */
+	activeProjectName?: string;
+	/** Install to a scope. A returned promise drives the foot's "Registering"
+	 *  state; a rejection is shown in the sheet foot. */
+	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void | Promise<unknown>;
+	/** Update one installed pkg to `latestVersion`; same promise contract. */
+	onUpdate?: (entry: NgwaStoreEntry) => void | Promise<unknown>;
+	/** Update every pending entry after the review dialog is confirmed. */
+	onUpdateAll?: (entries: NgwaStoreEntry[]) => void | Promise<unknown>;
+}
+
+type PendingAction = 'install' | 'update';
+
+function errText(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+/** True when `r` is a thenable (the handler returned a promise). */
+function isPromise(r: unknown): r is Promise<unknown> {
+	return Boolean(r) && typeof (r as Promise<unknown>).then === 'function';
 }
 
 const STORE_KINDS = [
@@ -47,11 +102,43 @@ const STORE_TRUSTS = [
 	{ id: 'unsigned', label: 'unsigned' },
 ];
 
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * The detail file for one Store entry, keyed by name + version under the
+ * registry namespace (so `useRefreshRegistry` invalidates it with the index).
+ * Kept apart from `registryKeys.detail(name)`: that cache holds details parsed
+ * by the registry-client's pinned schema, which drops `requires`/`signature`.
+ * `enabled: false` (list rows) only reads whatever the cache already holds.
+ */
+function useStoreDetail(
+	entry: NgwaStoreEntry,
+	loadDetail: StoreDetailLoader | undefined,
+	enabled: boolean
+) {
+	return useQuery({
+		queryKey: [...registryKeys.detail(entry.name), 'store', entry.latestVersion],
+		queryFn: ({ signal }) => {
+			if (!loadDetail) throw new Error('No registry detail loader');
+			return loadDetail(entry, signal);
+		},
+		enabled: enabled && Boolean(loadDetail),
+		staleTime: SIX_HOURS_MS,
+		retry: false,
+	});
+}
+
+function manifestOf(version: StorePkgVersion | undefined): StoreManifest | null {
+	return version?.manifest ?? null;
+}
+
 export function NgwaStoreSurface({
 	catalog,
 	isLoading = false,
 	error = null,
 	onRetry,
+	loadDetail,
+	activeProjectName,
 	onInstall,
 	onUpdate,
 	onUpdateAll,
@@ -60,38 +147,77 @@ export function NgwaStoreSurface({
 	const [kindFilter, setKindFilter] = useState('*');
 	const [trustFilter, setTrustFilter] = useState('*');
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const [openInstallMenuId, setOpenInstallMenuId] = useState<string | null>(null);
-	const installMenuRef = useRef<HTMLDivElement | null>(null);
-
-	// Dismiss the install-scope popover on Escape or a click outside it,
-	// matching the Scopes surface's cell popover.
-	useEffect(() => {
-		if (openInstallMenuId === null) return;
-		function onKey(e: KeyboardEvent) {
-			if (e.key === 'Escape') {
-				e.preventDefault();
-				setOpenInstallMenuId(null);
-			}
-		}
-		function onDown(e: MouseEvent) {
-			if (installMenuRef.current?.contains(e.target as Node)) return;
-			setOpenInstallMenuId(null);
-		}
-		document.addEventListener('keydown', onKey);
-		document.addEventListener('mousedown', onDown);
-		return () => {
-			document.removeEventListener('keydown', onKey);
-			document.removeEventListener('mousedown', onDown);
-		};
-	}, [openInstallMenuId]);
+	const [reviewOpen, setReviewOpen] = useState(false);
 	const [trustReviewItem, setTrustReviewItem] = useState<NgwaItem | null>(null);
+	// In-flight install/update per entry, and its last failure. Lifted here so
+	// a row's Update and the sheet foot show the same real promise.
+	const [pending, setPending] = useState<Record<string, PendingAction>>({});
+	const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
+	const [updateAllBusy, setUpdateAllBusy] = useState(false);
+	const [updateAllError, setUpdateAllError] = useState<string | null>(null);
 
-	// Updates available
-	const updateEntries = useMemo(() => {
-		return catalog.filter((c) => c.isUpdate);
-	}, [catalog]);
+	async function runAction(entry: NgwaStoreEntry, kind: PendingAction, fn: () => unknown) {
+		if (pending[entry.id]) return;
+		setActionErrors(({ [entry.id]: _drop, ...rest }) => rest);
+		let result: unknown;
+		try {
+			result = fn();
+		} catch (e) {
+			setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
+			return;
+		}
+		if (!isPromise(result)) return;
+		setPending((m) => ({ ...m, [entry.id]: kind }));
+		try {
+			await result;
+		} catch (e) {
+			setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
+		} finally {
+			setPending(({ [entry.id]: _drop, ...rest }) => rest);
+		}
+	}
 
-	// Filtered catalog
+	const install = onInstall
+		? (entry: NgwaStoreEntry, scope: StoreInstallScope) =>
+				void runAction(entry, 'install', () => onInstall(entry, scope))
+		: undefined;
+	const update = onUpdate
+		? (entry: NgwaStoreEntry) => {
+				// The foot is where progress and failures read, so open the row.
+				setSelectedId(entry.id);
+				void runAction(entry, 'update', () => onUpdate(entry));
+			}
+		: undefined;
+
+	async function updateAll(entries: NgwaStoreEntry[]) {
+		if (!onUpdateAll || updateAllBusy) return;
+		setUpdateAllError(null);
+		let result: unknown;
+		try {
+			result = onUpdateAll(entries);
+		} catch (e) {
+			setUpdateAllError(errText(e));
+			return;
+		}
+		if (!isPromise(result)) return;
+		setUpdateAllBusy(true);
+		setPending((m) => ({ ...m, ...Object.fromEntries(entries.map((e) => [e.id, 'update'])) }));
+		try {
+			await result;
+		} catch (e) {
+			setUpdateAllError(errText(e));
+		} finally {
+			setUpdateAllBusy(false);
+			setPending((m) => {
+				const next = { ...m };
+				for (const e of entries) delete next[e.id];
+				return next;
+			});
+		}
+	}
+
+	const updateEntries = useMemo(() => catalog.filter((c) => c.isUpdate), [catalog]);
+
 	const filtered = useMemo(() => {
 		return catalog.filter((c) => {
 			if (kindFilter !== '*' && c.kind !== kindFilter) return false;
@@ -105,30 +231,31 @@ export function NgwaStoreSurface({
 		});
 	}, [catalog, kindFilter, trustFilter, search]);
 
-	// Counts
 	const counts = useMemo(() => {
 		const kCounts: Record<string, number> = {};
 		for (const k of STORE_KINDS) {
 			kCounts[k.id] = catalog.filter((c) => k.id === '*' || c.kind === k.id).length;
 		}
-
 		const tCounts: Record<string, number> = {};
 		for (const t of STORE_TRUSTS) {
 			tCounts[t.id] = catalog.filter((c) => t.id === '*' || c.trustFacet === t.id).length;
 		}
-
 		return { kinds: kCounts, trusts: tCounts };
 	}, [catalog]);
 
-	const selectedEntry = useMemo(() => {
-		if (!filtered.length) return null;
-		if (!selectedId) return filtered[0];
-		return filtered.find((c) => c.id === selectedId) ?? filtered[0];
-	}, [filtered, selectedId]);
+	// D-02: nothing is selected until the user picks a row — the sheet then
+	// reads that row's closure and permissions. A selection survives the
+	// filters (the design keeps the sheet open while you narrow the list).
+	const selectedEntry = useMemo(
+		() => (selectedId ? (catalog.find((c) => c.id === selectedId) ?? null) : null),
+		[catalog, selectedId]
+	);
+
+	const projectLabel = activeProjectName || 'active project';
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
-			{/* ── Updates Available Banner ── */}
+			{/* ── Updates strip ── */}
 			{updateEntries.length > 0 && (
 				<div className="updates" data-updates>
 					<Download className="h-4 w-4 flex-none" />
@@ -143,17 +270,25 @@ export function NgwaStoreSurface({
 					{updateEntries.length > 2 && (
 						<span className="who">+{updateEntries.length - 2} more</span>
 					)}
-					<div className="rt">
-						{onUpdateAll && (
+					{onUpdateAll && (
+						<span className="rt">
+							{updateAllError && (
+								<span className="upderr" role="alert">
+									{updateAllError}
+								</span>
+							)}
 							<button
 								type="button"
-								className="chip on"
-								onClick={() => onUpdateAll(updateEntries)}
+								className="btn"
+								data-update-all
+								disabled={updateAllBusy}
+								aria-busy={updateAllBusy || undefined}
+								onClick={() => setReviewOpen(true)}
 							>
-								Update all ({updateEntries.length})
+								{updateAllBusy ? 'Updating…' : `Update all (${updateEntries.length})`}
 							</button>
-						)}
-					</div>
+						</span>
+					)}
 				</div>
 			)}
 
@@ -176,7 +311,6 @@ export function NgwaStoreSurface({
 					<span className="flabel">Kind</span>
 					{STORE_KINDS.map((k) => {
 						const on = kindFilter === k.id;
-						const cnt = counts.kinds[k.id] ?? 0;
 						return (
 							<button
 								key={k.id}
@@ -186,7 +320,7 @@ export function NgwaStoreSurface({
 								aria-pressed={on}
 								onClick={() => setKindFilter(k.id)}
 							>
-								{k.label} <span className="n">{cnt}</span>
+								{k.label} <span className="n">{counts.kinds[k.id] ?? 0}</span>
 							</button>
 						);
 					})}
@@ -197,10 +331,6 @@ export function NgwaStoreSurface({
 						Trust
 					</span>
 					{STORE_TRUSTS.map((t) => {
-						const cnt =
-							t.id === '*'
-								? catalog.length
-								: catalog.filter((c) => c.trustFacet === t.id).length;
 						const on = trustFilter === t.id;
 						return (
 							<button
@@ -211,19 +341,22 @@ export function NgwaStoreSurface({
 								aria-pressed={on}
 								onClick={() => setTrustFilter(t.id)}
 							>
-								{t.label} <span className="n">{cnt}</span>
+								{t.label} <span className="n">{counts.trusts[t.id] ?? 0}</span>
 							</button>
 						);
 					})}
 
-					<span className="meta" style={{ marginLeft: 'auto' }}>
+					<span className="meta" style={{ marginLeft: 'auto' }} data-store-count>
 						registry index signed
+						{!isLoading && !error && catalog.length > 0
+							? ` · ${filtered.length} of ${catalog.length} shown`
+							: ''}
 					</span>
 				</div>
 			</div>
 
 			{/* ── Split List & Install Sheet ── */}
-			<div className="split">
+			<div className="split storesplit">
 				<div className="listcol">
 					<div className="sc flex-1 min-h-0" data-slist>
 						{isLoading && (
@@ -241,177 +374,63 @@ export function NgwaStoreSurface({
 						)}
 
 						{!isLoading && !error && filtered.length === 0 && (
-							<div className="empty">No registry equipment matches these filters.</div>
+							<div className="empty">
+								Nothing in the registry matches. The index is fetched whole and filtered locally, so
+								this is the real answer, not a slow query.
+							</div>
 						)}
 
 						{!isLoading &&
-							filtered.map((entry) => {
-								const isSelected = selectedEntry?.id === entry.id;
-								return (
-									<div
-										key={entry.id}
-										className={`srow ${isSelected ? 'sel' : ''}`}
-										onClick={() => setSelectedId(entry.id)}
-										role="button"
-										tabIndex={0}
-										onKeyDown={(e) => {
-											if (e.key === 'Enter' || e.key === ' ') {
-												setSelectedId(entry.id);
-											}
-										}}
-									>
-										<div className="mark">{kindIcon(entry.kind)}</div>
-										<div className="mid">
-											<div className="l1">
-												<span className="pkg">{entry.displayName}</span>
-												<span className="tagp mono">v{entry.latestVersion}</span>
-												<span className={`kind k-${entry.kind}`}>{entry.kind}</span>
-												<span className={`badge t-${entry.trustFacet}`}>
-													<Shield className="h-3 w-3" />
-													{entry.trustFacet}
-												</span>
-											</div>
-											<div className="l2">{entry.description ?? 'No description.'}</div>
-										</div>
-
-										<div className="rt" onClick={(e) => e.stopPropagation()}>
-											{entry.isUpdate ? (
-												<button
-													type="button"
-													className="chip on"
-													onClick={() => onUpdate?.(entry)}
-												>
-													<Download className="h-3 w-3" /> Update to {entry.latestVersion}
-												</button>
-											) : entry.installedItem ? (
-												<span className="badge t-builtin">
-													<Check className="h-3 w-3" /> Installed
-												</span>
-											) : (
-												<div
-													className="relative inline-flex"
-													ref={openInstallMenuId === entry.id ? installMenuRef : undefined}
-												>
-													<button
-														type="button"
-														aria-label="Choose install scope"
-														aria-haspopup="menu"
-														aria-expanded={openInstallMenuId === entry.id}
-														className="chip on flex items-center gap-1"
-														onClick={() =>
-															setOpenInstallMenuId(
-																openInstallMenuId === entry.id ? null : entry.id
-															)
-														}
-													>
-														<Download className="h-3 w-3" /> Install
-														<ChevronDown className="h-3 w-3 ml-0.5" />
-													</button>
-													{openInstallMenuId === entry.id && (
-														<div
-															className="cellpop storepop"
-															role="menu"
-															aria-label="Install scope"
-														>
-															<div className="mgroup">Install Scope</div>
-															<button
-																type="button"
-																role="menuitem"
-																className="mitem"
-																onClick={() => {
-																	setOpenInstallMenuId(null);
-																	onInstall?.(entry, 'personal');
-																}}
-															>
-																Personal scope (~/.claude)
-															</button>
-															<button
-																type="button"
-																role="menuitem"
-																className="mitem"
-																onClick={() => {
-																	setOpenInstallMenuId(null);
-																	onInstall?.(entry, 'project');
-																}}
-															>
-																Active project (.claude)
-															</button>
-														</div>
-													)}
-												</div>
-											)}
-										</div>
-									</div>
-								);
-							})}
+							!error &&
+							filtered.map((entry) => (
+								<StoreRow
+									key={entry.id}
+									entry={entry}
+									selected={selectedEntry?.id === entry.id}
+									loadDetail={loadDetail}
+									onSelect={() => setSelectedId(entry.id)}
+									onUpdate={update}
+									busy={Boolean(pending[entry.id])}
+								/>
+							))}
 					</div>
 				</div>
 
-				{/* ── Install / Detail Sheet ── */}
-				<aside className="storesheet" role="region" aria-label="Install sheet">
+				{/* ── Install sheet ── */}
+				<aside className="storesheet" data-storesheet role="region" aria-label="Install sheet">
 					{selectedEntry ? (
-						<div className="sheetbody sc">
-							<div className="dtitle">
-								<h2>{selectedEntry.displayName}</h2>
-								<span className="v">v{selectedEntry.latestVersion}</span>
-								<span className={`badge t-${selectedEntry.trustFacet}`}>
-									<Shield className="h-3 w-3" />
-									{selectedEntry.trustFacet}
-								</span>
-							</div>
-
-							<p className="note" style={{ marginTop: 'var(--space-2)' }}>
-								{selectedEntry.description ?? 'No package description.'}
-							</p>
-
-							<div className="drow" style={{ marginTop: 'var(--space-3)' }}>
-								<span className="k2">Package ID</span>
-								<span className="val mono text-xs">{selectedEntry.id}</span>
-							</div>
-
-							<div className="drow">
-								<span className="k2">Kind</span>
-								<span className="val">{selectedEntry.kind}</span>
-							</div>
-
-							<div className="drow">
-								<span className="k2">Status</span>
-								<span className="val">
-									{selectedEntry.isUpdate
-										? `Update available (${selectedEntry.version} → ${selectedEntry.latestVersion})`
-										: selectedEntry.installedItem
-										? `Installed (${selectedEntry.version})`
-										: 'Not installed'}
-								</span>
-							</div>
-
-							<div className="subhead">Provenance</div>
-							<div className="drow">
-								<span className="k2">Source</span>
-								<span className="val">Ikenga Registry (npm / tarball)</span>
-							</div>
-							<div className="drow">
-								<span className="k2">Integrity</span>
-								<span className="val mono text-xs">
-									{'integrity' in selectedEntry.registryEntry ? String((selectedEntry.registryEntry as Record<string, unknown>).integrity) : 'minisign-verified index'}
-								</span>
-							</div>
-
-							{selectedEntry.installedItem && (
-								<button
-									type="button"
-									className="btn ghost text-xs mt-3 w-full"
-									onClick={() => setTrustReviewItem(selectedEntry.installedItem)}
-								>
-									<Shield className="h-3.5 w-3.5 mr-1" /> Review permissions & trust
-								</button>
-							)}
-						</div>
+						<StoreSheet
+							key={`${selectedEntry.id}@${selectedEntry.latestVersion}`}
+							entry={selectedEntry}
+							loadDetail={loadDetail}
+							projectLabel={projectLabel}
+							onClose={() => setSelectedId(null)}
+							onInstall={install}
+							onUpdate={update}
+							pendingAction={pending[selectedEntry.id] ?? null}
+							actionError={actionErrors[selectedEntry.id] ?? null}
+							onReviewTrust={setTrustReviewItem}
+						/>
 					) : (
-						<div className="empty">Select an item to view details.</div>
+						<div className="sheetbody sc">
+							<div className="empty" data-sheet-empty>
+								Pick a row to read its closure, its permissions and its settings before you consent
+								to anything.
+							</div>
+						</div>
 					)}
 				</aside>
 			</div>
+
+			<UpdatesReviewDialog
+				open={reviewOpen}
+				entries={updateEntries}
+				onCancel={() => setReviewOpen(false)}
+				onConfirm={() => {
+					setReviewOpen(false);
+					void updateAll(updateEntries);
+				}}
+			/>
 
 			<NgwaTrustSheet
 				open={Boolean(trustReviewItem)}
@@ -420,5 +439,514 @@ export function NgwaStoreSurface({
 				mode="review"
 			/>
 		</div>
+	);
+}
+
+// ─── Row ─────────────────────────────────────────────────────────────────────
+
+function StoreRow({
+	entry,
+	selected,
+	loadDetail,
+	onSelect,
+	onUpdate,
+	busy,
+}: {
+	entry: NgwaStoreEntry;
+	selected: boolean;
+	loadDetail: StoreDetailLoader | undefined;
+	onSelect: () => void;
+	onUpdate?: (entry: NgwaStoreEntry) => void;
+	busy: boolean;
+}) {
+	// Cache-only: the selected row's sheet does the fetch; every other row
+	// shows what has already been read, and says so when nothing has.
+	const { data: detail } = useStoreDetail(entry, loadDetail, false);
+	const manifest = manifestOf(detail);
+	const publisher = manifest?.author?.name ?? null;
+
+	return (
+		<div
+			className={`srow ${selected ? 'sel' : ''}`}
+			data-id={entry.id}
+			onClick={onSelect}
+			role="button"
+			tabIndex={0}
+			aria-pressed={selected}
+			aria-busy={busy || undefined}
+			onKeyDown={(e) => {
+				if (e.target !== e.currentTarget) return;
+				if (e.key === 'Enter' || e.key === ' ') {
+					e.preventDefault();
+					onSelect();
+				}
+			}}
+		>
+			<div className="mark">{kindIcon(entry.kind)}</div>
+			<div className="mid">
+				<div className="l1">
+					<span className="pkg">{entry.name}</span>
+					<span className={`kind k-${entry.kind}`}>{entry.kind}</span>
+					<span className="meta mono">{entry.latestVersion}</span>
+					{publisher && <span className="meta">{publisher}</span>}
+					<span className={`badge t-${entry.trustFacet}`}>
+						<Shield className="h-3 w-3" />
+						{entry.trustFacet}
+					</span>
+				</div>
+				<div className="l2">{entry.description ?? 'No description.'}</div>
+				<div className="l3" data-l3>
+					<span className="tagp" data-closure>
+						{closureLabel(entry.kind, manifest)}
+					</span>
+					<span className="tagp mono" data-asks>
+						{asksLabel(entry.kind, manifest)}
+					</span>
+				</div>
+			</div>
+
+			<div className="rt">
+				{entry.isUpdate ? (
+					<button
+						type="button"
+						className="btn"
+						disabled={!onUpdate || busy}
+						title={onUpdate ? undefined : 'Update is not available here'}
+						onClick={(e) => {
+							e.stopPropagation();
+							onUpdate?.(entry);
+						}}
+					>
+						{busy ? 'Updating…' : 'Update'}
+					</button>
+				) : entry.installedItem ? (
+					<span className="badge t-builtin">
+						<Check className="h-3 w-3" /> installed
+					</span>
+				) : (
+					// D-02: Install opens the sheet — consent happens there, never
+					// straight from the list.
+					<button
+						type="button"
+						className="btn primary"
+						onClick={(e) => {
+							e.stopPropagation();
+							onSelect();
+						}}
+					>
+						Install
+					</button>
+				)}
+			</div>
+		</div>
+	);
+}
+
+// ─── Sheet ───────────────────────────────────────────────────────────────────
+
+function StoreSheet({
+	entry,
+	loadDetail,
+	projectLabel,
+	onClose,
+	onInstall,
+	onUpdate,
+	pendingAction,
+	actionError,
+	onReviewTrust,
+}: {
+	entry: NgwaStoreEntry;
+	loadDetail: StoreDetailLoader | undefined;
+	projectLabel: string;
+	onClose: () => void;
+	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void;
+	onUpdate?: (entry: NgwaStoreEntry) => void;
+	/** The install/update in flight for this entry (the real promise). */
+	pendingAction: PendingAction | null;
+	/** The last install/update failure for this entry. */
+	actionError: string | null;
+	onReviewTrust: (item: NgwaItem) => void;
+}) {
+	const detailQuery = useStoreDetail(entry, loadDetail, true);
+	const version = detailQuery.data ?? null;
+	const manifest = version?.manifest ?? null;
+	const consents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
+	const [ticked, setTicked] = useState<Record<string, boolean>>({});
+	const [menuOpen, setMenuOpen] = useState(false);
+	const busy = pendingAction !== null;
+	const menuRef = useRef<HTMLDivElement | null>(null);
+
+	// Dismiss the install-scope popover on Escape or a click outside it,
+	// matching the Scopes surface's cell popover.
+	useEffect(() => {
+		if (!menuOpen) return;
+		function onKey(e: KeyboardEvent) {
+			if (e.key === 'Escape') {
+				e.preventDefault();
+				setMenuOpen(false);
+			}
+		}
+		function onDown(e: MouseEvent) {
+			if (menuRef.current?.contains(e.target as Node)) return;
+			setMenuOpen(false);
+		}
+		document.addEventListener('keydown', onKey);
+		document.addEventListener('mousedown', onDown);
+		return () => {
+			document.removeEventListener('keydown', onKey);
+			document.removeEventListener('mousedown', onDown);
+		};
+	}, [menuOpen]);
+
+	const title = manifest?.name ?? entry.displayName;
+	const requires = manifest?.requires ?? [];
+	const allTicked = consents.every((c) => ticked[c.id]);
+	const size = formatBytes(version?.size);
+	const settings = manifest?.settings?.schema ?? [];
+
+	let installBlocked: string | null = null;
+	if (!onInstall) installBlocked = 'Install is not available here';
+	else if (!loadDetail) installBlocked = 'Permissions not read — the registry index has not loaded';
+	else if (detailQuery.isLoading) installBlocked = 'Reading the manifest…';
+	else if (!manifest) installBlocked = 'Permissions could not be read — retry first';
+	else if (!allTicked) installBlocked = 'Tick every consent above first';
+
+	function install(scope: StoreInstallScope) {
+		setMenuOpen(false);
+		if (!onInstall || installBlocked || busy) return;
+		onInstall(entry, scope);
+	}
+
+	const scopeLabel = (s: StoreInstallScope) => (s === 'personal' ? 'personal' : projectLabel);
+
+	return (
+		<>
+			<div className="dhead">
+				<div className="dtitle">
+					<span className="ico">{kindIcon(entry.kind)}</span>
+					<h2>{title}</h2>
+					<span className={`kind k-${entry.kind}`}>{entry.kind}</span>
+					<span className="v">{entry.latestVersion}</span>
+					<span style={{ flex: 1 }} />
+					<button type="button" className="iconbtn" aria-label="Close sheet" onClick={onClose}>
+						<X className="h-3.5 w-3.5" />
+					</button>
+				</div>
+				<div className="dsub">
+					{manifest?.author?.name && (
+						<span>
+							publisher <b>{manifest.author.name}</b>
+						</span>
+					)}
+					<span className="mono">{manifest?.id ?? entry.name}</span>
+					{manifest && (
+						<span>
+							ikenga_api <b>{manifest.ikenga_api}</b>
+						</span>
+					)}
+				</div>
+			</div>
+
+			<div className="sheetbody sc">
+				<div className="subhead first">Overview</div>
+				<p className="note" style={{ fontSize: 'var(--text-caption)' }}>
+					{entry.description ?? 'No package description.'}
+				</p>
+
+				{detailQuery.isLoading && (
+					<LoadingState data-state="ngwa-store-detail-loading" heading="Reading the manifest" />
+				)}
+
+				{!detailQuery.isLoading && !loadDetail && (
+					<p className="note" data-detail-missing style={{ marginTop: 'var(--space-3)' }}>
+						Closure and permissions not read — the registry index has not loaded, so this package’s
+						detail file can’t be fetched yet.
+					</p>
+				)}
+
+				{!detailQuery.isLoading &&
+					detailQuery.error &&
+					(typeof navigator !== 'undefined' && navigator.onLine === false ? (
+						<OfflineState
+							data-state="ngwa-store-detail-offline"
+							heading="Registry unreachable"
+							body="The closure and permissions live in this package’s detail file, which needs the network."
+							action={{ label: 'Retry', onClick: () => void detailQuery.refetch() }}
+						/>
+					) : (
+						<ErrorState
+							data-state="ngwa-store-detail-error"
+							heading="Couldn’t read the manifest"
+							body={(detailQuery.error as Error).message}
+							action={{ label: 'Retry', onClick: () => void detailQuery.refetch() }}
+						/>
+					))}
+
+				{manifest && (
+					<>
+						{requires.length > 0 ? (
+							<div data-requires>
+								<div className="subhead">Requires — the closure, before you consent</div>
+								{requires.map((r) => (
+									<div className="drow" key={`${r.kind}:${r.name}`}>
+										<span className="k2 mono">{r.name}</span>
+										<span className="val">{r.kind}</span>
+										<span className="rt meta">
+											{scopeLabel('project')} · {r.source ?? 'catalog'}
+											{r.ref ? ` @ ${r.ref}` : ''}
+										</span>
+									</div>
+								))}
+							</div>
+						) : (
+							<>
+								<div className="subhead">Requires</div>
+								<div className="drow">
+									<span className="k2">Closure</span>
+									<span className="val no">nothing — this installs alone</span>
+								</div>
+							</>
+						)}
+
+						<div className="subhead">Permissions</div>
+						{consents.length > 0 ? (
+							<div data-consents>
+								<p className="kola">Share kola</p>
+								<p className="note" style={{ marginBottom: 'var(--space-2)' }}>
+									{title} asks for these before it runs. Tick each one to enable Install.
+								</p>
+								{consents.map((c) => (
+									<div className="consent" key={c.id}>
+										<label>
+											<input
+												type="checkbox"
+												data-consent={c.id}
+												checked={Boolean(ticked[c.id])}
+												onChange={(e) => setTicked((t) => ({ ...t, [c.id]: e.target.checked }))}
+											/>
+											<span>
+												<span className="b">{c.label}</span> <span className="d">{c.detail}</span>
+											</span>
+										</label>
+									</div>
+								))}
+								<p className="consentnote">
+									Consent is per install, because manifests are not signed yet.
+								</p>
+							</div>
+						) : (
+							<p className="note">
+								{entry.kind === 'skill' || entry.kind === 'bundle'
+									? `A ${entry.kind} declares intent and never grants itself anything, so there is nothing to consent to. Install is enabled.`
+									: 'This manifest declares no permissions, so there is nothing to consent to. Install is enabled.'}
+							</p>
+						)}
+
+						<div className="subhead">Trust</div>
+						<div className="drow">
+							<span className="k2">Signature</span>
+							{manifest.signature ? (
+								<span className="val yes">present — ed25519, verified at install</span>
+							) : (
+								<span className="val warn">
+									absent — this manifest carries no ed25519 signature
+								</span>
+							)}
+						</div>
+						{manifest.author?.key && (
+							<div className="drow">
+								<span className="k2">Publisher key</span>
+								<span className="val mono">{manifest.author.key}</span>
+								<span className="rt meta">declared, unverified</span>
+							</div>
+						)}
+						<div className="drow">
+							<span className="k2">Registry index</span>
+							<span className="val yes">signed · fetched over TLS</span>
+						</div>
+						{version?.integrity && (
+							<div className="drow">
+								<span className="k2">Integrity</span>
+								<span className="val mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+									{version.integrity}
+								</span>
+							</div>
+						)}
+
+						<div className="subhead">Settings</div>
+						{settings.length > 0 ? (
+							settings.map((s) => {
+								const unset = s.default === undefined || s.type === 'secret';
+								return (
+									<div className="drow" key={s.key}>
+										<span className="k2">{s.key}</span>
+										<span className={`val ${unset ? 'no' : 'mono'}`}>
+											{unset ? 'unset' : String(s.default)}
+										</span>
+										<span className="rt meta">{s.type}</span>
+									</div>
+								);
+							})
+						) : (
+							<div className="drow">
+								<span className="k2">settings.schema</span>
+								<span className="val no">none declared</span>
+							</div>
+						)}
+					</>
+				)}
+
+				{entry.installedItem && (
+					<button
+						type="button"
+						className="btn ghost"
+						style={{ marginTop: 'var(--space-3)' }}
+						onClick={() => entry.installedItem && onReviewTrust(entry.installedItem)}
+					>
+						<Shield className="h-3.5 w-3.5" /> Review permissions &amp; trust
+					</button>
+				)}
+			</div>
+
+			<div className="sheetfoot" data-sheetfoot>
+				{busy && (
+					<span className="emberbar" role="status">
+						<i /> {pendingAction === 'update' ? 'Updating' : 'Registering'}
+					</span>
+				)}
+				{actionError && (
+					<span className="note bad" role="alert" data-action-error>
+						Failed: {actionError}
+					</span>
+				)}
+				{entry.isUpdate ? (
+					<button
+						type="button"
+						className="btn primary lg"
+						disabled={!onUpdate || busy}
+						aria-busy={busy || undefined}
+						title={onUpdate ? undefined : 'Update is not available here'}
+						onClick={() => onUpdate?.(entry)}
+					>
+						Update {entry.version} → {entry.latestVersion}
+					</button>
+				) : entry.installedItem ? (
+					<>
+						<span className="badge t-builtin">
+							<Check className="h-3 w-3" /> installed
+						</span>
+						<span className="note">Remove or move it from the Installed tab.</span>
+					</>
+				) : (
+					<>
+						<div className="installsplit" ref={menuRef}>
+							<button
+								type="button"
+								className="btn primary lg"
+								data-install
+								disabled={Boolean(installBlocked) || busy}
+								aria-busy={busy || undefined}
+								title={installBlocked ?? undefined}
+								onClick={() => install('project')}
+							>
+								Install to {projectLabel}
+							</button>
+							<button
+								type="button"
+								className="btn primary lg caret"
+								aria-label="Choose install scope"
+								aria-haspopup="menu"
+								aria-expanded={menuOpen}
+								title={installBlocked ?? 'Choose an install scope'}
+								disabled={Boolean(installBlocked) || busy}
+								onClick={() => setMenuOpen((o) => !o)}
+							>
+								<ChevronDown className="h-3.5 w-3.5" />
+							</button>
+							{menuOpen && (
+								<div className="cellpop storepop up" role="menu" aria-label="Install scope">
+									<div className="mgroup">Install scope</div>
+									<button
+										type="button"
+										role="menuitem"
+										className="mitem"
+										onClick={() => install('project')}
+									>
+										Install to {projectLabel} <span className="msub">default here</span>
+									</button>
+									<button
+										type="button"
+										role="menuitem"
+										className="mitem"
+										onClick={() => install('personal')}
+									>
+										Install to personal <span className="msub">workspace · always loaded</span>
+									</button>
+								</div>
+							)}
+						</div>
+					</>
+				)}
+				{size && (
+					<span className="note" style={{ marginLeft: 'auto' }}>
+						{size}
+					</span>
+				)}
+			</div>
+		</>
+	);
+}
+
+// ─── Updates review ──────────────────────────────────────────────────────────
+
+/** D-02 §5 #23: "Review each" folded into one button that opens this list;
+ *  nothing is applied until the user confirms here. */
+function UpdatesReviewDialog({
+	open,
+	entries,
+	onCancel,
+	onConfirm,
+}: {
+	open: boolean;
+	entries: NgwaStoreEntry[];
+	onCancel: () => void;
+	onConfirm: () => void;
+}) {
+	return (
+		<Dialog open={open} onOpenChange={(o) => !o && onCancel()}>
+			{open && (
+				<DialogContent data-ngwa-confirm data-updates-review showCloseButton={false}>
+					<DialogHeader>
+						<DialogTitle>
+							Review {entries.length} update{entries.length === 1 ? '' : 's'}
+						</DialogTitle>
+						<DialogDescription asChild>
+							<div className="ngwa-confirm-body">
+								{entries.map((e) => (
+									<div className="drow" key={e.id}>
+										<span className="k2">{e.name}</span>
+										<span className="val mono">
+											{e.version} → {e.latestVersion}
+										</span>
+									</div>
+								))}
+								<p className="note">
+									Each one is fetched, verified and re-registered. Nothing is applied until you
+									confirm.
+								</p>
+							</div>
+						</DialogDescription>
+					</DialogHeader>
+					<DialogFooter>
+						<button type="button" className="chip" onClick={onCancel}>
+							Cancel
+						</button>
+						<button type="button" className="chip on" onClick={onConfirm}>
+							Update all ({entries.length})
+						</button>
+					</DialogFooter>
+				</DialogContent>
+			)}
+		</Dialog>
 	);
 }

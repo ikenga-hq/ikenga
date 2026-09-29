@@ -17,6 +17,11 @@ import {
 	type PkgDetail,
 	type RegistryEntry,
 } from '@ikenga/registry-client';
+import {
+	PkgVersionSchema,
+	pkgDetailPath,
+	type PkgVersion as StorePkgVersion,
+} from '@ikenga/contract/registry';
 
 /** Live registry. Source: docs/plans/2026-05-13-ikenga-pkgs-migration.md Phase C. */
 export const REGISTRY_URL = 'https://registry.ikenga.dev/index.json';
@@ -43,6 +48,7 @@ export type {
 	RegistryIndex,
 	PkgVersion,
 } from '@ikenga/registry-client';
+export type { PkgVersion as StorePkgVersion } from '@ikenga/contract/registry';
 
 /** Fetch + verify the registry index. Throws on any failure (see lib docs). */
 export async function fetchIndex(signal?: AbortSignal): Promise<FetchedIndex> {
@@ -73,4 +79,34 @@ export async function resolveInstallPlan(
 	version?: string
 ): Promise<InstallStep[]> {
 	return resolveInstallPlanLib({ root, version, fetchDetail: getDetail });
+}
+
+/**
+ * Detail fetch for the Ngwa Store install sheet: the one version the sheet
+ * shows, parsed with the shell's own (workspace) `@ikenga/contract` schema
+ * rather than the one pinned inside `@ikenga/registry-client`. The pinned
+ * schema predates `requires[]` and `signature`, and Zod strips unknown keys,
+ * so `fetchPkgDetail` above silently drops the closure and signature the
+ * sheet has to show before the user consents. Only the wanted version is
+ * validated — older versions in the same file may use retired manifest
+ * fields (e.g. `ui.nav`) that the current schema rejects outright.
+ * Same URL resolution as the library.
+ */
+export async function fetchPkgVersionForStore(
+	indexUrl: string,
+	entry: RegistryEntry | { name: string },
+	version: string,
+	signal?: AbortSignal
+): Promise<StorePkgVersion> {
+	const relPath = 'detail' in entry && entry.detail ? entry.detail : pkgDetailPath(entry.name);
+	const url = new URL(relPath, indexUrl).toString();
+	const res = await fetch(url, { signal });
+	if (!res.ok) {
+		throw new Error(`Registry detail fetch failed: ${res.status} ${res.statusText} (${url})`);
+	}
+	const json = (await res.json()) as { versions?: Array<{ version?: unknown }> };
+	const versions = Array.isArray(json?.versions) ? json.versions : [];
+	const raw = versions.find((v) => v?.version === version) ?? versions[0];
+	if (!raw) throw new Error(`Registry detail for ${entry.name} lists no versions`);
+	return PkgVersionSchema.parse(raw);
 }
