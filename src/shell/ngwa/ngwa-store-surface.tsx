@@ -40,7 +40,9 @@ import { kindIcon } from './ngwa-list';
 import { NgwaTrustSheet } from './ngwa-trust-sheet';
 import './ngwa.css';
 
-export type StoreInstallScope = 'personal' | 'project';
+import type { StoreInstallScope } from '@/lib/ngwa/use-store-install';
+
+export type { StoreInstallScope };
 
 /**
  * Lazily reads one pkg's registry detail file (`pkgs/<short>.json`) and
@@ -65,9 +67,24 @@ export interface NgwaStoreSurfaceProps {
 	loadDetail?: StoreDetailLoader;
 	/** Display name of the active project — the default install target. */
 	activeProjectName?: string;
+	/** Install to a scope. A returned promise drives the foot's "Registering"
+	 *  state; a rejection is shown in the sheet foot. */
 	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void | Promise<unknown>;
-	onUpdate?: (entry: NgwaStoreEntry) => void;
-	onUpdateAll?: (entries: NgwaStoreEntry[]) => void;
+	/** Update one installed pkg to `latestVersion`; same promise contract. */
+	onUpdate?: (entry: NgwaStoreEntry) => void | Promise<unknown>;
+	/** Update every pending entry after the review dialog is confirmed. */
+	onUpdateAll?: (entries: NgwaStoreEntry[]) => void | Promise<unknown>;
+}
+
+type PendingAction = 'install' | 'update';
+
+function errText(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+/** True when `r` is a thenable (the handler returned a promise). */
+function isPromise(r: unknown): r is Promise<unknown> {
+	return Boolean(r) && typeof (r as Promise<unknown>).then === 'function';
 }
 
 const STORE_KINDS = [
@@ -132,6 +149,72 @@ export function NgwaStoreSurface({
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [reviewOpen, setReviewOpen] = useState(false);
 	const [trustReviewItem, setTrustReviewItem] = useState<NgwaItem | null>(null);
+	// In-flight install/update per entry, and its last failure. Lifted here so
+	// a row's Update and the sheet foot show the same real promise.
+	const [pending, setPending] = useState<Record<string, PendingAction>>({});
+	const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
+	const [updateAllBusy, setUpdateAllBusy] = useState(false);
+	const [updateAllError, setUpdateAllError] = useState<string | null>(null);
+
+	async function runAction(entry: NgwaStoreEntry, kind: PendingAction, fn: () => unknown) {
+		if (pending[entry.id]) return;
+		setActionErrors(({ [entry.id]: _drop, ...rest }) => rest);
+		let result: unknown;
+		try {
+			result = fn();
+		} catch (e) {
+			setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
+			return;
+		}
+		if (!isPromise(result)) return;
+		setPending((m) => ({ ...m, [entry.id]: kind }));
+		try {
+			await result;
+		} catch (e) {
+			setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
+		} finally {
+			setPending(({ [entry.id]: _drop, ...rest }) => rest);
+		}
+	}
+
+	const install = onInstall
+		? (entry: NgwaStoreEntry, scope: StoreInstallScope) =>
+				void runAction(entry, 'install', () => onInstall(entry, scope))
+		: undefined;
+	const update = onUpdate
+		? (entry: NgwaStoreEntry) => {
+				// The foot is where progress and failures read, so open the row.
+				setSelectedId(entry.id);
+				void runAction(entry, 'update', () => onUpdate(entry));
+			}
+		: undefined;
+
+	async function updateAll(entries: NgwaStoreEntry[]) {
+		if (!onUpdateAll || updateAllBusy) return;
+		setUpdateAllError(null);
+		let result: unknown;
+		try {
+			result = onUpdateAll(entries);
+		} catch (e) {
+			setUpdateAllError(errText(e));
+			return;
+		}
+		if (!isPromise(result)) return;
+		setUpdateAllBusy(true);
+		setPending((m) => ({ ...m, ...Object.fromEntries(entries.map((e) => [e.id, 'update'])) }));
+		try {
+			await result;
+		} catch (e) {
+			setUpdateAllError(errText(e));
+		} finally {
+			setUpdateAllBusy(false);
+			setPending((m) => {
+				const next = { ...m };
+				for (const e of entries) delete next[e.id];
+				return next;
+			});
+		}
+	}
 
 	const updateEntries = useMemo(() => catalog.filter((c) => c.isUpdate), [catalog]);
 
@@ -189,13 +272,20 @@ export function NgwaStoreSurface({
 					)}
 					{onUpdateAll && (
 						<span className="rt">
+							{updateAllError && (
+								<span className="upderr" role="alert">
+									{updateAllError}
+								</span>
+							)}
 							<button
 								type="button"
 								className="btn"
 								data-update-all
+								disabled={updateAllBusy}
+								aria-busy={updateAllBusy || undefined}
 								onClick={() => setReviewOpen(true)}
 							>
-								Update all ({updateEntries.length})
+								{updateAllBusy ? 'Updating…' : `Update all (${updateEntries.length})`}
 							</button>
 						</span>
 					)}
@@ -299,7 +389,8 @@ export function NgwaStoreSurface({
 									selected={selectedEntry?.id === entry.id}
 									loadDetail={loadDetail}
 									onSelect={() => setSelectedId(entry.id)}
-									onUpdate={onUpdate}
+									onUpdate={update}
+									busy={Boolean(pending[entry.id])}
 								/>
 							))}
 					</div>
@@ -314,8 +405,10 @@ export function NgwaStoreSurface({
 							loadDetail={loadDetail}
 							projectLabel={projectLabel}
 							onClose={() => setSelectedId(null)}
-							onInstall={onInstall}
-							onUpdate={onUpdate}
+							onInstall={install}
+							onUpdate={update}
+							pendingAction={pending[selectedEntry.id] ?? null}
+							actionError={actionErrors[selectedEntry.id] ?? null}
 							onReviewTrust={setTrustReviewItem}
 						/>
 					) : (
@@ -335,7 +428,7 @@ export function NgwaStoreSurface({
 				onCancel={() => setReviewOpen(false)}
 				onConfirm={() => {
 					setReviewOpen(false);
-					onUpdateAll?.(updateEntries);
+					void updateAll(updateEntries);
 				}}
 			/>
 
@@ -357,12 +450,14 @@ function StoreRow({
 	loadDetail,
 	onSelect,
 	onUpdate,
+	busy,
 }: {
 	entry: NgwaStoreEntry;
 	selected: boolean;
 	loadDetail: StoreDetailLoader | undefined;
 	onSelect: () => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
+	busy: boolean;
 }) {
 	// Cache-only: the selected row's sheet does the fetch; every other row
 	// shows what has already been read, and says so when nothing has.
@@ -378,6 +473,7 @@ function StoreRow({
 			role="button"
 			tabIndex={0}
 			aria-pressed={selected}
+			aria-busy={busy || undefined}
 			onKeyDown={(e) => {
 				if (e.target !== e.currentTarget) return;
 				if (e.key === 'Enter' || e.key === ' ') {
@@ -414,12 +510,14 @@ function StoreRow({
 					<button
 						type="button"
 						className="btn"
+						disabled={!onUpdate || busy}
+						title={onUpdate ? undefined : 'Update is not available here'}
 						onClick={(e) => {
 							e.stopPropagation();
 							onUpdate?.(entry);
 						}}
 					>
-						Update
+						{busy ? 'Updating…' : 'Update'}
 					</button>
 				) : entry.installedItem ? (
 					<span className="badge t-builtin">
@@ -453,14 +551,20 @@ function StoreSheet({
 	onClose,
 	onInstall,
 	onUpdate,
+	pendingAction,
+	actionError,
 	onReviewTrust,
 }: {
 	entry: NgwaStoreEntry;
 	loadDetail: StoreDetailLoader | undefined;
 	projectLabel: string;
 	onClose: () => void;
-	onInstall?: NgwaStoreSurfaceProps['onInstall'];
+	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
+	/** The install/update in flight for this entry (the real promise). */
+	pendingAction: PendingAction | null;
+	/** The last install/update failure for this entry. */
+	actionError: string | null;
 	onReviewTrust: (item: NgwaItem) => void;
 }) {
 	const detailQuery = useStoreDetail(entry, loadDetail, true);
@@ -469,8 +573,7 @@ function StoreSheet({
 	const consents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
 	const [ticked, setTicked] = useState<Record<string, boolean>>({});
 	const [menuOpen, setMenuOpen] = useState(false);
-	const [busy, setBusy] = useState(false);
-	const [installError, setInstallError] = useState<string | null>(null);
+	const busy = pendingAction !== null;
 	const menuRef = useRef<HTMLDivElement | null>(null);
 
 	// Dismiss the install-scope popover on Escape or a click outside it,
@@ -508,21 +611,10 @@ function StoreSheet({
 	else if (!manifest) installBlocked = 'Permissions could not be read — retry first';
 	else if (!allTicked) installBlocked = 'Tick every consent above first';
 
-	async function install(scope: StoreInstallScope) {
+	function install(scope: StoreInstallScope) {
 		setMenuOpen(false);
-		if (!onInstall || installBlocked) return;
-		setInstallError(null);
-		const result = onInstall(entry, scope);
-		if (result && typeof (result as Promise<unknown>).then === 'function') {
-			setBusy(true);
-			try {
-				await result;
-			} catch (e) {
-				setInstallError(e instanceof Error ? e.message : String(e));
-			} finally {
-				setBusy(false);
-			}
-		}
+		if (!onInstall || installBlocked || busy) return;
+		onInstall(entry, scope);
 	}
 
 	const scopeLabel = (s: StoreInstallScope) => (s === 'personal' ? 'personal' : projectLabel);
@@ -717,8 +809,25 @@ function StoreSheet({
 			</div>
 
 			<div className="sheetfoot" data-sheetfoot>
+				{busy && (
+					<span className="emberbar" role="status">
+						<i /> {pendingAction === 'update' ? 'Updating' : 'Registering'}
+					</span>
+				)}
+				{actionError && (
+					<span className="note bad" role="alert" data-action-error>
+						Failed: {actionError}
+					</span>
+				)}
 				{entry.isUpdate ? (
-					<button type="button" className="btn primary lg" onClick={() => onUpdate?.(entry)}>
+					<button
+						type="button"
+						className="btn primary lg"
+						disabled={!onUpdate || busy}
+						aria-busy={busy || undefined}
+						title={onUpdate ? undefined : 'Update is not available here'}
+						onClick={() => onUpdate?.(entry)}
+					>
 						Update {entry.version} → {entry.latestVersion}
 					</button>
 				) : entry.installedItem ? (
@@ -730,16 +839,6 @@ function StoreSheet({
 					</>
 				) : (
 					<>
-						{busy && (
-							<span className="emberbar" role="status">
-								<i /> Registering
-							</span>
-						)}
-						{installError && (
-							<span className="note bad" role="alert">
-								{installError}
-							</span>
-						)}
 						<div className="installsplit" ref={menuRef}>
 							<button
 								type="button"
@@ -748,7 +847,7 @@ function StoreSheet({
 								disabled={Boolean(installBlocked) || busy}
 								aria-busy={busy || undefined}
 								title={installBlocked ?? undefined}
-								onClick={() => void install('project')}
+								onClick={() => install('project')}
 							>
 								Install to {projectLabel}
 							</button>
@@ -771,7 +870,7 @@ function StoreSheet({
 										type="button"
 										role="menuitem"
 										className="mitem"
-										onClick={() => void install('project')}
+										onClick={() => install('project')}
 									>
 										Install to {projectLabel} <span className="msub">default here</span>
 									</button>
@@ -779,9 +878,9 @@ function StoreSheet({
 										type="button"
 										role="menuitem"
 										className="mitem"
-										onClick={() => void install('personal')}
+										onClick={() => install('personal')}
 									>
-										Install to personal <span className="msub">~/.claude</span>
+										Install to personal <span className="msub">workspace · always loaded</span>
 									</button>
 								</div>
 							)}

@@ -23,6 +23,7 @@ import {
 	type PkgDetail,
 	type RegistryEntry,
 } from './client';
+import { cachedDetailGetter } from './install-plan';
 
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
@@ -88,16 +89,7 @@ export function useRegistryPkgDetail(
 export function useInstallPlanResolver(indexUrl: string | undefined) {
 	const queryClient = useQueryClient();
 
-	const getDetail = async (name: string): Promise<PkgDetail> => {
-		const cached = queryClient.getQueryData<PkgDetail>(registryKeys.detail(name));
-		if (cached) return cached;
-		if (!indexUrl) {
-			throw new Error('install plan: indexUrl not available');
-		}
-		const detail = await fetchPkgDetail(indexUrl, { name });
-		queryClient.setQueryData(registryKeys.detail(name), detail);
-		return detail;
-	};
+	const getDetail = cachedDetailGetter(queryClient, indexUrl);
 
 	return useMutation({
 		mutationFn: async (args: { root: PkgDetail; version?: string }): Promise<InstallStep[]> => {

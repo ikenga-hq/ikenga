@@ -375,4 +375,70 @@ describe('NgwaStoreSurface', () => {
 		fireEvent.click(within(dialog).getByRole('button', { name: 'Update all (1)' }));
 		expect(onUpdateAll).toHaveBeenCalledWith([mockCatalog[0]]);
 	});
+
+	it('shows Registering for the real install promise and its failure in the foot', async () => {
+		let reject: (e: Error) => void = () => {};
+		const onInstall = vi.fn(
+			() =>
+				new Promise<void>((_, rej) => {
+					reject = rej;
+				})
+		);
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		const { container } = renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} loadDetail={loadDetail} onInstall={onInstall} />
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
+
+		const install = screen.getByRole('button', {
+			name: 'Install to active project',
+		}) as HTMLButtonElement;
+		fireEvent.click(install);
+		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'project');
+		expect(screen.getByRole('status').textContent).toContain('Registering');
+		expect(install.disabled).toBe(true);
+		expect(
+			container.querySelector('.srow[data-id="skill-groundwork"]')?.getAttribute('aria-busy')
+		).toBe('true');
+
+		reject(new Error('integrity mismatch'));
+		expect(await screen.findByText('Failed: integrity mismatch')).toBeDefined();
+		expect(screen.queryByText('Registering')).toBeNull();
+		expect(install.disabled).toBe(false);
+	});
+
+	it('row Update opens the sheet, shows Updating while in flight, and surfaces a failure', async () => {
+		let reject: (e: Error) => void = () => {};
+		const onUpdate = vi.fn(
+			() =>
+				new Promise<void>((_, rej) => {
+					reject = rej;
+				})
+		);
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdate={onUpdate} />);
+
+		fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+		expect(onUpdate).toHaveBeenCalledWith(mockCatalog[0]);
+		expect(screen.getByRole('status').textContent).toContain('Updating');
+		expect(
+			(screen.getByRole('button', { name: 'Update 0.8.2 → 0.8.3' }) as HTMLButtonElement).disabled
+		).toBe(true);
+
+		reject(new Error('asks for new permissions'));
+		expect(await screen.findByText('Failed: asks for new permissions')).toBeDefined();
+	});
+
+	it('Update all shows its failure on the strip', async () => {
+		const onUpdateAll = vi
+			.fn()
+			.mockRejectedValue(new Error('1 of 1 update failed — pkg-tasks: 404'));
+		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdateAll={onUpdateAll} />);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Update all (1)' }));
+		fireEvent.click(
+			within(screen.getByRole('dialog')).getByRole('button', { name: 'Update all (1)' })
+		);
+		expect(await screen.findByText('1 of 1 update failed — pkg-tasks: 404')).toBeDefined();
+	});
 });

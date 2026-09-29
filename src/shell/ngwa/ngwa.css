@@ -1966,6 +1966,26 @@
 	margin-top: var(--space-2);
 }
 
+.view-ngwa .updates .btn[disabled] {
+	opacity: 0.6;
+	cursor: progress;
+}
+
+.view-ngwa .updates .upderr {
+	align-self: center;
+	color: var(--danger);
+	font-size: var(--text-micro);
+	max-width: 48ch;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.view-ngwa .srow .btn[disabled] {
+	opacity: 0.6;
+	cursor: not-allowed;
+}
+
 /* Updates review dialog — portalled outside .view-ngwa. */
 [data-updates-review] .drow {
 	display: flex;

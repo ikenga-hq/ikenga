@@ -6,6 +6,7 @@ import { useCallback } from 'react';
 import { createFileRoute } from '@tanstack/react-router';
 import { z } from 'zod';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
+import { useStoreInstall } from '@/lib/ngwa/use-store-install';
 import { fetchPkgVersionForStore } from '@/lib/registry/client';
 import { useRegistryIndex } from '@/lib/registry/use-registry';
 import { useShellStore } from '@/lib/shell/shell-store';
@@ -35,6 +36,8 @@ function NgwaStorePage() {
 		},
 		[indexUrl]
 	);
+	// Install / update through the shared signed-registry plan path.
+	const { install, update, updateAll } = useStoreInstall();
 	const activeProjectName = useShellStore((s) => {
 		const p = s.projects.find((x) => x.id === s.activeProjectId);
 		return p?.display_name || p?.id;
@@ -50,6 +53,9 @@ function NgwaStorePage() {
 				onRetry={refetch}
 				loadDetail={indexUrl ? loadDetail : undefined}
 				activeProjectName={activeProjectName}
+				onInstall={install}
+				onUpdate={update}
+				onUpdateAll={updateAll}
 			/>
 		</div>
 	);

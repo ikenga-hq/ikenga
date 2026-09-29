@@ -9,38 +9,15 @@
 // background auto-updater mounted in the workspace.
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { fetchPkgDetail, resolveInstallPlan, type PkgDetail } from '@/lib/registry/client';
-import { registryKeys, useRegistryIndex } from '@/lib/registry/use-registry';
+import { resolveInstallPlan } from '@/lib/registry/client';
 import {
-	pkgInstallFromRegistry,
-	pkgTrustPreviewIncoming,
-	type PkgTrustReview,
-} from '@/lib/tauri-cmd';
+	cachedDetailGetter,
+	previewIncomingTrust,
+	runInstallPlan,
+} from '@/lib/registry/install-plan';
+import { registryKeys, useRegistryIndex } from '@/lib/registry/use-registry';
+import type { PkgTrustReview } from '@/lib/tauri-cmd';
 import type { PkgRowV2 } from './use-derived';
-
-/**
- * Read the incoming manifest's `capabilities` + `permissions` blocks off a
- * fetched `PkgDetail`. The registry's per-pkg detail file IS manifest-shaped
- * (same pattern `pkg-install-sheet.tsx::extractElevatedCaps` relies on) —
- * there's no separate "capabilities preview" endpoint, so this is the data
- * source for the pre-install diff below.
- */
-function incomingCapabilityFields(detail: PkgDetail): {
-	version: string;
-	capabilitiesJson?: string;
-	permissionsJson?: string;
-} {
-	const d = detail as unknown as {
-		version?: string;
-		capabilities?: unknown;
-		permissions?: unknown;
-	};
-	return {
-		version: d.version ?? '',
-		capabilitiesJson: d.capabilities !== undefined ? JSON.stringify(d.capabilities) : undefined,
-		permissionsJson: d.permissions !== undefined ? JSON.stringify(d.permissions) : undefined,
-	};
-}
 
 export interface UpdateProgress {
 	/** Index of the pkg currently being updated (0-based). */
@@ -97,17 +74,9 @@ export function useUpdatePkgs() {
 	const indexQuery = useRegistryIndex();
 	const indexUrl = indexQuery.data?.indexUrl;
 
-	// Session-cached detail fetch, shared with the resolver. Mirrors the
-	// getDetail in useInstallPlanResolver so any pkg the user already inspected
-	// won't refetch.
-	const getDetail = async (name: string): Promise<PkgDetail> => {
-		const cached = qc.getQueryData<PkgDetail>(registryKeys.detail(name));
-		if (cached) return cached;
-		if (!indexUrl) throw new Error('registry index not available');
-		const detail = await fetchPkgDetail(indexUrl, { name });
-		qc.setQueryData(registryKeys.detail(name), detail);
-		return detail;
-	};
+	// Session-cached detail fetch, shared with the resolver (so any pkg the
+	// user already inspected won't refetch).
+	const getDetail = cachedDetailGetter(qc, indexUrl);
 
 	return useMutation({
 		mutationFn: async ({
@@ -131,13 +100,11 @@ export function useUpdatePkgs() {
 					// Skip the check for a row the caller already routed
 					// through the trust review modal and got approved.
 					if (!approvedIds?.has(row.id)) {
-						const incoming = incomingCapabilityFields(root);
-						const review = await pkgTrustPreviewIncoming({
-							pkgId: row.id,
-							manifestVersion: incoming.version || row.latest || row.version,
-							capabilitiesJson: incoming.capabilitiesJson,
-							permissionsJson: incoming.permissionsJson,
-						});
+						const review = await previewIncomingTrust(
+							row.id,
+							root,
+							row.latest || row.version
+						);
 						if (review) {
 							needsApproval.push(review);
 							continue;
@@ -145,17 +112,7 @@ export function useUpdatePkgs() {
 					}
 
 					const plan = await resolveInstallPlan(root, getDetail);
-					for (const step of plan) {
-						await pkgInstallFromRegistry({
-							tarball: step.tarball,
-							integrity: step.integrity,
-							pkgId: step.pkgId,
-							sourceUrl: step.tarball,
-							// Signed-index publisher key (WP-06 will populate it;
-							// undefined today -> installs untrusted-for-elevated).
-							publisherKey: (step as { publisherKey?: string | null }).publisherKey ?? undefined,
-						});
-					}
+					await runInstallPlan(plan);
 					done += 1;
 				} catch (e) {
 					// One bad pkg must not abort the rest of the batch — record it
