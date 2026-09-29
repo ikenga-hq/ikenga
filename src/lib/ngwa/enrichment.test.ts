@@ -8,6 +8,7 @@ import {
 	formatUsageTooltip,
 	resolveTrustFacet,
 	buildStoreCatalog,
+	storeKindFor,
 } from './enrichment';
 
 function makeItem(partial: Partial<NgwaItem>): NgwaItem {
@@ -261,6 +262,44 @@ describe('enrichment.ts', () => {
 			expect(uninstalled).toBeDefined();
 			expect(uninstalled?.installedItem).toBeNull();
 			expect(uninstalled?.isUpdate).toBe(false);
+		});
+	});
+
+	describe('storeKindFor — registry manifest hint → Ngwa kind', () => {
+		const entry = (name: string, kind?: string): RegistryEntry => ({
+			name,
+			latest: '1.0.0',
+			detail: `pkgs/${name}.json`,
+			...(kind !== undefined ? { kind } : {}),
+		});
+
+		it('maps the manifest hints the index actually carries', () => {
+			expect(storeKindFor(entry('@ikenga/pkg-agent-ops', 'embedded'), null)).toBe('app');
+			expect(storeKindFor(entry('@ikenga/pkg-x', 'windowed'), null)).toBe('app');
+			expect(storeKindFor(entry('@ikenga/pkg-meetings', 'app'), null)).toBe('app');
+			expect(storeKindFor(entry('@ikenga/pkg-engine-codex', 'engine'), null)).toBe('engine');
+			expect(storeKindFor(entry('@ikenga/studio-toolchain', 'bundle'), null)).toBe('bundle');
+			expect(storeKindFor(entry('@ikenga/skill-groundwork', 'skill'), null)).toBe('skill');
+		});
+
+		it('classifies the @ikenga/mcp-* servers (hint "skill") as tools', () => {
+			expect(storeKindFor(entry('@ikenga/mcp-browser', 'skill'), null)).toBe('tool');
+			expect(storeKindFor(entry('@ikenga/mcp-iyke', 'skill'), null)).toBe('tool');
+		});
+
+		it('falls back to app for a missing or unknown hint', () => {
+			expect(storeKindFor(entry('@ikenga/pkg-y'), null)).toBe('app');
+			expect(storeKindFor(entry('@ikenga/pkg-z', 'mystery'), null)).toBe('app');
+		});
+
+		it('prefers the kernel kind of an installed pkg over the hint', () => {
+			const installed = makeItem({ id: '@ikenga/pkg-git', kind: 'tool' });
+			expect(storeKindFor(entry('@ikenga/pkg-git', 'embedded'), installed)).toBe('tool');
+		});
+
+		it('buildStoreCatalog uses the mapped kind', () => {
+			const catalog = buildStoreCatalog([], [entry('@ikenga/mcp-browser', 'skill'), entry('@ikenga/pkg-content', 'embedded')]);
+			expect(catalog.map((c) => c.kind)).toEqual(['tool', 'app']);
 		});
 	});
 });
