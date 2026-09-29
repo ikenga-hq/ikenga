@@ -1,7 +1,8 @@
 import { render, screen, fireEvent, cleanup } from '@testing-library/react';
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import { NgwaList } from './ngwa-list';
 import type { NgwaItem } from '@ikenga/contract';
+import type { NgwaAct, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 
 afterEach(() => {
 	cleanup();
@@ -153,4 +154,70 @@ describe('NgwaList component (D-02 / WP-15)', () => {
 		expect(container.querySelector('[data-id="groundwork"]')).not.toBeNull();
 		expect(container.querySelector('[data-id="brand-voice"]')).toBeNull();
 	});
+
+	it('without actions: no action row and no context menu', () => {
+		const items = [makeItem({ id: 'a', kind: 'app' })];
+		const { container } = render(<NgwaList items={items} />);
+		expect(container.querySelector('[data-dacts]')).toBeNull();
+		fireEvent.contextMenu(container.querySelector('[data-id="a"]') as HTMLElement);
+		expect(screen.queryByRole('menu')).toBeNull();
+	});
+
+	it('with actions: Space toggles, Enter opens the folder, double-click opens the item', () => {
+		const items = [makeItem({ id: 'a', kind: 'app' })];
+		const set = stubActions();
+		const onOpenItem = vi.fn();
+		const { container } = render(
+			<NgwaList items={items} actionsFor={() => set} onOpenItem={onOpenItem} />
+		);
+		const row = container.querySelector('[data-id="a"]') as HTMLElement;
+		fireEvent.keyDown(row, { key: ' ' });
+		expect(set.toggle.run).toHaveBeenCalledTimes(1);
+		fireEvent.keyDown(row, { key: 'Enter' });
+		expect(set.openFolder.run).toHaveBeenCalledTimes(1);
+		fireEvent.doubleClick(row);
+		expect(onOpenItem).toHaveBeenCalledWith(items[0]);
+	});
+
+	it('the context menu runs the picked action and closes', () => {
+		const items = [makeItem({ id: 'a', kind: 'app', display_name: 'Alpha' })];
+		const set = stubActions();
+		const { container } = render(<NgwaList items={items} actionsFor={() => set} />);
+		fireEvent.contextMenu(container.querySelector('[data-id="a"]') as HTMLElement, {
+			clientX: 40,
+			clientY: 60,
+		});
+		const menu = screen.getByRole('menu', { name: 'Alpha' });
+		expect(menu.style.left).toBe('40px');
+		const remove = screen.getByRole('menuitem', { name: 'Remove…' });
+		expect(remove.className).toContain('danger');
+		fireEvent.click(remove);
+		expect(set.remove.run).toHaveBeenCalledTimes(1);
+		expect(screen.queryByRole('menu')).toBeNull();
+	});
 });
+
+function act(label: string, disabledReason?: string): NgwaAct {
+	return { label, disabledReason, run: vi.fn() };
+}
+
+function stubActions(): NgwaItemActionSet {
+	return {
+		toggle: act('Disable'),
+		move: { title: 'Move to', targets: [] },
+		copy: { title: 'Copy to', targets: [] },
+		moveToProject: act('Move to project'),
+		moveToPersonal: act('Move to personal', 'Already personal'),
+		update: act('Update', '1.0.0 is the newest published version'),
+		openFolder: act('Open folder'),
+		remove: act('Remove…'),
+		handToChi: act('Hand to Chi'),
+		openView: null,
+		openManifest: act('Open manifest.json'),
+		revealInstallPath: act('Reveal install path'),
+		resetSettings: act('Reset settings to defaults'),
+		copyIyke: act('Copy as iyke'),
+		iyke: 'iyke ngwa item a',
+		briefChi: null,
+	};
+}
