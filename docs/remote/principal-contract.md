@@ -1,8 +1,8 @@
 # G-PRINCIPAL — the principal and auth contract (T1, local accounts)
 
-**Gate:** G-PRINCIPAL · **Owner:** remote-access WP-20 · **Status:** DRAFT — awaiting founder sign-off (§13) · **Written:** 2026-09-27
+**Gate:** G-PRINCIPAL · **Owner:** remote-access WP-20 · **Status:** SIGNED — frozen 2026-09-29 (§13) · **Written:** 2026-09-27
 
-WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). This is a contract draft only: nothing here is implemented, and WP-20/21/22 must not start until §13 is signed.
+WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). Nothing here is implemented yet. §13 was signed on 2026-09-29, so WP-20/21/22 may start against it.
 
 **Grounded against:** `ikenga` `origin/main` at `a076a87` (WP-19 slices 1–3 #298/#301/#304; WP-18b part a #303; WP-18b part b #305, **merged** at `b569d88`). Nothing under `src-tauri/` changed between `b569d88` and `a076a87` (#306/#307). Line numbers are anchors on `a076a87`. Plan paths (`plans/…`, `docs/adr/…`) are in the workspace meta-repo.
 
@@ -460,12 +460,12 @@ Self-signup; LDAP/AD; OIDC flows (WP-22); per-principal pkg install or trust (v1
 
 | Condition | State |
 |---|---|
-| Contradictions review by a separate reviewer | **not yet run** |
-| OD-1…OD-14 answered | **open** |
+| Contradictions review by a separate reviewer | **not run**: signed without it |
+| OD-1…OD-14 answered | **Answered 2026-09-29**: every recommendation in §12.1 accepted as written, including OD-10's same-origin pkg carry-over (§5 row 11). The §12.2 pins stand. |
 | Locked decisions (§0.1) re-opened? | **No** |
 | Depends on #305 (WP-18b part b) | **Resolved**: merged at `b569d88`; no open dependency under either OD-1 option (§9.5) |
 | Recorded in `plans/remote-access/04-discussion.md` | **pending**: the freeze gets its own Round, and shell-ux notes it in its next Round (G-ACCESS waits on this, `plans/shell-ux-rearchitecture/04-discussion.md:147-149`) |
 
 After sign-off, any change to §1–§9 or §11.1 needs a new Round in `04`.
 
-**Status: DRAFT — freeze gate G-PRINCIPAL, awaiting founder sign-off. Not to be implemented until signed.**
+**Status: SIGNED — freeze gate G-PRINCIPAL signed off by the founder on 2026-09-29 (merged via #310). WP-20, WP-21 and WP-22 are unblocked.**
