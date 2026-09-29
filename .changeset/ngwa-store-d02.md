@@ -19,3 +19,10 @@
   - **personal** maps to the workspace scope, **project** to the active project;
   - Update installs the latest version in the pkg's current scope, and holds back if the new version asks for more permissions;
   - lists refresh afterwards.
+- **Installed and item-detail actions work** (#328, D-02 / D-08).
+  - **Installed tab:** the detail column and a new row context menu run Disable/Enable, Move…, Copy to…, Update, Open folder, **Remove…** (with confirm) and Hand to Chi.
+    - Remove uninstalls a pkg, or removes a skill/agent/command/hook from its scope.
+    - Builtin pkgs can't be removed.
+  - **Item-detail page:** Open view, Disable/Enable and the ⋯ menu (Open manifest.json, Reveal install path, Reset settings to defaults, Copy as iyke).
+  - **Shared code:** Scopes, Installed and item detail now share one action set and one set of confirm dialogs.
+  - **Rail:** icons pinned for a pkg are pruned when it is uninstalled.
