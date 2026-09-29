@@ -1,8 +1,10 @@
 // /ngwa/item/$itemId — Full-pane Ngwa equipment detail route (WP-17 / locked D-08).
 //
-// Mounts NgwaItemDetailSurface for the selected equipment item.
+// Mounts NgwaItemDetailSurface for the selected equipment item and wires the
+// D-08 header + ⋯ menu through the shared Ngwa actions.
 
 import { createFileRoute, useNavigate, useParams } from '@tanstack/react-router';
+import { useNgwaItemActions } from '@/lib/ngwa/use-ngwa-actions';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import { NgwaItemDetailSurface } from '@/shell/ngwa/ngwa-item-detail-surface';
 import { ArrowLeft } from 'lucide-react';
@@ -11,10 +13,16 @@ import '@/shell/ngwa/ngwa.css';
 function NgwaItemDetailPage() {
 	const { itemId } = useParams({ from: '/ngwa/item/$itemId' });
 	const navigate = useNavigate();
-	const { items, isLoading, error } = useNgwaSnapshot();
+	const { items, storeCatalog, unreadableSources, isLoading, error } = useNgwaSnapshot();
 
 	// Match by id or by name (for clean human-readable navigation)
 	const item = items.find((i) => i.id === itemId || i.name === itemId);
+	const { actionsFor, dialog, status } = useNgwaItemActions({
+		items,
+		storeCatalog,
+		unreadableSources,
+		settingsItem: item ?? null,
+	});
 
 	function handleBack() {
 		void navigate({ to: '/ngwa/installed' });
@@ -57,10 +65,15 @@ function NgwaItemDetailPage() {
 	}
 
 	return (
-		<NgwaItemDetailSurface
-			item={item}
-			onBack={handleBack}
-		/>
+		<>
+			<NgwaItemDetailSurface
+				item={item}
+				onBack={handleBack}
+				actions={actionsFor(item)}
+				status={status}
+			/>
+			{dialog}
+		</>
 	);
 }
 

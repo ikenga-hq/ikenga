@@ -7,7 +7,7 @@
 // - Placement: Multi-engine placement matrix
 // - Dependents: Items listing this item in requires[]
 
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
 	Shield,
 	FileText,
@@ -16,31 +16,25 @@ import {
 	Play,
 	Pause,
 	Download,
-	ExternalLink,
 	Sparkles,
-	Maximize2,
+	MoveRight,
+	Copy,
+	Trash2,
 } from 'lucide-react';
-import { useNavigate } from '@tanstack/react-router';
 import type { NgwaItem } from '@ikenga/contract';
 import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
-import { openExternalUrl } from '@/lib/transport';
+import type { NgwaAct, NgwaItemActionSet, NgwaScopePick } from '@/lib/ngwa/use-ngwa-actions';
+import { NgwaPopMenu } from './ngwa-scope-ops';
 
 export interface NgwaDetailPaneProps {
 	item: NgwaItem;
-	onToggleState?: (item: NgwaItem) => void;
-	onUpdate?: (item: NgwaItem) => void;
-	onHandToChi?: (item: NgwaItem) => void;
+	/** D-02's action row, built by `useNgwaItemActions`. Omitted ⇒ no row. */
+	actions?: NgwaItemActionSet;
 }
 
 type DetailTab = 'body' | 'files' | 'perms' | 'place' | 'deps';
 
-export function NgwaDetailPane({
-	item,
-	onToggleState,
-	onUpdate,
-	onHandToChi,
-}: NgwaDetailPaneProps) {
-	const navigate = useNavigate();
+export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 	const [activeTab, setActiveTab] = useState<DetailTab>('body');
 	const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
 
@@ -48,12 +42,6 @@ export function NgwaDetailPane({
 
 	function toggleFolder(key: string) {
 		setOpenFolders((prev) => ({ ...prev, [key]: !prev[key] }));
-	}
-
-	function handleOpenInEditor() {
-		if (item.install_path) {
-			void openExternalUrl(item.install_path);
-		}
 	}
 
 	return (
@@ -92,64 +80,7 @@ export function NgwaDetailPane({
 					</p>
 				)}
 
-				<div className="dacts">
-					{onToggleState && (
-						<button
-							type="button"
-							className="chip"
-							onClick={() => onToggleState(item)}
-						>
-							{item.state === 'enabled' ? (
-								<>
-									<Pause className="h-3 w-3" /> Disable
-								</>
-							) : (
-								<>
-									<Play className="h-3 w-3" /> Enable
-								</>
-							)}
-						</button>
-					)}
-
-					{item.state === 'update' && item.latest_version && onUpdate && (
-						<button
-							type="button"
-							className="chip on"
-							onClick={() => onUpdate(item)}
-						>
-							<Download className="h-3 w-3" /> Update to {item.latest_version}
-						</button>
-					)}
-
-					<button
-						type="button"
-						className="chip"
-						onClick={handleOpenInEditor}
-						title="Open files in editor"
-					>
-						<ExternalLink className="h-3 w-3" /> Open in editor
-					</button>
-
-					<button
-						type="button"
-						className="chip"
-						onClick={() => void navigate({ to: '/ngwa/item/$itemId', params: { itemId: item.id } })}
-						title="Open full pane detail"
-					>
-						<Maximize2 className="h-3 w-3" /> Open in pane
-					</button>
-
-					{onHandToChi && (
-						<button
-							type="button"
-							className="chip"
-							onClick={() => onHandToChi(item)}
-							title="Hand to Chi Companion"
-						>
-							<Sparkles className="h-3 w-3" /> Hand to Chi
-						</button>
-					)}
-				</div>
+				{actions && <DetailActions actions={actions} />}
 			</div>
 
 			{/* ── Tabs ── */}
@@ -352,5 +283,81 @@ export function NgwaDetailPane({
 				)}
 			</div>
 		</aside>
+	);
+}
+
+/** D-02 `.dacts`: Disable/Enable · Move… · Copy to… · Update · Open folder ·
+ *  Remove… (danger) · Hand to Chi (primary). A disabled action keeps its
+ *  reason as its title. */
+function DetailActions({ actions }: { actions: NgwaItemActionSet }) {
+	const on = actions.toggle.label === 'Disable';
+	return (
+		<div className="dacts" data-dacts>
+			<ActButton act={actions.toggle} icon={on ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />} />
+			<PickButton pick={actions.move} label="Move…" icon={<MoveRight className="h-3 w-3" />} />
+			<PickButton pick={actions.copy} label="Copy to…" icon={<Copy className="h-3 w-3" />} />
+			<ActButton
+				act={{ ...actions.update, label: 'Update' }}
+				icon={<Download className="h-3 w-3" />}
+				title={actions.update.disabledReason ?? actions.update.label}
+			/>
+			<ActButton act={actions.openFolder} icon={<Folder className="h-3 w-3" />} />
+			<ActButton act={actions.remove} icon={<Trash2 className="h-3 w-3" />} className="chip danger" />
+			<ActButton act={actions.handToChi} icon={<Sparkles className="h-3 w-3" />} className="chip on" />
+		</div>
+	);
+}
+
+function ActButton({
+	act,
+	icon,
+	className = 'chip',
+	title,
+}: {
+	act: NgwaAct;
+	icon: React.ReactNode;
+	className?: string;
+	title?: string;
+}) {
+	return (
+		<button
+			type="button"
+			className={className}
+			disabled={act.disabledReason !== undefined}
+			title={title ?? act.disabledReason}
+			onClick={act.run}
+		>
+			{icon} {act.label}
+		</button>
+	);
+}
+
+function PickButton({ pick, label, icon }: { pick: NgwaScopePick; label: string; icon: React.ReactNode }) {
+	const [open, setOpen] = useState(false);
+	const ref = useRef<HTMLButtonElement>(null);
+	const close = useCallback(() => setOpen(false), []);
+	return (
+		<span className="pickwrap">
+			<button
+				ref={ref}
+				type="button"
+				className="chip"
+				aria-haspopup="menu"
+				aria-expanded={open}
+				disabled={pick.disabledReason !== undefined}
+				title={pick.disabledReason}
+				onClick={() => setOpen((o) => !o)}
+			>
+				{icon} {label}
+			</button>
+			{open && (
+				<NgwaPopMenu
+					pop={{ id: pick.title, title: pick.title, items: pick.targets }}
+					anchor={ref}
+					onClose={close}
+					className="storepop"
+				/>
+			)}
+		</span>
 	);
 }

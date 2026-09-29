@@ -9,8 +9,13 @@
 //   supporting string, number, bool, enum, path, and secret fields.
 // - Scope switch (Personal vs Project) with target configuration path preview.
 // - Tokens-only styling adhering to @ikenga/tokens and D-08 layout.
+// - Header (D-08): pkgs get Open view (apps with ui.views[]) · Disable/Enable ·
+//   ⋯; primitives get Brief a Chi (skills, commands) · ⋯. The ⋯ menu is
+//   `itemDotsMenu()`: Open manifest.json · Reveal install path · Reset
+//   settings to defaults (danger) · Copy as iyke. There is no Uninstall,
+//   Update or Hand to Chi in this header — those live on the Installed tab.
 
-import { useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
 	ArrowLeft,
 	Shield,
@@ -22,8 +27,8 @@ import {
 	Pause,
 	Download,
 	ExternalLink,
-	Sparkles,
 	Lock,
+	MoreHorizontal,
 	Layers,
 	Grid,
 	BookOpen,
@@ -35,7 +40,6 @@ import {
 	User,
 	Slash,
 	RefreshCw,
-	Trash2,
 } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { NgwaItem, NgwaKind } from '@ikenga/contract';
@@ -53,17 +57,37 @@ import {
 	type PkgSettingsSnapshot,
 } from '@/lib/tauri-cmd';
 import { openExternalUrl } from '@/lib/transport';
+import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 import { NgwaFlowRenderer } from './ngwa-flow-renderer';
+import { NgwaPopMenu, type PopItem } from './ngwa-scope-ops';
 import { usePkgWorkflowGraphs } from './use-pkg-workflow-graphs';
 import './ngwa.css';
 
 export interface NgwaItemDetailSurfaceProps {
 	item: NgwaItem;
 	onBack?: () => void;
-	onToggleState?: (item: NgwaItem) => void;
-	onUpdate?: (item: NgwaItem) => void;
-	onHandToChi?: (item: NgwaItem) => void;
-	onUninstall?: (item: NgwaItem) => void;
+	/** D-08 header + ⋯ menu actions, built by `useNgwaItemActions`. */
+	actions?: NgwaItemActionSet;
+	/** Result line of the last action. */
+	status?: NgwaActionStatus | null;
+}
+
+/** D-08 `itemDotsMenu()`. */
+export function itemDotsMenuItems(a: NgwaItemActionSet): PopItem[] {
+	const act = (x: NgwaAct, extra: Partial<PopItem> = {}): PopItem => ({
+		label: x.label,
+		disabledReason: x.disabledReason,
+		onSelect: x.run,
+		...extra,
+	});
+	return [
+		act(a.openManifest),
+		act(a.revealInstallPath),
+		{ sep: true, label: '' },
+		act(a.resetSettings, { danger: true }),
+		{ sep: true, label: '' },
+		act(a.copyIyke),
+	];
 }
 
 export type PkgDetailTab =
@@ -108,10 +132,8 @@ export function kindIcon(kind: NgwaKind) {
 export function NgwaItemDetailSurface({
 	item,
 	onBack,
-	onToggleState,
-	onUpdate,
-	onHandToChi,
-	onUninstall,
+	actions,
+	status = null,
 }: NgwaItemDetailSurfaceProps) {
 	const isPkg = isPackageKind(item.kind);
 	const [activePkgTab, setActivePkgTab] = useState<PkgDetailTab>('overview');
@@ -132,12 +154,6 @@ export function NgwaItemDetailSurface({
 
 	function toggleFolder(key: string) {
 		setOpenFolders((prev) => ({ ...prev, [key]: !prev[key] }));
-	}
-
-	function handleOpenInEditor() {
-		if (item.install_path) {
-			void openExternalUrl(item.install_path);
-		}
 	}
 
 	return (
@@ -183,69 +199,33 @@ export function NgwaItemDetailSurface({
 					</div>
 				</div>
 
-				{/* ── Header Actions ── */}
-				<div className="idheader-acts">
-					{onToggleState && (
-						<button
-							type="button"
-							className="chip"
-							onClick={() => onToggleState(item)}
-						>
-							{item.state === 'enabled' ? (
-								<>
-									<Pause className="h-3 w-3" /> Disable
-								</>
-							) : (
-								<>
-									<Play className="h-3 w-3" /> Enable
-								</>
-							)}
-						</button>
-					)}
-
-					{item.state === 'update' && item.latest_version && onUpdate && (
-						<button
-							type="button"
-							className="chip on"
-							onClick={() => onUpdate(item)}
-						>
-							<Download className="h-3 w-3" /> Update to {item.latest_version}
-						</button>
-					)}
-
-					{item.install_path && (
-						<button
-							type="button"
-							className="chip"
-							onClick={handleOpenInEditor}
-							title="Open files in editor"
-						>
-							<ExternalLink className="h-3 w-3" /> Reveal in Files
-						</button>
-					)}
-
-					{onHandToChi && (
-						<button
-							type="button"
-							className="chip"
-							onClick={() => onHandToChi(item)}
-							title="Hand to Chi Companion"
-						>
-							<Sparkles className="h-3 w-3" /> Hand to Chi
-						</button>
-					)}
-
-					{onUninstall && item.origin.source !== 'builtin' && (
-						<button
-							type="button"
-							className="chip danger"
-							onClick={() => onUninstall(item)}
-							title="Uninstall equipment"
-						>
-							<Trash2 className="h-3 w-3" /> Uninstall
-						</button>
-					)}
-				</div>
+				{/* ── Header Actions (D-08) ── */}
+				{actions && (
+					<div className="idheader-acts" data-idacts>
+						{isPkg ? (
+							<>
+								{actions.openView && (
+									<HeaderButton act={actions.openView} icon={<Grid className="h-3 w-3" />} />
+								)}
+								<HeaderButton
+									act={actions.toggle}
+									icon={
+										actions.toggle.label === 'Disable' ? (
+											<Pause className="h-3 w-3" />
+										) : (
+											<Play className="h-3 w-3" />
+										)
+									}
+								/>
+							</>
+						) : (
+							actions.briefChi && (
+								<HeaderButton act={actions.briefChi} icon={<Play className="h-3 w-3" />} />
+							)
+						)}
+						<DotsMenu items={itemDotsMenuItems(actions)} />
+					</div>
+				)}
 			</header>
 
 			{/* ── Tabs Strip ── */}
@@ -386,7 +366,7 @@ export function NgwaItemDetailSurface({
 							/>
 						)}
 						{activePkgTab === 'activity' && <PkgActivityTab item={item} />}
-						{activePkgTab === 'versions' && <PkgVersionsTab item={item} onUpdate={onUpdate} />}
+						{activePkgTab === 'versions' && <PkgVersionsTab item={item} update={actions?.update} />}
 						{activePkgTab === 'flow' && (
 							<FlowTab graphs={workflowGraphs} isLoading={workflowsLoading} />
 						)}
@@ -403,7 +383,67 @@ export function NgwaItemDetailSurface({
 					</>
 				)}
 			</div>
+
+			{status && (
+				<div className={`mstatus ${status.tone}`} role="status" data-mstatus>
+					{status.text}
+				</div>
+			)}
+			{actions && (
+				<div className="iykeline" data-iykeline>
+					<Terminal className="h-3 w-3" />
+					<b>iyke</b>
+					<span className="cmdtext">{actions.iyke.replace(/^iyke /, '')}</span>
+					<button type="button" className="cp" onClick={actions.copyIyke.run}>
+						Copy
+					</button>
+				</div>
+			)}
 		</div>
+	);
+}
+
+function HeaderButton({ act, icon }: { act: NgwaAct; icon: React.ReactNode }) {
+	return (
+		<button
+			type="button"
+			className="chip"
+			disabled={act.disabledReason !== undefined}
+			title={act.disabledReason}
+			onClick={act.run}
+		>
+			{icon} {act.label}
+		</button>
+	);
+}
+
+/** The D-08 `⋯` (`#itemDots`) menu. */
+function DotsMenu({ items }: { items: PopItem[] }) {
+	const [open, setOpen] = useState(false);
+	const ref = useRef<HTMLButtonElement>(null);
+	const close = useCallback(() => setOpen(false), []);
+	return (
+		<span className="pickwrap">
+			<button
+				ref={ref}
+				type="button"
+				className="chip icon-only"
+				aria-label="More"
+				aria-haspopup="menu"
+				aria-expanded={open}
+				onClick={() => setOpen((o) => !o)}
+			>
+				<MoreHorizontal className="h-3.5 w-3.5" />
+			</button>
+			{open && (
+				<NgwaPopMenu
+					pop={{ id: 'item-dots', title: 'More', items }}
+					anchor={ref}
+					onClose={close}
+					className="storepop"
+				/>
+			)}
+		</span>
 	);
 }
 
@@ -916,15 +956,10 @@ function PkgActivityTab({ item }: { item: NgwaItem }) {
 	);
 }
 
-function PkgVersionsTab({
-	item,
-	onUpdate,
-}: {
-	item: NgwaItem;
-	onUpdate?: (item: NgwaItem) => void;
-}) {
-	const isUpdateAvailable =
-		Boolean(item.latest_version) && item.latest_version !== item.version;
+function PkgVersionsTab({ item, update }: { item: NgwaItem; update?: NgwaAct }) {
+	// The shared Update action decides (registry entry + newer version); it is
+	// the same signed-registry path the Store and the Installed tab use.
+	const canUpdate = update !== undefined && update.disabledReason === undefined;
 
 	return (
 		<div className="idinner">
@@ -937,16 +972,14 @@ function PkgVersionsTab({
 						<span className="who ml-2">installed</span>
 					</div>
 					<div>
-						{isUpdateAvailable && onUpdate ? (
-							<button
-								type="button"
-								className="chip on"
-								onClick={() => onUpdate(item)}
-							>
-								<Download className="h-3 w-3" /> Update to {item.latest_version}
+						{canUpdate ? (
+							<button type="button" className="chip on" onClick={update.run}>
+								<Download className="h-3 w-3" /> {update.label}
 							</button>
 						) : (
-							<span className="text-xs text-muted-foreground">Up to date</span>
+							<span className="text-xs text-muted-foreground" title={update?.disabledReason}>
+								Up to date
+							</span>
 						)}
 					</div>
 				</div>

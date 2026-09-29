@@ -104,6 +104,8 @@ import {
 	computeReorderIds,
 	dispatchPinSelection,
 	fuzzyMatchSection,
+	pinsOfPkg,
+	prunePinsForUninstalledPkg,
 	slugifySectionId,
 	usePinsStore,
 	type PinDispatchTarget,
@@ -454,5 +456,44 @@ describe('computeCrossSectionReorderIds (cross-section drop)', () => {
 
 	it('clamps a negative dstIdx to the front', () => {
 		expect(computeCrossSectionReorderIds(list('a', 'b'), 'x', -1)).toEqual(['x', 'a', 'b']);
+	});
+});
+
+describe('pins of an uninstalled pkg (pkg-uninstalled prune)', () => {
+	const pin = (kind: string, target: string, manifestId: string | null = null) =>
+		({ kind, target, manifestId }) as never;
+
+	it('matches route / pkg-route pins into /pkg/<id>, and pin_on_install pins by manifestId', () => {
+		const pins = [
+			pin('route', '/pkg/com.x.studio/grid', 'com.x.studio'),
+			pin('pkg-route', '/pkg/com.x.studio'),
+			pin('route', '/pkg/com.x.studio/loupe?id=1'),
+			pin('route', '/pkg/com.x.studio2/grid'),
+			pin('route', '/settings'),
+			pin('artifact', '/pkg/com.x.studio/page.html'),
+		];
+		expect(pinsOfPkg(pins, 'com.x.studio')).toEqual([pins[0], pins[1], pins[2]]);
+	});
+
+	it('prunes only the uninstalled pkg pins and re-reads the store', async () => {
+		const { addPin } = usePinsStore.getState();
+		await addPin({ kind: 'route', target: '/pkg/com.x.studio/grid', label: 'Grid', manifestId: 'com.x.studio' });
+		await addPin({ kind: 'route', target: '/pkg/com.x.studio/loupe', label: 'Loupe' });
+		await addPin({ kind: 'route', target: '/pkg/com.x.studio2/grid', label: 'Other' });
+		await addPin({ kind: 'artifact', target: '/home/x/a.html', label: 'Doc' });
+
+		const removed = await prunePinsForUninstalledPkg('com.x.studio');
+
+		expect(removed).toHaveLength(2);
+		expect(cmd.activityPinsRemove).toHaveBeenCalledTimes(2);
+		const left = usePinsStore.getState().pins.map((p) => p.target);
+		expect(left).toEqual(['/pkg/com.x.studio2/grid', '/home/x/a.html']);
+	});
+
+	it('is a no-op when the pkg had no pins', async () => {
+		await usePinsStore.getState().addPin({ kind: 'route', target: '/settings', label: 'Settings' });
+		vi.mocked(cmd.activityPinsRemove).mockClear();
+		expect(await prunePinsForUninstalledPkg('com.x.none')).toEqual([]);
+		expect(cmd.activityPinsRemove).not.toHaveBeenCalled();
 	});
 });
