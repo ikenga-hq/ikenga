@@ -45,6 +45,8 @@ export interface NgwaListProps {
 	onOpenItem?: (item: NgwaItem) => void;
 	/** Result line of the last action. */
 	status?: NgwaActionStatus | null;
+	/** Pre-filled name filter (the Store's "Open in Installed", R57). */
+	initialSearch?: string;
 }
 
 /** D-02 row context menu (`rowMenu`): the name as group header, Disable /
@@ -122,8 +124,11 @@ export function NgwaList({
 	actionsFor,
 	onOpenItem,
 	status = null,
+	initialSearch,
 }: NgwaListProps) {
-	const [facets, setFacets] = useState<NgwaFacetsState>(DEFAULT_FACETS);
+	const [facets, setFacets] = useState<NgwaFacetsState>(() =>
+		initialSearch ? { ...DEFAULT_FACETS, search: initialSearch } : DEFAULT_FACETS
+	);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [menu, setMenu] = useState<RowMenu | null>(null);
 	const closeMenu = useCallback(() => setMenu(null), []);

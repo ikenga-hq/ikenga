@@ -267,6 +267,10 @@ reason = "install_core->fetch_and_adopt calls npx_skills_add, which runs `npx`; 
 tag = "WP-18b"
 reason = "install_with_deps_core resolves the closure via install_core per dep, spawning git/npx (same site as oba_install_git/npx)."
 
+[oba_resolve_source]
+tag = "WP-18b"
+reason = "resolve_source_core clones into staging (git_clone / git_fetch_at_sha) or runs `npx skills add` — the same git/npx spawn sites as oba_install_git/npx; executor-routed (spawn_output_blocking), rpc.rs arm still pending."
+
 [oba_update]
 tag = "WP-18b"
 reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same git/npx spawn sites as install."

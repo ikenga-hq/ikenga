@@ -1754,6 +1754,14 @@ export interface ClaudeStoreEntry {
 	 *  surface mount. Catalog installs default this on; manual/local off. Absent
 	 *  → false. */
 	autoUpdate?: boolean;
+	/** R57 · N-C: true = installed against a reviewed pin (a git SHA and/or a
+	 *  content hash). A pinned install never tracks HEAD: it moves only when an
+	 *  update names the new pin (the catalog moved it, or the user confirmed the
+	 *  SHA shown). Absent → false (legacy unpinned install). */
+	pinned?: boolean;
+	/** R57 · N-C: content hash of the installed master (`sha256-<hex>`), as
+	 *  computed by the installer. Absent on pre-R57 entries. */
+	hash?: string | null;
 }
 
 /** Result of a symlink-farm or merge mutation. `path` is the on-disk location
@@ -2434,7 +2442,11 @@ export async function obaInstallGit(
 	/** Phase 3: true when the install was discovered through the recommended
 	 *  catalog (records `fromCatalog` + opts into auto-update). Omit/false for a
 	 *  direct git install. */
-	fromCatalog?: boolean
+	fromCatalog?: boolean,
+	/** R57 · N-C: install exactly what was reviewed. `sha` fetches that commit
+	 *  (never HEAD); `hash` is verified against the fetched content. A mismatch
+	 *  rejects with an error containing {@link OBA_PIN_MISMATCH}. */
+	pin?: ObaPin | null
 ): Promise<ClaudeStoreEntry> {
 	return invoke<ClaudeStoreEntry>('oba_install_git', {
 		kind,
@@ -2442,6 +2454,8 @@ export async function obaInstallGit(
 		url,
 		gitRef: gitRef ?? null,
 		fromCatalog: fromCatalog ?? false,
+		expectSha: pin?.sha ?? null,
+		expectHash: pin?.hash ?? null,
 	});
 }
 
@@ -2455,13 +2469,17 @@ export async function obaInstallNpx(
 	kind: ClaudeStoreKind,
 	name: string,
 	spec: string,
-	fromCatalog?: boolean
+	fromCatalog?: boolean,
+	/** R57 · N-C: see {@link obaInstallGit}. */
+	pin?: ObaPin | null
 ): Promise<ClaudeStoreEntry> {
 	return invoke<ClaudeStoreEntry>('oba_install_npx', {
 		kind,
 		name,
 		spec,
 		fromCatalog: fromCatalog ?? false,
+		expectSha: pin?.sha ?? null,
+		expectHash: pin?.hash ?? null,
 	});
 }
 
@@ -2507,6 +2525,11 @@ export interface CatalogEntryRef {
 	/** Member skills a `bundle` catalog row carries (WP-18/19). Absent for
 	 *  non-bundle rows. Mirrors the Rust `CatalogEntryRef.members`. */
 	members?: string[];
+	/** R57 · Q3: the catalog pin — a git commit SHA (or a git tag/branch when it
+	 *  is not a SHA). A dep resolved from this row is fetched at the pin. */
+	ref?: string | null;
+	/** R57 · Q3: the catalog content hash (`sha256-<hex>`), verified on fetch. */
+	hash?: string | null;
 }
 
 /** Result of a resolver-driven install (ADR-015 §3b / WP-14). Mirrors the Rust
@@ -2534,7 +2557,10 @@ export async function obaInstallWithDeps(
 	url: string,
 	catalog: CatalogEntryRef[],
 	gitRef?: string | null,
-	fromCatalog?: boolean
+	fromCatalog?: boolean,
+	/** R57 · N-C: the target's pin (see {@link obaInstallGit}). Deps take their
+	 *  pins from their `catalog` rows. */
+	pin?: ObaPin | null
 ): Promise<InstallWithDepsResult> {
 	return invoke<InstallWithDepsResult>('oba_install_with_deps', {
 		kind,
@@ -2544,6 +2570,8 @@ export async function obaInstallWithDeps(
 		gitRef: gitRef ?? null,
 		fromCatalog: fromCatalog ?? false,
 		catalog,
+		expectSha: pin?.sha ?? null,
+		expectHash: pin?.hash ?? null,
 	});
 }
 
@@ -2583,8 +2611,11 @@ export interface AutoUpdateSummary {
  * FE-driven (call on the catalog surface mount). Per-entry errors are collected,
  * never abort the batch.
  */
-export async function obaAutoUpdateAll(): Promise<AutoUpdateSummary> {
-	return invoke<AutoUpdateSummary>('oba_auto_update_all', {});
+export async function obaAutoUpdateAll(pins?: ObaCatalogPin[] | null): Promise<AutoUpdateSummary> {
+	// R57 · Q3: pass the signed catalog's pins. A pinned catalog install moves
+	// only to its catalog pin; it never tracks HEAD. Unpinned legacy installs
+	// with no pin here keep the HEAD-tracking behaviour.
+	return invoke<AutoUpdateSummary>('oba_auto_update_all', { pins: pins ?? null });
 }
 
 /**
@@ -2612,8 +2643,95 @@ export async function obaCheckUpdate(kind: ClaudeStoreKind, name: string): Promi
  * swap), so dependent symlinks resolve to the refreshed files with no relink.
  * Bumps the recorded version + `updatedAt`. Refuses an external master.
  */
-export async function obaUpdate(kind: ClaudeStoreKind, name: string): Promise<ClaudeStoreEntry> {
-	return invoke<ClaudeStoreEntry>('oba_update', { kind, name });
+export async function obaUpdate(
+	kind: ClaudeStoreKind,
+	name: string,
+	/** R57 · N-C: the version the user confirmed ("Update to <sha>"). With a
+	 *  `sha`, exactly that commit is fetched (never HEAD); with a `hash`, the
+	 *  fetched content must match. A pinned install REQUIRES a pin here. A
+	 *  mismatch rejects with an error containing {@link OBA_PIN_MISMATCH}. */
+	pin?: ObaPin | null
+): Promise<ClaudeStoreEntry> {
+	return invoke<ClaudeStoreEntry>('oba_update', {
+		kind,
+		name,
+		expectSha: pin?.sha ?? null,
+		expectHash: pin?.hash ?? null,
+	});
+}
+
+// ─── R57 · N-B — resolve a source without installing (dry-run) ────────────────
+
+/** Substring every pin-mismatch rejection carries (install / update refused
+ *  because the source no longer serves the reviewed SHA / content). */
+export const OBA_PIN_MISMATCH = 'pin mismatch';
+
+/** True when an Ọba install/update error is a pin mismatch (N-C refusal). */
+export function isObaPinMismatch(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : String(err);
+	return msg.includes(OBA_PIN_MISMATCH);
+}
+
+/** What an install/update must match (R57 · N-C). Either field may be absent. */
+export interface ObaPin {
+	/** A git commit SHA (full, or a prefix of at least 7 hex chars). */
+	sha?: string | null;
+	/** A content hash, `sha256-<hex>`. */
+	hash?: string | null;
+}
+
+/** A catalog pin handed to {@link obaAutoUpdateAll} (R57 · Q3). */
+export interface ObaCatalogPin {
+	kind: string;
+	name: string;
+	sha?: string | null;
+	hash?: string | null;
+}
+
+/** Result of {@link obaResolveSource}. Mirrors the Rust `ResolvedSource`. */
+export interface ResolvedSource {
+	kind: ClaudeStoreKind;
+	name: string;
+	/** How the kind was found, e.g. `root SKILL.md`, `agents/<n>.md`, `given`. */
+	inferredFrom: string;
+	/** The fetch route: `git` (a clone URL) or `npx` (an `owner/repo` spec). */
+	source: 'git' | 'npx';
+	/** The normalized clone URL (git) or spec (npx) Install should use. */
+	url: string;
+	/** The ref that was resolved (git only); null = the default branch. */
+	ref: string | null;
+	/** The commit the fetch landed on; pass it back as the install pin. */
+	sha: string | null;
+	/** Content hash of the located primitive (`sha256-<hex>`). */
+	hash: string;
+	/** Files the primitive consists of, relative to its root (capped at 200). */
+	files: string[];
+	/** The compiled `requires` the fetched manifest declares. */
+	requires: RequiresEntry[];
+	description: string | null;
+	/** Always `'unsigned'`: nothing vouches for a pasted source. */
+	trust: 'unsigned';
+}
+
+/**
+ * R57 · N-B: fetch `url` into a disposable staging folder, infer what it holds
+ * and report it — without writing to the vault. Staging is removed before this
+ * resolves. `url` is a git URL (`https://…`, `git@…`, `file://…`) or an
+ * `owner/repo` spec (npx; an `npx skills add ` prefix is tolerated). `kind` /
+ * `name` narrow the inference; `gitRef` picks a branch or tag (git only).
+ * Install the result with `pin: { sha, hash }` so what is placed is what was
+ * resolved.
+ */
+export async function obaResolveSource(
+	url: string,
+	opts?: { kind?: ClaudeStoreKind | null; name?: string | null; gitRef?: string | null }
+): Promise<ResolvedSource> {
+	return invoke<ResolvedSource>('oba_resolve_source', {
+		url,
+		kind: opts?.kind ?? null,
+		name: opts?.name ?? null,
+		gitRef: opts?.gitRef ?? null,
+	});
 }
 
 // ─── Iyke (phase 11 — Day 1: read-side state + shell mirror push) ─────────────

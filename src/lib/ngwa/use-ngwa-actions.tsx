@@ -18,14 +18,16 @@
 
 import { useCallback, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { useIsFetching, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { NgwaItem } from '@ikenga/contract';
+import { useIsFetching, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import type { NgwaItem, NgwaSnapshot } from '@ikenga/contract';
 import { loadHome } from '@/lib/home';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
 import { useStoreInstall } from '@/lib/ngwa/use-store-install';
 import { ngwaSnapshotQueryKey } from '@/lib/ngwa/use-ngwa-snapshot';
+import { useVaultEntries } from '@/lib/ngwa/use-vault-entries';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import {
+	obaCheckUpdateQueryOptions,
 	useCopyPrimitive,
 	useDisablePrimitive,
 	useDisablePrimitiveFor,
@@ -34,6 +36,15 @@ import {
 	useMovePrimitive,
 	useRemovePrimitive,
 } from '@/lib/queries/claude-config';
+import { queryKeys } from '@/lib/query-keys';
+import {
+	catalogPin,
+	catalogPinMoved,
+	primitiveCatalogKey,
+	shortSha,
+	usePrimitiveCatalog,
+	type PrimitiveCatalogEntry,
+} from '@/lib/registry/primitives';
 import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	pkgKernelStatus,
@@ -41,8 +52,19 @@ import {
 	pkgSettingsGet,
 	pkgSettingsSet,
 	pkgUninstall,
+	type ClaudeStoreEntry,
+	type ClaudeStoreKind,
 	type PkgSettingsField,
+	type UpdateStatus,
 } from '@/lib/tauri-cmd';
+import {
+	RemoteRemoveDialog,
+	RemoteUpdateDialog,
+	type NgwaRemoteRecord,
+	type RemoteRemoveRequest,
+	type RemoteUpdateRequest,
+} from '@/shell/ngwa/ngwa-remote-dialogs';
+import { placementTarget } from '@/shell/ngwa/ngwa-scope-model';
 import { openExternalUrl, writeClipboardText } from '@/lib/transport';
 import type { PkgViewEntry } from '@/lib/pkg/use-activity-bar-entries';
 import { handToChi } from '@/shell/companion/companion-store';
@@ -153,7 +175,244 @@ export function useNgwaScopeColumns(): { scopes: ScopeColumn[]; homeDir: string 
 export interface NgwaAct {
 	label: string;
 	disabledReason?: string;
+	/** Tooltip for an enabled action (R57: `3e1a9c0 → 8b77f2d at the remote`). */
+	title?: string;
 	run: () => void;
+}
+
+// ─── R57 · git / npx items: the remote record, the update check ─────────────
+
+/** The result of the on-open update check (`obaCheckUpdate`, a `git
+ *  ls-remote`), or of the catalog-pin comparison. */
+export interface RemoteCheck {
+	status: 'idle' | 'loading' | 'error' | 'ok';
+	current: string | null;
+	latest: string | null;
+	behind: boolean;
+	error: string | null;
+	checkedAtMs: number | null;
+}
+
+/** The remote side of a vault-managed git / npx item. */
+export interface NgwaRemoteActions {
+	record: NgwaRemoteRecord;
+	/** `<url> @ <sha7>` for the detail line. */
+	detailLine: string;
+	/** Q4: a direct install checks the remote when its detail opens; a pinned
+	 *  catalog install compares with the catalog pin instead (no network). */
+	needsCheck: boolean;
+	/** The Update action for this check's result. */
+	updateFor: (check: RemoteCheck | null) => NgwaAct;
+}
+
+/** True for an item with a vault-managed remote record (R57 flow 3). */
+export function isRemoteItem(item: NgwaItem): boolean {
+	return (
+		!isPkgItem(item) &&
+		item.origin.managed &&
+		(item.origin.source === 'git' || item.origin.source === 'npx')
+	);
+}
+
+const STORE_KINDS: ReadonlySet<string> = new Set(['skill', 'agent', 'command', 'hook', 'mcp']);
+
+/** The remote record for an item, joined from the snapshot, the vault list
+ *  and the signed catalog. Null when the item is not a git / npx install. */
+export function remoteRecordOf(
+	item: NgwaItem,
+	storeKind: ClaudeStoreKind | null,
+	vault: readonly ClaudeStoreEntry[],
+	catalog: readonly PrimitiveCatalogEntry[],
+	items: readonly NgwaItem[]
+): NgwaRemoteRecord | null {
+	if (!isRemoteItem(item)) return null;
+	const kind = storeKind ?? (STORE_KINDS.has(item.kind) ? (item.kind as ClaudeStoreKind) : null);
+	if (!kind) return null;
+	const v = vault.find((e) => e.kind === kind && e.name === item.name) ?? null;
+	const cat = catalog.find((c) => c.kind === kind && c.name === item.name) ?? null;
+	const fromCatalog = v?.fromCatalog === true;
+	const pin = fromCatalog && cat ? catalogPin(cat) : null;
+	const sha = v?.version ?? item.origin.resolved_version;
+	const hash = v?.hash ?? null;
+	const links = items
+		.filter((it) => it.name === item.name && it.kind === item.kind)
+		.reduce((n, it) => n + it.placements.filter((p) => p.in_store).length, 0);
+	return {
+		kind,
+		name: item.name,
+		source: item.origin.source as 'git' | 'npx',
+		url: v?.url ?? item.origin.url ?? '',
+		sha,
+		ref: v?.ref ?? item.origin.ref,
+		fromCatalog,
+		pinned: v?.pinned === true,
+		hash,
+		autoUpdate: v?.autoUpdate ?? item.origin.auto_update,
+		master: v?.canonicalPath ?? v?.storePath ?? item.install_path,
+		resolvedAtMs: item.origin.updated_at_ms ?? item.origin.installed_at_ms,
+		catalogPin: pin,
+		catalogBehind:
+			pin !== null && cat !== null
+				? catalogPinMoved({ version: sha, hash } as ClaudeStoreEntry, cat)
+				: false,
+		links,
+	};
+}
+
+/** "just now" / "4 min ago" for the update tooltip. */
+function checkedAgo(ms: number | null): string {
+	if (!ms) return 'just now';
+	const min = Math.floor((Date.now() - ms) / 60_000);
+	return min < 1 ? 'just now' : `${min} min ago`;
+}
+
+/**
+ * The Update action for a git / npx item. Hook and MCP entries are refused
+ * (the backend cannot update a settings fragment in place). A catalog install
+ * with a catalog pin moves to the pin; anything else follows the check.
+ */
+export function remoteUpdateAct(
+	record: NgwaRemoteRecord,
+	check: RemoteCheck | null,
+	open: (target: { sha: string | null; hash?: string | null }) => void,
+	gate: (why: string | undefined) => string | undefined
+): NgwaAct {
+	const cur = shortSha(record.sha);
+	if (record.kind === 'hook' || record.kind === 'mcp') {
+		return {
+			label: 'Update',
+			disabledReason: `A ${record.kind === 'mcp' ? 'MCP entry' : 'hook'} is merged into settings.json and can't be updated in place — remove it and install it again`,
+			run: () => {},
+		};
+	}
+	if (record.catalogPin) {
+		const pin = record.catalogPin;
+		const to = shortSha(pin.sha ?? null);
+		if (!record.catalogBehind) {
+			return {
+				label: 'Update',
+				disabledReason: `${cur} is the signed catalog's pinned version`,
+				run: () => {},
+			};
+		}
+		return {
+			label: `Update to ${to}`,
+			title: `${cur} → ${to} in the signed catalog`,
+			disabledReason: gate(undefined),
+			run: () => open({ sha: pin.sha ?? null, hash: pin.hash ?? null }),
+		};
+	}
+	if (!check || check.status === 'idle') {
+		return {
+			label: 'Update',
+			disabledReason: 'Open the item to check the remote',
+			run: () => {},
+		};
+	}
+	if (check.status === 'loading') {
+		return { label: 'Update', disabledReason: 'Checking the remote…', run: () => {} };
+	}
+	if (check.status === 'error') {
+		return {
+			label: 'Update',
+			disabledReason: `Couldn't check the remote: ${check.error ?? 'unknown error'}`,
+			run: () => {},
+		};
+	}
+	if (!check.behind || !check.latest) {
+		return {
+			label: 'Update',
+			disabledReason: `${shortSha(check.current ?? record.sha)} is the newest at the remote · checked ${checkedAgo(check.checkedAtMs)}`,
+			run: () => {},
+		};
+	}
+	const latest = check.latest;
+	const to = shortSha(latest);
+	return {
+		label: `Update to ${to}`,
+		title: `${shortSha(check.current ?? record.sha)} → ${to} at the remote`,
+		disabledReason: gate(undefined),
+		run: () => open({ sha: latest }),
+	};
+}
+
+/** A query state as a {@link RemoteCheck}. */
+export function toRemoteCheck(q: {
+	status: 'pending' | 'error' | 'success';
+	fetchStatus?: string;
+	data?: UpdateStatus;
+	error?: unknown;
+	dataUpdatedAt?: number;
+}): RemoteCheck {
+	if (q.status === 'error') {
+		return {
+			status: 'error',
+			current: null,
+			latest: null,
+			behind: false,
+			error: errText(q.error),
+			checkedAtMs: null,
+		};
+	}
+	if (q.status === 'pending' || !q.data) {
+		return {
+			status: q.fetchStatus === 'idle' ? 'idle' : 'loading',
+			current: null,
+			latest: null,
+			behind: false,
+			error: null,
+			checkedAtMs: null,
+		};
+	}
+	return {
+		status: 'ok',
+		current: q.data.current,
+		latest: q.data.latest,
+		behind: q.data.behind,
+		error: null,
+		checkedAtMs: q.dataUpdatedAt ?? null,
+	};
+}
+
+/** Q4: run the update check for a direct git / npx install while its detail
+ *  is open. Null when there is nothing to check. */
+export function useRemoteCheck(remote: NgwaRemoteActions | null | undefined): RemoteCheck | null {
+	const enabled = Boolean(remote?.needsCheck);
+	const q = useQuery({
+		...obaCheckUpdateQueryOptions(remote?.record.kind ?? 'skill', remote?.record.name ?? ''),
+		enabled,
+		retry: false,
+	});
+	if (!remote || !enabled) return null;
+	return toRemoteCheck(q);
+}
+
+/** Q6: after Forget, every scope's copy of the item reads as `local` at once
+ *  (the refetch that follows then reports whatever the scan finds). */
+export function markForgotten(qc: QueryClient, record: NgwaRemoteRecord): void {
+	qc.setQueryData<NgwaSnapshot>(ngwaSnapshotQueryKey, (snap) =>
+		snap
+			? {
+					...snap,
+					items: snap.items.map((it) =>
+						it.name === record.name && isRemoteItem(it)
+							? {
+									...it,
+									origin: {
+										...it.origin,
+										source: 'local',
+										url: null,
+										ref: null,
+										resolved_version: null,
+										managed: false,
+										auto_update: false,
+									},
+								}
+							: it
+					),
+				}
+			: snap
+	);
 }
 
 /** Move… / Copy to…: a scope picker. The trigger itself can be disabled. */
@@ -187,6 +446,9 @@ export interface NgwaItemActionSet {
 	iyke: string;
 	/** D-08 skill variant: fill the dispatch bar with the invocation. */
 	briefChi: NgwaAct | null;
+	/** R57: set for a vault-managed git / npx item — its Update and Remove are
+	 *  the remote-aware ones; null for every other item (locked D-02). */
+	remote?: NgwaRemoteActions | null;
 }
 
 export interface NgwaActionStatus {
@@ -256,6 +518,15 @@ export function useNgwaItemActions({
 	const views = usePkgViews();
 	const refreshing = useIsFetching({ queryKey: ngwaSnapshotQueryKey }) > 0;
 	const ops = useScopeOps({ items, scopes, homeDir, unreadableSources, actions: scopeActions });
+
+	// R57: the vault record and the signed catalog, read only when a git / npx
+	// item is on screen.
+	const anyRemote = useMemo(() => items.some(isRemoteItem), [items]);
+	const vault = useVaultEntries(anyRemote);
+	const catalogQ = usePrimitiveCatalog({ enabled: anyRemote });
+	const catalogEntries = catalogQ.data;
+	const [updateReq, setUpdateReq] = useState<RemoteUpdateRequest | null>(null);
+	const [removeReq, setRemoveReq] = useState<RemoteRemoveRequest | null>(null);
 
 	const settingsPkg = settingsItem && isPkgItem(settingsItem) ? settingsItem.id : null;
 	const settings = useQuery({
@@ -394,10 +665,39 @@ export function useNgwaItemActions({
 					? { label: 'Move to personal', disabledReason: 'Already personal', run: () => {} }
 					: asAct('Move to personal', moveTo('personal'));
 
+			// ── R57: a vault-managed git / npx item ──
+			const record = pkg
+				? null
+				: remoteRecordOf(item, sk, vault.entries, catalogEntries ?? [], items);
+			const remote: NgwaRemoteActions | null = record
+				? {
+						record,
+						detailLine: `${record.url} @ ${shortSha(record.sha)}`,
+						needsCheck: !record.catalogPin && record.kind !== 'hook' && record.kind !== 'mcp',
+						updateFor: (check) =>
+							remoteUpdateAct(
+								record,
+								check,
+								(target) => setUpdateReq({ item, record, target, links: record.links }),
+								gate
+							),
+					}
+				: null;
+
 			// ── Update (the Store's signed-registry path) ──
 			const entry = storeCatalog.find((e) => e.installedItem?.id === item.id) ?? null;
-			const update: NgwaAct =
-				entry?.isUpdate === true
+			const update: NgwaAct = remote
+				? // The row menu reads whatever check the detail already ran.
+					remote.updateFor(
+						remote.needsCheck
+							? toRemoteCheck(
+									qc.getQueryState(
+										obaCheckUpdateQueryOptions(record?.kind ?? 'skill', item.name).queryKey
+									) ?? { status: 'pending', fetchStatus: 'idle' }
+								)
+							: null
+					)
+				: entry?.isUpdate === true
 					? {
 							label: `Update to ${entry.latestVersion}`,
 							disabledReason: gate(undefined),
@@ -461,7 +761,15 @@ export function useNgwaItemActions({
 				};
 			}
 			let remove: NgwaAct;
-			if (pkg) {
+			if (remote && record) {
+				// R57: the dependents-aware safe delete (links → required-by →
+				// vault copy → unlink+delete | relink+delete | forget).
+				remove = {
+					label: 'Remove…',
+					disabledReason: gate(undefined),
+					run: () => setRemoveReq({ item, record }),
+				};
+			} else if (pkg) {
 				remove =
 					item.origin.source === 'builtin'
 						? { label: 'Remove…', disabledReason: BUILTIN_REMOVE_REASON, run: () => {} }
@@ -556,6 +864,7 @@ export function useNgwaItemActions({
 				copyIyke,
 				iyke,
 				briefChi,
+				remote,
 			};
 
 			function resetAct(it: NgwaItem, lbl: string): NgwaAct {
@@ -650,20 +959,63 @@ export function useNgwaItemActions({
 			settings.error,
 			settings.data,
 			qc,
+			vault.entries,
+			catalogEntries,
+			items,
 		]
 	);
 
+	const vaultChanged = useCallback(() => {
+		void qc.invalidateQueries({ queryKey: ngwaSnapshotQueryKey });
+		void qc.invalidateQueries({ queryKey: queryKeys.claudeStore.all });
+		void qc.invalidateQueries({ queryKey: queryKeys.claudeConfig.all });
+	}, [qc]);
+	const scopeLabel = useCallback((key: string) => ops.scopeLabel(key), [ops]);
+	const removeKind = removeReq?.record.kind ?? null;
+	const placementPath = useCallback(
+		(p: NgwaItem['placements'][number]) => placementTarget(p, removeKind),
+		[removeKind]
+	);
+
 	const dialog = (
-		<NgwaConfirmDialog
-			request={confirm}
-			onClose={(result) => {
-				const title = confirm?.title ?? '';
-				setConfirm(null);
-				if (result?.ok) setStatus({ tone: 'ok', text: `${title}: done` });
-				else if (result && !result.ok)
-					setStatus({ tone: 'err', text: `${title} failed: ${result.error}` });
-			}}
-		/>
+		<>
+			<NgwaConfirmDialog
+				request={confirm}
+				onClose={(result) => {
+					const title = confirm?.title ?? '';
+					setConfirm(null);
+					if (result?.ok) setStatus({ tone: 'ok', text: `${title}: done` });
+					else if (result && !result.ok)
+						setStatus({ tone: 'err', text: `${title} failed: ${result.error}` });
+				}}
+			/>
+			<RemoteUpdateDialog
+				request={updateReq}
+				onChanged={vaultChanged}
+				onRecheck={(rec) => {
+					void qc.invalidateQueries({
+						queryKey: obaCheckUpdateQueryOptions(rec.kind, rec.name).queryKey,
+					});
+					void qc.invalidateQueries({ queryKey: primitiveCatalogKey });
+				}}
+				onClose={(result) => {
+					setUpdateReq(null);
+					if (result) setStatus({ tone: result.ok ? 'ok' : 'err', text: result.text });
+				}}
+			/>
+			<RemoteRemoveDialog
+				request={removeReq}
+				items={items}
+				scopeLabel={scopeLabel}
+				placementPath={placementPath}
+				onChanged={vaultChanged}
+				onForgotten={(rec) => markForgotten(qc, rec)}
+				onClose={(result) => {
+					setRemoveReq(null);
+					if (result) setStatus({ tone: result.ok ? 'ok' : 'err', text: result.text });
+				}}
+			/>
+		</>
 	);
 
 	return { actionsFor, dialog, status };

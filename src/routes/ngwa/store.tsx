@@ -1,13 +1,19 @@
-// /ngwa/store — Ngwa Package Store (WP-15 / locked D-02).
+// /ngwa/store — Ngwa Package Store (WP-15 / locked D-02, R57 addendum).
 //
-// Mounts NgwaStoreSurface with enriched registry catalog and updates banner.
+// Mounts NgwaStoreSurface with enriched registry catalog and updates banner,
+// plus (R57) the signed primitive catalog's git / npx rows, Add from URL, and
+// the pinned catalog auto-update sweep on mount (Q3).
 
-import { useCallback } from 'react';
-import { createFileRoute } from '@tanstack/react-router';
+import { useCallback, useMemo } from 'react';
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { z } from 'zod';
+import { mergeCatalogIntoStore } from '@/lib/ngwa/enrichment';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import { useStoreInstall } from '@/lib/ngwa/use-store-install';
+import { useVaultEntries } from '@/lib/ngwa/use-vault-entries';
+import { useObaAutoUpdateOnMount } from '@/lib/queries/claude-config';
 import { fetchPkgVersionForStore } from '@/lib/registry/client';
+import { catalogPins, usePrimitiveCatalogResult } from '@/lib/registry/primitives';
 import { useRegistryIndex } from '@/lib/registry/use-registry';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { NgwaStoreSurface, type StoreDetailLoader } from '@/shell/ngwa/ngwa-store-surface';
@@ -22,9 +28,13 @@ const searchSchema = z.object({
 	kind: z.string().optional(),
 	sys: z.string().optional(),
 	search: z.string().optional(),
+	/** `ngwa.add-from-url`: open the Add from URL sheet. */
+	addurl: z.union([z.string(), z.number(), z.boolean()]).optional(),
 });
 
 function NgwaStorePage() {
+	const { addurl } = Route.useSearch();
+	const navigate = useNavigate();
 	const { items, storeCatalog, isLoading, error, refetch } = useNgwaSnapshot();
 	// The install sheet lazily reads the selected pkg's detail file, relative
 	// to the verified index URL (same query the snapshot hook already holds).
@@ -36,26 +46,68 @@ function NgwaStorePage() {
 		},
 		[indexUrl]
 	);
-	// Install / update through the shared signed-registry plan path.
-	const { install, update, updateAll } = useStoreInstall();
+	// Install / update through the shared signed-registry plan path, and (R57)
+	// the vault path for git / npx primitives.
+	const store = useStoreInstall();
 	const activeProjectName = useShellStore((s) => {
 		const p = s.projects.find((x) => x.id === s.activeProjectId);
 		return p?.display_name || p?.id;
 	});
 
+	// R57 · the signed catalog. A verify failure is an error, never the seed.
+	const catalogQuery = usePrimitiveCatalogResult();
+	const catalogEntries = catalogQuery.data?.entries ?? [];
+	const vault = useVaultEntries();
+	const { registry, primitives } = useMemo(
+		() => mergeCatalogIntoStore(storeCatalog, catalogEntries, vault.entries),
+		[storeCatalog, catalogEntries, vault.entries]
+	);
+	const catalogStatus = catalogQuery.isLoading
+		? 'loading'
+		: catalogQuery.error
+			? 'error'
+			: catalogQuery.data?.verified
+				? 'verified'
+				: 'seed';
+
+	// Q3: one auto-update sweep per Store mount, once the catalog is read, with
+	// its pins — a pinned catalog install moves only to its catalog pin.
+	const pins = useMemo(() => catalogPins(catalogEntries), [catalogEntries]);
+	useObaAutoUpdateOnMount(catalogQuery.isSuccess, pins);
+
+	const ctx = { catalog: catalogEntries, vault: vault.entries };
+
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
 			<NgwaTabs activeTab="store" installedCount={items.length} />
 			<NgwaStoreSurface
-				catalog={storeCatalog}
+				catalog={registry}
 				isLoading={isLoading}
 				error={error}
 				onRetry={refetch}
 				loadDetail={indexUrl ? loadDetail : undefined}
 				activeProjectName={activeProjectName}
-				onInstall={install}
-				onUpdate={update}
-				onUpdateAll={updateAll}
+				onInstall={store.install}
+				onUpdate={store.update}
+				onUpdateAll={store.updateAll}
+				primitives={primitives}
+				catalogEntries={catalogEntries}
+				vault={vault.entries}
+				catalogStatus={catalogStatus}
+				catalogError={catalogQuery.error ? (catalogQuery.error as Error).message : null}
+				onRecheckCatalog={() => void catalogQuery.refetch()}
+				onInstallPrimitive={(row, scope, onStage) =>
+					store.installPrimitive(row, scope, { ...ctx, onStage })
+				}
+				onUpdatePrimitive={store.updatePrimitive}
+				onResolveSource={store.resolveSource}
+				onInstallResolved={(resolved, scope, onStage) =>
+					store.installResolved(resolved, scope, { ...ctx, onStage })
+				}
+				onOpenInstalled={(name) =>
+					void navigate({ to: '/ngwa/installed', search: { search: name } })
+				}
+				initialAddUrl={addurl !== undefined}
 			/>
 		</div>
 	);

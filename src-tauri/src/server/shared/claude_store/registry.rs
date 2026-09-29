@@ -261,6 +261,8 @@ mod tests {
             updated_at: None,
             from_catalog: false,
             auto_update: false,
+            pinned: false,
+            hash: None,
         };
         let mut rf = RegistryFile::default();
         rf.entries
@@ -312,6 +314,8 @@ mod tests {
             updated_at: None,
             from_catalog: false,
             auto_update: false,
+            pinned: false,
+            hash: None,
         };
         let mut rf = RegistryFile::default();
         rf.entries

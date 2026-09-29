@@ -49,11 +49,17 @@ import {
 	type NgwaTranscodeMode,
 	type AutoUpdateSummary,
 	type InstallWithDepsResult,
+	type ObaCatalogPin,
 	type ObaRelinkRow,
 	type SafeDeleteOutcome,
 	type UpdateStatus,
 } from '@/lib/tauri-cmd';
-import type { PrimitiveCatalogEntry } from '@/lib/registry/primitives';
+import {
+	catalogGitRef,
+	catalogPin,
+	catalogRefs,
+	type PrimitiveCatalogEntry,
+} from '@/lib/registry/primitives';
 import { queryKeys } from '@/lib/query-keys';
 
 // Re-export the scan-result entry types plus the Ngwa Phase-2 cross-system
@@ -249,8 +255,15 @@ export function useObaInstall() {
 		// npx mechanism) and opts the entry into auto-update.
 		mutationFn: (entry) =>
 			entry.source === 'npx'
-				? obaInstallNpx(entry.kind, entry.name, entry.url, true)
-				: obaInstallGit(entry.kind, entry.name, entry.url, null, true),
+				? obaInstallNpx(entry.kind, entry.name, entry.url, true, catalogPin(entry))
+				: obaInstallGit(
+						entry.kind,
+						entry.name,
+						entry.url,
+						catalogGitRef(entry),
+						true,
+						catalogPin(entry)
+					),
 		onSuccess: invalidate,
 	});
 }
@@ -275,9 +288,10 @@ export function useObaInstallWithDeps() {
 				entry.name,
 				entry.source,
 				entry.url,
-				catalog.map((c) => ({ kind: c.kind, name: c.name, source: c.source, url: c.url })),
-				null,
-				true
+				catalogRefs(catalog),
+				catalogGitRef(entry),
+				true,
+				catalogPin(entry)
 			),
 		onSuccess: invalidate,
 	});
@@ -302,8 +316,10 @@ export function useObaUpdate() {
  */
 export function useObaAutoUpdateAll() {
 	const invalidate = useInvalidateClaudeStore();
-	return useMutation<AutoUpdateSummary, Error, void>({
-		mutationFn: () => obaAutoUpdateAll(),
+	return useMutation<AutoUpdateSummary, Error, ObaCatalogPin[] | undefined>({
+		// R57 · Q3: the signed catalog's pins — a pinned catalog install moves
+		// only to its pin, never to HEAD.
+		mutationFn: (pins) => obaAutoUpdateAll(pins ?? null),
 		onSuccess: (summary) => {
 			if (summary.updated.length > 0) invalidate();
 		},
@@ -316,13 +332,14 @@ export function useObaAutoUpdateAll() {
  * firing under React StrictMode's double-mount via a ref. Returns the mutation so
  * the surface can show in-flight / result state.
  */
-export function useObaAutoUpdateOnMount(enabled = true) {
+export function useObaAutoUpdateOnMount(enabled = true, pins?: ObaCatalogPin[]) {
 	const sweep = useObaAutoUpdateAll();
 	const fired = useRef(false);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: one sweep per mount, once enabled; the ref guards it and `pins` is read at that moment
 	useEffect(() => {
 		if (!enabled || fired.current) return;
 		fired.current = true;
-		sweep.mutate();
+		sweep.mutate(pins);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [enabled]);
 	return sweep;

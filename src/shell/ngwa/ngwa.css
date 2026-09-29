@@ -139,7 +139,9 @@
 	color: var(--fg-muted);
 	background: var(--bg-surface);
 	white-space: nowrap;
-	transition: background var(--motion-fast) var(--ease-calm), color var(--motion-fast) var(--ease-calm);
+	transition:
+		background var(--motion-fast) var(--ease-calm),
+		color var(--motion-fast) var(--ease-calm);
 	cursor: pointer;
 }
 
@@ -185,7 +187,7 @@
 	transition: transform var(--motion-fast) var(--ease-calm);
 }
 
-.view-ngwa .chip.disclose[aria-expanded='true'] .caret {
+.view-ngwa .chip.disclose[aria-expanded="true"] .caret {
 	transform: rotate(90deg);
 }
 
@@ -252,15 +254,31 @@
 	flex: none;
 }
 
-.view-ngwa .kind.k-app { color: var(--tint-project-fg, var(--info)); }
+.view-ngwa .kind.k-app {
+	color: var(--tint-project-fg, var(--info));
+}
 .view-ngwa .kind.k-engine,
-.view-ngwa .kind.k-agent { color: var(--tint-chi-fg, var(--agent, var(--achievement))); }
-.view-ngwa .kind.k-tool { color: var(--warning); }
-.view-ngwa .kind.k-skill { color: var(--success); }
-.view-ngwa .kind.k-command { color: var(--info); }
-.view-ngwa .kind.k-hook { color: var(--danger); }
-.view-ngwa .kind.k-workflow { color: var(--primary); }
-.view-ngwa .kind.k-schedule { color: var(--fg-muted); }
+.view-ngwa .kind.k-agent {
+	color: var(--tint-chi-fg, var(--agent, var(--achievement)));
+}
+.view-ngwa .kind.k-tool {
+	color: var(--warning);
+}
+.view-ngwa .kind.k-skill {
+	color: var(--success);
+}
+.view-ngwa .kind.k-command {
+	color: var(--info);
+}
+.view-ngwa .kind.k-hook {
+	color: var(--danger);
+}
+.view-ngwa .kind.k-workflow {
+	color: var(--primary);
+}
+.view-ngwa .kind.k-schedule {
+	color: var(--fg-muted);
+}
 
 .view-ngwa .meta {
 	font-size: var(--text-micro);
@@ -811,7 +829,7 @@
 }
 
 .view-ngwa .state::before {
-	content: '';
+	content: "";
 	width: 6px;
 	height: 6px;
 	border-radius: var(--radius-pill);
@@ -1146,7 +1164,6 @@
 	border-top: 1px solid var(--border-soft);
 	margin-top: var(--space-1);
 }
-
 
 /* ══════════════════════════════════════════════════════════════════════════
    WP-16a — matrix popover, confirm, status, health sub-lists (tokens only)
@@ -1671,8 +1688,6 @@
 	border-left: 1px solid var(--border);
 }
 
-
-
 /* ── Store install sheet (D-02, frame-workbench-v4.html `.sheetfoot`,
    `.kola`, `.consent*`, and the atoms the sheet shares with the pane body).
    Scoped to the Store's rows, strip and sheet so the Installed detail's
@@ -1749,14 +1764,14 @@
 }
 
 /* loading — an ember pulse inside the control, never a spinner */
-.view-ngwa .storesheet .btn[aria-busy='true'] {
+.view-ngwa .storesheet .btn[aria-busy="true"] {
 	color: var(--fg-muted);
 	position: relative;
 	cursor: progress;
 }
 
-.view-ngwa .storesheet .btn[aria-busy='true']::after {
-	content: '';
+.view-ngwa .storesheet .btn[aria-busy="true"]::after {
+	content: "";
 	position: absolute;
 	inset: 0;
 	border-radius: inherit;
@@ -1928,7 +1943,7 @@
 	cursor: pointer;
 }
 
-.view-ngwa .consent input[type='checkbox'] {
+.view-ngwa .consent input[type="checkbox"] {
 	appearance: none;
 	width: 14px;
 	height: 14px;
@@ -1942,17 +1957,17 @@
 	cursor: pointer;
 }
 
-.view-ngwa .consent input[type='checkbox']:hover {
+.view-ngwa .consent input[type="checkbox"]:hover {
 	border-color: var(--achievement);
 }
 
-.view-ngwa .consent input[type='checkbox']:checked {
+.view-ngwa .consent input[type="checkbox"]:checked {
 	background: var(--achievement);
 	border-color: var(--achievement);
 }
 
-.view-ngwa .consent input[type='checkbox']:checked::after {
-	content: '';
+.view-ngwa .consent input[type="checkbox"]:checked::after {
+	content: "";
 	width: 8px;
 	height: 5px;
 	border-left: 2px solid var(--bg-sunken);
@@ -2109,4 +2124,380 @@
 .view-ngwa .iykeline .cp:hover {
 	color: var(--fg);
 	background: var(--bg-raised);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   R57 · D-02 addendum — git / npx primitives in the Store, and the Installed
+   Update / Remove confirms for them (frame-workbench-v4.html, `R57` CSS).
+   Catalog rows reuse .srow; Add from URL reuses the sheet column, .consent
+   and the pieces below.
+   ══════════════════════════════════════════════════════════════════════════ */
+.view-ngwa .srcchip {
+	font-family: var(--font-mono);
+}
+
+.view-ngwa .facetbar .btn.addurl,
+.view-ngwa [data-slist] .empty .btn {
+	flex: none;
+	height: var(--btn-h-sm);
+	padding: 0 var(--space-3);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-micro);
+	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	border: 1px solid var(--border);
+	background: var(--bg-surface);
+	color: var(--fg-muted);
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+.view-ngwa .facetbar .btn.addurl:hover,
+.view-ngwa [data-slist] .empty .btn:hover {
+	background: var(--bg-raised);
+	color: var(--fg);
+	border-color: var(--border-strong);
+}
+
+.view-ngwa .facetbar .btn.addurl[aria-expanded="true"] {
+	background: var(--primary-soft);
+	border-color: var(--primary);
+	color: var(--fg);
+}
+
+.view-ngwa [data-slist] .empty .dacts {
+	margin-top: var(--space-2);
+}
+
+.view-ngwa .storesheet .bad {
+	color: var(--on-danger, var(--danger));
+}
+
+.view-ngwa .q2 {
+	margin-bottom: var(--space-3);
+}
+
+.view-ngwa .q2 .hint {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: var(--space-1);
+	line-height: 1.45;
+}
+
+.view-ngwa .storesheet .field {
+	margin-top: var(--space-2);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	padding: 0 var(--space-2);
+	height: var(--input-h, 30px);
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .storesheet .field:focus-within {
+	border-color: var(--primary);
+	box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.view-ngwa .storesheet .field[aria-disabled="true"] {
+	opacity: 0.6;
+}
+
+.view-ngwa .storesheet .field input {
+	flex: 1;
+	min-width: 0;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-family: var(--font-mono);
+	background: none;
+	border: 0;
+	outline: none;
+}
+
+.view-ngwa .storesheet .field .suffix {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+.view-ngwa .storesheet .seg {
+	display: inline-flex;
+	margin-top: var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	overflow: hidden;
+}
+
+.view-ngwa .storesheet .seg button {
+	height: 26px;
+	padding: 0 var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	background: transparent;
+	border: 0;
+	border-right: 1px solid var(--border);
+	cursor: pointer;
+}
+
+.view-ngwa .storesheet .seg button:last-child {
+	border-right: 0;
+}
+
+.view-ngwa .storesheet .seg button:hover:not(:disabled) {
+	background: var(--bg-raised);
+	color: var(--fg);
+}
+
+.view-ngwa .storesheet .seg button.on {
+	background: var(--primary-soft);
+	color: var(--fg);
+}
+
+.view-ngwa .storesheet .seg button[disabled] {
+	opacity: 0.4;
+	cursor: not-allowed;
+}
+
+.view-ngwa .trustbox {
+	display: flex;
+	gap: var(--space-2);
+	align-items: flex-start;
+	padding: var(--space-2);
+	border: 1px solid var(--danger-soft);
+	border-radius: var(--radius-md);
+	background: var(--bg-raised);
+	margin-top: var(--space-1);
+}
+
+.view-ngwa .trustbox .ico {
+	color: var(--on-danger, var(--danger));
+	flex: none;
+	margin-top: 2px;
+}
+
+.view-ngwa .trustbox.ok {
+	border-color: var(--systemic-soft);
+}
+
+.view-ngwa .trustbox.ok .ico {
+	color: var(--on-live, var(--live));
+}
+
+.view-ngwa .trustbox.err {
+	border-color: var(--danger);
+}
+
+.view-ngwa .trustbox .t1 {
+	display: block;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.view-ngwa .trustbox .t2 {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 2px;
+	line-height: 1.5;
+}
+
+.view-ngwa .trustbox code,
+.view-ngwa .sheetbody code {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--on-achievement, var(--achievement));
+	word-break: break-word;
+}
+
+/* The Installed Update / Remove confirms are portalled outside .view-ngwa. */
+[data-ngwa-remote].wide {
+	max-width: 600px;
+	width: 100%;
+}
+
+[data-ngwa-remote] .ngwa-confirm-body {
+	max-height: calc(100vh - 220px);
+	overflow-y: auto;
+}
+
+[data-ngwa-remote] .subhead {
+	font-size: var(--text-micro);
+	font-weight: 600;
+	letter-spacing: 0.1em;
+	text-transform: uppercase;
+	color: var(--fg-muted);
+	margin: var(--space-3) 0 var(--space-1);
+}
+
+[data-ngwa-remote] .subhead.first {
+	margin-top: var(--space-2);
+}
+
+[data-ngwa-remote] .drow {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 28px;
+	padding: var(--space-1) 0;
+	border-bottom: 1px solid var(--border-soft);
+	font-size: var(--text-caption);
+}
+
+[data-ngwa-remote] .drow .k2 {
+	width: 110px;
+	flex: none;
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+[data-ngwa-remote] .drow .k2.mono,
+[data-ngwa-remote] .mono,
+[data-ngwa-remote] .drow .val.mono {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+}
+
+[data-ngwa-remote] .drow .val {
+	flex: 1;
+	min-width: 0;
+	color: var(--fg);
+	overflow-wrap: anywhere;
+}
+
+[data-ngwa-remote] .drow .rt {
+	margin-left: auto;
+	flex: none;
+}
+
+[data-ngwa-remote] .meta,
+[data-ngwa-remote] .note,
+[data-ngwa-remote] .no {
+	color: var(--fg-muted);
+	font-size: var(--text-micro);
+}
+
+[data-ngwa-remote] .yes {
+	color: var(--on-live, var(--live));
+}
+
+[data-ngwa-remote] .warn {
+	color: var(--on-achievement, var(--achievement));
+}
+
+[data-ngwa-remote] .bad {
+	color: var(--on-danger, var(--danger));
+}
+
+[data-ngwa-remote] .choice {
+	display: flex;
+	gap: var(--space-2);
+	align-items: flex-start;
+	padding: var(--space-2);
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-md);
+	margin-top: var(--space-1);
+	cursor: pointer;
+}
+
+[data-ngwa-remote] .choice:hover {
+	border-color: var(--border-strong);
+}
+
+[data-ngwa-remote] .choice.on {
+	border-color: var(--primary);
+	background: var(--primary-soft);
+}
+
+[data-ngwa-remote] .choice[aria-disabled="true"] {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+[data-ngwa-remote] .choice input {
+	margin-top: 3px;
+	accent-color: var(--primary);
+	flex: none;
+}
+
+[data-ngwa-remote] .choice .c1 {
+	display: block;
+	font-size: var(--text-caption);
+	color: var(--fg);
+	font-weight: 500;
+}
+
+[data-ngwa-remote] .choice .c2 {
+	display: block;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	margin-top: 2px;
+	line-height: 1.45;
+}
+
+[data-ngwa-remote] .choice .chip {
+	margin-top: var(--space-1);
+	margin-right: var(--space-1);
+}
+
+[data-ngwa-remote] .relinkto {
+	margin-top: var(--space-2);
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 26px;
+	padding: 0 var(--space-2);
+	background: var(--bg-sunken);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg);
+	overflow-wrap: anywhere;
+}
+
+[data-ngwa-remote] .ackrow {
+	display: flex;
+	gap: var(--space-2);
+	align-items: flex-start;
+	margin-top: var(--space-3);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	cursor: pointer;
+	line-height: 1.45;
+}
+
+[data-ngwa-remote] .ackrow input {
+	margin-top: 1px;
+	accent-color: var(--primary);
+	flex: none;
+}
+
+[data-ngwa-remote] .emberbar {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
+[data-ngwa-remote] .emberbar i {
+	width: 7px;
+	height: 7px;
+	border-radius: var(--radius-pill);
+	background: var(--ember);
+	animation: ngwa-emberpulse 1.4s var(--ease-calm) infinite;
+	flex: none;
+}
+
+[data-ngwa-remote] .chip.on:not([disabled]) {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--primary-fg);
 }

@@ -195,6 +195,14 @@ export function NgwaItemDetailSurface({
 									<span>publisher: <span className="mono">{item.origin.publisher}</span></span>
 								</>
 							)}
+							{actions?.remote && (
+								<>
+									<span>·</span>
+									<span className="mono" data-remote-line>
+										{actions.remote.detailLine}
+									</span>
+								</>
+							)}
 						</div>
 					</div>
 				</div>
