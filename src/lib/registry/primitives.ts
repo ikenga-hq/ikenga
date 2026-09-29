@@ -21,7 +21,14 @@
 import { useQuery } from '@tanstack/react-query';
 import { semverCompare, verifyMinisign } from '@ikenga/registry-client';
 
-import type { ClaudeStoreEntry, ClaudeStoreKind, RequiresEntry } from '@/lib/tauri-cmd';
+import type {
+	CatalogEntryRef,
+	ClaudeStoreEntry,
+	ClaudeStoreKind,
+	ObaCatalogPin,
+	ObaPin,
+	RequiresEntry,
+} from '@/lib/tauri-cmd';
 import { PRIMITIVES_URL, REGISTRY_PUBKEY } from './client';
 import seed from './primitives-seed.json';
 
@@ -51,6 +58,13 @@ export interface PrimitiveCatalogEntry {
 	 *  Optional/default-empty so a non-bundle / pre-WP-18 catalog row (no
 	 *  `members`) still parses. Mirrors `members` on the Rust `CatalogEntryRef`. */
 	members?: string[];
+	/** R57 · Q3: the pin the signature covers — a git commit SHA (7–40 hex), or
+	 *  a tag / version when it is not hex. Absent → unpinned: the entry vouches
+	 *  for *where* only, and installs whatever the source serves today. */
+	ref?: string;
+	/** R57 · Q3: content hash of the primitive (`sha256-<64 hex>`), verified by
+	 *  the installer against what it fetched. */
+	hash?: string;
 }
 
 export interface PrimitiveCatalog {
@@ -114,11 +128,38 @@ function parseRequires(raw: unknown, i: number): RequiresEntry[] | undefined {
 	});
 }
 
+/** A git commit SHA (abbreviated to at least 7, at most 40 hex chars). */
+const SHA_RE = /^[0-9a-f]{7,40}$/i;
+/** A catalog content hash: `sha256-` + 64 hex chars. */
+const HASH_RE = /^sha256-[0-9a-f]{64}$/i;
+
+/** Validate an entry's optional R57 pin (`ref` / `hash`). Throws on a malformed
+ *  value — a signed catalog that carries a junk pin is rejected, never read as
+ *  "unpinned". Absent fields stay absent (backward compatible). */
+function parsePin(e: Record<string, unknown>, i: number): { ref?: string; hash?: string } {
+	const out: { ref?: string; hash?: string } = {};
+	if (e.ref !== undefined && e.ref !== null) {
+		if (typeof e.ref !== 'string' || !e.ref.trim() || /\s/.test(e.ref)) {
+			throw new Error(`primitives.json: entry ${i} has invalid ref ${JSON.stringify(e.ref)}`);
+		}
+		out.ref = e.ref;
+	}
+	if (e.hash !== undefined && e.hash !== null) {
+		if (typeof e.hash !== 'string' || !HASH_RE.test(e.hash)) {
+			throw new Error(
+				`primitives.json: entry ${i} has invalid hash ${JSON.stringify(e.hash)} (want sha256-<64 hex>)`
+			);
+		}
+		out.hash = e.hash;
+	}
+	return out;
+}
+
 /** Defensive runtime validation of a fetched catalog payload (there is no Zod
  *  schema for `primitives.json` in @ikenga/contract — the pkg index has one,
  *  primitives don't yet). Throws on a malformed payload so a verified-but-junk
  *  catalog is rejected loudly rather than rendering garbage rows. */
-function parseCatalog(json: unknown): PrimitiveCatalogEntry[] {
+export function parseCatalog(json: unknown): PrimitiveCatalogEntry[] {
 	if (typeof json !== 'object' || json === null) {
 		throw new Error('primitives.json: not an object');
 	}
@@ -155,8 +196,16 @@ function parseCatalog(json: unknown): PrimitiveCatalogEntry[] {
 			...(Array.isArray(e.members)
 				? { members: e.members.filter((m): m is string => typeof m === 'string') }
 				: {}),
+			...parsePin(e, i),
 		};
 	});
+}
+
+/** The catalog plus where it came from: `verified` = the remote, minisign-
+ *  verified; false = the bundled seed (the remote was absent). */
+export interface PrimitiveCatalogResult {
+	entries: PrimitiveCatalogEntry[];
+	verified: boolean;
 }
 
 /** Fetch + minisign-verify the remote primitive catalog (mirrors
@@ -166,6 +215,17 @@ function parseCatalog(json: unknown): PrimitiveCatalogEntry[] {
 export async function fetchPrimitiveCatalog(
 	signal?: AbortSignal
 ): Promise<PrimitiveCatalogEntry[]> {
+	return (await fetchPrimitiveCatalogResult(signal)).entries;
+}
+
+/** {@link fetchPrimitiveCatalog}, telling the verified remote from the seed. */
+export async function fetchPrimitiveCatalogResult(
+	signal?: AbortSignal
+): Promise<PrimitiveCatalogResult> {
+	const seedResult = (): PrimitiveCatalogResult => ({
+		entries: (seed as PrimitiveCatalog).primitives,
+		verified: false,
+	});
 	const sigUrl = `${PRIMITIVES_URL}.minisig`;
 	let raw: Uint8Array;
 	let signature: string;
@@ -180,7 +240,7 @@ export async function fetchPrimitiveCatalog(
 			console.warn(
 				`[primitives] remote catalog unavailable (${catRes.status}/${sigRes.status}); using bundled seed`
 			);
-			return (seed as PrimitiveCatalog).primitives;
+			return seedResult();
 		}
 		raw = new Uint8Array(await catRes.arrayBuffer());
 		signature = await sigRes.text();
@@ -189,7 +249,7 @@ export async function fetchPrimitiveCatalog(
 		console.warn(
 			`[primitives] remote catalog fetch failed (${(err as Error).message}); using bundled seed`
 		);
-		return (seed as PrimitiveCatalog).primitives;
+		return seedResult();
 	}
 
 	// Verify BEFORE parsing — same trust ordering as fetchIndex. A failure here
@@ -207,20 +267,121 @@ export async function fetchPrimitiveCatalog(
 	} catch (err) {
 		throw new Error(`primitives.json is not valid JSON: ${(err as Error).message}`);
 	}
-	return parseCatalog(json);
+	return { entries: parseCatalog(json), verified: true };
 }
 
 export const primitiveCatalogKey = ['registry', 'primitives'] as const;
 
-export function usePrimitiveCatalog() {
+const catalogQueryOptions = {
+	// The cached value is the {entries, verified} result; `usePrimitiveCatalog`
+	// selects the entries, `usePrimitiveCatalogResult` keeps the flag.
+	queryKey: [...primitiveCatalogKey, 'result'] as const,
+	queryFn: ({ signal }: { signal?: AbortSignal }) => fetchPrimitiveCatalogResult(signal),
+	// WP-10b fetches the remote signed catalog over the network, so cache it
+	// to match the pkg index cadence rather than re-fetching on every mount.
+	staleTime: 6 * 60 * 60 * 1000, // ~6h
+	refetchOnWindowFocus: false,
+};
+
+const selectEntries = (r: PrimitiveCatalogResult) => r.entries;
+
+export function usePrimitiveCatalog(opts: { enabled?: boolean } = {}) {
 	return useQuery({
-		queryKey: primitiveCatalogKey,
-		queryFn: ({ signal }) => fetchPrimitiveCatalog(signal),
-		// WP-10b fetches the remote signed catalog over the network, so cache it
-		// to match the pkg index cadence rather than re-fetching on every mount.
-		staleTime: 6 * 60 * 60 * 1000, // ~6h
-		refetchOnWindowFocus: false,
+		...catalogQueryOptions,
+		enabled: opts.enabled ?? true,
+		select: selectEntries,
 	});
+}
+
+/** The catalog with its `verified` flag (the Store's "catalog signed" line). */
+export function usePrimitiveCatalogResult(opts: { enabled?: boolean } = {}) {
+	return useQuery({ ...catalogQueryOptions, enabled: opts.enabled ?? true });
+}
+
+// ─── R57 · Q3 — pins ─────────────────────────────────────────────────────────
+
+/** True when `ref` reads as a git commit SHA (7–40 hex). */
+export function isShaRef(ref: string | null | undefined): ref is string {
+	return typeof ref === 'string' && SHA_RE.test(ref);
+}
+
+/** The pin an install/update of `entry` must match, or null when the entry is
+ *  unpinned. `sha` only when `ref` is a SHA (a tag/version `ref` is a git ref
+ *  to fetch, not a pin); `hash` whenever the entry carries one. */
+export function catalogPin(entry: PrimitiveCatalogEntry): ObaPin | null {
+	const sha = isShaRef(entry.ref) ? entry.ref : null;
+	const hash = entry.hash ?? null;
+	if (!sha && !hash) return null;
+	return { sha, hash };
+}
+
+/** True when the catalog pins `entry` (a SHA and/or a content hash). */
+export function isPinned(entry: PrimitiveCatalogEntry): boolean {
+	return catalogPin(entry) !== null;
+}
+
+/** The git ref to fetch `entry` at when it is not SHA-pinned (a tag/branch
+ *  `ref`), else null (the default branch — or the pinned SHA, via the pin). */
+export function catalogGitRef(entry: PrimitiveCatalogEntry): string | null {
+	return entry.ref && !isShaRef(entry.ref) ? entry.ref : null;
+}
+
+/** Two SHAs name the same commit: case-insensitive, one a prefix of the other
+ *  (the catalog may pin an abbreviated SHA; the vault records the full one). */
+export function shaMatches(a: string | null | undefined, b: string | null | undefined): boolean {
+	if (!a || !b) return false;
+	const x = a.toLowerCase();
+	const y = b.toLowerCase();
+	return x.startsWith(y) || y.startsWith(x);
+}
+
+/** A SHA shortened for display (7 chars); other strings are returned as-is. */
+export function shortSha(sha: string | null | undefined): string {
+	if (!sha) return '—';
+	return SHA_RE.test(sha) ? sha.slice(0, 7) : sha;
+}
+
+/**
+ * True when an installed catalog entry is behind its catalog pin: the
+ * recorded `version` is not the pinned SHA (prefix compare either way), or the
+ * recorded content `hash` differs from the pinned hash. A store entry with no
+ * recorded hash (pre-R57) is judged by the SHA when the pin has one, and
+ * counts as behind only when the pin is hash-only (nothing else to compare).
+ * An unpinned entry is never "behind" by this test.
+ */
+export function catalogPinMoved(store: ClaudeStoreEntry, entry: PrimitiveCatalogEntry): boolean {
+	const pin = catalogPin(entry);
+	if (!pin) return false;
+	if (pin.sha && !shaMatches(store.version ?? null, pin.sha)) return true;
+	if (pin.hash) {
+		if (store.hash) return store.hash.toLowerCase() !== pin.hash.toLowerCase();
+		return !pin.sha;
+	}
+	return false;
+}
+
+/** The catalog snapshot `obaInstallWithDeps` resolves deps against, pins
+ *  included so every catalogued dep is fetched at its pin. */
+export function catalogRefs(catalog: readonly PrimitiveCatalogEntry[]): CatalogEntryRef[] {
+	return catalog.map((c) => ({
+		kind: c.kind,
+		name: c.name,
+		source: c.source,
+		url: c.url,
+		...(c.members ? { members: c.members } : {}),
+		...(c.ref ? { ref: c.ref } : {}),
+		...(c.hash ? { hash: c.hash } : {}),
+	}));
+}
+
+/** The pins `obaAutoUpdateAll` moves pinned catalog installs to (Q3). */
+export function catalogPins(catalog: readonly PrimitiveCatalogEntry[]): ObaCatalogPin[] {
+	const out: ObaCatalogPin[] = [];
+	for (const c of catalog) {
+		const pin = catalogPin(c);
+		if (pin) out.push({ kind: c.kind, name: c.name, sha: pin.sha ?? null, hash: pin.hash ?? null });
+	}
+	return out;
 }
 
 export type PrimitiveStatus = 'installed' | 'updatable' | 'available';
@@ -240,10 +401,15 @@ export interface PrimitiveViewItem {
 }
 
 /** Merge the local store (what's installed) with the catalog (what's
- *  available) into one status-tagged list. Installed entries whose catalog
- *  version is newer than the recorded store version are `updatable`;
- *  catalog-only entries are `available`; everything else installed is
- *  `installed`. Store entries lead; catalog-only entries follow. */
+ *  available) into one status-tagged list. Catalog-only entries are
+ *  `available`. An installed entry is `updatable` when:
+ *   - the catalog entry is pinned (R57 · Q3), the store entry was installed
+ *     from the catalog (`fromCatalog`) and it has fallen behind the pin
+ *     ({@link catalogPinMoved}) — a pinned catalog install moves only when the
+ *     catalog moves the pin, and a same-named direct install is left alone;
+ *   - the catalog entry is unpinned and its semver is newer than the recorded
+ *     version (the pre-R57 rule; mostly moot, as the vault records SHAs).
+ *  Store entries lead; catalog-only entries follow. */
 export function mergePrimitiveView(
 	store: ClaudeStoreEntry[],
 	catalog: PrimitiveCatalogEntry[]
@@ -257,7 +423,9 @@ export function mergePrimitiveView(
 		const key = `${e.kind}:${e.name}`;
 		installed.add(key);
 		const cat = catByKey.get(key) ?? null;
-		const updatable = cat != null && e.version != null && semverCompare(e.version, cat.version) < 0;
+		let updatable = false;
+		if (cat && isPinned(cat)) updatable = e.fromCatalog === true && catalogPinMoved(e, cat);
+		else if (cat && e.version != null) updatable = semverLess(e.version, cat.version);
 		out.push({
 			key: `store:${key}`,
 			kind: e.kind,
@@ -282,6 +450,16 @@ export function mergePrimitiveView(
 		});
 	}
 	return out;
+}
+
+const SEMVER_RE = /^v?\d+\.\d+(\.\d+)?([-+].*)?$/;
+
+/** `semverCompare(a, b) < 0`; false when either side is not semver — the
+ *  vault records a git SHA as the version, which `semverCompare` would read
+ *  as garbage numbers. */
+function semverLess(a: string, b: string): boolean {
+	if (!SEMVER_RE.test(a) || !SEMVER_RE.test(b)) return false;
+	return semverCompare(a.replace(/^v/, ''), b.replace(/^v/, '')) < 0;
 }
 
 export const PRIMITIVE_STATUS_WORD: Record<PrimitiveStatus, string> = {
@@ -331,7 +509,7 @@ export interface ConsentDep {
  *  follow. `installedKeys` = `${kind}:${name}` of the local store. */
 export function resolveCatalogClosure(
 	target: PrimitiveCatalogEntry,
-	catalog: PrimitiveCatalogEntry[],
+	catalog: readonly PrimitiveCatalogEntry[],
 	installedKeys: ReadonlySet<string>
 ): ConsentDep[] {
 	const catByKey = new Map<string, PrimitiveCatalogEntry>();

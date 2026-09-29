@@ -8,8 +8,12 @@ import {
 	formatUsageTooltip,
 	resolveTrustFacet,
 	buildStoreCatalog,
+	mergeCatalogIntoStore,
+	registryMatchesCatalog,
 	storeKindFor,
 } from './enrichment';
+import type { PrimitiveCatalogEntry } from '@/lib/registry/primitives';
+import type { ClaudeStoreEntry } from '@/lib/tauri-cmd';
 
 function makeItem(partial: Partial<NgwaItem>): NgwaItem {
 	const id = partial.id ?? 'test-item';
@@ -242,9 +246,7 @@ describe('enrichment.ts', () => {
 		];
 
 		it('identifies update available for installed item with older version', () => {
-			const installed = [
-				makeItem({ id: 'groundwork', name: 'groundwork', version: '0.7.4' }),
-			];
+			const installed = [makeItem({ id: 'groundwork', name: 'groundwork', version: '0.7.4' })];
 			const catalog = buildStoreCatalog(installed, registryEntries);
 			const gw = catalog.find((c) => c.name === 'groundwork');
 			expect(gw).toBeDefined();
@@ -254,9 +256,7 @@ describe('enrichment.ts', () => {
 		});
 
 		it('marks non-installed registry entries correctly', () => {
-			const installed = [
-				makeItem({ id: 'groundwork', name: 'groundwork', version: '0.7.6' }),
-			];
+			const installed = [makeItem({ id: 'groundwork', name: 'groundwork', version: '0.7.6' })];
 			const catalog = buildStoreCatalog(installed, registryEntries);
 			const uninstalled = catalog.find((c) => c.name === 'new-uninstalled-skill');
 			expect(uninstalled).toBeDefined();
@@ -298,8 +298,114 @@ describe('enrichment.ts', () => {
 		});
 
 		it('buildStoreCatalog uses the mapped kind', () => {
-			const catalog = buildStoreCatalog([], [entry('@ikenga/mcp-browser', 'skill'), entry('@ikenga/pkg-content', 'embedded')]);
+			const catalog = buildStoreCatalog(
+				[],
+				[entry('@ikenga/mcp-browser', 'skill'), entry('@ikenga/pkg-content', 'embedded')]
+			);
 			expect(catalog.map((c) => c.kind)).toEqual(['tool', 'app']);
 		});
+	});
+});
+
+// ── R57 · catalog rows + Q2 dedupe ────────────────────────────────────────────
+
+describe('R57 · mergeCatalogIntoStore (Q2: one row per name)', () => {
+	const SHA = '9c41e07a1b2c3d4e5f60718293a4b5c6d7e8f901';
+	const cat = (name: string, over: Partial<PrimitiveCatalogEntry> = {}): PrimitiveCatalogEntry => ({
+		kind: 'skill',
+		name,
+		version: '0.1.0',
+		description: `${name} desc`,
+		source: 'npx',
+		url: `royalti-io/${name}`,
+		publisher: 'royalti-io',
+		...over,
+	});
+	const vaultEntry = (name: string, over: Partial<ClaudeStoreEntry> = {}): ClaudeStoreEntry => ({
+		kind: 'skill',
+		name,
+		storePath: `/vault/skills/${name}`,
+		description: null,
+		modifiedMs: 0,
+		enabledIn: ['workspace'],
+		...over,
+	});
+	const registry = buildStoreCatalog(
+		[],
+		[
+			{ name: '@ikenga/skill-groundwork', latest: '0.7.6', kind: 'skill' } as RegistryEntry,
+			{ name: '@ikenga/pkg-tasks', latest: '0.8.3', kind: 'app' } as RegistryEntry,
+		]
+	);
+
+	it('matches on kind + the registry name without scope and kind prefix', () => {
+		expect(registryMatchesCatalog('@ikenga/skill-groundwork', 'skill', cat('groundwork'))).toBe(
+			true
+		);
+		expect(registryMatchesCatalog('@ikenga/pkg-groundwork', 'skill', cat('groundwork'))).toBe(true);
+		expect(registryMatchesCatalog('groundwork', 'skill', cat('groundwork'))).toBe(true);
+		// Kinds never cross-match; other names never match.
+		expect(registryMatchesCatalog('@ikenga/skill-groundwork', 'app', cat('groundwork'))).toBe(
+			false
+		);
+		expect(
+			registryMatchesCatalog(
+				'@ikenga/skill-groundwork',
+				'skill',
+				cat('groundwork', { kind: 'agent' })
+			)
+		).toBe(false);
+		expect(registryMatchesCatalog('@ikenga/skill-groundworks', 'skill', cat('groundwork'))).toBe(
+			false
+		);
+	});
+
+	it('folds the duplicate into the registry row with an `also` note', () => {
+		const { registry: reg, primitives } = mergeCatalogIntoStore(
+			registry,
+			[cat('groundwork'), cat('impeccable')],
+			[]
+		);
+		expect(primitives.map((p) => p.name)).toEqual(['impeccable']);
+		const gw = reg.find((r) => r.name === '@ikenga/skill-groundwork');
+		expect(gw?.alsoFrom).toEqual({ source: 'npx', url: 'royalti-io/groundwork' });
+		expect(reg.find((r) => r.name === '@ikenga/pkg-tasks')?.alsoFrom).toBeUndefined();
+		// The input rows are not mutated.
+		expect(registry[0].alsoFrom).toBeUndefined();
+	});
+
+	it('builds catalog rows with installed state, mcp kind, and a pin-moved update', () => {
+		const { primitives } = mergeCatalogIntoStore(
+			[],
+			[
+				cat('design-language', { ref: SHA }),
+				cat('subagent-model-floor', { kind: 'hook', source: 'git', url: 'https://x/hooks' }),
+				cat('browser', { kind: 'mcp', source: 'git', url: 'https://x/mcp' }),
+				cat('fresh'),
+			],
+			[
+				vaultEntry('design-language', { version: '3e1a9c0ffff', fromCatalog: true }),
+				vaultEntry('subagent-model-floor', { kind: 'hook', fromCatalog: true }),
+			]
+		);
+		const by = Object.fromEntries(primitives.map((p) => [p.name, p]));
+		expect(by['design-language'].id).toBe('cat:skill:design-language');
+		expect(by['design-language'].installed?.name).toBe('design-language');
+		expect(by['design-language'].isUpdate).toBe(true);
+		expect(by['subagent-model-floor'].kind).toBe('hook');
+		expect(by['subagent-model-floor'].isUpdate).toBe(false);
+		expect(by.browser.kind).toBe('mcp');
+		expect(by.browser.storeKind).toBe('mcp');
+		expect(by.fresh.installed).toBeNull();
+		expect(by.fresh.isUpdate).toBe(false);
+	});
+
+	it('a direct (non-catalog) install of a pinned name is not a catalog update', () => {
+		const { primitives } = mergeCatalogIntoStore(
+			[],
+			[cat('design-language', { ref: SHA })],
+			[vaultEntry('design-language', { version: '3e1a9c0ffff', fromCatalog: false })]
+		);
+		expect(primitives[0].isUpdate).toBe(false);
 	});
 });

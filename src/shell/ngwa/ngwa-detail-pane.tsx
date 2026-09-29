@@ -23,7 +23,12 @@ import {
 } from 'lucide-react';
 import type { NgwaItem } from '@ikenga/contract';
 import { resolveTrustFacet } from '@/lib/ngwa/enrichment';
-import type { NgwaAct, NgwaItemActionSet, NgwaScopePick } from '@/lib/ngwa/use-ngwa-actions';
+import {
+	useRemoteCheck,
+	type NgwaAct,
+	type NgwaItemActionSet,
+	type NgwaScopePick,
+} from '@/lib/ngwa/use-ngwa-actions';
 import { NgwaPopMenu } from './ngwa-scope-ops';
 
 export interface NgwaDetailPaneProps {
@@ -39,6 +44,7 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 	const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
 
 	const trustFacet = resolveTrustFacet(item.trust);
+	const remote = actions?.remote ?? null;
 
 	function toggleFolder(key: string) {
 		setOpenFolders((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -72,6 +78,19 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 							publisher: <span className="mono">{item.origin.publisher}</span>
 						</span>
 					)}
+					{remote && (
+						<span
+							className="mono"
+							data-remote-line
+							title={
+								remote.record.fromCatalog
+									? 'installed from the curated catalog'
+									: 'installed from a URL'
+							}
+						>
+							{remote.detailLine}
+						</span>
+					)}
 				</div>
 
 				{item.description && (
@@ -80,7 +99,12 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 					</p>
 				)}
 
-				{actions && <DetailActions actions={actions} />}
+				{actions &&
+					(remote ? (
+						<RemoteDetailActions actions={actions} />
+					) : (
+						<DetailActions actions={actions} />
+					))}
 			</div>
 
 			{/* ── Tabs ── */}
@@ -180,9 +204,7 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 							<>
 								<div className="t d1" style={{ paddingLeft: '20px' }}>
 									<FileText className="h-3.5 w-3.5" />
-									<span className="f">
-										{item.kind === 'skill' ? 'SKILL.md' : 'manifest.json'}
-									</span>
+									<span className="f">{item.kind === 'skill' ? 'SKILL.md' : 'manifest.json'}</span>
 									<span className="c">{item.version ?? '—'}</span>
 								</div>
 								<div className="t d1" style={{ paddingLeft: '20px' }}>
@@ -218,7 +240,9 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 								{item.trust.perms.fs_write_outside_sandbox.length > 0 && (
 									<div className="drow">
 										<span className="k2 mono">fs_write</span>
-										<span className="val">{item.trust.perms.fs_write_outside_sandbox.join(', ')}</span>
+										<span className="val">
+											{item.trust.perms.fs_write_outside_sandbox.join(', ')}
+										</span>
 									</div>
 								)}
 							</>
@@ -286,6 +310,17 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 	);
 }
 
+/** R57 · Q4: a git / npx item's action row. A direct install checks its
+ *  remote while its detail is open (a `git ls-remote`); a pinned catalog
+ *  install compares with the catalog pin and needs no network. */
+function RemoteDetailActions({ actions }: { actions: NgwaItemActionSet }) {
+	const remote = actions.remote ?? null;
+	const check = useRemoteCheck(remote);
+	return (
+		<DetailActions actions={remote ? { ...actions, update: remote.updateFor(check) } : actions} />
+	);
+}
+
 /** D-02 `.dacts`: Disable/Enable · Move… · Copy to… · Update · Open folder ·
  *  Remove… (danger) · Hand to Chi (primary). A disabled action keeps its
  *  reason as its title. */
@@ -293,17 +328,28 @@ function DetailActions({ actions }: { actions: NgwaItemActionSet }) {
 	const on = actions.toggle.label === 'Disable';
 	return (
 		<div className="dacts" data-dacts>
-			<ActButton act={actions.toggle} icon={on ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />} />
+			<ActButton
+				act={actions.toggle}
+				icon={on ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+			/>
 			<PickButton pick={actions.move} label="Move…" icon={<MoveRight className="h-3 w-3" />} />
 			<PickButton pick={actions.copy} label="Copy to…" icon={<Copy className="h-3 w-3" />} />
 			<ActButton
 				act={{ ...actions.update, label: 'Update' }}
 				icon={<Download className="h-3 w-3" />}
-				title={actions.update.disabledReason ?? actions.update.label}
+				title={actions.update.disabledReason ?? actions.update.title ?? actions.update.label}
 			/>
 			<ActButton act={actions.openFolder} icon={<Folder className="h-3 w-3" />} />
-			<ActButton act={actions.remove} icon={<Trash2 className="h-3 w-3" />} className="chip danger" />
-			<ActButton act={actions.handToChi} icon={<Sparkles className="h-3 w-3" />} className="chip on" />
+			<ActButton
+				act={actions.remove}
+				icon={<Trash2 className="h-3 w-3" />}
+				className="chip danger"
+			/>
+			<ActButton
+				act={actions.handToChi}
+				icon={<Sparkles className="h-3 w-3" />}
+				className="chip on"
+			/>
 		</div>
 	);
 }
@@ -332,7 +378,15 @@ function ActButton({
 	);
 }
 
-function PickButton({ pick, label, icon }: { pick: NgwaScopePick; label: string; icon: React.ReactNode }) {
+function PickButton({
+	pick,
+	label,
+	icon,
+}: {
+	pick: NgwaScopePick;
+	label: string;
+	icon: React.ReactNode;
+}) {
 	const [open, setOpen] = useState(false);
 	const ref = useRef<HTMLButtonElement>(null);
 	const close = useCallback(() => setOpen(false), []);

@@ -13,9 +13,9 @@
 // for the selected row. Rows that haven't been read say so ("permissions not
 // read") rather than guessing.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Check, ChevronDown, Download, Search, Shield, X } from 'lucide-react';
+import { Check, Download, Link2, Search, Shield, X } from 'lucide-react';
 import { ErrorState, LoadingState, OfflineState } from '@/components/states';
 import {
 	Dialog,
@@ -25,7 +25,17 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from '@/components/ui/dialog';
-import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
+import type { NgwaCatalogRow, NgwaStoreEntry, StoreSource } from '@/lib/ngwa/enrichment';
+import type { PrimitiveInstallOutcome, PrimitiveInstallStage } from '@/lib/ngwa/use-store-install';
+import {
+	catalogPin,
+	resolveCatalogClosure,
+	shortSha,
+	type ConsentDep,
+	type PrimitiveCatalogEntry,
+} from '@/lib/registry/primitives';
+import type { ClaudeStoreEntry, ClaudeStoreKind, ResolvedSource } from '@/lib/tauri-cmd';
+import { AddUrlSheet, CatalogSheet, CatalogStoreRow, InstallSplit } from './ngwa-store-primitives';
 import {
 	asksLabel,
 	closureLabel,
@@ -74,6 +84,43 @@ export interface NgwaStoreSurfaceProps {
 	onUpdate?: (entry: NgwaStoreEntry) => void | Promise<unknown>;
 	/** Update every pending entry after the review dialog is confirmed. */
 	onUpdateAll?: (entries: NgwaStoreEntry[]) => void | Promise<unknown>;
+
+	// ── R57 · git / npx primitives ──
+	/** Signed-catalog rows, listed after the registry pkgs (Q2 duplicates
+	 *  already folded into their registry row). */
+	primitives?: NgwaCatalogRow[];
+	/** The whole signed catalog (closures resolve against it). */
+	catalogEntries?: PrimitiveCatalogEntry[];
+	/** The vault as listed now (the closure's "already installed"). */
+	vault?: ClaudeStoreEntry[];
+	/** `verified` = the remote, minisign-verified; `seed` = the bundled copy
+	 *  (remote absent); `error` = the remote failed to verify — nothing from
+	 *  it is listed, and the seed is never substituted. */
+	catalogStatus?: 'loading' | 'verified' | 'seed' | 'error';
+	catalogError?: string | null;
+	onRecheckCatalog?: () => void;
+	onInstallPrimitive?: (
+		row: NgwaCatalogRow,
+		scope: StoreInstallScope,
+		onStage: (s: PrimitiveInstallStage) => void
+	) => Promise<PrimitiveInstallOutcome>;
+	/** Q4: move a catalog install to its catalog pin. */
+	onUpdatePrimitive?: (row: NgwaCatalogRow) => Promise<unknown>;
+	/** Add from URL: the dry-run resolve (N-B). */
+	onResolveSource?: (
+		url: string,
+		opts: { kind: ClaudeStoreKind | null; name: string | null; gitRef: string | null }
+	) => Promise<ResolvedSource>;
+	/** Add from URL: install what was resolved, pinned, then place it. */
+	onInstallResolved?: (
+		resolved: ResolvedSource,
+		scope: StoreInstallScope,
+		onStage: (s: PrimitiveInstallStage) => void
+	) => Promise<PrimitiveInstallOutcome>;
+	/** Done state's "Open in Installed". */
+	onOpenInstalled?: (name: string) => void;
+	/** Open Add from URL on mount (the `ngwa.add-from-url` command). */
+	initialAddUrl?: boolean;
 }
 
 type PendingAction = 'install' | 'update';
@@ -94,7 +141,55 @@ const STORE_KINDS = [
 	{ id: 'tool', label: 'tool' },
 	{ id: 'skill', label: 'skill' },
 	{ id: 'bundle', label: 'bundle' },
+	// R57: catalog hooks (and MCP entries, when the catalog carries one).
+	{ id: 'hook', label: 'hook' },
+	{ id: 'mcp', label: 'mcp' },
 ];
+
+/** R57 Source chips: where a row installs FROM. */
+const STORE_SOURCES: Array<{ id: StoreSource; label: string }> = [
+	{ id: 'registry', label: 'registry' },
+	{ id: 'git', label: 'git' },
+	{ id: 'npx', label: 'npx' },
+];
+
+/** A catalog row or a registry row, as the list filters them. */
+interface FacetFields {
+	kind: string;
+	trust: string;
+	source: StoreSource;
+	text: string;
+}
+
+const registryFacets = (c: NgwaStoreEntry): FacetFields => ({
+	kind: c.kind,
+	trust: c.trustFacet,
+	source: 'registry',
+	text: `${c.name} ${c.displayName} ${c.description ?? ''}`,
+});
+const catalogFacets = (r: NgwaCatalogRow): FacetFields => ({
+	// The catalog's signature covers the entry, not the files it points at.
+	kind: r.kind,
+	trust: 'unsigned',
+	source: r.source,
+	text: `${r.name} ${r.description ?? ''} ${r.url}`,
+});
+
+/** Does a row pass the active Kind / Trust / Source / search filters? */
+function passesFacets(
+	f: FacetFields,
+	on: { kind: string; trust: string; source: StoreSource | null; search: string }
+): boolean {
+	if (on.kind !== '*' && f.kind !== on.kind) return false;
+	if (on.trust !== '*' && f.trust !== on.trust) return false;
+	if (on.source && f.source !== on.source) return false;
+	const q = on.search.trim().toLowerCase();
+	return !q || f.text.toLowerCase().includes(q);
+}
+
+const NO_PRIMITIVES: NgwaCatalogRow[] = [];
+const NO_CATALOG: PrimitiveCatalogEntry[] = [];
+const NO_VAULT: ClaudeStoreEntry[] = [];
 
 const STORE_TRUSTS = [
 	{ id: '*', label: 'all' },
@@ -142,11 +237,37 @@ export function NgwaStoreSurface({
 	onInstall,
 	onUpdate,
 	onUpdateAll,
+	primitives = NO_PRIMITIVES,
+	catalogEntries = NO_CATALOG,
+	vault = NO_VAULT,
+	catalogStatus,
+	catalogError = null,
+	onRecheckCatalog,
+	onInstallPrimitive,
+	onUpdatePrimitive,
+	onResolveSource,
+	onInstallResolved,
+	onOpenInstalled,
+	initialAddUrl = false,
 }: NgwaStoreSurfaceProps) {
 	const [search, setSearch] = useState('');
 	const [kindFilter, setKindFilter] = useState('*');
 	const [trustFilter, setTrustFilter] = useState('*');
+	const [sourceFilter, setSourceFilter] = useState<StoreSource | null>(null);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
+	// R57: Add from URL occupies the sheet column; `seed` is the Source it
+	// opens with (an empty search hands its query over), `n` remounts it.
+	const [addUrl, setAddUrl] = useState<{ seed: string; n: number } | null>(
+		initialAddUrl ? { seed: '', n: 0 } : null
+	);
+	const openAddUrl = (seed = '') => {
+		setSelectedId(null);
+		setAddUrl((a) => ({ seed, n: (a?.n ?? 0) + 1 }));
+	};
+	const selectRow = (id: string) => {
+		setAddUrl(null);
+		setSelectedId(id);
+	};
 	const [reviewOpen, setReviewOpen] = useState(false);
 	const [trustReviewItem, setTrustReviewItem] = useState<NgwaItem | null>(null);
 	// In-flight install/update per entry, and its last failure. Lifted here so
@@ -184,64 +305,129 @@ export function NgwaStoreSurface({
 	const update = onUpdate
 		? (entry: NgwaStoreEntry) => {
 				// The foot is where progress and failures read, so open the row.
-				setSelectedId(entry.id);
+				selectRow(entry.id);
 				void runAction(entry, 'update', () => onUpdate(entry));
 			}
 		: undefined;
 
-	async function updateAll(entries: NgwaStoreEntry[]) {
-		if (!onUpdateAll || updateAllBusy) return;
-		setUpdateAllError(null);
-		let result: unknown;
+	// R57 · Q4: a catalog install moves to its catalog pin. Same pending /
+	// error bookkeeping as a registry update, keyed by the row id.
+	async function runPrimitiveUpdate(row: NgwaCatalogRow) {
+		if (!onUpdatePrimitive || pending[row.id]) return;
+		setActionErrors(({ [row.id]: _drop, ...rest }) => rest);
+		setPending((m) => ({ ...m, [row.id]: 'update' }));
 		try {
-			result = onUpdateAll(entries);
+			await onUpdatePrimitive(row);
 		} catch (e) {
-			setUpdateAllError(errText(e));
+			setActionErrors((m) => ({ ...m, [row.id]: errText(e) }));
+		} finally {
+			setPending(({ [row.id]: _drop, ...rest }) => rest);
+		}
+	}
+	const updatePrimitive = onUpdatePrimitive
+		? (row: NgwaCatalogRow) => {
+				selectRow(row.id);
+				void runPrimitiveUpdate(row);
+			}
+		: undefined;
+
+	const updateEntries = useMemo(() => catalog.filter((c) => c.isUpdate), [catalog]);
+	// Q4: catalog installs whose pin moved join the strip; hook / MCP entries
+	// can't be updated in place, so `isUpdate` is never set on them.
+	const primitiveUpdates = useMemo(() => primitives.filter((r) => r.isUpdate), [primitives]);
+	const updateCount = updateEntries.length + primitiveUpdates.length;
+	const canUpdateAll =
+		(updateEntries.length === 0 || Boolean(onUpdateAll)) &&
+		(primitiveUpdates.length === 0 || Boolean(onUpdatePrimitive)) &&
+		updateCount > 0;
+
+	async function updateAll() {
+		if (!canUpdateAll || updateAllBusy) return;
+		setUpdateAllError(null);
+		const failures: string[] = [];
+		let registryRun: unknown;
+		try {
+			registryRun = updateEntries.length && onUpdateAll ? onUpdateAll(updateEntries) : undefined;
+		} catch (e) {
+			failures.push(errText(e));
+		}
+		const ids = [...updateEntries.map((e) => e.id), ...primitiveUpdates.map((r) => r.id)];
+		if (!isPromise(registryRun) && primitiveUpdates.length === 0) {
+			if (failures.length) setUpdateAllError(failures.join('; '));
 			return;
 		}
-		if (!isPromise(result)) return;
 		setUpdateAllBusy(true);
-		setPending((m) => ({ ...m, ...Object.fromEntries(entries.map((e) => [e.id, 'update'])) }));
+		setPending((m) => ({ ...m, ...Object.fromEntries(ids.map((id) => [id, 'update'])) }));
 		try {
-			await result;
-		} catch (e) {
-			setUpdateAllError(errText(e));
+			if (isPromise(registryRun)) {
+				try {
+					await registryRun;
+				} catch (e) {
+					failures.push(errText(e));
+				}
+			}
+			// One failing primitive must not stop the rest (batch-updater rule).
+			for (const row of primitiveUpdates) {
+				try {
+					await onUpdatePrimitive?.(row);
+				} catch (e) {
+					failures.push(`${row.name}: ${errText(e)}`);
+				}
+			}
+			if (failures.length) setUpdateAllError(failures.join('; '));
 		} finally {
 			setUpdateAllBusy(false);
 			setPending((m) => {
 				const next = { ...m };
-				for (const e of entries) delete next[e.id];
+				for (const id of ids) delete next[id];
 				return next;
 			});
 		}
 	}
 
-	const updateEntries = useMemo(() => catalog.filter((c) => c.isUpdate), [catalog]);
-
-	const filtered = useMemo(() => {
-		return catalog.filter((c) => {
-			if (kindFilter !== '*' && c.kind !== kindFilter) return false;
-			if (trustFilter !== '*' && c.trustFacet !== trustFilter) return false;
-			if (search.trim()) {
-				const q = search.toLowerCase();
-				const text = `${c.name} ${c.displayName} ${c.description ?? ''}`.toLowerCase();
-				if (!text.includes(q)) return false;
-			}
-			return true;
-		});
-	}, [catalog, kindFilter, trustFilter, search]);
+	const filters = useMemo(
+		() => ({ kind: kindFilter, trust: trustFilter, source: sourceFilter, search }),
+		[kindFilter, trustFilter, sourceFilter, search]
+	);
+	const filtered = useMemo(
+		() => catalog.filter((c) => passesFacets(registryFacets(c), filters)),
+		[catalog, filters]
+	);
+	const filteredPrimitives = useMemo(
+		() => primitives.filter((r) => passesFacets(catalogFacets(r), filters)),
+		[primitives, filters]
+	);
 
 	const counts = useMemo(() => {
+		const all = [...catalog.map(registryFacets), ...primitives.map(catalogFacets)];
 		const kCounts: Record<string, number> = {};
 		for (const k of STORE_KINDS) {
-			kCounts[k.id] = catalog.filter((c) => k.id === '*' || c.kind === k.id).length;
+			kCounts[k.id] = all.filter((c) => k.id === '*' || c.kind === k.id).length;
 		}
 		const tCounts: Record<string, number> = {};
 		for (const t of STORE_TRUSTS) {
-			tCounts[t.id] = catalog.filter((c) => t.id === '*' || c.trustFacet === t.id).length;
+			tCounts[t.id] = all.filter((c) => t.id === '*' || c.trust === t.id).length;
 		}
-		return { kinds: kCounts, trusts: tCounts };
-	}, [catalog]);
+		const sCounts: Record<string, number> = {};
+		for (const s of STORE_SOURCES) sCounts[s.id] = all.filter((c) => c.source === s.id).length;
+		return { kinds: kCounts, trusts: tCounts, sources: sCounts, total: all.length };
+	}, [catalog, primitives]);
+
+	// The Kind facet shows `hook` once the catalog lists (R57), `mcp` only when
+	// it has one; everything else as D-02 locked it.
+	const kindChips = STORE_KINDS.filter((k) => k.id !== 'mcp' || (counts.kinds.mcp ?? 0) > 0).filter(
+		(k) => k.id !== 'hook' || primitives.length > 0 || (counts.kinds.hook ?? 0) > 0
+	);
+
+	// R57: the closure of each catalog row, read from the catalog (no fetch).
+	const installedKeys = useMemo(() => new Set(vault.map((e) => `${e.kind}:${e.name}`)), [vault]);
+	const closures = useMemo(() => {
+		const m = new Map<string, ConsentDep[]>();
+		for (const r of primitives) {
+			m.set(r.id, resolveCatalogClosure(r.entry, catalogEntries, installedKeys));
+		}
+		return m;
+	}, [primitives, catalogEntries, installedKeys]);
 
 	// D-02: nothing is selected until the user picks a row — the sheet then
 	// reads that row's closure and permissions. A selection survives the
@@ -250,27 +436,51 @@ export function NgwaStoreSurface({
 		() => (selectedId ? (catalog.find((c) => c.id === selectedId) ?? null) : null),
 		[catalog, selectedId]
 	);
+	const selectedPrimitive = useMemo(
+		() => (selectedId ? (primitives.find((r) => r.id === selectedId) ?? null) : null),
+		[primitives, selectedId]
+	);
 
 	const projectLabel = activeProjectName || 'active project';
+	const shownCount = filtered.length + filteredPrimitives.length;
+	const indexLine =
+		catalogStatus === 'verified'
+			? 'index + catalog signed'
+			: catalogStatus === 'seed'
+				? 'index signed · catalog bundled (remote absent)'
+				: catalogStatus === 'error'
+					? 'index signed · catalog unavailable'
+					: catalogStatus === 'loading'
+						? 'index signed · reading the catalog'
+						: 'registry index signed';
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
 			{/* ── Updates strip ── */}
-			{updateEntries.length > 0 && (
+			{updateCount > 0 && (
 				<div className="updates" data-updates>
 					<Download className="h-4 w-4 flex-none" />
 					<b data-updcount>
-						{updateEntries.length} {updateEntries.length === 1 ? 'update' : 'updates'} available
+						{updateCount} {updateCount === 1 ? 'update' : 'updates'} available
 					</b>
-					{updateEntries.slice(0, 2).map((upd) => (
-						<span key={upd.id} className="who">
-							{upd.displayName} {upd.version} → {upd.latestVersion}
-						</span>
-					))}
-					{updateEntries.length > 2 && (
-						<span className="who">+{updateEntries.length - 2} more</span>
-					)}
-					{onUpdateAll && (
+					{[
+						...updateEntries.map((upd) => ({
+							id: upd.id,
+							text: `${upd.displayName} ${upd.version} → ${upd.latestVersion}`,
+						})),
+						...primitiveUpdates.map((r) => ({
+							id: r.id,
+							text: `${r.name} ${shortSha(r.installed?.version)} → ${shortSha(catalogPin(r.entry)?.sha ?? catalogPin(r.entry)?.hash?.slice(7, 14))}`,
+						})),
+					]
+						.slice(0, 2)
+						.map((w) => (
+							<span key={w.id} className="who">
+								{w.text}
+							</span>
+						))}
+					{updateCount > 2 && <span className="who">+{updateCount - 2} more</span>}
+					{canUpdateAll && (
 						<span className="rt">
 							{updateAllError && (
 								<span className="upderr" role="alert">
@@ -285,7 +495,7 @@ export function NgwaStoreSurface({
 								aria-busy={updateAllBusy || undefined}
 								onClick={() => setReviewOpen(true)}
 							>
-								{updateAllBusy ? 'Updating…' : `Update all (${updateEntries.length})`}
+								{updateAllBusy ? 'Updating…' : `Update all (${updateCount})`}
 							</button>
 						</span>
 					)}
@@ -305,11 +515,25 @@ export function NgwaStoreSurface({
 							onChange={(e) => setSearch(e.target.value)}
 						/>
 					</div>
+					{/* R57 · Q1: the entry point sits beside search — what you reach
+					    for when search comes up empty, in the same eye-line. */}
+					{onResolveSource && (
+						<button
+							type="button"
+							className="btn addurl"
+							data-addurl
+							aria-expanded={addUrl !== null}
+							title="Install a skill, agent or command from a git URL or an npx package"
+							onClick={() => openAddUrl('')}
+						>
+							<Link2 className="h-3.5 w-3.5" /> Add from URL…
+						</button>
+					)}
 
 					<span className="toolsep" />
 
 					<span className="flabel">Kind</span>
-					{STORE_KINDS.map((k) => {
+					{kindChips.map((k) => {
 						const on = kindFilter === k.id;
 						return (
 							<button
@@ -346,10 +570,39 @@ export function NgwaStoreSurface({
 						);
 					})}
 
-					<span className="meta" style={{ marginLeft: 'auto' }} data-store-count>
-						registry index signed
-						{!isLoading && !error && catalog.length > 0
-							? ` · ${filtered.length} of ${catalog.length} shown`
+					{primitives.length > 0 && (
+						<>
+							<span className="toolsep" />
+							<span className="flabel" style={{ width: 'auto' }}>
+								Source
+							</span>
+							{STORE_SOURCES.map((s) => {
+								const on = sourceFilter === s.id;
+								return (
+									<button
+										key={s.id}
+										type="button"
+										data-source={s.id}
+										className={`chip srcchip ${on ? 'on' : ''}`}
+										aria-pressed={on}
+										onClick={() => setSourceFilter(on ? null : s.id)}
+									>
+										{s.label} <span className="n">{counts.sources[s.id] ?? 0}</span>
+									</button>
+								);
+							})}
+						</>
+					)}
+
+					<span
+						className="meta"
+						style={{ marginLeft: 'auto' }}
+						data-store-count
+						title="The registry index and the curated catalog are both signed; the files they point at are not"
+					>
+						{indexLine}
+						{!isLoading && !error && counts.total > 0
+							? ` · ${shownCount} of ${counts.total} shown`
 							: ''}
 					</span>
 				</div>
@@ -373,10 +626,23 @@ export function NgwaStoreSurface({
 							/>
 						)}
 
-						{!isLoading && !error && filtered.length === 0 && (
-							<div className="empty">
-								Nothing in the registry matches. The index is fetched whole and filtered locally, so
-								this is the real answer, not a slow query.
+						{!isLoading && !error && shownCount === 0 && (
+							<div className="empty" data-store-empty>
+								{primitives.length > 0
+									? 'Nothing in the registry or the catalog matches. Both are fetched whole and filtered locally, so this is the real answer, not a slow query.'
+									: 'Nothing in the registry matches. The index is fetched whole and filtered locally, so this is the real answer, not a slow query.'}
+								{onResolveSource && (
+									<div className="dacts">
+										<button
+											type="button"
+											className="btn"
+											data-addurl-empty
+											onClick={() => openAddUrl(search.trim())}
+										>
+											<Link2 className="h-3.5 w-3.5" /> Add from URL…
+										</button>
+									</div>
+								)}
 							</div>
 						)}
 
@@ -388,17 +654,73 @@ export function NgwaStoreSurface({
 									entry={entry}
 									selected={selectedEntry?.id === entry.id}
 									loadDetail={loadDetail}
-									onSelect={() => setSelectedId(entry.id)}
+									onSelect={() => selectRow(entry.id)}
 									onUpdate={update}
 									busy={Boolean(pending[entry.id])}
 								/>
 							))}
+
+						{/* R57: the signed catalog lists after the registry pkgs. */}
+						{!isLoading &&
+							!error &&
+							filteredPrimitives.map((row) => (
+								<CatalogStoreRow
+									key={row.id}
+									row={row}
+									closure={closures.get(row.id) ?? []}
+									selected={selectedPrimitive?.id === row.id}
+									busy={Boolean(pending[row.id])}
+									onSelect={() => selectRow(row.id)}
+									onUpdate={updatePrimitive}
+								/>
+							))}
+
+						{!isLoading && !error && catalogStatus === 'error' && (
+							<div className="empty" data-catalog-unavailable role="status">
+								The signed catalog is unavailable{catalogError ? ` — ${catalogError}` : ''}. None of
+								its entries are listed: a catalog that fails to verify is never replaced by the
+								bundled copy.
+								{onRecheckCatalog && (
+									<div className="dacts">
+										<button type="button" className="btn" onClick={onRecheckCatalog}>
+											Retry
+										</button>
+									</div>
+								)}
+							</div>
+						)}
 					</div>
 				</div>
 
 				{/* ── Install sheet ── */}
 				<aside className="storesheet" data-storesheet role="region" aria-label="Install sheet">
-					{selectedEntry ? (
+					{addUrl ? (
+						<AddUrlSheet
+							key={`addurl:${addUrl.n}`}
+							initialSource={addUrl.seed}
+							projectLabel={projectLabel}
+							catalog={catalogEntries}
+							installedKeys={installedKeys}
+							onClose={() => setAddUrl(null)}
+							onResolve={onResolveSource}
+							onInstall={onInstallResolved}
+							onOpenInstalled={onOpenInstalled}
+						/>
+					) : selectedPrimitive ? (
+						<CatalogSheet
+							key={selectedPrimitive.id}
+							row={selectedPrimitive}
+							closure={closures.get(selectedPrimitive.id) ?? []}
+							projectLabel={projectLabel}
+							onClose={() => setSelectedId(null)}
+							onInstall={onInstallPrimitive}
+							onUpdate={updatePrimitive}
+							updating={Boolean(pending[selectedPrimitive.id])}
+							updateError={actionErrors[selectedPrimitive.id] ?? null}
+							onRecheckCatalog={onRecheckCatalog}
+							onOpenInstalled={onOpenInstalled}
+						/>
+					) : selectedEntry ? (
 						<StoreSheet
 							key={`${selectedEntry.id}@${selectedEntry.latestVersion}`}
 							entry={selectedEntry}
@@ -425,10 +747,11 @@ export function NgwaStoreSurface({
 			<UpdatesReviewDialog
 				open={reviewOpen}
 				entries={updateEntries}
+				primitives={primitiveUpdates}
 				onCancel={() => setReviewOpen(false)}
 				onConfirm={() => {
 					setReviewOpen(false);
-					void updateAll(updateEntries);
+					void updateAll();
 				}}
 			/>
 
@@ -502,6 +825,17 @@ function StoreRow({
 					<span className="tagp mono" data-asks>
 						{asksLabel(entry.kind, manifest)}
 					</span>
+					{entry.alsoFrom && (
+						// R57 · Q2: the signed catalog lists the same kind+name; this
+						// row stands for both.
+						<span
+							className="tagp mono"
+							data-also
+							title={`The signed catalog also lists it: ${entry.alsoFrom.source} · ${entry.alsoFrom.url}`}
+						>
+							also: {entry.alsoFrom.source}
+						</span>
+					)}
 				</div>
 			</div>
 
@@ -572,31 +906,7 @@ function StoreSheet({
 	const manifest = version?.manifest ?? null;
 	const consents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
 	const [ticked, setTicked] = useState<Record<string, boolean>>({});
-	const [menuOpen, setMenuOpen] = useState(false);
 	const busy = pendingAction !== null;
-	const menuRef = useRef<HTMLDivElement | null>(null);
-
-	// Dismiss the install-scope popover on Escape or a click outside it,
-	// matching the Scopes surface's cell popover.
-	useEffect(() => {
-		if (!menuOpen) return;
-		function onKey(e: KeyboardEvent) {
-			if (e.key === 'Escape') {
-				e.preventDefault();
-				setMenuOpen(false);
-			}
-		}
-		function onDown(e: MouseEvent) {
-			if (menuRef.current?.contains(e.target as Node)) return;
-			setMenuOpen(false);
-		}
-		document.addEventListener('keydown', onKey);
-		document.addEventListener('mousedown', onDown);
-		return () => {
-			document.removeEventListener('keydown', onKey);
-			document.removeEventListener('mousedown', onDown);
-		};
-	}, [menuOpen]);
 
 	const title = manifest?.name ?? entry.displayName;
 	const requires = manifest?.requires ?? [];
@@ -612,7 +922,6 @@ function StoreSheet({
 	else if (!allTicked) installBlocked = 'Tick every consent above first';
 
 	function install(scope: StoreInstallScope) {
-		setMenuOpen(false);
 		if (!onInstall || installBlocked || busy) return;
 		onInstall(entry, scope);
 	}
@@ -838,54 +1147,12 @@ function StoreSheet({
 						<span className="note">Remove or move it from the Installed tab.</span>
 					</>
 				) : (
-					<>
-						<div className="installsplit" ref={menuRef}>
-							<button
-								type="button"
-								className="btn primary lg"
-								data-install
-								disabled={Boolean(installBlocked) || busy}
-								aria-busy={busy || undefined}
-								title={installBlocked ?? undefined}
-								onClick={() => install('project')}
-							>
-								Install to {projectLabel}
-							</button>
-							<button
-								type="button"
-								className="btn primary lg caret"
-								aria-label="Choose install scope"
-								aria-haspopup="menu"
-								aria-expanded={menuOpen}
-								title={installBlocked ?? 'Choose an install scope'}
-								disabled={Boolean(installBlocked) || busy}
-								onClick={() => setMenuOpen((o) => !o)}
-							>
-								<ChevronDown className="h-3.5 w-3.5" />
-							</button>
-							{menuOpen && (
-								<div className="cellpop storepop up" role="menu" aria-label="Install scope">
-									<div className="mgroup">Install scope</div>
-									<button
-										type="button"
-										role="menuitem"
-										className="mitem"
-										onClick={() => install('project')}
-									>
-										Install to {projectLabel} <span className="msub">default here</span>
-									</button>
-									<button
-										type="button"
-										role="menuitem"
-										className="mitem"
-										onClick={() => install('personal')}
-									>
-										Install to personal <span className="msub">workspace · always loaded</span>
-									</button>
-								</div>
-							)}
-						</div>
-					</>
+					<InstallSplit
+						projectLabel={projectLabel}
+						blocked={installBlocked}
+						busy={busy}
+						onInstall={install}
+					/>
 				)}
 				{size && (
 					<span className="note" style={{ marginLeft: 'auto' }}>
@@ -904,21 +1171,24 @@ function StoreSheet({
 function UpdatesReviewDialog({
 	open,
 	entries,
+	primitives,
 	onCancel,
 	onConfirm,
 }: {
 	open: boolean;
 	entries: NgwaStoreEntry[];
+	primitives: NgwaCatalogRow[];
 	onCancel: () => void;
 	onConfirm: () => void;
 }) {
+	const n = entries.length + primitives.length;
 	return (
 		<Dialog open={open} onOpenChange={(o) => !o && onCancel()}>
 			{open && (
 				<DialogContent data-ngwa-confirm data-updates-review showCloseButton={false}>
 					<DialogHeader>
 						<DialogTitle>
-							Review {entries.length} update{entries.length === 1 ? '' : 's'}
+							Review {n} update{n === 1 ? '' : 's'}
 						</DialogTitle>
 						<DialogDescription asChild>
 							<div className="ngwa-confirm-body">
@@ -930,6 +1200,18 @@ function UpdatesReviewDialog({
 										</span>
 									</div>
 								))}
+								{primitives.map((r) => {
+									const pin = catalogPin(r.entry);
+									return (
+										<div className="drow" key={r.id} data-primitive-update={r.name}>
+											<span className="k2">{r.name}</span>
+											<span className="val mono">
+												{shortSha(r.installed?.version)} → {shortSha(pin?.sha ?? null)}
+											</span>
+											<span className="rt meta">moved by the signed catalog</span>
+										</div>
+									);
+								})}
 								<p className="note">
 									Each one is fetched, verified and re-registered. Nothing is applied until you
 									confirm.
@@ -942,7 +1224,7 @@ function UpdatesReviewDialog({
 							Cancel
 						</button>
 						<button type="button" className="chip on" onClick={onConfirm}>
-							Update all ({entries.length})
+							Update all ({n})
 						</button>
 					</DialogFooter>
 				</DialogContent>

@@ -11,6 +11,13 @@ import type { NgwaItem, NgwaTrust, NgwaUsage, NgwaKind } from '@ikenga/contract'
 import type { RegistryEntry } from '@/lib/registry/use-registry';
 import { entryMatchesPkgId } from '@/lib/registry/use-updates-available';
 import { semverCompare } from '@ikenga/registry-client';
+import {
+	catalogPin,
+	catalogPinMoved,
+	isPinned,
+	type PrimitiveCatalogEntry,
+} from '@/lib/registry/primitives';
+import type { ClaudeStoreEntry, ClaudeStoreKind } from '@/lib/tauri-cmd';
 
 export type TrustFacetValue = 'builtin' | 'signed' | 'unsigned' | 'review';
 
@@ -58,10 +65,7 @@ export function enrichNgwaItem(item: NgwaItem, registryEntries: RegistryEntry[])
 /**
  * Enriches all snapshot items with registry index data.
  */
-export function enrichNgwaItems(
-	items: NgwaItem[],
-	registryEntries: RegistryEntry[]
-): NgwaItem[] {
+export function enrichNgwaItems(items: NgwaItem[], registryEntries: RegistryEntry[]): NgwaItem[] {
 	if (!registryEntries.length) return items;
 	return items.map((it) => enrichNgwaItem(it, registryEntries));
 }
@@ -106,8 +110,17 @@ export function formatUsageTooltip(usage: NgwaUsage | null): string {
 }
 
 const NGWA_KIND_SET: ReadonlySet<string> = new Set<NgwaKind>([
-	'app', 'engine', 'tool', 'sidecar', 'skill', 'agent', 'command', 'hook',
-	'bundle', 'schedule', 'workflow',
+	'app',
+	'engine',
+	'tool',
+	'sidecar',
+	'skill',
+	'agent',
+	'command',
+	'hook',
+	'bundle',
+	'schedule',
+	'workflow',
 ]);
 
 /**
@@ -155,6 +168,9 @@ export interface NgwaStoreEntry {
 	installedItem: NgwaItem | null;
 	isUpdate: boolean;
 	registryEntry: RegistryEntry;
+	/** R57 · Q2: the signed catalog lists the same kind+name, so its row is
+	 *  folded into this one; the l3 line notes `also: <source>`. */
+	alsoFrom?: { source: 'git' | 'npx'; url: string } | null;
 }
 
 /**
@@ -200,4 +216,108 @@ export function buildStoreCatalog(
 			registryEntry: entry,
 		};
 	});
+}
+
+// ─── R57 · catalog rows (git / npx primitives from the signed catalog) ──────
+
+/** The Store facet a row installs FROM (R57 Source chips). */
+export type StoreSource = 'registry' | 'git' | 'npx';
+
+/** A row's Kind facet value: an Ngwa kind, or `mcp` (a catalog MCP entry has
+ *  no Ngwa kind of its own). */
+export type StoreRowKind = NgwaKind | 'mcp';
+
+/** One signed-catalog primitive as a Store row (R57 flow 1). */
+export interface NgwaCatalogRow {
+	/** `cat:<kind>:<name>` — never collides with a registry pkg name. */
+	id: string;
+	name: string;
+	kind: StoreRowKind;
+	storeKind: ClaudeStoreKind;
+	source: 'git' | 'npx';
+	url: string;
+	version: string;
+	description: string | null;
+	publisher: string | null;
+	entry: PrimitiveCatalogEntry;
+	/** The vault record when installed (any provenance), else null. */
+	installed: ClaudeStoreEntry | null;
+	/** Q4: a catalog install whose catalog pin has moved (pure comparison). */
+	isUpdate: boolean;
+}
+
+/** The Ngwa-facing kind for a catalog primitive kind. */
+function catalogRowKind(kind: ClaudeStoreKind): StoreRowKind {
+	return kind === 'mcp' ? 'mcp' : NGWA_KIND_SET.has(kind) ? (kind as NgwaKind) : 'skill';
+}
+
+/**
+ * R57 · Q2 — does a registry row stand for the same primitive as a catalog
+ * entry? The matching rule:
+ *   1. the registry row's Store kind (`storeKindFor`, e.g. `skill`) equals the
+ *      catalog entry's kind — kinds never cross-match; and
+ *   2. the registry name, with its npm scope (`@ikenga/`) and then a leading
+ *      `<kind>-` or `pkg-` prefix stripped, equals the catalog name
+ *      (case-insensitive). `@ikenga/skill-groundwork` ↔ skill `groundwork`.
+ * A catalog entry matches at most one registry row (the first).
+ */
+export function registryMatchesCatalog(
+	registryName: string,
+	registryKind: NgwaKind,
+	entry: PrimitiveCatalogEntry
+): boolean {
+	if (registryKind !== entry.kind) return false;
+	const bare = registryName.replace(/^@[^/]+\//, '').toLowerCase();
+	const stripped = bare.replace(new RegExp(`^(${registryKind}|pkg)-`), '');
+	const want = entry.name.toLowerCase();
+	return stripped === want || bare === want;
+}
+
+/**
+ * Build the Store's catalog rows and fold duplicates into registry rows (Q2).
+ * Returns the registry entries (with `alsoFrom` set where a catalog entry
+ * folded in) and the remaining catalog rows, which list after them.
+ */
+export function mergeCatalogIntoStore(
+	registryRows: NgwaStoreEntry[],
+	catalog: readonly PrimitiveCatalogEntry[],
+	vault: readonly ClaudeStoreEntry[]
+): { registry: NgwaStoreEntry[]; primitives: NgwaCatalogRow[] } {
+	const registry = registryRows.map((r) => ({ ...r }));
+	const primitives: NgwaCatalogRow[] = [];
+	for (const entry of catalog) {
+		const twin = registry.find((r) => !r.alsoFrom && registryMatchesCatalog(r.name, r.kind, entry));
+		if (twin) {
+			twin.alsoFrom = { source: entry.source, url: entry.url };
+			continue;
+		}
+		const installed = vault.find((v) => v.kind === entry.kind && v.name === entry.name) ?? null;
+		const isUpdate =
+			installed !== null &&
+			installed.fromCatalog === true &&
+			isPinned(entry) &&
+			entry.kind !== 'hook' &&
+			entry.kind !== 'mcp' &&
+			catalogPinMoved(installed, entry);
+		primitives.push({
+			id: `cat:${entry.kind}:${entry.name}`,
+			name: entry.name,
+			kind: catalogRowKind(entry.kind),
+			storeKind: entry.kind,
+			source: entry.source,
+			url: entry.url,
+			version: entry.version,
+			description: entry.description,
+			publisher: entry.publisher ?? null,
+			entry,
+			installed,
+			isUpdate,
+		});
+	}
+	return { registry, primitives };
+}
+
+/** The pin a catalog row updates to, for the Updates strip (Q4). */
+export function catalogRowPin(row: NgwaCatalogRow) {
+	return catalogPin(row.entry);
 }

@@ -24,6 +24,7 @@ const ngwaSearchSchema = z.object({
 });
 
 function NgwaInstalledPage() {
+	const { search } = Route.useSearch();
 	const { items, storeCatalog, unreadableSources, isLoading, error } = useNgwaSnapshot();
 	const navigate = useNavigate();
 	const { actionsFor, dialog, status } = useNgwaItemActions({
@@ -42,9 +43,8 @@ function NgwaInstalledPage() {
 				error={error}
 				actionsFor={actionsFor}
 				status={status}
-				onOpenItem={(it) =>
-					void navigate({ to: '/ngwa/item/$itemId', params: { itemId: it.id } })
-				}
+				initialSearch={search}
+				onOpenItem={(it) => void navigate({ to: '/ngwa/item/$itemId', params: { itemId: it.id } })}
 			/>
 			{dialog}
 		</div>
