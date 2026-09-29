@@ -263,8 +263,10 @@ pub async fn oba_install_git(
     url: String,
     gitRef: Option<String>,
     fromCatalog: Option<bool>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
-    install::oba_install_git(kind, name, url, gitRef, fromCatalog).await
+    install::oba_install_git(kind, name, url, gitRef, fromCatalog, expectSha, expectHash).await
 }
 
 /// Install a primitive via the Claude `skills` CLI (`npx skills add <spec>`).
@@ -275,8 +277,10 @@ pub async fn oba_install_npx(
     name: String,
     spec: String,
     fromCatalog: Option<bool>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
-    install::oba_install_npx(kind, name, spec, fromCatalog).await
+    install::oba_install_npx(kind, name, spec, fromCatalog, expectSha, expectHash).await
 }
 
 /// Install a primitive from a LOCAL path into the vault as a managed canonical
@@ -309,15 +313,39 @@ pub async fn oba_check_update(kind: String, name: String) -> Result<UpdateStatus
 }
 
 /// Re-fetch a managed primitive into its existing canonical in place (no relink).
+/// R57 · N-C: `expectSha` / `expectHash` pin what is fetched.
 #[tauri::command]
-pub async fn oba_update(kind: String, name: String) -> Result<ClaudeStoreEntry, String> {
-    install::oba_update(kind, name).await
+#[allow(non_snake_case)]
+pub async fn oba_update(
+    kind: String,
+    name: String,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
+) -> Result<ClaudeStoreEntry, String> {
+    install::oba_update(kind, name, expectSha, expectHash).await
 }
 
 /// Phase 3 — auto-update every `auto_update`-opted entry that's behind its remote.
+/// R57 · Q3: `pins` are the signed catalog's pins (pinned installs follow them).
 #[tauri::command]
-pub async fn oba_auto_update_all() -> Result<AutoUpdateSummary, String> {
-    install::oba_auto_update_all().await
+pub async fn oba_auto_update_all(
+    pins: Option<Vec<CatalogPin>>,
+) -> Result<AutoUpdateSummary, String> {
+    install::oba_auto_update_all(pins).await
+}
+
+/// R57 · N-B — dry-run resolve of a pasted git URL / `owner/repo` spec: fetch
+/// into staging, infer the kind, report `{kind, name, sha, hash, files,
+/// requires, trust}`; writes nothing to the vault.
+#[tauri::command]
+#[allow(non_snake_case)]
+pub async fn oba_resolve_source(
+    url: String,
+    kind: Option<String>,
+    name: Option<String>,
+    gitRef: Option<String>,
+) -> Result<ResolvedSource, String> {
+    install::oba_resolve_source(url, kind, name, gitRef).await
 }
 
 /// Phase 3 — toggle the per-entry auto-update opt-in and persist it to
@@ -343,8 +371,22 @@ pub async fn oba_install_with_deps(
     gitRef: Option<String>,
     fromCatalog: Option<bool>,
     catalog: Vec<CatalogEntryRef>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<InstallWithDepsResult, String> {
-    install::oba_install_with_deps(&db, kind, name, source, url, gitRef, fromCatalog, catalog).await
+    install::oba_install_with_deps(
+        &db,
+        kind,
+        name,
+        source,
+        url,
+        gitRef,
+        fromCatalog,
+        catalog,
+        expectSha,
+        expectHash,
+    )
+    .await
 }
 
 /// Re-verify a primitive's `requires` at enable time: return the recorded deps

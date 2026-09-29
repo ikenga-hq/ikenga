@@ -12,8 +12,17 @@
 //!   - **`source:"git"`** = `git clone`; **`source:"npx"`** = `npx skills add <gh-spec>`.
 //!   - **Public-only auth (v1)** — plain clone / npx, no credential handling.
 //!     A private repo fails with a clear error.
-//!   - **File-based primitives only** (skill/agent/command). hook/mcp are
-//!     JSON-fragments owned by the merge engine, not vault masters — rejected.
+//!   - **File-based primitives** (skill/agent/command) are vault masters.
+//!     **hook/mcp** (R57 · N-A) install from git as validated settings
+//!     *fragments* at `store/hooks/<name>.json` / `store/mcp/<name>.json` —
+//!     the same files the WP-03 merge engine splices on enable. npx is
+//!     skills-only.
+//!   - **Pinned installs** (R57 · N-C): an install/update may carry a [`Pin`]
+//!     (commit SHA and/or content hash). With a SHA the exact commit is
+//!     fetched — never HEAD — and a mismatch is refused before the vault is
+//!     touched. A pinned master never tracks HEAD afterwards.
+//!   - **Dry-run resolve** (R57 · N-B): `oba_resolve_source` fetches into
+//!     staging, infers what the source holds, reports it, and removes staging.
 //!
 //! The fetch always lands in a disposable staging dir first; only an atomic swap
 //! promotes it into the vault, so a failed/interrupted fetch never leaves a
@@ -40,9 +49,12 @@ use super::{
 };
 use crate::server::shared::claude_config::{mtime_ms, store_root};
 
+use super::fragment_path;
 use super::resolve::{
-    collect_satisfied, resolve_install_loop_core, resolve_requires_core, PrimitiveRef, RequiresGraph,
+    collect_satisfied, resolve_install_loop_core, resolve_requires_core, PrimitiveRef,
+    RequiresGraph,
 };
+use super::source::{self, Found, Pin};
 use crate::db::PaDb;
 use crate::pkg::manifest::RequiresEntry;
 
@@ -80,14 +92,18 @@ fn gh_url(spec: &str) -> String {
     }
 }
 
-fn ensure_file_based(kind: Kind) -> Result<(), String> {
-    if !kind.is_file_based() {
-        return Err(format!(
-            "kind {} is a JSON-fragment primitive (merge-engine owned); not installable as a vault master",
-            kind.as_str()
-        ));
+/// Kinds a single install/update handles: the file-based vault masters plus
+/// (R57 · N-A) hook/mcp settings fragments. A bundle has its own installer.
+fn ensure_installable(kind: Kind) -> Result<(), String> {
+    if kind == Kind::Bundle {
+        return Err("a bundle ships member skills; install it with oba_install_bundle".to_string());
     }
     Ok(())
+}
+
+/// hook/mcp are settings fragments (R57 · N-A).
+fn is_fragment(kind: Kind) -> bool {
+    matches!(kind, Kind::Hook | Kind::Mcp)
 }
 
 // ─── git / npx invocation (shell out; public-only) ───────────────────────────
@@ -112,19 +128,30 @@ fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<std::process::Out
     if let Some(d) = cwd {
         c.current_dir(d);
     }
-    crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`{cmd}` not found on PATH — install it to use {cmd}-sourced primitives")
-        } else {
-            format!("{cmd}: {e}")
-        }
-    })
+    if cmd == "git" {
+        // Public-only (v1, Q9): never block on — or pop up — a credential
+        // prompt. A private or mistyped repo must fail fast with git's own
+        // error, not wait on a Git Credential Manager dialog.
+        c.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never");
+    }
+    crate::executor::current()
+        .spawn_output_blocking(c, OUTPUT_OPTS)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("`{cmd}` not found on PATH — install it to use {cmd}-sourced primitives")
+            } else {
+                format!("{cmd}: {e}")
+            }
+        })
 }
 
 /// `git clone --depth 1 [--branch <ref>] <url> <dest>`. Public-only (no creds).
+/// `core.autocrlf=false` so a Windows checkout holds the bytes the source
+/// serves — the content hash (R57 · Q3) must not depend on the host.
 fn git_clone(url: &str, ref_: Option<&str>, dest: &Path) -> Result<(), String> {
     let dest_s = dest.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec!["clone", "--depth", "1"];
+    let mut args: Vec<&str> = vec!["clone", "--config", "core.autocrlf=false", "--depth", "1"];
     if let Some(r) = ref_ {
         args.push("--branch");
         args.push(r);
@@ -135,6 +162,67 @@ fn git_clone(url: &str, ref_: Option<&str>, dest: &Path) -> Result<(), String> {
     if !out.status.success() {
         return Err(format!(
             "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// R57 · N-C: materialize exactly commit `sha` of `url` at `dest` — never HEAD.
+/// Tries a shallow fetch of the SHA (GitHub and git ≥2.x `file://` serve any
+/// reachable commit by SHA); if the server refuses a want-by-SHA (or `sha` is
+/// an abbreviation), falls back to a full clone + checkout. Either way the
+/// caller re-reads HEAD and refuses a mismatch.
+fn git_fetch_at_sha(url: &str, sha: &str, dest: &Path) -> Result<(), String> {
+    let dest_s = dest.to_string_lossy().to_string();
+    let shallow = (|| {
+        std::fs::create_dir_all(dest).map_err(|e| format!("mkdir staging: {e}"))?;
+        let steps: [&[&str]; 4] = [
+            &["init", "-q", &dest_s],
+            &["-C", &dest_s, "config", "core.autocrlf", "false"],
+            &["-C", &dest_s, "fetch", "-q", "--depth", "1", url, sha],
+            &["-C", &dest_s, "checkout", "-q", "--detach", "FETCH_HEAD"],
+        ];
+        for args in steps {
+            let out = run("git", args, None)?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+        }
+        Ok::<_, String>(())
+    })();
+    if shallow.is_ok() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(dest);
+    let out = run(
+        "git",
+        &[
+            "clone",
+            "-q",
+            "--config",
+            "core.autocrlf=false",
+            url,
+            &dest_s,
+        ],
+        None,
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let out = run(
+        "git",
+        &["-C", &dest_s, "checkout", "-q", "--detach", sha],
+        None,
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "{}: commit {} is not at {url} ({})",
+            source::PIN_MISMATCH,
+            source::short_sha(sha),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -191,13 +279,16 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
         // without this the sandbox is a no-op there and `skills add` writes
         // into the real user profile instead of `staging`.
         .env("USERPROFILE", staging);
-    let out = crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
-        } else {
-            format!("npx: {e}")
-        }
-    })?;
+    let out = crate::executor::current()
+        .spawn_output_blocking(c, OUTPUT_OPTS)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "`npx` not found on PATH — install Node.js to use npx-sourced primitives"
+                    .to_string()
+            } else {
+                format!("npx: {e}")
+            }
+        })?;
     if !out.status.success() {
         return Err(format!(
             "npx skills add failed: {}",
@@ -220,13 +311,16 @@ fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
         .env("HOME", staging)
         // See npx_skills_add: os.homedir() reads %USERPROFILE% on Windows.
         .env("USERPROFILE", staging);
-    let out = crate::executor::current().spawn_output_blocking(c, OUTPUT_OPTS).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "`npx` not found on PATH — install Node.js to use npx-sourced primitives".to_string()
-        } else {
-            format!("npx: {e}")
-        }
-    })?;
+    let out = crate::executor::current()
+        .spawn_output_blocking(c, OUTPUT_OPTS)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "`npx` not found on PATH — install Node.js to use npx-sourced primitives"
+                    .to_string()
+            } else {
+                format!("npx: {e}")
+            }
+        })?;
     if !out.status.success() {
         return Err(format!(
             "npx skills add --skill '*' failed: {}",
@@ -249,13 +343,21 @@ fn locate_in_clone(root: &Path, kind: Kind, name: &str) -> Result<PathBuf, Strin
             if root.join("SKILL.md").is_file() {
                 return Ok(root.to_path_buf());
             }
-            for cand in [root.join("skills").join(name), root.join(name)] {
+            // R57: `.claude/skills/<n>` / `.agents/skills/<n>` too — the layouts
+            // the `skills` CLI discovers, so an npx source can be fetched
+            // pinned through git (see `stage_npx`).
+            for cand in [
+                root.join("skills").join(name),
+                root.join(name),
+                root.join(".claude").join("skills").join(name),
+                root.join(".agents").join("skills").join(name),
+            ] {
                 if cand.join("SKILL.md").is_file() {
                     return Ok(cand);
                 }
             }
             Err(format!(
-                "no SKILL.md found in clone for skill {name:?} (looked at root, skills/{name}, {name})"
+                "no SKILL.md found in clone for skill {name:?} (looked at root, skills/{name}, {name}, .claude/skills/{name}, .agents/skills/{name})"
             ))
         }
         Kind::Agent | Kind::Command => {
@@ -263,6 +365,8 @@ fn locate_in_clone(root: &Path, kind: Kind, name: &str) -> Result<PathBuf, Strin
             let mut cands = vec![root.join(&leaf)];
             if let Some(sub) = kind.dir_name() {
                 cands.push(root.join(sub).join(&leaf));
+                // R57: `.claude/<kind>s/<n>.md` too (what a resolve infers).
+                cands.push(root.join(".claude").join(sub).join(&leaf));
             }
             for cand in cands {
                 if cand.is_file() {
@@ -274,9 +378,10 @@ fn locate_in_clone(root: &Path, kind: Kind, name: &str) -> Result<PathBuf, Strin
                 kind.as_str()
             ))
         }
-        Kind::Bundle => {
-            Err("bundle locate-in-clone not yet implemented (WP-19); a bundle ships member skills".to_string())
-        }
+        Kind::Bundle => Err(
+            "bundle locate-in-clone not yet implemented (WP-19); a bundle ships member skills"
+                .to_string(),
+        ),
         Kind::Hook | Kind::Mcp => {
             Err("hook/mcp are JSON-fragment primitives; install via the merge engine".to_string())
         }
@@ -373,98 +478,307 @@ fn adopt_into_store(
     Ok(dest)
 }
 
-// ─── fetch + adopt (shared by install + update) ──────────────────────────────
+// ─── fetch → verify → adopt (shared by install + update) ─────────────────────
+//
+// R57 split the old single `fetch_and_adopt` into three steps so the pin (N-C)
+// is checked BETWEEN the fetch and the only vault mutation:
+//   1. `stage`  — fetch into a disposable staging dir, locate the primitive,
+//                 read its compiled `requires`, hash its content;
+//   2. verify   — refuse a SHA / content-hash mismatch (nothing written yet);
+//   3. `adopt_staged` — the one atomic swap into the vault.
+// Staging is removed whatever happens. The vault is mutated only by step 3, so
+// a failure anywhere before it leaves the prior canonical (if any) untouched.
 
-/// Fetch from the remote into staging, locate the primitive, atomically swap it
-/// into the vault canonical, and clean up staging. Returns `(canonical, version)`.
-/// The vault is mutated only by the final atomic swap, so a failure anywhere
-/// before it leaves the prior canonical (if any) untouched.
-fn fetch_and_adopt(
+/// A fetched, located, hashed primitive waiting in staging.
+struct Staged {
+    /// The disposable staging root to remove afterwards (`None` for a LOCAL
+    /// source — that is the user's own directory and is never removed).
+    staging: Option<PathBuf>,
+    /// The primitive inside staging.
+    found: Found,
+    /// The commit the fetch landed on (`None` for local / an npx fetch whose
+    /// source SHA could not be read).
+    sha: Option<String>,
+    requires: Vec<RequiresEntry>,
+    /// `sha256-<hex>` of the primitive's content (`source::content_hash_*`).
+    hash: String,
+}
+
+impl Staged {
+    fn cleanup(&self) {
+        if let Some(s) = &self.staging {
+            let _ = std::fs::remove_dir_all(s);
+        }
+    }
+}
+
+fn hash_found(found: &Found) -> Result<String, String> {
+    match found {
+        Found::Path(p) if p.is_dir() => source::content_hash_dir(p),
+        Found::Path(p) => {
+            let bytes = std::fs::read(p).map_err(|e| format!("read {}: {e}", p.display()))?;
+            Ok(source::content_hash_bytes(&bytes))
+        }
+        Found::Fragment(bytes) => Ok(source::content_hash_bytes(bytes)),
+    }
+}
+
+/// Locate `kind`/`name` inside a fetched tree: vault masters via
+/// `locate_in_clone`, hook/mcp fragments via `source::locate_fragment`.
+fn locate_found(root: &Path, kind: Kind, name: &str) -> Result<Found, String> {
+    if is_fragment(kind) {
+        source::locate_fragment(root, kind, name).map(Found::Fragment)
+    } else {
+        locate_in_clone(root, kind, name).map(Found::Path)
+    }
+}
+
+/// `requires` for a fetched primitive: the clone root's `manifest.json` first,
+/// else beside the located primitive (WP-14).
+fn requires_for(root: &Path, found: &Found) -> Vec<RequiresEntry> {
+    let mut requires = read_manifest_requires(root);
+    if requires.is_empty() {
+        if let Found::Path(p) = found {
+            if p.is_dir() {
+                requires = read_manifest_requires(p);
+            }
+        }
+    }
+    requires
+}
+
+/// Git route: clone `ref_` (or fetch exactly `pin.sha`), read HEAD, locate.
+fn stage_git(
+    kind: Kind,
+    name: &str,
+    url: &str,
+    ref_: Option<&str>,
+    pin: &Pin,
+) -> Result<Staged, String> {
+    let staging = staging_dir("git");
+    let res = (|| {
+        match &pin.sha {
+            Some(sha) => git_fetch_at_sha(url, sha, &staging)?,
+            None => git_clone(url, ref_, &staging)?,
+        }
+        let sha = git_head_sha(&staging)?;
+        let found = locate_found(&staging, kind, name)?;
+        let requires = requires_for(&staging, &found);
+        let hash = hash_found(&found)?;
+        Ok::<_, String>(Staged {
+            staging: Some(staging.clone()),
+            found,
+            sha: Some(sha),
+            requires,
+            hash,
+        })
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    res
+}
+
+/// npx route (skills only). Unpinned: `npx skills add <spec>` exactly as
+/// before, the SHA read best-effort from the source's HEAD. Pinned to a SHA:
+/// the `skills` CLI cannot fetch an older commit, so the source repo is fetched
+/// at the pin through git and the skill located in the layouts the CLI itself
+/// discovers; only if that fails, and the source's HEAD still IS the pin, does
+/// it fall back to the CLI. A moved source is refused (N-C).
+fn stage_npx(
+    kind: Kind,
+    name: &str,
+    spec: &str,
+    pin: &Pin,
+    npx_add: &dyn Fn(&str, &Path) -> Result<(), String>,
+) -> Result<Staged, String> {
+    if kind != Kind::Skill {
+        return Err(
+            "npx (skills CLI) installs skills only; use git for agents/commands/hooks/mcp"
+                .to_string(),
+        );
+    }
+    if let Some(want) = &pin.sha {
+        match stage_git(kind, name, &gh_url(spec), None, pin) {
+            Ok(st) => return Ok(st),
+            Err(git_err) => {
+                let head = git_ls_remote_sha(&gh_url(spec), None).ok();
+                if !head
+                    .as_deref()
+                    .is_some_and(|h| source::sha_matches(h, want))
+                {
+                    return Err(if git_err.contains(source::PIN_MISMATCH) {
+                        git_err
+                    } else {
+                        format!(
+                            "{}: {spec} was reviewed at {} and could not be fetched at that commit ({git_err}); its HEAD is now {} — nothing was written",
+                            source::PIN_MISMATCH,
+                            source::short_sha(want),
+                            head.as_deref().map(source::short_sha).unwrap_or("unknown")
+                        )
+                    });
+                }
+                // HEAD is still the pin: the CLI serves exactly it.
+            }
+        }
+    }
+    let staging = staging_dir("npx");
+    std::fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
+    let res = (|| {
+        npx_add(spec, &staging)?;
+        let located = locate_installed_skill(&staging, name)?;
+        // The skills CLI writes only the skill dir (no package manifest), so
+        // `requires` is best-effort here — read the skill dir itself.
+        let requires = read_manifest_requires(&located);
+        // Best-effort version: resolve the source repo's HEAD SHA.
+        let sha = git_ls_remote_sha(&gh_url(spec), None).ok();
+        let found = Found::Path(located);
+        let hash = hash_found(&found)?;
+        Ok::<_, String>(Staged {
+            staging: Some(staging.clone()),
+            found,
+            sha,
+            requires,
+            hash,
+        })
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    res
+}
+
+/// Local route (WP-25): `url` is an absolute source dir. Copy-only — the
+/// source tree is never moved, symlinked, mutated or removed.
+fn stage_local(kind: Kind, name: &str, url: &str) -> Result<Staged, String> {
+    if is_fragment(kind) {
+        return Err(format!(
+            "{} install from a local path is not supported; install it from git",
+            kind.as_str()
+        ));
+    }
+    let src_root = Path::new(url);
+    if !src_root.exists() {
+        return Err(format!("local source path does not exist: {url}"));
+    }
+    if !src_root.is_dir() {
+        return Err(format!(
+            "local source must be a directory (the dir containing the primitive content): {url}"
+        ));
+    }
+    let located = locate_in_local(src_root, kind, name)?;
+    // Compiled `requires`: read the package root's `manifest.json` first (the
+    // `ikenga-pkgs` skills/<name>/ publish layout puts it at the package root,
+    // two levels above SKILL.md), then fall back to the located primitive dir —
+    // mirrors the git path's two-step lookup.
+    let mut requires = read_manifest_requires_walk_up(&located, src_root);
+    if requires.is_empty() {
+        requires = read_manifest_requires(&located);
+    }
+    let found = Found::Path(located);
+    let hash = hash_found(&found)?;
+    Ok(Staged {
+        staging: None,
+        found,
+        sha: None,
+        requires,
+        hash,
+    })
+}
+
+/// Step 1 for any route.
+fn stage(
+    kind: Kind,
+    name: &str,
+    source: ProvenanceSource,
+    url: &str,
+    ref_: Option<&str>,
+    pin: &Pin,
+) -> Result<Staged, String> {
+    match source {
+        ProvenanceSource::Git | ProvenanceSource::Catalog => stage_git(kind, name, url, ref_, pin),
+        ProvenanceSource::Npx => stage_npx(kind, name, url, pin, &npx_skills_add),
+        ProvenanceSource::Local => stage_local(kind, name, url),
+    }
+}
+
+/// Step 2: refuse a staged fetch that is not what was reviewed.
+fn verify_staged(st: &Staged, kind: Kind, name: &str, pin: &Pin) -> Result<(), String> {
+    let what = format!("{} {name}", kind.as_str());
+    pin.check_sha(st.sha.as_deref(), &what)?;
+    pin.check_hash(&st.hash, &what)
+}
+
+/// Write `bytes` to `dest` atomically (temp file in the same dir + rename).
+fn atomic_write(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("no parent dir for {}", dest.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".oba-fragment.tmp.{nonce}"));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename into {}: {e}", dest.display())
+    })
+}
+
+/// Step 3: the one vault mutation. Vault masters go through the existing
+/// `atomic_copy_*` swap; hook/mcp fragments are written atomically to
+/// `store/{hooks,mcp}/<name>.json` (the path the merge engine reads on enable).
+fn adopt_staged(store: &Path, kind: Kind, name: &str, st: &Staged) -> Result<PathBuf, String> {
+    match &st.found {
+        Found::Path(located) => {
+            // Don't carry a clone's `.git` into the vault canonical.
+            if st.staging.is_some() {
+                let _ = std::fs::remove_dir_all(located.join(".git"));
+            }
+            adopt_into_store(store, kind, name, located)
+        }
+        Found::Fragment(bytes) => {
+            let dest = fragment_path(store, kind, name)?;
+            if !dest.starts_with(store) {
+                return Err(format!("install dest outside store: {}", dest.display()));
+            }
+            atomic_write(&dest, bytes)?;
+            Ok(dest)
+        }
+    }
+}
+
+/// What a completed fetch → verify → adopt produced.
+struct Adopted {
+    dest: PathBuf,
+    sha: Option<String>,
+    requires: Vec<RequiresEntry>,
+    hash: String,
+}
+
+/// Steps 1–3, staging always removed.
+fn fetch_verify_adopt(
     store: &Path,
     kind: Kind,
     name: &str,
     source: ProvenanceSource,
     url: &str,
     ref_: Option<&str>,
-) -> Result<(PathBuf, Option<String>, Vec<RequiresEntry>), String> {
-    match source {
-        ProvenanceSource::Git | ProvenanceSource::Catalog => {
-            let staging = staging_dir("git");
-            let res = (|| {
-                git_clone(url, ref_, &staging)?;
-                let sha = git_head_sha(&staging)?;
-                let located = locate_in_clone(&staging, kind, name)?;
-                // WP-14: the compiled `requires` live in the published
-                // `manifest.json` — at the package/clone root for an `ikenga-pkgs`
-                // skill (skills/<name>/ layout), or beside SKILL.md for a
-                // skill-at-root. Read the clone root first, fall back to the
-                // located primitive dir.
-                let mut requires = read_manifest_requires(&staging);
-                if requires.is_empty() {
-                    requires = read_manifest_requires(&located);
-                }
-                // Don't carry the clone's `.git` into the vault canonical.
-                let _ = std::fs::remove_dir_all(located.join(".git"));
-                let dest = adopt_into_store(store, kind, name, &located)?;
-                Ok::<_, String>((dest, Some(sha), requires))
-            })();
-            let _ = std::fs::remove_dir_all(&staging);
-            res
-        }
-        ProvenanceSource::Npx => {
-            if kind != Kind::Skill {
-                return Err(
-                    "npx (skills CLI) installs skills only; use git for agents/commands"
-                        .to_string(),
-                );
-            }
-            let staging = staging_dir("npx");
-            std::fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
-            let res = (|| {
-                npx_skills_add(url, &staging)?;
-                let located = locate_installed_skill(&staging, name)?;
-                // The skills CLI writes only the skill dir (no package manifest),
-                // so `requires` is best-effort here — read the skill dir itself.
-                let requires = read_manifest_requires(&located);
-                // Best-effort version: resolve the source repo's HEAD SHA.
-                let sha = git_ls_remote_sha(&gh_url(url), None).ok();
-                let dest = adopt_into_store(store, kind, name, &located)?;
-                Ok::<_, String>((dest, sha, requires))
-            })();
-            let _ = std::fs::remove_dir_all(&staging);
-            res
-        }
-        ProvenanceSource::Local => {
-            // WP-25: install from a LOCAL path — staging = COPY from the dir the
-            // caller pointed us at (the dir containing the primitive content, e.g.
-            // `ikenga-pkgs/packages/skills/mail/skills/mail`). `url` carries that
-            // absolute source path. No remote → no version (`None`). The copy is
-            // adopted through the SAME atomic swap as git/npx, so a partial copy
-            // never exposes a half-written canonical. Copy-only: the source tree
-            // is never moved, symlinked, or mutated (the v2b data-loss guard).
-            let src_root = Path::new(url);
-            if !src_root.exists() {
-                return Err(format!("local source path does not exist: {url}"));
-            }
-            if !src_root.is_dir() {
-                return Err(format!(
-                    "local source must be a directory (the dir containing the primitive content): {url}"
-                ));
-            }
-            let located = locate_in_local(src_root, kind, name)?;
-            // Compiled `requires`: read the package root's `manifest.json` first
-            // (the `ikenga-pkgs` skills/<name>/ publish layout puts it at the
-            // package root, two levels above SKILL.md), then fall back to the
-            // located primitive dir — mirrors the git path's two-step lookup.
-            let mut requires = read_manifest_requires_walk_up(&located, src_root);
-            if requires.is_empty() {
-                requires = read_manifest_requires(&located);
-            }
-            let dest = adopt_into_store(store, kind, name, &located)?;
-            // No remote ⇒ no resolved version.
-            Ok((dest, None, requires))
-        }
-    }
+    pin: &Pin,
+) -> Result<Adopted, String> {
+    let st = stage(kind, name, source, url, ref_, pin)?;
+    let res =
+        verify_staged(&st, kind, name, pin).and_then(|()| adopt_staged(store, kind, name, &st));
+    st.cleanup();
+    let dest = res?;
+    Ok(Adopted {
+        dest,
+        sha: st.sha,
+        requires: st.requires,
+        hash: st.hash,
+    })
 }
 
 /// Find the primitive content inside a LOCAL source directory — the copy-staging
@@ -505,9 +819,10 @@ fn locate_in_local(root: &Path, kind: Kind, name: &str) -> Result<PathBuf, Strin
                 kind.as_str()
             ))
         }
-        Kind::Bundle => {
-            Err("bundle local-install not supported (a bundle ships member skills via the bundle path)".to_string())
-        }
+        Kind::Bundle => Err(
+            "bundle local-install not supported (a bundle ships member skills via the bundle path)"
+                .to_string(),
+        ),
         Kind::Hook | Kind::Mcp => {
             Err("hook/mcp are JSON-fragment primitives; install via the merge engine".to_string())
         }
@@ -543,11 +858,18 @@ fn build_entry(
     requires: Vec<RequiresEntry>,
     prov: RegistryProvenance,
 ) -> ClaudeStoreEntry {
+    let description = if is_fragment(kind) {
+        std::fs::read(dest)
+            .ok()
+            .and_then(|b| source::fragment_description(&b))
+    } else {
+        read_description(dest, kind)
+    };
     ClaudeStoreEntry {
         kind: kind.as_str().to_string(),
         name: name.to_string(),
         store_path: dest.to_string_lossy().to_string(),
-        description: read_description(dest, kind),
+        description,
         modified_ms: mtime_ms(dest),
         enabled_in: Vec::new(),
         // WP-12/WP-14: the compiled `requires` are read from the fetched
@@ -563,6 +885,8 @@ fn build_entry(
 
 // ─── core (pure: store is a parameter, tempdir-testable) ──────────────────────
 
+/// Unpinned install (the pre-R57 behaviour: whatever the source serves at
+/// `ref_`). Kept as the entry point for existing callers and tests.
 fn install_core(
     store: &Path,
     kind: Kind,
@@ -572,26 +896,55 @@ fn install_core(
     ref_: Option<&str>,
     from_catalog: bool,
 ) -> Result<ClaudeStoreEntry, String> {
-    ensure_file_based(kind)?;
+    install_core_pinned(
+        store,
+        kind,
+        name,
+        source,
+        url,
+        ref_,
+        from_catalog,
+        &Pin::default(),
+    )
+}
+
+/// Install `kind`/`name` from `url`, refusing anything that isn't `pin`
+/// (R57 · N-C). A pinned install is recorded `pinned` and never tracks HEAD.
+#[allow(clippy::too_many_arguments)]
+fn install_core_pinned(
+    store: &Path,
+    kind: Kind,
+    name: &str,
+    source: ProvenanceSource,
+    url: &str,
+    ref_: Option<&str>,
+    from_catalog: bool,
+    pin: &Pin,
+) -> Result<ClaudeStoreEntry, String> {
+    ensure_installable(kind)?;
     validate_name(name)?;
-    let (dest, version, requires) = fetch_and_adopt(store, kind, name, source, url, ref_)?;
+    let got = fetch_verify_adopt(store, kind, name, source, url, ref_, pin)?;
     let now = now_iso();
     let prov = RegistryProvenance {
         source,
         url: Some(url.to_string()),
         r#ref: ref_.map(|s| s.to_string()),
-        version,
-        canonical_path: dest.to_string_lossy().to_string(),
+        version: got.sha,
+        canonical_path: got.dest.to_string_lossy().to_string(),
         managed: true,
         installed_at: Some(now.clone()),
         updated_at: Some(now),
         // Phase 3: record the catalog discovery origin orthogonally to the
         // resolved fetch mechanism (`source`). Curated-catalog installs opt into
         // auto-update; plain git/npx installs do not (catalog ON, manual OFF).
+        // R57: hook/mcp fragments never auto-update (an in-place fragment update
+        // would strand the copy already spliced into settings — see update).
         from_catalog,
-        auto_update: from_catalog,
+        auto_update: from_catalog && !is_fragment(kind),
+        pinned: pin.is_pinned(),
+        hash: Some(got.hash),
     };
-    let entry = build_entry(kind, name, &dest, requires, prov);
+    let entry = build_entry(kind, name, &got.dest, got.requires, prov);
     let mut rf = registry::load(store);
     registry::upsert_record(&mut rf, entry.clone());
     registry::save(store, &rf)?;
@@ -617,21 +970,51 @@ fn check_update_core(store: &Path, kind: Kind, name: &str) -> Result<UpdateStatu
         ProvenanceSource::Npx => git_ls_remote_sha(&gh_url(url), None)?,
         ProvenanceSource::Local => return Err("local entries have no remote to check".to_string()),
     };
+    // R57: a recorded SHA and the remote's may differ only in length.
+    let behind = !prov
+        .version
+        .as_deref()
+        .is_some_and(|v| v == latest || source::sha_matches(v, &latest));
     Ok(UpdateStatus {
         current: prov.version.clone(),
-        behind: prov.version.as_deref() != Some(latest.as_str()),
+        behind,
         latest: Some(latest),
     })
 }
 
+/// Unpinned update (pre-R57: re-fetch HEAD of the recorded ref). Refused for a
+/// pinned master — see [`update_core_pinned`].
 fn update_core(store: &Path, kind: Kind, name: &str) -> Result<ClaudeStoreEntry, String> {
+    update_core_pinned(store, kind, name, &Pin::default())
+}
+
+/// Re-fetch a managed master into its existing canonical in place (atomic swap,
+/// no relink). R57 · N-C: with a `pin`, exactly the pinned commit is fetched
+/// and a content mismatch is refused; a master installed pinned REQUIRES a pin
+/// here (it never tracks HEAD — Q3).
+fn update_core_pinned(
+    store: &Path,
+    kind: Kind,
+    name: &str,
+    pin: &Pin,
+) -> Result<ClaudeStoreEntry, String> {
     // WP-19: a bundle re-fetches whole (re-run skills-add --skill '*', re-assemble,
     // atomic-swap, re-derive members) — it does NOT flow through the single-skill
-    // fetch_and_adopt path (which rejects Bundle). Dispatch before that.
+    // fetch path (which rejects Bundle). Dispatch before that.
     if kind == Kind::Bundle {
         return update_bundle_core(store, name, &|spec, staging| {
             npx_skills_add_all(spec, staging)
         });
+    }
+    // R57 · N-A: a hook/mcp fragment is spliced into settings files on enable;
+    // swapping the vault copy would leave those spliced copies on the old block
+    // (and a later disable, which matches the vault block, could not find them).
+    if is_fragment(kind) {
+        return Err(format!(
+            "{} {name:?} is a settings fragment: updating it in place is not supported yet — \
+             disable it where it is enabled, remove it, and install it again",
+            kind.as_str()
+        ));
     }
     let rf = registry::load(store);
     let existing = rf
@@ -663,18 +1046,32 @@ fn update_core(store: &Path, kind: Kind, name: &str) -> Result<ClaudeStoreEntry,
             kind.as_str()
         ));
     }
+    if prov.pinned && !pin.is_pinned() {
+        return Err(format!(
+            "{} {name:?} is pinned to {} — an update must name the commit to move to (it never follows HEAD)",
+            kind.as_str(),
+            prov.version.as_deref().map(source::short_sha).unwrap_or("a reviewed version")
+        ));
+    }
     let url = prov
         .url
         .clone()
         .ok_or_else(|| "entry has no source url; cannot update".to_string())?;
-    let (dest, version, requires) =
-        fetch_and_adopt(store, kind, name, prov.source, &url, prov.r#ref.as_deref())?;
+    let got = fetch_verify_adopt(
+        store,
+        kind,
+        name,
+        prov.source,
+        &url,
+        prov.r#ref.as_deref(),
+        pin,
+    )?;
     let new_prov = RegistryProvenance {
         source: prov.source,
         url: prov.url.clone(),
         r#ref: prov.r#ref.clone(),
-        version,
-        canonical_path: dest.to_string_lossy().to_string(),
+        version: got.sha,
+        canonical_path: got.dest.to_string_lossy().to_string(),
         managed: true,
         installed_at: prov.installed_at.clone(),
         updated_at: Some(now_iso()),
@@ -683,8 +1080,11 @@ fn update_core(store: &Path, kind: Kind, name: &str) -> Result<ClaudeStoreEntry,
         // the user's auto-update preference.
         from_catalog: prov.from_catalog,
         auto_update: prov.auto_update,
+        // Once pinned, always pinned: the new pin replaces the old one.
+        pinned: prov.pinned || pin.is_pinned(),
+        hash: Some(got.hash),
     };
-    let entry = build_entry(kind, name, &dest, requires, new_prov);
+    let entry = build_entry(kind, name, &got.dest, got.requires, new_prov);
     let mut rf2 = registry::load(store);
     registry::upsert_record(&mut rf2, entry.clone());
     registry::save(store, &rf2)?;
@@ -821,10 +1221,15 @@ fn install_bundle_core(
             .and_then(|p| p.provenance.installed_at.clone())
             .or_else(|| Some(now.clone())),
         updated_at: Some(now),
-        from_catalog: prior.as_ref().map_or(from_catalog, |p| p.provenance.from_catalog),
+        from_catalog: prior
+            .as_ref()
+            .map_or(from_catalog, |p| p.provenance.from_catalog),
         auto_update: prior
             .as_ref()
             .map_or(from_catalog, |p| p.provenance.auto_update),
+        // R57: bundles install through the `skills` CLI whole; not pinnable yet.
+        pinned: false,
+        hash: None,
     };
     let entry = build_bundle_entry(name, &dest, members, prov);
     let mut rf = registry::load(store);
@@ -857,7 +1262,13 @@ fn update_bundle_core(
         .url
         .clone()
         .ok_or_else(|| "bundle entry has no source spec; cannot update".to_string())?;
-    install_bundle_core(store, name, &spec, existing.provenance.from_catalog, fetch_fn)
+    install_bundle_core(
+        store,
+        name,
+        &spec,
+        existing.provenance.from_catalog,
+        fetch_fn,
+    )
 }
 
 // ─── Phase 3 — auto-update trust policy (catalog ON, local/dev/manual OFF) ────
@@ -889,19 +1300,65 @@ pub struct AutoUpdateSummary {
     pub errored: Vec<AutoUpdateRow>,
 }
 
-/// Run auto-updates across every registry entry with `auto_update == true`:
-/// check each against its remote and re-fetch the stale ones. A per-entry error
-/// is recorded and the batch continues (never aborts). Pure-core (store is a
-/// parameter), tempdir-testable.
+/// A catalog pin the FE hands the auto-update batch (R57 · Q3): where the
+/// signed catalog currently pins `kind`/`name`. Mirrors `ObaCatalogPin` in
+/// `tauri-cmd.ts`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CatalogPin {
+    pub kind: String,
+    pub name: String,
+    #[serde(default)]
+    pub sha: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+/// Unpinned batch (no catalog pins supplied) — pre-R57 entry point.
+#[cfg(test)]
 fn auto_update_all_core(store: &Path) -> AutoUpdateSummary {
+    auto_update_all_pinned(store, &[])
+}
+
+/// Is `entry` behind the catalog `pin`? `None` when the pin carries nothing to
+/// compare (no sha, no hash).
+fn behind_pin(entry: &ClaudeStoreEntry, pin: &Pin) -> Option<bool> {
+    if let Some(want) = &pin.sha {
+        return Some(
+            !entry
+                .provenance
+                .version
+                .as_deref()
+                .is_some_and(|v| source::sha_matches(v, want)),
+        );
+    }
+    pin.hash.as_ref().map(|want| {
+        !entry
+            .provenance
+            .hash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(want))
+    })
+}
+
+/// Run auto-updates across every registry entry with `auto_update == true`. A
+/// per-entry error is recorded and the batch continues (never aborts).
+/// Pure-core (store is a parameter), tempdir-testable.
+///
+/// R57 · Q3 — catalog installs follow the CATALOG, not HEAD:
+///   - an entry with a usable pin in `pins` is behind iff its recorded SHA /
+///     hash differs from the pin, and is re-fetched AT the pin;
+///   - a `pinned` entry with no pin supplied is left alone (current);
+///   - an unpinned legacy entry with no pin keeps the pre-R57 HEAD tracking
+///     (its catalog row is unpinned too — the "installs HEAD" copy).
+fn auto_update_all_pinned(store: &Path, pins: &[CatalogPin]) -> AutoUpdateSummary {
     let rf = registry::load(store);
-    // Snapshot the (kind, name) of opted-in entries up front; each update reloads
-    // + rewrites registry.json, so we don't iterate a live-mutating list.
-    let targets: Vec<(String, String)> = rf
+    // Snapshot the opted-in entries up front; each update reloads + rewrites
+    // registry.json, so we don't iterate a live-mutating list.
+    let targets: Vec<ClaudeStoreEntry> = rf
         .entries
         .iter()
         .filter(|e| e.provenance.auto_update)
-        .map(|e| (e.kind.clone(), e.name.clone()))
+        .cloned()
         .collect();
 
     let mut summary = AutoUpdateSummary {
@@ -909,60 +1366,86 @@ fn auto_update_all_core(store: &Path) -> AutoUpdateSummary {
         current: Vec::new(),
         errored: Vec::new(),
     };
+    let row =
+        |kind: &str, name: &str, status: &str, version: Option<String>, error: Option<String>| {
+            AutoUpdateRow {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                status: status.into(),
+                version,
+                error,
+            }
+        };
 
-    for (kind_s, name) in targets {
+    for entry in targets {
+        let (kind_s, name) = (entry.kind.clone(), entry.name.clone());
         let k = match Kind::parse(&kind_s) {
             Ok(k) => k,
             Err(e) => {
-                summary.errored.push(AutoUpdateRow {
-                    kind: kind_s,
-                    name,
-                    status: "error".into(),
-                    version: None,
-                    error: Some(e),
-                });
+                summary
+                    .errored
+                    .push(row(&kind_s, &name, "error", None, Some(e)));
                 continue;
             }
         };
-        match check_update_core(store, k, &name) {
-            Ok(st) if st.behind => match update_core(store, k, &name) {
-                Ok(entry) => {
-                    tracing::info!(kind = %kind_s, name = %name, "oba auto-update: refreshed stale catalog entry");
-                    summary.updated.push(AutoUpdateRow {
-                        kind: kind_s,
-                        name,
-                        status: "updated".into(),
-                        version: entry.provenance.version,
-                        error: None,
-                    });
+        let catalog_pin = pins
+            .iter()
+            .find(|p| p.kind == kind_s && p.name == name)
+            .map(|p| Pin::from_wire(p.sha.clone(), p.hash.clone()));
+        let pin = match catalog_pin {
+            Some(Ok(p)) if p.is_pinned() => Some(p),
+            Some(Err(e)) => {
+                summary
+                    .errored
+                    .push(row(&kind_s, &name, "error", None, Some(e)));
+                continue;
+            }
+            _ => None,
+        };
+
+        // Decide behind-ness: at the catalog pin, or (legacy) at HEAD.
+        let behind: Result<bool, String> = match (&pin, entry.provenance.pinned) {
+            (Some(p), _) => Ok(behind_pin(&entry, p).unwrap_or(false)),
+            (None, true) => Ok(false),
+            (None, false) => check_update_core(store, k, &name).map(|st| st.behind),
+        };
+        match behind {
+            Ok(true) => {
+                let res = match &pin {
+                    Some(p) => update_core_pinned(store, k, &name, p),
+                    None => update_core(store, k, &name),
+                };
+                match res {
+                    Ok(updated) => {
+                        tracing::info!(kind = %kind_s, name = %name, "oba auto-update: refreshed catalog entry");
+                        summary.updated.push(row(
+                            &kind_s,
+                            &name,
+                            "updated",
+                            updated.provenance.version,
+                            None,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(kind = %kind_s, name = %name, error = %e, "oba auto-update: update failed");
+                        summary
+                            .errored
+                            .push(row(&kind_s, &name, "error", None, Some(e)));
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(kind = %kind_s, name = %name, error = %e, "oba auto-update: update failed");
-                    summary.errored.push(AutoUpdateRow {
-                        kind: kind_s,
-                        name,
-                        status: "error".into(),
-                        version: None,
-                        error: Some(e),
-                    });
-                }
-            },
-            Ok(st) => summary.current.push(AutoUpdateRow {
-                kind: kind_s,
-                name,
-                status: "current".into(),
-                version: st.current,
-                error: None,
-            }),
+            }
+            Ok(false) => summary.current.push(row(
+                &kind_s,
+                &name,
+                "current",
+                entry.provenance.version.clone(),
+                None,
+            )),
             Err(e) => {
                 tracing::warn!(kind = %kind_s, name = %name, error = %e, "oba auto-update: check failed");
-                summary.errored.push(AutoUpdateRow {
-                    kind: kind_s,
-                    name,
-                    status: "error".into(),
-                    version: None,
-                    error: Some(e),
-                });
+                summary
+                    .errored
+                    .push(row(&kind_s, &name, "error", None, Some(e)));
             }
         }
     }
@@ -988,6 +1471,218 @@ fn set_auto_update_core(
     Ok(enabled)
 }
 
+// ─── R57 · N-B — dry-run resolve of a pasted source ───────────────────────────
+//
+// `oba_resolve_source` is what the Store's "Add from URL…" sheet shows BEFORE
+// consent: it fetches into a disposable staging dir, infers the kind, reads the
+// compiled `requires`, hashes the content — and writes nothing to the vault.
+// Install then passes the returned `sha` + `hash` as its pin (N-C), so what is
+// placed is exactly what was reviewed.
+
+/// Result of a dry-run resolve. Mirrors `ResolvedSource` in `tauri-cmd.ts`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedSource {
+    pub kind: String,
+    pub name: String,
+    /// How the kind was found (`root SKILL.md`, `agents/<n>.md`, `as named`…).
+    pub inferred_from: String,
+    /// `"git"` | `"npx"` — the route Install should take.
+    pub source: String,
+    /// The clone URL (git) or `owner/repo` spec (npx) Install should use.
+    pub url: String,
+    /// The branch/tag resolved (git only); `None` = the default branch.
+    #[serde(rename = "ref")]
+    pub git_ref: Option<String>,
+    /// The commit the fetch landed on — the pin Install passes back.
+    pub sha: Option<String>,
+    /// Content hash of the located primitive (`sha256-<hex>`).
+    pub hash: String,
+    /// The primitive's files, relative to its root (capped).
+    pub files: Vec<String>,
+    pub requires: Vec<RequiresEntry>,
+    pub description: Option<String>,
+    /// Always `"unsigned"`: nothing vouches for a pasted source.
+    pub trust: String,
+}
+
+fn files_of(found: &Found, kind: Kind, name: &str) -> Vec<String> {
+    match found {
+        Found::Path(p) if p.is_dir() => source::walk_files(p)
+            .map(|v| {
+                v.into_iter()
+                    .take(source::MAX_LISTED_FILES)
+                    .map(|(rel, _)| rel)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Found::Path(p) => vec![p
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("{name}.md"))],
+        Found::Fragment(_) => vec![format!(
+            "{}/{name}.json",
+            if kind == Kind::Hook { "hooks" } else { "mcp" }
+        )],
+    }
+}
+
+fn describe_found(found: &Found, kind: Kind) -> Option<String> {
+    match found {
+        Found::Path(p) => read_description(p, kind),
+        Found::Fragment(b) => source::fragment_description(b),
+    }
+}
+
+/// Pick the primitive in a fetched tree. With BOTH kind and name the exact
+/// install-time locate runs (so resolve and install agree by construction);
+/// otherwise the bounded inference in `source::infer_in_tree`.
+fn pick_in_tree(
+    root: &Path,
+    kind: Option<Kind>,
+    name: Option<&str>,
+    leaf: &str,
+) -> Result<source::Candidate, String> {
+    if let (Some(k), Some(n)) = (kind, name) {
+        return locate_found(root, k, n).map(|found| source::Candidate {
+            kind: k,
+            name: n.to_string(),
+            how: "as named".into(),
+            found,
+        });
+    }
+    source::infer_in_tree(root, kind, name, leaf)
+}
+
+fn build_resolved(
+    route: ProvenanceSource,
+    url: &str,
+    git_ref: Option<&str>,
+    sha: Option<String>,
+    cand: source::Candidate,
+    requires: Vec<RequiresEntry>,
+) -> Result<ResolvedSource, String> {
+    validate_name(&cand.name)?;
+    Ok(ResolvedSource {
+        kind: cand.kind.as_str().to_string(),
+        files: files_of(&cand.found, cand.kind, &cand.name),
+        description: describe_found(&cand.found, cand.kind),
+        hash: hash_found(&cand.found)?,
+        name: cand.name,
+        inferred_from: cand.how,
+        source: match route {
+            ProvenanceSource::Npx => "npx",
+            _ => "git",
+        }
+        .to_string(),
+        url: url.to_string(),
+        git_ref: git_ref.map(str::to_string),
+        sha,
+        requires,
+        trust: "unsigned".to_string(),
+    })
+}
+
+/// The pure-over-injection resolve core (`npx_add` is the only impure edge that
+/// is not git; git runs against whatever URL is given, `file://` in tests).
+fn resolve_source_core(
+    input: &str,
+    kind: Option<Kind>,
+    name: Option<&str>,
+    git_ref: Option<&str>,
+    npx_add: &dyn Fn(&str, &Path) -> Result<(), String>,
+) -> Result<ResolvedSource, String> {
+    let (route, url) = source::classify_source(input)?;
+    if let Some(n) = name {
+        validate_name(n)?;
+    }
+    if kind == Some(Kind::Bundle) {
+        return Err("a bundle is installed with its own flow, not from a URL".to_string());
+    }
+    let leaf = source::url_leaf(&url);
+    let git_ref = git_ref.map(str::trim).filter(|r| !r.is_empty());
+
+    match route {
+        ProvenanceSource::Npx => {
+            if kind.is_some_and(|k| k != Kind::Skill) {
+                return Err(format!(
+                    "{url} is an npx spec, and `npx skills add` installs skills only — use a git URL for a {}",
+                    kind.map(|k| k.as_str()).unwrap_or("")
+                ));
+            }
+            let gh = gh_url(&url);
+            let head = git_ls_remote_sha(&gh, None).ok();
+            // Preferred: fetch the spec's repo AT its current HEAD through git,
+            // so the SHA reported is the SHA whose content was hashed.
+            if let Some(h) = &head {
+                let staging = staging_dir("resolve-npx");
+                let via_git = (|| {
+                    git_fetch_at_sha(&gh, h, &staging)?;
+                    let cand = pick_in_tree(&staging, Some(Kind::Skill), name, &leaf)?;
+                    let requires = requires_for(&staging, &cand.found);
+                    build_resolved(route, &url, None, Some(h.clone()), cand, requires)
+                })();
+                let _ = std::fs::remove_dir_all(&staging);
+                if via_git.is_ok() {
+                    return via_git;
+                }
+            }
+            // Fallback: the `skills` CLI itself, sandboxed in staging.
+            let staging = staging_dir("resolve-npx-cli");
+            std::fs::create_dir_all(&staging).map_err(|e| format!("mkdir staging: {e}"))?;
+            let res = (|| {
+                npx_add(&url, &staging)?;
+                let located = locate_installed_skill(&staging, name.unwrap_or(&leaf))?;
+                let found_name = name.map(str::to_string).unwrap_or_else(|| {
+                    located
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| leaf.clone())
+                });
+                let requires = read_manifest_requires(&located);
+                let cand = source::Candidate {
+                    kind: Kind::Skill,
+                    name: found_name,
+                    how: "npx skills add".into(),
+                    found: Found::Path(located),
+                };
+                build_resolved(route, &url, None, head.clone(), cand, requires)
+            })();
+            let _ = std::fs::remove_dir_all(&staging);
+            res
+        }
+        _ => {
+            let staging = staging_dir("resolve-git");
+            let res = (|| {
+                git_clone(&url, git_ref, &staging)?;
+                let sha = git_head_sha(&staging)?;
+                let cand = pick_in_tree(&staging, kind, name, &leaf)?;
+                let requires = requires_for(&staging, &cand.found);
+                build_resolved(route, &url, git_ref, Some(sha), cand, requires)
+            })();
+            let _ = std::fs::remove_dir_all(&staging);
+            res
+        }
+    }
+}
+
+/// R57 · N-B: dry-run resolve of a pasted git URL / `owner/repo` spec. Writes
+/// nothing to the vault; staging is removed before this returns.
+#[allow(non_snake_case)]
+pub(crate) async fn oba_resolve_source(
+    url: String,
+    kind: Option<String>,
+    name: Option<String>,
+    gitRef: Option<String>,
+) -> Result<ResolvedSource, String> {
+    let k = match kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(Kind::parse(s)?),
+        None => None,
+    };
+    let n = name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    resolve_source_core(&url, k, n, gitRef.as_deref(), &npx_skills_add)
+}
+
 // ─── Command bodies (thin: resolve the real store root, delegate to core) ─────
 //
 // The desktop's `#[tauri::command]` wrappers of the same names live in
@@ -1001,10 +1696,13 @@ pub(crate) async fn oba_install_git(
     url: String,
     gitRef: Option<String>,
     fromCatalog: Option<bool>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
     let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expectSha, expectHash)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    install_core(
+    install_core_pinned(
         &store,
         k,
         &name,
@@ -1012,6 +1710,7 @@ pub(crate) async fn oba_install_git(
         &url,
         gitRef.as_deref(),
         fromCatalog.unwrap_or(false),
+        &pin,
     )
 }
 
@@ -1025,10 +1724,13 @@ pub(crate) async fn oba_install_npx(
     name: String,
     spec: String,
     fromCatalog: Option<bool>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<ClaudeStoreEntry, String> {
     let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expectSha, expectHash)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    install_core(
+    install_core_pinned(
         &store,
         k,
         &name,
@@ -1036,6 +1738,7 @@ pub(crate) async fn oba_install_npx(
         &spec,
         None,
         fromCatalog.unwrap_or(false),
+        &pin,
     )
 }
 
@@ -1104,19 +1807,32 @@ pub(crate) async fn oba_check_update(kind: String, name: String) -> Result<Updat
 }
 
 /// Re-fetch a managed primitive into its existing canonical in place (no relink).
-pub(crate) async fn oba_update(kind: String, name: String) -> Result<ClaudeStoreEntry, String> {
+/// R57 · N-C: `expectSha` fetches exactly that commit ("Update to <sha>");
+/// `expectHash` must match the fetched content. Required for a pinned master.
+#[allow(non_snake_case)]
+pub(crate) async fn oba_update(
+    kind: String,
+    name: String,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
+) -> Result<ClaudeStoreEntry, String> {
     let k = Kind::parse(&kind)?;
+    let pin = Pin::from_wire(expectSha, expectHash)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    update_core(&store, k, &name)
+    update_core_pinned(&store, k, &name, &pin)
 }
 
 /// Phase 3 — auto-update every `auto_update`-opted entry that's behind its
 /// remote (FE-driven: called on the Ọba/catalog surface mount). Per-entry errors
 /// are collected, never abort the batch. Returns a summary of updated / current /
 /// errored entries.
-pub(crate) async fn oba_auto_update_all() -> Result<AutoUpdateSummary, String> {
+/// R57 · Q3: `pins` are the signed catalog's current pins; a pinned catalog
+/// install moves only to its pin.
+pub(crate) async fn oba_auto_update_all(
+    pins: Option<Vec<CatalogPin>>,
+) -> Result<AutoUpdateSummary, String> {
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
-    Ok(auto_update_all_core(&store))
+    Ok(auto_update_all_pinned(&store, &pins.unwrap_or_default()))
 }
 
 /// Phase 3 — toggle the per-entry auto-update opt-in and persist it to
@@ -1165,6 +1881,35 @@ pub struct CatalogEntryRef {
     #[serde(default)]
     #[allow(dead_code)]
     pub members: Vec<String>,
+    /// R57 · Q3: the catalog pin — a commit SHA (fetched exactly), or a git
+    /// tag/branch when it is not hex. Absent → unpinned (HEAD).
+    #[serde(rename = "ref", default)]
+    pub r#ref: Option<String>,
+    /// R57 · Q3: the catalog content hash (`sha256-<hex>`), verified on fetch.
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+impl CatalogEntryRef {
+    /// The `(pin, git ref)` a fetch from this catalog row uses: a hex `ref` is
+    /// a commit pin; any other `ref` is a branch/tag to clone.
+    fn pin_and_ref(&self) -> Result<(Pin, Option<String>), String> {
+        let r = self
+            .r#ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        match r {
+            Some(r) if source::looks_like_sha(r) => Ok((
+                Pin::from_wire(Some(r.to_string()), self.hash.clone())?,
+                None,
+            )),
+            other => Ok((
+                Pin::from_wire(None, self.hash.clone())?,
+                other.map(str::to_string),
+            )),
+        }
+    }
 }
 
 /// Result of a resolver-driven install: the target plus the dependency closure
@@ -1188,7 +1933,9 @@ fn parse_source(s: &str) -> Result<ProvenanceSource, String> {
         "npx" => Ok(ProvenanceSource::Npx),
         "catalog" => Ok(ProvenanceSource::Git),
         "local" => Ok(ProvenanceSource::Local),
-        other => Err(format!("install source must be git|npx|local, got {other:?}")),
+        other => Err(format!(
+            "install source must be git|npx|local, got {other:?}"
+        )),
     }
 }
 
@@ -1214,7 +1961,12 @@ fn read_manifest_requires(dir: &Path) -> Vec<RequiresEntry> {
 /// registry record. Best-effort (a rollback failure must not mask the original
 /// error). Mirrors the removal half of `oba_safe_delete`.
 fn rollback_install_kn(store: &Path, kind: Kind, name: &str) {
-    if let Ok(canon) = store_path_for(store, kind, name) {
+    let canon = if is_fragment(kind) {
+        fragment_path(store, kind, name)
+    } else {
+        store_path_for(store, kind, name)
+    };
+    if let Ok(canon) = canon {
         if canon.is_dir() {
             let _ = std::fs::remove_dir_all(&canon);
         } else if canon.exists() {
@@ -1293,7 +2045,18 @@ fn install_dep_with(
             )
         })?;
     let src = parse_source(&cat.source)?;
-    let entry = install_core(store, k, &item.name, src, &cat.url, None, true)?;
+    // R57 · Q3: a catalog dep is fetched at its catalog pin.
+    let (pin, git_ref) = cat.pin_and_ref()?;
+    let entry = install_core_pinned(
+        store,
+        k,
+        &item.name,
+        src,
+        &cat.url,
+        git_ref.as_deref(),
+        true,
+        &pin,
+    )?;
     Ok(entry.requires)
 }
 
@@ -1363,6 +2126,8 @@ fn install_requires_closure_core(
     Ok((installed, already_satisfied))
 }
 
+/// Unpinned target (pre-R57 entry point; tests).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn install_with_deps_core(
     store: &Path,
@@ -1375,8 +2140,38 @@ fn install_with_deps_core(
     from_catalog: bool,
     catalog: &[CatalogEntryRef],
 ) -> Result<InstallWithDepsResult, String> {
+    install_with_deps_core_pinned(
+        store,
+        scope_roots,
+        kind,
+        name,
+        source,
+        url,
+        ref_,
+        from_catalog,
+        catalog,
+        &Pin::default(),
+    )
+}
+
+/// [`install_with_deps_core`] with the target pinned (R57 · N-C); the deps
+/// take their pins from their catalog rows.
+#[allow(clippy::too_many_arguments)]
+fn install_with_deps_core_pinned(
+    store: &Path,
+    scope_roots: &[PathBuf],
+    kind: Kind,
+    name: &str,
+    source: ProvenanceSource,
+    url: &str,
+    ref_: Option<&str>,
+    from_catalog: bool,
+    catalog: &[CatalogEntryRef],
+    pin: &Pin,
+) -> Result<InstallWithDepsResult, String> {
     // 1. Fetch the target; its fetched manifest reveals its compiled `requires`.
-    let target_entry = install_core(store, kind, name, source, url, ref_, from_catalog)?;
+    let target_entry =
+        install_core_pinned(store, kind, name, source, url, ref_, from_catalog, pin)?;
     let target_requires = target_entry.requires.clone();
 
     // 2. Install the missing closure; on failure roll the TARGET back too.
@@ -1440,12 +2235,15 @@ pub(crate) async fn oba_install_with_deps(
     gitRef: Option<String>,
     fromCatalog: Option<bool>,
     catalog: Vec<CatalogEntryRef>,
+    expectSha: Option<String>,
+    expectHash: Option<String>,
 ) -> Result<InstallWithDepsResult, String> {
     let k = Kind::parse(&kind)?;
     let src = parse_source(&source)?;
+    let pin = Pin::from_wire(expectSha, expectHash)?;
     let store = store_root().ok_or_else(|| "cannot resolve store root".to_string())?;
     let scope_roots = super::all_scope_roots(db).await;
-    install_with_deps_core(
+    install_with_deps_core_pinned(
         &store,
         &scope_roots,
         k,
@@ -1455,6 +2253,7 @@ pub(crate) async fn oba_install_with_deps(
         gitRef.as_deref(),
         fromCatalog.unwrap_or(false),
         &catalog,
+        &pin,
     )
 }
 
@@ -2076,28 +2875,6 @@ mod tests {
     }
 
     #[test]
-    fn install_rejects_json_fragment_kinds() {
-        let base = unique_tmp("reject_hook");
-        let store = base.join("store");
-        std::fs::create_dir_all(&store).unwrap();
-        let err = install_core(
-            &store,
-            Kind::Hook,
-            "x",
-            ProvenanceSource::Git,
-            "u",
-            None,
-            false,
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("JSON-fragment"),
-            "hook install must be rejected: {err}"
-        );
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
     fn install_git_missing_skill_leaves_no_canonical_no_record() {
         let base = unique_tmp("install_missing");
         let store = base.join("store");
@@ -2488,7 +3265,10 @@ mod tests {
             entry.provenance.version.is_none(),
             "local install resolves no version (no remote)"
         );
-        assert_eq!(entry.provenance.url.as_deref(), Some(src.to_string_lossy().as_ref()));
+        assert_eq!(
+            entry.provenance.url.as_deref(),
+            Some(src.to_string_lossy().as_ref())
+        );
         // auto_update OFF for local (catalog ON, local/manual OFF)
         assert!(!entry.provenance.from_catalog);
         assert!(
@@ -2578,7 +3358,11 @@ mod tests {
 
         let canon = store_path_for(&store, Kind::Skill, "skill-mail").unwrap();
         assert!(canon.join("SKILL.md").is_file());
-        assert_eq!(entry.requires.len(), 1, "requires read from package-root manifest");
+        assert_eq!(
+            entry.requires.len(),
+            1,
+            "requires read from package-root manifest"
+        );
         assert_eq!(entry.requires[0].name, "skill-core");
         std::fs::remove_dir_all(&base).ok();
     }
@@ -2699,7 +3483,10 @@ mod tests {
 
         // the refreshed file is in the canonical; still exactly one record
         let canon = store_path_for(&store, Kind::Skill, "skill-mail").unwrap();
-        assert!(canon.join("NEW.md").is_file(), "reinstall picks up new file");
+        assert!(
+            canon.join("NEW.md").is_file(),
+            "reinstall picks up new file"
+        );
         assert_eq!(entry2.provenance.source, ProvenanceSource::Local);
         let recs: Vec<_> = registry::load(&store)
             .entries
@@ -2737,27 +3524,19 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
 
         // injected skills-add edge: writes 3 member skills, no network.
-        let fetch = |_spec: &str, staging: &Path| make_bundle_staging(staging, &["gamma", "alpha", "beta"]);
+        let fetch =
+            |_spec: &str, staging: &Path| make_bundle_staging(staging, &["gamma", "alpha", "beta"]);
 
-        let entry = install_bundle_core(
-            &store,
-            "atelier",
-            "ikenga-hq/atelier-bundle",
-            false,
-            &fetch,
-        )
-        .expect("bundle install ok");
+        let entry =
+            install_bundle_core(&store, "atelier", "ikenga-hq/atelier-bundle", false, &fetch)
+                .expect("bundle install ok");
 
         // ONE registry record, kind=bundle, members=[sorted leaves]
         assert_eq!(entry.kind, "bundle");
         assert_eq!(entry.name, "atelier");
         assert_eq!(
             entry.members,
-            vec![
-                "alpha".to_string(),
-                "beta".to_string(),
-                "gamma".to_string()
-            ],
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
             "members are the sorted produced leaves"
         );
         assert_eq!(entry.provenance.source, ProvenanceSource::Npx);
@@ -2798,8 +3577,7 @@ mod tests {
         // v1: alpha + beta + gamma
         let fetch_v1 =
             |_s: &str, staging: &Path| make_bundle_staging(staging, &["alpha", "beta", "gamma"]);
-        install_bundle_core(&store, "kit", "owner/kit", true, &fetch_v1)
-            .expect("install v1 ok");
+        install_bundle_core(&store, "kit", "owner/kit", true, &fetch_v1).expect("install v1 ok");
 
         let bundle_dir = store_path_for(&store, Kind::Bundle, "kit").unwrap();
         assert!(bundle_dir.join("gamma").join("SKILL.md").is_file());
@@ -2820,11 +3598,7 @@ mod tests {
         // members re-derived: delta present, gamma gone
         assert_eq!(
             updated.members,
-            vec![
-                "alpha".to_string(),
-                "beta".to_string(),
-                "delta".to_string()
-            ],
+            vec!["alpha".to_string(), "beta".to_string(), "delta".to_string()],
             "member set re-derived on whole-bundle re-fetch"
         );
         // on disk: the bundle dir was atomically swapped — delta exists, gamma removed
@@ -2845,8 +3619,14 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string(), "delta".to_string()],
             "post-update members re-derived + persisted (gamma dropped, delta added)"
         );
-        assert!(recs[0].provenance.auto_update, "auto_update preserved across update");
-        assert!(recs[0].provenance.from_catalog, "from_catalog preserved across update");
+        assert!(
+            recs[0].provenance.auto_update,
+            "auto_update preserved across update"
+        );
+        assert!(
+            recs[0].provenance.from_catalog,
+            "from_catalog preserved across update"
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2926,10 +3706,15 @@ mod tests {
 
         // Pre-seed the bundle (simulates what install_dep would have done on a
         // first install).
-        let fetch =
-            |_s: &str, staging: &Path| make_bundle_staging(staging, &["alpha", "beta"]);
-        install_bundle_core(&store, "studio-archetypes", "owner/studio-arc", false, &fetch)
-            .expect("pre-seed bundle");
+        let fetch = |_s: &str, staging: &Path| make_bundle_staging(staging, &["alpha", "beta"]);
+        install_bundle_core(
+            &store,
+            "studio-archetypes",
+            "owner/studio-arc",
+            false,
+            &fetch,
+        )
+        .expect("pre-seed bundle");
 
         // The bundle record is now in the registry → collect_satisfied will include it.
         let requires = vec![RequiresEntry {
@@ -2945,6 +3730,7 @@ mod tests {
             source: "npx".into(),
             url: "owner/studio-arc".into(),
             members: vec!["alpha".into(), "beta".into()],
+            ..Default::default()
         }];
 
         let (installed, already_satisfied) =
@@ -2957,7 +3743,9 @@ mod tests {
             "already-present bundle must not be re-installed; installed={installed:?}"
         );
         assert!(
-            already_satisfied.iter().any(|p| p.kind == "bundle" && p.name == "studio-archetypes"),
+            already_satisfied
+                .iter()
+                .any(|p| p.kind == "bundle" && p.name == "studio-archetypes"),
             "already-present bundle surfaced in already_satisfied"
         );
         std::fs::remove_dir_all(&base).ok();
@@ -2985,6 +3773,7 @@ mod tests {
             source: "npx".into(),
             url: "ikenga-hq/studio-archetypes".into(),
             members: vec!["alpha".into(), "beta".into()],
+            ..Default::default()
         }];
 
         // Fake skills-add edge: asserts the spec passed in is the CATALOG url
@@ -2999,7 +3788,10 @@ mod tests {
 
         let revealed =
             install_dep_with(&store, &catalog, &item, &fetch).expect("bundle dispatch ok");
-        assert!(revealed.is_empty(), "a bundle reveals no requires of its own");
+        assert!(
+            revealed.is_empty(),
+            "a bundle reveals no requires of its own"
+        );
 
         // Members materialized under store/bundles/<name>/<member>/.
         let bundle_dir = store_path_for(&store, Kind::Bundle, "studio-archetypes").unwrap();
@@ -3036,8 +3828,7 @@ mod tests {
             .expect("pre-seed bundle");
 
         // The skill dep comes from a git repo.
-        let skill_url =
-            make_skill_repo_with_requires(&base, "dep-skill", "dep-skill", "[]");
+        let skill_url = make_skill_repo_with_requires(&base, "dep-skill", "dep-skill", "[]");
 
         let requires = vec![
             RequiresEntry {
@@ -3060,6 +3851,7 @@ mod tests {
                 source: "npx".into(),
                 url: "owner/my-bundle".into(),
                 members: vec!["m1".into(), "m2".into()],
+                ..Default::default()
             },
             CatalogEntryRef {
                 kind: "skill".into(),
@@ -3071,14 +3863,15 @@ mod tests {
         ];
 
         let (installed, already_satisfied) =
-            install_requires_closure_core(&store, &[], &requires, &catalog)
-                .expect("closure ok");
+            install_requires_closure_core(&store, &[], &requires, &catalog).expect("closure ok");
 
         // skill installed (absent), bundle deduped (present)
         assert_eq!(installed.len(), 1, "only the skill dep is new");
         assert_eq!(installed[0].name, "dep-skill");
         assert!(
-            already_satisfied.iter().any(|p| p.kind == "bundle" && p.name == "my-bundle"),
+            already_satisfied
+                .iter()
+                .any(|p| p.kind == "bundle" && p.name == "my-bundle"),
             "bundle deduped"
         );
         std::fs::remove_dir_all(&base).ok();
@@ -3141,5 +3934,587 @@ mod tests {
             "no bundle record written on failure"
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── R57 — git/npx primitives in the Store: N-A / N-B / N-C ──────────────────
+
+    /// A fresh source repo at `base/<dir>` with `files` committed as v1.
+    fn make_repo(base: &Path, dir: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+        let repo = base.join(dir);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"], &repo);
+        git(&["config", "user.email", "t@t"], &repo);
+        git(&["config", "user.name", "t"], &repo);
+        git(&["config", "core.autocrlf", "false"], &repo);
+        commit_files(&repo, files, "v1");
+        (repo.clone(), format!("file://{}", repo.display()))
+    }
+
+    /// Write `files` into `repo` and commit them; returns the new HEAD SHA.
+    fn commit_files(repo: &Path, files: &[(&str, &str)], msg: &str) -> String {
+        for (rel, body) in files {
+            let p = repo.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        git(&["add", "-A"], repo);
+        git(&["commit", "-q", "-m", msg], repo);
+        head_of(repo)
+    }
+
+    fn head_of(repo: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    const HOOK_V1: &str = r#"{"description":"floor","event":"PreToolUse","block":[{"matcher":"Task","hooks":[{"type":"command","command":"echo v1"}]}]}"#;
+
+    fn no_npx(_: &str, _: &Path) -> Result<(), String> {
+        Err("npx must not run in this test".to_string())
+    }
+
+    #[test]
+    fn install_rejects_bundle_kind_on_the_single_install_path() {
+        let base = unique_tmp("reject_bundle");
+        let store = base.join("store");
+        let err = install_core(
+            &store,
+            Kind::Bundle,
+            "x",
+            ProvenanceSource::Git,
+            "u",
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("oba_install_bundle"), "{err}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // N-A ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn n_a_hook_installs_from_git_as_a_store_fragment() {
+        let base = unique_tmp("na_hook");
+        let store = base.join("store");
+        let (_repo, url) = make_repo(&base, "hooks-repo", &[("hooks/floor.json", HOOK_V1)]);
+
+        let entry = install_core(
+            &store,
+            Kind::Hook,
+            "floor",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            true,
+        )
+        .expect("hook install");
+        let frag = fragment_path(&store, Kind::Hook, "floor").unwrap();
+        assert_eq!(std::fs::read_to_string(&frag).unwrap(), HOOK_V1);
+        assert_eq!(entry.store_path, frag.to_string_lossy());
+        assert_eq!(entry.description.as_deref(), Some("floor"));
+        assert!(entry.provenance.from_catalog);
+        assert!(
+            !entry.provenance.auto_update,
+            "a fragment never auto-updates (its spliced settings copies would go stale)"
+        );
+        assert_eq!(
+            entry.provenance.hash.as_deref(),
+            Some(source::content_hash_bytes(HOOK_V1.as_bytes()).as_str())
+        );
+        // The merge engine can read what was written (the enable path).
+        read_hook_fragment_for_test(&store, "floor");
+        // The explicit hook listing now surfaces it, with provenance overlaid.
+        let listed = super::super::list_store_fragments(&store, Kind::Hook);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "floor");
+        let rf = registry::load(&store);
+        assert!(rf
+            .entries
+            .iter()
+            .any(|e| e.kind == "hook" && e.name == "floor"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    fn read_hook_fragment_for_test(store: &Path, name: &str) {
+        super::super::read_hook_fragment(store, name).expect("merge engine reads the fragment");
+    }
+
+    #[test]
+    fn n_a_mcp_installs_from_a_repo_mcp_json() {
+        let base = unique_tmp("na_mcp");
+        let store = base.join("store");
+        let (_repo, url) = make_repo(
+            &base,
+            "mcp-repo",
+            &[(
+                ".mcp.json",
+                r#"{"mcpServers":{"royalti":{"command":"node","args":["s.js"]},"other":{"url":"http://x"}}}"#,
+            )],
+        );
+        install_core(
+            &store,
+            Kind::Mcp,
+            "royalti",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+        )
+        .expect("mcp install");
+        let def = super::super::read_mcp_fragment(&store, "royalti").unwrap();
+        assert_eq!(def["command"], "node");
+        assert!(def.get("mcpServers").is_none(), "the wrapper is unwrapped");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_a_invalid_fragment_and_npx_route_are_refused_without_writes() {
+        let base = unique_tmp("na_bad");
+        let store = base.join("store");
+        let (_repo, url) = make_repo(&base, "bad", &[("hooks/h.json", r#"{"event":1}"#)]);
+        let err = install_core(
+            &store,
+            Kind::Hook,
+            "h",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not a hook fragment"), "{err}");
+        assert!(!fragment_path(&store, Kind::Hook, "h").unwrap().exists());
+        assert!(registry::load(&store).entries.is_empty());
+        let err = install_core(
+            &store,
+            Kind::Hook,
+            "h",
+            ProvenanceSource::Npx,
+            "o/r",
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("skills only"), "{err}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_a_fragment_update_is_refused_and_leaves_it_in_place() {
+        let base = unique_tmp("na_upd");
+        let store = base.join("store");
+        let (repo, url) = make_repo(&base, "h", &[("hooks/floor.json", HOOK_V1)]);
+        install_core(
+            &store,
+            Kind::Hook,
+            "floor",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+        )
+        .unwrap();
+        commit_files(
+            &repo,
+            &[("hooks/floor.json", &HOOK_V1.replace("v1", "v2"))],
+            "v2",
+        );
+        let err = update_core(&store, Kind::Hook, "floor").unwrap_err();
+        assert!(err.contains("settings fragment"), "{err}");
+        let frag = fragment_path(&store, Kind::Hook, "floor").unwrap();
+        assert_eq!(std::fs::read_to_string(frag).unwrap(), HOOK_V1);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_a_fragment_rollback_removes_the_fragment() {
+        let base = unique_tmp("na_rb");
+        let store = base.join("store");
+        let (_repo, url) = make_repo(&base, "h", &[("hooks/floor.json", HOOK_V1)]);
+        install_core(
+            &store,
+            Kind::Hook,
+            "floor",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+        )
+        .unwrap();
+        rollback_install_kn(&store, Kind::Hook, "floor");
+        assert!(!fragment_path(&store, Kind::Hook, "floor").unwrap().exists());
+        assert!(registry::load(&store).entries.is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // N-B ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn n_b_resolve_infers_a_root_skill_and_writes_nothing() {
+        let base = unique_tmp("nb_root");
+        let (repo, url) = make_repo(
+            &base,
+            "release-status",
+            &[
+                (
+                    "SKILL.md",
+                    "---\nname: release-status\ndescription: rs\n---\nbody",
+                ),
+                ("scripts/run.sh", "echo"),
+                (
+                    "manifest.json",
+                    r#"{"requires":[{"kind":"skill","name":"core"}]}"#,
+                ),
+            ],
+        );
+        let r = resolve_source_core(&url, None, None, None, &no_npx).expect("resolve");
+        assert_eq!(r.kind, "skill");
+        assert_eq!(r.name, "release-status");
+        assert_eq!(r.inferred_from, "root SKILL.md");
+        assert_eq!(r.source, "git");
+        assert_eq!(r.sha.as_deref(), Some(head_of(&repo).as_str()));
+        assert_eq!(r.trust, "unsigned");
+        assert_eq!(r.description.as_deref(), Some("rs"));
+        assert!(r.files.contains(&"SKILL.md".to_string()));
+        assert!(r.files.contains(&"scripts/run.sh".to_string()));
+        assert_eq!(r.requires.len(), 1);
+        assert_eq!(r.requires[0].name, "core");
+        assert!(source::looks_like_content_hash(&r.hash));
+        // The resolve's hash is the hash an install of the same tree records.
+        let store = base.join("store");
+        let e = install_core(
+            &store,
+            Kind::Skill,
+            "release-status",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(e.provenance.hash.as_deref(), Some(r.hash.as_str()));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_b_resolve_finds_agents_commands_hooks_and_narrows_by_kind_and_name() {
+        let base = unique_tmp("nb_many");
+        let (_repo, url) = make_repo(
+            &base,
+            "multi",
+            &[
+                ("agents/reviewer.md", "---\ndescription: rev\n---\nx"),
+                ("commands/ship.md", "x"),
+                ("hooks/floor.json", HOOK_V1),
+            ],
+        );
+        let err = resolve_source_core(&url, None, None, None, &no_npx).unwrap_err();
+        assert!(
+            err.contains("3 primitives") && err.contains("pick a Kind"),
+            "{err}"
+        );
+        let a = resolve_source_core(&url, Some(Kind::Agent), None, None, &no_npx).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.name.as_str(), a.inferred_from.as_str()),
+            ("agent", "reviewer", "agents/reviewer.md")
+        );
+        assert_eq!(a.files, vec!["reviewer.md".to_string()]);
+        let h = resolve_source_core(&url, None, Some("floor"), None, &no_npx).unwrap();
+        assert_eq!(h.kind, "hook");
+        assert_eq!(h.files, vec!["hooks/floor.json".to_string()]);
+        // kind + name → the exact install-time locate
+        let c =
+            resolve_source_core(&url, Some(Kind::Command), Some("ship"), None, &no_npx).unwrap();
+        assert_eq!(c.inferred_from, "as named");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_b_resolve_errors_verbatim_and_refuses_bad_input_before_fetching() {
+        let base = unique_tmp("nb_err");
+        let (_repo, url) = make_repo(&base, "empty", &[("README.md", "hi")]);
+        let err = resolve_source_core(&url, None, None, None, &no_npx).unwrap_err();
+        assert!(err.contains("found no anything installable"), "{err}");
+        // npx specs are skills-only — refused with no network
+        let err = resolve_source_core("o/r", Some(Kind::Agent), None, None, &no_npx).unwrap_err();
+        assert!(err.contains("skills only"), "{err}");
+        assert!(resolve_source_core("not a url", None, None, None, &no_npx).is_err());
+        assert!(resolve_source_core(&url, None, Some("../x"), None, &no_npx).is_err());
+        let missing = format!("file://{}", base.join("nope").display());
+        assert!(resolve_source_core(&missing, None, None, None, &no_npx)
+            .unwrap_err()
+            .contains("git clone failed"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // N-C ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn n_c_install_at_the_resolved_pin_even_after_the_source_moves() {
+        let base = unique_tmp("nc_pin");
+        let store = base.join("store");
+        let (repo, url) = make_repo(&base, "s", &[("SKILL.md", "---\nname: s\n---\nv1")]);
+        let r = resolve_source_core(&url, None, None, None, &no_npx).unwrap();
+        // The source moves on between Resolve and Install.
+        commit_files(&repo, &[("SKILL.md", "---\nname: s\n---\nv2")], "v2");
+        let pin = Pin::from_wire(r.sha.clone(), Some(r.hash.clone())).unwrap();
+        let e = install_core_pinned(
+            &store,
+            Kind::Skill,
+            "s",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+            &pin,
+        )
+        .expect("pinned install");
+        assert_eq!(
+            e.provenance.version, r.sha,
+            "installed exactly what was resolved"
+        );
+        assert!(e.provenance.pinned);
+        let body = std::fs::read_to_string(
+            store_path_for(&store, Kind::Skill, "s")
+                .unwrap()
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert!(body.ends_with("v1"), "not HEAD: {body}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_c_hash_or_sha_mismatch_is_refused_and_nothing_is_written() {
+        let base = unique_tmp("nc_mm");
+        let store = base.join("store");
+        let (_repo, url) = make_repo(&base, "s", &[("SKILL.md", "x")]);
+        let wrong_hash = Pin::from_wire(None, Some(format!("sha256-{}", "0".repeat(64)))).unwrap();
+        let err = install_core_pinned(
+            &store,
+            Kind::Skill,
+            "s",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+            &wrong_hash,
+        )
+        .unwrap_err();
+        assert!(err.contains(source::PIN_MISMATCH), "{err}");
+        let absent_sha = Pin::from_wire(
+            Some("0123456789abcdef0123456789abcdef01234567".into()),
+            None,
+        )
+        .unwrap();
+        let err = install_core_pinned(
+            &store,
+            Kind::Skill,
+            "s",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+            &absent_sha,
+        )
+        .unwrap_err();
+        assert!(err.contains(source::PIN_MISMATCH), "{err}");
+        assert!(!store_path_for(&store, Kind::Skill, "s").unwrap().exists());
+        assert!(registry::load(&store).entries.is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_c_pinned_update_requires_a_pin_and_moves_exactly_to_it() {
+        let base = unique_tmp("nc_upd");
+        let store = base.join("store");
+        let (repo, url) = make_repo(&base, "s", &[("SKILL.md", "v1")]);
+        let v1 = head_of(&repo);
+        let pin1 = Pin::from_wire(Some(v1.clone()), None).unwrap();
+        install_core_pinned(
+            &store,
+            Kind::Skill,
+            "s",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            false,
+            &pin1,
+        )
+        .unwrap();
+        let v2 = commit_files(&repo, &[("SKILL.md", "v2")], "v2");
+        let _v3 = commit_files(&repo, &[("SKILL.md", "v3")], "v3");
+
+        let err = update_core(&store, Kind::Skill, "s").unwrap_err();
+        assert!(
+            err.contains("pinned") && err.contains("never follows HEAD"),
+            "{err}"
+        );
+
+        // "Update to <v2>" installs v2 — not the newer v3 HEAD.
+        let pin2 = Pin::from_wire(Some(v2[..7].to_string()), None).unwrap();
+        let e = update_core_pinned(&store, Kind::Skill, "s", &pin2).unwrap();
+        assert_eq!(e.provenance.version.as_deref(), Some(v2.as_str()));
+        assert!(e.provenance.pinned);
+        let body = std::fs::read_to_string(
+            store_path_for(&store, Kind::Skill, "s")
+                .unwrap()
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(body, "v2");
+
+        // A wrong content hash on update leaves v2 in place.
+        let bad = Pin::from_wire(Some(v1), Some(format!("sha256-{}", "1".repeat(64)))).unwrap();
+        assert!(update_core_pinned(&store, Kind::Skill, "s", &bad)
+            .unwrap_err()
+            .contains(source::PIN_MISMATCH));
+        let body = std::fs::read_to_string(
+            store_path_for(&store, Kind::Skill, "s")
+                .unwrap()
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(body, "v2");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_c_auto_update_follows_the_catalog_pin_not_head() {
+        let base = unique_tmp("nc_auto");
+        let store = base.join("store");
+        let (repo, url) = make_repo(&base, "s", &[("SKILL.md", "v1")]);
+        let v1 = head_of(&repo);
+        install_core_pinned(
+            &store,
+            Kind::Skill,
+            "s",
+            ProvenanceSource::Git,
+            &url,
+            None,
+            true,
+            &Pin::from_wire(Some(v1.clone()), None).unwrap(),
+        )
+        .unwrap();
+        let v2 = commit_files(&repo, &[("SKILL.md", "v2")], "v2");
+        let v3 = commit_files(&repo, &[("SKILL.md", "v3")], "v3");
+
+        // No pin supplied: a pinned install stays put even though HEAD moved.
+        let s = auto_update_all_pinned(&store, &[]);
+        assert_eq!(s.current.len(), 1);
+        assert!(s.updated.is_empty());
+
+        // The catalog still pins v1: current.
+        let at = |sha: &str| {
+            vec![CatalogPin {
+                kind: "skill".into(),
+                name: "s".into(),
+                sha: Some(sha.to_string()),
+                hash: None,
+            }]
+        };
+        assert_eq!(auto_update_all_pinned(&store, &at(&v1)).current.len(), 1);
+
+        // The catalog moves the pin to v2: updated to v2, not HEAD (v3).
+        let s = auto_update_all_pinned(&store, &at(&v2));
+        assert_eq!(s.updated.len(), 1, "{s:?}");
+        assert_eq!(s.updated[0].version.as_deref(), Some(v2.as_str()));
+        assert_ne!(Some(v3.as_str()), s.updated[0].version.as_deref());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_c_catalog_dep_is_fetched_at_its_catalog_pin() {
+        let base = unique_tmp("nc_dep");
+        let store = base.join("store");
+        let (_prepo, purl) = make_repo(
+            &base,
+            "parent",
+            &[
+                ("SKILL.md", "p"),
+                (
+                    "manifest.json",
+                    r#"{"requires":[{"kind":"skill","name":"child"}]}"#,
+                ),
+            ],
+        );
+        let (crepo, curl) = make_repo(&base, "child", &[("SKILL.md", "child v1")]);
+        let c1 = head_of(&crepo);
+        commit_files(&crepo, &[("SKILL.md", "child v2")], "v2");
+        let catalog = vec![CatalogEntryRef {
+            kind: "skill".into(),
+            name: "child".into(),
+            source: "git".into(),
+            url: curl,
+            r#ref: Some(c1.clone()),
+            ..Default::default()
+        }];
+        let res = install_with_deps_core(
+            &store,
+            &[],
+            Kind::Skill,
+            "parent",
+            ProvenanceSource::Git,
+            &purl,
+            None,
+            true,
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(
+            res.installed[0].provenance.version.as_deref(),
+            Some(c1.as_str())
+        );
+        assert!(res.installed[0].provenance.pinned);
+        let body = std::fs::read_to_string(
+            store_path_for(&store, Kind::Skill, "child")
+                .unwrap()
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(body, "child v1");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn n_c_npx_rejects_non_skill_kinds_before_any_fetch() {
+        let err = stage_npx(Kind::Agent, "a", "o/r", &Pin::default(), &no_npx)
+            .err()
+            .expect("refused");
+        assert!(err.contains("skills only"), "{err}");
+    }
+
+    #[test]
+    fn n_c_npx_unpinned_runs_the_cli_in_staging() {
+        // The CLI edge is injected: it writes the `.agents/skills/<n>` layout.
+        let fake = |_: &str, staging: &Path| -> Result<(), String> {
+            let d = staging.join(".agents/skills/demo");
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            std::fs::write(d.join("SKILL.md"), "demo").map_err(|e| e.to_string())
+        };
+        let st = stage_npx(
+            Kind::Skill,
+            "demo",
+            "definitely-not/a-real-repo-r57",
+            &Pin::default(),
+            &fake,
+        )
+        .expect("staged");
+        assert!(matches!(&st.found, Found::Path(p) if p.join("SKILL.md").is_file()));
+        assert_eq!(
+            st.hash,
+            source::content_hash_dir(match &st.found {
+                Found::Path(p) => p,
+                _ => unreachable!(),
+            })
+            .unwrap()
+        );
+        st.cleanup();
+        assert!(!st.staging.as_ref().unwrap().exists(), "staging removed");
     }
 }

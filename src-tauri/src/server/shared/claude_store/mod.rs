@@ -85,9 +85,14 @@ mod registry;
 pub(crate) mod install;
 
 pub use install::{
-    resolve_pkg_requires, AutoUpdateSummary, CatalogEntryRef, InstallWithDepsResult,
-    PkgRequiresResult, UpdateStatus,
+    resolve_pkg_requires, AutoUpdateSummary, CatalogEntryRef, CatalogPin, InstallWithDepsResult,
+    PkgRequiresResult, ResolvedSource, UpdateStatus,
 };
+
+/// R57 — the pure half of git/npx primitives in the Store: pins + content
+/// hashes (N-C), source classification + kind inference (N-B), and hook/mcp
+/// fragment validation (N-A). The fetching half is in [`install`].
+mod source;
 
 /// The [`Vault`] a command runs against — home, store and [`Reach`] — and the
 /// daemon's confinement to it (WP-19 slice 7).
@@ -185,6 +190,16 @@ pub struct RegistryProvenance {
     /// `false` (back-compat).
     #[serde(rename = "autoUpdate", default)]
     pub auto_update: bool,
+    /// R57 · N-C: `true` = installed against a reviewed pin (a commit SHA and/or
+    /// a content hash). A pinned master never tracks HEAD — `oba_update` must
+    /// name the pin to move to, and the auto-update batch moves it only to its
+    /// catalog pin. `#[serde(default)]` → pre-R57 entries read `false`.
+    #[serde(default)]
+    pub pinned: bool,
+    /// R57 · N-C: content hash of the installed master (`sha256-<hex>`, see
+    /// `install::content_hash_*`). `None` on pre-R57 entries.
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 impl RegistryProvenance {
@@ -204,6 +219,8 @@ impl RegistryProvenance {
             updated_at: None,
             from_catalog: false,
             auto_update: false,
+            pinned: false,
+            hash: None,
         }
     }
 }
@@ -960,6 +977,50 @@ fn list_store_kind(store: &Path, kind: Kind) -> Vec<ClaudeStoreEntry> {
             members: Vec::new(),
             // Synthesized local provenance; WP-02's registry load overlays real
             // provenance from store/registry.json where present.
+            provenance: RegistryProvenance::local(store_path),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// R57 · N-A: the hook/mcp fragments in the store (`<store>/hooks/*.json`,
+/// `<store>/mcp/*.json`), one entry per valid name, sorted.
+fn list_store_fragments(store: &Path, kind: Kind) -> Vec<ClaudeStoreEntry> {
+    let Ok(probe) = fragment_path(store, kind, "x") else {
+        return Vec::new();
+    };
+    let Some(dir) = probe.parent() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        if !path.is_file() {
+            continue;
+        }
+        let fname = e.file_name().to_string_lossy().to_string();
+        let Some(name) = fname.strip_suffix(".json") else {
+            continue;
+        };
+        if name.starts_with('.') || validate_name(name).is_err() {
+            continue;
+        }
+        let store_path = path.to_string_lossy().to_string();
+        out.push(ClaudeStoreEntry {
+            kind: kind.as_str().to_string(),
+            name: name.to_string(),
+            store_path: store_path.clone(),
+            description: std::fs::read(&path)
+                .ok()
+                .and_then(|b| source::fragment_description(&b)),
+            modified_ms: mtime_ms(&path),
+            enabled_in: Vec::new(),
+            requires: Vec::new(),
+            members: Vec::new(),
             provenance: RegistryProvenance::local(store_path),
         });
     }
@@ -2841,10 +2902,21 @@ pub(crate) async fn claude_store_list_in(
 
     let mut out = Vec::new();
     for k in kinds {
+        if matches!(k, Kind::Hook | Kind::Mcp) {
+            // R57 · N-A: an explicit hook/mcp listing returns the vault's
+            // fragments (`store/{hooks,mcp}/*.json`) with their provenance, so
+            // the Store can tell an installed catalog hook. `enabledIn` stays
+            // empty — enablement of a fragment lives in settings files (the
+            // ngwa snapshot reports it). The kind-less listing is unchanged.
+            for mut entry in list_store_fragments(&store, k) {
+                registry::overlay_provenance(&mut entry, &prov_map);
+                out.push(entry);
+            }
+            continue;
+        }
         if !k.is_file_based() {
-            // hook/mcp catalogs are owned by the WP-03 merge engine; bundle
-            // listing is deferred to a later WP (bundles surface via their
-            // member skills). Either way, skip here.
+            // bundle listing is deferred to a later WP (bundles surface via
+            // their member skills). Skip here.
             continue;
         }
         for mut entry in list_store_kind(&store, k) {
@@ -3853,6 +3925,8 @@ mod tests {
                 updated_at: None,
                 from_catalog: false,
                 auto_update: false,
+                pinned: false,
+                hash: None,
             },
         };
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
