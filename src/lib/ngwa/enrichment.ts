@@ -105,6 +105,41 @@ export function formatUsageTooltip(usage: NgwaUsage | null): string {
 	return lines.join('\n');
 }
 
+const NGWA_KIND_SET: ReadonlySet<string> = new Set<NgwaKind>([
+	'app', 'engine', 'tool', 'sidecar', 'skill', 'agent', 'command', 'hook',
+	'bundle', 'schedule', 'workflow',
+]);
+
+/**
+ * The Ngwa kind for a Store row.
+ *
+ * The registry index's `kind` is the manifest's free-form hint ("skill" |
+ * "embedded" | "windowed" | "engine" | "app" | "bundle"), not an Ngwa kind, so
+ * it can't be cast. An installed pkg uses the kernel's own classification
+ * (`pkg_kind` in `commands/ngwa.rs`: engine → app (ui) → tool (mcp) →
+ * sidecar), the same one the Installed tab shows. Otherwise the hint is
+ * mapped, and the `@ikenga/mcp-*` MCP servers (`ikenga-pkgs/packages/mcp/`),
+ * which declare the hint "skill", are tools.
+ */
+export function storeKindFor(entry: RegistryEntry, installed: NgwaItem | null): NgwaKind {
+	if (installed && NGWA_KIND_SET.has(installed.kind)) return installed.kind as NgwaKind;
+	const hint = (entry.kind ?? '').toLowerCase();
+	switch (hint) {
+		case 'engine':
+			return 'engine';
+		case 'bundle':
+			return 'bundle';
+		case 'app':
+		case 'embedded':
+		case 'windowed':
+			return 'app';
+		case 'skill':
+			return /^@ikenga\/mcp-/.test(entry.name) ? 'tool' : 'skill';
+		default:
+			return NGWA_KIND_SET.has(hint) ? (hint as NgwaKind) : 'app';
+	}
+}
+
 /**
  * Normalized store entry for the Store tab.
  */
@@ -149,7 +184,7 @@ export function buildStoreCatalog(
 				? 'unsigned'
 				: 'signed';
 
-		const kind: NgwaKind = (entry.kind as NgwaKind) ?? 'app';
+		const kind = storeKindFor(entry, installed);
 
 		return {
 			id: entry.name,
