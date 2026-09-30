@@ -12,7 +12,7 @@
 // resolve result's SHA + hash). A pin mismatch is refused by the backend with
 // nothing written, and gets its own state here.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, Check, ChevronDown, Link2, Shield, X } from 'lucide-react';
 import type { NgwaKind } from '@ikenga/contract';
 import type { NgwaCatalogRow } from '@/lib/ngwa/enrichment';
@@ -101,8 +101,20 @@ function ClosureRows({ deps }: { deps: readonly ConsentDep[] }) {
 
 // ─── Install ▾ (P12) ─────────────────────────────────────────────────────────
 
+/** The consent gate's reason, with a live count so a disabled Install reads
+ *  as "not yet", not "broken" — e.g. "Tick every consent above first (2 of 6
+ *  ticked)". */
+export function consentBlockedReason(
+	ticked: number,
+	total: number,
+	text = 'Tick every consent above first'
+): string {
+	return `${text} (${ticked} of ${total} ticked)`;
+}
+
 /** The sheet foot's split Install button: the active project by default, the
- *  caret offers personal. Shared by the catalog and URL sheets. */
+ *  caret offers personal. Shared by the registry, catalog and URL sheets.
+ *  While blocked, the reason is written out beside it (not only a tooltip). */
 export function InstallSplit({
 	projectLabel,
 	blocked,
@@ -120,6 +132,7 @@ export function InstallSplit({
 }) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const menuRef = useRef<HTMLDivElement | null>(null);
+	const reasonId = useId();
 	useEffect(() => {
 		if (!menuOpen) return;
 		function onKey(e: KeyboardEvent) {
@@ -144,43 +157,52 @@ export function InstallSplit({
 		if (blocked || busy) return;
 		onInstall(scope);
 	}
+	const describedBy = blocked && !busy ? reasonId : undefined;
 	return (
-		<div className="installsplit" ref={menuRef}>
-			<button
-				type="button"
-				className="btn primary lg"
-				data-install
-				disabled={Boolean(blocked) || busy}
-				aria-busy={busy || undefined}
-				title={blocked ?? undefined}
-				onClick={() => go('project')}
-			>
-				{verb} to {projectLabel}
-			</button>
-			<button
-				type="button"
-				className="btn primary lg caret"
-				aria-label="Choose install scope"
-				aria-haspopup="menu"
-				aria-expanded={menuOpen}
-				title={blocked ?? 'Choose an install scope'}
-				disabled={Boolean(blocked) || busy}
-				onClick={() => setMenuOpen((o) => !o)}
-			>
-				<ChevronDown className="h-3.5 w-3.5" />
-			</button>
-			{menuOpen && (
-				<div className="cellpop storepop up" role="menu" aria-label="Install scope">
-					<div className="mgroup">Install scope</div>
-					<button type="button" role="menuitem" className="mitem" onClick={() => go('project')}>
-						{verb} to {projectLabel} <span className="msub">default here</span>
-					</button>
-					<button type="button" role="menuitem" className="mitem" onClick={() => go('personal')}>
-						{verb} to personal <span className="msub">workspace · always loaded</span>
-					</button>
-				</div>
+		<>
+			<div className="installsplit" ref={menuRef}>
+				<button
+					type="button"
+					className="btn primary lg"
+					data-install
+					disabled={Boolean(blocked) || busy}
+					aria-busy={busy || undefined}
+					aria-describedby={describedBy}
+					title={blocked ?? undefined}
+					onClick={() => go('project')}
+				>
+					{verb} to {projectLabel}
+				</button>
+				<button
+					type="button"
+					className="btn primary lg caret"
+					aria-label="Choose install scope"
+					aria-haspopup="menu"
+					aria-expanded={menuOpen}
+					title={blocked ?? 'Choose an install scope'}
+					disabled={Boolean(blocked) || busy}
+					onClick={() => setMenuOpen((o) => !o)}
+				>
+					<ChevronDown className="h-3.5 w-3.5" />
+				</button>
+				{menuOpen && (
+					<div className="cellpop storepop up" role="menu" aria-label="Install scope">
+						<div className="mgroup">Install scope</div>
+						<button type="button" role="menuitem" className="mitem" onClick={() => go('project')}>
+							{verb} to {projectLabel} <span className="msub">default here</span>
+						</button>
+						<button type="button" role="menuitem" className="mitem" onClick={() => go('personal')}>
+							{verb} to personal <span className="msub">workspace · always loaded</span>
+						</button>
+					</div>
+				)}
+			</div>
+			{describedBy && (
+				<span className="note" id={reasonId} data-install-blocked>
+					{blocked}
+				</span>
 			)}
-		</div>
+		</>
 	);
 }
 
@@ -414,7 +436,8 @@ export function CatalogSheet({
 
 	let blocked: string | null = null;
 	if (!onInstall) blocked = 'Install is not available here';
-	else if (!allTicked) blocked = 'Tick every consent above first';
+	else if (!allTicked)
+		blocked = consentBlockedReason(consentIds.filter((id) => ticked[id]).length, consentIds.length);
 
 	async function install(scope: StoreInstallScope) {
 		if (!onInstall || blocked || busy) return;
@@ -1234,7 +1257,11 @@ export function AddUrlSheet({
 							? 'Install is not available here'
 							: allTicked
 								? null
-								: 'Tick every box under Share kola first'
+								: consentBlockedReason(
+										consentIds.filter((id) => ticked[id]).length,
+										consentIds.length,
+										'Tick every box under Share kola first'
+									)
 					}
 					busy={installing}
 					onInstall={(s) => void install(r, s)}

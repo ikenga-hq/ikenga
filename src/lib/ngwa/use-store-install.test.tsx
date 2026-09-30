@@ -35,7 +35,13 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 }));
 
 import { useShellStore } from '@/lib/shell/shell-store';
-import { installedScopeWire, storeScopeWire, useStoreInstall } from './use-store-install';
+import {
+	installedScopeWire,
+	isNeedsApproval,
+	type NeedsApprovalError,
+	storeScopeWire,
+	useStoreInstall,
+} from './use-store-install';
 
 const PLAN = [
 	{
@@ -177,13 +183,51 @@ describe('useStoreInstall', () => {
 		expect(invalidatedKeys(invalidate)).toContainEqual(['ngwa', 'snapshot']);
 	});
 
-	it('does not update a pkg whose new version asks for new permissions', async () => {
-		pkgTrustPreviewIncomingMock.mockResolvedValueOnce({ pkg_id: 'com.ikenga.studio' });
+	it('holds back (not fails) a pkg whose new version asks for new permissions', async () => {
+		const review = { pkg_id: 'com.ikenga.studio', manifest_version: '0.8.0' };
+		pkgTrustPreviewIncomingMock.mockResolvedValueOnce(review);
 		const { hook } = setup();
-		await expect(
-			hook.update(entry({ isUpdate: true, installedItem: installed({ kind: 'personal' }) }))
-		).rejects.toThrow(/asks for new permissions/);
+		const e = entry({ isUpdate: true, installedItem: installed({ kind: 'personal' }) });
+		const err = await hook.update(e).catch((x: unknown) => x);
+		expect(isNeedsApproval(err)).toBe(true);
+		expect((err as NeedsApprovalError).approvals).toEqual([{ entry: e, review }]);
+		expect((err as Error).message).not.toMatch(/Installed tab/);
 		expect(pkgInstallFromRegistryMock).not.toHaveBeenCalled();
+	});
+
+	it('an approved update skips the capability diff and installs', async () => {
+		pkgTrustPreviewIncomingMock.mockResolvedValue({ pkg_id: 'com.ikenga.studio' });
+		const { hook } = setup();
+		await hook.update(entry({ isUpdate: true, installedItem: installed({ kind: 'personal' }) }), {
+			approved: true,
+		});
+		expect(pkgTrustPreviewIncomingMock).not.toHaveBeenCalled();
+		expect(pkgInstallFromRegistryMock).toHaveBeenCalledTimes(2);
+	});
+
+	it('updateAll separates approvals from failures', async () => {
+		const mk = (id: string) =>
+			entry({
+				id,
+				displayName: id,
+				isUpdate: true,
+				installedItem: installed({ kind: 'personal' }),
+			});
+		const [a, b, c] = [mk('a'), mk('b'), mk('c')];
+		// a: held for approval · b: fails · c: installs.
+		pkgTrustPreviewIncomingMock
+			.mockResolvedValueOnce({ pkg_id: 'a' })
+			.mockResolvedValueOnce(null)
+			.mockResolvedValueOnce(null);
+		resolveInstallPlanMock.mockRejectedValueOnce(new Error('404')).mockResolvedValueOnce([PLAN[1]]);
+		const { hook } = setup();
+
+		const err = await hook.updateAll([a, b, c]).catch((x: unknown) => x);
+		expect(isNeedsApproval(err)).toBe(true);
+		const held = err as NeedsApprovalError;
+		expect(held.approvals.map((p) => p.entry.id)).toEqual(['a']);
+		expect(held.failures).toEqual(['b: 404']);
+		expect(pkgInstallFromRegistryMock).toHaveBeenCalledTimes(1);
 	});
 
 	it('updateAll runs every entry and reports the failures together', async () => {

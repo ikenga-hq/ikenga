@@ -11,6 +11,7 @@ import { markBrokenEntries, registryNameMatches, useBrokenPkgs } from '@/lib/ngw
 import { mergeCatalogIntoStore } from '@/lib/ngwa/enrichment';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import { useStoreInstall } from '@/lib/ngwa/use-store-install';
+import { useUpdateApprovals } from '@/lib/ngwa/use-update-approvals';
 import { useVaultEntries } from '@/lib/ngwa/use-vault-entries';
 import { useObaAutoUpdateOnMount } from '@/lib/queries/claude-config';
 import { fetchPkgVersionForStore } from '@/lib/registry/client';
@@ -53,6 +54,9 @@ function NgwaStorePage() {
 	// Install / update through the shared signed-registry plan path, and (R57)
 	// the vault path for git / npx primitives.
 	const store = useStoreInstall();
+	// An update held back for new permissions opens the updater's trust
+	// review modal (mounted once, below); approve installs it.
+	const approvals = useUpdateApprovals({ update: store.update });
 	const activeProjectName = useShellStore((s) => {
 		const p = s.projects.find((x) => x.id === s.activeProjectId);
 		return p?.display_name || p?.id;
@@ -100,6 +104,7 @@ function NgwaStorePage() {
 				onInstall={store.install}
 				onUpdate={store.update}
 				onUpdateAll={store.updateAll}
+				updateApprovals={approvals}
 				primitives={primitives}
 				catalogEntries={catalogEntries}
 				vault={vault.entries}
@@ -122,6 +127,7 @@ function NgwaStorePage() {
 				key={initialSelectedId ?? undefined}
 				initialSelectedId={initialSelectedId}
 			/>
+			{approvals.element}
 		</div>
 	);
 }

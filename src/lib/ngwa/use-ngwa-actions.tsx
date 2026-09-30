@@ -8,7 +8,8 @@
 //     scope `'workspace'` = personal, `project:<id>` = a project;
 //   - kernel pkgs: `pkgSetEnabled` / `pkgUninstall`;
 //   - update: the Store's signed-registry path (`useStoreInstall().update`,
-//     which holds back an update that asks for new permissions);
+//     which holds back an update that asks for new permissions — the hold
+//     opens the trust review modal via `useUpdateApprovals`, approve installs);
 //   - Hand to Chi: the Companion dispatch-bar fill (`handToChi`).
 //
 // Every placing / deleting action runs the Scopes guards (`createScopeOps`)
@@ -22,7 +23,8 @@ import { useIsFetching, useQuery, useQueryClient, type QueryClient } from '@tans
 import type { NgwaItem, NgwaSnapshot } from '@ikenga/contract';
 import { loadHome } from '@/lib/home';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
-import { useStoreInstall } from '@/lib/ngwa/use-store-install';
+import { isNeedsApproval, useStoreInstall } from '@/lib/ngwa/use-store-install';
+import { useUpdateApprovals } from '@/lib/ngwa/use-update-approvals';
 import { ngwaSnapshotQueryKey } from '@/lib/ngwa/use-ngwa-snapshot';
 import { useVaultEntries } from '@/lib/ngwa/use-vault-entries';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -540,18 +542,38 @@ export function useNgwaItemActions({
 	const [pending, setPending] = useState(false);
 	const busy = pending || refreshing;
 
-	const exec = useCallback(async (label: string, fn: () => Promise<unknown>) => {
-		setPending(true);
-		setStatus(null);
-		try {
-			await fn();
-			setStatus({ tone: 'ok', text: label });
-		} catch (e) {
-			setStatus({ tone: 'err', text: `${label} failed: ${errText(e)}` });
-		} finally {
-			setPending(false);
-		}
-	}, []);
+	// An update held back for new permissions opens the trust review modal
+	// (the updater's own, controlled) — approve installs it, reject skips it.
+	const approvals = useUpdateApprovals({
+		update: store.update,
+		onApproved: (e) =>
+			setStatus({ tone: 'ok', text: `Updated ${e.displayName} to ${e.latestVersion}` }),
+		onRejected: (e) =>
+			setStatus({ tone: 'ok', text: `Skipped ${e.displayName} ${e.latestVersion}` }),
+	});
+	const requestApproval = approvals.request;
+
+	const exec = useCallback(
+		async (label: string, fn: () => Promise<unknown>) => {
+			setPending(true);
+			setStatus(null);
+			try {
+				await fn();
+				setStatus({ tone: 'ok', text: label });
+			} catch (e) {
+				if (isNeedsApproval(e)) {
+					// A hold, not a failure: the review is the next step.
+					requestApproval(e.approvals);
+					setStatus({ tone: 'ok', text: e.message });
+				} else {
+					setStatus({ tone: 'err', text: `${label} failed: ${errText(e)}` });
+				}
+			} finally {
+				setPending(false);
+			}
+		},
+		[requestApproval]
+	);
 
 	const actionsFor = useCallback(
 		(item: NgwaItem): NgwaItemActionSet => {
@@ -979,6 +1001,7 @@ export function useNgwaItemActions({
 
 	const dialog = (
 		<>
+			{approvals.element}
 			<NgwaConfirmDialog
 				request={confirm}
 				onClose={(result) => {
