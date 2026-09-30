@@ -1,5 +1,12 @@
 # ikenga-desktop
 
+## 0.18.2
+
+### Patch Changes
+
+- 6004afa: A pkg that is on disk but fails to register at boot (for example a manifest still on `ui.nav`) is no longer invisible. Its rail pins are hidden (not deleted) until it registers again, so the rail never shows a dead icon. Ngwa Health now lists it with the parse error, from `pkg_health_scan`'s new `pkgs_dir_unloadable` and `register_failed` kinds, and offers "Reinstall from registry" (or Remove, which deletes the unloadable folder). The Store row reads "installed · failed to load" with a Reinstall action that goes through the normal consent sheet.
+- 23adc9c: Uninstalling a registry or CLI-installed pkg no longer brings it back after a restart. The kernel now moves the pkg's folder under the app's `pkgs` dir to a hidden `.uninstalled-<id>-<time>` backup (kept 7 days, pruned at boot), so boot discovery no longer re-registers it as a local install. Builtin, dev, and out-of-tree local installs are never touched.
+
 ## 0.18.1
 
 ### Patch Changes
