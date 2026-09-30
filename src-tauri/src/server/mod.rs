@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -441,8 +441,12 @@ fn build_router(
         .with_state(state)
 }
 
-async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> impl IntoResponse {
-    state.spa_service.handle(uri).await
+async fn spa_fallback_handler(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    state.spa_service.handle_with(uri, &headers).await
 }
 
 pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {

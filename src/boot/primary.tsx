@@ -18,7 +18,8 @@ import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { startActionsStore } from '@/lib/actions/store';
 import { installKeyDispatcher, startOsShortcutSync } from '@/lib/keymap/dispatcher';
-import { isTauri } from '@/lib/transport';
+import { awaitingFirstToken, isTauri } from '@/lib/transport';
+import { useReauthStore } from '@/lib/transport/reauth-store';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
 import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
@@ -55,6 +56,20 @@ export async function bootPrimary(): Promise<void> {
 	// Sync Ikenga data-attrs onto <html> before first React render so the very
 	// first paint already has the right theme/mode/density/workspace applied.
 	installIkengaDomSync();
+
+	// A browser tab with no token yet can't reach the daemon, and every store
+	// hydration below is an RPC, so awaiting them would leave the screen blank
+	// forever. Show only the connect dialog; entering a token reloads the page
+	// into a normal boot. Desktop never takes this branch (`isTauri()`).
+	if (awaitingFirstToken()) {
+		useReauthStore.getState().showReauth('first-visit');
+		createRoot(document.getElementById('root')!).render(
+			<React.StrictMode>
+				<ReauthOverlay />
+			</React.StrictMode>
+		);
+		return;
+	}
 
 	// Install native menu best-effort (Mac-only; silently no-ops elsewhere).
 	void installNativeMenu();
