@@ -8,6 +8,8 @@
 //! logs and rollback diagnostics ("sidecars", "iyke_routes", "cron_jobs",
 //! ...). Keep them stable — they appear in diagnostics commands.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use serde_json::Value;
 
@@ -30,6 +32,19 @@ pub trait Registry: Send + Sync {
     /// Remove this package's contribution. Must be a no-op if the package
     /// was never registered.
     fn unregister(&self, pkg_id: &str) -> Result<()>;
+
+    /// Stop every OS process this registry started for `pkg_id` and block
+    /// until each has actually exited (or `deadline` passes). `unregister`
+    /// only has to *signal*; this is the barrier the kernel runs before it
+    /// touches the pkg's folder (uninstall's retire, a reinstall's backup
+    /// rename) — on Windows a child still exiting holds the folder open.
+    /// Also unregisters, so it is safe to call without a prior `unregister`.
+    /// Default: nothing to wait for. `Err` means a process may still be
+    /// alive; `lifecycle::StillRunning` is downcastable for the pids.
+    fn quiesce(&self, pkg_id: &str, deadline: Duration) -> Result<()> {
+        let _ = (pkg_id, deadline);
+        Ok(())
+    }
 
     /// Diagnostic snapshot of the registry's current state. Surfaced via
     /// `pkg_kernel_status` for debugging.

@@ -38,6 +38,23 @@ pub(crate) const BACKUP_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 
 /// is a sync Tauri command. Worst case ~350ms, and only when files are locked.
 const RENAME_BACKOFF_MS: &[u64] = &[100, 250];
 
+/// `std::fs::rename` with the same short retry [`retire`] uses: a Windows
+/// handle that is just being released (a child that exited a moment ago, an
+/// AV scan) clears within a few hundred ms. Returns the last error.
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..=RENAME_BACKOFF_MS.len() {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(RENAME_BACKOFF_MS[attempt - 1]));
+        }
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
 /// What [`retire`] did with a pkg's install folder.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Retired {

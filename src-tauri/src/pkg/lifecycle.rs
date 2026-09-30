@@ -62,9 +62,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -108,6 +108,19 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 /// than counting a strike. The supervisor re-spawns every BLOCKED_RETRY
 /// indefinitely until the port frees up or the operator hits Restart.
 const BLOCKED_RETRY: Duration = Duration::from_secs(10);
+
+/// Shutdown: how long a child gets to exit on its own after its stdin is
+/// closed (the MCP stdio convention for "go away") before it is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Shutdown: how long to wait for the child to be reaped after the kill
+/// (Windows: `taskkill /T /F` on the whole tree; elsewhere SIGKILL).
+const SHUTDOWN_KILL_WAIT: Duration = Duration::from_secs(3);
+
+/// Upper bound a caller of [`SidecarSupervisor::stop_and_wait`] should give a
+/// supervised child to go away: the grace period, the kill, plus slack for a
+/// supervisor task that is mid-spawn when the stop lands.
+pub const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "ikenga-desktop";
@@ -170,12 +183,47 @@ const MCP_LOGGING_MESSAGE_METHOD: &str = "notifications/message";
 /// rolling one-second window are dropped (noted once per window via warn).
 const MCP_NOTIFICATION_MAX_PER_SEC: u32 = 20;
 
+/// A supervised child that did not exit within the stop deadline. Returned
+/// (inside `anyhow::Error`, downcastable) by [`SidecarSupervisor::stop_and_wait`]
+/// so callers can name the process that still holds the pkg's folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StillRunning {
+    pub pkg_id: String,
+    /// OS pids of the children that are still alive. Empty when the
+    /// supervisor task did not finish in time and no child pid was known.
+    pub pids: Vec<u32>,
+}
+
+impl std::fmt::Display for StillRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.pids.is_empty() {
+            write!(f, "a process of `{}` did not stop in time", self.pkg_id)
+        } else {
+            let pids: Vec<String> = self.pids.iter().map(|p| p.to_string()).collect();
+            write!(
+                f,
+                "a process of `{}` is still running (pid {})",
+                self.pkg_id,
+                pids.join(", ")
+            )
+        }
+    }
+}
+
+impl std::error::Error for StillRunning {}
+
 #[derive(Default)]
 pub struct SidecarSupervisor {
     /// pkg_id → supervised handle. Reads (call_tool, snapshot) take the read
     /// lock; register/unregister take the write lock briefly. Per-pkg
     /// supervisor tasks themselves do not hold this lock.
     children: RwLock<HashMap<String, Arc<SupervisedSidecar>>>,
+    /// Handles `unregister` has told to shut down whose supervisor task has
+    /// not finished yet. `unregister` only signals (reconcile / disable must
+    /// not block), so without this list a later `stop_and_wait` — uninstall,
+    /// or a registry reinstall about to rename the folder — could no longer
+    /// find the child it has to wait for. Pruned as tasks finish.
+    draining: StdMutex<Vec<Arc<SupervisedSidecar>>>,
     /// AppHandle for emitting lifecycle events. None in unit tests where no
     /// Tauri app is running — emit becomes a no-op.
     app: Option<AppHandle>,
@@ -197,6 +245,7 @@ impl SidecarSupervisor {
     pub fn with_app(app: AppHandle) -> Self {
         Self {
             children: RwLock::new(HashMap::new()),
+            draining: StdMutex::new(Vec::new()),
             app: Some(app),
             pa_db: None,
         }
@@ -282,8 +331,9 @@ impl SidecarSupervisor {
         // works from sync contexts (kernel boot replay calls register()
         // from inside block_on).
         let task = supervised.clone();
+        supervised.mark_running_task();
         tauri::async_runtime::spawn(async move {
-            SupervisedSidecar::supervisor_loop(task).await;
+            SupervisedSidecar::run(task).await;
         });
 
         Ok(())
@@ -337,6 +387,58 @@ impl SidecarSupervisor {
         };
         if let Some(handle) = removed {
             handle.request_shutdown();
+            let mut draining = self.draining.lock().unwrap_or_else(|e| e.into_inner());
+            draining.retain(|h| !h.is_finished());
+            draining.push(handle);
+        }
+        Ok(())
+    }
+
+    /// Stop every supervised child of `pkg_id` and block until each one has
+    /// actually exited, or `deadline` passes. Covers both a still-registered
+    /// pkg (it is unregistered here) and one `unregister` already signalled
+    /// whose task is still draining. Each child gets its stdin closed, then
+    /// [`SHUTDOWN_GRACE`] to exit, then a kill of its whole process tree.
+    ///
+    /// Blocking: call from a sync / `spawn_blocking` context (kernel
+    /// uninstall, registry reinstall), never from inside an async task.
+    ///
+    /// `Err` wraps a [`StillRunning`] naming the pids that survived.
+    pub fn stop_and_wait(&self, pkg_id: &str, deadline: Duration) -> Result<()> {
+        self.shutdown_supervised(pkg_id)?;
+        let handles: Vec<Arc<SupervisedSidecar>> = self
+            .draining
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|h| h.pkg_id == pkg_id)
+            .cloned()
+            .collect();
+        let until = Instant::now() + deadline;
+        let mut pids = Vec::new();
+        let mut unstopped = false;
+        for h in &handles {
+            let left = until.saturating_duration_since(Instant::now());
+            if let Err(pid) = h.wait_stopped(left) {
+                unstopped = true;
+                pids.extend(pid);
+            }
+        }
+        self.draining
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|h| !h.is_finished());
+        if unstopped {
+            log::error!(
+                "[pkg_lifecycle] `{pkg_id}`: supervised child did not stop within {deadline:?} (pids: {pids:?})"
+            );
+            return Err(anyhow::Error::new(StillRunning {
+                pkg_id: pkg_id.to_string(),
+                pids,
+            }));
+        }
+        if !handles.is_empty() {
+            log::info!("[pkg_lifecycle] `{pkg_id}`: supervised children stopped");
         }
         Ok(())
     }
@@ -353,6 +455,10 @@ impl Registry for SidecarSupervisor {
 
     fn unregister(&self, pkg_id: &str) -> Result<()> {
         self.shutdown_supervised(pkg_id)
+    }
+
+    fn quiesce(&self, pkg_id: &str, deadline: Duration) -> Result<()> {
+        self.stop_and_wait(pkg_id, deadline)
     }
 
     fn snapshot(&self) -> Value {
@@ -464,6 +570,21 @@ pub struct SupervisedSidecar {
     next_id: AtomicU64,
     /// Notified by `request_shutdown` to break the supervisor loop.
     shutdown: Notify,
+    /// Sticky shutdown flag. `Notify::notify_waiters` stores no permit, so a
+    /// shutdown that landed while the loop was not parked on `notified()` —
+    /// mid-spawn / mid-handshake — used to be lost: the handshake finished,
+    /// the state flipped ShuttingDown → Running, and the child ran on with
+    /// nothing tracking it (the v0.18.3 `com.ikenga.meetings` orphan). Every
+    /// wait on `shutdown` goes through [`Self::wait_shutdown`], which checks
+    /// this first, and `set_state` refuses to leave ShuttingDown once set.
+    shutdown_requested: AtomicBool,
+    /// OS pid of the current child (0 = none). Set at spawn, before the
+    /// handshake, so a stop that fails can name the holder even when the
+    /// child never reached Running.
+    child_pid: AtomicU32,
+    /// Supervisor-task completion, for [`Self::wait_stopped`].
+    finished: StdMutex<LoopFinish>,
+    finished_cv: Condvar,
     /// Notified by `restart()` (operator action) to break out of any
     /// pending sleep — Blocked retry, RESTART_DELAY, etc. — and re-spawn
     /// immediately.
@@ -550,6 +671,10 @@ impl SupervisedSidecar {
             active: StdMutex::new(None),
             next_id: AtomicU64::new(100),
             shutdown: Notify::new(),
+            shutdown_requested: AtomicBool::new(false),
+            child_pid: AtomicU32::new(0),
+            finished: StdMutex::new(LoopFinish::default()),
+            finished_cv: Condvar::new(),
             restart_kick: Notify::new(),
             blocked_signal: Arc::new(StdMutex::new(None)),
             app,
@@ -614,6 +739,17 @@ impl SupervisedSidecar {
     }
 
     fn set_state(&self, s: State) {
+        // Once shutdown is requested, ShuttingDown is terminal: a handshake,
+        // crash note or restart that completes afterwards must not resurrect
+        // the pkg as Running / Crashed (that is what orphaned the child).
+        if self.shutdown_requested.load(Ordering::SeqCst) && !matches!(s, State::ShuttingDown) {
+            log::debug!(
+                "[pkg_lifecycle] `{}` ignoring → {} (shutdown requested)",
+                self.pkg_id,
+                s.label()
+            );
+            return;
+        }
         let label = s.label();
         log::info!("[pkg_lifecycle] `{}` → {label}", self.pkg_id);
         // Emit before storing so the closure-captured `s` is still readable
@@ -622,11 +758,135 @@ impl SupervisedSidecar {
         *self.state.lock().expect("state lock poisoned") = s;
     }
 
+    /// Atomically promote a freshly handshaken child to Running, unless a
+    /// shutdown landed while it was spawning. Check and store happen under
+    /// the state lock, and `request_shutdown` sets the flag before taking
+    /// that lock, so exactly one of the two wins.
+    fn try_promote_running(&self, pid: u32) -> bool {
+        let mut state = self.state.lock().expect("state lock poisoned");
+        if self.shutdown_requested.load(Ordering::SeqCst)
+            || matches!(&*state, State::ShuttingDown)
+        {
+            return false;
+        }
+        let restarts = match &*state {
+            State::Crashed { retries, .. } => *retries,
+            _ => 0,
+        };
+        let next = State::Running {
+            pid,
+            started_at: Instant::now(),
+            restarts,
+        };
+        log::info!("[pkg_lifecycle] `{}` → running", self.pkg_id);
+        self.emit_lifecycle(&next);
+        *state = next;
+        true
+    }
+
+    /// Resolves once shutdown has been requested. Lost-wakeup safe: the
+    /// `Notified` future is enabled before the flag is checked.
+    async fn wait_shutdown(&self) {
+        loop {
+            let notified = self.shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    /// True once no supervisor task is running for this handle (so it owns
+    /// no child).
+    fn is_finished(&self) -> bool {
+        self.finished.lock().unwrap_or_else(|e| e.into_inner()).active == 0
+    }
+
+    /// Count a supervisor task in. Called before every spawn of `run`, so a
+    /// waiter can never observe "finished" between the spawn and the task's
+    /// first poll. A counter (not a flag) so an operator restart racing the
+    /// previous task's exit can't be marked finished by the old task.
+    fn mark_running_task(&self) {
+        let mut f = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        f.active += 1;
+    }
+
+    fn mark_finished(&self, unstopped_pid: Option<u32>) {
+        let mut f = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        f.active = f.active.saturating_sub(1);
+        if unstopped_pid.is_some() {
+            f.unstopped_pid = unstopped_pid;
+        }
+        self.finished_cv.notify_all();
+    }
+
+    /// Block until the supervisor task has finished and its child is gone.
+    /// `Err(pid)` when the deadline passed first, or the child survived the
+    /// kill; `pid` is `None` if no child was known at that point.
+    fn wait_stopped(&self, deadline: Duration) -> std::result::Result<(), Option<u32>> {
+        let guard = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .finished_cv
+            .wait_timeout_while(guard, deadline, |f| f.active > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.active > 0 {
+            let pid = self.child_pid.load(Ordering::SeqCst);
+            return Err((pid != 0).then_some(pid));
+        }
+        match guard.unstopped_pid {
+            Some(pid) => Err(Some(pid)),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop one child for good: its stdin is (about to be) closed, so give it
+    /// [`SHUTDOWN_GRACE`] to exit, then kill the whole process tree and wait
+    /// [`SHUTDOWN_KILL_WAIT`] for the reap. Returns the pid if it is somehow
+    /// still alive after all that.
+    async fn stop_child(&self, mut child: Child) -> Option<u32> {
+        let pid = child.id();
+        if let Ok(res) = timeout(SHUTDOWN_GRACE, child.wait()).await {
+            if let Err(e) = res {
+                log::warn!("[pkg_lifecycle] `{}` wait on child failed: {e}", self.pkg_id);
+            }
+            self.child_pid.store(0, Ordering::SeqCst);
+            return None;
+        }
+        log::warn!(
+            "[pkg_lifecycle] `{}` child (pid {pid:?}) did not exit within {SHUTDOWN_GRACE:?} of stdin close — killing its process tree",
+            self.pkg_id
+        );
+        kill_process_tree(pid, &mut child).await;
+        match timeout(SHUTDOWN_KILL_WAIT, child.wait()).await {
+            Ok(_) => {
+                self.child_pid.store(0, Ordering::SeqCst);
+                None
+            }
+            Err(_) => {
+                log::error!(
+                    "[pkg_lifecycle] `{}` child (pid {pid:?}) is STILL running {SHUTDOWN_KILL_WAIT:?} after kill — it may keep holding the pkg folder",
+                    self.pkg_id
+                );
+                pid
+            }
+        }
+    }
+
     fn current_state(&self) -> State {
         self.state.lock().expect("state lock poisoned").clone()
     }
 
     fn request_shutdown(&self) {
+        // Flag first: `try_promote_running` checks it under the state lock,
+        // so a handshake finishing concurrently either sees it or is
+        // overwritten by the ShuttingDown store below — never both missed.
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         self.set_state(State::ShuttingDown);
         self.shutdown.notify_waiters();
     }
@@ -743,13 +1003,23 @@ impl SupervisedSidecar {
         outcome.map_err(|e| anyhow!("{e}"))
     }
 
+    /// Task entry point: runs the supervisor loop, then records completion
+    /// (and any child that survived its stop) for `wait_stopped`.
+    async fn run(self_arc: Arc<Self>) {
+        let unstopped = Self::supervisor_loop(self_arc.clone()).await;
+        self_arc.mark_finished(unstopped);
+    }
+
     /// The supervisor task body. Runs spawn / handshake / wait / restart
-    /// until shutdown. One instance per supervised pkg.
-    async fn supervisor_loop(self_arc: Arc<Self>) {
+    /// until shutdown. One instance per supervised pkg. Returns the pid of a
+    /// child that could not be stopped, if any.
+    async fn supervisor_loop(self_arc: Arc<Self>) -> Option<u32> {
         loop {
-            if matches!(self_arc.current_state(), State::ShuttingDown) {
+            if self_arc.is_shutdown_requested()
+                || matches!(self_arc.current_state(), State::ShuttingDown)
+            {
                 self_arc.tear_down_active().await;
-                return;
+                return None;
             }
             // Preserve Crashed / Blocked across loop iterations so the
             // strike counter survives. Pre-2026-05-15 this unconditionally
@@ -779,7 +1049,7 @@ impl SupervisedSidecar {
 
             match self_arc.spawn_and_handshake(crash_tx).await {
                 Ok(child) => {
-                    let shutdown = self_arc.shutdown.notified();
+                    let shutdown = self_arc.wait_shutdown();
                     tokio::pin!(shutdown);
                     tokio::pin!(crash_rx);
                     tokio::select! {
@@ -801,11 +1071,17 @@ impl SupervisedSidecar {
                         }
                         _ = &mut shutdown => {
                             log::info!("[pkg_lifecycle] `{}` shutdown signalled", self_arc.pkg_id);
+                            // Close stdin (the graceful stop), then wait for
+                            // the exit — kill the tree if it doesn't come.
                             self_arc.tear_down_active().await;
-                            drop(child);
-                            return;
+                            return self_arc.stop_child(child).await;
                         }
                     }
+                }
+                Err(e) if self_arc.is_shutdown_requested() => {
+                    // Shut down mid-spawn: `spawn_and_handshake` already
+                    // stopped + reaped the child. Not a crash.
+                    return e.downcast_ref::<StillRunning>().and_then(|s| s.pids.first().copied());
                 }
                 Err(e) => {
                     log::error!(
@@ -825,7 +1101,7 @@ impl SupervisedSidecar {
                 NextAction::RetryAfterCrash => {
                     if !self_arc.sleep_or_kicked(RESTART_DELAY).await {
                         self_arc.set_state(State::ShuttingDown);
-                        return;
+                        return None;
                     }
                 }
                 NextAction::RetryBlocked => {
@@ -836,10 +1112,10 @@ impl SupervisedSidecar {
                     );
                     if !self_arc.sleep_or_kicked(BLOCKED_RETRY).await {
                         self_arc.set_state(State::ShuttingDown);
-                        return;
+                        return None;
                     }
                 }
-                NextAction::Park | NextAction::Stop => return,
+                NextAction::Park | NextAction::Stop => return None,
             }
         }
     }
@@ -848,7 +1124,7 @@ impl SupervisedSidecar {
     /// false → caller should bail) or restart_kick (returns true → caller
     /// proceeds with the next iteration immediately).
     async fn sleep_or_kicked(&self, dur: Duration) -> bool {
-        let shutdown = self.shutdown.notified();
+        let shutdown = self.wait_shutdown();
         let kick = self.restart_kick.notified();
         tokio::pin!(shutdown);
         tokio::pin!(kick);
@@ -876,9 +1152,10 @@ impl SupervisedSidecar {
         // caller that wins the CAS spawns.
         if self.claim_terminal_to_spawning() {
             self.clear_blocked_signal();
+            self.mark_running_task();
             let task = self.clone();
             tauri::async_runtime::spawn(async move {
-                SupervisedSidecar::supervisor_loop(task).await;
+                SupervisedSidecar::run(task).await;
             });
         }
     }
@@ -890,6 +1167,9 @@ impl SupervisedSidecar {
     /// terminal respawn.
     fn claim_terminal_to_spawning(&self) -> bool {
         let mut state = self.state.lock().expect("state lock poisoned");
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            return false;
+        }
         if matches!(&*state, State::Parked { .. } | State::Stopped { .. }) {
             *state = State::Spawning;
             drop(state);
@@ -1177,6 +1457,7 @@ impl SupervisedSidecar {
             .with_context(|| format!("spawn `{} {:?}`", self.server.command, self.server.args))?;
 
         let pid = child.id().unwrap_or(0);
+        self.child_pid.store(pid, Ordering::SeqCst);
         let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stderr = child.stderr.take();
@@ -1193,7 +1474,7 @@ impl SupervisedSidecar {
         }
 
         // Handshake (sync within INIT_TIMEOUT, before we expose ActiveChild).
-        let handshake_result = timeout(INIT_TIMEOUT, async {
+        let handshake = timeout(INIT_TIMEOUT, async {
             let mut init_msg = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1223,8 +1504,21 @@ impl SupervisedSidecar {
             stdin.flush().await.ok();
 
             Ok::<_, anyhow::Error>((stdin, reader))
-        })
-        .await;
+        });
+        // Race the handshake against a shutdown (a reconcile park or an
+        // uninstall landing while the child boots). Dropping the handshake
+        // future drops its stdin, so the child sees EOF; `stop_child` then
+        // waits for the exit and kills the tree if it doesn't come.
+        let handshake_result = tokio::select! {
+            r = handshake => r,
+            _ = self.wait_shutdown() => {
+                log::info!(
+                    "[pkg_lifecycle] `{}` shut down during handshake — stopping child (pid {pid})",
+                    self.pkg_id
+                );
+                return Err(self.stopped_during_spawn(child).await);
+            }
+        };
 
         let (stdin, reader) = match handshake_result {
             Ok(Ok(v)) => v,
@@ -1348,18 +1642,68 @@ impl SupervisedSidecar {
             });
         }
 
-        let prior_restarts = match self.current_state() {
-            State::Crashed { retries, .. } => retries,
-            _ => 0,
-        };
-        self.set_state(State::Running {
-            pid,
-            started_at: Instant::now(),
-            restarts: prior_restarts,
-        });
+        // A shutdown that landed after the handshake finished but before
+        // this point must win: never promote a child whose pkg was parked or
+        // uninstalled meanwhile — stop it instead of orphaning it.
+        if !self.try_promote_running(pid) {
+            log::info!(
+                "[pkg_lifecycle] `{}` handshake completed after shutdown was requested — stopping child (pid {pid}) instead of marking it running",
+                self.pkg_id
+            );
+            self.tear_down_active().await;
+            return Err(self.stopped_during_spawn(child).await);
+        }
 
         Ok(child)
     }
+
+    /// Stop a child whose pkg was shut down before it reached Running, and
+    /// build the `spawn_and_handshake` error for it.
+    async fn stopped_during_spawn(&self, child: Child) -> anyhow::Error {
+        match self.stop_child(child).await {
+            Some(left) => anyhow::Error::new(StillRunning {
+                pkg_id: self.pkg_id.clone(),
+                pids: vec![left],
+            }),
+            None => anyhow!("`{}` shut down during spawn", self.pkg_id),
+        }
+    }
+}
+
+/// Completion record of one supervisor task, guarded by `finished`.
+#[derive(Debug, Default)]
+struct LoopFinish {
+    /// Supervisor tasks currently running for this handle (0 or 1 in
+    /// practice).
+    active: u32,
+    /// A child the task could not stop (still alive after the kill).
+    unstopped_pid: Option<u32>,
+}
+
+/// Kill `child` and, on Windows, every process it started (`taskkill /T /F`
+/// walks the tree while the root is still alive, so it runs first). A node
+/// MCP launched through a shim would otherwise leave the real server running.
+async fn kill_process_tree(pid: Option<u32>, child: &mut Child) {
+    #[cfg(windows)]
+    {
+        if let Some(pid) = pid {
+        use crate::platform::NoConsoleWindow;
+        use std::process::Stdio;
+        // Not executor-routed: a signal to a child the executor already
+        // spawned, not a session spawn (same as `action_exec::kill_tree`).
+        let pid = pid.to_string();
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", pid.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .no_console_window();
+        let _ = timeout(Duration::from_secs(5), cmd.status()).await;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
+    let _ = child.start_kill();
 }
 
 #[derive(Debug)]
@@ -2001,5 +2345,171 @@ mod tests {
         }
         // Ok(...) is also acceptable on hosts where /bin/false somehow
         // completes the MCP handshake (it won't, but don't assume).
+    }
+
+    // ── Stop-and-wait / shutdown race (v0.18.3 `com.ikenga.meetings`) ──────
+
+    /// A shutdown that lands before the handshake finishes must win: the
+    /// promotion to Running is refused and later state writes are ignored.
+    #[test]
+    fn promote_to_running_refused_after_shutdown() {
+        let sidecar = SupervisedSidecar::new(
+            "x".into(),
+            McpServer {
+                name: "t".into(),
+                command: "/bin/sh".into(),
+                args: vec![],
+                env: HashMap::new(),
+                lifecycle: Some("long-lived".into()),
+                restart_when_changed: vec![],
+                auto_restart: true,
+            },
+            PathBuf::from("/tmp"),
+        );
+        assert!(matches!(sidecar.current_state(), State::Spawning));
+        sidecar.request_shutdown();
+        assert!(
+            !sidecar.try_promote_running(4242),
+            "a child whose pkg was shut down mid-spawn must not be promoted"
+        );
+        assert!(matches!(sidecar.current_state(), State::ShuttingDown));
+        // Nor may a late crash note / restart resurrect it.
+        sidecar.note_crash_after_run("late".into());
+        sidecar.set_state(State::Spawning);
+        assert!(matches!(sidecar.current_state(), State::ShuttingDown));
+        assert!(!sidecar.claim_terminal_to_spawning());
+    }
+
+    #[cfg(unix)]
+    mod real_child {
+        use super::*;
+        use std::time::Instant;
+
+        /// Minimal MCP server in POSIX sh: answers `initialize`, then keeps
+        /// reading stdin until EOF (the graceful-stop signal).
+        const MCP_OK: &str = r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; while read l; do :; done"#;
+        /// Same, but the handshake answer arrives only after 1.5s.
+        const MCP_SLOW_HANDSHAKE: &str = r#"read l; sleep 1.5; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; while read l; do :; done"#;
+        /// Answers the handshake, then ignores stdin EOF entirely: only a
+        /// kill stops it.
+        const MCP_STUBBORN: &str =
+            r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; exec sleep 60"#;
+
+        fn sh_pkg(id: &str, script: &str, dir: &std::path::Path) -> Package {
+            let mut pkg = fake_pkg(None, "/bin/sh");
+            pkg.manifest.id = id.into();
+            pkg.manifest.mcp[0] = McpServer {
+                name: "t".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: HashMap::new(),
+                lifecycle: Some("long-lived".into()),
+                restart_when_changed: vec![],
+                auto_restart: true,
+            };
+            pkg.manifest.permissions.shell_execute = vec!["/bin/sh".into()];
+            pkg.install_path = dir.to_path_buf();
+            pkg
+        }
+
+        fn pid_alive(pid: u32) -> bool {
+            // Signal 0 = existence check. The supervisor reaps (waits) its
+            // child, so an exited child is gone, not a zombie.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+
+        fn wait_for(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+            let until = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < until {
+                if f() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        fn running_pid(sup: &SidecarSupervisor, id: &str) -> u32 {
+            let mut pid = 0;
+            wait_for("child to reach running", 20, || {
+                let s = sup.get(id).map(|h| h.status_snapshot());
+                match s {
+                    Some(s) if s.state == "running" => {
+                        pid = s.pid.unwrap_or(0);
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            assert_ne!(pid, 0);
+            pid
+        }
+
+        /// `stop_and_wait` returns only after the child has exited — the
+        /// barrier uninstall now runs before it retires the folder.
+        #[test]
+        fn stop_and_wait_returns_after_child_exit() {
+            let dir = tempfile::tempdir().unwrap();
+            let sup = SidecarSupervisor::new();
+            let id = "com.test.stopwait";
+            sup.register(&sh_pkg(id, MCP_OK, dir.path())).unwrap();
+            let pid = running_pid(&sup, id);
+            assert!(pid_alive(pid));
+
+            // Signal-only unregister first (what the kernel's reverse walk
+            // does), then the blocking barrier must still find the child.
+            sup.unregister(id).unwrap();
+            sup.stop_and_wait(id, STOP_WAIT_TIMEOUT)
+                .expect("child should stop on stdin EOF");
+            assert!(!pid_alive(pid), "child pid {pid} still alive after stop_and_wait");
+            assert!(sup.get(id).is_none());
+            // Idempotent: nothing left to wait for.
+            sup.stop_and_wait(id, Duration::from_millis(50)).unwrap();
+        }
+
+        /// A child that ignores the graceful stop is killed after the grace
+        /// period, and the waiter still sees it gone.
+        #[test]
+        fn stop_and_wait_kills_child_that_ignores_stdin_eof() {
+            let dir = tempfile::tempdir().unwrap();
+            let sup = SidecarSupervisor::new();
+            let id = "com.test.stubborn";
+            sup.register(&sh_pkg(id, MCP_STUBBORN, dir.path())).unwrap();
+            let pid = running_pid(&sup, id);
+            let t0 = Instant::now();
+            sup.stop_and_wait(id, STOP_WAIT_TIMEOUT)
+                .expect("stubborn child should be killed");
+            assert!(t0.elapsed() >= SHUTDOWN_GRACE, "kill must follow the grace period");
+            assert!(!pid_alive(pid), "stubborn child pid {pid} survived the kill");
+        }
+
+        /// The v0.18.3 race: the pkg is parked (unregistered) while its child
+        /// is still in the handshake. The child must be terminated — never
+        /// promoted to Running and left untracked.
+        #[test]
+        fn child_finishing_handshake_after_park_is_terminated() {
+            let dir = tempfile::tempdir().unwrap();
+            let sup = SidecarSupervisor::new();
+            let id = "com.test.parkrace";
+            sup.register(&sh_pkg(id, MCP_SLOW_HANDSHAKE, dir.path())).unwrap();
+            let handle = sup.get(id).expect("supervised");
+            wait_for("child spawn", 10, || handle.child_pid.load(Ordering::SeqCst) != 0);
+            let pid = handle.child_pid.load(Ordering::SeqCst);
+            assert!(matches!(handle.current_state(), State::Spawning));
+
+            // Park mid-handshake (reconcile → Registry::unregister).
+            sup.unregister(id).unwrap();
+            // Give the (slow) handshake time to complete if it were going to.
+            std::thread::sleep(Duration::from_millis(2000));
+            assert!(
+                matches!(handle.current_state(), State::ShuttingDown),
+                "parked child must not be promoted, got {:?}",
+                handle.current_state()
+            );
+            sup.stop_and_wait(id, STOP_WAIT_TIMEOUT).unwrap();
+            assert!(!pid_alive(pid), "parked child pid {pid} was orphaned");
+            assert!(handle.active.lock().unwrap().is_none());
+            assert!(handle.is_finished());
+        }
     }
 }

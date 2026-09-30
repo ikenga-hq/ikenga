@@ -503,6 +503,132 @@ pub struct Kernel {
     pkgs_dir_failures: RwLock<HashMap<PathBuf, String>>,
 }
 
+/// Normalize a stored / wire pkg scope to the kernel's `Option<project_id>`.
+/// `pkg_installed.project_id` is meant to hold `NULL` (workspace) or a bare
+/// project id, but the wire format (`"workspace"`, `"project:<id>"`) and an
+/// empty string have all been seen reaching storage paths. Left raw, any of
+/// them reads as "bound to a project that is never active", and reconcile
+/// parks a workspace pkg for "scope mismatch". Every read and write of the
+/// scope goes through here.
+pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("workspace") {
+        return None;
+    }
+    let id = t.strip_prefix("project:").unwrap_or(t).trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// The reconcile scope rule: a workspace pkg (no project) is live under
+/// every active project; a project pkg only under its own.
+pub(crate) fn scope_wants_live(project_id: Option<&str>, active_project_id: &str) -> bool {
+    match normalize_scope(project_id.map(str::to_string)) {
+        None => true,
+        Some(p) => p == active_project_id,
+    }
+}
+
+/// What one `reconcile_for_project` pass should do, computed from the
+/// installed scopes and the currently-live set. Pure, so it is tested
+/// without a kernel.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcilePlan {
+    /// Live, installed, and bound to a different project → unregister.
+    pub park: Vec<String>,
+    /// Installed, in scope, not live → register.
+    pub resume: Vec<String>,
+    /// In `live` but no longer installed (uninstalled / purged) → drop from
+    /// the live set only. Never "parked": there is nothing left to
+    /// unregister, and logging it as a scope mismatch sent the v0.18.3
+    /// investigation the wrong way.
+    pub forget: Vec<String>,
+}
+
+pub(crate) fn plan_reconcile(
+    installed: &[(String, Option<String>)],
+    live: &HashSet<String>,
+    active_project_id: &str,
+) -> ReconcilePlan {
+    let scopes: HashMap<&str, Option<&str>> = installed
+        .iter()
+        .map(|(id, scope)| (id.as_str(), scope.as_deref()))
+        .collect();
+    let mut plan = ReconcilePlan::default();
+    for id in live {
+        match scopes.get(id.as_str()) {
+            None => plan.forget.push(id.clone()),
+            Some(scope) if !scope_wants_live(*scope, active_project_id) => {
+                plan.park.push(id.clone())
+            }
+            Some(_) => {}
+        }
+    }
+    for (id, scope) in installed {
+        if !live.contains(id) && scope_wants_live(scope.as_deref(), active_project_id) {
+            plan.resume.push(id.clone());
+        }
+    }
+    plan.park.sort();
+    plan.resume.sort();
+    plan.forget.sort();
+    plan
+}
+
+/// Uninstall / reinstall barrier: unregister `pkg_id` from every registry
+/// (reverse order, as uninstall always did), then `quiesce` each one so any
+/// process a registry started for the pkg has *exited* before the caller
+/// touches the pkg's folder. Returns the failures (registry name + error);
+/// empty means everything is stopped.
+pub(crate) fn unregister_and_quiesce(
+    registries: &[Arc<dyn Registry>],
+    pkg_id: &str,
+    deadline: std::time::Duration,
+) -> Vec<(&'static str, anyhow::Error)> {
+    replay_unregisters(registries, pkg_id);
+    let until = std::time::Instant::now() + deadline;
+    let mut failed = Vec::new();
+    for reg in registries.iter().rev() {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if let Err(e) = reg.quiesce(pkg_id, left) {
+            failed.push((reg.name(), e));
+        }
+    }
+    failed
+}
+
+/// Human-readable "who still holds it" for a quiesce failure, e.g.
+/// "a Meetings process is still running (pid 43456)".
+pub(crate) fn describe_still_running(
+    display_name: &str,
+    failures: &[(&'static str, anyhow::Error)],
+) -> String {
+    let pids: Vec<u32> = failures
+        .iter()
+        .filter_map(|(_, e)| e.downcast_ref::<super::lifecycle::StillRunning>())
+        .flat_map(|s| s.pids.iter().copied())
+        .collect();
+    if pids.is_empty() {
+        let why: Vec<String> = failures
+            .iter()
+            .map(|(name, e)| format!("{name}: {e:#}"))
+            .collect();
+        return format!(
+            "a {display_name} process could not be stopped ({})",
+            why.join("; ")
+        );
+    }
+    let list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    format!(
+        "a {display_name} process is still running (pid {})",
+        list.join(", ")
+    )
+}
+
 /// Walk the registries in reverse order calling `unregister`. Per the
 /// `Registry` trait contract, `unregister` must be a no-op on absent
 /// pkgs — so a failure here is logged but never aborts the sequence.
@@ -597,6 +723,7 @@ impl Kernel {
         source: InstallSource,
         project_id: Option<String>,
     ) -> Result<InstalledSummary> {
+        let project_id = normalize_scope(project_id);
         let pkg = Package::load(install_path)
             .with_context(|| format!("load manifest at {}", install_path.display()))?;
         let pkg_id = pkg.manifest.id.clone();
@@ -705,6 +832,14 @@ impl Kernel {
             .write()
             .map_err(|_| anyhow!("installed lock poisoned"))?
             .insert(pkg_id.clone(), summary.clone());
+        // Every registry now has it, so it is live — fresh installs too.
+        // Leaving a fresh install out of `live` made the next reconcile
+        // "resume" (re-register) an already-running pkg, and a project-scoped
+        // fresh install outside the active project could never be parked.
+        self.live
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pkg_id.clone());
 
         // Trust-review modal (2026-05-15): the install itself is implicit
         // consent for the manifest's current capabilities + permissions.
@@ -736,8 +871,6 @@ impl Kernel {
         // restart (mirrors the dev-loop `pkg-reloaded` path). Harmless if the
         // pkg isn't currently mounted — the host filters by pkg_id.
         if is_reinstall {
-            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
-            live.insert(pkg_id.clone());
             if let Err(e) = self.app.emit(
                 "pkg-reloaded",
                 serde_json::json!({ "pkg_id": pkg_id, "version": pkg.manifest.version }),
@@ -825,6 +958,7 @@ impl Kernel {
     /// the pkg isn't installed. The caller should run a reconcile after
     /// updating to start/stop sidecars affected by the change.
     pub fn set_scope(&self, pkg_id: &str, project_id: Option<String>) -> Result<()> {
+        let project_id = normalize_scope(project_id);
         let lock = self.lock_for(pkg_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let exists = self
@@ -926,13 +1060,32 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 "package `{pkg_id}` is shipped with the shell and cannot be uninstalled (disable it instead)"
             ));
         }
-        for reg in self.registries.iter().rev() {
-            if let Err(e) = reg.unregister(pkg_id) {
-                log::warn!(
-                    "[pkg_kernel] unregister `{}` failed for `{pkg_id}` (continuing): {e}",
-                    reg.name()
-                );
-            }
+        // Unregister everywhere, then WAIT until every process a registry
+        // started for this pkg (long-lived MCP / supervised sidecar) has
+        // exited — `unregister` alone only signals. The folder retire below
+        // must not race a child that still has its cwd / files open inside
+        // it (v0.18.3: `node mcp/dist/index.js` kept `com.ikenga.meetings`
+        // locked, the move failed with os error 32, and a reinstall then
+        // failed on the same lock).
+        let reaped = crate::commands::pkg_sidecar_stream::shutdown_pkg_sidecars(pkg_id);
+        if reaped > 0 {
+            log::info!("[pkg_kernel] uninstall `{pkg_id}`: closed {reaped} streaming sidecar(s)");
+        }
+        let still_running = unregister_and_quiesce(
+            &self.registries,
+            pkg_id,
+            super::lifecycle::STOP_WAIT_TIMEOUT,
+        );
+        if !still_running.is_empty() {
+            let name = prior
+                .as_ref()
+                .and_then(|(_, p)| Package::load(Path::new(p)).ok())
+                .map(|p| p.manifest.name)
+                .unwrap_or_else(|| pkg_id.to_string());
+            log::error!(
+                "[pkg_kernel] uninstall `{pkg_id}`: {} — its install dir may stay locked until it exits",
+                describe_still_running(&name, &still_running)
+            );
         }
         // WP-23 (D-18): drop this pkg's scoped-db bearer token so a still-running
         // (or leaked) backend process can't keep querying under the identity of a
@@ -947,10 +1100,14 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .write()
             .map_err(|_| anyhow!("installed lock poisoned"))?
             .remove(pkg_id);
+        self.live
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(pkg_id);
         // Retire the folder of a registry / CLI install (a direct child of
         // `pkgs_dir`) so `install_from_pkgs_dir` doesn't re-register it as
-        // `Local` at the next boot. Runs after every registry unregistered the
-        // pkg (supervised sidecars / MCP children stopped). Moves to a
+        // `Local` at the next boot. Runs only after every registry unregistered
+        // the pkg and its supervised sidecars / MCP children exited (above). Moves to a
         // dot-prefixed backup; Builtin / Dev / out-of-tree Local paths are
         // left alone. A failure here is logged, not returned: the kernel side
         // of the uninstall is already complete and consistent.
@@ -982,6 +1139,33 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         }
         log::info!("[pkg_kernel] uninstalled `{pkg_id}` (restart for full ACL revocation)");
         Ok(())
+    }
+
+    /// Stop every running process of an installed pkg and wait for each to
+    /// exit, leaving it unregistered. The registry installer calls this before
+    /// it renames the existing install dir to `.bak-<id>`: a live child
+    /// holding the dir makes that rename fail with os error 32 on Windows.
+    /// The following `install_from_path` re-registers (and so restarts) the
+    /// pkg from the new files; on a failed swap the caller re-registers via
+    /// [`Self::reload_pkg`]. `Err` names the process still holding the dir.
+    pub fn stop_pkg_processes(&self, pkg_id: &str) -> Result<()> {
+        let lock = self.lock_for(pkg_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        crate::commands::pkg_sidecar_stream::shutdown_pkg_sidecars(pkg_id);
+        let failed = unregister_and_quiesce(
+            &self.registries,
+            pkg_id,
+            super::lifecycle::STOP_WAIT_TIMEOUT,
+        );
+        if failed.is_empty() {
+            return Ok(());
+        }
+        let name = self
+            .installed_summary(pkg_id)
+            .and_then(|s| Package::load(Path::new(&s.install_path)).ok())
+            .map(|p| p.manifest.name)
+            .unwrap_or_else(|| pkg_id.to_string());
+        Err(anyhow!("{}", describe_still_running(&name, &failed)))
     }
 
     /// Live enable/disable. Disable walks registries in reverse so spawning
@@ -1368,7 +1552,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                         installed_at,
                         compatible: true,
                         source,
-                        project_id,
+                        project_id: normalize_scope(project_id),
                     };
 
                     if needs_review {
@@ -1910,14 +2094,19 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             "reconcile_for_project called from inside an async task — use spawn_blocking (issue #130)"
         );
         let _reconcile = self.reconcile_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let installed = self.list_installed();
-        let want_live: std::collections::HashSet<String> = installed
+        // Read the installed set through the poison-tolerant path: an empty
+        // list (the old `list_installed` fallback on a poisoned lock) would
+        // have parked every live pkg as a "scope mismatch".
+        let installed: Vec<InstalledSummary> = self
+            .installed
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let scopes: Vec<(String, Option<String>)> = installed
             .iter()
-            .filter(|s| match &s.project_id {
-                None => true,
-                Some(p) => p == active_project_id,
-            })
-            .map(|s| s.id.clone())
+            .map(|s| (s.id.clone(), s.project_id.clone()))
             .collect();
 
         let prev_live: std::collections::HashSet<String> = self
@@ -1926,16 +2115,24 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        let mut parked_ids: Vec<String> = Vec::new();
+        let plan = plan_reconcile(&scopes, &prev_live, active_project_id);
+        let mut parked_ids: Vec<String> = plan.forget.clone();
         let mut resumed_ids: Vec<String> = Vec::new();
+        for pkg_id in &plan.forget {
+            log::debug!("[pkg_kernel] reconcile: `{pkg_id}` no longer installed — dropping from live set");
+        }
 
-        // Park anything live → not in target set.
-        for pkg_id in prev_live
-            .difference(&want_live)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            log::info!("[pkg_kernel] reconcile: parking `{pkg_id}` (scope mismatch)");
+        // Park anything live whose project scope excludes the active project.
+        // Workspace pkgs never land here (`scope_wants_live`).
+        for pkg_id in plan.park {
+            let scope = installed
+                .iter()
+                .find(|s| s.id == pkg_id)
+                .and_then(|s| s.project_id.clone())
+                .unwrap_or_default();
+            log::info!(
+                "[pkg_kernel] reconcile: parking `{pkg_id}` (scope mismatch: project `{scope}`, active `{active_project_id}`)"
+            );
             for reg in self.registries.iter().rev() {
                 if let Err(e) = reg.unregister(&pkg_id) {
                     log::warn!(
@@ -1947,12 +2144,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             parked_ids.push(pkg_id);
         }
 
-        // Resume anything in target set → not yet live.
-        for pkg_id in want_live
-            .difference(&prev_live)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
+        // Resume anything in scope that is not yet live.
+        for pkg_id in plan.resume {
             let install_path = installed
                 .iter()
                 .find(|s| s.id == pkg_id)
@@ -2606,5 +2799,224 @@ mod tests {
             serde_json::to_value(HealthIssueKind::RegisterFailed).unwrap(),
             serde_json::json!({ "kind": "register_failed" })
         );
+    }
+
+    // ── Reconcile scope rule (v0.18.3: workspace pkg parked at boot) ───────
+
+    #[test]
+    fn normalize_scope_maps_wire_and_blank_values_to_workspace() {
+        assert_eq!(normalize_scope(None), None);
+        assert_eq!(normalize_scope(Some(String::new())), None);
+        assert_eq!(normalize_scope(Some("  ".into())), None);
+        assert_eq!(normalize_scope(Some("workspace".into())), None);
+        assert_eq!(normalize_scope(Some("project:".into())), None);
+        assert_eq!(normalize_scope(Some("project:p1".into())), Some("p1".into()));
+        assert_eq!(normalize_scope(Some("p1".into())), Some("p1".into()));
+    }
+
+    #[test]
+    fn reconcile_never_parks_workspace_scoped_pkg() {
+        let live: HashSet<String> = [
+            "com.ikenga.meetings",
+            "com.test.blank",
+            "com.test.wire",
+            "com.test.other_project",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let installed = vec![
+            ("com.ikenga.meetings".to_string(), None),
+            // Stale / non-normalized "workspace" spellings must read as workspace.
+            ("com.test.blank".to_string(), Some(String::new())),
+            ("com.test.wire".to_string(), Some("workspace".to_string())),
+            ("com.test.other_project".to_string(), Some("p-other".to_string())),
+        ];
+        for active in ["default", "p-active", "p-other"] {
+            let plan = plan_reconcile(&installed, &live, active);
+            for ws in ["com.ikenga.meetings", "com.test.blank", "com.test.wire"] {
+                assert!(
+                    !plan.park.contains(&ws.to_string()),
+                    "workspace pkg `{ws}` parked under active `{active}`: {plan:?}"
+                );
+            }
+            assert_eq!(
+                plan.park.contains(&"com.test.other_project".to_string()),
+                active != "p-other",
+                "project pkg parks exactly when its project isn't active ({active})"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_forgets_uninstalled_ids_instead_of_parking() {
+        // A live id with no install row (uninstalled / purged, or an installed
+        // snapshot read that came back empty) is dropped from `live`, never
+        // unregistered as a "scope mismatch".
+        let live: HashSet<String> = ["com.ikenga.meetings".to_string()].into_iter().collect();
+        let plan = plan_reconcile(&[], &live, "default");
+        assert!(plan.park.is_empty(), "{plan:?}");
+        assert_eq!(plan.forget, vec!["com.ikenga.meetings".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_resumes_only_in_scope_pkgs_that_are_not_live() {
+        let live: HashSet<String> = ["com.a".to_string()].into_iter().collect();
+        let installed = vec![
+            ("com.a".to_string(), None),
+            ("com.b".to_string(), None),
+            ("com.c".to_string(), Some("p1".to_string())),
+            ("com.d".to_string(), Some("p2".to_string())),
+        ];
+        let plan = plan_reconcile(&installed, &live, "p1");
+        assert_eq!(plan.resume, vec!["com.b".to_string(), "com.c".to_string()]);
+        assert!(plan.park.is_empty());
+    }
+
+    // ── Uninstall / reinstall barrier ──────────────────────────────────────
+
+    /// Records unregister + quiesce, and can refuse to quiesce like a child
+    /// that would not die.
+    struct QuiesceRecorder {
+        name: &'static str,
+        stuck_pid: Option<u32>,
+        events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl Registry for QuiesceRecorder {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn register(&self, _pkg: &Package) -> Result<()> {
+            Ok(())
+        }
+        fn unregister(&self, pkg_id: &str) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("unregister:{}:{pkg_id}", self.name));
+            Ok(())
+        }
+        fn quiesce(&self, pkg_id: &str, _deadline: std::time::Duration) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("quiesce:{}:{pkg_id}", self.name));
+            match self.stuck_pid {
+                Some(pid) => Err(anyhow::Error::new(crate::pkg::lifecycle::StillRunning {
+                    pkg_id: pkg_id.to_string(),
+                    pids: vec![pid],
+                })),
+                None => Ok(()),
+            }
+        }
+        fn snapshot(&self) -> Value {
+            Value::Null
+        }
+    }
+
+    #[test]
+    fn unregister_and_quiesce_unregisters_everything_before_waiting() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let regs: Vec<Arc<dyn Registry>> = vec![
+            Arc::new(QuiesceRecorder { name: "a", stuck_pid: None, events: events.clone() }),
+            Arc::new(QuiesceRecorder { name: "b", stuck_pid: None, events: events.clone() }),
+        ];
+        let failed = unregister_and_quiesce(&regs, "com.x", std::time::Duration::from_secs(1));
+        assert!(failed.is_empty());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "unregister:b:com.x",
+                "unregister:a:com.x",
+                "quiesce:b:com.x",
+                "quiesce:a:com.x",
+            ]
+        );
+    }
+
+    #[test]
+    fn unregister_and_quiesce_names_the_holder_when_a_child_survives() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let regs: Vec<Arc<dyn Registry>> = vec![
+            Arc::new(QuiesceRecorder { name: "a", stuck_pid: None, events: events.clone() }),
+            Arc::new(QuiesceRecorder {
+                name: "sidecar_supervisor",
+                stuck_pid: Some(43456),
+                events: events.clone(),
+            }),
+        ];
+        let failed = unregister_and_quiesce(
+            &regs,
+            "com.ikenga.meetings",
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "sidecar_supervisor");
+        assert_eq!(
+            describe_still_running("Meetings", &failed),
+            "a Meetings process is still running (pid 43456)"
+        );
+    }
+
+    /// End to end with the real supervisor: uninstall's barrier stops a
+    /// supervised long-lived MCP child and waits for it to exit, and only
+    /// then is the install folder retired.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_barrier_stops_supervised_child_before_folder_is_retired() {
+        use crate::pkg::lifecycle::{SidecarSupervisor, STOP_WAIT_TIMEOUT};
+        use crate::pkg::manifest::McpServer;
+
+        let pkgs = tempfile::tempdir().unwrap();
+        let id = "com.test.uninstall_child";
+        let install = pkgs.path().join(id);
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("manifest.json"), "{}").unwrap();
+
+        let mut pkg = fixture_pkg(id);
+        pkg.install_path = install.clone();
+        pkg.manifest.permissions.shell_execute = vec!["/bin/sh".into()];
+        pkg.manifest.mcp.push(McpServer {
+            name: "t".into(),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{}}'; while read l; do :; done"#
+                    .into(),
+            ],
+            env: std::collections::HashMap::new(),
+            lifecycle: Some("long-lived".into()),
+            restart_when_changed: vec![],
+            auto_restart: true,
+        });
+
+        let sup = Arc::new(SidecarSupervisor::new());
+        sup.register(&pkg).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let pid = loop {
+            let s = sup.statuses();
+            if let Some(s) = s.iter().find(|s| s.pkg_id == id && s.state == "running") {
+                break s.pid.expect("running child has a pid");
+            }
+            assert!(std::time::Instant::now() < until, "child never reached running");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        let alive = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        assert!(alive(pid));
+
+        let regs: Vec<Arc<dyn Registry>> = vec![sup.clone() as Arc<dyn Registry>];
+        let failed = unregister_and_quiesce(&regs, id, STOP_WAIT_TIMEOUT);
+        assert!(failed.is_empty(), "child did not stop: {failed:?}");
+        assert!(!alive(pid), "child pid {pid} still running when the folder would be retired");
+
+        let source = InstallSource::Local {
+            path: install.display().to_string(),
+        };
+        match uninstall_dir::retire(pkgs.path(), &install, &source).unwrap() {
+            uninstall_dir::Retired::BackedUp(to) => assert!(to.is_dir()),
+            other => panic!("expected the folder to move, got {other:?}"),
+        }
+        assert!(!install.exists());
     }
 }
