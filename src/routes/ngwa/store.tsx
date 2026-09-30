@@ -7,6 +7,7 @@
 import { useCallback, useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { z } from 'zod';
+import { markBrokenEntries, registryNameMatches, useBrokenPkgs } from '@/lib/ngwa/broken-pkgs';
 import { mergeCatalogIntoStore } from '@/lib/ngwa/enrichment';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import { useStoreInstall } from '@/lib/ngwa/use-store-install';
@@ -30,10 +31,13 @@ const searchSchema = z.object({
 	search: z.string().optional(),
 	/** `ngwa.add-from-url`: open the Add from URL sheet. */
 	addurl: z.union([z.string(), z.number(), z.boolean()]).optional(),
+	/** A pkg id (or registry name): open its sheet. Health's "Reinstall from
+	 *  registry" lands here so the reinstall goes through the sheet's consent. */
+	pkg: z.string().optional(),
 });
 
 function NgwaStorePage() {
-	const { addurl } = Route.useSearch();
+	const { addurl, pkg } = Route.useSearch();
 	const navigate = useNavigate();
 	const { items, storeCatalog, isLoading, error, refetch } = useNgwaSnapshot();
 	// The install sheet lazily reads the selected pkg's detail file, relative
@@ -58,9 +62,15 @@ function NgwaStorePage() {
 	const catalogQuery = usePrimitiveCatalogResult();
 	const catalogEntries = catalogQuery.data?.entries ?? [];
 	const vault = useVaultEntries();
-	const { registry, primitives } = useMemo(
-		() => mergeCatalogIntoStore(storeCatalog, catalogEntries, vault.entries),
-		[storeCatalog, catalogEntries, vault.entries]
+	// On disk but failed to register → the row reads Reinstall (install health).
+	const broken = useBrokenPkgs();
+	const { registry, primitives } = useMemo(() => {
+		const merged = mergeCatalogIntoStore(storeCatalog, catalogEntries, vault.entries);
+		return { ...merged, registry: markBrokenEntries(merged.registry, broken) };
+	}, [storeCatalog, catalogEntries, vault.entries, broken]);
+	const initialSelectedId = useMemo(
+		() => (pkg ? (storeCatalog.find((e) => registryNameMatches(e.name, pkg))?.id ?? pkg) : null),
+		[pkg, storeCatalog]
 	);
 	const catalogStatus = catalogQuery.isLoading
 		? 'loading'
@@ -108,6 +118,9 @@ function NgwaStorePage() {
 					void navigate({ to: '/ngwa/installed', search: { search: name } })
 				}
 				initialAddUrl={addurl !== undefined}
+				// Keyed so a late-loading catalog (or a new ?pkg=) re-opens the sheet.
+				key={initialSelectedId ?? undefined}
+				initialSelectedId={initialSelectedId}
 			/>
 		</div>
 	);

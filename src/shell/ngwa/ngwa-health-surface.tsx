@@ -4,7 +4,9 @@
 // of the (slow) Ngwa snapshot:
 //   1. Violations — `pkg_permission_violations` (full list, per-pkg Clear) and
 //      the install-integrity scan (`pkgHealthScan`, Remove / Remove all), plus
-//      the unsigned count from the snapshot (gate §5).
+//      the unsigned count from the snapshot (gate §5). A pkg on disk that
+//      failed to register offers D-02's "Reinstall from registry" when the
+//      registry lists it — the Store sheet runs it, consent included.
 //   2. Sidecars  — `pkgKernelStatus().registries.sidecar_supervisor`, Restart.
 //   3. Cron      — agent-ops jobs (`agentOpsListJobs`, Run now, Logs) and pkg
 //      manifest `cron[]` (`registries.cron`, no run history) — DEC-33.
@@ -34,6 +36,7 @@ import {
 	dataHealthDbSize,
 	dataHealthScan,
 	detectAgent,
+	isUnregisteredPkgIssue,
 	pkgHealthRemove,
 	pkgHealthRemoveAll,
 	pkgHealthScan,
@@ -71,6 +74,11 @@ export interface NgwaHealthSurfaceProps {
 	section?: HealthSection;
 	onOpenBackup: () => void;
 	onOpenStore: () => void;
+	/** Is this pkg id in the registry? Gates "Reinstall from registry". */
+	canReinstall?: (pkgId: string) => boolean;
+	/** D-02 "Reinstall from registry": open the pkg's Store sheet, where the
+	 *  shared registry install path runs behind the consent step. */
+	onReinstall?: (pkgId: string) => void;
 	/** Injectable clock so "Audited N min ago" is testable. */
 	now?: () => number;
 }
@@ -129,7 +137,53 @@ export function issueLabel(kind: PkgHealthIssueKind): string {
 			return `api ${kind.ikenga_api}`;
 		case 'orphan_row':
 			return `orphan: ${kind.table}`;
+		case 'pkgs_dir_unloadable':
+			return 'failed to load';
+		case 'register_failed':
+			return 'not registered';
 	}
+}
+
+/** The confirm for one install-health row's Remove. A pkgs-dir entry that
+ *  failed to load has no record — the pkg is its folder — so Remove deletes
+ *  that folder; every other kind is a DB-record purge. */
+function removeRequest(r: PkgHealthIssue): ConfirmRequest {
+	if (r.issue.kind === 'pkgs_dir_unloadable') {
+		return {
+			title: `Remove ${r.id} from disk`,
+			confirmLabel: 'Remove',
+			body: (
+				<>
+					<p>
+						<code>{r.id}</code> failed to load, so it has no install record. Removing it deletes its
+						folder <code>{r.install_path}</code> from disk.
+					</p>
+					<p>There is no undo.</p>
+				</>
+			),
+			run: () => pkgHealthRemove(r.id),
+		};
+	}
+	return {
+		title: `Remove record ${r.id}`,
+		confirmLabel: 'Remove',
+		body: (
+			<>
+				<p>
+					Deletes the {issueLabel(r.issue)} record <code>{r.id}</code>
+					{r.install_path ? (
+						<>
+							{' '}
+							(<code>{r.install_path}</code>)
+						</>
+					) : null}
+					: its <code>pkg_installed</code> row and child <code>pkg_*</code> rows, or the orphan row.
+				</p>
+				<p>Files on disk are never touched. There is no undo.</p>
+			</>
+		),
+		run: () => pkgHealthRemove(r.id),
+	};
 }
 
 interface RegistryRead<T> {
@@ -186,6 +240,8 @@ export function NgwaHealthSurface({
 	section,
 	onOpenBackup,
 	onOpenStore,
+	canReinstall,
+	onReinstall,
 	now = Date.now,
 }: NgwaHealthSurfaceProps) {
 	const qc = useQueryClient();
@@ -467,6 +523,12 @@ export function NgwaHealthSurface({
 															Last scan found {installs.length}: {installs.map((r) => r.id).join(', ')}
 														</p>
 														<p>Files on disk are never touched. There is no undo.</p>
+														{installs.some((r) => r.issue.kind === 'pkgs_dir_unloadable') && (
+															<p data-removeall-keeps-dirs>
+																Packages that failed to load from the pkgs folder are only files, so
+																they stay listed: reinstall or remove each one from its row.
+															</p>
+														)}
 													</>
 												),
 												run: () => pkgHealthRemoveAll(),
@@ -519,40 +581,31 @@ export function NgwaHealthSurface({
 										</span>
 									</div>
 									<div className="acts">
-										<button
-											type="button"
-											className="chip danger"
-											data-remove={r.id}
-											onClick={() =>
-												ask(
-													{
-														title: `Remove record ${r.id}`,
-														confirmLabel: 'Remove',
-														body: (
-															<>
-																<p>
-																	Deletes the {issueLabel(r.issue)} record <code>{r.id}</code>
-																	{r.install_path ? (
-																		<>
-																			{' '}
-																			(<code>{r.install_path}</code>)
-																		</>
-																	) : null}
-																	: its <code>pkg_installed</code> row and child <code>pkg_*</code> rows, or
-																	the orphan row.
-																</p>
-																<p>Files on disk are never touched. There is no undo.</p>
-															</>
-														),
-														run: () => pkgHealthRemove(r.id),
-													},
-													`Remove record ${r.id}`,
-													[HEALTH_KEYS.installs, ngwaSnapshotQueryKey]
-												)
-											}
-										>
-											Remove
-										</button>
+										{isUnregisteredPkgIssue(r.issue) && onReinstall && canReinstall?.(r.id) ? (
+											<button
+												type="button"
+												className="chip on"
+												data-reinstall={r.id}
+												title="Fetch it again from the signed registry. The Store sheet asks for consent first."
+												onClick={() => onReinstall(r.id)}
+											>
+												Reinstall from registry
+											</button>
+										) : (
+											<button
+												type="button"
+												className="chip danger"
+												data-remove={r.id}
+												onClick={() =>
+													ask(removeRequest(r), `Remove record ${r.id}`, [
+														HEALTH_KEYS.installs,
+														ngwaSnapshotQueryKey,
+													])
+												}
+											>
+												Remove
+											</button>
+										)}
 									</div>
 								</div>
 							))}
