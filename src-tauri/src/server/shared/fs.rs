@@ -33,6 +33,72 @@ pub struct FsSearchResult {
     pub truncated: bool,
 }
 
+/// One row of a directory listing: the desktop's `FileEntry` (`commands::fs`), which is
+/// camelCase and carries size and mtime, plus `is_dir`, the spelling the daemon's original
+/// `fs_list` used. The file picker still reads it, so both keys are sent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsEntry {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    #[serde(rename = "is_dir")]
+    pub is_dir_legacy: bool,
+    pub size: u64,
+    pub modified_ms: i64,
+}
+
+/// List `dir`. Mirrors the desktop `fs_list` (unsorted; the caller sorts), with one difference
+/// that only matters to a server. The desktop describes a symlink by its target. Here the target
+/// is followed only when `resolve` accepts it, so a link that leaves the allowlist (or points
+/// into the daemon's own state) is listed as itself: its name, but not the target's kind, size
+/// or mtime. A plain entry, including the data dir's own name, is listed as on the desktop.
+pub async fn list(resolve: Resolve<'_>, dir: &str) -> Result<Vec<FsEntry>, String> {
+    let resolved = resolve(dir)?;
+    let mut rd = tokio::fs::read_dir(&resolved)
+        .await
+        .map_err(|e| format!("read_dir failed: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(entry) = rd
+        .next_entry()
+        .await
+        .map_err(|e| format!("next_entry failed: {e}"))?
+    {
+        let p = entry.path();
+        let Ok(link_meta) = tokio::fs::symlink_metadata(&p).await else {
+            continue;
+        };
+        let meta = if link_meta.file_type().is_symlink() {
+            match resolve(&p.to_string_lossy()) {
+                Ok(real) => tokio::fs::metadata(&real).await.unwrap_or(link_meta),
+                Err(_) => link_meta,
+            }
+        } else {
+            link_meta
+        };
+        let modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let is_dir = meta.is_dir();
+        out.push(FsEntry {
+            path: p.to_string_lossy().into_owned(),
+            name: p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            is_dir,
+            is_dir_legacy: is_dir,
+            size: meta.len(),
+            modified_ms,
+        });
+    }
+    Ok(out)
+}
+
 /// `'file' | 'dir' | 'missing'`. `'missing'` is returned both for not-found
 /// and for allowlist-rejected paths so callers can fall back uniformly.
 pub async fn kind(resolve: Resolve<'_>, path: &str) -> &'static str {
