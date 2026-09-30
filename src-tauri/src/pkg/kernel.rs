@@ -503,10 +503,6 @@ pub struct Kernel {
     pkgs_dir_failures: RwLock<HashMap<PathBuf, String>>,
 }
 
-/// Walk the registries in reverse order calling `unregister`. Per the
-/// `Registry` trait contract, `unregister` must be a no-op on absent
-/// pkgs — so a failure here is logged but never aborts the sequence.
-/// Used by `Kernel::reload_pkg` (and called directly by tests).
 /// Normalize a stored / wire pkg scope to the kernel's `Option<project_id>`.
 /// `pkg_installed.project_id` is meant to hold `NULL` (workspace) or a bare
 /// project id, but the wire format (`"workspace"`, `"project:<id>"`) and an
@@ -633,6 +629,10 @@ pub(crate) fn describe_still_running(
     )
 }
 
+/// Walk the registries in reverse order calling `unregister`. Per the
+/// `Registry` trait contract, `unregister` must be a no-op on absent
+/// pkgs — so a failure here is logged but never aborts the sequence.
+/// Used by `Kernel::reload_pkg` (and called directly by tests).
 fn replay_unregisters(registries: &[Arc<dyn Registry>], pkg_id: &str) {
     for reg in registries.iter().rev() {
         if let Err(e) = reg.unregister(pkg_id) {
