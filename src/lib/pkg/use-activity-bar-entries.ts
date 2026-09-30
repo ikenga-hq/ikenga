@@ -94,6 +94,14 @@ export interface PkgActivityBarState {
 	 *  failure). Until then `entries`/`views` are empty placeholders, not a
 	 *  real "nothing installed" answer. */
 	loaded: boolean;
+	/** Pkg ids the kernel currently has: any registered view / rail entry /
+	 *  UI route, or an install record (a pkg parked for capability review has
+	 *  no views but its route shows the consent step). A rail pin into a pkg
+	 *  outside this set would open "No such package route", so the rail hides
+	 *  it — without deleting it, so it returns once the pkg registers again.
+	 *  `null` until the first snapshot, or when the snapshot failed: unknown,
+	 *  so nothing is hidden. */
+	availablePkgIds: ReadonlySet<string> | null;
 }
 
 interface SidecarStatus {
@@ -209,10 +217,29 @@ function mergeRegistries(
 	});
 }
 
+/** Pkg ids with anything registered in the kernel snapshot, or installed.
+ *  See `PkgActivityBarState.availablePkgIds`. */
+export function availablePkgIdsOf(status: {
+	installed?: ReadonlyArray<{ id: string }>;
+	registries?: Record<string, unknown>;
+}): Set<string> {
+	const ids = new Set<string>();
+	for (const i of status.installed ?? []) ids.add(i.id);
+	for (const name of ['views', 'activity_bar', 'ui_routes']) {
+		const reg = status.registries?.[name] as { entries?: unknown } | undefined;
+		if (!Array.isArray(reg?.entries)) continue;
+		for (const e of reg.entries as Array<{ pkg_id?: unknown }>) {
+			if (typeof e?.pkg_id === 'string') ids.add(e.pkg_id);
+		}
+	}
+	return ids;
+}
+
 export function usePkgActivityBarEntries(): PkgActivityBarState {
 	const [entries, setEntries] = useState<PkgActivityBarEntry[]>([]);
 	const [views, setViews] = useState<PkgViewEntry[]>([]);
 	const [loaded, setLoaded] = useState(false);
+	const [availablePkgIds, setAvailablePkgIds] = useState<ReadonlySet<string> | null>(null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -238,11 +265,13 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 				if (!cancelled) {
 					setViews(viewEntries);
 					setEntries(merged);
+					setAvailablePkgIds(availablePkgIdsOf(status));
 				}
 			} catch {
 				if (!cancelled) {
 					setViews([]);
 					setEntries([]);
+					setAvailablePkgIds(null);
 				}
 			} finally {
 				if (!cancelled) setLoaded(true);
@@ -278,5 +307,5 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 		};
 	}, []);
 
-	return { entries, views, loaded };
+	return { entries, views, loaded, availablePkgIds };
 }

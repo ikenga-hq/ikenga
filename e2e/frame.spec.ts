@@ -9,6 +9,7 @@ import { expect, type Page, type TestInfo, test } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import {
 	installTauriMock,
+	MOCK_KERNEL_STATUS,
 	MOCK_PINS,
 	MOCK_PROJECTS,
 	unmockedCommands,
@@ -119,6 +120,20 @@ const RAIL_PINS = [
 	},
 ];
 
+/** Every pkg `RAIL_PINS` points into must be installed: the rail hides pins
+ *  into a pkg the kernel doesn't have (on disk but failed to register). */
+const RAIL_KERNEL = {
+	...MOCK_KERNEL_STATUS,
+	installed: [
+		...MOCK_KERNEL_STATUS.installed,
+		{
+			...MOCK_KERNEL_STATUS.installed[0]!,
+			id: 'com.e2e.wiki',
+			install_path: '/home/e2e/pkgs/com.e2e.wiki',
+		},
+	],
+};
+
 async function bootRail(page: Page, opts: { glossSeen?: boolean } = {}) {
 	const pageErrors = trackPageErrors(page);
 	if (opts.glossSeen !== false) {
@@ -126,7 +141,9 @@ async function bootRail(page: Page, opts: { glossSeen?: boolean } = {}) {
 			localStorage.setItem('ikenga.gloss.seen', JSON.stringify(['ngwa', 'chi']));
 		});
 	}
-	await installTauriMock(page, { responses: { activity_pins_list: RAIL_PINS } });
+	await installTauriMock(page, {
+		responses: { activity_pins_list: RAIL_PINS, pkg_kernel_status: RAIL_KERNEL },
+	});
 	await page.goto('/', { waitUntil: 'domcontentloaded' });
 	const rail = page.getByRole('navigation', { name: 'Activity bar' });
 	await expect(rail).toBeVisible({ timeout: 60_000 });
@@ -569,6 +586,7 @@ test.describe('D-01 conformance (WP-12)', () => {
 			responses: {
 				project_get_active: MOCK_PROJECTS[1],
 				activity_pins_list: RAIL_PINS,
+				pkg_kernel_status: RAIL_KERNEL,
 				pkg_sidecar_call: { ok: true, stdout: gitSnapshotStdout, stderr: '', code: 0 },
 			},
 		});

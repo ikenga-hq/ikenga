@@ -120,12 +120,15 @@ export function InstallSplit({
 	blocked,
 	busy,
 	onInstall,
+	verb = 'Install',
 }: {
 	projectLabel: string;
 	/** Why Install can't run yet, or null. */
 	blocked: string | null;
 	busy: boolean;
 	onInstall: (scope: StoreInstallScope) => void;
+	/** The action's verb: `Reinstall` for a pkg on disk that failed to load. */
+	verb?: 'Install' | 'Reinstall';
 }) {
 	const [menuOpen, setMenuOpen] = useState(false);
 	const menuRef = useRef<HTMLDivElement | null>(null);
@@ -168,7 +171,7 @@ export function InstallSplit({
 					title={blocked ?? undefined}
 					onClick={() => go('project')}
 				>
-					Install to {projectLabel}
+					{verb} to {projectLabel}
 				</button>
 				<button
 					type="button"
@@ -186,10 +189,10 @@ export function InstallSplit({
 					<div className="cellpop storepop up" role="menu" aria-label="Install scope">
 						<div className="mgroup">Install scope</div>
 						<button type="button" role="menuitem" className="mitem" onClick={() => go('project')}>
-							Install to {projectLabel} <span className="msub">default here</span>
+							{verb} to {projectLabel} <span className="msub">default here</span>
 						</button>
 						<button type="button" role="menuitem" className="mitem" onClick={() => go('personal')}>
-							Install to personal <span className="msub">workspace · always loaded</span>
+							{verb} to personal <span className="msub">workspace · always loaded</span>
 						</button>
 					</div>
 				)}

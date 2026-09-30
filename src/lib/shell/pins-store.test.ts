@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { renderHook } from '@testing-library/react';
 
 // Hoisted mocks for the tauri-cmd module — vitest's vi.mock is hoisted, so
 // we expose our state via the factory return value and reach into it via
@@ -105,9 +106,12 @@ import {
 	dispatchPinSelection,
 	fuzzyMatchSection,
 	pinsOfPkg,
+	pkgIdOfPin,
 	prunePinsForUninstalledPkg,
 	slugifySectionId,
+	useActivityBarPins,
 	usePinsStore,
+	visiblePins,
 	type PinDispatchTarget,
 } from './pins-store';
 
@@ -495,5 +499,47 @@ describe('pins of an uninstalled pkg (pkg-uninstalled prune)', () => {
 		vi.mocked(cmd.activityPinsRemove).mockClear();
 		expect(await prunePinsForUninstalledPkg('com.x.none')).toEqual([]);
 		expect(cmd.activityPinsRemove).not.toHaveBeenCalled();
+	});
+});
+
+describe('pins into an unregistered pkg (on disk, failed to load)', () => {
+	const pin = (kind: string, target: string) =>
+		({ kind, target }) as { kind: 'route' | 'artifact' | 'pkg-route'; target: string };
+
+	it('reads the pkg id off route / pkg-route targets only', () => {
+		expect(pkgIdOfPin(pin('route', '/pkg/com.ikenga.meetings/meetings'))).toBe('com.ikenga.meetings');
+		expect(pkgIdOfPin(pin('pkg-route', '/pkg/com.x.studio?tab=1'))).toBe('com.x.studio');
+		expect(pkgIdOfPin(pin('route', '/pkg/com.x.studio'))).toBe('com.x.studio');
+		expect(pkgIdOfPin(pin('route', '/settings'))).toBeNull();
+		expect(pkgIdOfPin(pin('artifact', '/pkg/com.x.studio/page.html'))).toBeNull();
+	});
+
+	it('keeps everything while the kernel snapshot is unknown', () => {
+		const pins = [pin('route', '/pkg/com.ikenga.meetings/meetings')];
+		expect(visiblePins(pins, null)).toEqual(pins);
+		expect(visiblePins(pins, undefined)).toEqual(pins);
+	});
+
+	it('hides a rail pin whose pkg is not registered, without deleting it, and shows it once it registers', async () => {
+		const { addPin } = usePinsStore.getState();
+		await addPin({ kind: 'route', target: '/pkg/com.ikenga.meetings/meetings', label: 'Meetings' });
+		await addPin({ kind: 'route', target: '/pkg/com.ikenga.studio/grid', label: 'Studio' });
+		await addPin({ kind: 'route', target: '/settings', label: 'Settings' });
+		vi.mocked(cmd.activityPinsRemove).mockClear();
+
+		const { result, rerender } = renderHook(
+			({ available }: { available: ReadonlySet<string> | null }) => useActivityBarPins(available),
+			{ initialProps: { available: new Set(['com.ikenga.studio']) as ReadonlySet<string> | null } }
+		);
+		const labels = () => result.current.sectionLessPins.map((p) => p.label);
+
+		expect(labels()).toEqual(['Studio', 'Settings']);
+		// Hidden, not pruned: the stored pin is untouched.
+		expect(cmd.activityPinsRemove).not.toHaveBeenCalled();
+		expect(usePinsStore.getState().pins.map((p) => p.label)).toContain('Meetings');
+
+		// The pkg is repaired / reinstalled → its view registers → the pin returns.
+		rerender({ available: new Set(['com.ikenga.studio', 'com.ikenga.meetings']) });
+		expect(labels()).toEqual(['Meetings', 'Studio', 'Settings']);
 	});
 });

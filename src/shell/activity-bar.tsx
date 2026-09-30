@@ -208,9 +208,15 @@ export function ActivityBar() {
 	const setActiveMode = useShellStore((s) => s.setActiveMode);
 	const setWorkspace = useIkengaStore((s) => s.setWorkspace);
 	const hydratePins = usePinsStore((s) => s.hydrate);
-	const { sections, pinsBySection, sectionLessPins, hydrated } = useActivityBarPins();
+	// One kernel-snapshot subscription feeds both the pins' badge / parked
+	// state and which pins can open at all: a pin into a pkg that is not
+	// registered (on disk but failed to load) is hidden, not deleted.
+	const pkgBar = usePkgActivityBarEntries();
+	const { sections, pinsBySection, sectionLessPins, hydrated } = useActivityBarPins(
+		pkgBar.availablePkgIds
+	);
 	const updatesAvailable = useUpdatesAvailable();
-	const pinStatus = usePinPkgStatus();
+	const pinStatus = usePinPkgStatus(pkgBar.entries);
 	const railRef = useRef<HTMLElement>(null);
 	const [rovingId, setRovingId] = useState<string | null>(null);
 	const terms = useMemo(glossTerms, []);
@@ -539,8 +545,7 @@ interface PinPkgStatus {
 	parkedReason: string | null;
 }
 
-function usePinPkgStatus(): ReadonlyMap<string, PinPkgStatus> {
-	const { entries } = usePkgActivityBarEntries();
+function usePinPkgStatus(entries: PkgActivityBarEntry[]): ReadonlyMap<string, PinPkgStatus> {
 	return useMemo(() => {
 		const map = new Map<string, PinPkgStatus>();
 		for (const e of entries) {

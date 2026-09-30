@@ -9,7 +9,7 @@
 //! place that calls `Registry::register/unregister`. Other code that wants to
 //! "see what's registered" reads through the kernel's snapshot API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -78,6 +78,109 @@ pub enum HealthIssueKind {
     ApiIncompatible { ikenga_api: String },
     /// A child `pkg_*` row with no parent in `pkg_installed`.
     OrphanRow { table: String },
+    /// A directory under the pkgs dir with no `pkg_installed` row whose
+    /// manifest failed to load, parse or validate (or is api-incompatible),
+    /// so boot's `install_from_pkgs_dir` could not register it. The pkg is
+    /// on disk but absent from the kernel. `install_path` is that directory;
+    /// `id` is the manifest's `id` when it can be read, else the dir name.
+    PkgsDirUnloadable,
+    /// An enabled `pkg_installed` row whose manifest loads and is compatible
+    /// but which is not in the kernel's installed set: a registry rejected
+    /// it at boot replay, so none of its views / routes are mounted.
+    RegisterFailed,
+}
+
+/// Scan the pkgs dir for entries boot could not register: every direct
+/// child directory (dot-prefixed installer staging / backup dirs skipped)
+/// that holds a `manifest.json`, is not already tracked in `pkg_installed`
+/// (by id or by path), and fails to load or is api-incompatible. A loadable,
+/// compatible untracked dir is NOT reported: `install_from_pkgs_dir` picks it
+/// up at the next boot. Read-only; the unit-tested core behind the pkgs-dir
+/// half of `Kernel::health_scan`.
+pub(crate) fn scan_pkgs_dir(
+    dir: &Path,
+    tracked_ids: &HashSet<String>,
+    tracked_paths: &HashSet<String>,
+) -> Vec<PkgHealthIssue> {
+    let mut issues = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return issues;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+            continue;
+        };
+        if dir_name.starts_with('.') {
+            continue;
+        }
+        let path_str = path.display().to_string();
+        if tracked_paths.contains(&path_str) {
+            continue;
+        }
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let raw_id = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("id").and_then(|s| s.as_str().map(String::from)))
+            .filter(|s| !s.is_empty());
+        if raw_id.as_ref().is_some_and(|id| tracked_ids.contains(id)) {
+            continue;
+        }
+        let id = raw_id.unwrap_or_else(|| dir_name.clone());
+        let detail = match Package::load(&path) {
+            Ok(pkg) if pkg.is_compatible() => continue,
+            Ok(pkg) => format!(
+                "on disk but not registered: ikenga_api={} outside supported window {}..={}",
+                pkg.manifest.ikenga_api, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION
+            ),
+            Err(e) => format!("on disk but failed to load: {e:#}"),
+        };
+        issues.push(PkgHealthIssue {
+            id,
+            install_path: path_str,
+            enabled: false,
+            issue: HealthIssueKind::PkgsDirUnloadable,
+            detail,
+        });
+    }
+    issues
+}
+
+/// Enabled `pkg_installed` rows that load cleanly and are compatible (so the
+/// row scan reported nothing) yet are missing from the kernel's installed
+/// set: boot replay's registry walk rejected them. `registered` is the
+/// kernel's in-memory installed id set (pkgs parked for capability review
+/// are in it, so they are never flagged here).
+pub(crate) fn scan_unregistered_rows(
+    rows: &[(String, String, bool)],
+    row_issue_ids: &HashSet<String>,
+    registered: &HashSet<String>,
+) -> Vec<PkgHealthIssue> {
+    rows.iter()
+        .filter(|(id, path, enabled)| {
+            *enabled
+                && !registered.contains(id)
+                && !row_issue_ids.contains(id)
+                && Path::new(path).is_dir()
+        })
+        .map(|(id, path, _)| PkgHealthIssue {
+            id: id.clone(),
+            install_path: path.clone(),
+            enabled: true,
+            issue: HealthIssueKind::RegisterFailed,
+            detail: format!(
+                "installed and on disk but not registered: a registry rejected it at boot (see the shell log for `{id}`)"
+            ),
+        })
+        .collect()
 }
 
 /// Scan every `pkg_installed` row (enabled **and** disabled — boot only loads
@@ -209,6 +312,24 @@ pub(crate) async fn purge_orphans(pool: &sqlx::SqlitePool) -> Result<u64> {
     Ok(total)
 }
 
+/// `(id, install_path, enabled)` for every `pkg_installed` row.
+async fn read_install_rows(pool: &sqlx::SqlitePool) -> Result<Vec<(String, String, bool)>> {
+    let rows: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT id, install_path, enabled FROM pkg_installed")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| anyhow!("read pkg_installed: {e}"))?;
+    Ok(rows.into_iter().map(|(id, p, e)| (id, p, e != 0)).collect())
+}
+
+/// The ids and install paths `pkg_installed` already tracks, for [`scan_pkgs_dir`].
+fn tracked_sets(rows: &[(String, String, bool)]) -> (HashSet<String>, HashSet<String>) {
+    (
+        rows.iter().map(|(id, _, _)| id.clone()).collect(),
+        rows.iter().map(|(_, p, _)| p.clone()).collect(),
+    )
+}
+
 pub struct Kernel {
     /// Registries are registered once at construction and never mutate after.
     registries: Vec<Arc<dyn Registry>>,
@@ -254,6 +375,12 @@ pub struct Kernel {
     /// `health_scan()`. Read by the `pkg_health_scan` command so the UI can
     /// show the last result without re-hitting SQLite.
     health: RwLock<Vec<PkgHealthIssue>>,
+
+    /// pkgs-dir entries whose boot-time `install_from_pkgs_dir` failed, keyed
+    /// by folder, with the error. Covers failures a fresh manifest parse
+    /// can't reproduce (a registry rejecting a loadable pkg), which then
+    /// leave an untracked folder behind. Read by `health_scan`.
+    pkgs_dir_failures: RwLock<HashMap<PathBuf, String>>,
 }
 
 /// Walk the registries in reverse order calling `unregister`. Per the
@@ -316,6 +443,7 @@ impl Kernel {
             reconcile_lock: Mutex::new(()),
             dev_watchers: RwLock::new(HashMap::new()),
             health: RwLock::new(Vec::new()),
+            pkgs_dir_failures: RwLock::new(HashMap::new()),
         }
     }
 
@@ -992,15 +1120,25 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             // know which project the user intended. They can move it via
             // Settings → Packages or `iyke_pkg_install_scope_set`.
             match self.install_from_path(&path, InstallSource::Local { path: path_str }, None) {
-                Ok(s) => log::info!(
-                    "[pkg_kernel] discovered pkgs-dir pkg `{}` v{} (CLI install)",
-                    s.id,
-                    s.version
-                ),
-                Err(e) => log::warn!(
-                    "[pkg_kernel] register pkgs-dir entry at {} failed (continuing): {e:#}",
-                    path.display()
-                ),
+                Ok(s) => {
+                    if let Ok(mut g) = self.pkgs_dir_failures.write() {
+                        g.remove(&path);
+                    }
+                    log::info!(
+                        "[pkg_kernel] discovered pkgs-dir pkg `{}` v{} (CLI install)",
+                        s.id,
+                        s.version
+                    )
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[pkg_kernel] register pkgs-dir entry at {} failed (continuing): {e:#}",
+                        path.display()
+                    );
+                    if let Ok(mut g) = self.pkgs_dir_failures.write() {
+                        g.insert(path.clone(), format!("{e:#}"));
+                    }
+                }
             }
         }
         Ok(())
@@ -1187,15 +1325,82 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         Ok(())
     }
 
+    /// pkgs-dir folders the kernel holds no record of and could not register:
+    /// the live manifest scan ([`scan_pkgs_dir`]) plus boot-time register
+    /// failures of loadable folders (`pkgs_dir_failures`) that are still on
+    /// disk and still untracked.
+    fn unregistered_dir_issues(&self, rows: &[(String, String, bool)]) -> Vec<PkgHealthIssue> {
+        let dir = match self.pkgs_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("[pkg_kernel] health: pkgs dir unresolved, skipping its scan: {e:#}");
+                return Vec::new();
+            }
+        };
+        let (tracked_ids, tracked_paths) = tracked_sets(rows);
+        let mut issues = scan_pkgs_dir(&dir, &tracked_ids, &tracked_paths);
+        let failures: Vec<(PathBuf, String)> = self
+            .pkgs_dir_failures
+            .read()
+            .map(|g| g.iter().map(|(p, e)| (p.clone(), e.clone())).collect())
+            .unwrap_or_default();
+        for (path, err) in failures {
+            let path_str = path.display().to_string();
+            if !path.is_dir()
+                || tracked_paths.contains(&path_str)
+                || issues.iter().any(|i| i.install_path == path_str)
+            {
+                continue;
+            }
+            let id = std::fs::read_to_string(path.join("manifest.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("id").and_then(|s| s.as_str().map(String::from)))
+                .filter(|s| !s.is_empty())
+                .or_else(|| path.file_name().and_then(|n| n.to_str()).map(String::from))
+                .unwrap_or_default();
+            if tracked_ids.contains(&id) {
+                continue;
+            }
+            issues.push(PkgHealthIssue {
+                id,
+                install_path: path_str,
+                enabled: false,
+                issue: HealthIssueKind::PkgsDirUnloadable,
+                detail: format!("on disk but failed to register at boot: {err}"),
+            });
+        }
+        issues
+    }
+
     /// Read-only scan for broken / orphaned install records. Refreshes the
     /// cached `health` snapshot and returns the issues. Backed by the
     /// module-level [`scan_health`] (the unit-tested core).
+    ///
+    /// On top of the `pkg_installed` / orphan scan it reports pkgs the user
+    /// has on disk that never made it into the kernel: pkgs-dir entries whose
+    /// manifest fails to load ([`scan_pkgs_dir`]) and enabled rows a registry
+    /// rejected at boot ([`scan_unregistered_rows`]).
     pub fn health_scan(&self) -> Result<Vec<PkgHealthIssue>> {
         let db = self.db.clone();
-        let issues = tauri::async_runtime::block_on(async move {
+        let (mut issues, rows) = tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
-            scan_health(&pool).await
+            let issues = scan_health(&pool).await?;
+            let rows = read_install_rows(&pool).await?;
+            Ok::<_, anyhow::Error>((issues, rows))
         })?;
+        let row_issue_ids: HashSet<String> = issues
+            .iter()
+            .filter(|i| !matches!(i.issue, HealthIssueKind::OrphanRow { .. }))
+            .map(|i| i.id.clone())
+            .collect();
+        let registered: HashSet<String> = self
+            .installed
+            .read()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default();
+        issues.extend(scan_unregistered_rows(&rows, &row_issue_ids, &registered));
+        issues.extend(self.unregistered_dir_issues(&rows));
         if let Ok(mut g) = self.health.write() {
             g.clone_from(&issues);
         }
@@ -1207,15 +1412,40 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// install/uninstall via the per-pkg lock. Never touches the filesystem or
     /// registries: a broken row was never registered, so there is nothing to
     /// unregister.
+    ///
+    /// The one exception is a [`HealthIssueKind::PkgsDirUnloadable`] entry:
+    /// it has no record at all (the pkg IS its folder under the pkgs dir), so
+    /// removing it deletes that folder, which must be a direct child of the
+    /// pkgs dir. Without that, boot would rediscover it and fail again.
     pub fn purge_install_record(&self, pkg_id: &str) -> Result<()> {
         let lock = self.lock_for(pkg_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.db.clone();
+        let rows = tauri::async_runtime::block_on(async move {
+            let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
+            read_install_rows(&pool).await
+        })?;
+        let unloadable_dirs: Vec<PathBuf> = match self.pkgs_dir() {
+            Ok(pkgs_dir) => self
+                .unregistered_dir_issues(&rows)
+                .into_iter()
+                .filter(|i| i.id == pkg_id)
+                .map(|i| PathBuf::from(i.install_path))
+                .filter(|p| p.parent() == Some(pkgs_dir.as_path()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
         let db = self.db.clone();
         let id = pkg_id.to_string();
         tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
             purge_record(&pool, &id).await
         })?;
+        for dir in unloadable_dirs {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("remove unloadable pkg folder {}", dir.display()))?;
+            log::info!("[pkg_kernel] removed unloadable pkgs-dir entry {}", dir.display());
+        }
         if let Ok(mut g) = self.installed.write() {
             g.remove(pkg_id);
         }
@@ -1238,9 +1468,17 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// Returns `(records_removed, orphan_rows_removed)` and refreshes the cache.
     pub fn purge_all_broken(&self) -> Result<(usize, u64)> {
         let issues = self.health_scan()?;
+        // Bulk removal stays record-only: a pkgs-dir entry that failed to load
+        // is a folder on disk (removing it deletes files), so it is removed
+        // one at a time from its own row, or repaired by a reinstall.
         let mut broken_ids: Vec<String> = issues
             .iter()
-            .filter(|i| !matches!(i.issue, HealthIssueKind::OrphanRow { .. }))
+            .filter(|i| {
+                !matches!(
+                    i.issue,
+                    HealthIssueKind::OrphanRow { .. } | HealthIssueKind::PkgsDirUnloadable
+                )
+            })
             .map(|i| i.id.clone())
             .collect();
         broken_ids.sort();
@@ -1970,6 +2208,107 @@ mod tests {
                 "unregister:b:com.test.x".to_string(),
                 "unregister:a:com.test.x".to_string(),
             ]
+        );
+    }
+
+    fn write_manifest(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        std::fs::write(dir.join("manifest.json"), json).expect("write manifest");
+    }
+
+    /// The founder's v0.18.0 repro: a pkgs-dir entry (pkg-meetings 0.2.0)
+    /// whose manifest still declares `ui.nav`, with no `pkg_installed` row,
+    /// is reported as `PkgsDirUnloadable` carrying the parse error. Tracked,
+    /// dot-prefixed, manifest-less and loadable entries are not reported.
+    #[test]
+    fn scan_pkgs_dir_reports_entry_with_bad_manifest() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pkgs = root.path();
+
+        let broken = pkgs.join("com.ikenga.meetings");
+        write_manifest(
+            &broken,
+            r#"{"id": "com.ikenga.meetings", "name": "Meetings", "version": "0.2.0",
+                "ikenga_api": "5",
+                "ui": {"nav": [{"id": "meetings", "label": "Meetings", "route": "/meetings"}]}}"#,
+        );
+        // Same bad manifest, but already tracked in pkg_installed: the row
+        // scan owns it, so the dir scan must not double-report.
+        write_manifest(
+            &pkgs.join("com.test.tracked"),
+            r#"{"id": "com.test.tracked", "name": "T", "version": "0.1.0", "ikenga_api": "5",
+                "ui": {"nav": []}}"#,
+        );
+        // Installer staging dir: skipped.
+        write_manifest(&pkgs.join(".staging-com.ikenga.meetings"), "{ not json");
+        // A loadable, compatible, untracked entry: boot picks it up; not an issue.
+        write_manifest(
+            &pkgs.join("com.test.fine"),
+            r#"{"id": "com.test.fine", "name": "Fine", "version": "0.1.0", "ikenga_api": "5"}"#,
+        );
+        // No manifest at all: not a pkg dir.
+        std::fs::create_dir_all(pkgs.join("stray")).unwrap();
+        // Unparseable JSON with no readable id: reported under its dir name.
+        write_manifest(&pkgs.join("com.test.garbled"), "{ not json");
+
+        let tracked_ids: HashSet<String> = ["com.test.tracked".to_string()].into_iter().collect();
+        let issues = scan_pkgs_dir(pkgs, &tracked_ids, &HashSet::new());
+
+        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["com.ikenga.meetings", "com.test.garbled"], "got {issues:?}");
+
+        let meetings = &issues[0];
+        assert_eq!(meetings.issue, HealthIssueKind::PkgsDirUnloadable);
+        assert_eq!(meetings.install_path, broken.display().to_string());
+        assert!(!meetings.enabled);
+        assert!(
+            meetings.detail.contains("ui.nav"),
+            "detail carries the parse error: {}",
+            meetings.detail
+        );
+
+        // Tracking by path (not id) also suppresses it.
+        let tracked_paths: HashSet<String> = [broken.display().to_string()].into_iter().collect();
+        let issues = scan_pkgs_dir(pkgs, &tracked_ids, &tracked_paths);
+        assert!(!issues.iter().any(|i| i.id == "com.ikenga.meetings"));
+
+        // A missing pkgs dir is simply empty, never an error.
+        assert!(scan_pkgs_dir(&pkgs.join("absent"), &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    /// An enabled, loadable row the kernel never registered is flagged
+    /// `RegisterFailed`; registered, disabled, already-flagged and vanished
+    /// rows are not.
+    #[test]
+    fn scan_unregistered_rows_flags_enabled_rows_missing_from_kernel() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let on_disk = root.path().display().to_string();
+        let rows = vec![
+            ("com.test.rejected".to_string(), on_disk.clone(), true),
+            ("com.test.live".to_string(), on_disk.clone(), true),
+            ("com.test.disabled".to_string(), on_disk.clone(), false),
+            ("com.test.badmanifest".to_string(), on_disk.clone(), true),
+            ("com.test.gone".to_string(), "/nonexistent/gone".to_string(), true),
+        ];
+        let row_issue_ids: HashSet<String> = ["com.test.badmanifest".to_string()].into_iter().collect();
+        let registered: HashSet<String> = ["com.test.live".to_string()].into_iter().collect();
+        let issues = scan_unregistered_rows(&rows, &row_issue_ids, &registered);
+        assert_eq!(issues.len(), 1, "got {issues:?}");
+        assert_eq!(issues[0].id, "com.test.rejected");
+        assert_eq!(issues[0].issue, HealthIssueKind::RegisterFailed);
+        assert!(issues[0].enabled);
+    }
+
+    /// The new kinds serialize as the snake_case tags the FE switches on.
+    #[test]
+    fn unregistered_kinds_serialize_as_snake_case_tags() {
+        assert_eq!(
+            serde_json::to_value(HealthIssueKind::PkgsDirUnloadable).unwrap(),
+            serde_json::json!({ "kind": "pkgs_dir_unloadable" })
+        );
+        assert_eq!(
+            serde_json::to_value(HealthIssueKind::RegisterFailed).unwrap(),
+            serde_json::json!({ "kind": "register_failed" })
         );
     }
 }

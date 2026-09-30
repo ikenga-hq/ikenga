@@ -35,6 +35,10 @@ function kindLabel(kind: PkgHealthIssueKind): string {
 			return `api ${kind.ikenga_api}`;
 		case 'orphan_row':
 			return `orphan: ${kind.table}`;
+		case 'pkgs_dir_unloadable':
+			return 'failed to load';
+		case 'register_failed':
+			return 'not registered';
 	}
 }
 

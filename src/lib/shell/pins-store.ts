@@ -300,10 +300,42 @@ export function computeCrossSectionReorderIds<T extends { id: string }>(
 	return ids;
 }
 
+/** The pkg a route / pkg-route pin opens (`/pkg/<id>`, `/pkg/<id>/…`), or
+ *  null for any other pin. */
+export function pkgIdOfPin(pin: Pick<Pin, 'kind' | 'target'>): string | null {
+	if (pin.kind !== 'route' && pin.kind !== 'pkg-route') return null;
+	const m = /^\/pkg\/([^/?#]+)/.exec(pin.target);
+	if (!m) return null;
+	try {
+		return decodeURIComponent(m[1]!);
+	} catch {
+		return m[1]!;
+	}
+}
+
+/** Drop pins into a pkg the kernel does not currently have (on disk but
+ *  failed to register, say): they would open "No such package route".
+ *  Display-only — the pins stay stored, so they come back as soon as the
+ *  pkg registers. `available` null = not known yet: keep everything. */
+export function visiblePins<T extends Pick<Pin, 'kind' | 'target'>>(
+	pins: readonly T[],
+	available: ReadonlySet<string> | null | undefined
+): T[] {
+	if (!available) return [...pins];
+	return pins.filter((p) => {
+		const pkgId = pkgIdOfPin(p);
+		return pkgId === null || available.has(pkgId);
+	});
+}
+
 /** Selector hook returning pins grouped by section, plus a loose group for
  *  section-less pins. Consumers iterate `sections` to render headers in
- *  user order, then look up `pinsBySection.get(section.id)`. */
-export function useActivityBarPins() {
+ *  user order, then look up `pinsBySection.get(section.id)`.
+ *
+ *  `availablePkgIds` (the kernel's current pkgs, from
+ *  `usePkgActivityBarEntries`) hides pins into a pkg that is not registered;
+ *  see `visiblePins`. */
+export function useActivityBarPins(availablePkgIds?: ReadonlySet<string> | null) {
 	const pins = usePinsStore((s) => s.pins);
 	const sections = usePinsStore((s) => s.sections);
 	const hydrated = usePinsStore((s) => s.hydrated);
@@ -311,7 +343,7 @@ export function useActivityBarPins() {
 	const sortedSections = [...sections].sort(
 		(a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)
 	);
-	const sortedPins = [...pins].sort(
+	const sortedPins = visiblePins(pins, availablePkgIds).sort(
 		(a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt)
 	);
 	const pinsBySection = new Map<string, Pin[]>();
