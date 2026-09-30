@@ -3,7 +3,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { NgwaStoreSurface } from './ngwa-store-surface';
+import { NgwaStoreSurface, type NgwaStoreSurfaceProps } from './ngwa-store-surface';
+import { NeedsApprovalError, type StoreUpdateOptions } from '@/lib/ngwa/use-store-install';
+import { useUpdateApprovals } from '@/lib/ngwa/use-update-approvals';
 import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
 import type { StorePkgVersion } from '@/lib/registry/client';
 
@@ -280,12 +282,21 @@ describe('NgwaStoreSurface', () => {
 		const boxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
 		expect(boxes).toHaveLength(2);
 		expect(install.disabled).toBe(true);
-		expect(install.title).toBe('Tick every consent above first');
+		expect(install.title).toBe('Tick every consent above first (0 of 2 ticked)');
+		// The reason is visible in the foot, not only a tooltip, with a live count.
+		const foot = document.querySelector<HTMLElement>('[data-sheetfoot]')!;
+		const reason = () => foot.querySelector('[data-install-blocked]')?.textContent ?? null;
+		expect(reason()).toBe('Tick every consent above first (0 of 2 ticked)');
+		expect(install.getAttribute('aria-describedby')).toBe(
+			foot.querySelector('[data-install-blocked]')?.id
+		);
 
 		fireEvent.click(boxes[0]);
 		expect(install.disabled).toBe(true);
+		expect(reason()).toBe('Tick every consent above first (1 of 2 ticked)');
 		fireEvent.click(boxes[1]);
 		expect(install.disabled).toBe(false);
+		expect(reason()).toBeNull();
 
 		fireEvent.click(install);
 		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'project');
@@ -425,8 +436,8 @@ describe('NgwaStoreSurface', () => {
 			(screen.getByRole('button', { name: 'Update 0.8.2 → 0.8.3' }) as HTMLButtonElement).disabled
 		).toBe(true);
 
-		reject(new Error('asks for new permissions'));
-		expect(await screen.findByText('Failed: asks for new permissions')).toBeDefined();
+		reject(new Error('network down'));
+		expect(await screen.findByText('Failed: network down')).toBeDefined();
 	});
 
 	it('Update all shows its failure on the strip', async () => {
@@ -440,5 +451,118 @@ describe('NgwaStoreSurface', () => {
 			within(screen.getByRole('dialog')).getByRole('button', { name: 'Update all (1)' })
 		);
 		expect(await screen.findByText('1 of 1 update failed — pkg-tasks: 404')).toBeDefined();
+	});
+});
+
+// ─── Updates held for approval (WP-41-F1 in the Store) ───────────────────────
+
+const TASKS_REVIEW = {
+	pkg_id: '@ikenga/pkg-tasks',
+	manifest_version: '0.8.3',
+	old_capabilities: '{}',
+	new_capabilities: '{"net":["https://api.example.com"]}',
+	prior_approved_at_ms: 0,
+};
+
+/** The Store route's wiring: the surface plus the shared approvals hook,
+ *  whose modal is mounted once beside it. */
+function StoreWithApprovals({
+	update,
+	...props
+}: Omit<NgwaStoreSurfaceProps, 'updateApprovals' | 'onUpdate'> & {
+	update: (entry: NgwaStoreEntry, opts?: StoreUpdateOptions) => Promise<void>;
+}) {
+	const approvals = useUpdateApprovals({ update });
+	return (
+		<>
+			<NgwaStoreSurface {...props} onUpdate={update} updateApprovals={approvals} />
+			{approvals.element}
+		</>
+	);
+}
+
+/** Held unless re-run approved. */
+function heldUpdate() {
+	return vi.fn((entry: NgwaStoreEntry, opts?: StoreUpdateOptions) =>
+		opts?.approved
+			? Promise.resolve()
+			: Promise.reject(new NeedsApprovalError([{ entry, review: TASKS_REVIEW }]))
+	);
+}
+
+describe('NgwaStoreSurface — updates that need approval', () => {
+	it('a held row Update opens the trust review instead of failing; Approve runs it approved', async () => {
+		const update = heldUpdate();
+		renderWithClient(<StoreWithApprovals catalog={mockCatalog} update={update} />);
+
+		fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+		const row = await screen.findByTestId('trust-review-row-@ikenga/pkg-tasks');
+		expect(screen.getByText('Capability review')).toBeDefined();
+		expect(screen.queryByText(/^Failed:/)).toBeNull();
+
+		fireEvent.click(within(row).getByTestId('trust-review-approve-@ikenga/pkg-tasks'));
+		await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+		expect(update.mock.calls[1]).toEqual([mockCatalog[0], { approved: true }]);
+		await waitFor(() => expect(screen.queryByText('Capability review')).toBeNull());
+		expect(document.querySelector('[data-update-approvals]')).toBeNull();
+	});
+
+	it('Reject drops it: nothing is re-run and the strip clears', async () => {
+		const update = heldUpdate();
+		renderWithClient(<StoreWithApprovals catalog={mockCatalog} update={update} />);
+
+		fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+		await screen.findByTestId('trust-review-row-@ikenga/pkg-tasks');
+		fireEvent.click(screen.getByTestId('trust-review-reject-@ikenga/pkg-tasks'));
+		await waitFor(() => expect(screen.queryByText('Capability review')).toBeNull());
+		expect(update).toHaveBeenCalledTimes(1);
+		expect(document.querySelector('[data-update-approvals]')).toBeNull();
+	});
+
+	it('Update all puts approvals on the strip ("needs approval · Review") apart from real failures', async () => {
+		const update = heldUpdate();
+		const other: NgwaStoreEntry = {
+			...mockCatalog[0],
+			id: '@ikenga/pkg-notes',
+			name: '@ikenga/pkg-notes',
+			displayName: 'pkg-notes',
+		};
+		const catalog = [mockCatalog[0], other, mockCatalog[1]];
+		const onUpdateAll = vi
+			.fn()
+			.mockRejectedValue(
+				new NeedsApprovalError(
+					[{ entry: mockCatalog[0], review: TASKS_REVIEW }],
+					['pkg-notes: 404']
+				)
+			);
+		renderWithClient(
+			<StoreWithApprovals catalog={catalog} update={update} onUpdateAll={onUpdateAll} />
+		);
+
+		fireEvent.click(screen.getByRole('button', { name: 'Update all (2)' }));
+		fireEvent.click(
+			within(screen.getByRole('dialog')).getByRole('button', { name: 'Update all (2)' })
+		);
+
+		// The review opens for the held row…
+		await screen.findByTestId('trust-review-row-@ikenga/pkg-tasks');
+		// …the strip says it needs approval, and shows the real failure apart.
+		const strip = document.querySelector<HTMLElement>('[data-updates]')!;
+		expect(strip.querySelector('[data-update-approvals]')?.textContent).toContain(
+			'1 needs approval'
+		);
+		expect(strip.querySelector('[data-update-failures]')?.textContent).toBe(
+			'1 of 2 failed — pkg-notes: 404'
+		);
+		expect(strip.querySelector('[data-update-failures]')?.textContent).not.toMatch(/tasks/);
+
+		// Closing the modal keeps the hold; Review reopens it.
+		fireEvent.click(
+			screen.getAllByRole('button', { name: 'Close' }).find((b) => b.textContent === 'Close')!
+		);
+		await waitFor(() => expect(screen.queryByText('Capability review')).toBeNull());
+		fireEvent.click(within(strip).getByRole('button', { name: 'Review' }));
+		expect(await screen.findByText('Capability review')).toBeDefined();
 	});
 });

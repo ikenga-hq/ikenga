@@ -238,8 +238,13 @@ describe('R57 · the catalog sheet', () => {
 			name: 'Install to royalti-co',
 		}) as HTMLButtonElement;
 		expect(install.disabled).toBe(true);
+		// The foot says why, with the live count (not only a tooltip).
+		expect(s.querySelector('[data-install-blocked]')?.textContent).toBe(
+			'Tick every consent above first (0 of 1 ticked)'
+		);
 		fireEvent.click(s.querySelector('[data-consent="runs"]') as HTMLInputElement);
 		expect(install.disabled).toBe(false);
+		expect(s.querySelector('[data-install-blocked]')).toBeNull();
 	});
 
 	it('a pin mismatch at install is its own state: nothing written, re-check the catalog', async () => {
@@ -450,6 +455,9 @@ describe('R57 · Add from URL', () => {
 		expect(install.disabled).toBe(true);
 		fireEvent.click(s.querySelector('[data-consent="src"]') as HTMLInputElement);
 		expect(install.disabled).toBe(true);
+		expect(sheet().querySelector('[data-install-blocked]')?.textContent).toMatch(
+			/^Tick every box under Share kola first \(1 of \d+ ticked\)$/
+		);
 		fireEvent.click(s.querySelector('[data-consent="dep:credits-parse"]') as HTMLInputElement);
 		// The catalogued ikenga-artifact-builder reveals its own non-catalog dep
 		// (transitive closure), which needs its own box too.

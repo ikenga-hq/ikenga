@@ -1,7 +1,9 @@
 // Ngwa Store Surface (WP-15 / locked D-02).
 //
 // Registry catalog browsing, package installation, and updates:
-// - Updates strip: "Update all (N)" opens a review of each pending update
+// - Updates strip: "Update all (N)" opens a review of each pending update; an
+//   update held back for new permissions is "needs approval · Review" (the
+//   trust review modal), never "failed"
 // - Kind & Trust facet chips over the whole (locally filtered) index
 // - Rows carry the closure + asks chips, read from the pkg's detail file
 // - Install sheet: overview, the `requires` closure, per-permission consent
@@ -15,7 +17,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Check, Download, Link2, Search, Shield, X } from 'lucide-react';
+import { Check, Download, Link2, Search, Shield, ShieldAlert, X } from 'lucide-react';
 import { ErrorState, LoadingState, OfflineState } from '@/components/states';
 import {
 	Dialog,
@@ -26,7 +28,12 @@ import {
 	DialogTitle,
 } from '@/components/ui/dialog';
 import type { NgwaCatalogRow, NgwaStoreEntry, StoreSource } from '@/lib/ngwa/enrichment';
-import type { PrimitiveInstallOutcome, PrimitiveInstallStage } from '@/lib/ngwa/use-store-install';
+import {
+	isNeedsApproval,
+	type PrimitiveInstallOutcome,
+	type PrimitiveInstallStage,
+} from '@/lib/ngwa/use-store-install';
+import type { UpdateApprovals } from '@/lib/ngwa/use-update-approvals';
 import {
 	catalogPin,
 	resolveCatalogClosure,
@@ -35,7 +42,13 @@ import {
 	type PrimitiveCatalogEntry,
 } from '@/lib/registry/primitives';
 import type { ClaudeStoreEntry, ClaudeStoreKind, ResolvedSource } from '@/lib/tauri-cmd';
-import { AddUrlSheet, CatalogSheet, CatalogStoreRow, InstallSplit } from './ngwa-store-primitives';
+import {
+	AddUrlSheet,
+	CatalogSheet,
+	CatalogStoreRow,
+	InstallSplit,
+	consentBlockedReason,
+} from './ngwa-store-primitives';
 import {
 	asksLabel,
 	closureLabel,
@@ -84,6 +97,12 @@ export interface NgwaStoreSurfaceProps {
 	onUpdate?: (entry: NgwaStoreEntry) => void | Promise<unknown>;
 	/** Update every pending entry after the review dialog is confirmed. */
 	onUpdateAll?: (entries: NgwaStoreEntry[]) => void | Promise<unknown>;
+	/**
+	 * Where an update held back for new permissions goes (`NeedsApprovalError`
+	 * from `onUpdate` / `onUpdateAll`): the route's `useUpdateApprovals()`,
+	 * whose modal it mounts. Absent → the hold reads as a failure.
+	 */
+	updateApprovals?: Pick<UpdateApprovals, 'pending' | 'request' | 'review'>;
 
 	// ── R57 · git / npx primitives ──
 	/** Signed-catalog rows, listed after the registry pkgs (Q2 duplicates
@@ -237,6 +256,7 @@ export function NgwaStoreSurface({
 	onInstall,
 	onUpdate,
 	onUpdateAll,
+	updateApprovals,
 	primitives = NO_PRIMITIVES,
 	catalogEntries = NO_CATALOG,
 	vault = NO_VAULT,
@@ -292,7 +312,9 @@ export function NgwaStoreSurface({
 		try {
 			await result;
 		} catch (e) {
-			setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
+			// Held for approval is not a failure: the review opens instead.
+			if (isNeedsApproval(e) && updateApprovals) updateApprovals.request(e.approvals);
+			else setActionErrors((m) => ({ ...m, [entry.id]: errText(e) }));
 		} finally {
 			setPending(({ [entry.id]: _drop, ...rest }) => rest);
 		}
@@ -332,6 +354,14 @@ export function NgwaStoreSurface({
 		: undefined;
 
 	const updateEntries = useMemo(() => catalog.filter((c) => c.isUpdate), [catalog]);
+	// Held for approval and still an update (an approve elsewhere drops it).
+	const approvalsPending = useMemo(
+		() =>
+			(updateApprovals?.pending ?? []).filter((p) =>
+				updateEntries.some((e) => e.id === p.entry.id)
+			),
+		[updateApprovals?.pending, updateEntries]
+	);
 	// Q4: catalog installs whose pin moved join the strip; hook / MCP entries
 	// can't be updated in place, so `isUpdate` is never set on them.
 	const primitiveUpdates = useMemo(() => primitives.filter((r) => r.isUpdate), [primitives]);
@@ -363,7 +393,17 @@ export function NgwaStoreSurface({
 				try {
 					await registryRun;
 				} catch (e) {
-					failures.push(errText(e));
+					if (isNeedsApproval(e) && updateApprovals) {
+						// Held rows go to the review; only real failures stay here.
+						updateApprovals.request(e.approvals);
+						if (e.failures.length) {
+							failures.push(
+								`${e.failures.length} of ${updateEntries.length} failed — ${e.failures.join('; ')}`
+							);
+						}
+					} else {
+						failures.push(errText(e));
+					}
 				}
 			}
 			// One failing primitive must not stop the rest (batch-updater rule).
@@ -483,9 +523,25 @@ export function NgwaStoreSurface({
 					{canUpdateAll && (
 						<span className="rt">
 							{updateAllError && (
-								<span className="upderr" role="alert">
+								<span className="upderr" role="alert" data-update-failures>
 									{updateAllError}
 								</span>
+							)}
+							{approvalsPending.length > 0 && (
+								<>
+									<span className="updappr" role="status" data-update-approvals>
+										<ShieldAlert className="h-3 w-3" /> {approvalsPending.length}{' '}
+										{approvalsPending.length === 1 ? 'needs' : 'need'} approval
+									</span>
+									<button
+										type="button"
+										className="btn"
+										data-review-approvals
+										onClick={() => updateApprovals?.review()}
+									>
+										Review
+									</button>
+								</>
 							)}
 							<button
 								type="button"
@@ -731,6 +787,11 @@ export function NgwaStoreSurface({
 							onUpdate={update}
 							pendingAction={pending[selectedEntry.id] ?? null}
 							actionError={actionErrors[selectedEntry.id] ?? null}
+							onReviewApproval={
+								approvalsPending.some((p) => p.entry.id === selectedEntry.id)
+									? () => updateApprovals?.review()
+									: undefined
+							}
 							onReviewTrust={setTrustReviewItem}
 						/>
 					) : (
@@ -887,6 +948,7 @@ function StoreSheet({
 	onUpdate,
 	pendingAction,
 	actionError,
+	onReviewApproval,
 	onReviewTrust,
 }: {
 	entry: NgwaStoreEntry;
@@ -899,6 +961,8 @@ function StoreSheet({
 	pendingAction: PendingAction | null;
 	/** The last install/update failure for this entry. */
 	actionError: string | null;
+	/** Set while this entry's update is held for approval: opens the review. */
+	onReviewApproval?: () => void;
 	onReviewTrust: (item: NgwaItem) => void;
 }) {
 	const detailQuery = useStoreDetail(entry, loadDetail, true);
@@ -919,7 +983,11 @@ function StoreSheet({
 	else if (!loadDetail) installBlocked = 'Permissions not read — the registry index has not loaded';
 	else if (detailQuery.isLoading) installBlocked = 'Reading the manifest…';
 	else if (!manifest) installBlocked = 'Permissions could not be read — retry first';
-	else if (!allTicked) installBlocked = 'Tick every consent above first';
+	else if (!allTicked)
+		installBlocked = consentBlockedReason(
+			consents.filter((c) => ticked[c.id]).length,
+			consents.length
+		);
 
 	function install(scope: StoreInstallScope) {
 		if (!onInstall || installBlocked || busy) return;
@@ -1127,6 +1195,16 @@ function StoreSheet({
 					<span className="note bad" role="alert" data-action-error>
 						Failed: {actionError}
 					</span>
+				)}
+				{onReviewApproval && !busy && (
+					<>
+						<span className="note warn" role="status" data-needs-approval>
+							needs approval — this version asks for new permissions
+						</span>
+						<button type="button" className="btn" onClick={onReviewApproval}>
+							Review
+						</button>
+					</>
 				)}
 				{entry.isUpdate ? (
 					<button
