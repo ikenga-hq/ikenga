@@ -17,6 +17,7 @@ import type {
 	SettingsWriteOptions,
 } from '@/lib/settings/types';
 import { scopedPersistName } from '@/lib/window/window-context';
+import { isRemoteWebSession } from '@/lib/transport';
 import {
 	type Project,
 	projectGetActive,
@@ -56,6 +57,16 @@ function hasTauriRuntime(): boolean {
 		('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
 	);
 }
+
+/**
+ * Settings have somewhere to be written: the Tauri host, or the daemon a browser
+ * session is talking to. Gating writes on `hasTauriRuntime()` alone dropped every one
+ * in a browser. Reads still worked over RPC, so each boot loaded the server's untouched
+ * "first run" state over the browser's and sent the user back to onboarding.
+ */
+function hasSettingsBackend(): boolean {
+	return hasTauriRuntime() || isRemoteWebSession();
+}
 function parseKv<T>(raw: string | undefined): T | undefined {
 	if (raw == null) return undefined;
 	try {
@@ -88,7 +99,7 @@ function enqueueSettingsWrite(
 	task: () => Promise<unknown>,
 	rollback: () => void,
 ): void {
-	if (!hasTauriRuntime()) return;
+	if (!hasSettingsBackend()) return;
 	const run = async () => {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 2; attempt += 1) {
