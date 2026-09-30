@@ -72,6 +72,8 @@ pub mod status;
 #[cfg(feature = "desktop")]
 pub mod trust;
 #[cfg(feature = "desktop")]
+pub(crate) mod uninstall_dir;
+#[cfg(feature = "desktop")]
 pub mod webview;
 
 #[cfg(feature = "desktop")]
