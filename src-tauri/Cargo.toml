@@ -1,6 +1,6 @@
 [package]
 name = "ikenga-desktop"
-version = "0.18.4"
+version = "0.18.5"
 description = "PA Desktop — Tauri + xterm + portable-pty"
 authors = ["Ikenga"]
 edition = "2021"
