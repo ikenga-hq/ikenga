@@ -111,8 +111,15 @@ beforeEach(() => {
 	m.pkgPermissionViolationsList.mockResolvedValue(VIOLATIONS);
 	m.pkgPermissionViolationsClear.mockResolvedValue(3);
 	m.pkgHealthScan.mockResolvedValue(INSTALLS);
-	m.pkgHealthRemove.mockResolvedValue(undefined);
-	m.pkgHealthRemoveAll.mockResolvedValue({ removed_records: 3, removed_orphans: 1 });
+	m.pkgHealthRemove.mockResolvedValue({ removed_rows: 2, retired: [] });
+	m.pkgHealthRemoveAll.mockResolvedValue({
+		removed_records: 3,
+		removed_orphans: 1,
+		retired_folders: [],
+		failed: [],
+		remaining: [],
+		rescan_error: null,
+	});
 	m.pkgKernelStatus.mockResolvedValue(kernel());
 	m.pkgSupervisorRestart.mockResolvedValue(true);
 	m.agentOpsListJobs.mockResolvedValue(JOBS);
@@ -241,6 +248,11 @@ describe('/ngwa/health — Violations panel (fold-in of pkg-audit + pkg-health)'
 			fireEvent.click(within(dialog()).getByRole('button', { name: 'Remove all' }));
 		});
 		await waitFor(() => expect(m.pkgHealthRemoveAll).toHaveBeenCalledTimes(1));
+		// The result line names what was removed; a clean rescan empties the list.
+		await waitFor(() =>
+			expect(document.querySelector('[data-hnotice]')?.textContent).toBe('Removed 3 records · 1 orphan row')
+		);
+		await waitFor(() => expect(m.pkgHealthScan).toHaveBeenCalledTimes(2));
 	});
 
 	it('Refresh refetches both lists', async () => {

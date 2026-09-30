@@ -1043,15 +1043,25 @@
 /* ══════════════════════════════════════════════════════════════════════════
    Health Surface (WP-16 / locked D-02)
    ══════════════════════════════════════════════════════════════════════════ */
-.view-ngwa .hgrid {
+/* The page scrolls as a whole. The scroller is a separate box so the grid
+   itself has no definite height: with one, the auto rows were sized down to
+   the panels' zero minimum (`.panel` is overflow:hidden) and every panel was
+   clipped at a fixed height with its last rows unreachable. */
+.view-ngwa .hscroll {
 	flex: 1;
 	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+}
+
+.view-ngwa .hgrid {
 	padding: var(--space-3);
 	display: grid;
-	grid-template-columns: 1fr 1fr;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+	grid-auto-rows: auto;
 	gap: var(--space-3) var(--space-4);
 	align-content: start;
-	overflow-y: auto;
+	align-items: start;
 }
 
 .view-ngwa .panel {
@@ -1135,22 +1145,54 @@
 	line-height: 1.45;
 }
 
+.view-ngwa .hrow .t1,
+.view-ngwa .hrow .t2 {
+	overflow-wrap: anywhere;
+}
+
+.view-ngwa .hrow > .hico {
+	color: var(--danger);
+	align-self: flex-start;
+	margin-top: 2px;
+}
+
+.view-ngwa .hrow[data-row="unsigned"] > .hico {
+	color: var(--achievement);
+}
+
+/* Inline actions on the right (D-02). They wrap inside their own column
+   instead of pushing the row wider than its panel. */
 .view-ngwa .hrow .acts {
 	display: flex;
 	gap: var(--space-1);
-	flex: none;
+	flex: 0 1 auto;
+	max-width: 60%;
 	align-items: center;
+	justify-content: flex-end;
 	flex-wrap: wrap;
 }
 
 .view-ngwa .panelfoot {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
 	gap: var(--space-2);
 	padding: var(--space-2) var(--space-3);
 	font-size: var(--text-micro);
 	color: var(--fg-muted);
 	border-top: 1px solid var(--border-soft);
+}
+
+.view-ngwa .panelfoot .grow {
+	flex: 1;
+	min-width: 0;
+}
+
+/* Narrow panes stack the panels (design `.leaf.mid .hgrid`). */
+@container pane-leaf (max-width: 819px) {
+	.view-ngwa .hgrid {
+		grid-template-columns: minmax(0, 1fr);
+	}
 }
 
 .view-ngwa .auditline {
@@ -1420,9 +1462,15 @@
 	gap: var(--space-1);
 }
 
+/* No max-height: a panel lists every row and grows; the page scrolls. */
 .view-ngwa .hlist {
-	max-height: 280px;
-	overflow-y: auto;
+	display: block;
+}
+
+.view-ngwa .panel > .hlist + .hlist,
+.view-ngwa .panel > .hlist + .hnote,
+.view-ngwa .panel > .hnote + .hlist {
+	border-top: 1px solid var(--border-soft);
 }
 
 .view-ngwa .hnote {

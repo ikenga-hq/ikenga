@@ -3384,9 +3384,34 @@ export interface PkgHealthIssue {
 	detail: string;
 }
 
+/** A pkgs-dir folder a health removal retired: renamed to a recoverable
+ *  `.uninstalled-<id>-<millis>` backup (the same path uninstall uses), never
+ *  hard-deleted. `backup` is null when the folder was locked and only its
+ *  manifest could be tombstoned in place (boot finishes the move).
+ *  Mirrors Rust `RetiredFolder` (kernel.rs). */
+export interface PkgHealthRetiredFolder {
+	id: string;
+	path: string;
+	backup: string | null;
+}
+
+/** Mirrors Rust `PurgeOutcome` (kernel.rs). */
+export interface PkgHealthRemoveResult {
+	/** `pkg_installed` + child `pkg_*` rows deleted. */
+	removed_rows: number;
+	retired: PkgHealthRetiredFolder[];
+}
+
+/** Mirrors Rust `PurgeAllReport` (kernel.rs). */
 export interface PkgHealthRemoveAllResult {
 	removed_records: number;
 	removed_orphans: number;
+	retired_folders: PkgHealthRetiredFolder[];
+	failed: Array<{ id: string; error: string }>;
+	/** What the rescan after the removal still reports. */
+	remaining: PkgHealthIssue[];
+	/** Set when that rescan failed; `remaining` is then unknown, not clean. */
+	rescan_error: string | null;
 }
 
 /** Scan for broken / orphaned package install records (read-only). */
@@ -3394,14 +3419,15 @@ export async function pkgHealthScan(): Promise<PkgHealthIssue[]> {
 	return invoke<PkgHealthIssue[]>('pkg_health_scan');
 }
 
-/** Remove one broken install record (its `pkg_installed` row + child rows).
- *  For a `pkgs_dir_unloadable` entry, which has no record, this deletes its
- *  folder under the pkgs dir instead. */
-export async function pkgHealthRemove(pkgId: string): Promise<void> {
-	return invoke('pkg_health_remove', { pkgId });
+/** Remove one health issue: a broken install record (its `pkg_installed` row +
+ *  child rows), or, for a `pkgs_dir_unloadable` entry (no record), its folder,
+ *  retired to a recoverable backup. Rejects when nothing matched. */
+export async function pkgHealthRemove(pkgId: string): Promise<PkgHealthRemoveResult> {
+	return invoke<PkgHealthRemoveResult>('pkg_health_remove', { pkgId });
 }
 
-/** Remove every currently-detected broken record + orphan row. */
+/** Remove everything the health scan lists (records, pkgs-dir folders retired
+ *  to a backup, orphan rows), then rescan. */
 export async function pkgHealthRemoveAll(): Promise<PkgHealthRemoveAllResult> {
 	return invoke<PkgHealthRemoveAllResult>('pkg_health_remove_all');
 }

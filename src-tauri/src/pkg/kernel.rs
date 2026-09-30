@@ -183,6 +183,123 @@ pub(crate) fn scan_unregistered_rows(
         .collect()
 }
 
+/// One pkgs-dir folder a health removal retired through
+/// [`uninstall_dir::retire`] — the same rename-to-backup `uninstall` uses, so
+/// it is recoverable until boot prunes backups older than
+/// [`uninstall_dir::BACKUP_RETENTION`].
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct RetiredFolder {
+    /// The pkg id the scan reported for the folder.
+    pub id: String,
+    /// The folder that was retired.
+    pub path: String,
+    /// The `.uninstalled-<id>-<millis>` backup it was moved to. `None` when the
+    /// folder was locked and only its `manifest.json` could be tombstoned in
+    /// place (discovery no longer sees it; boot finishes the move).
+    pub backup: Option<String>,
+}
+
+/// What removing one health issue did. `removed_rows` counts the
+/// `pkg_installed` + child `pkg_*` rows deleted; `retired` the pkgs-dir folders
+/// moved to a backup.
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct PurgeOutcome {
+    pub removed_rows: u64,
+    pub retired: Vec<RetiredFolder>,
+}
+
+/// A health removal that failed, with the reason, safe to show in the UI.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct PurgeFailure {
+    pub id: String,
+    pub error: String,
+}
+
+/// What `Kernel::purge_all_broken` did, and what the rescan afterwards still
+/// finds. The UI builds its result line from this, so it never reports "done"
+/// while `remaining` is non-empty.
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct PurgeAllReport {
+    /// Broken install records (ids) whose rows were deleted.
+    pub removed_records: usize,
+    /// Orphan child rows deleted.
+    pub removed_orphans: u64,
+    /// pkgs-dir folders retired to a backup.
+    pub retired_folders: Vec<RetiredFolder>,
+    /// Issues whose removal failed.
+    pub failed: Vec<PurgeFailure>,
+    /// Everything the rescan after the removal still reports.
+    pub remaining: Vec<PkgHealthIssue>,
+    /// Set when that rescan itself failed (then `remaining` is empty and
+    /// unknown, not clean).
+    pub rescan_error: Option<String>,
+}
+
+/// The ids "Remove all" acts on, deduplicated and sorted: every broken record
+/// and every pkgs-dir folder that failed to load. Orphan rows are excluded
+/// here because one bulk `purge_orphans` removes them all.
+pub(crate) fn plan_purge_all(issues: &[PkgHealthIssue]) -> Vec<String> {
+    let mut ids: Vec<String> = issues
+        .iter()
+        .filter(|i| !matches!(i.issue, HealthIssueKind::OrphanRow { .. }))
+        .map(|i| i.id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Retire every [`HealthIssueKind::PkgsDirUnloadable`] folder in `issues`
+/// (only those reported for `only_id`, when given) through
+/// [`uninstall_dir::retire`]: rename to a dot-prefixed backup that boot
+/// discovery and the health scan skip. Never a hard delete. A folder that is
+/// not a direct child of `pkgs_dir` is refused and left in place. Returns the
+/// retired folders and, per folder, any failure.
+pub(crate) fn retire_unloadable_dirs(
+    pkgs_dir: &Path,
+    issues: &[PkgHealthIssue],
+    only_id: Option<&str>,
+) -> (Vec<RetiredFolder>, Vec<PurgeFailure>) {
+    let mut retired = Vec::new();
+    let mut failed = Vec::new();
+    for issue in issues.iter().filter(|i| {
+        i.issue == HealthIssueKind::PkgsDirUnloadable && only_id.map_or(true, |id| i.id == id)
+    }) {
+        let path = Path::new(&issue.install_path);
+        // A pkgs-dir entry has no install record; `Local` is the provenance
+        // boot would give it, and is what `retire` manages (never Builtin/Dev).
+        let source = InstallSource::Local {
+            path: issue.install_path.clone(),
+        };
+        match uninstall_dir::retire(pkgs_dir, path, &source) {
+            Ok(uninstall_dir::Retired::BackedUp(to)) => retired.push(RetiredFolder {
+                id: issue.id.clone(),
+                path: issue.install_path.clone(),
+                backup: Some(to.display().to_string()),
+            }),
+            Ok(uninstall_dir::Retired::Tombstoned) => retired.push(RetiredFolder {
+                id: issue.id.clone(),
+                path: issue.install_path.clone(),
+                backup: None,
+            }),
+            // Already gone: nothing to retire, nothing left to report.
+            Ok(uninstall_dir::Retired::Missing) => {}
+            Ok(uninstall_dir::Retired::NotManaged) => failed.push(PurgeFailure {
+                id: issue.id.clone(),
+                error: format!(
+                    "{} is not a folder directly under the pkgs dir, so it was left in place",
+                    issue.install_path
+                ),
+            }),
+            Err(e) => failed.push(PurgeFailure {
+                id: issue.id.clone(),
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+    (retired, failed)
+}
+
 /// Scan every `pkg_installed` row (enabled **and** disabled — boot only loads
 /// enabled ones, so disabled-but-broken rows would otherwise never surface)
 /// plus the child `pkg_*` tables, returning every broken/orphaned record.
@@ -276,22 +393,25 @@ pub(crate) async fn scan_health(pool: &sqlx::SqlitePool) -> Result<Vec<PkgHealth
 /// transaction. Children are deleted explicitly so this is correct regardless
 /// of the connection's `foreign_keys` pragma — and it clears
 /// `pkg_capability_snapshots`, which has no cascade FK.
-pub(crate) async fn purge_record(pool: &sqlx::SqlitePool, id: &str) -> Result<()> {
+pub(crate) async fn purge_record(pool: &sqlx::SqlitePool, id: &str) -> Result<u64> {
+    let mut removed = 0u64;
     let mut tx = pool.begin().await.map_err(|e| anyhow!("begin txn: {e}"))?;
     for table in PKG_CHILD_TABLES {
-        sqlx::query(&format!("DELETE FROM {table} WHERE pkg_id = ?"))
+        let r = sqlx::query(&format!("DELETE FROM {table} WHERE pkg_id = ?"))
             .bind(id)
             .execute(&mut *tx)
             .await
             .map_err(|e| anyhow!("delete {table} for {id}: {e}"))?;
+        removed += r.rows_affected();
     }
-    sqlx::query("DELETE FROM pkg_installed WHERE id = ?")
+    let r = sqlx::query("DELETE FROM pkg_installed WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("delete pkg_installed for {id}: {e}"))?;
+    removed += r.rows_affected();
     tx.commit().await.map_err(|e| anyhow!("commit txn: {e}"))?;
-    Ok(())
+    Ok(removed)
 }
 
 /// Delete every child `pkg_*` row whose `pkg_id` has no parent in
@@ -1347,6 +1467,7 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         for (path, err) in failures {
             let path_str = path.display().to_string();
             if !path.is_dir()
+                || !path.join("manifest.json").exists()
                 || tracked_paths.contains(&path_str)
                 || issues.iter().any(|i| i.install_path == path_str)
             {
@@ -1407,17 +1528,23 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         Ok(issues)
     }
 
-    /// Delete a broken install record — its `pkg_installed` row + every child
-    /// `pkg_*` row — and drop it from the in-memory maps. Serialized against
-    /// install/uninstall via the per-pkg lock. Never touches the filesystem or
-    /// registries: a broken row was never registered, so there is nothing to
-    /// unregister.
+    /// Remove one health issue by id. Serialized against install/uninstall
+    /// via the per-pkg lock.
     ///
-    /// The one exception is a [`HealthIssueKind::PkgsDirUnloadable`] entry:
-    /// it has no record at all (the pkg IS its folder under the pkgs dir), so
-    /// removing it deletes that folder, which must be a direct child of the
-    /// pkgs dir. Without that, boot would rediscover it and fail again.
-    pub fn purge_install_record(&self, pkg_id: &str) -> Result<()> {
+    /// - A record issue (broken `pkg_installed` row, `RegisterFailed`, orphan
+    ///   rows under this id): deletes the row + every child `pkg_*` row and
+    ///   drops the id from the in-memory maps. Registries are not touched: a
+    ///   broken row was never registered, so there is nothing to unregister.
+    /// - A [`HealthIssueKind::PkgsDirUnloadable`] entry has no record (the pkg
+    ///   IS its folder under the pkgs dir), so its folder is retired through
+    ///   [`uninstall_dir::retire`], the same recoverable rename-to-backup
+    ///   `uninstall` uses. Never a hard delete. Without it, boot would
+    ///   rediscover the folder and fail again.
+    ///
+    /// Errors when nothing matched (no row, no child row, no folder), so a
+    /// caller never reports success for a removal that did nothing, and when
+    /// a folder could not be retired.
+    pub fn purge_install_record(&self, pkg_id: &str) -> Result<PurgeOutcome> {
         let lock = self.lock_for(pkg_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let db = self.db.clone();
@@ -1425,33 +1552,54 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
             read_install_rows(&pool).await
         })?;
-        let unloadable_dirs: Vec<PathBuf> = match self.pkgs_dir() {
-            Ok(pkgs_dir) => self
-                .unregistered_dir_issues(&rows)
-                .into_iter()
-                .filter(|i| i.id == pkg_id)
-                .map(|i| PathBuf::from(i.install_path))
-                .filter(|p| p.parent() == Some(pkgs_dir.as_path()))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let dir_issues: Vec<PkgHealthIssue> = self
+            .unregistered_dir_issues(&rows)
+            .into_iter()
+            .filter(|i| i.id == pkg_id)
+            .collect();
         let db = self.db.clone();
         let id = pkg_id.to_string();
-        tauri::async_runtime::block_on(async move {
+        let removed_rows = tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
             purge_record(&pool, &id).await
         })?;
-        for dir in unloadable_dirs {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("remove unloadable pkg folder {}", dir.display()))?;
-            log::info!("[pkg_kernel] removed unloadable pkgs-dir entry {}", dir.display());
+        let mut retired = Vec::new();
+        if !dir_issues.is_empty() {
+            let pkgs_dir = self.pkgs_dir()?;
+            let (done, failed) = retire_unloadable_dirs(&pkgs_dir, &dir_issues, Some(pkg_id));
+            if let Ok(mut g) = self.pkgs_dir_failures.write() {
+                for r in &done {
+                    g.remove(Path::new(&r.path));
+                }
+            }
+            for r in &done {
+                log::info!(
+                    "[pkg_kernel] retired unloadable pkgs-dir entry {} -> {}",
+                    r.path,
+                    r.backup.as_deref().unwrap_or("(manifest tombstoned in place)")
+                );
+            }
+            retired = done;
+            if let Some(f) = failed.first() {
+                return Err(anyhow!("could not retire the folder of `{}`: {}", f.id, f.error));
+            }
         }
         if let Ok(mut g) = self.installed.write() {
             g.remove(pkg_id);
         }
-        let mut g = self.live.write().unwrap_or_else(|e| e.into_inner());
-        g.remove(pkg_id);
-        Ok(())
+        {
+            let mut g = self.live.write().unwrap_or_else(|e| e.into_inner());
+            g.remove(pkg_id);
+        }
+        if removed_rows == 0 && retired.is_empty() {
+            return Err(anyhow!(
+                "nothing to remove for `{pkg_id}`: no install record, child row or pkgs-dir folder matched (rescan)"
+            ));
+        }
+        Ok(PurgeOutcome {
+            removed_rows,
+            retired,
+        })
     }
 
     /// Delete every orphaned child `pkg_*` row (no parent in `pkg_installed`).
@@ -1464,32 +1612,40 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         })
     }
 
-    /// Remove every currently-detected broken install record + orphan row.
-    /// Returns `(records_removed, orphan_rows_removed)` and refreshes the cache.
-    pub fn purge_all_broken(&self) -> Result<(usize, u64)> {
+    /// Remove everything the health scan lists: every broken install record,
+    /// every pkgs-dir folder that failed to load (retired to a backup, exactly
+    /// like a single Remove), and every orphan row. A failure on one id is
+    /// recorded and the rest still run. Rescans afterwards and returns what is
+    /// still there, so the caller can say exactly what was and wasn't removed.
+    pub fn purge_all_broken(&self) -> Result<PurgeAllReport> {
         let issues = self.health_scan()?;
-        // Bulk removal stays record-only: a pkgs-dir entry that failed to load
-        // is a folder on disk (removing it deletes files), so it is removed
-        // one at a time from its own row, or repaired by a reinstall.
-        let mut broken_ids: Vec<String> = issues
-            .iter()
-            .filter(|i| {
-                !matches!(
-                    i.issue,
-                    HealthIssueKind::OrphanRow { .. } | HealthIssueKind::PkgsDirUnloadable
-                )
-            })
-            .map(|i| i.id.clone())
-            .collect();
-        broken_ids.sort();
-        broken_ids.dedup();
-        let records = broken_ids.len();
-        for id in &broken_ids {
-            self.purge_install_record(id)?;
+        let mut report = PurgeAllReport::default();
+        for id in plan_purge_all(&issues) {
+            match self.purge_install_record(&id) {
+                Ok(outcome) => {
+                    if outcome.removed_rows > 0 {
+                        report.removed_records += 1;
+                    }
+                    report.retired_folders.extend(outcome.retired);
+                }
+                Err(e) => report.failed.push(PurgeFailure {
+                    id,
+                    error: format!("{e:#}"),
+                }),
+            }
         }
-        let orphans = self.purge_orphan_rows()?;
-        let _ = self.health_scan();
-        Ok((records, orphans))
+        match self.purge_orphan_rows() {
+            Ok(n) => report.removed_orphans = n,
+            Err(e) => report.failed.push(PurgeFailure {
+                id: "orphan rows".into(),
+                error: format!("{e:#}"),
+            }),
+        }
+        match self.health_scan() {
+            Ok(left) => report.remaining = left,
+            Err(e) => report.rescan_error = Some(format!("{e:#}")),
+        }
+        Ok(report)
     }
 
     /// Trust-review modal (2026-05-15) — run the registry replay for a pkg
@@ -2274,6 +2430,146 @@ mod tests {
 
         // A missing pkgs dir is simply empty, never an error.
         assert!(scan_pkgs_dir(&pkgs.join("absent"), &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    const MEETINGS_020: &str = r#"{"id": "com.ikenga.meetings", "name": "Meetings", "version": "0.2.0",
+        "ikenga_api": "5",
+        "ui": {"nav": [{"id": "meetings", "label": "Meetings", "route": "/meetings"}]}}"#;
+
+    /// Remove on a `PkgsDirUnloadable` row retires the folder through
+    /// `uninstall_dir::retire` (rename to a `.uninstalled-<id>-<millis>`
+    /// backup, files intact), not a hard delete, and only that pkg's folder.
+    /// A rescan no longer reports it.
+    #[test]
+    fn remove_unloadable_pkgs_dir_entry_retires_folder_to_backup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pkgs = root.path();
+        let meetings = pkgs.join("com.ikenga.meetings");
+        write_manifest(&meetings, MEETINGS_020);
+        std::fs::write(meetings.join("index.html"), "<p>kept</p>").unwrap();
+        write_manifest(&pkgs.join("com.test.garbled"), "{ not json");
+
+        let none = HashSet::new();
+        let issues = scan_pkgs_dir(pkgs, &none, &none);
+        assert_eq!(issues.len(), 2, "got {issues:?}");
+
+        let (retired, failed) = retire_unloadable_dirs(pkgs, &issues, Some("com.ikenga.meetings"));
+        assert!(failed.is_empty(), "got {failed:?}");
+        assert_eq!(retired.len(), 1, "only the requested pkg: {retired:?}");
+        assert_eq!(retired[0].id, "com.ikenga.meetings");
+        assert_eq!(retired[0].path, meetings.display().to_string());
+
+        // Recoverable: the folder was moved, not deleted.
+        assert!(!meetings.exists(), "original folder is gone");
+        let backup = PathBuf::from(retired[0].backup.as_deref().expect("moved to a backup"));
+        let name = backup.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(
+            name.starts_with(".uninstalled-com.ikenga.meetings-"),
+            "backup name: {name}"
+        );
+        assert_eq!(backup.parent(), Some(pkgs));
+        assert!(backup.join("manifest.json").exists());
+        assert_eq!(std::fs::read_to_string(backup.join("index.html")).unwrap(), "<p>kept</p>");
+
+        // The rescan (which skips dot-prefixed backups) sees only the other one.
+        let left = scan_pkgs_dir(pkgs, &none, &none);
+        let ids: Vec<&str> = left.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["com.test.garbled"]);
+        assert!(pkgs.join("com.test.garbled").exists(), "untouched");
+    }
+
+    /// A folder outside the pkgs dir is refused and left in place, reported
+    /// as a failure rather than silently skipped.
+    #[test]
+    fn retire_refuses_folder_outside_pkgs_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pkgs = root.path().join("pkgs");
+        std::fs::create_dir_all(&pkgs).unwrap();
+        let outside = root.path().join("elsewhere");
+        write_manifest(&outside, "{ not json");
+        let issues = vec![PkgHealthIssue {
+            id: "com.test.outside".into(),
+            install_path: outside.display().to_string(),
+            enabled: false,
+            issue: HealthIssueKind::PkgsDirUnloadable,
+            detail: String::new(),
+        }];
+        let (retired, failed) = retire_unloadable_dirs(&pkgs, &issues, None);
+        assert!(retired.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].error.contains("left in place"), "{}", failed[0].error);
+        assert!(outside.join("manifest.json").exists());
+    }
+
+    /// "Remove all" covers everything the scan lists: record issues AND
+    /// pkgs-dir folders (orphans are removed by the one bulk purge). Running
+    /// the plan against a pkgs dir retires every unloadable folder, so the
+    /// rescan comes back empty; nothing is left listed after a "done".
+    #[test]
+    fn remove_all_plan_covers_folder_issues_and_retires_them() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pkgs = root.path();
+        write_manifest(&pkgs.join("com.ikenga.meetings"), MEETINGS_020);
+        write_manifest(&pkgs.join("com.test.garbled"), "{ not json");
+        let none = HashSet::new();
+        let mut issues = scan_pkgs_dir(pkgs, &none, &none);
+        issues.push(PkgHealthIssue {
+            id: "com.test.rejected".into(),
+            install_path: "/x/rejected".into(),
+            enabled: true,
+            issue: HealthIssueKind::RegisterFailed,
+            detail: String::new(),
+        });
+        issues.push(PkgHealthIssue {
+            id: "com.test.broken".into(),
+            install_path: "/x/broken".into(),
+            enabled: true,
+            issue: HealthIssueKind::ManifestMissing,
+            detail: String::new(),
+        });
+        issues.push(PkgHealthIssue {
+            id: "com.test.ghost".into(),
+            install_path: String::new(),
+            enabled: true,
+            issue: HealthIssueKind::OrphanRow {
+                table: "pkg_settings".into(),
+            },
+            detail: String::new(),
+        });
+
+        let plan = plan_purge_all(&issues);
+        assert_eq!(
+            plan,
+            vec![
+                "com.ikenga.meetings",
+                "com.test.broken",
+                "com.test.garbled",
+                "com.test.rejected"
+            ],
+            "folder issues are in the plan; orphans go through purge_orphans"
+        );
+
+        let mut retired = Vec::new();
+        for id in &plan {
+            let (done, failed) = retire_unloadable_dirs(pkgs, &issues, Some(id.as_str()));
+            assert!(failed.is_empty(), "{id}: {failed:?}");
+            retired.extend(done);
+        }
+        assert_eq!(retired.len(), 2, "both folders retired: {retired:?}");
+        assert!(retired.iter().all(|r| r.backup.is_some()));
+        assert!(scan_pkgs_dir(pkgs, &none, &none).is_empty(), "rescan is clean");
+
+        // The report shape the UI reads.
+        let report = PurgeAllReport {
+            removed_records: 2,
+            removed_orphans: 1,
+            retired_folders: retired,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["retired_folders"].as_array().unwrap().len(), 2);
+        assert_eq!(v["remaining"], serde_json::json!([]));
+        assert_eq!(v["rescan_error"], serde_json::Value::Null);
     }
 
     /// An enabled, loadable row the kernel never registered is flagged

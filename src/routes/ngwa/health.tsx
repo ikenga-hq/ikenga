@@ -1,6 +1,6 @@
 // /ngwa/health — Ngwa Health Dashboard (WP-16 / WP-16a / locked D-02).
 //
-// Mounts the five health panels. `?section=` scrolls to and focuses a panel;
+// Mounts the six D-02 health panels. `?section=` scrolls to and focuses a panel;
 // the three retired settings pages redirect here with it.
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
@@ -13,7 +13,7 @@ import { NgwaTabs } from '@/shell/ngwa/ngwa-tabs';
 import '@/shell/ngwa/ngwa.css';
 
 const healthSearchSchema = z.object({
-	section: z.enum(['violations', 'sidecars', 'cron', 'data', 'engines']).optional(),
+	section: z.enum(['violations', 'sidecars', 'cron', 'data', 'trust', 'engines']).optional(),
 });
 
 function NgwaHealthPage() {

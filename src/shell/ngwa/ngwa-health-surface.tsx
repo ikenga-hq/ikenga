@@ -1,17 +1,21 @@
 // Ngwa Health Surface (WP-16 / WP-16a / locked D-02 frame-workbench-v4.html).
 //
-// Five panels, each reading its own real source and rendering independently
-// of the (slow) Ngwa snapshot:
-//   1. Violations — `pkg_permission_violations` (full list, per-pkg Clear) and
-//      the install-integrity scan (`pkgHealthScan`, Remove / Remove all), plus
-//      the unsigned count from the snapshot (gate §5). A pkg on disk that
-//      failed to register offers D-02's "Reinstall from registry" when the
-//      registry lists it — the Store sheet runs it, consent included.
+// D-02 layout: a 2-column grid of six panels (VIOLATIONS · SIDECARS / CRON ·
+// DATA / TRUST · ENGINES) plus the audit line. Panels grow to fit their rows
+// and the page scrolls as a whole — nothing is clipped. Each panel reads its
+// own real source and renders independently of the (slow) Ngwa snapshot:
+//   1. Violations — the install-integrity scan (`pkgHealthScan`) and
+//      `pkg_permission_violations`, one row each with inline actions: Reinstall
+//      from registry (when the registry lists the pkg), Remove… (confirmed; a
+//      pkgs-dir folder is retired to a recoverable backup, never deleted),
+//      Clear, Hand to Chi. Remove all covers everything the scan lists and
+//      reports exactly what it removed and what is still there.
 //   2. Sidecars  — `pkgKernelStatus().registries.sidecar_supervisor`, Restart.
 //   3. Cron      — agent-ops jobs (`agentOpsListJobs`, Run now, Logs) and pkg
 //      manifest `cron[]` (`registries.cron`, no run history) — DEC-33.
 //   4. Data      — DB file sizes (DEC-32), soft-FK orphan scan, newest backup.
-//   5. Engines   — the shared installed-engine signal + `detectAgent` probes.
+//   5. Trust     — the unsigned count from the snapshot (gate §5), Review.
+//   6. Engines   — the shared installed-engine signal + `detectAgent` probes.
 // Anything not measured reads "—". Every failure renders as an error, never as
 // an empty list or a zero. Destructive actions confirm first (DEC-30).
 
@@ -49,8 +53,11 @@ import {
 	type EngineId,
 	type PkgHealthIssue,
 	type PkgHealthIssueKind,
+	type PkgHealthRemoveAllResult,
+	type PkgHealthRemoveResult,
 	type PkgKernelStatus,
 } from '@/lib/tauri-cmd';
+import { handToChi } from '@/shell/companion/companion-store';
 import { ngwaSnapshotQueryKey } from '@/lib/ngwa/use-ngwa-snapshot';
 import {
 	ENGINE_IDS,
@@ -63,7 +70,7 @@ import {
 } from './ngwa-scopes-surface';
 import './ngwa.css';
 
-export type HealthSection = 'violations' | 'sidecars' | 'cron' | 'data' | 'engines';
+export type HealthSection = 'violations' | 'sidecars' | 'cron' | 'data' | 'trust' | 'engines';
 
 export interface NgwaHealthSurfaceProps {
 	items: NgwaItem[];
@@ -144,21 +151,34 @@ export function issueLabel(kind: PkgHealthIssueKind): string {
 	}
 }
 
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+export type Notice = { tone: 'ok' | 'err'; text: string };
+
 /** The confirm for one install-health row's Remove. A pkgs-dir entry that
- *  failed to load has no record — the pkg is its folder — so Remove deletes
- *  that folder; every other kind is a DB-record purge. */
-function removeRequest(r: PkgHealthIssue): ConfirmRequest {
+ *  failed to load has no record — the pkg is its folder — so Remove retires
+ *  that folder to a recoverable backup (the uninstall path); every other kind
+ *  is a DB-record purge. */
+export function removeRequest(r: PkgHealthIssue, reinstallable: boolean): ConfirmRequest {
 	if (r.issue.kind === 'pkgs_dir_unloadable') {
 		return {
-			title: `Remove ${r.id} from disk`,
+			title: `Remove ${r.id}`,
 			confirmLabel: 'Remove',
+			cancelLabel: 'Keep it',
 			body: (
 				<>
 					<p>
-						<code>{r.id}</code> failed to load, so it has no install record. Removing it deletes its
-						folder <code>{r.install_path}</code> from disk.
+						<code>{r.id}</code> failed to load, so it has no install record. Removing it moves its folder{' '}
+						<code>{r.install_path}</code> to a <code>.uninstalled-…</code> backup in the pkgs folder, the
+						same as an uninstall.
 					</p>
-					<p>There is no undo.</p>
+					<p data-remove-recoverable>
+						Nothing is deleted now: boot skips the backup and prunes it after 7 days, so it can be put
+						back until then.
+					</p>
+					{reinstallable && (
+						<p data-remove-reinstall-hint>To keep the pkg, use Reinstall from registry instead.</p>
+					)}
 				</>
 			),
 			run: () => pkgHealthRemove(r.id),
@@ -183,6 +203,51 @@ function removeRequest(r: PkgHealthIssue): ConfirmRequest {
 			</>
 		),
 		run: () => pkgHealthRemove(r.id),
+	};
+}
+
+/** The result line for one row's Remove, from what the kernel actually did. */
+export function summarizeRemove(id: string, r: PkgHealthRemoveResult | null | undefined): Notice {
+	if (!r) return { tone: 'ok', text: `Removed ${id}` };
+	const parts: string[] = [];
+	if (r.removed_rows > 0) parts.push(`deleted ${plural(r.removed_rows, 'record row')}`);
+	for (const f of r.retired) {
+		parts.push(
+			f.backup
+				? `moved its folder to ${f.backup}`
+				: 'set its manifest aside; the folder moves to a backup at next start'
+		);
+	}
+	return { tone: 'ok', text: `Removed ${id}: ${parts.join(' · ') || 'nothing matched'}` };
+}
+
+/** The result line for Remove all: exactly what was removed, and what is still
+ *  listed after the kernel's rescan and why. "ok" only when nothing is left. */
+export function summarizeRemoveAll(r: PkgHealthRemoveAllResult): Notice {
+	const done: string[] = [];
+	if (r.removed_records > 0) done.push(plural(r.removed_records, 'record'));
+	if (r.retired_folders.length > 0) done.push(`retired ${plural(r.retired_folders.length, 'folder')}`);
+	if (r.removed_orphans > 0) done.push(plural(r.removed_orphans, 'orphan row'));
+	const head = done.length ? `Removed ${done.join(' · ')}` : '0 removed';
+	if (r.rescan_error) {
+		return { tone: 'err', text: `${head} — the rescan failed, so what is left is unknown: ${r.rescan_error}` };
+	}
+	const failedById = new Map(r.failed.map((f) => [f.id, f.error]));
+	const leftIds = Array.from(new Set(r.remaining.map((i) => i.id)));
+	const why = leftIds.map((id) => {
+		const err = failedById.get(id);
+		if (err) return `${id}: ${err}`;
+		const kinds = r.remaining.filter((i) => i.id === id).map((i) => i.issue.kind);
+		return kinds.includes('pkgs_dir_unloadable') || kinds.includes('register_failed')
+			? `${id} needs Reinstall or Remove`
+			: `${id} is still listed`;
+	});
+	// A failure whose id is no longer listed is still named.
+	for (const f of r.failed) if (!leftIds.includes(f.id)) why.push(`${f.id}: ${f.error}`);
+	if (why.length === 0) return { tone: 'ok', text: head };
+	return {
+		tone: 'err',
+		text: `${head} — ${leftIds.length ? `${plural(leftIds.length, 'issue')} left: ` : ''}${why.join('; ')}`,
 	};
 }
 
@@ -328,24 +393,99 @@ export function NgwaHealthSurface({
 		'aria-current': section === s ? ('true' as const) : undefined,
 	});
 
-	function done(label: string, invalidate: readonly (readonly unknown[])[]) {
+	const lastResult = useRef<unknown>(null);
+	function done(
+		label: string,
+		invalidate: readonly (readonly unknown[])[],
+		summarize?: (result: unknown) => Notice
+	) {
 		return (result: { ok: true } | { ok: false; error: string } | null) => {
 			setConfirm(null);
 			if (!result) return;
 			for (const k of invalidate) void qc.invalidateQueries({ queryKey: k });
 			setNotice(
-				result.ok
-					? { tone: 'ok', text: `${label}: done` }
-					: { tone: 'err', text: `${label} failed: ${result.error}` }
+				!result.ok
+					? { tone: 'err', text: `${label} failed: ${result.error}` }
+					: summarize
+						? summarize(lastResult.current)
+						: { tone: 'ok', text: `${label}: done` }
 			);
 		};
 	}
 	const [onConfirmClose, setOnConfirmClose] = useState<
 		((r: { ok: true } | { ok: false; error: string } | null) => void) | null
 	>(null);
-	function ask(req: ConfirmRequest, label: string, invalidate: readonly (readonly unknown[])[]) {
-		setConfirm(req);
-		setOnConfirmClose(() => done(label, invalidate));
+	function ask(
+		req: ConfirmRequest,
+		label: string,
+		invalidate: readonly (readonly unknown[])[],
+		summarize?: (result: unknown) => Notice
+	) {
+		lastResult.current = null;
+		setConfirm({
+			...req,
+			run: async () => {
+				lastResult.current = await req.run();
+			},
+		});
+		setOnConfirmClose(() => done(label, invalidate, summarize));
+	}
+
+	function askRemove(r: PkgHealthIssue) {
+		const reinstallable = isUnregisteredPkgIssue(r.issue) && !!onReinstall && !!canReinstall?.(r.id);
+		ask(
+			removeRequest(r, reinstallable),
+			`Remove ${r.id}`,
+			[HEALTH_KEYS.installs, ngwaSnapshotQueryKey],
+			(res) => summarizeRemove(r.id, res as PkgHealthRemoveResult | null)
+		);
+	}
+
+	function askRemoveAll() {
+		const folders = installs.filter((r) => r.issue.kind === 'pkgs_dir_unloadable');
+		const reinstallable = folders.filter((r) => onReinstall && canReinstall?.(r.id));
+		ask(
+			{
+				title: 'Remove all listed issues',
+				confirmLabel: 'Remove all',
+				body: (
+					<>
+						<p data-removeall-rescan>
+							The kernel <b>rescans when you confirm</b> and removes whatever is broken or orphaned{' '}
+							<b>at that moment</b>: each broken <code>pkg_installed</code> row with its child{' '}
+							<code>pkg_*</code> rows, each orphan row, and each pkgs-folder entry that failed to load.
+							That set can differ from the list below if anything changed since this screen last scanned.
+						</p>
+						<p>
+							Last scan found {installs.length}: {installs.map((r) => r.id).join(', ')}
+						</p>
+						{folders.length > 0 && (
+							<p data-removeall-folders>
+								{folders.length === 1 ? 'The folder' : `The ${folders.length} folders`} (
+								{folders.map((r) => r.id).join(', ')}) {folders.length === 1 ? 'is' : 'are'} not deleted:
+								each moves to a <code>.uninstalled-…</code> backup in the pkgs folder, which boot skips
+								and prunes after 7 days.
+								{reinstallable.length > 0 && (
+									<> To keep {reinstallable.map((r) => r.id).join(', ')}, cancel and use Reinstall from registry.</>
+								)}
+							</p>
+						)}
+						<p>Deleted records have no undo. You get a line saying exactly what was removed and what is left.</p>
+					</>
+				),
+				run: () => pkgHealthRemoveAll(),
+			},
+			'Remove all',
+			[HEALTH_KEYS.installs, ngwaSnapshotQueryKey],
+			(res) => {
+				const report = res as PkgHealthRemoveAllResult | null;
+				if (!report) return { tone: 'err', text: 'Remove all returned no report' };
+				// Show the kernel's own post-removal rescan at once; the
+				// invalidation above then refetches it.
+				if (!report.rescan_error) qc.setQueryData(HEALTH_KEYS.installs, report.remaining);
+				return summarizeRemoveAll(report);
+			}
+		);
 	}
 
 	// ── auditline ──
@@ -387,7 +527,6 @@ export function NgwaHealthSurface({
 	const ageMin = snapshot ? Math.max(0, Math.floor((now() - snapshot.as_of_ms) / 60_000)) : null;
 
 	const violationCount = violationsQ.isSuccess && installsQ.isSuccess ? violations.length + installs.length : null;
-	const violationPkgIds = Array.from(new Set(violations.map((v) => v.pkg_id)));
 	const agentJobs: AgentOpsRawJob[] = agentOpsQ.data?.jobs ?? [];
 	const cronCount =
 		agentOpsQ.isSuccess && pkgCron.entries ? agentJobs.length + pkgCron.entries.length : null;
@@ -402,156 +541,21 @@ export function NgwaHealthSurface({
 					{notice.text}
 				</div>
 			)}
-			<div className="hgrid sc" data-hgrid>
+			<div className="hscroll sc" data-hscroll>
+			<div className="hgrid" data-hgrid>
 				{/* ── 1. Violations ── */}
 				<section className="panel" {...panelProps('violations')} aria-label="Violations">
 					<h3>
 						<AlertTriangle className="h-3.5 w-3.5" />
 						<span>Violations</span>
-						{violationCount !== null && violationCount > 0 && (
-							<span className="n bad" data-violn>
+						{violationCount !== null && (
+							<span className={`n ${violationCount > 0 ? 'bad' : 'ok'}`} data-violn>
 								{violationCount}
 							</span>
 						)}
-						<span className="n warn" data-unsignedn>
-							<Shield className="inline h-3 w-3" />{' '}
-							{snapshotReady && trustDown.length === 0 ? unsigned.length : '—'} unsigned
-						</span>
 					</h3>
 
-					<div className="hsub">
-						<span>Permission violations</span>
-						<span className="rt">
-							<button
-								type="button"
-								className="chip"
-								aria-label="Refresh violations"
-								disabled={violationsQ.isFetching}
-								onClick={() => void violationsQ.refetch()}
-							>
-								<RefreshCw className="h-3 w-3" />
-							</button>
-						</span>
-					</div>
-					{violationsQ.isLoading ? (
-						<div className="hnote">Loading violations…</div>
-					) : violationsQ.error ? (
-						<Err>Failed to load violations: {errText(violationsQ.error)}</Err>
-					) : violations.length === 0 ? (
-						<div className="hnote" data-empty="violations">
-							No violations recorded.
-						</div>
-					) : (
-						<>
-							<div className="hnote">
-								{violationPkgIds.map((id) => (
-									<button
-										key={id}
-										type="button"
-										className="chip clear"
-										data-clear={id}
-										onClick={() => {
-											const n = violations.filter((v) => v.pkg_id === id).length;
-											ask(
-												{
-													title: `Clear violations for ${id}`,
-													confirmLabel: 'Clear',
-													body: (
-														<>
-															<p>
-																Deletes the {n} audit row{n === 1 ? '' : 's'} for <code>{id}</code> from{' '}
-																<code>pkg_permission_violations</code>.
-															</p>
-															<p>Audit-only: trust state and grants are unchanged. There is no undo.</p>
-														</>
-													),
-													run: () => pkgPermissionViolationsClear(id),
-												},
-												`Clear violations for ${id}`,
-												[HEALTH_KEYS.violations]
-											);
-										}}
-									>
-										Clear {id}
-									</button>
-								))}
-							</div>
-							<div className="hlist" data-list="violations">
-								{violations.map((v) => (
-									<div key={v.id} className="hrow" data-violation={v.id}>
-										<AlertTriangle className="h-4 w-4 flex-none" />
-										<div className="txt">
-											<span className="t1">
-												{v.pkg_id} <span className="tag">{violationScopeLabel(v.scope_kind)}</span>
-											</span>
-											<span className="t2">
-												attempted <code>{v.attempted}</code> · declared <code>{v.declared || '—'}</code> ·{' '}
-												{fmtTime(v.occurred_at)}
-											</span>
-										</div>
-									</div>
-								))}
-							</div>
-							<div className="hnote">
-								Showing {violations.length} most recent (cap 200). Local audit data only.
-							</div>
-						</>
-					)}
-
-					<div className="hsub">
-						<span>Install records</span>
-						<span className="rt">
-							{installs.length > 0 && (
-								<button
-									type="button"
-									className="chip danger"
-									data-act="remove-all"
-									onClick={() =>
-										ask(
-											{
-												title: 'Remove all unhealthy records',
-												confirmLabel: 'Remove all',
-												body: (
-													<>
-														<p data-removeall-rescan>
-															The kernel <b>rescans when you confirm</b> and deletes whatever is broken or
-															orphaned <b>at that moment</b>: each broken <code>pkg_installed</code> row with its
-															child <code>pkg_*</code> rows, and each orphan row. That set can differ from the
-															list below if anything changed since this screen last scanned.
-														</p>
-														<p>
-															Last scan found {installs.length}: {installs.map((r) => r.id).join(', ')}
-														</p>
-														<p>Files on disk are never touched. There is no undo.</p>
-														{installs.some((r) => r.issue.kind === 'pkgs_dir_unloadable') && (
-															<p data-removeall-keeps-dirs>
-																Packages that failed to load from the pkgs folder are only files, so
-																they stay listed: reinstall or remove each one from its row.
-															</p>
-														)}
-													</>
-												),
-												run: () => pkgHealthRemoveAll(),
-											},
-											'Remove all records',
-											[HEALTH_KEYS.installs, ngwaSnapshotQueryKey]
-										)
-									}
-								>
-									Remove all
-								</button>
-							)}
-							<button
-								type="button"
-								className="chip"
-								aria-label="Rescan install records"
-								disabled={installsQ.isFetching}
-								onClick={() => void installsQ.refetch()}
-							>
-								<RefreshCw className="h-3 w-3" />
-							</button>
-						</span>
-					</div>
+					{/* install integrity: broken / unregistered pkgs first — they are what blocks a view */}
 					{installsQ.isLoading ? (
 						<div className="hnote">Scanning installs…</div>
 					) : installsQ.error ? (
@@ -562,120 +566,186 @@ export function NgwaHealthSurface({
 						</div>
 					) : (
 						<div className="hlist" data-list="installs">
-							{installs.map((r) => (
-								<div key={`${r.id}:${r.issue.kind}`} className="hrow" data-install={r.id}>
-									<AlertTriangle className="h-4 w-4 flex-none" />
-									<div className="txt">
-										<span className="t1">
-											{r.id}{' '}
-											<span
-												className={`tag ${r.issue.kind === 'orphan_row' ? '' : 'bad'}`}
-												data-issue={r.issue.kind}
-											>
-												{issueLabel(r.issue)}
+							{installs.map((r) => {
+								const reinstall =
+									isUnregisteredPkgIssue(r.issue) && onReinstall && canReinstall?.(r.id);
+								return (
+									<div key={`${r.id}:${r.issue.kind}`} className="hrow" data-install={r.id}>
+										<AlertTriangle className="hico h-4 w-4 flex-none" />
+										<div className="txt">
+											<span className="t1">
+												{r.id}{' '}
+												<span
+													className={`tag ${r.issue.kind === 'orphan_row' ? '' : 'bad'}`}
+													data-issue={r.issue.kind}
+												>
+													{issueLabel(r.issue)}
+												</span>
+												{!r.enabled && r.issue.kind !== 'pkgs_dir_unloadable' && (
+													<span className="tag">disabled</span>
+												)}
 											</span>
-											{!r.enabled && <span className="tag">disabled</span>}
-										</span>
-										<span className="t2">
-											{r.install_path ? <code>{r.install_path}</code> : '—'} · {r.detail}
-										</span>
-									</div>
-									<div className="acts">
-										{isUnregisteredPkgIssue(r.issue) && onReinstall && canReinstall?.(r.id) ? (
-											<button
-												type="button"
-												className="chip on"
-												data-reinstall={r.id}
-												title="Fetch it again from the signed registry. The Store sheet asks for consent first."
-												onClick={() => onReinstall(r.id)}
-											>
-												Reinstall from registry
-											</button>
-										) : (
+											<span className="t2">
+												{r.detail}
+												{r.install_path ? (
+													<>
+														{' '}
+														· <code>{r.install_path}</code>
+													</>
+												) : null}
+											</span>
+										</div>
+										<div className="acts">
+											{reinstall && (
+												<button
+													type="button"
+													className="chip on"
+													data-reinstall={r.id}
+													title="Fetch it again from the signed registry. The Store sheet asks for consent first."
+													onClick={() => onReinstall(r.id)}
+												>
+													Reinstall from registry
+												</button>
+											)}
 											<button
 												type="button"
 												className="chip danger"
 												data-remove={r.id}
+												title={
+													r.issue.kind === 'pkgs_dir_unloadable'
+														? 'Move its folder to a recoverable backup'
+														: 'Delete this record'
+												}
+												onClick={() => askRemove(r)}
+											>
+												Remove…
+											</button>
+											<button
+												type="button"
+												className="chip"
+												data-chi={r.id}
 												onClick={() =>
-													ask(removeRequest(r), `Remove record ${r.id}`, [
-														HEALTH_KEYS.installs,
-														ngwaSnapshotQueryKey,
-													])
+													handToChi(
+														`Look at the Ikenga pkg ${r.id} (${issueLabel(r.issue)})${
+															r.install_path ? ` at ${r.install_path}` : ''
+														}: ${r.detail}`
+													)
 												}
 											>
-												Remove
+												Hand to Chi
 											</button>
-										)}
+										</div>
 									</div>
-								</div>
-							))}
+								);
+							})}
 						</div>
 					)}
 
-					<div className="hrow">
-						<Shield className="h-4 w-4 flex-none" />
-						<div className="txt">
-							{isLoading ? (
-								<span className="t1" data-snapshot-loading>
-									{SNAPSHOT_WAIT}
-								</span>
-							) : error ? (
-								<span className="t1 herr">Snapshot failed: {error.message}</span>
-							) : trustDown.length > 0 ? (
-								<span className="t1 herr" data-unsigned-unknown>
-									Unsigned count unknown: {trustDown.map((s) => s.source).join(', ')} unreadable.
-								</span>
-							) : (
-								<>
-									<span className="t1" data-unsigned>
-										{unsigned.length} of {items.length} installed items are unsigned
-									</span>
-									<span className="t2">
-										Unsigned means no signature and no approval pending. Skills, agents, commands and
-										hooks carry no manifest, so they can never be signed; pkgs are unsigned when their
-										manifest has no signature.
-									</span>
-								</>
-							)}
+					{/* permission violations */}
+					{violationsQ.isLoading ? (
+						<div className="hnote">Loading violations…</div>
+					) : violationsQ.error ? (
+						<Err>Failed to load violations: {errText(violationsQ.error)}</Err>
+					) : violations.length === 0 ? (
+						<div className="hnote" data-empty="violations">
+							No permission violations recorded.
 						</div>
-						<div className="acts">
-							<button
-								type="button"
-								className="chip"
-								data-act="review-unsigned"
-								aria-expanded={showUnsigned}
-								disabled={!snapshotReady || trustDown.length > 0 || unsigned.length === 0}
-								title={
-									!snapshotReady
-										? 'Waiting for the snapshot'
-										: trustDown.length > 0
-											? 'Trust data is unreadable'
-											: unsigned.length === 0
-												? 'Nothing unsigned'
-												: undefined
-								}
-								onClick={() => setShowUnsigned((v) => !v)}
-							>
-								Review the {snapshotReady && trustDown.length === 0 ? unsigned.length : '—'}
-							</button>
-						</div>
-					</div>
-					{showUnsigned && (
-						<div className="hlist" data-list="unsigned">
-							{unsigned.map((it) => (
-								<div key={it.id} className="hrow">
-									<div className="txt">
-										<span className="t1">
-											{it.display_name || it.name} <span className="tag">{it.kind}</span>
-										</span>
-										<span className="t2">
-											source {it.origin.source} · trust {it.trust.state}
-										</span>
+					) : (
+						<div className="hlist" data-list="violations">
+							{violations.map((v) => {
+								const n = violations.filter((x) => x.pkg_id === v.pkg_id).length;
+								return (
+									<div key={v.id} className="hrow" data-violation={v.id}>
+										<AlertTriangle className="hico h-4 w-4 flex-none" />
+										<div className="txt">
+											<span className="t1">
+												{v.pkg_id} attempted <code>{v.attempted}</code>{' '}
+												<span className="tag">{violationScopeLabel(v.scope_kind)}</span>
+											</span>
+											<span className="t2">
+												declared <code>{v.declared || '—'}</code> · {fmtTime(v.occurred_at)}
+											</span>
+										</div>
+										<div className="acts">
+											<button
+												type="button"
+												className="chip"
+												data-clear={v.pkg_id}
+												title={`Clear the ${plural(n, 'audit row')} for ${v.pkg_id}`}
+												onClick={() =>
+													ask(
+														{
+															title: `Clear violations for ${v.pkg_id}`,
+															confirmLabel: 'Clear',
+															body: (
+																<>
+																	<p>
+																		Deletes the {plural(n, 'audit row')} for <code>{v.pkg_id}</code> from{' '}
+																		<code>pkg_permission_violations</code>.
+																	</p>
+																	<p>Audit-only: trust state and grants are unchanged. There is no undo.</p>
+																</>
+															),
+															run: () => pkgPermissionViolationsClear(v.pkg_id),
+														},
+														`Clear violations for ${v.pkg_id}`,
+														[HEALTH_KEYS.violations]
+													)
+												}
+											>
+												Clear
+											</button>
+											<button
+												type="button"
+												className="chip"
+												data-chi={`violation:${v.id}`}
+												onClick={() =>
+													handToChi(
+														`Look at why ${v.pkg_id} attempted ${violationScopeLabel(v.scope_kind)} ${v.attempted} when it declared ${v.declared || 'nothing'}`
+													)
+												}
+											>
+												Hand to Chi
+											</button>
+										</div>
 									</div>
-								</div>
-							))}
+								);
+							})}
 						</div>
 					)}
+
+					<div className="panelfoot" data-violations-foot>
+						<span className="grow">
+							{violationsQ.isSuccess && violations.length > 0
+								? `Showing the ${violations.length} most recent permission violations (cap 200). Local audit data only.`
+								: 'Install scan and local permission audit.'}
+						</span>
+						<button
+							type="button"
+							className="chip"
+							aria-label="Refresh violations"
+							title="Refresh violations"
+							disabled={violationsQ.isFetching}
+							onClick={() => void violationsQ.refetch()}
+						>
+							<RefreshCw className="h-3 w-3" />
+						</button>
+						<button
+							type="button"
+							className="chip"
+							aria-label="Rescan install records"
+							title="Rescan install records"
+							disabled={installsQ.isFetching}
+							onClick={() => void installsQ.refetch()}
+						>
+							Rescan
+						</button>
+						{installs.length > 0 && (
+							<button type="button" className="chip danger" data-act="remove-all" onClick={askRemoveAll}>
+								Remove all…
+							</button>
+						)}
+					</div>
 				</section>
 
 				{/* ── 2. Sidecars ── */}
@@ -1022,7 +1092,82 @@ export function NgwaHealthSurface({
 					</div>
 				</section>
 
-				{/* ── 5. Engines ── */}
+				{/* ── 5. Trust ── */}
+				<section className="panel" {...panelProps('trust')} aria-label="Trust">
+					<h3>
+						<Shield className="h-3.5 w-3.5" />
+						<span>Trust</span>
+						<span className="n warn" data-unsignedn>
+							{snapshotReady && trustDown.length === 0 ? unsigned.length : '—'} unsigned
+						</span>
+					</h3>
+					<div className="hrow" data-row="unsigned">
+						<Shield className="hico h-4 w-4 flex-none" />
+						<div className="txt">
+							{isLoading ? (
+								<span className="t1" data-snapshot-loading>
+									{SNAPSHOT_WAIT}
+								</span>
+							) : error ? (
+								<span className="t1 herr">Snapshot failed: {error.message}</span>
+							) : trustDown.length > 0 ? (
+								<span className="t1 herr" data-unsigned-unknown>
+									Unsigned count unknown: {trustDown.map((s) => s.source).join(', ')} unreadable.
+								</span>
+							) : (
+								<>
+									<span className="t1" data-unsigned>
+										{unsigned.length} of {items.length} installed items are unsigned
+									</span>
+									<span className="t2">
+										Unsigned means no signature and no approval pending. Skills, agents, commands and hooks
+										carry no manifest, so they can never be signed; pkgs are unsigned when their manifest
+										has no signature.
+									</span>
+								</>
+							)}
+						</div>
+						<div className="acts">
+							<button
+								type="button"
+								className="chip"
+								data-act="review-unsigned"
+								aria-expanded={showUnsigned}
+								disabled={!snapshotReady || trustDown.length > 0 || unsigned.length === 0}
+								title={
+									!snapshotReady
+										? 'Waiting for the snapshot'
+										: trustDown.length > 0
+											? 'Trust data is unreadable'
+											: unsigned.length === 0
+												? 'Nothing unsigned'
+												: undefined
+								}
+								onClick={() => setShowUnsigned((v) => !v)}
+							>
+								Review the {snapshotReady && trustDown.length === 0 ? unsigned.length : '—'}
+							</button>
+						</div>
+					</div>
+					{showUnsigned && (
+						<div className="hlist" data-list="unsigned">
+							{unsigned.map((it) => (
+								<div key={it.id} className="hrow">
+									<div className="txt">
+										<span className="t1">
+											{it.display_name || it.name} <span className="tag">{it.kind}</span>
+										</span>
+										<span className="t2">
+											source {it.origin.source} · trust {it.trust.state}
+										</span>
+									</div>
+								</div>
+							))}
+						</div>
+					)}
+				</section>
+
+				{/* ── 6. Engines ── */}
 				<section className="panel" {...panelProps('engines')} aria-label="Engines">
 					<h3>
 						<Bot className="h-3.5 w-3.5" />
@@ -1105,6 +1250,7 @@ export function NgwaHealthSurface({
 						{readSources.length > 0 && <> · also read: {readSources.join(', ')}</>}. Anything not
 						measured reads “—”.
 					</span>
+				</div>
 				</div>
 			</div>
 

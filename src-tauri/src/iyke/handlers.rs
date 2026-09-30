@@ -2011,11 +2011,13 @@ pub async fn post_pkg_health_scan(
         })
 }
 
-/// Remove one broken install record. Mirrors `pkg_health_remove`.
+/// Remove one health issue (record, or a pkgs-dir folder retired to a
+/// backup). Mirrors `pkg_health_remove`; returns `{ ok: true, removed_rows,
+/// retired }`.
 pub async fn post_pkg_health_remove(
     Extension(app): Extension<AppHandle>,
     JsonBody(body): JsonBody<PkgHealthRemoveBody>,
-) -> Result<Json<OkResponse>, (StatusCode, String)> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     use tauri::Manager;
     let kernel = app.try_state::<crate::commands::KernelState>().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2023,7 +2025,7 @@ pub async fn post_pkg_health_remove(
     ))?;
     let kernel_arc = kernel.0.clone();
     let pkg_id = body.pkg_id;
-    tokio::task::spawn_blocking(move || kernel_arc.purge_install_record(&pkg_id))
+    let outcome = tokio::task::spawn_blocking(move || kernel_arc.purge_install_record(&pkg_id))
         .await
         .map_err(|e| {
             (
@@ -2032,11 +2034,16 @@ pub async fn post_pkg_health_remove(
             )
         })?
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    Ok(ok())
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "removed_rows": outcome.removed_rows,
+        "retired": outcome.retired,
+    })))
 }
 
-/// Remove every currently-detected broken record + orphan row. Mirrors
-/// `pkg_health_remove_all`; returns the removed counts.
+/// Remove everything the health scan lists, then rescan. Mirrors
+/// `pkg_health_remove_all`; returns the full report (`removed_records`,
+/// `removed_orphans`, `retired_folders`, `failed`, `remaining`, `rescan_error`).
 pub async fn post_pkg_health_remove_all(
     Extension(app): Extension<AppHandle>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -2046,20 +2053,21 @@ pub async fn post_pkg_health_remove_all(
         "pkg kernel state not registered".into(),
     ))?;
     let kernel_arc = kernel.0.clone();
-    let (removed_records, removed_orphans) =
-        tokio::task::spawn_blocking(move || kernel_arc.purge_all_broken())
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("remove-all join: {e}"),
-                )
-            })?
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(Json(serde_json::json!({
-        "removed_records": removed_records,
-        "removed_orphans": removed_orphans,
-    })))
+    let report = tokio::task::spawn_blocking(move || kernel_arc.purge_all_broken())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("remove-all join: {e}"),
+            )
+        })?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    serde_json::to_value(&report).map(Json).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize report: {e}"),
+        )
+    })
 }
 
 pub async fn post_devtools(

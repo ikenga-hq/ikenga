@@ -305,11 +305,11 @@ reason = "HTTP proxy with capability/trust/SSRF checks via reqwest; no process s
 
 [pkg_health_remove]
 tag = "WP-19"
-reason = "kernel.purge_install_record deletes a pkg_installed row + child rows via SQL only; no registry spawn touched."
+reason = "kernel.purge_install_record deletes a pkg_installed row + child rows via SQL, or retires an unloadable pkgs-dir folder via uninstall_dir::retire (rename to a backup under the app-data pkgs dir, which the daemon does not own); no spawn."
 
 [pkg_health_remove_all]
 tag = "WP-19"
-reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL only; no spawn."
+reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL and retires unloadable pkgs-dir folders via uninstall_dir::retire (rename to a backup under the app-data pkgs dir); no spawn."
 
 [pkg_health_scan]
 tag = "WP-19"
