@@ -101,7 +101,8 @@ export function PkgHealthPanel() {
 					<p className="mt-0.5 text-[11.5px] text-muted-foreground">
 						Broken or orphaned install records — rows whose manifest is missing, unreadable,
 						invalid, or api-incompatible, plus orphaned child rows the kernel skips at boot.
-						Removing a record deletes only its database rows; it never touches files.
+						Removing a record deletes its database rows; a pkgs-folder entry that failed to load
+						is moved to a recoverable backup folder, never deleted.
 					</p>
 				</div>
 				<div className="flex shrink-0 items-center gap-1.5">

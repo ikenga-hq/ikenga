@@ -3,10 +3,21 @@
 // "one engine signal" check across both screens (must-fix 3).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import * as cmd from '@/lib/tauri-cmd';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { NgwaHealthSurface, fmtBytes, fmtTime, issueLabel } from './ngwa-health-surface';
+import { handToChi } from '@/shell/companion/companion-store';
+import {
+	NgwaHealthSurface,
+	fmtBytes,
+	fmtTime,
+	issueLabel,
+	summarizeRemove,
+	summarizeRemoveAll,
+} from './ngwa-health-surface';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { NgwaScopesSurface, type NgwaScopeActions } from './ngwa-scopes-surface';
 import { engineItems, mkItem, mkPlacement, mkSnapshot } from '@/routes/ngwa/-ngwa-test-fixtures';
 
@@ -21,10 +32,20 @@ vi.mock('@/lib/tauri-cmd', async (orig) => {
 		agentOpsListJobs: vi.fn(never),
 		backupList: vi.fn(never),
 		detectAgent: vi.fn(never),
+		pkgHealthRemove: vi.fn(),
+		pkgHealthRemoveAll: vi.fn(),
 	};
 });
 
-afterEach(() => cleanup());
+vi.mock('@/shell/companion/companion-store', async (orig) => {
+	const actual = await orig<typeof import('@/shell/companion/companion-store')>();
+	return { ...actual, handToChi: vi.fn() };
+});
+
+afterEach(() => {
+	cleanup();
+	vi.clearAllMocks();
+});
 
 const noop = () => Promise.resolve();
 const actions: NgwaScopeActions = {
@@ -131,31 +152,214 @@ describe('a pkg on disk that failed to register (Bug 2)', () => {
 		expect(issueLabel({ kind: 'register_failed' })).toBe('not registered');
 	});
 
-	it('lists the broken pkg with its parse error and "Reinstall from registry" when the registry has it', async () => {
-		const onReinstall = vi.fn();
-		const { container } = mount({ canReinstall: (id) => id === 'com.ikenga.meetings', onReinstall });
-		const row = await waitFor(() => {
+	const row = async (container: HTMLElement) =>
+		waitFor(() => {
 			const el = container.querySelector('[data-install="com.ikenga.meetings"]');
 			if (!el) throw new Error('row not rendered yet');
 			return el as HTMLElement;
 		});
-		expect(row.querySelector('[data-issue="pkgs_dir_unloadable"]')?.textContent).toBe('failed to load');
-		expect(row.textContent).toContain('ui.nav');
-		// Reinstall replaces Remove — the fix, not the delete.
-		expect(row.querySelector('[data-remove]')).toBeNull();
-		fireEvent.click(screen.getByRole('button', { name: 'Reinstall from registry' }));
+
+	it('shows Reinstall from registry AND Remove… AND Hand to Chi inline when the registry has it', async () => {
+		const onReinstall = vi.fn();
+		const { container } = mount({ canReinstall: (id) => id === 'com.ikenga.meetings', onReinstall });
+		const r = await row(container);
+		expect(r.querySelector('[data-issue="pkgs_dir_unloadable"]')?.textContent).toBe('failed to load');
+		expect(r.textContent).toContain('ui.nav');
+		const acts = r.querySelector('.acts') as HTMLElement;
+		expect(within(acts).getByRole('button', { name: 'Reinstall from registry' })).toBeTruthy();
+		expect(within(acts).getByRole('button', { name: 'Remove…' })).toBeTruthy();
+		expect(within(acts).getByRole('button', { name: 'Hand to Chi' })).toBeTruthy();
+		fireEvent.click(within(acts).getByRole('button', { name: 'Reinstall from registry' }));
 		expect(onReinstall).toHaveBeenCalledWith('com.ikenga.meetings');
+		fireEvent.click(within(acts).getByRole('button', { name: 'Hand to Chi' }));
+		expect(vi.mocked(handToChi)).toHaveBeenCalledWith(expect.stringContaining('com.ikenga.meetings'));
 	});
 
-	it('offers Remove (deleting the folder) when the registry does not list it', async () => {
+	it('shows Remove… (no Reinstall) when the registry does not list it', async () => {
 		const { container } = mount({ canReinstall: () => false, onReinstall: vi.fn() });
-		const remove = await waitFor(() => {
-			const el = container.querySelector('[data-remove="com.ikenga.meetings"]');
-			if (!el) throw new Error('row not rendered yet');
-			return el as HTMLElement;
+		const r = await row(container);
+		expect(r.querySelector('[data-reinstall]')).toBeNull();
+		expect(r.querySelector('[data-remove="com.ikenga.meetings"]')).not.toBeNull();
+	});
+
+	it('Remove confirms first, then calls the retire path and says where the folder went', async () => {
+		vi.mocked(cmd.pkgHealthRemove).mockResolvedValue({
+			removed_rows: 0,
+			retired: [
+				{
+					id: 'com.ikenga.meetings',
+					path: MEETINGS.install_path,
+					backup: 'C:/pkgs/.uninstalled-com.ikenga.meetings-1727700000000',
+				},
+			],
 		});
-		expect(container.querySelector('[data-reinstall]')).toBeNull();
-		fireEvent.click(remove);
-		expect(await screen.findByText(/deletes its folder/)).toBeTruthy();
+		const { container } = mount({ canReinstall: () => true, onReinstall: vi.fn() });
+		const r = await row(container);
+		fireEvent.click(r.querySelector('[data-remove="com.ikenga.meetings"]') as HTMLElement);
+		const dlg = await screen.findByRole('dialog');
+		// Recoverable backup, not a delete; and it points at Reinstall.
+		expect(dlg.textContent).toContain('.uninstalled-');
+		expect(dlg.querySelector('[data-remove-recoverable]')?.textContent).toContain('7 days');
+		expect(dlg.querySelector('[data-remove-reinstall-hint]')).not.toBeNull();
+		expect(dlg.textContent).not.toMatch(/deletes its folder/);
+		// Cancel ("Keep it") calls nothing.
+		fireEvent.click(within(dlg).getByRole('button', { name: 'Keep it' }));
+		await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+		expect(cmd.pkgHealthRemove).not.toHaveBeenCalled();
+
+		fireEvent.click(r.querySelector('[data-remove="com.ikenga.meetings"]') as HTMLElement);
+		await act(async () => {
+			fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+		});
+		await waitFor(() => expect(cmd.pkgHealthRemove).toHaveBeenCalledWith('com.ikenga.meetings'));
+		await waitFor(() =>
+			expect(container.querySelector('[data-hnotice]')?.textContent).toContain(
+				'moved its folder to C:/pkgs/.uninstalled-com.ikenga.meetings-1727700000000'
+			)
+		);
+	});
+
+	it('Remove all: the result line says exactly what happened, and never "done" while an issue remains', async () => {
+		vi.mocked(cmd.pkgHealthRemoveAll).mockResolvedValue({
+			removed_records: 0,
+			removed_orphans: 0,
+			retired_folders: [],
+			failed: [{ id: 'com.ikenga.meetings', error: 'could not retire the folder: access denied' }],
+			remaining: [MEETINGS],
+			rescan_error: null,
+		});
+		const { container } = mount({ canReinstall: () => false });
+		await row(container);
+		fireEvent.click(container.querySelector('[data-act="remove-all"]') as HTMLElement);
+		const dlg = await screen.findByRole('dialog');
+		// Folder issues are covered, and the dialog says how.
+		expect(dlg.querySelector('[data-removeall-folders]')?.textContent).toContain('com.ikenga.meetings');
+		await act(async () => {
+			fireEvent.click(within(dlg).getByRole('button', { name: 'Remove all' }));
+		});
+		await waitFor(() => expect(cmd.pkgHealthRemoveAll).toHaveBeenCalledTimes(1));
+		const notice = await waitFor(() => {
+			const n = container.querySelector('[data-hnotice]');
+			if (!n) throw new Error('no notice');
+			return n as HTMLElement;
+		});
+		expect(notice.textContent).toBe(
+			'0 removed — 1 issue left: com.ikenga.meetings: could not retire the folder: access denied'
+		);
+		expect(notice.className).toContain('err');
+		expect(notice.textContent).not.toContain('done');
+		// The list reflects the kernel's rescan: the item is still shown.
+		expect(container.querySelector('[data-install="com.ikenga.meetings"]')).not.toBeNull();
+	});
+});
+
+describe('Remove result lines', () => {
+	const base = {
+		removed_records: 0,
+		removed_orphans: 0,
+		retired_folders: [] as cmd.PkgHealthRetiredFolder[],
+		failed: [] as Array<{ id: string; error: string }>,
+		remaining: [] as cmd.PkgHealthIssue[],
+		rescan_error: null as string | null,
+	};
+	const folder = { id: 'com.ikenga.meetings', path: '/p/m', backup: '/p/.uninstalled-m-1' };
+
+	it('names every kind removed and is ok only when nothing is left', () => {
+		expect(summarizeRemoveAll({ ...base, removed_records: 1, retired_folders: [folder] })).toEqual({
+			tone: 'ok',
+			text: 'Removed 1 record · retired 1 folder',
+		});
+		expect(
+			summarizeRemoveAll({ ...base, removed_records: 2, removed_orphans: 3, retired_folders: [folder, folder] }).text
+		).toBe('Removed 2 records · retired 2 folders · 3 orphan rows');
+	});
+
+	it('says what was left and why', () => {
+		const left: cmd.PkgHealthIssue = {
+			id: 'com.ikenga.meetings',
+			install_path: '/p/m',
+			enabled: false,
+			issue: { kind: 'pkgs_dir_unloadable' },
+			detail: 'x',
+		};
+		expect(summarizeRemoveAll({ ...base, remaining: [left] })).toEqual({
+			tone: 'err',
+			text: '0 removed — 1 issue left: com.ikenga.meetings needs Reinstall or Remove',
+		});
+		expect(summarizeRemoveAll({ ...base, removed_records: 1, rescan_error: 'db locked' })).toEqual({
+			tone: 'err',
+			text: 'Removed 1 record — the rescan failed, so what is left is unknown: db locked',
+		});
+		expect(summarizeRemoveAll({ ...base, failed: [{ id: 'orphan rows', error: 'busy' }] }).tone).toBe('err');
+	});
+
+	it('a single Remove names the rows deleted or the backup folder', () => {
+		expect(summarizeRemove('a', { removed_rows: 3, retired: [] }).text).toBe('Removed a: deleted 3 record rows');
+		expect(summarizeRemove('m', { removed_rows: 0, retired: [folder] }).text).toBe(
+			'Removed m: moved its folder to /p/.uninstalled-m-1'
+		);
+	});
+});
+
+describe('D-02 layout', () => {
+	const many: cmd.PkgHealthIssue[] = Array.from({ length: 40 }, (_, i) => ({
+		id: `com.test.broken${i}`,
+		install_path: `/pkgs/b${i}`,
+		enabled: true,
+		issue: { kind: 'manifest_missing' },
+		detail: 'no manifest',
+	}));
+
+	function mountLayout() {
+		vi.mocked(cmd.pkgHealthScan).mockResolvedValueOnce(many);
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const items = engineItems(['claude']);
+		return render(
+			<QueryClientProvider client={qc}>
+				<NgwaHealthSurface items={items} snapshot={mkSnapshot(items)} onOpenBackup={() => {}} onOpenStore={() => {}} />
+			</QueryClientProvider>
+		);
+	}
+
+	it('renders six panels in D-02 order, with Trust as its own panel', () => {
+		const { container } = mountLayout();
+		const panels = [...container.querySelectorAll('[data-hgrid] > section.panel')].map((p) =>
+			p.getAttribute('data-panel')
+		);
+		expect(panels).toEqual(['violations', 'sidecars', 'cron', 'data', 'trust', 'engines']);
+		const trust = container.querySelector('[data-panel="trust"]') as HTMLElement;
+		expect(trust.querySelector('h3')?.textContent).toContain('Trust');
+		expect(trust.querySelector('[data-act="review-unsigned"]')).not.toBeNull();
+		expect(trust.querySelector('[data-unsignedn]')).not.toBeNull();
+		const violations = container.querySelector('[data-panel="violations"]') as HTMLElement;
+		expect(violations.querySelector('[data-act="review-unsigned"]')).toBeNull();
+		expect(violations.querySelector('[data-unsignedn]')).toBeNull();
+		// No "Permission violations" / "Install records" subsections any more.
+		expect(violations.querySelector('.hsub')).toBeNull();
+		// The audit line closes the grid.
+		expect(container.querySelector('[data-hgrid] > [data-auditline]')).not.toBeNull();
+	});
+
+	it('renders every row: nothing is capped, clipped or hidden', async () => {
+		const { container } = mountLayout();
+		await waitFor(() => expect(container.querySelectorAll('[data-install]').length).toBe(40));
+		for (const r of container.querySelectorAll('[data-install]')) {
+			expect(within(r as HTMLElement).getByRole('button', { name: 'Remove…' })).toBeTruthy();
+		}
+		// The page is the one scroller; the grid sits inside it.
+		expect(container.querySelector('[data-hscroll] > [data-hgrid]')).not.toBeNull();
+	});
+
+	it('the stylesheet gives no health list a height cap and the grid no definite height', () => {
+		const ngwaCss = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'ngwa.css'), 'utf8');
+		const block = (sel: string) => {
+			const m = ngwaCss.match(new RegExp(`${sel.replace(/[.]/g, '\\.')} \\{([^}]*)\\}`));
+			return m?.[1] ?? '';
+		};
+		expect(block('.view-ngwa .hlist')).not.toMatch(/max-height/);
+		const grid = block('.view-ngwa .hgrid');
+		expect(grid).toMatch(/display: grid/);
+		expect(grid).not.toMatch(/overflow|flex: 1|height/);
+		expect(block('.view-ngwa .hscroll')).toMatch(/overflow-y: auto/);
 	});
 });

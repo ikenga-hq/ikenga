@@ -18,6 +18,7 @@ use crate::pkg::manifest::Package;
 use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, SettingsRegistry};
 use crate::pkg::{
     DiscoveredPkg, InstallSource, InstalledSummary, Kernel, KernelStatus, PkgHealthIssue,
+    PurgeAllReport, PurgeOutcome,
 };
 
 /// State wrapper so the kernel can be stored in Tauri state behind an Arc.
@@ -300,35 +301,27 @@ pub fn pkg_health_scan(kernel: State<'_, KernelState>) -> Result<Vec<PkgHealthIs
     kernel.0.health_scan().map_err(|e| format!("{e:#}"))
 }
 
-/// Remove one broken install record (its `pkg_installed` row + child rows).
+/// Remove one health issue: a broken install record (its `pkg_installed` row +
+/// child rows), or, for a pkgs-dir folder that failed to load, the folder,
+/// retired to a recoverable `.uninstalled-<id>-<millis>` backup (never hard
+/// deleted). Errors when nothing matched.
 #[tauri::command]
 pub fn pkg_health_remove(
     kernel: State<'_, KernelState>,
     pkg_id: String,
-) -> Result<(), String> {
+) -> Result<PurgeOutcome, String> {
     kernel
         .0
         .purge_install_record(&pkg_id)
         .map_err(|e| format!("{e:#}"))
 }
 
-#[derive(Serialize)]
-pub struct PkgHealthRemoveAllResult {
-    pub removed_records: usize,
-    pub removed_orphans: u64,
-}
-
-/// Remove every currently-detected broken record + orphan row.
+/// Remove everything the health scan lists (records, pkgs-dir folders retired
+/// to a backup, orphan rows), then rescan. The report says what was removed,
+/// what failed and what is still there.
 #[tauri::command]
-pub fn pkg_health_remove_all(
-    kernel: State<'_, KernelState>,
-) -> Result<PkgHealthRemoveAllResult, String> {
-    let (removed_records, removed_orphans) =
-        kernel.0.purge_all_broken().map_err(|e| format!("{e:#}"))?;
-    Ok(PkgHealthRemoveAllResult {
-        removed_records,
-        removed_orphans,
-    })
+pub fn pkg_health_remove_all(kernel: State<'_, KernelState>) -> Result<PurgeAllReport, String> {
+    kernel.0.purge_all_broken().map_err(|e| format!("{e:#}"))
 }
 
 // ─── pkg_settings ────────────────────────────────────────────────────────────

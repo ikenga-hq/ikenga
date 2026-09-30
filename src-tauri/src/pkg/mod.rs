@@ -79,7 +79,7 @@ pub mod webview;
 #[cfg(feature = "desktop")]
 pub use engine_adapter::EngineAdaptersRegistry;
 #[cfg(feature = "desktop")]
-pub use kernel::{DiscoveredPkg, Kernel, PkgHealthIssue};
+pub use kernel::{DiscoveredPkg, Kernel, PkgHealthIssue, PurgeAllReport, PurgeOutcome};
 #[cfg(feature = "desktop")]
 pub use lifecycle::SidecarSupervisor;
 #[cfg(feature = "desktop")]
