@@ -109,9 +109,16 @@ pub async fn pkg_install_from_path(
     Ok(PkgInstallResult { installed, requires })
 }
 
+/// Async + `spawn_blocking`: uninstall now waits (bounded) for the pkg's
+/// supervised children to exit before retiring its folder, which must not
+/// block the main thread a sync command would run on.
 #[tauri::command]
-pub fn pkg_uninstall(kernel: State<'_, KernelState>, pkg_id: String) -> Result<(), String> {
-    kernel.0.uninstall(&pkg_id).map_err(|e| format!("{e:#}"))
+pub async fn pkg_uninstall(kernel: State<'_, KernelState>, pkg_id: String) -> Result<(), String> {
+    let kernel = kernel.0.clone();
+    tokio::task::spawn_blocking(move || kernel.uninstall(&pkg_id))
+        .await
+        .map_err(|e| format!("uninstall join: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Update an installed pkg's scope. `scope` is the same wire format as
@@ -471,21 +478,40 @@ async fn install_from_registry_inner(
 
     // 4. Atomic-ish swap: backup existing → move staging → final.
     //    Reverse on failure so the previous install isn't lost.
-    if final_dir.exists() {
-        tokio::fs::rename(&final_dir, &backup_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "backup existing install: {} → {}",
-                    final_dir.display(),
-                    backup_dir.display()
-                )
-            })?;
+    //
+    //    An existing install may still be running (long-lived MCP / supervised
+    //    sidecar with its cwd inside `final_dir`). On Windows that holds the
+    //    folder and the backup rename fails with os error 32, so stop the
+    //    pkg's children — and wait for them to exit — first. The kernel
+    //    re-registers (restarts) it from the new files in step 5; if the swap
+    //    fails, `restart_prior` brings the old version back up.
+    let pkg_name = manifest_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&args.pkg_id)
+        .to_string();
+    let was_installed = kernel.installed_summary(&args.pkg_id).is_some();
+    let stop_kernel = kernel.clone();
+    let stop_id = args.pkg_id.clone();
+    let backup = backup_existing_install(&final_dir, &backup_dir, &pkg_name, move || {
+        stop_kernel.stop_pkg_processes(&stop_id)
+    })
+    .await;
+    if let Err(e) = backup {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        let _ = tokio::fs::remove_file(&tarball_path).await;
+        if was_installed {
+            restart_prior(kernel.clone(), &args.pkg_id).await;
+        }
+        return Err(e);
     }
     if let Err(e) = tokio::fs::rename(&staging_dir, &final_dir).await {
         // Rollback: put the backup back.
         if backup_dir.exists() {
             let _ = tokio::fs::rename(&backup_dir, &final_dir).await;
+        }
+        if was_installed {
+            restart_prior(kernel.clone(), &args.pkg_id).await;
         }
         return Err(anyhow!(
             "promote staging dir to install: {} → {}: {}",
@@ -531,6 +557,60 @@ async fn install_from_registry_inner(
             let _ = tokio::fs::remove_file(&tarball_path).await;
             Err(anyhow!("{e:#}"))
         }
+    }
+}
+
+/// Move an existing install dir aside to `backup_dir` so the staged one can
+/// take its place. `stop` runs first — it must stop, and wait for, every
+/// process of the pkg that could hold the dir open (see
+/// `Kernel::stop_pkg_processes`). The rename then retries briefly
+/// (`uninstall_dir::rename_with_retry`) for a handle that is just being
+/// released. A no-op when `final_dir` doesn't exist (fresh install; `stop`
+/// is not called). Errors name what still holds the dir when known.
+async fn backup_existing_install<F>(
+    final_dir: &Path,
+    backup_dir: &Path,
+    pkg_name: &str,
+    stop: F,
+) -> AnyResult<()>
+where
+    F: FnOnce() -> AnyResult<()> + Send + 'static,
+{
+    if !final_dir.exists() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(stop)
+        .await
+        .map_err(|e| anyhow!("stop running pkg join: {e}"))?
+        .map_err(|e| {
+            anyhow!(
+                "can't replace the existing install of {pkg_name} at {}: {e:#}. Close it (or restart Ikenga) and try again",
+                final_dir.display()
+            )
+        })?;
+    let (from, to) = (final_dir.to_path_buf(), backup_dir.to_path_buf());
+    tokio::task::spawn_blocking(move || crate::pkg::uninstall_dir::rename_with_retry(&from, &to))
+        .await
+        .map_err(|e| anyhow!("backup rename join: {e}"))?
+        .map_err(|e| {
+            anyhow!(
+                "backup existing install: {} → {}: {e}. {pkg_name}'s processes were stopped, so something else (an editor, terminal or antivirus scan) still has files open in that folder — close it and try again",
+                final_dir.display(),
+                backup_dir.display()
+            )
+        })
+}
+
+/// Best-effort: re-register (and so restart) a pkg that
+/// `stop_pkg_processes` stopped, after the registry swap failed and the old
+/// files are back in place.
+async fn restart_prior(kernel: Arc<Kernel>, pkg_id: &str) {
+    let id = pkg_id.to_string();
+    let res = tokio::task::spawn_blocking(move || kernel.reload_pkg(&id)).await;
+    match res {
+        Ok(Ok(_)) => log::info!("[pkg_install] restarted prior install of `{pkg_id}`"),
+        Ok(Err(e)) => log::warn!("[pkg_install] restart prior `{pkg_id}` failed: {e:#}"),
+        Err(e) => log::warn!("[pkg_install] restart prior `{pkg_id}` join: {e}"),
     }
 }
 
@@ -805,4 +885,68 @@ pub async fn pkg_is_trusted_for_elevated(
         .map_err(|e| format!("app_data_dir: {e}"))?;
     let pool = db.ensure_pool().await.map_err(|e| e.to_string())?;
     Ok(crate::pkg::trust::resolve_elevated_trust(&pool, &kernel.0, &app_data, &pkg_id).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Reinstall over an existing install: the pkg's processes are stopped
+    /// (and waited for) BEFORE the existing dir is renamed to `.bak-<id>`.
+    #[tokio::test]
+    async fn install_over_existing_stops_children_before_backup() {
+        let pkgs = tempfile::tempdir().unwrap();
+        let final_dir = pkgs.path().join("com.ikenga.meetings");
+        let backup_dir = pkgs.path().join(".bak-com.ikenga.meetings");
+        std::fs::create_dir_all(final_dir.join("mcp")).unwrap();
+        std::fs::write(final_dir.join("manifest.json"), "{}").unwrap();
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (flag, dir_at_stop) = (stopped.clone(), final_dir.clone());
+        backup_existing_install(&final_dir, &backup_dir, "Meetings", move || {
+            // The dir must still be in place: nothing was moved yet.
+            assert!(dir_at_stop.join("manifest.json").exists());
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect("backup");
+        assert!(stopped.load(Ordering::SeqCst), "children were not stopped");
+        assert!(!final_dir.exists());
+        assert!(backup_dir.join("manifest.json").exists());
+    }
+
+    /// If a child can't be stopped, nothing is renamed and the error names
+    /// the holder.
+    #[tokio::test]
+    async fn install_over_existing_reports_process_that_would_not_stop() {
+        let pkgs = tempfile::tempdir().unwrap();
+        let final_dir = pkgs.path().join("com.ikenga.meetings");
+        let backup_dir = pkgs.path().join(".bak-com.ikenga.meetings");
+        std::fs::create_dir_all(&final_dir).unwrap();
+        let err = backup_existing_install(&final_dir, &backup_dir, "Meetings", || {
+            Err(anyhow!("a Meetings process is still running (pid 43456)"))
+        })
+        .await
+        .expect_err("stop failure must abort the swap");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("a Meetings process is still running (pid 43456)"), "{msg}");
+        assert!(final_dir.exists(), "existing install must be left in place");
+        assert!(!backup_dir.exists());
+    }
+
+    /// Fresh install: no existing dir, so nothing to stop.
+    #[tokio::test]
+    async fn fresh_install_does_not_stop_anything() {
+        let pkgs = tempfile::tempdir().unwrap();
+        let final_dir = pkgs.path().join("com.new");
+        let backup_dir = pkgs.path().join(".bak-com.new");
+        backup_existing_install(&final_dir, &backup_dir, "New", || {
+            panic!("stop must not run for a fresh install")
+        })
+        .await
+        .unwrap();
+        assert!(!backup_dir.exists());
+    }
 }
