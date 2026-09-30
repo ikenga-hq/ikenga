@@ -33,6 +33,41 @@ pub struct FsSearchResult {
     pub truncated: bool,
 }
 
+/// The desktop's `FileReadResult`: the file's bytes (a JSON array of numbers) and its MIME.
+#[derive(Debug, Serialize)]
+pub struct FsReadResult {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+
+/// Read a whole file as bytes. Mirrors the desktop `fs_read`, so a binary file reads too
+/// (the daemon's original arm used `read_to_string` and returned a bare string, which no
+/// viewer could use and which failed outright on anything that was not UTF-8).
+pub async fn read(resolve: Resolve<'_>, path: &str) -> Result<FsReadResult, String> {
+    let resolved = resolve(path)?;
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let mime = mime_guess::from_path(&resolved)
+        .first_or_octet_stream()
+        .essence_str()
+        .to_string();
+    Ok(FsReadResult { bytes, mime })
+}
+
+/// Write `bytes` to `path`, creating missing parent folders. Mirrors the desktop `fs_write`.
+pub async fn write(resolve: Resolve<'_>, path: &str, bytes: &[u8]) -> Result<(), String> {
+    let resolved = resolve(path)?;
+    if let Some(parent) = resolved.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+    tokio::fs::write(&resolved, bytes)
+        .await
+        .map_err(|e| format!("write failed: {e}"))
+}
+
 /// One row of a directory listing: the desktop's `FileEntry` (`commands::fs`), which is
 /// camelCase and carries size and mtime, plus `is_dir`, the spelling the daemon's original
 /// `fs_list` used. The file picker still reads it, so both keys are sent.

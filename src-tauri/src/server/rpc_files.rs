@@ -73,6 +73,44 @@ fn resolver(state: &AppState) -> impl Fn(&str) -> Result<PathBuf, String> + Sync
 /// The desktop answers `"missing"` for an allowlist-rejected path, and so
 /// does this — but only once the allowlist exists: without `--data-dir`
 /// every path would read as missing, which is an answer, not the truth.
+/// `fs_read`: the desktop's `{ bytes, mime }`, which is what every viewer reads.
+pub(super) async fn fs_read(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        state.path_guard.ready()?;
+        shared_fs::read(&resolver(state), &path).await
+    }
+    .await;
+    respond("fs_read", r)
+}
+
+/// `fs_write`. The desktop command is `fs_write(path, bytes)`, so `bytes` (an array of numbers)
+/// is what `tauri-cmd.ts` sends. `content` (a string) is what the daemon's original arm took and
+/// is kept. **Neither is an error.** The original arm read `content` with
+/// `unwrap_or_default()`, so a call that sent only `bytes` wrote an empty file over the target.
+pub(super) async fn fs_write(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        let bytes: Option<Vec<u8>> = targ(args, &["bytes"])?;
+        let content: Option<String> = targ(args, &["content"])?;
+        let data = match (bytes, content) {
+            (Some(b), None) => b,
+            (None, Some(c)) => c.into_bytes(),
+            (Some(_), Some(_)) => {
+                return Err("fs_write: pass `bytes` or `content`, not both".to_string())
+            }
+            (None, None) => return Err("fs_write: `bytes` is required".to_string()),
+        };
+        state.path_guard.ready()?;
+        // The deep resolver, not `resolver(state)`: a write may target a file in a folder that
+        // does not exist yet, so the allowlist check walks up to the nearest existing ancestor,
+        // and it carries the `..` and dangling-link refusals `reserved.rs` pins.
+        shared_fs::write(&|p: &str| state.path_guard.resolve_deep(p), &path, &data).await
+    }
+    .await;
+    respond("fs_write", r)
+}
+
 /// `fs_list`. The desktop command is `fs_list(dir, glob)`, so `dir` is the argument
 /// `tauri-cmd.ts` sends; `path` is kept because the file picker and older callers use it. A
 /// missing directory is an error: the original arm defaulted to `"."`, which on a daemon is
@@ -791,6 +829,84 @@ mod tests {
         let listed = ok(&d.router, "fs_list", json!({ "dir": s(&d.allowed) })).await;
         assert_eq!(listed[0]["isDir"], true);
         assert_eq!(listed[0]["name"], "plain");
+    }
+
+    // ── fs_read / fs_write ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_read_answers_bytes_and_mime_like_the_desktop() {
+        let d = daemon();
+        let r = &d.router;
+        std::fs::write(d.allowed.join("a.txt"), b"hi").unwrap();
+        // Not UTF-8: the original string-returning arm failed on this.
+        std::fs::write(d.allowed.join("blob.bin"), [0u8, 255, 1, 128]).unwrap();
+
+        let text = ok(r, "fs_read", json!({ "path": s(&d.allowed.join("a.txt")) })).await;
+        assert_eq!(text["bytes"], json!([104, 105]));
+        assert_eq!(text["mime"], "text/plain");
+        let bin = ok(r, "fs_read", json!({ "path": s(&d.allowed.join("blob.bin")) })).await;
+        assert_eq!(bin["bytes"], json!([0, 255, 1, 128]));
+        assert_eq!(bin["mime"], "application/octet-stream");
+
+        std::fs::write(d.outside.join("x.txt"), b"x").unwrap();
+        let e = err(r, "fs_read", json!({ "path": s(&d.outside.join("x.txt")) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn fs_write_takes_bytes_like_the_desktop_and_round_trips() {
+        let d = daemon();
+        let r = &d.router;
+        let deep = s(&d.allowed.join("deep/er/f.bin"));
+        ok(r, "fs_write", json!({ "path": deep, "bytes": [0, 255, 1] })).await;
+        assert_eq!(std::fs::read(d.allowed.join("deep/er/f.bin")).unwrap(), [0, 255, 1]);
+        let back = ok(r, "fs_read", json!({ "path": deep })).await;
+        assert_eq!(back["bytes"], json!([0, 255, 1]));
+
+        ok(r, "fs_write", json!({ "path": deep, "bytes": [9] })).await;
+        assert_eq!(std::fs::read(d.allowed.join("deep/er/f.bin")).unwrap(), [9]);
+    }
+
+    #[tokio::test]
+    async fn fs_write_still_takes_content_for_older_callers() {
+        let d = daemon();
+        let p = s(&d.allowed.join("c.txt"));
+        ok(&d.router, "fs_write", json!({ "path": p, "content": "héllo" })).await;
+        assert_eq!(std::fs::read_to_string(d.allowed.join("c.txt")).unwrap(), "héllo");
+    }
+
+    /// The original arm read `content` with `unwrap_or_default()`, so the browser's
+    /// `{ path, bytes }` call wrote an empty file over the target. A write that names no data
+    /// must fail and leave the file alone.
+    #[tokio::test]
+    async fn fs_write_with_no_data_is_an_error_and_never_truncates() {
+        let d = daemon();
+        let r = &d.router;
+        let keep = d.allowed.join("keep.txt");
+        std::fs::write(&keep, b"precious").unwrap();
+        let p = s(&keep);
+
+        for args in [
+            json!({ "path": p }),
+            json!({ "path": p, "bytes": null }),
+            json!({ "path": p, "content": null }),
+        ] {
+            let e = err(r, "fs_write", args).await;
+            assert!(e.contains("`bytes` is required"), "{e}");
+            assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
+        }
+        let e = err(r, "fs_write", json!({ "path": p, "bytes": [1], "content": "x" })).await;
+        assert!(e.contains("not both"), "{e}");
+        assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
+    }
+
+    #[tokio::test]
+    async fn fs_write_refuses_outside_the_allowlist() {
+        let d = daemon();
+        let target = d.outside.join("w.txt");
+        let e = err(&d.router, "fs_write", json!({ "path": s(&target), "bytes": [1] })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(!target.exists());
     }
 
     // ── fs_kind / fs_mime ──────────────────────────────────────────────────
