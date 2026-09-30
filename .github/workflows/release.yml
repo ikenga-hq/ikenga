@@ -107,7 +107,10 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
 
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 60
+    # 120, not 60: the universal-apple-darwin build compiles both arches and
+    # took ~57 min on v0.18.3, so the macOS job timed out twice (run
+    # 36705744371) after its artifacts had already uploaded.
+    timeout-minutes: 120
 
     steps:
       # ── Checkout shell + sibling workspace repos ────────────────────────────
