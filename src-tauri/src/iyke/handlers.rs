@@ -401,8 +401,11 @@ pub async fn get_ngwa_snapshot(
             format!("resolve app_data_dir: {e}"),
         )
     })?;
+    let status = crate::commands::ngwa::kernel_status_off_runtime(kernel.0.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     crate::commands::ngwa::ngwa_snapshot_inner(
-        kernel.0.status(),
+        status,
         &db,
         &app_data_dir,
         crate::transcript::usage::claude_projects_dir(),
