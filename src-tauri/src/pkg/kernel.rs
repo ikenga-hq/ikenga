@@ -24,6 +24,7 @@ use super::file_watcher::{self, WatcherHandle};
 use super::manifest::{Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
 use super::registry::Registry;
 use super::source::InstallSource;
+use super::uninstall_dir;
 // Moved to the ungated `pkg::status` so the headless daemon builds the same
 // wire shape; re-exported here so `pkg::kernel::{InstalledSummary, KernelStatus}`
 // keeps resolving for every existing caller.
@@ -777,7 +778,10 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         Ok(())
     }
 
-    /// Uninstall: walk registries in reverse, drop the row, mark disabled.
+    /// Uninstall: walk registries in reverse, drop the row, mark disabled,
+    /// then move a registry / CLI install's `pkgs_dir` folder to a
+    /// dot-prefixed backup so boot discovery can't resurrect it
+    /// (see `pkg::uninstall_dir`).
     /// Tauri ACL grants are NOT actually revoked — `add_capability` has no
     /// counterpart. The kernel-side allowlists in each registry stop spawning
     /// the package's binaries / accepting its iyke routes immediately; the
@@ -790,12 +794,13 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         // Refuse to uninstall shell-bundled builtins. Enforced here (not just
         // in the UI) so CLI / iyke / future remote callers also can't strip
         // them — they'd just get auto-reinstalled on next boot anyway.
-        let is_builtin = self
-            .installed
-            .read()
-            .ok()
-            .and_then(|g| g.get(pkg_id).map(|s| s.source.is_builtin()))
-            .unwrap_or(false);
+        // Snapshot provenance + path before the in-memory entry is dropped:
+        // the on-disk retire step below needs both.
+        let prior = self.installed.read().ok().and_then(|g| {
+            g.get(pkg_id)
+                .map(|s| (s.source.clone(), s.install_path.clone()))
+        });
+        let is_builtin = prior.as_ref().is_some_and(|(src, _)| src.is_builtin());
         if is_builtin {
             return Err(anyhow!(
                 "package `{pkg_id}` is shipped with the shell and cannot be uninstalled (disable it instead)"
@@ -822,6 +827,30 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             .write()
             .map_err(|_| anyhow!("installed lock poisoned"))?
             .remove(pkg_id);
+        // Retire the folder of a registry / CLI install (a direct child of
+        // `pkgs_dir`) so `install_from_pkgs_dir` doesn't re-register it as
+        // `Local` at the next boot. Runs after every registry unregistered the
+        // pkg (supervised sidecars / MCP children stopped). Moves to a
+        // dot-prefixed backup; Builtin / Dev / out-of-tree Local paths are
+        // left alone. A failure here is logged, not returned: the kernel side
+        // of the uninstall is already complete and consistent.
+        if let Some((source, install_path)) = prior.as_ref() {
+            match self.pkgs_dir() {
+                Ok(dir) => match uninstall_dir::retire(&dir, Path::new(install_path), source) {
+                    Ok(uninstall_dir::Retired::BackedUp(to)) => log::info!(
+                        "[pkg_kernel] moved `{pkg_id}` install dir to {}",
+                        to.display()
+                    ),
+                    Ok(other) => log::debug!("[pkg_kernel] install dir of `{pkg_id}`: {other:?}"),
+                    Err(e) => log::warn!(
+                        "[pkg_kernel] retiring install dir of `{pkg_id}` failed (it may return at next boot): {e:#}"
+                    ),
+                },
+                Err(e) => log::warn!(
+                    "[pkg_kernel] pkgs dir unresolved; `{pkg_id}` install dir left in place: {e:#}"
+                ),
+            }
+        }
         // Best-effort: `usePkgActivityBarEntries` already listens for this —
         // it just never fired before. Emitted AFTER the row + in-memory maps
         // are updated so a listener's immediate re-fetch sees the removal.
@@ -1048,22 +1077,18 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         if !dir.is_dir() {
             return Ok(());
         }
+        // Finish any uninstall whose folder move was blocked by a file lock,
+        // and prune expired uninstall backups, before discovering.
+        uninstall_dir::sweep(&dir, uninstall_dir::BACKUP_RETENTION);
         let entries = std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // Skips dot-prefixed dirs (installer staging/backup, uninstall
+            // backups) and dirs without a manifest.json (tombstoned uninstalls).
+            if !uninstall_dir::is_discoverable(&path) {
                 continue;
-            }
-            // Skip the installer's own staging/backup directories.
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') {
-                    continue;
-                }
             }
             let manifest_path = path.join("manifest.json");
-            if !manifest_path.exists() {
-                continue;
-            }
             // Cheap pre-read of the id; skip if already-installed (the
             // path-equal replay inside install_from_path is also idempotent,
             // but checking here avoids re-reading the full manifest).
