@@ -59,6 +59,7 @@ import {
 	type ClaudeStoreScope,
 	type ObaPin,
 	type PkgScopeWire,
+	type PkgTrustReview,
 	type PrimitiveRef,
 	type ResolvedSource,
 } from '@/lib/tauri-cmd';
@@ -114,9 +115,51 @@ export interface PrimitiveInstallContext {
 	onStage?: (stage: PrimitiveInstallStage) => void;
 }
 
+/** An update the pre-install capability diff (WP-41-F1) held back: the new
+ *  version asks for a capability / permission beyond what is approved. */
+export interface PendingUpdateApproval {
+	entry: NgwaStoreEntry;
+	review: PkgTrustReview;
+}
+
+/**
+ * Not a failure: the update was held back for the user's approval, nothing
+ * was installed. `approvals` go to the trust review modal
+ * (`useUpdateApprovals`); an approved re-run passes `{ approved: true }`.
+ * From `updateAll`, `failures` carries the batch's real failures alongside.
+ */
+export class NeedsApprovalError extends Error {
+	readonly approvals: PendingUpdateApproval[];
+	readonly failures: string[];
+	constructor(approvals: PendingUpdateApproval[], failures: string[] = []) {
+		const names = approvals
+			.map((a) => `${a.entry.displayName} ${a.entry.latestVersion}`)
+			.join(', ');
+		const held = `${names} ${approvals.length === 1 ? 'asks' : 'ask'} for new permissions — review and approve ${approvals.length === 1 ? 'it' : 'them'} to update`;
+		super(failures.length ? `${held}; ${failures.length} failed — ${failures.join('; ')}` : held);
+		this.name = 'NeedsApprovalError';
+		this.approvals = approvals;
+		this.failures = failures;
+	}
+}
+
+export function isNeedsApproval(e: unknown): e is NeedsApprovalError {
+	return e instanceof NeedsApprovalError;
+}
+
+export interface StoreUpdateOptions {
+	/** The user approved this version's permissions in the trust review
+	 *  modal: skip the pre-install capability diff (it would park it again). */
+	approved?: boolean;
+}
+
 export interface UseStoreInstall {
 	install: (entry: NgwaStoreEntry, scope: StoreInstallScope) => Promise<void>;
-	update: (entry: NgwaStoreEntry) => Promise<void>;
+	/** Rejects with `NeedsApprovalError` (nothing installed) when the new
+	 *  version asks for new permissions and `opts.approved` isn't set. */
+	update: (entry: NgwaStoreEntry, opts?: StoreUpdateOptions) => Promise<void>;
+	/** Runs every entry; rejects with `NeedsApprovalError` when any were held
+	 *  for approval (real failures ride along), else a plain Error on failures. */
 	updateAll: (entries: NgwaStoreEntry[]) => Promise<void>;
 	/** R57 flow 1: install a signed-catalog row and place it. */
 	installPrimitive: (
@@ -207,17 +250,19 @@ export function useStoreInstall(): UseStoreInstall {
 		]);
 	}
 
-	async function installOne(entry: NgwaStoreEntry, scope: PkgScopeWire | null, isUpdate: boolean) {
+	async function installOne(
+		entry: NgwaStoreEntry,
+		scope: PkgScopeWire | null,
+		isUpdate: boolean,
+		approved = false
+	) {
 		const root = await getDetail(entry.registryEntry.name);
-		if (isUpdate && entry.installedItem) {
+		if (isUpdate && entry.installedItem && !approved) {
 			// Same pre-update capability diff as the batch updater (WP-41-F1):
-			// the install records itself as approved, so stop here first.
+			// the install records itself as approved, so stop here first and
+			// hand the review to the caller — a hold, not a failure.
 			const review = await previewIncomingTrust(entry.installedItem.id, root, entry.latestVersion);
-			if (review) {
-				throw new Error(
-					`${entry.displayName} ${entry.latestVersion} asks for new permissions — review them from the Installed tab before updating.`
-				);
-			}
+			if (review) throw new NeedsApprovalError([{ entry, review }]);
 		}
 		await resolveAndInstall({ root, getDetail, version: entry.latestVersion, scope });
 	}
@@ -230,27 +275,36 @@ export function useStoreInstall(): UseStoreInstall {
 				await refresh();
 			}
 		},
-		async update(entry) {
+		async update(entry, opts) {
 			try {
-				await installOne(entry, installedScopeWire(entry.installedItem?.scope), true);
+				await installOne(
+					entry,
+					installedScopeWire(entry.installedItem?.scope),
+					true,
+					opts?.approved === true
+				);
 			} finally {
 				await refresh();
 			}
 		},
 		async updateAll(entries) {
 			const failed: string[] = [];
+			const approvals: PendingUpdateApproval[] = [];
 			try {
-				// One failing pkg must not abort the rest (batch-updater rule).
+				// One failing pkg must not abort the rest (batch-updater rule),
+				// and a held-back pkg is parked for approval, not failed.
 				for (const entry of entries) {
 					try {
 						await installOne(entry, installedScopeWire(entry.installedItem?.scope), true);
 					} catch (e) {
-						failed.push(`${entry.displayName}: ${e instanceof Error ? e.message : String(e)}`);
+						if (isNeedsApproval(e)) approvals.push(...e.approvals);
+						else failed.push(`${entry.displayName}: ${e instanceof Error ? e.message : String(e)}`);
 					}
 				}
 			} finally {
 				await refresh();
 			}
+			if (approvals.length) throw new NeedsApprovalError(approvals, failed);
 			if (failed.length) {
 				throw new Error(
 					`${failed.length} of ${entries.length} update${entries.length === 1 ? '' : 's'} failed — ${failed.join('; ')}`

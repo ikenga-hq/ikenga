@@ -11,6 +11,8 @@ import * as home from '@/lib/home';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useCompanionStore } from '@/shell/companion/companion-store';
+import { NeedsApprovalError } from '@/lib/ngwa/use-store-install';
+import type { NgwaStoreEntry } from '@/lib/ngwa/enrichment';
 import { Route as InstalledRoute } from './installed';
 import { Route as ItemRoute } from './item.$itemId';
 import { HOME, PROJECTS, mkSnapshot, mountRoutes, scopesItems } from './-ngwa-test-fixtures';
@@ -29,7 +31,8 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 	}),
 }));
 
-vi.mock('@/lib/ngwa/use-store-install', () => ({
+vi.mock('@/lib/ngwa/use-store-install', async (orig) => ({
+	...(await orig<typeof import('@/lib/ngwa/use-store-install')>()),
 	useStoreInstall: () => ({ install: vi.fn(), update: storeUpdate, updateAll: vi.fn() }),
 }));
 
@@ -154,6 +157,14 @@ async function select(id: string) {
 	});
 }
 
+const REVIEW = {
+	pkg_id: 'com.ikenga.tasks',
+	manifest_version: '0.9.0',
+	old_capabilities: '{}',
+	new_capabilities: '{"net":["https://api.example.com"]}',
+	prior_approved_at_ms: 0,
+};
+
 const btn = (scope: HTMLElement, name: RegExp) =>
 	within(scope).getByRole('button', { name }) as HTMLButtonElement;
 const dialog = () => screen.getByRole('dialog');
@@ -274,6 +285,51 @@ describe('/ngwa/installed — D-02 detail action row', () => {
 		});
 	});
 
+	it('Update that asks for new permissions opens the trust review; Approve re-runs it approved', async () => {
+		registryPkgs.list = [{ name: 'com.ikenga.tasks', latest: '0.9.0' }];
+		storeUpdate.mockImplementation((entry: NgwaStoreEntry, opts?: { approved?: boolean }) =>
+			opts?.approved
+				? Promise.resolve()
+				: Promise.reject(new NeedsApprovalError([{ entry, review: REVIEW }]))
+		);
+		await mountInstalled();
+		const acts = await select('com.ikenga.tasks');
+		fireEvent.click(btn(acts, /^Update$/));
+
+		// The updater's own modal, not a failure status.
+		const rowEl = await screen.findByTestId('trust-review-row-com.ikenga.tasks');
+		expect(within(dialog()).getByText('Capability review')).toBeTruthy();
+		expect(screen.queryByText(/failed/)).toBeNull();
+		expect(screen.queryByText(/from the Installed tab/)).toBeNull();
+
+		await act(async () => {
+			fireEvent.click(within(rowEl).getByTestId('trust-review-approve-com.ikenga.tasks'));
+		});
+		await waitFor(() => expect(storeUpdate).toHaveBeenCalledTimes(2));
+		expect(storeUpdate.mock.calls[1][1]).toEqual({ approved: true });
+		expect(storeUpdate.mock.calls[1][0]).toMatchObject({ latestVersion: '0.9.0' });
+		await waitFor(() => expect(screen.queryByText('Capability review')).toBeNull());
+		expect(await screen.findByText(/^Updated .+ to 0.9.0$/)).toBeTruthy();
+	});
+
+	it('Reject in the trust review leaves the pkg un-updated', async () => {
+		registryPkgs.list = [{ name: 'com.ikenga.tasks', latest: '0.9.0' }];
+		storeUpdate.mockImplementation((entry: NgwaStoreEntry) =>
+			Promise.reject(new NeedsApprovalError([{ entry, review: REVIEW }]))
+		);
+		await mountInstalled();
+		const acts = await select('com.ikenga.tasks');
+		fireEvent.click(btn(acts, /^Update$/));
+		await screen.findByTestId('trust-review-row-com.ikenga.tasks');
+		await act(async () => {
+			fireEvent.click(screen.getByTestId('trust-review-reject-com.ikenga.tasks'));
+		});
+		await waitFor(() => expect(screen.queryByText('Capability review')).toBeNull());
+		// Only the held first attempt ran; nothing was installed on Reject.
+		expect(storeUpdate).toHaveBeenCalledTimes(1);
+		noWrites();
+	});
+
 	it('Move… offers each scope; a confirmed move calls the Ọba move from the item scope', async () => {
 		await mountInstalled();
 		const acts = await select('skill:personal:lint');
@@ -333,6 +389,25 @@ describe('/ngwa/installed — D-02 row context menu', () => {
 		const mp = within(menu).getByRole('menuitem', { name: 'Move to project' }) as HTMLButtonElement;
 		expect(mp.disabled).toBe(true);
 		expect(mp.title).toBeTruthy();
+	});
+
+	it('Update from the context menu routes a permissions hold to the same trust review', async () => {
+		registryPkgs.list = [{ name: 'com.ikenga.tasks', latest: '0.9.0' }];
+		storeUpdate.mockImplementation((entry: NgwaStoreEntry, opts?: { approved?: boolean }) =>
+			opts?.approved
+				? Promise.resolve()
+				: Promise.reject(new NeedsApprovalError([{ entry, review: REVIEW }]))
+		);
+		await mountInstalled();
+		fireEvent.contextMenu(await waitFor(() => row('com.ikenga.tasks')));
+		const menu = screen.getByRole('menu', { name: 'Tasks' });
+		fireEvent.click(within(menu).getByRole('menuitem', { name: /^Update/ }));
+		await screen.findByTestId('trust-review-row-com.ikenga.tasks');
+		await act(async () => {
+			fireEvent.click(screen.getByTestId('trust-review-approve-com.ikenga.tasks'));
+		});
+		await waitFor(() => expect(storeUpdate).toHaveBeenCalledTimes(2));
+		expect(storeUpdate.mock.calls[1][1]).toEqual({ approved: true });
 	});
 
 	it('Move to personal is disabled "Already personal" for a personal skill; Move to project moves it', async () => {

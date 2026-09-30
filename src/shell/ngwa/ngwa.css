@@ -1986,6 +1986,16 @@
 	cursor: progress;
 }
 
+/* An update held back for new permissions: not a failure, a next step. */
+.view-ngwa .updates .updappr {
+	align-self: center;
+	display: inline-flex;
+	align-items: center;
+	gap: var(--space-1);
+	color: var(--warning);
+	font-size: var(--text-micro);
+}
+
 .view-ngwa .updates .upderr {
 	align-self: center;
 	color: var(--danger);

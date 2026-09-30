@@ -30,7 +30,8 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 	}),
 }));
 
-vi.mock('@/lib/ngwa/use-store-install', () => ({
+vi.mock('@/lib/ngwa/use-store-install', async (orig) => ({
+	...(await orig<typeof import('@/lib/ngwa/use-store-install')>()),
 	useStoreInstall: () => ({ install: vi.fn(), update: vi.fn(), updateAll: vi.fn() }),
 }));
 
