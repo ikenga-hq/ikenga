@@ -9,6 +9,7 @@ import { expect, type Page, type TestInfo, test } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import {
 	installTauriMock,
+	MOCK_KERNEL_STATUS,
 	MOCK_PINS,
 	MOCK_PROJECTS,
 	unmockedCommands,
@@ -126,7 +127,22 @@ async function bootRail(page: Page, opts: { glossSeen?: boolean } = {}) {
 			localStorage.setItem('ikenga.gloss.seen', JSON.stringify(['ngwa', 'chi']));
 		});
 	}
-	await installTauriMock(page, { responses: { activity_pins_list: RAIL_PINS } });
+	// Every pinned pkg must be installed: the rail hides pins into a pkg the
+	// kernel doesn't have (on disk but failed to register).
+	const kernel = {
+		...MOCK_KERNEL_STATUS,
+		installed: [
+			...MOCK_KERNEL_STATUS.installed,
+			{
+				...MOCK_KERNEL_STATUS.installed[0]!,
+				id: 'com.e2e.wiki',
+				install_path: '/home/e2e/pkgs/com.e2e.wiki',
+			},
+		],
+	};
+	await installTauriMock(page, {
+		responses: { activity_pins_list: RAIL_PINS, pkg_kernel_status: kernel },
+	});
 	await page.goto('/', { waitUntil: 'domcontentloaded' });
 	const rail = page.getByRole('navigation', { name: 'Activity bar' });
 	await expect(rail).toBeVisible({ timeout: 60_000 });
