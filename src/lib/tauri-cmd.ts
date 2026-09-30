@@ -3363,7 +3363,18 @@ export type PkgHealthIssueKind =
 	| { kind: 'manifest_unreadable' }
 	| { kind: 'manifest_unparseable' }
 	| { kind: 'api_incompatible'; ikenga_api: string }
-	| { kind: 'orphan_row'; table: string };
+	| { kind: 'orphan_row'; table: string }
+	/** A pkgs-dir folder with no install record that failed to load / parse
+	 *  (or register) at boot: on disk, absent from the kernel. */
+	| { kind: 'pkgs_dir_unloadable' }
+	/** An enabled install record, loadable, that a registry rejected at boot. */
+	| { kind: 'register_failed' };
+
+/** Issue kinds for a pkg that is on disk but not registered in the kernel —
+ *  the ones Ngwa offers "Reinstall from registry" for. */
+export function isUnregisteredPkgIssue(kind: PkgHealthIssueKind): boolean {
+	return kind.kind === 'pkgs_dir_unloadable' || kind.kind === 'register_failed';
+}
 
 export interface PkgHealthIssue {
 	id: string;
@@ -3383,7 +3394,9 @@ export async function pkgHealthScan(): Promise<PkgHealthIssue[]> {
 	return invoke<PkgHealthIssue[]>('pkg_health_scan');
 }
 
-/** Remove one broken install record (its `pkg_installed` row + child rows). */
+/** Remove one broken install record (its `pkg_installed` row + child rows).
+ *  For a `pkgs_dir_unloadable` entry, which has no record, this deletes its
+ *  folder under the pkgs dir instead. */
 export async function pkgHealthRemove(pkgId: string): Promise<void> {
 	return invoke('pkg_health_remove', { pkgId });
 }

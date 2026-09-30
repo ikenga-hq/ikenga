@@ -454,6 +454,76 @@ describe('NgwaStoreSurface', () => {
 	});
 });
 
+describe('an installed pkg that failed to load (Bug 3)', () => {
+	const meetings: NgwaStoreEntry = {
+		id: '@ikenga/pkg-meetings',
+		name: '@ikenga/pkg-meetings',
+		displayName: 'pkg-meetings',
+		description: 'Meetings',
+		version: '0.2.1',
+		latestVersion: '0.2.1',
+		kind: 'app',
+		trustFacet: 'unsigned',
+		installedItem: null,
+		isUpdate: false,
+		registryEntry: {
+			name: '@ikenga/pkg-meetings',
+			latest: '0.2.1',
+			detail: 'https://example.com/meetings.json',
+		},
+		broken: 'on disk but failed to load: `ui.nav` was removed in manifest v5',
+	};
+
+	it('the row says installed but broken, and its action reads Reinstall, not Install', () => {
+		renderWithClient(<NgwaStoreSurface catalog={[meetings]} onInstall={vi.fn()} />);
+		const row = document.querySelector('[data-id="@ikenga/pkg-meetings"]') as HTMLElement;
+		expect(within(row).getByText(/installed · failed to load/)).toBeDefined();
+		expect(within(row).getByRole('button', { name: 'Reinstall' })).toBeDefined();
+		expect(within(row).queryByRole('button', { name: 'Install' })).toBeNull();
+	});
+
+	it('Reinstall opens the sheet and runs the normal consent-gated install', async () => {
+		const onInstall = vi.fn();
+		const loadDetail = vi.fn().mockResolvedValue(studioLike);
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={[meetings]}
+				loadDetail={loadDetail}
+				onInstall={onInstall}
+				activeProjectName="royalti-co"
+			/>
+		);
+		const row = document.querySelector('[data-id="@ikenga/pkg-meetings"]') as HTMLElement;
+		fireEvent.click(within(row).getByRole('button', { name: 'Reinstall' }));
+		// Opening the sheet never installs by itself.
+		expect(onInstall).not.toHaveBeenCalled();
+
+		expect(await screen.findByText('Share kola')).toBeDefined();
+		expect(document.querySelector('[data-broken-note]')?.textContent).toMatch(/failed to load/);
+		const reinstall = screen.getByRole('button', {
+			name: 'Reinstall to royalti-co',
+		}) as HTMLButtonElement;
+		expect(reinstall.disabled).toBe(true);
+		for (const box of screen.getAllByRole('checkbox')) fireEvent.click(box);
+		expect(reinstall.disabled).toBe(false);
+		fireEvent.click(reinstall);
+		expect(onInstall).toHaveBeenCalledWith(meetings, 'project');
+	});
+
+	it('initialSelectedId opens that row sheet (Health → Reinstall from registry)', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={[meetings]}
+				loadDetail={loadDetail}
+				onInstall={vi.fn()}
+				initialSelectedId="@ikenga/pkg-meetings"
+			/>
+		);
+		expect(await screen.findByRole('button', { name: 'Reinstall to active project' })).toBeDefined();
+	});
+});
+
 // ─── Updates held for approval (WP-41-F1 in the Store) ───────────────────────
 
 const TASKS_REVIEW = {

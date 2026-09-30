@@ -171,6 +171,10 @@ export interface NgwaStoreEntry {
 	/** R57 · Q2: the signed catalog lists the same kind+name, so its row is
 	 *  folded into this one; the l3 line notes `also: <source>`. */
 	alsoFrom?: { source: 'git' | 'npx'; url: string } | null;
+	/** The pkg is on disk but failed to register (install-health scan
+	 *  `pkgs_dir_unloadable` / `register_failed`); the scan's detail. The row
+	 *  reads "installed · failed to load" and its action is Reinstall. */
+	broken?: string | null;
 }
 
 /**

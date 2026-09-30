@@ -17,7 +17,7 @@
 
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Check, Download, Link2, Search, Shield, ShieldAlert, X } from 'lucide-react';
+import { AlertTriangle, Check, Download, Link2, Search, Shield, ShieldAlert, X } from 'lucide-react';
 import { ErrorState, LoadingState, OfflineState } from '@/components/states';
 import {
 	Dialog,
@@ -140,6 +140,8 @@ export interface NgwaStoreSurfaceProps {
 	onOpenInstalled?: (name: string) => void;
 	/** Open Add from URL on mount (the `ngwa.add-from-url` command). */
 	initialAddUrl?: boolean;
+	/** Open this row's sheet on mount (Health's "Reinstall from registry"). */
+	initialSelectedId?: string | null;
 }
 
 type PendingAction = 'install' | 'update';
@@ -269,12 +271,13 @@ export function NgwaStoreSurface({
 	onInstallResolved,
 	onOpenInstalled,
 	initialAddUrl = false,
+	initialSelectedId = null,
 }: NgwaStoreSurfaceProps) {
 	const [search, setSearch] = useState('');
 	const [kindFilter, setKindFilter] = useState('*');
 	const [trustFilter, setTrustFilter] = useState('*');
 	const [sourceFilter, setSourceFilter] = useState<StoreSource | null>(null);
-	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [selectedId, setSelectedId] = useState<string | null>(initialSelectedId);
 	// R57: Add from URL occupies the sheet column; `seed` is the Source it
 	// opens with (an empty search hands its query over), `n` remounts it.
 	const [addUrl, setAddUrl] = useState<{ seed: string; n: number } | null>(
@@ -914,6 +917,25 @@ function StoreRow({
 					>
 						{busy ? 'Updating…' : 'Update'}
 					</button>
+				) : entry.broken ? (
+					// On disk but failed to register: say so, and route the fix
+					// through the sheet (and its consent) like any install.
+					<>
+						<span className="badge t-review" data-broken title={entry.broken}>
+							<AlertTriangle className="h-3 w-3" /> installed · failed to load
+						</span>
+						<button
+							type="button"
+							className="btn primary"
+							data-reinstall
+							onClick={(e) => {
+								e.stopPropagation();
+								onSelect();
+							}}
+						>
+							Reinstall
+						</button>
+					</>
 				) : entry.installedItem ? (
 					<span className="badge t-builtin">
 						<Check className="h-3 w-3" /> installed
@@ -1217,6 +1239,19 @@ function StoreSheet({
 					>
 						Update {entry.version} → {entry.latestVersion}
 					</button>
+				) : entry.broken ? (
+					<>
+						<span className="note bad" data-broken-note title={entry.broken}>
+							Installed · failed to load — reinstall
+						</span>
+						<InstallSplit
+							projectLabel={projectLabel}
+							blocked={installBlocked}
+							busy={busy}
+							onInstall={install}
+							verb="Reinstall"
+						/>
+					</>
 				) : entry.installedItem ? (
 					<>
 						<span className="badge t-builtin">
