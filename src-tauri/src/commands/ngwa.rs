@@ -1281,13 +1281,20 @@ pub async fn ngwa_snapshot(
         .path()
         .app_data_dir()
         .map_err(|e| format!("resolve app_data_dir: {e}"))?;
-    ngwa_snapshot_inner(
-        kernel.0.status(),
-        db.inner(),
-        &app_data_dir,
-        usage::claude_projects_dir(),
-    )
-    .await
+    let status = kernel_status_off_runtime(kernel.0.clone()).await?;
+    ngwa_snapshot_inner(status, db.inner(), &app_data_dir, usage::claude_projects_dir()).await
+}
+
+/// `Kernel::status()` walks every registry's sync `snapshot()`, and some of
+/// those read SQLite with a blocking `block_on`. Called straight from async
+/// code on a tokio worker that panics ("Cannot start a runtime from within a
+/// runtime") — the v0.18.4 Installed-tab hang. Run it on the blocking pool.
+pub async fn kernel_status_off_runtime(
+    kernel: Arc<crate::pkg::kernel::Kernel>,
+) -> Result<KernelStatus, String> {
+    tokio::task::spawn_blocking(move || kernel.status())
+        .await
+        .map_err(|e| format!("kernel status task failed: {e}"))
 }
 
 /// The snapshot data path shared by the `ngwa_snapshot` command and the
