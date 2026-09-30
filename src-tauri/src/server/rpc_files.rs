@@ -909,6 +909,56 @@ mod tests {
         assert!(!target.exists());
     }
 
+    // ── pty_spawn ──────────────────────────────────────────────────
+
+    /// The browser sends `terminalId` (camelCase, as `tauri-cmd.ts` does); the arm used to read
+    /// only `terminal_id`, dropped the name, and recorded an empty one. The daemon always mints
+    /// its own pty id; `terminal_id` is the stable name the terminal is listed and found by
+    /// (`resolve_id` matches it), which is what lets a browser reattach after a reload.
+    #[tokio::test]
+    async fn pty_spawn_records_the_terminal_id_in_either_spelling() {
+        let d = daemon();
+        let r = &d.router;
+        let spawn = |key: &str, id: &str| {
+            json!({
+                key: id,
+                "title": "audit",
+                "cwd": s(&d.allowed),
+                "cmd": ["/bin/sh", "-c", "sleep 30"],
+                "rows": 24,
+                "cols": 80,
+            })
+        };
+        let camel = ok(r, "pty_spawn", spawn("terminalId", "audit-camel")).await;
+        let snake = ok(r, "pty_spawn", spawn("terminal_id", "audit-snake")).await;
+
+        let listed = ok(r, "pty_terminal_list", json!({})).await;
+        let names: Vec<String> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["terminal_id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"audit-camel".to_string()), "{names:?}");
+        assert!(names.contains(&"audit-snake".to_string()), "{names:?}");
+        // The descriptor ties the name to the pty the spawn returned.
+        let by_name = |name: &str| {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["terminal_id"] == name)
+                .unwrap()["pty_id"]
+                .clone()
+        };
+        assert_eq!(by_name("audit-camel"), camel["pty_id"]);
+        assert_eq!(by_name("audit-snake"), snake["pty_id"]);
+
+        for spawned in [&camel, &snake] {
+            ok(r, "pty_kill", json!({ "id": spawned["pty_id"] })).await;
+        }
+    }
+
     // ── fs_kind / fs_mime ──────────────────────────────────────────────────
 
     #[tokio::test]

@@ -135,9 +135,14 @@ pub async fn rpc_handler(
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
         "pty_spawn" => {
+            // `terminalId` is what `tauri-cmd.ts` sends (Tauri does the camel -> snake conversion
+            // on the desktop; nothing does it here). `terminal_id` is kept for older callers.
+            // Reading only the snake spelling dropped the id, so a browser terminal got a random
+            // one and could not be found again after a reload.
             let terminal_id = payload
                 .args
-                .get("terminal_id")
+                .get("terminalId")
+                .or_else(|| payload.args.get("terminal_id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let title = payload
