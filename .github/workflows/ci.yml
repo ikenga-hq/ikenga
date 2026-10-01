@@ -379,7 +379,7 @@ jobs:
       - name: t1_root tests (root, T1 capabilities only)
         run: >-
           docker run --rm
-          --cap-drop=ALL --cap-add=SETUID,SETGID,CHOWN,KILL,DAC_OVERRIDE,FOWNER
+          --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER
           -v /opt/t1:/opt/t1:ro -w /tmp
           debian:stable-slim
           /opt/t1/lib-tests --ignored --test-threads=1 t1_root
@@ -391,7 +391,7 @@ jobs:
           for t in /opt/t1/server-tests/*; do
             echo "::group::$(basename "$t")"
             docker run --rm \
-              --cap-drop=ALL --cap-add=SETUID,SETGID,CHOWN,KILL,DAC_OVERRIDE,FOWNER \
+              --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER \
               -v /opt/t1:/opt/t1:ro -w /tmp \
               -e IKENGA_SERVER_BIN=/opt/t1/ikenga-server \
               debian:stable-slim \
@@ -402,7 +402,7 @@ jobs:
       - name: probe passes with the T1 capabilities
         run: >-
           docker run --rm
-          --cap-drop=ALL --cap-add=SETUID,SETGID,CHOWN,KILL,DAC_OVERRIDE,FOWNER
+          --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER
           -v /opt/t1:/opt/t1:ro -w /tmp
           debian:stable-slim
           /opt/t1/ikenga-server probe --executor-tier t1 --data-dir /srv/ikenga
