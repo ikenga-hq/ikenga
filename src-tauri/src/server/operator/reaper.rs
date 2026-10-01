@@ -20,9 +20,11 @@
 //!   helper (its own unreaped child, so no pid-reuse race) and reports
 //!   [`ReapOutcome::Failed`];
 //! - afterwards root **sweeps** `/proc` for any live process whose real,
-//!   effective, saved or fs uid is the target's, and kills each survivor
-//!   through a pidfd (`pidfd_open` → re-check `/proc/<pid>/status` → the
-//!   pidfd is still live, so that status was this process's →
+//!   effective, saved or fs uid is the target's (a thread group whose leader
+//!   is a zombie but whose other threads still run counts as live: review
+//!   R2-1), and kills each survivor through a pidfd (`pidfd_open` →
+//!   re-check `/proc/<pid>/status` → the pidfd is still live, so that status
+//!   was this process's →
 //!   `pidfd_send_signal(SIGKILL)`), until a full pass finds none. Only a
 //!   helper that exited 0 **and** a clean sweep is [`ReapOutcome::Killed`].
 
@@ -221,21 +223,62 @@ fn drain_nonblocking(pipe: Option<std::process::ChildStderr>) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// `/proc/<pid>/status` → is this a live (not zombie/dead) process with
-/// `uid` as its real, effective, saved or fs uid?
-fn status_holds_uid(status: &str, uid: u32) -> bool {
-    let mut live = false;
-    let mut holds = false;
-    for line in status.lines() {
-        if let Some(state) = line.strip_prefix("State:") {
-            live = !matches!(state.trim_start().chars().next(), Some('Z' | 'X' | 'x'));
-        } else if let Some(ids) = line.strip_prefix("Uid:") {
-            holds = ids
-                .split_whitespace()
-                .any(|id| id.parse::<u32>().ok() == Some(uid));
-        }
-    }
-    live && holds
+/// `State:` of a `/proc/.../status` is zombie or dead.
+fn status_dead(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.strip_prefix("State:")
+            .is_some_and(|state| matches!(state.trim_start().chars().next(), Some('Z' | 'X' | 'x')))
+    })
+}
+
+/// `Threads:` of a `/proc/<pid>/status` (0 if absent).
+fn status_threads(status: &str) -> u32 {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `uid` is the real, effective, saved or fs uid of a `/proc/.../status`.
+fn status_has_uid(status: &str, uid: u32) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|ids| {
+            ids.split_whitespace()
+                .any(|id| id.parse::<u32>().ok() == Some(uid))
+        })
+}
+
+/// Given its leader's `/proc/<pid>/status`, is this thread group a live
+/// process of `uid`?
+///
+/// A zombie **leader** is not a dead process (review R2-1): when the main
+/// thread `pthread_exit`s while others run, the leader shows `State: Z` but
+/// the group lives on (`Threads:` > 1, and some `/proc/<pid>/task/*` is not
+/// Z/X). It still holds the uid, is still a `kill(2)` target, and `pidfd_open`
+/// and SIGKILL on its tgid reach the whole group. `any_task_live` is asked
+/// only for a zombie leader whose `Threads:` doesn't already settle it.
+fn group_holds_uid(status: &str, uid: u32, any_task_live: impl FnOnce() -> bool) -> bool {
+    status_has_uid(status, uid)
+        && (!status_dead(status) || status_threads(status) > 1 || any_task_live())
+}
+
+/// Some thread of group `pid` is neither zombie nor dead.
+fn any_task_live(pid: i32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read_to_string(task.path().join("status")).is_ok_and(|s| !status_dead(&s))
+    })
+}
+
+/// `/proc/<pid>` is a live thread group holding `uid` (see
+/// [`group_holds_uid`]).
+fn pid_holds_uid(pid: i32, uid: u32) -> bool {
+    read_status(pid).is_some_and(|s| group_holds_uid(&s, uid, || any_task_live(pid)))
 }
 
 fn read_status(pid: i32) -> Option<String> {
@@ -283,7 +326,7 @@ fn processes_of(uid: u32) -> io::Result<Vec<i32>> {
             continue;
         };
         // Gone already (ENOENT/ESRCH) is fine.
-        if read_status(pid).is_some_and(|s| status_holds_uid(&s, uid)) {
+        if pid_holds_uid(pid, uid) {
             pids.push(pid);
         }
     }
@@ -321,7 +364,9 @@ fn kill_if_still_uid(pid: i32, uid: u32) -> io::Result<bool> {
     }
     // SAFETY: pidfd_open returned a fresh fd we now own.
     let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-    let matches = read_status(pid).is_some_and(|s| status_holds_uid(&s, uid));
+    // Same liveness rule as the sweep: a zombie leader with live threads is
+    // a target, and SIGKILL through its pidfd kills the whole group.
+    let matches = pid_holds_uid(pid, uid);
     // Still alive through the pidfd → the pid wasn't reused, so the status
     // just read was this process's.
     match pidfd_send_signal(&fd, 0) {
@@ -395,30 +440,35 @@ pub(crate) mod tests {
 
     #[test]
     fn status_parsing_matches_any_live_uid_field() {
-        let status = |state: &str, uids: &str| {
-            format!("Name:\tsleep\nState:\t{state}\nTgid:\t9\nUid:\t{uids}\nGid:\t0\t0\t0\t0\n")
+        let status = |state: &str, threads: u32, uids: &str| {
+            format!(
+                "Name:\tsleep\nState:\t{state}\nTgid:\t9\nUid:\t{uids}\nGid:\t0\t0\t0\t0\n\
+                 Threads:\t{threads}\n"
+            )
         };
-        assert!(status_holds_uid(
-            &status("S (sleeping)", "28520\t28520\t28520\t28520"),
-            28_520
-        ));
+        let holds = |status: &str, tasks_live: bool| group_holds_uid(status, 28_520, || tasks_live);
+        let all = "28520\t28520\t28520\t28520";
+        assert!(holds(&status("S (sleeping)", 1, all), false));
         // Only the saved uid (reachable by kill(2)) still counts.
-        assert!(status_holds_uid(
-            &status("T (stopped)", "1000\t1000\t28520\t1000"),
-            28_520
+        assert!(holds(
+            &status("T (stopped)", 1, "1000\t1000\t28520\t1000"),
+            false
         ));
-        assert!(!status_holds_uid(
-            &status("S (sleeping)", "1000\t1000\t1000\t1000"),
-            28_520
+        assert!(!holds(
+            &status("S (sleeping)", 1, "1000\t1000\t1000\t1000"),
+            true
         ));
-        // Zombies and dead tasks are not survivors.
-        assert!(!status_holds_uid(
-            &status("Z (zombie)", "28520\t28520\t28520\t28520"),
-            28_520
-        ));
-        assert!(!status_holds_uid(
-            &status("X (dead)", "28520\t28520\t28520\t28520"),
-            28_520
+        // A dead process (zombie leader, no thread left) or dead task is not
+        // a survivor.
+        assert!(!holds(&status("Z (zombie)", 1, all), false));
+        assert!(!holds(&status("X (dead)", 1, all), false));
+        // Review R2-1: a zombie leader whose group still runs threads is.
+        assert!(holds(&status("Z (zombie)", 2, all), false));
+        assert!(holds(&status("Z (zombie)", 1, all), true));
+        // ... but only if it holds the uid.
+        assert!(!holds(
+            &status("Z (zombie)", 2, "1000\t1000\t1000\t1000"),
+            true
         ));
     }
 
@@ -529,6 +579,110 @@ pub(crate) mod tests {
         let status = tokio::time::timeout(std::time::Duration::from_secs(10), survivor.wait())
             .await
             .expect("root killed the survivor")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// Set in the survivor that [`t1_root_zombie_leader_entry`] becomes.
+    const ZOMBIE_LEADER_ENV: &str = "IKENGA_TEST_ZOMBIE_LEADER";
+
+    /// The lib test binary re-exec'd as a thread group whose main thread has
+    /// exited while another thread sleeps: the leader is a zombie
+    /// (`State: Z`), the group is alive. A signal handler makes the **main**
+    /// thread leave with a raw `exit(2)` (thread-only, no unwinding,
+    /// async-signal-safe); a spawned thread keeps sleeping.
+    #[test]
+    #[ignore = "t1-root (zombie-leader survivor entry)"]
+    fn t1_root_zombie_leader_entry() {
+        if std::env::var_os(ZOMBIE_LEADER_ENV).is_none() {
+            return;
+        }
+        extern "C" fn exit_main_thread(_: libc::c_int) {
+            // SAFETY: raw SYS_exit ends only the calling thread.
+            unsafe {
+                if libc::syscall(libc::SYS_gettid) == libc::getpid() as libc::c_long {
+                    libc::syscall(libc::SYS_exit, 0);
+                }
+            }
+        }
+        // The survivor's own thread, whichever thread libtest runs us on.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(300));
+            std::process::exit(0);
+        });
+        // SAFETY: installing a handler, then signalling the main thread.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = exit_main_thread as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()), 0);
+            let pid = libc::getpid();
+            libc::syscall(libc::SYS_tgkill, pid, pid, libc::SIGUSR1);
+        }
+        std::thread::sleep(Duration::from_secs(300));
+        std::process::exit(0);
+    }
+
+    /// Review R2-1: a survivor whose thread-group leader is a zombie (main
+    /// thread exited, another still running) is not mistaken for dead. With
+    /// a lying helper (`exit 0`) root's sweep must find and SIGKILL it, and
+    /// only then report `Killed`.
+    #[tokio::test]
+    #[ignore = "t1-root"]
+    async fn t1_root_sweep_kills_a_group_whose_leader_is_a_zombie() {
+        t1_root::require_root();
+        let uid = 28_524;
+        let (_t, home) = t1_root::home_for(uid);
+        let exec = T1Executor::new(crate::executor::t1::tests::config());
+        let victim = principal(uid, &home);
+        let mut spec = SpawnSpec::new(std::env::current_exe().unwrap());
+        spec.args([
+            "--exact",
+            "server::operator::reaper::tests::t1_root_zombie_leader_entry",
+            "--ignored",
+            "--test-threads=1",
+            "-q",
+        ])
+        .env(ZOMBIE_LEADER_ENV, "1")
+        .current_dir("/")
+        .principal(Some(victim.clone()));
+        let mut opts = crate::executor::t1::tests::piped();
+        opts.detached = true;
+        let mut survivor = exec.spawn_piped(spec, opts).unwrap();
+        let pid = survivor.id().unwrap() as i32;
+
+        // Wait for the shape under test: leader Z, group still threaded.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = read_status(pid).expect("the survivor is running");
+            if status_dead(&status) && status_threads(&status) > 1 {
+                assert!(status_has_uid(&status, uid));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the main thread never exited:\n{status}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(any_task_live(pid));
+        assert_eq!(processes_of(uid).unwrap(), vec![pid], "the sweep sees it");
+
+        let (_tmp, root) = test_support::temp_root();
+        let reaper = T1Reaper::new(&root, sh_helper("exit 0"));
+        assert_eq!(reaper.kill_all(&victim).unwrap(), ReapOutcome::Killed);
+        // `Killed` came only after the group was gone: no live thread is
+        // left by the time kill_all returns.
+        assert!(
+            !any_task_live(pid),
+            "kill_all returned with the group alive"
+        );
+        assert!(processes_of(uid).unwrap().is_empty());
+
+        let status = tokio::time::timeout(Duration::from_secs(10), survivor.wait())
+            .await
+            .expect("root killed the group")
             .unwrap();
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));

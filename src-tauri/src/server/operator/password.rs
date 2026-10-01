@@ -615,14 +615,18 @@ impl LoginVerifier {
         pool: &SqlitePool,
         attempt: LoginAttempt,
     ) -> anyhow::Result<LoginOutcome> {
-        self.login_at(pool, attempt, now_ms()).await
+        self.login_at(pool, attempt, now_ms).await
     }
 
+    /// [`login`](Self::login) with an injectable clock (tests). The clock is
+    /// read when the attempt begins and again once argon2 has finished: a
+    /// verify queued behind other hashes can take seconds, and the miss must
+    /// be stamped with when it actually resolved (review S1-M3).
     pub(crate) async fn login_at(
         &self,
         pool: &SqlitePool,
         attempt: LoginAttempt,
-        now_ms: u64,
+        clock: impl Fn() -> u64,
     ) -> anyhow::Result<LoginOutcome> {
         let LoginAttempt {
             username,
@@ -644,7 +648,7 @@ impl LoginVerifier {
             None => LoginSubject::unknown(&username),
         };
 
-        let ticket = match self.throttle.begin(&subject, addr, now_ms) {
+        let ticket = match self.throttle.begin(&subject, addr, clock()) {
             Ok(ticket) => ticket,
             Err(retry_after_ms) => {
                 let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -678,7 +682,7 @@ impl LoginVerifier {
         if failure.is_none() {
             ticket.succeeded();
         } else {
-            ticket.failed(now_ms);
+            ticket.failed(clock());
         }
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -969,7 +973,7 @@ mod tests {
             let v = LoginVerifier::new();
 
             let LoginOutcome::Ok(a) = v
-                .login_at(&pool, attempt("ADA", PW, "10.0.0.1"), 0)
+                .login_at(&pool, attempt("ADA", PW, "10.0.0.1"), || 0)
                 .await
                 .unwrap()
             else {
@@ -989,7 +993,7 @@ mod tests {
                 ("bob", PW, "disabled"),
             ] {
                 let out = v
-                    .login_at(&pool, attempt(user, pw, "10.0.0.2"), 0)
+                    .login_at(&pool, attempt(user, pw, "10.0.0.2"), || 0)
                     .await
                     .unwrap();
                 assert!(matches!(out, LoginOutcome::Failed), "{user}: {out:?}");
@@ -1014,14 +1018,14 @@ mod tests {
             let v = LoginVerifier::new();
             for _ in 0..MAX_ATTEMPTS {
                 let out = v
-                    .login_at(&pool, attempt("ada", "nope nope", "10.0.0.9"), 1_000)
+                    .login_at(&pool, attempt("ada", "nope nope", "10.0.0.9"), || 1_000)
                     .await
                     .unwrap();
                 assert!(matches!(out, LoginOutcome::Failed));
             }
             // Even the right password is refused while the wait runs.
             let out = v
-                .login_at(&pool, attempt("ada", PW, "10.0.0.8"), 2_000)
+                .login_at(&pool, attempt("ada", PW, "10.0.0.8"), || 2_000)
                 .await
                 .unwrap();
             let LoginOutcome::Throttled { retry_after_ms } = out else {
@@ -1032,10 +1036,49 @@ mod tests {
             // After the wait, it goes through.
             let later = 1_000 + BACKOFF_STEPS_MS[0];
             let out = v
-                .login_at(&pool, attempt("ada", PW, "10.0.0.8"), later)
+                .login_at(&pool, attempt("ada", PW, "10.0.0.8"), || later)
                 .await
                 .unwrap();
             assert!(matches!(out, LoginOutcome::Ok(_)), "{out:?}");
+        }
+
+        /// Review S1-M3: a miss is stamped with the time verify finished, not
+        /// the time the attempt began (argon2 may have queued meanwhile), so
+        /// the backoff runs from when the last miss actually landed.
+        #[tokio::test]
+        async fn a_miss_is_stamped_after_verify_not_before() {
+            let (_root_tmp, root) = test_support::temp_root();
+            let (etc_tmp, _etc) = fake_etc(true);
+            let prov = Provisioner::for_tests(
+                root.clone(),
+                UidRange::new(3_900_000_100, 3_900_000_110).unwrap(),
+                etc_tmp.path(),
+            );
+            let pool = open_accounts(&root, Opener::Broker).await.unwrap();
+            prov.create(&pool, "ada", PW, false, None).await.unwrap();
+            let v = LoginVerifier::new();
+            // Each attempt begins at 1_000 and its verify ends at 9_000.
+            for _ in 0..MAX_ATTEMPTS {
+                let calls = std::sync::atomic::AtomicU32::new(0);
+                let clock = || match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => 1_000,
+                    _ => 9_000,
+                };
+                let out = v
+                    .login_at(&pool, attempt("ada", "nope nope", "10.4.0.1"), clock)
+                    .await
+                    .unwrap();
+                assert!(matches!(out, LoginOutcome::Failed));
+                assert_eq!(calls.into_inner(), 2, "begin, then after verify");
+            }
+            let out = v
+                .login_at(&pool, attempt("ada", PW, "10.4.0.2"), || 9_000)
+                .await
+                .unwrap();
+            let LoginOutcome::Throttled { retry_after_ms } = out else {
+                panic!("{out:?}");
+            };
+            assert_eq!(retry_after_ms, BACKOFF_STEPS_MS[0]);
         }
 
         /// Review F1 end to end: a burst of wrong passwords for one account
@@ -1060,7 +1103,7 @@ mod tests {
                         v.login_at(
                             &pool,
                             attempt("ada", "wrong guess", &format!("10.2.0.{i}")),
-                            5,
+                            || 5,
                         )
                         .await
                         .unwrap()
@@ -1094,7 +1137,7 @@ mod tests {
             assert_eq!((verified + throttled) as usize, burst);
             // The round is spent: even the right password waits.
             assert!(matches!(
-                v.login_at(&pool, attempt("ada", PW, "10.3.0.1"), 6)
+                v.login_at(&pool, attempt("ada", PW, "10.3.0.1"), || 6)
                     .await
                     .unwrap(),
                 LoginOutcome::Throttled { .. }

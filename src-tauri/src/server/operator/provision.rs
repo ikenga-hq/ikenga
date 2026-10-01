@@ -216,6 +216,68 @@ impl ShadowTools {
     }
 }
 
+/// Which subordinate-id files the host has. `useradd` allocates a
+/// subordinate uid (gid) range only when `/etc/subuid` (`/etc/subgid`)
+/// exists, so `-K SUB_UID_COUNT=0` (`SUB_GID_COUNT=0`) is needed only then —
+/// and passing it otherwise can fail outright: shadow-utils built without
+/// subid support rejects the unknown `-K` key with `E_BAD_ARG`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubidFiles {
+    subuid: bool,
+    subgid: bool,
+}
+
+impl SubidFiles {
+    fn on_host() -> Self {
+        Self {
+            subuid: Path::new("/etc/subuid").exists(),
+            subgid: Path::new("/etc/subgid").exists(),
+        }
+    }
+}
+
+/// `useradd`'s argv for the user `name` (uid = gid = `uid`; the group already
+/// exists).
+fn useradd_args(
+    name: &str,
+    uid: u32,
+    home: &Path,
+    shell: &Path,
+    subid: SubidFiles,
+) -> Vec<std::ffi::OsString> {
+    let uid_s = uid.to_string();
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-u".into(),
+        uid_s.clone().into(),
+        "-g".into(),
+        uid_s.into(),
+        // No home creation (we create and chown it), no per-user group (made
+        // by the caller), no lastlog entry.
+        "-M".into(),
+        "-N".into(),
+        "-l".into(),
+    ];
+    // No /etc/subuid or /etc/subgid range: with newuidmap a principal could
+    // otherwise own a block of 65 536 host ids (Debian's SUB_UID_COUNT). The
+    // built-in writer creates none either.
+    if subid.subuid {
+        args.extend(["-K".into(), "SUB_UID_COUNT=0".into()]);
+    }
+    if subid.subgid {
+        args.extend(["-K".into(), "SUB_GID_COUNT=0".into()]);
+    }
+    args.extend([
+        "-d".into(),
+        home.as_os_str().to_owned(),
+        "-s".into(),
+        shell.as_os_str().to_owned(),
+        "-c".into(),
+        GECOS.into(),
+        name.into(),
+    ]);
+    args
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
     ShadowUtils(ShadowTools),
@@ -257,39 +319,13 @@ impl Backend {
     ) -> anyhow::Result<()> {
         match self {
             Backend::ShadowUtils(t) => {
-                let (uid_s, home_s) = (uid.to_string(), home.as_os_str());
+                let uid_s = uid.to_string();
                 if own_group {
                     t.run(&t.groupadd, &["-g".as_ref(), uid_s.as_ref(), name.as_ref()])?;
                 }
-                let useradd = t.run(
-                    &t.useradd,
-                    &[
-                        "-u".as_ref(),
-                        uid_s.as_ref(),
-                        "-g".as_ref(),
-                        uid_s.as_ref(),
-                        // No home creation (we create and chown it), no
-                        // per-user group (made above), no lastlog entry.
-                        "-M".as_ref(),
-                        "-N".as_ref(),
-                        "-l".as_ref(),
-                        // No /etc/subuid or /etc/subgid range: with
-                        // newuidmap a principal could otherwise own a block
-                        // of 65 536 host ids (Debian's SUB_UID_COUNT). The
-                        // built-in writer creates none either.
-                        "-K".as_ref(),
-                        "SUB_UID_COUNT=0".as_ref(),
-                        "-K".as_ref(),
-                        "SUB_GID_COUNT=0".as_ref(),
-                        "-d".as_ref(),
-                        home_s,
-                        "-s".as_ref(),
-                        shell.as_os_str(),
-                        "-c".as_ref(),
-                        GECOS.as_ref(),
-                        name.as_ref(),
-                    ],
-                );
+                let args = useradd_args(name, uid, home, shell, SubidFiles::on_host());
+                let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+                let useradd = t.run(&t.useradd, &args);
                 if let Err(e) = useradd {
                     if own_group {
                         let _ = t.run(&t.groupdel, &[name.as_ref()]);
@@ -1587,6 +1623,42 @@ mod tests {
         end: 3_900_000_006,
     };
     const PW: &str = "correct horse battery";
+
+    /// Review S1-M1: `-K SUB_*_COUNT=0` only when the matching subid file
+    /// exists (useradd allocates nothing otherwise, and a build without subid
+    /// support would reject the key).
+    #[test]
+    fn useradd_args_pass_subid_counts_only_when_the_files_exist() {
+        let args = |subuid, subgid| {
+            useradd_args(
+                "ik_ada",
+                28_600,
+                Path::new("/data/p/home"),
+                Path::new("/bin/sh"),
+                SubidFiles { subuid, subgid },
+            )
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        let tail = "-d /data/p/home -s /bin/sh -c ikenga principal ik_ada";
+        let head = "-u 28600 -g 28600 -M -N -l";
+        assert_eq!(args(false, false), format!("{head} {tail}"));
+        assert!(!args(false, false).contains("-K"));
+        assert_eq!(
+            args(true, false),
+            format!("{head} -K SUB_UID_COUNT=0 {tail}")
+        );
+        assert_eq!(
+            args(false, true),
+            format!("{head} -K SUB_GID_COUNT=0 {tail}")
+        );
+        assert_eq!(
+            args(true, true),
+            format!("{head} -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 {tail}")
+        );
+    }
 
     struct Fixture {
         _root_tmp: tempfile::TempDir,

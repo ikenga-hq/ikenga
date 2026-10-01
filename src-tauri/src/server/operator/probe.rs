@@ -428,7 +428,9 @@ async fn steps(
             Ok::<_, super::provision::ProvisionError>(())
         }
         .await;
-        pinned_now.map_err(|e| report.fail(failed("uid_range", e.to_string())))?;
+        // Its own check name: `uid_range` already passed above, and a check
+        // must not appear both passed and failed in one report.
+        pinned_now.map_err(|e| report.fail(failed("uid_range_pin", e.to_string())))?;
         let reconciled = prov
             .reconcile(pool)
             .await
@@ -436,10 +438,11 @@ async fn steps(
         report.pass(
             "reconcile",
             format!(
-                "{} active account(s) checked; {} host user(s) recreated, {} shell(s) restored \
-                 [backend: {}]",
+                "{} active account(s) checked; {} host user(s) recreated, {} group(s) \
+                 recreated, {} shell(s) restored [backend: {}]",
                 reconciled.checked,
                 reconciled.created.len(),
+                reconciled.created_groups.len(),
                 reconciled.repaired_shell.len(),
                 prov.backend_name()
             ),
