@@ -23,11 +23,14 @@ pub(crate) struct PasswdInfo {
     pub shell: PathBuf,
 }
 
-/// `getpw*_r` / `getgr*_r` report "no such entry" either as a zero return
-/// with a NULL result or, on some NSS backends, as one of these errnos
-/// (`getpwnam_r(3)`, NOTES).
+/// `getpw*_r` / `getgr*_r` report "no such entry" as a zero return with a
+/// NULL result, or on some NSS backends as `ENOENT` / `ESRCH`. `EBADF` and
+/// `EPERM` (also listed in `getpwnam_r(3)` NOTES) are **errors** here: they
+/// can mean a backend failed, and treating them as "free" would let the §7.2
+/// collision checks pass on a uid or name the host actually holds. Failing
+/// closed refuses the provisioning instead.
 fn is_not_found(rc: i32) -> bool {
-    matches!(rc, libc::ENOENT | libc::ESRCH | libc::EBADF | libc::EPERM)
+    matches!(rc, libc::ENOENT | libc::ESRCH)
 }
 
 const INITIAL_BUF: usize = 1024;
@@ -187,6 +190,21 @@ impl Drop for PwdLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review F12: an NSS backend error fails closed.
+    #[test]
+    fn only_not_found_errnos_mean_no_entry() {
+        let mut calls = 0;
+        assert!(with_buffer::<()>(|_| {
+            calls += 1;
+            Err(libc::EPERM)
+        })
+        .is_err());
+        assert!(with_buffer::<()>(|_| Err(libc::EBADF)).is_err());
+        assert_eq!(with_buffer::<()>(|_| Err(libc::ENOENT)).unwrap(), None);
+        assert_eq!(with_buffer::<()>(|_| Err(libc::ESRCH)).unwrap(), None);
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn root_resolves_and_an_unused_uid_does_not() {

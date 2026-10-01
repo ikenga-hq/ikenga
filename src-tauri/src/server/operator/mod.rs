@@ -48,6 +48,11 @@ use crate::executor::PrincipalId;
 
 /// Files that only a T0 daemon writes at the top of its `--data-dir`. Any of
 /// them at an operator root means the directory is (or was) a T0 install.
+///
+/// SLICE-3 TRAP: `run_server` writes `<data_dir>/daemon.json` today
+/// (`server/mod.rs`). Under T1 that write must move to
+/// `operator/daemon.json` (§4) before the broker boots, or the second T1 boot
+/// refuses its own root here.
 const T0_MARKERS: &[&str] = &[
     "ikenga.db",
     "ikenga.db-wal",
@@ -95,10 +100,9 @@ impl std::fmt::Display for LayoutError {
             LayoutError::T0Layout { root, marker } => write!(
                 f,
                 "{} is a T0 data dir (it holds {marker}); T1 refuses it rather than migrating it \
-                 (G-PRINCIPAL I-10). Stop the T0 daemon and migrate it with \
-                 `ikenga-server accounts adopt-t0 --from {} …` into a fresh operator root, \
-                 or point --data-dir at an empty directory",
-                root.display(),
+                 (G-PRINCIPAL I-10). Point --data-dir at an empty directory for a fresh \
+                 operator root. (Migrating a T0 install with `accounts adopt-t0` is not \
+                 available in this build yet.)",
                 root.display()
             ),
             LayoutError::Unsafe { path, why } => {
@@ -256,9 +260,14 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum Opener {
     /// The T1 broker: the only migrator.
     Broker,
-    /// The root CLI: refuses any schema it doesn't match, except that it may
-    /// initialise a brand-new store (see [`migrations::Policy::InitialiseOnly`]).
+    /// The root CLI's `create`: refuses any schema it doesn't match, except
+    /// that it may initialise a brand-new store (see
+    /// [`migrations::Policy::InitialiseOnly`]) so the first admin can be
+    /// created before the first T1 boot (§7.4).
     Cli,
+    /// Every other CLI command: the store must already exist and be exactly
+    /// current. Creates nothing (a mistyped `--data-dir` grows no store).
+    CliExisting,
 }
 
 /// Open (creating if needed) `operator/accounts.db` with WAL, a busy timeout
@@ -268,7 +277,7 @@ pub enum Opener {
 pub async fn open_accounts(root: &OperatorRoot, opener: Opener) -> anyhow::Result<SqlitePool> {
     let path = root.accounts_db();
     fs::OpenOptions::new()
-        .create(true)
+        .create(opener != Opener::CliExisting)
         .append(true)
         .mode(0o600)
         .open(&path)
@@ -276,6 +285,7 @@ pub async fn open_accounts(root: &OperatorRoot, opener: Opener) -> anyhow::Resul
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     let options = SqliteConnectOptions::new()
         .filename(&path)
+        .create_if_missing(false)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(BUSY_TIMEOUT)
@@ -284,13 +294,32 @@ pub async fn open_accounts(root: &OperatorRoot, opener: Opener) -> anyhow::Resul
         .max_connections(4)
         .connect_with(options)
         .await?;
-    let policy = match opener {
-        Opener::Broker => migrations::Policy::Migrate,
-        Opener::Cli => migrations::Policy::InitialiseOnly,
-    };
     {
         let mut conn = pool.acquire().await?;
-        migrations::apply(&mut conn, &migrations::ACCOUNTS, policy).await?;
+        let checked = match opener {
+            Opener::Broker => migrations::apply(
+                &mut conn,
+                &migrations::ACCOUNTS,
+                migrations::Policy::Migrate,
+            )
+            .await
+            .map(drop),
+            Opener::Cli => migrations::apply(
+                &mut conn,
+                &migrations::ACCOUNTS,
+                migrations::Policy::InitialiseOnly,
+            )
+            .await
+            .map(drop),
+            Opener::CliExisting => {
+                migrations::require_current(&mut conn, &migrations::ACCOUNTS).await
+            }
+        };
+        if let Err(e) = checked {
+            drop(conn);
+            pool.close().await;
+            return Err(e.into());
+        }
     }
     Ok(pool)
 }
@@ -368,7 +397,7 @@ mod tests {
                 matches!(err, LayoutError::T0Layout { .. }),
                 "{marker}: {err}"
             );
-            assert!(err.to_string().contains("adopt-t0"), "{err}");
+            assert!(err.to_string().contains("not available"), "{err}");
             assert!(
                 !root.operator_dir().exists(),
                 "refusal must not create operator/"
@@ -404,6 +433,28 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root.operator_dir()).unwrap();
         let err = root.prepare(Ownership::SkipForTests).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// Review F10: read-only commands neither create nor initialise a store.
+    #[tokio::test]
+    async fn the_cli_existing_opener_creates_nothing() {
+        let (_tmp, root) = test_support::temp_root();
+        assert!(open_accounts(&root, Opener::CliExisting).await.is_err());
+        assert!(!root.accounts_db().exists());
+        // An empty (never initialised) file is refused too, and left empty.
+        fs::write(root.accounts_db(), b"").unwrap();
+        let err = open_accounts(&root, Opener::CliExisting).await.unwrap_err();
+        assert!(err.to_string().contains("never been initialised"), "{err}");
+        open_accounts(&root, Opener::Cli)
+            .await
+            .unwrap()
+            .close()
+            .await;
+        open_accounts(&root, Opener::CliExisting)
+            .await
+            .unwrap()
+            .close()
+            .await;
     }
 
     #[tokio::test]

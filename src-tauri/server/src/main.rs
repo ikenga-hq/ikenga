@@ -86,6 +86,10 @@ pub enum AccountsCommand {
         /// Map the account onto this existing Unix user instead of allocating one.
         #[arg(long, value_name = "NAME")]
         adopt_unix_user: Option<String>,
+        /// With --adopt-unix-user: allow a system user (uid below login.defs
+        /// UID_MIN). Root, nobody and the probe uid are refused regardless.
+        #[arg(long, requires = "adopt_unix_user")]
+        allow_system_user: bool,
         #[command(flatten)]
         password: PasswordArgs,
     },
@@ -168,18 +172,28 @@ pub struct ServeArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,ikenga_server=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let CliArgs {
         command,
         serve: args,
     } = CliArgs::parse();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,ikenga_server=debug".into());
+    if command.is_some() {
+        // Subcommands log to stderr: their stdout is their output
+        // (`accounts list --json` must stay parseable), and stdout is only
+        // ever written once the command is done (see `operator::cli::run`).
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    } else {
+        // `serve` keeps logging to stdout, unchanged for systemd and Docker.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     // §7.4 first-admin bootstrap: captured and removed from the environment
     // here, beside the token stripping below and for the same reason — every
@@ -302,11 +316,13 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
             username,
             admin,
             adopt_unix_user,
+            allow_system_user,
             password,
         } => Cmd::Create {
             username,
             admin,
             adopt_unix_user,
+            allow_system_user,
             password: source(password),
         },
         AccountsCommand::Passwd { username, password } => Cmd::Passwd {
@@ -382,10 +398,12 @@ mod tests {
                 username,
                 admin,
                 adopt_unix_user,
+                allow_system_user,
                 password,
             } => {
                 assert_eq!(username, "ada");
                 assert!(admin && password.password_stdin && adopt_unix_user.is_none());
+                assert!(!allow_system_user);
             }
             other => panic!("{other:?}"),
         }
@@ -429,6 +447,28 @@ mod tests {
         ] {
             assert!(CliArgs::try_parse_from(&argv).is_err(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn allow_system_user_needs_an_adopted_user() {
+        assert!(CliArgs::try_parse_from([
+            "ikenga-server",
+            "accounts",
+            "create",
+            "ada",
+            "--allow-system-user",
+        ])
+        .is_err());
+        assert!(CliArgs::try_parse_from([
+            "ikenga-server",
+            "accounts",
+            "create",
+            "ada",
+            "--adopt-unix-user",
+            "daemon",
+            "--allow-system-user",
+        ])
+        .is_ok());
     }
 
     #[test]

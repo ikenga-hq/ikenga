@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use super::accounts::{self, Actor, NoDeviceGrants};
 use super::provision::{
-    Provisioner, ProvisioningMode, ReapOutcome, ReaperPendingT1Executor, UidRange,
+    Adopt, Provisioner, ProvisioningMode, ReapOutcome, ReaperPendingT1Executor, UidRange,
 };
 use super::{open_accounts, sys, Opener, OperatorRoot, Ownership};
 
@@ -40,6 +40,8 @@ pub enum AccountsCommand {
         username: String,
         admin: bool,
         adopt_unix_user: Option<String>,
+        /// With `adopt_unix_user`: permit a system user (uid < `UID_MIN`).
+        allow_system_user: bool,
         password: PasswordSource,
     },
     Passwd {
@@ -78,13 +80,40 @@ pub async fn run(opts: AccountsOptions, cmd: AccountsCommand) -> anyhow::Result<
         std::env::current_dir()?.join(&opts.data_dir)
     };
     let root = OperatorRoot::new(data_dir)?;
+    let opener = if matches!(cmd, AccountsCommand::Create { .. }) {
+        // Only `create` may initialise a brand-new store (the first admin,
+        // §7.4, before any T1 boot).
+        Opener::Cli
+    } else {
+        // Everything else needs an existing, current store and creates
+        // nothing: a mistyped --data-dir must not grow an operator root.
+        root.refuse_t0_layout()?;
+        if !root.accounts_db().exists() {
+            anyhow::bail!(
+                "no operator store at {} (no {}); check --data-dir, or create the first account \
+                 with `ikenga-server accounts create <name> --admin`",
+                root.root().display(),
+                root.accounts_db().display()
+            );
+        }
+        Opener::CliExisting
+    };
     root.prepare(Ownership::Enforce)?;
-    let pool = open_accounts(&root, Opener::Cli).await?;
+    let pool = open_accounts(&root, opener).await?;
     let prov = Provisioner::new(root, opts.uid_range, opts.provisioning, Actor::Cli);
-    let mut out = io::stdout().lock();
+    // Output is buffered and written after the command, never through a held
+    // `StdoutLock`: holding it across awaits deadlocks against any log event
+    // another thread emits (sqlx's workers at debug), and logs go to stderr
+    // anyway (`main.rs`), so `list --json` stays clean.
+    let mut out = Vec::new();
     let result = run_with(&prov, &pool, cmd, &mut read_password, &mut out).await;
     pool.close().await;
-    result
+    let written = {
+        let mut stdout = io::stdout();
+        stdout.write_all(&out).and_then(|()| stdout.flush())
+    };
+    result?;
+    Ok(written?)
 }
 
 /// [`run`] after setup, with the password reader and output injectable.
@@ -100,16 +129,22 @@ pub(crate) async fn run_with(
             username,
             admin,
             adopt_unix_user,
+            allow_system_user,
             password,
         } => {
             // Validate the name before prompting for a password.
             if adopt_unix_user.is_none() {
                 accounts::unix_name_for(&username)?;
+                if allow_system_user {
+                    anyhow::bail!("--allow-system-user only applies with --adopt-unix-user");
+                }
             }
             let pw = read_password(password)?;
-            let a = prov
-                .create(pool, &username, &pw, admin, adopt_unix_user.as_deref())
-                .await?;
+            let adopt = adopt_unix_user.as_deref().map(|unix_user| Adopt {
+                unix_user,
+                allow_system_user,
+            });
+            let a = prov.create(pool, &username, &pw, admin, adopt).await?;
             writeln!(
                 out,
                 "created {}account {} ({}) as {} uid {} home {} [backend: {}]",
@@ -329,6 +364,7 @@ mod tests {
                 username: "ada".into(),
                 admin: true,
                 adopt_unix_user: None,
+                allow_system_user: false,
                 password: PasswordSource::Stdin,
             },
             AccountsCommand::Passwd {
@@ -395,6 +431,7 @@ mod tests {
             username: "no.dots".into(),
             admin: false,
             adopt_unix_user: None,
+            allow_system_user: false,
             password: PasswordSource::Tty,
         };
         assert!(run_with(&prov, &pool, cmd, &mut pw, &mut Vec::new())

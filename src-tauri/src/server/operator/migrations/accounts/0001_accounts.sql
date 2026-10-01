@@ -47,3 +47,26 @@ CREATE TRIGGER accounts_never_deleted BEFORE DELETE ON accounts
 BEGIN
   SELECT RAISE(ABORT, 'accounts rows are never deleted (G-PRINCIPAL I-4)');
 END;
+
+-- I-4 and §7.2 ("unix_name is immutable after provisioning"), for UPDATE too:
+-- the identity columns of a row never change, so neither an id nor a uid can
+-- be recycled by rewriting a tombstone. (username, password, shell, flags and
+-- the epoch stay mutable; so does unix_gid, which an adopted host user's
+-- primary group can legitimately change.)
+CREATE TRIGGER accounts_identity_immutable
+BEFORE UPDATE OF principal_id, unix_uid, unix_name ON accounts
+WHEN NEW.principal_id IS NOT OLD.principal_id
+  OR NEW.unix_uid IS NOT OLD.unix_uid
+  OR NEW.unix_name IS NOT OLD.unix_name
+BEGIN
+  SELECT RAISE(ABORT, 'accounts identity columns are immutable (G-PRINCIPAL I-4, §7.2)');
+END;
+
+-- Operator-wide settings that the broker and the root CLI (separate
+-- invocations) must agree on. `uid_range` ('START-END') is pinned by the first
+-- provisioning (`Provisioner::pin_uid_range`) and a different --uid-range is
+-- refused afterwards, so neither can allocate the other's §8 probe uid.
+CREATE TABLE operator_meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);

@@ -103,7 +103,12 @@ impl std::fmt::Display for MigrationError {
                 SchemaState::Inconsistent(why) => {
                     write!(f, "operator store migration set `{set}` is inconsistent: {why}")
                 }
-                SchemaState::Fresh | SchemaState::Current => {
+                SchemaState::Fresh => write!(
+                    f,
+                    "operator store migration set `{set}` has never been initialised; create the \
+                     first account with `ikenga-server accounts create <name> --admin`"
+                ),
+                SchemaState::Current => {
                     write!(f, "operator store migration set `{set}`: unexpected state {state:?}")
                 }
             },
@@ -449,5 +454,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("never deleted"), "{err}");
+        // Review F13: nor can a tombstone's identity be rewritten.
+        let other_id = crate::executor::PrincipalId::new_v7().to_string();
+        for stmt in [
+            "UPDATE accounts SET unix_uid = 20001".to_string(),
+            "UPDATE accounts SET unix_name = 'ik-eve'".to_string(),
+            format!("UPDATE accounts SET principal_id = '{other_id}'"),
+        ] {
+            let err = sqlx::query(&stmt).execute(&mut conn).await.unwrap_err();
+            assert!(err.to_string().contains("immutable"), "{stmt}: {err}");
+        }
+        // A no-op write of the same value, and the mutable columns, pass.
+        sqlx::query(
+            "UPDATE accounts SET unix_uid = unix_uid, username = 'Ada', session_epoch = 1, \
+             unix_gid = 20002",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
     }
 }

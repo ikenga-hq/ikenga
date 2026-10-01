@@ -160,14 +160,30 @@ struct ShadowTools {
     groupdel: PathBuf,
 }
 
+/// The only places the shadow-utils tools are looked for. Never the caller's
+/// `$PATH`: this runs as root, and a stray `.` or user-writable entry there
+/// would hand root to whatever `useradd` it found. Same list as the spawned
+/// tools' own fixed `PATH`.
+const SHADOW_TOOL_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// `dir/tool` if it is a root-owned regular executable that neither group nor
+/// others can write (symlinks resolved, as on merged-/usr hosts).
+fn trusted_tool(dir: &str, tool: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Path::new(dir).join(tool);
+    let meta = fs::metadata(&path).ok()?;
+    let ok =
+        meta.is_file() && meta.uid() == 0 && meta.mode() & 0o022 == 0 && meta.mode() & 0o111 != 0;
+    ok.then_some(path)
+}
+
 impl ShadowTools {
     fn find() -> Option<Self> {
-        let path = format!(
-            "{}:/usr/sbin:/sbin:/usr/bin:/bin",
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        let find = |tool: &str| which::which_in(tool, Some(&path), &cwd).ok();
+        let find = |tool: &str| {
+            SHADOW_TOOL_DIRS
+                .iter()
+                .find_map(|dir| trusted_tool(dir, tool))
+        };
         Some(Self {
             groupadd: find("groupadd")?,
             useradd: find("useradd")?,
@@ -251,6 +267,14 @@ impl Backend {
                         "-M".as_ref(),
                         "-N".as_ref(),
                         "-l".as_ref(),
+                        // No /etc/subuid or /etc/subgid range: with
+                        // newuidmap a principal could otherwise own a block
+                        // of 65 536 host ids (Debian's SUB_UID_COUNT). The
+                        // built-in writer creates none either.
+                        "-K".as_ref(),
+                        "SUB_UID_COUNT=0".as_ref(),
+                        "-K".as_ref(),
+                        "SUB_GID_COUNT=0".as_ref(),
                         "-d".as_ref(),
                         home_s,
                         "-s".as_ref(),
@@ -390,6 +414,11 @@ pub enum ProvisionError {
     /// `--provisioning external` can only adopt existing users.
     ExternalNeedsAdopt,
     AdoptRefused(String),
+    /// `--uid-range` differs from the range the store was first used with.
+    UidRangeMismatch {
+        stored: String,
+        requested: UidRange,
+    },
     Host(anyhow::Error),
     Db(sqlx::Error),
 }
@@ -419,6 +448,12 @@ impl fmt::Display for ProvisionError {
                  --adopt-unix-user <name>",
             ),
             ProvisionError::AdoptRefused(why) => write!(f, "cannot adopt: {why}"),
+            ProvisionError::UidRangeMismatch { stored, requested } => write!(
+                f,
+                "--uid-range {requested} differs from {stored}, the range this operator store \
+                 was first provisioned with; the broker and the CLI must agree on it (its last \
+                 uid is the boot probe's) — pass --uid-range {stored}"
+            ),
             ProvisionError::Host(e) => write!(f, "provisioning the host failed: {e:#}"),
             ProvisionError::Db(e) => write!(f, "accounts.db: {e}"),
         }
@@ -558,10 +593,21 @@ impl BootstrapAdmin {
     ///
     /// Must run before anything can spawn: the vars are gone afterwards.
     pub fn take_from_env() -> Result<Option<Self>, String> {
-        let user = std::env::var_os(BOOTSTRAP_ADMIN_ENV);
-        let pass = std::env::var_os(BOOTSTRAP_ADMIN_PASSWORD_ENV);
-        std::env::remove_var(BOOTSTRAP_ADMIN_ENV);
-        std::env::remove_var(BOOTSTRAP_ADMIN_PASSWORD_ENV);
+        Self::take_from(&mut |key| {
+            let value = std::env::var_os(key);
+            std::env::remove_var(key);
+            value
+        })
+    }
+
+    /// [`take_from_env`](Self::take_from_env) over any environment: `take`
+    /// returns a variable's value **and removes it**. Tests use this with a
+    /// map, never the process env (concurrent `setenv` is UB in glibc).
+    pub(crate) fn take_from(
+        take: &mut dyn FnMut(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Option<Self>, String> {
+        let user = take(BOOTSTRAP_ADMIN_ENV);
+        let pass = take(BOOTSTRAP_ADMIN_PASSWORD_ENV);
         let pass = pass.map(|p| Zeroizing::new(p.to_string_lossy().into_owned()));
         match (user, pass) {
             (None, None) => Ok(None),
@@ -577,6 +623,82 @@ impl BootstrapAdmin {
             )),
         }
     }
+}
+
+/// `create --adopt-unix-user <name> [--allow-system-user]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adopt<'a> {
+    pub unix_user: &'a str,
+    /// Permit a uid below `login.defs` `UID_MIN` (a system account).
+    pub allow_system_user: bool,
+}
+
+impl<'a> Adopt<'a> {
+    pub fn user(unix_user: &'a str) -> Self {
+        Self {
+            unix_user,
+            allow_system_user: false,
+        }
+    }
+}
+
+/// The overflow id (`nobody` / `nogroup`): shared by every unmapped file and
+/// many daemons, never a principal.
+const OVERFLOW_ID: u32 = 65_534;
+
+/// Why `pw` can't be adopted under `range`, if it can't.
+fn adopt_refusal(
+    pw: &sys::PasswdInfo,
+    range: UidRange,
+    uid_min: u32,
+    allow_system_user: bool,
+) -> Option<String> {
+    let name = &pw.name;
+    if pw.uid == 0 || pw.gid == 0 {
+        return Some(format!(
+            "`{name}` is root (uid {} gid {}); a principal never runs as root (I-1)",
+            pw.uid, pw.gid
+        ));
+    }
+    let probe = range.probe_uid();
+    if pw.uid == probe || pw.gid == probe {
+        return Some(format!(
+            "`{name}` holds {probe}, the reserved probe uid of --uid-range {range}"
+        ));
+    }
+    for id in [pw.uid, pw.gid] {
+        if id == OVERFLOW_ID || id >= u32::MAX - 1 {
+            return Some(format!(
+                "`{name}` holds {id}, the overflow id (nobody) or a (uid_t)-1/-2 sentinel"
+            ));
+        }
+    }
+    if pw.uid < uid_min && !allow_system_user {
+        return Some(format!(
+            "`{name}` (uid {}) is a system user (below UID_MIN {uid_min}); pass \
+             --allow-system-user if that is really meant",
+            pw.uid
+        ));
+    }
+    None
+}
+
+/// `UID_MIN` from `login.defs` text; `None` when absent or unparsable.
+fn parse_uid_min(login_defs: &str) -> Option<u32> {
+    login_defs.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == "UID_MIN")
+            .then(|| words.next()?.parse().ok())
+            .flatten()
+    })
+}
+
+/// The host's `UID_MIN` (`/etc/login.defs`), else 1000.
+fn login_defs_uid_min() -> u32 {
+    fs::read_to_string("/etc/login.defs")
+        .ok()
+        .and_then(|text| parse_uid_min(&text))
+        .unwrap_or(1000)
 }
 
 /// The provisioning core, configured for one operator root.
@@ -688,18 +810,16 @@ impl Provisioner {
         Ok(uid)
     }
 
-    /// Create `dir` (and nothing above it) `0700`, owned by `uid:gid`.
-    fn make_private_dir(&self, dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
-        fs::DirBuilder::new().mode(0o700).create(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-        if self.ownership == Ownership::Enforce {
-            std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
-        }
-        Ok(())
-    }
-
-    /// The §4 principal dirs: `<id>/`, `<id>/data/`, `<id>/data/tmp/` and,
-    /// unless the home lives elsewhere (adopted), `<id>/home/`.
+    /// The §4 principal dirs, all `0700` and owned by `uid:gid`: `<id>/`,
+    /// `<id>/data/`, `<id>/data/tmp/` and, unless the home lives elsewhere
+    /// (adopted), `<id>/home/`.
+    ///
+    /// The whole subtree is created and chmodded **while still root-owned**,
+    /// then chowned **leaf first, `<id>/` last**. Until that last chown the
+    /// uid can't even enter `<id>/`, so no process of an (adopted, possibly
+    /// live) uid can swap a child for a symlink between root's create and
+    /// root's path-based chmod (which follows symlinks). `lchown` never
+    /// follows one.
     fn make_principal_dirs(
         &self,
         id: PrincipalId,
@@ -707,13 +827,52 @@ impl Provisioner {
         gid: u32,
         with_home: bool,
     ) -> io::Result<()> {
-        self.make_private_dir(&self.root.principal_dir(id), uid, gid)?;
-        if with_home {
-            self.make_private_dir(&self.root.principal_home(id), uid, gid)?;
-        }
         let data = self.root.principal_data(id);
-        self.make_private_dir(&data, uid, gid)?;
-        self.make_private_dir(&data.join("tmp"), uid, gid)
+        let mut dirs = vec![self.root.principal_dir(id)];
+        if with_home {
+            dirs.push(self.root.principal_home(id));
+        }
+        dirs.push(data.clone());
+        dirs.push(data.join("tmp"));
+        for dir in &dirs {
+            fs::DirBuilder::new().mode(0o700).create(dir)?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+        if self.ownership == Ownership::Enforce {
+            for dir in dirs.iter().rev() {
+                std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record `--uid-range` in the store the first time it provisions, and
+    /// refuse a different one afterwards (the CLI and the broker are separate
+    /// invocations; a mismatch would let one allocate the other's probe uid).
+    /// Runs inside the caller's `BEGIN IMMEDIATE`. The broker's boot and the
+    /// §8 probe (WP-20 slices 2/3) call it too.
+    pub async fn pin_uid_range(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<(), ProvisionError> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = 'uid_range'")
+                .fetch_optional(&mut **tx)
+                .await?;
+        match stored {
+            None => {
+                sqlx::query("INSERT INTO operator_meta (key, value) VALUES ('uid_range', ?)")
+                    .bind(self.range.to_string())
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(())
+            }
+            Some(stored) if stored == self.range.to_string() => Ok(()),
+            Some(stored) => Err(ProvisionError::UidRangeMismatch {
+                stored,
+                requested: self.range,
+            }),
+        }
     }
 
     async fn insert_row(
@@ -770,6 +929,11 @@ impl Provisioner {
 
     /// §7.2 steps 2–4 inside the caller's `BEGIN IMMEDIATE` (R-8). See the
     /// module docs for the contract of the returned guard.
+    ///
+    /// On an `Err`, the caller **must** roll back and then call
+    /// [`record_provision_failed`](Self::record_provision_failed) (§7.2: a
+    /// failed create records `provision_failed`), as [`create`](Self::create)
+    /// does for the CLI.
     pub async fn create_in(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -782,6 +946,7 @@ impl Provisioner {
         if self.backend == Backend::External {
             return Err(ProvisionError::ExternalNeedsAdopt);
         }
+        self.pin_uid_range(tx).await?;
         Self::refuse_taken_username(tx, username).await?;
 
         // Step 2.
@@ -843,14 +1008,20 @@ impl Provisioner {
     /// range, but never 0 and never `range_end` (the probe uid). Its home is
     /// the user's passwd home; only `<id>/data` is created. Works under every
     /// backend — it is the only create `--provisioning external` allows.
+    ///
+    /// Also refused: `nobody` / the overflow id 65534, the `(uid_t)-1/-2`
+    /// sentinels, and system users (uid below `login.defs` `UID_MIN`) unless
+    /// [`Adopt::allow_system_user`] is set. Errors are recorded by the caller
+    /// as for [`create_in`](Self::create_in).
     pub async fn adopt_in(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         username: &str,
         password: &str,
         is_admin: bool,
-        unix_user: &str,
+        adopt: Adopt<'_>,
     ) -> Result<ProvisionGuard, ProvisionError> {
+        let unix_user = adopt.unix_user;
         if username.is_empty() || username.chars().count() > accounts::MAX_USERNAME_CHARS {
             return Err(ProvisionError::Username(if username.is_empty() {
                 UsernameError::Empty
@@ -859,22 +1030,18 @@ impl Provisioner {
             }));
         }
         password::validate_new_password(password)?;
+        self.pin_uid_range(tx).await?;
         Self::refuse_taken_username(tx, username).await?;
         let pw = sys::user_by_name(unix_user)
             .map_err(host_err)?
             .ok_or_else(|| ProvisionError::AdoptRefused(format!("no host user `{unix_user}`")))?;
-        if pw.uid == 0 || pw.gid == 0 {
-            return Err(ProvisionError::AdoptRefused(format!(
-                "`{unix_user}` is root (uid {} gid {}); a principal never runs as root (I-1)",
-                pw.uid, pw.gid
-            )));
-        }
-        let probe = self.range.probe_uid();
-        if pw.uid == probe || pw.gid == probe {
-            return Err(ProvisionError::AdoptRefused(format!(
-                "`{unix_user}` holds {probe}, the reserved probe uid of --uid-range {}",
-                self.range
-            )));
+        if let Some(why) = adopt_refusal(
+            &pw,
+            self.range,
+            login_defs_uid_min(),
+            adopt.allow_system_user,
+        ) {
+            return Err(ProvisionError::AdoptRefused(why));
         }
         let held: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM accounts WHERE unix_uid = ? OR unix_name = ?")
@@ -936,7 +1103,11 @@ impl Provisioner {
         Ok(guard)
     }
 
-    async fn record_provision_failed(
+    /// Write `provision_failed` for `username` in its own `BEGIN IMMEDIATE`
+    /// (§7.2). Call it **after** rolling back a failed
+    /// [`create_in`](Self::create_in) / [`adopt_in`](Self::adopt_in); a
+    /// failure to record is logged, never returned.
+    pub async fn record_provision_failed(
         &self,
         pool: &SqlitePool,
         username: &str,
@@ -973,13 +1144,13 @@ impl Provisioner {
         username: &str,
         password: &str,
         is_admin: bool,
-        adopt_unix_user: Option<&str>,
+        adopt: Option<Adopt<'_>>,
     ) -> Result<Account, ProvisionError> {
         let result = async {
             let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-            let guard = match adopt_unix_user {
-                Some(unix_user) => {
-                    self.adopt_in(&mut tx, username, password, is_admin, unix_user)
+            let guard = match adopt {
+                Some(adopt) => {
+                    self.adopt_in(&mut tx, username, password, is_admin, adopt)
                         .await?
                 }
                 None => {
@@ -1606,33 +1777,156 @@ mod tests {
         // Root can never be adopted (I-1).
         let root_name = sys::user_by_uid(0).unwrap().unwrap().name;
         let err = prov
-            .create(&pool, "ada", PW, false, Some(&root_name))
+            .create(&pool, "ada", PW, false, Some(Adopt::user(&root_name)))
             .await
             .unwrap_err();
         assert!(matches!(err, ProvisionError::AdoptRefused(_)), "{err}");
         let err = prov
-            .create(&pool, "ada", PW, false, Some("ik-no-such-user-wp20"))
+            .create(
+                &pool,
+                "ada",
+                PW,
+                false,
+                Some(Adopt::user("ik-no-such-user-wp20")),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ProvisionError::AdoptRefused(_)), "{err}");
         assert_eq!(events(&pool).await.len(), 3, "every failure is recorded");
+        // Review F4: `nobody` (65534) is never adoptable, whatever the flag.
+        if let Some(nobody) = sys::user_by_uid(OVERFLOW_ID).unwrap() {
+            let err = prov
+                .create(
+                    &pool,
+                    "nob",
+                    PW,
+                    false,
+                    Some(Adopt {
+                        unix_user: &nobody.name,
+                        allow_system_user: true,
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("overflow id"), "{err}");
+        }
+    }
+
+    fn passwd(name: &str, uid: u32, gid: u32) -> sys::PasswdInfo {
+        sys::PasswdInfo {
+            name: name.into(),
+            uid,
+            gid,
+            home: PathBuf::from("/home/x"),
+            shell: PathBuf::from("/bin/sh"),
+        }
     }
 
     #[test]
+    fn adopt_refuses_root_probe_overflow_sentinels_and_system_users() {
+        let range = UidRange::DEFAULT;
+        let refused = |pw: &sys::PasswdInfo, allow: bool| adopt_refusal(pw, range, 1000, allow);
+        assert!(refused(&passwd("root", 0, 0), true).is_some());
+        assert!(refused(&passwd("g0", 1500, 0), true).is_some());
+        assert!(refused(&passwd("probe", 29_999, 1500), true).is_some());
+        assert!(refused(&passwd("nobody", 65_534, 65_534), true).is_some());
+        assert!(refused(&passwd("nogroup", 1500, 65_534), true).is_some());
+        assert!(refused(&passwd("m1", u32::MAX, 1500), true).is_some());
+        assert!(refused(&passwd("m2", 1500, u32::MAX - 1), true).is_some());
+        // System users only with the explicit flag.
+        let daemon = passwd("daemon", 1, 1);
+        assert!(refused(&daemon, false)
+            .unwrap()
+            .contains("--allow-system-user"));
+        assert!(refused(&daemon, true).is_none());
+        assert!(refused(&passwd("www-data", 33, 33), false).is_some());
+        // An ordinary login user, even with a low shared primary group.
+        assert!(refused(&passwd("ada", 1000, 100), false).is_none());
+    }
+
+    #[test]
+    fn uid_min_is_read_from_login_defs() {
+        let defs = "# comment UID_MIN 5\nUID_MAX\t\t60000\nUID_MIN\t\t\t 1500\nSYS_UID_MIN 100\n";
+        assert_eq!(parse_uid_min(defs), Some(1500));
+        assert_eq!(parse_uid_min("UID_MIN nope\n"), None);
+        assert_eq!(parse_uid_min(""), None);
+    }
+
+    /// Review F11: the first provisioning pins --uid-range in the store; a
+    /// different one is refused before anything is allocated.
+    #[tokio::test]
+    async fn the_uid_range_is_pinned_by_the_first_create() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        let (etc_tmp, etc) = fake_etc(true);
+        let other = Provisioner::for_tests(
+            f.prov.root().clone(),
+            UidRange::new(3_900_000_200, 3_900_000_300).unwrap(),
+            etc_tmp.path(),
+        );
+        let err = other
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::UidRangeMismatch { stored, .. }
+                if *stored == RANGE.to_string()),
+            "{err}"
+        );
+        assert!(etc.line("passwd", "ik-bob").is_none());
+        assert_eq!(events(&f.pool).await.last().unwrap().0, "provision_failed");
+        // The original range still works.
+        f.prov
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap();
+    }
+
+    /// Review F6: the subtree is never handed over parent-first.
+    #[tokio::test]
+    async fn principal_dirs_are_all_0700() {
+        let f = fixture().await;
+        let a = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        for dir in [
+            f.prov.root().principal_dir(a.principal_id),
+            f.prov.root().principal_home(a.principal_id),
+            f.prov.root().principal_data(a.principal_id).join("tmp"),
+        ] {
+            assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        }
+    }
+
+    /// Over a map, never the process env: `setenv` racing the other tests'
+    /// `getenv` is UB in glibc (review F16).
+    #[test]
     fn bootstrap_env_is_captured_and_always_removed() {
-        // Env is process-global; this is the only test touching these vars.
-        std::env::set_var(BOOTSTRAP_ADMIN_ENV, "ada");
-        std::env::set_var(BOOTSTRAP_ADMIN_PASSWORD_ENV, PW);
-        let b = BootstrapAdmin::take_from_env().unwrap().unwrap();
+        use std::collections::HashMap;
+        use std::ffi::OsString;
+        let mut env: HashMap<String, OsString> = HashMap::from([
+            (BOOTSTRAP_ADMIN_ENV.to_string(), "ada".into()),
+            (BOOTSTRAP_ADMIN_PASSWORD_ENV.to_string(), PW.into()),
+            ("OTHER".to_string(), "kept".into()),
+        ]);
+        let b = BootstrapAdmin::take_from(&mut |k| env.remove(k))
+            .unwrap()
+            .unwrap();
         assert_eq!(b.username, "ada");
         assert_eq!(b.password.as_str(), PW);
-        assert!(std::env::var_os(BOOTSTRAP_ADMIN_ENV).is_none());
-        assert!(std::env::var_os(BOOTSTRAP_ADMIN_PASSWORD_ENV).is_none());
+        assert_eq!(env.keys().collect::<Vec<_>>(), ["OTHER"]);
 
-        std::env::set_var(BOOTSTRAP_ADMIN_PASSWORD_ENV, PW);
-        assert!(BootstrapAdmin::take_from_env().is_err());
-        assert!(std::env::var_os(BOOTSTRAP_ADMIN_PASSWORD_ENV).is_none());
-        assert!(BootstrapAdmin::take_from_env().unwrap().is_none());
+        env.insert(BOOTSTRAP_ADMIN_PASSWORD_ENV.to_string(), PW.into());
+        assert!(BootstrapAdmin::take_from(&mut |k| env.remove(k)).is_err());
+        assert!(!env.contains_key(BOOTSTRAP_ADMIN_PASSWORD_ENV));
+        assert!(BootstrapAdmin::take_from(&mut |k| env.remove(k))
+            .unwrap()
+            .is_none());
     }
 
     /// Real host provisioning. These need root (euid 0 with CAP_CHOWN /
@@ -1703,6 +1997,15 @@ mod tests {
             assert_eq!(pw.home, a.home);
             assert_eq!(pw.shell, Path::new(DEFAULT_SHELL));
             assert!(sys::group_gid_exists(a.unix_gid).unwrap());
+            // Review F5: no subordinate id range for a principal.
+            for file in ["/etc/subuid", "/etc/subgid"] {
+                if let Ok(text) = fs::read_to_string(file) {
+                    assert!(
+                        !text.lines().any(|l| l.starts_with("ik-t1root-ada:")),
+                        "{file}: {text}"
+                    );
+                }
+            }
 
             // §4 owners and modes; I-9 for the principal subtree.
             assert_owned(root.root(), 0, 0, 0o755);
