@@ -242,6 +242,34 @@ fn read_status(pid: i32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/status")).ok()
 }
 
+/// The nearest ancestor of this process (parent, grandparent, … up to pid 1)
+/// that runs as `uid`, if any. A uid-wide kill would take it down, and with
+/// it this process's session: `sudo adopt-t0` from a login of the very user
+/// being adopted would be cut off by its own kill (SIGHUP) half-way.
+pub(crate) fn ancestor_holding_uid(uid: u32) -> io::Result<Option<i32>> {
+    // SAFETY: getppid has no preconditions and cannot fail.
+    let mut pid = unsafe { libc::getppid() };
+    // Bounded: a pid chain can't be longer than the pid space, but a racing
+    // reparent must not loop us forever either.
+    for _ in 0..4096 {
+        if pid <= 1 {
+            return Ok(None);
+        }
+        let Some(status) = read_status(pid) else {
+            return Ok(None);
+        };
+        if status_holds_uid(&status, uid) {
+            return Ok(Some(pid));
+        }
+        pid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+    }
+    Ok(None)
+}
+
 /// Live processes of `uid`, from a pass over `/proc`.
 fn processes_of(uid: u32) -> io::Result<Vec<i32>> {
     let mut pids = Vec::new();
@@ -344,7 +372,7 @@ fn sweep_uid(uid: u32) -> Result<usize, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::executor::t1::tests::{principal, t1_root};
     use crate::executor::SessionExecutor;
@@ -410,7 +438,7 @@ mod tests {
         }
     }
 
-    fn test_helper() -> HelperCommand {
+    pub(crate) fn test_helper() -> HelperCommand {
         HelperCommand {
             program: std::env::current_exe().unwrap(),
             args: [

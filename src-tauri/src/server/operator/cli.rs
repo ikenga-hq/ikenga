@@ -264,7 +264,10 @@ pub(crate) async fn run_with(
             password,
         } => {
             // Everything about the old install is checked before an
-            // account is created, so a bad --from leaves nothing behind.
+            // account is created, so a bad --from or --home leaves nothing
+            // behind. A failure after that (in `migrate`) can leave the new
+            // account in place; re-running the same command then finds it
+            // and goes on (`--admin` included, when it is already admin).
             let pre = adopt_t0::preflight(prov.root(), &from, &home, &adopt_t0::stamp_now())?;
             let existing = {
                 let mut conn = pool.acquire().await?;
@@ -272,10 +275,10 @@ pub(crate) async fn run_with(
             };
             let account = match existing {
                 Some(a) => {
-                    if admin {
+                    if admin && !a.is_admin {
                         anyhow::bail!(
-                            "`{username}` already exists; --admin only applies when adopt-t0 \
-                             creates the account"
+                            "`{username}` already exists and is not an admin; --admin only \
+                             applies when adopt-t0 creates the account"
                         );
                     }
                     a
@@ -296,7 +299,8 @@ pub(crate) async fn run_with(
                     a
                 }
             };
-            let report = adopt_t0::migrate(prov.root(), prov.ownership(), &account, &pre).await?;
+            let report =
+                adopt_t0::migrate(prov.root(), prov.ownership(), &account, &pre, reaper).await?;
             write!(out, "{}", report.summary())?;
         }
         AccountsCommand::List { json } => {
@@ -609,19 +613,44 @@ mod tests {
         assert!(!data.join("access.db").exists(), "R-10");
         assert!(a.home.join(".codex/auth.json").exists());
 
-        // An existing account is never re-created, and --admin is refused.
-        let again = AccountsCommand::AdoptT0 {
-            username: "ada".into(),
+        // An existing account is never re-created. Re-running the same
+        // command (--admin included: ada is admin) finds it and goes on,
+        // without a password prompt; here it stops at the used data dir.
+        std::fs::create_dir_all(base.join("t0b")).unwrap();
+        std::fs::write(base.join("t0b/ikenga.db"), b"").unwrap();
+        let again = |username: &str| AccountsCommand::AdoptT0 {
+            username: username.into(),
             from: base.join("t0b"),
-            home,
+            home: home.clone(),
             admin: true,
             password: PasswordSource::Stdin,
         };
-        std::fs::create_dir_all(base.join("t0b")).unwrap();
-        std::fs::write(base.join("t0b/ikenga.db"), b"").unwrap();
-        let err = run_with(&prov, &pool, &NoReaper, again, &mut pw, &mut Vec::new())
+        let err = run_with(
+            &prov,
+            &pool,
+            &NoReaper,
+            again("ada"),
+            &mut pw,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("never run"), "{err}");
+        assert_eq!(prompted.get(), 1);
+        // --admin on an existing account that is not admin is refused.
+        prov.create(&pool, "bob", "correct horse battery", false, None)
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = run_with(
+            &prov,
+            &pool,
+            &NoReaper,
+            again("bob"),
+            &mut pw,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("--admin"), "{err}");
         // Unseal the archive for the tempdir cleanup.
         for e in std::fs::read_dir(&base).unwrap() {

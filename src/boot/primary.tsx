@@ -18,9 +18,9 @@ import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { startActionsStore } from '@/lib/actions/store';
 import { installKeyDispatcher, startOsShortcutSync } from '@/lib/keymap/dispatcher';
-import { getAuthToken, isTauri } from '@/lib/transport';
+import { detectBrowserTier, isTauri } from '@/lib/transport';
 import { useReauthStore } from '@/lib/transport/reauth-store';
-import { detectT1Server, fetchAuthMe } from '@/lib/transport/t1-session';
+import { fetchAuthMe } from '@/lib/transport/t1-session';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
 import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
@@ -54,14 +54,14 @@ export async function bootPrimary(): Promise<void> {
 		void import('@/lib/dev');
 	}
 
-	// WP-20 (G-PRINCIPAL §2.4): a browser tab with no bearer token may be on
-	// a T1 (multi-user) server, where people sign in with a username and
-	// password and the session cookie is the credential. Ask once, before
-	// anything reaches the transport. Desktop and token-holding T0 tabs never
-	// ask. Signed out: show only the sign-in dialog, since every RPC would
-	// 401. Signing in reloads the page into a normal boot.
-	// (`isTauri()` first: a desktop window never even reads the token.)
-	if (!isTauri() && getAuthToken() === null && (await detectT1Server())) {
+	// WP-20 (G-PRINCIPAL §2.4): a browser tab may be on a T1 (multi-user)
+	// server, where people sign in with a username and password and the
+	// session cookie is the credential. Ask once, before anything reaches the
+	// transport, whether or not the tab holds a T0 token: a tab left open
+	// across an adopt-t0 still has one, and under T1 it is dropped. Desktop
+	// windows never ask. Signed out: show only the sign-in dialog, since every
+	// RPC would 401. Signing in reloads the page into a normal boot.
+	if (await detectBrowserTier()) {
 		if (!(await fetchAuthMe())) {
 			installIkengaDomSync();
 			useReauthStore.getState().showReauth();

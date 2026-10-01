@@ -10,8 +10,10 @@
 //!   user). Its home is the T0 user's own home, so nothing in it moves and
 //!   paths under it stay valid. The data dir moves into
 //!   `principals/<id>/data/` by **rename** when it is on the same filesystem
-//!   and not a mount point ([`Mode::AdoptRename`]), else by copy + verify
-//!   ([`Mode::AdoptCopy`]).
+//!   and not a mount point ([`Mode::AdoptRename`]), else — or when that
+//!   rename fails with `EXDEV`/`EBUSY` (a bind mount) — by copy + verify
+//!   ([`Mode::AdoptCopy`]). Run it from a root session that is not a login
+//!   of the adopted user: that user's processes are all killed first.
 //! * **Copy** — root/Docker installs (root can't be adopted, I-1). The
 //!   account is a fresh, allocated principal (created by this command when
 //!   it doesn't exist yet). The data dir is copied + verified into
@@ -31,10 +33,17 @@
 //!   renamed), they are deleted from the source once the copy verifies. The
 //!   old `daemon.json` (it carries the T0 bearer token) is archived the same
 //!   way;
-//! * the principal's dir is held root-owned while the migration runs, so no
-//!   process of that uid can reach into it half-way;
+//! * the old dir and the principal's dir are both held root-owned `0700`
+//!   while the migration runs, and for an adopted user every process of
+//!   its uid is killed first (§7.3), so nothing of that uid can reach into
+//!   either half-way. Every walk root makes over the old tree goes through
+//!   held directory fds and never follows a symlink ([`super::safe_fs`]);
+//!   an adopted tree with a hard-linked file or a mount point inside is
+//!   refused before anything moves (review S4-1);
 //! * everything moved in is chowned to the principal and stripped of
 //!   group/other bits, then checked against **I-9**;
+//! * a failure after the data has moved still seals the archive and writes
+//!   a partial report, and the error names both;
 //! * a migration report lists what moved, what was rewritten, and every
 //!   `ikenga.db` column that still holds a path under the old home or old
 //!   data dir. Those are **not** rewritten (§11.2).
@@ -42,9 +51,11 @@
 //! Chi runs that were live under T0 are reconciled as `Unverified` by the
 //! existing sweep: the pid probe now runs as a different uid (§11.2).
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -53,6 +64,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection, Row};
 
 use super::accounts::Account;
+use super::provision::{ReapOutcome, UidReaper};
+use super::safe_fs::{self, Dir, Kind, Stat};
 use super::{OperatorRoot, Ownership, T0_MARKERS};
 
 /// The T0 access store (G-ACCESS §2.5). R-10: archived, never migrated.
@@ -165,6 +178,9 @@ pub struct MigrationReport {
     pub db_paths: Vec<DbPathHit>,
     pub db_scan_error: Option<String>,
     pub notes: Vec<String>,
+    /// Set when the migration failed after the data had moved: the report
+    /// is then partial (review S4-4).
+    pub error: Option<String>,
 }
 
 impl MigrationReport {
@@ -253,16 +269,46 @@ pub fn archive_path(from: &Path, stamp: &str) -> PathBuf {
 }
 
 /// The pid in `<from>/daemon.json`, if that process is alive. `Ok(None)`
-/// when there is no file or the pid is gone; an unreadable file is an error
-/// (we can't tell, so we refuse).
+/// when there is no file or the pid is gone; an unreadable file (or one
+/// that is not a regular file) is an error (we can't tell, so we refuse).
 pub fn t0_daemon_alive(from: &Path) -> anyhow::Result<Option<u32>> {
     let path = from.join("daemon.json");
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+        Ok(m) if !m.file_type().is_file() => {
+            anyhow::bail!("{} is not a regular file; remove it", path.display())
+        }
+        Ok(_) => {}
+    }
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
     };
-    let json: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+    daemon_pid_alive(&text, &path)
+}
+
+/// [`t0_daemon_alive`] through the held old dir.
+fn t0_daemon_alive_in(dir: &Dir, from: &Path) -> anyhow::Result<Option<u32>> {
+    let path = from.join("daemon.json");
+    let mut text = String::new();
+    match dir.open_file(os("daemon.json")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+        Ok((_, st)) if st.kind != Kind::File => {
+            anyhow::bail!("{} is not a regular file; remove it", path.display())
+        }
+        Ok((mut f, _)) => {
+            f.read_to_string(&mut text)
+                .with_context(|| format!("{}", path.display()))?;
+        }
+    }
+    daemon_pid_alive(&text, &path)
+}
+
+fn daemon_pid_alive(text: &str, path: &Path) -> anyhow::Result<Option<u32>> {
+    let json: serde_json::Value = serde_json::from_str(text).with_context(|| {
         format!(
             "{} is not JSON, so whether the T0 daemon still runs can't be told; stop it and \
              remove the file",
@@ -369,6 +415,13 @@ pub fn preflight(
 }
 
 // ─── filesystem helpers ─────────────────────────────────────────────────────
+//
+// Root walks trees that an adopted T0 user owned, so every walk below goes
+// through `safe_fs` (held directory fds, `O_NOFOLLOW`, changes made through
+// the fd that was checked) — never a path that a racing rename could turn
+// into a symlink (review S4-1). Plain paths are only used on the principal's
+// side, under `principals/<id>`, which is held root-owned for the whole
+// migration.
 
 fn mkdir_0700(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
@@ -383,49 +436,94 @@ fn is_cross_device(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::EBUSY))
 }
 
-/// Byte-for-byte equality.
-fn files_equal(a: &Path, b: &Path) -> io::Result<bool> {
-    let (mut fa, mut fb) = (File::open(a)?, File::open(b)?);
-    if fa.metadata()?.len() != fb.metadata()?.len() {
-        return Ok(false);
+fn os(name: &str) -> &OsStr {
+    OsStr::new(name)
+}
+
+fn other(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
+}
+
+/// Prefix an error with the path it is about.
+fn at_path(path: &Path) -> impl Fn(io::Error) -> io::Error + '_ {
+    move |e| io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+fn changed(path: &Path) -> io::Error {
+    other(format!(
+        "{}: changed while adopt-t0 was working on it",
+        path.display()
+    ))
+}
+
+fn hard_linked(path: &Path, nlink: u64) -> io::Error {
+    other(format!(
+        "{}: has {nlink} hard links, so it may also be named outside the tree; adopt-t0 \
+         won't carry or change it. Break the link (`cp -p f f.new && mv f.new f`) and run it \
+         again",
+        path.display()
+    ))
+}
+
+fn mount_inside(path: &Path) -> io::Error {
+    other(format!(
+        "{}: is a mount point; adopt-t0 doesn't cross into another filesystem",
+        path.display()
+    ))
+}
+
+/// Fill `buf` from `r` as far as it goes; `Ok(n < buf.len())` only at EOF.
+fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(n)
+}
+
+/// Byte-for-byte equality of two readers.
+fn readers_equal(a: &mut impl Read, b: &mut impl Read) -> io::Result<bool> {
     let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
-        let n = fa.read(&mut ba)?;
-        if n == 0 {
-            // Equal lengths: b must be at EOF too.
-            return Ok(fb.read(&mut bb[..1])? == 0);
-        }
-        fb.read_exact(&mut bb[..n])?;
-        if ba[..n] != bb[..n] {
+        let (n, m) = (read_full(a, &mut ba)?, read_full(b, &mut bb)?);
+        if n != m || ba[..n] != bb[..m] {
             return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
         }
     }
 }
 
-/// Copy one regular file to a new `dst` (never overwriting) and verify it.
-fn copy_file_verified(src: &Path, dst: &Path, src_mode: u32) -> io::Result<u64> {
+/// Copy the open regular file `src` to the new entry `dst_name` of `dst`
+/// (never overwriting, never through a symlink) and verify it. `at` names
+/// the source, for messages.
+fn copy_file_verified(
+    mut src: File,
+    src_st: &Stat,
+    dst: &Dir,
+    dst_name: &OsStr,
+    at: &Path,
+) -> io::Result<u64> {
     let bytes = {
-        let mut reader = File::open(src)?;
-        let mut writer = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dst)?;
-        let n = io::copy(&mut reader, &mut writer)?;
+        let mut writer = dst.create_file(dst_name, 0o600)?;
+        let n = io::copy(&mut src, &mut writer)?;
         writer.sync_all()?;
+        writer.set_permissions(fs::Permissions::from_mode((src_st.mode & 0o700) | 0o600))?;
         n
     };
-    fs::set_permissions(dst, fs::Permissions::from_mode((src_mode & 0o700) | 0o600))?;
-    if !files_equal(src, dst)? {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "verify failed: {} differs from {} after the copy",
-                dst.display(),
-                src.display()
-            ),
-        ));
+    src.seek(SeekFrom::Start(0))?;
+    let (mut back, back_st) = dst.open_file(dst_name)?;
+    if back_st.kind != Kind::File || !readers_equal(&mut src, &mut back)? {
+        return Err(other(format!(
+            "verify failed: the copy of {} differs from it",
+            at.display()
+        )));
     }
     Ok(bytes)
 }
@@ -437,155 +535,319 @@ struct CopyStats {
     special: Vec<String>,
 }
 
-/// Copy `src` to the new path `dst` without following symlinks (they are
-/// recreated as symlinks), verifying every file; skip `skip_top` names
-/// directly under `src`. Sockets, FIFOs and devices are listed, not copied.
-fn copy_tree(src: &Path, dst: &Path, skip_top: &[&str], stats: &mut CopyStats) -> io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
-    } else if ft.is_dir() {
-        mkdir_0700(dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if skip_top.iter().any(|s| name == **s) {
-                continue;
+/// Copy the entry `name` of `src` to the new entry `dst_name` of `dst`
+/// without following symlinks (they are recreated as symlinks), verifying
+/// every file. Sockets, FIFOs and devices are listed, not copied. With
+/// `refuse_links`, a file or symlink with a second hard link is an error:
+/// its content may be someone else's file. `at` is `src/name`, for
+/// messages.
+fn copy_entry(
+    src: &Dir,
+    name: &OsStr,
+    dst: &Dir,
+    dst_name: &OsStr,
+    at: &Path,
+    refuse_links: bool,
+    stats: &mut CopyStats,
+) -> io::Result<()> {
+    let st = src.stat_at(name).map_err(at_path(at))?;
+    match st.kind {
+        Kind::Symlink => {
+            if refuse_links && st.nlink > 1 {
+                return Err(hard_linked(at, st.nlink));
             }
-            copy_tree(&entry.path(), &dst.join(&name), &[], stats)?;
+            let target = src.read_link(name).map_err(at_path(at))?;
+            dst.symlink(&target, dst_name).map_err(at_path(at))?;
         }
-    } else if ft.is_file() {
-        stats.bytes += copy_file_verified(src, dst, meta.mode())?;
-        stats.files += 1;
-    } else {
-        stats.special.push(src.display().to_string());
+        Kind::Dir => {
+            let sub = src.open_dir(name).map_err(at_path(at))?;
+            if !sub.stat()?.same_inode(&st) {
+                return Err(changed(at));
+            }
+            let dsub = dst.mkdir(dst_name, 0o700).map_err(at_path(at))?;
+            copy_dir_contents(&sub, at, &dsub, &[], refuse_links, stats)?;
+        }
+        Kind::File => {
+            let (file, fst) = src.open_file(name).map_err(at_path(at))?;
+            if fst.kind != Kind::File || !fst.same_inode(&st) {
+                return Err(changed(at));
+            }
+            if refuse_links && fst.nlink > 1 {
+                return Err(hard_linked(at, fst.nlink));
+            }
+            stats.bytes +=
+                copy_file_verified(file, &fst, dst, dst_name, at).map_err(at_path(at))?;
+            stats.files += 1;
+        }
+        Kind::Other => stats.special.push(at.display().to_string()),
     }
     Ok(())
 }
 
-/// I-9 for a migrated tree: chown everything to `uid:gid` (`lchown`, never
-/// following a symlink) and strip group/other and set-id bits. Directories
-/// become `0700`.
-fn normalize_tree(path: &Path, uid: u32, gid: u32, ownership: Ownership) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(path)? {
-            normalize_tree(&entry?.path(), uid, gid, ownership)?;
+/// [`copy_entry`] for every entry of `src` except the `skip` names.
+fn copy_dir_contents(
+    src: &Dir,
+    at: &Path,
+    dst: &Dir,
+    skip: &[&str],
+    refuse_links: bool,
+    stats: &mut CopyStats,
+) -> io::Result<()> {
+    for name in src.entries().map_err(at_path(at))? {
+        if skip.iter().any(|s| name == **s) {
+            continue;
         }
-    }
-    if !meta.file_type().is_symlink() {
-        let mode = if meta.is_dir() {
-            0o700
-        } else {
-            (meta.mode() & 0o700) | 0o600
-        };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    if ownership == Ownership::Enforce {
-        std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+        copy_entry(src, &name, dst, &name, &at.join(&name), refuse_links, stats)?;
     }
     Ok(())
 }
 
-/// Make the archive (or an old dir left in place) read-only and root-only:
-/// directories `0500`, files lose every write and group/other bit, owner
-/// root under [`Ownership::Enforce`].
-fn seal_tree(path: &Path, ownership: Ownership) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(path)? {
-            seal_tree(&entry?.path(), ownership)?;
+/// Before anything moves: nothing inside the source is a mount point, and —
+/// with `refuse_links` (the tree is not root's) — no file or symlink in it
+/// has a second hard link. One line per problem.
+fn source_problems(
+    dir: &Dir,
+    at: &Path,
+    dev: u64,
+    refuse_links: bool,
+    out: &mut Vec<String>,
+) -> io::Result<()> {
+    for name in dir.entries().map_err(at_path(at))? {
+        let p = at.join(&name);
+        let st = dir.stat_at(&name).map_err(at_path(&p))?;
+        if st.dev != dev {
+            out.push(format!("{}: a mount point", p.display()));
+            continue;
+        }
+        match st.kind {
+            Kind::Dir => {
+                let sub = dir.open_dir(&name).map_err(at_path(&p))?;
+                source_problems(&sub, &p, dev, refuse_links, out)?;
+            }
+            Kind::File | Kind::Symlink if refuse_links && st.nlink > 1 => {
+                out.push(format!("{}: {} hard links", p.display(), st.nlink));
+            }
+            _ => {}
         }
     }
-    if ownership == Ownership::Enforce {
-        std::os::unix::fs::lchown(path, Some(0), Some(0))?;
+    Ok(())
+}
+
+/// I-9 for a migrated tree: everything under `dir` (itself included) is
+/// chowned to `owner` and stripped of group/other and set-id bits;
+/// directories become `0700`. Every change goes through the fd that was
+/// checked. It never crosses into another filesystem and never changes an
+/// entry with a second hard link (that would change its other names too):
+/// both are errors.
+fn normalize_tree(
+    dir: &Dir,
+    at: &Path,
+    owner: (u32, u32),
+    ownership: Ownership,
+    dev: u64,
+) -> io::Result<()> {
+    let enforce = ownership == Ownership::Enforce;
+    for name in dir.entries().map_err(at_path(at))? {
+        let p = at.join(&name);
+        let st = dir.stat_at(&name).map_err(at_path(&p))?;
+        if st.dev != dev {
+            return Err(mount_inside(&p));
+        }
+        if st.kind == Kind::Dir {
+            let sub = dir.open_dir(&name).map_err(at_path(&p))?;
+            if !sub.stat()?.same_inode(&st) {
+                return Err(changed(&p));
+            }
+            normalize_tree(&sub, &p, owner, ownership, dev)?;
+            continue;
+        }
+        let (fd, fst) = dir.open_path(&name).map_err(at_path(&p))?;
+        if !fst.same_inode(&st) {
+            return Err(changed(&p));
+        }
+        if fst.nlink > 1 {
+            return Err(hard_linked(&p, fst.nlink));
+        }
+        if fst.kind != Kind::Symlink {
+            safe_fs::chmod_fd(fd.as_raw_fd(), (fst.mode & 0o700) | 0o600).map_err(at_path(&p))?;
+        }
+        if enforce {
+            safe_fs::chown_fd(fd.as_raw_fd(), owner.0, owner.1).map_err(at_path(&p))?;
+        }
     }
-    if !meta.file_type().is_symlink() {
-        let mode = if meta.is_dir() {
-            0o500
-        } else {
-            (meta.mode() & 0o500) | 0o400
-        };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    dir.chmod(0o700).map_err(at_path(at))?;
+    if enforce {
+        dir.chown(owner.0, owner.1).map_err(at_path(at))?;
     }
     Ok(())
+}
+
+/// Make the contents of `dir` read-only and root-only, **top-down**: each
+/// directory is made root-owned `0500` before anything in it is touched;
+/// files lose every write and group/other bit, owner root under
+/// [`Ownership::Enforce`]. A mount point inside, or an entry with a second
+/// hard link, is left as it was and listed in `skipped` (sealing it would
+/// change what is mounted there, or the entry's other names).
+fn seal_contents(
+    dir: &Dir,
+    at: &Path,
+    ownership: Ownership,
+    dev: u64,
+    skipped: &mut Vec<String>,
+) -> io::Result<()> {
+    let enforce = ownership == Ownership::Enforce;
+    for name in dir.entries().map_err(at_path(at))? {
+        let p = at.join(&name);
+        let st = dir.stat_at(&name).map_err(at_path(&p))?;
+        if st.dev != dev {
+            skipped.push(format!("{}: a mount point, not sealed", p.display()));
+            continue;
+        }
+        if st.kind == Kind::Dir {
+            let sub = dir.open_dir(&name).map_err(at_path(&p))?;
+            if !sub.stat()?.same_inode(&st) {
+                return Err(changed(&p));
+            }
+            seal_tree(&sub, &p, ownership, dev, skipped)?;
+            continue;
+        }
+        let (fd, fst) = dir.open_path(&name).map_err(at_path(&p))?;
+        if !fst.same_inode(&st) {
+            return Err(changed(&p));
+        }
+        if fst.nlink > 1 {
+            skipped.push(format!(
+                "{}: {} hard links, not sealed",
+                p.display(),
+                fst.nlink
+            ));
+            continue;
+        }
+        if enforce {
+            safe_fs::chown_fd(fd.as_raw_fd(), 0, 0).map_err(at_path(&p))?;
+        }
+        if fst.kind != Kind::Symlink {
+            safe_fs::chmod_fd(fd.as_raw_fd(), (fst.mode & 0o500) | 0o400).map_err(at_path(&p))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`seal_contents`] of `dir`, after making `dir` itself root-owned `0500`
+/// (top-down: from then on no other uid can look anything up in it).
+fn seal_tree(
+    dir: &Dir,
+    at: &Path,
+    ownership: Ownership,
+    dev: u64,
+    skipped: &mut Vec<String>,
+) -> io::Result<()> {
+    if ownership == Ownership::Enforce {
+        dir.chown(0, 0).map_err(at_path(at))?;
+    }
+    dir.chmod(0o500).map_err(at_path(at))?;
+    seal_contents(dir, at, ownership, dev, skipped)
 }
 
 /// I-9: every path under `dir` (itself included) is owned by `uid:gid`
 /// (when `check_owner`) and carries no group/other or set-id bit. Returns
-/// one line per violation.
+/// one line per violation. Walks through fds, never following a symlink.
 pub fn i9_violations(dir: &Path, uid: u32, gid: u32, check_owner: bool) -> io::Result<Vec<String>> {
+    fn check(p: &Path, st: &Stat, uid: u32, gid: u32, check_owner: bool, out: &mut Vec<String>) {
+        if check_owner && (st.uid, st.gid) != (uid, gid) {
+            out.push(format!(
+                "{}: owned by {}:{}, not {uid}:{gid}",
+                p.display(),
+                st.uid,
+                st.gid
+            ));
+        }
+        if st.kind != Kind::Symlink && st.mode & 0o6077 != 0 {
+            out.push(format!(
+                "{}: mode {:o} has group/other or set-id bits",
+                p.display(),
+                st.mode
+            ));
+        }
+    }
     fn walk(
-        path: &Path,
+        dir: &Dir,
+        at: &Path,
         uid: u32,
         gid: u32,
         check_owner: bool,
         out: &mut Vec<String>,
     ) -> io::Result<()> {
-        let meta = fs::symlink_metadata(path)?;
-        if check_owner && (meta.uid(), meta.gid()) != (uid, gid) {
-            out.push(format!(
-                "{}: owned by {}:{}, not {uid}:{gid}",
-                path.display(),
-                meta.uid(),
-                meta.gid()
-            ));
-        }
-        if !meta.file_type().is_symlink() && meta.mode() & 0o6077 != 0 {
-            out.push(format!(
-                "{}: mode {:o} has group/other or set-id bits",
-                path.display(),
-                meta.mode() & 0o7777
-            ));
-        }
-        if meta.is_dir() {
-            for entry in fs::read_dir(path)? {
-                walk(&entry?.path(), uid, gid, check_owner, out)?;
+        for name in dir.entries().map_err(at_path(at))? {
+            let p = at.join(&name);
+            let st = dir.stat_at(&name).map_err(at_path(&p))?;
+            check(&p, &st, uid, gid, check_owner, out);
+            if st.kind == Kind::Dir {
+                let sub = dir.open_dir(&name).map_err(at_path(&p))?;
+                walk(&sub, &p, uid, gid, check_owner, out)?;
             }
         }
         Ok(())
     }
+    let canonical = fs::canonicalize(dir).map_err(at_path(dir))?;
+    let top = Dir::open_no_symlinks(&canonical)?;
     let mut out = Vec::new();
-    walk(dir, uid, gid, check_owner, &mut out)?;
+    check(&canonical, &top.stat()?, uid, gid, check_owner, &mut out);
+    walk(&top, &canonical, uid, gid, check_owner, &mut out)?;
     Ok(out)
 }
 
-/// Holds `<root>/principals/<id>` root-owned while the migration runs, so no
-/// process of the principal's uid can enter it (it is `0700`); hands it back
-/// on drop, success or not.
-struct PrincipalDirHold {
-    path: PathBuf,
-    uid: u32,
-    gid: u32,
+/// Holds a directory root-owned `0700` while the migration runs, so no
+/// process of another uid can start a lookup in it (one already inside
+/// through an open fd or cwd is what the uid-wide kill is for). On drop it
+/// gets back the owner and mode it had, unless [`Hold::release`]d because
+/// the directory was moved into place or archived.
+struct Hold {
+    dir: Dir,
+    restore: Option<(u32, u32, u32)>,
     ownership: Ownership,
+    path: PathBuf,
 }
 
-impl PrincipalDirHold {
-    fn take(path: &Path, uid: u32, gid: u32, ownership: Ownership) -> io::Result<Self> {
+impl Hold {
+    fn take(dir: Dir, path: &Path, ownership: Ownership) -> io::Result<Self> {
+        let st = dir.stat()?;
         if ownership == Ownership::Enforce {
-            std::os::unix::fs::lchown(path, Some(0), Some(0))?;
+            dir.chown(0, 0)?;
         }
+        dir.chmod(0o700)?;
         Ok(Self {
-            path: path.to_path_buf(),
-            uid,
-            gid,
+            dir,
+            restore: Some((st.uid, st.gid, st.mode)),
             ownership,
+            path: path.to_path_buf(),
         })
+    }
+
+    fn dir(&self) -> &Dir {
+        &self.dir
+    }
+
+    fn release(&mut self) {
+        self.restore = None;
     }
 }
 
-impl Drop for PrincipalDirHold {
+impl Drop for Hold {
     fn drop(&mut self) {
-        if self.ownership == Ownership::Enforce {
-            if let Err(e) = std::os::unix::fs::lchown(&self.path, Some(self.uid), Some(self.gid)) {
-                tracing::error!(
-                    "adopt-t0: could not hand {} back to {}:{}: {e}",
-                    self.path.display(),
-                    self.uid,
-                    self.gid
-                );
-            }
+        let Some((uid, gid, mode)) = self.restore else {
+            return;
+        };
+        let owner = if self.ownership == Ownership::Enforce {
+            self.dir.chown(uid, gid)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = owner.and_then(|()| self.dir.chmod(mode)) {
+            tracing::error!(
+                "adopt-t0: could not give {} back its owner {uid}:{gid} and mode {mode:o}: {e}",
+                self.path.display()
+            );
         }
     }
 }
@@ -613,7 +875,7 @@ fn require_fresh_data(data: &Path) -> anyhow::Result<()> {
 /// Remove the fresh (empty) `data/` so something can be renamed onto it.
 fn remove_fresh_data(data: &Path) -> io::Result<()> {
     let tmp = data.join("tmp");
-    if tmp.exists() {
+    if exists_no_follow(&tmp) {
         fs::remove_dir(&tmp)?;
     }
     fs::remove_dir(data)
@@ -632,25 +894,73 @@ fn restore_fresh_data(data: &Path, uid: u32, gid: u32, ownership: Ownership) {
     }
 }
 
-/// The archive-only files of `from` by copy (the archive is on another
-/// filesystem): copy, verify, and only then delete the source (R-10).
-fn archive_by_copy(from: &Path, archive: &Path) -> io::Result<Vec<String>> {
-    mkdir_0700(archive)?;
-    let mut moved = Vec::new();
+/// The old data dir, held open: its parent, its name there, the dir itself
+/// and what it was when opened.
+struct Source<'a> {
+    parent: &'a Dir,
+    name: &'a OsStr,
+    dir: &'a Dir,
+    st: Stat,
+    path: &'a Path,
+}
+
+/// The archive-only files of the source by copy (the archive is on another
+/// filesystem): copy and verify **all** of them first, and only then delete
+/// them from the source (R-10). A failed copy removes the half-made archive
+/// and leaves the source as it was. Returns the archive, the names moved,
+/// and notes for any source file that could not be removed afterwards.
+fn archive_by_copy(
+    src: &Source<'_>,
+    archive_name: &OsStr,
+    archive_path: &Path,
+    refuse_links: bool,
+) -> io::Result<(Dir, Vec<String>, Vec<String>)> {
+    let archive = src
+        .parent
+        .mkdir(archive_name, 0o700)
+        .map_err(at_path(archive_path))?;
+    let mut copied: Vec<&str> = Vec::new();
     for name in ARCHIVE_ONLY {
-        let src = from.join(name);
-        let Ok(meta) = fs::symlink_metadata(&src) else {
-            continue;
+        let at = src.path.join(name);
+        let result = match src.dir.try_stat_at(os(name)) {
+            Ok(None) => continue,
+            Ok(Some(st)) if !matches!(st.kind, Kind::File | Kind::Symlink) => {
+                Err(other(format!("{}: not a file", at.display())))
+            }
+            Ok(Some(_)) => copy_entry(
+                src.dir,
+                os(name),
+                &archive,
+                os(name),
+                &at,
+                refuse_links,
+                &mut CopyStats::default(),
+            ),
+            Err(e) => Err(at_path(&at)(e)),
         };
-        if meta.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(&src)?, archive.join(name))?;
-        } else {
-            copy_file_verified(&src, &archive.join(name), meta.mode())?;
+        if let Err(e) = result {
+            for done in copied.iter().chain([&name]) {
+                let _ = archive.unlink(os(done));
+            }
+            let _ = src.parent.rmdir(archive_name);
+            return Err(e);
         }
-        fs::remove_file(&src)?;
-        moved.push(name.to_string());
+        copied.push(name);
     }
-    Ok(moved)
+    let mut notes = Vec::new();
+    for name in &copied {
+        if let Err(e) = src.dir.unlink(os(name)) {
+            notes.push(format!(
+                "{name} is archived but could not be removed from {}: {e}; remove it by hand",
+                src.path.display()
+            ));
+        }
+    }
+    Ok((
+        archive,
+        copied.iter().map(|n| n.to_string()).collect(),
+        notes,
+    ))
 }
 
 // ─── fs_roots.json ──────────────────────────────────────────────────────────
@@ -710,9 +1020,54 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Every text column of every table in `db` holding a value under one of
-/// `prefixes` (`(label, path)`): equal to the path, or containing
+/// `SQLITE_DBCONFIG_DEFENSIVE` (sqlite3.h).
+const SQLITE_DBCONFIG_DEFENSIVE: libc::c_int = 1010;
+
+extern "C" {
+    // The bundled SQLite that sqlx links (libsqlite3-sys); declared here so
+    // the scan can turn on defensive mode without a direct dependency.
+    fn sqlite3_db_config(db: *mut libc::c_void, op: libc::c_int, ...) -> libc::c_int;
+}
+
+/// The files SQLite may open beside `ikenga.db`. All of them must be plain,
+/// singly-linked files (or absent) before root lets SQLite open the
+/// database: SQLite follows symlinks and opens `-shm` read-write.
+const DB_FILES: [&str; 4] = [
+    "ikenga.db",
+    "ikenga.db-wal",
+    "ikenga.db-shm",
+    "ikenga.db-journal",
+];
+
+/// Whether `data/ikenga.db` (and its companions) may be opened by root:
+/// `Ok(false)` when there is no database. An `Err` names what is wrong.
+fn db_files_safe(data: &Dir) -> Result<bool, String> {
+    let mut any = false;
+    for (i, name) in DB_FILES.iter().enumerate() {
+        match data.try_stat_at(os(name)) {
+            Ok(None) if i == 0 => return Ok(false),
+            Ok(None) => {}
+            Ok(Some(st)) if st.kind == Kind::File && st.nlink == 1 => any = true,
+            Ok(Some(_)) => {
+                return Err(format!(
+                    "{name} is not a plain, singly-linked file; the database was not opened"
+                ))
+            }
+            Err(e) => return Err(format!("{name}: {e}")),
+        }
+    }
+    Ok(any)
+}
+
+/// Every text column of every ordinary table in `db` holding a value under
+/// one of `prefixes` (`(label, path)`): equal to the path, or containing
 /// `<path>/` anywhere (JSON blobs included).
+///
+/// The database was written by the adopted uid and root opens it (review
+/// S4-5), so: read-only and `query_only`; `trusted_schema = OFF` (no SQL
+/// function from the schema runs — views, triggers, generated columns); and
+/// `SQLITE_DBCONFIG_DEFENSIVE`. Virtual tables (their module code would run)
+/// and hidden or generated columns are skipped.
 async fn scan_db_paths(
     db: &Path,
     prefixes: &[(&'static str, &Path)],
@@ -721,21 +1076,42 @@ async fn scan_db_paths(
         .filename(db)
         .read_only(true)
         .create_if_missing(false)
+        .foreign_keys(false)
+        .pragma("trusted_schema", "OFF")
+        .pragma("query_only", "ON")
         .connect()
         .await?;
+    {
+        let mut handle = conn.lock_handle().await?;
+        let raw = handle.as_raw_handle().as_ptr().cast::<libc::c_void>();
+        // SAFETY: a live connection handle, held locked; DEFENSIVE takes an
+        // int (1 = on) and an optional int* for the new setting.
+        let rc = unsafe {
+            sqlite3_db_config(
+                raw,
+                SQLITE_DBCONFIG_DEFENSIVE,
+                1 as libc::c_int,
+                std::ptr::null_mut::<libc::c_int>(),
+            )
+        };
+        if rc != 0 {
+            anyhow::bail!("could not enable SQLite defensive mode (rc {rc})");
+        }
+    }
     let tables: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
-         ORDER BY name",
+        "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table' AND name \
+         NOT LIKE 'sqlite_%' ORDER BY name",
     )
     .fetch_all(&mut conn)
     .await?;
     let mut hits = Vec::new();
     for table in tables {
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-                .bind(&table)
-                .fetch_all(&mut conn)
-                .await?;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0 ORDER BY cid",
+        )
+        .bind(&table)
+        .fetch_all(&mut conn)
+        .await?;
         for column in columns {
             for (under, prefix) in prefixes {
                 let exact = prefix.to_string_lossy().into_owned();
@@ -777,12 +1153,16 @@ async fn scan_db_paths(
 
 // ─── the migration ──────────────────────────────────────────────────────────
 
-fn dev_of(path: &Path) -> io::Result<u64> {
-    Ok(fs::metadata(path)?.dev())
-}
+/// The copy is built here, beside `data/`, then renamed onto it.
+const STAGING: &str = "data.t0-adopt";
 
-/// Pick the [`Mode`] for `account`.
-fn choose_mode(account: &Account, pre: &Preflight, principal_dir: &Path) -> anyhow::Result<Mode> {
+/// Pick the [`Mode`] for `account` from the `fstat`s of the held source,
+/// its parent and the principal's dir.
+fn choose_mode(
+    account: &Account,
+    pre: &Preflight,
+    (src, src_parent, principal_dir): (&Stat, &Stat, &Stat),
+) -> anyhow::Result<Mode> {
     if !account.adopted {
         return Ok(Mode::Copy);
     }
@@ -797,9 +1177,10 @@ fn choose_mode(account: &Account, pre: &Preflight, principal_dir: &Path) -> anyh
             pre.old_home.display()
         );
     }
-    let parent = pre.from.parent().unwrap_or(Path::new("/"));
-    let mount_point = dev_of(&pre.from)? != dev_of(parent)?;
-    let same_fs = dev_of(&pre.from)? == dev_of(principal_dir)?;
+    // Same st_dev isn't proof a rename works (a bind mount of the same
+    // filesystem shares it): `move_by_rename` falls back to a copy on EXDEV.
+    let mount_point = src.dev != src_parent.dev;
+    let same_fs = src.dev == principal_dir.dev;
     Ok(if same_fs && !mount_point {
         Mode::AdoptRename
     } else {
@@ -807,28 +1188,89 @@ fn choose_mode(account: &Account, pre: &Preflight, principal_dir: &Path) -> anyh
     })
 }
 
-/// [`Mode::AdoptRename`]: archive-only files to a new archive dir, then the
-/// whole old dir onto `data/` in one rename. Undone on failure.
-fn move_by_rename(
-    pre: &Preflight,
-    data: &Path,
-    (uid, gid, ownership): (u32, u32, Ownership),
+/// Adopt modes: stop every process of the adopted uid (§7.3's uid-wide
+/// kill) once both trees are held, so none is still inside the old dir
+/// through an open fd or cwd the holds can't revoke (review S4-1).
+fn stop_adopted_uid(
+    reaper: &dyn UidReaper,
+    account: &Account,
+    ownership: Ownership,
     report: &mut MigrationReport,
 ) -> anyhow::Result<()> {
-    mkdir_0700(&pre.archive).with_context(|| format!("{}", pre.archive.display()))?;
+    let uid = account.unix_uid;
+    if ownership == Ownership::Enforce {
+        if let Some(pid) = super::reaper::ancestor_holding_uid(uid)? {
+            anyhow::bail!(
+                "this command runs under process {pid} of uid {uid} ({}), the user being adopted. \
+                 adopt-t0 first kills every process of that uid, which would end this session \
+                 half-way. Run it from a root login, or outside this session: `sudo systemd-run \
+                 --wait --pipe --collect ikenga-server accounts adopt-t0 …`. Nothing was changed",
+                account.unix_name
+            );
+        }
+    }
+    match reaper.kill_all(&account.principal())? {
+        ReapOutcome::Killed => report.notes.push(format!(
+            "every process of uid {uid} was killed before the old dir was touched (§7.3)"
+        )),
+        ReapOutcome::Unavailable(why) if ownership != Ownership::Enforce => report.notes.push(
+            format!("the processes of uid {uid} were not stopped: {why}"),
+        ),
+        ReapOutcome::Unavailable(why) => {
+            anyhow::bail!("can't stop the processes of uid {uid} ({why}); nothing was moved")
+        }
+        ReapOutcome::Failed(why) => anyhow::bail!(
+            "could not stop every process of uid {uid}, which owns the old dir ({why}); nothing \
+             was moved"
+        ),
+    }
+    Ok(())
+}
+
+/// What [`move_by_rename`] did.
+enum Renamed {
+    /// Moved; the archive dir holds the archive-only files.
+    Done(Dir),
+    /// The rename crossed a mount (`EXDEV`/`EBUSY`): everything was undone.
+    CrossDevice(io::Error),
+}
+
+/// [`Mode::AdoptRename`]: archive-only files to a new archive dir, then the
+/// whole old dir onto `data/` in one rename. `Err` and
+/// [`Renamed::CrossDevice`] leave everything as it was.
+fn move_by_rename(
+    src: &Source<'_>,
+    pdir: &Dir,
+    data: &Path,
+    pre: &Preflight,
+    (uid, gid, ownership): (u32, u32, Ownership),
+    report: &mut MigrationReport,
+) -> anyhow::Result<Renamed> {
+    let archive_name = pre.archive.file_name().context("archive path")?;
+    let archive = src
+        .parent
+        .mkdir(archive_name, 0o700)
+        .with_context(|| format!("{}", pre.archive.display()))?;
     let mut moved: Vec<&str> = Vec::new();
     let undo = |moved: &[&str]| {
         for name in moved {
-            let _ = fs::rename(pre.archive.join(name), pre.from.join(name));
+            let _ = archive.rename(os(name), src.dir, os(name));
         }
-        let _ = fs::remove_dir(&pre.archive);
+        let _ = src.parent.rmdir(archive_name);
     };
     for name in ARCHIVE_ONLY {
-        if !exists_no_follow(&pre.from.join(name)) {
-            continue;
-        }
-        if let Err(e) = fs::rename(pre.from.join(name), pre.archive.join(name)) {
+        let step = match src.dir.try_stat_at(os(name)) {
+            Ok(None) => continue,
+            Ok(Some(_)) => src.dir.rename(os(name), &archive, os(name)),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = step {
             undo(&moved);
+            // The old dir is its own mount (a bind mount): nothing renames
+            // out of it.
+            if is_cross_device(&e) {
+                return Ok(Renamed::CrossDevice(e));
+            }
             return Err(e).with_context(|| format!("archiving {name}"));
         }
         moved.push(name);
@@ -838,11 +1280,21 @@ fn move_by_rename(
         undo(&moved);
         return Err(e).with_context(|| format!("{}", data.display()));
     }
-    if let Err(e) = fs::rename(&pre.from, data) {
+    if let Err(e) = src.parent.rename(src.name, pdir, os("data")) {
         restore_fresh_data(data, uid, gid, ownership);
         undo(&moved);
+        if is_cross_device(&e) {
+            return Ok(Renamed::CrossDevice(e));
+        }
         return Err(e)
             .with_context(|| format!("renaming {} onto {}", pre.from.display(), data.display()));
+    }
+    // What landed is the held dir, not something renamed into its place.
+    if !matches!(pdir.stat_at(os("data")), Ok(st) if st.same_inode(&src.st)) {
+        let _ = pdir.rename(os("data"), src.parent, src.name);
+        restore_fresh_data(data, uid, gid, ownership);
+        undo(&moved);
+        anyhow::bail!("{} was replaced during the migration", pre.from.display());
     }
     report.access_store_archived = moved
         .iter()
@@ -854,30 +1306,140 @@ fn move_by_rename(
         "the data dir was renamed into place; {} keeps only the files that never migrate",
         pre.archive.display()
     ));
+    Ok(Renamed::Done(archive))
+}
+
+/// Copy the [`HOME_ENTRIES`] of the old home into `new_home` (a fresh
+/// principal's). Symlinks are followed only in an old home owned by root
+/// (the root/Docker case, where a dot-dir may be a volume): elsewhere the
+/// home's owner could point one at anything root can read.
+fn copy_home_entries(
+    pre: &Preflight,
+    new_home: &Path,
+    created: &mut Vec<PathBuf>,
+    stats: &mut CopyStats,
+    report: &mut MigrationReport,
+) -> anyhow::Result<()> {
+    // Root's own home in production (this runs as root); the test user's
+    // in unprivileged tests.
+    let old_home_is_ours = Dir::open_no_symlinks(&pre.old_home)
+        .and_then(|d| d.stat())
+        .with_context(|| format!("{}", pre.old_home.display()))?
+        .uid
+        == super::sys::geteuid();
+    let home_canonical =
+        fs::canonicalize(new_home).with_context(|| format!("{}", new_home.display()))?;
+    for entry in HOME_ENTRIES {
+        let src_path = pre.old_home.join(entry);
+        if !exists_no_follow(&src_path) {
+            continue;
+        }
+        let dst_path = new_home.join(entry);
+        if exists_no_follow(&dst_path) {
+            report.home_entries_skipped.push(entry.to_string());
+            continue;
+        }
+        // A symlinked entry (Docker mounts `/root/.claude`) is copied as
+        // what it points at, not as the link — the link would point the
+        // principal at root's files.
+        let target = if old_home_is_ours {
+            let target =
+                fs::canonicalize(&src_path).with_context(|| format!("{}", src_path.display()))?;
+            if target != src_path {
+                report.notes.push(format!(
+                    "{} is a symlink; copied its target {}",
+                    src_path.display(),
+                    target.display()
+                ));
+            }
+            target
+        } else {
+            src_path.clone()
+        };
+        let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+            continue;
+        };
+        let not_followed = |why: String, report: &mut MigrationReport| {
+            report.notes.push(format!(
+                "{} was not copied: {why} (a symlink in a home root doesn't own is never \
+                 followed)",
+                src_path.display()
+            ))
+        };
+        let parent_dir = match Dir::open_no_symlinks(parent) {
+            Ok(dir) => dir,
+            Err(e) if !old_home_is_ours => {
+                not_followed(e.to_string(), report);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !old_home_is_ours && parent_dir.stat_at(name)?.kind == Kind::Symlink {
+            not_followed("it is a symlink".into(), report);
+            continue;
+        }
+        // `.local/share/app.ikenga`: create the missing parents, and
+        // remember the outermost one this run created.
+        let comps: Vec<&OsStr> = Path::new(entry).iter().collect();
+        let (last, parents) = comps.split_last().context("empty home entry")?;
+        let mut dst_dir = Dir::open_no_symlinks(&home_canonical)?;
+        let mut dst_at = home_canonical.clone();
+        let mut first_created = None;
+        for comp in parents {
+            dst_at.push(comp);
+            dst_dir = if dst_dir.try_stat_at(comp)?.is_some() {
+                dst_dir.open_dir(comp).map_err(at_path(&dst_at))?
+            } else {
+                let made = dst_dir.mkdir(comp, 0o700).map_err(at_path(&dst_at))?;
+                first_created.get_or_insert_with(|| {
+                    new_home.join(dst_at.strip_prefix(&home_canonical).unwrap_or(&dst_at))
+                });
+                made
+            };
+        }
+        let result = copy_entry(
+            &parent_dir,
+            name,
+            &dst_dir,
+            last,
+            &src_path,
+            !old_home_is_ours,
+            stats,
+        );
+        created.push(first_created.unwrap_or_else(|| dst_path.clone()));
+        result.with_context(|| format!("copying {}", src_path.display()))?;
+        report.home_entries_copied.push(entry.to_string());
+    }
     Ok(())
 }
 
 /// [`Mode::AdoptCopy`] / [`Mode::Copy`]: copy + verify into a staging dir
-/// beside `data/` (and, for a fresh principal, the home dot-dirs), archive
-/// the old dir, then swap the staging dir onto `data/`.
+/// beside `data/` (and, for a fresh principal, the home dot-dirs), then
+/// archive the old dir. `Err` leaves everything as it was. `Ok(None)`: the
+/// old dir itself became the archive; `Ok(Some(dir))`: the old dir is a
+/// mount point and stays (sealed) in place, `dir` is the new archive. The
+/// caller swaps the staging dir onto `data/` ([`swap_in_staging`]).
+#[allow(clippy::too_many_arguments)]
 fn move_by_copy(
-    pre: &Preflight,
+    src: &Source<'_>,
+    pdir: &Dir,
     principal_dir: &Path,
-    data: &Path,
     new_home: Option<&Path>,
-    (uid, gid, ownership): (u32, u32, Ownership),
+    pre: &Preflight,
+    refuse_links: bool,
+    ownership: Ownership,
     report: &mut MigrationReport,
-) -> anyhow::Result<()> {
-    let staging = principal_dir.join("data.t0-adopt");
-    if exists_no_follow(&staging) {
+) -> anyhow::Result<Option<Dir>> {
+    let staging_path = principal_dir.join(STAGING);
+    if exists_no_follow(&staging_path) {
         // A failed earlier run; the principal dir is held, nothing else wrote it.
-        fs::remove_dir_all(&staging)?;
+        fs::remove_dir_all(&staging_path)?;
     }
     let mut stats = CopyStats::default();
     // Top-level paths this run created in the new home, for the undo.
     let mut created_in_home: Vec<PathBuf> = Vec::new();
     let undo = |created: &[PathBuf]| {
-        let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_dir_all(&staging_path);
         for path in created {
             let _ = if fs::symlink_metadata(path)
                 .map(|m| m.is_dir())
@@ -890,92 +1452,65 @@ fn move_by_copy(
         }
     };
 
-    if let Err(e) = copy_tree(&pre.from, &staging, &ARCHIVE_ONLY, &mut stats) {
+    let copied = pdir
+        .mkdir(os(STAGING), 0o700)
+        .map_err(at_path(&staging_path))
+        .and_then(|staging| {
+            copy_dir_contents(
+                src.dir,
+                &pre.from,
+                &staging,
+                &ARCHIVE_ONLY,
+                refuse_links,
+                &mut stats,
+            )
+        });
+    if let Err(e) = copied {
         undo(&created_in_home);
         return Err(e).with_context(|| format!("copying {}", pre.from.display()));
     }
-
     if let Some(new_home) = new_home {
-        for entry in HOME_ENTRIES {
-            let src = pre.old_home.join(entry);
-            if !exists_no_follow(&src) {
-                continue;
-            }
-            let dst = new_home.join(entry);
-            if exists_no_follow(&dst) {
-                report.home_entries_skipped.push(entry.to_string());
-                continue;
-            }
-            // `.local/share/app.ikenga`: create the missing parents, and
-            // remember the outermost one this run created.
-            let mut first_created = None;
-            let mut parent = new_home.to_path_buf();
-            let rel = Path::new(entry);
-            let components: Vec<_> = rel.components().collect();
-            for comp in &components[..components.len().saturating_sub(1)] {
-                parent.push(comp);
-                if !exists_no_follow(&parent) {
-                    if let Err(e) = mkdir_0700(&parent) {
-                        undo(&created_in_home);
-                        return Err(e).with_context(|| format!("{}", parent.display()));
-                    }
-                    first_created.get_or_insert_with(|| parent.clone());
-                }
-            }
-            // A top-level entry may be a symlink to a volume (Docker mounts
-            // `/root/.claude`): copy what it points at, not the link — the
-            // link would point the principal at root's files.
-            let src = match fs::symlink_metadata(&src) {
-                Ok(m) if m.file_type().is_symlink() => match fs::canonicalize(&src) {
-                    Ok(target) => {
-                        report.notes.push(format!(
-                            "{} is a symlink; copied its target {}",
-                            src.display(),
-                            target.display()
-                        ));
-                        target
-                    }
-                    Err(_) => src,
-                },
-                _ => src,
-            };
-            let result = copy_tree(&src, &dst, &[], &mut stats);
-            created_in_home.push(first_created.unwrap_or_else(|| dst.clone()));
-            if let Err(e) = result {
-                undo(&created_in_home);
-                return Err(e).with_context(|| format!("copying {}", src.display()));
-            }
-            report.home_entries_copied.push(entry.to_string());
+        if let Err(e) = copy_home_entries(pre, new_home, &mut created_in_home, &mut stats, report) {
+            undo(&created_in_home);
+            return Err(e);
         }
     }
 
     // The archive: the old dir itself when it can be renamed.
-    match fs::rename(&pre.from, &pre.archive) {
+    let archive_name = pre.archive.file_name().context("archive path")?;
+    let archive = match src.parent.rename(src.name, src.parent, archive_name) {
         Ok(()) => {
+            if !matches!(src.parent.stat_at(archive_name), Ok(st) if st.same_inode(&src.st)) {
+                let _ = src.parent.rename(archive_name, src.parent, src.name);
+                undo(&created_in_home);
+                anyhow::bail!("{} was replaced during the migration", pre.from.display());
+            }
             report.archive_is_old_dir = true;
             report.access_store_archived = ACCESS_STORE_FILES
                 .iter()
-                .filter(|n| exists_no_follow(&pre.archive.join(n)))
+                .filter(|n| matches!(src.dir.try_stat_at(os(n)), Ok(Some(_))))
                 .map(|n| n.to_string())
                 .collect();
+            None
         }
         Err(e) if is_cross_device(&e) => {
             // A mount point (a Docker volume): it stays, read-only; the
             // archive-only files leave it by verified copy (R-10).
-            match archive_by_copy(&pre.from, &pre.archive) {
-                Ok(moved) => {
-                    report.access_store_archived = moved
-                        .into_iter()
-                        .filter(|n| ACCESS_STORE_FILES.contains(&n.as_str()))
-                        .collect();
-                }
-                Err(e) => {
-                    undo(&created_in_home);
-                    return Err(e).with_context(|| {
-                        format!("archiving the access store into {}", pre.archive.display())
-                    });
-                }
-            }
+            let (archive, moved, notes) =
+                match archive_by_copy(src, archive_name, &pre.archive, refuse_links) {
+                    Ok(done) => done,
+                    Err(e) => {
+                        undo(&created_in_home);
+                        return Err(e).with_context(|| {
+                            format!("archiving the access store into {}", pre.archive.display())
+                        });
+                    }
+                };
+            report.access_store_archived = moved
+                .into_iter()
+                .filter(|n| ACCESS_STORE_FILES.contains(&n.as_str()))
+                .collect();
+            report.notes.extend(notes);
             report.old_dir_left_in_place = true;
             report.notes.push(format!(
                 "{} could not be renamed (a mount point); it stays in place, read-only. The \
@@ -983,12 +1518,15 @@ fn move_by_copy(
                 pre.from.display(),
                 pre.archive.display()
             ));
-            if let Err(e) = seal_tree(&pre.from, ownership) {
+            let mut skipped = Vec::new();
+            if let Err(e) = seal_tree(src.dir, &pre.from, ownership, src.st.dev, &mut skipped) {
                 report.notes.push(format!(
                     "could not make {} read-only: {e}",
                     pre.from.display()
                 ));
             }
+            report.notes.extend(skipped);
+            Some(archive)
         }
         Err(e) => {
             undo(&created_in_home);
@@ -1000,33 +1538,189 @@ fn move_by_copy(
                 )
             });
         }
-    }
+    };
+    report.files_copied = stats.files;
+    report.bytes_copied = stats.bytes;
+    report.special_files_skipped = stats.special;
+    Ok(archive)
+}
 
-    if let Err(e) = remove_fresh_data(data).and_then(|()| fs::rename(&staging, data)) {
+/// After a copy: the staging dir onto `data/`.
+fn swap_in_staging(
+    pdir: &Dir,
+    principal_dir: &Path,
+    data: &Path,
+    pre: &Preflight,
+    (uid, gid, ownership): (u32, u32, Ownership),
+) -> anyhow::Result<()> {
+    if let Err(e) =
+        remove_fresh_data(data).and_then(|()| pdir.rename(os(STAGING), pdir, os("data")))
+    {
         restore_fresh_data(data, uid, gid, ownership);
         return Err(e).with_context(|| {
             format!(
                 "the copy is complete at {} and the old dir is archived at {}, but it could not \
                  be moved onto {}; move it by hand",
-                staging.display(),
+                principal_dir.join(STAGING).display(),
                 pre.archive.display(),
                 data.display()
             )
         });
     }
-    report.files_copied = stats.files;
-    report.bytes_copied = stats.bytes;
-    report.special_files_skipped = stats.special;
     Ok(())
 }
 
+/// `fs_roots.json` in the migrated data dir (§11.2), read and replaced
+/// through `data`'s fd.
+fn rewrite_fs_roots_in(
+    data: &Dir,
+    data_path: &Path,
+    pre: &Preflight,
+    new_home: Option<&Path>,
+    report: &mut MigrationReport,
+) -> anyhow::Result<()> {
+    const NAME: &str = "fs_roots.json";
+    const NEXT: &str = "fs_roots.json.t0-adopt";
+    let Some(st) = data.try_stat_at(os(NAME))? else {
+        return Ok(());
+    };
+    if st.kind != Kind::File || st.nlink != 1 {
+        report.notes.push(format!(
+            "{NAME} is not a plain, singly-linked file; not rewritten"
+        ));
+        return Ok(());
+    }
+    let mut text = String::new();
+    let read = data.open_file(os(NAME)).and_then(|(mut f, fst)| {
+        if !fst.same_inode(&st) {
+            return Err(changed(&data_path.join(NAME)));
+        }
+        f.read_to_string(&mut text)
+    });
+    if let Err(e) = read {
+        report.notes.push(format!("{NAME} was not rewritten: {e}"));
+        return Ok(());
+    }
+    match rewrite_fs_roots(&text, &pre.old_home, new_home, &pre.from) {
+        Ok(rw) => {
+            if let Some(next) = &rw.text {
+                let _ = data.unlink(os(NEXT));
+                let mut f = data.create_file(os(NEXT), 0o600)?;
+                f.write_all(next.as_bytes())?;
+                f.sync_all()?;
+                data.rename(os(NEXT), data, os(NAME))?;
+            }
+            report.fs_roots_rewritten = rw.rewritten;
+            report.fs_roots_under_old_data_dir = rw.under_old_data_dir;
+        }
+        Err(e) => report
+            .notes
+            .push(format!("{NAME} was not rewritten: {e:#}")),
+    }
+    Ok(())
+}
+
+/// Everything after the data has moved: the staging swap, `tmp/`,
+/// `fs_roots.json`, the `ikenga.db` scan and I-9's owners and modes. Runs
+/// under the principal-dir hold.
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    pdir: &Dir,
+    principal_dir: &Path,
+    data_path: &Path,
+    staged: bool,
+    new_home: Option<&Path>,
+    pre: &Preflight,
+    owner: (u32, u32, Ownership),
+    report: &mut MigrationReport,
+) -> anyhow::Result<()> {
+    let (uid, gid, ownership) = owner;
+    if staged {
+        swap_in_staging(pdir, principal_dir, data_path, pre, owner)?;
+    }
+    let data = pdir
+        .open_dir(os("data"))
+        .with_context(|| format!("{}", data_path.display()))?;
+    if data.try_stat_at(os("tmp"))?.is_none() {
+        data.mkdir(os("tmp"), 0o700)?;
+    }
+
+    rewrite_fs_roots_in(&data, data_path, pre, new_home, report)?;
+
+    match db_files_safe(&data) {
+        Ok(false) => {}
+        Err(why) => report.db_scan_error = Some(why),
+        Ok(true) => {
+            let mut prefixes: Vec<(&'static str, &Path)> =
+                vec![("old_data_dir", pre.from.as_path())];
+            if new_home.is_some() && pre.old_home != Path::new("/") {
+                prefixes.insert(0, ("old_home", pre.old_home.as_path()));
+            }
+            match scan_db_paths(&data_path.join("ikenga.db"), &prefixes).await {
+                Ok(hits) => report.db_paths = hits,
+                Err(e) => report.db_scan_error = Some(format!("{e:#}")),
+            }
+        }
+    }
+
+    // Owned by the principal, private (I-9) — including anything the scan
+    // above created as root (a `-shm`).
+    normalize_tree(&data, data_path, (uid, gid), ownership, data.stat()?.dev)?;
+    if let Some(home) = new_home {
+        let canonical = fs::canonicalize(home)?;
+        let dir = Dir::open_no_symlinks(&canonical)?;
+        let dev = dir.stat()?.dev;
+        normalize_tree(&dir, home, (uid, gid), ownership, dev)?;
+    }
+    Ok(())
+}
+
+/// The report into the archive (`0400`), then the archive sealed: its top
+/// dir is root-owned `0700` first, its contents sealed top-down, the report
+/// written, and the top made `0500` last.
+fn seal_archive(
+    archive: &Dir,
+    pre: &Preflight,
+    ownership: Ownership,
+    report: &mut MigrationReport,
+) -> io::Result<()> {
+    if ownership == Ownership::Enforce {
+        archive.chown(0, 0).map_err(at_path(&pre.archive))?;
+    }
+    archive.chmod(0o700).map_err(at_path(&pre.archive))?;
+    let mut skipped = Vec::new();
+    let sealed = archive
+        .stat()
+        .and_then(|st| seal_contents(archive, &pre.archive, ownership, st.dev, &mut skipped));
+    report.notes.extend(skipped);
+    if let Err(e) = &sealed {
+        report
+            .notes
+            .push(format!("the archive could not be fully sealed: {e}"));
+    }
+    let report_path = pre.archive.join(REPORT_FILE);
+    let json = serde_json::to_string_pretty(&*report).map_err(io::Error::other)?;
+    let written = archive
+        .create_file(os(REPORT_FILE), 0o400)
+        .and_then(|mut f| f.write_all(json.as_bytes()))
+        .map_err(at_path(&report_path));
+    let top = archive.chmod(0o500).map_err(at_path(&pre.archive));
+    sealed.and(written).and(top)
+}
+
 /// Migrate `pre.from` into `account`'s principal (see the module docs).
-/// `ownership` is [`Ownership::Enforce`] in production.
+/// `ownership` is [`Ownership::Enforce`] in production; `reaper` stops the
+/// adopted uid's processes (the CLI's is [`super::reaper::T1Reaper`]).
+///
+/// A failure before the data moves leaves everything as it was. A failure
+/// after it still seals the archive and writes the (partial) report, and
+/// the error names both (review S4-4).
 pub async fn migrate(
     root: &OperatorRoot,
     ownership: Ownership,
     account: &Account,
     pre: &Preflight,
+    reaper: &dyn UidReaper,
 ) -> anyhow::Result<MigrationReport> {
     if account.is_disabled() {
         anyhow::bail!("{} is disabled; enable it first", account.username);
@@ -1034,8 +1728,23 @@ pub async fn migrate(
     let id = account.principal_id;
     let (uid, gid) = (account.unix_uid, account.unix_gid);
     let principal_dir = root.principal_dir(id);
-    let data = root.principal_data(id);
-    let mode = choose_mode(account, pre, &principal_dir)?;
+    let data_path = root.principal_data(id);
+
+    // The old dir, opened without following a symlink anywhere: `pre.from`
+    // is canonical, so a symlink found on the way now was put there since.
+    let from_name = pre.from.file_name().context("--from has no name")?;
+    let from_parent = pre.from.parent().context("--from has no parent")?;
+    let src_parent =
+        Dir::open_no_symlinks(from_parent).with_context(|| format!("{}", from_parent.display()))?;
+    let src_dir = src_parent
+        .open_dir(from_name)
+        .with_context(|| format!("{}", pre.from.display()))?;
+    let src_st = src_dir.stat()?;
+    let pdir = Dir::open_no_symlinks(
+        &fs::canonicalize(&principal_dir)
+            .with_context(|| format!("{}", principal_dir.display()))?,
+    )?;
+    let mode = choose_mode(account, pre, (&src_st, &src_parent.stat()?, &pdir.stat()?))?;
     // Only a fresh principal's home is ours to fill; an adopted one keeps
     // the T0 user's own home, untouched.
     let new_home = (mode == Mode::Copy).then(|| account.home.clone());
@@ -1048,7 +1757,7 @@ pub async fn migrate(
         mode,
         from: pre.from.clone(),
         old_home: pre.old_home.clone(),
-        data_dir: data.clone(),
+        data_dir: data_path.clone(),
         home: account.home.clone(),
         archive: pre.archive.clone(),
         archive_is_old_dir: false,
@@ -1068,102 +1777,170 @@ pub async fn migrate(
              sweep (their pid is probed as a different uid now)"
                 .into(),
         ],
+        error: None,
     };
 
-    {
-        let _hold = PrincipalDirHold::take(&principal_dir, uid, gid, ownership)
-            .with_context(|| format!("{}", principal_dir.display()))?;
-        require_fresh_data(&data)?;
-        // Again, under the hold: the daemon may have been started since.
-        if let Some(pid) = t0_daemon_alive(&pre.from)? {
-            anyhow::bail!(
-                "the T0 daemon of {} is running again (pid {pid})",
-                pre.from.display()
-            );
-        }
-
-        match mode {
-            Mode::AdoptRename => move_by_rename(pre, &data, (uid, gid, ownership), &mut report)?,
-            Mode::AdoptCopy | Mode::Copy => move_by_copy(
-                pre,
-                &principal_dir,
-                &data,
-                new_home.as_deref(),
-                (uid, gid, ownership),
-                &mut report,
-            )?,
-        }
-        if !exists_no_follow(&data.join("tmp")) {
-            mkdir_0700(&data.join("tmp"))?;
-        }
-
-        let fs_roots = data.join("fs_roots.json");
-        if let Ok(text) = fs::read_to_string(&fs_roots) {
-            match rewrite_fs_roots(&text, &pre.old_home, new_home.as_deref(), &pre.from) {
-                Ok(rw) => {
-                    if let Some(next) = &rw.text {
-                        fs::write(&fs_roots, next)?;
-                    }
-                    report.fs_roots_rewritten = rw.rewritten;
-                    report.fs_roots_under_old_data_dir = rw.under_old_data_dir;
-                }
-                Err(e) => report
-                    .notes
-                    .push(format!("fs_roots.json was not rewritten: {e:#}")),
-            }
-        }
-
-        let db = data.join("ikenga.db");
-        if db.exists() {
-            let mut prefixes: Vec<(&'static str, &Path)> =
-                vec![("old_data_dir", pre.from.as_path())];
-            if new_home.is_some() && pre.old_home != Path::new("/") {
-                prefixes.insert(0, ("old_home", pre.old_home.as_path()));
-            }
-            match scan_db_paths(&db, &prefixes).await {
-                Ok(hits) => report.db_paths = hits,
-                Err(e) => report.db_scan_error = Some(format!("{e:#}")),
-            }
-        }
-
-        // Owned by the principal, private (I-9) — including anything the
-        // scan above created as root (a `-shm`).
-        normalize_tree(&data, uid, gid, ownership)?;
-        if let Some(home) = &new_home {
-            normalize_tree(home, uid, gid, ownership)?;
-        }
-    }
-
-    let violations = i9_violations(&principal_dir, uid, gid, ownership == Ownership::Enforce)?;
-    if !violations.is_empty() {
+    // Hold both trees root-owned 0700: from here no other uid can start a
+    // lookup in either. Then stop the adopted uid's processes, which may
+    // already be inside the old dir.
+    let mut src_hold = Hold::take(src_dir, &pre.from, ownership)
+        .with_context(|| format!("{}", pre.from.display()))?;
+    let principal_hold = Hold::take(pdir, &principal_dir, ownership)
+        .with_context(|| format!("{}", principal_dir.display()))?;
+    let src = Source {
+        parent: &src_parent,
+        name: from_name,
+        dir: src_hold.dir(),
+        st: src_st,
+        path: &pre.from,
+    };
+    require_fresh_data(&data_path)?;
+    // Again, under the hold: the daemon may have been started since.
+    if let Some(pid) = t0_daemon_alive_in(src.dir, &pre.from)? {
         anyhow::bail!(
-            "I-9 does not hold under {} after the migration:\n  {}",
-            principal_dir.display(),
-            violations.join("\n  ")
+            "the T0 daemon of {} is running again (pid {pid})",
+            pre.from.display()
+        );
+    }
+    if mode != Mode::Copy {
+        stop_adopted_uid(reaper, account, ownership, &mut report)?;
+    }
+    // A tree that isn't ours (root's, in production) may hold hard links to
+    // files outside it. Checked after the kill: nothing can add one now, and
+    // every later step re-checks the link count on the fd it changes.
+    let refuse_links = mode != Mode::Copy || src_st.uid != super::sys::geteuid();
+    let mut problems = Vec::new();
+    source_problems(src.dir, &pre.from, src_st.dev, refuse_links, &mut problems)?;
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "{} can't be migrated as it is; nothing was moved:\n  {}\nUnmount (or move out) a \
+             mount point inside it. A hard-linked file may also be named outside the tree, so \
+             root won't carry or chown it: break the link (`cp -p f f.new && mv f.new f`) first",
+            pre.from.display(),
+            problems.join("\n  ")
         );
     }
 
+    let owner = (uid, gid, ownership);
+    let pdir = principal_hold.dir();
+    let (archive, staged) = match mode {
+        Mode::AdoptRename => match move_by_rename(&src, pdir, &data_path, pre, owner, &mut report)?
+        {
+            Renamed::Done(archive) => (Some(archive), false),
+            Renamed::CrossDevice(e) => {
+                // Same st_dev, but another mount (a bind mount): copy (S4-3).
+                report.mode = Mode::AdoptCopy;
+                report.notes.push(format!(
+                    "{} could not be renamed into place ({e}: another mount of the same \
+                     filesystem?), so it was copied instead",
+                    pre.from.display()
+                ));
+                let archive = move_by_copy(
+                    &src,
+                    pdir,
+                    &principal_dir,
+                    None,
+                    pre,
+                    refuse_links,
+                    ownership,
+                    &mut report,
+                )?;
+                (archive, true)
+            }
+        },
+        Mode::AdoptCopy | Mode::Copy => {
+            let archive = move_by_copy(
+                &src,
+                pdir,
+                &principal_dir,
+                new_home.as_deref(),
+                pre,
+                refuse_links,
+                ownership,
+                &mut report,
+            )?;
+            (archive, true)
+        }
+    };
+    // The data has moved: the old dir is data/, the archive, or sealed in
+    // place. From here a failure still seals the archive and writes the
+    // report.
+    src_hold.release();
+
+    let mut outcome = finish(
+        pdir,
+        &principal_dir,
+        &data_path,
+        staged,
+        new_home.as_deref(),
+        pre,
+        owner,
+        &mut report,
+    )
+    .await;
+    // Hand the principal's dir back before checking I-9 over it.
+    drop(principal_hold);
+    if outcome.is_ok() {
+        outcome = i9_violations(&principal_dir, uid, gid, ownership == Ownership::Enforce)
+            .map_err(anyhow::Error::from)
+            .and_then(|violations| {
+                if violations.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "I-9 does not hold under {} after the migration:\n  {}",
+                        principal_dir.display(),
+                        violations.join("\n  ")
+                    ))
+                }
+            });
+    }
+    report.error = outcome.as_ref().err().map(|e| format!("{e:#}"));
+
+    let archive_dir = archive.as_ref().unwrap_or(src_hold.dir());
+    let sealed = seal_archive(archive_dir, pre, ownership, &mut report);
     let report_path = pre.archive.join(REPORT_FILE);
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .open(&report_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(serde_json::to_string_pretty(&report)?.as_bytes())
-        })
-        .with_context(|| format!("{}", report_path.display()))?;
-    seal_tree(&pre.archive, ownership)
-        .with_context(|| format!("sealing {}", pre.archive.display()))?;
-    Ok(report)
+    match (outcome, sealed) {
+        (Ok(()), Ok(())) => Ok(report),
+        (Ok(()), Err(e)) => Err(anyhow::Error::from(e).context(format!(
+            "the data was migrated into {}, but the archive {} could not be sealed and its \
+             report {} may be missing; make the archive root-only and read-only by hand",
+            data_path.display(),
+            pre.archive.display(),
+            report_path.display()
+        ))),
+        (Err(e), sealed) => Err(e.context(format!(
+            "adopt-t0 failed after the T0 data had moved into {}: the old dir is archived at {} \
+             ({}) and the partial report is {}. Finish by hand from the report; running \
+             adopt-t0 again won't (the principal is no longer fresh)",
+            data_path.display(),
+            pre.archive.display(),
+            match &sealed {
+                Ok(()) => "sealed".to_string(),
+                Err(se) => format!("NOT sealed: {se}"),
+            },
+            report_path.display()
+        ))),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::PrincipalId;
+    use crate::executor::{Principal, PrincipalId};
+    use crate::server::operator::provision::NoReaper;
     use crate::server::operator::test_support;
+    use std::os::unix::fs::MetadataExt;
+
+    /// Records the uids it is asked to kill; kills nothing.
+    #[derive(Default)]
+    struct CountingReaper(std::sync::Mutex<Vec<u32>>);
+    impl UidReaper for CountingReaper {
+        fn kill_all(&self, p: &Principal) -> anyhow::Result<ReapOutcome> {
+            self.0.lock().unwrap().push(p.uid);
+            Ok(ReapOutcome::Killed)
+        }
+    }
 
     fn mode_of(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o7777
@@ -1416,10 +2193,15 @@ mod tests {
         fs::write(volume.join("oauth"), "gemini login").unwrap();
         std::os::unix::fs::symlink(&volume, home.join(".gemini")).unwrap();
         let pre = preflight(&root, &from, &home, "20261001T000001Z").unwrap();
-        let report = migrate(&root, Ownership::SkipForTests, &account, &pre)
+        let reaper = CountingReaper::default();
+        let report = migrate(&root, Ownership::SkipForTests, &account, &pre, &reaper)
             .await
             .unwrap();
         assert_eq!(report.mode, Mode::Copy);
+        assert!(
+            reaper.0.lock().unwrap().is_empty(),
+            "a fresh principal's uid owns nothing of the old dir: no kill"
+        );
 
         let data = root.principal_data(account.principal_id);
         let new_home = root.principal_home(account.principal_id);
@@ -1516,10 +2298,13 @@ mod tests {
         let account = principal(&root, Some(&home));
         let pre = preflight(&root, &from, &home, "20261001T000002Z").unwrap();
         let ino = fs::metadata(&from).unwrap().ino();
-        let report = migrate(&root, Ownership::SkipForTests, &account, &pre)
+        let reaper = CountingReaper::default();
+        let report = migrate(&root, Ownership::SkipForTests, &account, &pre, &reaper)
             .await
             .unwrap();
         assert_eq!(report.mode, Mode::AdoptRename);
+        // S4-1: the adopted uid's processes were stopped first.
+        assert_eq!(*reaper.0.lock().unwrap(), [account.unix_uid]);
         let data = root.principal_data(account.principal_id);
         assert_eq!(
             fs::metadata(&data).unwrap().ino(),
@@ -1573,7 +2358,7 @@ mod tests {
         let elsewhere = tmp.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         let wrong_home = principal(&root, Some(&elsewhere));
-        let err = migrate(&root, Ownership::SkipForTests, &wrong_home, &pre)
+        let err = migrate(&root, Ownership::SkipForTests, &wrong_home, &pre, &NoReaper)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--home must name it"), "{err}");
@@ -1584,16 +2369,18 @@ mod tests {
             b"",
         )
         .unwrap();
-        let err = migrate(&root, Ownership::SkipForTests, &used, &pre)
+        let err = migrate(&root, Ownership::SkipForTests, &used, &pre, &NoReaper)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("never run"), "{err}");
 
         let mut disabled = principal(&root, None);
         disabled.disabled_at = Some(1);
-        assert!(migrate(&root, Ownership::SkipForTests, &disabled, &pre)
-            .await
-            .is_err());
+        assert!(
+            migrate(&root, Ownership::SkipForTests, &disabled, &pre, &NoReaper)
+                .await
+                .is_err()
+        );
         // Nothing moved.
         assert!(from.join("ikenga.db").exists() && from.join("access.db").exists());
         assert!(!pre.archive.exists());
@@ -1617,9 +2404,11 @@ mod tests {
             fs::Permissions::from_mode(0o000),
         )
         .unwrap();
-        assert!(migrate(&root, Ownership::SkipForTests, &account, &pre)
-            .await
-            .is_err());
+        assert!(
+            migrate(&root, Ownership::SkipForTests, &account, &pre, &NoReaper)
+                .await
+                .is_err()
+        );
         let data = root.principal_data(account.principal_id);
         require_fresh_data(&data).unwrap();
         let new_home = root.principal_home(account.principal_id);
@@ -1631,40 +2420,200 @@ mod tests {
         assert!(from.join("access.db").exists() && !pre.archive.exists());
     }
 
-    /// R-10's copy branch: copied, verified, and only then removed from the
-    /// source.
+    /// R-10's copy branch: copied and verified — all of it — and only then
+    /// removed from the source. A failed copy leaves the source as it was.
     #[test]
     fn archive_by_copy_deletes_the_source_after_verifying() {
         let tmp = tempfile::tempdir().unwrap();
-        let from = tmp.path().join("from");
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let from = base.join("from");
         fs::create_dir(&from).unwrap();
         fs::write(from.join("access.db"), "chain").unwrap();
         fs::write(from.join("access.db-wal"), "wal").unwrap();
         fs::write(from.join("ikenga.db"), "stays").unwrap();
-        let archive = tmp.path().join("archive");
-        let moved = archive_by_copy(&from, &archive).unwrap();
+        let parent = Dir::open_no_symlinks(&base).unwrap();
+        let dir = parent.open_dir(os("from")).unwrap();
+        let src = Source {
+            parent: &parent,
+            name: os("from"),
+            dir: &dir,
+            st: dir.stat().unwrap(),
+            path: &from,
+        };
+        let archive = base.join("archive");
+        let (_, moved, notes) = archive_by_copy(&src, os("archive"), &archive, true).unwrap();
         assert_eq!(moved, ["access.db", "access.db-wal"]);
+        assert!(notes.is_empty());
         assert_eq!(
             fs::read_to_string(archive.join("access.db")).unwrap(),
             "chain"
         );
         assert!(!from.join("access.db").exists() && !from.join("access.db-wal").exists());
         assert!(from.join("ikenga.db").exists());
+
+        // The second file fails (a hard link): the first is not deleted
+        // from the source, and no half archive is left.
+        fs::write(from.join("access.db"), "chain").unwrap();
+        fs::write(from.join("access.db-wal"), "wal").unwrap();
+        fs::hard_link(from.join("access.db-wal"), base.join("elsewhere")).unwrap();
+        let err = archive_by_copy(&src, os("archive2"), &base.join("archive2"), true).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        assert!(from.join("access.db").exists() && from.join("access.db-wal").exists());
+        assert!(!base.join("archive2").exists());
     }
 
     #[test]
-    fn files_equal_compares_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
-        fs::write(&a, vec![1u8; 70_000]).unwrap();
-        fs::write(&b, vec![1u8; 70_000]).unwrap();
-        assert!(files_equal(&a, &b).unwrap());
+    fn readers_equal_compares_bytes() {
+        let eq = |a: &[u8], b: &[u8]| readers_equal(&mut &a[..], &mut &b[..]).unwrap();
+        assert!(eq(&[1u8; 70_000], &[1u8; 70_000]));
         let mut other = vec![1u8; 70_000];
         other[69_999] = 2;
-        fs::write(&b, other).unwrap();
-        assert!(!files_equal(&a, &b).unwrap());
-        fs::write(&b, vec![1u8; 10]).unwrap();
-        assert!(!files_equal(&a, &b).unwrap());
+        assert!(!eq(&[1u8; 70_000], &other));
+        assert!(!eq(&[1u8; 70_000], &[1u8; 10]));
+        assert!(eq(&[], &[]));
+    }
+
+    /// S4-1: a file in an adopted tree with a second hard link may be
+    /// someone else's (`ln /etc/shadow data-t0/x`): refused before anything
+    /// moves, and the hold on the old dir is given back.
+    #[tokio::test]
+    async fn an_adopted_tree_with_a_hard_link_is_refused_before_anything_moves() {
+        let (tmp, root) = test_support::temp_root();
+        let (from, home) = t0_install(tmp.path()).await;
+        let outside = from.parent().unwrap().join("outside");
+        fs::write(&outside, "not the principal's").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&outside, from.join("chi-cache/x")).unwrap();
+        let from_mode = mode_of(&from);
+        let account = principal(&root, Some(&home));
+        let pre = preflight(&root, &from, &home, "20261001T000005Z").unwrap();
+        let err = migrate(&root, Ownership::SkipForTests, &account, &pre, &NoReaper)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("hard links") && msg.contains("nothing was moved"),
+            "{msg}"
+        );
+        assert_eq!(mode_of(&outside), 0o644);
+        assert_eq!(mode_of(&from), from_mode, "the hold was given back");
+        assert!(from.join("access.db").exists() && !pre.archive.exists());
+        require_fresh_data(&root.principal_data(account.principal_id)).unwrap();
+    }
+
+    /// S4-1: symlinks in an adopted tree are moved as links; nothing they
+    /// point at is chmodded, chowned or copied, even a directory link.
+    #[tokio::test]
+    async fn symlinks_in_a_migrated_tree_are_never_followed() {
+        for adopted in [true, false] {
+            let (tmp, root) = test_support::temp_root();
+            let (from, home) = t0_install(tmp.path()).await;
+            let base = from.parent().unwrap().to_path_buf();
+            let (secret, secret_dir) = (base.join("secret"), base.join("secret-dir"));
+            fs::write(&secret, "root's").unwrap();
+            fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::create_dir(&secret_dir).unwrap();
+            fs::write(secret_dir.join("inner"), "root's too").unwrap();
+            fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink(&secret, from.join("chi-cache/to-file")).unwrap();
+            std::os::unix::fs::symlink(&secret_dir, from.join("to-dir")).unwrap();
+            let account = principal(&root, adopted.then_some(home.as_path()));
+            let pre = preflight(&root, &from, &home, "20261001T000006Z").unwrap();
+            let report = migrate(&root, Ownership::SkipForTests, &account, &pre, &NoReaper)
+                .await
+                .unwrap();
+            assert_eq!(report.mode == Mode::AdoptRename, adopted);
+            let data = root.principal_data(account.principal_id);
+            for link in ["chi-cache/to-file", "to-dir"] {
+                assert!(fs::symlink_metadata(data.join(link))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+            }
+            assert_eq!(mode_of(&secret), 0o644);
+            assert_eq!(mode_of(&secret_dir), 0o755);
+            assert_eq!(mode_of(&secret_dir.join("inner")) & 0o044, 0o044);
+            fs::set_permissions(&pre.archive, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// S4-4: a failure after the data has moved still writes the (partial)
+    /// report and seals the archive, and the error names both.
+    #[tokio::test]
+    async fn a_failure_after_the_move_still_seals_the_archive_and_reports() {
+        let (tmp, root) = test_support::temp_root();
+        let (from, home) = t0_install(tmp.path()).await;
+        // fs_roots.json is rewritten (copy mode) through a temp name; a
+        // non-empty dir already there makes that fail after the data moved.
+        fs::create_dir_all(from.join("fs_roots.json.t0-adopt/x")).unwrap();
+        let account = principal(&root, None);
+        let pre = preflight(&root, &from, &home, "20261001T000007Z").unwrap();
+        let err = migrate(&root, Ownership::SkipForTests, &account, &pre, &NoReaper)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("after the T0 data had moved"), "{msg}");
+        assert!(
+            msg.contains("(sealed)") && msg.contains(REPORT_FILE),
+            "{msg}"
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(pre.archive.join(REPORT_FILE)).unwrap())
+                .unwrap();
+        assert!(written["error"].as_str().is_some(), "{written}");
+        assert_eq!(mode_of(&pre.archive), 0o500);
+        assert_eq!(mode_of(&pre.archive.join("access.db")) & 0o222, 0);
+        fs::set_permissions(&pre.archive, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// S4-5: the scan never reads virtual tables (their module would run)
+    /// or generated columns, and a database whose files aren't plain,
+    /// singly-linked files is not opened at all.
+    #[tokio::test]
+    async fn the_db_scan_skips_virtual_tables_and_generated_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let db = base.join("ikenga.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Delete)
+            .connect()
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, p TEXT, g TEXT GENERATED ALWAYS AS \
+             (p || '/gen') VIRTUAL)",
+            "INSERT INTO t (p) VALUES ('/old/data/a')",
+            "CREATE VIRTUAL TABLE v USING fts5(p)",
+            "INSERT INTO v (p) VALUES ('/old/data/b')",
+        ] {
+            sqlx::query(sql).execute(&mut conn).await.unwrap();
+        }
+        conn.close().await.unwrap();
+        let hits = scan_db_paths(&db, &[("old_data_dir", Path::new("/old/data"))])
+            .await
+            .unwrap();
+        let cols: Vec<_> = hits
+            .iter()
+            .map(|h| (h.table.as_str(), h.column.as_str()))
+            .collect();
+        assert_eq!(cols, [("t", "p")], "{hits:?}");
+
+        let dir = Dir::open_no_symlinks(&base).unwrap();
+        assert_eq!(db_files_safe(&dir), Ok(true));
+        std::os::unix::fs::symlink("/etc/passwd", base.join("ikenga.db-shm")).unwrap();
+        assert!(db_files_safe(&dir).unwrap_err().contains("ikenga.db-shm"));
+        fs::remove_file(base.join("ikenga.db-shm")).unwrap();
+        fs::hard_link(&db, base.join("other")).unwrap();
+        assert!(db_files_safe(&dir).is_err());
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            db_files_safe(
+                &Dir::open_no_symlinks(&fs::canonicalize(empty.path()).unwrap()).unwrap()
+            ),
+            Ok(false)
+        );
     }
 
     /// The I-9 checker itself: modes everywhere, owners when asked.
@@ -1726,6 +2675,53 @@ mod tests {
             (tmp, root)
         }
 
+        /// The real §7.3 kill, through the lib test binary's helper entry.
+        fn reaper(root: &OperatorRoot) -> crate::server::operator::reaper::T1Reaper {
+            crate::server::operator::reaper::T1Reaper::new(
+                root,
+                crate::server::operator::reaper::tests::test_helper(),
+            )
+        }
+
+        /// A host user `name` (uid = gid = `uid`) whose T0 install is
+        /// `t0_install`'s, owned by it as a non-root T0 daemon would leave it,
+        /// adopted by a new account.
+        async fn adopted_install(
+            name: &'static str,
+            uid: u32,
+            uids: (u32, u32),
+        ) -> (tempfile::TempDir, OperatorRoot, PathBuf, PathBuf, Account) {
+            let (tmp, root) = enforced_root();
+            let (from, home) = t0_install(tmp.path()).await;
+            crate::server::operator::etc_files::EtcFiles::system()
+                .add_user(&crate::server::operator::etc_files::NewUser {
+                    name,
+                    uid,
+                    gid: uid,
+                    gecos: "t1root",
+                    home: &home,
+                    shell: Path::new("/bin/sh"),
+                    own_group: true,
+                })
+                .unwrap();
+            chown_tree(&from, uid);
+            chown_tree(&home, uid);
+            let prov = Provisioner::new(
+                root.clone(),
+                UidRange::new(uids.0, uids.1).unwrap(),
+                ProvisioningMode::Auto,
+                Actor::Cli,
+            );
+            let pool = open_accounts(&root, Opener::Cli).await.unwrap();
+            let username = name.trim_start_matches("ik-");
+            let a = prov
+                .create(&pool, username, PW, false, Some(Adopt::user(name)))
+                .await
+                .unwrap();
+            pool.close().await;
+            (tmp, root, from, home, a)
+        }
+
         fn owner_mode(path: &Path) -> (u32, u32, u32) {
             let m = fs::symlink_metadata(path).unwrap();
             (m.uid(), m.gid(), m.mode() & 0o7777)
@@ -1759,7 +2755,9 @@ mod tests {
                 .create(&pool, "t1root-ado", PW, true, None)
                 .await
                 .unwrap();
-            let report = migrate(&root, Ownership::Enforce, &a, &pre).await.unwrap();
+            let report = migrate(&root, Ownership::Enforce, &a, &pre, &NoReaper)
+                .await
+                .unwrap();
             assert_eq!(report.mode, Mode::Copy);
 
             let pdir = root.principal_dir(a.principal_id);
@@ -1821,7 +2819,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(a.adopted);
-            let report = migrate(&root, Ownership::Enforce, &a, &pre).await.unwrap();
+            let report = migrate(&root, Ownership::Enforce, &a, &pre, &reaper(&root))
+                .await
+                .unwrap();
             assert_eq!(report.mode, Mode::AdoptRename);
             let pdir = root.principal_dir(a.principal_id);
             let v = i9_violations(&pdir, uid, uid, true).unwrap();
@@ -1831,6 +2831,124 @@ mod tests {
             assert_eq!(owner_mode(&pre.archive.join("daemon.json")).0, 0);
             // The adopted home is untouched (still the user's, still 0755-ish).
             assert_eq!(owner_mode(&home.join("Documents/private")).0, uid);
+        }
+
+        /// S4-1 under root: a process of the adopted uid already inside the
+        /// old dir (cwd held there) is killed before the tree is touched; a
+        /// hard link to a root-owned file outside is refused before anything
+        /// moves; nothing outside the tree changes owner or mode.
+        #[tokio::test]
+        #[ignore = "t1-root"]
+        async fn t1_root_adopt_t0_kills_the_uid_and_never_touches_what_is_outside() {
+            require_root();
+            let name = "ik-t1root-race";
+            let _cleanup = HostUser(name);
+            let uid = 28_100;
+            let (_tmp, root, from, home, a) = adopted_install(name, uid, (28_101, 28_109)).await;
+            let victim = from.parent().unwrap().join("victim");
+            fs::write(&victim, "root's").unwrap();
+            fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+            let exec = crate::executor::t1::T1Executor::new(crate::executor::t1::tests::config());
+            let sleeper = || {
+                use crate::executor::SessionExecutor;
+                let mut spec = crate::executor::SpawnSpec::new("/bin/sh");
+                spec.arg("-c")
+                    .arg("exec sleep 300")
+                    .current_dir(from.join("chi-cache"))
+                    .principal(Some(a.principal()));
+                let mut opts = crate::executor::t1::tests::piped();
+                opts.detached = true;
+                exec.spawn_piped(spec, opts).unwrap()
+            };
+            let killed = |mut child: tokio::process::Child| async move {
+                use std::os::unix::process::ExitStatusExt;
+                let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+                    .await
+                    .expect("the uid's process was killed")
+                    .unwrap();
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+            };
+
+            // A hard link to a root-owned file: refused, nothing moved.
+            fs::hard_link(&victim, from.join("chi-cache/shadow")).unwrap();
+            let from_before = owner_mode(&from);
+            let child = sleeper();
+            let pre = preflight(&root, &from, &home, "20261001T000012Z").unwrap();
+            let err = migrate(&root, Ownership::Enforce, &a, &pre, &reaper(&root))
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("hard links"), "{err:#}");
+            killed(child).await;
+            assert_eq!(owner_mode(&victim), (0, 0, 0o644));
+            assert_eq!(owner_mode(&from), from_before, "the hold was given back");
+            assert!(!pre.archive.exists());
+
+            // Without it: the process inside is killed, the rename lands,
+            // and the file outside is still root's.
+            fs::remove_file(from.join("chi-cache/shadow")).unwrap();
+            let child = sleeper();
+            let pre = preflight(&root, &from, &home, "20261001T000013Z").unwrap();
+            let report = migrate(&root, Ownership::Enforce, &a, &pre, &reaper(&root))
+                .await
+                .unwrap();
+            killed(child).await;
+            assert_eq!(report.mode, Mode::AdoptRename);
+            assert!(report.notes.iter().any(|n| n.contains("was killed")));
+            assert_eq!(owner_mode(&victim), (0, 0, 0o644));
+            let pdir = root.principal_dir(a.principal_id);
+            let v = i9_violations(&pdir, uid, uid, true).unwrap();
+            assert!(v.is_empty(), "I-9: {v:#?}");
+        }
+
+        /// S4-3: a bind mount of the same filesystem shares its st_dev, so
+        /// the rename is tried and fails (EBUSY/EXDEV); the migration falls
+        /// back to a copy instead of failing.
+        #[tokio::test]
+        #[ignore = "t1-root"]
+        async fn t1_root_adopt_t0_falls_back_to_a_copy_across_a_bind_mount() {
+            require_root();
+            let name = "ik-t1root-bind";
+            let _cleanup = HostUser(name);
+            let uid = 28_110;
+            let (_tmp, root, from, home, a) = adopted_install(name, uid, (28_111, 28_119)).await;
+            let mounted = std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(&from)
+                .arg(&from)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !mounted {
+                eprintln!("skipped: mount --bind is not permitted here");
+                return;
+            }
+            struct Umount(PathBuf);
+            impl Drop for Umount {
+                fn drop(&mut self) {
+                    let _ = std::process::Command::new("umount").arg(&self.0).status();
+                }
+            }
+            let _umount = Umount(from.clone());
+            let pre = preflight(&root, &from, &home, "20261001T000014Z").unwrap();
+            let report = migrate(&root, Ownership::Enforce, &a, &pre, &reaper(&root))
+                .await
+                .unwrap();
+            assert_eq!(report.mode, Mode::AdoptCopy);
+            assert!(report.old_dir_left_in_place, "{report:?}");
+            assert!(report.notes.iter().any(|n| n.contains("copied instead")));
+            let data = root.principal_data(a.principal_id);
+            assert_eq!(
+                fs::read(data.join("chi-cache/run.json")).unwrap(),
+                vec![7u8; 200_000]
+            );
+            for f in ARCHIVE_ONLY {
+                assert!(!data.join(f).exists(), "R-10: {f}");
+                assert!(!from.join(f).exists(), "{f} left the old dir");
+                assert!(pre.archive.join(f).exists(), "{f} archived");
+            }
+            let v = i9_violations(&root.principal_dir(a.principal_id), uid, uid, true).unwrap();
+            assert!(v.is_empty(), "I-9: {v:#?}");
+            assert_eq!(owner_mode(&from), (0, 0, 0o500), "left in place, sealed");
         }
     }
 }

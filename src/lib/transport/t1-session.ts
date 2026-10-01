@@ -8,10 +8,10 @@
  * appends `?token=`. The broker would ignore one anyway (I-6).
  *
  * The tier is read once at boot from the unauthenticated `/api/health`
- * (`executor.tier`), and only for a browser tab with no token (see
- * `boot/primary.tsx`). A desktop window (Tauri) never asks, and a
- * T0 tab opened from its `?token=` link never asks. Both keep exactly the
- * behaviour they had before.
+ * (`executor.tier`), by every browser tab, token or not (`detectBrowserTier`
+ * in `./index.ts`, called from `boot/primary.tsx`); under T1 any T0 token
+ * the tab holds is dropped. A desktop window (Tauri) never asks, and a T0
+ * tab behaves exactly as before.
  *
  * This module has no imports, so the boot path can load it before the
  * transport picks a backend.

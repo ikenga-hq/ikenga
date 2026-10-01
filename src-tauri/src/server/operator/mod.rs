@@ -32,6 +32,8 @@
 //! * [`reaper`] — the §7.3 uid-wide kill through the T1 executor.
 //! * [`adopt_t0`] — `accounts adopt-t0`, the §11.2 T0 → T1 migration (and
 //!   G-ACCESS R-10's archiving of the T0 access store).
+//! * [`safe_fs`] — fd-relative, never-follow-a-symlink walks for root over
+//!   trees another uid controls (used by [`adopt_t0`]).
 
 pub mod accounts;
 pub mod adopt_t0;
@@ -43,6 +45,7 @@ pub mod password;
 pub mod probe;
 pub mod provision;
 pub mod reaper;
+mod safe_fs;
 mod sys;
 
 use std::fs;

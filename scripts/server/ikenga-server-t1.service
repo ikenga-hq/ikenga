@@ -62,7 +62,10 @@ EnvironmentFile=-/opt/ikenga/.env
 # their parent is gone within a second and shut down on their own (draining
 # their PTYs — terminals don't survive a restart by design, ADR-023 D5), and
 # the detached runners keep going; the next broker's children pick their
-# status files back up. The cost: any other orphan a principal left running
+# status files back up. Until an old child is gone (~1 s plus its drain) it
+# still holds its principal's <data>/.lock (I-3), so that principal's first
+# request to the new broker inside that window fails once ("the principal
+# child exited before it was ready"); the next one starts the child. The cost: any other orphan a principal left running
 # (e.g. `nohup … &` in a terminal) survives a restart too. To stop
 # everything, `systemctl kill --kill-who=all ikenga-server-t1` or disable the
 # account (§7.3 kills every process of its uid).
@@ -102,7 +105,9 @@ RestrictRealtime=true
 LockPersonality=true
 # Writable: the operator root, and /etc for provisioning (§7.2, §8 step 7).
 #
-# §8 names /etc/{passwd,group,shadow,gshadow} rather than /etc. That is not
+# DEVIATION from G-PRINCIPAL §8 "Deploy consequence", pending a
+# remote-access Round that records it as a §14 amendment: §8 names
+# /etc/{passwd,group,shadow,gshadow} rather than /etc. That is not
 # enough in practice: both provisioning backends replace those files by
 # writing `<file>+` (built-in writer) or `<file>.lock`/`<file>-` (useradd)
 # NEXT TO them and renaming over them, and lckpwdf(3) creates

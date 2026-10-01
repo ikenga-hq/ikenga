@@ -148,7 +148,9 @@ pub enum AccountsCommand {
     /// home stays. Otherwise (root/Docker) the account is created here as a
     /// fresh principal, and the data dir plus the old home's engine and app
     /// dot-dirs are copied in. The old dir is kept, read-only, as
-    /// `<old>.t0-migrated-<ts>`, together with its access store.
+    /// `<old>.t0-migrated-<ts>`, together with its access store. For an
+    /// adopted user, every process of its uid is killed first: run this
+    /// from a root session that is not a login of that user.
     #[command(name = "adopt-t0")]
     AdoptT0 {
         username: String,
@@ -158,7 +160,8 @@ pub enum AccountsCommand {
         /// The home the T0 daemon ran with (`/root` for Docker).
         #[arg(long, value_name = "OLD_HOME")]
         home: PathBuf,
-        /// When adopt-t0 creates the account: make it an admin.
+        /// When adopt-t0 creates the account: make it an admin. Accepted
+        /// on a re-run when the account already exists and is an admin.
         #[arg(long)]
         admin: bool,
         #[command(flatten)]
