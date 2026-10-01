@@ -40,23 +40,119 @@ mod in_process;
 mod tier;
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use portable_pty::{Child as PtyProcess, MasterPty, PtySize, SlavePty};
+use serde::{Deserialize, Serialize};
 
 pub use in_process::InProcessExecutor;
 pub use tier::{probe, Capabilities, ExecutorTier, ParseTierError, Refusal};
 
-/// The identity a spawn runs *as*. Reserved: T0 ignores it (everything runs as
-/// the host process's own user). T1 maps it to a per-user Unix uid, T2/T3 to a
-/// per-session sandbox. Carried on every [`SpawnSpec`] now so the call sites
-/// don't have to change shape again when a tier that honours it lands.
+/// A principal's stable id (G-PRINCIPAL §1): an opaque **UUIDv7**, minted once
+/// when the account is created and never reused, even after the account is
+/// disabled. Distinct from the username (mutable, human-facing) and from the
+/// uid (a host attribute a restored host may renumber).
+///
+/// Wire form (`Display`, `FromStr`, serde) is the lowercase hyphenated
+/// 36-char string. Parsing is strict: anything else — upper case, braces, the
+/// simple/URN forms, or a UUID of any other version — is rejected, so one id
+/// has exactly one spelling wherever it is used as a key (WP-21 secrets,
+/// WP-22 OIDC links, G-ACCESS roles/devices/audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PrincipalId(uuid::Uuid);
+
+impl PrincipalId {
+    /// Mint a fresh id. Time-ordered (v7), so the `accounts` PK index stays
+    /// append-mostly.
+    pub fn new_v7() -> Self {
+        PrincipalId(uuid::Uuid::now_v7())
+    }
+
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+/// A string that is not a lowercase hyphenated UUIDv7.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePrincipalIdError(pub String);
+
+impl fmt::Display for ParsePrincipalIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` is not a principal id (expected a lowercase hyphenated UUIDv7)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParsePrincipalIdError {}
+
+impl FromStr for PrincipalId {
+    type Err = ParsePrincipalIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParsePrincipalIdError(s.to_string());
+        // `Uuid::parse_str` also accepts upper case, braces, URN and simple
+        // forms; the canonical spelling is the only one a key may have.
+        if s.len() != 36 || s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(err());
+        }
+        let uuid = uuid::Uuid::try_parse(s).map_err(|_| err())?;
+        if uuid.get_version() != Some(uuid::Version::SortRand) {
+            return Err(err());
+        }
+        Ok(PrincipalId(uuid))
+    }
+}
+
+impl fmt::Display for PrincipalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Hyphenated`'s Display is lowercase.
+        fmt::Display::fmt(&self.0.hyphenated(), f)
+    }
+}
+
+impl Serialize for PrincipalId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PrincipalId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The identity a spawn runs *as* (G-PRINCIPAL §1). T0 ignores it (everything
+/// runs as the host process's own user, and T0 never constructs one). T1 maps
+/// it to its Unix uid; T2/T3 to a per-session sandbox.
+///
+/// A `Principal` is **fully resolved before any spawn** (§9.1): the caller
+/// reads it from `operator/accounts.db`, and the executor never reads the
+/// accounts DB, NSS or `/etc/passwd` on the spawn path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
-    /// Opaque principal id. Its meaning is the executor's business.
-    pub id: String,
+    pub id: PrincipalId,
+    /// Login name (display); mutable; NOT used for any path or key.
+    pub username: String,
+    /// passwd name; immutable once provisioned (§7.2).
+    pub unix_name: String,
+    /// Never 0; inside the operator's uid range unless adopted (§11.2).
+    pub uid: u32,
+    /// User-private group; == uid for allocated accounts.
+    pub gid: u32,
+    /// Absolute; the passwd home (§4).
+    pub home: PathBuf,
+    /// passwd shell; `/bin/sh` when the operator sets none.
+    pub shell: PathBuf,
 }
 
 /// How the child's environment is assembled. Applied in order: when `clear`
@@ -311,6 +407,45 @@ mod tests {
         );
         assert_eq!(spec.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(spec.principal, None);
+    }
+
+    #[test]
+    fn principal_id_round_trips_its_canonical_spelling() {
+        let id = PrincipalId::new_v7();
+        let s = id.to_string();
+        assert_eq!(s.len(), 36);
+        assert_eq!(s, s.to_lowercase());
+        assert_eq!(s.parse::<PrincipalId>(), Ok(id));
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{s}\""));
+        assert_eq!(serde_json::from_str::<PrincipalId>(&json).unwrap(), id);
+    }
+
+    #[test]
+    fn principal_id_parse_rejects_every_other_spelling_and_version() {
+        let id = PrincipalId::new_v7().to_string();
+        let v4 = uuid::Uuid::new_v4().hyphenated().to_string();
+        for bad in [
+            id.to_uppercase(),
+            format!("{{{id}}}"),
+            format!("urn:uuid:{id}"),
+            id.replace('-', ""),
+            v4,
+            String::new(),
+            "not-a-uuid".into(),
+        ] {
+            assert!(bad.parse::<PrincipalId>().is_err(), "{bad} must not parse");
+        }
+        assert!(serde_json::from_str::<PrincipalId>("\"nope\"").is_err());
+    }
+
+    #[test]
+    fn principal_ids_are_time_ordered() {
+        let a = PrincipalId::new_v7();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = PrincipalId::new_v7();
+        assert!(a < b);
+        assert!(a.to_string() < b.to_string());
     }
 
     #[test]

@@ -3217,6 +3217,7 @@ dependencies = [
  "clap",
  "ikenga-desktop",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
