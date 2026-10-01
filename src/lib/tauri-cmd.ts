@@ -48,7 +48,10 @@ export interface PtySpawnOpts {
 }
 
 export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
-	return invoke<string>('pty_spawn', {
+	// Tauri's `pty_spawn` returns the bare id. The daemon's `/api/rpc` arm returns
+	// `{ pty_id }`. Unwrap both, or a browser session builds `/ws/pty/[object Object]`,
+	// attaches to nothing, and the terminal sits on "spawning" forever.
+	const res = await invoke<string | { pty_id: string }>('pty_spawn', {
 		terminalId: opts.terminalId ?? null,
 		title: opts.title ?? null,
 		cwd: opts.cwd,
@@ -58,6 +61,7 @@ export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
 		cols: opts.cols ?? 80,
 		settingsPath: opts.settingsPath ?? null,
 	});
+	return typeof res === 'string' ? res : res.pty_id;
 }
 
 export async function ptyWrite(id: string, data: string): Promise<void> {

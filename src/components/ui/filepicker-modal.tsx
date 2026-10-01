@@ -22,17 +22,40 @@ export function FilepickerModal() {
 	const [selectedIndex, setSelectedIndex] = useState<number>(0);
 	const [loading, setLoading] = useState<boolean>(false);
 	const [error, setError] = useState<string | null>(null);
+	// The folders the daemon will let this session list (its fs allowlist).
+	const [roots, setRoots] = useState<string[]>([]);
 
-	// Initial directory load
-	useEffect(() => {
-		if (options.defaultPath) {
-			setCurrentDir(options.defaultPath);
-		} else {
-			setCurrentDir('.');
+	const fetchRoots = useCallback(async (): Promise<string[]> => {
+		try {
+			const r = await getTransport().invoke<string[]>('fs_roots_list', {});
+			const list = Array.isArray(r) ? r : [];
+			setRoots(list);
+			return list;
+		} catch {
+			return [];
 		}
+	}, []);
+
+	// Initial directory load. With no `defaultPath` the picker used to start at `.`, which on
+	// a headless daemon is the daemon's own working directory, never on the allowlist, so it
+	// opened on an error with no way out. Start in the first allowed folder instead.
+	useEffect(() => {
 		setQuery('');
 		setSelectedIndex(0);
-	}, [activeRequest?.id, options.defaultPath]);
+		if (options.defaultPath) {
+			setCurrentDir(options.defaultPath);
+			return;
+		}
+		let cancelled = false;
+		setCurrentDir(''); // resolving; the listing effect waits for a real path
+		void (async () => {
+			const list = await fetchRoots();
+			if (!cancelled) setCurrentDir(list[0] ?? '.');
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [activeRequest?.id, options.defaultPath, fetchRoots]);
 
 	// Fetch directory contents
 	const loadDirectory = useCallback(async (dirPath: string) => {
@@ -57,14 +80,17 @@ export function FilepickerModal() {
 			// the user has no way to tell that the listing failed.
 			console.warn('[filepicker-modal] failed to list dir:', err);
 			setEntries([]);
-			setError(err instanceof Error ? err.message : String(err));
+			const message = err instanceof Error ? err.message : String(err);
+			setError(message);
+			// Outside the allowlist: learn where we may go so the error can offer it.
+			if (message.includes('outside allowlist')) void fetchRoots();
 		} finally {
 			setLoading(false);
 		}
-	}, []);
+	}, [fetchRoots]);
 
 	useEffect(() => {
-		if (isPicker) {
+		if (isPicker && currentDir) {
 			loadDirectory(currentDir);
 		}
 	}, [isPicker, currentDir, loadDirectory]);
@@ -174,6 +200,22 @@ export function FilepickerModal() {
 							data-testid="filepicker-error"
 						>
 							Could not list this directory — {error}
+							{roots.length > 0 && (
+								<div className="mt-3 flex flex-col items-center gap-1.5">
+									<span className="text-[var(--fg-faint)]">Folders you can open:</span>
+									{roots.map((r) => (
+										<button
+											key={r}
+											type="button"
+											data-testid="filepicker-root"
+											onClick={() => loadDirectory(r)}
+											className="cursor-pointer rounded border border-[var(--border)] px-2.5 py-1 text-[var(--fg)] hover:bg-[var(--bg-raised)]"
+										>
+											{r}
+										</button>
+									))}
+								</div>
+							)}
 						</div>
 					) : filteredEntries.length === 0 ? (
 						<div className="p-4 text-center font-mono text-[12px] text-[var(--fg-faint)]">

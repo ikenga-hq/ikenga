@@ -1,8 +1,20 @@
 import { create } from 'zustand';
 
+/**
+ * Why the dialog is open. `expired`: this tab had a token and the daemon
+ * refused it (it restarted and minted a new one). `first-visit`: this tab has
+ * never had one, so there is nothing to have expired.
+ *
+ * T1 (multi-user, docs/remote/principal-contract.md §2.4) adds a
+ * username/password mode to this same dialog, chosen from the tier that
+ * `/api/health` reports. Keep new sign-in modes here; don't add a second overlay.
+ */
+export type ReauthReason = 'expired' | 'first-visit';
+
 interface ReauthStore {
 	isOpen: boolean;
-	showReauth: () => void;
+	reason: ReauthReason;
+	showReauth: (reason?: ReauthReason) => void;
 	hideReauth: () => void;
 	tokenInput: string;
 	setTokenInput: (val: string) => void;
@@ -13,9 +25,10 @@ interface ReauthStore {
 
 export const useReauthStore = create<ReauthStore>((set) => ({
 	isOpen: false,
+	reason: 'expired',
 	tokenInput: '',
 	errorMsg: null,
-	showReauth: () => set({ isOpen: true, errorMsg: null }),
+	showReauth: (reason = 'expired') => set({ isOpen: true, reason, errorMsg: null }),
 	hideReauth: () => set({ isOpen: false, errorMsg: null }),
 	setTokenInput: (val) => set({ tokenInput: val }),
 	setErrorMsg: (msg) => set({ errorMsg: msg }),

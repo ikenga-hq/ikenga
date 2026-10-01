@@ -480,7 +480,9 @@ mod router_tests {
         let d = daemon();
         let r = &d.router;
         let sib = s(&d.root.join("sibling.txt"));
-        assert_eq!(ok(r, "fs_read", json!({ "path": sib })).await, "hello");
+        // The desktop's FileReadResult: the bytes of "hello", and a MIME.
+        let read = ok(r, "fs_read", json!({ "path": sib })).await;
+        assert_eq!(read["bytes"], json!([104, 101, 108, 108, 111]));
         assert_eq!(ok(r, "fs_exists", json!({ "path": sib })).await, true);
         assert_eq!(ok(r, "fs_kind", json!({ "path": sib })).await, "file");
         assert_eq!(ok(r, "fs_mime", json!({ "path": sib })).await, "text/plain");
