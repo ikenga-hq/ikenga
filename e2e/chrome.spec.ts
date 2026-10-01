@@ -107,7 +107,7 @@ test.describe('frame chrome (WP-09)', () => {
 		await expect(bar.locator('[data-seg="branch"]')).toContainText('feat/frame-chrome');
 		await expect(bar.locator('[data-seg="modified"]')).toHaveText('3 modified');
 		await expect(bar.locator('[data-seg="project"]')).toContainText(ACTIVE.display_name);
-		await expect(bar.locator('[data-seg="ngwa-installed"]')).toHaveText('1 installed');
+		await expect(bar.locator('[data-seg="ngwa-installed"]')).toHaveText('1 pkg');
 		await expect(bar.locator('[data-seg="ngwa-violations"]')).toHaveText('1 violation');
 		// Zero segments are not rendered at all.
 		await expect(bar.locator('[data-seg="ngwa-updates"]')).toHaveCount(0);

@@ -1,7 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { pkgKernelStatus } from '@/lib/tauri-cmd';
 import type { PaneView } from '@/lib/panes/types';
-import type { TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import { RouteView } from './views/route-view';
 import { TerminalView } from './views/terminal-view';
 import { ArtifactView } from './views/artifact-view';
@@ -38,54 +37,18 @@ export function PaneBody({ paneId, view }: PaneBodyProps) {
 
 export { viewKey } from './view-key';
 
-/**
- * Tab label for a view.
- *
- * `resolveTerminal` is how a terminal tab gets a real name (`claude · shell`)
- * instead of the constant "Terminal" — it needs the session store plus the live
- * foreground poll, neither of which belongs in a pure function. Callers that
- * render tab strips pass `useTerminalTitles()`; everyone else omits it and gets
- * the old constant, which is still correct, just uninformative.
- */
-export function viewLabel(view: PaneView, resolveTerminal?: TerminalTitleResolver): string {
-	switch (view.kind) {
-		case 'route': {
-			const segs = view.path.split('/').filter(Boolean);
-			if (segs.length === 0) return 'Dashboard';
-			return segs[segs.length - 1].replace(/-/g, ' ');
-		}
-		case 'terminal':
-			return resolveTerminal?.(view.sessionId)?.label ?? 'Terminal';
-		case 'artifact': {
-			const name = view.path.split('/').filter(Boolean).pop();
-			return name ?? 'Artifact';
-		}
-		case 'artifact-studio': {
-			const name = view.path.split('/').filter(Boolean).pop();
-			const prefix = view.density === 'grid' ? 'Grid' : 'Studio';
-			return `${prefix} · ${name ?? (view.density === 'grid' ? 'folder' : 'artifact')}`;
-		}
-		case 'scratchpad':
-			return view.name;
-	}
-}
-
-export function viewSubtitle(view: PaneView, resolveTerminal?: TerminalTitleResolver): string {
-	switch (view.kind) {
-		case 'route':
-			return view.path || '/';
-		case 'terminal':
-			// The terminal tooltip is multi-line — label, full cwd, argv, agent
-			// label — so the tab's hover carries everything the label had to drop.
-			return resolveTerminal?.(view.sessionId)?.tooltip ?? `session: ${view.sessionId}`;
-		case 'artifact':
-			return view.path;
-		case 'artifact-studio':
-			return view.density === 'compare' && view.vs ? `${view.path} ↔ ${view.vs}` : view.path;
-		case 'scratchpad':
-			return view.scope;
-	}
-}
+// Pure label/subtitle logic lives in `pane-view-label.ts`, free of the heavy
+// view-component imports above — re-exported here so existing callers of
+// `pane-views` keep working unchanged. Callers that only need label text
+// (tab strip, address bar, ⌘K switcher) import `pane-view-label` directly
+// instead, so computing a title doesn't drag in the whole view registry.
+export {
+	routeLabelInfo,
+	shouldCapitalizeLabel,
+	viewLabel,
+	viewSubtitle,
+	type RouteLabelInfo,
+} from './pane-view-label';
 
 /**
  * Resolves a PaneView to its webview UiRouteEntry if it's a webview route.
@@ -103,9 +66,11 @@ export function useWebviewRoute(view: PaneView | undefined) {
 	if (!match) return null;
 	const pkgId = match[1];
 	const splat = match[2] || '/';
-	
+
 	const entries = (data.registries?.ui_routes as any)?.entries ?? [];
-	const entry = entries.find((e: any) => e.pkg_id === pkgId && (e.path === splat || e.path === splat + '/'));
+	const entry = entries.find(
+		(e: any) => e.pkg_id === pkgId && (e.path === splat || e.path === splat + '/')
+	);
 	if (entry?.kind === 'webview') return entry;
 	return null;
 }

@@ -3,7 +3,12 @@ import { Package } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ListRow } from '@/components/ui/list-row';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import { pkgKernelStatus, pkgSetEnabled, pkgUninstall, type PkgInstalledSummary } from '@/lib/tauri-cmd';
+import {
+	pkgKernelStatus,
+	pkgSetEnabled,
+	pkgUninstall,
+	type PkgInstalledSummary,
+} from '@/lib/tauri-cmd';
 import { itemDetailPath } from '@/lib/pkg/pkg-view-state';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import type { NgwaSnapshot } from '@ikenga/contract';
@@ -20,9 +25,7 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 		queryFn: async () => {
 			try {
 				const status = await pkgKernelStatus();
-				return status.installed.filter(
-					(p) => !p.project_id || p.project_id === projectId
-				);
+				return status.installed.filter((p) => !p.project_id || p.project_id === projectId);
 			} catch {
 				return [];
 			}
@@ -38,14 +41,10 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 	 *  package placement's `ngwa-item` kinds show once the snapshot is known. */
 	const ngwaKindOf = useCallback(
 		(pkgId: string): string | undefined =>
-			qc.getQueryData<NgwaSnapshot>(NGWA_SNAPSHOT_QUERY_KEY)?.items.find((i) => i.id === pkgId)?.kind,
+			qc.getQueryData<NgwaSnapshot>(NGWA_SNAPSHOT_QUERY_KEY)?.items.find((i) => i.id === pkgId)
+				?.kind,
 		[qc]
 	);
-
-	const openPkg = useCallback((pkgId: string) => {
-		const { focusedId, addTab } = usePaneStore.getState();
-		addTab(focusedId, { kind: 'route', path: `/pkg/${pkgId}` });
-	}, []);
 
 	const openDetail = useCallback((pkgId: string) => {
 		const { focusedId, addTab } = usePaneStore.getState();
@@ -95,7 +94,10 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 						},
 						uninstall: () => {
 							void (async () => {
-								const ok = await confirmDialog(`Uninstall "${pkg.id}"?`, { title: 'Uninstall', kind: 'warning' });
+								const ok = await confirmDialog(`Uninstall "${pkg.id}"?`, {
+									title: 'Uninstall',
+									kind: 'warning',
+								});
 								if (!ok) return;
 								await pkgUninstall(pkg.id);
 								await qc.invalidateQueries({ queryKey: ['explorer-ngwa-project', projectId] });
@@ -105,7 +107,7 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 				>
 					<ListRow
 						size="sm"
-						onActivate={() => openPkg(pkg.id)}
+						onActivate={() => openDetail(pkg.id)}
 						title={pkg.id}
 						className="w-full gap-1.5 px-2"
 					>

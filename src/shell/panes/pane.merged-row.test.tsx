@@ -18,15 +18,20 @@
 import { render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// `PaneBody`/`useWebviewRoute` are the only things this slice still needs
+// from `./pane-views` — tab-label logic now lives in `./pane-view-label`
+// (not mocked; pure and side-effect free) and its display-name resolver in
+// `./use-pane-display-names`, mocked below since the real hook needs a
+// QueryClientProvider this test doesn't set up.
 vi.mock('./pane-views', () => ({
 	PaneBody: () => null,
 	useWebviewRoute: () => undefined,
-	viewLabel: (view: { kind: string; path?: string }) =>
-		view.kind === 'route' ? (view.path ?? '/') : 'Terminal',
-	viewSubtitle: () => '',
 }));
 vi.mock('@/terminal/use-terminal-titles', () => ({
 	useTerminalTitles: () => undefined,
+}));
+vi.mock('./use-pane-display-names', () => ({
+	usePaneDisplayNameResolver: () => () => undefined,
 }));
 vi.mock('./pane-iyke-overlay', () => ({
 	PaneIykeOverlay: () => null,

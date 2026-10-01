@@ -13,6 +13,9 @@
 //     always loaded, and the Ngwa snapshot reports it as scope `personal`.
 //   - 'project'  → 'project:<active project id>', or null (the kernel's
 //     default: the active project) when the shell doesn't know the id yet.
+//     DEC-71 (Round 58): the Default project *is* personal for pkg scope, so
+//     with Default active the project target is 'workspace' too (and the
+//     sheet labels it "personal" — `pkgProjectTarget`).
 //   - update     → the installed item's own scope, so updating never moves a
 //     pkg between scopes.
 //
@@ -66,18 +69,40 @@ import {
 
 export type StoreInstallScope = 'personal' | 'project';
 
+/** The Default project's id (`DEFAULT_PROJECT_ID` in the Rust core). */
+export const DEFAULT_PROJECT_ID = 'default';
+
+/** DEC-71: for pkg scope, the Default project means personal (workspace). */
+export function isDefaultProject(projectId: string | null | undefined): boolean {
+	return projectId === DEFAULT_PROJECT_ID;
+}
+
 export function storeScopeWire(
 	scope: StoreInstallScope,
 	activeProjectId: string | null | undefined
 ): PkgScopeWire | null {
-	if (scope === 'personal') return 'workspace';
+	if (scope === 'personal' || isDefaultProject(activeProjectId)) return 'workspace';
 	return activeProjectId ? `project:${activeProjectId}` : null;
+}
+
+/**
+ * The Store's project install target for a pkg, as a label: the active
+ * project's name, or null when there is no project target because the active
+ * project is Default (DEC-71) — the sheet then offers personal only (D-02:
+ * the scopes are personal plus real projects).
+ */
+export function pkgProjectTarget(
+	activeProjectId: string | null | undefined,
+	projectLabel: string
+): string | null {
+	return isDefaultProject(activeProjectId) ? null : projectLabel;
 }
 
 /** An installed item's current scope, as the wire value that keeps it there. */
 export function installedScopeWire(scope: NgwaScope | undefined): PkgScopeWire | null {
 	if (!scope) return null;
-	return scope.kind === 'personal' ? 'workspace' : `project:${scope.project_id}`;
+	if (scope.kind === 'personal' || isDefaultProject(scope.project_id)) return 'workspace';
+	return `project:${scope.project_id}`;
 }
 
 /** Ọba's scope for a Store scope choice (personal = the workspace, which

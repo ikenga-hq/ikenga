@@ -18,6 +18,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use crate::commands::db::PaDb;
+use crate::server::shared::projects::DEFAULT_PROJECT_ID;
 
 use super::cap_snapshot;
 use super::file_watcher::{self, WatcherHandle};
@@ -566,6 +567,12 @@ pub struct Kernel {
 /// them reads as "bound to a project that is never active", and reconcile
 /// parks a workspace pkg for "scope mismatch". Every read and write of the
 /// scope goes through here.
+///
+/// DEC-71 (Round 58): the Default project *is* personal scope for pkgs, so
+/// `"default"` / `"project:default"` also normalize to `None`. Kept as a bare
+/// project id, `'default'` parked every pkg (builtins included) the moment a
+/// real project became active. Because every write path normalizes first,
+/// `'default'` is never stored again; migration 0069 clears existing rows.
 pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let t = raw.trim();
@@ -573,11 +580,30 @@ pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
         return None;
     }
     let id = t.strip_prefix("project:").unwrap_or(t).trim();
-    if id.is_empty() {
+    if id.is_empty() || id == DEFAULT_PROJECT_ID {
         None
     } else {
         Some(id.to_string())
     }
+}
+
+/// Write a pkg's scope to `pkg_installed.project_id`, normalized first so a
+/// wire value (`"workspace"`, `"project:default"`, …) never lands raw.
+/// Returns the scope actually stored. Split out of [`Kernel::set_scope`] so
+/// the DB write is testable without an `AppHandle`.
+pub(crate) async fn store_scope(
+    pool: &sqlx::SqlitePool,
+    pkg_id: &str,
+    raw: Option<String>,
+) -> Result<Option<String>> {
+    let project_id = normalize_scope(raw);
+    sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
+        .bind(&project_id)
+        .bind(pkg_id)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow!("update project_id: {e}"))?;
+    Ok(project_id)
 }
 
 /// The reconcile scope rule: a workspace pkg (no project) is live under
@@ -767,8 +793,8 @@ impl Kernel {
     /// shell-bundled builtins from registry / sideloaded pkgs.
     /// Install a pkg at `install_path` with the given provenance + scope.
     /// `project_id = None` means workspace scope (always loaded);
-    /// `Some("default" | other slug)` binds the pkg to that project so it
-    /// only loads when the project is active. The kernel persists the
+    /// `Some(slug)` binds the pkg to that project so it only loads when the
+    /// project is active. `"default"` normalizes to `None` (DEC-71). The kernel persists the
     /// scope on `pkg_installed.project_id` but does *not* perform
     /// reconciliation here — caller is responsible for kicking
     /// `reconcile_for_project` after install if the scope differs from the
@@ -1048,13 +1074,7 @@ impl Kernel {
         let scope_owned = project_id.clone();
         tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
-            sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
-                .bind(&scope_owned)
-                .bind(&id_owned)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow!("update project_id: {e}"))?;
-            Ok::<_, anyhow::Error>(())
+            store_scope(&pool, &id_owned, scope_owned).await
         })?;
         if let Ok(mut g) = self.installed.write() {
             if let Some(existing) = g.get_mut(pkg_id) {
@@ -1456,7 +1476,9 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             return Ok(());
         }
         // Finish any uninstall whose folder move was blocked by a file lock,
-        // and prune expired uninstall backups, before discovering.
+        // and prune expired uninstall backups, before discovering. Installer
+        // scratch (`.staging-*` / `.bak-*`) was already reaped by
+        // `sweep_install_scratch` at the top of `boot()`, which runs first.
         uninstall_dir::sweep(&dir, uninstall_dir::BACKUP_RETENTION);
         let entries = std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?;
         for entry in entries.flatten() {
@@ -1528,6 +1550,23 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// loads gets logged and skipped — the row stays so the user can decide
     /// to repair or uninstall via the UI.
     pub fn boot(&self) -> Result<()> {
+        // Reap installer scratch (`.staging-*`, `.bak-*`) a crash or restart
+        // mid-install left in the pkgs dir. Runs BEFORE the row replay (and so
+        // before `install_from_pkgs_dir`'s discovery): an update that died
+        // between moving `<id>` aside and promoting the new one gets its
+        // `.bak-<id>` restored here, so its row loads from the restored folder
+        // with its recorded provenance instead of being skipped now and then
+        // rediscovered as a `Local` pkg. Called from Tauri setup before
+        // `KernelState` is managed, so no install command can be in flight;
+        // the sweep's min-age guard covers a concurrent CLI `ikenga add`.
+        match self.pkgs_dir() {
+            Ok(dir) => {
+                uninstall_dir::sweep_install_scratch(&dir, uninstall_dir::INSTALL_SCRATCH_MIN_AGE)
+            }
+            Err(e) => log::warn!(
+                "[pkg_kernel] pkgs dir unresolved, skipping install-scratch sweep: {e:#}"
+            ),
+        }
         // (id, install_path, installed_at, source_json, project_id,
         //  stored version, stored ikenga_api)
         type BootRow = (
@@ -2744,6 +2783,82 @@ mod tests {
         assert!(scan_pkgs_dir(&pkgs.join("absent"), &HashSet::new(), &HashSet::new()).is_empty());
     }
 
+    /// A builtin pkg's `pkg_installed` row points at the bundled resource dir,
+    /// outside the pkgs dir. The row scan reports it healthy, and the pkgs-dir
+    /// half of `health_scan` (`unregistered_dir_issues` = `scan_pkgs_dir` over
+    /// `tracked_sets` of the same rows) never flags it, even when a stale
+    /// same-id folder that fails to load sits in the pkgs dir.
+    #[test]
+    fn builtin_row_outside_pkgs_dir_is_healthy_and_never_flagged() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let root = tempfile::tempdir().expect("tempdir");
+        let builtin = root
+            .path()
+            .join("resources")
+            .join("builtin-pkgs")
+            .join("com.ikenga.iyke");
+        write_manifest(
+            &builtin,
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.1.0", "ikenga_api": "5"}"#,
+        );
+        let pkgs = root.path().join("pkgs");
+        // A stale same-id copy in the pkgs dir that would not load
+        // (api-incompatible): the tracked id suppresses it.
+        write_manifest(
+            &pkgs.join("com.ikenga.iyke"),
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.0.1", "ikenga_api": "99"}"#,
+        );
+        let builtin_path = builtin.display().to_string();
+
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            for ddl in [
+                "CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, version TEXT, ikenga_api TEXT, manifest_json TEXT, install_path TEXT NOT NULL, installed_at INTEGER, enabled INTEGER NOT NULL DEFAULT 1, signature TEXT, source_json TEXT, project_id TEXT)",
+                "CREATE TABLE pkg_capability_snapshots (pkg_id TEXT PRIMARY KEY, manifest_capabilities_json TEXT NOT NULL, approved_at INTEGER NOT NULL, approved_by_implicit INTEGER NOT NULL DEFAULT 0)",
+                "CREATE TABLE pkg_settings (pkg_id TEXT, key TEXT, value_json TEXT, updated_at INTEGER, PRIMARY KEY (pkg_id, key))",
+                "CREATE TABLE pkg_permissions_granted (pkg_id TEXT, scope TEXT, granted_at INTEGER, PRIMARY KEY (pkg_id, scope))",
+                "CREATE TABLE pkg_migrations (pkg_id TEXT, version TEXT, applied_at INTEGER, PRIMARY KEY (pkg_id, version))",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.expect("create table");
+            }
+            sqlx::query(
+                "INSERT INTO pkg_installed (id, version, ikenga_api, manifest_json, install_path, installed_at, enabled, source_json) VALUES (?,?,?,?,?,?,?,?)",
+            )
+            .bind("com.ikenga.iyke")
+            .bind("0.1.0")
+            .bind("5")
+            .bind("{}")
+            .bind(&builtin_path)
+            .bind(0)
+            .bind(1)
+            .bind(r#"{"kind":"builtin"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let issues = scan_health(&pool).await.expect("scan");
+            assert!(issues.is_empty(), "builtin row is healthy; got {issues:?}");
+
+            let rows = read_install_rows(&pool).await.expect("rows");
+            assert_eq!(
+                rows,
+                vec![("com.ikenga.iyke".to_string(), builtin_path.clone(), true)]
+            );
+            let (tracked_ids, tracked_paths) = tracked_sets(&rows);
+            let dir_issues = scan_pkgs_dir(&pkgs, &tracked_ids, &tracked_paths);
+            assert!(
+                dir_issues.is_empty(),
+                "tracked builtin id is never flagged from the pkgs dir; got {dir_issues:?}"
+            );
+            let registered: HashSet<String> = ["com.ikenga.iyke".to_string()].into_iter().collect();
+            assert!(scan_unregistered_rows(&rows, &HashSet::new(), &registered).is_empty());
+        });
+    }
+
     const MEETINGS_020: &str = r#"{"id": "com.ikenga.meetings", "name": "Meetings", "version": "0.2.0",
         "ikenga_api": "5",
         "ui": {"nav": [{"id": "meetings", "label": "Meetings", "route": "/meetings"}]}}"#;
@@ -2965,6 +3080,95 @@ mod tests {
                 "project pkg parks exactly when its project isn't active ({active})"
             );
         }
+    }
+
+    /// DEC-71: the Default project is personal scope for pkgs.
+    #[test]
+    fn normalize_scope_maps_default_project_to_workspace() {
+        assert_eq!(normalize_scope(Some("default".into())), None);
+        assert_eq!(normalize_scope(Some("project:default".into())), None);
+        assert_eq!(normalize_scope(Some(" project:default ".into())), None);
+        // Real project ids are untouched, including ones that merely contain
+        // "default".
+        assert_eq!(
+            normalize_scope(Some("project:kinnect".into())),
+            Some("kinnect".into())
+        );
+        assert_eq!(
+            normalize_scope(Some("default-2".into())),
+            Some("default-2".into())
+        );
+    }
+
+    /// DEC-71 / Round 58: with every row on `'default'`, switching to a real
+    /// project parked every pkg, builtins included.
+    #[test]
+    fn reconcile_never_parks_default_or_null_rows_under_a_real_project() {
+        let live: HashSet<String> = ["com.ikenga.studio", "com.ikenga.tasks", "com.test.kin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let installed = vec![
+            ("com.ikenga.studio".to_string(), Some("default".to_string())),
+            ("com.ikenga.tasks".to_string(), None),
+            ("com.test.kin".to_string(), Some("kinnect".to_string())),
+            (
+                "com.test.wire_default".to_string(),
+                Some("project:default".to_string()),
+            ),
+        ];
+        let plan = plan_reconcile(&installed, &live, "kinnect");
+        assert!(plan.park.is_empty(), "{plan:?}");
+        assert_eq!(plan.resume, vec!["com.test.wire_default".to_string()]);
+
+        // A real non-default project pkg still parks when its project is not
+        // active — the Default project included.
+        let plan = plan_reconcile(&installed, &live, "default");
+        assert_eq!(plan.park, vec!["com.test.kin".to_string()]);
+    }
+
+    /// `set_scope("project:default")` stores NULL, never `'default'`.
+    #[test]
+    fn store_scope_writes_null_for_default_project() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            sqlx::query("CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, install_path TEXT NOT NULL, project_id TEXT)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            for id in ["com.a", "com.b"] {
+                sqlx::query("INSERT INTO pkg_installed (id, install_path, project_id) VALUES (?, '/x', 'kinnect')")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let stored = store_scope(&pool, "com.a", Some("project:default".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, None);
+            let stored = store_scope(&pool, "com.b", Some("project:p2".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, Some("p2".into()));
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT id, project_id FROM pkg_installed ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("com.a".to_string(), None),
+                    ("com.b".to_string(), Some("p2".to_string())),
+                ]
+            );
+        });
     }
 
     #[test]

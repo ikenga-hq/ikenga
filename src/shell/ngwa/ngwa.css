@@ -78,6 +78,15 @@
 	padding: 0 5px;
 }
 
+/* DEC-73 (Round 58): the pkg sub-count next to the Installed total — plain
+ * muted text, not another pill, so it reads as a breakdown of the count
+ * beside it rather than a second badge. */
+.view-ngwa .ntab .pkgcnt {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
 .view-ngwa .ntabs .far {
 	margin-left: auto;
 	display: flex;

@@ -1589,7 +1589,8 @@ pub async fn post_iframe_message(
 pub struct PkgInstallBody {
     pub install_path: String,
     /// Phase 2 (projects-first-class): scope picker.
-    /// `"workspace"` / `"project:<id>"` / null (defaults to active project).
+    /// `"workspace"` / `"project:<id>"` / null (defaults to active project;
+    /// personal when that is the Default project, DEC-71).
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -1696,7 +1697,8 @@ pub async fn get_pkg_list(
 #[derive(Deserialize)]
 pub struct PkgScopeSetBody {
     pub pkg_id: String,
-    /// "workspace" | "project:<id>" | null (defaults to active project).
+    /// "workspace" | "project:<id>" | null (defaults to active project;
+    /// personal when that is the Default project, DEC-71).
     pub scope: Option<String>,
 }
 

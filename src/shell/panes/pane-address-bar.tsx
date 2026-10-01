@@ -25,7 +25,8 @@ import { writeClipboardText } from '@/lib/transport';
 import { usePathToManifestId, usePinsStore } from '@/lib/shell/pins-store';
 import { PinArtifactDialog } from './pin-artifact-dialog';
 import { PaneTools } from './pane-toolbar';
-import { viewLabel } from './pane-views';
+import { viewLabel } from './pane-view-label';
+import { usePaneDisplayNameResolver } from './use-pane-display-names';
 import { NewTabMenu, useAnchorRect } from './new-tab-menu';
 
 interface PaneAddressBarProps {
@@ -107,11 +108,15 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 	);
 	const [pinDialogOpen, setPinDialogOpen] = useState(false);
 
+	// Names a `/pkg/<id>` or `/ngwa/item/<id>` sole tab by its pkg manifest or
+	// ngwa display name, same as the multi-tab strip — see pane-tab-strip.tsx.
+	const resolveDisplayName = usePaneDisplayNameResolver();
+
 	// §6A.3: in the merged row the tab title becomes this row's accessible
 	// label (a browser-style address bar has no visible room for it), and
 	// the address text itself is what a `.leaf.micro` container query hides
 	// first, leaving the icon-less row to just its aria-label + tools.
-	const rowLabel = leaf ? viewLabel(leaf.tabs[0]) : undefined;
+	const rowLabel = leaf ? viewLabel(leaf.tabs[0], undefined, resolveDisplayName) : undefined;
 
 	const focusPane = usePaneStore((s) => s.focusPane);
 	const closeTab = usePaneStore((s) => s.closeTab);
@@ -128,7 +133,8 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 	// new pane" items that only make sense with a sibling tab to move past.
 	const soleTab = leaf?.tabs[0];
 	const isSoleTabPinned = Boolean(soleTab?.pinned);
-	const soleTabPath = soleTab?.kind === 'artifact' || soleTab?.kind === 'route' ? soleTab.path : undefined;
+	const soleTabPath =
+		soleTab?.kind === 'artifact' || soleTab?.kind === 'route' ? soleTab.path : undefined;
 	// `address` (G-ACTIONS §1.3), resolved only while the menu is open. The
 	// default contents carry no applicability for "Pin to sidebar…"; it has a
 	// handler (and so renders) only on an artifact tab, as shipped.
@@ -194,47 +200,47 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 				handlers={addressMenuHandlers}
 				builtinsNeedHandler
 			>
-					<Input
-						ref={inputRef}
-						type="text"
-						value={draft}
-						onChange={(e) => {
-							setDraft(e.target.value);
-							if (invalid) setInvalid(false);
-						}}
-						onKeyDown={(e) => {
-							if (e.key === 'Enter') {
-								e.preventDefault();
-								submit();
-							} else if (e.key === 'Escape') {
-								setDraft(address);
-								inputRef.current?.blur();
-							}
-						}}
-						// §6A.3: the address text is this tab's drag source when there's
-						// no tab strip to carry one. `beginPointerDrag` is threshold-gated
-						// (see pointer-drag.ts) so a plain click still places the cursor —
-						// only a real drag past the threshold hijacks the pointer.
-						onPointerDown={
-							mergedTools && leaf
-								? (e) =>
-										beginPointerDrag(e, {
-											label: rowLabel ?? 'Tab',
-											onStart: () => useDragState.getState().startPane(leaf.id, 0),
-											onEnd: () => useDragState.getState().end(),
-										})
-								: undefined
+				<Input
+					ref={inputRef}
+					type="text"
+					value={draft}
+					onChange={(e) => {
+						setDraft(e.target.value);
+						if (invalid) setInvalid(false);
+					}}
+					onKeyDown={(e) => {
+						if (e.key === 'Enter') {
+							e.preventDefault();
+							submit();
+						} else if (e.key === 'Escape') {
+							setDraft(address);
+							inputRef.current?.blur();
 						}
-						spellCheck={false}
-						autoCorrect="off"
-						autoCapitalize="off"
-						aria-invalid={invalid || undefined}
-						aria-label="Address"
-						className={cn(
-							'pane-address-text ml-1 h-6 flex-1 rounded-sm px-2 py-0 font-mono text-xs',
-							invalid && 'border-destructive ring-2 ring-destructive/40'
-						)}
-					/>
+					}}
+					// §6A.3: the address text is this tab's drag source when there's
+					// no tab strip to carry one. `beginPointerDrag` is threshold-gated
+					// (see pointer-drag.ts) so a plain click still places the cursor —
+					// only a real drag past the threshold hijacks the pointer.
+					onPointerDown={
+						mergedTools && leaf
+							? (e) =>
+									beginPointerDrag(e, {
+										label: rowLabel ?? 'Tab',
+										onStart: () => useDragState.getState().startPane(leaf.id, 0),
+										onEnd: () => useDragState.getState().end(),
+									})
+							: undefined
+					}
+					spellCheck={false}
+					autoCorrect="off"
+					autoCapitalize="off"
+					aria-invalid={invalid || undefined}
+					aria-label="Address"
+					className={cn(
+						'pane-address-text ml-1 h-6 flex-1 rounded-sm px-2 py-0 font-mono text-xs',
+						invalid && 'border-destructive ring-2 ring-destructive/40'
+					)}
+				/>
 			</EffectiveContextMenu>
 			{view.kind === 'artifact' && (
 				<>
