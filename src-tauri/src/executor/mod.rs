@@ -5,8 +5,11 @@
 //! architectural one: the same call site builds the same [`SpawnSpec`] whether
 //! the host runs everything in-process (T0), as a per-user Unix uid (T1), in a
 //! container per session (T2) or under firejail (T3). Only the executor
-//! changes. This slice implements **T0 only** — [`InProcessExecutor`], which is
-//! byte-for-byte the spawn each call site used to perform inline.
+//! changes. T0 is [`InProcessExecutor`], byte-for-byte the spawn each call
+//! site used to perform inline. T1 (Linux) is `t1::T1Executor`: every spawn
+//! runs as a resolved [`Principal`] and proves its privilege drop before
+//! `exec` (G-PRINCIPAL §9); its boot probe is `t1_probe` plus
+//! `server::operator::probe` (§8). T2/T3 are refused.
 //!
 //! ## Tier selection and the boot probe
 //!
@@ -37,6 +40,12 @@
 //! This module compiles without the `desktop` feature: the daemon needs it.
 
 mod in_process;
+/// T1 — per-principal Unix uid (G-PRINCIPAL §9). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod t1;
+/// The host-side steps of the T1 boot probe (§8 steps 2–4 and 6).
+#[cfg(target_os = "linux")]
+pub mod t1_probe;
 mod tier;
 
 use std::ffi::{OsStr, OsString};
@@ -50,7 +59,7 @@ use portable_pty::{Child as PtyProcess, MasterPty, PtySize, SlavePty};
 use serde::{Deserialize, Serialize};
 
 pub use in_process::InProcessExecutor;
-pub use tier::{probe, Capabilities, ExecutorTier, ParseTierError, Refusal};
+pub use tier::{probe, Capabilities, ExecutorTier, ParseTierError, ProbeStamp, Refusal};
 
 /// A principal's stable id (G-PRINCIPAL §1): an opaque **UUIDv7**, minted once
 /// when the account is created and never reused, even after the account is
@@ -317,6 +326,13 @@ pub trait SessionExecutor: Send + Sync {
     /// What this executor honours. Reported on `/api/health`.
     fn capabilities(&self) -> Capabilities;
 
+    /// The §8 boot probe this executor was installed from, if its tier has
+    /// one (T1). Reported on `/api/health` as `probe: {ok, at}` and nothing
+    /// more (G-PRINCIPAL §8 "Results").
+    fn probe_stamp(&self) -> Option<ProbeStamp> {
+        None
+    }
+
     fn tier(&self) -> ExecutorTier {
         self.capabilities().tier
     }
@@ -363,6 +379,9 @@ pub fn current() -> &'static dyn SessionExecutor {
 /// Probe `tier` and, if this build can honour it, publish its executor as
 /// [`current`]. Idempotent for the same tier; installing a *different* tier
 /// after one is live is refused rather than silently ignored.
+///
+/// T1 is not installed through here: its probe needs the operator root, and
+/// a passing one hands back the [`t1::T1Executor`] to [`install_executor`].
 pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
     let capabilities = probe(tier)?;
     let executor: Box<dyn SessionExecutor> = match tier {
@@ -371,6 +390,14 @@ pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
         // arm is only reachable if the two drift apart — refuse, don't guess.
         other => return Err(Refusal::NotImplemented { tier: other }),
     };
+    install_executor(executor).map(|_| capabilities)
+}
+
+/// Publish `executor` as [`current`]. Idempotent for the same tier;
+/// installing a different tier after one is live is refused. The T1 boot
+/// installs the executor its passing probe produced through this.
+pub fn install_executor(executor: Box<dyn SessionExecutor>) -> Result<Capabilities, Refusal> {
+    let tier = executor.tier();
     let installed = INSTALLED.get_or_init(|| executor);
     if installed.tier() != tier {
         return Err(Refusal::AlreadyInstalled {
@@ -378,7 +405,7 @@ pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
             requested: tier,
         });
     }
-    Ok(capabilities)
+    Ok(installed.capabilities())
 }
 
 #[cfg(test)]
@@ -458,9 +485,38 @@ mod tests {
 
     #[test]
     fn install_refuses_unimplemented_tiers_without_touching_current() {
-        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
+        for tier in [ExecutorTier::T2, ExecutorTier::T3] {
             assert_eq!(install(tier), Err(Refusal::NotImplemented { tier }));
         }
+        // T1 needs its operator-root probe; `install` can't run it.
+        assert!(matches!(
+            install(ExecutorTier::T1),
+            Err(Refusal::ProbeFailed { check: "setup", .. })
+        ));
         assert_eq!(current().tier(), ExecutorTier::T0);
+    }
+
+    /// A second executor of another tier is refused, and `current` keeps the
+    /// first (installing T0 is a no-op once T0 is live).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_executor_refuses_a_different_tier() {
+        install(ExecutorTier::T0).unwrap();
+        let t1 = t1::T1Executor::with_probe(
+            t1::T1Config {
+                principals_dir: "/nonexistent".into(),
+                principal_path: None,
+            },
+            ProbeStamp { ok: true, at: 1 },
+        );
+        assert_eq!(
+            install_executor(Box::new(t1)),
+            Err(Refusal::AlreadyInstalled {
+                installed: ExecutorTier::T0,
+                requested: ExecutorTier::T1,
+            })
+        );
+        assert_eq!(current().tier(), ExecutorTier::T0);
+        assert_eq!(current().probe_stamp(), None);
     }
 }

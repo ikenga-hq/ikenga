@@ -302,3 +302,94 @@ jobs:
       - name: cargo test -p ikenga-server
         working-directory: src-tauri
         run: cargo test -p ikenga-server --no-fail-fast
+
+  # T1 root tests (remote-access WP-20, G-PRINCIPAL §8/§9). The T1 executor
+  # drops to per-principal uids, so its real tests need root — and, to prove
+  # the floor (ADR-023: no privileged container), root with ONLY the
+  # capabilities the T1 unit grants: SETUID, SETGID, CHOWN, KILL,
+  # DAC_OVERRIDE, FOWNER. They run in a throwaway debian:stable-slim
+  # container (they write its /etc), never on the runner itself.
+  #
+  # The `#[ignore = "t1-root"]` tests are skipped by every other job; here the
+  # headless lib test binary runs them with `--ignored --test-threads=1
+  # t1_root` (one thread: some flip a process-wide fault-injection flag).
+  # Then `ikenga-server probe --executor-tier t1` must pass in that container
+  # and must FAIL (exit 1) as a non-root user and without CAP_SETUID.
+  t1-root:
+    name: T1 root tests (minimal-capability container)
+    needs: scope
+    if: needs.scope.outputs.headless == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      # Same headers as `headless`: the gtk/glib -sys crates still compile.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Reads the `headless` cache (same feature set); never saves its own.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ci-headless
+          save-if: false
+
+      - name: Build the headless lib test binary and ikenga-server
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p ikenga-server --message-format=short
+          tests=$(cargo test --lib --no-default-features --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true
+                            and .target.name == "ikenga_desktop_lib") | .executable' | tail -1)
+          test -x "$tests"
+          # World-readable, outside the runner's home: the tests re-exec
+          # these binaries as unprivileged probe/principal uids.
+          sudo install -d -m 0755 /opt/t1
+          sudo install -m 0755 "$tests" /opt/t1/lib-tests
+          sudo install -m 0755 target/debug/ikenga-server /opt/t1/ikenga-server
+
+      - name: t1_root tests (root, T1 capabilities only)
+        run: >-
+          docker run --rm
+          --cap-drop=ALL --cap-add=SETUID,SETGID,CHOWN,KILL,DAC_OVERRIDE,FOWNER
+          -v /opt/t1:/opt/t1:ro -w /tmp
+          debian:stable-slim
+          /opt/t1/lib-tests --ignored --test-threads=1 t1_root
+
+      - name: probe passes with the T1 capabilities
+        run: >-
+          docker run --rm
+          --cap-drop=ALL --cap-add=SETUID,SETGID,CHOWN,KILL,DAC_OVERRIDE,FOWNER
+          -v /opt/t1:/opt/t1:ro -w /tmp
+          debian:stable-slim
+          /opt/t1/ikenga-server probe --executor-tier t1 --data-dir /srv/ikenga
+
+      - name: probe refuses as non-root and without CAP_SETUID
+        shell: bash
+        run: |
+          set -uo pipefail
+          expect_refusal() {
+            local what=$1; shift
+            docker run --rm -v /opt/t1:/opt/t1:ro -w /tmp "$@" debian:stable-slim \
+              /opt/t1/ikenga-server probe --executor-tier t1 --data-dir /tmp/t1
+            local rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::probe $what: expected exit 1, got $rc"
+              return 1
+            fi
+            echo "probe $what: refused (exit 1), as required"
+          }
+          ok=0
+          expect_refusal "as uid 1000" --user 1000 || ok=1
+          expect_refusal "without CAP_SETUID" --cap-drop=SETUID || ok=1
+          exit $ok

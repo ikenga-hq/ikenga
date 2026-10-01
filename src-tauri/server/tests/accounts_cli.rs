@@ -165,3 +165,71 @@ fn t1_root_accounts_cli_under_trace_logging() {
     assert!(json.starts_with('[') && json.ends_with(']'), "{json}");
     assert!(json.contains("\"username\": \"t1root-log\""), "{json}");
 }
+
+/// Root: `accounts disable` kills every process of the account's uid
+/// (G-PRINCIPAL §7.3) through the built binary's `__t1-kill-all`, spawned via
+/// the T1 executor as that uid — a detached process in its own group too.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_disable_kills_every_process_of_the_uid() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    assert!(is_root(), "t1-root tests must run as root");
+    struct HostUser;
+    impl Drop for HostUser {
+        fn drop(&mut self) {
+            let _ = Command::new("userdel").arg("ik-t1root-reap").output();
+            let _ = Command::new("groupdel").arg("ik-t1root-reap").output();
+        }
+    }
+    let _cleanup = HostUser;
+    let tmp = TempDir::new("reap");
+    let root = tmp.0.join("root");
+    let root = root.to_str().unwrap();
+    let common = ["accounts", "--data-dir", root, "--uid-range", "28120-28130"];
+
+    let mut create = common.to_vec();
+    create.extend(["create", "t1root-reap", "--password-stdin"]);
+    let created = run(
+        &tmp.0,
+        &create,
+        "correct horse battery\n",
+        Duration::from_secs(120),
+    );
+    assert!(created.status.success(), "{}", created.stderr);
+
+    // A process of that uid, detached into its own process group.
+    let mut victim = Command::new("sleep")
+        .arg("300")
+        .uid(28_120)
+        .gid(28_120)
+        .process_group(0)
+        .current_dir("/")
+        .spawn()
+        .unwrap();
+
+    let mut disable = common.to_vec();
+    disable.extend(["disable", "t1root-reap"]);
+    let disabled = run(&tmp.0, &disable, "", Duration::from_secs(60));
+    assert!(disabled.status.success(), "{}", disabled.stderr);
+    assert!(
+        disabled
+            .stdout
+            .contains("killed every process of uid 28120"),
+        "{}",
+        disabled.stdout
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = victim.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the uid's process survived disable"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(status.signal(), Some(9), "SIGKILL");
+}

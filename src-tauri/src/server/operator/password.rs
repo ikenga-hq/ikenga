@@ -889,7 +889,7 @@ mod tests {
     mod login {
         use super::super::*;
         use crate::server::operator::etc_files::tests::fake_etc;
-        use crate::server::operator::provision::{Provisioner, ReaperPendingT1Executor, UidRange};
+        use crate::server::operator::provision::{NoReaper, Provisioner, UidRange};
         use crate::server::operator::{open_accounts, test_support, Opener};
 
         const PW: &str = "correct horse battery";
@@ -926,9 +926,7 @@ mod tests {
             let pool = open_accounts(&root, Opener::Broker).await.unwrap();
             let ada = prov.create(&pool, "ada", PW, false, None).await.unwrap();
             prov.create(&pool, "bob", PW, false, None).await.unwrap();
-            prov.disable(&pool, "bob", &ReaperPendingT1Executor)
-                .await
-                .unwrap();
+            prov.disable(&pool, "bob", &NoReaper).await.unwrap();
             let v = LoginVerifier::new();
 
             let LoginOutcome::Ok(a) = v

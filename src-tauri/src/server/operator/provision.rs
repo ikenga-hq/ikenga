@@ -375,28 +375,29 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub enum ReapOutcome {
     /// Every process of the uid was sent SIGKILL.
     Killed,
-    /// The reaper can't run on this build; nothing was signalled.
+    /// No reaper was configured; nothing was signalled.
     Unavailable(&'static str),
+    /// The helper could not run or failed. The account is disabled
+    /// regardless (the disable committed first); its processes may live on.
+    Failed(String),
 }
 
 /// Kills every process of a principal's uid (§7.3): a helper spawned
 /// **through the T1 executor as that uid** calls `kill(-1, SIGKILL)`, which
-/// also reaches detached chi-runners in their own process groups. The helper
-/// needs the T1 executor (WP-20 slice 2), which fills this trait.
+/// also reaches detached chi-runners in their own process groups. The real
+/// one is [`super::reaper::T1Reaper`].
 pub trait UidReaper: Send + Sync {
     fn kill_all(&self, principal: &Principal) -> anyhow::Result<ReapOutcome>;
 }
 
-/// Slice 1's reaper: the T1 executor does not exist yet, so nothing can run
-/// as a principal's uid and there is nothing of theirs to kill.
+/// A reaper that signals nothing (tests, and callers that stop the
+/// principal's processes some other way).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ReaperPendingT1Executor;
+pub struct NoReaper;
 
-impl UidReaper for ReaperPendingT1Executor {
+impl UidReaper for NoReaper {
     fn kill_all(&self, _principal: &Principal) -> anyhow::Result<ReapOutcome> {
-        Ok(ReapOutcome::Unavailable(
-            "the uid-wide kill runs through the T1 executor, which lands in WP-20 slice 2",
-        ))
+        Ok(ReapOutcome::Unavailable("no uid reaper configured"))
     }
 }
 
@@ -419,6 +420,9 @@ pub enum ProvisionError {
         stored: String,
         requested: UidRange,
     },
+    /// §8 step 7: the host's `/etc` disagrees with `accounts.db` in a way
+    /// reconcile must not paper over.
+    Drift(String),
     Host(anyhow::Error),
     Db(sqlx::Error),
 }
@@ -454,6 +458,7 @@ impl fmt::Display for ProvisionError {
                  was first provisioned with; the broker and the CLI must agree on it (its last \
                  uid is the boot probe's) — pass --uid-range {stored}"
             ),
+            ProvisionError::Drift(why) => write!(f, "/etc disagrees with accounts.db: {why}"),
             ProvisionError::Host(e) => write!(f, "provisioning the host failed: {e:#}"),
             ProvisionError::Db(e) => write!(f, "accounts.db: {e}"),
         }
@@ -552,6 +557,17 @@ impl Drop for ProvisionGuard {
 }
 
 // ─── the provisioner ────────────────────────────────────────────────────────
+
+/// What §8 step 7 did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReconcileReport {
+    /// Non-disabled rows checked.
+    pub checked: usize,
+    /// Host users (re)created.
+    pub created: Vec<String>,
+    /// Host users whose drifted shell was restored.
+    pub repaired_shell: Vec<String>,
+}
 
 /// Result of a §7.3 disable.
 #[derive(Debug)]
@@ -1234,9 +1250,11 @@ impl Provisioner {
             .lock(&account.unix_name, &self.nologin)
             .map_err(ProvisionError::Host)?;
         tx.commit().await?;
+        // After COMMIT: the account is disabled whatever the kill does, and a
+        // failed kill is reported rather than turned into a failed disable.
         let reap = reaper
             .kill_all(&account.principal())
-            .map_err(ProvisionError::Host)?;
+            .unwrap_or_else(|e| ReapOutcome::Failed(format!("{e:#}")));
         Ok(DisableReport { account, reap })
     }
 
@@ -1261,6 +1279,112 @@ impl Provisioner {
             return Err(e.into());
         }
         Ok(account)
+    }
+
+    /// The passwd entry named `name`, as the host (or, in a unit test, the
+    /// built-in writer's temp prefix) sees it.
+    fn passwd_by_name(&self, name: &str) -> Result<Option<sys::PasswdInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.passwd_by_name(name).map_err(host_err),
+            _ => sys::user_by_name(name).map_err(host_err),
+        }
+    }
+
+    fn passwd_by_uid(&self, uid: u32) -> Result<Option<sys::PasswdInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.passwd_by_uid(uid).map_err(host_err),
+            _ => sys::user_by_uid(uid).map_err(host_err),
+        }
+    }
+
+    /// §8 step 7 — `/etc` is a projection of `accounts.db` (§4): for every
+    /// non-disabled row the passwd entry must match `(unix_name, uid, gid,
+    /// home, shell)`. A missing entry of an allocated account is recreated
+    /// with the §7.2 backend; a drifted shell is restored. Anything else —
+    /// the row's uid or name held by a **different** host entry, a moved
+    /// home, a missing adopted user, or a missing entry under
+    /// `--provisioning external` — is refused, never rewritten. Reconcile
+    /// never writes the probe uid: no row holds it (§7.2).
+    pub async fn reconcile(&self, pool: &SqlitePool) -> Result<ReconcileReport, ProvisionError> {
+        let rows = {
+            let mut conn = pool.acquire().await?;
+            accounts::list(&mut conn).await?
+        };
+        let mut report = ReconcileReport::default();
+        for a in rows.iter().filter(|a| !a.is_disabled()) {
+            report.checked += 1;
+            let who = format!("account `{}` ({})", a.username, a.unix_name);
+            if let Some(holder) = self.passwd_by_uid(a.unix_uid)? {
+                if holder.name != a.unix_name {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: uid {} is held by host user `{}`",
+                        a.unix_uid, holder.name
+                    )));
+                }
+            }
+            match self.passwd_by_name(&a.unix_name)? {
+                Some(pw) => {
+                    if (pw.uid, pw.gid) != (a.unix_uid, a.unix_gid) {
+                        return Err(ProvisionError::Drift(format!(
+                            "{who}: the host entry has uid:gid {}:{}, accounts.db {}:{}",
+                            pw.uid, pw.gid, a.unix_uid, a.unix_gid
+                        )));
+                    }
+                    if pw.home != a.home {
+                        return Err(ProvisionError::Drift(format!(
+                            "{who}: the host entry's home is {}, accounts.db's {}",
+                            pw.home.display(),
+                            a.home.display()
+                        )));
+                    }
+                    if pw.shell != a.shell {
+                        if a.adopted || matches!(self.backend, Backend::External) {
+                            tracing::warn!(
+                                "{who}: host shell {} differs from {} (operator-managed; left \
+                                 as is)",
+                                pw.shell.display(),
+                                a.shell.display()
+                            );
+                        } else {
+                            self.backend
+                                .unlock(&a.unix_name, &a.shell)
+                                .map_err(ProvisionError::Host)?;
+                            report.repaired_shell.push(a.unix_name.clone());
+                        }
+                    }
+                }
+                None if a.adopted => {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who} is adopted, but host user `{}` no longer exists; recreate it \
+                         (uid {}, home {})",
+                        a.unix_name,
+                        a.unix_uid,
+                        a.home.display()
+                    )))
+                }
+                None if matches!(self.backend, Backend::External) => {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who} has no host user, and --provisioning external never writes \
+                         /etc; pre-create `{}` with uid {} and home {}",
+                        a.unix_name,
+                        a.unix_uid,
+                        a.home.display()
+                    )))
+                }
+                None => {
+                    self.backend
+                        .create_identity(&a.unix_name, a.unix_uid, &a.home, &a.shell)
+                        .map_err(ProvisionError::Host)?;
+                    tracing::info!(
+                        "reconcile: recreated host user {} (uid {})",
+                        a.unix_name,
+                        a.unix_uid
+                    );
+                    report.created.push(a.unix_name.clone());
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// §7.4: create `bootstrap` as an admin **only if `accounts` is empty**,
@@ -1453,10 +1577,7 @@ mod tests {
             .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        f.prov
-            .disable(&f.pool, "ada", &ReaperPendingT1Executor)
-            .await
-            .unwrap();
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
         let b = f
             .prov
             .create(&f.pool, "bob", PW, false, None)
@@ -1669,18 +1790,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slice_one_reaper_reports_unavailable() {
+    async fn no_reaper_reports_unavailable() {
         let f = fixture().await;
         f.prov
             .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        let report = f
-            .prov
-            .disable(&f.pool, "ada", &ReaperPendingT1Executor)
+        let report = f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        assert!(matches!(report.reap, ReapOutcome::Unavailable(_)));
+    }
+
+    struct BrokenReaper;
+    impl UidReaper for BrokenReaper {
+        fn kill_all(&self, _p: &Principal) -> anyhow::Result<ReapOutcome> {
+            anyhow::bail!("helper could not run")
+        }
+    }
+
+    /// A failed kill is reported, not turned into a failed disable: the
+    /// account is disabled either way (the disable committed first).
+    #[tokio::test]
+    async fn a_failed_reap_still_disables() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        assert!(matches!(report.reap, ReapOutcome::Unavailable(_)));
+        let report = f.prov.disable(&f.pool, "ada", &BrokenReaper).await.unwrap();
+        assert!(report.account.is_disabled());
+        assert!(
+            matches!(&report.reap, ReapOutcome::Failed(why) if why.contains("helper")),
+            "{:?}",
+            report.reap
+        );
+    }
+
+    // ── §8 step 7: reconcile ────────────────────────────────────────────────
+
+    /// A redeploy reset `/etc`: reconcile recreates the entries of active
+    /// allocated accounts from `accounts.db`, and leaves disabled ones.
+    #[tokio::test]
+    async fn reconcile_recreates_missing_entries_of_active_accounts() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.prov
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap();
+        f.prov.disable(&f.pool, "bob", &NoReaper).await.unwrap();
+        // Nothing to do on a consistent host.
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                checked: 1,
+                ..Default::default()
+            }
+        );
+
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc.remove_user("ik-bob").unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created, vec!["ik-ada".to_string()]);
+        let pw = f.etc.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!((pw.uid, pw.gid), (ada.unix_uid, ada.unix_gid));
+        assert_eq!(pw.home, ada.home);
+        assert_eq!(pw.shell, ada.shell);
+        assert!(f.etc.line("group", "ik-ada").is_some());
+        assert!(
+            f.etc.passwd_by_name("ik-bob").unwrap().is_none(),
+            "a disabled account is not re-projected"
+        );
+        // Idempotent.
+        assert!(f.prov.reconcile(&f.pool).await.unwrap().created.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_a_drifted_shell() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.set_shell("ik-ada", Path::new("/bin/bash")).unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.repaired_shell, vec!["ik-ada".to_string()]);
+        assert!(f
+            .etc
+            .line("passwd", "ik-ada")
+            .unwrap()
+            .ends_with(":/bin/sh"));
+    }
+
+    /// Refuse, never rewrite: the row's uid held by another host user, or
+    /// its entry pointing elsewhere.
+    #[tokio::test]
+    async fn reconcile_refuses_identity_drift() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "intruder",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/home/intruder"),
+                shell: Path::new("/bin/sh"),
+            })
+            .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("intruder")),
+            "{err}"
+        );
+        assert!(
+            f.etc.passwd_by_name("ik-ada").unwrap().is_none(),
+            "nothing written"
+        );
+
+        f.etc.remove_user("intruder").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "ik-ada",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/elsewhere"),
+                shell: Path::new("/bin/sh"),
+            })
+            .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("home")),
+            "{err}"
+        );
+    }
+
+    /// `--provisioning external` never writes `/etc`, so a missing entry is
+    /// the operator's to recreate.
+    #[tokio::test]
+    async fn reconcile_under_external_refuses_a_missing_entry() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        // The same store, now administered with `--provisioning external`
+        // (its lookups fall back to NSS, which has no `ik-ada`).
+        let ext = Provisioner::external_for_tests(f.prov.root().clone(), RANGE);
+        let err = ext.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("external")),
+            "{err}"
+        );
     }
 
     struct FailingHook;
@@ -2022,9 +2294,7 @@ mod tests {
             }
 
             // §7.3 disable locks the entry; enable restores the shell.
-            prov.disable(&pool, "t1root-ada", &ReaperPendingT1Executor)
-                .await
-                .unwrap();
+            prov.disable(&pool, "t1root-ada", &NoReaper).await.unwrap();
             let locked = sys::user_by_name("ik-t1root-ada").unwrap().unwrap();
             assert!(
                 locked.shell.ends_with("nologin"),

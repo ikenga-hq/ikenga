@@ -199,6 +199,48 @@ impl EtcFiles {
         self.contains("group", |_, id| id == Some(gid))
     }
 
+    /// The passwd entry matching `pred`, parsed (§8 step 7 reconcile).
+    fn passwd_entry(
+        &self,
+        pred: impl Fn(&str, Option<u32>) -> bool,
+    ) -> io::Result<Option<sys::PasswdInfo>> {
+        let Some(text) = self.read("passwd")? else {
+            return Ok(None);
+        };
+        for line in text.lines() {
+            let Some((name, id)) = name_and_id(line) else {
+                continue;
+            };
+            if !pred(name, id) {
+                continue;
+            }
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() < 7 {
+                return Err(invalid(format!("malformed passwd line for {name}")));
+            }
+            let num = |v: &str| {
+                v.parse::<u32>()
+                    .map_err(|_| invalid(format!("malformed passwd id `{v}` for {name}")))
+            };
+            return Ok(Some(sys::PasswdInfo {
+                name: name.to_string(),
+                uid: num(f[2])?,
+                gid: num(f[3])?,
+                home: PathBuf::from(f[5]),
+                shell: PathBuf::from(f[6]),
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn passwd_by_name(&self, name: &str) -> io::Result<Option<sys::PasswdInfo>> {
+        self.passwd_entry(|n, _| n == name)
+    }
+
+    pub(crate) fn passwd_by_uid(&self, uid: u32) -> io::Result<Option<sys::PasswdInfo>> {
+        self.passwd_entry(|_, id| id == Some(uid))
+    }
+
     pub(crate) fn name_taken(&self, name: &str) -> io::Result<bool> {
         Ok(self.contains("passwd", |n, _| n == name)?
             || self.contains("group", |n, _| n == name)?)
@@ -473,6 +515,19 @@ pub(crate) mod tests {
                 .is_err());
         }
         assert!(etc.line("passwd", "ik-ada").is_none());
+    }
+
+    #[test]
+    fn passwd_lookups_parse_the_entry() {
+        let (tmp, files) = fake_etc(true);
+        let home = tmp.path().join("h");
+        files.add_user(&user("ik-ada", 20_000, &home)).unwrap();
+        let by_name = files.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!((by_name.uid, by_name.gid), (20_000, 20_000));
+        assert_eq!(by_name.home, home);
+        assert_eq!(files.passwd_by_uid(20_000).unwrap(), Some(by_name));
+        assert_eq!(files.passwd_by_name("ik-bob").unwrap(), None);
+        assert_eq!(files.passwd_by_uid(20_001).unwrap(), None);
     }
 
     #[test]

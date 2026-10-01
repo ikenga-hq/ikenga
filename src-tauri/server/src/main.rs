@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ikenga_desktop_lib::executor::ExecutorTier;
-use ikenga_desktop_lib::server::{run_server, ServerConfig};
+use ikenga_desktop_lib::server::{run_server_with, ServerConfig, T1ServeOptions};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -27,6 +27,36 @@ pub enum Command {
     /// Administer T1 local accounts (root only; G-PRINCIPAL §7). Passwords
     /// are read from the terminal or `--password-stdin`, never from argv.
     Accounts(AccountsArgs),
+    /// Check whether this host can run an executor tier (G-PRINCIPAL §8).
+    /// For t1: identity, capabilities, the operator root and a real test
+    /// drop to the reserved probe uid — read-only (no reconcile, no
+    /// probe.json). Exits 0 when the tier can run, 1 when it can't.
+    Probe(ProbeArgs),
+    /// Internal: the §8 test-drop child (spawned by the probe as the probe uid).
+    #[command(name = "__t1-probe-child", hide = true)]
+    T1ProbeChild,
+    /// Internal: the §7.3 uid-wide kill (spawned as the principal's uid).
+    #[command(name = "__t1-kill-all", hide = true)]
+    T1KillAll,
+}
+
+#[derive(Args, Debug)]
+pub struct ProbeArgs {
+    /// The tier to probe.
+    #[arg(long, env = "IKENGA_EXECUTOR_TIER")]
+    pub executor_tier: ExecutorTier,
+
+    /// The T1 operator root (the server's `--data-dir` under t1).
+    #[arg(long, env = "IKENGA_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
+    /// The operator's uid range, `START-END`; `END` is the probe uid.
+    #[arg(long, env = "IKENGA_UID_RANGE", default_value = "20000-29999")]
+    pub uid_range: String,
+
+    /// Print the full report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -164,10 +194,27 @@ pub struct ServeArgs {
 
     /// Session-executor isolation tier (ADR-023): `t0` in-process, `t1`
     /// per-user uid, `t2` container per session, `t3` firejail per session.
-    /// Only `t0` is implemented on this build; any other tier makes the
-    /// server refuse to start rather than fall back to a weaker one.
+    /// `t1` runs its boot probe (G-PRINCIPAL §8) and, on this build, then
+    /// refuses to serve (its broker is not built yet); `t2`/`t3` are refused.
+    /// A refused tier never falls back to a weaker one.
     #[arg(long, env = "IKENGA_EXECUTOR_TIER", default_value = "t0")]
     pub executor_tier: ExecutorTier,
+
+    /// T1 only: the uid range for accounts, `START-END` (`END` is the boot
+    /// probe's reserved uid). Must match the range the accounts store was
+    /// first provisioned with.
+    #[arg(long, env = "IKENGA_UID_RANGE")]
+    pub uid_range: Option<String>,
+
+    /// T1 only: `auto` (useradd, else a built-in /etc writer) or `external`
+    /// (never write /etc).
+    #[arg(long, env = "IKENGA_PROVISIONING", value_enum, default_value = "auto")]
+    pub provisioning: Provisioning,
+
+    /// T1 only: the PATH a principal's processes get. Default:
+    /// `<home>/.local/bin:/usr/local/bin:/usr/bin:/bin`.
+    #[arg(long, env = "IKENGA_PRINCIPAL_PATH")]
+    pub principal_path: Option<std::ffi::OsString>,
 }
 
 #[tokio::main]
@@ -176,6 +223,14 @@ async fn main() -> anyhow::Result<()> {
         command,
         serve: args,
     } = CliArgs::parse();
+
+    // The internal entries run as a dropped principal uid, with a cleared
+    // environment: no logging setup, nothing else — check, report, exit.
+    match command {
+        Some(Command::T1ProbeChild) => internal_entry("t1 probe child", t1_probe_child()),
+        Some(Command::T1KillAll) => internal_entry("t1 kill-all", t1_kill_all()),
+        _ => {}
+    }
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,ikenga_server=debug".into());
@@ -224,13 +279,19 @@ async fn main() -> anyhow::Result<()> {
         std::env::remove_var(key);
     }
 
-    if let Some(Command::Accounts(accounts)) = command {
-        if bootstrap.is_some() {
-            tracing::warn!(
-                "IKENGA_BOOTSTRAP_ADMIN is only read by the T1 server at boot; ignored by `accounts`"
-            );
+    match command {
+        Some(Command::Accounts(accounts)) => {
+            if bootstrap.is_some() {
+                tracing::warn!(
+                    "IKENGA_BOOTSTRAP_ADMIN is only read by the T1 server at boot; ignored by \
+                     `accounts`"
+                );
+            }
+            return run_accounts(accounts).await;
         }
-        return run_accounts(accounts).await;
+        Some(Command::Probe(probe)) => std::process::exit(run_probe(probe).await),
+        Some(Command::T1ProbeChild | Command::T1KillAll) => unreachable!("handled above"),
+        None => {}
     }
 
     if bootstrap.is_some() {
@@ -258,8 +319,80 @@ async fn main() -> anyhow::Result<()> {
         idle_timeout_secs: args.idle_timeout,
         executor_tier: args.executor_tier,
     };
+    let t1 = T1ServeOptions {
+        uid_range: args.uid_range,
+        provisioning_external: args.provisioning == Provisioning::External,
+        principal_path: args.principal_path,
+    };
 
-    run_server(config).await
+    run_server_with(config, t1).await
+}
+
+/// Exit with the internal entry's verdict: 0, or 1 with the reason on stderr.
+fn internal_entry(name: &str, result: Result<(), String>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("{name}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn t1_probe_child() -> Result<(), String> {
+    ikenga_desktop_lib::executor::t1_probe::probe_child_entry()
+}
+
+#[cfg(target_os = "linux")]
+fn t1_kill_all() -> Result<(), String> {
+    ikenga_desktop_lib::executor::t1::kill_all_entry()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn t1_probe_child() -> Result<(), String> {
+    Err("executor tier t1 is Linux-only".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn t1_kill_all() -> Result<(), String> {
+    Err("executor tier t1 is Linux-only".into())
+}
+
+/// `ikenga-server probe` → exit code (0 = the tier can run here).
+async fn run_probe(args: ProbeArgs) -> i32 {
+    if args.executor_tier != ExecutorTier::T1 {
+        return match ikenga_desktop_lib::executor::probe(args.executor_tier) {
+            Ok(caps) => {
+                println!("{} probe: PASS {caps:?}", args.executor_tier);
+                0
+            }
+            Err(refusal) => {
+                println!("{} probe: FAIL {refusal}", args.executor_tier);
+                1
+            }
+        };
+    }
+    probe_t1(args).await
+}
+
+#[cfg(target_os = "linux")]
+async fn probe_t1(args: ProbeArgs) -> i32 {
+    use ikenga_desktop_lib::server::operator::{probe, provision::UidRange};
+    let uid_range = match args.uid_range.parse::<UidRange>() {
+        Ok(range) => range,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    probe::cli(args.data_dir, uid_range, args.json).await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn probe_t1(_args: ProbeArgs) -> i32 {
+    println!("t1 probe: FAIL at `os`: executor tier t1 is Linux-only");
+    1
 }
 
 #[cfg(target_os = "linux")]
@@ -469,6 +602,67 @@ mod tests {
             "--allow-system-user",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn probe_and_the_hidden_entries_parse() {
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "probe",
+            "--executor-tier",
+            "t1",
+            "--data-dir",
+            "/opt/ikenga/data",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Probe(p)) = args.command else {
+            panic!("expected probe");
+        };
+        assert_eq!(p.executor_tier, ExecutorTier::T1);
+        assert!(p.json);
+        assert_eq!(p.uid_range, "20000-29999");
+        assert!(matches!(
+            CliArgs::try_parse_from(["ikenga-server", "__t1-probe-child"])
+                .unwrap()
+                .command,
+            Some(Command::T1ProbeChild)
+        ));
+        assert!(matches!(
+            CliArgs::try_parse_from(["ikenga-server", "__t1-kill-all"])
+                .unwrap()
+                .command,
+            Some(Command::T1KillAll)
+        ));
+        // Hidden from --help.
+        let help = <CliArgs as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("probe"), "{help}");
+        assert!(!help.contains("__t1"), "{help}");
+    }
+
+    #[test]
+    fn t1_serve_flags_parse() {
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "--executor-tier",
+            "t1",
+            "--uid-range",
+            "30000-30999",
+            "--provisioning",
+            "external",
+            "--principal-path",
+            "/usr/bin:/bin",
+        ])
+        .unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.serve.uid_range.as_deref(), Some("30000-30999"));
+        assert_eq!(args.serve.provisioning, Provisioning::External);
+        assert_eq!(
+            args.serve.principal_path.as_deref(),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin"))
+        );
     }
 
     #[test]

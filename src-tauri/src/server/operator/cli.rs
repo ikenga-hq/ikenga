@@ -11,9 +11,8 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 use super::accounts::{self, Actor, NoDeviceGrants};
-use super::provision::{
-    Adopt, Provisioner, ProvisioningMode, ReapOutcome, ReaperPendingT1Executor, UidRange,
-};
+use super::provision::{Adopt, Provisioner, ProvisioningMode, ReapOutcome, UidRange, UidReaper};
+use super::reaper::{HelperCommand, T1Reaper};
 use super::{open_accounts, sys, Opener, OperatorRoot, Ownership};
 
 /// Options shared by every `accounts` subcommand.
@@ -100,13 +99,16 @@ pub async fn run(opts: AccountsOptions, cmd: AccountsCommand) -> anyhow::Result<
     };
     root.prepare(Ownership::Enforce)?;
     let pool = open_accounts(&root, opener).await?;
+    // §7.3's uid-wide kill: this binary's `__t1-kill-all`, spawned through
+    // the T1 executor as the principal.
+    let reaper = T1Reaper::new(&root, HelperCommand::current_exe()?);
     let prov = Provisioner::new(root, opts.uid_range, opts.provisioning, Actor::Cli);
     // Output is buffered and written after the command, never through a held
     // `StdoutLock`: holding it across awaits deadlocks against any log event
     // another thread emits (sqlx's workers at debug), and logs go to stderr
     // anyway (`main.rs`), so `list --json` stays clean.
     let mut out = Vec::new();
-    let result = run_with(&prov, &pool, cmd, &mut read_password, &mut out).await;
+    let result = run_with(&prov, &pool, &reaper, cmd, &mut read_password, &mut out).await;
     pool.close().await;
     let written = {
         let mut stdout = io::stdout();
@@ -120,6 +122,7 @@ pub async fn run(opts: AccountsOptions, cmd: AccountsCommand) -> anyhow::Result<
 pub(crate) async fn run_with(
     prov: &Provisioner,
     pool: &sqlx::SqlitePool,
+    reaper: &dyn UidReaper,
     cmd: AccountsCommand,
     read_password: &mut dyn FnMut(PasswordSource) -> anyhow::Result<Zeroizing<String>>,
     out: &mut dyn Write,
@@ -173,9 +176,7 @@ pub(crate) async fn run_with(
             )?;
         }
         AccountsCommand::Disable { username } => {
-            let report = prov
-                .disable(pool, &username, &ReaperPendingT1Executor)
-                .await?;
+            let report = prov.disable(pool, &username, reaper).await?;
             writeln!(
                 out,
                 "disabled {} ({}); sessions revoked (session epoch {}); passwd entry locked",
@@ -188,6 +189,17 @@ pub(crate) async fn run_with(
                     report.account.unix_uid
                 )?,
                 ReapOutcome::Unavailable(why) => writeln!(out, "note: no processes killed: {why}")?,
+                ReapOutcome::Failed(why) => {
+                    writeln!(
+                        out,
+                        "WARNING: could not kill the processes of uid {}: {why}",
+                        report.account.unix_uid
+                    )?;
+                    anyhow::bail!(
+                        "{} is disabled, but its running processes may not have been stopped",
+                        report.account.username
+                    );
+                }
             }
         }
         AccountsCommand::Enable { username } => {
@@ -330,6 +342,7 @@ mod tty {
 mod tests {
     use super::*;
     use crate::server::operator::etc_files::tests::fake_etc;
+    use crate::server::operator::provision::NoReaper;
     use crate::server::operator::{open_accounts, test_support};
 
     #[test]
@@ -382,7 +395,7 @@ mod tests {
             },
             AccountsCommand::List { json: false },
         ] {
-            run_with(&prov, &pool, cmd, &mut pw, &mut out)
+            run_with(&prov, &pool, &NoReaper, cmd, &mut pw, &mut out)
                 .await
                 .unwrap();
         }
@@ -400,6 +413,7 @@ mod tests {
         run_with(
             &prov,
             &pool,
+            &NoReaper,
             AccountsCommand::List { json: true },
             &mut no_prompt,
             &mut out,
@@ -434,16 +448,72 @@ mod tests {
             allow_system_user: false,
             password: PasswordSource::Tty,
         };
-        assert!(run_with(&prov, &pool, cmd, &mut pw, &mut Vec::new())
-            .await
-            .is_err());
+        assert!(
+            run_with(&prov, &pool, &NoReaper, cmd, &mut pw, &mut Vec::new())
+                .await
+                .is_err()
+        );
         let cmd = AccountsCommand::Passwd {
             username: "ghost".into(),
             password: PasswordSource::Tty,
         };
-        assert!(run_with(&prov, &pool, cmd, &mut pw, &mut Vec::new())
-            .await
-            .is_err());
+        assert!(
+            run_with(&prov, &pool, &NoReaper, cmd, &mut pw, &mut Vec::new())
+                .await
+                .is_err()
+        );
         assert!(!prompted);
+    }
+
+    struct BrokenReaper;
+    impl UidReaper for BrokenReaper {
+        fn kill_all(
+            &self,
+            _p: &crate::executor::Principal,
+        ) -> anyhow::Result<super::super::provision::ReapOutcome> {
+            anyhow::bail!("no CAP_SETUID here")
+        }
+    }
+
+    /// A failed uid-wide kill is loud: the account is disabled (and says
+    /// so), but the command fails so the operator sees the warning.
+    #[tokio::test]
+    async fn disable_reports_a_failed_kill_and_exits_nonzero() {
+        let (_root_tmp, root) = test_support::temp_root();
+        let (etc_tmp, _etc) = fake_etc(true);
+        let range = UidRange::new(3_900_000_040, 3_900_000_050).unwrap();
+        let prov = Provisioner::for_tests(root.clone(), range, etc_tmp.path());
+        let pool = open_accounts(&root, Opener::Cli).await.unwrap();
+        let mut pw = |_: PasswordSource| Ok(Zeroizing::new("correct horse battery".to_string()));
+        let create = AccountsCommand::Create {
+            username: "ada".into(),
+            admin: false,
+            adopt_unix_user: None,
+            allow_system_user: false,
+            password: PasswordSource::Stdin,
+        };
+        run_with(&prov, &pool, &NoReaper, create, &mut pw, &mut Vec::new())
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let disable = AccountsCommand::Disable {
+            username: "ada".into(),
+        };
+        let err = run_with(&prov, &pool, &BrokenReaper, disable, &mut pw, &mut out)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is disabled"), "{err}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("disabled ada"), "{text}");
+        assert!(
+            text.contains("WARNING") && text.contains("no CAP_SETUID"),
+            "{text}"
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(accounts::by_username(&mut conn, "ada")
+            .await
+            .unwrap()
+            .unwrap()
+            .is_disabled());
     }
 }
