@@ -45,8 +45,8 @@
 //! the broker's child launcher uses for its per-child token and the
 //! `IKENGA_SECRET_*` operator defaults (§5 row 15).
 //!
-//! A missing cwd becomes the principal's home: the executor never inherits
-//! the broker's cwd.
+//! A missing cwd becomes the principal's home, and a relative one is resolved
+//! against it: the executor never inherits the broker's cwd.
 //!
 //! ## PTYs
 //!
@@ -254,9 +254,18 @@ impl T1Executor {
                 ));
             }
         }
+        // §9.3: never the broker's cwd. A missing cwd is the home, and a
+        // relative one (pty_ws asks for ".") is resolved against the home —
+        // chdir() after fork would otherwise resolve it against the
+        // broker's inherited cwd.
+        let cwd = match &spec.cwd {
+            Some(cwd) if cwd.is_absolute() => cwd.clone(),
+            Some(cwd) => p.home.join(cwd),
+            None => p.home.clone(),
+        };
         let mut cmd = std::process::Command::new(&spec.program);
         cmd.args(&spec.args)
-            .current_dir(spec.cwd.as_ref().unwrap_or(&p.home))
+            .current_dir(cwd)
             .stdin(opts.stdin.to_stdio())
             .stdout(opts.stdout.to_stdio())
             .stderr(opts.stderr.to_stdio())
@@ -298,6 +307,21 @@ impl T1Executor {
             }
         }
         result
+    }
+
+    /// A synchronous spawn the caller waits on itself — for the root CLI's
+    /// uid-wide kill, which must bound the wait (a process of the uid could
+    /// SIGSTOP the helper) and kill the helper from root on a timeout.
+    /// Same admission, environment, drop and verification as every spawn.
+    pub fn spawn_std(&self, spec: SpawnSpec, opts: PipedOpts) -> io::Result<std::process::Child> {
+        if opts.detached {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "spawn_std is for children the caller waits on; `detached` makes no sense here",
+            ));
+        }
+        let mut cmd = self.std_command(&spec, &opts, &[])?;
+        self.after_spawn(cmd.spawn())
     }
 
     /// [`SessionExecutor::spawn_piped`] plus explicitly listed host-only
@@ -623,6 +647,29 @@ pub(crate) mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// §9.3 / review S2-3: the child's cwd is never relative to the broker's.
+    #[test]
+    fn cwd_is_the_home_or_resolved_against_it() {
+        let exec = T1Executor::new(config());
+        let home = PathBuf::from("/srv/ikenga/principals/x/home");
+        let p = principal(20_003, &home);
+        let cwd_of = |cwd: Option<&str>| {
+            let mut spec = sh("true", Some(p.clone()));
+            if let Some(cwd) = cwd {
+                spec.current_dir(cwd);
+            }
+            let cmd = exec.std_command(&spec, &piped(), &[]).unwrap();
+            cmd.get_current_dir().map(PathBuf::from)
+        };
+        assert_eq!(cwd_of(None), Some(home.clone()));
+        assert_eq!(cwd_of(Some(".")), Some(home.join(".")));
+        assert_eq!(cwd_of(Some("proj/a")), Some(home.join("proj/a")));
+        assert_eq!(
+            cwd_of(Some("/srv/other")),
+            Some(PathBuf::from("/srv/other"))
+        );
+    }
+
     /// I-5: isolation is reported only from a passing probe, and drift turns
     /// it off and refuses every later spawn.
     #[tokio::test]
@@ -781,6 +828,57 @@ pub(crate) mod tests {
             assert!(exec
                 .spawn_piped(sh("true", Some(principal(uid, &home))), piped())
                 .is_err());
+        }
+
+        /// Review S2-6: the verifier itself, with no fault injection. A child
+        /// that never dropped (still root), and one dropped to the wrong ids,
+        /// both fail with `DROP_VERIFY_ERRNO` before exec.
+        #[test]
+        #[ignore = "t1-root"]
+        fn t1_root_the_verifier_rejects_a_child_that_did_not_drop() {
+            require_root();
+            let spawn = |drop_to: Option<u32>| {
+                let mut cmd = std::process::Command::new("/bin/true");
+                cmd.current_dir("/")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if let Some(id) = drop_to {
+                    cmd.uid(id).gid(id);
+                }
+                // SAFETY: as in `std_command`: raw syscalls only.
+                unsafe {
+                    cmd.pre_exec(|| verify_dropped(28_505, 28_505));
+                }
+                cmd.spawn().map(|mut c| c.wait())
+            };
+            // Still root: getresuid says (0, 0, 0).
+            let err = spawn(None).expect_err("a root child must fail verification");
+            assert_eq!(err.raw_os_error(), Some(DROP_VERIFY_ERRNO), "{err}");
+            // Dropped, but not to the principal's ids.
+            let err = spawn(Some(28_506)).expect_err("wrong ids must fail verification");
+            assert_eq!(err.raw_os_error(), Some(DROP_VERIFY_ERRNO), "{err}");
+            // The right ids pass (and the child runs).
+            let status = spawn(Some(28_505)).unwrap().unwrap();
+            assert!(status.success());
+        }
+
+        /// Review S2-3: a relative cwd is the home's, not the broker's.
+        #[test]
+        #[ignore = "t1-root"]
+        fn t1_root_a_relative_cwd_is_resolved_against_the_home() {
+            require_root();
+            let uid = 28_507;
+            let (_tmp, home) = home_for(uid);
+            let exec = T1Executor::new(config());
+            let mut spec = sh("pwd -P", Some(principal(uid, &home)));
+            spec.current_dir(".");
+            let out = exec.spawn_output_blocking(spec, piped()).unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                home.display().to_string()
+            );
         }
 
         /// A missing cwd is the principal's home, never the broker's cwd.

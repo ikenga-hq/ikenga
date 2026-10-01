@@ -14,8 +14,8 @@
 //! | 7 | reconcile `/etc` from `accounts.db` (boot only) | [`Provisioner::reconcile`] |
 //!
 //! Two modes. **Boot** (the T1 server) creates the operator root, migrates
-//! `accounts.db` (only the broker migrates, §6.1), pins the uid range,
-//! reconciles, writes `operator/probe.json` and, on failure, an
+//! `accounts.db` (only the broker migrates, §6.1), pins the uid range once
+//! step 6 has passed (never before: review S2-1), reconciles, writes `operator/probe.json` and, on failure, an
 //! `auth_events` `probe_failed` row. **Read-only** (`ikenga-server probe
 //! --executor-tier t1`) runs steps 1–6 and writes nothing but the transient
 //! step-6 scaffold — no operator dirs, no store, no `/etc`, no `probe.json`.
@@ -295,63 +295,68 @@ async fn steps(
         opts.provisioning,
         Actor::Broker,
     );
-    let rows_holding_probe_uid = match opts.mode {
+    // Step 5 only *compares* the range (review S2-1): pinning it before the
+    // probe-uid precondition and the test drop would, on a refusal that says
+    // "move --uid-range", lock the store to the very range the operator was
+    // just told to move away from. The boot pins it after step 6 passes.
+    let (pinned, rows_holding_probe_uid) = match opts.mode {
         ProbeMode::Boot => {
             // Only the broker migrates (§6.1).
             let pool = open_accounts(&root, Opener::Broker)
                 .await
                 .map_err(|e| report.fail(failed("operator_root", format!("accounts.db: {e:#}"))))?;
             *store = Some(pool.clone());
-            let pinned = async {
-                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-                prov.pin_uid_range(&mut tx).await?;
-                tx.commit().await?;
-                Ok::<_, super::provision::ProvisionError>(())
-            }
-            .await;
-            pinned.map_err(|e| report.fail(failed("uid_range", e.to_string())))?;
-            report.pass(
-                "uid_range",
-                format!("{} pinned in accounts.db", opts.uid_range),
-            );
             let mut conn = pool
                 .acquire()
                 .await
-                .map_err(|e| report.fail(failed("probe_uid", e.to_string())))?;
-            rows_holding(&mut conn, probe_uid)
+                .map_err(|e| report.fail(failed("uid_range", e.to_string())))?;
+            let pinned = Provisioner::stored_uid_range(&mut conn)
                 .await
-                .map_err(|e| report.fail(failed("probe_uid", e.to_string())))?
+                .map_err(|e| report.fail(failed("uid_range", e.to_string())))?;
+            let holding = rows_holding(&mut conn, probe_uid)
+                .await
+                .map_err(|e| report.fail(failed("probe_uid", e.to_string())))?;
+            (pinned, holding)
         }
         ProbeMode::ReadOnly => {
             match read_only_store_view(&root, probe_uid)
                 .await
                 .map_err(|e| report.fail(failed("uid_range", e)))?
             {
-                None => {
-                    report.pass("uid_range", "no accounts.db yet; nothing pinned");
-                    0
-                }
-                Some((pinned, holding)) => {
-                    match pinned {
-                        Some(stored) if stored != opts.uid_range.to_string() => {
-                            return Err(report.fail(failed(
-                                "uid_range",
-                                format!(
-                                    "--uid-range {} differs from {stored}, the range accounts.db \
-                                     is pinned to; pass --uid-range {stored}",
-                                    opts.uid_range
-                                ),
-                            )))
-                        }
-                        Some(stored) => {
-                            report.pass("uid_range", format!("{stored} matches accounts.db"))
-                        }
-                        None => report.pass("uid_range", "accounts.db has no range pinned yet"),
-                    }
-                    holding
-                }
+                None => (None, 0),
+                Some((pinned, holding)) => (pinned, holding),
             }
         }
+    };
+    match &pinned {
+        Some(stored) if *stored != opts.uid_range.to_string() => {
+            return Err(report.fail(failed(
+                "uid_range",
+                format!(
+                    "--uid-range {} differs from {stored}, the range accounts.db is pinned to; \
+                     pass --uid-range {stored}",
+                    opts.uid_range
+                ),
+            )))
+        }
+        Some(stored) => report.pass("uid_range", format!("{stored} matches accounts.db")),
+        None => report.pass(
+            "uid_range",
+            match opts.mode {
+                ProbeMode::Boot => {
+                    "accounts.db has no range pinned yet; pinned once the test \
+                                    drop passes"
+                }
+                ProbeMode::ReadOnly => "accounts.db has no range pinned yet",
+            },
+        ),
+    }
+    // What to tell an operator whose probe uid is taken on the host: a range
+    // that is already pinned holds accounts and can't simply move.
+    let move_hint = if pinned.is_some() {
+        "remove that host entry (the uid range is pinned in accounts.db and can't move)"
+    } else {
+        "move --uid-range or remove that host entry"
     };
     if rows_holding_probe_uid > 0 {
         return Err(report.fail(failed(
@@ -368,8 +373,7 @@ async fn steps(
         return Err(report.fail(failed(
             "probe_uid",
             format!(
-                "uid {probe_uid} (the reserved probe uid) belongs to host user `{}`; move \
-                 --uid-range",
+                "uid {probe_uid} (the reserved probe uid) belongs to host user `{}`; {move_hint}",
                 pw.name
             ),
         )));
@@ -379,7 +383,7 @@ async fn steps(
     {
         return Err(report.fail(failed(
             "probe_uid",
-            format!("gid {probe_uid} (the reserved probe uid) is a host group; move --uid-range"),
+            format!("gid {probe_uid} (the reserved probe uid) is a host group; {move_hint}"),
         )));
     }
     report.pass(
@@ -412,9 +416,19 @@ async fn steps(
         ),
     );
 
-    // 7. Reconcile (boot only).
+    // 7. Reconcile (boot only) — after pinning the range, now that it has
+    // passed every check, in its own BEGIN IMMEDIATE (a concurrent CLI
+    // create may have pinned it meanwhile; a different range still refuses).
     if opts.mode == ProbeMode::Boot {
         let pool = store.as_ref().expect("the boot opened the store");
+        let pinned_now = async {
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+            prov.pin_uid_range(&mut tx).await?;
+            tx.commit().await?;
+            Ok::<_, super::provision::ProvisionError>(())
+        }
+        .await;
+        pinned_now.map_err(|e| report.fail(failed("uid_range", e.to_string())))?;
         let reconciled = prov
             .reconcile(pool)
             .await
@@ -806,6 +820,59 @@ mod tests {
             let json: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(root.probe_json()).unwrap()).unwrap();
             assert_eq!(json["ok"], false);
+        }
+
+        /// Review S2-1: a probe uid held by a host group refuses the boot
+        /// *without* pinning the range, so moving `--uid-range` as the
+        /// refusal says lets the next boot pass (and pin the new range).
+        #[tokio::test]
+        #[ignore = "t1-root"]
+        async fn t1_root_a_refused_boot_does_not_pin_the_range_it_says_to_move() {
+            require_root();
+            let _cleanup = HostUser("ik-t1probe-grp");
+            let groupadd = ["/usr/sbin/groupadd", "/sbin/groupadd"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .expect("groupadd");
+            let out = std::process::Command::new(groupadd)
+                .args(["-g", "28610", "ik-t1probe-grp"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+
+            let tmp = traversable_tempdir();
+            let root = OperatorRoot::new(tmp.path().join("root")).unwrap();
+            let first = opts(Some(root.root().to_path_buf()), ProbeMode::Boot);
+            let (report, result) = run(&first).await;
+            let Err(Refusal::ProbeFailed { check, detail }) = result else {
+                panic!("expected a refusal\n{}", report.render_text());
+            };
+            assert_eq!(check, "probe_uid");
+            assert!(detail.contains("move --uid-range"), "{detail}");
+            let pool = open_accounts(&root, Opener::Broker).await.unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                Provisioner::stored_uid_range(&mut conn).await.unwrap(),
+                None
+            );
+            drop(conn);
+            pool.close().await;
+
+            // Moved, as told: the next boot passes and pins the new range.
+            let moved = ProbeOptions {
+                uid_range: UidRange::new(28_600, 28_620).unwrap(),
+                ..first
+            };
+            let (report, result) = run(&moved).await;
+            assert!(result.is_ok(), "{}", report.render_text());
+            let pool = open_accounts(&root, Opener::Broker).await.unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                Provisioner::stored_uid_range(&mut conn).await.unwrap(),
+                Some("28600-28620".to_string())
+            );
+            drop(conn);
+            pool.close().await;
         }
 
         impl HostUser {

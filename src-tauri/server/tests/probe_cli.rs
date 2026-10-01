@@ -8,7 +8,14 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ikenga-server");
+/// The binary under test: cargo's, unless `IKENGA_SERVER_BIN` names a copy
+/// (the CI `t1-root` job runs these test binaries in a container with the
+/// server installed at `/opt/t1/ikenga-server`).
+fn bin() -> PathBuf {
+    std::env::var_os("IKENGA_SERVER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ikenga-server")))
+}
 
 struct TempDir(PathBuf);
 
@@ -34,7 +41,7 @@ impl Drop for TempDir {
 }
 
 fn probe(args: &[&str]) -> Output {
-    Command::new(BIN)
+    Command::new(bin())
         .arg("probe")
         .args(args)
         .env_remove("IKENGA_DATA_DIR")
@@ -119,7 +126,7 @@ fn t1_root_probe_passes_read_only_and_the_boot_refuses_after_probing() {
     assert!(report.contains("\"probe_uid\": 28810"), "{report}");
     assert!(!data.exists(), "read-only creates nothing");
 
-    let boot = Command::new(BIN)
+    let boot = Command::new(bin())
         .args(["--executor-tier", "t1", "--data-dir", data_s, "--port", "0"])
         .args(range)
         .env_remove("IKENGA_DATA_DIR")

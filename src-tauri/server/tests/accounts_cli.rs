@@ -8,7 +8,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const BIN: &str = env!("CARGO_BIN_EXE_ikenga-server");
+/// The binary under test: cargo's, unless `IKENGA_SERVER_BIN` names a copy
+/// (the CI `t1-root` job runs these test binaries in a container with the
+/// server installed at `/opt/t1/ikenga-server`).
+fn bin() -> PathBuf {
+    std::env::var_os("IKENGA_SERVER_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ikenga-server")))
+}
 
 struct TempDir(PathBuf);
 
@@ -44,7 +51,7 @@ struct Run {
 fn run(scratch: &Path, args: &[&str], stdin: &str, timeout: Duration) -> Run {
     let out_path = scratch.join("stdout");
     let err_path = scratch.join("stderr");
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(bin())
         .args(args)
         .env("RUST_LOG", "trace")
         .env_remove("IKENGA_DATA_DIR")

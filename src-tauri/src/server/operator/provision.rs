@@ -244,17 +244,23 @@ impl Backend {
         }
     }
 
+    /// The user `name` (uid = gid = `uid`) and, with `own_group`, its
+    /// user-private group. `own_group = false`: the group is already there
+    /// (reconcile recreating only a lost passwd entry).
     fn create_identity(
         &self,
         name: &str,
         uid: u32,
         home: &Path,
         shell: &Path,
+        own_group: bool,
     ) -> anyhow::Result<()> {
         match self {
             Backend::ShadowUtils(t) => {
                 let (uid_s, home_s) = (uid.to_string(), home.as_os_str());
-                t.run(&t.groupadd, &["-g".as_ref(), uid_s.as_ref(), name.as_ref()])?;
+                if own_group {
+                    t.run(&t.groupadd, &["-g".as_ref(), uid_s.as_ref(), name.as_ref()])?;
+                }
                 let useradd = t.run(
                     &t.useradd,
                     &[
@@ -285,7 +291,9 @@ impl Backend {
                     ],
                 );
                 if let Err(e) = useradd {
-                    let _ = t.run(&t.groupdel, &[name.as_ref()]);
+                    if own_group {
+                        let _ = t.run(&t.groupdel, &[name.as_ref()]);
+                    }
                     return Err(e);
                 }
                 Ok(())
@@ -297,7 +305,20 @@ impl Backend {
                 gecos: GECOS,
                 home,
                 shell,
+                own_group,
             })?),
+            Backend::External => anyhow::bail!("external provisioning never writes /etc"),
+        }
+    }
+
+    /// Recreate a lost user-private group (§8 step 7).
+    fn create_group(&self, name: &str, gid: u32) -> anyhow::Result<()> {
+        match self {
+            Backend::ShadowUtils(t) => {
+                let gid_s = gid.to_string();
+                t.run(&t.groupadd, &["-g".as_ref(), gid_s.as_ref(), name.as_ref()])
+            }
+            Backend::Builtin(files) => Ok(files.add_group(name, gid)?),
             Backend::External => anyhow::bail!("external provisioning never writes /etc"),
         }
     }
@@ -565,8 +586,18 @@ pub struct ReconcileReport {
     pub checked: usize,
     /// Host users (re)created.
     pub created: Vec<String>,
+    /// User-private groups (re)created (with or without their user).
+    pub created_groups: Vec<String>,
     /// Host users whose drifted shell was restored.
     pub repaired_shell: Vec<String>,
+}
+
+/// What [`Provisioner::ensure_identity`] repaired.
+#[derive(Debug, Clone, Copy, Default)]
+struct IdentityFix {
+    created_user: bool,
+    created_group: bool,
+    repaired_shell: bool,
 }
 
 /// Result of a §7.3 disable.
@@ -862,6 +893,15 @@ impl Provisioner {
         Ok(())
     }
 
+    /// The range `accounts.db` is pinned to, if any (read-only).
+    pub async fn stored_uid_range(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = 'uid_range'")
+            .fetch_optional(conn)
+            .await
+    }
+
     /// Record `--uid-range` in the store the first time it provisions, and
     /// refuse a different one afterwards (the CLI and the broker are separate
     /// invocations; a mismatch would let one allocate the other's probe uid).
@@ -871,11 +911,7 @@ impl Provisioner {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
     ) -> Result<(), ProvisionError> {
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = 'uid_range'")
-                .fetch_optional(&mut **tx)
-                .await?;
-        match stored {
+        match Self::stored_uid_range(&mut **tx).await? {
             None => {
                 sqlx::query("INSERT INTO operator_meta (key, value) VALUES ('uid_range', ?)")
                     .bind(self.range.to_string())
@@ -1008,7 +1044,13 @@ impl Provisioner {
             }),
         };
         self.backend
-            .create_identity(&unix_name, uid, &guard.account.home, &guard.account.shell)
+            .create_identity(
+                &unix_name,
+                uid,
+                &guard.account.home,
+                &guard.account.shell,
+                true,
+            )
             .map_err(ProvisionError::Host)?;
         if let Some(undo) = guard.undo.as_mut() {
             undo.identity = true;
@@ -1270,12 +1312,23 @@ impl Provisioner {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let account = Self::lookup(&mut tx, username).await?;
         let account = accounts::mark_enabled_in(&mut tx, account.principal_id, self.actor).await?;
-        self.backend
-            .unlock(&account.unix_name, &account.shell)
-            .map_err(ProvisionError::Host)?;
+        // Reconcile skips disabled rows, so a redeploy that reset /etc while
+        // this account was disabled left it without an entry (review S2-5):
+        // recreate it here, after the same checks reconcile makes.
+        let fix = self.ensure_identity(&account, false)?;
+        if !fix.created_user {
+            self.backend
+                .unlock(&account.unix_name, &account.shell)
+                .map_err(ProvisionError::Host)?;
+        }
         if let Err(e) = tx.commit().await {
-            // Fail closed: the row is still disabled, so lock /etc again.
-            let _ = self.backend.lock(&account.unix_name, &self.nologin);
+            // Fail closed: the row is still disabled, so lock /etc again
+            // (or take back the entry this call created).
+            if fix.created_user {
+                let _ = self.backend.remove_identity(&account.unix_name);
+            } else {
+                let _ = self.backend.lock(&account.unix_name, &self.nologin);
+            }
             return Err(e.into());
         }
         Ok(account)
@@ -1297,13 +1350,159 @@ impl Provisioner {
         }
     }
 
-    /// §8 step 7 — `/etc` is a projection of `accounts.db` (§4): for every
-    /// non-disabled row the passwd entry must match `(unix_name, uid, gid,
-    /// home, shell)`. A missing entry of an allocated account is recreated
-    /// with the §7.2 backend; a drifted shell is restored. Anything else —
-    /// the row's uid or name held by a **different** host entry, a moved
-    /// home, a missing adopted user, or a missing entry under
-    /// `--provisioning external` — is refused, never rewritten. Reconcile
+    fn group_by_gid(&self, gid: u32) -> Result<Option<sys::GroupInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.group_by_gid(gid).map_err(host_err),
+            _ => sys::group_by_gid(gid).map_err(host_err),
+        }
+    }
+
+    fn group_by_name(&self, name: &str) -> Result<Option<sys::GroupInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.group_by_name(name).map_err(host_err),
+            _ => sys::group_by_name(name).map_err(host_err),
+        }
+    }
+
+    /// One account's §8 step 7 check-and-repair, shared by reconcile and
+    /// `enable`. The passwd entry must match `(unix_name, uid, gid, home)`
+    /// and, for an allocated account, the group holding its gid must be its
+    /// user-private group `unix_name` (review S2-4). A missing entry or group
+    /// of an allocated account is recreated; a drifted shell is restored when
+    /// `restore_shell`. Anything else — the uid, gid or name held by a
+    /// **different** host entry, a moved home, a missing adopted user, or a
+    /// missing entry under `--provisioning external` — is refused, never
+    /// rewritten.
+    fn ensure_identity(
+        &self,
+        a: &Account,
+        restore_shell: bool,
+    ) -> Result<IdentityFix, ProvisionError> {
+        let who = format!("account `{}` ({})", a.username, a.unix_name);
+        let external = matches!(self.backend, Backend::External);
+        let mut fix = IdentityFix::default();
+        if let Some(holder) = self.passwd_by_uid(a.unix_uid)? {
+            if holder.name != a.unix_name {
+                return Err(ProvisionError::Drift(format!(
+                    "{who}: uid {} is held by host user `{}`",
+                    a.unix_uid, holder.name
+                )));
+            }
+        }
+        let existing = self.passwd_by_name(&a.unix_name)?;
+        match &existing {
+            Some(pw) => {
+                if (pw.uid, pw.gid) != (a.unix_uid, a.unix_gid) {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: the host entry has uid:gid {}:{}, accounts.db {}:{}",
+                        pw.uid, pw.gid, a.unix_uid, a.unix_gid
+                    )));
+                }
+                if pw.home != a.home {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: the host entry's home is {}, accounts.db's {}",
+                        pw.home.display(),
+                        a.home.display()
+                    )));
+                }
+            }
+            None if a.adopted => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who} is adopted, but host user `{}` no longer exists; recreate it \
+                     (uid {}, home {})",
+                    a.unix_name,
+                    a.unix_uid,
+                    a.home.display()
+                )))
+            }
+            None if external => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who} has no host user, and --provisioning external never writes \
+                     /etc; pre-create `{}` with uid {} and home {}",
+                    a.unix_name,
+                    a.unix_uid,
+                    a.home.display()
+                )))
+            }
+            None => {}
+        }
+
+        // The group. An adopted user's primary group is the operator's
+        // (any name); an allocated account's is its own `unix_name`.
+        let need_group = match self.group_by_gid(a.unix_gid)? {
+            Some(g) if a.adopted || g.name == a.unix_name => false,
+            Some(g) => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who}: gid {} is held by host group `{}`, not `{}`",
+                    a.unix_gid, g.name, a.unix_name
+                )))
+            }
+            None if a.adopted => {
+                tracing::warn!(
+                    "{who}: no host group holds its primary gid {} (operator-managed; left as is)",
+                    a.unix_gid
+                );
+                false
+            }
+            None => {
+                if let Some(g) = self.group_by_name(&a.unix_name)? {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: host group `{}` has gid {}, accounts.db {}",
+                        g.name, g.gid, a.unix_gid
+                    )));
+                }
+                if external {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: no host group holds gid {}, and --provisioning external never \
+                         writes /etc; pre-create group `{}` with gid {}",
+                        a.unix_gid, a.unix_name, a.unix_gid
+                    )));
+                }
+                true
+            }
+        };
+
+        match existing {
+            None => {
+                self.backend
+                    .create_identity(&a.unix_name, a.unix_uid, &a.home, &a.shell, need_group)
+                    .map_err(ProvisionError::Host)?;
+                tracing::info!("recreated host user {} (uid {})", a.unix_name, a.unix_uid);
+                fix.created_user = true;
+                fix.created_group = need_group;
+            }
+            Some(pw) => {
+                if need_group {
+                    self.backend
+                        .create_group(&a.unix_name, a.unix_gid)
+                        .map_err(ProvisionError::Host)?;
+                    tracing::info!("recreated host group {} (gid {})", a.unix_name, a.unix_gid);
+                    fix.created_group = true;
+                }
+                if restore_shell && pw.shell != a.shell {
+                    if a.adopted || external {
+                        tracing::warn!(
+                            "{who}: host shell {} differs from {} (operator-managed; left as is)",
+                            pw.shell.display(),
+                            a.shell.display()
+                        );
+                    } else {
+                        self.backend
+                            .unlock(&a.unix_name, &a.shell)
+                            .map_err(ProvisionError::Host)?;
+                        fix.repaired_shell = true;
+                    }
+                }
+            }
+        }
+        Ok(fix)
+    }
+
+    /// §8 step 7 — `/etc` is a projection of `accounts.db` (§4): every
+    /// non-disabled row goes through [`Self::ensure_identity`] (passwd entry
+    /// and user-private group; missing ones of allocated accounts recreated
+    /// with the §7.2 backend, a drifted shell restored, anything else
+    /// refused). Disabled rows are skipped: `enable` repairs them. Reconcile
     /// never writes the probe uid: no row holds it (§7.2).
     pub async fn reconcile(&self, pool: &SqlitePool) -> Result<ReconcileReport, ProvisionError> {
         let rows = {
@@ -1313,75 +1512,15 @@ impl Provisioner {
         let mut report = ReconcileReport::default();
         for a in rows.iter().filter(|a| !a.is_disabled()) {
             report.checked += 1;
-            let who = format!("account `{}` ({})", a.username, a.unix_name);
-            if let Some(holder) = self.passwd_by_uid(a.unix_uid)? {
-                if holder.name != a.unix_name {
-                    return Err(ProvisionError::Drift(format!(
-                        "{who}: uid {} is held by host user `{}`",
-                        a.unix_uid, holder.name
-                    )));
-                }
+            let fix = self.ensure_identity(a, true)?;
+            if fix.created_user {
+                report.created.push(a.unix_name.clone());
             }
-            match self.passwd_by_name(&a.unix_name)? {
-                Some(pw) => {
-                    if (pw.uid, pw.gid) != (a.unix_uid, a.unix_gid) {
-                        return Err(ProvisionError::Drift(format!(
-                            "{who}: the host entry has uid:gid {}:{}, accounts.db {}:{}",
-                            pw.uid, pw.gid, a.unix_uid, a.unix_gid
-                        )));
-                    }
-                    if pw.home != a.home {
-                        return Err(ProvisionError::Drift(format!(
-                            "{who}: the host entry's home is {}, accounts.db's {}",
-                            pw.home.display(),
-                            a.home.display()
-                        )));
-                    }
-                    if pw.shell != a.shell {
-                        if a.adopted || matches!(self.backend, Backend::External) {
-                            tracing::warn!(
-                                "{who}: host shell {} differs from {} (operator-managed; left \
-                                 as is)",
-                                pw.shell.display(),
-                                a.shell.display()
-                            );
-                        } else {
-                            self.backend
-                                .unlock(&a.unix_name, &a.shell)
-                                .map_err(ProvisionError::Host)?;
-                            report.repaired_shell.push(a.unix_name.clone());
-                        }
-                    }
-                }
-                None if a.adopted => {
-                    return Err(ProvisionError::Drift(format!(
-                        "{who} is adopted, but host user `{}` no longer exists; recreate it \
-                         (uid {}, home {})",
-                        a.unix_name,
-                        a.unix_uid,
-                        a.home.display()
-                    )))
-                }
-                None if matches!(self.backend, Backend::External) => {
-                    return Err(ProvisionError::Drift(format!(
-                        "{who} has no host user, and --provisioning external never writes \
-                         /etc; pre-create `{}` with uid {} and home {}",
-                        a.unix_name,
-                        a.unix_uid,
-                        a.home.display()
-                    )))
-                }
-                None => {
-                    self.backend
-                        .create_identity(&a.unix_name, a.unix_uid, &a.home, &a.shell)
-                        .map_err(ProvisionError::Host)?;
-                    tracing::info!(
-                        "reconcile: recreated host user {} (uid {})",
-                        a.unix_name,
-                        a.unix_uid
-                    );
-                    report.created.push(a.unix_name.clone());
-                }
+            if fix.created_group {
+                report.created_groups.push(a.unix_name.clone());
+            }
+            if fix.repaired_shell {
+                report.repaired_shell.push(a.unix_name.clone());
             }
         }
         Ok(report)
@@ -1679,6 +1818,7 @@ mod tests {
                 gecos: "",
                 home: Path::new("/home/eve"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
         let err = f
@@ -1905,6 +2045,7 @@ mod tests {
                 gecos: "",
                 home: Path::new("/home/intruder"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
         let err = f.prov.reconcile(&f.pool).await.unwrap_err();
@@ -1926,6 +2067,7 @@ mod tests {
                 gecos: "",
                 home: Path::new("/elsewhere"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
         let err = f.prov.reconcile(&f.pool).await.unwrap_err();
@@ -1933,6 +2075,163 @@ mod tests {
             matches!(&err, ProvisionError::Drift(why) if why.contains("home")),
             "{err}"
         );
+    }
+
+    /// Review S2-4: the user-private group is part of the projection. A
+    /// lost group is recreated (with or without its user); a lost user whose
+    /// group survived gets only its passwd entry back.
+    #[tokio::test]
+    async fn reconcile_recreates_a_missing_group() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        let drop_group = |etc: &EtcFiles| {
+            for file in ["group", "gshadow"] {
+                let path = etc_path(etc, file);
+                let text = std::fs::read_to_string(&path).unwrap();
+                let kept: String = text
+                    .lines()
+                    .filter(|l| !l.starts_with("ik-ada:"))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                std::fs::write(&path, kept).unwrap();
+            }
+        };
+        drop_group(&f.etc);
+        assert!(f.etc.line("group", "ik-ada").is_none());
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created_groups, vec!["ik-ada".to_string()]);
+        assert!(report.created.is_empty());
+        assert_eq!(
+            f.etc.line("group", "ik-ada").unwrap(),
+            format!("ik-ada:x:{}:", ada.unix_gid)
+        );
+        assert_eq!(f.etc.line("gshadow", "ik-ada").unwrap(), "ik-ada:!::");
+
+        // Only the passwd side lost: the surviving group is reused.
+        let pw_line = f.etc.line("passwd", "ik-ada").unwrap();
+        let path = etc_path(&f.etc, "passwd");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace(&format!("{pw_line}\n"), "")).unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created, vec!["ik-ada".to_string()]);
+        assert!(report.created_groups.is_empty());
+        assert_eq!(
+            f.etc.passwd_by_name("ik-ada").unwrap().unwrap().gid,
+            ada.unix_gid
+        );
+        let groups = std::fs::read_to_string(etc_path(&f.etc, "group")).unwrap();
+        assert_eq!(groups.matches("ik-ada:").count(), 1);
+
+        // Idempotent.
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert!(report.created.is_empty() && report.created_groups.is_empty());
+    }
+
+    /// Review S2-4: the account's gid held by a different host group, or its
+    /// group name moved to another gid, is drift — refused, not rewritten.
+    #[tokio::test]
+    async fn reconcile_refuses_group_drift() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        let path = etc_path(&f.etc, "group");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                &format!("ik-ada:x:{}:", ada.unix_gid),
+                &format!("squatter:x:{}:", ada.unix_gid),
+            ),
+        )
+        .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("squatter")),
+            "{err}"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                &format!("squatter:x:{}:", ada.unix_gid),
+                "ik-ada:x:3900000005:",
+            ),
+        )
+        .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("has gid 3900000005")),
+            "{err}"
+        );
+    }
+
+    /// Review S2-5: an account disabled when a redeploy reset `/etc` (so
+    /// reconcile never re-projected it) can be enabled: enable recreates the
+    /// entry, with the account's real shell.
+    #[tokio::test]
+    async fn enable_recreates_an_entry_lost_while_disabled() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        assert_eq!(f.prov.reconcile(&f.pool).await.unwrap().checked, 0);
+
+        let e = f.prov.enable(&f.pool, "ada").await.unwrap();
+        assert!(!e.is_disabled());
+        let pw = f.etc.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!(
+            (pw.uid, pw.gid, pw.home.clone(), pw.shell.clone()),
+            (
+                ada.unix_uid,
+                ada.unix_gid,
+                ada.home.clone(),
+                ada.shell.clone()
+            )
+        );
+        assert!(f.etc.line("group", "ik-ada").is_some());
+
+        // A uid taken meanwhile still refuses, and the enable rolls back.
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "intruder",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/home/intruder"),
+                shell: Path::new("/bin/sh"),
+                own_group: true,
+            })
+            .unwrap();
+        let err = f.prov.enable(&f.pool, "ada").await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("intruder")),
+            "{err}"
+        );
+        let mut conn = f.pool.acquire().await.unwrap();
+        assert!(accounts::by_username(&mut conn, "ada")
+            .await
+            .unwrap()
+            .unwrap()
+            .is_disabled());
+    }
+
+    fn etc_path(etc: &EtcFiles, file: &str) -> std::path::PathBuf {
+        // The fixture's EtcFiles is `<prefix>/etc`; `line` reads the same files.
+        etc.path_for_tests(file)
     }
 
     /// `--provisioning external` never writes `/etc`, so a missing entry is
@@ -2349,6 +2648,7 @@ mod tests {
                 gecos: GECOS,
                 home: Path::new("/nonexistent/t1root-cy"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
             let pw = sys::user_by_name("ik-t1root-cy")
