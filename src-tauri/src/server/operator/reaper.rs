@@ -301,7 +301,7 @@ pub(crate) fn ancestor_holding_uid(uid: u32) -> io::Result<Option<i32>> {
         let Some(status) = read_status(pid) else {
             return Ok(None);
         };
-        if status_holds_uid(&status, uid) {
+        if group_holds_uid(&status, uid, || any_task_live(pid)) {
             return Ok(Some(pid));
         }
         pid = status
