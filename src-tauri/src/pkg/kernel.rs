@@ -1382,7 +1382,9 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             return Ok(());
         }
         // Finish any uninstall whose folder move was blocked by a file lock,
-        // and prune expired uninstall backups, before discovering.
+        // and prune expired uninstall backups, before discovering. Installer
+        // scratch (`.staging-*` / `.bak-*`) was already reaped by
+        // `sweep_install_scratch` at the top of `boot()`, which runs first.
         uninstall_dir::sweep(&dir, uninstall_dir::BACKUP_RETENTION);
         let entries = std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?;
         for entry in entries.flatten() {
@@ -1454,6 +1456,23 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// loads gets logged and skipped — the row stays so the user can decide
     /// to repair or uninstall via the UI.
     pub fn boot(&self) -> Result<()> {
+        // Reap installer scratch (`.staging-*`, `.bak-*`) a crash or restart
+        // mid-install left in the pkgs dir. Runs BEFORE the row replay (and so
+        // before `install_from_pkgs_dir`'s discovery): an update that died
+        // between moving `<id>` aside and promoting the new one gets its
+        // `.bak-<id>` restored here, so its row loads from the restored folder
+        // with its recorded provenance instead of being skipped now and then
+        // rediscovered as a `Local` pkg. Called from Tauri setup before
+        // `KernelState` is managed, so no install command can be in flight;
+        // the sweep's min-age guard covers a concurrent CLI `ikenga add`.
+        match self.pkgs_dir() {
+            Ok(dir) => {
+                uninstall_dir::sweep_install_scratch(&dir, uninstall_dir::INSTALL_SCRATCH_MIN_AGE)
+            }
+            Err(e) => log::warn!(
+                "[pkg_kernel] pkgs dir unresolved, skipping install-scratch sweep: {e:#}"
+            ),
+        }
         let db = self.db.clone();
         let (rows, total_rows): (
             Vec<(String, String, i64, Option<String>, Option<String>)>,
@@ -2623,6 +2642,82 @@ mod tests {
 
         // A missing pkgs dir is simply empty, never an error.
         assert!(scan_pkgs_dir(&pkgs.join("absent"), &HashSet::new(), &HashSet::new()).is_empty());
+    }
+
+    /// A builtin pkg's `pkg_installed` row points at the bundled resource dir,
+    /// outside the pkgs dir. The row scan reports it healthy, and the pkgs-dir
+    /// half of `health_scan` (`unregistered_dir_issues` = `scan_pkgs_dir` over
+    /// `tracked_sets` of the same rows) never flags it, even when a stale
+    /// same-id folder that fails to load sits in the pkgs dir.
+    #[test]
+    fn builtin_row_outside_pkgs_dir_is_healthy_and_never_flagged() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let root = tempfile::tempdir().expect("tempdir");
+        let builtin = root
+            .path()
+            .join("resources")
+            .join("builtin-pkgs")
+            .join("com.ikenga.iyke");
+        write_manifest(
+            &builtin,
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.1.0", "ikenga_api": "5"}"#,
+        );
+        let pkgs = root.path().join("pkgs");
+        // A stale same-id copy in the pkgs dir that would not load
+        // (api-incompatible): the tracked id suppresses it.
+        write_manifest(
+            &pkgs.join("com.ikenga.iyke"),
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.0.1", "ikenga_api": "99"}"#,
+        );
+        let builtin_path = builtin.display().to_string();
+
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            for ddl in [
+                "CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, version TEXT, ikenga_api TEXT, manifest_json TEXT, install_path TEXT NOT NULL, installed_at INTEGER, enabled INTEGER NOT NULL DEFAULT 1, signature TEXT, source_json TEXT, project_id TEXT)",
+                "CREATE TABLE pkg_capability_snapshots (pkg_id TEXT PRIMARY KEY, manifest_capabilities_json TEXT NOT NULL, approved_at INTEGER NOT NULL, approved_by_implicit INTEGER NOT NULL DEFAULT 0)",
+                "CREATE TABLE pkg_settings (pkg_id TEXT, key TEXT, value_json TEXT, updated_at INTEGER, PRIMARY KEY (pkg_id, key))",
+                "CREATE TABLE pkg_permissions_granted (pkg_id TEXT, scope TEXT, granted_at INTEGER, PRIMARY KEY (pkg_id, scope))",
+                "CREATE TABLE pkg_migrations (pkg_id TEXT, version TEXT, applied_at INTEGER, PRIMARY KEY (pkg_id, version))",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.expect("create table");
+            }
+            sqlx::query(
+                "INSERT INTO pkg_installed (id, version, ikenga_api, manifest_json, install_path, installed_at, enabled, source_json) VALUES (?,?,?,?,?,?,?,?)",
+            )
+            .bind("com.ikenga.iyke")
+            .bind("0.1.0")
+            .bind("5")
+            .bind("{}")
+            .bind(&builtin_path)
+            .bind(0)
+            .bind(1)
+            .bind(r#"{"kind":"builtin"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let issues = scan_health(&pool).await.expect("scan");
+            assert!(issues.is_empty(), "builtin row is healthy; got {issues:?}");
+
+            let rows = read_install_rows(&pool).await.expect("rows");
+            assert_eq!(
+                rows,
+                vec![("com.ikenga.iyke".to_string(), builtin_path.clone(), true)]
+            );
+            let (tracked_ids, tracked_paths) = tracked_sets(&rows);
+            let dir_issues = scan_pkgs_dir(&pkgs, &tracked_ids, &tracked_paths);
+            assert!(
+                dir_issues.is_empty(),
+                "tracked builtin id is never flagged from the pkgs dir; got {dir_issues:?}"
+            );
+            let registered: HashSet<String> = ["com.ikenga.iyke".to_string()].into_iter().collect();
+            assert!(scan_unregistered_rows(&rows, &HashSet::new(), &registered).is_empty());
+        });
     }
 
     const MEETINGS_020: &str = r#"{"id": "com.ikenga.meetings", "name": "Meetings", "version": "0.2.0",

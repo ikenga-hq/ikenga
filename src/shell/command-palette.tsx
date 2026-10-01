@@ -33,6 +33,11 @@ import { fuzzyMatchSection, slugifySectionId, usePinsStore } from '@/lib/shell/p
 import { useShellStore } from '@/lib/shell/shell-store';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles, type TerminalTitleResolver } from '@/terminal/use-terminal-titles';
+import {
+	usePaneDisplayNameResolver,
+	type PaneDisplayNameResolver,
+} from './panes/use-pane-display-names';
+import { routeLabelInfo } from './panes/pane-view-label';
 import { ChromePickerDialog } from './chrome-picker/chrome-picker-dialog';
 import { ActionsGroup, ChiGroup, ManageGroup } from './palette-actions';
 import { ShortcutsView } from './shortcuts-view';
@@ -348,22 +353,37 @@ interface SwitcherEntry {
 	view: PaneView;
 }
 
-function collectOpenTabs(node: PaneNode, resolveTerminal: TerminalTitleResolver): SwitcherEntry[] {
+function collectOpenTabs(
+	node: PaneNode,
+	resolveTerminal: TerminalTitleResolver,
+	resolveDisplayName: PaneDisplayNameResolver
+): SwitcherEntry[] {
 	if (node.type === 'leaf') {
 		return node.tabs.map((view, tabIdx) => ({
 			paneId: node.id,
 			tabIdx,
-			label: viewLabelShort(view, resolveTerminal),
+			label: viewLabelShort(view, resolveTerminal, resolveDisplayName),
 			view,
 		}));
 	}
-	return node.children.flatMap((child) => collectOpenTabs(child, resolveTerminal));
+	return node.children.flatMap((child) =>
+		collectOpenTabs(child, resolveTerminal, resolveDisplayName)
+	);
 }
 
-function viewLabelShort(view: PaneView, resolveTerminal: TerminalTitleResolver): string {
+function viewLabelShort(
+	view: PaneView,
+	resolveTerminal: TerminalTitleResolver,
+	resolveDisplayName: PaneDisplayNameResolver
+): string {
 	switch (view.kind) {
-		case 'route':
-			return `Route ${view.path}`;
+		case 'route': {
+			// `/pkg/<id>` and `/ngwa/item/<id>` resolve to a display name — same
+			// resolver the tab strip and address bar use — so the switcher shows
+			// "Route · Studio" instead of the raw "Route /pkg/com.ikenga.studio".
+			const info = routeLabelInfo(view.path, resolveDisplayName);
+			return info.resolved ? `Route · ${info.label}` : `Route ${view.path}`;
+		}
 		case 'terminal': {
 			// A uuid slice is unsearchable — you can't type "claude" to find the
 			// terminal running claude. The real label is, and it doubles as the
@@ -386,8 +406,9 @@ function SwitcherGroup({ onClose }: { onClose: () => void }) {
 	const focusPane = usePaneStore((s) => s.focusPane);
 	const switchTab = usePaneStore((s) => s.switchTab);
 	const resolveTerminal = useTerminalTitles();
+	const resolveDisplayName = usePaneDisplayNameResolver();
 
-	const entries = collectOpenTabs(root, resolveTerminal);
+	const entries = collectOpenTabs(root, resolveTerminal, resolveDisplayName);
 
 	function focusEntry(entry: SwitcherEntry) {
 		onClose();
@@ -788,7 +809,8 @@ export function useCommandPalette() {
 			setState({ open: true, mode: modeRef.current === 'shortcuts' ? 'all' : 'shortcuts' }),
 		'shortcuts.open': () => setState({ open: true, mode: 'shortcuts' }),
 		'shortcuts.open-quick': () => {
-			if (openRef.current && modeRef.current === 'shortcuts') setState({ open: false, mode: 'all' });
+			if (openRef.current && modeRef.current === 'shortcuts')
+				setState({ open: false, mode: 'all' });
 			else setState({ open: true, mode: 'shortcuts' });
 		},
 	});
