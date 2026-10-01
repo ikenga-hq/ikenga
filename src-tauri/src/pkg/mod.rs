@@ -79,6 +79,8 @@ pub mod webview;
 #[cfg(feature = "desktop")]
 pub use engine_adapter::EngineAdaptersRegistry;
 #[cfg(feature = "desktop")]
+pub(crate) use kernel::normalize_scope;
+#[cfg(feature = "desktop")]
 pub use kernel::{DiscoveredPkg, Kernel, PkgHealthIssue, PurgeAllReport, PurgeOutcome};
 #[cfg(feature = "desktop")]
 pub use lifecycle::SidecarSupervisor;

@@ -152,26 +152,42 @@ pub async fn resolve_install_scope_for_iyke(
 /// Parse a wire scope ("workspace" | "project:<id>" | null) into the
 /// Option<String> the kernel persists. Null defaults to the active
 /// project. Returns Err if the slug is malformed.
+///
+/// DEC-71: the Default project is personal scope, so a null scope while
+/// Default is active, or an explicit `"project:default"`, resolves to `None`.
 async fn resolve_install_scope(
     db: Arc<crate::commands::db::PaDb>,
     scope: Option<String>,
 ) -> Result<Option<String>, String> {
     match scope.as_deref() {
-        Some("workspace") => Ok(None),
-        Some(s) if s.starts_with("project:") => {
+        Some(s) => parse_explicit_scope(s),
+        None => {
+            let pool = db.ensure_pool().await.map_err(|e| e.to_string())?;
+            let id = crate::commands::projects::get_active_project_id(&pool).await?;
+            Ok(active_project_scope(id))
+        }
+    }
+}
+
+/// The explicit-scope half of [`resolve_install_scope`]. Pure.
+fn parse_explicit_scope(s: &str) -> Result<Option<String>, String> {
+    match s {
+        "workspace" => Ok(None),
+        s if s.starts_with("project:") => {
             let slug = &s["project:".len()..];
             if slug.is_empty() {
                 return Err("empty project slug".into());
             }
-            Ok(Some(slug.to_string()))
+            Ok(crate::pkg::normalize_scope(Some(slug.to_string())))
         }
-        Some(other) => Err(format!("invalid scope: {other}")),
-        None => {
-            let pool = db.ensure_pool().await.map_err(|e| e.to_string())?;
-            let id = crate::commands::projects::get_active_project_id(&pool).await?;
-            Ok(Some(id))
-        }
+        other => Err(format!("invalid scope: {other}")),
     }
+}
+
+/// The null-scope half of [`resolve_install_scope`]: the active project, or
+/// personal (`None`) when that is the Default project. Pure.
+fn active_project_scope(active_project_id: String) -> Option<String> {
+    crate::pkg::normalize_scope(Some(active_project_id))
 }
 
 #[tauri::command]
@@ -948,5 +964,28 @@ mod tests {
         .await
         .unwrap();
         assert!(!backup_dir.exists());
+    }
+
+    // ── DEC-71: the Default project is personal scope ─────────────────────
+
+    #[test]
+    fn explicit_project_default_resolves_to_personal() {
+        assert_eq!(parse_explicit_scope("project:default"), Ok(None));
+        assert_eq!(parse_explicit_scope("workspace"), Ok(None));
+        assert_eq!(
+            parse_explicit_scope("project:kinnect"),
+            Ok(Some("kinnect".to_string()))
+        );
+        assert!(parse_explicit_scope("project:").is_err());
+        assert!(parse_explicit_scope("default").is_err());
+    }
+
+    #[test]
+    fn null_scope_under_default_project_resolves_to_personal() {
+        assert_eq!(active_project_scope("default".to_string()), None);
+        assert_eq!(
+            active_project_scope("kinnect".to_string()),
+            Some("kinnect".to_string())
+        );
     }
 }

@@ -114,7 +114,9 @@ export function consentBlockedReason(
 
 /** The sheet foot's split Install button: the active project by default, the
  *  caret offers personal. Shared by the registry, catalog and URL sheets.
- *  While blocked, the reason is written out beside it (not only a tooltip). */
+ *  While blocked, the reason is written out beside it (not only a tooltip).
+ *  A null `projectLabel` means there is no project target — a pkg while the
+ *  Default project is active (DEC-71) — so personal is the only target. */
 export function InstallSplit({
 	projectLabel,
 	blocked,
@@ -122,7 +124,7 @@ export function InstallSplit({
 	onInstall,
 	verb = 'Install',
 }: {
-	projectLabel: string;
+	projectLabel: string | null;
 	/** Why Install can't run yet, or null. */
 	blocked: string | null;
 	busy: boolean;
@@ -158,6 +160,9 @@ export function InstallSplit({
 		onInstall(scope);
 	}
 	const describedBy = blocked && !busy ? reasonId : undefined;
+	// The primary button's target: the active project, or personal when there
+	// is no project target.
+	const primary: StoreInstallScope = projectLabel === null ? 'personal' : 'project';
 	return (
 		<>
 			<div className="installsplit" ref={menuRef}>
@@ -169,9 +174,9 @@ export function InstallSplit({
 					aria-busy={busy || undefined}
 					aria-describedby={describedBy}
 					title={blocked ?? undefined}
-					onClick={() => go('project')}
+					onClick={() => go(primary)}
 				>
-					{verb} to {projectLabel}
+					{verb} to {projectLabel ?? 'personal'}
 				</button>
 				<button
 					type="button"
@@ -188,11 +193,16 @@ export function InstallSplit({
 				{menuOpen && (
 					<div className="cellpop storepop up" role="menu" aria-label="Install scope">
 						<div className="mgroup">Install scope</div>
-						<button type="button" role="menuitem" className="mitem" onClick={() => go('project')}>
-							{verb} to {projectLabel} <span className="msub">default here</span>
-						</button>
+						{projectLabel !== null && (
+							<button type="button" role="menuitem" className="mitem" onClick={() => go('project')}>
+								{verb} to {projectLabel} <span className="msub">default here</span>
+							</button>
+						)}
 						<button type="button" role="menuitem" className="mitem" onClick={() => go('personal')}>
-							{verb} to personal <span className="msub">workspace · always loaded</span>
+							{verb} to personal{' '}
+							<span className="msub">
+								{projectLabel === null ? 'default here · ' : ''}workspace · always loaded
+							</span>
 						</button>
 					</div>
 				)}

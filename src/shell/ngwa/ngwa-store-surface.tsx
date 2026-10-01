@@ -30,6 +30,7 @@ import {
 import type { NgwaCatalogRow, NgwaStoreEntry, StoreSource } from '@/lib/ngwa/enrichment';
 import {
 	isNeedsApproval,
+	pkgProjectTarget,
 	type PrimitiveInstallOutcome,
 	type PrimitiveInstallStage,
 } from '@/lib/ngwa/use-store-install';
@@ -90,6 +91,9 @@ export interface NgwaStoreSurfaceProps {
 	loadDetail?: StoreDetailLoader;
 	/** Display name of the active project — the default install target. */
 	activeProjectName?: string;
+	/** Id of the active project. When it is the Default project a pkg has no
+	 *  project target: it installs to personal (DEC-71). */
+	activeProjectId?: string | null;
 	/** Install to a scope. A returned promise drives the foot's "Registering"
 	 *  state; a rejection is shown in the sheet foot. */
 	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void | Promise<unknown>;
@@ -255,6 +259,7 @@ export function NgwaStoreSurface({
 	onRetry,
 	loadDetail,
 	activeProjectName,
+	activeProjectId,
 	onInstall,
 	onUpdate,
 	onUpdateAll,
@@ -485,6 +490,10 @@ export function NgwaStoreSurface({
 	);
 
 	const projectLabel = activeProjectName || 'active project';
+	// DEC-71: pkg scope has no Default project — with Default active a pkg's
+	// target is personal. Primitives keep the project label: Ọba places them
+	// in the project's own root.
+	const pkgTargetLabel = pkgProjectTarget(activeProjectId, projectLabel);
 	const shownCount = filtered.length + filteredPrimitives.length;
 	const indexLine =
 		catalogStatus === 'verified'
@@ -784,7 +793,7 @@ export function NgwaStoreSurface({
 							key={`${selectedEntry.id}@${selectedEntry.latestVersion}`}
 							entry={selectedEntry}
 							loadDetail={loadDetail}
-							projectLabel={projectLabel}
+							projectLabel={pkgTargetLabel}
 							onClose={() => setSelectedId(null)}
 							onInstall={install}
 							onUpdate={update}
@@ -975,7 +984,8 @@ function StoreSheet({
 }: {
 	entry: NgwaStoreEntry;
 	loadDetail: StoreDetailLoader | undefined;
-	projectLabel: string;
+	/** The project install target, or null when there is none (DEC-71). */
+	projectLabel: string | null;
 	onClose: () => void;
 	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
@@ -1016,7 +1026,8 @@ function StoreSheet({
 		onInstall(entry, scope);
 	}
 
-	const scopeLabel = (s: StoreInstallScope) => (s === 'personal' ? 'personal' : projectLabel);
+	const scopeLabel = (s: StoreInstallScope) =>
+		s === 'personal' ? 'personal' : (projectLabel ?? 'personal');
 
 	return (
 		<>
