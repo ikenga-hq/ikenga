@@ -143,22 +143,34 @@ describe('<StatusBar /> — zero hides (T2)', () => {
 		// badge at zero.
 		const bell = screen.getByTestId('status-bar').querySelector('[data-slot="notifications-bell"]');
 		expect(bell).not.toBeNull();
-		expect(bell?.querySelector('button[data-seg="notifications"]')?.getAttribute('aria-label')).toBe(
-			'Notifications, none unread'
-		);
+		expect(
+			bell?.querySelector('button[data-seg="notifications"]')?.getAttribute('aria-label')
+		).toBe('Notifications, none unread');
 	});
 
 	it('hides each Ngwa segment independently and deep-links the rest', async () => {
 		mocks.derived.mockReturnValue(derived({ installed: 22, updates: 0, violations: 2 }));
 		const user = userEvent.setup();
 		render(<StatusBar />);
-		expect(seg('ngwa-installed')?.textContent).toBe('22 installed');
+		// DEC-73 (Round 58): labelled "N pkgs" — the kernel pkg count, not the
+		// full Ngwa item count — so it agrees with the Installed tab's pkg
+		// sub-count (`selectPkgCount`).
+		expect(seg('ngwa-installed')?.textContent).toBe('22 pkgs');
+		expect(seg('ngwa-installed')?.getAttribute('title')).toBe(
+			'22 pkgs installed (all scopes) — open the Installed tab'
+		);
 		expect(seg('ngwa-updates')).toBeNull();
 		expect(seg('ngwa-violations')?.textContent).toBe('2 violations');
 		await user.click(seg('ngwa-installed') as HTMLElement);
 		expect(navigateFocused).toHaveBeenLastCalledWith(NGWA_LINKS.installed);
 		await user.click(seg('ngwa-violations') as HTMLElement);
 		expect(navigateFocused).toHaveBeenLastCalledWith(NGWA_LINKS.violations);
+	});
+
+	it('singularizes the pkg count at one (DEC-73)', async () => {
+		mocks.derived.mockReturnValue(derived({ installed: 1 }));
+		render(<StatusBar />);
+		expect(seg('ngwa-installed')?.textContent).toBe('1 pkg');
 	});
 
 	it('shows branch + modified from the git pkg snapshot, hiding modified at zero', async () => {

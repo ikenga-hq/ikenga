@@ -5,7 +5,9 @@
 // Ngwa actions (the same writers, guards and confirms the Scopes matrix uses).
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { useMemo } from 'react';
 import { z } from 'zod';
+import { selectPkgCount } from '@/lib/ngwa/pkg-count';
 import { useNgwaItemActions } from '@/lib/ngwa/use-ngwa-actions';
 import { useNgwaSnapshot } from '@/lib/ngwa/use-ngwa-snapshot';
 import { NgwaList } from '@/shell/ngwa/ngwa-list';
@@ -32,10 +34,13 @@ function NgwaInstalledPage() {
 		storeCatalog,
 		unreadableSources,
 	});
+	// DEC-73: the pkg sub-count shown next to the Installed total must agree
+	// with the status bar's kernel pkg count — same selector, same definition.
+	const pkgCount = useMemo(() => selectPkgCount(items), [items]);
 
 	return (
 		<div className="view-ngwa flex-1 min-h-0 flex flex-col">
-			<NgwaTabs activeTab="installed" installedCount={items.length} />
+			<NgwaTabs activeTab="installed" installedCount={items.length} pkgCount={pkgCount} />
 			<NgwaList
 				items={items}
 				unreadableSources={unreadableSources}
