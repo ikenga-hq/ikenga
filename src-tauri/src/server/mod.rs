@@ -15,6 +15,10 @@ pub mod chat_ws;
 pub mod discovery;
 pub mod fs_ws;
 pub mod health;
+/// T1 operator: the operator root, `operator/accounts.db`, passwords and the
+/// provisioning core (G-PRINCIPAL §4, §6, §7; WP-20). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod operator;
 pub mod pkg_index;
 pub mod pkg_static;
 pub mod pty_ws;

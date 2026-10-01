@@ -66,7 +66,7 @@ base64 = "0.22"
 # here so the pane native-crop path has it directly. PNG-only to stay lean.
 image = { version = "0.25", default-features = false, features = ["png"] }
 portable-pty = "0.8"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 percent-encoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "process", "io-util"] }
 dashmap = "6"
