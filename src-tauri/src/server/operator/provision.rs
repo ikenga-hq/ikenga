@@ -807,6 +807,11 @@ impl Provisioner {
         self.range
     }
 
+    /// Whether owners are enforced ([`Ownership::Enforce`] in production).
+    pub fn ownership(&self) -> Ownership {
+        self.ownership
+    }
+
     /// `useradd`, `builtin` or `external`.
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
