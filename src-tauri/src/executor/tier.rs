@@ -95,6 +95,16 @@ pub struct Capabilities {
     pub principal_isolation: bool,
 }
 
+/// A §8 boot-probe result as `/api/health` carries it: `ok` and when, nothing
+/// else — the endpoint is unauthenticated, so the full report goes to the log
+/// and `operator/probe.json` (G-PRINCIPAL §8 "Results").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProbeStamp {
+    pub ok: bool,
+    /// Unix seconds.
+    pub at: u64,
+}
+
 /// Why a tier cannot be used. The daemon treats any refusal as fatal at boot
 /// (DEC-R9-1): refuse, don't fall back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,14 +116,27 @@ pub enum Refusal {
         installed: ExecutorTier,
         requested: ExecutorTier,
     },
+    /// A boot-probe check failed (G-PRINCIPAL §8). `check` is a stable name
+    /// (`os`, `identity`, `capabilities`, `operator_root`, `uid_range`,
+    /// `probe_uid`, `test_drop`, `reconcile`, `setup`); `detail` is for the
+    /// operator's log, never for an unauthenticated client.
+    ProbeFailed { check: &'static str, detail: String },
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Refusal::NotImplemented {
+                tier: ExecutorTier::T1,
+            } => f.write_str(
+                "executor tier t1 passed its boot probe, but this build has no T1 broker yet \
+                 (WP-20 slice 3), so it can't serve; refusing to start rather than serving a \
+                 single-tenant daemon as root. `ikenga-server probe --executor-tier t1` \
+                 reports whether this host can run T1",
+            ),
             Refusal::NotImplemented { tier } => write!(
                 f,
-                "executor tier {tier} is not implemented on this build (only t0 is); \
+                "executor tier {tier} is not implemented on this build (only t0 and t1 are); \
                  refusing to start rather than falling back to a weaker tier"
             ),
             Refusal::AlreadyInstalled {
@@ -124,18 +147,26 @@ impl fmt::Display for Refusal {
                 "executor tier {installed} is already installed in this process; \
                  refusing to switch to {requested}"
             ),
+            Refusal::ProbeFailed { check, detail } => write!(
+                f,
+                "t1 boot probe failed at `{check}`: {detail}; refusing to start rather than \
+                 falling back to a weaker tier"
+            ),
         }
     }
 }
 
 impl std::error::Error for Refusal {}
 
-/// Boot capability probe: can this host honour `tier`?
+/// Boot capability probe for the tiers that need no operator context.
 ///
-/// T0 always passes. T1–T3 are refused with [`Refusal::NotImplemented`] until
-/// their executors land (WP-20 onward). When they do, this is where the host
-/// check lives (e.g. T1: can we `setuid`?), so a tier is never *claimed* on a
-/// host that can't deliver it.
+/// T0 always passes. T2/T3 are refused with [`Refusal::NotImplemented`].
+/// T1's probe (G-PRINCIPAL §8) is real and needs the operator root, the uid
+/// range and `accounts.db`: it runs as `server::operator::probe`, whose
+/// host-side steps live in [`super::t1_probe`] and whose passing result is
+/// the only way a [`super::t1::T1Executor`] reports isolation. Called without
+/// that context, T1 is refused with [`Refusal::ProbeFailed`] (`setup`) — a
+/// tier is never *claimed* on a host that hasn't proven it.
 pub fn probe(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
     match tier {
         ExecutorTier::T0 => Ok(Capabilities {
@@ -144,9 +175,13 @@ pub fn probe(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
             piped: true,
             principal_isolation: false,
         }),
-        ExecutorTier::T1 | ExecutorTier::T2 | ExecutorTier::T3 => {
-            Err(Refusal::NotImplemented { tier })
-        }
+        ExecutorTier::T1 => Err(Refusal::ProbeFailed {
+            check: "setup",
+            detail: "the t1 probe needs the operator root (--data-dir) and uid range; it runs \
+                     from the T1 boot and `ikenga-server probe --executor-tier t1`"
+                .into(),
+        }),
+        ExecutorTier::T2 | ExecutorTier::T3 => Err(Refusal::NotImplemented { tier }),
     }
 }
 
@@ -190,8 +225,18 @@ mod tests {
     }
 
     #[test]
-    fn probe_refuses_t1_to_t3_with_a_typed_error() {
-        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
+    fn probe_without_operator_context_refuses_t1() {
+        let refusal = probe(ExecutorTier::T1).expect_err("needs the operator root");
+        assert!(
+            matches!(refusal, Refusal::ProbeFailed { check: "setup", .. }),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("t1 boot probe failed"));
+    }
+
+    #[test]
+    fn probe_refuses_t2_and_t3_with_a_typed_error() {
+        for tier in [ExecutorTier::T2, ExecutorTier::T3] {
             let refusal = probe(tier).expect_err("not implemented on this build");
             assert_eq!(refusal, Refusal::NotImplemented { tier });
             let msg = refusal.to_string();

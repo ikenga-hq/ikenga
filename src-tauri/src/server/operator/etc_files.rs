@@ -31,6 +31,9 @@ pub(crate) struct NewUser<'a> {
     pub gecos: &'a str,
     pub home: &'a Path,
     pub shell: &'a Path,
+    /// Also add the user-private group `name`/`gid`. `false`: that group
+    /// already exists (reconcile recreating only a lost passwd entry).
+    pub own_group: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +202,99 @@ impl EtcFiles {
         self.contains("group", |_, id| id == Some(gid))
     }
 
+    /// The passwd entry matching `pred`, parsed (§8 step 7 reconcile).
+    fn passwd_entry(
+        &self,
+        pred: impl Fn(&str, Option<u32>) -> bool,
+    ) -> io::Result<Option<sys::PasswdInfo>> {
+        let Some(text) = self.read("passwd")? else {
+            return Ok(None);
+        };
+        for line in text.lines() {
+            let Some((name, id)) = name_and_id(line) else {
+                continue;
+            };
+            if !pred(name, id) {
+                continue;
+            }
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() < 7 {
+                return Err(invalid(format!("malformed passwd line for {name}")));
+            }
+            let num = |v: &str| {
+                v.parse::<u32>()
+                    .map_err(|_| invalid(format!("malformed passwd id `{v}` for {name}")))
+            };
+            return Ok(Some(sys::PasswdInfo {
+                name: name.to_string(),
+                uid: num(f[2])?,
+                gid: num(f[3])?,
+                home: PathBuf::from(f[5]),
+                shell: PathBuf::from(f[6]),
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn passwd_by_name(&self, name: &str) -> io::Result<Option<sys::PasswdInfo>> {
+        self.passwd_entry(|n, _| n == name)
+    }
+
+    pub(crate) fn passwd_by_uid(&self, uid: u32) -> io::Result<Option<sys::PasswdInfo>> {
+        self.passwd_entry(|_, id| id == Some(uid))
+    }
+
+    /// The group entry matching `pred`, parsed (§8 step 7 reconcile).
+    fn group_entry(
+        &self,
+        pred: impl Fn(&str, Option<u32>) -> bool,
+    ) -> io::Result<Option<sys::GroupInfo>> {
+        let Some(text) = self.read("group")? else {
+            return Ok(None);
+        };
+        for (name, id) in text.lines().filter_map(name_and_id) {
+            if !pred(name, id) {
+                continue;
+            }
+            let gid = id.ok_or_else(|| invalid(format!("malformed group line for {name}")))?;
+            return Ok(Some(sys::GroupInfo {
+                name: name.to_string(),
+                gid,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn group_by_gid(&self, gid: u32) -> io::Result<Option<sys::GroupInfo>> {
+        self.group_entry(|_, id| id == Some(gid))
+    }
+
+    pub(crate) fn group_by_name(&self, name: &str) -> io::Result<Option<sys::GroupInfo>> {
+        self.group_entry(|n, _| n == name)
+    }
+
+    /// Add group `name`/`gid` (and its gshadow line), refusing if either is
+    /// already in `group`.
+    pub(crate) fn add_group(&self, name: &str, gid: u32) -> io::Result<()> {
+        check_field("name", name)?;
+        let _lock = self.lock()?;
+        if self.contains("group", |n, id| n == name || id == Some(gid))? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "group {name} or gid {gid} is already in {}",
+                    self.file("group").display()
+                ),
+            ));
+        }
+        self.rewrite("group", true, append_line(format!("{name}:x:{gid}:")))?;
+        if let Err(e) = self.rewrite("gshadow", false, append_line(format!("{name}:!::"))) {
+            let _ = self.rewrite("group", false, |cur| without(cur, name));
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub(crate) fn name_taken(&self, name: &str) -> io::Result<bool> {
         Ok(self.contains("passwd", |n, _| n == name)?
             || self.contains("group", |n, _| n == name)?)
@@ -222,7 +318,16 @@ impl EtcFiles {
         check_field("shell", shell)?;
 
         let _lock = self.lock()?;
-        if self.name_taken(user.name)? || self.uid_taken(user.uid)? || self.gid_taken(user.gid)? {
+        let group_clash = if user.own_group {
+            self.contains("group", |n, _| n == user.name)? || self.gid_taken(user.gid)?
+        } else {
+            // The group must already be there, under that gid.
+            self.group_by_gid(user.gid)?.map(|g| g.name).as_deref() != Some(user.name)
+        };
+        if self.contains("passwd", |n, _| n == user.name)?
+            || self.uid_taken(user.uid)?
+            || group_clash
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
@@ -235,17 +340,7 @@ impl EtcFiles {
             ));
         }
         let has_shadow = self.read("shadow")?.is_some();
-        let append = |line: String| {
-            move |cur: &str| {
-                let mut s = cur.to_string();
-                if !s.is_empty() && !s.ends_with('\n') {
-                    s.push('\n');
-                }
-                s.push_str(&line);
-                s.push('\n');
-                s
-            }
-        };
+        let append = append_line;
         let steps: [(&str, bool, String); 4] = [
             ("group", true, format!("{}:x:{}:", user.name, user.gid)),
             ("gshadow", false, format!("{}:!::", user.name)),
@@ -271,6 +366,9 @@ impl EtcFiles {
         ];
         let mut done: Vec<&str> = Vec::new();
         for (file, required, line) in steps {
+            if !user.own_group && (file == "group" || file == "gshadow") {
+                continue;
+            }
             match self.rewrite(file, required, append(line)) {
                 Ok(_) => done.push(file),
                 Err(e) => {
@@ -331,12 +429,30 @@ impl EtcFiles {
     }
 
     #[cfg(test)]
+    pub(crate) fn path_for_tests(&self, file: &str) -> PathBuf {
+        self.file(file)
+    }
+
+    #[cfg(test)]
     pub(crate) fn line(&self, file: &str, name: &str) -> Option<String> {
         self.read(file)
             .unwrap()?
             .lines()
             .find(|l| l.split(':').next() == Some(name))
             .map(str::to_string)
+    }
+}
+
+/// An edit appending `line` (and a newline before it if the file lacks one).
+fn append_line(line: String) -> impl FnOnce(&str) -> String {
+    move |cur: &str| {
+        let mut s = cur.to_string();
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&line);
+        s.push('\n');
+        s
     }
 }
 
@@ -398,7 +514,47 @@ pub(crate) mod tests {
             gecos: "ikenga principal",
             home,
             shell: Path::new("/bin/sh"),
+            own_group: true,
         }
+    }
+
+    /// Review S2-4: a lost group comes back alone; a user can be re-added
+    /// onto its surviving group; clashes are refused.
+    #[test]
+    fn add_group_and_add_user_onto_an_existing_group() {
+        let (_tmp, etc) = fake_etc(true);
+        etc.add_group("ik-ada", 3_900_000_000).unwrap();
+        assert_eq!(etc.line("group", "ik-ada").unwrap(), "ik-ada:x:3900000000:");
+        assert_eq!(etc.line("gshadow", "ik-ada").unwrap(), "ik-ada:!::");
+        assert_eq!(
+            etc.group_by_gid(3_900_000_000).unwrap().map(|g| g.name),
+            Some("ik-ada".to_string())
+        );
+        assert_eq!(
+            etc.group_by_name("ik-ada").unwrap().map(|g| g.gid),
+            Some(3_900_000_000)
+        );
+        assert!(etc.add_group("ik-ada", 3_900_000_001).is_err());
+        assert!(etc.add_group("other", 3_900_000_000).is_err());
+        assert!(
+            etc.add_group("other", 3_900_000_004).is_err(),
+            "hostgroup's gid"
+        );
+
+        let home = Path::new("/h");
+        let mut u = user("ik-ada", 3_900_000_000, home);
+        // own_group = true would clash with the group just added.
+        assert!(etc.add_user(&u).is_err());
+        u.own_group = false;
+        etc.add_user(&u).unwrap();
+        assert!(etc.line("passwd", "ik-ada").is_some());
+        let groups = fs::read_to_string(etc.file("group")).unwrap();
+        assert_eq!(groups.matches("ik-ada:").count(), 1);
+        // own_group = false needs that group, under that gid and name.
+        let mut v = user("ik-bob", 3_900_000_001, home);
+        v.own_group = false;
+        assert!(etc.add_user(&v).is_err());
+        assert!(etc.line("passwd", "ik-bob").is_none());
     }
 
     #[test]
@@ -473,6 +629,19 @@ pub(crate) mod tests {
                 .is_err());
         }
         assert!(etc.line("passwd", "ik-ada").is_none());
+    }
+
+    #[test]
+    fn passwd_lookups_parse_the_entry() {
+        let (tmp, files) = fake_etc(true);
+        let home = tmp.path().join("h");
+        files.add_user(&user("ik-ada", 20_000, &home)).unwrap();
+        let by_name = files.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!((by_name.uid, by_name.gid), (20_000, 20_000));
+        assert_eq!(by_name.home, home);
+        assert_eq!(files.passwd_by_uid(20_000).unwrap(), Some(by_name));
+        assert_eq!(files.passwd_by_name("ik-bob").unwrap(), None);
+        assert_eq!(files.passwd_by_uid(20_001).unwrap(), None);
     }
 
     #[test]

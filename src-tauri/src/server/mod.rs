@@ -78,6 +78,21 @@ pub struct ServerConfig {
     pub executor_tier: crate::executor::ExecutorTier,
 }
 
+/// T1-only serve options (G-PRINCIPAL §7.2, §8, §9.3). Kept out of
+/// [`ServerConfig`] so the T0 config and its many constructors don't change;
+/// [`run_server_with`] takes them beside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct T1ServeOptions {
+    /// `--uid-range START-END`; `None` is the default 20000-29999. Must agree
+    /// with the range `accounts.db` is pinned to.
+    pub uid_range: Option<String>,
+    /// `--provisioning external`: never write `/etc` (reconcile refuses a
+    /// missing entry instead of recreating it).
+    pub provisioning_external: bool,
+    /// `--principal-path`: the `PATH` principals' children get (§9.3).
+    pub principal_path: Option<std::ffi::OsString>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: ServerConfig,
@@ -449,19 +464,27 @@ async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> i
     state.spa_service.handle(uri).await
 }
 
-pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
+pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
+    run_server_with(config, T1ServeOptions::default()).await
+}
+
+/// [`run_server`] with the T1-only options (`ikenga-server` passes its
+/// flags through here).
+pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
     // Executor tier first, before anything is created, bound or written: a
     // tier the host can't honour means this server must not start at all.
     // Refuse, don't fall back (ADR-023 / DEC-R9-1) — an operator who asked for
     // per-user isolation and quietly got a shared uid is worse off than one
     // whose server wouldn't boot.
+    if config.executor_tier == crate::executor::ExecutorTier::T1 {
+        let refusal = t1_boot(&config, &t1).await;
+        error!("executor tier t1 refused: {refusal}");
+        return Err(refusal.into());
+    }
     let executor = match crate::executor::install(config.executor_tier) {
         Ok(caps) => caps,
         Err(refusal) => {
-            error!(
-                "executor tier {} refused: {refusal}",
-                config.executor_tier
-            );
+            error!("executor tier {} refused: {refusal}", config.executor_tier);
             return Err(refusal.into());
         }
     };
@@ -663,6 +686,57 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The T1 boot: the real §8 probe, first, before anything binds. A failing
+/// probe is the refusal. A passing one still refuses on this build: the T1
+/// broker (session auth, per-principal children, proxy) is WP-20 slice 3, and
+/// serving today's single-tenant daemon as root under T1 would hand every
+/// bearer-token holder a root shell — the opposite of what T1 promises.
+#[cfg(target_os = "linux")]
+async fn t1_boot(config: &ServerConfig, t1: &T1ServeOptions) -> crate::executor::Refusal {
+    use crate::executor::Refusal;
+    use operator::provision::{ProvisioningMode, UidRange};
+
+    let uid_range = match t1.uid_range.as_deref().map(str::parse::<UidRange>) {
+        None => UidRange::DEFAULT,
+        Some(Ok(range)) => range,
+        Some(Err(e)) => {
+            return Refusal::ProbeFailed {
+                check: "uid_range",
+                detail: e.to_string(),
+            }
+        }
+    };
+    let provisioning = if t1.provisioning_external {
+        ProvisioningMode::External
+    } else {
+        ProvisioningMode::Auto
+    };
+    match operator::probe::boot(
+        config.data_dir.clone(),
+        uid_range,
+        provisioning,
+        t1.principal_path.clone(),
+    )
+    .await
+    {
+        Err(refusal) => refusal,
+        // SLICE-3: install the stamped executor
+        // (`executor::install_executor(Box::new(executor))`), then boot the
+        // broker instead of the single-tenant daemon below.
+        Ok(_executor) => Refusal::NotImplemented {
+            tier: crate::executor::ExecutorTier::T1,
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn t1_boot(_config: &ServerConfig, _t1: &T1ServeOptions) -> crate::executor::Refusal {
+    crate::executor::Refusal::ProbeFailed {
+        check: "os",
+        detail: "executor tier t1 is Linux-only".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,14 +764,12 @@ mod tests {
     /// starting, with the typed refusal — it never falls back to T0.
     #[tokio::test]
     async fn refuses_to_start_on_an_unimplemented_executor_tier() {
-        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
-            let err = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                run_server(config(tier)),
-            )
-            .await
-            .expect("a refusal is immediate, not a running server")
-            .expect_err("an unimplemented tier must not start");
+        for tier in [ExecutorTier::T2, ExecutorTier::T3] {
+            let err =
+                tokio::time::timeout(std::time::Duration::from_secs(5), run_server(config(tier)))
+                    .await
+                    .expect("a refusal is immediate, not a running server")
+                    .expect_err("an unimplemented tier must not start");
             assert_eq!(
                 err.downcast_ref::<Refusal>(),
                 Some(&Refusal::NotImplemented { tier }),
@@ -709,6 +781,52 @@ mod tests {
             ExecutorTier::T0,
             "a refused tier must not be installed"
         );
+    }
+
+    /// DEC-R9-1 for T1: the real §8 probe runs first and refuses with its
+    /// typed failure (unprivileged: identity; as root: the missing
+    /// `--data-dir`) — never a fallback, never a bound port.
+    #[tokio::test]
+    async fn t1_runs_its_boot_probe_first_and_refuses_on_failure() {
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_server(config(ExecutorTier::T1)),
+        )
+        .await
+        .expect("a refusal is immediate, not a running server")
+        .expect_err("t1 without an operator root must not start");
+        assert!(
+            matches!(
+                err.downcast_ref::<Refusal>(),
+                Some(Refusal::ProbeFailed { .. })
+            ),
+            "expected the typed probe refusal, got: {err:#}"
+        );
+        assert_eq!(crate::executor::current().tier(), ExecutorTier::T0);
+
+        // A bad --uid-range is refused before anything runs.
+        let err = run_server_with(
+            config(ExecutorTier::T1),
+            T1ServeOptions {
+                uid_range: Some("nope".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(
+                err.downcast_ref::<Refusal>(),
+                Some(Refusal::ProbeFailed {
+                    check: "uid_range",
+                    ..
+                })
+            ),
+            "{err:#}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = err;
     }
 
     #[tokio::test]

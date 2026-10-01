@@ -25,6 +25,10 @@
 //! * [`provision`] — §7.2 create (`create_in`, R-8), §7.3 disable / enable /
 //!   passwd, the uid allocator and the `/etc` backends.
 //! * [`cli`] — `ikenga-server accounts …`.
+//! * [`probe`] — the §8 boot probe's operator side (steps 5 and 7, the
+//!   probe-uid precondition, `probe.json`) and `ikenga-server probe`; the
+//!   host side (steps 2–4, 6) is `executor::t1_probe`.
+//! * [`reaper`] — the §7.3 uid-wide kill through the T1 executor.
 
 pub mod accounts;
 pub mod auth_events;
@@ -32,7 +36,9 @@ pub mod cli;
 mod etc_files;
 pub mod migrations;
 pub mod password;
+pub mod probe;
 pub mod provision;
+pub mod reaper;
 mod sys;
 
 use std::fs;
@@ -191,54 +197,83 @@ impl OperatorRoot {
         Ok(())
     }
 
+    /// The three operator dirs with their §4 modes.
+    fn operator_dirs(&self) -> [(PathBuf, u32); 3] {
+        [
+            (self.root.clone(), 0o755),
+            (self.operator_dir(), 0o700),
+            (self.principals_dir(), 0o711),
+        ]
+    }
+
+    /// [`prepare`](Self::prepare) without writing anything (the read-only
+    /// `ikenga-server probe`, §8 step 5): refuse a T0 layout, check every
+    /// operator dir that exists, and return the ones that don't yet (the boot
+    /// would create them).
+    pub fn check_layout(&self, ownership: Ownership) -> Result<Vec<PathBuf>, LayoutError> {
+        self.refuse_t0_layout()?;
+        let mut missing = Vec::new();
+        for (path, _) in self.operator_dirs() {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) => check_existing_dir(&path, &meta, ownership)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => missing.push(path),
+                Err(e) => return Err(io_err(&path)(e)),
+            }
+        }
+        Ok(missing)
+    }
+
     /// Create or verify `<root>` (0755), `operator/` (0700) and `principals/`
     /// (0711) per §4 / §8 step 5: none may be a symlink or group/other
     /// writable, and under [`Ownership::Enforce`] each must be root-owned.
     /// Refuses a T0 layout first (I-10).
     pub fn prepare(&self, ownership: Ownership) -> Result<(), LayoutError> {
         self.refuse_t0_layout()?;
-        for (path, mode) in [
-            (self.root.clone(), 0o755),
-            (self.operator_dir(), 0o700),
-            (self.principals_dir(), 0o711),
-        ] {
+        for (path, mode) in self.operator_dirs() {
             ensure_dir(&path, mode, ownership)?;
         }
         Ok(())
     }
 }
 
+/// §8 step 5 for one existing operator dir: not a symlink, a directory, not
+/// group/world writable, and (enforced) root-owned.
+fn check_existing_dir(
+    path: &Path,
+    meta: &fs::Metadata,
+    ownership: Ownership,
+) -> Result<(), LayoutError> {
+    let unsafe_because = |why: String| {
+        Err(LayoutError::Unsafe {
+            path: path.into(),
+            why,
+        })
+    };
+    if meta.file_type().is_symlink() {
+        return unsafe_because("is a symlink".into());
+    }
+    if !meta.is_dir() {
+        return unsafe_because("is not a directory".into());
+    }
+    if meta.mode() & 0o022 != 0 {
+        return unsafe_because(format!(
+            "is group- or world-writable (mode {:o})",
+            meta.mode() & 0o7777
+        ));
+    }
+    if ownership == Ownership::Enforce && (meta.uid() != 0 || meta.gid() != 0) {
+        return unsafe_because(format!(
+            "is owned by {}:{}, not root:root",
+            meta.uid(),
+            meta.gid()
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_dir(path: &Path, mode: u32, ownership: Ownership) -> Result<(), LayoutError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(LayoutError::Unsafe {
-                    path: path.into(),
-                    why: "is a symlink".into(),
-                });
-            }
-            if !meta.is_dir() {
-                return Err(LayoutError::Unsafe {
-                    path: path.into(),
-                    why: "is not a directory".into(),
-                });
-            }
-            if meta.mode() & 0o022 != 0 {
-                return Err(LayoutError::Unsafe {
-                    path: path.into(),
-                    why: format!(
-                        "is group- or world-writable (mode {:o})",
-                        meta.mode() & 0o7777
-                    ),
-                });
-            }
-            if ownership == Ownership::Enforce && (meta.uid() != 0 || meta.gid() != 0) {
-                return Err(LayoutError::Unsafe {
-                    path: path.into(),
-                    why: format!("is owned by {}:{}, not root:root", meta.uid(), meta.gid()),
-                });
-            }
-        }
+        Ok(meta) => check_existing_dir(path, &meta, ownership)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             fs::DirBuilder::new()
                 .recursive(true)
@@ -433,6 +468,33 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root.operator_dir()).unwrap();
         let err = root.prepare(Ownership::SkipForTests).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// The read-only probe's step 5: checks what exists, creates nothing.
+    #[test]
+    fn check_layout_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = OperatorRoot::new(tmp.path().join("root")).unwrap();
+        let missing = root.check_layout(Ownership::SkipForTests).unwrap();
+        assert_eq!(missing.len(), 3);
+        assert!(!root.root().exists());
+
+        root.prepare(Ownership::SkipForTests).unwrap();
+        assert!(root
+            .check_layout(Ownership::SkipForTests)
+            .unwrap()
+            .is_empty());
+        fs::set_permissions(root.principals_dir(), fs::Permissions::from_mode(0o773)).unwrap();
+        assert!(matches!(
+            root.check_layout(Ownership::SkipForTests),
+            Err(LayoutError::Unsafe { .. })
+        ));
+        fs::set_permissions(root.principals_dir(), fs::Permissions::from_mode(0o711)).unwrap();
+        fs::write(root.root().join("ikenga.db"), b"").unwrap();
+        assert!(matches!(
+            root.check_layout(Ownership::SkipForTests),
+            Err(LayoutError::T0Layout { .. })
+        ));
     }
 
     /// Review F10: read-only commands neither create nor initialise a store.

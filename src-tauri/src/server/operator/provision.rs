@@ -216,6 +216,68 @@ impl ShadowTools {
     }
 }
 
+/// Which subordinate-id files the host has. `useradd` allocates a
+/// subordinate uid (gid) range only when `/etc/subuid` (`/etc/subgid`)
+/// exists, so `-K SUB_UID_COUNT=0` (`SUB_GID_COUNT=0`) is needed only then —
+/// and passing it otherwise can fail outright: shadow-utils built without
+/// subid support rejects the unknown `-K` key with `E_BAD_ARG`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubidFiles {
+    subuid: bool,
+    subgid: bool,
+}
+
+impl SubidFiles {
+    fn on_host() -> Self {
+        Self {
+            subuid: Path::new("/etc/subuid").exists(),
+            subgid: Path::new("/etc/subgid").exists(),
+        }
+    }
+}
+
+/// `useradd`'s argv for the user `name` (uid = gid = `uid`; the group already
+/// exists).
+fn useradd_args(
+    name: &str,
+    uid: u32,
+    home: &Path,
+    shell: &Path,
+    subid: SubidFiles,
+) -> Vec<std::ffi::OsString> {
+    let uid_s = uid.to_string();
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-u".into(),
+        uid_s.clone().into(),
+        "-g".into(),
+        uid_s.into(),
+        // No home creation (we create and chown it), no per-user group (made
+        // by the caller), no lastlog entry.
+        "-M".into(),
+        "-N".into(),
+        "-l".into(),
+    ];
+    // No /etc/subuid or /etc/subgid range: with newuidmap a principal could
+    // otherwise own a block of 65 536 host ids (Debian's SUB_UID_COUNT). The
+    // built-in writer creates none either.
+    if subid.subuid {
+        args.extend(["-K".into(), "SUB_UID_COUNT=0".into()]);
+    }
+    if subid.subgid {
+        args.extend(["-K".into(), "SUB_GID_COUNT=0".into()]);
+    }
+    args.extend([
+        "-d".into(),
+        home.as_os_str().to_owned(),
+        "-s".into(),
+        shell.as_os_str().to_owned(),
+        "-c".into(),
+        GECOS.into(),
+        name.into(),
+    ]);
+    args
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
     ShadowUtils(ShadowTools),
@@ -244,48 +306,30 @@ impl Backend {
         }
     }
 
+    /// The user `name` (uid = gid = `uid`) and, with `own_group`, its
+    /// user-private group. `own_group = false`: the group is already there
+    /// (reconcile recreating only a lost passwd entry).
     fn create_identity(
         &self,
         name: &str,
         uid: u32,
         home: &Path,
         shell: &Path,
+        own_group: bool,
     ) -> anyhow::Result<()> {
         match self {
             Backend::ShadowUtils(t) => {
-                let (uid_s, home_s) = (uid.to_string(), home.as_os_str());
-                t.run(&t.groupadd, &["-g".as_ref(), uid_s.as_ref(), name.as_ref()])?;
-                let useradd = t.run(
-                    &t.useradd,
-                    &[
-                        "-u".as_ref(),
-                        uid_s.as_ref(),
-                        "-g".as_ref(),
-                        uid_s.as_ref(),
-                        // No home creation (we create and chown it), no
-                        // per-user group (made above), no lastlog entry.
-                        "-M".as_ref(),
-                        "-N".as_ref(),
-                        "-l".as_ref(),
-                        // No /etc/subuid or /etc/subgid range: with
-                        // newuidmap a principal could otherwise own a block
-                        // of 65 536 host ids (Debian's SUB_UID_COUNT). The
-                        // built-in writer creates none either.
-                        "-K".as_ref(),
-                        "SUB_UID_COUNT=0".as_ref(),
-                        "-K".as_ref(),
-                        "SUB_GID_COUNT=0".as_ref(),
-                        "-d".as_ref(),
-                        home_s,
-                        "-s".as_ref(),
-                        shell.as_os_str(),
-                        "-c".as_ref(),
-                        GECOS.as_ref(),
-                        name.as_ref(),
-                    ],
-                );
+                let uid_s = uid.to_string();
+                if own_group {
+                    t.run(&t.groupadd, &["-g".as_ref(), uid_s.as_ref(), name.as_ref()])?;
+                }
+                let args = useradd_args(name, uid, home, shell, SubidFiles::on_host());
+                let args: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+                let useradd = t.run(&t.useradd, &args);
                 if let Err(e) = useradd {
-                    let _ = t.run(&t.groupdel, &[name.as_ref()]);
+                    if own_group {
+                        let _ = t.run(&t.groupdel, &[name.as_ref()]);
+                    }
                     return Err(e);
                 }
                 Ok(())
@@ -297,7 +341,20 @@ impl Backend {
                 gecos: GECOS,
                 home,
                 shell,
+                own_group,
             })?),
+            Backend::External => anyhow::bail!("external provisioning never writes /etc"),
+        }
+    }
+
+    /// Recreate a lost user-private group (§8 step 7).
+    fn create_group(&self, name: &str, gid: u32) -> anyhow::Result<()> {
+        match self {
+            Backend::ShadowUtils(t) => {
+                let gid_s = gid.to_string();
+                t.run(&t.groupadd, &["-g".as_ref(), gid_s.as_ref(), name.as_ref()])
+            }
+            Backend::Builtin(files) => Ok(files.add_group(name, gid)?),
             Backend::External => anyhow::bail!("external provisioning never writes /etc"),
         }
     }
@@ -375,28 +432,29 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub enum ReapOutcome {
     /// Every process of the uid was sent SIGKILL.
     Killed,
-    /// The reaper can't run on this build; nothing was signalled.
+    /// No reaper was configured; nothing was signalled.
     Unavailable(&'static str),
+    /// The helper could not run or failed. The account is disabled
+    /// regardless (the disable committed first); its processes may live on.
+    Failed(String),
 }
 
 /// Kills every process of a principal's uid (§7.3): a helper spawned
 /// **through the T1 executor as that uid** calls `kill(-1, SIGKILL)`, which
-/// also reaches detached chi-runners in their own process groups. The helper
-/// needs the T1 executor (WP-20 slice 2), which fills this trait.
+/// also reaches detached chi-runners in their own process groups. The real
+/// one is [`super::reaper::T1Reaper`].
 pub trait UidReaper: Send + Sync {
     fn kill_all(&self, principal: &Principal) -> anyhow::Result<ReapOutcome>;
 }
 
-/// Slice 1's reaper: the T1 executor does not exist yet, so nothing can run
-/// as a principal's uid and there is nothing of theirs to kill.
+/// A reaper that signals nothing (tests, and callers that stop the
+/// principal's processes some other way).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ReaperPendingT1Executor;
+pub struct NoReaper;
 
-impl UidReaper for ReaperPendingT1Executor {
+impl UidReaper for NoReaper {
     fn kill_all(&self, _principal: &Principal) -> anyhow::Result<ReapOutcome> {
-        Ok(ReapOutcome::Unavailable(
-            "the uid-wide kill runs through the T1 executor, which lands in WP-20 slice 2",
-        ))
+        Ok(ReapOutcome::Unavailable("no uid reaper configured"))
     }
 }
 
@@ -419,6 +477,9 @@ pub enum ProvisionError {
         stored: String,
         requested: UidRange,
     },
+    /// §8 step 7: the host's `/etc` disagrees with `accounts.db` in a way
+    /// reconcile must not paper over.
+    Drift(String),
     Host(anyhow::Error),
     Db(sqlx::Error),
 }
@@ -454,6 +515,7 @@ impl fmt::Display for ProvisionError {
                  was first provisioned with; the broker and the CLI must agree on it (its last \
                  uid is the boot probe's) — pass --uid-range {stored}"
             ),
+            ProvisionError::Drift(why) => write!(f, "/etc disagrees with accounts.db: {why}"),
             ProvisionError::Host(e) => write!(f, "provisioning the host failed: {e:#}"),
             ProvisionError::Db(e) => write!(f, "accounts.db: {e}"),
         }
@@ -552,6 +614,27 @@ impl Drop for ProvisionGuard {
 }
 
 // ─── the provisioner ────────────────────────────────────────────────────────
+
+/// What §8 step 7 did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReconcileReport {
+    /// Non-disabled rows checked.
+    pub checked: usize,
+    /// Host users (re)created.
+    pub created: Vec<String>,
+    /// User-private groups (re)created (with or without their user).
+    pub created_groups: Vec<String>,
+    /// Host users whose drifted shell was restored.
+    pub repaired_shell: Vec<String>,
+}
+
+/// What [`Provisioner::ensure_identity`] repaired.
+#[derive(Debug, Clone, Copy, Default)]
+struct IdentityFix {
+    created_user: bool,
+    created_group: bool,
+    repaired_shell: bool,
+}
 
 /// Result of a §7.3 disable.
 #[derive(Debug)]
@@ -846,6 +929,15 @@ impl Provisioner {
         Ok(())
     }
 
+    /// The range `accounts.db` is pinned to, if any (read-only).
+    pub async fn stored_uid_range(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = 'uid_range'")
+            .fetch_optional(conn)
+            .await
+    }
+
     /// Record `--uid-range` in the store the first time it provisions, and
     /// refuse a different one afterwards (the CLI and the broker are separate
     /// invocations; a mismatch would let one allocate the other's probe uid).
@@ -855,11 +947,7 @@ impl Provisioner {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
     ) -> Result<(), ProvisionError> {
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = 'uid_range'")
-                .fetch_optional(&mut **tx)
-                .await?;
-        match stored {
+        match Self::stored_uid_range(&mut **tx).await? {
             None => {
                 sqlx::query("INSERT INTO operator_meta (key, value) VALUES ('uid_range', ?)")
                     .bind(self.range.to_string())
@@ -992,7 +1080,13 @@ impl Provisioner {
             }),
         };
         self.backend
-            .create_identity(&unix_name, uid, &guard.account.home, &guard.account.shell)
+            .create_identity(
+                &unix_name,
+                uid,
+                &guard.account.home,
+                &guard.account.shell,
+                true,
+            )
             .map_err(ProvisionError::Host)?;
         if let Some(undo) = guard.undo.as_mut() {
             undo.identity = true;
@@ -1234,9 +1328,11 @@ impl Provisioner {
             .lock(&account.unix_name, &self.nologin)
             .map_err(ProvisionError::Host)?;
         tx.commit().await?;
+        // After COMMIT: the account is disabled whatever the kill does, and a
+        // failed kill is reported rather than turned into a failed disable.
         let reap = reaper
             .kill_all(&account.principal())
-            .map_err(ProvisionError::Host)?;
+            .unwrap_or_else(|e| ReapOutcome::Failed(format!("{e:#}")));
         Ok(DisableReport { account, reap })
     }
 
@@ -1252,15 +1348,218 @@ impl Provisioner {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let account = Self::lookup(&mut tx, username).await?;
         let account = accounts::mark_enabled_in(&mut tx, account.principal_id, self.actor).await?;
-        self.backend
-            .unlock(&account.unix_name, &account.shell)
-            .map_err(ProvisionError::Host)?;
+        // Reconcile skips disabled rows, so a redeploy that reset /etc while
+        // this account was disabled left it without an entry (review S2-5):
+        // recreate it here, after the same checks reconcile makes.
+        let fix = self.ensure_identity(&account, false)?;
+        if !fix.created_user {
+            self.backend
+                .unlock(&account.unix_name, &account.shell)
+                .map_err(ProvisionError::Host)?;
+        }
         if let Err(e) = tx.commit().await {
-            // Fail closed: the row is still disabled, so lock /etc again.
-            let _ = self.backend.lock(&account.unix_name, &self.nologin);
+            // Fail closed: the row is still disabled, so lock /etc again
+            // (or take back the entry this call created).
+            if fix.created_user {
+                let _ = self.backend.remove_identity(&account.unix_name);
+            } else {
+                let _ = self.backend.lock(&account.unix_name, &self.nologin);
+            }
             return Err(e.into());
         }
         Ok(account)
+    }
+
+    /// The passwd entry named `name`, as the host (or, in a unit test, the
+    /// built-in writer's temp prefix) sees it.
+    fn passwd_by_name(&self, name: &str) -> Result<Option<sys::PasswdInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.passwd_by_name(name).map_err(host_err),
+            _ => sys::user_by_name(name).map_err(host_err),
+        }
+    }
+
+    fn passwd_by_uid(&self, uid: u32) -> Result<Option<sys::PasswdInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.passwd_by_uid(uid).map_err(host_err),
+            _ => sys::user_by_uid(uid).map_err(host_err),
+        }
+    }
+
+    fn group_by_gid(&self, gid: u32) -> Result<Option<sys::GroupInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.group_by_gid(gid).map_err(host_err),
+            _ => sys::group_by_gid(gid).map_err(host_err),
+        }
+    }
+
+    fn group_by_name(&self, name: &str) -> Result<Option<sys::GroupInfo>, ProvisionError> {
+        match self.backend.files() {
+            Some(files) if !files.is_system() => files.group_by_name(name).map_err(host_err),
+            _ => sys::group_by_name(name).map_err(host_err),
+        }
+    }
+
+    /// One account's §8 step 7 check-and-repair, shared by reconcile and
+    /// `enable`. The passwd entry must match `(unix_name, uid, gid, home)`
+    /// and, for an allocated account, the group holding its gid must be its
+    /// user-private group `unix_name` (review S2-4). A missing entry or group
+    /// of an allocated account is recreated; a drifted shell is restored when
+    /// `restore_shell`. Anything else — the uid, gid or name held by a
+    /// **different** host entry, a moved home, a missing adopted user, or a
+    /// missing entry under `--provisioning external` — is refused, never
+    /// rewritten.
+    fn ensure_identity(
+        &self,
+        a: &Account,
+        restore_shell: bool,
+    ) -> Result<IdentityFix, ProvisionError> {
+        let who = format!("account `{}` ({})", a.username, a.unix_name);
+        let external = matches!(self.backend, Backend::External);
+        let mut fix = IdentityFix::default();
+        if let Some(holder) = self.passwd_by_uid(a.unix_uid)? {
+            if holder.name != a.unix_name {
+                return Err(ProvisionError::Drift(format!(
+                    "{who}: uid {} is held by host user `{}`",
+                    a.unix_uid, holder.name
+                )));
+            }
+        }
+        let existing = self.passwd_by_name(&a.unix_name)?;
+        match &existing {
+            Some(pw) => {
+                if (pw.uid, pw.gid) != (a.unix_uid, a.unix_gid) {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: the host entry has uid:gid {}:{}, accounts.db {}:{}",
+                        pw.uid, pw.gid, a.unix_uid, a.unix_gid
+                    )));
+                }
+                if pw.home != a.home {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: the host entry's home is {}, accounts.db's {}",
+                        pw.home.display(),
+                        a.home.display()
+                    )));
+                }
+            }
+            None if a.adopted => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who} is adopted, but host user `{}` no longer exists; recreate it \
+                     (uid {}, home {})",
+                    a.unix_name,
+                    a.unix_uid,
+                    a.home.display()
+                )))
+            }
+            None if external => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who} has no host user, and --provisioning external never writes \
+                     /etc; pre-create `{}` with uid {} and home {}",
+                    a.unix_name,
+                    a.unix_uid,
+                    a.home.display()
+                )))
+            }
+            None => {}
+        }
+
+        // The group. An adopted user's primary group is the operator's
+        // (any name); an allocated account's is its own `unix_name`.
+        let need_group = match self.group_by_gid(a.unix_gid)? {
+            Some(g) if a.adopted || g.name == a.unix_name => false,
+            Some(g) => {
+                return Err(ProvisionError::Drift(format!(
+                    "{who}: gid {} is held by host group `{}`, not `{}`",
+                    a.unix_gid, g.name, a.unix_name
+                )))
+            }
+            None if a.adopted => {
+                tracing::warn!(
+                    "{who}: no host group holds its primary gid {} (operator-managed; left as is)",
+                    a.unix_gid
+                );
+                false
+            }
+            None => {
+                if let Some(g) = self.group_by_name(&a.unix_name)? {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: host group `{}` has gid {}, accounts.db {}",
+                        g.name, g.gid, a.unix_gid
+                    )));
+                }
+                if external {
+                    return Err(ProvisionError::Drift(format!(
+                        "{who}: no host group holds gid {}, and --provisioning external never \
+                         writes /etc; pre-create group `{}` with gid {}",
+                        a.unix_gid, a.unix_name, a.unix_gid
+                    )));
+                }
+                true
+            }
+        };
+
+        match existing {
+            None => {
+                self.backend
+                    .create_identity(&a.unix_name, a.unix_uid, &a.home, &a.shell, need_group)
+                    .map_err(ProvisionError::Host)?;
+                tracing::info!("recreated host user {} (uid {})", a.unix_name, a.unix_uid);
+                fix.created_user = true;
+                fix.created_group = need_group;
+            }
+            Some(pw) => {
+                if need_group {
+                    self.backend
+                        .create_group(&a.unix_name, a.unix_gid)
+                        .map_err(ProvisionError::Host)?;
+                    tracing::info!("recreated host group {} (gid {})", a.unix_name, a.unix_gid);
+                    fix.created_group = true;
+                }
+                if restore_shell && pw.shell != a.shell {
+                    if a.adopted || external {
+                        tracing::warn!(
+                            "{who}: host shell {} differs from {} (operator-managed; left as is)",
+                            pw.shell.display(),
+                            a.shell.display()
+                        );
+                    } else {
+                        self.backend
+                            .unlock(&a.unix_name, &a.shell)
+                            .map_err(ProvisionError::Host)?;
+                        fix.repaired_shell = true;
+                    }
+                }
+            }
+        }
+        Ok(fix)
+    }
+
+    /// §8 step 7 — `/etc` is a projection of `accounts.db` (§4): every
+    /// non-disabled row goes through [`Self::ensure_identity`] (passwd entry
+    /// and user-private group; missing ones of allocated accounts recreated
+    /// with the §7.2 backend, a drifted shell restored, anything else
+    /// refused). Disabled rows are skipped: `enable` repairs them. Reconcile
+    /// never writes the probe uid: no row holds it (§7.2).
+    pub async fn reconcile(&self, pool: &SqlitePool) -> Result<ReconcileReport, ProvisionError> {
+        let rows = {
+            let mut conn = pool.acquire().await?;
+            accounts::list(&mut conn).await?
+        };
+        let mut report = ReconcileReport::default();
+        for a in rows.iter().filter(|a| !a.is_disabled()) {
+            report.checked += 1;
+            let fix = self.ensure_identity(a, true)?;
+            if fix.created_user {
+                report.created.push(a.unix_name.clone());
+            }
+            if fix.created_group {
+                report.created_groups.push(a.unix_name.clone());
+            }
+            if fix.repaired_shell {
+                report.repaired_shell.push(a.unix_name.clone());
+            }
+        }
+        Ok(report)
     }
 
     /// §7.4: create `bootstrap` as an admin **only if `accounts` is empty**,
@@ -1318,6 +1617,42 @@ mod tests {
         end: 3_900_000_006,
     };
     const PW: &str = "correct horse battery";
+
+    /// Review S1-M1: `-K SUB_*_COUNT=0` only when the matching subid file
+    /// exists (useradd allocates nothing otherwise, and a build without subid
+    /// support would reject the key).
+    #[test]
+    fn useradd_args_pass_subid_counts_only_when_the_files_exist() {
+        let args = |subuid, subgid| {
+            useradd_args(
+                "ik_ada",
+                28_600,
+                Path::new("/data/p/home"),
+                Path::new("/bin/sh"),
+                SubidFiles { subuid, subgid },
+            )
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        let tail = "-d /data/p/home -s /bin/sh -c ikenga principal ik_ada";
+        let head = "-u 28600 -g 28600 -M -N -l";
+        assert_eq!(args(false, false), format!("{head} {tail}"));
+        assert!(!args(false, false).contains("-K"));
+        assert_eq!(
+            args(true, false),
+            format!("{head} -K SUB_UID_COUNT=0 {tail}")
+        );
+        assert_eq!(
+            args(false, true),
+            format!("{head} -K SUB_GID_COUNT=0 {tail}")
+        );
+        assert_eq!(
+            args(true, true),
+            format!("{head} -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 {tail}")
+        );
+    }
 
     struct Fixture {
         _root_tmp: tempfile::TempDir,
@@ -1453,10 +1788,7 @@ mod tests {
             .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        f.prov
-            .disable(&f.pool, "ada", &ReaperPendingT1Executor)
-            .await
-            .unwrap();
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
         let b = f
             .prov
             .create(&f.pool, "bob", PW, false, None)
@@ -1558,6 +1890,7 @@ mod tests {
                 gecos: "",
                 home: Path::new("/home/eve"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
         let err = f
@@ -1669,18 +2002,328 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slice_one_reaper_reports_unavailable() {
+    async fn no_reaper_reports_unavailable() {
         let f = fixture().await;
         f.prov
             .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        let report = f
-            .prov
-            .disable(&f.pool, "ada", &ReaperPendingT1Executor)
+        let report = f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        assert!(matches!(report.reap, ReapOutcome::Unavailable(_)));
+    }
+
+    struct BrokenReaper;
+    impl UidReaper for BrokenReaper {
+        fn kill_all(&self, _p: &Principal) -> anyhow::Result<ReapOutcome> {
+            anyhow::bail!("helper could not run")
+        }
+    }
+
+    /// A failed kill is reported, not turned into a failed disable: the
+    /// account is disabled either way (the disable committed first).
+    #[tokio::test]
+    async fn a_failed_reap_still_disables() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
             .await
             .unwrap();
-        assert!(matches!(report.reap, ReapOutcome::Unavailable(_)));
+        let report = f.prov.disable(&f.pool, "ada", &BrokenReaper).await.unwrap();
+        assert!(report.account.is_disabled());
+        assert!(
+            matches!(&report.reap, ReapOutcome::Failed(why) if why.contains("helper")),
+            "{:?}",
+            report.reap
+        );
+    }
+
+    // ── §8 step 7: reconcile ────────────────────────────────────────────────
+
+    /// A redeploy reset `/etc`: reconcile recreates the entries of active
+    /// allocated accounts from `accounts.db`, and leaves disabled ones.
+    #[tokio::test]
+    async fn reconcile_recreates_missing_entries_of_active_accounts() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.prov
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap();
+        f.prov.disable(&f.pool, "bob", &NoReaper).await.unwrap();
+        // Nothing to do on a consistent host.
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                checked: 1,
+                ..Default::default()
+            }
+        );
+
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc.remove_user("ik-bob").unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created, vec!["ik-ada".to_string()]);
+        let pw = f.etc.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!((pw.uid, pw.gid), (ada.unix_uid, ada.unix_gid));
+        assert_eq!(pw.home, ada.home);
+        assert_eq!(pw.shell, ada.shell);
+        assert!(f.etc.line("group", "ik-ada").is_some());
+        assert!(
+            f.etc.passwd_by_name("ik-bob").unwrap().is_none(),
+            "a disabled account is not re-projected"
+        );
+        // Idempotent.
+        assert!(f.prov.reconcile(&f.pool).await.unwrap().created.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_a_drifted_shell() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.set_shell("ik-ada", Path::new("/bin/bash")).unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.repaired_shell, vec!["ik-ada".to_string()]);
+        assert!(f
+            .etc
+            .line("passwd", "ik-ada")
+            .unwrap()
+            .ends_with(":/bin/sh"));
+    }
+
+    /// Refuse, never rewrite: the row's uid held by another host user, or
+    /// its entry pointing elsewhere.
+    #[tokio::test]
+    async fn reconcile_refuses_identity_drift() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "intruder",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/home/intruder"),
+                shell: Path::new("/bin/sh"),
+                own_group: true,
+            })
+            .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("intruder")),
+            "{err}"
+        );
+        assert!(
+            f.etc.passwd_by_name("ik-ada").unwrap().is_none(),
+            "nothing written"
+        );
+
+        f.etc.remove_user("intruder").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "ik-ada",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/elsewhere"),
+                shell: Path::new("/bin/sh"),
+                own_group: true,
+            })
+            .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("home")),
+            "{err}"
+        );
+    }
+
+    /// Review S2-4: the user-private group is part of the projection. A
+    /// lost group is recreated (with or without its user); a lost user whose
+    /// group survived gets only its passwd entry back.
+    #[tokio::test]
+    async fn reconcile_recreates_a_missing_group() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        let drop_group = |etc: &EtcFiles| {
+            for file in ["group", "gshadow"] {
+                let path = etc_path(etc, file);
+                let text = std::fs::read_to_string(&path).unwrap();
+                let kept: String = text
+                    .lines()
+                    .filter(|l| !l.starts_with("ik-ada:"))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                std::fs::write(&path, kept).unwrap();
+            }
+        };
+        drop_group(&f.etc);
+        assert!(f.etc.line("group", "ik-ada").is_none());
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created_groups, vec!["ik-ada".to_string()]);
+        assert!(report.created.is_empty());
+        assert_eq!(
+            f.etc.line("group", "ik-ada").unwrap(),
+            format!("ik-ada:x:{}:", ada.unix_gid)
+        );
+        assert_eq!(f.etc.line("gshadow", "ik-ada").unwrap(), "ik-ada:!::");
+
+        // Only the passwd side lost: the surviving group is reused.
+        let pw_line = f.etc.line("passwd", "ik-ada").unwrap();
+        let path = etc_path(&f.etc, "passwd");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace(&format!("{pw_line}\n"), "")).unwrap();
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert_eq!(report.created, vec!["ik-ada".to_string()]);
+        assert!(report.created_groups.is_empty());
+        assert_eq!(
+            f.etc.passwd_by_name("ik-ada").unwrap().unwrap().gid,
+            ada.unix_gid
+        );
+        let groups = std::fs::read_to_string(etc_path(&f.etc, "group")).unwrap();
+        assert_eq!(groups.matches("ik-ada:").count(), 1);
+
+        // Idempotent.
+        let report = f.prov.reconcile(&f.pool).await.unwrap();
+        assert!(report.created.is_empty() && report.created_groups.is_empty());
+    }
+
+    /// Review S2-4: the account's gid held by a different host group, or its
+    /// group name moved to another gid, is drift — refused, not rewritten.
+    #[tokio::test]
+    async fn reconcile_refuses_group_drift() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        let path = etc_path(&f.etc, "group");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                &format!("ik-ada:x:{}:", ada.unix_gid),
+                &format!("squatter:x:{}:", ada.unix_gid),
+            ),
+        )
+        .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("squatter")),
+            "{err}"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace(
+                &format!("squatter:x:{}:", ada.unix_gid),
+                "ik-ada:x:3900000005:",
+            ),
+        )
+        .unwrap();
+        let err = f.prov.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("has gid 3900000005")),
+            "{err}"
+        );
+    }
+
+    /// Review S2-5: an account disabled when a redeploy reset `/etc` (so
+    /// reconcile never re-projected it) can be enabled: enable recreates the
+    /// entry, with the account's real shell.
+    #[tokio::test]
+    async fn enable_recreates_an_entry_lost_while_disabled() {
+        let f = fixture().await;
+        let ada = f
+            .prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        assert_eq!(f.prov.reconcile(&f.pool).await.unwrap().checked, 0);
+
+        let e = f.prov.enable(&f.pool, "ada").await.unwrap();
+        assert!(!e.is_disabled());
+        let pw = f.etc.passwd_by_name("ik-ada").unwrap().unwrap();
+        assert_eq!(
+            (pw.uid, pw.gid, pw.home.clone(), pw.shell.clone()),
+            (
+                ada.unix_uid,
+                ada.unix_gid,
+                ada.home.clone(),
+                ada.shell.clone()
+            )
+        );
+        assert!(f.etc.line("group", "ik-ada").is_some());
+
+        // A uid taken meanwhile still refuses, and the enable rolls back.
+        f.prov.disable(&f.pool, "ada", &NoReaper).await.unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        f.etc
+            .add_user(&NewUser {
+                name: "intruder",
+                uid: ada.unix_uid,
+                gid: ada.unix_gid,
+                gecos: "",
+                home: Path::new("/home/intruder"),
+                shell: Path::new("/bin/sh"),
+                own_group: true,
+            })
+            .unwrap();
+        let err = f.prov.enable(&f.pool, "ada").await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("intruder")),
+            "{err}"
+        );
+        let mut conn = f.pool.acquire().await.unwrap();
+        assert!(accounts::by_username(&mut conn, "ada")
+            .await
+            .unwrap()
+            .unwrap()
+            .is_disabled());
+    }
+
+    fn etc_path(etc: &EtcFiles, file: &str) -> std::path::PathBuf {
+        // The fixture's EtcFiles is `<prefix>/etc`; `line` reads the same files.
+        etc.path_for_tests(file)
+    }
+
+    /// `--provisioning external` never writes `/etc`, so a missing entry is
+    /// the operator's to recreate.
+    #[tokio::test]
+    async fn reconcile_under_external_refuses_a_missing_entry() {
+        let f = fixture().await;
+        f.prov
+            .create(&f.pool, "ada", PW, false, None)
+            .await
+            .unwrap();
+        f.etc.remove_user("ik-ada").unwrap();
+        // The same store, now administered with `--provisioning external`
+        // (its lookups fall back to NSS, which has no `ik-ada`).
+        let ext = Provisioner::external_for_tests(f.prov.root().clone(), RANGE);
+        let err = ext.reconcile(&f.pool).await.unwrap_err();
+        assert!(
+            matches!(&err, ProvisionError::Drift(why) if why.contains("external")),
+            "{err}"
+        );
     }
 
     struct FailingHook;
@@ -2022,9 +2665,7 @@ mod tests {
             }
 
             // §7.3 disable locks the entry; enable restores the shell.
-            prov.disable(&pool, "t1root-ada", &ReaperPendingT1Executor)
-                .await
-                .unwrap();
+            prov.disable(&pool, "t1root-ada", &NoReaper).await.unwrap();
             let locked = sys::user_by_name("ik-t1root-ada").unwrap().unwrap();
             assert!(
                 locked.shell.ends_with("nologin"),
@@ -2079,6 +2720,7 @@ mod tests {
                 gecos: GECOS,
                 home: Path::new("/nonexistent/t1root-cy"),
                 shell: Path::new("/bin/sh"),
+                own_group: true,
             })
             .unwrap();
             let pw = sys::user_by_name("ik-t1root-cy")

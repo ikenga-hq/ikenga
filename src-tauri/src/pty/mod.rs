@@ -196,7 +196,7 @@ static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 ///   it is set on a pkg child's `Command` and never on the shell's own process
 ///   env, so today there is nothing here to inherit. Listed so that stays true
 ///   if the injection ever moves.
-fn is_host_only_env(key: &str) -> bool {
+pub(crate) fn is_host_only_env(key: &str) -> bool {
     matches!(
         key,
         "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY" | "IKENGA_PKG_DB_TOKEN"

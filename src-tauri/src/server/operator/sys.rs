@@ -115,8 +115,29 @@ pub(crate) fn user_by_name(name: &str) -> io::Result<Option<PasswdInfo>> {
     })
 }
 
-/// `getgrgid_r`: does a group hold `gid`?
-pub(crate) fn group_gid_exists(gid: u32) -> io::Result<bool> {
+/// A group entry as reconcile needs it (§8 step 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupInfo {
+    pub name: String,
+    pub gid: u32,
+}
+
+/// SAFETY: `gr` must be filled by a successful `getgr*_r` whose buffer is
+/// still alive.
+unsafe fn group_info(gr: &libc::group) -> GroupInfo {
+    let name = if gr.gr_name.is_null() {
+        Vec::new()
+    } else {
+        CStr::from_ptr(gr.gr_name).to_bytes().to_vec()
+    };
+    GroupInfo {
+        name: String::from_utf8_lossy(&name).into_owned(),
+        gid: gr.gr_gid,
+    }
+}
+
+/// `getgrgid_r`: the group holding `gid`, if any.
+pub(crate) fn group_by_gid(gid: u32) -> io::Result<Option<GroupInfo>> {
     with_buffer(|buf| {
         // SAFETY: all-zero is a valid `group`.
         let mut gr: libc::group = unsafe { std::mem::zeroed() };
@@ -127,13 +148,13 @@ pub(crate) fn group_gid_exists(gid: u32) -> io::Result<bool> {
         if rc != 0 {
             return Err(rc);
         }
-        Ok((!result.is_null()).then_some(()))
+        // SAFETY: on success `result` is null or `&gr`, backed by `buf`.
+        Ok((!result.is_null()).then(|| unsafe { group_info(&gr) }))
     })
-    .map(|found| found.is_some())
 }
 
-/// `getgrnam_r`: does a group named `name` exist?
-pub(crate) fn group_name_exists(name: &str) -> io::Result<bool> {
+/// `getgrnam_r`: the group named `name`, if any.
+pub(crate) fn group_by_name(name: &str) -> io::Result<Option<GroupInfo>> {
     let cname = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     with_buffer(|buf| {
         // SAFETY: all-zero is a valid `group`.
@@ -152,9 +173,19 @@ pub(crate) fn group_name_exists(name: &str) -> io::Result<bool> {
         if rc != 0 {
             return Err(rc);
         }
-        Ok((!result.is_null()).then_some(()))
+        // SAFETY: as in `group_by_gid`.
+        Ok((!result.is_null()).then(|| unsafe { group_info(&gr) }))
     })
-    .map(|found| found.is_some())
+}
+
+/// Does a group hold `gid`?
+pub(crate) fn group_gid_exists(gid: u32) -> io::Result<bool> {
+    Ok(group_by_gid(gid)?.is_some())
+}
+
+/// Does a group named `name` exist?
+pub(crate) fn group_name_exists(name: &str) -> io::Result<bool> {
+    Ok(group_by_name(name)?.is_some())
 }
 
 extern "C" {
@@ -212,6 +243,8 @@ mod tests {
         assert_eq!(root.uid, 0);
         assert_eq!(user_by_name(&root.name).unwrap().unwrap().uid, 0);
         assert!(group_gid_exists(0).unwrap());
+        let g0 = group_by_gid(0).unwrap().expect("gid 0 has a group");
+        assert_eq!(group_by_name(&g0.name).unwrap().map(|g| g.gid), Some(0));
         // Far outside any distro or operator range.
         assert_eq!(user_by_uid(3_999_999_000).unwrap(), None);
         assert!(!group_gid_exists(3_999_999_000).unwrap());
