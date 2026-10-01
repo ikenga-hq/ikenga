@@ -422,9 +422,12 @@ async fn install_from_registry_inner(
     // Stage path is a sibling of the final install dir. Both live under
     // pkgs_dir, so a successful untar + atomic rename never crosses
     // filesystems.
+    // Every scratch name carries the full pkg id (see `install_scratch_paths`);
+    // leftovers from a crash mid-install are reaped at boot by
+    // `uninstall_dir::sweep_install_scratch`.
     let final_dir = pkgs_dir.join(&args.pkg_id);
-    let staging_dir = pkgs_dir.join(format!(".staging-{}", args.pkg_id));
-    let backup_dir = pkgs_dir.join(format!(".bak-{}", args.pkg_id));
+    let (staging_dir, tarball_path, backup_dir) =
+        crate::pkg::uninstall_dir::install_scratch_paths(&pkgs_dir, &args.pkg_id);
 
     // Clean up leftover staging/backup from a prior aborted install. We never
     // resume a partial install — start fresh every time.
@@ -436,7 +439,6 @@ async fn install_from_registry_inner(
     }
 
     // 1. Download tarball + verify SHA-512 against the SRI integrity.
-    let tarball_path = staging_dir.with_extension("tgz");
     if let Some(parent) = tarball_path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }

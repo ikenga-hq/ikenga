@@ -34,6 +34,18 @@ pub(crate) const BACKUP_PREFIX: &str = ".uninstalled-";
 pub(crate) const TOMBSTONE: &str = ".manifest.json.uninstalled";
 /// How long a backup is kept before boot prunes it.
 pub(crate) const BACKUP_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Prefix of an installer's unpack dir (`.staging-<id>`) and, with
+/// [`TARBALL_SUFFIX`], of its downloaded tarball (`.staging-<id>.tgz`).
+pub(crate) const STAGING_PREFIX: &str = ".staging-";
+/// Prefix of the dir an installer moves the previous install to while it
+/// promotes the new one (`.bak-<id>`).
+pub(crate) const INSTALL_BACKUP_PREFIX: &str = ".bak-";
+/// Extension of the downloaded registry tarball next to the staging dir.
+pub(crate) const TARBALL_SUFFIX: &str = ".tgz";
+/// Installer scratch younger than this is left alone by
+/// [`sweep_install_scratch`]: `ikenga add` (the CLI) installs into the same
+/// pkgs dir with the same names and can be mid-install while the shell boots.
+pub(crate) const INSTALL_SCRATCH_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 /// Backoff between folder-rename attempts. Short on purpose: `pkg_uninstall`
 /// is a sync Tauri command. Worst case ~350ms, and only when files are locked.
 const RENAME_BACKOFF_MS: &[u64] = &[100, 250];
@@ -231,6 +243,118 @@ pub(crate) fn sweep(pkgs_dir: &Path, retention: Duration) {
     }
 }
 
+/// Scratch paths a registry install of `pkg_id` uses under `pkgs_dir`:
+/// `(staging_dir, tarball, backup_dir)` =
+/// `(.staging-<id>, .staging-<id>.tgz, .bak-<id>)`. Every name carries the
+/// full id. (Building the tarball as `staging_dir.with_extension("tgz")`
+/// replaced the id's last dotted segment, so every `com.ikenga.*` install
+/// shared one `.staging-com.ikenga.tgz`.) Same names as the CLI's
+/// `ikenga add`.
+pub(crate) fn install_scratch_paths(pkgs_dir: &Path, pkg_id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        pkgs_dir.join(format!("{STAGING_PREFIX}{pkg_id}")),
+        pkgs_dir.join(format!("{STAGING_PREFIX}{pkg_id}{TARBALL_SUFFIX}")),
+        pkgs_dir.join(format!("{INSTALL_BACKUP_PREFIX}{pkg_id}")),
+    )
+}
+
+/// Age of `path` by mtime; `None` when it can't be read. A future mtime
+/// counts as age zero.
+fn age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
+    Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// Boot-time reaping of installer scratch left by a crash / restart
+/// mid-install (registry install in `commands::pkg` or the CLI's
+/// `ikenga add`), which nothing else ever removes:
+/// - `.staging-*` dirs and `.staging-*.tgz` files are removed (including
+///   the legacy collided `.staging-com.ikenga.tgz`);
+/// - `.bak-<id>` with no `<id>` beside it means the install died between
+///   moving the old version aside and promoting the new one: the backup is
+///   renamed back to `<id>` (restored);
+/// - `.bak-<id>` with `<id>` present is a leftover of a promoted install:
+///   removed.
+///
+/// Entries younger than `min_age` by mtime are skipped, and so is a
+/// `.bak-<id>` while a young `.staging-<id>` / `.staging-<id>.tgz` exists:
+/// the CLI writes the same names and may be installing while the shell
+/// boots. (The shell's own installer can't race this: it runs from
+/// `Kernel::boot` during Tauri setup, before `KernelState` is managed, so no
+/// install command can reach the kernel yet.) `.uninstalled-*` backups and
+/// pkg dirs are [`sweep`]'s business and untouched here. Best-effort: every
+/// failure is logged and skipped.
+pub(crate) fn sweep_install_scratch(pkgs_dir: &Path, min_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(pkgs_dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    let is_young = |p: &Path| age(p).map_or(true, |a| a < min_age);
+
+    for path in &paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(STAGING_PREFIX) || is_young(path) {
+            continue;
+        }
+        if path.is_dir() {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => log::info!("[pkg_kernel] removed leftover install staging dir {name}"),
+                Err(e) => log::warn!("[pkg_kernel] remove {} failed: {e}", path.display()),
+            }
+        } else if name.ends_with(TARBALL_SUFFIX) {
+            match std::fs::remove_file(path) {
+                Ok(()) => log::info!("[pkg_kernel] removed leftover install tarball {name}"),
+                Err(e) => log::warn!("[pkg_kernel] remove {} failed: {e}", path.display()),
+            }
+        }
+    }
+
+    for path in &paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(id) = name.strip_prefix(INSTALL_BACKUP_PREFIX) else {
+            continue;
+        };
+        if id.is_empty() || id.starts_with('.') || !path.is_dir() || is_young(path) {
+            continue;
+        }
+        let (staging, tarball, _) = install_scratch_paths(pkgs_dir, id);
+        if [&staging, &tarball]
+            .iter()
+            .any(|p| std::fs::symlink_metadata(p).is_ok() && is_young(p))
+        {
+            log::info!("[pkg_kernel] {name}: an install of `{id}` looks in flight — left as-is");
+            continue;
+        }
+        let final_dir = pkgs_dir.join(id);
+        if std::fs::symlink_metadata(&final_dir).is_ok() {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => log::info!("[pkg_kernel] removed leftover install backup {name}"),
+                Err(e) => log::warn!("[pkg_kernel] remove {} failed: {e}", path.display()),
+            }
+        } else {
+            match std::fs::rename(path, &final_dir) {
+                Ok(()) => log::info!(
+                    "[pkg_kernel] restored interrupted install: {name} → {id} (install died before promoting the new version)"
+                ),
+                Err(e) => log::warn!(
+                    "[pkg_kernel] restore {} → {} failed: {e}",
+                    path.display(),
+                    final_dir.display()
+                ),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +543,121 @@ mod tests {
         assert!(!old.exists(), "expired backup pruned");
         assert!(fresh.exists(), "recent backup kept for recovery");
         assert!(odd.exists(), "unrecognised name left alone");
-        assert!(other_dot.exists(), "installer's own dot dirs untouched");
+        assert!(
+            other_dot.exists(),
+            "installer's own dot dirs are sweep_install_scratch's job, not sweep's"
+        );
+    }
+
+    #[test]
+    fn install_scratch_paths_carry_the_full_id() {
+        let pkgs = Path::new("pkgs");
+        let (s_studio, t_studio, b_studio) = install_scratch_paths(pkgs, "com.ikenga.studio");
+        let (s_git, t_git, b_git) = install_scratch_paths(pkgs, "com.ikenga.git");
+        assert_eq!(s_studio, pkgs.join(".staging-com.ikenga.studio"));
+        assert_eq!(t_studio, pkgs.join(".staging-com.ikenga.studio.tgz"));
+        assert_eq!(b_studio, pkgs.join(".bak-com.ikenga.studio"));
+        assert_eq!(t_git, pkgs.join(".staging-com.ikenga.git.tgz"));
+        assert_ne!(t_studio, t_git, "no two pkgs share a tarball path");
+        assert_ne!(s_studio, s_git);
+        assert_ne!(b_studio, b_git);
+        for p in [&s_studio, &t_studio, &b_studio] {
+            assert!(p.to_str().unwrap().contains("com.ikenga.studio"), "{p:?}");
+        }
+        assert_ne!(t_studio, pkgs.join(".staging-com.ikenga.tgz"));
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The live leftovers from an interrupted studio update (stray collided
+    /// tarball, `.bak-` with the final dir still present) plus a fresh
+    /// staging dir / tarball: all scratch goes, everything else stays.
+    #[test]
+    fn sweep_install_scratch_removes_staging_and_promoted_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkgs = tmp.path();
+        let studio = write_pkg(pkgs, "com.ikenga.studio");
+        write_pkg(pkgs, ".bak-com.ikenga.studio");
+        write_pkg(pkgs, ".staging-com.ikenga.git");
+        std::fs::write(pkgs.join(".staging-com.ikenga.git.tgz"), b"tgz").unwrap();
+        std::fs::write(pkgs.join(".staging-com.ikenga.tgz"), b"legacy").unwrap();
+        let uninstalled = pkgs.join(format!("{BACKUP_PREFIX}com.test.a-{}", now_millis()));
+        std::fs::create_dir_all(&uninstalled).unwrap();
+        let other = write_pkg(pkgs, "com.test.other");
+
+        sweep_install_scratch(pkgs, Duration::ZERO);
+
+        let mut want = vec![
+            uninstalled
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "com.ikenga.studio".to_string(),
+            "com.test.other".to_string(),
+        ];
+        want.sort();
+        assert_eq!(names(pkgs), want);
+        assert!(studio.join("manifest.json").exists(), "final install kept");
+        assert!(other.join("index.js").exists(), "normal pkg dir untouched");
+    }
+
+    /// Install died between `<id>` → `.bak-<id>` and promoting staging: the
+    /// previous version is put back so the pkg is not lost.
+    #[test]
+    fn sweep_install_scratch_restores_backup_when_final_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkgs = tmp.path();
+        write_pkg(pkgs, ".bak-com.ikenga.studio");
+        write_pkg(pkgs, ".staging-com.ikenga.studio");
+        std::fs::write(pkgs.join(".staging-com.ikenga.studio.tgz"), b"tgz").unwrap();
+
+        sweep_install_scratch(pkgs, Duration::ZERO);
+
+        assert_eq!(names(pkgs), vec!["com.ikenga.studio".to_string()]);
+        let restored = pkgs.join("com.ikenga.studio");
+        assert!(restored.join("manifest.json").exists());
+        assert_eq!(discovered(pkgs), vec![restored]);
+    }
+
+    /// Scratch younger than the min age may belong to an in-flight CLI
+    /// install: nothing is touched, not even a backup whose final is missing.
+    #[test]
+    fn sweep_install_scratch_skips_young_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkgs = tmp.path();
+        write_pkg(pkgs, ".bak-com.ikenga.studio");
+        write_pkg(pkgs, ".staging-com.ikenga.studio");
+        std::fs::write(pkgs.join(".staging-com.ikenga.studio.tgz"), b"tgz").unwrap();
+        let before = names(pkgs);
+
+        sweep_install_scratch(pkgs, INSTALL_SCRATCH_MIN_AGE);
+
+        assert_eq!(names(pkgs), before);
+    }
+
+    #[test]
+    fn sweep_install_scratch_clean_dir_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkgs = tmp.path();
+        let a = write_pkg(pkgs, "com.test.a");
+        let tomb = write_pkg(pkgs, "com.test.tomb");
+        std::fs::rename(tomb.join("manifest.json"), tomb.join(TOMBSTONE)).unwrap();
+        let before = names(pkgs);
+
+        sweep_install_scratch(pkgs, Duration::ZERO);
+        sweep_install_scratch(&pkgs.join("absent"), Duration::ZERO);
+
+        assert_eq!(names(pkgs), before);
+        assert!(a.join("manifest.json").exists());
+        assert!(tomb.join(TOMBSTONE).exists());
     }
 }
