@@ -1,5 +1,17 @@
 # ikenga-desktop
 
+## 0.18.6
+
+### Patch Changes
+
+- 9c7f0ae: Clicking a package row in the Explorer's "Ngwa · project" section now opens that package's Ngwa item detail page instead of a package UI route — fixing a "No such package route" error for engines, skills, and MCP-only packages that have no UI of their own.
+- 3f7436d: The Explorer's "Ngwa · project" section now lists the active project's full mix of Ngwa items (skills, agents, hooks, MCP servers, workflows and pkgs) from the Ngwa snapshot, each with a kind icon and label, instead of only kernel pkg rows — matching locked design D-01. It falls back to the previous kernel-pkg list while the snapshot's cold scan is still running, and its Explorer row-count badge now hides at zero like the other sections.
+- e2dadd5: Pane tabs for an installed pkg or an ngwa item (skill/agent) now show their real name ("Studio") instead of the title-cased pkg id ("Com.Ikenga.Studio") — the same fix applies to the single-tab address bar and the ⌘K switcher.
+- 8cc0c8f: Package installs no longer leave scratch files behind in the pkgs folder. Each registry install now names its downloaded tarball after the full package id (previously every `com.ikenga.*` install shared one `.staging-com.ikenga.tgz`), and on startup the shell cleans up staging folders, tarballs and backups left by an install that was interrupted by a crash or restart, restoring the previous version of a package if the update died before the new one was put in place.
+- 6b38a4d: Packages bound to the Default project now count as personal, so they stay loaded whichever project is active. Before this, every package on an existing install was stamped with the Default project on each start, and switching to any other project parked all of them, built-in packages included. A migration clears the existing Default stamps, the start-up backfill no longer re-stamps packages, and installs or scope changes that target the Default project are stored as personal. With Default active, the Store's install button now reads "Install to personal", and Default no longer appears as a separate install target.
+- 7c17836: An installed package's recorded version now stays in step with the version the shell shows. Hot-reloading a dev package, or starting the shell after a package's manifest changed on disk, now updates the stored install record too, so it no longer reports an old version (for example 0.6.0 while the Explorer shows 0.8.0).
+- aa79e85: The status bar's middle Ngwa group now labels its install count "N pkgs" (singular "1 pkg") instead of "N installed", because it only ever counted the pkg kernel's installed rows, not the full Ngwa catalogue (skills, agents, hooks, mcp tools, …) the label implied. The Ngwa Installed tab now shows a small muted "· N pkgs" sub-count next to its total, computed by the same shared `selectPkgCount` definition, so the two numbers always agree.
+
 ## 0.18.5
 
 ### Patch Changes
