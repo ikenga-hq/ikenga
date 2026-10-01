@@ -1,6 +1,6 @@
 # G-PRINCIPAL — the principal and auth contract (T1, local accounts)
 
-**Gate:** G-PRINCIPAL · **Owner:** remote-access WP-20 · **Status:** SIGNED — frozen 2026-09-29 (§13) · **Written:** 2026-09-27
+**Gate:** G-PRINCIPAL · **Owner:** remote-access WP-20 · **Status:** SIGNED — frozen 2026-09-29 (§13) · **Written:** 2026-09-27 · **amended** by remote-access Round 16 (2026-10-01) — see §14
 
 WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). Nothing here is implemented yet. §13 was signed on 2026-09-29, so WP-20/21/22 may start against it.
 
@@ -93,7 +93,7 @@ Every later credential kind (OIDC login, device grant, PAT) *adds a way to obtai
 - **Stack:** `axum-login` 0.16 over `tower-sessions` 0.13, with the `tower-sessions-sqlx-store` 0.14 `SqliteStore` in `operator/sessions.db` (§4, §6.3).
 - **Login:** `POST /auth/login {username, password}` → `204` + `Set-Cookie`. axum-login cycles the session id on login.
 - **Other routes:** `POST /auth/logout`. `GET /auth/me` → `{principal_id, username, is_admin}`. `POST /auth/password {current, new}`.
-- **Unauthenticated routes:** only `/api/health`, `/auth/login` and the static SPA. Today that is `/api/health` and the SPA fallback (`server/mod.rs:322-326`).
+- **Unauthenticated routes:** only `/api/health`, `/auth/login` and the static SPA. Today that is `/api/health` and the SPA fallback (`server/mod.rs:322-326`). _(amended Round 16, §14.1)_
 - **Cookie:** `ikenga_session`, `HttpOnly`, `SameSite=Strict`, `Path=/`, `Secure` by default (§12.2 P-3). Expiry `OnInactivity(24h)`.
 - **Staying valid:** `AuthUser::session_auth_hash` is derived from `(password_phc, session_epoch)`. A password change, a disable, or a forced logout bumps the epoch and invalidates every session of that principal on its next request (§6).
 - **Live sockets are revoked too, not just new requests.** A PTY/chat/fs WebSocket authenticates once, at its handshake, so a request-time check alone would let an open socket outlive the revocation. The broker keeps a registry of every open WS keyed by `(principal_id, session_id, session_epoch)` captured at handshake (under B, the proxied socket; under A, the handler's socket). When a principal's `session_epoch` or `disabled_at` no longer matches `accounts.db`, the broker **closes every socket of that principal** carrying the old epoch (WS close `4401`), and `POST /auth/logout` closes the sockets of that one `session_id`. Detection is immediate for changes the broker makes itself (`/auth/password`, logout) and bounded for CLI writes (§7.1): the broker re-checks the epochs of principals with open sockets at least every **2 s** (cheap: `PRAGMA data_version` gates the re-read). Closing the socket does not kill the PTY or run; the owner can reattach after logging in again.
@@ -112,7 +112,7 @@ A cookie also closes the gap `pkg_static.rs:25-39` records: iframe subresources 
 
 ### 2.5 Ownership of live objects
 
-Every PTY session, chat thread, chi run, fs watch and pkg MCP/sidecar child has an **owner principal**. Every attach / write / resize / kill (`server/pty_ws.rs:15-19`), prompt / cancel (`server/chat_ws.rs:242`, `:280`) and read checks it against `PrincipalCtx`.
+Every PTY session, chat thread, chi run, fs watch and pkg MCP/sidecar child has an **owner principal**. Every attach / write / resize / kill (`server/pty_ws.rs:15-19`), prompt / cancel (`server/chat_ws.rs:242`, `:280`) and read checks it against `PrincipalCtx`. _(amended Round 16, §14.1)_
 
 Today there is no check: `resolve_id` resolves any id or label daemon-wide (`pty_ws.rs:61`, `pty/mod.rs:812`). `owner_agent_id` is a multi-agent lease, not a human owner (`pty/mod.rs:268`, `:937`). Id and label lookups are **namespaced by principal**, so another principal's id or label resolves to "gone", never "forbidden". An existence oracle leaks ids.
 
@@ -134,7 +134,7 @@ Under topology B (§3) this holds **by construction**: each principal's objects 
 | Cost | Largest refactor, but one process and lowest memory. Cross-principal admin views are trivial. | One process per active principal (idle-reaped), plus a WS-capable reverse proxy in the broker (net-new). Cross-principal admin views go through the broker/accounts DB. |
 | Precedent | — | JupyterHub hub + single-user servers; code-server's "one instance per user" (`02` §h `:82`). |
 
-**Recommendation: (B).** It keeps root off the ~85-arm RPC surface. It turns every §5 seam but one (the `service_role_key` policy) into a no-op or a layout change. It makes the single-writer rule structural. It sidesteps portable-pty's missing `pre_exec`. And it confines setuid to one spawn site. The executor seam still earns its keep: the broker's child launch is a `SessionExecutor::spawn_piped` with `SpawnSpec.principal = Some(..)` (§9), and T2 later swaps that one spawn for a container.
+**Recommendation: (B).** It keeps root off the ~85-arm RPC surface. It turns every §5 seam but one (the `service_role_key` policy) into a no-op or a layout change. It makes the single-writer rule structural. It sidesteps portable-pty's missing `pre_exec`. And it confines setuid to one spawn site. The executor seam still earns its keep: the broker's child launch is a `SessionExecutor::spawn_piped` with `SpawnSpec.principal = Some(..)` (§9), and T2 later swaps that one spawn for a container. _(amended Round 16, §14.1)_
 
 **Under B, pinned for the child:** it runs `--executor-tier t1 --principal-child` (a hidden flag). It installs an executor with T0 spawn mechanics whose `probe` verifies the process is **already dropped**: `euid != 0`, `CapEff == CapPrm == 0`, `NoNewPrivs == 1`, uid == the expected uid. It reports `principal_isolation: true` only if all four hold.
 
@@ -192,7 +192,7 @@ Under T1, `--data-dir` (`server/src/main.rs:33-35`) names the **operator root**,
 | 8 | `fs_roots` process-wide `OnceLock` | `fs_roots.rs:50`, `:200-212`; installed `mod.rs:371-378`; read by `path_allow.rs:86`, `fs_ws.rs:189` | one allowlist per process | One per child from `<data>/fs_roots.json`. Under A: keyed by `PrincipalId` before `resolve_allowlisted`. |
 | 9 | Single-writer migrations | `db.rs:604-627` (doc: no txn, no `BEGIN IMMEDIATE`), `:628-668`; `PaDb::new` `:76`; only a warning at `mod.rs:380-395` | one opener per `ikenga.db` | **Rule: no two processes, and no two principals, ever open the same `ikenga.db`.** Enforced by the child's `flock` on `<data>/.lock` before `PaDb` opens (§11.1). The broker never opens a principal DB. `db.rs` stays as is. |
 | 10 | `supabase.json` `service_role_key` returned to clients | `server/shared/supabase_config.rs:24-30`; `rpc_local.rs:132-135`; `rpc.rs:611` | token holder = file owner | Per-principal `<data>/supabase.json`. Under B it is only ever returned to its owner, which holds structurally. **Proposed:** no operator-level `service_role_key` is ever seeded into or returned to a principal unless the operator opts in explicitly (`--share-supabase-service-role`); URL + anon key may be seeded. §12 OD-5. |
-| 11 | `pkg_index` / `pkg_static` shared | `mod.rs:258-264`; `AppState` `:86-94`; `pkg_index.rs:10`, `:30`; same-origin caveat `pkg_static.rs:41-48` | every token holder sees every pkg | Shared operator-installed set for v1 (§12 OD-10). **Carried risk, for explicit sign-off:** pkg HTML is same-origin with the SPA, so a framed pkg reaches `window.parent` and acts **as the viewing principal**. Pkgs are operator-installed, hence operator-trusted. It is not a cross-principal leak under B, because each principal's SPA only talks to its own child. |
+| 11 | `pkg_index` / `pkg_static` shared | `mod.rs:258-264`; `AppState` `:86-94`; `pkg_index.rs:10`, `:30`; same-origin caveat `pkg_static.rs:41-48` | every token holder sees every pkg | Shared operator-installed set for v1 (§12 OD-10). **Carried risk, for explicit sign-off:** pkg HTML is same-origin with the SPA, so a framed pkg reaches `window.parent` and acts **as the viewing principal**. Pkgs are operator-installed, hence operator-trusted. It is not a cross-principal leak under B, because each principal's SPA only talks to its own child. _(amended Round 16, §14.1)_ |
 | 12 | PTY / chat registries | `pty/mod.rs:362-363`; `pty_ws.rs:61-99` (auto-spawn `cwd: "."` `:75`); `chat_ws.rs:222-280` | one namespace | Per child (B). Under A: owner field + checks (§2.5). Auto-spawn `cwd "."` becomes the principal's home (§9.3). |
 | 13 | Idle timeout | `mod.rs:433-458` counts only PTY sessions (`active_session_count`, `pty/mod.rs:1404`) | daemon-wide clock | Per child. **Pinned:** "active" also counts open WS connections, so an open chat or fs socket isn't reaped. The broker's own process has no idle timeout. |
 | 14 | Executor tier + health | `executor/tier.rs:139-151`; `executor/mod.rs:255-286`; `health.rs:45` | T0 only | §8 (probe), §9 (T1 spawn). `principal_isolation: true` only from a verified probe. |
@@ -300,7 +300,7 @@ The CLI writes `accounts.db` directly in `BEGIN IMMEDIATE` transactions. That is
 ### 7.2 Create: eager
 
 `create` does four things, and a failure at any step rolls the whole create back:
-1. It opens `BEGIN IMMEDIATE`.
+1. It opens `BEGIN IMMEDIATE`. _(amended Round 16, §14.1)_
 2. It allocates `unix_uid = max(range_start, MAX(unix_uid over non-adopted rows) + 1)`. Disabled rows count, because uids are never reused. It fails if the result is `>= range_end` (`range_end` itself is **permanently reserved** as the §8 probe uid and is never allocated), or if `getpwuid` / `getgrgid` shows the number already taken by a host user.
 3. It mints the UUIDv7, derives `unix_name = "ik-" + lowercase(username)`, validated `^[a-z][a-z0-9-]{0,28}$` (so ≤ 31 chars), and inserts the row.
 4. It provisions: user-private group `gid = uid`, a passwd entry (home `<root>/principals/<id>/home`, the shell), then creates and chowns the §4 dirs.
@@ -402,7 +402,7 @@ As of `b569d88` (#305 merged) every desktop session spawn goes through `executor
 - **I-4** `principal_id` and `unix_uid` are never reused. `accounts` rows are never deleted.
 - **I-5** `/api/health` reports `principal_isolation: true` only if the §8 probe passed in this process and the executor is not degraded.
 - **I-6** Under T1, no request reaches an RPC/WS/pkg handler without a `PrincipalCtx`. `?token=` and the operator bearer grant nothing.
-- **I-7** A principal cannot resolve, attach to, signal or read another principal's PTY, thread, run, watch or files. Under B this is enforced by process and uid; under A, by owner checks.
+- **I-7** A principal cannot resolve, attach to, signal or read another principal's PTY, thread, run, watch or files. Under B this is enforced by process and uid; under A, by owner checks. _(amended Round 16, §14.1)_
 - **I-8** Bumping `session_epoch` (passwd / disable / forced logout) invalidates every existing session of that principal on its next request **and** closes every open PTY/chat/fs WebSocket of that principal authenticated under the old epoch, within 2 s of a CLI write and immediately for a broker-side change (§2.2). Test: open a PTY WS, run `accounts passwd`, assert the socket is closed.
 - **I-9** `<root>/principals/<id>` and everything under it is owned by that uid with no group/other bits. `operator/` is root `0700`. Nothing a principal owns is ever executed by root.
 - **I-10** A T1 boot on a T0-shaped data dir is refused, never auto-migrated.
@@ -469,3 +469,39 @@ Self-signup; LDAP/AD; OIDC flows (WP-22); per-principal pkg install or trust (v1
 After sign-off, any change to §1–§9 or §11.1 needs a new Round in `04`.
 
 **Status: SIGNED — freeze gate G-PRINCIPAL signed off by the founder on 2026-09-29 (merged via #310). WP-20, WP-21 and WP-22 are unblocked.**
+
+---
+
+## 14. Amendments
+
+The signed text above is not rewritten. Each amended statement carries an inline "_(amended Round 16, §14.1)_" marker, and where a marker's statement and this section differ, **this section wins**. Change control is the same as for the signed text: any further change to §1–§9 or §11.1 needs a new Round in `plans/remote-access/04-discussion.md`.
+
+### 14.1 Round 16 (2026-10-01) — G-ACCESS shares, pairing, invites
+
+Recorded in remote-access `04` Round 16. Founder-approved in shell-ux `04` Round 60 (DEC-84). The source is `plans/shell-ux-rearchitecture/drafts/access-schema.md` (G-ACCESS, frozen 2026-10-01) in the workspace meta-repo: §4.5 (sharing), §3 (pairing), §7 (invites) and §12 (the amendment rows marked "Round 16").
+
+- **§2.2 · unauthenticated routes.** The list is now `/api/health`, `/auth/login`, the static SPA, and five G-ACCESS endpoints.
+  - Pairing (T0 and T1): `/access/pair/hello`, `/access/pair/confirm`, `/access/pair/status`.
+  - Invites (T1 only): `/access/invite/inspect`, `/access/invite/accept`.
+  - These five are throttled, and every state-changing one passes the `Origin` gate.
+  - None of them grants a principal surface by itself. Pairing yields a `DeviceGrant` only after the host confirms. Invite accept only sets credentials and then runs the §7.2 core.
+- **§2.5 · ownership of live objects.** One exception is added: an **Owner-delegated, broker-mediated share** (access-schema §4.5). This is the one case where a member's request reaches another principal's threads and runs.
+  - The broker checks the member's active membership and refuses owner- and operator-class arms.
+  - It proxies the request into the **Owner's** child, narrowed by role ∩ device tier.
+  - With no active membership, the other principal's project resolves to `404 not_found`, the same as an unknown project. The no-existence-oracle rule holds.
+- **§3 · process topology (clarifications).**
+  1. The broker serves the `access_*` arms itself, **as root**, and parses `/api/rpc` bodies into `{cmd, args}` to authorize them. This is new root-side logic, bounded by access-schema §6.8: the broker never writes a file at a principal-named path (`destPath` is refused under T1).
+  2. The child reads the broker-set headers `X-Ikenga-Caps` and `X-Ikenga-Share-*`, and only on per-child-token requests. These headers are **narrowing only**: they can remove a right, never grant one. The broker strips every client-supplied `X-Ikenga-*` header. `X-Ikenga-Principal` stays logging-only, and the child still never authorizes on it.
+  3. A principal child never opens an access store. It answers `access_*` with `served_by_broker`.
+- **§5 row 11 / OD-10 · share clause (re-signed).** In share mode, the member's SPA loads `/pkgs/*` from the Owner's child, so a framed pkg acts as the viewing member inside the Owner's project. This is accepted: pkgs are operator-installed, hence operator-trusted, and the member's reach is still capped by role ∩ tier at the broker. Outside share mode, the signed rationale is unchanged: each principal's SPA talks only to its own child.
+- **§7.2 · create (clarification).** The provisioning core runs inside a **caller-owned** `BEGIN IMMEDIATE` transaction: `provision::create_in(&tx, …) -> ProvisionGuard`.
+  - The caller opens the transaction. Both the CLI `create` and G-ACCESS invite accept do this.
+  - Steps 2–4 run inside it.
+  - The guard undoes step 4 on drop unless the caller marks it committed after `COMMIT`.
+  - The semantics are unchanged: one `BEGIN IMMEDIATE`, all-or-nothing, cleanup on failure. Only the owner of the `BEGIN` moves.
+- **§11.1 I-7 · exception for shares.** I-7 still holds by process and uid, with one exception: an Owner-delegated, broker-mediated share (§2.5 above). There, the broker's membership check and role ∩ tier narrowing enforce the limit by policy, under T1 semantics, not by process and uid.
+- **Sharing is on under T1.** There is no `--enable-sharing` flag.
+
+**Unchanged:**
+- **§1:** `uid` is never 0. T0 constructs no `Principal`.
+- **I-8** is unchanged, and it now also covers device sockets: every `session_epoch` bump closes the principal's paired-device sockets too.
