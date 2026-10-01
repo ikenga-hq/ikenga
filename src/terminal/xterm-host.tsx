@@ -16,6 +16,7 @@ import { evaluateTerminalKey, terminalKeyLabel } from './keybindings';
 import { registerPathLinks } from './path-links';
 import { setupSemanticPrompts, type SemanticPromptsManager } from './osc133';
 import { Pty, type PtySpawnOpts } from './pty-bridge';
+import { resyncPtySizeOnWindowFocus } from './resync-on-focus';
 import { readCaptureWithOffset } from './pty-output-buffer';
 import { useTerminalStore } from './session-store';
 
@@ -364,9 +365,18 @@ function wirePtyToTerm(
 	const onDataDispose = term.onData((data) => {
 		pty.write(data).catch(console.error);
 	});
-	const onResizeDispose = term.onResize(({ rows, cols }) => {
+	const xtermResizeDispose = term.onResize(({ rows, cols }) => {
 		pty.resize(rows, cols).catch(console.error);
 	});
+	// A non-owning viewer in an unfocused window skips pty.resize (D-10), so the PTY can be left
+	// at another viewer's size; correct it when this window is focused again.
+	const stopFocusResync = resyncPtySizeOnWindowFocus(pty, term);
+	const onResizeDispose = {
+		dispose: () => {
+			xtermResizeDispose.dispose();
+			stopFocusResync();
+		},
+	};
 	// Sync initial size to PTY (in case we attached/rewired at a different
 	// terminal geometry than the PTY currently has).
 	try {
