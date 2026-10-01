@@ -43,6 +43,10 @@ mod in_process;
 /// T1 — per-principal Unix uid (G-PRINCIPAL §9). Linux-only, like T1.
 #[cfg(target_os = "linux")]
 pub mod t1;
+/// The executor of a T1 principal child: T0 spawn mechanics, isolation
+/// verified from `/proc/self/status` (§3, topology B).
+#[cfg(target_os = "linux")]
+pub mod t1_child;
 /// The host-side steps of the T1 boot probe (§8 steps 2–4 and 6).
 #[cfg(target_os = "linux")]
 pub mod t1_probe;

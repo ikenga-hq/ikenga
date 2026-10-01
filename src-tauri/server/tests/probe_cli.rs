@@ -94,10 +94,12 @@ fn the_probe_fails_closed_without_root_or_an_operator_root() {
 
 /// Root: a fresh operator root passes the read-only probe and is left
 /// uncreated; the T1 boot then probes (creating the root, writing
-/// `probe.json`) and refuses to serve on this build.
+/// `probe.json`) and serves the broker — and boots again on the same root
+/// (its discovery file is `operator/daemon.json`, never the T0 marker
+/// `<root>/daemon.json`, slice 1's trap).
 #[test]
 #[ignore = "t1-root"]
-fn t1_root_probe_passes_read_only_and_the_boot_refuses_after_probing() {
+fn t1_root_probe_passes_read_only_and_the_boot_serves_after_probing() {
     assert!(is_root(), "t1-root tests run as root");
     let tmp = TempDir::new("pass");
     let data = tmp.0.join("root");
@@ -126,16 +128,53 @@ fn t1_root_probe_passes_read_only_and_the_boot_refuses_after_probing() {
     assert!(report.contains("\"probe_uid\": 28810"), "{report}");
     assert!(!data.exists(), "read-only creates nothing");
 
-    let boot = Command::new(bin())
-        .args(["--executor-tier", "t1", "--data-dir", data_s, "--port", "0"])
-        .args(range)
-        .env_remove("IKENGA_DATA_DIR")
-        .env("RUST_BACKTRACE", "0")
-        .output()
-        .unwrap();
-    assert_eq!(boot.status.code(), Some(1), "{boot:?}");
-    let stderr = String::from_utf8_lossy(&boot.stderr);
-    assert!(stderr.contains("no T1 broker yet"), "{stderr}");
+    for boot in 1..=2 {
+        let mut broker = Command::new(bin())
+            .args(["--executor-tier", "t1", "--data-dir", data_s, "--port", "0"])
+            .args(range)
+            .env_remove("IKENGA_DATA_DIR")
+            .env("RUST_BACKTRACE", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let meta = data.join("operator/daemon.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let port = loop {
+            if let Ok(text) = std::fs::read_to_string(&meta) {
+                if text.contains(&format!("\"pid\":{}", broker.id())) {
+                    let port = text
+                        .split("\"port\":")
+                        .nth(1)
+                        .and_then(|r| r.split([',', '}']).next())
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                        .unwrap();
+                    break port;
+                }
+            }
+            if let Some(status) = broker.try_wait().unwrap() {
+                panic!("boot {boot}: the broker exited: {status}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "boot {boot}: never ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert!(port > 0);
+        assert!(
+            !data.join("daemon.json").exists(),
+            "no T0 marker at the root"
+        );
+        // SIGTERM: a clean shutdown removes the discovery file.
+        let _ = Command::new("kill").arg(broker.id().to_string()).status();
+        let status = broker.wait().unwrap();
+        assert!(status.success(), "boot {boot}: {status}");
+        assert!(
+            !meta.exists(),
+            "boot {boot}: operator/daemon.json left behind"
+        );
+    }
     let probe_json = std::fs::read_to_string(data.join("operator/probe.json")).unwrap();
     assert!(probe_json.contains("\n  \"ok\": true"), "{probe_json}");
     assert!(probe_json.contains("\"mode\": \"boot\""), "{probe_json}");

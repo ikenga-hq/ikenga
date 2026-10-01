@@ -129,7 +129,7 @@ pub async fn fs_ws_handler(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_fs_socket(socket, state))
+    ws.on_upgrade(move |socket| super::activity::track_ws(handle_fs_socket(socket, state)))
 }
 
 async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {

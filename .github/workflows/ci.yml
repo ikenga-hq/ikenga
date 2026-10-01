@@ -359,7 +359,8 @@ jobs:
           sudo install -d -m 0755 /opt/t1
           sudo install -m 0755 "$tests" /opt/t1/lib-tests
           sudo install -m 0755 target/debug/ikenga-server /opt/t1/ikenga-server
-          # The ikenga-server integration tests (accounts_cli, probe_cli):
+          # The ikenga-server integration tests (accounts_cli, probe_cli,
+          # broker_t1 — the T1 broker with real per-principal children, I-7/I-8):
           # end to end against the built binary — `accounts disable` through
           # the real `__t1-kill-all` entry, the boot probe + probe.json.
           # They find the binary through IKENGA_SERVER_BIN at run time.
@@ -375,6 +376,7 @@ jobs:
           ls /opt/t1/server-tests
           test -x /opt/t1/server-tests/accounts_cli
           test -x /opt/t1/server-tests/probe_cli
+          test -x /opt/t1/server-tests/broker_t1
 
       - name: t1_root tests (root, T1 capabilities only)
         run: >-

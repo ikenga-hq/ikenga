@@ -11,6 +11,17 @@
 //! WebSockets are exempt from CORS, so the `Origin` header is checked
 //! explicitly on every protected route rather than left to the browser.
 
+/// What keeps a daemon active for its idle timeout: PTYs, open WebSockets,
+/// recent requests (§5 row 13).
+pub mod activity;
+/// T1 request → principal: `PrincipalCtx`, the resolver list, sessions,
+/// `/auth/*` (G-PRINCIPAL §2; WP-20 slice 3). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod auth;
+/// The T1 broker: per-principal children, the reverse proxy and the
+/// open-socket registry (G-PRINCIPAL §3, topology B). Linux-only.
+#[cfg(target_os = "linux")]
+pub mod broker;
 pub mod chat_ws;
 pub mod discovery;
 pub mod fs_ws;
@@ -21,6 +32,9 @@ pub mod health;
 pub mod operator;
 pub mod pkg_index;
 pub mod pkg_static;
+/// The principal-child side of topology B: the data-dir flock (I-3).
+#[cfg(target_os = "linux")]
+pub mod principal_child;
 pub mod pty_ws;
 mod reserved;
 pub mod rpc;
@@ -78,9 +92,28 @@ pub struct ServerConfig {
     pub executor_tier: crate::executor::ExecutorTier,
 }
 
-/// T1-only serve options (G-PRINCIPAL §7.2, §8, §9.3). Kept out of
-/// [`ServerConfig`] so the T0 config and its many constructors don't change;
-/// [`run_server_with`] takes them beside it.
+/// `IKENGA_BOOTSTRAP_ADMIN` + `…_PASSWORD` as captured by `main` (§7.4),
+/// carried to the T1 broker, which applies it after its probe and only on an
+/// empty accounts table. Debug never prints the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootstrapCredentials {
+    pub username: String,
+    pub password: zeroize::Zeroizing<String>,
+}
+
+impl std::fmt::Debug for BootstrapCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Serve options beyond [`ServerConfig`] (G-PRINCIPAL §2.2, §3, §7.2, §7.4,
+/// §8, §9.3). Kept out of [`ServerConfig`] so the T0 config and its many
+/// constructors don't change; [`run_server_with`] takes them beside it, and
+/// every tier's boot reads them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct T1ServeOptions {
     /// `--uid-range START-END`; `None` is the default 20000-29999. Must agree
@@ -91,6 +124,19 @@ pub struct T1ServeOptions {
     pub provisioning_external: bool,
     /// `--principal-path`: the `PATH` principals' children get (§9.3).
     pub principal_path: Option<std::ffi::OsString>,
+    /// `--insecure-cookie` (P-3, G-ACCESS R-9): drop `Secure` from the
+    /// session cookie, for a plain-HTTP tailnet deploy. Read by every tier's
+    /// boot; only the T1 broker sets a cookie today.
+    pub insecure_cookie: bool,
+    /// `--principal-child` (hidden): this process is a T1 principal child,
+    /// launched by the broker as the principal's uid (§3). It never opens an
+    /// access store (G-ACCESS R-11).
+    pub principal_child: bool,
+    /// `--expected-uid` (hidden, with `--principal-child`): the uid the
+    /// child's probe requires it is running as.
+    pub expected_uid: Option<u32>,
+    /// The captured first-admin bootstrap (§7.4).
+    pub bootstrap_admin: Option<BootstrapCredentials>,
 }
 
 #[derive(Clone)]
@@ -221,6 +267,7 @@ async fn auth_middleware(
         .and_then(|h| h.strip_prefix("Bearer "))
     {
         if ct_eq(header, expected) {
+            activity::touch();
             return Ok(next.run(req).await);
         }
     }
@@ -237,6 +284,7 @@ async fn auth_middleware(
                     .decode_utf8_lossy()
                     .into_owned();
                 if ct_eq(&decoded, expected) {
+                    activity::touch();
                     return Ok(next.run(req).await);
                 }
             }
@@ -468,18 +516,19 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     run_server_with(config, T1ServeOptions::default()).await
 }
 
-/// [`run_server`] with the T1-only options (`ikenga-server` passes its
+/// [`run_server`] with the [`T1ServeOptions`] (`ikenga-server` passes its
 /// flags through here).
-pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
+pub async fn run_server_with(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
     // Executor tier first, before anything is created, bound or written: a
     // tier the host can't honour means this server must not start at all.
     // Refuse, don't fall back (ADR-023 / DEC-R9-1) — an operator who asked for
     // per-user isolation and quietly got a shared uid is worse off than one
     // whose server wouldn't boot.
     if config.executor_tier == crate::executor::ExecutorTier::T1 {
-        let refusal = t1_boot(&config, &t1).await;
-        error!("executor tier t1 refused: {refusal}");
-        return Err(refusal.into());
+        return t1_boot(config, t1).await;
+    }
+    if t1.principal_child {
+        anyhow::bail!("--principal-child is only valid with --executor-tier t1");
     }
     let executor = match crate::executor::install(config.executor_tier) {
         Ok(caps) => caps,
@@ -492,7 +541,52 @@ pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> an
         "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
         executor.tier, executor.pty, executor.piped, executor.principal_isolation
     );
+    serve_single_tenant(config, SingleTenant::default()).await
+}
 
+/// What differs when the single-tenant daemon runs as a T1 principal child.
+#[derive(Default)]
+struct SingleTenant {
+    /// The `<data>/.lock` flock, held for the process lifetime (I-3).
+    #[cfg(target_os = "linux")]
+    lock: Option<principal_child::DataDirLock>,
+    /// A principal child: exits when the broker that launched it is gone.
+    principal_child: bool,
+}
+
+/// Resolves on SIGINT, SIGTERM or a message on `shutdown_rx`.
+pub(crate) async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received SIGINT (Ctrl+C), shutting down daemon");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, shutting down daemon");
+        }
+        _ = shutdown_rx.recv() => {
+            info!("Received shutdown signal, shutting down daemon");
+        }
+    }
+}
+
+/// Today's single-tenant daemon: T0, and each T1 principal child.
+async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> anyhow::Result<()> {
     health::init_uptime();
 
     // Fail closed: an operator who forgets `--auth-token` gets a generated
@@ -580,14 +674,15 @@ pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> an
             let mut idle_since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let active = pty_manager.active_session_count();
-                if active > 0 {
+                // §5 row 13: PTYs, open WebSockets and recent requests.
+                if activity::is_active(pty_manager.active_session_count(), timeout) {
                     idle_since = None;
                 } else {
                     let since = idle_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= timeout {
                         info!(
-                            "Daemon idle for {}s (no active PTY sessions). Initiating auto-shutdown.",
+                            "Daemon idle for {}s (no PTY session, open WebSocket or request). \
+                             Initiating auto-shutdown.",
                             idle_timeout_secs
                         );
                         let _ = shutdown_tx.send(());
@@ -619,19 +714,27 @@ pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> an
         info!("token is the configured one; read it from the env file, not from this log");
     }
 
+    // Bound before the discovery files are written, so they carry the real
+    // port (a principal child binds port 0 and reports it this way, P-7).
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+
     // Write daemon discovery metadata files. They carry the bearer token, so
     // they are owner-only and the temp copy is per user (`discovery.rs`).
     let temp_meta_path = discovery::user_temp_path();
     let daemon_meta = serde_json::json!({
         "pid": std::process::id(),
         "host": config.host,
-        "port": config.port,
+        "port": bound.port(),
         "token": token,
         "version": env!("CARGO_PKG_VERSION"),
     })
     .to_string();
     if let Err(e) = discovery::write_private(&temp_meta_path, &daemon_meta) {
-        warn!("could not write discovery file {}: {e}", temp_meta_path.display());
+        warn!(
+            "could not write discovery file {}: {e}",
+            temp_meta_path.display()
+        );
     }
     let data_dir_meta = config.data_dir.as_ref().map(|d| d.join("daemon.json"));
     if let Some(ref path) = data_dir_meta {
@@ -640,40 +743,23 @@ pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> an
         }
     }
 
-    let shutdown_signal = {
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        async move {
-            let ctrl_c = async {
-                let _ = tokio::signal::ctrl_c().await;
-            };
-            #[cfg(unix)]
-            let terminate = async {
-                if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    sig.recv().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
+    // A principal child whose broker died exits rather than hold the
+    // principal's data-dir lock forever (the next broker could never start
+    // a child for it).
+    #[cfg(target_os = "linux")]
+    if mode.principal_child {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            principal_child::parent_gone().await;
+            warn!("the T1 broker that launched this principal child is gone; shutting down");
+            let _ = shutdown_tx.send(());
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mode.principal_child;
 
-            tokio::select! {
-                _ = ctrl_c => {
-                    info!("Received SIGINT (Ctrl+C), shutting down daemon");
-                }
-                _ = terminate => {
-                    info!("Received SIGTERM, shutting down daemon");
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Received shutdown signal, shutting down daemon");
-                }
-            }
-        }
-    };
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal)
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx.subscribe()))
         .await?;
 
     info!("ikenga-server shutting down: cleaning up metadata and draining PTY sessions");
@@ -682,28 +768,38 @@ pub async fn run_server_with(mut config: ServerConfig, t1: T1ServeOptions) -> an
         let _ = std::fs::remove_file(path);
     }
     pty_manager.drain_all();
+    // Released last: nothing of this process touches ikenga.db any more.
+    #[cfg(target_os = "linux")]
+    drop(mode.lock);
 
     Ok(())
 }
 
-/// The T1 boot: the real §8 probe, first, before anything binds. A failing
-/// probe is the refusal. A passing one still refuses on this build: the T1
-/// broker (session auth, per-principal children, proxy) is WP-20 slice 3, and
-/// serving today's single-tenant daemon as root under T1 would hand every
-/// bearer-token holder a root shell — the opposite of what T1 promises.
+/// The T1 boot. A principal child verifies its own drop and serves as the
+/// single-tenant daemon ([`principal_child_boot`]). Otherwise this is the
+/// broker: the real §8 probe first, before anything binds; a failing probe is
+/// the refusal (DEC-R9-1). A passing one installs the stamped executor and
+/// serves the broker (`server::broker`).
 #[cfg(target_os = "linux")]
-async fn t1_boot(config: &ServerConfig, t1: &T1ServeOptions) -> crate::executor::Refusal {
+async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
     use crate::executor::Refusal;
-    use operator::provision::{ProvisioningMode, UidRange};
+    use operator::provision::{BootstrapAdmin, ProvisioningMode, UidRange};
 
+    if t1.principal_child {
+        return principal_child_boot(config, t1).await;
+    }
+    let refuse = |refusal: Refusal| -> anyhow::Error {
+        error!("executor tier t1 refused: {refusal}");
+        refusal.into()
+    };
     let uid_range = match t1.uid_range.as_deref().map(str::parse::<UidRange>) {
         None => UidRange::DEFAULT,
         Some(Ok(range)) => range,
         Some(Err(e)) => {
-            return Refusal::ProbeFailed {
+            return Err(refuse(Refusal::ProbeFailed {
                 check: "uid_range",
                 detail: e.to_string(),
-            }
+            }))
         }
     };
     let provisioning = if t1.provisioning_external {
@@ -711,30 +807,115 @@ async fn t1_boot(config: &ServerConfig, t1: &T1ServeOptions) -> crate::executor:
     } else {
         ProvisioningMode::Auto
     };
-    match operator::probe::boot(
+    // The probe pins the uid range once its test drop passes (§8).
+    let executor = operator::probe::boot(
         config.data_dir.clone(),
         uid_range,
         provisioning,
         t1.principal_path.clone(),
     )
     .await
-    {
-        Err(refusal) => refusal,
-        // SLICE-3: install the stamped executor
-        // (`executor::install_executor(Box::new(executor))`), then boot the
-        // broker instead of the single-tenant daemon below.
-        Ok(_executor) => Refusal::NotImplemented {
-            tier: crate::executor::ExecutorTier::T1,
-        },
+    .map_err(refuse)?;
+    let executor = Arc::new(executor);
+    let caps = crate::executor::install_executor(Box::new(executor.clone())).map_err(refuse)?;
+    info!(
+        "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
+        caps.tier, caps.pty, caps.piped, caps.principal_isolation
+    );
+    health::init_uptime();
+
+    // The probe accepted --data-dir as the operator root (it resolved a
+    // relative one against the cwd the same way).
+    let data_dir = config
+        .data_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--data-dir is required under t1"))?;
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()?.join(data_dir)
+    };
+    let root = operator::OperatorRoot::new(data_dir)?;
+    if config.auth_token.is_some() {
+        warn!(
+            "IKENGA_AUTH_TOKEN / --auth-token is ignored under t1: the operator bearer grants \
+             no principal surface (G-PRINCIPAL §2.4); principals sign in at /auth/login"
+        );
     }
+    let bootstrap = t1.bootstrap_admin.map(|b| BootstrapAdmin {
+        username: b.username,
+        password: b.password,
+    });
+    broker::serve(broker::BrokerBoot {
+        config,
+        executor,
+        root,
+        uid_range,
+        provisioning,
+        bootstrap,
+        insecure_cookie: t1.insecure_cookie,
+    })
+    .await
+}
+
+/// A T1 principal child (§3 "pinned for the child"): verify the drop and
+/// install that executor, take the data-dir flock **before** `PaDb` can open
+/// `ikenga.db` (I-3), then serve as the single-tenant daemon on loopback
+/// with the broker-issued per-child token.
+#[cfg(target_os = "linux")]
+async fn principal_child_boot(mut config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
+    use crate::executor::Refusal;
+
+    let refuse = |detail: String| -> anyhow::Error {
+        let refusal = Refusal::ProbeFailed {
+            check: "principal_child",
+            detail,
+        };
+        error!("principal child refused: {refusal}");
+        refusal.into()
+    };
+    let expected_uid = t1
+        .expected_uid
+        .ok_or_else(|| refuse("--principal-child needs --expected-uid".into()))?;
+    let executor = crate::executor::t1_child::PrincipalChildExecutor::probe(expected_uid)
+        .map_err(|r| refuse(r.to_string()))?;
+    let caps =
+        crate::executor::install_executor(Box::new(executor)).map_err(|r| refuse(r.to_string()))?;
+    info!(
+        "executor tier: {} principal child (pty: {}, piped: {}, principal isolation: {})",
+        caps.tier, caps.pty, caps.piped, caps.principal_isolation
+    );
+    if config.auth_token.is_none() {
+        // Never mint: only the broker's per-child token may reach us (P-7).
+        return Err(refuse("no IKENGA_AUTH_TOKEN from the broker".into()));
+    }
+    let data_dir = config
+        .data_dir
+        .clone()
+        .ok_or_else(|| refuse("--principal-child needs --data-dir".into()))?;
+    let lock = principal_child::DataDirLock::acquire(&data_dir)
+        .map_err(|e| refuse(format!("{}: {e}", data_dir.join(".lock").display())))?;
+    // Loopback only, whatever was passed (P-7).
+    config.host = "127.0.0.1".into();
+    config.port = 0;
+    serve_single_tenant(
+        config,
+        SingleTenant {
+            lock: Some(lock),
+            principal_child: true,
+        },
+    )
+    .await
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn t1_boot(_config: &ServerConfig, _t1: &T1ServeOptions) -> crate::executor::Refusal {
-    crate::executor::Refusal::ProbeFailed {
+async fn t1_boot(_config: ServerConfig, _t1: T1ServeOptions) -> anyhow::Result<()> {
+    let refusal = crate::executor::Refusal::ProbeFailed {
         check: "os",
         detail: "executor tier t1 is Linux-only".into(),
-    }
+    };
+    error!("executor tier t1 refused: {refusal}");
+    Err(refusal.into())
 }
 
 #[cfg(test)]

@@ -46,7 +46,9 @@ pub async fn chat_ws_handler(
     Path(thread_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, thread_id))
+    ws.on_upgrade(move |socket| {
+        super::activity::track_ws(handle_chat_socket(socket, state, thread_id))
+    })
 }
 
 /// One `session/update` envelope.

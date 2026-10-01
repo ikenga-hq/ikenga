@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ikenga_desktop_lib::executor::ExecutorTier;
-use ikenga_desktop_lib::server::{run_server_with, ServerConfig, T1ServeOptions};
+use ikenga_desktop_lib::server::{
+    run_server_with, BootstrapCredentials, ServerConfig, T1ServeOptions,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -188,15 +190,19 @@ pub struct ServeArgs {
     )]
     pub allowed_origins: Vec<String>,
 
-    /// Idle timeout in seconds before server automatically shuts down when no sessions are active.
+    /// Idle timeout in seconds before server automatically shuts down when no
+    /// PTY session, open WebSocket or recent request keeps it active. Under
+    /// `t1` this is each principal child's idle timeout instead (default 1800;
+    /// the broker itself never idles out).
     #[arg(long, env = "IKENGA_IDLE_TIMEOUT")]
     pub idle_timeout: Option<u64>,
 
     /// Session-executor isolation tier (ADR-023): `t0` in-process, `t1`
     /// per-user uid, `t2` container per session, `t3` firejail per session.
-    /// `t1` runs its boot probe (G-PRINCIPAL §8) and, on this build, then
-    /// refuses to serve (its broker is not built yet); `t2`/`t3` are refused.
-    /// A refused tier never falls back to a weaker one.
+    /// `t1` runs its boot probe (G-PRINCIPAL §8) and serves the multi-user
+    /// broker: principals sign in at /auth/login and each gets their own
+    /// child process as their own uid. `t2`/`t3` are refused. A refused tier
+    /// never falls back to a weaker one.
     #[arg(long, env = "IKENGA_EXECUTOR_TIER", default_value = "t0")]
     pub executor_tier: ExecutorTier,
 
@@ -215,6 +221,21 @@ pub struct ServeArgs {
     /// `<home>/.local/bin:/usr/local/bin:/usr/bin:/bin`.
     #[arg(long, env = "IKENGA_PRINCIPAL_PATH")]
     pub principal_path: Option<std::ffi::OsString>,
+
+    /// Drop `Secure` from the session cookie (G-PRINCIPAL P-3). Only for a
+    /// plain-HTTP deploy on a private network (a tailnet IP); behind HTTPS,
+    /// leave it off.
+    #[arg(long, env = "IKENGA_INSECURE_COOKIE")]
+    pub insecure_cookie: bool,
+
+    /// Internal: run as a T1 principal child (launched by the broker as the
+    /// principal's uid, G-PRINCIPAL §3).
+    #[arg(long, hide = true, requires = "expected_uid")]
+    pub principal_child: bool,
+
+    /// Internal, with `--principal-child`: the uid the child must be running as.
+    #[arg(long, hide = true, requires = "principal_child")]
+    pub expected_uid: Option<u32>,
 }
 
 #[tokio::main]
@@ -294,19 +315,21 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    if bootstrap.is_some() {
-        if args.executor_tier == ExecutorTier::T1 {
-            // Honoured by the T1 broker after its §8 boot probe, only on an
-            // empty accounts table (`Provisioner::bootstrap_admin`). The broker
-            // lands in a later WP-20 slice; on this build T1 refuses to boot.
+    // Honoured by the T1 broker after its §8 boot probe, only on an empty
+    // accounts table (`Provisioner::bootstrap_admin`); never by a child.
+    let bootstrap_admin = match bootstrap {
+        Some(b) if args.executor_tier == ExecutorTier::T1 && !args.principal_child => {
             tracing::info!("IKENGA_BOOTSTRAP_ADMIN captured for the T1 broker");
-        } else {
+            Some(bootstrap_credentials(b))
+        }
+        Some(_) => {
             tracing::warn!(
                 "IKENGA_BOOTSTRAP_ADMIN ignored: local accounts exist only under --executor-tier t1"
             );
+            None
         }
-    }
-    drop(bootstrap);
+        None => None,
+    };
 
     let config = ServerConfig {
         host: args.host,
@@ -323,6 +346,10 @@ async fn main() -> anyhow::Result<()> {
         uid_range: args.uid_range,
         provisioning_external: args.provisioning == Provisioning::External,
         principal_path: args.principal_path,
+        insecure_cookie: args.insecure_cookie,
+        principal_child: args.principal_child,
+        expected_uid: args.expected_uid,
+        bootstrap_admin,
     };
 
     run_server_with(config, t1).await
@@ -409,6 +436,19 @@ fn take_bootstrap_admin() -> Option<BootstrapAdmin> {
             None
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn bootstrap_credentials(b: BootstrapAdmin) -> BootstrapCredentials {
+    BootstrapCredentials {
+        username: b.username,
+        password: b.password,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bootstrap_credentials(_b: BootstrapAdmin) -> BootstrapCredentials {
+    unreachable!("no bootstrap is captured off Linux")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -663,6 +703,31 @@ mod tests {
             args.serve.principal_path.as_deref(),
             Some(std::ffi::OsStr::new("/usr/bin:/bin"))
         );
+    }
+
+    #[test]
+    fn insecure_cookie_and_the_hidden_child_flags_parse() {
+        let args = CliArgs::try_parse_from(["ikenga-server", "--insecure-cookie"]).unwrap();
+        assert!(args.serve.insecure_cookie && !args.serve.principal_child);
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "--executor-tier",
+            "t1",
+            "--principal-child",
+            "--expected-uid",
+            "20001",
+        ])
+        .unwrap();
+        assert!(args.serve.principal_child);
+        assert_eq!(args.serve.expected_uid, Some(20_001));
+        // Each needs the other.
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--principal-child"]).is_err());
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--expected-uid", "1"]).is_err());
+        let help = <CliArgs as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--insecure-cookie"), "{help}");
+        assert!(!help.contains("--principal-child"), "{help}");
     }
 
     #[test]
