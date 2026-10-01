@@ -24,18 +24,49 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dir, '..');
+// The one `generate_handler!` list moved out of lib.rs in the WP-19 final
+// slice (part A). lib.rs is still read, to assert it holds no list of its own.
+const REGISTRY_RS = join(ROOT, 'src-tauri', 'src', 'commands', 'registry.rs');
 const LIB_RS = join(ROOT, 'src-tauri', 'src', 'lib.rs');
+const HANDLER_OPEN = 'tauri::generate_handler![';
 const PERMS = join(ROOT, 'src-tauri', 'permissions', 'app-commands.toml');
 const PERMISSION = 'allow-app-commands';
 
-/** Command names inside `tauri::generate_handler![ … ]`, module paths stripped. */
+/** Occurrences of the handler-list opener in `src`. */
+function countHandlerLists(src: string): number {
+	return src.split(HANDLER_OPEN).length - 1;
+}
+
+/**
+ * Exactly one `tauri::generate_handler![` across lib.rs + registry.rs, all of
+ * it in registry.rs. A second list would register commands this gate never
+ * parses. Mirrors `registry_holds_the_only_handler_list` in server/parity.rs.
+ */
+function assertSingleHandlerList(): void {
+	const inLib = countHandlerLists(readFileSync(LIB_RS, 'utf8'));
+	const inRegistry = countHandlerLists(readFileSync(REGISTRY_RS, 'utf8'));
+	if (inLib !== 0 || inRegistry !== 1) {
+		console.error(
+			`[acl-parity] FAIL: expected exactly one ${HANDLER_OPEN} across lib.rs + commands/registry.rs, ` +
+				`all of it in registry.rs; found lib.rs=${inLib} registry.rs=${inRegistry}`
+		);
+		process.exit(1);
+	}
+}
+
+/**
+ * Command names inside `tauri::generate_handler![ … ]`, module paths stripped.
+ * The list ends at the first line that starts with its closing `]` (a bare
+ * `]` as a fn's tail expression, or `])` as a builder argument) — the same
+ * slice `server/parity.rs` takes.
+ */
 function registeredCommands(): Set<string> {
-	const src = readFileSync(LIB_RS, 'utf8');
-	const start = src.indexOf('tauri::generate_handler![');
-	if (start === -1) throw new Error(`no tauri::generate_handler! in ${LIB_RS}`);
-	const end = src.indexOf('])', start);
-	if (end === -1) throw new Error(`unterminated generate_handler! in ${LIB_RS}`);
-	const block = src.slice(start, end);
+	const src = readFileSync(REGISTRY_RS, 'utf8');
+	const start = src.indexOf(HANDLER_OPEN);
+	if (start === -1) throw new Error(`no tauri::generate_handler! in ${REGISTRY_RS}`);
+	const close = /\n[ \t]*\]/.exec(src.slice(start));
+	if (!close) throw new Error(`unterminated generate_handler! in ${REGISTRY_RS}`);
+	const block = src.slice(start, start + close.index);
 
 	const out = new Set<string>();
 	for (const raw of block.split('\n')) {
@@ -63,6 +94,7 @@ function grantedCommands(): Set<string> {
 	return out;
 }
 
+assertSingleHandlerList();
 const registered = registeredCommands();
 const granted = grantedCommands();
 if (registered.size === 0) {

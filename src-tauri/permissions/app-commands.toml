@@ -24,7 +24,7 @@
 # it fails in a release build, instead of only in front of users.
 #
 # MAINTENANCE: this list must stay in sync with `tauri::generate_handler![..]`
-# in `src-tauri/src/lib.rs`. `bun run test:acl-parity`
+# in `src-tauri/src/commands/registry.rs`. `bun run test:acl-parity`
 # (scripts/check-acl-parity.ts) asserts that and runs in CI.
 
 [[permission]]

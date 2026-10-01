@@ -7,10 +7,16 @@
 //! server, because the dynamic linker demands `libwebkit2gtk-4.1` and five
 //! friends that no headless box has.
 //!
-//! Everything in the second group is desktop-only — built around
+//! The module list below is in three groups. The first, the headless core,
+//! is every module the daemon compiles — deliberately short. The second
+//! is a set of thin desktop facades over code that already lives in the
+//! ungated `server::shared`. The third is desktop-only — built around
 //! `#[tauri::command]` and `AppHandle`, neither of which exists without a
-//! webview runtime (`AppHandle`'s default type parameter IS `Wry`). The
-//! daemon's dependency closure is deliberately the short first list.
+//! webview runtime (`AppHandle`'s default type parameter IS `Wry`).
+//!
+//! The Tauri command surface itself is registered in `commands/registry.rs`
+//! (the one `generate_handler!` list, which both parity gates parse); `run()`
+//! below only installs it.
 
 // --- Headless core: compiled into BOTH binaries ---
 // `db` holds PaDb + the embedded migration set; `commands::db` keeps only the
@@ -41,13 +47,26 @@ pub mod pty;
 mod runtime;
 pub mod secrets_env;
 pub mod server;
-#[cfg(feature = "desktop")]
-pub mod settings;
 
-// --- Desktop-only ---
+// --- Desktop facades over the headless `server::shared` substrate ---
+// The implementations already compile into both binaries (WP-19 slices
+// 5a/5b); these modules only keep the desktop's historical `crate::…` paths
+// and add the `AppHandle`-backed pieces (the `settings://changed` /
+// `actions://changed` emitting constructors, the OS opener behind
+// `actions_open_file`, the `claude_config_resolve_cascade` command).
+// TODO(WP-19 PR B): ungate or fold these into `server::shared` call sites —
+// out of scope for the registry move (part A), which changes no behaviour.
 // WP-50: actions.json / keybindings.json file layer + project-trust record.
 #[cfg(feature = "desktop")]
 pub mod actions;
+#[cfg(feature = "desktop")]
+pub mod settings;
+#[cfg(feature = "desktop")]
+pub mod settings_cascade;
+#[cfg(feature = "desktop")]
+mod terminal;
+
+// --- Desktop-only ---
 #[cfg(feature = "desktop")]
 mod agent_detect;
 #[cfg(feature = "desktop")]
@@ -66,10 +85,6 @@ pub mod notifications;
 mod pkg_content;
 #[cfg(feature = "desktop")]
 pub mod secrets;
-#[cfg(feature = "desktop")]
-pub mod settings_cascade;
-#[cfg(feature = "desktop")]
-mod terminal;
 #[cfg(feature = "desktop")]
 pub mod transcript;
 #[cfg(feature = "desktop")]
@@ -96,90 +111,18 @@ use tokio::sync::Mutex;
 #[cfg(feature = "desktop")]
 use commands::db::PaDb;
 #[cfg(feature = "desktop")]
-use commands::screenshot::new_pending as new_screenshot_pending;
-#[cfg(feature = "desktop")]
-use commands::{
-    action_exec, action_git_branch, actions_open_file, actions_read_files, actions_trust_grant,
-    actions_trust_revoke, actions_trust_status, actions_write, keybindings_write,
-};
-// WP-72: app lock (D-05 `locked`).
-#[cfg(feature = "desktop")]
-use commands::{
-    app_lock_clear_secret, app_lock_configure, app_lock_lock, app_lock_set_secret,
-    app_lock_status, app_lock_touch, app_lock_unlock, app_lock_unlock_biometric, AppLockState,
-};
-#[cfg(feature = "desktop")]
-use commands::{
-    activity_pins_add, activity_pins_list, activity_pins_remove, activity_pins_reorder,
-    activity_pins_resolve_artifact, activity_pins_touch_open, activity_sections_create,
-    activity_sections_list, activity_sections_remove, activity_sections_update,
-    agent_ops_delete_job, agent_ops_list_jobs, agent_ops_run_now, agent_ops_set_enabled,
-    agent_ops_tail_run, agent_ops_upsert_job, atelier_file_read, atelier_file_write, backup_delete,
-    backup_export, backup_import, backup_list, chi_cancel, chi_list, chi_resume, chi_run,
-    chi_status, claude_asset_list_pins, claude_asset_pin, claude_asset_unpin,
-    claude_assets_discover, claude_config_load, claude_config_read_file, claude_config_unwatch,
-    claude_config_watch, claude_list_sessions, claude_primitive_copy, claude_primitive_copy_batch,
-    claude_primitive_disable, claude_primitive_disable_for, claude_primitive_enable,
-    claude_primitive_enable_for, claude_primitive_move, claude_primitive_remove,
-    claude_primitive_remove_for, claude_read_jsonl, claude_store_import, claude_store_list,
-    comment_create, comment_delete, comment_get, comment_list, comment_record_routing,
-    comment_route, comment_set_status, data_health_scan, db_exec, db_export_ndjson,
-    db_import_ndjson, db_query, dev_bind_port, dev_release_port, engine_layout, fs_exists, fs_kind,
-    fs_list, fs_mime, fs_mkdir, fs_read, fs_rename, fs_roots_add, fs_roots_list, fs_roots_remove,
-    fs_roots_reset, fs_search, fs_trash, fs_unwatch, fs_watch, fs_write, iyke_action_done,
-    iyke_dom_done, iyke_dom_query, iyke_endpoint, iyke_log_push, iyke_mcp_info, iyke_network_push,
-    iyke_query_cache_done, iyke_set_shell, iyke_terminal_read_done, iyke_terminal_spawn_done,
-    iyke_wait_done, list_all_skill_actions, list_skill_actions, ngwa_snapshot,
-    notifications_list, notifications_mark_all_read, notifications_mark_read,
-    notifications_mute_kind, notifications_mute_state, notifications_record_update,
-    notifications_unmute_kind, notifications_unread_count, oba_auto_update_all,
-    oba_backfill_registry, oba_check_update, oba_dependents, oba_forget, oba_install_bundle,
-    oba_install_git, oba_install_local, oba_install_npx, oba_install_with_deps,
-    oba_missing_requires, oba_relink_dependents, oba_resolve_source, oba_safe_delete,
-    oba_set_auto_update, oba_unlink_one, oba_update, os_username, pin_screenshot_write, pkg_activity_bar_set_badge,
-    pkg_content_html, pkg_content_revoke, pkg_content_url, pkg_db_diag, pkg_dev_register,
-    pkg_dev_reload, pkg_dev_unregister, pkg_discover_workspace, pkg_fetch, pkg_health_remove,
-    pkg_health_remove_all, pkg_health_scan, pkg_install_from_path, pkg_install_from_registry,
-    pkg_invoke, pkg_is_trusted_for_elevated, pkg_kernel_status, pkg_mcp_call, pkg_preview_manifest,
-    pkg_scaffold, pkg_screenshot, pkg_set_enabled, pkg_set_scope, pkg_settings_get, pkg_settings_set,
-    pkg_sidecar_call, pkg_sidecar_rpc_send, pkg_sidecar_rpc_shutdown,
-    pkg_studio_request_project_access, pkg_supervisor_restart, pkg_uninstall, pkg_webview_clear_session,
-    pkg_webview_allow_origin, pkg_webview_create, pkg_webview_destroy, pkg_webview_navigate, pkg_webview_set_rect,
-    project_archive, project_artifacts_walk, project_create, project_get_active, project_inventory, project_list,
-    project_scaffold_claude, project_set_active, project_skills_list, project_update,
-    pty_attach_arm, pty_attach_begin, pty_daemon_info, pty_daemon_shutdown, pty_foreground,
-    pty_foreground_snapshot, pty_kill, pty_resize, pty_spawn, pty_terminal_list, pty_write,
-    runtime_retry_bun_fetch,
-    screenshot_capture_done, screenshot_capture_failed, screenshot_capture_native_crop,
-    screenshot_get_config, screenshot_pane, screenshot_set_dir, screenshot_window, secrets_delete,
-    secrets_delete_scoped, secrets_get, secrets_get_scoped, secrets_index_names,
-    secrets_list_keys, secrets_list_keys_scoped, secrets_lock, secrets_lock_state, secrets_set,
-    secrets_set_passphrase, secrets_set_scoped, secrets_unlock, secrets_vault_status,
-    set_dock_badge, settings_clear_all, settings_get, settings_get_all, settings_open_file,
-    settings_read_file, settings_set, settings_write_field, spike_grant_fs_read,
-    spike_setup_test_file, studio_message_append, studio_message_list, studio_thread_delete,
-    studio_thread_get, studio_thread_get_or_create, studio_thread_list_recent,
-    terminal_detect_shells, window_close, window_join_surface, window_list, window_remove_surface,
-    window_spawn, ChiCache, ChiRuntime,
-    KernelState, PkgContentState, PkgSettingsState, SidecarSupervisorState, SidecarsRegistryState,
-    StreamingSidecarManager, StreamingSidecarManagerState, WebviewPanesState,
-};
-#[cfg(feature = "desktop")]
 #[cfg(debug_assertions)]
-use commands::{bg_spike_reply, bg_spike_run, new_bg_spike_state};
-// DEC-32 (WP-16a): read-only database file sizes for Ngwa → Health.
+use commands::new_bg_spike_state;
 #[cfg(feature = "desktop")]
-use commands::data_health_db_size;
+use commands::screenshot::new_pending as new_screenshot_pending;
+// Managed-state types only. The `#[tauri::command]` functions are named by
+// `commands/registry.rs`, which holds the one `generate_handler!` list.
 #[cfg(feature = "desktop")]
 use commands::{
-    pa_actions_commit, pa_actions_list, pa_actions_pause, pa_actions_reject, pa_actions_retry,
-    pa_actions_update, pkg_permission_violations_clear, pkg_permission_violations_list,
-    pkg_trust_approve, pkg_trust_grant, pkg_trust_list, pkg_trust_list_pending, pkg_trust_preview,
-    pkg_trust_preview_incoming, pkg_trust_reject, pkg_trust_revoke, session_cancel,
-    session_destroy, session_destroy_all, session_ensure, session_send, session_tool_result,
-    supabase_config_clear, supabase_config_get,
-    supabase_config_set, viewer_port, viewer_serve, viewer_stop, IykeRuntimeState,
-    ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending, SecretsLock,
+    AppLockState, ChiCache, ChiRuntime, IykeRuntimeState, KernelState, PkgContentState,
+    PkgSettingsState, ScreenshotConfigState, ScreenshotConfigStateRef, ScreenshotPending,
+    SecretsLock, SidecarSupervisorState, SidecarsRegistryState, StreamingSidecarManager,
+    StreamingSidecarManagerState, WebviewPanesState,
 };
 #[cfg(feature = "desktop")]
 use fs_watch::FsWatchManager;
@@ -315,7 +258,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(global_shortcut_plugin())
+        .plugin(commands::os_shortcuts::global_shortcut_plugin())
         .plugin(tauri_plugin_clipboard_manager::init())
         // Phase 9 (ACP migration): OS notifications for the
         // user-attention hooks (Notification + PermissionRequest). The
@@ -571,7 +514,7 @@ pub fn run() {
 
             // OS-wide shortcuts (G-ACTIONS §6): the default `os.*` rules now;
             // the webview replaces them with the effective set on load.
-            register_default_os_shortcuts(app.handle());
+            commands::os_shortcuts::register_default_os_shortcuts(app.handle());
 
             // Iyke (Phase 11): localhost control bridge. Boot synchronously so
             // the server is ready by the time the webview asks for its
@@ -1104,363 +1047,8 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            // agent-ops host bridge (WP-09 / G-TRIGGER + WP-14 CRUD)
-            agent_ops_run_now,
-            agent_ops_set_enabled,
-            agent_ops_list_jobs,
-            agent_ops_upsert_job,
-            agent_ops_delete_job,
-            agent_ops_tail_run,
-            // pty
-            pty_spawn,
-            pty_write,
-            pty_resize,
-            pty_kill,
-            pty_attach_begin,
-            pty_attach_arm,
-            pty_foreground,
-            pty_foreground_snapshot,
-            pty_terminal_list,
-            terminal_detect_shells,
-            pty_daemon_info,
-            pty_daemon_shutdown,
-            // multi-window substrate (plans/multi-window WP-03)
-            window_spawn,
-            window_close,
-            window_list,
-            // WP-69: Pop out joins Window 2 (G-SEATS §4.4)
-            window_join_surface,
-            window_remove_surface,
-            // fs
-            fs_read,
-            fs_write,
-            fs_mkdir,
-            fs_exists,
-            fs_kind,
-            fs_list,
-            fs_mime,
-            fs_watch,
-            fs_unwatch,
-            fs_trash,
-            fs_rename,
-            fs_search,
-            // fs allowlist (user-configurable roots)
-            fs_roots_list,
-            fs_roots_add,
-            fs_roots_remove,
-            fs_roots_reset,
-            // claude
-            claude_list_sessions,
-            claude_read_jsonl,
-            session_ensure,
-            session_send,
-            session_tool_result,
-            session_cancel,
-            session_destroy,
-            session_destroy_all,
-            // chi-first agent surface (WP-01)
-            chi_run,
-            chi_resume,
-            chi_status,
-            chi_list,
-            chi_cancel,
-            // Chi seats (G-SEATS §9.2, WP-65) — `src-tauri/src/iyke/seats.rs`.
-            iyke::seats::seats_list,
-            iyke::seats::seats_get,
-            iyke::seats::seats_engines,
-            iyke::seats::seats_resolve,
-            iyke::seats::seats_create,
-            iyke::seats::seats_move,
-            iyke::seats::seats_resume,
-            iyke::seats::seats_fill,
-            iyke::seats::seats_queue,
-            iyke::seats::seats_clear,
-            iyke::seats::seats_rename,
-            iyke::seats::seats_remove,
-            iyke::seats::seats_release,
-            // claude config browser
-            claude_config_load,
-            claude_config_watch,
-            claude_config_unwatch,
-            claude_config_read_file,
-            settings_cascade::claude_config_resolve_cascade,
-            claude::session_browser::claude_session_list,
-            // claude config — Phase 4 (4-tier discovery + pin CRUD)
-            claude_assets_discover,
-            claude_asset_pin,
-            claude_asset_unpin,
-            claude_asset_list_pins,
-            // Ngwa store layer — WP-02 (central store + symlink farm)
-            claude_store_list,
-            claude_store_import,
-            claude_primitive_enable,
-            claude_primitive_disable,
-            claude_primitive_copy,
-            claude_primitive_move,
-            claude_primitive_remove,
-            // Ngwa Phase-2 v2b write — unified per-engine dispatch + cross-engine copy
-            claude_primitive_enable_for,
-            claude_primitive_disable_for,
-            claude_primitive_remove_for,
-            claude_primitive_copy_batch,
-            // Ngwa Ọba registry — WP-04 dependent-aware safe delete + WP-06 finish
-            oba_dependents,
-            oba_safe_delete,
-            oba_relink_dependents,
-            oba_unlink_one,
-            oba_forget,
-            oba_backfill_registry,
-            oba_install_git,
-            oba_install_npx,
-            oba_install_local,
-            oba_install_bundle,
-            oba_install_with_deps,
-            oba_missing_requires,
-            oba_check_update,
-            oba_update,
-            oba_resolve_source,
-            oba_auto_update_all,
-            oba_set_auto_update,
-            os_username,
-            // app lock (WP-72, D-05 `locked`)
-            app_lock_status,
-            app_lock_touch,
-            app_lock_lock,
-            app_lock_unlock,
-            app_lock_unlock_biometric,
-            app_lock_configure,
-            app_lock_set_secret,
-            app_lock_clear_secret,
-            // OS-wide shortcuts from the effective keymap (WP-54, G-ACTIONS §6)
-            os_shortcuts_apply,
-            // Ngwa Phase-2 cross-system — G-ADAPTER engine layout descriptor
-            engine_layout,
-            // Ngwa Phase-2 — WP-14 unified snapshot (G-NGWA-ITEM)
-            ngwa_snapshot,
-            // viewer
-            viewer_serve,
-            viewer_stop,
-            viewer_port,
-            // secrets
-            secrets_get,
-            secrets_set,
-            secrets_delete,
-            secrets_list_keys,
-            secrets_index_names,
-            secrets_vault_status,
-            secrets_set_passphrase,
-            secrets_unlock,
-            secrets_lock,
-            secrets_lock_state,
-            // secrets — Phase 7 scoped variants
-            secrets_get_scoped,
-            secrets_set_scoped,
-            secrets_delete_scoped,
-            secrets_list_keys_scoped,
-            // settings_kv (durable mirror for Zustand-backed prefs)
-            settings_get,
-            settings_set,
-            settings_get_all,
-            settings_clear_all,
-            settings_read_file,
-            settings_write_field,
-            settings_open_file,
-            // actions — WP-50 actions.json / keybindings.json + project trust
-            actions_read_files,
-            actions_write,
-            keybindings_write,
-            actions_open_file,
-            actions_trust_status,
-            actions_trust_grant,
-            actions_trust_revoke,
-            // action runner — WP-53 `shell` run kind + `{{branch}}`
-            action_exec,
-            action_git_branch,
-            // notifications — WP-40 aggregation table (D-07 notification centre)
-            notifications_list,
-            notifications_unread_count,
-            notifications_mark_read,
-            notifications_mark_all_read,
-            notifications_mute_state,
-            notifications_mute_kind,
-            notifications_unmute_kind,
-            notifications_record_update,
-            // projects (phase 0 of projects-first-class plan)
-            project_create,
-            project_update,
-            project_list,
-            project_archive,
-            project_set_active,
-            project_get_active,
-            project_inventory,
-            project_skills_list,
-            project_scaffold_claude,
-            project_artifacts_walk,
-            // atelier skill files (WP-16b / WP-10) — generic reader for
-            // <project_root>/.atelier/<skill>/<file>; the Tasks roster read is one caller.
-            atelier_file_read,
-            // atelier instance write path (WP-18b) — the setup-chat confirm-write
-            // persists <project_root>/.atelier/<skill>/manifest.json through here.
-            atelier_file_write,
-            // supabase config (URL + anon key manifest)
-            supabase_config_get,
-            supabase_config_set,
-            supabase_config_clear,
-            // trust gating (Phase 9)
-            pkg_trust_list,
-            pkg_trust_preview,
-            pkg_trust_grant,
-            pkg_trust_revoke,
-            // trust-review modal (2026-05-15) — capability-diff batch surface
-            pkg_trust_list_pending,
-            pkg_trust_preview_incoming,
-            pkg_trust_approve,
-            pkg_trust_reject,
-            // per-folder Studio project-access gate (WP-04)
-            pkg_studio_request_project_access,
-            // runtime-ACL violations audit (2026-05-15)
-            pkg_permission_violations_list,
-            pkg_permission_violations_clear,
-            // approve-gate run-then-pause seam (pa_action_drafts, WP-3)
-            pa_actions_pause,
-            pa_actions_list,
-            pa_actions_update,
-            pa_actions_commit,
-            pa_actions_reject,
-            pa_actions_retry,
-            // db
-            db_query,
-            db_exec,
-            // data health (orphan audit + DEC-32 db size)
-            data_health_scan,
-            data_health_db_size,
-            // iyke
-            iyke_endpoint,
-            iyke_set_shell,
-            iyke::handlers::iyke_set_frame,
-            // WP-62: the `iyke` actions/menus/keys surface — FE→Rust
-            // effective-model mirror push + the write/query round-trip
-            // callback (`src-tauri/src/iyke/actions_routes.rs`).
-            iyke::actions_routes::iyke_set_actions_frame,
-            iyke::actions_routes::iyke_actions_request_done,
-            iyke_log_push,
-            iyke_network_push,
-            iyke_dom_done,
-            iyke_dom_query,
-            iyke_query_cache_done,
-            iyke_wait_done,
-            iyke_terminal_read_done,
-            iyke_terminal_spawn_done,
-            iyke_action_done,
-            iyke::browser_handlers::iyke_browser_reply,
-            // backup / restore
-            backup_export,
-            backup_import,
-            backup_list,
-            backup_delete,
-            db_export_ndjson,
-            db_import_ndjson,
-            // desktop
-            set_dock_badge,
-            iyke_mcp_info,
-            // screenshots
-            screenshot_window,
-            screenshot_pane,
-            screenshot_capture_done,
-            screenshot_capture_failed,
-            screenshot_capture_native_crop,
-            screenshot_get_config,
-            screenshot_set_dir,
-            // spike: dynamic ACL verification (delete after kernel lands)
-            spike_grant_fs_read,
-            spike_setup_test_file,
-            // pkg-browser child webviews
-            pkg_webview_create,
-            pkg_webview_allow_origin,
-            pkg_webview_destroy,
-            pkg_webview_navigate,
-            pkg_webview_set_rect,
-            pkg_webview_clear_session,
-            // Phase 0.5 bg-execution spike. Debug builds only.
-            #[cfg(debug_assertions)]
-            bg_spike_run,
-            #[cfg(debug_assertions)]
-            bg_spike_reply,
-            // pkg kernel
-            pkg_install_from_path,
-            pkg_install_from_registry,
-            pkg_uninstall,
-            pkg_set_enabled,
-            pkg_set_scope,
-            pkg_kernel_status,
-            list_skill_actions,
-            list_all_skill_actions,
-            pkg_discover_workspace,
-            pkg_db_diag,
-            pkg_health_scan,
-            pkg_health_remove,
-            pkg_health_remove_all,
-            pkg_settings_get,
-            pkg_settings_set,
-            pkg_activity_bar_set_badge,
-            pkg_preview_manifest,
-            pkg_scaffold,
-            pkg_screenshot,
-            pkg_content_url,
-            pkg_content_html,
-            pkg_content_revoke,
-            pkg_is_trusted_for_elevated,
-            // trusted-pkg elevated verbs (ADR-017, WP-04/05)
-            pkg_fetch,
-            pkg_invoke,
-            pkg_mcp_call,
-            pkg_sidecar_call,
-            pkg_sidecar_rpc_send,
-            pkg_sidecar_rpc_shutdown,
-            pkg_supervisor_restart,
-            pkg_dev_register,
-            pkg_dev_unregister,
-            pkg_dev_reload,
-            runtime_retry_bun_fetch,
-            dev_bind_port,
-            dev_release_port,
-            // first-run wizard detection
-            agent_detect::detect_system,
-            agent_detect::detect_agents,
-            agent_detect::detect_agent,
-            agent_detect::detect_agent_config,
-            agent_detect::list_claude_projects,
-            agent_detect::list_agent_projects,
-            agent_detect::scaffold_agent_config,
-            // activity bar pinning
-            activity_pins_list,
-            activity_pins_add,
-            activity_pins_remove,
-            activity_pins_reorder,
-            activity_pins_resolve_artifact,
-            activity_pins_touch_open,
-            activity_sections_list,
-            activity_sections_create,
-            activity_sections_update,
-            activity_sections_remove,
-            // artifact-grid pin comments
-            comment_create,
-            comment_get,
-            comment_list,
-            comment_record_routing,
-            comment_set_status,
-            comment_delete,
-            comment_route,
-            pin_screenshot_write,
-            // artifact-studio chat threads (one per folder, D3)
-            studio_thread_get_or_create,
-            studio_thread_get,
-            studio_thread_list_recent,
-            studio_thread_delete,
-            studio_message_append,
-            studio_message_list,
-        ])
+        // The command list lives in `commands/registry.rs` (WP-19 final slice A).
+        .invoke_handler(commands::registry::handler())
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app, event| {
@@ -1519,455 +1107,6 @@ fn init_logging() {
             .with(filter)
             .with(stderr_layer)
             .init();
-    }
-}
-
-// ─── OS-wide shortcuts (G-ACTIONS §6, DEC-60; WP-54) ─────────────────────────
-//
-// The three shipped OS-wide shortcuts are the registry's `os.*` commands
-// (`scope: 'os'` entries in `src/lib/keymap/defaults.ts`). What is
-// registered with the OS is the **effective** default + personal OS rules:
-// the defaults below at boot (so summon works before the webview loads),
-// then whatever the primary window pushes through `os_shortcuts_apply` —
-// on load and again whenever a personal `keybindings.json` rebind changes
-// them. Registration stays tolerant per shortcut: one failure is logged and
-// reported in its status (the Keys tab shows "not registered: <reason>") and
-// never blocks the others. The handler dispatches by the bound command, not
-// by a fixed key, so a rebound key runs the same command.
-
-/// One effective OS rule: an action id and its key in the registry grammar
-/// (`alt+space`, `ctrl+alt+shift+s`).
-#[cfg(feature = "desktop")]
-#[derive(Debug, Clone, serde::Deserialize)]
-struct OsShortcutRule {
-    command: String,
-    key: String,
-}
-
-/// Per-rule registration result, returned to the webview.
-#[cfg(feature = "desktop")]
-#[derive(Debug, Clone, serde::Serialize)]
-struct OsShortcutStatus {
-    command: String,
-    key: String,
-    registered: bool,
-    reason: Option<String>,
-}
-
-/// The shortcuts currently registered with the OS and the command each runs.
-///
-/// `bound` is only ever held for a copy-in / copy-out, never across an OS
-/// (un)register call: on Linux/X11 global-hotkey runs the plugin handler on
-/// its own thread, and that handler reads `bound` (`command_for`) while a
-/// `register` from another thread waits on that same thread — holding
-/// `bound` across `register` would deadlock the moment an OS shortcut is
-/// pressed during a re-apply. `apply` serializes whole re-applies instead;
-/// the handler never takes it.
-#[cfg(feature = "desktop")]
-#[derive(Default)]
-struct OsShortcuts {
-    bound: std::sync::Mutex<Vec<(tauri_plugin_global_shortcut::Shortcut, String)>>,
-    apply: std::sync::Mutex<()>,
-}
-
-#[cfg(feature = "desktop")]
-impl OsShortcuts {
-    fn command_for(&self, shortcut: &tauri_plugin_global_shortcut::Shortcut) -> Option<String> {
-        let bound = self.bound.lock().unwrap_or_else(|p| p.into_inner());
-        bound
-            .iter()
-            .find(|(bound_shortcut, _)| bound_shortcut == shortcut)
-            .map(|(_, command)| command.clone())
-    }
-}
-
-/// The default-layer OS rules — mirrors `DEFAULT_KEYMAP`'s `scope: 'os'`
-/// entries. `os.summon` on Windows/Linux stays Super+Space as shipped; on
-/// Windows it may collide with the input-language switcher (open question,
-/// `04` Round 37 — flagged, not changed here).
-#[cfg(feature = "desktop")]
-fn default_os_rules() -> Vec<OsShortcutRule> {
-    let summon = if cfg!(target_os = "macos") {
-        "alt+space"
-    } else {
-        "meta+space"
-    };
-    [
-        ("os.summon", summon),
-        ("os.screenshot-window", "ctrl+alt+shift+s"),
-        ("os.screenshot-pane", "ctrl+alt+shift+p"),
-    ]
-    .into_iter()
-    .map(|(command, key)| OsShortcutRule {
-        command: command.to_string(),
-        key: key.to_string(),
-    })
-    .collect()
-}
-
-/// A registry key name (G-ACTIONS §3.1) → the physical key the OS registers.
-/// `plus` and `?` are character keys with no fixed position, so they cannot
-/// be OS-wide.
-#[cfg(feature = "desktop")]
-fn os_key_code(name: &str) -> Option<tauri_plugin_global_shortcut::Code> {
-    use tauri_plugin_global_shortcut::Code;
-    let code = match name {
-        "a" => Code::KeyA,
-        "b" => Code::KeyB,
-        "c" => Code::KeyC,
-        "d" => Code::KeyD,
-        "e" => Code::KeyE,
-        "f" => Code::KeyF,
-        "g" => Code::KeyG,
-        "h" => Code::KeyH,
-        "i" => Code::KeyI,
-        "j" => Code::KeyJ,
-        "k" => Code::KeyK,
-        "l" => Code::KeyL,
-        "m" => Code::KeyM,
-        "n" => Code::KeyN,
-        "o" => Code::KeyO,
-        "p" => Code::KeyP,
-        "q" => Code::KeyQ,
-        "r" => Code::KeyR,
-        "s" => Code::KeyS,
-        "t" => Code::KeyT,
-        "u" => Code::KeyU,
-        "v" => Code::KeyV,
-        "w" => Code::KeyW,
-        "x" => Code::KeyX,
-        "y" => Code::KeyY,
-        "z" => Code::KeyZ,
-        "0" => Code::Digit0,
-        "1" => Code::Digit1,
-        "2" => Code::Digit2,
-        "3" => Code::Digit3,
-        "4" => Code::Digit4,
-        "5" => Code::Digit5,
-        "6" => Code::Digit6,
-        "7" => Code::Digit7,
-        "8" => Code::Digit8,
-        "9" => Code::Digit9,
-        "`" => Code::Backquote,
-        "-" => Code::Minus,
-        "=" => Code::Equal,
-        "[" => Code::BracketLeft,
-        "]" => Code::BracketRight,
-        "\\" => Code::Backslash,
-        ";" => Code::Semicolon,
-        "'" => Code::Quote,
-        "," => Code::Comma,
-        "." => Code::Period,
-        "/" => Code::Slash,
-        "space" => Code::Space,
-        "enter" => Code::Enter,
-        "escape" => Code::Escape,
-        "tab" => Code::Tab,
-        "backspace" => Code::Backspace,
-        "delete" => Code::Delete,
-        "insert" => Code::Insert,
-        "home" => Code::Home,
-        "end" => Code::End,
-        "pageup" => Code::PageUp,
-        "pagedown" => Code::PageDown,
-        "arrowup" => Code::ArrowUp,
-        "arrowdown" => Code::ArrowDown,
-        "arrowleft" => Code::ArrowLeft,
-        "arrowright" => Code::ArrowRight,
-        "f1" => Code::F1,
-        "f2" => Code::F2,
-        "f3" => Code::F3,
-        "f4" => Code::F4,
-        "f5" => Code::F5,
-        "f6" => Code::F6,
-        "f7" => Code::F7,
-        "f8" => Code::F8,
-        "f9" => Code::F9,
-        "f10" => Code::F10,
-        "f11" => Code::F11,
-        "f12" => Code::F12,
-        "f13" => Code::F13,
-        "f14" => Code::F14,
-        "f15" => Code::F15,
-        "f16" => Code::F16,
-        "f17" => Code::F17,
-        "f18" => Code::F18,
-        "f19" => Code::F19,
-        "f20" => Code::F20,
-        "f21" => Code::F21,
-        "f22" => Code::F22,
-        "f23" => Code::F23,
-        "f24" => Code::F24,
-        _ => return None,
-    };
-    Some(code)
-}
-
-/// Parse one stroke of the registry grammar into an OS shortcut. `mod` is ⌘
-/// on macOS and Ctrl elsewhere; `meta` is the literal ⌘ / Win / Super key.
-#[cfg(feature = "desktop")]
-fn parse_os_key(key: &str) -> Result<tauri_plugin_global_shortcut::Shortcut, String> {
-    use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
-
-    let key = key.trim();
-    if key.is_empty() {
-        return Err("empty key".to_string());
-    }
-    if key.contains(' ') {
-        return Err("a chord cannot be an OS-wide shortcut".to_string());
-    }
-    let parts: Vec<&str> = key.split('+').collect();
-    let Some((name, modifier_names)) = parts.split_last() else {
-        return Err("empty key".to_string());
-    };
-    let mut modifiers = Modifiers::empty();
-    for m in modifier_names {
-        let flag = match *m {
-            "mod" => {
-                if cfg!(target_os = "macos") {
-                    Modifiers::SUPER
-                } else {
-                    Modifiers::CONTROL
-                }
-            }
-            "ctrl" => Modifiers::CONTROL,
-            "meta" => Modifiers::SUPER,
-            "alt" => Modifiers::ALT,
-            "shift" => Modifiers::SHIFT,
-            other => return Err(format!("unknown modifier `{other}`")),
-        };
-        modifiers |= flag;
-    }
-    let code = os_key_code(name).ok_or_else(|| format!("`{name}` cannot be an OS-wide key"))?;
-    // A bare key would be taken from every app on the machine. Only the
-    // function keys may go without a modifier.
-    let function_key = name.len() > 1
-        && name.starts_with('f')
-        && name[1..].chars().all(|c| c.is_ascii_digit());
-    if modifiers.is_empty() && !function_key {
-        return Err(format!(
-            "`{name}` needs a modifier to be OS-wide (it would take the key from every app)"
-        ));
-    }
-    let modifiers = if modifiers.is_empty() {
-        None
-    } else {
-        Some(modifiers)
-    };
-    Ok(Shortcut::new(modifiers, code))
-}
-
-/// A command an OS rule may not name (§6): a package action (DEC-54) or a
-/// hosted command, whose owner has no focus while Ikenga is unfocused.
-#[cfg(feature = "desktop")]
-fn os_command_refusal(command: &str) -> Option<&'static str> {
-    if command.contains(':') {
-        return Some("a package action cannot be OS-wide");
-    }
-    if command.starts_with("terminal.")
-        || matches!(
-            command,
-            "companion.send" | "companion.new-run" | "companion.persistent-run"
-        )
-    {
-        return Some("a hosted command cannot be OS-wide");
-    }
-    None
-}
-
-/// Replace every registered OS shortcut with `rules`. Tolerant per rule.
-#[cfg(feature = "desktop")]
-fn apply_os_shortcuts(app: &tauri::AppHandle, rules: &[OsShortcutRule]) -> Vec<OsShortcutStatus> {
-    use tauri_plugin_global_shortcut::GlobalShortcutExt;
-
-    let status = |rule: &OsShortcutRule, reason: Option<String>| OsShortcutStatus {
-        command: rule.command.clone(),
-        key: rule.key.clone(),
-        registered: reason.is_none(),
-        reason,
-    };
-    let Some(state) = app.try_state::<OsShortcuts>() else {
-        return rules
-            .iter()
-            .map(|rule| status(rule, Some("OS shortcuts are not initialised".to_string())))
-            .collect();
-    };
-    let _applying = state.apply.lock().unwrap_or_else(|p| p.into_inner());
-    // Take the old set and release `bound` before touching the OS (see
-    // `OsShortcuts`): the handler may need it while we (un)register.
-    let old = std::mem::take(&mut *state.bound.lock().unwrap_or_else(|p| p.into_inner()));
-    for (shortcut, command) in old {
-        if let Err(e) = app.global_shortcut().unregister(shortcut) {
-            // `log::` macros are dropped in this crate (no log→tracing
-            // bridge); use tracing so the warning actually emits.
-            tracing::warn!("OS shortcut for {command} not unregistered (continuing): {e}");
-        }
-    }
-
-    let mut bound: Vec<(tauri_plugin_global_shortcut::Shortcut, String)> = Vec::new();
-    let mut out = Vec::with_capacity(rules.len());
-    for rule in rules {
-        if let Some(reason) = os_command_refusal(&rule.command) {
-            out.push(status(rule, Some(reason.to_string())));
-            continue;
-        }
-        let shortcut = match parse_os_key(&rule.key) {
-            Ok(shortcut) => shortcut,
-            Err(reason) => {
-                out.push(status(rule, Some(reason)));
-                continue;
-            }
-        };
-        if let Some((_, other)) = bound.iter().find(|(b, _)| *b == shortcut) {
-            let reason = format!("the key is already OS-wide for {other}");
-            out.push(status(rule, Some(reason)));
-            continue;
-        }
-        match app.global_shortcut().register(shortcut) {
-            Ok(()) => {
-                bound.push((shortcut, rule.command.clone()));
-                out.push(status(rule, None));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "OS shortcut {} → {} not registered (continuing): {e}",
-                    rule.key,
-                    rule.command
-                );
-                out.push(status(rule, Some(e.to_string())));
-            }
-        }
-    }
-    *state.bound.lock().unwrap_or_else(|p| p.into_inner()) = bound;
-    out
-}
-
-/// Registers the effective default + personal OS rules the primary window
-/// computed (`startOsShortcutSync`, `src/lib/keymap/dispatcher.ts`),
-/// replacing the previous set. Sync on purpose: it runs on the main thread,
-/// where the OS registration has to happen.
-#[cfg(feature = "desktop")]
-#[tauri::command]
-fn os_shortcuts_apply(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    rules: Vec<OsShortcutRule>,
-) -> Vec<OsShortcutStatus> {
-    // Only the primary window computes the effective default + personal OS
-    // rules (DEC-60). Detached windows share `allow-app-commands`, so refuse
-    // them here rather than trust the capability set.
-    if window.label() != "main" {
-        return rules
-            .into_iter()
-            .map(|rule| OsShortcutStatus {
-                command: rule.command,
-                key: rule.key,
-                registered: false,
-                reason: Some("only the main window applies OS shortcuts".to_string()),
-            })
-            .collect();
-    }
-    apply_os_shortcuts(&app, &rules)
-}
-
-/// Run the command an OS shortcut is bound to.
-#[cfg(feature = "desktop")]
-fn run_os_command(app: &tauri::AppHandle, command: &str) {
-    match command {
-        "os.summon" => {
-            // Summon always targets the PRIMARY window — "bring Ikenga to
-            // the front" means the main window, not whatever is focused
-            // (multi-window: intentionally stays "main").
-            if let Some(window) = app.get_webview_window("main") {
-                let visible = window.is_visible().unwrap_or(false);
-                if visible && window.is_focused().unwrap_or(false) {
-                    let _ = window.hide();
-                } else {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
-        }
-        "os.screenshot-window" | "os.screenshot-pane" => {
-            // Target the focused window that actually hosts the screenshot
-            // listener (`useScreenshotListener`, mounted only inside
-            // `<Workspace/>`). `focused_listener_window_label` returns a
-            // focused `Workspace`-kind spawned window (Flavor B) if any,
-            // else `None` — deliberately never a `single-surface`/`pane-set`
-            // detached window or a pkg-pane child webview, which have no
-            // listener. `None` → "main", exactly today's behavior; on
-            // WebKitGTK `is_focused` can under-report, which also falls back
-            // to "main" (safe). Detached-window capture also needs the
-            // listener + `capture_window_png` de-"main"'d before it lights
-            // up in practice.
-            let kind = if command == "os.screenshot-window" {
-                "window"
-            } else {
-                "pane-focused"
-            };
-            let target = crate::window::focused_listener_window_label(app)
-                .unwrap_or_else(|| "main".to_string());
-            let _ = crate::window::emit_to_label(
-                app,
-                &target,
-                "screenshot://shortcut",
-                serde_json::json!({ "kind": kind }),
-            );
-        }
-        // Any other action a personal OS rule names (§6): the primary
-        // window's dispatcher runs it through the command table.
-        other => {
-            let _ = crate::window::emit_to_label(
-                app,
-                "main",
-                "keymap://os-command",
-                serde_json::json!({ "command": other }),
-            );
-        }
-    }
-}
-
-/// Build the global-shortcut plugin. The handler looks the pressed shortcut
-/// up in `OsShortcuts` and runs the command it is bound to; the screenshot
-/// commands emit `screenshot://shortcut` events that the FE picks up and
-/// routes back through `screenshot_window` / `screenshot_pane`. Doing the
-/// focused-pane resolution in the FE avoids mirroring `usePaneStore` on the
-/// Rust side just for one handler.
-#[cfg(feature = "desktop")]
-fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
-    use tauri_plugin_global_shortcut::{Builder, ShortcutState};
-
-    Builder::new()
-        .with_handler(move |app, shortcut, event| {
-            if event.state() != ShortcutState::Pressed {
-                return;
-            }
-            let Some(command) = app
-                .try_state::<OsShortcuts>()
-                .and_then(|state| state.command_for(shortcut))
-            else {
-                return;
-            };
-            run_os_command(app, &command);
-        })
-        .build()
-}
-
-/// Boot: register the default OS rules until the webview pushes the
-/// effective set. Tolerant — a clash on one never kills the others.
-#[cfg(feature = "desktop")]
-fn register_default_os_shortcuts(app: &tauri::AppHandle) {
-    app.manage(OsShortcuts::default());
-    for status in apply_os_shortcuts(app, &default_os_rules()) {
-        if !status.registered {
-            tracing::warn!(
-                "OS shortcut {} → {} not registered (continuing): {}",
-                status.key,
-                status.command,
-                status.reason.unwrap_or_default()
-            );
-        }
     }
 }
 

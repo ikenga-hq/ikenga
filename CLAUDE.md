@@ -44,7 +44,7 @@ Required env (`.env.local`): `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, opti
 The frontend is a TanStack Router file-based-routing React app. The Rust core (`src-tauri/src/lib.rs`) wires Tauri commands and owns long-lived state (PTYs, Claude sessions, viewer HTTP server, pkg kernel + sidecar supervisor, fs watchers, iyke control bridge, child-webview panes). Everything the UI needs from the OS goes through `src/lib/tauri-cmd.ts` — that file is the **cross-team contract**; matching Rust commands live in `src-tauri/src/commands/`.
 
 When adding a Tauri command:
-1. Add the Rust handler in `src-tauri/src/commands/<area>.rs`, re-export from `commands/mod.rs`, register in `lib.rs` `invoke_handler`.
+1. Add the Rust handler in `src-tauri/src/commands/<area>.rs`, re-export from `commands/mod.rs`, and register it as `<area>::<name>` in its domain section of `src-tauri/src/commands/registry.rs` (the one `generate_handler!` list; `lib.rs` only installs it). Grant it in `src-tauri/permissions/app-commands.toml` (`bun run test:acl-parity`) and either serve it from `server/rpc.rs` or allowlist it in `server/desktop_only.toml` (`cargo test --lib server::parity`).
 2. Add the typed wrapper in `src/lib/tauri-cmd.ts`.
 3. Never call `invoke()` directly from components — always go through `tauri-cmd.ts`.
 

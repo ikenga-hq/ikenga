@@ -30,6 +30,9 @@ pub mod identity;
 pub mod iyke;
 pub mod ngwa;
 pub mod notifications;
+// WP-54 OS-wide shortcuts (G-ACTIONS §6): the global-shortcut plugin, its
+// boot defaults and `os_shortcuts_apply`. Moved out of `lib.rs` (WP-19 A).
+pub(crate) mod os_shortcuts;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -45,6 +48,9 @@ pub mod pkg_trust;
 pub mod pkg_webview;
 pub mod projects;
 pub mod pty;
+// The ONE `generate_handler!` list (WP-19 final slice A) — `lib.rs` installs
+// `registry::handler()`; both parity gates parse this file.
+pub(crate) mod registry;
 pub mod runtime;
 pub mod scaffold;
 pub mod screenshot;
