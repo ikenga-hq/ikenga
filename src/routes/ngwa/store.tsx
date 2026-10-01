@@ -57,6 +57,7 @@ function NgwaStorePage() {
 	// An update held back for new permissions opens the updater's trust
 	// review modal (mounted once, below); approve installs it.
 	const approvals = useUpdateApprovals({ update: store.update });
+	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const activeProjectName = useShellStore((s) => {
 		const p = s.projects.find((x) => x.id === s.activeProjectId);
 		return p?.display_name || p?.id;
@@ -101,6 +102,7 @@ function NgwaStorePage() {
 				onRetry={refetch}
 				loadDetail={indexUrl ? loadDetail : undefined}
 				activeProjectName={activeProjectName}
+				activeProjectId={activeProjectId}
 				onInstall={store.install}
 				onUpdate={store.update}
 				onUpdateAll={store.updateAll}

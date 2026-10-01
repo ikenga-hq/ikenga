@@ -39,6 +39,7 @@ import {
 	installedScopeWire,
 	isNeedsApproval,
 	type NeedsApprovalError,
+	pkgProjectTarget,
 	storeScopeWire,
 	useStoreInstall,
 } from './use-store-install';
@@ -111,6 +112,19 @@ describe('scope mapping', () => {
 		expect(installedScopeWire({ kind: 'personal' })).toBe('workspace');
 		expect(installedScopeWire({ kind: 'project', project_id: 'p2' })).toBe('project:p2');
 	});
+
+	it('DEC-71: with the Default project active, the project target is personal', () => {
+		expect(storeScopeWire('project', 'default')).toBe('workspace');
+		expect(storeScopeWire('personal', 'default')).toBe('workspace');
+		expect(installedScopeWire({ kind: 'project', project_id: 'default' })).toBe('workspace');
+		// The label: no project target under Default, the project's name otherwise.
+		expect(pkgProjectTarget('default', 'Default')).toBeNull();
+		expect(pkgProjectTarget('kinnect', 'Kinnect')).toBe('Kinnect');
+		expect(pkgProjectTarget(null, 'active project')).toBe('active project');
+		// Real projects are untouched, including ids that merely contain "default".
+		expect(storeScopeWire('project', 'kinnect')).toBe('project:kinnect');
+		expect(storeScopeWire('project', 'default-2')).toBe('project:default-2');
+	});
 });
 
 describe('useStoreInstall', () => {
@@ -148,6 +162,16 @@ describe('useStoreInstall', () => {
 	it('installs to personal as the workspace scope', async () => {
 		const { hook } = setup();
 		await hook.install(entry(), 'personal');
+		expect(pkgInstallFromRegistryMock.mock.calls.map((c) => c[1])).toEqual([
+			'workspace',
+			'workspace',
+		]);
+	});
+
+	it('DEC-71: installs the project target to the workspace scope while Default is active', async () => {
+		useShellStore.setState({ activeProjectId: 'default' });
+		const { hook } = setup();
+		await hook.install(entry(), 'project');
 		expect(pkgInstallFromRegistryMock.mock.calls.map((c) => c[1])).toEqual([
 			'workspace',
 			'workspace',

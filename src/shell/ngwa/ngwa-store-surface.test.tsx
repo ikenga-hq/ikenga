@@ -373,6 +373,51 @@ describe('NgwaStoreSurface', () => {
 		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'personal');
 	});
 
+	it('DEC-71: with the Default project active, a pkg installs to personal and the menu lists no Default target', async () => {
+		const onInstall = vi.fn();
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				onInstall={onInstall}
+				activeProjectName="Default"
+				activeProjectId="default"
+			/>
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
+
+		expect(screen.queryByRole('button', { name: 'Install to Default' })).toBeNull();
+		const install = screen.getByRole('button', { name: 'Install to personal' });
+		fireEvent.click(install);
+		expect(onInstall).toHaveBeenLastCalledWith(mockCatalog[1], 'personal');
+
+		fireEvent.click(screen.getByLabelText('Choose install scope'));
+		const items = screen.getAllByRole('menuitem');
+		expect(items).toHaveLength(1);
+		expect(items[0].textContent).toContain('Install to personal');
+		expect(items[0].textContent).not.toContain('Default');
+	});
+
+	it('keeps a real project as the pkg install target', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				onInstall={vi.fn()}
+				activeProjectName="Kinnect"
+				activeProjectId="kinnect"
+			/>
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
+		expect(screen.getByRole('button', { name: 'Install to Kinnect' })).toBeDefined();
+		fireEvent.click(screen.getByLabelText('Choose install scope'));
+		expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+	});
+
 	it('Update all opens a review of each update and applies only on confirm', () => {
 		const onUpdateAll = vi.fn();
 		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdateAll={onUpdateAll} />);
@@ -520,7 +565,9 @@ describe('an installed pkg that failed to load (Bug 3)', () => {
 				initialSelectedId="@ikenga/pkg-meetings"
 			/>
 		);
-		expect(await screen.findByRole('button', { name: 'Reinstall to active project' })).toBeDefined();
+		expect(
+			await screen.findByRole('button', { name: 'Reinstall to active project' })
+		).toBeDefined();
 	});
 });
 

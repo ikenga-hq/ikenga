@@ -1,0 +1,11 @@
+-- DEC-71 (Round 58): the Default project is personal scope for pkgs.
+--
+-- `pkg_installed.project_id = 'default'` used to bind a pkg to the Default
+-- project, so reconcile parked it (builtins included) whenever any other
+-- project was active. The bootstrap backfill in db.rs stamped every NULL row
+-- with 'default' on each boot, so on existing installs every row reads
+-- 'default'. The kernel now normalizes 'default' to NULL (workspace /
+-- personal) on every write and the bootstrap no longer touches
+-- pkg_installed; this clears the rows already stamped. Rows bound to a real
+-- project are left alone.
+UPDATE pkg_installed SET project_id = NULL WHERE project_id = 'default';

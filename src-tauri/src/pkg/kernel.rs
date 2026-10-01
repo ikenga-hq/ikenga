@@ -18,6 +18,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use crate::commands::db::PaDb;
+use crate::server::shared::projects::DEFAULT_PROJECT_ID;
 
 use super::cap_snapshot;
 use super::file_watcher::{self, WatcherHandle};
@@ -510,6 +511,12 @@ pub struct Kernel {
 /// them reads as "bound to a project that is never active", and reconcile
 /// parks a workspace pkg for "scope mismatch". Every read and write of the
 /// scope goes through here.
+///
+/// DEC-71 (Round 58): the Default project *is* personal scope for pkgs, so
+/// `"default"` / `"project:default"` also normalize to `None`. Kept as a bare
+/// project id, `'default'` parked every pkg (builtins included) the moment a
+/// real project became active. Because every write path normalizes first,
+/// `'default'` is never stored again; migration 0069 clears existing rows.
 pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let t = raw.trim();
@@ -517,11 +524,30 @@ pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
         return None;
     }
     let id = t.strip_prefix("project:").unwrap_or(t).trim();
-    if id.is_empty() {
+    if id.is_empty() || id == DEFAULT_PROJECT_ID {
         None
     } else {
         Some(id.to_string())
     }
+}
+
+/// Write a pkg's scope to `pkg_installed.project_id`, normalized first so a
+/// wire value (`"workspace"`, `"project:default"`, …) never lands raw.
+/// Returns the scope actually stored. Split out of [`Kernel::set_scope`] so
+/// the DB write is testable without an `AppHandle`.
+pub(crate) async fn store_scope(
+    pool: &sqlx::SqlitePool,
+    pkg_id: &str,
+    raw: Option<String>,
+) -> Result<Option<String>> {
+    let project_id = normalize_scope(raw);
+    sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
+        .bind(&project_id)
+        .bind(pkg_id)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow!("update project_id: {e}"))?;
+    Ok(project_id)
 }
 
 /// The reconcile scope rule: a workspace pkg (no project) is live under
@@ -711,8 +737,8 @@ impl Kernel {
     /// shell-bundled builtins from registry / sideloaded pkgs.
     /// Install a pkg at `install_path` with the given provenance + scope.
     /// `project_id = None` means workspace scope (always loaded);
-    /// `Some("default" | other slug)` binds the pkg to that project so it
-    /// only loads when the project is active. The kernel persists the
+    /// `Some(slug)` binds the pkg to that project so it only loads when the
+    /// project is active. `"default"` normalizes to `None` (DEC-71). The kernel persists the
     /// scope on `pkg_installed.project_id` but does *not* perform
     /// reconciliation here — caller is responsible for kicking
     /// `reconcile_for_project` after install if the scope differs from the
@@ -974,13 +1000,7 @@ impl Kernel {
         let scope_owned = project_id.clone();
         tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
-            sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
-                .bind(&scope_owned)
-                .bind(&id_owned)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow!("update project_id: {e}"))?;
-            Ok::<_, anyhow::Error>(())
+            store_scope(&pool, &id_owned, scope_owned).await
         })?;
         if let Ok(mut g) = self.installed.write() {
             if let Some(existing) = g.get_mut(pkg_id) {
@@ -2941,6 +2961,95 @@ mod tests {
                 "project pkg parks exactly when its project isn't active ({active})"
             );
         }
+    }
+
+    /// DEC-71: the Default project is personal scope for pkgs.
+    #[test]
+    fn normalize_scope_maps_default_project_to_workspace() {
+        assert_eq!(normalize_scope(Some("default".into())), None);
+        assert_eq!(normalize_scope(Some("project:default".into())), None);
+        assert_eq!(normalize_scope(Some(" project:default ".into())), None);
+        // Real project ids are untouched, including ones that merely contain
+        // "default".
+        assert_eq!(
+            normalize_scope(Some("project:kinnect".into())),
+            Some("kinnect".into())
+        );
+        assert_eq!(
+            normalize_scope(Some("default-2".into())),
+            Some("default-2".into())
+        );
+    }
+
+    /// DEC-71 / Round 58: with every row on `'default'`, switching to a real
+    /// project parked every pkg, builtins included.
+    #[test]
+    fn reconcile_never_parks_default_or_null_rows_under_a_real_project() {
+        let live: HashSet<String> = ["com.ikenga.studio", "com.ikenga.tasks", "com.test.kin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let installed = vec![
+            ("com.ikenga.studio".to_string(), Some("default".to_string())),
+            ("com.ikenga.tasks".to_string(), None),
+            ("com.test.kin".to_string(), Some("kinnect".to_string())),
+            (
+                "com.test.wire_default".to_string(),
+                Some("project:default".to_string()),
+            ),
+        ];
+        let plan = plan_reconcile(&installed, &live, "kinnect");
+        assert!(plan.park.is_empty(), "{plan:?}");
+        assert_eq!(plan.resume, vec!["com.test.wire_default".to_string()]);
+
+        // A real non-default project pkg still parks when its project is not
+        // active — the Default project included.
+        let plan = plan_reconcile(&installed, &live, "default");
+        assert_eq!(plan.park, vec!["com.test.kin".to_string()]);
+    }
+
+    /// `set_scope("project:default")` stores NULL, never `'default'`.
+    #[test]
+    fn store_scope_writes_null_for_default_project() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            sqlx::query("CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, install_path TEXT NOT NULL, project_id TEXT)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            for id in ["com.a", "com.b"] {
+                sqlx::query("INSERT INTO pkg_installed (id, install_path, project_id) VALUES (?, '/x', 'kinnect')")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let stored = store_scope(&pool, "com.a", Some("project:default".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, None);
+            let stored = store_scope(&pool, "com.b", Some("project:p2".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, Some("p2".into()));
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT id, project_id FROM pkg_installed ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("com.a".to_string(), None),
+                    ("com.b".to_string(), Some("p2".to_string())),
+                ]
+            );
+        });
     }
 
     #[test]
