@@ -9,9 +9,13 @@ import { Package, Store, Layers, HeartPulse, Plus } from 'lucide-react';
 export interface NgwaTabsProps {
 	activeTab: 'installed' | 'store' | 'scopes' | 'health' | 'create';
 	installedCount?: number;
+	/** DEC-73 (Round 58): the pkg-kernel sub-count of `installedCount`, shown
+	 *  muted next to the total so it visibly agrees with the status bar's
+	 *  "N pkgs" segment (both read `selectPkgCount` / the same kernel rows). */
+	pkgCount?: number;
 }
 
-export function NgwaTabs({ activeTab, installedCount }: NgwaTabsProps) {
+export function NgwaTabs({ activeTab, installedCount, pkgCount }: NgwaTabsProps) {
 	return (
 		<div className="ntabs" role="tablist" aria-label="Ngwa surfaces">
 			<Link
@@ -22,7 +26,20 @@ export function NgwaTabs({ activeTab, installedCount }: NgwaTabsProps) {
 			>
 				<Package className="h-3.5 w-3.5" />
 				<span>Installed</span>
-				{installedCount !== undefined && <span className="cnt" data-instcount>{installedCount}</span>}
+				{installedCount !== undefined && (
+					<span className="cnt" data-instcount>
+						{installedCount}
+					</span>
+				)}
+				{pkgCount !== undefined && (
+					<span
+						className="pkgcnt"
+						data-pkgcount
+						title={`${pkgCount} ${pkgCount === 1 ? 'pkg' : 'pkgs'} — matches the status bar's pkg count`}
+					>
+						· {pkgCount} {pkgCount === 1 ? 'pkg' : 'pkgs'}
+					</span>
+				)}
 				<span className="k">1</span>
 			</Link>
 
