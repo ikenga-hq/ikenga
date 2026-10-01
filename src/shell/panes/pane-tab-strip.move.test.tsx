@@ -7,13 +7,15 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./pane-views', () => ({
-	viewLabel: (view: { kind: string; path?: string }) =>
-		view.kind === 'route' ? (view.path ?? '/') : 'Terminal',
-	viewSubtitle: () => '',
-}));
+// `PaneTabStrip` gets its label logic from `./pane-view-label` (not mocked
+// here — it's pure and side-effect free, so the real implementation runs),
+// and its display-name resolver from `./use-pane-display-names`, mocked
+// below since the real hook needs a QueryClientProvider this test doesn't set up.
 vi.mock('@/terminal/use-terminal-titles', () => ({
 	useTerminalTitles: () => undefined,
+}));
+vi.mock('./use-pane-display-names', () => ({
+	usePaneDisplayNameResolver: () => () => undefined,
 }));
 vi.mock('./new-tab-menu', () => ({
 	NewTabMenu: () => null,
