@@ -9,7 +9,8 @@ import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { TabStrip, Tab } from '@/components/ui/tab-strip';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { useTerminalTitles } from '@/terminal/use-terminal-titles';
-import { viewLabel, viewSubtitle } from './pane-views';
+import { shouldCapitalizeLabel, viewLabel, viewSubtitle } from './pane-view-label';
+import { usePaneDisplayNameResolver } from './use-pane-display-names';
 import { viewWorkspace } from './tab-workspace';
 import { NewTabMenu, useAnchorRect } from './new-tab-menu';
 import { PinArtifactDialog } from './pin-artifact-dialog';
@@ -49,6 +50,9 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	// Names terminal tabs by what they're running and where — `claude · shell`
 	// rather than N tabs all reading "Terminal".
 	const resolveTerminal = useTerminalTitles();
+	// Names `/pkg/<id>` and `/ngwa/item/<id>` route tabs by their pkg manifest
+	// or ngwa display name — `Studio` rather than `com.ikenga.studio`.
+	const resolveDisplayName = usePaneDisplayNameResolver();
 
 	// Close every closable (non-pinned) tab except `keepIdx`. Read fresh state
 	// and close in DESCENDING index order so earlier closes never shift the
@@ -172,7 +176,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 					const isActive = idx === leaf.activeTabIdx;
 					const isPinned = Boolean(tab.pinned);
 					const ws = viewWorkspace(tab);
-					const label = viewLabel(tab, resolveTerminal);
+					const label = viewLabel(tab, resolveTerminal, resolveDisplayName);
 					const tabPath = tab.kind === 'artifact' || tab.kind === 'route' ? tab.path : undefined;
 					return (
 						<EffectiveContextMenu
@@ -218,44 +222,44 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 							builtinsNeedHandler
 						>
 							<Tab
-									index={idx}
-									active={isActive}
-									ws={ws}
-									label={label}
-									// Terminal labels are real command + directory names
-									// (`claude · shell`). Title-casing them would render
-									// "Claude · Shell" and misspell anything lowercase by
-									// convention; route labels still capitalize.
-									labelClassName={tab.kind === 'terminal' ? undefined : 'capitalize'}
-									title={`${label}${isPinned ? ' (pinned)' : ''}\n${viewSubtitle(tab, resolveTerminal)}`}
-									pinned={isPinned}
-									closable={!isPinned}
-									onActivate={() => activate(idx)}
-									onClose={() => closeTab(leaf.id, idx)}
-									onTogglePin={() => toggleTabPinned(leaf.id, idx)}
-									onMiddleClick={!isPinned ? () => closeTab(leaf.id, idx) : undefined}
-									dropEdge={dropAt?.idx === idx ? dropAt.side : null}
-									className={cn(
-										'border-r border-border',
-										isPinned
-											? 'min-w-[32px] max-w-[140px] px-2'
-											: 'min-w-[120px] max-w-[180px] px-3'
-									)}
-									onDragPointerDown={
-										isPinned
-											? undefined
-											: (e) =>
-													beginPointerDrag(e, {
-														label,
-														onStart: () => useDragState.getState().startPane(leaf.id, idx),
-														onEnd: () => {
-															useDragState.getState().end();
-															setDropAt(null);
-														},
-													})
-									}
-								/>
-							</EffectiveContextMenu>
+								index={idx}
+								active={isActive}
+								ws={ws}
+								label={label}
+								// See `shouldCapitalizeLabel`: terminal labels, resolved
+								// display names, and any dotted label (an unresolved
+								// reverse-DNS id, where CSS capitalize treats "." as a
+								// word boundary) all skip title-casing.
+								labelClassName={
+									shouldCapitalizeLabel(tab, label, resolveDisplayName) ? 'capitalize' : undefined
+								}
+								title={`${label}${isPinned ? ' (pinned)' : ''}\n${viewSubtitle(tab, resolveTerminal)}`}
+								pinned={isPinned}
+								closable={!isPinned}
+								onActivate={() => activate(idx)}
+								onClose={() => closeTab(leaf.id, idx)}
+								onTogglePin={() => toggleTabPinned(leaf.id, idx)}
+								onMiddleClick={!isPinned ? () => closeTab(leaf.id, idx) : undefined}
+								dropEdge={dropAt?.idx === idx ? dropAt.side : null}
+								className={cn(
+									'border-r border-border',
+									isPinned ? 'min-w-[32px] max-w-[140px] px-2' : 'min-w-[120px] max-w-[180px] px-3'
+								)}
+								onDragPointerDown={
+									isPinned
+										? undefined
+										: (e) =>
+												beginPointerDrag(e, {
+													label,
+													onStart: () => useDragState.getState().startPane(leaf.id, idx),
+													onEnd: () => {
+														useDragState.getState().end();
+														setDropAt(null);
+													},
+												})
+								}
+							/>
+						</EffectiveContextMenu>
 					);
 				})}
 			</TabStrip>
