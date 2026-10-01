@@ -21,7 +21,7 @@ use crate::commands::db::PaDb;
 
 use super::cap_snapshot;
 use super::file_watcher::{self, WatcherHandle};
-use super::manifest::{Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
+use super::manifest::{Manifest, Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
 use super::registry::Registry;
 use super::source::InstallSource;
 use super::uninstall_dir;
@@ -430,6 +430,62 @@ pub(crate) async fn purge_orphans(pool: &sqlx::SqlitePool) -> Result<u64> {
     }
     tx.commit().await.map_err(|e| anyhow!("commit txn: {e}"))?;
     Ok(total)
+}
+
+/// Rewrite the manifest-derived columns (`version`, `ikenga_api`,
+/// `manifest_json`) of an existing `pkg_installed` row from `manifest`.
+///
+/// Deliberately narrow: unlike `persist_install`'s `INSERT OR REPLACE`, it
+/// never touches `source_json`, `project_id`, `installed_at`, `enabled`,
+/// `signature` or `install_path`, and never creates a row. Returns the
+/// number of rows updated (0 = no row for `id`).
+pub(crate) async fn write_manifest_columns(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    manifest: &Manifest,
+) -> Result<u64> {
+    let manifest_json =
+        serde_json::to_string(manifest).map_err(|e| anyhow!("serialize manifest: {e}"))?;
+    let r = sqlx::query(
+        "UPDATE pkg_installed SET version = ?, ikenga_api = ?, manifest_json = ? WHERE id = ?",
+    )
+    .bind(&manifest.version)
+    .bind(&manifest.ikenga_api)
+    .bind(&manifest_json)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow!("update pkg_installed manifest columns for {id}: {e}"))?;
+    Ok(r.rows_affected())
+}
+
+/// Whether a `pkg_installed` row's stored `version` / `ikenga_api` differ
+/// from the manifest now on disk (e.g. a Dev install whose checkout moved on
+/// while the shell was closed).
+pub(crate) fn manifest_drifted(
+    stored_version: Option<&str>,
+    stored_api: Option<&str>,
+    manifest: &Manifest,
+) -> bool {
+    stored_version != Some(manifest.version.as_str())
+        || stored_api != Some(manifest.ikenga_api.as_str())
+}
+
+/// The in-memory summary after a successful `reload_pkg`: version and
+/// `ikenga_api` come from the reloaded manifest; path, enabled, install
+/// time, source and scope are carried over from the pre-reload entry.
+pub(crate) fn reloaded_summary(prev: InstalledSummary, manifest: &Manifest) -> InstalledSummary {
+    InstalledSummary {
+        id: prev.id,
+        version: manifest.version.clone(),
+        ikenga_api: manifest.ikenga_api.clone(),
+        install_path: prev.install_path,
+        enabled: prev.enabled,
+        installed_at: prev.installed_at,
+        compatible: true,
+        source: prev.source,
+        project_id: prev.project_id,
+    }
 }
 
 /// `(id, install_path, enabled)` for every `pkg_installed` row.
@@ -953,6 +1009,24 @@ impl Kernel {
         })
     }
 
+    /// Sync an existing `pkg_installed` row's `version` / `ikenga_api` /
+    /// `manifest_json` to `manifest` (see [`write_manifest_columns`]). Sync
+    /// `block_on`, like the other row writers here — callers run off the
+    /// async runtime (`reload_pkg` is always driven via `spawn_blocking`).
+    fn update_manifest_row(&self, pkg_id: &str, manifest: &Manifest) -> Result<()> {
+        let db = self.db.clone();
+        let id_owned = pkg_id.to_string();
+        let manifest = manifest.clone();
+        let updated = tauri::async_runtime::block_on(async move {
+            let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
+            write_manifest_columns(&pool, &id_owned, &manifest).await
+        })?;
+        if updated == 0 {
+            log::warn!("[pkg_kernel] no pkg_installed row for `{pkg_id}` to sync manifest into");
+        }
+        Ok(())
+    }
+
     /// Phase 2: update the scope of an already-installed pkg. `None` means
     /// workspace; `Some(slug)` rebinds it to that project. Returns Err if
     /// the pkg isn't installed. The caller should run a reconcile after
@@ -1454,11 +1528,19 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// loads gets logged and skipped — the row stays so the user can decide
     /// to repair or uninstall via the UI.
     pub fn boot(&self) -> Result<()> {
-        let db = self.db.clone();
-        let (rows, total_rows): (
-            Vec<(String, String, i64, Option<String>, Option<String>)>,
+        // (id, install_path, installed_at, source_json, project_id,
+        //  stored version, stored ikenga_api)
+        type BootRow = (
+            String,
+            String,
             i64,
-        ) = tauri::async_runtime::block_on(async move {
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let db = self.db.clone();
+        let (rows, total_rows): (Vec<BootRow>, i64) = tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
             // Diagnostic: total row count regardless of `enabled`. Distinguishes
             // "wrong DB file" / "missing rows" from "all rows disabled".
@@ -1466,8 +1548,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 .fetch_one(&pool)
                 .await
                 .map_err(|e| anyhow!("count pkg_installed: {e}"))?;
-            let r: Vec<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT id, install_path, installed_at, source_json, project_id
+            let r: Vec<BootRow> = sqlx::query_as(
+                "SELECT id, install_path, installed_at, source_json, project_id, version, ikenga_api
                  FROM pkg_installed WHERE enabled = 1",
             )
             .fetch_all(&pool)
@@ -1483,7 +1565,9 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         let mut replayed = 0usize;
         let mut skipped = 0usize;
         let mut parked_for_review = 0usize;
-        for (id, install_path, installed_at, source_raw, project_id) in rows {
+        for (id, install_path, installed_at, source_raw, project_id, stored_version, stored_api) in
+            rows
+        {
             match Package::load(Path::new(&install_path)) {
                 Ok(pkg) => {
                     if !pkg.is_compatible() {
@@ -1493,6 +1577,38 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                         );
                         skipped += 1;
                         continue;
+                    }
+
+                    // The in-memory summary below takes version / ikenga_api
+                    // from the on-disk manifest, so a row written at install
+                    // time goes stale once the manifest moves on (a Dev
+                    // checkout pulled to a newer version while the shell was
+                    // closed). Write the loaded manifest back so the durable
+                    // row matches what the shell shows. Best-effort.
+                    if manifest_drifted(
+                        stored_version.as_deref(),
+                        stored_api.as_deref(),
+                        &pkg.manifest,
+                    ) {
+                        log::info!(
+                            "[pkg_kernel] boot: `{id}` pkg_installed row drifted from manifest \
+                             (version {} -> {}, ikenga_api {} -> {}) — syncing row",
+                            stored_version.as_deref().unwrap_or("?"),
+                            pkg.manifest.version,
+                            stored_api.as_deref().unwrap_or("?"),
+                            pkg.manifest.ikenga_api
+                        );
+                        let db_sync = self.db.clone();
+                        let id_sync = id.clone();
+                        let manifest_sync = pkg.manifest.clone();
+                        if let Err(e) = tauri::async_runtime::block_on(async move {
+                            let pool = db_sync.ensure_pool().await.map_err(|e| anyhow!(e))?;
+                            write_manifest_columns(&pool, &id_sync, &manifest_sync).await
+                        }) {
+                            log::warn!(
+                                "[pkg_kernel] boot: sync pkg_installed row for `{id}` failed (continuing): {e:#}"
+                            );
+                        }
                     }
 
                     // Trust-review modal (2026-05-15): diff the current
@@ -1952,22 +2068,25 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 .get(pkg_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("pkg `{pkg_id}` vanished mid-reload"))?;
-            let updated = InstalledSummary {
-                id: pkg_id.to_string(),
-                version: pkg.manifest.version.clone(),
-                ikenga_api: pkg.manifest.ikenga_api.clone(),
-                install_path: prev.install_path.clone(),
-                enabled: prev.enabled,
-                installed_at: prev.installed_at,
-                compatible: true,
-                source: prev.source,
-                project_id: prev.project_id,
-            };
+            let updated = reloaded_summary(prev, &pkg.manifest);
             g.insert(pkg_id.to_string(), updated.clone());
             updated
         };
-        let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
-        live.insert(pkg_id.to_string());
+        {
+            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+            live.insert(pkg_id.to_string());
+        }
+
+        // Write the reloaded manifest back to `pkg_installed` so the durable
+        // row matches what the shell now shows (only the manifest-derived
+        // columns; source / scope / install time are untouched). Best-effort:
+        // every registry already runs the new version, so a failed write is
+        // logged rather than failing the reload — boot replay re-syncs it.
+        if let Err(e) = self.update_manifest_row(pkg_id, &pkg.manifest) {
+            log::warn!(
+                "[pkg_kernel] reload: sync pkg_installed row for `{pkg_id}` failed (continuing): {e:#}"
+            );
+        }
 
         // Best-effort event emission for the FE. A failure here means the
         // iframe/webview won't auto-remount, but the reload itself
@@ -3018,5 +3137,204 @@ mod tests {
             other => panic!("expected the folder to move, got {other:?}"),
         }
         assert!(!install.exists());
+    }
+
+    // ── pkg_installed version drift ──
+
+    const PKG_INSTALLED_DDL: &str = "CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, version TEXT NOT NULL, ikenga_api TEXT NOT NULL, manifest_json TEXT NOT NULL, install_path TEXT NOT NULL, installed_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, signature TEXT, source_json TEXT, project_id TEXT)";
+
+    fn drift_manifest(id: &str, version: &str) -> String {
+        format!(r#"{{"id": "{id}", "name": "Studio", "version": "{version}", "ikenga_api": "5"}}"#)
+    }
+
+    async fn drift_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query(PKG_INSTALLED_DDL)
+            .execute(&pool)
+            .await
+            .expect("create pkg_installed");
+        pool
+    }
+
+    /// Insert a row the way `persist_install` does, plus a signature, so the
+    /// test can prove the sync leaves every non-manifest column alone.
+    async fn insert_drift_row(pool: &sqlx::SqlitePool, pkg: &Package, source_json: &str) {
+        let manifest_json = serde_json::to_string(&pkg.manifest).unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO pkg_installed
+             (id, version, ikenga_api, manifest_json, install_path, installed_at, enabled, signature, source_json, project_id)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(&pkg.manifest.id)
+        .bind(&pkg.manifest.version)
+        .bind(&pkg.manifest.ikenga_api)
+        .bind(&manifest_json)
+        .bind(pkg.install_path.display().to_string())
+        .bind(1_700_000_000_000i64)
+        .bind("sig-abc")
+        .bind(source_json)
+        .bind("music-2026")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    type UntouchedCols = (
+        String,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn untouched_cols(pool: &sqlx::SqlitePool, id: &str) -> UntouchedCols {
+        sqlx::query_as(
+            "SELECT install_path, installed_at, enabled, signature, source_json, project_id
+             FROM pkg_installed WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn stored_manifest_cols(pool: &sqlx::SqlitePool, id: &str) -> (String, String, String) {
+        sqlx::query_as("SELECT version, ikenga_api, manifest_json FROM pkg_installed WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Live repro: Studio installed at 0.6.0, then a Dev install pointed at a
+    /// checkout whose manifest is 0.8.0. `reload_pkg` must leave both the
+    /// in-memory summary (what `status()` reports) and the durable row at
+    /// 0.8.0, with source / scope / install time untouched.
+    #[test]
+    fn reload_syncs_pkg_installed_version_and_keeps_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "com.ikenga.studio";
+        let dir = root.path().join(id);
+        write_manifest(&dir, &drift_manifest(id, "0.6.0"));
+        let v060 = Package::load(&dir).expect("load 0.6.0");
+        let source = InstallSource::Dev {
+            path: dir.display().to_string(),
+        };
+        let source_json = serde_json::to_string(&source).unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let pool = drift_pool().await;
+            insert_drift_row(&pool, &v060, &source_json).await;
+            let before = untouched_cols(&pool, id).await;
+
+            let prev = InstalledSummary {
+                id: id.into(),
+                version: v060.manifest.version.clone(),
+                ikenga_api: v060.manifest.ikenga_api.clone(),
+                install_path: dir.display().to_string(),
+                enabled: true,
+                installed_at: 1_700_000_000_000,
+                compatible: true,
+                source: source.clone(),
+                project_id: Some("music-2026".into()),
+            };
+
+            // The checkout moves on; reload_pkg re-reads the manifest.
+            write_manifest(&dir, &drift_manifest(id, "0.8.0"));
+            let v080 = Package::load(&dir).expect("load 0.8.0");
+
+            // In-memory half: what `Kernel::status()` reports.
+            let updated = reloaded_summary(prev, &v080.manifest);
+            let status = super::super::status::assemble_status(vec![updated.clone()], &[], 1);
+            assert_eq!(status.installed[0].version, "0.8.0");
+            assert_eq!(updated.id, id);
+            assert_eq!(updated.source, source);
+            assert_eq!(updated.project_id.as_deref(), Some("music-2026"));
+            assert_eq!(updated.installed_at, 1_700_000_000_000);
+
+            // Durable half: the row reload_pkg now writes back.
+            let n = write_manifest_columns(&pool, id, &v080.manifest)
+                .await
+                .unwrap();
+            assert_eq!(n, 1);
+            let (version, api, manifest_json) = stored_manifest_cols(&pool, id).await;
+            assert_eq!(version, "0.8.0");
+            assert_eq!(api, "5");
+            let stored: Manifest = serde_json::from_str(&manifest_json).unwrap();
+            assert_eq!(stored.version, "0.8.0", "manifest_json follows the reload");
+            assert_eq!(
+                untouched_cols(&pool, id).await,
+                before,
+                "install_path / installed_at / enabled / signature / source_json / project_id unchanged"
+            );
+        });
+    }
+
+    /// Boot replay with a DB row at 0.6.0 and an on-disk manifest at 0.8.0
+    /// detects the drift and updates the row; a matching row reads as clean;
+    /// the narrow update never invents a row.
+    #[test]
+    fn boot_replay_syncs_drifted_pkg_installed_row() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "com.ikenga.studio";
+        let dir = root.path().join(id);
+        write_manifest(&dir, &drift_manifest(id, "0.6.0"));
+        let v060 = Package::load(&dir).unwrap();
+        let source_json = serde_json::to_string(&InstallSource::Local {
+            path: dir.display().to_string(),
+        })
+        .unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let pool = drift_pool().await;
+            insert_drift_row(&pool, &v060, &source_json).await;
+            let before = untouched_cols(&pool, id).await;
+
+            // Matching row: no drift, boot writes nothing.
+            let (sv, sa, _) = stored_manifest_cols(&pool, id).await;
+            assert!(!manifest_drifted(Some(&sv), Some(&sa), &v060.manifest));
+
+            // Manifest moved to 0.8.0 while the shell was closed.
+            write_manifest(&dir, &drift_manifest(id, "0.8.0"));
+            let v080 = Package::load(&dir).unwrap();
+            assert!(manifest_drifted(Some(&sv), Some(&sa), &v080.manifest));
+            // ikenga_api alone also counts as drift.
+            let mut api_only = v060.manifest.clone();
+            api_only.ikenga_api = "4".into();
+            assert!(manifest_drifted(Some(&sv), Some(&sa), &api_only));
+
+            // What boot does on drift.
+            assert_eq!(
+                write_manifest_columns(&pool, id, &v080.manifest)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let (sv, sa, _) = stored_manifest_cols(&pool, id).await;
+            assert_eq!(sv, "0.8.0");
+            assert!(
+                !manifest_drifted(Some(&sv), Some(&sa), &v080.manifest),
+                "converged"
+            );
+            assert_eq!(untouched_cols(&pool, id).await, before);
+
+            // No row → no insert.
+            assert_eq!(
+                write_manifest_columns(&pool, "com.test.absent", &v080.manifest)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pkg_installed")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+        });
     }
 }
