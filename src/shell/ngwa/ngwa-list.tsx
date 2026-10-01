@@ -8,30 +8,17 @@
 // - Synchronized detail pane
 
 import { useCallback, useState, useMemo } from 'react';
-import {
-	AlertTriangle,
-	AppWindow,
-	Bot,
-	Clock,
-	Layers,
-	RefreshCw,
-	Shield,
-	Slash,
-	Terminal,
-	User,
-	Zap,
-} from 'lucide-react';
-import type { NgwaItem, NgwaKind } from '@ikenga/contract';
+import { AlertTriangle } from 'lucide-react';
+import type { NgwaItem } from '@ikenga/contract';
 import { NgwaFacetBar, DEFAULT_FACETS, type NgwaFacetsState } from './ngwa-facet-bar';
 import { NgwaDetailPane } from './ngwa-detail-pane';
 import { NgwaPopMenu, type PopItem } from './ngwa-scope-ops';
 import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
-import {
-	formatUsageDisplay,
-	formatUsageTooltip,
-	resolveTrustFacet,
-} from '@/lib/ngwa/enrichment';
+import { formatUsageDisplay, formatUsageTooltip, resolveTrustFacet } from '@/lib/ngwa/enrichment';
+import { kindIcon } from '@/lib/ngwa/kind-icon';
 import './ngwa.css';
+
+export { kindIcon };
 
 export interface NgwaListProps {
 	items: NgwaItem[];
@@ -89,31 +76,6 @@ interface RowMenu {
 	x: number;
 	y: number;
 	mode: 'menu' | 'copy';
-}
-
-export function kindIcon(kind: NgwaKind) {
-	switch (kind) {
-		case 'app':
-			return <AppWindow className="h-3.5 w-3.5 flex-none" />;
-		case 'engine':
-			return <Bot className="h-3.5 w-3.5 flex-none" />;
-		case 'tool':
-			return <Terminal className="h-3.5 w-3.5 flex-none" />;
-		case 'skill':
-			return <Zap className="h-3.5 w-3.5 flex-none" />;
-		case 'agent':
-			return <User className="h-3.5 w-3.5 flex-none" />;
-		case 'command':
-			return <Slash className="h-3.5 w-3.5 flex-none" />;
-		case 'hook':
-			return <Shield className="h-3.5 w-3.5 flex-none" />;
-		case 'workflow':
-			return <RefreshCw className="h-3.5 w-3.5 flex-none" />;
-		case 'schedule':
-			return <Clock className="h-3.5 w-3.5 flex-none" />;
-		default:
-			return <Layers className="h-3.5 w-3.5 flex-none" />;
-	}
 }
 
 export function NgwaList({
