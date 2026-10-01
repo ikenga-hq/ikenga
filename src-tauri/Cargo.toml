@@ -175,6 +175,9 @@ url = "2"
 axum-login = "=0.16"
 tower-sessions = "0.13"
 tower-sessions-sqlx-store = { version = "0.14", features = ["sqlite"] }
+# The session record codec the sqlx store uses (already in the tree through
+# it): the broker's UPDATE-only `save` writes the same encoding.
+rmp-serde = "1"
 # The broker's WS reverse proxy (G-PRINCIPAL §3, topology B). 0.24 is the
 # version axum 0.7's `ws` feature already pulls in, so no new tungstenite.
 tokio-tungstenite = "0.24"

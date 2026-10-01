@@ -16,6 +16,14 @@
 //!   another connection commits — and only then asks a pluggable
 //!   [`StillValid`] check about every open socket.
 //!
+//! **A socket registered after its revocation** (the handshake raced it) is
+//! still caught: the registry remembers recently logged-out session ids and
+//! each principal's epoch floor, and [`WsRegistry::register`] checks both
+//! atomically with inserting the socket — so a socket registered after the
+//! broker-side close is born closed. For writes made elsewhere, the proxy
+//! runs the [`StillValid`] check once *after* registering: a commit before
+//! that check is seen by it, one after it is seen by the loop's next pass.
+//!
 //! The default check ([`AccountEpochs`]) closes a socket once its account is
 //! gone or disabled or its `session_epoch` moved. WP-74 plugs in a check that
 //! also compares `grant_epoch`, so a device socket closes on **either** epoch
@@ -25,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use tokio::sync::oneshot;
@@ -40,6 +48,11 @@ pub const CLOSE_REVOKED: u16 = 4401;
 /// The re-check bound for writes the broker didn't make (§2.2: "at least
 /// every 2 s").
 pub const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a logged-out session id is remembered for a racing handshake.
+/// The proxy registers a socket first thing in its handler, so the window
+/// it covers is resolution → handler (no I/O); this is generous.
+pub const LOGGED_OUT_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// What a socket was authenticated with, captured at its handshake (R-5).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,10 +103,35 @@ struct Entry {
     close: Option<oneshot::Sender<CloseReason>>,
 }
 
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<u64, Entry>,
+    /// Session ids logged out within [`LOGGED_OUT_TTL`].
+    logged_out: HashMap<String, Instant>,
+    /// Per principal: the lowest `session_epoch` still valid, as last set by
+    /// a broker-side epoch bump.
+    epoch_floor: HashMap<PrincipalId, i64>,
+}
+
+/// Whether a broker-side revocation already covers `key`.
+fn revoked(
+    logged_out: &HashMap<String, Instant>,
+    epoch_floor: &HashMap<PrincipalId, i64>,
+    key: &WsKey,
+) -> Option<CloseReason> {
+    if !key.session_id.is_empty() && logged_out.contains_key(&key.session_id) {
+        return Some(CloseReason::LOGGED_OUT);
+    }
+    match epoch_floor.get(&key.principal_id) {
+        Some(floor) if key.session_epoch < *floor => Some(CloseReason::REVOKED),
+        _ => None,
+    }
+}
+
 /// Every proxied socket that is open right now.
 #[derive(Default)]
 pub struct WsRegistry {
-    entries: Mutex<HashMap<u64, Entry>>,
+    inner: Mutex<Inner>,
     next: AtomicU64,
 }
 
@@ -105,9 +143,16 @@ pub struct WsRegistration {
     pub closed: oneshot::Receiver<CloseReason>,
 }
 
+impl WsRegistration {
+    /// Whether the registry has already told this socket to close.
+    pub fn revoked(&mut self) -> Option<CloseReason> {
+        self.closed.try_recv().ok()
+    }
+}
+
 impl Drop for WsRegistration {
     fn drop(&mut self) {
-        self.registry.lock().remove(&self.id);
+        self.registry.lock().entries.remove(&self.id);
     }
 }
 
@@ -116,20 +161,26 @@ impl WsRegistry {
         Arc::new(Self::default())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Entry>> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Register a socket under the credential it resolved with. If that
+    /// credential was already revoked broker-side (a logout of its session,
+    /// or an epoch bump past it), the registration is born closed.
     pub fn register(self: &Arc<Self>, key: WsKey) -> WsRegistration {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.lock().insert(
-            id,
-            Entry {
-                key,
-                close: Some(tx),
-            },
-        );
+        let mut inner = self.lock();
+        let close = match revoked(&inner.logged_out, &inner.epoch_floor, &key) {
+            Some(reason) => {
+                let _ = tx.send(reason);
+                None
+            }
+            None => Some(tx),
+        };
+        inner.entries.insert(id, Entry { key, close });
+        drop(inner);
         WsRegistration {
             id,
             registry: self.clone(),
@@ -139,7 +190,11 @@ impl WsRegistry {
 
     /// Open sockets (not yet told to close).
     pub fn len(&self) -> usize {
-        self.lock().values().filter(|e| e.close.is_some()).count()
+        self.lock()
+            .entries
+            .values()
+            .filter(|e| e.close.is_some())
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -149,6 +204,7 @@ impl WsRegistry {
     /// Open sockets of one principal (the idle reaper counts them, OD-13).
     pub fn open_for(&self, principal: PrincipalId) -> usize {
         self.lock()
+            .entries
             .values()
             .filter(|e| e.close.is_some() && e.key.principal_id == principal)
             .count()
@@ -157,6 +213,7 @@ impl WsRegistry {
     /// The keys of every open socket, for a validity pass.
     pub fn keys(&self) -> Vec<(u64, WsKey)> {
         self.lock()
+            .entries
             .iter()
             .filter(|(_, e)| e.close.is_some())
             .map(|(id, e)| (*id, e.key.clone()))
@@ -164,10 +221,10 @@ impl WsRegistry {
     }
 
     fn close_ids(&self, ids: &[u64], reason: &CloseReason) -> usize {
-        let mut entries = self.lock();
+        let mut inner = self.lock();
         let mut closed = 0;
         for id in ids {
-            if let Some(tx) = entries.get_mut(id).and_then(|e| e.close.take()) {
+            if let Some(tx) = inner.entries.get_mut(id).and_then(|e| e.close.take()) {
                 let _ = tx.send(reason.clone());
                 closed += 1;
             }
@@ -186,20 +243,53 @@ impl WsRegistry {
         self.close_ids(&ids, &reason)
     }
 
-    /// `POST /auth/logout`: that one session's sockets.
+    /// `POST /auth/logout`: that one session's sockets — and any socket
+    /// whose handshake resolved before the logout but registers after it.
     pub fn close_session(&self, session_id: &str) -> usize {
         if session_id.is_empty() {
             return 0;
         }
-        self.close_where(CloseReason::LOGGED_OUT, |k| k.session_id == session_id)
+        self.close_matching(CloseReason::LOGGED_OUT, |inner| {
+            let now = Instant::now();
+            inner
+                .logged_out
+                .retain(|_, at| now.duration_since(*at) < LOGGED_OUT_TTL);
+            inner.logged_out.insert(session_id.to_string(), now);
+        })
     }
 
-    /// A broker-side epoch bump: every socket of `principal` opened under any
-    /// other `session_epoch` (§2.2: "carrying the old epoch").
+    /// A broker-side epoch bump: every socket of `principal` opened under an
+    /// older `session_epoch` (§2.2: "carrying the old epoch"), and any
+    /// older-epoch socket that registers later. Epochs only grow, so a
+    /// floor (never lowered) is exact — and a late call with a stale
+    /// `current_epoch` can't close sockets of a newer one.
     pub fn close_stale_epoch(&self, principal: PrincipalId, current_epoch: i64) -> usize {
-        self.close_where(CloseReason::REVOKED, |k| {
-            k.principal_id == principal && k.session_epoch != current_epoch
+        self.close_matching(CloseReason::REVOKED, |inner| {
+            let floor = inner.epoch_floor.entry(principal).or_insert(current_epoch);
+            *floor = (*floor).max(current_epoch);
         })
+    }
+
+    /// Record a revocation and close every open socket it covers, under one
+    /// lock, so no registration slips between the two.
+    fn close_matching(&self, reason: CloseReason, record: impl FnOnce(&mut Inner)) -> usize {
+        let mut inner = self.lock();
+        record(&mut inner);
+        let Inner {
+            entries,
+            logged_out,
+            epoch_floor,
+        } = &mut *inner;
+        let mut closed = 0;
+        for e in entries.values_mut() {
+            if e.close.is_some() && revoked(logged_out, epoch_floor, &e.key).is_some() {
+                if let Some(tx) = e.close.take() {
+                    let _ = tx.send(reason.clone());
+                    closed += 1;
+                }
+            }
+        }
+        closed
     }
 
     /// Ask `check` about every open socket and close the invalid ones. A
@@ -349,6 +439,33 @@ mod tests {
         assert!(other.closed.try_recv().is_err());
         // Idempotent: a closed socket isn't closed twice.
         assert_eq!(reg.close_stale_epoch(a, 4), 0);
+    }
+
+    /// S3-2: a handshake that resolved before a broker-side revocation but
+    /// registers after it is born closed.
+    #[tokio::test]
+    async fn a_socket_registered_after_its_revocation_is_born_closed() {
+        let reg = WsRegistry::new();
+        let (a, b) = (PrincipalId::new_v7(), PrincipalId::new_v7());
+        assert_eq!(reg.close_session("s1"), 0);
+        let mut late = reg.register(key(a, "s1", 0));
+        assert_eq!(late.revoked(), Some(CloseReason::LOGGED_OUT));
+        let mut other_session = reg.register(key(a, "s2", 0));
+        assert_eq!(other_session.revoked(), None);
+
+        assert_eq!(reg.close_stale_epoch(a, 5), 1, "s2 was at epoch 0");
+        let mut stale = reg.register(key(a, "s3", 4));
+        assert_eq!(stale.revoked(), Some(CloseReason::REVOKED));
+        let mut current = reg.register(key(a, "s4", 5));
+        assert_eq!(current.revoked(), None);
+        let mut other = reg.register(key(b, "s5", 0));
+        assert_eq!(other.revoked(), None, "another principal's floor");
+
+        // A late call with an older epoch never lowers the floor or closes
+        // a newer socket.
+        assert_eq!(reg.close_stale_epoch(a, 3), 0);
+        assert_eq!(current.revoked(), None);
+        assert_eq!(reg.len(), 2);
     }
 
     struct Revoke(PrincipalId, AtomicBool);

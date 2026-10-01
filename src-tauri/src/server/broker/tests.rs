@@ -5,7 +5,7 @@
 //! by the root tests in `server/tests/broker_t1.rs`.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +44,8 @@ struct Seen {
 struct FakeLauncher {
     launches: AtomicUsize,
     seen: Mutex<Vec<Seen>>,
+    /// How long a launch takes (a slow child start, for handshake races).
+    delay_ms: AtomicU64,
 }
 
 impl FakeLauncher {
@@ -80,6 +82,10 @@ impl ChildLauncher for FakeLauncher {
     ) -> BoxFuture<'a, anyhow::Result<LaunchedChild>> {
         Box::pin(async move {
             self.launches.fetch_add(1, Ordering::SeqCst);
+            let delay = self.delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             let requests = Arc::new(Mutex::new(Vec::new()));
             let (r1, r2) = (requests.clone(), requests.clone());
             let app = Router::new()
@@ -165,13 +171,7 @@ async fn harness_with(insecure_cookie: bool, hooks: impl FnOnce(&mut BrokerHooks
             .await
             .unwrap(),
     );
-    let mut state = BrokerState::new(
-        pool.clone(),
-        verifier,
-        launcher.clone(),
-        Duration::from_secs(60),
-    )
-    .unwrap();
+    let mut state = BrokerState::new(pool.clone(), verifier, launcher.clone()).unwrap();
     hooks(&mut state.hooks);
     let state = Arc::new(state);
     let store = backend::open_session_store(&root).await.unwrap();
@@ -982,4 +982,205 @@ async fn i8_an_external_epoch_bump_closes_sockets_within_two_seconds() {
     );
     assert!(started.elapsed() < Duration::from_secs(2));
     let _ = stop.send(());
+}
+
+/// Start the ≤2 s re-check loop against the harness's accounts.db, as
+/// `serve()` does. Send on the returned channel to stop it.
+async fn spawn_recheck(h: &Harness) -> (tokio::sync::broadcast::Sender<()>, String) {
+    let file: (i64, String, String) = sqlx::query_as("PRAGMA database_list")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let conn = SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&file.2)
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    let (stop, _) = tokio::sync::broadcast::channel(1);
+    tokio::spawn(ws_registry::recheck_loop(
+        h.state.ws.clone(),
+        conn,
+        h.state.hooks.still_valid.clone(),
+        ws_registry::RECHECK_INTERVAL,
+        stop.subscribe(),
+    ));
+    (stop, file.2)
+}
+
+/// A handshake that was in progress when its credential was revoked: it is
+/// either refused (401) or opened and then closed with 4401 — never left
+/// open.
+async fn assert_revoked_handshake(
+    handshake: tokio::task::JoinHandle<Result<Client, tungstenite::Error>>,
+) {
+    match handshake.await.unwrap() {
+        Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 401),
+        Ok(mut ws) => assert_eq!(
+            close_code(&mut ws, Duration::from_secs(3)).await,
+            Some(4401),
+            "a socket that raced its revocation stayed open"
+        ),
+        Err(e) => panic!("unexpected handshake error: {e}"),
+    }
+}
+
+/// S3-2: a CLI epoch bump that lands while the child is still being
+/// launched for the handshake (the re-check pass sees an empty registry
+/// unless the socket registered first).
+#[tokio::test]
+async fn i8_an_external_epoch_bump_inside_the_handshake_window_is_not_missed() {
+    let h = harness().await;
+    let id = insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let addr = serve(h.app.clone()).await;
+    let (stop, db) = spawn_recheck(&h).await;
+    h.launcher.delay_ms.store(1_500, Ordering::SeqCst);
+
+    let handshake = tokio::spawn(async move { ws_connect(addr, "/ws/pty/abc", &cookie).await });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut cli =
+        SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(&db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE principal_id = ?")
+        .bind(id.to_string())
+        .execute(&mut cli)
+        .await
+        .unwrap();
+    assert_revoked_handshake(handshake).await;
+    let _ = stop.send(());
+}
+
+/// S3-2: a logout of the session while its socket's child is launching.
+#[tokio::test]
+async fn i8_a_logout_inside_the_handshake_window_is_not_missed() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let addr = serve(h.app.clone()).await;
+    h.launcher.delay_ms.store(1_000, Ordering::SeqCst);
+
+    let c = cookie.clone();
+    let handshake = tokio::spawn(async move { ws_connect(addr, "/ws/fs", &c).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        http_post(addr, "/auth/logout", &cookie, json!({})).await,
+        204
+    );
+    assert_revoked_handshake(handshake).await;
+}
+
+/// S3-1: a request that loaded its session before a logout and finishes
+/// after it must not write the session back (always_save + an upsert would
+/// resurrect the logged-out id).
+#[tokio::test]
+async fn a_request_in_flight_across_logout_does_not_resurrect_the_session() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(2);
+    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    }));
+    let req = request("POST", "/api/rpc")
+        .header("cookie", &cookie)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+    let app = h.app.clone();
+    let in_flight = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    tx.send(Ok(r#"{"cmd":"echo","#.into())).await.unwrap();
+    // Past the session layer, holding a loaded session, reading its body.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", "/auth/logout")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(me(&h.app, &cookie).await.0, StatusCode::UNAUTHORIZED);
+
+    tx.send(Ok(r#""args":{}}"#.into())).await.unwrap();
+    drop(tx);
+    let res = in_flight.await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the request itself completes");
+    assert_eq!(
+        me(&h.app, &cookie).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the logged-out session came back"
+    );
+}
+
+/// S3-5: a path the child would resolve to another route is refused before
+/// any child is launched.
+#[tokio::test]
+async fn dot_segment_paths_are_refused_not_forwarded() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    for path in ["/pkgs/../api/rpc", "/pkgs/%2e%2e/api/rpc", "/pkgs/x/.%2E/y"] {
+        let (status, _, _) = send(
+            &h.app,
+            request("GET", path)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    let addr = serve(h.app.clone()).await;
+    match ws_connect(addr, "/ws/pty/%2e%2e", &cookie).await {
+        Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 400),
+        other => panic!("expected a 400, got {:?}", other.map(|_| ())),
+    }
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
+}
+
+struct DropBinary;
+impl super::proxy::WsFrameHook for DropBinary {
+    fn client_frame(
+        &self,
+        _ctx: &crate::server::auth::PrincipalCtx,
+        _path: &str,
+        frame: super::proxy::ClientFrame<'_>,
+    ) -> super::proxy::FrameDecision {
+        match frame {
+            super::proxy::ClientFrame::Binary(_) => super::proxy::FrameDecision::Drop,
+            super::proxy::ClientFrame::Text(_) => super::proxy::FrameDecision::Pass,
+        }
+    }
+}
+
+/// S3-6: binary frames (raw PTY stdin) go through the frame hook too.
+#[tokio::test]
+async fn the_frame_hook_sees_binary_frames_too() {
+    let h = harness_with(false, |hooks| hooks.ws_frames = Arc::new(DropBinary)).await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let addr = serve(h.app.clone()).await;
+    let mut ws = ws_connect(addr, "/ws/pty/abc", &cookie).await.unwrap();
+    ws.send(tungstenite::Message::Binary(b"rm -rf ~\n".to_vec()))
+        .await
+        .unwrap();
+    ws.send(tungstenite::Message::Text("after".into()))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        next,
+        tungstenite::Message::Text("after".into()),
+        "the binary frame was dropped by the hook, not forwarded"
+    );
 }

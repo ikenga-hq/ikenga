@@ -1,6 +1,8 @@
 //! What keeps a daemon "active" for its idle timeout (G-PRINCIPAL §5 row 13,
 //! OD-13): PTY sessions (counted by `PtyManager`), **open WebSocket
-//! connections** and recent authenticated requests.
+//! connections**, requests still in flight and recent authenticated
+//! requests — so a single RPC that runs longer than the timeout isn't cut
+//! off mid-request.
 //!
 //! Before WP-20 the idle watcher counted PTY sessions only, so an open chat
 //! or fs socket — or a browser driving the RPC surface with no terminal open
@@ -13,6 +15,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 static OPEN_WS: AtomicUsize = AtomicUsize::new(0);
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Milliseconds since [`epoch`] at the last [`touch`].
 static LAST_REQUEST_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +60,29 @@ pub async fn track_ws<F: Future>(socket_task: F) -> F::Output {
     socket_task.await
 }
 
+struct InFlight;
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        touch();
+    }
+}
+
+/// Run an authenticated request's handler, counting it as activity from
+/// start to finish.
+pub async fn track_request<F: Future>(handler: F) -> F::Output {
+    touch();
+    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let _in_flight = InFlight;
+    handler.await
+}
+
+/// Requests whose handler is still running.
+pub fn in_flight() -> usize {
+    IN_FLIGHT.load(Ordering::SeqCst)
+}
+
 /// WebSocket connections currently open in this process.
 pub fn open_ws() -> usize {
     OPEN_WS.load(Ordering::SeqCst)
@@ -73,10 +99,10 @@ pub fn since_last_request() -> Duration {
     Duration::from_millis(now_ms().saturating_sub(last))
 }
 
-/// Whether the daemon counts as active: any PTY session, any open WS, or a
-/// request within `window`.
+/// Whether the daemon counts as active: any PTY session, any open WS, any
+/// request in flight, or a request within `window`.
 pub fn is_active(pty_sessions: usize, window: Duration) -> bool {
-    pty_sessions > 0 || open_ws() > 0 || since_last_request() < window
+    pty_sessions > 0 || open_ws() > 0 || in_flight() > 0 || since_last_request() < window
 }
 
 #[cfg(test)]
@@ -92,6 +118,19 @@ mod tests {
         drop(guard);
         let out = track_ws(async { open_ws() }).await;
         assert!(out > before.saturating_sub(1));
+    }
+
+    #[tokio::test]
+    async fn a_request_in_flight_counts_until_it_finishes() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handler = tokio::spawn(track_request(async move {
+            let _ = rx.await;
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(in_flight() >= 1);
+        assert!(is_active(0, Duration::ZERO), "a long request is active");
+        tx.send(()).unwrap();
+        handler.await.unwrap();
     }
 
     #[test]

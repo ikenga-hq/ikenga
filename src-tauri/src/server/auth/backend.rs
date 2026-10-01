@@ -16,6 +16,13 @@
 //! `SameSite=Strict`, `Path=/`, `Secure` unless `--insecure-cookie`,
 //! `OnInactivity(24h)` (saved on every request so the window slides). The
 //! login route cycles the session id.
+//!
+//! **A save never recreates a session** ([`BrokerSessionStore`]). Saving on
+//! every request means a request that loaded its session *before* a logout
+//! (or a password change's id cycle) writes it back *after* — and the sqlx
+//! store's `save` is an upsert, which would bring the deleted id back to
+//! life. Here `save` only updates a row that still exists; only `create`
+//! (a login) inserts.
 
 use std::fs;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -28,6 +35,8 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 use tower_sessions::cookie::{time, SameSite};
+use tower_sessions::session::{Id, Record};
+use tower_sessions::session_store::{self, ExpiredDeletion, SessionStore};
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 
@@ -194,11 +203,66 @@ impl CredentialResolver for SessionCookieResolver {
     }
 }
 
+/// `operator/sessions.db`: the sqlx store, except that [`save`] is
+/// UPDATE-only, so a request still in flight across a logout can't
+/// resurrect the session it loaded (see the module docs).
+///
+/// [`save`]: SessionStore::save
+#[derive(Debug, Clone)]
+pub struct BrokerSessionStore {
+    inner: SqliteStore,
+    pool: SqlitePool,
+}
+
+/// The sqlx store's table (its default name; never configured otherwise).
+const SESSIONS_TABLE: &str = "tower_sessions";
+
+#[axum::async_trait]
+impl SessionStore for BrokerSessionStore {
+    /// A new session (login, or an id cycle): the only path that inserts.
+    async fn create(&self, record: &mut Record) -> session_store::Result<()> {
+        self.inner.create(record).await
+    }
+
+    /// Slide an **existing** session's data and expiry. A row that is gone
+    /// (logged out, cycled, expired and swept) stays gone: the request that
+    /// still holds it finishes, but its id never authenticates again.
+    async fn save(&self, record: &Record) -> session_store::Result<()> {
+        let data =
+            rmp_serde::to_vec(record).map_err(|e| session_store::Error::Encode(e.to_string()))?;
+        sqlx::query(&format!(
+            "UPDATE {SESSIONS_TABLE} SET data = ?, expiry_date = ? WHERE id = ?"
+        ))
+        .bind(data)
+        .bind(record.expiry_date)
+        .bind(record.id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| session_store::Error::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
+        self.inner.load(session_id).await
+    }
+
+    async fn delete(&self, session_id: &Id) -> session_store::Result<()> {
+        self.inner.delete(session_id).await
+    }
+}
+
+#[axum::async_trait]
+impl ExpiredDeletion for BrokerSessionStore {
+    async fn delete_expired(&self) -> session_store::Result<()> {
+        self.inner.delete_expired().await
+    }
+}
+
 /// Open (creating `0600` if needed) `operator/sessions.db` and run the
 /// store's own migration (`tower_sessions (id, data, expiry_date)`).
 /// Separate from `accounts.db` so per-request session writes never contend
 /// with account writes (P-6).
-pub async fn open_session_store(root: &OperatorRoot) -> anyhow::Result<SqliteStore> {
+pub async fn open_session_store(root: &OperatorRoot) -> anyhow::Result<BrokerSessionStore> {
     let path = root.sessions_db();
     fs::OpenOptions::new()
         .create(true)
@@ -217,16 +281,16 @@ pub async fn open_session_store(root: &OperatorRoot) -> anyhow::Result<SqliteSto
         .max_connections(4)
         .connect_with(options)
         .await?;
-    let store = SqliteStore::new(pool);
-    store.migrate().await?;
-    Ok(store)
+    let inner = SqliteStore::new(pool.clone());
+    inner.migrate().await?;
+    Ok(BrokerSessionStore { inner, pool })
 }
 
 /// The cookie and expiry policy (§2.2, P-3, P-4).
 pub fn session_layer(
-    store: SqliteStore,
+    store: BrokerSessionStore,
     insecure_cookie: bool,
-) -> SessionManagerLayer<SqliteStore> {
+) -> SessionManagerLayer<BrokerSessionStore> {
     SessionManagerLayer::new(store)
         .with_name(SESSION_COOKIE)
         .with_http_only(true)
@@ -237,7 +301,8 @@ pub fn session_layer(
             SESSION_INACTIVITY.as_secs() as i64,
         )))
         // Save on every authenticated request, so the inactivity window
-        // slides; only `sessions.db` is written.
+        // slides; only `sessions.db` is written, and only rows that still
+        // exist ([`BrokerSessionStore::save`]).
         .with_always_save(true)
 }
 
@@ -264,5 +329,48 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// S3-1: a request that loaded its session before a logout writes it
+    /// back after — that write must not bring the session back.
+    #[tokio::test]
+    async fn a_save_after_a_delete_never_resurrects_the_session() {
+        use tower_sessions::Session;
+        let (_tmp, root) = crate::server::operator::test_support::temp_root();
+        let store = Arc::new(open_session_store(&root).await.unwrap());
+
+        // Login: a fresh session is created.
+        let login = Session::new(None, store.clone(), None);
+        login.insert("user", "ada").await.unwrap();
+        login.save().await.unwrap();
+        let id = login.id().unwrap();
+
+        // A slow request loads it…
+        let in_flight = Session::new(Some(id), store.clone(), None);
+        assert_eq!(
+            in_flight.get::<String>("user").await.unwrap().as_deref(),
+            Some("ada")
+        );
+        // …the user logs out on another request…
+        let logout = Session::new(Some(id), store.clone(), None);
+        logout.flush().await.unwrap();
+        assert!(store.load(&id).await.unwrap().is_none());
+        // …and the slow request finishes and saves (always_save).
+        in_flight.save().await.unwrap();
+        assert!(
+            store.load(&id).await.unwrap().is_none(),
+            "the logged-out session came back"
+        );
+
+        // An existing session still slides.
+        let live = Session::new(None, store.clone(), None);
+        live.insert("user", "bob").await.unwrap();
+        live.save().await.unwrap();
+        let live_id = live.id().unwrap();
+        let again = Session::new(Some(live_id), store.clone(), None);
+        again.insert("n", 2).await.unwrap();
+        again.save().await.unwrap();
+        let rec = store.load(&live_id).await.unwrap().unwrap();
+        assert_eq!(rec.data.get("n"), Some(&serde_json::json!(2)));
     }
 }

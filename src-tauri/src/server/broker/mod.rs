@@ -39,14 +39,13 @@ use axum_login::AuthManagerLayerBuilder;
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_sessions::ExpiredDeletion;
-use tower_sessions_sqlx_store::SqliteStore;
 
 use self::children::{ChildLauncher, Children, T1Launcher};
 use self::proxy::{
     AccessHandler, AccessNotFound, AllowAll, PassFrames, RpcAuthorizer, WsFrameHook,
 };
 use self::ws_registry::{AccountEpochs, StillValid, WsRegistry};
-use super::auth::backend::{self, AccountsBackend, SessionCookieResolver};
+use super::auth::backend::{self, AccountsBackend, BrokerSessionStore, SessionCookieResolver};
 use super::auth::{self as auth_mod, json_error, PublicRoutes, Resolvers};
 use super::operator::accounts::{self, Actor};
 use super::operator::password::LoginVerifier;
@@ -92,7 +91,6 @@ impl BrokerState {
         pool: SqlitePool,
         verifier: Arc<LoginVerifier>,
         launcher: Arc<dyn ChildLauncher>,
-        idle_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             // Loopback only: never through an operator's HTTP(S)_PROXY.
@@ -104,7 +102,7 @@ impl BrokerState {
             hooks: BrokerHooks::defaults(pool.clone()),
             pool,
             verifier,
-            children: Arc::new(Children::new(launcher, idle_timeout)),
+            children: Arc::new(Children::new(launcher)),
             ws: WsRegistry::new(),
             http,
         })
@@ -138,7 +136,7 @@ async fn api_not_found() -> Response {
 /// state-changing route and WebSocket handshake.
 pub fn router(
     state: Arc<BrokerState>,
-    store: SqliteStore,
+    store: BrokerSessionStore,
     static_dir: &std::path::Path,
     allowed_origins: Vec<String>,
     insecure_cookie: bool,
@@ -291,12 +289,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         pkgs_dir: config.pkgs_dir.clone(),
         idle_timeout,
     });
-    let state = Arc::new(BrokerState::new(
-        pool.clone(),
-        verifier,
-        launcher,
-        idle_timeout,
-    )?);
+    let state = Arc::new(BrokerState::new(pool.clone(), verifier, launcher)?);
     let app = router(
         state.clone(),
         store,
@@ -324,15 +317,15 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         shutdown_tx.subscribe(),
     ));
 
-    // OD-13 idle reap, and §7.3: a disabled principal's child is stopped.
+    // §7.3: a disabled principal's child is stopped. (OD-13 idle reap is
+    // the child's own watcher, which counts PTYs; `running()` forgets the
+    // children that exited.)
     {
         let state = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(15));
             loop {
                 tick.tick().await;
-                let ws = state.ws.clone();
-                state.children.reap_idle(&|id| ws.open_for(id)).await;
                 for id in state.children.running().await {
                     let disabled = async {
                         let mut conn = state.pool.acquire().await?;

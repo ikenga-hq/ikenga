@@ -267,8 +267,7 @@ async fn auth_middleware(
         .and_then(|h| h.strip_prefix("Bearer "))
     {
         if ct_eq(header, expected) {
-            activity::touch();
-            return Ok(next.run(req).await);
+            return Ok(activity::track_request(next.run(req)).await);
         }
     }
 
@@ -284,8 +283,7 @@ async fn auth_middleware(
                     .decode_utf8_lossy()
                     .into_owned();
                 if ct_eq(&decoded, expected) {
-                    activity::touch();
-                    return Ok(next.run(req).await);
+                    return Ok(activity::track_request(next.run(req)).await);
                 }
             }
         }

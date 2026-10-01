@@ -166,9 +166,23 @@ fn t1_root_probe_passes_read_only_and_the_boot_serves_after_probing() {
             !data.join("daemon.json").exists(),
             "no T0 marker at the root"
         );
-        // SIGTERM: a clean shutdown removes the discovery file.
-        let _ = Command::new("kill").arg(broker.id().to_string()).status();
-        let status = broker.wait().unwrap();
+        // SIGTERM (a syscall: the CI image has no `kill` binary), then a
+        // bounded wait — the broker never idles out on its own.
+        // SAFETY: plain syscall on our own, unreaped child.
+        assert_eq!(unsafe { libc_kill(broker.id() as i32, 15) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = broker.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = broker.kill();
+                let _ = broker.wait();
+                panic!("boot {boot}: the broker ignored SIGTERM for 30 s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // A clean shutdown removes the discovery file.
         assert!(status.success(), "boot {boot}: {status}");
         assert!(
             !meta.exists(),
@@ -178,4 +192,9 @@ fn t1_root_probe_passes_read_only_and_the_boot_serves_after_probing() {
     let probe_json = std::fs::read_to_string(data.join("operator/probe.json")).unwrap();
     assert!(probe_json.contains("\n  \"ok\": true"), "{probe_json}");
     assert!(probe_json.contains("\"mode\": \"boot\""), "{probe_json}");
+}
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
 }

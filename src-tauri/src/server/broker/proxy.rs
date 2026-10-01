@@ -16,8 +16,12 @@
 //!   [`RpcAuthorizer::authorize_rpc`] decides before anything is forwarded
 //!   (default: allow); a `cmd` starting `access_` never reaches a child — the
 //!   broker's [`AccessHandler`] answers it (default: `not_found`); and every
-//!   client→child WebSocket **text** frame passes [`WsFrameHook`] (default:
-//!   pass).
+//!   client→child WebSocket data frame — **text and binary**, since the PTY
+//!   socket takes binary frames as raw stdin — passes [`WsFrameHook`]
+//!   (default: pass);
+//! * a forwarded path is the path the broker routed and authorized: one with
+//!   a dot-segment (raw or percent-encoded) or a backslash is refused, since
+//!   the child's URL parser would resolve it to another route.
 
 use std::sync::Arc;
 
@@ -107,7 +111,7 @@ impl AccessHandler for AccessNotFound {
     }
 }
 
-/// What to do with one client→child text frame.
+/// What to do with one client→child data frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameDecision {
     Pass,
@@ -120,16 +124,34 @@ pub enum FrameDecision {
     },
 }
 
-/// R-3: the client→child WebSocket text-frame hook.
+/// One client→child data frame, as the hook sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientFrame<'a> {
+    Text(&'a str),
+    /// `pty_ws` writes a binary frame straight to the PTY's stdin, so a
+    /// read-only / share policy (WP-74) **must** gate these as well as text.
+    Binary(&'a [u8]),
+}
+
+/// R-3: the client→child WebSocket frame hook. It sees every text **and**
+/// binary frame (R-3 names a text-frame hook; binary frames are PTY input
+/// too, so a hook that saw only text could be bypassed). Ping, pong and
+/// close are control frames and pass.
 pub trait WsFrameHook: Send + Sync {
-    fn client_text(&self, ctx: &PrincipalCtx, path: &str, text: &str) -> FrameDecision;
+    fn client_frame(&self, ctx: &PrincipalCtx, path: &str, frame: ClientFrame<'_>)
+        -> FrameDecision;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PassFrames;
 
 impl WsFrameHook for PassFrames {
-    fn client_text(&self, _ctx: &PrincipalCtx, _path: &str, _text: &str) -> FrameDecision {
+    fn client_frame(
+        &self,
+        _ctx: &PrincipalCtx,
+        _path: &str,
+        _frame: ClientFrame<'_>,
+    ) -> FrameDecision {
         FrameDecision::Pass
     }
 }
@@ -149,12 +171,27 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// The header names a `Connection:` value lists: hop-by-hop for this one
+/// connection (RFC 9110 §7.6.1), so never forwarded.
+fn connection_listed(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(axum::http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 /// The client headers a child may see.
 pub fn upstream_headers(client: &HeaderMap) -> HeaderMap {
+    let listed = connection_listed(client);
     let mut out = HeaderMap::new();
     for (name, value) in client {
         let n = name.as_str();
         if HOP_BY_HOP.contains(&n)
+            || listed.iter().any(|l| l == n)
             || n.starts_with("x-ikenga-")
             || n.starts_with("sec-websocket-")
             || matches!(
@@ -171,10 +208,11 @@ pub fn upstream_headers(client: &HeaderMap) -> HeaderMap {
 
 /// The child response headers a client may see.
 fn downstream_headers(child: &HeaderMap) -> HeaderMap {
+    let listed = connection_listed(child);
     let mut out = HeaderMap::new();
     for (name, value) in child {
         let n = name.as_str();
-        if HOP_BY_HOP.contains(&n) || n == "set-cookie" {
+        if HOP_BY_HOP.contains(&n) || n == "set-cookie" || listed.iter().any(|l| l == n) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -183,21 +221,52 @@ fn downstream_headers(child: &HeaderMap) -> HeaderMap {
 }
 
 /// Drop any `token=` from a query: under T1 it grants nothing, and it must
-/// not be forwarded as if it were the child's credential.
+/// not be forwarded as if it were the child's credential. The key is
+/// compared percent-decoded (`%74oken=` is the same parameter to the child).
 pub fn strip_token_param(query: Option<&str>) -> Option<String> {
     let kept: Vec<&str> = query?
         .split('&')
-        .filter(|p| !p.is_empty() && p.split('=').next() != Some("token"))
+        .filter(|p| {
+            let key = p.split('=').next().unwrap_or_default().replace('+', " ");
+            !p.is_empty()
+                && percent_encoding::percent_decode_str(&key).decode_utf8_lossy() != "token"
+        })
         .collect();
     (!kept.is_empty()).then(|| kept.join("&"))
 }
 
-fn path_and_query(uri: &axum::http::Uri) -> String {
+/// Whether `path` reaches the child as the very route the broker matched:
+/// no segment that is, once percent-decoded, `.` or `..` (the child's URL
+/// parser resolves those, so `/pkgs/../api/rpc` would arrive as
+/// `/api/rpc`), and no backslash, raw or encoded (a URL parser treats it as
+/// `/` for http). A path that fails is refused, never normalised.
+pub fn is_routable_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.split('/').all(|seg| {
+            let decoded = percent_encoding::percent_decode_str(seg).collect::<Vec<u8>>();
+            decoded != b"." && decoded != b".." && !decoded.contains(&b'\\')
+        })
+}
+
+/// The path and (token-free) query to forward, or `None` if the path isn't
+/// [routable](is_routable_path).
+fn path_and_query(uri: &axum::http::Uri) -> Option<String> {
     let path = uri.path();
-    match strip_token_param(uri.query()) {
+    if !is_routable_path(path) {
+        return None;
+    }
+    Some(match strip_token_param(uri.query()) {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
-    }
+    })
+}
+
+fn bad_path() -> Response {
+    json_error(
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        "path segments `.`/`..` and backslashes are not allowed",
+    )
 }
 
 fn child_unavailable(e: &anyhow::Error) -> Response {
@@ -336,7 +405,9 @@ pub async fn pkgs_proxy(
     if !matches!(parts.method, Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let pq = path_and_query(&parts.uri);
+    let Some(pq) = path_and_query(&parts.uri) else {
+        return bad_path();
+    };
     forward(
         &state,
         &ctx,
@@ -347,6 +418,9 @@ pub async fn pkgs_proxy(
     )
     .await
 }
+
+/// How long the broker waits for a child to accept a WebSocket handshake.
+pub const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 type Upstream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -368,7 +442,17 @@ async fn connect_upstream(
         HeaderValue::from_str(&ctx.principal.id.to_string())
             .map_err(|e| tungstenite::Error::HttpFormat(e.into()))?,
     );
-    let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+    let (ws, _) = tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| {
+        tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the principal child did not complete the WebSocket handshake",
+        ))
+    })??;
     Ok(ws)
 }
 
@@ -379,6 +463,14 @@ fn is_refused(e: &tungstenite::Error) -> bool {
 /// `GET /ws/*` (upgrade) → the principal's child. The upstream socket is
 /// opened **before** the client's upgrade completes, so a child that can't
 /// be reached is an HTTP error, not an instantly-closed socket.
+///
+/// I-8 across the handshake: the socket is registered **first**, before a
+/// child is launched or reached (that can take up to `READY_TIMEOUT`), so a
+/// logout, password change or epoch bump that lands meanwhile reaches it —
+/// and one that landed between resolution and registration is caught by
+/// [`WsRegistry::register`](super::ws_registry::WsRegistry::register)
+/// itself. Then the [`StillValid`](super::ws_registry::StillValid) check
+/// runs once, for CLI writes whose re-check pass already went by.
 pub async fn ws_proxy(
     State(state): State<Arc<BrokerState>>,
     Extension(ctx): Extension<PrincipalCtx>,
@@ -386,7 +478,23 @@ pub async fn ws_proxy(
     uri: axum::http::Uri,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let pq = path_and_query(&uri);
+    let Some(pq) = path_and_query(&uri) else {
+        return bad_path();
+    };
+    let key = WsKey::from_ctx(&ctx, epochs);
+    let mut registration = state.ws.register(key.clone());
+    match state.hooks.still_valid.still_valid(&key).await {
+        Ok(true) => {}
+        Ok(false) => return revoked_handshake(),
+        Err(e) => {
+            tracing::warn!("ws handshake re-check for {}: {e:#}", ctx.principal.id);
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "could not confirm the session; try again",
+            );
+        }
+    }
     let mut upstream = None;
     for attempt in 0..2 {
         let endpoint = match state.children.endpoint(&ctx.principal).await {
@@ -412,16 +520,26 @@ pub async fn ws_proxy(
             }
         }
     }
-    let Some(upstream) = upstream else {
+    let Some(mut upstream) = upstream else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    // Registered before the upgrade completes: a revocation racing the
-    // handshake still reaches this socket.
-    let registration = state.ws.register(WsKey::from_ctx(&ctx, epochs));
+    // Revoked while the child was launched or reached: refuse the upgrade.
+    if registration.revoked().is_some() {
+        let _ = upstream.close(None).await;
+        return revoked_handshake();
+    }
     let path = uri.path().to_string();
     ws.on_upgrade(move |client| async move {
         pump(state, ctx, path, client, upstream, registration).await;
     })
+}
+
+fn revoked_handshake() -> Response {
+    json_error(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "the session was revoked",
+    )
 }
 
 fn to_upstream(msg: Message) -> tungstenite::Message {
@@ -473,7 +591,6 @@ async fn pump(
 ) {
     let (mut client_tx, mut client_rx) = client.split();
     let (mut up_tx, mut up_rx) = upstream.split();
-    let mut touch = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tokio::select! {
             reason = &mut registration.closed => {
@@ -483,12 +600,25 @@ async fn pump(
                 let _ = up_tx.send(tungstenite::Message::Close(None)).await;
                 break;
             }
-            _ = touch.tick() => state.children.touch(ctx.principal.id).await,
             msg = client_rx.next() => match msg {
-                Some(Ok(Message::Text(text))) => {
-                    match state.hooks.ws_frames.client_text(&ctx, &path, &text) {
+                Some(Ok(Message::Close(frame))) => {
+                    let _ = up_tx.send(to_upstream(Message::Close(frame))).await;
+                    break;
+                }
+                Some(Ok(msg)) => {
+                    let decision = match &msg {
+                        Message::Text(t) => {
+                            state.hooks.ws_frames.client_frame(&ctx, &path, ClientFrame::Text(t))
+                        }
+                        Message::Binary(b) => {
+                            state.hooks.ws_frames.client_frame(&ctx, &path, ClientFrame::Binary(b))
+                        }
+                        // Ping / pong: control frames, not input.
+                        _ => FrameDecision::Pass,
+                    };
+                    match decision {
                         FrameDecision::Pass => {
-                            if up_tx.send(tungstenite::Message::Text(text)).await.is_err() {
+                            if up_tx.send(to_upstream(msg)).await.is_err() {
                                 let _ = client_tx.send(close_frame(1011, "upstream gone")).await;
                                 break;
                             }
@@ -499,16 +629,6 @@ async fn pump(
                             let _ = up_tx.send(tungstenite::Message::Close(None)).await;
                             break;
                         }
-                    }
-                }
-                Some(Ok(Message::Close(frame))) => {
-                    let _ = up_tx.send(to_upstream(Message::Close(frame))).await;
-                    break;
-                }
-                Some(Ok(other)) => {
-                    if up_tx.send(to_upstream(other)).await.is_err() {
-                        let _ = client_tx.send(close_frame(1011, "upstream gone")).await;
-                        break;
                     }
                 }
                 Some(Err(_)) | None => {
@@ -537,7 +657,6 @@ async fn pump(
         }
     }
     let _ = client_tx.close().await;
-    state.children.touch(ctx.principal.id).await;
 }
 
 #[cfg(test)]
@@ -581,5 +700,52 @@ mod tests {
             strip_token_param(Some("tokens=1")).as_deref(),
             Some("tokens=1")
         );
+        // S3-5: an encoded key is the same parameter to the child.
+        assert_eq!(
+            strip_token_param(Some("%74oken=abc&a=1&%54OKEN=x")).as_deref(),
+            Some("a=1&%54OKEN=x")
+        );
+    }
+
+    /// S3-5: the child must see the route the broker matched.
+    #[test]
+    fn dot_segments_and_backslashes_are_not_routable() {
+        for ok in [
+            "/pkgs/studio/index.html",
+            "/ws/pty/abc",
+            "/pkgs/a/..b/c.js",
+            "/pkgs/a/.hidden",
+            "/pkgs/a//b",
+        ] {
+            assert!(is_routable_path(ok), "{ok}");
+        }
+        for bad in [
+            "/pkgs/../api/rpc",
+            "/pkgs/./x",
+            "/pkgs/%2e%2e/api/rpc",
+            "/pkgs/.%2E/api/rpc",
+            "/pkgs/%2e/x",
+            "/pkgs/a/..",
+            "/pkgs/..%5capi/rpc",
+            "/pkgs/a\\b",
+            "pkgs/x",
+        ] {
+            assert!(!is_routable_path(bad), "{bad}");
+        }
+    }
+
+    /// S3-8: a header named in `Connection:` is hop-by-hop for that hop.
+    #[test]
+    fn headers_named_by_connection_are_not_forwarded() {
+        let mut h = HeaderMap::new();
+        h.insert("connection", "close, X-Foo".parse().unwrap());
+        h.insert("x-foo", "1".parse().unwrap());
+        h.insert("x-bar", "2".parse().unwrap());
+        let up = upstream_headers(&h);
+        let names: Vec<&str> = up.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["x-bar"]);
+        let down = downstream_headers(&h);
+        let names: Vec<&str> = down.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["x-bar"]);
     }
 }

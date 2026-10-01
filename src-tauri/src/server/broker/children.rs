@@ -7,14 +7,24 @@
 //! principal's uid with every §9.2 check behind it. The transport is
 //! loopback TCP (P-7): the child binds `127.0.0.1:0`, gets a random
 //! per-child `IKENGA_AUTH_TOKEN`, and reports its bound port through its own
-//! `<data>/daemon.json`.
+//! `<data>/daemon.json`. That file is in a principal-writable directory, so
+//! the broker also checks that a loopback **listener of the principal's own
+//! uid** holds that port before it sends anything there (a principal can
+//! at most point their own traffic at their own process; the planned UDS in
+//! a broker-owned directory closes even that).
 //!
-//! Idle reap (OD-13): a child with no proxied request for the idle timeout
-//! (default 30 min) and no open proxied WebSocket is stopped (SIGTERM, so it
-//! drains like any daemon), and respawned on the principal's next request.
-//! The child also runs its own idle watcher with the same timeout, which
-//! counts PTY sessions and open WebSockets (§5 row 13); whichever fires
-//! first, the broker notices the exit and respawns.
+//! Idle reap (OD-13: "no PTY and no WS"): **the child's own idle watcher**
+//! decides, with the timeout the broker passes it (default 30 min) — it
+//! counts PTY sessions, open WebSockets and in-flight or recent requests
+//! (§5 row 13), which the broker can't see all of. The broker never reaps a
+//! live child for idleness; it notices the exit and respawns on the
+//! principal's next request.
+//!
+//! When the broker does stop a child (disable, shutdown) it sends SIGTERM
+//! and waits up to [`STOP_GRACE`] for it to drain (PTYs, discovery file,
+//! data-dir lock) before SIGKILL. A child that refused a connection is
+//! killed and **reaped** before a replacement launches, so the replacement
+//! never races the old one for the data-dir lock (I-3).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -37,6 +47,10 @@ use crate::server::operator::OperatorRoot;
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long a launched child gets to report its port.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a SIGTERMed child gets to drain before SIGKILL.
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+/// How long the broker waits for a SIGKILLed child to be reaped.
+pub const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// Where and how to reach one running child.
 #[derive(Clone, PartialEq, Eq)]
@@ -59,10 +73,11 @@ impl std::fmt::Debug for ChildEndpoint {
 pub trait ChildProcess: Send {
     /// Whether it has exited (reaps it if so).
     fn has_exited(&mut self) -> bool;
-    /// Ask it to shut down gracefully (SIGTERM).
-    fn terminate(&mut self);
-    /// Make sure it is gone (SIGKILL).
-    fn kill(&mut self);
+    /// SIGTERM, up to `grace` to drain, then SIGKILL. Resolves once the
+    /// process is reaped (or the SIGKILL wait gave up).
+    fn shutdown(self: Box<Self>, grace: Duration) -> BoxFuture<'static, ()>;
+    /// SIGKILL, and wait up to `wait` for it to be reaped.
+    fn kill(self: Box<Self>, wait: Duration) -> BoxFuture<'static, ()>;
 }
 
 pub struct LaunchedChild {
@@ -83,7 +98,6 @@ pub trait ChildLauncher: Send + Sync {
 struct Live {
     endpoint: ChildEndpoint,
     process: Box<dyn ChildProcess>,
-    last_used: Instant,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Live>>>;
@@ -94,7 +108,6 @@ type Slot = Arc<tokio::sync::Mutex<Option<Live>>>;
 pub struct Children {
     launcher: Arc<dyn ChildLauncher>,
     slots: Mutex<HashMap<PrincipalId, Slot>>,
-    idle_timeout: Duration,
 }
 
 fn mint_token() -> String {
@@ -104,16 +117,11 @@ fn mint_token() -> String {
 }
 
 impl Children {
-    pub fn new(launcher: Arc<dyn ChildLauncher>, idle_timeout: Duration) -> Self {
+    pub fn new(launcher: Arc<dyn ChildLauncher>) -> Self {
         Self {
             launcher,
             slots: Mutex::new(HashMap::new()),
-            idle_timeout,
         }
-    }
-
-    pub fn idle_timeout(&self) -> Duration {
-        self.idle_timeout
     }
 
     fn slot(&self, id: PrincipalId) -> Slot {
@@ -135,13 +143,12 @@ impl Children {
     }
 
     /// The principal's running child, launching one if there is none (or the
-    /// last one exited). Marks it used.
+    /// last one exited).
     pub async fn endpoint(&self, principal: &Principal) -> anyhow::Result<ChildEndpoint> {
         let slot = self.slot(principal.id);
         let mut live = slot.lock().await;
         if let Some(l) = live.as_mut() {
             if !l.process.has_exited() {
-                l.last_used = Instant::now();
                 return Ok(l.endpoint.clone());
             }
             tracing::info!("principal child for {} exited; respawning", principal.id);
@@ -161,51 +168,47 @@ impl Children {
         *live = Some(Live {
             endpoint: endpoint.clone(),
             process: launched.process,
-            last_used: Instant::now(),
         });
         Ok(endpoint)
     }
 
-    /// Mark the principal's child used (a proxied socket is still open).
-    pub async fn touch(&self, id: PrincipalId) {
-        if let Some(l) = self.slot(id).lock().await.as_mut() {
-            l.last_used = Instant::now();
-        }
-    }
-
-    /// The child at `endpoint` refused a connection: forget it if it is
-    /// still the current one, so the next [`endpoint`](Self::endpoint)
-    /// launches afresh.
+    /// The child at `endpoint` refused a connection: if it is still the
+    /// current one, kill it and wait for it to be reaped (holding the slot,
+    /// so the next [`endpoint`](Self::endpoint) can't launch a replacement
+    /// that loses the data-dir lock to it, I-3).
     pub async fn invalidate(&self, id: PrincipalId, endpoint: &ChildEndpoint) {
         let slot = self.slot(id);
         let mut live = slot.lock().await;
         if live.as_ref().is_some_and(|l| &l.endpoint == endpoint) {
-            if let Some(mut l) = live.take() {
-                l.process.kill();
+            if let Some(l) = live.take() {
+                l.process.kill(KILL_WAIT).await;
             }
         }
     }
 
-    /// Stop the principal's child, if any (disable, §7.3).
+    /// Stop the principal's child, if any (disable, §7.3): SIGTERM, drain,
+    /// then SIGKILL after [`STOP_GRACE`].
     pub async fn stop(&self, id: PrincipalId) -> bool {
         let slot = self.slot(id);
         let mut live = slot.lock().await;
         match live.take() {
-            Some(mut l) => {
-                l.process.terminate();
+            Some(l) => {
+                l.process.shutdown(STOP_GRACE).await;
                 true
             }
             None => false,
         }
     }
 
-    /// Stop every child (broker shutdown).
+    /// Stop every child (broker shutdown), draining them concurrently.
     pub async fn stop_all(&self) {
+        let mut stopping = Vec::new();
         for (_, slot) in self.all_slots() {
-            if let Some(mut l) = slot.lock().await.take() {
-                l.process.terminate();
+            if let Some(l) = slot.lock().await.take() {
+                stopping.push(l.process.shutdown(STOP_GRACE));
             }
         }
+        futures_util::future::join_all(stopping).await;
     }
 
     /// Principals with a live (not exited) child.
@@ -225,38 +228,6 @@ impl Children {
         }
         out
     }
-
-    /// OD-13: stop children idle past the timeout. `open_ws` counts a
-    /// principal's open proxied sockets; any open socket keeps its child.
-    pub async fn reap_idle(
-        &self,
-        open_ws: &(dyn Fn(PrincipalId) -> usize + Send + Sync),
-    ) -> Vec<PrincipalId> {
-        let mut reaped = Vec::new();
-        for (id, slot) in self.all_slots() {
-            let mut live = slot.lock().await;
-            let Some(l) = live.as_mut() else { continue };
-            if l.process.has_exited() {
-                *live = None;
-                continue;
-            }
-            if open_ws(id) > 0 {
-                l.last_used = Instant::now();
-                continue;
-            }
-            if l.last_used.elapsed() >= self.idle_timeout {
-                tracing::info!(
-                    "principal child for {id} idle for {}s; stopping it (respawned on demand)",
-                    self.idle_timeout.as_secs()
-                );
-                if let Some(mut l) = live.take() {
-                    l.process.terminate();
-                }
-                reaped.push(id);
-            }
-        }
-        reaped
-    }
 }
 
 // ─── the real launcher ─────────────────────────────────────────────────────
@@ -264,22 +235,47 @@ impl Children {
 /// A `tokio::process::Child` launched through the T1 executor.
 pub struct TokioChild(pub tokio::process::Child);
 
+impl TokioChild {
+    async fn kill_and_reap(&mut self, wait: Duration) {
+        let _ = self.0.start_kill();
+        if tokio::time::timeout(wait, self.0.wait()).await.is_err() {
+            tracing::warn!(
+                "principal child {:?} not reaped {}s after SIGKILL",
+                self.0.id(),
+                wait.as_secs()
+            );
+        }
+    }
+}
+
 impl ChildProcess for TokioChild {
     fn has_exited(&mut self) -> bool {
         !matches!(self.0.try_wait(), Ok(None))
     }
 
-    fn terminate(&mut self) {
-        if let Some(pid) = self.0.id() {
-            // SAFETY: plain syscall on a pid we spawned and have not reaped.
+    /// The process is owned by this future until it is reaped, so
+    /// `kill_on_drop` (kept as the safety net for a broker that unwinds)
+    /// never cuts the drain short.
+    fn shutdown(mut self: Box<Self>, grace: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let Some(pid) = self.0.id() else { return };
+            // SAFETY: plain syscall on a pid we spawned and have not reaped
+            // (`id()` is `None` once it has been).
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
-        }
+            if tokio::time::timeout(grace, self.0.wait()).await.is_err() {
+                tracing::warn!(
+                    "principal child {pid} still running {}s after SIGTERM; killing it",
+                    grace.as_secs()
+                );
+                self.kill_and_reap(KILL_WAIT).await;
+            }
+        })
     }
 
-    fn kill(&mut self) {
-        let _ = self.0.start_kill();
+    fn kill(mut self: Box<Self>, wait: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(async move { self.kill_and_reap(wait).await })
     }
 }
 
@@ -364,13 +360,13 @@ impl ChildLauncher for T1Launcher {
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("the principal child exited at once"))?;
             let mut process = TokioChild(child);
-            match wait_for_port(&data, pid, &mut process, READY_TIMEOUT).await {
+            match wait_for_port(&data, pid, principal.uid, &mut process, READY_TIMEOUT).await {
                 Ok(addr) => Ok(LaunchedChild {
                     addr,
                     process: Box::new(process),
                 }),
                 Err(e) => {
-                    process.kill();
+                    process.kill_and_reap(KILL_WAIT).await;
                     Err(e)
                 }
             }
@@ -407,16 +403,44 @@ pub fn read_child_port(data_dir: &Path, pid: u32) -> Option<u16> {
         .filter(|p| *p != 0)
 }
 
+/// Whether a socket of `uid` is listening on `127.0.0.1:port`, per
+/// `/proc/net/tcp` (needs no privilege beyond reading it). The port came
+/// from a file the principal can write; this keeps the broker from sending
+/// the principal's traffic (and the child's bearer) to another uid's
+/// listener.
+pub fn loopback_listener_uid_is(port: u16, uid: u32) -> bool {
+    let Ok(table) = fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    // `sl local_address rem_address st tx:rx tr:when retrnsmt uid ...`;
+    // the address is the kernel's u32 in host order, the port big-endian.
+    let local = format!("{:08X}:{:04X}", u32::from_ne_bytes([127, 0, 0, 1]), port);
+    table.lines().skip(1).any(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        f.len() > 7 && f[1] == local && f[3] == "0A" && f[7].parse::<u32>().ok() == Some(uid)
+    })
+}
+
 async fn wait_for_port(
     data_dir: &Path,
     pid: u32,
+    uid: u32,
     process: &mut dyn ChildProcess,
     timeout: Duration,
 ) -> anyhow::Result<SocketAddr> {
     let deadline = Instant::now() + timeout;
+    let mut warned = false;
     loop {
         if let Some(port) = read_child_port(data_dir, pid) {
-            return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+            if loopback_listener_uid_is(port, uid) {
+                return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+            }
+            if !std::mem::replace(&mut warned, true) {
+                tracing::warn!(
+                    "the principal child's daemon.json names port {port}, which no loopback \
+                     listener of uid {uid} holds; waiting"
+                );
+            }
         }
         if process.has_exited() {
             anyhow::bail!(
@@ -461,12 +485,14 @@ pub(crate) mod tests {
         fn has_exited(&mut self) -> bool {
             self.exited.load(Ordering::SeqCst)
         }
-        fn terminate(&mut self) {
+        fn shutdown(self: Box<Self>, _grace: Duration) -> BoxFuture<'static, ()> {
             self.terminated.store(true, Ordering::SeqCst);
             self.exited.store(true, Ordering::SeqCst);
+            Box::pin(async {})
         }
-        fn kill(&mut self) {
+        fn kill(self: Box<Self>, _wait: Duration) -> BoxFuture<'static, ()> {
             self.exited.store(true, Ordering::SeqCst);
+            Box::pin(async {})
         }
     }
 
@@ -499,7 +525,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn one_child_per_principal_even_under_concurrent_first_requests() {
         let launcher = Arc::new(CountingLauncher::default());
-        let children = Arc::new(Children::new(launcher.clone(), DEFAULT_IDLE_TIMEOUT));
+        let children = Arc::new(Children::new(launcher.clone()));
         let p = principal();
         let (a, b) = tokio::join!(children.endpoint(&p), children.endpoint(&p));
         assert_eq!(a.unwrap(), b.unwrap());
@@ -515,7 +541,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_exited_child_is_respawned_on_the_next_request() {
         let launcher = Arc::new(CountingLauncher::default());
-        let children = Children::new(launcher.clone(), DEFAULT_IDLE_TIMEOUT);
+        let children = Children::new(launcher.clone());
         let p = principal();
         let first = children.endpoint(&p).await.unwrap();
         launcher
@@ -531,26 +557,79 @@ pub(crate) mod tests {
         assert_eq!(launcher.launches.load(Ordering::SeqCst), 2);
     }
 
+    /// S3-3: idleness is the child's call (it counts PTYs; the broker can't
+    /// see them). The broker keeps a live child however long it was unused.
     #[tokio::test]
-    async fn idle_reap_spares_open_sockets_and_stops_the_rest() {
+    async fn the_broker_never_reaps_a_live_child_for_idleness() {
         let launcher = Arc::new(CountingLauncher::default());
-        let children = Children::new(launcher.clone(), Duration::from_millis(50));
-        let (p, q) = (principal(), principal());
-        children.endpoint(&p).await.unwrap();
-        children.endpoint(&q).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let reaped = children.reap_idle(&|id| usize::from(id == p.id)).await;
-        assert_eq!(reaped, vec![q.id], "p has an open socket");
+        let children = Children::new(launcher.clone());
+        let p = principal();
+        let first = children.endpoint(&p).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(children.running().await, vec![p.id]);
-        // The next request respawns q's child.
-        children.endpoint(&q).await.unwrap();
-        assert_eq!(launcher.launches.load(Ordering::SeqCst), 3);
+        assert_eq!(children.endpoint(&p).await.unwrap(), first);
+        assert_eq!(launcher.launches.load(Ordering::SeqCst), 1);
+    }
+
+    fn sh(script: &str) -> TokioChild {
+        TokioChild(
+            tokio::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    /// S3-3: a stopped child gets to drain — SIGTERM, then its own shutdown
+    /// path runs — rather than being SIGKILLed by `kill_on_drop` at once.
+    #[tokio::test]
+    async fn shutdown_lets_the_child_drain_then_escalates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("drained");
+        let child = sh(&format!(
+            "trap 'sleep 0.2; echo ok > {}; exit 0' TERM; while :; do sleep 0.05; done",
+            marker.display()
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Box::new(child).shutdown(Duration::from_secs(5)).await;
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap_or_default().trim(),
+            "ok",
+            "the SIGTERM handler ran to completion"
+        );
+
+        // A child that ignores SIGTERM is killed once the grace runs out.
+        let mut stubborn = sh("trap '' TERM; while :; do sleep 0.05; done");
+        let pid = stubborn.0.id().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!stubborn.has_exited());
+        let started = Instant::now();
+        Box::new(stubborn)
+            .shutdown(Duration::from_millis(300))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(4));
+        // Killed and reaped: the pid is gone.
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+    }
+
+    /// S3-7: the port named by a principal-writable file is used only if a
+    /// loopback listener of the principal's uid holds it.
+    #[tokio::test]
+    async fn only_a_loopback_listener_of_the_principals_uid_is_trusted() {
+        let me = unsafe { libc::geteuid() };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(loopback_listener_uid_is(port, me));
+        assert!(!loopback_listener_uid_is(port, me.wrapping_add(1)));
+        drop(listener);
+        assert!(!loopback_listener_uid_is(port, me), "nobody listens now");
     }
 
     #[tokio::test]
     async fn stop_and_invalidate_forget_the_child() {
         let launcher = Arc::new(CountingLauncher::default());
-        let children = Children::new(launcher.clone(), DEFAULT_IDLE_TIMEOUT);
+        let children = Children::new(launcher.clone());
         let p = principal();
         let e = children.endpoint(&p).await.unwrap();
         // A stale endpoint doesn't knock out a newer child.
