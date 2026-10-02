@@ -46,6 +46,7 @@ import { Route as SettingsEnginesRouteImport } from './routes/settings/engines'
 import { Route as SettingsDevicesRouteImport } from './routes/settings/devices'
 import { Route as SettingsDataHealthRouteImport } from './routes/settings/data-health'
 import { Route as SettingsBackupRouteImport } from './routes/settings/backup'
+import { Route as SettingsAuditRouteImport } from './routes/settings/audit'
 import { Route as SettingsArtifactGridRouteImport } from './routes/settings/artifact-grid'
 import { Route as SettingsAppearanceRouteImport } from './routes/settings/appearance'
 import { Route as SettingsAgentRouteImport } from './routes/settings/agent'
@@ -275,6 +276,11 @@ const SettingsDataHealthRoute = SettingsDataHealthRouteImport.update({
 const SettingsBackupRoute = SettingsBackupRouteImport.update({
   id: '/backup',
   path: '/backup',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsAuditRoute = SettingsAuditRouteImport.update({
+  id: '/audit',
+  path: '/audit',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const SettingsArtifactGridRoute = SettingsArtifactGridRouteImport.update({
@@ -557,6 +563,7 @@ export interface FileRoutesByFullPath {
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
+  '/settings/audit': typeof SettingsAuditRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
   '/settings/devices': typeof SettingsDevicesRoute
@@ -638,6 +645,7 @@ export interface FileRoutesByTo {
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
+  '/settings/audit': typeof SettingsAuditRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
   '/settings/devices': typeof SettingsDevicesRoute
@@ -723,6 +731,7 @@ export interface FileRoutesById {
   '/settings/agent': typeof SettingsAgentRoute
   '/settings/appearance': typeof SettingsAppearanceRoute
   '/settings/artifact-grid': typeof SettingsArtifactGridRoute
+  '/settings/audit': typeof SettingsAuditRoute
   '/settings/backup': typeof SettingsBackupRoute
   '/settings/data-health': typeof SettingsDataHealthRoute
   '/settings/devices': typeof SettingsDevicesRoute
@@ -809,6 +818,7 @@ export interface FileRouteTypes {
     | '/settings/agent'
     | '/settings/appearance'
     | '/settings/artifact-grid'
+    | '/settings/audit'
     | '/settings/backup'
     | '/settings/data-health'
     | '/settings/devices'
@@ -890,6 +900,7 @@ export interface FileRouteTypes {
     | '/settings/agent'
     | '/settings/appearance'
     | '/settings/artifact-grid'
+    | '/settings/audit'
     | '/settings/backup'
     | '/settings/data-health'
     | '/settings/devices'
@@ -974,6 +985,7 @@ export interface FileRouteTypes {
     | '/settings/agent'
     | '/settings/appearance'
     | '/settings/artifact-grid'
+    | '/settings/audit'
     | '/settings/backup'
     | '/settings/data-health'
     | '/settings/devices'
@@ -1308,6 +1320,13 @@ declare module '@tanstack/react-router' {
       path: '/backup'
       fullPath: '/settings/backup'
       preLoaderRoute: typeof SettingsBackupRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/audit': {
+      id: '/settings/audit'
+      path: '/audit'
+      fullPath: '/settings/audit'
+      preLoaderRoute: typeof SettingsAuditRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
     '/settings/artifact-grid': {
@@ -1693,6 +1712,7 @@ interface SettingsRouteRouteChildren {
   SettingsAgentRoute: typeof SettingsAgentRoute
   SettingsAppearanceRoute: typeof SettingsAppearanceRoute
   SettingsArtifactGridRoute: typeof SettingsArtifactGridRoute
+  SettingsAuditRoute: typeof SettingsAuditRoute
   SettingsBackupRoute: typeof SettingsBackupRoute
   SettingsDataHealthRoute: typeof SettingsDataHealthRoute
   SettingsDevicesRoute: typeof SettingsDevicesRoute
@@ -1721,6 +1741,7 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsAgentRoute: SettingsAgentRoute,
   SettingsAppearanceRoute: SettingsAppearanceRoute,
   SettingsArtifactGridRoute: SettingsArtifactGridRoute,
+  SettingsAuditRoute: SettingsAuditRoute,
   SettingsBackupRoute: SettingsBackupRoute,
   SettingsDataHealthRoute: SettingsDataHealthRoute,
   SettingsDevicesRoute: SettingsDevicesRoute,

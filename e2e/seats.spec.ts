@@ -458,7 +458,95 @@ for (const mode of ['dark', 'light'] as const) {
 			await expect(note).not.toContainText('Right now that is');
 			await expect(devices.getByText('Set by how the server was started.')).toBeVisible();
 			await expect(devices.getByText(/No paired devices\. Pair a phone/)).toBeVisible();
+			// D-4 (G-ACCESS §11.2): the access-store file bar, no "Open file" (WP-77).
+			await expect(devices.locator('[data-filebar="access-store"]')).toBeVisible();
 			await page.screenshot({ path: shotPath(testInfo, `people-devices-${mode}.png`) });
+			expect(pageErrors).toEqual([]);
+		});
+
+		test(`audit: the append-only log with filters and export (${mode})`, async ({ page }, testInfo) => {
+			const now = Date.now();
+			const row = (seq: number, over: Record<string, unknown>) => ({
+				seq,
+				atMs: now - seq * 60_000,
+				kind: 'app.locked',
+				category: 'access',
+				principalId: 'p',
+				actorName: 'nedjamez',
+				deviceId: 'host',
+				deviceName: 'ned-desktop',
+				via: 'operator',
+				subjectPrincipalId: null,
+				subjectName: null,
+				subjectDeviceId: null,
+				subjectDeviceName: null,
+				projectKey: null,
+				target: null,
+				remoteAddr: null,
+				userAgent: null,
+				detail: {},
+				...over,
+			});
+			const pageErrors = await boot(page, {
+				mode,
+				responses: {
+					access_status: {
+						tier: 't0',
+						store: 'ok',
+						principal: { principalId: 'p', username: 'nedjamez', isAdmin: false },
+						credential: { via: 'operator', deviceId: 'host', tier: 'full' },
+						caps: ['files', 'sessions', 'dispatch', 'approve', 'install', 'settings', 'secrets'],
+						adminStrength: true,
+						publicUrl: null,
+						sharingEnabled: false,
+						share: null,
+					},
+					access_audit_list: {
+						rows: [
+							row(1, {
+								kind: 'permission.decided',
+								category: 'permission',
+								target: 'royalti-server-v2.6/.env',
+								detail: { decision: 'allow_once' },
+							}),
+							row(2, {
+								kind: 'dispatch.sent',
+								category: 'dispatch',
+								principalId: 'p',
+								deviceId: 'pixel',
+								deviceName: 'Pixel 9 · Chrome',
+								via: 'device',
+								target: 'pty · 3',
+							}),
+							row(3, { kind: 'pair.allowed', category: 'pairing', target: 'Pixel 9 · Chrome' }),
+							row(4, { kind: 'vault.locked', category: 'access', target: 'workspace' }),
+						],
+						nextBefore: null,
+					},
+				},
+			});
+			const address = page.getByRole('textbox', { name: 'Address' });
+			await address.fill('/settings/audit');
+			await address.press('Enter');
+			const audit = page.locator('[data-state="audit"]');
+			await expect(audit).toBeVisible();
+			await expect(audit).toHaveAttribute('data-audit', 'rows');
+			await expect(audit.getByRole('heading', { name: 'People, devices and access' })).toBeVisible();
+			// D-05 `#scopeSw`: both scopes live on Audit (G-ACCESS §11.1).
+			await expect(audit.locator('#scopeSw button[data-scope="project"]')).toBeEnabled();
+			const table = audit.getByRole('table');
+			await expect(table.getByRole('columnheader')).toHaveText(['Who', 'Device', 'Action', 'Target', 'When']);
+			await expect(table.getByRole('row')).toHaveCount(5);
+			await expect(table.getByText('Allowed permission')).toBeVisible();
+			await expect(table.getByText('Vault locked')).toBeVisible();
+			// Kind → Pairing narrows the table.
+			await audit.getByRole('group', { name: 'Kind' }).getByRole('button', { name: /^Pairing/ }).click();
+			await expect(table.getByRole('row')).toHaveCount(2);
+			await audit.getByRole('group', { name: 'Kind' }).getByRole('button', { name: /^All/ }).click();
+			await expect(audit.getByRole('button', { name: /Export/ })).toBeEnabled();
+			await expect(audit.getByText(/^Append-only\. Rows are written by the host/)).toBeVisible();
+			await expect(audit.locator('[data-filebar="access-store"]')).toBeVisible();
+			await page.screenshot({ path: shotPath(testInfo, `people-audit-${mode}.png`) });
 			expect(pageErrors).toEqual([]);
 		});
 

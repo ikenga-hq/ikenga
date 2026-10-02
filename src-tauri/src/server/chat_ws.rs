@@ -55,7 +55,8 @@ pub async fn chat_ws_handler(
 ) -> impl IntoResponse {
     // G-ACCESS §1.6: attaching needs `sessions` (checked at the handshake);
     // `Prompt` and `Cancel` need `dispatch`.
-    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c));
+    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c))
+        .with_target(format!("chat · {thread_id}"));
     ws.on_upgrade(move |socket| {
         super::activity::track_ws(handle_chat_socket(socket, state, thread_id, guard))
     })

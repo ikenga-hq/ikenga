@@ -312,6 +312,7 @@ pub async fn secrets_vault_status(
     lock: State<'_, SecretsLock>,
 ) -> Result<VaultStatus, String> {
     if lock.expire_if_idle() {
+        audit_vault(&app, "vault.locked", "idle");
         invalidate_env_vaults(&app).map_err(|error| {
             format!("secrets idle-locked but env-vault invalidation failed: {error}")
         })?;
@@ -429,7 +430,7 @@ pub async fn secrets_unlock(
     let unlock = lock.unlock.clone();
     let app_for_work = app.clone();
     let passphrase = Zeroizing::new(passphrase);
-    tokio::task::spawn_blocking(move || {
+    let unlocked = tokio::task::spawn_blocking(move || {
         let outcome = with_store(&app_for_work, &state, unlock.as_ref(), |store| {
             if let Err(error) = unlock.unlock(passphrase.as_str()) {
                 return Ok(Err(error.to_string()));
@@ -451,10 +452,24 @@ pub async fn secrets_unlock(
         outcome?;
         dump_to_runtime_file_locked(&app_for_work, &state, unlock.as_ref())
             .map_err(|error| error.to_string())?;
-        Ok(unlock.state())
+        Ok::<_, String>(unlock.state())
     })
     .await
-    .map_err(|error| format!("join: {error}"))?
+    .map_err(|error| format!("join: {error}"))??;
+    audit_vault(&app, "vault.unlocked", "passphrase");
+    Ok(unlocked)
+}
+
+/// `vault.locked {reason}` / `vault.unlocked {method}` in the access audit
+/// chain (G-ACCESS §6.5, WP-77): best-effort and off the lock path — see
+/// `app_lock::record_access_audit`.
+fn audit_vault(app: &AppHandle, kind: &'static str, why: &'static str) {
+    let detail = if kind == "vault.unlocked" {
+        serde_json::json!({ "method": why })
+    } else {
+        serde_json::json!({ "reason": why })
+    };
+    crate::commands::app_lock::record_access_audit(app, kind, "workspace", detail);
 }
 
 /// After a failed post-unlock step: drop the DEK again and, if one was held,
@@ -492,7 +507,10 @@ pub async fn secrets_lock(
         // daemon until the next mutation).
         return Ok(lock.state());
     }
-    lock.unlock.lock().map_err(|error| error.to_string())?;
+    let was_unlocked = lock.unlock.lock().map_err(|error| error.to_string())?;
+    if was_unlocked {
+        audit_vault(&app, "vault.locked", "manual");
+    }
     invalidate_env_vaults(&app)
         .map_err(|error| format!("secrets locked but env-vault invalidation failed: {error}"))?;
     Ok(lock.state())
@@ -504,6 +522,7 @@ pub async fn secrets_lock_state(
     lock: State<'_, SecretsLock>,
 ) -> Result<LockState, String> {
     if lock.expire_if_idle() {
+        audit_vault(&app, "vault.locked", "idle");
         invalidate_env_vaults(&app).map_err(|error| {
             format!("secrets idle-locked but env-vault invalidation failed: {error}")
         })?;

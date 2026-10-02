@@ -393,14 +393,7 @@ mod tests {
         let reg = Registry::new();
         let op = operator_ctx(&store);
         let e = env(&store, &reg);
-        for (cmd, wp) in [
-            ("access_audit_list", "WP-77"),
-            ("access_audit_reseal", "WP-77"),
-        ] {
-            let err = dispatch(&e, &op, cmd, &json!({})).await.unwrap_err();
-            assert_eq!(err.code, Code::Internal, "{cmd}");
-            assert!(err.message.contains(wp), "{cmd}: {err}");
-        }
+        // WP-77 filled the audit arms (`access::audit`); no stub remains.
         // WP-76: on T0 (one principal) the member, invite and share arms
         // answer `requires_t1`, and the policy matrix is the defaults
         // (§4.5.5).

@@ -61,6 +61,9 @@ pub struct BrokerCtx {
     pub access: AccessCtx,
     /// On a share: the Owner, whose child the request is routed into.
     pub owner: Option<Principal>,
+    /// A process-wide id for this request / socket: the `dispatch.sent`
+    /// coalescing key (P-22, WP-77).
+    pub socket: u64,
 }
 
 /// The broker's shared access state.
@@ -187,6 +190,7 @@ impl T1Access {
                 meta,
             },
             owner,
+            socket: super::audit::next_socket_id(),
         })
     }
 
@@ -480,6 +484,42 @@ impl WsFrameHook for DeviceFrames {
     }
 }
 
+/// [`DeviceFrames`], then the dispatch audit on a delivered frame
+/// (`dispatch.sent`, §6.5, P-22, WP-77): the broker is the T1 store's
+/// writer, and it sees every remote frame before the child does.
+pub struct AuditedFrames {
+    pub t1: Arc<T1Access>,
+}
+
+impl WsFrameHook for AuditedFrames {
+    fn client_frame(
+        &self,
+        ctx: &PrincipalCtx,
+        narrowing: &Narrowing,
+        path: &str,
+        frame: ClientFrame<'_>,
+    ) -> FrameDecision {
+        let decision = DeviceFrames.client_frame(ctx, narrowing, path, frame);
+        if decision == FrameDecision::Pass {
+            if let Some(b) = narrowing.snapshot::<BrokerCtx>() {
+                let frame = match frame {
+                    ClientFrame::Text(t) => super::ws::Frame::Text(t),
+                    ClientFrame::Binary(b) => super::ws::Frame::Binary(b),
+                };
+                super::audit::on_client_frame(
+                    Some(&self.t1.store),
+                    &b.access,
+                    b.socket,
+                    &super::audit::frame_target(path),
+                    super::ws::Route::of(path),
+                    frame,
+                );
+            }
+        }
+        decision
+    }
+}
+
 /// §1.4 / §4.5.2–§4.5.3: once per request / WS handshake, the
 /// [`BrokerCtx`] — then `X-Ikenga-Caps` on every proxied request (the child
 /// narrows every check to it, §1.7), the `X-Ikenga-Share-*` set and the
@@ -609,7 +649,7 @@ pub fn install(t1: &Arc<T1Access>, ws: Arc<WsRegistry>) -> Installed {
     Installed {
         authorizer: Arc::new(AccessAuthorizer(t1.clone())),
         access: Arc::new(BrokerAccess { t1: t1.clone(), ws }),
-        ws_frames: Arc::new(DeviceFrames),
+        ws_frames: Arc::new(AuditedFrames { t1: t1.clone() }),
         still_valid: Arc::new(DeviceEpochs {
             pool: t1.pool.clone(),
         }),

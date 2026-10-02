@@ -529,6 +529,7 @@ pub fn spawn_idle_ticker(app: AppHandle) {
             };
             if locked_now {
                 log::info!("[app-lock] locked after idle");
+                audit_locked(&app, "idle");
                 emit_changed(&app);
             }
         }
@@ -537,6 +538,85 @@ pub fn spawn_idle_ticker(app: AppHandle) {
 
 fn emit_changed(app: &AppHandle) {
     let _ = app.emit(APP_LOCK_CHANGED_EVENT, serde_json::json!({}));
+}
+
+/// G-ACCESS §6.5 / §6.9 (WP-77): append a desktop-local row — `app.*`,
+/// `vault.*` — to the access audit chain through the daemon's
+/// `access_audit_record_local` (the operator bearer; the desktop never opens
+/// the store, P-20). **Best-effort and off the lock path:** spawned, never
+/// awaited by the lock or unlock it records, and a failure (no daemon, a
+/// store that is unavailable) is only logged.
+pub(crate) fn record_access_audit(
+    app: &AppHandle,
+    kind: &'static str,
+    target: impl Into<String>,
+    detail: serde_json::Value,
+) {
+    let app = app.clone();
+    let target = target.into();
+    tauri::async_runtime::spawn(async move {
+        let Some(daemon) =
+            app.try_state::<std::sync::Arc<crate::pty::daemon_client::DaemonState>>()
+        else {
+            return;
+        };
+        let daemon = daemon.inner().clone();
+        let args = serde_json::json!({ "kind": kind, "target": target, "detail": detail });
+        match crate::commands::access::proxy(&app, &daemon, "access_audit_record_local", args).await
+        {
+            Ok(_) => {}
+            // G-ACCESS §2.5: a drop while the store is unavailable is
+            // logged at `warn` (review m-5) — once per window, so idle
+            // locks on a machine with no daemon don't flood the log.
+            Err(e) if e.starts_with("store_unavailable") => {
+                if store_unavailable_warn_due((now_ms() / 1000) as i64) {
+                    log::warn!(
+                        "[access-audit] {kind} not recorded (and further drops for 10 min are \
+                         logged at debug): {e}"
+                    );
+                } else {
+                    log::debug!("[access-audit] {kind} not recorded: {e}");
+                }
+            }
+            Err(e) => log::warn!("[access-audit] {kind} not recorded: {e}"),
+        }
+    });
+}
+
+/// The `store_unavailable` warn window for [`record_access_audit`].
+const STORE_UNAVAILABLE_WARN_SECS: i64 = 600;
+
+/// Whether a `store_unavailable` drop at `now` (unix seconds) logs at
+/// `warn`: the first, then at most once per [`STORE_UNAVAILABLE_WARN_SECS`].
+fn store_unavailable_warn_due(now: i64) -> bool {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
+    let last = LAST.load(Ordering::Relaxed);
+    if last != i64::MIN && now.saturating_sub(last) < STORE_UNAVAILABLE_WARN_SECS {
+        return false;
+    }
+    LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// `app.locked {reason}` (best-effort, see [`record_access_audit`]).
+fn audit_locked(app: &AppHandle, reason: &'static str) {
+    record_access_audit(
+        app,
+        "app.locked",
+        host_name(),
+        serde_json::json!({ "reason": reason }),
+    );
+}
+
+/// `app.unlocked {method}` (best-effort).
+fn audit_unlocked(app: &AppHandle, method: &'static str) {
+    record_access_audit(
+        app,
+        "app.unlocked",
+        host_name(),
+        serde_json::json!({ "method": method }),
+    );
 }
 
 // ─── commands ───────────────────────────────────────────────────────────────
@@ -554,6 +634,7 @@ pub async fn app_lock_status(
         (locked_now, inner.status(now))
     });
     if locked_now {
+        audit_locked(&app, "idle");
         emit_changed(&app);
     }
     Ok(status)
@@ -581,6 +662,7 @@ pub async fn app_lock_lock(
     })?;
     if changed {
         log::info!("[app-lock] locked (Lock now)");
+        audit_locked(&app, "manual");
         emit_changed(&app);
     }
     Ok(status)
@@ -611,6 +693,7 @@ pub async fn app_lock_unlock(
         UnlockGate::NoSecret => {
             log::warn!("[app-lock] locked with no PIN on record; unlocking");
             state.with(|inner| inner.set_unlocked(now_ms()));
+            audit_unlocked(&app, "no_secret");
             emit_changed(&app);
             return Ok(outcome(&state, true, None));
         }
@@ -632,6 +715,7 @@ pub async fn app_lock_unlock(
     let error = state.with(|inner| inner.finish_unlock(ok, now_ms()));
     if ok {
         log::info!("[app-lock] unlocked (PIN)");
+        audit_unlocked(&app, "pin");
         emit_changed(&app);
     }
     Ok(outcome(&state, ok, error))
@@ -639,7 +723,9 @@ pub async fn app_lock_unlock(
 
 /// Unlock with OS biometrics. Always refused on this build (see the module
 /// header); kept so the frontend and the ACL already carry the path the
-/// follow-up fills in.
+/// follow-up fills in. It never unlocks, so it records nothing; the
+/// follow-up that makes it succeed records `app.unlocked {method: "os"}`
+/// through [`audit_unlocked`] like the PIN path (G-ACCESS §6.5, WP-77).
 #[tauri::command]
 pub async fn app_lock_unlock_biometric(
     state: State<'_, AppLockState>,
@@ -951,6 +1037,19 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review m-5: a `store_unavailable` drop warns, then at most once per
+    /// window (the rest log at debug).
+    #[test]
+    fn store_unavailable_drops_warn_once_per_window() {
+        let t = 4_000_000_000;
+        assert!(store_unavailable_warn_due(t));
+        assert!(!store_unavailable_warn_due(t + 1));
+        assert!(!store_unavailable_warn_due(
+            t + STORE_UNAVAILABLE_WARN_SECS - 1
+        ));
+        assert!(store_unavailable_warn_due(t + STORE_UNAVAILABLE_WARN_SECS));
+    }
 
     fn inner_with_secret(dir: &Path, idle_enabled: bool) -> Inner {
         let mut inner = Inner {

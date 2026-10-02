@@ -158,6 +158,56 @@ impl AccessStore {
         Self::finish_open(pool, StoreTier::T0, &seed).await.unwrap()
     }
 
+    /// `ikenga-server audit …` (WP-77): open an **existing** store file as
+    /// the root CLI (T1 `operator/accounts.db`, or any store named with
+    /// `--file`). Never creates or migrates — the access set must be exactly
+    /// current (§8.1: the CLI refuses a version it doesn't know; only the
+    /// broker / daemon migrates). Its chain starts with no known head, like
+    /// any second writer (§6.3 step 2). `read_only` (`audit verify`, review
+    /// m-8) opens it `SQLITE_OPEN_READONLY`.
+    pub async fn open_cli(path: &Path, read_only: bool) -> anyhow::Result<Self> {
+        if !path.is_file() {
+            anyhow::bail!("no access store at {}", path.display());
+        }
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .read_only(read_only)
+            .busy_timeout(BUSY_TIMEOUT);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await?;
+        let mut conn = pool.acquire().await?;
+        match migrations::state(&mut conn).await? {
+            migrations::SetState::Current => {}
+            migrations::SetState::Fresh => anyhow::bail!(
+                "{} has no access store (the server has never started on it)",
+                path.display()
+            ),
+            other => anyhow::bail!(
+                "{}: the access store is {other:?} for this binary; start the matching server \
+                 once (only it migrates), then retry",
+                path.display()
+            ),
+        }
+        let meta = read_meta(&mut conn).await?;
+        drop(conn);
+        let chain = Arc::new(Chain::new(meta.store_id.clone()));
+        chain.attach(pool.clone());
+        Ok(Self { pool, meta, chain })
+    }
+
+    /// The same store with a fresh chain view: a second writer in tests.
+    #[cfg(test)]
+    pub fn clone_with_fresh_chain(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            meta: self.meta.clone(),
+            chain: Arc::new(Chain::new(self.meta.store_id.clone())),
+        }
+    }
+
     async fn finish_open(pool: SqlitePool, tier: StoreTier, seed: &Seed) -> anyhow::Result<Self> {
         let mut conn = pool.acquire().await?;
         migrations::migrate(&mut conn, seed).await?;
@@ -170,6 +220,7 @@ impl AccessStore {
             );
         }
         let chain = Arc::new(Chain::new(meta.store_id.clone()));
+        chain.attach(pool.clone());
         let report: VerifyReport = chain.verify_boot(&mut conn).await?;
         if report.ok() {
             tracing::info!(

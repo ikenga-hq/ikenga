@@ -27,20 +27,39 @@ use crate::executor::PrincipalId;
 /// This set's name in `_operator_migrations`.
 pub const SET: &str = "access";
 
-/// One step: SQL, or a Rust step (WP-77's `0002_absorb_auth_events`).
+#[path = "0002_absorb_auth_events.rs"]
+mod absorb_auth_events;
+
+/// What a step runs.
+#[derive(Debug, Clone, Copy)]
+pub enum Body {
+    Sql(&'static str),
+    /// `0002_absorb_auth_events` (WP-77): needs the chain's hash and the
+    /// tier, so it is Rust (§8.1, §8.3).
+    AbsorbAuthEvents,
+}
+
+/// One step: SQL, or a Rust step.
 #[derive(Debug, Clone, Copy)]
 pub struct Step {
     pub version: i64,
     pub name: &'static str,
-    pub sql: &'static str,
+    pub body: Body,
 }
 
-/// §8.1's table. WP-77 appends `0002_absorb_auth_events` in W5.
-pub const STEPS: &[Step] = &[Step {
-    version: 1,
-    name: "0001_core",
-    sql: include_str!("0001_core.sql"),
-}];
+/// §8.1's table.
+pub const STEPS: &[Step] = &[
+    Step {
+        version: 1,
+        name: "0001_core",
+        body: Body::Sql(include_str!("0001_core.sql")),
+    },
+    Step {
+        version: 2,
+        name: "0002_absorb_auth_events",
+        body: Body::AbsorbAuthEvents,
+    },
+];
 
 pub fn latest() -> i64 {
     STEPS.last().map(|s| s.version).unwrap_or(0)
@@ -155,7 +174,12 @@ pub async fn migrate(conn: &mut SqliteConnection, seed: &Seed) -> anyhow::Result
     sqlx::query(CREATE_BOOKKEEPING).execute(&mut *tx).await?;
     let mut applied = 0;
     for step in STEPS.iter().filter(|s| s.version > from) {
-        sqlx::raw_sql(step.sql).execute(&mut *tx).await?;
+        match step.body {
+            Body::Sql(sql) => {
+                sqlx::raw_sql(sql).execute(&mut *tx).await?;
+            }
+            Body::AbsorbAuthEvents => absorb_auth_events::run(&mut tx, seed.tier).await?,
+        }
         if step.version == 1 {
             post_core(&mut tx, seed).await?;
         }
@@ -253,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn t0_migrates_once_and_seeds_owner_host_and_genesis() {
         let mut conn = mem().await;
-        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 1);
+        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 2);
         assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 0);
         assert_eq!(state(&mut conn).await.unwrap(), SetState::Current);
         let tier: String = sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'tier'")
@@ -320,11 +344,11 @@ mod tests {
     async fn a_newer_set_is_refused_untouched() {
         let mut conn = mem().await;
         migrate(&mut conn, &t0()).await.unwrap();
-        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 2, '0002_future', 0)")
+        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 3, '0003_future', 0)")
             .execute(&mut conn)
             .await
             .unwrap();
-        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(2));
+        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(3));
         assert!(migrate(&mut conn, &t0()).await.is_err());
     }
 

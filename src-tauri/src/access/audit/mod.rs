@@ -4,17 +4,33 @@
 //!
 //! WP-74a owns the chain core ([`chain`]: the §6.2 hash, the §6.3 append
 //! protocol and the §6.4 fail-closed verify) so W3's device events are
-//! chained from the first row. WP-77 (W5) fills the stub modules — list,
-//! export, the `auth_events` absorption and reseal — and the dispatch-frame
-//! hook ([`on_client_frame`]).
+//! chained from the first row. WP-77 (W5) fills the rest:
+//!
+//! * [`list`] — `access_audit_list`, `access_audit_verify` and the
+//!   desktop-local `access_audit_record_local` (§6.5, §6.7);
+//! * [`export`] — `access_audit_export` and `ikenga-server audit export`
+//!   (§6.8);
+//! * [`reseal`] — `access_audit_reseal` and `ikenga-server audit reseal`
+//!   (§6.4);
+//! * [`verify_boot`] — the reseal-aware full walk every start, verify and
+//!   export runs (§6.4), and `ikenga-server audit verify`;
+//! * [`absorb`] — `access/0002_absorb_auth_events` (§6.6, §8.3);
+//! * [`on_client_frame`] — `dispatch.sent` (§6.5, P-22).
 
 pub mod absorb;
 pub mod chain;
 pub mod export;
 pub mod list;
 pub mod reseal;
+pub mod verify_boot;
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
+
+use super::ws::{Frame, Route};
 
 /// The §6.1 `category` column (D-05 `AUDIT_KINDS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +140,11 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("audit.chain_broken", Category::Access, false),
     ("audit.resealed", Category::Access, false),
 ];
+
+/// `kind` as the list's `'static` spelling, or `None` outside §6.5.
+pub fn static_kind(kind: &str) -> Option<&'static str> {
+    KINDS.iter().find(|(k, ..)| *k == kind).map(|(k, ..)| *k)
+}
 
 /// `kind`'s category, or `None` for a kind outside the closed list.
 pub fn category_of(kind: &str) -> Option<Category> {
@@ -237,10 +258,123 @@ pub fn session_ref(session_id: &str) -> String {
     hex::encode(sha2::Sha256::digest(session_id.as_bytes()))[..8].to_string()
 }
 
-/// WP-77 stub: the dispatch-audit hook on a client WS frame (`dispatch.sent`,
-/// P-22). WP-74a wires the call sites in `pty_ws` / `chat_ws`; WP-77 fills
-/// the body. A no-op until then.
-pub fn on_client_frame(_ctx: &super::ctx::AccessCtx, _route: &str, _is_dispatch: bool) {}
+/// Append `ev` in its own `BEGIN IMMEDIATE` (§6.3: events that change
+/// nothing else — authentication, dispatch, desktop-local rows, `audit.*`).
+pub async fn record(
+    store: &super::AccessStore,
+    ev: &Event,
+) -> Result<chain::Head, chain::AppendError> {
+    use sqlx::Connection;
+    let mut conn = store.pool().acquire().await?;
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+    let head = store.chain().append(&mut tx, ev).await?;
+    tx.commit().await?;
+    store.chain().committed(head);
+    Ok(head)
+}
+
+/// A process-wide socket id: the P-22 coalescing key. The T0 daemon's
+/// sockets (`server::pty_ws::SocketAccess`) and the T1 broker's
+/// (`access::t1::BrokerCtx`) take one each.
+pub fn next_socket_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// P-22: one `dispatch.sent` row per (socket, 10 min).
+pub const DISPATCH_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+fn dispatch_seen() -> &'static Mutex<HashMap<u64, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<u64, i64>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// The coalescing gate: `true` when `socket` has no row in the current
+/// window, and opens one.
+fn dispatch_window_opens(socket: u64, now_ms: i64) -> bool {
+    let mut seen = dispatch_seen().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = seen.get(&socket) {
+        if now_ms - at < DISPATCH_WINDOW_MS {
+            return false;
+        }
+    }
+    if seen.len() >= 1024 {
+        seen.retain(|_, at| now_ms - *at < DISPATCH_WINDOW_MS);
+    }
+    seen.insert(socket, now_ms);
+    true
+}
+
+/// Whether a client frame is a `Prompt` (chat) or a `Write` (PTY: binary
+/// stdin, a `write` frame, or the raw-text write fallback) — §6.5's
+/// `dispatch.sent` trigger. Resize, kill and cancel are not.
+pub fn is_prompt_or_write(route: Route, frame: Frame<'_>) -> bool {
+    let kind = |t: &str| {
+        serde_json::from_str::<Value>(t)
+            .ok()
+            .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+    };
+    match (route, frame) {
+        (Route::Chat, Frame::Text(t)) => kind(t).as_deref() == Some("prompt"),
+        (Route::Pty, Frame::Binary(_)) => true,
+        (Route::Pty, Frame::Text(t)) => {
+            !matches!(kind(t).as_deref(), Some("resize") | Some("kill"))
+        }
+        _ => false,
+    }
+}
+
+/// `"pty · <id>"` / `"chat · <id>"` from a WS path (the T1 broker's view).
+pub fn frame_target(path: &str) -> String {
+    let path = path.split('?').next().unwrap_or(path);
+    let id = path.rsplit('/').next().unwrap_or_default();
+    format!("{} · {id}", Route::of(path).as_str())
+}
+
+/// The dispatch-audit hook on a delivered client WS frame (§6.5, P-22),
+/// called by the T0 daemon's PTY / chat sockets and by the T1 broker's
+/// frame hook (the store's one writer on each tier):
+///
+/// * remote credentials only — a Session or a DeviceGrant, never the T0
+///   operator (the desktop) and never a T1 child's relayed context;
+/// * the first `Prompt` / `Write` frame per socket, coalesced to one
+///   `dispatch.sent {route, target}` row per (socket, 10 min);
+/// * best-effort: appended off the frame path, in its own transaction; a
+///   failure is logged and never touches the frame. Allowed while the chain
+///   is degraded (P-35).
+pub fn on_client_frame(
+    store: Option<&super::AccessStore>,
+    ctx: &super::ctx::AccessCtx,
+    socket: u64,
+    target: &str,
+    route: Route,
+    frame: Frame<'_>,
+) {
+    use super::ctx::Via;
+    let Some(store) = store else { return };
+    if !matches!(ctx.via, Via::Session { .. } | Via::Device { .. }) {
+        return;
+    }
+    if !is_prompt_or_write(route, frame) {
+        return;
+    }
+    if !dispatch_window_opens(socket, chain::now_ms()) {
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let mut ev = Event::by("dispatch.sent", ctx)
+        .target(target)
+        .detail(serde_json::json!({ "route": route.as_str(), "target": target }));
+    ev.project_key = ctx.share.as_ref().map(|s| s.project_key.clone());
+    let store = store.clone();
+    rt.spawn(async move {
+        if let Err(e) = record(&store, &ev).await {
+            tracing::warn!("audit dispatch.sent not recorded: {e}");
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -265,6 +399,107 @@ mod tests {
         let r = session_ref("secret-session-id");
         assert_eq!(r.len(), 8);
         assert!(!"secret-session-id".contains(&r));
+    }
+
+    #[test]
+    fn prompts_and_writes_are_dispatch_resizes_are_not() {
+        assert!(is_prompt_or_write(Route::Pty, Frame::Binary(b"ls\n")));
+        assert!(is_prompt_or_write(
+            Route::Pty,
+            Frame::Text(r#"{"type":"write","data":"x"}"#)
+        ));
+        assert!(is_prompt_or_write(Route::Pty, Frame::Text("raw")));
+        assert!(!is_prompt_or_write(
+            Route::Pty,
+            Frame::Text(r#"{"type":"resize","rows":1,"cols":1}"#)
+        ));
+        assert!(!is_prompt_or_write(
+            Route::Pty,
+            Frame::Text(r#"{"type":"kill"}"#)
+        ));
+        assert!(is_prompt_or_write(
+            Route::Chat,
+            Frame::Text(r#"{"type":"prompt","prompt":"hi"}"#)
+        ));
+        assert!(!is_prompt_or_write(
+            Route::Chat,
+            Frame::Text(r#"{"type":"cancel"}"#)
+        ));
+        assert!(!is_prompt_or_write(Route::Fs, Frame::Text("{}")));
+        assert_eq!(frame_target("/ws/pty/abc?spawn=true"), "pty · abc");
+        assert_eq!(frame_target("/ws/chat/t1"), "chat · t1");
+    }
+
+    #[test]
+    fn the_dispatch_window_coalesces_per_socket() {
+        let s = next_socket_id();
+        let other = next_socket_id();
+        assert!(dispatch_window_opens(s, 1_000));
+        assert!(!dispatch_window_opens(s, 1_000 + DISPATCH_WINDOW_MS - 1));
+        assert!(dispatch_window_opens(other, 1_001));
+        assert!(dispatch_window_opens(s, 1_000 + DISPATCH_WINDOW_MS));
+    }
+
+    /// §6.5 / P-22: a remote credential's first Prompt / Write per socket
+    /// writes one `dispatch.sent`, coalesced per (socket, 10 min); the T0
+    /// operator (the desktop) writes none.
+    #[tokio::test]
+    async fn dispatch_sent_is_remote_only_and_coalesced() {
+        use crate::access::caps::Tier;
+        use crate::access::devices::tests::{operator_ctx, pair};
+        use crate::access::AccessStore;
+        let store = AccessStore::memory_t0().await;
+        let (row, _) = pair(&store, Tier::Dispatch).await;
+        let phone =
+            crate::access::audit::list::tests::device_ctx(&store, &row.device_id, Tier::Dispatch);
+        let op = operator_ctx(&store);
+        let sock = next_socket_id();
+        let write = Frame::Text(r#"{"type":"write","data":"ls\n"}"#);
+        let resize = Frame::Text(r#"{"type":"resize","rows":1,"cols":1}"#);
+        on_client_frame(Some(&store), &phone, sock, "pty · a", Route::Pty, resize);
+        on_client_frame(
+            Some(&store),
+            &op,
+            next_socket_id(),
+            "pty · a",
+            Route::Pty,
+            write,
+        );
+        on_client_frame(Some(&store), &phone, sock, "pty · a", Route::Pty, write);
+        on_client_frame(Some(&store), &phone, sock, "pty · a", Route::Pty, write);
+        let count = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE kind = 'dispatch.sent'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+        };
+        for _ in 0..100 {
+            if count().await > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(count().await, 1);
+        let (dev, via, target, cat): (Option<String>, String, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT device_id, via, target, category FROM audit_events \
+                 WHERE kind = 'dispatch.sent'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(dev.as_deref(), Some(row.device_id.as_str()));
+        assert_eq!((via.as_str(), cat.as_str()), ("device", "dispatch"));
+        assert_eq!(target.as_deref(), Some("pty · a"));
+    }
+
+    #[test]
+    fn static_kinds_come_from_the_closed_list() {
+        assert_eq!(static_kind("auth.login_ok"), Some("auth.login_ok"));
+        assert_eq!(static_kind("auth.nope"), None);
     }
 
     #[test]

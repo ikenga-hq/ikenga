@@ -44,7 +44,8 @@ export type SettingsFieldRoute =
 	| '/settings/profile'
 	| '/settings/devices'
 	| '/settings/members'
-	| '/settings/policies';
+	| '/settings/policies'
+	| '/settings/audit';
 
 export interface SettingsSectionMeta {
 	id: SettingsSectionId;
@@ -166,6 +167,14 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 				route: '/settings/devices',
 			},
 			{ field: null, label: 'Pending invites' },
+			// WP-77 (G-ACCESS §6): /settings/audit.
+			{
+				field: null,
+				label: 'Audit log',
+				help: 'who did what, export, append-only',
+				keywords: 'audit history log export',
+				route: '/settings/audit',
+			},
 			// WP-72 (D-05 local surfaces): /settings/profile.
 			{ field: null, label: 'Profile', help: 'display name, OS user', route: '/settings/profile' },
 			{
@@ -216,6 +225,7 @@ const SECTION_ALIASES: Readonly<Record<string, SettingsSectionId>> = {
 	devices: 'people',
 	members: 'people',
 	policies: 'people',
+	audit: 'people',
 };
 
 export function settingsSection(id: string | undefined): SettingsSectionMeta {

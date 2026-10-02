@@ -14,10 +14,11 @@
 //!   changes are refused with `audit_unavailable`; authentication,
 //!   dispatch, decisions and their appends continue (P-35).
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqliteConnection};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::Event;
 
@@ -32,10 +33,45 @@ pub struct Head {
 }
 
 /// Where a verification failed.
+///
+/// `class` and `fingerprint` are the break's **evidence** (review B-1): a
+/// reseal acknowledges exactly this break — the same class at the same seq
+/// over the same stored bytes — never "whatever is broken at #seq". A
+/// different break at the same seq (a re-forged row, a gap that now
+/// swallows more rows) has different evidence and is outstanding again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Broken {
     pub broken_at_seq: i64,
     pub reason: String,
+    /// `gap`, `link`, `hash`, `genesis` (joined with `+` when one row fails
+    /// several checks), `empty`, `head_missing`, `head_changed`, or
+    /// `recorded` (a break only a running process saw, §6.4).
+    pub class: String,
+    /// What the break looks like in the stored bytes (see [`row_fingerprint`]).
+    pub fingerprint: String,
+}
+
+impl Broken {
+    pub fn new(
+        broken_at_seq: i64,
+        reason: impl Into<String>,
+        class: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            broken_at_seq,
+            reason: reason.into(),
+            class: class.into(),
+            fingerprint: fingerprint.into(),
+        }
+    }
+
+    /// Whether `other` is the same break (same seq, class and evidence).
+    pub fn same_as(&self, other: &Broken) -> bool {
+        self.broken_at_seq == other.broken_at_seq
+            && self.class == other.class
+            && self.fingerprint == other.fingerprint
+    }
 }
 
 /// The outcome of a full walk.
@@ -44,6 +80,9 @@ pub struct VerifyReport {
     pub rows: i64,
     pub head: Option<Head>,
     pub broken: Option<Broken>,
+    /// `broken_at_seq`s of breaks a reseal acknowledged (the reseal-aware
+    /// walk only; the strict walk leaves it empty).
+    pub resealed: Vec<i64>,
 }
 
 impl VerifyReport {
@@ -139,7 +178,7 @@ impl StoredRow {
         h.finalize().into()
     }
 
-    fn from_sql(r: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+    pub(crate) fn from_sql(r: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             seq: r.try_get("seq")?,
             at_ms: r.try_get("at_ms")?,
@@ -170,15 +209,84 @@ pub fn genesis(store_id: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-const COLUMNS: &str = "seq, at_ms, kind, category, principal_id, device_id, via, \
+pub(crate) const COLUMNS: &str = "seq, at_ms, kind, category, principal_id, device_id, via, \
     subject_principal_id, subject_device_id, project_key, target, remote_addr, user_agent, \
     detail, prev_hash, hash";
 
-fn to32(v: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn to32(v: &[u8]) -> Option<[u8; 32]> {
     v.try_into().ok()
 }
 
-fn now_ms() -> i64 {
+/// A row's evidence (review B-1): its stored `hash` and a digest of every
+/// stored column (`prev_hash` included), so any later change to the row
+/// changes the fingerprint.
+pub(crate) fn row_fingerprint(row: &StoredRow) -> String {
+    let anchor = to32(&row.prev_hash).unwrap_or_else(|| Sha256::digest(&row.prev_hash).into());
+    format!(
+        "{}:{}",
+        hex::encode(&row.hash),
+        hex::encode(row.compute_hash(&anchor))
+    )
+}
+
+/// The break at `expected` when the next surviving row is `row` (rows
+/// deleted). Its evidence is that next row, so a gap that later swallows
+/// more rows is a different break.
+pub(crate) fn gap_break(expected: i64, row: &StoredRow) -> Broken {
+    Broken::new(
+        expected,
+        format!(
+            "seq gap: expected #{expected}, found #{} (rows deleted)",
+            row.seq
+        ),
+        "gap",
+        format!("#{}:{}", row.seq, row_fingerprint(row)),
+    )
+}
+
+/// The row-level checks of §6.4 against `prev`, the hash the row should
+/// link to: its link, its own hash (recomputed over the `prev_hash` it
+/// stores, so a bad link doesn't hide a forged body), and row 1's kind.
+/// One `Broken` per row, every failing check in its class. The strict
+/// walk and the reseal-aware walk share it, so a break recorded by one is
+/// recognised by the other.
+pub(crate) fn inspect_row(row: &StoredRow, prev: &[u8; 32]) -> Option<Broken> {
+    let mut class: Vec<&str> = Vec::new();
+    let mut reason: Vec<&str> = Vec::new();
+    if row.prev_hash.as_slice() != prev.as_slice() {
+        class.push("link");
+        reason.push("prev_hash does not link to the previous row");
+    }
+    let anchor = to32(&row.prev_hash).unwrap_or(*prev);
+    if row.hash.as_slice() != row.compute_hash(&anchor).as_slice() {
+        class.push("hash");
+        reason.push("row hash does not match its contents");
+    }
+    if row.seq == 1 && row.kind != "store.created" {
+        class.push("genesis");
+        reason.push("row 1 is not store.created");
+    }
+    (!class.is_empty()).then(|| {
+        Broken::new(
+            row.seq,
+            reason.join("; "),
+            class.join("+"),
+            row_fingerprint(row),
+        )
+    })
+}
+
+/// The break of a migrated store whose every row is gone (§6.2).
+pub(crate) fn empty_break() -> Broken {
+    Broken::new(
+        1,
+        "row 1 (store.created) is missing: the chain is empty",
+        "empty",
+        "",
+    )
+}
+
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -218,34 +326,22 @@ async fn walk(
     let mut head = after;
     for r in &rows {
         let row = StoredRow::from_sql(r)?;
-        let broken = |reason: String| VerifyReport {
+        let broken = |b: Broken| VerifyReport {
             rows: count,
             head,
-            broken: Some(Broken {
-                broken_at_seq: expected_seq,
-                reason,
-            }),
+            broken: Some(b),
+            resealed: Vec::new(),
         };
         if row.seq != expected_seq {
-            return Ok(broken(format!(
-                "seq gap: expected #{expected_seq}, found #{}",
-                row.seq
-            )));
+            return Ok(broken(gap_break(expected_seq, &row)));
         }
-        if row.prev_hash.as_slice() != prev.as_slice() {
-            return Ok(broken("prev_hash does not link to the previous row".into()));
+        if let Some(b) = inspect_row(&row, &prev) {
+            return Ok(broken(b));
         }
-        let computed = row.compute_hash(&prev);
-        if row.hash.as_slice() != computed.as_slice() {
-            return Ok(broken("row hash does not match its contents".into()));
-        }
-        if after.is_none() && row.seq == 1 && row.kind != "store.created" {
-            return Ok(broken("row 1 is not store.created".into()));
-        }
-        prev = computed;
+        prev = row.compute_hash(&prev);
         head = Some(Head {
             seq: row.seq,
-            hash: computed,
+            hash: prev,
         });
         expected_seq += 1;
         count += 1;
@@ -254,6 +350,7 @@ async fn walk(
         rows: count,
         head,
         broken: None,
+        resealed: Vec::new(),
     })
 }
 
@@ -277,10 +374,8 @@ pub async fn verify_all(
             return Ok(VerifyReport {
                 rows: 0,
                 head: None,
-                broken: Some(Broken {
-                    broken_at_seq: 1,
-                    reason: "row 1 (store.created) is missing: the chain is empty".into(),
-                }),
+                broken: Some(empty_break()),
+                resealed: Vec::new(),
             });
         }
     }
@@ -295,15 +390,35 @@ pub async fn insert_row(
     head: Option<Head>,
     ev: &Event,
 ) -> Result<Head, sqlx::Error> {
+    insert_row_at(conn, store_id, head, ev, now_ms()).await
+}
+
+/// [`insert_row`] with an explicit `at_ms` — for the §6.6 backfill, whose
+/// rows keep their original time (`at * 1000`).
+pub async fn insert_row_at(
+    conn: &mut SqliteConnection,
+    store_id: &str,
+    head: Option<Head>,
+    ev: &Event,
+    at_ms: i64,
+) -> Result<Head, sqlx::Error> {
+    // §6.5 is a closed list (review m-6): a kind outside it never reaches
+    // the chain, in release builds too.
+    let Some(category) = super::category_of(ev.kind) else {
+        return Err(sqlx::Error::Protocol(format!(
+            "audit kind `{}` is not in the closed list (G-ACCESS §6.5)",
+            ev.kind
+        )));
+    };
     let (seq, prev) = match head {
         Some(h) => (h.seq + 1, h.hash),
         None => (1, genesis(store_id)),
     };
     let row = StoredRow {
         seq,
-        at_ms: now_ms(),
+        at_ms,
         kind: ev.kind.to_string(),
-        category: ev.category().as_str().to_string(),
+        category: category.as_str().to_string(),
         principal_id: ev.principal_id.clone(),
         device_id: ev.device_id.clone(),
         via: ev.via.as_str().to_string(),
@@ -343,16 +458,178 @@ pub async fn insert_row(
     Ok(Head { seq, hash })
 }
 
+/// The degraded state, under one lock (review m-2): readers never see a
+/// transient `None` while a re-verify recomputes it.
+///
+/// Invariant (review M-3): `unrecorded` non-empty ⇒ `degraded` is `Some`.
+/// A break leaves `unrecorded` only once its `audit.chain_broken` row is
+/// seen committed in the chain, so nothing — a refused or rolled-back
+/// append, a re-verify whose walk can't see the break, a reseal of another
+/// break — can drop a break this process found.
+#[derive(Debug, Default)]
+struct State {
+    degraded: Option<Broken>,
+    /// Breaks this process found whose `audit.chain_broken` row isn't known
+    /// to be committed yet (a refused append rolled back, or the row was
+    /// written inside a caller's transaction that may still roll back).
+    unrecorded: Vec<Broken>,
+    /// The newest `audit.resealed` seq step 0 has already re-verified for.
+    reseal_checked: i64,
+}
+
 /// The process's view of one store's chain: the last head it committed and
 /// whether it is degraded (§6.3, §6.4).
 #[derive(Debug)]
 pub struct Chain {
     store_id: String,
     known: Mutex<Option<Head>>,
-    degraded: Mutex<Option<Broken>>,
-    /// A break found mid-append whose `audit.chain_broken` row could not be
-    /// written yet (its append was refused and rolled back).
-    pending_broken_row: Mutex<Option<Broken>>,
+    state: Mutex<State>,
+    /// Serialises the out-of-transaction `audit.chain_broken` writes and
+    /// the re-verify that follows one (review M-3): a walk never runs while
+    /// a recording is in flight.
+    flush_lock: tokio::sync::Mutex<()>,
+    /// Set by [`Chain::attach`]: the store's pool (to persist a break found
+    /// inside a refused append, review M-2) and this chain's own `Arc`.
+    attached: OnceLock<(SqlitePool, Weak<Chain>)>,
+}
+
+/// The process-wide chains, by `store_id` (review m-1): every appender in
+/// a process — the access arms and `operator::auth_events::record` — goes
+/// through the one [`Chain`] its [`crate::access::AccessStore`] holds.
+fn registry() -> &'static Mutex<HashMap<String, Weak<Chain>>> {
+    static CHAINS: OnceLock<Mutex<HashMap<String, Weak<Chain>>>> = OnceLock::new();
+    CHAINS.get_or_init(Default::default)
+}
+
+/// The chain this process holds for `store_id`, or a fresh view when no
+/// store is open on it here (the root CLI's `accounts …`).
+pub fn shared(store_id: &str) -> Arc<Chain> {
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = map.get(store_id).and_then(Weak::upgrade) {
+        return c;
+    }
+    map.retain(|_, w| w.strong_count() > 0);
+    Arc::new(Chain::new(store_id))
+}
+
+/// The newest `audit.resealed` row after `b.broken_at_seq`, if any: another
+/// process (the T1 root CLI) may reseal while this one is degraded.
+async fn newest_reseal_after(
+    conn: &mut SqliteConnection,
+    b: &Broken,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT max(seq) FROM audit_events WHERE seq > ? AND kind = 'audit.resealed'",
+    )
+    .bind(b.broken_at_seq)
+    .fetch_one(&mut *conn)
+    .await
+}
+
+/// Whether the chain already holds a committed (or, inside a transaction,
+/// this transaction's) `audit.chain_broken` row recording exactly `b` that
+/// is **in** the chain: it links to the stored hash of the row before it
+/// (genesis for row 1) and verifies against it (review m-11). A row that
+/// is only consistent with its own `prev_hash` — say one planted after a
+/// tail truncation with the detail this process would write — doesn't
+/// count, so the process records the break itself. A rolled-back row is
+/// not seen either, so the break stays to be recorded again.
+async fn is_recorded(
+    conn: &mut SqliteConnection,
+    store_id: &str,
+    b: &Broken,
+) -> Result<bool, sqlx::Error> {
+    let detail = broken_detail(b);
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM audit_events WHERE kind = 'audit.chain_broken' AND detail = ? \
+         ORDER BY seq"
+    ))
+    .bind(&detail)
+    .fetch_all(&mut *conn)
+    .await?;
+    for r in &rows {
+        let row = StoredRow::from_sql(r)?;
+        let pred = if row.seq == 1 {
+            Some(genesis(store_id))
+        } else {
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT hash FROM audit_events WHERE seq = ?")
+                .bind(row.seq - 1)
+                .fetch_optional(&mut *conn)
+                .await?
+                .and_then(|h| to32(&h))
+        };
+        if pred.is_some_and(|p| inspect_row(&row, &p).is_none()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The break the process's known head shows against the DB head `db`
+/// (§6.3 step 2), or `None`. A head regression is invisible to a walk from
+/// genesis (§6.4 "Tail truncation"), so this is checked before every
+/// append **and** before every re-verify adopts a verdict (review M-3).
+///
+/// * The known row is gone: `head_missing`, at the **first missing seq**
+///   (`db.seq + 1` on a tail truncation — the seq the `audit.chain_broken`
+///   row recording it takes), evidenced by the known head itself
+///   (`#seq:hash`).
+/// * The known row changed: `head_changed` at its seq.
+/// * With `forward`, the rows after it must link and hash (another
+///   writer's appends, P-33).
+async fn known_head_break(
+    conn: &mut SqliteConnection,
+    store_id: &str,
+    known: Option<Head>,
+    db: Option<Head>,
+    forward: bool,
+) -> Result<Option<Broken>, sqlx::Error> {
+    let Some(k) = known else {
+        // Nothing known yet (a fresh process, e.g. the root CLI): the boot
+        // walk is the integrity check.
+        return Ok(None);
+    };
+    if Some(k) == db {
+        return Ok(None);
+    }
+    let still_there = sqlx::query("SELECT hash FROM audit_events WHERE seq = ?")
+        .bind(k.seq)
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|r| r.get::<Vec<u8>, _>(0));
+    Ok(match still_there {
+        Some(h) if h.as_slice() == k.hash.as_slice() => {
+            if forward {
+                walk(conn, store_id, Some(k)).await?.broken
+            } else {
+                None
+            }
+        }
+        Some(h) => Some(Broken::new(
+            k.seq,
+            "a row this process wrote has changed",
+            "head_changed",
+            format!("{}:{}", hex::encode(k.hash), hex::encode(h)),
+        )),
+        None => {
+            let first_missing = db.map_or(1, |d| d.seq + 1).min(k.seq);
+            Some(Broken::new(
+                first_missing,
+                format!(
+                    "rows #{first_missing}..#{} this process wrote are missing (head regression)",
+                    k.seq
+                ),
+                "head_missing",
+                format!("#{}:{}", k.seq, hex::encode(k.hash)),
+            ))
+        }
+    })
+}
+
+/// Whether `class` is a break only a running process can see (its known
+/// head), never the walk from genesis.
+pub(crate) fn is_head_class(class: &str) -> bool {
+    matches!(class, "head_missing" | "head_changed")
 }
 
 impl Chain {
@@ -360,87 +637,240 @@ impl Chain {
         Self {
             store_id: store_id.into(),
             known: Mutex::new(None),
-            degraded: Mutex::new(None),
-            pending_broken_row: Mutex::new(None),
+            state: Mutex::new(State::default()),
+            flush_lock: tokio::sync::Mutex::new(()),
+            attached: OnceLock::new(),
         }
+    }
+
+    /// Bind this chain to its store's pool and make it the process's chain
+    /// for its `store_id` ([`shared`]). `AccessStore` calls it once.
+    pub fn attach(self: &Arc<Self>, pool: SqlitePool) {
+        let _ = self.attached.set((pool, Arc::downgrade(self)));
+        registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.store_id.clone(), Arc::downgrade(self));
     }
 
     pub fn store_id(&self) -> &str {
         &self.store_id
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn degraded(&self) -> Option<Broken> {
-        self.degraded
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.state().degraded.clone()
     }
 
     pub fn known_head(&self) -> Option<Head> {
         *self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set_degraded(&self, b: Broken) {
-        tracing::error!(
-            "audit chain broken at #{}: {} — access changes are paused (G-ACCESS §6.4)",
-            b.broken_at_seq,
-            b.reason
-        );
-        let mut d = self.degraded.lock().unwrap_or_else(|e| e.into_inner());
-        if d.is_none() {
-            *d = Some(b.clone());
-            *self
-                .pending_broken_row
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(b);
+    fn set_known(&self, head: Option<Head>) {
+        *self.known.lock().unwrap_or_else(|e| e.into_inner()) = head;
+    }
+
+    /// A break this process found: enter `degraded` (the first break stays
+    /// the reported one) and queue its `audit.chain_broken` row unless the
+    /// chain already holds one. A head break re-bases the known head on the
+    /// DB head `db` — the break now carries the old head as its evidence —
+    /// so it is found once, and a further regression after it is a new
+    /// break.
+    async fn note_break(
+        &self,
+        conn: &mut SqliteConnection,
+        b: Broken,
+        db: Option<Head>,
+    ) -> Result<(), sqlx::Error> {
+        let recorded = is_recorded(conn, &self.store_id, &b).await?;
+        if !recorded {
+            tracing::error!(
+                "audit chain broken at #{}: {} — access changes are paused (G-ACCESS §6.4)",
+                b.broken_at_seq,
+                b.reason
+            );
+        }
+        if is_head_class(&b.class) {
+            self.set_known(db);
+        }
+        let mut st = self.state();
+        if st.degraded.is_none() {
+            st.degraded = Some(b.clone());
+        }
+        if !recorded && !st.unrecorded.iter().any(|u| u.same_as(&b)) {
+            st.unrecorded.push(b);
+        }
+        Ok(())
+    }
+
+    /// Replace the state with a walk's verdict in one step (review m-2),
+    /// never dropping a break the walk can't see yet (review M-3): one
+    /// still unrecorded keeps the store `degraded`. Adopts the walk's head
+    /// only when nothing is outstanding.
+    fn adopt(&self, verdict: &super::verify_boot::Verdict) {
+        let outstanding = verdict.outstanding.as_ref();
+        let clean = {
+            let mut st = self.state();
+            if let Some(b) = outstanding {
+                if !verdict.recorded && !st.unrecorded.iter().any(|u| u.same_as(b)) {
+                    st.unrecorded.push(b.clone());
+                }
+            }
+            st.degraded = outstanding
+                .cloned()
+                .or_else(|| st.unrecorded.first().cloned());
+            st.degraded.is_none()
+        };
+        if let Some(b) = outstanding {
+            tracing::error!(
+                "audit chain broken at #{}{}: {} — access changes are paused (G-ACCESS §6.4)",
+                b.broken_at_seq,
+                if verdict.recorded {
+                    " (recorded, not resealed)"
+                } else {
+                    ""
+                },
+                b.reason
+            );
+        }
+        if clean {
+            self.set_known(verdict.head);
         }
     }
 
     /// After the caller's `COMMIT`: remember `head` as ours (§6.3 step 4).
     /// Forgetting to call it is harmless — the next append verifies forward.
+    /// Never moves the known head backwards.
     pub fn committed(&self, head: Head) {
-        *self.known.lock().unwrap_or_else(|e| e.into_inner()) = Some(head);
+        let mut k = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        if k.is_none_or(|k| head.seq > k.seq) {
+            *k = Some(head);
+        }
     }
 
-    /// Clear `degraded` (reseal, WP-77) — the break stays in the chain.
-    pub fn clear_degraded(&self) {
-        *self.degraded.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
-    /// §6.4 at boot (and on `access_audit_verify`): walk everything. On a
-    /// failure, enter `degraded` and append `audit.chain_broken` after the DB
-    /// head in its own transaction.
+    /// §6.4 at boot, on `access_audit_verify`, before an export and after a
+    /// reseal: the reseal-aware full walk ([`super::verify_boot::verify`]).
+    ///
+    /// * A break this process found but could not record yet is written
+    ///   first, so the walk sees it.
+    /// * The process's known head is checked against the DB head (review
+    ///   M-3): a head regression is invisible to the walk, so it is
+    ///   recorded before the walk rather than lost to a clean verdict.
+    /// * An outstanding break enters `degraded`; its `audit.chain_broken`
+    ///   row is appended after the DB head in its own transaction unless
+    ///   the chain already records it (a restart doesn't repeat the row).
+    /// * Nothing outstanding and nothing unrecorded clears `degraded` and
+    ///   adopts the head.
+    ///
+    /// `conn` must not be inside a transaction.
     pub async fn verify_boot(&self, conn: &mut SqliteConnection) -> anyhow::Result<VerifyReport> {
-        let report = verify_all(conn, &self.store_id).await?;
-        match &report.broken {
-            None => {
-                *self.known.lock().unwrap_or_else(|e| e.into_inner()) = report.head;
-            }
-            Some(b) => {
-                self.set_degraded(b.clone());
-                self.flush_broken_row(conn).await?;
+        let _flushing = self.flush_lock.lock().await;
+        self.flush_locked(conn).await?;
+        let db = db_head(conn).await?;
+        if let Some(b) =
+            known_head_break(conn, &self.store_id, self.known_head(), db, false).await?
+        {
+            self.note_break(conn, b, db).await?;
+            self.flush_locked(conn).await?;
+        }
+        let verdict = super::verify_boot::verify(conn, &self.store_id).await?;
+        self.adopt(&verdict);
+        self.flush_locked(conn).await?;
+        Ok(verdict.report())
+    }
+
+    /// Write every unrecorded `audit.chain_broken` row the chain doesn't
+    /// already hold, chained to the DB head, in one `BEGIN IMMEDIATE`, and
+    /// forget them once committed. On failure they stay unrecorded.
+    /// Callers hold `flush_lock`.
+    async fn flush_locked(&self, conn: &mut SqliteConnection) -> anyhow::Result<()> {
+        let pending = self.state().unrecorded.clone();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        use sqlx::Connection;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let mut head = db_head(&mut tx).await?;
+        let mut wrote = None;
+        for b in &pending {
+            if !is_recorded(&mut tx, &self.store_id, b).await? {
+                let h = insert_row(&mut tx, &self.store_id, head, &broken_event(b)).await?;
+                head = Some(h);
+                wrote = Some(h);
             }
         }
-        Ok(report)
+        tx.commit().await?;
+        if let Some(h) = wrote {
+            self.committed(h);
+        }
+        self.state()
+            .unrecorded
+            .retain(|u| !pending.iter().any(|p| p.same_as(u)));
+        Ok(())
     }
 
-    /// Write a pending `audit.chain_broken` row, chained to the DB head.
-    async fn flush_broken_row(&self, conn: &mut SqliteConnection) -> anyhow::Result<()> {
-        let pending = self
-            .pending_broken_row
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(b) = pending {
-            use sqlx::Connection;
-            let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-            let head = db_head(&mut tx).await?;
-            let ev = Event::new("audit.chain_broken", super::AuditVia::System).detail(
-                serde_json::json!({ "broken_at_seq": b.broken_at_seq, "reason": b.reason }),
+    /// Review M-2: a break found by an append that is then refused must
+    /// not live only in memory (the T0 daemon idle-exits; a crash or a
+    /// broker restart loses it, and a head regression is invisible to the
+    /// next boot's walk). Persist it on a fresh pool connection once the
+    /// caller's transaction is gone (`busy_timeout` covers the wait).
+    fn spawn_flush(&self) {
+        let Some((pool, me)) = self.attached.get() else {
+            return;
+        };
+        let (Some(me), Ok(rt)) = (me.upgrade(), tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let pool = pool.clone();
+        rt.spawn(async move {
+            let res = async {
+                // Connection first, then the lock — the order every
+                // `verify_boot` caller takes them in (a one-connection pool
+                // would deadlock otherwise).
+                let mut conn = pool.acquire().await?;
+                let _flushing = me.flush_lock.lock().await;
+                me.flush_locked(&mut conn).await
+            }
+            .await;
+            if let Err(e) = res {
+                tracing::warn!("audit.chain_broken not recorded yet (stays pending): {e:#}");
+            }
+        });
+    }
+
+    /// Step 0 while degraded: has another process (the T1 root CLI)
+    /// resealed since? Re-run the reseal-aware walk once per new
+    /// `audit.resealed` row and adopt its verdict — after checking the
+    /// known head, which the walk can't (review M-3). A break still
+    /// unrecorded keeps the store degraded ([`adopt`](Self::adopt)).
+    async fn recheck_after_reseal(
+        &self,
+        conn: &mut SqliteConnection,
+        b: &Broken,
+    ) -> Result<(), sqlx::Error> {
+        let Some(at) = newest_reseal_after(conn, b).await? else {
+            return Ok(());
+        };
+        if at <= self.state().reseal_checked {
+            return Ok(());
+        }
+        let db = db_head(conn).await?;
+        if let Some(hb) =
+            known_head_break(conn, &self.store_id, self.known_head(), db, false).await?
+        {
+            self.note_break(conn, hb, db).await?;
+        }
+        let verdict = super::verify_boot::verify(conn, &self.store_id).await?;
+        self.state().reseal_checked = at;
+        self.adopt(&verdict);
+        if self.degraded().is_none() {
+            tracing::info!(
+                "audit chain: the break at #{} was resealed at #{at}; access changes resume",
+                b.broken_at_seq
             );
-            let new_head = insert_row(&mut tx, &self.store_id, head, &ev).await?;
-            tx.commit().await?;
-            self.committed(new_head);
         }
         Ok(())
     }
@@ -453,75 +883,70 @@ impl Chain {
         conn: &mut SqliteConnection,
         ev: &Event,
     ) -> Result<Head, AppendError> {
+        // 0. Degraded: resealed by another process since?
+        if let Some(b) = self.degraded() {
+            self.recheck_after_reseal(conn, &b).await?;
+        }
         // 1. The DB head.
         let db = db_head(conn).await?;
-        // 2. Against the head this process holds.
-        let known = self.known_head();
-        if self.degraded().is_none() && known != db {
-            match known {
-                // Nothing known yet (a fresh process, e.g. the root CLI):
-                // adopt the DB head; the boot walk is the integrity check.
-                None => {}
-                Some(k) => {
-                    let still_there = sqlx::query("SELECT hash FROM audit_events WHERE seq = ?")
-                        .bind(k.seq)
-                        .fetch_optional(&mut *conn)
-                        .await?
-                        .map(|r| r.get::<Vec<u8>, _>(0));
-                    let forward_ok = match still_there {
-                        Some(h) if h.as_slice() == k.hash.as_slice() => {
-                            let report = walk(conn, &self.store_id, Some(k)).await?;
-                            match report.broken {
-                                None => true,
-                                Some(b) => {
-                                    self.set_degraded(b);
-                                    false
-                                }
-                            }
-                        }
-                        Some(_) => {
-                            self.set_degraded(Broken {
-                                broken_at_seq: k.seq,
-                                reason: "a row this process wrote has changed".into(),
-                            });
-                            false
-                        }
-                        None => {
-                            self.set_degraded(Broken {
-                                broken_at_seq: k.seq,
-                                reason: "a row this process wrote is missing (head regression)"
-                                    .into(),
-                            });
-                            false
-                        }
-                    };
-                    let _ = forward_ok;
-                }
-            }
+        // 2. Against the head this process holds — degraded or not, so a
+        //    regression while degraded is a break of its own (review M-3).
+        if let Some(b) = known_head_break(conn, &self.store_id, self.known_head(), db, true).await?
+        {
+            self.note_break(conn, b, db).await?;
         }
         if let Some(b) = self.degraded() {
             if ev.refused_when_degraded() {
+                // The caller rolls back; record the break on its own.
+                if !self.state().unrecorded.is_empty() {
+                    self.spawn_flush();
+                }
                 return Err(AppendError::AuditUnavailable(b));
             }
             // Degraded but allowed: chain to the DB head (the break stays
-            // visible), writing the pending chain_broken row first.
+            // visible), writing the unrecorded chain_broken rows first. They
+            // stay unrecorded until seen committed — the caller may still
+            // roll back — so a flush confirms them once the caller's
+            // transaction is gone (or writes them again after a rollback).
             let mut head = db;
-            let pending = self
-                .pending_broken_row
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(pb) = pending {
-                let broken_ev = Event::new("audit.chain_broken", super::AuditVia::System).detail(
-                    serde_json::json!({ "broken_at_seq": pb.broken_at_seq, "reason": pb.reason }),
-                );
-                head = Some(insert_row(conn, &self.store_id, head, &broken_ev).await?);
+            let pending = self.state().unrecorded.clone();
+            let mut wrote = false;
+            for pb in &pending {
+                if !is_recorded(conn, &self.store_id, pb).await? {
+                    head = Some(insert_row(conn, &self.store_id, head, &broken_event(pb)).await?);
+                    wrote = true;
+                }
             }
-            return Ok(insert_row(conn, &self.store_id, head, ev).await?);
+            let new_head = insert_row(conn, &self.store_id, head, ev).await?;
+            if wrote {
+                self.spawn_flush();
+            }
+            return Ok(new_head);
         }
         // 3. Insert chained to the (verified) DB head.
         Ok(insert_row(conn, &self.store_id, db, ev).await?)
     }
+}
+
+fn broken_fields(b: &Broken) -> serde_json::Value {
+    serde_json::json!({
+        "broken_at_seq": b.broken_at_seq,
+        "reason": b.reason,
+        "class": b.class,
+        "fingerprint": b.fingerprint,
+    })
+}
+
+/// `audit.chain_broken {broken_at_seq, reason, class, fingerprint}` (§6.4;
+/// the evidence fields bind a later reseal to this break, review B-1).
+pub(crate) fn broken_event(b: &Broken) -> Event {
+    Event::new("audit.chain_broken", super::AuditVia::System).detail(broken_fields(b))
+}
+
+/// The `detail` column [`broken_event`] stores for `b` (as `insert_row`
+/// serialises it), to find a row that already records `b`.
+fn broken_detail(b: &Broken) -> String {
+    serde_json::to_string(&broken_event(b).detail).unwrap_or_else(|_| "{}".into())
 }
 
 #[cfg(test)]
@@ -747,6 +1172,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(last, "audit.chain_broken");
+    }
+
+    /// Review m-6: the closed kind list (§6.5) holds in release builds too —
+    /// a kind outside it never reaches the chain.
+    #[tokio::test]
+    async fn a_kind_outside_the_closed_list_is_refused() {
+        let mut conn = store().await;
+        let mut ev = Event::new("store.created", AuditVia::System);
+        ev.kind = "made.up";
+        let err = insert_row(&mut conn, "s", None, &ev).await.unwrap_err();
+        assert!(err.to_string().contains("closed list"), "{err}");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Review B-1: the strict walk and the reseal-aware walk describe a
+    /// break identically, so a break the runtime recorded is recognised at
+    /// boot (no second `audit.chain_broken` row).
+    #[tokio::test]
+    async fn both_walks_agree_on_a_breaks_evidence() {
+        let mut conn = store().await;
+        let chain = Chain::new("s");
+        seed(&mut conn, &chain, 4).await;
+        drop_triggers(&mut conn).await;
+        sqlx::query(
+            "UPDATE audit_events SET target = 'x', prev_hash = randomblob(32) WHERE seq = 3",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        let strict = verify_all(&mut conn, "s").await.unwrap().broken.unwrap();
+        let full = super::super::verify_boot::verify(&mut conn, "s")
+            .await
+            .unwrap()
+            .outstanding
+            .unwrap();
+        assert_eq!(strict, full);
+        assert_eq!(strict.class, "link+hash");
     }
 
     #[test]
