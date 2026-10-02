@@ -52,6 +52,7 @@ import {
 	type SecretLayer,
 	scopeDisabledReason,
 	secretLayer,
+	settledLayerNames,
 	type VaultAxis,
 	vaultAxis,
 } from '@/shell/secrets/principal-axis';
@@ -129,14 +130,12 @@ function SecretsPage() {
 		queryFn: () => secretsDefaultNames(),
 		enabled: layered && vaultUnlocked,
 	});
+	const names = settledLayerNames(layered ? indexQuery.data : undefined, {
+		data: layered ? defaultsQuery.data : undefined,
+		isError: defaultsQuery.isError,
+	});
 	const layerOf = (key: string): SecretLayer =>
-		secretLayer(
-			axis,
-			tab,
-			key,
-			layered ? indexQuery.data : undefined,
-			layered ? defaultsQuery.data : undefined
-		);
+		secretLayer(axis, tab, key, names.indexNames, names.defaultNames);
 
 	const [editKey, setEditKey] = useState<string | null>(null);
 	const [editLayer, setEditLayer] = useState<SecretLayer>('own');

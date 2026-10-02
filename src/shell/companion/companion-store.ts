@@ -201,8 +201,6 @@ export const useCompanionStore = create<CompanionStoreState>()(
 				if (!card || card.status !== 'undoable' || !card.decision) return;
 				patchCard(id, { status: 'resolved', undoUntil: undefined });
 				try {
-					let ruleFile: string | undefined;
-					if (card.decision === 'always') ruleFile = await writeProjectAllowRule(card.toolName);
 					// G-ACCESS §5.5 (review WP75-R10): through `permission_decide`
 					// when the ask's row is recorded, else the checked hooks
 					// route — a refusal (e.g. `routing_refused`, §5.1) is shown,
@@ -212,10 +210,15 @@ export const useCompanionStore = create<CompanionStoreState>()(
 						card.decision === 'deny' ? 'denied' : 'approved'
 					);
 					if (refused) {
-						patchCard(id, { decision: undefined, refused: true, error: refused, ruleFile });
+						patchCard(id, { decision: undefined, refused: true, error: refused });
 						return;
 					}
-					if (ruleFile) patchCard(id, { ruleFile });
+					// "Always": the project allow rule is written only once the
+					// decision was taken (review WP78a-R1) — a refused decision
+					// must not leave a rule that answers every later ask (§5.1).
+					if (card.decision === 'always') {
+						patchCard(id, { ruleFile: await writeProjectAllowRule(card.toolName) });
+					}
 				} catch (e) {
 					patchCard(id, { error: e instanceof Error ? e.message : String(e) });
 				}

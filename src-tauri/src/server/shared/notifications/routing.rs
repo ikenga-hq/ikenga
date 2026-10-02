@@ -1738,8 +1738,8 @@ static DAEMON: OnceLock<DaemonRouting> = OnceLock::new();
 /// Installed once by the T0 daemon's access boot (`access::DaemonAccess::
 /// boot_t0`), with `run_server`'s own `pa_db` (the `<data-dir>/ikenga.db`
 /// the daemon serves) — never a second `PaDb` on the same file.
-pub fn install_daemon(store: AccessStore, db: Arc<crate::db::PaDb>) {
-    let _ = DAEMON.set(DaemonRouting::new(store, db));
+pub fn install_daemon(rt: DaemonRouting) {
+    let _ = DAEMON.set(rt);
 }
 
 pub fn daemon() -> Option<&'static DaemonRouting> {

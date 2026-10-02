@@ -428,20 +428,34 @@ pub async fn post_hook_decision(
     // preference (§5.1; reviews WP75-R10, WP75-RV1). The host's routing is
     // read from the AppHandle either way, so this fails closed. This path
     // writes no `decided_*` and no audit — there is no row to attribute.
-    if let Some(e) = no_row_refusal(crate::notifications::host_routing(&app).await) {
-        return (
+    let host = crate::notifications::host_side(&app);
+    match answer_without_row(&host, || resolve_held(&app, &decision.request_id, approved)).await {
+        Ok(was_gated) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "recorded": true,
+                "gated": was_gated,
+            })),
+        ),
+        Err(e) => (
             e.code.status(),
             Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
-        );
+        ),
     }
-    let was_gated = resolve_held(&app, &decision.request_id, approved);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "recorded": true,
-            "gated": was_gated,
-        })),
-    )
+}
+
+/// The no-row fallback (review WP75-RV1): reads the host's routing from
+/// `host` — never from the installed runtime (`routing::local()`), which is
+/// absent without a `PaDb` — and answers the hold through `answer` only
+/// when it admits this device. `Ok(gated)`, or the refusal.
+async fn answer_without_row(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    answer: impl FnOnce() -> bool,
+) -> Result<bool, crate::access::AccessError> {
+    if let Some(e) = no_row_refusal(host.host_routing().await) {
+        return Err(e);
+    }
+    Ok(answer())
 }
 
 /// Whether the no-row fallback must refuse: the host may not answer its
@@ -558,6 +572,62 @@ mod tests {
             no_row_refusal(Err(unread)).unwrap().code,
             Code::RoutingRefused
         );
+    }
+
+    /// Review WP78a-R4: the no-row branch itself, with no routing runtime
+    /// installed (`routing::local()` is None — no `PaDb`): a routed-away or
+    /// unreadable host refuses and never touches the hold; an admitted one
+    /// answers it.
+    #[tokio::test]
+    async fn the_no_row_branch_refuses_without_a_routing_runtime() {
+        use crate::access::{AccessError, Code};
+        use crate::server::shared::notifications::routing::{self, HostRouting, HostSide};
+        use futures_util::future::BoxFuture;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Fake(Result<HostRouting, AccessError>);
+        impl HostSide for Fake {
+            fn host_routing(&self) -> BoxFuture<'_, Result<HostRouting, AccessError>> {
+                let r = self.0.clone();
+                Box::pin(async move { r })
+            }
+            fn audit_local(
+                &self,
+                _kind: &'static str,
+                _target: String,
+                _detail: serde_json::Value,
+            ) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        assert!(
+            routing::local().is_none(),
+            "no routing runtime in unit tests"
+        );
+        let touched = AtomicBool::new(false);
+        let answer = || {
+            touched.store(true, Ordering::SeqCst);
+            true
+        };
+        let away = Fake(Ok(HostRouting::default()));
+        let e = answer_without_row(&away, answer).await.unwrap_err();
+        assert_eq!(e.code, Code::RoutingRefused);
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "a refused hold is not answered"
+        );
+
+        let unread = Fake(Err(AccessError::new(Code::RoutingRefused, "unreadable")));
+        assert!(answer_without_row(&unread, answer).await.is_err());
+        assert!(!touched.load(Ordering::SeqCst));
+
+        let admit = Fake(Ok(HostRouting {
+            routing_ok: true,
+            ..Default::default()
+        }));
+        assert!(answer_without_row(&admit, answer).await.unwrap());
+        assert!(touched.load(Ordering::SeqCst));
     }
 
     #[test]

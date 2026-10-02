@@ -303,6 +303,30 @@ describe('C3 — permission card resolve + undo (§5.6)', () => {
 		});
 	});
 
+	// Review WP78a-R1: a refused "Always" leaves no project allow rule behind.
+	it('a refused "Always for this project" writes no rule', async () => {
+		useShellStore.setState({
+			activeProject: { id: 'p1', root_path: '/work/royalti-co', extra_roots: [] },
+		});
+		fsRead.mockResolvedValue({ bytes: [], mime: 'application/json' });
+		iykeFetch.mockImplementationOnce(async () => ({
+			ok: false,
+			status: 403,
+			json: async () => ({
+				recorded: false,
+				error: 'routing_refused: permission asks are answered on another device',
+			}),
+		}));
+		const st = useCompanionStore.getState;
+		st().receivePermission(req('r1'));
+		st().resolvePermission('r1', 'always');
+		await vi.advanceTimersByTimeAsync(PERMISSION_UNDO_MS);
+		expect(iykeFetch).toHaveBeenCalledTimes(1);
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(st().permissions[0]).toMatchObject({ refused: true, decision: undefined });
+		expect(st().permissions[0].ruleFile).toBeUndefined();
+	});
+
 	it('a recorded ask goes through permission_decide; its refusal is shown', async () => {
 		notificationsList.mockResolvedValue([
 			{ id: 42, dedupeKey: 'permission:hook:r1', resolvedAt: null },

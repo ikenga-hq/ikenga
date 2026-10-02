@@ -11,6 +11,7 @@ import {
 	SHARED_REASON,
 	scopeDisabledReason,
 	secretLayer,
+	settledLayerNames,
 	vaultAxis,
 } from './principal-axis';
 
@@ -70,6 +71,19 @@ describe('principal axis', () => {
 		expect(secretLayer('principal', 'project', 'X', index)).toBe('own');
 		expect(secretLayer('operator', 'workspace', 'OPENAI_KEY', index)).toBe('default');
 		expect(secretLayer('desktop', 'workspace', 'ANY', undefined)).toBe('own');
+	});
+
+	it('rows read as default until the default list settles (WP78a-R6)', () => {
+		const index = ['MINE', 'workspace::MINE'];
+		const layer = (d: { data?: readonly string[]; isError: boolean }) => {
+			const n = settledLayerNames(index, d);
+			return secretLayer('principal', 'workspace', 'MINE', n.indexNames, n.defaultNames);
+		};
+		// Loading: never a flash of "override" (nor of "own").
+		expect(layer({ isError: false })).toBe('default');
+		expect(layer({ data: [], isError: false })).toBe('own');
+		// Failed (an older daemon): the index's bare names decide.
+		expect(layer({ isError: true })).toBe('override');
 	});
 
 	it('a bare key in your own store is not "your override" (WP76-RV1)', () => {

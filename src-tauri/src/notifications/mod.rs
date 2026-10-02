@@ -63,7 +63,7 @@ pub fn spawn_event_forwarder(app: tauri::AppHandle) {
     });
 }
 
-pub use routing_desktop::{host_routing, record_permission, relay_resolved};
+pub use routing_desktop::{host_side, record_permission, relay_resolved};
 
 /// The desktop half of permission routing (G-ACCESS §5.5, WP-75; DEC-83):
 ///
@@ -282,12 +282,12 @@ mod routing_desktop {
         tauri::async_runtime::spawn(async move { relay_loop(app).await });
     }
 
-    /// `host_routing` for the host device (§5.1) without the installed
-    /// runtime: the same fail-closed read [`Host`] gives `permission_decide`.
-    /// What `/iyke/hooks/decision`'s no-row fallback consults even when
-    /// routing never installed (no `PaDb`; review WP75-RV1).
-    pub async fn host_routing(app: &AppHandle) -> Result<HostRouting, AccessError> {
-        Host { app: app.clone() }.host_routing().await
+    /// The host side (§5.1) without the installed runtime: the same
+    /// fail-closed routing read [`Host`] gives `permission_decide`. What
+    /// `/iyke/hooks/decision`'s no-row fallback consults even when routing
+    /// never installed (no `PaDb`; review WP75-RV1).
+    pub fn host_side(app: &AppHandle) -> impl HostSide {
+        Host { app: app.clone() }
     }
 
     /// Review WP75-RV2: close the hook / ACP asks the last desktop run left

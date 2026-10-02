@@ -435,7 +435,14 @@ pub fn viewed_target(share: &super::ShareCtx, cmd: &str, args: &Value) -> Option
             (requested == artifact || requested.ends_with(&format!("/{artifact}")))
                 .then_some(artifact)
         }
-        None if share.role == Some(super::Role::Guest) => Some(path.to_string()),
+        // Named (and coalesced) by the normalized path, so `/p//a.md` and
+        // `/p/./a.md` are the one (member, path, hour) window (review
+        // WP78a-R2).
+        None if share.role == Some(super::Role::Guest) => Some(if path.starts_with(['/', '\\']) {
+            format!("/{requested}")
+        } else {
+            requested
+        }),
         None => None,
     }
 }
@@ -669,6 +676,18 @@ mod tests {
             viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read("/p/a.md")).as_deref(),
             Some("/p/a.md")
         );
+        // Review WP78a-R2: every spelling of one file is the one view.
+        for spelling in ["/p//a.md", "/p/./a.md", "//p/a.md", "\\p\\a.md"] {
+            assert_eq!(
+                viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read(spelling)).as_deref(),
+                Some("/p/a.md"),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read("p/a.md")).as_deref(),
+            Some("p/a.md")
+        );
         let operator = share_ctx(Role::Operator, None);
         assert_eq!(
             viewed_target(
@@ -729,5 +748,36 @@ mod tests {
         assert!(view_window_opens(key.clone(), 1_000));
         assert!(!view_window_opens(key.clone(), 1_000 + VIEW_WINDOW_MS - 1));
         assert!(view_window_opens(key, 1_000 + VIEW_WINDOW_MS));
+    }
+
+    /// Review WP78a-R2: a project-scope Guest reading one file under two
+    /// spellings opens one (member, path, hour) window — one row.
+    #[tokio::test]
+    async fn guest_views_coalesce_by_normalized_path() {
+        use crate::access::{AccessStore, Role};
+        use serde_json::json;
+        let store = AccessStore::memory_t0().await;
+        let ctx = share_ctx(Role::Guest, None);
+        for p in ["/proj/a.md", "/proj//a.md", "/proj/./a.md"] {
+            on_share_read(Some(&store), &ctx, "fs_read", &json!({ "path": p }));
+        }
+        let rows = || async {
+            sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT target FROM audit_events WHERE kind = 'share.artifact_viewed'",
+            )
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+        };
+        for _ in 0..100 {
+            if !rows().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = rows().await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0.as_deref(), Some("/proj/a.md"));
     }
 }

@@ -31,6 +31,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import type { DetectedAgent, SeatView } from '@/lib/tauri-cmd';
 import { listen } from '@/lib/transport';
 import { COMPANION_FOCUS_EVENT } from '@/shell/companion-focus';
+import { hostDecideBlock, refreshHostDecideBlock } from '@/shell/notifications/actions';
 import { CostHud } from '@/terminal/cost-hud';
 import { MissionControl } from '@/terminal/mission-control';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
@@ -507,6 +508,8 @@ export function PermissionCards({
 		if (!id) return;
 		const card = cards.find((c) => c.id === id);
 		if (!card || card.status !== 'pending') return;
+		// Routed to another device (§5.1): the card offers no decision.
+		if (hostDecideBlock()) return;
 		resolve(id, decision);
 	};
 	useCommands({
@@ -548,6 +551,20 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 	const resolve = useCompanionStore((s) => s.resolvePermission);
 
 	const title = card.kind === 'tool_use' ? `Tool use: ${card.toolName}` : card.toolName;
+	// §5.1 (review WP78a-R1): an ask routed to another device offers no
+	// Allow / Always / Deny here — the reason instead, as the popover does.
+	const pending = card.status === 'pending';
+	const [block, setBlock] = useState<string | null>(() => hostDecideBlock());
+	useEffect(() => {
+		if (!pending) return;
+		let live = true;
+		void refreshHostDecideBlock().then((b) => {
+			if (live) setBlock(b);
+		});
+		return () => {
+			live = false;
+		};
+	}, [pending]);
 	return (
 		<fieldset
 			// biome-ignore lint/a11y/noNoninteractiveTabindex: the card is the focus target for A / D (spec §2)
@@ -589,7 +606,17 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 					{JSON.stringify(card.toolInput, null, 2)}
 				</pre>
 			)}
-			{card.status === 'pending' && (
+			{pending && block && (
+				<div
+					role="status"
+					data-state="routed-away"
+					className="mt-2 text-[11px]"
+					style={{ color: 'var(--fg-muted)' }}
+				>
+					{block}
+				</div>
+			)}
+			{pending && !block && (
 				<div className="mt-3 flex flex-wrap gap-2">
 					<CardButton tone="primary" onClick={() => resolve(card.id, 'allow')}>
 						Allow once

@@ -1296,17 +1296,23 @@ impl Provisioner {
         username: &str,
         err: &ProvisionError,
     ) {
+        let mut detail = serde_json::json!({
+            "via": self.actor.as_str(),
+            "backend": self.backend.name(),
+            "error": err.to_string(),
+        });
+        // §4.4 / P-27: the cap refusal carries a structured reason (review
+        // WP78a-R7), not only the free-text error.
+        if matches!(err, ProvisionError::MaxAccounts(_)) {
+            detail["reason"] = serde_json::Value::from("max_accounts");
+        }
         let recorded = async {
             let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
             auth_events::record(
                 &mut tx,
                 AuthEvent::new(AuthEventKind::ProvisionFailed)
                     .username_tried(username)
-                    .detail(serde_json::json!({
-                        "via": self.actor.as_str(),
-                        "backend": self.backend.name(),
-                        "error": err.to_string(),
-                    })),
+                    .detail(detail),
             )
             .await?;
             tx.commit().await
@@ -2524,6 +2530,14 @@ mod tests {
         assert!(matches!(e, ProvisionError::MaxAccounts(1)), "{e}");
         assert!(e.to_string().contains("reason=max_accounts"), "{e}");
         assert_eq!(failed(f.pool.clone()).await, 1);
+        // Review WP78a-R7: `provision_failed {reason:"max_accounts"}`.
+        let detail: String =
+            sqlx::query_scalar("SELECT detail FROM auth_events WHERE kind = 'provision_failed'")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["reason"], "max_accounts", "{detail}");
 
         // The CLI (no flag): the broker's pinned cap applies.
         Provisioner::pin_max_accounts(&f.pool, Some(1))

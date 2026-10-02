@@ -61,12 +61,15 @@ function openTerminalPane(sessionId: string): void {
 	addTab(focusedId, { kind: 'terminal', sessionId });
 }
 
+/** What a decision that reached no live ask reads as (review WP78a-R5). */
+export const ASK_ALREADY_OVER = 'This ask is already over';
+
 /**
  * The pre-WP-75 path for the held hooks gate — the fallback when the decide
  * core can't take the row (an older backend, or the row not recorded yet).
  * Checked (review WP75-R10): resolves to `null` when the gate took the
- * decision, else the refusal message, so a refused decision never looks
- * answered. A `routing_refused` reply re-reads the host's routing and names
+ * decision, else the refusal message (or {@link ASK_ALREADY_OVER} when no
+ * held gate took it), so a refused decision never looks answered. A `routing_refused` reply re-reads the host's routing and names
  * where the ask is answered (§5.7).
  */
 export async function postHookDecision(
@@ -83,7 +86,18 @@ export async function postHookDecision(
 	} catch (e) {
 		return `Couldn't reach the permission gate: ${e instanceof Error ? e.message : String(e)}`;
 	}
-	if (res.ok) return null;
+	if (res.ok) {
+		// A 2xx with `gated: false` took nothing: the hold was already over
+		// (answered, timed out as deny) — never presented as answered
+		// (review WP78a-R5). No body / no flag: an older backend, answered.
+		try {
+			const body = (await res.json()) as { gated?: unknown };
+			if (body?.gated === false) return ASK_ALREADY_OVER;
+		} catch {
+			// No JSON body.
+		}
+		return null;
+	}
 	let raw = '';
 	try {
 		const body = (await res.json()) as { error?: unknown };

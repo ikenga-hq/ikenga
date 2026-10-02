@@ -81,6 +81,19 @@ export function secretLayer(
 	return overDefault ? 'override' : 'own';
 }
 
+/** What {@link secretLayer} reads while `secrets_default_names` is in
+ *  flight (review WP78a-R6): the index is held back — every principal
+ *  Workspace row reads `default` (read-only) — until the default list
+ *  resolves, so a bare key of yours never flashes as an override; only a
+ *  failed query (an older daemon) falls back to the index's bare names. */
+export function settledLayerNames(
+	indexNames: readonly string[] | undefined,
+	defaults: { data?: readonly string[]; isError: boolean }
+): { indexNames: readonly string[] | undefined; defaultNames: readonly string[] | undefined } {
+	if (defaults.data) return { indexNames, defaultNames: defaults.data };
+	return { indexNames: defaults.isError ? indexNames : undefined, defaultNames: undefined };
+}
+
 /** Whether the lock / passphrase controls apply: only the desktop keychain
  *  has a passphrase layer; a principal store is sealed server-side. */
 export function hasPassphraseLayer(axis: VaultAxis): boolean {
