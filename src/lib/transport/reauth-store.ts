@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { signInWithPassword } from './t1-session';
 
 interface ReauthStore {
 	isOpen: boolean;
@@ -9,6 +10,10 @@ interface ReauthStore {
 	errorMsg: string | null;
 	setErrorMsg: (msg: string | null) => void;
 	reconnect: (token: string) => Promise<boolean>;
+	/** T1 (G-PRINCIPAL §2.4): sign in at `/auth/login`. The broker sets the
+	 *  session cookie and the page reloads into a normal boot, like
+	 *  `reconnect`. */
+	signIn: (username: string, password: string) => Promise<boolean>;
 }
 
 export const useReauthStore = create<ReauthStore>((set) => ({
@@ -53,5 +58,20 @@ export const useReauthStore = create<ReauthStore>((set) => ({
 			set({ errorMsg: `Connection failed: ${String(err)}` });
 			return false;
 		}
+	},
+	signIn: async (username: string, password: string) => {
+		if (!username.trim() || !password) {
+			set({ errorMsg: 'Enter your username and password.' });
+			return false;
+		}
+		const result = await signInWithPassword(username.trim(), password);
+		if (!result.ok) {
+			set({ errorMsg: result.message });
+			return false;
+		}
+		if (typeof window !== 'undefined') {
+			window.location.reload();
+		}
+		return true;
 	},
 }));

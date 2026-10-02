@@ -331,6 +331,7 @@ IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
 
 #### Running under systemd or Docker
 - **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.
+- **systemd, multi-user (T1)**: `scripts/server/ikenga-server-t1.service` instead. [`scripts/server/README.md`](scripts/server/README.md) covers the unit, local accounts, and migrating a T0 install with `ikenga-server accounts adopt-t0`.
 - **Docker**: Run `docker compose -f scripts/server/docker-compose.yml up -d` after running `deploy.sh`.
 
 ### What we don't do yet

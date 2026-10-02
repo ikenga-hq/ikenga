@@ -52,6 +52,9 @@ EnvironmentFile=/opt/ikenga/.env
 # — blunter: then EVERY orphan this unit spawns outlives it, not just runners.
 # See ADR-023 D5 (docs/adr/023-remote-tier-execution-isolation.md in the
 # workspace repo): Chi runs survive a daemon restart, terminals don't.
+# The T1 unit, ikenga-server-t1.service, carries that fix (KillMode=process,
+# G-PRINCIPAL §9.4); scripts/server/README.md explains the choice. Apply the
+# same line here once this T0 daemon serves Chi runs.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

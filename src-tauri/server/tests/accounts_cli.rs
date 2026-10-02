@@ -240,3 +240,106 @@ fn t1_root_disable_kills_every_process_of_the_uid() {
     };
     assert_eq!(status.signal(), Some(9), "SIGKILL");
 }
+
+/// Root: `accounts adopt-t0` end to end through the built binary (G-PRINCIPAL
+/// §11.2, G-ACCESS R-10): a root/Docker-shaped T0 install is copied into a
+/// fresh principal the command creates, the access store stays in the
+/// root-only archive, and the principal's tree is the uid's alone (I-9).
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_adopt_t0_through_the_binary() {
+    use std::os::unix::fs::MetadataExt;
+    assert!(is_root(), "t1-root tests must run as root");
+    struct HostUser;
+    impl Drop for HostUser {
+        fn drop(&mut self) {
+            let _ = Command::new("userdel").arg("ik-t1root-mig").output();
+            let _ = Command::new("groupdel").arg("ik-t1root-mig").output();
+        }
+    }
+    let _cleanup = HostUser;
+    let tmp = TempDir::new("adopt");
+    let (from, home) = (tmp.0.join("t0-data"), tmp.0.join("t0-home"));
+    std::fs::create_dir_all(from.join("chi-cache")).unwrap();
+    std::fs::create_dir_all(home.join(".gemini")).unwrap();
+    std::fs::write(from.join("supabase.json"), "{}").unwrap();
+    std::fs::write(from.join("chi-cache/x"), "run").unwrap();
+    std::fs::write(from.join("access.db"), "device hashes").unwrap();
+    std::fs::write(
+        from.join("fs_roots.json"),
+        format!(r#"{{"roots":["{}/code"]}}"#, home.display()),
+    )
+    .unwrap();
+    std::fs::write(home.join(".gemini/oauth"), "login").unwrap();
+    let root = tmp.0.join("root");
+    let args = [
+        "accounts",
+        "--data-dir",
+        root.to_str().unwrap(),
+        "--uid-range",
+        "28140-28150",
+        "adopt-t0",
+        "--from",
+        from.to_str().unwrap(),
+        "--home",
+        home.to_str().unwrap(),
+        "--admin",
+        "--password-stdin",
+        "t1root-mig",
+    ];
+    let out = run(
+        &tmp.0,
+        &args,
+        "correct horse battery\n",
+        Duration::from_secs(120),
+    );
+    assert!(out.status.success(), "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stdout.contains("created admin account t1root-mig"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("holds access.db"), "{}", out.stdout);
+
+    let principals: Vec<_> = std::fs::read_dir(root.join("principals"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(principals.len(), 1);
+    let pdir = &principals[0];
+    let uid = std::fs::metadata(pdir).unwrap().uid();
+    assert_eq!(uid, 28_140);
+    fn walk(p: &Path, uid: u32, seen: &mut usize) {
+        let m = std::fs::symlink_metadata(p).unwrap();
+        assert_eq!((m.uid(), m.gid()), (uid, uid), "{}", p.display());
+        assert_eq!(m.mode() & 0o6077, 0, "{}: {:o}", p.display(), m.mode());
+        *seen += 1;
+        if m.is_dir() {
+            for e in std::fs::read_dir(p).unwrap() {
+                walk(&e.unwrap().path(), uid, seen);
+            }
+        }
+    }
+    let mut seen = 0;
+    walk(pdir, uid, &mut seen);
+    assert!(seen >= 9, "{seen}");
+    assert!(!pdir.join("data/access.db").exists(), "R-10");
+    assert_eq!(
+        std::fs::read_to_string(pdir.join("home/.gemini/oauth")).unwrap(),
+        "login"
+    );
+    let roots = std::fs::read_to_string(pdir.join("data/fs_roots.json")).unwrap();
+    assert!(
+        roots.contains(&format!("{}/code", pdir.join("home").display())),
+        "{roots}"
+    );
+    let archive = std::fs::read_dir(&tmp.0)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.to_string_lossy().contains("t0-data.t0-migrated-"))
+        .expect("archive");
+    let m = std::fs::metadata(&archive).unwrap();
+    assert_eq!((m.uid(), m.mode() & 0o7777), (0, 0o500));
+    assert!(archive.join("access.db").exists());
+    assert!(!from.exists());
+}

@@ -30,8 +30,13 @@
 //!   probe-uid precondition, `probe.json`) and `ikenga-server probe`; the
 //!   host side (steps 2–4, 6) is `executor::t1_probe`.
 //! * [`reaper`] — the §7.3 uid-wide kill through the T1 executor.
+//! * [`adopt_t0`] — `accounts adopt-t0`, the §11.2 T0 → T1 migration (and
+//!   G-ACCESS R-10's archiving of the T0 access store).
+//! * [`safe_fs`] — fd-relative, never-follow-a-symlink walks for root over
+//!   trees another uid controls (used by [`adopt_t0`]).
 
 pub mod accounts;
+pub mod adopt_t0;
 pub mod auth_events;
 pub mod cli;
 mod etc_files;
@@ -40,6 +45,7 @@ pub mod password;
 pub mod probe;
 pub mod provision;
 pub mod reaper;
+mod safe_fs;
 mod sys;
 
 use std::fs;
@@ -106,9 +112,11 @@ impl std::fmt::Display for LayoutError {
             LayoutError::T0Layout { root, marker } => write!(
                 f,
                 "{} is a T0 data dir (it holds {marker}); T1 refuses it rather than migrating it \
-                 (G-PRINCIPAL I-10). Point --data-dir at an empty directory for a fresh \
-                 operator root. (Migrating a T0 install with `accounts adopt-t0` is not \
-                 available in this build yet.)",
+                 (G-PRINCIPAL I-10). Point --data-dir at a separate, empty directory for the \
+                 operator root, then migrate this install into a principal with `ikenga-server \
+                 accounts adopt-t0 --data-dir <operator-root> --from {} --home <the T0 \
+                 daemon's home> <username>` (stop the T0 daemon first).",
+                root.display(),
                 root.display()
             ),
             LayoutError::Unsafe { path, why } => {
@@ -432,7 +440,7 @@ mod tests {
                 matches!(err, LayoutError::T0Layout { .. }),
                 "{marker}: {err}"
             );
-            assert!(err.to_string().contains("not available"), "{err}");
+            assert!(err.to_string().contains("accounts adopt-t0"), "{err}");
             assert!(
                 !root.operator_dir().exists(),
                 "refusal must not create operator/"

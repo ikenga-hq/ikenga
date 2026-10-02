@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
+import { isT1Session } from '@/lib/transport/t1-session';
+import { T1SignInForm } from './t1-sign-in-form';
 
 export function ReauthOverlay() {
 	const isOpen = useReauthStore((s) => s.isOpen);
@@ -26,6 +28,8 @@ export function ReauthOverlay() {
 	}, [isOpen]);
 
 	if (!isOpen) return null;
+	// T1: there is no token to paste; principals sign in (G-PRINCIPAL §2.4).
+	if (isT1Session()) return <T1SignInForm />;
 
 	const handleReconnect = async () => {
 		setLoading(true);

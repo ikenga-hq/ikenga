@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 use super::accounts::{self, Actor, NoDeviceGrants};
+use super::adopt_t0;
 use super::provision::{Adopt, Provisioner, ProvisioningMode, ReapOutcome, UidRange, UidReaper};
 use super::reaper::{HelperCommand, T1Reaper};
 use super::{open_accounts, sys, Opener, OperatorRoot, Ownership};
@@ -61,6 +62,16 @@ pub enum AccountsCommand {
     List {
         json: bool,
     },
+    /// §11.2: migrate a T0 data dir (and, for a fresh principal, the old
+    /// home's dot-dirs) into `username`'s principal. Creates the account
+    /// when it doesn't exist (`admin` and `password` apply only then).
+    AdoptT0 {
+        username: String,
+        from: PathBuf,
+        home: PathBuf,
+        admin: bool,
+        password: PasswordSource,
+    },
 }
 
 /// Entry point for `main.rs`: checks `euid == 0`, prepares the operator root
@@ -79,9 +90,32 @@ pub async fn run(opts: AccountsOptions, cmd: AccountsCommand) -> anyhow::Result<
         std::env::current_dir()?.join(&opts.data_dir)
     };
     let root = OperatorRoot::new(data_dir)?;
-    let opener = if matches!(cmd, AccountsCommand::Create { .. }) {
-        // Only `create` may initialise a brand-new store (the first admin,
-        // §7.4, before any T1 boot).
+    let cmd = match cmd {
+        AccountsCommand::AdoptT0 {
+            username,
+            from,
+            home,
+            admin,
+            password,
+        } => {
+            let cwd = std::env::current_dir()?;
+            AccountsCommand::AdoptT0 {
+                username,
+                from: cwd.join(from),
+                home: cwd.join(home),
+                admin,
+                password,
+            }
+        }
+        other => other,
+    };
+    let opener = if matches!(
+        cmd,
+        AccountsCommand::Create { .. } | AccountsCommand::AdoptT0 { .. }
+    ) {
+        // Only `create` (and `adopt-t0`, which may create the account) may
+        // initialise a brand-new store (the first admin, §7.4, before any
+        // T1 boot).
         Opener::Cli
     } else {
         // Everything else needs an existing, current store and creates
@@ -221,6 +255,53 @@ pub(crate) async fn run_with(
                 "revoked every session of {} (session epoch {})",
                 a.username, a.session_epoch
             )?;
+        }
+        AccountsCommand::AdoptT0 {
+            username,
+            from,
+            home,
+            admin,
+            password,
+        } => {
+            // Everything about the old install is checked before an
+            // account is created, so a bad --from or --home leaves nothing
+            // behind. A failure after that (in `migrate`) can leave the new
+            // account in place; re-running the same command then finds it
+            // and goes on (`--admin` included, when it is already admin).
+            let pre = adopt_t0::preflight(prov.root(), &from, &home, &adopt_t0::stamp_now())?;
+            let existing = {
+                let mut conn = pool.acquire().await?;
+                accounts::by_username(&mut conn, &username).await?
+            };
+            let account = match existing {
+                Some(a) => {
+                    if admin && !a.is_admin {
+                        anyhow::bail!(
+                            "`{username}` already exists and is not an admin; --admin only \
+                             applies when adopt-t0 creates the account"
+                        );
+                    }
+                    a
+                }
+                None => {
+                    accounts::unix_name_for(&username)?;
+                    let pw = read_password(password)?;
+                    let a = prov.create(pool, &username, &pw, admin, None).await?;
+                    writeln!(
+                        out,
+                        "created {}account {} ({}) as {} uid {}",
+                        if a.is_admin { "admin " } else { "" },
+                        a.username,
+                        a.principal_id,
+                        a.unix_name,
+                        a.unix_uid
+                    )?;
+                    a
+                }
+            };
+            let report =
+                adopt_t0::migrate(prov.root(), prov.ownership(), &account, &pre, reaper).await?;
+            write!(out, "{}", report.summary())?;
         }
         AccountsCommand::List { json } => {
             let mut conn = pool.acquire().await?;
@@ -463,6 +544,122 @@ mod tests {
                 .is_err()
         );
         assert!(!prompted);
+    }
+
+    /// `adopt-t0` for a name with no account: preflight first (a bad
+    /// --from creates nothing and prompts for nothing), then create + copy.
+    #[tokio::test]
+    async fn adopt_t0_creates_the_account_and_migrates() {
+        let (root_tmp, root) = test_support::temp_root();
+        let (etc_tmp, _etc) = fake_etc(true);
+        let range = UidRange::new(3_900_000_060, 3_900_000_070).unwrap();
+        let prov = Provisioner::for_tests(root.clone(), range, etc_tmp.path());
+        let pool = open_accounts(&root, Opener::Cli).await.unwrap();
+        let base = std::fs::canonicalize(root_tmp.path()).unwrap();
+        let (from, home) = (base.join("t0"), base.join("home"));
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("supabase.json"), "{}").unwrap();
+        std::fs::write(from.join("access.db"), "chain").unwrap();
+
+        let prompted = std::cell::Cell::new(0);
+        let mut pw = |_: PasswordSource| {
+            prompted.set(prompted.get() + 1);
+            Ok(Zeroizing::new("correct horse battery".to_string()))
+        };
+        let bad = AccountsCommand::AdoptT0 {
+            username: "ada".into(),
+            from: base.join("missing"),
+            home: home.clone(),
+            admin: true,
+            password: PasswordSource::Stdin,
+        };
+        assert!(
+            run_with(&prov, &pool, &NoReaper, bad, &mut pw, &mut Vec::new())
+                .await
+                .is_err()
+        );
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(accounts::count(&mut conn).await.unwrap(), 0);
+        }
+
+        let mut out = Vec::new();
+        let cmd = AccountsCommand::AdoptT0 {
+            username: "ada".into(),
+            from: from.clone(),
+            home: home.clone(),
+            admin: true,
+            password: PasswordSource::Stdin,
+        };
+        run_with(&prov, &pool, &NoReaper, cmd, &mut pw, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(prompted.get(), 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("created admin account ada"), "{text}");
+        assert!(text.contains("copy into a fresh principal"), "{text}");
+        assert!(text.contains("holds access.db"), "{text}");
+        let a = {
+            let mut conn = pool.acquire().await.unwrap();
+            accounts::by_username(&mut conn, "ada")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let data = root.principal_data(a.principal_id);
+        assert!(data.join("supabase.json").exists());
+        assert!(!data.join("access.db").exists(), "R-10");
+        assert!(a.home.join(".codex/auth.json").exists());
+
+        // An existing account is never re-created. Re-running the same
+        // command (--admin included: ada is admin) finds it and goes on,
+        // without a password prompt; here it stops at the used data dir.
+        std::fs::create_dir_all(base.join("t0b")).unwrap();
+        std::fs::write(base.join("t0b/ikenga.db"), b"").unwrap();
+        let again = |username: &str| AccountsCommand::AdoptT0 {
+            username: username.into(),
+            from: base.join("t0b"),
+            home: home.clone(),
+            admin: true,
+            password: PasswordSource::Stdin,
+        };
+        let err = run_with(
+            &prov,
+            &pool,
+            &NoReaper,
+            again("ada"),
+            &mut pw,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("never run"), "{err}");
+        assert_eq!(prompted.get(), 1);
+        // --admin on an existing account that is not admin is refused.
+        prov.create(&pool, "bob", "correct horse battery", false, None)
+            .await
+            .unwrap();
+        let err = run_with(
+            &prov,
+            &pool,
+            &NoReaper,
+            again("bob"),
+            &mut pw,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--admin"), "{err}");
+        // Unseal the archive for the tempdir cleanup.
+        for e in std::fs::read_dir(&base).unwrap() {
+            let p = e.unwrap().path();
+            if p.to_string_lossy().contains(".t0-migrated-") {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
     }
 
     struct BrokenReaper;

@@ -17,6 +17,7 @@ import type {
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
+import { currentPrincipal, fetchAuthMe, isT1Session } from './transport/t1-session';
 
 export { getTransport, isRemoteWebSession, isTauri, type RpcTransport };
 export type UnlistenFn = () => void;
@@ -403,6 +404,12 @@ export async function fsRootsReset(): Promise<string[]> {
  *  to populate `hostContext.operator` when the onboarding display name
  *  (`useShellStore().userName`) is empty. */
 export async function osUsername(): Promise<string> {
+	// T1: the signed-in principal's username from `/auth/me`, not the
+	// child's Unix name (`ik-<name>`) — G-PRINCIPAL §5 row 7.
+	if (isT1Session()) {
+		const me = currentPrincipal() ?? (await fetchAuthMe());
+		if (me) return me.username;
+	}
 	return invoke('os_username');
 }
 

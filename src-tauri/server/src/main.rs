@@ -142,6 +142,31 @@ pub enum AccountsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Migrate a stopped T0 install into a principal (G-PRINCIPAL §11.2).
+    /// For a T0 that ran as a non-root user, first `create <username>
+    /// --adopt-unix-user <that user>`: its data dir then moves in and its
+    /// home stays. Otherwise (root/Docker) the account is created here as a
+    /// fresh principal, and the data dir plus the old home's engine and app
+    /// dot-dirs are copied in. The old dir is kept, read-only, as
+    /// `<old>.t0-migrated-<ts>`, together with its access store. For an
+    /// adopted user, every process of its uid is killed first: run this
+    /// from a root session that is not a login of that user.
+    #[command(name = "adopt-t0")]
+    AdoptT0 {
+        username: String,
+        /// The T0 daemon's --data-dir. Must be outside the operator root.
+        #[arg(long, value_name = "OLD_DATA_DIR")]
+        from: PathBuf,
+        /// The home the T0 daemon ran with (`/root` for Docker).
+        #[arg(long, value_name = "OLD_HOME")]
+        home: PathBuf,
+        /// When adopt-t0 creates the account: make it an admin. Accepted
+        /// on a re-run when the account already exists and is an admin.
+        #[arg(long)]
+        admin: bool,
+        #[command(flatten)]
+        password: PasswordArgs,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -506,6 +531,19 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
         AccountsCommand::Enable { username } => Cmd::Enable { username },
         AccountsCommand::RevokeSessions { username } => Cmd::RevokeSessions { username },
         AccountsCommand::List { json } => Cmd::List { json },
+        AccountsCommand::AdoptT0 {
+            username,
+            from,
+            home,
+            admin,
+            password,
+        } => Cmd::AdoptT0 {
+            username,
+            from,
+            home,
+            admin,
+            password: source(password),
+        },
     };
     cli::run(opts, cmd).await
 }
@@ -590,6 +628,18 @@ mod tests {
             vec![
                 "ikenga-server",
                 "accounts",
+                "adopt-t0",
+                "--from",
+                "/opt/ikenga/data-t0",
+                "--home",
+                "/root",
+                "ada",
+                "--admin",
+                "--password-stdin",
+            ],
+            vec![
+                "ikenga-server",
+                "accounts",
                 "--provisioning",
                 "external",
                 "list",
@@ -619,6 +669,69 @@ mod tests {
             vec!["ikenga-server", "accounts", "passwd", "ada", "hunter2"],
         ] {
             assert!(CliArgs::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn adopt_t0_needs_from_and_home() {
+        for argv in [
+            vec!["ikenga-server", "accounts", "adopt-t0", "ada"],
+            vec![
+                "ikenga-server",
+                "accounts",
+                "adopt-t0",
+                "--from",
+                "/x",
+                "ada",
+            ],
+            vec![
+                "ikenga-server",
+                "accounts",
+                "adopt-t0",
+                "--home",
+                "/root",
+                "ada",
+            ],
+            vec![
+                "ikenga-server",
+                "accounts",
+                "adopt-t0",
+                "--from",
+                "/x",
+                "--home",
+                "/root",
+            ],
+        ] {
+            assert!(CliArgs::try_parse_from(&argv).is_err(), "{argv:?}");
+        }
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "accounts",
+            "adopt-t0",
+            "--from",
+            "/opt/ikenga/data-t0",
+            "--home",
+            "/home/ikenga",
+            "ada",
+        ])
+        .unwrap();
+        let Some(Command::Accounts(a)) = args.command else {
+            panic!("expected accounts");
+        };
+        match a.command {
+            AccountsCommand::AdoptT0 {
+                username,
+                from,
+                home,
+                admin,
+                password,
+            } => {
+                assert_eq!(username, "ada");
+                assert_eq!(from, PathBuf::from("/opt/ikenga/data-t0"));
+                assert_eq!(home, PathBuf::from("/home/ikenga"));
+                assert!(!admin && !password.password_stdin);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

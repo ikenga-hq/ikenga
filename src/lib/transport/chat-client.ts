@@ -1,8 +1,10 @@
 import { connectionStateStore } from './connection-state';
-import { getAuthToken } from './index';
+import { transportToken } from './index';
 
+/** `?token=` for T0; nothing under T1, where the session cookie rides the
+ *  WebSocket handshake (G-PRINCIPAL §2.3). */
 function tokenQuery(): string {
-	const token = getAuthToken();
+	const token = transportToken();
 	return token ? `?token=${encodeURIComponent(token)}` : '';
 }
 
