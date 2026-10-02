@@ -39,6 +39,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	isRemoteWebSession,
 	pkgKernelStatus,
+	secretsDefaultNames,
 	secretsIndexNames,
 	type VaultScope,
 } from '@/lib/tauri-cmd';
@@ -121,8 +122,21 @@ function SecretsPage() {
 		queryFn: () => secretsIndexNames(),
 		enabled: layered && vaultUnlocked,
 	});
+	// WP76-RV1: the default layer's own names — a bare key of yours is not
+	// an override.
+	const defaultsQuery = useQuery({
+		queryKey: ['secrets', 'default-names'] as const,
+		queryFn: () => secretsDefaultNames(),
+		enabled: layered && vaultUnlocked,
+	});
 	const layerOf = (key: string): SecretLayer =>
-		secretLayer(axis, tab, key, layered ? indexQuery.data : undefined);
+		secretLayer(
+			axis,
+			tab,
+			key,
+			layered ? indexQuery.data : undefined,
+			layered ? defaultsQuery.data : undefined
+		);
 
 	const [editKey, setEditKey] = useState<string | null>(null);
 	const [editLayer, setEditLayer] = useState<SecretLayer>('own');

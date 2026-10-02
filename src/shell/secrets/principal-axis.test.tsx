@@ -71,4 +71,17 @@ describe('principal axis', () => {
 		expect(secretLayer('operator', 'workspace', 'OPENAI_KEY', index)).toBe('default');
 		expect(secretLayer('desktop', 'workspace', 'ANY', undefined)).toBe('own');
 	});
+
+	it('a bare key in your own store is not "your override" (WP76-RV1)', () => {
+		// MINE is in your store twice (bare and `workspace::`); no operator
+		// default holds it. SHARED really overrides one.
+		const index = ['MINE', 'OPENAI_KEY', 'SHARED', 'workspace::MINE', 'workspace::SHARED'];
+		const defaults = ['OPENAI_KEY', 'SHARED'];
+		const layer = (k: string) => secretLayer('principal', 'workspace', k, index, defaults);
+		expect(layer('MINE')).toBe('own');
+		expect(layer('SHARED')).toBe('override');
+		expect(layer('OPENAI_KEY')).toBe('default');
+		// Without the default list (an older daemon) the index decides.
+		expect(secretLayer('principal', 'workspace', 'MINE', index)).toBe('override');
+	});
 });

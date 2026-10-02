@@ -69,6 +69,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("secrets_list_keys", req!(owner[Settings])),
     ("secrets_list_keys_scoped", req!(owner[Settings])),
     ("secrets_index_names", req!(owner[Settings])),
+    ("secrets_default_names", req!(owner[Settings])),
     ("secrets_vault_status", req!(owner[Settings])),
     ("secrets_set", req!(owner[Settings, Secrets])),
     ("secrets_delete", req!(owner[Settings, Secrets])),

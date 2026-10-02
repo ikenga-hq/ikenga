@@ -472,6 +472,10 @@ pub(super) fn secrets_index_names(state: &AppState) -> RpcResponse {
     respond("secrets_index_names", state.secrets.index_names())
 }
 
+pub(super) fn secrets_default_names(state: &AppState) -> RpcResponse {
+    RpcResponse::success(state.secrets.default_names())
+}
+
 pub(super) fn secrets_get_scoped(state: &AppState, args: &Value) -> RpcResponse {
     let r = super::rpc::scope_kind(args).and_then(|scope| {
         let key = req_str(args, &["key"])?;
