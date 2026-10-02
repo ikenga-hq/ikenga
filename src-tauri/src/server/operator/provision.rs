@@ -480,6 +480,9 @@ pub enum ProvisionError {
     /// §8 step 7: the host's `/etc` disagrees with `accounts.db` in a way
     /// reconcile must not paper over.
     Drift(String),
+    /// `--max-accounts` (G-ACCESS P-27, §4.4): the server is full. Every
+    /// creation path refuses past it and records `provision_failed`.
+    MaxAccounts(u32),
     Host(anyhow::Error),
     Db(sqlx::Error),
 }
@@ -516,6 +519,11 @@ impl fmt::Display for ProvisionError {
                  uid is the boot probe's) — pass --uid-range {stored}"
             ),
             ProvisionError::Drift(why) => write!(f, "/etc disagrees with accounts.db: {why}"),
+            ProvisionError::MaxAccounts(max) => write!(
+                f,
+                "reason=max_accounts (--max-accounts {max}): this server has no room for another \
+                 account"
+            ),
             ProvisionError::Host(e) => write!(f, "provisioning the host failed: {e:#}"),
             ProvisionError::Db(e) => write!(f, "accounts.db: {e}"),
         }
@@ -793,7 +801,14 @@ pub struct Provisioner {
     ownership: Ownership,
     actor: Actor,
     nologin: PathBuf,
+    /// `--max-accounts` as this process was configured (`None`: not given
+    /// here — the cap the broker pinned in `operator_meta` applies, see
+    /// [`Self::pin_max_accounts`]).
+    max_accounts: Option<u32>,
 }
+
+/// `operator_meta` key holding the serving broker's `--max-accounts`.
+const MAX_ACCOUNTS_KEY: &str = "max_accounts";
 
 impl Provisioner {
     pub fn new(root: OperatorRoot, range: UidRange, mode: ProvisioningMode, actor: Actor) -> Self {
@@ -811,6 +826,7 @@ impl Provisioner {
             ownership: Ownership::Enforce,
             actor,
             nologin: nologin_shell(),
+            max_accounts: None,
         }
     }
 
@@ -824,6 +840,7 @@ impl Provisioner {
             ownership: Ownership::SkipForTests,
             actor: Actor::Cli,
             nologin: PathBuf::from("/usr/sbin/nologin"),
+            max_accounts: None,
         }
     }
 
@@ -833,6 +850,71 @@ impl Provisioner {
             backend: Backend::External,
             ..Self::for_tests(root, range, Path::new("/nonexistent"))
         }
+    }
+
+    /// Cap account creation at `max` (`--max-accounts`, G-ACCESS P-27).
+    /// `None` leaves the pinned cap ([`Self::pin_max_accounts`]) in force.
+    pub fn with_max_accounts(mut self, max: Option<u32>) -> Self {
+        self.max_accounts = max;
+        self
+    }
+
+    /// The broker's boot: record its `--max-accounts` (or its absence) in
+    /// `operator_meta`, so the root CLI and the env bootstrap — separate
+    /// invocations that never see the serve flags — refuse past the same
+    /// cap (§4.4: it "caps every creation path"; review WP76-R6).
+    pub async fn pin_max_accounts(pool: &SqlitePool, max: Option<u32>) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        match max {
+            Some(max) => {
+                sqlx::query(
+                    "INSERT INTO operator_meta (key, value) VALUES (?, ?) \
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(MAX_ACCOUNTS_KEY)
+                .bind(max.to_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM operator_meta WHERE key = ?")
+                    .bind(MAX_ACCOUNTS_KEY)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await
+    }
+
+    /// The cap in force: this process's flag, else the pinned one.
+    async fn effective_max_accounts(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<Option<u32>, ProvisionError> {
+        if self.max_accounts.is_some() {
+            return Ok(self.max_accounts);
+        }
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM operator_meta WHERE key = ?")
+                .bind(MAX_ACCOUNTS_KEY)
+                .fetch_optional(&mut **tx)
+                .await?;
+        // An unreadable value fails closed: no new account.
+        Ok(stored.map(|v| v.trim().parse().unwrap_or(0)))
+    }
+
+    /// Refuse a creation past `--max-accounts`, inside the caller's
+    /// `BEGIN IMMEDIATE` (so two racing creates can't both fit).
+    async fn check_max_accounts(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+    ) -> Result<(), ProvisionError> {
+        if let Some(max) = self.effective_max_accounts(tx).await? {
+            if accounts::count(&mut **tx).await? >= i64::from(max) {
+                return Err(ProvisionError::MaxAccounts(max));
+            }
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &OperatorRoot {
@@ -1041,6 +1123,7 @@ impl Provisioner {
         }
         self.pin_uid_range(tx).await?;
         Self::refuse_taken_username(tx, username).await?;
+        self.check_max_accounts(tx).await?;
 
         // Step 2.
         let uid = self.allocate_uid(tx).await?;
@@ -1131,6 +1214,7 @@ impl Provisioner {
         password::validate_new_password(password)?;
         self.pin_uid_range(tx).await?;
         Self::refuse_taken_username(tx, username).await?;
+        self.check_max_accounts(tx).await?;
         let pw = sys::user_by_name(unix_user)
             .map_err(host_err)?
             .ok_or_else(|| ProvisionError::AdoptRefused(format!("no host user `{unix_user}`")))?;
@@ -2411,6 +2495,98 @@ mod tests {
         let mut conn = f.pool.acquire().await.unwrap();
         assert_eq!(accounts::count(&mut conn).await.unwrap(), 1);
         assert!(format!("{again:?}").contains("<redacted>"));
+    }
+
+    /// G-ACCESS P-27 / §4.4 (review WP76-R6): `--max-accounts` is enforced
+    /// by the provisioning core, so every path respects it: the broker's
+    /// own flag, and — for the root CLI and the env bootstrap, which never
+    /// see it — the cap the serving broker pinned. A refusal records
+    /// `provision_failed` and creates nothing.
+    #[tokio::test]
+    async fn max_accounts_caps_every_creation_path() {
+        let f = fixture().await;
+        let failed = |pool: SqlitePool| async move {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM auth_events WHERE kind = 'provision_failed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n
+        };
+        // The flag on this process.
+        let capped = f.prov.clone().with_max_accounts(Some(1));
+        capped.create(&f.pool, "ada", PW, true, None).await.unwrap();
+        let e = capped
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ProvisionError::MaxAccounts(1)), "{e}");
+        assert!(e.to_string().contains("reason=max_accounts"), "{e}");
+        assert_eq!(failed(f.pool.clone()).await, 1);
+
+        // The CLI (no flag): the broker's pinned cap applies.
+        Provisioner::pin_max_accounts(&f.pool, Some(1))
+            .await
+            .unwrap();
+        let e = f
+            .prov
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ProvisionError::MaxAccounts(1)), "{e}");
+        assert_eq!(failed(f.pool.clone()).await, 2);
+        // The env bootstrap goes through the same core (here: not empty,
+        // so ignored before the cap is even reached).
+        let boot = BootstrapAdmin {
+            username: "late".into(),
+            password: Zeroizing::new(PW.into()),
+        };
+        assert!(matches!(
+            f.prov.bootstrap_admin(&f.pool, &boot).await.unwrap(),
+            BootstrapOutcome::IgnoredNotEmpty
+        ));
+
+        // Raised, then unpinned (a broker serving without the flag).
+        Provisioner::pin_max_accounts(&f.pool, Some(2))
+            .await
+            .unwrap();
+        f.prov
+            .create(&f.pool, "bob", PW, false, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            f.prov.create(&f.pool, "cy", PW, false, None).await,
+            Err(ProvisionError::MaxAccounts(2))
+        ));
+        Provisioner::pin_max_accounts(&f.pool, None).await.unwrap();
+        f.prov.create(&f.pool, "cy", PW, false, None).await.unwrap();
+        let mut conn = f.pool.acquire().await.unwrap();
+        assert_eq!(accounts::count(&mut conn).await.unwrap(), 3);
+    }
+
+    /// The env bootstrap on an empty table is capped too (`--max-accounts
+    /// 0` leaves no room even for the first admin).
+    #[tokio::test]
+    async fn the_bootstrap_respects_max_accounts() {
+        let f = fixture().await;
+        Provisioner::pin_max_accounts(&f.pool, Some(0))
+            .await
+            .unwrap();
+        let boot = BootstrapAdmin {
+            username: "root-admin".into(),
+            password: Zeroizing::new(PW.into()),
+        };
+        assert!(matches!(
+            f.prov.bootstrap_admin(&f.pool, &boot).await,
+            Err(ProvisionError::MaxAccounts(0))
+        ));
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_events WHERE kind = 'provision_failed'")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

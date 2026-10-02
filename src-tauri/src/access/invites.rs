@@ -632,6 +632,10 @@ fn provision_error(e: &crate::server::operator::provision::ProvisionError) -> Ac
         P::UsernameTaken(_) | P::UnixNameTaken(_) => {
             AccessError::new(Code::Conflict, e.to_string())
         }
+        P::MaxAccounts(_) => AccessError::new(
+            Code::Forbidden,
+            "provision_failed: reason=max_accounts — this server has no room for another account",
+        ),
         _ => {
             tracing::error!("invite accept: provisioning failed: {e}");
             AccessError::new(
@@ -685,32 +689,18 @@ pub async fn accept(
                     "This invite is for an existing account on this server — sign in to accept.",
                 ));
             }
-            if let Some(max) = host.options.max_accounts {
-                let n = accounts::count(&mut tx)
-                    .await
-                    .map_err(AccessError::internal)?;
-                if n >= i64::from(max) {
-                    // §4.4 / §7.3: a refused creation is a provision failure,
-                    // recorded in its own transaction (review WP76-R6).
-                    drop(tx);
-                    host.provisioner
-                        .record_provision_failed(
-                            store.pool(),
-                            username,
-                            &ProvisionError::Host(anyhow::anyhow!(
-                                "reason=max_accounts (--max-accounts {max})"
-                            )),
-                        )
-                        .await;
-                    return Err(AccessError::new(
-                        Code::Forbidden,
-                        "provision_failed: reason=max_accounts — this server has no room for \
-                         another account",
-                    ));
+            // §4.4 / P-27: `--max-accounts` is enforced by the provisioning
+            // core itself (`create_in`, every creation path; review
+            // WP76-R6), which refuses past it as a provision failure.
+            let capped;
+            let provisioner = match host.options.max_accounts {
+                Some(max) => {
+                    capped = host.provisioner.clone().with_max_accounts(Some(max));
+                    &capped
                 }
-            }
-            let guard = match host
-                .provisioner
+                None => &host.provisioner,
+            };
+            let guard = match provisioner
                 .create_in(&mut tx, username, password, false)
                 .await
             {
@@ -718,7 +708,7 @@ pub async fn accept(
                 Err(e) => {
                     let mapped = provision_error(&e);
                     drop(tx);
-                    host.provisioner
+                    provisioner
                         .record_provision_failed(store.pool(), username, &e)
                         .await;
                     return Err(mapped);
