@@ -90,7 +90,12 @@ export function PeopleScopeSwitch({
 						title={enabled ? undefined : TAB_SCOPE_WHY[tab]}
 						onClick={enabled && !on ? () => onScope?.(s.id) : undefined}
 						className={cn(
-							'min-h-[26px] border-r border-[var(--border)] px-3 text-[length:var(--text-micro)] last:border-r-0',
+							// D-05 `:focus-visible` inside a clipped group: the fieldset's
+							// `overflow-hidden` (it rounds the segment fills) cuts any ring
+							// drawn outside a button, so the ring is inset — its outer edge
+							// on the button's edge — and the end buttons take the group's
+							// inner radius so the ring's corners are not clipped either.
+							'min-h-[26px] border-r border-[var(--border)] px-3 text-[length:var(--text-micro)] last:border-r-0 focus-visible:-outline-offset-2 first:rounded-l-[calc(var(--radius-sm,4px)-1px)] last:rounded-r-[calc(var(--radius-sm,4px)-1px)]',
 							on
 								? 'bg-[var(--primary-soft)] text-[var(--fg)]'
 								: enabled
