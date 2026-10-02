@@ -91,10 +91,7 @@ impl DaemonState {
             info!("Sent POST /api/shutdown to daemon at {}", info.http_url);
             true
         } else {
-            warn!(
-                "Failed to send POST /api/shutdown to daemon at {}",
-                info.http_url
-            );
+            warn!("Failed to send POST /api/shutdown to daemon at {}", info.http_url);
             false
         }
     }
@@ -135,14 +132,13 @@ pub fn find_daemon_binary() -> Option<PathBuf> {
         return Some(target_debug);
     }
 
-    let parent_target_debug =
-        Path::new(manifest_dir)
-            .join("../target/debug")
-            .join(if cfg!(windows) {
-                "ikenga-server.exe"
-            } else {
-                "ikenga-server"
-            });
+    let parent_target_debug = Path::new(manifest_dir)
+        .join("../target/debug")
+        .join(if cfg!(windows) {
+            "ikenga-server.exe"
+        } else {
+            "ikenga-server"
+        });
     if parent_target_debug.is_file() {
         return Some(parent_target_debug);
     }
@@ -164,6 +160,7 @@ pub fn find_daemon_binary() -> Option<PathBuf> {
 
     None
 }
+
 
 /// The version this app expects its daemon to be. The daemon's `/api/health`
 /// reports the same crate's `CARGO_PKG_VERSION`, so equal strings mean the
@@ -277,10 +274,7 @@ fn retire_outdated(http_url: &str, token: &str, version: &str) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    warn!(
-        "outdated ikenga-server at {http_url} did not exit within {}ms",
-        SHUTDOWN_WAIT.as_millis()
-    );
+    warn!("outdated ikenga-server at {http_url} did not exit within {}ms", SHUTDOWN_WAIT.as_millis());
 }
 
 fn persistent_info(host: String, port: u16, token: String, pid: Option<u32>) -> DaemonInfo {
@@ -391,10 +385,7 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
             continue;
         }
         if crate::server::discovery::tighten(&meta_path) {
-            info!(
-                "tightened {} to owner-only; it holds a bearer token",
-                meta_path.display()
-            );
+            info!("tightened {} to owner-only; it holds a bearer token", meta_path.display());
         }
         let Ok(content) = std::fs::read_to_string(&meta_path) else {
             continue;
@@ -423,10 +414,7 @@ pub fn init_daemon(app_data_dir: Option<PathBuf>) -> DaemonInfo {
             }
             Probe::WrongVersion(version) => retire_outdated(&http_url, &token, &version),
             Probe::Unauthorized => {
-                warn!(
-                    "ikenga-server at {http_url} rejected the token from {}",
-                    meta_path.display()
-                );
+                warn!("ikenga-server at {http_url} rejected the token from {}", meta_path.display());
             }
             Probe::Down => {}
         }
@@ -531,18 +519,12 @@ mod tests {
             TEST_TOKEN,
             Some(Path::new("/tmp/ikenga-data/daemon")),
         );
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
             !args.iter().any(|a| a.contains(TEST_TOKEN)),
             "the bearer token must not appear in the daemon's argv"
         );
-        assert!(
-            !args.iter().any(|a| a == "--auth-token"),
-            "--auth-token must not be passed"
-        );
+        assert!(!args.iter().any(|a| a == "--auth-token"), "--auth-token must not be passed");
 
         let env_token = cmd
             .get_envs()
@@ -588,17 +570,11 @@ mod tests {
                 let mut body = vec![0u8; content_length];
                 let _ = reader.read_exact(&mut body);
                 let (status, payload) = if request_line.starts_with("GET /api/health") {
-                    (
-                        "200 OK",
-                        format!("{{\"ok\":true,\"version\":\"{version}\"}}"),
-                    )
+                    ("200 OK", format!("{{\"ok\":true,\"version\":\"{version}\"}}"))
                 } else if !authorized {
                     ("401 Unauthorized", "{}".to_string())
                 } else {
-                    (
-                        "200 OK",
-                        "{\"ok\":false,\"error\":\"unknown command\"}".to_string(),
-                    )
+                    ("200 OK", "{\"ok\":false,\"error\":\"unknown command\"}".to_string())
                 };
                 let _ = write!(
                     stream,
@@ -639,15 +615,8 @@ mod tests {
 
     #[test]
     fn nothing_listening_is_down() {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        assert_eq!(
-            probe_candidate(&format!("http://127.0.0.1:{port}"), TEST_TOKEN, 300),
-            Probe::Down
-        );
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        assert_eq!(probe_candidate(&format!("http://127.0.0.1:{port}"), TEST_TOKEN, 300), Probe::Down);
     }
 
     #[cfg(unix)]

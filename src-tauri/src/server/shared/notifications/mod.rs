@@ -137,10 +137,7 @@ impl NotificationKind {
 
     /// D-07: permission and violation cannot be muted; every other kind can.
     pub fn is_mutable(self) -> bool {
-        !matches!(
-            self,
-            NotificationKind::Permission | NotificationKind::Violation
-        )
+        !matches!(self, NotificationKind::Permission | NotificationKind::Violation)
     }
 }
 
@@ -316,9 +313,7 @@ fn row_to_notification(row: &sqlx::sqlite::SqliteRow) -> Result<Notification, St
         updated_at: row
             .try_get("updated_at")
             .map_err(|e| format!("updated_at: {e}"))?,
-        read_at: row
-            .try_get("read_at")
-            .map_err(|e| format!("read_at: {e}"))?,
+        read_at: row.try_get("read_at").map_err(|e| format!("read_at: {e}"))?,
         resolved_at: row
             .try_get("resolved_at")
             .map_err(|e| format!("resolved_at: {e}"))?,
@@ -347,13 +342,12 @@ pub async fn record(
 
     let outcome_id: Option<(i64, bool)> = match (&new.dedupe_key, new.coalesce) {
         (Some(key), Coalesce::Once) => {
-            let exists: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM shell_notifications WHERE dedupe_key = ? LIMIT 1",
-            )
-            .bind(key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("notifications dedupe lookup: {e}"))?;
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM shell_notifications WHERE dedupe_key = ? LIMIT 1")
+                    .bind(key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| format!("notifications dedupe lookup: {e}"))?;
             if exists.is_some() {
                 tx.rollback().await.ok();
                 return Ok(RecordOutcome::Suppressed);
@@ -464,7 +458,8 @@ pub async fn record_with_db(db: &crate::db::PaDb, new: NewNotification) {
 }
 
 /// SQL predicate for rows the cap never evicts: a still-open permission ask.
-const PROTECTED_FROM_CAP: &str = "kind = 'permission' AND read_at IS NULL AND resolved_at IS NULL";
+const PROTECTED_FROM_CAP: &str =
+    "kind = 'permission' AND read_at IS NULL AND resolved_at IS NULL";
 
 /// Retention: read rows older than 30 days go, then the table is capped at
 /// `MAX_ROWS` newest. Unread rows are only ever dropped by the cap, and the
@@ -473,7 +468,10 @@ const PROTECTED_FROM_CAP: &str = "kind = 'permission' AND read_at IS NULL AND re
 /// `MAX_ROWS`, so the table stays bounded; they are bounded themselves
 /// (gate / ACP asks resolve within their timeout, terminal asks fold to one
 /// unread row per terminal).
-async fn prune(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, now: i64) -> Result<(), String> {
+async fn prune(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: i64,
+) -> Result<(), String> {
     sqlx::query("DELETE FROM shell_notifications WHERE read_at IS NOT NULL AND updated_at < ?")
         .bind(now - READ_RETENTION_MS)
         .execute(&mut **tx)
@@ -515,10 +513,7 @@ pub async fn list(pool: &sqlx::SqlitePool, q: &ListQuery) -> Result<Vec<Notifica
         binds.extend(kinds.iter().map(|k| k.as_str().to_string()));
     }
     if !q.exclude.is_empty() {
-        sql.push_str(&format!(
-            " AND kind NOT IN ({})",
-            placeholders(q.exclude.len())
-        ));
+        sql.push_str(&format!(" AND kind NOT IN ({})", placeholders(q.exclude.len())));
         binds.extend(q.exclude.iter().map(|k| k.as_str().to_string()));
     }
     if q.before.is_some() {
@@ -634,13 +629,11 @@ pub async fn mark_all_read(
     let now = now_ms();
     let res = match kind {
         Some(k) => {
-            sqlx::query(
-                "UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL AND kind = ?",
-            )
-            .bind(now)
-            .bind(k.as_str())
-            .execute(pool)
-            .await
+            sqlx::query("UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL AND kind = ?")
+                .bind(now)
+                .bind(k.as_str())
+                .execute(pool)
+                .await
         }
         None => {
             sqlx::query("UPDATE shell_notifications SET read_at = ? WHERE read_at IS NULL")
@@ -833,18 +826,8 @@ mod tests {
                 .await
                 .unwrap();
         for c in [
-            "id",
-            "kind",
-            "title",
-            "body",
-            "action",
-            "source",
-            "dedupe_key",
-            "count",
-            "created_at",
-            "updated_at",
-            "read_at",
-            "resolved_at",
+            "id", "kind", "title", "body", "action", "source", "dedupe_key", "count",
+            "created_at", "updated_at", "read_at", "resolved_at",
         ] {
             assert!(cols.iter().any(|x| x == c), "missing column {c}: {cols:?}");
         }
@@ -863,12 +846,9 @@ mod tests {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        let b = record(
-            &pool,
-            note(NotificationKind::RunFailed, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        let b = record(&pool, note(NotificationKind::RunFailed, None, Coalesce::Never))
+            .await
+            .unwrap();
         assert!(matches!(a, RecordOutcome::Inserted(_)));
         let rows = list(&pool, &ListQuery::default()).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -881,18 +861,12 @@ mod tests {
     #[tokio::test]
     async fn unread_count_counts_per_kind_and_drops_read_rows() {
         let (pool, _tmp) = fresh_pool().await;
-        let first = record(
-            &pool,
-            note(NotificationKind::Permission, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
-        record(
-            &pool,
-            note(NotificationKind::Permission, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        let first = record(&pool, note(NotificationKind::Permission, None, Coalesce::Never))
+            .await
+            .unwrap();
+        record(&pool, note(NotificationKind::Permission, None, Coalesce::Never))
+            .await
+            .unwrap();
         record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
             .await
             .unwrap();
@@ -908,9 +882,7 @@ mod tests {
         assert_eq!(changed, 1);
         // Re-marking is a no-op.
         assert_eq!(
-            mark_read(&pool, &[first.notification().unwrap().id])
-                .await
-                .unwrap(),
+            mark_read(&pool, &[first.notification().unwrap().id]).await.unwrap(),
             0
         );
         let c = unread_count(&pool, &[]).await.unwrap();
@@ -923,21 +895,15 @@ mod tests {
     #[tokio::test]
     async fn mute_is_respected_by_list_and_unread_count() {
         let (pool, _tmp) = fresh_pool().await;
-        record(
-            &pool,
-            note(NotificationKind::RunFinished, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
+            .await
+            .unwrap();
         record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
             .await
             .unwrap();
-        record(
-            &pool,
-            note(NotificationKind::Permission, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::Permission, None, Coalesce::Never))
+            .await
+            .unwrap();
 
         let muted = vec![NotificationKind::RunFinished, NotificationKind::Update];
         let c = unread_count(&pool, &muted).await.unwrap();
@@ -963,25 +929,17 @@ mod tests {
     #[tokio::test]
     async fn list_filters_unread_kind_and_cursor() {
         let (pool, _tmp) = fresh_pool().await;
-        let r1 = record(
-            &pool,
-            note(NotificationKind::Violation, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        let r1 = record(&pool, note(NotificationKind::Violation, None, Coalesce::Never))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;
-        record(
-            &pool,
-            note(NotificationKind::Violation, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::Violation, None, Coalesce::Never))
+            .await
+            .unwrap();
         record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
             .await
             .unwrap();
-        mark_read(&pool, &[r1.notification().unwrap().id])
-            .await
-            .unwrap();
+        mark_read(&pool, &[r1.notification().unwrap().id]).await.unwrap();
 
         let unread_violations = list(
             &pool,
@@ -1004,9 +962,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(older
-            .iter()
-            .all(|n| n.updated_at <= r1.notification().unwrap().updated_at));
+        assert!(older.iter().all(|n| n.updated_at <= r1.notification().unwrap().updated_at));
         assert!(older.iter().any(|n| n.id == r1.notification().unwrap().id));
 
         let none = list(
@@ -1049,18 +1005,12 @@ mod tests {
     async fn coalesce_while_unread_folds_then_starts_a_new_row_once_read() {
         let (pool, _tmp) = fresh_pool().await;
         let key = Some("violation:p:shell.execute:ffmpeg");
-        let a = record(
-            &pool,
-            note(NotificationKind::Violation, key, Coalesce::WhileUnread),
-        )
-        .await
-        .unwrap();
-        let b = record(
-            &pool,
-            note(NotificationKind::Violation, key, Coalesce::WhileUnread),
-        )
-        .await
-        .unwrap();
+        let a = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnread))
+            .await
+            .unwrap();
+        let b = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnread))
+            .await
+            .unwrap();
         let b = match b {
             RecordOutcome::Coalesced(n) => n,
             other => panic!("expected coalesced, got {other:?}"),
@@ -1071,12 +1021,9 @@ mod tests {
         assert_eq!(unread_count(&pool, &[]).await.unwrap().total, 1);
 
         mark_read(&pool, &[b.id]).await.unwrap();
-        let c = record(
-            &pool,
-            note(NotificationKind::Violation, key, Coalesce::WhileUnread),
-        )
-        .await
-        .unwrap();
+        let c = record(&pool, note(NotificationKind::Violation, key, Coalesce::WhileUnread))
+            .await
+            .unwrap();
         assert!(matches!(c, RecordOutcome::Inserted(_)));
         assert_ne!(c.notification().unwrap().id, b.id);
         assert_eq!(c.notification().unwrap().count, 1);
@@ -1085,30 +1032,13 @@ mod tests {
     #[tokio::test]
     async fn mark_read_by_key_resolves_only_that_key() {
         let (pool, _tmp) = fresh_pool().await;
-        record(
-            &pool,
-            note(
-                NotificationKind::Permission,
-                Some("permission:hook:1"),
-                Coalesce::Once,
-            ),
-        )
-        .await
-        .unwrap();
-        record(
-            &pool,
-            note(
-                NotificationKind::Permission,
-                Some("permission:hook:2"),
-                Coalesce::Once,
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            mark_read_by_key(&pool, "permission:hook:1").await.unwrap(),
-            1
-        );
+        record(&pool, note(NotificationKind::Permission, Some("permission:hook:1"), Coalesce::Once))
+            .await
+            .unwrap();
+        record(&pool, note(NotificationKind::Permission, Some("permission:hook:2"), Coalesce::Once))
+            .await
+            .unwrap();
+        assert_eq!(mark_read_by_key(&pool, "permission:hook:1").await.unwrap(), 1);
         let unread = list(
             &pool,
             &ListQuery {
@@ -1128,16 +1058,11 @@ mod tests {
         record(&pool, note(NotificationKind::Update, None, Coalesce::Never))
             .await
             .unwrap();
-        record(
-            &pool,
-            note(NotificationKind::RunFinished, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
+            .await
+            .unwrap();
         assert_eq!(
-            mark_all_read(&pool, Some(NotificationKind::Update))
-                .await
-                .unwrap(),
+            mark_all_read(&pool, Some(NotificationKind::Update)).await.unwrap(),
             1
         );
         let c = unread_count(&pool, &[]).await.unwrap();
@@ -1173,16 +1098,9 @@ mod tests {
     async fn record_publishes_a_created_event() {
         let mut rx = subscribe();
         let (pool, _tmp) = fresh_pool().await;
-        let out = record(
-            &pool,
-            note(
-                NotificationKind::RunFinished,
-                Some("evt-test-unique"),
-                Coalesce::Once,
-            ),
-        )
-        .await
-        .unwrap();
+        let out = record(&pool, note(NotificationKind::RunFinished, Some("evt-test-unique"), Coalesce::Once))
+            .await
+            .unwrap();
         let id = out.notification().unwrap().id;
         // Other tests publish on the same process-wide channel; find ours.
         loop {
@@ -1192,10 +1110,7 @@ mod tests {
                 Err(broadcast::error::RecvError::Closed) => panic!("channel closed"),
             };
             if ev.reason == ChangeReason::Created
-                && ev
-                    .notification
-                    .as_ref()
-                    .and_then(|n| n.dedupe_key.as_deref())
+                && ev.notification.as_ref().and_then(|n| n.dedupe_key.as_deref())
                     == Some("evt-test-unique")
             {
                 assert_eq!(ev.notification.unwrap().id, id);
@@ -1216,11 +1131,7 @@ mod tests {
             .unwrap();
         assert!(NotificationKind::Invite.is_mutable());
         assert_eq!(
-            unread_count(&pool, &[])
-                .await
-                .unwrap()
-                .by_kind
-                .get("invite"),
+            unread_count(&pool, &[]).await.unwrap().by_kind.get("invite"),
             Some(&1)
         );
         assert_eq!(
@@ -1235,12 +1146,9 @@ mod tests {
     async fn resolve_by_key_sets_resolved_and_read_and_drops_it_from_counts() {
         let (pool, _tmp) = fresh_pool().await;
         let key = "permission:hook:perm-9";
-        record(
-            &pool,
-            note(NotificationKind::Permission, Some(key), Coalesce::Once),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::Once))
+            .await
+            .unwrap();
         let c = unread_count(&pool, &[]).await.unwrap();
         assert_eq!(c.by_kind.get("permission"), Some(&1));
         assert_eq!(c.pending_permissions, 1);
@@ -1259,22 +1167,16 @@ mod tests {
         assert_eq!(resolve_by_key(&pool, key).await.unwrap(), 0);
         let row = &list(&pool, &ListQuery::default()).await.unwrap()[0];
         assert!(row.resolved_at.is_some());
-        assert_eq!(
-            unread_count(&pool, &[]).await.unwrap().pending_permissions,
-            0
-        );
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().pending_permissions, 0);
     }
 
     #[tokio::test]
     async fn resolving_an_unread_row_also_marks_it_read() {
         let (pool, _tmp) = fresh_pool().await;
         let key = "permission:acp:t:r";
-        record(
-            &pool,
-            note(NotificationKind::Permission, Some(key), Coalesce::Once),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::Once))
+            .await
+            .unwrap();
         resolve_by_key(&pool, key).await.unwrap();
         let row = &list(&pool, &ListQuery::default()).await.unwrap()[0];
         assert!(row.read_at.is_some() && row.resolved_at.is_some());
@@ -1287,37 +1189,17 @@ mod tests {
     async fn a_resolved_terminal_ask_is_not_folded_into_by_the_next_one() {
         let (pool, _tmp) = fresh_pool().await;
         let key = "permission:terminal:t-1";
-        let first = record(
-            &pool,
-            note(
-                NotificationKind::Permission,
-                Some(key),
-                Coalesce::WhileUnread,
-            ),
-        )
-        .await
-        .unwrap();
+        let first = record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::WhileUnread))
+            .await
+            .unwrap();
         resolve_by_key(&pool, key).await.unwrap();
-        let next = record(
-            &pool,
-            note(
-                NotificationKind::Permission,
-                Some(key),
-                Coalesce::WhileUnread,
-            ),
-        )
-        .await
-        .unwrap();
+        let next = record(&pool, note(NotificationKind::Permission, Some(key), Coalesce::WhileUnread))
+            .await
+            .unwrap();
         assert!(matches!(next, RecordOutcome::Inserted(_)));
-        assert_ne!(
-            next.notification().unwrap().id,
-            first.notification().unwrap().id
-        );
+        assert_ne!(next.notification().unwrap().id, first.notification().unwrap().id);
         assert!(next.notification().unwrap().resolved_at.is_none());
-        assert_eq!(
-            unread_count(&pool, &[]).await.unwrap().pending_permissions,
-            1
-        );
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().pending_permissions, 1);
     }
 
     #[tokio::test]
@@ -1359,12 +1241,9 @@ mod tests {
             .await
             .unwrap();
         }
-        record(
-            &pool,
-            note(NotificationKind::Violation, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        record(&pool, note(NotificationKind::Violation, None, Coalesce::Never))
+            .await
+            .unwrap();
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shell_notifications")
             .fetch_one(&pool)
             .await
@@ -1412,27 +1291,19 @@ mod tests {
     async fn unmute_marks_read_only_rows_recorded_while_muted() {
         let (pool, _tmp) = fresh_pool().await;
         // Unread before the mute: must survive the unmute.
-        let before = record(
-            &pool,
-            note(NotificationKind::RunFinished, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
+        let before = record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
+            .await
+            .unwrap();
         // Back-date it so it is strictly older than the mute time.
         sqlx::query("UPDATE shell_notifications SET updated_at = updated_at - 10000 WHERE id = ?")
             .bind(before.notification().unwrap().id)
             .execute(&pool)
             .await
             .unwrap();
-        mute::note_muted(&pool, NotificationKind::RunFinished)
+        mute::note_muted(&pool, NotificationKind::RunFinished).await.unwrap();
+        record(&pool, note(NotificationKind::RunFinished, None, Coalesce::Never))
             .await
             .unwrap();
-        record(
-            &pool,
-            note(NotificationKind::RunFinished, None, Coalesce::Never),
-        )
-        .await
-        .unwrap();
 
         assert_eq!(
             mute::clear_muted_backlog(&pool, NotificationKind::RunFinished)
@@ -1440,15 +1311,9 @@ mod tests {
                 .unwrap(),
             1
         );
-        let unread = list(
-            &pool,
-            &ListQuery {
-                unread_only: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let unread = list(&pool, &ListQuery { unread_only: true, ..Default::default() })
+            .await
+            .unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].id, before.notification().unwrap().id);
         // The mute time is forgotten: a second clear marks nothing.

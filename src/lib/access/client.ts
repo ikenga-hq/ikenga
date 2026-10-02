@@ -11,7 +11,7 @@
 // wrappers for their commands are here from the start.
 
 import { getTransport } from '../transport';
-import { type ArmClass, type Cap, CAPS, type Role, type Tier, TIER_LABELS } from './caps.gen';
+import { type ArmClass, CAPS, type Cap, type Role, TIER_LABELS, type Tier } from './caps.gen';
 import { RPC_REQUIREMENTS } from './rpc-requirements.gen';
 
 export type Via = 'session' | 'device' | 'operator';

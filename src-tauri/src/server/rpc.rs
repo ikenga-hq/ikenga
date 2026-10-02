@@ -580,12 +580,11 @@ pub async fn rpc_handler(
         // the fallthrough reads as "unfinished, someone will get to it", and
         // the next person to read it would implement the thing this decision
         // rejects. `secrets_env::WRITE_REFUSAL` is the operator runbook.
-        cmd @ ("secrets_set"
-        | "secrets_delete"
-        | "secrets_set_scoped"
-        | "secrets_delete_scoped") => {
-            RpcResponse::error(format!("{cmd} {}", crate::secrets_env::WRITE_REFUSAL))
-        }
+        cmd @ ("secrets_set" | "secrets_delete" | "secrets_set_scoped"
+        | "secrets_delete_scoped") => RpcResponse::error(format!(
+            "{cmd} {}",
+            crate::secrets_env::WRITE_REFUSAL
+        )),
         // Desktop: the names in `secrets-index.json`. Daemon: the names of
         // its own namespace — same `string[]` shape, daemon-true content.
         // Needs no `--data-dir`: the namespace is process environment.
