@@ -5,16 +5,25 @@ import { describe, expect, it } from 'vitest';
 import { settingsIykeLine, settingsSection } from '@/shell/settings/nav';
 import { searchSettings } from '@/shell/settings/search';
 
-import { PEOPLE_TABS } from './frame';
+import { PEOPLE_TABS, tabScope } from './frame';
 
 describe('People tabs', () => {
-	it('are Profile and Devices only; Members, Policies and Audit wait for G-ACCESS (G-101)', () => {
-		expect(PEOPLE_TABS.map((t) => t.to)).toEqual(['/settings/profile', '/settings/devices']);
+	it('are Profile, Devices, Members and Policies; Audit waits for WP-77', () => {
+		expect(PEOPLE_TABS.map((t) => t.to)).toEqual([
+			'/settings/profile',
+			'/settings/devices',
+			'/settings/members',
+			'/settings/policies',
+		]);
+		expect(tabScope('members')).toBe('project');
+		expect(tabScope('devices')).toBe('personal');
 	});
 
 	it('resolve to the People section for the nav highlight, header and iyke line', () => {
 		expect(settingsSection('profile').id).toBe('people');
 		expect(settingsSection('devices').id).toBe('people');
+		expect(settingsSection('members').id).toBe('people');
+		expect(settingsSection('policies').id).toBe('people');
 		expect(settingsIykeLine(settingsSection('devices').id, 'personal')).toBe(
 			'iyke settings open people'
 		);

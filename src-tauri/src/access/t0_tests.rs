@@ -501,10 +501,11 @@ async fn a_principal_child_takes_caps_only_from_the_broker_header() {
         .starts_with("served_by_broker:"));
     // `internal` arms: only on the broker's own call (the marker, no caps
     // header, no share header) — never on a relayed request (L74-3).
+    // (WP-76: the arm is filled, so the broker's call reaches its body.)
     assert!(call_as(true, None, "share_project_info").await["error"]
         .as_str()
         .unwrap()
-        .contains("WP-76"));
+        .starts_with("invalid_request:"));
     for caps in [
         None,
         Some(""),

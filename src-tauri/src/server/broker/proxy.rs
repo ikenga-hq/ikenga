@@ -452,6 +452,134 @@ async fn forward(
     )
 }
 
+// ─── G-ACCESS §4.5 share functions (WP-76) ──────────────────────────────────
+
+/// The broker's handle on owner children for the access layer
+/// (`access::share::OwnerCalls`, installed at broker boot): the two
+/// `internal` arms — `share_project_info` (validate a project on invite
+/// issue, warm the child's share-root cache on a share's WebSocket
+/// handshake) and `notifications_record_access` (the first `invite`
+/// producer) — and closing a member's sockets when its caps change.
+///
+/// An internal call is the broker's own request: the per-child bearer, the
+/// [`crate::access::INTERNAL_CALL_HEADER`] marker, `X-Ikenga-Principal` for
+/// the child's logs, and **no** caps or share header (§4.5.3: an internal
+/// arm refuses any). It is never a relayed client request.
+pub struct ShareChildCalls {
+    pub pool: sqlx::SqlitePool,
+    pub children: Arc<super::children::Children>,
+    pub http: reqwest::Client,
+    pub ws: Arc<super::ws_registry::WsRegistry>,
+}
+
+impl ShareChildCalls {
+    pub fn new(state: &BrokerState) -> Self {
+        Self {
+            pool: state.pool.clone(),
+            children: state.children.clone(),
+            http: state.http.clone(),
+            ws: state.ws.clone(),
+        }
+    }
+
+    async fn owner(
+        &self,
+        id: crate::executor::PrincipalId,
+    ) -> Result<Principal, crate::access::AccessError> {
+        use crate::access::{AccessError, Code};
+        let mut conn = self.pool.acquire().await.map_err(AccessError::internal)?;
+        match crate::server::operator::accounts::by_id(&mut conn, id)
+            .await
+            .map_err(AccessError::internal)?
+        {
+            Some(a) if !a.is_disabled() => Ok(a.principal()),
+            _ => Err(AccessError::new(Code::NotFound, "no such project")),
+        }
+    }
+}
+
+/// `"<code>: <message>"` (the child's RPC error) → an access error.
+fn child_error(raw: &str) -> crate::access::AccessError {
+    use crate::access::{AccessError, Code};
+    let (head, msg) = raw.split_once(':').unwrap_or(("", raw));
+    let code = match head.trim() {
+        "not_found" => Code::NotFound,
+        "forbidden" => Code::Forbidden,
+        "invalid_request" => Code::InvalidRequest,
+        "gone" => Code::Gone,
+        "conflict" => Code::Conflict,
+        _ => Code::Internal,
+    };
+    AccessError::new(code, msg.trim().to_string())
+}
+
+impl crate::access::share::OwnerCalls for ShareChildCalls {
+    fn call<'a>(
+        &'a self,
+        owner: crate::executor::PrincipalId,
+        cmd: &'a str,
+        args: Value,
+    ) -> crate::access::share::BoxFuture<'a, Result<Value, crate::access::AccessError>> {
+        Box::pin(async move {
+            use crate::access::{AccessError, Code};
+            let principal = self.owner(owner).await?;
+            let body = serde_json::json!({ "cmd": cmd, "args": args });
+            for attempt in 0..2 {
+                let endpoint = self.children.endpoint(&principal).await.map_err(|e| {
+                    AccessError::new(
+                        Code::Internal,
+                        format!("the owner's workspace is unavailable: {e:#}"),
+                    )
+                })?;
+                let sent = self
+                    .http
+                    .post(format!("http://{}/api/rpc", endpoint.addr))
+                    .bearer_auth(&*endpoint.token)
+                    .header(PRINCIPAL_HEADER, principal.id.to_string())
+                    .header(crate::access::INTERNAL_CALL_HEADER, "1")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await;
+                match sent {
+                    Ok(resp) => {
+                        let bytes = resp.bytes().await.map_err(AccessError::internal)?;
+                        let v: Value =
+                            serde_json::from_slice(&bytes).map_err(AccessError::internal)?;
+                        if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                            return Ok(v.get("data").cloned().unwrap_or(Value::Null));
+                        }
+                        let err = v
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("internal: error");
+                        return Err(child_error(err));
+                    }
+                    Err(e) if e.is_connect() && attempt == 0 => {
+                        self.children.invalidate(principal.id, &endpoint).await;
+                    }
+                    Err(e) => return Err(AccessError::internal(e)),
+                }
+            }
+            Err(AccessError::new(
+                Code::Internal,
+                "the owner's workspace did not answer",
+            ))
+        })
+    }
+
+    fn close_principal(&self, principal: crate::executor::PrincipalId) -> usize {
+        let close = crate::access::sockets::Close::CAPS_CHANGED;
+        self.ws.close_where(
+            super::ws_registry::CloseReason {
+                code: close.code,
+                reason: close.reason,
+            },
+            |k| k.principal_id == principal,
+        )
+    }
+}
+
 /// `POST /api/rpc` → R-3 → the principal's child.
 pub async fn rpc_proxy(
     State(state): State<Arc<BrokerState>>,

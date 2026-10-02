@@ -291,13 +291,178 @@ async fn status(
     res
 }
 
-/// WP-76 replaces these bodies.
-async fn invite_gone() -> Response {
+/// No invite host (T0, or a router built without the broker): every invite
+/// link is `410 gone`.
+fn invite_gone() -> Response {
     error(
         StatusCode::GONE,
         "gone",
-        "This invite link is not valid (invites are not available yet).",
+        "This invite link is not valid (invites need an Ikenga server with accounts).",
     )
+}
+
+fn access_error(e: &super::AccessError) -> Response {
+    let mut res = error(e.code.status(), e.code.as_str(), &e.message);
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+fn peer_addr(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
+    conn.as_ref()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// `POST /access/invite/inspect {token}` (§7.3, WP-76): the invite's
+/// project, Owner, role, scope and expiry, or `410 gone`. Throttled per
+/// address on bad tokens.
+#[cfg(target_os = "linux")]
+async fn invite_inspect(
+    host: Option<Extension<Arc<super::invites::InviteHost>>>,
+    conn: Option<ConnectInfo<SocketAddr>>,
+    body: Bytes,
+) -> Response {
+    let Some(Extension(host)) = host else {
+        return invite_gone();
+    };
+    let addr = peer_addr(&conn);
+    let now = super::share::now_ms();
+    if let Err(e) = host.throttle.check(&addr, now) {
+        return access_error(&e);
+    }
+    let token = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    match super::invites::inspect(&host.store, &token, now).await {
+        Ok(v) => {
+            let mut body = serde_json::to_value(v).unwrap_or(Value::Null);
+            body["ok"] = json!(true);
+            let mut res = Json(body).into_response();
+            res.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+        Err(e) => {
+            if e.code == super::Code::Gone {
+                host.throttle.fail(&addr, now);
+            }
+            access_error(&e)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn invite_inspect() -> Response {
+    invite_gone()
+}
+
+/// `POST /access/invite/accept {token, existing?: true} | {token, username,
+/// password}` (§7.3, WP-76). Form 1 needs the `ikenga_session` cookie; form
+/// 2 creates the account (only on an `allow_new_account` invite) and signs
+/// it in. One transaction with the provisioning core (R-8).
+#[cfg(target_os = "linux")]
+async fn invite_accept(
+    host: Option<Extension<Arc<super::invites::InviteHost>>>,
+    conn: Option<ConnectInfo<SocketAddr>>,
+    auth: Option<axum_login::AuthSession<crate::server::auth::backend::AccountsBackend>>,
+    session: Option<tower_sessions::Session>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use super::invites::AcceptForm;
+    let Some(Extension(host)) = host else {
+        return invite_gone();
+    };
+    let addr = peer_addr(&conn);
+    let now = super::share::now_ms();
+    if let Err(e) = host.throttle.check(&addr, now) {
+        return access_error(&e);
+    }
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "expected JSON");
+    };
+    let text = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
+    let token = text("token").unwrap_or_default();
+    let signed_in = auth
+        .as_ref()
+        .and_then(|a| a.user.as_ref())
+        .map(|u| u.account.principal_id);
+    let form = match (text("username"), text("password")) {
+        (Some(username), Some(password)) if body.get("existing") != Some(&json!(true)) => {
+            AcceptForm::New { username, password }
+        }
+        _ => match signed_in {
+            Some(id) => AcceptForm::Existing(id),
+            None => {
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthenticated",
+                    "Sign in to accept this invite.",
+                )
+            }
+        },
+    };
+    let meta = super::ctx::RequestMeta {
+        remote_addr: conn.as_ref().map(|c| c.0.ip().to_string()),
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.chars().take(256).collect()),
+        ..Default::default()
+    };
+    let accepted = match super::invites::accept(&host, &token, form, &meta, now).await {
+        Ok(a) => a,
+        Err(e) => {
+            if e.code == super::Code::Gone {
+                host.throttle.fail(&addr, now);
+            }
+            return access_error(&e);
+        }
+    };
+    // A new account is signed in (§7.3 "a new account gets a session
+    // cookie"); P-4: a fresh session id.
+    if let (Some(account), Some(mut auth)) = (accepted.account.clone(), auth) {
+        if let Some(session) = &session {
+            if let Err(e) = session.cycle_id().await {
+                tracing::warn!("invite accept: cycling the session id failed: {e}");
+            }
+        }
+        if let Err(e) = auth
+            .login(&crate::server::auth::backend::BrokerUser::new(account))
+            .await
+        {
+            tracing::warn!("invite accept: signing the new account in failed: {e}");
+        }
+    }
+    let (owner, project_id) = accepted
+        .project_key
+        .split_once('/')
+        .map(|(o, p)| (o.to_string(), p.to_string()))
+        .unwrap_or_default();
+    let mut res = Json(json!({
+        "ok": true,
+        "principalId": accepted.principal_id.to_string(),
+        "username": accepted.username,
+        "newAccount": accepted.new_account,
+        "share": {
+            "projectKey": accepted.project_key,
+            "ownerPrincipalId": owner,
+            "projectId": project_id,
+            "projectName": accepted.project_name,
+            "role": accepted.role.as_str(),
+        },
+    }))
+    .into_response();
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn invite_accept() -> Response {
+    invite_gone()
 }
 
 /// `/access/pair/{hello,confirm,status}`, relative to the prefix. The
@@ -337,12 +502,22 @@ async fn t0_pairing_host(mut req: Request, next: Next) -> Response {
 /// `/access/invite/{inspect,accept}` (T1 only), relative to the prefix.
 pub fn invite_routes(allowed_origins: Vec<String>) -> Router {
     Router::new()
-        .route("/inspect", post(invite_gone))
-        .route("/accept", post(invite_gone))
+        .route("/inspect", post(invite_inspect))
+        .route("/accept", post(invite_accept))
         .layer(middleware::from_fn_with_state(
             Arc::new(allowed_origins),
             origin_layer,
         ))
+}
+
+/// The T1 broker's invite routes (nested under `INVITE_PREFIX`), serving
+/// against its [`super::invites::InviteHost`] (WP-76).
+#[cfg(target_os = "linux")]
+pub fn invite_routes_for(
+    host: Arc<super::invites::InviteHost>,
+    allowed_origins: Vec<String>,
+) -> Router {
+    invite_routes(allowed_origins).layer(Extension(host))
 }
 
 pub const PAIRING_PREFIX: &str = "/access/pair";

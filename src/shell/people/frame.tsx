@@ -1,10 +1,10 @@
-// D-05 People frame pieces shared by the Profile and Devices tabs (WP-72).
+// D-05 People frame pieces shared by the People tabs (WP-72; WP-76 adds
+// Members and Policies).
 //
 // The design's `.phead` title + `new` chip, the tab strip (`.ptabs`), and the
-// `.block` / `.srow2` settings rows (`designs/people.html`). Only the tabs
-// that don't need a principal exist yet: Profile and Devices. Members,
-// Policies and Audit come with G-ACCESS (WP-76, WP-77). G-101 leaves them out
-// on purpose rather than mocking them.
+// `.block` / `.srow2` settings rows (`designs/people.html`). Profile and
+// Devices are personal; Members and Policies are per project (G-ACCESS §4,
+// §11.1 "scope switch"). Audit comes with WP-77.
 
 import type { ReactNode } from 'react';
 
@@ -14,9 +14,18 @@ import { cn } from '@/components/ui/utils';
 export const PEOPLE_TABS = [
 	{ to: '/settings/profile', label: 'Profile', exact: true },
 	{ to: '/settings/devices', label: 'Devices', exact: true },
+	{ to: '/settings/members', label: 'Members', exact: true },
+	{ to: '/settings/policies', label: 'Policies', exact: true },
 ] as const;
 
-export function PeopleHeader({ tab }: { tab: 'profile' | 'devices' }) {
+export type PeopleTab = 'profile' | 'devices' | 'members' | 'policies';
+
+/** D-05 `#scopeSw`: which scope a tab lives at (G-ACCESS §11.1). */
+export function tabScope(tab: PeopleTab): 'personal' | 'project' {
+	return tab === 'members' || tab === 'policies' ? 'project' : 'personal';
+}
+
+export function PeopleHeader({ tab }: { tab: PeopleTab }) {
 	return (
 		<div className="space-y-3">
 			<header className="flex flex-wrap items-center gap-2">

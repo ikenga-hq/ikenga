@@ -183,6 +183,12 @@ pub struct Comment {
     pub acknowledged_at: Option<i64>,
     #[serde(rename = "resolvedAt")]
     pub resolved_at: Option<i64>,
+    /// G-ACCESS §4.5.4 (WP-76, column from 0070): who wrote it. `None` for
+    /// the Owner's own comments (and every row from before 0070); a share
+    /// member's comment carries the member's `principal_id`, so a non-Owner
+    /// may change only their own rows.
+    #[serde(rename = "authorPrincipalId")]
+    pub author_principal_id: Option<String>,
 }
 
 type CommentRow = (
@@ -200,11 +206,12 @@ type CommentRow = (
     i64,            // created_at
     Option<i64>,    // acknowledged_at
     Option<i64>,    // resolved_at
+    Option<String>, // author_principal_id
 );
 
 const COMMENT_COLUMNS: &str = "id, artifact_path, selector, text, screenshot_path, \
     status, position_x, position_y, thread_id, opening_session_id, sink, \
-    created_at, acknowledged_at, resolved_at";
+    created_at, acknowledged_at, resolved_at, author_principal_id";
 
 fn row_to_comment(row: CommentRow) -> Comment {
     Comment {
@@ -222,11 +229,39 @@ fn row_to_comment(row: CommentRow) -> Comment {
         created_at: row.11,
         acknowledged_at: row.12,
         resolved_at: row.13,
+        author_principal_id: row.14,
     }
 }
 
 pub async fn create(
     db: &PaDb,
+    artifact_path: String,
+    selector: String,
+    text: String,
+    screenshot_path: Option<String>,
+    position_x: Option<f64>,
+    position_y: Option<f64>,
+) -> Result<Comment, String> {
+    create_as(
+        db,
+        None,
+        artifact_path,
+        selector,
+        text,
+        screenshot_path,
+        position_x,
+        position_y,
+    )
+    .await
+}
+
+/// [`create`] with an author (G-ACCESS §4.5.4, WP-76): a share member's
+/// comment is stamped with the member's `principal_id`, taken from the
+/// broker's `X-Ikenga-Share-Principal` — never from the request body.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_as(
+    db: &PaDb,
+    author_principal_id: Option<String>,
     artifact_path: String,
     selector: String,
     text: String,
@@ -247,8 +282,8 @@ pub async fn create(
     let created_at = now_millis();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO artifact_comments (artifact_path, selector, text, screenshot_path, \
-         status, position_x, position_y, created_at) \
-         VALUES (?, ?, ?, ?, 'open', ?, ?, ?) RETURNING id",
+         status, position_x, position_y, created_at, author_principal_id) \
+         VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?) RETURNING id",
     )
     .bind(&artifact_path)
     .bind(&selector)
@@ -257,6 +292,7 @@ pub async fn create(
     .bind(position_x)
     .bind(position_y)
     .bind(created_at)
+    .bind(&author_principal_id)
     .fetch_one(&pool)
     .await
     .map_err(|e| format!("insert comment: {e}"))?;
@@ -269,6 +305,21 @@ pub async fn create(
     .await
     .map_err(|e| format!("read created comment: {e}"))?;
     Ok(row_to_comment(row))
+}
+
+/// A comment's `artifact_path` and `author_principal_id` (G-ACCESS §4.5.4:
+/// the share pre-hook's ownership and confinement check). `None` when the
+/// row doesn't exist.
+pub async fn path_and_author(
+    db: &PaDb,
+    id: i64,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let pool = db.ensure_pool().await?;
+    sqlx::query_as("SELECT artifact_path, author_principal_id FROM artifact_comments WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("read comment: {e}"))
 }
 
 pub async fn get(db: &PaDb, id: i64) -> Result<Comment, String> {

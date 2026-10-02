@@ -88,6 +88,28 @@ const NO_ALLOWLIST: &str = "fs allowlist not initialized (the daemon needs --dat
 pub(crate) struct PathGuard {
     roots: GuardRoots,
     reserved: std::sync::Arc<super::reserved::Reserved>,
+    /// G-ACCESS §4.5.4 (WP-76): a share request's confinement — the shared
+    /// project's root, or the one artifact for artifact scope. `None` for
+    /// every own-workspace guard. Set only by [`PathGuard::narrowed_to`].
+    narrow: Option<std::sync::Arc<Narrow>>,
+}
+
+/// What [`PathGuard::narrowed_to`] confines a guard to (canonical).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Narrow {
+    /// The path itself and everything under it.
+    Tree(PathBuf),
+    /// Exactly this file (artifact scope, §4.2).
+    File(PathBuf),
+}
+
+impl Narrow {
+    fn admits(&self, canonical: &Path) -> bool {
+        match self {
+            Narrow::Tree(root) => canonical.starts_with(root),
+            Narrow::File(file) => canonical == file,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -103,6 +125,7 @@ impl PathGuard {
         Self {
             roots: GuardRoots::Allowlist,
             reserved: Default::default(),
+            narrow: None,
         }
     }
 
@@ -112,7 +135,45 @@ impl PathGuard {
         Self {
             roots: GuardRoots::Local(roots),
             reserved: Default::default(),
+            narrow: None,
         }
+    }
+
+    /// G-ACCESS §4.5.4 (WP-76): this guard, further confined to `target` —
+    /// a share's project root (a directory: it and everything under it) or
+    /// its one artifact (a file: exactly that path, §4.2). `target` is
+    /// canonicalized first, so a symlink in its spelling can't widen it, and
+    /// every later check compares the caller's **canonical** path, so neither
+    /// `..` nor a symlink inside the tree escapes it (A-21). The allowlist and
+    /// the reserved set still apply: narrowing only ever removes paths. A
+    /// target that doesn't resolve is refused rather than left unconfined,
+    /// and narrowing an already narrowed guard can only shrink it.
+    pub(crate) fn narrowed_to(&self, target: &Path) -> Result<Self, String> {
+        let c = target
+            .canonicalize()
+            .map_err(|e| format!("share root {}: {e}", target.display()))?;
+        let narrow = if c.is_dir() {
+            Narrow::Tree(c)
+        } else if c.is_file() {
+            Narrow::File(c)
+        } else {
+            return Err(format!(
+                "share root is neither a directory nor a file: {}",
+                c.display()
+            ));
+        };
+        if let Some(outer) = &self.narrow {
+            let inner = match &narrow {
+                Narrow::Tree(p) | Narrow::File(p) => p,
+            };
+            if !outer.admits(inner) {
+                return Err(format!("{} is outside the share", inner.display()));
+            }
+        }
+        Ok(Self {
+            narrow: Some(std::sync::Arc::new(narrow)),
+            ..self.clone()
+        })
     }
 
     /// This guard, refusing `reserved` on every check as well.
@@ -261,6 +322,14 @@ impl PathGuard {
         };
         if !allowed {
             return Err(format!("path outside allowlist: {}", canonical.display()));
+        }
+        if let Some(narrow) = &self.narrow {
+            if !narrow.admits(canonical) {
+                return Err(format!(
+                    "forbidden: outside the shared project: {}",
+                    canonical.display()
+                ));
+            }
         }
         self.check_reserved(canonical)
     }
@@ -2368,5 +2437,55 @@ mod tests {
             ok(r, "studio_message_list", json!({ "threadId": tid })).await,
             json!([])
         );
+    }
+
+    /// G-ACCESS A-21 (WP-76): `PathGuard::narrowed_to` confines every check
+    /// to the share root — or exactly the shared artifact — through a `..`
+    /// spelling and a symlink pointing out of the root alike.
+    #[test]
+    fn narrowed_to_confines_to_the_share_root_and_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let allowed = root.join("allowed");
+        let project = allowed.join("proj");
+        let other = allowed.join("other");
+        std::fs::create_dir_all(project.join("docs")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(project.join("docs/brief.md"), "x").unwrap();
+        std::fs::write(project.join("notes.md"), "y").unwrap();
+        std::fs::write(other.join("secret.md"), "z").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&other, project.join("escape")).unwrap();
+        let roots_file = root.join("fs_roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [allowed.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let guard = PathGuard::roots(Arc::new(
+            crate::fs_roots::FsRoots::load(roots_file).unwrap(),
+        ));
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let tree = guard.narrowed_to(&project).unwrap();
+        assert!(tree.resolve(&s(&project.join("notes.md"))).is_ok());
+        assert!(tree.resolve_deep(&s(&project.join("new/deep.md"))).is_ok());
+        assert!(tree.resolve(&s(&other.join("secret.md"))).is_err());
+        assert!(tree
+            .resolve(&format!("{}/../other/secret.md", s(&project)))
+            .is_err());
+        #[cfg(unix)]
+        assert!(
+            tree.resolve(&s(&project.join("escape/secret.md"))).is_err(),
+            "a symlink out of the share is refused"
+        );
+        assert!(
+            guard.resolve(&s(&other.join("secret.md"))).is_ok(),
+            "the router's own guard is untouched"
+        );
+        let file = guard.narrowed_to(&project.join("docs/brief.md")).unwrap();
+        assert!(file.resolve(&s(&project.join("docs/brief.md"))).is_ok());
+        assert!(file.resolve(&s(&project.join("notes.md"))).is_err());
+        assert!(tree.narrowed_to(&other).is_err(), "narrowing only shrinks");
+        assert!(guard.narrowed_to(&project.join("missing")).is_err());
     }
 }

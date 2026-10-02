@@ -1,5 +1,5 @@
 import { connectionStateStore } from './connection-state';
-import { transportToken } from './index';
+import { transportToken, withShareQuery } from './index';
 
 /** `?token=` for T0; nothing under T1, where the session cookie rides the
  *  WebSocket handshake (G-PRINCIPAL §2.3). */
@@ -89,7 +89,10 @@ export class ChatWebSocketClient {
 		this.setStatus(this.attempt > 0 ? 'reconnecting' : 'connecting');
 
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const uri = `${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(this.threadId)}${tokenQuery()}`;
+		// G-ACCESS §4.5.2 (WP-76): in share mode the socket selects the share.
+		const uri = withShareQuery(
+			`${protocol}//${window.location.host}/ws/chat/${encodeURIComponent(this.threadId)}${tokenQuery()}`
+		);
 
 		try {
 			this.ws = new WebSocket(uri);

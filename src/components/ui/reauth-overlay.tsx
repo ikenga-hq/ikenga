@@ -1,7 +1,22 @@
-import { type FormEvent, useState, useEffect } from 'react';
+import { type FormEvent, lazy, Suspense, useEffect, useState } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { isT1Session } from '@/lib/transport/t1-session';
+import { ShareModeBanner } from '@/shell/people/shared-with-you';
 import { T1SignInForm } from './t1-sign-in-form';
+
+// WP-76 (G-ACCESS §7.3): a signed-out browser on a T1 server boots straight
+// into this overlay, so an invite link (`/remote/invite#t=…`) is answered
+// here — the invitee may have no account yet.
+const InvitePage = lazy(() =>
+	import('@/routes/remote/invite').then((m) => ({ default: m.InvitePage }))
+);
+
+/** Whether this tab was opened on an invite link. */
+function onInvitePath(): boolean {
+	if (typeof window === 'undefined') return false;
+	const p = window.location.pathname;
+	return p === '/remote/invite' || p.startsWith('/remote/invite/');
+}
 
 /**
  * "Pair this device" (G-ACCESS §3.12, WP-74b): beside the T0 token and WP-20's
@@ -73,26 +88,36 @@ function PairThisDevice() {
 	);
 }
 
-/** The way into pair mode from the token / password modes (equal weight
- *  belongs to WP-76's restyle; this is the plain entry). */
-function PairModeLink({ floating }: { floating?: boolean }) {
+/** The way into pair mode from the T0 token mode. (Under T1 the restyled
+ *  sign-in carries it with equal weight, WP-76.) */
+function PairModeLink() {
 	const setMode = useReauthStore((s) => s.setMode);
 	return (
 		<button
 			type="button"
 			onClick={() => setMode('pair')}
-			className={
-				floating
-					? 'fixed bottom-6 left-1/2 z-[51] -translate-x-1/2 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-2 text-[var(--text-body-sm)] text-[var(--fg)] shadow-lg hover:bg-[var(--bg-sunken)] cursor-pointer'
-					: 'mt-3 text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer'
-			}
+			className="mt-3 text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
 		>
 			Pair this device with a code
 		</button>
 	);
 }
 
+/**
+ * The session chrome every browser boot root renders: the share-mode strip
+ * (G-ACCESS §4.5.2, WP-76) and, when a credential is needed, the
+ * re-authentication overlay.
+ */
 export function ReauthOverlay() {
+	return (
+		<>
+			<ShareModeBanner />
+			<ReauthDialog />
+		</>
+	);
+}
+
+function ReauthDialog() {
 	const isOpen = useReauthStore((s) => s.isOpen);
 	const mode = useReauthStore((s) => s.mode);
 	const tokenInput = useReauthStore((s) => s.tokenInput);
@@ -119,14 +144,18 @@ export function ReauthOverlay() {
 
 	if (!isOpen) return null;
 	if (mode === 'pair') return <PairThisDevice />;
-	// T1: there is no token to paste; principals sign in (G-PRINCIPAL §2.4).
-	if (isT1Session())
-		return (
-			<>
-				<T1SignInForm />
-				<PairModeLink floating />
-			</>
-		);
+	// T1: there is no token to paste; principals sign in (G-PRINCIPAL §2.4),
+	// or accept an invite (§7.3) — D-05 `sign-in`, restyled (WP-76).
+	if (isT1Session()) {
+		if (onInvitePath()) {
+			return (
+				<Suspense fallback={null}>
+					<InvitePage />
+				</Suspense>
+			);
+		}
+		return <T1SignInForm />;
+	}
 
 	const handleReconnect = async () => {
 		setLoading(true);
