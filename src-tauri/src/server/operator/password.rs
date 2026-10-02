@@ -121,6 +121,23 @@ pub fn verify_blocking(phc: &str, password: &str) -> bool {
     argon2::verify_encoded(phc, password.as_bytes()).unwrap_or(false)
 }
 
+/// Whether `phc` was hashed with other than the live parameters (§6.2:
+/// "raising them later is rehash-on-next-login"). A PHC this build can't
+/// read is due for a rehash too.
+pub fn needs_rehash(phc: &str) -> bool {
+    let live = format!(
+        "$argon2id$v=19$m={ARGON2_MEMORY_KIB},t={ARGON2_ITERATIONS},p={ARGON2_PARALLELISM}$"
+    );
+    let Some(rest) = phc.strip_prefix(&live) else {
+        return true;
+    };
+    // `<salt>$<hash>`, unpadded base64: a 32-byte hash is 43 characters.
+    match rest.split_once('$') {
+        Some((salt, hash)) => salt.is_empty() || hash.len() != 43,
+        None => true,
+    }
+}
+
 /// A fixed hash at the live parameters that no password the user typed is
 /// checked against meaningfully — it exists so the unknown-user path does the
 /// same work as the known-user one.
@@ -706,6 +723,28 @@ mod tests {
         assert!(!verify_blocking("not a phc string", "correct horse"));
         // Fresh salt every time.
         assert_ne!(phc, hash_blocking("correct horse").unwrap());
+    }
+
+    #[test]
+    fn needs_rehash_only_off_the_live_parameters() {
+        assert!(!needs_rehash(&hash_blocking("correct horse").unwrap()));
+        let old = argon2::hash_encoded(
+            b"correct horse",
+            b"0123456789abcdef",
+            &argon2::Config {
+                variant: argon2::Variant::Argon2id,
+                version: argon2::Version::Version13,
+                mem_cost: 8_192,
+                time_cost: 1,
+                lanes: 1,
+                secret: &[],
+                ad: &[],
+                hash_length: 32,
+            },
+        )
+        .unwrap();
+        assert!(needs_rehash(&old), "{old}");
+        assert!(needs_rehash("not a phc"));
     }
 
     #[test]

@@ -36,7 +36,9 @@ pub async fn pty_ws_handler(
     Query(query): Query<PtyQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_pty_socket(socket, state, id, query))
+    ws.on_upgrade(move |socket| {
+        super::activity::track_ws(handle_pty_socket(socket, state, id, query))
+    })
 }
 
 /// Control frames are JSON text; terminal output is always binary. The client

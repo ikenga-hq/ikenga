@@ -1313,8 +1313,9 @@ impl Provisioner {
     /// §7.3 disable: set `disabled_at`, bump `session_epoch`, lock the passwd
     /// entry (`!` password, nologin shell) — all before `COMMIT`, so a failed
     /// lock disables nothing — then kill every process of the uid. Files, uid
-    /// and `principal_id` are kept. Stopping the principal's child is the
-    /// broker's (slice 3).
+    /// and `principal_id` are kept. The uid-wide kill takes the principal's
+    /// child down with everything else; a running broker also stops it once
+    /// it sees the disable (`server::broker`).
     pub async fn disable(
         &self,
         pool: &SqlitePool,

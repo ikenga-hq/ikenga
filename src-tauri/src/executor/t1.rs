@@ -418,6 +418,36 @@ impl SessionExecutor for T1Executor {
     }
 }
 
+/// The broker keeps an `Arc` of its executor — its child launcher needs
+/// [`T1Executor::spawn_piped_with_host_env`] — and installs a clone as the
+/// process-wide [`super::current`], so `/api/health` and every other spawn
+/// see the one probed, degradable instance.
+impl SessionExecutor for std::sync::Arc<T1Executor> {
+    fn capabilities(&self) -> Capabilities {
+        self.as_ref().capabilities()
+    }
+
+    fn probe_stamp(&self) -> Option<ProbeStamp> {
+        self.as_ref().probe_stamp()
+    }
+
+    fn spawn_pty(&self, spec: SpawnSpec, size: PtySize) -> anyhow::Result<PtyChild> {
+        self.as_ref().spawn_pty(spec, size)
+    }
+
+    fn spawn_piped(&self, spec: SpawnSpec, opts: PipedOpts) -> io::Result<tokio::process::Child> {
+        self.as_ref().spawn_piped(spec, opts)
+    }
+
+    fn spawn_output_blocking(
+        &self,
+        spec: SpawnSpec,
+        opts: PipedOpts,
+    ) -> io::Result<std::process::Output> {
+        self.as_ref().spawn_output_blocking(spec, opts)
+    }
+}
+
 /// `ikenga-server __t1-kill-all` — the §7.3 uid-wide kill helper, spawned
 /// **through the T1 executor as the principal**: `kill(-1, SIGKILL)` reaches
 /// every process that uid may signal (Linux skips the caller and init),

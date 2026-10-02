@@ -321,6 +321,35 @@ pub async fn set_password_in(
     Ok(account)
 }
 
+/// Rehash-on-login (§6.2): replace `old_phc` with `new_phc`, the same
+/// password at the live argon2 parameters. Not a password change: no epoch
+/// bump, no `password_changed` row. Conditional on the row still holding
+/// `old_phc`, so it never undoes a concurrent `passwd`; `Ok(None)` when it
+/// lost that race. (The session auth hash follows the PHC, so the
+/// principal's *other* sessions sign in again once.)
+pub async fn rehash_password_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: PrincipalId,
+    old_phc: &str,
+    new_phc: &str,
+) -> Result<Option<Account>, sqlx::Error> {
+    let n = sqlx::query(
+        "UPDATE accounts SET password_phc = ?, updated_at = ? \
+         WHERE principal_id = ? AND password_phc = ?",
+    )
+    .bind(new_phc)
+    .bind(now_secs())
+    .bind(id.to_string())
+    .bind(old_phc)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if n != 1 {
+        return Ok(None);
+    }
+    reload(tx, id).await.map(Some)
+}
+
 /// Forced logout: bump `session_epoch`, write `sessions_revoked`, and call the
 /// R-11 hook — all inside `tx`, so a failing hook revokes nothing.
 pub async fn revoke_sessions_in(

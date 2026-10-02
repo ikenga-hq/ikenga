@@ -169,6 +169,18 @@ minisign-verify = "=0.2.5"
 # URL parsing for pkg_webview navigation. Already a transitive dep via several
 # crates; pinning explicitly so usage in pkg/webview.rs is direct.
 url = "2"
+# T1 broker sessions (G-PRINCIPAL §2.2, §6.3 pins): axum-login 0.16 is the last
+# line on axum 0.7 / tower-sessions 0.13; the sqlx store 0.14 is the one on
+# tower-sessions-core 0.13 + sqlx 0.8 (0.13 needs core 0.12 — never use it).
+axum-login = "=0.16"
+tower-sessions = "0.13"
+tower-sessions-sqlx-store = { version = "0.14", features = ["sqlite"] }
+# The session record codec the sqlx store uses (already in the tree through
+# it): the broker's UPDATE-only `save` writes the same encoding.
+rmp-serde = "1"
+# The broker's WS reverse proxy (G-PRINCIPAL §3, topology B). 0.24 is the
+# version axum 0.7's `ws` feature already pulls in, so no new tungstenite.
+tokio-tungstenite = "0.24"
 
 
 # Agent Client Protocol — types + traits for our in-process ACP server

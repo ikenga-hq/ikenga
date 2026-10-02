@@ -15,7 +15,8 @@
 //! ```
 //!
 //! Module map (G-ACCESS R-6 keeps account provisioning apart from credential
-//! resolution, proxying and child launch, which land in later slices):
+//! resolution — `server::auth` — and proxying and child launch —
+//! `server::broker`):
 //!
 //! * [`migrations`] — the embedded `accounts` set and the `(set, version)`
 //!   bookkeeping table (R-1).
@@ -55,10 +56,9 @@ use crate::executor::PrincipalId;
 /// Files that only a T0 daemon writes at the top of its `--data-dir`. Any of
 /// them at an operator root means the directory is (or was) a T0 install.
 ///
-/// SLICE-3 TRAP: `run_server` writes `<data_dir>/daemon.json` today
-/// (`server/mod.rs`). Under T1 that write must move to
-/// `operator/daemon.json` (§4) before the broker boots, or the second T1 boot
-/// refuses its own root here.
+/// `daemon.json` is among them: the T0 daemon writes `<data_dir>/daemon.json`,
+/// while the T1 broker writes `operator/daemon.json` (§4, `server::broker`),
+/// so a second T1 boot never trips over its own discovery file.
 const T0_MARKERS: &[&str] = &[
     "ikenga.db",
     "ikenga.db-wal",
