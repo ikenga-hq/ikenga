@@ -529,11 +529,11 @@ function AuditTable({
 			>
 				<thead>
 					<tr className="border-b border-[var(--border-soft)] text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
-						<th className="px-3 py-2 font-semibold">Who</th>
-						<th className="px-3 py-2 font-semibold">Device</th>
-						<th className="px-3 py-2 font-semibold">Action</th>
-						<th className="px-3 py-2 font-semibold">Target</th>
-						<th className="px-3 py-2 text-right font-semibold">When</th>
+						<th className="h-6 px-3 py-0 font-semibold">Who</th>
+						<th className="h-6 px-3 py-0 font-semibold">Device</th>
+						<th className="h-6 px-3 py-0 font-semibold">Action</th>
+						<th className="h-6 px-3 py-0 font-semibold">Target</th>
+						<th className="h-6 px-3 py-0 text-right font-semibold">When</th>
 					</tr>
 				</thead>
 				<tbody id="auditBody">
@@ -552,16 +552,16 @@ function AuditTable({
 								data-category={r.category}
 								className="border-b border-[var(--border-soft)] last:border-b-0"
 							>
-								<td className="px-3 py-2 text-[var(--fg)]">{whoLabel(r)}</td>
-								<td className="px-3 py-2 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg)]">{whoLabel(r)}</td>
+								<td className="h-9 px-3 py-0 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 									{deviceLabel(r)}
 								</td>
-								<td className="px-3 py-2 text-[var(--fg)]">{actionLabel(r)}</td>
-								<td className="max-w-[280px] truncate px-3 py-2 font-mono text-[length:var(--text-micro)] text-[var(--fg)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg)]">{actionLabel(r)}</td>
+								<td className="max-w-[280px] truncate h-9 px-3 py-0 font-mono text-[length:var(--text-micro)] text-[var(--fg)]">
 									{targetLabel(r)}
 								</td>
 								<td
-									className="px-3 py-2 text-right font-mono text-[var(--fg-muted)]"
+									className="h-9 px-3 py-0 text-right font-mono text-[var(--fg-muted)]"
 									title={new Date(r.atMs).toISOString()}
 								>
 									{whenLabel(r.atMs, now)}

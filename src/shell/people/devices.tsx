@@ -278,12 +278,12 @@ function DevicesTableBlock({ devices, onPair }: { devices: DevicesState; onPair:
 				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
 						<tr className="border-b border-[var(--border-soft)] text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
-							<th className="px-3 py-2 font-semibold">Device</th>
-							<th className="px-3 py-2 font-semibold">Last seen</th>
-							<th className="px-3 py-2 font-semibold">Address</th>
-							<th className="px-3 py-2 font-semibold">What it can do</th>
-							<th className="px-3 py-2 font-semibold">Live sessions</th>
-							<th className="px-3 py-2 text-right font-semibold">
+							<th className="h-6 px-3 py-0 font-semibold">Device</th>
+							<th className="h-6 px-3 py-0 font-semibold">Last seen</th>
+							<th className="h-6 px-3 py-0 font-semibold">Address</th>
+							<th className="h-6 px-3 py-0 font-semibold">What it can do</th>
+							<th className="h-6 px-3 py-0 text-right font-semibold">Live sessions</th>
+							<th className="h-6 px-3 py-0 text-right font-semibold">
 								<span className="sr-only">Actions</span>
 							</th>
 						</tr>
@@ -295,25 +295,25 @@ function DevicesTableBlock({ devices, onPair }: { devices: DevicesState; onPair:
 								data-device-kind={d.kind}
 								className="border-b border-[var(--border-soft)] last:border-b-0"
 							>
-								<td className="px-3 py-2">
-									<span className="block text-[var(--fg)]">{d.name}</span>
+								<td className="h-9 px-3 py-0">
+									<span className="block font-medium text-[var(--fg)]">{d.name}</span>
 									<span className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 										{deviceSubLine(d)}
 									</span>
 								</td>
-								<td className="px-3 py-2 text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">
 									{d.kind === 'host' || d.thisDevice ? 'now' : relativeTime(d.lastSeenAt, now)}
 								</td>
-								<td className="px-3 py-2 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 									{d.kind === 'host' ? 'local' : (d.lastSeenAddr ?? '—')}
 								</td>
-								<td className="px-3 py-2">
+								<td className="h-9 px-3 py-0">
 									<TierMenu device={d} onPick={(t) => void setTier(d, t)} />
 								</td>
-								<td className="px-3 py-2 font-mono text-[var(--fg-muted)]">
-									{d.liveSockets > 0 ? d.liveSockets : '–'}
+								<td className="h-9 px-3 py-0 text-right font-mono text-[var(--fg-muted)]">
+									{d.liveSockets > 0 ? d.liveSockets : '—'}
 								</td>
-								<td className="px-3 py-2 text-right">
+								<td className="h-9 px-3 py-0 text-right">
 									{d.kind === 'host' || d.thisDevice ? (
 										<Kv>this device</Kv>
 									) : (

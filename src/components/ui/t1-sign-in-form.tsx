@@ -49,15 +49,19 @@ export function T1SignInForm() {
 			data-state="sign-in"
 			className={`${D05_FOCUS} fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[var(--bg-base)] p-6 text-[var(--fg)]`}
 		>
-			<form onSubmit={submit} aria-label="Sign in" className="w-full max-w-[420px] space-y-3">
+			<form
+				onSubmit={submit}
+				aria-label="Sign in"
+				className="flex w-full max-w-[420px] flex-col gap-3"
+			>
 				<h1
-					className="m-0 text-center text-[34px] font-semibold tracking-tight"
+					className="m-0 mb-1 text-center text-[34px] font-semibold tracking-tight"
 					style={{ fontFamily: 'var(--font-display)' }}
 				>
 					Ikenga
 				</h1>
 				<h2 className="sr-only">{previous ? 'Sign in again' : 'Sign in'}</h2>
-				<p className="m-0 text-center text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+				<p className="m-0 mb-1 text-center text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 					{previous
 						? 'Your session ended. Your work is untouched — sign in to pick it back up.'
 						: `Sign in to ${host}. Your files, sessions and secrets stay on this server.`}

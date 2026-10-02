@@ -3,13 +3,24 @@
  * outline. Unlayered on purpose: it wins over the shadcn primitives'
  * `outline-none` + 3px ring, which live in Tailwind's `@layer utilities`
  * (a box-shadow ring is not an outline, and the two together read twice).
- * Offsets stay with the control (inset ones inside clipped groups). A
- * container focused by script (`tabindex="-1"`, e.g. the pair-confirm panel)
- * is a landing spot, not a control, and draws nothing. */
+ * A container focused by script (`tabindex="-1"`, e.g. the pair-confirm
+ * panel) is a landing spot, not a control, and draws nothing. */
 .d05-focus :focus-visible:not([tabindex="-1"]),
 .d05-focus:focus-visible:not([tabindex="-1"]) {
 	outline: 2px solid var(--primary);
 	--tw-ring-shadow: 0 0 #0000;
+}
+
+/* D-05 `outline-offset: 1px`: the ring stands 1px clear of the control, so
+ * it reads on a primary-filled button (Pair device, Sign in, Allow once)
+ * whose fill is the ring's own colour. Layered below utilities, so a
+ * control's own `outline-offset-*` (the inset ones inside clipped groups)
+ * still wins. */
+@layer components {
+	.d05-focus :focus-visible:not([tabindex="-1"]),
+	.d05-focus:focus-visible:not([tabindex="-1"]) {
+		outline-offset: 1px;
+	}
 }
 
 /* D-05 `.btn`: a 1px var(--border) edge. The shadcn outline button names a

@@ -82,8 +82,10 @@ async function tabTo(page: Page, el: Locator) {
 }
 
 /** D-05 `:focus-visible`: 2px solid. Polled: the shadcn buttons'
- *  `transition-all` animates the outline in. */
-async function expectFocusRing(page: Page, el: Locator) {
+ *  `transition-all` animates the outline in. `clear` (a primary-filled
+ *  control, whose fill is the ring's colour) also wants the design's
+ *  `outline-offset: 1px` — flush, the ring vanishes into the fill. */
+async function expectFocusRing(page: Page, el: Locator, opts: { clear?: boolean } = {}) {
 	await tabTo(page, el);
 	await expect
 		.poll(
@@ -95,6 +97,13 @@ async function expectFocusRing(page: Page, el: Locator) {
 			{ message: await el.evaluate((node) => node.outerHTML.slice(0, 120)) }
 		)
 		.toEqual({ style: 'solid', width: '2px' });
+	if (opts.clear) {
+		const offset = await el.evaluate((node) => getComputedStyle(node).outlineOffset);
+		expect(
+			Number.parseFloat(offset),
+			'a primary-filled control needs an outline offset'
+		).toBeGreaterThan(0);
+	}
 }
 
 // ── sample content (D-05 `people.html` placeholders) ───────────────────────
@@ -475,12 +484,17 @@ for (const mode of ['dark', 'light'] as const) {
 			await page.keyboard.press('Tab');
 			const allow = confirm.getByRole('button', { name: 'Pair device' });
 			await expect(allow).toBeFocused();
+			// Pair device is primary-filled: the ring must stand clear of it (F1).
 			expect(
 				await allow.evaluate((el) => {
 					const cs = getComputedStyle(el);
-					return { style: cs.outlineStyle, width: cs.outlineWidth };
+					return {
+						style: cs.outlineStyle,
+						width: cs.outlineWidth,
+						clear: Number.parseFloat(cs.outlineOffset) > 0,
+					};
 				})
-			).toEqual({ style: 'solid', width: '2px' });
+			).toEqual({ style: 'solid', width: '2px', clear: true });
 			for (let i = 0; i < 4; i++) {
 				await page.keyboard.press('Tab');
 				expect(
@@ -621,7 +635,7 @@ for (const mode of ['dark', 'light'] as const) {
 					Math.round(a.width) === Math.round(b.width) &&
 					Math.round(a.height) === Math.round(b.height)
 			).toBe(true);
-			await expectFocusRing(page, submit);
+			await expectFocusRing(page, submit, { clear: true });
 			await expectFocusRing(page, pair);
 			await page.mouse.click(5, 5);
 			await page.screenshot({ path: shotPath(testInfo, `people-sign-in-${mode}.png`) });
@@ -744,7 +758,9 @@ for (const mode of ['dark', 'light'] as const) {
 			await expect(sheet.getByRole('button', { name: 'Create invite' })).toBeEnabled();
 			await expect(sheet).not.toContainText('Send invite');
 			await expectFocusRing(page, sheet.getByRole('button', { name: 'Link' }));
-			await expectFocusRing(page, sheet.getByRole('button', { name: 'Create invite' }));
+			await expectFocusRing(page, sheet.getByRole('button', { name: 'Create invite' }), {
+				clear: true,
+			});
 			await page.mouse.move(0, 0);
 			await page.screenshot({ path: shotPath(testInfo, `people-share-kola-${mode}.png`) });
 			expect(pageErrors).toEqual([]);
@@ -854,7 +870,7 @@ for (const mode of ['dark', 'light'] as const) {
 		await expect(card.getByRole('button', { name: 'Allow once' })).toBeVisible();
 		await expect(card.getByRole('button', { name: 'Always for this project' })).toBeVisible();
 		await expect(client.locator('form[data-dispatch="enabled"]')).toBeVisible();
-		await expectFocusRing(page, card.getByRole('button', { name: 'Allow once' }));
+		await expectFocusRing(page, card.getByRole('button', { name: 'Allow once' }), { clear: true });
 		await expectFocusRing(page, card.getByRole('button', { name: 'Deny' }));
 		await page.mouse.move(0, 0);
 		await page.screenshot({ path: shotPath(testInfo, `people-remote-client-${mode}.png`) });

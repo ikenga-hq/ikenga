@@ -238,9 +238,13 @@ export function PairConfirm({
 		}
 	};
 
-	const row = 'grid grid-cols-[140px_1fr_auto] items-baseline gap-3 py-1.5';
-	const k = 'text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]';
-	const v = 'min-w-0 text-[length:var(--text-body-sm)] text-[var(--fg)]';
+	// D-05 `.drow`: a 28px row on a soft hairline; key `.k2` at micro, value at
+	// caption, a `.val.mono` value at micro mono (the code keeps body size).
+	const row =
+		'grid min-h-[28px] grid-cols-[132px_1fr_auto] items-center gap-2 border-b border-[var(--border-soft)] py-1 text-[length:var(--text-caption,12px)]';
+	const k = 'text-[length:var(--text-micro)] text-[var(--fg-muted)]';
+	const v = 'min-w-0 text-[var(--fg)]';
+	const mono = 'font-mono text-[length:var(--text-micro)]';
 
 	return (
 		<div
@@ -277,7 +281,7 @@ export function PairConfirm({
 					</div>
 					<div className={row}>
 						<span className={k}>Address</span>
-						<span className={`${v} font-mono`}>{request.remoteAddr}</span>
+						<span className={`${v} ${mono}`}>{request.remoteAddr}</span>
 					</div>
 					<div className={row}>
 						<span className={k}>Asked</span>
@@ -285,14 +289,16 @@ export function PairConfirm({
 					</div>
 					<div className={row} id={ids.code}>
 						<span className={k}>Code it typed</span>
-						<span className={`${v} font-mono tracking-[0.15em]`}>{request.code}</span>
+						<span className={`${v} font-mono text-[length:var(--text-body)] tracking-[0.14em]`}>
+							{request.code}
+						</span>
 						<span className="font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 							check this matches the phone
 						</span>
 					</div>
 					<div className={row} data-row="fingerprint" id={ids.words}>
 						<span className={k}>Words on the phone</span>
-						<span className={`${v} font-mono`}>{request.fingerprint.join(' · ')}</span>
+						<span className={`${v} ${mono}`}>{request.fingerprint.join(' · ')}</span>
 					</div>
 
 					<h3 className="m-0 mt-3 text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">

@@ -445,34 +445,34 @@ function PeopleTable({
 				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
 						<tr className="text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
-							<th className="px-3 py-1.5 font-semibold">Person</th>
-							<th className="px-3 py-1.5 font-semibold">Role</th>
-							<th className="px-3 py-1.5 font-semibold">Scope</th>
-							<th className="px-3 py-1.5 font-semibold">Added</th>
-							<th className="px-3 py-1.5 font-semibold">Last active</th>
-							<th className="px-3 py-1.5" />
+							<th className="h-6 px-3 py-0 font-semibold">Person</th>
+							<th className="h-6 px-3 py-0 font-semibold">Role</th>
+							<th className="h-6 px-3 py-0 font-semibold">Scope</th>
+							<th className="h-6 px-3 py-0 font-semibold">Added</th>
+							<th className="h-6 px-3 py-0 font-semibold">Last active</th>
+							<th className="h-6 px-3 py-0" />
 						</tr>
 					</thead>
 					<tbody>
 						<tr className="border-t border-[var(--border-soft)]" data-member="owner">
-							<td className="px-3 py-2">
+							<td className="h-9 px-3 py-0">
 								<span className="block font-medium text-[var(--fg)]">
 									{list.owner.username ?? 'Owner'}
 								</span>
 								{/* D-05 `m.self`: the Owner's own row reads "you · this device". */}
 								<Kv>{currentShare() ? 'Owner' : 'you · this device'}</Kv>
 							</td>
-							<td className="px-3 py-2">
+							<td className="h-9 px-3 py-0">
 								<span title={OWNER_FIXED_REASON}>
 									<Button type="button" variant="outline" size="xs" className={CELL_MENU} disabled>
 										Owner <ChevronDown />
 									</Button>
 								</span>
 							</td>
-							<td className="px-3 py-2">Project</td>
-							<td className="px-3 py-2 text-[var(--fg-muted)]">—</td>
-							<td className="px-3 py-2 text-[var(--fg-muted)]">—</td>
-							<td className="px-3 py-2 text-right">
+							<td className="h-9 px-3 py-0">Project</td>
+							<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">—</td>
+							<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">—</td>
+							<td className="h-9 px-3 py-0 text-right">
 								<DropdownMenu>
 									<DropdownMenuTrigger asChild>
 										<Button type="button" variant="ghost" size="xs" aria-label="Owner actions">
@@ -496,15 +496,15 @@ function PeopleTable({
 								className="border-t border-[var(--border-soft)]"
 								data-member={m.role}
 							>
-								<td className="px-3 py-2 font-mono text-[var(--fg)]">{personName(m)}</td>
-								<td className="px-3 py-2">
+								<td className="h-9 px-3 py-0 font-mono text-[var(--fg)]">{personName(m)}</td>
+								<td className="h-9 px-3 py-0">
 									<RoleMenu
 										member={m}
 										disabled={!canEdit}
 										onPick={(r) => (r === 'guest' ? setGuestFor(m) : void setRole(m, r))}
 									/>
 								</td>
-								<td className="px-3 py-2">
+								<td className="h-9 px-3 py-0">
 									{m.scope === 'artifact' ? (
 										<span className="font-mono text-[length:var(--text-micro)]">
 											{m.artifactPath}
@@ -518,11 +518,11 @@ function PeopleTable({
 										</span>
 									)}
 								</td>
-								<td className="px-3 py-2 text-[var(--fg-muted)]">{dayStamp(m.addedAt)}</td>
-								<td className="px-3 py-2 text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">{dayStamp(m.addedAt)}</td>
+								<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">
 									{m.lastActiveAt ? relativeTime(m.lastActiveAt, now) : '—'}
 								</td>
-								<td className="px-3 py-2 text-right">
+								<td className="h-9 px-3 py-0 text-right">
 									<Button
 										type="button"
 										variant="outline"
@@ -786,11 +786,11 @@ function PendingInvites({
 				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
 						<tr className="text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
-							<th className="px-3 py-1.5 font-semibold">Invited</th>
-							<th className="px-3 py-1.5 font-semibold">Role</th>
-							<th className="px-3 py-1.5 font-semibold">Scope</th>
-							<th className="px-3 py-1.5 font-semibold">Sent</th>
-							<th className="px-3 py-1.5" />
+							<th className="h-6 px-3 py-0 font-semibold">Invited</th>
+							<th className="h-6 px-3 py-0 font-semibold">Role</th>
+							<th className="h-6 px-3 py-0 font-semibold">Scope</th>
+							<th className="h-6 px-3 py-0 font-semibold">Sent</th>
+							<th className="h-6 px-3 py-0" />
 						</tr>
 					</thead>
 					<tbody>
@@ -800,7 +800,7 @@ function PendingInvites({
 								className="border-t border-[var(--border-soft)]"
 								data-invite={i.state}
 							>
-								<td className="px-3 py-2 font-mono text-[var(--fg)]">
+								<td className="h-9 px-3 py-0 font-mono text-[var(--fg)]">
 									{i.label ?? 'Link invite'}
 									{i.state === 'expired' && (
 										<span className="ml-2">
@@ -808,8 +808,8 @@ function PendingInvites({
 										</span>
 									)}
 								</td>
-								<td className="px-3 py-2">{ROLE_TITLES[i.role]}</td>
-								<td className="px-3 py-2">
+								<td className="h-9 px-3 py-0">{ROLE_TITLES[i.role]}</td>
+								<td className="h-9 px-3 py-0">
 									{i.scope === 'artifact' ? (
 										<span className="font-mono text-[length:var(--text-micro)]">
 											{i.artifactPath}
@@ -818,10 +818,10 @@ function PendingInvites({
 										'Project'
 									)}
 								</td>
-								<td className="px-3 py-2 text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg-muted)]">
 									{relativeTime(i.issuedAt, now)}
 								</td>
-								<td className="px-3 py-2 text-right">
+								<td className="h-9 px-3 py-0 text-right">
 									<Button
 										type="button"
 										variant="outline"

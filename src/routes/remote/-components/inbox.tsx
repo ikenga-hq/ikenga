@@ -111,15 +111,17 @@ function InboxCard({
 			setBusy(false);
 		}
 	};
+	// D-05 `.btn` (sm, medium weight, 1px edge): primary / ghost / danger.
 	const btn =
-		'rounded-md px-3 py-1.5 text-[length:var(--text-micro)] font-semibold disabled:opacity-50';
+		'inline-flex h-[var(--btn-h-sm,26px)] items-center rounded-[var(--radius-sm)] border px-3 text-[length:var(--text-micro)] font-medium whitespace-nowrap disabled:opacity-45';
 	return (
 		<div
 			data-card={reason ? 'read-only' : 'live'}
 			data-waiting-on={row.waiting_on ?? undefined}
-			className="rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2.5"
+			// D-05 `.perm`: an achievement-tinted card on an achievement-soft edge.
+			className="rounded-[var(--radius-md)] border border-[var(--achievement-soft)] bg-[color-mix(in_srgb,var(--achievement)_7%,var(--bg-raised))] p-3"
 		>
-			<p className="m-0 text-[length:var(--text-body-sm)] text-[var(--fg)]">{row.title}</p>
+			<p className="m-0 text-[length:var(--text-body)] text-[var(--fg)]">{row.title}</p>
 			{row.body && (
 				<p className="m-0 mt-0.5 truncate font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					{row.body}
@@ -128,12 +130,12 @@ function InboxCard({
 			{reason ? (
 				<p className="m-0 mt-2 text-[length:var(--text-micro)] text-[var(--fg-muted)]">{reason}</p>
 			) : (
-				<div className="mt-2 flex flex-wrap gap-2">
+				<div className="mt-3 flex flex-wrap gap-2">
 					<button
 						type="button"
 						disabled={busy}
 						onClick={() => decide('allow_once')}
-						className={`${btn} bg-[var(--primary)] text-[var(--primary-fg)]`}
+						className={`${btn} border-[var(--primary)] bg-[var(--primary)] text-[var(--primary-fg)] hover:opacity-90`}
 					>
 						Allow once
 					</button>
@@ -142,7 +144,7 @@ function InboxCard({
 							type="button"
 							disabled={busy}
 							onClick={() => decide('allow_always_project')}
-							className={`${btn} text-[var(--fg-muted)] hover:text-[var(--fg)]`}
+							className={`${btn} border-[var(--border)] bg-transparent text-[var(--fg-muted)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)]`}
 						>
 							Always for this project
 						</button>
@@ -151,7 +153,7 @@ function InboxCard({
 						type="button"
 						disabled={busy}
 						onClick={() => decide('deny')}
-						className={`${btn} ${D05_DANGER} border`}
+						className={`${btn} ${D05_DANGER}`}
 					>
 						Deny
 					</button>
