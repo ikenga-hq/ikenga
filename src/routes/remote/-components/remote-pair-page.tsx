@@ -14,7 +14,7 @@ import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { Fingerprint } from '@/lib/access/fingerprint';
 import { displayPairCode, normalizePairCode } from '@/lib/access/pair-code';
-
+import { D05_FOCUS } from '@/shell/people/focus';
 import {
 	codeFromHash,
 	deviceNameFromUA,
@@ -129,24 +129,24 @@ export function RemotePairPage({
 		<div
 			data-state="remote-pair"
 			data-phase={phase.kind === 'done' ? phase.outcome.kind : phase.kind}
-			className="grid min-h-dvh place-items-center bg-[var(--bg-base)] p-4"
+			className={`${D05_FOCUS} grid min-h-dvh place-items-center bg-[var(--bg-base)] p-4`}
 		>
 			<div className={card}>
 				<div className="border-b border-[var(--border-soft)] px-4 py-3">
 					<h1
-						className="m-0 text-[var(--text-h4)] font-semibold"
+						className="m-0 text-[length:var(--text-h4)] font-semibold"
 						style={{ fontFamily: 'var(--font-display)' }}
 					>
 						Pair this device
 					</h1>
-					<p className="m-0 mt-1 text-[var(--text-micro)] text-[var(--fg-muted)]">
+					<p className="m-0 mt-1 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 						{device.name} · {typeof window === 'undefined' ? '' : window.location.host}
 					</p>
 				</div>
 
 				{(phase.kind === 'entry' || phase.kind === 'working') && (
 					<form onSubmit={start} className="flex flex-col gap-3 p-4" aria-label="Pairing code">
-						<p className="m-0 text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+						<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							Enter the code the computer shows under{' '}
 							<b className="text-[var(--fg)]">Pair a device</b>. Nothing is granted by the code
 							alone — the computer confirms first.
@@ -171,7 +171,7 @@ export function RemotePairPage({
 						<button
 							type="submit"
 							disabled={phase.kind === 'working'}
-							className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
+							className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[length:var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
 						>
 							{phase.kind === 'working' ? 'Checking the code…' : 'Pair'}
 						</button>
@@ -180,7 +180,7 @@ export function RemotePairPage({
 
 				{phase.kind === 'words' && (
 					<div className="flex flex-col gap-3 p-4" data-pair="awaiting_host">
-						<p className="m-0 text-[var(--text-body-sm)] text-[var(--fg-muted)]">
+						<p className="m-0 text-[length:var(--text-body-sm)] text-[var(--fg-muted)]">
 							Check these words match the computer:
 						</p>
 						<div
@@ -189,7 +189,7 @@ export function RemotePairPage({
 						>
 							{phase.words.join(' · ')}
 						</div>
-						<p className="m-0 text-[var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
+						<p className="m-0 text-[length:var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
 							Waiting for the computer to approve this device. If the words differ, deny it there.
 						</p>
 					</div>
@@ -197,10 +197,10 @@ export function RemotePairPage({
 
 				{phase.kind === 'done' && (
 					<div className="flex flex-col gap-3 p-4" role="status">
-						<h2 className="m-0 text-[var(--text-body)] font-semibold">
+						<h2 className="m-0 text-[length:var(--text-body)] font-semibold">
 							{outcomeCopy(phase.outcome).title}
 						</h2>
-						<p className="m-0 text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+						<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							{outcomeCopy(phase.outcome).body}
 						</p>
 						{phase.outcome.kind !== 'allowed' && (
@@ -210,7 +210,7 @@ export function RemotePairPage({
 									setCode('');
 									setPhase({ kind: 'entry' });
 								}}
-								className="rounded-md border border-[var(--border)] px-4 py-2 text-[var(--text-body-sm)] hover:bg-[var(--bg-hover,var(--bg-sunken))]"
+								className="rounded-md border border-[var(--border)] px-4 py-2 text-[length:var(--text-body-sm)] hover:bg-[var(--bg-hover,var(--bg-sunken))]"
 							>
 								Enter a new code
 							</button>

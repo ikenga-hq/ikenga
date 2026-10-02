@@ -31,6 +31,8 @@ import { cn } from '@/components/ui/utils';
 import { type Cap, ROLE_DEFAULT_CAPS } from '@/lib/access/caps.gen';
 import { accessInviteIssue, accessPolicyGet, parseAccessError } from '@/lib/access/client';
 
+import { NewChip } from './devices-pair-confirm';
+import { D05_FOCUS } from './focus';
 import type { MemberRole } from './members';
 
 export type InviteMode = 'email' | 'link';
@@ -252,19 +254,20 @@ export function ShareKolaSheet({
 	};
 
 	const field =
-		'h-8 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]';
+		'h-8 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]';
 
 	return (
 		<>
 			<Dialog open={open} onOpenChange={onOpenChange}>
 				<DialogContent
 					data-state="share-kola"
-					className="max-w-[760px] bg-[var(--bg-surface)] text-[var(--fg)] sm:max-w-[760px]"
+					className={`${D05_FOCUS} max-w-[760px] bg-[var(--bg-surface)] text-[var(--fg)] sm:max-w-[760px]`}
 				>
 					<DialogHeader>
 						<DialogTitle className="flex items-center gap-2">
 							<span style={{ fontFamily: 'var(--font-display)' }}>Share kola</span>
-							<span className="font-mono text-[var(--text-micro)] font-normal text-[var(--fg-muted)]">
+							<NewChip />
+							<span className="font-mono text-[length:var(--text-micro)] font-normal text-[var(--fg-muted)]">
 								{projectName}
 							</span>
 						</DialogTitle>
@@ -283,7 +286,7 @@ export function ShareKolaSheet({
 											aria-pressed={mode === m}
 											onClick={() => setMode(m)}
 											className={cn(
-												'px-3 py-1 text-[var(--text-caption,12px)]',
+												'px-3 py-1 text-[length:var(--text-caption,12px)]',
 												mode === m
 													? 'bg-[var(--primary-soft)] font-semibold text-[var(--fg)]'
 													: 'text-[var(--fg-muted)]'
@@ -362,7 +365,7 @@ export function ShareKolaSheet({
 							</Row>
 						</div>
 						<div>
-							<h4 className="m-0 mb-2 text-[var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
+							<h4 className="m-0 mb-2 text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
 								What they will be able to see
 							</h4>
 							<ul className="m-0 list-none space-y-2 p-0" data-see-list>
@@ -380,14 +383,14 @@ export function ShareKolaSheet({
 										<span>
 											<span
 												className={cn(
-													'block text-[var(--text-caption,12px)]',
+													'block text-[length:var(--text-caption,12px)]',
 													item.allowed ? 'font-medium text-[var(--fg)]' : 'text-[var(--fg-muted)]'
 												)}
 											>
 												{item.label}
 											</span>
 											{item.sub && (
-												<span className="block text-[var(--text-micro)] text-[var(--fg-muted)]">
+												<span className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 													{item.sub}
 												</span>
 											)}
@@ -410,11 +413,14 @@ export function ShareKolaSheet({
 									<Copy /> {copied ? 'Copied' : 'Copy link'}
 								</Button>
 							</div>
-							<p className="m-0 text-[var(--text-micro)] text-[var(--fg-muted)]">
+							<p className="m-0 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 								No email is sent — send them this link yourself. It works once.
 							</p>
 							{!issued.allowNewAccount && (
-								<p className="m-0 text-[var(--text-micro)] text-[var(--fg)]" data-needs-account>
+								<p
+									className="m-0 text-[length:var(--text-micro)] text-[var(--fg)]"
+									data-needs-account
+								>
 									{NEEDS_ACCOUNT_COPY}
 								</p>
 							)}
@@ -470,7 +476,7 @@ function Row({
 }) {
 	return (
 		<div className="flex min-h-8 flex-wrap items-center gap-3">
-			<span className="w-[80px] flex-none text-[var(--text-caption,12px)] font-medium text-[var(--fg)]">
+			<span className="w-[80px] flex-none text-[length:var(--text-caption,12px)] font-medium text-[var(--fg)]">
 				{htmlFor ? <label htmlFor={htmlFor}>{label}</label> : label}
 			</span>
 			<span className="flex min-w-0 flex-1 flex-wrap items-center gap-2">{children}</span>

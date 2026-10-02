@@ -35,6 +35,7 @@ import {
 } from '@/lib/access/client';
 import { currentShare } from '@/lib/transport';
 
+import { D05_FOCUS } from './focus';
 import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader, PeopleRow } from './frame';
 import {
 	type MembersList,
@@ -139,7 +140,10 @@ export function PoliciesTab() {
 	};
 
 	return (
-		<div data-state="policies" className="mx-auto w-full max-w-[960px] space-y-4 px-6 py-6">
+		<div
+			data-state="policies"
+			className={`${D05_FOCUS} mx-auto w-full max-w-[960px] space-y-4 px-6 py-6`}
+		>
 			<PeopleHeader tab="policies" />
 			<PeopleBlock
 				title="What each role may do"
@@ -147,7 +151,7 @@ export function PoliciesTab() {
 			>
 				<div className="-mx-3 overflow-x-auto">
 					<table
-						className="w-full border-collapse text-left text-[var(--text-caption,12px)]"
+						className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]"
 						data-matrix
 					>
 						<thead>
@@ -160,7 +164,7 @@ export function PoliciesTab() {
 									>
 										{ROLE_TITLES[r]}
 										{tier === 't1' && roleCount(list, r) && (
-											<span className="block font-mono text-[var(--text-micro)] font-normal text-[var(--fg-muted)]">
+											<span className="block font-mono text-[length:var(--text-micro)] font-normal text-[var(--fg-muted)]">
 												{roleCount(list, r)}
 											</span>
 										)}
@@ -171,16 +175,16 @@ export function PoliciesTab() {
 						<tbody>
 							{CAPS.map((cap) => (
 								<tr key={cap} className="border-t border-[var(--border-soft)]">
-									<td className="px-3 py-1.5">
+									<td className="px-3 py-1 leading-tight">
 										<span className="block text-[var(--fg)]">{CAP_LABELS[cap].label}</span>
-										<span className="block text-[var(--text-micro)] text-[var(--fg-muted)]">
+										<span className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 											{CAP_LABELS[cap].sub}
 										</span>
 									</td>
 									{ROLES.map((role) => (
 										<td
 											key={role}
-											className="border-l border-[var(--border-soft)] px-3 py-1.5 text-center"
+											className="border-l border-[var(--border-soft)] px-3 py-1 text-center"
 										>
 											<MatrixCell
 												role={role}
@@ -196,7 +200,7 @@ export function PoliciesTab() {
 						</tbody>
 					</table>
 				</div>
-				<p className="m-0 max-w-[560px] py-3 text-[var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
+				<p className="m-0 max-w-[560px] py-3 text-[length:var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
 					{tier === 't0' ? (
 						'Roles apply to people you share a project with on an Ikenga server.'
 					) : canEdit ? (
@@ -234,7 +238,7 @@ export function PoliciesTab() {
 						<Kv>{ownerApproval ? 'on' : 'off'}</Kv>
 						{!ownerApproval && (
 							<span
-								className="basis-full text-[var(--text-micro)] text-[var(--fg-muted)]"
+								className="basis-full text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 								data-secrets-line
 							>
 								Operators may answer sensitive asks. {SECRETS_STILL_GO_TO_YOU}
@@ -252,10 +256,10 @@ export function PoliciesTab() {
 							) : (
 								(list?.members ?? []).map((m) => (
 									<div key={m.principalId} className="flex items-center gap-3">
-										<span className="w-[180px] truncate font-mono text-[var(--text-micro)] text-[var(--fg)]">
+										<span className="w-[180px] truncate font-mono text-[length:var(--text-micro)] text-[var(--fg)]">
 											{personName(m)}
 										</span>
-										<span className="w-[72px] text-[var(--text-micro)] text-[var(--fg-muted)]">
+										<span className="w-[72px] text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 											{ROLE_TITLES[m.role]}
 										</span>
 										<input

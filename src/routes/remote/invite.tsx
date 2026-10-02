@@ -201,9 +201,9 @@ export function InvitePage() {
 	};
 
 	const field =
-		'w-full rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 text-[var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]';
+		'w-full rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 text-[length:var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]';
 	const primary =
-		'w-full rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50 cursor-pointer';
+		'w-full rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[length:var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50 cursor-pointer';
 
 	return (
 		<div
@@ -221,7 +221,7 @@ export function InvitePage() {
 					<p className="m-0 text-[var(--fg-muted)]">Opening the invite…</p>
 				)}
 				{phase.kind === 'error' && (
-					<p role="alert" className="m-0 text-[var(--text-body-sm)] text-[var(--danger)]">
+					<p role="alert" className="m-0 text-[length:var(--text-body-sm)] text-[var(--danger)]">
 						{phase.message}
 					</p>
 				)}
@@ -230,12 +230,12 @@ export function InvitePage() {
 				)}
 				{phase.kind === 'ready' && (
 					<form onSubmit={submit} aria-label="Accept invite" className="space-y-3 text-left">
-						<p className="m-0 text-center text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+						<p className="m-0 text-center text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							<b className="text-[var(--fg)]">{phase.info.owner_username ?? 'Someone'}</b> shared{' '}
 							<b className="text-[var(--fg)]">{phase.info.project_name}</b> with you on{' '}
 							{window.location.host}.
 						</p>
-						<ul className="m-0 list-none space-y-1 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] p-3 text-[var(--text-caption,12px)]">
+						<ul className="m-0 list-none space-y-1 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] p-3 text-[length:var(--text-caption,12px)]">
 							<li>{ROLE_LINE[phase.info.role]}</li>
 							<li className="text-[var(--fg-muted)]">
 								{phase.info.scope === 'artifact'
@@ -256,7 +256,7 @@ export function InvitePage() {
 						) : (
 							<>
 								{phase.info.allow_new_account && (
-									<div className="flex justify-center gap-1 text-[var(--text-micro)]">
+									<div className="flex justify-center gap-1 text-[length:var(--text-micro)]">
 										{(['create', 'signin'] as const).map((f) => (
 											<button
 												key={f}
@@ -276,7 +276,7 @@ export function InvitePage() {
 								)}
 								<label
 									htmlFor={ids.user}
-									className="block text-[var(--text-micro)] text-[var(--fg-muted)]"
+									className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 								>
 									Username
 								</label>
@@ -291,7 +291,7 @@ export function InvitePage() {
 								/>
 								<label
 									htmlFor={ids.pass}
-									className="block text-[var(--text-micro)] text-[var(--fg-muted)]"
+									className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 								>
 									Password{form === 'create' ? ' (at least 12 characters)' : ''}
 								</label>
@@ -311,7 +311,7 @@ export function InvitePage() {
 											: 'Sign in to accept'}
 								</button>
 								{!phase.info.allow_new_account && (
-									<p className="m-0 text-center text-[var(--text-micro)] text-[var(--fg-muted)]">
+									<p className="m-0 text-center text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 										This invite is for an existing account on this server. No account? Ask an admin
 										to create one.
 									</p>

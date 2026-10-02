@@ -20,13 +20,20 @@
 // drawn but disabled, with the reason.
 
 import { Fingerprint, ShieldCheck } from 'lucide-react';
-import { type FormEvent, type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+	type FormEvent,
+	type RefObject,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from 'react';
 import { createPortal } from 'react-dom';
 
 import {
+	type AppLockStatus,
 	appLockUnlock,
 	appLockUnlockBiometric,
-	type AppLockStatus,
 	chiList,
 	ptyTerminalList,
 } from '@/lib/tauri-cmd';
@@ -44,7 +51,10 @@ function useStillGoing(): string {
 			.then(() => Promise.all([ptyTerminalList(), chiList(null, 200)]))
 			.then(([terms, runs]) => {
 				if (cancelled || !Array.isArray(terms) || !Array.isArray(runs)) return;
-				setCounts({ sessions: terms.filter((t) => t.status === 'running').length, runs: countGoingRuns(runs) });
+				setCounts({
+					sessions: terms.filter((t) => t.status === 'running').length,
+					runs: countGoingRuns(runs),
+				});
 			})
 			.catch(() => {});
 		return () => {
@@ -165,7 +175,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 			</h1>
 			<p
 				id="app-lock-meta"
-				className="m-0 flex items-center justify-center gap-2 font-mono text-[var(--text-micro)] text-[var(--fg-muted)]"
+				className="m-0 flex items-center justify-center gap-2 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 			>
 				<ShieldCheck className="h-3.5 w-3.5 shrink-0" aria-hidden />
 				<span>{lockMetaLine(status)}</span>
@@ -195,20 +205,20 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 						aria-label="PIN or passphrase"
 						aria-invalid={Boolean(error) || undefined}
 						aria-describedby="app-lock-error"
-						className="h-full w-full bg-transparent font-mono text-[var(--text-body-sm,13px)] text-[var(--fg)] outline-none placeholder:text-[var(--fg-faint)] disabled:opacity-50"
+						className="h-full w-full bg-transparent font-mono text-[length:var(--text-body-sm,13px)] text-[var(--fg)] outline-none placeholder:text-[var(--fg-faint)] disabled:opacity-50"
 					/>
 				</span>
 				<div
 					id="app-lock-error"
 					role="alert"
-					className="min-h-4 text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]"
+					className="min-h-4 text-[length:var(--text-micro)] text-[var(--on-danger,var(--danger))]"
 				>
 					{errorLine}
 				</div>
 				<button
 					type="submit"
 					disabled={busy || waiting}
-					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
+					className="flex h-[var(--btn-h-lg,40px)] items-center justify-center rounded-[var(--radius-sm)] bg-[var(--primary)] px-4 text-[length:var(--text-caption,12px)] font-medium text-[var(--primary-fg)] outline-none hover:opacity-90 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:opacity-50"
 				>
 					{busy ? 'Checking…' : 'Unlock'}
 				</button>
@@ -219,7 +229,7 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 						onClick={() => void tryBiometric()}
 						title={status.biometric.available ? undefined : status.biometric.reason}
 						aria-describedby={status.biometric.available ? undefined : 'app-lock-os-why'}
-						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
+						className="flex h-[var(--btn-h-lg,40px)] items-center justify-center gap-2 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-surface)] px-4 text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none hover:bg-[var(--bg-raised)] focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-45"
 					>
 						<Fingerprint className="h-4 w-4 shrink-0" aria-hidden />
 						Use {status.biometric.label}
@@ -232,10 +242,10 @@ function LockedScreen({ status }: { status: AppLockStatus }) {
 				)}
 			</form>
 
-			<p className="m-0 max-w-[52ch] text-center text-[var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
-				<b className="font-medium text-[var(--fg)]">{going}</b> underneath.
-				Locking hides the window; it does not stop Chi, and it does not lock the vault — that has
-				its own lock in Settings › Secrets.
+			<p className="m-0 max-w-[52ch] text-center text-[length:var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
+				<b className="font-medium text-[var(--fg)]">{going}</b> underneath. Locking hides the
+				window; it does not stop Chi, and it does not lock the vault — that has its own lock in
+				Settings › Secrets.
 			</p>
 		</div>,
 		container

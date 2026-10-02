@@ -22,6 +22,7 @@ import {
 	parseAccessError,
 } from '@/lib/access/client';
 import { chiList, notificationsList, ptyTerminalList, ptyWrite } from '@/lib/tauri-cmd';
+import { D05_FOCUS } from '@/shell/people/focus';
 
 import { RemoteInbox, SectionHead } from './inbox';
 import { type AnnotatedRow, credentialLine, type SessionRow, sessionRows } from './remote-model';
@@ -70,15 +71,15 @@ export function RemoteClient() {
 	return (
 		<div
 			data-state="remote-client"
-			className="grid min-h-dvh justify-items-center bg-[var(--bg-base)] sm:py-6"
+			className={`${D05_FOCUS} grid min-h-dvh justify-items-center bg-[var(--bg-base)] sm:py-6`}
 		>
 			<div className="flex min-h-dvh w-full max-w-[390px] flex-col overflow-hidden border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] sm:min-h-0 sm:rounded-xl sm:border">
 				<header className="flex items-start gap-2 px-3 py-2.5">
 					<div className="min-w-0">
-						<div className="truncate text-[var(--text-body-sm)] font-semibold">
+						<div className="truncate text-[length:var(--text-body-sm)] font-semibold">
 							{status?.principal.username ?? 'Ikenga'}
 						</div>
-						<div className="truncate font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+						<div className="truncate font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 							{host}
 							{status ? ` · ${credentialLine(status)}` : ''}
 						</div>
@@ -94,14 +95,14 @@ export function RemoteClient() {
 					<SectionHead title="Sessions" right={String(sessions.length)} />
 					<ul className="m-0 list-none p-0">
 						{sessions.length === 0 && (
-							<li className="px-3 py-2 text-[var(--text-micro)] text-[var(--fg-muted)]">
+							<li className="px-3 py-2 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 								No sessions running.
 							</li>
 						)}
 						{sessions.map((s) => (
 							<li
 								key={s.id}
-								className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-2 font-mono text-[var(--text-micro)] last:border-b-0"
+								className="flex items-center gap-2 border-b border-[var(--border-soft)] px-3 py-2 font-mono text-[length:var(--text-micro)] last:border-b-0"
 							>
 								<span
 									aria-hidden
@@ -118,7 +119,7 @@ export function RemoteClient() {
 
 				<section data-section="tool-feed" aria-label="Tool feed">
 					<SectionHead title="Tool feed" />
-					<p className="m-0 px-3 py-2 text-[var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
+					<p className="m-0 px-3 py-2 text-[length:var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
 						Tool calls stay on the computer for now; they reach paired devices with the ask relay.
 					</p>
 				</section>
@@ -168,7 +169,7 @@ function DispatchBar({ status, sessions }: { status: AccessStatus; sessions: Ses
 				value={chosen?.ptyId ?? ''}
 				onChange={(e) => setTarget(e.target.value)}
 				disabled={targets.length === 0 || Boolean(blocked)}
-				className="mb-2 max-w-full rounded-full border border-[var(--border)] bg-[var(--bg-sunken)] px-2.5 py-1 font-mono text-[var(--text-micro)] text-[var(--fg)]"
+				className="mb-2 max-w-full rounded-full border border-[var(--border)] bg-[var(--bg-sunken)] px-2.5 py-1 font-mono text-[length:var(--text-micro)] text-[var(--fg)]"
 			>
 				{targets.length === 0 && <option value="">no terminal to send to</option>}
 				{targets.map((t) => (
@@ -184,7 +185,7 @@ function DispatchBar({ status, sessions }: { status: AccessStatus; sessions: Ses
 					onChange={(e) => setText(e.target.value)}
 					placeholder={blocked ?? 'Dispatch an instruction…'}
 					disabled={Boolean(blocked) || targets.length === 0}
-					className="min-w-0 flex-1 bg-transparent py-2 text-[var(--text-body-sm)] text-[var(--fg)] outline-none"
+					className="min-w-0 flex-1 bg-transparent py-2 text-[length:var(--text-body-sm)] text-[var(--fg)] outline-none"
 				/>
 				<button
 					type="submit"
@@ -195,7 +196,7 @@ function DispatchBar({ status, sessions }: { status: AccessStatus; sessions: Ses
 					<Send className="h-4 w-4" />
 				</button>
 			</div>
-			<p className="m-0 mt-1 text-[var(--text-micro)] text-[var(--fg-faint)]">
+			<p className="m-0 mt-1 text-[length:var(--text-micro)] text-[var(--fg-faint)]">
 				{note ?? (blocked ? blocked : '↵ send to session')}
 			</p>
 		</form>
@@ -207,7 +208,7 @@ function ForgetDevice({ status }: { status: AccessStatus }) {
 	const id = status.credential.deviceId;
 	if (status.credential.via !== 'device' || !id) return null;
 	return (
-		<div className="flex items-center gap-2 border-t border-[var(--border-soft)] px-3 py-2 text-[var(--text-micro)] text-[var(--fg-muted)]">
+		<div className="flex items-center gap-2 border-t border-[var(--border-soft)] px-3 py-2 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 			{confirming ? (
 				<>
 					<span>This device loses access at once.</span>

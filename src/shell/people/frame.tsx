@@ -90,7 +90,7 @@ export function PeopleScopeSwitch({
 						title={enabled ? undefined : TAB_SCOPE_WHY[tab]}
 						onClick={enabled && !on ? () => onScope?.(s.id) : undefined}
 						className={cn(
-							'min-h-[26px] border-r border-[var(--border)] px-3 text-[var(--text-micro)] last:border-r-0',
+							'min-h-[26px] border-r border-[var(--border)] px-3 text-[length:var(--text-micro)] last:border-r-0',
 							on
 								? 'bg-[var(--primary-soft)] text-[var(--fg)]'
 								: enabled
@@ -123,7 +123,7 @@ export function PeopleFileBar({ t1 = isT1Session() }: { t1?: boolean }) {
 	return (
 		<div
 			data-filebar="access-store"
-			className="flex items-center gap-2 border-t border-[var(--border-soft)] pt-2 font-mono text-[var(--text-micro)]"
+			className="flex items-center gap-2 border-t border-[var(--border-soft)] pt-2 font-mono text-[length:var(--text-micro)]"
 		>
 			<span className="text-[var(--fg-faint,var(--fg-muted))]">writes</span>
 			<span className="truncate text-[var(--fg-muted)]">access store · {accessStorePath(t1)}</span>
@@ -227,7 +227,7 @@ export function PeopleBlock({
 				className
 			)}
 		>
-			<h3 className="m-0 flex h-[30px] items-center gap-2 border-b border-[var(--border-soft)] px-3 text-[var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
+			<h3 className="m-0 flex h-[30px] items-center gap-2 border-b border-[var(--border-soft)] px-3 text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
 				{title}
 				{right && (
 					<span className="ml-auto flex items-center gap-2 font-normal normal-case tracking-normal">
@@ -263,10 +263,10 @@ export function PeopleRow({
 				top ? 'items-start' : 'items-center'
 			)}
 		>
-			<span className="w-[176px] flex-none text-[var(--text-caption,12px)] text-[var(--fg)]">
+			<span className="w-[176px] flex-none text-[length:var(--text-caption,12px)] text-[var(--fg)]">
 				{htmlFor ? <label htmlFor={htmlFor}>{label}</label> : label}
 				{sub && (
-					<span className="mt-px block text-[var(--text-micro)] leading-snug text-[var(--fg-muted)]">
+					<span className="mt-px block text-[length:var(--text-micro)] leading-snug text-[var(--fg-muted)]">
 						{sub}
 					</span>
 				)}
@@ -276,10 +276,17 @@ export function PeopleRow({
 	);
 }
 
+/** D-05 `.cellmenu`: the pill a table cell's menu opens from (a device's
+ *  capabilities, a member's role). Merged over the outline `xs` button. */
+export const CELL_MENU =
+	'h-[22px] gap-1 rounded-full bg-[var(--bg-base)] px-2 text-[length:var(--text-micro)] font-normal text-[var(--fg-muted)] hover:text-[var(--fg)] aria-expanded:border-[var(--primary)] aria-expanded:text-[var(--fg)]';
+
 /** D-05 `.kv`: a quiet mono value. */
 export function Kv({ children, className }: { children: ReactNode; className?: string }) {
 	return (
-		<span className={cn('font-mono text-[var(--text-micro)] text-[var(--fg-muted)]', className)}>
+		<span
+			className={cn('font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]', className)}
+		>
 			{children}
 		</span>
 	);

@@ -54,7 +54,8 @@ import {
 } from './devices-model';
 import { usePairWatch } from './devices-pair-confirm';
 import { PairSheet } from './devices-pair-sheet';
-import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader, PeopleRow } from './frame';
+import { D05_DANGER, D05_FOCUS } from './focus';
+import { CELL_MENU, Kv, PeopleBlock, PeopleFileBar, PeopleHeader, PeopleRow } from './frame';
 import { RoutingPolicy } from './routing-policy';
 
 export function DevicesTab() {
@@ -62,7 +63,10 @@ export function DevicesTab() {
 	const devices = useDevices();
 	const [pairing, setPairing] = useState(false);
 	return (
-		<div data-state="devices" className="mx-auto w-full max-w-[960px] space-y-4 px-6 py-6">
+		<div
+			data-state="devices"
+			className={`${D05_FOCUS} mx-auto w-full max-w-[960px] space-y-4 px-6 py-6`}
+		>
 			<PeopleHeader tab="devices" />
 			<RemoteAccessBlock view={view} refreshing={refreshing} onRefresh={refresh} />
 			<DevicesTableBlock devices={devices} onPair={() => setPairing(true)} />
@@ -271,9 +275,9 @@ function DevicesTableBlock({ devices, onPair }: { devices: DevicesState; onPair:
 			}
 		>
 			<div className="-mx-3 overflow-x-auto">
-				<table className="w-full border-collapse text-left text-[var(--text-caption,12px)]">
+				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
-						<tr className="border-b border-[var(--border-soft)] text-[var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
+						<tr className="border-b border-[var(--border-soft)] text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
 							<th className="px-3 py-2 font-semibold">Device</th>
 							<th className="px-3 py-2 font-semibold">Last seen</th>
 							<th className="px-3 py-2 font-semibold">Address</th>
@@ -293,14 +297,14 @@ function DevicesTableBlock({ devices, onPair }: { devices: DevicesState; onPair:
 							>
 								<td className="px-3 py-2">
 									<span className="block text-[var(--fg)]">{d.name}</span>
-									<span className="block text-[var(--text-micro)] text-[var(--fg-muted)]">
+									<span className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 										{deviceSubLine(d)}
 									</span>
 								</td>
 								<td className="px-3 py-2 text-[var(--fg-muted)]">
 									{d.kind === 'host' || d.thisDevice ? 'now' : relativeTime(d.lastSeenAt, now)}
 								</td>
-								<td className="px-3 py-2 font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+								<td className="px-3 py-2 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 									{d.kind === 'host' ? 'local' : (d.lastSeenAddr ?? '—')}
 								</td>
 								<td className="px-3 py-2">
@@ -317,7 +321,7 @@ function DevicesTableBlock({ devices, onPair }: { devices: DevicesState; onPair:
 											type="button"
 											variant="outline"
 											size="xs"
-											className="text-[var(--danger)]"
+											className={D05_DANGER}
 											onClick={() => setRevoking(d)}
 										>
 											Revoke
@@ -374,7 +378,13 @@ function TierMenu({ device, onPick }: { device: DeviceView; onPick: (t: Tier) =>
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>
-				<Button type="button" variant="outline" size="xs" aria-label={`What ${device.name} can do`}>
+				<Button
+					type="button"
+					variant="outline"
+					size="xs"
+					className={CELL_MENU}
+					aria-label={`What ${device.name} can do`}
+				>
 					{label} <ChevronDown />
 				</Button>
 			</DropdownMenuTrigger>
@@ -422,7 +432,7 @@ function RevokeConfirm({
 		<Dialog open={device !== null} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent
 				data-state="devices-revoke"
-				className="bg-[var(--bg-surface)] text-[var(--fg)]"
+				className={`${D05_FOCUS} bg-[var(--bg-surface)] text-[var(--fg)]`}
 			>
 				<DialogHeader>
 					<DialogTitle>Revoke {device?.name}?</DialogTitle>

@@ -15,7 +15,7 @@
 //
 // The access arms decide; this view only disables controls with a reason.
 
-import { MoreHorizontal, Plus, RefreshCw, Undo2 } from 'lucide-react';
+import { ChevronDown, MoreHorizontal, Plus, RefreshCw, Undo2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
@@ -53,7 +53,8 @@ import { currentShare } from '@/lib/transport';
 import { isT1Session } from '@/lib/transport/t1-session';
 
 import { relativeTime } from './devices-model';
-import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader } from './frame';
+import { D05_DANGER, D05_FOCUS } from './focus';
+import { CELL_MENU, Kv, PeopleBlock, PeopleFileBar, PeopleHeader } from './frame';
 import { ShareKolaSheet } from './share-kola-sheet';
 import { SharedWithYou } from './shared-with-you';
 
@@ -244,12 +245,12 @@ export function MembersTab() {
 	return (
 		<div
 			data-state={mode === 'shared' ? 'members-shared' : 'members'}
-			className="mx-auto w-full max-w-[960px] space-y-4 px-6 py-6"
+			className={`${D05_FOCUS} mx-auto w-full max-w-[960px] space-y-4 px-6 py-6`}
 		>
 			<PeopleHeader tab="members" />
 			{tier === 't1' && share && !canList ? (
 				<PeopleBlock title={`People on ${name}`}>
-					<p className="m-0 py-3 text-[var(--text-caption,12px)] text-[var(--fg-muted)]">
+					<p className="m-0 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
 						You're a {ROLE_TITLES[share.role]} here. Only the Owner and Operators see who else has
 						access.
 					</p>
@@ -316,7 +317,7 @@ function SoloBlock({
 				>
 					Just you.
 				</h3>
-				<p className="m-0 max-w-[340px] text-[var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
+				<p className="m-0 max-w-[340px] text-[length:var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
 					That is the normal setup, and nothing in Ikenga is waiting for a second person. Share kola
 					when you actually want someone looking at this project — not before.
 				</p>
@@ -356,7 +357,7 @@ function SoloBlock({
 /** D-05's dashed rule box under the table. */
 function RuleBox({ tier }: { tier: AccessTier }) {
 	return (
-		<p className="m-0 rounded-[var(--radius-md,6px)] border border-dashed border-[var(--border)] px-3 py-2.5 text-[var(--text-caption,12px)] text-[var(--fg-muted)]">
+		<p className="m-0 rounded-[var(--radius-md,6px)] border border-dashed border-[var(--border)] px-3 py-2.5 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
 			{tier === 't0' ? (
 				'Sharing needs an account, because the other person needs something to sign in to. Everything else on this screen works signed out.'
 			) : (
@@ -441,9 +442,9 @@ function PeopleTable({
 			}
 		>
 			<div className="-mx-3 overflow-x-auto">
-				<table className="w-full border-collapse text-left text-[var(--text-caption,12px)]">
+				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
-						<tr className="text-[var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
+						<tr className="text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
 							<th className="px-3 py-1.5 font-semibold">Person</th>
 							<th className="px-3 py-1.5 font-semibold">Role</th>
 							<th className="px-3 py-1.5 font-semibold">Scope</th>
@@ -463,8 +464,8 @@ function PeopleTable({
 							</td>
 							<td className="px-3 py-2">
 								<span title={OWNER_FIXED_REASON}>
-									<Button type="button" variant="outline" size="xs" disabled>
-										Owner
+									<Button type="button" variant="outline" size="xs" className={CELL_MENU} disabled>
+										Owner <ChevronDown />
 									</Button>
 								</span>
 							</td>
@@ -505,12 +506,14 @@ function PeopleTable({
 								</td>
 								<td className="px-3 py-2">
 									{m.scope === 'artifact' ? (
-										<span className="font-mono text-[var(--text-micro)]">{m.artifactPath}</span>
+										<span className="font-mono text-[length:var(--text-micro)]">
+											{m.artifactPath}
+										</span>
 									) : (
 										'Project'
 									)}
 									{m.expiresAt !== null && (
-										<span className="block text-[var(--text-micro)] text-[var(--fg-muted)]">
+										<span className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 											{expiryLabel(m.expiresAt, now)}
 										</span>
 									)}
@@ -524,7 +527,7 @@ function PeopleTable({
 										type="button"
 										variant="outline"
 										size="xs"
-										className="text-[var(--danger)]"
+										className={D05_DANGER}
 										disabled={!canEdit}
 										title={canEdit ? undefined : 'Only the Owner can remove people'}
 										onClick={() => setRemoving(m)}
@@ -599,9 +602,10 @@ function RoleMenu({
 					type="button"
 					variant="outline"
 					size="xs"
+					className={CELL_MENU}
 					aria-label={`${personName(member)}'s role`}
 				>
-					{ROLE_TITLES[member.role]}
+					{ROLE_TITLES[member.role]} <ChevronDown />
 				</Button>
 			</DropdownMenuTrigger>
 			<DropdownMenuContent align="start" className="w-[260px]">
@@ -640,7 +644,10 @@ function GuestScopeDialog({
 	const valid = path.trim().length > 0 && !path.trim().startsWith('/') && !path.includes('..');
 	return (
 		<Dialog open={member !== null} onOpenChange={(o) => !o && onClose()}>
-			<DialogContent data-state="members-guest" className="bg-[var(--bg-surface)] text-[var(--fg)]">
+			<DialogContent
+				data-state="members-guest"
+				className={`${D05_FOCUS} bg-[var(--bg-surface)] text-[var(--fg)]`}
+			>
 				<DialogHeader>
 					<DialogTitle>Make {member ? personName(member) : ''} a Guest</DialogTitle>
 					<DialogDescription>
@@ -648,7 +655,7 @@ function GuestScopeDialog({
 						their access ends.
 					</DialogDescription>
 				</DialogHeader>
-				<label className="flex flex-col gap-1 text-[var(--text-micro)] text-[var(--fg-muted)]">
+				<label className="flex flex-col gap-1 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					Artifact
 					<input
 						value={path}
@@ -657,7 +664,7 @@ function GuestScopeDialog({
 						className="h-7 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 font-mono text-[12px] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
 					/>
 				</label>
-				<label className="flex flex-col gap-1 text-[var(--text-micro)] text-[var(--fg-muted)]">
+				<label className="flex flex-col gap-1 text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					Expires
 					<select
 						value={days}
@@ -718,7 +725,7 @@ function RemoveConfirm({
 		<Dialog open={member !== null} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent
 				data-state="members-remove"
-				className="bg-[var(--bg-surface)] text-[var(--fg)]"
+				className={`${D05_FOCUS} bg-[var(--bg-surface)] text-[var(--fg)]`}
 			>
 				<DialogHeader>
 					<DialogTitle>Remove {member ? personName(member) : ''}?</DialogTitle>
@@ -776,9 +783,9 @@ function PendingInvites({
 	return (
 		<PeopleBlock title="Pending invites" right={<Kv>{pending}</Kv>}>
 			<div className="-mx-3 overflow-x-auto">
-				<table className="w-full border-collapse text-left text-[var(--text-caption,12px)]">
+				<table className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]">
 					<thead>
-						<tr className="text-[var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
+						<tr className="text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
 							<th className="px-3 py-1.5 font-semibold">Invited</th>
 							<th className="px-3 py-1.5 font-semibold">Role</th>
 							<th className="px-3 py-1.5 font-semibold">Scope</th>
@@ -804,7 +811,9 @@ function PendingInvites({
 								<td className="px-3 py-2">{ROLE_TITLES[i.role]}</td>
 								<td className="px-3 py-2">
 									{i.scope === 'artifact' ? (
-										<span className="font-mono text-[var(--text-micro)]">{i.artifactPath}</span>
+										<span className="font-mono text-[length:var(--text-micro)]">
+											{i.artifactPath}
+										</span>
 									) : (
 										'Project'
 									)}
@@ -817,7 +826,7 @@ function PendingInvites({
 										type="button"
 										variant="outline"
 										size="xs"
-										className={i.state === 'pending' ? 'text-[var(--danger)]' : undefined}
+										className={i.state === 'pending' ? D05_DANGER : undefined}
 										disabled={!canRevoke}
 										onClick={() => void revoke(i)}
 									>

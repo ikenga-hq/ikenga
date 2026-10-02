@@ -1,0 +1,35 @@
+/* D-05 `:focus-visible` (`designs/people.html`): every control on a People,
+ * devices and access surface shows keyboard focus as one 2px solid primary
+ * outline. Unlayered on purpose: it wins over the shadcn primitives'
+ * `outline-none` + 3px ring, which live in Tailwind's `@layer utilities`
+ * (a box-shadow ring is not an outline, and the two together read twice).
+ * Offsets stay with the control (inset ones inside clipped groups). A
+ * container focused by script (`tabindex="-1"`, e.g. the pair-confirm panel)
+ * is a landing spot, not a control, and draws nothing. */
+.d05-focus :focus-visible:not([tabindex="-1"]),
+.d05-focus:focus-visible:not([tabindex="-1"]) {
+	outline: 2px solid var(--primary);
+	--tw-ring-shadow: 0 0 #0000;
+}
+
+/* D-05 `.btn`: a 1px var(--border) edge. The shadcn outline button names a
+ * border colour only under `dark:` (which follows the OS scheme, not the
+ * app's mode), so in light mode it fell back to currentColor — a near-black
+ * edge. Layered below utilities, so a control's own border class still wins. */
+@layer components {
+	.d05-focus [data-variant="outline"] {
+		border-color: var(--border);
+	}
+}
+
+/* D-05 `.btn.danger` (Revoke, Remove, Revoke invite, Sign out, Deny): the
+ * danger text on a danger-soft edge, filled on hover. Unlayered, so it wins
+ * over the outline button's `dark:` border and `hover:` fill. */
+.d05-danger {
+	border-color: var(--danger-soft);
+	color: var(--danger);
+}
+.d05-danger:hover:not(:disabled) {
+	background: var(--danger-soft);
+	color: var(--danger);
+}
