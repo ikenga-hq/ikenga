@@ -42,7 +42,8 @@ use tower_sessions::ExpiredDeletion;
 
 use self::children::{ChildLauncher, Children, T1Launcher};
 use self::proxy::{
-    AccessHandler, AccessNotFound, AllowAll, PassFrames, RpcAuthorizer, WsFrameHook,
+    AccessHandler, AccessNotFound, AllowAll, Narrower, NoNarrowing, PassFrames, RpcAuthorizer,
+    WsFrameHook,
 };
 use self::ws_registry::{AccountEpochs, StillValid, WsRegistry};
 use super::auth::backend::{self, AccountsBackend, BrokerSessionStore, SessionCookieResolver};
@@ -54,24 +55,42 @@ use super::operator::{open_accounts, Opener, OperatorRoot};
 use super::{discovery, health, static_files::SpaStaticService, ServerConfig};
 use crate::executor::t1::T1Executor;
 
-/// The R-3 / R-5 hook points, with their WP-20 defaults. WP-74 swaps them.
+/// The R-3 / R-5 hook points, with their WP-20 defaults. WP-74a swaps them
+/// in [`serve`] (`access::t1::install`).
 #[derive(Clone)]
 pub struct BrokerHooks {
     pub authorizer: Arc<dyn RpcAuthorizer>,
     pub access: Arc<dyn AccessHandler>,
     pub ws_frames: Arc<dyn WsFrameHook>,
     pub still_valid: Arc<dyn StillValid>,
+    /// G-ACCESS §1.4 / §4.5.2–§4.5.3: each proxied request's / socket's
+    /// narrowing (`X-Ikenga-Caps`, share selection and headers, target
+    /// child), decided once.
+    pub narrower: Arc<dyn Narrower>,
 }
 
 impl BrokerHooks {
-    /// Allow every RPC, no `access_*` arms, pass every frame, and close a
-    /// socket once its account is disabled or its `session_epoch` moved.
+    /// Allow every RPC, no `access_*` arms, pass every frame, close a socket
+    /// once its account is disabled or its `session_epoch` moved, and set no
+    /// narrowing headers.
     pub fn defaults(pool: SqlitePool) -> Self {
         Self {
             authorizer: Arc::new(AllowAll),
             access: Arc::new(AccessNotFound),
             ws_frames: Arc::new(PassFrames),
             still_valid: Arc::new(AccountEpochs { pool }),
+            narrower: Arc::new(NoNarrowing),
+        }
+    }
+
+    /// WP-74a's fills (G-ACCESS R-3, R-5).
+    pub fn access(installed: &crate::access::t1::Installed) -> Self {
+        Self {
+            authorizer: installed.authorizer.clone(),
+            access: installed.access.clone(),
+            ws_frames: installed.ws_frames.clone(),
+            still_valid: installed.still_valid.clone(),
+            narrower: installed.narrower.clone(),
         }
     }
 }
@@ -109,12 +128,17 @@ impl BrokerState {
     }
 }
 
+/// A layer applied around the protected routes, outside credential
+/// resolution (WP-74a: the device-cookie resolve / rotate / clear layer).
+pub type ProtectedLayer = Box<dyn FnOnce(Router) -> Router + Send>;
+
 /// What WP-74 / WP-76 add without restructuring: more credential resolvers
-/// (appended after the session cookie, R-4) and the public pairing/invite
-/// routes (Round 16 §14.1).
+/// (appended after the session cookie, R-4), the public pairing/invite
+/// routes (Round 16 §14.1), and a layer around the protected routes.
 pub struct BrokerExtensions {
     pub resolvers: Resolvers,
     pub public: PublicRoutes,
+    pub protected_layer: Option<ProtectedLayer>,
 }
 
 impl Default for BrokerExtensions {
@@ -122,6 +146,7 @@ impl Default for BrokerExtensions {
         Self {
             resolvers: Resolvers::new(Arc::new(SessionCookieResolver)),
             public: PublicRoutes::default(),
+            protected_layer: None,
         }
     }
 }
@@ -166,6 +191,10 @@ pub fn router(
             auth_mod::require_principal,
         ))
         .with_state(state.clone());
+    let protected = match extensions.protected_layer {
+        Some(layer) => layer(protected),
+        None => protected,
+    };
 
     let public = Router::new()
         .route("/api/health", get(health::health_handler))
@@ -208,6 +237,9 @@ pub struct BrokerBoot {
     pub provisioning: ProvisioningMode,
     pub bootstrap: Option<BootstrapAdmin>,
     pub insecure_cookie: bool,
+    /// The Part B flags (G-ACCESS §10.1): `--public-url`, `--max-accounts`,
+    /// `--invite-ttl`, `--member-invites-create-accounts`.
+    pub access: crate::access::AccessOptions,
 }
 
 /// Refuse to exec a binary a principal could have replaced (I-9: nothing a
@@ -238,6 +270,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         provisioning,
         bootstrap,
         insecure_cookie,
+        access: access_options,
     } = boot;
 
     // Only the broker migrates (§6.1); the probe already did, so this is a
@@ -253,6 +286,12 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
             );
         }
     }
+
+    // G-ACCESS §8.1 / R-1: the access set runs after `accounts`, in the same
+    // `_operator_migrations` table; then the chain is verified (§6.4 "at
+    // every start"). Only the broker migrates it.
+    let access_store = crate::access::AccessStore::attach_t1(pool.clone()).await?;
+    let access_t1 = crate::access::t1::T1Access::new(access_store, pool.clone(), access_options);
 
     // §7.4: honoured after the probe, only on an empty accounts table.
     if let Some(bootstrap) = bootstrap {
@@ -289,14 +328,38 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         pkgs_dir: config.pkgs_dir.clone(),
         idle_timeout,
     });
-    let state = Arc::new(BrokerState::new(pool.clone(), verifier, launcher)?);
+    let mut broker_state = BrokerState::new(pool.clone(), verifier, launcher)?;
+    // G-ACCESS R-3 / R-4 / R-5: the device-grant resolver, authorize_rpc, the
+    // broker-served `access_*` arms, the WS frame hook, the narrowing hook and
+    // the two-epoch socket check.
+    let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
+    broker_state.hooks = BrokerHooks::access(&installed);
+    let state = Arc::new(broker_state);
+    let mut extensions = BrokerExtensions::default();
+    extensions.resolvers.push(installed.resolver.clone());
+    extensions.public = PublicRoutes::default()
+        .pairing(crate::access::http::pairing_routes(
+            config.allowed_origins.clone(),
+        ))
+        .invites(crate::access::http::invite_routes(
+            config.allowed_origins.clone(),
+        ));
+    {
+        let t1 = access_t1.clone();
+        extensions.protected_layer = Some(Box::new(move |r: Router| {
+            r.layer(middleware::from_fn_with_state(
+                t1,
+                crate::access::t1::device_cookie_middleware,
+            ))
+        }));
+    }
     let app = router(
         state.clone(),
         store,
         &config.static_dir,
         config.allowed_origins.clone(),
         insecure_cookie,
-        BrokerExtensions::default(),
+        extensions,
     );
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);

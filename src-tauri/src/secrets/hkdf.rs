@@ -1,13 +1,21 @@
-//! HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), over the `sha2` the
-//! crate already depends on.
+//! HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), hand-rolled over the
+//! `sha2` the crate already depends on.
 //!
-//! Why not the `hmac` / `hkdf` crates: WP-21 runs beside shell-ux WP-74a in
-//! one wave, and WP-74a is the one that adds those two as direct
-//! dependencies (G-ACCESS §10.1: "WP-21 adds no crate in W3"). Both
-//! constructions are a few lines over a hash, and the tests below pin them to
-//! the RFC 4231 / RFC 5869 vectors, so swapping in `hkdf::Hkdf<Sha256>` once
-//! WP-74a lands is a mechanical change that the same vectors re-check.
+//! Why not the `hmac` / `hkdf` crates (WP-74a adds both as direct
+//! dependencies for WP-74b, G-ACCESS §10.1): neither wipes its intermediate
+//! key material. `hmac` 0.12 builds its padded key block in a plain local
+//! array, `hkdf` 0.12's extract returns the PRK as a plain `GenericArray`,
+//! and `mac.finalize().into_bytes()` hands back another; neither crate
+//! implements `Zeroize`/`ZeroizeOnDrop` (no `zeroize` feature exists in those
+//! versions), so the per-principal key derivation would leave the PRK and
+//! key-derived blocks on the stack. Here every key-derived buffer (padded key block, ipad, opad, inner
+//! hash, PRK, each T(i)) is a `Zeroizing` wrapper and digests are finalized
+//! straight into those wrappers (`finalize_into`), never into an unwiped
+//! temporary. The one residue neither approach can wipe is a consumed
+//! `Sha256`'s chaining state (sha2 0.10 has no `zeroize` either). The tests
+//! below pin both constructions to the RFC 4231 / RFC 5869 vectors.
 
+use sha2::digest::generic_array::GenericArray;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -19,8 +27,9 @@ pub const HASH_LEN: usize = 32;
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; HASH_LEN]> {
     let mut block = Zeroizing::new([0u8; BLOCK]);
     if key.len() > BLOCK {
-        let digest = Sha256::digest(key);
-        block[..HASH_LEN].copy_from_slice(&digest);
+        let mut hasher = Sha256::new();
+        hasher.update(key);
+        hasher.finalize_into(GenericArray::from_mut_slice(&mut block[..HASH_LEN]));
     } else {
         block[..key.len()].copy_from_slice(key);
     }
@@ -36,12 +45,12 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; HASH_LEN]> {
         inner.update(part);
     }
     let mut inner_hash = Zeroizing::new([0u8; HASH_LEN]);
-    inner_hash.copy_from_slice(&inner.finalize());
+    inner.finalize_into(GenericArray::from_mut_slice(&mut inner_hash[..]));
     let mut outer = Sha256::new();
     outer.update(&opad[..]);
     outer.update(&inner_hash[..]);
     let mut out = Zeroizing::new([0u8; HASH_LEN]);
-    out.copy_from_slice(&outer.finalize());
+    outer.finalize_into(GenericArray::from_mut_slice(&mut out[..]));
     out
 }
 

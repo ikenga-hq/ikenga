@@ -253,6 +253,30 @@ pub struct ServeArgs {
     #[arg(long, env = "IKENGA_INSECURE_COOKIE")]
     pub insecure_cookie: bool,
 
+    /// The public base URL of this server, e.g. `https://ik.example.ts.net`:
+    /// the base of device-pairing QR links and invite links (G-ACCESS §3.3).
+    /// Without it the pairing sheet falls back to the address a browser
+    /// reached the server on.
+    #[arg(long, env = "IKENGA_PUBLIC_URL")]
+    pub public_url: Option<String>,
+
+    /// T1 only: the most accounts this server may hold; every creation path
+    /// (CLI, bootstrap, invites) refuses past it (G-ACCESS P-27). Default:
+    /// unlimited.
+    #[arg(long, env = "IKENGA_MAX_ACCOUNTS")]
+    pub max_accounts: Option<u32>,
+
+    /// T1 only: how many days an invite link stays valid (G-ACCESS P-15).
+    /// Default 7, at most 30.
+    #[arg(long, env = "IKENGA_INVITE_TTL", value_parser = clap::value_parser!(u32).range(1..=30))]
+    pub invite_ttl: Option<u32>,
+
+    /// T1 only: let any project Owner or Operator issue invites that create
+    /// a new account. Off by default: only an `is_admin` issuer's invites may
+    /// (G-ACCESS §4.4, N-11).
+    #[arg(long, env = "IKENGA_MEMBER_INVITES_CREATE_ACCOUNTS")]
+    pub member_invites_create_accounts: bool,
+
     /// Internal: run as a T1 principal child (launched by the broker as the
     /// principal's uid, G-PRINCIPAL §3).
     #[arg(long, hide = true, requires = "expected_uid")]
@@ -312,12 +336,21 @@ async fn main() -> anyhow::Result<()> {
     // pair of braces, and the one that also covers anything else the process
     // may spawn later.
     //
-    // TRAP FOR LATER: this runs BEFORE `run_server`, so anything downstream
-    // that expects to read these from the environment will find them gone.
-    // `IKENGA_AUTH_TOKEN` is safe because clap has already put it in `config`;
-    // `IKENGA_VAULT_KEY` currently has no reader at all. When a headless vault
-    // lands it must capture the value HERE, into `config`, rather than calling
-    // `env::var` inside `run_server` — that call will always return `Err`.
+    // This runs BEFORE `run_server`, so nothing downstream can read these
+    // from the environment. `IKENGA_AUTH_TOKEN` is safe because clap has
+    // already put it in `config`. `IKENGA_VAULT_KEY` is the desktop vault's
+    // unlock key and has no reader in the daemon; it is stripped only so a
+    // stray one can't leak into a child.
+    //
+    // The headless per-principal secret store does NOT use it (WP-21). Its
+    // key is `IKENGA_PRINCIPAL_SECRETS_KEY` (`secrets::principal_store::
+    // WRAP_KEY_ENV`), which the broker sets on each T1 principal child it
+    // launches. It is deliberately NOT in this list: the child takes it while
+    // building `AppState` (`DaemonSecrets::for_daemon` → `WrapKey::take_from_env`),
+    // which reads it once, zeroes the value in the environment block and
+    // unsets it before anything is spawned — in every tier, so it never
+    // outlives startup. `pty::is_host_only_env` filters it from PTYs as well.
+    // Adding it here would make that read always fail.
     //
     // Safety: single-threaded here — the Tokio worker pool is running but no
     // task of ours has started, and `run_server` is called below.
@@ -375,6 +408,10 @@ async fn main() -> anyhow::Result<()> {
         principal_child: args.principal_child,
         expected_uid: args.expected_uid,
         bootstrap_admin,
+        public_url: args.public_url,
+        max_accounts: args.max_accounts,
+        invite_ttl_days: args.invite_ttl,
+        member_invites_create_accounts: args.member_invites_create_accounts,
     };
 
     run_server_with(config, t1).await
@@ -841,6 +878,37 @@ mod tests {
             .to_string();
         assert!(help.contains("--insecure-cookie"), "{help}");
         assert!(!help.contains("--principal-child"), "{help}");
+    }
+
+    /// G-ACCESS §10.1: every Part B flag parses and defaults off / unlimited.
+    #[test]
+    fn part_b_access_flags_parse_with_safe_defaults() {
+        let args = CliArgs::try_parse_from(["ikenga-server"]).unwrap();
+        assert_eq!(args.serve.public_url, None);
+        assert_eq!(args.serve.max_accounts, None);
+        assert_eq!(args.serve.invite_ttl, None);
+        assert!(!args.serve.member_invites_create_accounts);
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "--public-url",
+            "https://ik.example.ts.net",
+            "--max-accounts",
+            "25",
+            "--invite-ttl",
+            "30",
+            "--member-invites-create-accounts",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.serve.public_url.as_deref(),
+            Some("https://ik.example.ts.net")
+        );
+        assert_eq!(args.serve.max_accounts, Some(25));
+        assert_eq!(args.serve.invite_ttl, Some(30));
+        assert!(args.serve.member_invites_create_accounts);
+        // P-15: the invite TTL tops out at 30 days.
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "31"]).is_err());
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "0"]).is_err());
     }
 
     #[test]

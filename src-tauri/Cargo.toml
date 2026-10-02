@@ -148,6 +148,11 @@ include_dir = "0.7"
 # data_store_identifier is a 16-byte sha256 prefix of (pkg_id || '/' || partition).
 # Also used by `pkg_install_from_registry` (sha2::Sha512) for tarball integrity.
 sha2 = "0.10"
+# G-ACCESS (WP-74a, §3.5): HKDF-SHA256 / HMAC-SHA256 for pairing key
+# confirmation and the fingerprint seed (WP-74b). Both already in Cargo.lock
+# transitively (hkdf 0.12.4, hmac 0.12.1), so no new version enters the tree.
+hkdf = "0.12"
+hmac = "0.12"
 # Async HTTP client for downloading pkg tarballs from npm. rustls instead of
 # system OpenSSL — no native deps, matches the rest of the rust-tls ecosystem.
 # `stream` enables chunk-by-chunk reads so we can hash + write in parallel
