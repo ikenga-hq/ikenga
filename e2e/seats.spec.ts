@@ -402,16 +402,37 @@ for (const mode of ['dark', 'light'] as const) {
 			expect(pageErrors).toEqual([]);
 		});
 
-		test(`devices: read-only, labelled not a security boundary (${mode})`, async ({ page }, testInfo) => {
-			const pageErrors = await boot(page, { mode });
+		test(`devices: paired-devices table, no shared-token note (${mode})`, async ({ page }, testInfo) => {
+			const pageErrors = await boot(page, {
+				mode,
+				responses: {
+					access_devices_list: [
+						{
+							deviceId: 'host',
+							kind: 'host',
+							name: 'This Mac',
+							platform: 'macOS',
+							tier: 'full',
+							pairedAt: 0,
+							lastSeenAt: null,
+							lastSeenAddr: null,
+							liveSockets: 0,
+							thisDevice: true,
+						},
+					],
+				},
+			});
 			const address = page.getByRole('textbox', { name: 'Address' });
 			await address.fill('/settings/devices');
 			await address.press('Enter');
 			const devices = page.locator('[data-state="devices"]');
 			await expect(devices).toBeVisible();
-			const note = devices.getByRole('note', { name: 'Not a security boundary' });
-			await expect(note).toBeVisible();
-			await expect(note).toContainText('read-only');
+			// WP-74b (G-ACCESS §15 N-7): each remote device holds its own grant, so the
+			// WP-72 shared-bearer "Not a security boundary" note is gone.
+			await expect(devices.getByRole('note', { name: 'Not a security boundary' })).toHaveCount(0);
+			await expect(devices.getByText('Permission requests')).toBeVisible();
+			await expect(devices.getByText('Set by how the server was started.')).toBeVisible();
+			await expect(devices.getByText(/No paired devices\. Pair a phone/)).toBeVisible();
 			await page.screenshot({ path: shotPath(testInfo, `people-devices-${mode}.png`) });
 			expect(pageErrors).toEqual([]);
 		});

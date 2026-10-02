@@ -267,6 +267,68 @@ async fn the_public_route_set_is_exactly_health_spa_and_pairing() {
     assert_ne!(res.status(), StatusCode::GONE);
 }
 
+/// Review m7: the T0 pairing endpoints reach the daemon's registry through
+/// the full router (`t0_pairing_host`: `Arc<DaemonAccess>` →
+/// `PairingHost`): begin over `/api/rpc` with the operator bearer, then a
+/// device's hello and confirm through `create_router` answer 200, and the
+/// request shows in `access_pair_pending`.
+#[tokio::test]
+async fn t0_pairing_runs_through_the_full_router() {
+    let (router, access) = daemon().await;
+    let store_id = access.store().unwrap().meta().store_id.clone();
+    let (status, body, _) = rpc(&router, bearer(OP), "access_pair_begin", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let code = super::pairing::normalize_code(body["data"]["code"].as_str().unwrap()).unwrap();
+    assert_eq!(body["data"]["cookieSecure"], true);
+    let post = |path: &'static str, v: Value| {
+        let router = router.clone();
+        async move {
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(v.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (dev, msg_a) = super::spake::device_start_with_rng(&code, &store_id, rand::rngs::OsRng);
+    let (status, v) = post(
+        "/access/pair/hello",
+        json!({"slot": &code[..1], "msgA": super::spake::b64(&msg_a), "deviceName": "Pixel 9 · Chrome"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["storeId"], store_id);
+    let pid = v["pairingId"].as_str().unwrap().to_string();
+    let msg_b = super::spake::unb64(v["msgB"].as_str().unwrap()).unwrap();
+    let keys = super::spake::Keys::derive(&dev.finish(&msg_b).unwrap(), &pid, &msg_a, &msg_b);
+    let (status, v) = post(
+        "/access/pair/confirm",
+        json!({"pairingId": pid, "deviceConfirm": super::spake::b64(&keys.device_confirm())}),
+    )
+    .await;
+    assert_eq!(
+        (status, v["state"].as_str()),
+        (StatusCode::OK, Some("awaiting_host"))
+    );
+    let (_, body, _) = rpc(&router, bearer(OP), "access_pair_pending", json!({})).await;
+    assert_eq!(body["data"][0]["pairingId"], pid.as_str());
+    assert_eq!(body["data"][0]["state"], "awaiting_host");
+}
+
 /// A-6 / A-7 (T0, end to end): a device's open socket closes with 4403 on a
 /// tier change and 4401 on revoke, immediately.
 #[tokio::test]
@@ -703,4 +765,127 @@ async fn a_rotated_cookie_is_set_on_a_refusal_too() {
         .unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"], "forbidden: missing=dispatch");
+}
+
+/// Round 19, DEC-R19-1 (T0, full router): the `auth_middleware` device
+/// cookie — cleared or rotated — omits `Secure` only when the TCP peer
+/// (`ConnectInfo`) is a tailnet address. A LAN peer keeps it, and so does a
+/// LAN peer claiming a tailnet `X-Forwarded-For`.
+#[tokio::test]
+async fn t0_device_cookies_drop_secure_only_for_a_tailnet_peer() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    let (router, access) = daemon().await;
+    let store = access.store().unwrap();
+    let (row, tok) = pair(store, Tier::View).await;
+    let forged = super::devices::token(&row.device_id, &super::devices::mint_secret().secret);
+    let send = |cookie: String, peer: &'static str, xff: &'static str| {
+        let router = router.clone();
+        async move {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/api/rpc")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {OP}"))
+                .header("cookie", format!("ikenga_device={cookie}"))
+                .header("x-forwarded-for", xff)
+                .body(Body::from(
+                    json!({"cmd": "access_status", "args": {}}).to_string(),
+                ))
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 51000)));
+            let res = router.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            res.headers()
+                .get("set-cookie")
+                .expect("a Set-Cookie")
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+
+    // Clear (a dead cookie beside the operator bearer).
+    for (peer, xff, secure) in [
+        ("100.101.102.103", "192.168.1.9", false),
+        ("fd7a:115c:a1e0::7", "192.168.1.9", false),
+        ("::ffff:100.64.0.9", "192.168.1.9", false),
+        ("192.168.1.9", "100.101.102.103", true),
+        ("100.63.255.255", "100.101.102.103", true),
+        ("127.0.0.1", "100.101.102.103", true),
+    ] {
+        let cookie = send(forged.clone(), peer, xff).await;
+        assert!(cookie.contains("Max-Age=0"), "{cookie}");
+        assert_eq!(
+            cookie.contains("Secure"),
+            secure,
+            "clear, peer={peer}: {cookie}"
+        );
+    }
+
+    // Rotate (a cookie older than 30 days).
+    let age = || async {
+        let old = super::devices::now_ms() - super::devices::ROTATE_AFTER.as_millis() as i64 - 1000;
+        sqlx::query(
+            "UPDATE devices SET secret_rotated_at = ?, paired_at = ?, last_seen_at = ? \
+             WHERE device_id = ?",
+        )
+        .bind(old)
+        .bind(old)
+        .bind(super::devices::now_ms())
+        .bind(&row.device_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    };
+    let mut tok = tok;
+    for (peer, secure) in [("100.101.102.103", false), ("192.168.1.9", true)] {
+        age().await;
+        let cookie = send(tok.clone(), peer, "100.101.102.103").await;
+        let fresh = cookie
+            .strip_prefix("ikenga_device=")
+            .and_then(|v| v.split(';').next())
+            .filter(|v| !v.is_empty())
+            .expect("a rotated (not cleared) cookie")
+            .to_string();
+        assert_ne!(fresh, tok);
+        assert_eq!(
+            cookie.contains("Secure"),
+            secure,
+            "rotate, peer={peer}: {cookie}"
+        );
+        tok = fresh;
+    }
+}
+
+/// Round 19, DEC-R19-1: `access_pair_begin`'s `cookieSecure` predicts the
+/// cookie a device opening `pairUrl` gets — false for a tailnet host on
+/// T0, true for a LAN host.
+#[tokio::test]
+async fn pair_begin_reports_cookie_secure_by_the_pair_url_host() {
+    let (router, _access) = daemon().await;
+    for (base, secure) in [
+        ("http://100.101.102.103:4000", false),
+        ("http://[fd7a:115c:a1e0::7]:4000", false),
+        ("http://ned-desktop.tail1a2b.ts.net:4000", false),
+        ("http://192.168.1.9:4000", true),
+        ("http://100.128.0.1:4000", true),
+    ] {
+        let (status, body, _) = rpc(
+            &router,
+            bearer(OP),
+            "access_pair_begin",
+            json!({"publicBase": base}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"]["pairUrl"],
+            format!("{base}/remote/pair"),
+            "{body}"
+        );
+        assert_eq!(body["data"]["cookieSecure"], secure, "{base}");
+    }
 }

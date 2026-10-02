@@ -19,6 +19,7 @@
 //! All times are unix **milliseconds**.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use sqlx::{Connection, Row, SqliteConnection};
 use super::audit::{chain::Chain, AuditVia, Event};
 use super::caps::Tier;
 use super::ctx::AccessCtx;
-use super::store::AccessStore;
+use super::store::{AccessStore, StoreTier};
 use super::{AccessError, Code};
 
 /// The token prefix (P-4).
@@ -601,6 +602,42 @@ pub async fn revoke(
     Ok(row)
 }
 
+/// WP-74b review m1: a grant minted at `decide(allow)` whose token never
+/// reached the device (the session expired, or was dropped, before the
+/// first status poll). The row would otherwise be a live grant nobody
+/// holds; it is revoked in place (`revoked_reason = 'user'`, the DDL's
+/// closed set — the audit detail says `undelivered`), one `device.revoked`
+/// row, continuing on a degraded chain (killing a credential, P-35).
+pub async fn revoke_undelivered(
+    store: &AccessStore,
+    device_id: &str,
+    pairing_id: &str,
+) -> anyhow::Result<()> {
+    let mut conn = store.pool().acquire().await?;
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT principal_id, name FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((principal_id, name)) = row else {
+        return Ok(());
+    };
+    if mark_revoked(&mut tx, device_id, None, "user").await? == 0 {
+        return Ok(());
+    }
+    let ev = Event::new("device.revoked", AuditVia::System)
+        .subject_principal(principal_id)
+        .subject_device(device_id)
+        .target(name)
+        .detail(serde_json::json!({ "reason": "undelivered", "pairing_id": pairing_id }))
+        .continue_when_degraded();
+    let head = store.chain().append(&mut tx, &ev).await?;
+    tx.commit().await?;
+    store.chain().committed(head);
+    Ok(())
+}
+
 /// R-11: a forced logout revokes **every** grant of the principal
 /// (`revoked_reason = 'sessions_revoked'`, one `device.revoked` row each),
 /// inside the forced-logout transaction. Returns the revoked device ids.
@@ -633,8 +670,59 @@ pub async fn revoke_all_for_sessions_revoked(
     Ok(ids.into_iter().map(|(id, _)| id).collect())
 }
 
-/// `Set-Cookie` for a device token (§3.8). `Secure` unless
-/// `--insecure-cookie`.
+/// A Tailscale address (Round 19, DEC-R19-1): IPv4 `100.64.0.0/10`
+/// (Tailscale's CGNAT range), IPv6 `fd7a:115c:a1e0::/48` (its ULA prefix), or
+/// an IPv4-mapped `::ffff:100.64.0.0/106` (a dual-stack listener's view of an
+/// IPv4 tailnet peer).
+pub fn is_tailnet_ip(ip: IpAddr) -> bool {
+    fn v4(ip: Ipv4Addr) -> bool {
+        let [a, b, ..] = ip.octets();
+        a == 100 && (b & 0xc0) == 0x40
+    }
+    match ip {
+        IpAddr::V4(ip) => v4(ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => v4(mapped),
+            None => matches!(ip.segments(), [0xfd7a, 0x115c, 0xa1e0, ..]),
+        },
+    }
+}
+
+/// Whether a `Set-Cookie` (device cookie, or a session cookie where one
+/// applies) omits `Secure` (G-PRINCIPAL §12.2 P-3 as amended by Round 19,
+/// DEC-R19-1):
+///
+/// * `--insecure-cookie` always drops it, on every tier.
+/// * On **T0** only, a request whose **TCP peer** (axum `ConnectInfo`) is a
+///   Tailscale address ([`is_tailnet_ip`]) drops it too: that hop is already
+///   WireGuard-encrypted end to end, and a browser drops a `Secure` cookie
+///   set over the daemon's plain-HTTP tailnet bind. `X-Forwarded-For` never
+///   decides this, so the caller passes the socket peer and nothing else.
+/// * The T1 broker is unchanged: P-3 plus `--insecure-cookie` as signed.
+pub fn cookie_insecure(tier: StoreTier, insecure_flag: bool, peer: Option<IpAddr>) -> bool {
+    insecure_flag || (tier == StoreTier::T0 && peer.is_some_and(is_tailnet_ip))
+}
+
+/// Whether a link's host is a tailnet address — an IP in the
+/// [`is_tailnet_ip`] ranges, or a MagicDNS `*.ts.net` name (which resolves
+/// only to those) — so that a device opening it reaches the T0 daemon from a
+/// tailnet peer and gets a non-`Secure` cookie (DEC-R19-1). Only a
+/// prediction for the pair sheet; the server decides per request by the
+/// peer address.
+pub fn is_tailnet_url(link: &str) -> bool {
+    match url::Url::parse(link).ok().as_ref().and_then(url::Url::host) {
+        Some(url::Host::Ipv4(ip)) => is_tailnet_ip(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => is_tailnet_ip(IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d.ends_with(".ts.net") && d.len() > ".ts.net".len()
+        }
+        None => false,
+    }
+}
+
+/// `Set-Cookie` for a device token (§3.8). `Secure` unless `insecure` —
+/// [`cookie_insecure`] decides that per request.
 pub fn set_cookie(token: &str, insecure: bool) -> String {
     format!(
         "{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={COOKIE_MAX_AGE_SECS}{}",
@@ -1108,6 +1196,109 @@ pub(crate) mod tests {
         .unwrap();
         for line in dump {
             assert!(!line.contains(&secret) && !line.contains("ikd1."), "{line}");
+        }
+    }
+
+    /// DEC-R19-1: the Tailscale ranges, exactly — `100.64.0.0/10`,
+    /// `fd7a:115c:a1e0::/48`, and the IPv4-mapped form of the former.
+    #[test]
+    fn the_tailnet_predicate_matches_exactly_the_tailscale_ranges() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for s in [
+            "100.64.0.0",
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.255",
+            "::ffff:100.64.0.0",
+            "::ffff:100.101.102.103",
+            "::ffff:100.127.255.255",
+            "fd7a:115c:a1e0::",
+            "fd7a:115c:a1e0::1",
+            "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+            "fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(is_tailnet_ip(ip(s)), "{s} is tailnet");
+        }
+        for s in [
+            "100.63.255.255",
+            "100.128.0.0",
+            "100.0.0.1",
+            "101.64.0.1",
+            "99.64.0.1",
+            "10.0.0.1",
+            "192.168.1.4",
+            "172.16.0.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::ffff:100.63.255.255",
+            "::ffff:100.128.0.0",
+            "::ffff:192.168.1.4",
+            // IPv4-compatible (deprecated), not mapped: not a tailnet peer.
+            "::100.64.0.1",
+            "fd7a:115c:a1df:ffff:ffff:ffff:ffff:ffff",
+            "fd7a:115c:a1e1::",
+            "fd7a:115c::1",
+            "fd7a::1",
+            "fd00::1",
+            "::1",
+            "::",
+            "2001:db8::1",
+        ] {
+            assert!(!is_tailnet_ip(ip(s)), "{s} is not tailnet");
+        }
+    }
+
+    /// DEC-R19-1: only a T0 tailnet peer (or `--insecure-cookie`) drops
+    /// `Secure`; the T1 broker follows the flag alone.
+    #[test]
+    fn cookie_insecure_relaxes_only_t0_tailnet_peers() {
+        let tail = Some("100.64.1.2".parse().unwrap());
+        let tail6 = Some("fd7a:115c:a1e0::9".parse().unwrap());
+        let lan = Some("192.168.1.4".parse().unwrap());
+        for (tier, flag, peer, want) in [
+            (StoreTier::T0, false, tail, true),
+            (StoreTier::T0, false, tail6, true),
+            (StoreTier::T0, false, lan, false),
+            (StoreTier::T0, false, None, false),
+            (StoreTier::T0, true, lan, true),
+            (StoreTier::T0, true, None, true),
+            (StoreTier::T1, false, tail, false),
+            (StoreTier::T1, false, tail6, false),
+            (StoreTier::T1, false, lan, false),
+            (StoreTier::T1, true, tail, true),
+            (StoreTier::T1, true, lan, true),
+        ] {
+            assert_eq!(
+                cookie_insecure(tier, flag, peer),
+                want,
+                "{tier:?} flag={flag} peer={peer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tailnet_urls_are_tailnet_ip_hosts_or_magicdns_names() {
+        for u in [
+            "http://100.64.0.1:4000/remote/pair",
+            "http://100.127.255.255/remote/pair",
+            "http://[fd7a:115c:a1e0::1]:4000/remote/pair",
+            "http://ned-desktop.tail1a2b.ts.net:4000/remote/pair",
+            "http://NED-DESKTOP.TAIL1A2B.TS.NET/remote/pair",
+        ] {
+            assert!(is_tailnet_url(u), "{u}");
+        }
+        for u in [
+            "http://100.63.255.255:4000/remote/pair",
+            "http://100.128.0.0:4000/remote/pair",
+            "http://192.168.1.4:4000/remote/pair",
+            "http://[fd7a::1]:4000/remote/pair",
+            "http://ik.example/remote/pair",
+            "http://ts.net/remote/pair",
+            "http://evil-ts.net/remote/pair",
+            "http://localhost:4000/remote/pair",
+            "not a url",
+        ] {
+            assert!(!is_tailnet_url(u), "{u}");
         }
     }
 

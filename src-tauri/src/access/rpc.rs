@@ -48,9 +48,14 @@ pub struct PrincipalInfo {
 pub struct Env<'a> {
     pub tier: StoreTier,
     pub store: Option<&'a AccessStore>,
+    /// The pairing sessions (§3.1): the T0 daemon's or the T1 broker's;
+    /// `None` without a store (pairing is off).
+    pub pairing: Option<&'a super::pairing::Registry>,
     pub sockets: &'a dyn SocketControl,
     pub principal: PrincipalInfo,
     pub public_url: Option<String>,
+    /// `--insecure-cookie` (§3.8): whether the device cookie drops `Secure`.
+    pub insecure_cookie: bool,
 }
 
 /// `RpcResponse` for an [`AccessError`] (`"<code>: <message>"`).
@@ -97,12 +102,14 @@ pub async fn serve_daemon(
     let env = Env {
         tier: StoreTier::T0,
         store: access.store(),
+        pairing: access.store().map(|_| access.pairing.as_ref()),
         sockets: access.sockets.as_ref(),
         principal: PrincipalInfo {
             username: access.host.username.clone(),
             is_admin: false,
         },
         public_url: access.options.public_url.clone(),
+        insecure_cookie: access.options.insecure_cookie,
     };
     to_response(dispatch(&env, ctx, cmd, args).await)
 }
@@ -119,14 +126,11 @@ pub async fn dispatch(
         "access_devices_list" => devices_list(env, ctx).await,
         "access_device_set_tier" => device_set_tier(env, ctx, args).await,
         "access_device_revoke" => device_revoke(env, ctx, args).await,
-        // Pairing — WP-74b fills `access::pairing`.
+        // Pairing (§3, WP-74b).
         "access_pair_begin"
         | "access_pair_cancel"
         | "access_pair_pending"
-        | "access_pair_decide" => {
-            store(env)?;
-            Err(AccessError::not_implemented("WP-74b"))
-        }
+        | "access_pair_decide" => super::pairing::dispatch(env, ctx, cmd, args).await,
         // Routing preference — WP-75.
         "access_routing_get" | "access_routing_set" => {
             super::routing::dispatch(env, ctx, cmd, args).await
@@ -270,12 +274,14 @@ mod tests {
         Env {
             tier: StoreTier::T0,
             store: Some(store),
+            pairing: None,
             sockets,
             principal: PrincipalInfo {
                 username: "ned".into(),
                 is_admin: false,
             },
             public_url: None,
+            insecure_cookie: false,
         }
     }
 
@@ -386,7 +392,6 @@ mod tests {
         let op = operator_ctx(&store);
         let e = env(&store, &reg);
         for (cmd, wp) in [
-            ("access_pair_begin", "WP-74b"),
             ("access_routing_get", "WP-75"),
             ("permission_decide", "WP-75"),
             ("access_members_list", "WP-76"),
@@ -418,12 +423,14 @@ mod tests {
         let e = Env {
             tier: StoreTier::T0,
             store: None,
+            pairing: None,
             sockets: &*reg,
             principal: PrincipalInfo {
                 username: "u".into(),
                 is_admin: false,
             },
             public_url: None,
+            insecure_cookie: false,
         };
         let s = dispatch(&e, &ctx, "access_status", &json!({}))
             .await

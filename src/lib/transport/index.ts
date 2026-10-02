@@ -1,3 +1,4 @@
+import { isDeviceSession } from './device-session';
 import { detectT1Server, isT1Session } from './t1-session';
 
 export interface RpcTransport {
@@ -297,7 +298,9 @@ let transportInstance: RpcTransport | null = null;
  */
 export function isRemoteWebSession(): boolean {
 	// T1: no token, by design — the boot path's tier probe is the marker.
-	return !isTauri() && (isT1Session() || getAuthToken() !== null);
+	// A paired device (G-ACCESS §3.8, WP-74b): its HttpOnly cookie is the
+	// credential, so the boot path's `access_status` probe is the marker.
+	return !isTauri() && (isT1Session() || isDeviceSession() || getAuthToken() !== null);
 }
 
 export function getTransport(): RpcTransport {

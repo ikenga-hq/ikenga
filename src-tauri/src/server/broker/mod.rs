@@ -338,7 +338,8 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     let mut extensions = BrokerExtensions::default();
     extensions.resolvers.push(installed.resolver.clone());
     extensions.public = PublicRoutes::default()
-        .pairing(crate::access::http::pairing_routes(
+        .pairing(crate::access::http::pairing_routes_for(
+            access_t1.pairing_host(),
             config.allowed_origins.clone(),
         ))
         .invites(crate::access::http::invite_routes(

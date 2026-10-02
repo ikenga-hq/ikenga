@@ -56,6 +56,14 @@ export interface PairTicket {
 	expiresAt: number;
 	pairUrl: string | null;
 	qrPayload: string | null;
+	/**
+	 * The device cookie a device opening `pairUrl` gets carries `Secure`. A
+	 * browser drops it over plain HTTP off loopback, so the sheet warns when
+	 * `pairUrl` is `http://` and this is true (WP-74b review M1). False under
+	 * `--insecure-cookie`, and on the T0 daemon when `pairUrl`'s host is a
+	 * tailnet address (Round 19, DEC-R19-1). Absent on older daemons.
+	 */
+	cookieSecure?: boolean;
 }
 
 export interface PairRequest {
@@ -66,7 +74,10 @@ export interface PairRequest {
 	askedAt: number;
 	code: string;
 	fingerprint: [string, string, string, string];
-	state: 'awaiting_host' | 'burned';
+	/** `paused`: burned by the host-wide pause, which still lasts (§3.7). */
+	state: 'awaiting_host' | 'burned' | 'paused';
+	/** With `paused`: ms until pairing reopens. */
+	retryAfterMs?: number | null;
 }
 
 export type RoutingMode = 'any_approve' | 'this_device';

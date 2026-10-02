@@ -1,0 +1,13 @@
+Ikenga desktop (ikenga-desktop)
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party material
+--------------------
+
+EFF Large Wordlist for Passphrases
+  File: src-tauri/src/access/wordlist_eff_large.txt (used unmodified; the
+        pairing fingerprint phrase, G-ACCESS §3.5)
+  Source: https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt
+  Copyright Electronic Frontier Foundation (https://www.eff.org/dice).
+  Licensed under the Creative Commons Attribution 3.0 United States License
+  (CC BY 3.0 US): https://creativecommons.org/licenses/by/3.0/us/

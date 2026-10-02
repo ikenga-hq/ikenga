@@ -1,10 +1,100 @@
-import { useState, useEffect } from 'react';
+import { type FormEvent, useState, useEffect } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { isT1Session } from '@/lib/transport/t1-session';
 import { T1SignInForm } from './t1-sign-in-form';
 
+/**
+ * "Pair this device" (G-ACCESS §3.12, WP-74b): beside the T0 token and WP-20's
+ * T1 password modes. A browser with no credential at all, or a paired device
+ * whose grant died, gets a code field; pairing itself runs at `/remote/pair`
+ * (the code travels in the `#c=` fragment, never to the server's logs).
+ */
+function PairThisDevice() {
+	const errorMsg = useReauthStore((s) => s.errorMsg);
+	const pairWithCode = useReauthStore((s) => s.pairWithCode);
+	const setMode = useReauthStore((s) => s.setMode);
+	const [code, setCode] = useState('');
+	const host = typeof window !== 'undefined' ? window.location.host : '';
+	const submit = (e: FormEvent) => {
+		e.preventDefault();
+		pairWithCode(code);
+	};
+	return (
+		<div
+			data-state="reauth-pair"
+			className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_78%,transparent)] p-6 backdrop-blur-xs"
+		>
+			<form
+				onSubmit={submit}
+				aria-label="Pair this device"
+				className="w-full max-w-[400px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl"
+			>
+				<div className="flex items-center gap-2.5 border-b border-[var(--border-soft)] bg-[var(--bg-sunken)] px-5 py-4">
+					<span className="h-2 w-2 flex-none rounded-full bg-[var(--primary)]" />
+					<h2 className="m-0 text-[var(--text-h4)] font-semibold">Pair this device</h2>
+				</div>
+				<div className="flex flex-col gap-3 p-5">
+					<p className="m-0 text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+						On the computer that runs {host || 'Ikenga'}, open Settings › Devices › Pair a device
+						and type the code it shows. The computer confirms before this device gets anything.
+					</p>
+					<input
+						aria-label="Pairing code"
+						value={code}
+						onChange={(e) => setCode(e.target.value.toUpperCase())}
+						placeholder="K7P-42Q"
+						autoCapitalize="characters"
+						autoComplete="one-time-code"
+						spellCheck={false}
+						maxLength={9}
+						className="rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 text-center font-mono text-[18px] tracking-[0.25em] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]"
+					/>
+					<button
+						type="submit"
+						className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 cursor-pointer"
+					>
+						Pair with this code
+					</button>
+					{errorMsg && (
+						<div role="alert" className="font-mono text-[12px] text-[var(--danger)]">
+							{errorMsg}
+						</div>
+					)}
+					<button
+						type="button"
+						onClick={() => setMode('auto')}
+						className="text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
+					>
+						{isT1Session() ? 'Sign in with a password instead' : 'I have a token instead'}
+					</button>
+				</div>
+			</form>
+		</div>
+	);
+}
+
+/** The way into pair mode from the token / password modes (equal weight
+ *  belongs to WP-76's restyle; this is the plain entry). */
+function PairModeLink({ floating }: { floating?: boolean }) {
+	const setMode = useReauthStore((s) => s.setMode);
+	return (
+		<button
+			type="button"
+			onClick={() => setMode('pair')}
+			className={
+				floating
+					? 'fixed bottom-6 left-1/2 z-[51] -translate-x-1/2 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-2 text-[var(--text-body-sm)] text-[var(--fg)] shadow-lg hover:bg-[var(--bg-sunken)] cursor-pointer'
+					: 'mt-3 text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer'
+			}
+		>
+			Pair this device with a code
+		</button>
+	);
+}
+
 export function ReauthOverlay() {
 	const isOpen = useReauthStore((s) => s.isOpen);
+	const mode = useReauthStore((s) => s.mode);
 	const tokenInput = useReauthStore((s) => s.tokenInput);
 	const setTokenInput = useReauthStore((s) => s.setTokenInput);
 	const errorMsg = useReauthStore((s) => s.errorMsg);
@@ -28,8 +118,15 @@ export function ReauthOverlay() {
 	}, [isOpen]);
 
 	if (!isOpen) return null;
+	if (mode === 'pair') return <PairThisDevice />;
 	// T1: there is no token to paste; principals sign in (G-PRINCIPAL §2.4).
-	if (isT1Session()) return <T1SignInForm />;
+	if (isT1Session())
+		return (
+			<>
+				<T1SignInForm />
+				<PairModeLink floating />
+			</>
+		);
 
 	const handleReconnect = async () => {
 		setLoading(true);
@@ -90,6 +187,8 @@ export function ReauthOverlay() {
 					{errorMsg && (
 						<div className="mt-3 font-mono text-[12px] text-[var(--danger)]">{errorMsg}</div>
 					)}
+
+					<PairModeLink />
 
 					<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
 						<b className="text-[var(--live)] font-semibold">Still running on the host</b> — session

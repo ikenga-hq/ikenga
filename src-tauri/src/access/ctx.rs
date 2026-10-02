@@ -87,6 +87,28 @@ pub struct ShareCtx {
 pub struct RequestMeta {
     pub remote_addr: Option<String>,
     pub user_agent: Option<String>,
+    /// The `Host` the request arrived on (§3.3 rule 3: the pairing QR's
+    /// base when no `--public-url` is set and the host isn't loopback).
+    pub host: Option<String>,
+    /// `http` / `https`, from the request's `Origin` when it has one.
+    pub scheme: Option<String>,
+}
+
+impl RequestMeta {
+    /// `host` + `scheme` from a request's headers (WP-74b, §3.3).
+    pub fn with_host_from(mut self, headers: &axum::http::HeaderMap) -> Self {
+        let get = |n: &str| {
+            headers
+                .get(n)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string)
+        };
+        self.host = get("host");
+        self.scheme = get("origin")
+            .and_then(|o| o.split_once("://").map(|(s, _)| s.to_ascii_lowercase()))
+            .filter(|s| s == "http" || s == "https");
+        self
+    }
 }
 
 /// G-ACCESS's one derived, per-request struct (§2.3).
