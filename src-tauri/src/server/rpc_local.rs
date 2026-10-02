@@ -511,6 +511,26 @@ pub(super) fn secrets_write(state: &AppState, cmd: &str, args: &Value) -> RpcRes
     respond(cmd, r)
 }
 
+/// `secrets_lock_state`, `secrets_lock`, `secrets_set_passphrase`,
+/// `secrets_unlock`. Served only with a principal layer (T1). A T0 daemon
+/// answers exactly what `rpc_handler`'s unknown-command fallthrough always
+/// answered for these, because Settings → Secrets reads a successful
+/// unlocked state as "writable" and every T0 write is refused
+/// (`secrets_env`, "No passphrase layer"). The string is pinned to the
+/// fallthrough's by `secrets_lock_family_on_t0_is_the_unknown_command_error`.
+pub(super) fn secrets_lock_family(state: &AppState, cmd: &str) -> RpcResponse {
+    let Some(lock) = state.secrets.lock_state() else {
+        tracing::debug!("Unimplemented or pass-through RPC command: {cmd}");
+        return RpcResponse::error(format!(
+            "Command '{cmd}' not implemented in headless daemon"
+        ));
+    };
+    match cmd {
+        "secrets_lock_state" | "secrets_lock" => RpcResponse::success(lock),
+        _ => RpcResponse::error(format!("{cmd}: {}", crate::secrets_env::NO_PASSPHRASE)),
+    }
+}
+
 // ─── Identity ────────────────────────────────────────────────────────────────
 
 /// The daemon PROCESS's OS user (the desktop's function, unchanged).
@@ -862,6 +882,38 @@ mod tests {
             let names = ok(&r, "secrets_index_names", json!({})).await;
             assert!(names.is_array(), "{names}");
             assert_eq!(names, json!(crate::secrets_env::list_keys()));
+        }
+    }
+
+    /// R1 (WP-21 review): T0 must look to the FE exactly as it did on
+    /// `main`, where the lock family was unserved. Settings → Secrets marks
+    /// the vault writable on `available && configured && !locked`, and T0
+    /// reports `available: true`, so a served unlocked state would show add /
+    /// edit controls whose writes all fail with `WRITE_REFUSAL`. Each of the
+    /// four must answer the fallthrough's own unknown-command error.
+    #[tokio::test]
+    async fn secrets_lock_family_on_t0_is_the_unknown_command_error() {
+        for r in [daemon().router, bare(None)] {
+            let unknown = err(&r, "wp21_no_such_command", json!({})).await;
+            assert_eq!(
+                unknown, "Command 'wp21_no_such_command' not implemented in headless daemon",
+                "the fallthrough's shape drifted; update secrets_lock_family with it"
+            );
+            for (cmd, args) in [
+                ("secrets_lock_state", json!({})),
+                ("secrets_lock", json!({})),
+                ("secrets_set_passphrase", json!({ "passphrase": "p" })),
+                ("secrets_unlock", json!({ "passphrase": "p" })),
+            ] {
+                let e = err(&r, cmd, args).await;
+                assert_eq!(e, unknown.replace("wp21_no_such_command", cmd), "{cmd}");
+            }
+            // And the rest of T0 is as before: readable, never writable.
+            let status = ok(&r, "secrets_vault_status", json!({})).await;
+            assert_eq!(status["available"], true);
+            assert_eq!(status["writable"], false);
+            let e = err(&r, "secrets_set", json!({ "key": "K", "value": "v" })).await;
+            assert!(e.contains(crate::secrets_env::WRITE_REFUSAL), "{e}");
         }
     }
 

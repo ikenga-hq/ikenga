@@ -42,12 +42,22 @@
 //! # No passphrase layer
 //!
 //! Under DEC-R18-1 the key is server-held, so background work decrypts while
-//! the user is signed out. There is nothing to set, unlock or lock:
-//! `secrets_lock_state` reports `{configured: true, locked: false}` (the
-//! same `configured` `secrets_vault_status` has always reported),
+//! the user is signed out. There is nothing to set, unlock or lock. In a T1
+//! principal child `secrets_lock_state` reports `{configured: true,
+//! locked: false}` (the same `configured` `secrets_vault_status` reports),
 //! `secrets_lock` is a no-op answering that state, and
 //! `secrets_set_passphrase` / `secrets_unlock` are refused with
 //! [`NO_PASSPHRASE`].
+//!
+//! **A T0 daemon does not serve that family at all** ([`DaemonSecrets::lock_state`]
+//! is `None`): the four commands answer the unknown-command error they
+//! always have. That is load-bearing for the frontend, not an oversight.
+//! Settings → Secrets (`src/routes/settings/secrets.tsx`) treats the vault
+//! as writable when `available && configured && !locked`; T0 reports
+//! `available: true`, so an unlocked lock state there would show add / edit
+//! controls whose every write is refused with [`WRITE_REFUSAL`]. With the
+//! query erroring the page falls back to `configured: false, locked: true`
+//! and renders read-only, exactly as it did before WP-21.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -508,15 +518,25 @@ impl DaemonSecrets {
         }
     }
 
-    /// `secrets_lock_state` (and `secrets_lock`, which has nothing to lock):
-    /// a server-held key is always configured and never locked — the same
-    /// `configured` [`status`] reports.
-    pub fn lock_state(&self) -> LockState {
-        LockState {
-            configured: true,
-            locked: false,
-            idle_timeout_secs: 0,
-            last_activity_unix_ms: None,
+    /// `secrets_lock_state` (and `secrets_lock`, which has nothing to lock).
+    ///
+    /// With a principal layer (T1, open or broken): a server-held key is
+    /// always configured and never locked — the same `configured`
+    /// [`Self::status`] reports. A broken store still answers this; its
+    /// `available: false` status is what keeps the FE read-only.
+    ///
+    /// `None` without one (T0): the daemon does not serve the lock family,
+    /// so the RPC answers the unknown-command error it always has and the
+    /// FE stays read-only (see the module docs, "No passphrase layer").
+    pub fn lock_state(&self) -> Option<LockState> {
+        match self.principal {
+            PrincipalLayer::Absent => None,
+            PrincipalLayer::Open(_) | PrincipalLayer::Broken(_) => Some(LockState {
+                configured: true,
+                locked: false,
+                idle_timeout_secs: 0,
+                last_activity_unix_ms: None,
+            }),
         }
     }
 }
@@ -728,11 +748,10 @@ mod tests {
             (st.mode.as_str(), st.writable, st.available),
             (MODE_ENV, false, true)
         );
-        let lock = s.lock_state();
-        assert!(
-            lock.configured && !lock.locked,
-            "consistent with status().configured"
-        );
+        // The lock family stays unserved on T0, as before WP-21: an
+        // unlocked state here would make Settings → Secrets offer writes
+        // that WRITE_REFUSAL then rejects.
+        assert!(s.lock_state().is_none());
     }
 
     /// Fail closed: a T1 child whose store won't open never silently serves
@@ -748,6 +767,8 @@ mod tests {
         assert!(!st.available && !st.writable);
         assert_eq!(st.mode, MODE_PRINCIPAL);
         assert_eq!(st.error.as_deref(), Some("no key"));
+        // Still answered (T1), but `available: false` keeps the FE read-only.
+        assert!(s.lock_state().is_some());
     }
 
     #[test]
@@ -759,6 +780,11 @@ mod tests {
         assert_eq!(st.mode, MODE_PRINCIPAL);
         let v = serde_json::to_value(&st).unwrap();
         assert_eq!(v.as_object().unwrap().len(), 9, "same wire shape");
+        let lock = s.lock_state().expect("T1 serves the lock family");
+        assert!(
+            lock.configured && !lock.locked,
+            "consistent with status().configured"
+        );
     }
 
     /// A T0 daemon never opens a principal store, and building one never

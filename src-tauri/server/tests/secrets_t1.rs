@@ -440,5 +440,43 @@ fn t1_root_secrets_principal_store_over_the_operator_default() {
         );
     });
     drop(broker);
+
+    // WP-21 review R3: a lost operator/secrets-kek (stores exist) is never
+    // silently re-minted. The launch fails with the restore instruction,
+    // and restoring the backup brings every store back.
+    let kek_path = root.join("operator/secrets-kek");
+    let backup = root.join("operator-kek-backup");
+    std::fs::rename(&kek_path, &backup).unwrap();
+    let broker = start_broker(&tmp.0, &root);
+    rt.block_on(async {
+        let ada = login(&broker, "t1sec-ada").await;
+        let res = http()
+            .post(broker.url("/api/rpc"))
+            .header("cookie", &ada)
+            .header("content-type", "application/json")
+            .body(json!({ "cmd": "secrets_get", "args": { "key": "ADA_ONLY" } }).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(res.status(), 200, "no child without its KEK");
+    });
+    assert!(!kek_path.exists(), "a lost KEK is never re-minted");
+    let log = broker.log();
+    assert!(
+        log.contains("Restore operator/secrets-kek from backup"),
+        "the refusal says how to recover: {log}"
+    );
+    drop(broker);
+    std::fs::rename(&backup, &kek_path).unwrap();
+    let broker = start_broker(&tmp.0, &root);
+    rt.block_on(async {
+        let ada = login(&broker, "t1sec-ada").await;
+        assert_eq!(
+            data(&broker, &ada, "secrets_get", json!({ "key": "ADA_ONLY" })).await,
+            "a",
+            "the restored KEK opens the existing store"
+        );
+    });
+    drop(broker);
     drop(users);
 }

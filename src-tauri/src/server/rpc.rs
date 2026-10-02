@@ -507,15 +507,15 @@ pub async fn rpc_handler(
         // both layers — same `string[]` shape, never a value.
         "secrets_index_names" => rpc_local::secrets_index_names(&state),
         // No passphrase layer (DEC-R18-1: the key is server-held, so
-        // background work reads secrets while the user is signed out).
-        // `configured: true, locked: false` — the same `configured` that
-        // `secrets_vault_status` reports — and `secrets_lock` has nothing to
-        // lock, so it answers the state (as the desktop does with no
-        // passphrase). Setting or unlocking one is refused, with why.
-        "secrets_lock_state" | "secrets_lock" => RpcResponse::success(state.secrets.lock_state()),
-        cmd @ ("secrets_set_passphrase" | "secrets_unlock") => {
-            RpcResponse::error(format!("{cmd}: {}", crate::secrets_env::NO_PASSPHRASE))
-        }
+        // background work reads secrets while the user is signed out). T1:
+        // `configured: true, locked: false`, `secrets_lock` answers that
+        // state, setting / unlocking a passphrase is refused with why. T0:
+        // the unknown-command error, byte-identical to before WP-21, so
+        // Settings → Secrets stays read-only there.
+        cmd @ ("secrets_lock_state"
+        | "secrets_lock"
+        | "secrets_set_passphrase"
+        | "secrets_unlock") => rpc_local::secrets_lock_family(&state, cmd),
 
         // --- Local state (WP-19 slice 2) ---
         //

@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, SqliteConnection};
 
 use crate::executor::t1::T1Executor;
 use crate::executor::{PipedOpts, Principal, PrincipalId, SpawnSpec, StdioMode};
@@ -338,10 +340,25 @@ impl T1Launcher {
     /// The operator KEK (created on the first launch) and this principal's
     /// wrapping key from it. Fails the launch rather than starting a child
     /// with no store, which would serve the operator default in place of the
-    /// principal's own credential.
-    fn secrets_key(&self, principal: &Principal) -> anyhow::Result<WrapKey> {
-        let kek = SecretsKek::load_or_create(&self.root.operator_dir(), KekOwner::Root)
-            .map_err(|e| anyhow::anyhow!("operator secrets KEK unusable: {e}"))?;
+    /// principal's own credential — including when the KEK file is missing
+    /// but one existed before (`secrets_kek::KekLost`: restore it from
+    /// backup; a new one is never minted over existing stores).
+    ///
+    /// `accounts.db` (whose `operator_meta` records KEK creation) is opened
+    /// here, per launch, on its own connection: the launcher holds no pool,
+    /// and a launch is rare next to the work it starts.
+    async fn secrets_key(&self, principal: &Principal) -> anyhow::Result<WrapKey> {
+        let mut meta = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(self.root.accounts_db())
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("operator secrets KEK: opening accounts.db: {e}"))?;
+        let kek = SecretsKek::load_or_create(&self.root, KekOwner::Root, &mut meta).await;
+        let _ = meta.close().await;
+        let kek = kek.map_err(|e| anyhow::anyhow!("operator secrets KEK unusable: {e}"))?;
         Ok(kek.wrap_key_for(principal.id))
     }
 }
@@ -373,7 +390,7 @@ impl ChildLauncher for T1Launcher {
                 // directly; the broker stops them itself.
                 new_process_group: true,
             };
-            let secrets_key = self.secrets_key(principal)?;
+            let secrets_key = self.secrets_key(principal).await?;
             let child = self.executor.spawn_piped_with_host_env(
                 spec,
                 opts,

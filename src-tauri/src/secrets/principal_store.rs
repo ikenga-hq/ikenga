@@ -419,6 +419,18 @@ impl PrincipalStore {
     /// point leaves either the old or the new envelope, each of which opens
     /// every value. A `current` that doesn't open the envelope writes
     /// nothing. Run it while the principal's child is stopped.
+    ///
+    /// **Not yet safe to call as root.** It opens, writes and renames by
+    /// path inside `<data>/secrets/`, a directory the principal owns: root
+    /// following those paths could be steered by a principal-planted
+    /// symlink into writing elsewhere, or leave a root-owned envelope the
+    /// principal's child cannot read. Until it is ported, call it only as
+    /// the principal's uid (e.g. in a T1-executor child, as the store's own
+    /// writes are) — or port it to fd-relative, never-follow I/O
+    /// (`server::operator::safe_fs`, as `adopt_t0` does) with the result
+    /// chowned to the uid. The deferred operator `rotate` command (WP-21
+    /// follow-up) must do one of the two; today nothing calls this outside
+    /// tests.
     pub fn rewrap(data_dir: &Path, current: &WrapKey, next: &WrapKey) -> Result<(), StoreError> {
         if current.principal != next.principal {
             return Err(StoreError::invalid(
