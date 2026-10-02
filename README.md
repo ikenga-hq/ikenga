@@ -1,7 +1,7 @@
 # Ikenga
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/ikenga-hq/ikenga/actions)
-[![Version](https://img.shields.io/badge/version-v0.0.7-blue.svg)](https://github.com/ikenga-hq/ikenga/releases)
+[![Version](https://img.shields.io/github/v/release/ikenga-hq/ikenga?label=version&color=blue)](https://github.com/ikenga-hq/ikenga/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Discussions](https://img.shields.io/badge/community-discussions-5865F2.svg)](https://github.com/ikenga-hq/ikenga/discussions)
 [![Newsletter](https://img.shields.io/badge/newsletter-Building%20in%20the%20Loop-e8590c.svg)](https://buildingintheloop.substack.com/subscribe)
@@ -9,7 +9,7 @@
 > An open-source desktop workspace for the multi-agent way of working — your agents,
 > skills, commands, scheduled jobs, and memory in one window, all aware of each other.
 
-<!-- SCREENSHOT: docs/media/hero.png — full app window: Home canvas with a couple of widgets, a chat pane open on the right -->
+<!-- SCREENSHOT: docs/media/hero.png — full app window: Home canvas with a couple of widgets -->
 ![Ikenga desktop](docs/media/hero.png)
 
 ## Why Ikenga?
@@ -30,7 +30,9 @@ memory — and pulled the whole thing into one place. Now it's open.
 `ikenga` is a Tauri 2 + Vite + React 19 + TypeScript desktop app — a single-window control
 plane that hosts terminals, AI chat sessions, viewers, and mini-apps. It's **engine-optional**:
 the default AI engine (Claude Code) ships as a package, so it updates independently of the
-shell, and the shell runs without any engine at all. Codex and Gemini are pluggable adapters.
+shell, and the shell runs without any engine at all. Other engines — Codex, OpenRouter,
+Antigravity, OpenCode, and Pi — are optional engine pkgs; see [Multi-engine chat](#multi-engine-chat)
+for what each one needs and how mature it is.
 
 Everything beyond the window chrome — mini-apps, tool servers, engine adapters — is an
 independently installable **package (pkg)**. At boot the kernel discovers installed pkgs,
@@ -42,7 +44,7 @@ Pkgs (independently installable + updatable)
   ├─ UI pkgs       — iframe / webview mini-apps
   ├─ MCP pkgs      — headless tool servers
   ├─ CLI pkgs      — bundled sidecar binaries
-  └─ Engine pkgs   — Claude Code adapter (default), alternatives later
+  └─ Engine pkgs   — Claude Code adapter (default) plus alternative engines
 
 Pkg Kernel (Rust + TS)  — manifest, lifecycle, scopes, IPC, updater
 Shell Core              — chrome, identity, pkg manager UI
@@ -54,21 +56,19 @@ first-party pkgs.
 
 ## Install
 
-<!-- GATED: install one-liner not live until WP-13 — the real one-liner ships with the first verified GitHub Release. -->
-
 ```bash
-# placeholder — the real one-liner lands with the first verified GitHub Release
 curl -fsSL https://ikenga.dev/install.sh | sh
 ```
 
-Until the install script is live, build from source (below). Released builds, when
-available, are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases).
+The script installs on macOS, Linux (x86_64) and Windows (under Git Bash). Installers are
+also on the [Releases page](https://github.com/ikenga-hq/ikenga/releases). To build from
+source, see Quickstart below.
 
 ## Quickstart
 
 Prereqs:
 
-- macOS or Linux (Linux needs WebKit2GTK 4.1 — `libwebkit2gtk-4.1-dev`)
+- macOS, Linux, or Windows (Linux needs WebKit2GTK 4.1 — `libwebkit2gtk-4.1-dev`)
 - Rust ≥ 1.77
 - `bun` ≥ 1.1
 - `claude` on `$PATH` (for the default engine + terminal panel)
@@ -79,10 +79,12 @@ bun install
 bun run tauri dev
 ```
 
-The window opens to the **Home** canvas — a free-form workspace of built-in and
-pkg-contributed widgets. Navigate via the activity bar, sidebar, and command palette
-(⌘K / Ctrl+K). The first-run onboarding flow handles account / engine setup; no env file is
-required to launch.
+The Project dashboard (⌘1) is built on the **Home** canvas — a free-form workspace of
+built-in widgets (greeting, quick actions, scratchpad) and pkg-contributed ones (tasks,
+inbox triage, boards, finance), with a daily-address summary row above it. **Customize**
+turns on edit mode: drag widgets in from the palette and reposition them, and the layout
+persists. Navigate via the activity bar, sidebar, and command palette (⌘K / Ctrl+K). The
+first-run onboarding flow handles account / engine setup; no env file is required to launch.
 
 ### Optional env vars
 
@@ -120,15 +122,22 @@ monorepo — read those for working examples of each archetype.
 ## Multi-engine chat
 
 The chat layer is multi-engine. The frontend sees one wire — ACP-shaped session updates —
-regardless of which CLI backs a thread. Engine and model are selectable per turn. Each
-engine needs its CLI on `$PATH`.
+regardless of which engine backs a thread. Engine and model are selectable per turn. Every
+engine below except OpenRouter (an HTTP engine) needs its CLI on `$PATH`.
 
-| Engine | Status | Auth |
+| Engine | Maturity | Auth |
 |---|---|---|
-| **Claude Code** | default | `claude login` / `ANTHROPIC_API_KEY` |
-| **Gemini** | ACP passthrough | `gemini auth` / `GEMINI_API_KEY` |
-| **Codex** | custom adapter | `codex login` / `OPENAI_API_KEY` |
-| **cursor-agent** | scaffold only (runtime stubbed) | TBD |
+| **Claude Code** | Supported (default) | `claude login` / `ANTHROPIC_API_KEY` |
+| **Codex** | Beta | `codex login` / `OPENAI_API_KEY` |
+| **OpenRouter** | Beta — cannot resume a session after a restart | `OPENROUTER_API_KEY` |
+| **Antigravity** | Beta | `GEMINI_API_KEY` (`agy` CLI) |
+| **OpenCode** | Experimental | `opencode /init` |
+| **Pi** | Experimental | `pi /login` |
+
+Each engine is its own pkg under
+[`ikenga-pkgs/packages/engine/`](https://github.com/ikenga-hq/ikenga-pkgs/tree/main/packages/engine).
+The `cursor-agent` engine pkg is a scaffold with its runtime stubbed, so it is not a usable
+engine yet.
 
 ## Scripts
 
@@ -141,7 +150,7 @@ bun run tsr:generate # regenerate routeTree.gen.ts after route changes
 bun run fmt          # biome format --write .
 bun run lint         # biome lint .
 bun run test         # vitest run
-bun run engine:smoke # probe gemini --acp + codex --json wires (no build needed)
+bun run engine:smoke # probe engine CLI wire protocols (no build needed)
 ```
 
 `dev` and `build` first run bundle prereqs automatically (`bun:fetch`,
@@ -153,7 +162,7 @@ bun run engine:smoke # probe gemini --acp + codex --json wires (no build needed)
 src/
 ├─ routes/                # file-based routes (TanStack Router)
 │  ├─ __root.tsx          # mounts the workspace shell
-│  ├─ index.tsx           # /  → Home canvas
+│  ├─ index.tsx           # /  → Home canvas (also mounted at project/dashboard)
 │  ├─ artifacts/  claude/  packages.tsx  pkg/  projects/
 │  ├─ sessions/  settings/  onboarding/  scratchpads.tsx  todos.tsx
 │  └─ …
@@ -197,8 +206,8 @@ focus the Ikenga window.
 
 ## Status
 
-Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases)
-(current: v0.0.7).
+Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases);
+the version badge at the top shows the latest release.
 
 ## Distribution
 
@@ -208,13 +217,12 @@ Two release paths: **GitHub Actions** for cross-platform release builds, and
 ### GitHub Actions (recommended for releases)
 
 `.github/workflows/release.yml` runs on tag push (`v*`) and produces installers
-for all four targets in parallel:
+for all three targets in parallel:
 
 | Runner | Target | Output |
 |---|---|---|
-| `macos-latest` | `aarch64-apple-darwin` | `.dmg`, `.app.tar.gz` (Apple Silicon) |
-| `macos-latest` | `x86_64-apple-darwin` | `.dmg`, `.app.tar.gz` (Intel) |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `.msi`, `.exe` |
+| `macos-latest` | `universal-apple-darwin` | `.dmg`, `.app.tar.gz` (one universal build: Apple Silicon + Intel) |
+| `windows-latest` | `x86_64-pc-windows-msvc` | NSIS `.exe` |
 | `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `.deb` (`.AppImage` — see caveat) |
 
 ```bash
@@ -223,8 +231,8 @@ git push origin v0.0.1   # → draft release on the Releases page
 ```
 
 **Manual test build** (no tag): Actions tab → Release workflow → Run workflow.
-Pick a single matrix leg (`linux-only` / `mac-arm-only` / …) to test fast
-(~10 min vs ~25). Artifacts attach to the run; no release is published.
+Pick a single platform (`linux-only` / `mac-only` / `windows-only`; default `all`) to
+test fast. Artifacts attach to the run; no release is published.
 
 **Setup:** workspace sibling deps (`@ikenga/contract`, `@ikenga/tokens`, the
 engine + mcp-iyke pkgs) are public Apache-2.0, so the default `GITHUB_TOKEN`
@@ -241,7 +249,7 @@ Caveats:
 
 ### Local install (single platform)
 
-Unsigned, no notarization, no auto-updater, no remote distribution.
+Unsigned, no notarization, no remote distribution.
 
 #### Linux (Pop_OS! / Ubuntu)
 
@@ -306,7 +314,7 @@ credential nobody has another copy of.
 - `IKENGA_VAULT_KEY`: **Reserved — nothing reads it yet.** The headless vault is WP-12b
   (ikenga#100); `secrets_set` currently answers "not implemented in the headless daemon".
   It is generated now so the vault lands on a key that has been stable since first boot.
-- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`: appended to the same env file if exported.
+- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (the latter is used by the Antigravity engine): appended to the same env file if exported.
   systemd loads it via `EnvironmentFile` and the engine adapters inherit their
   environment, so the agent CLIs pick them up without any config file being written.
 
@@ -338,13 +346,14 @@ IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
 
 - No code signing (no Apple Developer ID, no Windows EV cert)
 - No notarization
-- No auto-updater (`tauri-plugin-updater` intentionally absent)
 - No Snap, Flatpak, or Mac App Store
 - No system-tray icon (global shortcut covers summon UX)
 
 GitHub Releases (via the Actions workflow) is the supported remote distribution
-channel. Revisit signing / notarization if Ikenga ever needs to be installed at
-scale.
+channel. The built-in updater checks GitHub Releases (`latest.json`) for new app
+versions, while packages update from the registry at
+`https://registry.ikenga.dev/index.json`; one update flow covers both, and it shipped
+in v0.14.0. Revisit signing / notarization if Ikenga ever needs to be installed at scale.
 
 ## Links
 
