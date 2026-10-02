@@ -62,13 +62,32 @@ pub async fn chat_ws_handler(
 }
 
 /// One `session/update` envelope.
-fn update_event(thread_id: &str, update: serde_json::Value) -> String {
+fn update_envelope(thread_id: &str, update: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": { "thread_id": thread_id, "update": update }
     })
-    .to_string()
+}
+
+fn update_event(thread_id: &str, update: serde_json::Value) -> String {
+    update_envelope(thread_id, update).to_string()
+}
+
+/// An engine `session/update` as this socket sends it, or `None` when the
+/// request's share drops it (G-ACCESS §4.5.4, WP-76 H-2): a Reviewer share
+/// loses `usage` updates and every cost key (`access::share::chat_event`).
+/// Own workspace and other share roles: unchanged.
+fn outbound_update(
+    ctx: Option<&AccessCtx>,
+    thread_id: &str,
+    update: serde_json::Value,
+) -> Option<String> {
+    let mut event = update_envelope(thread_id, update);
+    if ctx.is_some_and(|c| !crate::access::share::chat_event(c, &mut event)) {
+        return None;
+    }
+    Some(event.to_string())
 }
 
 fn status_event(thread_id: &str, status: &str, stop_reason: Option<&str>) -> String {
@@ -123,6 +142,7 @@ async fn run_turn(
     prompt: String,
     cwd: Option<String>,
     model: Option<String>,
+    ctx: Option<AccessCtx>,
 ) {
     send(&ws_tx, status_event(&thread_id, "running", None)).await;
 
@@ -169,14 +189,11 @@ async fn run_turn(
                 let thread_id = thread_id.clone();
                 async move {
                     while let Some(update) = rx_chan.recv().await {
-                        send(
-                            &ws_tx,
-                            update_event(
-                                &thread_id,
-                                serde_json::to_value(&update).unwrap_or(serde_json::Value::Null),
-                            ),
-                        )
-                        .await;
+                        let update =
+                            serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                        if let Some(event) = outbound_update(ctx.as_ref(), &thread_id, update) {
+                            send(&ws_tx, event).await;
+                        }
                     }
                 }
             };
@@ -345,6 +362,7 @@ async fn handle_chat_socket(
                             prompt,
                             cwd,
                             model,
+                            guard.ctx.clone(),
                         ));
                         in_flight = Some((handle, engine_name));
                     }
@@ -439,5 +457,70 @@ async fn prompt_context(
             .map(|(_, root)| root.clone())
             .or_else(|| cwd.map(str::to_string)),
         project_id: found.map(|(id, _)| id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::{CapSet, Role, ShareCtx, Tier, Via};
+    use serde_json::json;
+
+    fn share_ctx(role: Role) -> AccessCtx {
+        AccessCtx {
+            principal_id: crate::executor::PrincipalId::new_v7(),
+            via: Via::Relayed,
+            device_id: None,
+            tier: Tier::View,
+            share: Some(ShareCtx {
+                project_key: "o/p".into(),
+                project_id: "p".into(),
+                member_principal_id: Some("m".into()),
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: None,
+                owner_approval: true,
+            }),
+            share_headers: true,
+            caps: CapSet::ALL,
+            admin_strength: false,
+            meta: Default::default(),
+        }
+    }
+
+    /// WP-76 H-2: the engine stream to a Reviewer share drops `usage`
+    /// updates and strips cost keys; other roles, your own workspace and a
+    /// socket without a ctx send the update as the engine produced it.
+    #[test]
+    fn reviewer_share_stream_loses_usage_and_cost() {
+        let reviewer = share_ctx(Role::Reviewer);
+        let usage = json!({"sessionUpdate": "usage_update", "used": 10, "size": 100});
+        assert_eq!(outbound_update(Some(&reviewer), "t", usage.clone()), None);
+
+        let chunk = json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hi"}, "_meta": {"costUsd": 0.1}});
+        let sent: serde_json::Value =
+            serde_json::from_str(&outbound_update(Some(&reviewer), "t", chunk.clone()).unwrap())
+                .unwrap();
+        assert_eq!(sent["method"], "session/update");
+        assert_eq!(sent["params"]["thread_id"], "t");
+        assert_eq!(
+            sent["params"]["update"],
+            json!({"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hi"}, "_meta": {}})
+        );
+
+        let unchanged = update_event("t", usage.clone());
+        let operator = share_ctx(Role::Operator);
+        let own = AccessCtx {
+            share: None,
+            ..share_ctx(Role::Reviewer)
+        };
+        for ctx in [Some(&operator), Some(&own), None] {
+            assert_eq!(
+                outbound_update(ctx, "t", usage.clone()).as_deref(),
+                Some(unchanged.as_str())
+            );
+        }
     }
 }

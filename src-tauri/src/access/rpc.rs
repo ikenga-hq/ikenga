@@ -394,10 +394,6 @@ mod tests {
         let op = operator_ctx(&store);
         let e = env(&store, &reg);
         for (cmd, wp) in [
-            ("access_members_list", "WP-76"),
-            ("access_policy_get", "WP-76"),
-            ("access_invite_issue", "WP-76"),
-            ("share_project_info", "WP-76"),
             ("access_audit_list", "WP-77"),
             ("access_audit_reseal", "WP-77"),
         ] {
@@ -405,6 +401,24 @@ mod tests {
             assert_eq!(err.code, Code::Internal, "{cmd}");
             assert!(err.message.contains(wp), "{cmd}: {err}");
         }
+        // WP-76: on T0 (one principal) the member, invite and share arms
+        // answer `requires_t1`, and the policy matrix is the defaults
+        // (§4.5.5).
+        for cmd in [
+            "access_members_list",
+            "access_member_set_role",
+            "access_invite_issue",
+            "access_invite_revoke",
+            "access_shares_list",
+            "access_policy_set_cell",
+        ] {
+            let err = dispatch(&e, &op, cmd, &json!({})).await.unwrap_err();
+            assert_eq!(err.code, Code::RequiresT1, "{cmd}");
+        }
+        let policy = dispatch(&e, &op, "access_policy_get", &json!({"projectId": "p"}))
+            .await
+            .unwrap();
+        assert_eq!(policy["matrix"]["reviewer"]["secrets"], "never");
     }
 
     #[tokio::test]

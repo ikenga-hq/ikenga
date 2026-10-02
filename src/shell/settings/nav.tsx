@@ -40,7 +40,11 @@ export interface SettingsFieldMeta {
 }
 
 /** Sub-routes a settings search hit can land on. */
-export type SettingsFieldRoute = '/settings/profile' | '/settings/devices';
+export type SettingsFieldRoute =
+	| '/settings/profile'
+	| '/settings/devices'
+	| '/settings/members'
+	| '/settings/policies';
 
 export interface SettingsSectionMeta {
 	id: SettingsSectionId;
@@ -142,7 +146,19 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		Icon: Users,
 		description: 'Who this workspace is shared with, and on which devices.',
 		fields: [
-			{ field: null, label: 'Members' },
+			// WP-76 (G-ACCESS §4): /settings/members and /settings/policies.
+			{
+				field: null,
+				label: 'Members',
+				help: 'share kola, roles, shared with you',
+				route: '/settings/members',
+			},
+			{
+				field: null,
+				label: 'Policies',
+				help: 'what each role may do, require Owner approval',
+				route: '/settings/policies',
+			},
 			{
 				field: null,
 				label: 'Devices',
@@ -198,6 +214,8 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
 const SECTION_ALIASES: Readonly<Record<string, SettingsSectionId>> = {
 	profile: 'people',
 	devices: 'people',
+	members: 'people',
+	policies: 'people',
 };
 
 export function settingsSection(id: string | undefined): SettingsSectionMeta {

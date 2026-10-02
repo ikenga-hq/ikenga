@@ -1,6 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
-import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import {
 	Eye,
 	EyeOff,
@@ -16,15 +15,7 @@ import {
 	ShieldAlert,
 	Trash2,
 } from 'lucide-react';
-import {
-	type KeyboardEvent,
-	useCallback,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from 'react';
-
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	Dialog,
@@ -37,10 +28,6 @@ import {
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
 import {
-	type VaultScope,
-	pkgKernelStatus,
-} from '@/lib/tauri-cmd';
-import {
 	secretsLockStateQueryOptions,
 	useDeleteScopedSecret,
 	useLockSecrets,
@@ -49,6 +36,24 @@ import {
 	vaultStatusQueryOptions,
 } from '@/lib/queries/secrets';
 import { useShellStore } from '@/lib/shell/shell-store';
+import {
+	isRemoteWebSession,
+	pkgKernelStatus,
+	secretsIndexNames,
+	type VaultScope,
+} from '@/lib/tauri-cmd';
+import { currentShare } from '@/lib/transport';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
+import { currentPrincipal } from '@/lib/transport/t1-session';
+import {
+	hasPassphraseLayer,
+	PrincipalAxis,
+	type SecretLayer,
+	scopeDisabledReason,
+	secretLayer,
+	type VaultAxis,
+	vaultAxis,
+} from '@/shell/secrets/principal-axis';
 import { useUnlockSheet } from '@/shell/secrets/unlock-sheet';
 
 type TabKind = 'workspace' | 'project' | 'pkg';
@@ -60,15 +65,26 @@ const HOLD_DELAY_MS = 350;
 const HOLD_REVEAL_MS = 10_000;
 
 function SecretsPage() {
-	const status = useQuery(vaultStatusQueryOptions());
+	// WP-76 (D-03 principal axis on remote): whose vault this is. In a shared
+	// project the secrets arms are never reachable (owner-class, G-ACCESS
+	// §4.1), so nothing is queried.
+	const remote = isRemoteWebSession();
+	const share = remote ? currentShare() : null;
+	const status = useQuery({ ...vaultStatusQueryOptions(), enabled: !share });
 	const lock = useQuery({
 		...secretsLockStateQueryOptions(),
 		refetchInterval: 5_000,
+		enabled: !share,
 	});
+	const axis: VaultAxis = vaultAxis({ remote, mode: status.data?.mode, share });
 	const vaultAvailable = status.data?.available === true;
 	const configured = lock.data?.configured ?? false;
 	const locked = lock.data?.locked ?? true;
-	const vaultUnlocked = vaultAvailable && configured && !locked;
+	// The operator default (a T0 daemon in a browser) has no lock family: it
+	// is always readable and never writable from here.
+	const readOnlyDefault = axis === 'operator' && vaultAvailable;
+	const vaultUnlocked = (vaultAvailable && configured && !locked) || readOnlyDefault;
+	const writable = vaultUnlocked && !readOnlyDefault;
 
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
@@ -86,18 +102,46 @@ function SecretsPage() {
 
 	const scope: VaultScope = useMemo(() => {
 		if (tab === 'workspace') return { kind: 'workspace' };
-		if (tab === 'project') return { kind: 'project', id: projectId || activeProjectId || 'default' };
+		if (tab === 'project')
+			return { kind: 'project', id: projectId || activeProjectId || 'default' };
 		return { kind: 'pkg', id: effectivePkgId };
 	}, [tab, projectId, activeProjectId, effectivePkgId]);
 
-	const canQuery = tab !== 'pkg' || !!effectivePkgId;
+	const canQuery = (tab !== 'pkg' || !!effectivePkgId) && scopeDisabledReason(axis, tab) === null;
 	const keysQuery = useQuery({
 		...vaultKeysScopedQueryOptions(scope),
 		enabled: canQuery && vaultUnlocked,
 	});
 
+	// WP76-R3: on your own store the Workspace list includes the operator
+	// default's keys; the store's own names tell the layers apart.
+	const layered = axis === 'principal' && tab === 'workspace';
+	const indexQuery = useQuery({
+		queryKey: ['secrets', 'index-names'] as const,
+		queryFn: () => secretsIndexNames(),
+		enabled: layered && vaultUnlocked,
+	});
+	const layerOf = (key: string): SecretLayer =>
+		secretLayer(axis, tab, key, layered ? indexQuery.data : undefined);
+
 	const [editKey, setEditKey] = useState<string | null>(null);
+	const [editLayer, setEditLayer] = useState<SecretLayer>('own');
 	const [addingNew, setAddingNew] = useState(false);
+
+	// A shared project: the Owner's secrets are never reachable (§4.1).
+	if (axis === 'shared') {
+		return (
+			<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
+				<h2
+					className="text-2xl font-semibold tracking-tight"
+					style={{ fontFamily: 'var(--font-display)' }}
+				>
+					Vault secrets
+				</h2>
+				<PrincipalAxis axis={axis} username={null} share={share} />
+			</div>
+		);
+	}
 
 	return (
 		<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
@@ -109,20 +153,34 @@ function SecretsPage() {
 					Vault secrets
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
-					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project secrets
-					are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve at
-					command-handling time inside the kernel.
+					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project
+					secrets are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve
+					at command-handling time inside the kernel.
 				</p>
 			</header>
 
-			<VaultLockBanner
-				available={vaultAvailable}
-				configured={configured}
-				unlocked={vaultUnlocked}
-				error={status.data?.error ?? null}
-			/>
+			<PrincipalAxis axis={axis} username={currentPrincipal()?.username ?? null} share={null} />
 
-			<ScopeTabList tab={tab} onTabChange={setTab} />
+			{hasPassphraseLayer(axis) ? (
+				<VaultLockBanner
+					available={vaultAvailable}
+					configured={configured}
+					unlocked={vaultUnlocked}
+					error={status.data?.error ?? null}
+				/>
+			) : (
+				<RemoteVaultBanner
+					axis={axis}
+					available={vaultAvailable}
+					error={status.data?.error ?? null}
+				/>
+			)}
+
+			<ScopeTabList
+				tab={tab}
+				onTabChange={setTab}
+				disabledReason={(kind) => scopeDisabledReason(axis, kind)}
+			/>
 
 			{tab === 'project' && (
 				<div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -191,7 +249,7 @@ function SecretsPage() {
 							size="sm"
 							className="h-7 px-2 text-[11px]"
 							onClick={() => setAddingNew(true)}
-							disabled={!canQuery}
+							disabled={!canQuery || !writable}
 						>
 							<Plus className="mr-1 h-3 w-3" /> Add secret
 						</Button>
@@ -217,8 +275,12 @@ function SecretsPage() {
 								key={k}
 								scope={scope}
 								name={k}
-								writable={vaultUnlocked}
-								onEdit={() => setEditKey(k)}
+								layer={layerOf(k)}
+								writable={writable}
+								onEdit={() => {
+									setEditLayer(layerOf(k));
+									setEditKey(k);
+								}}
 							/>
 						))}
 					</ul>
@@ -233,6 +295,7 @@ function SecretsPage() {
 				<SecretDialog
 					scope={scope}
 					editKey={editKey}
+					overriding={editKey !== null && editLayer === 'default'}
 					onClose={() => {
 						setAddingNew(false);
 						setEditKey(null);
@@ -323,13 +386,58 @@ function VaultLockBanner({
 	);
 }
 
+/** The remote vaults' banner (WP-76): no passphrase layer to show. */
+function RemoteVaultBanner({
+	axis,
+	available,
+	error,
+}: {
+	axis: VaultAxis;
+	available: boolean;
+	error: string | null;
+}) {
+	return (
+		<div
+			data-vault-banner={axis}
+			className={cn(
+				'flex flex-wrap items-center gap-3 rounded-md border px-3 py-2.5 text-xs',
+				available
+					? 'border-border bg-card text-foreground'
+					: 'border-red-200 bg-red-50 text-red-900 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200'
+			)}
+		>
+			{available ? (
+				<LockOpen className="h-3.5 w-3.5 shrink-0" />
+			) : (
+				<ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+			)}
+			<span className="min-w-0 flex-1">
+				{!available
+					? `Vault unavailable: ${error ?? 'unknown error'}.`
+					: axis === 'principal'
+						? 'Your store is open: the server holds its key for you, so there is nothing to unlock or lock.'
+						: 'Read-only: these are the operator defaults set on the host.'}
+			</span>
+		</div>
+	);
+}
+
 const TAB_ITEMS: Array<{ kind: TabKind; label: string; icon: React.ReactNode }> = [
 	{ kind: 'workspace', label: 'Workspace', icon: <Layers className="h-3.5 w-3.5" /> },
 	{ kind: 'project', label: 'Project', icon: <FolderKanban className="h-3.5 w-3.5" /> },
 	{ kind: 'pkg', label: 'Pkg', icon: <Package className="h-3.5 w-3.5" /> },
 ];
 
-function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: TabKind) => void }) {
+function ScopeTabList({
+	tab,
+	onTabChange,
+	disabledReason = () => null,
+}: {
+	tab: TabKind;
+	onTabChange: (t: TabKind) => void;
+	/** WP-76: why a scope isn't available on this vault (remote axis). */
+	disabledReason?: (t: TabKind) => string | null;
+}) {
 	const listRef = useRef<HTMLDivElement | null>(null);
 
 	const focusTab = useCallback((kind: TabKind) => {
@@ -348,7 +456,7 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 			else if (e.key === 'Home') next = 0;
 			else if (e.key === 'End') next = TAB_ITEMS.length - 1;
 			const target = TAB_ITEMS[next];
-			if (!target || target.kind === tab) {
+			if (!target || target.kind === tab || disabledReason(target.kind) !== null) {
 				e.preventDefault();
 				return;
 			}
@@ -356,7 +464,7 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 			onTabChange(target.kind);
 			focusTab(target.kind);
 		},
-		[tab, onTabChange, focusTab]
+		[tab, onTabChange, focusTab, disabledReason]
 	);
 
 	return (
@@ -369,6 +477,7 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 		>
 			{TAB_ITEMS.map((item) => {
 				const active = tab === item.kind;
+				const why = disabledReason(item.kind);
 				return (
 					<button
 						key={item.kind}
@@ -377,6 +486,8 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 						aria-selected={active}
 						data-tab={item.kind}
 						tabIndex={active ? 0 : -1}
+						disabled={why !== null}
+						title={why ?? undefined}
 						onClick={() => onTabChange(item.kind)}
 						className={cn(
 							// min-h off the shared tab-height token, not a hardcoded px
@@ -386,7 +497,8 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 							'outline-none focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-offset-2 focus-visible:outline-primary',
 							active
 								? 'bg-accent text-accent-foreground'
-								: 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
+								: 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
+							'disabled:cursor-not-allowed disabled:opacity-50'
 						)}
 					>
 						{item.icon}
@@ -401,11 +513,14 @@ function ScopeTabList({ tab, onTabChange }: { tab: TabKind; onTabChange: (t: Tab
 function SecretRow({
 	scope,
 	name,
+	layer,
 	writable,
 	onEdit,
 }: {
 	scope: VaultScope;
 	name: string;
+	/** WP76-R3: which layer the key comes from (principal axis). */
+	layer: SecretLayer;
 	writable: boolean;
 	onEdit: () => void;
 }) {
@@ -440,9 +555,26 @@ function SecretRow({
 	}
 
 	return (
-		<li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs">
+		<li
+			data-secret-layer={layer}
+			className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs"
+		>
 			<div className="min-w-0">
-				<div className="truncate font-mono font-medium text-foreground">{name}</div>
+				<div className="flex min-w-0 items-center gap-2">
+					<span className="truncate font-mono font-medium text-foreground">{name}</span>
+					{layer !== 'own' && (
+						<span
+							className="shrink-0 rounded border border-border px-1.5 py-px font-mono text-[10px] text-muted-foreground"
+							title={
+								layer === 'default'
+									? 'Set on the host by the operator (IKENGA_SECRET_*). Read-only from here.'
+									: 'Your value, over an operator default of the same name.'
+							}
+						>
+							{layer === 'default' ? 'operator default' : 'your override'}
+						</span>
+					)}
+				</div>
 				<div className="mt-0.5 flex gap-3 font-mono text-[10px] text-muted-foreground">
 					<span>used-by: not tracked yet</span>
 					<span>last changed: not tracked yet</span>
@@ -478,7 +610,19 @@ function SecretRow({
 				>
 					{revealed ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
 				</Button>
-				{writable && (
+				{writable && layer === 'default' && (
+					<Button
+						variant="ghost"
+						size="sm"
+						className="h-6 px-2 text-[11px]"
+						onClick={onEdit}
+						aria-label={`Override ${name} with a value of your own`}
+						title="Set a value of your own; the operator default stays on the host"
+					>
+						Override
+					</Button>
+				)}
+				{writable && layer !== 'default' && (
 					<>
 						<Button
 							variant="ghost"
@@ -495,8 +639,13 @@ function SecretRow({
 							className="h-6 px-2 text-[11px] text-muted-foreground hover:text-red-700"
 							onClick={async () => {
 								const ok = await confirmDialog(
-									`Delete "${name}" from the ${scope.kind} scope? Anything using it will fail at its next run — the value cannot be recovered.`,
-									{ title: 'Delete secret', kind: 'warning' }
+									layer === 'override'
+										? `Remove your override of "${name}"? The operator default shows through again.`
+										: `Delete "${name}" from the ${scope.kind} scope? Anything using it will fail at its next run — the value cannot be recovered.`,
+									{
+										title: layer === 'override' ? 'Remove your override' : 'Delete secret',
+										kind: 'warning',
+									}
 								);
 								if (!ok) return;
 								delMut.mutate(
@@ -505,7 +654,10 @@ function SecretRow({
 								);
 							}}
 							disabled={delMut.isPending}
-							aria-label={`Delete secret ${name}`}
+							aria-label={
+								layer === 'override' ? `Remove your override of ${name}` : `Delete secret ${name}`
+							}
+							title={layer === 'override' ? 'Remove your override' : undefined}
 						>
 							<Trash2 className="h-3 w-3" />
 						</Button>
@@ -519,10 +671,13 @@ function SecretRow({
 function SecretDialog({
 	scope,
 	editKey,
+	overriding = false,
 	onClose,
 }: {
 	scope: VaultScope;
 	editKey: string | null;
+	/** WP76-R3: a new value of your own over an operator default. */
+	overriding?: boolean;
 	onClose: () => void;
 }) {
 	const [name, setName] = useState(editKey ?? '');
@@ -534,11 +689,18 @@ function SecretDialog({
 		<Dialog open onOpenChange={(o) => !o && onClose()}>
 			<DialogContent>
 				<DialogHeader>
-					<DialogTitle>{editKey ? `Edit secret: ${editKey}` : 'Add secret'}</DialogTitle>
+					<DialogTitle>
+						{overriding
+							? `Override: ${editKey}`
+							: editKey
+								? `Edit secret: ${editKey}`
+								: 'Add secret'}
+					</DialogTitle>
 					<DialogDescription>
-						Scope: <span className="font-mono">{scopeLabel(scope)}</span>. Values are
-						Encrypted at rest in the OS keychain and never written to a log. For an existing secret the
-						field starts empty; type a value to replace it.
+						Scope: <span className="font-mono">{scopeLabel(scope)}</span>.{' '}
+						{overriding
+							? 'Your value goes into your own store and is used instead of the operator default; the default on the host is unchanged.'
+							: 'Values are Encrypted at rest in the OS keychain and never written to a log. For an existing secret the field starts empty; type a value to replace it.'}
 					</DialogDescription>
 				</DialogHeader>
 				<div className="space-y-3">

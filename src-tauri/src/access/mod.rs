@@ -568,6 +568,11 @@ pub async fn rpc_prehook(
         crate::server::shared::notifications::routing::audit_prehook_refusal(ctx, cmd, &e).await;
         return PreHook::Answered(rpc::error_response(&e));
     }
+    // WP-76: the two `internal` arms read the child's own `ikenga.db`, so
+    // they are served here, with the router's `AppState` (§4.5.4, §7.3).
+    if let Some(res) = share::internal(state, ctx, cmd, args).await {
+        return PreHook::Answered(res);
+    }
     match &ctx.share {
         None => PreHook::Proceed,
         Some(share) => share::prehook(state, ctx, share, cmd, args).await,

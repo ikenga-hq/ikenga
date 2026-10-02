@@ -34,11 +34,13 @@ import { Route as SettingsStorageRouteImport } from './routes/settings/storage'
 import { Route as SettingsSecretsRouteImport } from './routes/settings/secrets'
 import { Route as SettingsProjectsRouteImport } from './routes/settings/projects'
 import { Route as SettingsProfileRouteImport } from './routes/settings/profile'
+import { Route as SettingsPoliciesRouteImport } from './routes/settings/policies'
 import { Route as SettingsPkgHealthRouteImport } from './routes/settings/pkg-health'
 import { Route as SettingsPkgAuditRouteImport } from './routes/settings/pkg-audit'
 import { Route as SettingsPeopleRouteImport } from './routes/settings/people'
 import { Route as SettingsPackagesRouteImport } from './routes/settings/packages'
 import { Route as SettingsOnboardingRouteImport } from './routes/settings/onboarding'
+import { Route as SettingsMembersRouteImport } from './routes/settings/members'
 import { Route as SettingsIntegrationsRouteImport } from './routes/settings/integrations'
 import { Route as SettingsEnginesRouteImport } from './routes/settings/engines'
 import { Route as SettingsDevicesRouteImport } from './routes/settings/devices'
@@ -51,6 +53,7 @@ import { Route as SettingsActivityBarRouteImport } from './routes/settings/activ
 import { Route as SettingsActionsRouteImport } from './routes/settings/actions'
 import { Route as SettingsAboutRouteImport } from './routes/settings/about'
 import { Route as RemotePairRouteImport } from './routes/remote/pair'
+import { Route as RemoteInviteRouteImport } from './routes/remote/invite'
 import { Route as ProjectsNewArtifactRouteImport } from './routes/projects/new-artifact'
 import { Route as ProjectDashboardRouteImport } from './routes/project/dashboard'
 import { Route as PackagesBrowseRouteImport } from './routes/packages_.browse'
@@ -214,6 +217,11 @@ const SettingsProfileRoute = SettingsProfileRouteImport.update({
   path: '/profile',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
+const SettingsPoliciesRoute = SettingsPoliciesRouteImport.update({
+  id: '/policies',
+  path: '/policies',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
 const SettingsPkgHealthRoute = SettingsPkgHealthRouteImport.update({
   id: '/pkg-health',
   path: '/pkg-health',
@@ -237,6 +245,11 @@ const SettingsPackagesRoute = SettingsPackagesRouteImport.update({
 const SettingsOnboardingRoute = SettingsOnboardingRouteImport.update({
   id: '/onboarding',
   path: '/onboarding',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsMembersRoute = SettingsMembersRouteImport.update({
+  id: '/members',
+  path: '/members',
   getParentRoute: () => SettingsRouteRoute,
 } as any)
 const SettingsIntegrationsRoute = SettingsIntegrationsRouteImport.update({
@@ -297,6 +310,11 @@ const SettingsAboutRoute = SettingsAboutRouteImport.update({
 const RemotePairRoute = RemotePairRouteImport.update({
   id: '/remote/pair',
   path: '/remote/pair',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RemoteInviteRoute = RemoteInviteRouteImport.update({
+  id: '/remote/invite',
+  path: '/remote/invite',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectsNewArtifactRoute = ProjectsNewArtifactRouteImport.update({
@@ -531,6 +549,7 @@ export interface FileRoutesByFullPath {
   '/packages/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/invite': typeof RemoteInviteRoute
   '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
@@ -543,11 +562,13 @@ export interface FileRoutesByFullPath {
   '/settings/devices': typeof SettingsDevicesRoute
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
+  '/settings/members': typeof SettingsMembersRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
+  '/settings/policies': typeof SettingsPoliciesRoute
   '/settings/profile': typeof SettingsProfileRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
@@ -609,6 +630,7 @@ export interface FileRoutesByTo {
   '/packages/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/invite': typeof RemoteInviteRoute
   '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
@@ -621,11 +643,13 @@ export interface FileRoutesByTo {
   '/settings/devices': typeof SettingsDevicesRoute
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
+  '/settings/members': typeof SettingsMembersRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
+  '/settings/policies': typeof SettingsPoliciesRoute
   '/settings/profile': typeof SettingsProfileRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
@@ -691,6 +715,7 @@ export interface FileRoutesById {
   '/packages_/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/invite': typeof RemoteInviteRoute
   '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
@@ -703,11 +728,13 @@ export interface FileRoutesById {
   '/settings/devices': typeof SettingsDevicesRoute
   '/settings/engines': typeof SettingsEnginesRoute
   '/settings/integrations': typeof SettingsIntegrationsRoute
+  '/settings/members': typeof SettingsMembersRoute
   '/settings/onboarding': typeof SettingsOnboardingRoute
   '/settings/packages': typeof SettingsPackagesRoute
   '/settings/people': typeof SettingsPeopleRoute
   '/settings/pkg-audit': typeof SettingsPkgAuditRoute
   '/settings/pkg-health': typeof SettingsPkgHealthRoute
+  '/settings/policies': typeof SettingsPoliciesRoute
   '/settings/profile': typeof SettingsProfileRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/secrets': typeof SettingsSecretsRoute
@@ -774,6 +801,7 @@ export interface FileRouteTypes {
     | '/packages/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/invite'
     | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
@@ -786,11 +814,13 @@ export interface FileRouteTypes {
     | '/settings/devices'
     | '/settings/engines'
     | '/settings/integrations'
+    | '/settings/members'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
+    | '/settings/policies'
     | '/settings/profile'
     | '/settings/projects'
     | '/settings/secrets'
@@ -852,6 +882,7 @@ export interface FileRouteTypes {
     | '/packages/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/invite'
     | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
@@ -864,11 +895,13 @@ export interface FileRouteTypes {
     | '/settings/devices'
     | '/settings/engines'
     | '/settings/integrations'
+    | '/settings/members'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
+    | '/settings/policies'
     | '/settings/profile'
     | '/settings/projects'
     | '/settings/secrets'
@@ -933,6 +966,7 @@ export interface FileRouteTypes {
     | '/packages_/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/invite'
     | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
@@ -945,11 +979,13 @@ export interface FileRouteTypes {
     | '/settings/devices'
     | '/settings/engines'
     | '/settings/integrations'
+    | '/settings/members'
     | '/settings/onboarding'
     | '/settings/packages'
     | '/settings/people'
     | '/settings/pkg-audit'
     | '/settings/pkg-health'
+    | '/settings/policies'
     | '/settings/profile'
     | '/settings/projects'
     | '/settings/secrets'
@@ -1003,6 +1039,7 @@ export interface RootRouteChildren {
   PackagesBrowseRoute: typeof PackagesBrowseRoute
   ProjectDashboardRoute: typeof ProjectDashboardRoute
   ProjectsNewArtifactRoute: typeof ProjectsNewArtifactRoute
+  RemoteInviteRoute: typeof RemoteInviteRoute
   RemotePairRoute: typeof RemotePairRoute
   ChiIndexRoute: typeof ChiIndexRoute
   NgwaIndexRoute: typeof NgwaIndexRoute
@@ -1189,6 +1226,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SettingsProfileRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
+    '/settings/policies': {
+      id: '/settings/policies'
+      path: '/policies'
+      fullPath: '/settings/policies'
+      preLoaderRoute: typeof SettingsPoliciesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
     '/settings/pkg-health': {
       id: '/settings/pkg-health'
       path: '/pkg-health'
@@ -1222,6 +1266,13 @@ declare module '@tanstack/react-router' {
       path: '/onboarding'
       fullPath: '/settings/onboarding'
       preLoaderRoute: typeof SettingsOnboardingRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/members': {
+      id: '/settings/members'
+      path: '/members'
+      fullPath: '/settings/members'
+      preLoaderRoute: typeof SettingsMembersRouteImport
       parentRoute: typeof SettingsRouteRoute
     }
     '/settings/integrations': {
@@ -1306,6 +1357,13 @@ declare module '@tanstack/react-router' {
       path: '/remote/pair'
       fullPath: '/remote/pair'
       preLoaderRoute: typeof RemotePairRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/remote/invite': {
+      id: '/remote/invite'
+      path: '/remote/invite'
+      fullPath: '/remote/invite'
+      preLoaderRoute: typeof RemoteInviteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/projects/new-artifact': {
@@ -1640,11 +1698,13 @@ interface SettingsRouteRouteChildren {
   SettingsDevicesRoute: typeof SettingsDevicesRoute
   SettingsEnginesRoute: typeof SettingsEnginesRoute
   SettingsIntegrationsRoute: typeof SettingsIntegrationsRoute
+  SettingsMembersRoute: typeof SettingsMembersRoute
   SettingsOnboardingRoute: typeof SettingsOnboardingRoute
   SettingsPackagesRoute: typeof SettingsPackagesRoute
   SettingsPeopleRoute: typeof SettingsPeopleRoute
   SettingsPkgAuditRoute: typeof SettingsPkgAuditRoute
   SettingsPkgHealthRoute: typeof SettingsPkgHealthRoute
+  SettingsPoliciesRoute: typeof SettingsPoliciesRoute
   SettingsProfileRoute: typeof SettingsProfileRoute
   SettingsProjectsRoute: typeof SettingsProjectsRoute
   SettingsSecretsRoute: typeof SettingsSecretsRoute
@@ -1666,11 +1726,13 @@ const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
   SettingsDevicesRoute: SettingsDevicesRoute,
   SettingsEnginesRoute: SettingsEnginesRoute,
   SettingsIntegrationsRoute: SettingsIntegrationsRoute,
+  SettingsMembersRoute: SettingsMembersRoute,
   SettingsOnboardingRoute: SettingsOnboardingRoute,
   SettingsPackagesRoute: SettingsPackagesRoute,
   SettingsPeopleRoute: SettingsPeopleRoute,
   SettingsPkgAuditRoute: SettingsPkgAuditRoute,
   SettingsPkgHealthRoute: SettingsPkgHealthRoute,
+  SettingsPoliciesRoute: SettingsPoliciesRoute,
   SettingsProfileRoute: SettingsProfileRoute,
   SettingsProjectsRoute: SettingsProjectsRoute,
   SettingsSecretsRoute: SettingsSecretsRoute,
@@ -1732,6 +1794,7 @@ const rootRouteChildren: RootRouteChildren = {
   PackagesBrowseRoute: PackagesBrowseRoute,
   ProjectDashboardRoute: ProjectDashboardRoute,
   ProjectsNewArtifactRoute: ProjectsNewArtifactRoute,
+  RemoteInviteRoute: RemoteInviteRoute,
   RemotePairRoute: RemotePairRoute,
   ChiIndexRoute: ChiIndexRoute,
   NgwaIndexRoute: NgwaIndexRoute,

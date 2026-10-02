@@ -120,6 +120,95 @@ export function clearAuthToken(): void {
 	}
 }
 
+// ── share mode (G-ACCESS §4.5.2, WP-76) ─────────────────────────────────────
+
+/**
+ * A project someone else shared with this principal (T1 only), as the
+ * "Shared with you" block opened it. While one is selected, every RPC
+ * carries `X-Ikenga-Share: <owner_principal_id>/<project_id>` and every
+ * WebSocket URL `?share=…`: the broker checks the membership, narrows the
+ * caps to role ∩ device tier and routes the request into the Owner's child.
+ * The selector only selects — the session cookie still authenticates.
+ */
+export interface ShareSelection {
+	projectKey: string;
+	projectId: string;
+	projectName: string;
+	ownerUsername: string | null;
+	role: 'operator' | 'reviewer' | 'guest';
+	scope: 'project' | 'artifact';
+	artifactPath?: string | null;
+}
+
+const SHARE_KEY = 'ikenga_share';
+let shareSelection: ShareSelection | null | undefined;
+const shareListeners = new Set<(s: ShareSelection | null) => void>();
+
+function isShareSelection(v: unknown): v is ShareSelection {
+	if (!v || typeof v !== 'object') return false;
+	const o = v as Record<string, unknown>;
+	return (
+		typeof o.projectKey === 'string' &&
+		/^[0-9a-f-]{36}\/[^/]+$/.test(o.projectKey) &&
+		typeof o.projectId === 'string' &&
+		typeof o.projectName === 'string' &&
+		(o.role === 'operator' || o.role === 'reviewer' || o.role === 'guest')
+	);
+}
+
+/** The selected share, or `null` for your own workspace. Per tab
+ *  (`sessionStorage`), never on the desktop. */
+export function currentShare(): ShareSelection | null {
+	if (shareSelection !== undefined) return shareSelection;
+	shareSelection = null;
+	if (typeof window === 'undefined' || isTauri()) return null;
+	try {
+		const raw = sessionStorage.getItem(SHARE_KEY);
+		const parsed: unknown = raw ? JSON.parse(raw) : null;
+		shareSelection = isShareSelection(parsed) ? parsed : null;
+	} catch {
+		shareSelection = null;
+	}
+	return shareSelection;
+}
+
+/** Switch this tab into (or, with `null`, out of) share mode. */
+export function setShareMode(selection: ShareSelection | null): void {
+	shareSelection = selection && isShareSelection(selection) ? selection : null;
+	try {
+		if (shareSelection) sessionStorage.setItem(SHARE_KEY, JSON.stringify(shareSelection));
+		else sessionStorage.removeItem(SHARE_KEY);
+	} catch {
+		// Memory-only for this page load.
+	}
+	for (const l of shareListeners) l(shareSelection);
+}
+
+/** Be told when share mode changes. Returns the unsubscribe. */
+export function onShareModeChange(listener: (s: ShareSelection | null) => void): () => void {
+	shareListeners.add(listener);
+	return () => shareListeners.delete(listener);
+}
+
+/** `share=<owner>/<project>` for a WebSocket URL, or `''` outside a share. */
+export function shareQueryParam(): string {
+	const s = currentShare();
+	return s ? `share=${encodeURIComponent(s.projectKey)}` : '';
+}
+
+/** Append {@link shareQueryParam} to a URL that may already carry a query. */
+export function withShareQuery(url: string): string {
+	const q = shareQueryParam();
+	if (!q) return url;
+	return `${url}${url.includes('?') ? '&' : '?'}${q}`;
+}
+
+/** Test-only: forget the cached selection so the next read re-hydrates. */
+export function __resetShareModeForTests(): void {
+	shareSelection = undefined;
+	shareListeners.clear();
+}
+
 export class TauriTransport implements RpcTransport {
 	async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 		const { invoke } = await import('@tauri-apps/api/core');
@@ -150,6 +239,8 @@ export class WebRemoteTransport implements RpcTransport {
 		if (token) {
 			headers['Authorization'] = `Bearer ${token}`;
 		}
+		const share = currentShare();
+		if (share) headers['X-Ikenga-Share'] = share.projectKey;
 
 		const res = await fetch('/api/rpc', {
 			method: 'POST',
@@ -237,6 +328,8 @@ export class WebRemoteTransport implements RpcTransport {
 		const token = transportToken();
 		if (token) params.set('token', token);
 		if (opts?.spawn) params.set('spawn', 'true');
+		const share = currentShare();
+		if (share) params.set('share', share.projectKey);
 		const query = params.toString();
 		const ws = new WebSocket(
 			`${protocol}//${window.location.host}/ws/pty/${encodeURIComponent(id)}${query ? `?${query}` : ''}`
@@ -255,7 +348,7 @@ export class WebRemoteTransport implements RpcTransport {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const token = transportToken();
 		const query = token ? `?token=${encodeURIComponent(token)}` : '';
-		return new WebSocket(`${protocol}//${window.location.host}/ws/fs${query}`);
+		return new WebSocket(withShareQuery(`${protocol}//${window.location.host}/ws/fs${query}`));
 	}
 }
 

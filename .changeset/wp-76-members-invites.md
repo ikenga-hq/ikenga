@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": patch
+---
+
+G-ACCESS WP-76: members, roles, invites ("Share kola") and sharing on a T1 server. Owners and Operators issue single-use, expiring invites with role and scope fixed at issue; accepting one adds the membership — or, only when the issuer is an admin (or the server runs with `--member-invites-create-accounts`), creates the account through the provisioning core in the same transaction. The broker routes a share request into the Owner's workspace capped by role ∩ device tier; the Owner's workspace confines it to the project (or one artifact), filters lists, strips cost figures for Reviewers and never injects vault secrets. Settings › People gains Members (people, roles, Remove with Undo, pending invites, "Shared with you") and Policies (the role matrix backed by data, "Require Owner approval", spend cap shown but not enforced). On a T1 server the sign-in screen is restyled with "Pair this device with a code", Profile gains the Account block (username, principal id, change password, sign out), and Settings › Secrets shows whose vault it is. The desktop keeps its single-owner view.

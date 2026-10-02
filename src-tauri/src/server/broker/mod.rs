@@ -335,6 +335,15 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
     broker_state.hooks = BrokerHooks::access(&installed);
     let state = Arc::new(broker_state);
+    // G-ACCESS §4.5 / §7 (WP-76): the broker's handle on owner children
+    // (share validation, the `invite` notification, member socket closes),
+    // the membership expiry sweeper, and the invite-accept host (the §7.2
+    // provisioning core, R-8).
+    let invite_host = crate::access::share::install_t1(
+        &access_t1,
+        Arc::new(proxy::ShareChildCalls::new(&state)),
+        Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker),
+    );
     let mut extensions = BrokerExtensions::default();
     extensions.resolvers.push(installed.resolver.clone());
     extensions.public = PublicRoutes::default()
@@ -342,7 +351,8 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
             access_t1.pairing_host(),
             config.allowed_origins.clone(),
         ))
-        .invites(crate::access::http::invite_routes(
+        .invites(crate::access::http::invite_routes_for(
+            invite_host,
             config.allowed_origins.clone(),
         ));
     {

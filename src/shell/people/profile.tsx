@@ -1,9 +1,9 @@
-// Profile tab — D-05 `profile` (`designs/people.html?state=profile`), WP-72.
+// Profile tab — D-05 `profile` (`designs/people.html?state=profile`), WP-72;
+// WP-76 adds the T1 Account block (`profile-account`, G-ACCESS §2.2, G-98).
 //
-// The local profile, which is always there, and the App lock block. The
-// design's Account block is left out on purpose. It belongs to
-// `profile-account` / `sign-in`, which G-98 gives to WP-76, and only if
-// G-ACCESS keeps an account. A local-only shell has nothing to sign in to.
+// The local profile, which is always there, and the App lock block. On a T1
+// server (a signed-in browser) the Account block sits between them. On the
+// desktop it is descoped (DEC-75, D-3): a T0 shell has no account to show.
 //
 // Display name is the existing onboarding name (`useShellStore().userName`,
 // persisted as `workspace.userName`). "OS user" is what the shipped shell
@@ -11,19 +11,25 @@
 // `app_lock_status` reports.
 
 import { useEffect, useId, useState } from 'react';
-
-import { osUsername } from '@/lib/tauri-cmd';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { osUsername } from '@/lib/tauri-cmd';
 
+import { isT1Session } from '@/lib/transport/t1-session';
+
+import { AccountBlock } from './account';
 import { AppLockBlock } from './app-lock-settings';
 import { startAppLockSync, useAppLockStore } from './app-lock-store';
 import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
 
 export function ProfileTab() {
 	return (
-		<div data-state="profile" className="mx-auto w-full max-w-[720px] space-y-4 px-6 py-6">
+		<div
+			data-state={isT1Session() ? 'profile-account' : 'profile'}
+			className="mx-auto w-full max-w-[720px] space-y-4 px-6 py-6"
+		>
 			<PeopleHeader tab="profile" />
 			<LocalProfileBlock />
+			{isT1Session() && <AccountBlock />}
 			<AppLockBlock />
 		</div>
 	);

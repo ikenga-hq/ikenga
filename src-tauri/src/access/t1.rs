@@ -1096,8 +1096,9 @@ mod tests {
     }
 
     /// §4.5.2 hook site (review F-1): a share selection reaches
-    /// `share::broker_select` (WP-76); until it is filled the request is
-    /// refused, never served unconfined in the caller's own workspace.
+    /// `share::broker_select` (WP-76) and is refused — never served
+    /// unconfined in the caller's own workspace — when it names no active
+    /// membership (`not_found`, no existence oracle).
     #[tokio::test]
     async fn a_share_selection_goes_through_the_share_hook() {
         let (_tmp, t1, ada) = setup().await;
@@ -1119,7 +1120,7 @@ mod tests {
         share.extensions = parts.extensions.clone();
         let r = AccessNarrower(t1.clone()).narrow(&ctx, &share).await;
         let refusal = r.unwrap_err();
-        assert!(refusal.message.contains("WP-76"), "{refusal:?}");
+        assert_eq!(refusal.code, "not_found", "{refusal:?}");
         assert!(matches!(
             AccessAuthorizer(t1.clone())
                 .authorize_rpc(&ctx, &share, "fs_read", &Value::Null)
