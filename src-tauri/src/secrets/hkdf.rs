@@ -1,38 +1,79 @@
-//! HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), as thin wrappers over
-//! the `hmac` / `hkdf` crates (added as direct dependencies by WP-74a,
-//! G-ACCESS §3.5).
+//! HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), hand-rolled over the
+//! `sha2` the crate already depends on.
 //!
-//! WP-21 first shipped these hand-rolled over `sha2`, because it ran beside
-//! WP-74a in one wave and added no crate (G-ACCESS §10.1). The signatures are
-//! unchanged and the tests below still pin both to the RFC 4231 / RFC 5869
-//! vectors, so the swap is checked by the same vectors.
+//! Why not the `hmac` / `hkdf` crates (WP-74a adds both as direct
+//! dependencies for WP-74b, G-ACCESS §10.1): neither wipes its intermediate
+//! key material. `hmac` 0.12 builds its padded key block in a plain local
+//! array, `hkdf` 0.12's extract returns the PRK as a plain `GenericArray`,
+//! and `mac.finalize().into_bytes()` hands back another; neither crate
+//! implements `Zeroize`/`ZeroizeOnDrop` (no `zeroize` feature exists in those
+//! versions), so the per-principal key derivation would leave the PRK and
+//! key-derived blocks on the stack. Here every key-derived buffer (padded key block, ipad, opad, inner
+//! hash, PRK, each T(i)) is a `Zeroizing` wrapper and digests are finalized
+//! straight into those wrappers (`finalize_into`), never into an unwiped
+//! temporary. The one residue neither approach can wipe is a consumed
+//! `Sha256`'s chaining state (sha2 0.10 has no `zeroize` either). The tests
+//! below pin both constructions to the RFC 4231 / RFC 5869 vectors.
 
-use ::hkdf::Hkdf;
-use ::hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::digest::generic_array::GenericArray;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+const BLOCK: usize = 64;
 pub const HASH_LEN: usize = 32;
 
 /// HMAC-SHA256(key, message), with the message given in parts (so callers
 /// never concatenate secrets into a temporary buffer).
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; HASH_LEN]> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC takes any key length");
-    for part in parts {
-        mac.update(part);
+    let mut block = Zeroizing::new([0u8; BLOCK]);
+    if key.len() > BLOCK {
+        let mut hasher = Sha256::new();
+        hasher.update(key);
+        hasher.finalize_into(GenericArray::from_mut_slice(&mut block[..HASH_LEN]));
+    } else {
+        block[..key.len()].copy_from_slice(key);
     }
+    let mut ipad = Zeroizing::new([0x36u8; BLOCK]);
+    let mut opad = Zeroizing::new([0x5cu8; BLOCK]);
+    for i in 0..BLOCK {
+        ipad[i] ^= block[i];
+        opad[i] ^= block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad[..]);
+    for part in parts {
+        inner.update(part);
+    }
+    let mut inner_hash = Zeroizing::new([0u8; HASH_LEN]);
+    inner.finalize_into(GenericArray::from_mut_slice(&mut inner_hash[..]));
+    let mut outer = Sha256::new();
+    outer.update(&opad[..]);
+    outer.update(&inner_hash[..]);
     let mut out = Zeroizing::new([0u8; HASH_LEN]);
-    out.copy_from_slice(&mac.finalize().into_bytes());
+    outer.finalize_into(GenericArray::from_mut_slice(&mut out[..]));
     out
 }
 
-/// HKDF-SHA256 extract-then-expand, `out.len()` ≤ 255 × 32 bytes. An empty
-/// `salt` is RFC 5869 §2.2's absent salt (HMAC zero-pads the key, so the two
-/// are the same PRK).
+/// HKDF-SHA256 extract-then-expand, `out.len()` ≤ 255 × 32 bytes.
 pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
-    Hkdf::<Sha256>::new(Some(salt), ikm)
-        .expand(info, out)
-        .expect("HKDF output too long");
+    assert!(out.len() <= 255 * HASH_LEN, "HKDF output too long");
+    // RFC 5869 §2.2: an absent salt is HashLen zero bytes.
+    let zero_salt = [0u8; HASH_LEN];
+    let salt = if salt.is_empty() {
+        &zero_salt[..]
+    } else {
+        salt
+    };
+    let prk = hmac_sha256(salt, &[ikm]);
+    let mut previous: Zeroizing<[u8; HASH_LEN]> = Zeroizing::new([0u8; HASH_LEN]);
+    let mut previous_len = 0usize;
+    for (index, chunk) in out.chunks_mut(HASH_LEN).enumerate() {
+        let counter = [(index + 1) as u8];
+        let block = hmac_sha256(&prk[..], &[&previous[..previous_len], info, &counter]);
+        chunk.copy_from_slice(&block[..chunk.len()]);
+        *previous = *block;
+        previous_len = HASH_LEN;
+    }
 }
 
 #[cfg(test)]
