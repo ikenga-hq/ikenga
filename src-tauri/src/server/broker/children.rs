@@ -40,6 +40,7 @@ use rand::RngCore;
 
 use crate::executor::t1::T1Executor;
 use crate::executor::{PipedOpts, Principal, PrincipalId, SpawnSpec, StdioMode};
+use crate::secrets_env::principal::{self, PrincipalKey};
 use crate::server::auth::BoxFuture;
 use crate::server::operator::OperatorRoot;
 
@@ -315,14 +316,34 @@ impl T1Launcher {
     }
 
     /// The host-only variables the child gets (§9.3's one exception): its
-    /// own token, and the `IKENGA_SECRET_*` operator defaults (§5 row 15).
-    pub fn host_env(token: &str) -> Vec<(OsString, OsString)> {
+    /// own token, the `IKENGA_SECRET_*` operator defaults (§5 row 15), and
+    /// the principal's derived secrets key (WP-21, DEC-R18-1) — never the
+    /// broker's KEK. A `HANDOFF_ENV` in the broker's own environment is not
+    /// forwarded: the only one a child gets is the one derived for it.
+    pub fn host_env(token: &str, secrets_key: &PrincipalKey) -> Vec<(OsString, OsString)> {
         let mut env: Vec<(OsString, OsString)> =
             vec![("IKENGA_AUTH_TOKEN".into(), token.to_string().into())];
-        env.extend(
-            std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IKENGA_SECRET_")),
-        );
+        env.extend(std::env::vars_os().filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            k.starts_with("IKENGA_SECRET_") && k != principal::HANDOFF_ENV
+        }));
+        env.push((
+            principal::HANDOFF_ENV.into(),
+            secrets_key.to_env_value().as_str().into(),
+        ));
         env
+    }
+
+    /// The principal's derived secrets key, from the operator KEK
+    /// (`operator/secrets-kek.json`, created on the first launch of a T1
+    /// boot if absent; root-only, 0600, never a symlink). A KEK that can't be
+    /// loaded or created refuses the launch rather than start a child whose
+    /// secret store can't open.
+    pub fn secrets_key(&self, principal: &Principal) -> anyhow::Result<PrincipalKey> {
+        let kek = principal::BrokerKek::load_or_create(&self.root.operator_dir()).map_err(|e| {
+            anyhow::anyhow!("the principal-secrets KEK is unavailable (WP-21): {e}")
+        })?;
+        Ok(kek.derive(principal.id))
     }
 }
 
@@ -353,9 +374,12 @@ impl ChildLauncher for T1Launcher {
                 // directly; the broker stops them itself.
                 new_process_group: true,
             };
-            let child =
-                self.executor
-                    .spawn_piped_with_host_env(spec, opts, &Self::host_env(token))?;
+            let secrets_key = self.secrets_key(principal)?;
+            let child = self.executor.spawn_piped_with_host_env(
+                spec,
+                opts,
+                &Self::host_env(token, &secrets_key),
+            )?;
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("the principal child exited at once"))?;
@@ -680,11 +704,61 @@ pub(crate) mod tests {
         assert!(joined.contains("--pkgs-dir /opt/ikenga/pkgs"), "{joined}");
         assert!(!joined.contains("token"), "the token never rides argv");
 
-        let env = T1Launcher::host_env("tok");
+        let key = principal::BrokerKek::from_bytes([3; 32]).derive(p.id);
+        let env = T1Launcher::host_env("tok", &key);
         assert_eq!(env[0], ("IKENGA_AUTH_TOKEN".into(), "tok".into()));
         assert!(env
             .iter()
             .all(|(k, _)| crate::pty::is_host_only_env(&k.to_string_lossy())));
+        // WP-21: exactly one secrets key, the one derived for this principal.
+        let handed: Vec<_> = env
+            .iter()
+            .filter(|(k, _)| k == principal::HANDOFF_ENV)
+            .collect();
+        assert_eq!(handed.len(), 1);
+        let back = PrincipalKey::from_env_value(&handed[0].1.to_string_lossy()).unwrap();
+        assert_eq!(back.id(), p.id);
+    }
+
+    /// WP-21: the launcher derives each principal's key from the one KEK it
+    /// keeps under `operator/`, and the T1 executor's env floor keeps the
+    /// key out of anything the child's spawn spec would add.
+    #[test]
+    fn the_launcher_hands_each_child_its_own_derived_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = OperatorRoot::new(tmp.path()).unwrap();
+        fs::create_dir_all(root.operator_dir()).unwrap();
+        let launcher = T1Launcher {
+            executor: Arc::new(T1Executor::new(crate::executor::t1::T1Config {
+                principals_dir: root.principals_dir(),
+                principal_path: None,
+            })),
+            exe: "/usr/local/bin/ikenga-server".into(),
+            root: root.clone(),
+            pkgs_dir: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        };
+        let (p, q) = (principal(), principal());
+        let kp = launcher.secrets_key(&p).unwrap();
+        assert!(root.operator_dir().join(principal::KEK_FILENAME).exists());
+        let kp_again = launcher.secrets_key(&p).unwrap();
+        let kq = launcher.secrets_key(&q).unwrap();
+        assert_eq!(
+            kp.to_env_value(),
+            kp_again.to_env_value(),
+            "stable across launches"
+        );
+        assert_ne!(kp.to_env_value(), kq.to_env_value(), "per principal");
+        let kek = fs::read_to_string(root.operator_dir().join(principal::KEK_FILENAME)).unwrap();
+        let kek_hex = serde_json::from_str::<serde_json::Value>(&kek).unwrap()["kek"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            !kp.to_env_value().contains(&kek_hex),
+            "the child never sees the master KEK"
+        );
+        assert!(crate::pty::is_host_only_env(principal::HANDOFF_ENV));
     }
 
     #[test]

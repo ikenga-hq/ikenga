@@ -37,38 +37,6 @@ reason = "manager.open_file -> open_path spawns explorer.exe/open/xdg-open — n
 tag = "WP-18b"
 reason = "POSTs the {port, secret} from ~/.agent-ops/daemon.lock to a SEPARATE local agent-ops daemon's /jobs/<id>/trigger endpoint, which then runs the job (a shell command or `claude -p`) outside the session executor; serving it would let any token holder fire host jobs remotely. Held until executor routing + principal scoping (WP-20) decide who may."
 
-[app_lock_clear_secret]
-tag = "WP-20"
-reason = "Clears the one shared PIN record after verify_secret; same single-tenant AppLockState as the rest of the family."
-
-[app_lock_configure]
-tag = "WP-20"
-reason = "Writes the one AppLockConfig (idle_enabled/method) shared app-wide; no per-principal config exists."
-
-[app_lock_lock]
-tag = "WP-20"
-reason = "Locks the single shared AppLockState for the whole app; one user's lock would freeze every remote client."
-
-[app_lock_set_secret]
-tag = "WP-20"
-reason = "hash_secret/verify_secret write the single shared PIN record; a per-principal secrets store is a WP-20 prerequisite."
-
-[app_lock_status]
-tag = "WP-20"
-reason = "Reads single global AppLockState (one PIN gates the whole app); needs per-principal state before a multi-user daemon can serve it."
-
-[app_lock_touch]
-tag = "WP-20"
-reason = "Bumps the one global AppLockState.last_activity_ms; single-tenant idle clock, no principal dimension."
-
-[app_lock_unlock]
-tag = "WP-20"
-reason = "Verifies the one global PIN/passphrase (verify_secret) against one shared SecretRecord; needs per-principal secrets first."
-
-[app_lock_unlock_biometric]
-tag = "WP-20"
-reason = "OS-credential op (biometric_support/OS biometrics) explicitly named under WP-20; also single global state."
-
 [backup_export]
 tag = "WP-19"
 reason = "dest_path is unconfined: PathBuf::from(dest_path) + create_dir_all(parent) + the zip write, no allowlist or data-dir check, so a token holder could write a zip anywhere the daemon can (backup_list / backup_delete are served only because they stay inside <data-dir>/backups). include_secrets also reads the desktop Stronghold vault through SecretsLock, which the daemon has no analog for. Needs a dest confined to <data-dir>/backups and a secrets story first."
@@ -530,22 +498,6 @@ reason = "Routing decision only; doc comment 'Never resumes or starts anything',
 [seats_resume]
 tag = "WP-18b"
 reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same executor-routed engine spawn path as chi_resume; rpc.rs arm still pending."
-
-[secrets_lock]
-tag = "WP-20"
-reason = "unlock.lock() re-locks the one shared vault DEK app-wide; same single-tenant unlock-layer gap as secrets_unlock."
-
-[secrets_lock_state]
-tag = "WP-20"
-reason = "The daemon has no passphrase/lock layer. The only literally-true LockState is {configured:false, locked:false}, but the already-served secrets_vault_status reports configured:true (so the FE shows env secrets as readable); serving false would contradict it and steer the FE into the set-passphrase flow the daemon refuses. Settle `configured` for the env namespace for both commands together."
-
-[secrets_set_passphrase]
-tag = "WP-20"
-reason = "unlock.set_or_rotate is the ADR-022 KEK/DEK envelope for the ONE shared vault; per-principal secrets store/unlock is WP-20 by definition."
-
-[secrets_unlock]
-tag = "WP-20"
-reason = "unlock.unlock(passphrase) gates the single shared DEK/vault for the whole daemon; needs per-principal unlock state."
 
 [session_cancel]
 tag = "WP-19"

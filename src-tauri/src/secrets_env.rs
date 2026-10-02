@@ -1,11 +1,38 @@
-//! Environment-backed secret reads for the headless daemon.
+//! Secrets for the headless daemon: the `IKENGA_SECRET_*` operator
+//! namespace, and — in a T1 principal child — the principal's own encrypted
+//! store layered over it (remote-access WP-21).
+//!
+//! # Layers (G-PRINCIPAL §10, ADR-023 `:45`, DEC-R18-1)
+//!
+//! 1. **The principal store** ([`principal`]): only in a T1 principal child
+//!    whose broker handed it a key. Per-principal, encrypted at rest under a
+//!    DEK wrapped by a key the broker derives from its operator KEK. Holds
+//!    every scope (`workspace::K`, `project::<id>::K`, `pkg::<id>::K`, the
+//!    desktop vault's naming) and is writable.
+//! 2. **The operator default**: `IKENGA_SECRET_<KEY>`, read-only, workspace
+//!    scope only. A principal's own value for the same key wins.
+//!
+//! T0 (and any daemon without a hand-off) has only layer 2 and behaves
+//! exactly as before WP-21: the "no vault" sections below describe it.
+//!
+//! `store` and `crypto` (the `SecretsStore` trait and the AES-GCM helpers),
+//! `principal` and `app_lock` (the WP-72 core the daemon's `app_lock_*` arms
+//! share with the desktop) live in `src/secrets/` but are mounted HERE,
+//! because `lib.rs` gates `crate::secrets` on `desktop`; `crate::secrets`
+//! re-exports `store` and `crypto`.
+//!
+//! # T0: environment-backed reads
 //!
 //! Lives outside `commands/` for the same reason `path_allow` does: the
 //! daemon needs it and `commands/` is desktop-only, built around
 //! `#[tauri::command]` and `AppHandle` (whose default type parameter IS
 //! `Wry`, which a `--no-default-features` build does not link).
 //!
-//! # There is no vault here, and that is the decision — not an omission
+//! # T0: there is no vault here, and that is the decision — not an omission
+//!
+//! (WP-21 changes this only for T1, where the store is the principal's own,
+//! in a process running as the principal's uid, and the "remote client" is
+//! that principal — see Layers above.)
 //!
 //! The headless build has **no server-side consumer of a secret at all**.
 //! Every reader in the crate — `pkg_content`, `pkg_fetch`,
@@ -33,11 +60,27 @@
 //!
 //! # Writes
 //!
-//! There are none. [`WRITE_REFUSAL`] is the operator-facing explanation the
+//! On T0 there are none. [`WRITE_REFUSAL`] is the operator-facing explanation the
 //! RPC layer returns for every write command, so a reader hitting it can tell
-//! *decided* from *unfinished*.
+//! *decided* from *unfinished*. On T1 writes go to the principal store only;
+//! the operator default stays read-only.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use serde::Serialize;
+
+#[path = "secrets/app_lock.rs"]
+pub mod app_lock;
+#[path = "secrets/crypto.rs"]
+pub mod crypto;
+#[cfg(unix)]
+#[path = "secrets/principal.rs"]
+pub mod principal;
+#[path = "secrets/store.rs"]
+pub mod store;
+
+use store::SharedSecretStore;
 
 /// Prefix the operator uses to opt a credential into the remote namespace.
 pub const ENV_PREFIX: &str = "IKENGA_SECRET_";
@@ -83,8 +126,15 @@ pub const SCOPE_REFUSAL: &str = concat!(
 /// Note this rejects the dotted convention the desktop vault uses for
 /// pkg-scoped keys (`studio.fal`) — such a key cannot be expressed as an
 /// environment variable at all, so it is simply not reachable from the daemon.
+///
+/// A leading underscore is reserved for host-only plumbing that rides the
+/// `IKENGA_SECRET_` prefix to stay inside the PTY / executor deny floor —
+/// [`principal::HANDOFF_ENV`] (`IKENGA_SECRET__PRINCIPAL_KEY`) — so such a
+/// name is never listed or served.
 pub fn is_valid_key(key: &str) -> bool {
-    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !key.is_empty()
+        && !key.starts_with('_')
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Read one secret. `Ok(None)` means "not set", which is a normal answer and
@@ -157,6 +207,402 @@ pub fn status() -> VaultStatus {
     }
 }
 
+// ─── WP-21: the layered store ──────────────────────────────────────────────
+
+/// `VaultStatus::mode` for a T1 principal child's own store.
+pub const MODE_PRINCIPAL: &str = "principal";
+
+/// Returned by the passphrase / lock arms on the daemon. The T0 env
+/// namespace has no lock layer, and the principal store is keyed by the
+/// broker (DEC-R18-1) precisely so it never needs one.
+pub const LOCK_REFUSAL: &str = concat!(
+    "the headless daemon's secret store has no passphrase or lock. ",
+    "On T1 each principal's store is encrypted at rest under a key the broker derives from its ",
+    "operator-held KEK (remote-access DEC-R18-1), so background work keeps decrypting while you ",
+    "are signed out; a password-derived key was rejected for v1. On T0 the daemon reads only ",
+    "IKENGA_SECRET_<KEY> environment variables. Signing out (T1) or revoking the token (T0) is ",
+    "the boundary here."
+);
+
+/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }`
+/// (`VaultScope` in `src/lib/tauri-cmd.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Workspace,
+    Project(String),
+    Pkg(String),
+}
+
+impl Scope {
+    fn prefix(&self) -> String {
+        match self {
+            Scope::Workspace => "workspace::".into(),
+            Scope::Project(id) => format!("project::{id}::"),
+            Scope::Pkg(id) => format!("pkg::{id}::"),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Scope::Workspace => Ok(()),
+            Scope::Project(id) | Scope::Pkg(id) => {
+                if is_principal_token(id, 128) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "invalid scope id {id:?}: expected 1-128 of [A-Za-z0-9_.-]"
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The store name, desktop-vault style (`commands::secrets::vault_key`).
+    fn name(&self, key: &str) -> Result<String, String> {
+        self.validate()?;
+        if !is_principal_token(key, 256) {
+            return Err(format!(
+                "invalid key {key:?}: expected 1-256 of [A-Za-z0-9_.-]"
+            ));
+        }
+        Ok(format!("{}{key}", self.prefix()))
+    }
+}
+
+fn is_principal_token(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Wire shape of `secrets_lock_state` (the desktop's `secrets::LockState`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LockStateWire {
+    pub configured: bool,
+    pub locked: bool,
+    pub idle_timeout_secs: u64,
+    pub last_activity_unix_ms: Option<u64>,
+}
+
+/// The daemon has no lock layer in either mode, so this is the one true
+/// answer: `configured` agrees with [`status`] (values are readable, the FE
+/// lists them), and nothing is ever locked.
+pub fn lock_state() -> LockStateWire {
+    LockStateWire {
+        configured: true,
+        locked: false,
+        idle_timeout_secs: 0,
+        last_activity_unix_ms: None,
+    }
+}
+
+/// Where the operator layer reads from: the process environment in
+/// production, a fixed map in tests (so they never mutate global env).
+enum EnvLayer {
+    Process,
+    #[cfg(test)]
+    Fixed(std::collections::BTreeMap<String, String>),
+}
+
+impl EnvLayer {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        match self {
+            EnvLayer::Process => get(key),
+            #[cfg(test)]
+            EnvLayer::Fixed(map) => {
+                if !is_valid_key(key) {
+                    return Err(format!("invalid key {key:?}"));
+                }
+                Ok(map.get(&format!("{ENV_PREFIX}{key}")).cloned())
+            }
+        }
+    }
+
+    fn list(&self) -> Vec<String> {
+        match self {
+            EnvLayer::Process => list_keys(),
+            #[cfg(test)]
+            EnvLayer::Fixed(map) => list_keys_from(map.keys().cloned()),
+        }
+    }
+}
+
+enum PrincipalLayer {
+    /// T0, or a daemon nobody handed a key.
+    Absent,
+    Ready(SharedSecretStore),
+    /// A principal child whose store could not be opened. Fails closed: no
+    /// read falls through to the operator default, which could differ from
+    /// the principal's own value.
+    Broken(String),
+}
+
+/// The daemon's secret surface: the principal store (if any) over the
+/// `IKENGA_SECRET_*` operator default. Backs every `secrets_*` RPC arm.
+pub struct DaemonSecrets {
+    principal: PrincipalLayer,
+    env: EnvLayer,
+}
+
+impl std::fmt::Debug for DaemonSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let principal = match &self.principal {
+            PrincipalLayer::Absent => "absent",
+            PrincipalLayer::Ready(_) => "ready",
+            PrincipalLayer::Broken(_) => "broken",
+        };
+        f.debug_struct("DaemonSecrets")
+            .field("principal", &principal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonSecrets {
+    /// The env namespace only: T0, exactly as before WP-21.
+    pub fn env_only() -> Self {
+        Self {
+            principal: PrincipalLayer::Absent,
+            env: EnvLayer::Process,
+        }
+    }
+
+    /// A principal store over the process-env default.
+    pub fn with_principal(store: SharedSecretStore) -> Self {
+        Self {
+            principal: PrincipalLayer::Ready(store),
+            env: EnvLayer::Process,
+        }
+    }
+
+    /// Boot: in a T1 child, take the broker's hand-off (always removing it
+    /// from this process's environment) and open the principal store in the
+    /// child's data dir. T0 constructs no principal (G-PRINCIPAL §1).
+    pub fn from_boot(
+        tier: crate::executor::ExecutorTier,
+        data_dir: Option<&std::path::Path>,
+    ) -> Self {
+        // Only a T1 child reads (and strips) the hand-off. Reading it on T0
+        // would gain nothing — no broker hands one to a T0 daemon, and the
+        // PTY / executor floors drop the name anyway — and would let every
+        // T0 router (tests included) race the process-global variable.
+        #[cfg(unix)]
+        {
+            if tier != crate::executor::ExecutorTier::T1 {
+                return Self::env_only();
+            }
+            Self::from_handoff(principal::take_handoff(), tier, data_dir)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (tier, data_dir);
+            Self::env_only()
+        }
+    }
+
+    /// [`from_boot`](Self::from_boot) after the hand-off was taken.
+    #[cfg(unix)]
+    fn from_handoff(
+        taken: Result<Option<principal::PrincipalKey>, String>,
+        tier: crate::executor::ExecutorTier,
+        data_dir: Option<&std::path::Path>,
+    ) -> Self {
+        if tier != crate::executor::ExecutorTier::T1 {
+            if !matches!(taken, Ok(None)) {
+                tracing::warn!(
+                    "{} was set, but this daemon is not a T1 principal child; stripped and \
+                     ignored",
+                    principal::HANDOFF_ENV
+                );
+            }
+            return Self::env_only();
+        }
+        let key = match taken {
+            Ok(None) => return Self::env_only(),
+            Ok(Some(key)) => key,
+            Err(e) => {
+                tracing::error!("principal secret store disabled: {e}");
+                return Self::broken(e);
+            }
+        };
+        let Some(data_dir) = data_dir else {
+            return Self::broken("a principal child without --data-dir has no store".into());
+        };
+        // `<root>/principals/<id>/data`: the key must be this dir's.
+        let dir_id = data_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        if dir_id.as_deref() != Some(key.id().to_string().as_str()) {
+            return Self::broken(format!(
+                "the broker's key is for principal {}, but --data-dir {} is not that \
+                 principal's",
+                key.id(),
+                data_dir.display()
+            ));
+        }
+        match principal::PrincipalStore::open(data_dir, &key) {
+            Ok(store) => {
+                tracing::info!(
+                    "principal secret store open at {} (key version {})",
+                    store.dir().display(),
+                    key.version()
+                );
+                Self::with_principal(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::error!("principal secret store unavailable: {e}");
+                Self::broken(e.to_string())
+            }
+        }
+    }
+
+    fn broken(reason: String) -> Self {
+        Self {
+            principal: PrincipalLayer::Broken(reason),
+            env: EnvLayer::Process,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        principal: Option<SharedSecretStore>,
+        env: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            principal: principal.map_or(PrincipalLayer::Absent, PrincipalLayer::Ready),
+            env: EnvLayer::Fixed(env),
+        }
+    }
+
+    /// Whether this daemon has a principal layer (ready or broken).
+    pub fn has_principal(&self) -> bool {
+        !matches!(self.principal, PrincipalLayer::Absent)
+    }
+
+    fn store(&self) -> Result<Option<&SharedSecretStore>, String> {
+        match &self.principal {
+            PrincipalLayer::Absent => Ok(None),
+            PrincipalLayer::Ready(store) => Ok(Some(store)),
+            PrincipalLayer::Broken(reason) => Err(format!(
+                "the principal secret store is unavailable: {reason}"
+            )),
+        }
+    }
+
+    /// Principal value first, then (workspace scope only) the operator
+    /// default.
+    pub fn get(&self, scope: &Scope, key: &str) -> Result<Option<String>, String> {
+        let Some(store) = self.store()? else {
+            return match scope {
+                Scope::Workspace => self.env.get(key),
+                _ => Err(SCOPE_REFUSAL.to_string()),
+            };
+        };
+        let name = scope.name(key)?;
+        if let Some(value) = store.get(&name).map_err(String::from)? {
+            return Ok(Some(value));
+        }
+        match scope {
+            // A key the env layer cannot name (dotted) simply has no default.
+            Scope::Workspace if is_valid_key(key) => self.env.get(key),
+            _ => Ok(None),
+        }
+    }
+
+    /// The scope's key names across both layers, sorted, deduplicated.
+    pub fn list_keys(&self, scope: &Scope) -> Result<Vec<String>, String> {
+        let Some(store) = self.store()? else {
+            return match scope {
+                Scope::Workspace => Ok(self.env.list()),
+                _ => Err(SCOPE_REFUSAL.to_string()),
+            };
+        };
+        scope.validate()?;
+        let prefix = scope.prefix();
+        let mut out: BTreeSet<String> = store
+            .list_meta()
+            .map_err(String::from)?
+            .into_iter()
+            .filter_map(|m| m.name.strip_prefix(&prefix).map(str::to_string))
+            // Neither ids nor keys contain `::`: a longer name belongs to
+            // another scope's namespace, never to this one.
+            .filter(|k| !k.contains("::"))
+            .collect();
+        if *scope == Scope::Workspace {
+            out.extend(self.env.list());
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Write the principal's own value. The operator default is read-only.
+    pub fn set(&self, scope: &Scope, key: &str, value: &str) -> Result<(), String> {
+        let Some(store) = self.store()? else {
+            return Err(WRITE_REFUSAL.to_string());
+        };
+        store.set(&scope.name(key)?, value).map_err(String::from)
+    }
+
+    /// Remove the principal's own value. An operator default for the same
+    /// key becomes visible again; it cannot be deleted from here.
+    pub fn delete(&self, scope: &Scope, key: &str) -> Result<(), String> {
+        let Some(store) = self.store()? else {
+            return Err(WRITE_REFUSAL.to_string());
+        };
+        store.delete(&scope.name(key)?).map_err(String::from)
+    }
+
+    /// `secrets_index_names`: the principal store's full names (desktop
+    /// `secrets-index.json` style) plus the operator namespace's keys (as the
+    /// T0 daemon has always answered).
+    pub fn index_names(&self) -> Result<Vec<String>, String> {
+        let mut out: BTreeSet<String> = BTreeSet::new();
+        if let Some(store) = self.store()? {
+            out.extend(
+                store
+                    .list_meta()
+                    .map_err(String::from)?
+                    .into_iter()
+                    .map(|m| m.name),
+            );
+        }
+        out.extend(self.env.list());
+        Ok(out.into_iter().collect())
+    }
+
+    /// `secrets_vault_status`.
+    pub fn status(&self) -> VaultStatus {
+        match &self.principal {
+            PrincipalLayer::Absent => status(),
+            PrincipalLayer::Ready(store) => {
+                let probe = store.probe();
+                VaultStatus {
+                    available: probe.is_ok(),
+                    keychain_backend: store.backend_label().to_string(),
+                    error: probe.err().map(String::from),
+                    mode: MODE_PRINCIPAL.to_string(),
+                    writable: true,
+                    locked: false,
+                    configured: true,
+                    idle_timeout_secs: 0,
+                    last_activity_unix_ms: None,
+                }
+            }
+            PrincipalLayer::Broken(reason) => VaultStatus {
+                available: false,
+                keychain_backend: "principal store".to_string(),
+                error: Some(reason.clone()),
+                mode: MODE_PRINCIPAL.to_string(),
+                writable: false,
+                locked: false,
+                configured: true,
+                idle_timeout_secs: 0,
+                last_activity_unix_ms: None,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +618,8 @@ mod tests {
         assert!(!is_valid_key("A B"));
         // No traversal into the wider environment via a crafted name.
         assert!(!is_valid_key("PATH}${"));
+        // Leading underscore: reserved host-only plumbing (WP-21 hand-off).
+        assert!(!is_valid_key("_PRINCIPAL_KEY"));
     }
 
     #[test]
@@ -236,5 +684,241 @@ mod tests {
             assert!(obj.contains_key(field), "missing field {field}");
         }
         assert_eq!(obj.len(), 9);
+    }
+
+    // ─── WP-21 layering ────────────────────────────────────────────────
+
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::store::{SecretMeta, SecretsStore, StoreError};
+
+    /// An in-memory principal layer.
+    #[derive(Default)]
+    struct MemStore(Mutex<BTreeMap<String, String>>);
+
+    impl SecretsStore for MemStore {
+        fn get(&self, name: &str) -> Result<Option<String>, StoreError> {
+            Ok(self.0.lock().unwrap().get(name).cloned())
+        }
+        fn set(&self, name: &str, value: &str) -> Result<(), StoreError> {
+            self.0.lock().unwrap().insert(name.into(), value.into());
+            Ok(())
+        }
+        fn delete(&self, name: &str) -> Result<(), StoreError> {
+            self.0.lock().unwrap().remove(name);
+            Ok(())
+        }
+        fn list_meta(&self) -> Result<Vec<SecretMeta>, StoreError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|n| SecretMeta { name: n.clone() })
+                .collect())
+        }
+        fn replace_all(&self, _: &BTreeMap<String, String>) -> Result<usize, StoreError> {
+            unimplemented!()
+        }
+        fn probe(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn prepare_encryption(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn detect_configuration(&self) -> Result<bool, StoreError> {
+            Ok(true)
+        }
+        fn backend_label(&self) -> &'static str {
+            "mem"
+        }
+    }
+
+    fn env() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("IKENGA_SECRET_ANTHROPIC_API_KEY".into(), "operator".into()),
+            (
+                "IKENGA_SECRET_RESEND_API_KEY".into(),
+                "operator-resend".into(),
+            ),
+            (
+                "IKENGA_SECRET__PRINCIPAL_KEY".into(),
+                "1:never:listed".into(),
+            ),
+        ])
+    }
+
+    fn layered() -> DaemonSecrets {
+        DaemonSecrets::for_test(Some(Arc::new(MemStore::default())), env())
+    }
+
+    #[test]
+    fn principal_value_wins_over_the_operator_default() {
+        let s = layered();
+        let ws = Scope::Workspace;
+        assert_eq!(
+            s.get(&ws, "ANTHROPIC_API_KEY").unwrap().as_deref(),
+            Some("operator"),
+            "no principal value: the operator default"
+        );
+        s.set(&ws, "ANTHROPIC_API_KEY", "mine").unwrap();
+        assert_eq!(
+            s.get(&ws, "ANTHROPIC_API_KEY").unwrap().as_deref(),
+            Some("mine")
+        );
+        s.delete(&ws, "ANTHROPIC_API_KEY").unwrap();
+        assert_eq!(
+            s.get(&ws, "ANTHROPIC_API_KEY").unwrap().as_deref(),
+            Some("operator"),
+            "deleting the override uncovers the default"
+        );
+        // A dotted key lives only in the principal layer.
+        s.set(&ws, "studio.fal", "f").unwrap();
+        assert_eq!(s.get(&ws, "studio.fal").unwrap().as_deref(), Some("f"));
+        assert_eq!(s.get(&ws, "other.key").unwrap(), None);
+    }
+
+    #[test]
+    fn project_and_pkg_scopes_are_principal_only() {
+        let s = layered();
+        let proj = Scope::Project("p1".into());
+        assert_eq!(s.get(&proj, "ANTHROPIC_API_KEY").unwrap(), None);
+        s.set(&proj, "TOKEN", "t").unwrap();
+        s.set(&Scope::Pkg("studio".into()), "fal", "x").unwrap();
+        assert_eq!(s.list_keys(&proj).unwrap(), vec!["TOKEN"]);
+        assert_eq!(
+            s.list_keys(&Scope::Pkg("studio".into())).unwrap(),
+            vec!["fal"]
+        );
+        assert!(s.get(&Scope::Project("a::b".into()), "K").is_err());
+        assert!(s.set(&proj, "a::b", "v").is_err());
+    }
+
+    #[test]
+    fn listing_unions_both_layers_and_hides_reserved_names() {
+        let s = layered();
+        s.set(&Scope::Workspace, "MINE", "m").unwrap();
+        s.set(&Scope::Workspace, "RESEND_API_KEY", "r").unwrap();
+        s.set(&Scope::Project("p".into()), "P", "p").unwrap();
+        assert_eq!(
+            s.list_keys(&Scope::Workspace).unwrap(),
+            vec!["ANTHROPIC_API_KEY", "MINE", "RESEND_API_KEY"]
+        );
+        assert_eq!(
+            s.index_names().unwrap(),
+            vec![
+                "ANTHROPIC_API_KEY",
+                "RESEND_API_KEY",
+                "project::p::P",
+                "workspace::MINE",
+                "workspace::RESEND_API_KEY"
+            ]
+        );
+        assert!(s
+            .get(&Scope::Workspace, "_PRINCIPAL_KEY")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn without_a_principal_the_daemon_is_unchanged() {
+        let s = DaemonSecrets::for_test(None, env());
+        assert!(!s.has_principal());
+        assert_eq!(
+            s.get(&Scope::Workspace, "ANTHROPIC_API_KEY")
+                .unwrap()
+                .as_deref(),
+            Some("operator")
+        );
+        assert!(s.get(&Scope::Workspace, "studio.fal").is_err());
+        assert!(s
+            .get(&Scope::Project("p".into()), "K")
+            .unwrap_err()
+            .contains("flat"));
+        assert!(s
+            .set(&Scope::Workspace, "K", "v")
+            .unwrap_err()
+            .contains("no vault, by design"));
+        assert!(s.delete(&Scope::Workspace, "K").is_err());
+        assert_eq!(
+            s.list_keys(&Scope::Workspace).unwrap(),
+            vec!["ANTHROPIC_API_KEY", "RESEND_API_KEY"]
+        );
+        assert_eq!(
+            s.index_names().unwrap(),
+            s.list_keys(&Scope::Workspace).unwrap()
+        );
+        let st = s.status();
+        assert_eq!(st.mode, MODE_ENV);
+        assert!(!st.writable);
+    }
+
+    #[test]
+    fn a_broken_principal_store_fails_closed() {
+        let s = DaemonSecrets {
+            principal: PrincipalLayer::Broken("dek does not unwrap".into()),
+            env: EnvLayer::Fixed(env()),
+        };
+        let err = s.get(&Scope::Workspace, "ANTHROPIC_API_KEY").unwrap_err();
+        assert!(err.contains("dek does not unwrap"), "{err}");
+        assert!(s.list_keys(&Scope::Workspace).is_err());
+        assert!(s.set(&Scope::Workspace, "K", "v").is_err());
+        let st = s.status();
+        assert!(!st.available);
+        assert_eq!(st.mode, MODE_PRINCIPAL);
+    }
+
+    #[test]
+    fn principal_status_is_writable_configured_and_never_locked() {
+        let st = layered().status();
+        assert!(st.available && st.writable && st.configured && !st.locked);
+        assert_eq!(st.mode, MODE_PRINCIPAL);
+        let lock = lock_state();
+        assert!(lock.configured && !lock.locked, "agrees with status");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_constructs_a_principal_only_for_a_t1_child_with_its_own_data_dir() {
+        use crate::executor::{ExecutorTier, PrincipalId};
+        use principal::{BrokerKek, PrincipalKey};
+        let kek = BrokerKek::from_bytes([42; 32]);
+        let id = PrincipalId::new_v7();
+        let key = || -> Result<Option<PrincipalKey>, String> { Ok(Some(kek.derive(id))) };
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join(id.to_string()).join("data");
+        std::fs::create_dir_all(&data).unwrap();
+
+        // T0 constructs no principal, whatever it was handed (G-PRINCIPAL §1).
+        let s = DaemonSecrets::from_handoff(key(), ExecutorTier::T0, Some(&data));
+        assert!(!s.has_principal());
+        let s = DaemonSecrets::from_handoff(Err("bad".into()), ExecutorTier::T0, Some(&data));
+        assert!(!s.has_principal());
+        // T1 without a hand-off: env only.
+        assert!(
+            !DaemonSecrets::from_handoff(Ok(None), ExecutorTier::T1, Some(&data)).has_principal()
+        );
+
+        // T1 with its own data dir: ready, and it stores.
+        let s = DaemonSecrets::from_handoff(key(), ExecutorTier::T1, Some(&data));
+        assert_eq!(s.status().mode, MODE_PRINCIPAL);
+        assert!(s.status().available);
+        s.set(&Scope::Workspace, "K", "v").unwrap();
+        assert_eq!(s.get(&Scope::Workspace, "K").unwrap().as_deref(), Some("v"));
+        assert!(data.join("secrets").join(principal::DEK_FILENAME).exists());
+
+        // Another principal's data dir: refused, fails closed.
+        let other = tmp
+            .path()
+            .join(PrincipalId::new_v7().to_string())
+            .join("data");
+        std::fs::create_dir_all(&other).unwrap();
+        let s = DaemonSecrets::from_handoff(key(), ExecutorTier::T1, Some(&other));
+        assert!(!s.status().available);
+        assert!(s.get(&Scope::Workspace, "K").is_err());
+        // A malformed hand-off on T1 fails closed too.
+        let s = DaemonSecrets::from_handoff(Err("malformed".into()), ExecutorTier::T1, Some(&data));
+        assert!(s.get(&Scope::Workspace, "K").is_err());
     }
 }

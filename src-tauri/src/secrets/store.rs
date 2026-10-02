@@ -1,7 +1,15 @@
+//! The `SecretsStore` trait and its error type.
+//!
+//! Compiled in BOTH feature sets: `lib.rs` gates `crate::secrets` on
+//! `desktop`, so this file is mounted through `crate::secrets_env::store`
+//! (`#[path]`) and re-exported as `crate::secrets::store` for the desktop
+//! code. It must therefore stay free of desktop-only dependencies — the
+//! `UnlockError` conversion lives in `secrets/unlock.rs` for that reason.
+//! The headless daemon's per-principal store (WP-21,
+//! `secrets_env::principal`) implements this same trait.
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-
-use super::unlock::UnlockError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretMeta {
@@ -101,20 +109,6 @@ impl std::error::Error for StoreError {}
 impl From<StoreError> for String {
     fn from(error: StoreError) -> Self {
         error.message
-    }
-}
-
-impl From<UnlockError> for StoreError {
-    fn from(error: UnlockError) -> Self {
-        match error {
-            UnlockError::Locked | UnlockError::NotConfigured => Self::locked(),
-            UnlockError::EnvelopeMissing => {
-                Self::unavailable(UnlockError::EnvelopeMissing.to_string())
-            }
-            UnlockError::WrongPassphrase => Self::unknown("wrong passphrase"),
-            UnlockError::InvalidPassphrase => Self::unavailable("passphrase is invalid"),
-            other => Self::unknown(other.to_string()),
-        }
     }
 }
 
@@ -276,12 +270,6 @@ mod tests {
             store.detect_configuration().unwrap_err().kind(),
             StoreErrorKind::Unavailable
         );
-    }
-
-    #[test]
-    fn envelope_missing_maps_to_unavailable() {
-        let error: StoreError = UnlockError::EnvelopeMissing.into();
-        assert_eq!(error.kind(), StoreErrorKind::Unavailable);
     }
 
     #[test]

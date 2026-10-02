@@ -69,26 +69,32 @@ fn db_args(args: &Value) -> Result<(String, Vec<Value>), String> {
     Ok((sql, params))
 }
 
-/// The `kind` discriminant of the frontend's `VaultScope`
-/// (`src/lib/tauri-cmd.ts`), whose wire shape is
-/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }`.
-///
-/// The daemon only distinguishes workspace from everything else, because its
-/// secret namespace is flat — see `crate::secrets_env`.
-enum ScopeKind {
-    Workspace,
-    Other(String),
-}
-
-fn scope_kind(args: &Value) -> Result<ScopeKind, String> {
-    let kind = args
+/// The frontend's `VaultScope` (`src/lib/tauri-cmd.ts`), whose wire shape is
+/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }`,
+/// as a [`crate::secrets_env::Scope`]. Whether a scope is servable is the
+/// store's call: the T0 env namespace is flat (workspace only), a T1
+/// principal store holds all three (WP-21).
+fn scope_kind(args: &Value) -> Result<crate::secrets_env::Scope, String> {
+    use crate::secrets_env::Scope;
+    let scope = args
         .get("scope")
-        .and_then(|s| s.get("kind"))
+        .ok_or("scope is required, e.g. {\"kind\":\"workspace\"}")?;
+    let kind = scope
+        .get("kind")
         .and_then(|k| k.as_str())
         .ok_or("scope is required, e.g. {\"kind\":\"workspace\"}")?;
+    let id = || {
+        scope
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("scope {kind:?} needs an `id`"))
+    };
     Ok(match kind {
-        "workspace" => ScopeKind::Workspace,
-        other => ScopeKind::Other(other.to_string()),
+        "workspace" => Scope::Workspace,
+        "project" => Scope::Project(id()?),
+        "pkg" => Scope::Pkg(id()?),
+        other => return Err(format!("unknown scope kind {other:?}")),
     })
 }
 
@@ -487,77 +493,81 @@ pub async fn rpc_handler(
             RpcResponse::success(state.pkg_index.all_skill_actions(store.as_deref()))
         }
 
-        // --- Secrets & Vault Commands (G-30) ---
+        // --- Secrets & Vault Commands (G-30, remote-access WP-21) ---
         //
-        // There is no vault in the daemon and that is decided, not pending:
-        // every server-side reader of a secret is desktop-gated, so an
-        // encrypted store here would exist only to be read back out over the
-        // bearer-token boundary. The daemon serves the flat, operator-opted-in
-        // `IKENGA_SECRET_*` namespace instead. Rationale, the PTY denylist
-        // interaction, and the operator runbook all live in
-        // `crate::secrets_env` — read that before changing anything below.
-        "secrets_get" => {
-            let key = payload
-                .args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match crate::secrets_env::get(key) {
-                Ok(value) => RpcResponse::success(value),
-                Err(e) => RpcResponse::error(format!("secrets_get: {e}")),
-            }
-        }
-        "secrets_list_keys" => RpcResponse::success(crate::secrets_env::list_keys()),
+        // Bodies in `server::rpc_local`, over `state.secrets`
+        // (`secrets_env::DaemonSecrets`). T0: the flat, read-only,
+        // operator-opted-in `IKENGA_SECRET_*` namespace — no vault, by design
+        // (`crate::secrets_env` has the rationale, the PTY denylist
+        // interaction and the operator runbook). A T1 principal child: the
+        // principal's own encrypted store (DEC-R18-1, broker-held KEK) layered
+        // over that namespace as the operator default. Unscoped commands are
+        // workspace scope. Writes on T0 are explicit refusals
+        // (`WRITE_REFUSAL`), never the unknown-command fallthrough.
+        "secrets_get" => rpc_local::secrets_get(
+            &state,
+            &crate::secrets_env::Scope::Workspace,
+            &payload.args,
+            "secrets_get",
+        ),
+        "secrets_list_keys" => rpc_local::secrets_list_keys(
+            &state,
+            &crate::secrets_env::Scope::Workspace,
+            "secrets_list_keys",
+        ),
         // Without this arm Settings → API Keys / Integrations / Secrets and
         // every connector probe are dead in a browser session: they all gate
         // on `available`, and the unknown-command fallthrough throws.
-        "secrets_vault_status" => RpcResponse::success(crate::secrets_env::status()),
-
-        // Scoped reads: the env namespace is flat, which IS workspace scope.
-        // Project and pkg partitions exist only in the desktop vault, so they
-        // get a refusal that says which, rather than an empty list that reads
-        // like "you have no secrets there".
-        "secrets_get_scoped" => match scope_kind(&payload.args) {
-            Ok(ScopeKind::Workspace) => {
-                let key = payload
-                    .args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                match crate::secrets_env::get(key) {
-                    Ok(value) => RpcResponse::success(value),
-                    Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
-                }
-            }
-            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
-                "secrets_get_scoped: scope {kind:?} is not servable — {}",
-                crate::secrets_env::SCOPE_REFUSAL
-            )),
-            Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
+        "secrets_vault_status" => rpc_local::secrets_vault_status(&state),
+        "secrets_set" => rpc_local::secrets_set(
+            &state,
+            &crate::secrets_env::Scope::Workspace,
+            &payload.args,
+            "secrets_set",
+        ),
+        "secrets_delete" => rpc_local::secrets_delete(
+            &state,
+            &crate::secrets_env::Scope::Workspace,
+            &payload.args,
+            "secrets_delete",
+        ),
+        cmd @ ("secrets_get_scoped"
+        | "secrets_list_keys_scoped"
+        | "secrets_set_scoped"
+        | "secrets_delete_scoped") => match scope_kind(&payload.args) {
+            Ok(scope) => match cmd {
+                "secrets_get_scoped" => rpc_local::secrets_get(&state, &scope, &payload.args, cmd),
+                "secrets_list_keys_scoped" => rpc_local::secrets_list_keys(&state, &scope, cmd),
+                "secrets_set_scoped" => rpc_local::secrets_set(&state, &scope, &payload.args, cmd),
+                _ => rpc_local::secrets_delete(&state, &scope, &payload.args, cmd),
+            },
+            Err(e) => RpcResponse::error(format!("{cmd}: {e}")),
         },
-        "secrets_list_keys_scoped" => match scope_kind(&payload.args) {
-            Ok(ScopeKind::Workspace) => RpcResponse::success(crate::secrets_env::list_keys()),
-            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
-                "secrets_list_keys_scoped: scope {kind:?} is not servable — {}",
-                crate::secrets_env::SCOPE_REFUSAL
-            )),
-            Err(e) => RpcResponse::error(format!("secrets_list_keys_scoped: {e}")),
-        },
+        // Desktop: the names in `secrets-index.json`. Daemon: the principal
+        // store's full names plus the operator namespace's keys.
+        "secrets_index_names" => rpc_local::secrets_index_names(&state),
+        // The daemon has no passphrase or lock layer (T0: env only; T1: the
+        // broker-keyed store, DEC-R18-1): the lock state is the one true
+        // answer, consistent with `secrets_vault_status`, and the three
+        // mutating arms refuse with the reason (`secrets_env::LOCK_REFUSAL`).
+        "secrets_lock_state" => rpc_local::secrets_lock_state(),
+        cmd @ ("secrets_lock" | "secrets_unlock" | "secrets_set_passphrase") => {
+            rpc_local::secrets_lock_refusal(cmd)
+        }
 
-        // Writes. Explicit refusal arms, NOT the unknown-command fallthrough:
-        // the fallthrough reads as "unfinished, someone will get to it", and
-        // the next person to read it would implement the thing this decision
-        // rejects. `secrets_env::WRITE_REFUSAL` is the operator runbook.
-        cmd @ ("secrets_set" | "secrets_delete" | "secrets_set_scoped"
-        | "secrets_delete_scoped") => RpcResponse::error(format!(
-            "{cmd} {}",
-            crate::secrets_env::WRITE_REFUSAL
-        )),
-        // Desktop: the names in `secrets-index.json`. Daemon: the names of
-        // its own namespace — same `string[]` shape, daemon-true content.
-        // Needs no `--data-dir`: the namespace is process environment.
-        // (`secrets_lock_state` stays allowlisted; see `desktop_only.toml`.)
-        "secrets_index_names" => RpcResponse::success(crate::secrets_env::list_keys()),
+        // --- App lock (WP-72 core; served per data dir, remote-access WP-21) ---
+        //
+        // `state.app_lock` is rooted at `<data-dir>/app-lock.json`, so under
+        // T1 each principal's child has its own PIN and lock. A privacy
+        // screen, not a security boundary (see `commands/app_lock.rs`).
+        "app_lock_status" => rpc_local::app_lock_status(&state),
+        "app_lock_touch" => rpc_local::app_lock_touch(&state),
+        "app_lock_lock" => rpc_local::app_lock_lock(&state),
+        "app_lock_unlock" => rpc_local::app_lock_unlock(&state, &payload.args).await,
+        "app_lock_unlock_biometric" => rpc_local::app_lock_unlock_biometric(&state),
+        "app_lock_configure" => rpc_local::app_lock_configure(&state, &payload.args),
+        "app_lock_set_secret" => rpc_local::app_lock_set_secret(&state, &payload.args).await,
+        "app_lock_clear_secret" => rpc_local::app_lock_clear_secret(&state, &payload.args).await,
 
         // --- Local state (WP-19 slice 2) ---
         //

@@ -188,6 +188,15 @@ pub struct AppState {
     /// resolved; those arms then answer the desktop's "cannot resolve store
     /// root". Single-user seam (G-PRINCIPAL / WP-20), same as `home`.
     pub(crate) store: Option<PathBuf>,
+    /// The secrets behind the `secrets_*` arms (remote-access WP-21): in a
+    /// T1 principal child, the principal's own encrypted store over the
+    /// `IKENGA_SECRET_*` operator default; otherwise the env namespace only
+    /// (T0 constructs no principal). See `secrets_env::DaemonSecrets`.
+    pub(crate) secrets: Arc<crate::secrets_env::DaemonSecrets>,
+    /// The WP-72 app lock behind the `app_lock_*` arms, rooted at
+    /// `<data-dir>/app-lock.json` (per principal under T1). `None` without a
+    /// data dir; those arms then say so.
+    pub(crate) app_lock: Option<Arc<crate::secrets_env::app_lock::AppLockCore>>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -446,6 +455,19 @@ fn build_router(
         ))),
         _ => None,
     };
+    // WP-21: the broker's per-principal key hand-off is read (and removed
+    // from this process's environment) here, before anything is served or
+    // spawned. Only a T1 child reads it; T0 builds the env-only store.
+    let secrets = Arc::new(crate::secrets_env::DaemonSecrets::from_boot(
+        config.executor_tier,
+        config.data_dir.as_deref(),
+    ));
+    let app_lock = config.data_dir.as_ref().map(|dir| {
+        use crate::secrets_env::app_lock::{AppLockCore, Platform, CONFIG_FILENAME};
+        let core = AppLockCore::new();
+        core.configure(dir.join(CONFIG_FILENAME), Platform::headless());
+        Arc::new(core)
+    });
     let allowed_origins = config.allowed_origins.clone();
     let state = Arc::new(AppState {
         config,
@@ -460,6 +482,8 @@ fn build_router(
         path_guard,
         actions,
         store,
+        secrets,
+        app_lock,
         shutdown_tx,
     });
 

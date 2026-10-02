@@ -119,6 +119,24 @@ impl From<CryptoError> for UnlockError {
     }
 }
 
+/// Lives here rather than beside `StoreError` (`secrets/store.rs`) because
+/// that file is also compiled in the headless build, which has no unlock
+/// layer (see the `secrets/store.rs` header).
+impl From<UnlockError> for super::store::StoreError {
+    fn from(error: UnlockError) -> Self {
+        use super::store::StoreError;
+        match error {
+            UnlockError::Locked | UnlockError::NotConfigured => StoreError::locked(),
+            UnlockError::EnvelopeMissing => {
+                StoreError::unavailable(UnlockError::EnvelopeMissing.to_string())
+            }
+            UnlockError::WrongPassphrase => StoreError::unknown("wrong passphrase"),
+            UnlockError::InvalidPassphrase => StoreError::unavailable("passphrase is invalid"),
+            other => StoreError::unknown(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct UnlockState {
     path: Arc<Mutex<Option<PathBuf>>>,
@@ -546,6 +564,13 @@ fn persist_envelope(path: &Path, envelope: &WrappedDekEnvelope) -> Result<(), Un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_missing_maps_to_unavailable() {
+        use crate::secrets::store::{StoreError, StoreErrorKind};
+        let error: StoreError = UnlockError::EnvelopeMissing.into();
+        assert_eq!(error.kind(), StoreErrorKind::Unavailable);
+    }
 
     fn state(dir: &Path, timeout: Duration) -> UnlockState {
         UnlockState::with_path(dir.join(UNLOCK_ENVELOPE_FILENAME), timeout)

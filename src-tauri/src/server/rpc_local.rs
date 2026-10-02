@@ -584,6 +584,139 @@ pub(super) async fn pkg_db_diag(state: &AppState) -> RpcResponse {
     respond("pkg_db_diag", r)
 }
 
+// ─── Secrets + app lock (remote-access WP-21) ────────────────────────────────
+//
+// `secrets_*` go through `state.secrets` (`secrets_env::DaemonSecrets`): in a
+// T1 principal child, the principal's own encrypted store over the
+// `IKENGA_SECRET_*` operator default; everywhere else, the env namespace
+// exactly as before (G-30). The passphrase / lock arms answer the daemon's
+// one true lock state and refuse the rest (`secrets_env::LOCK_REFUSAL`).
+//
+// `app_lock_*` go through `state.app_lock`, the WP-72 core rooted at
+// `<data-dir>/app-lock.json` — per principal under T1, because each child has
+// its own data dir. No events: the shell polls `app_lock_status`, which runs
+// the idle check (the daemon has no ticker).
+
+use crate::secrets_env::{self, Scope};
+
+pub(super) fn secrets_get(state: &AppState, scope: &Scope, args: &Value, cmd: &str) -> RpcResponse {
+    let r = req_str(args, &["key"]).and_then(|key| state.secrets.get(scope, &key));
+    respond(cmd, r)
+}
+
+pub(super) fn secrets_list_keys(state: &AppState, scope: &Scope, cmd: &str) -> RpcResponse {
+    respond(cmd, state.secrets.list_keys(scope))
+}
+
+pub(super) fn secrets_set(state: &AppState, scope: &Scope, args: &Value, cmd: &str) -> RpcResponse {
+    let r = (|| {
+        let key = req_str(args, &["key"])?;
+        let value = zeroize::Zeroizing::new(req_str(args, &["value"])?);
+        state.secrets.set(scope, &key, &value)
+    })();
+    respond(cmd, r)
+}
+
+pub(super) fn secrets_delete(
+    state: &AppState,
+    scope: &Scope,
+    args: &Value,
+    cmd: &str,
+) -> RpcResponse {
+    let r = req_str(args, &["key"]).and_then(|key| state.secrets.delete(scope, &key));
+    respond(cmd, r)
+}
+
+pub(super) fn secrets_index_names(state: &AppState) -> RpcResponse {
+    respond("secrets_index_names", state.secrets.index_names())
+}
+
+pub(super) fn secrets_vault_status(state: &AppState) -> RpcResponse {
+    RpcResponse::success(state.secrets.status())
+}
+
+pub(super) fn secrets_lock_state() -> RpcResponse {
+    RpcResponse::success(secrets_env::lock_state())
+}
+
+/// `secrets_lock`, `secrets_unlock`, `secrets_set_passphrase`.
+pub(super) fn secrets_lock_refusal(cmd: &str) -> RpcResponse {
+    RpcResponse::error(format!("{cmd}: {}", secrets_env::LOCK_REFUSAL))
+}
+
+const NO_APP_LOCK: &str =
+    "no app lock: the daemon was started without --data-dir, so there is no app-lock.json";
+
+fn app_lock(state: &AppState) -> Result<&secrets_env::app_lock::AppLockCore, String> {
+    state
+        .app_lock
+        .as_deref()
+        .ok_or_else(|| NO_APP_LOCK.to_string())
+}
+
+pub(super) fn app_lock_status(state: &AppState) -> RpcResponse {
+    respond("app_lock_status", app_lock(state).map(|l| l.status().1))
+}
+
+pub(super) fn app_lock_touch(state: &AppState) -> RpcResponse {
+    respond("app_lock_touch", app_lock(state).map(|l| l.touch()))
+}
+
+pub(super) fn app_lock_lock(state: &AppState) -> RpcResponse {
+    respond(
+        "app_lock_lock",
+        app_lock(state).and_then(|l| l.lock_now().map(|(_, s)| s)),
+    )
+}
+
+pub(super) async fn app_lock_unlock(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let secret = zeroize::Zeroizing::new(req_str(args, &["secret"])?);
+        app_lock(state)?.unlock(secret).await.map(|(o, _)| o)
+    }
+    .await;
+    respond("app_lock_unlock", r)
+}
+
+pub(super) fn app_lock_unlock_biometric(state: &AppState) -> RpcResponse {
+    respond(
+        "app_lock_unlock_biometric",
+        app_lock(state).map(|l| l.unlock_biometric()),
+    )
+}
+
+pub(super) fn app_lock_configure(state: &AppState, args: &Value) -> RpcResponse {
+    let r = (|| {
+        let idle_enabled = req_bool(args, &["idleEnabled", "idle_enabled"])?;
+        let idle_minutes =
+            opt_u64(args, &["idleMinutes", "idle_minutes"])?.ok_or("`idleMinutes` is required")?;
+        let idle_minutes =
+            u32::try_from(idle_minutes).map_err(|_| "`idleMinutes` is out of range".to_string())?;
+        let method: secrets_env::app_lock::UnlockMethod = targ(args, &["method"])?;
+        app_lock(state)?.configure_lock(idle_enabled, idle_minutes, method)
+    })();
+    respond("app_lock_configure", r)
+}
+
+pub(super) async fn app_lock_set_secret(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let current = opt_str(args, &["current"])?.map(zeroize::Zeroizing::new);
+        let next = zeroize::Zeroizing::new(req_str(args, &["next"])?);
+        app_lock(state)?.set_secret(current, next).await
+    }
+    .await;
+    respond("app_lock_set_secret", r)
+}
+
+pub(super) async fn app_lock_clear_secret(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let current = zeroize::Zeroizing::new(req_str(args, &["current"])?);
+        app_lock(state)?.clear_secret(current).await.map(|(_, s)| s)
+    }
+    .await;
+    respond("app_lock_clear_secret", r)
+}
+
 #[cfg(test)]
 mod tests {
     //! House pattern (see the slice-1 tests in `server/mod.rs`): a literal
@@ -2306,5 +2439,184 @@ mod tests {
             let direct = pkg_db::db_diag(&d.db).await.unwrap();
             assert_eq!(diag, serde_json::to_value(&direct).unwrap());
         }
+    }
+
+    // ── Secrets + app lock (remote-access WP-21) ────────────────────────────
+
+    /// T0: the env namespace, unchanged; the lock arms answer the one true
+    /// state and refuse the rest with the reason.
+    #[tokio::test]
+    async fn t0_secrets_are_the_env_namespace_and_have_no_lock() {
+        let r = bare(None);
+        let lock = ok(&r, "secrets_lock_state", json!({})).await;
+        assert_eq!(lock["configured"], true);
+        assert_eq!(lock["locked"], false);
+        let status = ok(&r, "secrets_vault_status", json!({})).await;
+        assert_eq!(status["configured"], lock["configured"], "the two agree");
+        assert_eq!(status["mode"], "env");
+        for cmd in ["secrets_lock", "secrets_unlock", "secrets_set_passphrase"] {
+            let e = err(&r, cmd, json!({"passphrase": "x"})).await;
+            assert!(e.contains("no passphrase or lock"), "{cmd}: {e}");
+        }
+        let e = err(&r, "secrets_set", json!({"key": "K", "value": "v"})).await;
+        assert!(e.contains("no vault, by design"), "{e}");
+        let e = err(
+            &r,
+            "secrets_get_scoped",
+            json!({"scope": {"kind": "project", "id": "p"}, "key": "K"}),
+        )
+        .await;
+        assert!(e.contains("flat"), "{e}");
+        let e = err(
+            &r,
+            "secrets_get_scoped",
+            json!({"scope": {"kind": "nope"}, "key": "K"}),
+        )
+        .await;
+        assert!(e.contains("unknown scope kind"), "{e}");
+    }
+
+    /// A T1 principal child: the broker's hand-off opens the principal's own
+    /// store under `<data>/secrets/`, writable in every scope, layered over
+    /// the operator default.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_principal_child_serves_its_own_store_over_the_operator_default() {
+        use crate::executor::PrincipalId;
+        use crate::secrets_env::principal::{BrokerKek, HANDOFF_ENV, HANDOFF_TEST_LOCK};
+        let tmp = tempfile::tempdir().unwrap();
+        let id = PrincipalId::new_v7();
+        let data = tmp.path().join(id.to_string()).join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let kek = BrokerKek::load_or_create(tmp.path()).unwrap();
+        let router = {
+            let _env = HANDOFF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(HANDOFF_ENV, kek.derive(id).to_env_value().as_str());
+            let mut cfg = config(Some(data.clone()), None);
+            cfg.executor_tier = ExecutorTier::T1;
+            let router = router_with_home(
+                cfg,
+                Arc::new(PtyManager::new()),
+                Arc::new(EngineRegistry::new()),
+                None,
+                None,
+                None,
+            );
+            assert!(
+                std::env::var_os(HANDOFF_ENV).is_none(),
+                "the child strips the hand-off before serving"
+            );
+            router
+        };
+        let status = ok(&router, "secrets_vault_status", json!({})).await;
+        assert_eq!(status["mode"], "principal", "{status}");
+        assert_eq!(status["writable"], true);
+        assert_eq!(status["available"], true);
+
+        ok(&router, "secrets_set", json!({"key": "MINE", "value": "m"})).await;
+        assert_eq!(
+            ok(&router, "secrets_get", json!({"key": "MINE"})).await,
+            "m"
+        );
+        let proj = json!({"kind": "project", "id": "p1"});
+        ok(
+            &router,
+            "secrets_set_scoped",
+            json!({"scope": proj, "key": "TOKEN", "value": "t"}),
+        )
+        .await;
+        assert_eq!(
+            ok(&router, "secrets_list_keys_scoped", json!({"scope": proj})).await,
+            json!(["TOKEN"])
+        );
+        assert_eq!(
+            ok(
+                &router,
+                "secrets_get_scoped",
+                json!({"scope": proj, "key": "TOKEN"})
+            )
+            .await,
+            "t"
+        );
+        let names = ok(&router, "secrets_index_names", json!({})).await;
+        assert!(
+            names
+                .as_array()
+                .unwrap()
+                .contains(&json!("project::p1::TOKEN")),
+            "{names}"
+        );
+        ok(
+            &router,
+            "secrets_delete_scoped",
+            json!({"scope": proj, "key": "TOKEN"}),
+        )
+        .await;
+        assert_eq!(
+            ok(
+                &router,
+                "secrets_get_scoped",
+                json!({"scope": proj, "key": "TOKEN"})
+            )
+            .await,
+            Value::Null
+        );
+        // On disk: the principal's dir, sealed.
+        let raw = std::fs::read_to_string(data.join("secrets").join("secrets.json")).unwrap();
+        assert!(raw.contains("workspace::MINE") && !raw.contains("\"m\""));
+        // Still no passphrase layer.
+        let e = err(&router, "secrets_unlock", json!({"passphrase": "x"})).await;
+        assert!(e.contains("DEC-R18-1"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn app_lock_is_served_per_data_dir() {
+        let d = daemon();
+        let r = &d.router;
+        let status = ok(r, "app_lock_status", json!({})).await;
+        assert_eq!(status["locked"], false);
+        assert_eq!(status["secretSet"], false);
+        assert!(err(r, "app_lock_lock", json!({}))
+            .await
+            .contains("Set a PIN"));
+
+        ok(
+            r,
+            "app_lock_set_secret",
+            json!({"current": null, "next": "2468"}),
+        )
+        .await;
+        ok(r, "app_lock_touch", json!({})).await;
+        let status = ok(r, "app_lock_lock", json!({})).await;
+        assert_eq!(status["locked"], true);
+        assert!(
+            d.data.join("app-lock.json").exists(),
+            "persisted in the data dir"
+        );
+
+        let out = ok(r, "app_lock_unlock", json!({"secret": "0000"})).await;
+        assert_eq!(out["ok"], false);
+        let out = ok(r, "app_lock_unlock", json!({"secret": "2468"})).await;
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["status"]["locked"], false);
+        assert_eq!(
+            ok(r, "app_lock_unlock_biometric", json!({})).await["ok"],
+            false
+        );
+
+        let status = ok(
+            r,
+            "app_lock_configure",
+            json!({"idleEnabled": true, "idleMinutes": 5, "method": "pin"}),
+        )
+        .await;
+        assert_eq!(status["idleEnabled"], true);
+        assert_eq!(status["idleMinutes"], 5);
+        let status = ok(r, "app_lock_clear_secret", json!({"current": "2468"})).await;
+        assert_eq!(status["secretSet"], false);
+
+        // Without a data dir there is no app-lock.json to root it at.
+        let e = err(&bare(None), "app_lock_status", json!({})).await;
+        assert!(e.contains("--data-dir"), "{e}");
     }
 }
