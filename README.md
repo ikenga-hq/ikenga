@@ -60,9 +60,8 @@ first-party pkgs.
 curl -fsSL https://ikenga.dev/install.sh | sh
 ```
 
-The script installs on Linux (x86_64) and Windows (under Git Bash). On macOS, download
-the universal `.dmg` (Apple Silicon and Intel) from the
-[Releases page](https://github.com/ikenga-hq/ikenga/releases) instead. To build from
+The script installs on macOS, Linux (x86_64) and Windows (under Git Bash). Installers are
+also on the [Releases page](https://github.com/ikenga-hq/ikenga/releases). To build from
 source, see Quickstart below.
 
 ## Quickstart
