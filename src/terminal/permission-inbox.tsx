@@ -1,16 +1,15 @@
-import { listen } from '@/lib/transport';
-import {
-	isNotificationPermissionGranted,
-	requestNotificationPermission,
-	sendNotification,
-} from '@/lib/transport';
 import { Bell, Check, ShieldAlert, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { iykeFetch } from '@/lib/iyke/client';
-import { notificationsList, settingsGet, settingsSet } from '@/lib/tauri-cmd';
+import { settingsGet, settingsSet } from '@/lib/tauri-cmd';
 import {
-	decidePermissionRow,
+	isNotificationPermissionGranted,
+	listen,
+	requestNotificationPermission,
+	sendNotification,
+} from '@/lib/transport';
+import {
+	decideHookRequest,
 	hostDecideBlock,
 	refreshHostDecideBlock,
 } from '@/shell/notifications/actions';
@@ -28,17 +27,6 @@ export interface PermissionRequestEntry {
 
 function holdSettingKey(sessionId: string) {
 	return `permissions.hold_terminal_${sessionId}`;
-}
-
-/** The `permission` row a held gate was recorded as (`permission:hook:<id>`). */
-async function hookRowId(requestId: string): Promise<number | null> {
-	try {
-		const rows = await notificationsList({ kinds: ['permission'], limit: 200 });
-		const key = `permission:hook:${requestId}`;
-		return rows.find((r) => r.dedupeKey === key && r.resolvedAt == null)?.id ?? null;
-	} catch {
-		return null;
-	}
 }
 
 export function PermissionInbox({ sessionId }: { sessionId: string }) {
@@ -163,26 +151,14 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 		setError(null);
 
 		// G-ACCESS §5.5: the held gate's row goes through `permission_decide`
-		// (routing-capped, attributed, audited); the hooks route is the
-		// fallback while the row is not recorded yet.
-		const rowId = await hookRowId(requestId);
-		if (rowId != null) {
-			const refused = await decidePermissionRow(
-				rowId,
-				decision === 'approved' ? 'allow_once' : 'deny',
-				requestId
-			);
-			if (refused) {
-				setError(refused);
-				setBlocked(hostDecideBlock());
-				return;
-			}
-		} else {
-			iykeFetch('/iyke/hooks/decision', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ requestId, decision }),
-			}).catch(() => {});
+		// (routing-capped, attributed, audited); the checked hooks route is the
+		// fallback while the row is not recorded yet. A refusal is shown,
+		// never presented as an answer (review WP75-R10).
+		const refused = await decideHookRequest(requestId, decision);
+		if (refused) {
+			setError(refused);
+			setBlocked(hostDecideBlock());
+			return;
 		}
 		setRequests((prev) => prev.map((r) => (r.id === id ? { ...r, status: decision } : r)));
 	};

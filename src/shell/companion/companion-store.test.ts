@@ -9,19 +9,32 @@ vi.mock('@/lib/iyke/client', () => ({ iykeFetch: (...a: unknown[]) => iykeFetch(
 
 const fsRead = vi.fn();
 const fsWriteText = vi.fn(async () => {});
+const notificationsList = vi.fn(async (): Promise<unknown[]> => []);
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	fsRead: (...a: unknown[]) => fsRead(...a),
 	fsWriteText: (...a: unknown[]) => fsWriteText(...(a as [])),
+	notificationsList: () => notificationsList(),
+}));
+
+const permissionDecide = vi.fn(
+	async (_id: number, _d: string): Promise<unknown> => ({
+		resolved: true,
+	})
+);
+vi.mock('@/lib/access/client', async (orig) => ({
+	...(await orig<typeof import('@/lib/access/client')>()),
+	permissionDecide: (id: number, d: string) => permissionDecide(id, d),
+	accessStatus: async () => null,
 }));
 
 import { useShellStore } from '@/lib/shell/shell-store';
 import {
-	PERMISSION_QUIET_MS,
-	PERMISSION_UNDO_MS,
 	__resetCompanionTimersForTests,
 	focusCompanion,
 	handToChi,
+	PERMISSION_QUIET_MS,
+	PERMISSION_UNDO_MS,
 	useCompanionStore,
 } from './companion-store';
 
@@ -53,6 +66,8 @@ beforeEach(() => {
 	vi.setSystemTime(new Date('2026-09-19T10:00:00Z'));
 	reset();
 	iykeFetch.mockClear();
+	notificationsList.mockClear();
+	permissionDecide.mockClear();
 	fsRead.mockReset();
 	fsWriteText.mockClear();
 });
@@ -263,6 +278,47 @@ describe('C3 — permission card resolve + undo (§5.6)', () => {
 			expect.objectContaining({ body: JSON.stringify({ requestId: 'r1', decision: 'approved' }) })
 		);
 		expect(st().permissions[0].ruleFile).toBe('/work/royalti-co/.claude/settings.json');
+	});
+
+	// Review WP75-R10: a refused decision never looks answered.
+	it('a refused hooks-route decision reads "Not answered here", not as an answer', async () => {
+		iykeFetch.mockImplementationOnce(async () => ({
+			ok: false,
+			status: 403,
+			json: async () => ({
+				recorded: false,
+				error: 'routing_refused: permission asks are answered on another device',
+			}),
+		}));
+		const st = useCompanionStore.getState;
+		st().receivePermission(req('r1'));
+		st().resolvePermission('r1', 'allow');
+		await vi.advanceTimersByTimeAsync(PERMISSION_UNDO_MS);
+		expect(iykeFetch).toHaveBeenCalledTimes(1);
+		expect(st().permissions[0]).toMatchObject({
+			status: 'resolved',
+			decision: undefined,
+			refused: true,
+			error: 'permission asks are answered on another device',
+		});
+	});
+
+	it('a recorded ask goes through permission_decide; its refusal is shown', async () => {
+		notificationsList.mockResolvedValue([
+			{ id: 42, dedupeKey: 'permission:hook:r1', resolvedAt: null },
+		]);
+		permissionDecide.mockRejectedValueOnce(new Error('conflict: the ask is already over'));
+		const st = useCompanionStore.getState;
+		st().receivePermission(req('r1'));
+		st().resolvePermission('r1', 'deny');
+		await vi.advanceTimersByTimeAsync(PERMISSION_UNDO_MS);
+		expect(permissionDecide).toHaveBeenCalledWith(42, 'deny');
+		expect(iykeFetch).not.toHaveBeenCalled();
+		expect(st().permissions[0]).toMatchObject({
+			refused: true,
+			error: 'the ask is already over',
+		});
+		notificationsList.mockResolvedValue([]);
 	});
 
 	it('keeps the last 20 cards', () => {

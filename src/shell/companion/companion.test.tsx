@@ -26,8 +26,16 @@ vi.mock('@/lib/transport', async (orig) => ({
 	sendNotification: vi.fn(),
 }));
 
-const iykeFetch = vi.fn(async () => ({ ok: false, json: async () => ({}) }));
-vi.mock('@/lib/iyke/client', () => ({ iykeFetch: (...a: unknown[]) => iykeFetch(...(a as [])) }));
+// The hook gate takes decisions (a refused one is covered in
+// companion-store.test.ts); every other iyke endpoint is unavailable here.
+const iykeFetch = vi.fn(async (path?: unknown) => ({
+	ok: path === '/iyke/hooks/decision',
+	status: path === '/iyke/hooks/decision' ? 200 : 503,
+	json: async () => ({}),
+}));
+vi.mock('@/lib/iyke/client', () => ({
+	iykeFetch: (...a: unknown[]) => iykeFetch(...(a as [unknown])),
+}));
 
 const ptyWrite = vi.fn(async () => {});
 const chiRun = vi.fn(async () => ({ run_id: 'run-1', status: 'queued' }));
@@ -59,8 +67,8 @@ import { CostHud } from '@/terminal/cost-hud';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
 import { COMPANION_FOCUS_EVENT, Companion } from './companion';
 import {
-	PERMISSION_UNDO_MS,
 	__resetCompanionTimersForTests,
+	PERMISSION_UNDO_MS,
 	useCompanionStore,
 } from './companion-store';
 
@@ -618,7 +626,9 @@ describe('C4 — drag between the Companion rail and the pane tree', () => {
 			focusedId: 'L1',
 		});
 		wrap(<Companion />);
-		fireEvent.contextMenu(document.querySelector('[role="option"][data-session="term-q"]') as HTMLElement);
+		fireEvent.contextMenu(
+			document.querySelector('[role="option"][data-session="term-q"]') as HTMLElement
+		);
 		fireEvent.click(screen.getByRole('menuitem', { name: 'Move to pane' }));
 		const leaf = usePaneStore.getState().root;
 		expect(leaf.type === 'leaf' && leaf.tabs.at(-1)).toEqual({

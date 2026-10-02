@@ -14,12 +14,12 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { iykeFetch } from '@/lib/iyke/client';
 import type { PaneView } from '@/lib/panes/types';
 import { cachedSeats } from '@/lib/queries/seats';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { fsRead, fsWriteText } from '@/lib/tauri-cmd';
 import { scopedPersistName } from '@/lib/window/window-context';
+import { decideHookRequest } from '@/shell/notifications/actions';
 
 export type CompanionState = 'collapsed' | 'expanded' | 'hidden';
 
@@ -27,7 +27,9 @@ export type CompanionState = 'collapsed' | 'expanded' | 'hidden';
  *  dispatch target and the panel scope together (G-SEATS §9.1); a
  *  *New session on…* / *Persistent run* target moves the chip without
  *  moving the selection (D-09). Not persisted, like the target. */
-export type RailSelection = { kind: 'seat'; seat_id: string } | { kind: 'session'; session_id: string };
+export type RailSelection =
+	| { kind: 'seat'; seat_id: string }
+	| { kind: 'session'; session_id: string };
 
 export const COMPANION_MIN_WIDTH = 280;
 export const COMPANION_MAX_WIDTH = 900;
@@ -65,6 +67,9 @@ export interface PermissionCardEntry {
 	appliedElsewhere?: boolean;
 	/** Settings file an "Always for this project" decision wrote. */
 	ruleFile?: string;
+	/** The decision was refused (routed to another device, already over, …):
+	 *  the card reads "Not answered here", never as an answer. */
+	refused?: boolean;
 	error?: string;
 }
 
@@ -158,14 +163,6 @@ function scopeFor(view: PaneView | undefined): string | null {
 	return view?.kind === 'terminal' ? view.sessionId : null;
 }
 
-async function postDecision(requestId: string, decision: 'approved' | 'denied') {
-	await iykeFetch('/iyke/hooks/decision', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ requestId, decision }),
-	});
-}
-
 /** "Always for this project" — add the tool to `permissions.allow` in
  *  `<project>/.claude/settings.json`. Returns the file written. */
 async function writeProjectAllowRule(toolName: string): Promise<string> {
@@ -206,7 +203,18 @@ export const useCompanionStore = create<CompanionStoreState>()(
 				try {
 					let ruleFile: string | undefined;
 					if (card.decision === 'always') ruleFile = await writeProjectAllowRule(card.toolName);
-					await postDecision(id, card.decision === 'deny' ? 'denied' : 'approved');
+					// G-ACCESS §5.5 (review WP75-R10): through `permission_decide`
+					// when the ask's row is recorded, else the checked hooks
+					// route — a refusal (e.g. `routing_refused`, §5.1) is shown,
+					// never presented as an answer.
+					const refused = await decideHookRequest(
+						id,
+						card.decision === 'deny' ? 'denied' : 'approved'
+					);
+					if (refused) {
+						patchCard(id, { decision: undefined, refused: true, error: refused, ruleFile });
+						return;
+					}
 					if (ruleFile) patchCard(id, { ruleFile });
 				} catch (e) {
 					patchCard(id, { error: e instanceof Error ? e.message : String(e) });
