@@ -3,6 +3,8 @@
 //! in `src/lib/tauri-cmd.ts` mirror this, so later phases just fill in the
 //! Rust side.
 
+// G-ACCESS (WP-74a): the `access_*` desktop proxies and `permission_decide`.
+pub mod access;
 pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;

@@ -158,11 +158,7 @@ impl PaDb {
 /// the test still expected 61, and nothing caught it because the Rust tests
 /// were not running in CI.
 const MIGRATIONS: &[(i64, &str, &str)] = &[
-    (
-        1,
-        "0001_init",
-        include_str!("../migrations/0001_init.sql"),
-    ),
+    (1, "0001_init", include_str!("../migrations/0001_init.sql")),
     (
         2,
         "0002_viewer_recents",
@@ -606,6 +602,14 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         69,
         "0069_pkg_scope_default_personal",
         include_str!("../migrations/0069_pkg_scope_default_personal.sql"),
+    ),
+    // G-ACCESS §8.4 (WP-74a): attribution columns on `shell_notifications`
+    // and `artifact_comments` (filled by WP-75 / WP-76). 0071 is reserved for
+    // remote-access WP-21, only if it needs one.
+    (
+        70,
+        "0070_access_attribution",
+        include_str!("../migrations/0070_access_attribution.sql"),
     ),
 ];
 
@@ -1602,7 +1606,10 @@ mod tests {
                 .fetch_all(&writer)
                 .await
                 .unwrap_or_else(|e| panic!("table_info({table}): {e}"));
-            assert!(!rows.is_empty(), "WP-05 meetings table `{table}` must exist");
+            assert!(
+                !rows.is_empty(),
+                "WP-05 meetings table `{table}` must exist"
+            );
             let present: std::collections::HashSet<String> =
                 rows.iter().map(|r| r.get::<String, _>("name")).collect();
             for col in *cols {
@@ -1620,8 +1627,10 @@ mod tests {
         .fetch_all(&writer)
         .await
         .expect("fetch indexes");
-        let idx_names: std::collections::HashSet<String> =
-            idx_rows.iter().map(|r| r.get::<String, _>("name")).collect();
+        let idx_names: std::collections::HashSet<String> = idx_rows
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
         for expected_idx in [
             "idx_meetings_status",
             "idx_meetings_created_at",
@@ -1697,7 +1706,10 @@ mod tests {
 
         // Step 2: Now open PaDb (as desktop app would on startup). ensure_pool() runs ensure_schema().
         let pa_db = PaDb::new(db_path.clone());
-        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+        let writer = pa_db
+            .ensure_pool()
+            .await
+            .expect("ensure_pool on existing DB");
 
         // Verify migration 63 was applied and recorded
         let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
@@ -1711,14 +1723,16 @@ mod tests {
             MIGRATIONS.len(),
             "expected every embedded migration recorded after startup"
         );
-        assert!(applied.contains(&63), "migration 63 must be in _pa_migrations");
+        assert!(
+            applied.contains(&63),
+            "migration 63 must be in _pa_migrations"
+        );
 
         // Verify meetings table exists and is queryable
-        let meetings_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
-                .fetch_one(&writer)
-                .await
-                .expect("select from meetings");
+        let meetings_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+            .fetch_one(&writer)
+            .await
+            .expect("select from meetings");
         assert_eq!(meetings_count, 0);
     }
 
@@ -1780,7 +1794,10 @@ mod tests {
 
         // Open PaDb — ensure_pool() should apply migration 64
         let pa_db = PaDb::new(db_path.clone());
-        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+        let writer = pa_db
+            .ensure_pool()
+            .await
+            .expect("ensure_pool on existing DB");
 
         let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
             .fetch_all(&writer)
@@ -1791,7 +1808,10 @@ mod tests {
             MIGRATIONS.len(),
             "expected every embedded migration recorded after startup"
         );
-        assert!(applied.contains(&64), "migration 64 must be in _pa_migrations");
+        assert!(
+            applied.contains(&64),
+            "migration 64 must be in _pa_migrations"
+        );
 
         // Verify the three 0064 tables exist (DEC-27 / DEC-28 schema)
         for table in ["ngwa_usage_sessions", "ngwa_usage_turns"] {
@@ -1803,17 +1823,19 @@ mod tests {
         }
         // UNIQUE(kind, name, session_key) is what makes rescans idempotent.
         let insert = "INSERT INTO ngwa_usage_sessions (kind, name, session_key, first_used_ms, last_used_ms, source_path) VALUES ('skill', 'gw', 's1', 1, 1, 'f')";
-        sqlx::query(insert).execute(&writer).await.expect("first insert");
+        sqlx::query(insert)
+            .execute(&writer)
+            .await
+            .expect("first insert");
         assert!(
             sqlx::query(insert).execute(&writer).await.is_err(),
             "duplicate (kind, name, session_key) must violate the UNIQUE constraint"
         );
 
-        let files_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_transcript_files")
-                .fetch_one(&writer)
-                .await
-                .expect("select from ngwa_transcript_files");
+        let files_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ngwa_transcript_files")
+            .fetch_one(&writer)
+            .await
+            .expect("select from ngwa_transcript_files");
         assert_eq!(files_count, 0);
     }
 
@@ -1914,13 +1936,19 @@ mod tests {
 
         // Open PaDb as the desktop app would: ensure_pool() applies 0065 only.
         let pa_db = PaDb::new(db_path.clone());
-        let writer = pa_db.ensure_pool().await.expect("ensure_pool on existing DB");
+        let writer = pa_db
+            .ensure_pool()
+            .await
+            .expect("ensure_pool on existing DB");
         let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations ORDER BY id ASC")
             .fetch_all(&writer)
             .await
             .expect("fetch applied");
         assert_eq!(applied.len(), MIGRATIONS.len());
-        assert!(applied.contains(&65), "migration 65 must be in _pa_migrations");
+        assert!(
+            applied.contains(&65),
+            "migration 65 must be in _pa_migrations"
+        );
         for (table, want) in [
             ("ngwa_usage_sessions", 0i64),
             ("ngwa_transcript_files", 0),
@@ -1938,7 +1966,10 @@ mod tests {
         let report = usage::scan_and_mirror_transcripts(&writer, corpus.path())
             .await
             .expect("scan");
-        assert_eq!(report.files_read, 2, "the reset watermarks force a full re-read");
+        assert_eq!(
+            report.files_read, 2,
+            "the reset watermarks force a full re-read"
+        );
         let owned = usage::load_owned_sessions(&writer).await.expect("owned");
         let for_item = |name: &str| -> Vec<String> {
             owned
@@ -2016,7 +2047,10 @@ mod tests {
             "external INSERT must be immediately visible to reader pool"
         );
         let m = rows_after_insert[0].as_object().unwrap();
-        assert_eq!(m.get("title").and_then(Value::as_str), Some("External Meeting"));
+        assert_eq!(
+            m.get("title").and_then(Value::as_str),
+            Some("External Meeting")
+        );
 
         // Simulate external DELETE
         sqlx::query("DELETE FROM meetings WHERE id = ?")
@@ -2266,5 +2300,93 @@ mod tests {
             pkg_scopes(&pool).await,
             vec![("com.test.personal".to_string(), None)]
         );
+    }
+
+    /// G-ACCESS §8.4: 0070 applies on a db at 0069 that already holds a
+    /// notification and a comment; existing rows read the defaults.
+    #[tokio::test]
+    async fn migration_0070_adds_attribution_columns_to_existing_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_69.db");
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 70) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO shell_notifications (kind, title, source, created_at, updated_at)
+             VALUES ('permission', 'Allow Bash?', 'iyke.hooks', 1, 1)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        drop(raw_pool);
+
+        let db = PaDb::new(db_path);
+        let pool = db.ensure_pool().await.expect("ensure_pool at 0069");
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(applied.contains(&70));
+        let row: (
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT requested_by, project_id, sensitive, decided_by, decided_via, decided_device \
+                 FROM shell_notifications",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (None, None, 0, None, None, None));
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('artifact_comments')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(cols.iter().any(|c| c == "author_principal_id"), "{cols:?}");
+        let idx: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_shell_notifications_project'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx, 1);
     }
 }
