@@ -3169,6 +3169,8 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "hkdf",
+ "hmac",
  "image",
  "include_dir",
  "keyring",

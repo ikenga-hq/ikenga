@@ -19,6 +19,10 @@
 //! below only installs it.
 
 // --- Headless core: compiled into BOTH binaries ---
+// G-ACCESS (WP-74a): capabilities, the access store, devices, the audit
+// chain and the hooks every daemon request passes. The desktop never opens
+// the store (P-20); its `access_*` commands proxy to the daemon.
+pub mod access;
 // `db` holds PaDb + the embedded migration set; `commands::db` keeps only the
 // two #[tauri::command] wrappers and re-exports PaDb.
 pub mod db;
