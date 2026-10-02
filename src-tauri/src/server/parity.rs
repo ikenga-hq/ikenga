@@ -42,6 +42,9 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///
 /// * `pty_list` — legacy alias of `pty_terminal_list`, same arm.
 /// * `fs_home` — the browser has no `@tauri-apps/api/path` `homeDir()`.
+/// * `secrets_default_names` (WP-78a, review WP76-RV1) — the operator
+///   default's names, a layer only the daemon has (the desktop keychain has
+///   no `IKENGA_SECRET_*` default).
 /// * G-ACCESS §9.1 (WP-74a): `notifications_record_access` and
 ///   `share_project_info` are `internal` arms (broker → owner child only);
 ///   the three `permission_relay_*` arms are called only by the desktop's
@@ -53,6 +56,7 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "permission_relay_resolve",
     "permission_relay_take",
     "pty_list",
+    "secrets_default_names",
     "share_project_info",
 ];
 

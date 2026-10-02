@@ -334,7 +334,15 @@ impl DaemonAccess {
     /// no `--data-dir` — or a store that refuses to open (a newer schema, a
     /// T1 store) — the daemon still serves, but every store-backed access
     /// arm answers `store_unavailable` and pairing is off.
-    pub async fn boot_t0(data_dir: Option<&Path>, options: AccessOptions) -> Arc<Self> {
+    ///
+    /// `pa_db` is `run_server`'s own `<data-dir>/ikenga.db` handle (the one
+    /// its router serves): the decide core and the relay share it, so the
+    /// daemon keeps one writer pool (review WP75-R9).
+    pub async fn boot_t0(
+        data_dir: Option<&Path>,
+        pa_db: Option<Arc<crate::db::PaDb>>,
+        options: AccessOptions,
+    ) -> Arc<Self> {
         let host = HostIdentity::detect();
         let store = match data_dir {
             None => None,
@@ -342,7 +350,9 @@ impl DaemonAccess {
                 Ok(s) => {
                     // WP-75: the decide core and the ask relay over this
                     // daemon's `ikenga.db` and chain (§5.5).
-                    crate::server::shared::notifications::routing::install_daemon(s.clone(), dir);
+                    if let Some(rt) = Self::daemon_routing(&s, pa_db) {
+                        crate::server::shared::notifications::routing::install_daemon(rt);
+                    }
                     Some(s)
                 }
                 Err(e) => {
@@ -355,6 +365,27 @@ impl DaemonAccess {
             },
         };
         Self::build(DaemonMode::T0, store, options)
+    }
+
+    /// The routing runtime `boot_t0` installs: over exactly the `pa_db`
+    /// handle it was given (`run_server`'s), never a second `PaDb` (review
+    /// WP75-R9). `None` (routing off) without one.
+    fn daemon_routing(
+        store: &AccessStore,
+        pa_db: Option<Arc<crate::db::PaDb>>,
+    ) -> Option<crate::server::shared::notifications::routing::DaemonRouting> {
+        match pa_db {
+            Some(db) => Some(
+                crate::server::shared::notifications::routing::DaemonRouting::new(
+                    store.clone(),
+                    db,
+                ),
+            ),
+            None => {
+                tracing::warn!("no ikenga.db handle: permission routing (the ask relay) is off");
+                None
+            }
+        }
     }
 
     /// A T1 principal child: never opens or creates `access.db` (A-32).
@@ -623,6 +654,19 @@ mod tests {
             },
             tier,
         )
+    }
+
+    /// Review WP78a-R4 (WP75-R9): `boot_t0` installs a routing runtime
+    /// over exactly the `pa_db` handle `run_server` passed it — the same
+    /// `Arc`, so the daemon keeps one writer pool — and none without one.
+    #[tokio::test]
+    async fn boot_t0_routes_over_the_servers_db_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::PaDb::new(tmp.path().join("ikenga.db")));
+        let store = AccessStore::memory_t0().await;
+        let rt = DaemonAccess::daemon_routing(&store, Some(db.clone())).unwrap();
+        assert!(Arc::ptr_eq(&rt.db, &db));
+        assert!(DaemonAccess::daemon_routing(&store, None).is_none());
     }
 
     #[test]

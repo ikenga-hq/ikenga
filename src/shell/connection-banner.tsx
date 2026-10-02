@@ -49,6 +49,41 @@ export function ConnectionBanner() {
 		return () => clearInterval(timer);
 	}, [info.state, countdown]);
 
+	// G-ACCESS §3.10: a socket closed on purpose says so, not "reconnecting".
+	if (info.access) {
+		const revoked = info.access.kind === 'revoked';
+		return (
+			<div
+				className="flex items-center gap-2.5 px-4 py-2 text-xs border-b"
+				style={{
+					background: revoked
+						? 'var(--danger-soft)'
+						: 'var(--warning-soft, rgba(234, 179, 8, 0.12))',
+					borderColor: 'var(--border-soft, rgba(234, 179, 8, 0.25))',
+					fontSize: 'var(--text-body-sm, 13px)',
+				}}
+				data-testid="connection-banner"
+				data-state={revoked ? 'connection-access-revoked' : 'connection-access-changed'}
+			>
+				<span
+					className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+					style={{ background: revoked ? 'var(--danger)' : 'var(--warning, #eab308)' }}
+				/>
+				<b
+					className="font-semibold"
+					style={{ color: revoked ? 'var(--danger)' : 'var(--warning, #eab308)' }}
+				>
+					{revoked ? 'Signed out' : 'Access changed'}
+				</b>
+				<span className="text-muted-foreground">
+					{revoked
+						? "— this device's access was revoked or its session ended. Sign in again; your work keeps running on the host."
+						: "— reconnecting with this device's new permissions. If it doesn't come back, this device no longer has access here."}
+				</span>
+			</div>
+		);
+	}
+
 	if (info.state === 'connected') return null;
 
 	return (

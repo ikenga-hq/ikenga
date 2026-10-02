@@ -46,13 +46,11 @@ import { EmptyState, ErrorState, LoadingState } from '@/components/states';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { cn } from '@/components/ui/utils';
-import { iykeFetch } from '@/lib/iyke/client';
 import { completeTodo, listTodos, type Todo } from '@/lib/iyke/memory';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { usePkgsDerived } from '@/lib/pkgs/use-derived';
 import { useUpdatePkgs } from '@/lib/pkgs/use-update-pkgs';
-import { queryKeys } from '@/lib/query-keys';
 import {
 	invalidateNotifications,
 	isNotificationResolved,
@@ -60,12 +58,14 @@ import {
 	notificationsListQueryOptions,
 	useMarkAllNotificationsRead,
 } from '@/lib/queries/notifications';
+import { queryKeys } from '@/lib/query-keys';
 import { readSettingsFile } from '@/lib/settings/client';
 import { isDailyAddressEnabled } from '@/lib/settings/daily-address';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { chiList, type ChiCacheRow, type NotificationRow } from '@/lib/tauri-cmd';
+import { type ChiCacheRow, chiList, type NotificationRow } from '@/lib/tauri-cmd';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { useUpdater } from '@/lib/updater/use-updater';
+import { decideHookRequest } from '@/shell/notifications/actions';
 import { runConsecrationAgain } from '@/shell/onboarding/run-again';
 
 /** Local (not UTC) calendar date, `YYYY-MM-DD`. Deliberately not
@@ -201,7 +201,7 @@ export function isUnderProjectRoot(cwd: string | null | undefined, root: string)
  */
 export function projectRecentRuns(
 	rows: readonly ChiCacheRow[],
-	projectRoot: string | null,
+	projectRoot: string | null
 ): ChiCacheRow[] {
 	return rows
 		.filter(isRecentOrActive)
@@ -295,8 +295,9 @@ function RunsTile() {
 // the user glanced at in the bell is still waiting. The mock
 // (designs/onboarding.html `renderDash`) answers inline; here that is done
 // as far as the row's action allows:
-//   - `permission.decide` (the held hooks gate): Allow once / Deny, posted to
-//     `/iyke/hooks/decision` like the permission inbox. The mock's "Always
+//   - `permission.decide` (the held hooks gate): Allow once / Deny, through
+//     `permission_decide` like the permission inbox (the checked hooks route
+//     while the row isn't recorded); a refusal is shown. The mock's "Always
 //     for this project" has no backend path for a gate answer, so it is not
 //     offered.
 //   - `open.terminal` / `open.thread` (Claude Code's own terminal prompt, ACP
@@ -324,17 +325,12 @@ function openTerminalPane(sessionId: string): void {
 	addTab(focusedId, { kind: 'terminal', sessionId });
 }
 
-function postHookDecision(requestId: string, decision: 'approved' | 'denied'): Promise<unknown> {
-	return iykeFetch('/iyke/hooks/decision', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ requestId, decision }),
-	}).catch(() => {});
-}
-
 function PermissionActions({ row, onDecided }: { row: NotificationRow; onDecided: () => void }) {
 	const navigateFocused = usePaneStore((s) => s.navigateFocused);
 	const decision = notificationDecision(row);
+	// A refused decision (routed to another device, already over, …) keeps
+	// the row and says why — it never looks answered (review WP75-R10).
+	const [refused, setRefused] = useState<string | null>(null);
 
 	if (decision) {
 		const decide = async (d: 'approved' | 'denied') => {
@@ -345,11 +341,25 @@ function PermissionActions({ row, onDecided }: { row: NotificationRow; onDecided
 				);
 				if (!ok) return;
 			}
-			await postHookDecision(decision.requestId, d);
+			const why = await decideHookRequest(decision.requestId, d);
+			if (why) {
+				setRefused(why);
+				return;
+			}
 			onDecided();
 		};
 		return (
 			<span className="mr-1 flex shrink-0 items-center gap-1">
+				{refused && (
+					<span
+						role="alert"
+						data-state="daily-address-permission-refused"
+						className="max-w-[16rem] truncate text-[11px] text-[var(--danger)]"
+						title={refused}
+					>
+						{refused}
+					</span>
+				)}
 				<Button type="button" size="sm" onClick={() => void decide('approved')}>
 					Allow once
 				</Button>
@@ -386,7 +396,12 @@ function PermissionsTile() {
 	const { pending, isLoading, isError, refetch } = usePendingPermissions();
 
 	if (isLoading) {
-		return <LoadingState data-state="daily-address-permissions-loading" heading="Checking permissions…" />;
+		return (
+			<LoadingState
+				data-state="daily-address-permissions-loading"
+				heading="Checking permissions…"
+			/>
+		);
 	}
 	if (isError) {
 		return (
@@ -446,7 +461,9 @@ function UpdatesTile() {
 	);
 
 	if (isLoading) {
-		return <LoadingState data-state="daily-address-updates-loading" heading="Checking for updates…" />;
+		return (
+			<LoadingState data-state="daily-address-updates-loading" heading="Checking for updates…" />
+		);
 	}
 	if (isError) {
 		return (
@@ -465,7 +482,9 @@ function UpdatesTile() {
 	// check) resolve after mount — don't report "up to date" before either
 	// has actually checked, or a real update can flash as absent for a beat.
 	if (nothingToShow && (derived.isLoading || updater.checking)) {
-		return <LoadingState data-state="daily-address-updates-loading" heading="Checking for updates…" />;
+		return (
+			<LoadingState data-state="daily-address-updates-loading" heading="Checking for updates…" />
+		);
 	}
 	if (nothingToShow) {
 		return (
@@ -523,7 +542,12 @@ function UpdatesTile() {
 				<Row
 					name="Installed — restart to finish"
 					actions={
-						<Button type="button" size="sm" variant="outline" onClick={() => void updater.restart()}>
+						<Button
+							type="button"
+							size="sm"
+							variant="outline"
+							onClick={() => void updater.restart()}
+						>
 							Restart
 						</Button>
 					}
@@ -659,7 +683,9 @@ export function summarizeDay(parts: {
 		}
 	}
 	if (parts.pending != null && parts.pending > 0) {
-		bits.push(`${plural(parts.pending, 'permission')} ${parts.pending === 1 ? 'is' : 'are'} waiting on you`);
+		bits.push(
+			`${plural(parts.pending, 'permission')} ${parts.pending === 1 ? 'is' : 'are'} waiting on you`
+		);
 	}
 	if (parts.openTodos != null) {
 		bits.push(`${plural(parts.openTodos, 'todo')} ${parts.openTodos === 1 ? 'is' : 'are'} open`);
@@ -684,7 +710,10 @@ function Greeting() {
 				{name ? `, ${name}` : ''}.
 			</span>
 			{summary && (
-				<span data-testid="daily-address-summary" className="text-xs font-normal text-muted-foreground">
+				<span
+					data-testid="daily-address-summary"
+					className="text-xs font-normal text-muted-foreground"
+				>
 					{summary}
 				</span>
 			)}
@@ -730,7 +759,9 @@ export function DailyAddress() {
 		<section
 			data-state="daily-address"
 			aria-label="Daily address"
-			className={cn('mb-4 flex flex-col gap-2 rounded-[var(--radius-md)] border border-border bg-card p-3')}
+			className={cn(
+				'mb-4 flex flex-col gap-2 rounded-[var(--radius-md)] border border-border bg-card p-3'
+			)}
 		>
 			<div className="flex items-start justify-between gap-2 px-1">
 				<Greeting />

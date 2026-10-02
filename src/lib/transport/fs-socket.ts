@@ -25,6 +25,8 @@
  */
 
 import type { FileChange } from '../tauri-cmd';
+import { connectionStateStore } from './connection-state';
+import { capsReconnectAllowed, handleAccessClose } from './ws-close';
 
 /** Longest backoff between reconnect attempts. */
 const MAX_BACKOFF_MS = 16_000;
@@ -138,6 +140,7 @@ class FsSocketClient {
 		ws.onopen = () => {
 			this.open = true;
 			this.attempt = 0;
+			connectionStateStore.socketConnected('fs');
 			// Re-issue every live watch. On a first connect this is empty and
 			// the outbox already holds the initial `watch` frame.
 			for (const [handleId, handle] of this.handles) {
@@ -168,13 +171,21 @@ class FsSocketClient {
 			console.warn('[fs-socket] WebSocket error:', err);
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (ev?: CloseEvent) => {
 			this.open = false;
 			this.ws = null;
 			// Every server id died with the connection.
 			this.byServerId.clear();
 			for (const handle of this.handles.values()) handle.serverId = null;
-			if (this.handles.size === 0) return;
+			// G-ACCESS §3.10: 4401 → the re-auth overlay, and no retry (it
+			// would be refused); 4403 → reconnect now with the new caps.
+			const access = handleAccessClose(ev?.code, ev?.reason);
+			if (access === 'revoked' || this.handles.size === 0) return;
+			if (access === 'caps_changed' && capsReconnectAllowed(this)) {
+				this.attempt = 0;
+				this.connect();
+				return;
+			}
 			this.scheduleReconnect();
 		};
 	}

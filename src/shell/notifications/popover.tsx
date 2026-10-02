@@ -11,7 +11,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { Bell, MoreHorizontal } from 'lucide-react';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { EmptyState } from '@/components/states';
 import {
 	DropdownMenu,
@@ -33,7 +33,12 @@ import {
 } from '@/lib/queries/notifications';
 import { formatRelativeTime } from '@/lib/relative-time';
 import type { NotificationKind, NotificationRow } from '@/lib/tauri-cmd';
-import { notificationActionButtons } from './actions';
+import {
+	hostDecideBlock,
+	notificationActionButtons,
+	notificationBlockedReason,
+	refreshHostDecideBlock,
+} from './actions';
 
 /** Where the Workspace settings section (which owns
  *  `workspace.notifications.mutedKinds`) lives. */
@@ -60,9 +65,12 @@ function KindTag({ kind }: { kind: NotificationKind }) {
 	);
 }
 
-function NotificationRowItem({ row }: { row: NotificationRow }) {
+function NotificationRowItem({ row, block }: { row: NotificationRow; block: string | null }) {
 	const markRead = useMarkNotificationsRead();
-	const buttons = useMemo(() => notificationActionButtons(row), [row]);
+	const buttons = useMemo(() => notificationActionButtons(row, Date.now(), block), [row, block]);
+	// G-ACCESS §5.7: a routed-away ask shows where it is answered instead of
+	// a dead Allow / Deny.
+	const blocked = notificationBlockedReason(row, Date.now(), block);
 	const unread = row.readAt == null;
 
 	function act(button: ReturnType<typeof notificationActionButtons>[number]) {
@@ -88,6 +96,14 @@ function NotificationRowItem({ row }: { row: NotificationRow }) {
 				</span>
 			</div>
 			{row.body && <p className="truncate text-[11px] text-muted-foreground">{row.body}</p>}
+			{blocked && (
+				<p
+					data-state="notification-routed-away"
+					className="rounded-[var(--radius-xs)] border border-dashed border-[var(--border-strong)] px-2 py-1 text-[10px] leading-snug text-muted-foreground"
+				>
+					{blocked}
+				</p>
+			)}
 			{buttons.length > 0 && (
 				<div className="flex items-center gap-1.5 pt-0.5">
 					{buttons.map((button) => (
@@ -134,6 +150,18 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 	const setKindMuted = useSetNotificationKindMuted();
 
 	const rows = listQuery.data ?? [];
+	// §5.1: re-read the host's routing when the popover opens, so a
+	// routed-away ask shows its reason (and no Allow / Deny) right away.
+	const [block, setBlock] = useState<string | null>(() => hostDecideBlock());
+	useEffect(() => {
+		let live = true;
+		void refreshHostDecideBlock().then((b) => {
+			if (live) setBlock(b);
+		});
+		return () => {
+			live = false;
+		};
+	}, []);
 	const { today, earlier } = useMemo(() => groupNotificationsByDay(rows), [rows]);
 	const hasAny = rows.length > 0;
 	const muted = new Set(muteQuery.data?.muted ?? []);
@@ -175,7 +203,9 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 							<DropdownMenuCheckboxItem
 								key={kind}
 								checked={muted.has(kind)}
-								onCheckedChange={(checked) => setKindMuted.mutate({ kind, muted: checked === true })}
+								onCheckedChange={(checked) =>
+									setKindMuted.mutate({ kind, muted: checked === true })
+								}
 							>
 								{KIND_META[kind].label}
 							</DropdownMenuCheckboxItem>
@@ -202,7 +232,7 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 						<div>
 							<GroupHeader label="Today" />
 							{today.map((row) => (
-								<NotificationRowItem key={row.id} row={row} />
+								<NotificationRowItem key={row.id} row={row} block={block} />
 							))}
 						</div>
 					)}
@@ -210,7 +240,7 @@ export function NotificationsPopoverContent({ onClose }: NotificationsPopoverCon
 						<div>
 							<GroupHeader label="Earlier" />
 							{earlier.map((row) => (
-								<NotificationRowItem key={row.id} row={row} />
+								<NotificationRowItem key={row.id} row={row} block={block} />
 							))}
 						</div>
 					)}

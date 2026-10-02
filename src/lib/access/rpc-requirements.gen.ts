@@ -165,6 +165,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	pty_terminal_list: { caps: ['sessions'], class: 'owner' },
 	pty_write: { caps: ['dispatch'], class: 'owner' },
 	scaffold_agent_config: { caps: ['settings'], class: 'owner' },
+	secrets_default_names: { caps: ['settings'], class: 'owner' },
 	secrets_delete: { caps: ['settings', 'secrets'], class: 'owner' },
 	secrets_delete_scoped: { caps: ['settings', 'secrets'], class: 'owner' },
 	secrets_get: { caps: ['secrets'], class: 'owner' },

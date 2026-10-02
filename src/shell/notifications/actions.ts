@@ -36,7 +36,7 @@ import {
 import { iykeFetch } from '@/lib/iyke/client';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
-import type { NotificationRow } from '@/lib/tauri-cmd';
+import { type NotificationRow, notificationsList } from '@/lib/tauri-cmd';
 
 // Duplicated from `src/shell/status-bar.tsx`'s `NGWA_LINKS` rather than
 // imported: this module is reached from the popover, and `status-bar.tsx`
@@ -61,15 +61,82 @@ function openTerminalPane(sessionId: string): void {
 	addTab(focusedId, { kind: 'terminal', sessionId });
 }
 
-/** The pre-WP-75 path for the held hooks gate — kept as the fallback when
- *  the decide core can't take the row (an older backend, or the row not
- *  recorded yet). Best-effort. */
-export function postHookDecision(requestId: string, decision: 'approved' | 'denied'): void {
-	void iykeFetch('/iyke/hooks/decision', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ requestId, decision }),
-	}).catch(() => {});
+/** What a decision that reached no live ask reads as (review WP78a-R5). */
+export const ASK_ALREADY_OVER = 'This ask is already over';
+
+/**
+ * The pre-WP-75 path for the held hooks gate — the fallback when the decide
+ * core can't take the row (an older backend, or the row not recorded yet).
+ * Checked (review WP75-R10): resolves to `null` when the gate took the
+ * decision, else the refusal message (or {@link ASK_ALREADY_OVER} when no
+ * held gate took it), so a refused decision never looks answered. A `routing_refused` reply re-reads the host's routing and names
+ * where the ask is answered (§5.7).
+ */
+export async function postHookDecision(
+	requestId: string,
+	decision: 'approved' | 'denied'
+): Promise<string | null> {
+	let res: Response;
+	try {
+		res = await iykeFetch('/iyke/hooks/decision', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ requestId, decision }),
+		});
+	} catch (e) {
+		return `Couldn't reach the permission gate: ${e instanceof Error ? e.message : String(e)}`;
+	}
+	if (res.ok) {
+		// A 2xx with `gated: false` took nothing: the hold was already over
+		// (answered, timed out as deny) — never presented as answered
+		// (review WP78a-R5). No body / no flag: an older backend, answered.
+		try {
+			const body = (await res.json()) as { gated?: unknown };
+			if (body?.gated === false) return ASK_ALREADY_OVER;
+		} catch {
+			// No JSON body.
+		}
+		return null;
+	}
+	let raw = '';
+	try {
+		const body = (await res.json()) as { error?: unknown };
+		if (typeof body?.error === 'string') raw = body.error;
+	} catch {
+		// Not JSON: the status line below says what happened.
+	}
+	const { code, message } = parseAccessError(raw || `HTTP ${res.status}`);
+	if (code === 'routing_refused') return (await refreshHostDecideBlock()) ?? message;
+	return message || `The decision was refused (HTTP ${res.status})`;
+}
+
+/** The open `permission` row a held gate was recorded as
+ *  (`permission:hook:<requestId>`), or `null`. */
+export async function hookRowId(requestId: string): Promise<number | null> {
+	try {
+		const rows = await notificationsList({ kinds: ['permission'], limit: 200 });
+		const key = `permission:hook:${requestId}`;
+		return rows.find((r) => r.dedupeKey === key && r.resolvedAt == null)?.id ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Decide a held hooks-gate ask by its request id (the Companion's permission
+ * cards, the home "Waiting on you" tile): through `permission_decide` when
+ * its row is recorded (§5.5), else the checked hooks route. Resolves to the
+ * refusal message, or `null` when decided.
+ */
+export async function decideHookRequest(
+	requestId: string,
+	decision: 'approved' | 'denied'
+): Promise<string | null> {
+	const rowId = await hookRowId(requestId);
+	if (rowId != null) {
+		return decidePermissionRow(rowId, decision === 'denied' ? 'deny' : 'allow_once', requestId);
+	}
+	return postHookDecision(requestId, decision);
 }
 
 // ── G-ACCESS §5.5 / §5.7 (WP-75): one decide core ──────────────────────────
@@ -107,8 +174,7 @@ export async function decidePermissionRow(
 		const { code, message } = parseAccessError(e);
 		if (code === 'routing_refused') void refreshHostDecideBlock();
 		if (hookRequestId && (code === null || !FINAL_DECIDE_CODES.has(code))) {
-			postHookDecision(hookRequestId, decision === 'deny' ? 'denied' : 'approved');
-			return null;
+			return postHookDecision(hookRequestId, decision === 'deny' ? 'denied' : 'approved');
 		}
 		return message;
 	}
@@ -178,6 +244,26 @@ export function isPermissionAskLive(row: NotificationRow, now: number = Date.now
 	if (row.resolvedAt != null) return false;
 	if (row.resolvedAt === undefined && row.readAt != null) return false;
 	return now - row.createdAt < HOOK_GATE_ANSWERABLE_MS;
+}
+
+/**
+ * Why this row's live ask offers no Allow / Deny here (§5.7: "Answer on
+ * ned-desktop (this device only)"), or `null`. Only a still-answerable
+ * permission ask — a held hooks gate or an ACP round-trip — is routed away;
+ * an expired or resolved one is just over.
+ */
+export function notificationBlockedReason(
+	row: NotificationRow,
+	now: number = Date.now(),
+	block: string | null = hostDecideBlock()
+): string | null {
+	if (!block || row.kind !== 'permission') return null;
+	const action = asKnownNotificationAction(row.action);
+	if (action?.kind === 'permission.decide') return isPermissionAskLive(row, now) ? block : null;
+	if (action?.kind === 'open.thread') {
+		return row.resolvedAt == null && now - row.createdAt < ACP_ASK_ANSWERABLE_MS ? block : null;
+	}
+	return null;
 }
 
 export function notificationActionButtons(

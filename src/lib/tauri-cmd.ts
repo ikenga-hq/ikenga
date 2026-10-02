@@ -718,6 +718,14 @@ export async function secretsIndexNames(): Promise<string[]> {
 	return invoke('secrets_index_names');
 }
 
+/** The operator default's names alone (`IKENGA_SECRET_*`, bare) — the
+ *  daemon's layer under a principal's own store (review WP76-RV1). A
+ *  browser-only verb: the desktop keychain has no default layer, so only
+ *  the principal axis calls it. */
+export async function secretsDefaultNames(): Promise<string[]> {
+	return invoke('secrets_default_names');
+}
+
 // ─── Phase 7 — scoped secrets ─────────────────────────────────────────────
 
 /** Vault scope discriminator matching Rust's `commands::secrets::Scope`.
