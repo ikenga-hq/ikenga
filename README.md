@@ -9,7 +9,7 @@
 > An open-source desktop workspace for the multi-agent way of working — your agents,
 > skills, commands, scheduled jobs, and memory in one window, all aware of each other.
 
-<!-- SCREENSHOT: docs/media/hero.png — full app window: Home canvas with a couple of widgets, a chat pane open on the right -->
+<!-- SCREENSHOT: docs/media/hero.png — full app window with a chat pane open on the right -->
 ![Ikenga desktop](docs/media/hero.png)
 
 ## Why Ikenga?
@@ -58,7 +58,8 @@ first-party pkgs.
 curl -fsSL https://ikenga.dev/install.sh | sh
 ```
 
-Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases).
+The script installs on macOS, Linux (x86_64) and Windows (under Git Bash). Released
+builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases).
 To build from source, see Quickstart below.
 
 ## Quickstart
@@ -148,7 +149,7 @@ bun run engine:smoke # probe gemini --acp + codex --json wires (no build needed)
 src/
 ├─ routes/                # file-based routes (TanStack Router)
 │  ├─ __root.tsx          # mounts the workspace shell
-│  ├─ index.tsx           # /  → Home canvas
+│  ├─ index.tsx           # /  → landing route
 │  ├─ artifacts/  claude/  packages.tsx  pkg/  projects/
 │  ├─ sessions/  settings/  onboarding/  scratchpads.tsx  todos.tsx
 │  └─ …
@@ -158,7 +159,6 @@ src/
 │  ├─ sidebar.tsx         # mode-aware sidebar
 │  ├─ content-pane.tsx    # renders <Outlet />
 │  ├─ command-palette.tsx # ⌘K / Ctrl+K
-│  ├─ home/               # Home widget canvas
 │  ├─ panes/              # side-pane tabs (Terminal | Chat | Viewer | Off)
 │  ├─ onboarding/         # first-run + engine auth wizard
 │  └─ native-menu.ts      # Mac-only menu bar
@@ -192,8 +192,8 @@ focus the Ikenga window.
 
 ## Status
 
-Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases)
-(current: v0.0.7).
+Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases);
+the version badge at the top shows the latest release.
 
 ## Distribution
 
@@ -236,7 +236,7 @@ Caveats:
 
 ### Local install (single platform)
 
-Unsigned, no notarization, no auto-updater, no remote distribution.
+Unsigned, no notarization, no remote distribution.
 
 #### Linux (Pop_OS! / Ubuntu)
 
@@ -337,7 +337,8 @@ IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
 - No system-tray icon (global shortcut covers summon UX)
 
 GitHub Releases (via the Actions workflow) is the supported remote distribution
-channel. The built-in auto-updater shipped in v0.14.0. Revisit signing /
+channel. The built-in updater checks GitHub Releases for new app and package
+versions; its unified update flow shipped in v0.14.0. Revisit signing /
 notarization if Ikenga ever needs to be installed at scale.
 
 ## Links
