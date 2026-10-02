@@ -63,7 +63,7 @@ pub fn spawn_event_forwarder(app: tauri::AppHandle) {
     });
 }
 
-pub use routing_desktop::{record_permission, relay_resolved};
+pub use routing_desktop::{host_routing, record_permission, relay_resolved};
 
 /// The desktop half of permission routing (G-ACCESS §5.5, WP-75; DEC-83):
 ///
@@ -179,45 +179,15 @@ mod routing_desktop {
         /// is `routing_ok` for the host device.
         fn host_routing(&self) -> BoxFuture<'_, Result<HostRouting, AccessError>> {
             Box::pin(async move {
-                match daemon_rpc(&self.app, "access_status", json!({})).await {
-                    Ok(st) => {
-                        let owner = st["principal"]["principalId"].as_str().map(str::to_string);
-                        let host = st["credential"]["deviceId"].as_str().map(str::to_string);
-                        if let Ok(mut id) = identity().lock() {
-                            *id = (owner.clone(), host.clone());
-                        }
-                        // A daemon with no store admits only if no store
-                        // exists to hold a preference (as below).
-                        let no_store =
-                            st["store"].as_str() == Some("none") && !store_on_disk(&self.app);
-                        let approve = st["caps"]
-                            .as_array()
-                            .is_some_and(|c| c.iter().any(|v| v.as_str() == Some("approve")));
-                        Ok(HostRouting {
-                            routing_ok: no_store || approve,
-                            owner,
-                            host_device: host,
-                        })
+                let st = daemon_rpc(&self.app, "access_status", json!({})).await;
+                let answered = st.is_ok();
+                let routing = routing_from_status(st, || store_on_disk(&self.app))?;
+                if answered {
+                    if let Ok(mut id) = identity().lock() {
+                        *id = (routing.owner.clone(), routing.host_device.clone());
                     }
-                    // The daemon can't be asked. Only when no access store
-                    // was ever created (no daemon binary, the ephemeral
-                    // fallback, a profile that never ran one) can no
-                    // preference exist, so the default holds. A store on disk
-                    // may hold `this_device` naming another device, and its
-                    // daemon being down doesn't lift it: fail closed (§5.1,
-                    // §1.4; review WP75-R3). The desktop never opens the
-                    // store itself (P-20) — it only checks that it exists.
-                    Err(e) if e.starts_with("store_unavailable") && !store_on_disk(&self.app) => {
-                        Ok(HostRouting {
-                            routing_ok: true,
-                            ..Default::default()
-                        })
-                    }
-                    Err(e) => Err(AccessError::new(
-                        Code::RoutingRefused,
-                        format!("couldn't read who may answer asks: {e}"),
-                    )),
                 }
+                Ok(routing)
             })
         }
 
@@ -252,19 +222,101 @@ mod routing_desktop {
         }
     }
 
+    /// [`Host::host_routing`]'s decision from the daemon's `access_status`
+    /// reply (pure, so the fail-closed table is testable without an app).
+    pub(super) fn routing_from_status(
+        status: Result<Value, String>,
+        store_on_disk: impl Fn() -> bool,
+    ) -> Result<HostRouting, AccessError> {
+        match status {
+            Ok(st) => {
+                let owner = st["principal"]["principalId"].as_str().map(str::to_string);
+                let host = st["credential"]["deviceId"].as_str().map(str::to_string);
+                // A daemon with no store admits only if no store exists to
+                // hold a preference (as below).
+                let no_store = st["store"].as_str() == Some("none") && !store_on_disk();
+                let approve = st["caps"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|v| v.as_str() == Some("approve")));
+                Ok(HostRouting {
+                    routing_ok: no_store || approve,
+                    owner,
+                    host_device: host,
+                })
+            }
+            // The daemon can't be asked. Only when no access store was ever
+            // created (no daemon binary, the ephemeral fallback, a profile
+            // that never ran one) can no preference exist, so the default
+            // holds. A store on disk may hold `this_device` naming another
+            // device, and its daemon being down doesn't lift it: fail closed
+            // (§5.1, §1.4; review WP75-R3). The desktop never opens the store
+            // itself (P-20) — it only checks that it exists.
+            Err(e) if e.starts_with("store_unavailable") && !store_on_disk() => Ok(HostRouting {
+                routing_ok: true,
+                ..Default::default()
+            }),
+            Err(e) => Err(AccessError::new(
+                Code::RoutingRefused,
+                format!("couldn't read who may answer asks: {e}"),
+            )),
+        }
+    }
+
     /// Install the in-process routing runtime and start the relay task.
     pub fn install(app: &AppHandle) {
         let Some(db) = pa_db(app) else {
             log::warn!(target: "ikenga::notifications", "no PaDb: permission routing is off");
             return;
         };
+        let booted_at = chrono::Utc::now().timestamp_millis();
         core::install_local(LocalRouting {
-            db,
+            db: db.clone(),
             resolvers: Arc::new(Resolvers { app: app.clone() }),
             host: Arc::new(Host { app: app.clone() }),
         });
+        {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { sweep_orphans(app, db, booted_at).await });
+        }
         let app = app.clone();
         tauri::async_runtime::spawn(async move { relay_loop(app).await });
+    }
+
+    /// `host_routing` for the host device (§5.1) without the installed
+    /// runtime: the same fail-closed read [`Host`] gives `permission_decide`.
+    /// What `/iyke/hooks/decision`'s no-row fallback consults even when
+    /// routing never installed (no `PaDb`; review WP75-RV1).
+    pub async fn host_routing(app: &AppHandle) -> Result<HostRouting, AccessError> {
+        Host { app: app.clone() }.host_routing().await
+    }
+
+    /// Review WP75-RV2: close the hook / ACP asks the last desktop run left
+    /// open and report each to the daemon (`permission_relay_resolve
+    /// {outcome:'cancelled'}`), so a remote decision delivered just before a
+    /// crash, never applied, is retracted from the daemon's chain. The daemon
+    /// may not be up yet at boot: each report retries for about a minute.
+    async fn sweep_orphans(app: AppHandle, db: Arc<PaDb>, booted_at: i64) {
+        let Ok(pool) = db.ensure_pool().await else {
+            return;
+        };
+        let keys = core::sweep_orphaned_asks(&pool, booted_at).await;
+        for key in keys {
+            let args = json!({ "key": key, "outcome": "cancelled" });
+            let mut delay = Duration::from_secs(1);
+            for attempt in 0..6 {
+                match daemon_rpc(&app, "permission_relay_resolve", args.clone()).await {
+                    Ok(_) => break,
+                    Err(e) => {
+                        log::debug!(
+                            target: "ikenga::notifications",
+                            "orphaned ask {key}: report attempt {attempt}: {e}"
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(20));
+                    }
+                }
+            }
+        }
     }
 
     /// Long-poll `permission_relay_take` while any mirrored ask is open
@@ -418,6 +470,59 @@ mod routing_desktop {
 mod tests {
     use super::*;
 
+    /// Review WP75-RV1 / WP75-R3: the host's routing read fails closed — a
+    /// daemon that can't be asked admits only when no access store exists
+    /// to hold a preference; `approve` in the operator's caps is the
+    /// answer otherwise. `/iyke/hooks/decision`'s no-row fallback reads it
+    /// whether or not the routing runtime installed.
+    #[test]
+    fn host_routing_fails_closed() {
+        use crate::access::Code;
+        use routing_desktop::routing_from_status;
+        use serde_json::json;
+        let st = |caps: &[&str], store: &str| {
+            Ok(json!({
+                "store": store,
+                "caps": caps,
+                "principal": {"principalId": "owner"},
+                "credential": {"deviceId": "host"},
+            }))
+        };
+        let ok = routing_from_status(st(&["approve"], "t0"), || true).unwrap();
+        assert!(ok.routing_ok);
+        assert_eq!(ok.owner.as_deref(), Some("owner"));
+        assert_eq!(ok.host_device.as_deref(), Some("host"));
+        assert!(
+            !routing_from_status(st(&["files"], "t0"), || true)
+                .unwrap()
+                .routing_ok
+        );
+        // A store-less daemon admits only while no store is on disk.
+        assert!(
+            routing_from_status(st(&[], "none"), || false)
+                .unwrap()
+                .routing_ok
+        );
+        assert!(
+            !routing_from_status(st(&[], "none"), || true)
+                .unwrap()
+                .routing_ok
+        );
+        // No daemon at all.
+        let down = || Err::<serde_json::Value, _>("store_unavailable: no daemon".to_string());
+        assert!(routing_from_status(down(), || false).unwrap().routing_ok);
+        assert_eq!(
+            routing_from_status(down(), || true).unwrap_err().code,
+            Code::RoutingRefused
+        );
+        assert_eq!(
+            routing_from_status(Err("connection refused".into()), || false)
+                .unwrap_err()
+                .code,
+            Code::RoutingRefused
+        );
+    }
+
     #[tokio::test]
     async fn resolve_installed_updates_resolves_only_installed_versions() {
         use super::producers::{update, UpdateSource};
@@ -450,6 +555,13 @@ mod tests {
         assert_eq!(open.len(), 2);
         assert!(open.contains(&"update:shell:0.14.0".to_string()));
         assert!(open.contains(&"update:pkg:com.ikenga.iyke@2.0.0".to_string()));
-        assert_eq!(unread_count(&pool, &[]).await.unwrap().by_kind.get("update"), Some(&2));
+        assert_eq!(
+            unread_count(&pool, &[])
+                .await
+                .unwrap()
+                .by_kind
+                .get("update"),
+            Some(&2)
+        );
     }
 }

@@ -37,6 +37,42 @@ pub struct McpEntry {
     pub name: String,
     /// Key written into `~/.claude.json:mcpServers` (e.g. `pkg-com-royalti-cms-royalti-cms`).
     pub key: String,
+    /// The pkg declares secrets (G-ACCESS §5.3 rule 3): this server's tools
+    /// classify as secret material. Host-side only; not in the snapshot.
+    #[serde(skip)]
+    pub secret: bool,
+}
+
+/// Whether `pkg`'s manifest declares secrets: `permissions["vault.keys"]`
+/// or `capabilities.secrets` declarations (§5.3 rule 3, third bullet).
+pub fn declares_secrets(pkg: &Package) -> bool {
+    !pkg.manifest.permissions.vault_keys.is_empty()
+        || pkg
+            .manifest
+            .capabilities
+            .as_ref()
+            .and_then(|c| c.secrets.as_ref())
+            .is_some_and(|s| !s.declarations.is_empty())
+}
+
+/// The `mcpServers` keys whose tools are secret material, from the live
+/// entries.
+pub fn secret_server_keys(entries: &HashMap<String, Vec<McpEntry>>) -> Vec<String> {
+    let mut keys: Vec<String> = entries
+        .values()
+        .flatten()
+        .filter(|e| e.secret)
+        .map(|e| e.key.clone())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Feed the permission classifier (§5.3 rule 3) the current set.
+fn publish_secret_servers(entries: &HashMap<String, Vec<McpEntry>>) {
+    crate::server::shared::notifications::routing::set_secret_mcp_servers(secret_server_keys(
+        entries,
+    ));
 }
 
 pub struct McpRegistry {
@@ -142,6 +178,7 @@ impl Registry for McpRegistry {
         // before we touch ~/.claude.json.
         let mut new_keys: Vec<(String, McpEntry, Value)> =
             Vec::with_capacity(pkg.manifest.mcp.len());
+        let secret = declares_secrets(pkg);
         for server in &pkg.manifest.mcp {
             if server.name.is_empty() {
                 return Err(anyhow!("mcp entry of `{}` has empty name", pkg.manifest.id));
@@ -174,6 +211,7 @@ impl Registry for McpRegistry {
                     pkg_id: pkg.manifest.id.clone(),
                     name: server.name.clone(),
                     key,
+                    secret,
                 },
                 value,
             ));
@@ -212,6 +250,7 @@ impl Registry for McpRegistry {
             pkg.manifest.id.clone(),
             new_keys.into_iter().map(|(_, e, _)| e).collect(),
         );
+        publish_secret_servers(&map);
         drop(map);
 
         // ADR-012 §4: fan out to every installed engine adapter so the
@@ -255,12 +294,17 @@ impl Registry for McpRegistry {
     }
 
     fn unregister(&self, pkg_id: &str) -> Result<()> {
-        let removed: Vec<McpEntry> = self
-            .entries
-            .write()
-            .map_err(|_| anyhow!("mcp registry lock poisoned"))?
-            .remove(pkg_id)
-            .unwrap_or_default();
+        let removed: Vec<McpEntry> = {
+            let mut map = self
+                .entries
+                .write()
+                .map_err(|_| anyhow!("mcp registry lock poisoned"))?;
+            let removed = map.remove(pkg_id).unwrap_or_default();
+            if removed.iter().any(|e| e.secret) {
+                publish_secret_servers(&map);
+            }
+            removed
+        };
         // Clear the per-pkg adapter reports map regardless — even if the
         // kernel-side entry was already gone, prior fan-out reports should
         // not linger.
@@ -342,5 +386,73 @@ impl Registry for McpRegistry {
             "config_path": Self::config_path().map(|p| p.display().to_string()).unwrap_or_default(),
             "adapter_reports": adapter_reports,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::shared::notifications::routing::{classify, Sensitivity};
+
+    fn pkg(json: &str) -> Package {
+        Package {
+            manifest: serde_json::from_str(json).expect("manifest"),
+            install_path: PathBuf::new(),
+        }
+    }
+
+    fn entry(pkg_id: &str, key: &str, secret: bool) -> McpEntry {
+        McpEntry {
+            pkg_id: pkg_id.into(),
+            name: "srv".into(),
+            key: key.into(),
+            secret,
+        }
+    }
+
+    /// G-ACCESS §5.3 rule 3 (third bullet): a pkg declaring secrets —
+    /// `vault.keys` or `capabilities.secrets` — makes its MCP servers'
+    /// tools secret material; the kernel feeds the classifier that set.
+    #[test]
+    fn secret_declaring_pkgs_feed_the_classifier() {
+        let base = r#""name": "x", "version": "0.1.0", "ikenga_api": "3""#;
+        let plain = pkg(&format!(r#"{{ "id": "com.x.plain", {base} }}"#));
+        let vault = pkg(&format!(
+            r#"{{ "id": "com.x.vault", {base}, "permissions": {{ "vault.keys": ["K"] }} }}"#
+        ));
+        let declared = pkg(&format!(
+            r#"{{ "id": "com.x.decl", {base}, "permissions": {{ "vault.keys": ["K"] }},
+                 "capabilities": {{ "secrets": {{ "declarations": [
+                   {{ "name": "k", "vault_key": "K" }} ] }} }} }}"#
+        ));
+        assert!(!declares_secrets(&plain));
+        assert!(declares_secrets(&vault));
+        assert!(declares_secrets(&declared));
+
+        let unique = format!("pkg-wp78a-{}", std::process::id());
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), vec![entry("a", &unique, true)]);
+        map.insert("b".to_string(), vec![entry("b", "pkg-wp78a-plain", false)]);
+        assert_eq!(secret_server_keys(&map), vec![unique.clone()]);
+        publish_secret_servers(&map);
+        let tool = format!("mcp__{unique}__list");
+        assert_eq!(
+            classify(&tool, &serde_json::json!({}), Some("/p")),
+            Sensitivity::SECRET
+        );
+        assert_eq!(
+            classify(
+                "mcp__pkg-wp78a-plain__list",
+                &serde_json::json!({}),
+                Some("/p")
+            ),
+            Sensitivity::NONE
+        );
+        map.remove("a");
+        publish_secret_servers(&map);
+        assert_eq!(
+            classify(&tool, &serde_json::json!({}), Some("/p")),
+            Sensitivity::NONE
+        );
     }
 }

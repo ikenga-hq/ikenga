@@ -334,7 +334,15 @@ impl DaemonAccess {
     /// no `--data-dir` — or a store that refuses to open (a newer schema, a
     /// T1 store) — the daemon still serves, but every store-backed access
     /// arm answers `store_unavailable` and pairing is off.
-    pub async fn boot_t0(data_dir: Option<&Path>, options: AccessOptions) -> Arc<Self> {
+    ///
+    /// `pa_db` is `run_server`'s own `<data-dir>/ikenga.db` handle (the one
+    /// its router serves): the decide core and the relay share it, so the
+    /// daemon keeps one writer pool (review WP75-R9).
+    pub async fn boot_t0(
+        data_dir: Option<&Path>,
+        pa_db: Option<Arc<crate::db::PaDb>>,
+        options: AccessOptions,
+    ) -> Arc<Self> {
         let host = HostIdentity::detect();
         let store = match data_dir {
             None => None,
@@ -342,7 +350,15 @@ impl DaemonAccess {
                 Ok(s) => {
                     // WP-75: the decide core and the ask relay over this
                     // daemon's `ikenga.db` and chain (§5.5).
-                    crate::server::shared::notifications::routing::install_daemon(s.clone(), dir);
+                    match pa_db {
+                        Some(db) => crate::server::shared::notifications::routing::install_daemon(
+                            s.clone(),
+                            db,
+                        ),
+                        None => tracing::warn!(
+                            "no ikenga.db handle: permission routing (the ask relay) is off"
+                        ),
+                    }
                     Some(s)
                 }
                 Err(e) => {

@@ -51,6 +51,8 @@ pub mod static_files;
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
+#[cfg(test)]
+mod share_router_tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -912,7 +914,12 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     let access = if mode.principal_child {
         crate::access::DaemonAccess::principal_child(mode.access.clone())
     } else {
-        crate::access::DaemonAccess::boot_t0(config.data_dir.as_deref(), mode.access.clone()).await
+        crate::access::DaemonAccess::boot_t0(
+            config.data_dir.as_deref(),
+            pa_db.clone(),
+            mode.access.clone(),
+        )
+        .await
     };
     let router = create_router_with_access(
         config.clone(),
