@@ -37,7 +37,8 @@
 //!   [`crate::pty::is_host_only_env`]'s floor, the T1 executor drops it from
 //!   any spec, and the child scrubs it from its own environment block (so
 //!   `/proc/<pid>/environ` doesn't show it either) and unsets it at startup
-//!   ([`WrapKey::take_from_env`]).
+//!   ([`WrapKey::take_from_env`]): before `main`, on Linux, after turning
+//!   itself non-dumpable ([`capture_handoff_at_exec`]).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -72,7 +73,13 @@ const ALG: &str = "A256GCM-HKDF-SHA256";
 const DEK_AAD_PREFIX: &str = "ikenga:secrets:principal-dek:v1:";
 const VALUE_AAD_PREFIX: &str = "ikenga:secrets:principal-value:v1:";
 const MAX_ENVELOPE_BYTES: u64 = 4 * 1024;
-const MAX_VALUES_BYTES: u64 = 8 * 1024 * 1024;
+/// The largest `values.json` [`PrincipalStore`] reads, and so the largest it
+/// ever writes: `save` refuses a body over it, because a file `load` refuses
+/// would lock the principal out of every get / list / delete.
+pub const MAX_VALUES_BYTES: u64 = 8 * 1024 * 1024;
+/// The largest single secret value a [`PrincipalStore`] accepts (64 KiB —
+/// API keys, tokens, PEM bundles; not files).
+pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 const MAX_PRINCIPAL_LEN: usize = 64;
 
 // ─── the wrapping key ──────────────────────────────────────────────────────
@@ -161,22 +168,36 @@ impl WrapKey {
         })
     }
 
-    /// Read [`WRAP_KEY_ENV`] once, then scrub it out of this process's
-    /// environment block and unset it, so nothing this process spawns
-    /// inherits it and `/proc/<pid>/environ` no longer shows it. `None` when
-    /// it isn't set.
+    /// The broker's hand-off, once: the key [`WRAP_KEY_ENV`] carried into
+    /// this process, `None` when it carried none (or it was already taken).
     ///
-    /// Call it once, at startup, before anything is spawned (the daemon does
-    /// it while building its `AppState`).
+    /// On Linux the variable was read, scrubbed and unset **before `main`**
+    /// ([`capture_handoff_at_exec`], an `.init_array` entry), so by the time
+    /// the daemon builds its `AppState` it is no longer in the environment
+    /// and this only hands over what was captured. That ordering is the
+    /// point: `remove_var` (glibc `unsetenv`) rearranges `environ` under
+    /// Rust's env lock only, and by `AppState` time the multi-thread Tokio
+    /// runtime and the daemon's tasks are running, any of which may be inside
+    /// a libc `getenv` (DNS, time zones, locale) that takes no such lock.
+    ///
+    /// Without that capture (a non-Linux build, where no T1 child exists)
+    /// the key is read and scrubbed in place now, but never `remove_var`'d
+    /// late, for the same reason.
     pub fn take_from_env() -> Option<Result<Self, String>> {
-        let raw = std::env::var_os(WRAP_KEY_ENV)?;
-        scrub_env_value(WRAP_KEY_ENV);
-        std::env::remove_var(WRAP_KEY_ENV);
-        let raw = Zeroizing::new(match raw.into_string() {
-            Ok(s) => s,
-            Err(_) => return Some(Err(format!("{WRAP_KEY_ENV} is not UTF-8"))),
-        });
-        Some(Self::from_env_value(raw.as_str()))
+        let mut slot = handoff_slot();
+        match std::mem::replace(&mut *slot, Handoff::Taken) {
+            Handoff::Captured(key) => key,
+            Handoff::Taken => None,
+            Handoff::NotCaptured => {
+                if std::env::var_os(WRAP_KEY_ENV).is_some() {
+                    tracing::warn!(
+                        "{WRAP_KEY_ENV} was not captured at exec; taking it late (scrubbed in \
+                         place, left set but empty)"
+                    );
+                }
+                read_handoff(Unset::No)
+            }
+        }
     }
 
     fn dek_aad(&self) -> Vec<u8> {
@@ -216,9 +237,119 @@ impl WrapKey {
     }
 }
 
-/// Overwrite the variable's value in place in the environment block before
-/// it is unset: `remove_var` only drops the pointer from `environ`, and the
-/// initial block is what `/proc/<pid>/environ` reads.
+// ─── the hand-off, taken at exec ───────────────────────────────────────────
+
+/// Where the process-start capture leaves the broker's hand-off for
+/// [`WrapKey::take_from_env`].
+enum Handoff {
+    /// No capture ran (non-Linux).
+    NotCaptured,
+    /// What the capture found: `None` when the variable was not set.
+    Captured(Option<Result<WrapKey, String>>),
+    /// Handed over already.
+    Taken,
+}
+
+static HANDOFF: Mutex<Handoff> = Mutex::new(Handoff::NotCaptured);
+
+fn handoff_slot() -> std::sync::MutexGuard<'static, Handoff> {
+    HANDOFF.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unset {
+    Yes,
+    No,
+}
+
+/// Read the hand-off out of the environment: make the process non-dumpable
+/// first, then copy the value, overwrite it in the environment block, and
+/// (with [`Unset::Yes`], only ever single-threaded) unset it.
+fn read_handoff(unset: Unset) -> Option<Result<WrapKey, String>> {
+    if !env_has(WRAP_KEY_ENV) {
+        return None;
+    }
+    harden_before_reading_key();
+    let raw = std::env::var_os(WRAP_KEY_ENV)?;
+    scrub_env_value(WRAP_KEY_ENV);
+    if unset == Unset::Yes {
+        std::env::remove_var(WRAP_KEY_ENV);
+    }
+    let raw = Zeroizing::new(match raw.into_string() {
+        Ok(s) => s,
+        Err(_) => return Some(Err(format!("{WRAP_KEY_ENV} is not UTF-8"))),
+    });
+    Some(WrapKey::from_env_value(raw.as_str()))
+}
+
+/// Capture the broker's hand-off into [`HANDOFF`]. Idempotent. Runs from
+/// [`CAPTURE_HANDOFF_AT_EXEC`] before `main`: one thread, no runtime, nothing
+/// spawned, so the `remove_var` here races nothing. A process the variable
+/// was not set for (the desktop app, the T1 broker, every test binary
+/// without it) only records that.
+pub fn capture_handoff_at_exec() {
+    let mut slot = handoff_slot();
+    if matches!(*slot, Handoff::NotCaptured) {
+        *slot = Handoff::Captured(read_handoff(Unset::Yes));
+    }
+}
+
+/// The `.init_array` entry: the dynamic loader runs it before `main`, so the
+/// hand-off is out of the environment before `#[tokio::main]` builds its
+/// multi-thread runtime — without `server/src/main.rs` having to call
+/// anything. Lives in this module beside [`HANDOFF`], which
+/// [`WrapKey::take_from_env`] reads, so the linker can't keep one without
+/// the other. It must never panic (that would abort before `main`): nothing
+/// it calls unwraps.
+#[cfg(target_os = "linux")]
+#[used]
+#[link_section = ".init_array"]
+static CAPTURE_HANDOFF_AT_EXEC: extern "C" fn() = {
+    extern "C" fn capture() {
+        capture_handoff_at_exec();
+    }
+    capture
+};
+
+/// Whether `name` is set, without copying its value out.
+#[cfg(unix)]
+fn env_has(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: a read-only lookup; the returned pointer is only null-checked.
+    unsafe { !libc::getenv(name.as_ptr()).is_null() }
+}
+
+#[cfg(not(unix))]
+fn env_has(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+/// A process handed a wrapping key turns itself non-dumpable before reading
+/// it: `/proc/<pid>/environ`, `mem` and friends become root-owned and
+/// `ptrace` / `process_vm_readv` need `CAP_SYS_PTRACE`, so the principal's
+/// other processes (its own shells included) can read neither the hand-off
+/// still in the environment block nor the key or DEK in this process's
+/// memory. `execve` resets the flag, so what the child spawns is unaffected.
+#[cfg(target_os = "linux")]
+fn harden_before_reading_key() {
+    // SAFETY: PR_SET_DUMPABLE takes one integer argument; nothing is read
+    // or written through the others. It cannot fail for 0, and nothing could
+    // be logged before `main` anyway; the key is scrubbed regardless.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn harden_before_reading_key() {}
+
+/// Overwrite the variable's value in place in the environment block (before
+/// it is unset, if it is): `remove_var` only drops the pointer from
+/// `environ`, and the initial block is what `/proc/<pid>/environ` reads.
+/// Only the value bytes change, never the name, so a concurrent `getenv` of
+/// any other variable (which compares names only) is unaffected.
 #[cfg(unix)]
 fn scrub_env_value(name: &str) {
     let Ok(name) = std::ffi::CString::new(name) else {
@@ -227,7 +358,7 @@ fn scrub_env_value(name: &str) {
     // SAFETY: `getenv` returns null or a pointer to the NUL-terminated value
     // inside the environment block; exactly `strlen` bytes are overwritten,
     // never the terminator. Nothing else in this process reads this variable
-    // (it is read once, by `take_from_env`, at startup).
+    // (it is read once, by `read_handoff`).
     unsafe {
         let value = libc::getenv(name.as_ptr());
         if !value.is_null() {
@@ -357,6 +488,18 @@ fn write_envelope(path: &Path, key: &WrapKey, dek: &[u8; DEK_LEN]) -> Result<(),
         .map_err(|e| StoreError::uncommitted(format!("serialize envelope: {e}")))?;
     body.push(b'\n');
     write_atomic(path, &body).map_err(StoreError::uncommitted)
+}
+
+/// A principal store's file left in `<data_dir>/secrets/` (the envelope or
+/// the values, whatever its file type), if there is one. A daemon that is not
+/// the T1 principal child for it must not answer secrets from the operator
+/// default alone over it (`crate::secrets_env`, fail closed).
+pub fn leftover_store_file(data_dir: &Path) -> Option<PathBuf> {
+    let dir = data_dir.join(SECRETS_DIR);
+    [ENVELOPE_FILENAME, VALUES_FILENAME]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| fs::symlink_metadata(path).is_ok())
 }
 
 // ─── the store ─────────────────────────────────────────────────────────────
@@ -489,10 +632,22 @@ impl PrincipalStore {
         Ok(values)
     }
 
+    /// Never writes a body [`Self::load`] would refuse: past
+    /// [`MAX_VALUES_BYTES`] the write is refused and the file on disk is the
+    /// last good one, so the store stays readable (and deletable) instead of
+    /// locking its owner out.
     fn save(&self, values: &Values) -> Result<(), StoreError> {
         let mut body = serde_json::to_vec_pretty(values)
             .map_err(|e| StoreError::uncommitted(format!("serialize values: {e}")))?;
         body.push(b'\n');
+        if body.len() as u64 > MAX_VALUES_BYTES {
+            return Err(StoreError::invalid(format!(
+                "secret store is full: this write would make it {} bytes, over the {} byte \
+                 limit; delete secrets you no longer need (nothing was written)",
+                body.len(),
+                MAX_VALUES_BYTES
+            )));
+        }
         write_atomic(&self.values_path(), &body).map_err(StoreError::uncommitted)
     }
 
@@ -522,6 +677,16 @@ fn check_name(name: &str) -> Result<(), StoreError> {
     validate_legacy_name(name).map_err(StoreError::invalid)
 }
 
+fn check_value(name: &str, value: &str) -> Result<(), StoreError> {
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(StoreError::invalid(format!(
+            "secret {name:?} is {} bytes; the limit is {MAX_VALUE_BYTES} (nothing was written)",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
 impl SecretsStore for PrincipalStore {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError> {
         check_name(name)?;
@@ -536,6 +701,7 @@ impl SecretsStore for PrincipalStore {
 
     fn set(&self, name: &str, value: &str) -> Result<(), StoreError> {
         check_name(name)?;
+        check_value(name, value)?;
         let _guard = self.guard();
         let mut values = self.load()?;
         values
@@ -565,8 +731,9 @@ impl SecretsStore for PrincipalStore {
     }
 
     fn replace_all(&self, values: &BTreeMap<String, String>) -> Result<usize, StoreError> {
-        for name in values.keys() {
+        for (name, value) in values {
             check_name(name)?;
+            check_value(name, value)?;
         }
         let _guard = self.guard();
         let mut next = self.load()?;
@@ -845,5 +1012,47 @@ mod tests {
         assert!(PrincipalStore::open(tmp.path(), &key(&KEK, ADA))
             .unwrap_err()
             .is_unavailable());
+    }
+
+    /// L21-1: a store must never write itself into a file its own `load`
+    /// refuses. Oversized values are refused outright; a write that would
+    /// push `values.json` past the read cap is refused with nothing written;
+    /// every read, list and delete keeps working.
+    #[test]
+    fn oversized_writes_are_refused_and_never_lock_the_store_out() {
+        const VALUE_CAP: usize = MAX_VALUE_BYTES;
+        const FILE_CAP: u64 = MAX_VALUES_BYTES;
+        assert_eq!(VALUE_CAP, 64 * 1024);
+        let tmp = data_dir();
+        let store = PrincipalStore::open(tmp.path(), &key(&KEK, ADA)).unwrap();
+        store.set("SMALL", "kept").unwrap();
+
+        let over = "x".repeat(VALUE_CAP + 1);
+        assert!(store.set("BIG", &over).unwrap_err().is_invalid());
+        let one: BTreeMap<String, String> = [("BIG".to_string(), over)].into();
+        assert!(store.replace_all(&one).unwrap_err().is_invalid());
+        assert_eq!(store.get("SMALL").unwrap().as_deref(), Some("kept"));
+
+        let at_cap = "y".repeat(VALUE_CAP);
+        let path = tmp.path().join("secrets/values.json");
+        let mut stored = 1;
+        let refusal = loop {
+            match store.set(&format!("K{stored}"), &at_cap) {
+                Ok(()) => stored += 1,
+                Err(e) => break e,
+            }
+            assert!(stored < 1_000, "never refused");
+        };
+        assert!(refusal.is_invalid(), "{refusal}");
+        assert!(fs::metadata(&path).unwrap().len() <= FILE_CAP);
+        // Still fully usable: get, list, delete, and a write after a delete.
+        assert_eq!(store.get("SMALL").unwrap().as_deref(), Some("kept"));
+        assert_eq!(store.list_meta().unwrap().len(), stored);
+        store.probe().unwrap();
+        store.delete("K1").unwrap();
+        store.set("AFTER", "ok").unwrap();
+        drop(store);
+        let reopened = PrincipalStore::open(tmp.path(), &key(&KEK, ADA)).unwrap();
+        assert_eq!(reopened.get("AFTER").unwrap().as_deref(), Some("ok"));
     }
 }

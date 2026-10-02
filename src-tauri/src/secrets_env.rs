@@ -22,7 +22,10 @@
 //!
 //! A T0 daemon has only layer 2, and behaves exactly as it did before WP-21:
 //! a flat, read-only namespace, writes refused with [`WRITE_REFUSAL`],
-//! project / pkg scopes refused with [`SCOPE_REFUSAL`]. Taking the key as a
+//! project / pkg scopes refused with [`SCOPE_REFUSAL`] — unless its data dir
+//! holds a principal store's files, when it fails closed instead (every
+//! secret read errors; DEC-R18-1), exactly as a T1 child does whose store
+//! will not open or whose broker handed it no key. Taking the key as a
 //! bare env var name would have made the default layer a remote `printenv`
 //! for every credential the process inherited, hence the prefix.
 //!
@@ -247,6 +250,12 @@ enum PrincipalLayer {
     /// which would silently swap a principal's own credential for the
     /// operator's.
     Broken(String),
+    /// A daemon that is not a T1 principal child (T0) over a data dir that
+    /// holds a principal store (a downgraded or copied T1 data dir). Fails
+    /// closed like [`Self::Broken`] — answering from the operator default
+    /// would hide the principal's own values behind the operator's — but
+    /// stays T0 on the wire: env-mode status, no lock family.
+    Stranded(String),
 }
 
 /// The daemon's two-layer secrets (see the module docs). One per daemon
@@ -262,6 +271,7 @@ impl std::fmt::Debug for DaemonSecrets {
             PrincipalLayer::Absent => "absent".to_string(),
             PrincipalLayer::Open(store) => format!("open ({})", store.backend_label()),
             PrincipalLayer::Broken(why) => format!("broken: {why}"),
+            PrincipalLayer::Stranded(why) => format!("stranded: {why}"),
         };
         f.debug_struct("DaemonSecrets")
             .field("principal", &layer)
@@ -295,6 +305,23 @@ impl DaemonSecrets {
                      this process's environment)",
                     crate::secrets::principal_store::WRAP_KEY_ENV
                 );
+            }
+            if let Some(file) =
+                data_dir.and_then(crate::secrets::principal_store::leftover_store_file)
+            {
+                let why = format!(
+                    "{} belongs to a per-principal secret store, which only that principal's \
+                     T1 child can open; this {tier} daemon refuses every secret rather than \
+                     answer from the IKENGA_SECRET_* default alone. Serve this data dir under \
+                     --executor-tier t1, or move its secrets/ directory aside to serve the \
+                     operator default",
+                    file.display()
+                );
+                tracing::error!("secrets unavailable: {why}");
+                return Self {
+                    principal: PrincipalLayer::Stranded(why),
+                    env: EnvSource::Process,
+                };
             }
             return Self::env_only();
         }
@@ -349,7 +376,7 @@ impl DaemonSecrets {
         match &self.principal {
             PrincipalLayer::Absent => Ok(None),
             PrincipalLayer::Open(store) => Ok(Some(store)),
-            PrincipalLayer::Broken(why) => Err(why.clone()),
+            PrincipalLayer::Broken(why) | PrincipalLayer::Stranded(why) => Err(why.clone()),
         }
     }
 
@@ -515,6 +542,11 @@ impl DaemonSecrets {
                 Err(e) => principal_status(false, Some(e.to_string())),
             },
             PrincipalLayer::Broken(why) => principal_status(false, Some(why.clone())),
+            PrincipalLayer::Stranded(why) => VaultStatus {
+                available: false,
+                error: Some(why.clone()),
+                ..status()
+            },
         }
     }
 
@@ -530,7 +562,7 @@ impl DaemonSecrets {
     /// FE stays read-only (see the module docs, "No passphrase layer").
     pub fn lock_state(&self) -> Option<LockState> {
         match self.principal {
-            PrincipalLayer::Absent => None,
+            PrincipalLayer::Absent | PrincipalLayer::Stranded(_) => None,
             PrincipalLayer::Open(_) | PrincipalLayer::Broken(_) => Some(LockState {
                 configured: true,
                 locked: false,
@@ -795,5 +827,64 @@ mod tests {
         let s = DaemonSecrets::for_daemon(Some(tmp.path()), crate::executor::ExecutorTier::T0);
         assert!(!s.writable());
         assert!(!tmp.path().join("secrets").exists());
+    }
+
+    /// L21-2 / DEC-R18-1: a T1 principal child the broker handed no key
+    /// never serves the operator default alone in place of the principal's
+    /// own store.
+    #[test]
+    fn a_t1_child_without_a_handoff_key_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = DaemonSecrets::for_daemon(Some(tmp.path()), crate::executor::ExecutorTier::T1);
+        assert!(!s.writable());
+        assert!(s
+            .get("ANY")
+            .unwrap_err()
+            .contains("no IKENGA_PRINCIPAL_SECRETS_KEY"));
+        assert!(s.list_keys().is_err());
+        assert!(s.index_names().is_err());
+        assert!(s.get_scoped(&Scope::Workspace, "ANY").is_err());
+        let st = s.status();
+        assert!(!st.available && !st.writable);
+        assert!(!tmp.path().join("secrets").exists(), "nothing minted");
+    }
+
+    /// L21-2: a T0 daemon pointed at a data dir that holds a principal store
+    /// (a downgraded or copied T1 data dir) fails closed too, rather than
+    /// silently answering from the operator default. The lock family stays
+    /// unserved there (T0), and status reports the env mode, unavailable.
+    #[test]
+    fn t0_over_a_principal_store_fails_closed() {
+        for leave in ["both", "values-only", "envelope-only"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store =
+                PrincipalStore::open(tmp.path(), &WrapKey::derive(&KEK, ADA).unwrap()).unwrap();
+            store.set("K", "ada").unwrap();
+            drop(store);
+            let dir = tmp.path().join("secrets");
+            match leave {
+                "values-only" => std::fs::remove_file(dir.join("envelope.json")).unwrap(),
+                "envelope-only" => std::fs::remove_file(dir.join("values.json")).unwrap(),
+                _ => {}
+            }
+            let s = DaemonSecrets::for_daemon(Some(tmp.path()), crate::executor::ExecutorTier::T0);
+            assert!(!s.writable(), "{leave}");
+            assert!(s.get("K").is_err(), "{leave}: never the default alone");
+            assert!(s.list_keys().is_err(), "{leave}");
+            assert!(s.get_scoped(&Scope::Workspace, "K").is_err(), "{leave}");
+            let st = s.status();
+            assert!(!st.available && !st.writable, "{leave}");
+            assert_eq!(st.mode, MODE_ENV, "{leave}");
+            assert!(st.error.is_some(), "{leave}");
+            assert!(
+                s.lock_state().is_none(),
+                "{leave}: T0 never serves the lock family"
+            );
+        }
+        // An empty secrets/ dir holds nothing to lose: T0 as before.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("secrets")).unwrap();
+        let s = DaemonSecrets::for_daemon(Some(tmp.path()), crate::executor::ExecutorTier::T0);
+        assert!(s.status().available);
     }
 }
