@@ -1,9 +1,16 @@
 //! `auth_events` (G-PRINCIPAL §6.1): the append-only authentication log.
 //!
 //! **Every** write — broker and root CLI alike — goes through [`record`]
-//! (G-ACCESS request R-2). WP-77 absorbs this table into the access audit
-//! chain (G-ACCESS §6.6) by re-pointing this one function at
-//! `access::audit::append`; a second writer would escape the chain.
+//! (G-ACCESS request R-2), so a second writer can't escape the chain.
+//!
+//! **Absorbed (G-ACCESS §6.6, WP-77).** Once the access set's
+//! `0002_absorb_auth_events` has run (the broker migrates it at start),
+//! `auth_events` is a view over the access audit chain with §6.1's columns,
+//! the old rows are kept in `auth_events_legacy`, and [`record`] appends to
+//! the chain (`kind = 'auth.<kind>'`, category `access`) through the
+//! chain's §6.3 append — the same function in the broker and the root CLI.
+//! Before that (a store no WP-77 broker has started on yet) it still
+//! inserts into the table, and the absorption backfills those rows.
 //!
 //! `detail` is JSON and never carries a password, hash or token.
 
@@ -43,6 +50,23 @@ impl AuthEventKind {
         AuthEventKind::ProvisionFailed,
         AuthEventKind::ProbeFailed,
     ];
+
+    /// The chained kind (G-ACCESS §6.5: the §6.1 kinds, prefixed).
+    pub fn audit_kind(self) -> &'static str {
+        match self {
+            AuthEventKind::LoginOk => "auth.login_ok",
+            AuthEventKind::LoginFail => "auth.login_fail",
+            AuthEventKind::LoginThrottled => "auth.login_throttled",
+            AuthEventKind::Logout => "auth.logout",
+            AuthEventKind::PasswordChanged => "auth.password_changed",
+            AuthEventKind::AccountCreated => "auth.account_created",
+            AuthEventKind::AccountDisabled => "auth.account_disabled",
+            AuthEventKind::AccountEnabled => "auth.account_enabled",
+            AuthEventKind::SessionsRevoked => "auth.sessions_revoked",
+            AuthEventKind::ProvisionFailed => "auth.provision_failed",
+            AuthEventKind::ProbeFailed => "auth.probe_failed",
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -118,8 +142,13 @@ fn now_secs() -> i64 {
 }
 
 /// Append `event` inside the caller's transaction (R-2). The only writer of
-/// `auth_events`. Returns the new row id.
+/// `auth_events`. Returns the new row id — after the absorption, the chain
+/// `seq`, which is the view's `id` (G-ACCESS §6.6).
 pub async fn record(tx: &mut Transaction<'_, Sqlite>, event: AuthEvent) -> sqlx::Result<i64> {
+    use crate::access::audit::absorb::{shape, AuthEventsShape};
+    if shape(&mut **tx).await? == AuthEventsShape::View {
+        return record_chained(tx, event).await;
+    }
     let detail = event.detail.as_ref().map(|d| d.to_string());
     let result = sqlx::query(
         "INSERT INTO auth_events (at, principal_id, username_tried, kind, remote_addr, user_agent, detail) \
@@ -135,6 +164,55 @@ pub async fn record(tx: &mut Transaction<'_, Sqlite>, event: AuthEvent) -> sqlx:
     .execute(&mut **tx)
     .await?;
     Ok(result.last_insert_rowid())
+}
+
+/// The §6.1 `via` of a chained row: the root CLI, a password session's own
+/// login / logout, or the system (failures, throttles, provisioning).
+fn audit_via(event: &AuthEvent) -> crate::access::audit::AuditVia {
+    use crate::access::audit::AuditVia;
+    let via = event
+        .detail
+        .as_ref()
+        .and_then(|d| d.get("via"))
+        .and_then(serde_json::Value::as_str);
+    match (via, event.kind) {
+        (Some("cli"), _) => AuditVia::Cli,
+        (_, AuthEventKind::LoginOk | AuthEventKind::Logout) => AuditVia::Session,
+        _ => AuditVia::System,
+    }
+}
+
+/// [`record`] after the absorption: one chained row (G-ACCESS §6.3), in the
+/// caller's transaction. `username_tried` moves into `detail`, where the
+/// view reads it. Authentication rows append even while the chain is
+/// degraded (P-35); a process-local chain view is enough, because every
+/// other writer verifies forward over these rows (§6.3 step 2, A-37).
+async fn record_chained(tx: &mut Transaction<'_, Sqlite>, event: AuthEvent) -> sqlx::Result<i64> {
+    use crate::access::audit::{chain::Chain, Event};
+    let store_id: String = sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'store_id'")
+        .fetch_one(&mut **tx)
+        .await?;
+    let mut detail = match &event.detail {
+        Some(serde_json::Value::Object(o)) => o.clone(),
+        Some(other) => serde_json::Map::from_iter([("detail".to_string(), other.clone())]),
+        None => serde_json::Map::new(),
+    };
+    if let Some(u) = &event.username_tried {
+        detail.insert("username_tried".into(), serde_json::Value::from(u.clone()));
+    }
+    let mut ev = Event::new(event.kind.audit_kind(), audit_via(&event))
+        .detail(serde_json::Value::Object(detail));
+    ev.principal_id = event.principal_id.map(|id| id.to_string());
+    ev.remote_addr = event.remote_addr;
+    ev.user_agent = event.user_agent;
+    let head = Chain::new(store_id)
+        .append(&mut **tx, &ev)
+        .await
+        .map_err(|e| match e {
+            crate::access::audit::chain::AppendError::Sql(e) => e,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })?;
+    Ok(head.seq)
 }
 
 #[cfg(test)]

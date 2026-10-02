@@ -43,7 +43,8 @@ pub async fn pty_ws_handler(
 ) -> impl IntoResponse {
     // G-ACCESS §1.6: attaching needs `sessions` (checked at the handshake by
     // `auth_middleware`); input frames and `?spawn=true` need `dispatch`.
-    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c));
+    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c))
+        .with_target(format!("pty · {id}"));
     ws.on_upgrade(move |socket| {
         super::activity::track_ws(handle_pty_socket(socket, state, id, query, guard))
     })
@@ -55,6 +56,11 @@ pub async fn pty_ws_handler(
 pub(crate) struct SocketAccess {
     pub(crate) ctx: Option<AccessCtx>,
     pub(crate) registration: Option<crate::access::sockets::SocketGuard>,
+    /// The store `dispatch.sent` is written to (G-ACCESS §6.5, WP-77).
+    access: Option<Arc<DaemonAccess>>,
+    /// The P-22 coalescing key and the row's `target`.
+    socket_id: u64,
+    target: String,
 }
 
 impl SocketAccess {
@@ -68,7 +74,19 @@ impl SocketAccess {
             }))),
             _ => None,
         };
-        Self { ctx, registration }
+        Self {
+            ctx,
+            registration,
+            access,
+            socket_id: crate::access::audit::next_socket_id(),
+            target: String::new(),
+        }
+    }
+
+    /// What `dispatch.sent` names as this socket's target (§6.5).
+    pub(crate) fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = target.into();
+        self
     }
 
     /// `Ok` to deliver, or the refusal control frame to answer with. No
@@ -83,9 +101,12 @@ impl SocketAccess {
             Ok(()) => {
                 if let Some(ctx) = &self.ctx {
                     crate::access::audit::on_client_frame(
+                        self.access.as_deref().and_then(DaemonAccess::store),
                         ctx,
-                        route.as_str(),
-                        access_ws::is_dispatch(route, frame),
+                        self.socket_id,
+                        &self.target,
+                        route,
+                        frame,
                     );
                 }
                 Ok(())

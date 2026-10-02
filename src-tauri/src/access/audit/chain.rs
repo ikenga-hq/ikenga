@@ -139,7 +139,7 @@ impl StoredRow {
         h.finalize().into()
     }
 
-    fn from_sql(r: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+    pub(crate) fn from_sql(r: &sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(Self {
             seq: r.try_get("seq")?,
             at_ms: r.try_get("at_ms")?,
@@ -170,15 +170,15 @@ pub fn genesis(store_id: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-const COLUMNS: &str = "seq, at_ms, kind, category, principal_id, device_id, via, \
+pub(crate) const COLUMNS: &str = "seq, at_ms, kind, category, principal_id, device_id, via, \
     subject_principal_id, subject_device_id, project_key, target, remote_addr, user_agent, \
     detail, prev_hash, hash";
 
-fn to32(v: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn to32(v: &[u8]) -> Option<[u8; 32]> {
     v.try_into().ok()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -295,13 +295,25 @@ pub async fn insert_row(
     head: Option<Head>,
     ev: &Event,
 ) -> Result<Head, sqlx::Error> {
+    insert_row_at(conn, store_id, head, ev, now_ms()).await
+}
+
+/// [`insert_row`] with an explicit `at_ms` — for the §6.6 backfill, whose
+/// rows keep their original time (`at * 1000`).
+pub async fn insert_row_at(
+    conn: &mut SqliteConnection,
+    store_id: &str,
+    head: Option<Head>,
+    ev: &Event,
+    at_ms: i64,
+) -> Result<Head, sqlx::Error> {
     let (seq, prev) = match head {
         Some(h) => (h.seq + 1, h.hash),
         None => (1, genesis(store_id)),
     };
     let row = StoredRow {
         seq,
-        at_ms: now_ms(),
+        at_ms,
         kind: ev.kind.to_string(),
         category: ev.category().as_str().to_string(),
         principal_id: ev.principal_id.clone(),
@@ -355,6 +367,28 @@ pub struct Chain {
     pending_broken_row: Mutex<Option<Broken>>,
 }
 
+/// The newest `audit.resealed` row after `b.broken_at_seq` that acknowledges
+/// it (WP-77): another process (the T1 root CLI) may reseal while this one
+/// is degraded.
+async fn resealed_after(
+    conn: &mut SqliteConnection,
+    b: &Broken,
+) -> Result<Option<Head>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT seq, hash FROM audit_events WHERE seq > ? AND kind = 'audit.resealed' \
+         AND json_extract(detail, '$.broken_at_seq') = ? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(b.broken_at_seq)
+    .bind(b.broken_at_seq)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.and_then(|r| {
+        let seq: i64 = r.get(0);
+        let hash: Vec<u8> = r.get(1);
+        to32(&hash).map(|hash| Head { seq, hash })
+    }))
+}
+
 impl Chain {
     pub fn new(store_id: impl Into<String>) -> Self {
         Self {
@@ -396,6 +430,21 @@ impl Chain {
         }
     }
 
+    /// Enter `degraded` for a break the chain already records (an
+    /// unacknowledged `audit.chain_broken` row): no second row.
+    fn set_degraded_recorded(&self, b: Broken) {
+        tracing::error!(
+            "audit chain broken at #{} (recorded, not resealed): {} — access changes are paused \
+             (G-ACCESS §6.4)",
+            b.broken_at_seq,
+            b.reason
+        );
+        let mut d = self.degraded.lock().unwrap_or_else(|e| e.into_inner());
+        if d.is_none() {
+            *d = Some(b);
+        }
+    }
+
     /// After the caller's `COMMIT`: remember `head` as ours (§6.3 step 4).
     /// Forgetting to call it is harmless — the next append verifies forward.
     pub fn committed(&self, head: Head) {
@@ -405,23 +454,39 @@ impl Chain {
     /// Clear `degraded` (reseal, WP-77) — the break stays in the chain.
     pub fn clear_degraded(&self) {
         *self.degraded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .pending_broken_row
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// §6.4 at boot (and on `access_audit_verify`): walk everything. On a
-    /// failure, enter `degraded` and append `audit.chain_broken` after the DB
-    /// head in its own transaction.
+    /// §6.4 at boot, on `access_audit_verify`, before an export and after a
+    /// reseal: the reseal-aware full walk ([`super::verify_boot::verify`]).
+    ///
+    /// * A break this process found but could not record yet is written
+    ///   first, so the walk sees it.
+    /// * An outstanding break enters `degraded`; its `audit.chain_broken`
+    ///   row is appended after the DB head in its own transaction unless
+    ///   the chain already records it (a restart doesn't repeat the row).
+    /// * No outstanding break clears `degraded` and adopts the head.
+    ///
+    /// `conn` must not be inside a transaction.
     pub async fn verify_boot(&self, conn: &mut SqliteConnection) -> anyhow::Result<VerifyReport> {
-        let report = verify_all(conn, &self.store_id).await?;
-        match &report.broken {
+        self.flush_broken_row(conn).await?;
+        let verdict = super::verify_boot::verify(conn, &self.store_id).await?;
+        // The walk is the source of truth: recompute the state from it.
+        self.clear_degraded();
+        match &verdict.outstanding {
             None => {
-                *self.known.lock().unwrap_or_else(|e| e.into_inner()) = report.head;
+                *self.known.lock().unwrap_or_else(|e| e.into_inner()) = verdict.head;
             }
+            Some(b) if verdict.recorded => self.set_degraded_recorded(b.clone()),
             Some(b) => {
                 self.set_degraded(b.clone());
                 self.flush_broken_row(conn).await?;
             }
         }
-        Ok(report)
+        Ok(verdict.report())
     }
 
     /// Write a pending `audit.chain_broken` row, chained to the DB head.
@@ -435,9 +500,7 @@ impl Chain {
             use sqlx::Connection;
             let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
             let head = db_head(&mut tx).await?;
-            let ev = Event::new("audit.chain_broken", super::AuditVia::System).detail(
-                serde_json::json!({ "broken_at_seq": b.broken_at_seq, "reason": b.reason }),
-            );
+            let ev = broken_event(&b);
             let new_head = insert_row(&mut tx, &self.store_id, head, &ev).await?;
             tx.commit().await?;
             self.committed(new_head);
@@ -453,6 +516,20 @@ impl Chain {
         conn: &mut SqliteConnection,
         ev: &Event,
     ) -> Result<Head, AppendError> {
+        // 0. Degraded: has another process (the T1 root CLI) resealed the
+        //    break since? Then resume from its `audit.resealed` row, which
+        //    step 2 verifies forward like any foreign append.
+        if let Some(b) = self.degraded() {
+            if let Some(h) = resealed_after(conn, &b).await? {
+                tracing::info!(
+                    "audit chain: the break at #{} was resealed at #{}; access changes resume",
+                    b.broken_at_seq,
+                    h.seq
+                );
+                self.clear_degraded();
+                self.committed(h);
+            }
+        }
         // 1. The DB head.
         let db = db_head(conn).await?;
         // 2. Against the head this process holds.
@@ -468,34 +545,23 @@ impl Chain {
                         .fetch_optional(&mut *conn)
                         .await?
                         .map(|r| r.get::<Vec<u8>, _>(0));
-                    let forward_ok = match still_there {
+                    match still_there {
                         Some(h) if h.as_slice() == k.hash.as_slice() => {
+                            // §6.3 step 2: every newer row must link and hash.
                             let report = walk(conn, &self.store_id, Some(k)).await?;
-                            match report.broken {
-                                None => true,
-                                Some(b) => {
-                                    self.set_degraded(b);
-                                    false
-                                }
+                            if let Some(b) = report.broken {
+                                self.set_degraded(b);
                             }
                         }
-                        Some(_) => {
-                            self.set_degraded(Broken {
-                                broken_at_seq: k.seq,
-                                reason: "a row this process wrote has changed".into(),
-                            });
-                            false
-                        }
-                        None => {
-                            self.set_degraded(Broken {
-                                broken_at_seq: k.seq,
-                                reason: "a row this process wrote is missing (head regression)"
-                                    .into(),
-                            });
-                            false
-                        }
-                    };
-                    let _ = forward_ok;
+                        Some(_) => self.set_degraded(Broken {
+                            broken_at_seq: k.seq,
+                            reason: "a row this process wrote has changed".into(),
+                        }),
+                        None => self.set_degraded(Broken {
+                            broken_at_seq: k.seq,
+                            reason: "a row this process wrote is missing (head regression)".into(),
+                        }),
+                    }
                 }
             }
         }
@@ -512,16 +578,19 @@ impl Chain {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(pb) = pending {
-                let broken_ev = Event::new("audit.chain_broken", super::AuditVia::System).detail(
-                    serde_json::json!({ "broken_at_seq": pb.broken_at_seq, "reason": pb.reason }),
-                );
-                head = Some(insert_row(conn, &self.store_id, head, &broken_ev).await?);
+                head = Some(insert_row(conn, &self.store_id, head, &broken_event(&pb)).await?);
             }
             return Ok(insert_row(conn, &self.store_id, head, ev).await?);
         }
         // 3. Insert chained to the (verified) DB head.
         Ok(insert_row(conn, &self.store_id, db, ev).await?)
     }
+}
+
+/// `audit.chain_broken {broken_at_seq, reason}` (§6.4).
+fn broken_event(b: &Broken) -> Event {
+    Event::new("audit.chain_broken", super::AuditVia::System)
+        .detail(serde_json::json!({ "broken_at_seq": b.broken_at_seq, "reason": b.reason }))
 }
 
 #[cfg(test)]
