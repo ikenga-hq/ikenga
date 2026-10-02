@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { settingsIykeLine, settingsSection } from '@/shell/settings/nav';
 import { searchSettings } from '@/shell/settings/search';
 
-import { PEOPLE_TABS, tabScope } from './frame';
+import { accessStorePath, PEOPLE_TABS, TAB_SCOPE_WHY, tabScope } from './frame';
 
 describe('People tabs', () => {
 	it('are Profile, Devices, Members and Policies; Audit waits for WP-77', () => {
@@ -17,6 +17,14 @@ describe('People tabs', () => {
 		]);
 		expect(tabScope('members')).toBe('project');
 		expect(tabScope('devices')).toBe('personal');
+		// D-05 `#scopeSw`: the other scope is disabled with the tab's reason.
+		expect(TAB_SCOPE_WHY.members).toBe('People are invited to a project, not to a machine.');
+		expect(TAB_SCOPE_WHY.policies).toBe('Roles are defined per project.');
+	});
+
+	it('name the access store in the file bar (G-ACCESS §11.2 D-4)', () => {
+		expect(accessStorePath(true)).toBe('server operator database');
+		expect(accessStorePath(false)).toBe('<data-dir>/access.db');
 	});
 
 	it('resolve to the People section for the nav highlight, header and iyke line', () => {

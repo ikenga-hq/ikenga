@@ -571,6 +571,13 @@ impl InviteThrottle {
         Ok(())
     }
 
+    /// Whether an accept outcome spends `addr`'s budget: a gone token, and
+    /// (review WP76-R8) a taken or invalid username/password — otherwise a
+    /// live `allow_new_account` token is an unlimited username oracle.
+    pub fn counts(code: Code) -> bool {
+        matches!(code, Code::Gone | Code::Conflict | Code::InvalidRequest)
+    }
+
     /// Record a failed (gone) lookup from `addr`.
     pub fn fail(&self, addr: &str, now: i64) {
         let mut map = self.fails.lock().unwrap_or_else(|e| e.into_inner());
@@ -598,6 +605,10 @@ pub struct Accepted {
     pub project_key: String,
     pub project_name: String,
     pub role: Role,
+    /// Fixed at issue: `Some` for an artifact-scoped membership (WP76-R7).
+    pub artifact_path: Option<String>,
+    /// The Owner's username, for the share selection (WP76-R7).
+    pub owner_username: Option<String>,
     pub new_account: bool,
     #[cfg(target_os = "linux")]
     pub account: Option<crate::server::operator::accounts::Account>,
@@ -644,6 +655,7 @@ pub async fn accept(
 ) -> Result<Accepted, AccessError> {
     use super::audit::AuditVia;
     use crate::server::operator::accounts;
+    use crate::server::operator::provision::ProvisionError;
     let store = &host.store;
     let mut conn = store
         .pool()
@@ -678,6 +690,18 @@ pub async fn accept(
                     .await
                     .map_err(AccessError::internal)?;
                 if n >= i64::from(max) {
+                    // §4.4 / §7.3: a refused creation is a provision failure,
+                    // recorded in its own transaction (review WP76-R6).
+                    drop(tx);
+                    host.provisioner
+                        .record_provision_failed(
+                            store.pool(),
+                            username,
+                            &ProvisionError::Host(anyhow::anyhow!(
+                                "reason=max_accounts (--max-accounts {max})"
+                            )),
+                        )
+                        .await;
                     return Err(AccessError::new(
                         Code::Forbidden,
                         "provision_failed: reason=max_accounts — this server has no room for \
@@ -704,103 +728,142 @@ pub async fn accept(
             (a.principal_id, a.username, Some(guard), true)
         }
     };
-    if principal == owner {
-        return Err(AccessError::new(
-            Code::Conflict,
-            "this is your own project — you are its Owner",
-        ));
-    }
-    let member = principal.to_string();
-    let already: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM project_members WHERE project_key = ? AND member_principal_id = ? \
-         AND removed_at IS NULL",
-    )
-    .bind(&inv.project_key)
-    .bind(&member)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(AccessError::internal)?;
-    if already.is_some() {
-        return Err(AccessError::new(
-            Code::Conflict,
-            "you already have access to this project",
-        ));
-    }
-    // A-25: single use — the conditional update is the claim.
-    let claimed = sqlx::query(
-        "UPDATE invites SET accepted_at = ?, accepted_by = ? \
-         WHERE invite_id = ? AND accepted_at IS NULL AND revoked_at IS NULL",
-    )
-    .bind(now)
-    .bind(&member)
-    .bind(&inv.invite_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(AccessError::internal)?;
-    if claimed.rows_affected() != 1 {
-        return Err(gone());
-    }
-    sqlx::query(
-        "INSERT INTO project_members (project_key, member_principal_id, role, scope_kind, \
-           artifact_path, expires_at, invite_id, added_by, added_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&inv.project_key)
-    .bind(&member)
-    .bind(inv.role.as_str())
-    .bind(if inv.artifact_path.is_some() {
-        "artifact"
-    } else {
-        "project"
-    })
-    .bind(&inv.artifact_path)
-    .bind(inv.member_expires_at)
-    .bind(&inv.invite_id)
-    .bind(&inv.issued_by)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .map_err(AccessError::internal)?;
-    let project_name: Option<String> =
-        sqlx::query_scalar("SELECT display_name FROM shared_projects WHERE project_key = ?")
-            .bind(&inv.project_key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(AccessError::internal)?;
-    let project_name = project_name.unwrap_or_else(|| project_id.clone());
-    let via = if new_account {
-        AuditVia::System
-    } else {
-        AuditVia::Session
-    };
-    let actor = |kind: &'static str| {
-        let mut e = Event::new(kind, via);
-        e.principal_id = Some(member.clone());
-        e.subject_principal_id = Some(member.clone());
-        e.project_key = Some(inv.project_key.clone());
-        e.remote_addr = meta.remote_addr.clone();
-        e.user_agent = meta.user_agent.clone();
-        e
-    };
-    let accepted_ev = actor("invite.accepted")
-        .target(username.clone())
-        .detail(json!({ "invite_id": inv.invite_id, "new_account": new_account }));
-    let added_ev = actor("member.added")
-        .target(format!("{username} → {}", inv.role.as_str()))
-        .detail(json!({
-            "role": inv.role.as_str(),
-            "scope": if inv.artifact_path.is_some() { "artifact" } else { "project" },
-        }));
-    let chain = store.chain();
-    chain
-        .append(&mut tx, &accepted_ev)
+    // Everything after `create_in` runs in this block so that a failure
+    // there (a lost single-use race, a degraded audit chain, a failed
+    // COMMIT) still undoes the host user and records `auth.provision_failed`
+    // in its own transaction (§7.3, review WP76-R6).
+    let steps = async {
+        if principal == owner {
+            return Err(AccessError::new(
+                Code::Conflict,
+                "this is your own project — you are its Owner",
+            ));
+        }
+        let member = principal.to_string();
+        let already: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM project_members WHERE project_key = ? AND member_principal_id = ? \
+             AND removed_at IS NULL",
+        )
+        .bind(&inv.project_key)
+        .bind(&member)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(audit_err)?;
-    let head = chain.append(&mut tx, &added_ev).await.map_err(audit_err)?;
-    if let Err(e) = tx.commit().await {
-        // The guard (if any) undoes the host user and dirs on drop.
-        return Err(AccessError::internal(e));
+        .map_err(AccessError::internal)?;
+        if already.is_some() {
+            return Err(AccessError::new(
+                Code::Conflict,
+                "you already have access to this project",
+            ));
+        }
+        // A-25: single use — the conditional update is the claim.
+        let claimed = sqlx::query(
+            "UPDATE invites SET accepted_at = ?, accepted_by = ? \
+             WHERE invite_id = ? AND accepted_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(&member)
+        .bind(&inv.invite_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AccessError::internal)?;
+        if claimed.rows_affected() != 1 {
+            return Err(gone());
+        }
+        sqlx::query(
+            "INSERT INTO project_members (project_key, member_principal_id, role, scope_kind, \
+               artifact_path, expires_at, invite_id, added_by, added_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&inv.project_key)
+        .bind(&member)
+        .bind(inv.role.as_str())
+        .bind(if inv.artifact_path.is_some() {
+            "artifact"
+        } else {
+            "project"
+        })
+        .bind(&inv.artifact_path)
+        .bind(inv.member_expires_at)
+        .bind(&inv.invite_id)
+        .bind(&inv.issued_by)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(AccessError::internal)?;
+        let project_name: Option<String> =
+            sqlx::query_scalar("SELECT display_name FROM shared_projects WHERE project_key = ?")
+                .bind(&inv.project_key)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AccessError::internal)?;
+        let project_name = project_name.unwrap_or_else(|| project_id.clone());
+        let owner_username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM accounts WHERE principal_id = ?")
+                .bind(owner.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AccessError::internal)?;
+        let via = if new_account {
+            AuditVia::System
+        } else {
+            AuditVia::Session
+        };
+        let actor = |kind: &'static str| {
+            let mut e = Event::new(kind, via);
+            e.principal_id = Some(member.clone());
+            e.subject_principal_id = Some(member.clone());
+            e.project_key = Some(inv.project_key.clone());
+            e.remote_addr = meta.remote_addr.clone();
+            e.user_agent = meta.user_agent.clone();
+            e
+        };
+        let accepted_ev = actor("invite.accepted")
+            .target(username.clone())
+            .detail(json!({ "invite_id": inv.invite_id, "new_account": new_account }));
+        let added_ev = actor("member.added")
+            .target(format!("{username} → {}", inv.role.as_str()))
+            .detail(json!({
+                "role": inv.role.as_str(),
+                "scope": if inv.artifact_path.is_some() { "artifact" } else { "project" },
+            }));
+        let chain = store.chain();
+        chain
+            .append(&mut tx, &accepted_ev)
+            .await
+            .map_err(audit_err)?;
+        let head = chain.append(&mut tx, &added_ev).await.map_err(audit_err)?;
+        Ok::<_, AccessError>((head, project_name, owner_username))
     }
+    .await;
+    let committed = match steps {
+        Ok((head, project_name, owner_username)) => tx
+            .commit()
+            .await
+            .map(|()| (head, project_name, owner_username))
+            .map_err(AccessError::internal),
+        Err(e) => {
+            drop(tx);
+            Err(e)
+        }
+    };
+    let (head, project_name, owner_username) = match committed {
+        Ok(v) => v,
+        Err(e) => {
+            // The guard (if any) undoes the host user and dirs on drop.
+            if let Some(g) = guard {
+                drop(g);
+                host.provisioner
+                    .record_provision_failed(
+                        store.pool(),
+                        &username,
+                        &ProvisionError::Host(anyhow::anyhow!("invite accept: {e}")),
+                    )
+                    .await;
+            }
+            return Err(e);
+        }
+    };
+    let chain = store.chain();
     chain.committed(head);
     let account = guard.map(|g| g.committed());
 
@@ -825,6 +888,8 @@ pub async fn accept(
         project_key: inv.project_key,
         project_name,
         role: inv.role,
+        artifact_path: inv.artifact_path,
+        owner_username,
         new_account,
         account,
     })
@@ -1068,6 +1133,12 @@ pub(crate) mod tests {
         assert_eq!(t.check("1.2.3.4", 1).unwrap_err().code, Code::Throttled);
         t.check("5.6.7.8", 1).unwrap();
         t.check("1.2.3.4", InviteThrottle::WINDOW_MS + 1).unwrap();
+        // WP76-R8: a taken / invalid username spends the budget too.
+        for c in [Code::Gone, Code::Conflict, Code::InvalidRequest] {
+            assert!(InviteThrottle::counts(c), "{c:?}");
+        }
+        assert!(!InviteThrottle::counts(Code::Unauthenticated));
+        assert!(!InviteThrottle::counts(Code::Internal));
     }
 
     /// §7.3 against a real `accounts.db` and the provisioning core (a fake
@@ -1285,6 +1356,15 @@ pub(crate) mod tests {
             assert_eq!(
                 count(
                     &f,
+                    "SELECT COUNT(*) FROM auth_events WHERE kind = 'provision_failed'"
+                )
+                .await,
+                1,
+                "§7.3: still recorded, in its own transaction (WP76-R6)"
+            );
+            assert_eq!(
+                count(
+                    &f,
                     "SELECT COUNT(*) FROM invites WHERE accepted_at IS NOT NULL"
                 )
                 .await,
@@ -1303,6 +1383,43 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
+        }
+
+        /// §4.4: `--max-accounts` refuses the creation and records
+        /// `auth.provision_failed` (review WP76-R6).
+        #[tokio::test]
+        async fn max_accounts_refuses_and_records_the_failure() {
+            let mut f = fx().await;
+            f.host.options.max_accounts = Some(1);
+            let t = token(&f, true).await;
+            let e = accept(
+                &f.host,
+                &t,
+                new_form("tomi"),
+                &RequestMeta::default(),
+                now_ms(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.code, Code::Forbidden);
+            assert!(e.message.contains("max_accounts"), "{}", e.message);
+            assert_eq!(count(&f, "SELECT COUNT(*) FROM accounts").await, 1);
+            assert_eq!(
+                count(
+                    &f,
+                    "SELECT COUNT(*) FROM auth_events WHERE kind = 'provision_failed'"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                count(
+                    &f,
+                    "SELECT COUNT(*) FROM invites WHERE accepted_at IS NOT NULL"
+                )
+                .await,
+                0
+            );
         }
 
         /// A-25: two concurrent accepts of one token — exactly one succeeds.

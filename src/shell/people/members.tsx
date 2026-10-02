@@ -53,7 +53,7 @@ import { currentShare } from '@/lib/transport';
 import { isT1Session } from '@/lib/transport/t1-session';
 
 import { relativeTime } from './devices-model';
-import { Kv, PeopleBlock, PeopleHeader } from './frame';
+import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader } from './frame';
 import { ShareKolaSheet } from './share-kola-sheet';
 import { SharedWithYou } from './shared-with-you';
 
@@ -291,6 +291,7 @@ export function MembersTab() {
 				projectName={name}
 				onIssued={() => void reload()}
 			/>
+			<PeopleFileBar t1={tier === 't1'} />
 		</div>
 	);
 }
@@ -457,7 +458,8 @@ function PeopleTable({
 								<span className="block font-medium text-[var(--fg)]">
 									{list.owner.username ?? 'Owner'}
 								</span>
-								<Kv>{canEdit || !currentShare() ? 'you · Owner' : 'Owner'}</Kv>
+								{/* D-05 `m.self`: the Owner's own row reads "you · this device". */}
+								<Kv>{currentShare() ? 'Owner' : 'you · this device'}</Kv>
 							</td>
 							<td className="px-3 py-2">
 								<span title={OWNER_FIXED_REASON}>

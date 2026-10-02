@@ -10,6 +10,7 @@ import {
 	PrincipalAxis,
 	SHARED_REASON,
 	scopeDisabledReason,
+	secretLayer,
 	vaultAxis,
 } from './principal-axis';
 
@@ -54,5 +55,20 @@ describe('principal axis', () => {
 		expect(screen.getByText(SHARED_REASON)).toBeTruthy();
 		rerender(<PrincipalAxis axis="desktop" username={null} share={null} />);
 		expect(container.textContent).toBe('');
+	});
+
+	it('tells your keys from the operator default in a mixed Workspace list (WP76-R3)', () => {
+		// `secrets_index_names`: env names bare, store names `workspace::KEY`.
+		const index = ['OPENAI_KEY', 'SHARED', 'workspace::MINE', 'workspace::SHARED', 'project::p::X'];
+		const layer = (k: string) => secretLayer('principal', 'workspace', k, index);
+		expect(layer('MINE')).toBe('own');
+		expect(layer('SHARED')).toBe('override');
+		expect(layer('OPENAI_KEY')).toBe('default');
+		// Unknown layers are never presented as yours.
+		expect(secretLayer('principal', 'workspace', 'MINE', undefined)).toBe('default');
+		// Project / pkg scopes exist only in your store; the T0 default is all default.
+		expect(secretLayer('principal', 'project', 'X', index)).toBe('own');
+		expect(secretLayer('operator', 'workspace', 'OPENAI_KEY', index)).toBe('default');
+		expect(secretLayer('desktop', 'workspace', 'ANY', undefined)).toBe('own');
 	});
 });

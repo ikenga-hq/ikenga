@@ -48,6 +48,33 @@ export function scopeDisabledReason(axis: VaultAxis, scope: ScopeKind): string |
 	return null;
 }
 
+/** Which layer a listed key comes from (review WP76-R3). On a principal
+ *  store the Workspace list merges the operator default's env keys in
+ *  (`DaemonSecrets::list_keys_scoped`), so a row is:
+ *  - `own`: only in your store (edit, delete);
+ *  - `override`: in your store over an operator default (edit, "Remove your
+ *    override" — the default shows through again);
+ *  - `default`: only the operator default (read-only; "Override" writes a
+ *    value of your own into your store).
+ *  `indexNames` is `secrets_index_names` (env names bare, store names
+ *  `workspace::KEY`); while it is unknown every principal Workspace row is
+ *  treated as `default` (read-only) rather than presented as yours. */
+export type SecretLayer = 'own' | 'override' | 'default';
+
+export function secretLayer(
+	axis: VaultAxis,
+	scope: ScopeKind,
+	key: string,
+	indexNames: readonly string[] | undefined
+): SecretLayer {
+	if (axis === 'operator') return 'default';
+	if (axis !== 'principal' || scope !== 'workspace') return 'own';
+	if (!indexNames) return 'default';
+	const inStore = indexNames.includes(`workspace::${key}`);
+	if (!inStore) return 'default';
+	return indexNames.includes(key) ? 'override' : 'own';
+}
+
 /** Whether the lock / passphrase controls apply: only the desktop keychain
  *  has a passphrase layer; a principal store is sealed server-side. */
 export function hasPassphraseLayer(axis: VaultAxis): boolean {

@@ -1,6 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { createFileRoute } from '@tanstack/react-router';
-import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import {
 	Eye,
 	EyeOff,
@@ -16,15 +15,7 @@ import {
 	ShieldAlert,
 	Trash2,
 } from 'lucide-react';
-import {
-	type KeyboardEvent,
-	useCallback,
-	useEffect,
-	useMemo,
-	useRef,
-	useState,
-} from 'react';
-
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
 	Dialog,
@@ -37,13 +28,6 @@ import {
 import { Input } from '@/components/ui/input';
 import { cn } from '@/components/ui/utils';
 import {
-	type VaultScope,
-	isRemoteWebSession,
-	pkgKernelStatus,
-} from '@/lib/tauri-cmd';
-import { currentShare } from '@/lib/transport';
-import { currentPrincipal } from '@/lib/transport/t1-session';
-import {
 	secretsLockStateQueryOptions,
 	useDeleteScopedSecret,
 	useLockSecrets,
@@ -53,9 +37,20 @@ import {
 } from '@/lib/queries/secrets';
 import { useShellStore } from '@/lib/shell/shell-store';
 import {
+	isRemoteWebSession,
+	pkgKernelStatus,
+	secretsIndexNames,
+	type VaultScope,
+} from '@/lib/tauri-cmd';
+import { currentShare } from '@/lib/transport';
+import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
+import { currentPrincipal } from '@/lib/transport/t1-session';
+import {
 	hasPassphraseLayer,
 	PrincipalAxis,
+	type SecretLayer,
 	scopeDisabledReason,
+	secretLayer,
 	type VaultAxis,
 	vaultAxis,
 } from '@/shell/secrets/principal-axis';
@@ -107,7 +102,8 @@ function SecretsPage() {
 
 	const scope: VaultScope = useMemo(() => {
 		if (tab === 'workspace') return { kind: 'workspace' };
-		if (tab === 'project') return { kind: 'project', id: projectId || activeProjectId || 'default' };
+		if (tab === 'project')
+			return { kind: 'project', id: projectId || activeProjectId || 'default' };
 		return { kind: 'pkg', id: effectivePkgId };
 	}, [tab, projectId, activeProjectId, effectivePkgId]);
 
@@ -117,7 +113,19 @@ function SecretsPage() {
 		enabled: canQuery && vaultUnlocked,
 	});
 
+	// WP76-R3: on your own store the Workspace list includes the operator
+	// default's keys; the store's own names tell the layers apart.
+	const layered = axis === 'principal' && tab === 'workspace';
+	const indexQuery = useQuery({
+		queryKey: ['secrets', 'index-names'] as const,
+		queryFn: () => secretsIndexNames(),
+		enabled: layered && vaultUnlocked,
+	});
+	const layerOf = (key: string): SecretLayer =>
+		secretLayer(axis, tab, key, layered ? indexQuery.data : undefined);
+
 	const [editKey, setEditKey] = useState<string | null>(null);
+	const [editLayer, setEditLayer] = useState<SecretLayer>('own');
 	const [addingNew, setAddingNew] = useState(false);
 
 	// A shared project: the Owner's secrets are never reachable (§4.1).
@@ -145,9 +153,9 @@ function SecretsPage() {
 					Vault secrets
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
-					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project secrets
-					are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve at
-					command-handling time inside the kernel.
+					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project
+					secrets are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve
+					at command-handling time inside the kernel.
 				</p>
 			</header>
 
@@ -267,8 +275,12 @@ function SecretsPage() {
 								key={k}
 								scope={scope}
 								name={k}
+								layer={layerOf(k)}
 								writable={writable}
-								onEdit={() => setEditKey(k)}
+								onEdit={() => {
+									setEditLayer(layerOf(k));
+									setEditKey(k);
+								}}
 							/>
 						))}
 					</ul>
@@ -283,6 +295,7 @@ function SecretsPage() {
 				<SecretDialog
 					scope={scope}
 					editKey={editKey}
+					overriding={editKey !== null && editLayer === 'default'}
 					onClose={() => {
 						setAddingNew(false);
 						setEditKey(null);
@@ -500,11 +513,14 @@ function ScopeTabList({
 function SecretRow({
 	scope,
 	name,
+	layer,
 	writable,
 	onEdit,
 }: {
 	scope: VaultScope;
 	name: string;
+	/** WP76-R3: which layer the key comes from (principal axis). */
+	layer: SecretLayer;
 	writable: boolean;
 	onEdit: () => void;
 }) {
@@ -539,9 +555,26 @@ function SecretRow({
 	}
 
 	return (
-		<li className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs">
+		<li
+			data-secret-layer={layer}
+			className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2 text-xs"
+		>
 			<div className="min-w-0">
-				<div className="truncate font-mono font-medium text-foreground">{name}</div>
+				<div className="flex min-w-0 items-center gap-2">
+					<span className="truncate font-mono font-medium text-foreground">{name}</span>
+					{layer !== 'own' && (
+						<span
+							className="shrink-0 rounded border border-border px-1.5 py-px font-mono text-[10px] text-muted-foreground"
+							title={
+								layer === 'default'
+									? 'Set on the host by the operator (IKENGA_SECRET_*). Read-only from here.'
+									: 'Your value, over an operator default of the same name.'
+							}
+						>
+							{layer === 'default' ? 'operator default' : 'your override'}
+						</span>
+					)}
+				</div>
 				<div className="mt-0.5 flex gap-3 font-mono text-[10px] text-muted-foreground">
 					<span>used-by: not tracked yet</span>
 					<span>last changed: not tracked yet</span>
@@ -577,7 +610,19 @@ function SecretRow({
 				>
 					{revealed ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
 				</Button>
-				{writable && (
+				{writable && layer === 'default' && (
+					<Button
+						variant="ghost"
+						size="sm"
+						className="h-6 px-2 text-[11px]"
+						onClick={onEdit}
+						aria-label={`Override ${name} with a value of your own`}
+						title="Set a value of your own; the operator default stays on the host"
+					>
+						Override
+					</Button>
+				)}
+				{writable && layer !== 'default' && (
 					<>
 						<Button
 							variant="ghost"
@@ -594,8 +639,13 @@ function SecretRow({
 							className="h-6 px-2 text-[11px] text-muted-foreground hover:text-red-700"
 							onClick={async () => {
 								const ok = await confirmDialog(
-									`Delete "${name}" from the ${scope.kind} scope? Anything using it will fail at its next run — the value cannot be recovered.`,
-									{ title: 'Delete secret', kind: 'warning' }
+									layer === 'override'
+										? `Remove your override of "${name}"? The operator default shows through again.`
+										: `Delete "${name}" from the ${scope.kind} scope? Anything using it will fail at its next run — the value cannot be recovered.`,
+									{
+										title: layer === 'override' ? 'Remove your override' : 'Delete secret',
+										kind: 'warning',
+									}
 								);
 								if (!ok) return;
 								delMut.mutate(
@@ -604,7 +654,10 @@ function SecretRow({
 								);
 							}}
 							disabled={delMut.isPending}
-							aria-label={`Delete secret ${name}`}
+							aria-label={
+								layer === 'override' ? `Remove your override of ${name}` : `Delete secret ${name}`
+							}
+							title={layer === 'override' ? 'Remove your override' : undefined}
 						>
 							<Trash2 className="h-3 w-3" />
 						</Button>
@@ -618,10 +671,13 @@ function SecretRow({
 function SecretDialog({
 	scope,
 	editKey,
+	overriding = false,
 	onClose,
 }: {
 	scope: VaultScope;
 	editKey: string | null;
+	/** WP76-R3: a new value of your own over an operator default. */
+	overriding?: boolean;
 	onClose: () => void;
 }) {
 	const [name, setName] = useState(editKey ?? '');
@@ -633,11 +689,18 @@ function SecretDialog({
 		<Dialog open onOpenChange={(o) => !o && onClose()}>
 			<DialogContent>
 				<DialogHeader>
-					<DialogTitle>{editKey ? `Edit secret: ${editKey}` : 'Add secret'}</DialogTitle>
+					<DialogTitle>
+						{overriding
+							? `Override: ${editKey}`
+							: editKey
+								? `Edit secret: ${editKey}`
+								: 'Add secret'}
+					</DialogTitle>
 					<DialogDescription>
-						Scope: <span className="font-mono">{scopeLabel(scope)}</span>. Values are
-						Encrypted at rest in the OS keychain and never written to a log. For an existing secret the
-						field starts empty; type a value to replace it.
+						Scope: <span className="font-mono">{scopeLabel(scope)}</span>.{' '}
+						{overriding
+							? 'Your value goes into your own store and is used instead of the operator default; the default on the host is unchanged.'
+							: 'Values are Encrypted at rest in the OS keychain and never written to a log. For an existing secret the field starts empty; type a value to replace it.'}
 					</DialogDescription>
 				</DialogHeader>
 				<div className="space-y-3">

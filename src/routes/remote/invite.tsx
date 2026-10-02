@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { type FormEvent, useEffect, useId, useState } from 'react';
 
-import { setShareMode } from '@/lib/transport';
+import { type ShareSelection, setShareMode } from '@/lib/transport';
 import { type AuthMe, fetchAuthMe, signInWithPassword } from '@/lib/transport/t1-session';
 
 // `/remote/invite#t=<token>` — accepting a "Share kola" invite (G-ACCESS §7.3,
@@ -30,12 +30,16 @@ export interface InviteInfo {
 	allow_new_account: boolean;
 }
 
-interface AcceptedShare {
+export interface AcceptedShare {
 	projectKey: string;
 	ownerPrincipalId: string;
 	projectId: string;
 	projectName: string;
+	ownerUsername?: string | null;
 	role: 'operator' | 'reviewer' | 'guest';
+	/** Fixed at issue (§7.2); absent from an older server → project. */
+	scope?: 'project' | 'artifact';
+	artifactPath?: string | null;
 }
 
 const ROLE_LINE: Record<InviteInfo['role'], string> = {
@@ -85,17 +89,23 @@ async function post(
 	return { status: res.status, json };
 }
 
+/** The share selection an accepted invite opens (§4.5.2): scope and
+ *  artifact as fixed at issue, so a Guest lands artifact-scoped (WP76-R7). */
+export function selectionFromAccept(share: AcceptedShare): ShareSelection {
+	const artifact = share.scope === 'artifact' || !!share.artifactPath;
+	return {
+		projectKey: share.projectKey,
+		projectId: share.projectId,
+		projectName: share.projectName,
+		ownerUsername: share.ownerUsername ?? null,
+		role: share.role,
+		scope: artifact ? 'artifact' : 'project',
+		...(artifact && share.artifactPath ? { artifactPath: share.artifactPath } : {}),
+	};
+}
+
 function enter(share: AcceptedShare | undefined) {
-	if (share) {
-		setShareMode({
-			projectKey: share.projectKey,
-			projectId: share.projectId,
-			projectName: share.projectName,
-			ownerUsername: null,
-			role: share.role,
-			scope: 'project',
-		});
-	}
+	if (share) setShareMode(selectionFromAccept(share));
 	window.location.assign('/');
 }
 

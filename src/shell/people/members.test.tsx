@@ -141,6 +141,11 @@ describe('MembersTab', () => {
 		expect(screen.getByText(/Sharing needs an account/)).toBeTruthy();
 		expect(container.querySelector('[data-state="members"]')).toBeTruthy();
 		expect(mocks.accessMembersList).not.toHaveBeenCalled();
+		// D-4: the file bar names the access store, with no Open file button.
+		expect(container.querySelector('[data-filebar]')?.textContent).toContain(
+			'access store · <data-dir>/access.db'
+		);
+		expect(screen.queryByRole('button', { name: /Open file/ })).toBeNull();
 	});
 
 	it('T1: the people table, the fixed Owner row, Remove with Undo, pending invites', async () => {
@@ -153,6 +158,10 @@ describe('MembersTab', () => {
 		expect(container.querySelector('[data-state="members-shared"]')).toBeTruthy();
 		const owner = container.querySelector('[data-member="owner"]');
 		expect(owner?.textContent).toContain('nedjamez');
+		expect(owner?.textContent).toContain('you · this device');
+		expect(container.querySelector('[data-filebar]')?.textContent).toContain(
+			'access store · server operator database'
+		);
 		expect(screen.getByText('plans/shell/board.html')).toBeTruthy();
 		expect(screen.getByText('expires in 4 d')).toBeTruthy();
 		expect(screen.getByText('tomi@example.com')).toBeTruthy();

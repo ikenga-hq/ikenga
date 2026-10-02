@@ -6,7 +6,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { __resetShareModeForTests, currentShare } from '@/lib/transport';
-import { InvitePage, inviteErrorCopy, tokenFromHash } from '@/routes/remote/invite';
+import {
+	InvitePage,
+	inviteErrorCopy,
+	selectionFromAccept,
+	tokenFromHash,
+} from '@/routes/remote/invite';
 
 const fetchMock = vi.fn<typeof fetch>();
 const TOKEN = 'iki1.01890a5d-ac96-774b-bcce-b302099a8057.c2VjcmV0';
@@ -44,6 +49,28 @@ describe('invite helpers', () => {
 		expect(tokenFromHash('')).toBeNull();
 		expect(inviteErrorCopy(410, null)).toMatch(/used, revoked or has expired/);
 		expect(inviteErrorCopy(429, null)).toMatch(/Too many/);
+	});
+
+	it('opens the share with the scope fixed at issue (WP76-R7)', () => {
+		const base = {
+			projectKey: '01890a5d-ac96-774b-bcce-b302099a8057/royalti-co',
+			ownerPrincipalId: '01890a5d-ac96-774b-bcce-b302099a8057',
+			projectId: 'royalti-co',
+			projectName: 'royalti-co',
+		};
+		expect(
+			selectionFromAccept({
+				...base,
+				role: 'guest',
+				ownerUsername: 'ned',
+				scope: 'artifact',
+				artifactPath: 'plans/board.html',
+			})
+		).toMatchObject({ scope: 'artifact', artifactPath: 'plans/board.html', ownerUsername: 'ned' });
+		const project = selectionFromAccept({ ...base, role: 'operator' });
+		expect(project.scope).toBe('project');
+		expect(project.ownerUsername).toBeNull();
+		expect('artifactPath' in project).toBe(false);
 	});
 });
 

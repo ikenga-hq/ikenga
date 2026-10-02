@@ -35,7 +35,7 @@ import {
 } from '@/lib/access/client';
 import { currentShare } from '@/lib/transport';
 
-import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
+import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader, PeopleRow } from './frame';
 import {
 	type MembersList,
 	personName,
@@ -275,6 +275,7 @@ export function PoliciesTab() {
 					</PeopleRow>
 				</PeopleBlock>
 			)}
+			<PeopleFileBar t1={tier === 't1'} />
 		</div>
 	);
 }

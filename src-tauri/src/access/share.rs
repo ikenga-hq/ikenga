@@ -674,6 +674,23 @@ async fn prehook_inner(
                 return Err(forbidden("outside the shared project"));
             }
         }
+        // Review WP76-R1: the arms keyed by a studio thread id are confined
+        // by the thread's own folder, not by the id being unguessable.
+        "studio_message_list" | "studio_message_append" => {
+            studio_thread_check(state, args, &target).await?
+        }
+        // Review WP76-R2: `install` under a share reaches the shared
+        // project's scope only — never `workspace` (the Owner's ~/.claude,
+        // ~/.claude.json) or another project — and only for the Claude
+        // engine, whose project-scope files all live under the project root
+        // (the other engines' hook / MCP homes are user-level files).
+        "claude_primitive_enable_for"
+        | "claude_primitive_disable_for"
+        | "claude_primitive_remove_for" => install_scope_check(share, args)?,
+        // Review WP76-R9: a member's comment never carries a screenshot
+        // (`comment_create` drops it), so nothing is written into the
+        // Owner's data dir; the composer gets no path back.
+        "pin_screenshot_write" => return Ok(PreHook::Answered(RpcResponse::success(Value::Null))),
         _ => {}
     }
     let narrowed = narrowed_state(state, &target, ACTIONS_ARMS.contains(&cmd))?;
@@ -762,6 +779,61 @@ async fn project_row(
         .find(|p| p.id == project_id)
         .ok_or_else(|| AccessError::new(Code::NotFound, "no such project"))?;
     Ok(PreHook::Answered(RpcResponse::success(p)))
+}
+
+/// `studio_message_list` / `studio_message_append` under a share: the
+/// thread's `folder_path` must lie under the share, else `not_found` (no
+/// existence oracle for the Owner's other threads).
+async fn studio_thread_check(
+    state: &crate::server::AppState,
+    args: &Value,
+    target: &Path,
+) -> Result<(), AccessError> {
+    let db = state
+        .pa_db
+        .as_ref()
+        .ok_or_else(|| AccessError::new(Code::NotFound, "no such thread in the shared project"))?;
+    thread_in_share(db, args, target).await
+}
+
+async fn thread_in_share(
+    db: &crate::db::PaDb,
+    args: &Value,
+    target: &Path,
+) -> Result<(), AccessError> {
+    let not_found = || AccessError::new(Code::NotFound, "no such thread in the shared project");
+    let id = str_arg(args, &["threadId", "thread_id"])
+        .filter(|id| !id.is_empty())
+        .ok_or_else(not_found)?;
+    let thread = crate::server::shared::studio_threads::thread_get(db, id.to_string())
+        .await
+        .map_err(|_| not_found())?;
+    if is_under(&thread.folder_path, target) {
+        Ok(())
+    } else {
+        Err(not_found())
+    }
+}
+
+/// The one store scope a share may install into: `project:<shared id>`, on
+/// a project-scoped share, for the Claude engine.
+fn install_scope_check(share: &ShareCtx, args: &Value) -> Result<(), AccessError> {
+    if share.artifact_path.is_some() {
+        return Err(forbidden(
+            "an artifact share can't install into the project",
+        ));
+    }
+    if str_arg(args, &["scope"]) != Some(format!("project:{}", share.project_id).as_str()) {
+        return Err(forbidden(
+            "a share installs into the shared project's scope only",
+        ));
+    }
+    if str_arg(args, &["engine"]) != Some("claude") {
+        return Err(forbidden(
+            "a share installs for the Claude engine only (other engines keep user-level files)",
+        ));
+    }
+    Ok(())
 }
 
 /// `claude_read_jsonl` under a share (§4.5.4): the transcript's recorded
@@ -943,6 +1015,23 @@ const PATH_FIELDS: &[&str] = &[
     "root_path",
 ];
 
+/// Whether a link path (a dependent: a symlink into the store) sits under
+/// `base`. The link itself is not followed — its parent is canonicalized.
+fn link_under(path: &str, base: &Path) -> bool {
+    let p = Path::new(path);
+    if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name)
+            .starts_with(base),
+        _ => false,
+    }
+}
+
 fn row_under(row: &Value, base: &Path) -> bool {
     PATH_FIELDS.iter().any(|f| {
         row.get(*f)
@@ -1018,6 +1107,26 @@ pub fn filter(_ctx: &AccessCtx, share: &ShareCtx, cmd: &str, data: &mut Value) {
                 *data = Value::Null;
             }
         }
+        // Review WP76-R2: the Owner's other scopes and paths stay hidden.
+        "claude_store_list" => {
+            let shared = format!("project:{}", share.project_id);
+            if let Value::Array(rows) = data {
+                for row in rows.iter_mut() {
+                    if let Some(Value::Array(scopes)) = row.get_mut("enabledIn") {
+                        scopes.retain(|s| s.as_str() == Some(shared.as_str()));
+                    }
+                }
+            }
+        }
+        "oba_dependents" => {
+            if let Value::Array(paths) = data {
+                paths.retain(|p| {
+                    p.as_str()
+                        .zip(base.as_deref())
+                        .is_some_and(|(p, b)| link_under(p, b))
+                });
+            }
+        }
         _ => {}
     }
     if share.role == Some(Role::Reviewer) && is_session_read(cmd) {
@@ -1068,6 +1177,13 @@ pub fn chat_cwd(ctx: &AccessCtx, cwd: Option<String>) -> Result<Option<String>, 
     let Some(share) = &ctx.share else {
         return Ok(cwd);
     };
+    // Review WP76-R9: an artifact share confines to one file, and a run
+    // can't be confined to a file — its cwd would hold every sibling.
+    if share.artifact_path.is_some() {
+        return Err(forbidden(
+            "an artifact share can't start runs — ask for project access",
+        ));
+    }
     let base = share_base(share, false)?;
     match cwd {
         None => Ok(Some(base.to_string_lossy().into_owned())),
@@ -1084,6 +1200,29 @@ pub fn chat_cwd(ctx: &AccessCtx, cwd: Option<String>) -> Result<Option<String>, 
             }
         }
     }
+}
+
+/// `/ws/chat` outbound events under a share (§4.5.4 "chat usage/cost events
+/// dropped" for a Reviewer; review WP76-R5). Returns whether to send the
+/// event; for a Reviewer share, `usage` updates are dropped and every cost
+/// key is stripped from the rest. Own workspace and other roles: unchanged.
+/// WP-75 wires it at the `chat_ws` send site (§10.4 hand-off).
+pub fn chat_event(ctx: &AccessCtx, event: &mut Value) -> bool {
+    let Some(share) = &ctx.share else {
+        return true;
+    };
+    if share.role != Some(Role::Reviewer) {
+        return true;
+    }
+    let update = event.pointer("/params/update").unwrap_or(&*event);
+    let tag = ["sessionUpdate", "kind", "type"]
+        .iter()
+        .find_map(|k| update.get(*k).and_then(Value::as_str));
+    if tag.is_some_and(|t| t == "usage_update" || t == "usage" || t.contains("cost")) {
+        return false;
+    }
+    strip_costs(event);
+    true
 }
 
 /// Share-originated runs get no Ikenga vault env (§4.5.1, N-10): returns
@@ -1381,10 +1520,10 @@ mod tests {
         let guest = share_ctx(&id, Role::Guest, Some("docs/brief.md"));
         assert!(fs_watch_root(&guest, &s(&project.join("docs/brief.md"))).is_ok());
         assert!(fs_watch_root(&guest, &s(&project.join("docs"))).is_err());
-        assert_eq!(
-            chat_cwd(&guest, None).unwrap(),
-            Some(s(&project.join("docs")))
-        );
+        // WP76-R9: a run can't be confined to one file — refused.
+        assert_eq!(chat_cwd(&guest, None).unwrap_err().code, Code::Forbidden);
+        let artifact_operator = share_ctx(&id, Role::Operator, Some("docs/brief.md"));
+        assert!(chat_cwd(&artifact_operator, Some(s(&project.join("docs")))).is_err());
         assert!(
             !run_env(&ctx),
             "N-10: no vault env in share-originated runs"
@@ -1398,6 +1537,137 @@ mod tests {
         );
         assert!(fs_watch_root(&own, "/anywhere").is_ok());
         assert!(run_env(&own));
+    }
+
+    /// WP76-R1: the arms keyed by a studio thread id are confined by the
+    /// thread's folder — a thread outside the share is `not_found`.
+    #[tokio::test]
+    async fn studio_threads_outside_the_share_are_not_found() {
+        use crate::server::shared::studio_threads;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("proj");
+        std::fs::create_dir_all(project.join("deck")).unwrap();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let db = crate::db::PaDb::new(root.join("ikenga.db"));
+        let s = |p: &Path| p.to_string_lossy().into_owned();
+        let inside = studio_threads::thread_get_or_create(&db, s(&project.join("deck")))
+            .await
+            .unwrap();
+        let outside = studio_threads::thread_get_or_create(&db, s(&root.join("other")))
+            .await
+            .unwrap();
+        thread_in_share(&db, &json!({ "threadId": inside.id }), &project)
+            .await
+            .unwrap();
+        for args in [
+            json!({ "threadId": outside.id }),
+            json!({ "thread_id": outside.id }),
+            json!({ "threadId": "no-such-thread" }),
+            json!({}),
+        ] {
+            assert_eq!(
+                thread_in_share(&db, &args, &project)
+                    .await
+                    .unwrap_err()
+                    .code,
+                Code::NotFound,
+                "{args}"
+            );
+        }
+    }
+
+    /// WP76-R2: under a share `install` reaches `project:<shared>` for the
+    /// Claude engine only; the store listing hides the Owner's other scopes
+    /// and dependents outside the share.
+    #[test]
+    fn install_under_a_share_stays_in_the_shared_scope() {
+        let ctx = share_ctx("royalti-co", Role::Operator, None);
+        let share = ctx.share.clone().unwrap();
+        let ok = json!({"engine": "claude", "kind": "skill", "name": "x", "scope": "project:royalti-co"});
+        install_scope_check(&share, &ok).unwrap();
+        for scope in ["workspace", "project:other", "project:royalti-co/../x", ""] {
+            let args = json!({"engine": "claude", "kind": "hook", "name": "x", "scope": scope});
+            assert_eq!(
+                install_scope_check(&share, &args).unwrap_err().code,
+                Code::Forbidden,
+                "{scope}"
+            );
+        }
+        let codex =
+            json!({"engine": "codex", "kind": "mcp", "name": "x", "scope": "project:royalti-co"});
+        assert!(install_scope_check(&share, &codex).is_err());
+        let artifact = share_ctx("royalti-co", Role::Operator, Some("a.md"));
+        assert!(install_scope_check(artifact.share.as_ref().unwrap(), &ok).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().canonicalize().unwrap().join("proj");
+        std::fs::create_dir_all(project.join(".claude/skills")).unwrap();
+        let id = format!("store-{}", PrincipalId::new_v7());
+        remember_root(
+            &id,
+            &ShareRoot {
+                root: project.clone(),
+                name: "P".into(),
+            },
+        );
+        let ctx = share_ctx(&id, Role::Operator, None);
+        let share = ctx.share.clone().unwrap();
+        let mut list = json!([
+            {"name": "x", "enabledIn": ["workspace", format!("project:{id}"), "project:other"]},
+            {"name": "y", "enabledIn": ["workspace"]}
+        ]);
+        filter(&ctx, &share, "claude_store_list", &mut list);
+        assert_eq!(list[0]["enabledIn"], json!([format!("project:{id}")]));
+        assert_eq!(list[1]["enabledIn"], json!([]));
+        // A dependent is a symlink into the store: judged by where the link
+        // sits, not where it points.
+        let store = tmp.path().join("store-skill");
+        std::fs::create_dir_all(&store).unwrap();
+        let link = project.join(".claude/skills/x");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let mut deps = json!([
+            link.to_string_lossy(),
+            "/home/owner/.claude/skills/x",
+            "/elsewhere/proj/.claude/skills/x"
+        ]);
+        filter(&ctx, &share, "oba_dependents", &mut deps);
+        assert_eq!(deps, json!([link.to_string_lossy()]));
+        forget_root(&id);
+    }
+
+    /// WP76-R5: a Reviewer share's chat socket loses usage updates and cost
+    /// keys; other roles and your own workspace are unchanged.
+    #[test]
+    fn reviewer_chat_events_lose_usage_and_cost() {
+        let reviewer = share_ctx("p", Role::Reviewer, None);
+        let envelope = |update: Value| {
+            json!({"jsonrpc": "2.0", "method": "session/update",
+                   "params": {"thread_id": "t", "update": update}})
+        };
+        let mut usage = envelope(json!({"sessionUpdate": "usage_update", "used": 10}));
+        assert!(!chat_event(&reviewer, &mut usage));
+        let mut done = envelope(json!({"kind": "done", "usage": {"in": 1},
+            "totalCostUsd": 0.2, "stopReason": "end_turn"}));
+        assert!(chat_event(&reviewer, &mut done));
+        assert_eq!(
+            done["params"]["update"],
+            json!({"kind": "done", "stopReason": "end_turn"})
+        );
+        let mut text = envelope(json!({"sessionUpdate": "agent_message_chunk", "content": "hi"}));
+        let before = text.clone();
+        assert!(chat_event(&reviewer, &mut text));
+        assert_eq!(text, before);
+        let operator = share_ctx("p", Role::Operator, None);
+        let mut usage = envelope(json!({"sessionUpdate": "usage_update"}));
+        assert!(chat_event(&operator, &mut usage));
+        let own = AccessCtx {
+            share: None,
+            ..reviewer
+        };
+        let mut usage = envelope(json!({"sessionUpdate": "usage_update"}));
+        assert!(chat_event(&own, &mut usage));
     }
 
     /// §4.2: an artifact symlinked out of the project is `not_found`.

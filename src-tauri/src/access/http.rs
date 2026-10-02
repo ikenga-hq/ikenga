@@ -415,7 +415,7 @@ async fn invite_accept(
     let accepted = match super::invites::accept(&host, &token, form, &meta, now).await {
         Ok(a) => a,
         Err(e) => {
-            if e.code == super::Code::Gone {
+            if super::invites::InviteThrottle::counts(e.code) {
                 host.throttle.fail(&addr, now);
             }
             return access_error(&e);
@@ -451,7 +451,10 @@ async fn invite_accept(
             "ownerPrincipalId": owner,
             "projectId": project_id,
             "projectName": accepted.project_name,
+            "ownerUsername": accepted.owner_username,
             "role": accepted.role.as_str(),
+            "scope": if accepted.artifact_path.is_some() { "artifact" } else { "project" },
+            "artifactPath": accepted.artifact_path,
         },
     }))
     .into_response();
