@@ -39,11 +39,13 @@ vi.mock('@/lib/iyke/client', () => ({
 
 import {
 	ACP_ASK_ANSWERABLE_MS,
+	ASK_ALREADY_OVER,
 	decidePermissionRow,
 	HOOK_GATE_ANSWERABLE_MS,
 	hostDecideBlock,
 	isPermissionAskLive,
 	notificationActionButtons,
+	postHookDecision,
 	refreshHostDecideBlock,
 	setHostDecideBlock,
 } from './actions';
@@ -123,6 +125,21 @@ describe('notificationActionButtons', () => {
 		expect(mocks.iykeFetch).not.toHaveBeenCalled();
 	});
 
+	// Review WP78a-R5: a 2xx that reached no held gate is not an answer.
+	it('postHookDecision reads `gated: false` as "already over", not answered', async () => {
+		const json = (body: unknown) =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		mocks.iykeFetch.mockResolvedValueOnce(json({ recorded: true, gated: false }));
+		expect(await postHookDecision('req-1', 'approved')).toBe(ASK_ALREADY_OVER);
+		mocks.iykeFetch.mockResolvedValueOnce(json({ recorded: true, gated: true }));
+		expect(await postHookDecision('req-1', 'approved')).toBeNull();
+		// An older backend (no body / no flag) still reads as answered.
+		expect(await postHookDecision('req-1', 'denied')).toBeNull();
+	});
+
 	it('a desktop routed to another device offers no Allow / Deny (§5.1)', async () => {
 		mocks.accessStatus.mockResolvedValueOnce({ store: 'ok', caps: ['files', 'sessions'] });
 		mocks.accessRoutingGet.mockResolvedValueOnce({
@@ -181,7 +198,9 @@ describe('notificationActionButtons', () => {
 			requestId: 'req-1',
 			terminalId: null,
 		} as const;
-		expect(notificationActionButtons(row({ action: decide }), HOOK_GATE_ANSWERABLE_MS + 1)).toEqual([]);
+		expect(notificationActionButtons(row({ action: decide }), HOOK_GATE_ANSWERABLE_MS + 1)).toEqual(
+			[]
+		);
 	});
 
 	it('isPermissionAskLive: read-but-pending stays live; an older row without resolvedAt uses read state', () => {

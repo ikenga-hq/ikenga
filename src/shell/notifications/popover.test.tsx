@@ -22,6 +22,14 @@ const mocks = vi.hoisted(() => ({
 	notificationsUnmuteKind: vi.fn(),
 	navigateFocused: vi.fn(),
 	addTab: vi.fn(),
+	accessStatus: vi.fn(),
+	accessRoutingGet: vi.fn(),
+}));
+
+vi.mock('@/lib/access/client', async (orig) => ({
+	...(await orig<typeof import('@/lib/access/client')>()),
+	accessStatus: mocks.accessStatus,
+	accessRoutingGet: mocks.accessRoutingGet,
 }));
 
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
@@ -49,6 +57,7 @@ vi.mock('@/lib/iyke/client', () => ({
 	iykeFetch: vi.fn(() => Promise.resolve(new Response(null, { status: 204 }))),
 }));
 
+import { setHostDecideBlock } from './actions';
 import { NotificationsPopoverContent } from './popover';
 
 function render(ui: ReactElement) {
@@ -86,6 +95,8 @@ beforeEach(() => {
 	mocks.notificationsMuteState.mockResolvedValue(MUTE_STATE);
 	mocks.notificationsMarkAllRead.mockResolvedValue(0);
 	mocks.notificationsMarkRead.mockResolvedValue(0);
+	mocks.accessStatus.mockResolvedValue(null);
+	setHostDecideBlock(null);
 });
 
 afterEach(() => {
@@ -132,7 +143,12 @@ describe('NotificationsPopoverContent', () => {
 
 	it('clicking a row action marks that row read', async () => {
 		mocks.notificationsList.mockResolvedValue([
-			row({ id: 7, kind: 'violation', title: 'blocked ffmpeg', action: { kind: 'open.violations', pkgId: 'com.ikenga.pkg-browser' } }),
+			row({
+				id: 7,
+				kind: 'violation',
+				title: 'blocked ffmpeg',
+				action: { kind: 'open.violations', pkgId: 'com.ikenga.pkg-browser' },
+			}),
 		]);
 		render(<NotificationsPopoverContent onClose={vi.fn()} />);
 
@@ -161,5 +177,46 @@ describe('NotificationsPopoverContent', () => {
 
 		await userEvent.click(within(menu).getByText('run finished'));
 		expect(mocks.notificationsMuteKind).toHaveBeenCalledWith('run_finished');
+	});
+
+	// G-ACCESS §5.7 (WP-78a): a routed-away live ask shows where it is
+	// answered — and no dead Allow / Deny.
+	it('a routed-away ask shows its reason instead of Allow / Deny', async () => {
+		mocks.accessStatus.mockResolvedValue({ store: 'ok', caps: ['files', 'sessions'] });
+		mocks.accessRoutingGet.mockResolvedValue({
+			mode: 'this_device',
+			deviceId: 'd',
+			deviceName: 'ned-desktop',
+		});
+		const decide = {
+			kind: 'permission.decide',
+			via: 'hooks',
+			requestId: 'r',
+			terminalId: 't-1',
+		} as const;
+		mocks.notificationsList.mockResolvedValue([
+			row({ id: 3, title: 'live ask', action: decide }),
+			row({ id: 4, title: 'over ask', action: decide, resolvedAt: NOW, readAt: NOW }),
+		]);
+		render(<NotificationsPopoverContent onClose={vi.fn()} />);
+		const reason = await screen.findByText('Answer on ned-desktop (this device only)');
+		expect(reason.closest('[data-notification-row="3"]')).toBeTruthy();
+		expect(document.querySelectorAll('[data-state="notification-routed-away"]')).toHaveLength(1);
+		expect(screen.queryByRole('button', { name: 'Allow once' })).toBeNull();
+		expect(screen.getAllByRole('button', { name: 'Open terminal' })).toHaveLength(2);
+	});
+
+	it('an ask this device may answer shows Allow / Deny and no reason', async () => {
+		mocks.accessStatus.mockResolvedValue({ store: 'ok', caps: ['files', 'approve'] });
+		mocks.notificationsList.mockResolvedValue([
+			row({
+				id: 5,
+				title: 'answerable',
+				action: { kind: 'permission.decide', via: 'hooks', requestId: 'r', terminalId: 't' },
+			}),
+		]);
+		render(<NotificationsPopoverContent onClose={vi.fn()} />);
+		expect(await screen.findByRole('button', { name: 'Allow once' })).toBeTruthy();
+		expect(document.querySelector('[data-state="notification-routed-away"]')).toBeNull();
 	});
 });

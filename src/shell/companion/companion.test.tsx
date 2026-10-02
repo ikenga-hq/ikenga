@@ -26,8 +26,25 @@ vi.mock('@/lib/transport', async (orig) => ({
 	sendNotification: vi.fn(),
 }));
 
-const iykeFetch = vi.fn(async () => ({ ok: false, json: async () => ({}) }));
-vi.mock('@/lib/iyke/client', () => ({ iykeFetch: (...a: unknown[]) => iykeFetch(...(a as [])) }));
+// The hook gate takes decisions (a refused one is covered in
+// companion-store.test.ts); every other iyke endpoint is unavailable here.
+const iykeFetch = vi.fn(async (path?: unknown) => ({
+	ok: path === '/iyke/hooks/decision',
+	status: path === '/iyke/hooks/decision' ? 200 : 503,
+	json: async () => ({}),
+}));
+vi.mock('@/lib/iyke/client', () => ({
+	iykeFetch: (...a: unknown[]) => iykeFetch(...(a as [unknown])),
+}));
+
+// The host's routing (§5.1): unrouted unless a test says otherwise.
+const accessStatus = vi.fn(async (): Promise<unknown> => null);
+const accessRoutingGet = vi.fn(async (): Promise<unknown> => ({}));
+vi.mock('@/lib/access/client', async (orig) => ({
+	...(await orig<typeof import('@/lib/access/client')>()),
+	accessStatus: () => accessStatus(),
+	accessRoutingGet: () => accessRoutingGet(),
+}));
 
 const ptyWrite = vi.fn(async () => {});
 const chiRun = vi.fn(async () => ({ run_id: 'run-1', status: 'queued' }));
@@ -54,13 +71,14 @@ import { useDragState } from '@/lib/panes/drag-state';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { beginPointerDrag } from '@/lib/panes/pointer-drag';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { setHostDecideBlock } from '@/shell/notifications/actions';
 import { PaneDropZones } from '@/shell/panes/drop-zones';
 import { CostHud } from '@/terminal/cost-hud';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
 import { COMPANION_FOCUS_EVENT, Companion } from './companion';
 import {
-	PERMISSION_UNDO_MS,
 	__resetCompanionTimersForTests,
+	PERMISSION_UNDO_MS,
 	useCompanionStore,
 } from './companion-store';
 
@@ -338,6 +356,30 @@ describe('C3 — permission card (§5.6)', () => {
 		fireEvent.click(within(card).getByRole('button', { name: 'Allow once' }));
 		expect(card.getAttribute('data-status')).toBe('undoable');
 		expect(within(card).getByRole('button', { name: 'Undo' })).toBeTruthy();
+	});
+
+	// Review WP78a-R1: routed to another device (§5.1), a card offers no
+	// Allow / Always / Deny — the reason instead — and A does nothing.
+	it('a routed-away ask shows where it is answered, with no decision buttons', async () => {
+		accessStatus.mockResolvedValue({ store: 'ok', caps: ['files'] });
+		accessRoutingGet.mockResolvedValue({ deviceName: 'Pixel 9' });
+		useCompanionStore
+			.getState()
+			.receivePermission({ id: 'r4', kind: 'permission', toolName: 'Bash' });
+		wrap(<Companion />);
+		const card = screen.getByRole('group', { name: 'Permission request: Bash' });
+		await waitFor(() =>
+			expect(card.querySelector('[data-state="routed-away"]')?.textContent).toBe(
+				'Answer on Pixel 9 (this device only)'
+			)
+		);
+		expect(within(card).queryByRole('button', { name: 'Always for this project' })).toBeNull();
+		expect(within(card).queryByRole('button', { name: 'Allow once' })).toBeNull();
+		act(() => card.focus());
+		fireEvent.keyDown(card, { key: 'a' });
+		expect(card.getAttribute('data-status')).toBe('pending');
+		accessStatus.mockResolvedValue(null);
+		setHostDecideBlock(null);
 	});
 });
 
@@ -618,7 +660,9 @@ describe('C4 — drag between the Companion rail and the pane tree', () => {
 			focusedId: 'L1',
 		});
 		wrap(<Companion />);
-		fireEvent.contextMenu(document.querySelector('[role="option"][data-session="term-q"]') as HTMLElement);
+		fireEvent.contextMenu(
+			document.querySelector('[role="option"][data-session="term-q"]') as HTMLElement
+		);
 		fireEvent.click(screen.getByRole('menuitem', { name: 'Move to pane' }));
 		const leaf = usePaneStore.getState().root;
 		expect(leaf.type === 'leaf' && leaf.tabs.at(-1)).toEqual({

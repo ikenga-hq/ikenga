@@ -10,6 +10,13 @@ export interface RemoteConnectionInfo {
 	activeTerminals: number;
 	/** Agent turns in flight when the connection dropped. */
 	activeAgentTurns: number;
+	/**
+	 * A socket was closed on purpose (G-ACCESS §3.10): `revoked` (4401 — the
+	 * credential is dead; the re-auth overlay is up) or `caps_changed` (4403 —
+	 * what it may do changed; reconnecting with the new caps). Cleared when
+	 * any socket gets back in. `null` otherwise.
+	 */
+	access: { kind: 'revoked' | 'caps_changed'; reason: string | null } | null;
 }
 
 type ConnectionListener = (info: RemoteConnectionInfo) => void;
@@ -35,6 +42,7 @@ const disconnected = new Map<string, SocketEntry>();
 const liveTerminals = new Set<string>();
 const liveAgentTurns = new Set<string>();
 const listeners = new Set<ConnectionListener>();
+let accessState: RemoteConnectionInfo['access'] = null;
 
 let currentInfo: RemoteConnectionInfo = {
 	state: 'connected',
@@ -42,6 +50,7 @@ let currentInfo: RemoteConnectionInfo = {
 	nextRetryDelayMs: 0,
 	activeTerminals: 0,
 	activeAgentTurns: 0,
+	access: null,
 };
 
 function recompute(): RemoteConnectionInfo {
@@ -52,6 +61,7 @@ function recompute(): RemoteConnectionInfo {
 			nextRetryDelayMs: 0,
 			activeTerminals: liveTerminals.size,
 			activeAgentTurns: liveAgentTurns.size,
+			access: accessState,
 		};
 	}
 	let attempt = 0;
@@ -69,6 +79,7 @@ function recompute(): RemoteConnectionInfo {
 		nextRetryDelayMs: Number.isFinite(soonest) ? soonest : 0,
 		activeTerminals: liveTerminals.size,
 		activeAgentTurns: liveAgentTurns.size,
+		access: accessState,
 	};
 }
 
@@ -114,9 +125,18 @@ export const connectionStateStore = {
 		disconnected.set(id, { attempt, nextRetryDelayMs });
 		publish();
 	},
-	/** This socket is back. Clears only its own entry. */
+	/** This socket is back. Clears only its own entry — and any access
+	 *  close: a socket that got back in holds a live credential. */
 	socketConnected(id: string) {
-		if (disconnected.delete(id)) publish();
+		const hadAccess = accessState !== null;
+		accessState = null;
+		if (disconnected.delete(id) || hadAccess) publish();
+	},
+
+	/** A socket was closed with 4401 / 4403 (G-ACCESS §3.10). */
+	accessLost(kind: 'revoked' | 'caps_changed', reason?: string) {
+		accessState = { kind, reason: reason || null };
+		publish();
 	},
 
 	subscribe(listener: ConnectionListener): () => void {
@@ -132,6 +152,7 @@ export const connectionStateStore = {
 		disconnected.clear();
 		liveTerminals.clear();
 		liveAgentTurns.clear();
+		accessState = null;
 		publish();
 	},
 };

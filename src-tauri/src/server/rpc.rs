@@ -519,6 +519,10 @@ pub async fn rpc_handler(
         // Desktop: the names in `secrets-index.json`. Daemon: every name of
         // both layers — same `string[]` shape, never a value.
         "secrets_index_names" => rpc_local::secrets_index_names(&state),
+        // The operator default's names alone (review WP76-RV1): how the
+        // browser tells "your override" from a bare key of your own. A
+        // browser-only verb — the desktop keychain has no default layer.
+        "secrets_default_names" => rpc_local::secrets_default_names(&state),
         // No passphrase layer (DEC-R18-1: the key is server-held, so
         // background work reads secrets while the user is signed out). T1:
         // `configured: true, locked: false`, `secrets_lock` answers that
