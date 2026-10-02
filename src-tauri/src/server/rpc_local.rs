@@ -452,6 +452,85 @@ pub(super) async fn agent_ops_set_enabled(state: &AppState, args: &Value) -> Rpc
     respond("agent_ops_set_enabled", r)
 }
 
+// ─── Secrets (G-30; per-principal layer, remote-access WP-21) ─────────────────
+//
+// Over `state.secrets` (`crate::secrets_env::DaemonSecrets`): a T1 principal
+// child's own store over the `IKENGA_SECRET_*` operator default, or the
+// default alone (T0). The arg names are the desktop commands' (`key`, `value`,
+// `scope`); `scope` decodes as the desktop's `Scope`.
+
+pub(super) fn secrets_get(state: &AppState, args: &Value) -> RpcResponse {
+    let r = req_str(args, &["key"]).and_then(|key| state.secrets.get(&key));
+    respond("secrets_get", r)
+}
+
+pub(super) fn secrets_list_keys(state: &AppState) -> RpcResponse {
+    respond("secrets_list_keys", state.secrets.list_keys())
+}
+
+pub(super) fn secrets_index_names(state: &AppState) -> RpcResponse {
+    respond("secrets_index_names", state.secrets.index_names())
+}
+
+pub(super) fn secrets_get_scoped(state: &AppState, args: &Value) -> RpcResponse {
+    let r = super::rpc::scope_kind(args).and_then(|scope| {
+        let key = req_str(args, &["key"])?;
+        state.secrets.get_scoped(&scope, &key)
+    });
+    respond("secrets_get_scoped", r)
+}
+
+pub(super) fn secrets_list_keys_scoped(state: &AppState, args: &Value) -> RpcResponse {
+    let r = super::rpc::scope_kind(args).and_then(|scope| state.secrets.list_keys_scoped(&scope));
+    respond("secrets_list_keys_scoped", r)
+}
+
+/// The four writes. Into the principal's own store; without one (T0) every
+/// write is refused with `secrets_env::WRITE_REFUSAL`, the operator runbook.
+pub(super) fn secrets_write(state: &AppState, cmd: &str, args: &Value) -> RpcResponse {
+    let secrets = &state.secrets;
+    let r = (|| match cmd {
+        "secrets_set" => {
+            let key = req_str(args, &["key"])?;
+            let value = req_str(args, &["value"])?;
+            secrets.set(&key, &value)
+        }
+        "secrets_delete" => secrets.delete(&req_str(args, &["key"])?),
+        "secrets_set_scoped" => {
+            let scope = super::rpc::scope_kind(args)?;
+            let key = req_str(args, &["key"])?;
+            let value = req_str(args, &["value"])?;
+            secrets.set_scoped(&scope, &key, &value)
+        }
+        "secrets_delete_scoped" => {
+            let scope = super::rpc::scope_kind(args)?;
+            secrets.delete_scoped(&scope, &req_str(args, &["key"])?)
+        }
+        other => Err(format!("not a secrets write: {other}")),
+    })();
+    respond(cmd, r)
+}
+
+/// `secrets_lock_state`, `secrets_lock`, `secrets_set_passphrase`,
+/// `secrets_unlock`. Served only with a principal layer (T1). A T0 daemon
+/// answers exactly what `rpc_handler`'s unknown-command fallthrough always
+/// answered for these, because Settings → Secrets reads a successful
+/// unlocked state as "writable" and every T0 write is refused
+/// (`secrets_env`, "No passphrase layer"). The string is pinned to the
+/// fallthrough's by `secrets_lock_family_on_t0_is_the_unknown_command_error`.
+pub(super) fn secrets_lock_family(state: &AppState, cmd: &str) -> RpcResponse {
+    let Some(lock) = state.secrets.lock_state() else {
+        tracing::debug!("Unimplemented or pass-through RPC command: {cmd}");
+        return RpcResponse::error(format!(
+            "Command '{cmd}' not implemented in headless daemon"
+        ));
+    };
+    match cmd {
+        "secrets_lock_state" | "secrets_lock" => RpcResponse::success(lock),
+        _ => RpcResponse::error(format!("{cmd}: {}", crate::secrets_env::NO_PASSPHRASE)),
+    }
+}
+
 // ─── Identity ────────────────────────────────────────────────────────────────
 
 /// The daemon PROCESS's OS user (the desktop's function, unchanged).
@@ -803,6 +882,38 @@ mod tests {
             let names = ok(&r, "secrets_index_names", json!({})).await;
             assert!(names.is_array(), "{names}");
             assert_eq!(names, json!(crate::secrets_env::list_keys()));
+        }
+    }
+
+    /// R1 (WP-21 review): T0 must look to the FE exactly as it did on
+    /// `main`, where the lock family was unserved. Settings → Secrets marks
+    /// the vault writable on `available && configured && !locked`, and T0
+    /// reports `available: true`, so a served unlocked state would show add /
+    /// edit controls whose writes all fail with `WRITE_REFUSAL`. Each of the
+    /// four must answer the fallthrough's own unknown-command error.
+    #[tokio::test]
+    async fn secrets_lock_family_on_t0_is_the_unknown_command_error() {
+        for r in [daemon().router, bare(None)] {
+            let unknown = err(&r, "wp21_no_such_command", json!({})).await;
+            assert_eq!(
+                unknown, "Command 'wp21_no_such_command' not implemented in headless daemon",
+                "the fallthrough's shape drifted; update secrets_lock_family with it"
+            );
+            for (cmd, args) in [
+                ("secrets_lock_state", json!({})),
+                ("secrets_lock", json!({})),
+                ("secrets_set_passphrase", json!({ "passphrase": "p" })),
+                ("secrets_unlock", json!({ "passphrase": "p" })),
+            ] {
+                let e = err(&r, cmd, args).await;
+                assert_eq!(e, unknown.replace("wp21_no_such_command", cmd), "{cmd}");
+            }
+            // And the rest of T0 is as before: readable, never writable.
+            let status = ok(&r, "secrets_vault_status", json!({})).await;
+            assert_eq!(status["available"], true);
+            assert_eq!(status["writable"], false);
+            let e = err(&r, "secrets_set", json!({ "key": "K", "value": "v" })).await;
+            assert!(e.contains(crate::secrets_env::WRITE_REFUSAL), "{e}");
         }
     }
 

@@ -45,6 +45,10 @@ pub mod pkg_html;
 pub mod platform;
 pub mod pty;
 mod runtime;
+// The secrets substrate compiles into both binaries: the desktop's keychain
+// backend stays desktop-only inside it (ADR-022), and the daemon gets the
+// per-principal store (remote-access WP-21, `secrets::principal_store`).
+pub mod secrets;
 pub mod secrets_env;
 pub mod server;
 
@@ -83,8 +87,6 @@ mod iyke;
 pub mod notifications;
 #[cfg(feature = "desktop")]
 mod pkg_content;
-#[cfg(feature = "desktop")]
-pub mod secrets;
 #[cfg(feature = "desktop")]
 pub mod transcript;
 #[cfg(feature = "desktop")]

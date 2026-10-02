@@ -189,6 +189,10 @@ static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 ///   survives revoking the client.
 /// * `IKENGA_VAULT_KEY` — unlocks the secrets store; a shell that can read it
 ///   can decrypt every secret at rest.
+/// * `IKENGA_PRINCIPAL_SECRETS_KEY` — a T1 principal child's wrapping key for
+///   its own secret store (WP-21), handed over by the broker at launch. The
+///   child also scrubs and unsets it at startup; this keeps it out of a PTY
+///   even if that ever regressed.
 /// * `IKENGA_SECRET_*` — the namespace `/api/rpc`'s `secrets_get` serves.
 ///   These are application secrets fetched deliberately through an
 ///   authenticated RPC, not shell environment.
@@ -199,7 +203,10 @@ static NEXT_ATTACH_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub(crate) fn is_host_only_env(key: &str) -> bool {
     matches!(
         key,
-        "IKENGA_AUTH_TOKEN" | "IKENGA_VAULT_KEY" | "IKENGA_PKG_DB_TOKEN"
+        "IKENGA_AUTH_TOKEN"
+            | "IKENGA_VAULT_KEY"
+            | "IKENGA_PKG_DB_TOKEN"
+            | crate::secrets::principal_store::WRAP_KEY_ENV
     ) || key.starts_with("IKENGA_SECRET_")
 }
 
@@ -1457,6 +1464,7 @@ mod tests {
         // The daemon's own keys — a shell must never see these.
         assert!(is_host_only_env("IKENGA_AUTH_TOKEN"));
         assert!(is_host_only_env("IKENGA_VAULT_KEY"));
+        assert!(is_host_only_env("IKENGA_PRINCIPAL_SECRETS_KEY"));
         assert!(is_host_only_env("IKENGA_SECRET_FAL"));
         assert!(is_host_only_env("IKENGA_SECRET_"));
         assert!(is_host_only_env("IKENGA_PKG_DB_TOKEN"));

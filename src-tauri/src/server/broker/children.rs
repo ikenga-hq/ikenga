@@ -37,10 +37,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, SqliteConnection};
 
 use crate::executor::t1::T1Executor;
 use crate::executor::{PipedOpts, Principal, PrincipalId, SpawnSpec, StdioMode};
+use crate::secrets::principal_store::{WrapKey, WRAP_KEY_ENV};
 use crate::server::auth::BoxFuture;
+use crate::server::operator::secrets_kek::{KekOwner, SecretsKek};
 use crate::server::operator::OperatorRoot;
 
 /// OD-13's default.
@@ -315,14 +319,47 @@ impl T1Launcher {
     }
 
     /// The host-only variables the child gets (§9.3's one exception): its
-    /// own token, and the `IKENGA_SECRET_*` operator defaults (§5 row 15).
-    pub fn host_env(token: &str) -> Vec<(OsString, OsString)> {
-        let mut env: Vec<(OsString, OsString)> =
-            vec![("IKENGA_AUTH_TOKEN".into(), token.to_string().into())];
+    /// own token, its own secret store's wrapping key (WP-21 — derived from
+    /// the operator KEK for this principal alone; the KEK itself never
+    /// leaves the broker), and the `IKENGA_SECRET_*` operator defaults (§5
+    /// row 15). The child scrubs and unsets the wrapping key at startup.
+    pub fn host_env(token: &str, secrets_key: &WrapKey) -> Vec<(OsString, OsString)> {
+        let mut env: Vec<(OsString, OsString)> = vec![
+            ("IKENGA_AUTH_TOKEN".into(), token.to_string().into()),
+            (
+                WRAP_KEY_ENV.into(),
+                secrets_key.to_env_value().as_str().into(),
+            ),
+        ];
         env.extend(
             std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("IKENGA_SECRET_")),
         );
         env
+    }
+
+    /// The operator KEK (created on the first launch) and this principal's
+    /// wrapping key from it. Fails the launch rather than starting a child
+    /// with no store, which would serve the operator default in place of the
+    /// principal's own credential — including when the KEK file is missing
+    /// but one existed before (`secrets_kek::KekLost`: restore it from
+    /// backup; a new one is never minted over existing stores).
+    ///
+    /// `accounts.db` (whose `operator_meta` records KEK creation) is opened
+    /// here, per launch, on its own connection: the launcher holds no pool,
+    /// and a launch is rare next to the work it starts.
+    async fn secrets_key(&self, principal: &Principal) -> anyhow::Result<WrapKey> {
+        let mut meta = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(self.root.accounts_db())
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("operator secrets KEK: opening accounts.db: {e}"))?;
+        let kek = SecretsKek::load_or_create(&self.root, KekOwner::Root, &mut meta).await;
+        let _ = meta.close().await;
+        let kek = kek.map_err(|e| anyhow::anyhow!("operator secrets KEK unusable: {e}"))?;
+        Ok(kek.wrap_key_for(principal.id))
     }
 }
 
@@ -353,9 +390,12 @@ impl ChildLauncher for T1Launcher {
                 // directly; the broker stops them itself.
                 new_process_group: true,
             };
-            let child =
-                self.executor
-                    .spawn_piped_with_host_env(spec, opts, &Self::host_env(token))?;
+            let secrets_key = self.secrets_key(principal).await?;
+            let child = self.executor.spawn_piped_with_host_env(
+                spec,
+                opts,
+                &Self::host_env(token, &secrets_key),
+            )?;
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("the principal child exited at once"))?;
@@ -680,11 +720,22 @@ pub(crate) mod tests {
         assert!(joined.contains("--pkgs-dir /opt/ikenga/pkgs"), "{joined}");
         assert!(!joined.contains("token"), "the token never rides argv");
 
-        let env = T1Launcher::host_env("tok");
+        let kek = [5u8; 32];
+        let key = WrapKey::derive(&kek, &p.id.to_string()).unwrap();
+        let env = T1Launcher::host_env("tok", &key);
         assert_eq!(env[0], ("IKENGA_AUTH_TOKEN".into(), "tok".into()));
+        assert_eq!(
+            env[1],
+            (WRAP_KEY_ENV.into(), key.to_env_value().as_str().into())
+        );
         assert!(env
             .iter()
             .all(|(k, _)| crate::pty::is_host_only_env(&k.to_string_lossy())));
+        // WP-21: only this principal's derived key — never the KEK.
+        let kek_hex = hex::encode(kek);
+        assert!(env
+            .iter()
+            .all(|(_, v)| !v.to_string_lossy().contains(&kek_hex)));
     }
 
     #[test]
