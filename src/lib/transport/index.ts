@@ -397,9 +397,15 @@ export function isRemoteWebSession(): boolean {
 }
 
 export function getTransport(): RpcTransport {
-	// T1 is detected asynchronously at boot; a desktop transport picked before
-	// that (by anything that ran first) is replaced once it is known.
-	if (!transportInstance || (isT1Session() && transportInstance instanceof TauriTransport)) {
+	// T1 and a paired device's cookie are both detected asynchronously at
+	// boot; a desktop transport picked before that (by anything that ran
+	// first — e.g. the log bridge flushing a console line) is replaced once
+	// either is known. Without the device half a phone below `full` booted
+	// into `/remote` with no transport at all (WP-78b).
+	if (
+		!transportInstance ||
+		((isT1Session() || isDeviceSession()) && transportInstance instanceof TauriTransport)
+	) {
 		transportInstance = isRemoteWebSession() ? new WebRemoteTransport() : new TauriTransport();
 	}
 	return transportInstance;
