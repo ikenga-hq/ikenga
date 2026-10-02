@@ -1149,6 +1149,7 @@ impl super::proxy::WsFrameHook for DropBinary {
     fn client_frame(
         &self,
         _ctx: &crate::server::auth::PrincipalCtx,
+        _narrowing: &super::proxy::Narrowing,
         _path: &str,
         frame: super::proxy::ClientFrame<'_>,
     ) -> super::proxy::FrameDecision {
@@ -1185,17 +1186,33 @@ async fn the_frame_hook_sees_binary_frames_too() {
     );
 }
 
-/// G-ACCESS §4.5.3 / A-29: with a caps hook installed, the child sees the
-/// broker's `X-Ikenga-Caps` — never the client's.
+/// G-ACCESS §4.5.3 / A-29: with a narrowing hook installed, the child sees
+/// the broker's `X-Ikenga-Caps` — never the client's — and the share
+/// selector `?share=` is not forwarded (§4.5.2 step 6).
 #[tokio::test]
 async fn the_child_sees_the_brokers_caps_header_not_the_clients() {
     struct Fixed;
-    impl super::proxy::CapsHeader for Fixed {
-        fn caps_header(&self, _ctx: &crate::server::auth::PrincipalCtx) -> Option<String> {
-            Some("files,sessions".into())
+    impl super::proxy::Narrower for Fixed {
+        fn narrow<'a>(
+            &'a self,
+            _ctx: &'a crate::server::auth::PrincipalCtx,
+            _req: &'a axum::http::request::Parts,
+        ) -> crate::server::auth::BoxFuture<
+            'a,
+            Result<super::proxy::Narrowing, super::proxy::Refusal>,
+        > {
+            Box::pin(async {
+                Ok(super::proxy::Narrowing {
+                    headers: vec![(
+                        axum::http::HeaderName::from_static(super::proxy::CAPS_HEADER),
+                        axum::http::HeaderValue::from_static("files,sessions"),
+                    )],
+                    ..Default::default()
+                })
+            })
         }
     }
-    let h = harness_with(false, |hooks| hooks.caps = Arc::new(Fixed)).await;
+    let h = harness_with(false, |hooks| hooks.narrower = Arc::new(Fixed)).await;
     let ada = insert_account(&h.pool, "ada", 20_001, false).await;
     let cookie = login_cookie(&h.app, "ada").await;
     let (status, _, _) = send(
@@ -1203,8 +1220,20 @@ async fn the_child_sees_the_brokers_caps_header_not_the_clients() {
         request("POST", "/api/rpc")
             .header("cookie", &cookie)
             .header("content-type", "application/json")
-            .header("x-ikenga-caps", "files,sessions,dispatch,approve,install,settings,secrets")
+            .header(
+                "x-ikenga-caps",
+                "files,sessions,dispatch,approve,install,settings,secrets",
+            )
             .body(Body::from(json!({"cmd":"pty_list","args":{}}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(
+        &h.app,
+        request("GET", "/pkgs/studio/index.html?share=o%2Fp&v=1")
+            .header("cookie", &cookie)
+            .body(Body::empty())
             .unwrap(),
     )
     .await;
@@ -1213,4 +1242,51 @@ async fn the_child_sees_the_brokers_caps_header_not_the_clients() {
     let (_, headers, _) = &reqs[0];
     let caps: Vec<_> = headers.get_all("x-ikenga-caps").iter().collect();
     assert_eq!(caps, ["files,sessions"]);
+    let (uri, headers, _) = &reqs[1];
+    assert_eq!(uri, "/pkgs/studio/index.html?v=1");
+    assert_eq!(headers.get("x-ikenga-caps").unwrap(), "files,sessions");
+}
+
+/// A narrowing refusal (e.g. an unknown share, G-ACCESS §4.5.2) answers the
+/// client; nothing is proxied and no child is launched.
+#[tokio::test]
+async fn a_narrowing_refusal_proxies_nothing() {
+    struct Refuse;
+    impl super::proxy::Narrower for Refuse {
+        fn narrow<'a>(
+            &'a self,
+            _ctx: &'a crate::server::auth::PrincipalCtx,
+            _req: &'a axum::http::request::Parts,
+        ) -> crate::server::auth::BoxFuture<
+            'a,
+            Result<super::proxy::Narrowing, super::proxy::Refusal>,
+        > {
+            Box::pin(async {
+                Err(super::proxy::Refusal {
+                    status: StatusCode::NOT_FOUND,
+                    code: "not_found",
+                    message: "no such project".into(),
+                })
+            })
+        }
+    }
+    let h = harness_with(false, |hooks| hooks.narrower = Arc::new(Refuse)).await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", "/api/rpc")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"cmd":"pty_list","args":{}}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let addr = serve(h.app.clone()).await;
+    match ws_connect(addr, "/ws/pty/abc", &cookie).await {
+        Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 404),
+        other => panic!("expected a 404, got {:?}", other.map(|_| ())),
+    }
+    assert_eq!(h.launcher.launches.load(Ordering::SeqCst), 0);
 }

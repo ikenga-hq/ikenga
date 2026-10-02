@@ -385,7 +385,7 @@ async fn auth_middleware(
                                 Err(e) => warn!("device cookie rotation: {e:#}"),
                             }
                         }
-                        ctx = Some(access.device_ctx(&row, meta.clone()));
+                        ctx = Some(access.device_ctx(&row, meta.clone()).await);
                     }
                     Ok(devices::DeviceAuth::Invalid(why)) => {
                         if presented == devices::Presented::Bearer {
@@ -415,7 +415,7 @@ async fn auth_middleware(
     if ctx.is_none() && operator_bearer_ok(&req, &expected) {
         ctx = Some(match access.mode {
             DaemonMode::PrincipalChild => access.child_ctx(req.headers(), meta),
-            DaemonMode::T0 => access.operator_ctx(meta),
+            DaemonMode::T0 => access.operator_ctx(meta).await,
         });
     }
 

@@ -3,10 +3,13 @@
 //! * **R-4** — [`DeviceGrantResolver`], pushed after the session cookie in
 //!   the broker's ordered `Resolvers` (§2.4 precedence: Session, then
 //!   DeviceGrant; the operator bearer never resolves under T1);
-//! * **R-3** — [`AccessAuthorizer`] (`authorize_rpc`: class + caps before
-//!   proxying), [`BrokerAccess`] (the broker-served `access_*` arms, as
-//!   root), [`DeviceFrames`] (the client → child WS frame hook) and
-//!   [`CapsFor`] (`X-Ikenga-Caps` on every proxied request, §4.5.3);
+//! * **R-3** — [`AccessNarrower`] (once per request / WS handshake: the
+//!   effective caps with share selection and routing — §1.4 — as
+//!   `X-Ikenga-Caps` + `X-Ikenga-Share-*` on the proxied request, §4.5.3,
+//!   and the target child), [`AccessAuthorizer`] (`authorize_rpc`: class +
+//!   caps before proxying), [`BrokerAccess`] (the broker-served `access_*`
+//!   arms, as root) and [`DeviceFrames`] (the client → child WS frame hook,
+//!   on the handshake's snapshot);
 //! * **R-5** — [`DeviceEpochs`]: the pluggable "still valid?" check that
 //!   closes a device socket when its account's `session_epoch` **or** its
 //!   `grant_epoch` moves (I-8 for device sockets, §3.10);
@@ -20,8 +23,7 @@
 //! Everything here runs in the broker (root) and opens only
 //! `operator/accounts.db` (G-PRINCIPAL §5 row 9).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{header, request::Parts, HeaderValue, StatusCode};
@@ -32,58 +34,39 @@ use serde_json::Value;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::audit::AuditVia;
-use super::caps::{self, CapSet, Tier};
+use super::caps::{self, CapSet, RoleContext, Tier};
 use super::ctx::{AccessCtx, RequestMeta, Via};
 use super::devices::{self, DeviceAuth, Presented, SeenGate};
 use super::rpc::{self as access_rpc, Env, PrincipalInfo, SocketControl};
 use super::sockets::Close;
 use super::store::{AccessStore, StoreTier};
-use super::{AccessOptions, Code};
-use crate::executor::PrincipalId;
+use super::{AccessError, AccessOptions, Code};
+use crate::executor::{Principal, PrincipalId};
 use crate::server::auth::{
     BoxFuture, Credential, CredentialResolver, Epochs, PrincipalCtx, Resolution,
 };
 use crate::server::broker::proxy::{
-    AccessHandler, CapsHeader, ClientFrame, Decision, FrameDecision, RpcAuthorizer, WsFrameHook,
+    AccessHandler, ClientFrame, Decision, FrameDecision, Narrower, Narrowing, Refusal,
+    RpcAuthorizer, WsFrameHook, CAPS_HEADER,
 };
 use crate::server::broker::ws_registry::{CloseReason, StillValid, WsKey, WsRegistry};
 use crate::server::operator::accounts::{self, HookFuture, SessionsRevokedHook};
 
-/// device id → tier, as last resolved. The frame hook and the caps header
-/// are synchronous, so they read the tier the resolver saw at this
-/// request's / socket's resolution. A tier change closes the device's
-/// sockets (4403) and updates the entry, so a socket never runs on a stale
-/// tier.
-#[derive(Default)]
-pub struct TierCache(Mutex<HashMap<String, Tier>>);
-
-impl TierCache {
-    pub fn set(&self, device_id: &str, tier: Option<Tier>) {
-        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match tier {
-            Some(t) => {
-                m.insert(device_id.to_string(), t);
-            }
-            None => {
-                m.remove(device_id);
-            }
-        }
-    }
-
-    pub fn get(&self, device_id: &str) -> Option<Tier> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(device_id)
-            .copied()
-    }
+/// The broker's access decision for one request or WebSocket handshake
+/// (§1.4: computed **once**, never re-read from shared state). The
+/// [`AccessNarrower`] stores it as the request's / socket's
+/// [`Narrowing::snapshot`].
+#[derive(Debug, Clone)]
+pub struct BrokerCtx {
+    pub access: AccessCtx,
+    /// On a share: the Owner, whose child the request is routed into.
+    pub owner: Option<Principal>,
 }
 
 /// The broker's shared access state.
 pub struct T1Access {
     pub store: AccessStore,
     pub pool: SqlitePool,
-    pub tiers: TierCache,
     pub seen: SeenGate,
     pub options: AccessOptions,
 }
@@ -93,63 +76,123 @@ impl T1Access {
         Arc::new(Self {
             store,
             pool,
-            tiers: TierCache::default(),
             seen: SeenGate::default(),
             options,
         })
     }
 
     /// The tier a resolved credential carries (§1.3): a password session is
-    /// `full`; a device its row's tier (fail closed to `view` if unknown).
-    pub fn tier_of(&self, ctx: &PrincipalCtx) -> Tier {
-        match &ctx.via {
-            Credential::Session { .. } => Tier::Full,
-            Credential::DeviceGrant { device_id } => {
-                self.tiers.get(device_id).unwrap_or(Tier::View)
-            }
+    /// `full`; a device its row's tier **as resolved for this request** —
+    /// the row [`device_cookie_middleware`] read (the same read the
+    /// resolver used). Without it the row is re-read and must still be
+    /// unrevoked and at the resolution's `grant_epoch`, else `view` (fail
+    /// closed): a tier change bumps the epoch, so a stale resolution never
+    /// carries a stale (higher) tier.
+    async fn tier_of(&self, ctx: &PrincipalCtx, parts: &Parts) -> Tier {
+        let device_id = match &ctx.via {
+            Credential::Session { .. } => return Tier::Full,
+            Credential::DeviceGrant { device_id } => device_id,
             // Never produced under T1 (§2.4); grant nothing beyond view.
-            Credential::OperatorBearer => Tier::View,
-        }
-    }
-
-    /// The effective caps of an own-workspace request (§1.4). Shares are
-    /// WP-76's; T1 own workspace means role = Owner, so the tier decides.
-    pub fn caps_of(&self, ctx: &PrincipalCtx) -> CapSet {
-        if matches!(ctx.via, Credential::OperatorBearer) {
-            return CapSet::EMPTY;
-        }
-        caps::effective(
-            caps::RoleContext::OwnWorkspace,
-            self.tier_of(ctx),
-            CapSet::ALL,
-            super::routing::routing_ok_default(),
-        )
-    }
-
-    /// `PrincipalCtx` → [`AccessCtx`] (§2.3, built right after resolution).
-    pub fn access_ctx(&self, ctx: &PrincipalCtx, parts: Option<&Parts>) -> AccessCtx {
-        let via = Via::from(&ctx.via);
-        let tier = self.tier_of(ctx);
-        let meta = RequestMeta {
-            remote_addr: parts.and_then(remote_addr),
-            user_agent: parts.and_then(|p| {
-                p.headers
-                    .get(header::USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-            }),
+            Credential::OperatorBearer => return Tier::View,
         };
-        AccessCtx {
-            principal_id: ctx.principal.id,
-            admin_strength: AccessCtx::admin_strength_of(&via, tier)
-                && !matches!(via, Via::Operator),
-            device_id: ctx.via.device_id().map(str::to_string),
-            via,
-            tier,
-            share: None,
-            caps: self.caps_of(ctx),
-            meta,
+        if let Some(ResolvedDevice {
+            auth: DeviceAuth::Valid { row, .. },
+        }) = parts.extensions.get::<ResolvedDevice>()
+        {
+            if &row.device_id == device_id {
+                return row.tier;
+            }
         }
+        let epoch = parts.extensions.get::<Epochs>().and_then(|e| e.grant_epoch);
+        let row = match self.pool.acquire().await {
+            Ok(mut conn) => devices::get(&mut conn, device_id).await.ok().flatten(),
+            Err(_) => None,
+        };
+        match row {
+            Some(r) if !r.is_revoked() && epoch.map_or(true, |e| e == r.grant_epoch) => r.tier,
+            _ => Tier::View,
+        }
+    }
+
+    /// `PrincipalCtx` → [`BrokerCtx`] (§2.3, built right after resolution):
+    /// the tier, the share selection (§4.5.2, `share::broker_select`,
+    /// WP-76), routing (§5.1, `routing::routing_ok`, WP-75) and the
+    /// effective caps (§1.4). Everything W4 fills is reached from here, so
+    /// W4 edits only `routing.rs` / `share.rs`.
+    pub async fn access_ctx(
+        &self,
+        ctx: &PrincipalCtx,
+        parts: &Parts,
+    ) -> Result<BrokerCtx, AccessError> {
+        let via = Via::from(&ctx.via);
+        let tier = self.tier_of(ctx, parts).await;
+        let device_id = ctx.via.device_id().map(str::to_string);
+        let selected = super::share::broker_select(self, ctx, parts).await?;
+        let routing_ok =
+            super::routing::routing_ok(Some(&self.store), &ctx.principal.id, device_id.as_deref())
+                .await;
+        let (context, ceiling) = match &selected {
+            Some(s) => (s.context, s.ceiling),
+            None => (RoleContext::OwnWorkspace, CapSet::ALL),
+        };
+        let caps = if matches!(via, Via::Operator) {
+            CapSet::EMPTY
+        } else {
+            caps::effective(context, tier, ceiling, routing_ok)
+        };
+        let (share, owner) = match selected {
+            Some(s) => (Some(s.share), Some(s.owner)),
+            None => (None, None),
+        };
+        let meta = RequestMeta {
+            remote_addr: remote_addr(parts),
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        };
+        Ok(BrokerCtx {
+            access: AccessCtx {
+                principal_id: ctx.principal.id,
+                admin_strength: AccessCtx::admin_strength_of(&via, tier)
+                    && !matches!(via, Via::Operator),
+                device_id,
+                via,
+                tier,
+                share,
+                share_headers: false,
+                caps,
+                meta,
+            },
+            owner,
+        })
+    }
+
+    /// This request's [`BrokerCtx`]: the snapshot the narrower computed for
+    /// it (`rpc_proxy` puts the [`Narrowing`] in the request extensions), or
+    /// a fresh computation.
+    pub async fn ctx_for(
+        &self,
+        ctx: &PrincipalCtx,
+        parts: &Parts,
+    ) -> Result<BrokerCtx, AccessError> {
+        if let Some(b) = parts
+            .extensions
+            .get::<Narrowing>()
+            .and_then(|n| n.snapshot::<BrokerCtx>())
+        {
+            return Ok(b.clone());
+        }
+        self.access_ctx(ctx, parts).await
+    }
+}
+
+fn refusal(e: &AccessError) -> Refusal {
+    Refusal {
+        status: e.code.status(),
+        code: e.code.as_str(),
+        message: e.to_string(),
     }
 }
 
@@ -210,7 +253,6 @@ impl CredentialResolver for DeviceGrantResolver {
             if account.is_disabled() {
                 return Ok(Resolution::Rejected("device"));
             }
-            self.0.tiers.set(&row.device_id, Some(row.tier));
             Ok(Resolution::Resolved {
                 ctx: PrincipalCtx {
                     principal: account.principal(),
@@ -300,14 +342,18 @@ impl RpcAuthorizer for AccessAuthorizer {
         _args: &'a Value,
     ) -> BoxFuture<'a, Decision> {
         Box::pin(async move {
-            let actx = self.0.access_ctx(ctx, Some(req));
-            match super::authorize(&actx, cmd) {
+            let deny = |e: AccessError| Decision::Deny {
+                status: e.code.status(),
+                code: e.code.as_str(),
+                message: e.to_string(),
+            };
+            let b = match self.0.ctx_for(ctx, req).await {
+                Ok(b) => b,
+                Err(e) => return deny(e),
+            };
+            match super::authorize(&b.access, cmd) {
                 Ok(()) => Decision::Allow,
-                Err(e) => Decision::Deny {
-                    status: e.code.status(),
-                    code: e.code.as_str(),
-                    message: e.to_string(),
-                },
+                Err(e) => deny(e),
             }
         })
     }
@@ -352,7 +398,10 @@ impl AccessHandler for BrokerAccess {
         args: &'a Value,
     ) -> BoxFuture<'a, Response> {
         Box::pin(async move {
-            let actx = self.t1.access_ctx(ctx, Some(req));
+            let actx = match self.t1.ctx_for(ctx, req).await {
+                Ok(b) => b.access,
+                Err(e) => return Json(access_rpc::error_response(&e)).into_response(),
+            };
             if let Err(e) = super::authorize(&actx, cmd) {
                 return Json(access_rpc::error_response(&e)).into_response();
             }
@@ -363,8 +412,6 @@ impl AccessHandler for BrokerAccess {
                     .flatten(),
                 Err(_) => None,
             };
-            let tiers = &self.t1.tiers;
-            let refresh = move |id: &str, tier: Option<Tier>| tiers.set(id, tier);
             let sockets = BrokerSockets(&self.ws);
             let env = Env {
                 tier: StoreTier::T1,
@@ -378,7 +425,6 @@ impl AccessHandler for BrokerAccess {
                     is_admin: principal.as_ref().is_some_and(|a| a.is_admin),
                 },
                 public_url: self.t1.options.public_url.clone(),
-                on_device_changed: Some(&refresh),
             };
             let res = match access_rpc::dispatch(&env, &actx, cmd, args).await {
                 Ok(v) => crate::server::rpc::RpcResponse::success(v),
@@ -390,17 +436,23 @@ impl AccessHandler for BrokerAccess {
 }
 
 /// R-3 frame hook: a frame the caps don't cover is dropped and answered
-/// with the refusal control frame (§1.6); the socket stays open.
-pub struct DeviceFrames(pub Arc<T1Access>);
+/// with the refusal control frame (§1.6); the socket stays open. The caps
+/// are the handshake's snapshot (§1.4); a socket without one (no narrower
+/// ran) gets none — fail closed. A change to tier, routing or membership
+/// closes the socket (4403), so the snapshot is never stale.
+pub struct DeviceFrames;
 
 impl WsFrameHook for DeviceFrames {
     fn client_frame(
         &self,
-        ctx: &PrincipalCtx,
+        _ctx: &PrincipalCtx,
+        narrowing: &Narrowing,
         path: &str,
         frame: ClientFrame<'_>,
     ) -> FrameDecision {
-        let caps = self.0.caps_of(ctx);
+        let caps = narrowing
+            .snapshot::<BrokerCtx>()
+            .map_or(CapSet::EMPTY, |b| b.access.caps);
         let frame = match frame {
             ClientFrame::Text(t) => super::ws::Frame::Text(t),
             ClientFrame::Binary(b) => super::ws::Frame::Binary(b),
@@ -412,13 +464,40 @@ impl WsFrameHook for DeviceFrames {
     }
 }
 
-/// §4.5.3: `X-Ikenga-Caps` on every proxied request — the child narrows
-/// every check to it (§1.7).
-pub struct CapsFor(pub Arc<T1Access>);
+/// §1.4 / §4.5.2–§4.5.3: once per request / WS handshake, the
+/// [`BrokerCtx`] — then `X-Ikenga-Caps` on every proxied request (the child
+/// narrows every check to it, §1.7), the `X-Ikenga-Share-*` set and the
+/// Owner as the target on a share.
+pub struct AccessNarrower(pub Arc<T1Access>);
 
-impl CapsHeader for CapsFor {
-    fn caps_header(&self, ctx: &PrincipalCtx) -> Option<String> {
-        Some(self.0.caps_of(ctx).to_header())
+impl Narrower for AccessNarrower {
+    fn narrow<'a>(
+        &'a self,
+        ctx: &'a PrincipalCtx,
+        req: &'a Parts,
+    ) -> BoxFuture<'a, Result<Narrowing, Refusal>> {
+        Box::pin(async move {
+            let b = self.0.access_ctx(ctx, req).await.map_err(|e| refusal(&e))?;
+            let mut pairs = vec![(CAPS_HEADER, b.access.caps.to_header())];
+            if let Some(share) = &b.access.share {
+                pairs.extend(super::share::to_child_headers(share));
+            }
+            let mut headers = Vec::with_capacity(pairs.len());
+            for (name, value) in pairs {
+                let value = HeaderValue::from_str(&value).map_err(|_| {
+                    refusal(&AccessError::new(
+                        Code::Internal,
+                        format!("unencodable `{name}` value"),
+                    ))
+                })?;
+                headers.push((axum::http::HeaderName::from_static(name), value));
+            }
+            Ok(Narrowing {
+                headers,
+                target: b.owner.clone(),
+                snapshot: Some(Arc::new(b)),
+            })
+        })
     }
 }
 
@@ -506,7 +585,7 @@ pub struct Installed {
     pub access: Arc<dyn AccessHandler>,
     pub ws_frames: Arc<dyn WsFrameHook>,
     pub still_valid: Arc<dyn StillValid>,
-    pub caps: Arc<dyn CapsHeader>,
+    pub narrower: Arc<dyn Narrower>,
     pub resolver: Arc<dyn CredentialResolver>,
 }
 
@@ -514,11 +593,11 @@ pub fn install(t1: &Arc<T1Access>, ws: Arc<WsRegistry>) -> Installed {
     Installed {
         authorizer: Arc::new(AccessAuthorizer(t1.clone())),
         access: Arc::new(BrokerAccess { t1: t1.clone(), ws }),
-        ws_frames: Arc::new(DeviceFrames(t1.clone())),
+        ws_frames: Arc::new(DeviceFrames),
         still_valid: Arc::new(DeviceEpochs {
             pool: t1.pool.clone(),
         }),
-        caps: Arc::new(CapsFor(t1.clone())),
+        narrower: Arc::new(AccessNarrower(t1.clone())),
         resolver: Arc::new(DeviceGrantResolver(t1.clone())),
     }
 }
@@ -594,7 +673,9 @@ mod tests {
                 assert_eq!(ctx.principal.id, ada);
                 assert_eq!(ctx.via.device_id(), Some(row.device_id.as_str()));
                 assert_eq!(epochs.grant_epoch, Some(0));
-                assert_eq!(t1.caps_of(&ctx), Tier::Dispatch.caps());
+                let b = t1.access_ctx(&ctx, &parts).await.unwrap();
+                assert_eq!(b.access.caps, Tier::Dispatch.caps());
+                assert!(b.owner.is_none() && b.access.share.is_none());
             }
             other => panic!("{other:?}"),
         }
@@ -705,13 +786,19 @@ mod tests {
         else {
             panic!()
         };
-        let frames = DeviceFrames(t1.clone());
+        let narrowing = AccessNarrower(t1.clone())
+            .narrow(&ctx, &parts)
+            .await
+            .unwrap();
+        assert_eq!(narrowing.header("x-ikenga-caps"), Some("files,sessions"));
+        assert!(narrowing.target.is_none(), "own workspace: own child");
+        let frames = DeviceFrames;
         assert!(matches!(
-            frames.client_frame(&ctx, "/ws/pty/x", ClientFrame::Binary(b"ls")),
+            frames.client_frame(&ctx, &narrowing, "/ws/pty/x", ClientFrame::Binary(b"ls")),
             FrameDecision::Reply(_)
         ));
         assert_eq!(
-            frames.client_frame(&ctx, "/ws/fs", ClientFrame::Text("{}")),
+            frames.client_frame(&ctx, &narrowing, "/ws/fs", ClientFrame::Text("{}")),
             FrameDecision::Pass
         );
         let authz = AccessAuthorizer(t1.clone());
@@ -727,15 +814,113 @@ mod tests {
                 .await,
             Decision::Allow
         );
-        assert_eq!(
-            CapsFor(t1.clone()).caps_header(&ctx).as_deref(),
-            Some("files,sessions")
-        );
-        // Operator-class arms are never proxied under T1.
-        t1.tiers.set(&row.device_id, Some(Tier::Full));
+        // Operator-class arms are never proxied under T1, whatever the tier.
+        sqlx::query("UPDATE devices SET tier = 'full' WHERE device_id = ?")
+            .bind(&row.device_id)
+            .execute(&t1.pool)
+            .await
+            .unwrap();
         assert!(matches!(
             authz
                 .authorize_rpc(&ctx, &parts, "permission_relay_put", &Value::Null)
+                .await,
+            Decision::Deny { .. }
+        ));
+    }
+
+    /// Review F-2: the tier is the one this request resolved — the
+    /// narrowing snapshot rides with the request / socket; no shared cache.
+    /// A request whose resolution predates a tier change (its
+    /// `grant_epoch` is stale) never carries the new tier, and a socket keeps
+    /// its handshake caps (a tier change closes it, §3.10).
+    #[tokio::test]
+    async fn the_tier_is_per_request_and_epoch_bound() {
+        let (_tmp, t1, ada) = setup().await;
+        let (row, tok) = pair(&t1, ada, Tier::Full).await;
+        let parts = parts_with("authorization", &format!("Bearer {tok}"));
+        let Resolution::Resolved { ctx, .. } = DeviceGrantResolver(t1.clone())
+            .resolve(&parts)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let socket = AccessNarrower(t1.clone())
+            .narrow(&ctx, &parts)
+            .await
+            .unwrap();
+        // Downgrade: tier view, grant_epoch 0 → 1.
+        sqlx::query("UPDATE devices SET tier = 'view', grant_epoch = 1 WHERE device_id = ?")
+            .bind(&row.device_id)
+            .execute(&t1.pool)
+            .await
+            .unwrap();
+        let with_epoch = |e: i64| {
+            let mut p = parts_with("authorization", &format!("Bearer {tok}"));
+            p.extensions.insert(Epochs {
+                session_epoch: 0,
+                grant_epoch: Some(e),
+            });
+            p
+        };
+        let stale = t1.access_ctx(&ctx, &with_epoch(0)).await.unwrap();
+        assert_eq!(stale.access.tier, Tier::View, "stale epoch: fail closed");
+        let fresh = t1.access_ctx(&ctx, &with_epoch(1)).await.unwrap();
+        assert_eq!(fresh.access.tier, Tier::View);
+        // The open socket's snapshot is the handshake's (it is closed with
+        // 4403 by the tier change, not re-read).
+        assert_eq!(
+            socket.snapshot::<BrokerCtx>().unwrap().access.tier,
+            Tier::Full
+        );
+        assert_eq!(
+            DeviceFrames.client_frame(&ctx, &socket, "/ws/pty/x", ClientFrame::Binary(b"ls")),
+            FrameDecision::Pass
+        );
+        // A socket with no snapshot (no narrower ran) gets no caps.
+        assert!(matches!(
+            DeviceFrames.client_frame(
+                &ctx,
+                &Narrowing::default(),
+                "/ws/pty/x",
+                ClientFrame::Binary(b"ls")
+            ),
+            FrameDecision::Reply(_)
+        ));
+        // A rpc_proxy-style request reuses its snapshot, no recomputation.
+        let mut p = with_epoch(1);
+        p.extensions.insert(socket.clone());
+        assert_eq!(t1.ctx_for(&ctx, &p).await.unwrap().access.tier, Tier::Full);
+    }
+
+    /// §4.5.2 hook site (review F-1): a share selection reaches
+    /// `share::broker_select` (WP-76); until it is filled the request is
+    /// refused, never served unconfined in the caller's own workspace.
+    #[tokio::test]
+    async fn a_share_selection_goes_through_the_share_hook() {
+        let (_tmp, t1, ada) = setup().await;
+        let (_, tok) = pair(&t1, ada, Tier::Full).await;
+        let parts = parts_with("authorization", &format!("Bearer {tok}"));
+        let Resolution::Resolved { ctx, .. } = DeviceGrantResolver(t1.clone())
+            .resolve(&parts)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut share = axum::http::Request::builder()
+            .uri("/ws/chat/x?share=o%2Fp")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        share.extensions = parts.extensions.clone();
+        let r = AccessNarrower(t1.clone()).narrow(&ctx, &share).await;
+        let refusal = r.unwrap_err();
+        assert!(refusal.message.contains("WP-76"), "{refusal:?}");
+        assert!(matches!(
+            AccessAuthorizer(t1.clone())
+                .authorize_rpc(&ctx, &share, "fs_read", &Value::Null)
                 .await,
             Decision::Deny { .. }
         ));

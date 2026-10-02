@@ -94,6 +94,11 @@ pub struct AccessCtx {
     pub device_id: Option<String>,
     pub tier: Tier,
     pub share: Option<ShareCtx>,
+    /// Whether the request carried **any** `X-Ikenga-Share-*` header (T1
+    /// child only; always `false` elsewhere). `internal` arms are refused
+    /// when it is set, even if the headers didn't parse into a [`ShareCtx`]
+    /// (§4.5.3: "no `X-Ikenga-Share-*` header" at all).
+    pub share_headers: bool,
     /// Effective caps (§1.4), computed once per request / WS handshake.
     pub caps: CapSet,
     /// `via ∈ {Session, OperatorBearer} || tier == Full` (P-26).

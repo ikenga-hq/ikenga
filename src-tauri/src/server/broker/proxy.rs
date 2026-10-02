@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{request::Parts, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
@@ -39,6 +39,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use super::children::ChildEndpoint;
 use super::ws_registry::WsKey;
 use super::BrokerState;
+use crate::executor::Principal;
 use crate::server::auth::{json_error, BoxFuture, Epochs, PrincipalCtx};
 
 /// The largest `/api/rpc` body the broker parses (file writes ride RPC).
@@ -141,9 +142,18 @@ pub enum ClientFrame<'a> {
 /// binary frame (R-3 names a text-frame hook; binary frames are PTY input
 /// too, so a hook that saw only text could be bypassed). Ping, pong and
 /// close are control frames and pass.
+///
+/// `narrowing` is the socket's [`Narrowing`], decided once at the handshake
+/// (G-ACCESS §1.4: effective caps are per handshake, never re-read per
+/// frame from shared state).
 pub trait WsFrameHook: Send + Sync {
-    fn client_frame(&self, ctx: &PrincipalCtx, path: &str, frame: ClientFrame<'_>)
-        -> FrameDecision;
+    fn client_frame(
+        &self,
+        ctx: &PrincipalCtx,
+        narrowing: &Narrowing,
+        path: &str,
+        frame: ClientFrame<'_>,
+    ) -> FrameDecision;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -153,6 +163,7 @@ impl WsFrameHook for PassFrames {
     fn client_frame(
         &self,
         _ctx: &PrincipalCtx,
+        _narrowing: &Narrowing,
         _path: &str,
         _frame: ClientFrame<'_>,
     ) -> FrameDecision {
@@ -160,21 +171,87 @@ impl WsFrameHook for PassFrames {
     }
 }
 
-/// G-ACCESS §4.5.3: the `X-Ikenga-Caps` value the broker sets on every
-/// request it proxies for `ctx` (the child narrows every check to it, §1.7).
-/// `None` sets no header (WP-20's default; WP-74a's `access::t1::CapsFor`
-/// always sets one).
-pub trait CapsHeader: Send + Sync {
-    fn caps_header(&self, ctx: &PrincipalCtx) -> Option<String>;
+/// G-ACCESS §1.4 / §4.5.2–§4.5.3: what one proxied request or WebSocket is
+/// narrowed to, decided **once** — per request, or per WebSocket handshake —
+/// by the [`Narrower`] hook before anything is proxied.
+#[derive(Clone, Default)]
+pub struct Narrowing {
+    /// Set on the upstream request after every client `X-Ikenga-*` header
+    /// was stripped: `X-Ikenga-Caps` on every request, plus the
+    /// `X-Ikenga-Share-*` set on a share (§4.5.3).
+    pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// The child to proxy to. `None` = the caller's own; a share routes into
+    /// the Owner's child (§4.5.1 — `access::share::broker_select`, WP-76).
+    /// `X-Ikenga-Principal` names the target.
+    pub target: Option<Principal>,
+    /// The hook's own per-request / per-socket snapshot (WP-74a: the
+    /// broker's `AccessCtx`). [`rpc_proxy`] puts the whole `Narrowing` in
+    /// the request extensions before [`RpcAuthorizer`] / [`AccessHandler`]
+    /// run, and [`WsFrameHook`] receives it per frame, so neither recomputes
+    /// it nor reads a shared cache.
+    pub snapshot: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoCapsHeader;
-
-impl CapsHeader for NoCapsHeader {
-    fn caps_header(&self, _ctx: &PrincipalCtx) -> Option<String> {
-        None
+impl std::fmt::Debug for Narrowing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Narrowing")
+            .field("headers", &self.headers)
+            .field("target", &self.target.as_ref().map(|p| p.id))
+            .field("snapshot", &self.snapshot.is_some())
+            .finish()
     }
+}
+
+impl Narrowing {
+    /// A header this narrowing sets, as text.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .and_then(|(_, v)| v.to_str().ok())
+    }
+
+    /// The hook's snapshot, if it is a `T`.
+    pub fn snapshot<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.snapshot.as_deref().and_then(|s| s.downcast_ref::<T>())
+    }
+}
+
+/// Why a request was refused before it was proxied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// G-ACCESS §4.5.2–§4.5.3: decide a request's / socket's [`Narrowing`]
+/// (effective caps, share selection, target child). A refusal answers the
+/// client and nothing is proxied (e.g. a share that doesn't exist: `404`).
+pub trait Narrower: Send + Sync {
+    fn narrow<'a>(
+        &'a self,
+        ctx: &'a PrincipalCtx,
+        req: &'a Parts,
+    ) -> BoxFuture<'a, Result<Narrowing, Refusal>>;
+}
+
+/// WP-20's default: no narrowing headers, the caller's own child.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoNarrowing;
+
+impl Narrower for NoNarrowing {
+    fn narrow<'a>(
+        &'a self,
+        _ctx: &'a PrincipalCtx,
+        _req: &'a Parts,
+    ) -> BoxFuture<'a, Result<Narrowing, Refusal>> {
+        Box::pin(async { Ok(Narrowing::default()) })
+    }
+}
+
+fn refused(r: Refusal) -> Response {
+    json_error(r.status, r.code, &r.message)
 }
 
 /// The narrowing header (§4.5.3). Set only by the broker; a client's copy is
@@ -249,12 +326,17 @@ fn downstream_headers(child: &HeaderMap) -> HeaderMap {
 /// not be forwarded as if it were the child's credential. The key is
 /// compared percent-decoded (`%74oken=` is the same parameter to the child).
 pub fn strip_token_param(query: Option<&str>) -> Option<String> {
+    strip_params(query, &["token"])
+}
+
+/// Drop every `keys` parameter (compared percent-decoded) from a query.
+fn strip_params(query: Option<&str>, keys: &[&str]) -> Option<String> {
     let kept: Vec<&str> = query?
         .split('&')
         .filter(|p| {
             let key = p.split('=').next().unwrap_or_default().replace('+', " ");
-            !p.is_empty()
-                && percent_encoding::percent_decode_str(&key).decode_utf8_lossy() != "token"
+            let key = percent_encoding::percent_decode_str(&key).decode_utf8_lossy();
+            !p.is_empty() && !keys.contains(&key.as_ref())
         })
         .collect();
     (!kept.is_empty()).then(|| kept.join("&"))
@@ -273,14 +355,16 @@ pub fn is_routable_path(path: &str) -> bool {
         })
 }
 
-/// The path and (token-free) query to forward, or `None` if the path isn't
-/// [routable](is_routable_path).
+/// The path and query to forward — without `token=` and without the share
+/// selector `share=` (G-ACCESS §4.5.2 step 6: the broker strips it; the
+/// child learns the share only from `X-Ikenga-Share-*`) — or `None` if the
+/// path isn't [routable](is_routable_path).
 fn path_and_query(uri: &axum::http::Uri) -> Option<String> {
     let path = uri.path();
     if !is_routable_path(path) {
         return None;
     }
-    Some(match strip_token_param(uri.query()) {
+    Some(match strip_params(uri.query(), &["token", "share"]) {
         Some(q) => format!("{path}?{q}"),
         None => path.to_string(),
     })
@@ -308,6 +392,7 @@ fn child_unavailable(e: &anyhow::Error) -> Response {
 /// request never reached the old child, so the retry can't double it.
 async fn forward(
     state: &BrokerState,
+    narrowing: &Narrowing,
     ctx: &PrincipalCtx,
     method: Method,
     path_and_query: &str,
@@ -315,14 +400,13 @@ async fn forward(
     body: Bytes,
 ) -> Response {
     let mut headers = upstream_headers(headers);
-    if let Some(caps) = state.hooks.caps.caps_header(ctx) {
-        if let Ok(v) = HeaderValue::from_str(&caps) {
-            headers.insert(HeaderName::from_static(CAPS_HEADER), v);
-        }
+    for (name, value) in &narrowing.headers {
+        headers.insert(name.clone(), value.clone());
     }
-    let principal = ctx.principal.id.to_string();
+    let target = narrowing.target.as_ref().unwrap_or(&ctx.principal);
+    let principal = target.id.to_string();
     for attempt in 0..2 {
-        let endpoint = match state.children.endpoint(&ctx.principal).await {
+        let endpoint = match state.children.endpoint(target).await {
             Ok(e) => e,
             Err(e) => return child_unavailable(&e),
         };
@@ -349,10 +433,10 @@ async fn forward(
                     .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
             }
             Err(e) if e.is_connect() && attempt == 0 => {
-                state.children.invalidate(ctx.principal.id, &endpoint).await;
+                state.children.invalidate(target.id, &endpoint).await;
             }
             Err(e) => {
-                tracing::warn!("proxy to principal child {}: {e}", ctx.principal.id);
+                tracing::warn!("proxy to principal child {}: {e}", target.id);
                 return json_error(
                     StatusCode::BAD_GATEWAY,
                     "bad_gateway",
@@ -374,7 +458,7 @@ pub async fn rpc_proxy(
     Extension(ctx): Extension<PrincipalCtx>,
     req: Request,
 ) -> Response {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, MAX_RPC_BODY).await {
         Ok(b) => b,
         Err(_) => {
@@ -398,6 +482,14 @@ pub async fn rpc_proxy(
     };
     let args = payload.remove("args").unwrap_or(Value::Null);
 
+    // Decided once; the authorizer and the access handler read it back from
+    // the request extensions.
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
+    parts.extensions.insert(narrowing.clone());
+
     if cmd.starts_with("access_") {
         return state.hooks.access.handle(&ctx, &parts, &cmd, &args).await;
     }
@@ -416,6 +508,7 @@ pub async fn rpc_proxy(
     }
     forward(
         &state,
+        &narrowing,
         &ctx,
         Method::POST,
         "/api/rpc",
@@ -438,8 +531,13 @@ pub async fn pkgs_proxy(
     let Some(pq) = path_and_query(&parts.uri) else {
         return bad_path();
     };
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
     forward(
         &state,
+        &narrowing,
         &ctx,
         parts.method.clone(),
         &pq,
@@ -457,9 +555,9 @@ type Upstream =
 
 async fn connect_upstream(
     endpoint: &ChildEndpoint,
-    ctx: &PrincipalCtx,
+    target: &Principal,
     path_and_query: &str,
-    caps: Option<&str>,
+    narrowing: &Narrowing,
 ) -> Result<Upstream, tungstenite::Error> {
     let mut request = format!("ws://{}{path_and_query}", endpoint.addr).into_client_request()?;
     let h = request.headers_mut();
@@ -470,14 +568,11 @@ async fn connect_upstream(
     );
     h.insert(
         HeaderName::from_static(PRINCIPAL_HEADER),
-        HeaderValue::from_str(&ctx.principal.id.to_string())
+        HeaderValue::from_str(&target.id.to_string())
             .map_err(|e| tungstenite::Error::HttpFormat(e.into()))?,
     );
-    if let Some(caps) = caps {
-        h.insert(
-            HeaderName::from_static(CAPS_HEADER),
-            HeaderValue::from_str(caps).map_err(|e| tungstenite::Error::HttpFormat(e.into()))?,
-        );
+    for (name, value) in &narrowing.headers {
+        h.insert(name.clone(), value.clone());
     }
     let (ws, _) = tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
@@ -512,9 +607,14 @@ pub async fn ws_proxy(
     State(state): State<Arc<BrokerState>>,
     Extension(ctx): Extension<PrincipalCtx>,
     Extension(epochs): Extension<Epochs>,
-    uri: axum::http::Uri,
-    ws: WebSocketUpgrade,
+    req: Request,
 ) -> Response {
+    let (mut parts, _body) = req.into_parts();
+    let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let uri = parts.uri.clone();
     let Some(pq) = path_and_query(&uri) else {
         return bad_path();
     };
@@ -532,20 +632,29 @@ pub async fn ws_proxy(
             );
         }
     }
-    let caps = state.hooks.caps.caps_header(&ctx);
+    // G-ACCESS §1.4: the socket's caps (and share selection) are decided
+    // once, here; the frame hook reads this snapshot for the socket's life.
+    let narrowing = match state.hooks.narrower.narrow(&ctx, &parts).await {
+        Ok(n) => n,
+        Err(r) => return refused(r),
+    };
+    let target = narrowing
+        .target
+        .clone()
+        .unwrap_or_else(|| ctx.principal.clone());
     let mut upstream = None;
     for attempt in 0..2 {
-        let endpoint = match state.children.endpoint(&ctx.principal).await {
+        let endpoint = match state.children.endpoint(&target).await {
             Ok(e) => e,
             Err(e) => return child_unavailable(&e),
         };
-        match connect_upstream(&endpoint, &ctx, &pq, caps.as_deref()).await {
+        match connect_upstream(&endpoint, &target, &pq, &narrowing).await {
             Ok(up) => {
                 upstream = Some(up);
                 break;
             }
             Err(e) if is_refused(&e) && attempt == 0 => {
-                state.children.invalidate(ctx.principal.id, &endpoint).await;
+                state.children.invalidate(target.id, &endpoint).await;
             }
             Err(tungstenite::Error::Http(resp)) => {
                 let status =
@@ -553,7 +662,7 @@ pub async fn ws_proxy(
                 return status.into_response();
             }
             Err(e) => {
-                tracing::warn!("ws proxy to principal child {}: {e}", ctx.principal.id);
+                tracing::warn!("ws proxy to principal child {}: {e}", target.id);
                 return StatusCode::BAD_GATEWAY.into_response();
             }
         }
@@ -568,7 +677,7 @@ pub async fn ws_proxy(
     }
     let path = uri.path().to_string();
     ws.on_upgrade(move |client| async move {
-        pump(state, ctx, path, client, upstream, registration).await;
+        pump(state, ctx, narrowing, path, client, upstream, registration).await;
     })
 }
 
@@ -622,6 +731,7 @@ fn close_frame(code: u16, reason: impl Into<String>) -> Message {
 async fn pump(
     state: Arc<BrokerState>,
     ctx: PrincipalCtx,
+    narrowing: Narrowing,
     path: String,
     client: WebSocket,
     upstream: Upstream,
@@ -646,10 +756,10 @@ async fn pump(
                 Some(Ok(msg)) => {
                     let decision = match &msg {
                         Message::Text(t) => {
-                            state.hooks.ws_frames.client_frame(&ctx, &path, ClientFrame::Text(t))
+                            state.hooks.ws_frames.client_frame(&ctx, &narrowing, &path, ClientFrame::Text(t))
                         }
                         Message::Binary(b) => {
-                            state.hooks.ws_frames.client_frame(&ctx, &path, ClientFrame::Binary(b))
+                            state.hooks.ws_frames.client_frame(&ctx, &narrowing, &path, ClientFrame::Binary(b))
                         }
                         // Ping / pong: control frames, not input.
                         _ => FrameDecision::Pass,
@@ -748,6 +858,11 @@ mod tests {
         assert_eq!(
             strip_token_param(Some("%74oken=abc&a=1&%54OKEN=x")).as_deref(),
             Some("a=1&%54OKEN=x")
+        );
+        // G-ACCESS §4.5.2 step 6: the share selector is stripped too.
+        assert_eq!(
+            strip_params(Some("share=o%2Fp&cols=80&%73hare=x"), &["token", "share"]).as_deref(),
+            Some("cols=80")
         );
     }
 

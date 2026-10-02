@@ -646,6 +646,7 @@ pub(crate) mod tests {
             device_id: store.meta().host_device_id.clone(),
             tier: Tier::Full,
             share: None,
+            share_headers: false,
             caps: CapSet::ALL,
             admin_strength: true,
             meta: RequestMeta::default(),
@@ -681,6 +682,7 @@ pub(crate) mod tests {
             device_id: Some(row.device_id.clone()),
             tier: row.tier,
             share: None,
+            share_headers: false,
             caps: row.tier.caps(),
             admin_strength: AccessCtx::admin_strength_of(
                 &Via::Device {

@@ -42,7 +42,7 @@ use tower_sessions::ExpiredDeletion;
 
 use self::children::{ChildLauncher, Children, T1Launcher};
 use self::proxy::{
-    AccessHandler, AccessNotFound, AllowAll, CapsHeader, NoCapsHeader, PassFrames, RpcAuthorizer,
+    AccessHandler, AccessNotFound, AllowAll, Narrower, NoNarrowing, PassFrames, RpcAuthorizer,
     WsFrameHook,
 };
 use self::ws_registry::{AccountEpochs, StillValid, WsRegistry};
@@ -63,21 +63,23 @@ pub struct BrokerHooks {
     pub access: Arc<dyn AccessHandler>,
     pub ws_frames: Arc<dyn WsFrameHook>,
     pub still_valid: Arc<dyn StillValid>,
-    /// G-ACCESS §4.5.3: `X-Ikenga-Caps` on proxied requests.
-    pub caps: Arc<dyn CapsHeader>,
+    /// G-ACCESS §1.4 / §4.5.2–§4.5.3: each proxied request's / socket's
+    /// narrowing (`X-Ikenga-Caps`, share selection and headers, target
+    /// child), decided once.
+    pub narrower: Arc<dyn Narrower>,
 }
 
 impl BrokerHooks {
     /// Allow every RPC, no `access_*` arms, pass every frame, close a socket
     /// once its account is disabled or its `session_epoch` moved, and set no
-    /// caps header.
+    /// narrowing headers.
     pub fn defaults(pool: SqlitePool) -> Self {
         Self {
             authorizer: Arc::new(AllowAll),
             access: Arc::new(AccessNotFound),
             ws_frames: Arc::new(PassFrames),
             still_valid: Arc::new(AccountEpochs { pool }),
-            caps: Arc::new(NoCapsHeader),
+            narrower: Arc::new(NoNarrowing),
         }
     }
 
@@ -88,7 +90,7 @@ impl BrokerHooks {
             access: installed.access.clone(),
             ws_frames: installed.ws_frames.clone(),
             still_valid: installed.still_valid.clone(),
-            caps: installed.caps.clone(),
+            narrower: installed.narrower.clone(),
         }
     }
 }
@@ -328,7 +330,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     });
     let mut broker_state = BrokerState::new(pool.clone(), verifier, launcher)?;
     // G-ACCESS R-3 / R-4 / R-5: the device-grant resolver, authorize_rpc, the
-    // broker-served `access_*` arms, the WS frame hook, the caps header and
+    // broker-served `access_*` arms, the WS frame hook, the narrowing hook and
     // the two-epoch socket check.
     let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
     broker_state.hooks = BrokerHooks::access(&installed);

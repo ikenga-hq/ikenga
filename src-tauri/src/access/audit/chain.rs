@@ -258,11 +258,33 @@ async fn walk(
 }
 
 /// A full verification walk from genesis (§6.4).
+///
+/// An empty `audit_events` table fails at `#1` whenever `store_meta` is
+/// populated: the migration writes `store_meta` and the `store.created`
+/// genesis row in one transaction (§6.2 "row 1 is always store.created"),
+/// so a migrated store with no rows had them all deleted — and a fresh
+/// process has no known head to catch that otherwise.
 pub async fn verify_all(
     conn: &mut SqliteConnection,
     store_id: &str,
 ) -> Result<VerifyReport, sqlx::Error> {
-    walk(conn, store_id, None).await
+    let report = walk(conn, store_id, None).await?;
+    if report.rows == 0 && report.broken.is_none() {
+        let migrated: i64 = sqlx::query_scalar("SELECT count(*) FROM store_meta")
+            .fetch_one(&mut *conn)
+            .await?;
+        if migrated > 0 {
+            return Ok(VerifyReport {
+                rows: 0,
+                head: None,
+                broken: Some(Broken {
+                    broken_at_seq: 1,
+                    reason: "row 1 (store.created) is missing: the chain is empty".into(),
+                }),
+            });
+        }
+    }
+    Ok(report)
 }
 
 /// Insert `ev` as the row after `head` (or as row 1 on `None`). Low level:
@@ -621,6 +643,30 @@ mod tests {
             .unwrap();
         let r = verify_all(&mut conn, "s").await.unwrap();
         assert_eq!(r.broken.unwrap().broken_at_seq, 3);
+    }
+
+    /// §6.2 / review F-3: a migrated store (store_meta populated) whose
+    /// every row was deleted fails at #1; an unmigrated, empty one is clean.
+    #[tokio::test]
+    async fn an_emptied_chain_fails_at_row_one() {
+        let mut conn = store().await;
+        let r = verify_all(&mut conn, "s").await.unwrap();
+        assert!(r.ok(), "no store_meta yet: nothing to verify ({r:?})");
+        let chain = Chain::new("s");
+        seed(&mut conn, &chain, 2).await;
+        sqlx::query("INSERT INTO store_meta (k, v) VALUES ('store_id', 's')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop_triggers(&mut conn).await;
+        sqlx::query("DELETE FROM audit_events")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let r = verify_all(&mut conn, "s").await.unwrap();
+        let b = r.broken.expect("an emptied chain must not verify");
+        assert_eq!(b.broken_at_seq, 1);
+        assert_eq!(r.rows, 0);
     }
 
     /// A-16 (running process) / A-37 shape: a known head that vanished

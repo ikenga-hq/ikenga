@@ -341,38 +341,52 @@ impl DaemonAccess {
     }
 
     /// The T0 operator bearer → synthetic owner, host device, `full` (§2.3).
-    pub fn operator_ctx(&self, meta: RequestMeta) -> AccessCtx {
+    /// `approve` only if [`routing::routing_ok`] (§5.1; the host device
+    /// satisfies a T0 `this_device` preference).
+    pub async fn operator_ctx(&self, meta: RequestMeta) -> AccessCtx {
+        let device_id = self.store().and_then(|s| s.meta().host_device_id.clone());
+        let routing_ok = routing::routing_ok(self.store(), &self.owner, device_id.as_deref()).await;
         AccessCtx {
             principal_id: self.owner,
             via: Via::Operator,
-            device_id: self.store().and_then(|s| s.meta().host_device_id.clone()),
+            device_id,
             tier: Tier::Full,
             share: None,
-            caps: CapSet::ALL,
+            share_headers: false,
+            caps: caps::effective(
+                caps::RoleContext::OwnWorkspace,
+                Tier::Full,
+                CapSet::ALL,
+                routing_ok,
+            ),
             admin_strength: true,
             meta,
         }
     }
 
     /// A T0 device grant → the row's principal and tier (§2.3).
-    pub fn device_ctx(&self, row: &devices::DeviceRow, meta: RequestMeta) -> AccessCtx {
+    pub async fn device_ctx(&self, row: &devices::DeviceRow, meta: RequestMeta) -> AccessCtx {
         let via = Via::Device {
             device_id: row.device_id.clone(),
         };
+        let principal_id = row.principal_id.parse().unwrap_or(self.owner);
+        let routing_ok =
+            routing::routing_ok(self.store(), &principal_id, Some(&row.device_id)).await;
         AccessCtx {
-            principal_id: row.principal_id.parse().unwrap_or(self.owner),
+            principal_id,
             admin_strength: AccessCtx::admin_strength_of(&via, row.tier),
             via,
             device_id: Some(row.device_id.clone()),
             tier: row.tier,
             share: None,
+            share_headers: false,
             // Own workspace (T0 has one principal): role = Owner, so the
-            // tier decides (§1.4). Routing (WP-75) narrows `approve` later.
+            // tier decides (§1.4), and routing (§5.1) gates `approve`.
             caps: caps::effective(
                 caps::RoleContext::OwnWorkspace,
                 row.tier,
                 CapSet::ALL,
-                routing::routing_ok_default(),
+                routing_ok,
             ),
             meta,
         }
@@ -404,6 +418,7 @@ impl DaemonAccess {
                 Tier::View
             },
             share: share::from_child_headers(headers),
+            share_headers: share::any_share_header(headers),
             caps,
             admin_strength: false,
             meta,
@@ -415,7 +430,9 @@ impl DaemonAccess {
 pub fn check(ctx: &AccessCtx, req: Requirement) -> Result<(), AccessError> {
     match req.class {
         ArmClass::Operator if !ctx.is_operator() => return Err(AccessError::class(req.class)),
-        ArmClass::Internal if !(ctx.via == Via::ChildToken && ctx.share.is_none()) => {
+        ArmClass::Internal
+            if !(ctx.via == Via::ChildToken && ctx.share.is_none() && !ctx.share_headers) =>
+        {
             return Err(AccessError::class(req.class))
         }
         ArmClass::Owner if ctx.share.is_some() => return Err(AccessError::class(req.class)),
@@ -517,6 +534,7 @@ mod tests {
             device_id: None,
             tier,
             share: None,
+            share_headers: false,
             caps: tier.caps(),
             meta: RequestMeta::default(),
         }
@@ -575,6 +593,28 @@ mod tests {
             Code::Forbidden
         );
         assert!(authorize(&device(Tier::Full), "brand_new_cmd").is_ok());
+    }
+
+    /// §4.5.3 / review F-4: an `internal` arm is refused on a child request
+    /// carrying **any** `X-Ikenga-Share-*` header, even one that doesn't
+    /// parse into a share (no `X-Ikenga-Share-Project`).
+    #[test]
+    fn internal_arms_refuse_any_share_header() {
+        let child = DaemonAccess::principal_child(AccessOptions::default());
+        let plain = child.child_ctx(&axum::http::HeaderMap::new(), RequestMeta::default());
+        assert!(authorize(&plain, "share_project_info").is_ok());
+        for name in ["x-ikenga-share-principal", "x-ikenga-share-role"] {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(name, "x".parse().unwrap());
+            let c = child.child_ctx(&h, RequestMeta::default());
+            assert!(c.share.is_none(), "{name} alone selects no share");
+            assert!(c.share_headers);
+            assert_eq!(
+                authorize(&c, "share_project_info").unwrap_err().message,
+                "class=internal",
+                "{name}"
+            );
+        }
     }
 
     #[test]

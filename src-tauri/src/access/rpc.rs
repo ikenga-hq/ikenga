@@ -51,10 +51,6 @@ pub struct Env<'a> {
     pub sockets: &'a dyn SocketControl,
     pub principal: PrincipalInfo,
     pub public_url: Option<String>,
-    /// Called after a tier change / revoke commits, with the device id and
-    /// its new tier (`None` = revoked), so a T1 broker can refresh its tier
-    /// cache. T0 has nothing to refresh.
-    pub on_device_changed: Option<&'a (dyn Fn(&str, Option<Tier>) + Send + Sync)>,
 }
 
 /// `RpcResponse` for an [`AccessError`] (`"<code>: <message>"`).
@@ -107,7 +103,6 @@ pub async fn serve_daemon(
             is_admin: false,
         },
         public_url: access.options.public_url.clone(),
-        on_device_changed: None,
     };
     to_response(dispatch(&env, ctx, cmd, args).await)
 }
@@ -246,9 +241,6 @@ async fn device_set_tier(
     })?;
     let (row, from) = devices::set_tier(store, ctx, device_id, tier).await?;
     if from != row.tier {
-        if let Some(f) = env.on_device_changed {
-            f(device_id, Some(row.tier));
-        }
         // §3.10: the device reconnects at once with its new caps.
         env.sockets.close_device(device_id, Close::CAPS_CHANGED);
     }
@@ -261,9 +253,6 @@ async fn device_revoke(env: &Env<'_>, ctx: &AccessCtx, args: &Value) -> Result<V
     let store = store(env)?;
     let device_id = str_arg(args, "deviceId")?;
     devices::revoke(store, ctx, device_id).await?;
-    if let Some(f) = env.on_device_changed {
-        f(device_id, None);
-    }
     // §3.10: every open socket of the device closes at once (4401).
     env.sockets.close_device(device_id, Close::DEVICE_REVOKED);
     Ok(json!({}))
@@ -287,7 +276,6 @@ mod tests {
                 is_admin: false,
             },
             public_url: None,
-            on_device_changed: None,
         }
     }
 
@@ -369,6 +357,7 @@ mod tests {
             device_id: Some(row.device_id.clone()),
             tier: Tier::View,
             share: None,
+            share_headers: false,
             caps: CapSet::of(&[crate::access::Cap::Files, crate::access::Cap::Sessions]),
             admin_strength: false,
             meta: RequestMeta::default(),
@@ -425,7 +414,7 @@ mod tests {
     async fn no_store_means_store_unavailable() {
         let reg = Registry::new();
         let access = DaemonAccess::unavailable();
-        let ctx = access.operator_ctx(RequestMeta::default());
+        let ctx = access.operator_ctx(RequestMeta::default()).await;
         let e = Env {
             tier: StoreTier::T0,
             store: None,
@@ -435,7 +424,6 @@ mod tests {
                 is_admin: false,
             },
             public_url: None,
-            on_device_changed: None,
         };
         let s = dispatch(&e, &ctx, "access_status", &json!({}))
             .await
