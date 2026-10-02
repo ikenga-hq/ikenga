@@ -10,7 +10,7 @@
 //!   Wire (all binary values base64url, no padding):
 //!   - `hello {slot, msgA, deviceName, platform?}` →
 //!     `{ok, pairingId, msgB, hostConfirm, storeId}` (`storeId` completes
-//!     the device's `idB`, §3.4);
+//!     a typed code's `idB`, §3.4; a scanned QR pins it with `#h=`);
 //!   - `confirm {pairingId, deviceConfirm}` → `{ok, state:"awaiting_host"}`;
 //!   - `status ?id=<pairingId>[&client=cli]` with `X-Ikenga-Pair-Poll:
 //!     <poll_key>` → `{ok, state}`; on the first poll after `allow`,
@@ -137,6 +137,11 @@ fn fail(f: Fail) -> Response {
     }
 }
 
+/// The TCP peer's IP: the throttle key (bucketed per IPv6 /64 in
+/// [`pairing::throttle_key`]) and pair-confirm's "Address" row. Behind a
+/// reverse proxy (Caddy, Tailscale Serve) every client shares the proxy's
+/// address; `X-Forwarded-For` is deliberately not trusted (no trusted-proxy
+/// configuration exists yet), review m8.
 fn addr_of(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
     conn.as_ref()
         .map(|c| c.0.ip().to_string())
@@ -178,8 +183,11 @@ async fn hello(
             "pairingId": ok.pairing_id,
             "msgB": spake::b64(&ok.msg_b),
             "hostConfirm": spake::b64(&ok.host_confirm),
-            // idB's suffix (§3.4): the device needs it to finish SPAKE2.
-            // Public; a substituted one only makes the keys disagree.
+            // idB's suffix (§3.4): a typed code needs it to finish SPAKE2.
+            // It travels on the same untrusted channel, so it gives the
+            // device no independent host binding (a MITM substitutes it
+            // consistently; without the code that still gets it nothing).
+            // A scanned QR pins it (`#h=`) and the device ignores this.
             "storeId": host.store.meta().store_id,
         }))
         .into_response(),
@@ -515,12 +523,12 @@ mod tests {
         let info = registry
             .begin_decide(&pid, &store.meta().owner_principal_id.unwrap().to_string())
             .unwrap();
-        registry.finish_allow(
+        assert!(registry.finish_allow(
             &info.pairing_id,
             "dev-1",
             super::super::Tier::View,
             "ikd1.tok".into(),
-        );
+        ));
         let (st, h, v) = send(&r, poll(false)).await;
         assert_eq!((st, v["state"].as_str()), (StatusCode::OK, Some("allowed")));
         assert_eq!(v["tier"], "view");

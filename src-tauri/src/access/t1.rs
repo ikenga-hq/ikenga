@@ -435,6 +435,7 @@ impl AccessHandler for BrokerAccess {
                     is_admin: principal.as_ref().is_some_and(|a| a.is_admin),
                 },
                 public_url: self.t1.options.public_url.clone(),
+                insecure_cookie: self.t1.options.insecure_cookie,
             };
             let res = match access_rpc::dispatch(&env, &actx, cmd, args).await {
                 Ok(v) => crate::server::rpc::RpcResponse::success(v),

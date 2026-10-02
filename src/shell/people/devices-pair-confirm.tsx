@@ -9,12 +9,19 @@
 //
 // Deny burns the session and leaves no device row; Pair device issues the
 // credential (§3.8). Both are audited by the daemon (`pair.denied`,
-// `pair.allowed`). `full` is never offered here (P-9).
+// `pair.allowed`). `full` is never offered here (P-9). Each outcome ends in
+// D-05's toast ("Paired <name> · <tier>", "Denied · the code is now dead").
+//
+// The pair sheet hands its code over to this confirm the moment the request
+// reaches `awaiting_host` (it closes without cancelling, D-05 `closeOverlays()
+// → pair-confirm`), so no modal dialog sits over it.
 
-import { useEffect, useState } from 'react';
+import { CheckCircle2, XCircle } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { create } from 'zustand';
 
+import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { Segmented } from '@/components/ui/segmented';
 import type { Tier } from '@/lib/access/caps.gen';
 import { TIER_LABELS } from '@/lib/access/caps.gen';
@@ -39,10 +46,13 @@ interface PairWatchState {
 	/** Bumped when a device is paired, so the table refreshes. */
 	revision: number;
 	lastPaired: DeviceView | null;
+	/** The post-decision toast (D-05), or null. */
+	notice: { tone: 'ok' | 'denied'; text: string } | null;
 	watch: (t: PairTicket) => void;
 	unwatch: (pairingId: string) => void;
 	setPending: (rows: PairRequest[]) => void;
 	paired: (pairingId: string, device: DeviceView | null) => void;
+	setNotice: (notice: PairWatchState['notice']) => void;
 }
 
 export const usePairWatch = create<PairWatchState>((set) => ({
@@ -50,6 +60,8 @@ export const usePairWatch = create<PairWatchState>((set) => ({
 	pending: [],
 	revision: 0,
 	lastPaired: null,
+	notice: null,
+	setNotice: (notice) => set({ notice }),
 	watch: (t) => set((s) => ({ watching: { ...s.watching, [t.pairingId]: t.expiresAt } })),
 	unwatch: (id) =>
 		set((s) => {
@@ -100,9 +112,28 @@ export function PairConfirmOverlay() {
 	usePendingPoll();
 	const pending = usePairWatch((s) => s.pending);
 	const watching = usePairWatch((s) => s.watching);
+	const notice = usePairWatch((s) => s.notice);
+	const setNotice = usePairWatch((s) => s.setNotice);
 	const request = pending.find((p) => p.state === 'awaiting_host' && watching[p.pairingId]);
-	if (!request || typeof document === 'undefined') return null;
-	return createPortal(<PairConfirm key={request.pairingId} request={request} />, document.body);
+	if (typeof document === 'undefined') return null;
+	return (
+		<>
+			{request &&
+				createPortal(<PairConfirm key={request.pairingId} request={request} />, document.body)}
+			{notice && (
+				<div data-pair-toast={notice.tone}>
+					<FloatingToastChip
+						variant={notice.tone === 'ok' ? 'notice' : 'info'}
+						anchor="viewport-bottom-right"
+						icon={notice.tone === 'ok' ? <CheckCircle2 /> : <XCircle />}
+						label={notice.text}
+						ttlMs={4000}
+						onDismiss={() => setNotice(null)}
+					/>
+				</div>
+			)}
+		</>
+	);
 }
 
 export function PairConfirm({
@@ -119,6 +150,15 @@ export function PairConfirm({
 	const [now, setNow] = useState(() => nowProp ?? Date.now());
 	const paired = usePairWatch((s) => s.paired);
 	const unwatch = usePairWatch((s) => s.unwatch);
+	const setNotice = usePairWatch((s) => s.setNotice);
+	const panel = useRef<HTMLDivElement>(null);
+
+	// Take focus on mount (a security decision; nothing behind it should
+	// keep the keyboard). The panel, not a button, so a stray Enter decides
+	// nothing.
+	useEffect(() => {
+		panel.current?.focus();
+	}, []);
 
 	useEffect(() => {
 		if (nowProp !== undefined) return;
@@ -135,8 +175,16 @@ export function PairConfirm({
 				decision,
 				decision === 'allow' ? tier : undefined
 			);
-			if (decision === 'allow') paired(request.pairingId, res.device ?? null);
-			else unwatch(request.pairingId);
+			if (decision === 'allow') {
+				paired(request.pairingId, res.device ?? null);
+				setNotice({
+					tone: 'ok',
+					text: `Paired ${res.device?.name ?? request.deviceName} · ${TIER_LABELS[tier].label}`,
+				});
+			} else {
+				unwatch(request.pairingId);
+				setNotice({ tone: 'denied', text: 'Denied · the code is now dead' });
+			}
 		} catch (e) {
 			const { code, message } = parseAccessError(e);
 			setError(
@@ -160,9 +208,13 @@ export function PairConfirm({
 			role="dialog"
 			aria-modal="true"
 			aria-labelledby="pair-confirm-title"
-			className="fixed inset-0 z-[60] grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_82%,transparent)] p-6 backdrop-blur-xs"
+			className="pointer-events-auto fixed inset-0 z-[60] grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_82%,transparent)] p-6 backdrop-blur-xs"
 		>
-			<div className="w-full max-w-[560px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl">
+			<div
+				ref={panel}
+				tabIndex={-1}
+				className="w-full max-w-[560px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl outline-none"
+			>
 				<div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-4 py-3">
 					<h2
 						id="pair-confirm-title"
@@ -171,6 +223,7 @@ export function PairConfirm({
 					>
 						A device wants to pair
 					</h2>
+					<NewChip />
 				</div>
 				<div className="px-4 py-3">
 					<div className={row}>
@@ -243,5 +296,17 @@ export function PairConfirm({
 				</div>
 			</div>
 		</div>
+	);
+}
+
+/** D-05's `newchip` (proposed — not in the shipped shell). */
+export function NewChip() {
+	return (
+		<span
+			className="newchip inline-flex h-4 flex-none items-center rounded-full bg-[var(--achievement-soft)] px-1.5 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--on-achievement,var(--achievement))]"
+			title="Proposed — nothing here exists in the shipped shell"
+		>
+			new
+		</span>
 	);
 }

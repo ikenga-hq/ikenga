@@ -15,7 +15,13 @@ import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { Fingerprint } from '@/lib/access/fingerprint';
 import { displayPairCode, normalizePairCode } from '@/lib/access/pair-code';
 
-import { codeFromHash, deviceNameFromUA, type PairOutcome, runPairing } from './pair-flow';
+import {
+	codeFromHash,
+	deviceNameFromUA,
+	hostFromHash,
+	type PairOutcome,
+	runPairing,
+} from './pair-flow';
 
 type Phase =
 	| { kind: 'entry'; error?: string }
@@ -28,6 +34,11 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 	switch (o.kind) {
 		case 'allowed':
 			return { title: 'Paired', body: 'Opening your workspace…' };
+		case 'cookie_rejected':
+			return {
+				title: "This browser didn't keep the pairing",
+				body: "The computer allowed this device, but this connection isn't HTTPS, so the browser dropped the device credential. Start ikenga-server with --insecure-cookie (on a Tailscale perimeter) or serve it over HTTPS, then remove this device on the computer and pair again.",
+			};
 		case 'denied':
 			return {
 				title: 'The computer said no',
@@ -75,6 +86,10 @@ export function RemotePairPage({
 		() => (typeof window === 'undefined' ? null : codeFromHash(window.location.hash)),
 		[]
 	);
+	const pinnedStoreId = useMemo(
+		() => (typeof window === 'undefined' ? null : hostFromHash(window.location.hash)),
+		[]
+	);
 	const [code, setCode] = useState(initial ? displayPairCode(initial) : '');
 	const [phase, setPhase] = useState<Phase>({ kind: 'entry' });
 	const abort = useRef<AbortController | null>(null);
@@ -99,6 +114,8 @@ export function RemotePairPage({
 		const outcome = await runPairing(norm, device, {
 			signal: ctl.signal,
 			onWords: (words) => setPhase({ kind: 'words', words }),
+			// The QR's store id pins the host only for the code it came with.
+			pinnedStoreId: initial && norm === initial ? pinnedStoreId : null,
 		});
 		if (ctl.signal.aborted) return;
 		setPhase({ kind: 'done', outcome });

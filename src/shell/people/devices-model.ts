@@ -14,7 +14,7 @@
 // (§3.3 rule 2).
 
 import { TIER_LABELS, type Tier } from '@/lib/access/caps.gen';
-import type { DeviceView } from '@/lib/access/client';
+import type { DeviceView, PairTicket } from '@/lib/access/client';
 import type { DaemonInfo } from '@/lib/tauri-cmd';
 
 export type Exposure = 'loopback' | 'tailnet' | 'lan' | 'all-interfaces' | 'public' | 'unknown';
@@ -240,6 +240,28 @@ export function pairPublicBase(view: DevicesView): string | undefined {
 	if (view.source !== 'desktop' || view.run !== 'running' || !view.address) return undefined;
 	if (view.exposure !== 'tailnet' && view.exposure !== 'lan') return undefined;
 	return view.address.replace(/\/+$/, '');
+}
+
+/**
+ * WP-74b review M1: the device cookie carries `Secure` unless the server runs
+ * with `--insecure-cookie` (§3.8), and browsers drop a `Secure` Set-Cookie
+ * from a plain-HTTP origin that isn't loopback. A device pairing through such
+ * a `pairUrl` would be told "Paired" and hold nothing, so the sheet says so
+ * up front. `null` when the link is HTTPS, loopback, absent, or the cookie
+ * isn't `Secure`.
+ */
+export function insecureCookieWarning(
+	ticket: Pick<PairTicket, 'pairUrl' | 'cookieSecure'>
+): string | null {
+	if (!ticket.pairUrl || ticket.cookieSecure === false) return null;
+	let url: URL;
+	try {
+		url = new URL(ticket.pairUrl);
+	} catch {
+		return null;
+	}
+	if (url.protocol !== 'http:' || classifyHost(url.hostname) === 'loopback') return null;
+	return "This address is plain HTTP, so a phone's browser won't keep the device credential and pairing won't stick. Start ikenga-server with --insecure-cookie (on a Tailscale perimeter) or serve it over HTTPS.";
 }
 
 /** "now", "12 s ago", "4 min ago", "2 h ago", "3 d ago". */

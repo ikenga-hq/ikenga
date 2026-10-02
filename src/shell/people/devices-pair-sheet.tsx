@@ -9,11 +9,14 @@
 // works on a device that reaches the computer some other way.
 //
 // The confirm itself is `devices-pair-confirm.tsx`, full-window, driven by the
-// same `access_pair_pending` poll this sheet reads for burned codes.
+// same `access_pair_pending` poll this sheet reads for burned codes. When this
+// sheet's request reaches `awaiting_host` the sheet hands over: it closes
+// WITHOUT cancelling (D-05: `closeOverlays(); setState('pair-confirm')`), so
+// the modal dialog never sits over the confirm (review B1).
 
 import { RefreshCw } from 'lucide-react';
 import qrcode from 'qrcode-generator';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -32,14 +35,24 @@ import {
 	parseAccessError,
 } from '@/lib/access/client';
 
-import { type DevicesView, EXPOSURE_COPY, expiresIn, pairPublicBase } from './devices-model';
-import { usePairWatch } from './devices-pair-confirm';
+import {
+	type DevicesView,
+	EXPOSURE_COPY,
+	expiresIn,
+	insecureCookieWarning,
+	pairPublicBase,
+} from './devices-model';
+import { NewChip, usePairWatch } from './devices-pair-confirm';
+
+/** §3.7 copy for the host-wide pause. */
+export const PAUSED_COPY = 'Too many wrong codes — pairing paused for 15 min.';
 
 /** What the sheet shows in step 3. */
 export type PairSheetPhase =
 	| { kind: 'loading' }
 	| { kind: 'code'; ticket: PairTicket }
 	| { kind: 'burned'; ticket: PairTicket }
+	| { kind: 'paused'; ticket: PairTicket; retryAfterMs: number }
 	| { kind: 'expired'; ticket: PairTicket }
 	| { kind: 'error'; message: string; paused: boolean };
 
@@ -47,10 +60,14 @@ export function pairSheetPhase(
 	ticket: PairTicket | null,
 	error: { message: string; paused: boolean } | null,
 	burnedIds: ReadonlySet<string>,
-	now: number
+	now: number,
+	/** Codes burned by the host-wide pause → ms until it lifts (§3.7). */
+	pausedIds: ReadonlyMap<string, number> = new Map()
 ): PairSheetPhase {
 	if (error) return { kind: 'error', ...error };
 	if (!ticket) return { kind: 'loading' };
+	const paused = pausedIds.get(ticket.pairingId);
+	if (paused !== undefined) return { kind: 'paused', ticket, retryAfterMs: paused };
 	if (burnedIds.has(ticket.pairingId)) return { kind: 'burned', ticket };
 	if (now >= ticket.expiresAt) return { kind: 'expired', ticket };
 	return { kind: 'code', ticket };
@@ -105,10 +122,13 @@ export function PairSheet({
 	const revision = usePairWatch((s) => s.revision);
 	const lastPaired = usePairWatch((s) => s.lastPaired);
 	const [openedAt] = useState(revision);
+	/** The ticket handed to the confirm (never cancelled by closing). */
+	const handedOff = useRef<string | null>(null);
 
 	const begin = useCallback(async () => {
 		setError(null);
 		setTicket(null);
+		handedOff.current = null;
 		try {
 			const t = await accessPairBegin(pairPublicBase(view));
 			setTicket(t);
@@ -119,7 +139,7 @@ export function PairSheet({
 				paused: code === 'throttled',
 				message:
 					code === 'throttled'
-						? 'Too many wrong codes — pairing paused for 15 min.'
+						? PAUSED_COPY
 						: code === 'store_unavailable'
 							? "Pairing needs the background server (ikenga-server) with its data folder. It isn't available right now."
 							: message,
@@ -145,8 +165,23 @@ export function PairSheet({
 		if (open && revision !== openedAt && lastPaired) onOpenChange(false);
 	}, [open, revision, openedAt, lastPaired, onOpenChange]);
 
+	// The device confirmed: hand the request to the full-window confirm.
+	// Close without cancelling or unwatching — the confirm reads the same
+	// watch and poll, and decides the session (review B1).
+	useEffect(() => {
+		if (!open || !ticket) return;
+		const waiting = pending.some(
+			(p) => p.pairingId === ticket.pairingId && p.state === 'awaiting_host'
+		);
+		if (!waiting) return;
+		handedOff.current = ticket.pairingId;
+		setTicket(null);
+		onOpenChange(false);
+	}, [open, ticket, pending, onOpenChange]);
+
+	// Closing kills an open code — never one already handed to the confirm.
 	const close = (next: boolean) => {
-		if (!next && ticket) {
+		if (!next && ticket && handedOff.current !== ticket.pairingId) {
 			unwatch(ticket.pairingId);
 			void accessPairCancel(ticket.pairingId).catch(() => {});
 			setTicket(null);
@@ -158,19 +193,44 @@ export function PairSheet({
 		() => new Set(pending.filter((p) => p.state === 'burned').map((p) => p.pairingId)),
 		[pending]
 	);
-	const phase = pairSheetPhase(ticket, error, burnedIds, now);
+	const pausedIds = useMemo(
+		() =>
+			new Map(
+				pending
+					.filter((p) => p.state === 'paused')
+					.map((p) => [p.pairingId, p.retryAfterMs ?? 0] as const)
+			),
+		[pending]
+	);
+	const phase = pairSheetPhase(ticket, error, burnedIds, now, pausedIds);
 	const exposure = EXPOSURE_COPY[view.exposure];
 	const reachable = view.run === 'running' && view.address !== null;
+	const cookieWarning = ticket ? insecureCookieWarning(ticket) : null;
 
 	return (
 		<Dialog open={open} onOpenChange={close}>
 			<DialogContent
 				data-state="pair"
 				data-pair={phase.kind}
+				// Belt and braces for B1: a click on the confirm (portaled
+				// outside this dialog) is never an "outside" dismiss, and the
+				// close doesn't pull focus back from it.
+				onInteractOutside={(e) => {
+					const target = e.target as Element | null;
+					if (target?.closest?.('[data-state="pair-confirm"]')) e.preventDefault();
+				}}
+				onCloseAutoFocus={(e) => {
+					if (handedOff.current) e.preventDefault();
+				}}
 				className="max-h-[calc(100dvh-2rem)] overflow-y-auto border-[var(--border-strong)] bg-[var(--bg-surface)] p-0 text-[var(--fg)] sm:max-w-[640px]"
 			>
 				<DialogHeader className="border-b border-[var(--border-soft)] px-4 py-3">
-					<DialogTitle style={{ fontFamily: 'var(--font-display)' }}>Pair a device</DialogTitle>
+					<DialogTitle
+						className="flex items-center gap-2"
+						style={{ fontFamily: 'var(--font-display)' }}
+					>
+						Pair a device <NewChip />
+					</DialogTitle>
 					<DialogDescription className="sr-only">
 						Show a one-time code to another device, then confirm it here.
 					</DialogDescription>
@@ -194,6 +254,15 @@ export function PairSheet({
 					<Step n={3} title="Open the address on the other device and enter this code">
 						<span className="block">One device, one use. It expires on its own.</span>
 						<PairCode phase={phase} now={now} onNewCode={() => void begin()} />
+						{cookieWarning && phase.kind === 'code' && (
+							<span
+								role="note"
+								data-pair-warning="insecure-cookie"
+								className="mt-2 block rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-[var(--fg)]"
+							>
+								{cookieWarning}
+							</span>
+						)}
 					</Step>
 					<Step n={4} title="Confirm it here">
 						This computer asks you to approve the request before the device gets anything. You pick
@@ -296,8 +365,13 @@ function PairCode({
 						A device entered the wrong code — this code is dead.
 					</span>
 				)}
+				{phase.kind === 'paused' && (
+					<span role="alert" className="text-[var(--danger)]" data-pair-error="paused">
+						{PAUSED_COPY}
+					</span>
+				)}
 				{phase.kind === 'expired' && <span>This code expired.</span>}
-				<NewCode onClick={onNewCode} />
+				{phase.kind !== 'paused' && <NewCode onClick={onNewCode} />}
 			</span>
 		</span>
 	);

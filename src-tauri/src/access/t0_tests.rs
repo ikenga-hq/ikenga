@@ -267,6 +267,68 @@ async fn the_public_route_set_is_exactly_health_spa_and_pairing() {
     assert_ne!(res.status(), StatusCode::GONE);
 }
 
+/// Review m7: the T0 pairing endpoints reach the daemon's registry through
+/// the full router (`t0_pairing_host`: `Arc<DaemonAccess>` →
+/// `PairingHost`): begin over `/api/rpc` with the operator bearer, then a
+/// device's hello and confirm through `create_router` answer 200, and the
+/// request shows in `access_pair_pending`.
+#[tokio::test]
+async fn t0_pairing_runs_through_the_full_router() {
+    let (router, access) = daemon().await;
+    let store_id = access.store().unwrap().meta().store_id.clone();
+    let (status, body, _) = rpc(&router, bearer(OP), "access_pair_begin", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let code = super::pairing::normalize_code(body["data"]["code"].as_str().unwrap()).unwrap();
+    assert_eq!(body["data"]["cookieSecure"], true);
+    let post = |path: &'static str, v: Value| {
+        let router = router.clone();
+        async move {
+            let res = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(v.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (dev, msg_a) = super::spake::device_start_with_rng(&code, &store_id, rand::rngs::OsRng);
+    let (status, v) = post(
+        "/access/pair/hello",
+        json!({"slot": &code[..1], "msgA": super::spake::b64(&msg_a), "deviceName": "Pixel 9 · Chrome"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["storeId"], store_id);
+    let pid = v["pairingId"].as_str().unwrap().to_string();
+    let msg_b = super::spake::unb64(v["msgB"].as_str().unwrap()).unwrap();
+    let keys = super::spake::Keys::derive(&dev.finish(&msg_b).unwrap(), &pid, &msg_a, &msg_b);
+    let (status, v) = post(
+        "/access/pair/confirm",
+        json!({"pairingId": pid, "deviceConfirm": super::spake::b64(&keys.device_confirm())}),
+    )
+    .await;
+    assert_eq!(
+        (status, v["state"].as_str()),
+        (StatusCode::OK, Some("awaiting_host"))
+    );
+    let (_, body, _) = rpc(&router, bearer(OP), "access_pair_pending", json!({})).await;
+    assert_eq!(body["data"][0]["pairingId"], pid.as_str());
+    assert_eq!(body["data"][0]["state"], "awaiting_host");
+}
+
 /// A-6 / A-7 (T0, end to end): a device's open socket closes with 4403 on a
 /// tier change and 4401 on revoke, immediately.
 #[tokio::test]

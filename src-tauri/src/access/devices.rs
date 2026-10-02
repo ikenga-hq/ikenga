@@ -601,6 +601,42 @@ pub async fn revoke(
     Ok(row)
 }
 
+/// WP-74b review m1: a grant minted at `decide(allow)` whose token never
+/// reached the device (the session expired, or was dropped, before the
+/// first status poll). The row would otherwise be a live grant nobody
+/// holds; it is revoked in place (`revoked_reason = 'user'`, the DDL's
+/// closed set — the audit detail says `undelivered`), one `device.revoked`
+/// row, continuing on a degraded chain (killing a credential, P-35).
+pub async fn revoke_undelivered(
+    store: &AccessStore,
+    device_id: &str,
+    pairing_id: &str,
+) -> anyhow::Result<()> {
+    let mut conn = store.pool().acquire().await?;
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT principal_id, name FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((principal_id, name)) = row else {
+        return Ok(());
+    };
+    if mark_revoked(&mut tx, device_id, None, "user").await? == 0 {
+        return Ok(());
+    }
+    let ev = Event::new("device.revoked", AuditVia::System)
+        .subject_principal(principal_id)
+        .subject_device(device_id)
+        .target(name)
+        .detail(serde_json::json!({ "reason": "undelivered", "pairing_id": pairing_id }))
+        .continue_when_degraded();
+    let head = store.chain().append(&mut tx, &ev).await?;
+    tx.commit().await?;
+    store.chain().committed(head);
+    Ok(())
+}
+
 /// R-11: a forced logout revokes **every** grant of the principal
 /// (`revoked_reason = 'sessions_revoked'`, one `device.revoked` row each),
 /// inside the forced-logout transaction. Returns the revoked device ids.

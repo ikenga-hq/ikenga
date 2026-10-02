@@ -17,7 +17,7 @@ import {
 	utf8,
 } from '@/lib/access/spake2';
 
-import { codeFromHash, deviceNameFromUA, runPairing } from './pair-flow';
+import { codeFromHash, deviceNameFromUA, hostFromHash, runPairing } from './pair-flow';
 
 describe('pairing code (§3.2)', () => {
 	it('normalizes typed input', () => {
@@ -32,6 +32,10 @@ describe('pairing code (§3.2)', () => {
 		expect(codeFromHash('#c=K7P42Q')).toBe('K7P42Q');
 		expect(codeFromHash('#c=k7p-42q')).toBe('K7P42Q');
 		expect(codeFromHash('')).toBeNull();
+		expect(codeFromHash('#c=K7P42Q&h=0190abcd-ef')).toBe('K7P42Q');
+		expect(hostFromHash('#c=K7P42Q&h=0190abcd-ef')).toBe('0190abcd-ef');
+		expect(hostFromHash('#c=K7P42Q')).toBeNull();
+		expect(hostFromHash('#h=<script>')).toBeNull();
 	});
 
 	it('names the device from its UA', () => {
@@ -48,8 +52,12 @@ describe('pairing code (§3.2)', () => {
 function fakeHost(opts: {
 	code: string;
 	storeId?: string;
+	/** What the hello reply claims (a MITM's substitution); default the real one. */
+	replyStoreId?: string;
 	statuses?: string[];
 	helloStatus?: number;
+	/** The browser kept the device cookie (default true). */
+	cookieKept?: boolean;
 }) {
 	const storeId = opts.storeId ?? 'store-1';
 	const pairingId = 'pid-1';
@@ -74,8 +82,13 @@ function fakeHost(opts: {
 				pairingId,
 				msgB: b64url(b.msg),
 				hostConfirm: b64url(keys.hostConfirm),
-				storeId,
+				storeId: opts.replyStoreId ?? storeId,
 			});
+		}
+		if (path === '/api/rpc') {
+			return opts.cookieKept === false
+				? res(401, { ok: false, error: 'unauthorized' })
+				: res(200, { ok: true, data: { credential: { via: 'device', deviceId: 'd1' } } });
 		}
 		if (path === '/access/pair/confirm') {
 			const ok = keys && b64url(keys.deviceConfirm) === body.deviceConfirm;
@@ -111,7 +124,32 @@ describe('runPairing', () => {
 			'/access/pair/confirm',
 			'/access/pair/status',
 			'/access/pair/status',
+			'/api/rpc',
 		]);
+	});
+
+	it('review M1: allowed but the browser dropped the cookie → cookie_rejected', async () => {
+		const host = fakeHost({ code: 'K7P42Q', cookieKept: false });
+		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
+		expect(out).toEqual({ kind: 'cookie_rejected', deviceId: 'd1' });
+	});
+
+	it('review m5: a QR-pinned store id beats a substituted one in the hello reply', async () => {
+		const mitm = fakeHost({ code: 'K7P42Q', replyStoreId: 'store-evil' });
+		expect((await runPairing('K7P42Q', device, {}, { fetch: mitm.f, ...fast })).kind).toBe(
+			'failed'
+		);
+		const pinned = fakeHost({ code: 'K7P42Q', replyStoreId: 'store-evil' });
+		expect(
+			(
+				await runPairing(
+					'K7P42Q',
+					device,
+					{ pinnedStoreId: 'store-1' },
+					{ fetch: pinned.f, ...fast }
+				)
+			).kind
+		).toBe('allowed');
 	});
 
 	it('a wrong code fails on the device and still burns the code on the host', async () => {

@@ -54,6 +54,8 @@ pub struct Env<'a> {
     pub sockets: &'a dyn SocketControl,
     pub principal: PrincipalInfo,
     pub public_url: Option<String>,
+    /// `--insecure-cookie` (§3.8): whether the device cookie drops `Secure`.
+    pub insecure_cookie: bool,
 }
 
 /// `RpcResponse` for an [`AccessError`] (`"<code>: <message>"`).
@@ -107,6 +109,7 @@ pub async fn serve_daemon(
             is_admin: false,
         },
         public_url: access.options.public_url.clone(),
+        insecure_cookie: access.options.insecure_cookie,
     };
     to_response(dispatch(&env, ctx, cmd, args).await)
 }
@@ -278,6 +281,7 @@ mod tests {
                 is_admin: false,
             },
             public_url: None,
+            insecure_cookie: false,
         }
     }
 
@@ -426,6 +430,7 @@ mod tests {
                 is_admin: false,
             },
             public_url: None,
+            insecure_cookie: false,
         };
         let s = dispatch(&e, &ctx, "access_status", &json!({}))
             .await

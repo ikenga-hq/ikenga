@@ -27,6 +27,18 @@ export function codeFromHash(hash: string): string | null {
 	return c ? normalizePairCode(c) : null;
 }
 
+/**
+ * The host's store id from a QR link's fragment (`#c=…&h=<storeId>`). A
+ * scanned code pins idB with it (§3.4), so the binding to the host doesn't
+ * rest on the hello reply's `storeId`, which travels on the same untrusted
+ * channel (WP-74b review m5). Typed codes have none and fall back to the
+ * reply.
+ */
+export function hostFromHash(hash: string): string | null {
+	const h = new URLSearchParams(hash.replace(/^#/, '')).get('h');
+	return h && /^[A-Za-z0-9._-]{1,128}$/.test(h) ? h : null;
+}
+
 /** §3.6: the FE proposes a name from the UA, e.g. "Pixel 9 · Chrome". */
 export function deviceNameFromUA(ua: string): { name: string; platform: string | null } {
 	const browser = /Edg\//.test(ua)
@@ -53,6 +65,12 @@ export function deviceNameFromUA(ua: string): { name: string; platform: string |
 /** How a run ended, for the page's outcome states. */
 export type PairOutcome =
 	| { kind: 'allowed'; deviceId: string; tier: string }
+	/**
+	 * The host allowed the device, but the browser didn't keep the
+	 * `ikenga_device` cookie — a `Secure` cookie over plain HTTP off
+	 * loopback (review M1). The device holds nothing.
+	 */
+	| { kind: 'cookie_rejected'; deviceId: string }
 	| { kind: 'denied' }
 	| { kind: 'expired' }
 	| { kind: 'burned' }
@@ -66,6 +84,8 @@ export interface PairCallbacks {
 	onWords?: (words: Fingerprint) => void;
 	/** Abort the poll (the page unmounted). */
 	signal?: AbortSignal;
+	/** The QR's `h=` store id: pins idB instead of the hello reply's. */
+	pinnedStoreId?: string | null;
 }
 
 export interface PairDeps {
@@ -151,7 +171,7 @@ export async function runPairing(
 	}
 	if (hello.status !== 200) return refusal(hello.status, hello.body);
 	const pairingId = String(hello.body.pairingId ?? '');
-	const storeId = String(hello.body.storeId ?? '');
+	const storeId = cb.pinnedStoreId ?? String(hello.body.storeId ?? '');
 	let msgB: Uint8Array;
 	let hostConfirm: Uint8Array;
 	try {
@@ -204,14 +224,42 @@ export async function runPairing(
 		if (st.status !== 200) return refusal(st.status, st.body);
 		const state = String(st.body.state ?? '');
 		if (state === 'allowed') {
-			return {
-				kind: 'allowed',
-				deviceId: String(st.body.device_id ?? ''),
-				tier: String(st.body.tier ?? ''),
-			};
+			const deviceId = String(st.body.device_id ?? '');
+			// The status response set the cookie — if the browser kept it.
+			if ((await probeDeviceCookie(f, deviceId)) === 'missing') {
+				return { kind: 'cookie_rejected', deviceId };
+			}
+			return { kind: 'allowed', deviceId, tier: String(st.body.tier ?? '') };
 		}
 		const done = STATE_OUTCOME[state];
 		if (done) return done;
 		await sleep(deps.pollEveryMs ?? 1500);
 	}
+}
+
+/**
+ * After `allowed`: did the browser keep the device cookie? `access_status`
+ * over `/api/rpc` with the cookie only (review M1). `missing` when the
+ * server doesn't see this device's credential; `unknown` when it can't be
+ * asked (network) — the boot path finds out then.
+ */
+export async function probeDeviceCookie(
+	f: typeof fetch,
+	deviceId: string
+): Promise<'ok' | 'missing' | 'unknown'> {
+	let res: { status: number; body: Json };
+	try {
+		res = await call(f, '/api/rpc', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ cmd: 'access_status', args: {} }),
+		});
+	} catch {
+		return 'unknown';
+	}
+	const data = res.body.data as
+		| { credential?: { via?: string; deviceId?: string | null } }
+		| undefined;
+	const cred = res.status === 200 && res.body.ok ? data?.credential : undefined;
+	return cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing';
 }
