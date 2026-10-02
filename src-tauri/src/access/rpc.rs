@@ -137,9 +137,11 @@ pub async fn dispatch(
         }
         // The decide core and the T0 ask relay — WP-75
         // (`server::shared::notifications::routing`).
-        "permission_decide" => crate::server::shared::notifications::routing::decide_rpc(ctx, args),
+        "permission_decide" => {
+            crate::server::shared::notifications::routing::decide_rpc(ctx, args).await
+        }
         "permission_relay_put" | "permission_relay_take" | "permission_relay_resolve" => {
-            crate::server::shared::notifications::routing::relay_rpc(ctx, cmd, args)
+            crate::server::shared::notifications::routing::relay_rpc(ctx, cmd, args).await
         }
         // Members, policies, invites, shares — WP-76.
         "access_members_list"
@@ -392,8 +394,6 @@ mod tests {
         let op = operator_ctx(&store);
         let e = env(&store, &reg);
         for (cmd, wp) in [
-            ("access_routing_get", "WP-75"),
-            ("permission_decide", "WP-75"),
             ("access_members_list", "WP-76"),
             ("access_policy_get", "WP-76"),
             ("access_invite_issue", "WP-76"),
@@ -405,14 +405,6 @@ mod tests {
             assert_eq!(err.code, Code::Internal, "{cmd}");
             assert!(err.message.contains(wp), "{cmd}: {err}");
         }
-        let relay = dispatch(&e, &op, "permission_relay_put", &json!({}))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            relay.code,
-            Code::InvalidRequest,
-            "§9.1: relay stubs are invalid_request"
-        );
     }
 
     #[tokio::test]

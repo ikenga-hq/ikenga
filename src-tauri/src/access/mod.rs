@@ -339,7 +339,12 @@ impl DaemonAccess {
         let store = match data_dir {
             None => None,
             Some(dir) => match AccessStore::open_t0(dir, &host).await {
-                Ok(s) => Some(s),
+                Ok(s) => {
+                    // WP-75: the decide core and the ask relay over this
+                    // daemon's `ikenga.db` and chain (§5.5).
+                    crate::server::shared::notifications::routing::install_daemon(s.clone(), dir);
+                    Some(s)
+                }
                 Err(e) => {
                     tracing::error!(
                         "access store {} unavailable: {e:#} — pairing is off",
@@ -484,6 +489,20 @@ pub fn check(ctx: &AccessCtx, req: Requirement) -> Result<(), AccessError> {
     }
     let missing = ctx.caps.missing(req.caps);
     if !missing.is_empty() {
+        // §5.1 / A-23 (WP-75): `approve` the tier and role hold but the
+        // routing preference removed is `routing_refused`, not `forbidden`.
+        if missing == CapSet::of(&[Cap::Approve])
+            && crate::server::shared::notifications::routing::approve_removed_by_routing(
+                ctx.caps,
+                ctx.tier,
+                ctx.share.as_ref(),
+            )
+        {
+            return Err(AccessError::new(
+                Code::RoutingRefused,
+                "permission asks are answered on another device (this device only)",
+            ));
+        }
         return Err(AccessError::missing(missing));
     }
     Ok(())
@@ -539,6 +558,8 @@ pub async fn rpc_prehook(
         )));
     };
     if let Err(e) = authorize(ctx, cmd) {
+        // A-23: a refused decision is audited `permission.refused` (WP-75).
+        crate::server::shared::notifications::routing::audit_prehook_refusal(ctx, cmd, &e).await;
         return PreHook::Answered(rpc::error_response(&e));
     }
     match &ctx.share {

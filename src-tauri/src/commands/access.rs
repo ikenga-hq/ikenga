@@ -86,8 +86,9 @@ async fn post(info: &DaemonInfo, cmd: &str, args: &Value) -> Sent {
     }
 }
 
-/// The one generic proxy (P-20).
-async fn proxy(
+/// The one generic proxy (P-20). `pub(crate)` for the desktop's permission
+/// routing (WP-75: the relay task and the host's routing / audit calls).
+pub(crate) async fn proxy(
     app: &AppHandle,
     daemon: &DaemonState,
     cmd: &str,
@@ -374,6 +375,7 @@ pub async fn access_routing_set(
 #[tauri::command]
 pub async fn permission_decide(notification_id: i64, decision: String) -> Result<Value, String> {
     crate::server::shared::notifications::routing::decide_local(notification_id, &decision)
+        .await
         .map_err(|e| e.to_string())
 }
 

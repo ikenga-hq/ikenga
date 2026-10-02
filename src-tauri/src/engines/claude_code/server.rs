@@ -133,6 +133,28 @@ impl ClaudeCodeEngine {
         }
     }
 
+    /// G-ACCESS §5.5 (WP-75): the decide core's ACP resolver — the first
+    /// production caller of the parked round-trip. Answers `request_id` with
+    /// the engine option for `decision` (`allow_once` → Allow once,
+    /// `allow_always_project` → Allow always, `deny` → Reject once).
+    /// `false` when nothing is parked under it any more (answered, cancelled
+    /// or timed out — §5.6: never revived).
+    pub async fn answer_permission(
+        &self,
+        request_id: &str,
+        decision: crate::server::shared::notifications::routing::Decision,
+    ) -> bool {
+        let Some(tx) = self.permission_waiters.lock().await.remove(request_id) else {
+            return false;
+        };
+        let resp = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            agent_client_protocol::schema::SelectedPermissionOutcome::new(option_for_decision(
+                decision,
+            )),
+        ));
+        tx.send(resp).is_ok()
+    }
+
     /// Negotiated protocol version we'll advertise. Hard-coded for now —
     /// the crate exports it as `ProtocolVersion::V1` (numeric 1).
     pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -532,16 +554,29 @@ impl ClaudeCodeEngine {
         // `chat://notify` is gone. Spawned so this loop never waits on a DB
         // write; the round-trip task below resolves it (`resolvedAt`) once
         // it is answered, cancelled or times out.
+        //
+        // G-ACCESS §5.7 / §5.5 (a) (WP-75): recorded with its attribution
+        // (the session's cwd → project, classified against its root) and
+        // mirrored to the daemon until the round-trip's own bound.
         let pa_db = app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone());
-        if let Some(db) = pa_db.clone() {
+        {
             let new = crate::notifications::producers::permission_from_engine(
                 &thread_id,
                 &request_id,
                 &tool_name,
                 tool_input.as_ref(),
             );
+            let facts = crate::notifications::producers::ask_facts(
+                Some(&tool_name),
+                tool_input.as_ref(),
+                Some(&session.cwd),
+                false,
+            );
+            let expires =
+                chrono::Utc::now().timestamp_millis() + (PERMISSION_TIMEOUT_SECS as i64) * 1000;
+            let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                crate::notifications::record_with_db(&db, new).await;
+                crate::notifications::record_permission(&app, new, facts, Some(expires)).await;
             });
         }
 
@@ -561,7 +596,9 @@ impl ClaudeCodeEngine {
         } else {
             crate::claude::session::ControlWire::Legacy
         };
+        let app_for_task = app.clone();
         tauri::async_runtime::spawn(async move {
+            let mut outcome = "decided_on_host";
             let response = match tokio::time::timeout(
                 Duration::from_secs(PERMISSION_TIMEOUT_SECS),
                 rx,
@@ -570,6 +607,7 @@ impl ClaudeCodeEngine {
             {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(_)) | Err(_) => {
+                    outcome = "timed_out";
                     // Sender dropped (server torn down) OR timeout. Either
                     // way, synthesize a Cancelled outcome so claude doesn't
                     // hang waiting on us. We also evict the (possibly
@@ -602,6 +640,9 @@ impl ClaudeCodeEngine {
             if let Some(db) = pa_db {
                 crate::notifications::resolve_key_with_db(&db, &notification_key).await;
             }
+            // §5.5 (a): close the daemon's mirror (a no-op when a paired
+            // device decided it).
+            crate::notifications::relay_resolved(&app_for_task, &notification_key, outcome);
         });
     }
 
@@ -890,6 +931,21 @@ fn resolve_project_id(meta: Option<&serde_json::Map<String, serde_json::Value>>)
         .map(str::to_string)
 }
 
+/// `permission_decide`'s decision → this engine's option id (§5.5).
+pub fn option_for_decision(
+    decision: crate::server::shared::notifications::routing::Decision,
+) -> &'static str {
+    use crate::engines::claude_code::permission::{
+        OPT_ALLOW_ALWAYS, OPT_ALLOW_ONCE, OPT_REJECT_ONCE,
+    };
+    use crate::server::shared::notifications::routing::Decision;
+    match decision {
+        Decision::AllowOnce => OPT_ALLOW_ONCE,
+        Decision::AllowAlwaysProject => OPT_ALLOW_ALWAYS,
+        Decision::Deny => OPT_REJECT_ONCE,
+    }
+}
+
 /// Tauri-friendly wrapper around the server.
 pub type ClaudeCodeEngineState = Arc<ClaudeCodeEngine>;
 
@@ -1011,6 +1067,37 @@ mod tests {
             }
             _ => panic!("expected Selected outcome"),
         }
+    }
+
+    /// G-ACCESS §5.5 (WP-75): the decide core's ACP resolver answers a
+    /// parked round-trip once, with the mapped option; a gone ask is `false`.
+    #[tokio::test]
+    async fn answer_permission_maps_the_decision_and_answers_once() {
+        use crate::server::shared::notifications::routing::Decision;
+        let server = ClaudeCodeEngine::default();
+        let (tx, rx) = oneshot::channel::<RequestPermissionResponse>();
+        server
+            .permission_waiters
+            .lock()
+            .await
+            .insert("req_a".into(), tx);
+        assert!(
+            server
+                .answer_permission("req_a", Decision::AllowAlwaysProject)
+                .await
+        );
+        match rx.await.expect("fires").outcome {
+            RequestPermissionOutcome::Selected(s) => assert_eq!(
+                s.option_id.0.as_ref(),
+                crate::engines::claude_code::permission::OPT_ALLOW_ALWAYS
+            ),
+            _ => panic!("expected Selected"),
+        }
+        assert!(!server.answer_permission("req_a", Decision::Deny).await);
+        assert_eq!(
+            option_for_decision(Decision::Deny),
+            crate::engines::claude_code::permission::OPT_REJECT_ONCE
+        );
     }
 
     #[tokio::test]

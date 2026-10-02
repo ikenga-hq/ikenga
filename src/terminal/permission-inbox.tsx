@@ -8,7 +8,12 @@ import { Bell, Check, ShieldAlert, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { iykeFetch } from '@/lib/iyke/client';
-import { settingsGet, settingsSet } from '@/lib/tauri-cmd';
+import { notificationsList, settingsGet, settingsSet } from '@/lib/tauri-cmd';
+import {
+	decidePermissionRow,
+	hostDecideBlock,
+	refreshHostDecideBlock,
+} from '@/shell/notifications/actions';
 
 export interface PermissionRequestEntry {
 	id: string;
@@ -25,9 +30,34 @@ function holdSettingKey(sessionId: string) {
 	return `permissions.hold_terminal_${sessionId}`;
 }
 
+/** The `permission` row a held gate was recorded as (`permission:hook:<id>`). */
+async function hookRowId(requestId: string): Promise<number | null> {
+	try {
+		const rows = await notificationsList({ kinds: ['permission'], limit: 200 });
+		const key = `permission:hook:${requestId}`;
+		return rows.find((r) => r.dedupeKey === key && r.resolvedAt == null)?.id ?? null;
+	} catch {
+		return null;
+	}
+}
+
 export function PermissionInbox({ sessionId }: { sessionId: string }) {
 	const [requests, setRequests] = useState<PermissionRequestEntry[]>([]);
 	const [holdEnabled, setHoldEnabled] = useState(false);
+	// G-ACCESS §5.1 / §5.7 (WP-75): when asks are routed to another device,
+	// this inbox renders them read-only with the reason.
+	const [blocked, setBlocked] = useState<string | null>(hostDecideBlock());
+	const [error, setError] = useState<string | null>(null);
+
+	useEffect(() => {
+		let live = true;
+		void refreshHostDecideBlock().then((b) => {
+			if (live) setBlocked(b);
+		});
+		return () => {
+			live = false;
+		};
+	}, []);
 
 	useEffect(() => {
 		// Initialize desktop notification permissions
@@ -127,18 +157,34 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 		};
 	}, [sessionId]);
 
-	const handleDecision = (id: string, decision: 'approved' | 'denied') => {
-		setRequests((prev) => prev.map((r) => (r.id === id ? { ...r, status: decision } : r)));
-
+	const handleDecision = async (id: string, decision: 'approved' | 'denied') => {
 		const req = requests.find((r) => r.id === id);
 		const requestId = req?.request_id || id;
+		setError(null);
 
-		// Post decision back to backend bridge
-		iykeFetch('/iyke/hooks/decision', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ requestId, decision }),
-		}).catch(() => {});
+		// G-ACCESS §5.5: the held gate's row goes through `permission_decide`
+		// (routing-capped, attributed, audited); the hooks route is the
+		// fallback while the row is not recorded yet.
+		const rowId = await hookRowId(requestId);
+		if (rowId != null) {
+			const refused = await decidePermissionRow(
+				rowId,
+				decision === 'approved' ? 'allow_once' : 'deny',
+				requestId
+			);
+			if (refused) {
+				setError(refused);
+				setBlocked(hostDecideBlock());
+				return;
+			}
+		} else {
+			iykeFetch('/iyke/hooks/decision', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ requestId, decision }),
+			}).catch(() => {});
+		}
+		setRequests((prev) => prev.map((r) => (r.id === id ? { ...r, status: decision } : r)));
 	};
 
 	async function toggleHold() {
@@ -170,6 +216,12 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 					Hold PreToolUse
 				</label>
 			</div>
+
+			{error && (
+				<p role="alert" className="text-[10px] text-rose-400">
+					{error}
+				</p>
+			)}
 
 			{requests.length === 0 ? (
 				<div className="flex h-full flex-col items-center justify-center p-6 text-center text-xs text-muted-foreground font-mono select-none">
@@ -206,12 +258,16 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 							</pre>
 						)}
 
-						{req.status === 'pending' ? (
+						{req.status === 'pending' && blocked ? (
+							<p data-waiting-on="device" className="mt-2 text-[10px] text-muted-foreground">
+								{blocked}
+							</p>
+						) : req.status === 'pending' ? (
 							<div className="mt-2 flex items-center justify-end gap-2">
 								<Button
 									size="sm"
 									className="h-6 px-2 text-[10px] bg-rose-600 hover:bg-rose-500 text-white"
-									onClick={() => handleDecision(req.id, 'denied')}
+									onClick={() => void handleDecision(req.id, 'denied')}
 								>
 									<X className="mr-1 h-3 w-3" /> Deny
 								</Button>
@@ -219,7 +275,7 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 								<Button
 									size="sm"
 									className="h-6 px-2 text-[10px] bg-emerald-600 hover:bg-emerald-500 text-white"
-									onClick={() => handleDecision(req.id, 'approved')}
+									onClick={() => void handleDecision(req.id, 'approved')}
 								>
 									<Check className="mr-1 h-3 w-3" /> Approve
 								</Button>

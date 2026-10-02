@@ -1,18 +1,89 @@
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { NgwaTrustSheet } from './ngwa-trust-sheet';
+import { NgwaTrustSheet, operatorPolicy } from './ngwa-trust-sheet';
+import type { AccessStatus } from '@/lib/access/client';
 import type { NgwaItem } from '@ikenga/contract';
 import * as tauriCmd from '@/lib/tauri-cmd';
+
+const access = vi.hoisted(() => ({ status: null as unknown }));
 
 vi.mock('@/lib/tauri-cmd', () => ({
 	pkgTrustGrant: vi.fn(),
 	pkgTrustRevoke: vi.fn(),
+	// `access_status` (G-ACCESS §5.8): T0 unless a test sets a T1 status.
+	invoke: vi.fn((cmd: string) =>
+		cmd === 'access_status' && access.status
+			? Promise.resolve(access.status)
+			: Promise.reject(new Error('store_unavailable: none'))
+	),
 }));
 
 afterEach(() => {
 	cleanup();
 	vi.clearAllMocks();
+	access.status = null;
+});
+
+function t1Status(over: Partial<AccessStatus> = {}): AccessStatus {
+	return {
+		tier: 't1',
+		store: 'ok',
+		principal: { principalId: 'p', username: 'ada', isAdmin: false },
+		credential: { via: 'device', deviceId: 'd', tier: 'dispatch' },
+		caps: ['files', 'sessions', 'dispatch'],
+		adminStrength: false,
+		publicUrl: null,
+		sharingEnabled: true,
+		share: null,
+		...over,
+	};
+}
+
+describe('NgwaTrustSheet remote split (G-ACCESS §5.8, G-62)', () => {
+	it('the desktop (T0) has no operator-policy block', () => {
+		expect(operatorPolicy({ id: 'com.ikenga.tasks' }, null)).toBeNull();
+		expect(operatorPolicy({ id: 'com.ikenga.tasks' }, { ...t1Status(), tier: 't0' })).toBeNull();
+	});
+
+	it('kernel pkgs are operator-installed; vault items need install in this context', () => {
+		expect(operatorPolicy({ id: 'com.ikenga.tasks' }, t1Status())?.line).toMatch(
+			/Installed by the operator/
+		);
+		const vault = { id: 'skill:personal:grill' };
+		expect(operatorPolicy(vault, t1Status())).toMatchObject({ canInstall: false });
+		expect(operatorPolicy(vault, t1Status())?.line).toMatch(/View \+ dispatch/);
+		const full = t1Status({
+			caps: ['files', 'sessions', 'dispatch', 'approve', 'install', 'settings', 'secrets'],
+		});
+		expect(operatorPolicy(vault, full)).toMatchObject({ canInstall: true });
+		const share = t1Status({
+			caps: ['files', 'sessions', 'install'],
+			share: {
+				projectKey: 'o/royalti-co',
+				projectName: 'royalti-co',
+				ownerUsername: 'ned',
+				role: 'operator',
+				scope: 'project',
+			},
+		});
+		expect(operatorPolicy(vault, share)?.line).toMatch(/project scope only/);
+	});
+
+	it('renders "Operator policy" above "Your trust" on a T1 server', async () => {
+		access.status = t1Status();
+		renderWithClient(
+			<NgwaTrustSheet
+				open={true}
+				onOpenChange={vi.fn()}
+				item={makeItem({ id: 'com.ikenga.tasks' })}
+				mode="review"
+			/>
+		);
+		await waitFor(() => expect(screen.getByText('Operator policy')).toBeTruthy());
+		expect(screen.getByText('Your trust')).toBeTruthy();
+		expect(screen.getByText(/Installed by the operator/)).toBeTruthy();
+	});
 });
 
 function makeItem(partial: Partial<NgwaItem> = {}): NgwaItem {

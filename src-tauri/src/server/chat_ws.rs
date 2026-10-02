@@ -27,6 +27,7 @@ use super::AppState;
 use crate::access::ws::{Frame, Route};
 use crate::access::{AccessCtx, DaemonAccess};
 use crate::engines::EngineHandle;
+use crate::server::shared::notifications::routing;
 
 /// Engine used when the client doesn't name one.
 const DEFAULT_ENGINE: &str = "antigravity-cli";
@@ -323,6 +324,13 @@ async fn handle_chat_socket(
                             continue;
                         }
 
+                        // G-ACCESS §5.7 (WP-75): capture who this turn's
+                        // asks are attributed to — the share's member and
+                        // project, or the own-workspace project from the cwd.
+                        let attribution =
+                            prompt_context(&state, guard.ctx.as_ref(), cwd.as_deref()).await;
+                        routing::set_prompt_context(&thread_id, attribution);
+
                         let engine_name = engine.unwrap_or_else(|| DEFAULT_ENGINE.to_string());
                         info!("Running prompt on engine {engine_name} for thread {thread_id}");
 
@@ -382,5 +390,51 @@ async fn handle_chat_socket(
         }
     }
 
+    routing::clear_prompt_context(&thread_id);
     info!("Chat WebSocket disconnected for thread: {thread_id}");
+}
+
+/// The attribution a `/ws/chat` prompt's asks carry (G-ACCESS §5.7): under a
+/// share, `X-Ikenga-Share-Principal` / `-Project` as captured at the
+/// handshake (narrowing / attribution only, never authorization), with the
+/// shared project's root; in the principal's own workspace, the project
+/// whose root holds the prompt's cwd (the Owner's own work: no
+/// `requested_by`). A daemon engine that raises asks records them through
+/// `routing::record_ask_for_thread`.
+async fn prompt_context(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    cwd: Option<&str>,
+) -> routing::PromptContext {
+    let pool = match &state.pa_db {
+        Some(db) => db.ensure_pool().await.ok(),
+        None => None,
+    };
+    if let Some(share) = ctx.and_then(|c| c.share.as_ref()) {
+        let root = match &pool {
+            Some(p) => crate::server::shared::projects::get_project(p, &share.project_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| p.root_path),
+            None => None,
+        };
+        return routing::PromptContext {
+            requested_by: share.member_principal_id.clone(),
+            project_id: Some(share.project_id.clone()),
+            project_root: root,
+        };
+    }
+    let found = match (&pool, cwd) {
+        (Some(p), Some(cwd)) => routing::project_for_path(p, cwd).await,
+        _ => None,
+    };
+    routing::PromptContext {
+        requested_by: None,
+        project_root: found
+            .as_ref()
+            .map(|(_, root)| root.clone())
+            .or_else(|| cwd.map(str::to_string)),
+        project_id: found.map(|(id, _)| id),
+    }
 }

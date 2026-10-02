@@ -1,26 +1,43 @@
 // The remote client's permission inbox (G-ACCESS §3.12, §5.7; D-05
-// `remote-client`). WP-74b ships the view; WP-75 owns `inbox*` in W4
-// (`can_decide` / `waiting_on` from its annotate, the T0 ask relay).
+// `remote-client`). WP-74b ships the view; WP-75 fills its states: the
+// desktop's asks reach a paired device through the T0 ask relay (§5.5 (a)),
+// and the daemon's post-hook says per row whether THIS device may answer
+// (`can_decide`), what it waits on (`waiting_on`) and whether "always for
+// this project" is on offer (`can_allow_always`).
 //
 // A card is LIVE only when its row says `can_decide`; otherwise it renders
-// read-only with the reason (D-7: a `dispatch` device can't approve).
+// read-only with the reason (D-7: a `dispatch` device can't approve; "this
+// device only" names the device that can; a share's sensitive ask waits on
+// the Owner).
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
-import { type AccessStatus, parseAccessError, permissionDecide } from '@/lib/access/client';
+import {
+	type AccessStatus,
+	accessRoutingGet,
+	parseAccessError,
+	permissionDecide,
+} from '@/lib/access/client';
 
-import { type AnnotatedRow, inboxReadOnlyReason } from './remote-model';
+import {
+	decideErrorCopy,
+	type InboxRow,
+	inboxCardReason,
+	needsRoutedDevice,
+	offersAlways,
+} from './inbox-model';
 
 export function RemoteInbox({
 	rows,
 	status,
 	onDecided,
 }: {
-	rows: AnnotatedRow[];
+	rows: InboxRow[];
 	status: AccessStatus;
 	onDecided: () => void;
 }) {
 	const pending = rows.filter((r) => !r.resolvedAt);
+	const routedDevice = useRoutedDevice(needsRoutedDevice(pending));
 	return (
 		<section data-section="inbox" aria-label="Permission inbox">
 			<SectionHead title="Permission inbox" right={`${pending.length} pending`} />
@@ -31,23 +48,50 @@ export function RemoteInbox({
 					</p>
 				)}
 				{pending.map((row) => (
-					<InboxCard key={row.id} row={row} status={status} onDecided={onDecided} />
+					<InboxCard
+						key={row.id}
+						row={row}
+						status={status}
+						routedDevice={routedDevice}
+						onDecided={onDecided}
+					/>
 				))}
 			</div>
 		</section>
 	);
 }
 
+/** The device "this device only" names, fetched only when a card needs it. */
+function useRoutedDevice(needed: boolean): string | null {
+	const [name, setName] = useState<string | null>(null);
+	useEffect(() => {
+		if (!needed) return;
+		let live = true;
+		accessRoutingGet()
+			.then((r) => {
+				const n = (r as { deviceName?: string | null }).deviceName ?? null;
+				if (live) setName(n);
+			})
+			.catch(() => {});
+		return () => {
+			live = false;
+		};
+	}, [needed]);
+	return needed ? name : null;
+}
+
 function InboxCard({
 	row,
 	status,
+	routedDevice,
 	onDecided,
 }: {
-	row: AnnotatedRow;
+	row: InboxRow;
 	status: AccessStatus;
+	routedDevice: string | null;
 	onDecided: () => void;
 }) {
-	const reason = inboxReadOnlyReason(row, status);
+	const reason = inboxCardReason(row, status, routedDevice);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const decide = async (decision: 'allow_once' | 'allow_always_project' | 'deny') => {
@@ -57,7 +101,11 @@ function InboxCard({
 			await permissionDecide(row.id, decision);
 			onDecided();
 		} catch (e) {
-			setError(parseAccessError(e).message);
+			const { code, message } = parseAccessError(e);
+			setError(decideErrorCopy(code, message));
+			// The row changed under us (answered elsewhere, timed out,
+			// re-routed): refresh so the card shows its new state.
+			if (code && code !== 'internal') onDecided();
 		} finally {
 			setBusy(false);
 		}
@@ -66,6 +114,7 @@ function InboxCard({
 	return (
 		<div
 			data-card={reason ? 'read-only' : 'live'}
+			data-waiting-on={row.waiting_on ?? undefined}
 			className="rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2.5"
 		>
 			<p className="m-0 text-[var(--text-body-sm)] text-[var(--fg)]">{row.title}</p>
@@ -86,14 +135,16 @@ function InboxCard({
 					>
 						Allow once
 					</button>
-					<button
-						type="button"
-						disabled={busy}
-						onClick={() => decide('allow_always_project')}
-						className={`${btn} text-[var(--fg-muted)] hover:text-[var(--fg)]`}
-					>
-						Always for this project
-					</button>
+					{offersAlways(row) && (
+						<button
+							type="button"
+							disabled={busy}
+							onClick={() => decide('allow_always_project')}
+							className={`${btn} text-[var(--fg-muted)] hover:text-[var(--fg)]`}
+						>
+							Always for this project
+						</button>
+					)}
 					<button
 						type="button"
 						disabled={busy}
