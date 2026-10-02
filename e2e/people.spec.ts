@@ -85,7 +85,11 @@ async function tabTo(page: Page, el: Locator) {
  *  `transition-all` animates the outline in. `clear` (a primary-filled
  *  control, whose fill is the ring's colour) also wants the design's
  *  `outline-offset: 1px` — flush, the ring vanishes into the fill. */
-async function expectFocusRing(page: Page, el: Locator, opts: { clear?: boolean } = {}) {
+async function expectFocusRing(
+	page: Page,
+	el: Locator,
+	opts: { clear?: boolean; unclipped?: boolean } = {}
+) {
 	await tabTo(page, el);
 	await expect
 		.poll(
@@ -103,6 +107,42 @@ async function expectFocusRing(page: Page, el: Locator, opts: { clear?: boolean 
 			Number.parseFloat(offset),
 			'a primary-filled control needs an outline offset'
 		).toBeGreaterThan(0);
+	}
+	if (opts.unclipped) {
+		// The ring's outer edge (border box grown by offset + width) must sit
+		// inside every clipping ancestor's padding box, or part of it is cut.
+		const clipped = await el.evaluate((node) => {
+			const cs = getComputedStyle(node);
+			const grow = Number.parseFloat(cs.outlineOffset) + Number.parseFloat(cs.outlineWidth);
+			const r = node.getBoundingClientRect();
+			const ring = {
+				left: r.left - grow,
+				top: r.top - grow,
+				right: r.right + grow,
+				bottom: r.bottom + grow,
+			};
+			const cuts: string[] = [];
+			for (let a = node.parentElement; a; a = a.parentElement) {
+				const acs = getComputedStyle(a);
+				if (acs.overflowX === 'visible' && acs.overflowY === 'visible') continue;
+				const b = a.getBoundingClientRect();
+				const left = b.left + a.clientLeft;
+				const top = b.top + a.clientTop;
+				const right = left + a.clientWidth;
+				const bottom = top + a.clientHeight;
+				const eps = 0.5;
+				if (
+					ring.left < left - eps ||
+					ring.top < top - eps ||
+					ring.right > right + eps ||
+					ring.bottom > bottom + eps
+				) {
+					cuts.push(`${a.tagName.toLowerCase()}${a.id ? `#${a.id}` : ''}`);
+				}
+			}
+			return cuts;
+		});
+		expect(clipped, 'the focus ring is clipped by').toEqual([]);
 	}
 }
 
@@ -383,6 +423,11 @@ for (const mode of ['dark', 'light'] as const) {
 			await page.screenshot({ path: shotPath(testInfo, `people-devices-paired-${mode}.png`) });
 
 			// Cap menu (§1.3): the three remote tiers plus Full, each with its line.
+			// WP-78c (78b N1): the #scopeSw segments sit in an overflow-hidden
+			// group; the whole ring must still show.
+			await expectFocusRing(page, devices.locator('#scopeSw button[data-scope="personal"]'), {
+				unclipped: true,
+			});
 			const cap = devices.getByRole('button', { name: 'What Pixel 9 · Chrome can do' });
 			await expectFocusRing(page, cap);
 			await cap.click();
