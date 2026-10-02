@@ -2,7 +2,7 @@
 
 **Gate:** G-PRINCIPAL · **Owner:** remote-access WP-20 · **Status:** SIGNED — frozen 2026-09-29 (§13) · **Written:** 2026-09-27 · **amended** by remote-access Round 16 (2026-10-01) — see §14
 
-WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). Nothing here is implemented yet. §13 was signed on 2026-09-29, so WP-20/21/22 may start against it.
+WP-21, WP-22 and shell-ux WP-73 (G-ACCESS) code against **this file**, not against a WP-20 merge. The gate was defined in remote-access Round 13 as freezing "the principal id, the session/token → uid mapping, and the per-principal data-dir layout", fixing `03` §l's singletons (`plans/remote-access/04-discussion.md:70`). **Implemented** — WP-20 complete (4 slices merged 2026-10-01/02 on main); G-PRINCIPAL signed 2026-09-29. Implements §1–§9, §11. §13 was signed on 2026-09-29, so WP-20/21/22 may start against it.
 
 **Grounded against:** `ikenga` `origin/main` at `a076a87` (WP-19 slices 1–3 #298/#301/#304; WP-18b part a #303; WP-18b part b #305, **merged** at `b569d88`). Nothing under `src-tauri/` changed between `b569d88` and `a076a87` (#306/#307). Line numbers are anchors on `a076a87`. Plan paths (`plans/…`, `docs/adr/…`) are in the workspace meta-repo.
 

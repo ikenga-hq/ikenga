@@ -1,7 +1,7 @@
 # Ikenga
 
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/ikenga-hq/ikenga/actions)
-[![Version](https://img.shields.io/badge/version-v0.0.7-blue.svg)](https://github.com/ikenga-hq/ikenga/releases)
+[![Version](https://img.shields.io/github/v/release/ikenga-hq/ikenga?label=version&color=blue)](https://github.com/ikenga-hq/ikenga/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Discussions](https://img.shields.io/badge/community-discussions-5865F2.svg)](https://github.com/ikenga-hq/ikenga/discussions)
 [![Newsletter](https://img.shields.io/badge/newsletter-Building%20in%20the%20Loop-e8590c.svg)](https://buildingintheloop.substack.com/subscribe)
@@ -54,21 +54,18 @@ first-party pkgs.
 
 ## Install
 
-<!-- GATED: install one-liner not live until WP-13 — the real one-liner ships with the first verified GitHub Release. -->
-
 ```bash
-# placeholder — the real one-liner lands with the first verified GitHub Release
 curl -fsSL https://ikenga.dev/install.sh | sh
 ```
 
-Until the install script is live, build from source (below). Released builds, when
-available, are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases).
+Released builds are on the [Releases page](https://github.com/ikenga-hq/ikenga/releases).
+To build from source, see Quickstart below.
 
 ## Quickstart
 
 Prereqs:
 
-- macOS or Linux (Linux needs WebKit2GTK 4.1 — `libwebkit2gtk-4.1-dev`)
+- macOS, Linux, or Windows (Linux needs WebKit2GTK 4.1 — `libwebkit2gtk-4.1-dev`)
 - Rust ≥ 1.77
 - `bun` ≥ 1.1
 - `claude` on `$PATH` (for the default engine + terminal panel)
@@ -79,10 +76,8 @@ bun install
 bun run tauri dev
 ```
 
-The window opens to the **Home** canvas — a free-form workspace of built-in and
-pkg-contributed widgets. Navigate via the activity bar, sidebar, and command palette
-(⌘K / Ctrl+K). The first-run onboarding flow handles account / engine setup; no env file is
-required to launch.
+Navigate via the activity bar, sidebar, and command palette (⌘K / Ctrl+K). The
+first-run onboarding flow handles account / engine setup; no env file is required to launch.
 
 ### Optional env vars
 
@@ -214,7 +209,7 @@ for all four targets in parallel:
 |---|---|---|
 | `macos-latest` | `aarch64-apple-darwin` | `.dmg`, `.app.tar.gz` (Apple Silicon) |
 | `macos-latest` | `x86_64-apple-darwin` | `.dmg`, `.app.tar.gz` (Intel) |
-| `windows-latest` | `x86_64-pc-windows-msvc` | `.msi`, `.exe` |
+| `windows-latest` | `x86_64-pc-windows-msvc` | NSIS `.exe` |
 | `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | `.deb` (`.AppImage` — see caveat) |
 
 ```bash
@@ -338,13 +333,12 @@ IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
 
 - No code signing (no Apple Developer ID, no Windows EV cert)
 - No notarization
-- No auto-updater (`tauri-plugin-updater` intentionally absent)
 - No Snap, Flatpak, or Mac App Store
 - No system-tray icon (global shortcut covers summon UX)
 
 GitHub Releases (via the Actions workflow) is the supported remote distribution
-channel. Revisit signing / notarization if Ikenga ever needs to be installed at
-scale.
+channel. The built-in auto-updater shipped in v0.14.0. Revisit signing /
+notarization if Ikenga ever needs to be installed at scale.
 
 ## Links
 
