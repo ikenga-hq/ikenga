@@ -462,7 +462,14 @@ fn build_router(
         config.executor_tier,
         config.data_dir.as_deref(),
     ));
-    let app_lock = config.data_dir.as_ref().map(|dir| {
+    // Only a T1 principal child serves the app lock (its own, per principal).
+    // A T0 daemon would otherwise grow a second PIN beside the desktop's;
+    // its `app_lock_*` arms refuse instead (see `rpc_local::app_lock`).
+    let app_lock = config
+        .data_dir
+        .as_ref()
+        .filter(|_| config.executor_tier == crate::executor::ExecutorTier::T1)
+        .map(|dir| {
         use crate::secrets_env::app_lock::{AppLockCore, Platform, CONFIG_FILENAME};
         let core = AppLockCore::new();
         core.configure(dir.join(CONFIG_FILENAME), Platform::headless());

@@ -340,9 +340,11 @@ impl T1Launcher {
     /// loaded or created refuses the launch rather than start a child whose
     /// secret store can't open.
     pub fn secrets_key(&self, principal: &Principal) -> anyhow::Result<PrincipalKey> {
-        let kek = principal::BrokerKek::load_or_create(&self.root.operator_dir()).map_err(|e| {
-            anyhow::anyhow!("the principal-secrets KEK is unavailable (WP-21): {e}")
-        })?;
+        let kek = principal::BrokerKek::load_or_create(
+            &self.root.operator_dir(),
+            &self.root.principals_dir(),
+        )
+        .map_err(|e| anyhow::anyhow!("the principal-secrets KEK is unavailable (WP-21): {e}"))?;
         Ok(kek.derive(principal.id))
     }
 }

@@ -269,6 +269,19 @@ impl Scope {
     }
 }
 
+/// `prctl(PR_SET_DUMPABLE, 0)`: `/proc/<pid>/{environ,mem,…}` become
+/// root-owned and ptrace by the same uid is refused.
+#[cfg(all(target_os = "linux", not(test)))]
+fn set_non_dumpable() {
+    // SAFETY: plain prctl with integer arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        tracing::warn!(
+            "prctl(PR_SET_DUMPABLE, 0) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn is_principal_token(s: &str, max: usize) -> bool {
     !s.is_empty()
         && s.len() <= max
@@ -386,11 +399,22 @@ impl DaemonSecrets {
         // would gain nothing — no broker hands one to a T0 daemon, and the
         // PTY / executor floors drop the name anyway — and would let every
         // T0 router (tests included) race the process-global variable.
+        //
+        // `tier == T1` here means a principal child: the T1 broker never
+        // builds this router (`server::t1_boot` routes to the broker or to
+        // `principal_child_boot`, and only the latter serves it).
         #[cfg(unix)]
         {
             if tier != crate::executor::ExecutorTier::T1 {
-                return Self::env_only();
+                return Self::t0(data_dir);
             }
+            // The child holds the derived key in memory from here on, and its
+            // initial copy stays in `/proc/self/environ` whatever `remove_var`
+            // does: make the process non-dumpable first, so the principal's
+            // other processes (same uid) can't read either through `/proc`
+            // or ptrace. Not in tests, which share one process.
+            #[cfg(all(target_os = "linux", not(test)))]
+            set_non_dumpable();
             Self::from_handoff(principal::take_handoff(), tier, data_dir)
         }
         #[cfg(not(unix))]
@@ -398,6 +422,24 @@ impl DaemonSecrets {
             let _ = (tier, data_dir);
             Self::env_only()
         }
+    }
+
+    /// T0: the env namespace — unless the data dir holds a principal store
+    /// (`secrets/dek.json`), which a T0 daemon can't open: then fail closed
+    /// rather than serve the operator defaults over it.
+    fn t0(data_dir: Option<&std::path::Path>) -> Self {
+        match data_dir.map(Self::sealed_store) {
+            Some(Some(dek)) => Self::broken(format!(
+                "{} holds a principal secret store, which only a T1 principal child can open",
+                dek.display()
+            )),
+            _ => Self::env_only(),
+        }
+    }
+
+    fn sealed_store(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dek = data_dir.join("secrets").join("dek.json");
+        std::fs::symlink_metadata(&dek).is_ok().then_some(dek)
     }
 
     /// [`from_boot`](Self::from_boot) after the hand-off was taken.
@@ -415,10 +457,23 @@ impl DaemonSecrets {
                     principal::HANDOFF_ENV
                 );
             }
-            return Self::env_only();
+            return Self::t0(data_dir);
         }
         let key = match taken {
-            Ok(None) => return Self::env_only(),
+            // A principal child always gets a key from its broker. Without
+            // one it must not quietly serve the operator defaults as if they
+            // were the principal's (fail closed).
+            Ok(None) => {
+                tracing::error!(
+                    "principal child started without {}; secret store disabled",
+                    principal::HANDOFF_ENV
+                );
+                return Self::broken(format!(
+                    "this principal child was started without a secrets key from its broker \
+                     ({}); restart it through the T1 broker",
+                    principal::HANDOFF_ENV
+                ));
+            }
             Ok(Some(key)) => key,
             Err(e) => {
                 tracing::error!("principal secret store disabled: {e}");
@@ -895,9 +950,16 @@ mod tests {
         assert!(!s.has_principal());
         let s = DaemonSecrets::from_handoff(Err("bad".into()), ExecutorTier::T0, Some(&data));
         assert!(!s.has_principal());
-        // T1 without a hand-off: env only.
+        // T1 (a principal child) without a hand-off: fails closed, never the
+        // operator defaults alone.
+        let s = DaemonSecrets::from_handoff(Ok(None), ExecutorTier::T1, Some(&data));
+        assert!(s
+            .get(&Scope::Workspace, "K")
+            .unwrap_err()
+            .contains("without a secrets key"));
+        assert!(!s.status().available);
         assert!(
-            !DaemonSecrets::from_handoff(Ok(None), ExecutorTier::T1, Some(&data)).has_principal()
+            DaemonSecrets::from_handoff(Ok(None), ExecutorTier::T1, Some(&data)).has_principal()
         );
 
         // T1 with its own data dir: ready, and it stores.
@@ -920,5 +982,21 @@ mod tests {
         // A malformed hand-off on T1 fails closed too.
         let s = DaemonSecrets::from_handoff(Err("malformed".into()), ExecutorTier::T1, Some(&data));
         assert!(s.get(&Scope::Workspace, "K").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t0_fails_closed_over_a_data_dir_that_holds_a_principal_store() {
+        use crate::executor::ExecutorTier;
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!DaemonSecrets::from_boot(ExecutorTier::T0, Some(tmp.path())).has_principal());
+        std::fs::create_dir_all(tmp.path().join("secrets")).unwrap();
+        std::fs::write(tmp.path().join("secrets").join("dek.json"), "{}").unwrap();
+        let s = DaemonSecrets::from_boot(ExecutorTier::T0, Some(tmp.path()));
+        assert!(s
+            .get(&Scope::Workspace, "K")
+            .unwrap_err()
+            .contains("only a T1"));
+        assert!(!s.status().available);
     }
 }

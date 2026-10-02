@@ -89,7 +89,12 @@ pub const VALUES_FILENAME: &str = "secrets.json";
 
 const KEY_LEN: usize = 32;
 const FORMAT: u32 = 1;
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// The largest `secrets.json` [`PrincipalStore`] reads — and writes: a write
+/// that would grow past it is refused, so the store can never lock itself
+/// out.
+pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// The largest single value [`PrincipalStore`] accepts.
+pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 const HKDF_SALT: &[u8] = b"ikenga.principal-secrets.v1";
 const HKDF_INFO: &[u8] = b"ikenga/principal-secrets/dek-wrap-key";
 const DEK_AAD: &[u8] = b"ikenga/principal-secrets/dek";
@@ -160,12 +165,30 @@ impl BrokerKek {
     /// `version` other than [`KEY_VERSION`]. Two concurrent first launches
     /// agree on one key: the new file is published with `link(2)`, which
     /// never replaces an existing one.
-    pub fn load_or_create(operator_dir: &Path) -> io::Result<Self> {
+    ///
+    /// A **new** KEK is refused when any principal already has a wrapped
+    /// DEK (`<principals_dir>/*/data/secrets/dek.json`): those stores were
+    /// sealed under the missing KEK, and a fresh one would lock every
+    /// principal out for good. The operator restores the file instead.
+    pub fn load_or_create(operator_dir: &Path, principals_dir: &Path) -> io::Result<Self> {
         let path = operator_dir.join(KEK_FILENAME);
         match read_private(&path, 4096) {
             Ok(body) => return Self::parse(&path, &body),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        if let Some(sealed) = existing_principal_store(principals_dir)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "{} is missing, but principal secret stores sealed under it exist (e.g. \
+                     {}). Refusing to create a new KEK, which would lock every principal out \
+                     of their secrets: restore operator/{KEK_FILENAME} from backup (root:root, \
+                     0600) and retry",
+                    path.display(),
+                    sealed.display()
+                ),
+            ));
         }
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         OsRng.fill_bytes(&mut key[..]);
@@ -238,6 +261,26 @@ impl BrokerKek {
             key,
         }
     }
+}
+
+/// The first `<principals_dir>/<id>/data/secrets/dek.json` found, if any.
+fn existing_principal_store(principals_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(principals_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let dek = entry?
+            .path()
+            .join("data")
+            .join(SECRETS_DIR)
+            .join(DEK_FILENAME);
+        if fs::symlink_metadata(&dek).is_ok() {
+            return Ok(Some(dek));
+        }
+    }
+    Ok(None)
 }
 
 // ─── the hand-off ──────────────────────────────────────────────────────────
@@ -316,6 +359,14 @@ pub(crate) static HANDOFF_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// nothing the child spawns later (an engine, a pkg sidecar, a call site that
 /// forgets the PTY filter) can inherit it. Always removes it, also when it is
 /// malformed. `Ok(None)` when it is not set (T0, or a broker without one).
+///
+/// TODO(main.rs): this runs from `server::build_router`, i.e. after
+/// `server/src/main.rs` started the multi-thread Tokio runtime (no task of
+/// ours has been spawned yet, and `std::env` serializes Rust-side access, but
+/// a C-level `getenv` on a runtime thread could still race the removal).
+/// Moving the take before the runtime starts needs `server/src/main.rs` to
+/// capture the variable next to its `IKENGA_AUTH_TOKEN` stripping and pass it
+/// in, which is outside WP-21's files (WP-74a owns `main.rs` this wave).
 pub fn take_handoff() -> Result<Option<PrincipalKey>, String> {
     let value = std::env::var_os(HANDOFF_ENV);
     if value.is_none() {
@@ -477,6 +528,15 @@ impl PrincipalStore {
         let path = self.values_path();
         let body = serde_json::to_vec(file)
             .map_err(|e| StoreError::uncommitted(format!("serialize: {e}")))?;
+        if body.len() as u64 > MAX_FILE_BYTES {
+            // Refused before anything is written: `load` would never read a
+            // larger file back, so writing it would lock the store.
+            return Err(StoreError::invalid(format!(
+                "the principal secret store is full: this write would grow {} past \
+                 {MAX_FILE_BYTES} bytes; delete secrets you no longer need",
+                VALUES_FILENAME
+            )));
+        }
         write_private_atomic(&path, &body)
             .map_err(|e| StoreError::uncommitted(format!("write {}: {e}", path.display())))
     }
@@ -496,6 +556,17 @@ impl PrincipalStore {
         String::from_utf8(plain.to_vec())
             .map_err(|_| StoreError::unknown(format!("secret {name:?} is not UTF-8")))
     }
+}
+
+fn check_value(name: &str, value: &str) -> Result<(), StoreError> {
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(StoreError::invalid(format!(
+            "secret {name:?} is {} bytes; the principal store holds values up to \
+             {MAX_VALUE_BYTES} bytes",
+            value.len()
+        )));
+    }
+    Ok(())
 }
 
 fn check_name(name: &str) -> Result<(), StoreError> {
@@ -518,6 +589,7 @@ impl SecretsStore for PrincipalStore {
 
     fn set(&self, name: &str, value: &str) -> Result<(), StoreError> {
         check_name(name)?;
+        check_value(name, value)?;
         let _g = self.guard();
         let mut file = self.load()?;
         file.entries
@@ -553,6 +625,7 @@ impl SecretsStore for PrincipalStore {
         };
         for (name, value) in values {
             check_name(name)?;
+            check_value(name, value)?;
             file.entries.insert(name.clone(), self.seal(name, value)?);
         }
         self.save(&file)?;
@@ -1009,10 +1082,10 @@ mod tests {
     fn kek_is_created_once_private_and_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let op = tmp.path();
-        let a = BrokerKek::load_or_create(op).unwrap();
+        let a = BrokerKek::load_or_create(op, &op.join("principals")).unwrap();
         let path = op.join(KEK_FILENAME);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
-        let b = BrokerKek::load_or_create(op).unwrap();
+        let b = BrokerKek::load_or_create(op, &op.join("principals")).unwrap();
         assert_eq!(a.0[..], b.0[..], "a second boot reuses the KEK");
         let id = PrincipalId::new_v7();
         assert_eq!(a.derive(id).key[..], b.derive(id).key[..]);
@@ -1022,7 +1095,9 @@ mod tests {
         // Group/other-readable: refused.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            BrokerKek::load_or_create(op).unwrap_err().kind(),
+            BrokerKek::load_or_create(op, &op.join("principals"))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1032,7 +1107,9 @@ mod tests {
         fs::rename(&path, &real).unwrap();
         std::os::unix::fs::symlink(&real, &path).unwrap();
         assert_eq!(
-            BrokerKek::load_or_create(op).unwrap_err().kind(),
+            BrokerKek::load_or_create(op, &op.join("principals"))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::PermissionDenied
         );
     }
@@ -1043,10 +1120,11 @@ mod tests {
             return; // needs root to chown
         }
         let tmp = tempfile::tempdir().unwrap();
-        BrokerKek::load_or_create(tmp.path()).unwrap();
+        BrokerKek::load_or_create(tmp.path(), &tmp.path().join("principals")).unwrap();
         let path = tmp.path().join(KEK_FILENAME);
         std::os::unix::fs::chown(&path, Some(65_000), None).unwrap();
-        let err = BrokerKek::load_or_create(tmp.path()).unwrap_err();
+        let err =
+            BrokerKek::load_or_create(tmp.path(), &tmp.path().join("principals")).unwrap_err();
         assert!(err.to_string().contains("owned by uid 65000"), "{err}");
     }
 
@@ -1057,12 +1135,94 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let dir = dir.clone();
-                std::thread::spawn(move || BrokerKek::load_or_create(&dir).unwrap())
+                std::thread::spawn(move || {
+                    BrokerKek::load_or_create(&dir, &dir.join("principals")).unwrap()
+                })
             })
             .collect();
         let keys: Vec<BrokerKek> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         for k in &keys[1..] {
             assert_eq!(k.0[..], keys[0].0[..]);
         }
+    }
+
+    #[test]
+    fn an_oversize_value_is_refused_and_the_store_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, key) = key_for(&BrokerKek::from_bytes([12; 32]));
+        let store = PrincipalStore::open(tmp.path(), &key).unwrap();
+        store.set("workspace::A", "alpha").unwrap();
+        let err = store
+            .set("workspace::BIG", &"x".repeat(MAX_VALUE_BYTES + 1))
+            .unwrap_err();
+        assert!(err.is_invalid() && !err.is_committed(), "{err}");
+        assert!(err.to_string().contains("up to"), "{err}");
+        store
+            .set("workspace::EDGE", &"y".repeat(MAX_VALUE_BYTES))
+            .unwrap();
+        assert_eq!(store.get("workspace::A").unwrap().as_deref(), Some("alpha"));
+        let mut too_big = BTreeMap::new();
+        too_big.insert("workspace::B".to_string(), "z".repeat(MAX_VALUE_BYTES + 1));
+        assert!(store.replace_all(&too_big).is_err());
+        assert_eq!(store.get("workspace::A").unwrap().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn a_write_that_would_outgrow_the_file_cap_is_refused_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, key) = key_for(&BrokerKek::from_bytes([13; 32]));
+        let store = PrincipalStore::open(tmp.path(), &key).unwrap();
+        let value = "v".repeat(MAX_VALUE_BYTES);
+        let mut refused = None;
+        // Each sealed 64 KiB value is ~87 KiB of base64; 4 MiB fits < 50.
+        for i in 0..100 {
+            if let Err(e) = store.set(&format!("workspace::K{i}"), &value) {
+                refused = Some((i, e));
+                break;
+            }
+        }
+        let (i, err) = refused.expect("the file cap was never hit");
+        assert!(err.to_string().contains("is full"), "{err}");
+        assert!(!err.is_committed());
+        let path = tmp.path().join("secrets").join(VALUES_FILENAME);
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_FILE_BYTES);
+        // The store still loads, after a reopen too, and holds every value
+        // written before the refusal.
+        drop(store);
+        let store = PrincipalStore::open(tmp.path(), &key).unwrap();
+        assert_eq!(store.list_meta().unwrap().len(), i);
+        assert_eq!(
+            store.get("workspace::K0").unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        store.delete("workspace::K0").unwrap();
+        store.set("workspace::small", "ok").unwrap();
+    }
+
+    #[test]
+    fn a_missing_kek_is_not_recreated_over_existing_principal_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let op = tmp.path().join("operator");
+        let principals = tmp.path().join("principals");
+        fs::create_dir_all(&op).unwrap();
+        let kek = BrokerKek::load_or_create(&op, &principals).unwrap();
+        let id = PrincipalId::new_v7();
+        let data = principals.join(id.to_string()).join("data");
+        fs::create_dir_all(&data).unwrap();
+        PrincipalStore::open(&data, &kek.derive(id)).unwrap();
+
+        // The KEK is lost: no new one may be minted over the sealed store.
+        fs::remove_file(op.join(KEK_FILENAME)).unwrap();
+        let err = BrokerKek::load_or_create(&op, &principals).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("restore operator/secrets-kek.json"),
+            "{err}"
+        );
+        assert!(!op.join(KEK_FILENAME).exists());
+
+        // A principal dir without a store doesn't block a first KEK.
+        fs::remove_dir_all(data.join("secrets")).unwrap();
+        BrokerKek::load_or_create(&op, &principals).unwrap();
     }
 }

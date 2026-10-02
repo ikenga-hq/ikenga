@@ -644,8 +644,14 @@ pub(super) fn secrets_lock_refusal(cmd: &str) -> RpcResponse {
     RpcResponse::error(format!("{cmd}: {}", secrets_env::LOCK_REFUSAL))
 }
 
-const NO_APP_LOCK: &str =
-    "no app lock: the daemon was started without --data-dir, so there is no app-lock.json";
+/// T0 (and a child without `--data-dir`, which its boot refuses anyway):
+/// the app lock is the desktop's (`commands/app_lock.rs`), one PIN on the
+/// machine; a T0 daemon serving its own would be a second, unrelated PIN.
+/// Only a T1 principal child has a lock of its own.
+const NO_APP_LOCK: &str = concat!(
+    "not available on this daemon: the app lock is per principal and served only by a T1 ",
+    "principal child. On a T0 install the app lock belongs to the desktop app."
+);
 
 fn app_lock(state: &AppState) -> Result<&secrets_env::app_lock::AppLockCore, String> {
     state
@@ -2488,7 +2494,7 @@ mod tests {
         let id = PrincipalId::new_v7();
         let data = tmp.path().join(id.to_string()).join("data");
         std::fs::create_dir_all(&data).unwrap();
-        let kek = BrokerKek::load_or_create(tmp.path()).unwrap();
+        let kek = BrokerKek::load_or_create(tmp.path(), &tmp.path().join("principals")).unwrap();
         let router = {
             let _env = HANDOFF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var(HANDOFF_ENV, kek.derive(id).to_env_value().as_str());
@@ -2569,10 +2575,50 @@ mod tests {
         assert!(e.contains("DEC-R18-1"), "{e}");
     }
 
+    /// T0 (finding: a second PIN beside the desktop's): refused, with or
+    /// without a data dir, and nothing is written.
     #[tokio::test]
-    async fn app_lock_is_served_per_data_dir() {
+    async fn t0_does_not_serve_its_own_app_lock() {
         let d = daemon();
-        let r = &d.router;
+        for cmd in ["app_lock_status", "app_lock_lock", "app_lock_touch"] {
+            let e = err(&d.router, cmd, json!({})).await;
+            assert!(e.contains("only by a T1"), "{cmd}: {e}");
+        }
+        let e = err(&d.router, "app_lock_set_secret", json!({"next": "2468"})).await;
+        assert!(e.contains("only by a T1"), "{e}");
+        assert!(!d.data.join("app-lock.json").exists());
+        assert!(err(&bare(None), "app_lock_status", json!({}))
+            .await
+            .contains("T1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_lock_is_served_per_principal_child() {
+        use crate::secrets_env::principal::HANDOFF_TEST_LOCK;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let router = {
+            // No hand-off: the secrets layer fails closed, the lock is
+            // independent of it.
+            let _env = HANDOFF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cfg = config(Some(data.clone()), None);
+            cfg.executor_tier = ExecutorTier::T1;
+            router_with_home(
+                cfg,
+                Arc::new(PtyManager::new()),
+                Arc::new(EngineRegistry::new()),
+                None,
+                None,
+                None,
+            )
+        };
+        struct D {
+            data: PathBuf,
+        }
+        let d = D { data };
+        let r = &router;
         let status = ok(r, "app_lock_status", json!({})).await;
         assert_eq!(status["locked"], false);
         assert_eq!(status["secretSet"], false);
@@ -2614,9 +2660,5 @@ mod tests {
         assert_eq!(status["idleMinutes"], 5);
         let status = ok(r, "app_lock_clear_secret", json!({"current": "2468"})).await;
         assert_eq!(status["secretSet"], false);
-
-        // Without a data dir there is no app-lock.json to root it at.
-        let e = err(&bare(None), "app_lock_status", json!({})).await;
-        assert!(e.contains("--data-dir"), "{e}");
     }
 }
