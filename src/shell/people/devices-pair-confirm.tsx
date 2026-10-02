@@ -17,7 +17,7 @@
 // → pair-confirm`), so no modal dialog sits over it.
 
 import { CheckCircle2, XCircle } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { create } from 'zustand';
 
@@ -35,6 +35,7 @@ import {
 } from '@/lib/access/client';
 
 import { DEFAULT_PAIR_TIER, PAIR_TIERS, relativeTime } from './devices-model';
+import { D05_DANGER, D05_FOCUS } from './focus';
 
 const POLL_MS = 2000;
 
@@ -152,13 +153,52 @@ export function PairConfirm({
 	const unwatch = usePairWatch((s) => s.unwatch);
 	const setNotice = usePairWatch((s) => s.setNotice);
 	const panel = useRef<HTMLDivElement>(null);
+	const ids = { code: useId(), words: useId() };
 
 	// Take focus on mount (a security decision; nothing behind it should
 	// keep the keyboard). The panel, not a button, so a stray Enter decides
-	// nothing.
+	// nothing. The pair sheet is still closing when this mounts, and while it
+	// is open its focus scope pulls focus back into itself; so keep claiming
+	// for a few frames until focus holds here (WP-74b review R1).
 	useEffect(() => {
-		panel.current?.focus();
+		let raf = 0;
+		let held = 0;
+		const deadline = performance.now() + 1500;
+		const claim = () => {
+			const el = panel.current;
+			if (!el) return;
+			if (el.contains(document.activeElement)) held++;
+			else {
+				held = 0;
+				el.focus();
+			}
+			if (held < 3 && performance.now() < deadline) raf = requestAnimationFrame(claim);
+		};
+		claim();
+		return () => cancelAnimationFrame(raf);
 	}, []);
+
+	// Modal: Tab and Shift+Tab cycle inside the confirm, never into the frame.
+	const trapTab = (e: KeyboardEvent<HTMLDivElement>) => {
+		if (e.key !== 'Tab' || !panel.current) return;
+		// Tabbable only: the tier tabs rove, so only the chosen one counts.
+		const items = Array.from(
+			panel.current.querySelectorAll<HTMLElement>(
+				'button:not(:disabled), [href], input, [tabindex]'
+			)
+		).filter((el) => el.tabIndex >= 0);
+		if (items.length === 0) return;
+		const first = items[0];
+		const last = items[items.length - 1];
+		const active = document.activeElement;
+		if (e.shiftKey && (active === first || active === panel.current)) {
+			e.preventDefault();
+			last.focus();
+		} else if (!e.shiftKey && active === last) {
+			e.preventDefault();
+			first.focus();
+		}
+	};
 
 	useEffect(() => {
 		if (nowProp !== undefined) return;
@@ -199,26 +239,31 @@ export function PairConfirm({
 	};
 
 	const row = 'grid grid-cols-[140px_1fr_auto] items-baseline gap-3 py-1.5';
-	const k = 'text-[var(--text-caption,12px)] text-[var(--fg-muted)]';
-	const v = 'min-w-0 text-[var(--text-body-sm)] text-[var(--fg)]';
+	const k = 'text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]';
+	const v = 'min-w-0 text-[length:var(--text-body-sm)] text-[var(--fg)]';
 
 	return (
 		<div
 			data-state="pair-confirm"
-			role="dialog"
-			aria-modal="true"
-			aria-labelledby="pair-confirm-title"
-			className="pointer-events-auto fixed inset-0 z-[60] grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_82%,transparent)] p-6 backdrop-blur-xs"
+			className={`${D05_FOCUS} pointer-events-auto fixed inset-0 z-[60] grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_82%,transparent)] p-6 backdrop-blur-xs`}
 		>
 			<div
 				ref={panel}
 				tabIndex={-1}
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="pair-confirm-title"
+				// The code and the four words are what the person checks: read
+				// them out with the dialog (D-8).
+				aria-describedby={`${ids.code} ${ids.words}`}
+				data-pair-panel
+				onKeyDown={trapTab}
 				className="w-full max-w-[560px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl outline-none"
 			>
 				<div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-4 py-3">
 					<h2
 						id="pair-confirm-title"
-						className="m-0 text-[var(--text-h4)] font-semibold"
+						className="m-0 text-[length:var(--text-h4)] font-semibold"
 						style={{ fontFamily: 'var(--font-display)' }}
 					>
 						A device wants to pair
@@ -238,19 +283,19 @@ export function PairConfirm({
 						<span className={k}>Asked</span>
 						<span className={v}>{relativeTime(request.askedAt, now)}</span>
 					</div>
-					<div className={row}>
+					<div className={row} id={ids.code}>
 						<span className={k}>Code it typed</span>
 						<span className={`${v} font-mono tracking-[0.15em]`}>{request.code}</span>
-						<span className="font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+						<span className="font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 							check this matches the phone
 						</span>
 					</div>
-					<div className={row} data-row="fingerprint">
+					<div className={row} data-row="fingerprint" id={ids.words}>
 						<span className={k}>Words on the phone</span>
 						<span className={`${v} font-mono`}>{request.fingerprint.join(' · ')}</span>
 					</div>
 
-					<h3 className="m-0 mt-3 text-[var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
+					<h3 className="m-0 mt-3 text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
 						What it may do
 					</h3>
 					<div className="mt-2">
@@ -261,11 +306,11 @@ export function PairConfirm({
 							items={PAIR_TIERS.map((t) => ({ id: t, label: TIER_LABELS[t].label }))}
 						/>
 					</div>
-					<p className="m-0 mt-2 text-[var(--text-caption,12px)] text-[var(--fg-muted)]">
+					<p className="m-0 mt-2 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
 						{TIER_LABELS[tier].long}
 					</p>
 
-					<div className="mt-3 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
+					<div className="mt-3 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[length:var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
 						If you did not just type this code into a phone,{' '}
 						<b className="text-[var(--fg)]">deny</b>. A denied request leaves the device with
 						nothing and burns the code.
@@ -281,7 +326,7 @@ export function PairConfirm({
 						type="button"
 						disabled={busy}
 						onClick={() => void decide('deny')}
-						className="rounded-md border border-[var(--border)] px-3 py-1.5 text-[var(--text-body-sm)] text-[var(--danger)] hover:bg-[var(--bg-sunken)] disabled:opacity-50"
+						className={`${D05_DANGER} rounded-md border px-3 py-1.5 text-[length:var(--text-body-sm)] disabled:opacity-50`}
 					>
 						Deny
 					</button>
@@ -289,7 +334,7 @@ export function PairConfirm({
 						type="button"
 						disabled={busy}
 						onClick={() => void decide('allow')}
-						className="rounded-md bg-[var(--primary)] px-3 py-1.5 text-[var(--text-body-sm)] font-semibold text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
+						className="rounded-md bg-[var(--primary)] px-3 py-1.5 text-[length:var(--text-body-sm)] font-semibold text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
 					>
 						Pair device
 					</button>
