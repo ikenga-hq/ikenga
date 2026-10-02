@@ -574,9 +574,7 @@ for (const mode of ['dark', 'light'] as const) {
 			await expect(members).toBeVisible();
 			await expect(members.getByRole('heading', { name: 'Just you.' })).toBeVisible();
 			await expect(members.getByRole('button', { name: 'Share kola' })).toBeDisabled();
-			await expect(
-				members.getByText('Sharing needs an Ikenga server with accounts (T1)')
-			).toBeVisible();
+			await expect(members.getByText('Sharing needs a multi-user server')).toBeVisible();
 			await expect(members.locator('[data-filebar="access-store"]')).toContainText(
 				'<data-dir>/access.db'
 			);

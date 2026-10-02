@@ -123,7 +123,7 @@ export const ROLE_CHOICES: ReadonlyArray<{ id: MemberRole; label: string; sub: s
 	{ id: 'guest', label: 'Guest', sub: 'One artifact, for a while' },
 ];
 
-export const SOLO_DISABLED_REASON = 'Sharing needs an Ikenga server with accounts (T1)';
+export const SOLO_DISABLED_REASON = 'Sharing needs a multi-user server';
 export const OWNER_FIXED_REASON = 'A project keeps one Owner. Transfer it from the ⋯ menu.';
 export const TRANSFER_DISABLED_REASON =
 	"Transfer needs moving the project to the new owner's workspace — coming later";
