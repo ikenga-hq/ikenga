@@ -607,6 +607,13 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0069_pkg_scope_default_personal",
         include_str!("../migrations/0069_pkg_scope_default_personal.sql"),
     ),
+    // G-ACCESS §8.4 (WP-74a): attribution columns on `shell_notifications`
+    // and `artifact_comments`, filled by WP-75 / WP-76 (§5.7).
+    (
+        70,
+        "0070_access_attribution",
+        include_str!("../migrations/0070_access_attribution.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -2266,5 +2273,46 @@ mod tests {
             pkg_scopes(&pool).await,
             vec![("com.test.personal".to_string(), None)]
         );
+    }
+    /// G-ACCESS §8.4 (WP-74a): 0070 adds the attribution columns on a fresh
+    /// db, with `sensitive` defaulting to 0, and the project index.
+    #[tokio::test]
+    async fn migration_0070_adds_access_attribution_columns() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+        let cols = |table: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(&format!(
+                    "SELECT name FROM pragma_table_info('{table}')"
+                ))
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let notif = cols("shell_notifications").await;
+        for c in [
+            "requested_by",
+            "project_id",
+            "sensitive",
+            "decided_by",
+            "decided_via",
+            "decided_device",
+        ] {
+            assert!(notif.iter().any(|n| n == c), "shell_notifications.{c}");
+        }
+        assert!(cols("artifact_comments")
+            .await
+            .iter()
+            .any(|n| n == "author_principal_id"));
+        let idx: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_shell_notifications_project'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx, 1);
     }
 }

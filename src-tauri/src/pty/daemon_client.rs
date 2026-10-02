@@ -71,6 +71,17 @@ impl DaemonState {
         *self.info.write().unwrap() = info;
     }
 
+    /// G-ACCESS §2.5 (review M-3): re-run [`init_daemon`] (find or spawn)
+    /// after the daemon was found unreachable — it idles out after 60 s with
+    /// nothing open — and adopt the result. Blocking; the `access_*` proxy
+    /// (`commands::access`) calls it once, off the async runtime, before
+    /// answering `store_unavailable`.
+    pub fn reconnect(&self, app_data_dir: Option<PathBuf>) -> DaemonInfo {
+        let fresh = init_daemon(app_data_dir);
+        self.set_info(fresh.clone());
+        fresh
+    }
+
     /// Send POST /api/shutdown to daemon.
     pub fn shutdown(&self) -> bool {
         let info = self.get_info();
@@ -315,6 +326,10 @@ fn build_daemon_command(
         .arg("60")
         .env("IKENGA_AUTH_TOKEN", token);
 
+    // G-ACCESS §3.3 rule 1: the pairing-link base, when the desktop's own
+    // environment names one. (It is not a secret, so argv is fine.)
+    pass_public_url(&mut cmd, public_url_from_env());
+
     if let Some(dir) = daemon_dir {
         cmd.arg("--data-dir").arg(dir);
     }
@@ -340,6 +355,18 @@ fn build_daemon_command(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd
+}
+
+/// `IKENGA_PUBLIC_URL` from the desktop's environment, if set and non-blank.
+fn public_url_from_env() -> Option<String> {
+    std::env::var("IKENGA_PUBLIC_URL").ok()
+}
+
+/// Append `--public-url <url>` for a non-blank `url`.
+fn pass_public_url(cmd: &mut std::process::Command, url: Option<String>) {
+    if let Some(url) = url.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        cmd.arg("--public-url").arg(url);
+    }
 }
 
 /// Discovers an already running daemon or launches one in a detached process
@@ -515,6 +542,27 @@ mod tests {
         // The rest of the invocation is unchanged.
         assert!(args.windows(2).any(|w| w[0] == "--port" && w[1] == "4000"));
         assert!(args.iter().any(|a| a == "--data-dir"));
+    }
+
+    /// G-ACCESS §3.3: `--public-url` is passed through only when the desktop's
+    /// environment names a non-blank `IKENGA_PUBLIC_URL`.
+    #[test]
+    fn public_url_passes_through_when_set() {
+        let flag = |url: Option<&str>| {
+            let mut cmd = std::process::Command::new("/x/ikenga-server");
+            pass_public_url(&mut cmd, url.map(str::to_string));
+            let args: Vec<String> =
+                cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            args.windows(2)
+                .find(|w| w[0] == "--public-url")
+                .map(|w| w[1].clone())
+        };
+        assert_eq!(flag(None), None);
+        assert_eq!(flag(Some("  ")), None);
+        assert_eq!(
+            flag(Some(" https://ik.example.ts.net ")).as_deref(),
+            Some("https://ik.example.ts.net")
+        );
     }
 
     /// A one-shot stand-in for `ikenga-server`: `/api/health` reports

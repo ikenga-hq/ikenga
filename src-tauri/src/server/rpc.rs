@@ -1,6 +1,6 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -128,9 +128,23 @@ impl RpcResponse {
 
 pub async fn rpc_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<crate::access::DaemonAccess>>>,
+    ctx: Option<Extension<crate::access::AccessCtx>>,
     Json(payload): Json<RpcRequest>,
 ) -> impl IntoResponse {
     debug!("RPC request: cmd={}", payload.cmd);
+
+    // G-ACCESS §9.2 pre-hook: class + caps for this command (§1.6), and in
+    // share mode a narrowed `AppState` (WP-76). One call, before any arm.
+    let access = access.map(|Extension(a)| a);
+    let ctx = ctx.map(|Extension(c)| c);
+    let state = match crate::access::rpc_prehook(&state, ctx.as_ref(), &payload.cmd, &payload.args)
+        .await
+    {
+        crate::access::PreHook::Proceed => state,
+        crate::access::PreHook::Narrowed(narrowed) => narrowed,
+        crate::access::PreHook::Answered(res) => return Json(res),
+    };
 
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
@@ -814,6 +828,49 @@ pub async fn rpc_handler(
         "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
 
+        // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
+        //
+        // Every access arm, the permission decide core, the T0 ask relay and
+        // the two broker → child `internal` arms. Bodies in `crate::access::
+        // rpc`; the arms later waves own answer `internal: not implemented
+        // (WP-NN)` (the relay: `invalid_request`) until filled. Class and
+        // caps were already checked by the pre-hook above. A principal child
+        // answers `access_*` with `served_by_broker`.
+        cmd @ ("access_status"
+        | "access_devices_list"
+        | "access_device_set_tier"
+        | "access_device_revoke"
+        | "access_pair_begin"
+        | "access_pair_cancel"
+        | "access_pair_pending"
+        | "access_pair_decide"
+        | "access_routing_get"
+        | "access_routing_set"
+        | "access_members_list"
+        | "access_member_set_role"
+        | "access_member_remove"
+        | "access_member_restore"
+        | "access_policy_get"
+        | "access_policy_set_cell"
+        | "access_policy_set_owner_approval"
+        | "access_invite_issue"
+        | "access_invite_revoke"
+        | "access_shares_list"
+        | "access_audit_list"
+        | "access_audit_verify"
+        | "access_audit_export"
+        | "access_audit_record_local"
+        | "access_audit_reseal"
+        | "permission_decide"
+        | "permission_relay_put"
+        | "permission_relay_take"
+        | "permission_relay_resolve"
+        | "notifications_record_access"
+        | "share_project_info") => {
+            crate::access::rpc::serve_daemon(access.as_deref(), ctx.as_ref(), cmd, &payload.args)
+                .await
+        }
+
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");
@@ -823,7 +880,9 @@ pub async fn rpc_handler(
         }
     };
 
-    Json(res)
+    // G-ACCESS §9.2 post-hook: share filtering (WP-76) and the permission
+    // rows' `can_decide` / `waiting_on` (WP-75).
+    Json(crate::access::postfilter(ctx.as_ref(), &payload.cmd, res))
 }
 
 #[cfg(test)]

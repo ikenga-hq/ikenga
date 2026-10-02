@@ -399,8 +399,38 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         #[cfg(debug_assertions)]
         bg_spike::bg_spike_reply,
         // ── devices (WP-74) ─────────────────────────────────────────────────
+        // G-ACCESS §9.1, all registered skeleton-first by WP-74a (§9.2): each
+        // is a thin proxy to the local daemon (`commands/access.rs`, P-20)
+        // except `permission_decide`, served in-process (§5.5). Later waves
+        // fill only the daemon-side modules; none edits this list.
+        access::access_status,
+        access::access_devices_list,
+        access::access_device_set_tier,
+        access::access_device_revoke,
+        access::access_pair_begin,
+        access::access_pair_cancel,
+        access::access_pair_pending,
+        access::access_pair_decide,
         // ── access / members (WP-76) ────────────────────────────────────────
+        access::access_members_list,
+        access::access_member_set_role,
+        access::access_member_remove,
+        access::access_member_restore,
+        access::access_policy_get,
+        access::access_policy_set_cell,
+        access::access_policy_set_owner_approval,
+        access::access_invite_issue,
+        access::access_invite_revoke,
+        access::access_shares_list,
         // ── permission routing (WP-75) ──────────────────────────────────────
+        access::access_routing_get,
+        access::access_routing_set,
+        access::permission_decide,
         // ── audit (WP-77) ───────────────────────────────────────────────────
+        access::access_audit_list,
+        access::access_audit_verify,
+        access::access_audit_export,
+        access::access_audit_record_local,
+        access::access_audit_reseal,
     ]
 }

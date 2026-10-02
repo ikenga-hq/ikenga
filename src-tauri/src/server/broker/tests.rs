@@ -1184,3 +1184,33 @@ async fn the_frame_hook_sees_binary_frames_too() {
         "the binary frame was dropped by the hook, not forwarded"
     );
 }
+
+/// G-ACCESS §4.5.3 / A-29: with a caps hook installed, the child sees the
+/// broker's `X-Ikenga-Caps` — never the client's.
+#[tokio::test]
+async fn the_child_sees_the_brokers_caps_header_not_the_clients() {
+    struct Fixed;
+    impl super::proxy::CapsHeader for Fixed {
+        fn caps_header(&self, _ctx: &crate::server::auth::PrincipalCtx) -> Option<String> {
+            Some("files,sessions".into())
+        }
+    }
+    let h = harness_with(false, |hooks| hooks.caps = Arc::new(Fixed)).await;
+    let ada = insert_account(&h.pool, "ada", 20_001, false).await;
+    let cookie = login_cookie(&h.app, "ada").await;
+    let (status, _, _) = send(
+        &h.app,
+        request("POST", "/api/rpc")
+            .header("cookie", &cookie)
+            .header("content-type", "application/json")
+            .header("x-ikenga-caps", "files,sessions,dispatch,approve,install,settings,secrets")
+            .body(Body::from(json!({"cmd":"pty_list","args":{}}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reqs = h.launcher.seen_for(ada).requests.lock().unwrap().clone();
+    let (_, headers, _) = &reqs[0];
+    let caps: Vec<_> = headers.get_all("x-ikenga-caps").iter().collect();
+    assert_eq!(caps, ["files,sessions"]);
+}

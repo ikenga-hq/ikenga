@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-use super::accounts::{self, Actor, NoDeviceGrants};
+use super::accounts::{self, Actor};
 use super::adopt_t0;
 use super::provision::{Adopt, Provisioner, ProvisioningMode, ReapOutcome, UidRange, UidReaper};
 use super::reaper::{HelperCommand, T1Reaper};
@@ -247,8 +247,14 @@ pub(crate) async fn run_with(
             )?;
         }
         AccountsCommand::RevokeSessions { username } => {
+            // G-ACCESS R-11: a forced logout also revokes every device
+            // grant of the principal, in the same transaction (§3.10).
             let a = prov
-                .revoke_sessions(pool, &username, &NoDeviceGrants)
+                .revoke_sessions(
+                    pool,
+                    &username,
+                    &crate::access::t1::RevokeDeviceGrants { via_cli: true },
+                )
                 .await?;
             writeln!(
                 out,

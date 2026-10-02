@@ -15,13 +15,17 @@ use agent_client_protocol::schema::SessionUpdate;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
+use super::pty_ws::{close_message, closed, SocketAccess};
 use super::AppState;
+use crate::access::ws::{Frame, Route};
+use crate::access::{AccessCtx, DaemonAccess};
 use crate::engines::EngineHandle;
 
 /// Engine used when the client doesn't name one.
@@ -44,10 +48,15 @@ pub enum ChatClientMessage {
 pub async fn chat_ws_handler(
     State(state): State<Arc<AppState>>,
     Path(thread_id): Path<String>,
+    access: Option<Extension<Arc<DaemonAccess>>>,
+    ctx: Option<Extension<AccessCtx>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // G-ACCESS §1.6: attaching needs `sessions` (checked at the handshake);
+    // `Prompt` and `Cancel` need `dispatch`.
+    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c));
     ws.on_upgrade(move |socket| {
-        super::activity::track_ws(handle_chat_socket(socket, state, thread_id))
+        super::activity::track_ws(handle_chat_socket(socket, state, thread_id, guard))
     })
 }
 
@@ -221,9 +230,16 @@ async fn cancel_turn(state: &AppState, engine_name: &str, thread_id: &str) {
     }
 }
 
-async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: String) {
+async fn handle_chat_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    thread_id: String,
+    mut guard: SocketAccess,
+) {
     let (ws_tx, mut ws_rx) = socket.split();
     let ws_tx: WsSink = Arc::new(TokioMutex::new(ws_tx));
+    let closed_fut = closed(guard.take_closed());
+    tokio::pin!(closed_fut);
 
     info!("Chat WebSocket connected for thread: {thread_id}");
 
@@ -234,9 +250,27 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
     // adapter actually started the turn.
     let mut in_flight: Option<(tokio::task::JoinHandle<()>, String)> = None;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // G-ACCESS §3.10: revoked (4401) / caps changed (4403). The turn
+            // in flight is cancelled below, as on any disconnect.
+            close = &mut closed_fut => {
+                let _ = ws_tx.lock().await.send(close_message(&close)).await;
+                break;
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Text(text) => {
+                // G-ACCESS §1.6: `Prompt` / `Cancel` need `dispatch`; a
+                // refused frame is dropped and answered, the socket stays.
+                if let Err(refusal) = guard.check(Route::Chat, Frame::Text(&text)) {
+                    let _ = ws_tx.lock().await.send(Message::Text(refusal)).await;
+                    continue;
+                }
                 let Ok(client_msg) = serde_json::from_str::<ChatClientMessage>(&text) else {
                     continue;
                 };
@@ -247,6 +281,30 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                         cwd,
                         model,
                     } => {
+                        // G-ACCESS §4.5.4 share hooks (WP-76 fills them): a
+                        // share's `cwd` is forced under the share root, and a
+                        // share-originated run gets no vault env (§4.5.1).
+                        let cwd = match guard
+                            .ctx
+                            .as_ref()
+                            .map(|c| crate::access::share::chat_cwd(c, cwd.clone()))
+                        {
+                            None => cwd,
+                            Some(Ok(cwd)) => cwd,
+                            Some(Err(e)) => {
+                                send(&ws_tx, error_event(&thread_id, e.to_string())).await;
+                                continue;
+                            }
+                        };
+                        if guard
+                            .ctx
+                            .as_ref()
+                            .is_some_and(|c| !crate::access::share::run_env(c))
+                        {
+                            // The daemon's engines inject no Ikenga vault env
+                            // today; WP-76 strips it here once one does.
+                            tracing::debug!("share-originated run: no vault env");
+                        }
                         // Reap a finished turn so a completed one never looks
                         // in-flight.
                         if in_flight.as_ref().is_some_and(|(h, _)| h.is_finished()) {

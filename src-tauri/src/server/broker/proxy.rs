@@ -117,6 +117,10 @@ pub enum FrameDecision {
     Pass,
     /// Swallow this frame; keep the socket.
     Drop,
+    /// Swallow this frame and answer the client with this text control
+    /// frame (G-ACCESS §1.6's `{type:"error",code:"forbidden",…}` refusal);
+    /// keep the socket.
+    Reply(String),
     /// Close the socket with this code and reason.
     Close {
         code: u16,
@@ -155,6 +159,27 @@ impl WsFrameHook for PassFrames {
         FrameDecision::Pass
     }
 }
+
+/// G-ACCESS §4.5.3: the `X-Ikenga-Caps` value the broker sets on every
+/// request it proxies for `ctx` (the child narrows every check to it, §1.7).
+/// `None` sets no header (WP-20's default; WP-74a's `access::t1::CapsFor`
+/// always sets one).
+pub trait CapsHeader: Send + Sync {
+    fn caps_header(&self, ctx: &PrincipalCtx) -> Option<String>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCapsHeader;
+
+impl CapsHeader for NoCapsHeader {
+    fn caps_header(&self, _ctx: &PrincipalCtx) -> Option<String> {
+        None
+    }
+}
+
+/// The narrowing header (§4.5.3). Set only by the broker; a client's copy is
+/// stripped with every other `x-ikenga-*` header.
+pub const CAPS_HEADER: &str = "x-ikenga-caps";
 
 /// The header the broker adds for the child's logs.
 pub const PRINCIPAL_HEADER: &str = "x-ikenga-principal";
@@ -289,7 +314,12 @@ async fn forward(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    let headers = upstream_headers(headers);
+    let mut headers = upstream_headers(headers);
+    if let Some(caps) = state.hooks.caps.caps_header(ctx) {
+        if let Ok(v) = HeaderValue::from_str(&caps) {
+            headers.insert(HeaderName::from_static(CAPS_HEADER), v);
+        }
+    }
     let principal = ctx.principal.id.to_string();
     for attempt in 0..2 {
         let endpoint = match state.children.endpoint(&ctx.principal).await {
@@ -429,6 +459,7 @@ async fn connect_upstream(
     endpoint: &ChildEndpoint,
     ctx: &PrincipalCtx,
     path_and_query: &str,
+    caps: Option<&str>,
 ) -> Result<Upstream, tungstenite::Error> {
     let mut request = format!("ws://{}{path_and_query}", endpoint.addr).into_client_request()?;
     let h = request.headers_mut();
@@ -442,6 +473,12 @@ async fn connect_upstream(
         HeaderValue::from_str(&ctx.principal.id.to_string())
             .map_err(|e| tungstenite::Error::HttpFormat(e.into()))?,
     );
+    if let Some(caps) = caps {
+        h.insert(
+            HeaderName::from_static(CAPS_HEADER),
+            HeaderValue::from_str(caps).map_err(|e| tungstenite::Error::HttpFormat(e.into()))?,
+        );
+    }
     let (ws, _) = tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         tokio_tungstenite::connect_async(request),
@@ -495,13 +532,14 @@ pub async fn ws_proxy(
             );
         }
     }
+    let caps = state.hooks.caps.caps_header(&ctx);
     let mut upstream = None;
     for attempt in 0..2 {
         let endpoint = match state.children.endpoint(&ctx.principal).await {
             Ok(e) => e,
             Err(e) => return child_unavailable(&e),
         };
-        match connect_upstream(&endpoint, &ctx, &pq).await {
+        match connect_upstream(&endpoint, &ctx, &pq, caps.as_deref()).await {
             Ok(up) => {
                 upstream = Some(up);
                 break;
@@ -624,6 +662,12 @@ async fn pump(
                             }
                         }
                         FrameDecision::Drop => {}
+                        FrameDecision::Reply(text) => {
+                            if client_tx.send(Message::Text(text)).await.is_err() {
+                                let _ = up_tx.send(tungstenite::Message::Close(None)).await;
+                                break;
+                            }
+                        }
                         FrameDecision::Close { code, reason } => {
                             let _ = client_tx.send(close_frame(code, reason)).await;
                             let _ = up_tx.send(tungstenite::Message::Close(None)).await;
