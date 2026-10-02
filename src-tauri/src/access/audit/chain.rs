@@ -527,10 +527,18 @@ async fn newest_reseal_after(
 }
 
 /// Whether the chain already holds a committed (or, inside a transaction,
-/// this transaction's) `audit.chain_broken` row recording exactly `b`, and
-/// that row verifies against its predecessor. A rolled-back row is not
-/// seen, so the break stays to be recorded again.
-async fn is_recorded(conn: &mut SqliteConnection, b: &Broken) -> Result<bool, sqlx::Error> {
+/// this transaction's) `audit.chain_broken` row recording exactly `b` that
+/// is **in** the chain: it links to the stored hash of the row before it
+/// (genesis for row 1) and verifies against it (review m-11). A row that
+/// is only consistent with its own `prev_hash` — say one planted after a
+/// tail truncation with the detail this process would write — doesn't
+/// count, so the process records the break itself. A rolled-back row is
+/// not seen either, so the break stays to be recorded again.
+async fn is_recorded(
+    conn: &mut SqliteConnection,
+    store_id: &str,
+    b: &Broken,
+) -> Result<bool, sqlx::Error> {
     let detail = broken_detail(b);
     let rows = sqlx::query(&format!(
         "SELECT {COLUMNS} FROM audit_events WHERE kind = 'audit.chain_broken' AND detail = ? \
@@ -541,10 +549,16 @@ async fn is_recorded(conn: &mut SqliteConnection, b: &Broken) -> Result<bool, sq
     .await?;
     for r in &rows {
         let row = StoredRow::from_sql(r)?;
-        let Some(prev) = to32(&row.prev_hash) else {
-            continue;
+        let pred = if row.seq == 1 {
+            Some(genesis(store_id))
+        } else {
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT hash FROM audit_events WHERE seq = ?")
+                .bind(row.seq - 1)
+                .fetch_optional(&mut *conn)
+                .await?
+                .and_then(|h| to32(&h))
         };
-        if inspect_row(&row, &prev).is_none() {
+        if pred.is_some_and(|p| inspect_row(&row, &p).is_none()) {
             return Ok(true);
         }
     }
@@ -671,7 +685,7 @@ impl Chain {
         b: Broken,
         db: Option<Head>,
     ) -> Result<(), sqlx::Error> {
-        let recorded = is_recorded(conn, &b).await?;
+        let recorded = is_recorded(conn, &self.store_id, &b).await?;
         if !recorded {
             tracing::error!(
                 "audit chain broken at #{}: {} — access changes are paused (G-ACCESS §6.4)",
@@ -782,7 +796,7 @@ impl Chain {
         let mut head = db_head(&mut tx).await?;
         let mut wrote = None;
         for b in &pending {
-            if !is_recorded(&mut tx, b).await? {
+            if !is_recorded(&mut tx, &self.store_id, b).await? {
                 let h = insert_row(&mut tx, &self.store_id, head, &broken_event(b)).await?;
                 head = Some(h);
                 wrote = Some(h);
@@ -898,7 +912,7 @@ impl Chain {
             let pending = self.state().unrecorded.clone();
             let mut wrote = false;
             for pb in &pending {
-                if !is_recorded(conn, pb).await? {
+                if !is_recorded(conn, &self.store_id, pb).await? {
                     head = Some(insert_row(conn, &self.store_id, head, &broken_event(pb)).await?);
                     wrote = true;
                 }

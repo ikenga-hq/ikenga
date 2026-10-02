@@ -124,8 +124,9 @@ pub async fn verify(conn: &mut SqliteConnection, store_id: &str) -> Result<Verdi
     let mut head: Option<Head> = None;
     let mut found: Vec<Broken> = Vec::new();
     let mut recordings: Vec<Recording> = Vec::new();
-    // (seq, hash hex) of every verifying chain_broken row.
-    let mut verified_recordings: BTreeSet<(i64, String)> = BTreeSet::new();
+    // (seq, hash hex) of every verifying chain_broken row → whether it
+    // records a head break.
+    let mut verified_recordings: BTreeMap<(i64, String), bool> = BTreeMap::new();
     let mut acks: Vec<Ack> = Vec::new();
     for r in &rows {
         let row = StoredRow::from_sql(r)?;
@@ -162,7 +163,7 @@ pub async fn verify(conn: &mut SqliteConnection, store_id: &str) -> Result<Verdi
                     if let Some(b_at) =
                         seq_of("broken_at_seq").filter(|s| *s <= row.seq || head_class)
                     {
-                        verified_recordings.insert((row.seq, hash_hex(&at)));
+                        verified_recordings.insert((row.seq, hash_hex(&at)), head_class);
                         recordings.push(Recording {
                             at,
                             broken_at_seq: b_at,
@@ -177,14 +178,28 @@ pub async fn verify(conn: &mut SqliteConnection, store_id: &str) -> Result<Verdi
                         .and_then(|c| c.get("seq"))
                         .and_then(serde_json::Value::as_i64);
                     let cb_hash = cb.and_then(|c| str_of(c, "hash"));
+                    // The named recording, if it precedes this row and
+                    // verifies: `Some(records a head break)`.
                     let named = cb_seq
                         .zip(cb_hash)
-                        .is_some_and(|k| k.0 < row.seq && verified_recordings.contains(&k));
+                        .filter(|k| k.0 < row.seq)
+                        .and_then(|k| verified_recordings.get(&k).copied());
+                    let class = str_of(&d, "class");
+                    // A reseal follows the break it acknowledges — except a
+                    // head break's recording, which can land before the seq
+                    // it names (review m-10: the tail shrank again before
+                    // the row was flushed). Its `recorded` break is
+                    // evidenced by that row alone, so the reseal need only
+                    // follow the row (`named` checks it does); otherwise
+                    // the reseal could land at the very seq it names and
+                    // take a second one to clear.
+                    let head_recording =
+                        named == Some(true) && class.as_deref() == Some("recorded");
                     if let (Some(b_at), Some(class), Some(fp), true) = (
-                        seq_of("broken_at_seq").filter(|s| *s < row.seq),
-                        str_of(&d, "class"),
+                        seq_of("broken_at_seq").filter(|s| *s < row.seq || head_recording),
+                        class,
                         str_of(&d, "fingerprint"),
-                        named,
+                        named.is_some(),
                     ) {
                         acks.push(Ack {
                             broken_at_seq: b_at,

@@ -811,4 +811,134 @@ mod tests {
         assert_eq!(store.status(), ("degraded", Some(7)));
         assert_eq!(boot(&store).await.status(), ("degraded", Some(7)));
     }
+
+    /// The `head_missing` break a process holding `lost` records once rows
+    /// `#first..` are gone (as `known_head_break` words it).
+    fn head_missing(first: i64, lost: Head) -> Broken {
+        Broken::new(
+            first,
+            format!(
+                "rows #{first}..#{} this process wrote are missing (head regression)",
+                lost.seq
+            ),
+            "head_missing",
+            format!("#{}:{}", lost.seq, hex::encode(lost.hash)),
+        )
+    }
+
+    /// Review m-10: the shrink race, then a crash. A refused append queued
+    /// the break at #4 (rows #4..#6 gone); the tail shrank again before its
+    /// flush, so the recording landed at #3 — before the seq it names — and
+    /// the process exited before it could see the follow-on `head_changed`.
+    /// One reseal of #4 clears it, though that reseal lands at #4 itself.
+    #[tokio::test]
+    async fn a_head_break_recorded_before_its_seq_takes_one_reseal() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 5).await;
+        let lost = store.chain().known_head().unwrap();
+        assert_eq!(lost.seq, 6);
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        // The tail shrinks again; then the spawned flush writes the queued
+        // recording after the DB head (#2), and the process is gone.
+        sql(&store, "DELETE FROM audit_events WHERE seq = 3").await;
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            let db = db_head(&mut conn).await.unwrap();
+            assert_eq!(db.unwrap().seq, 2);
+            insert_row(
+                &mut conn,
+                &store.meta().store_id,
+                db,
+                &broken_event(&head_missing(4, lost)),
+            )
+            .await
+            .unwrap();
+        }
+        let restarted = boot(&store).await;
+        assert_eq!(restarted.status(), ("degraded", Some(4)));
+        let r = reseal(&restarted, 4, cli_ack()).await.unwrap();
+        assert_eq!(r.head.seq, 4, "the reseal lands at the seq the break names");
+        assert!(r.still_broken.is_none(), "{r:?}");
+        assert_eq!(restarted.status(), ("ok", None));
+        let v = walk(&store).await;
+        assert!(v.ok(), "{v:?}");
+        assert_eq!(v.resealed, [4]);
+        assert_eq!(boot(&store).await.status(), ("ok", None));
+        // B-1 still holds: the reseal acknowledges that recording, not the
+        // seq — delete it and the store is degraded again.
+        sql(&store, "DELETE FROM audit_events WHERE seq = 3").await;
+        assert!(!walk(&store).await.ok());
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(3)));
+    }
+
+    /// Review m-11: after a tail truncation an attacker plants a
+    /// self-consistent `audit.chain_broken` row carrying the exact detail
+    /// the process would write, but not linked to its predecessor. It must
+    /// not stand for the process's recording: the process records the
+    /// truncation itself, so resealing the planted row's link break leaves
+    /// "rows #5..#6 missing" outstanding.
+    #[tokio::test]
+    async fn a_planted_unlinked_recording_does_not_stand_for_the_process() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 5).await;
+        let lost = store.chain().known_head().unwrap();
+        assert_eq!(lost.seq, 6);
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        // With the planted row at #4 the process will find #5..#6 missing.
+        let predicted = head_missing(5, lost);
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            insert_row(
+                &mut conn,
+                &store.meta().store_id,
+                Some(Head {
+                    seq: 3,
+                    hash: [0; 32],
+                }),
+                &broken_event(&predicted),
+            )
+            .await
+            .unwrap();
+        }
+        reverify(&store).await;
+        let planted: String = sqlx::query_scalar("SELECT detail FROM audit_events WHERE seq = 4")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let same: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq FROM audit_events WHERE kind = 'audit.chain_broken' AND detail = ? \
+             ORDER BY seq",
+        )
+        .bind(&planted)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(same, [4, 5], "the process wrote its own recording");
+        let v = walk(&store).await;
+        let at: Vec<(i64, &str)> = v
+            .breaks
+            .iter()
+            .map(|(b, _)| (b.broken_at_seq, b.class.as_str()))
+            .collect();
+        assert_eq!(at, [(4, "link"), (5, "recorded")]);
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        // Resealing the planted row's link break doesn't clear the
+        // truncation.
+        let r = reseal(&store, 4, cli_ack()).await.unwrap();
+        let still = r.still_broken.expect("the truncation stays outstanding");
+        assert_eq!((still.broken_at_seq, still.class.as_str()), (5, "recorded"));
+        assert_eq!(store.status(), ("degraded", Some(5)));
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(5)));
+        let r = reseal(&store, 5, cli_ack()).await.unwrap();
+        assert!(r.still_broken.is_none(), "{r:?}");
+        assert!(walk(&store).await.ok());
+    }
 }
