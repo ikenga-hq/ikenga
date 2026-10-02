@@ -45,7 +45,7 @@ use super::ctx::AccessCtx;
 use super::devices::{self, DeviceView};
 use super::rpc::Env;
 use super::spake::{self, Keys};
-use super::store::AccessStore;
+use super::store::{AccessStore, StoreTier};
 use super::{AccessError, Code, KeepAlive};
 
 /// The code alphabet (P-5): Crockford base32 without `I L O U`.
@@ -1359,10 +1359,16 @@ async fn begin(
         "expiresAt": ticket.expires_at,
         "pairUrl": url,
         "qrPayload": qr,
-        // Whether the device cookie carries `Secure` (no `--insecure-cookie`):
-        // a browser drops it over plain HTTP off loopback, so the sheet warns
-        // when `pairUrl` is `http://` (review M1).
-        "cookieSecure": !env.insecure_cookie,
+        // Whether the device cookie a device opening `pairUrl` gets carries
+        // `Secure`: a browser drops it over plain HTTP off loopback, so the
+        // sheet warns when `pairUrl` is `http://` and this is true (review
+        // M1). False under `--insecure-cookie`, and on T0 when `pairUrl`'s
+        // host is a tailnet address — that device's peer address is then a
+        // tailnet one, which gets a non-`Secure` cookie (Round 19,
+        // DEC-R19-1). The T1 broker is unchanged.
+        "cookieSecure": !(env.insecure_cookie
+            || (env.tier == StoreTier::T0
+                && url.as_deref().is_some_and(devices::is_tailnet_url))),
     }))
 }
 

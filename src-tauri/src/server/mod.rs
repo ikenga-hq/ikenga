@@ -127,8 +127,9 @@ pub struct T1ServeOptions {
     /// `--principal-path`: the `PATH` principals' children get (§9.3).
     pub principal_path: Option<std::ffi::OsString>,
     /// `--insecure-cookie` (P-3, G-ACCESS R-9): drop `Secure` from the
-    /// session cookie, for a plain-HTTP tailnet deploy. Read by every tier's
-    /// boot; only the T1 broker sets a cookie today.
+    /// session and device cookies, for a plain-HTTP deploy. Read by every
+    /// tier's boot. On T0 a tailnet peer gets a non-`Secure` device cookie
+    /// without it (Round 19, DEC-R19-1, `devices::cookie_insecure`).
     pub insecure_cookie: bool,
     /// `--principal-child` (hidden): this process is a T1 principal child,
     /// launched by the broker as the principal's uid (§3). It never opens an
@@ -331,7 +332,7 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    use crate::access::{devices, DaemonAccess, DaemonMode, RequestMeta};
+    use crate::access::{devices, DaemonAccess, DaemonMode, RequestMeta, StoreTier};
 
     if !origin_permitted(&req, &state) {
         warn!(
@@ -367,7 +368,16 @@ async fn auth_middleware(
         ..Default::default()
     }
     .with_host_from(req.headers());
-    let insecure = access.options.insecure_cookie;
+    // P-3 as amended by Round 19 (DEC-R19-1): a T0 device cookie drops
+    // `Secure` for a tailnet TCP peer (`ConnectInfo`, never
+    // `X-Forwarded-For`) as well as under `--insecure-cookie`.
+    let insecure = devices::cookie_insecure(
+        StoreTier::T0,
+        access.options.insecure_cookie,
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip()),
+    );
     let mut set_cookie: Option<String> = None;
     let mut ctx = None;
 

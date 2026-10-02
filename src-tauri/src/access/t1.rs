@@ -91,6 +91,7 @@ impl T1Access {
         super::http::PairingHost {
             registry: self.pairing.clone(),
             store: self.store.clone(),
+            tier: super::store::StoreTier::T1,
             insecure_cookie: self.options.insecure_cookie,
         }
     }
@@ -909,6 +910,66 @@ mod tests {
                 .unwrap(),
             DeviceAuth::Valid { .. }
         ));
+    }
+
+    /// Round 19, DEC-R19-1 leaves the T1 broker unchanged: a device cookie
+    /// cleared or rotated for a tailnet TCP peer keeps `Secure` (only
+    /// `--insecure-cookie` drops it there).
+    #[tokio::test]
+    async fn t1_device_cookies_keep_secure_for_a_tailnet_peer() {
+        use tower::ServiceExt;
+        let (_tmp, t1, ada) = setup().await;
+        assert!(!t1.options.insecure_cookie);
+        let (row, tok) = pair(&t1, ada, Tier::View).await;
+        let forged = devices::token(&row.device_id, &devices::mint_secret().secret);
+        let app = axum::Router::new()
+            .route("/api/rpc", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                t1.clone(),
+                device_cookie_middleware,
+            ));
+        let send =
+            |cookie: String, peer: &'static str| {
+                let app = app.clone();
+                async move {
+                    let mut req = axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/rpc")
+                        .header("cookie", format!("ikenga_device={cookie}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(
+                        std::net::SocketAddr::new(peer.parse().unwrap(), 51000),
+                    ));
+                    let res = app.oneshot(req).await.unwrap();
+                    res.headers()
+                        .get(header::SET_COOKIE)
+                        .expect("a Set-Cookie")
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                }
+            };
+        for peer in ["100.101.102.103", "fd7a:115c:a1e0::7", "::ffff:100.64.0.9"] {
+            let cookie = send(forged.clone(), peer).await;
+            assert!(cookie.contains("Max-Age=0"), "{cookie}");
+            assert!(cookie.ends_with("; Secure"), "clear, peer={peer}: {cookie}");
+        }
+        let old = devices::now_ms() - devices::ROTATE_AFTER.as_millis() as i64 - 1000;
+        sqlx::query(
+            "UPDATE devices SET secret_rotated_at = ?, paired_at = ?, last_seen_at = ? \
+             WHERE device_id = ?",
+        )
+        .bind(old)
+        .bind(old)
+        .bind(devices::now_ms())
+        .bind(&row.device_id)
+        .execute(&t1.pool)
+        .await
+        .unwrap();
+        let cookie = send(tok.clone(), "100.101.102.103").await;
+        assert!(!cookie.starts_with("ikenga_device=;"), "rotated: {cookie}");
+        assert!(cookie.ends_with("; Secure"), "rotate: {cookie}");
     }
 
     #[tokio::test]

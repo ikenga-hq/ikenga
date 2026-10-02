@@ -41,7 +41,7 @@ use serde_json::{json, Value};
 
 use super::pairing::{self, Fail, Registry, StatusOut};
 use super::spake;
-use super::store::AccessStore;
+use super::store::{AccessStore, StoreTier};
 
 /// `{ok:false, error:<code>, message}` with the matching status (§9.1).
 pub fn error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -108,6 +108,9 @@ async fn origin_layer(
 pub struct PairingHost {
     pub registry: Arc<Registry>,
     pub store: AccessStore,
+    /// Which tier serves these endpoints: on T0 a tailnet peer gets a
+    /// non-`Secure` device cookie (Round 19, DEC-R19-1); T1 never does.
+    pub tier: StoreTier,
     /// `--insecure-cookie`: drop `Secure` from the device cookie (§3.8).
     pub insecure_cookie: bool,
 }
@@ -265,10 +268,13 @@ async fn status(
                     "tier": tier.as_str(),
                 }))
                 .into_response();
-                match HeaderValue::from_str(&super::devices::set_cookie(
-                    &token,
+                // DEC-R19-1: the TCP peer decides, never `X-Forwarded-For`.
+                let insecure = super::devices::cookie_insecure(
+                    host.tier,
                     host.insecure_cookie,
-                )) {
+                    conn.as_ref().map(|c| c.0.ip()),
+                );
+                match HeaderValue::from_str(&super::devices::set_cookie(&token, insecure)) {
                     Ok(v) => {
                         r.headers_mut().append(header::SET_COOKIE, v);
                     }
@@ -455,6 +461,95 @@ mod tests {
             .unwrap()
     }
 
+    /// Pairs one device over `host`'s registry and returns the `Set-Cookie`
+    /// the browser status poll from TCP peer `peer` receives (`ConnectInfo`,
+    /// as `into_make_service_with_connect_info` attaches it), with a
+    /// spoofed `X-Forwarded-For` naming the other kind of address.
+    async fn delivered_cookie(host: PairingHost, peer: &str, xff: &str) -> String {
+        let registry = host.registry.clone();
+        let store = host.store.clone();
+        let r = Router::new().nest(PAIRING_PREFIX, pairing_routes_for(host, vec![]));
+        let owner = store.meta().owner_principal_id.unwrap().to_string();
+        let ticket = registry.begin(&owner, None).unwrap();
+        let store_id = store.meta().store_id.clone();
+        let (dev, msg_a) = spake::device_start_with_rng(&ticket.code, &store_id, rand::rngs::OsRng);
+        let ok = registry
+            .hello(
+                &ticket.code[..1],
+                &spake::b64(&msg_a),
+                "Pixel 9 · Chrome",
+                None,
+                peer,
+                &store_id,
+            )
+            .unwrap();
+        let keys = spake::Keys::derive(
+            &dev.finish(&ok.msg_b).unwrap(),
+            &ok.pairing_id,
+            &msg_a,
+            &ok.msg_b,
+        );
+        registry
+            .confirm(&ok.pairing_id, &spake::b64(&keys.device_confirm()), peer)
+            .unwrap();
+        let info = registry.begin_decide(&ok.pairing_id, &owner).unwrap();
+        assert!(registry.finish_allow(
+            &info.pairing_id,
+            "dev-1",
+            super::super::Tier::View,
+            "ikd1.tok".into(),
+        ));
+        let mut req = axum::http::Request::builder()
+            .uri(format!("/access/pair/status?id={}", ok.pairing_id))
+            .header("host", "ik:4000")
+            .header("x-forwarded-for", xff)
+            .header(pairing::POLL_HEADER, spake::b64(keys.poll_key()))
+            .body(Body::empty())
+            .unwrap();
+        let addr = SocketAddr::new(peer.parse().unwrap(), 51000);
+        req.extensions_mut().insert(ConnectInfo(addr));
+        let (st, h, v) = send(&r, req).await;
+        assert_eq!((st, v["state"].as_str()), (StatusCode::OK, Some("allowed")));
+        h.get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Round 19, DEC-R19-1: the T0 pairing status drops `Secure` for a
+    /// tailnet TCP peer only — never on the strength of `X-Forwarded-For` —
+    /// and the T1 broker keeps it for every peer.
+    #[tokio::test]
+    async fn the_delivered_cookie_drops_secure_only_for_a_t0_tailnet_peer() {
+        let store = AccessStore::memory_t0().await;
+        let host = |tier| PairingHost {
+            registry: Registry::new(),
+            store: store.clone(),
+            tier,
+            insecure_cookie: false,
+        };
+        for (tier, peer, xff, secure) in [
+            (StoreTier::T0, "100.101.102.103", "192.168.1.9", false),
+            (StoreTier::T0, "fd7a:115c:a1e0::7", "192.168.1.9", false),
+            (StoreTier::T0, "::ffff:100.64.0.9", "192.168.1.9", false),
+            (StoreTier::T0, "192.168.1.9", "100.101.102.103", true),
+            (StoreTier::T0, "100.128.0.1", "100.101.102.103", true),
+            (StoreTier::T1, "100.101.102.103", "192.168.1.9", true),
+            (StoreTier::T1, "fd7a:115c:a1e0::7", "192.168.1.9", true),
+            (StoreTier::T1, "192.168.1.9", "100.101.102.103", true),
+        ] {
+            let cookie = delivered_cookie(host(tier), peer, xff).await;
+            assert!(cookie.starts_with("ikenga_device=ikd1.tok;"), "{cookie}");
+            assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
+            assert_eq!(
+                cookie.contains("Secure"),
+                secure,
+                "{tier:?} peer={peer}: {cookie}"
+            );
+        }
+    }
+
     /// The endpoints end to end over the router: hello → confirm → (allow)
     /// → status sets the HttpOnly device cookie once, then `410`.
     #[tokio::test]
@@ -464,6 +559,7 @@ mod tests {
         let host = PairingHost {
             registry: registry.clone(),
             store: store.clone(),
+            tier: StoreTier::T0,
             insecure_cookie: true,
         };
         let r = Router::new().nest(PAIRING_PREFIX, pairing_routes_for(host, vec![]));

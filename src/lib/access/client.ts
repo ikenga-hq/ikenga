@@ -57,9 +57,11 @@ export interface PairTicket {
 	pairUrl: string | null;
 	qrPayload: string | null;
 	/**
-	 * The device cookie carries `Secure` (no `--insecure-cookie`). A browser
-	 * drops it over plain HTTP off loopback, so the sheet warns when
-	 * `pairUrl` is `http://` (WP-74b review M1). Absent on older daemons.
+	 * The device cookie a device opening `pairUrl` gets carries `Secure`. A
+	 * browser drops it over plain HTTP off loopback, so the sheet warns when
+	 * `pairUrl` is `http://` and this is true (WP-74b review M1). False under
+	 * `--insecure-cookie`, and on the T0 daemon when `pairUrl`'s host is a
+	 * tailnet address (Round 19, DEC-R19-1). Absent on older daemons.
 	 */
 	cookieSecure?: boolean;
 }

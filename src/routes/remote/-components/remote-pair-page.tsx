@@ -37,7 +37,7 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 		case 'cookie_rejected':
 			return {
 				title: "This browser didn't keep the pairing",
-				body: "The computer allowed this device, but this connection isn't HTTPS, so the browser dropped the device credential. Start ikenga-server with --insecure-cookie (on a Tailscale perimeter) or serve it over HTTPS, then remove this device on the computer and pair again.",
+				body: "The computer allowed this device, but this connection isn't HTTPS, so the browser dropped the device credential. Pair over a Tailscale address, serve it over HTTPS, or start ikenga-server with --insecure-cookie, then remove this device on the computer and pair again.",
 			};
 		case 'denied':
 			return {

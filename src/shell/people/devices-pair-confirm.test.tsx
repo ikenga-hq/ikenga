@@ -171,6 +171,29 @@ describe('Pair sheet → confirm hand-off (review B1)', () => {
 		).toBeNull();
 		expect(insecureCookieWarning({ ...ticket, pairUrl: null })).toBeNull();
 	});
+
+	it('Round 19 (DEC-R19-1): no warning for a T0 tailnet link, still one for a LAN link', () => {
+		// T0 reports cookieSecure: false for a tailnet pairUrl (the daemon
+		// omits Secure for a tailnet peer).
+		for (const pairUrl of [
+			'http://100.94.12.30:4000/remote/pair',
+			'http://[fd7a:115c:a1e0::7]:4000/remote/pair',
+			'http://ned-desktop.tail1.ts.net:4000/remote/pair',
+		]) {
+			expect(insecureCookieWarning({ pairUrl, cookieSecure: false })).toBeNull();
+		}
+		expect(
+			insecureCookieWarning({ pairUrl: 'http://192.168.1.9:4000/remote/pair', cookieSecure: true })
+		).toMatch(/plain HTTP/);
+		expect(
+			insecureCookieWarning({ pairUrl: 'http://127.0.0.1:4000/remote/pair', cookieSecure: true })
+		).toBeNull();
+		// The T1 broker keeps Secure over a tailnet, so a tailnet http:// link
+		// with cookieSecure: true still warns.
+		expect(
+			insecureCookieWarning({ pairUrl: 'http://100.94.12.30:4000/remote/pair', cookieSecure: true })
+		).toMatch(/plain HTTP/);
+	});
 });
 
 describe('pairSheetPhase', () => {

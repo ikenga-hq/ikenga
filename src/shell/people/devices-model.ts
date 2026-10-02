@@ -243,12 +243,17 @@ export function pairPublicBase(view: DevicesView): string | undefined {
 }
 
 /**
- * WP-74b review M1: the device cookie carries `Secure` unless the server runs
- * with `--insecure-cookie` (§3.8), and browsers drop a `Secure` Set-Cookie
- * from a plain-HTTP origin that isn't loopback. A device pairing through such
- * a `pairUrl` would be told "Paired" and hold nothing, so the sheet says so
- * up front. `null` when the link is HTTPS, loopback, absent, or the cookie
- * isn't `Secure`.
+ * WP-74b review M1: browsers drop a `Secure` Set-Cookie from a plain-HTTP
+ * origin that isn't loopback, so a device pairing through such a `pairUrl`
+ * would be told "Paired" and hold nothing; the sheet says so up front.
+ *
+ * `cookieSecure` is the server's prediction for a device opening `pairUrl`
+ * and is authoritative here. Since Round 19 (DEC-R19-1) the T0 daemon omits
+ * `Secure` for a tailnet peer and reports `cookieSecure: false` for a tailnet
+ * `pairUrl` (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`), so on T0
+ * this warns only for a plain-HTTP LAN or public link. The T1 broker keeps
+ * `Secure` over a tailnet too, and still reports `true` there. `null` when
+ * the link is HTTPS, loopback, absent, or the cookie isn't `Secure`.
  */
 export function insecureCookieWarning(
 	ticket: Pick<PairTicket, 'pairUrl' | 'cookieSecure'>
@@ -261,7 +266,7 @@ export function insecureCookieWarning(
 		return null;
 	}
 	if (url.protocol !== 'http:' || classifyHost(url.hostname) === 'loopback') return null;
-	return "This address is plain HTTP, so a phone's browser won't keep the device credential and pairing won't stick. Start ikenga-server with --insecure-cookie (on a Tailscale perimeter) or serve it over HTTPS.";
+	return "This address is plain HTTP, so a phone's browser won't keep the device credential and pairing won't stick. Pair over a Tailscale address, serve it over HTTPS, or start ikenga-server with --insecure-cookie.";
 }
 
 /** "now", "12 s ago", "4 min ago", "2 h ago", "3 d ago". */

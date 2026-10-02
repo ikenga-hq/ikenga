@@ -448,7 +448,7 @@ Self-signup; LDAP/AD; OIDC flows (WP-22); per-principal pkg install or trust (v1
 |---|---|---|
 | **P-1** | `--data-dir` = the operator root under T1 | Deploy files stay unchanged. |
 | **P-2** | uid range 20000–29999 (`--uid-range`); `gid = uid`; `range_end` reserved as the probe uid, allocation stops at `range_end - 1` | Clear of login users and inside the 65 536 ids a user namespace maps; the probe never shares a uid with a principal. |
-| **P-3** | Cookie `ikenga_session`; `Secure` on by default; `--insecure-cookie` opt-out for a plain-HTTP tailnet | Tailnet deploys serve HTTP on a tailnet IP (`ikenga-server.service:10-13`, `:34-36`). |
+| **P-3** | Cookie `ikenga_session`; `Secure` on by default; `--insecure-cookie` opt-out for a plain-HTTP tailnet _(amended Round 19, §14.2)_ | Tailnet deploys serve HTTP on a tailnet IP (`ikenga-server.service:10-13`, `:34-36`). |
 | **P-4** | Session inactivity 24 h; the session id cycles on login | The session is a shell credential. |
 | **P-5** | `unix_name = "ik-" + username`, immutable | Readable in `ps`; renames never touch `/etc`. |
 | **P-6** | `accounts.db` migrations in `BEGIN IMMEDIATE`; `sessions.db` separate | Doesn't repeat `db.rs:604-627`. |
@@ -505,3 +505,15 @@ Recorded in remote-access `04` Round 16. Founder-approved in shell-ux `04` Round
 **Unchanged:**
 - **§1:** `uid` is never 0. T0 constructs no `Principal`.
 - **I-8** is unchanged, and it now also covers device sockets: every `session_epoch` bump closes the principal's paired-device sockets too.
+
+### 14.2 Round 19 (2026-10-02) — tailnet requests may carry non-`Secure` cookies on T0
+
+Recorded in remote-access `04` Round 19 (DEC-R19-1), decided by the founder during WP-74b (ikenga#365, review finding M1). It amends §12.2 **P-3** narrowly:
+
+- **T0 daemon:** a `Set-Cookie` (the device cookie, or a session cookie where one applies) omits `Secure` **only when the request's TCP peer address** (axum `ConnectInfo`) is a Tailscale address: IPv4 `100.64.0.0/10` (including its IPv4-mapped IPv6 form `::ffff:100.64.0.0/106`) or IPv6 `fd7a:115c:a1e0::/48`. That traffic is already WireGuard-encrypted end to end.
+- Every other plain-HTTP origin, including LAN and loopback-forwarded addresses, keeps `Secure` and still needs HTTPS (`IKENGA_PUBLIC_URL`) or an explicit `--insecure-cookie`.
+- `X-Forwarded-For` is never used to decide this.
+- **T1 broker: unchanged.** P-3 plus `--insecure-cookie`, as signed.
+- `access_pair_begin` reports `cookieSecure: false` on T0 when the pairing link's host is a tailnet address, so the pair sheet warns only for a plain-HTTP LAN or public link.
+
+Implementation: `access::devices::{is_tailnet_ip, cookie_insecure}`.

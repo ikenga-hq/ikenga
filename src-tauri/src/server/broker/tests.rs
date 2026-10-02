@@ -314,6 +314,37 @@ async fn insecure_cookie_drops_only_secure() {
     );
 }
 
+/// Round 19, DEC-R19-1 relaxes `Secure` on the T0 daemon only: a T1 login
+/// from a tailnet TCP peer still gets a `Secure` session cookie.
+#[tokio::test]
+async fn a_tailnet_peer_still_gets_a_secure_session_cookie() {
+    let h = harness().await;
+    insert_account(&h.pool, "ada", 20_001, false).await;
+    for peer in ["100.101.102.103", "fd7a:115c:a1e0::7", "::ffff:100.64.0.9"] {
+        let mut req = request("POST", "/auth/login")
+            .header("content-type", "application/json")
+            .header("origin", format!("https://{HOST}"))
+            .body(Body::from(
+                json!({ "username": "ada", "password": PASSWORD }).to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                peer.parse().unwrap(),
+                51000,
+            )));
+        let (status, headers, _) = send(&h.app, req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{peer}");
+        let raw = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|v| v.starts_with("ikenga_session="))
+            .unwrap();
+        assert!(raw.contains("Secure"), "{peer}: {raw}");
+    }
+}
+
 #[tokio::test]
 async fn a_failed_login_says_nothing_and_sets_no_session() {
     let h = harness().await;

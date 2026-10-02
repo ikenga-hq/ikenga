@@ -325,6 +325,7 @@ impl DaemonAccess {
         self.store.as_ref().map(|store| http::PairingHost {
             registry: self.pairing.clone(),
             store: store.clone(),
+            tier: StoreTier::T0,
             insecure_cookie: self.options.insecure_cookie,
         })
     }
