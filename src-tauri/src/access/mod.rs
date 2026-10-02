@@ -386,6 +386,7 @@ impl DaemonAccess {
     pub async fn operator_ctx(&self, meta: RequestMeta) -> AccessCtx {
         let device_id = self.store().and_then(|s| s.meta().host_device_id.clone());
         let routing_ok = routing::routing_ok(self.store(), &self.owner, device_id.as_deref()).await;
+        let context = caps::RoleContext::OwnWorkspace;
         AccessCtx {
             principal_id: self.owner,
             via: Via::Operator,
@@ -393,14 +394,17 @@ impl DaemonAccess {
             tier: Tier::Full,
             share: None,
             share_headers: false,
-            caps: caps::effective(
-                caps::RoleContext::OwnWorkspace,
-                Tier::Full,
-                CapSet::ALL,
-                routing_ok,
-            ),
+            caps: caps::effective(context, Tier::Full, CapSet::ALL, routing_ok),
             admin_strength: true,
-            meta,
+            meta: RequestMeta {
+                routing_withheld_approve: ctx::routing_withheld_approve(
+                    context,
+                    Tier::Full,
+                    CapSet::ALL,
+                    routing_ok,
+                ),
+                ..meta
+            },
         }
     }
 
@@ -428,7 +432,15 @@ impl DaemonAccess {
                 CapSet::ALL,
                 routing_ok,
             ),
-            meta,
+            meta: RequestMeta {
+                routing_withheld_approve: ctx::routing_withheld_approve(
+                    caps::RoleContext::OwnWorkspace,
+                    row.tier,
+                    CapSet::ALL,
+                    routing_ok,
+                ),
+                ..meta
+            },
         }
     }
 
@@ -491,13 +503,7 @@ pub fn check(ctx: &AccessCtx, req: Requirement) -> Result<(), AccessError> {
     if !missing.is_empty() {
         // §5.1 / A-23 (WP-75): `approve` the tier and role hold but the
         // routing preference removed is `routing_refused`, not `forbidden`.
-        if missing == CapSet::of(&[Cap::Approve])
-            && crate::server::shared::notifications::routing::approve_removed_by_routing(
-                ctx.caps,
-                ctx.tier,
-                ctx.share.as_ref(),
-            )
-        {
+        if missing == CapSet::of(&[Cap::Approve]) && ctx.meta.routing_withheld_approve {
             return Err(AccessError::new(
                 Code::RoutingRefused,
                 "permission asks are answered on another device (this device only)",

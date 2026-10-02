@@ -92,6 +92,23 @@ pub struct RequestMeta {
     pub host: Option<String>,
     /// `http` / `https`, from the request's `Origin` when it has one.
     pub scheme: Option<String>,
+    /// §5.1 / A-23 (WP-75): the principal's routing preference withheld an
+    /// `approve` the role and tier would otherwise grant — set where the
+    /// effective caps are computed ([`routing_withheld_approve`]), so a
+    /// refusal is `routing_refused` only when routing caused it (review
+    /// WP75-R5). `false` where caps arrive precomputed (a T1 child).
+    pub routing_withheld_approve: bool,
+}
+
+/// Whether routing (and only routing) removed `approve` from
+/// `caps::effective(context, tier, ceiling, routing_ok)`.
+pub fn routing_withheld_approve(
+    context: super::caps::RoleContext,
+    tier: Tier,
+    ceiling: CapSet,
+    routing_ok: bool,
+) -> bool {
+    !routing_ok && super::caps::effective(context, tier, ceiling, true).contains(Cap::Approve)
 }
 
 impl RequestMeta {

@@ -61,12 +61,15 @@ function status(over: Over = {}): AccessStatus {
 }
 
 describe('routing policy (G-ACCESS §5.1, D-05 approveNote)', () => {
-	it('names the devices that may approve under "any paired device"', () => {
-		expect(approverNames(DEVICES)).toEqual(['ned-desktop', 'ned-macbook']);
+	it('names the paired devices that may approve under "any paired device"', () => {
+		// D-05: the host is not a paired device, so only ned-macbook is named.
+		expect(approverNames(DEVICES)).toEqual(['ned-macbook']);
 		expect(routingNote({ mode: 'any_approve', deviceId: null }, DEVICES, 'host')).toEqual({
 			kind: 'any',
-			approvers: ['ned-desktop', 'ned-macbook'],
+			approvers: ['ned-macbook'],
 		});
+		// Only the host: nobody to name.
+		expect(approverNames([DEVICES[0]])).toEqual([]);
 	});
 
 	it('"this device only" set here names this device; set elsewhere names that one', () => {

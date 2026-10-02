@@ -396,7 +396,8 @@ pub async fn post_hook_event(
 /// is capped by the routing preference (§5.1), attributed (`decided_*`) and
 /// audited. The route stays for external hook clients; a decision that
 /// arrives before the row exists (the record is spawned beside the hold)
-/// waits for it briefly, then falls back to answering the hold directly.
+/// waits for it briefly, then falls back to answering the hold directly —
+/// still only when the host's routing preference admits it.
 pub async fn post_hook_decision(
     Extension(app): Extension<AppHandle>,
     Json(decision): Json<HookDecision>,
@@ -422,6 +423,23 @@ pub async fn post_hook_decision(
                 Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
             ),
         };
+    }
+    // No row to decide through (the record is slow or failed): still never
+    // answer past the routing preference (§5.1; review WP75-R10). This path
+    // writes no `decided_*` and no audit — there is no row to attribute.
+    use crate::server::shared::notifications::routing;
+    if let Some(local) = routing::local() {
+        let refused = match local.host.host_routing().await {
+            Ok(r) if r.routing_ok => None,
+            Ok(_) => Some(routing::Refusal::RoutingRefused.to_error()),
+            Err(e) => Some(e),
+        };
+        if let Some(e) = refused {
+            return (
+                e.code.status(),
+                Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
+            );
+        }
     }
     let was_gated = resolve_held(&app, &decision.request_id, approved);
     (

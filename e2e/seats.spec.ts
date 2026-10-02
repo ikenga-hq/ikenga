@@ -451,7 +451,11 @@ for (const mode of ['dark', 'light'] as const) {
 				'true'
 			);
 			await expect(routing.getByRole('tab', { name: 'This device only' })).toBeEnabled();
-			await expect(routing.locator('[data-note="any"]')).toContainText('Right now that is This Mac');
+			// D-05 approveNote: the host is not a paired device, and with no
+			// paired approver there is nobody to name.
+			const note = routing.locator('[data-note="any"]');
+			await expect(note).toContainText('Any device with approve may answer.');
+			await expect(note).not.toContainText('Right now that is');
 			await expect(devices.getByText('Set by how the server was started.')).toBeVisible();
 			await expect(devices.getByText(/No paired devices\. Pair a phone/)).toBeVisible();
 			await page.screenshot({ path: shotPath(testInfo, `people-devices-${mode}.png`) });

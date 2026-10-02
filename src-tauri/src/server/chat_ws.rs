@@ -243,6 +243,9 @@ async fn handle_chat_socket(
     tokio::pin!(closed_fut);
 
     info!("Chat WebSocket connected for thread: {thread_id}");
+    // G-ACCESS §5.7 (WP-75): this socket's prompt attribution is kept under
+    // its own id, so another socket on the thread never overwrites it.
+    let prompt_socket = routing::prompt_socket();
 
     send(&ws_tx, status_event(&thread_id, "idle", None)).await;
 
@@ -329,7 +332,7 @@ async fn handle_chat_socket(
                         // project, or the own-workspace project from the cwd.
                         let attribution =
                             prompt_context(&state, guard.ctx.as_ref(), cwd.as_deref()).await;
-                        routing::set_prompt_context(&thread_id, attribution);
+                        routing::set_prompt_context(&thread_id, prompt_socket, attribution);
 
                         let engine_name = engine.unwrap_or_else(|| DEFAULT_ENGINE.to_string());
                         info!("Running prompt on engine {engine_name} for thread {thread_id}");
@@ -390,7 +393,7 @@ async fn handle_chat_socket(
         }
     }
 
-    routing::clear_prompt_context(&thread_id);
+    routing::clear_prompt_context(&thread_id, prompt_socket);
     info!("Chat WebSocket disconnected for thread: {thread_id}");
 }
 

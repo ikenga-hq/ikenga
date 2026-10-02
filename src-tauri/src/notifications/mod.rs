@@ -186,7 +186,10 @@ mod routing_desktop {
                         if let Ok(mut id) = identity().lock() {
                             *id = (owner.clone(), host.clone());
                         }
-                        let no_store = st["store"].as_str() == Some("none");
+                        // A daemon with no store admits only if no store
+                        // exists to hold a preference (as below).
+                        let no_store =
+                            st["store"].as_str() == Some("none") && !store_on_disk(&self.app);
                         let approve = st["caps"]
                             .as_array()
                             .is_some_and(|c| c.iter().any(|v| v.as_str() == Some("approve")));
@@ -196,13 +199,20 @@ mod routing_desktop {
                             host_device: host,
                         })
                     }
-                    // No store (no daemon binary, ephemeral mode): no pairing,
-                    // so no preference can exist — the default holds.
-                    Err(e) if e.starts_with("store_unavailable") => Ok(HostRouting {
-                        routing_ok: true,
-                        ..Default::default()
-                    }),
-                    // Anything else fails closed (§5.1).
+                    // The daemon can't be asked. Only when no access store
+                    // was ever created (no daemon binary, the ephemeral
+                    // fallback, a profile that never ran one) can no
+                    // preference exist, so the default holds. A store on disk
+                    // may hold `this_device` naming another device, and its
+                    // daemon being down doesn't lift it: fail closed (§5.1,
+                    // §1.4; review WP75-R3). The desktop never opens the
+                    // store itself (P-20) — it only checks that it exists.
+                    Err(e) if e.starts_with("store_unavailable") && !store_on_disk(&self.app) => {
+                        Ok(HostRouting {
+                            routing_ok: true,
+                            ..Default::default()
+                        })
+                    }
                     Err(e) => Err(AccessError::new(
                         Code::RoutingRefused,
                         format!("couldn't read who may answer asks: {e}"),
@@ -225,6 +235,20 @@ mod routing_desktop {
                     log::debug!(target: "ikenga::notifications", "audit {kind} not recorded: {e}");
                 }
             })
+        }
+    }
+
+    /// Whether the daemon's access store exists in this profile
+    /// (`<app data>/daemon/access.db`, where `init_daemon` points
+    /// `--data-dir`). Existence only; never opened here (P-20).
+    fn store_on_disk(app: &AppHandle) -> bool {
+        match app.path().app_data_dir() {
+            Ok(dir) => dir
+                .join("daemon")
+                .join(crate::access::store::T0_FILE)
+                .exists(),
+            // Can't tell: assume it may exist (fail closed).
+            Err(_) => true,
         }
     }
 
@@ -281,9 +305,24 @@ mod routing_desktop {
         let Ok(pool) = db.ensure_pool().await else {
             return;
         };
+        // The daemon names the decider (`decidedBy`); the cached owner is
+        // only a fallback for an older daemon (review WP75-R4).
         let owner = identity().lock().ok().and_then(|i| i.0.clone());
-        if let Err(e) = core::apply_relayed(&pool, local.resolvers.as_ref(), owner, d).await {
-            log::warn!(target: "ikenga::notifications", "relay decision for {key}: {e}");
+        let outcome = match core::apply_relayed(&pool, local.resolvers.as_ref(), owner, d).await {
+            Ok(true) => return,
+            // The ask was already over here (timed out, or answered on
+            // the host first): the remote decision never took effect.
+            Ok(false) => "timed_out",
+            Err(e) => {
+                log::warn!(target: "ikenga::notifications", "relay decision for {key}: {e}");
+                "cancelled"
+            }
+        };
+        // Tell the daemon, so it retracts the decision it audited (review
+        // WP75-R2: the chain never claims a decision that didn't happen).
+        let args = json!({ "key": key, "outcome": outcome });
+        if let Err(e) = daemon_rpc(app, "permission_relay_resolve", args).await {
+            log::debug!(target: "ikenga::notifications", "relay resolve {key}: {e}");
         }
     }
 
@@ -411,13 +450,6 @@ mod tests {
         assert_eq!(open.len(), 2);
         assert!(open.contains(&"update:shell:0.14.0".to_string()));
         assert!(open.contains(&"update:pkg:com.ikenga.iyke@2.0.0".to_string()));
-        assert_eq!(
-            unread_count(&pool, &[])
-                .await
-                .unwrap()
-                .by_kind
-                .get("update"),
-            Some(&2)
-        );
+        assert_eq!(unread_count(&pool, &[]).await.unwrap().by_kind.get("update"), Some(&2));
     }
 }

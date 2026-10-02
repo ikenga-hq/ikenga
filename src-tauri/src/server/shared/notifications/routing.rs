@@ -16,7 +16,7 @@
 //!   (the one `annotate`, called by `access::postfilter`);
 //! * the T0 desktop → daemon ask relay (§5.5 (a), N-8 decided (a)+(c),
 //!   DEC-83): [`Relay`] behind `permission_relay_{put,take,resolve}`;
-//! * the per-thread prompt attribution `chat_ws` captures at the handshake
+//! * the per-socket prompt attribution `chat_ws` captures at the handshake
 //!   (§5.7, [`set_prompt_context`]) — what a daemon engine that raises asks
 //!   attributes them with. Under T1 no daemon engine raises asks yet
 //!   (§5.5 (c)), so the T1 path is exercised by the fixture producer in the
@@ -29,7 +29,7 @@
 //! starts (`crate::notifications`). Every core function takes its pool and
 //! resolvers explicitly, so the tests run without either.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -145,10 +145,36 @@ pub fn classify_with(
     secret_mcp: &dyn Fn(&str) -> bool,
 ) -> Sensitivity {
     let paths = path_args(tool_input);
+    let root = project_root
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| lexical_normalize(Path::new(r)));
+    // Where each argument really lands on this host (review WP75-R1): a
+    // symlink inside the project can point outside it, or at secret
+    // material. `None` when the host can't resolve it (the lexical form
+    // alone then decides).
+    let real_root = root.as_deref().and_then(canonical_existing);
+    let real = |raw: &str| -> Option<PathBuf> {
+        let abs = if raw.starts_with('~') || Path::new(raw).is_absolute() {
+            absolute_lexical(raw)?
+        } else {
+            resolve_under(root.as_deref()?, raw)?
+        };
+        canonical_existing(&abs)
+    };
+    let resolves_to_secret =
+        |raw: &str| real(raw).is_some_and(|r| is_secret_path(&r.to_string_lossy()));
+    let tokens = command_tokens(tool_input);
 
-    // Rule 3 — secret material.
-    let secret = paths.iter().any(|p| is_secret_path(p))
-        || command_tokens(tool_input).any(is_secret_path)
+    // Rule 3 — secret material: the argument as written **or** where it
+    // resolves.
+    let secret = paths
+        .iter()
+        .any(|p| is_secret_path(p) || resolves_to_secret(p))
+        || tokens.iter().any(|t| is_secret_path(t))
+        || tokens
+            .iter()
+            .take(MAX_RESOLVED_TOKENS)
+            .any(|t| resolves_to_secret(t))
         || input_text_mentions_secret_env(tool_input)
         || secret_mcp(tool_name);
     if secret {
@@ -160,16 +186,18 @@ pub fn classify_with(
         SHELL_TOOLS.contains(&tool_name) || SHELL_SUFFIXES.iter().any(|s| tool_name.ends_with(s));
 
     // Rule 2 — outside the project, or the project root is unknown (fail
-    // closed: nothing can be shown to be inside an unknown root).
-    let outside = match project_root.filter(|r| !r.trim().is_empty()) {
+    // closed: nothing can be shown to be inside an unknown root). Outside
+    // if **either** the lexical or the resolved form is.
+    let outside = match &root {
         None => true,
-        Some(root) => {
-            let root = lexical_normalize(Path::new(root));
-            paths.iter().any(|p| match resolve_under(&root, p) {
-                Some(abs) => !abs.starts_with(&root),
-                None => true,
-            })
-        }
+        Some(root) => paths.iter().any(|p| match resolve_under(root, p) {
+            None => true,
+            Some(abs) if !abs.starts_with(root) => true,
+            Some(abs) => match (canonical_existing(&abs), &real_root) {
+                (Some(real_abs), Some(real_root)) => !real_abs.starts_with(real_root),
+                _ => false,
+            },
+        }),
     };
 
     if shell || outside {
@@ -216,22 +244,31 @@ fn path_args(input: &Value) -> Vec<String> {
     out
 }
 
+/// Most Bash tokens resolved on the filesystem per ask (the lexical check
+/// covers every token).
+const MAX_RESOLVED_TOKENS: usize = 64;
+
 /// Whitespace / shell-metacharacter tokens of a Bash `command`, checked
 /// against the secret-path patterns ("a Bash command whose arguments match
-/// the §5.3 patterns" is secret material, §4.5.1).
-fn command_tokens(input: &Value) -> impl Iterator<Item = &str> {
-    input
+/// the §5.3 patterns" is secret material, §4.5.1). Quote characters and
+/// backslash escapes are **removed**, not split on, so shell quoting can't
+/// break a name apart (`cat .e"nv"` is `cat .env`; review WP75-R8).
+fn command_tokens(input: &Value) -> Vec<String> {
+    let unquoted: String = input
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    unquoted
         .split(|c: char| {
             c.is_whitespace()
-                || matches!(
-                    c,
-                    ';' | '|' | '&' | '<' | '>' | '(' | ')' | '"' | '\'' | '`' | '=' | ','
-                )
+                || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`' | '=' | ',')
         })
         .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn input_text_mentions_secret_env(input: &Value) -> bool {
@@ -290,6 +327,42 @@ fn lexical_normalize(p: &Path) -> PathBuf {
         }
     }
     out.iter().collect()
+}
+
+/// An absolute (or `~/`-relative) argument, lexically normalised; `None`
+/// for a relative one when there is no root to resolve it against.
+fn absolute_lexical(raw: &str) -> Option<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")?;
+        return Some(lexical_normalize(&Path::new(&home).join(rest)));
+    }
+    let p = Path::new(raw);
+    p.is_absolute().then(|| lexical_normalize(p))
+}
+
+/// Where `abs` really is on this host: the deepest existing ancestor
+/// canonicalised (symlinks followed), with the rest appended and
+/// normalised. `None` when not even the filesystem root resolves (or `abs`
+/// is relative). Paths the host doesn't have come back as written below
+/// their deepest real ancestor, so a remote-only path classifies lexically.
+fn canonical_existing(abs: &Path) -> Option<PathBuf> {
+    if !abs.is_absolute() {
+        return None;
+    }
+    let mut base = abs;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let mut out = real;
+            for c in rest.iter().rev() {
+                out.push(c);
+            }
+            return Some(lexical_normalize(&out));
+        }
+        let name = base.file_name()?;
+        rest.push(name);
+        base = base.parent()?;
+    }
 }
 
 /// `raw` resolved against `root` (relative paths join it). `None` for a
@@ -398,27 +471,61 @@ pub struct PromptContext {
     pub project_root: Option<String>,
 }
 
-fn prompt_contexts() -> &'static Mutex<HashMap<String, PromptContext>> {
-    static MAP: OnceLock<Mutex<HashMap<String, PromptContext>>> = OnceLock::new();
+/// One live `/ws/chat` socket's context on a thread: `(socket, seq, ctx)`.
+type SocketContexts = Vec<(u64, u64, PromptContext)>;
+
+fn prompt_contexts() -> &'static Mutex<(u64, HashMap<String, SocketContexts>)> {
+    static MAP: OnceLock<Mutex<(u64, HashMap<String, SocketContexts>)>> = OnceLock::new();
     MAP.get_or_init(Default::default)
 }
 
-/// Remember `thread_id`'s attribution for the turn about to run.
-pub fn set_prompt_context(thread_id: &str, ctx: PromptContext) {
-    if let Ok(mut m) = prompt_contexts().lock() {
-        m.insert(thread_id.to_string(), ctx);
+/// A fresh id for one `/ws/chat` socket: its prompt contexts are kept and
+/// cleared under it, so two sockets on one thread (the Owner and a member
+/// through a share) never overwrite or wipe each other's (review WP75-R11).
+pub fn prompt_socket() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Remember `socket`'s attribution on `thread_id` for the turn about to run.
+pub fn set_prompt_context(thread_id: &str, socket: u64, ctx: PromptContext) {
+    if let Ok(mut g) = prompt_contexts().lock() {
+        let (seq, map) = &mut *g;
+        *seq += 1;
+        let live = map.entry(thread_id.to_string()).or_default();
+        live.retain(|(s, _, _)| *s != socket);
+        live.push((socket, *seq, ctx));
     }
 }
 
-/// Forget it (the socket closed).
-pub fn clear_prompt_context(thread_id: &str) {
-    if let Ok(mut m) = prompt_contexts().lock() {
-        m.remove(thread_id);
+/// Forget `socket`'s context on `thread_id` (that socket closed); other
+/// sockets' stay.
+pub fn clear_prompt_context(thread_id: &str, socket: u64) {
+    if let Ok(mut g) = prompt_contexts().lock() {
+        let map = &mut g.1;
+        if let Some(live) = map.get_mut(thread_id) {
+            live.retain(|(s, _, _)| *s != socket);
+            if live.is_empty() {
+                map.remove(thread_id);
+            }
+        }
     }
 }
 
+/// The attribution an ask raised on `thread_id` carries. With one live
+/// context (or several that agree) that one. When live sockets on the
+/// thread disagree, the ask can't be tied to one requester, so it fails
+/// closed: no member, no project (§5.4 3a: no share may decide it — only
+/// the Owner), no root (§5.3 rule 2: sensitive).
 pub fn prompt_context(thread_id: &str) -> Option<PromptContext> {
-    prompt_contexts().lock().ok()?.get(thread_id).cloned()
+    let g = prompt_contexts().lock().ok()?;
+    let live = g.1.get(thread_id)?;
+    let (_, _, first) = live.first()?;
+    if live.iter().all(|(_, _, c)| c == first) {
+        Some(first.clone())
+    } else {
+        Some(PromptContext::default())
+    }
 }
 
 /// The producer path a daemon engine uses (and the T1 fixture producer the
@@ -586,6 +693,9 @@ pub struct Decider {
     pub caps: CapSet,
     pub tier: Tier,
     pub share: Option<ShareCtx>,
+    /// The routing preference (§5.1) withheld `approve` from `caps`, as
+    /// recorded where the caps were computed (review WP75-R5).
+    pub routing_withheld: bool,
 }
 
 impl Decider {
@@ -621,6 +731,7 @@ impl Decider {
             caps: ctx.caps,
             tier: ctx.tier,
             share,
+            routing_withheld: ctx.meta.routing_withheld_approve,
         }
     }
 
@@ -642,22 +753,8 @@ impl Decider {
             caps,
             tier: Tier::Full,
             share: None,
+            routing_withheld: !routing_ok,
         }
-    }
-}
-
-/// Whether `approve` is missing from `caps` **because of routing** (§5.1)
-/// rather than the tier or the role: the tier holds it and so does the
-/// role (the Owner in its own workspace; a share's role default).
-pub fn approve_removed_by_routing(caps: CapSet, tier: Tier, share: Option<&ShareCtx>) -> bool {
-    if caps.contains(Cap::Approve) || !tier.caps().contains(Cap::Approve) {
-        return false;
-    }
-    match share {
-        None => true,
-        Some(s) => s
-            .role
-            .is_some_and(|r| r.default_caps().contains(Cap::Approve)),
     }
 }
 
@@ -734,13 +831,11 @@ impl Refusal {
 pub fn can_decide(d: &Decider, row: &AskRow, decision: Option<Decision>) -> Result<(), Refusal> {
     // 1. shared{approve}; effective caps already include routing_ok.
     if !d.caps.contains(Cap::Approve) {
-        return Err(
-            if approve_removed_by_routing(d.caps, d.tier, d.share.as_ref()) {
-                Refusal::RoutingRefused
-            } else {
-                Refusal::MissingApprove
-            },
-        );
+        return Err(if d.routing_withheld {
+            Refusal::RoutingRefused
+        } else {
+            Refusal::MissingApprove
+        });
     }
     // 2.
     if row.resolved_at.is_some() {
@@ -990,7 +1085,8 @@ pub async fn decide_with(
 /// checked §5.4 and audited it (A-39: audited once, by the daemon), so this
 /// only claims the local row for the deciding device and resolves the ask.
 /// `Ok(false)`: the ask is no longer open here (answered on the host, or
-/// timed out) — nothing to do.
+/// timed out) — the caller reports that back (`permission_relay_resolve`)
+/// so the daemon retracts the decision.
 pub async fn apply_relayed(
     pool: &sqlx::SqlitePool,
     resolvers: &dyn AskResolvers,
@@ -1011,7 +1107,9 @@ pub async fn apply_relayed(
         return Ok(false);
     };
     let by = DecidedBy {
-        principal_id: owner,
+        // The daemon names the deciding principal (review WP75-R4); an
+        // older daemon's decision falls back to the host's owner.
+        principal_id: opt_str(decision, "decidedBy").or(owner),
         via: match decision.get("decidedVia").and_then(Value::as_str) {
             Some("session") => "session",
             Some("operator") => "operator",
@@ -1111,31 +1209,64 @@ pub struct RelayDecision {
     pub decision: &'static str,
     pub decided_via: &'static str,
     pub decided_device: Option<String>,
+    /// The deciding principal, server-derived (`Decider.by`), so the
+    /// desktop attributes the decision without a cached identity (review
+    /// WP75-R4). Additive to §9.1's shape.
+    pub decided_by: Option<String>,
 }
+
+/// How long after an ask's expiry the daemon still accepts the desktop's
+/// "that decision did not take effect" report for it.
+const RELAY_ACK_GRACE: Duration = Duration::from_secs(30);
 
 struct PendingAsk {
     row_id: i64,
     _hold: crate::access::KeepAlive,
 }
 
+/// A remote decision between `queue` and the end of its ask: queued (in
+/// the outbox, holding the daemon awake) or delivered to the desktop.
+struct Decided {
+    decision: RelayDecision,
+    row_id: i64,
+    /// `Some` while queued; dropped when taken or expired.
+    hold: Option<crate::access::KeepAlive>,
+    delivered: bool,
+    /// The `permission.decided` row once the daemon wrote it — what a
+    /// retraction answers.
+    audited: Option<Event>,
+}
+
 #[derive(Default)]
 struct RelayState {
     pending: HashMap<String, PendingAsk>,
-    /// Decided, not yet taken: each keeps its keep-alive until the desktop
-    /// takes it, so the daemon can't idle out between the two.
-    outbox: VecDeque<(RelayDecision, Option<crate::access::KeepAlive>)>,
+    /// Remote decisions by desktop key, in queue order (`seq`).
+    decided: HashMap<String, (u64, Decided)>,
+    seq: u64,
 }
 
-/// The daemon side of the relay: open mirror asks and the outbox.
+/// The daemon side of the relay: open mirror asks and remote decisions.
 #[derive(Default)]
 pub struct Relay {
     state: Mutex<RelayState>,
     notify: tokio::sync::Notify,
+    /// The daemon's chain (`None` in tests that don't audit): where a
+    /// retraction is written.
+    store: Option<AccessStore>,
+    /// Orders a decision's audit row before its retraction.
+    audit_order: tokio::sync::Mutex<()>,
 }
 
 impl Relay {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_store(store: AccessStore) -> Arc<Self> {
+        Arc::new(Self {
+            store: Some(store),
+            ..Self::default()
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RelayState> {
@@ -1147,10 +1278,20 @@ impl Relay {
         self.lock().pending.len()
     }
 
+    /// Whether `key`'s mirror is still answerable in this daemon run. A
+    /// mirror row left open by an earlier run is not (review WP75-R7).
+    pub fn is_open(&self, key: &str) -> bool {
+        self.lock().pending.contains_key(key)
+    }
+
     /// Keep-alives this relay holds: open asks plus decisions not yet taken.
     pub fn held(&self) -> usize {
         let st = self.lock();
-        st.pending.len() + st.outbox.iter().filter(|(_, h)| h.is_some()).count()
+        st.pending.len()
+            + st.decided
+                .values()
+                .filter(|(_, d)| d.hold.is_some())
+                .count()
     }
 
     fn mirror_key(key: &str) -> String {
@@ -1247,7 +1388,7 @@ impl Relay {
         if open {
             let fresh = {
                 let mut st = self.lock();
-                let fresh = !st.pending.contains_key(key);
+                let fresh = !st.pending.contains_key(key) && !st.decided.contains_key(key);
                 if fresh {
                     st.pending.insert(
                         key.to_string(),
@@ -1261,14 +1402,18 @@ impl Relay {
             };
             if fresh {
                 // §5.6: an unanswered ask times out as denied — the desktop's
-                // own bound fires there; here the mirror simply closes.
+                // own bound fires there; here the mirror closes, and a
+                // decision the desktop never took is retracted (review
+                // WP75-R7: an outbox entry lives no longer than its ask).
                 let relay = self.clone();
                 let pool = pool.clone();
                 let key = key.to_string();
                 let wait = Duration::from_millis((expires - now).max(0) as u64);
                 tokio::spawn(async move {
                     tokio::time::sleep(wait).await;
-                    relay.close(&pool, &key, "timed_out").await;
+                    relay.expire(&pool, &key).await;
+                    tokio::time::sleep(RELAY_ACK_GRACE).await;
+                    relay.forget(&key);
                 });
             }
         }
@@ -1276,12 +1421,79 @@ impl Relay {
     }
 
     /// Close a mirror ask that is over without a remote decision.
-    async fn close(&self, pool: &sqlx::SqlitePool, key: &str, _outcome: &str) {
+    async fn close(&self, pool: &sqlx::SqlitePool, key: &str) {
         let removed = self.lock().pending.remove(key);
         if removed.is_some() {
             if let Err(e) = super::resolve_by_key(pool, &Self::mirror_key(key)).await {
                 log::warn!(target: "ikenga::notifications", "relay close {key}: {e}");
             }
+        }
+    }
+
+    /// The ask's bound ran out: close an unanswered mirror; retract a
+    /// decision still queued (the desktop never took it, so it never took
+    /// effect).
+    async fn expire(&self, pool: &sqlx::SqlitePool, key: &str) {
+        self.close(pool, key).await;
+        let queued = self
+            .lock()
+            .decided
+            .get(key)
+            .is_some_and(|(_, d)| !d.delivered);
+        if queued {
+            self.retract(pool, key, "expired").await;
+        }
+    }
+
+    /// Drop a delivered decision's record once no report can come for it.
+    fn forget(&self, key: &str) {
+        let mut st = self.lock();
+        if st.decided.get(key).is_some_and(|(_, d)| d.delivered) {
+            st.decided.remove(key);
+        }
+    }
+
+    /// A remote decision did not take effect (review WP75-R2): drop it,
+    /// clear the mirror's `decided_*` (the row stays resolved — the ask is
+    /// over) and, if `permission.decided` was already written for it,
+    /// follow it with `permission.refused {reason: not_applied}` so the
+    /// chain never claims a decision that didn't happen.
+    async fn retract(&self, pool: &sqlx::SqlitePool, key: &str, outcome: &str) {
+        let _order = self.audit_order.lock().await;
+        let Some((_, d)) = self.lock().decided.remove(key) else {
+            return;
+        };
+        unclaim(pool, d.row_id, true).await;
+        super::publish(ChangeReason::Read, None);
+        if let (Some(store), Some(ev)) = (&self.store, d.audited) {
+            let fix = Event {
+                kind: "permission.refused",
+                detail: json!({}),
+                ..ev
+            }
+            .detail(json!({
+                "reason": "not_applied",
+                "outcome": outcome,
+                "decision": d.decision.decision,
+            }));
+            append_audit(store, &fix).await;
+        }
+    }
+
+    /// Write `permission.decided` for a queued remote decision (A-39:
+    /// audited once, by the daemon) — unless it was already retracted, in
+    /// which case nothing is claimed.
+    pub async fn audit_decided(&self, key: &str, ev: Event) {
+        let _order = self.audit_order.lock().await;
+        let live = match self.lock().decided.get_mut(key) {
+            Some((_, d)) => {
+                d.audited = Some(ev.clone());
+                true
+            }
+            None => false,
+        };
+        if let (true, Some(store)) = (live, &self.store) {
+            append_audit(store, &ev).await;
         }
     }
 
@@ -1296,7 +1508,18 @@ impl Relay {
             notified.as_mut().enable();
             let drained: Vec<RelayDecision> = {
                 let mut st = self.lock();
-                st.outbox.drain(..).map(|(d, _hold)| d).collect()
+                let mut out: Vec<(u64, RelayDecision)> = st
+                    .decided
+                    .values_mut()
+                    .filter(|(_, d)| !d.delivered)
+                    .map(|(seq, d)| {
+                        d.delivered = true;
+                        d.hold = None;
+                        (*seq, d.decision.clone())
+                    })
+                    .collect();
+                out.sort_by_key(|(seq, _)| *seq);
+                out.into_iter().map(|(_, d)| d).collect()
             };
             if !drained.is_empty() {
                 return json!({ "decisions": drained });
@@ -1308,8 +1531,9 @@ impl Relay {
     }
 
     /// `permission_relay_resolve {key, outcome}`: the desktop resolved or
-    /// timed out the ask itself — close the mirror, drop any decision still
-    /// queued for it.
+    /// timed out the ask itself — close the mirror. A remote decision for
+    /// the same ask, queued or delivered, did not take effect (the desktop
+    /// reports one it applied by saying nothing), so it is retracted.
     pub async fn resolve(
         &self,
         pool: &sqlx::SqlitePool,
@@ -1323,8 +1547,8 @@ impl Relay {
                 "outcome must be decided_on_host | timed_out | cancelled",
             ));
         }
-        self.lock().outbox.retain(|(d, _)| d.key != key);
-        self.close(pool, key, outcome).await;
+        self.retract(pool, key, outcome).await;
+        self.close(pool, key).await;
         // Already decided remotely: the row is resolved; nothing to do.
         let _ = super::resolve_by_key(pool, &Self::mirror_key(key)).await;
         Ok(json!({}))
@@ -1339,19 +1563,51 @@ impl Relay {
                 "the ask timed out before the decision reached the host",
             ));
         };
-        let _ = pending.row_id;
-        st.outbox.push_back((
-            RelayDecision {
-                key: key.to_string(),
-                decision: decision.as_str(),
-                decided_via: by.via,
-                decided_device: by.device_id.clone(),
-            },
-            Some(pending._hold),
-        ));
+        st.seq += 1;
+        let seq = st.seq;
+        st.decided.insert(
+            key.to_string(),
+            (
+                seq,
+                Decided {
+                    decision: RelayDecision {
+                        key: key.to_string(),
+                        decision: decision.as_str(),
+                        decided_via: by.via,
+                        decided_device: by.device_id.clone(),
+                        decided_by: by.principal_id.clone(),
+                    },
+                    row_id: pending.row_id,
+                    hold: Some(pending._hold),
+                    delivered: false,
+                    audited: None,
+                },
+            ),
+        );
         drop(st);
         self.notify.notify_one();
         Ok(())
+    }
+
+    /// Close every mirror row an earlier daemon run left open (review
+    /// WP75-R7): its relay state died with that run, so no decision on it
+    /// can reach the desktop. Run once, before this run's first put.
+    async fn sweep_stale(pool: &sqlx::SqlitePool) {
+        let now = now_ms();
+        let r = sqlx::query(
+            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
+             WHERE kind = 'permission' AND resolved_at IS NULL \
+               AND dedupe_key LIKE 'permission:relay:%'",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await;
+        match r {
+            Ok(done) if done.rows_affected() > 0 => super::publish(ChangeReason::Read, None),
+            Ok(_) => {}
+            Err(e) => log::warn!(target: "ikenga::notifications", "relay sweep: {e}"),
+        }
     }
 }
 
@@ -1397,6 +1653,19 @@ pub struct DaemonRouting {
     pub db: Arc<crate::db::PaDb>,
     pub store: AccessStore,
     pub relay: Arc<Relay>,
+    /// The boot sweep of an earlier run's mirror rows ran (review WP75-R7).
+    swept: tokio::sync::OnceCell<()>,
+}
+
+impl DaemonRouting {
+    /// The daemon's `ikenga.db` writer, opened lazily (the server's own
+    /// `pa_db` applies migrations on first use too; opening here at boot
+    /// would race it), with an earlier run's relay rows swept first.
+    pub async fn pool(&self) -> Result<sqlx::SqlitePool, AccessError> {
+        let pool = self.db.ensure_pool().await.map_err(AccessError::internal)?;
+        self.swept.get_or_init(|| Relay::sweep_stale(&pool)).await;
+        Ok(pool)
+    }
 }
 
 static DAEMON: OnceLock<DaemonRouting> = OnceLock::new();
@@ -1406,8 +1675,9 @@ static DAEMON: OnceLock<DaemonRouting> = OnceLock::new();
 pub fn install_daemon(store: AccessStore, data_dir: &Path) {
     let _ = DAEMON.set(DaemonRouting {
         db: Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db"))),
+        relay: Relay::with_store(store.clone()),
         store,
-        relay: Relay::new(),
+        swept: tokio::sync::OnceCell::new(),
     });
 }
 
@@ -1463,17 +1733,41 @@ pub async fn decide(
         // row can name one here.
         return Err(AccessError::new(Code::NotFound, "no such ask"));
     };
-    let pool = rt.db.ensure_pool().await.map_err(AccessError::internal)?;
+    let pool = rt.pool().await?;
+    decide_on_relay(&pool, &rt.relay, ctx, notification_id, decision).await
+}
+
+/// The daemon's decide over its relay: `decide_with`, then the audit — a
+/// remote decision's `permission.decided` goes through the relay, which
+/// can still retract it if the desktop never applies it (review WP75-R2).
+pub async fn decide_on_relay(
+    pool: &sqlx::SqlitePool,
+    relay: &Arc<Relay>,
+    ctx: &AccessCtx,
+    notification_id: i64,
+    decision: &str,
+) -> Result<Value, AccessError> {
     let report = decide_with(
-        &pool,
+        pool,
         &Decider::from_ctx(ctx),
         notification_id,
         decision,
-        &RelayResolvers(rt.relay.clone()),
+        &RelayResolvers(relay.clone()),
     )
     .await;
     if let Some(ev) = audit_event_for(Some(ctx), &report) {
-        append_audit(&rt.store, &ev).await;
+        let relayed = match (&report.result, report.row.as_ref()) {
+            (Ok(()), Some(row)) => match AskKey::parse(row.dedupe_key.as_deref().unwrap_or("")) {
+                AskKey::Relay { key } => Some(key),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (relayed, &relay.store) {
+            (Some(key), _) => relay.audit_decided(&key, ev).await,
+            (None, Some(store)) => append_audit(store, &ev).await,
+            (None, None) => {}
+        }
     }
     report.into_value()
 }
@@ -1533,11 +1827,11 @@ pub async fn relay_rpc(ctx: &AccessCtx, cmd: &str, args: &Value) -> Result<Value
             Ok(rt.relay.take(wait).await)
         }
         "permission_relay_put" => {
-            let pool = rt.db.ensure_pool().await.map_err(AccessError::internal)?;
+            let pool = rt.pool().await?;
             rt.relay.put(&pool, args).await
         }
         "permission_relay_resolve" => {
-            let pool = rt.db.ensure_pool().await.map_err(AccessError::internal)?;
+            let pool = rt.pool().await?;
             rt.relay.resolve(&pool, args).await
         }
         other => Err(AccessError::new(
@@ -1605,15 +1899,30 @@ fn row_from_json(v: &Value) -> Option<AskRow> {
 /// Annotate `permission` rows with `can_decide` / `waiting_on` for this
 /// request (§5.7). `rows` is `notifications_list`'s data (an array).
 pub fn annotate(ctx: &AccessCtx, rows: &mut Value) {
+    match daemon() {
+        Some(rt) => annotate_with(ctx, rows, &|key| rt.relay.is_open(key)),
+        None => annotate_with(ctx, rows, &|_| true),
+    }
+}
+
+/// [`annotate`] with an explicit "is this relay mirror live in this daemon
+/// run" check: an open mirror row whose ask the relay no longer holds (an
+/// earlier run's, review WP75-R7) reads as over.
+pub fn annotate_with(ctx: &AccessCtx, rows: &mut Value, relay_live: &dyn Fn(&str) -> bool) {
     let d = Decider::from_ctx(ctx);
     let Some(list) = rows.as_array_mut() else {
         return;
     };
     for v in list.iter_mut() {
-        let Some(row) = row_from_json(v) else {
+        let Some(mut row) = row_from_json(v) else {
             continue;
         };
         let key = AskKey::parse(row.dedupe_key.as_deref().unwrap_or(""));
+        if let AskKey::Relay { key } = &key {
+            if row.resolved_at.is_none() && !relay_live(key) {
+                row.resolved_at = Some(0);
+            }
+        }
         let answerable = matches!(
             key,
             AskKey::Hook { .. } | AskKey::Acp { .. } | AskKey::Relay { .. }
@@ -1824,6 +2133,25 @@ mod tests {
                 root,
                 Sensitivity::SENSITIVE,
             ),
+            // Shell quoting can't split a name apart (review WP75-R8).
+            (
+                "Bash",
+                json!({"command": "cat .e\"nv\""}),
+                root,
+                Sensitivity::SECRET,
+            ),
+            (
+                "Bash",
+                json!({"command": "cat '.e'nv.local"}),
+                root,
+                Sensitivity::SECRET,
+            ),
+            (
+                "Bash",
+                json!({"command": "cat ~/.s\\sh/config"}),
+                root,
+                Sensitivity::SECRET,
+            ),
         ];
         for (tool, input, root, want) in cases {
             assert_eq!(
@@ -1855,6 +2183,109 @@ mod tests {
         ] {
             assert_eq!(Sensitivity::from_level(s.level()), s);
         }
+    }
+
+    /// §5.3 rules 2 and 3 follow symlinks on the host that records the ask
+    /// (review WP75-R1): an in-project link to `~/.aws` or to `.env` is
+    /// secret material, a link out of the project is outside it, and a link
+    /// that stays inside stays NONE.
+    #[cfg(unix)]
+    #[test]
+    fn classifier_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let home = base.join("home");
+        let proj = base.join("proj");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::write(home.join(".aws/credentials"), "k").unwrap();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
+        std::fs::write(proj.join(".env"), "S=1").unwrap();
+        std::fs::write(proj.join("src/a.rs"), "").unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("notes.md"), "").unwrap();
+        symlink(home.join(".aws"), proj.join("config")).unwrap();
+        symlink(proj.join(".env"), proj.join("settings")).unwrap();
+        symlink(&elsewhere, proj.join("docs")).unwrap();
+        symlink(proj.join("src"), proj.join("lib")).unwrap();
+
+        let root = proj.to_string_lossy().to_string();
+        let root = Some(root.as_str());
+        let abs = |rel: &str| proj.join(rel).to_string_lossy().to_string();
+        let cases: &[(&str, Value, Sensitivity)] = &[
+            (
+                "Read",
+                json!({"file_path": abs("config/credentials")}),
+                Sensitivity::SECRET,
+            ),
+            (
+                "Read",
+                json!({"file_path": "config/credentials"}),
+                Sensitivity::SECRET,
+            ),
+            (
+                "Read",
+                json!({"file_path": "settings"}),
+                Sensitivity::SECRET,
+            ),
+            (
+                "Read",
+                json!({"file_path": abs("settings")}),
+                Sensitivity::SECRET,
+            ),
+            (
+                "Bash",
+                json!({"command": "cat settings"}),
+                Sensitivity::SECRET,
+            ),
+            (
+                "Read",
+                json!({"file_path": "docs/notes.md"}),
+                Sensitivity::SENSITIVE,
+            ),
+            (
+                "Write",
+                json!({"file_path": "docs/new.md"}),
+                Sensitivity::SENSITIVE,
+            ),
+            ("Read", json!({"file_path": "lib/a.rs"}), Sensitivity::NONE),
+            ("Read", json!({"file_path": "src/a.rs"}), Sensitivity::NONE),
+            (
+                "Write",
+                json!({"file_path": "src/new.rs"}),
+                Sensitivity::NONE,
+            ),
+        ];
+        for (tool, input, want) in cases {
+            assert_eq!(
+                classify_with(tool, input, root, &none),
+                *want,
+                "{tool} {input}"
+            );
+        }
+        // A root reached through a symlink classifies the same way.
+        let alias = base.join("alias");
+        symlink(&proj, &alias).unwrap();
+        let alias_root = alias.to_string_lossy().to_string();
+        assert_eq!(
+            classify_with(
+                "Read",
+                &json!({"file_path": "src/a.rs"}),
+                Some(&alias_root),
+                &none
+            ),
+            Sensitivity::NONE
+        );
+        assert_eq!(
+            classify_with(
+                "Read",
+                &json!({"file_path": "config/credentials"}),
+                Some(&alias_root),
+                &none
+            ),
+            Sensitivity::SECRET
+        );
     }
 
     #[test]
@@ -1957,7 +2388,15 @@ mod tests {
             share_headers: false,
             caps,
             admin_strength: tier == Tier::Full,
-            meta: RequestMeta::default(),
+            meta: RequestMeta {
+                routing_withheld_approve: crate::access::ctx::routing_withheld_approve(
+                    crate::access::caps::RoleContext::OwnWorkspace,
+                    tier,
+                    CapSet::ALL,
+                    routing_ok,
+                ),
+                ..Default::default()
+            },
         }
     }
 
@@ -1995,6 +2434,39 @@ mod tests {
         }
     }
 
+    const FIXTURE_SOCKET: u64 = 0;
+
+    /// Review WP75-R11: two sockets on one thread keep their own contexts;
+    /// one closing leaves the other's; disagreeing live contexts fail
+    /// closed (no member, no project, no root).
+    #[test]
+    fn prompt_contexts_are_per_socket() {
+        let (owner, member) = (prompt_socket(), prompt_socket());
+        let own = PromptContext {
+            requested_by: None,
+            project_id: Some("royalti-co".into()),
+            project_root: Some("/srv/owner/royalti-co".into()),
+        };
+        let ada = PromptContext {
+            requested_by: Some("ada".into()),
+            ..own.clone()
+        };
+        set_prompt_context("th-sock", owner, own.clone());
+        assert_eq!(prompt_context("th-sock"), Some(own.clone()));
+        set_prompt_context("th-sock", member, ada.clone());
+        assert_eq!(prompt_context("th-sock"), Some(PromptContext::default()));
+        clear_prompt_context("th-sock", owner);
+        assert_eq!(
+            prompt_context("th-sock"),
+            Some(ada.clone()),
+            "the member's survives"
+        );
+        set_prompt_context("th-sock", member, ada.clone());
+        assert_eq!(prompt_context("th-sock"), Some(ada));
+        clear_prompt_context("th-sock", member);
+        assert_eq!(prompt_context("th-sock"), None);
+    }
+
     /// The T1 fixture producer (DEC-83 / §5.5 (c)): an ask raised by a
     /// member's dispatch in the Owner's child, attributed the way `chat_ws`
     /// captures it at the handshake.
@@ -2007,6 +2479,7 @@ mod tests {
     ) -> i64 {
         set_prompt_context(
             thread,
+            FIXTURE_SOCKET,
             PromptContext {
                 requested_by: Some("ada".into()),
                 project_id: Some("royalti-co".into()),
@@ -2061,7 +2534,7 @@ mod tests {
         let routing = &v[0]["action"]["routing"];
         assert_eq!(routing["sensitive"], 2);
         assert_eq!(routing["requestedBy"], "ada");
-        clear_prompt_context("thread-attr");
+        clear_prompt_context("thread-attr", FIXTURE_SOCKET);
         assert!(prompt_context("thread-attr").is_none());
     }
 
@@ -2156,6 +2629,7 @@ mod tests {
             caps: CapSet::ALL,
             tier: Tier::Full,
             share: None,
+            routing_withheld: false,
         };
         let r = decide_with(&pool, &owner, secret, "allow_always_project", &spy).await;
         assert!(r.result.is_ok(), "{:?}", r.result);
@@ -2183,7 +2657,7 @@ mod tests {
         .id;
         let r = decide_with(&pool, &op_off, other, "deny", &spy).await;
         assert_eq!(r.result.unwrap_err().code, Code::NotFound);
-        clear_prompt_context("t1");
+        clear_prompt_context("t1", FIXTURE_SOCKET);
     }
 
     /// A-23: under `this_device`, any other credential is refused
@@ -2397,7 +2871,8 @@ mod tests {
         assert_eq!(
             taken["decisions"],
             json!([{"key": "permission:acp:th:r1", "decision": "allow_always_project",
-                    "decidedVia": "device", "decidedDevice": "phone"}])
+                    "decidedVia": "device", "decidedDevice": "phone",
+                    "decidedBy": phone.principal_id.to_string()}])
         );
         assert_eq!(relay.held(), 0);
         // A second take waits, then answers empty.
@@ -2476,6 +2951,168 @@ mod tests {
         )
         .await;
         assert_eq!(r.result.unwrap_err().code, Code::Conflict);
+    }
+
+    async fn audit_rows(store: &AccessStore) -> Vec<(String, Value)> {
+        sqlx::query("SELECT kind, detail FROM audit_events ORDER BY seq")
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let detail: String = r.get("detail");
+                (r.get("kind"), serde_json::from_str(&detail).unwrap())
+            })
+            .collect()
+    }
+
+    fn relay_put(key: &str, ttl_ms: i64) -> Value {
+        json!({"key": key, "title": "Claude wants to use Edit", "sensitive": 0,
+               "expiresAtMs": now_ms() + ttl_ms})
+    }
+
+    /// Review WP75-R2: a remote decision is audited once when it is made;
+    /// if it never takes effect on the desktop — reported back
+    /// (`permission_relay_resolve`), or never taken before the ask expired
+    /// — the daemon follows it with `permission.refused {not_applied}` and
+    /// clears the mirror's `decided_*`. One the desktop applied stands.
+    #[tokio::test]
+    async fn a_remote_decision_that_never_applies_is_retracted() {
+        let (_t, pool) = db().await;
+        let store = AccessStore::memory_t0().await;
+        let relay = Relay::with_store(store.clone());
+        let phone = owner_device(Tier::Approve, true);
+        let id_of = |v: Value| v["id"].as_i64().unwrap();
+        // Rows the store wrote for itself before this test's.
+        let n0 = audit_rows(&store).await.len();
+
+        // 1. Applied: taken, no report — the decision stands.
+        let a = id_of(
+            relay
+                .put(&pool, &relay_put("permission:hook:a", 30_000))
+                .await
+                .unwrap(),
+        );
+        decide_on_relay(&pool, &relay, &phone, a, "allow_once")
+            .await
+            .unwrap();
+        assert_eq!(
+            relay.take(100).await["decisions"][0]["key"],
+            "permission:hook:a"
+        );
+        let rows = audit_rows(&store).await;
+        assert_eq!(rows.len(), n0 + 1);
+        assert_eq!(rows[n0].0, "permission.decided");
+        assert_eq!(row_cols(&pool, a).await.2.as_deref(), Some("device"));
+
+        // 2. Taken, then the desktop reports it was too late.
+        let b = id_of(
+            relay
+                .put(&pool, &relay_put("permission:hook:b", 30_000))
+                .await
+                .unwrap(),
+        );
+        decide_on_relay(&pool, &relay, &phone, b, "allow_once")
+            .await
+            .unwrap();
+        relay.take(100).await;
+        relay
+            .resolve(
+                &pool,
+                &json!({"key": "permission:hook:b", "outcome": "timed_out"}),
+            )
+            .await
+            .unwrap();
+        let rows = audit_rows(&store).await;
+        assert_eq!(rows.len(), n0 + 3);
+        assert_eq!(rows[n0 + 2].0, "permission.refused");
+        assert_eq!(rows[n0 + 2].1["reason"], "not_applied");
+        assert_eq!(rows[n0 + 2].1["outcome"], "timed_out");
+        assert_eq!(rows[n0 + 2].1["decision"], "allow_once");
+        let (resolved, by, via, device) = row_cols(&pool, b).await;
+        assert!(resolved.is_some(), "the ask is over");
+        assert_eq!((by, via, device), (None, None, None), "no phantom decision");
+        // A second report is a no-op.
+        relay
+            .resolve(
+                &pool,
+                &json!({"key": "permission:hook:b", "outcome": "cancelled"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(audit_rows(&store).await.len(), n0 + 3);
+
+        // 3. Queued, never taken, the ask expires: the outbox entry (and
+        // its keep-alive) goes with it, retracted.
+        let c = id_of(
+            relay
+                .put(&pool, &relay_put("permission:hook:c", 150))
+                .await
+                .unwrap(),
+        );
+        decide_on_relay(&pool, &relay, &phone, c, "deny")
+            .await
+            .unwrap();
+        assert_eq!(relay.held(), 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(relay.held(), 0, "an expired decision holds nothing");
+        assert_eq!(relay.take(10).await["decisions"], json!([]));
+        let rows = audit_rows(&store).await;
+        assert_eq!(rows.len(), n0 + 5);
+        assert_eq!(rows[n0 + 4].0, "permission.refused");
+        assert_eq!(rows[n0 + 4].1["outcome"], "expired");
+        assert_eq!(row_cols(&pool, c).await.1, None);
+    }
+
+    /// Review WP75-R7: mirror rows an earlier daemon run left open are
+    /// swept, and read as over until then.
+    #[tokio::test]
+    async fn an_earlier_runs_relay_rows_are_not_live() {
+        let (_t, pool) = db().await;
+        let stale = record_ask(
+            &pool,
+            ask("permission:relay:permission:hook:old"),
+            &Attribution::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+        let relay = Relay::new();
+        let fresh = relay
+            .put(&pool, &relay_put("permission:hook:new", 30_000))
+            .await
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let mut rows = serde_json::to_value(
+            super::super::list(&pool, &Default::default())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        annotate_with(&owner_device(Tier::Full, true), &mut rows, &|k| {
+            relay.is_open(k)
+        });
+        let by_id = |id: i64| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(stale)["can_decide"], false);
+        assert_eq!(by_id(stale)["waiting_on"], Value::Null);
+        assert_eq!(by_id(fresh)["can_decide"], true);
+
+        Relay::sweep_stale(&pool).await;
+        assert!(load_ask(&pool, stale)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_some());
     }
 
     /// The take wakes as soon as a decision is queued.
@@ -2602,35 +3239,62 @@ mod tests {
         );
     }
 
+    /// A-23 / review WP75-R5: `routing_refused` only when routing removed
+    /// `approve` — not when the tier, the role or a per-member override
+    /// row did.
     #[test]
     fn routing_removal_is_told_apart_from_tier_and_role() {
-        let all = CapSet::ALL.without(Cap::Approve);
-        assert!(approve_removed_by_routing(all, Tier::Full, None));
-        assert!(!approve_removed_by_routing(
-            Tier::Dispatch.caps(),
-            Tier::Dispatch,
-            None
-        ));
-        assert!(!approve_removed_by_routing(CapSet::ALL, Tier::Full, None));
-        let share = |role| ShareCtx {
-            project_key: "o/p".into(),
-            project_id: "p".into(),
-            member_principal_id: None,
-            member_device_id: None,
-            role: Some(role),
-            artifact_path: None,
-            owner_approval: true,
+        use crate::access::caps::RoleContext;
+        use crate::access::ctx::routing_withheld_approve as withheld;
+        let own = RoleContext::OwnWorkspace;
+        assert!(withheld(own, Tier::Full, CapSet::ALL, false));
+        assert!(!withheld(own, Tier::Full, CapSet::ALL, true));
+        assert!(!withheld(own, Tier::Dispatch, CapSet::ALL, false));
+        let share = |role: Role, row: CapSet| RoleContext::Share {
+            role,
+            row,
+            artifact_scope: false,
         };
-        assert!(approve_removed_by_routing(
-            all,
+        let op = share(Role::Operator, Role::Operator.default_caps());
+        assert!(withheld(op, Tier::Approve, CapSet::ALL, false));
+        let rev = share(Role::Reviewer, Role::Reviewer.default_caps());
+        assert!(!withheld(rev, Tier::Approve, CapSet::ALL, false));
+        // The project's override row took approve away from Operators: a
+        // plain `forbidden`, even with routing also withholding it.
+        let overridden = share(
+            Role::Operator,
+            Role::Operator.default_caps().without(Cap::Approve),
+        );
+        assert!(!withheld(overridden, Tier::Approve, CapSet::ALL, false));
+        // The share ceiling took it away: likewise.
+        assert!(!withheld(
+            op,
             Tier::Approve,
-            Some(&share(Role::Operator))
+            CapSet::ALL.without(Cap::Approve),
+            false
         ));
-        assert!(!approve_removed_by_routing(
-            all,
-            Tier::Approve,
-            Some(&share(Role::Reviewer))
-        ));
+
+        // And the decide core reads the recorded bit.
+        let mut ctx = member(Role::Operator, Tier::Approve, false);
+        ctx.caps = ctx.caps.without(Cap::Approve);
+        let row = AskRow {
+            id: 1,
+            dedupe_key: Some("permission:relay:permission:hook:a".into()),
+            title: "t".into(),
+            resolved_at: None,
+            project_id: Some("royalti-co".into()),
+            requested_by: None,
+            sensitivity: Sensitivity::NONE,
+        };
+        assert_eq!(
+            can_decide(&Decider::from_ctx(&ctx), &row, None),
+            Err(Refusal::MissingApprove)
+        );
+        ctx.meta.routing_withheld_approve = true;
+        assert_eq!(
+            can_decide(&Decider::from_ctx(&ctx), &row, None),
+            Err(Refusal::RoutingRefused)
+        );
     }
 
     #[tokio::test]

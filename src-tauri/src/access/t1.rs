@@ -150,10 +150,13 @@ impl T1Access {
             Some(s) => (s.context, s.ceiling),
             None => (RoleContext::OwnWorkspace, CapSet::ALL),
         };
-        let caps = if matches!(via, Via::Operator) {
-            CapSet::EMPTY
+        let (caps, routing_withheld_approve) = if matches!(via, Via::Operator) {
+            (CapSet::EMPTY, false)
         } else {
-            caps::effective(context, tier, ceiling, routing_ok)
+            (
+                caps::effective(context, tier, ceiling, routing_ok),
+                super::ctx::routing_withheld_approve(context, tier, ceiling, routing_ok),
+            )
         };
         let (share, owner) = match selected {
             Some(s) => (Some(s.share), Some(s.owner)),
@@ -166,6 +169,7 @@ impl T1Access {
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
+            routing_withheld_approve,
             ..Default::default()
         }
         .with_host_from(&parts.headers);

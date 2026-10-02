@@ -40,9 +40,13 @@ export type RoutingNote =
 	| { kind: 'elsewhere'; device: string | null }
 	| { kind: 'any'; approvers: string[] };
 
-/** Devices that may answer under "any paired device" (tier holds approve). */
+/** Paired devices that may answer under "any paired device" (tier holds
+ *  approve). The host is not a paired device, so it is not listed (D-05
+ *  `approveNote`: "Right now that is ned-macbook"). */
 export function approverNames(devices: readonly DeviceView[]): string[] {
-	return devices.filter((d) => TIER_CAPS[d.tier].includes('approve')).map((d) => d.name);
+	return devices
+		.filter((d) => d.kind !== 'host' && TIER_CAPS[d.tier].includes('approve'))
+		.map((d) => d.name);
 }
 
 /** What the rule box under the control says (D-05 `approveNote`). */
