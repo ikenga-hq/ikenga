@@ -364,7 +364,9 @@ async fn auth_middleware(
             .get("user-agent")
             .and_then(|h| h.to_str().ok())
             .map(str::to_string),
-    };
+        ..Default::default()
+    }
+    .with_host_from(req.headers());
     let insecure = access.options.insecure_cookie;
     let mut set_cookie: Option<String> = None;
     let mut ctx = None;

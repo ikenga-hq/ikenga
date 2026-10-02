@@ -69,16 +69,30 @@ pub struct T1Access {
     pub pool: SqlitePool,
     pub seen: SeenGate,
     pub options: AccessOptions,
+    /// The broker's pairing sessions (§3.1, WP-74b): in memory only.
+    pub pairing: Arc<super::pairing::Registry>,
 }
 
 impl T1Access {
     pub fn new(store: AccessStore, pool: SqlitePool, options: AccessOptions) -> Arc<Self> {
+        let pairing = super::pairing::Registry::new();
+        super::pairing::spawn_sweeper(&pairing, store.clone());
         Arc::new(Self {
             store,
             pool,
             seen: SeenGate::default(),
             options,
+            pairing,
         })
+    }
+
+    /// The public `/access/pair/*` endpoints' state (§3.1, WP-74b).
+    pub fn pairing_host(&self) -> super::http::PairingHost {
+        super::http::PairingHost {
+            registry: self.pairing.clone(),
+            store: self.store.clone(),
+            insecure_cookie: self.options.insecure_cookie,
+        }
     }
 
     /// The tier a resolved credential carries (§1.3): a password session is
@@ -151,7 +165,9 @@ impl T1Access {
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string),
-        };
+            ..Default::default()
+        }
+        .with_host_from(&parts.headers);
         Ok(BrokerCtx {
             access: AccessCtx {
                 principal_id: ctx.principal.id,
@@ -409,6 +425,7 @@ impl AccessHandler for BrokerAccess {
             let env = Env {
                 tier: StoreTier::T1,
                 store: Some(&self.t1.store),
+                pairing: Some(&self.t1.pairing),
                 sockets: &sockets,
                 principal: PrincipalInfo {
                     username: principal

@@ -22,24 +22,30 @@
 //!
 //! Stub modules later waves fill (§9.2): [`routing`] (WP-75), [`members`],
 //! [`invites`], [`policy`], [`share`] (WP-76), and `audit::{list, export,
-//! absorb, reseal}` (WP-77). Pairing (`access::pairing`, SPAKE2, the
-//! fingerprint) is WP-74b.
+//! absorb, reseal}` (WP-77).
+//!
+//! WP-74b adds pairing: [`pairing`] (the registry, the `access_pair_*` arms
+//! and the public endpoint bodies), [`spake`] (SPAKE2, key confirmation)
+//! and [`fingerprint`] (the 4-word phrase).
 
 pub mod audit;
 pub mod caps;
 pub mod caps_ts;
 pub mod ctx;
 pub mod devices;
+pub mod fingerprint;
 pub mod http;
 pub mod invites;
 pub mod members;
 pub mod migrations;
+pub mod pairing;
 pub mod policy;
 pub mod routing;
 pub mod rpc;
 pub mod rpc_requirements;
 pub mod share;
 pub mod sockets;
+pub mod spake;
 pub mod store;
 #[cfg(test)]
 mod t0_tests;
@@ -275,6 +281,8 @@ pub struct DaemonAccess {
     pub sockets: Arc<sockets::Registry>,
     pub seen: devices::SeenGate,
     pub options: AccessOptions,
+    /// Open pairing sessions (§3.1, WP-74b). Only used with a store.
+    pub pairing: Arc<pairing::Registry>,
 }
 
 impl std::fmt::Debug for DaemonAccess {
@@ -292,6 +300,10 @@ impl DaemonAccess {
             .as_ref()
             .and_then(|s| s.meta().owner_principal_id)
             .unwrap_or_else(PrincipalId::new_v7);
+        let registry = pairing::Registry::new();
+        if let Some(store) = &store {
+            pairing::spawn_sweeper(&registry, store.clone());
+        }
         Arc::new(Self {
             mode,
             store,
@@ -300,6 +312,20 @@ impl DaemonAccess {
             sockets: sockets::Registry::new(),
             seen: devices::SeenGate::default(),
             options,
+            pairing: registry,
+        })
+    }
+
+    /// The public `/access/pair/*` endpoints' state: T0 with a store only
+    /// (a principal child never pairs; no store, no pairing).
+    pub fn pairing_host(&self) -> Option<http::PairingHost> {
+        if self.mode != DaemonMode::T0 {
+            return None;
+        }
+        self.store.as_ref().map(|store| http::PairingHost {
+            registry: self.pairing.clone(),
+            store: store.clone(),
+            insecure_cookie: self.options.insecure_cookie,
         })
     }
 

@@ -23,6 +23,7 @@ import { Route as OnboardingRouteRouteImport } from './routes/onboarding/route'
 import { Route as ClaudeRouteRouteImport } from './routes/claude/route'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as SettingsIndexRouteImport } from './routes/settings/index'
+import { Route as RemoteIndexRouteImport } from './routes/remote/index'
 import { Route as ProjectIndexRouteImport } from './routes/project/index'
 import { Route as OnboardingIndexRouteImport } from './routes/onboarding/index'
 import { Route as NgwaIndexRouteImport } from './routes/ngwa/index'
@@ -49,6 +50,7 @@ import { Route as SettingsAgentRouteImport } from './routes/settings/agent'
 import { Route as SettingsActivityBarRouteImport } from './routes/settings/activity-bar'
 import { Route as SettingsActionsRouteImport } from './routes/settings/actions'
 import { Route as SettingsAboutRouteImport } from './routes/settings/about'
+import { Route as RemotePairRouteImport } from './routes/remote/pair'
 import { Route as ProjectsNewArtifactRouteImport } from './routes/projects/new-artifact'
 import { Route as ProjectDashboardRouteImport } from './routes/project/dashboard'
 import { Route as PackagesBrowseRouteImport } from './routes/packages_.browse'
@@ -156,6 +158,11 @@ const SettingsIndexRoute = SettingsIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => SettingsRouteRoute,
+} as any)
+const RemoteIndexRoute = RemoteIndexRouteImport.update({
+  id: '/remote/',
+  path: '/remote/',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectIndexRoute = ProjectIndexRouteImport.update({
   id: '/project/',
@@ -286,6 +293,11 @@ const SettingsAboutRoute = SettingsAboutRouteImport.update({
   id: '/about',
   path: '/about',
   getParentRoute: () => SettingsRouteRoute,
+} as any)
+const RemotePairRoute = RemotePairRouteImport.update({
+  id: '/remote/pair',
+  path: '/remote/pair',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectsNewArtifactRoute = ProjectsNewArtifactRouteImport.update({
   id: '/projects/new-artifact',
@@ -519,6 +531,7 @@ export interface FileRoutesByFullPath {
   '/packages/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
@@ -545,6 +558,7 @@ export interface FileRoutesByFullPath {
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
   '/project/': typeof ProjectIndexRoute
+  '/remote/': typeof RemoteIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
@@ -595,6 +609,7 @@ export interface FileRoutesByTo {
   '/packages/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
@@ -621,6 +636,7 @@ export interface FileRoutesByTo {
   '/ngwa': typeof NgwaIndexRoute
   '/onboarding': typeof OnboardingIndexRoute
   '/project': typeof ProjectIndexRoute
+  '/remote': typeof RemoteIndexRoute
   '/settings': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
@@ -675,6 +691,7 @@ export interface FileRoutesById {
   '/packages_/browse': typeof PackagesBrowseRoute
   '/project/dashboard': typeof ProjectDashboardRoute
   '/projects/new-artifact': typeof ProjectsNewArtifactRoute
+  '/remote/pair': typeof RemotePairRoute
   '/settings/about': typeof SettingsAboutRoute
   '/settings/actions': typeof SettingsActionsRouteWithChildren
   '/settings/activity-bar': typeof SettingsActivityBarRoute
@@ -701,6 +718,7 @@ export interface FileRoutesById {
   '/ngwa/': typeof NgwaIndexRoute
   '/onboarding/': typeof OnboardingIndexRoute
   '/project/': typeof ProjectIndexRoute
+  '/remote/': typeof RemoteIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/artifacts/by-kind/$kind': typeof ArtifactsByKindKindRoute
   '/ngwa/item/$itemId': typeof NgwaItemItemIdRoute
@@ -756,6 +774,7 @@ export interface FileRouteTypes {
     | '/packages/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
     | '/settings/activity-bar'
@@ -782,6 +801,7 @@ export interface FileRouteTypes {
     | '/ngwa/'
     | '/onboarding/'
     | '/project/'
+    | '/remote/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
@@ -832,6 +852,7 @@ export interface FileRouteTypes {
     | '/packages/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
     | '/settings/activity-bar'
@@ -858,6 +879,7 @@ export interface FileRouteTypes {
     | '/ngwa'
     | '/onboarding'
     | '/project'
+    | '/remote'
     | '/settings'
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
@@ -911,6 +933,7 @@ export interface FileRouteTypes {
     | '/packages_/browse'
     | '/project/dashboard'
     | '/projects/new-artifact'
+    | '/remote/pair'
     | '/settings/about'
     | '/settings/actions'
     | '/settings/activity-bar'
@@ -937,6 +960,7 @@ export interface FileRouteTypes {
     | '/ngwa/'
     | '/onboarding/'
     | '/project/'
+    | '/remote/'
     | '/settings/'
     | '/artifacts/by-kind/$kind'
     | '/ngwa/item/$itemId'
@@ -979,9 +1003,11 @@ export interface RootRouteChildren {
   PackagesBrowseRoute: typeof PackagesBrowseRoute
   ProjectDashboardRoute: typeof ProjectDashboardRoute
   ProjectsNewArtifactRoute: typeof ProjectsNewArtifactRoute
+  RemotePairRoute: typeof RemotePairRoute
   ChiIndexRoute: typeof ChiIndexRoute
   NgwaIndexRoute: typeof NgwaIndexRoute
   ProjectIndexRoute: typeof ProjectIndexRoute
+  RemoteIndexRoute: typeof RemoteIndexRoute
   ArtifactsByKindKindRoute: typeof ArtifactsByKindKindRoute
   NgwaItemItemIdRoute: typeof NgwaItemItemIdRoute
 }
@@ -1085,6 +1111,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/settings/'
       preLoaderRoute: typeof SettingsIndexRouteImport
       parentRoute: typeof SettingsRouteRoute
+    }
+    '/remote/': {
+      id: '/remote/'
+      path: '/remote'
+      fullPath: '/remote/'
+      preLoaderRoute: typeof RemoteIndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/project/': {
       id: '/project/'
@@ -1267,6 +1300,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/settings/about'
       preLoaderRoute: typeof SettingsAboutRouteImport
       parentRoute: typeof SettingsRouteRoute
+    }
+    '/remote/pair': {
+      id: '/remote/pair'
+      path: '/remote/pair'
+      fullPath: '/remote/pair'
+      preLoaderRoute: typeof RemotePairRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/projects/new-artifact': {
       id: '/projects/new-artifact'
@@ -1692,9 +1732,11 @@ const rootRouteChildren: RootRouteChildren = {
   PackagesBrowseRoute: PackagesBrowseRoute,
   ProjectDashboardRoute: ProjectDashboardRoute,
   ProjectsNewArtifactRoute: ProjectsNewArtifactRoute,
+  RemotePairRoute: RemotePairRoute,
   ChiIndexRoute: ChiIndexRoute,
   NgwaIndexRoute: NgwaIndexRoute,
   ProjectIndexRoute: ProjectIndexRoute,
+  RemoteIndexRoute: RemoteIndexRoute,
   ArtifactsByKindKindRoute: ArtifactsByKindKindRoute,
   NgwaItemItemIdRoute: NgwaItemItemIdRoute,
 }
