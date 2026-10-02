@@ -217,6 +217,13 @@ pub struct AppState {
     /// resolved; those arms then answer the desktop's "cannot resolve store
     /// root". Single-user seam (G-PRINCIPAL / WP-20), same as `home`.
     pub(crate) store: Option<PathBuf>,
+    /// The `secrets_*` arms' two layers (remote-access WP-21): in a T1
+    /// principal child, the principal's own store under `<data>/secrets/`
+    /// over the `IKENGA_SECRET_*` operator default; elsewhere the operator
+    /// default alone, as before. Built once, here, because building it takes
+    /// the broker's wrapping key out of the process environment before
+    /// anything is spawned. See `crate::secrets_env`.
+    pub(crate) secrets: Arc<crate::secrets_env::DaemonSecrets>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -626,6 +633,10 @@ fn build_router(
         _ => None,
     };
     let allowed_origins = config.allowed_origins.clone();
+    let secrets = Arc::new(crate::secrets_env::DaemonSecrets::for_daemon(
+        config.data_dir.as_deref(),
+        config.executor_tier,
+    ));
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -639,6 +650,7 @@ fn build_router(
         path_guard,
         actions,
         store,
+        secrets,
         shutdown_tx,
     });
 

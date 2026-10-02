@@ -336,12 +336,21 @@ async fn main() -> anyhow::Result<()> {
     // pair of braces, and the one that also covers anything else the process
     // may spawn later.
     //
-    // TRAP FOR LATER: this runs BEFORE `run_server`, so anything downstream
-    // that expects to read these from the environment will find them gone.
-    // `IKENGA_AUTH_TOKEN` is safe because clap has already put it in `config`;
-    // `IKENGA_VAULT_KEY` currently has no reader at all. When a headless vault
-    // lands it must capture the value HERE, into `config`, rather than calling
-    // `env::var` inside `run_server` — that call will always return `Err`.
+    // This runs BEFORE `run_server`, so nothing downstream can read these
+    // from the environment. `IKENGA_AUTH_TOKEN` is safe because clap has
+    // already put it in `config`. `IKENGA_VAULT_KEY` is the desktop vault's
+    // unlock key and has no reader in the daemon; it is stripped only so a
+    // stray one can't leak into a child.
+    //
+    // The headless per-principal secret store does NOT use it (WP-21). Its
+    // key is `IKENGA_PRINCIPAL_SECRETS_KEY` (`secrets::principal_store::
+    // WRAP_KEY_ENV`), which the broker sets on each T1 principal child it
+    // launches. It is deliberately NOT in this list: the child takes it while
+    // building `AppState` (`DaemonSecrets::for_daemon` → `WrapKey::take_from_env`),
+    // which reads it once, zeroes the value in the environment block and
+    // unsets it before anything is spawned — in every tier, so it never
+    // outlives startup. `pty::is_host_only_env` filters it from PTYs as well.
+    // Adding it here would make that read always fail.
     //
     // Safety: single-threaded here — the Tokio worker pool is running but no
     // task of ours has started, and `run_server` is called below.
@@ -890,7 +899,10 @@ mod tests {
             "--member-invites-create-accounts",
         ])
         .unwrap();
-        assert_eq!(args.serve.public_url.as_deref(), Some("https://ik.example.ts.net"));
+        assert_eq!(
+            args.serve.public_url.as_deref(),
+            Some("https://ik.example.ts.net")
+        );
         assert_eq!(args.serve.max_accounts, Some(25));
         assert_eq!(args.serve.invite_ttl, Some(30));
         assert!(args.serve.member_invites_create_accounts);

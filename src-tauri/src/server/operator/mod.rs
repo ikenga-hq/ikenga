@@ -7,6 +7,7 @@
 //! ```text
 //! <root>/                     root:root 0755
 //! ├── operator/               root:root 0700   accounts.db (0600), sessions.db, daemon.json, probe.json
+//! │                                            secrets-kek (0600, WP-21)
 //! └── principals/             root:root 0711   traverse, no listing
 //!     └── <principal_id>/     uid:gid   0700
 //!         ├── home/           uid:gid   0700   the passwd home
@@ -34,6 +35,8 @@
 //!   G-ACCESS R-10's archiving of the T0 access store).
 //! * [`safe_fs`] — fd-relative, never-follow-a-symlink walks for root over
 //!   trees another uid controls (used by [`adopt_t0`]).
+//! * [`secrets_kek`] — `operator/secrets-kek`, the root-held master KEK of
+//!   every principal's secret store (remote-access WP-21, DEC-R18-1).
 
 pub mod accounts;
 pub mod adopt_t0;
@@ -46,6 +49,7 @@ pub mod probe;
 pub mod provision;
 pub mod reaper;
 mod safe_fs;
+pub mod secrets_kek;
 mod sys;
 
 use std::fs;

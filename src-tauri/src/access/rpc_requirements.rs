@@ -74,6 +74,12 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("secrets_delete", req!(owner[Settings, Secrets])),
     ("secrets_set_scoped", req!(owner[Settings, Secrets])),
     ("secrets_delete_scoped", req!(owner[Settings, Secrets])),
+    // WP-20-tagged lock family, served by WP-21 (§1.6 row "WP-20-tagged,
+    // served by WP-21 in W3"; X-1). Names confirmed against WP-21's arm.
+    ("secrets_lock_state", req!(owner[])),
+    ("secrets_lock", req!(owner[Settings])),
+    ("secrets_unlock", req!(owner[Settings, Secrets])),
+    ("secrets_set_passphrase", req!(owner[Settings, Secrets])),
     // ── supabase ──
     ("supabase_config_get", req!(owner[Secrets])),
     ("supabase_config_set", req!(owner[Settings, Secrets])),
@@ -241,11 +247,12 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("permission_relay_resolve", req!(operator)),
 ];
 
-/// The §1.6 defaults for the `WP-20`-tagged verbs remote-access **WP-21**
-/// serves in W3. Not arms on WP-74a's base yet, so they are NOT in
-/// [`RPC_REQUIREMENTS`] (A-1 refuses a row that names no arm). When WP-21
-/// merges first (X-1), WP-74a moves each served one into the table above,
-/// after confirming its name against WP-21's arms.
+/// The §1.6 defaults for the `WP-20`-tagged verbs WP-21 did **not** serve.
+/// Not arms yet, so they are NOT in [`RPC_REQUIREMENTS`] (A-1 refuses a row
+/// that names no arm). WP-21 served the four `secrets_*` lock verbs, which
+/// moved into the table above (X-1); `app_lock_*` stays desktop-only (its
+/// PIN record is `app-lock.json`, not the secrets store) and `fs_roots_*`
+/// is not WP-21's. Whichever WP serves one of these moves its row up.
 pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_status", req!(owner[])),
     ("app_lock_clear_secret", req!(owner[Settings])),
@@ -255,10 +262,6 @@ pub const PENDING_WP21: &[(&str, Requirement)] = &[
     ("app_lock_touch", req!(owner[Settings])),
     ("app_lock_unlock", req!(owner[Settings])),
     ("app_lock_unlock_biometric", req!(owner[Settings])),
-    ("secrets_lock_state", req!(owner[])),
-    ("secrets_lock", req!(owner[Settings])),
-    ("secrets_unlock", req!(owner[Settings, Secrets])),
-    ("secrets_set_passphrase", req!(owner[Settings, Secrets])),
     ("fs_roots_add", req!(operator)),
     ("fs_roots_remove", req!(operator)),
     ("fs_roots_reset", req!(operator)),
