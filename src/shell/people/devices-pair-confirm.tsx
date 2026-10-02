@@ -263,7 +263,7 @@ export function PairConfirm({
 				<div className="flex items-center gap-2 border-b border-[var(--border-soft)] px-4 py-3">
 					<h2
 						id="pair-confirm-title"
-						className="m-0 text-[length:var(--text-h4)] font-semibold"
+						className="m-0 text-[length:var(--text-h3)] font-semibold"
 						style={{ fontFamily: 'var(--font-display)' }}
 					>
 						A device wants to pair
@@ -326,7 +326,7 @@ export function PairConfirm({
 						type="button"
 						disabled={busy}
 						onClick={() => void decide('deny')}
-						className={`${D05_DANGER} rounded-md border px-3 py-1.5 text-[length:var(--text-body-sm)] disabled:opacity-50`}
+						className={`${D05_DANGER} h-[var(--btn-h-sm,26px)] rounded-[var(--radius-sm)] border px-3 text-[length:var(--text-micro)] font-medium disabled:opacity-50`}
 					>
 						Deny
 					</button>
@@ -334,7 +334,7 @@ export function PairConfirm({
 						type="button"
 						disabled={busy}
 						onClick={() => void decide('allow')}
-						className="rounded-md bg-[var(--primary)] px-3 py-1.5 text-[length:var(--text-body-sm)] font-semibold text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
+						className="h-[var(--btn-h-sm,26px)] rounded-[var(--radius-sm)] border border-[var(--primary)] bg-[var(--primary)] px-3 text-[length:var(--text-micro)] font-medium text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50"
 					>
 						Pair device
 					</button>
