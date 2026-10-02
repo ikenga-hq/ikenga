@@ -12,7 +12,8 @@
 //!  "filter":{…},"exported_at_ms":…}
 //! ```
 //!
-//! (plus `rows` and `truncated`). The chain is verified before every export
+//! (plus `rows`, `truncated` and `resealed`: the breaks an operator
+//! acknowledged). The chain is verified before every export
 //! (§6.4) and every export appends `audit.exported {rows, filter}`.
 //!
 //! **`destPath` (normative, review C-08, A-34).** Honoured only for the T0
@@ -106,6 +107,10 @@ pub async fn build(
         "contiguous": contiguous,
         "verified": report.ok(),
         "broken_at_seq": report.broken.as_ref().map(|b| b.broken_at_seq),
+        // Breaks an operator resealed (review B-1): `verified: true` means
+        // the chain verifies with these acknowledged, not that the rows
+        // verify standalone across them.
+        "resealed": report.resealed,
         "filter": filter.to_json(),
         "exported_at_ms": now_ms(),
         "rows": rows.len(),
@@ -133,15 +138,73 @@ async fn record_exported(store: &AccessStore, ev: Event, built: &Built, filter: 
     }
 }
 
-/// Write `data` to `path`, owner-only.
-async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    tokio::fs::write(path, data).await?;
+/// Write `data` to `path`, owner-only, without following links (review
+/// M-1): the bytes go to a fresh `0600` file created `O_EXCL|O_NOFOLLOW`
+/// next to `path`, which is then renamed over it. An existing `path` must
+/// be a regular file the caller owns — a symlink, a directory or someone
+/// else's file is refused, and a link is replaced (never written through).
+async fn write_private(path: &Path, data: Vec<u8>) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_private_blocking(&path, &data))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn write_private_blocking(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "refusing to write over something that is not a regular file (a link?)",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "refusing to replace a file another user owns",
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "the path names no file"))?;
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        now_ms()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    Ok(())
+    let res = (|| {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// `access_audit_export {filter, destPath?}` (§9.1).
@@ -179,7 +242,7 @@ pub async fn dispatch(env: &Env<'_>, ctx: &AccessCtx, args: &Value) -> Result<Va
         .map_err(AccessError::internal)?;
     let out = match &dest {
         Some(path) => {
-            write_private(path, built.jsonl.as_bytes())
+            write_private(path, built.jsonl.clone().into_bytes())
                 .await
                 .map_err(|e| {
                     AccessError::new(
@@ -187,7 +250,8 @@ pub async fn dispatch(env: &Env<'_>, ctx: &AccessCtx, args: &Value) -> Result<Va
                         format!("could not write {}: {e}", path.display()),
                     )
                 })?;
-            json!({ "path": path.display().to_string() })
+            // The rows the file holds (review m-7), not what a client shows.
+            json!({ "path": path.display().to_string(), "rows": built.rows })
         }
         None => json!({ "jsonl": built.jsonl, "truncated": built.truncated }),
     };
@@ -204,7 +268,7 @@ pub async fn export_cli(
 ) -> anyhow::Result<Built> {
     let built = build(store, filter, &Visibility::All, None).await?;
     if let Some(path) = out {
-        write_private(path, built.jsonl.as_bytes()).await?;
+        write_private(path, built.jsonl.clone().into_bytes()).await?;
     }
     record_exported(
         store,
@@ -349,6 +413,8 @@ mod tests {
         assert_eq!(v["path"], dest.display().to_string());
         let body = std::fs::read_to_string(&dest).unwrap();
         assert!(body.lines().last().unwrap().contains("\"manifest\""));
+        // Review m-7: the reply counts the rows the file holds.
+        assert_eq!(v["rows"], body.lines().count() - 1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -378,5 +444,39 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, Code::InvalidRequest);
         assert!(!dest.exists());
+    }
+
+    /// Review M-1: the export never writes through a link, never replaces
+    /// a non-regular file, and is created owner-only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_export_file_is_written_without_following_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("out.jsonl");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = write_private(&link, b"rows".to_vec()).await.unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        assert!(write_private(tmp.path(), b"rows".to_vec()).await.is_err());
+
+        // A new file, and an existing one of ours: replaced, 0600.
+        let out = tmp.path().join("new.jsonl");
+        write_private(&out, b"one".to_vec()).await.unwrap();
+        write_private(&out, b"two".to_vec()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "two");
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // No temp files left behind.
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
     }
 }

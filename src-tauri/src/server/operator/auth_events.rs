@@ -185,10 +185,14 @@ fn audit_via(event: &AuthEvent) -> crate::access::audit::AuditVia {
 /// [`record`] after the absorption: one chained row (G-ACCESS §6.3), in the
 /// caller's transaction. `username_tried` moves into `detail`, where the
 /// view reads it. Authentication rows append even while the chain is
-/// degraded (P-35); a process-local chain view is enough, because every
-/// other writer verifies forward over these rows (§6.3 step 2, A-37).
+/// degraded (P-35).
+///
+/// The append goes through the process's own [`Chain`] for the store
+/// (review m-1), so auth rows get the §6.3 step 2 head check and advance
+/// the head the broker holds; a commit hook on the caller's connection
+/// reports the new head once the caller commits.
 async fn record_chained(tx: &mut Transaction<'_, Sqlite>, event: AuthEvent) -> sqlx::Result<i64> {
-    use crate::access::audit::{chain::Chain, Event};
+    use crate::access::audit::{chain, Event};
     let store_id: String = sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'store_id'")
         .fetch_one(&mut **tx)
         .await?;
@@ -202,16 +206,32 @@ async fn record_chained(tx: &mut Transaction<'_, Sqlite>, event: AuthEvent) -> s
     }
     let mut ev = Event::new(event.kind.audit_kind(), audit_via(&event))
         .detail(serde_json::Value::Object(detail));
+    // `principal_id` stays the account (the §6.1 view's column); the
+    // account is also the row's subject (§6.1 "who the event is about"),
+    // and a `via = cli` row's actor renders as the server operator
+    // (review m-3).
     ev.principal_id = event.principal_id.map(|id| id.to_string());
+    ev.subject_principal_id = ev.principal_id.clone();
     ev.remote_addr = event.remote_addr;
     ev.user_agent = event.user_agent;
-    let head = Chain::new(store_id)
-        .append(&mut **tx, &ev)
-        .await
-        .map_err(|e| match e {
-            crate::access::audit::chain::AppendError::Sql(e) => e,
-            other => sqlx::Error::Protocol(other.to_string()),
-        })?;
+    let chain = chain::shared(&store_id);
+    let head = chain.append(&mut **tx, &ev).await.map_err(|e| match e {
+        chain::AppendError::Sql(e) => e,
+        other => sqlx::Error::Protocol(other.to_string()),
+    })?;
+    // §6.3 step 4 once the caller commits; a rollback disarms it.
+    let armed = std::sync::Arc::new(std::sync::Mutex::new(Some(chain)));
+    let on_rollback = armed.clone();
+    let mut handle = tx.lock_handle().await?;
+    handle.set_commit_hook(move || {
+        if let Some(c) = armed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            c.committed(head);
+        }
+        true
+    });
+    handle.set_rollback_hook(move || {
+        on_rollback.lock().unwrap_or_else(|e| e.into_inner()).take();
+    });
     Ok(head.seq)
 }
 
@@ -267,5 +287,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// Review m-1 / m-3: after the absorption, auth rows go through the
+    /// process's own chain for the store — its head advances on COMMIT
+    /// (not on ROLLBACK), so truncating an auth row the broker wrote is a
+    /// head regression it sees — and the account is the row's subject.
+    #[tokio::test]
+    async fn chained_auth_rows_advance_the_process_chain() {
+        use crate::access::audit::chain::AppendError;
+        use crate::access::audit::{AuditVia, Event};
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(SqliteConnectOptions::new().filename(":memory:"))
+            .await
+            .unwrap();
+        let ada = PrincipalId::new_v7();
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            apply(&mut conn, &ACCOUNTS, Policy::Migrate).await.unwrap();
+            sqlx::query(
+                "INSERT INTO accounts (principal_id, username, unix_name, unix_uid, unix_gid, \
+                 home, created_at, updated_at) VALUES (?, 'ada', 'ik-ada', 20001, 20001, '/h', 0, 0)",
+            )
+            .bind(ada.to_string())
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        let store = crate::access::AccessStore::attach_t1(pool.clone())
+            .await
+            .unwrap();
+        let before = store.chain().known_head().unwrap();
+
+        // A rolled-back auth row doesn't move the head.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            record(
+                &mut tx,
+                AuthEvent::new(AuthEventKind::LoginOk).principal(ada),
+            )
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(store.chain().known_head(), Some(before));
+
+        // A committed one does, and carries the account as its subject.
+        let seq = {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            let seq = record(
+                &mut tx,
+                AuthEvent::new(AuthEventKind::AccountDisabled)
+                    .principal(ada)
+                    .detail(serde_json::json!({ "via": "cli" })),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            seq
+        };
+        assert_eq!(store.chain().known_head().unwrap().seq, seq);
+        let (via, subject): (String, Option<String>) =
+            sqlx::query_as("SELECT via, subject_principal_id FROM audit_events WHERE seq = ?")
+                .bind(seq)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(via, "cli");
+        assert_eq!(subject, Some(ada.to_string()));
+
+        // Truncate that auth row: the broker's next access change sees the
+        // head regression.
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq = {seq};"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        let refused = store
+            .chain()
+            .append(
+                &mut tx,
+                &Event::new("member.role_changed", AuditVia::Session),
+            )
+            .await;
+        assert!(matches!(refused, Err(AppendError::AuditUnavailable(_))));
+        assert_eq!(store.chain().degraded().unwrap().broken_at_seq, seq);
     }
 }

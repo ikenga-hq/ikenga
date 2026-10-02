@@ -5,9 +5,12 @@
 //! A reseal acknowledges the **outstanding** break (the first one no
 //! earlier reseal acknowledged): `ackSeq` must name it, so an operator
 //! can't wave through a break they haven't looked at. It appends
-//! `audit.resealed {broken_at_seq, prior_head}` after the DB head and
-//! re-walks the chain: `degraded` clears unless another unacknowledged
-//! break remains (then that one is outstanding). The break itself stays in
+//! `audit.resealed {broken_at_seq, prior_head}` after the DB head — plus the
+//! break's evidence (`class`, `fingerprint`) and the `audit.chain_broken`
+//! row that records it (`chain_broken {seq, hash}`), so it acknowledges
+//! exactly that break and nothing that later shows up at the same seq
+//! (review B-1) — and re-walks the chain: `degraded` clears unless another
+//! unacknowledged break remains (then that one is outstanding). The break itself stays in
 //! the chain for ever; every later walk sees it, acknowledged.
 //!
 //! A T1 broker that is degraded notices a root-CLI reseal on its next
@@ -16,7 +19,7 @@
 use serde_json::{json, Value};
 use sqlx::Connection;
 
-use super::chain::{db_head, insert_row, Broken, Head};
+use super::chain::{broken_event, db_head, insert_row, Broken, Head};
 use super::list::store;
 use super::{verify_boot, Event};
 use crate::access::ctx::AccessCtx;
@@ -35,7 +38,8 @@ pub struct Resealed {
 }
 
 /// The reseal core: `ev` is the `audit.resealed` row with its actor
-/// columns set; this adds `{broken_at_seq, prior_head}`.
+/// columns set; this adds `{broken_at_seq, reason, class, fingerprint,
+/// chain_broken, prior_head}`.
 pub async fn reseal(store: &AccessStore, ack_seq: i64, ev: Event) -> Result<Resealed, AccessError> {
     debug_assert_eq!(ev.kind, "audit.resealed");
     let chain = store.chain();
@@ -72,10 +76,28 @@ pub async fn reseal(store: &AccessStore, ack_seq: i64, ev: Event) -> Result<Rese
             ),
         ));
     }
-    let prior = db_head(&mut tx).await.map_err(AccessError::internal)?;
+    let mut prior = db_head(&mut tx).await.map_err(AccessError::internal)?;
+    // The acknowledgment names the `audit.chain_broken` row that records
+    // this break (review B-1); `verify_boot` above wrote it, but write it
+    // here if another writer's walk raced us.
+    let recorded_by = match verdict.recorded_by {
+        Some(h) => h,
+        None => {
+            let h = insert_row(&mut tx, chain.store_id(), prior, &broken_event(&b))
+                .await
+                .map_err(AccessError::internal)?;
+            prior = Some(h);
+            h
+        }
+    };
+    // Bound to this break's evidence, not just its seq (review B-1): a
+    // different break at the same seq later is outstanding again.
     let ev = ev.detail(json!({
         "broken_at_seq": ack_seq,
         "reason": b.reason,
+        "class": b.class,
+        "fingerprint": b.fingerprint,
+        "chain_broken": { "seq": recorded_by.seq, "hash": hex::encode(recorded_by.hash) },
         "prior_head": prior.map(|h| json!({ "seq": h.seq, "hash": hex::encode(h.hash) })),
     }));
     let head = insert_row(&mut tx, chain.store_id(), prior, &ev)
@@ -294,5 +316,200 @@ mod tests {
             .await
             .unwrap();
         assert!(store.chain().degraded().is_none());
+    }
+
+    async fn add_rows(store: &AccessStore, n: usize) {
+        for i in 0..n {
+            crate::access::audit::record(
+                store,
+                &Event::new(
+                    "permission.decided",
+                    crate::access::audit::AuditVia::Operator,
+                )
+                .target(format!("Read f{i}")),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn walk(store: &AccessStore) -> verify_boot::Verdict {
+        let mut conn = store.pool().acquire().await.unwrap();
+        verify_boot::verify(&mut conn, &store.meta().store_id)
+            .await
+            .unwrap()
+    }
+
+    async fn sql(store: &AccessStore, q: &str) {
+        sqlx::raw_sql(q).execute(store.pool()).await.unwrap();
+    }
+
+    fn cli_ack() -> Event {
+        Event::new("audit.resealed", crate::access::audit::AuditVia::Cli)
+    }
+
+    /// Break #3 and reseal it; returns the `audit.chain_broken` seq.
+    async fn broken_and_resealed(store: &AccessStore) -> i64 {
+        add_rows(store, 5).await;
+        forge(store, 3).await;
+        let r = reseal(store, 3, cli_ack()).await.unwrap();
+        assert!(r.still_broken.is_none());
+        assert!(walk(store).await.ok());
+        sqlx::query_scalar("SELECT seq FROM audit_events WHERE kind = 'audit.chain_broken'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Review B-1: a reseal acknowledges the break it saw, not its seq.
+    /// Deleting the rows from the break through the `audit.chain_broken`
+    /// row (the reviewer's repro), deleting just that row, or re-forging
+    /// the broken row are new, outstanding breaks — and a restart degrades.
+    #[tokio::test]
+    async fn a_reseal_acknowledges_only_the_break_it_saw() {
+        // The repro: rows 1..6, forge #3, reseal, DELETE #3..#chain_broken.
+        let store = AccessStore::memory_t0().await;
+        let cb = broken_and_resealed(&store).await;
+        // The export says the chain verifies *with* the break resealed.
+        let built = crate::access::audit::export::build(
+            &store,
+            &crate::access::audit::list::Filter::default(),
+            &crate::access::audit::list::Visibility::All,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(built.manifest["verified"], true);
+        assert_eq!(built.manifest["resealed"], json!([3]));
+        sql(
+            &store,
+            &format!("DELETE FROM audit_events WHERE seq BETWEEN 3 AND {cb}"),
+        )
+        .await;
+        let v = walk(&store).await;
+        let b = v.outstanding.expect("a grown gap is a new break");
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (3, "gap"));
+        let restarted = store.clone_with_fresh_chain();
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            restarted.chain().verify_boot(&mut conn).await.unwrap();
+        }
+        assert_eq!(restarted.chain().degraded().unwrap().broken_at_seq, 3);
+        let built = crate::access::audit::export::build(
+            &restarted,
+            &crate::access::audit::list::Filter::default(),
+            &crate::access::audit::list::Visibility::All,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(built.manifest["verified"], false);
+        assert_eq!(built.manifest["contiguous"], false);
+
+        // Only the chain_broken row deleted: a gap at its seq.
+        let store = AccessStore::memory_t0().await;
+        let cb = broken_and_resealed(&store).await;
+        sql(
+            &store,
+            &format!("DELETE FROM audit_events WHERE seq = {cb}"),
+        )
+        .await;
+        let v = walk(&store).await;
+        // The reseal named that row, so it no longer acknowledges #3, and
+        // the deletion is a break of its own.
+        assert_eq!(v.outstanding.expect("a deleted record").broken_at_seq, 3);
+        assert!(v
+            .breaks
+            .iter()
+            .any(|(b, acked)| b.broken_at_seq == cb && b.class == "gap" && !acked));
+
+        // #3 re-forged after the reseal: the same seq, different evidence.
+        let store = AccessStore::memory_t0().await;
+        broken_and_resealed(&store).await;
+        sql(
+            &store,
+            "UPDATE audit_events SET target = 'forged again' WHERE seq = 3",
+        )
+        .await;
+        let v = walk(&store).await;
+        let b = v.outstanding.expect("a re-forged row is a new break");
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (3, "hash"));
+        assert!(
+            !v.recorded,
+            "the old chain_broken row records the old evidence"
+        );
+        // An operator who reviews it can reseal it; the first reseal still
+        // doesn't count for it.
+        reseal(&store, 3, cli_ack()).await.unwrap();
+        let v = walk(&store).await;
+        assert!(v.ok(), "{v:?}");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE kind = 'audit.chain_broken'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(rows, 2, "each break is recorded once");
+    }
+
+    /// Review M-2: a break found by an append that is then refused is
+    /// persisted at once — not only in memory — so a tail truncation
+    /// survives the process going away.
+    #[tokio::test]
+    async fn a_break_found_by_a_refused_append_survives_a_restart() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 3).await;
+        let head = store.chain().known_head().unwrap();
+        assert_eq!(head.seq, 4);
+        // Truncate the tail this process wrote.
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq = 4;",
+        )
+        .await;
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            let refused = store
+                .chain()
+                .append(
+                    &mut tx,
+                    &Event::new(
+                        "device.tier_changed",
+                        crate::access::audit::AuditVia::Operator,
+                    ),
+                )
+                .await;
+            assert!(matches!(
+                refused,
+                Err(crate::access::audit::chain::AppendError::AuditUnavailable(
+                    _
+                ))
+            ));
+            // The caller rolls back.
+        }
+        // The chain_broken row lands on its own, without another append.
+        let mut written = false;
+        for _ in 0..200 {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_events WHERE kind = 'audit.chain_broken'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            if n == 1 {
+                written = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(written, "the break was only in memory");
+        // "Restart": a fresh chain view boots degraded at the same seq.
+        let restarted = store.clone_with_fresh_chain();
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            restarted.chain().verify_boot(&mut conn).await.unwrap();
+        }
+        assert_eq!(restarted.chain().degraded().unwrap().broken_at_seq, 4);
     }
 }

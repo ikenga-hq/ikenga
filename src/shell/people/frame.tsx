@@ -6,11 +6,14 @@
 // Devices are personal; Members and Policies are per project; Audit is both
 // (G-ACCESS §4, §11.1 "scope switch").
 
-import type { ReactNode } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 
 import { SegmentedLinks } from '@/components/ui/segmented';
 import { cn } from '@/components/ui/utils';
+import { accessStatus } from '@/lib/access/client';
 import { isT1Session } from '@/lib/transport/t1-session';
+
+import { auditReadReason } from './audit-model';
 
 export const PEOPLE_TABS = [
 	{ to: '/settings/profile', label: 'Profile', exact: true },
@@ -128,15 +131,60 @@ export function PeopleFileBar({ t1 = isT1Session() }: { t1?: boolean }) {
 	);
 }
 
+/** G-ACCESS §6.7: why this credential can't open the Audit tab (a phone
+ *  below `full`, or inside a share), or `null`. `known` skips the fetch
+ *  when the caller already has the status (`undefined` = fetch it). An
+ *  unreachable store leaves the tab enabled: the view explains that. */
+function useAuditTabWhy(known: string | null | undefined): string | null {
+	const [fetched, setFetched] = useState<string | null>(null);
+	useEffect(() => {
+		if (known !== undefined) return;
+		let live = true;
+		accessStatus()
+			.then((s) => live && setFetched(auditReadReason(s)))
+			.catch(() => live && setFetched(null));
+		return () => {
+			live = false;
+		};
+	}, [known]);
+	return known !== undefined ? known : fetched;
+}
+
+/** The People tab strip. §6.7: phones below `full` can't open the Audit
+ *  tab, and it is disabled with that reason (review m-4); the Audit view
+ *  keeps the same reason for a direct URL. */
+function PeopleTabs({ auditWhy }: { auditWhy: string | null }) {
+	if (!auditWhy) return <SegmentedLinks items={[...PEOPLE_TABS]} ariaLabel="People sections" />;
+	const audit = PEOPLE_TABS.find((t) => t.to === '/settings/audit');
+	return (
+		<div className="flex min-w-0 items-center gap-1">
+			<SegmentedLinks items={PEOPLE_TABS.filter((t) => t !== audit)} ariaLabel="People sections" />
+			<button
+				type="button"
+				disabled
+				data-tab-disabled="audit"
+				title={auditWhy}
+				className="cursor-not-allowed whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground opacity-45"
+			>
+				{audit?.label ?? 'Audit'}
+			</button>
+		</div>
+	);
+}
+
 export function PeopleHeader({
 	tab,
 	scope,
 	onScope,
+	auditWhy: knownAuditWhy,
 }: {
 	tab: PeopleTab;
 	scope?: PeopleScope;
 	onScope?: (scope: PeopleScope) => void;
+	/** The Audit tab's §6.7 reason when the caller knows the status. */
+	auditWhy?: string | null;
 }) {
+	const auditWhy = useAuditTabWhy(knownAuditWhy);
 	return (
 		<div className="space-y-3">
 			<header className="flex flex-wrap items-center gap-2">
@@ -151,7 +199,7 @@ export function PeopleHeader({
 				</span>
 			</header>
 			<div className="flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">
-				<SegmentedLinks items={[...PEOPLE_TABS]} ariaLabel="People sections" />
+				<PeopleTabs auditWhy={auditWhy} />
 				<span className="ml-auto font-mono text-[11px] text-[var(--fg-muted)]">
 					/settings/{tab}
 				</span>

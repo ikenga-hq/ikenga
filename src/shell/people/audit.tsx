@@ -190,8 +190,13 @@ export function AuditTab() {
 				});
 				if (!path) return;
 				const r = await accessAuditExport(filter, path);
+				const where = 'path' in r ? r.path : path;
+				// The rows the file holds, as the daemon counted them (review
+				// m-7) — never the rows this view happens to show.
+				const n = 'rows' in r && typeof r.rows === 'number' ? r.rows : null;
 				setToast({
-					label: `Exported ${visible.length} rows to ${'path' in r ? r.path : path}`,
+					label:
+						n === null ? `Exported the audit log to ${where}` : `Exported ${n} rows to ${where}`,
 				});
 			} else {
 				const r = await accessAuditExport(filter);
@@ -209,7 +214,7 @@ export function AuditTab() {
 		} finally {
 			setBusy(false);
 		}
-	}, [base, chips, status, visible.length, reload]);
+	}, [base, chips, status, reload]);
 
 	const reseal = useCallback(async () => {
 		if (brokenAt === null) return;
@@ -237,7 +242,12 @@ export function AuditTab() {
 			data-store={brokenAt === null ? 'ok' : 'degraded'}
 			className="mx-auto w-full max-w-[960px] space-y-4 px-6 py-6"
 		>
-			<PeopleHeader tab="audit" scope={scope} onScope={setScope} />
+			<PeopleHeader
+				tab="audit"
+				scope={scope}
+				onScope={setScope}
+				auditWhy={loaded ? readReason : null}
+			/>
 			{brokenAt !== null && (
 				<BrokenBanner seq={brokenAt} status={status} onReseal={() => void reseal()} busy={busy} />
 			)}

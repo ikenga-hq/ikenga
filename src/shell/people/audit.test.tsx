@@ -174,6 +174,12 @@ describe('audit model', () => {
 		expect(deviceLabel(row({ deviceId: null, deviceName: null, via: 'cli' }))).toBe('server CLI');
 		expect(whoLabel(row({ principalId: null, actorName: null, via: 'system' }))).toBe('system');
 		expect(whoLabel(row({ principalId: ADA, actorName: null }))).toBe('01890a5d');
+		// A root-CLI row keeps the account in principal_id; its actor is the
+		// server operator (review m-3).
+		expect(whoLabel(row({ principalId: ADA, actorName: 'ada', via: 'cli' }))).toBe(
+			'server operator'
+		);
+		expect(whoOptions([row({ principalId: ADA, via: 'cli' })])).toEqual([]);
 		expect(targetLabel(row({ target: null, subjectName: 'ada' }))).toBe('ada');
 	});
 
@@ -368,7 +374,7 @@ describe('AuditTab', () => {
 		mocks.accessStatus.mockResolvedValue(t0Status());
 		mocks.accessAuditList.mockResolvedValue({ rows: ROWS, nextBefore: null });
 		mocks.save.mockResolvedValue('/home/ned/ikenga-audit.jsonl');
-		mocks.accessAuditExport.mockResolvedValue({ path: '/home/ned/ikenga-audit.jsonl' });
+		mocks.accessAuditExport.mockResolvedValue({ path: '/home/ned/ikenga-audit.jsonl', rows: 12 });
 		render(<AuditTab />);
 		await screen.findByText('Paired device');
 		fireEvent.click(screen.getByRole('button', { name: /Export/ }));
@@ -376,7 +382,8 @@ describe('AuditTab', () => {
 			expect(mocks.accessAuditExport).toHaveBeenCalledWith({}, '/home/ned/ikenga-audit.jsonl')
 		);
 		expect(mocks.save.mock.calls[0][0].defaultPath).toMatch(/^ikenga-audit-.*\.jsonl$/);
-		await screen.findByText('Exported 4 rows to /home/ned/ikenga-audit.jsonl');
+		// The daemon's count of the file's rows, not the 4 rows on screen (m-7).
+		await screen.findByText('Exported 12 rows to /home/ned/ikenga-audit.jsonl');
 		mocks.isTauri.mockReturnValue(false);
 	});
 

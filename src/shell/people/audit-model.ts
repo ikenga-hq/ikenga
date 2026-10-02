@@ -108,11 +108,13 @@ function shortId(id: string): string {
 	return id.slice(0, 8);
 }
 
-/** The Who column: the actor (§6.1 `principal_id`). */
+/** The Who column: the actor (§6.1 `principal_id`). A root-CLI row
+ *  (`via = cli`) keeps the account in `principal_id` for the G-PRINCIPAL
+ *  §6.1 view, but its actor is the server operator (review m-3). */
 export function whoLabel(row: AuditRow): string {
+	if (row.via === 'cli') return 'server operator';
 	if (row.actorName) return row.actorName;
 	if (row.principalId) return shortId(row.principalId);
-	if (row.via === 'cli') return 'server operator';
 	return 'system';
 }
 
@@ -129,13 +131,13 @@ export function uaFamily(ua: string | null): string {
 /** The Device column: the actor's device; a T1 password session reads
  *  "Browser session · <UA family> · <session_ref>" (review C-19). */
 export function deviceLabel(row: AuditRow): string {
+	if (row.via === 'cli') return 'server CLI';
 	if (row.deviceName) return row.deviceName;
 	if (row.via === 'session') {
 		const ref = typeof row.detail?.session_ref === 'string' ? row.detail.session_ref : null;
 		return ['Browser session', uaFamily(row.userAgent), ref].filter(Boolean).join(' · ');
 	}
 	if (row.deviceId) return shortId(row.deviceId);
-	if (row.via === 'cli') return 'server CLI';
 	return '—';
 }
 
@@ -208,7 +210,8 @@ export interface ChipOption {
 export function whoOptions(rows: readonly AuditRow[]): ChipOption[] {
 	const by = new Map<string, ChipOption>();
 	for (const r of rows) {
-		if (!r.principalId) continue;
+		// A root-CLI row's `principal_id` is the account it acted on.
+		if (!r.principalId || r.via === 'cli') continue;
 		const o = by.get(r.principalId) ?? { id: r.principalId, label: whoLabel(r), count: 0 };
 		o.count += 1;
 		by.set(r.principalId, o);

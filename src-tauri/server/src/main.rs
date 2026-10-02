@@ -521,15 +521,34 @@ async fn run_audit(args: AuditArgs) -> i32 {
 }
 
 async fn audit(args: AuditArgs) -> anyhow::Result<i32> {
-    use ikenga_desktop_lib::access::audit::{export, list::Filter, reseal, verify_boot};
+    use ikenga_desktop_lib::access::audit::verify_boot;
     use ikenga_desktop_lib::access::AccessStore;
-    use std::io::Write;
 
     let path = verify_boot::cli_store_path(args.data_dir, args.file)?;
-    let store = AccessStore::open_cli(&path).await?;
-    let code = match args.command {
+    let read_only = matches!(args.command, AuditCommand::Verify { .. });
+    if !read_only {
+        if let Some(w) = verify_boot::cli_foreign_owner_warning(&path) {
+            eprintln!("{w}");
+        }
+    }
+    // `verify` is read-only (review m-8); every path closes the pool
+    // before returning, errors included, so no connection outlives it.
+    let store = AccessStore::open_cli(&path, read_only).await?;
+    let result = audit_command(&store, args.command).await;
+    store.pool().close().await;
+    result
+}
+
+async fn audit_command(
+    store: &ikenga_desktop_lib::access::AccessStore,
+    command: AuditCommand,
+) -> anyhow::Result<i32> {
+    use ikenga_desktop_lib::access::audit::{export, list::Filter, reseal, verify_boot};
+    use std::io::Write;
+
+    Ok(match command {
         AuditCommand::Verify { json } => {
-            let (text, ok) = verify_boot::cli_verify(&store, json).await?;
+            let (text, ok) = verify_boot::cli_verify(store, json).await?;
             println!("{}", text.trim_end());
             if ok {
                 0
@@ -547,7 +566,7 @@ async fn audit(args: AuditArgs) -> anyhow::Result<i32> {
         } => {
             let filter = Filter::from_parts(who, device, category, q, project_key)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let built = export::export_cli(&store, &filter, out.as_deref()).await?;
+            let built = export::export_cli(store, &filter, out.as_deref()).await?;
             match &out {
                 Some(p) => eprintln!(
                     "exported {} rows to {} (verified: {})",
@@ -565,7 +584,7 @@ async fn audit(args: AuditArgs) -> anyhow::Result<i32> {
         }
         AuditCommand::Reseal { ack } => {
             let r = reseal::reseal(
-                &store,
+                store,
                 ack,
                 ikenga_desktop_lib::access::audit::Event::new(
                     "audit.resealed",
@@ -592,9 +611,7 @@ async fn audit(args: AuditArgs) -> anyhow::Result<i32> {
                 }
             }
         }
-    };
-    store.pool().close().await;
-    Ok(code)
+    })
 }
 
 /// `ikenga-server probe` → exit code (0 = the tier can run here).

@@ -163,14 +163,16 @@ impl AccessStore {
     /// `--file`). Never creates or migrates — the access set must be exactly
     /// current (§8.1: the CLI refuses a version it doesn't know; only the
     /// broker / daemon migrates). Its chain starts with no known head, like
-    /// any second writer (§6.3 step 2).
-    pub async fn open_cli(path: &Path) -> anyhow::Result<Self> {
+    /// any second writer (§6.3 step 2). `read_only` (`audit verify`, review
+    /// m-8) opens it `SQLITE_OPEN_READONLY`.
+    pub async fn open_cli(path: &Path, read_only: bool) -> anyhow::Result<Self> {
         if !path.is_file() {
             anyhow::bail!("no access store at {}", path.display());
         }
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
+            .read_only(read_only)
             .busy_timeout(BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(2)
@@ -192,6 +194,7 @@ impl AccessStore {
         let meta = read_meta(&mut conn).await?;
         drop(conn);
         let chain = Arc::new(Chain::new(meta.store_id.clone()));
+        chain.attach(pool.clone());
         Ok(Self { pool, meta, chain })
     }
 
@@ -217,6 +220,7 @@ impl AccessStore {
             );
         }
         let chain = Arc::new(Chain::new(meta.store_id.clone()));
+        chain.attach(pool.clone());
         let report: VerifyReport = chain.verify_boot(&mut conn).await?;
         if report.ok() {
             tracing::info!(
