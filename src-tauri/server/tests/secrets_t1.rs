@@ -401,7 +401,20 @@ fn t1_root_secrets_principal_store_over_the_operator_default() {
         let pids = child_pids();
         assert_eq!(pids.len(), 2, "two principal children");
         for pid in pids {
-            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+            // L21-5: each child made itself non-dumpable before reading its
+            // key, so its /proc entries are root's, not the principal's —
+            // none of the principal's other processes can read the block
+            // the hand-off arrived in.
+            let environ_path = format!("/proc/{pid}/environ");
+            let owner = std::fs::metadata(&environ_path).unwrap().uid();
+            assert_eq!(owner, 0, "principal child {pid} is still dumpable");
+            // Root reads it only with CAP_SYS_PTRACE (the CI container has
+            // none); when it can, the key must be gone from it too.
+            let environ = match std::fs::read(&environ_path) {
+                Ok(environ) => environ,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(e) => panic!("{environ_path}: {e}"),
+            };
             let hex = to_hex(&environ);
             let text = String::from_utf8_lossy(&environ);
             assert!(

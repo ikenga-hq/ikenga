@@ -598,14 +598,24 @@ mod tests {
         const OTHER_DATA: &str = "IKENGA_T1ROOT_SECRETS_OTHER";
         const KEK_PATH: &str = "IKENGA_T1ROOT_SECRETS_KEK";
 
-        fn environ_hex() -> String {
-            hex::encode(fs::read("/proc/self/environ").unwrap_or_default())
+        /// This process's environment as Rust sees it, `NAME=value\0`-joined.
+        fn env_hex() -> String {
+            let mut out = Vec::new();
+            for (k, v) in std::env::vars_os() {
+                out.extend_from_slice(k.as_encoded_bytes());
+                out.push(b'=');
+                out.extend_from_slice(v.as_encoded_bytes());
+                out.push(0);
+            }
+            hex::encode(out)
         }
 
         /// The child side, run as a principal's uid through the real T1
-        /// executor with the broker's real `host_env`. Prints its environment
-        /// block before and after taking the key; exits non-zero on the first
-        /// failed check, naming it on stderr.
+        /// executor with the broker's real `host_env`. The hand-off was
+        /// captured before `main` (`.init_array`), so by the time this test
+        /// body runs the key must already be out of the environment and the
+        /// process non-dumpable. Prints its environment; exits non-zero on
+        /// the first failed check, naming it on stderr.
         #[test]
         #[ignore = "t1-root (secrets child entry)"]
         fn t1_root_secrets_child_entry() {
@@ -616,7 +626,31 @@ mod tests {
                 eprintln!("secrets child: {why}");
                 std::process::exit(code)
             };
-            println!("BEFORE:{}", environ_hex());
+            // L21-5: captured at exec, before the test harness (or, in the
+            // daemon, the Tokio runtime) started a thread.
+            if std::env::var_os(WRAP_KEY_ENV).is_some() {
+                fail(
+                    19,
+                    "the hand-off was still in the environment after exec".into(),
+                );
+            }
+            // SAFETY: PR_GET_DUMPABLE reads one flag.
+            if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+                fail(
+                    18,
+                    "the child is still dumpable after taking its key".into(),
+                );
+            }
+            // Non-dumpable: `/proc/<pid>/environ` is root's, so no process of
+            // this uid (this one included) can read the block the key was in.
+            match fs::read("/proc/self/environ") {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                other => fail(
+                    20,
+                    format!("/proc/self/environ readable by the principal: {other:?}"),
+                ),
+            }
+            println!("ENV:{}", env_hex());
             let key = match WrapKey::take_from_env() {
                 Some(Ok(key)) => key,
                 Some(Err(e)) => fail(10, e),
@@ -625,7 +659,9 @@ mod tests {
             if std::env::var_os(WRAP_KEY_ENV).is_some() {
                 fail(12, "the wrapping key is still in the environment".into());
             }
-            println!("AFTER:{}", environ_hex());
+            if WrapKey::take_from_env().is_some() {
+                fail(21, "the hand-off was handed over twice".into());
+            }
             // The master KEK is out of reach (operator/ is root 0700).
             let kek = std::env::var_os(KEK_PATH).unwrap();
             if fs::File::open(&kek).is_ok() {
@@ -668,7 +704,7 @@ mod tests {
             own: &Path,
             other: &Path,
             kek_path: &Path,
-        ) -> (String, String) {
+        ) -> String {
             let mut spec = SpawnSpec::new(std::env::current_exe().unwrap());
             spec.args(
                 [
@@ -702,20 +738,17 @@ mod tests {
                 out.status.code(),
                 String::from_utf8_lossy(&out.stderr)
             );
-            let line = |tag: &str| {
-                let hex = stdout
-                    .lines()
-                    .find_map(|l| l.strip_prefix(tag))
-                    .unwrap_or_else(|| panic!("no {tag} line: {stdout}"));
-                String::from_utf8_lossy(&hex::decode(hex).unwrap()).into_owned()
-            };
-            (line("BEFORE:"), line("AFTER:"))
+            let hex = stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("ENV:"))
+                .unwrap_or_else(|| panic!("no ENV: line: {stdout}"));
+            String::from_utf8_lossy(&hex::decode(hex).unwrap()).into_owned()
         }
 
         /// WP-21: two principals' stores are isolated by uid and by key; the
         /// master KEK is root 0600 and never in a child's environment; the
-        /// wrapping key is gone from the child's environment block after
-        /// startup.
+        /// wrapping key is out of the child's environment before `main` and
+        /// the child is non-dumpable (L21-5).
         #[tokio::test]
         #[ignore = "t1-root"]
         async fn t1_root_principal_stores_are_isolated_and_the_kek_stays_root() {
@@ -753,24 +786,20 @@ mod tests {
             let data_b = data_for(tmp.path(), "b", ub);
             let exec = T1Executor::new(config());
             for (p, own, other) in [(&a, &data_a, &data_b), (&b, &data_b, &data_a)] {
-                let (before, after) = run_child(&exec, p, &kek, own, other, &kek_path).await;
+                // That the broker handed over exactly this principal's key is
+                // proven below: the store the child created with it opens
+                // with `wrap_key_for(p.id)` (and a smuggled spec value would
+                // have failed the child's take, exit 10).
+                let env = run_child(&exec, p, &kek, own, other, &kek_path).await;
                 let own_key = kek.wrap_key_for(p.id).to_env_value();
-                assert!(
-                    before.contains(own_key.as_str()),
-                    "the broker handed over its key"
-                );
-                assert!(!before.contains("v1:smuggled"), "a spec can't set the key");
-                assert!(!before.contains(&kek_hex), "never the master KEK");
+                assert!(!env.contains("v1:smuggled"), "a spec can't set the key");
+                assert!(!env.contains(&kek_hex), "never the master KEK");
                 let other_id = if p.id == a.id { b.id } else { a.id };
                 let other_key = kek.wrap_key_for(other_id).to_env_value();
                 let other_hex = other_key.rsplit(':').next().unwrap();
-                assert!(!before.contains(other_hex), "never another principal's key");
+                assert!(!env.contains(other_hex), "never another principal's key");
                 let own_hex = own_key.rsplit(':').next().unwrap();
-                assert!(
-                    !after.contains(own_hex),
-                    "scrubbed from /proc/<pid>/environ"
-                );
-                assert!(!after.contains(&kek_hex));
+                assert!(!env.contains(own_hex), "taken out at exec");
             }
 
             // §4 / I-9: each store is its uid's, 0700 / 0600.
