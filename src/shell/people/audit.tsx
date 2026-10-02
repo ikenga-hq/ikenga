@@ -63,6 +63,7 @@ import {
 	whoLabel,
 	whoOptions,
 } from './audit-model';
+import { D05_FOCUS } from './focus';
 import { Kv, PeopleFileBar, PeopleHeader } from './frame';
 import { tierOf, useTabProject } from './members';
 
@@ -240,7 +241,7 @@ export function AuditTab() {
 			data-state="audit"
 			data-audit={mode}
 			data-store={brokenAt === null ? 'ok' : 'degraded'}
-			className="mx-auto w-full max-w-[960px] space-y-4 px-6 py-6"
+			className={`${D05_FOCUS} mx-auto w-full max-w-[960px] space-y-4 px-6 py-6`}
 		>
 			<PeopleHeader
 				tab="audit"
@@ -254,7 +255,7 @@ export function AuditTab() {
 			{readReason ? (
 				<p
 					data-audit-reason
-					className="m-0 rounded-[var(--radius-md,6px)] border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-3 text-[var(--text-caption,12px)] text-[var(--fg-muted)]"
+					className="m-0 rounded-[var(--radius-md,6px)] border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-3 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]"
 				>
 					{readReason}
 				</p>
@@ -291,7 +292,7 @@ export function AuditTab() {
 					)}
 				</section>
 			)}
-			<p className="m-0 rounded-[var(--radius-md,6px)] border border-dashed border-[var(--border)] px-3 py-2.5 text-[var(--text-caption,12px)] text-[var(--fg-muted)]">
+			<p className="m-0 rounded-[var(--radius-md,6px)] border border-dashed border-[var(--border)] px-3 py-2.5 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
 				{AUDIT_RULE}
 			</p>
 			<PeopleFileBar t1={tier === 't1'} />
@@ -330,14 +331,14 @@ function BrokenBanner({
 		<div
 			role="alert"
 			data-audit-banner="degraded"
-			className="flex flex-wrap items-center gap-2 rounded-[var(--radius-md,6px)] border border-[var(--danger)] px-3 py-2.5 text-[var(--text-caption,12px)] text-[var(--fg)]"
+			className="flex flex-wrap items-center gap-2 rounded-[var(--radius-md,6px)] border border-[var(--danger)] px-3 py-2.5 text-[length:var(--text-caption,12px)] text-[var(--fg)]"
 			style={{ background: 'color-mix(in srgb, var(--danger) 8%, transparent)' }}
 		>
 			<ShieldAlert className="h-4 w-4 flex-none text-[var(--danger)]" aria-hidden />
 			<span className="min-w-0 flex-1">
 				{brokenBanner(seq)}
 				{how && (
-					<span className="mt-0.5 block font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+					<span className="mt-0.5 block font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 						{how}
 					</span>
 				)}
@@ -368,7 +369,7 @@ function Chip({
 			aria-pressed={on}
 			onClick={onClick}
 			className={cn(
-				'inline-flex h-[22px] items-center gap-[5px] whitespace-nowrap rounded-full border px-2 text-[var(--text-micro)]',
+				'inline-flex h-[22px] items-center gap-[5px] whitespace-nowrap rounded-full border px-2 text-[length:var(--text-micro)]',
 				on
 					? 'border-[var(--primary)] bg-[var(--primary-soft)] text-[var(--fg)]'
 					: 'border-[var(--border)] bg-[var(--bg-surface)] text-[var(--fg-muted)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)]'
@@ -398,7 +399,7 @@ function ChipGroup({
 	return (
 		// biome-ignore lint/a11y/useSemanticElements: a chip group, not a form fieldset
 		<span role="group" aria-label={label} className="contents">
-			<span className="text-[var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
+			<span className="text-[length:var(--text-micro)] font-semibold uppercase tracking-[0.1em] text-[var(--fg-muted)]">
 				{label}
 			</span>
 			<Chip on={value === 'all'} label="All" count={allCount} onClick={() => onPick('all')} />
@@ -469,7 +470,7 @@ function Filters({
 					aria-label="Search the audit log"
 					value={chips.q}
 					onChange={(e) => onChips({ ...chips, q: e.target.value })}
-					className="min-w-0 flex-1 bg-transparent text-[var(--text-caption,12px)] text-[var(--fg)] outline-none placeholder:text-[var(--fg-muted)]"
+					className="min-w-0 flex-1 bg-transparent text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none placeholder:text-[var(--fg-muted)]"
 				/>
 			</span>
 			<Button
@@ -524,15 +525,15 @@ function AuditTable({
 		<div className="overflow-x-auto">
 			<table
 				id="auditTable"
-				className="w-full border-collapse text-left text-[var(--text-caption,12px)]"
+				className="w-full border-collapse text-left text-[length:var(--text-caption,12px)]"
 			>
 				<thead>
-					<tr className="border-b border-[var(--border-soft)] text-[var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
-						<th className="px-3 py-2 font-semibold">Who</th>
-						<th className="px-3 py-2 font-semibold">Device</th>
-						<th className="px-3 py-2 font-semibold">Action</th>
-						<th className="px-3 py-2 font-semibold">Target</th>
-						<th className="px-3 py-2 text-right font-semibold">When</th>
+					<tr className="border-b border-[var(--border-soft)] text-[length:var(--text-micro)] uppercase tracking-[0.08em] text-[var(--fg-muted)]">
+						<th className="h-6 px-3 py-0 font-semibold">Who</th>
+						<th className="h-6 px-3 py-0 font-semibold">Device</th>
+						<th className="h-6 px-3 py-0 font-semibold">Action</th>
+						<th className="h-6 px-3 py-0 font-semibold">Target</th>
+						<th className="h-6 px-3 py-0 text-right font-semibold">When</th>
 					</tr>
 				</thead>
 				<tbody id="auditBody">
@@ -551,16 +552,16 @@ function AuditTable({
 								data-category={r.category}
 								className="border-b border-[var(--border-soft)] last:border-b-0"
 							>
-								<td className="px-3 py-2 font-semibold text-[var(--fg)]">{whoLabel(r)}</td>
-								<td className="px-3 py-2 font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg)]">{whoLabel(r)}</td>
+								<td className="h-9 px-3 py-0 font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 									{deviceLabel(r)}
 								</td>
-								<td className="px-3 py-2 text-[var(--fg)]">{actionLabel(r)}</td>
-								<td className="max-w-[280px] truncate px-3 py-2 font-mono text-[var(--text-micro)] text-[var(--fg)]">
+								<td className="h-9 px-3 py-0 text-[var(--fg)]">{actionLabel(r)}</td>
+								<td className="max-w-[280px] truncate h-9 px-3 py-0 font-mono text-[length:var(--text-micro)] text-[var(--fg)]">
 									{targetLabel(r)}
 								</td>
 								<td
-									className="px-3 py-2 text-right font-mono text-[var(--fg-muted)]"
+									className="h-9 px-3 py-0 text-right font-mono text-[var(--fg-muted)]"
 									title={new Date(r.atMs).toISOString()}
 								>
 									{whenLabel(r.atMs, now)}

@@ -23,6 +23,7 @@ import {
 	setShareMode,
 } from '@/lib/transport';
 
+import { D05_FOCUS } from './focus';
 import { Kv, PeopleBlock } from './frame';
 
 /** `access_shares_list`'s `ShareView` (§9.1). */
@@ -98,12 +99,15 @@ export function SharedWithYou() {
 	if (!error && (shares === null || shares.length === 0)) return null;
 	return (
 		<PeopleBlock title="Shared with you" right={<Kv>{shares?.length ?? 0}</Kv>}>
-			<div data-state="shared-with-you" className="divide-y divide-[var(--border-soft)]">
+			<div
+				data-state="shared-with-you"
+				className={`${D05_FOCUS} divide-y divide-[var(--border-soft)]`}
+			>
 				{(shares ?? []).map((s) => (
 					<div key={s.projectKey} className="flex flex-wrap items-center gap-3 py-2">
 						<Users className="h-3.5 w-3.5 text-[var(--fg-muted)]" />
 						<span className="min-w-0 flex-1">
-							<span className="block font-medium text-[var(--text-caption,12px)] text-[var(--fg)]">
+							<span className="block font-medium text-[length:var(--text-caption,12px)] text-[var(--fg)]">
 								{s.projectName}
 							</span>
 							<Kv>
@@ -137,7 +141,7 @@ export function ShareModeBanner() {
 			role="status"
 			className="pointer-events-none fixed inset-x-0 top-0 z-40 flex justify-center"
 		>
-			<div className="pointer-events-auto mt-1 flex items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1 text-[var(--text-micro)] text-[var(--fg)] shadow-md">
+			<div className="pointer-events-auto mt-1 flex items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] px-3 py-1 text-[length:var(--text-micro)] text-[var(--fg)] shadow-md">
 				<Users className="h-3 w-3 text-[var(--fg-muted)]" />
 				<span>{bannerLine(share)}</span>
 				<Button type="button" size="xs" variant="ghost" onClick={leaveShare}>

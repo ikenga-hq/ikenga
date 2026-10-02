@@ -12,6 +12,7 @@
 import { type FormEvent, useId, useState } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { currentPrincipal } from '@/lib/transport/t1-session';
+import { D05_FOCUS } from '@/shell/people/focus';
 
 export function T1SignInForm() {
 	const errorMsg = useReauthStore((s) => s.errorMsg);
@@ -39,24 +40,28 @@ export function T1SignInForm() {
 	};
 
 	const field =
-		'w-full rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 text-[var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]';
+		'w-full rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 text-[length:var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]';
 	const wide =
-		'w-full rounded-md px-5 py-2 text-[var(--text-body-sm)] cursor-pointer disabled:opacity-50';
+		'w-full rounded-md px-5 py-2 text-[length:var(--text-body-sm)] cursor-pointer disabled:opacity-50';
 
 	return (
 		<div
 			data-state="sign-in"
-			className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[var(--bg-base)] p-6 text-[var(--fg)]"
+			className={`${D05_FOCUS} fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[var(--bg-base)] p-6 text-[var(--fg)]`}
 		>
-			<form onSubmit={submit} aria-label="Sign in" className="w-full max-w-[420px] space-y-3">
+			<form
+				onSubmit={submit}
+				aria-label="Sign in"
+				className="flex w-full max-w-[420px] flex-col gap-3"
+			>
 				<h1
-					className="m-0 text-center text-[34px] font-semibold tracking-tight"
+					className="m-0 mb-1 text-center text-[34px] font-semibold tracking-tight"
 					style={{ fontFamily: 'var(--font-display)' }}
 				>
 					Ikenga
 				</h1>
 				<h2 className="sr-only">{previous ? 'Sign in again' : 'Sign in'}</h2>
-				<p className="m-0 text-center text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+				<p className="m-0 mb-1 text-center text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 					{previous
 						? 'Your session ended. Your work is untouched — sign in to pick it back up.'
 						: `Sign in to ${host}. Your files, sessions and secrets stay on this server.`}
@@ -91,7 +96,7 @@ export function T1SignInForm() {
 				<button
 					type="submit"
 					disabled={loading}
-					className={`${wide} bg-[var(--primary)] font-semibold text-[var(--primary-fg)] hover:opacity-90`}
+					className={`${wide} border border-[var(--primary)] bg-[var(--primary)] font-semibold text-[var(--primary-fg)] hover:opacity-90`}
 				>
 					{loading ? 'Signing in...' : 'Sign in'}
 				</button>
@@ -100,7 +105,7 @@ export function T1SignInForm() {
 						{errorMsg}
 					</div>
 				)}
-				<div className="flex items-center gap-3 text-[var(--text-micro)] text-[var(--fg-faint)]">
+				<div className="flex items-center gap-3 text-[length:var(--text-micro)] text-[var(--fg-faint)]">
 					<span className="h-px flex-1 bg-[var(--border-soft)]" />
 					or
 					<span className="h-px flex-1 bg-[var(--border-soft)]" />
@@ -112,7 +117,7 @@ export function T1SignInForm() {
 				>
 					Pair this device with a code
 				</button>
-				<p className="m-0 pt-2 text-center text-[var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
+				<p className="m-0 pt-2 text-center text-[length:var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
 					Accounts on this server are created by its operator, or by an invite someone shared with
 					you. Nothing here is synced anywhere else.
 				</p>

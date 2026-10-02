@@ -22,6 +22,7 @@ import {
 import { StatusChip } from '@/components/ui/status-chip';
 import { type AuthMe, currentPrincipal, fetchAuthMe } from '@/lib/transport/t1-session';
 
+import { D05_DANGER, D05_FOCUS } from './focus';
 import { Kv, PeopleBlock, PeopleRow } from './frame';
 
 /** §2.2 / §3.10 copy: signing out ends one session and bumps no epoch. */
@@ -127,7 +128,7 @@ export function AccountBlock() {
 					>
 						{(me?.username ?? '?').slice(0, 1).toUpperCase()}
 					</span>
-					<b className="font-mono text-[var(--text-caption,12px)] font-medium text-[var(--fg)]">
+					<b className="font-mono text-[length:var(--text-caption,12px)] font-medium text-[var(--fg)]">
 						{me?.username ?? '—'}
 					</b>
 					{me?.is_admin && <StatusChip tone="accent">admin</StatusChip>}
@@ -159,7 +160,7 @@ export function AccountBlock() {
 						type="button"
 						variant="outline"
 						size="xs"
-						className="text-[var(--danger)]"
+						className={D05_DANGER}
 						onClick={() => setSigningOut(true)}
 					>
 						<LogOut /> Sign out
@@ -191,7 +192,7 @@ function SignOutConfirm({ open, onClose }: { open: boolean; onClose: () => void 
 		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent
 				data-state="account-sign-out"
-				className="bg-[var(--bg-surface)] text-[var(--fg)]"
+				className={`${D05_FOCUS} bg-[var(--bg-surface)] text-[var(--fg)]`}
 			>
 				<DialogHeader>
 					<DialogTitle>Sign out?</DialogTitle>
@@ -264,12 +265,12 @@ function ChangePasswordDialog({
 		}
 	};
 	const field =
-		'h-8 w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]';
+		'h-8 w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]';
 	return (
 		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent
 				data-state="account-password"
-				className="bg-[var(--bg-surface)] text-[var(--fg)]"
+				className={`${D05_FOCUS} bg-[var(--bg-surface)] text-[var(--fg)]`}
 			>
 				<DialogHeader>
 					<DialogTitle>Change password</DialogTitle>
@@ -284,7 +285,7 @@ function ChangePasswordDialog({
 				>
 					<label
 						htmlFor={ids.current}
-						className="block text-[var(--text-micro)] text-[var(--fg-muted)]"
+						className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 					>
 						Current password
 					</label>
@@ -298,7 +299,7 @@ function ChangePasswordDialog({
 					/>
 					<label
 						htmlFor={ids.next}
-						className="block text-[var(--text-micro)] text-[var(--fg-muted)]"
+						className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 					>
 						New password
 					</label>
@@ -312,7 +313,7 @@ function ChangePasswordDialog({
 					/>
 					<label
 						htmlFor={ids.again}
-						className="block text-[var(--text-micro)] text-[var(--fg-muted)]"
+						className="block text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 					>
 						New password, again
 					</label>

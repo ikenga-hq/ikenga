@@ -43,6 +43,7 @@ import {
 	pairPublicBase,
 } from './devices-model';
 import { NewChip, usePairWatch } from './devices-pair-confirm';
+import { D05_FOCUS } from './focus';
 
 /** §3.7 copy for the host-wide pause. */
 export const PAUSED_COPY = 'Too many wrong codes — pairing paused for 15 min.';
@@ -222,7 +223,7 @@ export function PairSheet({
 				onCloseAutoFocus={(e) => {
 					if (handedOff.current) e.preventDefault();
 				}}
-				className="max-h-[calc(100dvh-2rem)] overflow-y-auto border-[var(--border-strong)] bg-[var(--bg-surface)] p-0 text-[var(--fg)] sm:max-w-[640px]"
+				className={`${D05_FOCUS} max-h-[calc(100dvh-2rem)] overflow-y-auto border-[var(--border-strong)] bg-[var(--bg-surface)] p-0 text-[var(--fg)] sm:max-w-[640px]`}
 			>
 				<DialogHeader className="border-b border-[var(--border-soft)] px-4 py-3">
 					<DialogTitle
@@ -237,12 +238,16 @@ export function PairSheet({
 				</DialogHeader>
 
 				<ol className="m-0 flex list-none flex-col gap-4 px-4 py-2">
-					<Step n={1} title={reachable ? 'Remote access is on' : 'Remote access is off'}>
+					<Step
+						n={1}
+						title={reachable ? 'Remote access is on' : 'Remote access is off'}
+						done={reachable}
+					>
 						{reachable
 							? `The daemon serves this workspace at ${view.address}.`
 							: 'Nothing is serving this workspace to other devices.'}
 					</Step>
-					<Step n={2} title="Perimeter">
+					<Step n={2} title="Perimeter" done={reachable}>
 						<span className="flex flex-wrap items-center gap-2">
 							<StatusChip tone={exposure.tone}>{exposure.label}</StatusChip>
 							<span>{exposure.note}</span>
@@ -272,7 +277,7 @@ export function PairSheet({
 					</Step>
 				</ol>
 
-				<div className="mx-4 mb-3 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[var(--text-caption,12px)] text-[var(--fg-muted)]">
+				<div className="mx-4 mb-3 rounded-md border border-dashed border-[var(--border)] px-3 py-2 text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]">
 					Nothing is granted by the code alone. A code that expires, or a confirm you decline,
 					leaves the device with no access at all.
 				</div>
@@ -290,15 +295,31 @@ export function PairSheet({
 	);
 }
 
-function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
+/** D-05 `.step`: a numbered row; a step already true (`done`) wears the
+ *  live tint on its number. */
+function Step({
+	n,
+	title,
+	done = false,
+	children,
+}: {
+	n: number;
+	title: string;
+	done?: boolean;
+	children: React.ReactNode;
+}) {
 	return (
-		<li className="grid grid-cols-[24px_1fr] gap-3">
-			<span className="grid h-6 w-6 place-items-center rounded-full border border-[var(--border)] font-mono text-[11px] text-[var(--fg-muted)]">
+		<li className="grid grid-cols-[20px_1fr] gap-3" data-step={n} data-done={done || undefined}>
+			<span
+				className={`mt-0.5 grid h-5 w-5 place-items-center rounded-full border font-mono text-[10px] ${done ? 'border-transparent bg-[var(--live-soft)] text-[var(--live)]' : 'border-[var(--border-strong)] text-[var(--fg-muted)]'}`}
+			>
 				{n}
 			</span>
 			<div className="min-w-0">
-				<div className="text-[var(--text-body-sm)] font-semibold text-[var(--fg)]">{title}</div>
-				<div className="mt-0.5 text-[var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
+				<div className="text-[length:var(--text-caption,12px)] font-medium text-[var(--fg)]">
+					{title}
+				</div>
+				<div className="mt-0.5 text-[length:var(--text-micro)] leading-relaxed text-[var(--fg-muted)]">
 					{children}
 				</div>
 			</div>
@@ -346,7 +367,7 @@ function PairCode({
 			) : (
 				!ticket.qrPayload && (
 					<span
-						className="max-w-[260px] text-[var(--text-caption,12px)] text-[var(--fg-muted)]"
+						className="max-w-[260px] text-[length:var(--text-caption,12px)] text-[var(--fg-muted)]"
 						data-qr="hidden"
 					>
 						This computer isn't reachable from other devices yet — see Remote access above. You can
@@ -356,7 +377,7 @@ function PairCode({
 			)}
 			<span className="flex flex-col items-start gap-2">
 				{phase.kind === 'code' && (
-					<span className="font-mono text-[var(--text-micro)] text-[var(--fg-muted)]">
+					<span className="font-mono text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 						expires in <b className="text-[var(--fg)]">{expiresIn(ticket.expiresAt, now)}</b>
 					</span>
 				)}

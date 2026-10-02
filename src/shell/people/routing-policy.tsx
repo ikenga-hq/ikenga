@@ -154,7 +154,7 @@ export function RoutingPolicy() {
 						{ id: 'any_approve', label: 'Any paired device', disabled: true },
 					]}
 				/>
-				<span className="text-[var(--text-micro)] text-[var(--fg-muted)]">
+				<span className="text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					{loadError
 						? `Can't read who may answer asks: ${loadError}`
 						: 'Reading who may answer asks…'}
@@ -186,7 +186,7 @@ export function RoutingPolicy() {
 			/>
 			<span
 				data-note={note.kind}
-				className="rounded-md border border-dashed border-[var(--border)] px-3 py-1.5 text-[var(--text-micro)] text-[var(--fg-muted)]"
+				className="rounded-md border border-dashed border-[var(--border)] px-3 py-1.5 text-[length:var(--text-micro)] text-[var(--fg-muted)]"
 			>
 				{note.kind === 'here' && (
 					<>
@@ -217,12 +217,12 @@ export function RoutingPolicy() {
 				)}
 			</span>
 			{(disabled || (hereDisabled && pref.mode !== 'this_device')) && (
-				<span className="text-[var(--text-micro)] text-[var(--fg-muted)]">
+				<span className="text-[length:var(--text-micro)] text-[var(--fg-muted)]">
 					{disabled ?? hereDisabled}
 				</span>
 			)}
 			{error && (
-				<span role="alert" className="text-[var(--text-micro)] text-[var(--danger)]">
+				<span role="alert" className="text-[length:var(--text-micro)] text-[var(--danger)]">
 					{error}
 				</span>
 			)}
