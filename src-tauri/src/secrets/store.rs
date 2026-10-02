@@ -118,6 +118,21 @@ impl From<UnlockError> for StoreError {
     }
 }
 
+/// Whose secrets a store holds — the principal dimension of the trait
+/// (remote-access WP-21, G-PRINCIPAL §10).
+///
+/// The desktop keychain and every T0 store belong to the host's one user;
+/// a T1 principal child's store belongs to exactly one principal, and is keyed
+/// on its `PrincipalId` (text form) both on disk (`<data>/secrets/`) and in
+/// the envelope's authenticated data (`secrets::principal_store`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOwner {
+    /// The process's own user: the desktop app, or a single-tenant daemon.
+    Host,
+    /// One T1 principal.
+    Principal(String),
+}
+
 pub trait SecretsStore: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<String>, StoreError>;
 
@@ -177,6 +192,13 @@ pub trait SecretsStore: Send + Sync {
 
     fn diagnostics(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Whose secrets these are. Defaults to [`StoreOwner::Host`], which is
+    /// every store that existed before WP-21; only the per-principal backend
+    /// overrides it. A wrapper over a principal store must forward it.
+    fn owner(&self) -> StoreOwner {
+        StoreOwner::Host
     }
 }
 

@@ -452,6 +452,65 @@ pub(super) async fn agent_ops_set_enabled(state: &AppState, args: &Value) -> Rpc
     respond("agent_ops_set_enabled", r)
 }
 
+// ─── Secrets (G-30; per-principal layer, remote-access WP-21) ─────────────────
+//
+// Over `state.secrets` (`crate::secrets_env::DaemonSecrets`): a T1 principal
+// child's own store over the `IKENGA_SECRET_*` operator default, or the
+// default alone (T0). The arg names are the desktop commands' (`key`, `value`,
+// `scope`); `scope` decodes as the desktop's `Scope`.
+
+pub(super) fn secrets_get(state: &AppState, args: &Value) -> RpcResponse {
+    let r = req_str(args, &["key"]).and_then(|key| state.secrets.get(&key));
+    respond("secrets_get", r)
+}
+
+pub(super) fn secrets_list_keys(state: &AppState) -> RpcResponse {
+    respond("secrets_list_keys", state.secrets.list_keys())
+}
+
+pub(super) fn secrets_index_names(state: &AppState) -> RpcResponse {
+    respond("secrets_index_names", state.secrets.index_names())
+}
+
+pub(super) fn secrets_get_scoped(state: &AppState, args: &Value) -> RpcResponse {
+    let r = super::rpc::scope_kind(args).and_then(|scope| {
+        let key = req_str(args, &["key"])?;
+        state.secrets.get_scoped(&scope, &key)
+    });
+    respond("secrets_get_scoped", r)
+}
+
+pub(super) fn secrets_list_keys_scoped(state: &AppState, args: &Value) -> RpcResponse {
+    let r = super::rpc::scope_kind(args).and_then(|scope| state.secrets.list_keys_scoped(&scope));
+    respond("secrets_list_keys_scoped", r)
+}
+
+/// The four writes. Into the principal's own store; without one (T0) every
+/// write is refused with `secrets_env::WRITE_REFUSAL`, the operator runbook.
+pub(super) fn secrets_write(state: &AppState, cmd: &str, args: &Value) -> RpcResponse {
+    let secrets = &state.secrets;
+    let r = (|| match cmd {
+        "secrets_set" => {
+            let key = req_str(args, &["key"])?;
+            let value = req_str(args, &["value"])?;
+            secrets.set(&key, &value)
+        }
+        "secrets_delete" => secrets.delete(&req_str(args, &["key"])?),
+        "secrets_set_scoped" => {
+            let scope = super::rpc::scope_kind(args)?;
+            let key = req_str(args, &["key"])?;
+            let value = req_str(args, &["value"])?;
+            secrets.set_scoped(&scope, &key, &value)
+        }
+        "secrets_delete_scoped" => {
+            let scope = super::rpc::scope_kind(args)?;
+            secrets.delete_scoped(&scope, &req_str(args, &["key"])?)
+        }
+        other => Err(format!("not a secrets write: {other}")),
+    })();
+    respond(cmd, r)
+}
+
 // ─── Identity ────────────────────────────────────────────────────────────────
 
 /// The daemon PROCESS's OS user (the desktop's function, unchanged).

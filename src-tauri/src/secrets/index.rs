@@ -216,6 +216,7 @@ pub fn item_name(name: &str) -> Result<String, String> {
 /// The service doubles as the item prefix because the Windows credential
 /// target is the item name itself: a different service with the production
 /// prefix would still address (and overwrite) the production credentials.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))] // keyring_store only
 pub(crate) fn item_name_for_service(service: &str, name: &str) -> Result<String, String> {
     validate_legacy_name(name)?;
     Ok(format!("{service}:{name}"))
