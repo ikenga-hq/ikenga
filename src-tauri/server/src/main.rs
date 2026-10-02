@@ -253,6 +253,29 @@ pub struct ServeArgs {
     #[arg(long, env = "IKENGA_INSECURE_COOKIE")]
     pub insecure_cookie: bool,
 
+    /// The public base URL other devices reach this server at, e.g.
+    /// `https://ik.example` or `http://100.94.12.7:4000` (G-ACCESS §3.3).
+    /// Pairing QR codes and invite links point here. Every tier.
+    #[arg(long, env = "IKENGA_PUBLIC_URL")]
+    pub public_url: Option<String>,
+
+    /// T1 only: the most accounts this server may hold; every creation path
+    /// (CLI, bootstrap, invites) refuses past it (G-ACCESS P-27). Default:
+    /// unlimited.
+    #[arg(long, env = "IKENGA_MAX_ACCOUNTS")]
+    pub max_accounts: Option<u32>,
+
+    /// T1 only: how many days an invite link stays valid (G-ACCESS P-15).
+    /// Default 7, at most 30.
+    #[arg(long, env = "IKENGA_INVITE_TTL", value_parser = clap::value_parser!(u32).range(1..=30))]
+    pub invite_ttl: Option<u32>,
+
+    /// T1 only: let an invite from a project Owner or Operator who is not an
+    /// admin create a new account (G-ACCESS §4.4, N-11). Off by default:
+    /// only an admin's invites create accounts.
+    #[arg(long, env = "IKENGA_MEMBER_INVITES_CREATE_ACCOUNTS")]
+    pub member_invites_create_accounts: bool,
+
     /// Internal: run as a T1 principal child (launched by the broker as the
     /// principal's uid, G-PRINCIPAL §3).
     #[arg(long, hide = true, requires = "expected_uid")]
@@ -375,6 +398,10 @@ async fn main() -> anyhow::Result<()> {
         principal_child: args.principal_child,
         expected_uid: args.expected_uid,
         bootstrap_admin,
+        public_url: args.public_url,
+        max_accounts: args.max_accounts,
+        invite_ttl_days: args.invite_ttl,
+        member_invites_create_accounts: args.member_invites_create_accounts,
     };
 
     run_server_with(config, t1).await
@@ -571,6 +598,40 @@ mod tests {
                 .unwrap();
             assert_eq!(args.serve.executor_tier, tier);
         }
+    }
+
+    /// G-ACCESS §10.1 (M-5): every Part B flag exists and defaults off /
+    /// unlimited.
+    #[test]
+    fn part_b_flags_default_off_and_parse() {
+        let args = CliArgs::try_parse_from(["ikenga-server"]).unwrap().serve;
+        assert_eq!(args.public_url, None);
+        assert_eq!(args.max_accounts, None);
+        assert_eq!(args.invite_ttl, None);
+        assert!(!args.member_invites_create_accounts);
+        assert!(!args.insecure_cookie);
+
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "--public-url",
+            "https://ik.example",
+            "--max-accounts",
+            "20",
+            "--invite-ttl",
+            "30",
+            "--member-invites-create-accounts",
+            "--insecure-cookie",
+        ])
+        .unwrap()
+        .serve;
+        assert_eq!(args.public_url.as_deref(), Some("https://ik.example"));
+        assert_eq!(args.max_accounts, Some(20));
+        assert_eq!(args.invite_ttl, Some(30));
+        assert!(args.member_invites_create_accounts && args.insecure_cookie);
+
+        // P-15: at most 30 days.
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "31"]).is_err());
+        assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "0"]).is_err());
     }
 
     #[test]

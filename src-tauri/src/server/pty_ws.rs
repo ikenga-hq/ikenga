@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
 use super::AppState;
+use crate::access::ctx::AccessCtx;
+use crate::access::sockets::{Registration, SocketKey};
+use crate::access::ws::{check_frame, refusal_frame, Frame, FrameVerdict, WsRoute};
 use crate::pty::SpawnOpts;
 
 #[derive(Deserialize, Debug)]
@@ -30,15 +35,49 @@ pub struct PtyQuery {
     pub spawn: bool,
 }
 
+/// The handshake's own class/caps check (owner{sessions}, `?spawn=true`
+/// {dispatch}) ran in `auth_middleware` (G-ACCESS §1.6); frames are checked
+/// here, and the socket is registered so a revoke or tier change closes it
+/// (§3.10).
 pub async fn pty_ws_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<crate::access::Runtime>>>,
+    ctx: Option<Extension<AccessCtx>>,
     Path(id): Path<String>,
     Query(query): Query<PtyQuery>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    let (Some(Extension(access)), Some(Extension(ctx))) = (access, ctx) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let registration = access.registry.register(socket_key(&ctx));
     ws.on_upgrade(move |socket| {
-        super::activity::track_ws(handle_pty_socket(socket, state, id, query))
+        super::activity::track_ws(handle_pty_socket(
+            socket,
+            state,
+            id,
+            query,
+            ctx,
+            registration,
+        ))
     })
+}
+
+/// What a socket is registered under (G-ACCESS §3.10).
+pub(crate) fn socket_key(ctx: &AccessCtx) -> SocketKey {
+    SocketKey {
+        principal_id: ctx.principal_id.map(|p| p.to_string()),
+        device_id: ctx.device_id.clone(),
+        grant_epoch: ctx.grant_epoch,
+    }
+}
+
+/// The close frame for a registry close (4401 / 4403).
+pub(crate) fn close_message(close: crate::access::sockets::Close) -> Message {
+    Message::Close(Some(CloseFrame {
+        code: close.code,
+        reason: close.reason.into(),
+    }))
 }
 
 /// Control frames are JSON text; terminal output is always binary. The client
@@ -54,8 +93,20 @@ fn control(kind: &str, extra: serde_json::Value) -> Message {
     Message::Text(obj.to_string())
 }
 
-async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, query: PtyQuery) {
+async fn handle_pty_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    id: String,
+    query: PtyQuery,
+    ctx: AccessCtx,
+    mut registration: Registration,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
+    // Revoked between the handshake and here: born closed.
+    if let Some(close) = registration.revoked() {
+        let _ = ws_tx.send(close_message(close)).await;
+        return;
+    }
 
     // The path segment may be a pty id, a terminal id, or a label. Resolve it
     // once: `write` / `resize` / `kill` take the pty id only, so holding on to
@@ -195,6 +246,8 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, 
     // exists to remove.
     let exit_manager = state.pty_manager.clone();
     let exit_watch_id = pty_id.clone();
+    // Refusal frames from the input pump (G-ACCESS §1.6) share this writer.
+    let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     let mut send_task = tokio::spawn(async move {
         let exit_fut = exit_manager.wait_for_exit(&exit_watch_id);
         tokio::pin!(exit_fut);
@@ -205,6 +258,16 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, 
                 // final chunk still in flight, and losing the last line of a
                 // command is the most visible way to get this wrong.
                 biased;
+
+                // A revoke (4401) or tier change (4403) closes the socket;
+                // the PTY lives on (G-ACCESS §3.10). First, so a flood of
+                // output can't starve it.
+                closed = &mut registration.closed => {
+                    if let Ok(close) = closed {
+                        let _ = ws_tx.send(close_message(close)).await;
+                    }
+                    break;
+                }
 
                 recv = pty_rx.recv() => match recv {
                     Ok(bytes) => {
@@ -220,6 +283,12 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, 
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
+
+                Some(ctl) = ctl_rx.recv() => {
+                    if ws_tx.send(ctl).await.is_err() {
+                        break;
+                    }
+                }
 
                 code = &mut exit_fut => {
                     // Flush whatever the shell emitted on its way out before
@@ -244,6 +313,24 @@ async fn handle_pty_socket(socket: WebSocket, state: Arc<AppState>, id: String, 
     // Task 2: Pump WebSocket input -> PTY stdin / control commands
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
+            // G-ACCESS §1.6: every PTY input frame needs {dispatch}; a
+            // refused one is dropped and answered, the socket stays open.
+            let frame = match &msg {
+                Message::Binary(b) => Some(Frame::Binary(b)),
+                Message::Text(t) => Some(Frame::Text(t)),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                if let FrameVerdict::Refuse(missing) = check_frame(ctx.caps, WsRoute::Pty, frame) {
+                    let _ = ctl_tx.send(Message::Text(refusal_frame(missing)));
+                    continue;
+                }
+                crate::access::audit::on_client_frame(
+                    &ctx,
+                    crate::access::audit::FrameRoute::Pty,
+                    &session_id,
+                );
+            }
             match msg {
                 Message::Binary(bytes) => {
                     let _ = pty_manager.write(&session_id, &bytes);

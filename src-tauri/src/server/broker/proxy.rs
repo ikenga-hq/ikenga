@@ -64,6 +64,18 @@ pub trait RpcAuthorizer: Send + Sync {
         cmd: &'a str,
         args: &'a Value,
     ) -> BoxFuture<'a, Decision>;
+
+    /// The non-RPC routes (`/pkgs/*`, the `/ws/*` handshakes), checked
+    /// before they are proxied (G-ACCESS §1.6). Default: allow.
+    fn authorize_route(&self, _ctx: &PrincipalCtx, _parts: &Parts) -> Decision {
+        Decision::Allow
+    }
+
+    /// The narrowing-only headers (`X-Ikenga-Caps`, G-ACCESS §4.5.3) the
+    /// broker sets on every request it proxies for `ctx`. Default: none.
+    fn proxy_headers(&self, _ctx: &PrincipalCtx) -> HeaderMap {
+        HeaderMap::new()
+    }
 }
 
 /// The default: every resolved principal may call every arm of its own
@@ -117,6 +129,9 @@ pub enum FrameDecision {
     Pass,
     /// Swallow this frame; keep the socket.
     Drop,
+    /// Swallow this frame, answer the client with this text frame, keep the
+    /// socket (G-ACCESS §1.6: a frame the caps don't allow).
+    Refuse(String),
     /// Close the socket with this code and reason.
     Close {
         code: u16,
@@ -289,7 +304,8 @@ async fn forward(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    let headers = upstream_headers(headers);
+    let mut headers = upstream_headers(headers);
+    headers.extend(state.hooks.authorizer.proxy_headers(ctx));
     let principal = ctx.principal.id.to_string();
     for attempt in 0..2 {
         let endpoint = match state.children.endpoint(&ctx.principal).await {
@@ -405,6 +421,14 @@ pub async fn pkgs_proxy(
     if !matches!(parts.method, Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
+    if let Decision::Deny {
+        status,
+        code,
+        message,
+    } = state.hooks.authorizer.authorize_route(&ctx, &parts)
+    {
+        return json_error(status, code, &message);
+    }
     let Some(pq) = path_and_query(&parts.uri) else {
         return bad_path();
     };
@@ -429,9 +453,13 @@ async fn connect_upstream(
     endpoint: &ChildEndpoint,
     ctx: &PrincipalCtx,
     path_and_query: &str,
+    extra: &HeaderMap,
 ) -> Result<Upstream, tungstenite::Error> {
     let mut request = format!("ws://{}{path_and_query}", endpoint.addr).into_client_request()?;
     let h = request.headers_mut();
+    for (name, value) in extra {
+        h.insert(name.clone(), value.clone());
+    }
     h.insert(
         "authorization",
         HeaderValue::from_str(&format!("Bearer {}", endpoint.token))
@@ -475,12 +503,24 @@ pub async fn ws_proxy(
     State(state): State<Arc<BrokerState>>,
     Extension(ctx): Extension<PrincipalCtx>,
     Extension(epochs): Extension<Epochs>,
-    uri: axum::http::Uri,
+    parts: Parts,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let uri = parts.uri.clone();
     let Some(pq) = path_and_query(&uri) else {
         return bad_path();
     };
+    // G-ACCESS §1.6: the handshake's class and caps, before a child is
+    // launched or reached.
+    if let Decision::Deny {
+        status,
+        code,
+        message,
+    } = state.hooks.authorizer.authorize_route(&ctx, &parts)
+    {
+        return json_error(status, code, &message);
+    }
+    let extra = state.hooks.authorizer.proxy_headers(&ctx);
     let key = WsKey::from_ctx(&ctx, epochs);
     let mut registration = state.ws.register(key.clone());
     match state.hooks.still_valid.still_valid(&key).await {
@@ -501,7 +541,7 @@ pub async fn ws_proxy(
             Ok(e) => e,
             Err(e) => return child_unavailable(&e),
         };
-        match connect_upstream(&endpoint, &ctx, &pq).await {
+        match connect_upstream(&endpoint, &ctx, &pq, &extra).await {
             Ok(up) => {
                 upstream = Some(up);
                 break;
@@ -624,6 +664,12 @@ async fn pump(
                             }
                         }
                         FrameDecision::Drop => {}
+                        FrameDecision::Refuse(reply) => {
+                            if client_tx.send(Message::Text(reply)).await.is_err() {
+                                let _ = up_tx.send(tungstenite::Message::Close(None)).await;
+                                break;
+                            }
+                        }
                         FrameDecision::Close { code, reason } => {
                             let _ = client_tx.send(close_frame(code, reason)).await;
                             let _ = up_tx.send(tungstenite::Message::Close(None)).await;
@@ -657,6 +703,164 @@ async fn pump(
         }
     }
     let _ = client_tx.close().await;
+}
+
+// ── G-ACCESS hook bodies (WP-74a, R-3) ──────────────────────────────────
+
+/// The caller's access context under T1 (§2.3): a password session is
+/// `full`; a device grant has its row's tier (recorded by the DeviceGrant
+/// resolver); anything else holds nothing. Own workspace only — share
+/// requests are WP-76's ([`select_share`]).
+pub fn access_ctx(
+    ctx: &PrincipalCtx,
+    tiers: &crate::access::devices::TierCache,
+) -> crate::access::ctx::AccessCtx {
+    use crate::access::ctx::AccessCtx;
+    use crate::server::auth::Credential as G;
+    match &ctx.via {
+        G::Session { session_id } => AccessCtx::session(ctx.principal.id, session_id.clone()),
+        G::DeviceGrant { device_id } => match tiers.get(device_id) {
+            Some(tier) => AccessCtx::device(ctx.principal.id, device_id.clone(), tier, 0),
+            None => AccessCtx::child(Some(crate::access::caps::CapSet::EMPTY), None),
+        },
+        // Never produced under T1 (§2.4): grants nothing.
+        G::OperatorBearer => AccessCtx::child(Some(crate::access::caps::CapSet::EMPTY), None),
+    }
+}
+
+/// The share selector a client sent (§4.5.2): `X-Ikenga-Share` on HTTP,
+/// `?share=` on a WS handshake. WP-76 fills the membership lookup and the
+/// routing into the Owner's child; until then a share request is refused
+/// (fail closed), never proxied into the caller's own child unconfined.
+pub fn select_share(parts: &Parts) -> Option<Decision> {
+    let header = parts.headers.contains_key("x-ikenga-share");
+    let query = parts
+        .uri
+        .query()
+        .is_some_and(|q| q.split('&').any(|p| p.split('=').next() == Some("share")));
+    (header || query).then(|| Decision::Deny {
+        status: StatusCode::NOT_IMPLEMENTED,
+        code: "internal",
+        message: crate::access::not_implemented("WP-76"),
+    })
+}
+
+fn forbidden(message: String) -> Decision {
+    Decision::Deny {
+        status: StatusCode::FORBIDDEN,
+        code: "forbidden",
+        message,
+    }
+}
+
+/// R-3 `authorize_rpc` (§1.7): class then caps, before proxying; the child
+/// re-checks with `X-Ikenga-Caps`.
+pub struct AccessAuthorizer {
+    pub tiers: Arc<crate::access::devices::TierCache>,
+}
+
+impl RpcAuthorizer for AccessAuthorizer {
+    fn authorize_rpc<'a>(
+        &'a self,
+        ctx: &'a PrincipalCtx,
+        req: &'a Parts,
+        cmd: &'a str,
+        _args: &'a Value,
+    ) -> BoxFuture<'a, Decision> {
+        Box::pin(async move {
+            if let Some(deny) = select_share(req) {
+                return deny;
+            }
+            let actx = access_ctx(ctx, &self.tiers);
+            match crate::access::authorize_rpc(&actx, cmd) {
+                Ok(()) => Decision::Allow,
+                Err(e) => forbidden(e),
+            }
+        })
+    }
+
+    fn authorize_route(&self, ctx: &PrincipalCtx, parts: &Parts) -> Decision {
+        if let Some(deny) = select_share(parts) {
+            return deny;
+        }
+        let actx = access_ctx(ctx, &self.tiers);
+        match crate::access::ws::authorize_route(&actx, parts.uri.path(), parts.uri.query()) {
+            Ok(()) => Decision::Allow,
+            Err(e) => forbidden(e),
+        }
+    }
+
+    fn proxy_headers(&self, ctx: &PrincipalCtx) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let caps = access_ctx(ctx, &self.tiers).caps.to_header();
+        if let Ok(v) = HeaderValue::from_str(&caps) {
+            h.insert(HeaderName::from_static(crate::access::CAPS_HEADER), v);
+        }
+        h
+    }
+}
+
+/// R-3 broker-side `access_*` arms (§9.1): served here, as root, never
+/// proxied (and so never touching a principal-named path, §6.8).
+pub struct BrokerAccess {
+    pub rt: Arc<crate::access::Runtime>,
+    pub tiers: Arc<crate::access::devices::TierCache>,
+}
+
+impl AccessHandler for BrokerAccess {
+    fn handle<'a>(
+        &'a self,
+        ctx: &'a PrincipalCtx,
+        req: &'a Parts,
+        cmd: &'a str,
+        args: &'a Value,
+    ) -> BoxFuture<'a, Response> {
+        Box::pin(async move {
+            if let Some(Decision::Deny {
+                status,
+                code,
+                message,
+            }) = select_share(req)
+            {
+                return json_error(status, code, &message);
+            }
+            let actx = access_ctx(ctx, &self.tiers);
+            let body = match crate::access::rpc::dispatch(&self.rt, None, &actx, cmd, args).await {
+                Ok(data) => serde_json::json!({ "ok": true, "data": data }),
+                Err(error) => serde_json::json!({ "ok": false, "error": error }),
+            };
+            axum::Json(body).into_response()
+        })
+    }
+}
+
+/// R-3 WS frame hook (§1.6): the same frame check the child runs.
+pub struct AccessFrames {
+    pub tiers: Arc<crate::access::devices::TierCache>,
+}
+
+impl WsFrameHook for AccessFrames {
+    fn client_frame(
+        &self,
+        ctx: &PrincipalCtx,
+        path: &str,
+        frame: ClientFrame<'_>,
+    ) -> FrameDecision {
+        use crate::access::ws::{check_frame, refusal_frame, Frame, FrameVerdict, WsRoute};
+        let Some(route) = WsRoute::of_path(path) else {
+            // Not a socket the table knows: nothing to forward to.
+            return FrameDecision::Drop;
+        };
+        let caps = access_ctx(ctx, &self.tiers).caps;
+        let frame = match frame {
+            ClientFrame::Text(t) => Frame::Text(t),
+            ClientFrame::Binary(b) => Frame::Binary(b),
+        };
+        match check_frame(caps, route, frame) {
+            FrameVerdict::Pass => FrameDecision::Pass,
+            FrameVerdict::Refuse(missing) => FrameDecision::Refuse(refusal_frame(missing)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +936,106 @@ mod tests {
         ] {
             assert!(!is_routable_path(bad), "{bad}");
         }
+    }
+
+    fn principal_ctx(via: crate::server::auth::Credential) -> PrincipalCtx {
+        PrincipalCtx {
+            principal: crate::executor::Principal {
+                id: crate::executor::PrincipalId::new_v7(),
+                username: "ada".into(),
+                unix_name: "ik-ada".into(),
+                uid: 20_000,
+                gid: 20_000,
+                home: "/h".into(),
+                shell: "/bin/sh".into(),
+            },
+            via,
+        }
+    }
+
+    /// G-ACCESS §1.7 / §4.5.3 (A-29, broker half): the broker sets
+    /// `X-Ikenga-Caps` from the resolved credential only — a session is
+    /// full, a device its tier, an unknown device nothing — and refuses a
+    /// share selector until WP-76 routes it.
+    #[test]
+    fn the_broker_sets_caps_from_the_credential_and_refuses_shares() {
+        use crate::access::caps::Tier;
+        use crate::server::auth::Credential;
+        let tiers = Arc::new(crate::access::devices::TierCache::default());
+        tiers.record("phone", Tier::View);
+        let auth = AccessAuthorizer {
+            tiers: tiers.clone(),
+        };
+        let caps = |via| {
+            auth.proxy_headers(&principal_ctx(via))
+                .get(crate::access::CAPS_HEADER)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(
+            caps(Credential::Session {
+                session_id: "s".into()
+            })
+            .as_deref(),
+            Some("files,sessions,dispatch,approve,install,settings,secrets")
+        );
+        assert_eq!(
+            caps(Credential::DeviceGrant {
+                device_id: "phone".into()
+            })
+            .as_deref(),
+            Some("files,sessions")
+        );
+        assert_eq!(
+            caps(Credential::DeviceGrant {
+                device_id: "stranger".into()
+            })
+            .as_deref(),
+            Some("")
+        );
+
+        let parts = |uri: &str, share: bool| {
+            let mut b = axum::http::Request::builder().uri(uri);
+            if share {
+                b = b.header("x-ikenga-share", "owner/project");
+            }
+            b.body(()).unwrap().into_parts().0
+        };
+        let phone = principal_ctx(Credential::DeviceGrant {
+            device_id: "phone".into(),
+        });
+        assert_eq!(
+            auth.authorize_route(&phone, &parts("/ws/fs", false)),
+            Decision::Allow
+        );
+        assert!(matches!(
+            auth.authorize_route(&phone, &parts("/ws/pty/x?spawn=true", false)),
+            Decision::Deny {
+                status: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+        assert!(matches!(
+            auth.authorize_route(&phone, &parts("/ws/fs?share=o/p", false)),
+            Decision::Deny {
+                status: StatusCode::NOT_IMPLEMENTED,
+                ..
+            }
+        ));
+        assert!(matches!(
+            select_share(&parts("/api/rpc", true)),
+            Some(Decision::Deny { .. })
+        ));
+
+        // Frames: a View device's PTY input is refused with the reply frame.
+        let frames = AccessFrames { tiers };
+        assert!(matches!(
+            frames.client_frame(&phone, "/ws/pty/x", ClientFrame::Binary(b"ls")),
+            FrameDecision::Refuse(_)
+        ));
+        assert_eq!(
+            frames.client_frame(&phone, "/ws/fs", ClientFrame::Text("{}")),
+            FrameDecision::Pass
+        );
     }
 
     /// S3-8: a header named in `Connection:` is hop-by-hop for that hop.

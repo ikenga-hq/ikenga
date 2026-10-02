@@ -171,7 +171,21 @@ pub async fn require_principal(
             super::activity::touch();
             next.run(Request::from_parts(parts, body)).await
         }
-        Ok(Resolution::NotPresent) | Ok(Resolution::Rejected(_)) => unauthenticated(),
+        Ok(Resolution::NotPresent) => unauthenticated(),
+        Ok(Resolution::Rejected(why)) => {
+            let mut res = unauthenticated();
+            // G-ACCESS §2.4: a dead device cookie is cleared — not one whose
+            // account is merely disabled (`enable` restores the grant, §3.10).
+            if why == crate::access::devices::REJECTED_DEAD_GRANT
+                && crate::access::http::device_cookie(&parts.headers).is_some()
+            {
+                res.headers_mut().append(
+                    axum::http::header::SET_COOKIE,
+                    crate::access::http::clear_device_cookie(),
+                );
+            }
+            res
+        }
         Err(e) => {
             tracing::error!("credential resolution failed: {e:#}");
             json_error(

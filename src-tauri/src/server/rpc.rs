@@ -128,11 +128,43 @@ impl RpcResponse {
 
 pub async fn rpc_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<axum::Extension<Arc<crate::access::Runtime>>>,
+    ctx: Option<axum::Extension<crate::access::ctx::AccessCtx>>,
     Json(payload): Json<RpcRequest>,
 ) -> impl IntoResponse {
     debug!("RPC request: cmd={}", payload.cmd);
 
-    let res = match payload.cmd.as_str() {
+    // G-ACCESS pre-hook (§1.7, §9.2): every arm runs for a resolved caller,
+    // after its class and caps are checked (an unmapped arm needs all seven,
+    // owner-class). Fail closed when the middleware left no context.
+    let (Some(axum::Extension(access)), Some(axum::Extension(ctx))) = (access, ctx) else {
+        return Json(RpcResponse::error(
+            "unauthenticated: no access context on this request",
+        ));
+    };
+    if let Err(e) = crate::access::authorize_rpc(&ctx, &payload.cmd) {
+        return Json(RpcResponse::error(e));
+    }
+    // A share request runs on a narrowed `AppState` (WP-76); share-mode
+    // `actions_*` go to their own per-request manager.
+    if let Some(share) = ctx.share.as_ref() {
+        if crate::access::share::ACTIONS_ARMS.contains(&payload.cmd.as_str()) {
+            let res =
+                crate::access::share::actions_dispatch(&state, share, &payload.cmd, &payload.args)
+                    .await;
+            return Json(match res {
+                Ok(v) => RpcResponse::success(v),
+                Err(e) => RpcResponse::error(e),
+            });
+        }
+    }
+    let state = match crate::access::prehook_state(&ctx, &payload.cmd, &state) {
+        Ok(Some(narrowed)) => narrowed,
+        Ok(None) => state,
+        Err(e) => return Json(RpcResponse::error(e)),
+    };
+
+    let mut res = match payload.cmd.as_str() {
         // --- PTY Commands ---
         "pty_spawn" => {
             let terminal_id = payload
@@ -548,11 +580,12 @@ pub async fn rpc_handler(
         // the fallthrough reads as "unfinished, someone will get to it", and
         // the next person to read it would implement the thing this decision
         // rejects. `secrets_env::WRITE_REFUSAL` is the operator runbook.
-        cmd @ ("secrets_set" | "secrets_delete" | "secrets_set_scoped"
-        | "secrets_delete_scoped") => RpcResponse::error(format!(
-            "{cmd} {}",
-            crate::secrets_env::WRITE_REFUSAL
-        )),
+        cmd @ ("secrets_set"
+        | "secrets_delete"
+        | "secrets_set_scoped"
+        | "secrets_delete_scoped") => {
+            RpcResponse::error(format!("{cmd} {}", crate::secrets_env::WRITE_REFUSAL))
+        }
         // Desktop: the names in `secrets-index.json`. Daemon: the names of
         // its own namespace — same `string[]` shape, daemon-true content.
         // Needs no `--data-dir`: the namespace is process environment.
@@ -815,6 +848,45 @@ pub async fn rpc_handler(
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
 
         // --- Unknown Command Fallback ---
+        // --- G-ACCESS (§9.1, §9.2): registered skeleton-first by WP-74a ---
+        cmd @ ("access_status"
+        | "access_devices_list"
+        | "access_device_set_tier"
+        | "access_device_revoke"
+        | "access_pair_begin"
+        | "access_pair_cancel"
+        | "access_pair_pending"
+        | "access_pair_decide"
+        | "access_routing_get"
+        | "access_routing_set"
+        | "access_members_list"
+        | "access_member_set_role"
+        | "access_member_remove"
+        | "access_member_restore"
+        | "access_policy_get"
+        | "access_policy_set_cell"
+        | "access_policy_set_owner_approval"
+        | "access_invite_issue"
+        | "access_invite_revoke"
+        | "access_shares_list"
+        | "access_audit_list"
+        | "access_audit_verify"
+        | "access_audit_export"
+        | "access_audit_record_local"
+        | "access_audit_reseal"
+        | "permission_decide"
+        | "permission_relay_put"
+        | "permission_relay_take"
+        | "permission_relay_resolve"
+        | "notifications_record_access"
+        | "share_project_info") => {
+            match crate::access::rpc::dispatch(&access, Some(&*state), &ctx, cmd, &payload.args)
+                .await
+            {
+                Ok(v) => RpcResponse::success(v),
+                Err(e) => RpcResponse::error(e),
+            }
+        }
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");
             RpcResponse::error(format!(
@@ -822,6 +894,16 @@ pub async fn rpc_handler(
             ))
         }
     };
+
+    // G-ACCESS post-hook (§9.2): share filtering (WP-76) and the permission
+    // read model (WP-75's `annotate`), on successful results.
+    if res.ok {
+        if let Some(data) = res.data.as_mut() {
+            if let Err(e) = crate::access::postfilter(&ctx, &payload.cmd, data) {
+                res = RpcResponse::error(e);
+            }
+        }
+    }
 
     Json(res)
 }

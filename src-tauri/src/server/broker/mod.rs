@@ -115,6 +115,9 @@ impl BrokerState {
 pub struct BrokerExtensions {
     pub resolvers: Resolvers,
     pub public: PublicRoutes,
+    /// G-ACCESS §3.9: device-cookie rotation (and clearing a dead cookie)
+    /// on authenticated requests. `None` without an access store.
+    pub device_cookies: Option<Arc<backend::DeviceCookieRotation>>,
 }
 
 impl Default for BrokerExtensions {
@@ -122,7 +125,29 @@ impl Default for BrokerExtensions {
         Self {
             resolvers: Resolvers::new(Arc::new(SessionCookieResolver)),
             public: PublicRoutes::default(),
+            device_cookies: None,
         }
+    }
+}
+
+/// `AccessStatus.principal` under T1: username and `is_admin` from
+/// `accounts` (G-ACCESS §9.1).
+struct AccountsDirectory {
+    pool: SqlitePool,
+}
+
+impl crate::access::PrincipalDirectory for AccountsDirectory {
+    fn lookup<'a>(
+        &'a self,
+        principal_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, bool)>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let id = principal_id.parse().ok()?;
+            let mut conn = self.pool.acquire().await.ok()?;
+            let account = accounts::by_id(&mut conn, id).await.ok()??;
+            Some((account.username, account.is_admin))
+        })
     }
 }
 
@@ -151,7 +176,7 @@ pub fn router(
     )
     .build();
 
-    let protected = Router::new()
+    let mut protected = Router::new()
         .route("/api/rpc", post(proxy::rpc_proxy))
         .route("/ws/*rest", get(proxy::ws_proxy))
         .route("/pkgs/*rest", get(proxy::pkgs_proxy))
@@ -160,7 +185,15 @@ pub fn router(
         .route("/auth/password", post(auth_mod::routes::change_password))
         // `/api/shutdown` and anything else under /api: no such route here,
         // and an unauthenticated caller can't even learn that.
-        .route("/api/*rest", any(api_not_found))
+        .route("/api/*rest", any(api_not_found));
+    // Inner to `require_principal`: runs once the caller is resolved.
+    if let Some(rotation) = extensions.device_cookies {
+        protected = protected.route_layer(middleware::from_fn_with_state(
+            rotation,
+            backend::rotate_device_cookie,
+        ));
+    }
+    let protected = protected
         .route_layer(middleware::from_fn_with_state(
             extensions.resolvers,
             auth_mod::require_principal,
@@ -208,6 +241,8 @@ pub struct BrokerBoot {
     pub provisioning: ProvisioningMode,
     pub bootstrap: Option<BootstrapAdmin>,
     pub insecure_cookie: bool,
+    /// The Part B flags (G-ACCESS §10.1).
+    pub access: crate::access::AccessOptions,
 }
 
 /// Refuse to exec a binary a principal could have replaced (I-9: nothing a
@@ -238,6 +273,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         provisioning,
         bootstrap,
         insecure_cookie,
+        access,
     } = boot;
 
     // Only the broker migrates (§6.1); the probe already did, so this is a
@@ -289,14 +325,55 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         pkgs_dir: config.pkgs_dir.clone(),
         idle_timeout,
     });
-    let state = Arc::new(BrokerState::new(pool.clone(), verifier, launcher)?);
+    let mut state = BrokerState::new(pool.clone(), verifier, launcher)?;
+
+    // G-ACCESS (WP-74a): the access set migrates after `accounts` in the
+    // same `_operator_migrations` table (R-1), and the audit chain is walked
+    // (§6.4; a broken chain comes up degraded, refusing access changes).
+    // Then the R-3 / R-4 / R-5 hooks get their access bodies.
+    let access_store = crate::access::store::AccessStore::open_t1(pool.clone()).await?;
+    let tiers = Arc::new(crate::access::devices::TierCache::default());
+    let access_rt = Arc::new(crate::access::Runtime::for_broker(
+        access_store.clone(),
+        state.ws.clone(),
+        Arc::new(AccountsDirectory { pool: pool.clone() }),
+        access,
+    ));
+    state.hooks = BrokerHooks {
+        authorizer: Arc::new(proxy::AccessAuthorizer {
+            tiers: tiers.clone(),
+        }),
+        access: Arc::new(proxy::BrokerAccess {
+            rt: access_rt.clone(),
+            tiers: tiers.clone(),
+        }),
+        ws_frames: Arc::new(proxy::AccessFrames {
+            tiers: tiers.clone(),
+        }),
+        still_valid: Arc::new(ws_registry::AccessStillValid { pool: pool.clone() }),
+    };
+    let mut extensions = BrokerExtensions::default();
+    extensions
+        .resolvers
+        .push(Arc::new(backend::DeviceGrantResolver {
+            store: access_store.clone(),
+            tiers,
+        }));
+    extensions.public = PublicRoutes::default()
+        .pairing(crate::access::http::pairing_routes(&access_rt))
+        .invites(crate::access::http::invite_routes(&access_rt));
+    extensions.device_cookies = Some(Arc::new(backend::DeviceCookieRotation {
+        store: access_store,
+        insecure_cookie,
+    }));
+    let state = Arc::new(state);
     let app = router(
         state.clone(),
         store,
         &config.static_dir,
         config.allowed_origins.clone(),
         insecure_cookie,
-        BrokerExtensions::default(),
+        extensions,
     );
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);

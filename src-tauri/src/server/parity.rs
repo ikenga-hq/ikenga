@@ -42,7 +42,19 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///
 /// * `pty_list` — legacy alias of `pty_terminal_list`, same arm.
 /// * `fs_home` — the browser has no `@tauri-apps/api/path` `homeDir()`.
-const DAEMON_ONLY_VERBS: &[&str] = &["fs_home", "pty_list"];
+/// * G-ACCESS §9.2 (WP-74a): the two `internal` broker → child arms
+///   (`notifications_record_access`, `share_project_info`) and the three
+///   desktop → daemon relay arms (`permission_relay_*`), which only the
+///   desktop's own Rust calls.
+const DAEMON_ONLY_VERBS: &[&str] = &[
+    "fs_home",
+    "notifications_record_access",
+    "permission_relay_put",
+    "permission_relay_resolve",
+    "permission_relay_take",
+    "pty_list",
+    "share_project_info",
+];
 
 /// `tauri::generate_handler![ … ]` command names, module paths stripped —
 /// line-for-line the parse in `scripts/check-acl-parity.ts`: slice to the
@@ -308,7 +320,9 @@ fn dispatch_arms(src: &str) -> Vec<Arm> {
 /// The served verbs: every literal in every arm pattern, after asserting the
 /// match ends in exactly one literal-free catch-all (the unknown-command
 /// fallback) — so a parse that wandered past the match fails loudly.
-fn served_verbs(rpc_rs: &str) -> BTreeSet<String> {
+/// `pub(crate)` for G-ACCESS A-1 (`access::rpc_requirements`), which maps
+/// every verb this lexer finds.
+pub(crate) fn served_verbs(rpc_rs: &str) -> BTreeSet<String> {
     let arms = dispatch_arms(rpc_rs);
     let catch_alls: Vec<&Arm> = arms.iter().filter(|a| a.literals.is_empty()).collect();
     assert_eq!(

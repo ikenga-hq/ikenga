@@ -203,6 +203,139 @@ impl CredentialResolver for SessionCookieResolver {
     }
 }
 
+/// The DeviceGrant resolver (G-ACCESS R-4, §2.3, §2.4), appended after the
+/// session cookie: the `ikenga_device` cookie or `Authorization: Bearer
+/// ikd1.…`, resolved against the device rows in `operator/accounts.db`.
+/// The device's account must exist, be enabled and have a password (a
+/// disabled account's grants are refused but not written, so `enable`
+/// restores them, §3.10). HTTP resolution does not compare
+/// `session_epoch`; every epoch bump closes the device's sockets through the
+/// R-5 re-check instead.
+pub struct DeviceGrantResolver {
+    pub store: Arc<crate::access::store::AccessStore>,
+    pub tiers: Arc<crate::access::devices::TierCache>,
+}
+
+/// The device token a request presents, and how (cookie first, as a browser
+/// sends it; a non-browser client uses the bearer form).
+pub fn presented_device_token(
+    headers: &axum::http::HeaderMap,
+) -> Option<(String, crate::access::devices::Presented)> {
+    use crate::access::devices::{Presented, TOKEN_PREFIX};
+    if let Some(cookie) = crate::access::http::device_cookie(headers) {
+        return Some((cookie, Presented::Cookie));
+    }
+    headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| t.starts_with(TOKEN_PREFIX))
+        .map(|t| (t.to_string(), Presented::Bearer))
+}
+
+impl CredentialResolver for DeviceGrantResolver {
+    fn name(&self) -> &'static str {
+        "device_grant"
+    }
+
+    fn resolve<'a>(&'a self, parts: &'a Parts) -> BoxFuture<'a, anyhow::Result<Resolution>> {
+        Box::pin(async move {
+            use crate::access::devices::{self, Resolved};
+            let Some((token, _)) = presented_device_token(&parts.headers) else {
+                return Ok(Resolution::NotPresent);
+            };
+            let now = crate::access::audit::chain::now_ms();
+            let row = match devices::resolve(&self.store, &token, now).await? {
+                Resolved::Ok { row, .. } => row,
+                Resolved::Refused(why) => {
+                    tracing::info!("device credential refused ({why:?})");
+                    return Ok(Resolution::Rejected(devices::REJECTED_DEAD_GRANT));
+                }
+            };
+            let Some(principal_id) = row.principal() else {
+                return Ok(Resolution::Rejected(devices::REJECTED_DEAD_GRANT));
+            };
+            let mut conn = self.store.pool.acquire().await?;
+            let account = accounts::by_id(&mut conn, principal_id).await?;
+            drop(conn);
+            let Some(account) = account.filter(|a| !a.is_disabled() && a.password_phc.is_some())
+            else {
+                return Ok(Resolution::Rejected(
+                    "device grant: account disabled or gone",
+                ));
+            };
+            devices::touch(&self.store, &row.device_id, None, now).await;
+            self.tiers.record(&row.device_id, row.tier);
+            Ok(Resolution::Resolved {
+                ctx: PrincipalCtx {
+                    principal: account.principal(),
+                    via: Credential::DeviceGrant {
+                        device_id: row.device_id.clone(),
+                    },
+                },
+                epochs: Epochs {
+                    session_epoch: account.session_epoch,
+                    grant_epoch: Some(row.grant_epoch),
+                },
+            })
+        })
+    }
+}
+
+/// G-ACCESS §2.4 / §3.9 on T1 (`route_layer`, inside `require_principal`):
+/// a cookie-presented device secret older than 30 days is rotated on its
+/// way through (bearer tokens never are), and a present but dead
+/// `ikenga_device` cookie is cleared even when a session carried the
+/// request.
+pub async fn rotate_device_cookie(
+    axum::extract::State(rot): axum::extract::State<Arc<DeviceCookieRotation>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use crate::access::devices::{self, Presented, Resolved};
+    let by_device = matches!(
+        req.extensions().get::<PrincipalCtx>(),
+        Some(PrincipalCtx {
+            via: Credential::DeviceGrant { .. },
+            ..
+        })
+    );
+    let mut set_cookie = None;
+    if let Some((token, Presented::Cookie)) = presented_device_token(req.headers()) {
+        let now = crate::access::audit::chain::now_ms();
+        match devices::resolve(&rot.store, &token, now).await {
+            Ok(Resolved::Ok { row, used_prev }) if by_device => {
+                match devices::rotate_if_due(&rot.store, &row, used_prev, Presented::Cookie, now)
+                    .await
+                {
+                    Ok(t) => {
+                        set_cookie = t.and_then(|t| {
+                            crate::access::http::set_device_cookie(&t, rot.insecure_cookie)
+                        })
+                    }
+                    Err(e) => tracing::warn!("device cookie rotation failed: {e:#}"),
+                }
+            }
+            Ok(Resolved::Refused(_)) => {
+                set_cookie = Some(crate::access::http::clear_device_cookie());
+            }
+            _ => {}
+        }
+    }
+    let mut res = next.run(req).await;
+    if let Some(cookie) = set_cookie {
+        res.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    res
+}
+
+/// State of [`rotate_device_cookie`].
+pub struct DeviceCookieRotation {
+    pub store: Arc<crate::access::store::AccessStore>,
+    pub insecure_cookie: bool,
+}
+
 /// `operator/sessions.db`: the sqlx store, except that [`save`] is
 /// UPDATE-only, so a request still in flight across a logout can't
 /// resurrect the session it loaded (see the module docs).

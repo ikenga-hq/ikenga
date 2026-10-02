@@ -276,6 +276,67 @@ impl SessionsRevokedHook for NoDeviceGrants {
     }
 }
 
+/// G-ACCESS R-11 (§3.10, P-31): a forced logout revokes every device grant
+/// of the principal (`revoked_reason = 'sessions_revoked'`, one
+/// `device.revoked` audit row each), inside the forced logout's own
+/// transaction — the CLI's (`accounts revoke-sessions`) and any broker path.
+/// Open device sockets then close within 2 s through the broker's R-5
+/// re-check (`AccessStillValid`). A store whose `access` set isn't migrated
+/// yet has no devices, and nothing to revoke.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeviceGrantsRevoked {
+    /// `audit_events.via` of the rows written: `cli` or `system`.
+    pub via_cli: bool,
+}
+
+impl SessionsRevokedHook for DeviceGrantsRevoked {
+    fn on_sessions_revoked<'a, 'c>(
+        &'a self,
+        tx: &'a mut Transaction<'c, Sqlite>,
+        principal_id: PrincipalId,
+    ) -> HookFuture<'a>
+    where
+        'c: 'a,
+    {
+        Box::pin(async move {
+            let has_meta: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_meta'",
+            )
+            .fetch_one(&mut **tx)
+            .await?;
+            if has_meta == 0 {
+                return Ok(());
+            }
+            let store_id: Option<String> =
+                sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'store_id'")
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            let Some(store_id) = store_id else {
+                return Ok(());
+            };
+            // A fresh chain view: `append` walks the chain once before it
+            // writes (this process knows no head yet), so a broken chain is
+            // not extended by a CLI write that couldn't verify it.
+            let chain = crate::access::audit::Chain::new(store_id);
+            let via = if self.via_cli { "cli" } else { "system" };
+            let revoked = crate::access::devices::revoke_all_for_principal_in(
+                &mut **tx,
+                &chain,
+                &principal_id.to_string(),
+                via,
+            )
+            .await?;
+            if !revoked.is_empty() {
+                tracing::info!(
+                    "forced logout of {principal_id} revoked {} device grant(s)",
+                    revoked.len()
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Re-read `id` inside `tx`. A row that vanished mid-transaction is a bug
 /// (rows are never deleted), so it is an error, not `None`.
 async fn reload(tx: &mut Transaction<'_, Sqlite>, id: PrincipalId) -> Result<Account, sqlx::Error> {

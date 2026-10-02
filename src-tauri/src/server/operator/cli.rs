@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-use super::accounts::{self, Actor, NoDeviceGrants};
+use super::accounts::{self, Actor, DeviceGrantsRevoked};
 use super::adopt_t0;
 use super::provision::{Adopt, Provisioner, ProvisioningMode, ReapOutcome, UidRange, UidReaper};
 use super::reaper::{HelperCommand, T1Reaper};
@@ -248,7 +248,7 @@ pub(crate) async fn run_with(
         }
         AccountsCommand::RevokeSessions { username } => {
             let a = prov
-                .revoke_sessions(pool, &username, &NoDeviceGrants)
+                .revoke_sessions(pool, &username, &DeviceGrantsRevoked { via_cli: true })
                 .await?;
             writeln!(
                 out,

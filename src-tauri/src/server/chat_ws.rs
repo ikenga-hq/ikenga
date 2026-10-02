@@ -14,7 +14,9 @@ use std::sync::Arc;
 use agent_client_protocol::schema::SessionUpdate;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -22,6 +24,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
 use super::AppState;
+use crate::access::ctx::AccessCtx;
+use crate::access::sockets::Registration;
+use crate::access::ws::{check_frame, refusal_frame, Frame, FrameVerdict, WsRoute};
 use crate::engines::EngineHandle;
 
 /// Engine used when the client doesn't name one.
@@ -41,13 +46,28 @@ pub enum ChatClientMessage {
     Cancel,
 }
 
+/// The handshake check (shared{sessions}) ran in `auth_middleware`
+/// (G-ACCESS §1.6); `Prompt` / `Cancel` need {dispatch} and are checked per
+/// frame, and the socket is registered for revocation (§3.10).
 pub async fn chat_ws_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<crate::access::Runtime>>>,
+    ctx: Option<Extension<AccessCtx>>,
     Path(thread_id): Path<String>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    let (Some(Extension(access)), Some(Extension(ctx))) = (access, ctx) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let registration = access.registry.register(super::pty_ws::socket_key(&ctx));
     ws.on_upgrade(move |socket| {
-        super::activity::track_ws(handle_chat_socket(socket, state, thread_id))
+        super::activity::track_ws(handle_chat_socket(
+            socket,
+            state,
+            thread_id,
+            ctx,
+            registration,
+        ))
     })
 }
 
@@ -221,9 +241,23 @@ async fn cancel_turn(state: &AppState, engine_name: &str, thread_id: &str) {
     }
 }
 
-async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: String) {
+async fn handle_chat_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    thread_id: String,
+    ctx: AccessCtx,
+    mut registration: Registration,
+) {
     let (ws_tx, mut ws_rx) = socket.split();
     let ws_tx: WsSink = Arc::new(TokioMutex::new(ws_tx));
+    if let Some(close) = registration.revoked() {
+        let _ = ws_tx
+            .lock()
+            .await
+            .send(super::pty_ws::close_message(close))
+            .await;
+        return;
+    }
 
     info!("Chat WebSocket connected for thread: {thread_id}");
 
@@ -234,9 +268,34 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
     // adapter actually started the turn.
     let mut in_flight: Option<(tokio::task::JoinHandle<()>, String)> = None;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // A revoke (4401) or tier change (4403) closes the socket; a
+            // running turn is cancelled below like any dropped socket.
+            closed = &mut registration.closed => {
+                if let Ok(close) = closed {
+                    let _ = ws_tx.lock().await.send(super::pty_ws::close_message(close)).await;
+                }
+                break;
+            }
+            msg = ws_rx.next() => match msg {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Text(text) => {
+                // G-ACCESS §1.6: `Prompt` / `Cancel` need {dispatch}.
+                if let FrameVerdict::Refuse(missing) =
+                    check_frame(ctx.caps, WsRoute::Chat, Frame::Text(&text))
+                {
+                    let _ = ws_tx
+                        .lock()
+                        .await
+                        .send(Message::Text(refusal_frame(missing)))
+                        .await;
+                    continue;
+                }
                 let Ok(client_msg) = serde_json::from_str::<ChatClientMessage>(&text) else {
                     continue;
                 };
@@ -247,6 +306,28 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                         cwd,
                         model,
                     } => {
+                        // G-ACCESS §4.5.4 share hooks (WP-76): the client's
+                        // `cwd` is forced under the share root, and a
+                        // share-originated run gets no vault env (N-10).
+                        let cwd = match ctx.share.as_ref() {
+                            None => cwd,
+                            Some(share) => {
+                                match crate::access::share::chat_cwd(share, cwd.as_deref())
+                                    .and_then(|c| crate::access::share::run_env(share).map(|_| c))
+                                {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        send(&ws_tx, error_event(&thread_id, e)).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        crate::access::audit::on_client_frame(
+                            &ctx,
+                            crate::access::audit::FrameRoute::Chat,
+                            &thread_id,
+                        );
                         // Reap a finished turn so a completed one never looks
                         // in-flight.
                         if in_flight.as_ref().is_some_and(|(h, _)| h.is_finished()) {

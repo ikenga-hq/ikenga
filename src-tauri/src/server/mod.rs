@@ -48,7 +48,7 @@ pub mod static_files;
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
 #[cfg(test)]
-mod parity;
+pub(crate) mod parity;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -137,6 +137,36 @@ pub struct T1ServeOptions {
     pub expected_uid: Option<u32>,
     /// The captured first-admin bootstrap (§7.4).
     pub bootstrap_admin: Option<BootstrapCredentials>,
+    /// `--public-url` / `IKENGA_PUBLIC_URL` (G-ACCESS §3.3): the public base
+    /// pairing QR codes and invite links point at. Every tier.
+    pub public_url: Option<String>,
+    /// `--max-accounts N` (G-ACCESS P-27): caps every account-creation path;
+    /// `None` = unlimited. T1 broker.
+    pub max_accounts: Option<u32>,
+    /// `--invite-ttl DAYS` (G-ACCESS P-15): invite token lifetime, default
+    /// 7, at most 30. T1 broker.
+    pub invite_ttl_days: Option<u32>,
+    /// `--member-invites-create-accounts` (G-ACCESS §4.4, N-11): let an
+    /// invite from a non-admin Owner/Operator create a new account. Off by
+    /// default. T1 broker.
+    pub member_invites_create_accounts: bool,
+}
+
+impl T1ServeOptions {
+    /// The Part B flags as the access module reads them (G-ACCESS §10.1).
+    /// Kept beside the WP-20 options rather than in [`ServerConfig`] for the
+    /// same reason as `insecure_cookie` (remote-access Round 17): the many
+    /// `ServerConfig` literals in tests stay untouched.
+    pub fn access_options(&self, allowed_origins: &[String]) -> crate::access::AccessOptions {
+        crate::access::AccessOptions {
+            public_url: self.public_url.clone(),
+            insecure_cookie: self.insecure_cookie,
+            max_accounts: self.max_accounts,
+            invite_ttl_days: self.invite_ttl_days,
+            member_invites_create_accounts: self.member_invites_create_accounts,
+            allowed_origins: allowed_origins.to_vec(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -238,6 +268,13 @@ fn origin_permitted(req: &Request, state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
+/// The protected routes' gate (G-ACCESS §1.7, §2.4): the `Origin` check,
+/// then credential resolution into an [`crate::access::ctx::AccessCtx`] in
+/// the request extensions (device grant, then the operator bearer; a
+/// principal child takes only its per-child token), then the non-RPC route
+/// requirement (`/api/shutdown` operator, `/ws/*`, `/pkgs/*`). Client-sent
+/// `X-Ikenga-*` headers never reach a handler (A-29). `/api/rpc` arms are
+/// checked by `rpc_handler`'s pre-hook.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -258,39 +295,64 @@ async fn auth_middleware(
         warn!("Rejecting {} — server has no auth token", req.uri().path());
         return Err(unauthorized("Unauthorized: server has no auth token"));
     };
+    // Every router carries the access runtime (`build_router`); without it
+    // nothing is authorized.
+    let Some(access) = req
+        .extensions()
+        .get::<Arc<crate::access::Runtime>>()
+        .cloned()
+    else {
+        error!(
+            "Rejecting {} — router has no access runtime",
+            req.uri().path()
+        );
+        return Err(unauthorized("Unauthorized: invalid or missing auth token"));
+    };
+    let remote = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string());
 
-    // 1. Authorization: Bearer <TOKEN>
-    if let Some(header) = req
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-    {
-        if ct_eq(header, expected) {
-            return Ok(activity::track_request(next.run(req)).await);
-        }
-    }
-
-    // 2. ?token=<TOKEN> — the only way to authenticate a WebSocket handshake
-    //    from a browser, which cannot set request headers on `new WebSocket`.
-    if let Some(query) = req.uri().query() {
-        for param in query.split('&') {
-            if let Some((k, v)) = param.split_once('=') {
-                if k != "token" {
-                    continue;
-                }
-                let decoded = percent_encoding::percent_decode_str(v)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                if ct_eq(&decoded, expected) {
-                    return Ok(activity::track_request(next.run(req)).await);
-                }
+    let (mut parts, body) = req.into_parts();
+    let resolved = crate::access::http::resolve_t0(
+        &access,
+        &parts.headers,
+        parts.uri.query(),
+        expected,
+        remote.as_deref(),
+    )
+    .await;
+    // Read (by a principal child) or not, they go no further.
+    crate::access::strip_ikenga_headers(&mut parts.headers);
+    let (ctx, set_cookie) = match resolved {
+        crate::access::http::T0Auth::Ok { ctx, set_cookie } => (ctx, set_cookie),
+        crate::access::http::T0Auth::Denied { clear_cookie } => {
+            warn!("Unauthorized request to {}", parts.uri.path());
+            let mut res = unauthorized("Unauthorized: invalid or missing auth token");
+            if clear_cookie {
+                res.headers_mut().append(
+                    axum::http::header::SET_COOKIE,
+                    crate::access::http::clear_device_cookie(),
+                );
             }
+            return Err(res);
         }
+    };
+    if let Err(e) = crate::access::ws::authorize_route(&ctx, parts.uri.path(), parts.uri.query()) {
+        warn!("{} refused: {e}", parts.uri.path());
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response());
     }
-
-    warn!("Unauthorized request to {}", req.uri().path());
-    Err(unauthorized("Unauthorized: invalid or missing auth token"))
+    parts.extensions.insert(ctx);
+    let mut res = activity::track_request(next.run(Request::from_parts(parts, body))).await;
+    if let Some(cookie) = set_cookie {
+        res.headers_mut()
+            .append(axum::http::header::SET_COOKIE, cookie);
+    }
+    Ok(res)
 }
 
 pub async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -371,6 +433,31 @@ pub(crate) fn router_with(
         path_guard,
         // G-PRINCIPAL seam: the daemon process's own store.
         crate::pkg::skill_actions::store_root(),
+        Arc::new(crate::access::Runtime::none()),
+    )
+}
+
+/// [`create_router`] with the access runtime the daemon opened at boot
+/// (G-ACCESS §2.5). The other constructors attach
+/// [`crate::access::Runtime::none`]: the operator bearer, no store.
+pub(crate) fn create_router_with_access(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    access: Arc<crate::access::Runtime>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        shutdown_tx,
+        crate::platform::home_dir(),
+        rpc_shell::PathGuard::allowlist(),
+        crate::pkg::skill_actions::store_root(),
+        access,
     )
 }
 
@@ -396,6 +483,7 @@ pub(crate) fn router_with_store(
         home,
         path_guard,
         store,
+        Arc::new(crate::access::Runtime::none()),
     )
 }
 
@@ -409,6 +497,7 @@ fn build_router(
     home: Option<PathBuf>,
     path_guard: rpc_shell::PathGuard,
     store: Option<PathBuf>,
+    access: Arc<crate::access::Runtime>,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -498,12 +587,19 @@ fn build_router(
             auth_middleware,
         ));
 
+    // G-ACCESS §1.6: the public pairing routes (T0 daemon only; their own
+    // `Origin` layer), and the access runtime as an `Extension` on every
+    // route — `auth_middleware`, `rpc_handler` and the WS handlers read it
+    // (X-2: never an `AppState` field).
+    let public_access = crate::access::http::t0_public_router(&access);
     Router::new()
         .route("/api/health", get(health::health_handler))
         .merge(protected_routes)
         .fallback(spa_fallback_handler)
-        .layer(cors)
         .with_state(state)
+        .merge(public_access)
+        .layer(axum::Extension(access))
+        .layer(cors)
 }
 
 async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> impl IntoResponse {
@@ -525,6 +621,7 @@ pub async fn run_server_with(config: ServerConfig, t1: T1ServeOptions) -> anyhow
     if config.executor_tier == crate::executor::ExecutorTier::T1 {
         return t1_boot(config, t1).await;
     }
+    let access = t1.access_options(&config.allowed_origins);
     if t1.principal_child {
         anyhow::bail!("--principal-child is only valid with --executor-tier t1");
     }
@@ -539,7 +636,14 @@ pub async fn run_server_with(config: ServerConfig, t1: T1ServeOptions) -> anyhow
         "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
         executor.tier, executor.pty, executor.piped, executor.principal_isolation
     );
-    serve_single_tenant(config, SingleTenant::default()).await
+    serve_single_tenant(
+        config,
+        SingleTenant {
+            access,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// What differs when the single-tenant daemon runs as a T1 principal child.
@@ -550,6 +654,8 @@ struct SingleTenant {
     lock: Option<principal_child::DataDirLock>,
     /// A principal child: exits when the broker that launched it is gone.
     principal_child: bool,
+    /// The Part B flags (G-ACCESS §10.1).
+    access: crate::access::AccessOptions,
 }
 
 /// Resolves on SIGINT, SIGTERM or a message on `shutdown_rx`.
@@ -592,6 +698,18 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     let minted = config.auth_token.is_none();
     if minted {
         config.auth_token = Some(uuid::Uuid::new_v4().simple().to_string());
+    }
+    // G-ACCESS §2.4: `ikd1.` marks a device grant. An operator token that
+    // looked like one would make the two credentials ambiguous.
+    if config
+        .auth_token
+        .as_deref()
+        .is_some_and(|t| t.starts_with(crate::access::devices::TOKEN_PREFIX))
+    {
+        anyhow::bail!(
+            "IKENGA_AUTH_TOKEN must not start with `{}` (reserved for paired-device tokens)",
+            crate::access::devices::TOKEN_PREFIX
+        );
     }
 
     let mut pa_db: Option<Arc<crate::db::PaDb>> = None;
@@ -655,25 +773,40 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     }
     let token = config.auth_token.clone().unwrap_or_default();
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
-    let router = create_router(
+    // G-ACCESS §2.5: the T0 daemon opens (migrates, verifies) the access
+    // store in `--data-dir`; a principal child never does (§1.7, A-32).
+    let access = Arc::new(
+        crate::access::Runtime::for_daemon(
+            config.data_dir.as_deref(),
+            mode.principal_child,
+            mode.access.clone(),
+        )
+        .await,
+    );
+    let router = create_router_with_access(
         config.clone(),
         pty_manager.clone(),
         engine_registry,
         pa_db,
         Some(shutdown_tx.clone()),
+        access.clone(),
     );
 
     // Idle timeout watcher (G-02): shuts down daemon when no active sessions for idle_timeout_secs
     if let Some(idle_timeout_secs) = config.idle_timeout_secs {
         let pty_manager = pty_manager.clone();
         let shutdown_tx = shutdown_tx.clone();
+        let access = access.clone();
         tokio::spawn(async move {
             let timeout = std::time::Duration::from_secs(idle_timeout_secs);
             let mut idle_since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                // §5 row 13: PTYs, open WebSockets and recent requests.
-                if activity::is_active(pty_manager.active_session_count(), timeout) {
+                // §5 row 13: PTYs, open WebSockets and recent requests;
+                // G-ACCESS §2.5 (M-3): plus live device sockets and the
+                // keep-alive leases of open pairing sessions / relay asks.
+                let busy = pty_manager.active_session_count() + access.activity();
+                if activity::is_active(busy, timeout) {
                     idle_since = None;
                 } else {
                     let since = idle_since.get_or_insert_with(std::time::Instant::now);
@@ -756,9 +889,13 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     #[cfg(not(target_os = "linux"))]
     let _ = mode.principal_child;
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx.subscribe()))
-        .await?;
+    // Connect info: device `last_seen_addr` (G-ACCESS §3.9).
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx.subscribe()))
+    .await?;
 
     info!("ikenga-server shutting down: cleaning up metadata and draining PTY sessions");
     let _ = std::fs::remove_file(&temp_meta_path);
@@ -840,6 +977,7 @@ async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()>
              no principal surface (G-PRINCIPAL §2.4); principals sign in at /auth/login"
         );
     }
+    let access = t1.access_options(&config.allowed_origins);
     let bootstrap = t1.bootstrap_admin.map(|b| BootstrapAdmin {
         username: b.username,
         password: b.password,
@@ -852,6 +990,7 @@ async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()>
         provisioning,
         bootstrap,
         insecure_cookie: t1.insecure_cookie,
+        access,
     })
     .await
 }
@@ -896,11 +1035,13 @@ async fn principal_child_boot(mut config: ServerConfig, t1: T1ServeOptions) -> a
     // Loopback only, whatever was passed (P-7).
     config.host = "127.0.0.1".into();
     config.port = 0;
+    let access = t1.access_options(&config.allowed_origins);
     serve_single_tenant(
         config,
         SingleTenant {
             lock: Some(lock),
             principal_child: true,
+            access,
         },
     )
     .await

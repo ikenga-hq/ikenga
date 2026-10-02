@@ -48,7 +48,9 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -57,6 +59,8 @@ use tracing::{debug, info};
 
 use super::rpc_shell::PathGuard;
 use super::AppState;
+use crate::access::ctx::{AccessCtx, ShareCtx};
+use crate::access::sockets::Registration;
 use crate::fs_watch::{FileChange, FsEventSink, FsWatchManager};
 
 /// Cap on live watchers for one socket. Each one is an OS watch plus a
@@ -125,15 +129,49 @@ fn error_frame(req_id: Option<&str>, message: &str) -> Message {
     )
 }
 
+/// The handshake check (shared{files}) ran in `auth_middleware` (G-ACCESS
+/// §1.6); under a share every watch root is confined (WP-76's
+/// `share::fs_watch_root`), and the socket is registered for revocation.
 pub async fn fs_ws_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<crate::access::Runtime>>>,
+    ctx: Option<Extension<AccessCtx>>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| super::activity::track_ws(handle_fs_socket(socket, state)))
+) -> axum::response::Response {
+    let (Some(Extension(access)), Some(Extension(ctx))) = (access, ctx) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let registration = access.registry.register(super::pty_ws::socket_key(&ctx));
+    ws.on_upgrade(move |socket| {
+        super::activity::track_ws(handle_fs_socket(socket, state, ctx, registration))
+    })
 }
 
-async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
+/// G-ACCESS §4.5.4: a share-mode `watch` is confined to the share root
+/// (the frame is rewritten to the confined root) or refused.
+fn confine_watch(raw: &str, guard: &PathGuard, share: &ShareCtx) -> Result<String, Message> {
+    let Ok(FsControlMessage::Watch { req_id, path }) = serde_json::from_str(raw) else {
+        return Ok(raw.to_string());
+    };
+    let resolved = guard
+        .resolve(&path)
+        .map_err(|e| error_frame(req_id.as_deref(), &e))?;
+    let root = crate::access::share::fs_watch_root(share, &resolved)
+        .map_err(|e| error_frame(req_id.as_deref(), &e))?;
+    Ok(json!({ "type": "watch", "reqId": req_id, "path": root.to_string_lossy() }).to_string())
+}
+
+async fn handle_fs_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    ctx: AccessCtx,
+    mut registration: Registration,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
+    if let Some(close) = registration.revoked() {
+        let _ = ws_tx.send(super::pty_ws::close_message(close)).await;
+        return;
+    }
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
     info!("FS watcher WebSocket client connected");
@@ -160,12 +198,33 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
         json!({ "type": "fs_ready", "status": "watching", "watching": true }).to_string(),
     ));
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // A revoke (4401) or tier change (4403) closes the socket.
+            closed = &mut registration.closed => {
+                if let Ok(close) = closed {
+                    let _ = out_tx.send(super::pty_ws::close_message(close));
+                }
+                break;
+            }
+            msg = ws_rx.next() => match msg {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Close(_) => break,
-            Message::Text(text) => {
-                handle_control(&text, &state.path_guard, &manager, &sink, &out_tx)
-            }
+            Message::Text(text) => match ctx.share.as_ref() {
+                None => handle_control(&text, &state.path_guard, &manager, &sink, &out_tx),
+                Some(share) => match confine_watch(&text, &state.path_guard, share) {
+                    Ok(frame) => {
+                        handle_control(&frame, &state.path_guard, &manager, &sink, &out_tx)
+                    }
+                    Err(refusal) => {
+                        let _ = out_tx.send(refusal);
+                    }
+                },
+            },
             // Binary/ping/pong carry nothing this socket understands. Axum
             // answers pings itself.
             _ => {}

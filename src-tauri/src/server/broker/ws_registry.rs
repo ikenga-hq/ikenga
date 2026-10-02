@@ -96,6 +96,16 @@ impl CloseReason {
         code: CLOSE_REVOKED,
         reason: "logged out",
     };
+    /// G-ACCESS §3.10: the device grant was revoked.
+    pub const DEVICE_REVOKED: CloseReason = CloseReason {
+        code: CLOSE_REVOKED,
+        reason: "device_revoked",
+    };
+    /// G-ACCESS §3.10 / P-12: the device's tier changed; reconnect.
+    pub const CAPS_CHANGED: CloseReason = CloseReason {
+        code: crate::access::sockets::CLOSE_CAPS_CHANGED,
+        reason: "caps_changed",
+    };
 }
 
 struct Entry {
@@ -334,6 +344,67 @@ impl StillValid for AccountEpochs {
     }
 }
 
+/// G-ACCESS R-5: [`AccountEpochs`] plus the device grant. A device socket
+/// closes once its account's `session_epoch` moved (passwd, disable, forced
+/// logout — I-8 for device sockets, P-31) **or** its grant was revoked or
+/// re-tiered (`grant_epoch` moved). Also covers root-CLI writes within 2 s
+/// through [`recheck_loop`] (A-33).
+#[derive(Clone)]
+pub struct AccessStillValid {
+    pub pool: SqlitePool,
+}
+
+impl StillValid for AccessStillValid {
+    fn still_valid<'a>(&'a self, key: &'a WsKey) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move {
+            let account_ok = AccountEpochs {
+                pool: self.pool.clone(),
+            }
+            .still_valid(key)
+            .await?;
+            if !account_ok {
+                return Ok(false);
+            }
+            let Some(device_id) = key.device_id.as_deref() else {
+                return Ok(true);
+            };
+            let row: Option<(i64, Option<i64>)> =
+                sqlx::query_as("SELECT grant_epoch, revoked_at FROM devices WHERE device_id = ?")
+                    .bind(device_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            Ok(matches!(
+                row,
+                Some((epoch, None)) if Some(epoch) == key.grant_epoch
+            ))
+        })
+    }
+}
+
+/// The access arms close device sockets through this (G-ACCESS §3.10):
+/// in-process, so a broker-side revoke or tier change is immediate.
+impl crate::access::sockets::SocketControl for WsRegistry {
+    fn device_revoked(&self, device_id: &str) -> usize {
+        self.close_where(CloseReason::DEVICE_REVOKED, |k| {
+            k.device_id.as_deref() == Some(device_id)
+        })
+    }
+
+    fn device_caps_changed(&self, device_id: &str, new_epoch: i64) -> usize {
+        self.close_where(CloseReason::CAPS_CHANGED, |k| {
+            k.device_id.as_deref() == Some(device_id)
+                && k.grant_epoch.map_or(true, |e| e < new_epoch)
+        })
+    }
+
+    fn live_for_device(&self, device_id: &str) -> usize {
+        self.keys()
+            .iter()
+            .filter(|(_, k)| k.device_id.as_deref() == Some(device_id))
+            .count()
+    }
+}
+
 /// `PRAGMA data_version` on `conn`: it changes whenever **another**
 /// connection commits to the database (SQLite docs), which is every writer
 /// the broker doesn't own — the root CLI — and its own pool's writes too.
@@ -531,6 +602,151 @@ mod tests {
             .await
             .unwrap();
         assert!(!check.still_valid(&key(id, "s", 2)).await.unwrap());
+    }
+
+    /// A-33 (over R-5 / R-11): a device socket closes when its account's
+    /// epoch moves (passwd, disable) or its grant is revoked or re-tiered;
+    /// a forced logout revokes every grant of the principal, audited, in the
+    /// logout's own transaction, and the CLI's write closes the socket
+    /// within 2 s through the re-check loop.
+    #[tokio::test]
+    async fn device_sockets_follow_both_epochs_and_forced_logout_revokes_grants() {
+        use crate::access::caps::Tier;
+        use crate::server::operator::accounts::{self, Actor, DeviceGrantsRevoked};
+        let (_tmp, root) = crate::server::operator::test_support::temp_root();
+        let pool =
+            crate::server::operator::open_accounts(&root, crate::server::operator::Opener::Broker)
+                .await
+                .unwrap();
+        let store = crate::access::store::AccessStore::open_t1(pool.clone())
+            .await
+            .unwrap();
+        let id = PrincipalId::new_v7();
+        sqlx::query(
+            "INSERT INTO accounts (principal_id, username, unix_name, unix_uid, unix_gid, home, \
+             password_phc, created_at, updated_at) VALUES (?, 'ada', 'ik-ada', 20000, 20000, \
+             '/h', 'phc', 0, 0)",
+        )
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = store.begin().await.unwrap();
+        let (device, _token) = crate::access::devices::issue_paired_in(
+            &mut tx,
+            &id.to_string(),
+            "phone",
+            None,
+            Tier::Approve,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let device_key = WsKey {
+            principal_id: id,
+            session_id: String::new(),
+            session_epoch: 0,
+            device_id: Some(device.device_id.clone()),
+            grant_epoch: Some(device.grant_epoch),
+        };
+        let check = AccessStillValid { pool: pool.clone() };
+        assert!(check.still_valid(&device_key).await.unwrap());
+
+        // A session epoch bump (passwd) closes the device socket, keeps the
+        // grant: the device reconnects at the new epoch.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let acct = accounts::set_password_in(&mut tx, id, "phc2", Actor::Cli)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(!check.still_valid(&device_key).await.unwrap());
+        let reconnect = WsKey {
+            session_epoch: acct.session_epoch,
+            ..device_key.clone()
+        };
+        assert!(check.still_valid(&reconnect).await.unwrap());
+
+        // A tier change (grant_epoch) closes it too.
+        sqlx::query("UPDATE devices SET grant_epoch = grant_epoch + 1 WHERE device_id = ?")
+            .bind(&device.device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!check.still_valid(&reconnect).await.unwrap());
+        let reconnect = WsKey {
+            grant_epoch: Some(device.grant_epoch + 1),
+            ..reconnect
+        };
+        assert!(check.still_valid(&reconnect).await.unwrap());
+
+        // Forced logout from "the CLI" (its own connection): grants
+        // revoked + audited; the loop closes the socket within 2 s.
+        let reg = WsRegistry::new();
+        let mut socket = reg.register(reconnect.clone());
+        let conn = SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(root.accounts_db()),
+        )
+        .await
+        .unwrap();
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(recheck_loop(
+            reg.clone(),
+            conn,
+            Arc::new(check.clone()),
+            Duration::from_millis(200),
+            stop.subscribe(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut cli = SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(root.accounts_db()),
+        )
+        .await
+        .unwrap();
+        let mut tx = cli.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        accounts::revoke_sessions_in(
+            &mut tx,
+            id,
+            Actor::Cli,
+            &DeviceGrantsRevoked { via_cli: true },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(2), &mut socket.closed)
+            .await
+            .expect("closed within 2 s")
+            .unwrap();
+        assert_eq!(reason.code, CLOSE_REVOKED);
+        stop.send(()).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+        let (reason, revoked): (Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT revoked_reason, revoked_at FROM devices WHERE device_id = ?")
+                .bind(&device.device_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("sessions_revoked"));
+        assert!(revoked.is_some());
+        let kinds: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, via FROM audit_events ORDER BY seq")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kinds,
+            vec![
+                ("store.created".to_string(), "system".to_string()),
+                ("device.revoked".to_string(), "cli".to_string())
+            ]
+        );
+        // The broker's chain view adopts the CLI's row (§6.3 step 2).
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(crate::access::audit::verify(&mut conn, &store.store_id)
+            .await
+            .is_ok());
     }
 
     /// The loop wakes on another connection's commit (the CLI's), closes the
