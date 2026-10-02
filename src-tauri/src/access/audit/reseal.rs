@@ -512,4 +512,303 @@ mod tests {
         }
         assert_eq!(restarted.chain().degraded().unwrap().broken_at_seq, 4);
     }
+
+    async fn chain_broken_rows(store: &AccessStore) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE kind = 'audit.chain_broken'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Poll until the chain holds `n` `audit.chain_broken` rows.
+    async fn wait_for_chain_broken(store: &AccessStore, n: i64) {
+        for _ in 0..200 {
+            if chain_broken_rows(store).await >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the break was only in memory");
+    }
+
+    /// An access change through `store`'s chain, which a degraded chain
+    /// refuses (the caller rolls back).
+    async fn refused_access_change(store: &AccessStore) {
+        let mut conn = store.pool().acquire().await.unwrap();
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let refused = store
+            .chain()
+            .append(
+                &mut tx,
+                &Event::new(
+                    "device.tier_changed",
+                    crate::access::audit::AuditVia::Operator,
+                ),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::access::audit::chain::AppendError::AuditUnavailable(
+                    _
+                ))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    async fn boot(store: &AccessStore) -> AccessStore {
+        let restarted = store.clone_with_fresh_chain();
+        let mut conn = store.pool().acquire().await.unwrap();
+        restarted.chain().verify_boot(&mut conn).await.unwrap();
+        drop(conn);
+        restarted
+    }
+
+    async fn reverify(store: &AccessStore) {
+        let mut conn = store.pool().acquire().await.unwrap();
+        store.chain().verify_boot(&mut conn).await.unwrap();
+    }
+
+    async fn export_all(store: &AccessStore) -> crate::access::audit::export::Built {
+        crate::access::audit::export::build(
+            store,
+            &crate::access::audit::list::Filter::default(),
+            &crate::access::audit::list::Visibility::All,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Review M-3: a tail truncation of two or more rows, found by an
+    /// access change that is then refused, is recorded at the first missing
+    /// seq and survives the walk — a restart boots degraded, and the same
+    /// process stays degraded across `verify_boot` and an export.
+    #[tokio::test]
+    async fn a_multi_row_tail_truncation_found_by_a_refused_append_stays_degraded() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 4).await;
+        assert_eq!(store.chain().known_head().unwrap().seq, 5);
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        refused_access_change(&store).await;
+        wait_for_chain_broken(&store, 1).await;
+        let (seq, detail): (i64, String) = sqlx::query_as(
+            "SELECT seq, detail FROM audit_events WHERE kind = 'audit.chain_broken'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let detail: Value = serde_json::from_str(&detail).unwrap();
+        // The first missing seq — the seq the recording itself takes — with
+        // the lost head (#5) as the evidence.
+        assert_eq!(seq, 4);
+        assert_eq!(detail["broken_at_seq"], 4);
+        assert_eq!(detail["class"], "head_missing");
+        assert!(detail["fingerprint"].as_str().unwrap().starts_with("#5:"));
+
+        let v = walk(&store).await;
+        let b = v
+            .outstanding
+            .clone()
+            .expect("the recording survives the walk");
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (4, "recorded"));
+        assert!(v.recorded);
+
+        // (a) A restart boots degraded.
+        let restarted = boot(&store).await;
+        assert_eq!(restarted.status(), ("degraded", Some(4)));
+        // (b) The same process stays degraded after a verify and an export.
+        reverify(&store).await;
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        let built = export_all(&store).await;
+        assert_eq!(built.manifest["verified"], false);
+        assert_eq!(built.manifest["broken_at_seq"], 4);
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        refused_access_change(&store).await;
+        assert_eq!(chain_broken_rows(&store).await, 1, "recorded once");
+
+        // B-1 still holds for a head break: reseal it, then delete the
+        // recording (rows after it remain) — a new, outstanding gap.
+        let r = reseal(&store, 4, cli_ack()).await.unwrap();
+        assert!(r.still_broken.is_none(), "{r:?}");
+        assert_eq!(store.status(), ("ok", None));
+        assert!(boot(&store).await.chain().degraded().is_none());
+        sql(&store, "DELETE FROM audit_events WHERE seq = 4").await;
+        let v = walk(&store).await;
+        let b = v.outstanding.expect("a deleted recording is a new break");
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (4, "gap"));
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(4)));
+
+        // ...or re-forge it: a new, outstanding break at its seq.
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 4).await;
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        refused_access_change(&store).await;
+        wait_for_chain_broken(&store, 1).await;
+        reseal(&store, 4, cli_ack()).await.unwrap();
+        assert!(walk(&store).await.ok());
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_update; \
+             UPDATE audit_events SET target = 'forged' WHERE seq = 4;",
+        )
+        .await;
+        let v = walk(&store).await;
+        let b = v.outstanding.expect("a re-forged recording is a new break");
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (4, "hash"));
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(4)));
+    }
+
+    /// Review M-3: the allowed-append path (an authentication row after a
+    /// two-row truncation) records the break in the caller's transaction
+    /// and stays degraded across a restart; a rollback doesn't lose it.
+    #[tokio::test]
+    async fn an_allowed_append_after_a_multi_row_truncation_stays_degraded() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 4).await;
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_delete; DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        // A rolled-back authentication row first: the break stays queued.
+        {
+            let mut conn = store.pool().acquire().await.unwrap();
+            let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.unwrap();
+            store
+                .chain()
+                .append(
+                    &mut tx,
+                    &Event::new("auth.login_ok", crate::access::audit::AuditVia::Session),
+                )
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+        }
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        let head = crate::access::audit::record(
+            &store,
+            &Event::new("auth.login_ok", crate::access::audit::AuditVia::Session),
+        )
+        .await
+        .unwrap();
+        assert_eq!(head.seq, 5, "the recording at #4, the login at #5");
+        wait_for_chain_broken(&store, 1).await;
+
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(4)));
+        reverify(&store).await;
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        assert_eq!(export_all(&store).await.manifest["verified"], false);
+        assert_eq!(store.status(), ("degraded", Some(4)));
+        // The flush that confirms the in-transaction row wrote no second one.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        reverify(&store).await;
+        assert_eq!(chain_broken_rows(&store).await, 1);
+    }
+
+    /// Review M-3 re-audit: a head break isn't dropped when its recording
+    /// lands before the seq it names (the tail shrank again before the row
+    /// was flushed), nor shadowed by a different break the walk finds at
+    /// that seq — resealing that one leaves the head break outstanding.
+    #[tokio::test]
+    async fn a_head_break_is_neither_dropped_nor_shadowed() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 4).await;
+        // The "process": a chain view with no pool attached, so a refused
+        // append leaves its break queued (as a busy store would).
+        let p = store.clone_with_fresh_chain();
+        reverify(&p).await;
+        assert_eq!(p.chain().known_head().unwrap().seq, 5);
+        sql(
+            &store,
+            "DROP TRIGGER audit_events_no_update; DROP TRIGGER audit_events_no_delete; \
+             DELETE FROM audit_events WHERE seq >= 4;",
+        )
+        .await;
+        refused_access_change(&p).await;
+        // The tail shrinks again before the recording is written.
+        sql(&store, "DELETE FROM audit_events WHERE seq = 3").await;
+        reverify(&p).await;
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT seq, detail FROM audit_events WHERE kind = 'audit.chain_broken' ORDER BY seq",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        // #3 records the break at #4 (it names a seq after itself) and #4
+        // records that the re-based head #3 changed.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, 3);
+        assert!(rows[0].1.contains("\"broken_at_seq\":4"), "{rows:?}");
+        assert!(rows[0].1.contains("head_missing"), "{rows:?}");
+        assert!(rows[1].1.contains("head_changed"), "{rows:?}");
+        let v = walk(&store).await;
+        let at: Vec<(i64, &str)> = v
+            .breaks
+            .iter()
+            .map(|(b, _)| (b.broken_at_seq, b.class.as_str()))
+            .collect();
+        assert_eq!(at, [(3, "recorded"), (4, "recorded")]);
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(3)));
+
+        // Forge #4 (the head_changed recording): the walk finds a hash
+        // break at #4, which must not swallow #3's head break at #4.
+        sql(
+            &store,
+            "UPDATE audit_events SET target = 'forged' WHERE seq = 4",
+        )
+        .await;
+        let v = walk(&store).await;
+        let at: Vec<(i64, &str)> = v
+            .breaks
+            .iter()
+            .map(|(b, _)| (b.broken_at_seq, b.class.as_str()))
+            .collect();
+        assert_eq!(at, [(4, "hash"), (4, "recorded")]);
+        let r = reseal(&p, 4, cli_ack()).await.unwrap();
+        let still = r.still_broken.expect("the head break stays outstanding");
+        assert_eq!((still.broken_at_seq, still.class.as_str()), (4, "recorded"));
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(4)));
+        let r = reseal(&p, 4, cli_ack()).await.unwrap();
+        assert!(r.still_broken.is_none(), "{r:?}");
+        assert!(walk(&store).await.ok());
+    }
+
+    /// Review M-3 re-audit: a tail truncation while the store is degraded
+    /// for another break is not lost when another process reseals that
+    /// break — the known head is checked before a clean verdict is adopted
+    /// (step 0 of an append, and `verify_boot`).
+    #[tokio::test]
+    async fn a_truncation_while_degraded_survives_a_reseal_of_the_other_break() {
+        let store = AccessStore::memory_t0().await;
+        add_rows(&store, 5).await;
+        forge(&store, 2).await;
+        reverify(&store).await;
+        assert_eq!(store.status(), ("degraded", Some(2)));
+        let known = store.chain().known_head().unwrap();
+        assert_eq!(known.seq, 7, "the chain_broken row");
+        // Truncate the tail (the recording with it), then the "CLI"
+        // reseals the forged row.
+        sql(&store, "DELETE FROM audit_events WHERE seq >= 6").await;
+        let cli = store.clone_with_fresh_chain();
+        let r = reseal(&cli, 2, cli_ack()).await.unwrap();
+        assert!(r.still_broken.is_none(), "{r:?}");
+        // The running process's next access change sees the reseal and the
+        // regression; it stays degraded instead of adopting the clean walk.
+        refused_access_change(&store).await;
+        let b = store.chain().degraded().unwrap();
+        assert_eq!((b.broken_at_seq, b.class.as_str()), (7, "head_changed"));
+        reverify(&store).await;
+        assert_eq!(store.status(), ("degraded", Some(7)));
+        assert_eq!(boot(&store).await.status(), ("degraded", Some(7)));
+    }
 }
