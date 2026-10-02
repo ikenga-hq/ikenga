@@ -281,6 +281,11 @@ pub fn route_requirement(path: &str) -> Option<Requirement> {
     if path == "/ws/fs" {
         return Some(shared(&[Files]));
     }
+    // Any other socket path (an encoded `/ws/%70ty/…`, a future socket):
+    // fail closed, as an unmapped RPC is (§1.6 rule 2).
+    if path == "/ws" || path.starts_with("/ws/") {
+        return Some(Requirement::UNMAPPED);
+    }
     if path == "/pkgs" || path.starts_with("/pkgs/") {
         return Some(shared(&[Files]));
     }
@@ -369,6 +374,10 @@ mod tests {
             Some(shared(&[Files]))
         );
         assert_eq!(route_requirement("/api/health"), None);
+        assert_eq!(
+            route_requirement("/ws/%70ty/x"),
+            Some(Requirement::UNMAPPED)
+        );
         assert_eq!(route_requirement("/api/rpc"), None);
     }
 }

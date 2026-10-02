@@ -721,10 +721,10 @@ pub fn access_ctx(
         G::Session { session_id } => AccessCtx::session(ctx.principal.id, session_id.clone()),
         G::DeviceGrant { device_id } => match tiers.get(device_id) {
             Some(tier) => AccessCtx::device(ctx.principal.id, device_id.clone(), tier, 0),
-            None => AccessCtx::child(Some(crate::access::caps::CapSet::EMPTY), None),
+            None => AccessCtx::nothing(),
         },
         // Never produced under T1 (§2.4): grants nothing.
-        G::OperatorBearer => AccessCtx::child(Some(crate::access::caps::CapSet::EMPTY), None),
+        G::OperatorBearer => AccessCtx::nothing(),
     }
 }
 
@@ -1025,6 +1025,31 @@ mod tests {
             select_share(&parts("/api/rpc", true)),
             Some(Decision::Deny { .. })
         ));
+        // Review finding 1 through the broker: encoded spawns are spawns.
+        for q in ["sp%61wn=true", "spawn=tru%65", "spawn=false&spawn=true"] {
+            assert!(
+                matches!(
+                    auth.authorize_route(&phone, &parts(&format!("/ws/pty/x?{q}"), false)),
+                    Decision::Deny {
+                        status: StatusCode::FORBIDDEN,
+                        ..
+                    }
+                ),
+                "{q}"
+            );
+        }
+        // Review finding 3: an unknown device (or a bearer) reaches no arm,
+        // `internal` ones included.
+        let stranger = principal_ctx(Credential::DeviceGrant {
+            device_id: "stranger".into(),
+        });
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        for cmd in ["share_project_info", "notifications_record_access", "fs_read"] {
+            for who in [&stranger, &principal_ctx(Credential::OperatorBearer)] {
+                let d = rt.block_on(auth.authorize_rpc(who, &parts("/api/rpc", false), cmd, &Value::Null));
+                assert!(matches!(d, Decision::Deny { .. }), "{cmd}");
+            }
+        }
 
         // Frames: a View device's PTY input is refused with the reply frame.
         let frames = AccessFrames { tiers };

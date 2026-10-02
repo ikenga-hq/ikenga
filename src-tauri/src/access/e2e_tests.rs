@@ -225,6 +225,67 @@ async fn a_view_device_reads_but_cannot_act() {
     );
 }
 
+/// Review finding 1 on T0: an encoded `spawn` is still a spawn.
+#[tokio::test]
+async fn an_encoded_spawn_still_needs_dispatch() {
+    let (_d, rt, router) = daemon().await;
+    let (_, token) = pair(&rt, Tier::View).await;
+    for q in ["sp%61wn=true", "spawn=tru%65", "spawn=false&spawn=true"] {
+        let req = Request::builder()
+            .uri(format!("/ws/pty/new?{q}"))
+            .header("cookie", format!("ikenga_device={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{q}");
+        assert_eq!(body["error"], "forbidden: missing=dispatch", "{q}");
+    }
+}
+
+/// Review finding 2: a cookie rotated while resolving a request reaches the
+/// browser even when the request is then refused.
+#[tokio::test]
+async fn a_rotated_cookie_survives_a_refusal() {
+    let (_d, rt, router) = daemon().await;
+    let (phone, token) = pair(&rt, Tier::View).await;
+    let old = crate::access::audit::chain::now_ms() - devices::ROTATE_AFTER_MS - 1000;
+    sqlx::query("UPDATE devices SET secret_rotated_at = ?, paired_at = ? WHERE device_id = ?")
+        .bind(old)
+        .bind(old)
+        .bind(&phone.device_id)
+        .execute(&rt.store.as_ref().unwrap().pool)
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/shutdown")
+        .header("cookie", format!("ikenga_device={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let cookie = res
+        .headers()
+        .get("set-cookie")
+        .expect("the rotated cookie")
+        .to_str()
+        .unwrap();
+    let fresh = cookie
+        .strip_prefix("ikenga_device=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert_ne!(fresh, token);
+    // The new secret works (the old one only for the grace window).
+    let (status, body) = send(&router, rpc_req("access_status", json!({}), Some(fresh))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["credential"]["deviceId"],
+        json!(phone.device_id)
+    );
+}
+
 /// The operator bearer keeps working exactly as before (every existing
 /// daemon test goes through it).
 #[tokio::test]

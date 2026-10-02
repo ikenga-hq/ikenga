@@ -50,6 +50,15 @@ pub async fn pty_ws_handler(
     let (Some(Extension(access)), Some(Extension(ctx))) = (access, ctx) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    // Defence in depth (G-ACCESS §1.6): the middleware checked `?spawn=`
+    // on the raw query; re-check the value this handler actually decoded.
+    if query.spawn && !ctx.caps.contains(crate::access::caps::Cap::Dispatch) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "ok": false, "error": "forbidden: missing=dispatch" })),
+        )
+            .into_response();
+    }
     let registration = access.registry.register(socket_key(&ctx));
     ws.on_upgrade(move |socket| {
         super::activity::track_ws(handle_pty_socket(

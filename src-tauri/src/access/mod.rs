@@ -303,6 +303,9 @@ pub fn child_ctx(headers: &HeaderMap) -> AccessCtx {
 /// The `rpc_handler` pre-hook (§1.7, §9.2): class first, then caps.
 /// `Err` is the RPC error string.
 pub fn authorize_rpc(ctx: &AccessCtx, cmd: &str) -> Result<(), String> {
+    if ctx.via == Credential::Unresolved {
+        return Err("unauthenticated: no usable credential".into());
+    }
     let req = rpc_requirements::requirement(cmd);
     match req.class {
         // Per-command rules live with the arms (`access::rpc`).
@@ -431,6 +434,16 @@ mod tests {
         // Internal: the per-child token without a share only.
         assert!(authorize_rpc(&op, "share_project_info").is_err());
         assert!(authorize_rpc(&AccessCtx::child(None, None), "share_project_info").is_ok());
+        // Review finding 3: the broker's non-granting context passes nothing,
+        // `internal` included.
+        for cmd in [
+            "share_project_info",
+            "notifications_record_access",
+            "fs_read",
+            "os_username",
+        ] {
+            assert!(authorize_rpc(&AccessCtx::nothing(), cmd).is_err(), "{cmd}");
+        }
         // Owner class through a share: refused whatever the caps.
         let mut shared = AccessCtx::child(Some(CapSet::ALL), None);
         shared.share = Some(ShareCtx {

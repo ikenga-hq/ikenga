@@ -167,6 +167,20 @@ pub fn device_cookie(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The device credential a request presents, and how (§2.4) — the one
+/// rule both tiers use: the `ikenga_device` cookie when present (a browser
+/// sends it on every same-origin request and WS handshake), else
+/// `Authorization: Bearer ikd1.…` (non-browser clients). When a cookie is
+/// present it alone decides the device credential.
+pub fn presented_device_token(headers: &HeaderMap) -> Option<(String, Presented)> {
+    if let Some(cookie) = device_cookie(headers) {
+        return Some((cookie, Presented::Cookie));
+    }
+    bearer(headers)
+        .filter(|t| t.starts_with(TOKEN_PREFIX))
+        .map(|t| (t.to_string(), Presented::Bearer))
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
@@ -221,30 +235,37 @@ pub async fn resolve_t0(
     }
 
     let header_bearer = bearer(headers);
-    // `Authorization: Bearer ikd1.…`: a device grant, never rotated. Present
-    // but invalid stops here: it can't also be the operator bearer.
-    if let Some(tok) = header_bearer.filter(|b| b.starts_with(TOKEN_PREFIX)) {
-        return match resolve_device(rt, tok, Presented::Bearer, remote_addr).await {
-            Some((ctx, _)) => T0Auth::Ok {
-                ctx,
-                set_cookie: None,
-            },
-            None => T0Auth::Denied {
-                clear_cookie: false,
-            },
-        };
-    }
-
+    // §2.4: the device credential (one rule on T0 and T1,
+    // [`presented_device_token`]: the cookie decides when present, else a
+    // `Bearer ikd1.…`).
     let mut clear_cookie = false;
-    if let Some(cookie) = device_cookie(headers) {
-        match resolve_device(rt, &cookie, Presented::Cookie, remote_addr).await {
-            Some((ctx, rotated)) => {
-                let set_cookie =
-                    rotated.and_then(|t| set_device_cookie(&t, rt.options.insecure_cookie));
-                return T0Auth::Ok { ctx, set_cookie };
+    match presented_device_token(headers) {
+        Some((cookie, Presented::Cookie)) => {
+            match resolve_device(rt, &cookie, Presented::Cookie, remote_addr).await {
+                Some((ctx, rotated)) => {
+                    let set_cookie =
+                        rotated.and_then(|t| set_device_cookie(&t, rt.options.insecure_cookie));
+                    return T0Auth::Ok { ctx, set_cookie };
+                }
+                // A dead cookie is cleared, and doesn't fail a request that
+                // carries the operator bearer.
+                None => clear_cookie = true,
             }
-            None => clear_cookie = true,
         }
+        // Never rotated. Present but invalid stops here: it can't also be
+        // the operator bearer.
+        Some((tok, Presented::Bearer)) => {
+            return match resolve_device(rt, &tok, Presented::Bearer, remote_addr).await {
+                Some((ctx, _)) => T0Auth::Ok {
+                    ctx,
+                    set_cookie: None,
+                },
+                None => T0Auth::Denied {
+                    clear_cookie: false,
+                },
+            };
+        }
+        None => {}
     }
 
     let operator = !expected_token.is_empty()
@@ -407,6 +428,61 @@ mod tests {
             resolve_t0(&none, &m, None, "op", None).await,
             T0Auth::Denied { .. }
         ));
+    }
+
+    /// Review finding 4: one §2.4 order on both tiers — the cookie decides
+    /// when present, else `Bearer ikd1.…`.
+    #[tokio::test]
+    async fn the_cookie_decides_the_device_credential_on_both_tiers() {
+        let (_d, rt, cookie_tok) = rt().await;
+        let store = rt.store.clone().unwrap();
+        let owner = store.owner.unwrap().to_string();
+        let mut tx = store.begin().await.unwrap();
+        let (bearer_dev, bearer_tok) =
+            devices::issue_paired_in(&mut tx, &owner, "cli", None, Tier::Full, None, None)
+                .await
+                .unwrap();
+        tx.commit().await.unwrap();
+        let both = h(&[
+            ("cookie", &format!("ikenga_device={cookie_tok}")),
+            ("authorization", &format!("Bearer {bearer_tok}")),
+        ]);
+        assert_eq!(
+            presented_device_token(&both),
+            Some((cookie_tok.clone(), Presented::Cookie))
+        );
+        match resolve_t0(&rt, &both, None, "op", None).await {
+            T0Auth::Ok { ctx, .. } => {
+                assert_eq!(
+                    ctx.tier,
+                    Tier::View,
+                    "the cookie's device, not the bearer's"
+                );
+                assert_ne!(
+                    ctx.device_id.as_deref(),
+                    Some(bearer_dev.device_id.as_str())
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A dead cookie isn't skipped for the bearer device (T1 rejects too).
+        let dead = h(&[
+            ("cookie", "ikenga_device=ikd1.dead"),
+            ("authorization", &format!("Bearer {bearer_tok}")),
+        ]);
+        assert!(matches!(
+            resolve_t0(&rt, &dead, None, "op", None).await,
+            T0Auth::Denied { clear_cookie: true }
+        ));
+        let only_bearer = h(&[("authorization", &format!("Bearer {bearer_tok}"))]);
+        assert_eq!(
+            presented_device_token(&only_bearer),
+            Some((bearer_tok.clone(), Presented::Bearer))
+        );
+        assert_eq!(
+            presented_device_token(&h(&[("authorization", "Bearer op")])),
+            None
+        );
     }
 
     #[tokio::test]

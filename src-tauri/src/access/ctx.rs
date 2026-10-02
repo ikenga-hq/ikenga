@@ -26,6 +26,11 @@ pub enum Credential {
     /// A T1 principal child's per-child token. Grants only what the broker's
     /// `X-Ikenga-Caps` header says (§1.7: no header, no caps).
     ChildToken,
+    /// No usable credential (the T1 broker's view of a device grant whose
+    /// tier it doesn't know, or an operator bearer, which T1 never honours).
+    /// Holds no caps and passes no class check — not even `internal`, which
+    /// accepts only [`Credential::ChildToken`].
+    Unresolved,
 }
 
 impl Credential {
@@ -43,6 +48,7 @@ impl Credential {
             Credential::DeviceGrant { .. } => "device",
             Credential::OperatorBearer => "operator",
             Credential::ChildToken => "operator",
+            Credential::Unresolved => "system",
         }
     }
 }
@@ -162,6 +168,20 @@ impl AccessCtx {
             tier: Tier::Full,
             share,
             caps: caps.unwrap_or(CapSet::EMPTY),
+            admin_strength: false,
+            grant_epoch: None,
+        }
+    }
+
+    /// A context that grants nothing (see [`Credential::Unresolved`]).
+    pub fn nothing() -> Self {
+        AccessCtx {
+            principal_id: None,
+            via: Credential::Unresolved,
+            device_id: None,
+            tier: Tier::View,
+            share: None,
+            caps: CapSet::EMPTY,
             admin_strength: false,
             grant_epoch: None,
         }

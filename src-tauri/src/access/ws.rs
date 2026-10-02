@@ -72,14 +72,14 @@ pub fn check_frame(caps: CapSet, route: WsRoute, frame: Frame<'_>) -> FrameVerdi
         // a control frame (`resize` / `write` / `kill`) or raw stdin.
         WsRoute::Pty => need(caps, DISPATCH),
         WsRoute::Chat => match frame {
+            // The handler's own parser decides what a frame is, so an
+            // escaped or duplicated `type` can't make the check and the
+            // handler disagree: anything it would act on (`Prompt`,
+            // `Cancel`) needs {dispatch}; anything it ignores passes.
             Frame::Text(t) => {
-                let kind = serde_json::from_str::<serde_json::Value>(t)
-                    .ok()
-                    .and_then(|v| v.get("type").and_then(|k| k.as_str()).map(str::to_string));
-                match kind.as_deref() {
-                    Some("prompt") | Some("cancel") => need(caps, DISPATCH),
-                    // Anything else is ignored by the chat handler.
-                    _ => FrameVerdict::Pass,
+                match serde_json::from_str::<crate::server::chat_ws::ChatClientMessage>(t) {
+                    Ok(_) => need(caps, DISPATCH),
+                    Err(_) => FrameVerdict::Pass,
                 }
             }
             Frame::Binary(_) => FrameVerdict::Pass,
@@ -95,18 +95,23 @@ pub fn refusal_frame(missing: CapSet) -> String {
     json!({ "type": "error", "code": "forbidden", "missing": missing.names() }).to_string()
 }
 
-/// `?spawn=true` / `?spawn=1` on a PTY attach.
-fn wants_spawn(query: Option<&str>) -> bool {
+/// Whether a PTY attach may spawn (`PtyQuery::spawn`). The query is
+/// percent- and `+`-decoded exactly as the handler's `Query<PtyQuery>`
+/// (`serde_urlencoded` over `form_urlencoded`) decodes it, so
+/// `sp%61wn=tru%65` is a spawn here too. Fail closed: any decoded `spawn`
+/// key whose value is not exactly `false` counts — duplicates included,
+/// and a value the handler would reject still needs {dispatch}.
+pub fn wants_spawn(query: Option<&str>) -> bool {
     query.is_some_and(|q| {
-        q.split('&').any(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            k == "spawn" && matches!(v, "true" | "1")
-        })
+        url::form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "spawn" && v != "false")
     })
 }
 
 /// Check `ctx` against a requirement (§1.6 rule 4 for non-RPC routes).
 pub fn check_requirement(ctx: &AccessCtx, req: Requirement) -> Result<(), String> {
+    if ctx.via == crate::access::ctx::Credential::Unresolved {
+        return Err("unauthenticated: no usable credential".into());
+    }
     match req.class {
         ArmClass::Operator if !ctx.is_operator() => return Err("forbidden: class=operator".into()),
         ArmClass::Owner if ctx.share.is_some() => return Err("forbidden: class=owner".into()),
@@ -128,6 +133,7 @@ pub fn authorize_route(ctx: &AccessCtx, path: &str, query: Option<&str>) -> Resu
         return Ok(());
     };
     if WsRoute::of_path(path) == Some(WsRoute::Pty) && wants_spawn(query) {
+        // (re-checked on the decoded `PtyQuery` in `pty_ws_handler`)
         req.caps = req.caps.with(Cap::Dispatch);
     }
     check_requirement(ctx, req)
@@ -161,6 +167,70 @@ mod tests {
             assert_eq!(
                 check_frame(Tier::Dispatch.caps(), WsRoute::Pty, f),
                 FrameVerdict::Pass
+            );
+        }
+    }
+
+    /// Review finding 1: the check decodes the query as the handler does.
+    #[test]
+    fn spawn_is_read_from_the_decoded_query() {
+        for q in [
+            "spawn=true",
+            "sp%61wn=true",
+            "spawn=tru%65",
+            "%73%70%61%77%6e=%74rue",
+            "spawn=1",
+            "spawn",
+            "spawn=false&spawn=true",
+            "spawn=true&spawn=false",
+            "spawn=%FF",
+            "x=1&spawn=+true",
+        ] {
+            assert!(wants_spawn(Some(q)), "{q}");
+            assert!(
+                authorize_route(&dev(Tier::View), "/ws/pty/new", Some(q))
+                    .unwrap_err()
+                    .contains("missing=dispatch"),
+                "{q}"
+            );
+        }
+        for q in [
+            "",
+            "spawn=false",
+            "spawned=true",
+            "x=spawn",
+            "sp%61wn=false",
+        ] {
+            assert!(!wants_spawn(Some(q)), "{q}");
+        }
+        assert!(!wants_spawn(None));
+        // What the handler decodes agrees on the encoded forms.
+        #[derive(serde::Deserialize)]
+        struct Q {
+            #[serde(default)]
+            spawn: bool,
+        }
+        for q in ["sp%61wn=true", "spawn=tru%65"] {
+            let uri: axum::http::Uri = format!("/ws/pty/x?{q}").parse().unwrap();
+            let parsed = axum::extract::Query::<Q>::try_from_uri(&uri).unwrap();
+            assert!(parsed.spawn && wants_spawn(Some(q)), "{q}");
+        }
+    }
+
+    #[test]
+    fn unknown_socket_paths_fail_closed() {
+        assert!(authorize_route(&dev(Tier::Full), "/ws/%70ty/x", None).is_ok());
+        assert!(authorize_route(&dev(Tier::Approve), "/ws/%70ty/x", None).is_err());
+    }
+
+    #[test]
+    fn chat_frames_are_classified_by_the_handlers_parser() {
+        let view = Tier::View.caps();
+        for t in [r#"{"type":"pro\u006dpt","prompt":"hi"}"#] {
+            assert_ne!(
+                check_frame(view, WsRoute::Chat, Frame::Text(t)),
+                FrameVerdict::Pass,
+                "{t}"
             );
         }
     }
@@ -208,5 +278,7 @@ mod tests {
         let child = AccessCtx::child(None, None);
         assert!(authorize_route(&child, "/ws/fs", None).is_err());
         assert!(authorize_route(&child, "/pkgs/a/x", None).is_err());
+        // The broker's non-granting context reaches no route at all.
+        assert!(authorize_route(&AccessCtx::nothing(), "/ws/chat/x", None).is_err());
     }
 }

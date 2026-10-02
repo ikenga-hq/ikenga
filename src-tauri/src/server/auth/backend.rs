@@ -216,22 +216,9 @@ pub struct DeviceGrantResolver {
     pub tiers: Arc<crate::access::devices::TierCache>,
 }
 
-/// The device token a request presents, and how (cookie first, as a browser
-/// sends it; a non-browser client uses the bearer form).
-pub fn presented_device_token(
-    headers: &axum::http::HeaderMap,
-) -> Option<(String, crate::access::devices::Presented)> {
-    use crate::access::devices::{Presented, TOKEN_PREFIX};
-    if let Some(cookie) = crate::access::http::device_cookie(headers) {
-        return Some((cookie, Presented::Cookie));
-    }
-    headers
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .filter(|t| t.starts_with(TOKEN_PREFIX))
-        .map(|t| (t.to_string(), Presented::Bearer))
-}
+/// The device token a request presents, and how (G-ACCESS §2.4): the one
+/// rule T0 and T1 share.
+pub use crate::access::http::presented_device_token;
 
 impl CredentialResolver for DeviceGrantResolver {
     fn name(&self) -> &'static str {

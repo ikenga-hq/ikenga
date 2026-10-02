@@ -338,13 +338,22 @@ async fn auth_middleware(
             return Err(res);
         }
     };
-    if let Err(e) = crate::access::ws::authorize_route(&ctx, parts.uri.path(), parts.uri.query()) {
+    if let Err(e) = crate::access::ws::authorize_route(&ctx, parts.uri.path(), parts.uri.query())
+    {
         warn!("{} refused: {e}", parts.uri.path());
-        return Err((
+        let mut res = (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
-            .into_response());
+            .into_response();
+        // A cookie rotated during resolution is already committed: it must
+        // reach the browser on a refusal too, or the device would be locked
+        // out once the 5-minute grace ends (§3.9).
+        if let Some(cookie) = set_cookie {
+            res.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
+        }
+        return Err(res);
     }
     parts.extensions.insert(ctx);
     let mut res = activity::track_request(next.run(Request::from_parts(parts, body))).await;
