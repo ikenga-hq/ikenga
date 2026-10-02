@@ -499,7 +499,13 @@ pub fn leftover_store_file(data_dir: &Path) -> Option<PathBuf> {
     [ENVELOPE_FILENAME, VALUES_FILENAME]
         .into_iter()
         .map(|name| dir.join(name))
-        .find(|path| fs::symlink_metadata(path).is_ok())
+        // Only NotFound counts as absent: EACCES/EIO on a principal's 0700
+        // `secrets/` must fail closed (Stranded), never fall back to the
+        // operator defaults.
+        .find(|path| match fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        })
 }
 
 // ─── the store ─────────────────────────────────────────────────────────────
@@ -783,6 +789,16 @@ mod tests {
 
     fn data_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn leftover_scan_counts_only_not_found_as_absent() {
+        let tmp = data_dir();
+        assert_eq!(leftover_store_file(tmp.path()), None, "no secrets/ at all");
+        // `secrets` as a regular file: stat of secrets/<file> fails with
+        // ENOTDIR, not NotFound, so the scan must report it (fail closed).
+        std::fs::write(tmp.path().join(SECRETS_DIR), b"").unwrap();
+        assert!(leftover_store_file(tmp.path()).is_some());
     }
 
     #[test]
