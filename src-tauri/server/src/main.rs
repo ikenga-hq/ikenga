@@ -29,6 +29,11 @@ pub enum Command {
     /// Administer T1 local accounts (root only; G-PRINCIPAL §7). Passwords
     /// are read from the terminal or `--password-stdin`, never from argv.
     Accounts(AccountsArgs),
+    /// The access audit chain (G-ACCESS §6.4, §6.8): verify, export or
+    /// reseal it. Operator-wide: on the T1 operator store (`--data-dir`) it
+    /// runs as root; `--file <db>` names any access store you can open (a
+    /// T0 `<data-dir>/access.db`, or a copy).
+    Audit(AuditArgs),
     /// Check whether this host can run an executor tier (G-PRINCIPAL §8).
     /// For t1: identity, capabilities, the operator root and a real test
     /// drop to the reserved probe uid — read-only (no reconcile, no
@@ -40,6 +45,61 @@ pub enum Command {
     /// Internal: the §7.3 uid-wide kill (spawned as the principal's uid).
     #[command(name = "__t1-kill-all", hide = true)]
     T1KillAll,
+}
+
+#[derive(Args, Debug)]
+pub struct AuditArgs {
+    /// The T1 operator root (the server's `--data-dir` under t1); the
+    /// store is its `operator/accounts.db`. Needs root.
+    #[arg(long, env = "IKENGA_DATA_DIR", global = true)]
+    pub data_dir: Option<PathBuf>,
+
+    /// An access store file instead of the T1 operator store.
+    #[arg(long, value_name = "DB", global = true)]
+    pub file: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: AuditCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCommand {
+    /// Walk the chain from genesis, recomputing every hash (read-only).
+    /// Exits 0 when it holds, 1 when a break no reseal acknowledges remains.
+    Verify {
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export every row (or a filtered set) as JSONL plus a manifest line
+    /// (`ikenga-audit-export-v1`). Verifies first; appends `audit.exported`.
+    Export {
+        /// Write here (owner-only) instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Rows where this principal is the actor or the subject.
+        #[arg(long)]
+        who: Option<String>,
+        /// Rows of this device (actor's or subject).
+        #[arg(long)]
+        device: Option<String>,
+        /// permission | dispatch | access | pairing | people
+        #[arg(long)]
+        category: Option<String>,
+        /// Free-text search.
+        #[arg(long)]
+        q: Option<String>,
+        /// `<owner_principal_id>/<project_id>`.
+        #[arg(long)]
+        project_key: Option<String>,
+    },
+    /// Acknowledge the outstanding break (`--ack` must name it) and clear
+    /// `degraded`: appends `audit.resealed`. The break stays in the chain.
+    Reseal {
+        /// The seq the chain is broken at (from `audit verify`).
+        #[arg(long, value_name = "SEQ")]
+        ack: i64,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -369,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
             return run_accounts(accounts).await;
         }
         Some(Command::Probe(probe)) => std::process::exit(run_probe(probe).await),
+        Some(Command::Audit(audit)) => std::process::exit(run_audit(audit).await),
         Some(Command::T1ProbeChild | Command::T1KillAll) => unreachable!("handled above"),
         None => {}
     }
@@ -446,6 +507,94 @@ fn t1_probe_child() -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn t1_kill_all() -> Result<(), String> {
     Err("executor tier t1 is Linux-only".into())
+}
+
+/// `ikenga-server audit …` → exit code (0 = done / the chain holds).
+async fn run_audit(args: AuditArgs) -> i32 {
+    match audit(args).await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("audit: {e:#}");
+            2
+        }
+    }
+}
+
+async fn audit(args: AuditArgs) -> anyhow::Result<i32> {
+    use ikenga_desktop_lib::access::audit::{export, list::Filter, reseal, verify_boot};
+    use ikenga_desktop_lib::access::AccessStore;
+    use std::io::Write;
+
+    let path = verify_boot::cli_store_path(args.data_dir, args.file)?;
+    let store = AccessStore::open_cli(&path).await?;
+    let code = match args.command {
+        AuditCommand::Verify { json } => {
+            let (text, ok) = verify_boot::cli_verify(&store, json).await?;
+            println!("{}", text.trim_end());
+            if ok {
+                0
+            } else {
+                1
+            }
+        }
+        AuditCommand::Export {
+            out,
+            who,
+            device,
+            category,
+            q,
+            project_key,
+        } => {
+            let filter = Filter::from_parts(who, device, category, q, project_key)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let built = export::export_cli(&store, &filter, out.as_deref()).await?;
+            match &out {
+                Some(p) => eprintln!(
+                    "exported {} rows to {} (verified: {})",
+                    built.rows,
+                    p.display(),
+                    built.manifest["verified"]
+                ),
+                None => {
+                    let mut stdout = std::io::stdout();
+                    stdout.write_all(built.jsonl.as_bytes())?;
+                    stdout.flush()?;
+                }
+            }
+            0
+        }
+        AuditCommand::Reseal { ack } => {
+            let r = reseal::reseal(
+                &store,
+                ack,
+                ikenga_desktop_lib::access::audit::Event::new(
+                    "audit.resealed",
+                    ikenga_desktop_lib::access::audit::AuditVia::Cli,
+                ),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "resealed the break at #{} with #{} (it stays in the chain)",
+                r.broken_at_seq, r.head.seq
+            );
+            match r.still_broken {
+                None => {
+                    println!("OK: access changes resume");
+                    0
+                }
+                Some(b) => {
+                    println!(
+                        "still BROKEN at #{}: {} — reseal that one too after reviewing it",
+                        b.broken_at_seq, b.reason
+                    );
+                    1
+                }
+            }
+        }
+    };
+    store.pool().close().await;
+    Ok(code)
 }
 
 /// `ikenga-server probe` → exit code (0 = the tier can run here).
@@ -593,6 +742,54 @@ async fn run_accounts(_args: AccountsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_subcommands_parse() {
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "audit",
+            "--file",
+            "/tmp/access.db",
+            "verify",
+            "--json",
+        ])
+        .unwrap();
+        let Some(Command::Audit(a)) = args.command else {
+            panic!("not audit")
+        };
+        assert_eq!(
+            a.file.as_deref(),
+            Some(std::path::Path::new("/tmp/access.db"))
+        );
+        assert!(matches!(a.command, AuditCommand::Verify { json: true }));
+
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "audit",
+            "export",
+            "--category",
+            "pairing",
+            "--out",
+            "/tmp/x.jsonl",
+        ])
+        .unwrap();
+        let Some(Command::Audit(a)) = args.command else {
+            panic!("not audit")
+        };
+        assert!(matches!(
+            a.command,
+            AuditCommand::Export { ref category, .. } if category.as_deref() == Some("pairing")
+        ));
+
+        let args =
+            CliArgs::try_parse_from(["ikenga-server", "audit", "reseal", "--ack", "42"]).unwrap();
+        let Some(Command::Audit(a)) = args.command else {
+            panic!("not audit")
+        };
+        assert!(matches!(a.command, AuditCommand::Reseal { ack: 42 }));
+        // `--ack` is required: no reseal of an unnamed break.
+        assert!(CliArgs::try_parse_from(["ikenga-server", "audit", "reseal"]).is_err());
+    }
 
     #[test]
     fn executor_tier_defaults_to_t0() {
