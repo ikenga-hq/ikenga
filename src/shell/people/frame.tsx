@@ -1,10 +1,10 @@
 // D-05 People frame pieces shared by the People tabs (WP-72; WP-76 adds
-// Members and Policies).
+// Members and Policies; WP-77 adds Audit).
 //
 // The design's `.phead` title + `new` chip, the tab strip (`.ptabs`), and the
 // `.block` / `.srow2` settings rows (`designs/people.html`). Profile and
-// Devices are personal; Members and Policies are per project (G-ACCESS §4,
-// §11.1 "scope switch"). Audit comes with WP-77.
+// Devices are personal; Members and Policies are per project; Audit is both
+// (G-ACCESS §4, §11.1 "scope switch").
 
 import type { ReactNode } from 'react';
 
@@ -17,17 +17,31 @@ export const PEOPLE_TABS = [
 	{ to: '/settings/devices', label: 'Devices', exact: true },
 	{ to: '/settings/members', label: 'Members', exact: true },
 	{ to: '/settings/policies', label: 'Policies', exact: true },
+	{ to: '/settings/audit', label: 'Audit', exact: true },
 ] as const;
 
-export type PeopleTab = 'profile' | 'devices' | 'members' | 'policies';
+export type PeopleTab = 'profile' | 'devices' | 'members' | 'policies' | 'audit';
+export type PeopleScope = 'personal' | 'project';
 
-/** D-05 `#scopeSw`: which scope a tab lives at (G-ACCESS §11.1). */
-export function tabScope(tab: PeopleTab): 'personal' | 'project' {
-	return tab === 'members' || tab === 'policies' ? 'project' : 'personal';
+/** D-05 `TABS[].scopes`: the scopes a tab is live at (G-ACCESS §11.1). */
+export const TAB_SCOPES: Readonly<Record<PeopleTab, readonly PeopleScope[]>> = {
+	profile: ['personal'],
+	devices: ['personal'],
+	members: ['project'],
+	policies: ['project'],
+	// Audit: personal = rows you acted in or are about; project = the
+	// active project's rows (`access_audit_list`'s `projectKey`).
+	audit: ['personal', 'project'],
+};
+
+/** D-05 `#scopeSw`: the scope a tab opens at (G-ACCESS §11.1). */
+export function tabScope(tab: PeopleTab): PeopleScope {
+	return TAB_SCOPES[tab][0];
 }
 
-/** D-05 `TABS[].why`: why the other scope is disabled on a tab (as drawn). */
-export const TAB_SCOPE_WHY: Record<PeopleTab, string> = {
+/** D-05 `TABS[].why`: why the other scope is disabled on a tab (as drawn).
+ *  Audit has both scopes live, so no reason. */
+export const TAB_SCOPE_WHY: Readonly<Partial<Record<PeopleTab, string>>> = {
 	profile: 'A profile is yours, not the project’s.',
 	devices: 'Devices pair to this machine, not to a project.',
 	members: 'People are invited to a project, not to a machine.',
@@ -39,10 +53,20 @@ const SCOPES = [
 	{ id: 'project', label: 'Project' },
 ] as const;
 
-/** D-05 `#scopeSw` (G-ACCESS §11.1 header controls): each People tab lives
- *  at one scope, so the other button is disabled with the tab's reason. */
-export function PeopleScopeSwitch({ tab }: { tab: PeopleTab }) {
-	const scope = tabScope(tab);
+/** D-05 `#scopeSw` (G-ACCESS §11.1 header controls): a tab that lives at
+ *  one scope disables the other button with the tab's reason; on Audit both
+ *  are live and `scope` / `onScope` drive them. */
+export function PeopleScopeSwitch({
+	tab,
+	scope: chosen,
+	onScope,
+}: {
+	tab: PeopleTab;
+	scope?: PeopleScope;
+	onScope?: (scope: PeopleScope) => void;
+}) {
+	const live = TAB_SCOPES[tab];
+	const scope = chosen && live.includes(chosen) ? chosen : tabScope(tab);
 	return (
 		<fieldset
 			id="scopeSw"
@@ -52,19 +76,23 @@ export function PeopleScopeSwitch({ tab }: { tab: PeopleTab }) {
 		>
 			{SCOPES.map((s) => {
 				const on = s.id === scope;
+				const enabled = live.includes(s.id) && (on || onScope !== undefined);
 				return (
 					<button
 						key={s.id}
 						type="button"
 						data-scope={s.id}
 						aria-pressed={on}
-						disabled={!on}
-						title={on ? undefined : TAB_SCOPE_WHY[tab]}
+						disabled={!enabled}
+						title={enabled ? undefined : TAB_SCOPE_WHY[tab]}
+						onClick={enabled && !on ? () => onScope?.(s.id) : undefined}
 						className={cn(
 							'min-h-[26px] border-r border-[var(--border)] px-3 text-[var(--text-micro)] last:border-r-0',
 							on
 								? 'bg-[var(--primary-soft)] text-[var(--fg)]'
-								: 'cursor-not-allowed text-[var(--fg-muted)] opacity-45'
+								: enabled
+									? 'text-[var(--fg-muted)] hover:bg-[var(--bg-raised)] hover:text-[var(--fg)]'
+									: 'cursor-not-allowed text-[var(--fg-muted)] opacity-45'
 						)}
 					>
 						{s.label}
@@ -100,7 +128,15 @@ export function PeopleFileBar({ t1 = isT1Session() }: { t1?: boolean }) {
 	);
 }
 
-export function PeopleHeader({ tab }: { tab: PeopleTab }) {
+export function PeopleHeader({
+	tab,
+	scope,
+	onScope,
+}: {
+	tab: PeopleTab;
+	scope?: PeopleScope;
+	onScope?: (scope: PeopleScope) => void;
+}) {
 	return (
 		<div className="space-y-3">
 			<header className="flex flex-wrap items-center gap-2">
@@ -111,7 +147,7 @@ export function PeopleHeader({ tab }: { tab: PeopleTab }) {
 					People, devices and access
 				</h2>
 				<span className="ml-auto">
-					<PeopleScopeSwitch tab={tab} />
+					<PeopleScopeSwitch tab={tab} scope={scope} onScope={onScope} />
 				</span>
 			</header>
 			<div className="flex items-center gap-2 border-b border-[var(--border-soft)] pb-2">

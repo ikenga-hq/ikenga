@@ -54,7 +54,7 @@ import {
 } from './devices-model';
 import { usePairWatch } from './devices-pair-confirm';
 import { PairSheet } from './devices-pair-sheet';
-import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
+import { Kv, PeopleBlock, PeopleFileBar, PeopleHeader, PeopleRow } from './frame';
 import { RoutingPolicy } from './routing-policy';
 
 export function DevicesTab() {
@@ -67,6 +67,7 @@ export function DevicesTab() {
 			<RemoteAccessBlock view={view} refreshing={refreshing} onRefresh={refresh} />
 			<DevicesTableBlock devices={devices} onPair={() => setPairing(true)} />
 			<PairSheet open={pairing} onOpenChange={setPairing} view={view} />
+			<PeopleFileBar />
 		</div>
 	);
 }
