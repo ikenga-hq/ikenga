@@ -65,7 +65,7 @@ impl AuditVia {
             Via::Session { .. } => AuditVia::Session,
             Via::Device { .. } => AuditVia::Device,
             Via::Operator => AuditVia::Operator,
-            Via::ChildToken => AuditVia::System,
+            Via::ChildToken | Via::Relayed => AuditVia::System,
         }
     }
 }

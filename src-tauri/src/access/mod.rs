@@ -214,6 +214,14 @@ impl Default for AccessOptions {
     }
 }
 
+/// Set by the T1 broker on a call **it** makes to a principal child (an
+/// `internal` arm, §9.1 — WP-76's `share_project_info` /
+/// `notifications_record_access` callers), never on a relayed request: the
+/// proxy strips every client `x-ikenga-*` header and adds only its narrowing
+/// set. Without it a per-child-token request is [`Via::Relayed`], which no
+/// `internal` arm accepts — fail closed, whatever the relay's caps.
+pub const INTERNAL_CALL_HEADER: &str = "x-ikenga-internal-call";
+
 pub const DEFAULT_INVITE_TTL_DAYS: u32 = 7;
 pub const MAX_INVITE_TTL_DAYS: u32 = 30;
 
@@ -394,7 +402,10 @@ impl DaemonAccess {
 
     /// A per-child-token request on a T1 principal child (§1.7): caps only
     /// from `X-Ikenga-Caps` (absent → none), share headers parsed for
-    /// narrowing. `X-Ikenga-Principal` is attribution only.
+    /// narrowing. `X-Ikenga-Principal` is attribution only. The broker's own
+    /// call ([`INTERNAL_CALL_HEADER`], and no caps header — a relay always
+    /// carries one) is [`Via::ChildToken`]; anything else is a relayed
+    /// principal request, [`Via::Relayed`].
     pub fn child_ctx(&self, headers: &axum::http::HeaderMap, meta: RequestMeta) -> AccessCtx {
         let header = |name: &str| {
             headers
@@ -408,9 +419,15 @@ impl DaemonAccess {
         let principal_id = header("x-ikenga-principal")
             .and_then(|v| v.parse().ok())
             .unwrap_or(self.owner);
+        let broker_call = header(INTERNAL_CALL_HEADER).as_deref() == Some("1")
+            && !headers.contains_key("x-ikenga-caps");
         AccessCtx {
             principal_id,
-            via: Via::ChildToken,
+            via: if broker_call {
+                Via::ChildToken
+            } else {
+                Via::Relayed
+            },
             device_id: None,
             tier: if caps == CapSet::ALL {
                 Tier::Full
@@ -601,10 +618,13 @@ mod tests {
     #[test]
     fn internal_arms_refuse_any_share_header() {
         let child = DaemonAccess::principal_child(AccessOptions::default());
-        let plain = child.child_ctx(&axum::http::HeaderMap::new(), RequestMeta::default());
+        let mut broker = axum::http::HeaderMap::new();
+        broker.insert(INTERNAL_CALL_HEADER, "1".parse().unwrap());
+        let plain = child.child_ctx(&broker, RequestMeta::default());
+        assert_eq!(plain.via, Via::ChildToken);
         assert!(authorize(&plain, "share_project_info").is_ok());
         for name in ["x-ikenga-share-principal", "x-ikenga-share-role"] {
-            let mut h = axum::http::HeaderMap::new();
+            let mut h = broker.clone();
             h.insert(name, "x".parse().unwrap());
             let c = child.child_ctx(&h, RequestMeta::default());
             assert!(c.share.is_none(), "{name} alone selects no share");
@@ -614,6 +634,39 @@ mod tests {
                 "class=internal",
                 "{name}"
             );
+        }
+    }
+
+    /// Handover lead L74-3: a per-child-token request the broker relayed is
+    /// a non-granting context of its own ([`Via::Relayed`]), never the
+    /// broker's internal one — with no caps header (a broker without the
+    /// narrower), with empty caps, with full caps, or with the internal-call
+    /// marker beside a caps header (a relay always carries one).
+    #[test]
+    fn a_relayed_request_never_reaches_an_internal_arm() {
+        let child = DaemonAccess::principal_child(AccessOptions::default());
+        let cases: [&[(&str, &str)]; 6] = [
+            &[],
+            &[("x-ikenga-caps", "")],
+            &[("x-ikenga-caps", "files,sessions,dispatch,approve,manage")],
+            &[(INTERNAL_CALL_HEADER, "1"), ("x-ikenga-caps", "")],
+            &[(INTERNAL_CALL_HEADER, "true")],
+            &[(INTERNAL_CALL_HEADER, "")],
+        ];
+        for headers in cases {
+            let mut h = axum::http::HeaderMap::new();
+            for (k, v) in headers {
+                h.insert(*k, v.parse().unwrap());
+            }
+            let c = child.child_ctx(&h, RequestMeta::default());
+            assert_eq!(c.via, Via::Relayed, "{headers:?}");
+            for cmd in ["share_project_info", "notifications_record_access"] {
+                assert_eq!(
+                    authorize(&c, cmd).unwrap_err().message,
+                    "class=internal",
+                    "{cmd} {headers:?}"
+                );
+            }
         }
     }
 

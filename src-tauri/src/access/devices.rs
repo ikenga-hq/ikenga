@@ -261,6 +261,46 @@ pub enum Presented {
     Bearer,
 }
 
+/// §2.4: the one device credential a request presents, picked the same way
+/// on T0 (`auth_middleware`) and T1 (`device_cookie_middleware` and the
+/// `DeviceGrantResolver`): an `Authorization: Bearer ikd1.…` first, else the
+/// `ikenga_device` cookie. Only the picked one is evaluated — a present
+/// bearer decides even when it is invalid, so a non-browser client's own
+/// credential never falls back to a cookie a jar happened to send.
+pub fn presented(headers: &axum::http::HeaderMap) -> Option<(String, Presented)> {
+    bearer_from(headers)
+        .map(|t| (t, Presented::Bearer))
+        .or_else(|| cookie_from(headers).map(|t| (t, Presented::Cookie)))
+}
+
+/// What a response does with the `ikenga_device` cookie (§2.4, §3.9),
+/// decided the same on T0 and T1 and attached to **every** response of the
+/// request — a refusal included, since a rotation is committed before the
+/// request is authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieAction {
+    Keep,
+    /// A valid cookie whose secret is due (never a bearer, never on a WS
+    /// handshake, which can't carry `Set-Cookie` back to a jar reliably).
+    Rotate,
+    /// A present but dead cookie: cleared (`Max-Age=0`), without failing a
+    /// request another credential authenticates.
+    Clear,
+}
+
+pub fn cookie_action(auth: &DeviceAuth, presented: Presented, upgrade: bool) -> CookieAction {
+    match (auth, presented) {
+        (
+            DeviceAuth::Valid {
+                rotation_due: true, ..
+            },
+            Presented::Cookie,
+        ) if !upgrade => CookieAction::Rotate,
+        (DeviceAuth::Invalid(_), Presented::Cookie) => CookieAction::Clear,
+        _ => CookieAction::Keep,
+    }
+}
+
 /// The outcome of presenting a device token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceAuth {
@@ -747,6 +787,86 @@ pub(crate) mod tests {
             resolve(&store, &gate, &tok, None).await.unwrap(),
             DeviceAuth::Invalid("revoked")
         );
+    }
+
+    /// Handover lead L74-4 / §2.4: the one device credential a request
+    /// presents and what the response does with the cookie — the functions
+    /// T0's `auth_middleware`, T1's `device_cookie_middleware` and T1's
+    /// `DeviceGrantResolver` all call, so the order can't drift.
+    #[test]
+    fn device_credential_precedence_is_one_table() {
+        use axum::http::HeaderMap;
+        let h = |pairs: &[(&str, &str)]| {
+            let mut m = HeaderMap::new();
+            for (k, v) in pairs {
+                m.append(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            m
+        };
+        let bearer = "Bearer ikd1.dev-b.secret";
+        let cookie = "ikenga_device=ikd1.dev-c.secret";
+        assert_eq!(presented(&h(&[])), None);
+        assert_eq!(
+            presented(&h(&[("cookie", cookie)])),
+            Some(("ikd1.dev-c.secret".into(), Presented::Cookie))
+        );
+        // A device bearer wins over the cookie, whichever is valid.
+        assert_eq!(
+            presented(&h(&[("cookie", cookie), ("authorization", bearer)])),
+            Some(("ikd1.dev-b.secret".into(), Presented::Bearer))
+        );
+        // The operator bearer is not a device credential: the cookie is.
+        assert_eq!(
+            presented(&h(&[
+                ("cookie", cookie),
+                ("authorization", "Bearer 0123abcd")
+            ])),
+            Some(("ikd1.dev-c.secret".into(), Presented::Cookie))
+        );
+        assert_eq!(presented(&h(&[("cookie", "ikenga_device=")])), None);
+
+        let row = DeviceRow {
+            device_id: "d".into(),
+            principal_id: "p".into(),
+            kind: "paired".into(),
+            name: "n".into(),
+            platform: None,
+            tier: Tier::View,
+            grant_epoch: 0,
+            paired_at: 0,
+            last_seen_at: None,
+            last_seen_addr: None,
+            secret_rotated_at: None,
+            revoked_at: None,
+        };
+        let due = DeviceAuth::Valid {
+            row: row.clone(),
+            rotation_due: true,
+        };
+        let fresh = DeviceAuth::Valid {
+            row,
+            rotation_due: false,
+        };
+        let dead = DeviceAuth::Invalid("revoked");
+        use CookieAction::*;
+        for (auth, presented, upgrade, want) in [
+            (&due, Presented::Cookie, false, Rotate),
+            (&due, Presented::Cookie, true, Keep),
+            (&due, Presented::Bearer, false, Keep),
+            (&fresh, Presented::Cookie, false, Keep),
+            (&dead, Presented::Cookie, false, Clear),
+            (&dead, Presented::Cookie, true, Clear),
+            (&dead, Presented::Bearer, false, Keep),
+        ] {
+            assert_eq!(
+                cookie_action(auth, presented, upgrade),
+                want,
+                "{auth:?} {presented:?} upgrade={upgrade}"
+            );
+        }
     }
 
     /// A-35: an old secret is due for rotation; rotating keeps the old hash

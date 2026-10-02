@@ -36,7 +36,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use super::audit::AuditVia;
 use super::caps::{self, CapSet, RoleContext, Tier};
 use super::ctx::{AccessCtx, RequestMeta, Via};
-use super::devices::{self, DeviceAuth, Presented, SeenGate};
+use super::devices::{self, CookieAction, DeviceAuth, SeenGate};
 use super::rpc::{self as access_rpc, Env, PrincipalInfo, SocketControl};
 use super::sockets::Close;
 use super::store::{AccessStore, StoreTier};
@@ -225,9 +225,7 @@ impl CredentialResolver for DeviceGrantResolver {
             let auth = match parts.extensions.get::<ResolvedDevice>() {
                 Some(r) => r.auth.clone(),
                 None => {
-                    let raw = devices::bearer_from(&parts.headers)
-                        .or_else(|| devices::cookie_from(&parts.headers));
-                    let Some(raw) = raw else {
+                    let Some((raw, _)) = devices::presented(&parts.headers) else {
                         return Ok(Resolution::NotPresent);
                     };
                     devices::resolve(
@@ -277,34 +275,29 @@ pub async fn device_cookie_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let cookie = devices::cookie_from(req.headers());
-    let bearer = devices::bearer_from(req.headers());
-    let (raw, presented) = match (bearer, cookie) {
-        (Some(b), _) => (Some(b), Presented::Bearer),
-        (None, Some(c)) => (Some(c), Presented::Cookie),
-        (None, None) => (None, Presented::Cookie),
-    };
     let mut set_cookie = None;
     let mut clear = false;
-    if let Some(raw) = raw {
+    // §2.4: the same pick and the same cookie decision as T0's
+    // `auth_middleware` (`devices::presented` / `devices::cookie_action`).
+    if let Some((raw, presented)) = devices::presented(req.headers()) {
         let addr = req
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|c| c.0.ip().to_string());
         match devices::resolve(&t1.store, &t1.seen, &raw, addr.as_deref()).await {
             Ok(auth) => {
-                match &auth {
-                    DeviceAuth::Valid { row, rotation_due } => {
-                        // WS handshakes never rotate (§3.9).
-                        let upgrade = req.headers().contains_key(header::UPGRADE);
-                        if *rotation_due && presented == Presented::Cookie && !upgrade {
+                let upgrade = req.headers().contains_key(header::UPGRADE);
+                match devices::cookie_action(&auth, presented, upgrade) {
+                    CookieAction::Rotate => {
+                        if let DeviceAuth::Valid { row, .. } = &auth {
                             match devices::rotate(&t1.store, &row.device_id).await {
                                 Ok(tok) => set_cookie = tok,
                                 Err(e) => tracing::warn!("device cookie rotation: {e:#}"),
                             }
                         }
                     }
-                    DeviceAuth::Invalid(_) => clear = presented == Presented::Cookie,
+                    CookieAction::Clear => clear = true,
+                    CookieAction::Keep => {}
                 }
                 req.extensions_mut().insert(ResolvedDevice { auth });
             }
@@ -772,6 +765,132 @@ mod tests {
             .await
             .unwrap();
         assert!(r.ok(), "{r:?}");
+    }
+
+    /// Handover lead L74-3 (broker side): no broker context reaches an
+    /// `internal` arm — not the never-produced-under-T1 `OperatorBearer`
+    /// (tier view, no caps), not a device whose row is gone (tier view), not
+    /// a full-tier device or a password session. Only the child's
+    /// `Via::ChildToken` (the broker's own marked call) does.
+    #[tokio::test]
+    async fn no_broker_context_reaches_an_internal_arm() {
+        let (_tmp, t1, ada) = setup().await;
+        let (row, tok) = pair(&t1, ada, Tier::Full).await;
+        let account = {
+            let mut conn = t1.pool.acquire().await.unwrap();
+            accounts::by_id(&mut conn, ada).await.unwrap().unwrap()
+        };
+        let authz = AccessAuthorizer(t1.clone());
+        let bare = axum::http::Request::new(()).into_parts().0;
+        let device_parts = parts_with("authorization", &format!("Bearer {tok}"));
+        let operator = PrincipalCtx {
+            principal: account.principal(),
+            via: Credential::OperatorBearer,
+        };
+        let session = PrincipalCtx {
+            principal: account.principal(),
+            via: Credential::Session {
+                session_id: "s".into(),
+            },
+        };
+        let device = PrincipalCtx {
+            principal: account.principal(),
+            via: Credential::DeviceGrant {
+                device_id: row.device_id.clone(),
+            },
+        };
+        let gone = PrincipalCtx {
+            principal: account.principal(),
+            via: Credential::DeviceGrant {
+                device_id: "no-such-device".into(),
+            },
+        };
+        let b = t1.access_ctx(&operator, &bare).await.unwrap();
+        assert_eq!((b.access.tier, b.access.caps), (Tier::View, CapSet::EMPTY));
+        let b = t1.access_ctx(&gone, &bare).await.unwrap();
+        assert_eq!(b.access.tier, Tier::View, "no row: fail closed to view");
+        for (ctx, parts) in [
+            (&operator, &bare),
+            (&session, &bare),
+            (&device, &device_parts),
+            (&gone, &bare),
+        ] {
+            for cmd in ["share_project_info", "notifications_record_access"] {
+                match authz.authorize_rpc(ctx, parts, cmd, &Value::Null).await {
+                    Decision::Deny { message, .. } => {
+                        assert_eq!(message, "forbidden: class=internal", "{cmd} {:?}", ctx.via)
+                    }
+                    Decision::Allow => panic!("{cmd} allowed for {:?}", ctx.via),
+                }
+            }
+        }
+    }
+
+    /// Handover lead L74-2 (T1): a rotation committed while resolving a
+    /// cookie reaches the client on a refusal too — the new `Set-Cookie`
+    /// rides the 403, so the jar never keeps a secret that is only valid
+    /// for the grace.
+    #[tokio::test]
+    async fn a_rotated_cookie_is_set_on_a_refusal_too() {
+        use tower::ServiceExt;
+        let (_tmp, t1, ada) = setup().await;
+        let (row, tok) = pair(&t1, ada, Tier::View).await;
+        let old = devices::now_ms() - devices::ROTATE_AFTER.as_millis() as i64 - 1000;
+        sqlx::query(
+            "UPDATE devices SET secret_rotated_at = ?, paired_at = ?, last_seen_at = ? \
+             WHERE device_id = ?",
+        )
+        .bind(old)
+        .bind(old)
+        .bind(devices::now_ms())
+        .bind(&row.device_id)
+        .execute(&t1.pool)
+        .await
+        .unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/api/rpc",
+                axum::routing::post(|| async {
+                    crate::server::auth::json_error(
+                        StatusCode::FORBIDDEN,
+                        "forbidden",
+                        "forbidden: missing=dispatch",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                t1.clone(),
+                device_cookie_middleware,
+            ));
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/rpc")
+                    .header("cookie", format!("ikenga_device={tok}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let cookie = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie on the refusal")
+            .to_str()
+            .unwrap();
+        let fresh = cookie
+            .strip_prefix("ikenga_device=")
+            .and_then(|v| v.split(';').next())
+            .unwrap();
+        assert_ne!(fresh, tok);
+        assert!(matches!(
+            devices::resolve(&t1.store, &SeenGate::default(), fresh, None)
+                .await
+                .unwrap(),
+            DeviceAuth::Valid { .. }
+        ));
     }
 
     #[tokio::test]

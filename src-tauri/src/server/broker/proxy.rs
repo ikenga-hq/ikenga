@@ -850,6 +850,14 @@ mod tests {
             strip_token_param(Some("spawn=true&token=abc&cols=80")).as_deref(),
             Some("spawn=true&cols=80")
         );
+        // L74-1: the broker decides nothing from the rest of the query; it
+        // forwards every other parameter byte for byte, so the child's
+        // `Query<PtyQuery>` decodes exactly what the client sent and
+        // re-checks `spawn` against `X-Ikenga-Caps` itself.
+        assert_eq!(
+            strip_token_param(Some("sp%61wn=tru%65&%74oken=abc&spawn=true")).as_deref(),
+            Some("sp%61wn=tru%65&spawn=true")
+        );
         assert_eq!(
             strip_token_param(Some("tokens=1")).as_deref(),
             Some("tokens=1")

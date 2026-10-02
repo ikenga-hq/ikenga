@@ -23,9 +23,17 @@ pub enum Via {
     Device { device_id: String },
     /// The T0 operator bearer (header or `?token=`). Never under T1.
     Operator,
-    /// A T1 principal child's per-child token: the broker speaking for the
-    /// principal. Caps come only from `X-Ikenga-Caps` (§1.7).
+    /// A T1 principal child's per-child token on a call the **broker itself**
+    /// makes (marked with [`super::INTERNAL_CALL_HEADER`]): the only context
+    /// that reaches an `internal` arm (§9.1). Caps come only from
+    /// `X-Ikenga-Caps` (§1.7).
     ChildToken,
+    /// A T1 principal child's per-child token on a principal's request the
+    /// broker **relayed** (every proxied request): caps only from
+    /// `X-Ikenga-Caps`, and never an `internal` arm — so a relay that set no
+    /// caps (a broker without the narrower) is a non-granting context, not
+    /// the broker's own one.
+    Relayed,
 }
 
 impl Via {
@@ -35,7 +43,7 @@ impl Via {
             Via::Session { .. } => "session",
             Via::Device { .. } => "device",
             Via::Operator => "operator",
-            Via::ChildToken => "system",
+            Via::ChildToken | Via::Relayed => "system",
         }
     }
 }
@@ -124,7 +132,7 @@ impl AccessCtx {
     pub fn credential_json(&self) -> serde_json::Value {
         serde_json::json!({
             "via": match self.via {
-                Via::ChildToken => "operator",
+                Via::ChildToken | Via::Relayed => "operator",
                 _ => self.via.as_str(),
             },
             "deviceId": self.device_id,

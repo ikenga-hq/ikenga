@@ -157,9 +157,9 @@ async fn handle_pty_socket(
     if query.spawn && !guard.may(crate::access::Cap::Dispatch) {
         query.spawn = false;
         let _ = ws_tx
-            .send(Message::Text(access_ws::refusal(crate::access::CapSet::of(&[
-                crate::access::Cap::Dispatch,
-            ]))))
+            .send(Message::Text(access_ws::refusal(
+                crate::access::CapSet::of(&[crate::access::Cap::Dispatch]),
+            )))
             .await;
     }
     let closed_rx = guard.take_closed();

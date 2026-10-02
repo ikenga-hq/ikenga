@@ -388,7 +388,7 @@ async fn a_principal_child_takes_caps_only_from_the_broker_header() {
         None,
         access,
     );
-    let call = |caps: Option<&'static str>, cmd: &'static str| {
+    let call_as = |broker_call: bool, caps: Option<&'static str>, cmd: &'static str| {
         let router = router.clone();
         async move {
             let mut req = Request::builder()
@@ -398,6 +398,9 @@ async fn a_principal_child_takes_caps_only_from_the_broker_header() {
                 .header("content-type", "application/json");
             if let Some(c) = caps {
                 req = req.header("x-ikenga-caps", c);
+            }
+            if broker_call {
+                req = req.header(super::INTERNAL_CALL_HEADER, "1");
             }
             let res = router
                 .oneshot(
@@ -412,6 +415,7 @@ async fn a_principal_child_takes_caps_only_from_the_broker_header() {
             serde_json::from_slice::<Value>(&body).unwrap()
         }
     };
+    let call = |caps: Option<&'static str>, cmd: &'static str| call_as(false, caps, cmd);
     // No header: no caps.
     assert_eq!(
         call(None, "pty_write").await["error"],
@@ -433,11 +437,25 @@ async fn a_principal_child_takes_caps_only_from_the_broker_header() {
         .as_str()
         .unwrap()
         .starts_with("served_by_broker:"));
-    // `internal` arms: only on the per-child token with no share header.
-    assert!(call(None, "share_project_info").await["error"]
+    // `internal` arms: only on the broker's own call (the marker, no caps
+    // header, no share header) — never on a relayed request (L74-3).
+    assert!(call_as(true, None, "share_project_info").await["error"]
         .as_str()
         .unwrap()
         .contains("WP-76"));
+    for caps in [
+        None,
+        Some(""),
+        Some("files,sessions,dispatch,approve,manage"),
+    ] {
+        for cmd in ["share_project_info", "notifications_record_access"] {
+            assert_eq!(call(caps, cmd).await["error"], "forbidden: class=internal");
+        }
+        assert_eq!(
+            call_as(true, caps.or(Some("")), "share_project_info").await["error"],
+            "forbidden: class=internal"
+        );
+    }
     assert!(!tmp.path().join("access.db").exists());
     let res = router
         .clone()
@@ -482,4 +500,207 @@ fn t0_code_builds_no_principal_and_the_desktop_never_opens_the_store() {
         !desktop.contains("AccessStore::"),
         "commands/access.rs must proxy (P-20)"
     );
+}
+
+async fn serve(router: Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_open(
+    addr: std::net::SocketAddr,
+    path_and_query: &str,
+    tok: &str,
+) -> Result<Ws, String> {
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}{path_and_query}")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {tok}").parse().unwrap());
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(|(ws, _)| ws)
+        .map_err(|e| e.to_string())
+}
+
+/// Every text frame until the server closes (or 5 s pass).
+async fn text_frames(ws: &mut Ws) -> Vec<Value> {
+    let mut out = Vec::new();
+    while let Ok(Some(Ok(msg))) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await
+    {
+        match msg {
+            tungstenite::Message::Text(t) => out.push(serde_json::from_str(&t).unwrap()),
+            tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Handover lead L74-1: `?spawn=` is decided once, inside
+/// `pty_ws_handler`, from the very `Query<PtyQuery>` (percent-decoded) parse
+/// that drives the spawn, against the socket's caps — there is no second,
+/// raw-query decision to disagree with it. So every encoded spelling of
+/// `spawn=true` from a `view` device is seen as a spawn request **and
+/// refused** (the refusal frame, then `ikenga.gone`, no shell); a spelling
+/// that isn't `spawn` is a plain attach; a duplicate is a 400 at the
+/// handshake (fail closed); and an encoded route segment is not the PTY
+/// route at all (axum matches the raw path, as `route_requirement` reads it).
+#[tokio::test]
+async fn encoded_spawn_forms_never_spawn_without_dispatch() {
+    let access = DaemonAccess::with_store(AccessStore::memory_t0().await);
+    let pty = Arc::new(PtyManager::new());
+    let router = create_router_with_access(
+        config(),
+        pty.clone(),
+        Arc::new(EngineRegistry::new()),
+        None,
+        None,
+        access.clone(),
+    );
+    let (_, tok) = pair(access.store().unwrap(), Tier::View).await;
+    let addr = serve(router).await;
+    let refusal = json!({"type": "error", "code": "forbidden", "missing": ["dispatch"]});
+
+    for q in [
+        "spawn=true",
+        "sp%61wn=true",
+        "spawn=tru%65",
+        "%73%70%61%77%6E=%74%72%75%65",
+        "spawn=true&cols=80",
+        "token=x&sp%61wn=true",
+    ] {
+        let mut ws = ws_open(addr, &format!("/ws/pty/l74-{}?{q}", q.len()), &tok)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let frames = text_frames(&mut ws).await;
+        assert_eq!(frames.first(), Some(&refusal), "{q}: {frames:?}");
+        assert_eq!(
+            frames.get(1).map(|f| &f["type"]),
+            Some(&json!("ikenga.gone")),
+            "{q}"
+        );
+    }
+    // Not `spawn`: a plain attach, told the terminal is gone.
+    for q in ["spawnx=true", "spawn%20=true", "spawn=false"] {
+        let mut ws = ws_open(addr, &format!("/ws/pty/plain?{q}"), &tok)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let frames = text_frames(&mut ws).await;
+        assert_eq!(frames.len(), 1, "{q}: {frames:?}");
+        assert_eq!(frames[0]["type"], "ikenga.gone", "{q}");
+    }
+    // Duplicates and unparseable values: the handshake fails.
+    for q in [
+        "spawn=false&spawn=true",
+        "spawn=true&sp%61wn=true",
+        "spawn=yes",
+    ] {
+        let err = ws_open(addr, &format!("/ws/pty/dup?{q}"), &tok)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{q} upgraded"));
+        assert!(err.contains("400"), "{q}: {err}");
+    }
+    // An encoded route segment never reaches the PTY handler.
+    for path in [
+        "/ws/p%74y/x?spawn=true",
+        "/ws/%70ty/x?spawn=true",
+        "/ws//pty/x?spawn=true",
+    ] {
+        assert!(ws_open(addr, path, &tok).await.is_err(), "{path} upgraded");
+    }
+    assert!(pty.list_terminals().is_empty(), "no shell was spawned");
+}
+
+/// Handover lead L74-2 (T0): a cookie rotation committed while resolving
+/// reaches the client on a refusal too — a route-class 403 and an RPC
+/// refusal both carry the new `Set-Cookie`.
+#[tokio::test]
+async fn a_rotated_cookie_is_set_on_a_refusal_too() {
+    let (router, access) = daemon().await;
+    let store = access.store().unwrap();
+    let (row, mut tok) = pair(store, Tier::View).await;
+    let age = || async {
+        let old = super::devices::now_ms() - super::devices::ROTATE_AFTER.as_millis() as i64 - 1000;
+        sqlx::query(
+            "UPDATE devices SET secret_rotated_at = ?, paired_at = ?, last_seen_at = ? \
+             WHERE device_id = ?",
+        )
+        .bind(old)
+        .bind(old)
+        .bind(super::devices::now_ms())
+        .bind(&row.device_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    };
+    let fresh_from = |res: &axum::response::Response| {
+        res.headers()
+            .get("set-cookie")
+            .expect("Set-Cookie on the refusal")
+            .to_str()
+            .unwrap()
+            .strip_prefix("ikenga_device=")
+            .and_then(|v| v.split(';').next())
+            .map(str::to_string)
+            .filter(|v| !v.is_empty())
+            .expect("a rotated (not cleared) cookie")
+    };
+
+    age().await;
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/shutdown")
+                .header("cookie", format!("ikenga_device={tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let fresh = fresh_from(&res);
+    assert_ne!(fresh, tok);
+    tok = fresh;
+
+    age().await;
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rpc")
+                .header("cookie", format!("ikenga_device={tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"cmd": "pty_write", "args": {"id": "x", "data": "ls"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fresh = fresh_from(&res);
+    assert_ne!(fresh, tok);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "forbidden: missing=dispatch");
 }

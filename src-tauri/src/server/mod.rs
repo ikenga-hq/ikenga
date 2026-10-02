@@ -373,35 +373,45 @@ async fn auth_middleware(
     // has no store, and the broker resolves devices for it.
     if access.mode == DaemonMode::T0 {
         if let Some(store) = access.store() {
-            let bearer = devices::bearer_from(req.headers());
-            let cookie = devices::cookie_from(req.headers());
-            let presented = if bearer.is_some() {
-                devices::Presented::Bearer
-            } else {
-                devices::Presented::Cookie
-            };
-            if let Some(raw) = bearer.or(cookie) {
+            if let Some((raw, presented)) = devices::presented(req.headers()) {
                 match devices::resolve(store, &access.seen, &raw, meta.remote_addr.as_deref()).await
                 {
-                    Ok(devices::DeviceAuth::Valid { row, rotation_due }) => {
+                    Ok(auth) => {
                         let upgrade = req.headers().contains_key("upgrade");
-                        if rotation_due && presented == devices::Presented::Cookie && !upgrade {
-                            match devices::rotate(store, &row.device_id).await {
-                                Ok(Some(tok)) => set_cookie = Some(devices::set_cookie(&tok, insecure)),
-                                Ok(None) => {}
-                                Err(e) => warn!("device cookie rotation: {e:#}"),
+                        match devices::cookie_action(&auth, presented, upgrade) {
+                            devices::CookieAction::Rotate => {
+                                if let devices::DeviceAuth::Valid { row, .. } = &auth {
+                                    match devices::rotate(store, &row.device_id).await {
+                                        Ok(Some(tok)) => {
+                                            set_cookie = Some(devices::set_cookie(&tok, insecure))
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => warn!("device cookie rotation: {e:#}"),
+                                    }
+                                }
+                            }
+                            devices::CookieAction::Clear => {
+                                set_cookie = Some(devices::clear_cookie(insecure))
+                            }
+                            devices::CookieAction::Keep => {}
+                        }
+                        match auth {
+                            devices::DeviceAuth::Valid { row, .. } => {
+                                ctx = Some(access.device_ctx(&row, meta.clone()).await);
+                            }
+                            // A dead bearer is a 401 (no fallback, §2.4); a
+                            // dead cookie is cleared above but doesn't fail a
+                            // request that also carries a valid operator
+                            // bearer.
+                            devices::DeviceAuth::Invalid(why) => {
+                                if presented == devices::Presented::Bearer {
+                                    warn!("device bearer refused on {} ({why})", req.uri().path());
+                                    return Err(unauthorized(
+                                        "Unauthorized: invalid device credential",
+                                    ));
+                                }
                             }
                         }
-                        ctx = Some(access.device_ctx(&row, meta.clone()).await);
-                    }
-                    Ok(devices::DeviceAuth::Invalid(why)) => {
-                        if presented == devices::Presented::Bearer {
-                            warn!("device bearer refused on {} ({why})", req.uri().path());
-                            return Err(unauthorized("Unauthorized: invalid device credential"));
-                        }
-                        // A dead cookie is cleared, but doesn't fail a
-                        // request that also carries a valid operator bearer.
-                        set_cookie = Some(devices::clear_cookie(insecure));
                     }
                     Err(e) => {
                         error!("device credential resolution failed: {e:#}");
@@ -427,7 +437,10 @@ async fn auth_middleware(
     }
 
     let with_cookie = |mut res: Response, cookie: &Option<String>| {
-        if let Some(v) = cookie.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        if let Some(v) = cookie
+            .as_deref()
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
             res.headers_mut().append("set-cookie", v);
         }
         res
@@ -887,8 +900,7 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     let access = if mode.principal_child {
         crate::access::DaemonAccess::principal_child(mode.access.clone())
     } else {
-        crate::access::DaemonAccess::boot_t0(config.data_dir.as_deref(), mode.access.clone())
-            .await
+        crate::access::DaemonAccess::boot_t0(config.data_dir.as_deref(), mode.access.clone()).await
     };
     let router = create_router_with_access(
         config.clone(),

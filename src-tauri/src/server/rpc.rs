@@ -129,13 +129,12 @@ pub async fn rpc_handler(
     // share mode a narrowed `AppState` (WP-76). One call, before any arm.
     let access = access.map(|Extension(a)| a);
     let ctx = ctx.map(|Extension(c)| c);
-    let state = match crate::access::rpc_prehook(&state, ctx.as_ref(), &payload.cmd, &payload.args)
-        .await
-    {
-        crate::access::PreHook::Proceed => state,
-        crate::access::PreHook::Narrowed(narrowed) => narrowed,
-        crate::access::PreHook::Answered(res) => return Json(res),
-    };
+    let state =
+        match crate::access::rpc_prehook(&state, ctx.as_ref(), &payload.cmd, &payload.args).await {
+            crate::access::PreHook::Proceed => state,
+            crate::access::PreHook::Narrowed(narrowed) => narrowed,
+            crate::access::PreHook::Answered(res) => return Json(res),
+        };
 
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
