@@ -4,8 +4,11 @@
 // popover row renders. Toasts (`components/ui/floating-toast-chip.tsx`) are
 // text-only transient copies and carry no action. The action is narrowed at
 // runtime with WP-40's `asKnownNotificationAction` (an ACP
-// `permission.decide` becomes open-only `open.thread`), and a hooks-gate
+// `permission.decide` becomes `open.thread`), and a hooks-gate
 // Allow / Deny is offered only while the ask is live (`isPermissionAskLive`).
+// WP-75 (G-ACCESS §5.5): every decision goes through `permission_decide`
+// (hook and ACP asks alike), and an ask routed to another device (§5.1)
+// offers no Allow / Deny here (`hostDecideBlock`).
 //
 // Deep-link fidelity notes (best-effort — no dedicated routes exist yet for
 // some targets; see the WP-40b PR body):
@@ -23,6 +26,13 @@
 //   - `invite` ships no producer yet (D-05's people surface doesn't exist),
 //     so its button is a guess: `/settings/people`.
 
+import {
+	accessRoutingGet,
+	accessStatus,
+	type PermissionDecision,
+	parseAccessError,
+	permissionDecide,
+} from '@/lib/access/client';
 import { iykeFetch } from '@/lib/iyke/client';
 import { asKnownNotificationAction } from '@/lib/notifications/action-kind';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -51,15 +61,100 @@ function openTerminalPane(sessionId: string): void {
 	addTab(focusedId, { kind: 'terminal', sessionId });
 }
 
-/** Same call `src/terminal/permission-inbox.tsx` makes for the held hooks
- *  gate — best-effort, matching its own `.catch(() => {})`. */
-function postHookDecision(requestId: string, decision: 'approved' | 'denied'): void {
+/** The pre-WP-75 path for the held hooks gate — kept as the fallback when
+ *  the decide core can't take the row (an older backend, or the row not
+ *  recorded yet). Best-effort. */
+export function postHookDecision(requestId: string, decision: 'approved' | 'denied'): void {
 	void iykeFetch('/iyke/hooks/decision', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ requestId, decision }),
 	}).catch(() => {});
 }
+
+// ── G-ACCESS §5.5 / §5.7 (WP-75): one decide core ──────────────────────────
+
+/**
+ * Refusals the decide core made on purpose (§9.1 codes). Never worked around
+ * by the hooks fallback: a `routing_refused` ask stays for the device it is
+ * routed to (§5.1), a timed-out one stays denied (§5.6).
+ */
+const FINAL_DECIDE_CODES = new Set([
+	'routing_refused',
+	'owner_approval_required',
+	'forbidden',
+	'conflict',
+	'answer_in_terminal',
+	'invalid_request',
+]);
+
+/**
+ * Decide a `permission` row through `permission_decide` (served in-process
+ * on the desktop, §5.5): hook and ACP asks alike, capped by the routing
+ * preference, attributed and audited. `hookRequestId` enables the
+ * `/iyke/hooks/decision` fallback for a hooks-gate row the core could not
+ * take. Resolves to the refusal message, or `null` when decided.
+ */
+export async function decidePermissionRow(
+	rowId: number,
+	decision: PermissionDecision,
+	hookRequestId?: string
+): Promise<string | null> {
+	try {
+		await permissionDecide(rowId, decision);
+		return null;
+	} catch (e) {
+		const { code, message } = parseAccessError(e);
+		if (code === 'routing_refused') void refreshHostDecideBlock();
+		if (hookRequestId && (code === null || !FINAL_DECIDE_CODES.has(code))) {
+			postHookDecision(hookRequestId, decision === 'deny' ? 'denied' : 'approved');
+			return null;
+		}
+		return message;
+	}
+}
+
+let hostBlock: string | null = null;
+
+/**
+ * Why THIS desktop may not answer its own asks right now (`waiting_on:
+ * 'device'`, §5.7), or `null`. Set by {@link refreshHostDecideBlock}; read by
+ * {@link notificationActionButtons} so a routed-away ask offers no dead
+ * Allow / Deny.
+ */
+export function hostDecideBlock(): string | null {
+	return hostBlock;
+}
+
+export function setHostDecideBlock(reason: string | null): void {
+	hostBlock = reason;
+}
+
+/**
+ * Re-read the host's routing (§5.1): the operator's effective caps already
+ * apply the preference, so a store-backed status without `approve` means the
+ * asks are answered on another device. No store → no preference → unblocked.
+ */
+export async function refreshHostDecideBlock(): Promise<string | null> {
+	try {
+		const status = await accessStatus();
+		if (!status || status.store === 'none' || status.caps.includes('approve')) {
+			hostBlock = null;
+			return hostBlock;
+		}
+		const routing = (await accessRoutingGet()) as { deviceName?: string | null };
+		hostBlock = routing.deviceName
+			? `Answer on ${routing.deviceName} (this device only)`
+			: 'Answered on the device chosen for asks (this device only)';
+	} catch {
+		// Unknown: leave the last answer; the daemon decides either way.
+	}
+	return hostBlock;
+}
+
+/** How long a Claude Code ACP round-trip waits (`PERMISSION_TIMEOUT_SECS`,
+ *  `engines/claude_code/server.rs`) plus the same slack as the hooks gate. */
+export const ACP_ASK_ANSWERABLE_MS = 310_000;
 
 /**
  * How long a held hooks-gate ask can possibly still be answerable, from its
@@ -88,6 +183,7 @@ export function isPermissionAskLive(row: NotificationRow, now: number = Date.now
 export function notificationActionButtons(
 	row: NotificationRow,
 	now: number = Date.now(),
+	block: string | null = hostDecideBlock()
 ): NotificationActionButton[] {
 	const action = asKnownNotificationAction(row.action);
 	if (!action) {
@@ -107,9 +203,24 @@ export function notificationActionButtons(
 					: [];
 			}
 			const { requestId } = action;
+			// Routed to another device (§5.1): no dead Allow / Deny here.
+			if (block) {
+				const terminalId = action.terminalId;
+				return terminalId
+					? [{ label: 'Open terminal', variant: 'ghost', run: () => openTerminalPane(terminalId) }]
+					: [];
+			}
 			return [
-				{ label: 'Allow once', variant: 'primary', run: () => postHookDecision(requestId, 'approved') },
-				{ label: 'Deny', variant: 'ghost', run: () => postHookDecision(requestId, 'denied') },
+				{
+					label: 'Allow once',
+					variant: 'primary',
+					run: () => void decidePermissionRow(row.id, 'allow_once', requestId),
+				},
+				{
+					label: 'Deny',
+					variant: 'ghost',
+					run: () => void decidePermissionRow(row.id, 'deny', requestId),
+				},
 			];
 		}
 		case 'open.terminal': {
@@ -119,11 +230,31 @@ export function notificationActionButtons(
 				: [];
 		}
 		case 'open.thread': {
-			// ACP asks are open-only: the thread's own dialog answers them.
+			// An ACP ask: the thread's own dialog answers it, and since WP-75
+			// so does `permission_decide` (§5.5) while the round-trip waits.
 			const { threadId } = action;
-			return threadId
+			const open: NotificationActionButton[] = threadId
 				? [{ label: 'Open thread', variant: 'ghost', run: () => openTerminalPane(threadId) }]
 				: [];
+			const live =
+				row.kind === 'permission' &&
+				row.resolvedAt == null &&
+				now - row.createdAt < ACP_ASK_ANSWERABLE_MS;
+			if (!live || block) return open;
+			return [
+				{
+					label: 'Allow once',
+					variant: 'primary',
+					run: () => void decidePermissionRow(row.id, 'allow_once'),
+				},
+				{
+					label: 'Always for this project',
+					variant: 'ghost',
+					run: () => void decidePermissionRow(row.id, 'allow_always_project'),
+				},
+				{ label: 'Deny', variant: 'ghost', run: () => void decidePermissionRow(row.id, 'deny') },
+				...open,
+			];
 		}
 		case 'open.chi_run': {
 			const label = action.status === 'failed' ? 'Open log' : 'Open artifact';

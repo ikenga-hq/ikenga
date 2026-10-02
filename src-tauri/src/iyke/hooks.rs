@@ -131,16 +131,6 @@ fn app_db(app: &AppHandle) -> Option<Arc<PaDb>> {
     app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone())
 }
 
-/// WP-40 `permission` producer for the hooks bus. Best-effort.
-async fn record_permission_notification(
-    app: &AppHandle,
-    new: crate::notifications::NewNotification,
-) {
-    if let Some(db) = app_db(app) {
-        crate::notifications::record_with_db(&db, new).await;
-    }
-}
-
 fn mint_request_id() -> String {
     format!(
         "perm-{}-{}",
@@ -198,6 +188,10 @@ pub async fn post_hook_event(
         // Spawned, not awaited: the hold below must start now. Its bound sits
         // only 5 s under curl's --max-time, and a busy DB write (busy_timeout
         // is 5 s) must never eat that margin.
+        //
+        // G-ACCESS §5.7 / §5.5 (a) (WP-75): recorded with its attribution and
+        // mirrored to the daemon, so a paired device can answer inside the
+        // hold. The mirror expires with the hold; nothing extends it (§5.6).
         {
             let app = app.clone();
             let new = crate::notifications::producers::permission_from_hook_gate(
@@ -207,8 +201,15 @@ pub async fn post_hook_event(
                 payload.cwd.as_deref(),
                 &request_id,
             );
+            let facts = crate::notifications::producers::ask_facts(
+                payload.tool_name.as_deref(),
+                payload.tool_input.as_ref(),
+                payload.cwd.as_deref(),
+                false,
+            );
+            let expires = chrono::Utc::now().timestamp_millis() + (GATE_HOLD_SECS as i64) * 1000;
             tauri::async_runtime::spawn(async move {
-                record_permission_notification(&app, new).await;
+                crate::notifications::record_permission(&app, new, facts, Some(expires)).await;
             });
         }
 
@@ -229,12 +230,24 @@ pub async fn post_hook_event(
         // (`resolvedAt`, and read) so the centre does not keep offering a
         // dead Allow / Deny. Spawned for
         // the same reason as the record above: never delay the hook reply.
+        let key = crate::notifications::producers::hook_gate_key(&request_id);
         if let Some(db) = app_db(&app) {
-            let key = crate::notifications::producers::hook_gate_key(&request_id);
+            let key = key.clone();
             tauri::async_runtime::spawn(async move {
                 crate::notifications::resolve_key_with_db(&db, &key).await;
             });
         }
+        // §5.5 (a): close the daemon's mirror (a no-op when a paired device
+        // decided it — that path already took it off the relay).
+        crate::notifications::relay_resolved(
+            &app,
+            &key,
+            if matches!(decision, Ok(Ok(_))) {
+                "decided_on_host"
+            } else {
+                "timed_out"
+            },
+        );
 
         let allowed = match decision {
             Ok(Ok(HookDecision { decision, .. })) => decision == "approved",
@@ -306,8 +319,16 @@ pub async fn post_hook_event(
             payload.session_id.as_deref(),
             payload.cwd.as_deref(),
         );
+        // Attributed (§5.7) but never relayed: a terminal prompt is answered
+        // in its terminal (`answer_in_terminal`, §5.5).
+        let facts = crate::notifications::producers::ask_facts(
+            payload.tool_name.as_deref(),
+            payload.tool_input.as_ref(),
+            payload.cwd.as_deref(),
+            true,
+        );
         tauri::async_runtime::spawn(async move {
-            record_permission_notification(&app, new).await;
+            crate::notifications::record_permission(&app, new, facts, None).await;
         });
     }
 
@@ -369,27 +390,58 @@ pub async fn post_hook_event(
 /// `PreToolUse` hook was held, the decision is forwarded to the pending
 /// receiver and the HTTP response is recorded. If no pending request exists,
 /// the decision is still emitted as an event so callers can observe it.
+///
+/// G-ACCESS §5.5 (WP-75): when the held ask has its `permission` row, the
+/// decision goes through the one decide core (`permission_decide`'s), so it
+/// is capped by the routing preference (§5.1), attributed (`decided_*`) and
+/// audited. The route stays for external hook clients; a decision that
+/// arrives before the row exists (the record is spawned beside the hold)
+/// waits for it briefly, then falls back to answering the hold directly —
+/// still only when the host's routing preference admits it.
 pub async fn post_hook_decision(
     Extension(app): Extension<AppHandle>,
     Json(decision): Json<HookDecision>,
 ) -> impl IntoResponse {
-    let was_gated = {
-        if let Ok(mut map) = get_held_requests().lock() {
-            if let Some(held) = map.remove(&decision.request_id) {
-                // If the receiver is already gone (timeout), the send fails;
-                // that's fine — we still record the decision.
-                let _ = held.tx.send(decision.clone());
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+    let approved = decision.decision == "approved";
+    if let Some(id) = held_row_id(&app, &decision.request_id).await {
+        let verdict = crate::server::shared::notifications::routing::decide_local(
+            id,
+            if approved { "allow_once" } else { "deny" },
+        )
+        .await;
+        return match verdict {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "recorded": true, "gated": true })),
+            ),
+            Err(e) if e.code == crate::access::Code::Conflict => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "recorded": true, "gated": false })),
+            ),
+            Err(e) => (
+                e.code.status(),
+                Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
+            ),
+        };
+    }
+    // No row to decide through (the record is slow or failed): still never
+    // answer past the routing preference (§5.1; review WP75-R10). This path
+    // writes no `decided_*` and no audit — there is no row to attribute.
+    use crate::server::shared::notifications::routing;
+    if let Some(local) = routing::local() {
+        let refused = match local.host.host_routing().await {
+            Ok(r) if r.routing_ok => None,
+            Ok(_) => Some(routing::Refusal::RoutingRefused.to_error()),
+            Err(e) => Some(e),
+        };
+        if let Some(e) = refused {
+            return (
+                e.code.status(),
+                Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
+            );
         }
-    };
-
-    let _ = app.emit("hooks://decision", &decision);
-
+    }
+    let was_gated = resolve_held(&app, &decision.request_id, approved);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -397,6 +449,51 @@ pub async fn post_hook_decision(
             "gated": was_gated,
         })),
     )
+}
+
+/// The open `permission` row of a still-held gate, waiting up to ~0.5 s for
+/// the spawned record to land.
+async fn held_row_id(app: &AppHandle, request_id: &str) -> Option<i64> {
+    let held = get_held_requests()
+        .lock()
+        .map(|m| m.contains_key(request_id))
+        .unwrap_or(false);
+    if !held {
+        return None;
+    }
+    let pool = app_db(app)?.ensure_pool().await.ok()?;
+    let key = crate::notifications::producers::hook_gate_key(request_id);
+    for _ in 0..5 {
+        if let Some(id) =
+            crate::server::shared::notifications::routing::find_open_by_key(&pool, &key).await
+        {
+            return Some(id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// Answer a held `PreToolUse` gate (the decide core's hook resolver, §5.5,
+/// and the direct fallback above). `false` when nothing is held under
+/// `request_id` any more (answered, or timed out as deny). Emits
+/// `hooks://decision` so every inbox marks it either way.
+pub fn resolve_held(app: &AppHandle, request_id: &str, approved: bool) -> bool {
+    let decision = HookDecision {
+        request_id: request_id.to_string(),
+        decision: if approved { "approved" } else { "denied" }.into(),
+    };
+    let was_gated = match get_held_requests().lock() {
+        Ok(mut map) => match map.remove(request_id) {
+            // If the receiver is already gone (timeout), the send fails;
+            // the gate has denied on its own.
+            Some(held) => held.tx.send(decision.clone()).is_ok(),
+            None => false,
+        },
+        Err(_) => false,
+    };
+    let _ = app.emit("hooks://decision", &decision);
+    was_gated
 }
 
 /// Get route handler: GET /iyke/hooks/events

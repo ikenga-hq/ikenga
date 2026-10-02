@@ -420,6 +420,19 @@ for (const mode of ['dark', 'light'] as const) {
 							thisDevice: true,
 						},
 					],
+					// WP-75 (G-ACCESS §5.1): the "Permission requests" control.
+					access_status: {
+						tier: 't0',
+						store: 'ok',
+						principal: { principalId: 'p', username: 'ned', isAdmin: false },
+						credential: { via: 'operator', deviceId: 'host', tier: 'full' },
+						caps: ['files', 'sessions', 'dispatch', 'approve', 'install', 'settings', 'secrets'],
+						adminStrength: true,
+						publicUrl: null,
+						sharingEnabled: false,
+						share: null,
+					},
+					access_routing_get: { mode: 'any_approve', deviceId: null, deviceName: null },
 				},
 			});
 			const address = page.getByRole('textbox', { name: 'Address' });
@@ -431,6 +444,18 @@ for (const mode of ['dark', 'light'] as const) {
 			// WP-72 shared-bearer "Not a security boundary" note is gone.
 			await expect(devices.getByRole('note', { name: 'Not a security boundary' })).toHaveCount(0);
 			await expect(devices.getByText('Permission requests')).toBeVisible();
+			const routing = devices.locator('[data-routing="any_approve"]');
+			await expect(routing).toBeVisible();
+			await expect(routing.getByRole('tab', { name: 'Any paired device' })).toHaveAttribute(
+				'aria-selected',
+				'true'
+			);
+			await expect(routing.getByRole('tab', { name: 'This device only' })).toBeEnabled();
+			// D-05 approveNote: the host is not a paired device, and with no
+			// paired approver there is nobody to name.
+			const note = routing.locator('[data-note="any"]');
+			await expect(note).toContainText('Any device with approve may answer.');
+			await expect(note).not.toContainText('Right now that is');
 			await expect(devices.getByText('Set by how the server was started.')).toBeVisible();
 			await expect(devices.getByText(/No paired devices\. Pair a phone/)).toBeVisible();
 			await page.screenshot({ path: shotPath(testInfo, `people-devices-${mode}.png`) });
