@@ -112,6 +112,13 @@ jobs:
     # 36705744371) after its artifacts had already uploaded.
     timeout-minutes: 120
 
+    env:
+      # macOS code signing is opt-in: the certificate-import step below runs
+      # only when this secret exists, so until then the leg produces the same
+      # unsigned universal .dmg / .app.tar.gz it does today. See
+      # docs/release-signing.md for the full secret inventory.
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+
     steps:
       # ── Checkout shell + sibling workspace repos ────────────────────────────
       - name: Checkout shell
@@ -272,6 +279,92 @@ jobs:
         working-directory: shell
         run: bun run build
 
+      # ── Optional code signing (opt-in via secrets) ───────────────────────
+      # Both blocks below are inert until the maintainer creates the secrets
+      # listed in docs/release-signing.md. With none configured, each leg
+      # builds unsigned exactly as it always has.
+
+      # macOS: import a base64-encoded .p12 "Developer ID Application"
+      # certificate into a temporary keychain so `codesign` can use it, then
+      # leave it as the default keychain for the rest of the job. Skipped
+      # entirely when APPLE_CERTIFICATE is empty.
+      - name: Import Apple signing certificate (if configured)
+        if: matrix.platform == 'macos-latest' && env.APPLE_CERTIFICATE != ''
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          SIGN_DIR="$RUNNER_TEMP/apple-signing"
+          mkdir -p "$SIGN_DIR"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$SIGN_DIR/certificate.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$SIGN_DIR/build.keychain"
+          security default-keychain -s "$SIGN_DIR/build.keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGN_DIR/build.keychain"
+          security set-keychain-settings -t 3600 -u "$SIGN_DIR/build.keychain"
+          # Put the temp keychain first on the user search list (keeping the
+          # existing entries) so codesign finds the identity regardless of
+          # what was default before.
+          security list-keychains -d user -s "$SIGN_DIR/build.keychain" $(security list-keychains -d user | sed 's/"//g')
+          security import "$SIGN_DIR/certificate.p12" -k "$SIGN_DIR/build.keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGN_DIR/build.keychain"
+          security find-identity -v -p codesigning "$SIGN_DIR/build.keychain"
+          rm -f "$SIGN_DIR/certificate.p12"
+          # App Store Connect API key for notarization (the preferred method;
+          # Tauri otherwise falls back to APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID).
+          # The secret stores the .p8 file CONTENTS; Tauri needs a file path,
+          # so we write it out and export APPLE_API_KEY_PATH for later steps.
+          if [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_KEY_P8" ]; then
+            KEY_FILE="$SIGN_DIR/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s\n' "$APPLE_API_KEY_P8" > "$KEY_FILE"
+            echo "APPLE_API_KEY_PATH=$KEY_FILE" >> "$GITHUB_ENV"
+            echo "Notarization will use App Store Connect API key $APPLE_API_KEY"
+          else
+            echo "No APPLE_API_KEY_P8 — notarization will use APPLE_ID credentials if set, else be skipped"
+          fi
+
+      # Windows: Azure Artifact Signing (née Trusted Signing). The signed
+      # `bundle.windows.signCommand` is injected via `tauri build --config`
+      # — never committed to tauri.conf.json, so contributor `tauri build`s
+      # keep working unsigned. artifact-signing-cli (Rust reimplementation
+      # of signtool+Azure auth, what the Tauri docs recommend) is only
+      # compiled when all six Azure values exist. The three credentials are
+      # secrets; the endpoint/account/profile are non-sensitive and live in
+      # repo *variables* (`vars.*`) — also fine as secrets if preferred.
+      - name: Configure Azure Artifact Signing (Windows, if configured)
+        id: windows_sign
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_CERT_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERT_PROFILE }}
+        run: |
+          set -euo pipefail
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+                   AZURE_ARTIFACT_SIGNING_ENDPOINT AZURE_ARTIFACT_SIGNING_ACCOUNT \
+                   AZURE_ARTIFACT_SIGNING_CERT_PROFILE; do
+            if [ -z "${!v:-}" ]; then
+              echo "Azure Artifact Signing not configured ($v is empty) — building unsigned."
+              exit 0
+            fi
+          done
+          cargo install artifact-signing-cli --locked
+          SIGN_CMD="artifact-signing-cli -e $AZURE_ARTIFACT_SIGNING_ENDPOINT -a $AZURE_ARTIFACT_SIGNING_ACCOUNT -c $AZURE_ARTIFACT_SIGNING_CERT_PROFILE -d Ikenga %1"
+          # Written inside shell/ (the tauri-action projectPath) so the
+          # --config path is a bare filename — no quoting/space issues when
+          # tauri-action tokenizes `args`.
+          jq -nc --arg cmd "$SIGN_CMD" '{bundle:{windows:{signCommand:$cmd}}}' \
+            > shell/ci-windows-sign-config.json
+          cat shell/ci-windows-sign-config.json
+          echo "config_args=--config ci-windows-sign-config.json" >> "$GITHUB_OUTPUT"
+
       # ── Tauri bundle ───────────────────────────────────────────────────────
       # ── Build + sign + (on tag push) publish a draft Release ──────────────
       # tauri-action runs `tauri build`, signs the installer with
@@ -284,12 +377,23 @@ jobs:
       # On workflow_dispatch we don't pass `tagName` — tauri-action still
       # builds + signs and exits with `artifactPaths`, which the next step
       # attaches as a workflow-run artifact for download via the UI.
+      #
+      # The APPLE_* / AZURE_* env vars are all empty until the secrets are
+      # created, and an empty APPLE_SIGNING_IDENTITY / AZURE config means
+      # "build unsigned" — identical output to today.
       - name: Build + sign + release (tauri-action)
         id: tauri_action
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: shell
           tagName: ${{ github.event_name == 'push' && github.ref_name || '' }}
@@ -297,7 +401,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} ${{ steps.windows_sign.outputs.config_args }}
 
       # Launch smoke gate — the only check in this pipeline that STARTS the app.
       #
@@ -536,3 +640,37 @@ jobs:
           gh release upload "$TAG" latest.json --repo "$REPO" --clobber
 
           echo "✓ Release notes + complete updater manifest applied to $TAG"
+
+  # ── SHA256 checksums ───────────────────────────────────────────────────────
+  # Final job. Runs strictly after `notes` so the sums cover EVERY published
+  # asset — installers, updater artifacts (.sig, latest.json), the lot —
+  # rather than racing whichever assets had landed when it ran.
+  #
+  # Idempotent on re-runs: the downloaded SHA256SUMS.txt is deleted before
+  # hashing (a checksum file can't list itself), and `gh release upload
+  # --clobber` replaces the previous copy. Re-running the job therefore just
+  # rewrites the same file over the same asset set.
+  checksums:
+    needs: notes
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Attach SHA256SUMS.txt covering every release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR=$(mktemp -d)
+          gh release download "$TAG" --repo "$REPO" --dir "$DIR" --clobber
+          cd "$DIR"
+          rm -f SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --repo "$REPO" --clobber
+          echo "✓ SHA256SUMS.txt attached to $TAG"
