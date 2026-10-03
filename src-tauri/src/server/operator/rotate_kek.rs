@@ -8,8 +8,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use anyhow::Context;
 use rand::RngCore;
@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 use zeroize::Zeroizing;
 
 use super::safe_fs::{chown_fd, Dir};
-use super::secrets_kek::{existing_stores, KekOwner, SecretsKek, HEADER, KEK_FILENAME};
+use super::secrets_kek::{existing_stores, KekOwner, SecretsKek, HEADER};
 use super::OperatorRoot;
 use crate::secrets::principal_store::{
     rewrap_envelope_bytes, unwrap_envelope_bytes, verify_envelope_and_values, WrapKey, KEY_LEN,
@@ -419,7 +419,7 @@ async fn record_rotation_audit(
             .bind(&row.user_agent)
             .bind(&row.detail)
             .bind(&row.prev_hash)
-            .bind(&hash)
+            .bind(hash.as_slice())
             .execute(&mut *conn)
             .await;
 
