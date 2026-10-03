@@ -355,7 +355,7 @@ jobs:
               exit 0
             fi
           done
-          cargo install artifact-signing-cli --locked
+          cargo install artifact-signing-cli
           SIGN_CMD="artifact-signing-cli -e $AZURE_ARTIFACT_SIGNING_ENDPOINT -a $AZURE_ARTIFACT_SIGNING_ACCOUNT -c $AZURE_ARTIFACT_SIGNING_CERT_PROFILE -d Ikenga %1"
           # Written inside shell/ (the tauri-action projectPath) so the
           # --config path is a bare filename — no quoting/space issues when
