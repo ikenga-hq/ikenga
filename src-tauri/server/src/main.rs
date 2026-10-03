@@ -39,6 +39,8 @@ pub enum Command {
     /// drop to the reserved probe uid — read-only (no reconcile, no
     /// probe.json). Exits 0 when the tier can run, 1 when it can't.
     Probe(ProbeArgs),
+    /// Manage server secrets and rotate the key-encryption key (root only).
+    Secrets(SecretsArgs),
     /// Internal: the §8 test-drop child (spawned by the probe as the probe uid).
     #[command(name = "__t1-probe-child", hide = true)]
     T1ProbeChild,
@@ -119,6 +121,26 @@ pub struct ProbeArgs {
     /// Print the full report as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SecretsArgs {
+    /// The multi-user server data root (the server's `--data-dir`). Needs root.
+    #[arg(long, env = "IKENGA_DATA_DIR", global = true)]
+    pub data_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: SecretsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretsCommand {
+    /// Rotate the master key-encryption key (KEK) protecting user secrets.
+    ///
+    /// Generates a new server KEK and re-wraps every user's secret store
+    /// envelope under it. Requires root. Refuses to run if the server or any
+    /// session is running.
+    RotateKek,
 }
 
 #[derive(Args, Debug)]
@@ -430,6 +452,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Probe(probe)) => std::process::exit(run_probe(probe).await),
         Some(Command::Audit(audit)) => std::process::exit(run_audit(audit).await),
+        Some(Command::Secrets(secrets)) => return run_secrets(secrets).await,
         Some(Command::T1ProbeChild | Command::T1KillAll) => unreachable!("handled above"),
         None => {}
     }
@@ -751,14 +774,68 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
     cli::run(opts, cmd).await
 }
 
+#[cfg(target_os = "linux")]
+async fn run_secrets(args: SecretsArgs) -> anyhow::Result<()> {
+    use ikenga_desktop_lib::server::operator::rotate_kek::{execute_or_resume, CrashSimulation};
+    use ikenga_desktop_lib::server::operator::secrets_kek::KekOwner;
+    use ikenga_desktop_lib::server::operator::OperatorRoot;
+
+    let data_dir = args.data_dir.ok_or_else(|| {
+        anyhow::anyhow!("`secrets` needs --data-dir (or IKENGA_DATA_DIR): the server data root")
+    })?;
+    let root = OperatorRoot::new(data_dir)?;
+    match args.command {
+        SecretsCommand::RotateKek => {
+            let summary = execute_or_resume(&root, KekOwner::Root, "cli", CrashSimulation::None).await?;
+            if summary.was_resumed {
+                println!(
+                    "Resumed and completed secrets KEK rotation: {} stores re-wrapped.",
+                    summary.stores_rotated
+                );
+            } else {
+                println!(
+                    "Rotated secrets KEK: {} stores re-wrapped.",
+                    summary.stores_rotated
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 async fn run_accounts(_args: AccountsArgs) -> anyhow::Result<()> {
     anyhow::bail!("local accounts are part of executor tier t1, which is Linux-only")
 }
 
+#[cfg(not(target_os = "linux"))]
+async fn run_secrets(_args: SecretsArgs) -> anyhow::Result<()> {
+    anyhow::bail!("secrets rotation is part of multi-user server, which is Linux-only")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_rotate_kek_parses() {
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "secrets",
+            "--data-dir",
+            "/srv/ikenga/data",
+            "rotate-kek",
+        ])
+        .unwrap();
+        let Some(Command::Secrets(s)) = args.command else {
+            panic!("not secrets");
+        };
+        assert_eq!(
+            s.data_dir.as_deref(),
+            Some(std::path::Path::new("/srv/ikenga/data"))
+        );
+        assert!(matches!(s.command, SecretsCommand::RotateKek));
+    }
 
     #[test]
     fn audit_subcommands_parse() {
