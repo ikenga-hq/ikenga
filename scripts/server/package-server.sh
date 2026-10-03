@@ -110,10 +110,24 @@ cmd_build() {
   command -v cargo-zigbuild >/dev/null 2>&1 \
     || die "cargo-zigbuild is not installed (cargo install cargo-zigbuild, plus zig)"
 
+  # The desktop library this daemon builds on is compiled as a cdylib too, so
+  # cargo links the GTK/WebKit -sys crates even though the daemon itself
+  # drops them (the link gate below proves it). zig does not search the
+  # distro's library directory when the target carries a glibc version, so
+  # point it there; and tolerate that those system libraries were built against
+  # a newer glibc than the floor, which only matters for libraries the final
+  # binary never loads.
+  local libdir
+  case "$arch" in
+    amd64) libdir=/usr/lib/x86_64-linux-gnu ;;
+    arm64) libdir=/usr/lib/aarch64-linux-gnu ;;
+  esac
+  local link_flags="-C link-arg=-L$libdir -C link-arg=-Wl,--allow-shlib-undefined"
+
   echo "==> Building ikenga-server for $triple, glibc floor $GLIBC_FLOOR"
   # The `.<floor>` suffix is cargo-zigbuild's glibc pin; cargo still writes to
   # target/<triple>/release.
-  (cd "$SHELL_DIR/src-tauri" && cargo zigbuild --release -p ikenga-server --target "$triple.$GLIBC_FLOOR")
+  (cd "$SHELL_DIR/src-tauri"     && RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$link_flags"        cargo zigbuild --release -p ikenga-server --target "$triple.$GLIBC_FLOOR")
 
   local bin="$SHELL_DIR/src-tauri/target/$triple/release/ikenga-server"
   [[ -f "$bin" ]] || die "build produced no $bin"
