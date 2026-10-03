@@ -39,11 +39,13 @@ configuration under the *Variables* tab.
 | `APPLE_API_KEY` + `APPLE_API_ISSUER` + `APPLE_API_KEY_P8` | *Preferred notarization auth.* From App Store Connect → Users and Access → Integrations: `APPLE_API_KEY` is the Key ID, `APPLE_API_ISSUER` the Issuer ID, `APPLE_API_KEY_P8` the **contents** of the `AuthKey_<id>.p8` file (downloadable once). The workflow writes it to disk and points `APPLE_API_KEY_PATH` at it. |
 | `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID` | *Alternative notarization auth* — used if the API key isn't set. `APPLE_PASSWORD` is an app-specific password (appleid.apple.com), not the account password. `APPLE_TEAM_ID` is on the Apple Developer membership page. |
 
-Signing turns on when `APPLE_CERTIFICATE` is non-empty: the release workflow
-imports it into a throwaway keychain and `tauri build` picks up
-`APPLE_SIGNING_IDENTITY`. Notarization follows automatically once either
-credential set exists — the bundler notarizes the `.dmg` and staples the
-ticket.
+Signing turns on when `APPLE_CERTIFICATE` is non-empty: `tauri build`
+imports it into a throwaway keychain itself (decrypting with
+`APPLE_CERTIFICATE_PASSWORD`) and signs with `APPLE_SIGNING_IDENTITY`.
+Notarization follows automatically once either credential set exists — the
+bundler notarizes the `.dmg` and staples the ticket. The release workflow
+forwards each `APPLE_*` variable to the build only when the corresponding
+secret is non-empty, because Tauri treats an *empty* variable as "set".
 
 ### Windows — create these to turn signing on
 
