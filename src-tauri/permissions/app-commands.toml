@@ -235,6 +235,7 @@ commands.allow = [
   "pkg_health_remove",
   "pkg_health_remove_all",
   "pkg_health_scan",
+  "pkg_install_cancel",
   "pkg_install_from_path",
   "pkg_install_from_registry",
   "pkg_invoke",
