@@ -274,7 +274,7 @@ pub(crate) trait InstallSteps {
 /// point of registering. On any failure `cleanup` runs before the error is
 /// returned, so a failed install leaves no partial pkg directory behind.
 pub(crate) async fn run_install<S: InstallSteps>(rep: &InstallReporter, steps: &mut S) -> Result<S::Output> {
-    let result = async {
+    let result: Result<S::Output> = async {
         rep.stage(InstallStage::Resolving);
         steps.prepare().await?;
         rep.check_cancelled()?;
