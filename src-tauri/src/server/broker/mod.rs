@@ -298,6 +298,12 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // so the serving broker pins it (or its absence) for them (WP76-R6).
     Provisioner::pin_max_accounts(&pool, max_accounts).await?;
 
+    // Resume any interrupted secrets KEK rotation before serving.
+    if let Err(e) = crate::server::operator::rotate_kek::resume_if_interrupted(&root, &pool).await {
+        tracing::error!("secrets KEK rotation auto-resume failed at boot: {e}");
+        return Err(e);
+    }
+
     // §7.4: honoured after the probe, only on an empty accounts table.
     if let Some(bootstrap) = bootstrap {
         let prov = Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker)

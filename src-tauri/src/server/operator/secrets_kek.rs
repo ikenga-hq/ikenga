@@ -47,7 +47,7 @@ use crate::secrets::principal_store::{WrapKey, KEY_LEN};
 
 /// Under `operator/`.
 pub const KEK_FILENAME: &str = "secrets-kek";
-const HEADER: &str = "ikenga-secrets-kek:v1:";
+pub const HEADER: &str = "ikenga-secrets-kek:v1:";
 
 /// The `operator_meta` key recording that a KEK was created (value: the
 /// creation time, unix seconds). Never deleted by Ikenga: an operator who
@@ -308,7 +308,7 @@ impl SecretsKek {
         }
     }
 
-    fn load(path: &Path, owner: KekOwner) -> io::Result<Self> {
+    pub fn load(path: &Path, owner: KekOwner) -> io::Result<Self> {
         let invalid = |why: String| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -356,6 +356,16 @@ impl SecretsKek {
     pub fn wrap_key_for(&self, principal: PrincipalId) -> WrapKey {
         WrapKey::derive(&self.key, &principal.to_string())
             .expect("a PrincipalId's text form is a valid store principal")
+    }
+
+    /// Wrap key for an arbitrary principal string id.
+    pub fn wrap_key_for_str(&self, principal: &str) -> Result<WrapKey, String> {
+        WrapKey::derive(&self.key, principal)
+    }
+
+    /// Key bytes for rewrapping.
+    pub fn raw_key(&self) -> &[u8; KEY_LEN] {
+        &self.key
     }
 
     /// The hex form a test can search a child's environment for.
