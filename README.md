@@ -285,62 +285,50 @@ Tauri produces an ad-hoc-signed `.app`; the script copies it to
 doesn't block first launch. For a universal binary, set
 `TAURI_TARGET=universal-apple-darwin` and build that target instead.
 
-### Server Deployment & Task 0 Credential Bootstrap
+### Server Deployment
 
-`ikenga-server` is a headless control plane binary that can run on a remote server or VM (behind a Tailscale perimeter).
+`ikenga-server` is the headless daemon: the same workspace, served to a browser from a Linux machine you control. It runs in two modes. **Multi-user** gives each person a local account and their own Unix user, and is the right choice for a team. **Single-user** is one person behind a bearer token.
 
-#### Build & Stage Artifacts
-Run `shell/scripts/server/deploy.sh` from a clean checkout of `shell`:
+#### Install from a release
+
+Each [GitHub release](https://github.com/ikenga-hq/ikenga/releases) carries signed server tarballs for x86_64 and arm64, covered by `SHA256SUMS.txt`. The full steps are in [`scripts/server/README.md`](scripts/server/README.md); in short:
+
+```bash
+V=X.Y.Z; A=amd64      # or arm64
+BASE=https://github.com/ikenga-hq/ikenga/releases/download/v$V
+curl -fsSLO $BASE/ikenga-server_${V}_linux_$A.tar.gz && curl -fsSLO $BASE/SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt
+sudo install -d /opt/ikenga && sudo tar -xzf ikenga-server_${V}_linux_$A.tar.gz -C /opt/ikenga
+sudo install -m 0644 /opt/ikenga/ikenga-server-t1.service /etc/systemd/system/
+sudo /opt/ikenga/bin/ikenga-server probe --executor-tier t1 --data-dir /opt/ikenga/data   # exits 0 when multi-user mode can run
+sudo /opt/ikenga/bin/ikenga-server accounts --data-dir /opt/ikenga/data create ada --admin
+sudo systemctl daemon-reload && sudo systemctl enable --now ikenga-server-t1
+```
+
+That is the multi-user path; the guide also covers the environment file (secrets, bind address, HTTPS), the single-user unit, what to back up (including the key file that protects members' stored secrets), and migrating a single-user install with `ikenga-server accounts adopt-t0`.
+
+A server install does not ship with mini-apps yet.
+
+#### Build from source
+
+`scripts/server/deploy.sh` builds the binary and the frontend and stages them into `scripts/server/out/`. It is the developer path: it needs the sibling `contract` and `tokens` repositories in the workspace layout described in its header, not a checkout of this repository alone.
+
 ```bash
 ./scripts/server/deploy.sh
-# Stages compiled binary & frontend assets into scripts/server/out/
 
 # Deploying from a non-Linux machine? Name the server's target, or you will
 # stage a binary the host cannot execute:
 TARGET=x86_64-unknown-linux-gnu ./scripts/server/deploy.sh
 ```
 
-#### Task 0 Credential Bootstrap
-On the target host, run `bootstrap-credentials.sh` prior to starting `ikenga-server`:
-```bash
-./scripts/server/bootstrap-credentials.sh
-```
-This idempotently generates server secrets into `/opt/ikenga/.env` (mode 600). It only
-ever *appends* — an existing value is left alone, so re-running it can never destroy a
-credential nobody has another copy of.
-
-- `IKENGA_AUTH_TOKEN`: Pinned bearer token for API + WebSocket authentication. Read by
-  `ikenga-server` directly (clap `env = "IKENGA_AUTH_TOKEN"`).
-- `IKENGA_VAULT_KEY`: **Reserved — nothing reads it yet.** The headless vault is WP-12b
-  (ikenga#100); `secrets_set` currently answers "not implemented in the headless daemon".
-  It is generated now so the vault lands on a key that has been stable since first boot.
-- `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (the latter is used by the Antigravity engine): appended to the same env file if exported.
-  systemd loads it via `EnvironmentFile` and the engine adapters inherit their
-  environment, so the agent CLIs pick them up without any config file being written.
-
-> ⚠️ **Security Posture Note (G-30)**: keeping long-lived credentials in
-> `/opt/ikenga/.env` lets `ikenga-server` run headless without manual passphrase entry.
-> That is the trade: **box compromise equals credential compromise**. It applies today to
-> `IKENGA_AUTH_TOKEN` and the agent API keys; `IKENGA_VAULT_KEY` joins them once WP-12b
-> gives it a consumer.
-
 #### Verifying a running daemon
 
-`scripts/server/verify-live.ts` drives the daemon's real HTTP and WebSocket
-surface — real PTYs, real reconnects, and a real `agy` turn. Nothing in it is
-stubbed, which is the point: the two worst defects found in this subsystem (a
-`tokio::join!` that never returned, and a deleted stylesheet import) both
-compiled clean and passed every offline gate.
+`scripts/server/verify-live.ts` drives a daemon's real HTTP and WebSocket surface (real terminals, real reconnects, and a real `agy` turn) from a source checkout. Nothing in it is stubbed, which is the point: the two worst defects found in this subsystem (a `tokio::join!` that never returned, and a deleted stylesheet import) both compiled clean and passed every offline gate.
 
 ```bash
 IKENGA_VERIFY_URL=http://127.0.0.1:4477 IKENGA_AUTH_TOKEN=<token> \
   bun run scripts/server/verify-live.ts
 ```
-
-#### Running under systemd or Docker
-- **systemd**: Copy `scripts/server/ikenga-server.service` to `/etc/systemd/system/ikenga-server.service` and run `systemctl daemon-reload && systemctl enable --now ikenga-server`.
-- **systemd, multi-user (T1)**: `scripts/server/ikenga-server-t1.service` instead. [`scripts/server/README.md`](scripts/server/README.md) covers the unit, local accounts, and migrating a T0 install with `ikenga-server accounts adopt-t0`.
-- **Docker**: Run `docker compose -f scripts/server/docker-compose.yml up -d` after running `deploy.sh`.
 
 ### What we don't do yet
 
