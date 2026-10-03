@@ -36,7 +36,7 @@
 		"@ikenga/registry-client": "^0.1.0",
 		"@ikenga/tokens": "workspace:*",
 		"@ikenga/ui-lib": "^0.2.0",
-		"@lobehub/icons": "^5.8.0",
+		"@lobehub/icons": "5.22.0",
 		"@lobehub/ui": "5.32.5",
 		"@modelcontextprotocol/ext-apps": "^1.7.1",
 		"@noble/curves": "^2.4.0",
