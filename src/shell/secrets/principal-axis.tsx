@@ -37,7 +37,7 @@ export function vaultAxis(opts: {
 }
 
 export const OPERATOR_SCOPE_REASON =
-	"The server's operator default is one flat namespace. Project and pkg secrets need your own store — an Ikenga server with accounts.";
+	"The server's operator default is one flat namespace. Project and pkg secrets need your own store on a multi-user server.";
 export const SHARED_REASON =
 	"Secrets stay with the project's Owner. A shared project shares files, sessions and dispatch — never credentials.";
 
@@ -135,7 +135,7 @@ export function PrincipalAxis({
 				sub:
 					axis === 'principal'
 						? 'Yours alone, on this server. Sealed under a key the server holds for you — there is no passphrase to unlock. Overrides the operator default key by key.'
-						: 'Needs an Ikenga server with accounts (T1).',
+						: 'Needs a multi-user server.',
 				active: axis === 'principal',
 			},
 			{
