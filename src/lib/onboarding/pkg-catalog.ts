@@ -9,6 +9,11 @@
 // configured any registry, and "browse the registry" is a post-onboarding
 // flow that lives on `/install`. New pkgs added to the registry will appear
 // on `/install` without needing to ship a shell update.
+//
+// Only offer what exists in the public registry and works on a fresh install.
+// Apps the registry holds back (`visibility: "hidden"`) are not listed here
+// and are never pre-selected. Of the apps that are listed, only Tasks is
+// pre-selected; Sales is listed but off by default.
 
 import type { ManifestLike } from './connectors';
 
@@ -65,100 +70,31 @@ export const ONBOARDING_PKG_CATALOG: readonly OnboardingPkgEntry[] = Object.free
 		manifest: {
 			id: 'com.ikenga.tasks',
 			name: 'Tasks',
-			version: '0.3.1',
-			capabilities: { supabase: { required: true } },
+			version: '0.8.4',
 			permissions: { 'vault.keys': [] },
 		},
 		display: 'Tasks',
-		summary: 'A kanban + agent inbox. Live-updates as your engine works.',
-		version: '0.3.1',
+		summary: 'Task list, agenda and triage for you and your agents, kept on this computer.',
+		version: '0.8.4',
 		icon: 'tasks',
-		bucket: 'needs-cloud',
-		defaultSelected: true,
-		sizeMb: 3.8,
-	},
-	{
-		manifest: {
-			id: 'com.ikenga.mail',
-			name: 'Mail',
-			version: '0.2.4',
-			permissions: { 'vault.keys': ['RESEND_API_KEY'] },
-		},
-		display: 'Mail',
-		summary: 'IMAP/JMAP triage with agent labels. Drafts go through your account.',
-		version: '0.2.4',
-		icon: 'mail',
-		bucket: 'needs-cloud',
-		defaultSelected: true,
-		sizeMb: 6.1,
-	},
-	{
-		manifest: {
-			id: 'com.ikenga.outbound',
-			name: 'Outbound',
-			version: '0.1.6',
-			permissions: { 'vault.keys': ['RESEND_API_KEY', 'LISTMONK_URL', 'LISTMONK_AUTH'] },
-		},
-		display: 'Outbound',
-		summary: 'DSP pitch sequences and reach-out drips for label outreach.',
-		version: '0.1.6',
-		icon: 'outbound',
-		bucket: 'needs-cloud',
-		defaultSelected: false,
-		sizeMb: 4.2,
-	},
-	{
-		manifest: {
-			id: 'com.ikenga.content',
-			name: 'Content',
-			version: '0.2.0',
-			permissions: { 'vault.keys': [] },
-		},
-		display: 'Content',
-		summary: 'Blog, changelog, help-doc pipelines that publish to Royalti CMS.',
-		version: '0.2.0',
-		icon: 'content',
 		bucket: 'local-only',
 		defaultSelected: true,
-		sizeMb: 5.2,
+		sizeMb: 0.4,
 	},
 	{
 		manifest: {
 			id: 'com.ikenga.sales',
 			name: 'Sales',
-			version: '0.1.2',
-			capabilities: { supabase: { required: true } },
-			permissions: {
-				'vault.keys': [
-					'TWENTY_API_URL',
-					'TWENTY_API_KEY',
-					'STRIPE_SECRET_KEY',
-					'STRIPE_WEBHOOK_SECRET',
-				],
-			},
-		},
-		display: 'Sales',
-		summary: 'Pipeline tracker against Stripe + Twenty CRM with manual deal entry.',
-		version: '0.1.2',
-		icon: 'sales',
-		bucket: 'needs-cloud',
-		defaultSelected: false,
-		sizeMb: 4.6,
-	},
-	{
-		manifest: {
-			id: 'com.ikenga.files',
-			name: 'Files',
-			version: '0.4.2',
+			version: '0.4.1',
 			permissions: { 'vault.keys': [] },
 		},
-		display: 'Files',
-		summary: 'File browser with agent-aware previews and quick actions.',
-		version: '0.4.2',
-		icon: 'files',
+		display: 'Sales',
+		summary: 'Deal pipeline, forecast and won deals, kept on this computer.',
+		version: '0.4.1',
+		icon: 'sales',
 		bucket: 'local-only',
-		defaultSelected: true,
-		sizeMb: 2.4,
+		defaultSelected: false,
+		sizeMb: 0.3,
 	},
 	{
 		manifest: {
