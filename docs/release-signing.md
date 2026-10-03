@@ -80,6 +80,83 @@ sha256sum --check --ignore-missing SHA256SUMS.txt
 
 from a directory containing the sums file plus the assets you fetched.
 
+## Server artifacts
+
+Every `v*` tag also publishes the headless multi-user server, built from the
+same commit and carrying the same version as the desktop installers. The
+release workflow (`release.yml`, jobs `server-build` and `server`) attaches:
+
+| Asset | What it is |
+|---|---|
+| `ikenga-server_X.Y.Z_linux_amd64.tar.gz` | Binary, web app, systemd units, README, LICENSE for x86-64 |
+| `ikenga-server_X.Y.Z_linux_arm64.tar.gz` | The same for aarch64 |
+| `ikenga-server_X.Y.Z_manifest.json` | Schema `ikenga-server-release/1`: version, tag, commit, channel, glibc floor, and each tarball's SHA-256 and size |
+| `<each of the three>.sigstore.json` | Keyless cosign bundle |
+
+All of them are also covered by `SHA256SUMS.txt`, and each tarball and the
+manifest carries a GitHub build-provenance attestation. If either server build
+fails, the release stays a draft.
+
+A tarball extracts straight into the install root (`/opt/ikenga`): `bin/`,
+`dist/`, the two systemd unit files, `README.md`, `LICENSE`, `NOTICE` and a small
+`release.json` naming the version, commit and architecture it was built from.
+
+### glibc floor: 2.31
+
+The binaries are dynamic glibc builds, not musl: the server looks up and
+creates per-member Unix users, which needs NSS, and a static musl binary
+cannot load NSS modules. `cargo-zigbuild` links against glibc **2.31**, so the
+binary runs on Debian 11 and newer, Ubuntu 20.04 and newer, and RHEL, Rocky and
+Alma 9 (glibc 2.34). The value lives in one place, `GLIBC_FLOOR` in
+`scripts/server/package-server.sh`; the manifest records it as `glibc_floor`
+and the release notes read it from there. To move the floor, change that one
+default.
+
+The build fails if the binary references a glibc symbol version above the
+floor. To check an extracted binary yourself:
+
+```bash
+objdump -T bin/ikenga-server | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -V | tail -1
+```
+
+### Binary size
+
+SERVER_SIZE_PLACEHOLDER
+
+### Verifying a server download
+
+Download the tarball, its `.sigstore.json` bundle and `SHA256SUMS.txt`, then:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS.txt
+
+# The signature was made by the release workflow of a v* tag, nobody else.
+cosign verify-blob \
+  --bundle ikenga-server_X.Y.Z_linux_amd64.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/ikenga-hq/ikenga/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ikenga-server_X.Y.Z_linux_amd64.tar.gz     # expect: Verified OK
+
+gh attestation verify ikenga-server_X.Y.Z_linux_amd64.tar.gz -R ikenga-hq/ikenga
+```
+
+Signing is keyless: the signature is bound to the workflow run's identity, so
+there is no key to store, rotate or leak and no secret to configure. It is
+unrelated to the updater key below and to the registry's signing key.
+
+### Testing without a tag
+
+A manual run of the Release workflow (`workflow_dispatch`, platforms `all` or
+`linux-only`) builds, signs and attests everything the same way and uploads the
+files as a workflow artifact named `ikenga-server` instead of attaching them to
+a release. The cosign certificate then names the branch the run used, not a
+tag, so verify it with `--certificate-identity` set to that exact ref.
+
+The CI workflow also builds both architectures and packs them, minus signing,
+whenever `scripts/server/`, the build action or the workflow files change, and
+on the full tier (release PRs and the nightly run), so a broken cross-build
+shows up before a tag is cut.
+
 ## The updater key: how it's held and how to rotate
 
 `TAURI_SIGNING_PRIVATE_KEY` is a repository Actions secret on
