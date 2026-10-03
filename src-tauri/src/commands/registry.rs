@@ -322,6 +322,7 @@ pub(crate) fn handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         // ── pkg kernel ──────────────────────────────────────────────────────
         pkg::pkg_install_from_path,
         pkg::pkg_install_from_registry,
+        pkg::pkg_install_cancel,
         pkg::pkg_uninstall,
         pkg::pkg_set_enabled,
         pkg::pkg_set_scope,

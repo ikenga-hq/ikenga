@@ -13,15 +13,16 @@
 // installed" from "snapshot not fetched yet" — the activity bar needs that to
 // avoid reconciling a persisted pkg mode before the kernel snapshot arrives.
 //
-// `pin_on_install` (§3): honoured ONCE at first install — the kernel emits
-// `pkg-installed` only for a fresh `pkg_installed` row (reinstalls emit
-// `pkg-reloaded`, boot replay emits nothing), so the event itself is the
-// freshness signal. We dedupe against existing pins on `manifestId` + target
-// so an update or a second hook mount can never double-pin.
+// `pin_on_install` (§3) is applied by the kernel itself, in the same call that
+// writes a fresh `pkg_installed` row (`pkg/pin_on_install.rs`), before it emits
+// `pkg-installed`. It used to run here and never pinned a reverse-DNS pkg id:
+// the pin store rejects a dotted `manifestId`, and the rejection was swallowed.
+// Doing it in the kernel also means it no longer depends on this hook being
+// mounted when the event fires. This hook only refreshes on the event.
 
 import { listen } from '@/lib/transport';
 import { useEffect, useState } from 'react';
-import { activityPinsAdd, activityPinsList, pkgKernelStatus } from '@/lib/tauri-cmd';
+import { pkgKernelStatus } from '@/lib/tauri-cmd';
 
 /** Shape mirrors the Rust `ActivityBarBadge` in
  *  `pkg/registries/activity_bar.rs` (WP-11). */
@@ -108,57 +109,6 @@ interface SidecarStatus {
 	pkg_id: string;
 	state: string;
 	last_err?: string | null;
-}
-
-/** Kernel `pkg-installed` event payload (emitted by `Kernel::install_from_path`
- *  on fresh installs only — never on reinstall or boot replay). */
-interface PkgInstalledEvent {
-	pkg_id: string;
-	version: string;
-	installed_at: number;
-}
-
-/** Pkg ids with a `pin_on_install` application currently in flight. The hook
- *  is mounted in several places (activity bar, Views section, section
- *  registry), so the same `pkg-installed` event arrives at N listeners —
- *  first claim wins, the rest no-op. Reuses are harmless: the
- *  manifestId+target dedupe inside `applyPinOnInstall` is the durable guard. */
-const pinOnInstallInflight = new Set<string>();
-
-/** Apply `pin_on_install` for a freshly-installed pkg: for every view that
- *  declares it, add a `route` pin unless a pin with the same `manifestId`
- *  (`pkg_id`) + `target` already exists (G-MANIFEST-V5 §3). Best-effort —
- *  never throws. */
-async function applyPinOnInstall(pkgId: string): Promise<void> {
-	if (pinOnInstallInflight.has(pkgId)) return;
-	pinOnInstallInflight.add(pkgId);
-	try {
-		const [status, pins] = await Promise.all([pkgKernelStatus(), activityPinsList()]);
-		const reg = (status.registries.views ?? {}) as { entries?: PkgViewEntry[] };
-		const targets = (reg.entries ?? []).filter((v) => v.pkg_id === pkgId && v.pin_on_install);
-		for (const view of targets) {
-			const alreadyPinned = pins.some(
-				(p) =>
-					(p.manifestId === pkgId && p.target === view.pane_route) ||
-					// Belt-and-braces: a user-created route pin at the same target
-					// counts as covered even if its manifestId differs.
-					(p.kind === 'route' && p.target === view.pane_route)
-			);
-			if (alreadyPinned) continue;
-			await activityPinsAdd({
-				kind: 'route',
-				target: view.pane_route,
-				label: view.title,
-				iconLucide: view.icon ?? null,
-				sectionId: null,
-				manifestId: pkgId,
-			});
-		}
-	} catch (err) {
-		console.warn(`[pkg-views] pin_on_install for ${pkgId} failed:`, err);
-	} finally {
-		pinOnInstallInflight.delete(pkgId);
-	}
 }
 
 /** Build the `entries` rail claims: `views[0]` per pkg from the views
@@ -283,14 +233,9 @@ export function usePkgActivityBarEntries(): PkgActivityBarState {
 		// Kernel lifecycle events. The names match those emitted by the pkg
 		// kernel in `kernel.rs` and `commands/pkg_dev.rs`.
 		const unsubs: Array<Promise<() => void>> = [
-			listen<PkgInstalledEvent>('pkg-installed', (ev) => {
-				// G-MANIFEST-V5 §3: `pin_on_install` applies only on a fresh
-				// install — the kernel emits this event only for a new
-				// `pkg_installed` row, so the event itself is the freshness
-				// check. Pin first, then refresh so the new pin and the new
-				// registry state land together.
-				void applyPinOnInstall(ev.payload.pkg_id).then(() => refresh());
-			}),
+			// A fresh install: the kernel has already written any
+			// `pin_on_install` pins (the pins store refreshes on this event too).
+			listen('pkg-installed', () => void refresh()),
 			listen('pkg-uninstalled', () => void refresh()),
 			listen('pkg-reloaded', () => void refresh()),
 			// WP-11: a pkg pushed/cleared its rail badge via

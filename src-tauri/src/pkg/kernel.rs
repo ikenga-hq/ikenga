@@ -960,13 +960,17 @@ impl Kernel {
                 log::warn!("[pkg_kernel] emit pkg-reloaded for `{pkg_id}` failed: {e}");
             }
         } else {
-            // Fresh install (no prior `pkg_installed` row): emit
-            // `pkg-installed` so the FE can refresh registry consumers and —
-            // manifest v5 (G-MANIFEST-V5 §3) — apply `pin_on_install` for
-            // views that declare it. The event's existence IS the freshness
-            // signal: reinstalls take the `pkg-reloaded` branch above and
-            // never re-pin. Boot replay doesn't reach `install_from_path` at
-            // all, so a reboot can't resurrect a user's unpin.
+            // Fresh install (no prior `pkg_installed` row): apply
+            // `pin_on_install` here, then emit `pkg-installed` so the FE
+            // refreshes registry consumers and the rail (which now already
+            // holds the pins). Pinning on the kernel side means it happens
+            // for every install path and whether or not any window has the
+            // rail mounted. Reinstalls take the `pkg-reloaded` branch above
+            // and never re-pin. Boot replay doesn't reach `install_from_path`
+            // at all, so a reboot can't resurrect a user's unpin.
+            tauri::async_runtime::block_on(crate::pkg::pin_on_install::apply_pin_on_install(
+                &self.db, &pkg,
+            ));
             if let Err(e) = self.app.emit(
                 "pkg-installed",
                 serde_json::json!({
