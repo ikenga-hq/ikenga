@@ -394,7 +394,7 @@ function viewLabelShort(
 		case 'artifact':
 			return `Artifact ${view.path}`;
 		case 'artifact-studio':
-			return 'Artifact studio';
+			return 'Artifact grid';
 		case 'scratchpad':
 			return `Scratchpad ${view.name}`;
 	}

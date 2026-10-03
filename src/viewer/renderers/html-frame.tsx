@@ -380,8 +380,8 @@ function OpenInStudioButton({ paneId, path }: OpenInStudioButtonProps) {
 		<button
 			type="button"
 			onClick={() => replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' })}
-			title="Open in Artifact Studio"
-			aria-label="Open in Artifact Studio"
+			title="Open in Artifact grid"
+			aria-label="Open in Artifact grid"
 			className={cn(
 				'ml-auto flex h-5 items-center gap-1 rounded px-2 text-[10.5px] font-semibold',
 				'bg-primary text-primary-foreground shadow-sm transition-colors hover:bg-primary/90'

@@ -292,7 +292,7 @@ export function NgwaDetailPane({ item, actions }: NgwaDetailPaneProps) {
 							<span className="val">
 								{item.required_by.length > 0
 									? item.required_by.map((r) => r.name).join(', ')
-									: 'None — no package lists this in requires[]'}
+									: 'None — no app or extension lists this in requires[]'}
 							</span>
 						</div>
 						{item.requires.length > 0 && (

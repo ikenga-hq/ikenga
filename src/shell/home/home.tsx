@@ -553,7 +553,7 @@ function TasksBody() {
 		return (
 			<WidgetError
 				title="Tasks unavailable"
-				detail="Query to tasks failed — pkg may be uninstalled or DB locked."
+				detail="Query to tasks failed — the Tasks app may be uninstalled or its database locked."
 				onRetry={() => void refetch()}
 			/>
 		);
@@ -626,7 +626,7 @@ function InboxBody() {
 	if (isError) {
 		return (
 			<WidgetError
-				title="Mail pkg unreachable"
+				title="Mail app unreachable"
 				detail="Read of email_messages timed out. Last sync unknown."
 				onRetry={() => void refetch()}
 			/>
@@ -675,8 +675,8 @@ function BoardsBody() {
 	if (isError) {
 		return (
 			<WidgetError
-				title="Pkg status unavailable"
-				detail="Could not read the pkg kernel to check for com.ikenga.studio."
+				title="App status unavailable"
+				detail="Could not read the installed apps to check for com.ikenga.studio."
 				onRetry={() => void refetch()}
 			/>
 		);
@@ -684,7 +684,7 @@ function BoardsBody() {
 	if (!installed) {
 		return (
 			<div style={{ ...CENTER_NOTE_STYLE, fontStyle: 'italic' }}>
-				Studio pkg not installed.
+				Studio app not installed.
 				<br />
 				This widget lights up once it's installed — board/frame query surface still TBD (design open
 				question).
@@ -716,7 +716,7 @@ function FinanceBody() {
 	if (isError) {
 		return (
 			<WidgetError
-				title="Finance pkg unreachable"
+				title="Finance app unreachable"
 				detail="finance_alerts / latest_account_balances read failed."
 				onRetry={() => void refetch()}
 			/>
@@ -825,16 +825,16 @@ function widgetMeta(kind: WidgetKind): {
 		case 'pad':
 			return { title: 'Scratchpad', icon: Icons.pad, tag: 'auto', Body: PadBody, cls: 'w-pad' };
 		case 'tasks':
-			return { title: "Today's tasks", icon: Icons.tasks, tag: 'pkg · tasks', Body: TasksBody };
+			return { title: "Today's tasks", icon: Icons.tasks, tag: 'app · tasks', Body: TasksBody };
 		case 'inbox':
-			return { title: 'Inbox triage', icon: Icons.mail, tag: 'pkg · email', Body: InboxBody };
+			return { title: 'Inbox triage', icon: Icons.mail, tag: 'app · email', Body: InboxBody };
 		case 'boards':
-			return { title: 'Active boards', icon: Icons.studio, tag: 'pkg · studio', Body: BoardsBody };
+			return { title: 'Active boards', icon: Icons.studio, tag: 'app · studio', Body: BoardsBody };
 		case 'finance':
 			return {
 				title: 'Week so far',
 				icon: Icons.finance,
-				tag: 'pkg · finance',
+				tag: 'app · finance',
 				Body: FinanceBody,
 				cls: 'w-finance',
 			};
@@ -1007,7 +1007,7 @@ export function Home({ hideGreeting = false }: { hideGreeting?: boolean } = {}) 
 					</div>
 				</div>
 				<div className="section">
-					<h4>Pkgs · {PALETTE_PKG.length} available</h4>
+					<h4>Apps · {PALETTE_PKG.length} available</h4>
 					<div className="list">
 						{PALETTE_PKG.map((p) => {
 							const placed = layout.some((l) => l.id === p.id);
@@ -1015,7 +1015,7 @@ export function Home({ hideGreeting = false }: { hideGreeting?: boolean } = {}) 
 								<div key={p.id} className={`item${placed ? ' is-placed' : ''}`}>
 									<div className="pic">{p.icon}</div>
 									<div className="title">{p.title}</div>
-									<span className="meta">pkg · {p.meta}</span>
+									<span className="meta">app · {p.meta}</span>
 								</div>
 							);
 						})}

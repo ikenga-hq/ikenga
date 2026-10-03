@@ -58,7 +58,7 @@ function EnginesPage() {
 					className="text-2xl font-semibold tracking-tight"
 					style={{ fontFamily: 'var(--font-display)' }}
 				>
-					Chi & engines
+					Engines
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
 					Which engine drives terminal sessions, which shells they run in, and whether terminals

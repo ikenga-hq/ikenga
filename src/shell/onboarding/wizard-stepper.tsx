@@ -46,7 +46,7 @@ import { useOnboardingStep } from './use-onboarding-step';
 // labels (`RAIL_COPY` in `rail.tsx`) carry the longer descriptive sub-line.
 const STEP_LABELS: Record<OnboardingStepId, string> = {
 	welcome: 'Welcome',
-	engine: 'Chi',
+	engine: 'Engine',
 	project: 'Project',
 	equipment: 'Ngwa',
 	look: 'Look',

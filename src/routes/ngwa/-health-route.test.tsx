@@ -427,11 +427,11 @@ describe('/ngwa/health — Sidecars, Cron, Data, Engines use real sources', () =
 		expect(claude).toContain('2.0.1');
 		expect(claude).toContain('CLI at /usr/bin/claude');
 		const codex = document.querySelector('[data-engine="codex"]')?.textContent ?? '';
-		expect(codex).toContain('engine pkg com.ikenga.engine-codex');
+		expect(codex).toContain('engine extension com.ikenga.engine-codex');
 		expect(codex).toContain('CLI not found by the probe');
 		expect(document.body.textContent).not.toContain('found on PATH');
 		const gemini = document.querySelector('[data-engine="gemini"]') as HTMLElement;
-		expect(gemini.textContent).toContain('No engine pkg installed');
+		expect(gemini.textContent).toContain('No engine extension installed');
 		expect(within(gemini).getByRole('button', { name: 'Open Store' })).toBeTruthy();
 	});
 

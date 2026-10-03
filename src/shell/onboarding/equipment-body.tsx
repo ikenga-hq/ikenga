@@ -458,7 +458,7 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						className="mb-2 text-xs font-semibold uppercase tracking-[0.04em]"
 						style={{ color: 'var(--primary)' }}
 					>
-						<LoreTerm term="Ngwa">Ngwa</LoreTerm> — your equipment
+						<LoreTerm term="Ngwa">Ngwa</LoreTerm> — your store
 					</p>
 					<h1 className="font-display text-3xl font-bold leading-tight tracking-tight">
 						Gather your <LoreTerm term="Ngwa">Ngwa</LoreTerm>.

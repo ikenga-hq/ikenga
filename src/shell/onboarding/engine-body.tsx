@@ -24,7 +24,6 @@ import { useMutation } from '@tanstack/react-query';
 import { openExternalUrl } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
-import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
 import { cn } from '@/components/ui/utils';
@@ -297,17 +296,17 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 						className="mb-2 text-xs font-semibold uppercase tracking-[0.04em]"
 						style={{ color: 'var(--primary)' }}
 					>
-						Choose your <LoreTerm term="Chi">Chi</LoreTerm>
+						Choose your engine
 					</p>
 					<h1 className="font-display text-3xl font-bold leading-tight tracking-tight">
-						Pick your <LoreTerm term="Chi">Chi</LoreTerm>.
+						Pick your engine.
 					</h1>
 					<p className="mt-2 max-w-[60ch] text-sm" style={{ color: 'var(--fg-muted)' }}>
 						{anyPending
 							? 'Scanning your $PATH for each agent in parallel…'
 							: anyDetected
-								? 'Pick one to continue. You can change your Chi later from Settings → Chi & engines.'
-								: "We couldn't find any Chi on $PATH. Install one below, point at a custom binary, or continue offline — the shell is engine-optional."}
+								? 'Pick one to continue. You can change your engine later from Settings → Engines.'
+								: "We couldn't find any engine on $PATH. Install one below, point at a custom binary, or continue offline — the shell is engine-optional."}
 					</p>
 				</div>
 				<Button variant="secondary" size="sm" onClick={() => refresh()} data-testid="agents-rescan">
@@ -411,8 +410,8 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 				<div className="flex-1">
 					<div className="text-[13px] font-semibold">
 						{allMissing
-							? 'No Chi found on this machine — continue without one'
-							: 'Continue without a Chi'}
+							? 'No engine found on this machine — continue without one'
+							: 'Continue without an engine'}
 					</div>
 					<div className="mt-0.5 text-xs" style={{ color: 'var(--fg-muted)' }}>
 						Pkg management, files, terminal, and project routing still work. Your Ikenga can be

@@ -107,13 +107,13 @@ function AutoUpdateSettings() {
 		<SettingGroup title="Automatic updates">
 			<SettingRow
 				label="Check for updates automatically"
-				desc="Checks the app and your packages on launch and every 6 hours. Turn off to only check manually with the button above."
+				desc="Checks Ikenga, your apps and your extensions on launch and every 6 hours. Turn off to only check manually with the button above."
 			>
 				<Switch checked={autoCheck} onCheckedChange={setAutoCheck} />
 			</SettingRow>
 			<SettingRow
-				label="Install package updates in the background"
-				desc="Packages are sandboxed and reload in place — no restart. Recommended on."
+				label="Install app and extension updates in the background"
+				desc="Apps and extensions are sandboxed and reload in place — no restart. Recommended on."
 			>
 				<Switch
 					checked={autoInstallPkgs}

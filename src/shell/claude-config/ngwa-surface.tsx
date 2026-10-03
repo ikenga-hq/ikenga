@@ -2272,7 +2272,7 @@ function StoreDetail({
 				<Section label="Per-scope state">
 					<div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
 						{[
-							{ key: 'workspace' as ClaudeStoreScope, label: 'Personal / workspace' },
+							{ key: 'workspace' as ClaudeStoreScope, label: 'Personal' },
 							...projectScopes,
 						].map((s) => {
 							const isOn = enabledSet.has(s.key);
@@ -2311,7 +2311,7 @@ function StoreDetail({
 				<ScopePicker
 					title="Install into scope…"
 					desc={`Symlink/merge "${entry.name}" into a scope.`}
-					scopes={[{ key: 'workspace', label: 'Personal / workspace' }, ...projectScopes]}
+					scopes={[{ key: 'workspace', label: 'Personal' }, ...projectScopes]}
 					disabledScopes={entry.enabledIn}
 					onPick={(scope) => {
 						enable.mutate({ kind: entry.kind, name: entry.name, scope });

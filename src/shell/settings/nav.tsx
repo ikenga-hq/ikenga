@@ -78,7 +78,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 	},
 	{
 		id: 'engines',
-		label: 'Chi & engines',
+		label: 'Engines',
 		Icon: Bot,
 		description: 'Default engine, shells, agent execution target and terminal restore.',
 		fields: [
