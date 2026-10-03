@@ -10,6 +10,7 @@
 import type { NgwaItem, NgwaTrust, NgwaUsage, NgwaKind } from '@ikenga/contract';
 import type { RegistryEntry } from '@/lib/registry/use-registry';
 import { entryMatchesPkgId } from '@/lib/registry/use-updates-available';
+import { isHiddenRegistryEntry } from '@/lib/registry/visibility';
 import { semverCompare } from '@ikenga/registry-client';
 import {
 	catalogPin,
@@ -180,12 +181,18 @@ export interface NgwaStoreEntry {
 /**
  * Builds the Store tab's catalog by merging registry entries with installed items.
  * Marks items that are already installed, and identifies available updates.
+ *
+ * An entry the index marks `visibility: "hidden"` is kept out of browse and
+ * search unless it is installed: an installed one keeps its row, so it still
+ * shows as installed and still gets update detection. Hidden entries stay
+ * resolvable by exact name everywhere else, because callers pass the whole
+ * index and only this list is filtered.
  */
 export function buildStoreCatalog(
 	installedItems: NgwaItem[],
 	registryEntries: RegistryEntry[]
 ): NgwaStoreEntry[] {
-	return registryEntries.map((entry) => {
+	const rows = registryEntries.map((entry) => {
 		const installed =
 			installedItems.find(
 				(it) =>
@@ -220,6 +227,9 @@ export function buildStoreCatalog(
 			registryEntry: entry,
 		};
 	});
+	return rows.filter(
+		(row) => row.installedItem !== null || !isHiddenRegistryEntry(row.registryEntry)
+	);
 }
 
 // ─── R57 · catalog rows (git / npx primitives from the signed catalog) ──────

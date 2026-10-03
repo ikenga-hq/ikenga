@@ -22,6 +22,7 @@ import {
 	pkgDetailPath,
 	type PkgVersion as StorePkgVersion,
 } from '@ikenga/contract/registry';
+import { withVerifiedVisibility } from './visibility';
 
 /** Live registry. Source: docs/plans/2026-05-13-ikenga-pkgs-migration.md Phase C. */
 export const REGISTRY_URL = 'https://registry.ikenga.dev/index.json';
@@ -50,13 +51,19 @@ export type {
 } from '@ikenga/registry-client';
 export type { PkgVersion as StorePkgVersion } from '@ikenga/contract/registry';
 
-/** Fetch + verify the registry index. Throws on any failure (see lib docs). */
+/**
+ * Fetch + verify the registry index. Throws on any failure (see lib docs).
+ * The library's schema drops `visibility`, so it is copied back from the
+ * verified bytes (see `visibility.ts`).
+ */
 export async function fetchIndex(signal?: AbortSignal): Promise<FetchedIndex> {
-	return fetchIndexLib({
-		indexUrl: REGISTRY_URL,
-		publicKey: REGISTRY_PUBKEY,
-		signal,
-	});
+	return withVerifiedVisibility(
+		await fetchIndexLib({
+			indexUrl: REGISTRY_URL,
+			publicKey: REGISTRY_PUBKEY,
+			signal,
+		})
+	);
 }
 
 /** Lazy detail fetch — used when the user opens the per-pkg pane. */

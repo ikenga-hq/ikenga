@@ -47,6 +47,7 @@ import {
 	type CatalogTrafficLight,
 	countByBucket,
 	defaultSelectedIds,
+	findCatalogEntry,
 	ONBOARDING_PKG_CATALOG,
 	type OnboardingPkgEntry,
 } from '@/lib/onboarding/pkg-catalog';
@@ -115,7 +116,9 @@ function isEnginePkg(id: string): boolean {
 	return id.startsWith('com.ikenga.engine-');
 }
 
-const CORE_PKG_IDS: ReadonlySet<string> = new Set(['com.ikenga.files']);
+// Pkgs that are always installed and cannot be toggled off. None today: the
+// catalog only lists pkgs the registry actually carries.
+const CORE_PKG_IDS: ReadonlySet<string> = new Set<string>();
 function isCorePkg(id: string): boolean {
 	return CORE_PKG_IDS.has(id);
 }
@@ -163,8 +166,13 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 
 	// ── Packages ───────────────────────────────────────────────────────
 	const [selected, setSelected] = useState<Set<string>>(() => {
+		// A selection saved by an older build may name pkgs the catalog no longer
+		// offers (held apps, the retired Files entry); drop them rather than queue
+		// an install that cannot resolve.
 		const seed = new Set(
-			(persisted?.selected ?? defaultSelectedIds()).filter((id) => !isEnginePkg(id))
+			(persisted?.selected ?? defaultSelectedIds()).filter(
+				(id) => !isEnginePkg(id) && findCatalogEntry(id) !== undefined
+			)
 		);
 		for (const id of CORE_PKG_IDS) seed.add(id);
 		return seed;
@@ -615,7 +623,7 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						role="tablist"
 						aria-label="Filter packages"
 					>
-						{FILTER_ORDER.map((f) => {
+						{FILTER_ORDER.filter((f) => f === 'all' || buckets[f] > 0).map((f) => {
 							const label = f === 'all' ? 'All' : BUCKET_LABEL[f];
 							const count = buckets[f];
 							const on = filter === f;
