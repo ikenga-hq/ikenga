@@ -6,7 +6,7 @@
 	"type": "module",
 	"description": "Ikenga — Tauri 2 desktop app (control plane for terminals, chat, viewer)",
 	"scripts": {
-		"changeset:version": "bunx @changesets/cli@^3.0.0 version && node scripts/sync-version.mjs",
+		"changeset:version": "bunx @changesets/cli@^3.0.0 version && node scripts/sync-version.mjs && node scripts/docs/generate.mjs --soft",
 		"dev": "bun run bun:fetch && bun run iyke:bundle && bun run artifact:bundle && bun run tokens:copy && bun run iyke:mcp:build && bun run pw:sidecar:build && vite",
 		"build": "bun run iyke:bundle && bun run artifact:bundle && bun run tokens:copy && bun run iyke:mcp:build && bun run engine:cc:materialize && vite build",
 		"pw:sidecar:build": "bash scripts/build-playwright-sidecar.sh",
