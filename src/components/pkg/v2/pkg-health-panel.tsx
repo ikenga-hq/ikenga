@@ -123,7 +123,7 @@ export function PkgHealthPanel() {
 						variant="ghost"
 						disabled={healthQuery.isFetching}
 						onClick={() => healthQuery.refetch()}
-						aria-label="Re-scan package health"
+						aria-label="Re-scan install health"
 					>
 						<RefreshCw className={`h-3.5 w-3.5 ${healthQuery.isFetching ? 'animate-spin' : ''}`} />
 					</Button>
@@ -142,7 +142,7 @@ export function PkgHealthPanel() {
 				<FeedbackState
 					variant="empty"
 					heading="All installs healthy."
-					body="No broken or orphaned package records."
+					body="No broken or orphaned install records."
 				/>
 			)}
 

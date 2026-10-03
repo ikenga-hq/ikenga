@@ -269,7 +269,7 @@ function SummaryCard({ card, onEdit }: { card: CardModel; onEdit: () => void }) 
 
 const STEP_LABEL: Record<OnboardingStepId, string> = {
 	welcome: 'Welcome',
-	engine: 'Chi',
+	engine: 'Engine',
 	project: 'Project',
 	equipment: 'Ngwa',
 	look: 'Look',
@@ -438,7 +438,7 @@ export function findBlockingState(
 		return 'Step 1 (Welcome) is incomplete — go back and review the system checks.';
 	}
 	if (steps.engine.status === 'pending') {
-		return 'Step 2 (Chi) is still pending — pick a Chi or continue offline.';
+		return 'Step 2 (Engine) is still pending — pick an engine or continue offline.';
 	}
 	return null;
 }

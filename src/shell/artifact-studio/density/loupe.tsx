@@ -233,7 +233,7 @@ export function StudioLoupe({ path, paneId, attachedTerminalId }: StudioLoupePro
 			{...focusMarkerProps('loupe')}
 			data-pane-id={paneId}
 			role="application"
-			aria-label="Artifact Studio"
+			aria-label="Artifact grid"
 			onFocusCapture={handleFocusWithinCapture}
 			onBlurCapture={handleBlurWithinCapture}
 		>

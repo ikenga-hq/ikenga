@@ -165,13 +165,13 @@ function glossTerms(): RailGlossTerm[] {
 	return [
 		{
 			term: 'ngwa',
-			text: 'Ngwa — your equipment',
+			text: 'Ngwa — your store',
 			keyLabel: labelFor('rail.ngwa'),
 			anchor: 'ngwa',
 		},
 		{
 			term: 'chi',
-			text: 'Chi — your engine session',
+			text: 'Chi — your agent companion',
 			keyLabel: labelFor('rail.chi'),
 			anchor: 'chi',
 		},

@@ -183,7 +183,7 @@ function LoupeTabs({
 		<div
 			ref={containerRef}
 			role="tablist"
-			aria-label="Package detail"
+			aria-label="App or extension detail"
 			onKeyDown={onKeyDown}
 			className="flex gap-0 border-b border-border bg-muted/40 px-5"
 		>
@@ -393,7 +393,9 @@ function TabOverview({ row }: { row: PkgRowV2 }) {
 function TabPermissions({ row }: { row: PkgRowV2 }) {
 	if (!row.scopes.length) {
 		return (
-			<p className="text-sm text-muted-foreground">This pkg requests no sensitive permissions.</p>
+			<p className="text-sm text-muted-foreground">
+				This app or extension requests no sensitive permissions.
+			</p>
 		);
 	}
 	const high = row.scopes.filter((s) => classifyScope(s).risk === 'high').length;
@@ -481,15 +483,15 @@ function TabTrust({ row }: { row: PkgRowV2 }) {
 	let tone: 'live' | 'warn' | 'danger' | 'muted' = 'muted';
 	if (t?.state === 'auto_trusted') {
 		label = 'Auto-trusted';
-		sub = `Built-in pkg in the com.ikenga.* namespace. Cannot be revoked.`;
+		sub = `Built-in app or extension in the com.ikenga.* namespace. Cannot be revoked.`;
 		tone = 'live';
 	} else if (t?.state === 'auto_granted') {
 		label = 'Auto-granted';
-		sub = `Skill-only pkg with no sensitive perms. Auto-approved on install.`;
+		sub = `Skill-only extension with no sensitive permissions. Auto-approved on install.`;
 		tone = 'live';
 	} else if (t?.state === 'granted') {
-		label = 'Trusted';
-		sub = `You approved this pkg on install. Permissions are honored.`;
+		label = 'Approved';
+		sub = `You approved its permissions on install. They are honoured.`;
 		tone = 'live';
 	} else if (t?.state === 'needs_approval') {
 		label = 'Pending review';
@@ -499,7 +501,7 @@ function TabTrust({ row }: { row: PkgRowV2 }) {
 		} else if (change?.kind === 'revoked') {
 			sub = `Trust was revoked. Re-approve to grant declared permissions again.`;
 		} else {
-			sub = `A change to this pkg requires your re-approval.`;
+			sub = `A change to this app or extension requires your re-approval.`;
 		}
 		tone = 'danger';
 	}
@@ -572,7 +574,9 @@ function TabSettings({ row }: { row: PkgRowV2 }) {
 	});
 
 	if (row.origin === 'registry') {
-		return <p className="text-sm text-muted-foreground">Install the pkg to configure it.</p>;
+		return (
+			<p className="text-sm text-muted-foreground">Install the app or extension to configure it.</p>
+		);
 	}
 	if (settings.isLoading) {
 		return <p className="text-sm text-muted-foreground">Loading settings…</p>;
@@ -588,7 +592,9 @@ function TabSettings({ row }: { row: PkgRowV2 }) {
 	const schema = (snapshot?.schema as PkgSettingsField[] | undefined) ?? [];
 	if (!schema.length) {
 		return (
-			<p className="text-sm text-muted-foreground">This pkg has no user-configurable settings.</p>
+			<p className="text-sm text-muted-foreground">
+				This app or extension has no user-configurable settings.
+			</p>
 		);
 	}
 	return (
@@ -1002,7 +1008,7 @@ function MetaGrid({ rows }: { rows: Array<[string, React.ReactNode]> }) {
 
 function TrustCallout({ row }: { row: PkgRowV2 }) {
 	const change = row.trust?.change_reason;
-	let note = 'A change to this pkg requires your re-approval.';
+	let note = 'A change to this app or extension requires your re-approval.';
 	if (change?.kind === 'permissions_changed') {
 		note = `Bumped from v${change.prior_version}. Added: ${change.added.join(', ') || '(none)'}. Re-approve before enabling.`;
 	}

@@ -53,7 +53,7 @@ export function UpdateSheet() {
 				<SheetHeader>
 					<SheetTitle>Update</SheetTitle>
 					<SheetDescription className="sr-only">
-						Shell and package update flow
+						Shell, app and extension update flow
 					</SheetDescription>
 				</SheetHeader>
 				<div
@@ -81,7 +81,7 @@ export function UpdateSheet() {
 							source === 'pkgs' ? 'bg-[var(--bg-raised)] text-foreground' : 'text-muted-foreground'
 						)}
 					>
-						Packages ({pkgCount})
+						Apps and extensions ({pkgCount})
 					</button>
 				</div>
 				<div className="flex-1 overflow-y-auto px-4 py-3">
@@ -251,7 +251,11 @@ function PkgUpdatePanel() {
 	}, [pkgs.updates.length]);
 
 	if (pkgs.updates.length === 0) {
-		return <p className="text-sm text-muted-foreground">Every installed package is up to date.</p>;
+		return (
+			<p className="text-sm text-muted-foreground">
+				Every installed app and extension is up to date.
+			</p>
+		);
 	}
 
 	function runBatch() {
@@ -284,7 +288,7 @@ function PkgUpdatePanel() {
 	return (
 		<div data-state="update-packages" className="space-y-4">
 			<h3 className="font-display text-sm font-semibold">
-				Package updates <span className="font-mono">{pkgs.updates.length}</span>
+				App and extension updates <span className="font-mono">{pkgs.updates.length}</span>
 			</h3>
 			<ul className="space-y-1.5">
 				{pkgs.updates.map((row) => {
@@ -348,18 +352,18 @@ function PkgUpdatePanel() {
 			</ul>
 			{failures.length > 0 && (
 				<p className="text-sm" style={{ color: 'var(--danger)' }}>
-					{plural(failures.length, 'package')} failed —{' '}
+					{plural(failures.length, 'update')} failed —{' '}
 					{failures.map((f) => `${f.name}: ${f.error}`).join(' · ')}
 				</p>
 			)}
 			{needsApproval.length > 0 && (
 				<p className="text-sm text-warning">
-					{plural(needsApproval.length, 'package')} stopped before installing — the new version
-					asks for a capability you haven't granted. Review each row above to install it.
+					{plural(needsApproval.length, 'update')} stopped before installing — the new version asks
+					for a capability you haven't granted. Review each row above to install it.
 				</p>
 			)}
 			<p className="text-xs text-muted-foreground">
-				Each package is verified and re-registered on its own; one failure never rolls back the
+				Each update is verified and re-registered on its own; one failure never rolls back the
 				others.
 			</p>
 			<SheetFooter className="gap-2 px-0">

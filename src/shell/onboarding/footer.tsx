@@ -90,7 +90,7 @@ export interface SettingsLink {
 // `/settings/backup` still exist as redirect stubs to `engines`/`storage`,
 // but there's no reason to bounce through them here).
 export const SETTINGS_LINKS: Partial<Record<OnboardingStepId, SettingsLink[]>> = {
-	engine: [{ label: 'Settings · Chi & engines', to: '/settings/engines' }],
+	engine: [{ label: 'Settings · Engines', to: '/settings/engines' }],
 	project: [{ label: 'Settings · Projects', to: '/settings/projects' }],
 	equipment: [
 		{ label: 'Ngwa', to: '/ngwa' },

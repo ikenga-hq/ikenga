@@ -2,7 +2,7 @@
 //
 // The rail's steady state is the 400 ms hover tooltip on every key. This is
 // the one-time introduction to the two lore nouns on the rail: a small
-// callout beside the key naming it in English ("Ngwa — your equipment").
+// callout beside the key naming it in English ("Ngwa — your store").
 // Rules, all tested in `rail-gloss.test.tsx`:
 //
 //   - Shows once per profile per term. Seen terms are a JSON array under
@@ -29,7 +29,7 @@ const DISMISS_EVENTS = ['pointerdown', 'pointermove', 'keydown'] as const;
 export interface RailGlossTerm {
 	/** Lore term id, e.g. `ngwa`. What gets recorded as seen. */
 	term: string;
-	/** One-line gloss, e.g. `Ngwa — your equipment`. */
+	/** One-line gloss, e.g. `Ngwa — your store`. */
 	text: string;
 	/** Key hint shown after the text (from `labelFor`), or '' for none. */
 	keyLabel: string;

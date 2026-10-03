@@ -115,7 +115,7 @@ export function describeMissing(ids: readonly ConnectorId[]): string {
 	if (ids.length === 1) {
 		const def = CONNECTOR_REGISTRY.find((c) => c.id === ids[0]);
 		const name = def?.display ?? ids[0];
-		return `${name} isn't configured — installed pkgs that need it won't load data until you set it up.`;
+		return `${name} isn't configured — installed apps and extensions that need it won't load data until you set it up.`;
 	}
-	return `${ids.length} connectors aren't configured — installed pkgs that need them won't load data until you set them up.`;
+	return `${ids.length} connectors aren't configured — installed apps and extensions that need them won't load data until you set them up.`;
 }
