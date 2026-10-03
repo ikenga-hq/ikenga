@@ -194,6 +194,7 @@ cmd_pack() {
   [[ -n "$published_at" ]] || published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$out_dir"
+  out_dir="$(cd "$out_dir" && pwd)"
   local stage_root
   stage_root="$(mktemp -d)"
   trap 'rm -rf "$stage_root"' RETURN
@@ -227,18 +228,18 @@ cmd_pack() {
     fi
 
     local stage="$stage_root/$arch"
-    mkdir -p "$stage/bin" "$stage/systemd"
+    mkdir -p "$stage/bin"
     install -m 0755 "$bin" "$stage/bin/ikenga-server"
     cp -r "$dist_dir" "$stage/dist"
     find "$stage/dist" -type d -exec chmod 0755 {} +
     find "$stage/dist" -type f -exec chmod 0644 {} +
     local unit
     for unit in "$SHELL_DIR"/scripts/server/*.service; do
-      install -m 0644 "$unit" "$stage/systemd/$(basename "$unit")"
+      install -m 0644 "$unit" "$stage/$(basename "$unit")"
     done
     install -m 0644 "$SHELL_DIR/scripts/server/README.md" "$stage/README.md"
     install -m 0644 "$SHELL_DIR/LICENSE" "$stage/LICENSE"
-    local members=(bin dist systemd README.md LICENSE release.json)
+    local members=(bin dist README.md LICENSE release.json)
     if [[ -f "$SHELL_DIR/NOTICE" ]]; then
       install -m 0644 "$SHELL_DIR/NOTICE" "$stage/NOTICE"
       members+=(NOTICE)
@@ -261,7 +262,7 @@ cmd_pack() {
       cd "$stage"
       # GNU tar flags; the release runner is Linux.
       tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
-        -cf - bin dist systemd README.md LICENSE release.json $([[ -f NOTICE ]] && echo NOTICE) \
+        -cf - bin dist ikenga-server*.service README.md LICENSE release.json $([[ -f NOTICE ]] && echo NOTICE) \
         | gzip -n -9 > "$out_dir/$name"
     )
 
@@ -272,7 +273,7 @@ cmd_pack() {
     for member in bin/ikenga-server dist/index.html README.md LICENSE release.json; do
       grep -qx "$member" <<<"$listing" || die "$name is missing $member"
     done
-    grep -q '^systemd/.*\.service$' <<<"$listing" || die "$name carries no systemd unit"
+    grep -Eq '^ikenga-server.*\.service$' <<<"$listing" || die "$name carries no systemd unit"
 
     local sha size
     sha="$(sha256sum "$out_dir/$name" | awk '{print $1}')"

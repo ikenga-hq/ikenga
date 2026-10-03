@@ -98,7 +98,7 @@ manifest carries a GitHub build-provenance attestation. If either server build
 fails, the release stays a draft.
 
 A tarball extracts straight into the install root (`/opt/ikenga`): `bin/`,
-`dist/`, `systemd/`, `README.md`, `LICENSE`, `NOTICE` and a small
+`dist/`, the two systemd unit files, `README.md`, `LICENSE`, `NOTICE` and a small
 `release.json` naming the version, commit and architecture it was built from.
 
 ### glibc floor: 2.31
