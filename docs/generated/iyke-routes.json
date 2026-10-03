@@ -1,0 +1,959 @@
+{
+  "$schemaVersion": 1,
+  "kind": "ikenga.iyke-routes",
+  "stability": "unstable",
+  "source": {
+    "repo": "ikenga-hq/ikenga",
+    "version": "0.19.0",
+    "producer": "scripts/docs/iyke-routes.mjs",
+    "path": "src-tauri/src/iyke/server.rs"
+  },
+  "groups": [
+    {
+      "group": "actions",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/actions"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/actions/import"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/actions/set"
+        }
+      ]
+    },
+    {
+      "group": "agent",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/agent/inbox"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/agent/inbox/ack"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/agent/register"
+        }
+      ]
+    },
+    {
+      "group": "browser",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/browser/_reply"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/back"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/click"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/close"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/eval"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/fill"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/focus"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/forward"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/goto"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/launch_profile"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/browser/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/open"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/pause"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/press-key"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/browser/profiles"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/read-text"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/reload"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/resume"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/screenshot"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/select"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/session/create"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/session/delete"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/browser/session/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/session/resolve"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/snapshot"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/browser/targets"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/browser/wait-for"
+        }
+      ]
+    },
+    {
+      "group": "chi",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/chi/cancel"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/chi/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/chi/resume"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/chi/run"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/chi/status"
+        }
+      ]
+    },
+    {
+      "group": "claude",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/claude/asset/pin"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/claude/asset/pins"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/claude/asset/unpin"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/claude/assets"
+        }
+      ]
+    },
+    {
+      "group": "click",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/click"
+        }
+      ]
+    },
+    {
+      "group": "close",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/close"
+        }
+      ]
+    },
+    {
+      "group": "devtools",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/devtools"
+        }
+      ]
+    },
+    {
+      "group": "dom",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/dom"
+        }
+      ]
+    },
+    {
+      "group": "explorer",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/explorer/sections"
+        }
+      ]
+    },
+    {
+      "group": "focus",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/focus"
+        }
+      ]
+    },
+    {
+      "group": "go",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/go"
+        }
+      ]
+    },
+    {
+      "group": "hooks",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/hooks/decision"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/hooks/event"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/hooks/events"
+        }
+      ]
+    },
+    {
+      "group": "ide",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/ide/lock"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/ide/open_file"
+        }
+      ]
+    },
+    {
+      "group": "iframe-message",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/iframe-message"
+        }
+      ]
+    },
+    {
+      "group": "iframe-state",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/iframe-state"
+        }
+      ]
+    },
+    {
+      "group": "key",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/key"
+        }
+      ]
+    },
+    {
+      "group": "keys",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/keys"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/keys/resolve"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/keys/set"
+        }
+      ]
+    },
+    {
+      "group": "kv",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/kv/delete"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/kv/get"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/kv/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/kv/set"
+        }
+      ]
+    },
+    {
+      "group": "layout",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/layout/get"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/layout/reset"
+        }
+      ]
+    },
+    {
+      "group": "lock",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/lock/acquire"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/lock/release"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/lock/renew"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/lock/status"
+        }
+      ]
+    },
+    {
+      "group": "logs",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/logs"
+        }
+      ]
+    },
+    {
+      "group": "mcp",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/mcp/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/mcp/restart"
+        }
+      ]
+    },
+    {
+      "group": "menus",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/menus/*menu_id"
+        }
+      ]
+    },
+    {
+      "group": "mode",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/mode"
+        }
+      ]
+    },
+    {
+      "group": "network",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/network"
+        }
+      ]
+    },
+    {
+      "group": "ngwa",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/ngwa/snapshot"
+        }
+      ]
+    },
+    {
+      "group": "notifications",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/notifications"
+        }
+      ]
+    },
+    {
+      "group": "oba",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/oba/install-local"
+        }
+      ]
+    },
+    {
+      "group": "open",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/open"
+        }
+      ]
+    },
+    {
+      "group": "pa-actions",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/pa-actions/pause"
+        }
+      ]
+    },
+    {
+      "group": "pin",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/pin/acknowledge"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/pin/read"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pin/resolve"
+        }
+      ]
+    },
+    {
+      "group": "pkg",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/badge-set"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/dev/register"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/dev/reload"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/dev/unregister"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/health/remove"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/health/remove-all"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/health/scan"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/install"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/pkg/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/scope-set"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg/uninstall"
+        }
+      ]
+    },
+    {
+      "group": "pkg-db",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/pkg-db/exec"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/pkg-db/query"
+        }
+      ]
+    },
+    {
+      "group": "pkg-trust",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/pkg-trust/project-access"
+        }
+      ]
+    },
+    {
+      "group": "project",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/project/active"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/project/archive"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/project/create"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/project/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/project/set-active"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/project/update"
+        }
+      ]
+    },
+    {
+      "group": "query-cache",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/query-cache"
+        }
+      ]
+    },
+    {
+      "group": "refresh",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/refresh"
+        }
+      ]
+    },
+    {
+      "group": "resize",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/resize"
+        }
+      ]
+    },
+    {
+      "group": "scratchpad",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/scratchpad/append"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/scratchpad/delete"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/scratchpad/list"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/scratchpad/read"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/scratchpad/watch"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/scratchpad/write"
+        }
+      ]
+    },
+    {
+      "group": "screenshot",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/screenshot/pane"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/screenshot/window"
+        }
+      ]
+    },
+    {
+      "group": "seats",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/seats/clear"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/seats/create"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/seats/fill"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/seats/get"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/seats/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/seats/release"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/seats/resume"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/seats/send"
+        }
+      ]
+    },
+    {
+      "group": "secret",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/secret/delete"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/secret/get"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/secret/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/secret/set"
+        }
+      ]
+    },
+    {
+      "group": "secrets",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/secrets/lock-state"
+        }
+      ]
+    },
+    {
+      "group": "sidebar",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/sidebar"
+        }
+      ]
+    },
+    {
+      "group": "split",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/split"
+        }
+      ]
+    },
+    {
+      "group": "state",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/state"
+        }
+      ]
+    },
+    {
+      "group": "statusline",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/statusline/event"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/statusline/snapshot"
+        }
+      ]
+    },
+    {
+      "group": "tab",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/tab/activate"
+        }
+      ]
+    },
+    {
+      "group": "task",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/task/complete"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/task/create"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/task/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/task/update"
+        }
+      ]
+    },
+    {
+      "group": "terminal",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/terminal/audit"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/get"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/kill"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/label"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/lease/acquire"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/lease/release"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/terminal/list"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/terminal/read"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/send"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/spawn"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/terminal/wait"
+        }
+      ]
+    },
+    {
+      "group": "timer",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/timer/cancel"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/timer/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/timer/schedule"
+        }
+      ]
+    },
+    {
+      "group": "todo",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/todo/complete"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/todo/create"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/todo/list"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/todo/update"
+        }
+      ]
+    },
+    {
+      "group": "trust",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/trust/grant"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/trust/list"
+        },
+        {
+          "method": "GET",
+          "path": "/iyke/trust/preview/:pkg_id"
+        },
+        {
+          "method": "POST",
+          "path": "/iyke/trust/revoke"
+        }
+      ]
+    },
+    {
+      "group": "type",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/type"
+        }
+      ]
+    },
+    {
+      "group": "violations",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/violations/list"
+        }
+      ]
+    },
+    {
+      "group": "wait",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/iyke/wait"
+        }
+      ]
+    },
+    {
+      "group": "windows",
+      "routes": [
+        {
+          "method": "GET",
+          "path": "/iyke/windows"
+        }
+      ]
+    }
+  ]
+}
