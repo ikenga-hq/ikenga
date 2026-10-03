@@ -1,5 +1,13 @@
 # ikenga-desktop
 
+## 0.19.1
+
+### Patch Changes
+
+- cb55ecd: Apps the registry holds back no longer appear when you browse or search the store. The store was ignoring the registry's hidden flag; it now honours it, and anything you already installed keeps working and still gets updates. The first-run setup also lists only apps that exist in the registry: Tasks is selected by default, Sales is listed but off, and the Files, Mail, Outbound and Content entries are gone. Tasks and Sales are now described as local-only, with the current version and no cloud connector required.
+- 35c26a1: People and Secrets now explain that sharing, and your own secrets store, need a multi-user server.
+- 34a921d: Clearer names across the app: the rail tips now call Ngwa "your store" and Chi "your agent companion", the Artifact grid is named consistently, the install screen says "Approved" instead of "Trusted", the personal scope reads "Personal" in the Store and Secrets, the first run and Settings say "engine" where they mean the engine, the Gemini filter is gone from the Ngwa engine facet, and the most visible "package" wording now says app or extension.
+
 ## 0.19.0
 
 ### Minor Changes
