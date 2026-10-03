@@ -472,6 +472,10 @@ pub async fn execute_or_resume(
     via: &str,
     crash_sim: CrashSimulation,
 ) -> anyhow::Result<RotationSummary> {
+    if owner == KekOwner::Root && unsafe { libc::geteuid() != 0 } {
+        anyhow::bail!("`ikenga-server secrets rotate-kek` must be run as root");
+    }
+
     check_concurrency(root)?;
 
     let operator_dir = root.operator_dir();

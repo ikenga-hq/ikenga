@@ -786,9 +786,6 @@ async fn run_secrets(args: SecretsArgs) -> anyhow::Result<()> {
     let root = OperatorRoot::new(data_dir)?;
     match args.command {
         SecretsCommand::RotateKek => {
-            if !nix::unistd::Uid::effective().is_root() {
-                anyhow::bail!("`ikenga-server secrets rotate-kek` must be run as root");
-            }
             let summary = execute_or_resume(&root, KekOwner::Root, "cli", CrashSimulation::None).await?;
             if summary.was_resumed {
                 println!(
