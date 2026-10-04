@@ -311,6 +311,10 @@ reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL an
 tag = "WP-19"
 reason = "kernel.health_scan is documented read-only, scans pkg_installed rows for broken/orphaned records; no spawn."
 
+[pkg_install_cancel]
+tag = "WP-18b"
+reason = "Sets the cancel flag of an in-flight pkg_install_from_registry, which the daemon does not serve yet; it is served together with that command."
+
 [pkg_install_from_path]
 tag = "WP-18b"
 reason = "materialize_npm_deps (npm/bun spawn) then kernel.install_from_path, whose SidecarSupervisor spawns long-lived MCP children."
