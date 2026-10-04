@@ -96,7 +96,7 @@ cmd_build() {
   local expect_version="" out_dir="$SHELL_DIR/scripts/server/out"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --expect-version) expect_version="${2:?}"; shift 2 ;;
+      --expect-version) expect_version="${2:?}"; expect_version="${expect_version#v}"; shift 2 ;;
       --out) out_dir="${2:?}"; shift 2 ;;
       *) die "unknown option '$1'" ;;
     esac
