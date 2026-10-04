@@ -139,6 +139,7 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("audit.exported", Category::Access, false),
     ("audit.chain_broken", Category::Access, false),
     ("audit.resealed", Category::Access, false),
+    ("secrets.kek_rotated", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.

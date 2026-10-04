@@ -48,6 +48,7 @@ pub mod password;
 pub mod probe;
 pub mod provision;
 pub mod reaper;
+pub mod rotate_kek;
 mod safe_fs;
 pub mod secrets_kek;
 mod sys;
