@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use super::safe_fs::{chown_fd, Dir};
 use super::secrets_kek::{existing_stores, KekOwner, SecretsKek, HEADER};
 use super::OperatorRoot;
+use crate::access::audit::AuditVia;
 use crate::secrets::principal_store::{
     rewrap_envelope_bytes, unwrap_envelope_bytes, verify_envelope_and_values, WrapKey, KEY_LEN,
 };
@@ -59,14 +60,26 @@ pub enum CrashSimulation {
     DuringRewrapAfter(usize),
     BeforeVerifying,
     BeforeFinalizing,
+    DuringSwap,
     AfterSwapBeforeWipe,
 }
 
 /// Refuse to run if the server daemon or any principal child session is active.
 pub fn check_concurrency(root: &OperatorRoot) -> anyhow::Result<()> {
+    check_concurrency_inner(root, false)
+}
+
+/// `at_boot`: called by the broker itself before it serves. Every
+/// `daemon.json` on disk is then left over from an earlier run, and its pid
+/// may since belong to an unrelated process (or, in a container, to this
+/// very broker), so only the data-directory locks are checked.
+fn check_concurrency_inner(root: &OperatorRoot, at_boot: bool) -> anyhow::Result<()> {
     let operator_dir = root.operator_dir();
     let daemon_meta = operator_dir.join("daemon.json");
-    if let Ok(text) = fs::read_to_string(&daemon_meta) {
+    if let Some(text) = (!at_boot)
+        .then(|| fs::read_to_string(&daemon_meta).ok())
+        .flatten()
+    {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(pid) = json.get("pid").and_then(|p| p.as_i64()).filter(|p| *p > 0) {
                 let pid = pid as i32;
@@ -90,7 +103,10 @@ pub fn check_concurrency(root: &OperatorRoot) -> anyhow::Result<()> {
             }
             let data_dir = p_dir.join("data");
             let child_daemon = data_dir.join("daemon.json");
-            if let Ok(text) = fs::read_to_string(&child_daemon) {
+            if let Some(text) = (!at_boot)
+                .then(|| fs::read_to_string(&child_daemon).ok())
+                .flatten()
+            {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(pid) = json.get("pid").and_then(|p| p.as_i64()).filter(|p| *p > 0) {
                         let pid = pid as i32;
@@ -113,7 +129,8 @@ pub fn check_concurrency(root: &OperatorRoot) -> anyhow::Result<()> {
                     .open(&lock_path)
                 {
                     // SAFETY: non-blocking test lock
-                    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    {
                         let err = io::Error::last_os_error();
                         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
                             anyhow::bail!(
@@ -176,8 +193,12 @@ fn load_journal(operator_dir: &Path) -> io::Result<Option<RotationJournal>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let journal: RotationJournal = serde_json::from_slice(&bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
+    let journal: RotationJournal = serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {e}", path.display()),
+        )
+    })?;
     Ok(Some(journal))
 }
 
@@ -188,7 +209,9 @@ fn mint_new_kek() -> Zeroizing<[u8; KEY_LEN]> {
 }
 
 fn write_kek_file(path: &Path, key: &[u8; KEY_LEN]) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| io::Error::other("no parent dir"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("no parent dir"))?;
     let tmp = parent.join(format!(
         ".{}.tmp-{}-{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -272,7 +295,9 @@ fn rewrap_store(
         .open_file(OsStr::new("envelope.json"))
         .context("open envelope.json")?;
     let mut body = Vec::new();
-    env_file.read_to_end(&mut body).context("read envelope.json")?;
+    env_file
+        .read_to_end(&mut body)
+        .context("read envelope.json")?;
     drop(env_file);
 
     // If already unwrappable with next_key, it was already rewrapped before interruption.
@@ -296,32 +321,39 @@ fn rewrap_store(
     let mut tmp_file = secrets_dir
         .create_file(tmp_os, 0o600)
         .context("create temp envelope file")?;
-    chown_fd(tmp_file.as_raw_fd(), env_stat.uid, env_stat.gid)
-        .context("chown temp envelope file to principal uid:gid")?;
-    tmp_file
-        .write_all(&rewrapped)
-        .context("write temp envelope file")?;
-    tmp_file.sync_all().context("sync temp envelope file")?;
+    let written = (|| -> anyhow::Result<()> {
+        chown_fd(tmp_file.as_raw_fd(), env_stat.uid, env_stat.gid)
+            .context("chown temp envelope file to principal uid:gid")?;
+        tmp_file
+            .write_all(&rewrapped)
+            .context("write temp envelope file")?;
+        tmp_file.sync_all().context("sync temp envelope file")?;
+        Ok(())
+    })();
     drop(tmp_file);
-
-    secrets_dir
-        .rename(tmp_os, secrets_dir, OsStr::new("envelope.json"))
-        .context("rename temp envelope to envelope.json")?;
+    let renamed = written.and_then(|()| {
+        secrets_dir
+            .rename(tmp_os, secrets_dir, OsStr::new("envelope.json"))
+            .context("rename temp envelope to envelope.json")
+    });
+    if let Err(e) = renamed {
+        // Don't leave a stray temp envelope beside the store.
+        let _ = secrets_dir.unlink(tmp_os);
+        return Err(e);
+    }
     // Sync secrets dir
     unsafe { libc::fsync(secrets_dir.raw()) };
     Ok(())
 }
 
-fn verify_store(
-    secrets_dir: &Dir,
-    principal_id: &str,
-    next_key: &WrapKey,
-) -> anyhow::Result<()> {
+fn verify_store(secrets_dir: &Dir, principal_id: &str, next_key: &WrapKey) -> anyhow::Result<()> {
     let (mut env_file, _) = secrets_dir
         .open_file(OsStr::new("envelope.json"))
         .context("open envelope.json")?;
     let mut env_body = Vec::new();
-    env_file.read_to_end(&mut env_body).context("read envelope.json")?;
+    env_file
+        .read_to_end(&mut env_body)
+        .context("read envelope.json")?;
     drop(env_file);
 
     let values_body = match secrets_dir.open_file(OsStr::new("values.json")) {
@@ -339,130 +371,132 @@ fn verify_store(
     Ok(())
 }
 
-async fn record_rotation_audit(
-    pool: &SqlitePool,
-    stores_count: usize,
-    via: &str,
-) -> anyhow::Result<()> {
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("could not acquire accounts.db connection for audit row: {e}");
-            return Ok(());
+/// Append a `secrets.kek_rotated` row to the audit chain in `accounts.db`.
+/// Best effort: the rotation has already committed, so a failure here is
+/// logged, never returned.
+async fn record_rotation_audit(pool: &SqlitePool, stores_count: usize, via: AuditVia) {
+    use crate::access::audit::{chain, Event};
+    use sqlx::Connection;
+
+    let result: anyhow::Result<bool> = async {
+        let mut conn = pool.acquire().await?;
+        let has_audit_events: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        if !has_audit_events {
+            return Ok(false);
         }
-    };
-
-    let has_audit_events: bool = sqlx::query_scalar(
-        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
-    )
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap_or(false);
-
-    if has_audit_events {
         let store_id: Option<String> =
             sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'store_id'")
                 .fetch_optional(&mut *conn)
-                .await
-                .unwrap_or(None);
+                .await?;
+        let Some(store_id) = store_id else {
+            return Ok(false);
+        };
+        let ev = Event::new("secrets.kek_rotated", via).detail(serde_json::json!({
+            "stores_rotated": stores_count,
+            "outcome": "success",
+        }));
+        let chain = chain::shared(&store_id);
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let head = chain
+            .append(&mut tx, &ev)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tx.commit().await?;
+        chain.committed(head);
+        Ok(true)
+    }
+    .await;
 
-        if let Some(store_id) = store_id {
-            use crate::access::audit::chain::{self, Head, StoredRow};
-            let head = chain::db_head(&mut *conn).await.unwrap_or(None);
-            let (seq, prev) = match head {
-                Some(h) => (h.seq + 1, h.hash),
-                None => (1, chain::genesis(&store_id)),
-            };
-            let detail = serde_json::json!({
-                "stores_rotated": stores_count,
-                "outcome": "success",
-            })
-            .to_string();
+    match result {
+        Ok(true) => tracing::info!(
+            stores_rotated = stores_count,
+            via = via.as_str(),
+            "secrets KEK rotation completed and recorded in the audit log"
+        ),
+        Ok(false) => tracing::warn!(
+            stores_rotated = stores_count,
+            via = via.as_str(),
+            "secrets KEK rotation completed; accounts.db has no audit chain yet, so it is \
+             recorded in this log only"
+        ),
+        Err(e) => tracing::warn!(
+            stores_rotated = stores_count,
+            via = via.as_str(),
+            "secrets KEK rotation completed, but writing its audit row failed: {e:#}"
+        ),
+    }
+}
 
-            let row = StoredRow {
-                seq,
-                at_ms: chain::now_ms(),
-                kind: "secrets.kek_rotated".to_string(),
-                category: "access".to_string(),
-                principal_id: None,
-                device_id: None,
-                via: via.to_string(),
-                subject_principal_id: None,
-                subject_device_id: None,
-                project_key: None,
-                target: None,
-                remote_addr: None,
-                user_agent: None,
-                detail,
-                prev_hash: prev.to_vec(),
-                hash: Vec::new(),
-            };
-            let hash = row.compute_hash(&prev);
+/// Re-wrap one principal's store from `from` to `to`. Idempotent: a store
+/// already under `to` is left alone.
+fn rewrap_one(
+    principals_dir: &Dir,
+    principal_id: &str,
+    from: &SecretsKek,
+    to: &SecretsKek,
+) -> anyhow::Result<()> {
+    let from_key = from
+        .wrap_key_for_str(principal_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let to_key = to
+        .wrap_key_for_str(principal_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secrets_dir = open_secrets_dir(principals_dir, principal_id)
+        .with_context(|| format!("open the secret store of principal {principal_id}"))?;
+    rewrap_store(&secrets_dir, principal_id, &from_key, &to_key)
+}
 
-            let res = sqlx::query(
-                "INSERT INTO audit_events (seq, at_ms, kind, category, principal_id, device_id, via, \
-                 subject_principal_id, subject_device_id, project_key, target, remote_addr, user_agent, \
-                 detail, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(row.seq)
-            .bind(row.at_ms)
-            .bind(&row.kind)
-            .bind(&row.category)
-            .bind(&row.principal_id)
-            .bind(&row.device_id)
-            .bind(&row.via)
-            .bind(&row.subject_principal_id)
-            .bind(&row.subject_device_id)
-            .bind(&row.project_key)
-            .bind(&row.target)
-            .bind(&row.remote_addr)
-            .bind(&row.user_agent)
-            .bind(&row.detail)
-            .bind(&row.prev_hash)
-            .bind(hash.as_slice())
-            .execute(&mut *conn)
-            .await;
-
-            if res.is_ok() {
-                chain::shared(&store_id).committed(Head { seq, hash });
-            }
-        }
-    } else {
-        let has_auth_events: bool = sqlx::query_scalar(
-            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'auth_events'",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap_or(false);
-
-        if has_auth_events {
-            let detail = serde_json::json!({
-                "stores_rotated": stores_count,
-                "outcome": "success",
-                "via": via,
-            })
-            .to_string();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let _ = sqlx::query(
-                "INSERT INTO auth_events (at, kind, detail) VALUES (?, 'secrets.kek_rotated', ?)",
-            )
-            .bind(now)
-            .bind(detail)
-            .execute(&mut *conn)
-            .await;
+/// A re-wrap failed: put every store already moved back under the current
+/// KEK, then drop the journal and the unused next KEK, so the server is
+/// exactly as it was. If a store can't be moved back, the journal stays and
+/// a rerun resumes the rotation instead.
+fn roll_back(
+    operator_dir: &Path,
+    principals_dir: &Dir,
+    journal: &RotationJournal,
+    current: &SecretsKek,
+    next: &SecretsKek,
+    next_kek_path: &Path,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    for principal_id in journal.stores_completed.iter().rev() {
+        if let Err(e) = rewrap_one(principals_dir, principal_id, next, current) {
+            return cause.context(format!(
+                "secrets KEK rotation failed, and moving principal {principal_id} back to the \
+                 current KEK failed too ({e:#}). The rotation journal is kept: fix the cause and \
+                 rerun `ikenga-server secrets rotate-kek` to finish the rotation"
+            ));
         }
     }
-
-    tracing::info!(
-        stores_rotated = stores_count,
-        via = via,
-        outcome = "success",
-        "secrets KEK rotation completed and recorded in audit log"
-    );
-    Ok(())
+    // Journal first: a journal without its next KEK could not resume.
+    let journal_path = operator_dir.join(JOURNAL_FILENAME);
+    if let Err(e) = fs::remove_file(&journal_path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            return cause.context(format!(
+                "secrets KEK rotation failed and every store was moved back, but removing {} \
+                 failed ({e}); rerun `ikenga-server secrets rotate-kek` to finish",
+                journal_path.display()
+            ));
+        }
+    }
+    if let Ok(dir) = fs::File::open(operator_dir) {
+        let _ = dir.sync_all();
+    }
+    if let Err(e) = secure_wipe_file(next_kek_path) {
+        tracing::warn!(
+            "secrets KEK rotation rolled back, but wiping the unused {} failed: {e}",
+            next_kek_path.display()
+        );
+    }
+    cause.context(format!(
+        "secrets KEK rotation failed and was rolled back ({} store(s) moved back); the current \
+         KEK and every store are unchanged",
+        journal.stores_completed.len()
+    ))
 }
 
 /// Execute a KEK rotation or resume an interrupted one.
@@ -472,11 +506,27 @@ pub async fn execute_or_resume(
     via: &str,
     crash_sim: CrashSimulation,
 ) -> anyhow::Result<RotationSummary> {
+    let via = if via == "system" {
+        AuditVia::System
+    } else {
+        AuditVia::Cli
+    };
+    run(root, owner, via, crash_sim, None, false).await
+}
+
+async fn run(
+    root: &OperatorRoot,
+    owner: KekOwner,
+    via: AuditVia,
+    crash_sim: CrashSimulation,
+    pool: Option<&SqlitePool>,
+    at_boot: bool,
+) -> anyhow::Result<RotationSummary> {
     if owner == KekOwner::Root && unsafe { libc::geteuid() != 0 } {
         anyhow::bail!("`ikenga-server secrets rotate-kek` must be run as root");
     }
 
-    check_concurrency(root)?;
+    check_concurrency_inner(root, at_boot)?;
 
     let operator_dir = root.operator_dir();
     let current_kek_path = SecretsKek::path(&operator_dir);
@@ -522,21 +572,22 @@ pub async fn execute_or_resume(
     let principals_dir_canon = fs::canonicalize(root.principals_dir())?;
     let principals_dir = Dir::open_no_symlinks(&principals_dir_canon)?;
 
-    // Handle each stage
     if journal.stage == RotationStage::Rewrapping {
         let current_kek = SecretsKek::load(&current_kek_path, owner)?;
         let next_kek = SecretsKek::load(&next_kek_path, owner)?;
 
         while let Some(principal_id) = journal.stores_pending.first().cloned() {
-            let cur_key = current_kek
-                .wrap_key_for_str(&principal_id)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let nxt_key = next_kek
-                .wrap_key_for_str(&principal_id)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let secrets_dir = open_secrets_dir(&principals_dir, &principal_id)?;
-            rewrap_store(&secrets_dir, &principal_id, &cur_key, &nxt_key)?;
+            if let Err(e) = rewrap_one(&principals_dir, &principal_id, &current_kek, &next_kek) {
+                return Err(roll_back(
+                    &operator_dir,
+                    &principals_dir,
+                    &journal,
+                    &current_kek,
+                    &next_kek,
+                    &next_kek_path,
+                    e,
+                ));
+            }
 
             journal.stores_pending.remove(0);
             journal.stores_completed.push(principal_id);
@@ -577,10 +628,17 @@ pub async fn execute_or_resume(
     }
 
     if journal.stage == RotationStage::Finalizing {
-        // Swap KEKs:
-        // If secrets-kek.next still exists, secrets-kek has not been replaced yet.
+        // Swap the KEKs. While `secrets-kek.next` exists the swap hasn't
+        // finished. Each step is checked on its own so a crash between the
+        // two renames (current already moved to `.old`) still resumes.
         if next_kek_path.exists() {
-            fs::rename(&current_kek_path, &old_kek_path).context("rename current KEK to .old")?;
+            if current_kek_path.exists() {
+                fs::rename(&current_kek_path, &old_kek_path)
+                    .context("rename current KEK to .old")?;
+            }
+            if let CrashSimulation::DuringSwap = crash_sim {
+                anyhow::bail!("simulated crash during swap");
+            }
             fs::rename(&next_kek_path, &current_kek_path).context("rename .next to current KEK")?;
             if let Ok(dir) = fs::File::open(&operator_dir) {
                 let _ = dir.sync_all();
@@ -596,9 +654,20 @@ pub async fn execute_or_resume(
             secure_wipe_file(&old_kek_path).context("securely wipe old KEK")?;
         }
 
-        // Audit log
-        if let Ok(pool) = super::open_accounts(root, super::Opener::Cli).await {
-            let _ = record_rotation_audit(&pool, journal.stores_total, via).await;
+        // Audit log: through the caller's pool (the broker at boot), else
+        // the CLI's own connection to an existing accounts.db.
+        match pool {
+            Some(pool) => record_rotation_audit(pool, journal.stores_total, via).await,
+            None => match super::open_accounts(root, super::Opener::CliExisting).await {
+                Ok(pool) => {
+                    record_rotation_audit(&pool, journal.stores_total, via).await;
+                    pool.close().await;
+                }
+                Err(e) => tracing::warn!(
+                    "secrets KEK rotation completed, but accounts.db could not be opened for \
+                     its audit row: {e:#}"
+                ),
+            },
         }
 
         // Clean up journal
@@ -619,23 +688,38 @@ pub async fn resume_if_interrupted(
     root: &OperatorRoot,
     pool: &SqlitePool,
 ) -> anyhow::Result<Option<RotationSummary>> {
-    let operator_dir = root.operator_dir();
-    let journal_path = operator_dir.join(JOURNAL_FILENAME);
+    resume_if_interrupted_as(root, pool, KekOwner::Root).await
+}
+
+async fn resume_if_interrupted_as(
+    root: &OperatorRoot,
+    pool: &SqlitePool,
+    owner: KekOwner,
+) -> anyhow::Result<Option<RotationSummary>> {
+    let journal_path = root.operator_dir().join(JOURNAL_FILENAME);
     if !journal_path.exists() {
         return Ok(None);
     }
     tracing::warn!("secrets rotation: found pending journal at boot; resuming rotation");
-    let summary = execute_or_resume(root, KekOwner::Root, "system", CrashSimulation::None).await?;
-    let _ = record_rotation_audit(pool, summary.stores_rotated, "system").await;
+    // `run` records the audit row itself, through `pool`.
+    let summary = run(
+        root,
+        owner,
+        AuditVia::System,
+        CrashSimulation::None,
+        Some(pool),
+        true,
+    )
+    .await?;
     Ok(Some(summary))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use crate::secrets::principal_store::{ENVELOPE_FILENAME, VALUES_FILENAME};
     use crate::server::operator::{open_accounts, Opener, Ownership};
+    use std::collections::BTreeMap;
 
     struct TestFixture {
         _tmp: tempfile::TempDir,
@@ -657,13 +741,22 @@ mod tests {
         }
 
         fn create_store(&self, principal_id: &str, secrets: &[(&str, &str)]) {
-            let p_dir = self.root.principals_dir().join(principal_id).join("data/secrets");
+            let p_dir = self
+                .root
+                .principals_dir()
+                .join(principal_id)
+                .join("data/secrets");
             fs::create_dir_all(&p_dir).unwrap();
 
-            let kek = SecretsKek::load(&SecretsKek::path(&self.root.operator_dir()), KekOwner::Any).unwrap();
+            let kek = SecretsKek::load(&SecretsKek::path(&self.root.operator_dir()), KekOwner::Any)
+                .unwrap();
             let key = kek.wrap_key_for_str(principal_id).unwrap();
 
-            let store = crate::secrets::PrincipalStore::open(&self.root.principals_dir().join(principal_id).join("data"), &key).unwrap();
+            let store = crate::secrets::PrincipalStore::open(
+                &self.root.principals_dir().join(principal_id).join("data"),
+                &key,
+            )
+            .unwrap();
             use crate::secrets::store::SecretsStore;
             for (k, v) in secrets {
                 store.set(k, v).unwrap();
@@ -671,9 +764,14 @@ mod tests {
         }
 
         fn get_secret(&self, principal_id: &str, key_name: &str) -> Option<String> {
-            let kek = SecretsKek::load(&SecretsKek::path(&self.root.operator_dir()), KekOwner::Any).unwrap();
+            let kek = SecretsKek::load(&SecretsKek::path(&self.root.operator_dir()), KekOwner::Any)
+                .unwrap();
             let key = kek.wrap_key_for_str(principal_id).unwrap();
-            let store = crate::secrets::PrincipalStore::open(&self.root.principals_dir().join(principal_id).join("data"), &key).unwrap();
+            let store = crate::secrets::PrincipalStore::open(
+                &self.root.principals_dir().join(principal_id).join("data"),
+                &key,
+            )
+            .unwrap();
             use crate::secrets::store::SecretsStore;
             store.get(key_name).unwrap()
         }
@@ -683,7 +781,9 @@ mod tests {
     async fn normal_rotation_and_decrypt() {
         let fx = TestFixture::new().await;
         let mut conn = fx.pool.acquire().await.unwrap();
-        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn).await.unwrap();
+        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn)
+            .await
+            .unwrap();
         drop(conn);
 
         fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
@@ -695,8 +795,14 @@ mod tests {
         assert_eq!(summary.stores_rotated, 2);
         assert_eq!(summary.was_resumed, false);
 
-        assert_eq!(fx.get_secret("p-ada", "API_KEY").as_deref(), Some("ada-secret-123"));
-        assert_eq!(fx.get_secret("p-bob", "TOKEN").as_deref(), Some("bob-token-456"));
+        assert_eq!(
+            fx.get_secret("p-ada", "API_KEY").as_deref(),
+            Some("ada-secret-123")
+        );
+        assert_eq!(
+            fx.get_secret("p-bob", "TOKEN").as_deref(),
+            Some("bob-token-456")
+        );
 
         // Journal and old KEK should be cleaned up
         assert!(!fx.root.operator_dir().join(JOURNAL_FILENAME).exists());
@@ -708,7 +814,9 @@ mod tests {
     async fn crash_mid_rotation_and_resume() {
         let fx = TestFixture::new().await;
         let mut conn = fx.pool.acquire().await.unwrap();
-        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn).await.unwrap();
+        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn)
+            .await
+            .unwrap();
         drop(conn);
 
         fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
@@ -738,8 +846,14 @@ mod tests {
         assert_eq!(summary.was_resumed, true);
 
         // Both decrypt cleanly
-        assert_eq!(fx.get_secret("p-ada", "API_KEY").as_deref(), Some("ada-secret-123"));
-        assert_eq!(fx.get_secret("p-bob", "TOKEN").as_deref(), Some("bob-token-456"));
+        assert_eq!(
+            fx.get_secret("p-ada", "API_KEY").as_deref(),
+            Some("ada-secret-123")
+        );
+        assert_eq!(
+            fx.get_secret("p-bob", "TOKEN").as_deref(),
+            Some("bob-token-456")
+        );
     }
 
     #[tokio::test]
@@ -753,7 +867,9 @@ mod tests {
 
         // Create valid KEK and stores
         let mut conn = fx.pool.acquire().await.unwrap();
-        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn).await.unwrap();
+        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn)
+            .await
+            .unwrap();
         drop(conn);
 
         fx.create_store("p-ada", &[("SECRET", "value-1")]);
@@ -776,7 +892,9 @@ mod tests {
     async fn rotate_twice_in_a_row() {
         let fx = TestFixture::new().await;
         let mut conn = fx.pool.acquire().await.unwrap();
-        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn).await.unwrap();
+        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn)
+            .await
+            .unwrap();
         drop(conn);
 
         fx.create_store("p-ada", &[("KEY", "secret-value")]);
@@ -786,13 +904,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary1.stores_rotated, 1);
-        assert_eq!(fx.get_secret("p-ada", "KEY").as_deref(), Some("secret-value"));
+        assert_eq!(
+            fx.get_secret("p-ada", "KEY").as_deref(),
+            Some("secret-value")
+        );
 
         // Second rotation immediately after
         let summary2 = execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
             .await
             .unwrap();
         assert_eq!(summary2.stores_rotated, 1);
-        assert_eq!(fx.get_secret("p-ada", "KEY").as_deref(), Some("secret-value"));
+        assert_eq!(
+            fx.get_secret("p-ada", "KEY").as_deref(),
+            Some("secret-value")
+        );
+    }
+
+    fn kek_bytes(fx: &TestFixture) -> Vec<u8> {
+        fs::read(SecretsKek::path(&fx.root.operator_dir())).unwrap()
+    }
+
+    async fn fixture_with_kek() -> TestFixture {
+        let fx = TestFixture::new().await;
+        let mut conn = fx.pool.acquire().await.unwrap();
+        let _ = SecretsKek::load_or_create(&fx.root, KekOwner::Any, &mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        fx
+    }
+
+    #[tokio::test]
+    async fn each_rotation_replaces_the_kek() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("KEY", "secret-value")]);
+        let before = kek_bytes(&fx);
+        execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
+            .await
+            .unwrap();
+        let after_one = kek_bytes(&fx);
+        execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
+            .await
+            .unwrap();
+        let after_two = kek_bytes(&fx);
+        assert_ne!(before, after_one);
+        assert_ne!(after_one, after_two);
+        assert_eq!(
+            fx.get_secret("p-ada", "KEY").as_deref(),
+            Some("secret-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_kek_rolls_back_and_leaves_stores_untouched() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("SECRET", "value-1")]);
+        let kek_path = SecretsKek::path(&fx.root.operator_dir());
+        let original = kek_bytes(&fx);
+        let envelope = fx
+            .root
+            .principals_dir()
+            .join("p-ada/data/secrets/envelope.json");
+        let envelope_before = fs::read(&envelope).unwrap();
+
+        // A well-formed KEK that is not the one the stores were wrapped under.
+        write_kek_file(&kek_path, &[7u8; KEY_LEN]).unwrap();
+        let err = execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("rolled back"), "{err:#}");
+
+        assert!(!fx.root.operator_dir().join(JOURNAL_FILENAME).exists());
+        assert!(!fx.root.operator_dir().join(NEXT_KEK_FILENAME).exists());
+        assert_eq!(fs::read(&envelope).unwrap(), envelope_before);
+
+        // Put the right KEK back: the store still opens.
+        fs::write(&kek_path, original).unwrap();
+        assert_eq!(fx.get_secret("p-ada", "SECRET").as_deref(), Some("value-1"));
+    }
+
+    #[tokio::test]
+    async fn failure_mid_rotation_moves_finished_stores_back() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
+        fx.create_store("p-bob", &[("TOKEN", "bob-token-456")]);
+        let before = kek_bytes(&fx);
+        // p-ada is re-wrapped first; p-bob's envelope then fails to parse.
+        let bob_envelope = fx
+            .root
+            .principals_dir()
+            .join("p-bob/data/secrets/envelope.json");
+        fs::write(&bob_envelope, b"{}").unwrap();
+
+        let err = execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rolled back (1 store"),
+            "{err:#}"
+        );
+
+        assert_eq!(kek_bytes(&fx), before);
+        assert!(!fx.root.operator_dir().join(JOURNAL_FILENAME).exists());
+        assert!(!fx.root.operator_dir().join(NEXT_KEK_FILENAME).exists());
+        assert_eq!(
+            fx.get_secret("p-ada", "API_KEY").as_deref(),
+            Some("ada-secret-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_between_the_kek_renames_resumes() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
+
+        let err = execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::DuringSwap)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated crash"));
+        let op = fx.root.operator_dir();
+        assert!(!SecretsKek::path(&op).exists());
+        assert!(op.join(NEXT_KEK_FILENAME).exists());
+        assert!(op.join(OLD_KEK_FILENAME).exists());
+
+        let summary = execute_or_resume(&fx.root, KekOwner::Any, "cli", CrashSimulation::None)
+            .await
+            .unwrap();
+        assert!(summary.was_resumed);
+        assert_eq!(
+            fx.get_secret("p-ada", "API_KEY").as_deref(),
+            Some("ada-secret-123")
+        );
+        assert!(!op.join(JOURNAL_FILENAME).exists());
+        assert!(!op.join(NEXT_KEK_FILENAME).exists());
+        assert!(!op.join(OLD_KEK_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn the_old_kek_stays_until_the_rewrap_verifies() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
+        let before = kek_bytes(&fx);
+
+        execute_or_resume(
+            &fx.root,
+            KekOwner::Any,
+            "cli",
+            CrashSimulation::BeforeFinalizing,
+        )
+        .await
+        .unwrap_err();
+        // Verified but not swapped: the current KEK is still the old one.
+        assert_eq!(kek_bytes(&fx), before);
+        assert!(fx.root.operator_dir().join(NEXT_KEK_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn boot_resume_records_one_audit_row() {
+        let fx = fixture_with_kek().await;
+        fx.create_store("p-ada", &[("API_KEY", "ada-secret-123")]);
+        execute_or_resume(
+            &fx.root,
+            KekOwner::Any,
+            "cli",
+            CrashSimulation::BeforeFinalizing,
+        )
+        .await
+        .unwrap_err();
+
+        let summary = resume_if_interrupted_as(&fx.root, &fx.pool, KekOwner::Any)
+            .await
+            .unwrap()
+            .expect("a pending journal resumes");
+        assert!(summary.was_resumed);
+        assert_eq!(
+            fx.get_secret("p-ada", "API_KEY").as_deref(),
+            Some("ada-secret-123")
+        );
+        assert!(resume_if_interrupted_as(&fx.root, &fx.pool, KekOwner::Any)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut conn = fx.pool.acquire().await.unwrap();
+        let has_chain: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        if has_chain {
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_events WHERE kind = 'secrets.kek_rotated'",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+            assert!(rows <= 1, "boot resume wrote {rows} audit rows");
+        }
     }
 }

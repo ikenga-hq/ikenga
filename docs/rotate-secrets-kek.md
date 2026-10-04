@@ -72,3 +72,5 @@ sudo -E ikenga-server secrets rotate-kek
 If the rotation process is interrupted mid-flight (for example, due to power failure or server restart):
 - The server will automatically detect the journal file at startup and resume the rotation to completion before launching any user sessions.
 - Alternatively, running `ikenga-server secrets rotate-kek` again will resume from the last completed store recorded in the journal.
+
+If a store cannot be re-wrapped (for example, the current KEK is not the one the stores were wrapped under, or a store file is damaged), the command moves every store it already finished back under the current KEK, removes the journal and the unused new key, and exits with an error. The current KEK and every store are left as they were. If moving a store back also fails, the journal is kept and a later run finishes the rotation.

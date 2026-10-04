@@ -868,7 +868,8 @@ async fn run_secrets(args: SecretsArgs) -> anyhow::Result<()> {
     let root = OperatorRoot::new(data_dir)?;
     match args.command {
         SecretsCommand::RotateKek => {
-            let summary = execute_or_resume(&root, KekOwner::Root, "cli", CrashSimulation::None).await?;
+            let summary =
+                execute_or_resume(&root, KekOwner::Root, "cli", CrashSimulation::None).await?;
             if summary.was_resumed {
                 println!(
                     "Resumed and completed secrets KEK rotation: {} stores re-wrapped.",
