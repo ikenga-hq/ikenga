@@ -8,7 +8,6 @@
 //! `#[cfg(feature = "desktop")]` — gate any new one the same way unless the
 //! daemon actually runs it.
 
-#[cfg(feature = "desktop")]
 pub mod activity_bar;
 #[cfg(feature = "desktop")]
 pub mod companion_panels;
@@ -33,12 +32,10 @@ pub mod settings;
 #[cfg(feature = "desktop")]
 pub mod sidecars;
 pub mod ui_routes;
-#[cfg(feature = "desktop")]
 pub mod views;
 #[cfg(feature = "desktop")]
 pub mod widgets;
 
-#[cfg(feature = "desktop")]
 pub use activity_bar::{ActivityBarBadge, ActivityBarRegistry};
 #[cfg(feature = "desktop")]
 pub use companion_panels::CompanionPanelsRegistry;
@@ -63,7 +60,6 @@ pub use settings::SettingsRegistry;
 #[cfg(feature = "desktop")]
 pub use sidecars::SidecarsRegistry;
 pub use ui_routes::UiRoutesRegistry;
-#[cfg(feature = "desktop")]
 pub use views::ViewsRegistry;
 #[cfg(feature = "desktop")]
 pub use widgets::WidgetsRegistry;

@@ -63,6 +63,9 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("list_skill_actions", req!(shared[Files])),
     ("list_all_skill_actions", req!(shared[Files])),
     ("pkg_settings_get", req!(shared[Files])),
+    ("pkg_activity_bar_set_badge", req!(shared[Files])),
+    ("pkg_trust_list_pending", req!(shared[Files])),
+    ("pkg_is_trusted_for_elevated", req!(shared[Files])),
     // ── secrets ──
     ("secrets_get", req!(owner[Secrets])),
     ("secrets_get_scoped", req!(owner[Secrets])),

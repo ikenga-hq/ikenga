@@ -398,6 +398,16 @@ async function checkSqliteTableScope(pkgId: string, targets: string[]): Promise<
 	return null;
 }
 
+/** Whether an RPC error means the server doesn't run this command (the
+ *  browser client), as opposed to the command itself failing. */
+export function isUnavailableOnServer(msg: string): boolean {
+	return (
+		msg.includes('not implemented in headless daemon') ||
+		msg.includes('not supported') ||
+		msg.includes('unknown command')
+	);
+}
+
 // Exported for unit tests (the verb's scope-gate + confirm + decline
 // branches). Not part of the pkg-facing API — callers go through the
 // AppBridge `oncalltool` path below.
@@ -419,10 +429,18 @@ export async function dispatchHostCall(
 		const stdin = typeof args.stdin === 'string' ? args.stdin : undefined;
 		const timeoutSecs = typeof args.timeoutSecs === 'number' ? args.timeoutSecs : undefined;
 
-		const result = await pkgSidecarCall(pkgId, sidecar, callArgs, {
-			stdin,
-			timeoutSecs,
-		});
+		let result: Awaited<ReturnType<typeof pkgSidecarCall>>;
+		try {
+			result = await pkgSidecarCall(pkgId, sidecar, callArgs, {
+				stdin,
+				timeoutSecs,
+			});
+		} catch (e) {
+			const msg = (e as Error)?.message ?? String(e);
+			return errResult(
+				`host.pkgSidecarCall: ${isUnavailableOnServer(msg) ? 'not available in the browser yet' : msg}`
+			);
+		}
 
 		if (!result.ok) {
 			return {
@@ -1514,7 +1532,21 @@ export function PkgIframeHostInner({
 				if (params.name.startsWith('host.')) {
 					return await dispatchHostCall(pkgId, params.name, params.arguments ?? {});
 				}
-				const result = await pkgMcpCall(pkgId, params.name, params.arguments ?? {});
+				let result: Awaited<ReturnType<typeof pkgMcpCall>>;
+				try {
+					result = await pkgMcpCall(pkgId, params.name, params.arguments ?? {});
+				} catch (e) {
+					const msg = (e as Error)?.message ?? String(e);
+					return {
+						content: [
+							{
+								type: 'text' as const,
+								text: isUnavailableOnServer(msg) ? 'not available in the browser yet' : msg,
+							},
+						],
+						isError: true,
+					};
+				}
 				if (!result.ok) {
 					// The MCP call failed at the host; surface as an MCP-level tool
 					// error so the iframe can render appropriately.

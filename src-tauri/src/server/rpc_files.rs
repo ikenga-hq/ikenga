@@ -359,10 +359,20 @@ pub(super) async fn action_git_branch(state: &AppState, args: &Value) -> RpcResp
 /// caller hands back.
 pub(super) fn pkg_preview_manifest(state: &AppState, args: &Value) -> RpcResponse {
     use super::shared::pkg_workspace;
+    use std::path::Path;
     let r = (|| {
         let install_path: String = targ(args, &["installPath", "install_path"])?;
         if install_path.is_empty() {
             return Err("`installPath` is required".to_string());
+        }
+        let target_path = Path::new(&install_path);
+        if let Some(installed) = state
+            .pkg_index
+            .installed()
+            .iter()
+            .find(|s| Path::new(&s.install_path) == target_path)
+        {
+            return pkg_workspace::preview_manifest(Path::new(&installed.install_path));
         }
         fs_boundary(state)?;
         let dir = state.path_guard.resolve(&install_path)?;

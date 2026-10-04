@@ -490,6 +490,45 @@ pub async fn rpc_handler(
             let store = crate::pkg::skill_actions::store_root();
             RpcResponse::success(state.pkg_index.all_skill_actions(store.as_deref()))
         }
+        "pkg_activity_bar_set_badge" => {
+            let pkg_id = payload
+                .args
+                .get("pkgId")
+                .or_else(|| payload.args.get("pkg_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if pkg_id.is_empty() {
+                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+            }
+            // Absent or null clears the badge; anything else must parse.
+            let badge: Option<crate::pkg::registries::ActivityBarBadge> =
+                match payload.args.get("badge").filter(|v| !v.is_null()) {
+                    None => None,
+                    Some(v) => match serde_json::from_value(v.clone()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            return Json(RpcResponse::error(format!(
+                                "pkg_activity_bar_set_badge: invalid `badge`: {e}"
+                            )))
+                        }
+                    },
+                };
+            // Kept in memory and reported through `pkg_kernel_status`'s
+            // `activity_bar` registry; the server has no desktop event to emit.
+            match state.pkg_index.set_badge(pkg_id, badge) {
+                Ok(true) => RpcResponse::success(()),
+                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Err(e) => RpcResponse::error(format!("{e:#}")),
+            }
+        }
+        // The server has no install-time trust gate, so nothing is ever
+        // parked for a capability review.
+        "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
+        // desktop only, and the server runs neither, so the answer here is
+        // always no: the app reports the capability as unavailable instead
+        // of failing on an unknown command.
+        "pkg_is_trusted_for_elevated" => RpcResponse::success(false),
 
         // --- Secrets & Vault Commands (G-30; per-principal store, WP-21) ---
         //
