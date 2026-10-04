@@ -1,5 +1,11 @@
 # ikenga-desktop
 
+## 0.19.3
+
+### Patch Changes
+
+- 9159f71: Release builds now attach the server tarballs correctly.
+
 ## 0.19.2
 
 ### Patch Changes
