@@ -1,5 +1,11 @@
 # ikenga-desktop
 
+## 0.19.4
+
+### Patch Changes
+
+- f626f56: Release builds sign and attach the server tarballs.
+
 ## 0.19.3
 
 ### Patch Changes
