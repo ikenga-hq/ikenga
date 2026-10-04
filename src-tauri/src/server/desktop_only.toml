@@ -279,10 +279,6 @@ reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same
 tag = "desktop-only-forever"
 reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
 
-[pkg_activity_bar_set_badge]
-tag = "WP-19"
-reason = "Mutates in-memory ActivityBarRegistry badge state + emits an event; data-only, no native UI or spawn."
-
 [pkg_content_url]
 tag = "WP-19"
 reason = "server.mint(&pkg_id) allocates a token/URL on the desktop pkg_content server; the daemon mounts via pkg_content_html."
@@ -326,10 +322,6 @@ reason = "Downloads/untars then calls materialize_npm_deps + kernel.install_from
 [pkg_invoke]
 tag = "WP-18b"
 reason = "Plan §j spawn-site table: pkg_invoke runs a manifest-declared one-shot CLI; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[pkg_is_trusted_for_elevated]
-tag = "WP-19"
-reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §k names trust.rs as Tauri-only logic pending WP-19, not multi-user."
 
 [pkg_mcp_call]
 tag = "WP-18b"
@@ -382,10 +374,6 @@ reason = "Resolves the pkg via kernel.installed_summary() and reloads its instal
 [pkg_trust_list]
 tag = "WP-19"
 reason = "Walks kernel.list_installed() and evaluates each pkg against its trust row + app_data_dir; the daemon has no kernel install registry, so it would answer an empty list that reads as \"nothing needs trust\"."
-
-[pkg_trust_list_pending]
-tag = "WP-19"
-reason = "Walks kernel.list_installed() + cap_snapshot rows for capability diffs parked for review; the daemon has no kernel install registry or install-time trust gate, so there is nothing to park. Every FE call site catches the error."
 
 [pkg_trust_preview]
 tag = "WP-19"
