@@ -1,5 +1,15 @@
 # ikenga-desktop
 
+## 0.19.2
+
+### Patch Changes
+
+- e52aafd: Installed apps such as Studio, Tasks and Sales now open in the remote browser client. The server reports app views and rail entries, answers the app trust and badge calls, and lets the browser load an app's own files with a short-lived cookie that only works under `/pkgs` and never contains the server token. App features that run local processes (sidecars, MCP tools, host fetch) report that they aren't available in the browser yet.
+- 4ed6dc4: Pin the engine icon library to a release that matches the pinned UI kit, so a fresh install no longer pulls an incompatible newer version and breaks the build.
+- 9187a09: Add `secrets rotate-kek` subcommand to rotate the secrets key-encryption key on multi-user servers.
+- 4963356: `ikenga-server` gains a `supervise` subcommand for hosts without systemd, such as a container. Run `ikenga-server supervise -- <server flags>` as the container's entrypoint: the server becomes its child and is started again whenever it exits, and `SIGHUP` restarts it on purpose. Detached agent runs are never signalled, so they survive a server crash or restart the way they already do under the systemd unit, and the server picks their status back up when it returns. The supervisor also reaps orphaned processes, so a finished run never lingers as a zombie. `SIGTERM` stops the server and then the supervisor. Stopping the whole container still ends every run inside it. An end-to-end test covers a crash, a requested restart, the reap and a clean stop.
+- cd25a7d: Installing from the Store now shows what is happening: the Install button turns into a progress row that names each step (downloading, verifying, extracting, installing dependencies, registering, starting services) with a bar, and you can cancel before the app registers. Several installs, and Update all, each show their own progress. When an install fails you get a short explanation with a next step, such as running out of disk space or a network problem, plus Retry and a "Show details" view with the cleaned-up log and the npm log path. A failed install no longer leaves a half-installed folder behind. Apps that ask to be pinned on install now appear on the rail again.
+
 ## 0.19.1
 
 ### Patch Changes
