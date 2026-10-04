@@ -15,7 +15,7 @@ inputs:
     required: false
     default: server-bin
   expect-version:
-    description: Version `ikenga-server --version` must print. Defaults to the crate version.
+    description: Version `ikenga-server --version` must print. A leading `v` is ignored. Defaults to the crate version.
     required: false
     default: ''
   cache-save:
@@ -63,6 +63,9 @@ runs:
         EXPECT_VERSION: ${{ inputs.expect-version }}
       run: |
         set -euo pipefail
+        # Callers may pass a git tag (v0.19.3); the binary prints the bare
+        # version (0.19.3). Ignore a leading "v" so either form is accepted.
+        EXPECT_VERSION="${EXPECT_VERSION#v}"
         args=(build "$ARCH" --out "$GITHUB_WORKSPACE/$OUT_DIR")
         if [ -n "$EXPECT_VERSION" ]; then args+=(--expect-version "$EXPECT_VERSION"); fi
         scripts/server/package-server.sh "${args[@]}"
