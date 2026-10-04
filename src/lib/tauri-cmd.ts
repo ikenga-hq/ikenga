@@ -3064,6 +3064,17 @@ export interface PkgInstallFromRegistryArgs {
 	 * host capabilities.
 	 */
 	publisherKey?: string | null;
+	/** Tags this install's `pkg-install://progress` events and is the handle
+	 *  `pkgInstallCancel` takes. Defaults to `pkgId` on the Rust side. */
+	installId?: string;
+}
+
+/** What a cancel request got: `requested` (it stops at its next check and
+ *  cleans up), `too_late` (already registering), or `not_running`. */
+export type PkgInstallCancelOutcome = 'requested' | 'too_late' | 'not_running';
+
+export async function pkgInstallCancel(installId: string): Promise<PkgInstallCancelOutcome> {
+	return invoke<PkgInstallCancelOutcome>('pkg_install_cancel', { installId });
 }
 
 export async function pkgInstallFromRegistry(

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -41,12 +42,32 @@ pub enum Command {
     Probe(ProbeArgs),
     /// Manage server secrets and rotate the key-encryption key (root only).
     Secrets(SecretsArgs),
+    /// Run the server under a minimal init, for hosts without systemd (a
+    /// container). The server becomes this process's child and is restarted
+    /// whenever it exits, so detached agent runs survive a server restart;
+    /// orphans are reaped. SIGHUP restarts the server, SIGTERM stops both.
+    /// Pass the server's own flags after `--`, e.g.
+    /// `ikenga-server supervise -- --host 0.0.0.0 --data-dir /data`.
+    /// Linux-only.
+    Supervise(SuperviseArgs),
     /// Internal: the §8 test-drop child (spawned by the probe as the probe uid).
     #[command(name = "__t1-probe-child", hide = true)]
     T1ProbeChild,
     /// Internal: the §7.3 uid-wide kill (spawned as the principal's uid).
     #[command(name = "__t1-kill-all", hide = true)]
     T1KillAll,
+}
+
+#[derive(Args, Debug)]
+pub struct SuperviseArgs {
+    /// The flags to run the server with, exactly as `ikenga-server` alone
+    /// would take them. Checked before anything starts.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "SERVER_FLAGS"
+    )]
+    pub server: Vec<OsString>,
 }
 
 #[derive(Args, Debug)]
@@ -369,12 +390,27 @@ pub struct ServeArgs {
     pub expected_uid: Option<u32>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let cli = CliArgs::parse();
+    // `supervise` runs before any async runtime exists: it blocks its
+    // signals and takes them synchronously, which needs a single-threaded
+    // process (`server::supervisor`). It also keeps the environment intact —
+    // every server it starts needs `IKENGA_AUTH_TOKEN` and the rest, which
+    // each one strips from itself.
+    if let Some(Command::Supervise(args)) = &cli.command {
+        std::process::exit(supervise(args));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cli))
+}
+
+async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
     let CliArgs {
         command,
         serve: args,
-    } = CliArgs::parse();
+    } = cli;
 
     // The internal entries run as a dropped principal uid, with a cleared
     // environment: no logging setup, nothing else — check, report, exit.
@@ -453,7 +489,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Probe(probe)) => std::process::exit(run_probe(probe).await),
         Some(Command::Audit(audit)) => std::process::exit(run_audit(audit).await),
         Some(Command::Secrets(secrets)) => return run_secrets(secrets).await,
-        Some(Command::T1ProbeChild | Command::T1KillAll) => unreachable!("handled above"),
+        Some(Command::T1ProbeChild | Command::T1KillAll | Command::Supervise(_)) => {
+            unreachable!("handled above")
+        }
         None => {}
     }
 
@@ -499,6 +537,50 @@ async fn main() -> anyhow::Result<()> {
     };
 
     run_server_with(config, t1).await
+}
+
+/// `ikenga-server supervise -- <server flags>` → exit code.
+fn supervise(args: &SuperviseArgs) -> i32 {
+    if let Err(e) = check_supervised_flags(&args.server) {
+        eprintln!("supervise: {e}");
+        return 2;
+    }
+    // Logs go to stdout beside the server's own, as `serve` does.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,ikenga_server=debug".into());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    // Re-exec by the path this process was started with, not
+    // /proc/self/exe: after an upgrade replaces the binary on disk, the next
+    // restart (SIGHUP) then runs the new one.
+    let program = std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("ikenga-server"));
+    let opts =
+        ikenga_desktop_lib::server::supervisor::SuperviseOptions::new(program, args.server.clone());
+    ikenga_desktop_lib::server::supervisor::run(&opts)
+}
+
+/// The supervised flags must start a server: they parse as `ikenga-server`'s
+/// own (environment included), name no subcommand and no internal mode. A
+/// typo fails here once instead of in a restart loop.
+fn check_supervised_flags(server: &[OsString]) -> Result<(), String> {
+    let cli = CliArgs::try_parse_from(
+        std::iter::once(OsString::from("ikenga-server")).chain(server.iter().cloned()),
+    )
+    .map_err(|e| e.to_string())?;
+    if cli.command.is_some() {
+        return Err("takes the server's own flags, not a subcommand".into());
+    }
+    if cli.serve.principal_child {
+        return Err("--principal-child is internal to the multi-user server".into());
+    }
+    Ok(())
 }
 
 /// Exit with the internal entry's verdict: 0, or 1 with the reason on stderr.
@@ -1200,6 +1282,66 @@ mod tests {
         // P-15: the invite TTL tops out at 30 days.
         assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "31"]).is_err());
         assert!(CliArgs::try_parse_from(["ikenga-server", "--invite-ttl", "0"]).is_err());
+    }
+
+    #[test]
+    fn supervise_takes_the_server_flags_after_a_double_dash() {
+        let args = CliArgs::try_parse_from([
+            "ikenga-server",
+            "supervise",
+            "--",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "4000",
+            "--data-dir",
+            "/opt/ikenga/data",
+        ])
+        .unwrap();
+        let Some(Command::Supervise(s)) = args.command else {
+            panic!("not supervise")
+        };
+        let flags: Vec<_> = s.server.iter().map(|f| f.to_str().unwrap()).collect();
+        assert_eq!(
+            flags,
+            [
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "4000",
+                "--data-dir",
+                "/opt/ikenga/data"
+            ]
+        );
+        check_supervised_flags(&s.server).expect("valid server flags");
+
+        // No flags at all is a plain default server.
+        let args = CliArgs::try_parse_from(["ikenga-server", "supervise"]).unwrap();
+        let Some(Command::Supervise(s)) = args.command else {
+            panic!("not supervise")
+        };
+        assert!(s.server.is_empty());
+        check_supervised_flags(&s.server).expect("defaults");
+    }
+
+    #[test]
+    fn supervise_refuses_flags_that_would_not_start_a_server() {
+        let flags = |f: &[&str]| f.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(check_supervised_flags(&flags(&["--no-such-flag"])).is_err());
+        assert!(check_supervised_flags(&flags(&["--port", "not-a-port"])).is_err());
+        let sub = check_supervised_flags(&flags(&["accounts", "list"])).unwrap_err();
+        assert!(sub.contains("subcommand"), "{sub}");
+        let nested = check_supervised_flags(&flags(&["supervise"])).unwrap_err();
+        assert!(nested.contains("subcommand"), "{nested}");
+        let child = check_supervised_flags(&flags(&[
+            "--executor-tier",
+            "t1",
+            "--principal-child",
+            "--expected-uid",
+            "20001",
+        ]))
+        .unwrap_err();
+        assert!(child.contains("internal"), "{child}");
     }
 
     #[test]

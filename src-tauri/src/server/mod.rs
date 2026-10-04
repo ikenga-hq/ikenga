@@ -44,6 +44,9 @@ mod rpc_local;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
+/// `ikenga-server supervise`: a minimal init that keeps detached runs alive
+/// across server restarts where there is no systemd (containers). Linux-only.
+pub mod supervisor;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
