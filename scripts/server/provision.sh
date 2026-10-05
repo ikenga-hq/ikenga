@@ -128,7 +128,6 @@ validate_profile() {
     # trusted operator with the bearer token as the sole gate. Refuse it.
     [[ "$TIER" == t1 ]] || die "PERIMETER=public-https requires TIER=t1 (a single shared bearer token must not be the only gate on a public host)"
     [[ -n "$PUBLIC_HOST" ]] || die "PERIMETER=public-https requires PUBLIC_HOST"
-    [[ -n "$ACME_EMAIL" ]] || die "PERIMETER=public-https requires ACME_EMAIL"
   else
     [[ -n "$TS_AUTHKEY_FILE" ]] || die "PERIMETER=tailnet requires TS_AUTHKEY_FILE (a file holding a Tailscale auth key; never pass it in argv)"
     [[ -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
@@ -311,9 +310,17 @@ perimeter_public() {
   # Request body cap and security headers. The daemon has no trusted-proxy
   # setting yet (WP-P4): it sees 127.0.0.1 for every client, so per-IP rate
   # limits belong here, not in the daemon, until that lands.
-  local conf="$PUBLIC_HOST {
+  local conf=""
+  [[ -n "$ACME_EMAIL" ]] && conf="{
+	email $ACME_EMAIL
+}
+
+"
+  conf+="$PUBLIC_HOST {
 	encode zstd gzip
-	request_body { max_size 12MB }
+	request_body {
+		max_size 12MB
+	}
 	header {
 		Strict-Transport-Security \"max-age=31536000; includeSubDomains\"
 		X-Content-Type-Options nosniff
@@ -473,11 +480,13 @@ install_service() {
     fi
   fi
   systemctl daemon-reload
+  local was_active=0
+  systemctl is-active --quiet "$svc" && was_active=1
   systemctl enable --now "$svc"
   # `enable --now` leaves an already-running service on the OLD binary, so an
   # upgrade (bumped VERSION) must restart it explicitly. This ends open
   # terminals (T1 keeps detached chi-runners via KillMode=process).
-  if [[ $BINARY_CHANGED -eq 1 ]] && systemctl is-active --quiet "$svc"; then
+  if [[ $BINARY_CHANGED -eq 1 && $was_active -eq 1 ]]; then
     systemctl restart "$svc"
     changed "service $svc restarted onto $VERSION (open terminals ended)"
   else
