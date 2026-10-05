@@ -314,7 +314,8 @@ export async function dispatchToSeat(
 	// engine with no terminal wrap (Rust grants none there either, E-1), so a
 	// claim can't be left behind by a path T that can't run.
 	const cachedEngine = cachedSeat(seatId)?.engine_id;
-	const claimResume = cachedEngine === undefined || WRAP_ENGINE_FOR_CHI[cachedEngine] !== undefined;
+	const claimResume =
+		cachedEngine === undefined || WRAP_ENGINE_FOR_CHI[cachedEngine] !== undefined;
 	let route: SeatRoute;
 	try {
 		route = await seatsResolve({ seatId }, opts.takeover ? { ...actor, takeover: true } : actor, {
@@ -413,11 +414,7 @@ export function seatResumingText(name: string | null): string {
 
 /** *Take over*: repeat the send with `takeover: true`; on success the
  *  dispatch input (still holding the refused text) is cleared. */
-async function takeOverAndSend(
-	seatId: string,
-	text: string,
-	context?: DispatchContext
-): Promise<void> {
+async function takeOverAndSend(seatId: string, text: string, context?: DispatchContext): Promise<void> {
 	try {
 		await dispatchToSeat(seatId, text, context, { takeover: true });
 		const { useCompanionStore } = await import('./companion-store');
@@ -433,18 +430,12 @@ async function takeOverAndSend(
  * the seat is resumable, new otherwise — with the text as its initial
  * positional prompt, then bind it with `seatsMove` and the claim.
  */
-async function sendPathT(
-	route: VacantRoute,
-	claim: string,
-	text: string,
-	context?: DispatchContext
-) {
+async function sendPathT(route: VacantRoute, claim: string, text: string, context?: DispatchContext) {
 	const seat = route.seat;
 	const engine = WRAP_ENGINE_FOR_CHI[seat.engine_id];
 	// Unreachable under E-1 (Rust grants a claim only for a wrap engine); the
 	// claim then lapses by itself after 30 s.
-	if (!engine)
-		throw new Error(`@${seat.name}'s engine (${seat.engine_id}) can't run in a terminal`);
+	if (!engine) throw new Error(`@${seat.name}'s engine (${seat.engine_id}) can't run in a terminal`);
 	const previous = seat.session;
 	const resumeId = route.resume.resumable ? (previous?.external_id ?? null) : null;
 	const cwd = previous?.cwd ?? useShellStore.getState().activeProject.root_path ?? null;
@@ -589,12 +580,7 @@ export async function occupyVacantSeat(
 			actor,
 			route.claim ? { claim: route.claim } : undefined
 		);
-		return {
-			seat: moved.seat,
-			terminalId,
-			outcome: resumeId ? 'resumed' : 'filled',
-			previous: from,
-		};
+		return { seat: moved.seat, terminalId, outcome: resumeId ? 'resumed' : 'filled', previous: from };
 	} catch (err) {
 		throw new Error(errorText(err));
 	} finally {
@@ -647,11 +633,7 @@ async function spawnSeatTerminal(opts: {
 	if (opts.numberAs) aliasSessionNumber(id, opts.numberAs);
 	const cwd = opts.cwd ?? activeProjectCwd();
 	const wrap = seatWrapOpts({ engine: opts.engine, prompt: opts.prompt, cwd, role: opts.role });
-	const cmd = buildAgentWrappedCmd({
-		...wrap,
-		terminalId: id,
-		resumeSessionId: opts.resumeSessionId,
-	});
+	const cmd = buildAgentWrappedCmd({ ...wrap, terminalId: id, resumeSessionId: opts.resumeSessionId });
 	useTerminalStore.getState().add({ cwd, cmd, wrap }, opts.title, id);
 	const withResume = (tab: TerminalTab): TerminalTab =>
 		tab.id === id ? { ...tab, claudeSessionId: opts.resumeSessionId } : tab;
