@@ -191,6 +191,18 @@ describe('awaitingFirstToken', () => {
 		expect(second.awaitingFirstToken()).toBe(false);
 	});
 
+	it('is false for a T1 cookie session, which has no token by design', async () => {
+		const { awaitingFirstToken } = await freshModule();
+		// Same registry as `./index` just imported (no reset in between).
+		const { __setT1SessionForTests } = await import('./t1-session');
+		__setT1SessionForTests(true, null);
+		try {
+			expect(awaitingFirstToken()).toBe(false);
+		} finally {
+			__setT1SessionForTests(false, null);
+		}
+	});
+
 	it('is never true under Tauri, where there is no token to wait for', async () => {
 		(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
 		const { awaitingFirstToken } = await freshModule();

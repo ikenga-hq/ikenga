@@ -407,7 +407,9 @@ export function isRemoteWebSession(): boolean {
  * instead. Not for tests or harnesses: only `bootPrimary` calls it.
  */
 export function awaitingFirstToken(): boolean {
-	return !isTauri() && getAuthToken() === null;
+	// A T1 password session and a paired device authenticate by cookie, so
+	// "no token" is their normal state, not a first visit.
+	return !isTauri() && getAuthToken() === null && !isT1Session() && !isDeviceSession();
 }
 
 export function getTransport(): RpcTransport {
