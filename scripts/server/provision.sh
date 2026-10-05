@@ -42,7 +42,9 @@ log()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 CHANGES=()
-changed() { CHANGES+=("$*"); }
+changed() {
+  if [[ $DRY_RUN -eq 1 ]]; then CHANGES+=("would: $*"); else CHANGES+=("$*"); fi
+}
 
 # Run a mutating command, or just print it under --dry-run. Reads are never
 # wrapped: a dry run must still be able to look at the host.
@@ -100,7 +102,9 @@ preflight() {
   log "Preflight"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
   [[ "$(uname -s)" == Linux ]] || die "Linux only"
-  command -v systemctl >/dev/null || die "systemd is required"
+  if ! command -v systemctl >/dev/null; then
+    [[ $DRY_RUN -eq 1 ]] && note "WARNING: systemd not found (tolerated in --dry-run only)" || die "systemd is required"
+  fi
 
   case "$(uname -m)" in
     x86_64) ARCH=amd64 ;;
@@ -108,11 +112,14 @@ preflight() {
     *) die "unsupported architecture $(uname -m)" ;;
   esac
 
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
+  # Read os-release in a subshell: sourcing it into this shell would clobber
+  # profile variables (it defines VERSION, ID, NAME, ...).
+  local os_id os_pretty
+  os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  os_pretty="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-$os_id}")"
+  case "$os_id" in
     ubuntu|debian) ;;
-    *) die "only Debian and Ubuntu are supported (got ${ID:-unknown})" ;;
+    *) die "only Debian and Ubuntu are supported (got ${os_id:-unknown})" ;;
   esac
 
   local glibc; glibc="$(ldd --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+$' || true)"
@@ -132,7 +139,7 @@ preflight() {
   if [[ "$PERIMETER" == public-https ]] && ss -ltn 2>/dev/null | grep -qE ':(80|443)\s' && ! systemctl is-active --quiet caddy 2>/dev/null; then
     die "port 80/443 is already in use; Caddy needs both for ACME"
   fi
-  note "os=${PRETTY_NAME:-$ID} arch=$ARCH tier=$TIER perimeter=$PERIMETER version=$VERSION"
+  note "os=$os_pretty arch=$ARCH tier=$TIER perimeter=$PERIMETER version=$VERSION"
 }
 
 confirm() {
