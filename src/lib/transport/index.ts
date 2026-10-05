@@ -396,6 +396,22 @@ export function isRemoteWebSession(): boolean {
 	return !isTauri() && (isT1Session() || isDeviceSession() || getAuthToken() !== null);
 }
 
+/**
+ * True for a real browser tab opened on a daemon-served page that holds no
+ * token yet: a first visit, or a visit by a bare URL with no `?token=`.
+ *
+ * The complement of {@link isRemoteWebSession} outside Tauri. It exists
+ * because that function's "no token" answer hands the page to the desktop
+ * transport, whose `invoke` does not exist in a browser, so boot stalls and
+ * the screen stays blank. The boot path uses this to show the connect dialog
+ * instead. Not for tests or harnesses: only `bootPrimary` calls it.
+ */
+export function awaitingFirstToken(): boolean {
+	// A T1 password session and a paired device authenticate by cookie, so
+	// "no token" is their normal state, not a first visit.
+	return !isTauri() && getAuthToken() === null && !isT1Session() && !isDeviceSession();
+}
+
 export function getTransport(): RpcTransport {
 	// T1 and a paired device's cookie are both detected asynchronously at
 	// boot; a desktop transport picked before that (by anything that ran

@@ -125,6 +125,7 @@ function ReauthDialog() {
 	const setTokenInput = useReauthStore((s) => s.setTokenInput);
 	const errorMsg = useReauthStore((s) => s.errorMsg);
 	const reconnect = useReauthStore((s) => s.reconnect);
+	const firstVisit = useReauthStore((s) => s.reason) === 'first-visit';
 
 	const [timeStr, setTimeStr] = useState<string>('');
 	const [loading, setLoading] = useState<boolean>(false);
@@ -171,10 +172,18 @@ function ReauthDialog() {
 		<div className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_78%,transparent)] p-6 backdrop-blur-xs">
 			<div className="w-full max-w-[460px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl">
 				{/* Top bar */}
-				<div className="flex items-center gap-2.5 border-b border-[var(--border-soft)] bg-[var(--danger-soft)] px-5 py-4">
-					<span className="h-2 w-2 flex-none rounded-full bg-[var(--danger)]" />
+				<div
+					className={`flex items-center gap-2.5 border-b border-[var(--border-soft)] px-5 py-4 ${
+						firstVisit ? 'bg-[var(--bg-sunken)]' : 'bg-[var(--danger-soft)]'
+					}`}
+				>
+					<span
+						className={`h-2 w-2 flex-none rounded-full ${
+							firstVisit ? 'bg-[var(--primary)]' : 'bg-[var(--danger)]'
+						}`}
+					/>
 					<h2 className="m-0 text-[length:var(--text-h4)] font-semibold">
-						Session needs re-authenticating
+						{firstVisit ? 'Connect to this Ikenga instance' : 'Session needs re-authenticating'}
 					</h2>
 					<span className="ml-auto font-mono text-[length:var(--text-micro)] text-[var(--fg-faint)]">
 						{timeStr}
@@ -184,8 +193,9 @@ function ReauthDialog() {
 				{/* Body */}
 				<div className="p-5">
 					<p className="mb-4 text-[length:var(--text-body-sm)] text-[var(--fg-muted)] leading-relaxed">
-						The daemon restarted and minted a new token, so this tab's saved one no longer works.
-						Your work is untouched — paste the current token to pick it back up.
+						{firstVisit
+							? 'This instance is protected by an access token. Paste it to connect. It stays in this tab only and is forgotten when the tab closes.'
+							: "The daemon restarted and minted a new token, so this tab's saved one no longer works. Your work is untouched — paste the current token to pick it back up."}
 					</p>
 
 					<div className="flex gap-2">
@@ -210,7 +220,7 @@ function ReauthDialog() {
 							disabled={loading}
 							className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[length:var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50 cursor-pointer"
 						>
-							{loading ? 'Connecting...' : 'Reconnect'}
+							{loading ? 'Connecting...' : firstVisit ? 'Connect' : 'Reconnect'}
 						</button>
 					</div>
 
@@ -220,10 +230,12 @@ function ReauthDialog() {
 
 					<PairModeLink />
 
-					<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[length:var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
-						<b className="text-[var(--live)] font-semibold">Still running on the host</b> — session
-						active. Nothing is lost by reconnecting.
-					</div>
+					{!firstVisit && (
+						<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[length:var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
+							<b className="text-[var(--live)] font-semibold">Still running on the host</b> —
+							session active. Nothing is lost by reconnecting.
+						</div>
+					)}
 				</div>
 			</div>
 		</div>

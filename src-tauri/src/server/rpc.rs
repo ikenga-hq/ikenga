@@ -139,9 +139,14 @@ pub async fn rpc_handler(
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
         "pty_spawn" => {
+            // `terminalId` is what `tauri-cmd.ts` sends (Tauri does the camel -> snake conversion
+            // on the desktop; nothing does it here). `terminal_id` is kept for older callers.
+            // Reading only the snake spelling dropped the id, so a browser terminal got a random
+            // one and could not be found again after a reload.
             let terminal_id = payload
                 .args
-                .get("terminal_id")
+                .get("terminalId")
+                .or_else(|| payload.args.get("terminal_id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let title = payload
@@ -282,73 +287,6 @@ pub async fn rpc_handler(
             match resolve_path(&state, path_str) {
                 Ok(path) => RpcResponse::success(path.exists()),
                 Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_read" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => RpcResponse::success(content),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_write" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let content = payload
-                .args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => {
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    match tokio::fs::write(&path, content).await {
-                        Ok(_) => RpcResponse::success(true),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_list" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let path = match resolve_path(&state, path_str) {
-                Ok(p) => p,
-                Err(e) => return Json(RpcResponse::error(e)),
-            };
-            match std::fs::read_dir(path) {
-                Ok(entries) => {
-                    let items: Vec<serde_json::Value> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|entry| {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                            serde_json::json!({
-                                "name": name,
-                                "is_dir": is_dir,
-                                "path": entry.path().to_string_lossy().into_owned(),
-                            })
-                        })
-                        .collect();
-                    RpcResponse::success(items)
-                }
-                Err(e) => RpcResponse::error(e.to_string()),
             }
         }
         "fs_mkdir" => {
@@ -772,6 +710,9 @@ pub async fn rpc_handler(
         // allowlist), `fs_roots_*` (would let the token holder redefine the
         // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
+        "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
+        "fs_write" => rpc_files::fs_write(&state, &payload.args).await,
+        "fs_list" => rpc_files::fs_list(&state, &payload.args).await,
         "fs_kind" => rpc_files::fs_kind(&state, &payload.args).await,
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
         "fs_search" => rpc_files::fs_search(&state, &payload.args).await,

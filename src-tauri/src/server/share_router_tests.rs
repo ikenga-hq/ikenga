@@ -171,6 +171,15 @@ fn has_cost_key(v: &Value) -> bool {
     }
 }
 
+/// `fs_read` answers the desktop's `{ bytes, mime }` shape, not a bare string.
+fn read_text(resp: &Value) -> String {
+    let bytes: Vec<u8> = resp["data"]["bytes"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|b| b.as_u64().map(|b| b as u8)).collect())
+        .unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[tokio::test]
 async fn the_share_prehook_end_to_end() {
     let c = child().await;
@@ -179,7 +188,7 @@ async fn the_share_prehook_end_to_end() {
 
     // The Owner's own request: the router's guard admits both files.
     let own = call(&c, None, "fs_read", json!({ "path": s(&c.outside) })).await;
-    assert_eq!(own["data"], "the Owner's other file", "{own}");
+    assert_eq!(read_text(&own), "the Owner's other file", "{own}");
 
     // 1. An allowed arm, served on the narrowed guard.
     let read = call(
@@ -190,7 +199,7 @@ async fn the_share_prehook_end_to_end() {
     )
     .await;
     assert_eq!(read["ok"], true, "{read}");
-    assert_eq!(read["data"], "the brief");
+    assert_eq!(read_text(&read), "the brief");
 
     // 2. A path the router's guard admits but the share doesn't: refused.
     let refused = call(
