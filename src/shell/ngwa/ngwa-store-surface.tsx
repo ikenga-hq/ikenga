@@ -15,7 +15,7 @@
 // for the selected row. Rows that haven't been read say so ("permissions not
 // read") rather than guessing.
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, Check, Download, Link2, Search, Shield, ShieldAlert, X } from 'lucide-react';
 import { ErrorState, LoadingState, OfflineState } from '@/components/states';
@@ -30,6 +30,7 @@ import {
 import type { NgwaCatalogRow, NgwaStoreEntry, StoreSource } from '@/lib/ngwa/enrichment';
 import {
 	isNeedsApproval,
+	pkgProjectTarget,
 	type PrimitiveInstallOutcome,
 	type PrimitiveInstallStage,
 } from '@/lib/ngwa/use-store-install';
@@ -64,6 +65,10 @@ import { NgwaTrustSheet } from './ngwa-trust-sheet';
 import './ngwa.css';
 
 import type { StoreInstallScope } from '@/lib/ngwa/use-store-install';
+import { cancelStoreInstall } from '@/lib/ngwa/use-store-install';
+import { classifyInstallError } from '@/lib/ngwa/install-errors';
+import { useInstallRun, type InstallRun } from '@/lib/ngwa/install-progress';
+import { InstallProgressRow } from './install-progress-row';
 
 export type { StoreInstallScope };
 
@@ -90,6 +95,9 @@ export interface NgwaStoreSurfaceProps {
 	loadDetail?: StoreDetailLoader;
 	/** Display name of the active project — the default install target. */
 	activeProjectName?: string;
+	/** Id of the active project. When it is the Default project a pkg has no
+	 *  project target: it installs to personal (DEC-71). */
+	activeProjectId?: string | null;
 	/** Install to a scope. A returned promise drives the foot's "Registering"
 	 *  state; a rejection is shown in the sheet foot. */
 	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void | Promise<unknown>;
@@ -255,6 +263,7 @@ export function NgwaStoreSurface({
 	onRetry,
 	loadDetail,
 	activeProjectName,
+	activeProjectId,
 	onInstall,
 	onUpdate,
 	onUpdateAll,
@@ -323,17 +332,26 @@ export function NgwaStoreSurface({
 		}
 	}
 
+	// The last attempt per entry, so a failed row's Retry repeats it exactly
+	// (same scope for an install).
+	const lastAttempt = useRef<Record<string, () => void>>({});
+	function attempt(entry: NgwaStoreEntry, kind: PendingAction, fn: () => unknown) {
+		const go = () => void runAction(entry, kind, fn);
+		lastAttempt.current[entry.id] = go;
+		go();
+	}
 	const install = onInstall
 		? (entry: NgwaStoreEntry, scope: StoreInstallScope) =>
-				void runAction(entry, 'install', () => onInstall(entry, scope))
+				attempt(entry, 'install', () => onInstall(entry, scope))
 		: undefined;
 	const update = onUpdate
 		? (entry: NgwaStoreEntry) => {
 				// The foot is where progress and failures read, so open the row.
 				selectRow(entry.id);
-				void runAction(entry, 'update', () => onUpdate(entry));
+				attempt(entry, 'update', () => onUpdate(entry));
 			}
 		: undefined;
+	const retry = (entry: NgwaStoreEntry) => lastAttempt.current[entry.id]?.();
 
 	// R57 · Q4: a catalog install moves to its catalog pin. Same pending /
 	// error bookkeeping as a registry update, keyed by the row id.
@@ -485,6 +503,10 @@ export function NgwaStoreSurface({
 	);
 
 	const projectLabel = activeProjectName || 'active project';
+	// DEC-71: pkg scope has no Default project — with Default active a pkg's
+	// target is personal. Primitives keep the project label: Ọba places them
+	// in the project's own root.
+	const pkgTargetLabel = pkgProjectTarget(activeProjectId, projectLabel);
 	const shownCount = filtered.length + filteredPrimitives.length;
 	const indexLine =
 		catalogStatus === 'verified'
@@ -716,6 +738,7 @@ export function NgwaStoreSurface({
 									onSelect={() => selectRow(entry.id)}
 									onUpdate={update}
 									busy={Boolean(pending[entry.id])}
+									onRetry={lastAttempt.current[entry.id] ? () => retry(entry) : undefined}
 								/>
 							))}
 
@@ -784,12 +807,15 @@ export function NgwaStoreSurface({
 							key={`${selectedEntry.id}@${selectedEntry.latestVersion}`}
 							entry={selectedEntry}
 							loadDetail={loadDetail}
-							projectLabel={projectLabel}
+							projectLabel={pkgTargetLabel}
 							onClose={() => setSelectedId(null)}
 							onInstall={install}
 							onUpdate={update}
 							pendingAction={pending[selectedEntry.id] ?? null}
 							actionError={actionErrors[selectedEntry.id] ?? null}
+							onRetry={
+								lastAttempt.current[selectedEntry.id] ? () => retry(selectedEntry) : undefined
+							}
 							onReviewApproval={
 								approvalsPending.some((p) => p.entry.id === selectedEntry.id)
 									? () => updateApprovals?.review()
@@ -838,6 +864,7 @@ function StoreRow({
 	onSelect,
 	onUpdate,
 	busy,
+	onRetry,
 }: {
 	entry: NgwaStoreEntry;
 	selected: boolean;
@@ -845,7 +872,12 @@ function StoreRow({
 	onSelect: () => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
 	busy: boolean;
+	onRetry?: () => void;
 }) {
+	// This row's install / update progress, when the Store hook is driving
+	// one: concurrent installs and Update all each show on their own row.
+	const run = useInstallRun(entry.id);
+	const showRun = run !== null && run.status !== 'done';
 	// Cache-only: the selected row's sheet does the fetch; every other row
 	// shows what has already been read, and says so when nothing has.
 	const { data: detail } = useStoreDetail(entry, loadDetail, false);
@@ -904,7 +936,17 @@ function StoreRow({
 			</div>
 
 			<div className="rt">
-				{entry.isUpdate ? (
+				{showRun && run ? (
+					// biome-ignore lint/a11y/noStaticElementInteractions: stops row selection only
+					<div onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+						<InstallProgressRow
+							run={run}
+							compact
+							onCancel={() => void cancelStoreInstall(entry.id)}
+							onRetry={onRetry}
+						/>
+					</div>
+				) : entry.isUpdate ? (
 					<button
 						type="button"
 						className="btn"
@@ -970,12 +1012,14 @@ function StoreSheet({
 	onUpdate,
 	pendingAction,
 	actionError,
+	onRetry,
 	onReviewApproval,
 	onReviewTrust,
 }: {
 	entry: NgwaStoreEntry;
 	loadDetail: StoreDetailLoader | undefined;
-	projectLabel: string;
+	/** The project install target, or null when there is none (DEC-71). */
+	projectLabel: string | null;
 	onClose: () => void;
 	onInstall?: (entry: NgwaStoreEntry, scope: StoreInstallScope) => void;
 	onUpdate?: (entry: NgwaStoreEntry) => void;
@@ -983,6 +1027,8 @@ function StoreSheet({
 	pendingAction: PendingAction | null;
 	/** The last install/update failure for this entry. */
 	actionError: string | null;
+	/** Repeat the last failed install / update. */
+	onRetry?: () => void;
 	/** Set while this entry's update is held for approval: opens the review. */
 	onReviewApproval?: () => void;
 	onReviewTrust: (item: NgwaItem) => void;
@@ -993,8 +1039,10 @@ function StoreSheet({
 	const consents = useMemo(() => (manifest ? consentGroups(manifest) : []), [manifest]);
 	const [ticked, setTicked] = useState<Record<string, boolean>>({});
 	const busy = pendingAction !== null;
+	const storeRun = useInstallRun(entry.id);
 
 	const title = manifest?.name ?? entry.displayName;
+	const run = footRun(storeRun, pendingAction, actionError, title);
 	const requires = manifest?.requires ?? [];
 	const allTicked = consents.every((c) => ticked[c.id]);
 	const size = formatBytes(version?.size);
@@ -1016,7 +1064,8 @@ function StoreSheet({
 		onInstall(entry, scope);
 	}
 
-	const scopeLabel = (s: StoreInstallScope) => (s === 'personal' ? 'personal' : projectLabel);
+	const scopeLabel = (s: StoreInstallScope) =>
+		s === 'personal' ? 'personal' : (projectLabel ?? 'personal');
 
 	return (
 		<>
@@ -1208,15 +1257,12 @@ function StoreSheet({
 			</div>
 
 			<div className="sheetfoot" data-sheetfoot>
-				{busy && (
-					<span className="emberbar" role="status">
-						<i /> {pendingAction === 'update' ? 'Updating' : 'Registering'}
-					</span>
-				)}
-				{actionError && (
-					<span className="note bad" role="alert" data-action-error>
-						Failed: {actionError}
-					</span>
+				{run && (
+					<InstallProgressRow
+						run={run}
+						onCancel={() => void cancelStoreInstall(entry.id)}
+						onRetry={onRetry}
+					/>
 				)}
 				{onReviewApproval && !busy && (
 					<>
@@ -1228,7 +1274,7 @@ function StoreSheet({
 						</button>
 					</>
 				)}
-				{entry.isUpdate ? (
+				{run && (run.status === 'running' || onRetry) ? null : entry.isUpdate ? (
 					<button
 						type="button"
 						className="btn primary lg"
@@ -1275,6 +1321,50 @@ function StoreSheet({
 			</div>
 		</>
 	);
+}
+
+/**
+ * What the sheet foot shows: the Store hook's progress run for this entry
+ * when there is one, else a stand-in built from the surface's own promise
+ * state (an `onInstall` that doesn't drive the progress store still gets an
+ * indeterminate bar and a readable failure).
+ */
+function footRun(
+	run: InstallRun | null,
+	pendingAction: PendingAction | null,
+	actionError: string | null,
+	name: string
+): InstallRun | null {
+	if (run && run.status !== 'done') return run;
+	const base = {
+		key: name,
+		name,
+		verb: pendingAction ?? 'install',
+		stage: 'resolving',
+		percent: null,
+		detail: null,
+		step: null,
+		cancellable: false,
+		cancelRequested: false,
+	} as const;
+	if (pendingAction) {
+		return {
+			...base,
+			status: 'running',
+			label: pendingAction === 'update' ? 'Updating' : 'Installing',
+			error: null,
+		};
+	}
+	if (actionError) {
+		const error = classifyInstallError(actionError, name);
+		return {
+			...base,
+			status: error.kind === 'cancelled' ? 'cancelled' : 'failed',
+			label: '',
+			error,
+		};
+	}
+	return null;
 }
 
 // ─── Updates review ──────────────────────────────────────────────────────────

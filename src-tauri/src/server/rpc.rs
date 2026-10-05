@@ -1,6 +1,6 @@
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -69,27 +69,18 @@ fn db_args(args: &Value) -> Result<(String, Vec<Value>), String> {
     Ok((sql, params))
 }
 
-/// The `kind` discriminant of the frontend's `VaultScope`
-/// (`src/lib/tauri-cmd.ts`), whose wire shape is
-/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }`.
+/// The frontend's `VaultScope` (`src/lib/tauri-cmd.ts`), whose wire shape is
+/// `{ kind: "workspace" } | { kind: "project", id } | { kind: "pkg", id }` —
+/// the desktop's `Scope`, decoded the same way (`crate::secrets::scope`).
 ///
-/// The daemon only distinguishes workspace from everything else, because its
-/// secret namespace is flat — see `crate::secrets_env`.
-enum ScopeKind {
-    Workspace,
-    Other(String),
-}
-
-fn scope_kind(args: &Value) -> Result<ScopeKind, String> {
-    let kind = args
+/// Whether a project or pkg scope is servable is the secrets layer's call
+/// (`crate::secrets_env::DaemonSecrets`): a T1 principal store serves all
+/// three, the T0 operator-default namespace only `workspace`.
+pub(super) fn scope_kind(args: &Value) -> Result<crate::secrets::scope::Scope, String> {
+    let scope = args
         .get("scope")
-        .and_then(|s| s.get("kind"))
-        .and_then(|k| k.as_str())
         .ok_or("scope is required, e.g. {\"kind\":\"workspace\"}")?;
-    Ok(match kind {
-        "workspace" => ScopeKind::Workspace,
-        other => ScopeKind::Other(other.to_string()),
-    })
+    serde_json::from_value(scope.clone()).map_err(|e| format!("invalid scope: {e}"))
 }
 
 #[derive(Deserialize, Debug)]
@@ -128,9 +119,22 @@ impl RpcResponse {
 
 pub async fn rpc_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<crate::access::DaemonAccess>>>,
+    ctx: Option<Extension<crate::access::AccessCtx>>,
     Json(payload): Json<RpcRequest>,
 ) -> impl IntoResponse {
     debug!("RPC request: cmd={}", payload.cmd);
+
+    // G-ACCESS §9.2 pre-hook: class + caps for this command (§1.6), and in
+    // share mode a narrowed `AppState` (WP-76). One call, before any arm.
+    let access = access.map(|Extension(a)| a);
+    let ctx = ctx.map(|Extension(c)| c);
+    let state =
+        match crate::access::rpc_prehook(&state, ctx.as_ref(), &payload.cmd, &payload.args).await {
+            crate::access::PreHook::Proceed => state,
+            crate::access::PreHook::Narrowed(narrowed) => narrowed,
+            crate::access::PreHook::Answered(res) => return Json(res),
+        };
 
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
@@ -424,78 +428,88 @@ pub async fn rpc_handler(
             let store = crate::pkg::skill_actions::store_root();
             RpcResponse::success(state.pkg_index.all_skill_actions(store.as_deref()))
         }
-
-        // --- Secrets & Vault Commands (G-30) ---
-        //
-        // There is no vault in the daemon and that is decided, not pending:
-        // every server-side reader of a secret is desktop-gated, so an
-        // encrypted store here would exist only to be read back out over the
-        // bearer-token boundary. The daemon serves the flat, operator-opted-in
-        // `IKENGA_SECRET_*` namespace instead. Rationale, the PTY denylist
-        // interaction, and the operator runbook all live in
-        // `crate::secrets_env` — read that before changing anything below.
-        "secrets_get" => {
-            let key = payload
+        "pkg_activity_bar_set_badge" => {
+            let pkg_id = payload
                 .args
-                .get("key")
+                .get("pkgId")
+                .or_else(|| payload.args.get("pkg_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            match crate::secrets_env::get(key) {
-                Ok(value) => RpcResponse::success(value),
-                Err(e) => RpcResponse::error(format!("secrets_get: {e}")),
+            if pkg_id.is_empty() {
+                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+            }
+            // Absent or null clears the badge; anything else must parse.
+            let badge: Option<crate::pkg::registries::ActivityBarBadge> =
+                match payload.args.get("badge").filter(|v| !v.is_null()) {
+                    None => None,
+                    Some(v) => match serde_json::from_value(v.clone()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            return Json(RpcResponse::error(format!(
+                                "pkg_activity_bar_set_badge: invalid `badge`: {e}"
+                            )))
+                        }
+                    },
+                };
+            // Kept in memory and reported through `pkg_kernel_status`'s
+            // `activity_bar` registry; the server has no desktop event to emit.
+            match state.pkg_index.set_badge(pkg_id, badge) {
+                Ok(true) => RpcResponse::success(()),
+                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Err(e) => RpcResponse::error(format!("{e:#}")),
             }
         }
-        "secrets_list_keys" => RpcResponse::success(crate::secrets_env::list_keys()),
+        // The server has no install-time trust gate, so nothing is ever
+        // parked for a capability review.
+        "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
+        // desktop only, and the server runs neither, so the answer here is
+        // always no: the app reports the capability as unavailable instead
+        // of failing on an unknown command.
+        "pkg_is_trusted_for_elevated" => RpcResponse::success(false),
+
+        // --- Secrets & Vault Commands (G-30; per-principal store, WP-21) ---
+        //
+        // Two layers: a T1 principal child's own store (`<data>/secrets/`,
+        // sealed under a key its broker derived for it alone) over the
+        // operator-opted-in `IKENGA_SECRET_*` default. A T0 daemon has only
+        // the default: read-only, workspace scope only, as before. Layer
+        // order, the fail-closed rule, the PTY denylist interaction and the
+        // operator runbook live in `crate::secrets_env` — read that before
+        // changing anything below. Bodies in `rpc_local`.
+        "secrets_get" => rpc_local::secrets_get(&state, &payload.args),
+        "secrets_list_keys" => rpc_local::secrets_list_keys(&state),
         // Without this arm Settings → API Keys / Integrations / Secrets and
         // every connector probe are dead in a browser session: they all gate
         // on `available`, and the unknown-command fallthrough throws.
-        "secrets_vault_status" => RpcResponse::success(crate::secrets_env::status()),
-
-        // Scoped reads: the env namespace is flat, which IS workspace scope.
-        // Project and pkg partitions exist only in the desktop vault, so they
-        // get a refusal that says which, rather than an empty list that reads
-        // like "you have no secrets there".
-        "secrets_get_scoped" => match scope_kind(&payload.args) {
-            Ok(ScopeKind::Workspace) => {
-                let key = payload
-                    .args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                match crate::secrets_env::get(key) {
-                    Ok(value) => RpcResponse::success(value),
-                    Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
-                }
-            }
-            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
-                "secrets_get_scoped: scope {kind:?} is not servable — {}",
-                crate::secrets_env::SCOPE_REFUSAL
-            )),
-            Err(e) => RpcResponse::error(format!("secrets_get_scoped: {e}")),
-        },
-        "secrets_list_keys_scoped" => match scope_kind(&payload.args) {
-            Ok(ScopeKind::Workspace) => RpcResponse::success(crate::secrets_env::list_keys()),
-            Ok(ScopeKind::Other(kind)) => RpcResponse::error(format!(
-                "secrets_list_keys_scoped: scope {kind:?} is not servable — {}",
-                crate::secrets_env::SCOPE_REFUSAL
-            )),
-            Err(e) => RpcResponse::error(format!("secrets_list_keys_scoped: {e}")),
-        },
-
-        // Writes. Explicit refusal arms, NOT the unknown-command fallthrough:
-        // the fallthrough reads as "unfinished, someone will get to it", and
-        // the next person to read it would implement the thing this decision
-        // rejects. `secrets_env::WRITE_REFUSAL` is the operator runbook.
-        cmd @ ("secrets_set" | "secrets_delete" | "secrets_set_scoped"
-        | "secrets_delete_scoped") => RpcResponse::error(format!(
-            "{cmd} {}",
-            crate::secrets_env::WRITE_REFUSAL
-        )),
-        // Desktop: the names in `secrets-index.json`. Daemon: the names of
-        // its own namespace — same `string[]` shape, daemon-true content.
-        // Needs no `--data-dir`: the namespace is process environment.
-        // (`secrets_lock_state` stays allowlisted; see `desktop_only.toml`.)
-        "secrets_index_names" => RpcResponse::success(crate::secrets_env::list_keys()),
+        "secrets_vault_status" => RpcResponse::success(state.secrets.status()),
+        "secrets_get_scoped" => rpc_local::secrets_get_scoped(&state, &payload.args),
+        "secrets_list_keys_scoped" => rpc_local::secrets_list_keys_scoped(&state, &payload.args),
+        // Writes land in the principal's own store. Without one (T0) each is
+        // an explicit refusal, NOT the unknown-command fallthrough, which
+        // would read as "unfinished": `secrets_env::WRITE_REFUSAL` is the
+        // operator runbook.
+        cmd @ ("secrets_set"
+        | "secrets_delete"
+        | "secrets_set_scoped"
+        | "secrets_delete_scoped") => rpc_local::secrets_write(&state, cmd, &payload.args),
+        // Desktop: the names in `secrets-index.json`. Daemon: every name of
+        // both layers — same `string[]` shape, never a value.
+        "secrets_index_names" => rpc_local::secrets_index_names(&state),
+        // The operator default's names alone (review WP76-RV1): how the
+        // browser tells "your override" from a bare key of your own. A
+        // browser-only verb — the desktop keychain has no default layer.
+        "secrets_default_names" => rpc_local::secrets_default_names(&state),
+        // No passphrase layer (DEC-R18-1: the key is server-held, so
+        // background work reads secrets while the user is signed out). T1:
+        // `configured: true, locked: false`, `secrets_lock` answers that
+        // state, setting / unlocking a passphrase is refused with why. T0:
+        // the unknown-command error, byte-identical to before WP-21, so
+        // Settings → Secrets stays read-only there.
+        cmd @ ("secrets_lock_state"
+        | "secrets_lock"
+        | "secrets_set_passphrase"
+        | "secrets_unlock") => rpc_local::secrets_lock_family(&state, cmd),
 
         // --- Local state (WP-19 slice 2) ---
         //
@@ -755,6 +769,49 @@ pub async fn rpc_handler(
         "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
 
+        // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
+        //
+        // Every access arm, the permission decide core, the T0 ask relay and
+        // the two broker → child `internal` arms. Bodies in `crate::access::
+        // rpc`; the arms later waves own answer `internal: not implemented
+        // (WP-NN)` (the relay: `invalid_request`) until filled. Class and
+        // caps were already checked by the pre-hook above. A principal child
+        // answers `access_*` with `served_by_broker`.
+        cmd @ ("access_status"
+        | "access_devices_list"
+        | "access_device_set_tier"
+        | "access_device_revoke"
+        | "access_pair_begin"
+        | "access_pair_cancel"
+        | "access_pair_pending"
+        | "access_pair_decide"
+        | "access_routing_get"
+        | "access_routing_set"
+        | "access_members_list"
+        | "access_member_set_role"
+        | "access_member_remove"
+        | "access_member_restore"
+        | "access_policy_get"
+        | "access_policy_set_cell"
+        | "access_policy_set_owner_approval"
+        | "access_invite_issue"
+        | "access_invite_revoke"
+        | "access_shares_list"
+        | "access_audit_list"
+        | "access_audit_verify"
+        | "access_audit_export"
+        | "access_audit_record_local"
+        | "access_audit_reseal"
+        | "permission_decide"
+        | "permission_relay_put"
+        | "permission_relay_take"
+        | "permission_relay_resolve"
+        | "notifications_record_access"
+        | "share_project_info") => {
+            crate::access::rpc::serve_daemon(access.as_deref(), ctx.as_ref(), cmd, &payload.args)
+                .await
+        }
+
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");
@@ -764,7 +821,9 @@ pub async fn rpc_handler(
         }
     };
 
-    Json(res)
+    // G-ACCESS §9.2 post-hook: share filtering (WP-76) and the permission
+    // rows' `can_decide` / `waiting_on` (WP-75).
+    Json(crate::access::postfilter(ctx.as_ref(), &payload.cmd, res))
 }
 
 #[cfg(test)]

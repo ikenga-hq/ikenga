@@ -3,6 +3,9 @@
 //! in `src/lib/tauri-cmd.ts` mirror this, so later phases just fill in the
 //! Rust side.
 
+// G-ACCESS (WP-74a): the desktop's `access_*` proxies + in-process
+// `permission_decide`.
+pub mod access;
 pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;
@@ -30,6 +33,9 @@ pub mod identity;
 pub mod iyke;
 pub mod ngwa;
 pub mod notifications;
+// WP-54 OS-wide shortcuts (G-ACTIONS §6): the global-shortcut plugin, its
+// boot defaults and `os_shortcuts_apply`. Moved out of `lib.rs` (WP-19 A).
+pub(crate) mod os_shortcuts;
 pub mod pa_actions;
 pub mod permissions_audit;
 pub mod pkg;
@@ -45,6 +51,9 @@ pub mod pkg_trust;
 pub mod pkg_webview;
 pub mod projects;
 pub mod pty;
+// The ONE `generate_handler!` list (WP-19 final slice A) — `lib.rs` installs
+// `registry::handler()`; both parity gates parse this file.
+pub(crate) mod registry;
 pub mod runtime;
 pub mod scaffold;
 pub mod screenshot;
@@ -73,8 +82,8 @@ pub use agent_ops::{
     agent_ops_tail_run, agent_ops_upsert_job,
 };
 pub use app_lock::{
-    app_lock_clear_secret, app_lock_configure, app_lock_lock, app_lock_set_secret,
-    app_lock_status, app_lock_touch, app_lock_unlock, app_lock_unlock_biometric, AppLockState,
+    app_lock_clear_secret, app_lock_configure, app_lock_lock, app_lock_set_secret, app_lock_status,
+    app_lock_touch, app_lock_unlock, app_lock_unlock_biometric, AppLockState,
 };
 pub use backup::{
     backup_delete, backup_export, backup_import, backup_list, db_export_ndjson, db_import_ndjson,

@@ -42,10 +42,11 @@ pub struct InstalledSummary {
     /// Provenance — recorded at install time, used by the UI for grouping
     /// and by the kernel to refuse uninstall of `Builtin` pkgs.
     pub source: InstallSource,
-    /// Scope (Phase 2 of projects-first-class). `Some("default" | "music-2026" | …)`
+    /// Scope (Phase 2 of projects-first-class). `Some("music-2026" | …)`
     /// means the pkg loads only when that project is active; `None` is the
-    /// workspace scope (always loaded). The Phase 0 bootstrap stamps existing
-    /// rows with `Some("default")` so they remain visible after upgrade.
+    /// workspace / personal scope (always loaded). The Default project is
+    /// personal for pkgs (DEC-71): `"default"` normalizes to `None` and is
+    /// never stored.
     pub project_id: Option<String>,
 }
 

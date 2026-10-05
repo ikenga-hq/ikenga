@@ -153,7 +153,20 @@ fn spawn_detached(mut cmd: Command) -> std::io::Result<tokio::process::Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{Principal, StdioMode};
+    use crate::executor::{Principal, PrincipalId, StdioMode};
+
+    /// Reserved on T0: any resolved principal, which T0 must ignore.
+    fn someone_else() -> Principal {
+        Principal {
+            id: PrincipalId::new_v7(),
+            username: "someone-else".into(),
+            unix_name: "ik-someone-else".into(),
+            uid: 20000,
+            gid: 20000,
+            home: "/nonexistent".into(),
+            shell: "/bin/sh".into(),
+        }
+    }
 
     fn piped_all() -> PipedOpts {
         PipedOpts {
@@ -191,7 +204,7 @@ mod tests {
             .env("WP18_PROBE", "hello world")
             .current_dir(&dir)
             // Reserved; T0 must ignore it rather than fail.
-            .principal(Some(Principal { id: "someone-else".into() }));
+            .principal(Some(someone_else()));
 
         let child = InProcessExecutor.spawn_piped(spec, piped_all()).unwrap();
         let out = child.wait_with_output().await.unwrap();
@@ -217,7 +230,7 @@ mod tests {
                 .env("WP18_PROBE", "first")
                 .env("WP18_PROBE", "hello")
                 .current_dir(&dir)
-                .principal(Some(Principal { id: "someone-else".into() }));
+                .principal(Some(someone_else()));
             InProcessExecutor.spawn_piped(spec, piped_all()).unwrap()
         };
 

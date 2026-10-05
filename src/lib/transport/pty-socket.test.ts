@@ -2,10 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { connectionStateStore } from './connection-state';
 import { attachRemotePty } from './pty-socket';
 
+const showReauth = vi.fn();
+vi.mock('./reauth-store', () => ({
+	useReauthStore: { getState: () => ({ showReauth }) },
+}));
+
 /** Minimal WebSocket stand-in the attach loop can drive. */
 class FakeSocket {
 	onopen: (() => void) | null = null;
-	onclose: (() => void) | null = null;
+	onclose: ((e?: { code: number; reason: string }) => void) | null = null;
 	onerror: ((e: unknown) => void) | null = null;
 	onmessage: ((e: { data: unknown }) => void) | null = null;
 	closed = false;
@@ -33,6 +38,10 @@ class FakeSocket {
 	}
 	drop() {
 		this.onclose?.();
+	}
+	/** The server closes on purpose (G-ACCESS §3.10). */
+	closeWith(code: number, reason = '') {
+		this.onclose?.({ code, reason });
 	}
 }
 
@@ -255,5 +264,43 @@ describe('attachRemotePty', () => {
 		h.detach();
 		expect(connectionStateStore.get().activeTerminals).toBe(0);
 		expect(connectionStateStore.get().state).toBe('connected');
+	});
+
+	// G-ACCESS §3.10 (WP-78a): 4401 routes to the re-auth overlay and stops.
+	it('a 4401 close opens re-auth and never retries', async () => {
+		showReauth.mockClear();
+		const h = harness();
+		h.sockets[0].open();
+		h.sockets[0].closeWith(4401, 'device_revoked');
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(h.sockets).toHaveLength(1);
+		expect(showReauth).toHaveBeenCalledTimes(1);
+		expect(connectionStateStore.get().access).toEqual({
+			kind: 'revoked',
+			reason: 'device_revoked',
+		});
+		expect(h.chunks.map((c) => c.text).join('')).toContain('signed out');
+		expect(h.onExit).not.toHaveBeenCalled();
+		h.detach();
+	});
+
+	// §3.10: "The client reconnects at once with its new caps."
+	it('a 4403 close reconnects at once, then falls back to backoff', async () => {
+		const h = harness();
+		h.sockets[0].open();
+		h.sockets[0].closeWith(4403, 'caps_changed');
+		expect(connectionStateStore.get().access?.kind).toBe('caps_changed');
+		await vi.advanceTimersByTimeAsync(0);
+		expect(h.sockets).toHaveLength(2);
+		expect(h.opens[1].spawn).toBe(false);
+		h.sockets[1].open();
+		expect(connectionStateStore.get().access).toBeNull();
+		// A second 4403 straight away: no tight loop.
+		h.sockets[1].closeWith(4403, 'caps_changed');
+		await vi.advanceTimersByTimeAsync(0);
+		expect(h.sockets).toHaveLength(2);
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(h.sockets).toHaveLength(3);
+		h.detach();
 	});
 });

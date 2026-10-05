@@ -15,14 +15,19 @@ use agent_client_protocol::schema::SessionUpdate;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::info;
 
+use super::pty_ws::{close_message, closed, SocketAccess};
 use super::AppState;
+use crate::access::ws::{Frame, Route};
+use crate::access::{AccessCtx, DaemonAccess};
 use crate::engines::EngineHandle;
+use crate::server::shared::notifications::routing;
 
 /// Engine used when the client doesn't name one.
 const DEFAULT_ENGINE: &str = "antigravity-cli";
@@ -44,19 +49,46 @@ pub enum ChatClientMessage {
 pub async fn chat_ws_handler(
     State(state): State<Arc<AppState>>,
     Path(thread_id): Path<String>,
+    access: Option<Extension<Arc<DaemonAccess>>>,
+    ctx: Option<Extension<AccessCtx>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_chat_socket(socket, state, thread_id))
+    // G-ACCESS §1.6: attaching needs `sessions` (checked at the handshake);
+    // `Prompt` and `Cancel` need `dispatch`.
+    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c))
+        .with_target(format!("chat · {thread_id}"));
+    ws.on_upgrade(move |socket| {
+        super::activity::track_ws(handle_chat_socket(socket, state, thread_id, guard))
+    })
 }
 
 /// One `session/update` envelope.
-fn update_event(thread_id: &str, update: serde_json::Value) -> String {
+fn update_envelope(thread_id: &str, update: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "session/update",
         "params": { "thread_id": thread_id, "update": update }
     })
-    .to_string()
+}
+
+fn update_event(thread_id: &str, update: serde_json::Value) -> String {
+    update_envelope(thread_id, update).to_string()
+}
+
+/// An engine `session/update` as this socket sends it, or `None` when the
+/// request's share drops it (G-ACCESS §4.5.4, WP-76 H-2): a Reviewer share
+/// loses `usage` updates and every cost key (`access::share::chat_event`).
+/// Own workspace and other share roles: unchanged.
+fn outbound_update(
+    ctx: Option<&AccessCtx>,
+    thread_id: &str,
+    update: serde_json::Value,
+) -> Option<String> {
+    let mut event = update_envelope(thread_id, update);
+    if ctx.is_some_and(|c| !crate::access::share::chat_event(c, &mut event)) {
+        return None;
+    }
+    Some(event.to_string())
 }
 
 fn status_event(thread_id: &str, status: &str, stop_reason: Option<&str>) -> String {
@@ -111,6 +143,7 @@ async fn run_turn(
     prompt: String,
     cwd: Option<String>,
     model: Option<String>,
+    ctx: Option<AccessCtx>,
 ) {
     send(&ws_tx, status_event(&thread_id, "running", None)).await;
 
@@ -157,14 +190,11 @@ async fn run_turn(
                 let thread_id = thread_id.clone();
                 async move {
                     while let Some(update) = rx_chan.recv().await {
-                        send(
-                            &ws_tx,
-                            update_event(
-                                &thread_id,
-                                serde_json::to_value(&update).unwrap_or(serde_json::Value::Null),
-                            ),
-                        )
-                        .await;
+                        let update =
+                            serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                        if let Some(event) = outbound_update(ctx.as_ref(), &thread_id, update) {
+                            send(&ws_tx, event).await;
+                        }
                     }
                 }
             };
@@ -219,11 +249,21 @@ async fn cancel_turn(state: &AppState, engine_name: &str, thread_id: &str) {
     }
 }
 
-async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: String) {
+async fn handle_chat_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    thread_id: String,
+    mut guard: SocketAccess,
+) {
     let (ws_tx, mut ws_rx) = socket.split();
     let ws_tx: WsSink = Arc::new(TokioMutex::new(ws_tx));
+    let closed_fut = closed(guard.take_closed());
+    tokio::pin!(closed_fut);
 
     info!("Chat WebSocket connected for thread: {thread_id}");
+    // G-ACCESS §5.7 (WP-75): this socket's prompt attribution is kept under
+    // its own id, so another socket on the thread never overwrites it.
+    let prompt_socket = routing::prompt_socket();
 
     send(&ws_tx, status_event(&thread_id, "idle", None)).await;
 
@@ -232,9 +272,27 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
     // adapter actually started the turn.
     let mut in_flight: Option<(tokio::task::JoinHandle<()>, String)> = None;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // G-ACCESS §3.10: revoked (4401) / caps changed (4403). The turn
+            // in flight is cancelled below, as on any disconnect.
+            close = &mut closed_fut => {
+                let _ = ws_tx.lock().await.send(close_message(&close)).await;
+                break;
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Text(text) => {
+                // G-ACCESS §1.6: `Prompt` / `Cancel` need `dispatch`; a
+                // refused frame is dropped and answered, the socket stays.
+                if let Err(refusal) = guard.check(Route::Chat, Frame::Text(&text)) {
+                    let _ = ws_tx.lock().await.send(Message::Text(refusal)).await;
+                    continue;
+                }
                 let Ok(client_msg) = serde_json::from_str::<ChatClientMessage>(&text) else {
                     continue;
                 };
@@ -245,6 +303,30 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                         cwd,
                         model,
                     } => {
+                        // G-ACCESS §4.5.4 share hooks (WP-76 fills them): a
+                        // share's `cwd` is forced under the share root, and a
+                        // share-originated run gets no vault env (§4.5.1).
+                        let cwd = match guard
+                            .ctx
+                            .as_ref()
+                            .map(|c| crate::access::share::chat_cwd(c, cwd.clone()))
+                        {
+                            None => cwd,
+                            Some(Ok(cwd)) => cwd,
+                            Some(Err(e)) => {
+                                send(&ws_tx, error_event(&thread_id, e.to_string())).await;
+                                continue;
+                            }
+                        };
+                        if guard
+                            .ctx
+                            .as_ref()
+                            .is_some_and(|c| !crate::access::share::run_env(c))
+                        {
+                            // The daemon's engines inject no Ikenga vault env
+                            // today; WP-76 strips it here once one does.
+                            tracing::debug!("share-originated run: no vault env");
+                        }
                         // Reap a finished turn so a completed one never looks
                         // in-flight.
                         if in_flight.as_ref().is_some_and(|(h, _)| h.is_finished()) {
@@ -263,6 +345,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                             continue;
                         }
 
+                        // G-ACCESS §5.7 (WP-75): capture who this turn's
+                        // asks are attributed to — the share's member and
+                        // project, or the own-workspace project from the cwd.
+                        let attribution =
+                            prompt_context(&state, guard.ctx.as_ref(), cwd.as_deref()).await;
+                        routing::set_prompt_context(&thread_id, prompt_socket, attribution);
+
                         let engine_name = engine.unwrap_or_else(|| DEFAULT_ENGINE.to_string());
                         info!("Running prompt on engine {engine_name} for thread {thread_id}");
 
@@ -274,6 +363,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
                             prompt,
                             cwd,
                             model,
+                            guard.ctx.clone(),
                         ));
                         in_flight = Some((handle, engine_name));
                     }
@@ -322,5 +412,116 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<AppState>, thread_id: 
         }
     }
 
+    routing::clear_prompt_context(&thread_id, prompt_socket);
     info!("Chat WebSocket disconnected for thread: {thread_id}");
+}
+
+/// The attribution a `/ws/chat` prompt's asks carry (G-ACCESS §5.7): under a
+/// share, `X-Ikenga-Share-Principal` / `-Project` as captured at the
+/// handshake (narrowing / attribution only, never authorization), with the
+/// shared project's root; in the principal's own workspace, the project
+/// whose root holds the prompt's cwd (the Owner's own work: no
+/// `requested_by`). A daemon engine that raises asks records them through
+/// `routing::record_ask_for_thread`.
+async fn prompt_context(
+    state: &AppState,
+    ctx: Option<&AccessCtx>,
+    cwd: Option<&str>,
+) -> routing::PromptContext {
+    let pool = match &state.pa_db {
+        Some(db) => db.ensure_pool().await.ok(),
+        None => None,
+    };
+    if let Some(share) = ctx.and_then(|c| c.share.as_ref()) {
+        let root = match &pool {
+            Some(p) => crate::server::shared::projects::get_project(p, &share.project_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|p| p.root_path),
+            None => None,
+        };
+        return routing::PromptContext {
+            requested_by: share.member_principal_id.clone(),
+            project_id: Some(share.project_id.clone()),
+            project_root: root,
+        };
+    }
+    let found = match (&pool, cwd) {
+        (Some(p), Some(cwd)) => routing::project_for_path(p, cwd).await,
+        _ => None,
+    };
+    routing::PromptContext {
+        requested_by: None,
+        project_root: found
+            .as_ref()
+            .map(|(_, root)| root.clone())
+            .or_else(|| cwd.map(str::to_string)),
+        project_id: found.map(|(id, _)| id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::{CapSet, Role, ShareCtx, Tier, Via};
+    use serde_json::json;
+
+    fn share_ctx(role: Role) -> AccessCtx {
+        AccessCtx {
+            principal_id: crate::executor::PrincipalId::new_v7(),
+            via: Via::Relayed,
+            device_id: None,
+            tier: Tier::View,
+            share: Some(ShareCtx {
+                project_key: "o/p".into(),
+                project_id: "p".into(),
+                member_principal_id: Some("m".into()),
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: None,
+                owner_approval: true,
+            }),
+            share_headers: true,
+            caps: CapSet::ALL,
+            admin_strength: false,
+            meta: Default::default(),
+        }
+    }
+
+    /// WP-76 H-2: the engine stream to a Reviewer share drops `usage`
+    /// updates and strips cost keys; other roles, your own workspace and a
+    /// socket without a ctx send the update as the engine produced it.
+    #[test]
+    fn reviewer_share_stream_loses_usage_and_cost() {
+        let reviewer = share_ctx(Role::Reviewer);
+        let usage = json!({"sessionUpdate": "usage_update", "used": 10, "size": 100});
+        assert_eq!(outbound_update(Some(&reviewer), "t", usage.clone()), None);
+
+        let chunk = json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "hi"}, "_meta": {"costUsd": 0.1}});
+        let sent: serde_json::Value =
+            serde_json::from_str(&outbound_update(Some(&reviewer), "t", chunk.clone()).unwrap())
+                .unwrap();
+        assert_eq!(sent["method"], "session/update");
+        assert_eq!(sent["params"]["thread_id"], "t");
+        assert_eq!(
+            sent["params"]["update"],
+            json!({"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hi"}, "_meta": {}})
+        );
+
+        let unchanged = update_event("t", usage.clone());
+        let operator = share_ctx(Role::Operator);
+        let own = AccessCtx {
+            share: None,
+            ..share_ctx(Role::Reviewer)
+        };
+        for ctx in [Some(&operator), Some(&own), None] {
+            assert_eq!(
+                outbound_update(ctx, "t", usage.clone()).as_deref(),
+                Some(unchanged.as_str())
+            );
+        }
+    }
 }

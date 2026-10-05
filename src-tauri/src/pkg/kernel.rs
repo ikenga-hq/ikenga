@@ -18,10 +18,11 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use crate::commands::db::PaDb;
+use crate::server::shared::projects::DEFAULT_PROJECT_ID;
 
 use super::cap_snapshot;
 use super::file_watcher::{self, WatcherHandle};
-use super::manifest::{Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
+use super::manifest::{Manifest, Package, IKENGA_API_MIN_SUPPORTED, IKENGA_API_VERSION};
 use super::registry::Registry;
 use super::source::InstallSource;
 use super::uninstall_dir;
@@ -432,6 +433,62 @@ pub(crate) async fn purge_orphans(pool: &sqlx::SqlitePool) -> Result<u64> {
     Ok(total)
 }
 
+/// Rewrite the manifest-derived columns (`version`, `ikenga_api`,
+/// `manifest_json`) of an existing `pkg_installed` row from `manifest`.
+///
+/// Deliberately narrow: unlike `persist_install`'s `INSERT OR REPLACE`, it
+/// never touches `source_json`, `project_id`, `installed_at`, `enabled`,
+/// `signature` or `install_path`, and never creates a row. Returns the
+/// number of rows updated (0 = no row for `id`).
+pub(crate) async fn write_manifest_columns(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    manifest: &Manifest,
+) -> Result<u64> {
+    let manifest_json =
+        serde_json::to_string(manifest).map_err(|e| anyhow!("serialize manifest: {e}"))?;
+    let r = sqlx::query(
+        "UPDATE pkg_installed SET version = ?, ikenga_api = ?, manifest_json = ? WHERE id = ?",
+    )
+    .bind(&manifest.version)
+    .bind(&manifest.ikenga_api)
+    .bind(&manifest_json)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow!("update pkg_installed manifest columns for {id}: {e}"))?;
+    Ok(r.rows_affected())
+}
+
+/// Whether a `pkg_installed` row's stored `version` / `ikenga_api` differ
+/// from the manifest now on disk (e.g. a Dev install whose checkout moved on
+/// while the shell was closed).
+pub(crate) fn manifest_drifted(
+    stored_version: Option<&str>,
+    stored_api: Option<&str>,
+    manifest: &Manifest,
+) -> bool {
+    stored_version != Some(manifest.version.as_str())
+        || stored_api != Some(manifest.ikenga_api.as_str())
+}
+
+/// The in-memory summary after a successful `reload_pkg`: version and
+/// `ikenga_api` come from the reloaded manifest; path, enabled, install
+/// time, source and scope are carried over from the pre-reload entry.
+pub(crate) fn reloaded_summary(prev: InstalledSummary, manifest: &Manifest) -> InstalledSummary {
+    InstalledSummary {
+        id: prev.id,
+        version: manifest.version.clone(),
+        ikenga_api: manifest.ikenga_api.clone(),
+        install_path: prev.install_path,
+        enabled: prev.enabled,
+        installed_at: prev.installed_at,
+        compatible: true,
+        source: prev.source,
+        project_id: prev.project_id,
+    }
+}
+
 /// `(id, install_path, enabled)` for every `pkg_installed` row.
 async fn read_install_rows(pool: &sqlx::SqlitePool) -> Result<Vec<(String, String, bool)>> {
     let rows: Vec<(String, String, i64)> =
@@ -510,6 +567,12 @@ pub struct Kernel {
 /// them reads as "bound to a project that is never active", and reconcile
 /// parks a workspace pkg for "scope mismatch". Every read and write of the
 /// scope goes through here.
+///
+/// DEC-71 (Round 58): the Default project *is* personal scope for pkgs, so
+/// `"default"` / `"project:default"` also normalize to `None`. Kept as a bare
+/// project id, `'default'` parked every pkg (builtins included) the moment a
+/// real project became active. Because every write path normalizes first,
+/// `'default'` is never stored again; migration 0069 clears existing rows.
 pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let t = raw.trim();
@@ -517,11 +580,30 @@ pub(crate) fn normalize_scope(raw: Option<String>) -> Option<String> {
         return None;
     }
     let id = t.strip_prefix("project:").unwrap_or(t).trim();
-    if id.is_empty() {
+    if id.is_empty() || id == DEFAULT_PROJECT_ID {
         None
     } else {
         Some(id.to_string())
     }
+}
+
+/// Write a pkg's scope to `pkg_installed.project_id`, normalized first so a
+/// wire value (`"workspace"`, `"project:default"`, …) never lands raw.
+/// Returns the scope actually stored. Split out of [`Kernel::set_scope`] so
+/// the DB write is testable without an `AppHandle`.
+pub(crate) async fn store_scope(
+    pool: &sqlx::SqlitePool,
+    pkg_id: &str,
+    raw: Option<String>,
+) -> Result<Option<String>> {
+    let project_id = normalize_scope(raw);
+    sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
+        .bind(&project_id)
+        .bind(pkg_id)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow!("update project_id: {e}"))?;
+    Ok(project_id)
 }
 
 /// The reconcile scope rule: a workspace pkg (no project) is live under
@@ -711,8 +793,8 @@ impl Kernel {
     /// shell-bundled builtins from registry / sideloaded pkgs.
     /// Install a pkg at `install_path` with the given provenance + scope.
     /// `project_id = None` means workspace scope (always loaded);
-    /// `Some("default" | other slug)` binds the pkg to that project so it
-    /// only loads when the project is active. The kernel persists the
+    /// `Some(slug)` binds the pkg to that project so it only loads when the
+    /// project is active. `"default"` normalizes to `None` (DEC-71). The kernel persists the
     /// scope on `pkg_installed.project_id` but does *not* perform
     /// reconciliation here — caller is responsible for kicking
     /// `reconcile_for_project` after install if the scope differs from the
@@ -878,13 +960,17 @@ impl Kernel {
                 log::warn!("[pkg_kernel] emit pkg-reloaded for `{pkg_id}` failed: {e}");
             }
         } else {
-            // Fresh install (no prior `pkg_installed` row): emit
-            // `pkg-installed` so the FE can refresh registry consumers and —
-            // manifest v5 (G-MANIFEST-V5 §3) — apply `pin_on_install` for
-            // views that declare it. The event's existence IS the freshness
-            // signal: reinstalls take the `pkg-reloaded` branch above and
-            // never re-pin. Boot replay doesn't reach `install_from_path` at
-            // all, so a reboot can't resurrect a user's unpin.
+            // Fresh install (no prior `pkg_installed` row): apply
+            // `pin_on_install` here, then emit `pkg-installed` so the FE
+            // refreshes registry consumers and the rail (which now already
+            // holds the pins). Pinning on the kernel side means it happens
+            // for every install path and whether or not any window has the
+            // rail mounted. Reinstalls take the `pkg-reloaded` branch above
+            // and never re-pin. Boot replay doesn't reach `install_from_path`
+            // at all, so a reboot can't resurrect a user's unpin.
+            tauri::async_runtime::block_on(crate::pkg::pin_on_install::apply_pin_on_install(
+                &self.db, &pkg,
+            ));
             if let Err(e) = self.app.emit(
                 "pkg-installed",
                 serde_json::json!({
@@ -953,6 +1039,24 @@ impl Kernel {
         })
     }
 
+    /// Sync an existing `pkg_installed` row's `version` / `ikenga_api` /
+    /// `manifest_json` to `manifest` (see [`write_manifest_columns`]). Sync
+    /// `block_on`, like the other row writers here — callers run off the
+    /// async runtime (`reload_pkg` is always driven via `spawn_blocking`).
+    fn update_manifest_row(&self, pkg_id: &str, manifest: &Manifest) -> Result<()> {
+        let db = self.db.clone();
+        let id_owned = pkg_id.to_string();
+        let manifest = manifest.clone();
+        let updated = tauri::async_runtime::block_on(async move {
+            let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
+            write_manifest_columns(&pool, &id_owned, &manifest).await
+        })?;
+        if updated == 0 {
+            log::warn!("[pkg_kernel] no pkg_installed row for `{pkg_id}` to sync manifest into");
+        }
+        Ok(())
+    }
+
     /// Phase 2: update the scope of an already-installed pkg. `None` means
     /// workspace; `Some(slug)` rebinds it to that project. Returns Err if
     /// the pkg isn't installed. The caller should run a reconcile after
@@ -974,13 +1078,7 @@ impl Kernel {
         let scope_owned = project_id.clone();
         tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
-            sqlx::query("UPDATE pkg_installed SET project_id = ? WHERE id = ?")
-                .bind(&scope_owned)
-                .bind(&id_owned)
-                .execute(&pool)
-                .await
-                .map_err(|e| anyhow!("update project_id: {e}"))?;
-            Ok::<_, anyhow::Error>(())
+            store_scope(&pool, &id_owned, scope_owned).await
         })?;
         if let Ok(mut g) = self.installed.write() {
             if let Some(existing) = g.get_mut(pkg_id) {
@@ -1382,7 +1480,9 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
             return Ok(());
         }
         // Finish any uninstall whose folder move was blocked by a file lock,
-        // and prune expired uninstall backups, before discovering.
+        // and prune expired uninstall backups, before discovering. Installer
+        // scratch (`.staging-*` / `.bak-*`) was already reaped by
+        // `sweep_install_scratch` at the top of `boot()`, which runs first.
         uninstall_dir::sweep(&dir, uninstall_dir::BACKUP_RETENTION);
         let entries = std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?;
         for entry in entries.flatten() {
@@ -1454,11 +1554,36 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
     /// loads gets logged and skipped — the row stays so the user can decide
     /// to repair or uninstall via the UI.
     pub fn boot(&self) -> Result<()> {
-        let db = self.db.clone();
-        let (rows, total_rows): (
-            Vec<(String, String, i64, Option<String>, Option<String>)>,
+        // Reap installer scratch (`.staging-*`, `.bak-*`) a crash or restart
+        // mid-install left in the pkgs dir. Runs BEFORE the row replay (and so
+        // before `install_from_pkgs_dir`'s discovery): an update that died
+        // between moving `<id>` aside and promoting the new one gets its
+        // `.bak-<id>` restored here, so its row loads from the restored folder
+        // with its recorded provenance instead of being skipped now and then
+        // rediscovered as a `Local` pkg. Called from Tauri setup before
+        // `KernelState` is managed, so no install command can be in flight;
+        // the sweep's min-age guard covers a concurrent CLI `ikenga add`.
+        match self.pkgs_dir() {
+            Ok(dir) => {
+                uninstall_dir::sweep_install_scratch(&dir, uninstall_dir::INSTALL_SCRATCH_MIN_AGE)
+            }
+            Err(e) => log::warn!(
+                "[pkg_kernel] pkgs dir unresolved, skipping install-scratch sweep: {e:#}"
+            ),
+        }
+        // (id, install_path, installed_at, source_json, project_id,
+        //  stored version, stored ikenga_api)
+        type BootRow = (
+            String,
+            String,
             i64,
-        ) = tauri::async_runtime::block_on(async move {
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let db = self.db.clone();
+        let (rows, total_rows): (Vec<BootRow>, i64) = tauri::async_runtime::block_on(async move {
             let pool = db.ensure_pool().await.map_err(|e| anyhow!(e))?;
             // Diagnostic: total row count regardless of `enabled`. Distinguishes
             // "wrong DB file" / "missing rows" from "all rows disabled".
@@ -1466,8 +1591,8 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 .fetch_one(&pool)
                 .await
                 .map_err(|e| anyhow!("count pkg_installed: {e}"))?;
-            let r: Vec<(String, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
-                "SELECT id, install_path, installed_at, source_json, project_id
+            let r: Vec<BootRow> = sqlx::query_as(
+                "SELECT id, install_path, installed_at, source_json, project_id, version, ikenga_api
                  FROM pkg_installed WHERE enabled = 1",
             )
             .fetch_all(&pool)
@@ -1483,7 +1608,9 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
         let mut replayed = 0usize;
         let mut skipped = 0usize;
         let mut parked_for_review = 0usize;
-        for (id, install_path, installed_at, source_raw, project_id) in rows {
+        for (id, install_path, installed_at, source_raw, project_id, stored_version, stored_api) in
+            rows
+        {
             match Package::load(Path::new(&install_path)) {
                 Ok(pkg) => {
                     if !pkg.is_compatible() {
@@ -1493,6 +1620,38 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                         );
                         skipped += 1;
                         continue;
+                    }
+
+                    // The in-memory summary below takes version / ikenga_api
+                    // from the on-disk manifest, so a row written at install
+                    // time goes stale once the manifest moves on (a Dev
+                    // checkout pulled to a newer version while the shell was
+                    // closed). Write the loaded manifest back so the durable
+                    // row matches what the shell shows. Best-effort.
+                    if manifest_drifted(
+                        stored_version.as_deref(),
+                        stored_api.as_deref(),
+                        &pkg.manifest,
+                    ) {
+                        log::info!(
+                            "[pkg_kernel] boot: `{id}` pkg_installed row drifted from manifest \
+                             (version {} -> {}, ikenga_api {} -> {}) — syncing row",
+                            stored_version.as_deref().unwrap_or("?"),
+                            pkg.manifest.version,
+                            stored_api.as_deref().unwrap_or("?"),
+                            pkg.manifest.ikenga_api
+                        );
+                        let db_sync = self.db.clone();
+                        let id_sync = id.clone();
+                        let manifest_sync = pkg.manifest.clone();
+                        if let Err(e) = tauri::async_runtime::block_on(async move {
+                            let pool = db_sync.ensure_pool().await.map_err(|e| anyhow!(e))?;
+                            write_manifest_columns(&pool, &id_sync, &manifest_sync).await
+                        }) {
+                            log::warn!(
+                                "[pkg_kernel] boot: sync pkg_installed row for `{id}` failed (continuing): {e:#}"
+                            );
+                        }
                     }
 
                     // Trust-review modal (2026-05-15): diff the current
@@ -1952,22 +2111,25 @@ pub fn is_visible_under(&self, pkg_id: &str, active_project_id: &str) -> bool {
                 .get(pkg_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("pkg `{pkg_id}` vanished mid-reload"))?;
-            let updated = InstalledSummary {
-                id: pkg_id.to_string(),
-                version: pkg.manifest.version.clone(),
-                ikenga_api: pkg.manifest.ikenga_api.clone(),
-                install_path: prev.install_path.clone(),
-                enabled: prev.enabled,
-                installed_at: prev.installed_at,
-                compatible: true,
-                source: prev.source,
-                project_id: prev.project_id,
-            };
+            let updated = reloaded_summary(prev, &pkg.manifest);
             g.insert(pkg_id.to_string(), updated.clone());
             updated
         };
-        let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
-        live.insert(pkg_id.to_string());
+        {
+            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+            live.insert(pkg_id.to_string());
+        }
+
+        // Write the reloaded manifest back to `pkg_installed` so the durable
+        // row matches what the shell now shows (only the manifest-derived
+        // columns; source / scope / install time are untouched). Best-effort:
+        // every registry already runs the new version, so a failed write is
+        // logged rather than failing the reload — boot replay re-syncs it.
+        if let Err(e) = self.update_manifest_row(pkg_id, &pkg.manifest) {
+            log::warn!(
+                "[pkg_kernel] reload: sync pkg_installed row for `{pkg_id}` failed (continuing): {e:#}"
+            );
+        }
 
         // Best-effort event emission for the FE. A failure here means the
         // iframe/webview won't auto-remount, but the reload itself
@@ -2625,6 +2787,82 @@ mod tests {
         assert!(scan_pkgs_dir(&pkgs.join("absent"), &HashSet::new(), &HashSet::new()).is_empty());
     }
 
+    /// A builtin pkg's `pkg_installed` row points at the bundled resource dir,
+    /// outside the pkgs dir. The row scan reports it healthy, and the pkgs-dir
+    /// half of `health_scan` (`unregistered_dir_issues` = `scan_pkgs_dir` over
+    /// `tracked_sets` of the same rows) never flags it, even when a stale
+    /// same-id folder that fails to load sits in the pkgs dir.
+    #[test]
+    fn builtin_row_outside_pkgs_dir_is_healthy_and_never_flagged() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let root = tempfile::tempdir().expect("tempdir");
+        let builtin = root
+            .path()
+            .join("resources")
+            .join("builtin-pkgs")
+            .join("com.ikenga.iyke");
+        write_manifest(
+            &builtin,
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.1.0", "ikenga_api": "5"}"#,
+        );
+        let pkgs = root.path().join("pkgs");
+        // A stale same-id copy in the pkgs dir that would not load
+        // (api-incompatible): the tracked id suppresses it.
+        write_manifest(
+            &pkgs.join("com.ikenga.iyke"),
+            r#"{"id": "com.ikenga.iyke", "name": "Iyke", "version": "0.0.1", "ikenga_api": "99"}"#,
+        );
+        let builtin_path = builtin.display().to_string();
+
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            for ddl in [
+                "CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, version TEXT, ikenga_api TEXT, manifest_json TEXT, install_path TEXT NOT NULL, installed_at INTEGER, enabled INTEGER NOT NULL DEFAULT 1, signature TEXT, source_json TEXT, project_id TEXT)",
+                "CREATE TABLE pkg_capability_snapshots (pkg_id TEXT PRIMARY KEY, manifest_capabilities_json TEXT NOT NULL, approved_at INTEGER NOT NULL, approved_by_implicit INTEGER NOT NULL DEFAULT 0)",
+                "CREATE TABLE pkg_settings (pkg_id TEXT, key TEXT, value_json TEXT, updated_at INTEGER, PRIMARY KEY (pkg_id, key))",
+                "CREATE TABLE pkg_permissions_granted (pkg_id TEXT, scope TEXT, granted_at INTEGER, PRIMARY KEY (pkg_id, scope))",
+                "CREATE TABLE pkg_migrations (pkg_id TEXT, version TEXT, applied_at INTEGER, PRIMARY KEY (pkg_id, version))",
+            ] {
+                sqlx::query(ddl).execute(&pool).await.expect("create table");
+            }
+            sqlx::query(
+                "INSERT INTO pkg_installed (id, version, ikenga_api, manifest_json, install_path, installed_at, enabled, source_json) VALUES (?,?,?,?,?,?,?,?)",
+            )
+            .bind("com.ikenga.iyke")
+            .bind("0.1.0")
+            .bind("5")
+            .bind("{}")
+            .bind(&builtin_path)
+            .bind(0)
+            .bind(1)
+            .bind(r#"{"kind":"builtin"}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let issues = scan_health(&pool).await.expect("scan");
+            assert!(issues.is_empty(), "builtin row is healthy; got {issues:?}");
+
+            let rows = read_install_rows(&pool).await.expect("rows");
+            assert_eq!(
+                rows,
+                vec![("com.ikenga.iyke".to_string(), builtin_path.clone(), true)]
+            );
+            let (tracked_ids, tracked_paths) = tracked_sets(&rows);
+            let dir_issues = scan_pkgs_dir(&pkgs, &tracked_ids, &tracked_paths);
+            assert!(
+                dir_issues.is_empty(),
+                "tracked builtin id is never flagged from the pkgs dir; got {dir_issues:?}"
+            );
+            let registered: HashSet<String> = ["com.ikenga.iyke".to_string()].into_iter().collect();
+            assert!(scan_unregistered_rows(&rows, &HashSet::new(), &registered).is_empty());
+        });
+    }
+
     const MEETINGS_020: &str = r#"{"id": "com.ikenga.meetings", "name": "Meetings", "version": "0.2.0",
         "ikenga_api": "5",
         "ui": {"nav": [{"id": "meetings", "label": "Meetings", "route": "/meetings"}]}}"#;
@@ -2848,6 +3086,95 @@ mod tests {
         }
     }
 
+    /// DEC-71: the Default project is personal scope for pkgs.
+    #[test]
+    fn normalize_scope_maps_default_project_to_workspace() {
+        assert_eq!(normalize_scope(Some("default".into())), None);
+        assert_eq!(normalize_scope(Some("project:default".into())), None);
+        assert_eq!(normalize_scope(Some(" project:default ".into())), None);
+        // Real project ids are untouched, including ones that merely contain
+        // "default".
+        assert_eq!(
+            normalize_scope(Some("project:kinnect".into())),
+            Some("kinnect".into())
+        );
+        assert_eq!(
+            normalize_scope(Some("default-2".into())),
+            Some("default-2".into())
+        );
+    }
+
+    /// DEC-71 / Round 58: with every row on `'default'`, switching to a real
+    /// project parked every pkg, builtins included.
+    #[test]
+    fn reconcile_never_parks_default_or_null_rows_under_a_real_project() {
+        let live: HashSet<String> = ["com.ikenga.studio", "com.ikenga.tasks", "com.test.kin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let installed = vec![
+            ("com.ikenga.studio".to_string(), Some("default".to_string())),
+            ("com.ikenga.tasks".to_string(), None),
+            ("com.test.kin".to_string(), Some("kinnect".to_string())),
+            (
+                "com.test.wire_default".to_string(),
+                Some("project:default".to_string()),
+            ),
+        ];
+        let plan = plan_reconcile(&installed, &live, "kinnect");
+        assert!(plan.park.is_empty(), "{plan:?}");
+        assert_eq!(plan.resume, vec!["com.test.wire_default".to_string()]);
+
+        // A real non-default project pkg still parks when its project is not
+        // active — the Default project included.
+        let plan = plan_reconcile(&installed, &live, "default");
+        assert_eq!(plan.park, vec!["com.test.kin".to_string()]);
+    }
+
+    /// `set_scope("project:default")` stores NULL, never `'default'`.
+    #[test]
+    fn store_scope_writes_null_for_default_project() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        tauri::async_runtime::block_on(async {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open in-memory sqlite");
+            sqlx::query("CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, install_path TEXT NOT NULL, project_id TEXT)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            for id in ["com.a", "com.b"] {
+                sqlx::query("INSERT INTO pkg_installed (id, install_path, project_id) VALUES (?, '/x', 'kinnect')")
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let stored = store_scope(&pool, "com.a", Some("project:default".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, None);
+            let stored = store_scope(&pool, "com.b", Some("project:p2".into()))
+                .await
+                .unwrap();
+            assert_eq!(stored, Some("p2".into()));
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT id, project_id FROM pkg_installed ORDER BY id")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("com.a".to_string(), None),
+                    ("com.b".to_string(), Some("p2".to_string())),
+                ]
+            );
+        });
+    }
+
     #[test]
     fn reconcile_forgets_uninstalled_ids_instead_of_parking() {
         // A live id with no install row (uninstalled / purged, or an installed
@@ -3018,5 +3345,204 @@ mod tests {
             other => panic!("expected the folder to move, got {other:?}"),
         }
         assert!(!install.exists());
+    }
+
+    // ── pkg_installed version drift ──
+
+    const PKG_INSTALLED_DDL: &str = "CREATE TABLE pkg_installed (id TEXT PRIMARY KEY, version TEXT NOT NULL, ikenga_api TEXT NOT NULL, manifest_json TEXT NOT NULL, install_path TEXT NOT NULL, installed_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, signature TEXT, source_json TEXT, project_id TEXT)";
+
+    fn drift_manifest(id: &str, version: &str) -> String {
+        format!(r#"{{"id": "{id}", "name": "Studio", "version": "{version}", "ikenga_api": "5"}}"#)
+    }
+
+    async fn drift_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        sqlx::query(PKG_INSTALLED_DDL)
+            .execute(&pool)
+            .await
+            .expect("create pkg_installed");
+        pool
+    }
+
+    /// Insert a row the way `persist_install` does, plus a signature, so the
+    /// test can prove the sync leaves every non-manifest column alone.
+    async fn insert_drift_row(pool: &sqlx::SqlitePool, pkg: &Package, source_json: &str) {
+        let manifest_json = serde_json::to_string(&pkg.manifest).unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO pkg_installed
+             (id, version, ikenga_api, manifest_json, install_path, installed_at, enabled, signature, source_json, project_id)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        )
+        .bind(&pkg.manifest.id)
+        .bind(&pkg.manifest.version)
+        .bind(&pkg.manifest.ikenga_api)
+        .bind(&manifest_json)
+        .bind(pkg.install_path.display().to_string())
+        .bind(1_700_000_000_000i64)
+        .bind("sig-abc")
+        .bind(source_json)
+        .bind("music-2026")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    type UntouchedCols = (
+        String,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    async fn untouched_cols(pool: &sqlx::SqlitePool, id: &str) -> UntouchedCols {
+        sqlx::query_as(
+            "SELECT install_path, installed_at, enabled, signature, source_json, project_id
+             FROM pkg_installed WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn stored_manifest_cols(pool: &sqlx::SqlitePool, id: &str) -> (String, String, String) {
+        sqlx::query_as("SELECT version, ikenga_api, manifest_json FROM pkg_installed WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Live repro: Studio installed at 0.6.0, then a Dev install pointed at a
+    /// checkout whose manifest is 0.8.0. `reload_pkg` must leave both the
+    /// in-memory summary (what `status()` reports) and the durable row at
+    /// 0.8.0, with source / scope / install time untouched.
+    #[test]
+    fn reload_syncs_pkg_installed_version_and_keeps_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "com.ikenga.studio";
+        let dir = root.path().join(id);
+        write_manifest(&dir, &drift_manifest(id, "0.6.0"));
+        let v060 = Package::load(&dir).expect("load 0.6.0");
+        let source = InstallSource::Dev {
+            path: dir.display().to_string(),
+        };
+        let source_json = serde_json::to_string(&source).unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let pool = drift_pool().await;
+            insert_drift_row(&pool, &v060, &source_json).await;
+            let before = untouched_cols(&pool, id).await;
+
+            let prev = InstalledSummary {
+                id: id.into(),
+                version: v060.manifest.version.clone(),
+                ikenga_api: v060.manifest.ikenga_api.clone(),
+                install_path: dir.display().to_string(),
+                enabled: true,
+                installed_at: 1_700_000_000_000,
+                compatible: true,
+                source: source.clone(),
+                project_id: Some("music-2026".into()),
+            };
+
+            // The checkout moves on; reload_pkg re-reads the manifest.
+            write_manifest(&dir, &drift_manifest(id, "0.8.0"));
+            let v080 = Package::load(&dir).expect("load 0.8.0");
+
+            // In-memory half: what `Kernel::status()` reports.
+            let updated = reloaded_summary(prev, &v080.manifest);
+            let status = super::super::status::assemble_status(vec![updated.clone()], &[], 1);
+            assert_eq!(status.installed[0].version, "0.8.0");
+            assert_eq!(updated.id, id);
+            assert_eq!(updated.source, source);
+            assert_eq!(updated.project_id.as_deref(), Some("music-2026"));
+            assert_eq!(updated.installed_at, 1_700_000_000_000);
+
+            // Durable half: the row reload_pkg now writes back.
+            let n = write_manifest_columns(&pool, id, &v080.manifest)
+                .await
+                .unwrap();
+            assert_eq!(n, 1);
+            let (version, api, manifest_json) = stored_manifest_cols(&pool, id).await;
+            assert_eq!(version, "0.8.0");
+            assert_eq!(api, "5");
+            let stored: Manifest = serde_json::from_str(&manifest_json).unwrap();
+            assert_eq!(stored.version, "0.8.0", "manifest_json follows the reload");
+            assert_eq!(
+                untouched_cols(&pool, id).await,
+                before,
+                "install_path / installed_at / enabled / signature / source_json / project_id unchanged"
+            );
+        });
+    }
+
+    /// Boot replay with a DB row at 0.6.0 and an on-disk manifest at 0.8.0
+    /// detects the drift and updates the row; a matching row reads as clean;
+    /// the narrow update never invents a row.
+    #[test]
+    fn boot_replay_syncs_drifted_pkg_installed_row() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "com.ikenga.studio";
+        let dir = root.path().join(id);
+        write_manifest(&dir, &drift_manifest(id, "0.6.0"));
+        let v060 = Package::load(&dir).unwrap();
+        let source_json = serde_json::to_string(&InstallSource::Local {
+            path: dir.display().to_string(),
+        })
+        .unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let pool = drift_pool().await;
+            insert_drift_row(&pool, &v060, &source_json).await;
+            let before = untouched_cols(&pool, id).await;
+
+            // Matching row: no drift, boot writes nothing.
+            let (sv, sa, _) = stored_manifest_cols(&pool, id).await;
+            assert!(!manifest_drifted(Some(&sv), Some(&sa), &v060.manifest));
+
+            // Manifest moved to 0.8.0 while the shell was closed.
+            write_manifest(&dir, &drift_manifest(id, "0.8.0"));
+            let v080 = Package::load(&dir).unwrap();
+            assert!(manifest_drifted(Some(&sv), Some(&sa), &v080.manifest));
+            // ikenga_api alone also counts as drift.
+            let mut api_only = v060.manifest.clone();
+            api_only.ikenga_api = "4".into();
+            assert!(manifest_drifted(Some(&sv), Some(&sa), &api_only));
+
+            // What boot does on drift.
+            assert_eq!(
+                write_manifest_columns(&pool, id, &v080.manifest)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let (sv, sa, _) = stored_manifest_cols(&pool, id).await;
+            assert_eq!(sv, "0.8.0");
+            assert!(
+                !manifest_drifted(Some(&sv), Some(&sa), &v080.manifest),
+                "converged"
+            );
+            assert_eq!(untouched_cols(&pool, id).await, before);
+
+            // No row → no insert.
+            assert_eq!(
+                write_manifest_columns(&pool, "com.test.absent", &v080.manifest)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pkg_installed")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+        });
     }
 }

@@ -51,7 +51,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 use crate::pkg::manifest::{Package, SettingsField, IKENGA_API_VERSION};
-use crate::pkg::registries::UiRoutesRegistry;
+use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, UiRoutesRegistry, ViewsRegistry};
 use crate::pkg::registry::Registry;
 use crate::pkg::skill_actions::{list_actions_for_pkg, SkillAction};
 use crate::pkg::{assemble_status, InstallSource, InstalledSummary, KernelStatus};
@@ -131,13 +131,15 @@ fn manifest_mtime_ms(install_path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-/// Discovered pkgs as `InstalledSummary` rows plus a live `ui_routes`
-/// registry. Immutable after construction — the daemon has no install path.
+/// Discovered pkgs as `InstalledSummary` rows plus live `ui_routes`, `views`,
+/// and `activity_bar` registries. Immutable after construction — the daemon has no install path.
 #[derive(Default)]
 pub struct PkgIndex {
     /// Sorted by id so `pkg_kernel_status` is stable across calls.
     installed: Vec<InstalledSummary>,
     ui_routes: UiRoutesRegistry,
+    views: ViewsRegistry,
+    activity_bar: ActivityBarRegistry,
     /// `pkg_id` → declared `settings.schema`, captured at index time the way
     /// the desktop `SettingsRegistry` captures it at register time — through
     /// the same `settings_values::declared_schema`, and only for pkgs that go
@@ -148,6 +150,8 @@ pub struct PkgIndex {
 impl PkgIndex {
     pub fn from_packages(pkgs: &[Package]) -> Self {
         let ui_routes = UiRoutesRegistry::new();
+        let views = ViewsRegistry::new();
+        let activity_bar = ActivityBarRegistry::new();
         let mut settings_schemas = HashMap::new();
         let mut installed: Vec<InstalledSummary> = Vec::with_capacity(pkgs.len());
         for pkg in pkgs {
@@ -164,6 +168,18 @@ impl PkgIndex {
                         pkg.manifest.id
                     );
                     continue;
+                }
+                if let Err(e) = views.register(pkg) {
+                    warn!(
+                        "[pkg_index] {}: no views entry (views rejected it): {e:#}",
+                        pkg.manifest.id
+                    );
+                }
+                if let Err(e) = activity_bar.register(pkg) {
+                    warn!(
+                        "[pkg_index] {}: no rail entry (activity_bar rejected it): {e:#}",
+                        pkg.manifest.id
+                    );
                 }
                 if let Some(schema) = crate::pkg::settings_values::declared_schema(pkg) {
                     settings_schemas.insert(pkg.manifest.id.clone(), schema);
@@ -205,6 +221,8 @@ impl PkgIndex {
         Self {
             installed,
             ui_routes,
+            views,
+            activity_bar,
             settings_schemas,
         }
     }
@@ -222,13 +240,22 @@ impl PkgIndex {
         &self.installed
     }
 
+    /// Set an activity-bar badge for an installed pkg.
+    pub fn set_badge(&self, pkg_id: &str, badge: Option<ActivityBarBadge>) -> anyhow::Result<bool> {
+        self.activity_bar.set_badge(pkg_id, badge)
+    }
+
     /// The `pkg_kernel_status` payload — through the same
-    /// [`assemble_status`] the desktop `Kernel::status` uses, with only the
-    /// registry the daemon actually runs.
+    /// [`assemble_status`] the desktop `Kernel::status` uses, with the
+    /// registries the daemon runs (`ui_routes`, `views`, `activity_bar`).
     pub fn status(&self) -> KernelStatus {
         assemble_status(
             self.installed.clone(),
-            &[&self.ui_routes as &dyn Registry],
+            &[
+                &self.ui_routes as &dyn Registry,
+                &self.views as &dyn Registry,
+                &self.activity_bar as &dyn Registry,
+            ],
             IKENGA_API_VERSION,
         )
     }
@@ -403,6 +430,8 @@ mod tests {
             vec!["com.test.comp", "com.test.iframe"],
             "incompatible pkg must not go live"
         );
+        assert!(wire["registries"].get("views").is_some());
+        assert!(wire["registries"].get("activity_bar").is_some());
     }
 
     #[test]

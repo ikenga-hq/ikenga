@@ -216,6 +216,7 @@ pub fn item_name(name: &str) -> Result<String, String> {
 /// The service doubles as the item prefix because the Windows credential
 /// target is the item name itself: a different service with the production
 /// prefix would still address (and overwrite) the production credentials.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))] // keyring_store only
 pub(crate) fn item_name_for_service(service: &str, name: &str) -> Result<String, String> {
     validate_legacy_name(name)?;
     Ok(format!("{service}:{name}"))
@@ -275,13 +276,13 @@ fn ensure_directory_chain(path: &Path) -> Result<(), String> {
     for directory in chain.into_iter().rev() {
         match fs::symlink_metadata(directory) {
             Ok(metadata) => {
-                if is_link_or_reparse_point(&metadata) {
+                if is_untrusted_directory_link(&metadata) {
                     return Err(format!(
                         "refusing linked secrets directory {}",
                         directory.display()
                     ));
                 }
-                if !metadata.is_dir() {
+                if !is_directory_or_link_to_one(directory, &metadata) {
                     return Err(format!(
                         "secrets path is not a directory: {}",
                         directory.display()
@@ -317,6 +318,35 @@ fn reject_link(path: &Path, label: &str) -> Result<(), String> {
         return Err(format!("{label} is not a regular file: {}", path.display()));
     }
     Ok(())
+}
+
+/// Directory-chain variant of `is_link_or_reparse_point`: a link that only
+/// root could have created (macOS `/var` -> `/private/var`, `/tmp` ->
+/// `/private/tmp`) is part of the OS layout, not something an attacker planted,
+/// so it is followed. Any other link or reparse point is refused.
+pub(crate) fn is_untrusted_directory_link(metadata: &fs::Metadata) -> bool {
+    if !is_link_or_reparse_point(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// `metadata` is the `symlink_metadata` of `path`. A link that passed
+/// `is_untrusted_directory_link` is judged by what it points at.
+pub(crate) fn is_directory_or_link_to_one(path: &Path, metadata: &fs::Metadata) -> bool {
+    if is_link_or_reparse_point(metadata) {
+        fs::metadata(path).is_ok_and(|target| target.is_dir())
+    } else {
+        metadata.is_dir()
+    }
 }
 
 fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
@@ -433,6 +463,35 @@ mod tests {
                 "workspace::TOKEN".to_string()
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_refuses_a_user_owned_linked_directory() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("linked");
+        symlink(&target, &link).unwrap();
+        let error = write_atomic(&link.join("secret"), b"value").unwrap_err();
+        assert!(error.contains(&format!(
+            "refusing linked secrets directory {}",
+            link.display()
+        )));
+        assert!(!target.join("secret").exists());
+    }
+
+    // macOS `/tmp` is a root-owned link to `/private/tmp`; refusing it broke
+    // every secrets write under `$TMPDIR` (`/var` -> `/private/var`) on macOS.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn write_atomic_follows_root_owned_os_links() {
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("nested").join("secret");
+        assert!(path.starts_with("/tmp"));
+        write_atomic(&path, b"value").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"value");
     }
 
     #[test]

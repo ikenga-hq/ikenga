@@ -13,6 +13,9 @@
 //     always loaded, and the Ngwa snapshot reports it as scope `personal`.
 //   - 'project'  → 'project:<active project id>', or null (the kernel's
 //     default: the active project) when the shell doesn't know the id yet.
+//     DEC-71 (Round 58): the Default project *is* personal for pkg scope, so
+//     with Default active the project target is 'workspace' too (and the
+//     sheet labels it "personal" — `pkgProjectTarget`).
 //   - update     → the installed item's own scope, so updating never moves a
 //     pkg between scopes.
 //
@@ -47,6 +50,12 @@ import {
 import { registryKeys, useRegistryIndex } from '@/lib/registry/use-registry';
 import { queryKeys } from '@/lib/query-keys';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { classifyInstallError } from '@/lib/ngwa/install-errors';
+import {
+	dispatchInstallProgress,
+	ensureInstallProgressSubscription,
+	useInstallProgressStore,
+} from '@/lib/ngwa/install-progress';
 import {
 	claudePrimitiveEnable,
 	obaInstallGit,
@@ -54,6 +63,7 @@ import {
 	obaInstallWithDeps,
 	obaResolveSource,
 	obaUpdate,
+	pkgInstallCancel,
 	type ClaudeStoreEntry,
 	type ClaudeStoreKind,
 	type ClaudeStoreScope,
@@ -66,18 +76,64 @@ import {
 
 export type StoreInstallScope = 'personal' | 'project';
 
+/** In-flight registry installs by Store row id, so Cancel can stop a plan
+ *  between steps (the step in flight is cancelled in Rust). */
+const inflight = new Map<string, AbortController>();
+
+/**
+ * Cancel a Store row's install or update. Safe up to registering: before a
+ * step reaches the installer it just stops; a step in flight is asked to stop
+ * (`pkgInstallCancel`), which the installer honours until it registers, and
+ * cleans up after. Resolves once the request is sent.
+ */
+export async function cancelStoreInstall(key: string): Promise<void> {
+	const run = useInstallProgressStore.getState().runs[key];
+	if (!run || run.status !== 'running' || !run.cancellable) return;
+	dispatchInstallProgress({ type: 'cancel-requested', key });
+	inflight.get(key)?.abort();
+	try {
+		await pkgInstallCancel(key);
+	} catch (e) {
+		// No installer to stop (a browser tab, or between steps): the abort
+		// above already stops the plan before its next step.
+		console.warn('[store-install] cancel request failed:', e);
+	}
+}
+
+/** The Default project's id (`DEFAULT_PROJECT_ID` in the Rust core). */
+export const DEFAULT_PROJECT_ID = 'default';
+
+/** DEC-71: for pkg scope, the Default project means personal (workspace). */
+export function isDefaultProject(projectId: string | null | undefined): boolean {
+	return projectId === DEFAULT_PROJECT_ID;
+}
+
 export function storeScopeWire(
 	scope: StoreInstallScope,
 	activeProjectId: string | null | undefined
 ): PkgScopeWire | null {
-	if (scope === 'personal') return 'workspace';
+	if (scope === 'personal' || isDefaultProject(activeProjectId)) return 'workspace';
 	return activeProjectId ? `project:${activeProjectId}` : null;
+}
+
+/**
+ * The Store's project install target for a pkg, as a label: the active
+ * project's name, or null when there is no project target because the active
+ * project is Default (DEC-71) — the sheet then offers personal only (D-02:
+ * the scopes are personal plus real projects).
+ */
+export function pkgProjectTarget(
+	activeProjectId: string | null | undefined,
+	projectLabel: string
+): string | null {
+	return isDefaultProject(activeProjectId) ? null : projectLabel;
 }
 
 /** An installed item's current scope, as the wire value that keeps it there. */
 export function installedScopeWire(scope: NgwaScope | undefined): PkgScopeWire | null {
 	if (!scope) return null;
-	return scope.kind === 'personal' ? 'workspace' : `project:${scope.project_id}`;
+	if (scope.kind === 'personal' || isDefaultProject(scope.project_id)) return 'workspace';
+	return `project:${scope.project_id}`;
 }
 
 /** Ọba's scope for a Store scope choice (personal = the workspace, which
@@ -250,25 +306,68 @@ export function useStoreInstall(): UseStoreInstall {
 		]);
 	}
 
+	ensureInstallProgressSubscription();
+
+	/** Start a row's progress run (queued for Update all). */
+	function startRun(entry: NgwaStoreEntry, isUpdate: boolean, queued = false) {
+		dispatchInstallProgress({
+			type: 'start',
+			key: entry.id,
+			name: entry.displayName,
+			verb: isUpdate ? 'update' : 'install',
+			queued,
+		});
+	}
+
 	async function installOne(
 		entry: NgwaStoreEntry,
 		scope: PkgScopeWire | null,
 		isUpdate: boolean,
 		approved = false
 	) {
-		const root = await getDetail(entry.registryEntry.name);
-		if (isUpdate && entry.installedItem && !approved) {
-			// Same pre-update capability diff as the batch updater (WP-41-F1):
-			// the install records itself as approved, so stop here first and
-			// hand the review to the caller — a hold, not a failure.
-			const review = await previewIncomingTrust(entry.installedItem.id, root, entry.latestVersion);
-			if (review) throw new NeedsApprovalError([{ entry, review }]);
+		const key = entry.id;
+		const controller = new AbortController();
+		inflight.set(key, controller);
+		dispatchInstallProgress({ type: 'resolving', key });
+		try {
+			const root = await getDetail(entry.registryEntry.name);
+			if (isUpdate && entry.installedItem && !approved) {
+				// Same pre-update capability diff as the batch updater (WP-41-F1):
+				// the install records itself as approved, so stop here first and
+				// hand the review to the caller — a hold, not a failure.
+				const review = await previewIncomingTrust(entry.installedItem.id, root, entry.latestVersion);
+				if (review) throw new NeedsApprovalError([{ entry, review }]);
+			}
+			await resolveAndInstall({
+				root,
+				getDetail,
+				version: entry.latestVersion,
+				scope,
+				installId: key,
+				signal: controller.signal,
+				onStep: (index, total, pkgId) =>
+					dispatchInstallProgress({ type: 'step', key, index, total, pkgId }),
+			});
+			dispatchInstallProgress({ type: 'succeeded', key });
+		} catch (e) {
+			// Held for approval is not a failure: the review takes over the row.
+			if (isNeedsApproval(e)) dispatchInstallProgress({ type: 'clear', key });
+			else {
+				dispatchInstallProgress({
+					type: 'failed',
+					key,
+					error: classifyInstallError(e, entry.displayName),
+				});
+			}
+			throw e;
+		} finally {
+			inflight.delete(key);
 		}
-		await resolveAndInstall({ root, getDetail, version: entry.latestVersion, scope });
 	}
 
 	return {
 		async install(entry, scope) {
+			startRun(entry, false);
 			try {
 				await installOne(entry, storeScopeWire(scope, activeProjectId), false);
 			} finally {
@@ -276,6 +375,7 @@ export function useStoreInstall(): UseStoreInstall {
 			}
 		},
 		async update(entry, opts) {
+			startRun(entry, true);
 			try {
 				await installOne(
 					entry,
@@ -290,15 +390,30 @@ export function useStoreInstall(): UseStoreInstall {
 		async updateAll(entries) {
 			const failed: string[] = [];
 			const approvals: PendingUpdateApproval[] = [];
+			// Every row shows its own progress: queued until its turn.
+			for (const entry of entries) startRun(entry, true, true);
 			try {
 				// One failing pkg must not abort the rest (batch-updater rule),
 				// and a held-back pkg is parked for approval, not failed.
 				for (const entry of entries) {
+					// Cancelled while still queued: skip it.
+					if (useInstallProgressStore.getState().runs[entry.id]?.cancelRequested) {
+						dispatchInstallProgress({
+							type: 'failed',
+							key: entry.id,
+							error: classifyInstallError('install cancelled', entry.displayName),
+						});
+						continue;
+					}
 					try {
 						await installOne(entry, installedScopeWire(entry.installedItem?.scope), true);
 					} catch (e) {
+						// Each row shows its own readable error; the batch summary
+						// keeps the short raw reason. A cancel isn't a failure.
+						const msg = e instanceof Error ? e.message : String(e);
 						if (isNeedsApproval(e)) approvals.push(...e.approvals);
-						else failed.push(`${entry.displayName}: ${e instanceof Error ? e.message : String(e)}`);
+						else if (classifyInstallError(e, entry.displayName).kind !== 'cancelled')
+							failed.push(`${entry.displayName}: ${msg}`);
 					}
 				}
 			} finally {

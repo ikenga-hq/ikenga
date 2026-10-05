@@ -16,9 +16,9 @@
 
 import { ChevronRight, ShieldCheck } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { cn } from '@/components/ui/utils';
-import { EmptyState } from '@/components/states';
 import { LoreTerm } from '@/components/lore/lore-term';
+import { EmptyState } from '@/components/states';
+import { cn } from '@/components/ui/utils';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { useCommands } from '@/lib/keymap/dispatcher';
 import { findEntry, labelFor } from '@/lib/keymap/registry';
@@ -29,8 +29,9 @@ import type { LeafNode, PaneNode, PaneView } from '@/lib/panes/types';
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { DetectedAgent, SeatView } from '@/lib/tauri-cmd';
-import { COMPANION_FOCUS_EVENT } from '@/shell/companion-focus';
 import { listen } from '@/lib/transport';
+import { COMPANION_FOCUS_EVENT } from '@/shell/companion-focus';
+import { hostDecideBlock, refreshHostDecideBlock } from '@/shell/notifications/actions';
 import { CostHud } from '@/terminal/cost-hud';
 import { MissionControl } from '@/terminal/mission-control';
 import { ToolCallFeed } from '@/terminal/tool-call-feed';
@@ -216,7 +217,11 @@ export function Companion() {
 
 	if (companionState === 'hidden') return <SeatNoticeHost />;
 
-	const selectedKey = sel ? (sel.kind === 'seat' ? `seat:${sel.seat_id}` : `session:${sel.session_id}`) : null;
+	const selectedKey = sel
+		? sel.kind === 'seat'
+			? `seat:${sel.seat_id}`
+			: `session:${sel.session_id}`
+		: null;
 
 	if (companionState === 'collapsed') {
 		return (
@@ -401,7 +406,9 @@ function CompanionPanels({ roster }: { roster: SeatRoster }) {
 	const scopeLabel = selSeat ? atName(selSeat.name) : scope ? sessionName(scope) : null;
 	// G-SEATS §9.1: selecting a seat scopes the permission panel too. A card
 	// with no session id can't be pinned on anyone, so it shows everywhere.
-	const shown = scope ? permissions.filter((p) => !p.sessionId || p.sessionId === scope) : permissions;
+	const shown = scope
+		? permissions.filter((p) => !p.sessionId || p.sessionId === scope)
+		: permissions;
 	const pending = shown.filter((p) => p.status === 'pending').length;
 	const elsewhere = new Map<string, number>();
 	if (scope) {
@@ -417,7 +424,11 @@ function CompanionPanels({ roster }: { roster: SeatRoster }) {
 	return (
 		<div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
 			{selSeat && selSeat.status === 'vacant' && <SeatVacantPanel seat={selSeat} />}
-			<Panel title="Permissions" scope={scopeLabel} count={pending ? `${pending} pending` : 'none pending'}>
+			<Panel
+				title="Permissions"
+				scope={scopeLabel}
+				count={pending ? `${pending} pending` : 'none pending'}
+			>
 				{/* §5.6 cards only: the scoped PermissionInbox HUD stays in the
 				    terminal host's side panels, not in the Companion. */}
 				<PermissionCards cards={shown} ownerOf={(id) => ownerLabel(id, roster.seats)} />
@@ -490,10 +501,15 @@ export function PermissionCards({
 		// Fix round 1: a focused button (Allow once / Always / Deny) handles
 		// its own Enter/Space — A/D must not also act behind its back.
 		if (el instanceof HTMLButtonElement) return;
-		const id = el instanceof Element ? el.closest('[data-permission-card]')?.getAttribute('data-permission-card') : null;
+		const id =
+			el instanceof Element
+				? el.closest('[data-permission-card]')?.getAttribute('data-permission-card')
+				: null;
 		if (!id) return;
 		const card = cards.find((c) => c.id === id);
 		if (!card || card.status !== 'pending') return;
+		// Routed to another device (§5.1): the card offers no decision.
+		if (hostDecideBlock()) return;
 		resolve(id, decision);
 	};
 	useCommands({
@@ -535,6 +551,20 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 	const resolve = useCompanionStore((s) => s.resolvePermission);
 
 	const title = card.kind === 'tool_use' ? `Tool use: ${card.toolName}` : card.toolName;
+	// §5.1 (review WP78a-R1): an ask routed to another device offers no
+	// Allow / Always / Deny here — the reason instead, as the popover does.
+	const pending = card.status === 'pending';
+	const [block, setBlock] = useState<string | null>(() => hostDecideBlock());
+	useEffect(() => {
+		if (!pending) return;
+		let live = true;
+		void refreshHostDecideBlock().then((b) => {
+			if (live) setBlock(b);
+		});
+		return () => {
+			live = false;
+		};
+	}, [pending]);
 	return (
 		<fieldset
 			// biome-ignore lint/a11y/noNoninteractiveTabindex: the card is the focus target for A / D (spec §2)
@@ -576,7 +606,17 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 					{JSON.stringify(card.toolInput, null, 2)}
 				</pre>
 			)}
-			{card.status === 'pending' && (
+			{pending && block && (
+				<div
+					role="status"
+					data-state="routed-away"
+					className="mt-2 text-[11px]"
+					style={{ color: 'var(--fg-muted)' }}
+				>
+					{block}
+				</div>
+			)}
+			{pending && !block && (
 				<div className="mt-3 flex flex-wrap gap-2">
 					<CardButton tone="primary" onClick={() => resolve(card.id, 'allow')}>
 						Allow once
@@ -601,9 +641,11 @@ function PermissionCard({ card, owner }: { card: PermissionCardEntry; owner: str
 				<div className="mt-2 text-[11px]" style={{ color: 'var(--fg-muted)' }}>
 					{card.appliedElsewhere
 						? 'Already applied'
-						: card.decision
-							? DECISION_TEXT[card.decision]
-							: 'Resolved'}
+						: card.refused
+							? 'Not answered here'
+							: card.decision
+								? DECISION_TEXT[card.decision]
+								: 'Resolved'}
 					{card.ruleFile && (
 						<span className="block font-mono">Rule written to {card.ruleFile}</span>
 					)}

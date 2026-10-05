@@ -10,6 +10,13 @@
 //   `actions_trust_grant`. Rendered by `ProjectActionsTrustSheet` below; the
 //   package modes are unchanged.
 //
+// G-ACCESS §5.8 (G-62, WP-75): on a server with accounts (`access_status.
+// tier === 't1'`) the package sheet splits the trust question in two:
+// "Operator policy" (read-only — may this principal install here at all:
+// kernel pkgs are operator-installed, a vault item needs `install` in this
+// context) above "Your trust" (the existing per-item prompt, whose records
+// live in the principal's own child). The desktop (T0) sheet is unchanged.
+//
 // Adheres strictly to kernel capability boundaries (shell_execute, fs_write_outside_sandbox, net, vault_keys)
 // and uses token-only styling.
 
@@ -38,6 +45,8 @@ import {
 	type KeybindingRule,
 } from '@/lib/actions/client';
 import { bindingsHash, trustShown, untrustedActions } from '@/lib/actions/runner/trust';
+import { TIER_LABELS } from '@/lib/access/caps.gen';
+import { type AccessStatus, accessStatus } from '@/lib/access/client';
 import './ngwa.css';
 
 export type TrustSheetMode = 'review' | 'update' | 'violation' | 'project-actions';
@@ -82,6 +91,66 @@ export function NgwaTrustSheet(props: NgwaTrustSheetProps) {
 		);
 	}
 	return <PkgTrustSheet {...props} />;
+}
+
+/** The read-only "Operator policy" lines for `item` in this context
+ *  (§5.8), or `null` off a T1 server (the desktop sheet is unchanged). */
+export function operatorPolicy(
+	item: Pick<NgwaItem, 'id'>,
+	status: AccessStatus | null | undefined
+): { kernel: boolean; canInstall: boolean; line: string } | null {
+	if (!status || status.tier !== 't1') return null;
+	// Kernel pkgs carry their manifest id; vault items are `${kind}:${scope}:${name}`.
+	const kernel = !item.id.includes(':');
+	if (kernel) {
+		return {
+			kernel,
+			canInstall: false,
+			line: 'Installed by the operator — ask them to add or remove it.',
+		};
+	}
+	const canInstall = status.caps.includes('install');
+	if (canInstall) {
+		return {
+			kernel,
+			canInstall,
+			line: status.share
+				? `You may add or remove it in ${status.share.projectName} — project scope only.`
+				: 'You may add or remove it in your own workspace.',
+		};
+	}
+	return {
+		kernel,
+		canInstall,
+		line: status.share
+			? `Your role in ${status.share.projectName} can't install packages.`
+			: `This device can't install packages — it is ${TIER_LABELS[status.credential.tier].label}.`,
+	};
+}
+
+function OperatorPolicyBlock({ item }: { item: NgwaItem }) {
+	const status = useQuery({
+		queryKey: ['access', 'status'],
+		queryFn: () => accessStatus(),
+		staleTime: 30_000,
+		retry: false,
+	});
+	const policy = operatorPolicy(item, status.data);
+	if (!policy) return null;
+	return (
+		<section data-trust-split="operator" className="mb-4" aria-label="Operator policy">
+			<div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
+				Operator policy
+			</div>
+			<div className="p-3 text-xs text-muted-foreground bg-muted/20 rounded border border-border flex items-start gap-2">
+				<Lock className="h-3.5 w-3.5 flex-none mt-0.5" />
+				<span>{policy.line}</span>
+			</div>
+			<div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mt-4">
+				Your trust
+			</div>
+		</section>
+	);
 }
 
 function PkgTrustSheet({
@@ -181,6 +250,7 @@ function PkgTrustSheet({
 
 				{/* ── Body ── */}
 				<div className="trust-body sc">
+					<OperatorPolicyBlock item={item} />
 					{actionError && (
 						<div className="p-3 mb-3 bg-destructive/10 border border-destructive/30 rounded text-destructive text-xs">
 							{actionError}

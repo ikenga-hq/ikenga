@@ -133,6 +133,28 @@ impl ClaudeCodeEngine {
         }
     }
 
+    /// G-ACCESS §5.5 (WP-75): the decide core's ACP resolver — the first
+    /// production caller of the parked round-trip. Answers `request_id` with
+    /// the engine option for `decision` (`allow_once` → Allow once,
+    /// `allow_always_project` → Allow always, `deny` → Reject once).
+    /// `false` when nothing is parked under it any more (answered, cancelled
+    /// or timed out — §5.6: never revived).
+    pub async fn answer_permission(
+        &self,
+        request_id: &str,
+        decision: crate::server::shared::notifications::routing::Decision,
+    ) -> bool {
+        let Some(tx) = self.permission_waiters.lock().await.remove(request_id) else {
+            return false;
+        };
+        let resp = RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            agent_client_protocol::schema::SelectedPermissionOutcome::new(option_for_decision(
+                decision,
+            )),
+        ));
+        tx.send(resp).is_ok()
+    }
+
     /// Negotiated protocol version we'll advertise. Hard-coded for now —
     /// the crate exports it as `ProtocolVersion::V1` (numeric 1).
     pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V1;
@@ -233,7 +255,7 @@ impl ClaudeCodeEngine {
         // Phase 3 ignores `mcp_servers` — claude already wires its own MCP
         // via `--mcp-config`. Phase 9 will translate ACP-declared servers
         // into a generated config file.
-        let opts = SessionOpts::default();
+        let opts = launch_opts_from_meta(req.meta.as_ref());
         let mut initial_mode = opts.permission_mode;
         let session = self.sessions.get_or_create(&thread_id, &cwd, opts).await;
 
@@ -532,16 +554,29 @@ impl ClaudeCodeEngine {
         // `chat://notify` is gone. Spawned so this loop never waits on a DB
         // write; the round-trip task below resolves it (`resolvedAt`) once
         // it is answered, cancelled or times out.
+        //
+        // G-ACCESS §5.7 / §5.5 (a) (WP-75): recorded with its attribution
+        // (the session's cwd → project, classified against its root) and
+        // mirrored to the daemon until the round-trip's own bound.
         let pa_db = app.try_state::<Arc<PaDb>>().map(|db| db.inner().clone());
-        if let Some(db) = pa_db.clone() {
+        {
             let new = crate::notifications::producers::permission_from_engine(
                 &thread_id,
                 &request_id,
                 &tool_name,
                 tool_input.as_ref(),
             );
+            let facts = crate::notifications::producers::ask_facts(
+                Some(&tool_name),
+                tool_input.as_ref(),
+                Some(&session.cwd),
+                false,
+            );
+            let expires =
+                chrono::Utc::now().timestamp_millis() + (PERMISSION_TIMEOUT_SECS as i64) * 1000;
+            let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                crate::notifications::record_with_db(&db, new).await;
+                crate::notifications::record_permission(&app, new, facts, Some(expires)).await;
             });
         }
 
@@ -561,7 +596,9 @@ impl ClaudeCodeEngine {
         } else {
             crate::claude::session::ControlWire::Legacy
         };
+        let app_for_task = app.clone();
         tauri::async_runtime::spawn(async move {
+            let mut outcome = "decided_on_host";
             let response = match tokio::time::timeout(
                 Duration::from_secs(PERMISSION_TIMEOUT_SECS),
                 rx,
@@ -570,6 +607,7 @@ impl ClaudeCodeEngine {
             {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(_)) | Err(_) => {
+                    outcome = "timed_out";
                     // Sender dropped (server torn down) OR timeout. Either
                     // way, synthesize a Cancelled outcome so claude doesn't
                     // hang waiting on us. We also evict the (possibly
@@ -602,6 +640,9 @@ impl ClaudeCodeEngine {
             if let Some(db) = pa_db {
                 crate::notifications::resolve_key_with_db(&db, &notification_key).await;
             }
+            // §5.5 (a): close the daemon's mirror (a no-op when a paired
+            // device decided it).
+            crate::notifications::relay_resolved(&app_for_task, &notification_key, outcome);
         });
     }
 
@@ -883,11 +924,52 @@ fn resolve_thread_id(meta: Option<&serde_json::Map<String, serde_json::Value>>) 
 /// Empty-string projectId is treated as "absent" so a callsite that always
 /// includes the field but with no value transparently falls back to the
 /// shell's active project.
+/// WP-11: session launch options carried on `_meta` of ACP `session/new`
+/// (`pluginDirs`, `appendSystemPrompt`, `role`), the same channel as
+/// `projectId`. Absent or mistyped keys leave the default, so a request
+/// without them creates exactly the session it did before.
+fn launch_opts_from_meta(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> SessionOpts {
+    let mut opts = SessionOpts::default();
+    let Some(m) = meta else { return opts };
+    let str_of = |k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(dirs) = m.get("pluginDirs").and_then(|v| v.as_array()) {
+        opts.plugin_dirs = dirs
+            .iter()
+            .filter_map(|d| d.as_str())
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    opts.append_system_prompt = str_of("appendSystemPrompt");
+    opts.role = str_of("role");
+    opts
+}
+
 fn resolve_project_id(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
     meta.and_then(|m| m.get("projectId"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// `permission_decide`'s decision → this engine's option id (§5.5).
+pub fn option_for_decision(
+    decision: crate::server::shared::notifications::routing::Decision,
+) -> &'static str {
+    use crate::engines::claude_code::permission::{
+        OPT_ALLOW_ALWAYS, OPT_ALLOW_ONCE, OPT_REJECT_ONCE,
+    };
+    use crate::server::shared::notifications::routing::Decision;
+    match decision {
+        Decision::AllowOnce => OPT_ALLOW_ONCE,
+        Decision::AllowAlwaysProject => OPT_ALLOW_ALWAYS,
+        Decision::Deny => OPT_REJECT_ONCE,
+    }
 }
 
 /// Tauri-friendly wrapper around the server.
@@ -932,6 +1014,40 @@ mod tests {
         let id = resolve_thread_id(None);
         assert_eq!(id.len(), 36);
         assert!(id.contains('-'));
+    }
+
+    #[test]
+    fn launch_opts_from_meta_reads_wp11_keys() {
+        let meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "projectId": "p",
+                "pluginDirs": ["/plugins/ikenga", "", 7],
+                "appendSystemPrompt": "Use the iyke tools.",
+                "role": "plan",
+            }))
+            .unwrap();
+        let opts = launch_opts_from_meta(Some(&meta));
+        assert_eq!(opts.plugin_dirs, vec!["/plugins/ikenga".to_string()]);
+        assert_eq!(
+            opts.append_system_prompt.as_deref(),
+            Some("Use the iyke tools.")
+        );
+        assert_eq!(opts.role.as_deref(), Some("plan"));
+        assert_eq!(opts.model, None);
+    }
+
+    #[test]
+    fn launch_opts_from_meta_without_keys_is_the_default() {
+        let meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({ "threadId": "t", "role": "" })).unwrap();
+        for opts in [
+            launch_opts_from_meta(None),
+            launch_opts_from_meta(Some(&meta)),
+        ] {
+            assert!(opts.plugin_dirs.is_empty());
+            assert_eq!(opts.append_system_prompt, None);
+            assert_eq!(opts.role, None);
+        }
     }
 
     #[test]
@@ -1011,6 +1127,37 @@ mod tests {
             }
             _ => panic!("expected Selected outcome"),
         }
+    }
+
+    /// G-ACCESS §5.5 (WP-75): the decide core's ACP resolver answers a
+    /// parked round-trip once, with the mapped option; a gone ask is `false`.
+    #[tokio::test]
+    async fn answer_permission_maps_the_decision_and_answers_once() {
+        use crate::server::shared::notifications::routing::Decision;
+        let server = ClaudeCodeEngine::default();
+        let (tx, rx) = oneshot::channel::<RequestPermissionResponse>();
+        server
+            .permission_waiters
+            .lock()
+            .await
+            .insert("req_a".into(), tx);
+        assert!(
+            server
+                .answer_permission("req_a", Decision::AllowAlwaysProject)
+                .await
+        );
+        match rx.await.expect("fires").outcome {
+            RequestPermissionOutcome::Selected(s) => assert_eq!(
+                s.option_id.0.as_ref(),
+                crate::engines::claude_code::permission::OPT_ALLOW_ALWAYS
+            ),
+            _ => panic!("expected Selected"),
+        }
+        assert!(!server.answer_permission("req_a", Decision::Deny).await);
+        assert_eq!(
+            option_for_decision(Decision::Deny),
+            crate::engines::claude_code::permission::OPT_REJECT_ONCE
+        );
     }
 
     #[tokio::test]

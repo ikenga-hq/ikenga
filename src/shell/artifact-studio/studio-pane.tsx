@@ -9,9 +9,10 @@
 // and travels with the pane view. The actual layout per density lives
 // in `density/{grid,loupe,compare}.tsx`.
 //
-// User-facing copy always says "Artifact Studio"; internally we use
-// `artifact-studio` (kebab) / `ArtifactStudio` (component) — never the
-// bare word "Studio" since that collides with pkgs/studio/.
+// User-facing copy says "Artifact grid" for the whole surface (grid, loupe
+// and compare are its views); internally we use `artifact-studio` (kebab) /
+// `ArtifactStudio` (component) — never the bare word "Studio" in copy since
+// that collides with pkgs/studio/.
 
 import { StudioGrid } from './density/grid';
 import { StudioLoupe } from './density/loupe';

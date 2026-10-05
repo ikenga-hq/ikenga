@@ -130,6 +130,36 @@ describe('getTransport', () => {
 		expect(getTransport()).toBeInstanceOf(WebRemoteTransport);
 	});
 
+	it('switches to the HTTP transport once a paired device is detected (WP-78b)', async () => {
+		// Something can call `invoke` before the boot probe answers (the log
+		// bridge flushing a console line); the desktop transport it caches
+		// must not outlive the device-cookie detection.
+		const { getTransport, TauriTransport, WebRemoteTransport } = await freshModule();
+		expect(getTransport()).toBeInstanceOf(TauriTransport);
+		const { detectAccessStatus } = await import('./device-session');
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({
+						ok: true,
+						data: {
+							tier: 't0',
+							credential: { via: 'device', deviceId: 'd1', tier: 'dispatch' },
+							caps: ['files', 'sessions', 'dispatch'],
+							adminStrength: false,
+						},
+					})
+				)
+		);
+		vi.stubGlobal('fetch', fetchMock);
+		try {
+			await detectAccessStatus();
+		} finally {
+			vi.unstubAllGlobals();
+		}
+		expect(getTransport()).toBeInstanceOf(WebRemoteTransport);
+	});
+
 	it('keeps the HTTP transport across a reload, once the URL is stripped', async () => {
 		sessionStorage.setItem(TOKEN_KEY, 'from-session');
 		const { getTransport, WebRemoteTransport } = await freshModule();

@@ -46,15 +46,35 @@ export function registryInstallArgs(step: InstallStep): PkgInstallFromRegistryAr
  * resolver's order). `scope` null/undefined = the kernel's default, the active
  * project. Stops at the first failing step and rethrows.
  */
+export interface RunInstallPlanOptions {
+	scope?: PkgScopeWire | null;
+	onProgress?: (p: InstallPlanProgress) => void;
+	/** Tags every step's progress events (and is the cancel handle). */
+	installId?: string;
+	/** Aborted = stop before the next step; the step in flight is cancelled
+	 *  separately through `pkgInstallCancel(installId)`. */
+	signal?: AbortSignal;
+	/** Called as each step starts, with its index and pkg id. */
+	onStep?: (index: number, total: number, pkgId: string) => void;
+}
+
+/** The error a run stops with when its signal is aborted between steps; the
+ *  same text the installer uses, so both classify as cancelled. */
+export const INSTALL_CANCELLED = 'install cancelled';
+
 export async function runInstallPlan(
 	plan: InstallStep[],
-	opts: { scope?: PkgScopeWire | null; onProgress?: (p: InstallPlanProgress) => void } = {}
+	opts: RunInstallPlanOptions = {}
 ): Promise<number> {
 	let done = 0;
 	for (const step of plan) {
+		if (opts.signal?.aborted) throw new Error(INSTALL_CANCELLED);
 		opts.onProgress?.({ done, total: plan.length, current: step.name });
-		if (opts.scope) await pkgInstallFromRegistry(registryInstallArgs(step), opts.scope);
-		else await pkgInstallFromRegistry(registryInstallArgs(step));
+		opts.onStep?.(done, plan.length, step.pkgId);
+		const args = registryInstallArgs(step);
+		if (opts.installId) args.installId = opts.installId;
+		if (opts.scope) await pkgInstallFromRegistry(args, opts.scope);
+		else await pkgInstallFromRegistry(args);
 		done += 1;
 	}
 	opts.onProgress?.({ done, total: plan.length, current: '' });
@@ -62,15 +82,16 @@ export async function runInstallPlan(
 }
 
 /** Resolve `root`'s dep plan at `version` (or latest) and install it. */
-export async function resolveAndInstall(opts: {
-	root: PkgDetail;
-	getDetail: (name: string) => Promise<PkgDetail>;
-	version?: string;
-	scope?: PkgScopeWire | null;
-	onProgress?: (p: InstallPlanProgress) => void;
-}): Promise<InstallStep[]> {
-	const plan = await resolveInstallPlan(opts.root, opts.getDetail, opts.version);
-	await runInstallPlan(plan, { scope: opts.scope, onProgress: opts.onProgress });
+export async function resolveAndInstall(
+	opts: {
+		root: PkgDetail;
+		getDetail: (name: string) => Promise<PkgDetail>;
+		version?: string;
+	} & RunInstallPlanOptions
+): Promise<InstallStep[]> {
+	const { root, getDetail, version, ...run } = opts;
+	const plan = await resolveInstallPlan(root, getDetail, version);
+	await runInstallPlan(plan, run);
 	return plan;
 }
 

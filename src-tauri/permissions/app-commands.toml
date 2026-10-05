@@ -24,7 +24,7 @@
 # it fails in a release build, instead of only in front of users.
 #
 # MAINTENANCE: this list must stay in sync with `tauri::generate_handler![..]`
-# in `src-tauri/src/lib.rs`. `bun run test:acl-parity`
+# in `src-tauri/src/commands/registry.rs`. `bun run test:acl-parity`
 # (scripts/check-acl-parity.ts) asserts that and runs in CI.
 
 [[permission]]
@@ -36,6 +36,31 @@ frontend from the trusted local viewer-server. Deliberately NOT granted to
 `pkg-*` webviews, which mount arbitrary third-party partner portals.
 """
 commands.allow = [
+  "access_audit_export",
+  "access_audit_list",
+  "access_audit_record_local",
+  "access_audit_reseal",
+  "access_audit_verify",
+  "access_device_revoke",
+  "access_device_set_tier",
+  "access_devices_list",
+  "access_invite_issue",
+  "access_invite_revoke",
+  "access_member_remove",
+  "access_member_restore",
+  "access_member_set_role",
+  "access_members_list",
+  "access_pair_begin",
+  "access_pair_cancel",
+  "access_pair_decide",
+  "access_pair_pending",
+  "access_policy_get",
+  "access_policy_set_cell",
+  "access_policy_set_owner_approval",
+  "access_routing_get",
+  "access_routing_set",
+  "access_shares_list",
+  "access_status",
   "action_exec",
   "action_git_branch",
   "actions_open_file",
@@ -195,6 +220,7 @@ commands.allow = [
   "pa_actions_reject",
   "pa_actions_retry",
   "pa_actions_update",
+  "permission_decide",
   "pin_screenshot_write",
   "pkg_activity_bar_set_badge",
   "pkg_content_html",
@@ -209,6 +235,7 @@ commands.allow = [
   "pkg_health_remove",
   "pkg_health_remove_all",
   "pkg_health_scan",
+  "pkg_install_cancel",
   "pkg_install_from_path",
   "pkg_install_from_registry",
   "pkg_invoke",

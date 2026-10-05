@@ -17,6 +17,7 @@ import type {
 import { getTransport, isRemoteWebSession, isTauri, type RpcTransport } from './transport';
 import { getFsSocketClient } from './transport/fs-socket';
 import { attachRemotePty } from './transport/pty-socket';
+import { currentPrincipal, fetchAuthMe, isT1Session } from './transport/t1-session';
 
 export { getTransport, isRemoteWebSession, isTauri, type RpcTransport };
 export type UnlistenFn = () => void;
@@ -407,6 +408,12 @@ export async function fsRootsReset(): Promise<string[]> {
  *  to populate `hostContext.operator` when the onboarding display name
  *  (`useShellStore().userName`) is empty. */
 export async function osUsername(): Promise<string> {
+	// T1: the signed-in principal's username from `/auth/me`, not the
+	// child's Unix name (`ik-<name>`) — G-PRINCIPAL §5 row 7.
+	if (isT1Session()) {
+		const me = currentPrincipal() ?? (await fetchAuthMe());
+		if (me) return me.username;
+	}
 	return invoke('os_username');
 }
 
@@ -713,6 +720,14 @@ export async function secretsListKeys(): Promise<string[]> {
  *  merge would touch without asking the user to unlock the vault first. */
 export async function secretsIndexNames(): Promise<string[]> {
 	return invoke('secrets_index_names');
+}
+
+/** The operator default's names alone (`IKENGA_SECRET_*`, bare) — the
+ *  daemon's layer under a principal's own store (review WP76-RV1). A
+ *  browser-only verb: the desktop keychain has no default layer, so only
+ *  the principal axis calls it. */
+export async function secretsDefaultNames(): Promise<string[]> {
+	return invoke('secrets_default_names');
 }
 
 // ─── Phase 7 — scoped secrets ─────────────────────────────────────────────
@@ -3053,6 +3068,17 @@ export interface PkgInstallFromRegistryArgs {
 	 * host capabilities.
 	 */
 	publisherKey?: string | null;
+	/** Tags this install's `pkg-install://progress` events and is the handle
+	 *  `pkgInstallCancel` takes. Defaults to `pkgId` on the Rust side. */
+	installId?: string;
+}
+
+/** What a cancel request got: `requested` (it stops at its next check and
+ *  cleans up), `too_late` (already registering), or `not_running`. */
+export type PkgInstallCancelOutcome = 'requested' | 'too_late' | 'not_running';
+
+export async function pkgInstallCancel(installId: string): Promise<PkgInstallCancelOutcome> {
+	return invoke<PkgInstallCancelOutcome>('pkg_install_cancel', { installId });
 }
 
 export async function pkgInstallFromRegistry(

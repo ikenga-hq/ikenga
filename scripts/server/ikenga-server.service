@@ -10,30 +10,26 @@ WorkingDirectory=/opt/ikenga
 # No --host here ON PURPOSE. clap's default is 127.0.0.1, so a unit that is
 # missing or has a malformed EnvironmentFile binds loopback and is unreachable
 # — the safe failure. The bind address comes from IKENGA_HOST in the env file
-# below, which bootstrap-credentials.sh sets to this host's Tailscale address.
-#
-# The previous value was `--host 0.0.0.0`, which contradicted the perimeter
-# note further down: on a box with a public IP that is a public listener, and
+# below. Set it to this host's Tailscale address, or leave it unset and put a
+# reverse proxy on loopback in front. Never bind a public address directly:
 # every route here can run code or read the user's files.
 ExecStart=/opt/ikenga/bin/ikenga-server --port 4000 --static-dir /opt/ikenga/dist --data-dir /opt/ikenga/data
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-# Carries IKENGA_AUTH_TOKEN and IKENGA_VAULT_KEY, written by
-# shell/scripts/server/bootstrap-credentials.sh. Run that BEFORE first start.
+# Carries IKENGA_AUTH_TOKEN (and IKENGA_HOST, plus any agent API keys). Create
+# it BEFORE first start — scripts/server/README.md, "Environment file".
 #
-# This binds 0.0.0.0. Every route the daemon serves can run code or read the
-# user's files, so the bearer token is what stands between the process and the
-# network. The daemon fails closed — with no token it mints one at startup and
-# logs it — but a minted token rotates on every restart, so a managed deploy
-# needs the pinned one from this file. Do not remove EnvironmentFile to "fix" a
-# startup failure; fix the file.
+# The bearer token is what stands between the process and the network. The
+# daemon fails closed — with no token it mints one at startup and logs it —
+# but a minted token rotates on every restart, so a managed deploy needs a
+# pinned one from this file. Do not remove EnvironmentFile to "fix" a startup
+# failure; fix the file.
 EnvironmentFile=/opt/ikenga/.env
 
-# Sits behind a Tailscale perimeter (ikenga#113 / WP-14b), enforced by binding
-# IKENGA_HOST to the tailnet address rather than by the token alone. The token
-# is defence in depth, not the whole perimeter.
+# The perimeter is the bind address (IKENGA_HOST on the tailnet, or loopback
+# behind a proxy), not the token alone. The token is defence in depth.
 
 # --- Sandboxing ---
 #
@@ -52,6 +48,9 @@ EnvironmentFile=/opt/ikenga/.env
 # — blunter: then EVERY orphan this unit spawns outlives it, not just runners.
 # See ADR-023 D5 (docs/adr/023-remote-tier-execution-isolation.md in the
 # workspace repo): Chi runs survive a daemon restart, terminals don't.
+# The T1 unit, ikenga-server-t1.service, carries that fix (KillMode=process,
+# G-PRINCIPAL §9.4); scripts/server/README.md explains the choice. Apply the
+# same line here once this T0 daemon serves Chi runs.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

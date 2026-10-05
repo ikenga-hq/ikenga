@@ -51,6 +51,7 @@ jobs:
       ts: ${{ steps.filter.outputs.ts == 'true' || steps.mode.outputs.full == 'true' }}
       rust: ${{ steps.filter.outputs.rust == 'true' || steps.mode.outputs.full == 'true' }}
       headless: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.server == 'true' || steps.mode.outputs.full == 'true' }}
+      server_artifact: ${{ steps.filter.outputs.server_artifact == 'true' || steps.mode.outputs.full == 'true' }}
       full: ${{ steps.mode.outputs.full }}
     steps:
       - uses: actions/checkout@v6
@@ -94,6 +95,12 @@ jobs:
             # The headless link gate script the `headless` job runs.
             server:
               - 'scripts/server/**'
+            # The release server artifacts and what builds them.
+            server_artifact:
+              - 'scripts/server/**'
+              - '.github/actions/build-server/**'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/ci.yml'
 
       # Cheapest gate in the pipeline and the one that would have caught
       # ikenga#140. Since tauri 2.11.2, app commands are ACL-gated for the
@@ -302,3 +309,204 @@ jobs:
       - name: cargo test -p ikenga-server
         working-directory: src-tauri
         run: cargo test -p ikenga-server --no-fail-fast
+
+  # T1 root tests (remote-access WP-20, G-PRINCIPAL §8/§9). The T1 executor
+  # drops to per-principal uids, so its real tests need root — and, to prove
+  # the floor (ADR-023: no privileged container), root with ONLY the
+  # capabilities the T1 unit grants: SETUID, SETGID, CHOWN, KILL,
+  # DAC_OVERRIDE, FOWNER. They run in a throwaway debian:stable-slim
+  # container (they write its /etc), never on the runner itself.
+  #
+  # The `#[ignore = "t1-root"]` tests are skipped by every other job; here the
+  # headless lib test binary runs them with `--ignored --test-threads=1
+  # t1_root` (one thread: some flip a process-wide fault-injection flag),
+  # and so do the ikenga-server integration test binaries (end to end
+  # against the built binary, found through IKENGA_SERVER_BIN).
+  # Then `ikenga-server probe --executor-tier t1` must pass in that container
+  # and must FAIL (exit 1) as a non-root user and without CAP_SETUID.
+  t1-root:
+    name: T1 root tests (minimal-capability container)
+    needs: scope
+    if: needs.scope.outputs.headless == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      # Same headers as `headless`: the gtk/glib -sys crates still compile.
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Reads the `headless` cache (same feature set); never saves its own.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ci-headless
+          save-if: false
+
+      - name: Build the headless lib test binary and ikenga-server
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p ikenga-server --message-format=short
+          tests=$(cargo test --lib --no-default-features --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true
+                            and .target.name == "ikenga_desktop_lib") | .executable' | tail -1)
+          test -x "$tests"
+          # World-readable, outside the runner's home: the tests re-exec
+          # these binaries as unprivileged probe/principal uids.
+          sudo install -d -m 0755 /opt/t1
+          sudo install -m 0755 "$tests" /opt/t1/lib-tests
+          sudo install -m 0755 target/debug/ikenga-server /opt/t1/ikenga-server
+          # The ikenga-server integration tests (accounts_cli, probe_cli,
+          # broker_t1 — the T1 broker with real per-principal children, I-7/I-8):
+          # end to end against the built binary — `accounts disable` through
+          # the real `__t1-kill-all` entry, the boot probe + probe.json.
+          # They find the binary through IKENGA_SERVER_BIN at run time.
+          sudo install -d -m 0755 /opt/t1/server-tests
+          cargo test -p ikenga-server --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true
+                            and (.target.kind | index("test"))) | .executable' \
+            | while read -r bin; do
+                test -x "$bin"
+                name=$(basename "$bin" | sed 's/-[0-9a-f]*$//')
+                sudo install -m 0755 "$bin" "/opt/t1/server-tests/$name"
+              done
+          ls /opt/t1/server-tests
+          test -x /opt/t1/server-tests/accounts_cli
+          test -x /opt/t1/server-tests/probe_cli
+          test -x /opt/t1/server-tests/broker_t1
+
+      - name: t1_root tests (root, T1 capabilities only)
+        run: >-
+          docker run --rm
+          --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER
+          -v /opt/t1:/opt/t1:ro -w /tmp
+          debian:stable-slim
+          /opt/t1/lib-tests --ignored --test-threads=1 t1_root
+
+      - name: ikenga-server t1_root integration tests (root, T1 capabilities only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in /opt/t1/server-tests/*; do
+            echo "::group::$(basename "$t")"
+            docker run --rm \
+              --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER \
+              -v /opt/t1:/opt/t1:ro -w /tmp \
+              -e IKENGA_SERVER_BIN=/opt/t1/ikenga-server \
+              debian:stable-slim \
+              "$t" --ignored --test-threads=1 t1_root
+            echo "::endgroup::"
+          done
+
+      - name: probe passes with the T1 capabilities
+        run: >-
+          docker run --rm
+          --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=KILL --cap-add=DAC_OVERRIDE --cap-add=FOWNER
+          -v /opt/t1:/opt/t1:ro -w /tmp
+          debian:stable-slim
+          /opt/t1/ikenga-server probe --executor-tier t1 --data-dir /srv/ikenga
+
+      - name: probe refuses as non-root and without CAP_SETUID
+        shell: bash
+        run: |
+          set -uo pipefail
+          expect_refusal() {
+            local what=$1; shift
+            docker run --rm -v /opt/t1:/opt/t1:ro -w /tmp "$@" debian:stable-slim \
+              /opt/t1/ikenga-server probe --executor-tier t1 --data-dir /tmp/t1
+            local rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::probe $what: expected exit 1, got $rc"
+              return 1
+            fi
+            echo "probe $what: refused (exit 1), as required"
+          }
+          ok=0
+          expect_refusal "as uid 1000" --user 1000 || ok=1
+          expect_refusal "without CAP_SETUID" --cap-drop=SETUID || ok=1
+          exit $ok
+
+  # Release server artifacts, minus the signing. release.yml builds these only
+  # when a tag is pushed, which is too late to find that a dependency change
+  # broke the cross-link or that a packaging edit dropped a file. This runs the
+  # same build action and packer, on a native runner per architecture, when the
+  # packaging changes and on the full tier (release PRs and the nightly).
+  server-artifact:
+    name: server artifact (${{ matrix.arch }})
+    needs: scope
+    if: needs.scope.outputs.server_artifact == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/build-server
+        with:
+          arch: ${{ matrix.arch }}
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-server-bin-${{ matrix.arch }}
+          path: server-bin/ikenga-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 3
+
+  server-package:
+    name: server tarballs + manifest
+    needs: server-artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-server-bin-*
+          path: server-bin
+          merge-multiple: true
+
+      # The packer only needs a web bundle with an index.html; the real one
+      # is the desktop leg's Vite output, which this job has no use for.
+      - name: Pack with a stand-in web bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-stub/assets
+          echo '<!doctype html><title>stand-in</title>' > dist-stub/index.html
+          echo '/* stand-in */' > dist-stub/assets/app.js
+          VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' src-tauri/server/Cargo.toml | head -n 1)"
+          scripts/server/package-server.sh pack \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --bin-dir server-bin --dist dist-stub --out server-out
+
+      - name: Show what was produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server-out
+          ls -l
+          cat ./*_manifest.json
+          for t in ./*.tar.gz; do echo "== $t"; tar -tvzf "$t"; done

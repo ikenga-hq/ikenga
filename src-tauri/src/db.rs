@@ -600,6 +600,20 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0068_chi_cache_runner_pid",
         include_str!("../migrations/0068_chi_cache_runner_pid.sql"),
     ),
+    // DEC-71 (Round 58): the Default project is personal scope for pkgs —
+    // existing `pkg_installed.project_id = 'default'` rows become NULL.
+    (
+        69,
+        "0069_pkg_scope_default_personal",
+        include_str!("../migrations/0069_pkg_scope_default_personal.sql"),
+    ),
+    // G-ACCESS §8.4 (WP-74a): attribution columns on `shell_notifications`
+    // and `artifact_comments`, filled by WP-75 / WP-76 (§5.7).
+    (
+        70,
+        "0070_access_attribution",
+        include_str!("../migrations/0070_access_attribution.sql"),
+    ),
 ];
 
 /// Embedded migration set, kept in lockstep with `migrations/*.sql`. Tracked
@@ -684,6 +698,11 @@ async fn ensure_schema(pool: &sqlx::SqlitePool) -> Result<(), String> {
 /// Ensure the Default project row exists and backfill project_id columns
 /// added by 0015_projects.sql. Runs after every schema apply; cheap when
 /// already done (INSERT OR IGNORE + UPDATE … WHERE project_id IS NULL).
+///
+/// `pkg_installed` is deliberately not in the backfill: for pkgs, NULL is
+/// personal scope and the Default project means personal too (DEC-71), so
+/// re-stamping NULL → 'default' on every boot undid `scope-set workspace`
+/// and made reconcile park every pkg under any other project.
 async fn bootstrap_default_project(pool: &sqlx::SqlitePool) -> Result<(), String> {
     let now = now_ms();
     sqlx::query(
@@ -696,11 +715,7 @@ async fn bootstrap_default_project(pool: &sqlx::SqlitePool) -> Result<(), String
     .await
     .map_err(|e| format!("seed default project: {e}"))?;
 
-    for table in [
-        "pkg_installed",
-        "layout_state",
-        "browser_sessions",
-    ] {
+    for table in ["layout_state", "browser_sessions"] {
         let sql = format!("UPDATE {table} SET project_id = 'default' WHERE project_id IS NULL");
         sqlx::query(&sql)
             .execute(pool)
@@ -2143,5 +2158,161 @@ mod tests {
         assert_eq!(ext.as_deref(), Some("sess-1"));
         assert_eq!(status, "running");
         assert_eq!(pid, None);
+    }
+
+    /// `(id, project_id)` for every `pkg_installed` row, ordered by id.
+    async fn pkg_scopes(pool: &sqlx::SqlitePool) -> Vec<(String, Option<String>)> {
+        sqlx::query_as("SELECT id, project_id FROM pkg_installed ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("pkg_installed scopes")
+    }
+
+    async fn insert_pkg(pool: &sqlx::SqlitePool, id: &str, project_id: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO pkg_installed
+             (id, version, ikenga_api, manifest_json, install_path, installed_at, project_id)
+             VALUES (?, '1.0.0', '1', '{}', '/x', 0, ?)",
+        )
+        .bind(id)
+        .bind(project_id)
+        .execute(pool)
+        .await
+        .expect("insert pkg_installed");
+    }
+
+    /// DEC-71 (Round 58): on an install at 0068 whose bootstrap stamped every
+    /// pkg row 'default', 0069 turns 'default' into NULL (personal) and leaves
+    /// rows bound to a real project alone.
+    #[tokio::test]
+    async fn migration_0069_clears_default_pkg_scope_and_keeps_real_projects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing_68.db");
+        let raw_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .expect("raw connect");
+        sqlx::query(
+            "CREATE TABLE _pa_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        for (id, name, sql) in MIGRATIONS.iter().filter(|(id, _, _)| *id < 69) {
+            for stmt in split_statements(sql) {
+                if stmt.trim().is_empty() {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(&stmt).execute(&raw_pool).await {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") && !msg.contains("already exists") {
+                        panic!("migration {name} failed: {msg}");
+                    }
+                }
+            }
+            sqlx::query("INSERT INTO _pa_migrations (id, applied_at) VALUES (?, ?)")
+                .bind(id)
+                .bind(now_ms())
+                .execute(&raw_pool)
+                .await
+                .unwrap();
+        }
+        // What the pre-DEC-71 bootstrap left behind: every pkg row stamped
+        // 'default', plus one bound to a real project.
+        sqlx::query(
+            "INSERT INTO projects (id, display_name, position, is_default, created_at)
+             VALUES ('default', 'Default', 0, 1, 0), ('kinnect', 'Kinnect', 1, 0, 0)",
+        )
+        .execute(&raw_pool)
+        .await
+        .unwrap();
+        insert_pkg(&raw_pool, "com.ikenga.studio", Some("default")).await;
+        insert_pkg(&raw_pool, "com.ikenga.tasks", Some("default")).await;
+        insert_pkg(&raw_pool, "com.test.kin", Some("kinnect")).await;
+        insert_pkg(&raw_pool, "com.test.personal", None).await;
+        drop(raw_pool);
+
+        let db = PaDb::new(db_path);
+        let pool = db.ensure_pool().await.expect("ensure_pool at 0068");
+        let applied: Vec<i64> = sqlx::query_scalar("SELECT id FROM _pa_migrations")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(applied.contains(&69));
+
+        assert_eq!(
+            pkg_scopes(&pool).await,
+            vec![
+                ("com.ikenga.studio".to_string(), None),
+                ("com.ikenga.tasks".to_string(), None),
+                ("com.test.kin".to_string(), Some("kinnect".to_string())),
+                ("com.test.personal".to_string(), None),
+            ]
+        );
+    }
+
+    /// DEC-71: the per-boot bootstrap no longer re-stamps a NULL (personal)
+    /// pkg row to 'default', so `scope-set workspace` survives a restart. The
+    /// other backfilled tables keep their NULL → 'default' backfill.
+    #[tokio::test]
+    async fn ensure_schema_twice_leaves_null_pkg_scope_null() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+        insert_pkg(&pool, "com.test.personal", None).await;
+
+        ensure_schema(&pool).await.expect("second ensure_schema");
+        ensure_schema(&pool).await.expect("third ensure_schema");
+
+        assert_eq!(
+            pkg_scopes(&pool).await,
+            vec![("com.test.personal".to_string(), None)]
+        );
+    }
+    /// G-ACCESS §8.4 (WP-74a): 0070 adds the attribution columns on a fresh
+    /// db, with `sensitive` defaulting to 0, and the project index.
+    #[tokio::test]
+    async fn migration_0070_adds_access_attribution_columns() {
+        let (db, _tmp) = fresh_db().await;
+        let pool = db.ensure_pool().await.expect("ensure_pool");
+        let cols = |table: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(&format!(
+                    "SELECT name FROM pragma_table_info('{table}')"
+                ))
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let notif = cols("shell_notifications").await;
+        for c in [
+            "requested_by",
+            "project_id",
+            "sensitive",
+            "decided_by",
+            "decided_via",
+            "decided_device",
+        ] {
+            assert!(notif.iter().any(|n| n == c), "shell_notifications.{c}");
+        }
+        assert!(cols("artifact_comments")
+            .await
+            .iter()
+            .any(|n| n == "author_principal_id"));
+        let idx: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_shell_notifications_project'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(idx, 1);
     }
 }

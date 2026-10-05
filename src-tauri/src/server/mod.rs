@@ -11,12 +11,31 @@
 //! WebSockets are exempt from CORS, so the `Origin` header is checked
 //! explicitly on every protected route rather than left to the browser.
 
+/// What keeps a daemon active for its idle timeout: PTYs, open WebSockets,
+/// recent requests (§5 row 13).
+pub mod activity;
+/// T1 request → principal: `PrincipalCtx`, the resolver list, sessions,
+/// `/auth/*` (G-PRINCIPAL §2; WP-20 slice 3). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod auth;
+/// The T1 broker: per-principal children, the reverse proxy and the
+/// open-socket registry (G-PRINCIPAL §3, topology B). Linux-only.
+#[cfg(target_os = "linux")]
+pub mod broker;
 pub mod chat_ws;
 pub mod discovery;
 pub mod fs_ws;
 pub mod health;
+/// T1 operator: the operator root, `operator/accounts.db`, passwords and the
+/// provisioning core (G-PRINCIPAL §4, §6, §7; WP-20). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod operator;
+mod pkg_cookie;
 pub mod pkg_index;
 pub mod pkg_static;
+/// The principal-child side of topology B: the data-dir flock (I-3).
+#[cfg(target_os = "linux")]
+pub mod principal_child;
 pub mod pty_ws;
 mod reserved;
 pub mod rpc;
@@ -26,22 +45,29 @@ mod rpc_local;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
+/// `ikenga-server supervise`: a minimal init that keeps detached runs alive
+/// across server restarts where there is no systemd (containers). Linux-only.
+pub mod supervisor;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
+/// `pub(crate)` so G-ACCESS A-1 (`access::rpc_requirements`) reuses its arm
+/// lexer.
 #[cfg(test)]
-mod parity;
+pub(crate) mod parity;
+#[cfg(test)]
+mod share_router_tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
@@ -72,6 +98,81 @@ pub struct ServerConfig {
     /// default `t0`). Probed first thing in `run_server`; a tier this build
     /// can't honour stops the server from starting (DEC-R9-1).
     pub executor_tier: crate::executor::ExecutorTier,
+}
+
+/// `IKENGA_BOOTSTRAP_ADMIN` + `…_PASSWORD` as captured by `main` (§7.4),
+/// carried to the T1 broker, which applies it after its probe and only on an
+/// empty accounts table. Debug never prints the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BootstrapCredentials {
+    pub username: String,
+    pub password: zeroize::Zeroizing<String>,
+}
+
+impl std::fmt::Debug for BootstrapCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootstrapCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Serve options beyond [`ServerConfig`] (G-PRINCIPAL §2.2, §3, §7.2, §7.4,
+/// §8, §9.3). Kept out of [`ServerConfig`] so the T0 config and its many
+/// constructors don't change; [`run_server_with`] takes them beside it, and
+/// every tier's boot reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct T1ServeOptions {
+    /// `--uid-range START-END`; `None` is the default 20000-29999. Must agree
+    /// with the range `accounts.db` is pinned to.
+    pub uid_range: Option<String>,
+    /// `--provisioning external`: never write `/etc` (reconcile refuses a
+    /// missing entry instead of recreating it).
+    pub provisioning_external: bool,
+    /// `--principal-path`: the `PATH` principals' children get (§9.3).
+    pub principal_path: Option<std::ffi::OsString>,
+    /// `--insecure-cookie` (P-3, G-ACCESS R-9): drop `Secure` from the
+    /// session and device cookies, for a plain-HTTP deploy. Read by every
+    /// tier's boot. On T0 a tailnet peer gets a non-`Secure` device cookie
+    /// without it (Round 19, DEC-R19-1, `devices::cookie_insecure`).
+    pub insecure_cookie: bool,
+    /// `--principal-child` (hidden): this process is a T1 principal child,
+    /// launched by the broker as the principal's uid (§3). It never opens an
+    /// access store (G-ACCESS R-11).
+    pub principal_child: bool,
+    /// `--expected-uid` (hidden, with `--principal-child`): the uid the
+    /// child's probe requires it is running as.
+    pub expected_uid: Option<u32>,
+    /// The captured first-admin bootstrap (§7.4).
+    pub bootstrap_admin: Option<BootstrapCredentials>,
+    /// `--public-url` / `IKENGA_PUBLIC_URL` (G-ACCESS §3.3 rule 1): the base
+    /// of pairing and invite links. Every tier.
+    pub public_url: Option<String>,
+    /// `--max-accounts N` (G-ACCESS P-27; T1). `None` = unlimited.
+    pub max_accounts: Option<u32>,
+    /// `--invite-ttl DAYS` (G-ACCESS P-15; T1). `None` = the 7-day default.
+    pub invite_ttl_days: Option<u32>,
+    /// `--member-invites-create-accounts` (G-ACCESS §4.4, N-11; T1). Off by
+    /// default.
+    pub member_invites_create_accounts: bool,
+}
+
+impl T1ServeOptions {
+    /// The Part B flags as the access layer reads them (G-ACCESS §10.1).
+    /// `--insecure-cookie` is WP-20's flag, reused tier-agnostically (R-9).
+    pub fn access_options(&self) -> crate::access::AccessOptions {
+        crate::access::AccessOptions {
+            public_url: self.public_url.clone(),
+            insecure_cookie: self.insecure_cookie,
+            max_accounts: self.max_accounts,
+            invite_ttl_days: self
+                .invite_ttl_days
+                .unwrap_or(crate::access::DEFAULT_INVITE_TTL_DAYS)
+                .clamp(1, crate::access::MAX_INVITE_TTL_DAYS),
+            member_invites_create_accounts: self.member_invites_create_accounts,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -123,6 +224,13 @@ pub struct AppState {
     /// resolved; those arms then answer the desktop's "cannot resolve store
     /// root". Single-user seam (G-PRINCIPAL / WP-20), same as `home`.
     pub(crate) store: Option<PathBuf>,
+    /// The `secrets_*` arms' two layers (remote-access WP-21): in a T1
+    /// principal child, the principal's own store under `<data>/secrets/`
+    /// over the `IKENGA_SECRET_*` operator default; elsewhere the operator
+    /// default alone, as before. Built once, here, because building it takes
+    /// the broker's wrapping key out of the process environment before
+    /// anything is spawned. See `crate::secrets_env`.
+    pub(crate) secrets: Arc<crate::secrets_env::DaemonSecrets>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -173,37 +281,14 @@ fn origin_permitted(req: &Request, state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-async fn auth_middleware(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, Response> {
-    if !origin_permitted(&req, &state) {
-        warn!(
-            "Cross-origin request to {} rejected (origin: {:?})",
-            req.uri().path(),
-            req.headers().get("origin")
-        );
-        return Err(unauthorized("Forbidden: cross-origin request"));
-    }
-
-    // `run_server` guarantees this is populated; a `None` here means the
-    // router was built directly (tests) and we still refuse to serve.
-    let Some(ref expected) = state.config.auth_token else {
-        warn!("Rejecting {} — server has no auth token", req.uri().path());
-        return Err(unauthorized("Unauthorized: server has no auth token"));
-    };
-
+/// `Authorization: Bearer <token>` or `?token=<token>` equals the operator
+/// bearer (constant time). A device token (`ikd1.…`) is never the operator
+/// bearer: the daemon refuses an operator-chosen token with that prefix at
+/// boot (G-ACCESS §2.4).
+fn operator_bearer_ok(req: &Request, expected: &str) -> bool {
     // 1. Authorization: Bearer <TOKEN>
-    if let Some(header) = req
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-    {
-        if ct_eq(header, expected) {
-            return Ok(next.run(req).await);
-        }
+    if header_bearer_ok(req, expected) {
+        return true;
     }
 
     // 2. ?token=<TOKEN> — the only way to authenticate a WebSocket handshake
@@ -218,14 +303,203 @@ async fn auth_middleware(
                     .decode_utf8_lossy()
                     .into_owned();
                 if ct_eq(&decoded, expected) {
-                    return Ok(next.run(req).await);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `Authorization: Bearer <token>` equals the operator bearer (constant time).
+fn header_bearer_ok(req: &Request, expected: &str) -> bool {
+    req.headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_some_and(|header| ct_eq(header, expected))
+}
+
+fn forbidden(e: &crate::access::AccessError) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    )
+        .into_response()
+}
+
+/// The T0 resolver (G-ACCESS §2.3, §2.4): the `Origin` gate, then — in
+/// precedence order — a paired device's grant (`ikenga_device` cookie or
+/// `Authorization: Bearer ikd1.…`), then the operator bearer. The result is
+/// an [`crate::access::AccessCtx`] in the request extensions; non-RPC routes
+/// are checked against their requirement here (§1.6), `/api/rpc` per
+/// command in `rpc_handler`. A principal child takes caps only from
+/// `X-Ikenga-Caps` on per-child-token requests (§1.7).
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    use crate::access::{devices, DaemonAccess, DaemonMode, RequestMeta, StoreTier};
+
+    if !origin_permitted(&req, &state) {
+        warn!(
+            "Cross-origin request to {} rejected (origin: {:?})",
+            req.uri().path(),
+            req.headers().get("origin")
+        );
+        return Err(unauthorized("Forbidden: cross-origin request"));
+    }
+
+    // `run_server` guarantees this is populated; a `None` here means the
+    // router was built directly (tests) and we still refuse to serve.
+    let Some(expected) = state.config.auth_token.clone() else {
+        warn!("Rejecting {} — server has no auth token", req.uri().path());
+        return Err(unauthorized("Unauthorized: server has no auth token"));
+    };
+
+    let access = req
+        .extensions()
+        .get::<Arc<DaemonAccess>>()
+        .cloned()
+        .unwrap_or_else(DaemonAccess::unavailable);
+    let meta = RequestMeta {
+        remote_addr: req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip().to_string()),
+        user_agent: req
+            .headers()
+            .get("user-agent")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string),
+        ..Default::default()
+    }
+    .with_host_from(req.headers());
+    // P-3 as amended by Round 19 (DEC-R19-1): a T0 device cookie drops
+    // `Secure` for a tailnet TCP peer (`ConnectInfo`, never
+    // `X-Forwarded-For`) as well as under `--insecure-cookie`.
+    let insecure = devices::cookie_insecure(
+        StoreTier::T0,
+        access.options.insecure_cookie,
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip()),
+    );
+    let mut set_cookie: Option<String> = None;
+    let mut ctx = None;
+
+    // DeviceGrant before OperatorBearer (§2.4). T0 only: a principal child
+    // has no store, and the broker resolves devices for it.
+    if access.mode == DaemonMode::T0 {
+        if let Some(store) = access.store() {
+            if let Some((raw, presented)) = devices::presented(req.headers()) {
+                match devices::resolve(store, &access.seen, &raw, meta.remote_addr.as_deref()).await
+                {
+                    Ok(auth) => {
+                        let upgrade = req.headers().contains_key("upgrade");
+                        match devices::cookie_action(&auth, presented, upgrade) {
+                            devices::CookieAction::Rotate => {
+                                if let devices::DeviceAuth::Valid { row, .. } = &auth {
+                                    match devices::rotate(store, &row.device_id).await {
+                                        Ok(Some(tok)) => {
+                                            set_cookie = Some(devices::set_cookie(&tok, insecure))
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => warn!("device cookie rotation: {e:#}"),
+                                    }
+                                }
+                            }
+                            devices::CookieAction::Clear => {
+                                set_cookie = Some(devices::clear_cookie(insecure))
+                            }
+                            devices::CookieAction::Keep => {}
+                        }
+                        match auth {
+                            devices::DeviceAuth::Valid { row, .. } => {
+                                ctx = Some(access.device_ctx(&row, meta.clone()).await);
+                            }
+                            // A dead bearer is a 401 (no fallback, §2.4); a
+                            // dead cookie is cleared above but doesn't fail a
+                            // request that also carries a valid operator
+                            // bearer.
+                            devices::DeviceAuth::Invalid(why) => {
+                                if presented == devices::Presented::Bearer {
+                                    warn!("device bearer refused on {} ({why})", req.uri().path());
+                                    return Err(unauthorized(
+                                        "Unauthorized: invalid device credential",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("device credential resolution failed: {e:#}");
+                        return Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": "authentication is temporarily unavailable"
+                            })),
+                        )
+                            .into_response());
+                    }
                 }
             }
         }
     }
 
-    warn!("Unauthorized request to {}", req.uri().path());
-    Err(unauthorized("Unauthorized: invalid or missing auth token"))
+    // App files under `/pkgs/*` (single-user server only): the browser loads
+    // them itself and can't attach the bearer header, so a request that
+    // authenticates with the header gets a `/pkgs`-scoped cookie, and a
+    // `/pkgs` request may authenticate with that cookie (`pkg_cookie`).
+    let now = pkg_cookie::now_secs();
+    let mut pkgs_cookie: Option<String> = None;
+    if ctx.is_none() && operator_bearer_ok(&req, &expected) {
+        ctx = Some(match access.mode {
+            DaemonMode::PrincipalChild => access.child_ctx(req.headers(), meta),
+            DaemonMode::T0 => {
+                if header_bearer_ok(&req, &expected) {
+                    pkgs_cookie = Some(pkg_cookie::set_cookie(&expected, now, insecure));
+                }
+                access.operator_ctx(meta).await
+            }
+        });
+    } else if ctx.is_none()
+        && access.mode == DaemonMode::T0
+        && pkg_cookie::is_pkgs_path(req.uri().path())
+        && pkg_cookie::presented_ok(req.headers(), &expected, now)
+    {
+        ctx = Some(access.operator_ctx(meta).await);
+    }
+
+    let with_cookie = |mut res: Response, cookie: &Option<String>| {
+        if let Some(v) = cookie
+            .as_deref()
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
+            res.headers_mut().append("set-cookie", v);
+        }
+        res
+    };
+
+    let Some(ctx) = ctx else {
+        warn!("Unauthorized request to {}", req.uri().path());
+        return Err(with_cookie(
+            unauthorized("Unauthorized: invalid or missing auth token"),
+            &set_cookie,
+        ));
+    };
+
+    // Non-RPC routes: their §1.6 requirement (RPCs are per command).
+    if let Some(requirement) = crate::access::route_requirement(req.uri().path()) {
+        if let Err(e) = crate::access::check(&ctx, requirement) {
+            return Err(with_cookie(forbidden(&e), &set_cookie));
+        }
+    }
+    req.extensions_mut().insert(ctx);
+    let res = activity::track_request(next.run(req)).await;
+    Ok(with_cookie(with_cookie(res, &set_cookie), &pkgs_cookie))
 }
 
 pub async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -284,6 +558,30 @@ pub(crate) fn router_with_home(
     )
 }
 
+/// [`create_router`] with the daemon's access state (G-ACCESS §2.5), which
+/// `run_server` opens. Attached through an `Extension` layer, not an
+/// `AppState` field (G-ACCESS §10.1 X-2).
+pub(crate) fn create_router_with_access(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    engine_registry: Arc<EngineRegistry>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    access: Arc<crate::access::DaemonAccess>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        engine_registry,
+        pa_db,
+        shutdown_tx,
+        crate::platform::home_dir(),
+        rpc_shell::PathGuard::allowlist(),
+        crate::pkg::skill_actions::store_root(),
+        access,
+    )
+}
+
 /// [`router_with_home`] with the path allowlist made explicit too, so tests
 /// can check the project filesystem arms against a local root set instead of
 /// installing the process-global one (a `OnceLock`).
@@ -306,6 +604,7 @@ pub(crate) fn router_with(
         path_guard,
         // G-PRINCIPAL seam: the daemon process's own store.
         crate::pkg::skill_actions::store_root(),
+        crate::access::DaemonAccess::unavailable(),
     )
 }
 
@@ -331,6 +630,7 @@ pub(crate) fn router_with_store(
         home,
         path_guard,
         store,
+        crate::access::DaemonAccess::unavailable(),
     )
 }
 
@@ -344,6 +644,7 @@ fn build_router(
     home: Option<PathBuf>,
     path_guard: rpc_shell::PathGuard,
     store: Option<PathBuf>,
+    access: Arc<crate::access::DaemonAccess>,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -382,6 +683,10 @@ fn build_router(
         _ => None,
     };
     let allowed_origins = config.allowed_origins.clone();
+    let secrets = Arc::new(crate::secrets_env::DaemonSecrets::for_daemon(
+        config.data_dir.as_deref(),
+        config.executor_tier,
+    ));
     let state = Arc::new(AppState {
         config,
         spa_service: spa_service.clone(),
@@ -395,6 +700,7 @@ fn build_router(
         path_guard,
         actions,
         store,
+        secrets,
         shutdown_tx,
     });
 
@@ -433,12 +739,26 @@ fn build_router(
             auth_middleware,
         ));
 
+    // G-ACCESS §1.6: the public pairing endpoints (T0 only — a principal
+    // child never pairs; the T1 broker serves its own), behind their own
+    // Origin layer (A-31).
+    let public_access = match access.mode {
+        crate::access::DaemonMode::T0 => {
+            crate::access::http::t0_public_router(allowed_origins.clone())
+        }
+        crate::access::DaemonMode::PrincipalChild => Router::new(),
+    };
+
     Router::new()
         .route("/api/health", get(health::health_handler))
         .merge(protected_routes)
         .fallback(spa_fallback_handler)
         .layer(cors)
         .with_state(state)
+        .merge(public_access)
+        // The access state reaches `auth_middleware`, the RPC pre-hook and
+        // the WS handlers through the request extensions (X-2).
+        .layer(Extension(access))
 }
 
 async fn spa_fallback_handler(
@@ -449,19 +769,28 @@ async fn spa_fallback_handler(
     state.spa_service.handle_with(uri, &headers).await
 }
 
-pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
+pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
+    run_server_with(config, T1ServeOptions::default()).await
+}
+
+/// [`run_server`] with the [`T1ServeOptions`] (`ikenga-server` passes its
+/// flags through here).
+pub async fn run_server_with(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
     // Executor tier first, before anything is created, bound or written: a
     // tier the host can't honour means this server must not start at all.
     // Refuse, don't fall back (ADR-023 / DEC-R9-1) — an operator who asked for
     // per-user isolation and quietly got a shared uid is worse off than one
     // whose server wouldn't boot.
+    if config.executor_tier == crate::executor::ExecutorTier::T1 {
+        return t1_boot(config, t1).await;
+    }
+    if t1.principal_child {
+        anyhow::bail!("--principal-child is only valid with --executor-tier t1");
+    }
     let executor = match crate::executor::install(config.executor_tier) {
         Ok(caps) => caps,
         Err(refusal) => {
-            error!(
-                "executor tier {} refused: {refusal}",
-                config.executor_tier
-            );
+            error!("executor tier {} refused: {refusal}", config.executor_tier);
             return Err(refusal.into());
         }
     };
@@ -469,7 +798,61 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
         executor.tier, executor.pty, executor.piped, executor.principal_isolation
     );
+    serve_single_tenant(
+        config,
+        SingleTenant {
+            access: t1.access_options(),
+            ..SingleTenant::default()
+        },
+    )
+    .await
+}
 
+/// What differs when the single-tenant daemon runs as a T1 principal child.
+#[derive(Default)]
+struct SingleTenant {
+    /// The `<data>/.lock` flock, held for the process lifetime (I-3).
+    #[cfg(target_os = "linux")]
+    lock: Option<principal_child::DataDirLock>,
+    /// A principal child: exits when the broker that launched it is gone.
+    principal_child: bool,
+    /// The Part B flags (G-ACCESS §10.1).
+    access: crate::access::AccessOptions,
+}
+
+/// Resolves on SIGINT, SIGTERM or a message on `shutdown_rx`.
+pub(crate) async fn shutdown_signal(mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received SIGINT (Ctrl+C), shutting down daemon");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, shutting down daemon");
+        }
+        _ = shutdown_rx.recv() => {
+            info!("Received shutdown signal, shutting down daemon");
+        }
+    }
+}
+
+/// Today's single-tenant daemon: T0, and each T1 principal child.
+async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> anyhow::Result<()> {
     health::init_uptime();
 
     // Fail closed: an operator who forgets `--auth-token` gets a generated
@@ -477,6 +860,18 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     let minted = config.auth_token.is_none();
     if minted {
         config.auth_token = Some(uuid::Uuid::new_v4().simple().to_string());
+    }
+    // G-ACCESS §2.4: the `ikd1.` prefix marks a device token, so an
+    // operator-chosen bearer may never start with it.
+    if config
+        .auth_token
+        .as_deref()
+        .is_some_and(|t| t.starts_with(crate::access::devices::TOKEN_PREFIX))
+    {
+        anyhow::bail!(
+            "IKENGA_AUTH_TOKEN must not start with `{}` (reserved for device tokens)",
+            crate::access::devices::TOKEN_PREFIX
+        );
     }
 
     let mut pa_db: Option<Arc<crate::db::PaDb>> = None;
@@ -540,12 +935,26 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
     }
     let token = config.auth_token.clone().unwrap_or_default();
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(4);
-    let router = create_router(
+    // G-ACCESS §2.5: the T0 daemon opens, migrates and verifies
+    // `<data-dir>/access.db`; a principal child never opens or creates one
+    // (§1.7, A-32).
+    let access = if mode.principal_child {
+        crate::access::DaemonAccess::principal_child(mode.access.clone())
+    } else {
+        crate::access::DaemonAccess::boot_t0(
+            config.data_dir.as_deref(),
+            pa_db.clone(),
+            mode.access.clone(),
+        )
+        .await
+    };
+    let router = create_router_with_access(
         config.clone(),
         pty_manager.clone(),
         engine_registry,
         pa_db,
         Some(shutdown_tx.clone()),
+        access,
     );
 
     // Idle timeout watcher (G-02): shuts down daemon when no active sessions for idle_timeout_secs
@@ -557,14 +966,19 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
             let mut idle_since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let active = pty_manager.active_session_count();
-                if active > 0 {
+                // §5 row 13: PTYs, open WebSockets and recent requests —
+                // plus (G-ACCESS §2.5, M-3) open pairing sessions and relay
+                // asks, which hold an `access::KeepAlive` while pending
+                // (live device sockets already count as open WebSockets).
+                let holds = pty_manager.active_session_count() + crate::access::keepalive_count();
+                if activity::is_active(holds, timeout) {
                     idle_since = None;
                 } else {
                     let since = idle_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= timeout {
                         info!(
-                            "Daemon idle for {}s (no active PTY sessions). Initiating auto-shutdown.",
+                            "Daemon idle for {}s (no PTY session, open WebSocket or request). \
+                             Initiating auto-shutdown.",
                             idle_timeout_secs
                         );
                         let _ = shutdown_tx.send(());
@@ -596,19 +1010,27 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         info!("token is the configured one; read it from the env file, not from this log");
     }
 
+    // Bound before the discovery files are written, so they carry the real
+    // port (a principal child binds port 0 and reports it this way, P-7).
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+
     // Write daemon discovery metadata files. They carry the bearer token, so
     // they are owner-only and the temp copy is per user (`discovery.rs`).
     let temp_meta_path = discovery::user_temp_path();
     let daemon_meta = serde_json::json!({
         "pid": std::process::id(),
         "host": config.host,
-        "port": config.port,
+        "port": bound.port(),
         "token": token,
         "version": env!("CARGO_PKG_VERSION"),
     })
     .to_string();
     if let Err(e) = discovery::write_private(&temp_meta_path, &daemon_meta) {
-        warn!("could not write discovery file {}: {e}", temp_meta_path.display());
+        warn!(
+            "could not write discovery file {}: {e}",
+            temp_meta_path.display()
+        );
     }
     let data_dir_meta = config.data_dir.as_ref().map(|d| d.join("daemon.json"));
     if let Some(ref path) = data_dir_meta {
@@ -617,41 +1039,28 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         }
     }
 
-    let shutdown_signal = {
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        async move {
-            let ctrl_c = async {
-                let _ = tokio::signal::ctrl_c().await;
-            };
-            #[cfg(unix)]
-            let terminate = async {
-                if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    sig.recv().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            };
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
+    // A principal child whose broker died exits rather than hold the
+    // principal's data-dir lock forever (the next broker could never start
+    // a child for it).
+    #[cfg(target_os = "linux")]
+    if mode.principal_child {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            principal_child::parent_gone().await;
+            warn!("the T1 broker that launched this principal child is gone; shutting down");
+            let _ = shutdown_tx.send(());
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mode.principal_child;
 
-            tokio::select! {
-                _ = ctrl_c => {
-                    info!("Received SIGINT (Ctrl+C), shutting down daemon");
-                }
-                _ = terminate => {
-                    info!("Received SIGTERM, shutting down daemon");
-                }
-                _ = shutdown_rx.recv() => {
-                    info!("Received shutdown signal, shutting down daemon");
-                }
-            }
-        }
-    };
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    // ConnectInfo: device `last_seen_addr` and audit `remote_addr` (§3.9).
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx.subscribe()))
+    .await?;
 
     info!("ikenga-server shutting down: cleaning up metadata and draining PTY sessions");
     let _ = std::fs::remove_file(&temp_meta_path);
@@ -659,8 +1068,157 @@ pub async fn run_server(mut config: ServerConfig) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(path);
     }
     pty_manager.drain_all();
+    // Released last: nothing of this process touches ikenga.db any more.
+    #[cfg(target_os = "linux")]
+    drop(mode.lock);
 
     Ok(())
+}
+
+/// The T1 boot. A principal child verifies its own drop and serves as the
+/// single-tenant daemon ([`principal_child_boot`]). Otherwise this is the
+/// broker: the real §8 probe first, before anything binds; a failing probe is
+/// the refusal (DEC-R9-1). A passing one installs the stamped executor and
+/// serves the broker (`server::broker`).
+#[cfg(target_os = "linux")]
+async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
+    use crate::executor::Refusal;
+    use operator::provision::{BootstrapAdmin, ProvisioningMode, UidRange};
+
+    if t1.principal_child {
+        return principal_child_boot(config, t1).await;
+    }
+    let refuse = |refusal: Refusal| -> anyhow::Error {
+        error!("executor tier t1 refused: {refusal}");
+        refusal.into()
+    };
+    let uid_range = match t1.uid_range.as_deref().map(str::parse::<UidRange>) {
+        None => UidRange::DEFAULT,
+        Some(Ok(range)) => range,
+        Some(Err(e)) => {
+            return Err(refuse(Refusal::ProbeFailed {
+                check: "uid_range",
+                detail: e.to_string(),
+            }))
+        }
+    };
+    let provisioning = if t1.provisioning_external {
+        ProvisioningMode::External
+    } else {
+        ProvisioningMode::Auto
+    };
+    // The probe pins the uid range once its test drop passes (§8).
+    let executor = operator::probe::boot(
+        config.data_dir.clone(),
+        uid_range,
+        provisioning,
+        t1.principal_path.clone(),
+    )
+    .await
+    .map_err(refuse)?;
+    let executor = Arc::new(executor);
+    let caps = crate::executor::install_executor(Box::new(executor.clone())).map_err(refuse)?;
+    info!(
+        "executor tier: {} (pty: {}, piped: {}, principal isolation: {})",
+        caps.tier, caps.pty, caps.piped, caps.principal_isolation
+    );
+    health::init_uptime();
+
+    // The probe accepted --data-dir as the operator root (it resolved a
+    // relative one against the cwd the same way).
+    let data_dir = config
+        .data_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--data-dir is required under t1"))?;
+    let data_dir = if data_dir.is_absolute() {
+        data_dir
+    } else {
+        std::env::current_dir()?.join(data_dir)
+    };
+    let root = operator::OperatorRoot::new(data_dir)?;
+    if config.auth_token.is_some() {
+        warn!(
+            "IKENGA_AUTH_TOKEN / --auth-token is ignored under t1: the operator bearer grants \
+             no principal surface (G-PRINCIPAL §2.4); principals sign in at /auth/login"
+        );
+    }
+    let access_options = t1.access_options();
+    let bootstrap = t1.bootstrap_admin.map(|b| BootstrapAdmin {
+        username: b.username,
+        password: b.password,
+    });
+    broker::serve(broker::BrokerBoot {
+        config,
+        executor,
+        root,
+        uid_range,
+        provisioning,
+        bootstrap,
+        insecure_cookie: t1.insecure_cookie,
+        access: access_options,
+    })
+    .await
+}
+
+/// A T1 principal child (§3 "pinned for the child"): verify the drop and
+/// install that executor, take the data-dir flock **before** `PaDb` can open
+/// `ikenga.db` (I-3), then serve as the single-tenant daemon on loopback
+/// with the broker-issued per-child token.
+#[cfg(target_os = "linux")]
+async fn principal_child_boot(mut config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()> {
+    use crate::executor::Refusal;
+
+    let refuse = |detail: String| -> anyhow::Error {
+        let refusal = Refusal::ProbeFailed {
+            check: "principal_child",
+            detail,
+        };
+        error!("principal child refused: {refusal}");
+        refusal.into()
+    };
+    let expected_uid = t1
+        .expected_uid
+        .ok_or_else(|| refuse("--principal-child needs --expected-uid".into()))?;
+    let executor = crate::executor::t1_child::PrincipalChildExecutor::probe(expected_uid)
+        .map_err(|r| refuse(r.to_string()))?;
+    let caps =
+        crate::executor::install_executor(Box::new(executor)).map_err(|r| refuse(r.to_string()))?;
+    info!(
+        "executor tier: {} principal child (pty: {}, piped: {}, principal isolation: {})",
+        caps.tier, caps.pty, caps.piped, caps.principal_isolation
+    );
+    if config.auth_token.is_none() {
+        // Never mint: only the broker's per-child token may reach us (P-7).
+        return Err(refuse("no IKENGA_AUTH_TOKEN from the broker".into()));
+    }
+    let data_dir = config
+        .data_dir
+        .clone()
+        .ok_or_else(|| refuse("--principal-child needs --data-dir".into()))?;
+    let lock = principal_child::DataDirLock::acquire(&data_dir)
+        .map_err(|e| refuse(format!("{}: {e}", data_dir.join(".lock").display())))?;
+    // Loopback only, whatever was passed (P-7).
+    config.host = "127.0.0.1".into();
+    config.port = 0;
+    serve_single_tenant(
+        config,
+        SingleTenant {
+            lock: Some(lock),
+            principal_child: true,
+            access: t1.access_options(),
+        },
+    )
+    .await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn t1_boot(_config: ServerConfig, _t1: T1ServeOptions) -> anyhow::Result<()> {
+    let refusal = crate::executor::Refusal::ProbeFailed {
+        check: "os",
+        detail: "executor tier t1 is Linux-only".into(),
+    };
+    error!("executor tier t1 refused: {refusal}");
+    Err(refusal.into())
 }
 
 #[cfg(test)]
@@ -690,14 +1248,12 @@ mod tests {
     /// starting, with the typed refusal — it never falls back to T0.
     #[tokio::test]
     async fn refuses_to_start_on_an_unimplemented_executor_tier() {
-        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
-            let err = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                run_server(config(tier)),
-            )
-            .await
-            .expect("a refusal is immediate, not a running server")
-            .expect_err("an unimplemented tier must not start");
+        for tier in [ExecutorTier::T2, ExecutorTier::T3] {
+            let err =
+                tokio::time::timeout(std::time::Duration::from_secs(5), run_server(config(tier)))
+                    .await
+                    .expect("a refusal is immediate, not a running server")
+                    .expect_err("an unimplemented tier must not start");
             assert_eq!(
                 err.downcast_ref::<Refusal>(),
                 Some(&Refusal::NotImplemented { tier }),
@@ -709,6 +1265,52 @@ mod tests {
             ExecutorTier::T0,
             "a refused tier must not be installed"
         );
+    }
+
+    /// DEC-R9-1 for T1: the real §8 probe runs first and refuses with its
+    /// typed failure (unprivileged: identity; as root: the missing
+    /// `--data-dir`) — never a fallback, never a bound port.
+    #[tokio::test]
+    async fn t1_runs_its_boot_probe_first_and_refuses_on_failure() {
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            run_server(config(ExecutorTier::T1)),
+        )
+        .await
+        .expect("a refusal is immediate, not a running server")
+        .expect_err("t1 without an operator root must not start");
+        assert!(
+            matches!(
+                err.downcast_ref::<Refusal>(),
+                Some(Refusal::ProbeFailed { .. })
+            ),
+            "expected the typed probe refusal, got: {err:#}"
+        );
+        assert_eq!(crate::executor::current().tier(), ExecutorTier::T0);
+
+        // A bad --uid-range is refused before anything runs.
+        let err = run_server_with(
+            config(ExecutorTier::T1),
+            T1ServeOptions {
+                uid_range: Some("nope".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(
+                err.downcast_ref::<Refusal>(),
+                Some(Refusal::ProbeFailed {
+                    check: "uid_range",
+                    ..
+                })
+            ),
+            "{err:#}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let _ = err;
     }
 
     #[tokio::test]
@@ -790,7 +1392,8 @@ mod tests {
             dir.join("manifest.json"),
             format!(
                 r#"{{"id":"{id}","name":"T","version":"0.1.0","ikenga_api":"1",
-                    "ui":{{"routes":[{{"path":"/x","kind":"iframe","source":"dist/index.html"}}]}}}}"#
+                    "ui":{{"routes":[{{"path":"/x","kind":"iframe","source":"dist/index.html"}}],
+                           "views":[{{"id":"v1","title":"V1","route":"/x"}}]}}}}"#
             ),
         )
         .unwrap();
@@ -830,16 +1433,23 @@ mod tests {
         assert_eq!(entry["kind"], "iframe");
         assert_eq!(
             data["registries"].as_object().unwrap().len(),
-            1,
-            "only the registry the daemon runs may be reported"
+            3,
+            "daemon reports ui_routes, views, and activity_bar registries"
         );
+        assert!(data["registries"].get("ui_routes").is_some());
+        assert!(data["registries"].get("views").is_some());
+        assert!(data["registries"].get("activity_bar").is_some());
 
         // Shape-equality with the Tauri side: `Kernel::status` goes through
         // the same `assemble_status`, so building it here from the same inputs
         // must reproduce the daemon's payload exactly.
         let pkg = crate::pkg::manifest::Package::load(&dir).unwrap();
         let ui = crate::pkg::registries::UiRoutesRegistry::new();
+        let views = crate::pkg::registries::ViewsRegistry::new();
+        let bar = crate::pkg::registries::ActivityBarRegistry::new();
         crate::pkg::Registry::register(&ui, &pkg).unwrap();
+        crate::pkg::Registry::register(&views, &pkg).unwrap();
+        crate::pkg::Registry::register(&bar, &pkg).unwrap();
         let expected = crate::pkg::assemble_status(
             vec![crate::pkg::InstalledSummary {
                 id: "com.test.good".into(),
@@ -854,7 +1464,7 @@ mod tests {
                 },
                 project_id: None,
             }],
-            &[&ui],
+            &[&ui, &views, &bar],
             crate::pkg::manifest::IKENGA_API_VERSION,
         );
         assert_eq!(data, &serde_json::to_value(expected).unwrap());
@@ -908,5 +1518,195 @@ mod tests {
         .await;
         assert_eq!(res["ok"], true, "{res}");
         assert!(res["data"].is_array());
+    }
+
+    async fn get_pkgs(router: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The `ikenga_pkgs` Set-Cookie a response carries, if any.
+    fn pkgs_set_cookie(res: &Response) -> Option<String> {
+        res.headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("ikenga_pkgs="))
+            .map(str::to_string)
+    }
+
+    /// `name=value` from a Set-Cookie line.
+    fn cookie_pair(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn pkgs_routes_take_the_scoped_cookie_minted_by_a_bearer_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+        let file = "/pkgs/com.test.good/index.html";
+
+        // No credential: refused.
+        let res = get_pkgs(&router, file, &[]).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // The bearer header works, and mints the `/pkgs` cookie.
+        let res = get_pkgs(&router, file, &[("authorization", "Bearer tok")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let set = pkgs_set_cookie(&res).expect("a bearer request mints the cookie");
+        assert!(set.contains("; HttpOnly"), "{set}");
+        assert!(set.contains("; SameSite=Strict"), "{set}");
+        assert!(set.contains("; Path=/pkgs;"), "{set}");
+        assert!(!set.contains("tok;"), "the cookie must not carry the bearer: {set}");
+        let pair = cookie_pair(&set);
+        assert!(!pair.contains("=tok"), "{pair}");
+
+        // That cookie alone now loads app files (an ES module import, say).
+        let res = get_pkgs(&router, file, &[("cookie", pair.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = get_pkgs(&router, "/pkgs/com.test.good/", &[("cookie", pair.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // ...but nothing outside `/pkgs`.
+        {
+            use axum::body::Body;
+            use tower::ServiceExt;
+            let res = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/rpc")
+                        .header("cookie", pair.as_str())
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"cmd":"pkg_kernel_status"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // A wrong, forged or raw-bearer cookie is refused.
+        for bad in [
+            "ikenga_pkgs=nope",
+            "ikenga_pkgs=tok",
+            "ikenga_session=tok",
+            "ikenga_pkgs=99999999999.00",
+        ] {
+            let res = get_pkgs(&router, file, &[("cookie", bad)]).await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{bad}");
+        }
+
+        // A cookie minted under another bearer is refused.
+        let other = format!(
+            "{}={}",
+            pkg_cookie::COOKIE,
+            pkg_cookie::mint("another-token", pkg_cookie::now_secs())
+        );
+        let res = get_pkgs(&router, file, &[("cookie", other.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // A token in the query string mints nothing.
+        let res = get_pkgs(&router, &format!("{file}?token=tok"), &[]).await;
+        assert!(pkgs_set_cookie(&res).is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_app_rpcs_answer_on_the_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+
+        // pkg_activity_bar_set_badge: set, visible in pkg_kernel_status, clear.
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_activity_bar_set_badge",
+                "args": { "pkgId": "com.test.good", "badge": { "dot": true, "count": 3 } }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+        let status = rpc(&router, serde_json::json!({ "cmd": "pkg_kernel_status" })).await;
+        assert!(
+            status["data"]["registries"]["activity_bar"]
+                .to_string()
+                .contains("\"count\":3"),
+            "{status}"
+        );
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_activity_bar_set_badge",
+                "args": { "pkgId": "com.test.good", "badge": null }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+
+        // Unknown pkg, missing id and a malformed badge are errors.
+        for args in [
+            serde_json::json!({ "pkgId": "com.test.unknown", "badge": null }),
+            serde_json::json!({ "badge": null }),
+            serde_json::json!({ "pkgId": "com.test.good", "badge": { "count": "x" } }),
+        ] {
+            let res = rpc(
+                &router,
+                serde_json::json!({ "cmd": "pkg_activity_bar_set_badge", "args": args }),
+            )
+            .await;
+            assert_eq!(res["ok"], false, "{res}");
+        }
+
+        // The server grants no elevated trust, to any pkg.
+        for id in ["com.test.good", "com.test.unknown"] {
+            let res = rpc(
+                &router,
+                serde_json::json!({
+                    "cmd": "pkg_is_trusted_for_elevated",
+                    "args": { "pkgId": id }
+                }),
+            )
+            .await;
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(res["data"], false, "{res}");
+        }
+
+        // Nothing is ever parked for review.
+        let res = rpc(&router, serde_json::json!({ "cmd": "pkg_trust_list_pending" })).await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["data"], serde_json::json!([]));
+
+        // Approving stays desktop-only.
+        let res = rpc(
+            &router,
+            serde_json::json!({ "cmd": "pkg_trust_approve", "args": { "pkgId": "com.test.good" } }),
+        )
+        .await;
+        assert_eq!(res["ok"], false, "{res}");
+
+        // pkg_preview_manifest reads an installed pkg's manifest.
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_preview_manifest",
+                "args": { "installPath": dir.to_str().unwrap() }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["data"]["id"], "com.test.good");
     }
 }

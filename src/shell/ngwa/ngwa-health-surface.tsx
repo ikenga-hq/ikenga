@@ -177,7 +177,7 @@ export function removeRequest(r: PkgHealthIssue, reinstallable: boolean): Confir
 						back until then.
 					</p>
 					{reinstallable && (
-						<p data-remove-reinstall-hint>To keep the pkg, use Reinstall from registry instead.</p>
+						<p data-remove-reinstall-hint>To keep it, use Reinstall from registry instead.</p>
 					)}
 				</>
 			),
@@ -1191,10 +1191,10 @@ export function NgwaHealthSurface({
 										{!snapshotReady
 											? isLoading
 												? SNAPSHOT_WAIT
-												: 'Engine pkgs unknown: the snapshot is unavailable.'
+												: 'Engine extensions unknown: the snapshot is unavailable.'
 											: pkgItem
-												? `engine pkg ${pkgItem.name} ${pkgItem.version ?? '—'} · ${placed} items placed`
-												: `No engine pkg installed, so Scopes shows no ${eng} column · ${placed} items placed`}
+												? `engine extension ${pkgItem.name} ${pkgItem.version ?? '—'} · ${placed} items placed`
+												: `No engine extension installed, so Scopes shows no ${eng} column · ${placed} items placed`}
 									</span>
 									<span className="t2" data-engine-probe>
 										{probe?.isLoading

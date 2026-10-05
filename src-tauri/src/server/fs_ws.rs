@@ -49,14 +49,17 @@ use std::sync::Arc;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+use super::pty_ws::{close_message, closed, SocketAccess};
 use super::rpc_shell::PathGuard;
 use super::AppState;
+use crate::access::{AccessCtx, DaemonAccess};
 use crate::fs_watch::{FileChange, FsEventSink, FsWatchManager};
 
 /// Cap on live watchers for one socket. Each one is an OS watch plus a
@@ -127,13 +130,20 @@ fn error_frame(req_id: Option<&str>, message: &str) -> Message {
 
 pub async fn fs_ws_handler(
     State(state): State<Arc<AppState>>,
+    access: Option<Extension<Arc<DaemonAccess>>>,
+    ctx: Option<Extension<AccessCtx>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_fs_socket(socket, state))
+    // G-ACCESS §1.6: `files` to attach (checked at the handshake); watch
+    // roots are confined under a share (`access::share::fs_watch_root`).
+    let guard = SocketAccess::new(access.map(|Extension(a)| a), ctx.map(|Extension(c)| c));
+    ws.on_upgrade(move |socket| super::activity::track_ws(handle_fs_socket(socket, state, guard)))
 }
 
-async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>, mut guard: SocketAccess) {
     let (mut ws_tx, mut ws_rx) = socket.split();
+    let closed_fut = closed(guard.take_closed());
+    tokio::pin!(closed_fut);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
     info!("FS watcher WebSocket client connected");
@@ -160,12 +170,28 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
         json!({ "type": "fs_ready", "status": "watching", "watching": true }).to_string(),
     ));
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
+        let msg = tokio::select! {
+            // G-ACCESS §3.10: revoked (4401) / caps changed (4403).
+            close = &mut closed_fut => {
+                let _ = out_tx.send(close_message(&close));
+                break;
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+        };
         match msg {
             Message::Close(_) => break,
-            Message::Text(text) => {
-                handle_control(&text, &state.path_guard, &manager, &sink, &out_tx)
-            }
+            Message::Text(text) => handle_control(
+                &text,
+                &state.path_guard,
+                guard.ctx.as_ref(),
+                &manager,
+                &sink,
+                &out_tx,
+            ),
             // Binary/ping/pong carry nothing this socket understands. Axum
             // answers pings itself.
             _ => {}
@@ -183,6 +209,7 @@ async fn handle_fs_socket(socket: WebSocket, state: Arc<AppState>) {
 fn handle_control(
     raw: &str,
     guard: &PathGuard,
+    ctx: Option<&AccessCtx>,
     manager: &FsWatchManager,
     sink: &Arc<dyn FsEventSink>,
     out: &mpsc::UnboundedSender<Message>,
@@ -206,6 +233,12 @@ fn handle_control(
                          unwatch something first"
                     ),
                 ));
+                return;
+            }
+            // G-ACCESS §4.5.4 share hook (WP-76 fills it): under a share a
+            // watch root is confined to the project (or the one artifact).
+            if let Some(Err(e)) = ctx.map(|c| crate::access::share::fs_watch_root(c, &path)) {
+                let _ = out.send(error_frame(req_id.as_deref(), &e.to_string()));
                 return;
             }
             // The router's guard: the process-global allowlist exactly as
@@ -416,7 +449,7 @@ mod tests {
             root.join("data/sub"),
         ] {
             let frame = json!({ "type": "watch", "reqId": "r", "path": path }).to_string();
-            handle_control(&frame, &guard, &manager, &sink, &tx);
+            handle_control(&frame, &guard, None, &manager, &sink, &tx);
             let got = frames(&mut rx);
             assert_eq!(got.len(), 1, "{got:?}");
             assert_eq!(got[0]["type"], "error", "{}: {got:?}", path.display());
@@ -430,7 +463,7 @@ mod tests {
 
         // The root around it is still watchable.
         let frame = json!({ "type": "watch", "reqId": "ok", "path": root }).to_string();
-        handle_control(&frame, &guard, &manager, &sink, &tx);
+        handle_control(&frame, &guard, None, &manager, &sink, &tx);
         let got = frames(&mut rx);
         assert_eq!(got[0]["type"], "watched", "{got:?}");
         assert_eq!(manager.len(), 1);

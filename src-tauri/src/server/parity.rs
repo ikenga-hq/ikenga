@@ -1,6 +1,6 @@
 //! Tauri-command ↔ daemon-RPC parity ratchet (WP-19).
 //!
-//! Every command the desktop registers in `lib.rs`'s
+//! Every command the desktop registers in `commands/registry.rs`'s
 //! `tauri::generate_handler![...]` must be exactly one of:
 //!
 //! * **served** — a string literal in an arm pattern of `rpc.rs`'s
@@ -16,12 +16,20 @@
 //! gates — in the desktop build and in the daemon's `--no-default-features`
 //! build alike. The `generate_handler!` parse is the same one
 //! `scripts/check-acl-parity.ts` does, so the two gates agree on the list.
+//! The list moved out of `lib.rs` in the WP-19 final slice (part A); both
+//! gates also assert it is the only one — `lib.rs` has none — so a second
+//! handler list cannot bypass them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+/// The one `generate_handler!` list (WP-19 final slice A).
+const REGISTRY_RS: &str = include_str!("../commands/registry.rs");
+/// Read only to assert it holds NO handler list any more.
 const LIB_RS: &str = include_str!("../lib.rs");
+/// The literal both gates anchor on.
+const HANDLER_OPEN: &str = "tauri::generate_handler![";
 const RPC_RS: &str = include_str!("rpc.rs");
 const ALLOWLIST: &str = include_str!("desktop_only.toml");
 
@@ -34,23 +42,43 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///
 /// * `pty_list` — legacy alias of `pty_terminal_list`, same arm.
 /// * `fs_home` — the browser has no `@tauri-apps/api/path` `homeDir()`.
-const DAEMON_ONLY_VERBS: &[&str] = &["fs_home", "pty_list"];
+/// * `secrets_default_names` (WP-78a, review WP76-RV1) — the operator
+///   default's names, a layer only the daemon has (the desktop keychain has
+///   no `IKENGA_SECRET_*` default).
+/// * G-ACCESS §9.1 (WP-74a): `notifications_record_access` and
+///   `share_project_info` are `internal` arms (broker → owner child only);
+///   the three `permission_relay_*` arms are called only by the desktop's
+///   own Rust relay task (WP-75), never from the front end.
+const DAEMON_ONLY_VERBS: &[&str] = &[
+    "fs_home",
+    "notifications_record_access",
+    "permission_relay_put",
+    "permission_relay_resolve",
+    "permission_relay_take",
+    "pty_list",
+    "secrets_default_names",
+    "share_project_info",
+];
 
 /// `tauri::generate_handler![ … ]` command names, module paths stripped —
 /// line-for-line the parse in `scripts/check-acl-parity.ts`: slice to the
-/// next `])`, strip `//` comments, keep lines shaped `path::to::cmd,`.
-/// `#[cfg(...)]` attribute lines inside the list don't match and are skipped.
-fn tauri_commands(lib_rs: &str) -> Vec<String> {
-    let start = lib_rs
-        .find("tauri::generate_handler![")
-        .expect("no `tauri::generate_handler![` in lib.rs — parser drifted");
+/// first line that starts with the closing `]` (`]` in a fn body, `])` as a
+/// builder argument), strip `//` comments, keep lines shaped
+/// `path::to::cmd,`. `#[cfg(...)]` attribute lines inside the list don't
+/// match and are skipped.
+fn tauri_commands(src: &str) -> Vec<String> {
+    let start = src
+        .find(HANDLER_OPEN)
+        .expect("no `tauri::generate_handler![` in commands/registry.rs — parser drifted");
+    let close_re = regex::Regex::new(r"\n[ \t]*\]").expect("static regex");
     let end = start
-        + lib_rs[start..]
-            .find("])")
-            .expect("unterminated generate_handler! in lib.rs");
+        + close_re
+            .find(&src[start..])
+            .expect("unterminated generate_handler! in commands/registry.rs")
+            .start();
     let line_re = regex::Regex::new(r"^((?:[A-Za-z_][A-Za-z0-9_]*::)*)([a-z_][a-z0-9_]*)\s*,$")
         .expect("static regex");
-    lib_rs[start..end]
+    src[start..end]
         .lines()
         .filter_map(|raw| {
             let line = raw.split("//").next().unwrap_or("").trim();
@@ -296,7 +324,7 @@ fn dispatch_arms(src: &str) -> Vec<Arm> {
 /// The served verbs: every literal in every arm pattern, after asserting the
 /// match ends in exactly one literal-free catch-all (the unknown-command
 /// fallback) — so a parse that wandered past the match fails loudly.
-fn served_verbs(rpc_rs: &str) -> BTreeSet<String> {
+pub(crate) fn served_verbs(rpc_rs: &str) -> BTreeSet<String> {
     let arms = dispatch_arms(rpc_rs);
     let catch_alls: Vec<&Arm> = arms.iter().filter(|a| a.literals.is_empty()).collect();
     assert_eq!(
@@ -337,7 +365,7 @@ fn fmt_list<'a>(names: impl IntoIterator<Item = &'a String>) -> String {
 
 #[test]
 fn every_tauri_command_is_served_xor_allowlisted() {
-    let tauri_list = tauri_commands(LIB_RS);
+    let tauri_list = tauri_commands(REGISTRY_RS);
     assert!(
         tauri_list.len() > 250,
         "parsed only {} Tauri commands from generate_handler! — the parser has drifted",
@@ -446,6 +474,21 @@ fn every_tauri_command_is_served_xor_allowlisted() {
     );
 }
 
+/// The registry is the ONE handler list: `lib.rs` installs it and holds none
+/// of its own. A second list anywhere the gates don't parse would register
+/// commands neither gate sees. Mirrored in `scripts/check-acl-parity.ts`.
+#[test]
+fn registry_holds_the_only_handler_list() {
+    let in_lib = LIB_RS.matches(HANDLER_OPEN).count();
+    let in_registry = REGISTRY_RS.matches(HANDLER_OPEN).count();
+    assert_eq!(
+        (in_lib, in_registry),
+        (0, 1),
+        "expected exactly one `tauri::generate_handler![` across lib.rs + commands/registry.rs, \
+         all of it in registry.rs; found lib.rs={in_lib} registry.rs={in_registry}"
+    );
+}
+
 #[test]
 fn arm_parser_reads_patterns_not_bodies() {
     let src = r##"
@@ -494,4 +537,21 @@ fn tauri_parser_matches_the_acl_script_shape() {
         tauri_commands(src),
         vec!["first_cmd", "debug_cmd", "plain_cmd"]
     );
+
+    // The registry shape: the list is a fn's tail expression, so it closes
+    // with a bare `]` (no `)`), and a `])` further down must not extend it.
+    let src = r#"
+        pub(crate) fn handler() -> impl Fn(Invoke<Wry>) -> bool {
+            tauri::generate_handler![
+                // ── section
+                a::first_cmd,
+                #[cfg(debug_assertions)]
+                b::debug_cmd,
+                // ── empty section stub
+            ]
+        }
+        fn later() { let _ = vec![x(1, [2])]; }
+        not_in_list,
+    "#;
+    assert_eq!(tauri_commands(src), vec!["first_cmd", "debug_cmd"]);
 }

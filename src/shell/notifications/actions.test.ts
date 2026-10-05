@@ -11,6 +11,16 @@ const mocks = vi.hoisted(() => ({
 	navigateFocused: vi.fn(),
 	addTab: vi.fn(),
 	iykeFetch: vi.fn(() => Promise.resolve(new Response(null, { status: 204 }))),
+	permissionDecide: vi.fn((_id: number, _d: string) => Promise.resolve({ resolved: true })),
+	accessStatus: vi.fn(),
+	accessRoutingGet: vi.fn(),
+}));
+
+vi.mock('@/lib/access/client', async (orig) => ({
+	...(await orig<typeof import('@/lib/access/client')>()),
+	permissionDecide: mocks.permissionDecide,
+	accessStatus: mocks.accessStatus,
+	accessRoutingGet: mocks.accessRoutingGet,
 }));
 
 vi.mock('@/lib/panes/pane-store', () => ({
@@ -27,7 +37,18 @@ vi.mock('@/lib/iyke/client', () => ({
 	iykeFetch: mocks.iykeFetch,
 }));
 
-import { HOOK_GATE_ANSWERABLE_MS, isPermissionAskLive, notificationActionButtons } from './actions';
+import {
+	ACP_ASK_ANSWERABLE_MS,
+	ASK_ALREADY_OVER,
+	decidePermissionRow,
+	HOOK_GATE_ANSWERABLE_MS,
+	hostDecideBlock,
+	isPermissionAskLive,
+	notificationActionButtons,
+	postHookDecision,
+	refreshHostDecideBlock,
+	setHostDecideBlock,
+} from './actions';
 
 /** Rows below are created at t=0; "now" inside the hold window. */
 const NOW = 1_000;
@@ -54,10 +75,13 @@ beforeEach(() => {
 	mocks.navigateFocused.mockClear();
 	mocks.addTab.mockClear();
 	mocks.iykeFetch.mockClear();
+	mocks.permissionDecide.mockClear();
+	mocks.accessStatus.mockReset();
+	mocks.accessRoutingGet.mockReset();
 });
 
 describe('notificationActionButtons', () => {
-	it('permission.decide: Allow once posts approved, Deny posts denied', () => {
+	it('permission.decide: Allow once / Deny go through permission_decide (G-ACCESS §5.5)', async () => {
 		const buttons = notificationActionButtons(
 			row({
 				kind: 'permission',
@@ -70,6 +94,16 @@ describe('notificationActionButtons', () => {
 		expect(buttons[1]?.variant).toBe('ghost');
 
 		buttons[0]?.run();
+		expect(mocks.permissionDecide).toHaveBeenCalledWith(1, 'allow_once');
+		buttons[1]?.run();
+		expect(mocks.permissionDecide).toHaveBeenLastCalledWith(1, 'deny');
+		await Promise.resolve();
+		expect(mocks.iykeFetch).not.toHaveBeenCalled();
+	});
+
+	it('decidePermissionRow falls back to the hooks route only for a non-final failure', async () => {
+		mocks.permissionDecide.mockRejectedValueOnce(new Error('internal: not running'));
+		expect(await decidePermissionRow(1, 'allow_once', 'req-1')).toBeNull();
 		expect(mocks.iykeFetch).toHaveBeenCalledWith(
 			'/iyke/hooks/decision',
 			expect.objectContaining({
@@ -77,12 +111,56 @@ describe('notificationActionButtons', () => {
 				body: JSON.stringify({ requestId: 'req-1', decision: 'approved' }),
 			})
 		);
+		mocks.iykeFetch.mockClear();
+		for (const err of [
+			'routing_refused: answered on another device',
+			'conflict: already answered',
+			'owner_approval_required: owner',
+		]) {
+			mocks.permissionDecide.mockRejectedValueOnce(new Error(err));
+			expect(await decidePermissionRow(1, 'deny', 'req-1')).toBe(
+				err.slice(err.indexOf(':') + 1).trim()
+			);
+		}
+		expect(mocks.iykeFetch).not.toHaveBeenCalled();
+	});
 
-		buttons[1]?.run();
-		expect(mocks.iykeFetch).toHaveBeenLastCalledWith(
-			'/iyke/hooks/decision',
-			expect.objectContaining({ body: JSON.stringify({ requestId: 'req-1', decision: 'denied' }) })
-		);
+	// Review WP78a-R5: a 2xx that reached no held gate is not an answer.
+	it('postHookDecision reads `gated: false` as "already over", not answered', async () => {
+		const json = (body: unknown) =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		mocks.iykeFetch.mockResolvedValueOnce(json({ recorded: true, gated: false }));
+		expect(await postHookDecision('req-1', 'approved')).toBe(ASK_ALREADY_OVER);
+		mocks.iykeFetch.mockResolvedValueOnce(json({ recorded: true, gated: true }));
+		expect(await postHookDecision('req-1', 'approved')).toBeNull();
+		// An older backend (no body / no flag) still reads as answered.
+		expect(await postHookDecision('req-1', 'denied')).toBeNull();
+	});
+
+	it('a desktop routed to another device offers no Allow / Deny (§5.1)', async () => {
+		mocks.accessStatus.mockResolvedValueOnce({ store: 'ok', caps: ['files', 'sessions'] });
+		mocks.accessRoutingGet.mockResolvedValueOnce({
+			mode: 'this_device',
+			deviceId: 'p',
+			deviceName: 'Pixel 9',
+		});
+		expect(await refreshHostDecideBlock()).toBe('Answer on Pixel 9 (this device only)');
+		expect(hostDecideBlock()).toMatch(/Pixel 9/);
+		const decide = {
+			kind: 'permission.decide',
+			via: 'hooks',
+			requestId: 'r',
+			terminalId: 't-1',
+		} as const;
+		expect(notificationActionButtons(row({ action: decide }), NOW).map((b) => b.label)).toEqual([
+			'Open terminal',
+		]);
+		mocks.accessStatus.mockResolvedValueOnce({ store: 'ok', caps: ['approve'] });
+		expect(await refreshHostDecideBlock()).toBeNull();
+		setHostDecideBlock(null);
 	});
 
 	it('permission.decide: a resolved row offers no live decision, only Open terminal', () => {
@@ -120,7 +198,9 @@ describe('notificationActionButtons', () => {
 			requestId: 'req-1',
 			terminalId: null,
 		} as const;
-		expect(notificationActionButtons(row({ action: decide }), HOOK_GATE_ANSWERABLE_MS + 1)).toEqual([]);
+		expect(notificationActionButtons(row({ action: decide }), HOOK_GATE_ANSWERABLE_MS + 1)).toEqual(
+			[]
+		);
 	});
 
 	it('isPermissionAskLive: read-but-pending stays live; an older row without resolvedAt uses read state', () => {
@@ -133,15 +213,34 @@ describe('notificationActionButtons', () => {
 		expect(isPermissionAskLive(legacyUnread, NOW)).toBe(true);
 	});
 
-	it('permission.decide via acp is narrowed to open-only open.thread', () => {
+	it('an ACP ask is answerable inline while the round-trip waits (WP-75), then open-only', () => {
+		const acp = {
+			kind: 'permission.decide',
+			via: 'acp',
+			threadId: 'th-9',
+			requestId: 'r-9',
+		} as const;
+		const live = notificationActionButtons(row({ kind: 'permission', action: acp }), NOW);
+		expect(live.map((b) => b.label)).toEqual([
+			'Allow once',
+			'Always for this project',
+			'Deny',
+			'Open thread',
+		]);
+		live[1]?.run();
+		expect(mocks.permissionDecide).toHaveBeenCalledWith(1, 'allow_always_project');
+
 		const buttons = notificationActionButtons(
-			row({
-				kind: 'permission',
-				action: { kind: 'permission.decide', via: 'acp', threadId: 'th-9', requestId: 'r-9' },
-			}),
+			row({ kind: 'permission', action: acp, resolvedAt: 500 }),
 			NOW
 		);
 		expect(buttons.map((b) => b.label)).toEqual(['Open thread']);
+		expect(
+			notificationActionButtons(
+				row({ kind: 'permission', action: acp }),
+				ACP_ASK_ANSWERABLE_MS + 1
+			).map((b) => b.label)
+		).toEqual(['Open thread']);
 		buttons[0]?.run();
 		expect(mocks.iykeFetch).not.toHaveBeenCalled();
 		expect(mocks.addTab).toHaveBeenCalledWith('pane-1', { kind: 'terminal', sessionId: 'th-9' });
@@ -175,7 +274,10 @@ describe('notificationActionButtons', () => {
 		);
 		expect(buttons.map((b) => b.label)).toEqual(['Open thread']);
 		buttons[0]?.run();
-		expect(mocks.addTab).toHaveBeenCalledWith('pane-1', { kind: 'terminal', sessionId: 'thread-1' });
+		expect(mocks.addTab).toHaveBeenCalledWith('pane-1', {
+			kind: 'terminal',
+			sessionId: 'thread-1',
+		});
 	});
 
 	it('open.chi_run labels "Open log" on failure, "Open artifact" on success, both route to /automations', () => {
@@ -194,7 +296,10 @@ describe('notificationActionButtons', () => {
 
 	it('open.release_notes routes to /settings/about', () => {
 		const buttons = notificationActionButtons(
-			row({ kind: 'update', action: { kind: 'open.release_notes', source: 'shell', version: '0.9.1' } })
+			row({
+				kind: 'update',
+				action: { kind: 'open.release_notes', source: 'shell', version: '0.9.1' },
+			})
 		);
 		buttons[0]?.run();
 		expect(mocks.navigateFocused).toHaveBeenCalledWith('/settings/about');
@@ -213,7 +318,10 @@ describe('notificationActionButtons', () => {
 
 	it('open.violations routes to the Ngwa review filter as the primary action', () => {
 		const buttons = notificationActionButtons(
-			row({ kind: 'violation', action: { kind: 'open.violations', pkgId: 'com.ikenga.pkg-browser' } })
+			row({
+				kind: 'violation',
+				action: { kind: 'open.violations', pkgId: 'com.ikenga.pkg-browser' },
+			})
 		);
 		expect(buttons[0]?.variant).toBe('primary');
 		buttons[0]?.run();

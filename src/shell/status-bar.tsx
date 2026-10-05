@@ -2,7 +2,7 @@
 // `.status`; spec §3.13 amended by §6A.7 / §6A.8 and v4 P5).
 //
 //   left   branch · modified · project
-//   middle Ngwa: installed · updates · violations   (each a deep link)
+//   middle Ngwa: pkgs · updates · violations   (each a deep link)
 //   right  [notifications bell slot] · permissions · runs · session cost ·
 //          engine · shortcuts
 //
@@ -17,8 +17,12 @@
 // Data sources — all existing, nothing new on the host:
 //   · branch / modified — `useGitRepoSummary()` (git pkg `repo.snapshot`)
 //   · Ngwa counts — `usePkgsDerived()`, the pkg kernel snapshot + registry
-//     index + violations list the pkg surface already reads (Phase 2 swaps in
-//     `ngwa_snapshot`)
+//     index + violations list the pkg surface already reads. DEC-73 (Round 58,
+//     `plans/shell-ux-rearchitecture/04-discussion.md`) keeps this segment on
+//     the kernel pkg count rather than swapping it to the full `ngwa_snapshot`
+//     item count — it is labelled "N pkgs", not "N installed", and the Ngwa
+//     Installed tab's pkg sub-count (`selectPkgCount`, `lib/ngwa/pkg-count.ts`)
+//     is defined to agree with it.
 //   · permissions — the exact query + 15 s poll the rail's
 //     `ApprovalsRailButton` used (`paActionsListQueryOptions()`), moved here
 //     with the rail button's removal (WP-03)
@@ -204,7 +208,9 @@ function ReadOnly({ id, title, children }: { id: string; title: string; children
 export function NotificationsBellSlot({ rovingId }: { rovingId?: string | null } = {}) {
 	return (
 		<span data-slot="notifications-bell" className="contents">
-			<NotificationsBell tabIndex={rovingId === undefined ? undefined : rovingId === 'notifications' ? 0 : -1} />
+			<NotificationsBell
+				tabIndex={rovingId === undefined ? undefined : rovingId === 'notifications' ? 0 : -1}
+			/>
 		</span>
 	);
 }
@@ -243,7 +249,8 @@ export function StatusBar() {
 		{
 			id: 'ngwa-installed',
 			count: installed,
-			text: `${installed} installed`,
+			text: plural(installed, 'pkg'),
+			title: `${plural(installed, 'pkg')} installed (all scopes) — open the Installed tab`,
 			to: NGWA_LINKS.installed,
 		},
 		{ id: 'ngwa-updates', count: updates, text: plural(updates, 'update'), to: NGWA_LINKS.updates },
@@ -361,6 +368,7 @@ export function StatusBar() {
 								rovingId={rovingId}
 								onClick={() => navigateFocused(seg.to)}
 								label={`Ngwa: ${seg.text}`}
+								title={seg.title}
 								className={cn('px-1', seg.className)}
 							>
 								{seg.text}

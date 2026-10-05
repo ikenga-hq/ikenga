@@ -18,13 +18,16 @@ import { seedPinsFromRail } from '@/lib/shell/seed-pins';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { startActionsStore } from '@/lib/actions/store';
 import { installKeyDispatcher, startOsShortcutSync } from '@/lib/keymap/dispatcher';
-import { awaitingFirstToken, isTauri } from '@/lib/transport';
+import { awaitingFirstToken, detectBrowserTier, getAuthToken, isTauri } from '@/lib/transport';
+import { bootsIntoRemote, detectAccessStatus } from '@/lib/transport/device-session';
 import { useReauthStore } from '@/lib/transport/reauth-store';
+import { fetchAuthMe, isT1Session } from '@/lib/transport/t1-session';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
 import { installNativeMenu } from '@/shell/native-menu';
 import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
 import { AppLockOverlay } from '@/shell/people/app-lock-overlay';
 import { useAppLockStore } from '@/shell/people/app-lock-store';
+import { PairConfirmOverlay } from '@/shell/people/devices-pair-confirm';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { FilepickerModal } from '@/components/ui/filepicker-modal';
 import { ReauthOverlay } from '@/components/ui/reauth-overlay';
@@ -51,6 +54,73 @@ export async function bootPrimary(): Promise<void> {
 	// helper entirely.
 	if (import.meta.env?.DEV) {
 		void import('@/lib/dev');
+	}
+
+	// G-ACCESS §3.12 (WP-74b): `/remote/pair` is the device side of pairing.
+	// It is public — it runs before any credential exists — so it boots on
+	// its own: no router, no RPC.
+	const path = typeof window === 'undefined' ? '' : window.location.pathname;
+	if (!isTauri() && (path === '/remote/pair' || path.startsWith('/remote/pair/'))) {
+		const { RemotePairPage } = await import('@/routes/remote/-components/remote-pair-page');
+		installIkengaDomSync();
+		createRoot(document.getElementById('root')!).render(
+			<React.StrictMode>
+				<RemotePairPage />
+			</React.StrictMode>
+		);
+		return;
+	}
+
+	// WP-20 (G-PRINCIPAL §2.4): a browser tab may be on a T1 (multi-user)
+	// server, where people sign in with a username and password and the
+	// session cookie is the credential. Ask once, before anything reaches the
+	// transport, whether or not the tab holds a T0 token: a tab left open
+	// across an adopt-t0 still has one, and under T1 it is dropped. Desktop
+	// windows never ask. Signed out: show only the sign-in dialog, since every
+	// RPC would 401. Signing in reloads the page into a normal boot.
+	if (await detectBrowserTier()) {
+		if (!(await fetchAuthMe())) {
+			installIkengaDomSync();
+			useReauthStore.getState().showReauth();
+			createRoot(document.getElementById('root')!).render(
+				<React.StrictMode>
+					<ReauthOverlay />
+				</React.StrictMode>
+			);
+			return;
+		}
+	}
+
+	// G-ACCESS §2.4 / §3.8 (WP-74b): a browser tab with no T0 token may be a
+	// paired device — its HttpOnly `ikenga_device` cookie is the credential.
+	// One `access_status` probe tells (and marks the transport remote); a tab
+	// with no credential at all is offered "Pair this device". P-21: a device
+	// below `full` boots into the remote client (`/remote`), which a `full`
+	// device or a password session can also open by hand.
+	if (!isTauri()) {
+		const access = await detectAccessStatus(isT1Session() ? null : getAuthToken());
+		if (!access && !isT1Session() && !getAuthToken()) {
+			installIkengaDomSync();
+			useReauthStore.getState().showPair();
+			createRoot(document.getElementById('root')!).render(
+				<React.StrictMode>
+					<ReauthOverlay />
+				</React.StrictMode>
+			);
+			return;
+		}
+		if (bootsIntoRemote(access) || path === '/remote' || path === '/remote/') {
+			if (path !== '/remote') window.history.replaceState(null, '', '/remote');
+			const { RemoteClient } = await import('@/routes/remote/-components/remote-client');
+			installIkengaDomSync();
+			createRoot(document.getElementById('root')!).render(
+				<React.StrictMode>
+					<RemoteClient />
+					<ReauthOverlay />
+				</React.StrictMode>
+			);
+			return;
+		}
 	}
 
 	// Sync Ikenga data-attrs onto <html> before first React render so the very
@@ -129,6 +199,8 @@ export async function bootPrimary(): Promise<void> {
 					</SecretsUnlockSheetProvider>
 					<FilepickerModal />
 					<ReauthOverlay />
+					{/* WP-74b: D-05 pair-confirm (G-ACCESS §3.6), beside the app lock. */}
+					<PairConfirmOverlay />
 					{/* WP-72: D-05 app lock. Last, so it covers everything above. */}
 					<AppLockOverlay />
 					{import.meta.env?.DEV && <ReactQueryDevtools buttonPosition="bottom-right" />}

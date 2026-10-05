@@ -1,3 +1,6 @@
+import { isDeviceSession } from './device-session';
+import { detectT1Server, isT1Session } from './t1-session';
+
 export interface RpcTransport {
 	invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T>;
 	listen<T>(
@@ -76,6 +79,35 @@ export function getAuthToken(): string | null {
 	return cachedToken;
 }
 
+/**
+ * The bearer token this tab presents: the T0 token, or none under T1, where
+ * the session cookie is the only credential and `?token=` grants nothing
+ * (G-PRINCIPAL §2.3, I-6). A token left in this tab's storage by an earlier
+ * T0 visit is never sent to a T1 server: {@link detectBrowserTier} drops it
+ * at boot, and this returns `null` under T1 regardless.
+ */
+export function transportToken(): string | null {
+	return isT1Session() ? null : getAuthToken();
+}
+
+/**
+ * Boot-time tier detection for a browser tab (G-PRINCIPAL §2.4). It runs for
+ * every non-desktop tab, token or not: a tab still holding a T0 token (in
+ * `sessionStorage` from an earlier visit, or from a `?token=` link) must
+ * still find out that the server is now T1, or it would keep presenting the
+ * token, get 401s, and offer a token-paste dialog instead of sign-in. Under
+ * T1 the token grants nothing (I-6), so it is dropped here. A desktop
+ * window never asks.
+ */
+export async function detectBrowserTier(): Promise<boolean> {
+	if (isTauri()) return false;
+	// Consume a `?token=` link first, so it leaves the address bar either way.
+	getAuthToken();
+	if (!(await detectT1Server())) return false;
+	clearAuthToken();
+	return true;
+}
+
 /** Drop the token from memory and this tab's storage. */
 export function clearAuthToken(): void {
 	cachedToken = null;
@@ -86,6 +118,95 @@ export function clearAuthToken(): void {
 	} catch {
 		// Nothing to do — the in-memory copy is already gone.
 	}
+}
+
+// ── share mode (G-ACCESS §4.5.2, WP-76) ─────────────────────────────────────
+
+/**
+ * A project someone else shared with this principal (T1 only), as the
+ * "Shared with you" block opened it. While one is selected, every RPC
+ * carries `X-Ikenga-Share: <owner_principal_id>/<project_id>` and every
+ * WebSocket URL `?share=…`: the broker checks the membership, narrows the
+ * caps to role ∩ device tier and routes the request into the Owner's child.
+ * The selector only selects — the session cookie still authenticates.
+ */
+export interface ShareSelection {
+	projectKey: string;
+	projectId: string;
+	projectName: string;
+	ownerUsername: string | null;
+	role: 'operator' | 'reviewer' | 'guest';
+	scope: 'project' | 'artifact';
+	artifactPath?: string | null;
+}
+
+const SHARE_KEY = 'ikenga_share';
+let shareSelection: ShareSelection | null | undefined;
+const shareListeners = new Set<(s: ShareSelection | null) => void>();
+
+function isShareSelection(v: unknown): v is ShareSelection {
+	if (!v || typeof v !== 'object') return false;
+	const o = v as Record<string, unknown>;
+	return (
+		typeof o.projectKey === 'string' &&
+		/^[0-9a-f-]{36}\/[^/]+$/.test(o.projectKey) &&
+		typeof o.projectId === 'string' &&
+		typeof o.projectName === 'string' &&
+		(o.role === 'operator' || o.role === 'reviewer' || o.role === 'guest')
+	);
+}
+
+/** The selected share, or `null` for your own workspace. Per tab
+ *  (`sessionStorage`), never on the desktop. */
+export function currentShare(): ShareSelection | null {
+	if (shareSelection !== undefined) return shareSelection;
+	shareSelection = null;
+	if (typeof window === 'undefined' || isTauri()) return null;
+	try {
+		const raw = sessionStorage.getItem(SHARE_KEY);
+		const parsed: unknown = raw ? JSON.parse(raw) : null;
+		shareSelection = isShareSelection(parsed) ? parsed : null;
+	} catch {
+		shareSelection = null;
+	}
+	return shareSelection;
+}
+
+/** Switch this tab into (or, with `null`, out of) share mode. */
+export function setShareMode(selection: ShareSelection | null): void {
+	shareSelection = selection && isShareSelection(selection) ? selection : null;
+	try {
+		if (shareSelection) sessionStorage.setItem(SHARE_KEY, JSON.stringify(shareSelection));
+		else sessionStorage.removeItem(SHARE_KEY);
+	} catch {
+		// Memory-only for this page load.
+	}
+	for (const l of shareListeners) l(shareSelection);
+}
+
+/** Be told when share mode changes. Returns the unsubscribe. */
+export function onShareModeChange(listener: (s: ShareSelection | null) => void): () => void {
+	shareListeners.add(listener);
+	return () => shareListeners.delete(listener);
+}
+
+/** `share=<owner>/<project>` for a WebSocket URL, or `''` outside a share. */
+export function shareQueryParam(): string {
+	const s = currentShare();
+	return s ? `share=${encodeURIComponent(s.projectKey)}` : '';
+}
+
+/** Append {@link shareQueryParam} to a URL that may already carry a query. */
+export function withShareQuery(url: string): string {
+	const q = shareQueryParam();
+	if (!q) return url;
+	return `${url}${url.includes('?') ? '&' : '?'}${q}`;
+}
+
+/** Test-only: forget the cached selection so the next read re-hydrates. */
+export function __resetShareModeForTests(): void {
+	shareSelection = undefined;
+	shareListeners.clear();
 }
 
 export class TauriTransport implements RpcTransport {
@@ -111,18 +232,23 @@ export class WebRemoteTransport implements RpcTransport {
 	private warnedEvents: Set<string> = new Set();
 
 	async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-		const token = getAuthToken();
+		const token = transportToken();
 		const headers: Record<string, string> = {
 			'Content-Type': 'application/json',
 		};
 		if (token) {
 			headers['Authorization'] = `Bearer ${token}`;
 		}
+		const share = currentShare();
+		if (share) headers['X-Ikenga-Share'] = share.projectKey;
 
 		const res = await fetch('/api/rpc', {
 			method: 'POST',
 			headers,
 			body: JSON.stringify({ cmd, args: args ?? {} }),
+			// T1: the session cookie (`same-origin` is fetch's default; stated
+			// so nothing downstream can drop it). T0's request is unchanged.
+			...(isT1Session() ? { credentials: 'same-origin' as const } : {}),
 		});
 		if (!res.ok) {
 			if (res.status === 401) {
@@ -199,9 +325,11 @@ export class WebRemoteTransport implements RpcTransport {
 	openPtySocket(id: string, opts?: { spawn?: boolean }): WebSocket {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 		const params = new URLSearchParams();
-		const token = getAuthToken();
+		const token = transportToken();
 		if (token) params.set('token', token);
 		if (opts?.spawn) params.set('spawn', 'true');
+		const share = currentShare();
+		if (share) params.set('share', share.projectKey);
 		const query = params.toString();
 		const ws = new WebSocket(
 			`${protocol}//${window.location.host}/ws/pty/${encodeURIComponent(id)}${query ? `?${query}` : ''}`
@@ -218,9 +346,9 @@ export class WebRemoteTransport implements RpcTransport {
 	 */
 	openFsSocket(): WebSocket {
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const token = getAuthToken();
+		const token = transportToken();
 		const query = token ? `?token=${encodeURIComponent(token)}` : '';
-		return new WebSocket(`${protocol}//${window.location.host}/ws/fs${query}`);
+		return new WebSocket(withShareQuery(`${protocol}//${window.location.host}/ws/fs${query}`));
 	}
 }
 
@@ -262,7 +390,10 @@ let transportInstance: RpcTransport | null = null;
  * to and the desktop transport is the right default.
  */
 export function isRemoteWebSession(): boolean {
-	return !isTauri() && getAuthToken() !== null;
+	// T1: no token, by design — the boot path's tier probe is the marker.
+	// A paired device (G-ACCESS §3.8, WP-74b): its HttpOnly cookie is the
+	// credential, so the boot path's `access_status` probe is the marker.
+	return !isTauri() && (isT1Session() || isDeviceSession() || getAuthToken() !== null);
 }
 
 /**
@@ -280,7 +411,15 @@ export function awaitingFirstToken(): boolean {
 }
 
 export function getTransport(): RpcTransport {
-	if (!transportInstance) {
+	// T1 and a paired device's cookie are both detected asynchronously at
+	// boot; a desktop transport picked before that (by anything that ran
+	// first — e.g. the log bridge flushing a console line) is replaced once
+	// either is known. Without the device half a phone below `full` booted
+	// into `/remote` with no transport at all (WP-78b).
+	if (
+		!transportInstance ||
+		((isT1Session() || isDeviceSession()) && transportInstance instanceof TauriTransport)
+	) {
 		transportInstance = isRemoteWebSession() ? new WebRemoteTransport() : new TauriTransport();
 	}
 	return transportInstance;

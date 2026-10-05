@@ -78,6 +78,15 @@
 	padding: 0 5px;
 }
 
+/* DEC-73 (Round 58): the pkg sub-count next to the Installed total — plain
+ * muted text, not another pill, so it reads as a breakdown of the count
+ * beside it rather than a second badge. */
+.view-ngwa .ntab .pkgcnt {
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+}
+
 .view-ngwa .ntabs .far {
 	margin-left: auto;
 	display: flex;
@@ -2558,4 +2567,128 @@
 	background: var(--primary);
 	border-color: var(--primary);
 	color: var(--primary-fg);
+}
+
+/* ── Store install progress row (install-progress-row.tsx): replaces the
+   Install / Update button while a row installs, and reads a failure after. */
+.view-ngwa .iprog {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	flex: 1;
+	min-width: 0;
+}
+
+.view-ngwa .iprog-main {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	flex: 1;
+	min-width: 0;
+}
+
+.view-ngwa .iprog-label {
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.view-ngwa .iprog-bar {
+	position: relative;
+	height: 4px;
+	border-radius: var(--radius-pill);
+	background: var(--border);
+	overflow: hidden;
+}
+
+.view-ngwa .iprog-bar i {
+	position: absolute;
+	inset: 0 auto 0 0;
+	border-radius: inherit;
+	background: var(--ember);
+	transition: width 160ms var(--ease-calm);
+}
+
+.view-ngwa .iprog-bar.indeterminate i {
+	width: 35%;
+	animation: ngwa-iprog-slide 1.3s var(--ease-calm) infinite;
+}
+
+@keyframes ngwa-iprog-slide {
+	from {
+		left: -35%;
+	}
+	to {
+		left: 100%;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.view-ngwa .iprog-bar.indeterminate i {
+		animation: none;
+		width: 100%;
+		opacity: 0.5;
+	}
+}
+
+.view-ngwa .iprog.failed {
+	align-items: flex-start;
+}
+
+.view-ngwa .iprog.failed .note {
+	white-space: normal;
+}
+
+.view-ngwa .iprog-toggle {
+	align-self: flex-start;
+	padding: 0;
+	border: 0;
+	background: none;
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.view-ngwa .iprog-details {
+	display: flex;
+	flex-direction: column;
+	gap: var(--space-2);
+	max-height: 220px;
+	overflow: auto;
+	padding: var(--space-2);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-sunken);
+}
+
+.view-ngwa .iprog-details pre {
+	margin: 0;
+	font-family: var(--font-mono);
+	font-size: var(--text-micro);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.view-ngwa .iprog-logpath {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	font-size: var(--text-micro);
+	color: var(--fg-muted);
+	min-width: 0;
+}
+
+.view-ngwa .iprog-logpath code {
+	font-family: var(--font-mono);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	min-width: 0;
+}
+
+.view-ngwa .srow .iprog {
+	max-width: 240px;
 }

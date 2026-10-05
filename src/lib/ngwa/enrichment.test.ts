@@ -263,6 +263,71 @@ describe('enrichment.ts', () => {
 			expect(uninstalled?.installedItem).toBeNull();
 			expect(uninstalled?.isUpdate).toBe(false);
 		});
+
+		describe('visibility "hidden" (held-back apps)', () => {
+			const hidden = (name: string, latest = '1.0.0'): RegistryEntry =>
+				({ name, latest, detail: `pkgs/${name}.json`, visibility: 'hidden' }) as RegistryEntry;
+			const publicEntry = (name: string, visibility?: 'public'): RegistryEntry =>
+				({
+					name,
+					latest: '1.0.0',
+					detail: `pkgs/${name}.json`,
+					...(visibility ? { visibility } : {}),
+				}) as RegistryEntry;
+
+			it('keeps a hidden entry that is not installed out of browse and search', () => {
+				const catalog = buildStoreCatalog(
+					[],
+					[publicEntry('@ikenga/pkg-tasks'), hidden('@ikenga/pkg-finance')]
+				);
+				expect(catalog.map((c) => c.name)).toEqual(['@ikenga/pkg-tasks']);
+			});
+
+			it('hides all seven held apps and leaves Tasks and Sales listed', () => {
+				const held = [
+					'@ikenga/pkg-finance',
+					'@ikenga/pkg-mail',
+					'@ikenga/pkg-content',
+					'@ikenga/pkg-research',
+					'@ikenga/pkg-strategy',
+					'@ikenga/pkg-outbound',
+					'@ikenga/pkg-agent-ops',
+				];
+				const catalog = buildStoreCatalog(
+					[],
+					[...held.map((n) => hidden(n)), publicEntry('@ikenga/pkg-tasks'), publicEntry('@ikenga/pkg-sales')]
+				);
+				expect(catalog.map((c) => c.name).sort()).toEqual([
+					'@ikenga/pkg-sales',
+					'@ikenga/pkg-tasks',
+				]);
+			});
+
+			it('lists an entry marked "public" or with no flag', () => {
+				const catalog = buildStoreCatalog(
+					[],
+					[publicEntry('@ikenga/pkg-a', 'public'), publicEntry('@ikenga/pkg-b')]
+				);
+				expect(catalog.map((c) => c.name)).toEqual(['@ikenga/pkg-a', '@ikenga/pkg-b']);
+			});
+
+			it('keeps a hidden entry that is installed, with update detection intact', () => {
+				const installed = [
+					makeItem({ id: '@ikenga/pkg-finance', name: '@ikenga/pkg-finance', version: '0.9.0' }),
+				];
+				const catalog = buildStoreCatalog(installed, [hidden('@ikenga/pkg-finance', '1.0.0')]);
+				expect(catalog).toHaveLength(1);
+				expect(catalog[0]?.installedItem).not.toBeNull();
+				expect(catalog[0]?.isUpdate).toBe(true);
+				expect(catalog[0]?.latestVersion).toBe('1.0.0');
+			});
+
+			it('does not change the registry list it was given, so exact-name lookups still resolve', () => {
+				const entries = [hidden('@ikenga/pkg-finance'), publicEntry('@ikenga/pkg-tasks')];
+				buildStoreCatalog([], entries);
+				expect(entries.map((e) => e.name)).toEqual(['@ikenga/pkg-finance', '@ikenga/pkg-tasks']);
+			});
+		});
 	});
 
 	describe('storeKindFor — registry manifest hint → Ngwa kind', () => {

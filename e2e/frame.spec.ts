@@ -270,7 +270,7 @@ test.describe('rail (WP-03)', () => {
 		const { rail } = await bootRail(page, { glossSeen: false });
 		const gloss = rail.locator('#rail-gloss');
 		await expect(gloss).toBeVisible();
-		await expect(gloss).toHaveText(/^Ngwa — your equipment/);
+		await expect(gloss).toHaveText(/^Ngwa — your store/);
 		await expect(gloss).toHaveCSS('pointer-events', 'none');
 		// Page clip, not the rail's own box: the gloss sits beside the rail.
 		await page.screenshot({

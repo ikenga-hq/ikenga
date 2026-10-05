@@ -1,6 +1,6 @@
 [package]
 name = "ikenga-desktop"
-version = "0.18.4"
+version = "0.19.4"
 description = "PA Desktop — Tauri + xterm + portable-pty"
 authors = ["Ikenga"]
 edition = "2021"
@@ -66,7 +66,7 @@ base64 = "0.22"
 # here so the pane native-crop path has it directly. PNG-only to stay lean.
 image = { version = "0.25", default-features = false, features = ["png"] }
 portable-pty = "0.8"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 percent-encoding = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "process", "io-util"] }
 dashmap = "6"
@@ -148,6 +148,17 @@ include_dir = "0.7"
 # data_store_identifier is a 16-byte sha256 prefix of (pkg_id || '/' || partition).
 # Also used by `pkg_install_from_registry` (sha2::Sha512) for tarball integrity.
 sha2 = "0.10"
+# G-ACCESS (WP-74a, §3.5): HKDF-SHA256 / HMAC-SHA256 for pairing key
+# confirmation and the fingerprint seed (WP-74b). Both already in Cargo.lock
+# transitively (hkdf 0.12.4, hmac 0.12.1), so no new version enters the tree.
+hkdf = "0.12"
+hmac = "0.12"
+# G-ACCESS (WP-74b, §3.4, P-7): the SPAKE2 pairing handshake (host side,
+# `start_b`, Ed25519Group). Its deps (curve25519-dalek ^4, hkdf ^0.12,
+# sha2 ^0.10, rand_core ^0.6) are already in the lock; pinned exactly so the
+# browser port (`src/lib/access/spake2.ts`) and the shared vectors stay in
+# step with the construction they were read from.
+spake2 = "=0.4.0"
 # Async HTTP client for downloading pkg tarballs from npm. rustls instead of
 # system OpenSSL — no native deps, matches the rest of the rust-tls ecosystem.
 # `stream` enables chunk-by-chunk reads so we can hash + write in parallel
@@ -169,6 +180,18 @@ minisign-verify = "=0.2.5"
 # URL parsing for pkg_webview navigation. Already a transitive dep via several
 # crates; pinning explicitly so usage in pkg/webview.rs is direct.
 url = "2"
+# T1 broker sessions (G-PRINCIPAL §2.2, §6.3 pins): axum-login 0.16 is the last
+# line on axum 0.7 / tower-sessions 0.13; the sqlx store 0.14 is the one on
+# tower-sessions-core 0.13 + sqlx 0.8 (0.13 needs core 0.12 — never use it).
+axum-login = "=0.16"
+tower-sessions = "0.13"
+tower-sessions-sqlx-store = { version = "0.14", features = ["sqlite"] }
+# The session record codec the sqlx store uses (already in the tree through
+# it): the broker's UPDATE-only `save` writes the same encoding.
+rmp-serde = "1"
+# The broker's WS reverse proxy (G-PRINCIPAL §3, topology B). 0.24 is the
+# version axum 0.7's `ws` feature already pulls in, so no new tungstenite.
+tokio-tungstenite = "0.24"
 
 
 # Agent Client Protocol — types + traits for our in-process ACP server

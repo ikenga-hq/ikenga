@@ -9,6 +9,7 @@
  * mode, /claude route, and New Tab / Dock terminal affordances.
  */
 
+import { resolveClaudeModel, type ModelRole } from '@/lib/model-catalog';
 import { isWindows } from '@/lib/platform';
 import { getClaudeSettingsPathSync } from './claude-settings';
 
@@ -35,6 +36,15 @@ export interface AgentWrapOpts {
 	cwd?: string | null;
 	/** `in-process` | etc. — becomes `--teammate-mode`. (G-08) */
 	teammateMode?: string | null;
+	/** Claude only (WP-11): appended to Claude Code's system prompt via
+	 *  `--append-system-prompt`. */
+	appendSystemPrompt?: string | null;
+	/** Claude only (WP-11): plugin folders loaded through the
+	 *  `CLAUDE_CODE_PLUGIN_DIRS` env — see `buildAgentEnv`. */
+	pluginDirs?: string[] | null;
+	/** Claude only (WP-11): launch role. With no `model`, the catalog default
+	 *  for the role becomes `--model` (Sonnet for chi/pane, Opus for plan). */
+	role?: ModelRole | null;
 }
 
 export type ClaudeWrapOpts = AgentWrapOpts;
@@ -122,14 +132,38 @@ export function buildAgentArgs(
 			}
 			if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 			if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
-			if (opts.model) args.push('--model', opts.model);
+			const model = resolveClaudeModel(opts.model, opts.role);
+			if (model) args.push('--model', model);
 			if (opts.teammateMode) args.push('--teammate-mode', opts.teammateMode);
+			if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
 			// Positional, last — seeds an interactive session. `-p` would force
 			// headless print mode; see AgentWrapOpts.prompt.
 			if (opts.prompt) args.push(opts.prompt);
 			return args;
 		}
 	}
+}
+
+/** Env var Claude Code reads plugin folders from when no `--plugin-dir` flag
+ *  is given. */
+export const PLUGIN_DIRS_ENV = 'CLAUDE_CODE_PLUGIN_DIRS';
+
+/**
+ * Extra PTY env for an agent launch (WP-11): `CLAUDE_CODE_PLUGIN_DIRS` for a
+ * Claude launch with `pluginDirs`, joined with the host's path-list separator
+ * (`;` on Windows, `:` elsewhere). `undefined` when there is nothing to add,
+ * so a launch without the option spawns with exactly the env it had.
+ *
+ * The PTY rebuilds the child env from the host's and then applies the
+ * caller's `env` (`pty/mod.rs` `spawn_inner`), so this must travel in the
+ * spawn's `env` — it is not inherited. A `wsl` target does not forward it:
+ * `wsl.exe` passes only `WSLENV`-listed variables into the distro.
+ */
+export function buildAgentEnv(opts: AgentWrapOpts = {}): Record<string, string> | undefined {
+	if ((opts.engine ?? 'claude') !== 'claude') return undefined;
+	const dirs = (opts.pluginDirs ?? []).filter((d) => d.length > 0);
+	if (dirs.length === 0) return undefined;
+	return { [PLUGIN_DIRS_ENV]: dirs.join(isWindows ? ';' : ':') };
 }
 
 export function buildAgentWrappedCmd(opts: AgentWrapOpts = {}): string[] {

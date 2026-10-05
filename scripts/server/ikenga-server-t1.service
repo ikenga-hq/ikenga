@@ -1,0 +1,128 @@
+[Unit]
+Description=Ikenga Remote Server Daemon (T1: multi-user, one Unix uid per principal)
+After=network.target
+
+# The T1 variant of ikenga-server.service (G-PRINCIPAL §8 "Deploy
+# consequence"). Install ONE of the two units, not both: they bind the same
+# port. See scripts/server/README.md for the T0 → T1 migration
+# (`ikenga-server accounts adopt-t0`).
+#
+# Why this unit differs from the T0 one:
+#
+# * It runs as ROOT. The T1 broker refuses to start unless it is euid 0 with
+#   CAP_SETUID/CAP_SETGID/CAP_CHOWN/CAP_KILL and a real test drop to the probe
+#   uid succeeds (§8 steps 2-3, 6). It provisions principals' Unix users
+#   (§7.2), reconciles /etc/passwd from accounts.db at every boot (§8 step 7),
+#   and launches each principal's own ikenga-server child AS THAT PRINCIPAL'S
+#   UID. Only auth, the reverse proxy and that one spawn run as root; every
+#   RPC, PTY and engine runs inside a child that has already dropped to the
+#   principal (verified by the child's own probe).
+# * The capability bounding set is cut to exactly what that needs.
+# * KillMode=process, so a restart does not kill detached chi-runners
+#   (G-PRINCIPAL §9.4; ADR-023 D5). See the KillMode block below.
+
+[Service]
+Type=simple
+# No User=: root. See above.
+WorkingDirectory=/opt/ikenga
+# --data-dir names the OPERATOR ROOT under t1 (P-1): operator/ (accounts.db,
+# sessions.db, probe.json) and principals/<id>/{home,data}. It must not be a
+# T0 data dir — the broker refuses one (I-10) and names the migration command.
+#
+# No --host here ON PURPOSE (same reasoning as the T0 unit): the default is
+# 127.0.0.1, and IKENGA_HOST comes from the env file below.
+ExecStart=/opt/ikenga/bin/ikenga-server --executor-tier t1 --port 4000 --static-dir /opt/ikenga/dist --data-dir /opt/ikenga/data
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# IKENGA_HOST (the tailnet address; leave it unset behind a reverse proxy on
+# loopback), IKENGA_PUBLIC_URL when the instance has an https address, and
+# optionally:
+#   IKENGA_INSECURE_COOKIE=true   plain-HTTP tailnet deploys only (P-3); leave
+#                                 unset behind HTTPS, so the session cookie
+#                                 stays `Secure`.
+#   IKENGA_UID_RANGE=20000-29999  must match the range the accounts store was
+#                                 first provisioned with.
+#   IKENGA_BOOTSTRAP_ADMIN / IKENGA_BOOTSTRAP_ADMIN_PASSWORD
+#                                 one-shot first admin, honoured only while
+#                                 accounts is empty (§7.4); prefer
+#                                 `ikenga-server accounts create <name> --admin`.
+# IKENGA_AUTH_TOKEN grants nothing under t1 (§2.4): principals sign in at
+# /auth/login and hold a session cookie.
+EnvironmentFile=-/opt/ikenga/.env
+
+# --- Detached chi-runner survival (G-PRINCIPAL §9.4; owed by WP-18b) ---
+#
+# A persistent Chi run is a chi-runner spawned DETACHED, in its own process
+# group, by the principal's child (as that uid), so it outlives the child's
+# idle exit. A process group does not leave the unit's cgroup, though, and
+# the default KillMode=control-group would SIGKILL every runner on
+# `systemctl restart` / `stop`.
+#
+# KillMode=process signals only the broker. Its principal children notice
+# their parent is gone within a second and shut down on their own (draining
+# their PTYs — terminals don't survive a restart by design, ADR-023 D5), and
+# the detached runners keep going; the next broker's children pick their
+# status files back up. Until an old child is gone (~1 s plus its drain) it
+# still holds its principal's <data>/.lock (I-3), so that principal's first
+# request to the new broker inside that window fails once ("the principal
+# child exited before it was ready"); the next one starts the child. The cost: any other orphan a principal left running
+# (e.g. `nohup … &` in a terminal) survives a restart too. To stop
+# everything, `systemctl kill --kill-who=all ikenga-server-t1` or disable the
+# account (§7.3 kills every process of its uid).
+#
+# The per-runner alternative, `systemd-run --scope` around each chi-runner,
+# is not usable here: under t1 the runner is spawned by an unprivileged
+# principal child, which can't create scopes in the system manager.
+KillMode=process
+
+# --- Privilege ---
+#
+# Exactly the capabilities the broker and its provisioning need: SETUID /
+# SETGID to launch children as principals, CHOWN / FOWNER / DAC_OVERRIDE to
+# lay out and hand over principals' dirs, KILL for the uid-wide kill on
+# disable. Nothing else (no NET_ADMIN, no SYS_ADMIN, no privileged container —
+# the T1 floor).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL CAP_DAC_OVERRIDE CAP_FOWNER
+# setuid() by a CAP_SETUID holder still works under NNP; T1 sets NNP on every
+# principal process anyway (OD-9).
+NoNewPrivileges=true
+
+# --- Sandboxing ---
+PrivateTmp=true
+ProtectSystem=strict
+# ProtectSystem=strict already makes every path not listed in ReadWritePaths
+# read-only, /home and /root included. Principal homes live on the data
+# volume (<root>/principals/<id>/home), so that is enough — EXCEPT for an
+# ADOPTED account (`accounts create --adopt-unix-user`, §11.2), which keeps
+# its existing passwd home: add that home to ReadWritePaths below, or its
+# shells and engines can't write their own dotfiles.
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# Writable: the operator root, and /etc for provisioning (§7.2, §8 step 7).
+#
+# DEVIATION from G-PRINCIPAL §8 "Deploy consequence", pending a
+# remote-access Round that records it as a §14 amendment: §8 names
+# /etc/{passwd,group,shadow,gshadow} rather than /etc. That is not
+# enough in practice: both provisioning backends replace those files by
+# writing `<file>+` (built-in writer) or `<file>.lock`/`<file>-` (useradd)
+# NEXT TO them and renaming over them, and lckpwdf(3) creates
+# /etc/.pwd.lock. ProtectSystem=strict bind-mounts a listed FILE in place,
+# and neither a new sibling in a read-only /etc nor a rename onto a bind
+# mount (EBUSY) is possible. So /etc as a whole is listed.
+#
+# Hardened alternative: pre-create every principal's Unix user yourself, run
+# with `--provisioning external` (IKENGA_PROVISIONING=external), map accounts
+# with `accounts create <name> --adopt-unix-user <user>`, and drop /etc from
+# this line — the broker then never writes /etc (reconcile refuses a missing
+# entry instead of recreating it).
+ReadWritePaths=/opt/ikenga/data /etc
+
+[Install]
+WantedBy=multi-user.target

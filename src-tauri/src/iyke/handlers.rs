@@ -401,8 +401,11 @@ pub async fn get_ngwa_snapshot(
             format!("resolve app_data_dir: {e}"),
         )
     })?;
+    let status = crate::commands::ngwa::kernel_status_off_runtime(kernel.0.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     crate::commands::ngwa::ngwa_snapshot_inner(
-        kernel.0.status(),
+        status,
         &db,
         &app_data_dir,
         crate::transcript::usage::claude_projects_dir(),
@@ -1586,7 +1589,8 @@ pub async fn post_iframe_message(
 pub struct PkgInstallBody {
     pub install_path: String,
     /// Phase 2 (projects-first-class): scope picker.
-    /// `"workspace"` / `"project:<id>"` / null (defaults to active project).
+    /// `"workspace"` / `"project:<id>"` / null (defaults to active project;
+    /// personal when that is the Default project, DEC-71).
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -1693,7 +1697,8 @@ pub async fn get_pkg_list(
 #[derive(Deserialize)]
 pub struct PkgScopeSetBody {
     pub pkg_id: String,
-    /// "workspace" | "project:<id>" | null (defaults to active project).
+    /// "workspace" | "project:<id>" | null (defaults to active project;
+    /// personal when that is the Default project, DEC-71).
     pub scope: Option<String>,
 }
 

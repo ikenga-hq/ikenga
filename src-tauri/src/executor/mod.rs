@@ -5,8 +5,11 @@
 //! architectural one: the same call site builds the same [`SpawnSpec`] whether
 //! the host runs everything in-process (T0), as a per-user Unix uid (T1), in a
 //! container per session (T2) or under firejail (T3). Only the executor
-//! changes. This slice implements **T0 only** — [`InProcessExecutor`], which is
-//! byte-for-byte the spawn each call site used to perform inline.
+//! changes. T0 is [`InProcessExecutor`], byte-for-byte the spawn each call
+//! site used to perform inline. T1 (Linux) is `t1::T1Executor`: every spawn
+//! runs as a resolved [`Principal`] and proves its privilege drop before
+//! `exec` (G-PRINCIPAL §9); its boot probe is `t1_probe` plus
+//! `server::operator::probe` (§8). T2/T3 are refused.
 //!
 //! ## Tier selection and the boot probe
 //!
@@ -37,26 +40,132 @@
 //! This module compiles without the `desktop` feature: the daemon needs it.
 
 mod in_process;
+/// T1 — per-principal Unix uid (G-PRINCIPAL §9). Linux-only, like T1.
+#[cfg(target_os = "linux")]
+pub mod t1;
+/// The executor of a T1 principal child: T0 spawn mechanics, isolation
+/// verified from `/proc/self/status` (§3, topology B).
+#[cfg(target_os = "linux")]
+pub mod t1_child;
+/// The host-side steps of the T1 boot probe (§8 steps 2–4 and 6).
+#[cfg(target_os = "linux")]
+pub mod t1_probe;
 mod tier;
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 use portable_pty::{Child as PtyProcess, MasterPty, PtySize, SlavePty};
+use serde::{Deserialize, Serialize};
 
 pub use in_process::InProcessExecutor;
-pub use tier::{probe, Capabilities, ExecutorTier, ParseTierError, Refusal};
+pub use tier::{probe, Capabilities, ExecutorTier, ParseTierError, ProbeStamp, Refusal};
 
-/// The identity a spawn runs *as*. Reserved: T0 ignores it (everything runs as
-/// the host process's own user). T1 maps it to a per-user Unix uid, T2/T3 to a
-/// per-session sandbox. Carried on every [`SpawnSpec`] now so the call sites
-/// don't have to change shape again when a tier that honours it lands.
+/// A principal's stable id (G-PRINCIPAL §1): an opaque **UUIDv7**, minted once
+/// when the account is created and never reused, even after the account is
+/// disabled. Distinct from the username (mutable, human-facing) and from the
+/// uid (a host attribute a restored host may renumber).
+///
+/// Wire form (`Display`, `FromStr`, serde) is the lowercase hyphenated
+/// 36-char string. Parsing is strict: anything else — upper case, braces, the
+/// simple/URN forms, or a UUID of any other version — is rejected, so one id
+/// has exactly one spelling wherever it is used as a key (WP-21 secrets,
+/// WP-22 OIDC links, G-ACCESS roles/devices/audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PrincipalId(uuid::Uuid);
+
+impl PrincipalId {
+    /// Mint a fresh id. Time-ordered (v7), so the `accounts` PK index stays
+    /// append-mostly.
+    pub fn new_v7() -> Self {
+        PrincipalId(uuid::Uuid::now_v7())
+    }
+
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+/// A string that is not a lowercase hyphenated UUIDv7.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsePrincipalIdError(pub String);
+
+impl fmt::Display for ParsePrincipalIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` is not a principal id (expected a lowercase hyphenated UUIDv7)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParsePrincipalIdError {}
+
+impl FromStr for PrincipalId {
+    type Err = ParsePrincipalIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParsePrincipalIdError(s.to_string());
+        // `Uuid::parse_str` also accepts upper case, braces, URN and simple
+        // forms; the canonical spelling is the only one a key may have.
+        if s.len() != 36 || s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(err());
+        }
+        let uuid = uuid::Uuid::try_parse(s).map_err(|_| err())?;
+        if uuid.get_version() != Some(uuid::Version::SortRand) {
+            return Err(err());
+        }
+        Ok(PrincipalId(uuid))
+    }
+}
+
+impl fmt::Display for PrincipalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Hyphenated`'s Display is lowercase.
+        fmt::Display::fmt(&self.0.hyphenated(), f)
+    }
+}
+
+impl Serialize for PrincipalId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PrincipalId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// The identity a spawn runs *as* (G-PRINCIPAL §1). T0 ignores it (everything
+/// runs as the host process's own user, and T0 never constructs one). T1 maps
+/// it to its Unix uid; T2/T3 to a per-session sandbox.
+///
+/// A `Principal` is **fully resolved before any spawn** (§9.1): the caller
+/// reads it from `operator/accounts.db`, and the executor never reads the
+/// accounts DB, NSS or `/etc/passwd` on the spawn path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
-    /// Opaque principal id. Its meaning is the executor's business.
-    pub id: String,
+    pub id: PrincipalId,
+    /// Login name (display); mutable; NOT used for any path or key.
+    pub username: String,
+    /// passwd name; immutable once provisioned (§7.2).
+    pub unix_name: String,
+    /// Never 0; inside the operator's uid range unless adopted (§11.2).
+    pub uid: u32,
+    /// User-private group; == uid for allocated accounts.
+    pub gid: u32,
+    /// Absolute; the passwd home (§4).
+    pub home: PathBuf,
+    /// passwd shell; `/bin/sh` when the operator sets none.
+    pub shell: PathBuf,
 }
 
 /// How the child's environment is assembled. Applied in order: when `clear`
@@ -221,6 +330,13 @@ pub trait SessionExecutor: Send + Sync {
     /// What this executor honours. Reported on `/api/health`.
     fn capabilities(&self) -> Capabilities;
 
+    /// The §8 boot probe this executor was installed from, if its tier has
+    /// one (T1). Reported on `/api/health` as `probe: {ok, at}` and nothing
+    /// more (G-PRINCIPAL §8 "Results").
+    fn probe_stamp(&self) -> Option<ProbeStamp> {
+        None
+    }
+
     fn tier(&self) -> ExecutorTier {
         self.capabilities().tier
     }
@@ -267,6 +383,9 @@ pub fn current() -> &'static dyn SessionExecutor {
 /// Probe `tier` and, if this build can honour it, publish its executor as
 /// [`current`]. Idempotent for the same tier; installing a *different* tier
 /// after one is live is refused rather than silently ignored.
+///
+/// T1 is not installed through here: its probe needs the operator root, and
+/// a passing one hands back the [`t1::T1Executor`] to [`install_executor`].
 pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
     let capabilities = probe(tier)?;
     let executor: Box<dyn SessionExecutor> = match tier {
@@ -275,6 +394,14 @@ pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
         // arm is only reachable if the two drift apart — refuse, don't guess.
         other => return Err(Refusal::NotImplemented { tier: other }),
     };
+    install_executor(executor).map(|_| capabilities)
+}
+
+/// Publish `executor` as [`current`]. Idempotent for the same tier;
+/// installing a different tier after one is live is refused. The T1 boot
+/// installs the executor its passing probe produced through this.
+pub fn install_executor(executor: Box<dyn SessionExecutor>) -> Result<Capabilities, Refusal> {
+    let tier = executor.tier();
     let installed = INSTALLED.get_or_init(|| executor);
     if installed.tier() != tier {
         return Err(Refusal::AlreadyInstalled {
@@ -282,7 +409,7 @@ pub fn install(tier: ExecutorTier) -> Result<Capabilities, Refusal> {
             requested: tier,
         });
     }
-    Ok(capabilities)
+    Ok(installed.capabilities())
 }
 
 #[cfg(test)]
@@ -314,6 +441,45 @@ mod tests {
     }
 
     #[test]
+    fn principal_id_round_trips_its_canonical_spelling() {
+        let id = PrincipalId::new_v7();
+        let s = id.to_string();
+        assert_eq!(s.len(), 36);
+        assert_eq!(s, s.to_lowercase());
+        assert_eq!(s.parse::<PrincipalId>(), Ok(id));
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{s}\""));
+        assert_eq!(serde_json::from_str::<PrincipalId>(&json).unwrap(), id);
+    }
+
+    #[test]
+    fn principal_id_parse_rejects_every_other_spelling_and_version() {
+        let id = PrincipalId::new_v7().to_string();
+        let v4 = uuid::Uuid::new_v4().hyphenated().to_string();
+        for bad in [
+            id.to_uppercase(),
+            format!("{{{id}}}"),
+            format!("urn:uuid:{id}"),
+            id.replace('-', ""),
+            v4,
+            String::new(),
+            "not-a-uuid".into(),
+        ] {
+            assert!(bad.parse::<PrincipalId>().is_err(), "{bad} must not parse");
+        }
+        assert!(serde_json::from_str::<PrincipalId>("\"nope\"").is_err());
+    }
+
+    #[test]
+    fn principal_ids_are_time_ordered() {
+        let a = PrincipalId::new_v7();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = PrincipalId::new_v7();
+        assert!(a < b);
+        assert!(a.to_string() < b.to_string());
+    }
+
+    #[test]
     fn current_is_t0_and_installing_t0_is_idempotent() {
         assert_eq!(current().tier(), ExecutorTier::T0);
         assert_eq!(install(ExecutorTier::T0).unwrap().tier, ExecutorTier::T0);
@@ -323,9 +489,38 @@ mod tests {
 
     #[test]
     fn install_refuses_unimplemented_tiers_without_touching_current() {
-        for tier in [ExecutorTier::T1, ExecutorTier::T2, ExecutorTier::T3] {
+        for tier in [ExecutorTier::T2, ExecutorTier::T3] {
             assert_eq!(install(tier), Err(Refusal::NotImplemented { tier }));
         }
+        // T1 needs its operator-root probe; `install` can't run it.
+        assert!(matches!(
+            install(ExecutorTier::T1),
+            Err(Refusal::ProbeFailed { check: "setup", .. })
+        ));
         assert_eq!(current().tier(), ExecutorTier::T0);
+    }
+
+    /// A second executor of another tier is refused, and `current` keeps the
+    /// first (installing T0 is a no-op once T0 is live).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_executor_refuses_a_different_tier() {
+        install(ExecutorTier::T0).unwrap();
+        let t1 = t1::T1Executor::with_probe(
+            t1::T1Config {
+                principals_dir: "/nonexistent".into(),
+                principal_path: None,
+            },
+            ProbeStamp { ok: true, at: 1 },
+        );
+        assert_eq!(
+            install_executor(Box::new(t1)),
+            Err(Refusal::AlreadyInstalled {
+                installed: ExecutorTier::T0,
+                requested: ExecutorTier::T1,
+            })
+        );
+        assert_eq!(current().tier(), ExecutorTier::T0);
+        assert_eq!(current().probe_stamp(), None);
     }
 }

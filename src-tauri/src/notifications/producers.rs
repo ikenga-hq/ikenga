@@ -22,11 +22,11 @@
 //!   (`via: "hooks"`: a held `PreToolUse`, answered by
 //!   `POST /iyke/hooks/decision` with `requestId`). Hide the buttons once the
 //!   row has `resolvedAt`.
-//! * `open.thread` — a chat-engine (ACP) permission ask. **Open only**: the
-//!   in-thread dialog answers it. Inline Allow / Deny for ACP rows is a
-//!   follow-up that needs a real resolve path (nothing in production calls
-//!   `ClaudeCodeEngine::resolve_permission` yet). Resolves when the
-//!   round-trip completes.
+//! * `open.thread` — a chat-engine (ACP) permission ask. The in-thread
+//!   dialog answers it; since WP-75 the row is also answerable inline through
+//!   `permission_decide` (G-ACCESS §5.5: `ClaudeCodeEngine::answer_permission`
+//!   is the decide core's ACP resolver). Resolves when the round-trip
+//!   completes.
 //! * `open.terminal` — Claude Code's own prompt inside a terminal. **Open
 //!   only**: the answer happens in the terminal, so the row cannot carry
 //!   Allow / Deny. It resolves on that terminal's `PostToolUse` for the same
@@ -358,6 +358,59 @@ pub fn permission_from_engine(
     }
 }
 
+// ─── permission attribution (G-ACCESS §5.3, §5.7; WP-75) ────────────────────
+
+/// What a permission producer knows about the ask, for its attribution
+/// columns (`shell_notifications.{requested_by, project_id, sensitive}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskFacts {
+    pub tool_name: String,
+    pub tool_input: Value,
+    /// The asking session's working directory: the project it belongs to,
+    /// and the root §5.3 rule 2 classifies against.
+    pub cwd: Option<String>,
+    /// Claude Code's own terminal prompt (§5.3 rule 1: shell exec).
+    pub terminal: bool,
+}
+
+pub fn ask_facts(
+    tool_name: Option<&str>,
+    tool_input: Option<&Value>,
+    cwd: Option<&str>,
+    terminal: bool,
+) -> AskFacts {
+    AskFacts {
+        tool_name: tool_name.unwrap_or_default().to_string(),
+        tool_input: tool_input.cloned().unwrap_or(Value::Null),
+        cwd: cwd.filter(|c| !c.is_empty()).map(str::to_string),
+        terminal,
+    }
+}
+
+/// The attribution a desktop ask is recorded with. `project` is the
+/// `(id, root_path)` the cwd resolved to; the root classifies, else the cwd
+/// itself. The desktop's asks are always the Owner's own work, so
+/// `requested_by` is `None` (§5.7).
+pub fn attribution(
+    facts: &AskFacts,
+    project: Option<&(String, String)>,
+) -> crate::server::shared::notifications::routing::Attribution {
+    use crate::server::shared::notifications::routing::{classify, classify_terminal, Attribution};
+    let root = project
+        .map(|(_, root)| root.as_str())
+        .or(facts.cwd.as_deref());
+    let sensitivity = if facts.terminal {
+        classify_terminal(&facts.tool_name, &facts.tool_input, root)
+    } else {
+        classify(&facts.tool_name, &facts.tool_input, root)
+    };
+    Attribution {
+        requested_by: None,
+        project_id: project.map(|(id, _)| id.clone()),
+        sensitivity,
+    }
+}
+
 // ─── violation ──────────────────────────────────────────────────────────────
 
 fn violation_verb(scope_kind: &str) -> &'static str {
@@ -608,6 +661,49 @@ pub fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G-ACCESS §5.7 (WP-75): desktop asks are the Owner's own work, sorted
+    /// into the project their cwd sits in and classified against its root.
+    #[test]
+    fn attribution_classifies_against_the_project_root() {
+        use crate::server::shared::notifications::routing::Sensitivity;
+        let project = ("royalti-co".to_string(), "/work/royalti-co".to_string());
+        let inside = ask_facts(
+            Some("Edit"),
+            Some(&json!({"file_path": "/work/royalti-co/src/a.rs"})),
+            Some("/work/royalti-co/src"),
+            false,
+        );
+        let a = attribution(&inside, Some(&project));
+        assert_eq!(a.requested_by, None);
+        assert_eq!(a.project_id.as_deref(), Some("royalti-co"));
+        assert_eq!(a.sensitivity, Sensitivity::NONE);
+        let outside = ask_facts(
+            Some("Edit"),
+            Some(&json!({"file_path": "/etc/hosts"})),
+            Some("/x"),
+            false,
+        );
+        assert_eq!(
+            attribution(&outside, None).sensitivity,
+            Sensitivity::SENSITIVE
+        );
+        let secret = ask_facts(
+            Some("Read"),
+            Some(&json!({"file_path": ".env"})),
+            Some("/x"),
+            false,
+        );
+        assert_eq!(attribution(&secret, None).sensitivity, Sensitivity::SECRET);
+        let term = ask_facts(
+            Some("Read"),
+            Some(&json!({"file_path": "a"})),
+            Some("/x"),
+            true,
+        );
+        assert_eq!(attribution(&term, None).sensitivity, Sensitivity::SENSITIVE);
+        assert_eq!(ask_facts(None, None, Some(""), false).cwd, None);
+    }
 
     #[test]
     fn permission_hook_gate_carries_allow_deny_and_a_per_request_key() {

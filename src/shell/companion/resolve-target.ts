@@ -49,6 +49,7 @@ import {
 	seatsResolve,
 	seatsResume,
 } from '@/lib/tauri-cmd';
+import type { ModelRole } from '@/lib/model-catalog';
 import {
 	type AgentEngineKind,
 	type AgentWrapOpts,
@@ -603,6 +604,18 @@ export async function occupyVacantSeat(
  * is invisible to Rust and can't be seated (P-10). A spawn that fails
  * removes the tab, so no half-made `--resume` terminal is left to respawn.
  */
+/** The wrap a seat terminal launches with. A Claude seat is an everyday
+ *  `pane` unless a role is given (WP-11), so with no model it starts on the
+ *  catalog's pane model. */
+export function seatWrapOpts(opts: {
+	engine: AgentEngineKind;
+	prompt: string | null;
+	cwd: string;
+	role?: ModelRole;
+}): AgentWrapOpts {
+	return { engine: opts.engine, prompt: opts.prompt, cwd: opts.cwd, role: opts.role ?? 'pane' };
+}
+
 async function spawnSeatTerminal(opts: {
 	engine: AgentEngineKind;
 	cwd: string | null;
@@ -612,12 +625,14 @@ async function spawnSeatTerminal(opts: {
 	title: string;
 	/** The session ref whose UI number the new terminal takes (a resume). */
 	numberAs?: string | null;
+	/** WP-11 launch role for a Claude seat; defaults to an everyday `pane`. */
+	role?: ModelRole;
 }): Promise<string> {
 	const id = makeTerminalId();
 	// Before the tab reaches the store, so no render numbers it first.
 	if (opts.numberAs) aliasSessionNumber(id, opts.numberAs);
 	const cwd = opts.cwd ?? activeProjectCwd();
-	const wrap: AgentWrapOpts = { engine: opts.engine, prompt: opts.prompt, cwd };
+	const wrap = seatWrapOpts({ engine: opts.engine, prompt: opts.prompt, cwd, role: opts.role });
 	const cmd = buildAgentWrappedCmd({ ...wrap, terminalId: id, resumeSessionId: opts.resumeSessionId });
 	useTerminalStore.getState().add({ cwd, cmd, wrap }, opts.title, id);
 	const withResume = (tab: TerminalTab): TerminalTab =>

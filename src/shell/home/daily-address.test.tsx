@@ -43,7 +43,11 @@ vi.mock('@/lib/transport/dialog-shim', () => ({
 }));
 
 vi.mock('@/lib/panes/pane-store', () => {
-	const state = { navigateFocused: mocks.navigateFocused, addTab: mocks.addTab, focusedId: 'pane-1' };
+	const state = {
+		navigateFocused: mocks.navigateFocused,
+		addTab: mocks.addTab,
+		focusedId: 'pane-1',
+	};
 	const usePaneStore = (selector: (s: typeof state) => unknown) => selector(state);
 	(usePaneStore as unknown as { getState: () => typeof state }).getState = () => state;
 	return { usePaneStore };
@@ -52,6 +56,13 @@ vi.mock('@/lib/panes/pane-store', () => {
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	chiList: mocks.chiList,
+	// The hook gate's recorded row (none here: the checked hooks route).
+	notificationsList: vi.fn(() => Promise.resolve([])),
+}));
+
+vi.mock('@/lib/access/client', async (orig) => ({
+	...(await orig<typeof import('@/lib/access/client')>()),
+	accessStatus: vi.fn(() => Promise.resolve(null)),
 }));
 
 vi.mock('@/lib/iyke/memory', () => ({
@@ -170,7 +181,7 @@ describe('<DailyAddress/>', () => {
 		expect(document.querySelector('[data-state="daily-address"]')).not.toBeNull();
 	});
 
-	it('dismissing hides it and persists today\'s date on the shell store', async () => {
+	it("dismissing hides it and persists today's date on the shell store", async () => {
 		const user = userEvent.setup();
 		renderAddress();
 		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeTruthy());
@@ -181,7 +192,7 @@ describe('<DailyAddress/>', () => {
 		expect(useShellStore.getState().dailyAddressDismissedOn).toBe(todayLocalDate());
 	});
 
-	it('a past dismissal date still shows it (only today\'s date suppresses it)', async () => {
+	it("a past dismissal date still shows it (only today's date suppresses it)", async () => {
 		useShellStore.setState({ dailyAddressDismissedOn: '2000-01-01' });
 		renderAddress();
 		await waitFor(() => expect(screen.getByLabelText('Daily address')).toBeTruthy());
@@ -250,9 +261,36 @@ describe('waiting on you (pending permissions)', () => {
 		await user.click(await screen.findByRole('button', { name: 'Allow once' }));
 		expect(mocks.iykeFetch).toHaveBeenCalledWith(
 			'/iyke/hooks/decision',
-			expect.objectContaining({ body: JSON.stringify({ requestId: 'req-1', decision: 'approved' }) })
+			expect.objectContaining({
+				body: JSON.stringify({ requestId: 'req-1', decision: 'approved' }),
+			})
 		);
 		expect(mocks.markRead).not.toHaveBeenCalled();
+	});
+
+	// Review WP75-R10: a refused decision keeps the row and says why.
+	it('a refused hooks-gate decision is shown, and the ask stays waiting', async () => {
+		mocks.permissionRows = [
+			permissionRow({
+				action: { kind: 'permission.decide', via: 'hooks', requestId: 'req-2', terminalId: 't-1' },
+			}),
+		];
+		mocks.iykeFetch.mockImplementationOnce(() =>
+			Promise.resolve(
+				new Response(
+					JSON.stringify({
+						recorded: false,
+						error: 'routing_refused: permission asks are answered on another device',
+					}),
+					{ status: 403, headers: { 'Content-Type': 'application/json' } }
+				)
+			)
+		);
+		const user = userEvent.setup();
+		renderAddress();
+		await user.click(await screen.findByRole('button', { name: 'Allow once' }));
+		expect(await screen.findByText('permission asks are answered on another device')).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Allow once' })).toBeTruthy();
 	});
 
 	it('Open on a pending terminal prompt goes to the terminal and does NOT mark it read', async () => {
@@ -270,7 +308,9 @@ describe('waiting on you (pending permissions)', () => {
 		mocks.permissionRows = [permissionRow({ resolvedAt: Date.now(), readAt: Date.now() })];
 		renderAddress();
 		await waitFor(() =>
-			expect(document.querySelector('[data-state="daily-address-permissions-empty"]')).not.toBeNull()
+			expect(
+				document.querySelector('[data-state="daily-address-permissions-empty"]')
+			).not.toBeNull()
 		);
 	});
 });
@@ -294,12 +334,10 @@ describe('since you were last here (project-scoped runs)', () => {
 		expect(projectRecentRuns(rows, null).map((r) => r.run_id)).toEqual(['in', 'out', 'nocwd']);
 	});
 
-	it('the runs tile shows only the active project\'s runs', async () => {
+	it("the runs tile shows only the active project's runs", async () => {
 		useShellStore.setState({
 			activeProjectId: 'p1',
-			projects: [
-				{ id: 'p1', display_name: 'App', root_path: '/code/app', icon: null } as never,
-			],
+			projects: [{ id: 'p1', display_name: 'App', root_path: '/code/app', icon: null } as never],
 		});
 		mocks.chiList.mockResolvedValue([
 			run({ run_id: 'in', brief: 'in-project run', cwd: '/code/app' }),

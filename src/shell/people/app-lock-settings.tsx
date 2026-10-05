@@ -47,9 +47,9 @@ export function AppLockBlock() {
 			{status ? (
 				<AppLockRows status={status} />
 			) : (
-				<p className="py-3 text-[var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
-					App lock guards the desktop app. It isn't available here: this is either a browser
-					session on the daemon or a build without the lock commands.
+				<p className="py-3 text-[length:var(--text-caption,12px)] leading-relaxed text-[var(--fg-muted)]">
+					App lock guards the desktop app. It isn't available here: this is either a browser session
+					on the daemon or a build without the lock commands.
 				</p>
 			)}
 		</PeopleBlock>
@@ -65,7 +65,9 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 	// Follow changes from another window, or from Rust's clamping.
 	useEffect(() => setMinutesDraft(String(status.idleMinutes)), [status.idleMinutes]);
 
-	const configure = async (next: Partial<{ idleEnabled: boolean; idleMinutes: number; method: AppLockMethod }>) => {
+	const configure = async (
+		next: Partial<{ idleEnabled: boolean; idleMinutes: number; method: AppLockMethod }>
+	) => {
 		setError(null);
 		try {
 			setStatus(
@@ -83,7 +85,9 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 	const commitMinutes = () => {
 		const parsed = parseIdleMinutes(minutesDraft);
 		if (parsed === null) {
-			setError(`Idle minutes must be a whole number from ${MIN_IDLE_MINUTES} to ${MAX_IDLE_MINUTES}.`);
+			setError(
+				`Idle minutes must be a whole number from ${MIN_IDLE_MINUTES} to ${MAX_IDLE_MINUTES}.`
+			);
 			setMinutesDraft(String(status.idleMinutes));
 			return;
 		}
@@ -140,7 +144,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 						}}
 						aria-label="Idle minutes before locking"
 						placeholder={String(DEFAULT_IDLE_MINUTES)}
-						className="w-10 bg-transparent font-mono text-[var(--text-caption,12px)] text-[var(--fg)] outline-none"
+						className="w-10 bg-transparent font-mono text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none"
 					/>
 					<span className="font-mono text-[11px] text-[var(--fg-muted)]">min</span>
 				</span>
@@ -165,7 +169,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 								title={m.why}
 								onClick={() => !on && void configure({ method: m.id })}
 								className={cn(
-									'h-[26px] border-r border-[var(--border)] px-3 text-[var(--text-micro)] outline-none last:border-r-0 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--primary)]',
+									'h-[26px] border-r border-[var(--border)] px-3 text-[length:var(--text-micro)] outline-none last:border-r-0 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[var(--primary)]',
 									'disabled:cursor-not-allowed disabled:opacity-45',
 									on
 										? 'bg-[var(--primary-soft)] text-[var(--fg)]'
@@ -188,7 +192,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 				<Button
 					type="button"
 					variant="outline"
-					size="sm"
+					size="xs"
 					disabled={noSecret}
 					onClick={() => void lockNow()}
 					title={noSecret ? 'Set a PIN first — otherwise nothing could unlock it' : undefined}
@@ -201,7 +205,7 @@ function AppLockRows({ status }: { status: AppLockStatus }) {
 			{error && (
 				<div
 					role="alert"
-					className="border-t border-[var(--border-soft)] py-2 text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]"
+					className="border-t border-[var(--border-soft)] py-2 text-[length:var(--text-micro)] text-[var(--on-danger,var(--danger))]"
 				>
 					{error}
 				</div>
@@ -289,7 +293,7 @@ function SecretRow({
 			}}
 			placeholder={label}
 			aria-label={label}
-			className="h-7 w-[160px] rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 font-mono text-[var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
+			className="h-7 w-[160px] rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 font-mono text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
 		/>
 	);
 
@@ -304,8 +308,8 @@ function SecretRow({
 						<>
 							{' '}
 							Forgot it? Quit Ikenga and delete{' '}
-							<span className="font-mono break-all">{status.configPath}</span>. The lock is a privacy
-							screen, not a security boundary.
+							<span className="font-mono break-all">{status.configPath}</span>. The lock is a
+							privacy screen, not a security boundary.
 						</>
 					)}
 				</>
@@ -317,13 +321,13 @@ function SecretRow({
 					<Kv>{status.secretSet ? 'set' : 'not set'}</Kv>
 					{status.secretSet ? (
 						<>
-							<Button type="button" variant="outline" size="sm" onClick={() => setMode('change')}>
+							<Button type="button" variant="outline" size="xs" onClick={() => setMode('change')}>
 								Change…
 							</Button>
 							<Button
 								type="button"
 								variant="ghost"
-								size="sm"
+								size="xs"
 								onClick={() => setMode('remove')}
 								className="text-[var(--danger)]"
 							>
@@ -331,7 +335,7 @@ function SecretRow({
 							</Button>
 						</>
 					) : (
-						<Button type="button" size="sm" onClick={() => setMode('set')}>
+						<Button type="button" size="xs" onClick={() => setMode('set')}>
 							Set a PIN…
 						</Button>
 					)}
@@ -343,10 +347,10 @@ function SecretRow({
 					{mode === 'change' && field(current, setCurrent, 'Current PIN', 'current-password', true)}
 					{field(next, setNext, 'New PIN', 'new-password', mode === 'set')}
 					{field(confirm, setConfirm, 'Repeat it', 'new-password')}
-					<Button type="button" size="sm" disabled={busy} onClick={submitNew}>
+					<Button type="button" size="xs" disabled={busy} onClick={submitNew}>
 						{busy ? 'Saving…' : 'Save'}
 					</Button>
-					<Button type="button" variant="ghost" size="sm" disabled={busy} onClick={reset}>
+					<Button type="button" variant="ghost" size="xs" disabled={busy} onClick={reset}>
 						Cancel
 					</Button>
 				</span>
@@ -358,13 +362,13 @@ function SecretRow({
 					<Button
 						type="button"
 						variant="destructive"
-						size="sm"
+						size="xs"
 						disabled={busy}
 						onClick={submitRemove}
 					>
 						{busy ? 'Removing…' : 'Remove PIN'}
 					</Button>
-					<Button type="button" variant="ghost" size="sm" disabled={busy} onClick={reset}>
+					<Button type="button" variant="ghost" size="xs" disabled={busy} onClick={reset}>
 						Cancel
 					</Button>
 					<Kv>Removing it also turns idle lock off.</Kv>
@@ -372,7 +376,10 @@ function SecretRow({
 			)}
 
 			{error && (
-				<span role="alert" className="basis-full text-[var(--text-micro)] text-[var(--on-danger,var(--danger))]">
+				<span
+					role="alert"
+					className="basis-full text-[length:var(--text-micro)] text-[var(--on-danger,var(--danger))]"
+				>
 					{error}
 				</span>
 			)}

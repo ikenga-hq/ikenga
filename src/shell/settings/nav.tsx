@@ -40,7 +40,12 @@ export interface SettingsFieldMeta {
 }
 
 /** Sub-routes a settings search hit can land on. */
-export type SettingsFieldRoute = '/settings/profile' | '/settings/devices';
+export type SettingsFieldRoute =
+	| '/settings/profile'
+	| '/settings/devices'
+	| '/settings/members'
+	| '/settings/policies'
+	| '/settings/audit';
 
 export interface SettingsSectionMeta {
 	id: SettingsSectionId;
@@ -73,7 +78,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 	},
 	{
 		id: 'engines',
-		label: 'Chi & engines',
+		label: 'Engines',
 		Icon: Bot,
 		description: 'Default engine, shells, agent execution target and terminal restore.',
 		fields: [
@@ -142,7 +147,19 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 		Icon: Users,
 		description: 'Who this workspace is shared with, and on which devices.',
 		fields: [
-			{ field: null, label: 'Members' },
+			// WP-76 (G-ACCESS §4): /settings/members and /settings/policies.
+			{
+				field: null,
+				label: 'Members',
+				help: 'share kola, roles, shared with you',
+				route: '/settings/members',
+			},
+			{
+				field: null,
+				label: 'Policies',
+				help: 'what each role may do, require Owner approval',
+				route: '/settings/policies',
+			},
 			{
 				field: null,
 				label: 'Devices',
@@ -150,6 +167,14 @@ export const SETTINGS_SECTIONS: readonly SettingsSectionMeta[] = [
 				route: '/settings/devices',
 			},
 			{ field: null, label: 'Pending invites' },
+			// WP-77 (G-ACCESS §6): /settings/audit.
+			{
+				field: null,
+				label: 'Audit log',
+				help: 'who did what, export, append-only',
+				keywords: 'audit history log export',
+				route: '/settings/audit',
+			},
 			// WP-72 (D-05 local surfaces): /settings/profile.
 			{ field: null, label: 'Profile', help: 'display name, OS user', route: '/settings/profile' },
 			{
@@ -198,6 +223,9 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
 const SECTION_ALIASES: Readonly<Record<string, SettingsSectionId>> = {
 	profile: 'people',
 	devices: 'people',
+	members: 'people',
+	policies: 'people',
+	audit: 'people',
 };
 
 export function settingsSection(id: string | undefined): SettingsSectionMeta {

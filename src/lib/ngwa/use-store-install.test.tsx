@@ -5,7 +5,7 @@
 // registry invalidation afterwards.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { renderHook } from '@testing-library/react';
+import { renderHook, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import type { NgwaItem } from '@ikenga/contract';
@@ -18,6 +18,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	pkgInstallFromRegistry: (...args: unknown[]) => pkgInstallFromRegistryMock(...args),
 	pkgTrustPreviewIncoming: (...args: unknown[]) => pkgTrustPreviewIncomingMock(...args),
+	pkgInstallCancel: vi.fn().mockResolvedValue('not_running'),
 }));
 
 const fetchPkgDetailMock = vi.fn();
@@ -39,9 +40,12 @@ import {
 	installedScopeWire,
 	isNeedsApproval,
 	type NeedsApprovalError,
+	pkgProjectTarget,
 	storeScopeWire,
 	useStoreInstall,
+	cancelStoreInstall,
 } from './use-store-install';
+import { useInstallProgressStore } from './install-progress';
 
 const PLAN = [
 	{
@@ -111,6 +115,19 @@ describe('scope mapping', () => {
 		expect(installedScopeWire({ kind: 'personal' })).toBe('workspace');
 		expect(installedScopeWire({ kind: 'project', project_id: 'p2' })).toBe('project:p2');
 	});
+
+	it('DEC-71: with the Default project active, the project target is personal', () => {
+		expect(storeScopeWire('project', 'default')).toBe('workspace');
+		expect(storeScopeWire('personal', 'default')).toBe('workspace');
+		expect(installedScopeWire({ kind: 'project', project_id: 'default' })).toBe('workspace');
+		// The label: no project target under Default, the project's name otherwise.
+		expect(pkgProjectTarget('default', 'Default')).toBeNull();
+		expect(pkgProjectTarget('kinnect', 'Kinnect')).toBe('Kinnect');
+		expect(pkgProjectTarget(null, 'active project')).toBe('active project');
+		// Real projects are untouched, including ids that merely contain "default".
+		expect(storeScopeWire('project', 'kinnect')).toBe('project:kinnect');
+		expect(storeScopeWire('project', 'default-2')).toBe('project:default-2');
+	});
 });
 
 describe('useStoreInstall', () => {
@@ -148,6 +165,16 @@ describe('useStoreInstall', () => {
 	it('installs to personal as the workspace scope', async () => {
 		const { hook } = setup();
 		await hook.install(entry(), 'personal');
+		expect(pkgInstallFromRegistryMock.mock.calls.map((c) => c[1])).toEqual([
+			'workspace',
+			'workspace',
+		]);
+	});
+
+	it('DEC-71: installs the project target to the workspace scope while Default is active', async () => {
+		useShellStore.setState({ activeProjectId: 'default' });
+		const { hook } = setup();
+		await hook.install(entry(), 'project');
 		expect(pkgInstallFromRegistryMock.mock.calls.map((c) => c[1])).toEqual([
 			'workspace',
 			'workspace',
@@ -249,5 +276,50 @@ describe('useStoreInstall', () => {
 		await expect(hook.updateAll([a, b])).rejects.toThrow('1 of 2 updates failed — a: 404');
 		expect(pkgInstallFromRegistryMock).toHaveBeenCalledTimes(1);
 		expect(pkgInstallFromRegistryMock.mock.calls[0][1]).toBe('workspace');
+	});
+});
+
+describe('install progress', () => {
+	it('tags every plan step with the row id and settles the run', async () => {
+		const { hook } = setup();
+		await hook.install(entry(), 'personal');
+		for (const call of pkgInstallFromRegistryMock.mock.calls) {
+			expect(call[0]).toMatchObject({ installId: '@ikenga/pkg-studio' });
+		}
+		const run = useInstallProgressStore.getState().runs['@ikenga/pkg-studio'];
+		expect(run).toMatchObject({ status: 'done', step: { index: 1, total: 2, pkgId: 'com.ikenga.studio' } });
+	});
+
+	it('records a classified failure on the row', async () => {
+		pkgInstallFromRegistryMock.mockRejectedValueOnce(
+			new Error('npm dependency materialization failed: npm error code ENOSPC')
+		);
+		const { hook } = setup();
+		await expect(hook.install(entry(), 'personal')).rejects.toThrow('ENOSPC');
+		const run = useInstallProgressStore.getState().runs['@ikenga/pkg-studio'];
+		expect(run?.status).toBe('failed');
+		expect(run?.error?.message).toBe(
+			'Not enough disk space to install pkg-studio. Free some space and try again.'
+		);
+	});
+
+	it('Update all queues every row and a cancel before its turn skips it', async () => {
+		const mk = (id: string) =>
+			entry({ id, displayName: id, isUpdate: true, installedItem: installed({ kind: 'personal' }) });
+		resolveInstallPlanMock.mockResolvedValue([PLAN[1]]);
+		let release: () => void = () => {};
+		pkgInstallFromRegistryMock.mockImplementationOnce(
+			() => new Promise((res) => (release = () => res({ installed: { id: 'com.x' } })))
+		);
+		const { hook } = setup();
+		const done = hook.updateAll([mk('a'), mk('b')]);
+		await waitFor(() => expect(pkgInstallFromRegistryMock).toHaveBeenCalledTimes(1));
+		expect(useInstallProgressStore.getState().runs.b?.stage).toBe('queued');
+		await cancelStoreInstall('b');
+		release();
+		await done;
+		expect(pkgInstallFromRegistryMock).toHaveBeenCalledTimes(1);
+		expect(useInstallProgressStore.getState().runs.a?.status).toBe('done');
+		expect(useInstallProgressStore.getState().runs.b?.status).toBe('cancelled');
 	});
 });

@@ -241,7 +241,7 @@ export function FrontmatterFormEditor({ value, onChange, readOnly = false }: Fro
 							disabled={readOnly}
 							value={frontmatter.model || ''}
 							onChange={(e) => updateField((prev) => ({ ...prev, model: e.target.value }))}
-							placeholder="e.g. claude-3-5-sonnet"
+							placeholder="e.g. sonnet or claude-sonnet-5-5"
 							className="w-full px-2.5 py-1.5 rounded border border-[var(--border-subtle)] bg-[var(--surface-input)] text-[var(--fg-base)] font-mono text-xs focus:outline-none focus:border-[var(--border-focus)]"
 							data-testid="field-model"
 						/>

@@ -373,6 +373,51 @@ describe('NgwaStoreSurface', () => {
 		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'personal');
 	});
 
+	it('DEC-71: with the Default project active, a pkg installs to personal and the menu lists no Default target', async () => {
+		const onInstall = vi.fn();
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				onInstall={onInstall}
+				activeProjectName="Default"
+				activeProjectId="default"
+			/>
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
+
+		expect(screen.queryByRole('button', { name: 'Install to Default' })).toBeNull();
+		const install = screen.getByRole('button', { name: 'Install to personal' });
+		fireEvent.click(install);
+		expect(onInstall).toHaveBeenLastCalledWith(mockCatalog[1], 'personal');
+
+		fireEvent.click(screen.getByLabelText('Choose install scope'));
+		const items = screen.getAllByRole('menuitem');
+		expect(items).toHaveLength(1);
+		expect(items[0].textContent).toContain('Install to personal');
+		expect(items[0].textContent).not.toContain('Default');
+	});
+
+	it('keeps a real project as the pkg install target', async () => {
+		const loadDetail = vi.fn().mockResolvedValue(detailVersion({}));
+		renderWithClient(
+			<NgwaStoreSurface
+				catalog={mockCatalog}
+				loadDetail={loadDetail}
+				onInstall={vi.fn()}
+				activeProjectName="Kinnect"
+				activeProjectId="kinnect"
+			/>
+		);
+		selectRow('skill-groundwork');
+		await screen.findByText(/declares intent and never grants itself anything/);
+		expect(screen.getByRole('button', { name: 'Install to Kinnect' })).toBeDefined();
+		fireEvent.click(screen.getByLabelText('Choose install scope'));
+		expect(screen.getAllByRole('menuitem')).toHaveLength(2);
+	});
+
 	it('Update all opens a review of each update and applies only on confirm', () => {
 		const onUpdateAll = vi.fn();
 		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdateAll={onUpdateAll} />);
@@ -387,7 +432,7 @@ describe('NgwaStoreSurface', () => {
 		expect(onUpdateAll).toHaveBeenCalledWith([mockCatalog[0]]);
 	});
 
-	it('shows Registering for the real install promise and its failure in the foot', async () => {
+	it('turns Install into a progress row for the real promise, then a readable failure with Retry', async () => {
 		let reject: (e: Error) => void = () => {};
 		const onInstall = vi.fn(
 			() =>
@@ -402,21 +447,31 @@ describe('NgwaStoreSurface', () => {
 		selectRow('skill-groundwork');
 		await screen.findByText(/declares intent and never grants itself anything/);
 
-		const install = screen.getByRole('button', {
-			name: 'Install to active project',
-		}) as HTMLButtonElement;
-		fireEvent.click(install);
+		fireEvent.click(screen.getByRole('button', { name: 'Install to active project' }));
 		expect(onInstall).toHaveBeenCalledWith(mockCatalog[1], 'project');
-		expect(screen.getByRole('status').textContent).toContain('Registering');
-		expect(install.disabled).toBe(true);
+		const foot = container.querySelector('[data-sheetfoot]') as HTMLElement;
+		// The button is replaced by a step label over an indeterminate bar.
+		expect(within(foot).getByRole('status').textContent).toContain('Installing');
+		expect(within(foot).getByRole('progressbar')).toBeDefined();
+		expect(within(foot).queryByRole('button', { name: 'Install to active project' })).toBeNull();
 		expect(
 			container.querySelector('.srow[data-id="skill-groundwork"]')?.getAttribute('aria-busy')
 		).toBe('true');
 
-		reject(new Error('integrity mismatch'));
-		expect(await screen.findByText('Failed: integrity mismatch')).toBeDefined();
-		expect(screen.queryByText('Registering')).toBeNull();
-		expect(install.disabled).toBe(false);
+		reject(new Error('npm warn tar TAR_ENTRY_ERROR ENOSPC: no space left on device, write'));
+		const alert = await within(foot).findByRole('alert');
+		expect(alert.textContent).toMatch(/^Not enough disk space to install .+\. Free some space and try again\.$/);
+		expect(within(foot).queryByRole('progressbar')).toBeNull();
+
+		// The raw log sits behind Show details.
+		expect(within(foot).queryByText(/TAR_ENTRY_ERROR/)).toBeNull();
+		fireEvent.click(within(foot).getByRole('button', { name: 'Show details' }));
+		expect(within(foot).getByText(/TAR_ENTRY_ERROR/)).toBeDefined();
+
+		// Retry repeats the same install.
+		fireEvent.click(within(foot).getByRole('button', { name: 'Retry' }));
+		expect(onInstall).toHaveBeenCalledTimes(2);
+		expect(onInstall).toHaveBeenLastCalledWith(mockCatalog[1], 'project');
 	});
 
 	it('row Update opens the sheet, shows Updating while in flight, and surfaces a failure', async () => {
@@ -427,17 +482,21 @@ describe('NgwaStoreSurface', () => {
 					reject = rej;
 				})
 		);
-		renderWithClient(<NgwaStoreSurface catalog={mockCatalog} onUpdate={onUpdate} />);
+		const { container } = renderWithClient(
+			<NgwaStoreSurface catalog={mockCatalog} onUpdate={onUpdate} />
+		);
 
 		fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
 		expect(onUpdate).toHaveBeenCalledWith(mockCatalog[0]);
-		expect(screen.getByRole('status').textContent).toContain('Updating');
-		expect(
-			(screen.getByRole('button', { name: 'Update 0.8.2 → 0.8.3' }) as HTMLButtonElement).disabled
-		).toBe(true);
+		const foot = container.querySelector('[data-sheetfoot]') as HTMLElement;
+		expect(within(foot).getByRole('status').textContent).toContain('Updating');
+		expect(within(foot).queryByRole('button', { name: 'Update 0.8.2 → 0.8.3' })).toBeNull();
 
-		reject(new Error('network down'));
-		expect(await screen.findByText('Failed: network down')).toBeDefined();
+		reject(new Error('npm error code ECONNRESET'));
+		expect((await within(foot).findByRole('alert')).textContent).toMatch(
+			/Couldn't reach the package registry/
+		);
+		expect(within(foot).getByRole('button', { name: 'Retry' })).toBeDefined();
 	});
 
 	it('Update all shows its failure on the strip', async () => {
@@ -520,7 +579,9 @@ describe('an installed pkg that failed to load (Bug 3)', () => {
 				initialSelectedId="@ikenga/pkg-meetings"
 			/>
 		);
-		expect(await screen.findByRole('button', { name: 'Reinstall to active project' })).toBeDefined();
+		expect(
+			await screen.findByRole('button', { name: 'Reinstall to active project' })
+		).toBeDefined();
 	});
 });
 

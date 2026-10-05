@@ -1,8 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
-
+import type { DeviceView } from '@/lib/access/client';
 import type { DaemonInfo } from '@/lib/tauri-cmd';
 
-import { buildDevicesView, classifyHost, maskToken, probeDaemon } from './devices-model';
+import {
+	buildDevicesView,
+	classifyHost,
+	deviceSubLine,
+	expiresIn,
+	maskToken,
+	pairedCount,
+	pairPublicBase,
+	probeDaemon,
+	relativeTime,
+} from './devices-model';
 
 const PERSISTENT: DaemonInfo = {
 	available: true,
@@ -103,7 +113,11 @@ describe('buildDevicesView', () => {
 	it('uses the page origin in a remote browser session', () => {
 		const view = buildDevicesView(
 			null,
-			{ origin: 'https://ikenga.tailnet-demo.ts.net', hostname: 'ikenga.tailnet-demo.ts.net', hasToken: true },
+			{
+				origin: 'https://ikenga.tailnet-demo.ts.net',
+				hostname: 'ikenga.tailnet-demo.ts.net',
+				hasToken: true,
+			},
 			'up'
 		);
 		expect(view).toMatchObject({ source: 'remote', run: 'running', exposure: 'tailnet' });
@@ -123,5 +137,80 @@ describe('probeDaemon', () => {
 	it('is down on a network error', async () => {
 		const fetchImpl = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 		await expect(probeDaemon('http://127.0.0.1:4000', 100, fetchImpl)).resolves.toBe('down');
+	});
+});
+
+// ── WP-74b ──────────────────────────────────────────────────────────────────
+
+describe('pairPublicBase (G-ACCESS §3.3 rule 2)', () => {
+	it('is the daemon address for a tailnet or LAN bind, nothing for loopback', () => {
+		const tail = buildDevicesView(
+			{ ...PERSISTENT, host: '100.94.12.7', httpUrl: 'http://100.94.12.7:4000/' },
+			null,
+			'up'
+		);
+		expect(pairPublicBase(tail)).toBe('http://100.94.12.7:4000');
+		const lan = buildDevicesView(
+			{ ...PERSISTENT, host: '192.168.1.20', httpUrl: 'http://192.168.1.20:4000' },
+			null,
+			'up'
+		);
+		expect(pairPublicBase(lan)).toBe('http://192.168.1.20:4000');
+		expect(pairPublicBase(buildDevicesView(PERSISTENT, null, 'up'))).toBeUndefined();
+		const all = buildDevicesView({ ...PERSISTENT, host: '0.0.0.0' }, null, 'up');
+		expect(pairPublicBase(all)).toBeUndefined();
+		const down = buildDevicesView(
+			{ ...PERSISTENT, host: '100.94.12.7', httpUrl: 'http://100.94.12.7:4000' },
+			null,
+			'down'
+		);
+		expect(pairPublicBase(down)).toBeUndefined();
+		const remote = buildDevicesView(
+			null,
+			{ origin: 'http://100.94.12.7:4000', hostname: '100.94.12.7', hasToken: true },
+			'up'
+		);
+		expect(pairPublicBase(remote)).toBeUndefined();
+	});
+});
+
+describe('table formatting', () => {
+	it('relativeTime / expiresIn', () => {
+		const now = 1_000_000_000;
+		expect(relativeTime(null, now)).toBe('—');
+		expect(relativeTime(now - 2_000, now)).toBe('now');
+		expect(relativeTime(now - 12_000, now)).toBe('12 s ago');
+		expect(relativeTime(now - 4 * 60_000, now)).toBe('4 min ago');
+		expect(relativeTime(now - 2 * 3_600_000, now)).toBe('2 h ago');
+		expect(relativeTime(now - 3 * 86_400_000, now)).toBe('3 d ago');
+		expect(expiresIn(now + 598_000, now)).toBe('9:58');
+		expect(expiresIn(now - 1, now)).toBe('0:00');
+	});
+
+	it('deviceSubLine / pairedCount', () => {
+		const host: DeviceView = {
+			deviceId: 'h',
+			kind: 'host',
+			name: 'ned-desktop',
+			platform: 'linux',
+			tier: 'full',
+			pairedAt: 1,
+			lastSeenAt: null,
+			lastSeenAddr: null,
+			liveSockets: 0,
+			thisDevice: true,
+		};
+		const phone: DeviceView = {
+			...host,
+			deviceId: 'p',
+			kind: 'paired',
+			name: 'Pixel 9 · Chrome',
+			platform: 'android',
+			tier: 'dispatch',
+			thisDevice: false,
+		};
+		expect(deviceSubLine(host)).toBe('Linux · this device');
+		expect(deviceSubLine(phone)).toMatch(/^Android · paired /);
+		expect(pairedCount([host, phone])).toBe(1);
 	});
 });

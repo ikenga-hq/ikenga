@@ -14,7 +14,7 @@ import {
 import { FilesSection } from './sections/files';
 import { ArtifactsSection } from './sections/artifacts';
 import { SessionsSeatsLink, SessionsSection } from './sections/sessions';
-import { NgwaProjectSection } from './sections/ngwa-project';
+import { NgwaProjectSection, useNgwaProjectRowCount } from './sections/ngwa-project';
 import { AutomationsSection } from './sections/automations';
 import { TodosSection } from './sections/todos';
 import { ScratchpadsSection } from './sections/scratchpads';
@@ -81,6 +81,7 @@ export const builtInSections: ExplorerSectionDefinition[] = [
 		icon: Package,
 		defaultOrder: 3,
 		render: (ctx) => React.createElement(NgwaProjectSection, ctx),
+		useCount: (ctx) => useNgwaProjectRowCount(ctx.projectId),
 	},
 	{
 		id: 'automations',
