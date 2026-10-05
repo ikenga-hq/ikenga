@@ -356,6 +356,7 @@ install_daemon() {
   tar -xzf "$tmp/$tarball" -C "$INSTALL_DIR"
   [[ "$("$INSTALL_DIR/bin/ikenga-server" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" == "$VERSION" ]] || die "installed binary does not report $VERSION"
   install -d -m 0700 "$INSTALL_DIR/data"
+  BINARY_CHANGED=1
   changed "ikenga-server $VERSION installed to $INSTALL_DIR"
 }
 
@@ -429,7 +430,15 @@ install_service() {
   fi
   systemctl daemon-reload
   systemctl enable --now "$svc"
-  changed "service $svc enabled and started"
+  # `enable --now` leaves an already-running service on the OLD binary, so an
+  # upgrade (bumped VERSION) must restart it explicitly. This ends open
+  # terminals (T1 keeps detached chi-runners via KillMode=process).
+  if [[ $BINARY_CHANGED -eq 1 ]] && systemctl is-active --quiet "$svc"; then
+    systemctl restart "$svc"
+    changed "service $svc restarted onto $VERSION (open terminals ended)"
+  else
+    changed "service $svc enabled and started"
+  fi
 }
 
 # ---------------------------------------------------------------- verify
@@ -470,7 +479,7 @@ summary() {
 # ------------------------------------------------------------------ main
 
 validate_profile
-IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""
+IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0
 preflight
 confirm
 harden_base
