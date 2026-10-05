@@ -48,6 +48,15 @@ pub struct ClaudeOpts {
     pub rows: Option<u16>,
     /// PTY cols. Defaults to 100. Ignored by streaming-chat spawn.
     pub cols: Option<u16>,
+    /// WP-11: plugin folders, set as `CLAUDE_CODE_PLUGIN_DIRS` on the child.
+    #[serde(rename = "pluginDirs")]
+    pub plugin_dirs: Vec<String>,
+    /// WP-11: passed as `--append-system-prompt`.
+    #[serde(rename = "appendSystemPrompt")]
+    pub append_system_prompt: Option<String>,
+    /// WP-11: launch role (`chi` | `pane` | `plan`). Picks the catalog
+    /// default model when `model` is unset.
+    pub role: Option<String>,
 }
 
 #[tauri::command]
@@ -106,6 +115,9 @@ pub async fn session_ensure(
         // effort from the frontend. The composer mutates this post-spawn
         // via `acp_set_effort` instead. Default `Off` matches claude's own.
         effort: Default::default(),
+        plugin_dirs: opts.plugin_dirs,
+        append_system_prompt: opts.append_system_prompt,
+        role: opts.role,
     };
     let session = sessions.get_or_create(&threadId, &cwd, opts).await;
     let claude_session_id = session.claude_session_id.lock().await.clone();

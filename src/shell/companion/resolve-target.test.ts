@@ -50,7 +50,9 @@ import {
 	contextCommentLine,
 	currentDispatchContext,
 	resolveTarget,
+	seatWrapOpts,
 } from './resolve-target';
+import { buildAgentArgs } from '@/terminal/claude-wrap';
 
 const ctx = { project: '/work/royalti-co', focusedView: '/files' };
 
@@ -189,5 +191,26 @@ describe('currentDispatchContext', () => {
 			focusedView: '/files',
 			selection: null,
 		});
+	});
+});
+
+describe('seatWrapOpts (WP-11 role)', () => {
+	const models = (args: string[]) => args.flatMap((a, i) => (a === '--model' ? [args[i + 1]] : []));
+
+	it('seats a Claude terminal as a pane on the catalog pane model', () => {
+		const wrap = seatWrapOpts({ engine: 'claude', prompt: 'hi', cwd: '/w' });
+		expect(wrap.role).toBe('pane');
+		expect(models(buildAgentArgs(wrap))).toEqual(['claude-sonnet-5-5']);
+	});
+
+	it('honours an explicit plan role', () => {
+		const wrap = seatWrapOpts({ engine: 'claude', prompt: null, cwd: '/w', role: 'plan' });
+		expect(models(buildAgentArgs(wrap))).toEqual(['claude-opus-5-5']);
+	});
+
+	it('adds no model to a non-Claude seat', () => {
+		expect(
+			models(buildAgentArgs(seatWrapOpts({ engine: 'codex', prompt: null, cwd: '/w' })))
+		).toEqual([]);
 	});
 });

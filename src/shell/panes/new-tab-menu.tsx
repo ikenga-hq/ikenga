@@ -117,6 +117,19 @@ export function NewTabMenu({ leaf, open, onClose, anchor }: NewTabMenuProps) {
 							label="Claude terminal"
 							shortcut={labelFor('pane.new-claude-terminal')}
 						/>
+						<MenuItem
+							onSelect={() =>
+								commit({
+									kind: 'terminal',
+									// WP-11: plan / review / orchestrate work launches on the
+									// catalog's plan model (Opus) unless a model is chosen.
+									sessionId: createClaudeTerminalSession({ role: 'plan' }, 'claude · plan'),
+								})
+							}
+							Icon={TerminalIcon}
+							label="Claude terminal (plan)"
+							detail="plan, review, orchestrate"
+						/>
 						{profiles
 							.filter((p) => p.kind === 'wsl')
 							.map((p) => (
