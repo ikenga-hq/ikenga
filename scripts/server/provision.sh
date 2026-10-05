@@ -259,21 +259,49 @@ Port $SSH_PORT
 # listening, and after SSH is confirmed on its port.
 firewall() {
   [[ $SKIP_HARDENING -eq 1 ]] && return
-  log "Firewall (ufw): default deny inbound"
+  log "Firewall (ufw): default deny inbound, exactly this profile's rules"
+
+  # The profile is the whole rule set. Every rule we add carries an
+  # `ikenga:` comment; if the live set differs from the wanted set in any way
+  # (a rule from a previous perimeter, a hand-added rule, a missing one) the
+  # table is reset and rebuilt. Without this, switching a host from
+  # public-https to tailnet would leave 22/80/443 open on the public address.
+  local -a rules
+  if [[ "$PERIMETER" == public-https ]]; then
+    rules=(
+      "limit $SSH_PORT/tcp comment ikenga:ssh-public-ratelimited"
+      "allow 80/tcp comment ikenga:acme-http01"
+      "allow 443/tcp comment ikenga:https"
+    )
+  else
+    # Tailnet: nothing on the public interface. SSH and the daemon only over
+    # tailscale0. perimeter_tailnet has already proven tailscale0 is up.
+    rules=(
+      "allow in on tailscale0 to any port $SSH_PORT proto tcp comment ikenga:ssh-tailnet"
+      "allow in on tailscale0 to any port 4000 proto tcp comment ikenga:daemon-tailnet"
+    )
+  fi
+
+  local want have
+  want="$(printf '%s\n' "${rules[@]}" | grep -oE 'ikenga:[a-z0-9-]+' | sort)"
+  have="$(ufw show added 2>/dev/null | grep -E '^ufw ' | while read -r line; do
+            c="$(grep -oE 'ikenga:[a-z0-9-]+' <<<"$line" || true)"; echo "${c:-foreign}"; done | sort)"
+  local active=0; ufw status 2>/dev/null | grep -q '^Status: active' && active=1
+
+  if [[ "$want" == "$have" && $active -eq 1 ]]; then
+    note "ufw already matches the $PERIMETER rule set"
+    return
+  fi
+
+  run ufw --force reset >/dev/null
   run ufw default deny incoming
   run ufw default allow outgoing
-  if [[ "$PERIMETER" == public-https ]]; then
-    run ufw limit "$SSH_PORT"/tcp comment 'ssh rate-limited'
-    run ufw allow 80/tcp comment 'acme http-01'
-    run ufw allow 443/tcp comment 'ikenga https'
-  else
-    # Tailnet: nothing on the public interface at all. SSH only over tailscale0.
-    run ufw allow in on tailscale0 to any port "$SSH_PORT" proto tcp comment 'ssh over tailnet'
-    run ufw allow in on tailscale0 to any port 4000 proto tcp comment 'ikenga over tailnet'
-    note "SSH on the public interface is CLOSED. Confirm tailnet SSH works from a second session before you leave this one."
-  fi
+  local r
+  # shellcheck disable=SC2086
+  for r in "${rules[@]}"; do run ufw $r; done
   run ufw --force enable
-  changed "ufw enabled ($PERIMETER rules)"
+  [[ "$PERIMETER" == tailnet ]] && note "SSH on the public interface is now CLOSED. Confirm tailnet SSH works from a second session before you leave this one."
+  changed "ufw rebuilt to the $PERIMETER rule set (${#rules[@]} rules)"
 }
 
 # --------------------------------------------------------------- perimeter
@@ -296,6 +324,12 @@ perimeter_tailnet() {
     TS_IP="<tailnet-ip>"
   fi
   IKENGA_HOST_VALUE="$TS_IP"
+  # A host moving from public-https keeps Caddy listening on 80/443 unless we
+  # retire it; the firewall closes the ports, but nothing should be serving.
+  if systemctl is-enabled --quiet caddy 2>/dev/null || systemctl is-active --quiet caddy 2>/dev/null; then
+    run systemctl disable --now caddy
+    changed "caddy disabled (tailnet perimeter has no public listener)"
+  fi
   note "Operator action: add an ACL rule letting your users reach this host on tcp:4000 (default-deny tailnet)."
 }
 
@@ -489,7 +523,7 @@ install_service() {
   if [[ $BINARY_CHANGED -eq 1 && $was_active -eq 1 ]]; then
     systemctl restart "$svc"
     changed "service $svc restarted onto $VERSION (open terminals ended)"
-  else
+  elif [[ $was_active -eq 0 ]]; then
     changed "service $svc enabled and started"
   fi
 }
