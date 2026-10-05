@@ -24,19 +24,54 @@ DRY_RUN=0
 ASSUME_YES=0
 SKIP_HARDENING=0
 PROFILE_FILE=""
+ACTION="provision"
+TARGET_VERSION=""
+UPGRADE_LATEST=0
+FORCE=0
+CHANNEL="stable"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-20}"
+RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
+
+if [[ "${1:-}" == "upgrade" ]]; then
+  ACTION="upgrade"
+  shift
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    upgrade) ACTION="upgrade"; shift ;;
+    --to) TARGET_VERSION="${2:?--to needs a version}"; shift 2 ;;
+    --latest) UPGRADE_LATEST=1; shift ;;
+    --force) FORCE=1; shift ;;
     --profile) PROFILE_FILE="${2:?--profile needs a file}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --skip-hardening) SKIP_HARDENING=1; shift ;;
-    -h|--help) sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)
+      if [[ "$ACTION" == "upgrade" ]]; then
+        printf 'Usage: %s upgrade [--profile <file>] [--to X.Y.Z|--latest] [--force] [--dry-run] [--yes]\n\n' "${BASH_SOURCE[0]}"
+        printf 'Upgrade ikenga-server to a specified or latest version:\n'
+        printf '  - reads release manifest for profile channel (stable)\n'
+        printf '  - refuses if installed version is below min-upgrade-from\n'
+        printf '  - verifies checksum and attestation\n'
+        printf '  - keeps bin/ikenga-server.prev-<ver> for rollback\n'
+        printf '  - swaps binary, restarts service, and health-checks /api/health\n'
+        printf '  - automatically rolls back to previous binary if health-check fails\n'
+        printf '  - refuses if open terminals are detected unless --force\n'
+        exit 0
+      fi
+      sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-[[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || { echo "error: --profile <file> is required and must exist" >&2; exit 2; }
+if [[ "$ACTION" == "provision" ]]; then
+  [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || { echo "error: --profile <file> is required and must exist" >&2; exit 2; }
+else
+  if [[ -z "$PROFILE_FILE" && -f "$INSTALL_DIR/.profile.env" ]]; then
+    PROFILE_FILE="$INSTALL_DIR/.profile.env"
+  fi
+fi
 
 log()  { printf '==> %s\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
@@ -72,8 +107,13 @@ AGENT_CLIS=()
 FS_ROOTS=()
 SECRETS_FROM=""
 
-# shellcheck disable=SC1090
-source "$PROFILE_FILE"
+if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$PROFILE_FILE"
+elif [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE" 2>/dev/null || true
+fi
 
 validate_profile() {
   [[ "$TIER" == t0 || "$TIER" == t1 ]] || die "TIER must be t0 or t1 (got '$TIER')"
@@ -98,6 +138,14 @@ validate_profile() {
 
 # --------------------------------------------------------------- preflight
 
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64; note "arm64: newer and less tested than amd64 (README)" ;;
+    *) die "unsupported architecture $(uname -m)" ;;
+  esac
+}
+
 preflight() {
   log "Preflight"
   [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
@@ -106,11 +154,7 @@ preflight() {
     [[ $DRY_RUN -eq 1 ]] && note "WARNING: systemd not found (tolerated in --dry-run only)" || die "systemd is required"
   fi
 
-  case "$(uname -m)" in
-    x86_64) ARCH=amd64 ;;
-    aarch64|arm64) ARCH=arm64; note "arm64: newer and less tested than amd64 (README)" ;;
-    *) die "unsupported architecture $(uname -m)" ;;
-  esac
+  detect_arch
 
   # Read os-release in a subshell: sourcing it into this shell would clobber
   # profile variables (it defines VERSION, ID, NAME, ...).
@@ -476,7 +520,336 @@ summary() {
   fi
 }
 
+# ------------------------------------------------------------------ upgrade
+
+semver_lt() {
+  local v1="$1" v2="$2"
+  if [[ "$v1" == "$v2" ]]; then return 1; fi
+  local sorted
+  sorted="$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -1)"
+  [[ "$sorted" == "$v1" ]]
+}
+
+count_open_terminals() {
+  local svc="$1"
+  if [[ -n "${IKENGA_TEST_OPEN_TERMINALS:-}" ]]; then
+    echo "$IKENGA_TEST_OPEN_TERMINALS"
+    return
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "0"
+    return
+  fi
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    echo "0"
+    return
+  fi
+
+  local pids=()
+  local main_pid
+  main_pid="$(systemctl show -p MainPID --value "$svc" 2>/dev/null || true)"
+  if [[ -z "$main_pid" || "$main_pid" -le 0 ]]; then
+    echo "0"
+    return
+  fi
+
+  local cgroup
+  cgroup="$(systemctl show -p ControlGroup --value "$svc" 2>/dev/null || true)"
+  if [[ -n "$cgroup" && -f "/sys/fs/cgroup${cgroup}/cgroup.procs" ]]; then
+    mapfile -t pids < "/sys/fs/cgroup${cgroup}/cgroup.procs" 2>/dev/null || true
+  fi
+  if [[ ${#pids[@]} -eq 0 ]]; then
+    pids=("$main_pid")
+    local children
+    children="$(pgrep -P "$main_pid" 2>/dev/null || true)"
+    for c in $children; do
+      pids+=("$c")
+      local gc
+      gc="$(pgrep -P "$c" 2>/dev/null || true)"
+      for g in $gc; do pids+=("$g"); done
+    done
+  fi
+
+  local count=0
+  local pts_list=()
+  for p in "${pids[@]}"; do
+    [[ -d "/proc/$p/fd" ]] || continue
+    local pts
+    pts="$(ls -l "/proc/$p/fd" 2>/dev/null | grep -oE '/dev/pts/[0-9]+' | sort -u || true)"
+    if [[ -n "$pts" ]]; then
+      while read -r line; do
+        [[ -n "$line" ]] && pts_list+=("$line")
+      done <<< "$pts"
+    fi
+  done
+  if [[ ${#pts_list[@]} -gt 0 ]]; then
+    count="$(printf '%s\n' "${pts_list[@]}" | sort -u | wc -l)"
+  fi
+  echo "$count"
+}
+
+get_latest_release_version() {
+  local ver=""
+  if command -v gh >/dev/null 2>&1; then
+    ver="$(gh release view -R "$REPO" --json tagName -q .tagName 2>/dev/null | sed 's/^v//' || true)"
+  fi
+  if [[ -z "$ver" ]]; then
+    ver="$(curl -fsSI "https://github.com/$REPO/releases/latest" 2>/dev/null | grep -i '^location:' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  fi
+  if [[ -z "$ver" ]]; then
+    ver="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -oE '"tag_name":\s*"v?[0-9]+\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  fi
+  echo "$ver"
+}
+
+parse_manifest() {
+  local manifest_file="$1"
+  local arch="$2"
+
+  if command -v jq >/dev/null 2>&1; then
+    SCHEMA="$(jq -r '.schema // empty' "$manifest_file")"
+    MANIFEST_VERSION="$(jq -r '.version // empty' "$manifest_file")"
+    MANIFEST_CHANNEL="$(jq -r '.channel // empty' "$manifest_file")"
+    MIN_UPGRADE_FROM="$(jq -r '.min_upgrade_from // empty' "$manifest_file")"
+    ARTIFACT_NAME="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .name' "$manifest_file" | head -1)"
+    ARTIFACT_SHA="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .sha256' "$manifest_file" | head -1)"
+    ARTIFACT_SIZE="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .size' "$manifest_file" | head -1)"
+  elif command -v python3 >/dev/null 2>&1; then
+    local out
+    out="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+print("SCHEMA=" + json.dumps(str(d.get("schema", ""))))
+print("MANIFEST_VERSION=" + json.dumps(str(d.get("version", ""))))
+print("MANIFEST_CHANNEL=" + json.dumps(str(d.get("channel", ""))))
+print("MIN_UPGRADE_FROM=" + json.dumps(str(d.get("min_upgrade_from", ""))))
+arch = sys.argv[2]
+art = next((a for a in d.get("artifacts", []) if a.get("arch") == arch and a.get("kind") == "tarball"), {})
+print("ARTIFACT_NAME=" + json.dumps(str(art.get("name", ""))))
+print("ARTIFACT_SHA=" + json.dumps(str(art.get("sha256", ""))))
+print("ARTIFACT_SIZE=" + json.dumps(str(art.get("size", ""))))
+' "$manifest_file" "$arch")"
+    eval "$out"
+  elif command -v node >/dev/null 2>&1; then
+    local out
+    out="$(node -e '
+const fs = require("fs");
+const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+console.log(`SCHEMA=${d.schema || ""}`);
+console.log(`MANIFEST_VERSION=${d.version || ""}`);
+console.log(`MANIFEST_CHANNEL=${d.channel || ""}`);
+console.log(`MIN_UPGRADE_FROM=${d.min_upgrade_from || ""}`);
+const arch = process.argv[2];
+const art = (d.artifacts || []).find(a => a.arch === arch && a.kind === "tarball") || {};
+console.log(`ARTIFACT_NAME=${art.name || ""}`);
+console.log(`ARTIFACT_SHA=${art.sha256 || ""}`);
+console.log(`ARTIFACT_SIZE=${art.size || ""}`);
+' "$manifest_file" "$arch")"
+    eval "$out"
+  else
+    die "jq, python3, or node is required to parse release manifest"
+  fi
+}
+
+do_upgrade() {
+  log "Upgrade ikenga-server"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
+
+  detect_arch
+
+  local have=""
+  if [[ -x "$INSTALL_DIR/bin/ikenga-server" ]]; then
+    have="$("$INSTALL_DIR/bin/ikenga-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+  fi
+  [[ -n "$have" ]] || die "no installed ikenga-server found at $INSTALL_DIR/bin/ikenga-server; cannot upgrade"
+  note "installed version: $have ($ARCH)"
+
+  local unit="ikenga-server.service"
+  [[ "${TIER:-t1}" == t1 ]] && unit="ikenga-server-t1.service"
+  local svc="${unit%.service}"
+
+  local open_terms
+  open_terms="$(count_open_terminals "$svc")"
+  if (( open_terms > 0 )) && [[ $FORCE -ne 1 ]]; then
+    die "$open_terms open terminal(s) detected. Upgrading will terminate open terminals. Use --force to proceed anyway."
+  fi
+  if (( open_terms > 0 )) && [[ $FORCE -eq 1 ]]; then
+    note "Warning: $open_terms open terminal(s) will be terminated (--force specified)"
+  fi
+
+  local channel="${CHANNEL:-stable}"
+  local base_url="${RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
+  local target="$TARGET_VERSION"
+
+  if [[ -z "$target" || $UPGRADE_LATEST -eq 1 ]]; then
+    log "Checking latest release on channel '$channel'..."
+    if [[ -z "${RELEASE_MANIFEST_URL:-}" ]]; then
+      local latest_ver
+      latest_ver="$(get_latest_release_version)"
+      [[ -n "$latest_ver" ]] || die "could not determine latest release version from $REPO; specify --to X.Y.Z"
+      target="$latest_ver"
+    fi
+  fi
+
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  local manifest_file="$tmp/manifest.json"
+  if [[ -n "${RELEASE_MANIFEST_URL:-}" ]]; then
+    note "Fetching manifest from $RELEASE_MANIFEST_URL"
+    if [[ "$RELEASE_MANIFEST_URL" =~ ^https?:// ]]; then
+      curl -fsSL -o "$manifest_file" "$RELEASE_MANIFEST_URL"
+    else
+      cp -a "$RELEASE_MANIFEST_URL" "$manifest_file"
+    fi
+  elif [[ -n "$target" ]]; then
+    local murl="$base_url/v$target/ikenga-server_${target}_manifest.json"
+    note "Fetching manifest for v$target ($channel) from $murl"
+    curl -fsSL -o "$manifest_file" "$murl"
+  else
+    die "target version is required"
+  fi
+
+  local SCHEMA="" MANIFEST_VERSION="" MANIFEST_CHANNEL="" MIN_UPGRADE_FROM=""
+  local ARTIFACT_NAME="" ARTIFACT_SHA="" ARTIFACT_SIZE=""
+  parse_manifest "$manifest_file" "$ARCH"
+
+  [[ "$SCHEMA" == "ikenga-server-release/1" ]] || die "manifest has unsupported schema '$SCHEMA' (expected ikenga-server-release/1)"
+  [[ -n "$MANIFEST_VERSION" ]] || die "manifest is missing version field"
+  target="$MANIFEST_VERSION"
+
+  if [[ -n "$MANIFEST_CHANNEL" && "$MANIFEST_CHANNEL" != "$channel" ]]; then
+    die "manifest channel '$MANIFEST_CHANNEL' does not match profile channel '$channel'"
+  fi
+
+  if [[ "$have" == "$target" ]]; then
+    note "already on version $target ($channel channel); nothing to upgrade"
+    return 0
+  fi
+
+  if [[ -n "$MIN_UPGRADE_FROM" ]] && semver_lt "$have" "$MIN_UPGRADE_FROM"; then
+    die "installed version $have is below min-upgrade-from $MIN_UPGRADE_FROM for $target; upgrade to an intermediate version first"
+  fi
+
+  [[ -n "$ARTIFACT_NAME" && -n "$ARTIFACT_SHA" ]] || die "no tarball artifact for $ARCH found in manifest for $target"
+
+  note "target version: $target (channel: $channel, min-upgrade-from: ${MIN_UPGRADE_FROM:-none})"
+  note "artifact: $ARTIFACT_NAME (sha256: $ARTIFACT_SHA)"
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] download $ARTIFACT_NAME"
+    note "[dry-run] verify sha256 checksum ($ARTIFACT_SHA)"
+    note "[dry-run] keep previous binary as bin/ikenga-server.prev-$have"
+    note "[dry-run] swap binary to $target in $INSTALL_DIR/bin/"
+    note "[dry-run] restart service $svc"
+    note "[dry-run] health check /api/health with automatic rollback to $have on failure"
+    changed "ikenga-server upgraded $have -> $target"
+    summary
+    return 0
+  fi
+
+  local tarball_path="$tmp/$ARTIFACT_NAME"
+  if [[ -n "${RELEASE_TARBALL_PATH:-}" && -f "$RELEASE_TARBALL_PATH" ]]; then
+    cp -a "$RELEASE_TARBALL_PATH" "$tarball_path"
+  else
+    local tarball_url="$base_url/v$target/$ARTIFACT_NAME"
+    note "Downloading $tarball_url"
+    curl -fsSL -o "$tarball_path" "$tarball_url"
+  fi
+
+  note "Verifying checksum..."
+  local actual_sha
+  actual_sha="$(sha256sum "$tarball_path" | awk '{print $1}')"
+  if [[ "$actual_sha" != "$ARTIFACT_SHA" ]]; then
+    die "checksum mismatch for $ARTIFACT_NAME: expected $ARTIFACT_SHA, got $actual_sha; nothing installed"
+  fi
+  note "checksum OK ($actual_sha)"
+
+  if command -v gh >/dev/null 2>&1; then
+    gh attestation verify "$tarball_path" -R "$REPO" >/dev/null 2>&1 || note "WARNING: attestation not verified (gh not authenticated or failed); checksum matched"
+  fi
+
+  cp -a "$INSTALL_DIR/bin/ikenga-server" "$INSTALL_DIR/bin/ikenga-server.prev-$have"
+  note "previous binary saved as bin/ikenga-server.prev-$have (rollback guard)"
+
+  mkdir -p "$tmp/stage"
+  tar -xzf "$tarball_path" -C "$tmp/stage"
+  [[ -x "$tmp/stage/bin/ikenga-server" ]] || die "tarball $ARTIFACT_NAME missing bin/ikenga-server"
+
+  install -m 0755 "$tmp/stage/bin/ikenga-server" "$INSTALL_DIR/bin/ikenga-server"
+
+  if [[ -d "$tmp/stage/dist" ]]; then
+    rm -rf "$INSTALL_DIR/dist.prev-$have"
+    [[ -d "$INSTALL_DIR/dist" ]] && mv "$INSTALL_DIR/dist" "$INSTALL_DIR/dist.prev-$have"
+    cp -r "$tmp/stage/dist" "$INSTALL_DIR/dist"
+  fi
+
+  if [[ -f "$tmp/stage/$unit" ]]; then
+    install -m 0644 "$tmp/stage/$unit" "/etc/systemd/system/$unit"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  log "Restarting $svc..."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "$svc" 2>/dev/null || true
+  fi
+
+  log "Checking health at /api/health..."
+  local url="http://127.0.0.1:4000"
+  if [[ "${PERIMETER:-}" == tailnet && -n "${IKENGA_HOST_VALUE:-}" ]]; then
+    url="http://$IKENGA_HOST_VALUE:4000"
+  fi
+
+  local healthy=0
+  for i in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
+    if curl -fsS -m 2 "$url/api/health" 2>/dev/null | grep -q '"ok":\s*true'; then
+      healthy=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ $healthy -eq 1 ]]; then
+    log "Health check PASSED: ikenga-server $target is healthy at $url"
+    changed "ikenga-server upgraded $have -> $target"
+    summary
+    return 0
+  fi
+
+  log "WARNING: /api/health failed after upgrade to $target! Initiating automatic rollback to $have..."
+  cp -a "$INSTALL_DIR/bin/ikenga-server.prev-$have" "$INSTALL_DIR/bin/ikenga-server"
+  if [[ -d "$INSTALL_DIR/dist.prev-$have" ]]; then
+    rm -rf "$INSTALL_DIR/dist"
+    mv "$INSTALL_DIR/dist.prev-$have" "$INSTALL_DIR/dist"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart "$svc" 2>/dev/null || true
+  fi
+
+  local rolled_back=0
+  for i in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
+    if curl -fsS -m 2 "$url/api/health" 2>/dev/null | grep -q '"ok":\s*true'; then
+      rolled_back=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ $rolled_back -eq 1 ]]; then
+    die "upgrade to $target failed health check; automatically rolled back to $have successfully"
+  else
+    die "upgrade to $target failed health check AND rollback to $have also failed; see journalctl -u $svc"
+  fi
+}
+
 # ------------------------------------------------------------------ main
+
+if [[ "$ACTION" == "upgrade" ]]; then
+  do_upgrade
+  exit 0
+fi
 
 validate_profile
 IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0
@@ -487,6 +860,9 @@ if [[ "$PERIMETER" == tailnet ]]; then perimeter_tailnet; else perimeter_public;
 install_deps
 install_daemon
 write_env
+if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" && $DRY_RUN -eq 0 ]]; then
+  cp -a "$PROFILE_FILE" "$INSTALL_DIR/.profile.env" 2>/dev/null || true
+fi
 install_service
 firewall
 verify
