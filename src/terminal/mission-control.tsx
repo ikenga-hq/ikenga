@@ -107,7 +107,7 @@ export function MissionControl({ embedded = false }: MissionControlProps = {}) {
 								{!embedded && (
 									<div className="flex items-center gap-1">
 										<Cpu className="h-3 w-3 text-purple-400" />
-										<span>Claude 3.5 Sonnet</span>
+										<span>Claude Sonnet 5.5</span>
 									</div>
 								)}
 

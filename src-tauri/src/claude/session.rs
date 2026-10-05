@@ -100,6 +100,54 @@ pub struct SessionOpts {
     /// via `--thinking-budget-tokens`. Mutated by `acp_set_effort`.
     #[serde(default)]
     pub effort: EffortLevel,
+    /// WP-11: plugin folders loaded into the session through
+    /// `CLAUDE_CODE_PLUGIN_DIRS`. Empty sets no env.
+    #[serde(rename = "pluginDirs")]
+    pub plugin_dirs: Vec<String>,
+    /// WP-11: passed as `--append-system-prompt` on spawn.
+    #[serde(rename = "appendSystemPrompt")]
+    pub append_system_prompt: Option<String>,
+    /// WP-11: launch role (`chi` | `pane` | `plan`). When `model` is unset,
+    /// the catalog default for the role becomes `--model`
+    /// (`server::shared::model_catalog`).
+    pub role: Option<String>,
+}
+
+/// The per-session tail of the claude argv and env: `--resume`, `--model`
+/// (explicit, else the role default), `--thinking-budget-tokens`,
+/// `--append-system-prompt` and `CLAUDE_CODE_PLUGIN_DIRS`. With none of
+/// those options set it adds nothing, so a default session spawns exactly
+/// as before WP-11.
+pub(crate) fn apply_launch_opts(command: &mut SpawnSpec, opts: &SessionOpts) -> Result<(), String> {
+    use crate::server::shared::claude_launch::{
+        append_system_prompt_args, plugin_dirs_env, resolve_model,
+    };
+    // Phase 8: forks seed `resume_session_id` with the SOURCE thread's
+    // `claude_session_id` at fork time (see `engines::claude_code::server::handle_fork_session`),
+    // so the first prompt on a forked thread resumes against the source's
+    // on-disk JSONL transcript. The user effectively continues the same
+    // claude conversation in a separate Ikenga thread.
+    if let Some(ref id) = opts.resume_session_id {
+        command.arg("--resume").arg(id);
+    }
+    if let Some(m) = resolve_model(opts.model.as_deref(), opts.role.as_deref()) {
+        command.arg("--model").arg(m);
+    }
+    // ADR-011 phase 3: extended-thinking effort. `Off` skips the flag so
+    // claude's own default applies; the other four steps map to discrete
+    // thinking-budget-tokens values (see `EffortLevel::thinking_budget_tokens`).
+    if let Some(budget) = opts.effort.thinking_budget_tokens() {
+        command
+            .arg("--thinking-budget-tokens")
+            .arg(budget.to_string());
+    }
+    command.args(append_system_prompt_args(
+        opts.append_system_prompt.as_deref(),
+    ));
+    if let Some((key, value)) = plugin_dirs_env(&opts.plugin_dirs)? {
+        command.env(key, value);
+    }
+    Ok(())
 }
 
 /// The live streaming child owned by a session, if one is currently spawned.
@@ -639,25 +687,7 @@ pub async fn spawn_streaming(
             command.envs(layered);
         }
     }
-    // Phase 8: forks seed `resume_session_id` with the SOURCE thread's
-    // `claude_session_id` at fork time (see `engines::claude_code::server::handle_fork_session`),
-    // so the first prompt on a forked thread resumes against the source's
-    // on-disk JSONL transcript. The user effectively continues the same
-    // claude conversation in a separate Ikenga thread.
-    if let Some(ref id) = opts.resume_session_id {
-        command.arg("--resume").arg(id);
-    }
-    if let Some(ref m) = opts.model {
-        command.arg("--model").arg(m);
-    }
-    // ADR-011 phase 3: extended-thinking effort. `Off` skips the flag so
-    // claude's own default applies; the other four steps map to discrete
-    // thinking-budget-tokens values (see `EffortLevel::thinking_budget_tokens`).
-    if let Some(budget) = opts.effort.thinking_budget_tokens() {
-        command
-            .arg("--thinking-budget-tokens")
-            .arg(budget.to_string());
-    }
+    apply_launch_opts(&mut command, &opts)?;
 
     let mut child = crate::executor::current()
         .spawn_piped(command, piped)
@@ -1458,6 +1488,127 @@ mod tests {
         // through the permission round-trip.
         let opts = SessionOpts::default();
         assert_eq!(opts.permission_mode, AcpSessionMode::Default);
+    }
+
+    fn launch_argv(opts: &SessionOpts) -> (Vec<String>, Vec<(String, String)>) {
+        let mut spec = SpawnSpec::new("claude");
+        apply_launch_opts(&mut spec, opts).expect("launch opts apply");
+        let args = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let env = spec
+            .env
+            .vars
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        (args, env)
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].as_str())
+    }
+
+    #[test]
+    fn launch_opts_default_adds_nothing() {
+        // WP-11: a session with none of the new options spawns exactly as
+        // before — no --model, no --append-system-prompt, no plugin env.
+        let (args, env) = launch_argv(&SessionOpts::default());
+        assert!(args.is_empty(), "unexpected args {args:?}");
+        assert!(env.is_empty(), "unexpected env {env:?}");
+    }
+
+    #[test]
+    fn launch_opts_existing_flags_keep_their_order() {
+        let opts = SessionOpts {
+            resume_session_id: Some("sess-1".into()),
+            model: Some("claude-haiku-4-5".into()),
+            effort: EffortLevel::Low,
+            ..Default::default()
+        };
+        let (args, env) = launch_argv(&opts);
+        assert_eq!(
+            args,
+            [
+                "--resume",
+                "sess-1",
+                "--model",
+                "claude-haiku-4-5",
+                "--thinking-budget-tokens",
+                "1000"
+            ]
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn launch_opts_model_per_role() {
+        for (role, want) in [
+            ("chi", "claude-sonnet-5-5"),
+            ("pane", "claude-sonnet-5-5"),
+            ("plan", "claude-opus-5-5"),
+        ] {
+            let opts = SessionOpts {
+                role: Some(role.into()),
+                ..Default::default()
+            };
+            let (args, _) = launch_argv(&opts);
+            assert_eq!(flag_value(&args, "--model"), Some(want), "role {role}");
+        }
+        // An explicit model beats the role default.
+        let opts = SessionOpts {
+            role: Some("plan".into()),
+            model: Some("claude-sonnet-5-5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            flag_value(&launch_argv(&opts).0, "--model"),
+            Some("claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
+    fn launch_opts_append_system_prompt_and_plugin_dirs() {
+        let opts = SessionOpts {
+            append_system_prompt: Some("You are inside Ikenga.".into()),
+            plugin_dirs: vec!["/p/one".into(), "/p/two".into()],
+            ..Default::default()
+        };
+        let (args, env) = launch_argv(&opts);
+        assert_eq!(
+            flag_value(&args, "--append-system-prompt"),
+            Some("You are inside Ikenga.")
+        );
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            env,
+            vec![(
+                "CLAUDE_CODE_PLUGIN_DIRS".to_string(),
+                format!("/p/one{sep}/p/two")
+            )]
+        );
+    }
+
+    #[test]
+    fn session_opts_wp11_fields_deserialize_camel_case() {
+        let opts: SessionOpts = serde_json::from_value(serde_json::json!({
+            "pluginDirs": ["/p"],
+            "appendSystemPrompt": "x",
+            "role": "chi"
+        }))
+        .expect("deserialize ok");
+        assert_eq!(opts.plugin_dirs, vec!["/p".to_string()]);
+        assert_eq!(opts.append_system_prompt.as_deref(), Some("x"));
+        assert_eq!(opts.role.as_deref(), Some("chi"));
     }
 
     #[test]
