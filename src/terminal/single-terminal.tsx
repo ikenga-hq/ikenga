@@ -197,7 +197,15 @@ export function createClaudeTerminalSession(
 ): string {
 	const id = makeTerminalId();
 	const cwd = opts.cwd ?? activeProjectCwd();
-	const wrap: AgentWrapOpts = { ...opts, terminalId: id, resumeSessionId: null };
+	// WP-11: a Claude terminal is an everyday pane unless the caller says
+	// otherwise (`plan`), so it launches on the catalog's pane model when no
+	// model is chosen. Stored on the wrap so a respawn keeps the role.
+	const wrap: AgentWrapOpts = {
+		...opts,
+		role: opts.role ?? 'pane',
+		terminalId: id,
+		resumeSessionId: null,
+	};
 	const cmd = buildClaudeWrappedCmd(wrap);
 	return useTerminalStore.getState().add({ cwd, cmd, wrap }, title, id);
 }

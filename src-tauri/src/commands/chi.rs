@@ -555,6 +555,22 @@ fn engine_command(launch: &EngineLaunch, args: &[String], cwd: &str, set_cwd: bo
     spec
 }
 
+/// The `--model` a Claude Code chi run launches with: the run's own model,
+/// else the catalog default for the `chi` role (WP-11).
+fn chi_claude_model(model: Option<&str>) -> Option<String> {
+    crate::server::shared::claude_launch::resolve_model(model, Some("chi"))
+}
+
+/// The model a run hands chi-runner: resolved like the in-process spawn for
+/// Claude Code, passed through unchanged for every other engine.
+fn runner_model(engine_id: &str, model: Option<&str>) -> Option<String> {
+    if engine_id == "claude-code" {
+        chi_claude_model(model)
+    } else {
+        model.map(str::to_string)
+    }
+}
+
 /// Return the command for the requested engine.
 fn build_engine_command(
     engine_id: &str,
@@ -610,8 +626,10 @@ fn build_engine_command_with(
             if let Some(id) = resume_id {
                 args.extend([s("--resume"), s(id)]);
             }
-            if let Some(m) = model {
-                args.extend([s("--model"), s(m)]);
+            // Chi's role default (Sonnet, from the model catalog) applies only
+            // when the run names no model; `iyke chi run --model` still wins.
+            if let Some(m) = chi_claude_model(model) {
+                args.extend([s("--model"), m]);
             }
             Ok(engine_command(&launch, &args, cwd, true))
         }
@@ -1557,12 +1575,13 @@ pub(crate) async fn spawn_chi_run(
     // `error` as fatal with `status: "failed"`) instead of passing silently.
     let mut fallback_warning: Option<String> = None;
     if opts.persistent {
+        let model = runner_model(&opts.engine_id, opts.model.as_deref());
         let conf = chi_runner::RunnerConf {
             run_id: &run_id,
             engine_id: &opts.engine_id,
             prompt: &opts.prompt,
             cwd: &cwd,
-            model: opts.model.as_deref(),
+            model: model.as_deref(),
             mode: opts.mode.as_deref(),
             resume_session_id: opts.resume_session_id.as_deref(),
             output_path: &output_path.to_string_lossy(),
@@ -2396,6 +2415,77 @@ mod tests {
              '--verbose' '--resume' 'sess-1' '--model' 'opus'"
         );
         assert_eq!(args.len(), 7);
+    }
+
+    fn model_flags(cmd: &SpawnSpec) -> Vec<String> {
+        let args = args_of(cmd);
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--model")
+            .map(|(i, _)| args[i + 1].clone())
+            .collect()
+    }
+
+    #[test]
+    fn claude_code_chi_run_defaults_to_the_chi_role_model() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["claude"]),
+            "claude-code",
+            "",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(model_flags(&cmd), ["claude-sonnet-5-5"]);
+    }
+
+    #[test]
+    fn claude_code_chi_run_explicit_model_wins_once() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["claude"]),
+            "claude-code",
+            "",
+            "/tmp",
+            Some("claude-opus-5-5"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(model_flags(&cmd), ["claude-opus-5-5"]);
+    }
+
+    #[test]
+    fn runner_conf_model_resolves_for_claude_only() {
+        assert_eq!(
+            runner_model("claude-code", None).as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            runner_model("claude-code", Some("opus")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(runner_model("codex", None), None);
+        assert_eq!(
+            runner_model("codex", Some("gpt-5")).as_deref(),
+            Some("gpt-5")
+        );
+    }
+
+    #[test]
+    fn non_claude_engines_get_no_role_default() {
+        let cmd = build_engine_command_with(
+            &FakeResolver::native(&["pi"]),
+            "pi",
+            "x",
+            "/tmp",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(model_flags(&cmd).is_empty());
     }
 
     #[test]
