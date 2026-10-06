@@ -278,17 +278,8 @@ pub async fn rpc_handler(
         "pty_foreground_snapshot" => RpcResponse::success(state.pty_manager.foreground_snapshot()),
 
         // --- FS Commands ---
-        "fs_exists" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => RpcResponse::success(path.exists()),
-                Err(e) => RpcResponse::error(e),
-            }
-        }
+        // Refusals fold into `false`, as on the desktop (`rpc_files`).
+        "fs_exists" => rpc_files::fs_exists(&state, &payload.args).await,
         "fs_mkdir" => {
             let path_str = payload
                 .args
