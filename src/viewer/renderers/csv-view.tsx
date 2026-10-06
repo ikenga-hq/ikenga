@@ -7,13 +7,21 @@
 // WP) — the parser below is a small hand-rolled RFC 4180 reader: quoted
 // fields, embedded commas/newlines, and `""` as an escaped quote.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { ErrorState, LoadingState } from '@/components/states';
 import { fsRead } from '@/lib/tauri-cmd';
+import { EditableTextFrame } from '../editing/editable-text-frame';
 
 interface CsvViewProps {
 	path: string;
+	/** Show the Edit toggle (plans/file-editing F1: CSV edits as text in v1, no
+	 *  validation). Defaults false so thumbnails and embeds stay read-only. */
+	editable?: boolean;
+	/** The pane this view lives in — scopes its editing session. */
+	paneId?: string;
+	line?: number;
+	col?: number;
 }
 
 export type ParsedCsv = { header: string[]; rows: string[][] };
@@ -101,24 +109,38 @@ export function renderedRowCount(total: number, shown: number): number {
 	return Math.max(0, Math.min(total, shown));
 }
 
-export function CsvView({ path }: CsvViewProps) {
-	const [shown, setShown] = useState(CSV_ROW_CAP);
-	const delimiter = path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+function delimiterFor(path: string): string {
+	return path.toLowerCase().endsWith('.tsv') ? '\t' : ',';
+}
+
+export function CsvView({ path, editable = false, paneId, line, col }: CsvViewProps) {
+	if (editable) {
+		return (
+			<EditableTextFrame
+				path={path}
+				paneId={paneId}
+				line={line}
+				col={col}
+				renderView={(text) => <CsvTable text={text} delimiter={delimiterFor(path)} />}
+			/>
+		);
+	}
+	return <CsvReadOnly path={path} />;
+}
+
+function CsvReadOnly({ path }: { path: string }) {
 	const [state, setState] = useState<
-		| { kind: 'loading' }
-		| { kind: 'ready'; data: ParsedCsv }
-		| { kind: 'error'; message: string }
+		{ kind: 'loading' } | { kind: 'ready'; text: string } | { kind: 'error'; message: string }
 	>({ kind: 'loading' });
 
 	useEffect(() => {
 		let cancelled = false;
 		setState({ kind: 'loading' });
-		setShown(CSV_ROW_CAP);
 		fsRead(path)
 			.then((res) => {
 				if (cancelled) return;
 				const text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
-				setState({ kind: 'ready', data: parseDelimited(text, delimiter) });
+				setState({ kind: 'ready', text });
 			})
 			.catch((err) => {
 				if (cancelled) return;
@@ -127,7 +149,7 @@ export function CsvView({ path }: CsvViewProps) {
 		return () => {
 			cancelled = true;
 		};
-	}, [path, delimiter]);
+	}, [path]);
 
 	if (state.kind === 'loading') {
 		return <LoadingState data-state="loading" fill heading="Loading…" />;
@@ -143,8 +165,15 @@ export function CsvView({ path }: CsvViewProps) {
 			/>
 		);
 	}
+	return <CsvTable key={path} text={state.text} delimiter={delimiterFor(path)} />;
+}
 
-	const { header, rows } = state.data;
+/** The sticky-header table for delimited text. */
+export function CsvTable({ text, delimiter }: { text: string; delimiter: string }) {
+	const [shown, setShown] = useState(CSV_ROW_CAP);
+	const data = useMemo(() => parseDelimited(text, delimiter), [text, delimiter]);
+
+	const { header, rows } = data;
 	const visible = renderedRowCount(rows.length, shown);
 
 	if (header.length === 0 && rows.length === 0) {

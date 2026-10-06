@@ -122,6 +122,7 @@ const BUILTIN_NAMES: ReadonlyArray<readonly [string, string, boolean?]> = [
 	['explorer.toggle-hidden', 'Show hidden files'],
 	['files.toggle-ignored', 'Show ignored'],
 	['files.open-as-artifact-grid', 'Open as Artifact Grid'],
+	['files.move', 'Move…'],
 	['viewer.add-pin', 'Add pin / comment here…'],
 	['viewer.open-in-studio', 'Open in Studio'],
 	['viewer.reload', 'Reload'],

@@ -3,6 +3,7 @@ import { PanelGroup } from 'react-resizable-panels';
 import { useCommands } from '@/lib/keymap/dispatcher';
 import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { guardedCloseActiveTab, guardedCloseFocusedPane } from '@/lib/panes/unsaved-guard';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { persistPanelSizes } from '@/lib/shell/panel-sizes';
 import { useShellStore } from '@/lib/shell/shell-store';
@@ -61,8 +62,9 @@ export const WORKSPACE_COMMANDS: Readonly<Record<string, () => void>> = {
 	// artifact-wizard.md, D8).
 	'pane.new-artifact': () => usePaneStore.getState().navigateFocused('/projects/new-artifact'),
 	'pane.reopen': () => usePaneStore.getState().reopenLastClosed(),
-	'pane.close': () => usePaneStore.getState().closeFocusedPane(),
-	'tab.close': () => usePaneStore.getState().closeActiveTab(),
+	// plans/file-editing: ask before discarding unsaved edits.
+	'pane.close': () => void guardedCloseFocusedPane(),
+	'tab.close': () => void guardedCloseActiveTab(),
 	'pane.focus-1': () => usePaneStore.getState().focusByIndex(0),
 	'pane.focus-2': () => usePaneStore.getState().focusByIndex(1),
 	'pane.focus-3': () => usePaneStore.getState().focusByIndex(2),

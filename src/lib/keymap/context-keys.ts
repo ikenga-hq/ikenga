@@ -48,6 +48,8 @@ export const CONTEXT_KEYS = {
 	loupeFocus: 'boolean',
 	pinComposerFocus: 'boolean',
 	markdownEditorFocus: 'boolean',
+	// plans/file-editing (B-21 additive rule): the shared text editor.
+	textEditorFocus: 'boolean',
 	// Fix round 1 (B-21): narrower than `approveGateFocus` (the whole
 	// section, incl. the draft queue) — true only inside the detail pane,
 	// matching the pre-WP-56 scoping of ⌘S / ⌘↵ (`onDetailKeyDown` was on
@@ -78,6 +80,7 @@ export const FOCUS_CONTEXT_KEYS: readonly ContextKeyName[] = [
 	'loupeFocus',
 	'pinComposerFocus',
 	'markdownEditorFocus',
+	'textEditorFocus',
 	'approveGateDetailFocus',
 ];
 
@@ -105,7 +108,8 @@ export type FocusArea =
 	| 'approve-gate-detail'
 	| 'loupe'
 	| 'pin-composer'
-	| 'markdown-editor';
+	| 'markdown-editor'
+	| 'text-editor';
 
 /** Spread onto a surface's root: `<div {...focusMarkerProps('dispatch')}>`. */
 export function focusMarkerProps(...areas: FocusArea[]): { [CTX_FOCUS_ATTR]: string } {
@@ -247,6 +251,7 @@ export function computeContextKeys(inputs: ContextInputs): ContextKeys {
 		loupeFocus: isFocusWithin(el, 'loupe'),
 		pinComposerFocus: isFocusWithin(el, 'pin-composer'),
 		markdownEditorFocus: isFocusWithin(el, 'markdown-editor'),
+		textEditorFocus: isFocusWithin(el, 'text-editor'),
 	};
 }
 

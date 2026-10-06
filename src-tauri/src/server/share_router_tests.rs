@@ -235,3 +235,84 @@ async fn the_share_prehook_end_to_end() {
         "only cost fields go, never the events"
     );
 }
+
+/// The broker's own `internal` call into this child (§4.5.3): the per-child
+/// token and the internal-call marker, no caps and no share headers.
+async fn broker_call(c: &Child, cmd: &str, args: Value) -> Value {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rpc")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("x-ikenga-principal", PrincipalId::new_v7().to_string())
+        .header(crate::access::INTERNAL_CALL_HEADER, "1")
+        .body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+        .unwrap();
+    let res = c.router.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+/// Gap audit 2026-10-06 rank 2: inviting to the built-in Default project
+/// failed with a bare "no such project". Default has no folder, and §4.5.4
+/// confines a share to the project root, so it can't be shared — but the
+/// broker's `share_project_info` now says so instead of claiming it does
+/// not exist. An unknown id stays `not_found`; a rooted project resolves.
+#[tokio::test]
+async fn share_project_info_says_why_a_folderless_project_cannot_be_shared() {
+    let c = child().await;
+    let shared = broker_call(&c, "share_project_info", json!({ "projectId": PROJECT })).await;
+    assert_eq!(shared["ok"], true, "{shared}");
+    assert_eq!(shared["data"]["name"], "Shared");
+
+    let default = broker_call(&c, "share_project_info", json!({ "projectId": "default" })).await;
+    assert_eq!(
+        default["error"],
+        format!(
+            "invalid_request: {}",
+            crate::access::share::NO_FOLDER_TO_SHARE
+        ),
+        "{default}"
+    );
+
+    let unknown = broker_call(&c, "share_project_info", json!({ "projectId": "nope" })).await;
+    assert_eq!(unknown["error"], "not_found: no such project", "{unknown}");
+
+    // A member's relayed request still gets a uniform `not_found` for a
+    // folderless project (the share pre-hook's own resolution).
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/rpc")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("x-ikenga-principal", PrincipalId::new_v7().to_string())
+        .header("x-ikenga-caps", "files,sessions")
+        .header("x-ikenga-share-project", "default")
+        .header(
+            "x-ikenga-share-principal",
+            PrincipalId::new_v7().to_string(),
+        )
+        .header("x-ikenga-share-device", "-")
+        .header("x-ikenga-share-role", "operator");
+    req = req.header("x-ikenga-share-policy", "owner-approval");
+    let res = c
+        .router
+        .clone()
+        .oneshot(
+            req.body(Body::from(
+                json!({ "cmd": "fs_list", "args": { "path": "/" } }).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"], "not_found: no such project", "{body}");
+}

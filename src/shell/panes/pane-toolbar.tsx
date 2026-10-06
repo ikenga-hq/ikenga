@@ -24,6 +24,7 @@ import {
 import type { PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
+import { guardedClosePane } from '@/lib/panes/unsaved-guard';
 import { hasAddressBar } from '@/lib/panes/pane-address';
 import { IconButton } from '@/components/ui/icon-button';
 import { useEffectiveMenu } from '@/lib/actions/store';
@@ -232,7 +233,6 @@ function PaneMenuBody({
 	pkg,
 }: Pick<PaneToolbarProps, 'paneId' | 'history' | 'onPinToArtifacts'> & { pkg: PkgPaneMenuData }) {
 	const splitPane = usePaneStore((s) => s.splitPane);
-	const closePane = usePaneStore((s) => s.closePane);
 	const revealPath = usePaneStore((s) => s.revealPath);
 	const canSplit = usePaneStore((s) => s.canSplit());
 	const leafCount = usePaneStore((s) => s.leafCount());
@@ -344,7 +344,7 @@ function PaneMenuBody({
 			},
 			'viewer.toggle-history': () =>
 				setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history'),
-			'pane.close': () => closePane(paneId),
+			'pane.close': () => void guardedClosePane(paneId),
 		},
 	});
 

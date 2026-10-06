@@ -1,3 +1,6 @@
+// First: decides the transport for anything that reaches it at module load
+// (audit 2026-10-06 rank 27). Must stay above every other import.
+import '@/lib/transport/browser-entry';
 import { mark } from '@/lib/boot-timing';
 mark('boot:js-start');
 

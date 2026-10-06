@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { detectAgent, type DetectedAgent } from '@/lib/tauri-cmd';
 
-export type AgentDetectStatus = 'pending' | 'detected' | 'missing';
+export type AgentDetectStatus = 'pending' | 'detected' | 'missing' | 'unknown';
 
 export interface AgentDetectEntry {
 	status: AgentDetectStatus;
@@ -37,7 +37,7 @@ export function entryFromProbe(
 	error?: unknown
 ): AgentDetectEntry {
 	if (error != null) {
-		return { status: 'missing', error: String((error as Error)?.message ?? error) };
+		return { status: 'unknown', error: String((error as Error)?.message ?? error) };
 	}
 	return agent ? { status: 'detected', agent } : { status: 'missing' };
 }
@@ -54,6 +54,18 @@ export function applyProbeResult(
 ): AgentDetectMap {
 	if (token !== currentToken) return prev;
 	return { ...prev, [id]: entry };
+}
+
+/** Pure helper to compute if all engines in `engineIds` are missing.
+ *  Returns false if any engine is detected, pending, or unknown (error). */
+export function computeAllMissing(
+	results: AgentDetectMap,
+	engineIds: readonly string[]
+): boolean {
+	const anyDetected = engineIds.some((id) => results[id]?.status === 'detected');
+	const anyPending = engineIds.some((id) => results[id]?.status === 'pending');
+	const anyUnknown = engineIds.some((id) => results[id]?.status === 'unknown');
+	return !anyPending && !anyUnknown && !anyDetected;
 }
 
 export function useAgentDetect(engineIds: readonly string[]): UseAgentDetectResult {

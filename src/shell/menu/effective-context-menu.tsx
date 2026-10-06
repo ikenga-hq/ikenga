@@ -31,6 +31,10 @@ export interface EffectiveContextMenuProps extends ResolveMenuOptions {
 	triggerDisabled?: boolean;
 	/** Rendered above the rows (a non-interactive caption). */
 	header?: ReactNode;
+	/** Called when the menu closes, before focus returns to the trigger;
+	 *  `preventDefault()` keeps focus where an item's handler put it (an
+	 *  inline rename / create input). */
+	onCloseAutoFocus?: (e: Event) => void;
 }
 
 /** The rows of a resolved menu as `ContextMenuItem`s (plain items only: a
@@ -65,18 +69,20 @@ function EffectiveContextMenuBody({
 	menuId,
 	contentClassName,
 	header,
+	onCloseAutoFocus,
 	opts,
 }: {
 	menuId: string;
 	contentClassName?: string;
 	header?: ReactNode;
+	onCloseAutoFocus?: (e: Event) => void;
 	opts: ResolveMenuOptions;
 }) {
 	const menu = useEffectiveMenu(menuId);
 	const rows = resolveMenuItems(menu, opts);
 	if (rows.length === 0) return null;
 	return (
-		<ContextMenuContent className={contentClassName}>
+		<ContextMenuContent className={contentClassName} onCloseAutoFocus={onCloseAutoFocus}>
 			{header}
 			<ContextMenuRows rows={rows} />
 		</ContextMenuContent>
@@ -89,6 +95,7 @@ export function EffectiveContextMenu({
 	contentClassName,
 	triggerDisabled,
 	header,
+	onCloseAutoFocus,
 	...opts
 }: EffectiveContextMenuProps) {
 	const [open, setOpen] = useState(false);
@@ -98,7 +105,13 @@ export function EffectiveContextMenu({
 				{children}
 			</ContextMenuTrigger>
 			{open && !triggerDisabled && (
-				<EffectiveContextMenuBody menuId={menuId} contentClassName={contentClassName} header={header} opts={opts} />
+				<EffectiveContextMenuBody
+					menuId={menuId}
+					contentClassName={contentClassName}
+					header={header}
+					onCloseAutoFocus={onCloseAutoFocus}
+					opts={opts}
+				/>
 			)}
 		</ContextMenu>
 	);

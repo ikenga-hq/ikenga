@@ -77,6 +77,11 @@ export interface WizardStepChildArgs<P> {
 	 *  user on the step and shows the error inline with a Retry. Pass null
 	 *  to clear. */
 	setBeforeNext: (fn: BeforeNext | null) => void;
+	/** Last step only: register what finishing does, so the footer's primary
+	 *  button and the body's own finish button run the same handler (the
+	 *  `done` step's greeting + navigate to `/`). Unset, the footer just calls
+	 *  `goNext`. Pass null to clear. */
+	setFinish: (fn: (() => void) | null) => void;
 }
 
 export type BeforeNext = () => Promise<void> | void;
@@ -150,6 +155,14 @@ export function WizardStepper<P = unknown>({
 
 	const bodyRef = useRef<HTMLDivElement>(null);
 	const beforeNextRef = useRef<BeforeNext | null>(null);
+	const finishRef = useRef<(() => void) | null>(null);
+	// Stable, so a body can list it as an effect dependency.
+	const setFinish = useMemo(
+		() => (fn: (() => void) | null) => {
+			finishRef.current = fn;
+		},
+		[]
+	);
 	// One commit at a time: a double-click (or footer + inline Continue) must
 	// not run `beforeNext` twice — e.g. two `project_create` calls. The ref
 	// guards synchronously; the state drives the busy Continue.
@@ -257,7 +270,11 @@ export function WizardStepper<P = unknown>({
 		setBeforeNext: (fn) => {
 			beforeNextRef.current = fn;
 		},
+		setFinish,
 	};
+	// The footer reads the ref at click time, so a body that registers after
+	// this render is still the one that runs.
+	const onFooterNext = isLast ? () => (finishRef.current ?? childArgs.goNext)() : childArgs.goNext;
 
 	const dataState: OnboardingChromeState = stateOverride ?? (showResume ? 'resume' : stepId);
 
@@ -348,7 +365,12 @@ export function WizardStepper<P = unknown>({
 								<b>You left off here.</b> {describeResume(steps, stepId)} Nothing you already
 								answered was lost.
 							</span>
-							<Button variant="ghost" size="sm" onClick={startOver} data-testid="onboarding-start-over">
+							<Button
+								variant="ghost"
+								size="sm"
+								onClick={startOver}
+								data-testid="onboarding-start-over"
+							>
 								Start over
 							</Button>
 						</div>
@@ -375,7 +397,7 @@ export function WizardStepper<P = unknown>({
 				progressLabel={summariseProgress(steps)}
 				onBack={goBack}
 				onSkip={skip}
-				onNext={childArgs.goNext}
+				onNext={onFooterNext}
 				nextBusy={committing}
 			/>
 		</div>
