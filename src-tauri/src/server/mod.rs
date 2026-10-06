@@ -48,6 +48,8 @@ pub mod static_files;
 /// `ikenga-server supervise`: a minimal init that keeps detached runs alive
 /// across server restarts where there is no systemd (containers). Linux-only.
 pub mod supervisor;
+/// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
+pub mod trusted_proxy;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
@@ -364,10 +366,12 @@ async fn auth_middleware(
         .cloned()
         .unwrap_or_else(DaemonAccess::unavailable);
     let meta = RequestMeta {
-        remote_addr: req
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string()),
+        remote_addr: trusted_proxy::client_addr(
+            req.extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip()),
+            req.headers(),
+        ),
         user_agent: req
             .headers()
             .get("user-agent")

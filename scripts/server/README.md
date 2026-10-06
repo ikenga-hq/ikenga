@@ -63,6 +63,7 @@ sudo touch /opt/ikenga/.env && sudo chmod 600 /opt/ikenga/.env
 |---|---|---|
 | `IKENGA_HOST` | both | Bind address. Unset, it is `127.0.0.1`, which is unreachable from other machines: the safe default. Set it to the host's Tailscale address, or leave it unset and put a reverse proxy on loopback in front. Do not bind a public address directly. |
 | `IKENGA_PUBLIC_URL` | both | The https address people reach the server on. It is the base of pairing and invite links. |
+| `IKENGA_TRUSTED_PROXIES` | both | Comma-separated list of trusted reverse proxy IP addresses and CIDR networks (e.g. `127.0.0.1,::1,10.0.0.0/8`). When set and the direct TCP peer matches, the server resolves client IP addresses from `Forwarded` or `X-Forwarded-For` headers (right-most untrusted hop). Unset by default (forwarded headers ignored). Behind Caddy on loopback (`PERIMETER=public-https`), set this to `127.0.0.1`. |
 | `IKENGA_INSECURE_COOKIE` | multi-user | `true` only for plain HTTP on a private network such as a tailnet. Leave it unset behind HTTPS so the session cookie stays `Secure`. |
 | `IKENGA_UID_RANGE` | multi-user | Unix uid range for accounts, default `20000-29999`. It must match the range the data directory was first set up with. |
 | `IKENGA_AUTH_TOKEN` | single-user | The bearer token. Without it the daemon mints a random one on every start, so every client breaks after a restart. Ignored in multi-user mode. |
@@ -78,7 +79,7 @@ Read it back, when you need to sign a client in, with `sudo grep '^IKENGA_AUTH_T
 
 Keeping long-lived credentials in this file lets the daemon start unattended. The trade is that **anyone who gets onto the box gets those credentials**. Do not put anything in it you would not leave on the host.
 
-The daemon speaks plain HTTP and has no TLS of its own. Reach it over a private network, or put an HTTPS proxy in front. There is no trusted-proxy setting yet: behind a proxy the server sees the proxy's address for every client, so device-pairing throttling is shared across devices, and pairing can fail with `cookie_rejected`.
+The daemon speaks plain HTTP and has no TLS of its own. Reach it over a private network, or put an HTTPS proxy in front. When running behind a reverse proxy (such as Caddy), set `IKENGA_TRUSTED_PROXIES=127.0.0.1` so client addresses are resolved from forwarded headers rather than collapsing onto loopback. Without this setting, device-pairing throttling, login backoff and access audit rows are shared across all clients behind the proxy.
 
 ## Multi-user: the unit, the first admin, the first start
 

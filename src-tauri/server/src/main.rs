@@ -318,6 +318,12 @@ pub struct ServeArgs {
     )]
     pub allowed_origins: Vec<String>,
 
+    /// Trusted reverse proxy IP addresses and CIDR subnets (comma-separated, e.g.
+    /// `127.0.0.1,::1,10.0.0.0/8`). When set, client addresses behind these proxies
+    /// are resolved from Forwarded and X-Forwarded-For headers. Unset by default.
+    #[arg(long, env = "IKENGA_TRUSTED_PROXIES")]
+    pub trusted_proxies: Option<String>,
+
     /// Idle timeout in seconds before server automatically shuts down when no
     /// PTY session, open WebSocket or recent request keeps it active. Under
     /// `t1` this is each principal child's idle timeout instead (default 1800;
@@ -495,8 +501,9 @@ async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
         None => {}
     }
 
-    // Honoured by the T1 broker after its §8 boot probe, only on an empty
-    // accounts table (`Provisioner::bootstrap_admin`); never by a child.
+    if let Some(tp) = &args.trusted_proxies {
+        std::env::set_var("IKENGA_TRUSTED_PROXIES", tp);
+    }
     let bootstrap_admin = match bootstrap {
         Some(b) if args.executor_tier == ExecutorTier::T1 && !args.principal_child => {
             tracing::info!("IKENGA_BOOTSTRAP_ADMIN captured for the T1 broker");
