@@ -51,8 +51,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn remote_addr(conn: &Option<ConnectInfo<SocketAddr>>) -> Option<String> {
-    conn.as_ref().map(|c| c.0.ip().to_string())
+fn remote_addr(conn: &Option<ConnectInfo<SocketAddr>>, headers: &HeaderMap) -> Option<String> {
+    crate::server::trusted_proxy::client_addr_from_conn(conn, headers)
 }
 
 fn user_agent(headers: &HeaderMap) -> Option<String> {
@@ -135,7 +135,7 @@ pub async fn login(
     let attempt = LoginAttempt {
         username: body.username,
         password: password.clone(),
-        remote_addr: remote_addr(&conn),
+        remote_addr: remote_addr(&conn, &headers),
         user_agent: user_agent(&headers),
     };
     let account = match state.verifier.login(&state.pool, attempt).await {
@@ -183,7 +183,7 @@ pub async fn logout(
             &mut tx,
             AuthEvent::new(AuthEventKind::Logout)
                 .principal(ctx.principal.id)
-                .remote_addr(remote_addr(&conn))
+                .remote_addr(remote_addr(&conn, &headers))
                 .user_agent(user_agent(&headers)),
         )
         .await?;
@@ -229,7 +229,7 @@ pub async fn change_password(
     Json(body): Json<PasswordBody>,
 ) -> Response {
     let id = ctx.principal.id;
-    let addr = remote_addr(&conn);
+    let addr = remote_addr(&conn, &headers);
     let current = Zeroizing::new(body.current);
     let new = Zeroizing::new(body.new);
 
