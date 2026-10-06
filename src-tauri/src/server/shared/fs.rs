@@ -1,6 +1,7 @@
 //! The `fs_kind` / `fs_mime` / `fs_search` / `fs_rename` bodies, shared by
 //! the desktop commands (`commands::fs`) and the daemon's `/api/rpc` arms
-//! (WP-19 slice 5a).
+//! (WP-19 slice 5a). [`exists`] is the daemon's copy of the desktop
+//! `fs_exists` contract (the desktop command keeps its own body).
 //!
 //! Each takes the path resolver as an argument instead of calling
 //! `resolve_allowlisted` itself: the desktop passes exactly that (so its
@@ -147,6 +148,21 @@ pub async fn kind(resolve: Resolve<'_>, path: &str) -> &'static str {
         Ok(_) => "missing",
         Err(_) => "missing",
     }
+}
+
+/// The desktop `fs_exists` contract: `true` only for a regular file the
+/// resolver accepts. A refused path is `false` whether or not it exists, so
+/// the answer outside the allowlist (or inside the daemon's own state) is a
+/// constant — never an existence oracle — and a caller probing candidate
+/// paths (the markdown path linkifier) gets an answer, not a rejection.
+pub async fn exists(resolve: Resolve<'_>, path: &str) -> bool {
+    let Ok(resolved) = resolve(path) else {
+        return false;
+    };
+    tokio::fs::metadata(&resolved)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
 }
 
 /// Extension-based MIME; the path must be allowlisted but need not exist.

@@ -1,5 +1,6 @@
 //! `/api/rpc` bodies for WP-19 slice 5a: the rest of the fs family that can
-//! be served honestly (`fs_kind`, `fs_mime`, `fs_search`, `fs_rename`) and
+//! be served honestly (`fs_kind`, `fs_mime`, `fs_search`, `fs_rename`, and
+//! since the 2026-10-06 gap audit `fs_exists`) and
 //! the actions / keybindings file layer with its project-trust record
 //! (`actions_read_files`, `actions_write`, `keybindings_write`,
 //! `actions_trust_status`, `actions_trust_grant`, `actions_trust_revoke`) —
@@ -137,6 +138,24 @@ pub(super) async fn fs_kind(state: &AppState, args: &Value) -> RpcResponse {
     }
     .await;
     respond("fs_kind", r)
+}
+
+/// The desktop's `fs_exists`: `true` for an allowlisted regular file, and
+/// `false` — not an error — for a refused path, exactly as the desktop
+/// command folds `resolve_allowlisted` failures (gap audit 2026-10-06 rank
+/// 17: the rejection surfaced as an unhandled promise rejection in the
+/// markdown path linkifier). Refused is `false` whether or not the path
+/// exists, so it answers nothing about the world outside the allowlist.
+/// Only a daemon with no allowlist at all errors, naming the flag, as
+/// `fs_kind` does.
+pub(super) async fn fs_exists(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        state.path_guard.ready()?;
+        Ok(shared_fs::exists(&resolver(state), &path).await)
+    }
+    .await;
+    respond("fs_exists", r)
 }
 
 pub(super) fn fs_mime(state: &AppState, args: &Value) -> RpcResponse {
@@ -683,6 +702,7 @@ mod tests {
         let r = bare();
         for (cmd, args) in [
             ("fs_kind", json!({ "path": "/tmp" })),
+            ("fs_exists", json!({ "path": "/tmp/a.md" })),
             ("fs_mime", json!({ "path": "/tmp/a.md" })),
             (
                 "fs_search",
@@ -1006,6 +1026,57 @@ mod tests {
             assert_eq!(ok(r, "fs_kind", json!({ "path": dir })).await, "missing");
         }
         let e = err(r, "fs_kind", json!({})).await;
+        assert!(e.contains("`path` is required"), "{e}");
+    }
+
+    /// Gap audit 2026-10-06 rank 17: a refused path answered with an error,
+    /// which the markdown path linkifier surfaced as an unhandled rejection.
+    /// The desktop folds refusals into `false`; so does this — and it is
+    /// `false` for an outside path whether or not that path exists, so the
+    /// arm is no existence oracle beyond the allowlist.
+    #[tokio::test]
+    async fn fs_exists_is_false_not_an_error_for_refusals() {
+        let d = daemon();
+        let r = &d.router;
+        std::fs::write(d.allowed.join("a.txt"), b"a").unwrap();
+        std::fs::write(d.outside.join("secret.txt"), b"s").unwrap();
+
+        let file = s(&d.allowed.join("a.txt"));
+        assert_eq!(ok(r, "fs_exists", json!({ "path": file })).await, true);
+        let gone = s(&d.allowed.join("gone.txt"));
+        assert_eq!(ok(r, "fs_exists", json!({ "path": gone })).await, false);
+        let deep = s(&d.allowed.join("no/such/chain.txt"));
+        assert_eq!(ok(r, "fs_exists", json!({ "path": deep })).await, false);
+        // The desktop contract is "a regular file", not "anything".
+        assert_eq!(
+            ok(r, "fs_exists", json!({ "path": s(&d.allowed) })).await,
+            false
+        );
+        // Shape parity with the shared core.
+        let direct = shared_fs::exists(&|p: &str| d.guard.resolve(p), &file).await;
+        assert_eq!(ok(r, "fs_exists", json!({ "path": file })).await, direct);
+
+        // Outside the allowlist: an existing and a missing path read the same.
+        for path in [
+            s(&d.outside.join("secret.txt")),
+            s(&d.outside.join("absent.txt")),
+            format!("{}/../outside/secret.txt", s(&d.allowed)),
+            "/etc/passwd".to_string(),
+            "/definitely/not/here".to_string(),
+        ] {
+            assert_eq!(
+                ok(r, "fs_exists", json!({ "path": path })).await,
+                false,
+                "{path}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            symlink(&d.outside, &d.allowed.join("escape"));
+            let via = s(&d.allowed.join("escape/secret.txt"));
+            assert_eq!(ok(r, "fs_exists", json!({ "path": via })).await, false);
+        }
+        let e = err(r, "fs_exists", json!({})).await;
         assert!(e.contains("`path` is required"), "{e}");
     }
 
