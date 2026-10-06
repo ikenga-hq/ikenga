@@ -44,9 +44,22 @@ interface EditingState {
 	remove: (key: string) => void;
 	/** Mark sessions discarded and drop any stash they hold. */
 	discard: (keys: string[]) => void;
-	/** Take (and clear) the stashed draft for this file: this pane's first,
-	 *  else any unmounted stash for the same path (the tab moved panes). */
-	takeStash: (path: string, paneId: string | null) => StashedDraft | null;
+	/**
+	 * Claim the stashed draft for this file for the editor mounting as `key`:
+	 * this pane's stash first, else any unmounted stash for the same path (the
+	 * tab moved panes). The stash moves onto `key`'s session, marked mounted,
+	 * and stays there until the editor has put the draft back in its buffer —
+	 * so while the file is still loading, the close guard, the reload prompt
+	 * and an unmount all still see it.
+	 */
+	claimStash: (key: string, path: string, paneId: string | null) => StashedDraft | null;
+	/**
+	 * A save that finished after its editor unmounted wrote `toBase` over
+	 * `fromBase`. Move the stashed draft onto what is now on disk — or drop
+	 * the stash when the draft is exactly what was written — so the remounted
+	 * editor does not show its own write as a conflict.
+	 */
+	rebaseStash: (key: string, fromBase: string, toBase: string, meta: StashedDraft['meta']) => void;
 }
 
 export function sessionKey(path: string, paneId: string | null | undefined): string {
@@ -91,23 +104,45 @@ export const useEditingStore = create<EditingState>((set, get) => ({
 			}
 			return { sessions };
 		}),
-	takeStash: (path, paneId) => {
+	claimStash: (key, path, paneId) => {
 		const { sessions } = get();
-		let key = sessionKey(path, paneId);
+		let from = key;
 		if (!sessions[key]?.stash) {
 			const other = Object.entries(sessions).find(
 				([, v]) => v.path === path && !v.mounted && v.stash !== undefined
 			);
 			if (!other) return null;
-			key = other[0];
+			from = other[0];
 		}
-		const stash = sessions[key].stash ?? null;
+		const stash = sessions[from]?.stash;
+		if (!stash) return null;
 		set((s) => {
-			const { [key]: _taken, ...rest } = s.sessions;
-			return { sessions: rest };
+			const next = { ...s.sessions };
+			if (from !== key) delete next[from];
+			next[key] = {
+				...(next[key] ?? { editing: false, dirty: false }),
+				path,
+				paneId,
+				mounted: true,
+				stash,
+			};
+			return { sessions: next };
 		});
 		return stash;
 	},
+	rebaseStash: (key, fromBase, toBase, meta) =>
+		set((s) => {
+			const cur = s.sessions[key];
+			// A remounted editor that already claimed the stash owns it now.
+			if (!cur || cur.mounted || !cur.stash || cur.stash.base !== fromBase) return s;
+			if (cur.stash.draft === toBase) {
+				const { [key]: _saved, ...rest } = s.sessions;
+				return { sessions: rest };
+			}
+			return {
+				sessions: { ...s.sessions, [key]: { ...cur, stash: { ...cur.stash, base: toBase, meta } } },
+			};
+		}),
 }));
 
 /** True while a mounted editor for `path` is in Edit — in this pane when a

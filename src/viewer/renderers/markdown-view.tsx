@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, Loader2 } from 'lucide-react';
+import { AlertCircle, Info, Loader2 } from 'lucide-react';
 import type { CodeEditorHandle } from '@ikenga/ui-lib';
 import { Markdown } from '@/components/markdown';
 import { fsRead } from '@/lib/tauri-cmd';
@@ -95,8 +95,7 @@ function EditableMarkdown({
 	col?: number;
 }) {
 	const doc = useTextDocument({ path, paneId });
-	const [formatting, setFormatting] = useState(false);
-	const [formatError, setFormatError] = useState<string | null>(null);
+	const [formatNote, setFormatNote] = useState<{ error: boolean; text: string } | null>(null);
 	const editorRef = useRef<CodeEditorHandle>(null);
 	const previewRef = useRef<HTMLDivElement>(null);
 	const cwd = cwdOf(path);
@@ -115,18 +114,28 @@ function EditableMarkdown({
 	);
 	const onPrefix = useCallback((p: string) => withView((v) => toggleLinePrefix(v, p)), [withView]);
 	const onLink = useCallback(() => withView((v) => insertLink(v)), [withView]);
-	const { draft, setDraft } = doc;
+	// Format runs as a buffer operation (use-text-document "Ordering"): queued
+	// behind a save or reload, and its result is applied only to the exact
+	// text it formatted. A reload or typing meanwhile drops it — applying it
+	// would put the old text back over the new.
+	const { transform } = doc;
 	const onFormatDoc = useCallback(async () => {
-		setFormatting(true);
-		setFormatError(null);
+		setFormatNote(null);
 		try {
-			setDraft(await formatMarkdown(draft));
+			const result = await transform(formatMarkdown);
+			if (result === 'stale') {
+				setFormatNote({
+					error: false,
+					text: 'Format not applied: the text changed while it was being formatted. Run it again.',
+				});
+			}
 		} catch (err) {
-			setFormatError(`Format failed: ${err instanceof Error ? err.message : String(err)}`);
-		} finally {
-			setFormatting(false);
+			setFormatNote({
+				error: true,
+				text: `Format failed: ${err instanceof Error ? err.message : String(err)}`,
+			});
 		}
-	}, [draft, setDraft]);
+	}, [transform]);
 
 	const getView = useCallback(() => editorRef.current?.view() ?? null, []);
 	const { onPreviewScroll } = useScrollSync({
@@ -163,7 +172,8 @@ function EditableMarkdown({
 			col={col}
 			toolbarExtras={
 				<MarkdownFormatControls
-					formatting={formatting}
+					formatting={doc.busy === 'transform'}
+					formatDisabled={doc.busy !== null || doc.blocked !== null}
 					onFormatDoc={() => void onFormatDoc()}
 					onWrap={onWrap}
 					onPrefix={onPrefix}
@@ -171,10 +181,19 @@ function EditableMarkdown({
 				/>
 			}
 			banner={
-				formatError ? (
+				formatNote?.error ? (
 					<div className="flex items-start gap-2 border-b border-destructive/40 bg-destructive/10 px-4 py-1.5 text-[11px] text-destructive">
 						<AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
-						<span className="break-all">{formatError}</span>
+						<span className="break-all">{formatNote.text}</span>
+					</div>
+				) : formatNote && doc.mode === 'edit' ? (
+					<div
+						role="status"
+						data-state="markdown-format-stale"
+						className="flex items-center gap-2 border-b border-border bg-muted/30 px-4 py-1 text-[11px] text-muted-foreground"
+					>
+						<Info className="h-3 w-3 shrink-0" />
+						<span>{formatNote.text}</span>
 					</div>
 				) : null
 			}

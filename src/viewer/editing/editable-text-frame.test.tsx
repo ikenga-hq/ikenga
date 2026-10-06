@@ -6,7 +6,12 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { anyDirtySession, useEditingStore } from '@/lib/editing/editing-store';
+import {
+	anyDirtySession,
+	dirtySessionKeys,
+	sessionKey,
+	useEditingStore,
+} from '@/lib/editing/editing-store';
 import { isMacPlatform } from '@/lib/keymap/platform';
 import { EditableTextFrame } from './editable-text-frame';
 import { MAX_EDITABLE_BYTES } from './text-document';
@@ -14,20 +19,47 @@ import { MAX_EDITABLE_BYTES } from './text-document';
 const h = vi.hoisted(() => ({
 	disk: new Map<string, Uint8Array>(),
 	missing: new Set<string>(),
-	watchCb: null as null | ((change: { kind: string; path: string }) => void),
+	watchCb: null as null | ((change: { kind: string; path: string }) => unknown),
+	// Gates for deterministic interleavings: while `holdReads` / `holdWrites`
+	// is set, each call waits in `heldReads` / `heldWrites` until the test
+	// releases it. A read sees the disk as it is when released.
+	holdReads: false,
+	holdWrites: false,
+	heldReads: [] as Array<() => void>,
+	heldWrites: [] as Array<() => void>,
+	// File reads and writes in progress at once, and the most seen.
+	inflight: 0,
+	maxInflight: 0,
 }));
+
+function track() {
+	h.inflight++;
+	h.maxInflight = Math.max(h.maxInflight, h.inflight);
+}
 
 vi.mock('@/lib/tauri-cmd', () => ({
 	fsRead: vi.fn(async (path: string) => {
-		if (h.missing.has(path) || !h.disk.has(path)) throw new Error(`not found: ${path}`);
-		return { bytes: Array.from(h.disk.get(path)!), mime: 'text/plain' };
+		track();
+		try {
+			if (h.holdReads) await new Promise<void>((r) => h.heldReads.push(r));
+			if (h.missing.has(path) || !h.disk.has(path)) throw new Error(`not found: ${path}`);
+			return { bytes: Array.from(h.disk.get(path)!), mime: 'text/plain' };
+		} finally {
+			h.inflight--;
+		}
 	}),
 	fsWriteText: vi.fn(async (path: string, text: string) => {
-		h.disk.set(path, new TextEncoder().encode(text));
-		h.missing.delete(path);
+		track();
+		try {
+			if (h.holdWrites) await new Promise<void>((r) => h.heldWrites.push(r));
+			h.disk.set(path, new TextEncoder().encode(text));
+			h.missing.delete(path);
+		} finally {
+			h.inflight--;
+		}
 	}),
 	fsWatch: vi.fn(async () => 'w1'),
-	fsListenWatch: vi.fn(async (_id: string, cb: (c: { kind: string; path: string }) => void) => {
+	fsListenWatch: vi.fn(async (_id: string, cb: (c: { kind: string; path: string }) => unknown) => {
 		h.watchCb = cb;
 		return () => {
 			h.watchCb = null;
@@ -100,10 +132,36 @@ async function fireWatchEvent(path: string) {
 	await act(async () => h.watchCb?.({ kind: 'modify', path }));
 }
 
+/** Let every queued promise run (one macrotask turn). */
+async function flush() {
+	await act(async () => {
+		await new Promise((r) => setTimeout(r, 0));
+	});
+}
+
+/** Release the oldest held read (or write) and let what follows run. */
+async function release(kind: 'read' | 'write') {
+	const held = kind === 'read' ? h.heldReads : h.heldWrites;
+	const next = held.shift();
+	if (!next) throw new Error(`no ${kind} is held`);
+	next();
+	await flush();
+}
+
+const button = (name: string | RegExp) => screen.getByRole('button', { name }) as HTMLButtonElement;
+const stashedDraftFor = (path: string) =>
+	Object.values(useEditingStore.getState().sessions).find((v) => v.path === path)?.stash?.draft;
+
 beforeEach(() => {
 	h.disk.clear();
 	h.missing.clear();
 	h.watchCb = null;
+	h.holdReads = false;
+	h.holdWrites = false;
+	h.heldReads.length = 0;
+	h.heldWrites.length = 0;
+	h.inflight = 0;
+	h.maxInflight = 0;
 	vi.clearAllMocks();
 	useEditingStore.setState({ sessions: {} });
 });
@@ -148,7 +206,7 @@ describe('EditableTextFrame — edit, save, cancel', () => {
 		const ed = await startEditing();
 		type(ed, 'changed\n');
 		fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-		expect(screen.getByTestId('view').textContent).toBe('orig\n');
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('orig\n'));
 		expect(fsWriteText).not.toHaveBeenCalled();
 		const again = await startEditing();
 		expect(again.value).toBe('orig\n');
@@ -632,7 +690,11 @@ describe('EditableTextFrame — bytes that turn uneditable while open', () => {
 		await expectNoSave('/w/b.txt', BIN);
 		// Discarding leaves a read-only view of the binary file.
 		fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-		expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(true);
+		await waitFor(() =>
+			expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(
+				true
+			)
+		);
 		await expectNoSave('/w/b.txt', BIN);
 	});
 
@@ -696,5 +758,301 @@ describe('EditableTextFrame — a watcher reload keeps the new line endings and 
 		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
 		expect(diskText('/w/a.txt')).toBe('a\r\nb\r\nc\r\n');
+	});
+});
+
+// Regression (round-3 review, blocking 1): a stashed draft was only taken out
+// of the store once the remount's read returned, so an unmount while the read
+// was still in flight saw a clean, empty buffer and removed the session —
+// stash included. The draft is now claimed when the load starts and goes back
+// into the store if the editor unmounts before the read returns.
+describe('EditableTextFrame — a stashed draft and an unmount during the load', () => {
+	async function stashDraft(path: string, draft: string) {
+		const first = mount(path);
+		const ed = await startEditing();
+		type(ed, draft);
+		first.unmount();
+		expect(stashedDraftFor(path)).toBe(draft);
+	}
+
+	it('keeps the draft when the editor unmounts before the file has loaded', async () => {
+		h.disk.set('/w/notes.txt', enc('base\n'));
+		await stashDraft('/w/notes.txt', 'MY EDITS\n');
+		h.holdReads = true;
+		const second = mount('/w/notes.txt');
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		// Still loading: the claimed draft counts as unsaved for the close guard
+		// and the reload prompt.
+		expect(dirtySessionKeys([{ path: '/w/notes.txt', paneId: 'p1' }])).toHaveLength(1);
+		expect(anyDirtySession()).toBe(true);
+		second.unmount();
+		expect(stashedDraftFor('/w/notes.txt')).toBe('MY EDITS\n');
+		expect(anyDirtySession()).toBe(true);
+		// The read returning late changes nothing.
+		h.holdReads = false;
+		await release('read');
+		expect(stashedDraftFor('/w/notes.txt')).toBe('MY EDITS\n');
+		// The next mount restores it in Edit.
+		mount('/w/notes.txt');
+		const back = (await screen.findByLabelText('File source')) as HTMLTextAreaElement;
+		expect(back.value).toBe('MY EDITS\n');
+		expect(screen.getByLabelText('Unsaved changes')).toBeTruthy();
+	});
+
+	it('drops the draft when the user discarded it (close guard) during the load', async () => {
+		h.disk.set('/w/notes.txt', enc('base\n'));
+		await stashDraft('/w/notes.txt', 'MY EDITS\n');
+		h.holdReads = true;
+		const second = mount('/w/notes.txt');
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		act(() => useEditingStore.getState().discard([sessionKey('/w/notes.txt', 'p1')]));
+		second.unmount();
+		expect(anyDirtySession()).toBe(false);
+		expect(useEditingStore.getState().sessions).toEqual({});
+	});
+
+	it('a remount that loads normally takes the draft back exactly once', async () => {
+		h.disk.set('/w/notes.txt', enc('base\n'));
+		await stashDraft('/w/notes.txt', 'MY EDITS\n');
+		mount('/w/notes.txt');
+		const back = (await screen.findByLabelText('File source')) as HTMLTextAreaElement;
+		expect(back.value).toBe('MY EDITS\n');
+		const session = useEditingStore.getState().sessions[sessionKey('/w/notes.txt', 'p1')];
+		expect(session).toMatchObject({ mounted: true, dirty: true });
+		expect(session?.stash).toBeUndefined();
+	});
+});
+
+// Regression (round-3 review, blocking 2): Save pressed while Load theirs was
+// reading the file compared the save's re-read with the base Load theirs had
+// just replaced, found it "unchanged" and wrote the discarded draft over the
+// external version. Buffer operations now run one at a time.
+describe('EditableTextFrame — Save during Load theirs', () => {
+	it('waits for Load theirs and then finds nothing to save; the file stays theirs', async () => {
+		h.disk.set('/w/a.ts', enc('base\n'));
+		mount('/w/a.ts');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/a.ts', enc('theirs\n'));
+		fireEvent.click(button('Save'));
+		await screen.findByText(/changed on disk since you opened it/);
+
+		h.holdReads = true;
+		fireEvent.click(button(/Load theirs/));
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		// Busy: nothing else that changes the buffer can start.
+		expect(button('Save').disabled).toBe(true);
+		expect(button('Cancel').disabled).toBe(true);
+		expect(button(/Keep mine/).disabled).toBe(true);
+		expect(button(/Load theirs/).disabled).toBe(true);
+		expect(ed.readOnly).toBe(true);
+		expect(screen.getByText(/Reading the file/)).toBeTruthy();
+		// ⌘S is not a button: it is queued, and must not start meanwhile.
+		act(() => ed.focus());
+		fireEvent.keyDown(ed, { key: 's', ...MOD });
+		await flush();
+		expect(h.heldReads).toHaveLength(1);
+		expect(fsWriteText).not.toHaveBeenCalled();
+
+		h.holdReads = false;
+		await release('read');
+		await waitFor(() => expect(ed.value).toBe('theirs\n'));
+		await flush();
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(diskText('/w/a.ts')).toBe('theirs\n');
+		expect(screen.queryByLabelText('Unsaved changes')).toBeNull();
+		expect(button('Save').disabled).toBe(true);
+		expect(ed.readOnly).toBe(false);
+	});
+});
+
+// Regression (round-3 review, blocking 4): Cancel — and the conflict banner's
+// Discard, which is the same action — went back to the base the editor had
+// loaded, although an outside write had replaced the file, so View showed
+// text that was no longer on disk. Discard now re-reads the file strictly.
+describe('EditableTextFrame — Cancel / Discard reload the file', () => {
+	it('after an outside write, Cancel shows the file as it is on disk now', async () => {
+		h.disk.set('/w/u.txt', enc('ext I\n'));
+		mount('/w/u.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		expect(button('Cancel').title).toBe('Discard your changes and reload the file');
+		type(ed, 'mine J\n');
+		h.disk.set('/w/u.txt', enc('ext J\n'));
+		await fireWatchEvent('/w/u.txt');
+		await screen.findByText(/changed on disk since you opened it/);
+		fireEvent.click(button('Cancel'));
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('ext J\n'));
+		expect(screen.queryByText(/changed on disk/)).toBeNull();
+		// Editing again starts from the file, and saves with no conflict.
+		const again = await startEditing();
+		expect(again.value).toBe('ext J\n');
+		type(again, 'ext J\nmore\n');
+		fireEvent.click(button('Save'));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/u.txt')).toBe('ext J\nmore\n');
+	});
+
+	it('reloads a file that changed with no watcher event too', async () => {
+		h.disk.set('/w/u.txt', enc('ext I\n'));
+		mount('/w/u.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/u.txt', enc('ext K\n'));
+		fireEvent.click(button('Cancel'));
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('ext K\n'));
+		expect(fsWriteText).not.toHaveBeenCalled();
+	});
+
+	it("Discard on the 'moved or deleted' choice says the file can't be read", async () => {
+		h.disk.set('/w/gone.txt', enc('base\n'));
+		mount('/w/gone.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.missing.add('/w/gone.txt');
+		fireEvent.click(button('Save'));
+		await screen.findByText(/moved or deleted/);
+		fireEvent.click(button(/Discard my changes/));
+		await screen.findByText(/Couldn't read this file/);
+		expect(screen.queryByTestId('view')).toBeNull();
+		expect(fsWriteText).not.toHaveBeenCalled();
+	});
+
+	it("Discard on the 'moved or deleted' choice shows the file when it is back", async () => {
+		h.disk.set('/w/gone.txt', enc('base\n'));
+		mount('/w/gone.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.missing.add('/w/gone.txt');
+		fireEvent.click(button('Save'));
+		await screen.findByText(/moved or deleted/);
+		h.missing.delete('/w/gone.txt');
+		h.disk.set('/w/gone.txt', enc('restored by git\n'));
+		fireEvent.click(button(/Discard my changes/));
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('restored by git\n'));
+		expect(fsWriteText).not.toHaveBeenCalled();
+	});
+
+	it('Cancel when the file is no longer UTF-8 shows it read-only, never as editable text', async () => {
+		const LATIN1 = new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a]);
+		h.disk.set('/w/c.txt', enc('café\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/c.txt', LATIN1);
+		fireEvent.click(button('Cancel'));
+		await waitFor(() => expect(button('Edit').disabled).toBe(true));
+		expect(screen.getByText(/not valid UTF-8/)).toBeTruthy();
+		expect(screen.getByTestId('view').textContent).toBe('caf�\n');
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(Array.from(h.disk.get('/w/c.txt') ?? [])).toEqual(Array.from(LATIN1));
+	});
+});
+
+describe('EditableTextFrame — buffer operations run one at a time', () => {
+	it('a change event and a second ⌘S during a save wait for it; one file op at a time', async () => {
+		h.disk.set('/w/s.txt', enc('base\n'));
+		mount('/w/s.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		type(ed, 'mine\n');
+		h.maxInflight = 0;
+		h.holdReads = true;
+		h.holdWrites = true;
+
+		fireEvent.click(button('Save'));
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		expect(button('Save').disabled).toBe(true);
+		expect(button('Cancel').disabled).toBe(true);
+		expect(button('Done').disabled).toBe(true);
+		// Meanwhile: the watcher fires (our write is about to land) and ⌘S again.
+		act(() => {
+			void h.watchCb?.({ kind: 'modify', path: '/w/s.txt' });
+		});
+		act(() => ed.focus());
+		fireEvent.keyDown(ed, { key: 's', ...MOD });
+		await flush();
+		expect(h.heldReads).toHaveLength(1);
+
+		await release('read'); // the save's re-read → its write
+		await waitFor(() => expect(h.heldWrites).toHaveLength(1));
+		expect(h.heldReads).toHaveLength(0);
+
+		await release('write'); // → the watcher's re-read
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		expect(h.heldWrites).toHaveLength(0);
+
+		h.holdReads = false;
+		h.holdWrites = false;
+		await release('read'); // → the queued ⌘S: nothing left to save
+		await waitFor(() => expect(button('Cancel').disabled).toBe(false));
+		expect(h.maxInflight).toBe(1);
+		expect(fsWriteText).toHaveBeenCalledTimes(1);
+		expect(diskText('/w/s.txt')).toBe('mine\n');
+		// The watcher's re-read saw our own write: no conflict, nothing dirty.
+		expect(screen.queryByText(/changed on disk/)).toBeNull();
+		expect(screen.queryByLabelText('Unsaved changes')).toBeNull();
+	});
+
+	it('Keep mine overwrites only the version it was shown; a newer one is a new conflict', async () => {
+		h.disk.set('/w/k.txt', enc('base\n'));
+		mount('/w/k.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/k.txt', enc('theirs 1\n'));
+		fireEvent.click(button('Save'));
+		await screen.findByText(/changed on disk since you opened it/);
+		// Changed again, with no watcher event, before the user picks.
+		h.disk.set('/w/k.txt', enc('theirs 2\n'));
+		fireEvent.click(button(/Keep mine/));
+		await flush();
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(diskText('/w/k.txt')).toBe('theirs 2\n');
+		// The banner now shows the newer version; choosing again overwrites it.
+		fireEvent.click(button('Show diff'));
+		await waitFor(() =>
+			expect(document.querySelector('[data-diff="theirs"]')?.textContent).toContain('theirs 2')
+		);
+		fireEvent.click(button(/Keep mine/));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/k.txt')).toBe('mine\n');
+	});
+
+	it("'Save anyway (recreate it)' does not overwrite a file that came back changed", async () => {
+		h.disk.set('/w/r.txt', enc('base\n'));
+		mount('/w/r.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.missing.add('/w/r.txt');
+		fireEvent.click(button('Save'));
+		await screen.findByText(/moved or deleted/);
+		h.missing.delete('/w/r.txt');
+		h.disk.set('/w/r.txt', enc('restored by git\n'));
+		fireEvent.click(button(/Save anyway/));
+		await screen.findByText(/changed on disk since you opened it/);
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(diskText('/w/r.txt')).toBe('restored by git\n');
+	});
+
+	it('a save still in flight when the editor unmounts is reconciled with the stash', async () => {
+		h.disk.set('/w/q.txt', enc('base\n'));
+		const first = mount('/w/q.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.holdReads = true;
+		fireEvent.click(button('Save'));
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		first.unmount();
+		expect(stashedDraftFor('/w/q.txt')).toBe('mine\n');
+		h.holdReads = false;
+		await release('read');
+		await waitFor(() => expect(diskText('/w/q.txt')).toBe('mine\n'));
+		// The draft is exactly what was written: nothing is left unsaved…
+		await waitFor(() => expect(anyDirtySession()).toBe(false));
+		// …so the remount opens the file cleanly, not as a conflict with our own write.
+		mount('/w/q.txt');
+		await ready();
+		expect(screen.getByTestId('view').textContent).toBe('mine\n');
+		expect(screen.queryByText(/changed on disk/)).toBeNull();
 	});
 });

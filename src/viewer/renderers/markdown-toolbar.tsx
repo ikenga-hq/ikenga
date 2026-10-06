@@ -18,6 +18,8 @@ import {
 
 interface MarkdownFormatControlsProps {
 	formatting: boolean;
+	/** Another buffer operation is running (or nothing is editable). */
+	formatDisabled?: boolean;
 	onFormatDoc: () => void;
 	onWrap: (before: string, after?: string) => void;
 	onPrefix: (prefix: string) => void;
@@ -26,6 +28,7 @@ interface MarkdownFormatControlsProps {
 
 export function MarkdownFormatControls({
 	formatting,
+	formatDisabled,
 	onFormatDoc,
 	onWrap,
 	onPrefix,
@@ -56,7 +59,11 @@ export function MarkdownFormatControls({
 				<LinkIcon className="h-3.5 w-3.5" />
 			</IconButton>
 			<Divider />
-			<IconButton title="Format document" onClick={onFormatDoc} disabled={formatting}>
+			<IconButton
+				title="Format document"
+				onClick={onFormatDoc}
+				disabled={formatting || formatDisabled}
+			>
 				{formatting ? (
 					<Loader2 className="h-3.5 w-3.5 animate-spin" />
 				) : (

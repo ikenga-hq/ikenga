@@ -2,7 +2,7 @@
 // (plans/file-editing): the read-only render is unchanged, and editing still
 // has the split live preview, the formatting controls and save.
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useEditingStore } from '@/lib/editing/editing-store';
 import { MarkdownView } from './markdown-view';
@@ -10,6 +10,7 @@ import { MarkdownView } from './markdown-view';
 const h = vi.hoisted(() => ({
 	disk: new Map<string, string>(),
 	fakeView: { hasFocus: true, state: { doc: { lines: 1 } } },
+	watchCb: null as null | ((change: { kind: string; path: string }) => unknown),
 }));
 
 vi.mock('@/lib/tauri-cmd', () => ({
@@ -24,7 +25,12 @@ vi.mock('@/lib/tauri-cmd', () => ({
 		h.disk.set(path, text);
 	}),
 	fsWatch: vi.fn(async () => 'w1'),
-	fsListenWatch: vi.fn(async () => () => {}),
+	fsListenWatch: vi.fn(async (_id: string, cb: (c: { kind: string; path: string }) => unknown) => {
+		h.watchCb = cb;
+		return () => {
+			h.watchCb = null;
+		};
+	}),
 	fsUnwatch: vi.fn(async () => {}),
 }));
 
@@ -72,6 +78,7 @@ const fmt = await import('./markdown-format');
 
 beforeEach(() => {
 	h.disk.clear();
+	h.watchCb = null;
 	vi.clearAllMocks();
 	useEditingStore.setState({ sessions: {} });
 });
@@ -116,5 +123,94 @@ describe('MarkdownView', () => {
 		await waitFor(() => expect(tauri.fsWriteText).toHaveBeenCalledWith('/d/a.md', 'two\n'));
 		// Still in Edit after saving (the editor is not remounted).
 		expect(screen.getByLabelText('Markdown source')).toBeTruthy();
+	});
+});
+
+// Regression (round-3 review, blocking 3): Format document awaited the
+// formatter and then set the draft unconditionally. A clean buffer reloaded by
+// the watcher meanwhile got the old text, formatted, put back over it — and
+// since the base was now the new file, the next Save wrote it with no conflict,
+// erasing the outside change. Format now runs as a buffer operation: the
+// watcher's reload waits for it, and its result applies only to the text it
+// formatted.
+describe('MarkdownView — Format document and the file changing on disk', () => {
+	const flush = () =>
+		act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
+
+	function holdFormat() {
+		let finish: (out: string) => void = () => {};
+		vi.mocked(fmt.formatMarkdown).mockImplementationOnce(
+			() =>
+				new Promise<string>((r) => {
+					finish = r;
+				})
+		);
+		return (out: string) => finish(out);
+	}
+
+	async function openForEdit(path: string, text: string) {
+		h.disk.set(path, text);
+		render(<MarkdownView path={path} editable />);
+		fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		return screen.getByLabelText('Markdown source') as HTMLTextAreaElement;
+	}
+
+	it('an outside write during Format is never overwritten by the next Save', async () => {
+		const src = await openForEdit('/d/n.md', '# Notes\n\nold line   \n');
+		const finish = holdFormat();
+		fireEvent.click(screen.getByRole('button', { name: 'Format document' }));
+		await waitFor(() => expect(fmt.formatMarkdown).toHaveBeenCalledTimes(1));
+		expect(
+			(screen.getByRole('button', { name: 'Format document' }) as HTMLButtonElement).disabled
+		).toBe(true);
+		expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(
+			true
+		);
+		// An agent appends a line while the formatter runs.
+		h.disk.set('/d/n.md', '# Notes\n\nold line   \nAGENT ADDED THIS\n');
+		const reads = vi.mocked(tauri.fsRead).mock.calls.length;
+		act(() => {
+			void h.watchCb?.({ kind: 'modify', path: '/d/n.md' });
+		});
+		await flush();
+		// The reload waits its turn: no read while the format is running.
+		expect(vi.mocked(tauri.fsRead).mock.calls.length).toBe(reads);
+
+		await act(async () => finish('# Notes\n\nold line\n'));
+		await flush();
+		// The formatted text is now unsaved edits on the old version, and the
+		// reload that followed sees the file moved on: the conflict choice.
+		await screen.findByText(/changed on disk since you opened it/);
+		expect(src.value).toBe('# Notes\n\nold line\n');
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await flush();
+		await screen.findByText(/changed on disk since you opened it/);
+		expect(tauri.fsWriteText).not.toHaveBeenCalled();
+		expect(h.disk.get('/d/n.md')).toBe('# Notes\n\nold line   \nAGENT ADDED THIS\n');
+	});
+
+	it('text typed while Format runs is kept, and the stale result is dropped with a note', async () => {
+		const src = await openForEdit('/d/t.md', 'one   \n');
+		const finish = holdFormat();
+		fireEvent.click(screen.getByRole('button', { name: 'Format document' }));
+		await waitFor(() => expect(fmt.formatMarkdown).toHaveBeenCalledTimes(1));
+		fireEvent.change(src, { target: { value: 'one   \ntwo\n' } });
+		await act(async () => finish('one\n'));
+		await flush();
+		expect(src.value).toBe('one   \ntwo\n');
+		expect(screen.getByText(/Format not applied/)).toBeTruthy();
+		expect(
+			(screen.getByRole('button', { name: 'Format document' }) as HTMLButtonElement).disabled
+		).toBe(false);
+	});
+
+	it('Format with nothing else going on still applies', async () => {
+		const src = await openForEdit('/d/f.md', 'one   \n');
+		fireEvent.click(screen.getByRole('button', { name: 'Format document' }));
+		await waitFor(() => expect(src.value).toBe('one\n'));
+		expect(screen.queryByText(/Format not applied/)).toBeNull();
 	});
 });

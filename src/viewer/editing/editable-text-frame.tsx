@@ -129,7 +129,9 @@ export function TextDocumentFrame({
 			ref={editorRef}
 			value={doc.draft}
 			onChange={doc.setDraft}
-			readOnly={doc.blocked !== null}
+			// Locked while Cancel or Load theirs reads the text it is about to
+			// put here: anything typed meanwhile would be overwritten.
+			readOnly={doc.blocked !== null || doc.busy === 'cancel' || doc.busy === 'load-theirs'}
 			language={lang}
 			ariaLabel={ariaLabel ?? 'File source'}
 		/>
@@ -147,11 +149,12 @@ export function TextDocumentFrame({
 				mode={doc.mode}
 				dirty={doc.dirty}
 				saveState={doc.saveState}
+				busy={doc.busy}
 				blocked={doc.blocked}
 				unvalidated={validationKindFor(path) === 'unvalidated'}
 				onEdit={doc.startEdit}
 				onDone={doc.finishEdit}
-				onCancel={doc.cancel}
+				onCancel={() => void doc.cancel()}
 				onSave={() => void doc.save()}
 				extras={toolbarExtras}
 			/>
@@ -159,10 +162,10 @@ export function TextDocumentFrame({
 				<ConflictBanner
 					conflict={doc.conflict}
 					mine={doc.draft}
-					busy={doc.saveState.kind === 'saving'}
+					busy={doc.busy !== null}
 					onKeepMine={() => void doc.keepMine()}
 					onLoadTheirs={() => void doc.loadTheirs()}
-					onDiscard={doc.cancel}
+					onDiscard={() => void doc.cancel()}
 				/>
 			)}
 			{editing && doc.blocked && (

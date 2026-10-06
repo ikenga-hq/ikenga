@@ -4,12 +4,14 @@
 
 import { Check, Loader2, Lock, Pencil, Save, Undo2 } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
-import type { SaveState } from './use-text-document';
+import type { DocOp, SaveState } from './use-text-document';
 
 interface EditorToolbarProps {
 	mode: 'view' | 'edit';
 	dirty: boolean;
 	saveState: SaveState;
+	/** A buffer operation is running or queued: Save, Cancel and Done wait. */
+	busy: DocOp | null;
 	/** Why Edit and Save are unavailable, or null. */
 	blocked: string | null;
 	/** A structured format saved without a parse check (JSON5). */
@@ -26,6 +28,7 @@ export function EditorToolbar({
 	mode,
 	dirty,
 	saveState,
+	busy,
 	blocked,
 	unvalidated,
 	onEdit,
@@ -36,7 +39,10 @@ export function EditorToolbar({
 }: EditorToolbarProps) {
 	const editing = mode === 'edit';
 	const saving = saveState.kind === 'saving';
-	const canSave = dirty && !saving && blocked === null;
+	const working = busy !== null;
+	const canSave = dirty && !working && blocked === null;
+	// Cancel and Load theirs read the file before anything changes; say so.
+	const reloading = busy === 'cancel' || busy === 'load-theirs';
 	return (
 		<div
 			data-state="editor-toolbar"
@@ -69,7 +75,7 @@ export function EditorToolbar({
 					<ToolbarButton
 						onClick={onDone}
 						label="Done"
-						disabled={dirty || saving}
+						disabled={dirty || working}
 						title={dirty ? 'Save or cancel your changes first' : 'Back to view'}
 					>
 						<Check className="h-3.5 w-3.5" />
@@ -85,6 +91,16 @@ export function EditorToolbar({
 						</span>
 					)}
 					<div className="ml-auto flex items-center gap-1">
+						{reloading && (
+							<span
+								role="status"
+								data-state="editor-reloading"
+								className="mr-1 inline-flex items-center gap-1 text-[11px] text-muted-foreground"
+							>
+								<Loader2 className="h-3 w-3 animate-spin" />
+								Reading the file…
+							</span>
+						)}
 						{dirty && (
 							<span
 								role="status"
@@ -96,7 +112,7 @@ export function EditorToolbar({
 						<ToolbarButton
 							onClick={onCancel}
 							label="Cancel"
-							disabled={saving}
+							disabled={working}
 							title="Discard your changes and reload the file"
 						>
 							<Undo2 className="h-3.5 w-3.5" />

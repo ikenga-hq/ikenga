@@ -13,10 +13,24 @@
 //   choice early for a dirty one. Our own write is recognised and ignored.
 // - Text only ever enters the buffer (or becomes the save base) through the
 //   strict `decodeForEdit` path — at load, and via `classifyReread` for every
-//   later read (watcher, save re-read, Load theirs). Bytes it refuses (not
-//   UTF-8, binary, too large) block editing and Save; they are never turned
-//   into lossy text that a save would write back over the file.
+//   later read (watcher, save re-read, Load theirs, Cancel). Bytes it refuses
+//   (not UTF-8, binary, too large) block editing and Save; they are never
+//   turned into lossy text that a save would write back over the file.
 // - Unsaved edits survive an unmount (tab switch) through the editing store.
+//
+// Ordering. Every operation that reads the file and then changes the buffer —
+// save (and Keep mine), Load theirs, Cancel/Discard, the watcher's reload and
+// a `transform` such as Markdown's Format document — runs through one queue,
+// one at a time, and `busy` names the one running so the UI can disable the
+// others. On top of that, each operation notes the buffer generation when it
+// starts (bumped whenever the base or draft is replaced by anything but
+// typing) and applies its result only if the generation, and this mounted
+// document, are still the ones it started from. Otherwise it drops the result
+// (or, for a save, writes nothing and raises the conflict). Without this, a
+// Save pressed during Load theirs wrote the discarded draft over the file, a
+// format finishing after a watcher reload put the old text back over the new
+// file, and so on — each async step applied a result computed against a base
+// that had since changed.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { type StashedDraft, sessionKey, useEditingStore } from '@/lib/editing/editing-store';
@@ -33,8 +47,9 @@ import type { ValidationResult, Validator } from './validate';
 
 export type SaveState = { kind: 'idle' } | { kind: 'saving' } | { kind: 'error'; message: string };
 
-/** `theirs` is always strictly decoded text, never a lossy decode; it is
- *  shown in the diff only — Load theirs re-reads the file. */
+/** `theirs` is always strictly decoded text, never a lossy decode. It is
+ *  shown in the diff, and Keep mine overwrites exactly that version — Load
+ *  theirs re-reads the file. */
 export type Conflict = { kind: 'changed'; theirs: string } | { kind: 'deleted' };
 
 export type LoadState =
@@ -43,6 +58,13 @@ export type LoadState =
 	| { kind: 'error'; message: string };
 
 export type ValidationError = Extract<ValidationResult, { ok: false }>;
+
+/** The buffer operations that run one at a time (see "Ordering" above). */
+export type DocOp = 'save' | 'load-theirs' | 'cancel' | 'reread' | 'transform';
+
+/** What became of a `transform`: applied, dropped because the buffer changed
+ *  while it ran, or not run (nothing editable). */
+export type TransformResult = 'applied' | 'stale' | 'skipped';
 
 export interface UseTextDocumentOptions {
 	path: string;
@@ -57,6 +79,7 @@ export interface TextDocument {
 	viewText: string;
 	base: string;
 	draft: string;
+	/** The user's edits (typing). Programmatic changes go through `transform`. */
 	setDraft: (next: string) => void;
 	dirty: boolean;
 	mode: 'view' | 'edit';
@@ -69,16 +92,24 @@ export interface TextDocument {
 	validation: ValidationError | null;
 	/** A short-lived note, e.g. "Reloaded — the file changed on disk." */
 	notice: string | null;
+	/** The buffer operation running (or still queued), or null. Save, Keep
+	 *  mine, Load theirs, Cancel and Format are disabled while it is set. */
+	busy: DocOp | null;
 	startEdit: () => void;
 	/** Leave Edit. Only valid with no unsaved changes. */
 	finishEdit: () => void;
-	/** Discard the draft (draft = base) and return to View. */
-	cancel: () => void;
+	/** Discard the draft and show the file as it is on disk now (re-read
+	 *  strictly), or say that it cannot be read. */
+	cancel: () => Promise<void>;
 	save: (opts?: { force?: boolean }) => Promise<void>;
 	/** Conflict: overwrite the file with the draft. */
 	keepMine: () => Promise<void>;
 	/** Conflict: replace the draft with the file on disk (re-read strictly). */
 	loadTheirs: () => Promise<void>;
+	/** Replace the draft with `fn(draft)` (Markdown's Format document). The
+	 *  result is dropped, not applied, if the buffer changed while `fn` ran —
+	 *  a reload, or the user typing. Errors from `fn` reject. */
+	transform: (fn: (text: string) => Promise<string>) => Promise<TransformResult>;
 	dismissValidation: () => void;
 }
 
@@ -108,6 +139,18 @@ const INITIAL: DocState = {
 	held: false,
 };
 
+/** Handed to each queued operation. */
+interface OpContext {
+	/** This mounted editor still shows the document the operation started on
+	 *  (not unmounted, not switched to another file). */
+	live: () => boolean;
+	/** …and its base and draft have not been replaced since the operation
+	 *  started. Only then may the operation apply its result. */
+	current: () => boolean;
+}
+
+const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
 export function useTextDocument({
 	path,
 	paneId = null,
@@ -120,58 +163,101 @@ export function useTextDocument({
 	const [conflict, setConflict] = useState<Conflict | null>(null);
 	const [validation, setValidation] = useState<ValidationError | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
+	const [busy, setBusy] = useState<DocOp | null>(null);
 
 	// Refs the async paths read, so they see the latest values without
-	// re-subscribing the watcher on every keystroke.
+	// re-subscribing the watcher on every keystroke. Each is written together
+	// with its state (setModeNow, raiseConflict, …), never by an effect after
+	// the render — an unmount in between would read a stale value.
 	const baseRef = useRef('');
 	const draftRef = useRef('');
 	const metaRef = useRef<DocumentMeta>(INITIAL.meta);
+	const modeRef = useRef<'view' | 'edit'>('view');
+	const conflictRef = useRef<Conflict | null>(null);
+	// The document loaded (ready); operations do nothing before that.
+	const loadedRef = useRef(false);
+	// Mirrors `doc.blocked` for the async paths (watcher, save, Load theirs).
+	const blockedRef = useRef<string | null>(null);
+	// A stashed draft claimed when the load started and not yet put back in
+	// the buffer. If the editor unmounts first, it goes back into the store.
+	const pendingStashRef = useRef<StashedDraft | null>(null);
 	// A draft stashed before this remount that cannot be applied to the file
 	// as it is now (too large, binary, not UTF-8). Held, never dropped: the
 	// session keeps reporting it as unsaved, and the next unmount stashes it
 	// again.
 	const heldStashRef = useRef<StashedDraft | null>(null);
-	// The load failed and a stashed draft was restored in its place: Cancel
-	// returns to that error instead of showing a file that is not there.
+	// The load failed and a stashed draft was restored in its place.
 	const loadErrorRef = useRef<string | null>(null);
-	const modeRef = useRef<'view' | 'edit'>('view');
-	// Mirrors `doc.blocked` for the async paths (watcher, save, Load theirs).
-	const blockedRef = useRef<string | null>(null);
-	const savingRef = useRef(false);
 	const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-	const dirty = doc.load.kind === 'ready' && draft !== doc.base;
+	// Ordering (see the header): `epoch` changes when this editor stops
+	// showing the document (unmount, another file); `gen` whenever the base or
+	// draft is replaced other than by typing. The queue runs operations one
+	// at a time.
+	const epochRef = useRef(0);
+	const genRef = useRef(0);
+	const queueRef = useRef<Promise<unknown>>(Promise.resolve());
+	const queuedOpsRef = useRef(0);
+	const rereadRef = useRef<Promise<unknown> | null>(null);
 
+	const dirty = doc.load.kind === 'ready' && draft !== doc.base;
+	const key = sessionKey(path, paneId);
+
+	/** The user typing. Does not bump the generation: a save may run while
+	 *  the user types (it saves what it read), and a transform checks the
+	 *  draft itself. */
 	const setDraft = useCallback((next: string) => {
 		draftRef.current = next;
 		setDraftState(next);
 	}, []);
 
-	const adoptBase = useCallback((text: string) => {
-		baseRef.current = text;
-		setDoc((d) => ({ ...d, base: text, viewText: text }));
+	/** Replace the draft programmatically (reload, Load theirs, Cancel, a
+	 *  restored stash, a transform). */
+	const replaceDraft = useCallback((next: string) => {
+		genRef.current++;
+		draftRef.current = next;
+		setDraftState(next);
 	}, []);
 
-	/** Take strictly decoded disk text (and its line ending / BOM) as the base. */
-	const adoptDisk = useCallback((text: string, meta: DocumentMeta) => {
-		metaRef.current = meta;
-		baseRef.current = text;
-		setDoc((d) => ({ ...d, base: text, viewText: text, meta }));
+	/** Take strictly decoded disk text (and its line ending / BOM) as the
+	 *  base — and as the draft too, when `withDraft`. */
+	const adoptDisk = useCallback(
+		(text: string, meta: DocumentMeta, withDraft: boolean) => {
+			genRef.current++;
+			metaRef.current = meta;
+			baseRef.current = text;
+			if (withDraft) replaceDraft(text);
+			setDoc((d) => ({ ...d, base: text, viewText: text, meta }));
+		},
+		[replaceDraft]
+	);
+
+	const setModeNow = useCallback((next: 'view' | 'edit') => {
+		modeRef.current = next;
+		setMode(next);
+	}, []);
+
+	const raiseConflict = useCallback((next: Conflict | null) => {
+		conflictRef.current = next;
+		setConflict(next);
 	}, []);
 
 	/** The file on disk can no longer be edited. Nothing lossy enters the
 	 *  buffer: the base and a dirty draft are kept as they are, View shows the
 	 *  lossy text, and Save refuses until the file is editable again. A clean
 	 *  buffer leaves Edit. */
-	const blockEditing = useCallback((reason: string, viewText: string) => {
-		const unsaved = modeRef.current === 'edit' && draftRef.current !== baseRef.current;
-		blockedRef.current = reason;
-		setConflict(null);
-		setValidation(null);
-		setSaveState({ kind: 'idle' });
-		setDoc((d) => ({ ...d, viewText, blocked: reason }));
-		if (!unsaved) setMode('view');
-	}, []);
+	const blockEditing = useCallback(
+		(reason: string, viewText: string) => {
+			const unsaved = modeRef.current === 'edit' && draftRef.current !== baseRef.current;
+			blockedRef.current = reason;
+			raiseConflict(null);
+			setValidation(null);
+			setSaveState({ kind: 'idle' });
+			setDoc((d) => ({ ...d, viewText, blocked: reason }));
+			if (!unsaved) setModeNow('view');
+		},
+		[raiseConflict, setModeNow]
+	);
 
 	/** The file is editable text again (a held stash keeps it blocked). */
 	const unblockEditing = useCallback(() => {
@@ -186,23 +272,62 @@ export function useTextDocument({
 		noticeTimer.current = setTimeout(() => setNotice(null), NOTICE_MS);
 	}, []);
 
-	useEffect(() => {
-		modeRef.current = mode;
-	}, [mode]);
+	/**
+	 * Queue a buffer operation behind the ones already queued. It is skipped
+	 * if this editor stopped showing the document before its turn came. `fn`
+	 * reads the refs when it runs — never state captured when it was queued.
+	 */
+	const runOp = useCallback(
+		<T>(kind: DocOp, fn: (op: OpContext) => Promise<T>): Promise<T | undefined> => {
+			const epoch = epochRef.current;
+			const live = () => epoch === epochRef.current;
+			queuedOpsRef.current++;
+			setBusy((b) => b ?? kind);
+			const run = async (): Promise<T | undefined> => {
+				if (!live()) return undefined;
+				const gen = genRef.current;
+				setBusy(kind);
+				try {
+					return await fn({ live, current: () => live() && gen === genRef.current });
+				} finally {
+					if (live()) {
+						queuedOpsRef.current--;
+						if (queuedOpsRef.current === 0) setBusy(null);
+					}
+				}
+			};
+			const result = queueRef.current.then(run);
+			queueRef.current = result.catch(() => undefined);
+			return result;
+		},
+		[]
+	);
 
 	// ── Session registration (editing store) ────────────────────────────────
-	const key = sessionKey(path, paneId);
 	const upsert = useEditingStore((s) => s.upsert);
 	useEffect(() => {
 		upsert(key, { path, paneId, mounted: true, editing: mode === 'edit', dirty });
 	}, [upsert, key, path, paneId, mode, dirty]);
+	// Declared before the load effect, so on unmount this runs first, while a
+	// stash the load has not consumed yet is still in `pendingStashRef`.
 	useEffect(() => {
 		return () => {
 			const store = useEditingStore.getState();
 			const cur = store.sessions[key];
-			const unsaved = draftRef.current !== baseRef.current && modeRef.current === 'edit';
-			const held = heldStashRef.current;
-			if (cur?.discarded || (!unsaved && !held)) {
+			const pending = pendingStashRef.current;
+			pendingStashRef.current = null;
+			if (cur?.discarded) {
+				store.remove(key);
+				return;
+			}
+			const unsaved = modeRef.current === 'edit' && draftRef.current !== baseRef.current;
+			// Never drop a session that still holds a stash — one claimed by a
+			// load that has not finished, one held for a file that cannot be
+			// edited, or any other.
+			const stash: StashedDraft | undefined = unsaved
+				? { draft: draftRef.current, base: baseRef.current, meta: metaRef.current }
+				: (heldStashRef.current ?? pending ?? cur?.stash);
+			if (!stash) {
 				store.remove(key);
 				return;
 			}
@@ -212,83 +337,115 @@ export function useTextDocument({
 				mounted: false,
 				editing: false,
 				dirty: true,
-				stash: unsaved
-					? { draft: draftRef.current, base: baseRef.current, meta: metaRef.current }
-					: (held ?? undefined),
+				stash,
 			});
 		};
 	}, [key, path, paneId]);
 
 	// ── Load ─────────────────────────────────────────────────────────────────
 	useEffect(() => {
-		let cancelled = false;
+		const epoch = ++epochRef.current;
+		const live = () => epoch === epochRef.current;
+		const sKey = sessionKey(path, paneId);
+		genRef.current++;
+		queueRef.current = Promise.resolve();
+		queuedOpsRef.current = 0;
+		rereadRef.current = null;
+		setBusy(null);
+		loadedRef.current = false;
+		baseRef.current = '';
+		draftRef.current = '';
+		setDraftState('');
+		metaRef.current = INITIAL.meta;
 		setDoc(INITIAL);
-		setMode('view');
+		setModeNow('view');
 		setSaveState({ kind: 'idle' });
-		setConflict(null);
+		raiseConflict(null);
 		setValidation(null);
 		setNotice(null);
 		heldStashRef.current = null;
 		loadErrorRef.current = null;
 		blockedRef.current = null;
-		fsRead(path)
-			.then((res) => {
-				if (cancelled) return;
-				// Take any stashed draft before deciding how to open the file, so
-				// no branch below can leave it behind unseen (and then drop it on
-				// the next unmount).
-				const stash = useEditingStore.getState().takeStash(path, paneId);
+		// Claim any stashed draft now, before the read: from here on this
+		// editor owns it, and an unmount before the read returns stashes it
+		// again (the cleanup above) instead of losing it.
+		pendingStashRef.current = useEditingStore.getState().claimStash(sKey, path, paneId);
+
+		/** The claimed stash, unless the user discarded it (close guard) while
+		 *  the file was loading. */
+		const takeClaimed = (): StashedDraft | null => {
+			const s = pendingStashRef.current;
+			pendingStashRef.current = null;
+			if (!s || useEditingStore.getState().sessions[sKey]?.discarded) return null;
+			return s;
+		};
+		/** Put a stashed draft back in the buffer, in Edit. */
+		const restore = (stash: StashedDraft, viewText: string) => {
+			genRef.current++;
+			metaRef.current = stash.meta;
+			baseRef.current = stash.base;
+			draftRef.current = stash.draft;
+			setDraftState(stash.draft);
+			setDoc({
+				load: { kind: 'ready' },
+				viewText,
+				base: stash.base,
+				meta: stash.meta,
+				blocked: null,
+				held: false,
+			});
+			setModeNow('edit');
+			loadedRef.current = true;
+			// The buffer holds the draft now; the session reports it as dirty.
+			useEditingStore.getState().upsert(sKey, {
+				path,
+				paneId,
+				mounted: true,
+				editing: true,
+				dirty: stash.draft !== stash.base,
+				stash: undefined,
+			});
+		};
+
+		fsRead(path).then(
+			(res) => {
+				if (!live()) return;
+				const stash = takeClaimed();
 				const dec = decodeForEdit(res.bytes);
 				if (!dec.ok) {
 					// The lossy text is for View only; it never becomes the
 					// base or the buffer.
-					const text = decodeForView(res.bytes);
-					baseRef.current = '';
-					metaRef.current = INITIAL.meta;
-					setDraft('');
 					blockedRef.current = dec.reason;
 					if (stash) {
 						// The draft cannot go into an editor for this file now.
 						// Keep it — still counted as unsaved by the close guard
 						// and the reload prompt — and say so.
 						heldStashRef.current = stash;
-						useEditingStore
-							.getState()
-							.upsert(sessionKey(path, paneId), { path, paneId, mounted: true, stash });
+						useEditingStore.getState().upsert(sKey, { path, paneId, mounted: true, stash });
 					}
 					setDoc({
 						load: { kind: 'ready' },
-						viewText: text,
+						viewText: decodeForView(res.bytes),
 						base: '',
 						meta: INITIAL.meta,
 						blocked: dec.reason,
 						held: stash !== null,
 					});
+					loadedRef.current = true;
 					return;
 				}
 				if (stash) {
 					// Unsaved edits from before this remount: back into Edit with
 					// them, and raise the conflict choice if the file moved on.
-					metaRef.current = stash.meta;
-					baseRef.current = stash.base;
-					setDraft(stash.draft);
-					setDoc({
-						load: { kind: 'ready' },
-						viewText: dec.text,
-						base: stash.base,
-						meta: stash.meta,
-						blocked: null,
-						held: false,
-					});
-					setMode('edit');
-					if (dec.text !== stash.base) {
-						setConflict({ kind: 'changed', theirs: dec.text });
-					}
+					restore(stash, dec.text);
+					if (dec.text !== stash.base) raiseConflict({ kind: 'changed', theirs: dec.text });
 					return;
 				}
+				genRef.current++;
 				metaRef.current = dec.meta;
 				baseRef.current = dec.text;
-				setDraft(dec.text);
+				draftRef.current = dec.text;
+				setDraftState(dec.text);
 				setDoc({
 					load: { kind: 'ready' },
 					viewText: dec.text,
@@ -297,37 +454,30 @@ export function useTextDocument({
 					blocked: null,
 					held: false,
 				});
-			})
-			.catch((err) => {
-				if (cancelled) return;
-				const message = err instanceof Error ? err.message : String(err);
-				const stash = useEditingStore.getState().takeStash(path, paneId);
+				loadedRef.current = true;
+			},
+			(err) => {
+				if (!live()) return;
+				const stash = takeClaimed();
 				if (stash) {
 					// The file is gone (moved, trashed, or unreadable) but there
 					// are unsaved edits for it: back into Edit with them and the
 					// "moved or deleted" choice, never a silent drop.
-					loadErrorRef.current = message;
-					metaRef.current = stash.meta;
-					baseRef.current = stash.base;
-					setDraft(stash.draft);
-					setDoc({
-						load: { kind: 'ready' },
-						viewText: stash.base,
-						base: stash.base,
-						meta: stash.meta,
-						blocked: null,
-						held: false,
-					});
-					setMode('edit');
-					setConflict({ kind: 'deleted' });
+					loadErrorRef.current = message(err);
+					restore(stash, stash.base);
+					raiseConflict({ kind: 'deleted' });
 					return;
 				}
-				setDoc({ ...INITIAL, load: { kind: 'error', message } });
-			});
+				setDoc({ ...INITIAL, load: { kind: 'error', message: message(err) } });
+			}
+		);
 		return () => {
-			cancelled = true;
+			// Anything still running or queued for this document is dropped,
+			// and nothing new starts on it.
+			epochRef.current++;
+			loadedRef.current = false;
 		};
-	}, [path, paneId, setDraft]);
+	}, [path, paneId, setModeNow, raiseConflict]);
 
 	useEffect(
 		() => () => {
@@ -339,143 +489,253 @@ export function useTextDocument({
 	// ── Save (conditional, F3) ───────────────────────────────────────────────
 	const save = useCallback(
 		async (opts?: { force?: boolean }) => {
-			const force = opts?.force === true;
-			if (doc.load.kind !== 'ready' || blockedRef.current !== null || savingRef.current) return;
-			const next = draftRef.current;
-			if (!force && next === baseRef.current) return;
-			savingRef.current = true;
-			setSaveState({ kind: 'saving' });
-			try {
-				if (validate) {
-					const v = await validate(next);
-					if (!v.ok) {
-						setValidation(v);
-						setSaveState({ kind: 'idle' });
-						return;
-					}
-				}
-				setValidation(null);
-				// Re-read even for a forced save: "Keep mine" / "Save anyway"
-				// overwrite a newer or missing file by choice, but never one
-				// that is no longer editable text.
-				let bytes: number[] | null = null;
+			await runOp('save', async (op) => {
+				if (!loadedRef.current || blockedRef.current !== null) return;
+				// A forced save answers the conflict on screen now; with none
+				// (resolved meanwhile) it is an ordinary conditional save.
+				const answered = opts?.force === true ? conflictRef.current : null;
+				const next = draftRef.current;
+				const base = baseRef.current;
+				let meta = metaRef.current;
+				if (answered === null && next === base) return;
+				setSaveState({ kind: 'saving' });
+				let outcome: SaveState = { kind: 'idle' };
 				try {
-					bytes = (await fsRead(path)).bytes;
-				} catch {
-					if (!force) {
-						setConflict({ kind: 'deleted' });
-						setSaveState({ kind: 'idle' });
+					if (validate) {
+						const v = await validate(next);
+						if (!v.ok) {
+							if (op.live()) setValidation(v);
+							return;
+						}
+					}
+					if (op.live()) setValidation(null);
+					// Re-read even for a forced save: "Keep mine" / "Save anyway"
+					// overwrite the version the user was shown, or a missing file,
+					// by choice — never a newer one, and never a file that is no
+					// longer editable text.
+					let bytes: number[] | null = null;
+					try {
+						bytes = (await fsRead(path)).bytes;
+					} catch {
+						bytes = null;
+					}
+					if (op.live() && !op.current()) {
+						// The base was replaced while this save ran. `next` was
+						// made against the old one: write nothing, and show the
+						// conflict if the file differs from the base now shown.
+						const disk = bytes ? classifyReread(bytes, baseRef.current) : null;
+						if (disk?.kind === 'changed') raiseConflict({ kind: 'changed', theirs: disk.text });
 						return;
 					}
-				}
-				if (bytes) {
-					const disk = classifyReread(bytes, baseRef.current);
-					if (disk.kind === 'refused') {
-						blockEditing(disk.reason, disk.viewText);
+					if (bytes === null) {
+						// Only "Save anyway (recreate it)" writes a missing file.
+						if (answered?.kind !== 'deleted') {
+							if (op.live()) raiseConflict({ kind: 'deleted' });
+							return;
+						}
+					} else {
+						const disk = classifyReread(bytes, base);
+						if (disk.kind === 'refused') {
+							if (op.live()) blockEditing(disk.reason, disk.viewText);
+							return;
+						}
+						// Keep mine overwrites exactly the "theirs" it was shown.
+						// A file that changed again — or one that came back after
+						// "Save anyway (recreate it)" was offered — is a new
+						// conflict, not something to overwrite unseen.
+						if (
+							disk.kind === 'changed' &&
+							!(answered?.kind === 'changed' && answered.theirs === disk.text)
+						) {
+							if (op.live()) raiseConflict({ kind: 'changed', theirs: disk.text });
+							return;
+						}
+						// Same text on disk: write it back in the file's current
+						// line ending and BOM, not the ones it had when opened.
+						if (disk.kind === 'unchanged') meta = disk.meta;
+					}
+					if (op.live() && (blockedRef.current !== null || !op.current())) return;
+					try {
+						await fsWriteText(path, encodeForSave(next, meta));
+					} catch (err) {
+						outcome = { kind: 'error', message: message(err) };
 						return;
 					}
-					if (!force && disk.kind === 'changed') {
-						setConflict({ kind: 'changed', theirs: disk.text });
-						setSaveState({ kind: 'idle' });
+					if (!op.live()) {
+						// The editor unmounted while the write was under way; its
+						// draft is stashed on the old base. Move it onto the write.
+						useEditingStore.getState().rebaseStash(key, base, next, meta);
 						return;
 					}
-					// Same text on disk: write it back in the file's current line
-					// ending and BOM, not the ones it had when it was opened.
-					if (disk.kind === 'unchanged') metaRef.current = disk.meta;
+					if (!op.current()) return;
+					// The base is now what we wrote, so the watcher's `disk ===
+					// base` check ignores our own write.
+					loadErrorRef.current = null;
+					adoptDisk(next, meta, false);
+					raiseConflict(null);
+				} finally {
+					if (op.live()) setSaveState(outcome);
 				}
-				// A Load theirs that resolved during the awaits above may have
-				// blocked editing.
-				if (blockedRef.current !== null) {
-					setSaveState({ kind: 'idle' });
-					return;
-				}
-				try {
-					await fsWriteText(path, encodeForSave(next, metaRef.current));
-				} catch (err) {
-					setSaveState({
-						kind: 'error',
-						message: err instanceof Error ? err.message : String(err),
-					});
-					return;
-				}
-				// The base is now what we wrote, so the watcher's `disk === base`
-				// check ignores our own write.
-				loadErrorRef.current = null;
-				adoptBase(next);
-				setConflict(null);
-				setSaveState({ kind: 'idle' });
-			} finally {
-				savingRef.current = false;
-			}
+			});
 		},
-		[doc.load.kind, path, validate, adoptBase, blockEditing]
+		[runOp, path, key, validate, adoptDisk, blockEditing, raiseConflict]
 	);
 
 	const keepMine = useCallback(() => save({ force: true }), [save]);
 
 	const loadTheirs = useCallback(async () => {
-		if (conflict?.kind !== 'changed' || savingRef.current) return;
-		// Read the file now rather than trusting `conflict.theirs`: it may have
-		// changed again — possibly into bytes that cannot be edited.
-		let bytes: number[];
-		try {
-			bytes = (await fsRead(path)).bytes;
-		} catch {
-			setConflict({ kind: 'deleted' });
-			return;
-		}
-		const disk = classifyReread(bytes, baseRef.current);
-		if (disk.kind === 'refused') {
-			blockEditing(disk.reason, disk.viewText);
-			return;
-		}
-		const text = disk.kind === 'changed' ? disk.text : baseRef.current;
-		adoptDisk(text, disk.meta);
-		setDraft(text);
-		unblockEditing();
-		setConflict(null);
-		setValidation(null);
-		setSaveState({ kind: 'idle' });
-	}, [conflict, path, adoptDisk, setDraft, blockEditing, unblockEditing]);
+		await runOp('load-theirs', async (op) => {
+			if (!loadedRef.current || conflictRef.current?.kind !== 'changed') return;
+			// Read the file now rather than trusting `conflict.theirs`: it may
+			// have changed again — possibly into bytes that cannot be edited.
+			let bytes: number[];
+			try {
+				bytes = (await fsRead(path)).bytes;
+			} catch {
+				if (op.current()) raiseConflict({ kind: 'deleted' });
+				return;
+			}
+			if (!op.current()) return;
+			const disk = classifyReread(bytes, baseRef.current);
+			if (disk.kind === 'refused') {
+				blockEditing(disk.reason, disk.viewText);
+				return;
+			}
+			const text = disk.kind === 'changed' ? disk.text : baseRef.current;
+			adoptDisk(text, disk.meta, true);
+			unblockEditing();
+			raiseConflict(null);
+			setValidation(null);
+			setSaveState({ kind: 'idle' });
+		});
+	}, [runOp, path, adoptDisk, blockEditing, unblockEditing, raiseConflict]);
+
+	const cancel = useCallback(async () => {
+		await runOp('cancel', async (op) => {
+			if (!loadedRef.current) return;
+			// Discard means "show me the file": re-read it rather than going
+			// back to the base, which an outside write may have left behind.
+			let bytes: number[] | null = null;
+			let readError = '';
+			try {
+				bytes = (await fsRead(path)).bytes;
+			} catch (err) {
+				readError = message(err);
+			}
+			if (!op.current()) return;
+			loadErrorRef.current = null;
+			if (heldStashRef.current) {
+				heldStashRef.current = null;
+				useEditingStore
+					.getState()
+					.upsert(sessionKey(path, paneId), { path, paneId, stash: undefined });
+			}
+			raiseConflict(null);
+			setValidation(null);
+			setSaveState({ kind: 'idle' });
+			setModeNow('view');
+			if (bytes === null) {
+				// Nothing to show but why: the file cannot be read.
+				blockedRef.current = null;
+				loadedRef.current = false;
+				adoptDisk('', INITIAL.meta, true);
+				setDoc({ ...INITIAL, load: { kind: 'error', message: readError } });
+				return;
+			}
+			const disk = classifyReread(bytes, baseRef.current);
+			if (disk.kind === 'refused') {
+				// As at load: the lossy text is shown, never edited.
+				adoptDisk('', INITIAL.meta, true);
+				blockedRef.current = disk.reason;
+				setDoc((d) => ({ ...d, viewText: disk.viewText, blocked: disk.reason, held: false }));
+				return;
+			}
+			adoptDisk(disk.kind === 'changed' ? disk.text : baseRef.current, disk.meta, true);
+			blockedRef.current = null;
+			setDoc((d) => ({ ...d, blocked: null, held: false }));
+		});
+	}, [runOp, path, paneId, adoptDisk, raiseConflict, setModeNow]);
+
+	const transform = useCallback(
+		async (fn: (text: string) => Promise<string>): Promise<TransformResult> => {
+			const result = await runOp('transform', async (op): Promise<TransformResult> => {
+				if (!loadedRef.current || blockedRef.current !== null || modeRef.current !== 'edit') {
+					return 'skipped';
+				}
+				const src = draftRef.current;
+				const out = await fn(src);
+				// Computed from `src`: apply it only to that same buffer.
+				if (!op.current() || draftRef.current !== src || blockedRef.current !== null) {
+					return 'stale';
+				}
+				if (out !== src) replaceDraft(out);
+				return 'applied';
+			});
+			return result ?? 'stale';
+		},
+		[runOp, replaceDraft]
+	);
 
 	const startEdit = useCallback(() => {
 		if (doc.load.kind !== 'ready' || doc.blocked !== null) return;
-		setMode('edit');
-	}, [doc.load.kind, doc.blocked]);
+		setModeNow('edit');
+	}, [doc.load.kind, doc.blocked, setModeNow]);
 
 	const finishEdit = useCallback(() => {
 		if (draftRef.current !== baseRef.current) return;
-		setMode('view');
+		setModeNow('view');
 		setValidation(null);
 		setSaveState({ kind: 'idle' });
-	}, []);
-
-	const cancel = useCallback(() => {
-		const loadError = loadErrorRef.current;
-		if (loadError !== null) {
-			// The draft stood in for a file that could not be read; discarding
-			// it leaves nothing to view but that error.
-			loadErrorRef.current = null;
-			blockedRef.current = null;
-			baseRef.current = '';
-			setDraft('');
-			setMode('view');
-			setConflict(null);
-			setValidation(null);
-			setSaveState({ kind: 'idle' });
-			setDoc({ ...INITIAL, load: { kind: 'error', message: loadError } });
-			return;
-		}
-		setDraft(baseRef.current);
-		setMode('view');
-		setConflict(null);
-		setValidation(null);
-		setSaveState({ kind: 'idle' });
-	}, [setDraft]);
+	}, [setModeNow]);
 
 	const dismissValidation = useCallback(() => setValidation(null), []);
 
 	// ── Watch the file ───────────────────────────────────────────────────────
+	/** Re-read after a change event, queued like any other operation (so it
+	 *  waits for a save, a format, … to finish). Events while one is already
+	 *  waiting share it. */
+	const reread = useCallback(() => {
+		if (rereadRef.current) return rereadRef.current;
+		const pending = runOp('reread', async (op) => {
+			rereadRef.current = null;
+			if (!loadedRef.current) return;
+			let bytes: number[];
+			try {
+				bytes = (await fsRead(path)).bytes;
+			} catch {
+				// Mid-write or deleted. A save re-reads and reports a missing
+				// file then, so a transient miss is ignored here.
+				return;
+			}
+			if (!op.current()) return;
+			// No "our last write" exception (see isConflict): after a save the
+			// base already is our write.
+			const disk = classifyReread(bytes, baseRef.current);
+			if (disk.kind === 'refused') {
+				blockEditing(disk.reason, disk.viewText);
+				return;
+			}
+			const clean = draftRef.current === baseRef.current;
+			if (disk.kind === 'unchanged') {
+				// Same text — maybe new line endings or BOM, which a clean buffer
+				// takes so the next save writes what is on disk.
+				if (clean) adoptDisk(baseRef.current, disk.meta, false);
+				else setDoc((d) => ({ ...d, viewText: baseRef.current }));
+				unblockEditing();
+				return;
+			}
+			unblockEditing();
+			if (clean) {
+				adoptDisk(disk.text, disk.meta, true);
+				if (modeRef.current === 'edit') flashNotice('Reloaded — the file changed on disk.');
+				return;
+			}
+			raiseConflict({ kind: 'changed', theirs: disk.text });
+		});
+		rereadRef.current = pending;
+		return pending;
+	}, [runOp, path, adoptDisk, blockEditing, unblockEditing, flashNotice, raiseConflict]);
+
 	const ready = doc.load.kind === 'ready';
 	useEffect(() => {
 		if (!ready) return;
@@ -490,41 +750,7 @@ export function useTextDocument({
 					return;
 				}
 				watcherId = id;
-				unlisten = await fsListenWatch(id, async () => {
-					let bytes: number[];
-					try {
-						bytes = (await fsRead(path)).bytes;
-					} catch {
-						// Mid-write or deleted. A save re-reads and reports a
-						// missing file then, so a transient miss is ignored here.
-						return;
-					}
-					if (!active || savingRef.current) return;
-					// No "our last write" exception (see isConflict): after a save
-					// the base already is our write.
-					const disk = classifyReread(bytes, baseRef.current);
-					if (disk.kind === 'refused') {
-						blockEditing(disk.reason, disk.viewText);
-						return;
-					}
-					const clean = draftRef.current === baseRef.current;
-					if (disk.kind === 'unchanged') {
-						// Same text — maybe new line endings or BOM, which a clean
-						// buffer takes so the next save writes what is on disk.
-						if (clean) adoptDisk(baseRef.current, disk.meta);
-						else setDoc((d) => ({ ...d, viewText: baseRef.current }));
-						unblockEditing();
-						return;
-					}
-					unblockEditing();
-					if (clean) {
-						adoptDisk(disk.text, disk.meta);
-						setDraft(disk.text);
-						if (modeRef.current === 'edit') flashNotice('Reloaded — the file changed on disk.');
-						return;
-					}
-					setConflict({ kind: 'changed', theirs: disk.text });
-				});
+				unlisten = await fsListenWatch(id, () => (active ? reread() : undefined));
 			} catch {
 				/* watching is best-effort */
 			}
@@ -534,7 +760,7 @@ export function useTextDocument({
 			unlisten?.();
 			if (watcherId) void fsUnwatch(watcherId);
 		};
-	}, [ready, path, adoptDisk, setDraft, flashNotice, blockEditing, unblockEditing]);
+	}, [ready, path, reread]);
 
 	let blocked = doc.blocked;
 	if (blocked !== null && doc.held) blocked = `${blocked} ${HELD_NOTE}`;
@@ -553,12 +779,14 @@ export function useTextDocument({
 		conflict,
 		validation,
 		notice,
+		busy,
 		startEdit,
 		finishEdit,
 		cancel,
 		save,
 		keepMine,
 		loadTheirs,
+		transform,
 		dismissValidation,
 	};
 }
