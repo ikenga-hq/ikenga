@@ -12,13 +12,14 @@
 // the legacy UpdaterBanner.
 
 import { createFileRoute } from '@tanstack/react-router';
-import { BellOff, CheckCircle2, Download, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
+import { BellOff, Download, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Markdown } from '@/components/markdown';
 import { cn } from '@/components/ui/utils';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { isTauri } from '@/lib/transport';
 import {
 	findReleaseByVersion,
 	useGitHubReleases,
@@ -30,6 +31,7 @@ import { useUpdaterSnooze } from '@/lib/updater/snooze';
 
 import { SettingGroup } from './-components/setting-group';
 import { SettingRow } from './-components/setting-row';
+import { formatRelative, UpdateStatus } from './-components/update-status';
 
 function AboutPage() {
 	const updater = useUpdater({ autoPoll: false });
@@ -40,11 +42,14 @@ function AboutPage() {
 	const currentVersion = updater.available?.currentVersion ?? shellVersion ?? '—';
 	const isSnoozed = snooze.isSnoozed(updater.available?.version ?? null);
 	const matchingRelease = findReleaseByVersion(releases.data, updater.available?.version ?? '');
+	// The in-app updater is desktop-only; a browser session never checks.
+	const desktop = isTauri();
 
 	return (
 		<div className="mx-auto w-full max-w-[720px] space-y-5 px-6 py-6">
 			<SettingGroup title="Current build">
 				<HeaderStrip
+					desktop={desktop}
 					currentVersion={currentVersion}
 					lastCheckedAt={updater.lastCheckedAt}
 					checking={updater.checking}
@@ -73,15 +78,12 @@ function AboutPage() {
 				/>
 			)}
 
-			{!updater.available && !updater.checking && (
-				<div className="flex items-center gap-3 rounded-lg border border-[var(--border-soft)] bg-card px-4 py-3 text-sm">
-					<CheckCircle2 className="size-4 text-emerald-500" />
-					<span className="text-muted-foreground">
-						Ikenga is up to date. Last checked{' '}
-						<span className="text-foreground">{formatRelative(updater.lastCheckedAt)}</span>.
-					</span>
-				</div>
-			)}
+			<UpdateStatus
+				desktop={desktop}
+				available={!!updater.available}
+				checking={updater.checking}
+				lastCheckedAt={updater.lastCheckedAt}
+			/>
 
 			<ChangelogFeed
 				releases={releases.data ?? null}
@@ -138,11 +140,13 @@ function AutoUpdateSettings() {
 /* ───── Header strip ───── */
 
 function HeaderStrip({
+	desktop,
 	currentVersion,
 	lastCheckedAt,
 	checking,
 	onCheck,
 }: {
+	desktop: boolean;
 	currentVersion: string;
 	lastCheckedAt: number | null;
 	checking: boolean;
@@ -160,18 +164,22 @@ function HeaderStrip({
 						v{currentVersion}
 					</span>
 				</div>
-				<div className="font-mono text-[11px] text-muted-foreground/70">
-					Last checked {formatRelative(lastCheckedAt)}
-				</div>
-			</div>
-			<Button size="sm" variant="outline" disabled={checking} onClick={onCheck}>
-				{checking ? (
-					<Loader2 className="mr-1.5 size-3.5 animate-spin" />
-				) : (
-					<RefreshCw className="mr-1.5 size-3.5" />
+				{desktop && (
+					<div className="font-mono text-[11px] text-muted-foreground/70">
+						Last checked {formatRelative(lastCheckedAt)}
+					</div>
 				)}
-				{checking ? 'Checking…' : 'Check now'}
-			</Button>
+			</div>
+			{desktop && (
+				<Button size="sm" variant="outline" disabled={checking} onClick={onCheck}>
+					{checking ? (
+						<Loader2 className="mr-1.5 size-3.5 animate-spin" />
+					) : (
+						<RefreshCw className="mr-1.5 size-3.5" />
+					)}
+					{checking ? 'Checking…' : 'Check now'}
+				</Button>
+			)}
 		</div>
 	);
 }
@@ -405,18 +413,6 @@ function ChangelogEntry({
 }
 
 /* ───── Time helpers ───── */
-
-function formatRelative(ms: number | null): string {
-	if (!ms) return 'never';
-	const secs = Math.floor((Date.now() - ms) / 1000);
-	if (secs < 30) return 'just now';
-	if (secs < 60) return `${secs}s ago`;
-	const mins = Math.floor(secs / 60);
-	if (mins < 60) return `${mins}m ago`;
-	const hours = Math.floor(mins / 60);
-	if (hours < 24) return `${hours}h ago`;
-	return `${Math.floor(hours / 24)}d ago`;
-}
 
 function formatDate(iso: string): string {
 	try {

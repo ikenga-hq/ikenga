@@ -317,12 +317,14 @@ export function ownerOf(command: string): CommandOwner | null {
 	}
 	// WP-56: widget-local commands registered by the surface that owns the
 	// focused element (permission card, approve gate, Studio loupe/pin
-	// composer, markdown editor) — never hosted, so never in §4.6's table.
+	// composer, markdown editor, and — plans/file-editing — the shared text
+	// editor) — never hosted, so never in §4.6's table.
 	if (
 		command.startsWith('companion.permission-') ||
 		command.startsWith('approve-gate.') ||
 		command.startsWith('studio.') ||
-		command.startsWith('markdown.')
+		command.startsWith('markdown.') ||
+		command.startsWith('editor.')
 	) {
 		return 'widget';
 	}

@@ -422,14 +422,14 @@ mod router_tests {
     }
 
     /// Refused as the daemon's data dir by every path arm that errors, and
-    /// folded into `"missing"` by `fs_kind` (the desktop's contract).
+    /// folded into `"missing"` by `fs_kind` and `false` by `fs_exists` (the
+    /// desktop's contract).
     async fn refused_everywhere(r: &Router, path: &str) {
         for (cmd, args) in [
             ("fs_read", json!({ "path": path })),
             ("fs_write", json!({ "path": path, "content": "pwned" })),
             ("fs_mkdir", json!({ "path": path })),
             ("fs_list", json!({ "path": path })),
-            ("fs_exists", json!({ "path": path })),
             ("fs_mime", json!({ "path": path })),
             ("fs_rename", json!({ "from": path, "toName": "moved" })),
         ] {
@@ -437,6 +437,7 @@ mod router_tests {
             assert!(e.contains(INSIDE_DATA_DIR), "{cmd} {path}: {e}");
         }
         assert_eq!(ok(r, "fs_kind", json!({ "path": path })).await, "missing");
+        assert_eq!(ok(r, "fs_exists", json!({ "path": path })).await, false);
     }
 
     /// The data dir holds exactly what the fixture put there, unchanged.
@@ -715,7 +716,6 @@ mod router_tests {
         let file = s(&dir.join(&name));
         for (cmd, args) in [
             ("fs_read", json!({ "path": file })),
-            ("fs_exists", json!({ "path": file })),
             ("fs_mime", json!({ "path": file })),
         ] {
             let e = err(&router, cmd, args).await;
@@ -724,6 +724,11 @@ mod router_tests {
         assert_eq!(
             ok(&router, "fs_kind", json!({ "path": file })).await,
             "missing"
+        );
+        // Whether or not a daemon has written it, refused reads as absent.
+        assert_eq!(
+            ok(&router, "fs_exists", json!({ "path": file })).await,
+            false
         );
         // Its staging sibling (`discovery::write_private`) too.
         let staging = s(&dir.join(format!(".{name}.0123abcd.tmp")));

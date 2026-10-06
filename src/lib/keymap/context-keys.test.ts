@@ -65,6 +65,8 @@ describe('vocabulary (§4.3)', () => {
 				'loupeFocus',
 				'pinComposerFocus',
 				'markdownEditorFocus',
+				// plans/file-editing: the shared text editor.
+				'textEditorFocus',
 				// Fix round 1 (B-21): narrower than approveGateFocus (detail pane only).
 				'approveGateDetailFocus',
 			].sort()
@@ -91,6 +93,7 @@ describe('vocabulary (§4.3)', () => {
 				'loupeFocus',
 				'pinComposerFocus',
 				'markdownEditorFocus',
+				'textEditorFocus',
 				'approveGateDetailFocus',
 			].sort()
 		);

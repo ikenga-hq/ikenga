@@ -50,7 +50,12 @@ pub async fn agent_ops_set_enabled(job_id: String, enabled: bool) -> Result<Valu
 /// Create-or-update a job in the project-scoped config. Config write only.
 #[tauri::command]
 pub async fn agent_ops_upsert_job(job: Value) -> Result<Value, String> {
-    agent_ops::upsert_job(crate::platform::home_dir().as_deref(), job).await
+    agent_ops::upsert_job(
+        crate::platform::home_dir().as_deref(),
+        job,
+        agent_ops::MissingConfig::Error,
+    )
+    .await
 }
 
 /// Remove a job from the project-scoped config by id.
@@ -63,7 +68,11 @@ pub async fn agent_ops_delete_job(job_id: String) -> Result<Value, String> {
 /// plus daemon liveness.
 #[tauri::command]
 pub async fn agent_ops_list_jobs() -> Result<Value, String> {
-    agent_ops::list_jobs(crate::platform::home_dir().as_deref()).await
+    agent_ops::list_jobs(
+        crate::platform::home_dir().as_deref(),
+        agent_ops::MissingConfig::Error,
+    )
+    .await
 }
 
 /// A job's live (or last) run output by byte range.

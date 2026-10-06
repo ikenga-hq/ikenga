@@ -36,10 +36,10 @@ pub const SCREENSHOTS_DIR: &str = "pin-screenshots";
 
 /// The daemon's cap on one decoded pin screenshot. The desktop has none (its
 /// caller is the user's own renderer over Tauri IPC); the daemon's caller is a
-/// remote token holder, so one call must not be able to fill its disk. 2 MiB
-/// is axum's default request-body limit, which already bounds the base64
-/// that reaches the arm to ~1.5 MiB decoded; the cap is stated here too so it
-/// holds even if that body limit is raised for another route. An element
+/// remote token holder, so one call must not be able to fill its disk.
+/// `/api/rpc`'s body limit is `server::RPC_BODY_LIMIT` (16 MiB, raised from
+/// axum's 2 MiB default for editor saves), so this cap — not the body limit —
+/// is what bounds a screenshot. An element
 /// crop (`captureToPng` of one picked element) is tens to hundreds of KB.
 pub const DAEMON_MAX_SCREENSHOT_BYTES: usize = 2 * 1024 * 1024;
 
