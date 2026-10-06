@@ -63,6 +63,8 @@ sudo touch /opt/ikenga/.env && sudo chmod 600 /opt/ikenga/.env
 |---|---|---|
 | `IKENGA_HOST` | both | Bind address. Unset, it is `127.0.0.1`, which is unreachable from other machines: the safe default. Set it to the host's Tailscale address, or leave it unset and put a reverse proxy on loopback in front. Do not bind a public address directly. |
 | `IKENGA_PUBLIC_URL` | both | The https address people reach the server on. It is the base of pairing and invite links. |
+| `IKENGA_TRUSTED_PROXIES` | both | Comma-separated trusted reverse-proxy addresses and CIDR networks (e.g. `127.0.0.1,::1,10.0.0.0/8`). Unset, every forwarded header is ignored and the server uses the TCP peer's address, as before. Set, and only for a request whose TCP peer is in the list, the client address is taken from the one header named by `IKENGA_TRUSTED_PROXY_HEADER`: the right-most hop that is not itself in the list. A hop that is not an IP address, or a malformed header, falls back to the TCP peer. Behind Caddy on loopback (`PERIMETER=public-https`), set `127.0.0.1`. If the daemon binds a dual-stack address (`[::]`), an IPv4 proxy still matches its IPv4 entry. Invalid entries are logged once at start and skipped. |
+| `IKENGA_TRUSTED_PROXY_HEADER` | both | The one forwarding header your proxy overwrites: `x-forwarded-for` (the default; right for Caddy and nginx) or `forwarded` (RFC 7239). Only that header is read. The other is ignored, because Caddy and nginx pass a client's own `Forwarded` header through untouched. Set `forwarded` only if your proxy overwrites that header. Any other value logs a warning and uses `x-forwarded-for`. Ignored when `IKENGA_TRUSTED_PROXIES` is unset. |
 | `IKENGA_INSECURE_COOKIE` | multi-user | `true` only for plain HTTP on a private network such as a tailnet. Leave it unset behind HTTPS so the session cookie stays `Secure`. |
 | `IKENGA_UID_RANGE` | multi-user | Unix uid range for accounts, default `20000-29999`. It must match the range the data directory was first set up with. |
 | `IKENGA_AUTH_TOKEN` | single-user | The bearer token. Without it the daemon mints a random one on every start, so every client breaks after a restart. Ignored in multi-user mode. |
@@ -78,7 +80,7 @@ Read it back, when you need to sign a client in, with `sudo grep '^IKENGA_AUTH_T
 
 Keeping long-lived credentials in this file lets the daemon start unattended. The trade is that **anyone who gets onto the box gets those credentials**. Do not put anything in it you would not leave on the host.
 
-The daemon speaks plain HTTP and has no TLS of its own. Reach it over a private network, or put an HTTPS proxy in front. There is no trusted-proxy setting yet: behind a proxy the server sees the proxy's address for every client, so device-pairing throttling is shared across devices, and pairing can fail with `cookie_rejected`.
+The daemon speaks plain HTTP and has no TLS of its own. Reach it over a private network, or put an HTTPS proxy in front. When running behind a reverse proxy (such as Caddy), set `IKENGA_TRUSTED_PROXIES=127.0.0.1` so client addresses are resolved from forwarded headers rather than collapsing onto loopback. Without this setting, device-pairing throttling, login backoff and access audit rows are shared across all clients behind the proxy. The setting only changes which address is throttled and recorded. Whether the device cookie is marked `Secure` is still decided by the TCP peer, so behind a plain-HTTP proxy pairing can still fail with `cookie_rejected` unless `IKENGA_INSECURE_COOKIE` is set.
 
 ## Multi-user: the unit, the first admin, the first start
 
@@ -96,7 +98,7 @@ Then sign in as that admin in a browser, at the address the server is reachable 
 
 If the service fails to start, run the `probe` line again. The server never falls back to a weaker mode: a failed probe means it stops.
 
-The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
+The unit differs from the T0 one in five ways (§8 "Deploy consequence", plus the WP-P10 `/proc` rule):
 
 - **Root, with a cut capability set.** `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL CAP_DAC_OVERRIDE CAP_FOWNER`, and `NoNewPrivileges=true`. The broker's boot probe refuses to start without root and the first four. It also does a real test drop to the reserved probe uid. Only auth, the reverse proxy and the per-principal child launch run as root. Every RPC, terminal and engine runs inside a child that has already dropped to that person's uid.
 - **Writable paths.** `ProtectSystem=strict` with `ReadWritePaths=/opt/ikenga/data /etc`.
@@ -104,6 +106,7 @@ The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
   - To keep `/etc` read-only, pre-create users yourself, set `IKENGA_PROVISIONING=external`, map each account with `accounts create <name> --adopt-unix-user <user>`, and drop `/etc` from the line.
 - **Adopted homes.** An adopted account (below) keeps its existing passwd home. Add that home to `ReadWritePaths`.
 - **`KillMode=process`.** This is the detached chi-runner fix (§9.4, owed by WP-18b), explained in the next section.
+- **`ProtectProc=invisible`.** `/proc` is mounted `hidepid=invisible` inside the unit, so a person's processes can't see anyone else's there. This is defense in depth, not a guarantee: someone signed in over SSH uses the host `/proc`, where it doesn't apply. Nothing depends on it. Every Chi engine (`claude-code`, `codex`, `antigravity-cli`, `opencode`, `pi`) reads its prompt from stdin, never from a command-line argument that `/proc/<pid>/cmdline` would show to other users (I-7). The same holds for the chat socket (`/ws/chat/:id`, default engine `antigravity-cli`), which sends each turn to `agy` on stdin as well. So all of them run under T1 with or without this line, including in the Docker deploy.
 
 ### Detached chi-runners survive a restart
 

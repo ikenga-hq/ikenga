@@ -318,6 +318,19 @@ pub struct ServeArgs {
     )]
     pub allowed_origins: Vec<String>,
 
+    /// Trusted reverse proxy IP addresses and CIDR subnets (comma-separated, e.g.
+    /// `127.0.0.1,::1,10.0.0.0/8`). When set, client addresses behind these proxies
+    /// are resolved from the one header named by `--trusted-proxy-header`.
+    /// Unset by default (forwarded headers ignored).
+    #[arg(long, env = "IKENGA_TRUSTED_PROXIES")]
+    pub trusted_proxies: Option<String>,
+
+    /// The single forwarding header the trusted proxy writes: `x-forwarded-for`
+    /// (default; Caddy, nginx) or `forwarded` (RFC 7239). The other header is
+    /// never read, because proxies pass a client-supplied copy through.
+    #[arg(long, env = "IKENGA_TRUSTED_PROXY_HEADER")]
+    pub trusted_proxy_header: Option<String>,
+
     /// Idle timeout in seconds before server automatically shuts down when no
     /// PTY session, open WebSocket or recent request keeps it active. Under
     /// `t1` this is each principal child's idle timeout instead (default 1800;
@@ -495,6 +508,31 @@ async fn async_main(cli: CliArgs) -> anyhow::Result<()> {
         None => {}
     }
 
+    // Parsed once, here, before anything is served; handed to the helper
+    // directly so the environment is never mutated on a running runtime.
+    {
+        use ikenga_desktop_lib::server::trusted_proxy::{install, TrustedProxies};
+        let tp = TrustedProxies::from_settings(
+            args.trusted_proxies.as_deref(),
+            args.trusted_proxy_header.as_deref(),
+        );
+        if tp.is_empty() {
+            if args.trusted_proxy_header.is_some() {
+                tracing::warn!(
+                    "IKENGA_TRUSTED_PROXY_HEADER ignored: no IKENGA_TRUSTED_PROXIES configured"
+                );
+            }
+        } else {
+            tracing::info!(
+                networks = tp.len(),
+                header = ?tp.header(),
+                "trusted proxies configured"
+            );
+        }
+        if !install(tp) {
+            tracing::warn!("trusted-proxy configuration was already initialised; ignoring");
+        }
+    }
     // Honoured by the T1 broker after its §8 boot probe, only on an empty
     // accounts table (`Provisioner::bootstrap_admin`); never by a child.
     let bootstrap_admin = match bootstrap {

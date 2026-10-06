@@ -2183,8 +2183,9 @@ pub async fn post_chi_cancel(
     JsonBody(body): JsonBody<ChiCancelBody>,
 ) -> Result<Json<crate::commands::chi::ChiRunResult>, (StatusCode, String)> {
     let db = app.state::<std::sync::Arc<PaDb>>();
+    let cache = app.state::<ChiCache>();
     let runtime = app.state::<std::sync::Arc<ChiRuntime>>();
-    chi_cancel(db, runtime, body.run_id)
+    chi_cancel(db, cache, runtime, body.run_id)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))

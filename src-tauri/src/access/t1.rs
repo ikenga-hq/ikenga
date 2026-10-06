@@ -222,10 +222,13 @@ fn refusal(e: &AccessError) -> Refusal {
 }
 
 fn remote_addr(parts: &Parts) -> Option<String> {
-    parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip().to_string())
+    crate::server::trusted_proxy::client_addr(
+        parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip()),
+        &parts.headers,
+    )
 }
 
 /// What [`device_cookie_middleware`] found, handed to the resolver through
@@ -305,10 +308,12 @@ pub async fn device_cookie_middleware(
     // §2.4: the same pick and the same cookie decision as T0's
     // `auth_middleware` (`devices::presented` / `devices::cookie_action`).
     if let Some((raw, presented)) = devices::presented(req.headers()) {
-        let addr = req
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|c| c.0.ip().to_string());
+        let addr = crate::server::trusted_proxy::client_addr(
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|c| c.0.ip()),
+            req.headers(),
+        );
         match devices::resolve(&t1.store, &t1.seen, &raw, addr.as_deref()).await {
             Ok(auth) => {
                 let upgrade = req.headers().contains_key(header::UPGRADE);

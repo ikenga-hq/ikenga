@@ -140,15 +140,12 @@ fn fail(f: Fail) -> Response {
     }
 }
 
-/// The TCP peer's IP: the throttle key (bucketed per IPv6 /64 in
+/// The client address: the throttle key (bucketed per IPv6 /64 in
 /// [`pairing::throttle_key`]) and pair-confirm's "Address" row. Behind a
-/// reverse proxy (Caddy, Tailscale Serve) every client shares the proxy's
-/// address; `X-Forwarded-For` is deliberately not trusted (no trusted-proxy
-/// configuration exists yet), review m8.
-fn addr_of(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
-    conn.as_ref()
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".into())
+/// trusted reverse proxy, resolved from the one header the proxy writes
+/// (`IKENGA_TRUSTED_PROXIES` + `IKENGA_TRUSTED_PROXY_HEADER`).
+fn addr_of(conn: &Option<ConnectInfo<SocketAddr>>, headers: &HeaderMap) -> String {
+    crate::server::trusted_proxy::addr_of_conn(conn, headers)
 }
 
 fn body_json(body: &Bytes) -> Option<Value> {
@@ -164,12 +161,13 @@ fn field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 async fn hello(
     host: Option<Extension<PairingHost>>,
     conn: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(Extension(host)) = host else {
         return pair_failed();
     };
-    let addr = addr_of(&conn);
+    let addr = addr_of(&conn, &headers);
     let req = body_json(&body).unwrap_or(Value::Null);
     let res = host.registry.hello(
         field(&req, "slot").unwrap_or(""),
@@ -201,12 +199,13 @@ async fn hello(
 async fn confirm(
     host: Option<Extension<PairingHost>>,
     conn: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(Extension(host)) = host else {
         return pair_failed();
     };
-    let addr = addr_of(&conn);
+    let addr = addr_of(&conn, &headers);
     let req = body_json(&body).unwrap_or(Value::Null);
     let res = host.registry.confirm(
         field(&req, "pairingId").unwrap_or(""),
@@ -229,7 +228,7 @@ async fn status(
     let Some(Extension(host)) = host else {
         return pair_failed();
     };
-    let addr = addr_of(&conn);
+    let addr = addr_of(&conn, &headers);
     let poll = headers
         .get(pairing::POLL_HEADER)
         .and_then(|h| h.to_str().ok())
@@ -308,10 +307,8 @@ fn access_error(e: &super::AccessError) -> Response {
     res
 }
 
-fn peer_addr(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
-    conn.as_ref()
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".into())
+fn peer_addr(conn: &Option<ConnectInfo<SocketAddr>>, headers: &HeaderMap) -> String {
+    crate::server::trusted_proxy::addr_of_conn(conn, headers)
 }
 
 /// `POST /access/invite/inspect {token}` (§7.3, WP-76): the invite's
@@ -321,12 +318,13 @@ fn peer_addr(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
 async fn invite_inspect(
     host: Option<Extension<Arc<super::invites::InviteHost>>>,
     conn: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(Extension(host)) = host else {
         return invite_gone();
     };
-    let addr = peer_addr(&conn);
+    let addr = peer_addr(&conn, &headers);
     let now = super::share::now_ms();
     if let Err(e) = host.throttle.check(&addr, now) {
         return access_error(&e);
@@ -375,7 +373,7 @@ async fn invite_accept(
     let Some(Extension(host)) = host else {
         return invite_gone();
     };
-    let addr = peer_addr(&conn);
+    let addr = peer_addr(&conn, &headers);
     let now = super::share::now_ms();
     if let Err(e) = host.throttle.check(&addr, now) {
         return access_error(&e);
@@ -405,7 +403,7 @@ async fn invite_accept(
         },
     };
     let meta = super::ctx::RequestMeta {
-        remote_addr: conn.as_ref().map(|c| c.0.ip().to_string()),
+        remote_addr: crate::server::trusted_proxy::client_addr_from_conn(&conn, &headers),
         user_agent: headers
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
@@ -820,5 +818,85 @@ mod tests {
             (st, v["error"].as_str()),
             (StatusCode::NOT_FOUND, Some("pair_failed"))
         );
+    }
+
+    #[tokio::test]
+    async fn pairing_status_resolves_client_address_behind_trusted_proxy() {
+        // Thread-scoped, not `set_var`: tests run in parallel and a leaked
+        // process env var changes every other handler's resolution.
+        let _tp = crate::server::trusted_proxy::test_override::set(
+            crate::server::trusted_proxy::TrustedProxies::parse("127.0.0.1"),
+        );
+        let store = AccessStore::memory_t0().await;
+        let registry = Registry::new();
+        let host = PairingHost {
+            registry: registry.clone(),
+            store: store.clone(),
+            tier: StoreTier::T0,
+            insecure_cookie: true,
+        };
+        let r = Router::new().nest(PAIRING_PREFIX, pairing_routes_for(host, vec![]));
+        let owner = store.meta().owner_principal_id.unwrap().to_string();
+        let ticket = registry.begin(&owner, None).unwrap();
+        let store_id = store.meta().store_id.clone();
+        let (dev, msg_a) = spake::device_start_with_rng(&ticket.code, &store_id, rand::rngs::OsRng);
+
+        // Hello sent through proxy (127.0.0.1) with X-Forwarded-For: 203.0.113.195
+        let mut req = axum::http::Request::builder()
+            .uri("/access/pair/hello")
+            .method("POST")
+            .header("host", "ik:4000")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "203.0.113.195")
+            // A client-injected Forwarded header Caddy passes through
+            // untouched: it must lose to the proxy-written X-Forwarded-For.
+            .header("forwarded", "for=9.9.9.1")
+            .body(Body::from(
+                json!({
+                    "slot": &ticket.code[..1],
+                    "msgA": spake::b64(&msg_a),
+                    "deviceName": "Test Device",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "127.0.0.1".parse().unwrap(),
+            50000,
+        )));
+        let (st, _, v) = send(&r, req).await;
+        assert_eq!(st, StatusCode::OK);
+        let pid = v["pairingId"].as_str().unwrap().to_string();
+        let msg_b = spake::unb64(v["msgB"].as_str().unwrap()).unwrap();
+        let key = dev.finish(&msg_b).unwrap();
+        let keys = spake::Keys::derive(&key, &pid, &msg_a, &msg_b);
+
+        let mut req_confirm = axum::http::Request::builder()
+            .uri("/access/pair/confirm")
+            .method("POST")
+            .header("host", "ik:4000")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "203.0.113.195")
+            .header("forwarded", "for=9.9.9.2")
+            .body(Body::from(
+                json!({
+                    "pairingId": pid,
+                    "deviceConfirm": spake::b64(&keys.device_confirm()),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req_confirm
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                50000,
+            )));
+        let (st, _, _) = send(&r, req_confirm).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Check that registry recorded the forwarded client IP, not 127.0.0.1
+        let info = registry.begin_decide(&pid, &owner).unwrap();
+        assert_eq!(info.remote_addr, "203.0.113.195");
     }
 }

@@ -548,6 +548,10 @@ write_env() {
   # Plain HTTP on a tailnet: the session cookie cannot be Secure (README).
   # Behind HTTPS it MUST be Secure, so a host leaving the tailnet drops it.
   if [[ "$TIER" == t1 && "$PERIMETER" == tailnet ]]; then set_var IKENGA_INSECURE_COOKIE true; else unset_var IKENGA_INSECURE_COOKIE; fi
+  # Behind Caddy on loopback every client arrives from 127.0.0.1; trusting only
+  # that peer lets the daemon read Caddy's X-Forwarded-For (which Caddy
+  # overwrites, so clients cannot spoof it). The tailnet perimeter has no proxy.
+  if [[ "$PERIMETER" == public-https ]]; then set_var IKENGA_TRUSTED_PROXIES 127.0.0.1; else unset_var IKENGA_TRUSTED_PROXIES; fi
 
   # Optional secrets (agent API keys etc.) from a file the operator controls:
   # copied by name, never read into argv or the log.

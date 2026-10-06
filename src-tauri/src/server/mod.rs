@@ -48,6 +48,8 @@ pub mod static_files;
 /// `ikenga-server supervise`: a minimal init that keeps detached runs alive
 /// across server restarts where there is no systemd (containers). Linux-only.
 pub mod supervisor;
+/// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
+pub mod trusted_proxy;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
@@ -240,6 +242,12 @@ pub struct AppState {
     /// the broker's wrapping key out of the process environment before
     /// anything is spawned. See `crate::secrets_env`.
     pub(crate) secrets: Arc<crate::secrets_env::DaemonSecrets>,
+    /// The `chi_run` / `chi_resume` / `chi_cancel` arms' live-run registry
+    /// and engine resolver (WP-P10; see `server::rpc_local::DaemonChi`). One
+    /// per process — under T1, one per principal child — so a run is only
+    /// ever reachable from the process that started it. Share-mode clones of
+    /// `AppState` keep the same `Arc`.
+    pub(crate) chi: Arc<rpc_local::DaemonChi>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -373,10 +381,12 @@ async fn auth_middleware(
         .cloned()
         .unwrap_or_else(DaemonAccess::unavailable);
     let meta = RequestMeta {
-        remote_addr: req
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string()),
+        remote_addr: trusted_proxy::client_addr(
+            req.extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip()),
+            req.headers(),
+        ),
         user_agent: req
             .headers()
             .get("user-agent")
@@ -588,6 +598,7 @@ pub(crate) fn create_router_with_access(
         rpc_shell::PathGuard::allowlist(),
         crate::pkg::skill_actions::store_root(),
         access,
+        None,
     )
 }
 
@@ -614,6 +625,7 @@ pub(crate) fn router_with(
         // G-PRINCIPAL seam: the daemon process's own store.
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
+        None,
     )
 }
 
@@ -640,6 +652,30 @@ pub(crate) fn router_with_store(
         path_guard,
         store,
         crate::access::DaemonAccess::unavailable(),
+        None,
+    )
+}
+
+/// [`router_with_home`] with the Chi arms' state made explicit, so their
+/// tests drive a stub engine instead of whatever `claude` is on PATH.
+#[cfg(test)]
+pub(crate) fn router_with_chi(
+    config: ServerConfig,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    chi: Arc<rpc_local::DaemonChi>,
+) -> Router {
+    build_router(
+        config,
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        pa_db,
+        None,
+        home,
+        rpc_shell::PathGuard::allowlist(),
+        crate::pkg::skill_actions::store_root(),
+        crate::access::DaemonAccess::unavailable(),
+        Some(chi),
     )
 }
 
@@ -654,6 +690,7 @@ fn build_router(
     path_guard: rpc_shell::PathGuard,
     store: Option<PathBuf>,
     access: Arc<crate::access::DaemonAccess>,
+    chi: Option<Arc<rpc_local::DaemonChi>>,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -710,6 +747,7 @@ fn build_router(
         actions,
         store,
         secrets,
+        chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
         shutdown_tx,
     });
 
@@ -923,7 +961,17 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
         // Opened lazily: `PaDb::new` only records the path. The pools (and the
         // migration apply) happen on the first `db_query` / `db_exec`, so a
         // daemon nobody queries never touches the file.
-        pa_db = Some(Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db"))));
+        let db = Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db")));
+        // Persistent Chi runs (detached chi-runners) outlive the daemon; the
+        // sweep folds the ones that ended while it was down into their rows.
+        // Only when there is a chi cache at all, so a daemon that never ran a
+        // chi run still never opens ikenga.db here (see above). A daemon whose
+        // first detached run comes later starts the sweep then (WP-P10).
+        let chi_cache = data_dir.join(shared::chi::CACHE_DIR);
+        if chi_cache.is_dir() {
+            shared::chi_exec::ensure_detached_sweep(db.clone(), chi_cache);
+        }
+        pa_db = Some(db);
     } else {
         warn!(
             "no --data-dir: fs_* RPC commands will reject every path and \

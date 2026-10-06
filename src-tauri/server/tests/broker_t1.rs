@@ -147,6 +147,11 @@ fn accounts(root: &Path, range: &str, args: &[&str], stdin: &str) {
 }
 
 fn start_broker(tmp: &Path, root: &Path, range: &str) -> Broker {
+    start_broker_with_env(tmp, root, range, &[])
+}
+
+/// [`start_broker`] with extra environment for the broker process.
+fn start_broker_with_env(tmp: &Path, root: &Path, range: &str, env: &[(&str, &str)]) -> Broker {
     let log = tmp.join("broker.log");
     let child = Command::new(bin())
         .args([
@@ -167,6 +172,7 @@ fn start_broker(tmp: &Path, root: &Path, range: &str) -> Broker {
         .env_remove("IKENGA_DATA_DIR")
         .env_remove("IKENGA_AUTH_TOKEN")
         .env("RUST_LOG", "info")
+        .envs(env.iter().copied())
         .stdout(File::create(&log).unwrap())
         .stderr(File::create(tmp.join("broker.err")).unwrap())
         .spawn()
@@ -501,6 +507,275 @@ fn t1_root_broker_i8_cli_passwd_closes_a_proxied_socket_within_two_seconds() {
         let fresh = login(&broker, "t1brk-eve", "a different long password").await;
         let (status, _) = get_json(&broker, "/auth/me", Some(&fresh)).await;
         assert_eq!(status, 200);
+    });
+    drop(broker);
+    drop(users);
+}
+
+/// A stub `claude` (stream-json) in `home/.local/bin`, owned by the
+/// principal: it reports `uid=<its uid>`, or `exec sleep 60` when the prompt
+/// says `sleep`. The child's augmented PATH includes `$HOME/.local/bin`.
+fn install_stub_claude(home: &Path) {
+    let meta = std::fs::metadata(home).unwrap();
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("claude");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+prompt=$(cat)
+case "$prompt" in *sleep*) exec sleep 60;; esac
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-t1"}'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"uid=%s"}]}}\n' "$(id -u)"
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for p in [home.join(".local"), bin, path] {
+        std::os::unix::fs::chown(&p, Some(meta.uid()), Some(meta.gid())).unwrap();
+    }
+}
+
+/// WP-P10: a Chi run requested through the broker executes in the signed-in
+/// principal's child, as that principal's uid (never root), with its output
+/// in that principal's own 0700 data dir; another principal's run id is
+/// "not found" for status, resume and cancel, and leaves the run alone.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_broker_chi_runs_are_per_principal() {
+    assert!(is_root(), "t1-root tests run as root");
+    let users = HostUsers(vec!["ik-t1chi-ada".into(), "ik-t1chi-bob".into()]);
+    let tmp = TempDir::new("chi");
+    let root = tmp.0.join("root");
+    let range = "28220-28230";
+    accounts(
+        &root,
+        range,
+        &["create", "t1chi-ada", "--admin", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    accounts(
+        &root,
+        range,
+        &["create", "t1chi-bob", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    let ada_id = account_id(&root, range, "t1chi-ada");
+    let ada_home = root.join("principals").join(&ada_id).join("home");
+    let broker = start_broker(&tmp.0, &root, range);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ada = login(&broker, "t1chi-ada", PASSWORD).await;
+        let bob = login(&broker, "t1chi-bob", PASSWORD).await;
+        // Both children up (and so both homes provisioned) before the stub
+        // goes into Ada's.
+        for who in [&ada, &bob] {
+            let r = rpc(&broker, who, "os_username", json!({})).await;
+            assert_eq!(r["ok"], true, "{r}");
+        }
+        let ada_uid = std::fs::metadata(&ada_home).unwrap().uid();
+        assert_ne!(ada_uid, 0);
+        install_stub_claude(&ada_home);
+
+        let started = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "claude-code", "prompt": "hello" } }),
+        )
+        .await;
+        assert_eq!(started["ok"], true, "{started}");
+        let run_id = started["data"]["run_id"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let done = loop {
+            let s = rpc(&broker, &ada, "chi_status", json!({ "runId": run_id })).await;
+            if s["data"]["status"] == "done" {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "the run never finished: {s}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            done["data"]["output"],
+            format!("uid={ada_uid}"),
+            "the engine ran as the principal: {done}"
+        );
+        let cache = root.join("principals").join(&ada_id).join("data/chi-cache");
+        let meta = std::fs::metadata(&cache).unwrap();
+        assert_eq!(meta.uid(), ada_uid, "the chi cache is the principal's");
+
+        // Bob cannot read, resume or cancel it — it does not exist for him.
+        let not_found = format!("chi run not found: {run_id}");
+        for (cmd, args) in [
+            ("chi_status", json!({ "runId": run_id })),
+            ("chi_resume", json!({ "runId": run_id, "prompt": "x" })),
+            ("chi_cancel", json!({ "runId": run_id })),
+        ] {
+            let r = rpc(&broker, &bob, cmd, args).await;
+            assert_eq!(r["ok"], false, "{cmd}: {r}");
+            assert_eq!(r["error"], format!("{cmd}: {not_found}"), "{cmd}");
+        }
+        let still = rpc(&broker, &ada, "chi_status", json!({ "runId": run_id })).await;
+        assert_eq!(still["data"]["status"], "done", "{still}");
+
+        // A live run: Bob's cancel misses, Ada's lands.
+        let sleeper = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "claude-code", "prompt": "please sleep" } }),
+        )
+        .await;
+        let sleeper_id = sleeper["data"]["run_id"].as_str().unwrap().to_string();
+        let miss = rpc(&broker, &bob, "chi_cancel", json!({ "runId": sleeper_id })).await;
+        assert_eq!(miss["ok"], false, "{miss}");
+        let hit = rpc(&broker, &ada, "chi_cancel", json!({ "runId": sleeper_id })).await;
+        assert_eq!(hit["data"]["status"], "cancelled", "{hit}");
+
+        let (_, health) = get_json(&broker, "/api/health", None).await;
+        assert_eq!(health["executor"]["principal_isolation"], true, "{health}");
+    });
+    drop(broker);
+    drop(users);
+}
+
+/// An executable owned by the principal in `home/.local/bin` (on the
+/// child's PATH under T1).
+fn install_principal_stub(home: &Path, name: &str, script: &str) {
+    let meta = std::fs::metadata(home).unwrap();
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(name);
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for p in [home.join(".local"), bin, path] {
+        std::os::unix::fs::chown(&p, Some(meta.uid()), Some(meta.gid())).unwrap();
+    }
+}
+
+/// WP-P10 review regressions, on a real broker:
+///
+/// - **I-7, prompt in argv.** No engine gets the prompt on its command
+///   line, where every uid can read it from `/proc/<pid>/cmdline` unless the
+///   *reader's* procfs is `hidepid` (an SSH session uses the host `/proc`, so
+///   the unit's `ProtectProc=invisible` proves nothing). `pi`, which used to
+///   run as `pi -p <prompt>`, now runs on any `/proc` and reads the prompt
+///   from stdin.
+/// - **Operator secrets via cwd.** A `cwd` of `$IKENGA_SECRET_DEMO_KEY` is
+///   not expanded against the principal child's environment (which holds
+///   the operator default): codex gets the literal string as `--cd`.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_broker_chi_prompts_and_operator_secrets_stay_private() {
+    assert!(is_root(), "t1-root tests run as root");
+    const SECRET: &str = "operator-default-sk-DEMO123";
+    const PROMPT: &str = "ADA-PRIVATE: payroll export for Q3";
+    let users = HostUsers(vec!["ik-t1chp-ada".into()]);
+    let tmp = TempDir::new("chi-private");
+    let root = tmp.0.join("root");
+    let range = "28240-28250";
+    accounts(
+        &root,
+        range,
+        &["create", "t1chp-ada", "--admin", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    let ada_id = account_id(&root, range, "t1chp-ada");
+    let ada_home = root.join("principals").join(&ada_id).join("home");
+    let broker = start_broker_with_env(&tmp.0, &root, range, &[("IKENGA_SECRET_DEMO_KEY", SECRET)]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ada = login(&broker, "t1chp-ada", PASSWORD).await;
+        let r = rpc(&broker, &ada, "os_username", json!({})).await;
+        assert_eq!(r["ok"], true, "{r}");
+        install_principal_stub(
+            &ada_home,
+            "pi",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/pi-argv.txt.tmp"
+cat > "$HOME/pi-stdin.txt"
+mv "$HOME/pi-argv.txt.tmp" "$HOME/pi-argv.txt"
+echo '{"type":"session","version":3,"id":"pi-t1"}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}'
+"#,
+        );
+        install_principal_stub(
+            &ada_home,
+            "codex",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/codex-argv.txt.tmp"
+mv "$HOME/codex-argv.txt.tmp" "$HOME/codex-argv.txt"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"t1"}'
+echo '{"type":"turn.completed","usage":{}}'
+"#,
+        );
+
+        // I-7: the engine that used to take `-p <prompt>` runs, prompt on stdin.
+        let run = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "pi", "prompt": PROMPT } }),
+        )
+        .await;
+        assert_eq!(run["ok"], true, "{run}");
+        let pi_argv = ada_home.join("pi-argv.txt");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pi_argv.exists() {
+            assert!(Instant::now() < deadline, "pi never ran: {}", broker.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let argv = std::fs::read_to_string(&pi_argv).unwrap();
+        assert!(!argv.contains("ADA-PRIVATE"), "prompt in pi's argv: {argv}");
+        assert_eq!(argv.lines().collect::<Vec<_>>(), ["--mode", "json"]);
+        assert_eq!(
+            std::fs::read_to_string(ada_home.join("pi-stdin.txt")).unwrap(),
+            PROMPT
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let list = rpc(&broker, &ada, "chi_list", json!({ "engineId": "pi" })).await;
+            if list["data"][0]["status"] == "done" {
+                assert_eq!(list["data"][0]["external_id"], "pi-t1", "{list}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "pi run never finished: {list}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // Operator secret: the cwd stays literal all the way into the argv.
+        let run = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": {
+                "engineId": "codex", "prompt": "x", "cwd": "$IKENGA_SECRET_DEMO_KEY",
+            } }),
+        )
+        .await;
+        assert_eq!(run["ok"], true, "{run}");
+        let argv_file = ada_home.join("codex-argv.txt");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !argv_file.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "codex never ran: {}",
+                broker.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains(SECRET),
+            "the operator secret reached the engine argv"
+        );
+        let args: Vec<&str> = argv.lines().collect();
+        let cd = args.iter().position(|a| *a == "--cd").expect("--cd");
+        assert_eq!(args[cd + 1], "$IKENGA_SECRET_DEMO_KEY");
     });
     drop(broker);
     drop(users);

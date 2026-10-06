@@ -114,6 +114,7 @@ async fn child() -> Child {
         PathGuard::roots(Arc::new(roots)),
         None,
         DaemonAccess::principal_child(Default::default()),
+        None,
     );
     Child {
         _tmp: tmp,
@@ -236,6 +237,46 @@ async fn the_share_prehook_end_to_end() {
     );
 }
 
+/// The same relay with an explicit caps header.
+async fn call_with_caps(
+    c: &Child,
+    role: Option<&str>,
+    caps: &str,
+    cmd: &str,
+    args: Value,
+) -> Value {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/rpc")
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .header("x-ikenga-principal", PrincipalId::new_v7().to_string())
+        .header("x-ikenga-caps", caps);
+    if let Some(role) = role {
+        req = req
+            .header("x-ikenga-share-project", PROJECT)
+            .header(
+                "x-ikenga-share-principal",
+                PrincipalId::new_v7().to_string(),
+            )
+            .header("x-ikenga-share-device", "-")
+            .header("x-ikenga-share-role", role);
+    }
+    let res = c
+        .router
+        .clone()
+        .oneshot(
+            req.body(Body::from(json!({ "cmd": cmd, "args": args }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
 /// The broker's own `internal` call into this child (§4.5.3): the per-child
 /// token and the internal-call marker, no caps and no share headers.
 async fn broker_call(c: &Child, cmd: &str, args: Value) -> Value {
@@ -253,6 +294,70 @@ async fn broker_call(c: &Child, cmd: &str, args: Value) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&body).unwrap()
+}
+
+/// WP-P10: the Chi write arms are owner-class. A Chi run executes as the
+/// child's principal (the Owner) with the Owner's engine logins, so a share
+/// member — even an operator holding `dispatch` — may not start, resume or
+/// cancel one in the Owner's child; the refusal comes before the arm, so no
+/// row is ever written. The Owner's own request needs `dispatch`.
+#[tokio::test]
+async fn chi_write_arms_are_owner_only_in_a_principal_child() {
+    let c = child().await;
+    let run = json!({ "opts": { "engineId": "cursor-agent", "prompt": "hi", "cwd": "/tmp" } });
+    let all = "files,sessions,dispatch,approve,install,settings,secrets";
+
+    for (cmd, args) in [
+        ("chi_run", run.clone()),
+        ("chi_resume", json!({ "runId": "r1", "prompt": "x" })),
+        ("chi_cancel", json!({ "runId": "r1" })),
+    ] {
+        let shared = call_with_caps(&c, Some("operator"), all, cmd, args.clone()).await;
+        assert_eq!(shared["ok"], false, "{cmd}: {shared}");
+        assert!(
+            shared["error"].as_str().unwrap().starts_with("forbidden"),
+            "{cmd}: {shared}"
+        );
+        let no_dispatch = call_with_caps(&c, None, "files,sessions", cmd, args).await;
+        assert_eq!(
+            no_dispatch["error"], "forbidden: missing=dispatch",
+            "{cmd}: {no_dispatch}"
+        );
+    }
+    let listed = call_with_caps(
+        &c,
+        None,
+        all,
+        "chi_list",
+        json!({ "engineId": "cursor-agent" }),
+    )
+    .await;
+    assert_eq!(
+        listed["data"],
+        json!([]),
+        "no refused call wrote a row: {listed}"
+    );
+
+    // The Owner's own request with `dispatch` reaches the arm (cursor-agent
+    // then fails to start, leaving a failed row of the Owner's).
+    let own = call_with_caps(&c, None, all, "chi_run", run).await;
+    assert_eq!(own["ok"], false, "{own}");
+    assert!(
+        own["error"]
+            .as_str()
+            .unwrap()
+            .contains("cursor-agent runtime not implemented"),
+        "{own}"
+    );
+    let listed = call_with_caps(
+        &c,
+        None,
+        all,
+        "chi_list",
+        json!({ "engineId": "cursor-agent" }),
+    )
+    .await;
+    assert_eq!(listed["data"][0]["status"], "failed", "{listed}");
 }
 
 /// Gap audit 2026-10-06 rank 2: inviting to the built-in Default project
