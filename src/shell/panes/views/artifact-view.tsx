@@ -121,32 +121,42 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	}
 
 	let content: React.ReactNode;
-	if (stopped) {
-		content = <ArtifactStoppedPlate path={path} onRestart={restart} />;
-	} else if (variant === 'history') {
-		content = (
-			<VersionHistoryPanel path={path} onClose={() => setVariant(stateKey, 'default')} />
-		);
-	} else if (variant === 'source') {
+	// "Open source" is checked before `stopped`: the source editor reads and
+	// writes the file through fs_read / fs_write, not the viewer server, so a
+	// stopped (or, in a browser against the daemon, never-served — the daemon
+	// has no `viewer_port`) server must not hide it. Only the rendered half
+	// shows the stopped plate. Desktop and browser then reach F1's HTML source
+	// editing the same way (plans/file-editing).
+	if (variant === 'source') {
 		content = (
 			<div className="grid h-full min-h-0 grid-cols-2 divide-x divide-border">
 				{/* The rendered side stays read-only and keeps the raw disk key,
 				    so it refreshes on every save; the source side is the one
 				    editor for this file in this pane (plans/file-editing F1). */}
-				<DeviceZoomFrame device={device} zoom={zoom}>
-					<ViewerRouter
-						key={diskReloadKey}
-						path={path}
-						source="pane"
-						paneId={paneId}
-						chromeless
-						editable={false}
-					/>
-				</DeviceZoomFrame>
+				{stopped ? (
+					<ArtifactStoppedPlate path={path} onRestart={restart} />
+				) : (
+					<DeviceZoomFrame device={device} zoom={zoom}>
+						<ViewerRouter
+							key={diskReloadKey}
+							path={path}
+							source="pane"
+							paneId={paneId}
+							chromeless
+							editable={false}
+						/>
+					</DeviceZoomFrame>
+				)}
 				<Suspense fallback={<CodeViewLoading />}>
 					<CodeView path={path} line={line} col={col} editable paneId={paneId} />
 				</Suspense>
 			</div>
+		);
+	} else if (stopped) {
+		content = <ArtifactStoppedPlate path={path} onRestart={restart} />;
+	} else if (variant === 'history') {
+		content = (
+			<VersionHistoryPanel path={path} onClose={() => setVariant(stateKey, 'default')} />
 		);
 	} else {
 		content = (

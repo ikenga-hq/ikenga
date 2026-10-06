@@ -6,7 +6,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useEditingStore } from '@/lib/editing/editing-store';
+import { anyDirtySession, useEditingStore } from '@/lib/editing/editing-store';
 import { isMacPlatform } from '@/lib/keymap/platform';
 import { EditableTextFrame } from './editable-text-frame';
 import { MAX_EDITABLE_BYTES } from './text-document';
@@ -383,5 +383,95 @@ describe('EditableTextFrame — unsaved edits survive an unmount', () => {
 				expect.objectContaining({ path: '/w/a.ts', paneId: 'pane-x', mounted: true, editing: true })
 			);
 		});
+	});
+});
+
+// Regression: a stashed draft was only taken back on the success path, so a
+// file that had been moved, trashed or made uneditable while the tab was in
+// the background showed "Couldn't read this file" (or a read-only view) while
+// the draft sat unseen in the store — and the next unmount deleted it.
+describe('EditableTextFrame — a stashed draft whose file changed shape', () => {
+	async function stashDraft(path: string, draft: string) {
+		const first = mount(path);
+		const ed = await startEditing();
+		type(ed, draft);
+		first.unmount();
+		expect(
+			Object.values(useEditingStore.getState().sessions).some((v) => v.stash?.draft === draft)
+		).toBe(true);
+	}
+
+	it('file gone: back into Edit with the draft and the "moved or deleted" choice', async () => {
+		h.disk.set('/w/plan.md', enc('base'));
+		await stashDraft('/w/plan.md', 'mine');
+		h.disk.delete('/w/plan.md');
+		mount('/w/plan.md');
+		const ed = (await screen.findByLabelText('File source')) as HTMLTextAreaElement;
+		expect(ed.value).toBe('mine');
+		expect(screen.getByText(/moved or deleted/)).toBeTruthy();
+		expect(screen.queryByText(/Couldn't read this file/)).toBeNull();
+		fireEvent.click(screen.getByRole('button', { name: /Save anyway/ }));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/plan.md')).toBe('mine');
+	});
+
+	it('file gone, then switched away again: the draft is stashed again, not dropped', async () => {
+		h.disk.set('/w/plan.md', enc('base'));
+		await stashDraft('/w/plan.md', 'mine');
+		h.disk.delete('/w/plan.md');
+		const second = mount('/w/plan.md');
+		await screen.findByLabelText('File source');
+		second.unmount();
+		expect(
+			Object.values(useEditingStore.getState().sessions).some((v) => v.stash?.draft === 'mine')
+		).toBe(true);
+	});
+
+	it('file no longer editable: read-only, says the edits are kept, and keeps them', async () => {
+		h.disk.set('/w/notes.txt', enc('base'));
+		await stashDraft('/w/notes.txt', 'mine');
+		h.disk.set('/w/notes.txt', new Uint8Array([0x63, 0x61, 0x66, 0xe9]));
+		const second = mount('/w/notes.txt');
+		await ready();
+		expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.getByText(/unsaved edits are kept/)).toBeTruthy();
+		// Still counted as unsaved while shown…
+		expect(anyDirtySession()).toBe(true);
+		// …and still there after the next unmount.
+		second.unmount();
+		expect(
+			Object.values(useEditingStore.getState().sessions).some((v) => v.stash?.draft === 'mine')
+		).toBe(true);
+	});
+});
+
+// Regression: our own last write (A1) was remembered and excused forever. Once
+// the watcher adopted a newer disk text (A2) as the base, a revert of the file
+// to A1 was ignored by the watcher and by the save check, so a draft built on
+// A2 overwrote the revert without the conflict choice (F3).
+describe('EditableTextFrame — a revert to our own earlier save is a conflict', () => {
+	it('raises the conflict choice and does not write', async () => {
+		h.disk.set('/w/a.ts', enc('A0'));
+		mount('/w/a.ts');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		type(ed, 'A1');
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => expect(diskText('/w/a.ts')).toBe('A1'));
+		await waitFor(() => expect(screen.queryByLabelText('Unsaved changes')).toBeNull());
+		// An agent writes A2; the clean buffer adopts it.
+		h.disk.set('/w/a.ts', enc('A2'));
+		await act(async () => h.watchCb?.({ kind: 'modify', path: '/w/a.ts' }));
+		await waitFor(() => expect(ed.value).toBe('A2'));
+		type(ed, 'D');
+		// The agent reverts the file to A1.
+		h.disk.set('/w/a.ts', enc('A1'));
+		await act(async () => h.watchCb?.({ kind: 'modify', path: '/w/a.ts' }));
+		await screen.findByText(/changed on disk since you opened it/);
+		fsWriteText.mockClear();
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await screen.findByText(/changed on disk since you opened it/);
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(diskText('/w/a.ts')).toBe('A1');
 	});
 });

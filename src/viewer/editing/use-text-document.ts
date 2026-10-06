@@ -14,7 +14,7 @@
 // - Unsaved edits survive an unmount (tab switch) through the editing store.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { sessionKey, useEditingStore } from '@/lib/editing/editing-store';
+import { type StashedDraft, sessionKey, useEditingStore } from '@/lib/editing/editing-store';
 import { fsListenWatch, fsRead, fsUnwatch, fsWatch, fsWriteText } from '@/lib/tauri-cmd';
 import type { UnlistenFn } from '@/lib/transport';
 import {
@@ -110,7 +110,14 @@ export function useTextDocument({
 	const baseRef = useRef('');
 	const draftRef = useRef('');
 	const metaRef = useRef<DocumentMeta>(INITIAL.meta);
-	const lastSavedRef = useRef<string | null>(null);
+	// A draft stashed before this remount that cannot be applied to the file
+	// as it is now (too large, binary, not UTF-8). Held, never dropped: the
+	// session keeps reporting it as unsaved, and the next unmount stashes it
+	// again.
+	const heldStashRef = useRef<StashedDraft | null>(null);
+	// The load failed and a stashed draft was restored in its place: Cancel
+	// returns to that error instead of showing a file that is not there.
+	const loadErrorRef = useRef<string | null>(null);
 	const modeRef = useRef<'view' | 'edit'>('view');
 	const savingRef = useRef(false);
 	const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -148,7 +155,8 @@ export function useTextDocument({
 			const store = useEditingStore.getState();
 			const cur = store.sessions[key];
 			const unsaved = draftRef.current !== baseRef.current && modeRef.current === 'edit';
-			if (cur?.discarded || !unsaved) {
+			const held = heldStashRef.current;
+			if (cur?.discarded || (!unsaved && !held)) {
 				store.remove(key);
 				return;
 			}
@@ -158,7 +166,9 @@ export function useTextDocument({
 				mounted: false,
 				editing: false,
 				dirty: true,
-				stash: { draft: draftRef.current, base: baseRef.current, meta: metaRef.current },
+				stash: unsaved
+					? { draft: draftRef.current, base: baseRef.current, meta: metaRef.current }
+					: (held ?? undefined),
 			});
 		};
 	}, [key, path, paneId]);
@@ -172,25 +182,40 @@ export function useTextDocument({
 		setConflict(null);
 		setValidation(null);
 		setNotice(null);
-		lastSavedRef.current = null;
+		heldStashRef.current = null;
+		loadErrorRef.current = null;
 		fsRead(path)
 			.then((res) => {
 				if (cancelled) return;
+				// Take any stashed draft before deciding how to open the file, so
+				// no branch below can leave it behind unseen (and then drop it on
+				// the next unmount).
+				const stash = useEditingStore.getState().takeStash(path, paneId);
 				const dec = decodeForEdit(res.bytes);
 				if (!dec.ok) {
 					const text = decodeForView(res.bytes);
 					baseRef.current = text;
 					setDraft(text);
+					let blocked = dec.reason;
+					if (stash) {
+						// The draft cannot go into an editor for this file now.
+						// Keep it — still counted as unsaved by the close guard
+						// and the reload prompt — and say so.
+						heldStashRef.current = stash;
+						useEditingStore
+							.getState()
+							.upsert(sessionKey(path, paneId), { path, paneId, mounted: true, stash });
+						blocked = `${dec.reason} Your unsaved edits are kept but can’t be applied to the file as it is now.`;
+					}
 					setDoc({
 						load: { kind: 'ready' },
 						viewText: text,
 						base: text,
 						meta: INITIAL.meta,
-						blocked: dec.reason,
+						blocked,
 					});
 					return;
 				}
-				const stash = useEditingStore.getState().takeStash(path, paneId);
 				if (stash) {
 					// Unsaved edits from before this remount: back into Edit with
 					// them, and raise the conflict choice if the file moved on.
@@ -221,10 +246,28 @@ export function useTextDocument({
 			})
 			.catch((err) => {
 				if (cancelled) return;
-				setDoc({
-					...INITIAL,
-					load: { kind: 'error', message: err instanceof Error ? err.message : String(err) },
-				});
+				const message = err instanceof Error ? err.message : String(err);
+				const stash = useEditingStore.getState().takeStash(path, paneId);
+				if (stash) {
+					// The file is gone (moved, trashed, or unreadable) but there
+					// are unsaved edits for it: back into Edit with them and the
+					// "moved or deleted" choice, never a silent drop.
+					loadErrorRef.current = message;
+					metaRef.current = stash.meta;
+					baseRef.current = stash.base;
+					setDraft(stash.draft);
+					setDoc({
+						load: { kind: 'ready' },
+						viewText: stash.base,
+						base: stash.base,
+						meta: stash.meta,
+						blocked: null,
+					});
+					setMode('edit');
+					setConflict({ kind: 'deleted' });
+					return;
+				}
+				setDoc({ ...INITIAL, load: { kind: 'error', message } });
 			});
 		return () => {
 			cancelled = true;
@@ -268,7 +311,7 @@ export function useTextDocument({
 						setSaveState({ kind: 'idle' });
 						return;
 					}
-					if (isConflict(baseRef.current, disk, lastSavedRef.current)) {
+					if (isConflict(baseRef.current, disk)) {
 						setConflict({ kind: 'changed', theirs: disk });
 						setSaveState({ kind: 'idle' });
 						return;
@@ -283,7 +326,9 @@ export function useTextDocument({
 					});
 					return;
 				}
-				lastSavedRef.current = next; // the watcher ignores our own write
+				// The base is now what we wrote, so the watcher's `disk === base`
+				// check ignores our own write.
+				loadErrorRef.current = null;
 				adoptBase(next);
 				setConflict(null);
 				setSaveState({ kind: 'idle' });
@@ -318,6 +363,20 @@ export function useTextDocument({
 	}, []);
 
 	const cancel = useCallback(() => {
+		const loadError = loadErrorRef.current;
+		if (loadError !== null) {
+			// The draft stood in for a file that could not be read; discarding
+			// it leaves nothing to view but that error.
+			loadErrorRef.current = null;
+			baseRef.current = '';
+			setDraft('');
+			setMode('view');
+			setConflict(null);
+			setValidation(null);
+			setSaveState({ kind: 'idle' });
+			setDoc({ ...INITIAL, load: { kind: 'error', message: loadError } });
+			return;
+		}
 		setDraft(baseRef.current);
 		setMode('view');
 		setConflict(null);
@@ -354,7 +413,9 @@ export function useTextDocument({
 						return;
 					}
 					if (!active || savingRef.current) return;
-					if (disk === lastSavedRef.current || disk === baseRef.current) return;
+					// No "our last write" exception (see isConflict): after a save
+					// the base already is our write.
+					if (disk === baseRef.current) return;
 					if (draftRef.current === baseRef.current) {
 						adoptBase(disk);
 						setDraft(disk);

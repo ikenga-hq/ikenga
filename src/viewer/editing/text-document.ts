@@ -90,11 +90,16 @@ export function normaliseText(raw: string): string {
 	return s.includes('\r\n') ? s.replace(/\r\n/g, '\n') : s;
 }
 
-/** True when the on-disk text no longer matches what the editor loaded and is
- *  not simply our own last write. A plain string compare: exact, and needs no
- *  `crypto.subtle` (absent on plain-http daemon origins). */
-export function isConflict(base: string, disk: string, lastSaved: string | null): boolean {
-	return disk !== base && disk !== lastSaved;
+/** True when the on-disk text no longer matches what the editor's buffer is
+ *  based on. A plain string compare: exact, and needs no `crypto.subtle`
+ *  (absent on plain-http daemon origins).
+ *
+ *  There is deliberately no "our own last write" exception: a save adopts
+ *  what it wrote as the base, so our own write already equals `base`, and a
+ *  remembered last write goes stale as soon as the base is taken from disk —
+ *  a file reverted to it would then be overwritten without asking (F3). */
+export function isConflict(base: string, disk: string): boolean {
+	return disk !== base;
 }
 
 function dominantEol(text: string): Eol {

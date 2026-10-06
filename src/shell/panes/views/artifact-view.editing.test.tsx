@@ -11,6 +11,7 @@ import { sessionKey, useEditingStore } from '@/lib/editing/editing-store';
 const h = vi.hoisted(() => ({
 	disk: { changed: false, reloadKey: 0 },
 	mounts: 0,
+	stopped: false,
 }));
 
 vi.mock('@/viewer/auto-router', () => ({
@@ -24,18 +25,26 @@ vi.mock('@/viewer/auto-router', () => ({
 vi.mock('@/viewer/chrome/artifact-info-strip', () => ({
 	ArtifactInfoStrip: ({ kind }: { kind: string }) => <div data-testid={`strip-${kind}`} />,
 }));
-vi.mock('@/viewer/chrome/artifact-stopped-plate', () => ({ ArtifactStoppedPlate: () => null }));
+vi.mock('@/viewer/chrome/artifact-stopped-plate', () => ({
+	ArtifactStoppedPlate: () => <div data-testid="stopped-plate" />,
+}));
+vi.mock('@/viewer/renderers/code-view', () => ({
+	CodeView: ({ editable }: { editable?: boolean }) => (
+		<div data-testid="source-editor" data-editable={String(editable)} />
+	),
+}));
 vi.mock('@/viewer/chrome/use-artifact-disk-watch', () => ({
 	useArtifactDiskWatch: () => ({ ...h.disk, dismiss: () => {} }),
 }));
 vi.mock('@/viewer/chrome/use-viewer-server-health', () => ({
-	useViewerServerHealth: () => ({ stopped: false, restart: () => {} }),
+	useViewerServerHealth: () => ({ stopped: h.stopped, restart: () => {} }),
 }));
 vi.mock('@/viewer/history/version-history-panel', () => ({ VersionHistoryPanel: () => null }));
 vi.mock('@/lib/window/detached-surfaces', () => ({ useIsSurfaceDetached: () => false }));
 vi.mock('@/lib/window/window-two', () => ({ popOutSurface: vi.fn() }));
 vi.mock('@/shell/companion/seat-notice', () => ({ showSeatNotice: vi.fn() }));
 
+import { useViewerPaneState } from '@/viewer/viewer-pane-state';
 import { ArtifactView, useEditAwareReloadKey } from './artifact-view';
 
 function setEditing(editing: boolean) {
@@ -53,6 +62,7 @@ function setEditing(editing: boolean) {
 beforeEach(() => {
 	h.disk = { changed: false, reloadKey: 0 };
 	h.mounts = 0;
+	h.stopped = false;
 	useEditingStore.setState({ sessions: {} });
 });
 afterEach(cleanup);
@@ -100,5 +110,22 @@ describe('ArtifactView while editing', () => {
 		h.disk = { changed: true, reloadKey: 1 };
 		rerender(<ArtifactView path="/w/a.ts" paneId="p2" />);
 		expect(h.mounts).toBe(2);
+	});
+});
+
+// Regression (plans/file-editing F1): the daemon does not serve `viewer_port`,
+// so in a browser an HTML artifact always reads as "viewer server stopped".
+// The stopped plate used to replace the whole pane, Open source included, so
+// HTML source editing was unreachable in a browser.
+describe('ArtifactView — Open source with the viewer server stopped', () => {
+	it('still shows the source editor; only the rendered half shows the plate', async () => {
+		h.stopped = true;
+		render(<ArtifactView path="/w/page.html" paneId="p1" />);
+		expect(screen.getByTestId('stopped-plate')).toBeTruthy();
+		act(() => useViewerPaneState.getState().setVariant('p1', 'source'));
+		const editor = await screen.findByTestId('source-editor');
+		expect(editor.getAttribute('data-editable')).toBe('true');
+		expect(screen.getByTestId('stopped-plate')).toBeTruthy();
+		expect(screen.queryByTestId('viewer')).toBeNull();
 	});
 });

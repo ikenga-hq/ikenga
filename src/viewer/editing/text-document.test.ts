@@ -73,13 +73,16 @@ describe('decodeForEdit / encodeForSave', () => {
 
 describe('isConflict', () => {
 	it('is false when the disk still matches the base', () => {
-		expect(isConflict('a', 'a', null)).toBe(false);
-	});
-	it('is false when the disk holds our own last write', () => {
-		expect(isConflict('a', 'b', 'b')).toBe(false);
+		expect(isConflict('a', 'a')).toBe(false);
 	});
 	it('is true when the disk moved on', () => {
-		expect(isConflict('a', 'c', 'b')).toBe(true);
+		expect(isConflict('a', 'c')).toBe(true);
+	});
+	// Regression: a stale "our last write" (A1) once excused a disk that had
+	// been reverted to it after the editor adopted a newer base (A2), so a save
+	// built on A2 overwrote the revert without asking.
+	it('is true when the disk went back to an older text than the base', () => {
+		expect(isConflict('A2', 'A1')).toBe(true);
 	});
 });
 

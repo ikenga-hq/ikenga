@@ -4,7 +4,7 @@ import { writeClipboardText } from '@/lib/transport';
 import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
-import { confirmDiscard, guardedCloseTab } from '@/lib/panes/unsaved-guard';
+import { confirmDiscard, discardClosedSessions, guardedCloseTab } from '@/lib/panes/unsaved-guard';
 import { useDragState } from '@/lib/panes/drag-state';
 import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { TabStrip, Tab } from '@/components/ui/tab-strip';
@@ -63,12 +63,15 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 		const lf = findLeaf(usePaneStore.getState().root, leaf.id);
 		if (!lf) return;
 		const views = lf.tabs.filter((t, i) => pick(i) && !t.pinned);
-		if (!(await confirmDiscard(leaf.id, views))) return;
+		const keys = await confirmDiscard(leaf.id, views);
+		if (keys === null) return;
 		const now = findLeaf(usePaneStore.getState().root, leaf.id);
 		if (!now) return;
 		for (let i = now.tabs.length - 1; i >= 0; i--) {
 			if (views.includes(now.tabs[i])) closeTab(leaf.id, i);
 		}
+		// Only the tabs that really closed lose their edits.
+		discardClosedSessions(leaf.id, keys);
 	}
 	function closeOthers(keepIdx: number) {
 		void closeMany((i) => i !== keepIdx);
