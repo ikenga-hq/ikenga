@@ -25,6 +25,7 @@ import {
 	hasPendingReclaimNudge,
 	useIsSurfaceDetached,
 } from '@/lib/window/detached-surfaces';
+import { canPopOut } from '@/lib/window/window-two';
 import { popOutTerminal, terminalToastName } from '@/shell/companion/seat-menu';
 import { CostHud } from '@/terminal/cost-hud';
 import { GitLedger } from '@/terminal/git-ledger';
@@ -207,7 +208,7 @@ export function TerminalView({ sessionId }: TerminalViewProps) {
 						<ShieldAlert className="h-3.5 w-3.5" />
 					</IconButton>
 
-					{ptyId && (
+					{ptyId && canPopOut() && (
 						// Disabled up front when the terminal isn't running, as the
 						// seat menu's Pop out is: `popOutTerminal` refuses it anyway,
 						// so its refusal toast stays a fallback, not the normal path.
