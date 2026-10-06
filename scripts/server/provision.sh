@@ -14,6 +14,13 @@ set -euo pipefail
 # a profile field: `tailnet` binds the tailnet address only; `public-https`
 # binds loopback and fronts it with Caddy + Let's Encrypt. Plan and rationale:
 # plans/remote-provisioning/01-plan.md in the ikenga workspace repo.
+#
+# Supported AGENT_CLIS: claude (Claude Code), codex (OpenAI Codex CLI),
+# opencode (OpenCode), pi (Pi Coding Agent), agy (Antigravity CLI).
+# OpenRouter is a provider key, not a CLI: OPENROUTER_API_KEY (and other
+# model provider keys) goes in the SECRETS_FROM file, never in the profile
+# or argv. Among the installed CLIs, opencode and pi directly support
+# OPENROUTER_API_KEY as a provider key.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/ikenga}"
@@ -433,7 +440,20 @@ install_deps() {
     case "$cli" in
       claude)
         command -v claude >/dev/null || { run npm install -g @anthropic-ai/claude-code; changed "claude CLI installed"; } ;;
-      *) die "unknown AGENT_CLI '$cli' (allowed: claude)" ;;
+      codex)
+        command -v codex >/dev/null || { run npm install -g @openai/codex; changed "codex CLI installed"; } ;;
+      opencode)
+        command -v opencode >/dev/null || { run npm install -g opencode-ai; changed "opencode CLI installed"; } ;;
+      pi)
+        command -v pi >/dev/null || { run npm install -g @earendil-works/pi-coding-agent; changed "pi CLI installed"; } ;;
+      agy)
+        command -v agy >/dev/null || {
+          # Official installer auto-detects architecture (amd64 vs arm64) and installs system-wide to /usr/local/bin
+          run sh -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin'
+          run chmod 0755 /usr/local/bin/agy
+          changed "agy CLI installed"
+        } ;;
+      *) die "unknown AGENT_CLI '$cli' (allowed: claude codex opencode pi agy)" ;;
     esac
   done
 }
@@ -881,6 +901,10 @@ do_upgrade() {
   fi
 
   if [[ -f "$tmp/stage/$unit" ]]; then
+    if [[ -f "/etc/systemd/system/$unit" ]]; then
+      cp -a "/etc/systemd/system/$unit" "/etc/systemd/system/$unit.prev-$have"
+      note "previous unit saved as /etc/systemd/system/$unit.prev-$have (rollback guard)"
+    fi
     install -m 0644 "$tmp/stage/$unit" "/etc/systemd/system/$unit"
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
   fi
@@ -917,6 +941,10 @@ do_upgrade() {
   if [[ -d "$INSTALL_DIR/dist.prev-$have" ]]; then
     rm -rf "$INSTALL_DIR/dist"
     mv "$INSTALL_DIR/dist.prev-$have" "$INSTALL_DIR/dist"
+  fi
+  if [[ -f "/etc/systemd/system/$unit.prev-$have" ]]; then
+    cp -a "/etc/systemd/system/$unit.prev-$have" "/etc/systemd/system/$unit"
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
   fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl restart "$svc" 2>/dev/null || true

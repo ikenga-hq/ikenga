@@ -210,6 +210,9 @@ echo "==> [Container] TEST 3b PASSED: --force accepted with open terminals"
 
 # --- TEST 4: Automatic rollback on failing binary ---
 echo "==> [Container] TEST 4: Testing automatic rollback with failing binary..."
+mkdir -p /etc/systemd/system
+echo "# unit version 0.18.2" > /etc/systemd/system/ikenga-server-t1.service
+
 STAGE_FAIL="$TEST_DIR/stage-fail"
 mkdir -p "$STAGE_FAIL/bin"
 # Failing binary: exits 1 or refuses health
@@ -223,8 +226,9 @@ echo "Crashing immediately as simulated broken binary..."
 exit 1
 BIN
 chmod +x "$STAGE_FAIL/bin/ikenga-server"
+echo "# unit version 0.18.4-broken" > "$STAGE_FAIL/ikenga-server-t1.service"
 
-tar -czf "$TEST_DIR/releases/ikenga-server_0.18.4_linux_amd64.tar.gz" -C "$STAGE_FAIL" bin
+tar -czf "$TEST_DIR/releases/ikenga-server_0.18.4_linux_amd64.tar.gz" -C "$STAGE_FAIL" bin ikenga-server-t1.service
 SHA_FAIL="$(sha256sum "$TEST_DIR/releases/ikenga-server_0.18.4_linux_amd64.tar.gz" | awk '{print $1}')"
 SIZE_FAIL="$(wc -c < "$TEST_DIR/releases/ikenga-server_0.18.4_linux_amd64.tar.gz" | tr -d ' ')"
 
@@ -268,6 +272,12 @@ echo "$ERR_OUT" | grep -q "automatically rolled back to 0.18.2 successfully"
 # Verify current binary is back to 0.18.2
 CURRENT_VER="$("$INSTALL_DIR/bin/ikenga-server" --version)"
 [[ "$CURRENT_VER" == "ikenga-server 0.18.2" ]]
+
+# Verify unit file was rolled back and previous unit was saved
+[[ -f "/etc/systemd/system/ikenga-server-t1.service.prev-0.18.2" ]]
+grep -q "unit version 0.18.2" /etc/systemd/system/ikenga-server-t1.service
+! grep -q "unit version 0.18.4-broken" /etc/systemd/system/ikenga-server-t1.service
+echo "==> [Container] Unit rollback verified cleanly"
 
 # Verify service is running and healthy again
 curl -fsS http://127.0.0.1:4000/api/health | grep -q '"version": "0.18.2"'
