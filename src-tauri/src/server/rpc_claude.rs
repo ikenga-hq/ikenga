@@ -53,7 +53,9 @@ use super::shared::claude_config::{self, ClaudeConfig, ScanError};
 use super::shared::claude_sessions::{self, projects_root_in};
 use super::shared::claude_store::{self, DaemonChecks, Vault};
 use super::shared::projects::FsReach;
-use super::shared::{agent_config, agent_projects, engine_layout, settings_cascade, shell_detect};
+use super::shared::{
+    agent_config, agent_projects, agents, engine_layout, settings_cascade, shell_detect,
+};
 use super::AppState;
 
 /// The desktop's own error for "no home to resolve `~/.claude` against".
@@ -324,6 +326,22 @@ pub(super) async fn claude_session_list(state: &AppState, args: &Value) -> RpcRe
 }
 
 // ─── Wizard detection / layout ───────────────────────────────────────────────
+
+/// Scan $PATH for all known coding agents via the session executor.
+pub(super) async fn detect_agents() -> RpcResponse {
+    let r = Ok::<_, String>(agents::detect_all().await);
+    respond("detect_agents", r)
+}
+
+/// Detect a single known coding agent by id via the session executor.
+pub(super) async fn detect_agent(args: &Value) -> RpcResponse {
+    let r = async {
+        let agent_id: String = targ(args, &["agentId", "agent_id"])?;
+        Ok::<_, String>(agents::detect_by_id(&agent_id).await)
+    }
+    .await;
+    respond("detect_agent", r)
+}
 
 /// Counts under the caller's `rootPath` (confined) plus the router home's
 /// global counts. `root_path` echoes the caller's spelling, as the desktop's
@@ -1416,6 +1434,65 @@ mod tests {
             ok(r, "terminal_detect_shells", json!({})).await,
             wire(crate::server::shared::shell_detect::detect_shells())
         );
+
+        let all = ok(r, "detect_agents", json!({})).await;
+        assert!(all.is_array());
+        if let Some(first) = all.as_array().and_then(|a| a.first()) {
+            assert!(first.get("id").is_some());
+            assert!(first.get("display").is_some());
+            assert!(first.get("executable_path").is_some());
+            assert!(first.get("capabilities").is_some());
+
+            let first_id = first.get("id").unwrap().as_str().unwrap();
+            let one = ok(r, "detect_agent", json!({ "agentId": first_id })).await;
+            assert_eq!(one.get("id").and_then(|v| v.as_str()), Some(first_id));
+            let one_snake = ok(r, "detect_agent", json!({ "agent_id": first_id })).await;
+            assert_eq!(one_snake.get("id").and_then(|v| v.as_str()), Some(first_id));
+        }
+
+        let non = ok(r, "detect_agent", json!({ "agentId": "nonexistent-agent" })).await;
+        assert_eq!(non, Value::Null);
+        let non_snake = ok(r, "detect_agent", json!({ "agent_id": "nonexistent-agent" })).await;
+        assert_eq!(non_snake, Value::Null);
+    }
+
+    /// A stub `claude` is found at its exact path and actually run. The search
+    /// path is injected rather than prepended to `$PATH`: detection resolves
+    /// through the `OnceLock`-cached augmented path, so an env mutation is
+    /// invisible to it once any test has built that cache, and racing it
+    /// against the parallel arm tests made both flaky. Asserting the full
+    /// path and the stub's own version (not just the file name `claude`)
+    /// keeps a real install on the host from passing the test for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detect_agent_stub_on_path_and_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = daemon();
+        let r = &d.router;
+
+        // An absent engine is reported missing (null) by the daemon arm.
+        let absent = ok(r, "detect_agent", json!({ "agentId": "nonexistent-agent" })).await;
+        assert_eq!(absent, Value::Null);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join("claude");
+        std::fs::write(&stub, "#!/bin/sh\necho 'Claude Code 9.9.9'\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        use crate::server::shared::agents::detect_by_id_in;
+        let search = tmp.path().as_os_str();
+        let detected = detect_by_id_in("claude-code", search)
+            .await
+            .expect("stub claude on the injected search path is detected");
+        // Through the wire shape the arm serves.
+        let detected = wire(detected);
+        let stub_path = stub.display().to_string();
+        assert_eq!(detected["id"], json!("claude-code"));
+        assert_eq!(detected["executable_path"], json!(stub_path));
+        assert_eq!(detected["version"], json!("9.9.9"));
+
+        // Unknown ids stay absent whatever the search path holds.
+        assert!(detect_by_id_in("nonexistent-agent", search).await.is_none());
     }
 
     // ── what is missing ─────────────────────────────────────────────────────

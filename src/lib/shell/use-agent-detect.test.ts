@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { DetectedAgent } from '@/lib/tauri-cmd';
 
-import { applyProbeResult, entryFromProbe, pendingMap } from './use-agent-detect';
+import { applyProbeResult, computeAllMissing, entryFromProbe, pendingMap } from './use-agent-detect';
 
 function makeAgent(id: string): DetectedAgent {
 	return {
@@ -51,9 +51,9 @@ describe('entryFromProbe', () => {
 		expect(entry.error).toBeUndefined();
 	});
 
-	it('returns missing with the error message when the probe rejects', () => {
+	it('returns unknown with the error message when the probe rejects', () => {
 		const entry = entryFromProbe(null, new Error('boom'));
-		expect(entry.status).toBe('missing');
+		expect(entry.status).toBe('unknown');
 		expect(entry.error).toContain('boom');
 	});
 });
@@ -104,5 +104,45 @@ describe('applyProbeResult (run-token guard)', () => {
 		expect(map['claude-code'].status).toBe('missing');
 		map = applyProbeResult(map, 'claude-code', entryFromProbe(makeAgent('claude-code')), 1, 1);
 		expect(map['claude-code'].status).toBe('detected');
+	});
+});
+
+describe('computeAllMissing', () => {
+	const ids = ['claude-code', 'codex', 'gemini'];
+
+	it('returns false when at least one engine is detected', () => {
+		const results = {
+			'claude-code': { status: 'detected' as const },
+			codex: { status: 'missing' as const },
+			gemini: { status: 'missing' as const },
+		};
+		expect(computeAllMissing(results, ids)).toBe(false);
+	});
+
+	it('returns false when any engine is pending', () => {
+		const results = {
+			'claude-code': { status: 'pending' as const },
+			codex: { status: 'missing' as const },
+			gemini: { status: 'missing' as const },
+		};
+		expect(computeAllMissing(results, ids)).toBe(false);
+	});
+
+	it('returns false when any engine is unknown (probe failed/rejected)', () => {
+		const results = {
+			'claude-code': { status: 'unknown' as const, error: 'Command not implemented' },
+			codex: { status: 'missing' as const },
+			gemini: { status: 'missing' as const },
+		};
+		expect(computeAllMissing(results, ids)).toBe(false);
+	});
+
+	it('returns true when all engines are missing', () => {
+		const results = {
+			'claude-code': { status: 'missing' as const },
+			codex: { status: 'missing' as const },
+			gemini: { status: 'missing' as const },
+		};
+		expect(computeAllMissing(results, ids)).toBe(true);
 	});
 });
