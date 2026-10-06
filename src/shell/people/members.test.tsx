@@ -28,14 +28,18 @@ vi.mock('./frame', async (orig) => ({
 }));
 
 import type { AccessStatus } from '@/lib/access/client';
+import { useShellStore } from '@/lib/shell/shell-store';
+import type { Project } from '@/lib/tauri-cmd';
 
 import {
 	expiryLabel,
 	type MembersList,
 	MembersTab,
 	membersMode,
+	NO_FOLDER_REASON,
 	personName,
 	SOLO_DISABLED_REASON,
+	shareDisabledReason,
 } from './members';
 import {
 	cellEditable,
@@ -123,6 +127,33 @@ describe('members model', () => {
 		expect(personName({ username: null, principalId: OWNER })).toBe('01890a5d…');
 	});
 
+	it('decides the Share kola blocker, T0 first so the desktop never changes', () => {
+		const base = {
+			tier: 't1' as const,
+			adminStrength: true,
+			shareRole: null,
+			inShare: false,
+			hasFolder: true,
+		};
+		expect(shareDisabledReason(base)).toBeNull();
+		expect(shareDisabledReason({ ...base, hasFolder: false })).toBe(NO_FOLDER_REASON);
+		// T0 keeps its own reason, folder or not.
+		expect(shareDisabledReason({ ...base, tier: 't0', hasFolder: false })).toBe(
+			SOLO_DISABLED_REASON
+		);
+		expect(shareDisabledReason({ ...base, adminStrength: false, hasFolder: false })).toBe(
+			'Needs a password session or a Full device'
+		);
+		// Status not loaded yet: not a blocker.
+		expect(shareDisabledReason({ ...base, adminStrength: null })).toBeNull();
+		expect(shareDisabledReason({ ...base, inShare: true, shareRole: 'reviewer' })).toBe(
+			'Only the Owner and Operators can invite'
+		);
+		expect(
+			shareDisabledReason({ ...base, inShare: true, shareRole: 'operator', hasFolder: false })
+		).toBeNull();
+	});
+
 	it('is solo on T0 and on T1 with nobody shared', () => {
 		expect(membersMode('t0', LIST)).toBe('solo');
 		expect(membersMode('t1', { ...LIST, members: [], invites: [] })).toBe('solo');
@@ -175,6 +206,43 @@ describe('MembersTab', () => {
 		);
 		expect(await screen.findByText('Removed ada')).toBeTruthy();
 		expect(screen.getByRole('button', { name: /Undo/ })).toBeTruthy();
+	});
+
+	// Gap audit 2026-10-06 rank 2: a share is confined to the project's folder
+	// (G-ACCESS §4.5.4), so the folderless Default can't be shared — say so
+	// up front instead of failing the invite.
+	it('T1: Share kola is disabled on a project with no folder, with the reason', async () => {
+		const project = (id: string, root_path: string | null): Project => ({
+			id,
+			display_name: id === 'default' ? 'Default' : id,
+			root_path,
+			icon: null,
+			color: null,
+			description: null,
+			position: 0,
+			is_default: id === 'default',
+			created_at: 0,
+			archived_at: null,
+		});
+		const before = useShellStore.getState();
+		useShellStore.setState({
+			activeProjectId: 'default',
+			projects: [project('default', null), project('music', '/srv/music')],
+		});
+		try {
+			mocks.accessStatus.mockResolvedValue(t1Status());
+			mocks.accessMembersList.mockResolvedValue({ ...LIST, members: [], invites: [] });
+			mocks.accessSharesList.mockResolvedValue([]);
+			render(<MembersTab />);
+			expect(await screen.findByText(NO_FOLDER_REASON)).toBeTruthy();
+			const share = screen.getByRole('button', { name: /Share kola/ });
+			expect((share as HTMLButtonElement).disabled).toBe(true);
+		} finally {
+			useShellStore.setState({
+				activeProjectId: before.activeProjectId,
+				projects: before.projects,
+			});
+		}
 	});
 
 	it('revokes an invite with no Undo (D-6)', async () => {

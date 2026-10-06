@@ -13,7 +13,7 @@
 // useIykeControlListener). Never mount inside per-pane MemoryRouter
 // contexts.
 
-import { invoke } from '@/lib/transport';
+import { invoke, isTauri } from '@/lib/transport';
 import { listen, type UnlistenFn } from '@/lib/transport';
 import { useEffect } from 'react';
 import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
@@ -242,12 +242,18 @@ function patchConsole() {
 	});
 }
 
-function isIykeIpc(url: string): boolean {
+export function isIykeIpc(url: string): boolean {
 	// Tauri's invoke() routes through fetch under the hood. Capturing those
 	// would create a feedback loop (network shim pushes via invoke → fetch
 	// captures → push → ...). Drop ipc:// + tauri:// + the iyke control
-	// bridge endpoint itself.
-	return url.startsWith('ipc://') || url.startsWith('tauri://') || url.includes('/iyke/');
+	// bridge endpoint itself, and the daemon's `/api/rpc` — the HTTP
+	// transport's own endpoint, which is how a push leaves a browser tab.
+	return (
+		url.startsWith('ipc://') ||
+		url.startsWith('tauri://') ||
+		url.includes('/iyke/') ||
+		url.includes('/api/rpc')
+	);
 }
 
 function patchFetch() {
@@ -330,7 +336,19 @@ function patchXhr() {
 	};
 }
 
+/**
+ * Patch console / fetch / XHR so their traffic lands in the Rust ring
+ * buffers that `iyke logs` and `iyke network` read.
+ *
+ * Desktop only. Those buffers live in the Tauri process; a browser tab served
+ * by `ikenga-server` has nowhere to push to (`iyke_*_push` is not served), so
+ * patching there produced a self-feeding loop: every push was a failing
+ * `/api/rpc` POST, the fetch shim recorded that POST, the failed batch was
+ * requeued, and the next flush sent it again — about 3.4 requests a second
+ * on every screen, as 401s before a T1 sign-in.
+ */
 export function installInstrumentation() {
+	if (!isTauri()) return;
 	const g = globalThis as PatchedGlobal;
 	if (g[PATCH_FLAG]) return;
 	g[PATCH_FLAG] = true;
@@ -1075,6 +1093,10 @@ function handleKey(payload: KeyPayload) {
 export function useIykeBridge(): void {
 	useEffect(() => {
 		installIykeIframeMessageListener();
+		// `iyke://*` requests come from the desktop's iyke HTTP server; a
+		// browser tab has no producer for them, so subscribing would only
+		// leave a dozen dead listeners (and a warning apiece).
+		if (!isTauri()) return;
 
 		const unlisteners: UnlistenFn[] = [];
 		let cancelled = false;

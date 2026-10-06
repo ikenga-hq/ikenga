@@ -8,7 +8,7 @@
 // log/network entries (tagged with the source pane id) into the same
 // ring buffers the shell uses.
 
-import { invoke } from '@/lib/transport';
+import { invoke, isTauri } from '@/lib/transport';
 
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
@@ -189,6 +189,9 @@ export function installIykeIframeMessageListener() {
 				return;
 			}
 			case 'logs': {
+				// The ring buffers live in the desktop process; a browser tab
+				// has no `iyke_log_push` to forward to (see installInstrumentation).
+				if (!isTauri()) return;
 				const batch = (data.payload as Array<Record<string, unknown>>).map((entry) => ({
 					...entry,
 					source: paneId ?? 'iframe',
@@ -199,6 +202,7 @@ export function installIykeIframeMessageListener() {
 				return;
 			}
 			case 'network': {
+				if (!isTauri()) return;
 				const batch = (data.payload as Array<Record<string, unknown>>).map((entry) => ({
 					...entry,
 					source: paneId ?? 'iframe',
