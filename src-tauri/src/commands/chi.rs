@@ -610,10 +610,11 @@ pub async fn chi_list(
 #[tauri::command]
 pub async fn chi_cancel(
     db: State<'_, Arc<PaDb>>,
+    cache: State<'_, ChiCache>,
     runtime: State<'_, Arc<ChiRuntime>>,
     #[allow(non_snake_case)] runId: String,
 ) -> Result<ChiRunResult, String> {
-    chi_exec::cancel_run(&db, &runtime, &runId).await
+    chi_exec::cancel_run(&db, &runtime, &cache.cache_dir(), &runId).await
 }
 
 // ═══════════════════════════════════════════════════════════════════════

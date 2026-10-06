@@ -641,26 +641,6 @@ fn t1_root_broker_chi_runs_are_per_principal() {
     drop(users);
 }
 
-/// Whether this mount namespace's `/proc` is `hidepid` (the topmost `proc`
-/// mount on `/proc`, any mode but off) — the broker's principal children see
-/// the same `/proc`, and run argv-prompt engines only when it is.
-fn proc_is_hidepid() -> bool {
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| {
-            let (pre, post) = l.split_once(" - ")?;
-            let mut post = post.split_whitespace();
-            (pre.split_whitespace().nth(4) == Some("/proc") && post.next() == Some("proc"))
-                .then(|| post.nth(1).unwrap_or("").to_string())
-        })
-        .last()
-        .is_some_and(|o| {
-            o.split(',')
-                .any(|o| o.starts_with("hidepid=") && o != "hidepid=0" && o != "hidepid=off")
-        })
-}
-
 /// An executable owned by the principal in `home/.local/bin` (on the
 /// child's PATH under T1).
 fn install_principal_stub(home: &Path, name: &str, script: &str) {
@@ -677,11 +657,12 @@ fn install_principal_stub(home: &Path, name: &str, script: &str) {
 
 /// WP-P10 review regressions, on a real broker:
 ///
-/// - **I-7, prompt in argv.** `pi`/`opencode`/`antigravity-cli` take the
-///   prompt as `-p <prompt>`, readable by every uid from
-///   `/proc/<pid>/cmdline` unless `/proc` is `hidepid`. Where it is not
-///   (this container), the run is refused before anything spawns; where it
-///   is (the T1 unit's `ProtectProc=invisible`), it runs.
+/// - **I-7, prompt in argv.** No engine gets the prompt on its command
+///   line, where every uid can read it from `/proc/<pid>/cmdline` unless the
+///   *reader's* procfs is `hidepid` (an SSH session uses the host `/proc`, so
+///   the unit's `ProtectProc=invisible` proves nothing). `pi`, which used to
+///   run as `pi -p <prompt>`, now runs on any `/proc` and reads the prompt
+///   from stdin.
 /// - **Operator secrets via cwd.** A `cwd` of `$IKENGA_SECRET_DEMO_KEY` is
 ///   not expanded against the principal child's environment (which holds
 ///   the operator default): codex gets the literal string as `--cd`.
@@ -713,7 +694,13 @@ fn t1_root_broker_chi_prompts_and_operator_secrets_stay_private() {
         install_principal_stub(
             &ada_home,
             "pi",
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/pi-argv.txt\"\n",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/pi-argv.txt.tmp"
+cat > "$HOME/pi-stdin.txt"
+mv "$HOME/pi-argv.txt.tmp" "$HOME/pi-argv.txt"
+echo '{"type":"session","version":3,"id":"pi-t1"}'
+echo '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}'
+"#,
         );
         install_principal_stub(
             &ada_home,
@@ -727,7 +714,7 @@ echo '{"type":"turn.completed","usage":{}}'
 "#,
         );
 
-        // I-7: the argv-prompt engine.
+        // I-7: the engine that used to take `-p <prompt>` runs, prompt on stdin.
         let run = rpc(
             &broker,
             &ada,
@@ -735,20 +722,29 @@ echo '{"type":"turn.completed","usage":{}}'
             json!({ "opts": { "engineId": "pi", "prompt": PROMPT } }),
         )
         .await;
-        if proc_is_hidepid() {
-            assert_eq!(run["ok"], true, "hidepid /proc: argv engines run: {run}");
-        } else {
-            assert_eq!(run["ok"], false, "{run}");
-            let e = run["error"].as_str().unwrap();
-            assert!(e.contains("takes its prompt on the command line"), "{e}");
-            assert!(!e.contains("ADA-PRIVATE"), "{e}");
+        assert_eq!(run["ok"], true, "{run}");
+        let pi_argv = ada_home.join("pi-argv.txt");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pi_argv.exists() {
+            assert!(Instant::now() < deadline, "pi never ran: {}", broker.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let argv = std::fs::read_to_string(&pi_argv).unwrap();
+        assert!(!argv.contains("ADA-PRIVATE"), "prompt in pi's argv: {argv}");
+        assert_eq!(argv.lines().collect::<Vec<_>>(), ["--mode", "json"]);
+        assert_eq!(
+            std::fs::read_to_string(ada_home.join("pi-stdin.txt")).unwrap(),
+            PROMPT
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
             let list = rpc(&broker, &ada, "chi_list", json!({ "engineId": "pi" })).await;
-            assert_eq!(list["data"][0]["status"], "failed", "{list}");
-            std::thread::sleep(Duration::from_millis(500));
-            assert!(
-                !ada_home.join("pi-argv.txt").exists(),
-                "the refused engine never ran"
-            );
+            if list["data"][0]["status"] == "done" {
+                assert_eq!(list["data"][0]["external_id"], "pi-t1", "{list}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "pi run never finished: {list}");
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Operator secret: the cwd stays literal all the way into the argv.

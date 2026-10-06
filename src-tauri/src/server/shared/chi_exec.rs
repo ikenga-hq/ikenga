@@ -223,9 +223,6 @@ pub(crate) struct ChiEnv {
     pub resolver: Arc<dyn EngineResolver>,
     /// How a run's `cwd` is expanded (see [`CwdExpansion`]).
     pub cwd_expansion: CwdExpansion,
-    /// Whether an engine that takes its prompt on the command line may run
-    /// (see [`PromptInArgv`]).
-    pub prompt_in_argv: PromptInArgv,
 }
 
 /// How a run's `cwd` is expanded before it is used.
@@ -242,101 +239,85 @@ pub(crate) enum CwdExpansion {
     TildeOnly,
 }
 
-/// Whether an engine that takes its prompt as a command-line argument
-/// ([`prompt_rides_argv`]) may run here.
-///
-/// On Linux any uid can read any process's argv from `/proc/<pid>/cmdline`
-/// unless `/proc` is mounted `hidepid`. On the desktop and under T0 the only
-/// principal is the operator, so that is the desktop's status quo. Under T1
-/// another principal on the same host could read the prompt (I-7), so such
-/// engines run only when `/proc` hides other uids' processes (the T1 unit's
-/// `ProtectProc=invisible`). claude-code and codex take the prompt on stdin
-/// and are never affected.
+// ── The prompt never rides argv (I-7) ─────────────────────────────────────
+//
+// Any uid on the host can read any process's argv from `/proc/<pid>/cmdline`
+// unless the *reader's* procfs is mounted `hidepid` — and that is a property
+// of the reader's mount namespace, not ours: the T1 unit's
+// `ProtectProc=invisible` hides nothing from a principal who is signed in
+// over SSH on the host `/proc`. So no check this process can make proves the
+// argv private, and every engine takes the run's prompt (and a resume's
+// follow-up) on stdin instead — a pipe only this process and the engine
+// hold. `build_engine_command_with` takes no prompt at all, so an arm cannot
+// put it back on the command line; `no_engine_ever_sees_the_prompt_in_argv`
+// runs each engine against a stub that records its argv and stdin.
+//
+// The detached `chi-runner` (iyke-cli) is a separate binary that builds its
+// own engine argv: it puts the antigravity-cli prompt on the command line
+// (`agy -p <prompt>`) and doesn't run opencode or pi at all. Only the engines
+// it feeds on stdin ([`RUNNER_STDIN_ENGINES`]) go detached; a persistent run
+// of any other engine runs in-process and says so (see [`spawn_run`]).
+
+/// How an engine reads a run's prompt from stdin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PromptInArgv {
-    Allowed,
-    /// Refused: another uid on this host could read the prompt.
-    Refused,
+pub(crate) enum PromptStdin {
+    /// `claude --input-format stream-json`: one `{"type":"user",…}` line.
+    ClaudeStreamJson,
+    /// `agy --input-format stream-json` (agy 1.1.15+): one
+    /// `{"event":"user","message":{"content":…}}` line per turn.
+    AgyStreamJson,
+    /// The bare text, read to EOF: `codex exec -`, `opencode run` (reads a
+    /// non-TTY stdin as the message), `pi --mode json` (merges piped stdin
+    /// into the initial prompt).
+    Raw,
 }
 
-/// Engines whose prompt is a command-line argument (`-p <prompt>`), in
-/// [`build_engine_command_with`] and in the detached `chi-runner`.
-/// `prompt_in_argv_matches_the_engine_commands` keeps this list honest.
-pub(crate) const PROMPT_IN_ARGV_ENGINES: &[&str] = &["antigravity-cli", "opencode", "pi"];
-
-/// Whether `engine_id` takes its prompt on the command line.
-pub(crate) fn prompt_rides_argv(engine_id: &str) -> bool {
-    PROMPT_IN_ARGV_ENGINES.contains(&engine_id)
-}
-
-/// The daemon's [`PromptInArgv`]: allowed under T0 (the desktop's
-/// behaviour), above T0 only when `/proc` hides other uids' processes.
-pub(crate) fn prompt_in_argv_policy(
-    tier: ExecutorTier,
-    proc_hides_other_uids: bool,
-) -> PromptInArgv {
-    if tier == ExecutorTier::T0 || proc_hides_other_uids {
-        PromptInArgv::Allowed
-    } else {
-        PromptInArgv::Refused
+/// How `engine_id` takes its prompt. Every engine takes it on stdin.
+pub(crate) fn prompt_stdin(engine_id: &str) -> PromptStdin {
+    match engine_id {
+        "claude-code" => PromptStdin::ClaudeStreamJson,
+        "antigravity-cli" => PromptStdin::AgyStreamJson,
+        _ => PromptStdin::Raw,
     }
 }
 
-/// Whether the `/proc` this process sees is mounted `hidepid` (any mode but
-/// `off`/`0`), from `/proc/self/mountinfo` text: the last `proc` mount on
-/// `/proc` is the one on top. `noaccess`/`1`, `invisible`/`2` and
-/// `ptraceable`/`4` all deny another uid `/proc/<pid>/cmdline`. (A `gid=`
-/// exemption group is irrelevant to T1: principal processes hold no
-/// supplementary groups.)
-pub(crate) fn mountinfo_proc_hides_other_uids(mountinfo: &str) -> bool {
-    mountinfo
-        .lines()
-        .filter_map(|line| {
-            let (pre, post) = line.split_once(" - ")?;
-            let mount_point = pre.split_whitespace().nth(4)?;
-            let mut post = post.split_whitespace();
-            let fstype = post.next()?;
-            let _source = post.next()?;
-            let super_opts = post.next().unwrap_or("");
-            (mount_point == "/proc" && fstype == "proc").then_some(super_opts)
-        })
-        .last()
-        .is_some_and(|opts| {
-            opts.split(',').any(|o| {
-                o.strip_prefix("hidepid=")
-                    .is_some_and(|v| v != "0" && v != "off")
-            })
-        })
-}
-
-/// [`mountinfo_proc_hides_other_uids`] for this process. `false` (not
-/// hidden) wherever it can't be read, and off Linux.
-pub(crate) fn proc_hides_other_uids() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/self/mountinfo")
-            .map(|m| mountinfo_proc_hides_other_uids(&m))
-            .unwrap_or(false)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
+/// The bytes written to `engine_id`'s stdin for `prompt` (stdin is closed
+/// after them, which ends the turn).
+pub(crate) fn stdin_payload(engine_id: &str, prompt: &str) -> String {
+    match prompt_stdin(engine_id) {
+        PromptStdin::ClaudeStreamJson => user_envelope(prompt),
+        PromptStdin::AgyStreamJson => {
+            let value = serde_json::json!({
+                "event": "user",
+                "message": { "content": prompt },
+            });
+            let mut s = serde_json::to_string(&value).unwrap_or_else(|_| String::from("{}"));
+            s.push('\n');
+            s
+        }
+        PromptStdin::Raw => prompt.to_string(),
     }
 }
 
-/// The refusal for an argv-prompt engine where [`PromptInArgv::Refused`].
-pub(crate) fn prompt_in_argv_refusal(engine_id: &str) -> String {
+/// Engines the detached `chi-runner` hands the prompt on stdin. It builds
+/// `agy -p <prompt>` for antigravity-cli and refuses opencode / pi, so a
+/// persistent run of those stays in-process instead.
+pub(crate) const RUNNER_STDIN_ENGINES: &[&str] = &["claude-code", "codex"];
+
+/// The warning a persistent run of an engine outside
+/// [`RUNNER_STDIN_ENGINES`] carries: it ran in-process, so it will not
+/// survive a restart. Never names the prompt.
+pub(crate) fn not_detachable_warning(engine_id: &str) -> String {
     format!(
-        "engine {engine_id} takes its prompt on the command line, which other users on this \
-         host can read from /proc/<pid>/cmdline; under a multi-user executor tier it runs only \
-         when /proc is mounted hidepid (systemd ProtectProc=invisible). claude-code and codex \
-         take the prompt on stdin and are not affected"
+        "persistent run fell back to in-process: chi-runner would pass the {engine_id} prompt \
+         on the command line, where other users on this host can read it, so {engine_id} runs \
+         only in-process. This run will NOT survive quitting the app."
     )
 }
 
 impl ChiEnv {
     /// The desktop's shape: no default cwd, stored output paths, host PATH,
-    /// full cwd expansion, argv prompts allowed.
+    /// full cwd expansion.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     pub(crate) fn new(db: Arc<PaDb>, cache_dir: PathBuf, runtime: Arc<ChiRuntime>) -> Self {
         Self {
@@ -347,17 +328,6 @@ impl ChiEnv {
             files: OutputFiles::AsStored,
             resolver: Arc::new(HostResolver),
             cwd_expansion: CwdExpansion::Full,
-            prompt_in_argv: PromptInArgv::Allowed,
-        }
-    }
-
-    /// `Err` when `engine_id` would put its prompt where another uid could
-    /// read it (see [`PromptInArgv`]).
-    fn check_prompt_in_argv(&self, engine_id: &str) -> Result<(), String> {
-        if self.prompt_in_argv == PromptInArgv::Refused && prompt_rides_argv(engine_id) {
-            Err(prompt_in_argv_refusal(engine_id))
-        } else {
-            Ok(())
         }
     }
 
@@ -366,8 +336,17 @@ impl ChiEnv {
         self.cache_dir.join(format!("{run_id}.json"))
     }
 
+    /// Create the cache dir, owner-only on Unix: it holds each run's output
+    /// and a persistent run's runner conf (which carries the prompt).
     pub(crate) fn ensure_cache_dir(&self) -> Result<(), String> {
-        std::fs::create_dir_all(&self.cache_dir).map_err(|e| format!("chi-cache dir: {e}"))
+        std::fs::create_dir_all(&self.cache_dir).map_err(|e| format!("chi-cache dir: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.cache_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chi-cache dir permissions: {e}"))?;
+        }
+        Ok(())
     }
 
     /// cwd for a run: the caller's, else the surface default, else the
@@ -973,11 +952,11 @@ pub(crate) fn runner_model(engine_id: &str, model: Option<&str>) -> Option<Strin
     }
 }
 
-/// Return the command for the requested engine.
+/// Return the command for the requested engine. It takes no prompt: every
+/// engine reads it from stdin ([`stdin_payload`]), never from argv (I-7).
 pub(crate) fn build_engine_command_with(
     resolver: &dyn EngineResolver,
     engine_id: &str,
-    prompt: &str,
     cwd: &str,
     model: Option<&str>,
     mode: Option<&str>,
@@ -1016,9 +995,17 @@ pub(crate) fn build_engine_command_with(
             }
             Ok(engine_command(&launch, &args, cwd, true))
         }
+        // agy's print mode takes the prompt as `-p <prompt>`; its stream-json
+        // input (no `-p`) reads one `{"event":"user",…}` line per turn from
+        // stdin instead, and ends at EOF.
         "antigravity-cli" => {
             let launch = resolve_engine("agy", resolver)?;
-            let mut args = vec![s("-p"), s(prompt), s("--output-format"), s("stream-json")];
+            let mut args = vec![
+                s("--input-format"),
+                s("stream-json"),
+                s("--output-format"),
+                s("stream-json"),
+            ];
             if let Some(id) = resume_id {
                 args.extend([s("--conversation"), s(id)]);
             }
@@ -1055,17 +1042,27 @@ pub(crate) fn build_engine_command_with(
             }
             Ok(engine_command(&launch, &args, cwd, false))
         }
+        // `opencode run` with no message reads a non-TTY stdin as the message;
+        // `--format json` streams its events. (`-p` here is `--password`.)
         "opencode" => {
             let launch = resolve_engine("opencode", resolver)?;
-            let mut args = vec![s("run"), s("-p"), s(prompt)];
+            let mut args = vec![s("run"), s("--format"), s("json")];
+            if let Some(id) = resume_id {
+                args.extend([s("--session"), s(id)]);
+            }
             if let Some(m) = model {
                 args.extend([s("--model"), s(m)]);
             }
             Ok(engine_command(&launch, &args, cwd, true))
         }
+        // `pi --mode json` merges piped stdin into the initial prompt and
+        // streams its session events as JSON lines.
         "pi" => {
             let launch = resolve_engine("pi", resolver)?;
-            let mut args = vec![s("-p"), s(prompt)];
+            let mut args = vec![s("--mode"), s("json")];
+            if let Some(id) = resume_id {
+                args.extend([s("--session"), s(id)]);
+            }
             if let Some(m) = model {
                 args.extend([s("--model"), s(m)]);
             }
@@ -1172,10 +1169,30 @@ async fn start_reader(
     let db = env.db.clone();
     let runtime = env.runtime.clone();
     let run_id = run_id.to_string();
+    let payload = stdin_payload(&engine_id, &prompt);
+    drop(prompt);
     let keepalive = crate::access::KeepAlive::hold();
     tokio::spawn(async move {
         let _keepalive = keepalive;
         let task_run_id = run_id.clone();
+        // Every engine reads its prompt here, never from argv (I-7).
+        if let Err(e) = write_prompt(stdin, &payload).await {
+            // Terminal failure: close the row out through `cache_update_done`
+            // so it gets `ended_at` and the WP-40 `run_failed` notification.
+            cache_update_done(
+                &db,
+                &run_id,
+                "failed",
+                Some(&format!("stdin write: {e}")),
+                false,
+                None,
+            )
+            .await
+            .ok();
+            runtime.release(&run_id, &handle).await;
+            return;
+        }
+        drop(payload);
         match engine_id.as_str() {
             "antigravity-cli" => {
                 antigravity_one_off_task(
@@ -1196,10 +1213,36 @@ async fn start_reader(
                     output_path,
                     child,
                     cancelled,
-                    stdin,
                     stdout,
                     stderr,
-                    prompt,
+                )
+                .await
+            }
+            "opencode" => {
+                json_lines_task(
+                    db,
+                    task_run_id,
+                    output_path,
+                    child,
+                    cancelled,
+                    stdout,
+                    stderr,
+                    "opencode",
+                    parse_opencode_line,
+                )
+                .await
+            }
+            "pi" => {
+                json_lines_task(
+                    db,
+                    task_run_id,
+                    output_path,
+                    child,
+                    cancelled,
+                    stdout,
+                    stderr,
+                    "pi",
+                    parse_pi_line,
                 )
                 .await
             }
@@ -1210,10 +1253,8 @@ async fn start_reader(
                     output_path,
                     child,
                     cancelled,
-                    stdin,
                     stdout,
                     stderr,
-                    prompt,
                 )
                 .await
             }
@@ -1224,50 +1265,35 @@ async fn start_reader(
     });
 }
 
+/// Write the prompt payload and close stdin for real. `shutdown()` on a
+/// child pipe does not close the handle, so it is dropped: until the write
+/// end closes, a stream-json engine waits for more input and a read-to-EOF
+/// engine (codex `-`, opencode, pi) never starts.
+async fn write_prompt(mut stdin: tokio::process::ChildStdin, payload: &str) -> std::io::Result<()> {
+    stdin.write_all(payload.as_bytes()).await?;
+    let _ = stdin.flush().await;
+    let _ = stdin.shutdown().await;
+    drop(stdin);
+    Ok(())
+}
+
 /// Whether a finished run's output is flagged `output_truncated`.
 fn is_truncated(output: &str) -> bool {
     output.len() > 100_000
 }
 
-/// Background task for a Claude Code one-off. Reads `stdout`, writes partial
+/// Background task for a Claude Code one-off (its prompt envelope already
+/// written to stdin by [`start_reader`]). Reads `stdout`, writes partial
 /// output to `output_path`, and updates `chi_cache` as the run progresses.
-#[allow(clippy::too_many_arguments)]
 async fn claude_one_off_task(
     db: Arc<PaDb>,
     run_id: String,
     output_path: PathBuf,
     child: Arc<Mutex<Child>>,
     cancelled: Arc<AtomicBool>,
-    mut stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
-    prompt: String,
 ) {
-    // Send the initial prompt envelope.
-    let envelope = user_envelope(&prompt);
-    if let Err(e) = stdin.write_all(envelope.as_bytes()).await {
-        // Terminal failure: close the row out through `cache_update_done` so it
-        // gets `ended_at` and the WP-40 `run_failed` notification.
-        cache_update_done(
-            &db,
-            &run_id,
-            "failed",
-            Some(&format!("stdin write: {e}")),
-            false,
-            None,
-        )
-        .await
-        .ok();
-        return;
-    }
-    let _ = stdin.flush().await;
-    // Close stdin so claude knows no more input is coming for this turn.
-    // `shutdown()` on a child pipe does not close the handle, so drop it:
-    // until the write end closes, stream-json claude waits for more input
-    // and the run never finishes.
-    let _ = stdin.shutdown().await;
-    drop(stdin);
-
     log_stderr("claude", stderr);
 
     let mut parser = StreamParser::new();
@@ -1492,40 +1518,17 @@ async fn antigravity_one_off_task(
 ///
 /// Reads the JSONL event stream from stdout via `codex_pty::parser`, extracts
 /// `agent_message` text chunks and the `thread.started` thread id (stored as
-/// `external_id` so `chi_resume` can pass it back as `--resume <id>`).
-#[allow(clippy::too_many_arguments)]
+/// `external_id` so `chi_resume` can pass it back as `--resume <id>`). The
+/// prompt was already written to stdin (the `-` positional) and closed.
 async fn codex_one_off_task(
     db: Arc<PaDb>,
     run_id: String,
     output_path: PathBuf,
     child: Arc<Mutex<Child>>,
     cancelled: Arc<AtomicBool>,
-    mut stdin: tokio::process::ChildStdin,
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
-    prompt: String,
 ) {
-    // Write prompt to stdin then close it so codex knows EOF.
-    if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-        // Terminal failure: see the matching note in `claude_one_off_task`.
-        cache_update_done(
-            &db,
-            &run_id,
-            "failed",
-            Some(&format!("stdin write: {e}")),
-            false,
-            None,
-        )
-        .await
-        .ok();
-        return;
-    }
-    let _ = stdin.flush().await;
-    let _ = stdin.shutdown().await;
-    // Close the pipe for real so codex sees EOF on the `-` prompt (see
-    // claude_one_off_task).
-    drop(stdin);
-
     log_stderr("codex", stderr);
 
     let mut reader = BufReader::new(stdout).lines();
@@ -1616,6 +1619,173 @@ async fn codex_one_off_task(
     let _ = child.try_wait();
 }
 
+/// What one JSON line of an engine's event stream contributes to the run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LineEvent {
+    /// The engine-native session id (stored as `external_id` for resume).
+    pub session_id: Option<String>,
+    /// Assistant text to append to the output.
+    pub text: Option<String>,
+    /// The turn finished.
+    pub done: bool,
+    /// The engine reported a failure.
+    pub error: Option<String>,
+}
+
+fn str_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    path.iter()
+        .try_fold(v, |v, k| v.get(*k))
+        .and_then(|v| v.as_str())
+}
+
+/// `opencode run --format json`: every event carries `sessionID`; a `text`
+/// event carries a finished text part, `step_finish` ends a step (the turn,
+/// unless its reason is `tool-calls`), `error` a failure.
+pub(crate) fn parse_opencode_line(v: &serde_json::Value) -> LineEvent {
+    let mut ev = LineEvent {
+        session_id: str_at(v, &["sessionID"])
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        ..LineEvent::default()
+    };
+    match str_at(v, &["type"]) {
+        Some("text") => ev.text = str_at(v, &["part", "text"]).map(str::to_string),
+        Some("step_finish") => ev.done = str_at(v, &["part", "reason"]) != Some("tool-calls"),
+        Some("error") => {
+            ev.error = Some(
+                str_at(v, &["error", "data", "message"])
+                    .or_else(|| str_at(v, &["error", "name"]))
+                    .unwrap_or("opencode reported an error")
+                    .to_string(),
+            )
+        }
+        _ => {}
+    }
+    ev
+}
+
+/// `pi --mode json`: a `session` header (its `id`), `message_update` events
+/// whose `assistantMessageEvent` is a `text_delta`, and `agent_end` — whose
+/// last assistant message has `stopReason` `error` / `aborted` on failure.
+pub(crate) fn parse_pi_line(v: &serde_json::Value) -> LineEvent {
+    let mut ev = LineEvent::default();
+    match str_at(v, &["type"]) {
+        Some("session") => {
+            ev.session_id = str_at(v, &["id"])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+        Some("message_update") => {
+            if str_at(v, &["assistantMessageEvent", "type"]) == Some("text_delta") {
+                ev.text = str_at(v, &["assistantMessageEvent", "delta"]).map(str::to_string);
+            }
+        }
+        Some("agent_end") => {
+            ev.done = true;
+            let last = v.get("messages").and_then(|m| m.as_array()).and_then(|m| {
+                m.iter()
+                    .rev()
+                    .find(|m| str_at(m, &["role"]) == Some("assistant"))
+            });
+            if let Some(last) = last {
+                if let Some(reason @ ("error" | "aborted")) = str_at(last, &["stopReason"]) {
+                    ev.error = Some(
+                        str_at(last, &["errorMessage"])
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("request {reason}")),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    ev
+}
+
+/// Background task for an engine that streams JSON lines (opencode, pi),
+/// each line folded through `parse`. Its prompt was already written to stdin.
+#[allow(clippy::too_many_arguments)]
+async fn json_lines_task(
+    db: Arc<PaDb>,
+    run_id: String,
+    output_path: PathBuf,
+    child: Arc<Mutex<Child>>,
+    cancelled: Arc<AtomicBool>,
+    stdout: tokio::process::ChildStdout,
+    stderr: Option<tokio::process::ChildStderr>,
+    engine: &'static str,
+    parse: fn(&serde_json::Value) -> LineEvent,
+) {
+    log_stderr(engine, stderr);
+
+    let mut reader = BufReader::new(stdout).lines();
+    let mut output = String::new();
+    let mut external_id: Option<String> = None;
+    let mut saw_done = false;
+    let mut engine_error: Option<String> = None;
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let ev = parse(&val);
+        if let Some(id) = ev.session_id {
+            if external_id.is_none() {
+                cache_update_external_id(&db, &run_id, &id).await.ok();
+                cache_update_status(&db, &run_id, "running", None)
+                    .await
+                    .ok();
+                external_id = Some(id);
+            }
+        }
+        if let Some(text) = ev.text {
+            output.push_str(&text);
+        }
+        saw_done |= ev.done;
+        if ev.error.is_some() {
+            engine_error = ev.error;
+        }
+        write_output_file(&output_path, &output, None).await.ok();
+    }
+
+    let error = if cancelled.load(Ordering::SeqCst) {
+        None
+    } else if let Some(e) = engine_error {
+        Some(format!("{engine} reported an error: {e}"))
+    } else if saw_done {
+        None
+    } else {
+        Some("engine child exited without a done envelope".to_string())
+    };
+    let status = if cancelled.load(Ordering::SeqCst) {
+        "cancelled"
+    } else if error.is_some() {
+        "failed"
+    } else {
+        "done"
+    };
+
+    let output_truncated = is_truncated(&output);
+    let file_error = match write_output_file(&output_path, &output, error.as_deref()).await {
+        Err(e) => Some(format!("write output file: {e}")),
+        Ok(()) => error,
+    };
+
+    cache_update_done(
+        &db,
+        &run_id,
+        status,
+        file_error.as_deref(),
+        output_truncated,
+        None,
+    )
+    .await
+    .ok();
+
+    let mut child = child.lock().await;
+    let _ = child.try_wait();
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // run / resume / cancel
 // ═══════════════════════════════════════════════════════════════════════
@@ -1661,26 +1831,21 @@ pub(crate) async fn spawn_run(
         return engines.start(env, run_id, output_path, &opts, cwd).await;
     }
 
-    // An engine that would put the prompt in its argv where another uid can
-    // read it never starts — neither in-process nor through the detached
-    // chi-runner (which builds the same `-p <prompt>` argv). Fail-closed, the
-    // row says why.
-    if let Err(refusal) = env.check_prompt_in_argv(&opts.engine_id) {
-        tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {refusal}");
-        cache_update_done(&env.db, &run_id, "failed", Some(&refusal), false, None)
-            .await
-            .ok();
-        return Err(refusal);
-    }
-
     // ── Persistent (detached chi-runner) path ────────────────────────────────
     // Try this first so we never spawn a redundant in-process child. When it
     // can't run, the in-process fallback is NOT durable, and the caller asked
     // for durability — so the fallback is carried back as a warning in the
     // result's `error` (status stays `running`: every FE caller only treats
     // `error` as fatal with `status: "failed"`) instead of passing silently.
+    // chi-runner builds its own engine argv, and only feeds
+    // [`RUNNER_STDIN_ENGINES`] their prompt on stdin: any other engine stays
+    // in-process, where its prompt goes to stdin too (I-7).
     let mut fallback_warning: Option<String> = None;
-    if opts.persistent {
+    if opts.persistent && !RUNNER_STDIN_ENGINES.contains(&opts.engine_id.as_str()) {
+        let warning = not_detachable_warning(&opts.engine_id);
+        tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {warning}");
+        fallback_warning = Some(warning);
+    } else if opts.persistent {
         let model = runner_model(&opts.engine_id, opts.model.as_deref());
         let conf = chi_runner::RunnerConf {
             run_id: &run_id,
@@ -1699,6 +1864,7 @@ pub(crate) async fn spawn_run(
                     // An unrecorded runner could be neither reconciled nor
                     // cancelled: take it down rather than leave it orphaned.
                     let _ = chi_runner::kill_process_group(pid, chi_runner::CANCEL_GRACE).await;
+                    chi_runner::remove_conf(&env.cache_dir, &run_id);
                     cache_update_done(&env.db, &run_id, "failed", Some(&e), false, None)
                         .await
                         .ok();
@@ -1732,7 +1898,6 @@ pub(crate) async fn spawn_run(
     let cmd = build_engine_command_with(
         &*env.resolver,
         &opts.engine_id,
-        &opts.prompt,
         &cwd,
         opts.model.as_deref(),
         opts.mode.as_deref(),
@@ -1766,9 +1931,6 @@ pub(crate) async fn resume_run(
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
 
-    // Same refusal as `spawn_run`, before anything about the row changes.
-    env.check_prompt_in_argv(&row.engine_id)?;
-
     // The output file this turn will write. On the daemon a row's path is
     // confined to the cache dir before anything reads or writes it: `db_exec`
     // can plant a row whose `output_path` aims the reader elsewhere.
@@ -1791,7 +1953,14 @@ pub(crate) async fn resume_run(
             ));
         }
         let external_id = seen.external_id.clone();
-        apply_detached(&env.db, &run_id, row.external_id.as_deref(), seen).await?;
+        apply_detached(
+            &env.db,
+            &env.cache_dir,
+            &run_id,
+            row.external_id.as_deref(),
+            seen,
+        )
+        .await?;
         if row.external_id.is_none() {
             row.external_id = external_id;
         }
@@ -1816,7 +1985,6 @@ pub(crate) async fn resume_run(
     let cmd = build_engine_command_with(
         &*env.resolver,
         &row.engine_id,
-        &prompt,
         &cwd,
         row.model.as_deref(),
         row.mode.as_deref(),
@@ -1843,10 +2011,12 @@ pub(crate) async fn resume_run(
 }
 
 /// `chi_cancel`: interrupt a live in-process run, kill a detached runner's
-/// process group, and mark the row `cancelled`.
+/// process group, drop its runner conf (which carries the prompt) from
+/// `cache_dir`, and mark the row `cancelled`.
 pub(crate) async fn cancel_run(
     db: &PaDb,
     runtime: &ChiRuntime,
+    cache_dir: &Path,
     run_id: &str,
 ) -> Result<ChiRunResult, String> {
     guard_identity()?;
@@ -1891,6 +2061,11 @@ pub(crate) async fn cancel_run(
                 "chi run {run_id}: not signalling pid {pid} ({other:?})"
             ),
         }
+    }
+    // The runner is gone (or was never ours to signal): its conf has no
+    // reader left.
+    if row.pid.is_some() {
+        chi_runner::remove_conf(cache_dir, &row.run_id);
     }
 
     cache_update_status(db, run_id, "cancelled", None).await?;
@@ -2005,10 +2180,12 @@ async fn observe_detached(
 
 /// Fold an observation into the row: record a newly seen engine session id,
 /// and finish a terminal run through the transition-guarded
-/// `cache_update_done_if_live` (which produces the WP-40 notification).
-/// Returns whether this call finished the run.
+/// `cache_update_done_if_live` (which produces the WP-40 notification),
+/// dropping its runner conf from `cache_dir`. Returns whether this call
+/// finished the run.
 async fn apply_detached(
     db: &PaDb,
+    cache_dir: &Path,
     run_id: &str,
     row_external_id: Option<&str>,
     seen: DetachedObservation,
@@ -2021,6 +2198,8 @@ async fn apply_detached(
     match seen.liveness {
         RunLiveness::Running => Ok(false),
         RunLiveness::Terminal { status, error } => {
+            // The runner has ended: nothing will read its conf again.
+            chi_runner::remove_conf(cache_dir, run_id);
             let finished = cache_update_done_if_live(db, run_id, status, error.as_deref()).await?;
             if finished {
                 tracing::info!(
@@ -2061,7 +2240,7 @@ pub(crate) async fn reconcile_detached_runs_with(
         let external_id: Option<String> = r.get("external_id");
         let path = resolve_output_path(cache_dir, output_path.as_deref());
         let seen = observe_detached(pid, path.as_deref(), probe).await;
-        match apply_detached(db, &run_id, external_id.as_deref(), seen).await {
+        match apply_detached(db, cache_dir, &run_id, external_id.as_deref(), seen).await {
             Ok(true) => finished += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(target: "ikenga::chi", "chi run {run_id}: reconcile: {e}"),

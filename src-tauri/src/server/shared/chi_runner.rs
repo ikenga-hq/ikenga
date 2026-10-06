@@ -11,7 +11,9 @@
 //!     every engine line and once more at the end.
 //!
 //! Protocol:
-//!   1. Write a [`RunnerConf`] JSON file to `<chi-cache-dir>/<run_id>.conf.json`.
+//!   1. Write a [`RunnerConf`] JSON file to `<chi-cache-dir>/<run_id>.conf.json`
+//!      — owner-only, since it carries the prompt; it is deleted once the run
+//!      ends or is cancelled ([`remove_conf`]).
 //!   2. Spawn `chi-runner` detached with `IKENGA_CHI_CONF=<that path>`.
 //!   3. chi-runner reads the conf, spawns the engine with piped stdio and
 //!      writes the status file.
@@ -43,7 +45,9 @@ pub(crate) use crate::server::shared::chi_liveness::{
 };
 
 /// Config written to disk and passed to chi-runner via `IKENGA_CHI_CONF`.
-/// Field-for-field what `chi_runner.rs::RunnerConf` deserialises.
+/// Field-for-field what `chi_runner.rs::RunnerConf` deserialises. chi-runner
+/// builds its engine's argv from it, putting antigravity-cli's prompt on the
+/// command line, so only `chi_exec::RUNNER_STDIN_ENGINES` are sent here.
 #[derive(Serialize)]
 pub(crate) struct RunnerConf<'a> {
     pub run_id: &'a str,
@@ -111,15 +115,72 @@ pub(crate) fn spawn_detached_runner(
     let runner = resolve_runner_path()
         .ok_or_else(|| runner_not_found(std::env::current_exe().ok().as_deref()))?;
 
-    let conf_path = cache_dir.join(format!("{}.conf.json", conf.run_id));
+    let conf_path = conf_path(cache_dir, conf.run_id)
+        .ok_or_else(|| format!("unusable run id for a runner conf: {}", conf.run_id))?;
     let conf_json = serde_json::to_string(conf).map_err(|e| format!("serialize conf: {e}"))?;
-    std::fs::write(&conf_path, conf_json).map_err(|e| format!("write conf: {e}"))?;
+    write_private(&conf_path, conf_json.as_bytes()).map_err(|e| format!("write conf: {e}"))?;
+    let spawned = spawn_runner(&runner, &conf_path);
+    if spawned.is_err() {
+        remove_conf(cache_dir, conf.run_id);
+    }
+    spawned
+}
 
-    let mut spec = SpawnSpec::new(&runner);
+/// Where a run's runner conf lives: `<cache_dir>/<run_id>.conf.json`. `None`
+/// for a run id that is not a plain file-name stem (a row planted through
+/// `db_exec` must not aim a write or a delete outside the cache dir).
+pub(crate) fn conf_path(cache_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    let plain = !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plain.then(|| cache_dir.join(format!("{run_id}.conf.json")))
+}
+
+/// Delete a run's runner conf — it carries the prompt — once no runner will
+/// read it: the run ended, was cancelled, or its runner never started.
+/// Best-effort; a missing file is fine.
+pub(crate) fn remove_conf(cache_dir: &Path, run_id: &str) {
+    if let Some(path) = conf_path(cache_dir, run_id) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id}: remove runner conf: {e}")
+            }
+        }
+    }
+}
+
+/// Write `bytes` to a fresh owner-only (0600 on Unix) file at `path`,
+/// replacing any file already there. Created with that mode, so it is never
+/// readable by anyone else, not even between create and chmod.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut file = open.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Spawn `runner` detached against the conf at `conf_path`; its pid.
+fn spawn_runner(runner: &Path, conf_path: &Path) -> Result<u32, String> {
+    let mut spec = SpawnSpec::new(runner);
     // The runner (and the engine it launches) gets the host env minus the
     // host-only secrets (`pty::is_host_only_env`), not the whole process env.
     super::chi_exec::inherit_scrubbed_env(&mut spec);
-    spec.env("IKENGA_CHI_CONF", &conf_path)
+    spec.env("IKENGA_CHI_CONF", conf_path)
         // chi-runner resolves the engine CLI (`claude`, `codex`, `agy`) on its
         // own PATH; give it the same augmented PATH the in-process spawns use,
         // or a GUI-launched app hands it a PATH without nvm / Homebrew bins.

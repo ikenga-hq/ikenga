@@ -340,10 +340,9 @@ pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcRespo
 // deltas: a run naming no cwd starts in the router home (the principal's
 // home under T1) instead of the process cwd; output paths are confined to the
 // cache dir; the in-process `openrouter` engine is refused (it needs the
-// desktop's engine registry + vault); a cwd gets `~` expansion only, never
-// `$VAR` (the daemon's env holds operator secrets); and above T0 the
-// argv-prompt engines (pi, opencode, antigravity-cli) are refused unless
-// `/proc` is hidepid (I-7).
+// desktop's engine registry + vault); and a cwd gets `~` expansion only,
+// never `$VAR` (the daemon's env holds operator secrets). As on the desktop,
+// no engine gets the prompt on its command line (I-7, see `chi_exec`).
 
 /// The Chi write arms' process state, held in `AppState::chi`: the live-run
 /// registry `chi_cancel` reaches in-process runs through, and where engine
@@ -364,18 +363,13 @@ impl DaemonChi {
 
 /// The daemon's [`chi_exec::ChiEnv`]: `--data-dir`'s db and chi-cache, the
 /// router home as the default cwd, output files confined to the cache dir,
-/// `~`-only cwd expansion (this process's env holds the operator's
-/// `IKENGA_SECRET_*` defaults), and — above T0 — argv-prompt engines only
-/// where `/proc` hides other uids' processes.
+/// and `~`-only cwd expansion (this process's env holds the operator's
+/// `IKENGA_SECRET_*` defaults).
 fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
     let db = state
         .pa_db
         .clone()
         .ok_or_else(|| super::rpc::NO_DB.to_string())?;
-    let prompt_in_argv = chi_exec::prompt_in_argv_policy(
-        crate::executor::current().tier(),
-        chi_exec::proc_hides_other_uids(),
-    );
     Ok(chi_exec::ChiEnv {
         db,
         cache_dir: chi_cache_dir(state)?,
@@ -384,7 +378,6 @@ fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
         files: OutputFiles::InCacheDir,
         resolver: state.chi.resolver.clone(),
         cwd_expansion: chi_exec::CwdExpansion::TildeOnly,
-        prompt_in_argv,
     })
 }
 
@@ -445,7 +438,7 @@ pub(super) async fn chi_cancel(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let run_id = req_str(args, &["runId", "run_id"])?;
         let env = chi_env(state)?;
-        chi_exec::cancel_run(&env.db, &env.runtime, &run_id).await
+        chi_exec::cancel_run(&env.db, &env.runtime, &env.cache_dir, &run_id).await
     }
     .await;
     respond("chi_cancel", r)

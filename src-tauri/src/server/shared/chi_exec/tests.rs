@@ -170,7 +170,6 @@ fn stub_env(root: &Path) -> ChiEnv {
         files: OutputFiles::InCacheDir,
         resolver: Arc::new(StubResolver(stub_claude())),
         cwd_expansion: CwdExpansion::TildeOnly,
-        prompt_in_argv: PromptInArgv::Allowed,
     }
 }
 
@@ -237,7 +236,6 @@ fn test_build_engine_command_antigravity() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["agy"]),
         "antigravity-cli",
-        "hello",
         "/tmp",
         Some("gemini-2.0-flash"),
         Some("plan"),
@@ -250,8 +248,8 @@ fn test_build_engine_command_antigravity() {
     assert_eq!(
         args,
         vec![
-            "-p",
-            "hello",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--conversation",
@@ -269,7 +267,6 @@ fn test_build_engine_command_opencode() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["opencode"]),
         "opencode",
-        "fix the bug",
         "/tmp",
         Some("claude-3-7-sonnet"),
         None,
@@ -281,7 +278,21 @@ fn test_build_engine_command_opencode() {
     let args: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
     assert_eq!(
         args,
-        vec!["run", "-p", "fix the bug", "--model", "claude-3-7-sonnet",]
+        vec!["run", "--format", "json", "--model", "claude-3-7-sonnet"]
+    );
+
+    let resumed = build_engine_command_with(
+        &FakeResolver::native(&["opencode"]),
+        "opencode",
+        "/tmp",
+        None,
+        None,
+        Some("ses_1"),
+    )
+    .unwrap();
+    assert_eq!(
+        args_of(&resumed),
+        ["run", "--format", "json", "--session", "ses_1"]
     );
 }
 
@@ -290,7 +301,6 @@ fn test_build_engine_command_pi() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["pi"]),
         "pi",
-        "refactor this file",
         "/tmp",
         Some("claude-3-7-sonnet"),
         None,
@@ -300,10 +310,18 @@ fn test_build_engine_command_pi() {
 
     assert_eq!(cmd.program, "pi");
     let args: Vec<&str> = cmd.args.iter().map(|s| s.to_str().unwrap()).collect();
-    assert_eq!(
-        args,
-        vec!["-p", "refactor this file", "--model", "claude-3-7-sonnet",]
-    );
+    assert_eq!(args, vec!["--mode", "json", "--model", "claude-3-7-sonnet"]);
+
+    let resumed = build_engine_command_with(
+        &FakeResolver::native(&["pi"]),
+        "pi",
+        "/tmp",
+        None,
+        None,
+        Some("0b1c"),
+    )
+    .unwrap();
+    assert_eq!(args_of(&resumed), ["--mode", "json", "--session", "0b1c"]);
 }
 
 #[test]
@@ -337,7 +355,6 @@ fn resolve_engine_errors_clearly_when_nothing_resolves() {
     let err = build_engine_command_with(
         &FakeResolver::native(&[]),
         "claude-code",
-        "hi",
         "/tmp",
         None,
         None,
@@ -352,7 +369,6 @@ fn claude_code_in_wsl_launches_like_the_terminal() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["claude"]),
         "claude-code",
-        "ignored: claude reads the prompt from stdin",
         r"C:\work\proj",
         Some("opus"),
         None,
@@ -379,7 +395,6 @@ fn claude_code_chi_run_defaults_to_the_chi_role_model() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["claude"]),
         "claude-code",
-        "",
         "/tmp",
         None,
         None,
@@ -394,7 +409,6 @@ fn claude_code_chi_run_explicit_model_wins_once() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["claude"]),
         "claude-code",
-        "",
         "/tmp",
         Some("claude-opus-5-5"),
         None,
@@ -426,7 +440,6 @@ fn non_claude_engines_get_no_role_default() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["pi"]),
         "pi",
-        "x",
         "/tmp",
         None,
         None,
@@ -437,18 +450,20 @@ fn non_claude_engines_get_no_role_default() {
 }
 
 #[test]
-fn wsl_launch_quotes_prompts_for_bash() {
+fn wsl_launch_quotes_args_for_bash() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["pi"]),
         "pi",
-        "it's $HOME; rm -rf /",
         "/tmp",
-        None,
+        Some("it's $HOME; rm -rf /"),
         None,
         None,
     )
     .unwrap();
-    assert_eq!(args_of(&cmd)[6], r"'pi' '-p' 'it'\''s $HOME; rm -rf /'");
+    assert_eq!(
+        args_of(&cmd)[6],
+        r"'pi' '--mode' 'json' '--model' 'it'\''s $HOME; rm -rf /'"
+    );
 }
 
 /// The spec carries the cwd split it always had (cwd unless the engine
@@ -466,7 +481,6 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
     let claude = build_engine_command_with(
         &FakeResolver::native(&["claude"]),
         "claude-code",
-        "",
         "/tmp",
         None,
         None,
@@ -487,7 +501,6 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
     let codex = build_engine_command_with(
         &FakeResolver::native(&["codex"]),
         "codex",
-        "",
         "/tmp",
         None,
         None,
@@ -503,16 +516,9 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
 
     // WSL: cwd is set on the host side too; wsl.exe gets the scrubbed env
     // but no augmented PATH override.
-    let wsl = build_engine_command_with(
-        &FakeResolver::wsl(&["pi"]),
-        "pi",
-        "",
-        "/tmp",
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let wsl =
+        build_engine_command_with(&FakeResolver::wsl(&["pi"]), "pi", "/tmp", None, None, None)
+            .unwrap();
     assert_eq!(wsl.cwd, Some(PathBuf::from("/tmp")));
     assert!(wsl.env.clear);
     assert!(!host_only(&wsl));
@@ -559,7 +565,6 @@ fn codex_in_wsl_gets_a_linux_cd_path() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["codex"]),
         "codex",
-        "",
         r"C:\Users\x\proj",
         None,
         None,
@@ -1086,7 +1091,7 @@ async fn stub_run_finishes_resumes_and_cancels() {
         crate::access::keepalive_count() >= 1,
         "a live run holds the daemon awake"
     );
-    let cancelled = cancel_run(&env.db, &env.runtime, &sleeper.run_id)
+    let cancelled = cancel_run(&env.db, &env.runtime, &env.cache_dir, &sleeper.run_id)
         .await
         .unwrap();
     assert_eq!(cancelled.status, "cancelled");
@@ -1140,7 +1145,10 @@ async fn cancel_and_resume_of_an_unknown_run_say_not_found() {
         tmp.path().join("chi-cache"),
         Arc::new(ChiRuntime::new()),
     );
-    let err = cancel_run(&db, &env.runtime, "nope").await.err().unwrap();
+    let err = cancel_run(&db, &env.runtime, &env.cache_dir, "nope")
+        .await
+        .err()
+        .unwrap();
     assert_eq!(err, "chi run not found: nope");
     let err = resume_run(&env, &NoInProcessEngines, "nope".into(), "x".into())
         .await
@@ -1311,199 +1319,430 @@ fn scrubbed_env_drops_the_host_only_secrets() {
     assert_eq!(kept, ["PATH", "HOME", "ANTHROPIC_API_KEY"]);
 }
 
-// ── prompt in argv (I-7) ───────────────────────────────────────────────
+// ── the prompt never rides argv (I-7) ───────────────────────────────────
 
-/// `PROMPT_IN_ARGV_ENGINES` is exactly the set of engines whose built
-/// command carries the prompt, so the T1 refusal can't miss one: moving an
-/// engine to stdin, or adding an argv-prompt engine, fails here until the
-/// list follows.
-#[test]
-fn prompt_in_argv_matches_the_engine_commands() {
-    const PROMPT: &str = "SENTINEL-PROMPT-7f3a";
-    let resolver = FakeResolver::native(&["claude", "agy", "codex", "opencode", "pi"]);
-    for engine in ["claude-code", "antigravity-cli", "codex", "opencode", "pi"] {
-        for resume in [None, Some("sess-1")] {
-            let cmd =
-                build_engine_command_with(&resolver, engine, PROMPT, "/tmp", None, None, resume)
-                    .unwrap();
-            let in_argv = cmd
-                .args
-                .iter()
-                .any(|a| a.to_string_lossy().contains(PROMPT));
-            assert_eq!(
-                in_argv,
-                prompt_rides_argv(engine),
-                "{engine} (resume {resume:?}): prompt in argv = {in_argv}"
-            );
+/// Marks prompt text in the tests below; must never appear in an argv.
+const SENTINEL: &str = "SENTINEL-PROMPT-7f3a";
+
+/// One stub per engine CLI, written once per test process (see
+/// [`stub_claude`] on ETXTBSY). Each records its argv (one per line) to
+/// `./argv` and its whole stdin to `./stdin` in the directory it runs in
+/// (codex: its `--cd`), then speaks just enough of its engine's stream for
+/// the run to end `done` with a session id. Stdin containing `sleep` makes
+/// it sleep instead — a run to cancel.
+#[cfg(unix)]
+fn stub_engines() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("ikenga-chi-stubs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = r#"args=$(printf '%s\n' "$@")
+prev=
+for a in "$@"; do [ "$prev" = --cd ] && cd "$a"; prev=$a; done
+printf '%s\n' "$args" > argv
+cat > stdin
+case "$(cat stdin)" in *sleep*) exec sleep 30;; esac
+"#;
+        let stubs = [
+            (
+                "claude",
+                r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-claude"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'"#,
+            ),
+            (
+                "agy",
+                r#"printf '%s\n' '{"event":"init","conversation_id":"conv-agy"}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"ok"}}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS"}}'"#,
+            ),
+            (
+                "codex",
+                r#"printf '%s\n' '{"type":"thread.started","thread_id":"thread-codex"}'
+printf '%s\n' '{"type":"turn.completed","usage":{}}'"#,
+            ),
+            (
+                "opencode",
+                r#"printf '%s\n' '{"type":"text","sessionID":"ses_opencode","part":{"type":"text","text":"ok"}}'
+printf '%s\n' '{"type":"step_finish","sessionID":"ses_opencode","part":{"reason":"stop"}}'"#,
+            ),
+            (
+                "pi",
+                r#"printf '%s\n' '{"type":"session","version":3,"id":"pi-session"}'
+printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"ok"}}'
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}'"#,
+            ),
+        ];
+        for (bin, speak) in stubs {
+            let path = dir.join(bin);
+            std::fs::write(&path, format!("#!/bin/sh\n{record}{speak}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-    }
-    assert!(!prompt_rides_argv("claude-code"));
-    assert!(!prompt_rides_argv("codex"));
+        dir
+    })
+    .clone()
 }
 
-#[test]
-fn prompt_in_argv_is_refused_only_above_t0_without_hidepid() {
-    use PromptInArgv::{Allowed, Refused};
-    assert_eq!(prompt_in_argv_policy(ExecutorTier::T0, false), Allowed);
-    assert_eq!(prompt_in_argv_policy(ExecutorTier::T0, true), Allowed);
-    assert_eq!(prompt_in_argv_policy(ExecutorTier::T1, false), Refused);
-    assert_eq!(prompt_in_argv_policy(ExecutorTier::T1, true), Allowed);
-    assert_eq!(prompt_in_argv_policy(ExecutorTier::T2, false), Refused);
-}
+/// Resolves every engine binary to its stub in [`stub_engines`].
+#[cfg(unix)]
+struct StubDirResolver(PathBuf);
 
-#[test]
-fn mountinfo_hidepid_detection() {
-    let line = |opts: &str| {
-        format!(
-            "22 1 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n\
-             25 1 0:23 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc {opts}\n"
-        )
-    };
-    // A stock /proc (the docker / CI container case): not hidden.
-    assert!(!mountinfo_proc_hides_other_uids(&line("rw")));
-    assert!(!mountinfo_proc_hides_other_uids(&line("rw,hidepid=0")));
-    assert!(!mountinfo_proc_hides_other_uids(&line("rw,hidepid=off")));
-    // systemd ProtectProc=invisible, and the other hiding modes.
-    for mode in ["invisible", "2", "noaccess", "1", "ptraceable", "4"] {
-        assert!(
-            mountinfo_proc_hides_other_uids(&line(&format!("rw,hidepid={mode}"))),
-            "{mode}"
-        );
-    }
-    // The topmost /proc mount decides: a hidepid mount stacked over a plain
-    // one hides, a plain one stacked over a hidepid one does not.
-    let stacked = |a: &str, b: &str| {
-        format!(
-            "25 1 0:23 / /proc rw - proc proc {a}\n\
-             90 25 0:50 / /proc rw - proc proc {b}\n"
-        )
-    };
-    assert!(mountinfo_proc_hides_other_uids(&stacked(
-        "rw",
-        "rw,hidepid=invisible"
-    )));
-    assert!(!mountinfo_proc_hides_other_uids(&stacked(
-        "rw,hidepid=invisible",
-        "rw"
-    )));
-    // Not /proc, or not procfs: ignored. Nothing parseable: not hidden.
-    assert!(!mountinfo_proc_hides_other_uids(
-        "30 1 0:23 / /mnt/proc rw - proc proc rw,hidepid=2\n"
-    ));
-    assert!(!mountinfo_proc_hides_other_uids(
-        "30 1 0:23 / /proc rw - tmpfs tmpfs rw,hidepid=2\n"
-    ));
-    assert!(!mountinfo_proc_hides_other_uids(""));
-    assert!(!mountinfo_proc_hides_other_uids("garbage line"));
-}
-
-/// Resolves nothing, but records every binary it was asked for — proof an
-/// engine was never even looked up.
-#[derive(Default)]
-struct RecordingResolver(std::sync::Mutex<Vec<String>>);
-
-impl EngineResolver for RecordingResolver {
+#[cfg(unix)]
+impl EngineResolver for StubDirResolver {
     fn native(&self, binary: &str) -> Option<PathBuf> {
-        self.0.lock().unwrap().push(binary.to_string());
-        None
+        let path = self.0.join(binary);
+        path.is_file().then_some(path)
     }
     fn in_wsl(&self, _binary: &str) -> bool {
         false
     }
 }
 
-/// I-7 regression: where another uid could read `/proc/<pid>/cmdline`
-/// (T1 without hidepid), an engine taking the prompt as `-p <prompt>` never
-/// starts — new run or resume, in-process or persistent — and its row says
-/// why. Before the fix a T1 `chi_run {engineId:"pi"}` spawned `pi -p
-/// <prompt>`, readable by every other principal on the host.
+/// A daemon-shaped env over every stub engine.
+#[cfg(unix)]
+fn stub_engines_env(root: &Path) -> ChiEnv {
+    let mut env = stub_env(root);
+    env.resolver = Arc::new(StubDirResolver(stub_engines()));
+    env
+}
+
+/// Every engine with its stub's session id and the flag its resume passes it
+/// with.
+const ENGINES: &[(&str, &str, &str)] = &[
+    ("claude-code", "sess-claude", "--resume"),
+    ("antigravity-cli", "conv-agy", "--conversation"),
+    ("codex", "thread-codex", "resume"),
+    ("opencode", "ses_opencode", "--session"),
+    ("pi", "pi-session", "--session"),
+];
+
+/// What `engine` must have read on stdin for `prompt`.
+fn assert_stdin_carries(engine: &str, stdin: &str, prompt: &str) {
+    match engine {
+        "claude-code" => {
+            let v: serde_json::Value = serde_json::from_str(stdin.trim()).unwrap();
+            assert_eq!(v["type"], "user", "{engine}: {stdin}");
+            assert_eq!(v["message"]["content"], prompt, "{engine}");
+        }
+        "antigravity-cli" => {
+            let v: serde_json::Value = serde_json::from_str(stdin.trim()).unwrap();
+            assert_eq!(v["event"], "user", "{engine}: {stdin}");
+            assert_eq!(v["message"]["content"], prompt, "{engine}");
+        }
+        _ => assert_eq!(stdin, prompt, "{engine}: the bare prompt"),
+    }
+}
+
+/// I-7: no engine ever gets the prompt — of a new run or of a resume's
+/// follow-up — on its command line, where every uid on the host can read it
+/// from `/proc/<pid>/cmdline` unless *its* procfs is `hidepid` (which no check
+/// in this process can establish: an SSH session uses the host `/proc`). Each
+/// engine runs against a stub that records the argv it was exec'd with and
+/// what it read on stdin: the prompt is only ever on stdin. A persistent run
+/// of an engine chi-runner would hand the prompt on argv stays in-process.
+/// Before the fix, pi / opencode / antigravity-cli ran as `… -p <prompt>`.
+#[cfg(unix)]
 #[tokio::test]
-async fn argv_prompt_engines_are_refused_where_proc_is_not_hidden() {
+async fn no_engine_ever_sees_the_prompt_in_argv() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    let db = Arc::new(test_db().await);
-    let resolver = Arc::new(RecordingResolver::default());
-    let mut env = ChiEnv::new(
-        db.clone(),
-        root.join("chi-cache"),
-        Arc::new(ChiRuntime::new()),
-    );
-    env.files = OutputFiles::InCacheDir;
-    env.cwd_expansion = CwdExpansion::TildeOnly;
-    env.prompt_in_argv = PromptInArgv::Refused;
-    env.resolver = resolver.clone();
+    let env = stub_engines_env(&root);
 
-    for engine in PROMPT_IN_ARGV_ENGINES {
+    for &(engine, session, resume_flag) in ENGINES {
+        // chi-runner would launch the real engine CLI, not the stub: persistent
+        // is only exercised where it stays in-process by design.
+        let detachable = RUNNER_STDIN_ENGINES.contains(&engine);
         for persistent in [false, true] {
-            let mut o = opts(engine, "ADA-PRIVATE payroll", Some("/tmp"));
-            o.persistent = persistent;
-            let err = spawn_run(&env, &NoInProcessEngines, o, "cli")
-                .await
-                .err()
-                .unwrap();
-            assert_eq!(err, prompt_in_argv_refusal(engine), "{engine}");
-            assert!(
-                !err.contains("ADA-PRIVATE"),
-                "the refusal never echoes the prompt"
-            );
-        }
-        let rows = cache_list(&db, Some(engine), 10).await.unwrap();
-        assert_eq!(rows.len(), 2, "{engine}");
-        for row in &rows {
-            assert_eq!(row.status, "failed", "{engine}");
-            assert_eq!(
-                row.error.as_deref(),
-                Some(prompt_in_argv_refusal(engine).as_str())
-            );
-        }
+            if persistent && detachable {
+                continue;
+            }
+            let cwd = root.join(format!("{engine}-{persistent}"));
+            std::fs::create_dir_all(&cwd).unwrap();
+            let read = |name: &str| std::fs::read_to_string(cwd.join(name)).unwrap_or_default();
 
-        // A resumable row of that engine is refused too, and left alone.
-        let resume_id = format!("planted-{engine}");
-        let mut o = opts(engine, "x", None);
-        o.resume_session_id = Some("sess-1".into());
-        cache_insert(&db, &resume_id, &o, &env.run_output_path(&resume_id), "cli")
-            .await
-            .unwrap();
-        cache_update_status(&db, &resume_id, "done", None)
-            .await
-            .unwrap();
-        let err = resume_run(
+            // A new run.
+            let prompt = format!("{SENTINEL} new run, it's $HOME; `id` \"q\"");
+            let mut o = opts(engine, &prompt, Some(cwd.to_string_lossy().as_ref()));
+            o.persistent = persistent;
+            let res = spawn_run(&env, &NoInProcessEngines, o, "cli")
+                .await
+                .unwrap();
+            assert_eq!(res.status, "running", "{engine}");
+            if persistent {
+                assert_eq!(res.error, Some(not_detachable_warning(engine)), "{engine}");
+                assert!(!res.error.as_deref().unwrap().contains(SENTINEL));
+            } else {
+                assert_eq!(res.error, None, "{engine}");
+            }
+            let run_id = res.run_id.clone();
+            assert!(
+                wait_for(|| async { row_status(&env.db, &run_id).await == "done" }).await,
+                "{engine}: {:?}",
+                cache_get(&env.db, &run_id).await.unwrap().unwrap().error
+            );
+            let argv = read("argv");
+            assert!(!argv.is_empty(), "{engine}: the stub ran");
+            assert!(!argv.contains(SENTINEL), "{engine} argv: {argv}");
+            assert_stdin_carries(engine, &read("stdin"), &prompt);
+            let row = cache_get(&env.db, &run_id).await.unwrap().unwrap();
+            assert_eq!(row.external_id.as_deref(), Some(session), "{engine}");
+            assert_eq!(row.pid, None, "{engine}: ran in-process");
+
+            // A resume: the follow-up goes to stdin too, the session id to argv.
+            let follow_up = format!("{SENTINEL} follow-up for {engine}");
+            resume_run(&env, &NoInProcessEngines, run_id.clone(), follow_up.clone())
+                .await
+                .unwrap();
+            assert!(
+                wait_for(|| async {
+                    row_status(&env.db, &run_id).await == "done"
+                        && read("stdin").contains("follow-up")
+                })
+                .await,
+                "{engine}: resume finished"
+            );
+            let argv = read("argv");
+            assert!(!argv.contains(SENTINEL), "{engine} resume argv: {argv}");
+            let args: Vec<&str> = argv.lines().collect();
+            let flag = args.iter().position(|a| *a == resume_flag);
+            assert_eq!(
+                flag.map(|i| args[i + 1]),
+                Some(session),
+                "{engine} resumes its session: {argv}"
+            );
+            assert_stdin_carries(engine, &read("stdin"), &follow_up);
+        }
+    }
+    // No runner conf was ever written: nothing went detached.
+    let confs: Vec<_> = std::fs::read_dir(&env.cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".conf.json"))
+        .collect();
+    assert!(confs.is_empty(), "{confs:?}");
+}
+
+/// Cancel of an in-process run of each formerly-argv engine: killed, row
+/// `cancelled`, the prompt never on its argv, nothing left behind that holds
+/// it but the principal's own row and output file.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cancelled_run_never_had_the_prompt_in_argv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let env = stub_engines_env(&root);
+    for engine in ["antigravity-cli", "opencode", "pi"] {
+        let cwd = root.join(engine);
+        std::fs::create_dir_all(&cwd).unwrap();
+        let prompt = format!("{SENTINEL} please sleep");
+        let res = spawn_run(
             &env,
             &NoInProcessEngines,
-            resume_id.clone(),
-            "secret".into(),
+            opts(engine, &prompt, Some(cwd.to_string_lossy().as_ref())),
+            "cli",
         )
         .await
-        .err()
         .unwrap();
-        assert_eq!(err, prompt_in_argv_refusal(engine));
-        assert_eq!(row_status(&db, &resume_id).await, "done", "row untouched");
+        // The stub has read its stdin (and so recorded its argv) and sleeps.
+        assert!(
+            wait_for(|| async {
+                std::fs::read_to_string(cwd.join("stdin")).is_ok_and(|s| s.contains("sleep"))
+            })
+            .await,
+            "{engine} started"
+        );
+        let argv = std::fs::read_to_string(cwd.join("argv")).unwrap();
+        assert!(!argv.contains(SENTINEL), "{engine} argv: {argv}");
+        let cancelled = cancel_run(&env.db, &env.runtime, &env.cache_dir, &res.run_id)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(
+            wait_for(|| async { env.runtime.len().await == 0 }).await,
+            "{engine}: the killed run's reader finished"
+        );
+        assert_eq!(row_status(&env.db, &res.run_id).await, "cancelled");
     }
+    // The cache dir is owner-only and holds no runner conf.
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&env.cache_dir)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+    assert!(!std::fs::read_dir(&env.cache_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().ends_with(".conf.json")));
+}
+
+#[test]
+fn every_engine_reads_its_prompt_from_stdin() {
+    let p = "line one\nit's \"quoted\"";
+    let claude: serde_json::Value =
+        serde_json::from_str(stdin_payload("claude-code", p).trim_end()).unwrap();
+    assert_eq!(
+        claude,
+        serde_json::json!({"type":"user","message":{"role":"user","content":p}})
+    );
+    let agy = stdin_payload("antigravity-cli", p);
     assert!(
-        resolver.0.lock().unwrap().is_empty(),
-        "no engine binary was even looked up: {:?}",
-        resolver.0.lock().unwrap()
+        agy.ends_with('\n') && agy.matches('\n').count() == 1,
+        "one NDJSON line"
+    );
+    let agy: serde_json::Value = serde_json::from_str(agy.trim_end()).unwrap();
+    assert_eq!(
+        agy,
+        serde_json::json!({"event":"user","message":{"content":p}})
+    );
+    for engine in ["codex", "opencode", "pi"] {
+        assert_eq!(stdin_payload(engine, p), p, "{engine}");
+        assert_eq!(prompt_stdin(engine), PromptStdin::Raw);
+    }
+    // Only stdin-fed engines go to chi-runner (it builds `agy -p <prompt>`).
+    assert_eq!(RUNNER_STDIN_ENGINES, ["claude-code", "codex"]);
+}
+
+#[test]
+fn opencode_json_lines_parse() {
+    let line = |s: &str| parse_opencode_line(&serde_json::from_str(s).unwrap());
+    assert_eq!(
+        line(r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#),
+        LineEvent {
+            session_id: Some("ses_1".into()),
+            ..LineEvent::default()
+        }
+    );
+    let text = line(r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"PONG"}}"#);
+    assert_eq!(text.text.as_deref(), Some("PONG"));
+    assert!(!text.done);
+    assert!(line(r#"{"type":"step_finish","sessionID":"s","part":{"reason":"stop"}}"#).done);
+    assert!(!line(r#"{"type":"step_finish","sessionID":"s","part":{"reason":"tool-calls"}}"#).done);
+    // The shape opencode 1.18 prints for a failed run.
+    let err = line(
+        r#"{"type":"error","sessionID":"s","error":{"name":"UnknownError","data":{"message":"Unexpected server error."}}}"#,
+    );
+    assert_eq!(err.error.as_deref(), Some("Unexpected server error."));
+    assert_eq!(
+        line(r#"{"type":"error","error":{"name":"APIError"}}"#)
+            .error
+            .as_deref(),
+        Some("APIError")
     );
 }
 
-/// The stdin engines are untouched by the refusal: a claude-code run still
-/// runs to `done` where argv prompts are refused.
+#[test]
+fn pi_json_lines_parse() {
+    let line = |s: &str| parse_pi_line(&serde_json::from_str(s).unwrap());
+    assert_eq!(
+        line(r#"{"type":"session","version":3,"id":"9f1e","cwd":"/w"}"#)
+            .session_id
+            .as_deref(),
+        Some("9f1e")
+    );
+    assert_eq!(
+        line(r#"{"type":"message_update","message":{},"assistantMessageEvent":{"type":"text_delta","delta":"He"}}"#)
+            .text
+            .as_deref(),
+        Some("He")
+    );
+    assert_eq!(
+        line(
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"x"}}"#
+        ),
+        LineEvent::default()
+    );
+    let ok = line(
+        r#"{"type":"agent_end","messages":[{"role":"user"},{"role":"assistant","stopReason":"stop"}]}"#,
+    );
+    assert!(ok.done && ok.error.is_none());
+    let failed = line(
+        r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"429 rate limited"}]}"#,
+    );
+    assert!(failed.done);
+    assert_eq!(failed.error.as_deref(), Some("429 rate limited"));
+    assert_eq!(
+        line(r#"{"type":"agent_end","messages":[{"role":"assistant","stopReason":"aborted"}]}"#)
+            .error
+            .as_deref(),
+        Some("request aborted")
+    );
+}
+
+/// A persistent run's runner conf carries the prompt: it is written
+/// owner-only, a planted run id can't aim it (or its removal) outside the
+/// cache dir, and it is deleted once the runner is done with it — when the
+/// sweep sees the run end, and on cancel — but kept while the runner runs.
 #[cfg(unix)]
 #[tokio::test]
-async fn stdin_prompt_engines_still_run_where_argv_prompts_are_refused() {
+async fn runner_conf_is_private_and_removed_when_the_run_ends() {
+    use chi_runner::{conf_path, remove_conf, write_private, PidProbe};
+    use std::os::unix::fs::PermissionsExt;
+
+    let db = test_db().await;
     let tmp = tempfile::tempdir().unwrap();
-    let mut env = stub_env(&tmp.path().canonicalize().unwrap());
-    env.prompt_in_argv = PromptInArgv::Refused;
-    let res = spawn_run(
-        &env,
-        &NoInProcessEngines,
-        opts("claude-code", "hello", None),
-        "cli",
+    let dir = tmp.path();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+    // Owner-only, even over a world-readable file already there.
+    let stale = dir.join("stale.conf.json");
+    std::fs::write(&stale, "old").unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+    write_private(&stale, SENTINEL.as_bytes()).unwrap();
+    assert_eq!(mode(&stale), 0o600);
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), SENTINEL);
+
+    for bad in ["", "../x", "a/b", "..", "x.conf"] {
+        assert_eq!(conf_path(dir, bad), None, "{bad:?}");
+    }
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let outside = dir.join("x.conf.json");
+    std::fs::write(&outside, "not ours").unwrap();
+    remove_conf(&sub, "../x");
+    assert!(outside.exists(), "a planted run id deletes nothing outside");
+
+    let conf = |id: &str| {
+        let p = conf_path(dir, id).unwrap();
+        write_private(&p, SENTINEL.as_bytes()).unwrap();
+        p
+    };
+    let ended = conf("ended");
+    let alive = conf("alive");
+    let cancelled = conf("cancelled");
+    detached_row(&db, dir, "ended", Some(3001), Some(r#"{"status":"done"}"#)).await;
+    detached_row(
+        &db,
+        dir,
+        "alive",
+        Some(3002),
+        Some(r#"{"status":"running"}"#),
     )
-    .await
-    .unwrap();
-    assert_eq!(res.status, "running");
-    assert!(wait_for(|| async { row_status(&env.db, &res.run_id).await == "done" }).await);
+    .await;
+    detached_row(&db, dir, "cancelled", Some(999_999_999), None).await;
+    let probe = |pid: u32| match pid {
+        3002 => PidProbe::Ours,
+        _ => PidProbe::Dead,
+    };
+    assert_eq!(
+        reconcile_detached_runs_with(&db, dir, &probe)
+            .await
+            .unwrap(),
+        2,
+        "ended + the dead runner of `cancelled`"
+    );
+    assert!(!ended.exists(), "the sweep dropped a finished run's conf");
+    assert!(alive.exists(), "a live runner keeps its conf");
+
+    // Cancel drops it too (the pid is no runner of ours: nothing signalled).
+    write_private(&cancelled, SENTINEL.as_bytes()).unwrap();
+    let runtime = ChiRuntime::new();
+    cancel_run(&db, &runtime, dir, "cancelled").await.unwrap();
+    assert!(!cancelled.exists(), "cancel dropped the conf");
+    remove_conf(dir, "alive");
+    assert!(!alive.exists());
+    remove_conf(dir, "alive"); // already gone: fine
 }
 
 /// Operator-secret regression: the daemon expands only `~` in a run's cwd.
@@ -1543,7 +1782,6 @@ fn the_daemon_expands_only_tilde_in_a_run_cwd() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["codex"]),
         "codex",
-        "x",
         &cwd,
         None,
         None,
@@ -1561,6 +1799,5 @@ fn the_daemon_expands_only_tilde_in_a_run_cwd() {
     // The desktop keeps its historical full expansion.
     let desktop = ChiEnv::new(env.db.clone(), env.cache_dir.clone(), env.runtime.clone());
     assert_eq!(desktop.cwd_expansion, CwdExpansion::Full);
-    assert_eq!(desktop.prompt_in_argv, PromptInArgv::Allowed);
     assert_eq!(desktop.run_cwd(Some("$HOME/proj")), format!("{home}/proj"));
 }
