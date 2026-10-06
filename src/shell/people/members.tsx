@@ -124,6 +124,11 @@ export const ROLE_CHOICES: ReadonlyArray<{ id: MemberRole; label: string; sub: s
 ];
 
 export const SOLO_DISABLED_REASON = 'Sharing needs a multi-user server';
+/** A share is confined to the project's folder (G-ACCESS §4.5.4), so a
+ *  project without one — the built-in Default — can't be shared. The daemon
+ *  answers an invite to it with the same reason (`NO_FOLDER_TO_SHARE`). */
+export const NO_FOLDER_REASON =
+	'This project has no folder, so it can’t be shared. Open a folder as a project and share that.';
 export const OWNER_FIXED_REASON = 'A project keeps one Owner. Transfer it from the ⋯ menu.';
 export const TRANSFER_DISABLED_REASON =
 	"Transfer needs moving the project to the new owner's workspace — coming later";
@@ -187,15 +192,37 @@ export function useAccessStatus(): {
 }
 
 /** The project the Members and Policies tabs are about: the share's in share
- *  mode, else the active project. */
-export function useTabProject(): { projectId: string; projectName: string } {
+ *  mode, else the active project. `hasFolder` is `false` only for a project
+ *  the store knows has no `root_path` (a share always has one; a project the
+ *  store hasn't loaded yet is not blocked here — the daemon still answers). */
+export function useTabProject(): { projectId: string; projectName: string; hasFolder: boolean } {
 	const activeProjectId = useShellStore((s) => s.activeProjectId);
 	const projects = useShellStore((s) => s.projects);
 	const share = currentShare();
-	if (share) return { projectId: share.projectId, projectName: share.projectName };
+	if (share) return { projectId: share.projectId, projectName: share.projectName, hasFolder: true };
 	const id = activeProjectId || 'default';
 	const p = projects.find((x) => x.id === id);
-	return { projectId: id, projectName: p?.display_name ?? id };
+	return {
+		projectId: id,
+		projectName: p?.display_name ?? id,
+		hasFolder: p ? Boolean(p.root_path?.trim()) : true,
+	};
+}
+
+/** Why Share kola is disabled, or `null`. T0 (the desktop, a T0 daemon) is
+ *  decided first, so nothing below it changes there. */
+export function shareDisabledReason(f: {
+	tier: AccessTier;
+	adminStrength: boolean | null;
+	shareRole: MemberRole | null;
+	inShare: boolean;
+	hasFolder: boolean;
+}): string | null {
+	if (f.tier === 't0') return SOLO_DISABLED_REASON;
+	if (f.adminStrength === false) return 'Needs a password session or a Full device';
+	if (f.inShare && f.shareRole !== 'operator') return 'Only the Owner and Operators can invite';
+	if (!f.inShare && !f.hasFolder) return NO_FOLDER_REASON;
+	return null;
 }
 
 export function useMembersList(projectId: string, enabled: boolean) {
@@ -226,21 +253,20 @@ export function useMembersList(projectId: string, enabled: boolean) {
 
 export function MembersTab() {
 	const { status, tier, loaded } = useAccessStatus();
-	const { projectId, projectName } = useTabProject();
+	const { projectId, projectName, hasFolder } = useTabProject();
 	const share = currentShare();
 	const canList = tier === 't1' && (!share || share.role === 'operator');
 	const { list, error, loading, reload } = useMembersList(projectId, loaded && canList);
 	const [sharing, setSharing] = useState(false);
 	const mode = membersMode(tier, list);
 	const name = list?.projectName ?? projectName;
-	const shareDisabled =
-		tier === 't0'
-			? SOLO_DISABLED_REASON
-			: status && !status.adminStrength
-				? 'Needs a password session or a Full device'
-				: share && share.role !== 'operator'
-					? 'Only the Owner and Operators can invite'
-					: null;
+	const shareDisabled = shareDisabledReason({
+		tier,
+		adminStrength: status ? status.adminStrength : null,
+		shareRole: share ? share.role : null,
+		inShare: share != null,
+		hasFolder,
+	});
 
 	return (
 		<div
