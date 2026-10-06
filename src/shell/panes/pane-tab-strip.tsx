@@ -4,6 +4,7 @@ import { writeClipboardText } from '@/lib/transport';
 import type { LeafNode } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
+import { confirmDiscard, guardedCloseTab } from '@/lib/panes/unsaved-guard';
 import { useDragState } from '@/lib/panes/drag-state';
 import { beginPointerDrag, useDropTarget } from '@/lib/panes/pointer-drag';
 import { TabStrip, Tab } from '@/components/ui/tab-strip';
@@ -54,24 +55,26 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 	// or ngwa display name — `Studio` rather than `com.ikenga.studio`.
 	const resolveDisplayName = usePaneDisplayNameResolver();
 
-	// Close every closable (non-pinned) tab except `keepIdx`. Read fresh state
-	// and close in DESCENDING index order so earlier closes never shift the
-	// indices of the ones still to close.
-	function closeOthers(keepIdx: number) {
+	// Close every closable (non-pinned) tab except `keepIdx`. Ask once about
+	// unsaved edits across all of them (plans/file-editing), then read fresh
+	// state and close in DESCENDING index order so earlier closes never shift
+	// the indices of the ones still to close.
+	async function closeMany(pick: (i: number) => boolean) {
 		const lf = findLeaf(usePaneStore.getState().root, leaf.id);
 		if (!lf) return;
-		for (let i = lf.tabs.length - 1; i >= 0; i--) {
-			if (i === keepIdx || lf.tabs[i].pinned) continue;
-			closeTab(leaf.id, i);
+		const views = lf.tabs.filter((t, i) => pick(i) && !t.pinned);
+		if (!(await confirmDiscard(leaf.id, views))) return;
+		const now = findLeaf(usePaneStore.getState().root, leaf.id);
+		if (!now) return;
+		for (let i = now.tabs.length - 1; i >= 0; i--) {
+			if (views.includes(now.tabs[i])) closeTab(leaf.id, i);
 		}
 	}
+	function closeOthers(keepIdx: number) {
+		void closeMany((i) => i !== keepIdx);
+	}
 	function closeToRight(fromIdx: number) {
-		const lf = findLeaf(usePaneStore.getState().root, leaf.id);
-		if (!lf) return;
-		for (let i = lf.tabs.length - 1; i > fromIdx; i--) {
-			if (lf.tabs[i].pinned) continue;
-			closeTab(leaf.id, i);
-		}
+		void closeMany((i) => i > fromIdx);
 	}
 
 	const [menuOpen, setMenuOpen] = useState(false);
@@ -215,7 +218,7 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 								...(tabPath !== undefined
 									? { 'copy-path': () => void writeClipboardText(tabPath).catch(() => {}) }
 									: {}),
-								'tab.close': () => closeTab(leaf.id, idx),
+								'tab.close': () => void guardedCloseTab(leaf.id, idx),
 								'tab.close-others': () => closeOthers(idx),
 								'tab.close-to-right': () => closeToRight(idx),
 							}}
@@ -237,9 +240,9 @@ export function PaneTabStrip({ leaf, isFocused }: PaneTabStripProps) {
 								pinned={isPinned}
 								closable={!isPinned}
 								onActivate={() => activate(idx)}
-								onClose={() => closeTab(leaf.id, idx)}
+								onClose={() => void guardedCloseTab(leaf.id, idx)}
 								onTogglePin={() => toggleTabPinned(leaf.id, idx)}
-								onMiddleClick={!isPinned ? () => closeTab(leaf.id, idx) : undefined}
+								onMiddleClick={!isPinned ? () => void guardedCloseTab(leaf.id, idx) : undefined}
 								dropEdge={dropAt?.idx === idx ? dropAt.side : null}
 								className={cn(
 									'border-r border-border',

@@ -1,6 +1,7 @@
 import { ArrowUpRight } from 'lucide-react';
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
+import { isEditingPath, useEditingStore } from '@/lib/editing/editing-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useIsSurfaceDetached } from '@/lib/window/detached-surfaces';
 import { popOutSurface } from '@/lib/window/window-two';
@@ -81,7 +82,13 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	const setVariant = useViewerPaneState((s) => s.setVariant);
 	const resetViewerState = useViewerPaneState((s) => s.reset);
 
-	const { changed, reloadKey, dismiss } = useArtifactDiskWatch(path);
+	const { changed, reloadKey: diskReloadKey, dismiss } = useArtifactDiskWatch(path);
+	// plans/file-editing (F3): while this pane's editor is in Edit, a disk
+	// change — our own save included — must not remount the renderer (that
+	// threw the user out of Edit and silently dropped unsaved edits). The
+	// editor watches the file itself and raises the conflict choice instead.
+	const editing = useEditingStore((s) => isEditingPath(s.sessions, path, paneId ?? null));
+	const reloadKey = useEditAwareReloadKey(diskReloadKey, editing);
 	const { stopped, restart } = useViewerServerHealth(path);
 	// D-08 `artifact-stopped` is strip + plate: the dismissible "viewer server
 	// stopped" strip above the full-content plate. Dismissal lasts until the
@@ -123,11 +130,21 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 	} else if (variant === 'source') {
 		content = (
 			<div className="grid h-full min-h-0 grid-cols-2 divide-x divide-border">
+				{/* The rendered side stays read-only and keeps the raw disk key,
+				    so it refreshes on every save; the source side is the one
+				    editor for this file in this pane (plans/file-editing F1). */}
 				<DeviceZoomFrame device={device} zoom={zoom}>
-					<ViewerRouter key={reloadKey} path={path} source="pane" paneId={paneId} chromeless editable />
+					<ViewerRouter
+						key={diskReloadKey}
+						path={path}
+						source="pane"
+						paneId={paneId}
+						chromeless
+						editable={false}
+					/>
 				</DeviceZoomFrame>
 				<Suspense fallback={<CodeViewLoading />}>
-					<CodeView path={path} line={line} col={col} />
+					<CodeView path={path} line={line} col={col} editable paneId={paneId} />
 				</Suspense>
 			</div>
 		);
@@ -174,12 +191,27 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 					onDismiss={() => setStoppedStripDismissed(true)}
 				/>
 			)}
-			{!stopped && changed && variant === 'default' && (
+			{!stopped && changed && variant === 'default' && !editing && (
 				<ArtifactInfoStrip kind="changed" onDismiss={dismiss} />
 			)}
 			<div className="min-h-0 flex-1">{content}</div>
 		</div>
 	);
+}
+
+/**
+ * The disk-watch remount key, minus every bump that landed while an edit
+ * session was open — so leaving Edit does not remount either (the editor
+ * already holds the current text). Exported for artifact-view.test.tsx.
+ */
+export function useEditAwareReloadKey(reloadKey: number, editing: boolean): number {
+	const suppressed = useRef(0);
+	const last = useRef(reloadKey);
+	if (reloadKey !== last.current) {
+		if (editing) suppressed.current += reloadKey - last.current;
+		last.current = reloadKey;
+	}
+	return reloadKey - suppressed.current;
 }
 
 function CodeViewLoading() {

@@ -382,6 +382,16 @@ export const DEFAULT_KEYMAP: KeymapEntry[] = [
 		source: 'default',
 		label: 'Save (markdown editor)',
 	},
+	// plans/file-editing: the shared text editor (code, JSON, YAML, TOML, CSV,
+	// HTML source). Markdown keeps `markdown.save` so existing rebinds hold;
+	// an editor marks one focus area or the other, never both.
+	{
+		command: 'editor.save',
+		key: 'mod+s',
+		when: 'textEditorFocus',
+		source: 'default',
+		label: 'Save (text editor)',
+	},
 	// Precedence, not a clash (DEC-59, §2.3): `explorer.toggle` also holds
 	// `mod+b` with `when: 'always'` (specificity 0). `markdownEditorFocus`
 	// (specificity 1) outranks it, so this wins while the markdown editor has

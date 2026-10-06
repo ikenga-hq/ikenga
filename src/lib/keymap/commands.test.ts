@@ -216,6 +216,7 @@ describe('DEC-58 single fire (native menu ↔ dispatcher)', () => {
 					loupeFocus: false,
 					pinComposerFocus: false,
 					markdownEditorFocus: false,
+					textEditorFocus: false,
 				}),
 			getEvalOptions: () => ({}),
 			run: (invocation) => {

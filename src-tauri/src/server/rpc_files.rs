@@ -919,6 +919,45 @@ mod tests {
         assert!(!target.exists());
     }
 
+    /// plans/file-editing Shape 5: a browser text save over axum's 2 MB body default used to
+    /// come back 413. `RPC_BODY_LIMIT` lifts that for `/api/rpc`.
+    #[tokio::test]
+    async fn fs_write_content_over_axums_2mb_default_succeeds() {
+        let d = daemon();
+        let p = d.allowed.join("big.txt");
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789\n".repeat(3 * 1024 * 1024 / 37 + 1);
+        assert!(text.len() > 3 * 1024 * 1024);
+        ok(&d.router, "fs_write", json!({ "path": s(&p), "content": text })).await;
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+    }
+
+    /// Over the cap the daemon refuses before the arm runs: a 413, and the file on disk is
+    /// untouched — a save fails loudly, never truncates.
+    #[tokio::test]
+    async fn fs_write_over_rpc_body_limit_is_413_and_writes_nothing() {
+        let d = daemon();
+        let keep = d.allowed.join("keep.txt");
+        std::fs::write(&keep, b"precious").unwrap();
+        let content = "x".repeat(crate::server::RPC_BODY_LIMIT + 1);
+        let body = json!({ "cmd": "fs_write", "args": { "path": s(&keep), "content": content } });
+        let res = d
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/rpc")
+                    .header("authorization", "Bearer tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
+    }
+
     // ── pty_spawn ──────────────────────────────────────────────────
 
     /// The browser sends `terminalId` (camelCase, as `tauri-cmd.ts` does); the arm used to read
