@@ -705,6 +705,7 @@ pub async fn rpc_handler(
         // `actions_open_file` (spawns the OS opener).
         "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
         "fs_write" => rpc_files::fs_write(&state, &payload.args).await,
+        "fs_trash" => rpc_files::fs_trash(&state, &payload.args).await,
         "fs_list" => rpc_files::fs_list(&state, &payload.args).await,
         "fs_kind" => rpc_files::fs_kind(&state, &payload.args).await,
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),

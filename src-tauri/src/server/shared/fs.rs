@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Resolves a caller's path to a canonical path inside the allowlist, or
 /// says why not.
@@ -318,4 +318,502 @@ pub async fn rename(
 
 fn path_string(p: &Path) -> String {
     p.to_string_lossy().to_string()
+}
+
+/// Metadata preserved alongside a trashed file or folder.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrashMetadata {
+    pub original_path: String,
+    pub trashed_at_ms: u64,
+    pub file_name: String,
+    pub is_dir: bool,
+}
+
+/// Move `canonical` into `trash_dir`, generating a unique name and sidecar JSON
+/// metadata file (`<trashed_name>.meta.json`) recording original path and timestamp.
+///
+/// The sidecar is written **before** anything moves, so whatever lands in the
+/// trash always carries its original path. A plain rename is tried first; only
+/// a cross-device rename (`EXDEV`) falls back to copy + remove — any other
+/// rename error (`EACCES`, `EINVAL` for a folder moved into its own subtree,
+/// `EBUSY`) is reported as is, with nothing copied. The copy refuses anything
+/// that is not a regular file, a directory or a symlink (a FIFO would block
+/// the copy in `open()` forever), and when removing the original fails
+/// partway the full copy and its sidecar stay in the trash and the error says
+/// the original may be partly deleted.
+///
+/// The caller decides *what* may be trashed (the daemon's `fs_trash` refuses
+/// allowlist roots, the data dir and its ancestors, the home): this only moves.
+pub async fn trash(canonical: &Path, trash_dir: &Path) -> Result<(), String> {
+    let canonical = canonical.to_path_buf();
+    let trash_dir = trash_dir.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        trash_blocking(&canonical, &trash_dir, move_path_with_fallback)
+    })
+    .await
+    .map_err(|e| format!("trash task join failed: {e}"))?
+}
+
+/// Why a move into the trash failed, and whether the source was touched.
+#[derive(Debug)]
+enum MoveError {
+    /// Nothing moved: the source is as it was and none of it is in the trash.
+    Untouched(String),
+    /// The source was copied in full, but removing it failed partway: the full
+    /// copy is in the trash, the source may be partly deleted.
+    SourcePartlyRemoved(String),
+}
+
+/// [`trash`]'s body, with the mover injectable so the copy fallback can be
+/// tested without a second filesystem.
+fn trash_blocking(
+    canonical: &Path,
+    trash_dir: &Path,
+    mv: impl Fn(&Path, &Path, bool) -> Result<(), MoveError>,
+) -> Result<(), String> {
+    // Ensure trash directory exists with mode 0700 permissions
+    create_secure_trash_dir(trash_dir)?;
+
+    let meta = std::fs::symlink_metadata(canonical)
+        .map_err(|e| format!("cannot trash nonexistent path {}: {e}", canonical.display()))?;
+
+    let is_dir = meta.is_dir();
+    let orig_name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("item")
+        .to_string();
+
+    let id = uuid::Uuid::now_v7();
+    let trashed_name = format!("{id}_{orig_name}");
+    let dest_path = trash_dir.join(&trashed_name);
+    let sidecar_path = trash_dir.join(format!("{trashed_name}.meta.json"));
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let metadata = TrashMetadata {
+        original_path: canonical.to_string_lossy().into_owned(),
+        trashed_at_ms: now_ms,
+        file_name: orig_name,
+        is_dir,
+    };
+
+    let meta_bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|e| format!("serialize trash metadata: {e}"))?;
+
+    // The sidecar first: whatever reaches the trash, even half a move, is
+    // recoverable by its original path.
+    write_new_file(&sidecar_path, &meta_bytes)
+        .map_err(|e| format!("write sidecar metadata: {e}"))?;
+
+    match mv(canonical, &dest_path, is_dir) {
+        Ok(()) => Ok(()),
+        Err(MoveError::Untouched(e)) => {
+            let _ = std::fs::remove_file(&sidecar_path);
+            Err(e)
+        }
+        Err(MoveError::SourcePartlyRemoved(e)) => Err(format!(
+            "{e}; a full copy is in the trash as {trashed_name} (with its metadata), \
+             but the original at {} may be partly deleted",
+            canonical.display()
+        )),
+    }
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+fn create_secure_trash_dir(trash_dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        if let Err(e) = builder.create(trash_dir) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("create trash dir {}: {e}", trash_dir.display()));
+            }
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(trash_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(trash_dir, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(trash_dir)
+            .map_err(|e| format!("create trash dir {}: {e}", trash_dir.display()))?;
+    }
+    Ok(())
+}
+
+/// A rename, falling back to copy + remove **only** when the rename failed
+/// because source and trash are on different filesystems.
+fn move_path_with_fallback(src: &Path, dst: &Path, is_dir: bool) -> Result<(), MoveError> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device(&e) => copy_then_remove(src, dst, is_dir),
+        Err(e) => Err(MoveError::Untouched(format!("move into trash failed: {e}"))),
+    }
+}
+
+fn is_cross_device(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        e.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The cross-device move. A copy that fails is removed, leaving the source
+/// untouched; only a directory whose removal fails partway leaves both.
+fn copy_then_remove(src: &Path, dst: &Path, is_dir: bool) -> Result<(), MoveError> {
+    if dst.starts_with(src) {
+        // A copy into its own subtree would re-copy its output until the path
+        // or the disk ran out.
+        return Err(MoveError::Untouched(format!(
+            "cannot move {} into itself",
+            src.display()
+        )));
+    }
+    if is_dir {
+        if let Err(e) = copy_dir_recursive(src, dst) {
+            let _ = std::fs::remove_dir_all(dst);
+            return Err(MoveError::Untouched(format!(
+                "cross-device copy failed: {e}"
+            )));
+        }
+        std::fs::remove_dir_all(src).map_err(|e| {
+            MoveError::SourcePartlyRemoved(format!("remove original after copy failed: {e}"))
+        })
+    } else {
+        if let Err(e) = copy_regular_file(src, dst) {
+            let _ = std::fs::remove_file(dst);
+            return Err(MoveError::Untouched(format!(
+                "cross-device copy failed: {e}"
+            )));
+        }
+        if let Err(e) = std::fs::remove_file(src) {
+            // One file: the original is intact, so drop the copy.
+            let _ = std::fs::remove_file(dst);
+            return Err(MoveError::Untouched(format!(
+                "remove original after copy failed: {e}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                let link_target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&link_target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to)?;
+            }
+        } else {
+            copy_regular_file(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn not_regular(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} is not a regular file (a FIFO, socket or device); refusing to copy it",
+            path.display()
+        ),
+    )
+}
+
+/// `std::fs::copy` for a regular file only. `std::fs::copy` opens its source
+/// with a blocking `open()`, which on a FIFO waits for a writer forever and
+/// pins the blocking thread. This refuses anything `lstat` says is not a
+/// regular file, then opens non-blocking without following a symlink and
+/// checks the opened descriptor again, so a file swapped for a FIFO between
+/// the two cannot block either. Permissions are carried over, as
+/// `std::fs::copy` does.
+fn copy_regular_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !std::fs::symlink_metadata(from)?.is_file() {
+        return Err(not_regular(from));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut src = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
+            .open(from)?;
+        let meta = src.metadata()?;
+        if !meta.is_file() {
+            return Err(not_regular(from));
+        }
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.set_permissions(meta.permissions())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(from, to).map(|_| ())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trash_tests {
+    //! The trash mover on its own: which rename errors may fall back to a
+    //! copy, what a partial copy + remove leaves, and that a FIFO never
+    //! blocks. Cross-device is forced by calling `copy_then_remove` (the
+    //! `EXDEV` branch) directly, so no second filesystem is needed.
+
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn mkfifo(p: &Path) {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Run `f` on a thread and fail (instead of hanging the suite) if it
+    /// does not return within 10s.
+    fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the trash mover blocked (a FIFO opened for reading?)")
+    }
+
+    /// Regression: a folder renamed into its own subtree fails with EINVAL.
+    /// That is not a cross-device move, so it must not fall back to a copy
+    /// (which recursed into its own output until ENAMETOOLONG / ENOSPC).
+    #[test]
+    fn a_non_cross_device_rename_error_never_falls_back_to_a_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("tree");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f.txt"), b"f").unwrap();
+        let dst = src.join("sub/into-itself");
+
+        let r = bounded({
+            let (src, dst) = (src.clone(), dst.clone());
+            move || move_path_with_fallback(&src, &dst, true)
+        });
+        assert!(matches!(r, Err(MoveError::Untouched(_))), "{r:?}");
+        assert!(!dst.exists(), "nothing may be copied into the source");
+        assert_eq!(names(&src.join("sub")), ["f.txt"]);
+
+        // And the copy fallback itself refuses a destination inside its source.
+        let r = copy_then_remove(&src, &dst, true);
+        assert!(matches!(r, Err(MoveError::Untouched(_))), "{r:?}");
+        assert!(!dst.exists());
+    }
+
+    /// Regression: EACCES on the rename used to fall back to copy + remove,
+    /// leaving a copy in the trash with no sidecar. Now nothing is left.
+    #[test]
+    fn a_permission_denied_rename_leaves_nothing_in_the_trash() {
+        if is_root() {
+            return; // root ignores the 0555 that makes the rename fail
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let rodir = tmp.path().join("rodir");
+        let trash = tmp.path().join("trash");
+        std::fs::create_dir(&rodir).unwrap();
+        let f = rodir.join("f.txt");
+        std::fs::write(&f, b"keep").unwrap();
+        std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let r = trash_blocking(&f, &trash, move_path_with_fallback);
+        std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let e = r.unwrap_err();
+        assert!(e.contains("Permission denied"), "{e}");
+        assert_eq!(std::fs::read(&f).unwrap(), b"keep");
+        assert!(names(&trash).is_empty(), "trash: {:?}", names(&trash));
+    }
+
+    /// Regression: when removing the original fails partway, the sidecar must
+    /// already be in the trash next to the full copy, and the error must say
+    /// the original may be partly deleted.
+    #[test]
+    fn a_partial_remove_keeps_the_full_copy_and_its_sidecar() {
+        if is_root() {
+            return; // root can delete inside a 0555 directory
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let xp = tmp.path().join("xp");
+        let trash = tmp.path().join("trash");
+        std::fs::create_dir_all(xp.join("locked")).unwrap();
+        std::fs::write(xp.join("a.txt"), b"a").unwrap();
+        std::fs::write(xp.join("z.txt"), b"z").unwrap();
+        std::fs::write(xp.join("locked/b.txt"), b"b").unwrap();
+        let locked = xp.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Force the cross-device branch.
+        let r = trash_blocking(&xp, &trash, copy_then_remove);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let e = r.unwrap_err();
+        assert!(e.contains("may be partly deleted"), "{e}");
+        let listed = names(&trash);
+        let item = listed
+            .iter()
+            .find(|n| n.ends_with("_xp"))
+            .unwrap_or_else(|| panic!("copy missing: {listed:?}"));
+        let sidecar = listed
+            .iter()
+            .find(|n| n.ends_with("_xp.meta.json"))
+            .unwrap_or_else(|| panic!("sidecar missing: {listed:?}"));
+        let copy = trash.join(item);
+        assert_eq!(std::fs::read(copy.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(copy.join("z.txt")).unwrap(), b"z");
+        assert_eq!(std::fs::read(copy.join("locked/b.txt")).unwrap(), b"b");
+        let meta: TrashMetadata =
+            serde_json::from_slice(&std::fs::read(trash.join(sidecar)).unwrap()).unwrap();
+        assert_eq!(meta.original_path, xp.to_string_lossy());
+        assert!(meta.is_dir);
+        assert!(meta.trashed_at_ms > 0);
+    }
+
+    /// A move that fails cleanly removes the sidecar it wrote first.
+    #[test]
+    fn a_clean_failure_removes_the_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = tmp.path().join("trash");
+        let f = tmp.path().join("f.txt");
+        std::fs::write(&f, b"f").unwrap();
+        let r = trash_blocking(&f, &trash, |_, _, _| {
+            Err(MoveError::Untouched("nope".into()))
+        });
+        assert_eq!(r.unwrap_err(), "nope");
+        assert!(names(&trash).is_empty(), "{:?}", names(&trash));
+        assert!(f.exists());
+    }
+
+    /// Regression: the copy fallback opened a FIFO for reading and blocked
+    /// in `open()` forever, pinning a blocking thread and stopping the daemon
+    /// from shutting down. It must refuse it at once and leave the source.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("xfifo");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("k.txt"), b"k").unwrap();
+        mkfifo(&dir.join("pipe"));
+        let dst = tmp.path().join("trash-copy");
+
+        let r = bounded({
+            let (dir, dst) = (dir.clone(), dst.clone());
+            move || copy_then_remove(&dir, &dst, true)
+        });
+        match r {
+            Err(MoveError::Untouched(e)) => assert!(e.contains("not a regular file"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!dst.exists(), "a failed copy is cleaned up");
+        assert_eq!(names(&dir), ["k.txt", "pipe"]);
+
+        // A FIFO trashed on its own, across devices.
+        let lone = tmp.path().join("lone-pipe");
+        mkfifo(&lone);
+        let dst = tmp.path().join("lone-copy");
+        let r = bounded({
+            let (lone, dst) = (lone.clone(), dst.clone());
+            move || copy_then_remove(&lone, &dst, false)
+        });
+        assert!(matches!(r, Err(MoveError::Untouched(_))), "{r:?}");
+        assert!(!dst.exists());
+        assert!(std::fs::symlink_metadata(&lone).is_ok());
+    }
+
+    /// The copy fallback carries a regular file's bytes and mode across.
+    #[test]
+    fn the_copy_fallback_moves_a_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("t");
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        std::fs::write(src.join("d/x.sh"), b"#!/bin/sh").unwrap();
+        std::fs::set_permissions(src.join("d/x.sh"), std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        std::os::unix::fs::symlink("d/x.sh", src.join("ln")).unwrap();
+        let dst = tmp.path().join("moved");
+        copy_then_remove(&src, &dst, true).unwrap();
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst.join("d/x.sh")).unwrap(), b"#!/bin/sh");
+        let mode = std::fs::metadata(dst.join("d/x.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+        assert_eq!(
+            std::fs::read_link(dst.join("ln")).unwrap(),
+            Path::new("d/x.sh")
+        );
+    }
 }

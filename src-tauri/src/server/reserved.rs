@@ -146,7 +146,28 @@ impl Snapshot {
         }
         self.files.iter().any(|f| is_file_or_staging(path, f))
     }
+
+    /// Why moving or deleting `path` (canonical) *as a whole* would take the
+    /// daemon's state with it: `path` is a strict ancestor of the data dir or
+    /// of the discovery file. [`Self::reason`] only refuses paths at or under
+    /// them, which is right for a read or a write but not for a subtree
+    /// operation (`fs_trash`) — an allowlist that covers the data dir
+    /// (`["~"]`, say) would otherwise let a caller trash its ancestor.
+    pub(crate) fn holds_reason(&self, path: &Path) -> Option<&'static str> {
+        if let Some(dd) = &self.data_dir {
+            if dd.path.starts_with(path) {
+                return Some(HOLDS_DATA_DIR);
+            }
+        }
+        if self.files.iter().any(|f| f.starts_with(path)) {
+            return Some(HOLDS_DISCOVERY_FILE);
+        }
+        None
+    }
 }
+
+pub(crate) const HOLDS_DATA_DIR: &str = "path holds the daemon's data directory";
+pub(crate) const HOLDS_DISCOVERY_FILE: &str = "path holds the daemon's discovery file";
 
 /// Why an absolute `path` that could not be canonicalized (its parent is
 /// missing) would be reserved once it existed: its nearest existing ancestor

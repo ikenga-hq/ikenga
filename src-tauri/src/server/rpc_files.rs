@@ -63,6 +63,8 @@ const NO_DATA_DIR_ACTIONS: &str =
     "no actions store: the daemon was started without --data-dir, so there is no ikenga.db (projects) or actions-trust.json to open";
 const NO_HOME_ACTIONS: &str =
     "no actions store: the daemon has no HOME in its environment, so there is no ~/.ikenga/actions.json to resolve";
+const NO_DATA_DIR_TRASH: &str =
+    "no data dir: the daemon was started without --data-dir, so there is no trash directory";
 
 // ─── fs ──────────────────────────────────────────────────────────────────────
 
@@ -110,6 +112,71 @@ pub(super) async fn fs_write(state: &AppState, args: &Value) -> RpcResponse {
     }
     .await;
     respond("fs_write", r)
+}
+
+/// `fs_trash`. Move target to the per-principal trash directory inside the data dir.
+pub(super) async fn fs_trash(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let dir = data_dir(state, NO_DATA_DIR_TRASH)?;
+        let trash_dir = dir.join("trash");
+        state.path_guard.ready()?;
+
+        // Refuse `..` explicitly
+        let raw_abs =
+            crate::path_allow::expand_absolute(&path).map_err(|e| format!("expand path: {e}"))?;
+        if raw_abs
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("path may not contain `..`".to_string());
+        }
+
+        // Deep resolve with allowlist and reserved check
+        let canonical = state.path_guard.resolve_deep(&path)?;
+
+        // A subtree move: the path itself passing the allowlist is not enough.
+        // Refuse an allowlist root or an ancestor of one (a root counts as
+        // inside itself, and under T1 the root is the principal's home), and
+        // an ancestor of the data dir — which would also make the move a
+        // rename into its own subtree.
+        state.path_guard.check_subtree_removable(&canonical)?;
+
+        // Ensure cannot trash the trash dir, anything in it, or anything that
+        // holds it (compared canonically: `--data-dir` may be given through a
+        // symlink).
+        let trash_canonical = trash_dir
+            .canonicalize()
+            .unwrap_or_else(|_| trash_dir.clone());
+        for t in [&trash_dir, &trash_canonical] {
+            if canonical.starts_with(t) || t.starts_with(&canonical) {
+                return Err(format!(
+                    "cannot trash the trash directory or a folder that holds it: {}",
+                    canonical.display()
+                ));
+            }
+        }
+
+        // The daemon's home (under T1, the principal's): every PTY, `~/.claude`
+        // and config lives there, so it and its ancestors are never trashed,
+        // whatever the allowlist says.
+        if let Some(home) = state.home.as_deref() {
+            let home_canonical = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+            if home_canonical.starts_with(&canonical) || home.starts_with(&canonical) {
+                return Err(format!(
+                    "cannot trash the home directory or a folder that holds it: {}",
+                    canonical.display()
+                ));
+            }
+        }
+
+        shared_fs::trash(&canonical, &trash_dir).await
+    }
+    .await;
+    respond("fs_trash", r)
 }
 
 /// `fs_list`. The desktop command is `fs_list(dir, glob)`, so `dir` is the argument
@@ -815,7 +882,12 @@ mod tests {
         }
         // A glob would be silently ignored by a plain read_dir and return everything, so it
         // is refused until it is implemented.
-        let e = err(r, "fs_list", json!({ "dir": s(&d.allowed), "glob": "*.rs" })).await;
+        let e = err(
+            r,
+            "fs_list",
+            json!({ "dir": s(&d.allowed), "glob": "*.rs" }),
+        )
+        .await;
         assert!(e.contains("glob"), "{e}");
     }
 
@@ -830,7 +902,10 @@ mod tests {
         std::fs::create_dir(d.outside.join("secret-dir")).unwrap();
         symlink(&d.allowed.join("real.txt"), &d.allowed.join("inside-link"));
         symlink(&d.outside.join("secret-dir"), &d.allowed.join("escape-dir"));
-        symlink(&d.outside.join("secret.txt"), &d.allowed.join("escape-file"));
+        symlink(
+            &d.outside.join("secret.txt"),
+            &d.allowed.join("escape-file"),
+        );
         symlink(&d.allowed.join("gone"), &d.allowed.join("dangling"));
 
         let listed = ok(r, "fs_list", json!({ "dir": s(&d.allowed) })).await;
@@ -876,7 +951,12 @@ mod tests {
         let text = ok(r, "fs_read", json!({ "path": s(&d.allowed.join("a.txt")) })).await;
         assert_eq!(text["bytes"], json!([104, 105]));
         assert_eq!(text["mime"], "text/plain");
-        let bin = ok(r, "fs_read", json!({ "path": s(&d.allowed.join("blob.bin")) })).await;
+        let bin = ok(
+            r,
+            "fs_read",
+            json!({ "path": s(&d.allowed.join("blob.bin")) }),
+        )
+        .await;
         assert_eq!(bin["bytes"], json!([0, 255, 1, 128]));
         assert_eq!(bin["mime"], "application/octet-stream");
 
@@ -891,7 +971,10 @@ mod tests {
         let r = &d.router;
         let deep = s(&d.allowed.join("deep/er/f.bin"));
         ok(r, "fs_write", json!({ "path": deep, "bytes": [0, 255, 1] })).await;
-        assert_eq!(std::fs::read(d.allowed.join("deep/er/f.bin")).unwrap(), [0, 255, 1]);
+        assert_eq!(
+            std::fs::read(d.allowed.join("deep/er/f.bin")).unwrap(),
+            [0, 255, 1]
+        );
         let back = ok(r, "fs_read", json!({ "path": deep })).await;
         assert_eq!(back["bytes"], json!([0, 255, 1]));
 
@@ -903,8 +986,16 @@ mod tests {
     async fn fs_write_still_takes_content_for_older_callers() {
         let d = daemon();
         let p = s(&d.allowed.join("c.txt"));
-        ok(&d.router, "fs_write", json!({ "path": p, "content": "héllo" })).await;
-        assert_eq!(std::fs::read_to_string(d.allowed.join("c.txt")).unwrap(), "héllo");
+        ok(
+            &d.router,
+            "fs_write",
+            json!({ "path": p, "content": "héllo" }),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(d.allowed.join("c.txt")).unwrap(),
+            "héllo"
+        );
     }
 
     /// The original arm read `content` with `unwrap_or_default()`, so the browser's
@@ -927,7 +1018,12 @@ mod tests {
             assert!(e.contains("`bytes` is required"), "{e}");
             assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
         }
-        let e = err(r, "fs_write", json!({ "path": p, "bytes": [1], "content": "x" })).await;
+        let e = err(
+            r,
+            "fs_write",
+            json!({ "path": p, "bytes": [1], "content": "x" }),
+        )
+        .await;
         assert!(e.contains("not both"), "{e}");
         assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
     }
@@ -936,9 +1032,354 @@ mod tests {
     async fn fs_write_refuses_outside_the_allowlist() {
         let d = daemon();
         let target = d.outside.join("w.txt");
-        let e = err(&d.router, "fs_write", json!({ "path": s(&target), "bytes": [1] })).await;
+        let e = err(
+            &d.router,
+            "fs_write",
+            json!({ "path": s(&target), "bytes": [1] }),
+        )
+        .await;
         assert!(e.contains("outside allowlist"), "{e}");
         assert!(!target.exists());
+    }
+
+    // ── fs_trash ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_trash_refuses_outside_allowlist() {
+        let d = daemon();
+        let target = d.outside.join("secret.txt");
+        std::fs::write(&target, b"keep me safe").unwrap();
+
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&target) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(
+            target.exists(),
+            "target outside allowlist must not be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_trash_refuses_dot_dot() {
+        let d = daemon();
+        let e = err(
+            &d.router,
+            "fs_trash",
+            json!({ "path": format!("{}/../outside/file.txt", s(&d.allowed)) }),
+        )
+        .await;
+        assert!(e.contains("may not contain `..`"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_trash_refuses_symlink_to_outside() {
+        let d = daemon();
+        let secret = d.outside.join("secret.txt");
+        std::fs::write(&secret, b"sensitive").unwrap();
+
+        let link = d.allowed.join("escape_link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&link) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(secret.exists(), "file outside allowlist must remain intact");
+    }
+
+    #[tokio::test]
+    async fn fs_trash_refuses_trash_dir_and_data_dir() {
+        let d = daemon();
+        let trash_dir = d.data.join("trash");
+        std::fs::create_dir_all(&trash_dir).unwrap();
+
+        // 1. Data dir is outside the standard allowlist
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&trash_dir) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+
+        let inside_trash = trash_dir.join("some_file.txt");
+        std::fs::write(&inside_trash, b"data").unwrap();
+        let e2 = err(&d.router, "fs_trash", json!({ "path": s(&inside_trash) })).await;
+        assert!(e2.contains("outside allowlist"), "{e2}");
+
+        // 2. Allowlist covers the root including the data dir (reserved check triggers)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let trash = data.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let item = trash.join("item.txt");
+        std::fs::write(&item, b"x").unwrap();
+
+        let roots_file = root.join("fs_roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [root.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        let guard = PathGuard::roots(Arc::new(roots));
+        let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+        let router = router_with(
+            config(Some(data.clone())),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            Some(db),
+            None,
+            Some(root.clone()),
+            guard,
+        );
+
+        let e_trash = err(&router, "fs_trash", json!({ "path": s(&trash) })).await;
+        assert!(
+            e_trash.contains("reserved")
+                || e_trash.contains("inside the daemon's data directory")
+                || e_trash.contains("cannot trash the trash directory itself"),
+            "{e_trash}"
+        );
+
+        let e_item = err(&router, "fs_trash", json!({ "path": s(&item) })).await;
+        assert!(
+            e_item.contains("reserved")
+                || e_item.contains("inside the daemon's data directory")
+                || e_item.contains("cannot trash the trash directory itself"),
+            "{e_item}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_trash_moves_file_and_writes_metadata_sidecar() {
+        let d = daemon();
+        let file = d.allowed.join("hello.txt");
+        std::fs::write(&file, b"content to trash").unwrap();
+
+        ok(&d.router, "fs_trash", json!({ "path": s(&file) })).await;
+        assert!(!file.exists(), "original file must be removed");
+
+        let trash_dir = d.data.join("trash");
+        assert!(trash_dir.exists(), "trash dir must exist");
+
+        // On Unix, verify mode 0700
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&trash_dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "trash dir must be mode 0700");
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&trash_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let item_file = entries
+            .iter()
+            .find(|n| n.ends_with("_hello.txt"))
+            .expect("trashed item exists");
+        let sidecar_file = entries
+            .iter()
+            .find(|n| n.ends_with("_hello.txt.meta.json"))
+            .expect("sidecar exists");
+
+        assert_eq!(
+            std::fs::read(trash_dir.join(item_file)).unwrap(),
+            b"content to trash"
+        );
+
+        let meta_str = std::fs::read_to_string(trash_dir.join(sidecar_file)).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta["original_path"], s(&file));
+        assert_eq!(meta["file_name"], "hello.txt");
+        assert_eq!(meta["is_dir"], false);
+        assert!(meta["trashed_at_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn fs_trash_moves_directory_recursively() {
+        let d = daemon();
+        let folder = d.allowed.join("my_project");
+        let sub = folder.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), b"deep nested data").unwrap();
+
+        ok(&d.router, "fs_trash", json!({ "path": s(&folder) })).await;
+        assert!(!folder.exists(), "original folder must be removed");
+
+        let trash_dir = d.data.join("trash");
+        let entries: Vec<_> = std::fs::read_dir(&trash_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let item_dir = entries
+            .iter()
+            .find(|n| n.ends_with("_my_project"))
+            .expect("trashed dir exists");
+        let sidecar_file = entries
+            .iter()
+            .find(|n| n.ends_with("_my_project.meta.json"))
+            .expect("sidecar exists");
+
+        assert_eq!(
+            std::fs::read(trash_dir.join(item_dir).join("sub/nested.txt")).unwrap(),
+            b"deep nested data"
+        );
+
+        let meta_str = std::fs::read_to_string(trash_dir.join(sidecar_file)).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta["original_path"], s(&folder));
+        assert_eq!(meta["file_name"], "my_project");
+        assert_eq!(meta["is_dir"], true);
+    }
+
+    #[tokio::test]
+    async fn fs_trash_cross_principal_isolation() {
+        let d_a = daemon();
+        let d_b = daemon();
+
+        let file_a = d_a.allowed.join("doc_a.txt");
+        let file_b = d_b.allowed.join("doc_b.txt");
+        std::fs::write(&file_a, b"for principal A").unwrap();
+        std::fs::write(&file_b, b"for principal B").unwrap();
+
+        ok(&d_a.router, "fs_trash", json!({ "path": s(&file_a) })).await;
+        ok(&d_b.router, "fs_trash", json!({ "path": s(&file_b) })).await;
+
+        let trash_a = d_a.data.join("trash");
+        let trash_b = d_b.data.join("trash");
+
+        let names_a: Vec<_> = std::fs::read_dir(&trash_a)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let names_b: Vec<_> = std::fs::read_dir(&trash_b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names_a.iter().any(|n| n.contains("doc_a.txt")));
+        assert!(
+            !names_a.iter().any(|n| n.contains("doc_b.txt")),
+            "principal A trash must not contain principal B files"
+        );
+
+        assert!(names_b.iter().any(|n| n.contains("doc_b.txt")));
+        assert!(
+            !names_b.iter().any(|n| n.contains("doc_a.txt")),
+            "principal B trash must not contain principal A files"
+        );
+    }
+
+    /// A daemon with the given allowlist roots, `--data-dir` and home.
+    fn daemon_with(roots: &[&Path], data: &Path, home: Option<&Path>) -> Router {
+        std::fs::create_dir_all(data).unwrap();
+        let roots_file = data.parent().unwrap().join("fs_roots_custom.json");
+        let roots_json: Vec<String> = roots.iter().map(|r| s(r)).collect();
+        std::fs::write(&roots_file, json!({ "roots": roots_json }).to_string()).unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        router_with(
+            config(Some(data.to_path_buf())),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            Some(Arc::new(PaDb::new(data.join("ikenga.db")))),
+            None,
+            home.map(Path::to_path_buf),
+            PathGuard::roots(Arc::new(roots)),
+        )
+    }
+
+    fn trash_is_empty(data: &Path) -> bool {
+        std::fs::read_dir(data.join("trash")).map_or(true, |mut rd| rd.next().is_none())
+    }
+
+    /// Regression: a root counts as inside itself, so the allowlist check
+    /// passed and `fs_trash` moved the whole root (under T1, the principal's
+    /// home) into the trash. A root, and a folder that holds one, are refused.
+    #[tokio::test]
+    async fn fs_trash_refuses_an_allowlist_root_and_a_folder_that_holds_one() {
+        let d = daemon();
+        std::fs::write(d.allowed.join("keep.txt"), b"k").unwrap();
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&d.allowed) })).await;
+        assert!(e.contains("allowlist root"), "{e}");
+        assert!(
+            d.allowed.join("keep.txt").exists(),
+            "the root must stay put"
+        );
+        // Spelled with a trailing slash too.
+        let e = err(
+            &d.router,
+            "fs_trash",
+            json!({ "path": format!("{}/", s(&d.allowed)) }),
+        )
+        .await;
+        assert!(e.contains("allowlist root"), "{e}");
+        assert!(trash_is_empty(&d.data));
+
+        // A root nested under another root, and a folder holding it.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let (r, inner) = (base.join("r"), base.join("r/a/b"));
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("f.txt"), b"f").unwrap();
+        std::fs::write(r.join("plain.txt"), b"p").unwrap();
+        let data = base.join("data");
+        let router = daemon_with(&[&r, &inner], &data, Some(&base.join("home")));
+        for p in [&inner, &r.join("a"), &r] {
+            let e = err(&router, "fs_trash", json!({ "path": s(p) })).await;
+            assert!(e.contains("allowlist root"), "{}: {e}", p.display());
+        }
+        assert!(inner.join("f.txt").exists());
+        assert!(trash_is_empty(&data));
+        // An ordinary file under the roots still trashes.
+        ok(
+            &router,
+            "fs_trash",
+            json!({ "path": s(&r.join("plain.txt")) }),
+        )
+        .await;
+        assert!(!r.join("plain.txt").exists());
+    }
+
+    /// Regression: with an allowlist that covers the data dir (a supported
+    /// setup), trashing an ancestor of the data dir renamed a folder into its
+    /// own subtree (EINVAL), fell back to a copy, and the copy recursed into
+    /// its own output until ENAMETOOLONG. The ancestor is refused up front.
+    #[tokio::test]
+    async fn fs_trash_refuses_an_ancestor_of_the_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("R");
+        let data = root.join("sub/data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(root.join("sub/sibling.txt"), b"s").unwrap();
+        let router = daemon_with(&[&root], &data, None);
+
+        let e = err(&router, "fs_trash", json!({ "path": s(&root.join("sub")) })).await;
+        assert!(e.contains("holds the daemon's data directory"), "{e}");
+        assert!(root.join("sub/sibling.txt").exists());
+        assert!(data.is_dir());
+        assert!(trash_is_empty(&data), "no copy may reach the trash");
+        // The root itself is refused as a root.
+        let e = err(&router, "fs_trash", json!({ "path": s(&root) })).await;
+        assert!(e.contains("allowlist root"), "{e}");
+        assert!(root.join("sub/sibling.txt").exists());
+    }
+
+    /// The daemon's home (under T1 the principal's) is never trashed, nor a
+    /// folder that holds it, even when the allowlist root sits above it.
+    #[tokio::test]
+    async fn fs_trash_refuses_the_home_and_its_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let root = base.join("R");
+        let home = root.join("people/ada");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let data = base.join("data");
+        let router = daemon_with(&[&root], &data, Some(&home));
+        for p in [&home, &root.join("people")] {
+            let e = err(&router, "fs_trash", json!({ "path": s(p) })).await;
+            assert!(e.contains("home directory"), "{}: {e}", p.display());
+        }
+        assert!(home.join(".claude").exists());
+        assert!(trash_is_empty(&data));
     }
 
     /// plans/file-editing Shape 5: a browser text save over axum's 2 MB body default used to
