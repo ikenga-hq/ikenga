@@ -31,6 +31,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import type { PaneNode, PaneView } from '@/lib/panes/types';
 import { fuzzyMatchSection, slugifySectionId, usePinsStore } from '@/lib/shell/pins-store';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { isRemoteWebSession } from '@/lib/tauri-cmd';
 import { createClaudeTerminalSession, createTerminalSession } from '@/terminal/single-terminal';
 import { useTerminalTitles, type TerminalTitleResolver } from '@/terminal/use-terminal-titles';
 import {
@@ -256,11 +257,16 @@ export function CommandPalette({ open, mode, onOpenChange }: CommandPaletteProps
 												Icon={PinIconGlyph}
 												label="Pin focused route to activity bar…"
 											/>
-											<PaletteItem
-												onSelect={startAttachChrome}
-												Icon={Globe}
-												label="Attach Chrome profile / tab…"
-											/>
+											{/* Managed Chrome runs beside the desktop app; a browser
+											    session has no `iyke_endpoint` to attach it through
+											    (gap audit rank 16). */}
+											{!isRemoteWebSession() && (
+												<PaletteItem
+													onSelect={startAttachChrome}
+													Icon={Globe}
+													label="Attach Chrome profile / tab…"
+												/>
+											)}
 										</Command.Group>
 
 										{mode === 'all' && <ActionsGroup onClose={() => onOpenChange(false)} />}

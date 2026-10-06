@@ -352,6 +352,43 @@ impl PathGuard {
         }
     }
 
+    /// For a subtree operation (`fs_trash`) on `canonical`, which must already
+    /// have passed [`Self::check`]: refuse a path that is, or holds, an
+    /// allowlist root (the whole root would leave the allowlist — under T1
+    /// the root is the principal's home), the share's own root when the guard
+    /// is narrowed, or the daemon's state (an ancestor of the data dir or the
+    /// discovery file, which [`Self::check`] does not refuse because it only
+    /// looks at the path itself and what lies under it).
+    pub(crate) fn check_subtree_removable(&self, canonical: &Path) -> Result<(), String> {
+        let root = match &self.roots {
+            GuardRoots::Allowlist => crate::fs_roots::current()
+                .ok_or(NO_ALLOWLIST)?
+                .root_within(canonical),
+            #[cfg(test)]
+            GuardRoots::Local(roots) => roots.root_within(canonical),
+        };
+        if let Some(root) = root {
+            return Err(format!(
+                "path is, or holds, an fs allowlist root ({}): {}",
+                root.display(),
+                canonical.display()
+            ));
+        }
+        if let Some(narrow) = &self.narrow {
+            let (Narrow::Tree(r) | Narrow::File(r)) = narrow.as_ref();
+            if r.starts_with(canonical) {
+                return Err(format!(
+                    "path is, or holds, the shared project root: {}",
+                    canonical.display()
+                ));
+            }
+        }
+        match self.reserved.snapshot().holds_reason(canonical) {
+            Some(reason) => Err(format!("{reason}: {}", canonical.display())),
+            None => Ok(()),
+        }
+    }
+
     /// Whether `canonical` is the daemon's own state: the filter form of
     /// [`Self::check_reserved`], for paths the OS reports (watch events)
     /// rather than paths a caller asks for — no symlink rule.

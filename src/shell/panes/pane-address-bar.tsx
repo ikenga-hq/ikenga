@@ -19,6 +19,7 @@ import { resolveArtifactAddress } from '@/lib/panes/pane-address-resolver';
 import type { LeafNode, PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneHistory } from '@/lib/panes/use-pane-history';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { guardedCloseTab } from '@/lib/panes/unsaved-guard';
 import { useDragState } from '@/lib/panes/drag-state';
 import { beginPointerDrag } from '@/lib/panes/pointer-drag';
 import { writeClipboardText } from '@/lib/transport';
@@ -119,7 +120,6 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 	const rowLabel = leaf ? viewLabel(leaf.tabs[0], undefined, resolveDisplayName) : undefined;
 
 	const focusPane = usePaneStore((s) => s.focusPane);
-	const closeTab = usePaneStore((s) => s.closeTab);
 	const toggleTabPinned = usePaneStore((s) => s.toggleTabPinned);
 	const [newTabOpen, setNewTabOpen] = useState(false);
 	const addBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -147,7 +147,7 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 			? { 'copy-path': () => void writeClipboardText(soleTabPath).catch(() => {}) }
 			: {}),
 		'tab.close': () => {
-			if (leaf) closeTab(leaf.id, 0);
+			if (leaf) void guardedCloseTab(leaf.id, 0);
 		},
 	};
 

@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SeatView } from '@/lib/tauri-cmd';
 
 const m = vi.hoisted(() => ({
+	// Gap audit rank 16: flips the page into a remote browser session.
+	remote: false,
 	spawnWindow: vi.fn(async (d: { label: string }) => d.label),
 	// `null` = no Window 2 open (the caller spawns).
 	windowJoinSurface: vi.fn(async (): Promise<string | null> => null),
@@ -20,6 +22,7 @@ const m = vi.hoisted(() => ({
 vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
 	listen: vi.fn(() => Promise.resolve(() => {})),
+	isRemoteWebSession: () => m.remote,
 }));
 vi.mock('@/lib/iyke/client', () => ({
 	iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })),
@@ -60,7 +63,8 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { seatsQueryKey } from '@/lib/queries/seats';
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
-import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { syncDetachedSurfaces, useDetachedSurfaces } from '@/lib/window/detached-surfaces';
+import { popOutSurface } from '@/lib/window/window-two';
 import { PENDING_WINDOW_LABEL } from '@/lib/window/surfaces-topic';
 import { useSeatNotice } from '@/shell/companion/seat-notice';
 import { __resetSessionNumbersForTests } from '@/shell/companion/seat-sessions';
@@ -124,6 +128,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	cleanup();
+	m.remote = false;
 });
 
 describe('TerminalView Pop out', () => {
@@ -226,5 +231,44 @@ describe('ArtifactView Pop out', () => {
 		expect(notice()?.message).toBe('Couldn’t pop out readme.md: no window');
 		expect(VIEWER_SURFACE in surfaceMap()).toBe(false);
 		await waitFor(() => expect(screen.getByTestId('viewer')).toBeTruthy());
+	});
+});
+
+// Gap audit rank 16 — a browser session has no second window, and the daemon
+// serves neither window_join_surface nor window_list. The Pop out controls are
+// hidden there and nothing reaches those commands.
+describe('Pop out in a remote browser session (gap rank 16)', () => {
+	it('TerminalView offers no Pop out button', () => {
+		m.remote = true;
+		render(<TerminalView sessionId="term-3" />);
+		expect(screen.queryByRole('button', { name: 'Pop out terminal' })).toBeNull();
+		expect(screen.getByTestId('xterm')).toBeTruthy();
+	});
+
+	it('ArtifactView offers no Pop out button', () => {
+		m.remote = true;
+		render(<ArtifactView path={FILE} paneId="L1" />);
+		expect(screen.queryByRole('button', { name: 'Pop out viewer' })).toBeNull();
+	});
+
+	it('a stray popOutSurface call rejects without calling the window commands or marking the surface', async () => {
+		m.remote = true;
+		await expect(popOutSurface(TERM_SURFACE, { projectId: PROJECT })).rejects.toThrow(
+			/Desktop app only/
+		);
+		expect(m.windowJoinSurface).not.toHaveBeenCalled();
+		expect(m.spawnWindow).not.toHaveBeenCalled();
+		expect(TERM_SURFACE in surfaceMap()).toBe(false);
+	});
+
+	it('the detached-surfaces refresh does not call window_list', async () => {
+		m.remote = true;
+		await syncDetachedSurfaces();
+		expect(m.listWindows).not.toHaveBeenCalled();
+	});
+
+	it('the desktop refresh still calls window_list', async () => {
+		await syncDetachedSurfaces();
+		expect(m.listWindows).toHaveBeenCalledTimes(1);
 	});
 });

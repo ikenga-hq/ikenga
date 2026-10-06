@@ -473,7 +473,7 @@ export function ProjectBody({ onContinue, registerBeforeNext }: ProjectBodyProps
 						file={scopeFile}
 						onOpenFile={
 							scope === 'personal' || scopeProjectId
-								? () => void openSettingsFile(scope, scope === 'project' ? scopeProjectId : null).catch(() => {})
+								? () => openSettingsFile(scope, scope === 'project' ? scopeProjectId : null)
 								: undefined
 						}
 					/>

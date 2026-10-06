@@ -96,14 +96,19 @@ function openSeatBoardCommand(): void {
  * `people.lock-now` (D-05 ⌘⇧L, WP-72's Lock now): lock the app now, exactly
  * as Profile › App lock's *Lock now* button does. With no PIN set nothing
  * could unlock it, so — like that button — it does nothing.
+ *
+ * Desktop only (gap audit rank 29): app lock guards the desktop app, and the
+ * headless daemon does not serve `app_lock_lock`, so in a browser the key
+ * used to fail silently with a console warning. It is now a no-op there.
  */
 function lockNowCommand(): void {
 	void (async () => {
 		try {
-			const [{ appLockLock }, { useAppLockStore }] = await Promise.all([
+			const [{ appLockLock, isTauri }, { useAppLockStore }] = await Promise.all([
 				import('@/lib/tauri-cmd'),
 				import('@/shell/people/app-lock-store'),
 			]);
+			if (!isTauri()) return;
 			const current = useAppLockStore.getState().status;
 			if (current && (current.locked || !current.secretSet)) return;
 			useAppLockStore.getState().setStatus(await appLockLock());
@@ -312,12 +317,14 @@ export function ownerOf(command: string): CommandOwner | null {
 	}
 	// WP-56: widget-local commands registered by the surface that owns the
 	// focused element (permission card, approve gate, Studio loupe/pin
-	// composer, markdown editor) — never hosted, so never in §4.6's table.
+	// composer, markdown editor, and — plans/file-editing — the shared text
+	// editor) — never hosted, so never in §4.6's table.
 	if (
 		command.startsWith('companion.permission-') ||
 		command.startsWith('approve-gate.') ||
 		command.startsWith('studio.') ||
-		command.startsWith('markdown.')
+		command.startsWith('markdown.') ||
+		command.startsWith('editor.')
 	) {
 		return 'widget';
 	}

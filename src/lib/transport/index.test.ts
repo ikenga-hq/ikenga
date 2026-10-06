@@ -166,3 +166,53 @@ describe('getTransport', () => {
 		expect(getTransport()).toBeInstanceOf(WebRemoteTransport);
 	});
 });
+
+describe('awaitingFirstToken', () => {
+	beforeEach(() => {
+		sessionStorage.clear();
+		localStorage.clear();
+		visit('');
+		delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+	});
+
+	it('is true for a browser tab with no token: the connect dialog must show, not a blank page', async () => {
+		const { awaitingFirstToken } = await freshModule();
+		expect(awaitingFirstToken()).toBe(true);
+	});
+
+	it('is false once the tab holds a token, from the URL or from sessionStorage', async () => {
+		visit('?token=abc123');
+		const first = await freshModule();
+		expect(first.awaitingFirstToken()).toBe(false);
+
+		visit('');
+		sessionStorage.setItem(TOKEN_KEY, 'from-session');
+		const second = await freshModule();
+		expect(second.awaitingFirstToken()).toBe(false);
+	});
+
+	it('is false for a T1 cookie session, which has no token by design', async () => {
+		const { awaitingFirstToken } = await freshModule();
+		// Same registry as `./index` just imported (no reset in between).
+		const { __setT1SessionForTests } = await import('./t1-session');
+		__setT1SessionForTests(true, null);
+		try {
+			expect(awaitingFirstToken()).toBe(false);
+		} finally {
+			__setT1SessionForTests(false, null);
+		}
+	});
+
+	it('is never true under Tauri, where there is no token to wait for', async () => {
+		(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+		const { awaitingFirstToken } = await freshModule();
+		expect(awaitingFirstToken()).toBe(false);
+		delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+	});
+
+	it('does not change which transport a token-less page gets', async () => {
+		const { getTransport, TauriTransport, isRemoteWebSession } = await freshModule();
+		expect(isRemoteWebSession()).toBe(false);
+		expect(getTransport()).toBeInstanceOf(TauriTransport);
+	});
+});

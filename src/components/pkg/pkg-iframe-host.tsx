@@ -66,6 +66,7 @@ import {
 	agentOpsUpsertJob,
 	dbExec,
 	dbQuery,
+	isRemoteWebSession,
 	osUsername,
 	paActionsCommit,
 	paActionsReject,
@@ -92,6 +93,7 @@ import {
 } from '@/lib/tauri-cmd';
 import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
+import { isUnavailableOnServer } from '@/lib/transport/unavailable';
 import {
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
@@ -398,15 +400,12 @@ async function checkSqliteTableScope(pkgId: string, targets: string[]): Promise<
 	return null;
 }
 
-/** Whether an RPC error means the server doesn't run this command (the
- *  browser client), as opposed to the command itself failing. */
-export function isUnavailableOnServer(msg: string): boolean {
-	return (
-		msg.includes('not implemented in headless daemon') ||
-		msg.includes('not supported') ||
-		msg.includes('unknown command')
-	);
-}
+/** The error suffix for a host verb the headless daemon does not serve to a
+ *  browser session (matches `host.pkgSidecarCall`'s wording). */
+export const NOT_IN_BROWSER = 'not available in the browser yet';
+
+/** Moved to `@/lib/transport/unavailable`; re-exported for existing callers. */
+export { isUnavailableOnServer };
 
 // Exported for unit tests (the verb's scope-gate + confirm + decline
 // branches). Not part of the pkg-facing API — callers go through the
@@ -620,7 +619,10 @@ export async function dispatchHostCall(
 				structuredContent: { ok: true, granted, path: picked },
 			};
 		} catch (e) {
-			return errResult(`host.openFolder failed: ${(e as Error).message ?? String(e)}`);
+			const msg = (e as Error).message ?? String(e);
+			return errResult(
+				`host.openFolder failed: ${isUnavailableOnServer(msg) ? NOT_IN_BROWSER : msg}`
+			);
 		}
 	}
 
@@ -947,7 +949,10 @@ export async function dispatchHostCall(
 				structuredContent: res,
 			};
 		} catch (e) {
-			return errResult(`host.agentOps.runNow failed: ${(e as Error).message ?? String(e)}`);
+			const msg = (e as Error).message ?? String(e);
+			return errResult(
+				`host.agentOps.runNow failed: ${isUnavailableOnServer(msg) ? NOT_IN_BROWSER : msg}`
+			);
 		}
 	}
 
@@ -1088,6 +1093,12 @@ export async function dispatchHostCall(
 		if (!url) {
 			return errResult('host.fetch: missing required `url` argument');
 		}
+		// Browser session (gap audit rank 22): `pkg_fetch` is not served, and
+		// the served `pkg_is_trusted_for_elevated` always answers false there —
+		// which surfaced as a misleading "not trusted" refusal. Say what's true.
+		if (isRemoteWebSession()) {
+			return errResult(`host.fetch: ${NOT_IN_BROWSER}`);
+		}
 		// Gate FE-side as `pkgDeclaresCapability('http') && pkgIsTrustedForElevated`
 		// (fail-fast UX; the Rust command re-checks both server-side).
 		if (!(await pkgDeclaresHttp(pkgId))) {
@@ -1131,6 +1142,10 @@ export async function dispatchHostCall(
 		const command = typeof args.command === 'string' ? args.command : null;
 		if (!command) {
 			return errResult('host.invoke: missing required `command` argument');
+		}
+		// Browser session (gap audit rank 22): see host.fetch above.
+		if (isRemoteWebSession()) {
+			return errResult(`host.invoke: ${NOT_IN_BROWSER}`);
 		}
 		if (!(await pkgDeclaresInvoke(pkgId, command))) {
 			return errResult(`host.invoke: '${command}' not in the pkg's capabilities.invoke.commands`);

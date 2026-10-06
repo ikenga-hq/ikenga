@@ -121,14 +121,6 @@ reason = "dest_dir is unconfined (Path::new(&dest_dir), no allowlist or data-dir
 tag = "WP-19"
 reason = "src_dir is unconfined (no allowlist check), and import_ndjson_from_dir interpolates each file's filename-derived stem into SQL as the table name (INSERT OR REPLACE INTO \"{table}\" ...) with no check against the real schema, so a crafted filename can break out of the quoted identifier. No FE caller (test-only). Needs containment + a table allowlist first."
 
-[detect_agent]
-tag = "WP-18b"
-reason = "agents::detect_by_id runs the same probe_version spawn as detect_agents for one agent id; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[detect_agents]
-tag = "WP-18b"
-reason = "agents::detect_all -> probe_version runs each detected CLI's --version; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
 [detect_system]
 tag = "WP-19"
 reason = "Half of system::build_report is the desktop vault (secret index in app_data_dir + the platform keychain probe via SecretsLock); the daemon has no vault (crate::secrets_env), so secrets_store_ready / vault_key_present and their fix hint would describe a store that does not exist there. Needs a daemon-true report shape first."
@@ -153,10 +145,6 @@ reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the opera
 [fs_roots_reset]
 tag = "WP-20"
 reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
-
-[fs_trash]
-tag = "desktop-only-forever"
-reason = "trash::delete moves the file into the OS trash (freedesktop: $XDG_DATA_HOME/Trash of the daemon's home, or a .Trash-$uid at the mount top) — outside the fs allowlist, with no daemon verb to list or restore it and no trash UI on a headless host, so over RPC it is a delete that leaves a copy outside the boundary. Not served, and never downgraded to a hard delete."
 
 [fs_unwatch]
 tag = "desktop-only-forever"

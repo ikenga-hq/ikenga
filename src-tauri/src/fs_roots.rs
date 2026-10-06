@@ -124,6 +124,18 @@ impl FsRoots {
         guard.iter().any(|e| path.starts_with(&e.resolved))
     }
 
+    /// The active root that `path` (canonical) is, or holds — `path` is that
+    /// root or one of its ancestors. A subtree operation (the daemon's
+    /// `fs_trash`) on such a path would move a whole root away; `is_allowed`
+    /// alone cannot see that, because a root counts as inside itself.
+    pub fn root_within(&self, path: &Path) -> Option<PathBuf> {
+        let guard = self.state.read().expect("fs_roots state poisoned");
+        guard
+            .iter()
+            .find(|e| e.resolved.starts_with(path))
+            .map(|e| e.resolved.clone())
+    }
+
     /// Add a new root. No-op if the trimmed input is empty or already present.
     /// Returns the updated input list.
     pub fn add(&self, input: &str) -> Result<Vec<String>> {

@@ -51,6 +51,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_home", req!(owner[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
+    ("fs_trash", req!(shared[Files, Dispatch])),
     ("fs_mkdir", req!(shared[Files, Dispatch])),
     ("fs_rename", req!(shared[Files, Dispatch])),
     // ── raw DB (P-3: owner-class) ──
@@ -157,6 +158,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("claude_config_load", req!(owner[Files])),
     ("claude_config_read_file", req!(owner[Files])),
     ("claude_config_resolve_cascade", req!(owner[Files])),
+    ("detect_agent", req!(owner[])),
+    ("detect_agents", req!(owner[])),
     ("detect_agent_config", req!(owner[Files])),
     ("list_claude_projects", req!(owner[Files])),
     ("list_agent_projects", req!(owner[Files])),

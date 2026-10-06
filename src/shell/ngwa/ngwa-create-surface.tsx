@@ -195,7 +195,7 @@ export const KIND_DEFS: KindDef[] = [
 		q2Placeholder: 'Generate git commit messages following Conventional Commits format based on git diff of staged files with concise bullet points.',
 		q4Title: 'Recommended model tier',
 		q4Desc: 'Default engine tier for expanding this command.',
-		chips: ['claude-3-5-sonnet', 'claude-3-7-sonnet', 'gemini-2.5-pro', 'gpt-4o'],
+		chips: ['claude-sonnet-5-5', 'claude-opus-5-5', 'gemini-2.5-pro', 'gpt-4o'],
 		files: [
 			{ name: 'command.md', role: 'slash prompt template + hints' },
 		],

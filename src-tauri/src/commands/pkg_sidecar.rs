@@ -92,7 +92,9 @@ pub async fn pkg_sidecar_call(
         args
     );
 
-    let mut cmd = SpawnSpec::new(&entry.bin_path);
+    let (program, pre_args) = crate::runtime::sidecar_program(&entry.bin_path);
+    let mut cmd = SpawnSpec::new(&program);
+    cmd.args(&pre_args);
     cmd.args(&args);
     cmd.current_dir(&install_path);
     // WP-23 (D-18): hand this pkg its scoped database accessor —

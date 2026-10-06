@@ -401,11 +401,16 @@ pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
 // are RPC successes carrying that value. `agent_ops_run_now` is not served
 // (see `desktop_only.toml`); the approve gate's hardcoded mutation-worker wake
 // below is the only daemon caller of `agent_ops::run_now`.
+//
+// A fresh host has no `jobs.json` (gap audit 2026-10-06 rank 12), so list and
+// upsert pass `MissingConfig::Empty`: an empty list, and the first upsert
+// creates the directory (0700) and the file. The desktop commands keep their
+// `io_error` for a missing config.
 
 pub(super) async fn agent_ops_list_jobs(state: &AppState) -> RpcResponse {
     respond(
         "agent_ops_list_jobs",
-        agent_ops::list_jobs(state.home.as_deref()).await,
+        agent_ops::list_jobs(state.home.as_deref(), agent_ops::MissingConfig::Empty).await,
     )
 }
 
@@ -427,7 +432,7 @@ pub(super) async fn agent_ops_upsert_job(state: &AppState, args: &Value) -> RpcR
             .get("job")
             .cloned()
             .ok_or_else(|| "`job` is required".to_string())?;
-        agent_ops::upsert_job(state.home.as_deref(), job).await
+        agent_ops::upsert_job(state.home.as_deref(), job, agent_ops::MissingConfig::Empty).await
     }
     .await;
     respond("agent_ops_upsert_job", r)
@@ -1722,17 +1727,85 @@ mod tests {
             home.join(".agent-ops/runs")
         }
 
+        /// Gap audit 2026-10-06 rank 12: on a fresh host (a T1 principal's
+        /// home on first use) there is no `jobs.json`, and the first schedule
+        /// could never be created — list and upsert both answered io_error.
+        #[tokio::test]
+        async fn agent_ops_first_job_on_a_fresh_host() {
+            use crate::server::shared::agent_ops::{self, MissingConfig};
+            let d = daemon();
+            let r = &d.router;
+            let file = jobs_file(&d.home);
+            assert!(!d.home.join(".atelier").exists());
+
+            // No config: an empty list, not an error.
+            let none = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(none["ok"], true, "{none}");
+            assert_eq!(none["jobs"], json!([]));
+            assert_eq!(none["daemon_up"], false);
+            // Listing creates nothing.
+            assert!(!d.home.join(".atelier").exists());
+
+            let job = json!({
+                "id": "ns:first",
+                "label": "First",
+                "schedule": "0 3 * * *",
+                "command": "echo hi",
+                "mode": "script",
+            });
+            let up = ok(r, "agent_ops_upsert_job", json!({ "job": job })).await;
+            assert_eq!(
+                up,
+                json!({ "ok": true, "jobId": "ns:first", "created": true })
+            );
+            // The bare-array root the agent-ops daemon and skill write.
+            let written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            assert_eq!(written.as_array().unwrap().len(), 1);
+            assert_eq!(written[0]["id"], "ns:first");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for dir in [
+                    d.home.join(".atelier"),
+                    file.parent().unwrap().to_path_buf(),
+                ] {
+                    let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+                }
+            }
+            let listed = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(listed["jobs"][0]["id"], "ns:first");
+
+            // A config that exists but does not parse is still an io_error —
+            // only "not found" reads as empty — and is left untouched.
+            std::fs::write(&file, b"{ not json").unwrap();
+            let bad = ok(r, "agent_ops_list_jobs", json!({})).await;
+            assert_eq!(bad["code"], "io_error");
+            let bad_up = ok(r, "agent_ops_upsert_job", json!({ "job": job })).await;
+            assert_eq!(bad_up["code"], "io_error");
+            assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
+
+            // The desktop policy is unchanged: a missing config is io_error,
+            // and its upsert creates nothing.
+            std::fs::remove_dir_all(d.home.join(".atelier")).unwrap();
+            let desk = agent_ops::list_jobs(Some(&d.home), MissingConfig::Error)
+                .await
+                .unwrap();
+            assert_eq!(desk["code"], "io_error");
+            let desk_up = agent_ops::upsert_job(Some(&d.home), job, MissingConfig::Error)
+                .await
+                .unwrap();
+            assert_eq!(desk_up["code"], "io_error");
+            assert!(!d.home.join(".atelier").exists());
+        }
+
         #[tokio::test]
         async fn agent_ops_jobs_round_trip_under_the_router_home() {
             let d = daemon();
             let r = &d.router;
             let file = jobs_file(&d.home);
 
-            // No config yet: the desktop's io_error value, as a success.
-            let none = ok(r, "agent_ops_list_jobs", json!({})).await;
-            assert_eq!(none["ok"], false);
-            assert_eq!(none["code"], "io_error");
-
+            // An existing `{ jobs: [] }` root (the object shape) is kept.
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, r#"{ "jobs": [] }"#).unwrap();
 
@@ -1761,9 +1834,12 @@ mod tests {
             assert_eq!(jobs[0]["schedule_dialect"], "5f");
             assert_eq!(jobs[0]["enabled"], true);
             // Same value the core (and so the desktop command) produces.
-            let direct = crate::server::shared::agent_ops::list_jobs(Some(&d.home))
-                .await
-                .unwrap();
+            let direct = crate::server::shared::agent_ops::list_jobs(
+                Some(&d.home),
+                crate::server::shared::agent_ops::MissingConfig::Empty,
+            )
+            .await
+            .unwrap();
             assert_eq!(listed, direct);
 
             // Both spellings of the id.

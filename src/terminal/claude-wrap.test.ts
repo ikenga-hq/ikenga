@@ -4,7 +4,14 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { __setClaudeSettingsPathForTests } from './claude-settings';
-import { buildAgentWrappedCmd, buildClaudeWrappedCmd } from './claude-wrap';
+import {
+	buildAgentArgs,
+	buildAgentEnv,
+	buildAgentWrappedCmd,
+	buildClaudeWrappedCmd,
+} from './claude-wrap';
+import { buildSpawnOpts } from './spawn-opts';
+import type { TerminalTab } from './session-store';
 
 /** Pull the quoted command invocation out of the bash wrapper script so
  *  assertions read against the real command rather than the printf chrome. */
@@ -226,5 +233,56 @@ describe('claude --settings injection', () => {
 		expect(extractInvocation(cmd)).toBe(
 			`'claude' '--dangerously-skip-permissions' '--settings' '/run/user/1000/app.ikenga/claude-hooks-term-abc.json' '--resume' 'sess-resume-123' 'continue where we left off'`
 		);
+	});
+});
+
+describe('WP-11 launch options (role, appendSystemPrompt, pluginDirs)', () => {
+	const flag = (args: string[], name: string) => {
+		const i = args.indexOf(name);
+		return i === -1 ? undefined : args[i + 1];
+	};
+
+	it('adds nothing when none of the options is set', () => {
+		const args = buildAgentArgs({ engine: 'claude' });
+		expect(args).not.toContain('--model');
+		expect(args).not.toContain('--append-system-prompt');
+		expect(buildAgentEnv({ engine: 'claude' })).toBeUndefined();
+	});
+
+	it('resolves --model from the catalog by role', () => {
+		expect(flag(buildAgentArgs({ role: 'chi' }), '--model')).toBe('claude-sonnet-5-5');
+		expect(flag(buildAgentArgs({ role: 'pane' }), '--model')).toBe('claude-sonnet-5-5');
+		expect(flag(buildAgentArgs({ role: 'plan' }), '--model')).toBe('claude-opus-5-5');
+	});
+
+	it('keeps an explicit model over the role default', () => {
+		expect(flag(buildAgentArgs({ role: 'plan', model: 'claude-haiku-4-5' }), '--model')).toBe(
+			'claude-haiku-4-5'
+		);
+	});
+
+	it('passes --append-system-prompt before the positional prompt', () => {
+		const args = buildAgentArgs({ appendSystemPrompt: 'You are in Ikenga.', prompt: 'hi' });
+		expect(flag(args, '--append-system-prompt')).toBe('You are in Ikenga.');
+		expect(args.at(-1)).toBe('hi');
+	});
+
+	it('sets CLAUDE_CODE_PLUGIN_DIRS for claude only', () => {
+		expect(buildAgentEnv({ pluginDirs: ['/p/one', '', '/p/two'] })).toEqual({
+			CLAUDE_CODE_PLUGIN_DIRS: '/p/one:/p/two',
+		});
+		expect(buildAgentEnv({ engine: 'codex', pluginDirs: ['/p'] })).toBeUndefined();
+		expect(buildAgentEnv({ pluginDirs: [] })).toBeUndefined();
+	});
+
+	it('threads the plugin dirs into the PTY spawn env, keeping the tab env', () => {
+		const tab = {
+			id: 't1',
+			title: 'claude',
+			spec: { cwd: '/w', cmd: ['claude'], env: { FOO: '1' }, wrap: { pluginDirs: ['/p'] } },
+		} as unknown as TerminalTab;
+		expect(buildSpawnOpts(tab, 't1').env).toEqual({ FOO: '1', CLAUDE_CODE_PLUGIN_DIRS: '/p' });
+		const plain = { ...tab, spec: { ...tab.spec, wrap: {} } } as unknown as TerminalTab;
+		expect(buildSpawnOpts(plain, 't1').env).toEqual({ FOO: '1' });
 	});
 });

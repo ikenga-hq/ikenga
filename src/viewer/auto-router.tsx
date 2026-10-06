@@ -34,8 +34,9 @@ interface ViewerRouterProps {
 	chromeless?: boolean;
 	/** Forwarded to renderers that opt into iyke iframe bridging (HtmlFrame). */
 	paneId?: string;
-	/** Enable in-place editing for renderers that support it (MarkdownView).
-	 *  Defaults false so thumbnails/embeds stay read-only. */
+	/** Enable in-place editing for the text renderers (Markdown, Code, JSON,
+	 *  CSV — plans/file-editing F1). Defaults false so thumbnails/embeds stay
+	 *  read-only. */
 	editable?: boolean;
 	line?: number;
 	col?: number;
@@ -136,9 +137,13 @@ export function ViewerRouter({
 			{Renderer === HtmlFrame ? (
 				<HtmlFrame path={path} paneId={paneId} />
 			) : Renderer === MarkdownView ? (
-				<MarkdownView path={path} editable={editable} line={line} col={col} />
+				<MarkdownView path={path} editable={editable} paneId={paneId} line={line} col={col} />
 			) : Renderer === CodeView ? (
-				<CodeView path={path} line={line} col={col} />
+				<CodeView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+			) : Renderer === JsonView ? (
+				<JsonView path={path} editable={editable} paneId={paneId} line={line} col={col} />
+			) : Renderer === CsvView ? (
+				<CsvView path={path} editable={editable} paneId={paneId} line={line} col={col} />
 			) : (
 				<Renderer path={path} />
 			)}

@@ -1279,7 +1279,26 @@ pub async fn internal(
     })
 }
 
+/// Why a project with no folder can't be shared (gap audit 2026-10-06 rank
+/// 2). §4.5.4 confines every share request to the project root
+/// (`PathGuard::narrowed_to(project_root | artifact_path)`), so a project
+/// with no root — the built-in Default, whose row is seeded with
+/// `root_path NULL` — has nothing to confine a member to. Widening it to the
+/// Owner's home would hand members the Owner's dotfiles and engine logins,
+/// which §4.4 / N-10 keep out of every share. The Members tab disables
+/// "Share kola" on such a project with the same reason.
+pub const NO_FOLDER_TO_SHARE: &str =
+    "this project has no folder, so it can't be shared. Open a folder as a project and share that";
+
 /// `share_project_info {projectId}` → `{root, name}`; unknown → `not_found`.
+///
+/// An active project that exists but has no folder is `invalid_request`
+/// ([`NO_FOLDER_TO_SHARE`]) rather than `not_found`, so the Owner who tries
+/// to invite to it (the Default project, most often) learns why. This arm
+/// is `internal`: only the broker calls it (§4.5.3), on behalf of the Owner
+/// or one of the project's Operators, who already know the project exists —
+/// it is no existence oracle. The share pre-hook's own [`resolve_root`]
+/// keeps answering a uniform `not_found`.
 async fn internal_project_info(
     state: &crate::server::AppState,
     args: &Value,
@@ -1287,8 +1306,36 @@ async fn internal_project_info(
     let project_id = str_arg(args, &["projectId", "project_id"])
         .filter(|p| !p.is_empty())
         .ok_or_else(|| AccessError::new(Code::InvalidRequest, "`projectId` is required"))?;
-    let r = resolve_root(state, project_id).await?;
-    Ok(json!({ "root": r.root.to_string_lossy(), "name": r.name }))
+    match resolve_root(state, project_id).await {
+        Ok(r) => Ok(json!({ "root": r.root.to_string_lossy(), "name": r.name })),
+        Err(e) if e.code == Code::NotFound && is_rootless(state, project_id).await => {
+            Err(AccessError::new(Code::InvalidRequest, NO_FOLDER_TO_SHARE))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `project_id` is an active project row whose `root_path` is unset
+/// or blank. Any failure to answer reads as "no" (the caller then keeps its
+/// `not_found`).
+async fn is_rootless(state: &crate::server::AppState, project_id: &str) -> bool {
+    let Some(db) = state.pa_db.as_ref() else {
+        return false;
+    };
+    let Ok(pool) = db.ensure_reader_pool().await else {
+        return false;
+    };
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT root_path FROM projects WHERE id = ? AND archived_at IS NULL")
+            .bind(project_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None);
+    match row {
+        Some((None,)) => true,
+        Some((Some(root),)) => root.trim().is_empty(),
+        None => false,
+    }
 }
 
 /// `notifications_record_access {kind:'invite', title, body}` → `{id}`: the

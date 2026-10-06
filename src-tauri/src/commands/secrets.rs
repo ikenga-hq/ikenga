@@ -1383,13 +1383,13 @@ fn ensure_private_env_parent(path: &Path) -> Result<(), String> {
     for directory in directories {
         match std::fs::symlink_metadata(directory) {
             Ok(metadata) => {
-                if is_link_or_reparse_point(&metadata) {
+                if crate::secrets::index::is_untrusted_directory_link(&metadata) {
                     return Err(format!(
                         "refusing linked env-vault directory {}",
                         directory.display()
                     ));
                 }
-                if !metadata.is_dir() {
+                if !crate::secrets::index::is_directory_or_link_to_one(directory, &metadata) {
                     return Err(format!(
                         "env-vault parent is not a directory: {}",
                         directory.display()
@@ -1855,7 +1855,10 @@ mod tests {
         let link = dir.path().join("linked");
         symlink(&target, &link).unwrap();
         let error = ensure_private_env_parent(&link.join("env-vault")).unwrap_err();
-        assert!(error.contains("linked env-vault directory"));
+        assert!(error.contains(&format!(
+            "refusing linked env-vault directory {}",
+            link.display()
+        )));
         assert!(!target.join("env-vault").exists());
     }
 

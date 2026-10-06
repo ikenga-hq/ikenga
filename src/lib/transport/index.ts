@@ -254,7 +254,11 @@ export class WebRemoteTransport implements RpcTransport {
 			if (res.status === 401) {
 				try {
 					const { useReauthStore } = await import('./reauth-store');
-					useReauthStore.getState().showReauth();
+					// Leave an open dialog as it is: a stray 401 must not turn
+					// a first-visit or sign-in prompt into "session expired",
+					// or clear the error the user is reading.
+					const reauth = useReauthStore.getState();
+					if (!reauth.isOpen) reauth.showReauth();
 				} catch {
 					// Fall through
 				}
@@ -378,6 +382,31 @@ export async function emit(event: string, payload?: unknown): Promise<void> {
 
 let transportInstance: RpcTransport | null = null;
 
+/** Set by `./browser-entry`, the first module `main.tsx` evaluates. */
+let browserEntry = false;
+
+/**
+ * Record that this page booted through the real SPA entry outside Tauri, so
+ * it is a browser tab on a daemon-served page — whatever the tier, and
+ * whether or not it holds a token yet.
+ *
+ * {@link isRemoteWebSession} cannot answer that before boot: a T1 or paired
+ * device tab has no token, and the tier probe has not run, so anything that
+ * reached the transport first (the `fs_home` and `supabase_config_get` probes
+ * at module load) used to get the desktop transport and call a Tauri
+ * `invoke` that does not exist in a browser. Tests and harnesses never load
+ * the entry, so they keep the desktop transport and their mocked `invoke`.
+ * No-op under Tauri.
+ */
+export function markBrowserEntry(): void {
+	if (!isTauri()) browserEntry = true;
+}
+
+/** True once {@link markBrowserEntry} ran in a non-Tauri page. */
+export function isBrowserEntry(): boolean {
+	return browserEntry;
+}
+
 /**
  * True only for a page served by `ikenga-server` to a browser.
  *
@@ -396,6 +425,22 @@ export function isRemoteWebSession(): boolean {
 	return !isTauri() && (isT1Session() || isDeviceSession() || getAuthToken() !== null);
 }
 
+/**
+ * True for a real browser tab opened on a daemon-served page that holds no
+ * token yet: a first visit, or a visit by a bare URL with no `?token=`.
+ *
+ * The complement of {@link isRemoteWebSession} outside Tauri. It exists
+ * because that function's "no token" answer hands the page to the desktop
+ * transport, whose `invoke` does not exist in a browser, so boot stalls and
+ * the screen stays blank. The boot path uses this to show the connect dialog
+ * instead. Not for tests or harnesses: only `bootPrimary` calls it.
+ */
+export function awaitingFirstToken(): boolean {
+	// A T1 password session and a paired device authenticate by cookie, so
+	// "no token" is their normal state, not a first visit.
+	return !isTauri() && getAuthToken() === null && !isT1Session() && !isDeviceSession();
+}
+
 export function getTransport(): RpcTransport {
 	// T1 and a paired device's cookie are both detected asynchronously at
 	// boot; a desktop transport picked before that (by anything that ran
@@ -406,7 +451,10 @@ export function getTransport(): RpcTransport {
 		!transportInstance ||
 		((isT1Session() || isDeviceSession()) && transportInstance instanceof TauriTransport)
 	) {
-		transportInstance = isRemoteWebSession() ? new WebRemoteTransport() : new TauriTransport();
+		// The SPA entry in a browser decides by `!isTauri()`, not by token
+		// presence: before the tier probe a T1 tab has no token by design.
+		transportInstance =
+			isRemoteWebSession() || isBrowserEntry() ? new WebRemoteTransport() : new TauriTransport();
 	}
 	return transportInstance;
 }

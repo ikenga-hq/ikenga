@@ -330,20 +330,33 @@ async fn pin_screenshot_write_keeps_the_desktop_checks() {
     );
 }
 
-/// The daemon-only cap. Over the router, axum's 2 MiB request-body limit
-/// already refuses a body that large (413, before the arm runs); the cap in
-/// the shared body is what holds if that limit is ever raised, and it refuses
-/// on the base64 length alone, before decoding anything.
+/// The daemon-only cap. `/api/rpc`'s request-body limit is now
+/// `RPC_BODY_LIMIT` (16 MiB, raised from axum's 2 MiB default for editor
+/// saves), so the cap in the shared body is what refuses an oversized
+/// screenshot — on the base64 length alone, before decoding or writing.
 #[tokio::test]
 async fn pin_screenshot_write_is_capped_on_the_daemon_only() {
     let f = fixture(false);
+    // `/api/rpc`'s body limit is `RPC_BODY_LIMIT` (16 MiB, plans/file-editing),
+    // no longer axum's 2 MB default, so an over-cap screenshot now reaches the
+    // arm — and the arm's own cap is what refuses it, before anything is written.
+    // (A body over the route limit is still a 413: rpc_files'
+    // `fs_write_over_rpc_body_limit_is_413_and_writes_nothing`.)
     let big = b64(&png(&vec![0u8; comments::DAEMON_MAX_SCREENSHOT_BYTES]));
     let res = send(
         &f.router,
         json!({ "cmd": "pin_screenshot_write", "args": { "base64Png": big } }).to_string(),
     )
     .await;
-    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["ok"], false, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("screenshot too large"),
+        "{body}"
+    );
     assert!(!f.data.join(comments::SCREENSHOTS_DIR).exists());
 
     let cap = comments::ShotLimit::Daemon { max_bytes: 64 };

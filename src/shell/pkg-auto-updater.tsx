@@ -25,6 +25,7 @@ import { useUpdateSheetStore } from '@/lib/updater/sheet-store';
 import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pkgs/use-update-pkgs';
 import { plural } from '@/lib/updater/updater-store';
 import { useShellStore } from '@/lib/shell/shell-store';
+import { isRemoteWebSession } from '@/lib/tauri-cmd';
 
 export function PkgAutoUpdater() {
 	const autoCheck = useShellStore((s) => s.updatesAutoCheck);
@@ -59,6 +60,13 @@ export function PkgAutoUpdater() {
 
 	useEffect(() => {
 		if (!autoCheck || !autoInstallPkgs) return;
+		// Browser session (gap audit rank 13): the install path
+		// (`pkg_trust_preview_incoming`, `pkg_install_from_registry`) is not
+		// served by the headless daemon, so an auto-install here only ever
+		// produced a persistent red "N packages failed to update" banner.
+		// Checked per run, not captured at mount — a T1 session is detected
+		// by an async boot probe.
+		if (isRemoteWebSession()) return;
 		if (updatePkgs.isPending || !d.updates.length) return;
 		const fresh = d.updates.filter((r) => !attempted.current.has(`${r.id}@${r.latest}`));
 		if (!fresh.length) return;
@@ -95,7 +103,12 @@ export function PkgAutoUpdater() {
 	// which read as "the update ran and nothing happened".
 	if (failures.length > 0) {
 		return (
-			<Banner data-state="update-packages" tone="danger" icon={<AlertTriangle />} onDismiss={() => setFailures([])}>
+			<Banner
+				data-state="update-packages"
+				tone="danger"
+				icon={<AlertTriangle />}
+				onDismiss={() => setFailures([])}
+			>
 				{doneCount ? (
 					<span>
 						Updated <span className="font-medium">{doneCount}</span>,{' '}
@@ -114,7 +127,12 @@ export function PkgAutoUpdater() {
 
 	if (doneCount && doneCount > 0) {
 		return (
-			<Banner data-state="update-packages" tone="success" icon={<CheckCircle2 />} onDismiss={() => setDoneCount(null)}>
+			<Banner
+				data-state="update-packages"
+				tone="success"
+				icon={<CheckCircle2 />}
+				onDismiss={() => setDoneCount(null)}
+			>
 				Updated <span className="font-medium">{doneCount}</span> package
 				{doneCount === 1 ? '' : 's'}.
 			</Banner>

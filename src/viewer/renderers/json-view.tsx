@@ -6,21 +6,44 @@
 // mock: every object/array row expands in place, primitives render on the
 // same line as their key.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { ErrorState, LoadingState } from '@/components/states';
 import { fsRead } from '@/lib/tauri-cmd';
+import { EditableTextFrame } from '../editing/editable-text-frame';
 
 interface JsonViewProps {
 	path: string;
+	/** Show the Edit toggle (plans/file-editing); JSON is validated before
+	 *  save. Defaults false so thumbnails and embeds stay read-only. */
+	editable?: boolean;
+	/** The pane this view lives in — scopes its editing session. */
+	paneId?: string;
+	line?: number;
+	col?: number;
 }
 
 type LoadState =
 	| { kind: 'loading' }
-	| { kind: 'ready'; value: unknown }
+	| { kind: 'ready'; text: string }
 	| { kind: 'error'; message: string };
 
-export function JsonView({ path }: JsonViewProps) {
+export function JsonView({ path, editable = false, paneId, line, col }: JsonViewProps) {
+	if (editable) {
+		return (
+			<EditableTextFrame
+				path={path}
+				paneId={paneId}
+				line={line}
+				col={col}
+				renderView={(text) => <JsonTree text={text} />}
+			/>
+		);
+	}
+	return <JsonReadOnly path={path} />;
+}
+
+function JsonReadOnly({ path }: { path: string }) {
 	const [state, setState] = useState<LoadState>({ kind: 'loading' });
 
 	useEffect(() => {
@@ -30,11 +53,7 @@ export function JsonView({ path }: JsonViewProps) {
 			.then((res) => {
 				if (cancelled) return;
 				const text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
-				try {
-					setState({ kind: 'ready', value: JSON.parse(text) });
-				} catch (err) {
-					setState({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
-				}
+				setState({ kind: 'ready', text });
 			})
 			.catch((err) => {
 				if (cancelled) return;
@@ -48,22 +67,37 @@ export function JsonView({ path }: JsonViewProps) {
 	if (state.kind === 'loading') {
 		return <LoadingState data-state="loading" fill heading="Loading…" />;
 	}
-	if (state.kind === 'error') {
-		return (
-			<ErrorState
-				data-state="error"
-				fill
-				icon={AlertCircle}
-				heading="Couldn't parse this file as JSON"
-				body={<span className="break-all">{state.message}</span>}
-			/>
-		);
-	}
+	if (state.kind === 'error') return <JsonParseError message={state.message} />;
+	return <JsonTree text={state.text} />;
+}
 
+/** The collapsible tree for a JSON document's text. */
+export function JsonTree({ text }: { text: string }) {
+	const parsed = useMemo((): { ok: true; value: unknown } | { ok: false; message: string } => {
+		try {
+			return { ok: true, value: JSON.parse(text) };
+		} catch (err) {
+			return { ok: false, message: err instanceof Error ? err.message : String(err) };
+		}
+	}, [text]);
+
+	if (!parsed.ok) return <JsonParseError message={parsed.message} />;
 	return (
 		<div className="h-full overflow-auto px-2 py-2 font-mono text-xs">
-			<JsonNode label={null} value={state.value} depth={0} />
+			<JsonNode label={null} value={parsed.value} depth={0} />
 		</div>
+	);
+}
+
+function JsonParseError({ message }: { message: string }) {
+	return (
+		<ErrorState
+			data-state="error"
+			fill
+			icon={AlertCircle}
+			heading="Couldn't parse this file as JSON"
+			body={<span className="break-all">{message}</span>}
+		/>
 	);
 }
 

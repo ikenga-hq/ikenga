@@ -1,5 +1,30 @@
 # ikenga-desktop
 
+## 0.20.0
+
+### Minor Changes
+
+- 756b921: Claude sessions can now be launched with a role, extra system prompt text and plugin folders. A chat or terminal session given the `chi` or `pane` role starts on Claude Sonnet 5.5, and a `plan` session starts on Claude Opus 5.5, unless a model is chosen explicitly. `appendSystemPrompt` is passed to Claude Code as `--append-system-prompt`, and `pluginDirs` reaches it as `CLAUDE_CODE_PLUGIN_DIRS`. Sessions that set none of these launch exactly as before. The model ids and prices come from a copy of the `@ikenga/contract` model catalog. The built-in Claude Code engine's default model setting is now `claude-sonnet-5-5`, and stale model names in the agent editors and Mission Control are updated.
+- 4347de2: Claude sessions now launch on the model for their role when no model is chosen. Claude terminals and Claude seats are `pane` sessions and start on Claude Sonnet 5.5. A new "Claude terminal (plan)" entry in the new-tab menu starts a `plan` session on Claude Opus 5.5.
+  
+  **Behaviour change:** Chi runs on Claude Code (`iyke chi run`, pinned and persistent runs) used to start on Claude Code's own default model. They now start on Claude Sonnet 5.5, the catalog default for Chi. A model passed with `--model` still wins, and other engines are unchanged.
+
+### Patch Changes
+
+- eadc23d: Fix secrets and env-vault writes on macOS: the symlink guard no longer refuses root-owned OS links such as `/var` and `/tmp`, so the env vault under `$TMPDIR` publishes again instead of latching the deny state. User-owned links are still refused.
+
+## 0.19.4
+
+### Patch Changes
+
+- f626f56: Release builds sign and attach the server tarballs.
+
+## 0.19.3
+
+### Patch Changes
+
+- 9159f71: Release builds now attach the server tarballs correctly.
+
 ## 0.19.2
 
 ### Patch Changes

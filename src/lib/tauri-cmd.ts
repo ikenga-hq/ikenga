@@ -49,7 +49,10 @@ export interface PtySpawnOpts {
 }
 
 export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
-	return invoke<string>('pty_spawn', {
+	// Tauri's `pty_spawn` returns the bare id. The daemon's `/api/rpc` arm returns
+	// `{ pty_id }`. Unwrap both, or a browser session builds `/ws/pty/[object Object]`,
+	// attaches to nothing, and the terminal sits on "spawning" forever.
+	const res = await invoke<string | { pty_id: string }>('pty_spawn', {
 		terminalId: opts.terminalId ?? null,
 		title: opts.title ?? null,
 		cwd: opts.cwd,
@@ -59,6 +62,7 @@ export async function ptySpawn(opts: PtySpawnOpts): Promise<string> {
 		cols: opts.cols ?? 80,
 		settingsPath: opts.settingsPath ?? null,
 	});
+	return typeof res === 'string' ? res : res.pty_id;
 }
 
 export async function ptyWrite(id: string, data: string): Promise<void> {
@@ -310,9 +314,38 @@ export async function fsWrite(path: string, bytes: Uint8Array): Promise<void> {
 	return invoke('fs_write', { path, bytes: Array.from(bytes) });
 }
 
-/** UTF-8 encode + write. Mirror of the TextDecoder read path in renderers. */
+/** The daemon's `/api/rpc` request-body cap — mirrors `RPC_BODY_LIMIT` in
+ *  `src-tauri/src/server/mod.rs`. Used to refuse an oversized browser save
+ *  before sending it; a 413 that still comes back is mapped below. */
+export const RPC_BODY_LIMIT_BYTES = 16 * 1024 * 1024;
+
+/** Headroom for the RPC envelope (`cmd`, `path`, JSON punctuation). */
+const RPC_ENVELOPE_SLACK = 64 * 1024;
+
+const REMOTE_SAVE_TOO_LARGE =
+	'This file is too large to save over the remote connection. Nothing was written.';
+
+/**
+ * UTF-8 encode + write. Mirror of the TextDecoder read path in renderers.
+ *
+ * In a browser this sends the daemon's `content` (string) arm rather than
+ * `bytes`: a JSON number array costs 3–4 characters per byte, which held text
+ * saves to roughly 400 KB under the daemon's old 2 MB body default. The desktop
+ * `fs_write` command takes `bytes` only, hence the gate. Either way a refused
+ * save is loud and writes nothing — never a truncated file.
+ */
 export async function fsWriteText(path: string, text: string): Promise<void> {
-	return fsWrite(path, new TextEncoder().encode(text));
+	if (!isRemoteWebSession()) return fsWrite(path, new TextEncoder().encode(text));
+	const bodyBytes = new TextEncoder().encode(JSON.stringify(text)).byteLength;
+	if (bodyBytes + RPC_ENVELOPE_SLACK > RPC_BODY_LIMIT_BYTES) throw new Error(REMOTE_SAVE_TOO_LARGE);
+	try {
+		return await invoke<void>('fs_write', { path, content: text });
+	} catch (err) {
+		if (err instanceof Error && /\bHTTP RPC error: 413\b/.test(err.message)) {
+			throw new Error(REMOTE_SAVE_TOO_LARGE);
+		}
+		throw err;
+	}
 }
 
 /** Recursive mkdir. Idempotent — succeeds if the directory already exists. */
@@ -329,9 +362,11 @@ export async function fsTrash(path: string): Promise<void> {
 	return invoke('fs_trash', { path });
 }
 
-/** Rename in place to a new basename. Returns the resolved destination path. */
-export async function fsRename(from: string, toName: string): Promise<string> {
-	return invoke('fs_rename', { from, toName });
+/** Rename to a new basename — in place, or into the folder `toDir` (a move).
+ *  Returns the resolved destination path. `toDir` is only sent when given, so
+ *  a plain rename stays the same call an older daemon understands. */
+export async function fsRename(from: string, toName: string, toDir?: string): Promise<string> {
+	return invoke('fs_rename', toDir === undefined ? { from, toName } : { from, toName, toDir });
 }
 
 export interface FsSearchResult {
@@ -475,6 +510,19 @@ export async function settingsWriteField(
 		remove: options.remove ?? false,
 		projectId: options.projectId ?? null,
 	});
+}
+
+/**
+ * Whether "Open file" affordances (`settings_open_file`, `actions_open_file`)
+ * can work here. Both hand a path to the OS opener on the machine running the
+ * backend; in a browser session that backend is the headless daemon, which
+ * serves neither — and an editor launched on the server host would never reach
+ * the viewer anyway. Callers hide the link when this is false (gap audit
+ * rank 14). Not `isTauri()`: jsdom harnesses are neither, and keep the desktop
+ * path.
+ */
+export function canOpenFilesWithOs(): boolean {
+	return !isRemoteWebSession();
 }
 
 export async function settingsOpenFile(
@@ -4223,6 +4271,39 @@ export interface AgentConfigInventory {
 
 export async function detectSystem(): Promise<SystemReport> {
 	return invoke<SystemReport>('detect_system');
+}
+
+/** `GET /api/health` on `ikenga-server` (`src-tauri/src/server/health.rs`).
+ *  `executor` mirrors `executor::Capabilities`; `probe` is present at T1
+ *  only. Both are optional here because an older server may omit them. */
+export interface ServerHealth {
+	ok: boolean;
+	name: string;
+	version: string;
+	status: string;
+	uptime_secs: number;
+	executor?: {
+		tier: string;
+		pty: boolean;
+		piped: boolean;
+		principal_isolation: boolean;
+	};
+	probe?: { ok: boolean; at: number };
+}
+
+/**
+ * The daemon's health report — browser sessions only.
+ *
+ * Not an RPC: `/api/health` is the daemon's own unauthenticated route, so a
+ * T1 cookie session, a paired device and a T0 token tab all read it the same
+ * way. Throws on a non-2xx answer or a network failure.
+ */
+export async function fetchServerHealth(): Promise<ServerHealth> {
+	const res = await fetch('/api/health', { credentials: 'same-origin' });
+	if (!res.ok) {
+		throw new Error(`Server health check failed (HTTP ${res.status})`);
+	}
+	return (await res.json()) as ServerHealth;
 }
 
 export async function detectAgents(): Promise<DetectedAgent[]> {
