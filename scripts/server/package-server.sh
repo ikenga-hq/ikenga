@@ -188,9 +188,14 @@ cmd_pack() {
   [[ "$tag" == "v$version" ]] || die "tag '$tag' does not match version '$version'"
   [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be a 40-character lowercase hex sha"
   [[ -n "$channel" ]] || { [[ "$version" == *-* ]] && channel=next || channel=stable; }
-  # No older server release exists to upgrade from yet, so by default the
-  # minimum supported starting point is this release itself.
-  [[ -n "$min_upgrade_from" ]] || min_upgrade_from="$version"
+  # No floor unless one is asked for. The old default (this release's own
+  # version) made every manifest refuse every upgrade from an older install,
+  # since `provision.sh upgrade` honours the floor and release.yml never
+  # passes one. Name a floor only for a release an older box truly cannot
+  # upgrade to directly.
+  if [[ -n "$min_upgrade_from" ]]; then
+    [[ "$min_upgrade_from" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--min-upgrade-from must look like X.Y.Z"
+  fi
   [[ -n "$published_at" ]] || published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   mkdir -p "$out_dir"
@@ -298,7 +303,7 @@ cmd_pack() {
       const manifest = {
         schema: e.SCHEMA, version: e.VERSION, tag: e.TAG, commit: e.COMMIT,
         published_at: e.PUBLISHED_AT, channel: e.CHANNEL, glibc_floor: e.FLOOR,
-        min_upgrade_from: e.MIN_FROM, migrations: "forward-only", artifacts,
+        min_upgrade_from: e.MIN_FROM || null, migrations: "forward-only", artifacts,
       };
       process.stdout.write(JSON.stringify(manifest, null, 2) + "\n");
     ' > "$manifest"

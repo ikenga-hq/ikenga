@@ -39,15 +39,33 @@ CHANNEL="stable"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-20}"
 RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 
-if [[ "${1:-}" == "upgrade" ]]; then
-  ACTION="upgrade"
-  shift
-fi
+# In-app updates (WP-P9 steps 2-3). Root owns all of this; the server only
+# reads STATE_DIR and drops a request file. The server's side of the same
+# contract is src-tauri/src/server/update.rs: keep the paths and schemas in
+# step with it. The overrides exist for the container tests.
+STATE_DIR="${IKENGA_UPDATE_STATE_DIR:-/var/lib/ikenga-update}"
+STABLE_COPY="${IKENGA_PROVISION_STABLE:-/usr/local/sbin/ikenga-provision}"
+SYSTEMD_DIR="${IKENGA_SYSTEMD_DIR:-/etc/systemd/system}"
+# A request older than this is refused, so a file left over a reboot never
+# fires a surprise restart.
+UPDATE_REQUEST_MAX_AGE="${UPDATE_REQUEST_MAX_AGE:-900}"
+# After a rolled-back or failed attempt at a version, refuse the same version
+# for this long: a broken release must not become a restart loop that keeps
+# ending people's terminals.
+UPDATE_RETRY_COOLDOWN="${UPDATE_RETRY_COOLDOWN:-3600}"
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+
+case "${1:-}" in
+  upgrade|check-update|apply-request|install-update-units) ACTION="$1"; shift ;;
+esac
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     upgrade) ACTION="upgrade"; shift ;;
-    --to) TARGET_VERSION="${2:?--to needs a version}"; shift 2 ;;
+    --to)
+      TARGET_VERSION="${2:?--to needs a version}"
+      [[ "$TARGET_VERSION" =~ $SEMVER_RE && ${#TARGET_VERSION} -le 32 ]] || { echo "error: --to must look like X.Y.Z" >&2; exit 2; }
+      shift 2 ;;
     --latest) UPGRADE_LATEST=1; shift ;;
     --force) FORCE=1; shift ;;
     --profile) PROFILE_FILE="${2:?--profile needs a file}"; shift 2 ;;
@@ -65,6 +83,14 @@ while [[ $# -gt 0 ]]; do
         printf '  - swaps binary, restarts service, and health-checks /api/health\n'
         printf '  - automatically rolls back to previous binary if health-check fails\n'
         printf '  - refuses if open terminals are detected unless --force\n'
+        printf '  - exit codes: 0 upgraded or already current, 3 rolled back, 4 rollback failed\n'
+        exit 0
+      fi
+      if [[ "$ACTION" != "provision" ]]; then
+        printf 'Usage: %s check-update | apply-request | install-update-units [--dry-run]\n\n' "${BASH_SOURCE[0]}"
+        printf '  check-update          read the release manifest and write %s/available.json (installs nothing)\n' "$STATE_DIR"
+        printf '  apply-request         claim and apply an admin update request (run by ikenga-update.service)\n'
+        printf '  install-update-units  install %s and the update timer, path and service units\n' "$STABLE_COPY"
         exit 0
       fi
       sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -72,11 +98,27 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# A profile root may source unattended (the update units run as root with no
+# arguments): a regular file owned by root that nobody else can write.
+profile_trusted() {
+  local f="$1" owner mode
+  [[ -f "$f" && ! -L "$f" ]] || return 1
+  read -r owner mode < <(stat -c '%u %a' -- "$f") || return 1
+  [[ "$owner" == 0 ]] || return 1
+  (( (8#$mode & 8#022) == 0 ))
+}
+
 if [[ "$ACTION" == "provision" ]]; then
   [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]] || { echo "error: --profile <file> is required and must exist" >&2; exit 2; }
 else
   if [[ -z "$PROFILE_FILE" && -f "$INSTALL_DIR/.profile.env" ]]; then
-    PROFILE_FILE="$INSTALL_DIR/.profile.env"
+    if profile_trusted "$INSTALL_DIR/.profile.env"; then
+      PROFILE_FILE="$INSTALL_DIR/.profile.env"
+    else
+      echo "WARNING: ignoring $INSTALL_DIR/.profile.env: not a root-owned file that only root can write" >&2
+    fi
+  elif [[ -n "$PROFILE_FILE" && "$ACTION" != "upgrade" ]] && ! profile_trusted "$PROFILE_FILE"; then
+    echo "error: $PROFILE_FILE must be a root-owned file that only root can write" >&2; exit 2
   fi
 fi
 
@@ -118,9 +160,13 @@ SECRETS_FROM=""
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$PROFILE_FILE"
-elif [[ -f "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE" 2>/dev/null || true
+elif [[ "$ACTION" != "provision" ]]; then
+  # No profile on this box. The tier is whichever unit is installed. The .env
+  # is NEVER sourced: it is a secrets file, and it holds none of these
+  # settings anyway (an earlier fallback executed it as shell, as root).
+  if [[ -f "$SYSTEMD_DIR/ikenga-server-t1.service" ]]; then TIER=t1
+  elif [[ -f "$SYSTEMD_DIR/ikenga-server.service" ]]; then TIER=t0
+  fi
 fi
 
 validate_profile() {
@@ -715,63 +761,215 @@ get_latest_release_version() {
   if command -v gh >/dev/null 2>&1; then
     ver="$(gh release view -R "$REPO" --json tagName -q .tagName 2>/dev/null | sed 's/^v//' || true)"
   fi
-  if [[ -z "$ver" ]]; then
+  if [[ ! "$ver" =~ $SEMVER_RE ]]; then
     ver="$(curl -fsSI "https://github.com/$REPO/releases/latest" 2>/dev/null | grep -i '^location:' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
   fi
-  if [[ -z "$ver" ]]; then
+  if [[ ! "$ver" =~ $SEMVER_RE ]]; then
     ver="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -oE '"tag_name":\s*"v?[0-9]+\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
   fi
+  [[ "$ver" =~ $SEMVER_RE ]] || ver=""
   echo "$ver"
 }
 
-parse_manifest() {
-  local manifest_file="$1"
-  local arch="$2"
-
+# Top-level scalar fields of a JSON file, one per line, in the order asked
+# ("" for a missing, null or non-scalar value; newlines inside a string
+# become spaces so a value can never spill into the next field). Nothing here
+# evaluates the file's text: every caller validates each line against a
+# strict pattern before using it. Exits non-zero when the file isn't JSON.
+json_fields() {
+  local f="$1"; shift
   if command -v jq >/dev/null 2>&1; then
-    SCHEMA="$(jq -r '.schema // empty' "$manifest_file")"
-    MANIFEST_VERSION="$(jq -r '.version // empty' "$manifest_file")"
-    MANIFEST_CHANNEL="$(jq -r '.channel // empty' "$manifest_file")"
-    MIN_UPGRADE_FROM="$(jq -r '.min_upgrade_from // empty' "$manifest_file")"
-    ARTIFACT_NAME="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .name' "$manifest_file" | head -1)"
-    ARTIFACT_SHA="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .sha256' "$manifest_file" | head -1)"
-    ARTIFACT_SIZE="$(jq -r --arg a "$arch" '.artifacts[] | select(.arch == $a and .kind == "tarball") | .size' "$manifest_file" | head -1)"
+    jq -r 'if type == "object" then . else {} end | . as $d | $ARGS.positional[] | $d[.]
+           | if type == "string" then gsub("[\r\n]"; " ")
+             elif type == "number" or type == "boolean" then tostring
+             else "" end' --args "$@" < "$f"
   elif command -v python3 >/dev/null 2>&1; then
-    local out
-    out="$(python3 -c '
+    python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-print("SCHEMA=" + json.dumps(str(d.get("schema", ""))))
-print("MANIFEST_VERSION=" + json.dumps(str(d.get("version", ""))))
-print("MANIFEST_CHANNEL=" + json.dumps(str(d.get("channel", ""))))
-print("MIN_UPGRADE_FROM=" + json.dumps(str(d.get("min_upgrade_from", ""))))
-arch = sys.argv[2]
-art = next((a for a in d.get("artifacts", []) if a.get("arch") == arch and a.get("kind") == "tarball"), {})
-print("ARTIFACT_NAME=" + json.dumps(str(art.get("name", ""))))
-print("ARTIFACT_SHA=" + json.dumps(str(art.get("sha256", ""))))
-print("ARTIFACT_SIZE=" + json.dumps(str(art.get("size", ""))))
-' "$manifest_file" "$arch")"
-    eval "$out"
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(3)
+if not isinstance(d, dict):
+    d = {}
+for k in sys.argv[2:]:
+    v = d.get(k)
+    if isinstance(v, bool):
+        print("true" if v else "false")
+    elif isinstance(v, (int, float)):
+        print(v)
+    elif isinstance(v, str):
+        print(v.replace("\r", " ").replace("\n", " "))
+    else:
+        print("")
+' "$f" "$@"
   elif command -v node >/dev/null 2>&1; then
-    local out
-    out="$(node -e '
+    node -e '
 const fs = require("fs");
-const d = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-console.log(`SCHEMA=${d.schema || ""}`);
-console.log(`MANIFEST_VERSION=${d.version || ""}`);
-console.log(`MANIFEST_CHANNEL=${d.channel || ""}`);
-console.log(`MIN_UPGRADE_FROM=${d.min_upgrade_from || ""}`);
-const arch = process.argv[2];
-const art = (d.artifacts || []).find(a => a.arch === arch && a.kind === "tarball") || {};
-console.log(`ARTIFACT_NAME=${art.name || ""}`);
-console.log(`ARTIFACT_SHA=${art.sha256 || ""}`);
-console.log(`ARTIFACT_SIZE=${art.size || ""}`);
-' "$manifest_file" "$arch")"
-    eval "$out"
+let d;
+try { d = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch { process.exit(3); }
+if (d === null || typeof d !== "object" || Array.isArray(d)) d = {};
+for (const k of process.argv.slice(2)) {
+  const v = d[k];
+  if (typeof v === "string") console.log(v.replace(/[\r\n]/g, " "));
+  else if (typeof v === "number" || typeof v === "boolean") console.log(String(v));
+  else console.log("");
+}
+' "$f" "$@"
   else
-    die "jq, python3, or node is required to parse release manifest"
+    return 4
   fi
+}
+
+# The tarball artifact for one architecture: name, sha256, size (one per
+# line, "" when absent). Same rules as json_fields.
+manifest_artifact_fields() {
+  local f="$1" arch="$2"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg a "$arch" '
+      def s: if type == "string" then gsub("[\r\n]"; " ")
+             elif type == "number" then tostring else "" end;
+      ([(.artifacts // [])[]? | objects | select(.arch == $a and .kind == "tarball")] | .[0] // {}) as $t
+      | ($t.name | s), ($t.sha256 | s), ($t.size | s)' < "$f"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+with open(sys.argv[1]) as fh:
+    d = json.load(fh)
+arts = d.get("artifacts") if isinstance(d, dict) else None
+if not isinstance(arts, list):
+    arts = []
+t = next((a for a in arts if isinstance(a, dict) and a.get("arch") == sys.argv[2] and a.get("kind") == "tarball"), {})
+for k in ("name", "sha256", "size"):
+    v = t.get(k)
+    if isinstance(v, bool) or v is None or isinstance(v, (dict, list)):
+        print("")
+    else:
+        print(str(v).replace("\r", " ").replace("\n", " "))
+' "$f" "$arch"
+  elif command -v node >/dev/null 2>&1; then
+    node -e '
+const d = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const arts = d && Array.isArray(d.artifacts) ? d.artifacts : [];
+const t = arts.find(a => a && typeof a === "object" && a.arch === process.argv[2] && a.kind === "tarball") || {};
+for (const k of ["name", "sha256", "size"]) {
+  const v = t[k];
+  console.log(typeof v === "string" ? v.replace(/[\r\n]/g, " ") : typeof v === "number" ? String(v) : "");
+}
+' "$f" "$arch"
+  else
+    return 4
+  fi
+}
+
+# fields_into ARRAY FILE KEY... : json_fields into ARRAY, one element per
+# key. `$(...)` strips trailing newlines, which would drop trailing empty
+# fields, hence the sentinel.
+fields_into() {
+  local -n _dst="$1"; shift
+  local _out
+  _out="$(json_fields "$@" && printf '.')" || return 1
+  _out="${_out%.}"
+  mapfile -t _dst < <(printf '%s' "$_out")
+}
+
+# Parse and validate a release manifest into SCHEMA, MANIFEST_VERSION,
+# MANIFEST_CHANNEL, MIN_UPGRADE_FROM, PUBLISHED_AT, ARTIFACT_NAME,
+# ARTIFACT_SHA and ARTIFACT_SIZE. Every value must match a strict pattern, or
+# this returns 1 with a fixed phrase in MANIFEST_ERROR. The manifest's own
+# text is never echoed and never run: an earlier version `eval`ed it, which
+# was root code execution for whoever could serve the manifest.
+parse_manifest() {
+  local manifest_file="$1" arch="$2" out
+  local -a top art
+  MANIFEST_ERROR=""
+  if ! fields_into top "$manifest_file" schema version channel min_upgrade_from published_at 2>/dev/null; then
+    MANIFEST_ERROR="the release manifest is not valid JSON (or no jq, python3 or node to read it)"; return 1
+  fi
+  if ! out="$(manifest_artifact_fields "$manifest_file" "$arch" 2>/dev/null && printf '.')"; then
+    MANIFEST_ERROR="the release manifest is not valid JSON"; return 1
+  fi
+  out="${out%.}"
+  mapfile -t art < <(printf '%s' "$out")
+  if [[ ${#top[@]} -ne 5 || ${#art[@]} -ne 3 ]]; then MANIFEST_ERROR="the release manifest is malformed"; return 1; fi
+
+  SCHEMA="${top[0]}" MANIFEST_VERSION="${top[1]}" MANIFEST_CHANNEL="${top[2]}"
+  MIN_UPGRADE_FROM="${top[3]}" PUBLISHED_AT="${top[4]}"
+  ARTIFACT_NAME="${art[0]}" ARTIFACT_SHA="${art[1]}" ARTIFACT_SIZE="${art[2]}"
+
+  if [[ "$SCHEMA" != "ikenga-server-release/1" ]]; then
+    MANIFEST_ERROR="the release manifest has an unsupported schema (expected ikenga-server-release/1)"; return 1
+  fi
+  if [[ ! "$MANIFEST_VERSION" =~ $SEMVER_RE || ${#MANIFEST_VERSION} -gt 32 ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid version"; return 1
+  fi
+  if [[ ! "$MANIFEST_CHANNEL" =~ ^(stable|next)$ ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid channel"; return 1
+  fi
+  if [[ -n "$MIN_UPGRADE_FROM" && ( ! "$MIN_UPGRADE_FROM" =~ $SEMVER_RE || ${#MIN_UPGRADE_FROM} -gt 32 ) ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid min_upgrade_from"; return 1
+  fi
+  if [[ -n "$PUBLISHED_AT" && ! "$PUBLISHED_AT" =~ ^[0-9TZ:.+-]{1,40}$ ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid published_at"; return 1
+  fi
+  if [[ -n "$ARTIFACT_NAME" && "$ARTIFACT_NAME" != "ikenga-server_${MANIFEST_VERSION}_linux_${arch}.tar.gz" ]]; then
+    MANIFEST_ERROR="the release manifest names an unexpected tarball for $arch"; return 1
+  fi
+  if [[ -n "$ARTIFACT_SHA" && ! "$ARTIFACT_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid sha256 for $arch"; return 1
+  fi
+  if [[ -n "$ARTIFACT_SIZE" && ! "$ARTIFACT_SIZE" =~ ^[0-9]{1,12}$ ]]; then
+    MANIFEST_ERROR="the release manifest has an invalid size for $arch"; return 1
+  fi
+  return 0
+}
+
+installed_version() {
+  local v=""
+  if [[ -x "$INSTALL_DIR/bin/ikenga-server" ]]; then
+    v="$("$INSTALL_DIR/bin/ikenga-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  fi
+  printf '%s' "$v"
+}
+
+# The address the daemon answers /api/health on. IKENGA_HOST is the bind
+# address provision wrote to the env file: a tailnet box binds only its
+# tailnet IP, so 127.0.0.1 never answers there and every upgrade would roll
+# back. Only that one line is read; the file is never sourced.
+health_base_url() {
+  local h=""
+  if [[ -n "${IKENGA_HOST_VALUE:-}" ]]; then
+    h="$IKENGA_HOST_VALUE"
+  elif [[ -r "$ENV_FILE" ]]; then
+    h="$(grep -E '^IKENGA_HOST=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
+    h="${h%\"}"; h="${h#\"}"
+  fi
+  if [[ "$h" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$ ]] \
+     && [[ "$h" != "0.0.0.0" ]]; then
+    printf 'http://%s:4000' "$h"
+  else
+    printf 'http://127.0.0.1:4000'
+  fi
+}
+
+# /api/health answers ok:true AND reports version $2.
+health_reports() {
+  local url="$1" want="${2//./\\.}"
+  local body
+  body="$(curl -fsS -m 2 "$url/api/health" 2>/dev/null)" || return 1
+  grep -q '"ok":[[:space:]]*true' <<<"$body" && grep -qE "\"version\":[[:space:]]*\"$want\"" <<<"$body"
+}
+
+# One upgrade at a time, shared by `upgrade` and `apply-request` (fd 9);
+# check-update has its own lock (fd 8).
+ensure_state_dir() {
+  [[ -d "$STATE_DIR" ]] || install -d -m 0755 -o root -g root "$STATE_DIR"
+}
+take_upgrade_lock() {
+  ensure_state_dir
+  exec 9>"$STATE_DIR/upgrade.lock"
+  flock -n 9
 }
 
 do_upgrade() {
@@ -781,9 +979,7 @@ do_upgrade() {
   detect_arch
 
   local have=""
-  if [[ -x "$INSTALL_DIR/bin/ikenga-server" ]]; then
-    have="$("$INSTALL_DIR/bin/ikenga-server" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
-  fi
+  have="$(installed_version)"
   [[ -n "$have" ]] || die "no installed ikenga-server found at $INSTALL_DIR/bin/ikenga-server; cannot upgrade"
   note "installed version: $have ($ARCH)"
 
@@ -834,21 +1030,29 @@ do_upgrade() {
     die "target version is required"
   fi
 
-  local SCHEMA="" MANIFEST_VERSION="" MANIFEST_CHANNEL="" MIN_UPGRADE_FROM=""
-  local ARTIFACT_NAME="" ARTIFACT_SHA="" ARTIFACT_SIZE=""
-  parse_manifest "$manifest_file" "$ARCH"
+  local SCHEMA="" MANIFEST_VERSION="" MANIFEST_CHANNEL="" MIN_UPGRADE_FROM="" PUBLISHED_AT=""
+  local ARTIFACT_NAME="" ARTIFACT_SHA="" ARTIFACT_SIZE="" MANIFEST_ERROR=""
+  parse_manifest "$manifest_file" "$ARCH" || die "$MANIFEST_ERROR"
 
-  [[ "$SCHEMA" == "ikenga-server-release/1" ]] || die "manifest has unsupported schema '$SCHEMA' (expected ikenga-server-release/1)"
-  [[ -n "$MANIFEST_VERSION" ]] || die "manifest is missing version field"
+  # The version asked for is the version installed. The manifest only ever
+  # confirms it: it never picks a different one (it used to, silently).
+  if [[ -n "$TARGET_VERSION" && $UPGRADE_LATEST -ne 1 && "$MANIFEST_VERSION" != "$TARGET_VERSION" ]]; then
+    die "the manifest is for $MANIFEST_VERSION, not the requested $TARGET_VERSION; nothing installed"
+  fi
   target="$MANIFEST_VERSION"
 
-  if [[ -n "$MANIFEST_CHANNEL" && "$MANIFEST_CHANNEL" != "$channel" ]]; then
+  if [[ "$MANIFEST_CHANNEL" != "$channel" ]]; then
     die "manifest channel '$MANIFEST_CHANNEL' does not match profile channel '$channel'"
   fi
 
   if [[ "$have" == "$target" ]]; then
     note "already on version $target ($channel channel); nothing to upgrade"
+    printf 'noop: already on %s\n' "$target"
     return 0
+  fi
+
+  if semver_lt "$target" "$have"; then
+    die "$target is older than the installed $have; downgrades are not supported here"
   fi
 
   if [[ -n "$MIN_UPGRADE_FROM" ]] && semver_lt "$have" "$MIN_UPGRADE_FROM"; then
@@ -911,14 +1115,14 @@ do_upgrade() {
   # Restore only a unit THIS run saved: a leftover .prev from an earlier
   # attempt must never be put back over the current unit.
   local unit_saved=0
-  rm -f "/etc/systemd/system/$unit.prev-$have"
+  rm -f "$SYSTEMD_DIR/$unit.prev-$have"
   if [[ -f "$tmp/stage/$unit" ]]; then
-    if [[ -f "/etc/systemd/system/$unit" ]]; then
-      cp -a "/etc/systemd/system/$unit" "/etc/systemd/system/$unit.prev-$have"
+    if [[ -f "$SYSTEMD_DIR/$unit" ]]; then
+      cp -a "$SYSTEMD_DIR/$unit" "$SYSTEMD_DIR/$unit.prev-$have"
       unit_saved=1
-      note "previous unit saved as /etc/systemd/system/$unit.prev-$have (rollback guard)"
+      note "previous unit saved as $SYSTEMD_DIR/$unit.prev-$have (rollback guard)"
     fi
-    install -m 0644 "$tmp/stage/$unit" "/etc/systemd/system/$unit"
+    install -m 0644 "$tmp/stage/$unit" "$SYSTEMD_DIR/$unit"
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
   fi
 
@@ -927,15 +1131,15 @@ do_upgrade() {
     systemctl restart "$svc" 2>/dev/null || true
   fi
 
-  log "Checking health at /api/health..."
-  local url="http://127.0.0.1:4000"
-  if [[ "${PERIMETER:-}" == tailnet && -n "${IKENGA_HOST_VALUE:-}" ]]; then
-    url="http://$IKENGA_HOST_VALUE:4000"
-  fi
+  local url
+  url="$(health_base_url)"
+  log "Checking health at $url/api/health (expecting version $target)..."
 
+  # Healthy means the NEW binary answers: a stale process still serving the
+  # old version must not count as a successful upgrade.
   local healthy=0
-  for i in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
-    if curl -fsS -m 2 "$url/api/health" 2>/dev/null | grep -q '"ok":\s*true'; then
+  for _ in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
+    if health_reports "$url" "$target"; then
       healthy=1
       break
     fi
@@ -955,8 +1159,8 @@ do_upgrade() {
     rm -rf "$INSTALL_DIR/dist"
     mv "$INSTALL_DIR/dist.prev-$have" "$INSTALL_DIR/dist"
   fi
-  if [[ $unit_saved -eq 1 && -f "/etc/systemd/system/$unit.prev-$have" ]]; then
-    cp -a "/etc/systemd/system/$unit.prev-$have" "/etc/systemd/system/$unit"
+  if [[ $unit_saved -eq 1 && -f "$SYSTEMD_DIR/$unit.prev-$have" ]]; then
+    cp -a "$SYSTEMD_DIR/$unit.prev-$have" "$SYSTEMD_DIR/$unit"
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
   fi
   if command -v systemctl >/dev/null 2>&1; then
@@ -964,27 +1168,451 @@ do_upgrade() {
   fi
 
   local rolled_back=0
-  for i in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
-    if curl -fsS -m 2 "$url/api/health" 2>/dev/null | grep -q '"ok":\s*true'; then
+  for _ in $(seq 1 "${HEALTH_TIMEOUT:-20}"); do
+    if health_reports "$url" "$have"; then
       rolled_back=1
       break
     fi
     sleep 1
   done
 
+  # Distinct exit codes, so a caller (apply-request) can tell a clean
+  # rollback (3) from a box that needs a human (4).
   if [[ $rolled_back -eq 1 ]]; then
-    die "upgrade to $target failed health check; automatically rolled back to $have successfully"
+    printf 'error: upgrade to %s failed health check; automatically rolled back to %s successfully\n' "$target" "$have" >&2
+    exit 3
   else
-    die "upgrade to $target failed health check AND rollback to $have also failed; see journalctl -u $svc"
+    printf 'error: upgrade to %s failed health check AND rollback to %s also failed; see journalctl -u %s\n' "$target" "$have" "$svc" >&2
+    exit 4
+  fi
+}
+
+# ---------------------------------------------------------- in-app updates
+#
+# Files (root-owned STATE_DIR, 0755; the server reads, never writes):
+#   available.json  ikenga-update-available/1, written by check-update
+#   status.json     ikenga-update-status/1, written by apply-request
+#   last-run.log    0600, the last apply's full output
+# The request (ikenga-update-request/1) is written by the server:
+#   t0: $INSTALL_DIR/data/update-request.json          (owner: ikenga)
+#   t1: $INSTALL_DIR/data/operator/update-request.json (owner: root, the broker)
+
+update_request_path() {
+  if [[ "$TIER" == t1 ]]; then
+    printf '%s/data/operator/update-request.json' "$INSTALL_DIR"
+  else
+    printf '%s/data/update-request.json' "$INSTALL_DIR"
+  fi
+}
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# A JSON string literal for a value that already passed a strict pattern, or
+# null when empty. Escapes anyway, and drops control characters, so a value
+# can never break the document.
+jstr() {
+  local v="$1"
+  if [[ -z "$v" ]]; then printf 'null'; return; fi
+  v="${v//\\/\\\\}"; v="${v//\"/\\\"}"
+  v="$(printf '%s' "$v" | tr -d '\000-\037')"
+  printf '"%s"' "$v"
+}
+
+# Write $2 to $STATE_DIR/$1 atomically (0644).
+write_state_file() {
+  local name="$1" content="$2" tmp
+  ensure_state_dir
+  tmp="$(mktemp "$STATE_DIR/.$name.XXXXXX")"
+  printf '%s\n' "$content" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -fT -- "$tmp" "$STATE_DIR/$name"
+}
+
+# Seconds since an ISO-8601 time we wrote ourselves; empty on failure.
+age_of() {
+  local t="$1" epoch
+  [[ "$t" =~ ^[0-9TZ:.+-]{1,40}$ ]] || return 0
+  epoch="$(date -u -d "$t" +%s 2>/dev/null)" || return 0
+  printf '%s' "$(( $(date -u +%s) - epoch ))"
+}
+
+# Read-only: never installs anything. Exit 0 even on a handled failure, so a
+# flaky network does not mark the timer's service failed.
+do_check_update() {
+  [[ $EUID -eq 0 ]] || die "check-update must run as root"
+  ensure_state_dir
+  exec 8>"$STATE_DIR/check.lock"
+  flock -n 8 || { note "another update check is running"; return 0; }
+  detect_arch
+
+  local installed; installed="$(installed_version)"
+  local channel="${CHANNEL:-stable}"
+  local latest="" min="" published="" blocked=false blocked_reason="" err=""
+  local tmp; tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+  local manifest_file="$tmp/manifest.json"
+
+  if [[ -n "${RELEASE_MANIFEST_URL:-}" ]]; then
+    if [[ "$RELEASE_MANIFEST_URL" =~ ^https?:// ]]; then
+      curl -fsSL -m 30 -o "$manifest_file" "$RELEASE_MANIFEST_URL" 2>/dev/null || err="could not reach the release server"
+    else
+      cp -- "$RELEASE_MANIFEST_URL" "$manifest_file" 2>/dev/null || err="could not reach the release server"
+    fi
+  else
+    latest="$(get_latest_release_version)"
+    if [[ -z "$latest" ]]; then
+      err="could not reach the release server"
+    else
+      curl -fsSL -m 30 -o "$manifest_file" \
+        "$RELEASE_BASE_URL/v$latest/ikenga-server_${latest}_manifest.json" 2>/dev/null \
+        || err="could not reach the release server"
+    fi
+  fi
+
+  local SCHEMA="" MANIFEST_VERSION="" MANIFEST_CHANNEL="" MIN_UPGRADE_FROM="" PUBLISHED_AT=""
+  local ARTIFACT_NAME="" ARTIFACT_SHA="" ARTIFACT_SIZE="" MANIFEST_ERROR=""
+  if [[ -z "$err" ]]; then
+    if ! parse_manifest "$manifest_file" "$ARCH"; then
+      err="the release manifest could not be read"
+    elif [[ -n "$latest" && "$MANIFEST_VERSION" != "$latest" ]]; then
+      err="the release manifest does not match the latest release"
+    elif [[ "$MANIFEST_CHANNEL" != "$channel" ]]; then
+      err="the latest release is not on this server's channel"
+    elif [[ -z "$ARTIFACT_NAME" || -z "$ARTIFACT_SHA" ]]; then
+      err="the latest release has no build for this architecture"
+    fi
+  fi
+
+  if [[ -z "$err" ]]; then
+    latest="$MANIFEST_VERSION"; min="$MIN_UPGRADE_FROM"; published="$PUBLISHED_AT"
+  else
+    # Keep what the last good check found; only last_error changes. Every
+    # field read back is re-validated: the file is ours, but trust nothing.
+    latest="" min="" published=""
+    if [[ -f "$STATE_DIR/available.json" ]]; then
+      local -a prev
+      if fields_into prev "$STATE_DIR/available.json" latest min_upgrade_from published_at 2>/dev/null; then
+        [[ "${prev[0]:-}" =~ $SEMVER_RE ]] && latest="${prev[0]}"
+        [[ "${prev[1]:-}" =~ $SEMVER_RE ]] && min="${prev[1]}"
+        [[ "${prev[2]:-}" =~ ^[0-9TZ:.+-]{1,40}$ ]] && published="${prev[2]}"
+      fi
+    fi
+    note "update check: $err"
+  fi
+
+  if [[ -n "$latest" && -n "$min" && -n "$installed" ]] && semver_lt "$installed" "$min"; then
+    blocked=true
+    blocked_reason="requires $min first"
+  fi
+  local notes_url=""
+  # Built here from the validated version, never copied from the manifest.
+  [[ -n "$latest" ]] && notes_url="https://github.com/$REPO/releases/tag/v$latest"
+
+  write_state_file available.json "{\"schema\":\"ikenga-update-available/1\",\"checked_at\":$(jstr "$(now_iso)"),\"channel\":$(jstr "$channel"),\"installed\":$(jstr "$installed"),\"latest\":$(jstr "$latest"),\"min_upgrade_from\":$(jstr "$min"),\"blocked\":$blocked,\"blocked_reason\":$(jstr "$blocked_reason"),\"notes_url\":$(jstr "$notes_url"),\"published_at\":$(jstr "$published"),\"last_error\":$(jstr "$err")}"
+  note "update check: installed ${installed:-unknown}, latest ${latest:-unknown}${err:+ (error: $err)}"
+  return 0
+}
+
+# status.json. Arguments are name=value pairs; values must already be safe.
+write_status() {
+  local state="" from="" to="" request_id="" requested_by="" started_at="" finished_at=""
+  local rolled_back=false exit_code="" message="" log_tail="[]" kv
+  for kv in "$@"; do
+    case "$kv" in
+      state=*) state="${kv#*=}" ;;
+      from=*) from="${kv#*=}" ;;
+      to=*) to="${kv#*=}" ;;
+      request_id=*) request_id="${kv#*=}" ;;
+      requested_by=*) requested_by="${kv#*=}" ;;
+      started_at=*) started_at="${kv#*=}" ;;
+      finished_at=*) finished_at="${kv#*=}" ;;
+      rolled_back=*) rolled_back="${kv#*=}" ;;
+      exit_code=*) exit_code="${kv#*=}" ;;
+      message=*) message="${kv#*=}" ;;
+      log_tail=*) log_tail="${kv#*=}" ;;
+    esac
+  done
+  [[ "$exit_code" =~ ^[0-9]{1,3}$ ]] || exit_code=null
+  write_state_file status.json "{\"schema\":\"ikenga-update-status/1\",\"state\":$(jstr "$state"),\"from\":$(jstr "$from"),\"to\":$(jstr "$to"),\"request_id\":$(jstr "$request_id"),\"requested_by\":$(jstr "$requested_by"),\"started_at\":$(jstr "$started_at"),\"finished_at\":$(jstr "$finished_at"),\"rolled_back\":$rolled_back,\"exit_code\":$exit_code,\"message\":$(jstr "$message"),\"log_tail\":$log_tail}"
+}
+
+# The last 40 progress lines of the run as a JSON array. Only provision.sh's
+# own progress shapes pass, each cut to 300 characters; do_upgrade prints no
+# environment values and the .env is never read on this path.
+log_tail_json() {
+  local f="$1" line out="" first=1
+  [[ -f "$f" ]] || { printf '[]'; return; }
+  while IFS= read -r line; do
+    line="$(printf '%s' "$line" | tr -d '\000-\037' | cut -c1-300)"
+    line="${line//\\/\\\\}"; line="${line//\"/\\\"}"
+    if [[ $first -eq 1 ]]; then first=0; else out+=","; fi
+    out+="\"$line\""
+  done < <(grep -E '^(==>|    |error:|WARNING|noop:)' "$f" | tail -n 40 || true)
+  printf '[%s]' "$out"
+}
+
+# Run by ikenga-update.service when the server drops a request. The request
+# is untrusted input: it may select nothing except "apply the version root
+# itself advertised, now". Root decides everything else from its own state.
+do_apply_request() {
+  [[ $EUID -eq 0 ]] || die "apply-request must run as root"
+  ensure_state_dir
+  local req claim cf
+  req="$(update_request_path)"
+  claim="$INSTALL_DIR/.update-claim"
+  install -d -m 0700 -o root -g root "$claim"
+  cf="$claim/request.json"
+  rm -rf -- "$cf"
+
+  # Claim by rename into a root-only directory: from here on nobody else can
+  # swap, relink or rewrite the name we check. rename(2) moves a symlink
+  # without following it.
+  if ! mv -fT -- "$req" "$cf" 2>/dev/null; then
+    note "no update request to apply"
+    return 0
+  fi
+
+  local started; started="$(now_iso)"
+  local installed; installed="$(installed_version)"
+
+  refuse() {
+    # $1 message, $2 request_id (validated or empty), $3 requested_by, $4 to
+    rm -rf -- "$cf"
+    write_status state=refused from="$installed" to="${4:-}" request_id="${2:-}" requested_by="${3:-}" \
+      started_at="$started" finished_at="$(now_iso)" message="$1"
+    printf 'ikenga-update: request %s by %s refused: %s\n' "${2:-?}" "${3:-?}" "$1"
+  }
+
+  # Check the claimed file BEFORE reading it.
+  if [[ -L "$cf" || ! -f "$cf" ]]; then refuse "invalid request"; return 0; fi
+  local owner nlink size mtime expected_owner
+  read -r owner nlink size mtime < <(stat -c '%u %h %s %Y' -- "$cf")
+  if [[ "$TIER" == t1 ]]; then
+    expected_owner=0
+  else
+    expected_owner="$(id -u ikenga 2>/dev/null || true)"
+  fi
+  if [[ -z "$expected_owner" || "$owner" != "$expected_owner" || "$nlink" != 1 ]] \
+     || (( size <= 0 || size > 4096 )); then
+    refuse "invalid request"; return 0
+  fi
+  local now; now="$(date -u +%s)"
+  if (( now - mtime > UPDATE_REQUEST_MAX_AGE || mtime - now > 60 )); then
+    refuse "the request expired"; return 0
+  fi
+
+  # Read ONCE, then validate only the copy: whatever happens to the file
+  # (or an fd someone kept open on it) after this no longer matters.
+  local content parsed
+  content="$(head -c 4096 -- "$cf")"
+  rm -rf -- "$cf"
+  parsed="$(mktemp "$claim/.parse.XXXXXX")"
+  printf '%s' "$content" > "$parsed"
+  local -a f
+  if ! fields_into f "$parsed" schema version request_id requested_by requested_at acknowledged_open_terminals 2>/dev/null; then
+    rm -f -- "$parsed"; refuse "invalid request"; return 0
+  fi
+  rm -f -- "$parsed"
+  local schema="${f[0]:-}" version="${f[1]:-}" request_id="${f[2]:-}" requested_by="${f[3]:-}"
+  local requested_at="${f[4]:-}" ack="${f[5]:-}"
+  [[ "$requested_by" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || requested_by="unknown"
+  if [[ ${#f[@]} -ne 6 || "$schema" != "ikenga-update-request/1" \
+        || ! "$version" =~ $SEMVER_RE || ${#version} -gt 32 \
+        || ! "$request_id" =~ ^[0-9a-f-]{36}$ \
+        || ! "$ack" =~ ^[0-9]{1,4}$ ]]; then
+    refuse "invalid request" "" "$requested_by"; return 0
+  fi
+  local req_age; req_age="$(age_of "$requested_at")"
+  if [[ -z "$req_age" ]] || (( req_age > UPDATE_REQUEST_MAX_AGE || req_age < -60 )); then
+    refuse "the request expired" "$request_id" "$requested_by" "$version"; return 0
+  fi
+
+  # One upgrade at a time (shared with a manual `upgrade` over SSH).
+  if ! take_upgrade_lock; then
+    refuse "another upgrade is running" "$request_id" "$requested_by" "$version"; return 0
+  fi
+
+  # Cross-check against root's own state only.
+  local -a av
+  if [[ ! -f "$STATE_DIR/available.json" ]] || ! fields_into av "$STATE_DIR/available.json" latest blocked 2>/dev/null; then
+    refuse "no update has been advertised" "$request_id" "$requested_by" "$version"; return 0
+  fi
+  if [[ "${av[0]:-}" != "$version" ]]; then
+    refuse "that version is not the advertised update" "$request_id" "$requested_by" "$version"; return 0
+  fi
+  if [[ "${av[1]:-}" == true ]]; then
+    refuse "the advertised update is blocked; update over SSH" "$request_id" "$requested_by" "$version"; return 0
+  fi
+  if [[ -z "$installed" ]]; then
+    refuse "no installed ikenga-server found" "$request_id" "$requested_by" "$version"; return 0
+  fi
+  if [[ "$installed" == "$version" ]]; then
+    write_status state=noop from="$installed" to="$version" request_id="$request_id" requested_by="$requested_by" \
+      started_at="$started" finished_at="$(now_iso)" message="already on $version"
+    printf 'ikenga-update: request %s by %s: already on %s (noop)\n' "$request_id" "$requested_by" "$version"
+    return 0
+  fi
+  if semver_lt "$version" "$installed"; then
+    refuse "that version is older than the installed one" "$request_id" "$requested_by" "$version"; return 0
+  fi
+  local -a st=()
+  if [[ -f "$STATE_DIR/status.json" ]] && fields_into st "$STATE_DIR/status.json" state to finished_at 2>/dev/null; then
+    if [[ ( "${st[0]:-}" == rolled_back || "${st[0]:-}" == failed ) && "${st[1]:-}" == "$version" ]]; then
+      local fin_age; fin_age="$(age_of "${st[2]:-}")"
+      if [[ -n "$fin_age" ]] && (( fin_age < UPDATE_RETRY_COOLDOWN )); then
+        refuse "cooldown: the last attempt at $version failed less than an hour ago" "$request_id" "$requested_by" "$version"
+        return 0
+      fi
+    fi
+  fi
+
+  write_status state=running from="$installed" to="$version" request_id="$request_id" \
+    requested_by="$requested_by" started_at="$started"
+  printf 'ikenga-update: request %s by %s: upgrading %s -> %s\n' "$request_id" "$requested_by" "$installed" "$version"
+
+  # FORCE: the server already made the admin acknowledge the open terminals
+  # it counted; root's /dev/pts heuristic over-counts (detached runners).
+  local rc log="$STATE_DIR/last-run.log"
+  ( umask 077; : > "$log" )
+  chmod 0600 "$log"
+  set +e
+  # shellcheck disable=SC2030  # the overrides are meant for this subshell only
+  ( set -e; TARGET_VERSION="$version"; UPGRADE_LATEST=0; FORCE=1; DRY_RUN=0; do_upgrade ) >>"$log" 2>&1
+  rc=$?
+  set -e
+
+  local state message rolled_back=false
+  case "$rc" in
+    0)
+      if grep -q '^noop:' "$log"; then state=noop; message="already on $version"
+      else state=succeeded; message="updated to $version"; fi ;;
+    3) state=rolled_back; rolled_back=true; message="the update failed its health check and was rolled back to $installed" ;;
+    4) state=failed; message="rollback also failed; see journalctl" ;;
+    *) state=failed; message="the update did not start; nothing was changed" ;;
+  esac
+  write_status state="$state" from="$installed" to="$version" request_id="$request_id" \
+    requested_by="$requested_by" started_at="$started" finished_at="$(now_iso)" \
+    rolled_back="$rolled_back" exit_code="$rc" message="$message" log_tail="$(log_tail_json "$log")"
+  printf 'ikenga-update: request %s by %s: %s -> %s: %s\n' "$request_id" "$requested_by" "$installed" "$version" "$state"
+
+  # Re-check, so available.json reflects what is installed now.
+  ( do_check_update ) >/dev/null 2>&1 || true
+  return 0
+}
+
+# Write $SYSTEMD_DIR/$1 only when its content differs.
+write_unit() {
+  local name="$1" content="$2"
+  if [[ "$(cat "$SYSTEMD_DIR/$name" 2>/dev/null || true)" == "${content%$'\n'}" ]]; then return 1; fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '    [dry-run] write %s/%s:\n' "$SYSTEMD_DIR" "$name"
+    printf '%s\n' "$content" | sed 's/^/      | /'
+  else
+    printf '%s' "$content" > "$SYSTEMD_DIR/$name"
+    chmod 0644 "$SYSTEMD_DIR/$name"
+  fi
+  changed "unit $name installed"
+  return 0
+}
+
+# The stable copy of this script and the four update units. Idempotent.
+install_update_units() {
+  log "Update units (check timer, request path, stable provisioner copy)"
+  [[ $EUID -eq 0 || $DRY_RUN -eq 1 ]] || die "run as root (sudo); dry runs may be unprivileged"
+  local self req
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  req="$(update_request_path)"
+
+  if [[ "$self" != "$(readlink -f "$STABLE_COPY" 2>/dev/null || true)" ]] && ! cmp -s "$self" "$STABLE_COPY"; then
+    run install -D -m 0755 -o root -g root "$self" "$STABLE_COPY"
+    changed "stable provisioner copy at $STABLE_COPY"
+  fi
+
+  local any=0
+  write_unit ikenga-update-check.service "[Unit]
+Description=Ikenga: check for a server update (notify only; installs nothing)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$STABLE_COPY check-update
+Nice=10
+StateDirectory=ikenga-update
+StateDirectoryMode=0755
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+" && any=1
+  write_unit ikenga-update-check.timer "[Unit]
+Description=Ikenga: daily server update check
+
+[Timer]
+OnBootSec=15min
+OnCalendar=daily
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+" && any=1
+  write_unit ikenga-update.path "[Unit]
+Description=Ikenga: apply an admin's server update request
+
+[Path]
+PathExists=$req
+Unit=ikenga-update.service
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
+" && any=1
+  write_unit ikenga-update.service "[Unit]
+Description=Ikenga: apply a requested server update (upgrade, health check, automatic rollback)
+
+[Service]
+Type=oneshot
+ExecStart=$STABLE_COPY apply-request
+TimeoutStartSec=15min
+StateDirectory=ikenga-update
+StateDirectoryMode=0755
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$INSTALL_DIR $SYSTEMD_DIR
+ProtectHome=read-only
+" && any=1
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    note "[dry-run] systemctl daemon-reload; enable --now ikenga-update-check.timer ikenga-update.path"
+    return 0
+  fi
+  install -d -m 0755 -o root -g root "$STATE_DIR"
+  if command -v systemctl >/dev/null 2>&1; then
+    [[ $any -eq 1 ]] && systemctl daemon-reload
+    systemctl enable --now ikenga-update-check.timer ikenga-update.path >/dev/null 2>&1 \
+      || note "WARNING: could not enable the update timer/path units (see systemctl status ikenga-update.path)"
+    # First check now, not 15 minutes after the next boot.
+    [[ ! -f "$STATE_DIR/available.json" ]] && systemctl start --no-block ikenga-update-check.service >/dev/null 2>&1 || true
   fi
 }
 
 # ------------------------------------------------------------------ main
 
-if [[ "$ACTION" == "upgrade" ]]; then
-  do_upgrade
-  exit 0
-fi
+case "$ACTION" in
+  upgrade)
+    if [[ $DRY_RUN -eq 0 ]]; then
+      take_upgrade_lock || die "another upgrade is running"
+    fi
+    do_upgrade
+    exit 0 ;;
+  check-update) do_check_update; exit 0 ;;
+  apply-request) do_apply_request; exit 0 ;;
+  install-update-units) install_update_units; summary; exit 0 ;;
+esac
 
 validate_profile
 IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0; ENV_CHANGED=0
@@ -996,9 +1624,12 @@ install_deps
 install_daemon
 write_env
 if [[ -n "$PROFILE_FILE" && -f "$PROFILE_FILE" && $DRY_RUN -eq 0 ]]; then
-  cp -a "$PROFILE_FILE" "$INSTALL_DIR/.profile.env" 2>/dev/null || true
+  # Root sources this file unattended (the update units), so it is stored
+  # root-owned and private, never with the operator's uid and mode.
+  install -m 0600 -o root -g root "$PROFILE_FILE" "$INSTALL_DIR/.profile.env"
 fi
 install_service
+install_update_units
 firewall
 verify
 summary
