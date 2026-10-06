@@ -876,3 +876,65 @@ jobs:
           cat SHA256SUMS.txt
           gh release upload "$TAG" SHA256SUMS.txt --repo "$REPO" --clobber
           echo "✓ SHA256SUMS.txt attached to $TAG"
+
+  # ── Tell ikenga.dev a release shipped (truth-sync) ─────────────────────
+  # Its own job after `checksums`, the final asset job, so the site rebuild
+  # sees the published release with every asset and SHA256SUMS.txt in place.
+  notify-site:
+    needs: checksums
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # ── Tell ikenga.dev a release shipped (truth-sync) ─────────────────────
+      # Final step on purpose: it runs only after the release is published
+      # (`--draft=false` above) and latest.json is re-uploaded, so the site
+      # rebuild fetches this tag's assets rather than the previous release's.
+      # It sends `repository_dispatch` (event_type `release`) to
+      # ikenga-hq/ikenga-site, whose `truth-rebuild.yml` then triggers the
+      # Cloudflare Pages build that refreshes downloads, install docs and the
+      # changelog.
+      #
+      # Founder setup, one time (the token is never echoed, and GitHub masks it
+      # in logs):
+      #   1. Create a fine-grained personal access token. Resource owner:
+      #      ikenga-hq. Repository access: only ikenga-hq/ikenga-site.
+      #      Repository permissions: Contents = Read and write (that is what
+      #      POST /repos/{owner}/{repo}/dispatches requires). Nothing else.
+      #      If the org requires approval for fine-grained tokens, approve it.
+      #   2. Save it as the Actions secret SITE_DISPATCH_TOKEN on
+      #      ikenga-hq/ikenga (Settings -> Secrets and variables -> Actions).
+      #   3. Put its expiry in the calendar. After it lapses this step only
+      #      warns, and the nightly rebuild is the backstop (a rebuild up to a
+      #      day late, not none).
+      #
+      # Never fails the release: the release is already public by now, so a
+      # missing or rejected token surfaces as a warning annotation instead.
+      - name: Notify ikenga.dev (repository_dispatch to ikenga-site)
+        env:
+          # The token is passed through the environment only, never on a
+          # command line.
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning title=ikenga.dev not notified::SITE_DISPATCH_TOKEN is not set on this repo, so ikenga-site was not told about ${TAG}. The nightly rebuild will pick it up. Setup steps are in the comment above this step in release.yml."
+            exit 0
+          fi
+
+          if gh api --method POST repos/ikenga-hq/ikenga-site/dispatches \
+            -f event_type=release \
+            -f "client_payload[source]=${SOURCE_REPO}" \
+            -f "client_payload[tag]=${TAG}" \
+            -f "client_payload[version]=${TAG#v}" \
+            -f "client_payload[sha]=${SOURCE_SHA}" \
+            -f "client_payload[run_url]=${RUN_URL}" \
+            --silent; then
+            echo "Dispatched event_type=release to ikenga-hq/ikenga-site for ${TAG}"
+          else
+            echo "::warning title=ikenga.dev dispatch failed::GitHub rejected the repository_dispatch to ikenga-hq/ikenga-site for ${TAG}. Check that SITE_DISPATCH_TOKEN is current and has Contents: write on that repo. The nightly rebuild will pick the release up."
+          fi
