@@ -1456,54 +1456,43 @@ mod tests {
         assert_eq!(non_snake, Value::Null);
     }
 
+    /// A stub `claude` is found at its exact path and actually run. The search
+    /// path is injected rather than prepended to `$PATH`: detection resolves
+    /// through the `OnceLock`-cached augmented path, so an env mutation is
+    /// invisible to it once any test has built that cache, and racing it
+    /// against the parallel arm tests made both flaky. Asserting the full
+    /// path and the stub's own version (not just the file name `claude`)
+    /// keeps a real install on the host from passing the test for it.
+    #[cfg(unix)]
     #[tokio::test]
     async fn detect_agent_stub_on_path_and_absent() {
+        use std::os::unix::fs::PermissionsExt;
         let d = daemon();
         let r = &d.router;
 
-        // An absent engine is reported missing (null)
+        // An absent engine is reported missing (null) by the daemon arm.
         let absent = ok(r, "detect_agent", json!({ "agentId": "nonexistent-agent" })).await;
         assert_eq!(absent, Value::Null);
 
-        // Create a stub binary for an agent
         let tmp = tempfile::tempdir().unwrap();
-        let stub = tmp.path().join(if cfg!(windows) { "claude.cmd" } else { "claude" });
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&stub, "#!/bin/sh\necho 'Claude Code 9.9.9'\n").unwrap();
-            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&stub, perms).unwrap();
-        }
-        #[cfg(windows)]
-        {
-            std::fs::write(&stub, "@echo Claude Code 9.9.9\r\n").unwrap();
-        }
+        let stub = tmp.path().join("claude");
+        std::fs::write(&stub, "#!/bin/sh\necho 'Claude Code 9.9.9'\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = std::env::var_os("PATH");
-        let new_path = match &old_path {
-            Some(p) => {
-                let mut v = tmp.path().as_os_str().to_os_string();
-                v.push(if cfg!(windows) { ";" } else { ":" });
-                v.push(p);
-                v
-            }
-            None => tmp.path().as_os_str().to_os_string(),
-        };
-        std::env::set_var("PATH", &new_path);
+        use crate::server::shared::agents::detect_by_id_in;
+        let search = tmp.path().as_os_str();
+        let detected = detect_by_id_in("claude-code", search)
+            .await
+            .expect("stub claude on the injected search path is detected");
+        // Through the wire shape the arm serves.
+        let detected = wire(detected);
+        let stub_path = stub.display().to_string();
+        assert_eq!(detected["id"], json!("claude-code"));
+        assert_eq!(detected["executable_path"], json!(stub_path));
+        assert_eq!(detected["version"], json!("9.9.9"));
 
-        let detected = ok(r, "detect_agent", json!({ "agentId": "claude-code" })).await;
-
-        if let Some(p) = old_path {
-            std::env::set_var("PATH", p);
-        } else {
-            std::env::remove_var("PATH");
-        }
-
-        assert_eq!(detected.get("id").and_then(|v| v.as_str()), Some("claude-code"));
-        let exec = detected.get("executable_path").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(exec.contains(stub.file_name().unwrap().to_str().unwrap()), "got exec: {exec}");
+        // Unknown ids stay absent whatever the search path holds.
+        assert!(detect_by_id_in("nonexistent-agent", search).await.is_none());
     }
 
     // ── what is missing ─────────────────────────────────────────────────────
