@@ -271,7 +271,7 @@ fn git_ls_remote_sha(url: &str, ref_: Option<&str>) -> Result<String, String> {
 /// the Claude `skills` CLI writes lands under our isolated tree (never the user's
 /// real `~/.claude`). We adopt the written skill from there.
 fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
-    let mut c = SpawnSpec::new("npx");
+    let mut c = SpawnSpec::new(crate::runtime::resolve_tool("npx"));
     c.args(["--yes", "skills", "add", spec])
         .current_dir(staging)
         .env("HOME", staging)
@@ -305,7 +305,7 @@ fn npx_skills_add(spec: &str, staging: &Path) -> Result<(), String> {
 /// network/impure edge; the bundle core takes it as an injected fn so the
 /// materialization + members + registry logic stays pure/tempdir-testable.
 fn npx_skills_add_all(spec: &str, staging: &Path) -> Result<(), String> {
-    let mut c = SpawnSpec::new("npx");
+    let mut c = SpawnSpec::new(crate::runtime::resolve_tool("npx"));
     c.args(["--yes", "skills", "add", spec, "--skill", "*"])
         .current_dir(staging)
         .env("HOME", staging)

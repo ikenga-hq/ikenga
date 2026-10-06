@@ -434,6 +434,14 @@ pub fn resolve_command(declared: &str) -> PathBuf {
     PathBuf::from(declared)
 }
 
+/// Resolve a bare tool name (`npx`) to a full path via the augmented PATH.
+/// Needed on Windows, where `npx` is an `npx.cmd` shim that a plain
+/// `Command::new("npx")` can't find. Falls back to the bare name.
+pub fn resolve_tool(name: &str) -> PathBuf {
+    which::which_in(name, Some(augmented_path()), std::env::current_dir().unwrap_or_default())
+        .unwrap_or_else(|_| PathBuf::from(name))
+}
+
 // ── Post-launch fetcher (ensure_bun) ─────────────────────────────────────────
 
 /// Progress narration for the bun fetch. Emitted on `runtime://bun` via the
