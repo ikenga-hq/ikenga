@@ -800,7 +800,7 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_detect::known::TargetFamily;
+    use super::super::known::TargetFamily;
 
     /// Real `-32000` payloads captured from gemini 0.55.1 on 2026-08-24.
     /// Neither is an auth failure, and treating them as one reports a

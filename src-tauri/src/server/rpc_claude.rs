@@ -53,7 +53,9 @@ use super::shared::claude_config::{self, ClaudeConfig, ScanError};
 use super::shared::claude_sessions::{self, projects_root_in};
 use super::shared::claude_store::{self, DaemonChecks, Vault};
 use super::shared::projects::FsReach;
-use super::shared::{agent_config, agent_projects, engine_layout, settings_cascade, shell_detect};
+use super::shared::{
+    agent_config, agent_projects, agents, engine_layout, settings_cascade, shell_detect,
+};
 use super::AppState;
 
 /// The desktop's own error for "no home to resolve `~/.claude` against".
@@ -324,6 +326,22 @@ pub(super) async fn claude_session_list(state: &AppState, args: &Value) -> RpcRe
 }
 
 // ─── Wizard detection / layout ───────────────────────────────────────────────
+
+/// Scan $PATH for all known coding agents via the session executor.
+pub(super) async fn detect_agents() -> RpcResponse {
+    let r = Ok::<_, String>(agents::detect_all().await);
+    respond("detect_agents", r)
+}
+
+/// Detect a single known coding agent by id via the session executor.
+pub(super) async fn detect_agent(args: &Value) -> RpcResponse {
+    let r = async {
+        let agent_id: String = targ(args, &["agentId", "agent_id"])?;
+        Ok::<_, String>(agents::detect_by_id(&agent_id).await)
+    }
+    .await;
+    respond("detect_agent", r)
+}
 
 /// Counts under the caller's `rootPath` (confined) plus the router home's
 /// global counts. `root_path` echoes the caller's spelling, as the desktop's
@@ -1416,6 +1434,76 @@ mod tests {
             ok(r, "terminal_detect_shells", json!({})).await,
             wire(crate::server::shared::shell_detect::detect_shells())
         );
+
+        let all = ok(r, "detect_agents", json!({})).await;
+        assert!(all.is_array());
+        if let Some(first) = all.as_array().and_then(|a| a.first()) {
+            assert!(first.get("id").is_some());
+            assert!(first.get("display").is_some());
+            assert!(first.get("executable_path").is_some());
+            assert!(first.get("capabilities").is_some());
+
+            let first_id = first.get("id").unwrap().as_str().unwrap();
+            let one = ok(r, "detect_agent", json!({ "agentId": first_id })).await;
+            assert_eq!(one.get("id").and_then(|v| v.as_str()), Some(first_id));
+            let one_snake = ok(r, "detect_agent", json!({ "agent_id": first_id })).await;
+            assert_eq!(one_snake.get("id").and_then(|v| v.as_str()), Some(first_id));
+        }
+
+        let non = ok(r, "detect_agent", json!({ "agentId": "nonexistent-agent" })).await;
+        assert_eq!(non, Value::Null);
+        let non_snake = ok(r, "detect_agent", json!({ "agent_id": "nonexistent-agent" })).await;
+        assert_eq!(non_snake, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn detect_agent_stub_on_path_and_absent() {
+        let d = daemon();
+        let r = &d.router;
+
+        // An absent engine is reported missing (null)
+        let absent = ok(r, "detect_agent", json!({ "agentId": "nonexistent-agent" })).await;
+        assert_eq!(absent, Value::Null);
+
+        // Create a stub binary for an agent
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = tmp.path().join(if cfg!(windows) { "claude.cmd" } else { "claude" });
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&stub, "#!/bin/sh\necho 'Claude Code 9.9.9'\n").unwrap();
+            let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::fs::write(&stub, "@echo Claude Code 9.9.9\r\n").unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let new_path = match &old_path {
+            Some(p) => {
+                let mut v = tmp.path().as_os_str().to_os_string();
+                v.push(if cfg!(windows) { ";" } else { ":" });
+                v.push(p);
+                v
+            }
+            None => tmp.path().as_os_str().to_os_string(),
+        };
+        std::env::set_var("PATH", &new_path);
+
+        let detected = ok(r, "detect_agent", json!({ "agentId": "claude-code" })).await;
+
+        if let Some(p) = old_path {
+            std::env::set_var("PATH", p);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert_eq!(detected.get("id").and_then(|v| v.as_str()), Some("claude-code"));
+        let exec = detected.get("executable_path").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(exec.contains(stub.file_name().unwrap().to_str().unwrap()), "got exec: {exec}");
     }
 
     // ── what is missing ─────────────────────────────────────────────────────
