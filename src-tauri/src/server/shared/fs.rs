@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Resolves a caller's path to a canonical path inside the allowlist, or
 /// says why not.
@@ -282,4 +282,147 @@ pub async fn rename(resolve: Resolve<'_>, from: &str, to_name: &str) -> Result<S
 
 fn path_string(p: &Path) -> String {
     p.to_string_lossy().to_string()
+}
+
+/// Metadata preserved alongside a trashed file or folder.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TrashMetadata {
+    pub original_path: String,
+    pub trashed_at_ms: u64,
+    pub file_name: String,
+    pub is_dir: bool,
+}
+
+/// Move `canonical` into `trash_dir`, generating a unique name and sidecar JSON
+/// metadata file (`<trashed_name>.meta.json`) recording original path and timestamp.
+/// If moving across filesystems fails with rename, falls back safely to recursive copy + remove.
+pub async fn trash(canonical: &Path, trash_dir: &Path) -> Result<(), String> {
+    let canonical = canonical.to_path_buf();
+    let trash_dir = trash_dir.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        // Ensure trash directory exists with mode 0700 permissions
+        create_secure_trash_dir(&trash_dir)?;
+
+        let meta = std::fs::symlink_metadata(&canonical)
+            .map_err(|e| format!("cannot trash nonexistent path {}: {e}", canonical.display()))?;
+
+        let is_dir = meta.is_dir();
+        let orig_name = canonical
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("item")
+            .to_string();
+
+        let id = uuid::Uuid::now_v7();
+        let trashed_name = format!("{id}_{orig_name}");
+        let dest_path = trash_dir.join(&trashed_name);
+        let sidecar_path = trash_dir.join(format!("{trashed_name}.meta.json"));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let metadata = TrashMetadata {
+            original_path: canonical.to_string_lossy().into_owned(),
+            trashed_at_ms: now_ms,
+            file_name: orig_name,
+            is_dir,
+        };
+
+        let meta_bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|e| format!("serialize trash metadata: {e}"))?;
+
+        // Move target to dest_path with cross-device fallback
+        move_path_with_fallback(&canonical, &dest_path, is_dir)?;
+
+        // Write sidecar metadata
+        if let Err(e) = std::fs::write(&sidecar_path, &meta_bytes) {
+            // Attempt rollback if metadata write fails
+            let _ = move_path_with_fallback(&dest_path, &canonical, is_dir);
+            return Err(format!("write sidecar metadata: {e}"));
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("trash task join failed: {e}"))?
+}
+
+fn create_secure_trash_dir(trash_dir: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        if let Err(e) = builder.create(trash_dir) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("create trash dir {}: {e}", trash_dir.display()));
+            }
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(trash_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(trash_dir, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(trash_dir)
+            .map_err(|e| format!("create trash dir {}: {e}", trash_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn move_path_with_fallback(src: &Path, dst: &Path, is_dir: bool) -> Result<(), String> {
+    // First try atomic rename
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    // Fall back to copy + remove for cross-device moves
+    if is_dir {
+        copy_dir_recursive(src, dst).map_err(|e| {
+            let _ = std::fs::remove_dir_all(dst);
+            format!("cross-device copy failed: {e}")
+        })?;
+        std::fs::remove_dir_all(src)
+            .map_err(|e| format!("remove original after copy failed: {e}"))?;
+    } else {
+        std::fs::copy(src, dst).map_err(|e| {
+            let _ = std::fs::remove_file(dst);
+            format!("cross-device copy failed: {e}")
+        })?;
+        std::fs::remove_file(src)
+            .map_err(|e| format!("remove original after copy failed: {e}"))?;
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                let link_target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&link_target, &to)?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::copy(&from, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }

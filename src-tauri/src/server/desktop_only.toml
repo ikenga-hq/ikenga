@@ -154,10 +154,6 @@ reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the opera
 tag = "WP-20"
 reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
 
-[fs_trash]
-tag = "desktop-only-forever"
-reason = "trash::delete moves the file into the OS trash (freedesktop: $XDG_DATA_HOME/Trash of the daemon's home, or a .Trash-$uid at the mount top) — outside the fs allowlist, with no daemon verb to list or restore it and no trash UI on a headless host, so over RPC it is a delete that leaves a copy outside the boundary. Not served, and never downgraded to a hard delete."
-
 [fs_unwatch]
 tag = "desktop-only-forever"
 reason = "Pair of fs_watch: in a remote web session tauri-cmd.ts fsUnwatch releases the watch on the /ws/fs socket (server/fs_ws.rs); an RPC arm would have no watcher of its own to release."

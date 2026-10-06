@@ -62,6 +62,8 @@ const NO_DATA_DIR_ACTIONS: &str =
     "no actions store: the daemon was started without --data-dir, so there is no ikenga.db (projects) or actions-trust.json to open";
 const NO_HOME_ACTIONS: &str =
     "no actions store: the daemon has no HOME in its environment, so there is no ~/.ikenga/actions.json to resolve";
+const NO_DATA_DIR_TRASH: &str =
+    "no data dir: the daemon was started without --data-dir, so there is no trash directory";
 
 // ─── fs ──────────────────────────────────────────────────────────────────────
 
@@ -109,6 +111,44 @@ pub(super) async fn fs_write(state: &AppState, args: &Value) -> RpcResponse {
     }
     .await;
     respond("fs_write", r)
+}
+
+/// `fs_trash`. Move target to the per-principal trash directory inside the data dir.
+pub(super) async fn fs_trash(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let path: String = targ(args, &["path"])?;
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let dir = data_dir(state, NO_DATA_DIR_TRASH)?;
+        let trash_dir = dir.join("trash");
+        state.path_guard.ready()?;
+
+        // Refuse `..` explicitly
+        let raw_abs = crate::path_allow::expand_absolute(&path)
+            .map_err(|e| format!("expand path: {e}"))?;
+        if raw_abs
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("path may not contain `..`".to_string());
+        }
+
+        // Deep resolve with allowlist and reserved check
+        let canonical = state.path_guard.resolve_deep(&path)?;
+
+        // Ensure cannot trash the data dir or trash dir itself
+        if canonical.starts_with(&trash_dir) || canonical == trash_dir {
+            return Err(format!(
+                "cannot trash the trash directory itself: {}",
+                canonical.display()
+            ));
+        }
+
+        shared_fs::trash(&canonical, &trash_dir).await
+    }
+    .await;
+    respond("fs_trash", r)
 }
 
 /// `fs_list`. The desktop command is `fs_list(dir, glob)`, so `dir` is the argument
@@ -917,6 +957,229 @@ mod tests {
         let e = err(&d.router, "fs_write", json!({ "path": s(&target), "bytes": [1] })).await;
         assert!(e.contains("outside allowlist"), "{e}");
         assert!(!target.exists());
+    }
+
+    // ── fs_trash ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_trash_refuses_outside_allowlist() {
+        let d = daemon();
+        let target = d.outside.join("secret.txt");
+        std::fs::write(&target, b"keep me safe").unwrap();
+
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&target) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(target.exists(), "target outside allowlist must not be deleted");
+    }
+
+    #[tokio::test]
+    async fn fs_trash_refuses_dot_dot() {
+        let d = daemon();
+        let e = err(
+            &d.router,
+            "fs_trash",
+            json!({ "path": format!("{}/../outside/file.txt", s(&d.allowed)) }),
+        )
+        .await;
+        assert!(e.contains("may not contain `..`"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_trash_refuses_symlink_to_outside() {
+        let d = daemon();
+        let secret = d.outside.join("secret.txt");
+        std::fs::write(&secret, b"sensitive").unwrap();
+
+        let link = d.allowed.join("escape_link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&link) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(secret.exists(), "file outside allowlist must remain intact");
+    }
+
+    #[tokio::test]
+    async fn fs_trash_refuses_trash_dir_and_data_dir() {
+        let d = daemon();
+        let trash_dir = d.data.join("trash");
+        std::fs::create_dir_all(&trash_dir).unwrap();
+
+        // 1. Data dir is outside the standard allowlist
+        let e = err(&d.router, "fs_trash", json!({ "path": s(&trash_dir) })).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+
+        let inside_trash = trash_dir.join("some_file.txt");
+        std::fs::write(&inside_trash, b"data").unwrap();
+        let e2 = err(&d.router, "fs_trash", json!({ "path": s(&inside_trash) })).await;
+        assert!(e2.contains("outside allowlist"), "{e2}");
+
+        // 2. Allowlist covers the root including the data dir (reserved check triggers)
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let data = root.join("data");
+        let trash = data.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let item = trash.join("item.txt");
+        std::fs::write(&item, b"x").unwrap();
+
+        let roots_file = root.join("fs_roots.json");
+        std::fs::write(
+            &roots_file,
+            json!({ "roots": [root.to_string_lossy()] }).to_string(),
+        )
+        .unwrap();
+        let roots = crate::fs_roots::FsRoots::load(roots_file).unwrap();
+        let guard = PathGuard::roots(Arc::new(roots));
+        let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+        let router = router_with(
+            config(Some(data.clone())),
+            Arc::new(PtyManager::new()),
+            Arc::new(EngineRegistry::new()),
+            Some(db),
+            None,
+            Some(root.clone()),
+            guard,
+        );
+
+        let e_trash = err(&router, "fs_trash", json!({ "path": s(&trash) })).await;
+        assert!(
+            e_trash.contains("reserved")
+                || e_trash.contains("inside the daemon's data directory")
+                || e_trash.contains("cannot trash the trash directory itself"),
+            "{e_trash}"
+        );
+
+        let e_item = err(&router, "fs_trash", json!({ "path": s(&item) })).await;
+        assert!(
+            e_item.contains("reserved")
+                || e_item.contains("inside the daemon's data directory")
+                || e_item.contains("cannot trash the trash directory itself"),
+            "{e_item}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_trash_moves_file_and_writes_metadata_sidecar() {
+        let d = daemon();
+        let file = d.allowed.join("hello.txt");
+        std::fs::write(&file, b"content to trash").unwrap();
+
+        ok(&d.router, "fs_trash", json!({ "path": s(&file) })).await;
+        assert!(!file.exists(), "original file must be removed");
+
+        let trash_dir = d.data.join("trash");
+        assert!(trash_dir.exists(), "trash dir must exist");
+
+        // On Unix, verify mode 0700
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&trash_dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "trash dir must be mode 0700");
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&trash_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let item_file = entries
+            .iter()
+            .find(|n| n.ends_with("_hello.txt"))
+            .expect("trashed item exists");
+        let sidecar_file = entries
+            .iter()
+            .find(|n| n.ends_with("_hello.txt.meta.json"))
+            .expect("sidecar exists");
+
+        assert_eq!(
+            std::fs::read(trash_dir.join(item_file)).unwrap(),
+            b"content to trash"
+        );
+
+        let meta_str = std::fs::read_to_string(trash_dir.join(sidecar_file)).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta["original_path"], s(&file));
+        assert_eq!(meta["file_name"], "hello.txt");
+        assert_eq!(meta["is_dir"], false);
+        assert!(meta["trashed_at_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn fs_trash_moves_directory_recursively() {
+        let d = daemon();
+        let folder = d.allowed.join("my_project");
+        let sub = folder.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), b"deep nested data").unwrap();
+
+        ok(&d.router, "fs_trash", json!({ "path": s(&folder) })).await;
+        assert!(!folder.exists(), "original folder must be removed");
+
+        let trash_dir = d.data.join("trash");
+        let entries: Vec<_> = std::fs::read_dir(&trash_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let item_dir = entries
+            .iter()
+            .find(|n| n.ends_with("_my_project"))
+            .expect("trashed dir exists");
+        let sidecar_file = entries
+            .iter()
+            .find(|n| n.ends_with("_my_project.meta.json"))
+            .expect("sidecar exists");
+
+        assert_eq!(
+            std::fs::read(trash_dir.join(item_dir).join("sub/nested.txt")).unwrap(),
+            b"deep nested data"
+        );
+
+        let meta_str = std::fs::read_to_string(trash_dir.join(sidecar_file)).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta["original_path"], s(&folder));
+        assert_eq!(meta["file_name"], "my_project");
+        assert_eq!(meta["is_dir"], true);
+    }
+
+    #[tokio::test]
+    async fn fs_trash_cross_principal_isolation() {
+        let d_a = daemon();
+        let d_b = daemon();
+
+        let file_a = d_a.allowed.join("doc_a.txt");
+        let file_b = d_b.allowed.join("doc_b.txt");
+        std::fs::write(&file_a, b"for principal A").unwrap();
+        std::fs::write(&file_b, b"for principal B").unwrap();
+
+        ok(&d_a.router, "fs_trash", json!({ "path": s(&file_a) })).await;
+        ok(&d_b.router, "fs_trash", json!({ "path": s(&file_b) })).await;
+
+        let trash_a = d_a.data.join("trash");
+        let trash_b = d_b.data.join("trash");
+
+        let names_a: Vec<_> = std::fs::read_dir(&trash_a)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let names_b: Vec<_> = std::fs::read_dir(&trash_b)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names_a.iter().any(|n| n.contains("doc_a.txt")));
+        assert!(
+            !names_a.iter().any(|n| n.contains("doc_b.txt")),
+            "principal A trash must not contain principal B files"
+        );
+
+        assert!(names_b.iter().any(|n| n.contains("doc_b.txt")));
+        assert!(
+            !names_b.iter().any(|n| n.contains("doc_a.txt")),
+            "principal B trash must not contain principal A files"
+        );
     }
 
     // ── pty_spawn ──────────────────────────────────────────────────

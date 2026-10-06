@@ -102,6 +102,7 @@ export const RPC_REQUIREMENTS: Readonly<Record<string, ArmRequirement>> = {
 	fs_rename: { caps: ['files', 'dispatch'], class: 'shared' },
 	fs_roots_list: { caps: ['files'], class: 'owner' },
 	fs_search: { caps: ['files'], class: 'shared' },
+	fs_trash: { caps: ['files', 'dispatch'], class: 'shared' },
 	fs_write: { caps: ['files', 'dispatch'], class: 'shared' },
 	keybindings_write: { caps: ['settings'], class: 'shared' },
 	list_agent_projects: { caps: ['files'], class: 'owner' },

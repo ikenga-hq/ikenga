@@ -51,6 +51,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_home", req!(owner[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
+    ("fs_trash", req!(shared[Files, Dispatch])),
     ("fs_mkdir", req!(shared[Files, Dispatch])),
     ("fs_rename", req!(shared[Files, Dispatch])),
     // ── raw DB (P-3: owner-class) ──
