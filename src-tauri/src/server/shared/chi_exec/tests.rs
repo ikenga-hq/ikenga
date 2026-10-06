@@ -100,7 +100,7 @@ fn opts(engine_id: &str, prompt: &str, cwd: Option<&str>) -> ChiRunOpts {
 
 /// A fake `claude` speaking just enough stream-json: it reads the prompt
 /// envelope from stdin, then prints `system:init` (session `sess-stub`), one
-/// assistant text carrying its uid and argv, and a `result`. A prompt
+/// assistant text carrying its uid, cwd and argv, and a `result`. A prompt
 /// containing `sleep` makes it `exec sleep 30` instead — a run to cancel.
 ///
 /// Written once per test process: writing an executable while other test
@@ -119,7 +119,7 @@ pub(crate) fn stub_claude() -> PathBuf {
 prompt=$(cat)
 case "$prompt" in *sleep*) exec sleep 30;; esac
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-stub"}'
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"uid=%s args=%s"}]}}\n' "$(id -u)" "$*"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"uid=%s cwd=%s args=%s"}]}}\n' "$(id -u)" "$(pwd)" "$*"
 printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
 "#,
         )
@@ -169,6 +169,8 @@ fn stub_env(root: &Path) -> ChiEnv {
         default_cwd: Some(root.to_path_buf()),
         files: OutputFiles::InCacheDir,
         resolver: Arc::new(StubResolver(stub_claude())),
+        cwd_expansion: CwdExpansion::TildeOnly,
+        prompt_in_argv: PromptInArgv::Allowed,
     }
 }
 
@@ -1307,4 +1309,258 @@ fn scrubbed_env_drops_the_host_only_secrets() {
         .collect();
     // The user's own engine credentials pass; the daemon's never do.
     assert_eq!(kept, ["PATH", "HOME", "ANTHROPIC_API_KEY"]);
+}
+
+// ── prompt in argv (I-7) ───────────────────────────────────────────────
+
+/// `PROMPT_IN_ARGV_ENGINES` is exactly the set of engines whose built
+/// command carries the prompt, so the T1 refusal can't miss one: moving an
+/// engine to stdin, or adding an argv-prompt engine, fails here until the
+/// list follows.
+#[test]
+fn prompt_in_argv_matches_the_engine_commands() {
+    const PROMPT: &str = "SENTINEL-PROMPT-7f3a";
+    let resolver = FakeResolver::native(&["claude", "agy", "codex", "opencode", "pi"]);
+    for engine in ["claude-code", "antigravity-cli", "codex", "opencode", "pi"] {
+        for resume in [None, Some("sess-1")] {
+            let cmd =
+                build_engine_command_with(&resolver, engine, PROMPT, "/tmp", None, None, resume)
+                    .unwrap();
+            let in_argv = cmd
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().contains(PROMPT));
+            assert_eq!(
+                in_argv,
+                prompt_rides_argv(engine),
+                "{engine} (resume {resume:?}): prompt in argv = {in_argv}"
+            );
+        }
+    }
+    assert!(!prompt_rides_argv("claude-code"));
+    assert!(!prompt_rides_argv("codex"));
+}
+
+#[test]
+fn prompt_in_argv_is_refused_only_above_t0_without_hidepid() {
+    use PromptInArgv::{Allowed, Refused};
+    assert_eq!(prompt_in_argv_policy(ExecutorTier::T0, false), Allowed);
+    assert_eq!(prompt_in_argv_policy(ExecutorTier::T0, true), Allowed);
+    assert_eq!(prompt_in_argv_policy(ExecutorTier::T1, false), Refused);
+    assert_eq!(prompt_in_argv_policy(ExecutorTier::T1, true), Allowed);
+    assert_eq!(prompt_in_argv_policy(ExecutorTier::T2, false), Refused);
+}
+
+#[test]
+fn mountinfo_hidepid_detection() {
+    let line = |opts: &str| {
+        format!(
+            "22 1 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw\n\
+             25 1 0:23 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc {opts}\n"
+        )
+    };
+    // A stock /proc (the docker / CI container case): not hidden.
+    assert!(!mountinfo_proc_hides_other_uids(&line("rw")));
+    assert!(!mountinfo_proc_hides_other_uids(&line("rw,hidepid=0")));
+    assert!(!mountinfo_proc_hides_other_uids(&line("rw,hidepid=off")));
+    // systemd ProtectProc=invisible, and the other hiding modes.
+    for mode in ["invisible", "2", "noaccess", "1", "ptraceable", "4"] {
+        assert!(
+            mountinfo_proc_hides_other_uids(&line(&format!("rw,hidepid={mode}"))),
+            "{mode}"
+        );
+    }
+    // The topmost /proc mount decides: a hidepid mount stacked over a plain
+    // one hides, a plain one stacked over a hidepid one does not.
+    let stacked = |a: &str, b: &str| {
+        format!(
+            "25 1 0:23 / /proc rw - proc proc {a}\n\
+             90 25 0:50 / /proc rw - proc proc {b}\n"
+        )
+    };
+    assert!(mountinfo_proc_hides_other_uids(&stacked(
+        "rw",
+        "rw,hidepid=invisible"
+    )));
+    assert!(!mountinfo_proc_hides_other_uids(&stacked(
+        "rw,hidepid=invisible",
+        "rw"
+    )));
+    // Not /proc, or not procfs: ignored. Nothing parseable: not hidden.
+    assert!(!mountinfo_proc_hides_other_uids(
+        "30 1 0:23 / /mnt/proc rw - proc proc rw,hidepid=2\n"
+    ));
+    assert!(!mountinfo_proc_hides_other_uids(
+        "30 1 0:23 / /proc rw - tmpfs tmpfs rw,hidepid=2\n"
+    ));
+    assert!(!mountinfo_proc_hides_other_uids(""));
+    assert!(!mountinfo_proc_hides_other_uids("garbage line"));
+}
+
+/// Resolves nothing, but records every binary it was asked for — proof an
+/// engine was never even looked up.
+#[derive(Default)]
+struct RecordingResolver(std::sync::Mutex<Vec<String>>);
+
+impl EngineResolver for RecordingResolver {
+    fn native(&self, binary: &str) -> Option<PathBuf> {
+        self.0.lock().unwrap().push(binary.to_string());
+        None
+    }
+    fn in_wsl(&self, _binary: &str) -> bool {
+        false
+    }
+}
+
+/// I-7 regression: where another uid could read `/proc/<pid>/cmdline`
+/// (T1 without hidepid), an engine taking the prompt as `-p <prompt>` never
+/// starts — new run or resume, in-process or persistent — and its row says
+/// why. Before the fix a T1 `chi_run {engineId:"pi"}` spawned `pi -p
+/// <prompt>`, readable by every other principal on the host.
+#[tokio::test]
+async fn argv_prompt_engines_are_refused_where_proc_is_not_hidden() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let db = Arc::new(test_db().await);
+    let resolver = Arc::new(RecordingResolver::default());
+    let mut env = ChiEnv::new(
+        db.clone(),
+        root.join("chi-cache"),
+        Arc::new(ChiRuntime::new()),
+    );
+    env.files = OutputFiles::InCacheDir;
+    env.cwd_expansion = CwdExpansion::TildeOnly;
+    env.prompt_in_argv = PromptInArgv::Refused;
+    env.resolver = resolver.clone();
+
+    for engine in PROMPT_IN_ARGV_ENGINES {
+        for persistent in [false, true] {
+            let mut o = opts(engine, "ADA-PRIVATE payroll", Some("/tmp"));
+            o.persistent = persistent;
+            let err = spawn_run(&env, &NoInProcessEngines, o, "cli")
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err, prompt_in_argv_refusal(engine), "{engine}");
+            assert!(
+                !err.contains("ADA-PRIVATE"),
+                "the refusal never echoes the prompt"
+            );
+        }
+        let rows = cache_list(&db, Some(engine), 10).await.unwrap();
+        assert_eq!(rows.len(), 2, "{engine}");
+        for row in &rows {
+            assert_eq!(row.status, "failed", "{engine}");
+            assert_eq!(
+                row.error.as_deref(),
+                Some(prompt_in_argv_refusal(engine).as_str())
+            );
+        }
+
+        // A resumable row of that engine is refused too, and left alone.
+        let resume_id = format!("planted-{engine}");
+        let mut o = opts(engine, "x", None);
+        o.resume_session_id = Some("sess-1".into());
+        cache_insert(&db, &resume_id, &o, &env.run_output_path(&resume_id), "cli")
+            .await
+            .unwrap();
+        cache_update_status(&db, &resume_id, "done", None)
+            .await
+            .unwrap();
+        let err = resume_run(
+            &env,
+            &NoInProcessEngines,
+            resume_id.clone(),
+            "secret".into(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err, prompt_in_argv_refusal(engine));
+        assert_eq!(row_status(&db, &resume_id).await, "done", "row untouched");
+    }
+    assert!(
+        resolver.0.lock().unwrap().is_empty(),
+        "no engine binary was even looked up: {:?}",
+        resolver.0.lock().unwrap()
+    );
+}
+
+/// The stdin engines are untouched by the refusal: a claude-code run still
+/// runs to `done` where argv prompts are refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdin_prompt_engines_still_run_where_argv_prompts_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = stub_env(&tmp.path().canonicalize().unwrap());
+    env.prompt_in_argv = PromptInArgv::Refused;
+    let res = spawn_run(
+        &env,
+        &NoInProcessEngines,
+        opts("claude-code", "hello", None),
+        "cli",
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.status, "running");
+    assert!(wait_for(|| async { row_status(&env.db, &res.run_id).await == "done" }).await);
+}
+
+/// Operator-secret regression: the daemon expands only `~` in a run's cwd.
+/// Before the fix `shellexpand::full` resolved `$VAR` against the daemon's
+/// own environment — which carries every `IKENGA_SECRET_*` operator default —
+/// and the value went into codex's `--cd` argv and the runner's conf file,
+/// handing a Dispatch-only caller what needs Secrets. `$HOME` / `$PATH`
+/// stand in for the secret (same mechanism, no process-env mutation).
+#[test]
+fn the_daemon_expands_only_tilde_in_a_run_cwd() {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let path = std::env::var("PATH").expect("PATH is set");
+    let mut env = ChiEnv::new(
+        Arc::new(PaDb::new(std::env::temp_dir().join("unused.db"))),
+        std::env::temp_dir().join("chi-cache"),
+        Arc::new(ChiRuntime::new()),
+    );
+    env.cwd_expansion = CwdExpansion::TildeOnly;
+
+    for (asked, want) in [
+        (
+            "$IKENGA_SECRET_DEMO_KEY",
+            "$IKENGA_SECRET_DEMO_KEY".to_string(),
+        ),
+        ("$PATH", "$PATH".to_string()),
+        ("/w/${PATH}/x", "/w/${PATH}/x".to_string()),
+        ("$HOME/proj", "$HOME/proj".to_string()),
+        ("~/proj", format!("{home}/proj")),
+        ("~", home.clone()),
+        ("/abs/dir", "/abs/dir".to_string()),
+    ] {
+        assert_eq!(env.run_cwd(Some(asked)), want, "{asked}");
+    }
+
+    // End to end into the engine argv: codex's `--cd` is the literal cwd.
+    let cwd = env.run_cwd(Some("$PATH"));
+    let cmd = build_engine_command_with(
+        &FakeResolver::native(&["codex"]),
+        "codex",
+        "x",
+        &cwd,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let args = args_of(&cmd);
+    let cd = args.iter().position(|a| a == "--cd").unwrap();
+    assert_eq!(args[cd + 1], "$PATH");
+    assert!(
+        !args.iter().any(|a| a.contains(&path)),
+        "no environment value reaches the argv: {args:?}"
+    );
+
+    // The desktop keeps its historical full expansion.
+    let desktop = ChiEnv::new(env.db.clone(), env.cache_dir.clone(), env.runtime.clone());
+    assert_eq!(desktop.cwd_expansion, CwdExpansion::Full);
+    assert_eq!(desktop.prompt_in_argv, PromptInArgv::Allowed);
+    assert_eq!(desktop.run_cwd(Some("$HOME/proj")), format!("{home}/proj"));
 }

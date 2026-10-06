@@ -96,7 +96,7 @@ Then sign in as that admin in a browser, at the address the server is reachable 
 
 If the service fails to start, run the `probe` line again. The server never falls back to a weaker mode: a failed probe means it stops.
 
-The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
+The unit differs from the T0 one in five ways (§8 "Deploy consequence", plus the WP-P10 `/proc` rule):
 
 - **Root, with a cut capability set.** `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL CAP_DAC_OVERRIDE CAP_FOWNER`, and `NoNewPrivileges=true`. The broker's boot probe refuses to start without root and the first four. It also does a real test drop to the reserved probe uid. Only auth, the reverse proxy and the per-principal child launch run as root. Every RPC, terminal and engine runs inside a child that has already dropped to that person's uid.
 - **Writable paths.** `ProtectSystem=strict` with `ReadWritePaths=/opt/ikenga/data /etc`.
@@ -104,6 +104,7 @@ The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
   - To keep `/etc` read-only, pre-create users yourself, set `IKENGA_PROVISIONING=external`, map each account with `accounts create <name> --adopt-unix-user <user>`, and drop `/etc` from the line.
 - **Adopted homes.** An adopted account (below) keeps its existing passwd home. Add that home to `ReadWritePaths`.
 - **`KillMode=process`.** This is the detached chi-runner fix (§9.4, owed by WP-18b), explained in the next section.
+- **`ProtectProc=invisible`.** `/proc` is mounted `hidepid=invisible`, so a person's processes can't see anyone else's. The Chi engines `pi`, `opencode` and `antigravity-cli` take the prompt as a command-line argument, which any user can otherwise read from `/proc/<pid>/cmdline` (I-7). Under T1 the server checks this at run time: where `/proc` is not `hidepid` (a kernel older than 5.8, or a container such as the Docker deploy, which can't remount `/proc` without `CAP_SYS_ADMIN`), it refuses runs of those three engines. `claude-code` and `codex` take the prompt on stdin and always run.
 
 ### Detached chi-runners survive a restart
 

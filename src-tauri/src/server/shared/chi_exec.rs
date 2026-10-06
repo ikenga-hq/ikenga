@@ -221,10 +221,122 @@ pub(crate) struct ChiEnv {
     /// must stay inside `cache_dir` (daemon; `db_exec` can plant rows).
     pub files: OutputFiles,
     pub resolver: Arc<dyn EngineResolver>,
+    /// How a run's `cwd` is expanded (see [`CwdExpansion`]).
+    pub cwd_expansion: CwdExpansion,
+    /// Whether an engine that takes its prompt on the command line may run
+    /// (see [`PromptInArgv`]).
+    pub prompt_in_argv: PromptInArgv,
+}
+
+/// How a run's `cwd` is expanded before it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CwdExpansion {
+    /// `~` and `$VAR`, against this process's environment: the desktop's
+    /// historical behaviour. The desktop user owns that environment.
+    Full,
+    /// `~` only (the daemon). The daemon's environment carries operator
+    /// credentials — every `IKENGA_SECRET_*` default — that a caller holding
+    /// only Dispatch must not read (they need Secrets, `secrets_get`), and a
+    /// run's cwd reaches the engine's argv (codex `--cd`) and the detached
+    /// runner's conf file. A `$` in a daemon-supplied cwd stays literal.
+    TildeOnly,
+}
+
+/// Whether an engine that takes its prompt as a command-line argument
+/// ([`prompt_rides_argv`]) may run here.
+///
+/// On Linux any uid can read any process's argv from `/proc/<pid>/cmdline`
+/// unless `/proc` is mounted `hidepid`. On the desktop and under T0 the only
+/// principal is the operator, so that is the desktop's status quo. Under T1
+/// another principal on the same host could read the prompt (I-7), so such
+/// engines run only when `/proc` hides other uids' processes (the T1 unit's
+/// `ProtectProc=invisible`). claude-code and codex take the prompt on stdin
+/// and are never affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptInArgv {
+    Allowed,
+    /// Refused: another uid on this host could read the prompt.
+    Refused,
+}
+
+/// Engines whose prompt is a command-line argument (`-p <prompt>`), in
+/// [`build_engine_command_with`] and in the detached `chi-runner`.
+/// `prompt_in_argv_matches_the_engine_commands` keeps this list honest.
+pub(crate) const PROMPT_IN_ARGV_ENGINES: &[&str] = &["antigravity-cli", "opencode", "pi"];
+
+/// Whether `engine_id` takes its prompt on the command line.
+pub(crate) fn prompt_rides_argv(engine_id: &str) -> bool {
+    PROMPT_IN_ARGV_ENGINES.contains(&engine_id)
+}
+
+/// The daemon's [`PromptInArgv`]: allowed under T0 (the desktop's
+/// behaviour), above T0 only when `/proc` hides other uids' processes.
+pub(crate) fn prompt_in_argv_policy(
+    tier: ExecutorTier,
+    proc_hides_other_uids: bool,
+) -> PromptInArgv {
+    if tier == ExecutorTier::T0 || proc_hides_other_uids {
+        PromptInArgv::Allowed
+    } else {
+        PromptInArgv::Refused
+    }
+}
+
+/// Whether the `/proc` this process sees is mounted `hidepid` (any mode but
+/// `off`/`0`), from `/proc/self/mountinfo` text: the last `proc` mount on
+/// `/proc` is the one on top. `noaccess`/`1`, `invisible`/`2` and
+/// `ptraceable`/`4` all deny another uid `/proc/<pid>/cmdline`. (A `gid=`
+/// exemption group is irrelevant to T1: principal processes hold no
+/// supplementary groups.)
+pub(crate) fn mountinfo_proc_hides_other_uids(mountinfo: &str) -> bool {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (pre, post) = line.split_once(" - ")?;
+            let mount_point = pre.split_whitespace().nth(4)?;
+            let mut post = post.split_whitespace();
+            let fstype = post.next()?;
+            let _source = post.next()?;
+            let super_opts = post.next().unwrap_or("");
+            (mount_point == "/proc" && fstype == "proc").then_some(super_opts)
+        })
+        .last()
+        .is_some_and(|opts| {
+            opts.split(',').any(|o| {
+                o.strip_prefix("hidepid=")
+                    .is_some_and(|v| v != "0" && v != "off")
+            })
+        })
+}
+
+/// [`mountinfo_proc_hides_other_uids`] for this process. `false` (not
+/// hidden) wherever it can't be read, and off Linux.
+pub(crate) fn proc_hides_other_uids() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|m| mountinfo_proc_hides_other_uids(&m))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// The refusal for an argv-prompt engine where [`PromptInArgv::Refused`].
+pub(crate) fn prompt_in_argv_refusal(engine_id: &str) -> String {
+    format!(
+        "engine {engine_id} takes its prompt on the command line, which other users on this \
+         host can read from /proc/<pid>/cmdline; under a multi-user executor tier it runs only \
+         when /proc is mounted hidepid (systemd ProtectProc=invisible). claude-code and codex \
+         take the prompt on stdin and are not affected"
+    )
 }
 
 impl ChiEnv {
-    /// The desktop's shape: no default cwd, stored output paths, host PATH.
+    /// The desktop's shape: no default cwd, stored output paths, host PATH,
+    /// full cwd expansion, argv prompts allowed.
     #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
     pub(crate) fn new(db: Arc<PaDb>, cache_dir: PathBuf, runtime: Arc<ChiRuntime>) -> Self {
         Self {
@@ -234,6 +346,18 @@ impl ChiEnv {
             default_cwd: None,
             files: OutputFiles::AsStored,
             resolver: Arc::new(HostResolver),
+            cwd_expansion: CwdExpansion::Full,
+            prompt_in_argv: PromptInArgv::Allowed,
+        }
+    }
+
+    /// `Err` when `engine_id` would put its prompt where another uid could
+    /// read it (see [`PromptInArgv`]).
+    fn check_prompt_in_argv(&self, engine_id: &str) -> Result<(), String> {
+        if self.prompt_in_argv == PromptInArgv::Refused && prompt_rides_argv(engine_id) {
+            Err(prompt_in_argv_refusal(engine_id))
+        } else {
+            Ok(())
         }
     }
 
@@ -247,8 +371,9 @@ impl ChiEnv {
     }
 
     /// cwd for a run: the caller's, else the surface default, else the
-    /// process cwd, else `.`; `~` / `$VAR` expanded as the desktop always has.
-    fn run_cwd(&self, requested: Option<&str>) -> String {
+    /// process cwd, else `.`; expanded per [`CwdExpansion`] (`~` / `$VAR` on
+    /// the desktop as it always has, `~` only on the daemon).
+    pub(crate) fn run_cwd(&self, requested: Option<&str>) -> String {
         let cwd = requested
             .map(str::to_string)
             .or_else(|| {
@@ -262,9 +387,12 @@ impl ChiEnv {
                     .map(|p| p.to_string_lossy().to_string())
             })
             .unwrap_or_else(|| ".".to_string());
-        shellexpand::full(&cwd)
-            .map(|c| c.into_owned())
-            .unwrap_or(cwd)
+        match self.cwd_expansion {
+            CwdExpansion::Full => shellexpand::full(&cwd)
+                .map(|c| c.into_owned())
+                .unwrap_or(cwd),
+            CwdExpansion::TildeOnly => shellexpand::tilde(&cwd).into_owned(),
+        }
     }
 }
 
@@ -1533,6 +1661,18 @@ pub(crate) async fn spawn_run(
         return engines.start(env, run_id, output_path, &opts, cwd).await;
     }
 
+    // An engine that would put the prompt in its argv where another uid can
+    // read it never starts — neither in-process nor through the detached
+    // chi-runner (which builds the same `-p <prompt>` argv). Fail-closed, the
+    // row says why.
+    if let Err(refusal) = env.check_prompt_in_argv(&opts.engine_id) {
+        tracing::warn!(target: "ikenga::chi", "chi run {run_id}: {refusal}");
+        cache_update_done(&env.db, &run_id, "failed", Some(&refusal), false, None)
+            .await
+            .ok();
+        return Err(refusal);
+    }
+
     // ── Persistent (detached chi-runner) path ────────────────────────────────
     // Try this first so we never spawn a redundant in-process child. When it
     // can't run, the in-process fallback is NOT durable, and the caller asked
@@ -1625,6 +1765,9 @@ pub(crate) async fn resume_run(
     let mut row = cache_get(&env.db, &run_id)
         .await?
         .ok_or_else(|| format!("chi run not found: {run_id}"))?;
+
+    // Same refusal as `spawn_run`, before anything about the row changes.
+    env.check_prompt_in_argv(&row.engine_id)?;
 
     // The output file this turn will write. On the daemon a row's path is
     // confined to the cache dir before anything reads or writes it: `db_exec`

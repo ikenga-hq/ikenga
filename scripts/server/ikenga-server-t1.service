@@ -102,6 +102,17 @@ ProtectHome=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+# hidepid=invisible /proc for the broker and everything under it: a
+# principal's processes can't see another principal's, so a Chi engine that
+# takes its prompt on the command line (pi, opencode, antigravity-cli:
+# `-p <prompt>`) doesn't publish it to every uid via /proc/<pid>/cmdline
+# (I-7). Principal children check this at run time and REFUSE those engines
+# when /proc is not hidepid (an old kernel, a container), so dropping this
+# line only disables them. Safe for the broker: it reads no other uid's
+# /proc/<pid> (child liveness is waitpid, the port check is /proc/net/tcp);
+# the uid-wide sweep on `accounts disable` runs from the root CLI, outside
+# this unit's mount namespace.
+ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true

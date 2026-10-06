@@ -147,6 +147,11 @@ fn accounts(root: &Path, range: &str, args: &[&str], stdin: &str) {
 }
 
 fn start_broker(tmp: &Path, root: &Path, range: &str) -> Broker {
+    start_broker_with_env(tmp, root, range, &[])
+}
+
+/// [`start_broker`] with extra environment for the broker process.
+fn start_broker_with_env(tmp: &Path, root: &Path, range: &str, env: &[(&str, &str)]) -> Broker {
     let log = tmp.join("broker.log");
     let child = Command::new(bin())
         .args([
@@ -167,6 +172,7 @@ fn start_broker(tmp: &Path, root: &Path, range: &str) -> Broker {
         .env_remove("IKENGA_DATA_DIR")
         .env_remove("IKENGA_AUTH_TOKEN")
         .env("RUST_LOG", "info")
+        .envs(env.iter().copied())
         .stdout(File::create(&log).unwrap())
         .stderr(File::create(tmp.join("broker.err")).unwrap())
         .spawn()
@@ -630,6 +636,150 @@ fn t1_root_broker_chi_runs_are_per_principal() {
 
         let (_, health) = get_json(&broker, "/api/health", None).await;
         assert_eq!(health["executor"]["principal_isolation"], true, "{health}");
+    });
+    drop(broker);
+    drop(users);
+}
+
+/// Whether this mount namespace's `/proc` is `hidepid` (the topmost `proc`
+/// mount on `/proc`, any mode but off) — the broker's principal children see
+/// the same `/proc`, and run argv-prompt engines only when it is.
+fn proc_is_hidepid() -> bool {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (pre, post) = l.split_once(" - ")?;
+            let mut post = post.split_whitespace();
+            (pre.split_whitespace().nth(4) == Some("/proc") && post.next() == Some("proc"))
+                .then(|| post.nth(1).unwrap_or("").to_string())
+        })
+        .last()
+        .is_some_and(|o| {
+            o.split(',')
+                .any(|o| o.starts_with("hidepid=") && o != "hidepid=0" && o != "hidepid=off")
+        })
+}
+
+/// An executable owned by the principal in `home/.local/bin` (on the
+/// child's PATH under T1).
+fn install_principal_stub(home: &Path, name: &str, script: &str) {
+    let meta = std::fs::metadata(home).unwrap();
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(name);
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for p in [home.join(".local"), bin, path] {
+        std::os::unix::fs::chown(&p, Some(meta.uid()), Some(meta.gid())).unwrap();
+    }
+}
+
+/// WP-P10 review regressions, on a real broker:
+///
+/// - **I-7, prompt in argv.** `pi`/`opencode`/`antigravity-cli` take the
+///   prompt as `-p <prompt>`, readable by every uid from
+///   `/proc/<pid>/cmdline` unless `/proc` is `hidepid`. Where it is not
+///   (this container), the run is refused before anything spawns; where it
+///   is (the T1 unit's `ProtectProc=invisible`), it runs.
+/// - **Operator secrets via cwd.** A `cwd` of `$IKENGA_SECRET_DEMO_KEY` is
+///   not expanded against the principal child's environment (which holds
+///   the operator default): codex gets the literal string as `--cd`.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_broker_chi_prompts_and_operator_secrets_stay_private() {
+    assert!(is_root(), "t1-root tests run as root");
+    const SECRET: &str = "operator-default-sk-DEMO123";
+    const PROMPT: &str = "ADA-PRIVATE: payroll export for Q3";
+    let users = HostUsers(vec!["ik-t1chp-ada".into()]);
+    let tmp = TempDir::new("chi-private");
+    let root = tmp.0.join("root");
+    let range = "28240-28250";
+    accounts(
+        &root,
+        range,
+        &["create", "t1chp-ada", "--admin", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    let ada_id = account_id(&root, range, "t1chp-ada");
+    let ada_home = root.join("principals").join(&ada_id).join("home");
+    let broker = start_broker_with_env(&tmp.0, &root, range, &[("IKENGA_SECRET_DEMO_KEY", SECRET)]);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ada = login(&broker, "t1chp-ada", PASSWORD).await;
+        let r = rpc(&broker, &ada, "os_username", json!({})).await;
+        assert_eq!(r["ok"], true, "{r}");
+        install_principal_stub(
+            &ada_home,
+            "pi",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/pi-argv.txt\"\n",
+        );
+        install_principal_stub(
+            &ada_home,
+            "codex",
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/codex-argv.txt.tmp"
+mv "$HOME/codex-argv.txt.tmp" "$HOME/codex-argv.txt"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"t1"}'
+echo '{"type":"turn.completed","usage":{}}'
+"#,
+        );
+
+        // I-7: the argv-prompt engine.
+        let run = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "pi", "prompt": PROMPT } }),
+        )
+        .await;
+        if proc_is_hidepid() {
+            assert_eq!(run["ok"], true, "hidepid /proc: argv engines run: {run}");
+        } else {
+            assert_eq!(run["ok"], false, "{run}");
+            let e = run["error"].as_str().unwrap();
+            assert!(e.contains("takes its prompt on the command line"), "{e}");
+            assert!(!e.contains("ADA-PRIVATE"), "{e}");
+            let list = rpc(&broker, &ada, "chi_list", json!({ "engineId": "pi" })).await;
+            assert_eq!(list["data"][0]["status"], "failed", "{list}");
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                !ada_home.join("pi-argv.txt").exists(),
+                "the refused engine never ran"
+            );
+        }
+
+        // Operator secret: the cwd stays literal all the way into the argv.
+        let run = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": {
+                "engineId": "codex", "prompt": "x", "cwd": "$IKENGA_SECRET_DEMO_KEY",
+            } }),
+        )
+        .await;
+        assert_eq!(run["ok"], true, "{run}");
+        let argv_file = ada_home.join("codex-argv.txt");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !argv_file.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "codex never ran: {}",
+                broker.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains(SECRET),
+            "the operator secret reached the engine argv"
+        );
+        let args: Vec<&str> = argv.lines().collect();
+        let cd = args.iter().position(|a| *a == "--cd").expect("--cd");
+        assert_eq!(args[cd + 1], "$IKENGA_SECRET_DEMO_KEY");
     });
     drop(broker);
     drop(users);

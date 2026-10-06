@@ -340,7 +340,10 @@ pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcRespo
 // deltas: a run naming no cwd starts in the router home (the principal's
 // home under T1) instead of the process cwd; output paths are confined to the
 // cache dir; the in-process `openrouter` engine is refused (it needs the
-// desktop's engine registry + vault).
+// desktop's engine registry + vault); a cwd gets `~` expansion only, never
+// `$VAR` (the daemon's env holds operator secrets); and above T0 the
+// argv-prompt engines (pi, opencode, antigravity-cli) are refused unless
+// `/proc` is hidepid (I-7).
 
 /// The Chi write arms' process state, held in `AppState::chi`: the live-run
 /// registry `chi_cancel` reaches in-process runs through, and where engine
@@ -360,12 +363,19 @@ impl DaemonChi {
 }
 
 /// The daemon's [`chi_exec::ChiEnv`]: `--data-dir`'s db and chi-cache, the
-/// router home as the default cwd, output files confined to the cache dir.
+/// router home as the default cwd, output files confined to the cache dir,
+/// `~`-only cwd expansion (this process's env holds the operator's
+/// `IKENGA_SECRET_*` defaults), and — above T0 — argv-prompt engines only
+/// where `/proc` hides other uids' processes.
 fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
     let db = state
         .pa_db
         .clone()
         .ok_or_else(|| super::rpc::NO_DB.to_string())?;
+    let prompt_in_argv = chi_exec::prompt_in_argv_policy(
+        crate::executor::current().tier(),
+        chi_exec::proc_hides_other_uids(),
+    );
     Ok(chi_exec::ChiEnv {
         db,
         cache_dir: chi_cache_dir(state)?,
@@ -373,6 +383,8 @@ fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
         default_cwd: state.home.clone(),
         files: OutputFiles::InCacheDir,
         resolver: state.chi.resolver.clone(),
+        cwd_expansion: chi_exec::CwdExpansion::TildeOnly,
+        prompt_in_argv,
     })
 }
 
@@ -2709,6 +2721,40 @@ mod tests {
                 assert_eq!(rows.len(), 1, "{engine}");
                 assert_eq!(rows[0]["status"], "failed", "{engine}");
             }
+        }
+
+        /// A `cwd` sent to the daemon is never `$VAR`-expanded against the
+        /// daemon's own environment (which holds the operator's
+        /// `IKENGA_SECRET_*` defaults): `<home>/$HOME` is that literal
+        /// directory. Before the fix it became `<home>/<the daemon's HOME>`,
+        /// which does not exist, and the run failed to start.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_daemon_run_cwd_is_not_expanded_against_the_daemon_env() {
+            let d = chi_daemon();
+            let r = &d.router;
+            let literal = d.home.join("$HOME");
+            std::fs::create_dir_all(&literal).unwrap();
+            let started = ok(
+                r,
+                "chi_run",
+                json!({ "opts": {
+                    "engineId": "claude-code",
+                    "prompt": "hello",
+                    "cwd": literal.to_string_lossy(),
+                } }),
+            )
+            .await;
+            let run_id = started["run_id"].as_str().unwrap().to_string();
+            assert!(wait_for(|| async { status_of(r, &run_id).await["status"] == "done" }).await);
+            let out = status_of(r, &run_id).await["output"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                out.contains(&format!("cwd={} ", literal.display())),
+                "the engine ran in the literal directory: {out}"
+            );
         }
 
         /// The whole loop a bridge drives: run → status → list → resume →
