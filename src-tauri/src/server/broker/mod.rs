@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{any, get, post};
@@ -215,9 +215,11 @@ pub fn router(
     Router::new()
         .merge(public)
         .merge(protected)
-        .fallback(move |uri: Uri| {
+        // With the request headers, so the broker gzips like the T0 daemon
+        // and refuses a non-`/sw.js` service-worker install the same way.
+        .fallback(move |uri: Uri, headers: HeaderMap| {
             let spa = spa.clone();
-            async move { spa.handle(uri).await }
+            async move { spa.handle_with(uri, &headers).await }
         })
         .layer(auth_layer)
         .layer(middleware::from_fn_with_state(
