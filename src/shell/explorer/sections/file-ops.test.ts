@@ -31,8 +31,10 @@ import {
 	createFolder,
 	filesMenuDisabled,
 	joinPath,
+	moveEntry,
 	nameError,
 	renameEntry,
+	resolveTarget,
 	trashEntry,
 	trashServed,
 } from './file-ops';
@@ -120,8 +122,32 @@ describe('renameEntry', () => {
 		await expect(renameEntry('/r/a.ts', 'b.ts')).rejects.toThrow('“b.ts” already exists here.');
 	});
 
-	it('refuses a name with a separator (that would be a move)', async () => {
-		await expect(renameEntry('/r/a.ts', 'sub/b.ts')).rejects.toThrow(/can’t contain/);
+	// Regression (F2): a path in the new name used to be refused outright,
+	// so there was no way to move a file at all.
+	it('a path in the new name moves the entry, relative to its folder', async () => {
+		h.fsRename.mockResolvedValue('/r/newdir/renamed.txt');
+		await expect(renameEntry('/r/a.txt', 'newdir/renamed.txt')).resolves.toBe(
+			'/r/newdir/renamed.txt'
+		);
+		expect(h.fsRename).toHaveBeenCalledWith('/r/a.txt', 'renamed.txt', '/r/newdir');
+		h.fsRename.mockResolvedValue('/x.txt');
+		await renameEntry('/r/sub/a.txt', '../../x.txt');
+		expect(h.fsRename).toHaveBeenLastCalledWith('/r/sub/a.txt', 'x.txt', '/');
+	});
+
+	it('a Move… path is relative to the given base; a leading / is absolute', async () => {
+		h.fsRename.mockResolvedValue('/r/lib/a.ts');
+		await renameEntry('/r/src/a.ts', 'lib/a.ts', '/r');
+		expect(h.fsRename).toHaveBeenLastCalledWith('/r/src/a.ts', 'a.ts', '/r/lib');
+		h.fsRename.mockResolvedValue('/elsewhere/a.ts');
+		await renameEntry('/r/src/a.ts', '/elsewhere/a.ts', '/r');
+		expect(h.fsRename).toHaveBeenLastCalledWith('/r/src/a.ts', 'a.ts', '/elsewhere');
+	});
+
+	it('refuses a bad last segment, a backslash or a trailing slash', async () => {
+		for (const bad of ['sub/..', 'sub/', 'a\\b', 'sub/.']) {
+			await expect(renameEntry('/r/a.ts', bad)).rejects.toThrow();
+		}
 		expect(h.fsRename).not.toHaveBeenCalled();
 	});
 
@@ -154,7 +180,73 @@ describe('renameEntry', () => {
 	});
 });
 
+describe('moveEntry', () => {
+	it('moves into another folder, keeping the name', async () => {
+		h.fsRename.mockResolvedValue('/r/newdir/a.ts');
+		await expect(moveEntry('/r/a.ts', '/r/newdir')).resolves.toBe('/r/newdir/a.ts');
+		expect(h.fsRename).toHaveBeenCalledWith('/r/a.ts', 'a.ts', '/r/newdir');
+	});
+
+	it('refuses to move a folder into itself or below itself', async () => {
+		await expect(moveEntry('/r/src', '/r/src')).rejects.toThrow(/into itself/);
+		await expect(moveEntry('/r/src', '/r/src/inner')).rejects.toThrow(/into itself/);
+		expect(h.fsRename).not.toHaveBeenCalled();
+	});
+
+	it('the same folder and name is a no-op', async () => {
+		await expect(moveEntry('/r/a.ts', '/r')).resolves.toBe('/r/a.ts');
+		expect(h.fsRename).not.toHaveBeenCalled();
+	});
+
+	it('says plainly when the name is taken in the target folder', async () => {
+		h.fsRename.mockRejectedValue(new Error('destination exists: /r/newdir/a.ts'));
+		await expect(moveEntry('/r/a.ts', '/r/newdir')).rejects.toThrow(
+			'“a.ts” already exists in newdir.'
+		);
+	});
+
+	it('refuses while the entry has unsaved edits', async () => {
+		useEditingStore.getState().upsert(sessionKey('/r/a.ts', 'p1'), {
+			path: '/r/a.ts',
+			paneId: 'p1',
+			mounted: true,
+			editing: true,
+			dirty: true,
+		});
+		await expect(moveEntry('/r/a.ts', '/r/newdir')).rejects.toThrow(SAVE_OR_DISCARD_FIRST);
+		expect(h.fsRename).not.toHaveBeenCalled();
+	});
+
+	it('a server that ignored the folder (renamed in place) is reported, not called a move', async () => {
+		h.fsRename.mockResolvedValue('/r/a.ts');
+		await expect(moveEntry('/r/a.ts', '/r/newdir')).rejects.toThrow(/can’t move files yet/);
+	});
+});
+
+describe('resolveTarget', () => {
+	it('folds . and .. and keeps a bare name in place', () => {
+		expect(resolveTarget('/r/src', 'a.ts')).toEqual({ dir: '/r/src', name: 'a.ts' });
+		expect(resolveTarget('/r/src', './x/../y/a.ts')).toEqual({ dir: '/r/src/y', name: 'a.ts' });
+		expect(resolveTarget('/r', '/../a')).toHaveProperty('error');
+	});
+});
+
 describe('Move to Trash — desktop and browser', () => {
+	// Regression: trash did not check for unsaved edits, so an open draft was
+	// left with no file behind it.
+	it('refuses while the file, or anything under a folder, has unsaved edits', async () => {
+		useEditingStore.getState().upsert(sessionKey('/r/src/plan.md', 'p1'), {
+			path: '/r/src/plan.md',
+			paneId: 'p1',
+			mounted: false,
+			dirty: true,
+			stash: { draft: 'x', base: 'y', meta: { eol: '\n', bom: false } },
+		});
+		await expect(trashEntry('/r/src/plan.md')).rejects.toThrow(SAVE_OR_DISCARD_FIRST);
+		await expect(trashEntry('/r/src')).rejects.toThrow(SAVE_OR_DISCARD_FIRST);
+		expect(h.fsTrash).not.toHaveBeenCalled();
+	});
+
 	it('is served on the desktop', async () => {
 		expect(trashServed()).toBe(true);
 		expect(filesMenuDisabled('delete')).toBeUndefined();

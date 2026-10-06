@@ -70,7 +70,7 @@ import { sessionKey, useEditingStore } from '@/lib/editing/editing-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import * as cmd from '@/lib/tauri-cmd';
 import { usePendingCreate } from './file-ops';
-import { FilesSection } from './files';
+import { FILE_DRAG_MIME, FilesSection } from './files';
 
 const fs = vi.mocked(cmd);
 
@@ -283,7 +283,94 @@ describe('Rename', () => {
 	});
 });
 
+// Regression (F2 "rename / move"): there was no way to move a file — a path
+// in Rename was refused, dragging onto a folder did nothing, and the context
+// menu had no Move item.
+describe('Move', () => {
+	function dataTransfer(path?: string) {
+		const store: Record<string, string> = path ? { [FILE_DRAG_MIME]: path } : {};
+		return {
+			get types() {
+				return Object.keys(store);
+			},
+			getData: (t: string) => store[t] ?? '',
+			setData: (t: string, v: string) => {
+				store[t] = v;
+			},
+			dropEffect: 'none',
+			effectAllowed: 'all',
+		};
+	}
+
+	it('a path in Rename moves the file into that folder', async () => {
+		fs.fsRename.mockResolvedValue('/root/src/renamed.json');
+		renderFiles();
+		const r = await row('/root/package.json');
+		fireEvent.click(within(r).getByLabelText('Rename'));
+		await typeAndEnter(within(r).getByRole('textbox'), 'src/renamed.json');
+		await waitFor(() =>
+			expect(fs.fsRename).toHaveBeenCalledWith('/root/package.json', 'renamed.json', '/root/src')
+		);
+		expect(screen.queryByRole('alert')).toBeNull();
+	});
+
+	it('Move… in the context menu edits the path from the project folder', async () => {
+		fs.fsRename.mockResolvedValue('/root/src/package.json');
+		renderFiles();
+		const r = await row('/root/package.json');
+		fireEvent.contextMenu(r);
+		fireEvent.click(await screen.findByRole('menuitem', { name: /Move…/ }));
+		const input = (await within(r).findByRole('textbox')) as HTMLInputElement;
+		expect(input.value).toBe('package.json');
+		await typeAndEnter(input, 'src/package.json');
+		await waitFor(() =>
+			expect(fs.fsRename).toHaveBeenCalledWith('/root/package.json', 'package.json', '/root/src')
+		);
+	});
+
+	it('dragging a file onto a folder moves it there', async () => {
+		fs.fsRename.mockResolvedValue('/root/src/package.json');
+		renderFiles();
+		const file = await row('/root/package.json');
+		const folder = await row('/root/src');
+		const dt = dataTransfer();
+		fireEvent.dragStart(file, { dataTransfer: dt });
+		expect(dt.getData(FILE_DRAG_MIME)).toBe('/root/package.json');
+		fireEvent.dragOver(folder, { dataTransfer: dt });
+		fireEvent.drop(folder, { dataTransfer: dt });
+		await waitFor(() =>
+			expect(fs.fsRename).toHaveBeenCalledWith('/root/package.json', 'package.json', '/root/src')
+		);
+	});
+
+	it('dropping a file back into its own folder does nothing', async () => {
+		renderFiles();
+		const file = await row('/root/package.json');
+		fireEvent.drop(file, { dataTransfer: dataTransfer('/root/package.json') });
+		await new Promise((res) => setTimeout(res, 20));
+		expect(fs.fsRename).not.toHaveBeenCalled();
+	});
+});
+
 describe('Move to Trash', () => {
+	// Regression: trash did not check for unsaved edits.
+	it('refuses while the file has unsaved edits, before asking', async () => {
+		useEditingStore.getState().upsert(sessionKey('/root/package.json', 'pane-1'), {
+			path: '/root/package.json',
+			paneId: 'pane-1',
+			mounted: true,
+			editing: true,
+			dirty: true,
+		});
+		renderFiles();
+		const r = await row('/root/package.json');
+		fireEvent.click(within(r).getByLabelText('Move to trash'));
+		expect((await screen.findByRole('alert')).textContent).toContain(
+			'Save or discard changes first.'
+		);
+		expect(fs.fsTrash).not.toHaveBeenCalled();
+	});
+
 	it('desktop: confirms, trashes and refreshes the listing', async () => {
 		renderFiles();
 		const r = await row('/root/package.json');

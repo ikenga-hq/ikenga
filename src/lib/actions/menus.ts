@@ -79,6 +79,9 @@ export const DEFAULT_MENUS: Readonly<Record<string, readonly DefaultMenuEntry[]>
 		i('copy-name'),
 		S,
 		i('rename'),
+		// plans/file-editing F2: into another folder (also by dragging a row
+		// onto a folder, or a path in Rename).
+		i('files.move'),
 		i('delete'),
 	],
 	'files-view': [

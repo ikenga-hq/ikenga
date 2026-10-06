@@ -188,13 +188,15 @@ pub(super) async fn fs_search(state: &AppState, args: &Value) -> RpcResponse {
     respond("fs_search", r)
 }
 
-/// Both ends are resolved through the allowlist; `toName` is a bare basename.
+/// Every end is resolved through the allowlist; `toName` is a bare basename
+/// and the optional `toDir` makes it a move into that folder.
 pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let from: String = targ(args, &["from"])?;
         let to_name: String = targ(args, &["toName", "to_name"])?;
+        let to_dir: Option<String> = targ(args, &["toDir", "to_dir"])?;
         state.path_guard.ready()?;
-        shared_fs::rename(&resolver(state), &from, &to_name).await
+        shared_fs::rename(&resolver(state), &from, &to_name, to_dir.as_deref()).await
     }
     .await;
     respond("fs_rename", r)
@@ -1242,6 +1244,51 @@ mod tests {
         assert!(d.outside.join("secret.txt").exists());
         assert!(!d.outside.join("x.txt").exists());
         assert!(a.join("three.txt").exists());
+    }
+
+    /// plans/file-editing F2: `toDir` moves the entry into another folder,
+    /// with every end held to the allowlist.
+    #[tokio::test]
+    async fn fs_rename_with_to_dir_moves_inside_the_allowlist() {
+        let d = daemon();
+        let r = &d.router;
+        let a = &d.allowed;
+        std::fs::write(a.join("note.txt"), b"n").unwrap();
+        std::fs::create_dir(a.join("newdir")).unwrap();
+        let newdir = s(&a.join("newdir"));
+
+        let args = json!({ "from": s(&a.join("note.txt")), "toName": "moved.txt", "toDir": newdir });
+        let dest = ok(r, "fs_rename", args).await;
+        assert_eq!(dest, s(&a.join("newdir/moved.txt")));
+        assert!(!a.join("note.txt").exists());
+        assert_eq!(std::fs::read(a.join("newdir/moved.txt")).unwrap(), b"n");
+
+        // Destination exists in the target folder.
+        std::fs::write(a.join("other.txt"), b"o").unwrap();
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "moved.txt", "toDir": newdir });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("destination exists"), "{e}");
+
+        // The target must be an existing folder.
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "x.txt", "toDir": s(&a.join("other.txt")) });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("not a folder"), "{e}");
+
+        // A folder cannot move into itself or below itself.
+        std::fs::create_dir(a.join("newdir/inner")).unwrap();
+        for into in [a.join("newdir"), a.join("newdir/inner")] {
+            let args = json!({ "from": newdir, "toName": "newdir", "toDir": s(&into) });
+            let e = err(r, "fs_rename", args).await;
+            assert!(e.contains("into itself"), "{into:?}: {e}");
+        }
+        assert!(a.join("newdir/moved.txt").exists());
+
+        // A target folder outside the allowlist is refused and nothing moves.
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "other.txt", "toDir": s(&d.outside) });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(a.join("other.txt").exists());
+        assert!(!d.outside.join("other.txt").exists());
     }
 
     // ── actions / keybindings ───────────────────────────────────────────────

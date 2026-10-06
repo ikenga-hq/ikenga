@@ -1,13 +1,15 @@
 // Explorer file operations — plans/file-editing Shape 4 (F2).
 //
-// New file, New folder, Rename and Move to Trash, all through the existing
-// `tauri-cmd` fs wrappers. The allowlist is enforced on the other side
+// New file, New folder, Rename / Move and Move to Trash, all through the
+// existing `tauri-cmd` fs wrappers. The allowlist is enforced on the other side
 // (`resolve_allowlisted` on desktop, the daemon's PathGuard in a browser);
 // this module only checks the name and turns the few errors a person can act
 // on into plain sentences. Every other error is shown as given.
 //
-// Move is not here: `fs_rename` takes a bare basename, and there is no
-// `fs_move` verb yet (a founder decision — see the plan's Shape 4).
+// A move is `fs_rename` with a destination folder (`toDir`), on both the
+// desktop and the daemon. It is reached three ways: a rename whose new name
+// holds a path ("newdir/renamed.txt"), the Move… item, and dragging a row onto
+// a folder.
 
 import { create } from 'zustand';
 import { RPC_REQUIREMENTS } from '@/lib/access/rpc-requirements.gen';
@@ -37,6 +39,56 @@ export function nameError(raw: string): string | null {
 
 export function joinPath(dir: string, name: string): string {
 	return dir.endsWith('/') ? `${dir}${name}` : `${dir}/${name}`;
+}
+
+/** The folder holding `path` (no trailing slash). */
+export function dirOf(path: string): string {
+	const p = path.length > 1 ? path.replace(/\/+$/, '') : path;
+	const idx = p.lastIndexOf('/');
+	return idx > 0 ? p.slice(0, idx) : '/';
+}
+
+/** The last segment of `path`. */
+export function baseName(path: string): string {
+	const p = path.length > 1 ? path.replace(/\/+$/, '') : path;
+	return p.slice(p.lastIndexOf('/') + 1);
+}
+
+/**
+ * Where a rename / move input points: `raw` is a bare name, or a path —
+ * relative to `fromDir`, or absolute when it starts with `/`. `.` and `..`
+ * segments are folded here so the name check sees the real last segment; the
+ * allowlist still has the final say on the other side.
+ */
+export function resolveTarget(
+	fromDir: string,
+	raw: string
+): { dir: string; name: string } | { error: string } {
+	const value = raw.trim();
+	if (!value) return { error: 'Enter a name.' };
+	if (value.includes('\\')) return { error: 'A name can’t contain \\.' };
+	if (!value.includes('/')) {
+		const err = nameError(value);
+		return err ? { error: err } : { dir: fromDir, name: value };
+	}
+	const last = value.slice(value.lastIndexOf('/') + 1);
+	if (!last || last === '.' || last === '..') {
+		return { error: 'End the path with a file or folder name.' };
+	}
+	const start = value.startsWith('/') ? [] : fromDir.split('/').filter(Boolean);
+	const parts = [...start];
+	for (const seg of value.split('/')) {
+		if (!seg || seg === '.') continue;
+		if (seg === '..') {
+			if (parts.length === 0) return { error: 'That path leaves the file system root.' };
+			parts.pop();
+		} else parts.push(seg);
+	}
+	const name = parts.pop();
+	if (!name) return { error: 'Enter a name.' };
+	const err = nameError(name);
+	if (err) return { error: err };
+	return { dir: `/${parts.join('/')}`, name };
 }
 
 /**
@@ -82,20 +134,53 @@ export function hasUnsavedEditsUnder(path: string): boolean {
 }
 
 /**
- * Rename `path` to the bare basename `rawName` in the same folder; returns
- * the new path. Refused while an editor holds unsaved edits for it: the
+ * Rename `path` to `raw`; returns the new path. A bare name renames in the
+ * same folder. A path ("newdir/renamed.txt", "../x.txt", or absolute) is
+ * resolved against `base` — the entry's own folder by default — and moves the
+ * entry there (F2). Refused while an editor holds unsaved edits for it: the
  * editor would keep saving to the old path.
  */
-export async function renameEntry(path: string, rawName: string): Promise<string> {
-	const err = nameError(rawName);
+export async function renameEntry(path: string, raw: string, base?: string): Promise<string> {
+	const target = resolveTarget(base ?? dirOf(path), raw);
+	if ('error' in target) throw new Error(target.error);
+	return moveEntry(path, target.dir, target.name);
+}
+
+/**
+ * Move `path` into the folder `destDir`, optionally under a new name; returns
+ * the new path. A target in the entry's own folder is a plain rename.
+ */
+export async function moveEntry(path: string, destDir: string, rawName?: string): Promise<string> {
+	const name = (rawName ?? baseName(path)).trim();
+	const err = nameError(name);
 	if (err) throw new Error(err);
+	const from = path.length > 1 ? path.replace(/\/+$/, '') : path;
+	const dir = destDir.length > 1 ? destDir.replace(/\/+$/, '') : destDir;
+	if (dir === from || dir.startsWith(`${from}/`)) {
+		throw new Error('A folder can’t be moved into itself.');
+	}
 	if (hasUnsavedEditsUnder(path)) throw new Error(SAVE_OR_DISCARD_FIRST);
-	const name = rawName.trim();
+	const sameFolder = dir === dirOf(from);
+	if (sameFolder && name === baseName(from)) return from;
 	try {
-		return await fsRename(path, name);
+		const dest = sameFolder ? await fsRename(from, name) : await fsRename(from, name, dir);
+		// A server that predates `toDir` would rename in place instead; say so
+		// rather than report a move that did not happen.
+		if (!sameFolder && dirOf(dest) === dirOf(from)) {
+			throw new Error('This server can’t move files yet; the item was renamed in place.');
+		}
+		return dest;
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
-		if (msg.includes('destination exists')) throw new Error(`“${name}” already exists here.`);
+		if (msg.includes('destination exists')) {
+			throw new Error(
+				sameFolder
+					? `“${name}” already exists here.`
+					: `“${name}” already exists in ${baseName(dir) || dir}.`
+			);
+		}
+		if (msg.includes('not a folder')) throw new Error(`${baseName(dir) || dir} isn’t a folder.`);
+		if (msg.includes('into itself')) throw new Error('A folder can’t be moved into itself.');
 		throw e instanceof Error ? e : new Error(msg);
 	}
 }
@@ -120,9 +205,12 @@ export function filesMenuDisabled(id: string): string | undefined {
 }
 
 /** Move `path` to the trash. A server that does not run `fs_trash` (an older
- *  daemon) gets a plain sentence instead of the raw RPC error. */
+ *  daemon) gets a plain sentence instead of the raw RPC error. Refused while
+ *  an editor holds unsaved edits for it or anything under it — those edits
+ *  would be left with no file to save to. */
 export async function trashEntry(path: string): Promise<void> {
 	if (!trashServed()) throw new Error(TRASH_UNAVAILABLE_MESSAGE);
+	if (hasUnsavedEditsUnder(path)) throw new Error(SAVE_OR_DISCARD_FIRST);
 	try {
 		await fsTrash(path);
 	} catch (e) {

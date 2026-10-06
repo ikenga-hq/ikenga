@@ -362,9 +362,11 @@ export async function fsTrash(path: string): Promise<void> {
 	return invoke('fs_trash', { path });
 }
 
-/** Rename in place to a new basename. Returns the resolved destination path. */
-export async function fsRename(from: string, toName: string): Promise<string> {
-	return invoke('fs_rename', { from, toName });
+/** Rename to a new basename — in place, or into the folder `toDir` (a move).
+ *  Returns the resolved destination path. `toDir` is only sent when given, so
+ *  a plain rename stays the same call an older daemon understands. */
+export async function fsRename(from: string, toName: string, toDir?: string): Promise<string> {
+	return invoke('fs_rename', toDir === undefined ? { from, toName } : { from, toName, toDir });
 }
 
 export interface FsSearchResult {

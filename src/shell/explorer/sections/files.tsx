@@ -23,10 +23,14 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { fsList, fsSearch, type FileEntry } from '@/lib/tauri-cmd';
 import {
 	type CreateKind,
+	SAVE_OR_DISCARD_FIRST,
 	TRASH_UNAVAILABLE_MESSAGE,
 	createFile,
 	createFolder,
+	dirOf,
 	filesMenuDisabled,
+	hasUnsavedEditsUnder,
+	moveEntry,
 	renameEntry,
 	trashEntry,
 	trashServed,
@@ -121,6 +125,35 @@ function focusSoon(el: HTMLInputElement | null, select = false): () => void {
 
 /** Search results are keyed per root and query; any of them may now be stale. */
 const FS_SEARCH_PREFIX = ['fs', 'search'] as const;
+
+/** Drag payload for a Files row being moved onto a folder (F2). */
+export const FILE_DRAG_MIME = 'application/x-ikenga-file-path';
+
+function isFileDrag(e: React.DragEvent): boolean {
+	return Array.from(e.dataTransfer.types).includes(FILE_DRAG_MIME);
+}
+
+/** The path of `p` relative to `root`, for the Move… input. */
+function relativeTo(root: string, p: string): string {
+	const r = stripTrailingSlash(root);
+	return p.startsWith(`${r}/`) ? p.slice(r.length + 1) : p;
+}
+
+/** After a rename or move: drop the old path from the tree state and refresh
+ *  both folders' listings and any search. */
+function refreshAfterMove(
+	qc: ReturnType<typeof useQueryClient>,
+	from: string,
+	to: string,
+	prune: (paths: string[]) => void
+) {
+	prune([from]);
+	void qc.invalidateQueries({ queryKey: queryKeys.fs.list(parentOf(from)) });
+	if (dirOf(to) !== dirOf(from)) {
+		void qc.invalidateQueries({ queryKey: queryKeys.fs.list(dirOf(to)) });
+	}
+	void qc.invalidateQueries({ queryKey: FS_SEARCH_PREFIX });
+}
 
 interface CreateEntryRowProps {
 	/** The folder to create in, spelled as its listing's query key. */
@@ -270,13 +303,15 @@ function buildMatchSet(matches: readonly string[], rootPath: string): Set<string
 interface TreeNodeProps {
 	entry: FileEntry;
 	depth: number;
+	/** The section root this row sits under — what a Move… path is relative to. */
+	rootPath: string;
 	/** When provided, the tree is in search-filter mode: only entries whose
 	 *  path is in `filter` render, and directories in `filter` auto-expand
 	 *  (without writing to the persisted `expanded` set). */
 	filter?: Set<string>;
 }
 
-function TreeNode({ entry, depth, filter }: TreeNodeProps) {
+function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 	const persistedExpanded = useFilesStore((s) => s.expanded.has(entry.path));
 	const expanded = filter ? filter.has(entry.path) && entry.isDir : persistedExpanded;
 	const isSelected = useFilesStore((s) => s.selectedPath === entry.path);
@@ -296,8 +331,11 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 	const canTrash = trashServed();
 	const qc = useQueryClient();
 
-	const [renaming, setRenaming] = useState(false);
+	// 'rename' edits the name (a path in it moves, relative to this folder);
+	// 'move' edits the path from the section root (F2).
+	const [renaming, setRenaming] = useState<false | 'rename' | 'move'>(false);
 	const [renameValue, setRenameValue] = useState(entry.name);
+	const [dropActive, setDropActive] = useState(false);
 	const [actionError, setActionError] = useState<string | null>(null);
 	const [pinOpen, setPinOpen] = useState(false);
 	const renameInputRef = useRef<HTMLInputElement | null>(null);
@@ -360,8 +398,14 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 	const startRename = useCallback(() => {
 		setRenameValue(entry.name);
 		setActionError(null);
-		setRenaming(true);
+		setRenaming('rename');
 	}, [entry.name]);
+
+	const startMove = useCallback(() => {
+		setRenameValue(relativeTo(rootPath, entry.path));
+		setActionError(null);
+		setRenaming('move');
+	}, [rootPath, entry.path]);
 
 	useEffect(() => {
 		if (renaming) return focusSoon(renameInputRef.current, true);
@@ -369,26 +413,75 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 
 	const commitRename = useCallback(async () => {
 		const next = renameValue.trim();
-		if (!next || next === entry.name) {
+		const unchanged =
+			renaming === 'move' ? next === relativeTo(rootPath, entry.path) : next === entry.name;
+		if (!next || unchanged) {
 			setRenaming(false);
 			return;
 		}
 		try {
-			await renameEntry(entry.path, next);
+			const to = await renameEntry(
+				entry.path,
+				next,
+				renaming === 'move' ? stripTrailingSlash(rootPath) : undefined
+			);
 			setRenaming(false);
 			setActionError(null);
-			// Path changed — drop the old path from expanded, refresh parent listing.
-			prune([entry.path]);
-			void qc.invalidateQueries({ queryKey: queryKeys.fs.list(parentOf(entry.path)) });
-			void qc.invalidateQueries({ queryKey: FS_SEARCH_PREFIX });
+			refreshAfterMove(qc, entry.path, to, prune);
+			setSelected(to);
 		} catch (err) {
 			setActionError(errorText(err));
 		}
-	}, [renameValue, entry.path, entry.name, prune, qc]);
+	}, [renameValue, renaming, rootPath, entry.path, entry.name, prune, qc, setSelected]);
+
+	// Drag a row onto a folder (or onto a file, meaning its folder) to move it
+	// there (F2). Same checks as Move….
+	const dropDir = entry.isDir ? stripTrailingSlash(entry.path) : parentOf(entry.path);
+	const onDragStart = useCallback(
+		(e: React.DragEvent) => {
+			if (renaming) return;
+			e.dataTransfer.setData(FILE_DRAG_MIME, entry.path);
+			e.dataTransfer.effectAllowed = 'move';
+		},
+		[entry.path, renaming]
+	);
+	const onDragOver = useCallback((e: React.DragEvent) => {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.stopPropagation();
+		e.dataTransfer.dropEffect = 'move';
+		setDropActive(true);
+	}, []);
+	const onDragLeave = useCallback(() => setDropActive(false), []);
+	const onDrop = useCallback(
+		async (e: React.DragEvent) => {
+			if (!isFileDrag(e)) return;
+			e.preventDefault();
+			e.stopPropagation();
+			setDropActive(false);
+			const from = e.dataTransfer.getData(FILE_DRAG_MIME);
+			if (!from || dirOf(from) === dropDir) return;
+			try {
+				const to = await moveEntry(from, dropDir);
+				setActionError(null);
+				if (entry.isDir) expand(entry.path);
+				refreshAfterMove(qc, from, to, prune);
+				setSelected(to);
+			} catch (err) {
+				setActionError(errorText(err));
+			}
+		},
+		[dropDir, entry.isDir, entry.path, expand, qc, prune, setSelected]
+	);
 
 	const handleDelete = useCallback(async () => {
 		if (!trashServed()) {
 			setActionError(TRASH_UNAVAILABLE_MESSAGE);
+			return;
+		}
+		// Unsaved edits would be left with no file to save to.
+		if (hasUnsavedEditsUnder(entry.path)) {
+			setActionError(SAVE_OR_DISCARD_FIRST);
 			return;
 		}
 		const ok = await confirmDialog(`Move "${entry.name}" to trash?`, { title: 'Move to Trash', kind: 'warning' });
@@ -469,6 +562,10 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 			keepFocusOnMenuClose.current = true;
 			startRename();
 		},
+		'files.move': () => {
+			keepFocusOnMenuClose.current = true;
+			startMove();
+		},
 		delete: () => void handleDelete(),
 	};
 
@@ -491,7 +588,13 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 						onActivate={handleClick}
 						indent={Math.min(depth, 10) * 12 + 8}
 						title={entry.path}
-						className="w-max min-w-full gap-1"
+						className={cn('w-max min-w-full gap-1', dropActive && 'ring-1 ring-inset ring-ring')}
+						draggable={!renaming}
+						onDragStart={onDragStart}
+						onDragOver={onDragOver}
+						onDragLeave={onDragLeave}
+						onDrop={(e) => void onDrop(e)}
+						data-drop-target={dropActive ? 'true' : undefined}
 						actions={
 							!renaming && (
 								<div className="absolute right-1 top-1/2 hidden -translate-y-1/2 items-center gap-0.5 rounded bg-accent pl-1 group-hover/row:flex group-focus-within/row:flex">
@@ -543,6 +646,7 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 							<input
 								ref={renameInputRef}
 								value={renameValue}
+								aria-label={renaming === 'move' ? `Move to (path from ${rootPath})` : 'New name'}
 								onChange={(e) => setRenameValue(e.target.value)}
 								onClick={(e) => e.stopPropagation()}
 								onKeyDown={(e) => {
@@ -635,7 +739,13 @@ function TreeNode({ entry, depth, filter }: TreeNodeProps) {
 					{children
 						?.filter((child) => !filter || filter.has(child.path))
 						.map((child) => (
-							<TreeNode key={child.path} entry={child} depth={depth + 1} filter={filter} />
+							<TreeNode
+								key={child.path}
+								entry={child}
+								depth={depth + 1}
+								rootPath={rootPath}
+								filter={filter}
+							/>
 						))}
 					{children && children.length === 0 && !error && !pendingCreate && (
 						<div
@@ -675,6 +785,34 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 	const beginRootCreate = useCallback(
 		(kind: CreateKind) => usePendingCreate.getState().begin(stripTrailingSlash(rootPath), kind),
 		[rootPath]
+	);
+	const prune = useFilesStore((s) => s.prune);
+	const setSelected = useFilesStore((s) => s.setSelected);
+	const [dropError, setDropError] = useState<string | null>(null);
+	// A row dropped on the section's empty space (or on its header) moves to
+	// the root folder; drops on a row are handled, and stopped, by that row.
+	const onRootDragOver = useCallback((e: React.DragEvent) => {
+		if (!isFileDrag(e)) return;
+		e.preventDefault();
+		e.dataTransfer.dropEffect = 'move';
+	}, []);
+	const onRootDrop = useCallback(
+		async (e: React.DragEvent) => {
+			if (!isFileDrag(e)) return;
+			e.preventDefault();
+			const from = e.dataTransfer.getData(FILE_DRAG_MIME);
+			const dir = stripTrailingSlash(rootPath);
+			if (!from || dirOf(from) === dir) return;
+			try {
+				const to = await moveEntry(from, dir);
+				setDropError(null);
+				refreshAfterMove(qc, from, to, prune);
+				setSelected(to);
+			} catch (err) {
+				setDropError(errorText(err));
+			}
+		},
+		[rootPath, qc, prune, setSelected]
 	);
 
 	// Local input value tracks every keystroke; the store (and therefore the
@@ -755,12 +893,15 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 		<>
 			{/* Header is a DIRECT child of the shared scroller so same-edge sticky
 			    headers push each other out — only one stays stuck per edge. */}
+			{/* biome-ignore lint/a11y/noStaticElementInteractions: a pointer drop zone for dragged rows; the keyboard path is the Move… item */}
 			<div
 				className={cn(
 					'flex shrink-0 items-center justify-between border-b border-border bg-background px-2 py-1.5',
 					'sticky z-10',
 					stickyEdge === 'top' ? 'top-0' : 'bottom-0'
 				)}
+				onDragOver={onRootDragOver}
+				onDrop={(e) => void onRootDrop(e)}
 			>
 				<button
 					type="button"
@@ -819,7 +960,13 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 				)}
 			</div>
 			{isOpen && (
-				<div className="border-b border-border">
+				// biome-ignore lint/a11y/noStaticElementInteractions: a pointer drop zone for dragged rows; the keyboard path is the Move… item
+				<div
+					className="border-b border-border"
+					data-testid="files-root-drop"
+					onDragOver={onRootDragOver}
+					onDrop={(e) => void onRootDrop(e)}
+				>
 					<div className="relative border-b border-border bg-background px-2 py-1">
 						<Search className="pointer-events-none absolute left-3.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
 						<input
@@ -878,9 +1025,23 @@ function RootSection({ rootPath, isOpen, stickyEdge }: RootSectionProps) {
 					{searchActive && matchSet && matchSet.size === 0 && !searchQuery.isFetching && (
 						<div className="px-3 py-1 text-xs text-muted-foreground italic">No matches.</div>
 					)}
+					{dropError && (
+						<div role="alert" className="flex items-start gap-1 px-3 py-1 text-xs text-destructive">
+							<AlertCircle className="h-3 w-3 shrink-0 mt-0.5" />
+							<span className="truncate" title={dropError}>
+								{dropError}
+							</span>
+						</div>
+					)}
 					{pendingCreate && <CreateEntryRow dir={rootPath} kind={pendingCreate} depth={0} />}
 					{visibleEntries?.map((entry) => (
-						<TreeNode key={entry.path} entry={entry} depth={0} filter={matchSet ?? undefined} />
+						<TreeNode
+							key={entry.path}
+							entry={entry}
+							depth={0}
+							rootPath={rootPath}
+							filter={matchSet ?? undefined}
+						/>
 					))}
 				</div>
 			)}
