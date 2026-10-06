@@ -180,7 +180,9 @@ fn spawn_streaming_child_sync(
         bin_path.display()
     );
 
-    let mut cmd = SpawnSpec::new(&bin_path);
+    let (program, pre_args) = crate::runtime::sidecar_program(&bin_path);
+    let mut cmd = SpawnSpec::new(&program);
+    cmd.args(&pre_args);
     cmd.current_dir(&install_path);
     // WP-23 (D-18): hand this pkg its scoped database accessor —
     // `IKENGA_PKG_DB_URL` + a per-pkg `IKENGA_PKG_DB_TOKEN` good only for the

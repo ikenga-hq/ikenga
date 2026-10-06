@@ -347,7 +347,9 @@ async fn run_sidecar_cron(
         entry.bin_path.display()
     );
 
-    let mut cmd = SpawnSpec::new(&entry.bin_path);
+    let (program, pre_args) = crate::runtime::sidecar_program(&entry.bin_path);
+    let mut cmd = SpawnSpec::new(&program);
+    cmd.args(&pre_args);
     cmd.arg(&subcommand);
     cmd.current_dir(&install_path);
     let opts = PipedOpts {
