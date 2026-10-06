@@ -76,6 +76,18 @@ pub async fn detect_all() -> Vec<DetectedAgent> {
 /// call per engine and reveal results as they land instead of blocking on
 /// the slowest probe.
 pub async fn detect_by_id(agent_id: &str) -> Option<DetectedAgent> {
+    detect_by_id_in(agent_id, crate::runtime::augmented_path()).await
+}
+
+/// [`detect_by_id`] resolving the executable against `search_path` instead
+/// of the process-wide augmented `$PATH`. The augmented path is a `OnceLock`
+/// built from `$PATH` the first time anything asks, so mutating `$PATH` later
+/// (as a test might) never reaches it — callers that need a specific search
+/// path pass it here rather than touching the process environment.
+pub(crate) async fn detect_by_id_in(
+    agent_id: &str,
+    search_path: &std::ffi::OsStr,
+) -> Option<DetectedAgent> {
     let os = std::env::consts::OS;
     let def = KNOWN_AGENTS.iter().find(|d| {
         d.id == agent_id
@@ -86,7 +98,7 @@ pub async fn detect_by_id(agent_id: &str) -> Option<DetectedAgent> {
             || (d.id == "opencode" && agent_id == "opencode-ai")
             || (d.id == "pi" && (agent_id == "pi-coding-agent" || agent_id == "pi-agent"))
     })?;
-    let mut detected = detect_one(def, os).await?;
+    let mut detected = detect_one_in(def, os, search_path).await?;
     // If the caller queried by an alias like "gemini", keep the queried id so
     // the frontend map keys line up.
     detected.id = agent_id.to_string();
@@ -107,7 +119,15 @@ where
 }
 
 async fn detect_one(def: &AgentDef, os: &str) -> Option<DetectedAgent> {
-    let exec_path = resolve_executable(def, os)?;
+    detect_one_in(def, os, crate::runtime::augmented_path()).await
+}
+
+async fn detect_one_in(
+    def: &AgentDef,
+    os: &str,
+    search_path: &std::ffi::OsStr,
+) -> Option<DetectedAgent> {
+    let exec_path = resolve_executable_in(def, os, search_path)?;
     let is_wsl = exec_path.to_string_lossy().starts_with("wsl:");
     let display_path = if is_wsl {
         let raw = exec_path.to_string_lossy();
@@ -140,12 +160,21 @@ async fn detect_one(def: &AgentDef, os: &str) -> Option<DetectedAgent> {
     })
 }
 
+#[cfg(test)]
 fn resolve_executable(def: &AgentDef, os: &str) -> Option<PathBuf> {
+    resolve_executable_in(def, os, crate::runtime::augmented_path())
+}
+
+fn resolve_executable_in(
+    def: &AgentDef,
+    os: &str,
+    search_path: &std::ffi::OsStr,
+) -> Option<PathBuf> {
     for spec in def.executables {
         if !family_matches(spec.target_family, os) {
             continue;
         }
-        if let Some(found) = lookup_spec(spec) {
+        if let Some(found) = lookup_spec_in(spec, search_path) {
             return Some(found);
         }
     }
@@ -225,14 +254,16 @@ pub(crate) fn wsl_which(name: &str) -> Option<String> {
     (!path_str.is_empty() && path_str.starts_with('/')).then_some(path_str)
 }
 
-fn lookup_spec(spec: &ExecutableSpec) -> Option<PathBuf> {
+/// Resolve `spec` against `search_path` (production passes the augmented
+/// PATH, ADR-013 §Addendum Decision 2, so a GUI-launched app — which inherits
+/// a thin $PATH missing the nvm/npm/homebrew shims — still finds CLIs
+/// installed there), then its `extra_dirs`. The process `$PATH` itself is
+/// never consulted here.
+fn lookup_spec_in(spec: &ExecutableSpec, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
     for name in spec.names {
-        // Resolve against the augmented PATH (ADR-013 §Addendum Decision 2)
-        // so a GUI-launched app — which inherits a thin $PATH missing the
-        // nvm/npm/homebrew shims — still finds CLIs installed there. `cwd` is
-        // irrelevant here since `name` is always a bare binary name, not a
-        // relative path.
-        if let Ok(found) = which::which_in(name, Some(crate::runtime::augmented_path()), ".") {
+        // `cwd` is irrelevant here since `name` is always a bare binary name,
+        // not a relative path.
+        if let Ok(found) = which::which_in(name, Some(search_path), ".") {
             return Some(found);
         }
     }
@@ -800,7 +831,7 @@ fn env_truthy(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_detect::known::TargetFamily;
+    use super::super::known::TargetFamily;
 
     /// Real `-32000` payloads captured from gemini 0.55.1 on 2026-08-24.
     /// Neither is an auth failure, and treating them as one reports a
@@ -883,6 +914,32 @@ mod tests {
         };
         // On linux, the Windows-only spec should be skipped.
         assert!(resolve_executable(&def, "linux").is_none());
+    }
+
+    /// Regression: detection used to be testable only by mutating `$PATH`,
+    /// which never reaches the `OnceLock`-cached augmented path and races
+    /// every other detection test. The injected search path must be the only
+    /// PATH-style source consulted: `sh` is on every host's real `$PATH`, so
+    /// finding nothing in an empty dir proves the process PATH was ignored,
+    /// and finding the stub proves the injected dir was searched.
+    #[cfg(unix)]
+    #[test]
+    fn lookup_spec_in_searches_only_the_given_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let spec = ExecutableSpec {
+            target_family: TargetFamily::Unix,
+            names: &["sh"],
+            extra_dirs: &[],
+        };
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(lookup_spec_in(&spec, empty.path().as_os_str()), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("sh");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(lookup_spec_in(&spec, dir.path().as_os_str()), Some(stub));
     }
 
     #[tokio::test]

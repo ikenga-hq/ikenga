@@ -109,14 +109,6 @@ reason = "dest_dir is unconfined (Path::new(&dest_dir), no allowlist or data-dir
 tag = "WP-19"
 reason = "src_dir is unconfined (no allowlist check), and import_ndjson_from_dir interpolates each file's filename-derived stem into SQL as the table name (INSERT OR REPLACE INTO \"{table}\" ...) with no check against the real schema, so a crafted filename can break out of the quoted identifier. No FE caller (test-only). Needs containment + a table allowlist first."
 
-[detect_agent]
-tag = "WP-18b"
-reason = "agents::detect_by_id runs the same probe_version spawn as detect_agents for one agent id; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[detect_agents]
-tag = "WP-18b"
-reason = "agents::detect_all -> probe_version runs each detected CLI's --version; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
 [detect_system]
 tag = "WP-19"
 reason = "Half of system::build_report is the desktop vault (secret index in app_data_dir + the platform keychain probe via SecretsLock); the daemon has no vault (crate::secrets_env), so secrets_store_ready / vault_key_present and their fix hint would describe a store that does not exist there. Needs a daemon-true report shape first."

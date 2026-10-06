@@ -164,6 +164,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("claude_config_load", req!(owner[Files])),
     ("claude_config_read_file", req!(owner[Files])),
     ("claude_config_resolve_cascade", req!(owner[Files])),
+    ("detect_agent", req!(owner[])),
+    ("detect_agents", req!(owner[])),
     ("detect_agent_config", req!(owner[Files])),
     ("list_claude_projects", req!(owner[Files])),
     ("list_agent_projects", req!(owner[Files])),

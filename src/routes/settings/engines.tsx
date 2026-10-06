@@ -93,6 +93,8 @@ function EngineSectionBody() {
 	const {
 		data: detected,
 		isLoading,
+		isError,
+		error,
 		refetch,
 	} = useQuery<DetectedAgent[]>({
 		queryKey: ['settings', 'agent', 'detect'],
@@ -123,6 +125,26 @@ function EngineSectionBody() {
 					Re-scan
 				</Button>
 			</header>
+			{isError && (
+				<div className="border-b border-[var(--border-soft)] px-4 py-3">
+					<Banner
+						tone="danger"
+						icon={<AlertTriangle />}
+						role="alert"
+						className="rounded-md border"
+						actions={
+							<Button variant="ghost" size="sm" onClick={() => refetch()}>
+								Retry
+							</Button>
+						}
+					>
+						<div className="text-[13px] font-semibold">Engine detection failed</div>
+						<div className="mt-1 text-xs" style={{ color: 'var(--fg-muted)' }}>
+							{error instanceof Error ? error.message : String(error ?? 'Could not check installed engines')}
+						</div>
+					</Banner>
+				</div>
+			)}
 			<div className="divide-y divide-border">
 				<SettingsFieldRow
 					field="engines.defaultEngineId"

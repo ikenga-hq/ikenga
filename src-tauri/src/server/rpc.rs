@@ -643,6 +643,8 @@ pub async fn rpc_handler(
         "claude_list_sessions" => rpc_claude::claude_list_sessions(&state, &payload.args).await,
         "claude_read_jsonl" => rpc_claude::claude_read_jsonl(&state, &payload.args).await,
         "claude_session_list" => rpc_claude::claude_session_list(&state, &payload.args).await,
+        "detect_agent" => rpc_claude::detect_agent(&payload.args).await,
+        "detect_agents" => rpc_claude::detect_agents().await,
         "detect_agent_config" => rpc_claude::detect_agent_config(&state, &payload.args),
         "list_claude_projects" => rpc_claude::list_claude_projects(&state).await,
         "list_agent_projects" => rpc_claude::list_agent_projects(&state, &payload.args).await,
