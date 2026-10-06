@@ -276,7 +276,10 @@ CURRENT_VER="$("$INSTALL_DIR/bin/ikenga-server" --version)"
 # Verify unit file was rolled back and previous unit was saved
 [[ -f "/etc/systemd/system/ikenga-server-t1.service.prev-0.18.2" ]]
 grep -q "unit version 0.18.2" /etc/systemd/system/ikenga-server-t1.service
-! grep -q "unit version 0.18.4-broken" /etc/systemd/system/ikenga-server-t1.service
+# `! cmd` never trips errexit, so assert the negative explicitly.
+if grep -q "unit version 0.18.4-broken" /etc/systemd/system/ikenga-server-t1.service; then
+  echo "FAIL: the broken unit is still installed after rollback" >&2; exit 1
+fi
 echo "==> [Container] Unit rollback verified cleanly"
 
 # Verify service is running and healthy again

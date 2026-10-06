@@ -124,6 +124,10 @@ elif [[ -f "$ENV_FILE" ]]; then
 fi
 
 validate_profile() {
+  local _cli
+  for _cli in "${AGENT_CLIS[@]}"; do
+    case "$_cli" in claude|codex|opencode|pi|agy) ;; *) die "unknown AGENT_CLI '$_cli' (allowed: claude codex opencode pi agy)" ;; esac
+  done
   [[ "$TIER" == t0 || "$TIER" == t1 ]] || die "TIER must be t0 or t1 (got '$TIER')"
   [[ "$PERIMETER" == tailnet || "$PERIMETER" == public-https ]] || die "PERIMETER must be tailnet or public-https (got '$PERIMETER')"
   [[ -n "$VERSION" ]] || die "VERSION is required (e.g. VERSION=0.18.2); the provisioner never installs 'latest' silently"
@@ -900,9 +904,14 @@ do_upgrade() {
     cp -r "$tmp/stage/dist" "$INSTALL_DIR/dist"
   fi
 
+  # Restore only a unit THIS run saved: a leftover .prev from an earlier
+  # attempt must never be put back over the current unit.
+  local unit_saved=0
+  rm -f "/etc/systemd/system/$unit.prev-$have"
   if [[ -f "$tmp/stage/$unit" ]]; then
     if [[ -f "/etc/systemd/system/$unit" ]]; then
       cp -a "/etc/systemd/system/$unit" "/etc/systemd/system/$unit.prev-$have"
+      unit_saved=1
       note "previous unit saved as /etc/systemd/system/$unit.prev-$have (rollback guard)"
     fi
     install -m 0644 "$tmp/stage/$unit" "/etc/systemd/system/$unit"
@@ -942,7 +951,7 @@ do_upgrade() {
     rm -rf "$INSTALL_DIR/dist"
     mv "$INSTALL_DIR/dist.prev-$have" "$INSTALL_DIR/dist"
   fi
-  if [[ -f "/etc/systemd/system/$unit.prev-$have" ]]; then
+  if [[ $unit_saved -eq 1 && -f "/etc/systemd/system/$unit.prev-$have" ]]; then
     cp -a "/etc/systemd/system/$unit.prev-$have" "/etc/systemd/system/$unit"
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
   fi
