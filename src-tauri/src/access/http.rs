@@ -142,8 +142,8 @@ fn fail(f: Fail) -> Response {
 
 /// The client address: the throttle key (bucketed per IPv6 /64 in
 /// [`pairing::throttle_key`]) and pair-confirm's "Address" row. Behind a
-/// trusted reverse proxy, resolved from Forwarded / X-Forwarded-For via
-/// `IKENGA_TRUSTED_PROXIES`.
+/// trusted reverse proxy, resolved from the one header the proxy writes
+/// (`IKENGA_TRUSTED_PROXIES` + `IKENGA_TRUSTED_PROXY_HEADER`).
 fn addr_of(conn: &Option<ConnectInfo<SocketAddr>>, headers: &HeaderMap) -> String {
     crate::server::trusted_proxy::addr_of_conn(conn, headers)
 }
@@ -822,7 +822,11 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_status_resolves_client_address_behind_trusted_proxy() {
-        std::env::set_var("IKENGA_TRUSTED_PROXIES", "127.0.0.1");
+        // Thread-scoped, not `set_var`: tests run in parallel and a leaked
+        // process env var changes every other handler's resolution.
+        let _tp = crate::server::trusted_proxy::test_override::set(
+            crate::server::trusted_proxy::TrustedProxies::parse("127.0.0.1"),
+        );
         let store = AccessStore::memory_t0().await;
         let registry = Registry::new();
         let host = PairingHost {
@@ -844,6 +848,9 @@ mod tests {
             .header("host", "ik:4000")
             .header("content-type", "application/json")
             .header("x-forwarded-for", "203.0.113.195")
+            // A client-injected Forwarded header Caddy passes through
+            // untouched: it must lose to the proxy-written X-Forwarded-For.
+            .header("forwarded", "for=9.9.9.1")
             .body(Body::from(
                 json!({
                     "slot": &ticket.code[..1],
@@ -870,6 +877,7 @@ mod tests {
             .header("host", "ik:4000")
             .header("content-type", "application/json")
             .header("x-forwarded-for", "203.0.113.195")
+            .header("forwarded", "for=9.9.9.2")
             .body(Body::from(
                 json!({
                     "pairingId": pid,
@@ -890,6 +898,5 @@ mod tests {
         // Check that registry recorded the forwarded client IP, not 127.0.0.1
         let info = registry.begin_decide(&pid, &owner).unwrap();
         assert_eq!(info.remote_addr, "203.0.113.195");
-        std::env::remove_var("IKENGA_TRUSTED_PROXIES");
     }
 }
