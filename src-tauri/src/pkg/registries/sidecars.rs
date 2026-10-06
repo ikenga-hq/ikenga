@@ -80,12 +80,22 @@ impl Registry for SidecarsRegistry {
         let mut new_entries: Vec<SidecarEntry> = Vec::with_capacity(pkg.manifest.sidecars.len());
         for spec in &pkg.manifest.sidecars {
             let bin_rel = spec.bin.replace("{target}", &host_target);
-            let bin_path = pkg.resolve_relative(&bin_rel).with_context(|| {
+            let mut bin_path = pkg.resolve_relative(&bin_rel).with_context(|| {
                 format!(
                     "sidecar `{}` of `{}`: bin `{}`",
                     spec.name, pkg.manifest.id, bin_rel
                 )
             })?;
+            // Windows native builds carry a `.exe` the manifest's extensionless
+            // `bin` doesn't name.
+            if cfg!(windows) && !bin_path.is_file() {
+                let mut exe = bin_path.clone().into_os_string();
+                exe.push(".exe");
+                let exe = std::path::PathBuf::from(exe);
+                if exe.is_file() {
+                    bin_path = exe;
+                }
+            }
             if !bin_path.is_file() {
                 return Err(anyhow!(
                     "sidecar `{}` of `{}`: bin `{}` not found",
