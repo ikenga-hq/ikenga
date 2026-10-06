@@ -1,5 +1,13 @@
 # ikenga-desktop
 
+## 0.20.1
+
+### Patch Changes
+
+- 505ead6: Windows: resolve extensionless native sidecar bins to their .exe, and resolve `npx` to its .cmd shim for skill installs.
+- a7680a0: Fix Windows "not a valid Win32 application" (os error 193) when starting pkg sidecars that declare a .js bin (e.g. Meetings recording): run them through the bundled Bun.
+- 1e650ca: Browser sessions on ikenga-server stop the endless failing iyke log/network pushes, pick the server transport before sign-in, no longer call the desktop terminal-attach commands on reattach, and no longer claim "Ikenga is up to date" on Settings › About. Markdown path links no longer raise unhandled errors or resolve relative paths against the server's working directory, and the onboarding footer's "Enter your Obi" now opens the workspace.
+
 ## 0.20.0
 
 ### Minor Changes
