@@ -4229,6 +4229,39 @@ export async function detectSystem(): Promise<SystemReport> {
 	return invoke<SystemReport>('detect_system');
 }
 
+/** `GET /api/health` on `ikenga-server` (`src-tauri/src/server/health.rs`).
+ *  `executor` mirrors `executor::Capabilities`; `probe` is present at T1
+ *  only. Both are optional here because an older server may omit them. */
+export interface ServerHealth {
+	ok: boolean;
+	name: string;
+	version: string;
+	status: string;
+	uptime_secs: number;
+	executor?: {
+		tier: string;
+		pty: boolean;
+		piped: boolean;
+		principal_isolation: boolean;
+	};
+	probe?: { ok: boolean; at: number };
+}
+
+/**
+ * The daemon's health report — browser sessions only.
+ *
+ * Not an RPC: `/api/health` is the daemon's own unauthenticated route, so a
+ * T1 cookie session, a paired device and a T0 token tab all read it the same
+ * way. Throws on a non-2xx answer or a network failure.
+ */
+export async function fetchServerHealth(): Promise<ServerHealth> {
+	const res = await fetch('/api/health', { credentials: 'same-origin' });
+	if (!res.ok) {
+		throw new Error(`Server health check failed (HTTP ${res.status})`);
+	}
+	return (await res.json()) as ServerHealth;
+}
+
 export async function detectAgents(): Promise<DetectedAgent[]> {
 	return invoke<DetectedAgent[]>('detect_agents');
 }
