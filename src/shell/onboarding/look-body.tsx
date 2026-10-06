@@ -239,10 +239,7 @@ export function LookBody({ onContinue }: LookBodyProps) {
 						</div>
 					</section>
 
-					<WritesNote
-						stepId="look"
-						onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
-					/>
+					<WritesNote stepId="look" onOpenFile={() => openSettingsFile('personal')} />
 				</div>
 
 				{/* ── Live preview ─────────────────────────────────────────── */}

@@ -10,6 +10,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { openSettingsFile, writeSettingsField } from '@/lib/settings/client';
+import { useOpenFile } from '@/lib/settings/use-open-file';
 import type { SettingsWriteOptions } from '@/lib/settings/types';
 import { PERSONAL_ONLY_FIELDS } from '@/lib/settings/types';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
@@ -54,6 +55,8 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 		: settingsPathLabel(scope, projectRoot);
 	const iykeLine = settingsIykeLine(sectionId, scope);
 	const [copied, setCopied] = useState(false);
+	const openFile = useOpenFile();
+	const openThisFile = () => void openFile.run(() => openSettingsFile(scope, projectId));
 	// Matches handleReset's own skip conditions below, so "Reset section" is
 	// enabled exactly when it would actually change something. Secrets,
 	// Integrations and People's fields are all informational (search-only,
@@ -163,12 +166,21 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 						{overrides.size} override{overrides.size === 1 ? '' : 's'}
 					</span>
 				)}
-				{!searchActive && !access && (
+				{openFile.error && (
+					<span
+						role="alert"
+						className="mr-1 max-w-[18rem] truncate text-[11px] text-destructive"
+						title={openFile.error}
+					>
+						{openFile.error}
+					</span>
+				)}
+				{!searchActive && !access && openFile.available && (
 					<Button
 						variant="outline"
 						size="sm"
 						className="h-7 gap-1.5 text-xs"
-						onClick={() => void openSettingsFile(scope, projectId).catch(() => {})}
+						onClick={openThisFile}
 					>
 						<ExternalLink className="h-3 w-3" />
 						Open file
@@ -201,10 +213,8 @@ export function SettingsSectionHeader({ sectionId, searchActive }: SettingsSecti
 								</div>
 							</DropdownMenuItem>
 						)}
-						{!access && (
-							<DropdownMenuItem
-								onSelect={() => void openSettingsFile(scope, projectId).catch(() => {})}
-							>
+						{!access && openFile.available && (
+							<DropdownMenuItem onSelect={openThisFile}>
 								<FileText className="mr-2 h-3.5 w-3.5" />
 								<div className="flex min-w-0 flex-col">
 									<span>Open file</span>

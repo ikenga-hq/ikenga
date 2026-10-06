@@ -166,10 +166,7 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 					</p>
 				</div>
 
-				<WritesNote
-					stepId="welcome"
-					onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
-				/>
+				<WritesNote stepId="welcome" onOpenFile={() => openSettingsFile('personal')} />
 
 				<div className="mt-4">
 					<Link

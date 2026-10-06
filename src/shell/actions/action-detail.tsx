@@ -14,6 +14,7 @@ import {
 	LockedActionError,
 } from '@/lib/actions/store';
 import { openActionsFile } from '@/lib/actions/client';
+import { canOpenFilesWithOs } from '@/lib/tauri-cmd';
 import { runAction, type RunOutcome } from '@/lib/actions/runner';
 import { iykePath } from '@/lib/actions/runner/iyke';
 import { runMenuAction } from '@/shell/menu/resolve';
@@ -218,9 +219,11 @@ export function ActionDetail({
 					>
 						<Play className="h-3 w-3" /> Test run
 					</button>
-					<button type="button" className="chip" onClick={() => void handleOpenFile()}>
-						<ExternalLink className="h-3 w-3" /> Open file
-					</button>
+					{canOpenFilesWithOs() && (
+						<button type="button" className="chip" onClick={() => void handleOpenFile()}>
+							<ExternalLink className="h-3 w-3" /> Open file
+						</button>
+					)}
 				</div>
 				{testNote && (
 					<p className="cempty" role="status" style={{ marginTop: 'var(--space-2)' }}>

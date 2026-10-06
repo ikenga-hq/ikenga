@@ -443,10 +443,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 				</div>
 			)}
 
-			<WritesNote
-				stepId="engine"
-				onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
-			/>
+			<WritesNote stepId="engine" onOpenFile={() => openSettingsFile('personal')} />
 
 			{/* ── Inline Continue ─────────────────────────────────────── */}
 			<div className="mt-8 flex items-center justify-end gap-3">

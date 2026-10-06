@@ -19,6 +19,7 @@ import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { dailyAddress } from '@/lib/lore';
 import { openSettingsFile } from '@/lib/settings/client';
+import { useOpenFile } from '@/lib/settings/use-open-file';
 import {
 	ONBOARDING_STEPS,
 	type OnboardingStepId,
@@ -86,6 +87,7 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 
 	// 700ms time-of-day greeting flourish before the route transition.
 	const [greeting, setGreeting] = useState<{ igbo: string; english: string } | null>(null);
+	const openFile = useOpenFile();
 
 	const handleOpenWorkspace = () => {
 		if (blocker) return;
@@ -179,12 +181,12 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 								<span className="truncate font-mono" style={{ color: 'var(--fg)' }} title={f}>
 									{f}
 								</span>
-								{f === '~/.ikenga/settings.json' && (
+								{f === '~/.ikenga/settings.json' && openFile.available && (
 									<Button
 										variant="ghost"
 										size="sm"
 										className="h-6 px-2 text-[11px]"
-										onClick={() => void openSettingsFile('personal').catch(() => {})}
+										onClick={() => void openFile.run(() => openSettingsFile('personal'))}
 									>
 										Open
 									</Button>
@@ -192,6 +194,11 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 							</div>
 						))}
 					</div>
+					{openFile.error && (
+						<p role="alert" className="mt-2 text-[11px]" style={{ color: 'var(--danger)' }}>
+							{openFile.error}
+						</p>
+					)}
 					<p className="mt-3 text-[11px]" style={{ color: 'var(--fg-faint)' }}>
 						No secret was written to any of these. Keys live in the vault.
 					</p>
