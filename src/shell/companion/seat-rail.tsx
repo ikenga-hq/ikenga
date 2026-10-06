@@ -67,6 +67,7 @@ import {
 	type SeatMenuItem,
 	seatPaneBlocker,
 } from './seat-menu';
+import { canPopOut, POP_OUT_DESKTOP_ONLY } from '@/lib/window/window-two';
 import {
 	atName,
 	checkSeatName,
@@ -722,8 +723,8 @@ export function seatMenuItems(
 		{
 			label: 'Pop out',
 			sub: inWindow ? 'in Window 2' : 'to Window 2',
-			disabled: Boolean(noPane) || inWindow,
-			title: inWindow ? 'Already in Window 2' : noPane,
+			disabled: !canPopOut() || Boolean(noPane) || inWindow,
+			title: !canPopOut() ? POP_OUT_DESKTOP_ONLY : inWindow ? 'Already in Window 2' : noPane,
 			run: () => popOutSeat(seat, run),
 		},
 		{ label: 'All seats', sub: 'seat board', run: openSeatBoard },
@@ -792,8 +793,14 @@ export function sessionMenuItems(session: UnseatedSession, isTarget: boolean, mo
 		{
 			label: 'Pop out',
 			sub: 'to Window 2',
-			disabled: inWindow || !live,
-			title: inWindow ? 'Already in Window 2' : !live ? 'Its terminal isn’t running' : '',
+			disabled: !canPopOut() || inWindow || !live,
+			title: !canPopOut()
+				? POP_OUT_DESKTOP_ONLY
+				: inWindow
+					? 'Already in Window 2'
+					: !live
+						? 'Its terminal isn’t running'
+						: '',
 			run: () => popOutTerminal(session.id, name),
 		},
 		{

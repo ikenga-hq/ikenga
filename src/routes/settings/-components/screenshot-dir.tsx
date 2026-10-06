@@ -8,17 +8,26 @@ import { Camera, FolderPlus, RotateCcw } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import {
+	isRemoteWebSession,
 	type ScreenshotConfig as ScreenshotCfg,
 	screenshotGetConfig,
 	screenshotSetDir,
 } from '@/lib/tauri-cmd';
 
+export const DESKTOP_ONLY_SCREENSHOTS =
+	'Desktop app only. Screenshots are taken by the Ikenga desktop app and saved on that machine; set their folder from Settings there.';
+
 export function ScreenshotDirSectionBody() {
+	// Browser session (gap audit rank 15): `screenshot_get_config` /
+	// `screenshot_set_dir` are not served, so the section used to sit on
+	// "Loading…" forever. Show what is true instead.
+	const remote = isRemoteWebSession();
 	const [cfg, setCfg] = useState<ScreenshotCfg | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 
 	useEffect(() => {
+		if (remote) return;
 		let cancelled = false;
 		screenshotGetConfig()
 			.then((c) => {
@@ -30,7 +39,7 @@ export function ScreenshotDirSectionBody() {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [remote]);
 
 	async function handleChange() {
 		setBusy(true);
@@ -59,6 +68,16 @@ export function ScreenshotDirSectionBody() {
 		} finally {
 			setBusy(false);
 		}
+	}
+
+	if (remote) {
+		return (
+			<div className="px-4 py-3">
+				<p className="text-xs text-muted-foreground" data-testid="screenshots-desktop-only">
+					{DESKTOP_ONLY_SCREENSHOTS}
+				</p>
+			</div>
+		);
 	}
 
 	return (

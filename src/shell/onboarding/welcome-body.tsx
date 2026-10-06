@@ -177,13 +177,9 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 					</p>
 				</div>
 
-				{/* Browser: no "Open file" (`settings_open_file` opens a desktop
-				    editor, desktop-only) and no restore link (`backup_import` is
-				    not served by the daemon, WP-19). */}
-				<WritesNote
-					stepId="welcome"
-					onOpenFile={remote ? undefined : () => void openSettingsFile('personal').catch(() => {})}
-				/>
+				{/* WritesNote hides "Open file" when the OS can't open files (a browser
+				    session: `settings_open_file` is desktop-only) and surfaces errors. */}
+				<WritesNote stepId="welcome" onOpenFile={() => openSettingsFile('personal')} />
 
 				{!remote && (
 					<div className="mt-4">

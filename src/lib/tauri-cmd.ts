@@ -512,6 +512,19 @@ export async function settingsWriteField(
 	});
 }
 
+/**
+ * Whether "Open file" affordances (`settings_open_file`, `actions_open_file`)
+ * can work here. Both hand a path to the OS opener on the machine running the
+ * backend; in a browser session that backend is the headless daemon, which
+ * serves neither — and an editor launched on the server host would never reach
+ * the viewer anyway. Callers hide the link when this is false (gap audit
+ * rank 14). Not `isTauri()`: jsdom harnesses are neither, and keep the desktop
+ * path.
+ */
+export function canOpenFilesWithOs(): boolean {
+	return !isRemoteWebSession();
+}
+
 export async function settingsOpenFile(
 	scope: SettingsScope,
 	projectId?: string | null,

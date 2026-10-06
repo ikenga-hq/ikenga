@@ -41,7 +41,12 @@ vi.mock('@/viewer/chrome/use-viewer-server-health', () => ({
 }));
 vi.mock('@/viewer/history/version-history-panel', () => ({ VersionHistoryPanel: () => null }));
 vi.mock('@/lib/window/detached-surfaces', () => ({ useIsSurfaceDetached: () => false }));
-vi.mock('@/lib/window/window-two', () => ({ popOutSurface: vi.fn() }));
+vi.mock('@/lib/window/window-two', () => ({
+	popOutSurface: vi.fn(),
+	// Desktop behaviour: these tests are about edit sessions, not pop-out gating.
+	canPopOut: () => true,
+	POP_OUT_DESKTOP_ONLY: 'Desktop app only',
+}));
 vi.mock('@/shell/companion/seat-notice', () => ({ showSeatNotice: vi.fn() }));
 
 import { useViewerPaneState } from '@/viewer/viewer-pane-state';

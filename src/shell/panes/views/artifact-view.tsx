@@ -4,7 +4,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { isEditingPath, useEditingStore } from '@/lib/editing/editing-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useIsSurfaceDetached } from '@/lib/window/detached-surfaces';
-import { popOutSurface } from '@/lib/window/window-two';
+import { canPopOut, popOutSurface } from '@/lib/window/window-two';
 import { showSeatNotice } from '@/shell/companion/seat-notice';
 import { ViewerRouter } from '@/viewer/auto-router';
 import { ArtifactInfoStrip } from '@/viewer/chrome/artifact-info-strip';
@@ -184,16 +184,18 @@ export function ArtifactView({ path, paneId, line, col }: ArtifactViewProps) {
 			{/* Pop-out affordance — floated top-right over the viewer chrome.
 			    Positioned absolute so it overlays the ViewerRouter's own header
 			    without requiring ViewerRouter to know about multi-window. */}
-			<div className="absolute right-2 top-1 z-10">
-				<IconButton
-					onClick={handlePopOut}
-					title="Pop out to Window 2"
-					aria-label="Pop out viewer"
-					className="bg-background/80 backdrop-blur-sm"
-				>
-					<ArrowUpRight className="h-3.5 w-3.5" />
-				</IconButton>
-			</div>
+			{canPopOut() && (
+				<div className="absolute right-2 top-1 z-10">
+					<IconButton
+						onClick={handlePopOut}
+						title="Pop out to Window 2"
+						aria-label="Pop out viewer"
+						className="bg-background/80 backdrop-blur-sm"
+					>
+						<ArrowUpRight className="h-3.5 w-3.5" />
+					</IconButton>
+				</div>
+			)}
 			{stopped && !stoppedStripDismissed && (
 				<ArtifactInfoStrip
 					kind="stopped"

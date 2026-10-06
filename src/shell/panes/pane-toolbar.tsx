@@ -49,6 +49,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { desktopOnlyReason } from '@/lib/desktop-only';
 import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
 import { type ReactNode, useState } from 'react';
 import { cn } from '@/components/ui/utils';
@@ -285,6 +286,10 @@ function PaneMenuBody({
 					return alreadyPinned ? 'Already pinned' : false;
 				case 'pane.close':
 					return closeDisabled ? 'Cannot close last pane' : false;
+				// `screenshot_pane` is not served to a browser session (gap
+				// audit rank 15).
+				case 'pane.screenshot':
+					return desktopOnlyReason();
 				default:
 					return false;
 			}

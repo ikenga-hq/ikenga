@@ -15,6 +15,7 @@ import { useSearch } from '@tanstack/react-router';
 import { Button } from '@/components/ui/button';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { openActionsFile } from '@/lib/actions/client';
+import { canOpenFilesWithOs } from '@/lib/tauri-cmd';
 import {
 	ActionsFileNotWritableError,
 	ActionsValidationError,
@@ -340,10 +341,12 @@ export function KeysSurface({ scope, model }: ActionsSurfaceProps) {
 						<RotateCcw className="mr-1.5 h-3 w-3" />
 						Reset all
 					</Button>
-					<Button variant="outline" size="sm" onClick={() => void handleOpenFile()}>
-						<FileText className="mr-1.5 h-3 w-3" />
-						Open keybindings.json
-					</Button>
+					{canOpenFilesWithOs() && (
+						<Button variant="outline" size="sm" onClick={() => void handleOpenFile()}>
+							<FileText className="mr-1.5 h-3 w-3" />
+							Open keybindings.json
+						</Button>
+					)}
 				</span>
 			</div>
 

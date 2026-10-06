@@ -28,6 +28,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { openActionsFile } from '@/lib/actions/client';
+import { canOpenFilesWithOs } from '@/lib/tauri-cmd';
 import {
 	ActionsFileNotWritableError,
 	ActionsValidationError,
@@ -120,6 +121,10 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 		);
 	}
 
+	// Hidden in a browser session: the daemon serves no open-with-OS command
+	// (gap audit rank 14).
+	const canOpenFile = canOpenFilesWithOs();
+
 	async function handleOpenFile() {
 		setWriteError(null);
 		try {
@@ -202,15 +207,17 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 						<Sparkles className="h-3 w-3" />
 						Brief a Chi to make an action
 					</Button>
-					<Button
-						variant="outline"
-						size="sm"
-						className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs"
-						onClick={() => void handleOpenFile()}
-					>
-						<ExternalLink className="h-3 w-3" />
-						Open file
-					</Button>
+					{canOpenFile && (
+						<Button
+							variant="outline"
+							size="sm"
+							className="min-h-[var(--btn-h-sm)] gap-1.5 text-xs"
+							onClick={() => void handleOpenFile()}
+						>
+							<ExternalLink className="h-3 w-3" />
+							Open file
+						</Button>
+					)}
 					<DropdownMenu>
 						<DropdownMenuTrigger asChild>
 							<Button
@@ -246,15 +253,17 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 									</span>
 								</div>
 							</DropdownMenuItem>
-							<DropdownMenuItem onSelect={() => void handleOpenFile()}>
-								<FileText className="mr-2 h-3.5 w-3.5" />
-								<div className="flex min-w-0 flex-col">
-									<span>Open file</span>
-									<span className="truncate font-mono text-[10px] text-muted-foreground">
-										{pathLabel}
-									</span>
-								</div>
-							</DropdownMenuItem>
+							{canOpenFile && (
+								<DropdownMenuItem onSelect={() => void handleOpenFile()}>
+									<FileText className="mr-2 h-3.5 w-3.5" />
+									<div className="flex min-w-0 flex-col">
+										<span>Open file</span>
+										<span className="truncate font-mono text-[10px] text-muted-foreground">
+											{pathLabel}
+										</span>
+									</div>
+								</DropdownMenuItem>
+							)}
 							<DropdownMenuSeparator />
 							<DropdownMenuItem
 								variant="destructive"
