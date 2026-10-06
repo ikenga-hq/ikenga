@@ -96,7 +96,7 @@ Then sign in as that admin in a browser, at the address the server is reachable 
 
 If the service fails to start, run the `probe` line again. The server never falls back to a weaker mode: a failed probe means it stops.
 
-The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
+The unit differs from the T0 one in five ways (§8 "Deploy consequence", plus the WP-P10 `/proc` rule):
 
 - **Root, with a cut capability set.** `CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL CAP_DAC_OVERRIDE CAP_FOWNER`, and `NoNewPrivileges=true`. The broker's boot probe refuses to start without root and the first four. It also does a real test drop to the reserved probe uid. Only auth, the reverse proxy and the per-principal child launch run as root. Every RPC, terminal and engine runs inside a child that has already dropped to that person's uid.
 - **Writable paths.** `ProtectSystem=strict` with `ReadWritePaths=/opt/ikenga/data /etc`.
@@ -104,6 +104,7 @@ The unit differs from the T0 one in four ways (§8 "Deploy consequence"):
   - To keep `/etc` read-only, pre-create users yourself, set `IKENGA_PROVISIONING=external`, map each account with `accounts create <name> --adopt-unix-user <user>`, and drop `/etc` from the line.
 - **Adopted homes.** An adopted account (below) keeps its existing passwd home. Add that home to `ReadWritePaths`.
 - **`KillMode=process`.** This is the detached chi-runner fix (§9.4, owed by WP-18b), explained in the next section.
+- **`ProtectProc=invisible`.** `/proc` is mounted `hidepid=invisible` inside the unit, so a person's processes can't see anyone else's there. This is defense in depth, not a guarantee: someone signed in over SSH uses the host `/proc`, where it doesn't apply. Nothing depends on it. Every Chi engine (`claude-code`, `codex`, `antigravity-cli`, `opencode`, `pi`) reads its prompt from stdin, never from a command-line argument that `/proc/<pid>/cmdline` would show to other users (I-7). The same holds for the chat socket (`/ws/chat/:id`, default engine `antigravity-cli`), which sends each turn to `agy` on stdin as well. So all of them run under T1 with or without this line, including in the Docker deploy.
 
 ### Detached chi-runners survive a restart
 

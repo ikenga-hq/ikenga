@@ -11,16 +11,24 @@
 //!     every engine line and once more at the end.
 //!
 //! Protocol:
-//!   1. Write a [`RunnerConf`] JSON file to `<chi-cache-dir>/<run_id>.conf.json`.
+//!   1. Write a [`RunnerConf`] JSON file to `<chi-cache-dir>/<run_id>.conf.json`
+//!      — owner-only, since it carries the prompt; it is deleted once the run
+//!      ends or is cancelled ([`remove_conf`]).
 //!   2. Spawn `chi-runner` detached with `IKENGA_CHI_CONF=<that path>`.
 //!   3. chi-runner reads the conf, spawns the engine with piped stdio and
 //!      writes the status file.
 //!   4. The caller stores the pid in `chi_cache.pid`; the reconciliation
-//!      sweep (`chi::reconcile_detached_runs`) folds the file + pid into the
-//!      row's terminal status.
+//!      sweep (`chi_exec::reconcile_detached_runs_with`) folds the file + pid
+//!      into the row's terminal status.
 //!
 //! This replaces the tmux multiplexer (`terminal/multiplexer.rs`, retired
 //! here): a detached run has no pane to attach to.
+//!
+//! Lives in the ungated `server::shared` (moved from `commands::chi_runner`
+//! by WP-P10) so the headless daemon launches and cancels persistent runs
+//! with the same code. Everything here is tauri-free: the spawn goes through
+//! `executor::current()`, so under T1 the runner runs as the principal child's
+//! own uid.
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +45,9 @@ pub(crate) use crate::server::shared::chi_liveness::{
 };
 
 /// Config written to disk and passed to chi-runner via `IKENGA_CHI_CONF`.
-/// Field-for-field what `chi_runner.rs::RunnerConf` deserialises.
+/// Field-for-field what `chi_runner.rs::RunnerConf` deserialises. chi-runner
+/// builds its engine's argv from it, putting antigravity-cli's prompt on the
+/// command line, so only `chi_exec::RUNNER_STDIN_ENGINES` are sent here.
 #[derive(Serialize)]
 pub(crate) struct RunnerConf<'a> {
     pub run_id: &'a str,
@@ -105,12 +115,72 @@ pub(crate) fn spawn_detached_runner(
     let runner = resolve_runner_path()
         .ok_or_else(|| runner_not_found(std::env::current_exe().ok().as_deref()))?;
 
-    let conf_path = cache_dir.join(format!("{}.conf.json", conf.run_id));
+    let conf_path = conf_path(cache_dir, conf.run_id)
+        .ok_or_else(|| format!("unusable run id for a runner conf: {}", conf.run_id))?;
     let conf_json = serde_json::to_string(conf).map_err(|e| format!("serialize conf: {e}"))?;
-    std::fs::write(&conf_path, conf_json).map_err(|e| format!("write conf: {e}"))?;
+    write_private(&conf_path, conf_json.as_bytes()).map_err(|e| format!("write conf: {e}"))?;
+    let spawned = spawn_runner(&runner, &conf_path);
+    if spawned.is_err() {
+        remove_conf(cache_dir, conf.run_id);
+    }
+    spawned
+}
 
-    let mut spec = SpawnSpec::new(&runner);
-    spec.env("IKENGA_CHI_CONF", &conf_path)
+/// Where a run's runner conf lives: `<cache_dir>/<run_id>.conf.json`. `None`
+/// for a run id that is not a plain file-name stem (a row planted through
+/// `db_exec` must not aim a write or a delete outside the cache dir).
+pub(crate) fn conf_path(cache_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    let plain = !run_id.is_empty()
+        && run_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plain.then(|| cache_dir.join(format!("{run_id}.conf.json")))
+}
+
+/// Delete a run's runner conf — it carries the prompt — once no runner will
+/// read it: the run ended, was cancelled, or its runner never started.
+/// Best-effort; a missing file is fine.
+pub(crate) fn remove_conf(cache_dir: &Path, run_id: &str) {
+    if let Some(path) = conf_path(cache_dir, run_id) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(target: "ikenga::chi", "chi run {run_id}: remove runner conf: {e}")
+            }
+        }
+    }
+}
+
+/// Write `bytes` to a fresh owner-only (0600 on Unix) file at `path`,
+/// replacing any file already there. Created with that mode, so it is never
+/// readable by anyone else, not even between create and chmod.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let mut file = open.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Spawn `runner` detached against the conf at `conf_path`; its pid.
+fn spawn_runner(runner: &Path, conf_path: &Path) -> Result<u32, String> {
+    let mut spec = SpawnSpec::new(runner);
+    // The runner (and the engine it launches) gets the host env minus the
+    // host-only secrets (`pty::is_host_only_env`), not the whole process env.
+    super::chi_exec::inherit_scrubbed_env(&mut spec);
+    spec.env("IKENGA_CHI_CONF", conf_path)
         // chi-runner resolves the engine CLI (`claude`, `codex`, `agy`) on its
         // own PATH; give it the same augmented PATH the in-process spawns use,
         // or a GUI-launched app hands it a PATH without nvm / Homebrew bins.
@@ -178,6 +248,38 @@ pub(crate) async fn kill_process_group(
         }
     }
     signal(libc::SIGKILL).map(|_| ())
+}
+
+/// The real uid in a `/proc/<pid>/status` body (`Uid:` line, first field).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn status_real_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+}
+
+/// Whether `pid` runs as this process's effective uid. `chi_cancel` signals a
+/// recorded runner pid only when it does: the pid comes from a `chi_cache`
+/// row, and `db_exec` (served over the network) can plant rows, so a root T0
+/// daemon must not be talked into signalling some other user's process that
+/// merely happens to be named `chi-runner`. Under T1 the kernel refuses that
+/// anyway (a principal child holds no `CAP_KILL`); this is the belt.
+///
+/// Linux reads `/proc`; elsewhere there is no cheap probe and the cmdline
+/// check in [`probe_runner`] is all there is, so this answers `true`.
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_owned_by_us(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status_real_uid(&status) == Some(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn pid_owned_by_us(_pid: u32) -> bool {
+    true
 }
 
 /// Windows: `taskkill /T /F` ends the runner and every descendant.
@@ -387,6 +489,29 @@ mod tests {
         let err = spawn_detached_runner(&conf, dir.path()).unwrap_err();
         assert!(err.starts_with("chi-runner not found (looked at "), "{err}");
         assert!(!dir.path().join("r1.conf.json").exists(), "no conf written");
+    }
+
+    #[test]
+    fn status_real_uid_reads_the_first_uid_field() {
+        let status = "Name:\tchi-runner\nUmask:\t0022\nUid:\t28200\t28200\t28200\t28200\nGid:\t28200\t28200\t28200\t28200\n";
+        assert_eq!(status_real_uid(status), Some(28200));
+        assert_eq!(status_real_uid("Name:\tx\n"), None);
+        assert_eq!(status_real_uid("Uid:\tnope\n"), None);
+    }
+
+    /// Our own children are ours; pid 1 (init, root) is not — unless this
+    /// test itself runs as root, where it is.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pid_owned_by_us_matches_our_uid_only() {
+        let mut child = detached_sh("sleep 5");
+        let pid = child.id().unwrap();
+        assert!(pid_owned_by_us(pid));
+        let root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(pid_owned_by_us(1), root);
+        assert!(!pid_owned_by_us(u32::MAX), "a pid that cannot exist");
+        kill_process_group(pid, CANCEL_GRACE).await.unwrap();
+        let _ = child.wait().await;
     }
 
     #[cfg(unix)]

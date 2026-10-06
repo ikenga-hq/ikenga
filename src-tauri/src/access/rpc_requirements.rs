@@ -104,6 +104,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // ── chi / agent-ops / identity ──
     ("chi_status", req!(shared[Sessions])),
     ("chi_list", req!(shared[Sessions])),
+    // WP-P10. Owner-class: a run executes as the serving principal's uid with
+    // that principal's engine logins, and neither a run's cwd nor a run id is
+    // share-root-confined, so a share member may not dispatch, resume or
+    // cancel one in the Owner's child (reads stay `shared[Sessions]`).
+    ("chi_run", req!(owner[Dispatch])),
+    ("chi_resume", req!(owner[Dispatch])),
+    ("chi_cancel", req!(owner[Dispatch])),
     ("agent_ops_list_jobs", req!(owner[Sessions])),
     ("agent_ops_tail_run", req!(owner[Sessions])),
     ("agent_ops_upsert_job", req!(owner[Settings, Dispatch])),

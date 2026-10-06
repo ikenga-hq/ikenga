@@ -30,7 +30,12 @@
 //! - Per-turn model / effort switching. Codex reads those from its own
 //!   config; the chat header still stages the values but they no-op here.
 
+// The chat adapter emits on Tauri channels, so it is desktop-only. The JSONL
+// `parser` is pure (serde + ACP schema types) and compiles into the headless
+// daemon too, which reads Chi runs' codex output with it (WP-P10).
+#[cfg(feature = "desktop")]
 pub mod engine;
 pub mod parser;
 
+#[cfg(feature = "desktop")]
 pub use engine::{CodexPtyEngine, CodexPtyEngineState};
