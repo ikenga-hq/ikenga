@@ -27,6 +27,7 @@ import { loadHome } from '@/lib/home';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { fsExists } from '@/lib/tauri-cmd';
+import { isRemoteWebSession } from '@/lib/transport';
 import { looksLikePath, resolvePath } from '@/lib/paths/file-paths';
 import { cn } from '@/components/ui/utils';
 
@@ -189,7 +190,7 @@ function buildComponents(cwd?: string) {
 			const text = String(children);
 			const isBlock = !!langMatch && text.includes('\n');
 			if (!isBlock) {
-				if (looksLikePath(text)) {
+				if (looksLikePath(text) && isLinkablePath(text, cwd)) {
 					return <FilePathPill rawPath={text} cwd={cwd} display={text} />;
 				}
 				return (
@@ -208,6 +209,7 @@ function buildComponents(cwd?: string) {
 			const { href = '', children } = props;
 			// Local file links → open in viewer pane.
 			if (looksLikePath(href)) {
+				if (!isLinkablePath(href, cwd)) return <span>{children}</span>;
 				return <FilePathPill rawPath={href} cwd={cwd} display={String(children)} />;
 			}
 			return (
@@ -321,9 +323,15 @@ function FilePathPill({
 
 	useEffect(() => {
 		let cancelled = false;
-		resolvePathCached(rawPath, cwd).then((p) => {
-			if (!cancelled) setResolvedPath(p);
-		});
+		resolvePathCached(rawPath, cwd)
+			.then((p) => {
+				if (!cancelled) setResolvedPath(p);
+			})
+			.catch((err) => {
+				// Keep the sync guess; a failed probe must not surface as an
+				// unhandled rejection from a render effect.
+				console.warn('[markdown] path resolve failed', rawPath, err);
+			});
 		return () => {
 			cancelled = true;
 		};
@@ -334,6 +342,7 @@ function FilePathPill({
 			type="button"
 			onClick={async () => {
 				// Re-resolve on click in case the cache hasn't filled yet.
+				// (`resolvePathCached` never rejects — see `pathExists`.)
 				const resolved = await resolvePathCached(rawPath, cwd);
 				addTabBackground(focusedId, { kind: 'artifact', path: resolved });
 			}}
@@ -350,6 +359,30 @@ function FilePathPill({
 // Detection (`looksLikePath`) and sync resolution (`resolvePath`) live in
 // `@/lib/paths/file-paths` so the terminal link provider shares them. The
 // async monorepo-disambiguation walk below is markdown-specific.
+
+function isAbsolutePath(p: string): boolean {
+	return p.startsWith('/') || /^[a-zA-Z]:[/\\]/.test(p);
+}
+
+/**
+ * Whether a path token should become a clickable pill.
+ *
+ * In a browser session every check and read runs on the daemon, so a token
+ * that is still relative after `resolvePath` (no `cwd` to anchor it) would
+ * resolve against the daemon's process cwd — a directory that means nothing
+ * to the person reading. Those stay plain text there. Desktop is unchanged.
+ */
+function isLinkablePath(rawPath: string, cwd: string | undefined): boolean {
+	if (!isRemoteWebSession()) return true;
+	return isAbsolutePath(resolvePath(rawPath, cwd));
+}
+
+/** `fs_exists` that answers `false` instead of rejecting. The daemon rejects
+ *  a path outside its allowlist, and these probes run from a render effect
+ *  with nobody to catch them (audit 2026-10-06 rank 17). */
+function pathExists(p: string): Promise<boolean> {
+	return fsExists(p).catch(() => false);
+}
 
 // Monorepo subproject names used as a disambiguation hint for `preferredSubproject`.
 // Populated with standard monorepo subprojects for workspace disambiguation (T-07).
@@ -403,10 +436,15 @@ function resolvePathCached(rawPath: string, cwd: string | undefined): Promise<st
 }
 
 async function resolvePathWithFallback(p: string, cwd: string | undefined): Promise<string> {
+	const initial = resolvePath(p, cwd);
+	// The monorepo walk below is a desktop heuristic over the local checkout;
+	// on a daemon it only probes paths outside the allowlist, and a relative
+	// `initial` would be checked against the daemon's cwd. Take the token as
+	// written.
+	if (isRemoteWebSession()) return initial;
 	const home = await loadHome();
 	const monorepoRoot = `${home}/royalti-co`;
-	const initial = resolvePath(p, cwd);
-	if (await fsExists(initial)) return initial;
+	if (await pathExists(initial)) return initial;
 
 	// Only relative paths get the subproject walk — absolute / ~ paths are
 	// fully specified by the user and shouldn't be guessed at.
@@ -426,7 +464,7 @@ async function resolvePathWithFallback(p: string, cwd: string | undefined): Prom
 	// Issue all existence checks in parallel; pick the first match by priority
 	// order. Worst case: one IPC roundtrip total instead of N sequential.
 	const candidates = ordered.map((sub) => `${monorepoRoot}/${sub}/${cleaned}`);
-	const results = await Promise.all(candidates.map((c) => fsExists(c)));
+	const results = await Promise.all(candidates.map((c) => pathExists(c)));
 	const idx = results.findIndex(Boolean);
 	return idx >= 0 ? candidates[idx] : initial;
 }

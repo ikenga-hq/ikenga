@@ -68,6 +68,11 @@ describe('conflicts() — DEC-59', () => {
 				'approve-gate.save + markdown.save',
 				'approve-gate.save + studio.loupe-save',
 				'markdown.save + studio.loupe-save',
+				// plans/file-editing: ⌘S in the shared text editor, a fourth
+				// owner on the same key, one focus key each.
+				'approve-gate.save + editor.save',
+				'editor.save + markdown.save',
+				'editor.save + studio.loupe-save',
 				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
 				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs
@@ -91,6 +96,11 @@ describe('conflicts() — DEC-59', () => {
 				'approve-gate.save + markdown.save',
 				'approve-gate.save + studio.loupe-save',
 				'markdown.save + studio.loupe-save',
+				// plans/file-editing: ⌘S in the shared text editor, a fourth
+				// owner on the same key, one focus key each.
+				'approve-gate.save + editor.save',
+				'editor.save + markdown.save',
+				'editor.save + studio.loupe-save',
 				'approve-gate.approve + studio.pin-submit',
 				'explorer.toggle + markdown.bold',
 				// WP-68 (G-SEATS §8.2): ⌘2 — `rail.chi` (`!inputFocus`) vs

@@ -114,9 +114,10 @@ console.log('\n=== 1. RPC surface ===');
 	);
 
 	const db = await rpc('db_query', { query: 'SELECT 1', values: [] });
+	// WP-12b landed: the daemon now opens ikenga.db and runs the query.
 	check(
-		'db_query fails loudly (WP-12b unimplemented) rather than returning a fake result',
-		db.body?.ok === false,
+		'db_query runs a real query against the daemon database',
+		db.body?.ok === true && Array.isArray(db.body.data) && db.body.data.length === 1,
 		JSON.stringify(db.body)
 	);
 

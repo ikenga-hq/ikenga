@@ -80,6 +80,15 @@ pub use pkg_index::PkgIndex;
 pub use pkg_static::PkgStaticService;
 pub use static_files::SpaStaticService;
 
+/// Request-body cap for `/api/rpc` (plans/file-editing Shape 5). axum's
+/// default is 2 MB, which held browser text saves to roughly 400 KB once a
+/// file's bytes were sent as a JSON number array. 16 MiB covers the editor's
+/// 2 MiB edit limit even at worst-case JSON escaping. Not 64 MiB like the T1
+/// broker's `MAX_RPC_BODY`: the RPC parses into `serde_json::Value`, and a
+/// byte-array body inflates to ~32 B per element there. The SPA mirrors this
+/// value as `RPC_BODY_LIMIT_BYTES` in `src/lib/tauri-cmd.ts`.
+pub const RPC_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub host: String,
@@ -722,7 +731,10 @@ fn build_router(
 
     // Protected API and WebSocket endpoints
     let protected_routes = Router::new()
-        .route("/api/rpc", post(rpc::rpc_handler))
+        .route(
+            "/api/rpc",
+            post(rpc::rpc_handler).layer(axum::extract::DefaultBodyLimit::max(RPC_BODY_LIMIT)),
+        )
         .route("/api/shutdown", post(shutdown_handler))
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))

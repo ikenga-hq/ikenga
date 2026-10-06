@@ -12,7 +12,9 @@ export const Route = createFileRoute('/onboarding/done')({
 function DoneStep() {
 	return (
 		<WizardStepper stepId="done">
-			{({ goTo, goNext }) => <DoneBody onFinish={goNext} goTo={goTo} />}
+			{({ goTo, goNext, setFinish }) => (
+				<DoneBody onFinish={goNext} goTo={goTo} setFinish={setFinish} />
+			)}
 		</WizardStepper>
 	);
 }

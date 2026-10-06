@@ -1,6 +1,7 @@
 //! The `fs_kind` / `fs_mime` / `fs_search` / `fs_rename` bodies, shared by
 //! the desktop commands (`commands::fs`) and the daemon's `/api/rpc` arms
-//! (WP-19 slice 5a).
+//! (WP-19 slice 5a). [`exists`] is the daemon's copy of the desktop
+//! `fs_exists` contract (the desktop command keeps its own body).
 //!
 //! Each takes the path resolver as an argument instead of calling
 //! `resolve_allowlisted` itself: the desktop passes exactly that (so its
@@ -149,6 +150,21 @@ pub async fn kind(resolve: Resolve<'_>, path: &str) -> &'static str {
     }
 }
 
+/// The desktop `fs_exists` contract: `true` only for a regular file the
+/// resolver accepts. A refused path is `false` whether or not it exists, so
+/// the answer outside the allowlist (or inside the daemon's own state) is a
+/// constant — never an existence oracle — and a caller probing candidate
+/// paths (the markdown path linkifier) gets an answer, not a rejection.
+pub async fn exists(resolve: Resolve<'_>, path: &str) -> bool {
+    let Ok(resolved) = resolve(path) else {
+        return false;
+    };
+    tokio::fs::metadata(&resolved)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
 /// Extension-based MIME; the path must be allowlisted but need not exist.
 pub fn mime(resolve: Resolve<'_>, path: &str) -> Result<String, String> {
     let resolved = resolve(path)?;
@@ -258,19 +274,39 @@ pub async fn search_skipping(
     .map_err(|e| format!("search join failed: {e}"))
 }
 
-/// Rename `from` to a sibling with the new basename. Both the source and the
-/// resolved destination must be inside the allowlist. The destination must
-/// not already exist. Returns the resolved destination.
-pub async fn rename(resolve: Resolve<'_>, from: &str, to_name: &str) -> Result<String, String> {
+/// Rename `from` to the basename `to_name` — in its own folder, or, when
+/// `to_dir` is given, in that folder (a move; plans/file-editing F2). The
+/// source, the destination folder and the resolved destination must all be
+/// inside the allowlist. The destination must not already exist, and a folder
+/// cannot move into itself. Returns the resolved destination.
+pub async fn rename(
+    resolve: Resolve<'_>,
+    from: &str,
+    to_name: &str,
+    to_dir: Option<&str>,
+) -> Result<String, String> {
     if to_name.is_empty() || to_name.contains('/') || to_name.contains('\\') {
         return Err("invalid name".to_string());
     }
     let resolved_from = resolve(from)?;
-    let parent = resolved_from
-        .parent()
-        .ok_or_else(|| "source has no parent".to_string())?;
+    let parent = match to_dir {
+        Some(dir) => {
+            let resolved_dir = resolve(dir)?;
+            match tokio::fs::metadata(&resolved_dir).await {
+                Ok(m) if m.is_dir() => resolved_dir,
+                _ => return Err(format!("not a folder: {}", resolved_dir.display())),
+            }
+        }
+        None => resolved_from
+            .parent()
+            .ok_or_else(|| "source has no parent".to_string())?
+            .to_path_buf(),
+    };
     let dest = parent.join(to_name);
     let resolved_dest = resolve(&dest.to_string_lossy())?;
+    if resolved_dest != resolved_from && resolved_dest.starts_with(&resolved_from) {
+        return Err("cannot move a folder into itself".to_string());
+    }
     if tokio::fs::metadata(&resolved_dest).await.is_ok() {
         return Err(format!("destination exists: {}", resolved_dest.display()));
     }

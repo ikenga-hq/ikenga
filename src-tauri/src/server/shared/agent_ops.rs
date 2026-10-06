@@ -335,21 +335,82 @@ pub(crate) async fn set_enabled(
 
 // ─── create / edit / delete (WP-14) ──────────────────────────────────────────
 
+/// What a missing `jobs.json` means to [`list_jobs`] / [`upsert_job`].
+///
+/// The desktop commands pass [`MissingConfig::Error`]: their answer for a
+/// host with no config has always been `io_error` ("read config: …"), and
+/// that stays exactly as it was. The headless daemon passes
+/// [`MissingConfig::Empty`] (gap audit 2026-10-06 rank 12): a fresh host —
+/// every T1 principal's home, on first use — has no file yet, so listing
+/// answers an empty job list and the first upsert creates the directory and
+/// the file instead of failing with `io_error` forever. Only *not found*
+/// is folded; an unreadable or unparseable file is still an `io_error`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MissingConfig {
+    Error,
+    Empty,
+}
+
+/// The root a missing config reads as under [`MissingConfig::Empty`]: the
+/// bare-array shape the agent-ops daemon and skill write.
+fn empty_config_root() -> Value {
+    Value::Array(Vec::new())
+}
+
+/// Read the project config's raw bytes, or `None` when it is absent and
+/// `missing` says absent means empty.
+async fn read_config_bytes(path: &Path, missing: MissingConfig) -> Result<Option<Vec<u8>>, Value> {
+    match tokio::fs::read(path).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && missing == MissingConfig::Empty => {
+            Ok(None)
+        }
+        Err(e) => Err(err_value("io_error", None, format!("read config: {e}"))),
+    }
+}
+
 /// Read + parse the project config root, returning `(root, err)`. On failure
 /// returns the err_value to bubble straight back to the FE.
-async fn read_config_root(home_dir: Option<&Path>) -> Result<Value, Value> {
+async fn read_config_root(home_dir: Option<&Path>, missing: MissingConfig) -> Result<Value, Value> {
     let path = project_config_path(home_dir).map_err(|e| err_value("io_error", None, e))?;
-    let raw = tokio::fs::read(&path)
-        .await
-        .map_err(|e| err_value("io_error", None, format!("read config: {e}")))?;
+    let Some(raw) = read_config_bytes(&path, missing).await? else {
+        return Ok(empty_config_root());
+    };
     serde_json::from_slice(&raw)
         .map_err(|e| err_value("io_error", None, format!("parse config: {e}")))
 }
 
+/// Create the config's directory chain when it is missing (the daemon's
+/// fresh-host path only, [`MissingConfig::Empty`]). Every directory created
+/// here is `0700`: the job file holds commands the agent-ops daemon will run.
+/// Under T1 this runs in the principal's child, as the principal's uid with
+/// HOME set to the principal's home, so the owner is the principal by
+/// construction — nothing is created as the broker.
+async fn ensure_config_dir(path: &Path) -> Result<(), Value> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder
+        .create(dir)
+        .await
+        .map_err(|e| err_value("io_error", None, format!("create config dir: {e}")))
+}
+
 /// Atomic write of the config root back to disk (temp + rename, same fs) so the
 /// live daemon never reads a torn file.
-async fn write_config_root(home_dir: Option<&Path>, root: &Value) -> Result<(), Value> {
+async fn write_config_root(
+    home_dir: Option<&Path>,
+    root: &Value,
+    missing: MissingConfig,
+) -> Result<(), Value> {
     let path = project_config_path(home_dir).map_err(|e| err_value("io_error", None, e))?;
+    if missing == MissingConfig::Empty {
+        ensure_config_dir(&path).await?;
+    }
     let serialized = serde_json::to_string_pretty(root)
         .map(|s| s + "\n")
         .map_err(|e| err_value("io_error", None, format!("serialize config: {e}")))?;
@@ -448,12 +509,16 @@ fn build_job(input: &Value) -> Result<(String, Value), Value> {
 /// form doesn't override them is NOT attempted — the form owns the definition),
 /// else append. Atomic write; daemon honors on next load. The shell never runs
 /// the job — this is a config write only.
-pub(crate) async fn upsert_job(home_dir: Option<&Path>, job: Value) -> Result<Value, String> {
+pub(crate) async fn upsert_job(
+    home_dir: Option<&Path>,
+    job: Value,
+    missing: MissingConfig,
+) -> Result<Value, String> {
     let (id, full) = match build_job(&job) {
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let mut root = match read_config_root(home_dir).await {
+    let mut root = match read_config_root(home_dir, missing).await {
         Ok(r) => r,
         Err(e) => return Ok(e),
     };
@@ -471,7 +536,7 @@ pub(crate) async fn upsert_job(home_dir: Option<&Path>, job: Value) -> Result<Va
     if created {
         arr.push(full);
     }
-    if let Err(e) = write_config_root(home_dir, &root).await {
+    if let Err(e) = write_config_root(home_dir, &root, missing).await {
         return Ok(e);
     }
     Ok(json!({ "ok": true, "jobId": id, "created": created }))
@@ -480,7 +545,7 @@ pub(crate) async fn upsert_job(home_dir: Option<&Path>, job: Value) -> Result<Va
 /// Remove a job from the project-scoped config by id. Atomic write; the daemon
 /// stops scheduling it on next load.
 pub(crate) async fn delete_job(home_dir: Option<&Path>, job_id: String) -> Result<Value, String> {
-    let mut root = match read_config_root(home_dir).await {
+    let mut root = match read_config_root(home_dir, MissingConfig::Error).await {
         Ok(r) => r,
         Err(e) => return Ok(e),
     };
@@ -496,7 +561,7 @@ pub(crate) async fn delete_job(home_dir: Option<&Path>, job_id: String) -> Resul
             format!("no job \"{job_id}\" in config"),
         ));
     }
-    if let Err(e) = write_config_root(home_dir, &root).await {
+    if let Err(e) = write_config_root(home_dir, &root, MissingConfig::Error).await {
         return Ok(e);
     }
     Ok(json!({ "ok": true, "jobId": job_id }))
@@ -518,19 +583,15 @@ fn jobs_array_from(root: Value) -> Vec<Value> {
 /// Read the project-scoped config + the daemon state file and return both,
 /// merged per job, plus daemon liveness. Run history is NOT included (the pkg
 /// reads cron_job_runs / agent_runs directly via host.dbQuery).
-pub(crate) async fn list_jobs(home_dir: Option<&Path>) -> Result<Value, String> {
-    // Config (required for the job list).
-    let cfg_path = match project_config_path(home_dir) {
-        Ok(p) => p,
-        Err(e) => return Ok(err_value("io_error", None, e)),
-    };
-    let cfg_raw = match tokio::fs::read(&cfg_path).await {
-        Ok(r) => r,
-        Err(e) => return Ok(err_value("io_error", None, format!("read config: {e}"))),
-    };
-    let cfg_root: Value = match serde_json::from_slice(&cfg_raw) {
+pub(crate) async fn list_jobs(
+    home_dir: Option<&Path>,
+    missing: MissingConfig,
+) -> Result<Value, String> {
+    // Config (required for the job list, unless `missing` folds its absence
+    // into an empty one).
+    let cfg_root = match read_config_root(home_dir, missing).await {
         Ok(v) => v,
-        Err(e) => return Ok(err_value("io_error", None, format!("parse config: {e}"))),
+        Err(e) => return Ok(e),
     };
     let cfg_jobs = jobs_array_from(cfg_root);
 
