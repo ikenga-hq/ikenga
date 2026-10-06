@@ -131,6 +131,44 @@ pub fn parse_agy_line(line: &str) -> Option<AgyEvent> {
 /// Antigravity CLI engine adapter normalizing to SessionUpdate ACP envelopes.
 pub struct AntigravityEngine {
     sessions: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<AntigravitySession>>>>>,
+    /// The CLI to run instead of resolving `agy` on PATH. Only tests set it.
+    binary_override: Option<PathBuf>,
+}
+
+/// The argv for one `agy` turn. It never carries the prompt (I-7): a
+/// process's argv is in `/proc/<pid>/cmdline`, which every user on the host
+/// can read unless procfs is mounted `hidepid` — and on a multi-user (T1)
+/// server a principal's shell session sees the host `/proc`, not the unit's
+/// `ProtectProc=invisible` one. With `--input-format stream-json` (agy
+/// 1.1.15+) the turn's text is read from stdin instead: one
+/// `{"event":"user",…}` line ([`agy_stdin_payload`]), then EOF. It is the
+/// same shape chi runs use (`chi_exec::build_engine_command_with`).
+fn agy_args(conversation: Option<&str>, model: Option<&str>, mode: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Some(id) = conversation {
+        args.extend(["--conversation".to_string(), id.to_string()]);
+    }
+    if let Some(m) = model {
+        args.extend(["--model".to_string(), m.to_string()]);
+    }
+    if let Some(m) = mode {
+        args.extend(["--mode".to_string(), m.to_string()]);
+    }
+    args
+}
+
+/// The bytes written to `agy`'s stdin for one turn (stdin is closed after
+/// them, which ends the turn). Shared with chi runs so the two can't drift.
+fn agy_stdin_payload(text: &str) -> String {
+    crate::server::shared::chi_exec::stdin_payload("antigravity-cli", text)
 }
 
 impl Default for AntigravityEngine {
@@ -143,6 +181,16 @@ impl AntigravityEngine {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            binary_override: None,
+        }
+    }
+
+    /// An engine that runs `binary` instead of `agy` (a test stub).
+    #[cfg(test)]
+    fn with_binary(binary: PathBuf) -> Self {
+        Self {
+            binary_override: Some(binary),
+            ..Self::new()
         }
     }
 
@@ -268,42 +316,36 @@ impl AntigravityEngine {
             )
         };
 
-        let cmd_binary =
-            which::which_in(DEFAULT_AGY_CMD, Some(crate::runtime::augmented_path()), ".")
+        let cmd_binary = match &self.binary_override {
+            Some(path) => path.clone(),
+            None => which::which_in(DEFAULT_AGY_CMD, Some(crate::runtime::augmented_path()), ".")
                 .or_else(|_| {
                     which::which_in("antigravity", Some(crate::runtime::augmented_path()), ".")
                 })
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_AGY_CMD));
+                .unwrap_or_else(|_| PathBuf::from(DEFAULT_AGY_CMD)),
+        };
 
         // Built as a `SpawnSpec` and spawned through the session executor
         // (WP-18); the T0 executor replays it onto a `tokio::process::Command`
-        // unchanged.
+        // unchanged, and on a T1 server it runs as the signed-in principal.
+        // The prompt is never an argument (I-7, see `agy_args`).
         let mut cmd = SpawnSpec::new(cmd_binary);
-        cmd.arg("-p")
-            .arg(text)
-            .arg("--output-format")
-            .arg("stream-json");
+        let turn_model = model.map(|m| m.to_string()).or(session_model);
+        cmd.args(agy_args(
+            conv_id.as_deref(),
+            turn_model.as_deref(),
+            session_mode.as_deref(),
+        ));
 
         if !cwd.is_empty() {
             cmd.current_dir(&cwd);
         }
 
-        if let Some(id) = &conv_id {
-            cmd.arg("--conversation").arg(id);
-        }
-        if let Some(m) = model.map(|m| m.to_string()).or(session_model) {
-            cmd.arg("--model").arg(m);
-        }
-        if let Some(m) = session_mode {
-            cmd.arg("--mode").arg(m);
-        }
-
         cmd.env("PATH", crate::runtime::augmented_path());
         let piped = PipedOpts {
-            // The prompt goes in on argv, so the child has no use for stdin.
-            // Leaving it as an open pipe we never write to and never close
-            // risks the CLI blocking forever on a read that can't complete.
-            stdin: StdioMode::Null,
+            // The turn's text goes in on stdin, which is closed right after
+            // it: agy's stream-json input waits for more lines until EOF.
+            stdin: StdioMode::Piped,
             stdout: StdioMode::Piped,
             stderr: StdioMode::Piped,
             kill_on_drop: true,
@@ -357,10 +399,27 @@ impl AntigravityEngine {
             .stdout
             .take()
             .ok_or_else(|| "antigravity stdout not piped".to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "antigravity stdin not piped".to_string())?;
         let child_handle = Arc::new(TokioMutex::new(child));
         {
             let mut s = session_arc.lock().await;
             s.in_flight = Some(child_handle.clone());
+        }
+
+        // The turn's text goes to stdin — a pipe only this process and the
+        // CLI hold — and stdin is closed, which ends the turn (I-7). Written
+        // after `in_flight` is set so a cancel can still kill a child that
+        // stalls on the write. A failed write leaves the CLI with no prompt,
+        // so it is killed rather than left waiting.
+        let mut stdin_error: Option<String> = None;
+        if let Err(e) =
+            crate::server::shared::chi_exec::write_prompt(stdin, &agy_stdin_payload(text)).await
+        {
+            let _ = child_handle.lock().await.start_kill();
+            stdin_error = Some(format!("antigravity stdin write failed: {e}"));
         }
 
         let mut lines = BufReader::new(stdout).lines();
@@ -432,6 +491,9 @@ impl AntigravityEngine {
         // `session/cancel`, even when the kill made the underlying read fail.
         if cancelled {
             return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
+        if let Some(e) = stdin_error {
+            return Err(e);
         }
         if let Some(e) = read_error {
             return Err(e);
@@ -682,5 +744,145 @@ mod tests {
             parse_agy_line(r#"{"event":"step_update","step_update":{"text_delta":""}}"#),
             Some(AgyEvent::Other)
         );
+    }
+
+    // ── I-7: the turn's text never reaches argv ─────────────────────────
+
+    const SENTINEL: &str = "I7-AGY-SENTINEL-4c1f";
+
+    #[test]
+    fn agy_argv_never_carries_the_prompt_and_reads_it_from_stdin() {
+        let args = agy_args(Some("conv-1"), Some("gemini-x"), Some("plan"));
+        assert_eq!(
+            args,
+            [
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--conversation",
+                "conv-1",
+                "--model",
+                "gemini-x",
+                "--mode",
+                "plan",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "-p" || a == "--prompt"));
+
+        let prompt = format!("{SENTINEL} line one\nline \"two\" $HOME `id`");
+        let payload = agy_stdin_payload(&prompt);
+        assert!(payload.ends_with('\n'));
+        assert_eq!(payload.matches('\n').count(), 1, "one NDJSON line");
+        let v: serde_json::Value = serde_json::from_str(payload.trim_end()).unwrap();
+        assert_eq!(v["event"], "user");
+        assert_eq!(v["message"]["content"], prompt);
+    }
+
+    /// A fake `agy`: records its argv, its own `/proc/<pid>/cmdline` (what
+    /// another user on the host would see) and its stdin into the cwd, then
+    /// speaks stream-json. It reads stdin to EOF first, so a turn whose stdin
+    /// is never closed hangs instead of passing.
+    ///
+    /// Written once per test process: writing an executable while other test
+    /// threads fork can make a concurrent exec of it fail with ETXTBSY.
+    #[cfg(unix)]
+    fn stub_agy() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static STUB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        STUB.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("ikenga-agy-stub-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("agy");
+            std::fs::write(
+                &path,
+                r#"#!/bin/sh
+printf '%s\n' "$@" > argv
+if [ -r /proc/$$/cmdline ]; then tr '\000' ' ' < /proc/$$/cmdline > cmdline; fi
+cat >> stdin
+printf '%s\n' '{"event":"init","conversation_id":"conv-stub"}'
+printf '%s\n' '{"event":"step_update","step_update":{"step_type":"response","text_delta":"PONG"}}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS"}}'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        })
+        .clone()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_turns_send_the_prompt_on_stdin_never_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().canonicalize().unwrap();
+        let read = |name: &str| std::fs::read_to_string(cwd.join(name)).unwrap_or_default();
+        let engine = AntigravityEngine::with_binary(stub_agy());
+        engine
+            .register_session("t-i7".into(), cwd.to_string_lossy().into_owned())
+            .await;
+
+        let out = Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = out.clone();
+        let cb = move |u: SessionUpdate| {
+            if let SessionUpdate::AgentMessageChunk(c) = u {
+                if let ContentBlock::Text(t) = c.content {
+                    sink.lock().unwrap().push_str(&t.text);
+                }
+            }
+        };
+        let cb: &(dyn Fn(SessionUpdate) + Send + Sync) = &cb;
+        let turn = |text: String| {
+            let engine = &engine;
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    engine.run_prompt("t-i7", &text, Some("m-1"), Some(cb)),
+                )
+                .await
+                .expect("turn hung: stdin was not closed")
+            }
+        };
+
+        // First turn: a new conversation.
+        let first = format!("{SENTINEL} first turn, it's $HOME; `id` \"q\"\nsecond line");
+        let res = turn(first.clone()).await.unwrap();
+        assert_eq!(res.stop_reason, StopReason::EndTurn);
+        assert_eq!(out.lock().unwrap().as_str(), "PONG");
+        let argv = read("argv");
+        assert!(!argv.is_empty(), "the stub ran");
+        assert!(!argv.contains(SENTINEL), "argv: {argv}");
+        assert!(!argv.lines().any(|a| a == "-p"), "argv: {argv}");
+        assert!(
+            argv.contains("--input-format\nstream-json\n"),
+            "argv: {argv}"
+        );
+        assert!(!argv.contains("--conversation"), "argv: {argv}");
+        #[cfg(target_os = "linux")]
+        {
+            let cmdline = read("cmdline");
+            assert!(!cmdline.is_empty(), "the stub read its own cmdline");
+            assert!(!cmdline.contains(SENTINEL), "cmdline: {cmdline}");
+        }
+        let stdin = read("stdin");
+        let v: serde_json::Value = serde_json::from_str(stdin.trim_end()).unwrap();
+        assert_eq!(v["event"], "user");
+        assert_eq!(v["message"]["content"], first);
+
+        // Second turn resumes the conversation by id; the follow-up goes to
+        // stdin too.
+        let follow_up = format!("{SENTINEL} follow-up");
+        turn(follow_up.clone()).await.unwrap();
+        let argv = read("argv");
+        assert!(!argv.contains(SENTINEL), "resume argv: {argv}");
+        assert!(argv.contains("--conversation\nconv-stub\n"), "argv: {argv}");
+        #[cfg(target_os = "linux")]
+        assert!(!read("cmdline").contains(SENTINEL));
+        let stdin = read("stdin");
+        let second: serde_json::Value =
+            serde_json::from_str(stdin.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(second["message"]["content"], follow_up);
     }
 }

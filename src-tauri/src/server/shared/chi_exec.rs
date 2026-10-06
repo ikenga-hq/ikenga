@@ -1268,8 +1268,12 @@ async fn start_reader(
 /// Write the prompt payload and close stdin for real. `shutdown()` on a
 /// child pipe does not close the handle, so it is dropped: until the write
 /// end closes, a stream-json engine waits for more input and a read-to-EOF
-/// engine (codex `-`, opencode, pi) never starts.
-async fn write_prompt(mut stdin: tokio::process::ChildStdin, payload: &str) -> std::io::Result<()> {
+/// engine (codex `-`, opencode, pi) never starts. The daemon's chat-socket
+/// antigravity engine feeds its turns through this too (I-7).
+pub(crate) async fn write_prompt(
+    mut stdin: tokio::process::ChildStdin,
+    payload: &str,
+) -> std::io::Result<()> {
     stdin.write_all(payload.as_bytes()).await?;
     let _ = stdin.flush().await;
     let _ = stdin.shutdown().await;
