@@ -18,7 +18,7 @@ import {
 	useState,
 } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { AlertCircle, Info, Lock } from 'lucide-react';
+import { AlertCircle, Lock } from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { ErrorState, LoadingState } from '@/components/states';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
@@ -208,15 +208,6 @@ export function TextDocumentFrame({
 				</div>
 			)}
 			{banner}
-			{editing && doc.notice && (
-				<div
-					role="status"
-					className="flex items-center gap-2 border-b border-border bg-muted/30 px-4 py-1 text-[11px] text-muted-foreground"
-				>
-					<Info className="h-3 w-3 shrink-0" />
-					<span>{doc.notice}</span>
-				</div>
-			)}
 			<div className="min-h-0 flex-1">
 				{!editing ? (
 					renderView(doc.viewText)

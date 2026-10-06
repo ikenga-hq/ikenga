@@ -1,8 +1,8 @@
 // Behaviour of the shared editing surface (plans/file-editing Shape 1–3, 5):
 // read-only until Edit, dirty → save writes once, Cancel restores, the F3
 // conflict choice, validation blocking, the large-file guard, the watcher and
-// ⌘S. The CodeMirror editor is replaced by a textarea; the fs wrappers by an
-// in-memory disk.
+// ⌘S. The CodeMirror editor is replaced by a textarea that, like it, takes a
+// new value in an effect after the render; the fs wrappers by an in-memory disk.
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -85,10 +85,19 @@ vi.mock('@ikenga/ui-lib', async () => {
 			getSelection: () => ({ from: 0, to: 0, text: '' }),
 			view: () => null,
 		}));
+		// Like the real CodeEditor, take a new `value` in an effect after the
+		// render, not during it: what the editor shows until then is what a
+		// keystroke is typed on (use-text-document's "Lineage").
+		const taRef = React.useRef<HTMLTextAreaElement>(null);
+		React.useEffect(() => {
+			const ta = taRef.current;
+			if (ta && ta.value !== props.value) ta.value = props.value;
+		}, [props.value]);
 		return (
 			<textarea
+				ref={taRef}
 				aria-label={props.ariaLabel ?? 'editor'}
-				value={props.value}
+				defaultValue={props.value}
 				readOnly={props.readOnly}
 				onChange={(e) => props.onChange(e.target.value)}
 			/>
@@ -330,16 +339,95 @@ describe('EditableTextFrame — watcher', () => {
 		expect(ed.value).toBe('mine');
 	});
 
-	it('a change while clean reloads quietly', async () => {
+	it('in View, a change reloads quietly', async () => {
+		h.disk.set('/w/a.ts', enc('base'));
+		mount('/w/a.ts');
+		await ready();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/a.ts', enc('theirs'));
+		await fireWatchEvent('/w/a.ts');
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('theirs'));
+		expect(document.querySelector('[data-state="editor-conflict"]')).toBeNull();
+		const ed = await startEditing();
+		expect(ed.value).toBe('theirs');
+	});
+
+	// Founder rule: in Edit the buffer is never replaced under the user, even
+	// a clean one — a keystroke may already be on its way.
+	it('in Edit, a change while clean raises the choice and leaves the buffer alone', async () => {
 		h.disk.set('/w/a.ts', enc('base'));
 		mount('/w/a.ts');
 		const ed = await startEditing();
 		await waitFor(() => expect(h.watchCb).not.toBeNull());
 		h.disk.set('/w/a.ts', enc('theirs'));
-		await act(async () => h.watchCb?.({ kind: 'modify', path: '/w/a.ts' }));
+		await fireWatchEvent('/w/a.ts');
+		await waitFor(() =>
+			expect(document.querySelector('[data-state="editor-conflict"]')).not.toBeNull()
+		);
+		expect(ed.value).toBe('base');
+		expect(button(/Load theirs/)).toBeTruthy();
+		expect(button(/Keep mine/)).toBeTruthy();
+		expect(button('Show diff')).toBeTruthy();
+		expect(fsWriteText).not.toHaveBeenCalled();
+		// Load theirs takes it.
+		fireEvent.click(button(/Load theirs/));
 		await waitFor(() => expect(ed.value).toBe('theirs'));
-		expect(screen.queryByText(/changed on disk since you opened it/)).toBeNull();
-		expect(screen.getByText(/Reloaded/)).toBeTruthy();
+		expect(document.querySelector('[data-state="editor-conflict"]')).toBeNull();
+		expect(fsWriteText).not.toHaveBeenCalled();
+	});
+
+	it('in Edit, Done on a clean buffer with the choice open shows the file as it is now', async () => {
+		h.disk.set('/w/a.ts', enc('base'));
+		mount('/w/a.ts');
+		await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/a.ts', enc('theirs'));
+		await fireWatchEvent('/w/a.ts');
+		await waitFor(() =>
+			expect(document.querySelector('[data-state="editor-conflict"]')).not.toBeNull()
+		);
+		fireEvent.click(button('Done'));
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('theirs'));
+		const ed = await startEditing();
+		expect(ed.value).toBe('theirs');
+		expect(document.querySelector('[data-state="editor-conflict"]')).toBeNull();
+	});
+
+	// Regression (round-4 review, blocking): the watcher quietly reloaded a
+	// clean buffer in Edit; a keystroke landing before CodeMirror took the new
+	// value was typed on the old text, and the next Save wrote it over the
+	// outside change with no conflict. Now the change raises the choice, the
+	// keystroke stays on the old base, and Save writes nothing.
+	it('typing right after an outside change to a clean buffer in Edit never overwrites it', async () => {
+		h.disk.set('/w/n.md', enc('B line\n'));
+		mount('/w/n.md');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/n.md', enc('A agent wrote this\n'));
+		h.holdReads = true;
+		let reread: unknown;
+		act(() => {
+			reread = h.watchCb?.({ kind: 'modify', path: '/w/n.md' });
+		});
+		await waitFor(() => expect(h.heldReads).toHaveLength(1));
+		h.holdReads = false;
+		// The watcher's re-read finishes, and the keystroke — typed on the text
+		// the editor still shows — lands before React renders what it did.
+		await act(async () => {
+			h.heldReads.shift()?.();
+			await reread;
+			type(ed, 'B line\nk');
+		});
+		await flush();
+		expect(ed.value).toBe('B line\nk');
+		fireEvent.click(button('Save'));
+		await flush();
+		act(() => ed.focus());
+		fireEvent.keyDown(ed, { key: 's', ...MOD });
+		await flush();
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(diskText('/w/n.md')).toBe('A agent wrote this\n');
+		expect(document.querySelector('[data-state="editor-conflict"]')).not.toBeNull();
 	});
 
 	it('ignores the event for our own write', async () => {
@@ -529,9 +617,10 @@ describe('EditableTextFrame — a revert to our own earlier save is a conflict',
 		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 		await waitFor(() => expect(diskText('/w/a.ts')).toBe('A1'));
 		await waitFor(() => expect(screen.queryByLabelText('Unsaved changes')).toBeNull());
-		// An agent writes A2; the clean buffer adopts it.
+		// An agent writes A2; the user takes it.
 		h.disk.set('/w/a.ts', enc('A2'));
 		await act(async () => h.watchCb?.({ kind: 'modify', path: '/w/a.ts' }));
+		fireEvent.click(await screen.findByRole('button', { name: /Load theirs/ }));
 		await waitFor(() => expect(ed.value).toBe('A2'));
 		type(ed, 'D');
 		// The agent reverts the file to A1.
@@ -722,14 +811,16 @@ describe('EditableTextFrame — bytes that turn uneditable while open', () => {
 });
 
 describe('EditableTextFrame — a watcher reload keeps the new line endings and BOM', () => {
-	it('a clean reload of a CRLF + BOM file saves back as CRLF + BOM', async () => {
+	it('a reload (in View) of a CRLF + BOM file saves back as CRLF + BOM', async () => {
 		h.disk.set('/w/a.txt', enc('a\n'));
 		mount('/w/a.txt');
-		const ed = await startEditing();
+		await ready();
 		await waitFor(() => expect(h.watchCb).not.toBeNull());
 		h.disk.set('/w/a.txt', new Uint8Array([0xef, 0xbb, 0xbf, ...enc('b\r\n')]));
 		await fireWatchEvent('/w/a.txt');
-		await waitFor(() => expect(ed.value).toBe('b\n'));
+		await waitFor(() => expect(screen.getByTestId('view').textContent).toBe('b\n'));
+		const ed = await startEditing();
+		expect(ed.value).toBe('b\n');
 		type(ed, 'b\nc\n');
 		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));

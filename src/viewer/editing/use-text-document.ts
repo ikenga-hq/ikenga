@@ -9,8 +9,14 @@
 // - `save` is conditional (F3): validate → re-read → compare with `base` →
 //   write only if the file is unchanged. A changed file raises the conflict
 //   choice instead of writing; a missing file raises the "deleted" choice.
-// - The file watcher reloads a clean buffer quietly and raises the conflict
-//   choice early for a dirty one. Our own write is recognised and ignored.
+// - The file watcher never changes the buffer under Edit. In View (read-only,
+//   nothing to lose) it reloads quietly; in Edit — clean or dirty — a change
+//   on disk raises the conflict choice (Load theirs / Keep mine / Show diff).
+//   Our own write is recognised and ignored.
+// - Every draft remembers the base it descends from (its `Origin`), and Save
+//   checks the file against *that* base, not merely the one on screen — so an
+//   edit made on text the editor showed before a reload can never be written
+//   over the newer file unseen (see "Lineage" below).
 // - Text only ever enters the buffer (or becomes the save base) through the
 //   strict `decodeForEdit` path — at load, and via `classifyReread` for every
 //   later read (watcher, save re-read, Load theirs, Cancel). Bytes it refuses
@@ -31,6 +37,21 @@
 // format finishing after a watcher reload put the old text back over the new
 // file, and so on — each async step applied a result computed against a base
 // that had since changed.
+//
+// Lineage. Typing is the one buffer writer outside the queue. CodeMirror
+// keeps its own copy of the text and takes a new `value` only in an effect
+// after React renders, so a keystroke landing between a programmatic change
+// and that render is computed on the text the editor still shows. Each draft
+// therefore carries the `Origin` (base) of the text it was typed on: typing
+// takes the origin of what the editor last rendered, not of the newest draft.
+// Save compares the file against that origin's base, so such an edit meets
+// the conflict choice instead of silently overwriting the change. A
+// successful save links the old origin to the new one, so text typed while
+// it ran counts as descending from what was written. This relies on the
+// editor taking a new `value` in a passive effect, as @ikenga/ui-lib's
+// CodeEditor does: that effect (in a child) runs just before the one here
+// that records the origin, so the two always agree. An editor that showed a
+// new value earlier would need to report its origin itself.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { type StashedDraft, sessionKey, useEditingStore } from '@/lib/editing/editing-store';
@@ -90,8 +111,6 @@ export interface TextDocument {
 	saveState: SaveState;
 	conflict: Conflict | null;
 	validation: ValidationError | null;
-	/** A short-lived note, e.g. "Reloaded — the file changed on disk." */
-	notice: string | null;
 	/** The buffer operation running (or still queued), or null. Save, Keep
 	 *  mine, Load theirs, Cancel and Format are disabled while it is set. */
 	busy: DocOp | null;
@@ -112,8 +131,6 @@ export interface TextDocument {
 	transform: (fn: (text: string) => Promise<string>) => Promise<TransformResult>;
 	dismissValidation: () => void;
 }
-
-const NOTICE_MS = 4_000;
 
 const HELD_NOTE = 'Your unsaved edits are kept but can’t be applied to the file as it is now.';
 const UNSAVED_NOTE =
@@ -149,6 +166,23 @@ interface OpContext {
 	current: () => boolean;
 }
 
+/** A base text a draft can descend from. Compared by identity: two loads of
+ *  the same text are different origins. `savedAs` links an origin to the one a
+ *  save from it produced, so text typed during the save follows it. */
+interface Origin {
+	base: string;
+	savedAs: Origin | null;
+}
+
+const newOrigin = (base: string): Origin => ({ base, savedAs: null });
+
+/** The newest origin on this line of descent. */
+function resolveOrigin(o: Origin): Origin {
+	let cur = o;
+	while (cur.savedAs) cur = cur.savedAs;
+	return cur;
+}
+
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 export function useTextDocument({
@@ -157,12 +191,17 @@ export function useTextDocument({
 	validate,
 }: UseTextDocumentOptions): TextDocument {
 	const [doc, setDoc] = useState<DocState>(INITIAL);
-	const [draft, setDraftState] = useState('');
+	// The buffer and the origin it descends from, committed together so the
+	// effect below knows which origin the editor is showing.
+	const [draftState, setDraftPair] = useState<{ text: string; origin: Origin }>(() => ({
+		text: '',
+		origin: newOrigin(''),
+	}));
+	const draft = draftState.text;
 	const [mode, setMode] = useState<'view' | 'edit'>('view');
 	const [saveState, setSaveState] = useState<SaveState>({ kind: 'idle' });
 	const [conflict, setConflict] = useState<Conflict | null>(null);
 	const [validation, setValidation] = useState<ValidationError | null>(null);
-	const [notice, setNotice] = useState<string | null>(null);
 	const [busy, setBusy] = useState<DocOp | null>(null);
 
 	// Refs the async paths read, so they see the latest values without
@@ -188,7 +227,11 @@ export function useTextDocument({
 	const heldStashRef = useRef<StashedDraft | null>(null);
 	// The load failed and a stashed draft was restored in its place.
 	const loadErrorRef = useRef<string | null>(null);
-	const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Lineage (see the header): the origin of `baseRef`, of `draftRef`, and of
+	// the text the editor last rendered — which is what a keystroke is typed on.
+	const baseOriginRef = useRef<Origin>(newOrigin(''));
+	const draftOriginRef = useRef<Origin>(baseOriginRef.current);
+	const editorOriginRef = useRef<Origin>(baseOriginRef.current);
 
 	// Ordering (see the header): `epoch` changes when this editor stops
 	// showing the document (unmount, another file); `gen` whenever the base or
@@ -203,31 +246,55 @@ export function useTextDocument({
 	const dirty = doc.load.kind === 'ready' && draft !== doc.base;
 	const key = sessionKey(path, paneId);
 
+	// The editor has rendered `draftState`: its CodeMirror effect (a child,
+	// so it runs first) has synced the text, and a keystroke from here on is
+	// typed on text descending from this origin.
+	useEffect(() => {
+		editorOriginRef.current = draftState.origin;
+	}, [draftState]);
+
+	/** Set the buffer and the origin it descends from. */
+	const putDraft = useCallback((text: string, origin: Origin) => {
+		draftRef.current = text;
+		draftOriginRef.current = origin;
+		setDraftPair({ text, origin });
+	}, []);
+
 	/** The user typing. Does not bump the generation: a save may run while
 	 *  the user types (it saves what it read), and a transform checks the
-	 *  draft itself. */
-	const setDraft = useCallback((next: string) => {
-		draftRef.current = next;
-		setDraftState(next);
-	}, []);
+	 *  draft itself. The text was typed on what the editor last rendered, so
+	 *  it descends from that origin — not necessarily the newest draft's. */
+	const setDraft = useCallback(
+		(next: string) => {
+			if (next === draftRef.current) return;
+			putDraft(next, editorOriginRef.current);
+		},
+		[putDraft]
+	);
 
 	/** Replace the draft programmatically (reload, Load theirs, Cancel, a
-	 *  restored stash, a transform). */
-	const replaceDraft = useCallback((next: string) => {
-		genRef.current++;
-		draftRef.current = next;
-		setDraftState(next);
-	}, []);
+	 *  restored stash, a transform) with text descending from `origin`. */
+	const replaceDraft = useCallback(
+		(next: string, origin: Origin) => {
+			genRef.current++;
+			putDraft(next, origin);
+		},
+		[putDraft]
+	);
 
 	/** Take strictly decoded disk text (and its line ending / BOM) as the
-	 *  base — and as the draft too, when `withDraft`. */
+	 *  base — and as the draft too, when `withDraft`. Returns the new base's
+	 *  origin. */
 	const adoptDisk = useCallback(
-		(text: string, meta: DocumentMeta, withDraft: boolean) => {
+		(text: string, meta: DocumentMeta, withDraft: boolean): Origin => {
 			genRef.current++;
+			const origin = newOrigin(text);
 			metaRef.current = meta;
 			baseRef.current = text;
-			if (withDraft) replaceDraft(text);
+			baseOriginRef.current = origin;
+			if (withDraft) replaceDraft(text, origin);
 			setDoc((d) => ({ ...d, base: text, viewText: text, meta }));
+			return origin;
 		},
 		[replaceDraft]
 	);
@@ -264,12 +331,6 @@ export function useTextDocument({
 		if (blockedRef.current === null || heldStashRef.current) return;
 		blockedRef.current = null;
 		setDoc((d) => ({ ...d, blocked: null }));
-	}, []);
-
-	const flashNotice = useCallback((text: string) => {
-		setNotice(text);
-		if (noticeTimer.current) clearTimeout(noticeTimer.current);
-		noticeTimer.current = setTimeout(() => setNotice(null), NOTICE_MS);
 	}, []);
 
 	/**
@@ -324,8 +385,14 @@ export function useTextDocument({
 			// Never drop a session that still holds a stash — one claimed by a
 			// load that has not finished, one held for a file that cannot be
 			// edited, or any other.
+			// The stash is based on what the draft descends from, so the
+			// remount's conflict check compares against the right text.
 			const stash: StashedDraft | undefined = unsaved
-				? { draft: draftRef.current, base: baseRef.current, meta: metaRef.current }
+				? {
+						draft: draftRef.current,
+						base: resolveOrigin(draftOriginRef.current).base,
+						meta: metaRef.current,
+					}
 				: (heldStashRef.current ?? pending ?? cur?.stash);
 			if (!stash) {
 				store.remove(key);
@@ -354,15 +421,14 @@ export function useTextDocument({
 		setBusy(null);
 		loadedRef.current = false;
 		baseRef.current = '';
-		draftRef.current = '';
-		setDraftState('');
+		baseOriginRef.current = newOrigin('');
+		putDraft('', baseOriginRef.current);
 		metaRef.current = INITIAL.meta;
 		setDoc(INITIAL);
 		setModeNow('view');
 		setSaveState({ kind: 'idle' });
 		raiseConflict(null);
 		setValidation(null);
-		setNotice(null);
 		heldStashRef.current = null;
 		loadErrorRef.current = null;
 		blockedRef.current = null;
@@ -384,8 +450,8 @@ export function useTextDocument({
 			genRef.current++;
 			metaRef.current = stash.meta;
 			baseRef.current = stash.base;
-			draftRef.current = stash.draft;
-			setDraftState(stash.draft);
+			baseOriginRef.current = newOrigin(stash.base);
+			putDraft(stash.draft, baseOriginRef.current);
 			setDoc({
 				load: { kind: 'ready' },
 				viewText,
@@ -444,8 +510,8 @@ export function useTextDocument({
 				genRef.current++;
 				metaRef.current = dec.meta;
 				baseRef.current = dec.text;
-				draftRef.current = dec.text;
-				setDraftState(dec.text);
+				baseOriginRef.current = newOrigin(dec.text);
+				putDraft(dec.text, baseOriginRef.current);
 				setDoc({
 					load: { kind: 'ready' },
 					viewText: dec.text,
@@ -477,14 +543,7 @@ export function useTextDocument({
 			epochRef.current++;
 			loadedRef.current = false;
 		};
-	}, [path, paneId, setModeNow, raiseConflict]);
-
-	useEffect(
-		() => () => {
-			if (noticeTimer.current) clearTimeout(noticeTimer.current);
-		},
-		[]
-	);
+	}, [path, paneId, setModeNow, raiseConflict, putDraft]);
 
 	// ── Save (conditional, F3) ───────────────────────────────────────────────
 	const save = useCallback(
@@ -495,9 +554,13 @@ export function useTextDocument({
 				// (resolved meanwhile) it is an ordinary conditional save.
 				const answered = opts?.force === true ? conflictRef.current : null;
 				const next = draftRef.current;
-				const base = baseRef.current;
+				// The base `next` was typed on — normally the one on screen, but
+				// not if the buffer changed under an edit (see "Lineage"). The
+				// file is checked against this one.
+				const origin = resolveOrigin(draftOriginRef.current);
+				const base = origin.base;
 				let meta = metaRef.current;
-				if (answered === null && next === base) return;
+				if (answered === null && next === baseRef.current) return;
 				setSaveState({ kind: 'saving' });
 				let outcome: SaveState = { kind: 'idle' };
 				try {
@@ -569,9 +632,10 @@ export function useTextDocument({
 					}
 					if (!op.current()) return;
 					// The base is now what we wrote, so the watcher's `disk ===
-					// base` check ignores our own write.
+					// base` check ignores our own write. Text typed on `origin`
+					// meanwhile now descends from the write.
 					loadErrorRef.current = null;
-					adoptDisk(next, meta, false);
+					origin.savedAs = adoptDisk(next, meta, false);
 					raiseConflict(null);
 				} finally {
 					if (op.live()) setSaveState(outcome);
@@ -668,7 +732,8 @@ export function useTextDocument({
 				if (!op.current() || draftRef.current !== src || blockedRef.current !== null) {
 					return 'stale';
 				}
-				if (out !== src) replaceDraft(out);
+				// Formatted text descends from the same base as its source.
+				if (out !== src) replaceDraft(out, draftOriginRef.current);
 				return 'applied';
 			});
 			return result ?? 'stale';
@@ -680,13 +745,6 @@ export function useTextDocument({
 		if (doc.load.kind !== 'ready' || doc.blocked !== null) return;
 		setModeNow('edit');
 	}, [doc.load.kind, doc.blocked, setModeNow]);
-
-	const finishEdit = useCallback(() => {
-		if (draftRef.current !== baseRef.current) return;
-		setModeNow('view');
-		setValidation(null);
-		setSaveState({ kind: 'idle' });
-	}, [setModeNow]);
 
 	const dismissValidation = useCallback(() => setValidation(null), []);
 
@@ -715,26 +773,41 @@ export function useTextDocument({
 				blockEditing(disk.reason, disk.viewText);
 				return;
 			}
-			const clean = draftRef.current === baseRef.current;
+			// Only View takes a change quietly: nothing there can be lost. In
+			// Edit the buffer is never replaced under the user, clean or dirty
+			// — a keystroke can always be on its way (see "Lineage").
+			const viewing = modeRef.current === 'view' && draftRef.current === baseRef.current;
 			if (disk.kind === 'unchanged') {
-				// Same text — maybe new line endings or BOM, which a clean buffer
-				// takes so the next save writes what is on disk.
-				if (clean) adoptDisk(baseRef.current, disk.meta, false);
+				// Same text — maybe new line endings or BOM. View takes them; in
+				// Edit the save re-read picks up the file's current ones.
+				if (viewing) adoptDisk(baseRef.current, disk.meta, false);
 				else setDoc((d) => ({ ...d, viewText: baseRef.current }));
 				unblockEditing();
 				return;
 			}
 			unblockEditing();
-			if (clean) {
+			if (viewing) {
 				adoptDisk(disk.text, disk.meta, true);
-				if (modeRef.current === 'edit') flashNotice('Reloaded — the file changed on disk.');
 				return;
 			}
 			raiseConflict({ kind: 'changed', theirs: disk.text });
 		});
 		rereadRef.current = pending;
 		return pending;
-	}, [runOp, path, adoptDisk, blockEditing, unblockEditing, flashNotice, raiseConflict]);
+	}, [runOp, path, adoptDisk, blockEditing, unblockEditing, raiseConflict]);
+
+	const finishEdit = useCallback(() => {
+		if (draftRef.current !== baseRef.current) return;
+		setModeNow('view');
+		setValidation(null);
+		setSaveState({ kind: 'idle' });
+		// Leaving Edit with the "changed on disk" choice still open on a clean
+		// buffer: nothing to keep, so View shows the file as it is now.
+		if (conflictRef.current?.kind === 'changed') {
+			raiseConflict(null);
+			void reread();
+		}
+	}, [setModeNow, raiseConflict, reread]);
 
 	const ready = doc.load.kind === 'ready';
 	useEffect(() => {
@@ -778,7 +851,6 @@ export function useTextDocument({
 		saveState,
 		conflict,
 		validation,
-		notice,
 		busy,
 		startEdit,
 		finishEdit,

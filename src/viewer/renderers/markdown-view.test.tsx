@@ -62,10 +62,18 @@ vi.mock('@ikenga/ui-lib', async () => {
 			getSelection: () => ({ from: 0, to: 0, text: '' }),
 			view: () => h.fakeView,
 		}));
+		// Like the real CodeEditor, take a new `value` in an effect after the
+		// render (see use-text-document's "Lineage").
+		const taRef = React.useRef<HTMLTextAreaElement>(null);
+		React.useEffect(() => {
+			const ta = taRef.current;
+			if (ta && ta.value !== props.value) ta.value = props.value;
+		}, [props.value]);
 		return (
 			<textarea
+				ref={taRef}
 				aria-label={props.ariaLabel}
-				value={props.value}
+				defaultValue={props.value}
 				onChange={(e) => props.onChange(e.target.value)}
 			/>
 		);
