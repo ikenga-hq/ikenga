@@ -812,6 +812,15 @@ pub async fn rpc_handler(
                 .await
         }
 
+        // --- WP-P9: in-app updates ---
+        //
+        // `internal` (only the T1 broker's own call reaches it): how many
+        // terminals a restart of this process would end. Served by T0 and
+        // principal children alike; nothing else.
+        "server_open_terminals" => RpcResponse::success(serde_json::json!({
+            "open": state.pty_manager.active_session_count(),
+        })),
+
         // --- Unknown Command Fallback ---
         other => {
             debug!("Unimplemented or pass-through RPC command: {other}");

@@ -256,6 +256,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("permission_decide", req!(shared[Approve])),
     ("notifications_record_access", req!(internal)),
     ("share_project_info", req!(internal)),
+    // WP-P9: the broker's cross-principal open-terminal count.
+    ("server_open_terminals", req!(internal)),
     ("permission_relay_put", req!(operator)),
     ("permission_relay_take", req!(operator)),
     ("permission_relay_resolve", req!(operator)),

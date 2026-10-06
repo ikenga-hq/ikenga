@@ -49,6 +49,8 @@ const VALID_TAGS: &[&str] = &["WP-19", "WP-18b", "WP-20", "desktop-only-forever"
 ///   `share_project_info` are `internal` arms (broker → owner child only);
 ///   the three `permission_relay_*` arms are called only by the desktop's
 ///   own Rust relay task (WP-75), never from the front end.
+/// * `server_open_terminals` (WP-P9) — `internal`: the T1 broker asks each
+///   running child how many terminals an update restart would end.
 const DAEMON_ONLY_VERBS: &[&str] = &[
     "fs_home",
     "notifications_record_access",
@@ -57,6 +59,7 @@ const DAEMON_ONLY_VERBS: &[&str] = &[
     "permission_relay_take",
     "pty_list",
     "secrets_default_names",
+    "server_open_terminals",
     "share_project_info",
 ];
 
