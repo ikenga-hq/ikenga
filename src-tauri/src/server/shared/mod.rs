@@ -13,6 +13,7 @@
 //! `server` is an ungated module in both builds. Nothing here depends on the
 //! HTTP server — no axum, no `AppState`.
 
+pub mod acp_mode;
 pub mod actions;
 pub mod activity_bar;
 pub mod agent_config;
@@ -22,7 +23,9 @@ pub mod agent_scaffold;
 pub mod atelier;
 pub mod backups;
 pub mod chi;
+pub mod chi_exec;
 pub mod chi_liveness;
+pub mod chi_runner;
 pub mod claude_config;
 pub mod claude_launch;
 pub mod claude_sessions;

@@ -85,18 +85,6 @@ reason = "Reply half of the same bg_spike_* debug harness; resolves a pending no
 tag = "desktop-only-forever"
 reason = "Phase 0.5 debug harness pinging the primary native webview window via eval round-trips; explicit 'debug spikes like bg_spike_*' example."
 
-[chi_cancel]
-tag = "WP-18b"
-reason = "Kills the chi engine child (child.start_kill()) and/or the detached chi-runner process group by pid — controls the chi_run spawns (both executor-routed since WP-18b); rpc.rs arm still pending."
-
-[chi_resume]
-tag = "WP-18b"
-reason = "resume_chi_run re-spawns the engine child through the same executor-routed path as chi_run (build_engine_command SpawnSpec -> executor::current().spawn_piped); rpc.rs arm still pending."
-
-[chi_run]
-tag = "WP-18b"
-reason = "spawn_chi_run spawns the in-process engine child via executor::current().spawn_piped (build_engine_command -> SpawnSpec), or for persistent runs a detached chi-runner (PipedOpts::detached); executor-routed since WP-18b part b, rpc.rs arm still pending."
-
 [claude_assets_discover]
 tag = "WP-19"
 reason = "discovery::discover reads the live pkg kernel's installed set (app.state::<KernelState>()) for tiers 2 and 4; the daemon runs no kernel (its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could only answer tiers 1 and 3 — a partial tree that would read as complete. Not served in slice 5b."
@@ -111,7 +99,7 @@ reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on
 
 [comment_route]
 tag = "WP-18b"
-reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) through executor::current(); executor-routed since WP-18b part b, rpc.rs arm still pending."
+reason = "RouteSink::Chi calls commands::chi::spawn_chi_run with the desktop's managed ChiCache/ChiRuntime/AppHandle; the chi core itself is daemon-served since WP-P10 (shared::chi_exec), but comment_route's sink resolution and its other sinks are still desktop-state-bound, so no rpc.rs arm yet."
 
 [db_export_ndjson]
 tag = "WP-19"
@@ -485,7 +473,7 @@ reason = "Read-only engine install-state info for the create form."
 
 [seats_fill]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run, the same executor-routed chi spawn path as chi_run; rpc.rs arm still pending."
+reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
 
 [seats_get]
 tag = "WP-19"
@@ -521,7 +509,7 @@ reason = "Routing decision only; doc comment 'Never resumes or starts anything',
 
 [seats_resume]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same executor-routed engine spawn path as chi_resume; rpc.rs arm still pending."
+reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
 
 [session_cancel]
 tag = "WP-19"

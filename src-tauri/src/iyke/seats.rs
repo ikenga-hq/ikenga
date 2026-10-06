@@ -715,7 +715,7 @@ pub(crate) struct EngineCap {
     pub unsupported_reason: Option<&'static str>,
 }
 
-/// §6.1, static, from `commands/chi.rs::build_engine_command_with`. The test
+/// §6.1, static, from `server/shared/chi_exec.rs::build_engine_command_with`. The test
 /// `every_chi_engine_arm_has_a_capability_row` walks that function's arms, so
 /// a new engine can't land without a row here.
 pub(crate) const ENGINE_CAPS: &[EngineCap] = &[
@@ -4357,15 +4357,16 @@ mod tests {
 
     // ── engine capability (§6.1) ────────────────────────────────────────
 
-    /// Walks `build_engine_command_with`'s match arms in `commands/chi.rs`:
+    /// Walks `build_engine_command_with`'s match arms in
+    /// `server/shared/chi_exec.rs` (moved from `commands/chi.rs` by WP-P10):
     /// every arm needs a capability row; an arm that refuses to build can't
     /// hold a seat, and every other arm can.
     #[test]
     fn every_chi_engine_arm_has_a_capability_row() {
-        let src = include_str!("../commands/chi.rs");
+        let src = include_str!("../server/shared/chi_exec.rs");
         let start = src
             .find("fn build_engine_command_with(")
-            .expect("build_engine_command_with in chi.rs");
+            .expect("build_engine_command_with in chi_exec.rs");
         let body = &src[start..];
         let end = body
             .find("\n}\n")
@@ -4394,8 +4395,15 @@ mod tests {
         assert!(body.contains("engine not yet supported by iyke chi"));
         assert!(!engine_seatable("gemini"));
         assert!(!engine_seatable("no-such-engine"));
-        // openrouter is dispatched in-process, before the arms.
-        assert!(src.contains("opts.engine_id == \"openrouter\""));
+        // openrouter is dispatched in-process, before the arms: the shared
+        // core asks its in-process engines first, and the desktop's (here)
+        // and the daemon's both claim openrouter.
+        assert!(src.contains("if engines.handles(&opts.engine_id)"));
+        assert!(include_str!("../commands/chi.rs").contains("engine_id == \"openrouter\""));
+        {
+            use crate::server::shared::chi_exec::{InProcessEngines, NoInProcessEngines};
+            assert!(NoInProcessEngines.handles("openrouter"));
+        }
         assert_eq!(
             engine_resume("openrouter"),
             Some(EngineResume::ProcessLocal)

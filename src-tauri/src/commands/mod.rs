@@ -16,8 +16,6 @@ pub mod backup;
 #[cfg(debug_assertions)]
 pub mod bg_spike;
 pub mod chi;
-// WP-18b: detached chi-runner spawn, pid liveness and process-group cancel.
-pub(crate) mod chi_runner;
 pub mod claude;
 pub mod claude_config;
 pub mod claude_store;

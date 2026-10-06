@@ -531,14 +531,20 @@ pub async fn rpc_handler(
         "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
         "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
-        // --- Chi reads, agent-ops files, identity (WP-19 slice 3) ---
+        // --- Chi runs, agent-ops files, identity (WP-19 slice 3, WP-P10) ---
         //
         // Also bodies in `server::rpc_local`, over `server::shared::{chi,
-        // agent_ops, identity}` — the cores the desktop commands call. The chi
-        // reads need `--data-dir`; the agent-ops arms resolve the router's home
-        // (single-user seam, G-PRINCIPAL / WP-20). Everything that spawns
-        // (`chi_run` / `chi_resume` / `chi_cancel`, `agent_ops_run_now`) stays
+        // chi_exec, agent_ops, identity}` — the cores the desktop commands
+        // call. Every chi arm needs `--data-dir`. The write arms (WP-P10)
+        // spawn and signal through `executor::current()`, so under T1 — where
+        // this handler runs in the signed-in principal's child — a run
+        // executes as that principal, against that principal's own ikenga.db
+        // and chi-cache. The agent-ops arms resolve the router's home
+        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` stays
         // desktop-only.
+        "chi_run" => rpc_local::chi_run(&state, &payload.args).await,
+        "chi_resume" => rpc_local::chi_resume(&state, &payload.args).await,
+        "chi_cancel" => rpc_local::chi_cancel(&state, &payload.args).await,
         "chi_status" => rpc_local::chi_status(&state, &payload.args).await,
         "chi_list" => rpc_local::chi_list(&state, &payload.args).await,
         "agent_ops_list_jobs" => rpc_local::agent_ops_list_jobs(&state).await,

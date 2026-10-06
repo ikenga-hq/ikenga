@@ -34,7 +34,7 @@ use super::rpc_shell::targ;
 use super::shared::chi::OutputFiles;
 use super::shared::settings::{SettingsManager, SettingsScope};
 use super::shared::{
-    agent_ops, backups, chi, chi_liveness, data_health, identity, pa_actions, pkg_db,
+    agent_ops, backups, chi, chi_exec, chi_liveness, data_health, identity, pa_actions, pkg_db,
     supabase_config,
 };
 use super::AppState;
@@ -329,12 +329,115 @@ pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcRespo
     respond("pkg_settings_get", r)
 }
 
-// ─── Chi run cache (reads) ───────────────────────────────────────────────────
+// ─── Chi runs ────────────────────────────────────────────────────────────────
 //
-// Only the reads are served. `chi_run` / `chi_resume` / `chi_cancel` spawn or
-// signal engine processes outside the session executor (WP-18b), so this
-// daemon never starts a chi run: its `chi_cache` is normally empty and these
-// answer that honestly — an empty list, or the desktop's "chi run not found".
+// Reads since WP-19 slice 3; the writes (`chi_run` / `chi_resume` /
+// `chi_cancel`) since WP-P10, over `shared::chi_exec` — the core the desktop
+// commands call. Every spawn and signal goes through `executor::current()`:
+// in a T1 principal child that is the principal's own uid, against the
+// principal's own `<data-dir>/ikenga.db` and `<data-dir>/chi-cache`, so a run
+// id from another principal is simply "chi run not found" here. The desktop
+// deltas: a run naming no cwd starts in the router home (the principal's
+// home under T1) instead of the process cwd; output paths are confined to the
+// cache dir; the in-process `openrouter` engine is refused (it needs the
+// desktop's engine registry + vault).
+
+/// The Chi write arms' process state, held in `AppState::chi`: the live-run
+/// registry `chi_cancel` reaches in-process runs through, and where engine
+/// binaries resolve (the host PATH in production, a stub in tests).
+pub(crate) struct DaemonChi {
+    pub(crate) runtime: Arc<chi_exec::ChiRuntime>,
+    pub(crate) resolver: Arc<dyn chi_exec::EngineResolver>,
+}
+
+impl DaemonChi {
+    pub(crate) fn host() -> Self {
+        Self {
+            runtime: Arc::new(chi_exec::ChiRuntime::new()),
+            resolver: Arc::new(chi_exec::HostResolver),
+        }
+    }
+}
+
+/// The daemon's [`chi_exec::ChiEnv`]: `--data-dir`'s db and chi-cache, the
+/// router home as the default cwd, output files confined to the cache dir.
+fn chi_env(state: &AppState) -> Result<chi_exec::ChiEnv, String> {
+    let db = state
+        .pa_db
+        .clone()
+        .ok_or_else(|| super::rpc::NO_DB.to_string())?;
+    Ok(chi_exec::ChiEnv {
+        db,
+        cache_dir: chi_cache_dir(state)?,
+        runtime: state.chi.runtime.clone(),
+        default_cwd: state.home.clone(),
+        files: OutputFiles::InCacheDir,
+        resolver: state.chi.resolver.clone(),
+    })
+}
+
+/// `chi_run`'s options. `tauri-cmd.ts` sends them nested under `opts`
+/// (`invoke('chi_run', { opts })`); a caller without that wrapper (curl, the
+/// Mattermost bridge) may send the same fields flat. camelCase and
+/// snake_case both accepted, `null` read as absent, a wrong type an error —
+/// as Tauri's own `ChiRunOpts` deserialization would.
+pub(super) fn chi_run_opts(args: &Value) -> Result<chi_exec::ChiRunOpts, String> {
+    let src = match args.get("opts") {
+        None | Some(Value::Null) => args,
+        Some(v @ Value::Object(_)) => v,
+        Some(_) => return Err("`opts` must be an object".to_string()),
+    };
+    let timeout_seconds = opt_u64(src, &["timeoutSeconds", "timeout_seconds"])?
+        .map(|t| u32::try_from(t).map_err(|_| "`timeoutSeconds` must fit in 32 bits".to_string()))
+        .transpose()?;
+    Ok(chi_exec::ChiRunOpts {
+        engine_id: req_str(src, &["engineId", "engine_id"])?,
+        prompt: req_str(src, &["prompt"])?,
+        cwd: opt_str(src, &["cwd"])?,
+        model: opt_str(src, &["model"])?,
+        mode: opt_str(src, &["mode"])?,
+        timeout_seconds,
+        parent_id: opt_str(src, &["parentId", "parent_id"])?,
+        resume_session_id: opt_str(src, &["resumeSessionId", "resume_session_id"])?,
+        persistent: opt_bool(src, &["persistent"])?.unwrap_or(false),
+    })
+}
+
+/// Start a Chi run (the desktop's `chi_run`, owner `cli`). Returns the run
+/// id at once; the engine runs in this process (or detached, `persistent`).
+pub(super) async fn chi_run(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let opts = chi_run_opts(args)?;
+        let env = chi_env(state)?;
+        chi_exec::spawn_run(&env, &chi_exec::NoInProcessEngines, opts, "cli").await
+    }
+    .await;
+    respond("chi_run", r)
+}
+
+/// Continue a run of this daemon's (same run id) with a new prompt.
+pub(super) async fn chi_resume(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let run_id = req_str(args, &["runId", "run_id"])?;
+        let prompt = req_str(args, &["prompt"])?;
+        let env = chi_env(state)?;
+        chi_exec::resume_run(&env, &chi_exec::NoInProcessEngines, run_id, prompt).await
+    }
+    .await;
+    respond("chi_resume", r)
+}
+
+/// Cancel a run of this daemon's: kill its engine child or its detached
+/// runner's process group (only when that pid is our runner, as our uid).
+pub(super) async fn chi_cancel(state: &AppState, args: &Value) -> RpcResponse {
+    let r = async {
+        let run_id = req_str(args, &["runId", "run_id"])?;
+        let env = chi_env(state)?;
+        chi_exec::cancel_run(&env.db, &env.runtime, &run_id).await
+    }
+    .await;
+    respond("chi_cancel", r)
+}
 
 /// `<data-dir>/chi-cache`, mirroring the desktop's `<app_data_dir>/chi-cache`.
 fn chi_cache_dir(state: &AppState) -> Result<PathBuf, String> {
@@ -342,9 +445,10 @@ fn chi_cache_dir(state: &AppState) -> Result<PathBuf, String> {
 }
 
 /// The desktop's read: row + output file + detached-run liveness decision,
-/// nothing written (the reconciliation sweep that persists a detached run's
-/// end is desktop-only). Output files are confined to the cache dir here —
-/// see [`OutputFiles::InCacheDir`].
+/// nothing written (the reconciliation sweep — `chi_exec`, started at boot
+/// when a chi-cache exists or on the first detached run — persists a detached
+/// run's end). Output files are confined to the cache dir here — see
+/// [`OutputFiles::InCacheDir`].
 pub(super) async fn chi_status(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let run_id = req_str(args, &["runId", "run_id"])?;
@@ -2420,6 +2524,323 @@ mod tests {
             assert_eq!(diag["ids"], json!(["com.a", "com.b"]));
             let direct = pkg_db::db_diag(&d.db).await.unwrap();
             assert_eq!(diag, serde_json::to_value(&direct).unwrap());
+        }
+    }
+
+    mod chi_write {
+        //! WP-P10: `chi_run` / `chi_resume` / `chi_cancel` over `/api/rpc`.
+        //! The engine is the stub `claude` from `chi_exec`'s tests, injected
+        //! through `router_with_chi`, so nothing here needs a real CLI.
+
+        use super::*;
+        use crate::server::rpc_local::{chi_run_opts, DaemonChi};
+        use crate::server::shared::chi_exec;
+        use crate::server::shared::chi_exec::tests::wait_for;
+
+        struct ChiDaemon {
+            _tmp: tempfile::TempDir,
+            home: PathBuf,
+            db: Arc<PaDb>,
+            router: Router,
+        }
+
+        fn chi_daemon() -> ChiDaemon {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let (data, home) = (root.join("data"), root.join("home"));
+            for d in [&data, &home] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            let db = Arc::new(PaDb::new(data.join("ikenga.db")));
+            #[cfg(unix)]
+            let resolver: Arc<dyn chi_exec::EngineResolver> =
+                Arc::new(chi_exec::tests::StubResolver(chi_exec::tests::stub_claude()));
+            #[cfg(not(unix))]
+            let resolver: Arc<dyn chi_exec::EngineResolver> = Arc::new(chi_exec::HostResolver);
+            let chi = Arc::new(DaemonChi {
+                runtime: Arc::new(chi_exec::ChiRuntime::new()),
+                resolver,
+            });
+            let router = crate::server::router_with_chi(
+                config(Some(data), None),
+                Some(db.clone()),
+                Some(home.clone()),
+                chi,
+            );
+            ChiDaemon {
+                _tmp: tmp,
+                home,
+                db,
+                router,
+            }
+        }
+
+        async fn status_of(r: &Router, run_id: &str) -> Value {
+            ok(r, "chi_status", json!({ "runId": run_id })).await
+        }
+
+        #[test]
+        fn chi_run_opts_accepts_nested_flat_camel_and_snake() {
+            let nested = chi_run_opts(&json!({ "opts": {
+                "engineId": "claude-code", "prompt": "p", "cwd": "/w", "model": "m",
+                "mode": "plan", "timeoutSeconds": 30, "parentId": "parent",
+                "resumeSessionId": "sess", "persistent": true,
+            }}))
+            .unwrap();
+            assert_eq!(nested.engine_id, "claude-code");
+            assert_eq!(nested.prompt, "p");
+            assert_eq!(nested.cwd.as_deref(), Some("/w"));
+            assert_eq!(nested.model.as_deref(), Some("m"));
+            assert_eq!(nested.mode.as_deref(), Some("plan"));
+            assert_eq!(nested.timeout_seconds, Some(30));
+            assert_eq!(nested.parent_id.as_deref(), Some("parent"));
+            assert_eq!(nested.resume_session_id.as_deref(), Some("sess"));
+            assert!(nested.persistent);
+
+            let flat = chi_run_opts(&json!({
+                "engine_id": "codex", "prompt": "q", "timeout_seconds": 5,
+                "parent_id": "pp", "resume_session_id": "s2", "cwd": null,
+            }))
+            .unwrap();
+            assert_eq!(flat.engine_id, "codex");
+            assert_eq!(flat.timeout_seconds, Some(5));
+            assert_eq!(flat.parent_id.as_deref(), Some("pp"));
+            assert_eq!(flat.resume_session_id.as_deref(), Some("s2"));
+            assert_eq!(flat.cwd, None, "null reads as absent");
+            assert!(!flat.persistent, "persistent defaults to false");
+
+            // `opts: null` falls back to the flat fields.
+            let null_opts =
+                chi_run_opts(&json!({ "opts": null, "engineId": "pi", "prompt": "r" })).unwrap();
+            assert_eq!(null_opts.engine_id, "pi");
+
+            let e = |args: Value| chi_run_opts(&args).err().unwrap();
+            assert_eq!(e(json!({ "opts": "x" })), "`opts` must be an object");
+            assert_eq!(
+                e(json!({ "opts": { "prompt": "p" } })),
+                "`engineId` is required"
+            );
+            assert_eq!(e(json!({ "engineId": "x" })), "`prompt` is required");
+            assert_eq!(
+                e(json!({ "engineId": "x", "prompt": "p", "persistent": "yes" })),
+                "`persistent` must be a boolean"
+            );
+            assert_eq!(
+                e(json!({ "engineId": "x", "prompt": "p", "timeoutSeconds": 1u64 << 40 })),
+                "`timeoutSeconds` must fit in 32 bits"
+            );
+            assert_eq!(
+                e(json!({ "engineId": "x", "prompt": "p", "timeoutSeconds": -1 })),
+                "`timeoutSeconds` must be a non-negative integer"
+            );
+            assert_eq!(
+                e(json!({ "engineId": 7, "prompt": "p" })),
+                "`engineId` must be a string"
+            );
+        }
+
+        #[tokio::test]
+        async fn chi_write_arms_need_a_data_dir() {
+            let r = bare(None);
+            let run = err(
+                &r,
+                "chi_run",
+                json!({ "opts": { "engineId": "claude-code", "prompt": "hi" } }),
+            )
+            .await;
+            assert_eq!(run, format!("chi_run: {}", crate::server::rpc::NO_DB));
+            for cmd in ["chi_resume", "chi_cancel"] {
+                let e = err(&r, cmd, json!({ "runId": "r1", "prompt": "x" })).await;
+                assert_eq!(e, format!("{cmd}: {}", crate::server::rpc::NO_DB));
+            }
+        }
+
+        #[tokio::test]
+        async fn chi_write_arms_reject_missing_args() {
+            let d = chi_daemon();
+            let r = &d.router;
+            assert_eq!(
+                err(r, "chi_run", json!({})).await,
+                "chi_run: `engineId` is required"
+            );
+            assert_eq!(
+                err(r, "chi_resume", json!({ "runId": "x" })).await,
+                "chi_resume: `prompt` is required"
+            );
+            assert_eq!(
+                err(r, "chi_resume", json!({ "prompt": "x" })).await,
+                "chi_resume: `runId` is required"
+            );
+            assert_eq!(
+                err(r, "chi_cancel", json!({})).await,
+                "chi_cancel: `runId` is required"
+            );
+            for cmd in ["chi_resume", "chi_cancel"] {
+                assert_eq!(
+                    err(r, cmd, json!({ "run_id": "nope", "prompt": "x" })).await,
+                    format!("{cmd}: chi run not found: nope")
+                );
+            }
+        }
+
+        /// An engine the daemon cannot run fails the call AND closes its row
+        /// as `failed`, so `chi_list` says why.
+        #[tokio::test]
+        async fn an_engine_that_cannot_start_leaves_a_failed_row() {
+            let d = chi_daemon();
+            let r = &d.router;
+            for (engine, want) in [
+                ("cursor-agent", "cursor-agent runtime not implemented"),
+                ("openrouter", chi_exec::HEADLESS_OPENROUTER),
+                (
+                    "no-such-engine",
+                    "engine not yet supported by iyke chi: no-such-engine",
+                ),
+            ] {
+                let e = err(
+                    r,
+                    "chi_run",
+                    json!({ "opts": { "engineId": engine, "prompt": "hi", "cwd": "/tmp" } }),
+                )
+                .await;
+                assert!(e.starts_with("chi_run: ") && e.contains(want), "{e}");
+                let rows = ok(r, "chi_list", json!({ "engineId": engine })).await;
+                let rows = rows.as_array().unwrap();
+                assert_eq!(rows.len(), 1, "{engine}");
+                assert_eq!(rows[0]["status"], "failed", "{engine}");
+            }
+        }
+
+        /// The whole loop a bridge drives: run → status → list → resume →
+        /// cancel, nested camelCase and flat snake_case args alike.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn chi_run_status_resume_cancel_round_trip() {
+            let d = chi_daemon();
+            let r = &d.router;
+
+            let started = ok(
+                r,
+                "chi_run",
+                json!({ "opts": { "engineId": "claude-code", "prompt": "hello" } }),
+            )
+            .await;
+            assert_eq!(started["status"], "running");
+            assert_eq!(started["error"], Value::Null);
+            let run_id = started["run_id"].as_str().unwrap().to_string();
+            assert!(wait_for(|| async { status_of(r, &run_id).await["status"] == "done" }).await);
+            let done = status_of(r, &run_id).await;
+            let out = done["output"].as_str().unwrap();
+            assert!(out.contains("--permission-mode default"), "{out}");
+            assert!(!out.contains("--resume"), "{out}");
+
+            // The row: owner `cli`, the engine's session id, and — no cwd was
+            // given — the router home as the run's working directory.
+            let list = ok(r, "chi_list", json!({ "engine_id": "claude-code" })).await;
+            let row = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["run_id"] == run_id.as_str())
+                .expect("the run is listed")
+                .clone();
+            assert_eq!(row["owner"], "cli");
+            assert_eq!(row["external_id"], "sess-stub");
+            let row = crate::server::shared::chi::cache_get(&d.db, &run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.cwd, None, "the row keeps what the caller sent");
+            let output_path = PathBuf::from(row.output_path.unwrap());
+            assert!(output_path.starts_with(d.home.parent().unwrap().join("data/chi-cache")));
+
+            // Resume (snake_case): same id, relaunched with --resume.
+            let resumed = ok(
+                r,
+                "chi_resume",
+                json!({ "run_id": run_id, "prompt": "and again" }),
+            )
+            .await;
+            assert_eq!(resumed["run_id"], run_id.as_str());
+            assert_eq!(resumed["status"], "running");
+            assert!(
+                wait_for(|| async {
+                    let s = status_of(r, &run_id).await;
+                    s["status"] == "done"
+                        && s["output"]
+                            .as_str()
+                            .is_some_and(|o| o.contains("--resume sess-stub"))
+                })
+                .await
+            );
+
+            // Cancel (flat snake_case run): a sleeping run is killed.
+            let sleeper = ok(
+                r,
+                "chi_run",
+                json!({ "engine_id": "claude-code", "prompt": "please sleep" }),
+            )
+            .await;
+            let sleeper_id = sleeper["run_id"].as_str().unwrap().to_string();
+            let cancelled = ok(r, "chi_cancel", json!({ "runId": sleeper_id })).await;
+            assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["run_id"], sleeper_id.as_str());
+            assert_eq!(status_of(r, &sleeper_id).await["status"], "cancelled");
+        }
+
+        /// Under T1 each principal is its own daemon process (its own child,
+        /// `--data-dir`, `ikenga.db` and chi-cache). A run id from one is
+        /// unknown to another: no read, resume or cancel crosses, and the
+        /// answer is the same "not found" an unknown id gets (no existence
+        /// oracle). The process-level half — the child's uid — is the
+        /// `t1-root` broker test.
+        #[tokio::test]
+        async fn another_principals_runs_are_not_found() {
+            let ada = chi_daemon();
+            let bob = chi_daemon();
+            // Any run will do; cursor-agent leaves a (failed) row without
+            // needing an engine.
+            let _ = err(
+                &ada.router,
+                "chi_run",
+                json!({ "opts": { "engineId": "cursor-agent", "prompt": "hi", "cwd": "/tmp" } }),
+            )
+            .await;
+            let rows = ok(
+                &ada.router,
+                "chi_list",
+                json!({ "engineId": "cursor-agent" }),
+            )
+            .await;
+            let ada_run = rows[0]["run_id"].as_str().unwrap().to_string();
+
+            let not_found = format!("chi run not found: {ada_run}");
+            assert_eq!(
+                err(&bob.router, "chi_status", json!({ "runId": ada_run })).await,
+                format!("chi_status: {not_found}")
+            );
+            assert_eq!(
+                err(
+                    &bob.router,
+                    "chi_resume",
+                    json!({ "runId": ada_run, "prompt": "x" })
+                )
+                .await,
+                format!("chi_resume: {not_found}")
+            );
+            assert_eq!(
+                err(&bob.router, "chi_cancel", json!({ "runId": ada_run })).await,
+                format!("chi_cancel: {not_found}")
+            );
+            let bob_rows = ok(
+                &bob.router,
+                "chi_list",
+                json!({ "engineId": "cursor-agent" }),
+            )
+            .await;
+            assert_eq!(bob_rows, json!([]));
+            // Ada's run is untouched.
+            assert_eq!(status_of(&ada.router, &ada_run).await["status"], "failed");
         }
     }
 }

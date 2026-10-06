@@ -505,3 +505,132 @@ fn t1_root_broker_i8_cli_passwd_closes_a_proxied_socket_within_two_seconds() {
     drop(broker);
     drop(users);
 }
+
+/// A stub `claude` (stream-json) in `home/.local/bin`, owned by the
+/// principal: it reports `uid=<its uid>`, or `exec sleep 60` when the prompt
+/// says `sleep`. The child's augmented PATH includes `$HOME/.local/bin`.
+fn install_stub_claude(home: &Path) {
+    let meta = std::fs::metadata(home).unwrap();
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("claude");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+prompt=$(cat)
+case "$prompt" in *sleep*) exec sleep 60;; esac
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-t1"}'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"uid=%s"}]}}\n' "$(id -u)"
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for p in [home.join(".local"), bin, path] {
+        std::os::unix::fs::chown(&p, Some(meta.uid()), Some(meta.gid())).unwrap();
+    }
+}
+
+/// WP-P10: a Chi run requested through the broker executes in the signed-in
+/// principal's child, as that principal's uid (never root), with its output
+/// in that principal's own 0700 data dir; another principal's run id is
+/// "not found" for status, resume and cancel, and leaves the run alone.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_broker_chi_runs_are_per_principal() {
+    assert!(is_root(), "t1-root tests run as root");
+    let users = HostUsers(vec!["ik-t1chi-ada".into(), "ik-t1chi-bob".into()]);
+    let tmp = TempDir::new("chi");
+    let root = tmp.0.join("root");
+    let range = "28220-28230";
+    accounts(
+        &root,
+        range,
+        &["create", "t1chi-ada", "--admin", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    accounts(
+        &root,
+        range,
+        &["create", "t1chi-bob", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    let ada_id = account_id(&root, range, "t1chi-ada");
+    let ada_home = root.join("principals").join(&ada_id).join("home");
+    let broker = start_broker(&tmp.0, &root, range);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ada = login(&broker, "t1chi-ada", PASSWORD).await;
+        let bob = login(&broker, "t1chi-bob", PASSWORD).await;
+        // Both children up (and so both homes provisioned) before the stub
+        // goes into Ada's.
+        for who in [&ada, &bob] {
+            let r = rpc(&broker, who, "os_username", json!({})).await;
+            assert_eq!(r["ok"], true, "{r}");
+        }
+        let ada_uid = std::fs::metadata(&ada_home).unwrap().uid();
+        assert_ne!(ada_uid, 0);
+        install_stub_claude(&ada_home);
+
+        let started = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "claude-code", "prompt": "hello" } }),
+        )
+        .await;
+        assert_eq!(started["ok"], true, "{started}");
+        let run_id = started["data"]["run_id"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let done = loop {
+            let s = rpc(&broker, &ada, "chi_status", json!({ "runId": run_id })).await;
+            if s["data"]["status"] == "done" {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "the run never finished: {s}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            done["data"]["output"],
+            format!("uid={ada_uid}"),
+            "the engine ran as the principal: {done}"
+        );
+        let cache = root.join("principals").join(&ada_id).join("data/chi-cache");
+        let meta = std::fs::metadata(&cache).unwrap();
+        assert_eq!(meta.uid(), ada_uid, "the chi cache is the principal's");
+
+        // Bob cannot read, resume or cancel it — it does not exist for him.
+        let not_found = format!("chi run not found: {run_id}");
+        for (cmd, args) in [
+            ("chi_status", json!({ "runId": run_id })),
+            ("chi_resume", json!({ "runId": run_id, "prompt": "x" })),
+            ("chi_cancel", json!({ "runId": run_id })),
+        ] {
+            let r = rpc(&broker, &bob, cmd, args).await;
+            assert_eq!(r["ok"], false, "{cmd}: {r}");
+            assert_eq!(r["error"], format!("{cmd}: {not_found}"), "{cmd}");
+        }
+        let still = rpc(&broker, &ada, "chi_status", json!({ "runId": run_id })).await;
+        assert_eq!(still["data"]["status"], "done", "{still}");
+
+        // A live run: Bob's cancel misses, Ada's lands.
+        let sleeper = rpc(
+            &broker,
+            &ada,
+            "chi_run",
+            json!({ "opts": { "engineId": "claude-code", "prompt": "please sleep" } }),
+        )
+        .await;
+        let sleeper_id = sleeper["data"]["run_id"].as_str().unwrap().to_string();
+        let miss = rpc(&broker, &bob, "chi_cancel", json!({ "runId": sleeper_id })).await;
+        assert_eq!(miss["ok"], false, "{miss}");
+        let hit = rpc(&broker, &ada, "chi_cancel", json!({ "runId": sleeper_id })).await;
+        assert_eq!(hit["data"]["status"], "cancelled", "{hit}");
+
+        let (_, health) = get_json(&broker, "/api/health", None).await;
+        assert_eq!(health["executor"]["principal_isolation"], true, "{health}");
+    });
+    drop(broker);
+    drop(users);
+}

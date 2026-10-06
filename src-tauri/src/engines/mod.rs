@@ -21,7 +21,8 @@
 pub mod antigravity_acp;
 #[cfg(feature = "desktop")]
 pub mod claude_code;
-#[cfg(feature = "desktop")]
+// Ungated for its pure JSONL `parser`, which the daemon's Chi runs read codex
+// output with (WP-P10); the engine adapter inside stays desktop-only.
 pub mod codex_pty;
 #[cfg(feature = "desktop")]
 pub mod cursor_agent;
