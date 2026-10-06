@@ -39,7 +39,12 @@ vi.mock('@/lib/tauri-cmd', () => ({
 vi.mock('@ikenga/ui-lib', async () => {
 	const React = await import('react');
 	const CodeEditor = React.forwardRef(function CodeEditor(
-		props: { value: string; onChange: (v: string) => void; ariaLabel?: string },
+		props: {
+			value: string;
+			onChange: (v: string) => void;
+			ariaLabel?: string;
+			readOnly?: boolean;
+		},
 		ref: React.Ref<unknown>
 	) {
 		React.useImperativeHandle(ref, () => ({
@@ -52,6 +57,7 @@ vi.mock('@ikenga/ui-lib', async () => {
 			<textarea
 				aria-label={props.ariaLabel ?? 'editor'}
 				value={props.value}
+				readOnly={props.readOnly}
 				onChange={(e) => props.onChange(e.target.value)}
 			/>
 		);
@@ -88,6 +94,10 @@ async function startEditing() {
 
 function type(el: HTMLTextAreaElement, value: string) {
 	fireEvent.change(el, { target: { value } });
+}
+
+async function fireWatchEvent(path: string) {
+	await act(async () => h.watchCb?.({ kind: 'modify', path }));
 }
 
 beforeEach(() => {
@@ -212,7 +222,9 @@ describe('EditableTextFrame — conditional save (F3)', () => {
 		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 		await screen.findByText(/changed on disk/);
 		fireEvent.click(screen.getByRole('button', { name: /Load theirs/ }));
-		expect((screen.getByLabelText('File source') as HTMLTextAreaElement).value).toBe('theirs\n');
+		await waitFor(() =>
+			expect((screen.getByLabelText('File source') as HTMLTextAreaElement).value).toBe('theirs\n')
+		);
 		expect(screen.queryByLabelText('Unsaved changes')).toBeNull();
 		expect(fsWriteText).not.toHaveBeenCalled();
 	});
@@ -473,5 +485,216 @@ describe('EditableTextFrame — a revert to our own earlier save is a conflict',
 		await screen.findByText(/changed on disk since you opened it/);
 		expect(fsWriteText).not.toHaveBeenCalled();
 		expect(diskText('/w/a.ts')).toBe('A1');
+	});
+});
+
+// Regression: the strict decode ran only at load. The watcher, the save
+// re-read and Load theirs fell back to a lossy decode, so a file rewritten as
+// Latin-1 (or binary) while open went into the buffer as U+FFFD, and the next
+// Save wrote EF BF BD over every byte that was not UTF-8. Now any later bytes
+// that decodeForEdit refuses block editing, and Save is impossible.
+describe('EditableTextFrame — bytes that turn uneditable while open', () => {
+	const LATIN1 = new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a]); // "café\n" in Latin-1
+	const bytesOf = (p: string) => Array.from(h.disk.get(p) ?? []);
+	const saveButton = () =>
+		screen.queryByRole('button', { name: 'Save' }) as HTMLButtonElement | null;
+
+	/** Every way to save is refused and the file's bytes are untouched. */
+	async function expectNoSave(path: string, bytes: number[]) {
+		const save = saveButton();
+		if (save) {
+			expect(save.disabled).toBe(true);
+			fireEvent.click(save);
+		}
+		const ed = screen.queryByLabelText('File source') as HTMLTextAreaElement | null;
+		if (ed) {
+			act(() => ed.focus());
+			fireEvent.keyDown(ed, { key: 's', ...MOD });
+		}
+		await act(async () => {});
+		expect(fsWriteText).not.toHaveBeenCalled();
+		expect(bytesOf(path)).toEqual(bytes);
+	}
+
+	it('watcher, clean buffer, file rewritten as Latin-1: leaves Edit, blocks it, never writes', async () => {
+		h.disk.set('/w/c.txt', enc('café\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/c.txt', LATIN1);
+		await fireWatchEvent('/w/c.txt');
+		// Back in View, showing the lossy text for display only.
+		await waitFor(() => expect(screen.queryByLabelText('File source')).toBeNull());
+		expect(ed.isConnected).toBe(false);
+		expect(screen.getByTestId('view').textContent).toBe('caf�\n');
+		const edit = screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement;
+		expect(edit.disabled).toBe(true);
+		expect(screen.getByText(/not valid UTF-8/)).toBeTruthy();
+		fireEvent.click(edit);
+		expect(screen.queryByLabelText('File source')).toBeNull();
+		await expectNoSave('/w/c.txt', Array.from(LATIN1));
+	});
+
+	it('watcher, dirty buffer, file rewritten as Latin-1: keeps the draft, Save is off', async () => {
+		h.disk.set('/w/c.txt', enc('café\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		type(ed, 'café\nmore\n');
+		h.disk.set('/w/c.txt', LATIN1);
+		await fireWatchEvent('/w/c.txt');
+		await screen.findByText(/not valid UTF-8.*unsaved edits are kept/);
+		expect(ed.value).toBe('café\nmore\n');
+		expect(ed.readOnly).toBe(true);
+		// No conflict choice offering a lossy "theirs".
+		expect(screen.queryByRole('button', { name: /Load theirs/ })).toBeNull();
+		await expectNoSave('/w/c.txt', Array.from(LATIN1));
+
+		// The file comes back as the text the draft is based on: Save is on again.
+		h.disk.set('/w/c.txt', enc('café\n'));
+		await fireWatchEvent('/w/c.txt');
+		await waitFor(() => expect(saveButton()?.disabled).toBe(false));
+		expect(ed.readOnly).toBe(false);
+		fireEvent.click(saveButton() as HTMLButtonElement);
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/c.txt')).toBe('café\nmore\n');
+	});
+
+	it('save re-read finds Latin-1 (no watcher event): blocks and does not write', async () => {
+		h.disk.set('/w/c.txt', enc('café\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/c.txt', LATIN1);
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await screen.findByText(/not valid UTF-8/);
+		expect(ed.value).toBe('mine\n');
+		expect(screen.queryByText(/changed on disk since you opened it/)).toBeNull();
+		await expectNoSave('/w/c.txt', Array.from(LATIN1));
+	});
+
+	it('Load theirs when the file is now Latin-1: blocks, keeps the draft, never writes', async () => {
+		h.disk.set('/w/c.txt', enc('base\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/c.txt', enc('theirs\n'));
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await screen.findByText(/changed on disk since you opened it/);
+		// Rewritten again, with no watcher event, before the user picks.
+		h.disk.set('/w/c.txt', LATIN1);
+		fireEvent.click(screen.getByRole('button', { name: /Load theirs/ }));
+		await screen.findByText(/not valid UTF-8/);
+		expect(ed.value).toBe('mine\n');
+		expect(ed.value).not.toContain('�');
+		expect(screen.queryByText(/changed on disk since you opened it/)).toBeNull();
+		await expectNoSave('/w/c.txt', Array.from(LATIN1));
+	});
+
+	it('Keep mine when the file is now binary: blocks instead of overwriting', async () => {
+		h.disk.set('/w/c.txt', enc('base\n'));
+		mount('/w/c.txt');
+		const ed = await startEditing();
+		type(ed, 'mine\n');
+		h.disk.set('/w/c.txt', enc('theirs\n'));
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await screen.findByText(/changed on disk since you opened it/);
+		const BIN = [0x89, 0x50, 0x4e, 0x47, 0x00, 0x01];
+		h.disk.set('/w/c.txt', new Uint8Array(BIN));
+		fireEvent.click(screen.getByRole('button', { name: /Keep mine/ }));
+		await screen.findByText(/looks binary/);
+		await expectNoSave('/w/c.txt', BIN);
+	});
+
+	it('a file that becomes binary while open: clean and dirty buffers are both blocked', async () => {
+		const BIN = [0x7f, 0x45, 0x4c, 0x46, 0x00, 0x00];
+		h.disk.set('/w/a.txt', enc('one\n'));
+		const first = mount('/w/a.txt');
+		await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/a.txt', new Uint8Array(BIN));
+		await fireWatchEvent('/w/a.txt');
+		await waitFor(() => expect(screen.queryByLabelText('File source')).toBeNull());
+		expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(true);
+		expect(screen.getByText(/looks binary/)).toBeTruthy();
+		await expectNoSave('/w/a.txt', BIN);
+		first.unmount();
+
+		h.disk.set('/w/b.txt', enc('two\n'));
+		mount('/w/b.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		type(ed, 'two\nthree\n');
+		h.disk.set('/w/b.txt', new Uint8Array(BIN));
+		await fireWatchEvent('/w/b.txt');
+		await screen.findByText(/looks binary.*unsaved edits are kept/);
+		expect(ed.value).toBe('two\nthree\n');
+		await expectNoSave('/w/b.txt', BIN);
+		// Discarding leaves a read-only view of the binary file.
+		fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+		expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(true);
+		await expectNoSave('/w/b.txt', BIN);
+	});
+
+	it('a blocked file that becomes editable text again reloads and can be edited', async () => {
+		h.disk.set('/w/c.txt', LATIN1);
+		mount('/w/c.txt');
+		await ready();
+		expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(true);
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/c.txt', enc('café\r\n'));
+		await fireWatchEvent('/w/c.txt');
+		await waitFor(() =>
+			expect((screen.getByRole('button', { name: 'Edit' }) as HTMLButtonElement).disabled).toBe(
+				false
+			)
+		);
+		const ed = await startEditing();
+		expect(ed.value).toBe('café\n');
+		type(ed, 'café\nok\n');
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		// The reloaded file's CRLF is kept.
+		expect(diskText('/w/c.txt')).toBe('café\r\nok\r\n');
+	});
+});
+
+describe('EditableTextFrame — a watcher reload keeps the new line endings and BOM', () => {
+	it('a clean reload of a CRLF + BOM file saves back as CRLF + BOM', async () => {
+		h.disk.set('/w/a.txt', enc('a\n'));
+		mount('/w/a.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/a.txt', new Uint8Array([0xef, 0xbb, 0xbf, ...enc('b\r\n')]));
+		await fireWatchEvent('/w/a.txt');
+		await waitFor(() => expect(ed.value).toBe('b\n'));
+		type(ed, 'b\nc\n');
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(fsWriteText).toHaveBeenCalledWith('/w/a.txt', '﻿b\r\nc\r\n');
+	});
+
+	it('the same text rewritten with CRLF while clean saves back as CRLF', async () => {
+		h.disk.set('/w/a.txt', enc('a\nb\n'));
+		mount('/w/a.txt');
+		const ed = await startEditing();
+		await waitFor(() => expect(h.watchCb).not.toBeNull());
+		h.disk.set('/w/a.txt', enc('a\r\nb\r\n'));
+		await fireWatchEvent('/w/a.txt');
+		type(ed, 'a\nb\nc\n');
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/a.txt')).toBe('a\r\nb\r\nc\r\n');
+	});
+
+	it('the same text rewritten with CRLF while dirty saves back as CRLF', async () => {
+		h.disk.set('/w/a.txt', enc('a\nb\n'));
+		mount('/w/a.txt');
+		const ed = await startEditing();
+		type(ed, 'a\nb\nc\n');
+		h.disk.set('/w/a.txt', enc('a\r\nb\r\n'));
+		fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await waitFor(() => expect(fsWriteText).toHaveBeenCalledTimes(1));
+		expect(diskText('/w/a.txt')).toBe('a\r\nb\r\nc\r\n');
 	});
 });

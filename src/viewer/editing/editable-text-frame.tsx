@@ -18,7 +18,7 @@ import {
 	useState,
 } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { AlertCircle, Info } from 'lucide-react';
+import { AlertCircle, Info, Lock } from 'lucide-react';
 import { CodeEditor, type CodeEditorHandle } from '@ikenga/ui-lib';
 import { ErrorState, LoadingState } from '@/components/states';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
@@ -129,6 +129,7 @@ export function TextDocumentFrame({
 			ref={editorRef}
 			value={doc.draft}
 			onChange={doc.setDraft}
+			readOnly={doc.blocked !== null}
 			language={lang}
 			ariaLabel={ariaLabel ?? 'File source'}
 		/>
@@ -160,9 +161,19 @@ export function TextDocumentFrame({
 					mine={doc.draft}
 					busy={doc.saveState.kind === 'saving'}
 					onKeepMine={() => void doc.keepMine()}
-					onLoadTheirs={doc.loadTheirs}
+					onLoadTheirs={() => void doc.loadTheirs()}
 					onDiscard={doc.cancel}
 				/>
+			)}
+			{editing && doc.blocked && (
+				<div
+					role="alert"
+					data-state="editor-blocked-edit"
+					className="flex items-start gap-2 border-b border-amber-500/40 bg-amber-500/10 px-4 py-1.5 text-[11px] text-amber-700 dark:text-amber-300"
+				>
+					<Lock className="mt-0.5 h-3 w-3 shrink-0" />
+					<span className="min-w-0 break-words">{doc.blocked}</span>
+				</div>
 			)}
 			{editing && doc.validation && (
 				<div

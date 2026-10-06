@@ -77,6 +77,41 @@ export function decodeForEdit(
 	return { ok: true, text, meta: { eol, bom }, size };
 }
 
+/** What bytes read *after* the editor opened (watcher reload, save re-read,
+ *  Load theirs) mean for the buffer. */
+export type Reread =
+	/** Same text as the buffer's base (e.g. our own write). `meta` is the
+	 *  file's current line ending and BOM. */
+	| { kind: 'unchanged'; meta: DocumentMeta }
+	/** Different, editable text. */
+	| { kind: 'changed'; text: string; meta: DocumentMeta }
+	/** Bytes the editor must not take: not UTF-8, binary, or too large.
+	 *  `viewText` is a lossy decode for *display only*. */
+	| { kind: 'refused'; reason: string; viewText: string };
+
+/**
+ * Classify a re-read of the file against the buffer's base. Text only ever
+ * reaches the edit buffer (or becomes the save base) through `decodeForEdit`;
+ * anything it refuses comes back as `refused`, never as lossy text — a lossy
+ * decode saved back would turn every invalid byte into U+FFFD on disk.
+ *
+ * The size limit is skipped when the text equals the base: that is our own
+ * save of a buffer that grew past the limit, not a new file to load.
+ */
+export function classifyReread(
+	bytes: number[] | Uint8Array,
+	base: string,
+	maxBytes: number = MAX_EDITABLE_BYTES
+): Reread {
+	const u8 = toU8(bytes);
+	const dec = decodeForEdit(u8, Number.POSITIVE_INFINITY);
+	if (!dec.ok) return { kind: 'refused', reason: dec.reason, viewText: decodeForView(u8) };
+	if (!isConflict(base, dec.text)) return { kind: 'unchanged', meta: dec.meta };
+	const limited = decodeForEdit(u8, maxBytes);
+	if (!limited.ok) return { kind: 'refused', reason: limited.reason, viewText: dec.text };
+	return { kind: 'changed', text: dec.text, meta: dec.meta };
+}
+
 /** Re-apply the file's line ending and BOM to LF editor text. */
 export function encodeForSave(text: string, meta: DocumentMeta): string {
 	const body = meta.eol === '\r\n' ? text.replace(/\r?\n/g, '\r\n') : text;

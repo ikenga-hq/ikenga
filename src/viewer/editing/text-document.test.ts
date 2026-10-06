@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	classifyReread,
 	decodeForEdit,
 	encodeForSave,
 	formatBytes,
@@ -68,6 +69,47 @@ describe('decodeForEdit / encodeForSave', () => {
 	it('accepts a plain number[] (the fs_read wire shape)', () => {
 		const d = decodeForEdit(Array.from(enc('hé')));
 		expect(d.ok && d.text).toBe('hé');
+	});
+});
+
+// Regression: the watcher and the save re-read fell back to a lossy decode
+// when decodeForEdit refused, so a file rewritten as Latin-1 or binary while
+// open went into the buffer as U+FFFD and the next save wrote that over it.
+describe('classifyReread', () => {
+	it('refuses invalid UTF-8 with a display-only text, never as editable text', () => {
+		const r = classifyReread(new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a]), 'café\n');
+		expect(r.kind).toBe('refused');
+		if (r.kind !== 'refused') return;
+		expect(r.reason).toMatch(/not valid UTF-8/);
+		expect(r.viewText).toBe('caf�\n');
+	});
+
+	it('refuses a file that became binary', () => {
+		const r = classifyReread(new Uint8Array([0x61, 0x00, 0x62]), 'ab');
+		expect(r.kind).toBe('refused');
+		if (r.kind === 'refused') expect(r.reason).toMatch(/binary/);
+	});
+
+	it('refuses new text above the size limit', () => {
+		const r = classifyReread(new Uint8Array(11).fill(0x61), 'a', 10);
+		expect(r.kind).toBe('refused');
+		if (r.kind === 'refused') expect(r.reason).toMatch(/too large to edit here/);
+	});
+
+	it('does not refuse our own save that grew past the limit', () => {
+		expect(classifyReread(new Uint8Array(11).fill(0x61), 'a'.repeat(11), 10).kind).toBe(
+			'unchanged'
+		);
+	});
+
+	it('reports unchanged text with the file’s current line ending and BOM', () => {
+		const r = classifyReread(new Uint8Array([0xef, 0xbb, 0xbf, ...enc('a\r\nb\r\n')]), 'a\nb\n');
+		expect(r).toEqual({ kind: 'unchanged', meta: { eol: '\r\n', bom: true } });
+	});
+
+	it('reports changed text with its meta', () => {
+		const r = classifyReread(enc('x\r\n'), 'a\n');
+		expect(r).toEqual({ kind: 'changed', text: 'x\n', meta: { eol: '\r\n', bom: false } });
 	});
 });
 

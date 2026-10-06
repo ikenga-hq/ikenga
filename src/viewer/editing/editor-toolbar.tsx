@@ -10,7 +10,7 @@ interface EditorToolbarProps {
 	mode: 'view' | 'edit';
 	dirty: boolean;
 	saveState: SaveState;
-	/** Why Edit is unavailable, or null. */
+	/** Why Edit and Save are unavailable, or null. */
 	blocked: string | null;
 	/** A structured format saved without a parse check (JSON5). */
 	unvalidated?: boolean;
@@ -36,6 +36,7 @@ export function EditorToolbar({
 }: EditorToolbarProps) {
 	const editing = mode === 'edit';
 	const saving = saveState.kind === 'saving';
+	const canSave = dirty && !saving && blocked === null;
 	return (
 		<div
 			data-state="editor-toolbar"
@@ -104,11 +105,12 @@ export function EditorToolbar({
 						<button
 							type="button"
 							onClick={onSave}
-							disabled={!dirty || saving}
+							disabled={!canSave}
 							aria-label="Save"
+							title={blocked ?? undefined}
 							className={cn(
 								'inline-flex items-center gap-1.5 rounded px-2 py-1 font-medium transition-colors',
-								dirty && !saving
+								canSave
 									? 'text-foreground hover:bg-muted'
 									: 'cursor-not-allowed text-muted-foreground/50'
 							)}
