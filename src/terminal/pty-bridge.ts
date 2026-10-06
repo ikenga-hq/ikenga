@@ -22,6 +22,7 @@ import {
 	type ForegroundProcess,
 	type PtySpawnOpts as RawPtySpawnOpts,
 } from '../lib/tauri-cmd';
+import { isRemoteWebSession } from '../lib/transport';
 import { attachRemotePty, createDaemonPtySocketOpener } from '../lib/transport/pty-socket';
 
 export interface PtySpawnOpts extends RawPtySpawnOpts {
@@ -478,11 +479,19 @@ export class Pty {
 
 		// 1. Snapshot + gate. A failure here (or a reaped session) just means no
 		//    scrollback replay; the live attach below still works.
+		//
+		//    Skipped in a browser session: `ptyListen` there opens `/ws/pty`,
+		//    whose handshake runs the same snapshot-and-gate on the daemon and
+		//    replays the scrollback itself. `pty_attach_begin`/`_arm` are
+		//    desktop-window commands the daemon does not serve, so calling them
+		//    only produced a failed RPC and a warning on every reattach.
 		let snap: Awaited<ReturnType<typeof ptyAttachBegin>> = null;
-		try {
-			snap = await ptyAttachBegin(id);
-		} catch (err) {
-			console.warn('[pty] attach snapshot failed', err);
+		if (!isRemoteWebSession()) {
+			try {
+				snap = await ptyAttachBegin(id);
+			} catch (err) {
+				console.warn('[pty] attach snapshot failed', err);
+			}
 		}
 
 		try {

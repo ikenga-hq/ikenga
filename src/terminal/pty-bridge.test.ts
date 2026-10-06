@@ -37,7 +37,15 @@ vi.mock('../lib/tauri-cmd', () => ({
 	ptyDaemonInfo: vi.fn(async () => null),
 }));
 
-import { ptyDaemonInfo, ptyKill } from '../lib/tauri-cmd';
+// Remote (browser) sessions skip the desktop attach handshake — see the
+// "in a remote session" block. Everything else runs as the desktop.
+const session = vi.hoisted(() => ({ remote: false }));
+vi.mock('../lib/transport', async (importOriginal) => ({
+	...(await importOriginal<typeof import('../lib/transport')>()),
+	isRemoteWebSession: () => session.remote,
+}));
+
+import { ptyAttachBegin, ptyDaemonInfo, ptyKill } from '../lib/tauri-cmd';
 import { Pty, resetDaemonInfoCache } from './pty-bridge';
 
 function bytes(s: string): Uint8Array {
@@ -60,6 +68,8 @@ function emit(s: string) {
 }
 
 beforeEach(() => {
+	session.remote = false;
+	vi.mocked(ptyAttachBegin).mockClear();
 	deliver = null;
 	attachBeginResolve = null;
 	armed = [];
@@ -243,6 +253,33 @@ describe('Pty detached-attach scrollback replay (atomic handshake)', () => {
 		expect(pty.cwd).toBe('/initial/dir');
 		pty.setCwd('/new/updated/dir');
 		expect(pty.cwd).toBe('/new/updated/dir');
+	});
+});
+
+describe('Pty.attach in a remote session (audit 2026-10-06 rank 26)', () => {
+	it('skips pty_attach_begin/arm: the /ws/pty handshake replays scrollback itself', async () => {
+		session.remote = true;
+		// Resolves on its own — it never parks on ptyAttachBegin.
+		const pty = await Pty.attach('fake-id', 'x');
+		expect(ptyAttachBegin).not.toHaveBeenCalled();
+		expect(armed).toEqual([]);
+
+		// The socket's replay arrives as the first chunk, live bytes after it.
+		deliver!(bytes('scrollback '), 11);
+		deliver!(bytes('live'), 15);
+		const seen: string[] = [];
+		const off = pty.onData((b) => seen.push(new TextDecoder().decode(b)));
+		expect(seen.join('')).toBe('scrollback live');
+		off();
+	});
+
+	it('still runs the handshake on the desktop', async () => {
+		const p = Pty.attach('fake-id', 'x');
+		await flush();
+		expect(ptyAttachBegin).toHaveBeenCalledWith('fake-id');
+		attachBeginResolve!({ data: bytes(''), endOffset: 0, token: 3 });
+		await p;
+		expect(armed).toEqual([3]);
 	});
 });
 
