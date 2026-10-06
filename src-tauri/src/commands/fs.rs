@@ -194,12 +194,16 @@ pub async fn fs_trash(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Rename `from` to a sibling with the new basename. Both the source and the
-/// resolved destination must be inside the allowlist. The destination must not
-/// already exist.
+/// Rename `from` to the basename `to_name` — in its own folder, or in `to_dir`
+/// when given (a move). Every end must be inside the allowlist and the
+/// destination must not already exist.
 #[tauri::command]
-pub async fn fs_rename(from: String, to_name: String) -> Result<String, String> {
-    shared_fs::rename(&allowlisted, &from, &to_name).await
+pub async fn fs_rename(
+    from: String,
+    to_name: String,
+    to_dir: Option<String>,
+) -> Result<String, String> {
+    shared_fs::rename(&allowlisted, &from, &to_name, to_dir.as_deref()).await
 }
 
 #[tauri::command]

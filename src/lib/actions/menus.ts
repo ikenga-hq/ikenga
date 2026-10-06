@@ -58,6 +58,11 @@ const radio = (id: string, condition: MenuItemCondition): DefaultMenuItem => ({
  *  `native/<top>` are handled by `defaultMenuContents`). */
 export const DEFAULT_MENUS: Readonly<Record<string, readonly DefaultMenuEntry[]>> = {
 	files: [
+		// Both row kinds: a folder row creates inside itself, a file row in
+		// its parent (plans/file-editing Shape 4).
+		i('new-file'),
+		i('new-folder'),
+		S,
 		c('open', 'file'),
 		c('open-to-side', 'file'),
 		c('open-below', 'file'),
@@ -74,6 +79,9 @@ export const DEFAULT_MENUS: Readonly<Record<string, readonly DefaultMenuEntry[]>
 		i('copy-name'),
 		S,
 		i('rename'),
+		// plans/file-editing F2: into another folder (also by dragging a row
+		// onto a folder, or a path in Rename).
+		i('files.move'),
 		i('delete'),
 	],
 	'files-view': [

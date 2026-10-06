@@ -207,13 +207,15 @@ pub(super) async fn fs_search(state: &AppState, args: &Value) -> RpcResponse {
     respond("fs_search", r)
 }
 
-/// Both ends are resolved through the allowlist; `toName` is a bare basename.
+/// Every end is resolved through the allowlist; `toName` is a bare basename
+/// and the optional `toDir` makes it a move into that folder.
 pub(super) async fn fs_rename(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let from: String = targ(args, &["from"])?;
         let to_name: String = targ(args, &["toName", "to_name"])?;
+        let to_dir: Option<String> = targ(args, &["toDir", "to_dir"])?;
         state.path_guard.ready()?;
-        shared_fs::rename(&resolver(state), &from, &to_name).await
+        shared_fs::rename(&resolver(state), &from, &to_name, to_dir.as_deref()).await
     }
     .await;
     respond("fs_rename", r)
@@ -939,6 +941,45 @@ mod tests {
         assert!(!target.exists());
     }
 
+    /// plans/file-editing Shape 5: a browser text save over axum's 2 MB body default used to
+    /// come back 413. `RPC_BODY_LIMIT` lifts that for `/api/rpc`.
+    #[tokio::test]
+    async fn fs_write_content_over_axums_2mb_default_succeeds() {
+        let d = daemon();
+        let p = d.allowed.join("big.txt");
+        let text = "abcdefghijklmnopqrstuvwxyz0123456789\n".repeat(3 * 1024 * 1024 / 37 + 1);
+        assert!(text.len() > 3 * 1024 * 1024);
+        ok(&d.router, "fs_write", json!({ "path": s(&p), "content": text })).await;
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+    }
+
+    /// Over the cap the daemon refuses before the arm runs: a 413, and the file on disk is
+    /// untouched — a save fails loudly, never truncates.
+    #[tokio::test]
+    async fn fs_write_over_rpc_body_limit_is_413_and_writes_nothing() {
+        let d = daemon();
+        let keep = d.allowed.join("keep.txt");
+        std::fs::write(&keep, b"precious").unwrap();
+        let content = "x".repeat(crate::server::RPC_BODY_LIMIT + 1);
+        let body = json!({ "cmd": "fs_write", "args": { "path": s(&keep), "content": content } });
+        let res = d
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/rpc")
+                    .header("authorization", "Bearer tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(std::fs::read(&keep).unwrap(), b"precious");
+    }
+
     // ── pty_spawn ──────────────────────────────────────────────────
 
     /// The browser sends `terminalId` (camelCase, as `tauri-cmd.ts` does); the arm used to read
@@ -1274,6 +1315,51 @@ mod tests {
         assert!(d.outside.join("secret.txt").exists());
         assert!(!d.outside.join("x.txt").exists());
         assert!(a.join("three.txt").exists());
+    }
+
+    /// plans/file-editing F2: `toDir` moves the entry into another folder,
+    /// with every end held to the allowlist.
+    #[tokio::test]
+    async fn fs_rename_with_to_dir_moves_inside_the_allowlist() {
+        let d = daemon();
+        let r = &d.router;
+        let a = &d.allowed;
+        std::fs::write(a.join("note.txt"), b"n").unwrap();
+        std::fs::create_dir(a.join("newdir")).unwrap();
+        let newdir = s(&a.join("newdir"));
+
+        let args = json!({ "from": s(&a.join("note.txt")), "toName": "moved.txt", "toDir": newdir });
+        let dest = ok(r, "fs_rename", args).await;
+        assert_eq!(dest, s(&a.join("newdir/moved.txt")));
+        assert!(!a.join("note.txt").exists());
+        assert_eq!(std::fs::read(a.join("newdir/moved.txt")).unwrap(), b"n");
+
+        // Destination exists in the target folder.
+        std::fs::write(a.join("other.txt"), b"o").unwrap();
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "moved.txt", "toDir": newdir });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("destination exists"), "{e}");
+
+        // The target must be an existing folder.
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "x.txt", "toDir": s(&a.join("other.txt")) });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("not a folder"), "{e}");
+
+        // A folder cannot move into itself or below itself.
+        std::fs::create_dir(a.join("newdir/inner")).unwrap();
+        for into in [a.join("newdir"), a.join("newdir/inner")] {
+            let args = json!({ "from": newdir, "toName": "newdir", "toDir": s(&into) });
+            let e = err(r, "fs_rename", args).await;
+            assert!(e.contains("into itself"), "{into:?}: {e}");
+        }
+        assert!(a.join("newdir/moved.txt").exists());
+
+        // A target folder outside the allowlist is refused and nothing moves.
+        let args = json!({ "from": s(&a.join("other.txt")), "toName": "other.txt", "toDir": s(&d.outside) });
+        let e = err(r, "fs_rename", args).await;
+        assert!(e.contains("outside allowlist"), "{e}");
+        assert!(a.join("other.txt").exists());
+        assert!(!d.outside.join("other.txt").exists());
     }
 
     // ── actions / keybindings ───────────────────────────────────────────────

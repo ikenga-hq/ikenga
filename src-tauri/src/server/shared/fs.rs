@@ -274,19 +274,39 @@ pub async fn search_skipping(
     .map_err(|e| format!("search join failed: {e}"))
 }
 
-/// Rename `from` to a sibling with the new basename. Both the source and the
-/// resolved destination must be inside the allowlist. The destination must
-/// not already exist. Returns the resolved destination.
-pub async fn rename(resolve: Resolve<'_>, from: &str, to_name: &str) -> Result<String, String> {
+/// Rename `from` to the basename `to_name` — in its own folder, or, when
+/// `to_dir` is given, in that folder (a move; plans/file-editing F2). The
+/// source, the destination folder and the resolved destination must all be
+/// inside the allowlist. The destination must not already exist, and a folder
+/// cannot move into itself. Returns the resolved destination.
+pub async fn rename(
+    resolve: Resolve<'_>,
+    from: &str,
+    to_name: &str,
+    to_dir: Option<&str>,
+) -> Result<String, String> {
     if to_name.is_empty() || to_name.contains('/') || to_name.contains('\\') {
         return Err("invalid name".to_string());
     }
     let resolved_from = resolve(from)?;
-    let parent = resolved_from
-        .parent()
-        .ok_or_else(|| "source has no parent".to_string())?;
+    let parent = match to_dir {
+        Some(dir) => {
+            let resolved_dir = resolve(dir)?;
+            match tokio::fs::metadata(&resolved_dir).await {
+                Ok(m) if m.is_dir() => resolved_dir,
+                _ => return Err(format!("not a folder: {}", resolved_dir.display())),
+            }
+        }
+        None => resolved_from
+            .parent()
+            .ok_or_else(|| "source has no parent".to_string())?
+            .to_path_buf(),
+    };
     let dest = parent.join(to_name);
     let resolved_dest = resolve(&dest.to_string_lossy())?;
+    if resolved_dest != resolved_from && resolved_dest.starts_with(&resolved_from) {
+        return Err("cannot move a folder into itself".to_string());
+    }
     if tokio::fs::metadata(&resolved_dest).await.is_ok() {
         return Err(format!("destination exists: {}", resolved_dest.display()));
     }
