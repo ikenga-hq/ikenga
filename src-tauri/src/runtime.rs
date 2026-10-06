@@ -434,6 +434,25 @@ pub fn resolve_command(declared: &str) -> PathBuf {
     PathBuf::from(declared)
 }
 
+/// Program + leading args for spawning a pkg sidecar `bin`. Windows can't
+/// exec a `.js`/`.mjs`/`.cjs` file directly (os error 193), so script bins run
+/// through the bundled Bun with the script as first arg; Unix relies on the
+/// shebang + exec bit, and native binaries pass through unchanged.
+pub fn sidecar_program(bin: &std::path::Path) -> (PathBuf, Vec<PathBuf>) {
+    let is_script = bin
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "js" | "mjs" | "cjs"));
+    if cfg!(windows) && is_script {
+        // Strip the `\\?\` verbatim prefix: Bun/Node resolve a script arg
+        // more reliably as a plain drive path.
+        let s = bin.to_string_lossy();
+        let script = s.strip_prefix(r"\\?\").map_or_else(|| bin.to_path_buf(), PathBuf::from);
+        return (resolve_command("bun"), vec![script]);
+    }
+    (bin.to_path_buf(), Vec::new())
+}
+
 // ── Post-launch fetcher (ensure_bun) ─────────────────────────────────────────
 
 /// Progress narration for the bun fetch. Emitted on `runtime://bun` via the
