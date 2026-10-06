@@ -92,6 +92,7 @@ import {
 } from '@/lib/tauri-cmd';
 import { isTauri, listen, type UnlistenFn } from '@/lib/transport';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
+import { isUnavailableOnServer } from '@/lib/transport/unavailable';
 import {
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
@@ -398,15 +399,8 @@ async function checkSqliteTableScope(pkgId: string, targets: string[]): Promise<
 	return null;
 }
 
-/** Whether an RPC error means the server doesn't run this command (the
- *  browser client), as opposed to the command itself failing. */
-export function isUnavailableOnServer(msg: string): boolean {
-	return (
-		msg.includes('not implemented in headless daemon') ||
-		msg.includes('not supported') ||
-		msg.includes('unknown command')
-	);
-}
+/** Moved to `@/lib/transport/unavailable`; re-exported for existing callers. */
+export { isUnavailableOnServer };
 
 // Exported for unit tests (the verb's scope-gate + confirm + decline
 // branches). Not part of the pkg-facing API — callers go through the
