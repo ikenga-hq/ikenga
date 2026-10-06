@@ -284,7 +284,9 @@ firewall() {
 
   local want have
   want="$(printf '%s\n' "${rules[@]}" | grep -oE 'ikenga:[a-z0-9-]+' | sort)"
-  have="$(ufw show added 2>/dev/null | grep -E '^ufw ' | while read -r line; do
+  # `|| true`: on a fresh host there are no rules, grep exits 1, and under
+  # pipefail + errexit that silently killed the whole run.
+  have="$( { ufw show added 2>/dev/null | grep -E '^ufw ' || true; } | while read -r line; do
             c="$(grep -oE 'ikenga:[a-z0-9-]+' <<<"$line" || true)"; echo "${c:-foreign}"; done | sort)"
   local active=0; ufw status 2>/dev/null | grep -q '^Status: active' && active=1
 
@@ -313,8 +315,14 @@ perimeter_tailnet() {
     changed "tailscale installed"
   fi
   if ! tailscale status >/dev/null 2>&1; then
-    # Auth key read from a file, passed via env so it never appears in argv or `ps`.
-    run sh -c "TS_AUTHKEY=\"\$(cat '$TS_AUTHKEY_FILE')\" tailscale up --auth-key=\"\$TS_AUTHKEY\" ${TS_HOSTNAME:+--hostname='$TS_HOSTNAME'} --ssh=false"
+    # `file:` makes tailscale read the key itself, so it never appears in argv
+    # (`ps`, /proc/*/cmdline) or this script's environment. An earlier
+    # `TS_AUTHKEY=$(cat f) tailscale up --auth-key="$TS_AUTHKEY"` passed an
+    # EMPTY key (a prefix assignment is not visible to the same command's
+    # argument expansion), and `tailscale up` then waited forever for an
+    # interactive browser login. --timeout makes a bad key fail, not hang.
+    run tailscale up --auth-key="file:$TS_AUTHKEY_FILE" ${TS_HOSTNAME:+--hostname="$TS_HOSTNAME"} --ssh=false --timeout=90s \
+      || die "tailscale up failed (bad, expired or already-used auth key, or the key's tags are not allowed by the tailnet policy)"
     changed "joined tailnet"
   fi
   if [[ $DRY_RUN -eq 0 ]]; then
