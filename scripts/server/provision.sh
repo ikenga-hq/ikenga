@@ -101,6 +101,7 @@ ACME_EMAIL=""
 TS_AUTHKEY_FILE=""
 TS_HOSTNAME=""
 SSH_PORT="22"
+SSH_ACCESS=""          # public | tailnet (default: public for public-https)
 APPS=()
 LIBS=()
 AGENT_CLIS=()
@@ -128,10 +129,14 @@ validate_profile() {
     # trusted operator with the bearer token as the sole gate. Refuse it.
     [[ "$TIER" == t1 ]] || die "PERIMETER=public-https requires TIER=t1 (a single shared bearer token must not be the only gate on a public host)"
     [[ -n "$PUBLIC_HOST" ]] || die "PERIMETER=public-https requires PUBLIC_HOST"
+    SSH_ACCESS="${SSH_ACCESS:-public}"
+    [[ "$SSH_ACCESS" == public || "$SSH_ACCESS" == tailnet ]] || die "SSH_ACCESS must be public or tailnet (got '$SSH_ACCESS')"
   else
-    [[ -n "$TS_AUTHKEY_FILE" ]] || die "PERIMETER=tailnet requires TS_AUTHKEY_FILE (a file holding a Tailscale auth key; never pass it in argv)"
-    [[ -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
+    SSH_ACCESS=tailnet
   fi
+  # The auth key is only needed to JOIN; a host already on the tailnet
+  # (re-run, or a perimeter switch) does not need one. tailnet_join enforces it.
+  [[ -z "$TS_AUTHKEY_FILE" || -f "$TS_AUTHKEY_FILE" ]] || die "TS_AUTHKEY_FILE '$TS_AUTHKEY_FILE' does not exist"
   [[ -z "$SECRETS_FROM" || -f "$SECRETS_FROM" ]] || die "SECRETS_FROM '$SECRETS_FROM' does not exist"
 }
 
@@ -268,8 +273,10 @@ firewall() {
   # public-https to tailnet would leave 22/80/443 open on the public address.
   local -a rules
   if [[ "$PERIMETER" == public-https ]]; then
+    local ssh_rule="limit $SSH_PORT/tcp comment ikenga:ssh-public-ratelimited"
+    [[ "$SSH_ACCESS" == tailnet ]] && ssh_rule="allow in on tailscale0 to any port $SSH_PORT proto tcp comment ikenga:ssh-tailnet"
     rules=(
-      "limit $SSH_PORT/tcp comment ikenga:ssh-public-ratelimited"
+      "$ssh_rule"
       "allow 80/tcp comment ikenga:acme-http01"
       "allow 443/tcp comment ikenga:https"
     )
@@ -308,8 +315,9 @@ firewall() {
 
 # --------------------------------------------------------------- perimeter
 
-perimeter_tailnet() {
-  log "Perimeter: tailnet"
+# Join the tailnet (idempotent). Used by the tailnet perimeter, and by
+# public-https when SSH_ACCESS=tailnet keeps SSH off the public interface.
+tailnet_join() {
   if ! command -v tailscale >/dev/null; then
     run sh -c 'curl -fsSL https://tailscale.com/install.sh | sh'
     changed "tailscale installed"
@@ -321,6 +329,7 @@ perimeter_tailnet() {
     # EMPTY key (a prefix assignment is not visible to the same command's
     # argument expansion), and `tailscale up` then waited forever for an
     # interactive browser login. --timeout makes a bad key fail, not hang.
+    [[ -n "$TS_AUTHKEY_FILE" ]] || die "not on a tailnet and no TS_AUTHKEY_FILE to join with"
     run tailscale up --auth-key="file:$TS_AUTHKEY_FILE" ${TS_HOSTNAME:+--hostname="$TS_HOSTNAME"} --ssh=false --timeout=90s \
       || die "tailscale up failed (bad, expired or already-used auth key, or the key's tags are not allowed by the tailnet policy)"
     changed "joined tailnet"
@@ -331,6 +340,11 @@ perimeter_tailnet() {
   else
     TS_IP="<tailnet-ip>"
   fi
+}
+
+perimeter_tailnet() {
+  log "Perimeter: tailnet"
+  tailnet_join
   IKENGA_HOST_VALUE="$TS_IP"
   # A host moving from public-https keeps Caddy listening on 80/443 unless we
   # retire it; the firewall closes the ports, but nothing should be serving.
@@ -342,7 +356,8 @@ perimeter_tailnet() {
 }
 
 perimeter_public() {
-  log "Perimeter: public-https (Caddy + Let's Encrypt)"
+  log "Perimeter: public-https (Caddy + Let's Encrypt)${SSH_ACCESS:+, SSH over $SSH_ACCESS}"
+  [[ "$SSH_ACCESS" == tailnet ]] && tailnet_join
   if ! command -v caddy >/dev/null; then
     run sh -c 'curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg'
     run sh -c "curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list"
@@ -381,6 +396,11 @@ perimeter_public() {
       systemctl enable --now caddy; systemctl reload caddy
       changed "Caddy configured for $PUBLIC_HOST"
     fi
+  fi
+  # A host moving here from the tailnet perimeter had Caddy disabled; the
+  # Caddyfile may be unchanged, so enabling cannot hang off the write above.
+  if [[ $DRY_RUN -eq 0 ]] && ! systemctl is-active --quiet caddy; then
+    systemctl enable --now caddy; changed "caddy enabled and started"
   fi
   IKENGA_HOST_VALUE="127.0.0.1"
   IKENGA_PUBLIC_URL_VALUE="https://$PUBLIC_HOST"
@@ -462,6 +482,31 @@ ensure_var() {
   changed "$key added to $ENV_FILE"
 }
 
+# Perimeter-derived settings are not secrets and must follow the profile:
+# set_var replaces a stale value, unset_var removes one. (ensure_var stays
+# append-only for secrets, which may exist nowhere else.)
+set_var() {
+  local key="$1" value="$2" cur
+  cur="$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    [[ "$cur" == "$value" ]] && return
+    awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k{print k"="v; next} {print}' "$ENV_FILE" > "$ENV_FILE.tmp" \
+      && cat "$ENV_FILE.tmp" > "$ENV_FILE" && rm -f "$ENV_FILE.tmp"
+    changed "$key updated in $ENV_FILE"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    changed "$key added to $ENV_FILE"
+  fi
+  ENV_CHANGED=1
+}
+unset_var() {
+  local key="$1"
+  grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null || return 0
+  grep -vE "^${key}=" "$ENV_FILE" > "$ENV_FILE.tmp" && cat "$ENV_FILE.tmp" > "$ENV_FILE" && rm -f "$ENV_FILE.tmp"
+  changed "$key removed from $ENV_FILE"
+  ENV_CHANGED=1
+}
+
 write_env() {
   log "Credentials and environment ($ENV_FILE)"
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -472,15 +517,13 @@ write_env() {
   [[ -f "$ENV_FILE" ]] && cp -a "$ENV_FILE" "$ENV_FILE.bak-$(date +%Y%m%d-%H%M%S)"
   touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
 
-  ensure_var IKENGA_HOST "$IKENGA_HOST_VALUE"
-  [[ -n "${IKENGA_PUBLIC_URL_VALUE:-}" ]] && ensure_var IKENGA_PUBLIC_URL "$IKENGA_PUBLIC_URL_VALUE"
+  set_var IKENGA_HOST "$IKENGA_HOST_VALUE"
+  if [[ -n "${IKENGA_PUBLIC_URL_VALUE:-}" ]]; then set_var IKENGA_PUBLIC_URL "$IKENGA_PUBLIC_URL_VALUE"; else unset_var IKENGA_PUBLIC_URL; fi
   ensure_var IKENGA_VAULT_KEY "$(openssl rand -hex 32)"
-  if [[ "$TIER" == t0 ]]; then
-    ensure_var IKENGA_AUTH_TOKEN "$(openssl rand -hex 32)"
-  elif [[ "$PERIMETER" == tailnet ]]; then
-    # Plain HTTP on a tailnet: the session cookie cannot be Secure (README).
-    ensure_var IKENGA_INSECURE_COOKIE true
-  fi
+  [[ "$TIER" == t0 ]] && ensure_var IKENGA_AUTH_TOKEN "$(openssl rand -hex 32)"
+  # Plain HTTP on a tailnet: the session cookie cannot be Secure (README).
+  # Behind HTTPS it MUST be Secure, so a host leaving the tailnet drops it.
+  if [[ "$TIER" == t1 && "$PERIMETER" == tailnet ]]; then set_var IKENGA_INSECURE_COOKIE true; else unset_var IKENGA_INSECURE_COOKIE; fi
 
   # Optional secrets (agent API keys etc.) from a file the operator controls:
   # copied by name, never read into argv or the log.
@@ -528,9 +571,9 @@ install_service() {
   # `enable --now` leaves an already-running service on the OLD binary, so an
   # upgrade (bumped VERSION) must restart it explicitly. This ends open
   # terminals (T1 keeps detached chi-runners via KillMode=process).
-  if [[ $BINARY_CHANGED -eq 1 && $was_active -eq 1 ]]; then
+  if [[ ( $BINARY_CHANGED -eq 1 || $ENV_CHANGED -eq 1 ) && $was_active -eq 1 ]]; then
     systemctl restart "$svc"
-    changed "service $svc restarted onto $VERSION (open terminals ended)"
+    changed "service $svc restarted (new binary or settings; open terminals ended)"
   elif [[ $was_active -eq 0 ]]; then
     changed "service $svc enabled and started"
   fi
@@ -903,7 +946,7 @@ if [[ "$ACTION" == "upgrade" ]]; then
 fi
 
 validate_profile
-IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0
+IKENGA_HOST_VALUE="127.0.0.1"; IKENGA_PUBLIC_URL_VALUE=""; ARCH=""; TS_IP=""; BINARY_CHANGED=0; ENV_CHANGED=0
 preflight
 confirm
 harden_base
