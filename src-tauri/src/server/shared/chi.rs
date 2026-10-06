@@ -4,10 +4,11 @@
 //!
 //! What is here is exactly the read path: the `chi_cache` row fetch, the
 //! per-run output-file merge, and the detached-run (WP-18b) liveness
-//! decision. None of it writes. The reconciliation sweep that *persists* a
-//! detached run's terminal status (`cache_update_done_if_live`) and the run
-//! notification it raises stay in `commands::chi`: they need the desktop's
-//! `AppHandle`, and a read must not have side effects anyway.
+//! decision. None of it writes. The write side — run / resume / cancel, the
+//! reconciliation sweep that *persists* a detached run's terminal status
+//! (`cache_update_done_if_live`) and the run notification it raises — is
+//! `super::chi_exec` (WP-P10), shared by the desktop and the daemon; a read
+//! must not have side effects anyway.
 //!
 //! Layout: the desktop keeps per-run output files in
 //! `<app_data_dir>/`[`CACHE_DIR`]; the daemon mirrors that under its
@@ -250,7 +251,7 @@ pub(crate) async fn list_merged(
         match sessions {
             Ok(sessions) => merge_claude_sessions(&mut rows, sessions),
             Err(e) => {
-                log::debug!(target: "ikenga::chi", "claude_list_sessions failed: {e}");
+                tracing::debug!(target: "ikenga::chi", "claude_list_sessions failed: {e}");
             }
         }
     }
@@ -347,7 +348,7 @@ fn confine(cache_dir: &Path, path: &Path) -> Result<(), String> {
 /// A detached run (WP-18b) whose row still says `queued` / `running` gets the
 /// liveness decision applied to what is returned — the pid probe, then the
 /// runner's status file — but NOT persisted: the row only learns its end from
-/// the desktop's reconciliation sweep. `probe` is `chi_liveness::probe_runner`
+/// the reconciliation sweep (`chi_exec`). `probe` is `chi_liveness::probe_runner`
 /// in production.
 pub(crate) async fn status(
     db: &PaDb,

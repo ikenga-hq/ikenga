@@ -57,6 +57,8 @@ pub mod mute;
 pub mod ops;
 /// Permission routing core (G-ACCESS §5.3–§5.7; WP-74a stub, WP-75 fills).
 pub mod routing;
+/// The Chi `run_finished` / `run_failed` builder (WP-40; ungated by WP-P10).
+pub mod run;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;

@@ -139,9 +139,14 @@ pub async fn rpc_handler(
     let res = match payload.cmd.as_str() {
         // --- PTY Commands ---
         "pty_spawn" => {
+            // `terminalId` is what `tauri-cmd.ts` sends (Tauri does the camel -> snake conversion
+            // on the desktop; nothing does it here). `terminal_id` is kept for older callers.
+            // Reading only the snake spelling dropped the id, so a browser terminal got a random
+            // one and could not be found again after a reload.
             let terminal_id = payload
                 .args
-                .get("terminal_id")
+                .get("terminalId")
+                .or_else(|| payload.args.get("terminal_id"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let title = payload
@@ -273,84 +278,8 @@ pub async fn rpc_handler(
         "pty_foreground_snapshot" => RpcResponse::success(state.pty_manager.foreground_snapshot()),
 
         // --- FS Commands ---
-        "fs_exists" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => RpcResponse::success(path.exists()),
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_read" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => RpcResponse::success(content),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_write" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let content = payload
-                .args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            match resolve_path(&state, path_str) {
-                Ok(path) => {
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    match tokio::fs::write(&path, content).await {
-                        Ok(_) => RpcResponse::success(true),
-                        Err(e) => RpcResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => RpcResponse::error(e),
-            }
-        }
-        "fs_list" => {
-            let path_str = payload
-                .args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let path = match resolve_path(&state, path_str) {
-                Ok(p) => p,
-                Err(e) => return Json(RpcResponse::error(e)),
-            };
-            match std::fs::read_dir(path) {
-                Ok(entries) => {
-                    let items: Vec<serde_json::Value> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|entry| {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                            serde_json::json!({
-                                "name": name,
-                                "is_dir": is_dir,
-                                "path": entry.path().to_string_lossy().into_owned(),
-                            })
-                        })
-                        .collect();
-                    RpcResponse::success(items)
-                }
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }
+        // Refusals fold into `false`, as on the desktop (`rpc_files`).
+        "fs_exists" => rpc_files::fs_exists(&state, &payload.args).await,
         "fs_mkdir" => {
             let path_str = payload
                 .args
@@ -490,6 +419,45 @@ pub async fn rpc_handler(
             let store = crate::pkg::skill_actions::store_root();
             RpcResponse::success(state.pkg_index.all_skill_actions(store.as_deref()))
         }
+        "pkg_activity_bar_set_badge" => {
+            let pkg_id = payload
+                .args
+                .get("pkgId")
+                .or_else(|| payload.args.get("pkg_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if pkg_id.is_empty() {
+                return Json(RpcResponse::error("pkg_activity_bar_set_badge: `pkgId` is required"));
+            }
+            // Absent or null clears the badge; anything else must parse.
+            let badge: Option<crate::pkg::registries::ActivityBarBadge> =
+                match payload.args.get("badge").filter(|v| !v.is_null()) {
+                    None => None,
+                    Some(v) => match serde_json::from_value(v.clone()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            return Json(RpcResponse::error(format!(
+                                "pkg_activity_bar_set_badge: invalid `badge`: {e}"
+                            )))
+                        }
+                    },
+                };
+            // Kept in memory and reported through `pkg_kernel_status`'s
+            // `activity_bar` registry; the server has no desktop event to emit.
+            match state.pkg_index.set_badge(pkg_id, badge) {
+                Ok(true) => RpcResponse::success(()),
+                Ok(false) => RpcResponse::error(format!("no activity-bar entry for pkg `{pkg_id}`")),
+                Err(e) => RpcResponse::error(format!("{e:#}")),
+            }
+        }
+        // The server has no install-time trust gate, so nothing is ever
+        // parked for a capability review.
+        "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
+        // desktop only, and the server runs neither, so the answer here is
+        // always no: the app reports the capability as unavailable instead
+        // of failing on an unknown command.
+        "pkg_is_trusted_for_elevated" => RpcResponse::success(false),
 
         // --- Secrets & Vault Commands (G-30; per-principal store, WP-21) ---
         //
@@ -519,6 +487,10 @@ pub async fn rpc_handler(
         // Desktop: the names in `secrets-index.json`. Daemon: every name of
         // both layers — same `string[]` shape, never a value.
         "secrets_index_names" => rpc_local::secrets_index_names(&state),
+        // The operator default's names alone (review WP76-RV1): how the
+        // browser tells "your override" from a bare key of your own. A
+        // browser-only verb — the desktop keychain has no default layer.
+        "secrets_default_names" => rpc_local::secrets_default_names(&state),
         // No passphrase layer (DEC-R18-1: the key is server-held, so
         // background work reads secrets while the user is signed out). T1:
         // `configured: true, locked: false`, `secrets_lock` answers that
@@ -550,14 +522,20 @@ pub async fn rpc_handler(
         "backup_delete" => rpc_local::backup_delete(&state, &payload.args),
         "pkg_settings_get" => rpc_local::pkg_settings_get(&state, &payload.args).await,
 
-        // --- Chi reads, agent-ops files, identity (WP-19 slice 3) ---
+        // --- Chi runs, agent-ops files, identity (WP-19 slice 3, WP-P10) ---
         //
         // Also bodies in `server::rpc_local`, over `server::shared::{chi,
-        // agent_ops, identity}` — the cores the desktop commands call. The chi
-        // reads need `--data-dir`; the agent-ops arms resolve the router's home
-        // (single-user seam, G-PRINCIPAL / WP-20). Everything that spawns
-        // (`chi_run` / `chi_resume` / `chi_cancel`, `agent_ops_run_now`) stays
+        // chi_exec, agent_ops, identity}` — the cores the desktop commands
+        // call. Every chi arm needs `--data-dir`. The write arms (WP-P10)
+        // spawn and signal through `executor::current()`, so under T1 — where
+        // this handler runs in the signed-in principal's child — a run
+        // executes as that principal, against that principal's own ikenga.db
+        // and chi-cache. The agent-ops arms resolve the router's home
+        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` stays
         // desktop-only.
+        "chi_run" => rpc_local::chi_run(&state, &payload.args).await,
+        "chi_resume" => rpc_local::chi_resume(&state, &payload.args).await,
+        "chi_cancel" => rpc_local::chi_cancel(&state, &payload.args).await,
         "chi_status" => rpc_local::chi_status(&state, &payload.args).await,
         "chi_list" => rpc_local::chi_list(&state, &payload.args).await,
         "agent_ops_list_jobs" => rpc_local::agent_ops_list_jobs(&state).await,
@@ -665,6 +643,8 @@ pub async fn rpc_handler(
         "claude_list_sessions" => rpc_claude::claude_list_sessions(&state, &payload.args).await,
         "claude_read_jsonl" => rpc_claude::claude_read_jsonl(&state, &payload.args).await,
         "claude_session_list" => rpc_claude::claude_session_list(&state, &payload.args).await,
+        "detect_agent" => rpc_claude::detect_agent(&payload.args).await,
+        "detect_agents" => rpc_claude::detect_agents().await,
         "detect_agent_config" => rpc_claude::detect_agent_config(&state, &payload.args),
         "list_claude_projects" => rpc_claude::list_claude_projects(&state).await,
         "list_agent_projects" => rpc_claude::list_agent_projects(&state, &payload.args).await,
@@ -729,6 +709,10 @@ pub async fn rpc_handler(
         // allowlist), `fs_roots_*` (would let the token holder redefine the
         // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
+        "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
+        "fs_write" => rpc_files::fs_write(&state, &payload.args).await,
+        "fs_trash" => rpc_files::fs_trash(&state, &payload.args).await,
+        "fs_list" => rpc_files::fs_list(&state, &payload.args).await,
         "fs_kind" => rpc_files::fs_kind(&state, &payload.args).await,
         "fs_mime" => rpc_files::fs_mime(&state, &payload.args),
         "fs_search" => rpc_files::fs_search(&state, &payload.args).await,

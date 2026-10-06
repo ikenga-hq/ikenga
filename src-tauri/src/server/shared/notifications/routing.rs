@@ -1216,8 +1216,12 @@ pub struct RelayDecision {
 }
 
 /// How long after an ask's expiry the daemon still accepts the desktop's
-/// "that decision did not take effect" report for it.
-const RELAY_ACK_GRACE: Duration = Duration::from_secs(30);
+/// "that decision did not take effect" report for it. Long enough to cover
+/// a desktop that crashed between `permission_relay_take` and applying the
+/// decision and is restarted: its boot sweep ([`sweep_orphaned_asks`])
+/// reports the ask then (review WP75-RV2). A delivered decision holds no
+/// keep-alive, so this keeps nothing awake.
+const RELAY_ACK_GRACE: Duration = Duration::from_secs(5 * 60);
 
 struct PendingAsk {
     row_id: i64,
@@ -1611,6 +1615,55 @@ impl Relay {
     }
 }
 
+/// Desktop boot (review WP75-RV2): the hook / ACP asks an earlier desktop
+/// run left open. Their hold (the hook gate's parked response, the ACP
+/// round-trip) died with that process, so none can still take a decision —
+/// including a remote decision the relay delivered just before a crash and
+/// the desktop never applied. Each is resolved here (the ask is over) and
+/// its key returned, for the desktop to report to the daemon as
+/// `permission_relay_resolve {outcome: 'cancelled'}` so the daemon retracts
+/// a `permission.decided` it wrote for a decision that never took effect.
+/// `before_ms` is this process's start: an ask raised since is live.
+pub async fn sweep_orphaned_asks(pool: &sqlx::SqlitePool, before_ms: i64) -> Vec<String> {
+    let rows: Vec<(i64, String)> = match sqlx::query_as(
+        "SELECT id, dedupe_key FROM shell_notifications \
+         WHERE kind = 'permission' AND resolved_at IS NULL AND created_at < ? \
+           AND (dedupe_key LIKE 'permission:hook:%' OR dedupe_key LIKE 'permission:acp:%')",
+    )
+    .bind(before_ms)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!(target: "ikenga::notifications", "orphaned-ask sweep: {e}");
+            return Vec::new();
+        }
+    };
+    let now = now_ms();
+    let mut keys = Vec::with_capacity(rows.len());
+    for (id, key) in rows {
+        let r = sqlx::query(
+            "UPDATE shell_notifications SET resolved_at = ?, read_at = COALESCE(read_at, ?) \
+             WHERE id = ? AND resolved_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await;
+        match r {
+            Ok(done) if done.rows_affected() > 0 => keys.push(key),
+            Ok(_) => {}
+            Err(e) => log::warn!(target: "ikenga::notifications", "orphaned ask {key}: {e}"),
+        }
+    }
+    if !keys.is_empty() {
+        super::publish(ChangeReason::Read, None);
+    }
+    keys
+}
+
 /// The daemon's resolver table: only the relay (§5.5).
 pub struct RelayResolvers(pub Arc<Relay>);
 
@@ -1658,9 +1711,21 @@ pub struct DaemonRouting {
 }
 
 impl DaemonRouting {
-    /// The daemon's `ikenga.db` writer, opened lazily (the server's own
-    /// `pa_db` applies migrations on first use too; opening here at boot
-    /// would race it), with an earlier run's relay rows swept first.
+    /// Over the daemon's own `ikenga.db` handle — the one `run_server`
+    /// hands its router (`AppState.pa_db`), so the daemon keeps a single
+    /// writer pool (review WP75-R9).
+    pub fn new(store: AccessStore, db: Arc<crate::db::PaDb>) -> Self {
+        DaemonRouting {
+            db,
+            relay: Relay::with_store(store.clone()),
+            store,
+            swept: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The daemon's `ikenga.db` writer (the server's own `pa_db`, which
+    /// opens and migrates on first use), with an earlier run's relay rows
+    /// swept first.
     pub async fn pool(&self) -> Result<sqlx::SqlitePool, AccessError> {
         let pool = self.db.ensure_pool().await.map_err(AccessError::internal)?;
         self.swept.get_or_init(|| Relay::sweep_stale(&pool)).await;
@@ -1671,14 +1736,10 @@ impl DaemonRouting {
 static DAEMON: OnceLock<DaemonRouting> = OnceLock::new();
 
 /// Installed once by the T0 daemon's access boot (`access::DaemonAccess::
-/// boot_t0`), with the same `<data-dir>/ikenga.db` the daemon serves.
-pub fn install_daemon(store: AccessStore, data_dir: &Path) {
-    let _ = DAEMON.set(DaemonRouting {
-        db: Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db"))),
-        relay: Relay::with_store(store.clone()),
-        store,
-        swept: tokio::sync::OnceCell::new(),
-    });
+/// boot_t0`), with `run_server`'s own `pa_db` (the `<data-dir>/ikenga.db`
+/// the daemon serves) — never a second `PaDb` on the same file.
+pub fn install_daemon(rt: DaemonRouting) {
+    let _ = DAEMON.set(rt);
 }
 
 pub fn daemon() -> Option<&'static DaemonRouting> {
@@ -1845,18 +1906,28 @@ pub async fn relay_rpc(ctx: &AccessCtx, cmd: &str, args: &Value) -> Result<Value
 /// refused it for `approve`, §5.4 step 1): audit `permission.refused`
 /// (A-23). Daemon only; best effort.
 pub async fn audit_prehook_refusal(ctx: &AccessCtx, cmd: &str, err: &AccessError) {
+    if let (Some(ev), Some(rt)) = (prehook_refusal_event(ctx, cmd, err), daemon()) {
+        append_audit(&rt.store, &ev).await;
+    }
+}
+
+/// The `permission.refused` row for a `permission_decide` refused before it
+/// reached the arm, or `None` (another command, or a refusal that is not
+/// about `approve`). The one copy both writers use: the T0 daemon's
+/// pre-hook ([`audit_prehook_refusal`]) and the T1 broker's
+/// `authorize_rpc` (`access::t1::AccessAuthorizer`).
+pub fn prehook_refusal_event(ctx: &AccessCtx, cmd: &str, err: &AccessError) -> Option<Event> {
     if cmd != "permission_decide" {
-        return;
+        return None;
     }
     let reason = match err.code {
         Code::RoutingRefused => "routing_refused",
         Code::Forbidden if err.message.contains("approve") => "forbidden",
-        _ => return,
+        _ => return None,
     };
-    if let Some(rt) = daemon() {
-        let ev = Event::by("permission.refused", ctx).detail(json!({ "reason": reason }));
-        append_audit(&rt.store, &ev).await;
-    }
+    let mut ev = Event::by("permission.refused", ctx).detail(json!({ "reason": reason }));
+    ev.project_key = ctx.share.as_ref().map(|s| s.project_key.clone());
+    Some(ev)
 }
 
 // ─── the read model (§5.7) ──────────────────────────────────────────────────
@@ -3320,5 +3391,119 @@ mod tests {
             Some("outer".into())
         );
         assert_eq!(project_for_path(&pool, "/elsewhere").await, None);
+    }
+
+    /// Review WP75-R9: the daemon's routing runtime runs on the server's own
+    /// `ikenga.db` handle — one writer pool, not a second `PaDb`.
+    #[tokio::test]
+    async fn the_daemon_runtime_shares_the_servers_db_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::PaDb::new(tmp.path().join("ikenga.db")));
+        let rt = DaemonRouting::new(AccessStore::memory_t0().await, db.clone());
+        assert!(Arc::ptr_eq(&rt.db, &db));
+        // The stale-mirror sweep runs on that handle, before first use.
+        let pool = db.ensure_pool().await.unwrap();
+        let stale = record_ask(
+            &pool,
+            ask("permission:relay:permission:hook:old"),
+            &Attribution::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+        rt.pool().await.unwrap();
+        assert!(load_ask(&pool, stale)
+            .await
+            .unwrap()
+            .unwrap()
+            .resolved_at
+            .is_some());
+    }
+
+    /// Review WP75-RV2: a desktop that crashed after a relayed decision was
+    /// delivered but before it applied leaves its ask open. The boot sweep
+    /// closes it (and every other hook / ACP ask the dead run held, never a
+    /// newer one), and its report retracts the daemon's `permission.decided`.
+    #[tokio::test]
+    async fn a_crash_between_take_and_apply_is_retracted_at_boot() {
+        // The daemon: a mirror, decided on the phone, taken by the desktop.
+        let (_dt, daemon_pool) = db().await;
+        let store = AccessStore::memory_t0().await;
+        let relay = Relay::with_store(store.clone());
+        let n0 = audit_rows(&store).await.len();
+        let mirror = relay
+            .put(&daemon_pool, &relay_put("permission:hook:crash", 30_000))
+            .await
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        decide_on_relay(
+            &daemon_pool,
+            &relay,
+            &owner_device(Tier::Approve, true),
+            mirror,
+            "allow_once",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            relay.take(100).await["decisions"][0]["key"],
+            "permission:hook:crash"
+        );
+
+        // The desktop's own rows: the delivered ask, an ACP ask, a terminal
+        // ask (answered in its terminal; not swept), and one raised after
+        // this boot (live; not swept).
+        let (_t, pool) = db().await;
+        let mut ids = Vec::new();
+        for key in [
+            "permission:hook:crash",
+            "permission:acp:t1:r1",
+            "permission:terminal:x",
+        ] {
+            ids.push(
+                record_ask(&pool, ask(key), &Attribution::default())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+            );
+        }
+        let booted = now_ms() + 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let fresh = record_ask(&pool, ask("permission:hook:new"), &Attribution::default())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let mut keys = sweep_orphaned_asks(&pool, booted).await;
+        keys.sort();
+        assert_eq!(keys, ["permission:acp:t1:r1", "permission:hook:crash"]);
+        for (id, swept) in [
+            (ids[0], true),
+            (ids[1], true),
+            (ids[2], false),
+            (fresh, false),
+        ] {
+            let resolved = load_ask(&pool, id).await.unwrap().unwrap().resolved_at;
+            assert_eq!(resolved.is_some(), swept, "row {id}");
+        }
+        assert!(sweep_orphaned_asks(&pool, booted).await.is_empty(), "once");
+
+        // The desktop reports each; the daemon retracts its claim.
+        for key in &keys {
+            relay
+                .resolve(&daemon_pool, &json!({"key": key, "outcome": "cancelled"}))
+                .await
+                .unwrap();
+        }
+        let rows = audit_rows(&store).await;
+        assert_eq!(rows.len(), n0 + 2);
+        assert_eq!(rows[n0].0, "permission.decided");
+        assert_eq!(rows[n0 + 1].0, "permission.refused");
+        assert_eq!(rows[n0 + 1].1["reason"], "not_applied");
+        assert_eq!(rows[n0 + 1].1["outcome"], "cancelled");
+        assert_eq!(row_cols(&daemon_pool, mirror).await.1, None);
     }
 }

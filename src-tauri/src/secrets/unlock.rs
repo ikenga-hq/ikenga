@@ -470,27 +470,13 @@ fn reject_linked_parent(path: &Path) -> Result<(), UnlockError> {
     {
         let metadata = fs::symlink_metadata(ancestor)
             .map_err(|error| UnlockError::Io(format!("inspect unlock parent: {error}")))?;
-        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        if crate::secrets::index::is_untrusted_directory_link(&metadata) {
             return Err(UnlockError::Io(
                 "secrets unlock envelope has a linked parent".to_string(),
             ));
         }
     }
     Ok(())
-}
-
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = metadata;
-        false
-    }
 }
 
 fn read_envelope(path: &Path) -> Result<WrappedDekEnvelope, UnlockError> {

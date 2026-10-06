@@ -255,7 +255,7 @@ impl ClaudeCodeEngine {
         // Phase 3 ignores `mcp_servers` — claude already wires its own MCP
         // via `--mcp-config`. Phase 9 will translate ACP-declared servers
         // into a generated config file.
-        let opts = SessionOpts::default();
+        let opts = launch_opts_from_meta(req.meta.as_ref());
         let mut initial_mode = opts.permission_mode;
         let session = self.sessions.get_or_create(&thread_id, &cwd, opts).await;
 
@@ -924,6 +924,32 @@ fn resolve_thread_id(meta: Option<&serde_json::Map<String, serde_json::Value>>) 
 /// Empty-string projectId is treated as "absent" so a callsite that always
 /// includes the field but with no value transparently falls back to the
 /// shell's active project.
+/// WP-11: session launch options carried on `_meta` of ACP `session/new`
+/// (`pluginDirs`, `appendSystemPrompt`, `role`), the same channel as
+/// `projectId`. Absent or mistyped keys leave the default, so a request
+/// without them creates exactly the session it did before.
+fn launch_opts_from_meta(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> SessionOpts {
+    let mut opts = SessionOpts::default();
+    let Some(m) = meta else { return opts };
+    let str_of = |k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(dirs) = m.get("pluginDirs").and_then(|v| v.as_array()) {
+        opts.plugin_dirs = dirs
+            .iter()
+            .filter_map(|d| d.as_str())
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    opts.append_system_prompt = str_of("appendSystemPrompt");
+    opts.role = str_of("role");
+    opts
+}
+
 fn resolve_project_id(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
     meta.and_then(|m| m.get("projectId"))
         .and_then(|v| v.as_str())
@@ -988,6 +1014,40 @@ mod tests {
         let id = resolve_thread_id(None);
         assert_eq!(id.len(), 36);
         assert!(id.contains('-'));
+    }
+
+    #[test]
+    fn launch_opts_from_meta_reads_wp11_keys() {
+        let meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "projectId": "p",
+                "pluginDirs": ["/plugins/ikenga", "", 7],
+                "appendSystemPrompt": "Use the iyke tools.",
+                "role": "plan",
+            }))
+            .unwrap();
+        let opts = launch_opts_from_meta(Some(&meta));
+        assert_eq!(opts.plugin_dirs, vec!["/plugins/ikenga".to_string()]);
+        assert_eq!(
+            opts.append_system_prompt.as_deref(),
+            Some("Use the iyke tools.")
+        );
+        assert_eq!(opts.role.as_deref(), Some("plan"));
+        assert_eq!(opts.model, None);
+    }
+
+    #[test]
+    fn launch_opts_from_meta_without_keys_is_the_default() {
+        let meta: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({ "threadId": "t", "role": "" })).unwrap();
+        for opts in [
+            launch_opts_from_meta(None),
+            launch_opts_from_meta(Some(&meta)),
+        ] {
+            assert!(opts.plugin_dirs.is_empty());
+            assert_eq!(opts.append_system_prompt, None);
+            assert_eq!(opts.role, None);
+        }
     }
 
     #[test]

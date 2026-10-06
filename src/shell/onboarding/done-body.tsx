@@ -12,13 +12,14 @@
 // summary WP-39's daily address links back into, per `05-tracking.md`
 // WP-38's "Produces" line.
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { dailyAddress } from '@/lib/lore';
 import { openSettingsFile } from '@/lib/settings/client';
+import { useOpenFile } from '@/lib/settings/use-open-file';
 import {
 	ONBOARDING_STEPS,
 	type OnboardingStepId,
@@ -38,6 +39,9 @@ interface DoneBodyProps {
 	 *  user lands on `/`. */
 	onFinish: () => void;
 	goTo: (id: OnboardingStepId) => void;
+	/** Wizard chrome hook: hands {@link handleOpenWorkspace} to the footer's
+	 *  "Enter your Obi" so both buttons finish the same way. */
+	setFinish?: (fn: (() => void) | null) => void;
 }
 
 interface CardModel {
@@ -48,7 +52,7 @@ interface CardModel {
 	skipped?: boolean;
 }
 
-export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
+export function DoneBody({ onFinish, goTo, setFinish }: DoneBodyProps) {
 	const navigate = useNavigate();
 	const steps = useShellStore((s) => s.onboarding.steps);
 	const startedAt = useShellStore((s) => s.onboarding.startedAt);
@@ -86,9 +90,14 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 
 	// 700ms time-of-day greeting flourish before the route transition.
 	const [greeting, setGreeting] = useState<{ igbo: string; english: string } | null>(null);
+	const openFile = useOpenFile();
 
+	// One finish per visit, whichever button fires it first (state is too
+	// late to stop a second click inside the 700ms flourish).
+	const openingRef = useRef(false);
 	const handleOpenWorkspace = () => {
-		if (blocker) return;
+		if (blocker || openingRef.current) return;
+		openingRef.current = true;
 		const g = dailyAddress(new Date());
 		setGreeting({ igbo: g.igbo, english: g.english });
 		window.setTimeout(() => {
@@ -96,6 +105,17 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 			void navigate({ to: '/' });
 		}, 700);
 	};
+
+	// The footer's "Enter your Obi" must do what the in-page button does
+	// (audit 2026-10-06 rank 19: it only stamped completion and never left
+	// the wizard). Register a stable trampoline to the latest handler.
+	const openRef = useRef(handleOpenWorkspace);
+	openRef.current = handleOpenWorkspace;
+	useEffect(() => {
+		if (!setFinish) return;
+		setFinish(() => openRef.current());
+		return () => setFinish(null);
+	}, [setFinish]);
 
 	return (
 		<div className="relative mx-auto max-w-5xl">
@@ -107,7 +127,10 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 					aria-live="polite"
 				>
 					<div className="text-center">
-						<div className="font-display text-4xl font-bold tracking-tight" style={{ color: 'var(--primary)' }}>
+						<div
+							className="font-display text-4xl font-bold tracking-tight"
+							style={{ color: 'var(--primary)' }}
+						>
 							{greeting.igbo}
 							{userName ? `, ${userName}` : ''}.
 						</div>
@@ -136,7 +159,10 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 				</div>
 				<div
 					className="flex flex-none items-center gap-3 rounded-md border px-4 py-3"
-					style={{ borderColor: 'var(--success)', background: 'var(--success-soft, var(--bg-surface))' }}
+					style={{
+						borderColor: 'var(--success)',
+						background: 'var(--success-soft, var(--bg-surface))',
+					}}
 					data-testid="summary-ready-mark"
 				>
 					<div
@@ -179,12 +205,12 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 								<span className="truncate font-mono" style={{ color: 'var(--fg)' }} title={f}>
 									{f}
 								</span>
-								{f === '~/.ikenga/settings.json' && (
+								{f === '~/.ikenga/settings.json' && openFile.available && (
 									<Button
 										variant="ghost"
 										size="sm"
 										className="h-6 px-2 text-[11px]"
-										onClick={() => void openSettingsFile('personal').catch(() => {})}
+										onClick={() => void openFile.run(() => openSettingsFile('personal'))}
 									>
 										Open
 									</Button>
@@ -192,6 +218,11 @@ export function DoneBody({ onFinish, goTo }: DoneBodyProps) {
 							</div>
 						))}
 					</div>
+					{openFile.error && (
+						<p role="alert" className="mt-2 text-[11px]" style={{ color: 'var(--danger)' }}>
+							{openFile.error}
+						</p>
+					)}
 					<p className="mt-3 text-[11px]" style={{ color: 'var(--fg-faint)' }}>
 						No secret was written to any of these. Keys live in the vault.
 					</p>
@@ -269,7 +300,7 @@ function SummaryCard({ card, onEdit }: { card: CardModel; onEdit: () => void }) 
 
 const STEP_LABEL: Record<OnboardingStepId, string> = {
 	welcome: 'Welcome',
-	engine: 'Chi',
+	engine: 'Engine',
 	project: 'Project',
 	equipment: 'Ngwa',
 	look: 'Look',
@@ -337,7 +368,8 @@ function renderCard(
 		case 'project': {
 			const p = rec.payload as ProjectStepPayload | undefined;
 			const rootCount = p?.extraRoots?.length ?? ctx.extraRoots.length;
-			const rootSample = (p?.extraRoots ?? ctx.extraRoots).slice(0, 3).join('\n') || '(no project roots)';
+			const rootSample =
+				(p?.extraRoots ?? ctx.extraRoots).slice(0, 3).join('\n') || '(no project roots)';
 			const extra = `${rootCount} extra root${rootCount === 1 ? '' : 's'}`;
 			// D-04 `done`: "royalti-co · ~/…/royalti-co" or "Empty workspace".
 			if (p?.mode === 'empty') {
@@ -438,7 +470,7 @@ export function findBlockingState(
 		return 'Step 1 (Welcome) is incomplete — go back and review the system checks.';
 	}
 	if (steps.engine.status === 'pending') {
-		return 'Step 2 (Chi) is still pending — pick a Chi or continue offline.';
+		return 'Step 2 (Engine) is still pending — pick an engine or continue offline.';
 	}
 	return null;
 }

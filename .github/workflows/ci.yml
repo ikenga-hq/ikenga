@@ -51,6 +51,7 @@ jobs:
       ts: ${{ steps.filter.outputs.ts == 'true' || steps.mode.outputs.full == 'true' }}
       rust: ${{ steps.filter.outputs.rust == 'true' || steps.mode.outputs.full == 'true' }}
       headless: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.server == 'true' || steps.mode.outputs.full == 'true' }}
+      server_artifact: ${{ steps.filter.outputs.server_artifact == 'true' || steps.mode.outputs.full == 'true' }}
       full: ${{ steps.mode.outputs.full }}
     steps:
       - uses: actions/checkout@v6
@@ -94,6 +95,12 @@ jobs:
             # The headless link gate script the `headless` job runs.
             server:
               - 'scripts/server/**'
+            # The release server artifacts and what builds them.
+            server_artifact:
+              - 'scripts/server/**'
+              - '.github/actions/build-server/**'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/ci.yml'
 
       # Cheapest gate in the pipeline and the one that would have caught
       # ikenga#140. Since tauri 2.11.2, app commands are ACL-gated for the
@@ -428,3 +435,78 @@ jobs:
           expect_refusal "as uid 1000" --user 1000 || ok=1
           expect_refusal "without CAP_SETUID" --cap-drop=SETUID || ok=1
           exit $ok
+
+  # Release server artifacts, minus the signing. release.yml builds these only
+  # when a tag is pushed, which is too late to find that a dependency change
+  # broke the cross-link or that a packaging edit dropped a file. This runs the
+  # same build action and packer, on a native runner per architecture, when the
+  # packaging changes and on the full tier (release PRs and the nightly).
+  server-artifact:
+    name: server artifact (${{ matrix.arch }})
+    needs: scope
+    if: needs.scope.outputs.server_artifact == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/build-server
+        with:
+          arch: ${{ matrix.arch }}
+          cache-save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-server-bin-${{ matrix.arch }}
+          path: server-bin/ikenga-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 3
+
+  server-package:
+    name: server tarballs + manifest
+    needs: server-artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-server-bin-*
+          path: server-bin
+          merge-multiple: true
+
+      # The packer only needs a web bundle with an index.html; the real one
+      # is the desktop leg's Vite output, which this job has no use for.
+      - name: Pack with a stand-in web bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-stub/assets
+          echo '<!doctype html><title>stand-in</title>' > dist-stub/index.html
+          echo '/* stand-in */' > dist-stub/assets/app.js
+          VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' src-tauri/server/Cargo.toml | head -n 1)"
+          scripts/server/package-server.sh pack \
+            --version "$VERSION" --commit "$GITHUB_SHA" \
+            --bin-dir server-bin --dist dist-stub --out server-out
+
+      - name: Show what was produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server-out
+          ls -l
+          cat ./*_manifest.json
+          for t in ./*.tar.gz; do echo "== $t"; tar -tvzf "$t"; done

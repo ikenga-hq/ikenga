@@ -24,7 +24,6 @@ import { useMutation } from '@tanstack/react-query';
 import { openExternalUrl } from '@/lib/transport';
 import { useEffect, useState } from 'react';
 
-import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
 import { cn } from '@/components/ui/utils';
@@ -37,7 +36,11 @@ import {
 } from '@/lib/registry/client';
 import { openSettingsFile } from '@/lib/settings/client';
 import { useShellStore } from '@/lib/shell/shell-store';
-import type { AgentDetectEntry, AgentDetectMap } from '@/lib/shell/use-agent-detect';
+import {
+	computeAllMissing as baseComputeAllMissing,
+	type AgentDetectEntry,
+	type AgentDetectMap,
+} from '@/lib/shell/use-agent-detect';
 import { type DetectedAgent, pkgInstallFromRegistry, pkgKernelStatus } from '@/lib/tauri-cmd';
 import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
@@ -137,9 +140,7 @@ export const SUPPORTED_ENGINE_IDS = SUPPORTED_ENGINES.map((e) => e.id);
  *  `engine-none` chrome state from the same probe results this body
  *  renders, without re-running `useAgentDetect`. */
 export function computeAllMissing(results: AgentDetectMap): boolean {
-	const anyDetected = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'detected');
-	const anyPending = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'pending');
-	return !anyPending && !anyDetected;
+	return baseComputeAllMissing(results, SUPPORTED_ENGINE_IDS);
 }
 
 export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
@@ -281,7 +282,8 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 
 	const anyDetected = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'detected');
 	const anyPending = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'pending');
-	const allMissing = !anyPending && !anyDetected;
+	const anyUnknown = SUPPORTED_ENGINE_IDS.some((id) => results[id]?.status === 'unknown');
+	const allMissing = computeAllMissing(results);
 
 	const offlineButtonLabel = (long: boolean) => {
 		if (offlineMut.isPending) return 'Installing offline engine…';
@@ -297,17 +299,19 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 						className="mb-2 text-xs font-semibold uppercase tracking-[0.04em]"
 						style={{ color: 'var(--primary)' }}
 					>
-						Choose your <LoreTerm term="Chi">Chi</LoreTerm>
+						Choose your engine
 					</p>
 					<h1 className="font-display text-3xl font-bold leading-tight tracking-tight">
-						Pick your <LoreTerm term="Chi">Chi</LoreTerm>.
+						Pick your engine.
 					</h1>
 					<p className="mt-2 max-w-[60ch] text-sm" style={{ color: 'var(--fg-muted)' }}>
 						{anyPending
 							? 'Scanning your $PATH for each agent in parallel…'
 							: anyDetected
-								? 'Pick one to continue. You can change your Chi later from Settings → Chi & engines.'
-								: "We couldn't find any Chi on $PATH. Install one below, point at a custom binary, or continue offline — the shell is engine-optional."}
+								? 'Pick one to continue. You can change your engine later from Settings → Engines.'
+								: anyUnknown
+									? "Some engine checks couldn't be completed. Check the details below, point at a custom binary, or continue offline."
+									: "We couldn't find any engine on $PATH. Install one below, point at a custom binary, or continue offline — the shell is engine-optional."}
 					</p>
 				</div>
 				<Button variant="secondary" size="sm" onClick={() => refresh()} data-testid="agents-rescan">
@@ -411,8 +415,8 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 				<div className="flex-1">
 					<div className="text-[13px] font-semibold">
 						{allMissing
-							? 'No Chi found on this machine — continue without one'
-							: 'Continue without a Chi'}
+							? 'No engine found on this machine — continue without one'
+							: 'Continue without an engine'}
 					</div>
 					<div className="mt-0.5 text-xs" style={{ color: 'var(--fg-muted)' }}>
 						Pkg management, files, terminal, and project routing still work. Your Ikenga can be
@@ -444,10 +448,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 				</div>
 			)}
 
-			<WritesNote
-				stepId="engine"
-				onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
-			/>
+			<WritesNote stepId="engine" onOpenFile={() => openSettingsFile('personal')} />
 
 			{/* ── Inline Continue ─────────────────────────────────────── */}
 			<div className="mt-8 flex items-center justify-end gap-3">
@@ -570,6 +571,17 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 							{entry.agent.executable_path}
 						</span>
 					</div>
+				) : entry.status === 'unknown' ? (
+					<div className="flex items-center justify-between gap-2">
+						<span
+							className="truncate text-[11.5px]"
+							style={{ color: 'var(--danger, #ef4444)' }}
+							title={entry.error}
+							data-testid="agent-probe-error"
+						>
+							{entry.error ? `Error: ${entry.error}` : "Couldn't check engine status"}
+						</span>
+					</div>
 				) : (
 					<div className="flex items-center justify-between gap-2">
 						<span style={{ color: 'var(--fg-faint)' }}>
@@ -632,6 +644,15 @@ function StatusPill({ entry }: { entry: AgentDetectEntry }) {
 			<span data-testid="status-pill" data-status="detected">
 				<StatusChip tone="live" dot>
 					Detected
+				</StatusChip>
+			</span>
+		);
+	}
+	if (entry.status === 'unknown') {
+		return (
+			<span data-testid="status-pill" data-status="unknown">
+				<StatusChip tone="warn" dot>
+					Check failed
 				</StatusChip>
 			</span>
 		);

@@ -22,9 +22,9 @@ import { cn } from '@/components/ui/utils';
 // rail can carry a longer descriptive sub-line without cramping the header.
 export const RAIL_COPY: Record<OnboardingStepId, { nm: string; sub: string }> = {
 	welcome: { nm: 'Welcome', sub: 'What this is' },
-	engine: { nm: 'Chi', sub: 'Your engine' },
+	engine: { nm: 'Engine', sub: 'Your engine' },
 	project: { nm: 'Project', sub: 'The container' },
-	equipment: { nm: 'Ngwa', sub: 'Your equipment' },
+	equipment: { nm: 'Ngwa', sub: 'Your store' },
 	look: { nm: 'Look', sub: 'Theme · mode · density' },
 	shortcuts: { nm: 'Keys', sub: 'Five that matter' },
 	done: { nm: 'Done', sub: 'What was set up' },

@@ -82,9 +82,9 @@ export function NgwaProjectSection({ projectId }: ExplorerSectionContext) {
 	if (isEmpty) {
 		return (
 			<div className="p-4 text-center">
-				<h3 className="text-sm font-semibold">No packages installed</h3>
+				<h3 className="text-sm font-semibold">No apps or extensions installed</h3>
 				<p className="text-xs text-muted-foreground mt-1 mb-3">
-					Packages, skills, agents and tools are installed from the Ngwa Store.
+					Apps, skills, agents and tools are installed from the Ngwa Store.
 				</p>
 				<button
 					type="button"

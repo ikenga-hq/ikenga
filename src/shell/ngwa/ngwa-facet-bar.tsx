@@ -15,7 +15,7 @@ export interface NgwaFacetsState {
 	kind: string; // '*' or NgwaKind
 	scope: string; // 'all' | 'personal' | 'project'
 	source: string; // '*' or NgwaSource
-	engine: string; // '*' or 'claude' | 'codex' | 'gemini'
+	engine: string; // '*' or 'claude' | 'codex'
 	trust: string; // '*' or TrustFacetValue
 	usage: string; // '*' | 'week' | 'never'
 	search: string;
@@ -66,7 +66,6 @@ const ENGINES: Array<{ id: string; label: string }> = [
 	{ id: '*', label: 'all' },
 	{ id: 'claude', label: 'claude' },
 	{ id: 'codex', label: 'codex' },
-	{ id: 'gemini', label: 'gemini' },
 ];
 
 const TRUSTS: Array<{ id: string; label: string }> = [

@@ -12,6 +12,7 @@
 import { Link } from '@tanstack/react-router';
 
 import { Button } from '@/components/ui/button';
+import { useOpenFile } from '@/lib/settings/use-open-file';
 import type { OnboardingStepId } from '@/lib/shell/shell-store';
 
 export interface WriteInfo {
@@ -90,7 +91,7 @@ export interface SettingsLink {
 // `/settings/backup` still exist as redirect stubs to `engines`/`storage`,
 // but there's no reason to bounce through them here).
 export const SETTINGS_LINKS: Partial<Record<OnboardingStepId, SettingsLink[]>> = {
-	engine: [{ label: 'Settings · Chi & engines', to: '/settings/engines' }],
+	engine: [{ label: 'Settings · Engines', to: '/settings/engines' }],
 	project: [{ label: 'Settings · Projects', to: '/settings/projects' }],
 	equipment: [
 		{ label: 'Ngwa', to: '/ngwa' },
@@ -112,12 +113,14 @@ export function WritesNote({
 	 *  write (`project`, `equipment`). */
 	file?: string;
 	/** Steps whose `WRITES[stepId].openable` is true pass a handler — usually
-	 *  `() => void openSettingsFile('personal').catch(() => {})`. Omitted (or
-	 *  a no-op) for `equipment`/`shortcuts`, which write outside settings.json
-	 *  and have no generic "open this path" command exposed to onboarding. */
-	onOpenFile?: () => void;
+	 *  `() => openSettingsFile('personal')`. Omitted for `equipment`/`shortcuts`,
+	 *  which write outside settings.json and have no generic "open this path"
+	 *  command exposed to onboarding. A rejection is shown inline, and the
+	 *  button is hidden in a browser session (gap audit rank 14). */
+	onOpenFile?: () => Promise<unknown>;
 }) {
 	const w = WRITES[stepId];
+	const openFile = useOpenFile();
 	return (
 		<div
 			className="mt-6 flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs"
@@ -129,16 +132,26 @@ export function WritesNote({
 				{file ?? w.file}
 			</span>
 			<span className="flex-1">{w.note}</span>
-			{w.openable && onOpenFile && (
+			{w.openable && onOpenFile && openFile.available && (
 				<Button
 					variant="ghost"
 					size="sm"
 					className="h-6 px-2 text-[11px]"
-					onClick={onOpenFile}
+					onClick={() => void openFile.run(onOpenFile)}
 					data-testid="onboarding-writes-open"
 				>
 					Open file
 				</Button>
+			)}
+			{openFile.error && (
+				<span
+					role="alert"
+					className="basis-full"
+					style={{ color: 'var(--danger, var(--fg-muted))' }}
+					data-testid="onboarding-writes-open-error"
+				>
+					{openFile.error}
+				</span>
 			)}
 		</div>
 	);

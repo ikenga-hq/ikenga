@@ -291,11 +291,23 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // `_operator_migrations` table; then the chain is verified (§6.4 "at
     // every start"). Only the broker migrates it.
     let access_store = crate::access::AccessStore::attach_t1(pool.clone()).await?;
+    let max_accounts = access_options.max_accounts;
     let access_t1 = crate::access::t1::T1Access::new(access_store, pool.clone(), access_options);
+    // G-ACCESS P-27 / §4.4: `--max-accounts` caps every creation path — the
+    // root CLI and the env bootstrap included, which never see this flag —
+    // so the serving broker pins it (or its absence) for them (WP76-R6).
+    Provisioner::pin_max_accounts(&pool, max_accounts).await?;
+
+    // Resume any interrupted secrets KEK rotation before serving.
+    if let Err(e) = crate::server::operator::rotate_kek::resume_if_interrupted(&root, &pool).await {
+        tracing::error!("secrets KEK rotation auto-resume failed at boot: {e}");
+        return Err(e);
+    }
 
     // §7.4: honoured after the probe, only on an empty accounts table.
     if let Some(bootstrap) = bootstrap {
-        let prov = Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker);
+        let prov = Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker)
+            .with_max_accounts(max_accounts);
         if let Err(e) = prov.bootstrap_admin(&pool, &bootstrap).await {
             tracing::error!("IKENGA_BOOTSTRAP_ADMIN could not be applied: {e}");
         }
@@ -342,7 +354,8 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     let invite_host = crate::access::share::install_t1(
         &access_t1,
         Arc::new(proxy::ShareChildCalls::new(&state)),
-        Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker),
+        Provisioner::new(root.clone(), uid_range, provisioning, Actor::Broker)
+            .with_max_accounts(max_accounts),
     );
     let mut extensions = BrokerExtensions::default();
     extensions.resolvers.push(installed.resolver.clone());

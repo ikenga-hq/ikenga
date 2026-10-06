@@ -51,6 +51,7 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("fs_home", req!(owner[Files])),
     // ── fs write (P-2: files + dispatch) ──
     ("fs_write", req!(shared[Files, Dispatch])),
+    ("fs_trash", req!(shared[Files, Dispatch])),
     ("fs_mkdir", req!(shared[Files, Dispatch])),
     ("fs_rename", req!(shared[Files, Dispatch])),
     // ── raw DB (P-3: owner-class) ──
@@ -63,12 +64,16 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("list_skill_actions", req!(shared[Files])),
     ("list_all_skill_actions", req!(shared[Files])),
     ("pkg_settings_get", req!(shared[Files])),
+    ("pkg_activity_bar_set_badge", req!(shared[Files])),
+    ("pkg_trust_list_pending", req!(shared[Files])),
+    ("pkg_is_trusted_for_elevated", req!(shared[Files])),
     // ── secrets ──
     ("secrets_get", req!(owner[Secrets])),
     ("secrets_get_scoped", req!(owner[Secrets])),
     ("secrets_list_keys", req!(owner[Settings])),
     ("secrets_list_keys_scoped", req!(owner[Settings])),
     ("secrets_index_names", req!(owner[Settings])),
+    ("secrets_default_names", req!(owner[Settings])),
     ("secrets_vault_status", req!(owner[Settings])),
     ("secrets_set", req!(owner[Settings, Secrets])),
     ("secrets_delete", req!(owner[Settings, Secrets])),
@@ -99,6 +104,13 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     // ── chi / agent-ops / identity ──
     ("chi_status", req!(shared[Sessions])),
     ("chi_list", req!(shared[Sessions])),
+    // WP-P10. Owner-class: a run executes as the serving principal's uid with
+    // that principal's engine logins, and neither a run's cwd nor a run id is
+    // share-root-confined, so a share member may not dispatch, resume or
+    // cancel one in the Owner's child (reads stay `shared[Sessions]`).
+    ("chi_run", req!(owner[Dispatch])),
+    ("chi_resume", req!(owner[Dispatch])),
+    ("chi_cancel", req!(owner[Dispatch])),
     ("agent_ops_list_jobs", req!(owner[Sessions])),
     ("agent_ops_tail_run", req!(owner[Sessions])),
     ("agent_ops_upsert_job", req!(owner[Settings, Dispatch])),
@@ -153,6 +165,8 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("claude_config_load", req!(owner[Files])),
     ("claude_config_read_file", req!(owner[Files])),
     ("claude_config_resolve_cascade", req!(owner[Files])),
+    ("detect_agent", req!(owner[])),
+    ("detect_agents", req!(owner[])),
     ("detect_agent_config", req!(owner[Files])),
     ("list_claude_projects", req!(owner[Files])),
     ("list_agent_projects", req!(owner[Files])),

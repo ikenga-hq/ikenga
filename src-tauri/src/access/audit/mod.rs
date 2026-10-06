@@ -139,6 +139,7 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("audit.exported", Category::Access, false),
     ("audit.chain_broken", Category::Access, false),
     ("audit.resealed", Category::Access, false),
+    ("secrets.kek_rotated", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.
@@ -376,6 +377,117 @@ pub fn on_client_frame(
     });
 }
 
+/// §6.5: one `share.artifact_viewed` row per (member, path, hour).
+pub const VIEW_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+fn view_seen() -> &'static Mutex<HashMap<String, i64>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// The coalescing gate for views: `true` when `(member, project, path)`
+/// has no row in the current hour, and opens one.
+fn view_window_opens(key: String, now_ms: i64) -> bool {
+    let mut seen = view_seen().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = seen.get(&key) {
+        if now_ms - at < VIEW_WINDOW_MS {
+            return false;
+        }
+    }
+    if seen.len() >= 4096 {
+        seen.retain(|_, at| now_ms - *at < VIEW_WINDOW_MS);
+    }
+    seen.insert(key, now_ms);
+    true
+}
+
+/// The file-content reads a share audits as a view (`{path}` args).
+const VIEW_ARMS: &[&str] = &["fs_read"];
+
+/// `path` with `.` segments dropped and separators collapsed; `None` when
+/// it climbs (`..`) — such a read is refused by the child anyway.
+fn lexical(path: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            p => out.push(p),
+        }
+    }
+    Some(out.join("/"))
+}
+
+/// What a share read views (§6.5 `share.artifact_viewed`, "Guest and
+/// artifact-scope reads"), or `None` when it is not one: another command,
+/// an own-workspace or project-scope non-Guest request, or — on an artifact
+/// share — a path that is not the shared artifact (the child refuses it).
+/// An artifact share's view is named by the artifact's project-relative
+/// path; a project-scope Guest's by the path it read.
+pub fn viewed_target(share: &super::ShareCtx, cmd: &str, args: &Value) -> Option<String> {
+    if !VIEW_ARMS.contains(&cmd) {
+        return None;
+    }
+    let path = args.get("path").and_then(Value::as_str)?;
+    let requested = lexical(path).filter(|p| !p.is_empty())?;
+    match share.artifact_path.as_deref() {
+        Some(artifact) => {
+            let artifact = super::share::normalize_artifact_path(artifact).ok()?;
+            (requested == artifact || requested.ends_with(&format!("/{artifact}")))
+                .then_some(artifact)
+        }
+        // Named (and coalesced) by the normalized path, so `/p//a.md` and
+        // `/p/./a.md` are the one (member, path, hour) window (review
+        // WP78a-R2).
+        None if share.role == Some(super::Role::Guest) => Some(if path.starts_with(['/', '\\']) {
+            format!("/{requested}")
+        } else {
+            requested
+        }),
+        None => None,
+    }
+}
+
+/// The view-audit hook on an authorized share RPC (§6.5), called by the T1
+/// broker — the store's one writer, which sees every share request before
+/// the Owner's child does: one `share.artifact_viewed {path}` per (member,
+/// path, hour), best-effort, off the request path. Allowed while the chain
+/// is degraded (P-35).
+pub fn on_share_read(
+    store: Option<&super::AccessStore>,
+    ctx: &super::ctx::AccessCtx,
+    cmd: &str,
+    args: &Value,
+) {
+    let (Some(store), Some(share)) = (store, ctx.share.as_ref()) else {
+        return;
+    };
+    let Some(target) = viewed_target(share, cmd, args) else {
+        return;
+    };
+    let member = share
+        .member_principal_id
+        .clone()
+        .unwrap_or_else(|| ctx.principal_id.to_string());
+    let key = format!("{member}\u{0}{}\u{0}{target}", share.project_key);
+    if !view_window_opens(key, chain::now_ms()) {
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let mut ev = Event::by("share.artifact_viewed", ctx)
+        .target(target.clone())
+        .detail(serde_json::json!({ "path": target }));
+    ev.project_key = Some(share.project_key.clone());
+    let store = store.clone();
+    rt.spawn(async move {
+        if let Err(e) = record(&store, &ev).await {
+            tracing::warn!("audit share.artifact_viewed not recorded: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +619,166 @@ mod tests {
         let e = Event::new("device.revoked", AuditVia::System);
         assert!(e.refused_when_degraded());
         assert!(!e.continue_when_degraded().refused_when_degraded());
+    }
+
+    fn share_ctx(role: crate::access::Role, artifact: Option<&str>) -> super::super::AccessCtx {
+        use crate::access::{AccessCtx, CapSet, ShareCtx, Tier, Via};
+        AccessCtx {
+            principal_id: crate::executor::PrincipalId::new_v7(),
+            via: Via::Session {
+                session_id: "s".into(),
+            },
+            device_id: None,
+            tier: Tier::Full,
+            share: Some(ShareCtx {
+                project_key: format!("o/p-{}", next_socket_id()),
+                project_id: "p".into(),
+                member_principal_id: Some(format!("m-{}", next_socket_id())),
+                member_device_id: None,
+                role: Some(role),
+                artifact_path: artifact.map(str::to_string),
+                owner_approval: true,
+            }),
+            share_headers: false,
+            caps: CapSet::of(&[crate::access::Cap::Files]),
+            admin_strength: false,
+            meta: Default::default(),
+        }
+    }
+
+    /// §6.5: which share reads are views — Guest and artifact-scope only,
+    /// file-content reads only, and on an artifact share the artifact
+    /// itself (named project-relative).
+    #[test]
+    fn views_are_guest_and_artifact_scope_reads() {
+        use crate::access::Role;
+        use serde_json::json;
+        let read = |p: &str| json!({ "path": p });
+        let art = share_ctx(Role::Reviewer, Some("./docs//brief.md"));
+        let a = art.share.as_ref().unwrap();
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("/home/o/proj/docs/brief.md")).as_deref(),
+            Some("docs/brief.md")
+        );
+        assert_eq!(
+            viewed_target(a, "fs_read", &read("docs/./brief.md")).as_deref(),
+            Some("docs/brief.md")
+        );
+        for other in ["/home/o/proj/docs/other.md", "/x/../docs/brief.md", ""] {
+            assert_eq!(viewed_target(a, "fs_read", &read(other)), None, "{other}");
+        }
+        assert_eq!(
+            viewed_target(a, "fs_list", &read("/home/o/proj/docs/brief.md")),
+            None
+        );
+        assert_eq!(viewed_target(a, "fs_read", &json!({})), None);
+        let guest = share_ctx(Role::Guest, None);
+        assert_eq!(
+            viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read("/p/a.md")).as_deref(),
+            Some("/p/a.md")
+        );
+        // Review WP78a-R2: every spelling of one file is the one view.
+        for spelling in ["/p//a.md", "/p/./a.md", "//p/a.md", "\\p\\a.md"] {
+            assert_eq!(
+                viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read(spelling)).as_deref(),
+                Some("/p/a.md"),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            viewed_target(guest.share.as_ref().unwrap(), "fs_read", &read("p/a.md")).as_deref(),
+            Some("p/a.md")
+        );
+        let operator = share_ctx(Role::Operator, None);
+        assert_eq!(
+            viewed_target(
+                operator.share.as_ref().unwrap(),
+                "fs_read",
+                &read("/p/a.md")
+            ),
+            None,
+            "a project-scope Operator's reads are not views"
+        );
+    }
+
+    /// §6.5: one `share.artifact_viewed` per (member, path, hour), with the
+    /// project key and the path; an own-workspace read writes none.
+    #[tokio::test]
+    async fn artifact_views_are_audited_once_per_hour() {
+        use crate::access::{AccessStore, Role};
+        use serde_json::json;
+        let store = AccessStore::memory_t0().await;
+        let ctx = share_ctx(Role::Guest, Some("docs/brief.md"));
+        let read = json!({ "path": "/proj/docs/brief.md" });
+        for _ in 0..3 {
+            on_share_read(Some(&store), &ctx, "fs_read", &read);
+        }
+        let own = crate::access::AccessCtx {
+            share: None,
+            ..ctx.clone()
+        };
+        on_share_read(Some(&store), &own, "fs_read", &read);
+        let rows = || async {
+            sqlx::query_as::<_, (Option<String>, Option<String>, String, String)>(
+                "SELECT project_key, target, detail, category FROM audit_events \
+                 WHERE kind = 'share.artifact_viewed'",
+            )
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+        };
+        for _ in 0..100 {
+            if !rows().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = rows().await;
+        assert_eq!(got.len(), 1);
+        let (project, target, detail, category) = &got[0];
+        assert_eq!(
+            project.as_deref(),
+            ctx.share.as_ref().map(|s| s.project_key.as_str())
+        );
+        assert_eq!(target.as_deref(), Some("docs/brief.md"));
+        assert!(detail.contains("\"path\":\"docs/brief.md\""), "{detail}");
+        assert_eq!(category, "access");
+        // The window is per hour.
+        let key = "k".to_string();
+        assert!(view_window_opens(key.clone(), 1_000));
+        assert!(!view_window_opens(key.clone(), 1_000 + VIEW_WINDOW_MS - 1));
+        assert!(view_window_opens(key, 1_000 + VIEW_WINDOW_MS));
+    }
+
+    /// Review WP78a-R2: a project-scope Guest reading one file under two
+    /// spellings opens one (member, path, hour) window — one row.
+    #[tokio::test]
+    async fn guest_views_coalesce_by_normalized_path() {
+        use crate::access::{AccessStore, Role};
+        use serde_json::json;
+        let store = AccessStore::memory_t0().await;
+        let ctx = share_ctx(Role::Guest, None);
+        for p in ["/proj/a.md", "/proj//a.md", "/proj/./a.md"] {
+            on_share_read(Some(&store), &ctx, "fs_read", &json!({ "path": p }));
+        }
+        let rows = || async {
+            sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT target FROM audit_events WHERE kind = 'share.artifact_viewed'",
+            )
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+        };
+        for _ in 0..100 {
+            if !rows().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let got = rows().await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0.as_deref(), Some("/proj/a.md"));
     }
 }

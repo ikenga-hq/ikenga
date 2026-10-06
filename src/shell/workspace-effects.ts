@@ -22,6 +22,25 @@ import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
 import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useTerminalStore } from '@/terminal/session-store';
+import { isTauri } from '@/lib/transport';
+
+/**
+ * `useIykeShellSync` on the desktop, a no-op anywhere else (gap audit rank
+ * 25). The iyke control bridge is the desktop app's localhost server; the
+ * headless daemon serves none of `iyke_set_frame` / `iyke_set_actions_frame`
+ * / `iyke_actions_request_done` / `iyke_set_shell`, so in a browser every
+ * keymap, explorer, project or actions change fired a failing RPC.
+ *
+ * Chosen once at module load from `isTauri()`, which is fixed for a page's
+ * life, so the hook order never changes between renders.
+ */
+export function pickIykeShellSync(desktop: boolean = isTauri()): () => void {
+	return desktop ? useIykeShellSync : noop;
+}
+
+function noop(): void {}
+
+const useDesktopIykeShellSync = pickIykeShellSync();
 
 export function useWorkspaceEffects(
 	setInitialSizes: Dispatch<SetStateAction<[number, number] | null>>
@@ -30,7 +49,7 @@ export function useWorkspaceEffects(
 	// Rust-side control bridge so external CLI/MCP callers see what the
 	// user sees. Mounted only here so it never fires inside a pane's
 	// memory-router re-render.
-	useIykeShellSync();
+	useDesktopIykeShellSync();
 	// Counterpart for the write side: subscribe to iyke:* Tauri events
 	// emitted by the Rust handlers and translate them into pane/shell
 	// store mutations. Same mounting reasoning — workspace-level only.

@@ -86,6 +86,7 @@ function ctx(partial: Partial<ContextKeys> = {}): ContextKeys {
 		loupeFocus: false,
 		pinComposerFocus: false,
 		markdownEditorFocus: false,
+		textEditorFocus: false,
 		approveGateDetailFocus: false,
 		...partial,
 	};

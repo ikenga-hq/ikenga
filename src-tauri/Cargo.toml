@@ -1,6 +1,6 @@
 [package]
 name = "ikenga-desktop"
-version = "0.18.6"
+version = "0.20.0"
 description = "PA Desktop — Tauri + xterm + portable-pty"
 authors = ["Ikenga"]
 edition = "2021"
@@ -143,6 +143,9 @@ sysinfo = { version = "0.36.1", default-features = false, features = ["disk"] }
 # to cc-config or carry loose files on disk. Source tree:
 # src-tauri/templates/starter/claude-code/.
 include_dir = "0.7"
+# CIDR matching for trusted proxy configuration (IKENGA_TRUSTED_PROXIES).
+# Already in Cargo.lock transitively; pinned here so the proxy helper has it directly.
+ipnet = "2"
 
 # pkg-browser kernel: per-pkg child webview cookie-jar isolation. On macOS the
 # data_store_identifier is a 16-byte sha256 prefix of (pkg_id || '/' || partition).

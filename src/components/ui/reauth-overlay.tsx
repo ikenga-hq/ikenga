@@ -1,6 +1,7 @@
 import { type FormEvent, lazy, Suspense, useEffect, useState } from 'react';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { isT1Session } from '@/lib/transport/t1-session';
+import { D05_FOCUS } from '@/shell/people/focus';
 import { ShareModeBanner } from '@/shell/people/shared-with-you';
 import { T1SignInForm } from './t1-sign-in-form';
 
@@ -37,7 +38,7 @@ function PairThisDevice() {
 	return (
 		<div
 			data-state="reauth-pair"
-			className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_78%,transparent)] p-6 backdrop-blur-xs"
+			className={`${D05_FOCUS} fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_78%,transparent)] p-6 backdrop-blur-xs`}
 		>
 			<form
 				onSubmit={submit}
@@ -46,10 +47,10 @@ function PairThisDevice() {
 			>
 				<div className="flex items-center gap-2.5 border-b border-[var(--border-soft)] bg-[var(--bg-sunken)] px-5 py-4">
 					<span className="h-2 w-2 flex-none rounded-full bg-[var(--primary)]" />
-					<h2 className="m-0 text-[var(--text-h4)] font-semibold">Pair this device</h2>
+					<h2 className="m-0 text-[length:var(--text-h4)] font-semibold">Pair this device</h2>
 				</div>
 				<div className="flex flex-col gap-3 p-5">
-					<p className="m-0 text-[var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
+					<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 						On the computer that runs {host || 'Ikenga'}, open Settings › Devices › Pair a device
 						and type the code it shows. The computer confirms before this device gets anything.
 					</p>
@@ -66,7 +67,7 @@ function PairThisDevice() {
 					/>
 					<button
 						type="submit"
-						className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 cursor-pointer"
+						className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[length:var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 cursor-pointer"
 					>
 						Pair with this code
 					</button>
@@ -78,7 +79,7 @@ function PairThisDevice() {
 					<button
 						type="button"
 						onClick={() => setMode('auto')}
-						className="text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
+						className="text-[length:var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
 					>
 						{isT1Session() ? 'Sign in with a password instead' : 'I have a token instead'}
 					</button>
@@ -96,7 +97,7 @@ function PairModeLink() {
 		<button
 			type="button"
 			onClick={() => setMode('pair')}
-			className="mt-3 text-[var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
+			className="mt-3 text-[length:var(--text-micro)] text-[var(--fg-muted)] underline-offset-2 hover:underline cursor-pointer"
 		>
 			Pair this device with a code
 		</button>
@@ -124,6 +125,7 @@ function ReauthDialog() {
 	const setTokenInput = useReauthStore((s) => s.setTokenInput);
 	const errorMsg = useReauthStore((s) => s.errorMsg);
 	const reconnect = useReauthStore((s) => s.reconnect);
+	const firstVisit = useReauthStore((s) => s.reason) === 'first-visit';
 
 	const [timeStr, setTimeStr] = useState<string>('');
 	const [loading, setLoading] = useState<boolean>(false);
@@ -170,21 +172,30 @@ function ReauthDialog() {
 		<div className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_srgb,var(--bg-base)_78%,transparent)] p-6 backdrop-blur-xs">
 			<div className="w-full max-w-[460px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl">
 				{/* Top bar */}
-				<div className="flex items-center gap-2.5 border-b border-[var(--border-soft)] bg-[var(--danger-soft)] px-5 py-4">
-					<span className="h-2 w-2 flex-none rounded-full bg-[var(--danger)]" />
-					<h2 className="m-0 text-[var(--text-h4)] font-semibold">
-						Session needs re-authenticating
+				<div
+					className={`flex items-center gap-2.5 border-b border-[var(--border-soft)] px-5 py-4 ${
+						firstVisit ? 'bg-[var(--bg-sunken)]' : 'bg-[var(--danger-soft)]'
+					}`}
+				>
+					<span
+						className={`h-2 w-2 flex-none rounded-full ${
+							firstVisit ? 'bg-[var(--primary)]' : 'bg-[var(--danger)]'
+						}`}
+					/>
+					<h2 className="m-0 text-[length:var(--text-h4)] font-semibold">
+						{firstVisit ? 'Connect to this Ikenga instance' : 'Session needs re-authenticating'}
 					</h2>
-					<span className="ml-auto font-mono text-[var(--text-micro)] text-[var(--fg-faint)]">
+					<span className="ml-auto font-mono text-[length:var(--text-micro)] text-[var(--fg-faint)]">
 						{timeStr}
 					</span>
 				</div>
 
 				{/* Body */}
 				<div className="p-5">
-					<p className="mb-4 text-[var(--text-body-sm)] text-[var(--fg-muted)] leading-relaxed">
-						The daemon restarted and minted a new token, so this tab's saved one no longer works.
-						Your work is untouched — paste the current token to pick it back up.
+					<p className="mb-4 text-[length:var(--text-body-sm)] text-[var(--fg-muted)] leading-relaxed">
+						{firstVisit
+							? 'This instance is protected by an access token. Paste it to connect. It stays in this tab only and is forgotten when the tab closes.'
+							: "The daemon restarted and minted a new token, so this tab's saved one no longer works. Your work is untouched — paste the current token to pick it back up."}
 					</p>
 
 					<div className="flex gap-2">
@@ -193,7 +204,7 @@ function ReauthDialog() {
 							value={tokenInput}
 							onChange={(e) => setTokenInput(e.target.value)}
 							placeholder="Paste auth token..."
-							className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 font-mono text-[var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]"
+							className="flex-1 rounded-md border border-[var(--border)] bg-[var(--bg-sunken)] px-3 py-2 font-mono text-[length:var(--text-body-sm)] text-[var(--fg)] outline-none focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary-soft)]"
 							autoFocus
 							spellCheck={false}
 							onKeyDown={(e) => {
@@ -207,9 +218,9 @@ function ReauthDialog() {
 							type="button"
 							onClick={handleReconnect}
 							disabled={loading}
-							className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50 cursor-pointer"
+							className="rounded-md bg-[var(--primary)] px-5 py-2 font-semibold text-[length:var(--text-body-sm)] text-[var(--primary-fg)] hover:opacity-90 disabled:opacity-50 cursor-pointer"
 						>
-							{loading ? 'Connecting...' : 'Reconnect'}
+							{loading ? 'Connecting...' : firstVisit ? 'Connect' : 'Reconnect'}
 						</button>
 					</div>
 
@@ -219,10 +230,12 @@ function ReauthDialog() {
 
 					<PairModeLink />
 
-					<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
-						<b className="text-[var(--live)] font-semibold">Still running on the host</b> — session
-						active. Nothing is lost by reconnecting.
-					</div>
+					{!firstVisit && (
+						<div className="mt-4 border-t border-[var(--border-soft)] pt-4 text-[length:var(--text-micro)] text-[var(--fg-faint)] leading-relaxed">
+							<b className="text-[var(--live)] font-semibold">Still running on the host</b> —
+							session active. Nothing is lost by reconnecting.
+						</div>
+					)}
 				</div>
 			</div>
 		</div>

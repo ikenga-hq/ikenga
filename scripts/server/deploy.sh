@@ -1,10 +1,23 @@
 #!/bin/bash
 set -euo pipefail
 
-# Build the ikenga-server binary + the SPA it serves.
+# Build the ikenga-server binary + the SPA it serves, from source.
 #
-# This script lives in shell/scripts/server/deploy.sh and runs from a clean
-# checkout of shell alone.
+# This is the developer build path. Most installs should use the server tarball
+# attached to each GitHub release instead (see scripts/server/README.md).
+#
+# It does NOT run from a checkout of this repository alone. The frontend
+# depends on the sibling packages @ikenga/contract and @ikenga/tokens
+# (`workspace:*`), so it needs the same layout the release workflow builds in:
+#
+#   <workspace>/
+#     shell/                 this repository
+#     contract/              ikenga-hq/ikenga-contract
+#     tokens/                ikenga-hq/ikenga-tokens
+#     pnpm-workspace.yaml    packages: [shell, contract, tokens]
+#
+# Run `pnpm install` once in <workspace>, then this script from shell/. The
+# Rust half needs a Rust toolchain; the SPA half needs `bun`.
 
 SHELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${OUT_DIR:-$SHELL_DIR/scripts/server/out}"
@@ -69,5 +82,5 @@ echo "==> Done."
 echo "    binary: $OUT_DIR/bin/ikenga-server"
 echo "    assets: $OUT_DIR/dist"
 echo
-echo "Deploy with:  rsync -a $OUT_DIR/ <host>:/opt/ikenga/"
-echo "Then on the host: shell/scripts/server/bootstrap-credentials.sh && systemctl restart ikenga-server"
+echo "Copy to the host:  rsync -a $OUT_DIR/ <host>:/opt/ikenga/"
+echo "Then follow scripts/server/README.md from the 'Environment file' step."

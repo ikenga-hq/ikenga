@@ -442,6 +442,18 @@ impl DaemonSecrets {
         Ok(names)
     }
 
+    /// `secrets_default_names`: the operator default's names alone (the
+    /// `IKENGA_SECRET_*` layer, bare), never a value. What tells a key in
+    /// the principal's own store that overrides a default from one that
+    /// merely shares a bare name with nothing (review WP76-RV1): the
+    /// store's own bare names are in [`Self::index_names`] too.
+    pub fn default_names(&self) -> Vec<String> {
+        let mut names = self.env.keys();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn writable_store(&self) -> Result<&Arc<dyn SecretsStore>, String> {
         self.store()?.ok_or_else(|| WRITE_REFUSAL.to_string())
     }
@@ -755,6 +767,23 @@ mod tests {
         assert_eq!(s.get_scoped(&proj, "TOKEN").unwrap(), None);
         // A scope id can't address another scope's entry.
         assert!(s.set_scoped(&Scope::project("a::b"), "c", "x").is_err());
+    }
+
+    /// Review WP76-RV1: a bare key in the principal's own store shows up in
+    /// `index_names` like an operator default; `default_names` is the env
+    /// layer alone, so the page can tell "your override" from "your own".
+    #[test]
+    fn default_names_are_the_env_layer_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = DaemonSecrets::fixed(principal_layer(tmp.path()), DEFAULTS);
+        s.set("MINE", "bare").unwrap();
+        s.set_scoped(&Scope::Workspace, "MINE", "ws").unwrap();
+        s.set_scoped(&Scope::Workspace, "SHARED", "over").unwrap();
+        let index = s.index_names().unwrap();
+        assert!(index.contains(&"MINE".to_string()), "{index:?}");
+        assert_eq!(s.default_names(), vec!["OPENAI_API_KEY", "SHARED"]);
+        let t0 = DaemonSecrets::fixed(PrincipalLayer::Absent, DEFAULTS);
+        assert_eq!(t0.default_names(), vec!["OPENAI_API_KEY", "SHARED"]);
     }
 
     /// T0 is unchanged: read-only flat namespace, project/pkg refused.

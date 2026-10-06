@@ -15,6 +15,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::commands::claude_store::{resolve_pkg_requires, CatalogEntryRef, PkgRequiresResult};
 use crate::pkg::manifest::Package;
+use crate::pkg::install_progress::{
+    cancelled_error, request_cancel, run_install, AppEmitSink, CancelOutcome, InstallReporter,
+    InstallStage, InstallSteps,
+};
 use crate::pkg::registries::{ActivityBarBadge, ActivityBarRegistry, SettingsRegistry};
 use crate::pkg::{
     DiscoveredPkg, InstallSource, InstalledSummary, Kernel, KernelStatus, PkgHealthIssue,
@@ -407,173 +411,269 @@ pub struct PkgInstallFromRegistryArgs {
     /// not carry per-pkg publisher keys yet (WP-06), so this is `None` today —
     /// the field is wired now so no shape change is needed when keys land.
     #[serde(default)]
-    pub publisher_key: Option<String>,
+    pub publisher_key: Option<String>,    /// Tags this install's progress events and is the handle
+    /// `pkg_install_cancel` takes. The Store passes one id for every step of
+    /// a dependency plan so they all land on the same row. Defaults to
+    /// `pkg_id`.
+    #[serde(default)]
+    pub install_id: Option<String>,
 }
 
 /// Install a pkg from a registry. `scope` follows the same wire format as
-/// `pkg_install_from_path`.
+/// `pkg_install_from_path`. Progress goes out as `pkg-install://progress`
+/// events tagged with `args.install_id` (or the pkg id); see
+/// `pkg::install_progress`.
 #[tauri::command]
 pub async fn pkg_install_from_registry(
+    app: AppHandle,
     kernel: State<'_, KernelState>,
     db: State<'_, Arc<crate::commands::db::PaDb>>,
     args: PkgInstallFromRegistryArgs,
     scope: Option<String>,
 ) -> Result<PkgInstallResult, String> {
     let project_id = resolve_install_scope(db.inner().clone(), scope).await?;
-    install_from_registry_inner(kernel.0.clone(), args, project_id)
+    let install_id = args.install_id.clone().unwrap_or_else(|| args.pkg_id.clone());
+    let reporter = InstallReporter::new(install_id, args.pkg_id.clone(), Arc::new(AppEmitSink(app)));
+    install_from_registry_inner(kernel.0.clone(), args, project_id, &reporter)
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Ask a running registry install to stop. Honoured up to the point it starts
+/// registering; after that the answer is `too_late` and it finishes.
+#[tauri::command]
+pub fn pkg_install_cancel(install_id: String) -> CancelOutcome {
+    request_cancel(&install_id)
 }
 
 async fn install_from_registry_inner(
     kernel: Arc<Kernel>,
     args: PkgInstallFromRegistryArgs,
     project_id: Option<String>,
+    reporter: &InstallReporter,
 ) -> AnyResult<PkgInstallResult> {
     let pkgs_dir = kernel.pkgs_dir()?;
-    tokio::fs::create_dir_all(&pkgs_dir)
-        .await
-        .with_context(|| format!("create pkgs dir {}", pkgs_dir.display()))?;
-
     // Stage path is a sibling of the final install dir. Both live under
     // pkgs_dir, so a successful untar + atomic rename never crosses
-    // filesystems.
-    // Every scratch name carries the full pkg id (see `install_scratch_paths`);
-    // leftovers from a crash mid-install are reaped at boot by
-    // `uninstall_dir::sweep_install_scratch`.
+    // filesystems. Every scratch name carries the full pkg id (see
+    // `install_scratch_paths`); leftovers from a crash mid-install are reaped
+    // at boot by `uninstall_dir::sweep_install_scratch`.
     let final_dir = pkgs_dir.join(&args.pkg_id);
     let (staging_dir, tarball_path, backup_dir) =
         crate::pkg::uninstall_dir::install_scratch_paths(&pkgs_dir, &args.pkg_id);
-
-    // Clean up leftover staging/backup from a prior aborted install. We never
-    // resume a partial install — start fresh every time.
-    if staging_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-    }
-    if backup_dir.exists() {
-        let _ = tokio::fs::remove_dir_all(&backup_dir).await;
-    }
-
-    // 1. Download tarball + verify SHA-512 against the SRI integrity.
-    if let Some(parent) = tarball_path.parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
-    download_and_verify(&args.tarball, &args.integrity, &tarball_path)
-        .await
-        .with_context(|| format!("download {}", args.tarball))?;
-
-    // 2. Extract into staging. Strip leading `package/` (npm convention).
-    //    Reject any entry whose normalized path escapes the staging root.
-    let tarball_path_for_blocking = tarball_path.clone();
-    let staging_dir_for_blocking = staging_dir.clone();
-    tokio::task::spawn_blocking(move || -> AnyResult<()> {
-        extract_tarball(&tarball_path_for_blocking, &staging_dir_for_blocking)
-    })
-    .await
-    .map_err(|e| anyhow!("untar task join: {e}"))??;
-
-    // 3. Cross-check the unpacked manifest's id against the requested pkg_id.
-    //    Catches: typo in pkg_id, tarball/manifest mismatch from a bad publish.
-    let manifest_path = staging_dir.join("manifest.json");
-    let manifest_bytes = tokio::fs::read(&manifest_path)
-        .await
-        .with_context(|| format!("read manifest.json from {}", manifest_path.display()))?;
-    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("parse {}", manifest_path.display()))?;
-    let manifest_id = manifest_json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("manifest.json missing `id` field"))?;
-    if manifest_id != args.pkg_id {
-        // Clean up staging before erroring.
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        let _ = tokio::fs::remove_file(&tarball_path).await;
-        return Err(anyhow!(
-            "manifest id mismatch: tarball declares `{manifest_id}`, registry said `{}`",
-            args.pkg_id
-        ));
-    }
-
-    // 4. Atomic-ish swap: backup existing → move staging → final.
-    //    Reverse on failure so the previous install isn't lost.
-    //
-    //    An existing install may still be running (long-lived MCP / supervised
-    //    sidecar with its cwd inside `final_dir`). On Windows that holds the
-    //    folder and the backup rename fails with os error 32, so stop the
-    //    pkg's children — and wait for them to exit — first. The kernel
-    //    re-registers (restarts) it from the new files in step 5; if the swap
-    //    fails, `restart_prior` brings the old version back up.
-    let pkg_name = manifest_json
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&args.pkg_id)
-        .to_string();
-    let was_installed = kernel.installed_summary(&args.pkg_id).is_some();
-    let stop_kernel = kernel.clone();
-    let stop_id = args.pkg_id.clone();
-    let backup = backup_existing_install(&final_dir, &backup_dir, &pkg_name, move || {
-        stop_kernel.stop_pkg_processes(&stop_id)
-    })
-    .await;
-    if let Err(e) = backup {
-        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-        let _ = tokio::fs::remove_file(&tarball_path).await;
-        if was_installed {
-            restart_prior(kernel.clone(), &args.pkg_id).await;
-        }
-        return Err(e);
-    }
-    if let Err(e) = tokio::fs::rename(&staging_dir, &final_dir).await {
-        // Rollback: put the backup back.
-        if backup_dir.exists() {
-            let _ = tokio::fs::rename(&backup_dir, &final_dir).await;
-        }
-        if was_installed {
-            restart_prior(kernel.clone(), &args.pkg_id).await;
-        }
-        return Err(anyhow!(
-            "promote staging dir to install: {} → {}: {}",
-            staging_dir.display(),
-            final_dir.display(),
-            e
-        ));
-    }
-
-    // 5. Register with the kernel. If the kernel rejects (e.g. ikenga_api
-    //    incompatible, registry conflict), we already have a backup to
-    //    restore; the kernel's own rollback handles the DB side.
-    let final_dir_for_kernel = final_dir.clone();
-    let source = InstallSource::Registry {
-        url: args.source_url,
-        publisher_key: args.publisher_key,
+    let mut steps = RegistryInstall {
+        kernel,
+        args,
+        project_id,
+        pkgs_dir,
+        final_dir,
+        staging_dir,
+        tarball_path,
+        backup_dir,
+        expected: [0u8; 64],
+        digest: None,
+        manifest: serde_json::Value::Null,
+        was_installed: false,
+        swap_started: false,
+        promoted: false,
     };
-    let installed = tokio::task::spawn_blocking(move || {
-        crate::pkg::materialize_npm_deps(&final_dir_for_kernel)?;
-        kernel.install_from_path(&final_dir_for_kernel, source, project_id)
-    })
-    .await
-    .map_err(|e| anyhow!("kernel install task join: {e}"))?;
+    let installed = run_install(reporter, &mut steps).await?;
+    // WP-16 requires-resolution for the registry path is a follow-up
+    // (the registry install flow has no catalog snapshot threaded yet).
+    Ok(PkgInstallResult { installed, requires: None })
+}
 
-    match installed {
-        Ok(summary) => {
-            // Success — drop the backup + downloaded tarball.
-            let _ = tokio::fs::remove_dir_all(&backup_dir).await;
-            let _ = tokio::fs::remove_file(&tarball_path).await;
-            // WP-16 requires-resolution for the registry path is a follow-up
-            // (the registry install flow has no catalog snapshot threaded yet).
-            Ok(PkgInstallResult {
-                installed: summary,
-                requires: None,
-            })
+/// The real steps of a registry install, driven by
+/// `install_progress::run_install` (which owns stage order, cancel and the
+/// cleanup-on-failure call).
+struct RegistryInstall {
+    kernel: Arc<Kernel>,
+    args: PkgInstallFromRegistryArgs,
+    project_id: Option<String>,
+    pkgs_dir: PathBuf,
+    final_dir: PathBuf,
+    staging_dir: PathBuf,
+    tarball_path: PathBuf,
+    backup_dir: PathBuf,
+    /// The SRI digest the registry published.
+    expected: [u8; 64],
+    /// The digest of the bytes actually downloaded.
+    digest: Option<[u8; 64]>,
+    manifest: serde_json::Value,
+    /// A previous version was registered when the swap began.
+    was_installed: bool,
+    /// We started stopping / moving the previous install aside.
+    swap_started: bool,
+    /// The new files are in `final_dir`.
+    promoted: bool,
+}
+
+impl InstallSteps for RegistryInstall {
+    type Output = InstalledSummary;
+
+    async fn prepare(&mut self) -> AnyResult<()> {
+        self.expected = parse_sri_sha512(&self.args.integrity)?;
+        tokio::fs::create_dir_all(&self.pkgs_dir)
+            .await
+            .with_context(|| format!("create pkgs dir {}", self.pkgs_dir.display()))?;
+        // Never resume a partial install: start fresh every time.
+        if self.staging_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&self.staging_dir).await;
         }
-        Err(e) => {
-            // Roll the filesystem back: remove the new dir, restore the backup.
-            let _ = tokio::fs::remove_dir_all(&final_dir).await;
-            if backup_dir.exists() {
-                let _ = tokio::fs::rename(&backup_dir, &final_dir).await;
+        if self.backup_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&self.backup_dir).await;
+        }
+        if let Some(parent) = self.tarball_path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        Ok(())
+    }
+
+    async fn download(&mut self, rep: &InstallReporter) -> AnyResult<()> {
+        let url = self.args.tarball.clone();
+        let digest = download_tarball(&url, &self.tarball_path, rep)
+            .await
+            .with_context(|| format!("download {url}"))?;
+        self.digest = Some(digest);
+        Ok(())
+    }
+
+    async fn verify(&mut self) -> AnyResult<()> {
+        let ok = self
+            .digest
+            .is_some_and(|d| constant_time_eq(&d, &self.expected));
+        if !ok {
+            return Err(anyhow!("tarball SHA-512 integrity mismatch — refusing to install"));
+        }
+        Ok(())
+    }
+
+    async fn extract(&mut self) -> AnyResult<()> {
+        // Untar into staging, stripping npm's leading `package/` and
+        // rejecting any entry that escapes the staging root.
+        let (tarball, staging) = (self.tarball_path.clone(), self.staging_dir.clone());
+        tokio::task::spawn_blocking(move || extract_tarball(&tarball, &staging))
+            .await
+            .map_err(|e| anyhow!("untar task join: {e}"))??;
+
+        // Cross-check the unpacked manifest's id against the requested one.
+        let manifest_path = self.staging_dir.join("manifest.json");
+        let bytes = tokio::fs::read(&manifest_path)
+            .await
+            .with_context(|| format!("read manifest.json from {}", manifest_path.display()))?;
+        self.manifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", manifest_path.display()))?;
+        let manifest_id = self
+            .manifest
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("manifest.json missing `id` field"))?;
+        if manifest_id != self.args.pkg_id {
+            return Err(anyhow!(
+                "manifest id mismatch: tarball declares `{manifest_id}`, registry said `{}`",
+                self.args.pkg_id
+            ));
+        }
+
+        // Atomic-ish swap: backup existing, move staging, final.
+        //
+        // An existing install may still be running (long-lived MCP /
+        // supervised sidecar with its cwd inside `final_dir`). On Windows
+        // that holds the folder and the backup rename fails with os error
+        // 32, so stop the pkg's children (and wait for them to exit) first.
+        // The kernel re-registers it from the new files; if anything fails,
+        // `cleanup` restores the old files and restarts it.
+        let pkg_name = self
+            .manifest
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.args.pkg_id)
+            .to_string();
+        self.was_installed = self.kernel.installed_summary(&self.args.pkg_id).is_some();
+        self.swap_started = true;
+        let stop_kernel = self.kernel.clone();
+        let stop_id = self.args.pkg_id.clone();
+        backup_existing_install(&self.final_dir, &self.backup_dir, &pkg_name, move || {
+            stop_kernel.stop_pkg_processes(&stop_id)
+        })
+        .await?;
+        if let Err(e) = tokio::fs::rename(&self.staging_dir, &self.final_dir).await {
+            return Err(anyhow!(
+                "promote staging dir to install: {} → {}: {e}",
+                self.staging_dir.display(),
+                self.final_dir.display()
+            ));
+        }
+        self.promoted = true;
+        Ok(())
+    }
+
+    async fn install_deps(&mut self, rep: &InstallReporter) -> AnyResult<()> {
+        let dir = self.final_dir.clone();
+        let rep = rep.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::pkg::npm_install::materialize_npm_deps_with(&dir, Some(&rep))
+        })
+        .await
+        .map_err(|e| anyhow!("dependency install join: {e}"))?
+    }
+
+    async fn register(&mut self) -> AnyResult<InstalledSummary> {
+        let kernel = self.kernel.clone();
+        let dir = self.final_dir.clone();
+        let source = InstallSource::Registry {
+            url: self.args.source_url.clone(),
+            publisher_key: self.args.publisher_key.clone(),
+        };
+        let project_id = self.project_id.clone();
+        tokio::task::spawn_blocking(move || kernel.install_from_path(&dir, source, project_id))
+            .await
+            .map_err(|e| anyhow!("kernel install task join: {e}"))?
+    }
+
+    fn has_services(&self) -> bool {
+        let sidecars = self
+            .manifest
+            .get("sidecars")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+        let long_lived_mcp = self
+            .manifest
+            .get("mcp")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|m| m.get("lifecycle").and_then(|l| l.as_str()) == Some("long-lived"))
+            });
+        sidecars || long_lived_mcp
+    }
+
+    async fn finish(&mut self) {
+        let _ = tokio::fs::remove_dir_all(&self.backup_dir).await;
+        let _ = tokio::fs::remove_file(&self.tarball_path).await;
+    }
+
+    async fn cleanup(&mut self) {
+        // Remove whatever this attempt put on disk, so a failed install
+        // leaves no partial pkg directory and Retry starts clean.
+        let partial = if self.promoted { &self.final_dir } else { &self.staging_dir };
+        if partial.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(partial).await {
+                log::warn!("[pkg_install] remove partial install {}: {e}", partial.display());
             }
-            let _ = tokio::fs::remove_file(&tarball_path).await;
-            Err(anyhow!("{e:#}"))
+        }
+        // Put the previous version back if it was moved aside.
+        if self.backup_dir.exists() && !self.final_dir.exists() {
+            if let Err(e) = tokio::fs::rename(&self.backup_dir, &self.final_dir).await {
+                log::warn!(
+                    "[pkg_install] restore previous install of `{}`: {e}",
+                    self.args.pkg_id
+                );
+            }
+        }
+        let _ = tokio::fs::remove_file(&self.tarball_path).await;
+        if self.swap_started && self.was_installed {
+            restart_prior(self.kernel.clone(), &self.args.pkg_id).await;
         }
     }
 }
@@ -632,24 +732,34 @@ async fn restart_prior(kernel: Arc<Kernel>, pkg_id: &str) {
     }
 }
 
-/// Stream the tarball to disk while hashing in parallel. Constant-time-compare
-/// the final digest against the SRI integrity. Removes the partial file on
+/// Stream the tarball to disk while hashing it, reporting bytes received on
+/// `rep` (with a percent when the server sends a length) and stopping when a
+/// cancel arrives. Returns the SHA-512 of what was written; the caller
+/// compares it against the published integrity. Removes the partial file on
 /// any failure.
-async fn download_and_verify(url: &str, integrity_sri: &str, dest: &Path) -> AnyResult<()> {
-    let expected = parse_sri_sha512(integrity_sri)?;
-
+async fn download_tarball(url: &str, dest: &Path, rep: &InstallReporter) -> AnyResult<[u8; 64]> {
     let res = reqwest::get(url)
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()
         .with_context(|| format!("HTTP error from {url}"))?;
+    let total = res.content_length().filter(|n| *n > 0);
 
     let mut file = tokio::fs::File::create(dest)
         .await
         .with_context(|| format!("create {}", dest.display()))?;
     let mut hasher = Sha512::new();
     let mut stream = res.bytes_stream();
+    let mut received: u64 = 0;
+    // Throttle: one event per whole percent, or per 256 KiB without a length.
+    let mut last_reported: Option<u64> = None;
+    rep.progress(InstallStage::Downloading, total.map(|_| 0.0), Some(0), total, None);
     while let Some(chunk) = stream.next().await {
+        if rep.is_cancelled() {
+            drop(file);
+            let _ = tokio::fs::remove_file(dest).await;
+            return Err(cancelled_error());
+        }
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
@@ -662,18 +772,23 @@ async fn download_and_verify(url: &str, integrity_sri: &str, dest: &Path) -> Any
             let _ = tokio::fs::remove_file(dest).await;
             return Err(anyhow!("write tarball chunk: {e}"));
         }
+        received += bytes.len() as u64;
+        let bucket = match total {
+            Some(t) => received.saturating_mul(100) / t,
+            None => received / (256 * 1024),
+        };
+        if last_reported != Some(bucket) {
+            last_reported = Some(bucket);
+            let percent = total.map(|t| (received as f64 / t as f64) * 100.0);
+            rep.progress(InstallStage::Downloading, percent, Some(received), total, None);
+        }
     }
-    file.flush().await.ok();
-    drop(file);
-
-    let actual: [u8; 64] = hasher.finalize().into();
-    if !constant_time_eq(&actual, &expected) {
+    if let Err(e) = file.flush().await {
         let _ = tokio::fs::remove_file(dest).await;
-        return Err(anyhow!(
-            "tarball SHA-512 integrity mismatch — refusing to install"
-        ));
+        return Err(anyhow!("write tarball: {e}"));
     }
-    Ok(())
+    drop(file);
+    Ok(hasher.finalize().into())
 }
 
 /// Parse a `sha512-<base64>` SRI integrity string into a 64-byte digest.

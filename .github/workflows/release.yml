@@ -5,6 +5,10 @@ name: Release
 # or manual dispatch. Tag-triggered runs publish to a GitHub Release;
 # dispatch runs upload artifacts only.
 #
+# The same tag also publishes the headless server: signed amd64 and arm64
+# tarballs plus a release manifest (jobs `server-build` and `server`). See the
+# "Server artifacts" section of docs/release-signing.md.
+#
 # Workspace layout in CI mirrors the local dev tree:
 #   ikenga-hq/ikenga-contract  → contract/    (workspace:* in shell)
 #   ikenga-hq/ikenga-tokens    → tokens/      (workspace:* in shell)
@@ -69,6 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
+      # Whether this run builds the Linux leg. The server artifacts reuse its
+      # web bundle, so they are built only when it is.
+      linux: ${{ steps.set.outputs.linux }}
     steps:
       - id: set
         shell: bash
@@ -95,6 +102,10 @@ jobs:
           esac
 
           echo "matrix={\"include\":$include}" >> "$GITHUB_OUTPUT"
+          case "$input" in
+            all|linux-only) echo "linux=true" >> "$GITHUB_OUTPUT" ;;
+            *)              echo "linux=false" >> "$GITHUB_OUTPUT" ;;
+          esac
 
   build:
     needs: plan
@@ -272,6 +283,124 @@ jobs:
         working-directory: shell
         run: bun run build
 
+      # The server tarballs ship the same web bundle the desktop app embeds.
+      # Hand it to the `server` job instead of rebuilding it there: that job
+      # has no sibling checkouts (contract, tokens, pkgs) to build it from.
+      - name: Upload web bundle for the server artifacts (Linux leg)
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-dist
+          path: shell/dist
+          if-no-files-found: error
+          retention-days: 7
+
+      # ── Optional code signing (opt-in via secrets) ───────────────────────
+      # Both blocks below are inert until the maintainer creates the secrets
+      # listed in docs/release-signing.md. With none configured, each leg
+      # builds unsigned exactly as it always has.
+
+      # macOS: forward each APPLE_* variable to later steps via $GITHUB_ENV
+      # ONLY when the corresponding secret is non-empty. This is load-bearing:
+      # Tauri reads these vars with `var_os`, which treats an EMPTY STRING as
+      # "set" — unconditionally forwarding "" would make the bundler call
+      # codesign with an empty identity and fail the leg. With no secrets
+      # configured nothing is exported and the artifacts are byte-for-byte
+      # what they were before.
+      - name: Export Apple signing env (macOS, only non-empty secrets)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # Heredoc-delimiter syntax because some values span multiple lines
+          # (the base64 .p12 and the .p8 private key both contain newlines).
+          export_if_set() {
+            local name="$1" value="$2" delim
+            if [ -z "$value" ]; then return 0; fi
+            delim="ghadelim_${name}_$(openssl rand -hex 8)"
+            {
+              printf '%s<<%s\n' "$name" "$delim"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delim"
+            } >> "$GITHUB_ENV"
+            echo "exported $name"
+          }
+
+          # No keychain import needed here: tauri-bundler imports
+          # APPLE_CERTIFICATE (decrypting with APPLE_CERTIFICATE_PASSWORD)
+          # into its own temporary keychain when both are set
+          # (bundle/macos/sign.rs keychain()). APPLE_SIGNING_IDENTITY then
+          # selects which identity codesign uses.
+          export_if_set APPLE_CERTIFICATE "$APPLE_CERTIFICATE"
+          export_if_set APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD"
+          export_if_set APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY"
+
+          # Notarization credentials — App Store Connect API key preferred,
+          # Apple ID as the alternative. Tauri needs APPLE_API_KEY_PATH to be
+          # a real file, so the .p8 secret (the file's contents) is written
+          # to disk and its path exported — only when both halves exist.
+          export_if_set APPLE_API_KEY "$APPLE_API_KEY"
+          export_if_set APPLE_API_ISSUER "$APPLE_API_ISSUER"
+          if [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_KEY_P8" ]; then
+            KEY_FILE="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s\n' "$APPLE_API_KEY_P8" > "$KEY_FILE"
+            echo "APPLE_API_KEY_PATH=$KEY_FILE" >> "$GITHUB_ENV"
+            echo "exported APPLE_API_KEY_PATH=$KEY_FILE"
+          fi
+          export_if_set APPLE_ID "$APPLE_ID"
+          export_if_set APPLE_PASSWORD "$APPLE_PASSWORD"
+          export_if_set APPLE_TEAM_ID "$APPLE_TEAM_ID"
+
+      # Windows: Azure Artifact Signing (née Trusted Signing). The signed
+      # `bundle.windows.signCommand` is injected via `tauri build --config`
+      # — never committed to tauri.conf.json, so contributor `tauri build`s
+      # keep working unsigned. artifact-signing-cli (Rust reimplementation
+      # of signtool+Azure auth, what the Tauri docs recommend) is only
+      # compiled when all six Azure values exist. The three credentials are
+      # secrets; the endpoint/account/profile are non-sensitive and live in
+      # repo *variables* (`vars.*`) — also fine as secrets if preferred.
+      - name: Configure Azure Artifact Signing (Windows, if configured)
+        id: windows_sign
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_CERT_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_CERT_PROFILE }}
+        run: |
+          set -euo pipefail
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+                   AZURE_ARTIFACT_SIGNING_ENDPOINT AZURE_ARTIFACT_SIGNING_ACCOUNT \
+                   AZURE_ARTIFACT_SIGNING_CERT_PROFILE; do
+            if [ -z "${!v:-}" ]; then
+              echo "Azure Artifact Signing not configured ($v is empty) — building unsigned."
+              exit 0
+            fi
+          done
+          cargo install artifact-signing-cli
+          SIGN_CMD="artifact-signing-cli -e $AZURE_ARTIFACT_SIGNING_ENDPOINT -a $AZURE_ARTIFACT_SIGNING_ACCOUNT -c $AZURE_ARTIFACT_SIGNING_CERT_PROFILE -d Ikenga %1"
+          # Written inside shell/ (the tauri-action projectPath) so the
+          # --config path is a bare filename — no quoting/space issues when
+          # tauri-action tokenizes `args`.
+          jq -nc --arg cmd "$SIGN_CMD" '{bundle:{windows:{signCommand:$cmd}}}' \
+            > shell/ci-windows-sign-config.json
+          cat shell/ci-windows-sign-config.json
+          echo "config_args=--config ci-windows-sign-config.json" >> "$GITHUB_OUTPUT"
+
       # ── Tauri bundle ───────────────────────────────────────────────────────
       # ── Build + sign + (on tag push) publish a draft Release ──────────────
       # tauri-action runs `tauri build`, signs the installer with
@@ -284,6 +413,11 @@ jobs:
       # On workflow_dispatch we don't pass `tagName` — tauri-action still
       # builds + signs and exits with `artifactPaths`, which the next step
       # attaches as a workflow-run artifact for download via the UI.
+      #
+      # The APPLE_* vars arrive via $GITHUB_ENV from the export step above —
+      # only the non-empty ones — so with no secrets configured Tauri sees
+      # exactly the environment it always has and builds unsigned. Azure
+      # signing is injected through `args` by the windows_sign step instead.
       - name: Build + sign + release (tauri-action)
         id: tauri_action
         uses: tauri-apps/tauri-action@v0
@@ -297,7 +431,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} ${{ steps.windows_sign.outputs.config_args }}
 
       # Launch smoke gate — the only check in this pipeline that STARTS the app.
       #
@@ -350,6 +484,156 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # ── Server artifacts ───────────────────────────────────────────────────────
+  # Cross-links `ikenga-server` for amd64 and arm64 against a pinned glibc
+  # floor, then signs and attests the tarballs and a release manifest. Both
+  # architectures build on a native runner, so the link and `--version` gates
+  # actually execute the binary they ship.
+  #
+  # The release is published by `notes`, which needs `server`: a tag whose
+  # server artifacts failed stays a draft rather than going out without them.
+  server-build:
+    name: server build (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.linux == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/build-server
+        with:
+          arch: ${{ matrix.arch }}
+          expect-version: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.ref_name || '' }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-bin-${{ matrix.arch }}
+          path: server-bin/ikenga-server-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  server:
+    name: server tarballs, manifest, signatures
+    needs: [plan, build, server-build]
+    if: needs.plan.outputs.linux == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # attach assets to the draft release
+      id-token: write # keyless signing and build provenance
+      attestations: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout shell
+        uses: actions/checkout@v6
+
+      - name: Download web bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: server-dist
+          path: server-dist
+
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: server-bin-*
+          path: server-bin
+          merge-multiple: true
+
+      # A tag push names its release; a dispatch run takes the crate's own
+      # version so the same steps can be exercised without a tag.
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' src-tauri/server/Cargo.toml | head -n 1)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pack tarballs and write the manifest
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/server/package-server.sh pack \
+            --version "$VERSION" \
+            --commit "$GITHUB_SHA" \
+            --bin-dir server-bin \
+            --dist server-dist \
+            --out server-out
+          ls -l server-out
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      # Keyless: the signature binds to this workflow's OIDC identity, so no
+      # signing key exists to store or rotate. It is separate from the updater
+      # key and from the registry's key. Each bundle is verified straight away
+      # against the exact identity of this run, so a misconfigured signer fails
+      # here and not on a user's machine.
+      - name: Sign with cosign (keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd server-out
+          for f in ikenga-server_*.tar.gz ikenga-server_*_manifest.json; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+            cosign verify-blob --bundle "$f.sigstore.json" \
+              --certificate-identity "https://github.com/$REPO/.github/workflows/release.yml@$GITHUB_REF" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+          done
+          ls -l
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            server-out/ikenga-server_*.tar.gz
+            server-out/ikenga-server_*_manifest.json
+
+      # Tag pushes attach to the draft release the build job created; `notes`
+      # publishes it and `checksums` hashes everything, these files included.
+      # Dispatch runs have no release, so they keep the files as a workflow
+      # artifact instead.
+      - name: Attach to the release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" server-out/* --repo "$REPO" --clobber
+
+      - name: Upload server artifacts (dispatch only)
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ikenga-server
+          path: server-out/*
+          if-no-files-found: error
+          retention-days: 14
+
   # ── Release publication ────────────────────────────────────────────────────
   # `tauri-apps/tauri-action` in the build job creates the draft GitHub
   # Release inline on tag push (one per matrix platform appends its
@@ -374,7 +658,7 @@ jobs:
   # `gh release edit vX.Y.Z --notes-file path/to/notes.md` after the
   # release publishes; that overrides whatever this job wrote.
   notes:
-    needs: build
+    needs: [build, server]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -452,6 +736,28 @@ jobs:
             echo ""
             echo "# Windows — Git Bash / MSYS / Cygwin"
             echo "curl -fsSL https://ikenga.dev/install.sh | sh"
+            echo '```'
+
+            # The multi-user server. The glibc floor is read from the release
+            # manifest, the one place it is recorded.
+            FLOOR=$(gh release download "$TAG" --repo "$REPO" -p '*_manifest.json' -O - \
+              | node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0, "utf8")).glibc_floor)')
+            SERVER_VERSION="${TAG#v}"
+            echo ""
+            echo "## Server"
+            echo ""
+            echo "The multi-user server for Linux (amd64 and arm64, glibc ${FLOOR} or newer) is attached as"
+            echo "\`ikenga-server_${SERVER_VERSION}_linux_<arch>.tar.gz\`. Each tarball holds the binary, the web app"
+            echo "and the systemd units. \`ikenga-server_${SERVER_VERSION}_manifest.json\` lists them with their digests."
+            echo ""
+            echo "Verify a download against the signature this release workflow made:"
+            echo ""
+            echo '```bash'
+            echo "cosign verify-blob --bundle ikenga-server_${SERVER_VERSION}_linux_amd64.tar.gz.sigstore.json \\"
+            echo "  --certificate-identity-regexp '^https://github.com/ikenga-hq/ikenga/.github/workflows/release.yml@refs/tags/v' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ikenga-server_${SERVER_VERSION}_linux_amd64.tar.gz"
+            echo "gh attestation verify ikenga-server_${SERVER_VERSION}_linux_amd64.tar.gz -R ikenga-hq/ikenga"
             echo '```'
           } > "$BODY_FILE"
 
@@ -537,6 +843,49 @@ jobs:
 
           echo "✓ Release notes + complete updater manifest applied to $TAG"
 
+  # ── SHA256 checksums ───────────────────────────────────────────────────────
+  # Final job. Runs strictly after `notes` so the sums cover EVERY published
+  # asset — installers, updater artifacts (.sig, latest.json), the lot —
+  # rather than racing whichever assets had landed when it ran.
+  #
+  # Idempotent on re-runs: the downloaded SHA256SUMS.txt is deleted before
+  # hashing (a checksum file can't list itself), and `gh release upload
+  # --clobber` replaces the previous copy. Re-running the job therefore just
+  # rewrites the same file over the same asset set.
+  checksums:
+    needs: notes
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Attach SHA256SUMS.txt covering every release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR=$(mktemp -d)
+          gh release download "$TAG" --repo "$REPO" --dir "$DIR" --clobber
+          cd "$DIR"
+          rm -f SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --repo "$REPO" --clobber
+          echo "✓ SHA256SUMS.txt attached to $TAG"
+
+  # ── Tell ikenga.dev a release shipped (truth-sync) ─────────────────────
+  # Its own job after `checksums`, the final asset job, so the site rebuild
+  # sees the published release with every asset and SHA256SUMS.txt in place.
+  notify-site:
+    needs: checksums
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       # ── Tell ikenga.dev a release shipped (truth-sync) ─────────────────────
       # Final step on purpose: it runs only after the release is published
       # (`--draft=false` above) and latest.json is re-uploaded, so the site

@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SeatView } from '@/lib/tauri-cmd';
 
 const m = vi.hoisted(() => ({
+	// Gap audit rank 16: flips the page into a remote browser session.
+	remote: false,
 	seatsList: vi.fn(),
 	seatsEngines: vi.fn(),
 	seatsRemove: vi.fn(async () => ({ seat_id: 'x' })),
@@ -29,6 +31,7 @@ const m = vi.hoisted(() => ({
 vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
 	listen: vi.fn(() => Promise.resolve(() => {})),
+	isRemoteWebSession: () => m.remote,
 }));
 vi.mock('@/lib/iyke/client', () => ({ iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })) }));
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
@@ -390,6 +393,22 @@ describe('the seat menu', () => {
 		await waitFor(() =>
 			expect(useSeatNotice.getState().notice?.message).toBe('lead moved to Window 2 — its address is unchanged')
 		);
+	});
+
+	it('remote browser session: Pop out is disabled as desktop-only and never reaches window_join_surface (gap rank 16)', async () => {
+		m.remote = true;
+		try {
+			await mountRail();
+			fireEvent.contextMenu(screen.getByRole('option', { name: /^@lead/ }));
+			const item = within(screen.getByRole('menu')).getByRole('menuitem', { name: /^Pop out/ });
+			expect((item as HTMLButtonElement).disabled).toBe(true);
+			expect(item.getAttribute('title')).toMatch(/^Desktop app only/);
+			fireEvent.click(item);
+			expect(m.windowJoinSurface).not.toHaveBeenCalled();
+			expect(m.spawnWindow).not.toHaveBeenCalled();
+		} finally {
+			m.remote = false;
+		}
 	});
 
 	it('Pop out with Window 2 open joins it and spawns nothing (DEC-69d)', async () => {

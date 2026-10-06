@@ -57,6 +57,12 @@ mod manifest_v5_parity;
 pub mod mcp_runtime;
 #[cfg(feature = "desktop")]
 pub mod npm_install;
+/// Structured install progress events and cancellation for registry installs.
+#[cfg(feature = "desktop")]
+pub mod install_progress;
+/// Kernel-side `pin_on_install`: rail pins written with a fresh install.
+#[cfg(feature = "desktop")]
+pub mod pin_on_install;
 #[cfg(feature = "desktop")]
 pub mod permissions_check;
 pub mod registries;

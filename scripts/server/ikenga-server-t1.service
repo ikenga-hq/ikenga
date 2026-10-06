@@ -36,7 +36,9 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-# IKENGA_HOST (the tailnet address), and optionally:
+# IKENGA_HOST (the tailnet address; leave it unset behind a reverse proxy on
+# loopback), IKENGA_PUBLIC_URL when the instance has an https address, and
+# optionally:
 #   IKENGA_INSECURE_COOKIE=true   plain-HTTP tailnet deploys only (P-3); leave
 #                                 unset behind HTTPS, so the session cookie
 #                                 stays `Secure`.
@@ -100,6 +102,17 @@ ProtectHome=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+# hidepid=invisible /proc for the broker and everything under it: a
+# principal's processes can't list another principal's, or read their argv
+# and environ, from inside this unit. Defense in depth only: it says nothing
+# about a principal signed in over SSH on the host /proc, so nothing relies
+# on it. In particular no Chi engine gets its prompt on the command line —
+# every engine reads it from stdin (I-7) — and no code checks for this line.
+# Safe for the broker: it reads no other uid's /proc/<pid> (child liveness is
+# waitpid, the port check is /proc/net/tcp); the uid-wide sweep on
+# `accounts disable` runs from the root CLI, outside this unit's mount
+# namespace.
+ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true

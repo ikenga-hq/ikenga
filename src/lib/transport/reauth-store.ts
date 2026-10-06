@@ -13,11 +13,23 @@ import { signInWithPassword } from './t1-session';
  */
 export type ReauthMode = 'auto' | 'pair';
 
+/**
+ * Why the dialog is open. `expired`: this tab had a token and the daemon
+ * refused it (it restarted and minted a new one). `first-visit`: this tab has
+ * never had one, so there is nothing to have expired.
+ *
+ * T1 (multi-user, docs/remote/principal-contract.md §2.4) adds a
+ * username/password mode to this same dialog, chosen from the tier that
+ * `/api/health` reports. Keep new sign-in modes here; don't add a second overlay.
+ */
+export type ReauthReason = 'expired' | 'first-visit';
+
 interface ReauthStore {
 	isOpen: boolean;
+	reason: ReauthReason;
 	mode: ReauthMode;
 	setMode: (mode: ReauthMode) => void;
-	showReauth: () => void;
+	showReauth: (reason?: ReauthReason) => void;
 	/** Open straight into "Pair this device" (a browser with no credential). */
 	showPair: () => void;
 	/** Leave for `/remote/pair` with a code (`#c=` keeps it out of the server's
@@ -37,12 +49,18 @@ interface ReauthStore {
 
 export const useReauthStore = create<ReauthStore>((set) => ({
 	isOpen: false,
+	reason: 'expired',
 	mode: 'auto',
 	tokenInput: '',
 	errorMsg: null,
 	setMode: (mode) => set({ mode, errorMsg: null }),
-	showReauth: () =>
-		set({ isOpen: true, errorMsg: null, mode: isDeviceSession() ? 'pair' : 'auto' }),
+	showReauth: (reason = 'expired') =>
+		set({
+			isOpen: true,
+			reason,
+			errorMsg: null,
+			mode: isDeviceSession() ? 'pair' : 'auto',
+		}),
 	showPair: () => set({ isOpen: true, errorMsg: null, mode: 'pair' }),
 	pairWithCode: (code: string) => {
 		const norm = normalizePairCode(code);

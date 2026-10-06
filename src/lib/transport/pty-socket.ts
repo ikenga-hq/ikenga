@@ -1,4 +1,5 @@
 import { connectionStateStore } from './connection-state';
+import { capsReconnectAllowed, handleAccessClose } from './ws-close';
 
 /** Longest backoff between reconnect attempts. */
 const MAX_BACKOFF_MS = 16_000;
@@ -72,6 +73,8 @@ export function attachRemotePty(
 	let attempt = 0;
 	let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	let everConnected = false;
+	/** This attachment's identity for the 4403 immediate-reconnect guard. */
+	const capsKey = {};
 
 	/** Bytes handed to `onData` so far — connection-relative, monotonic. */
 	let received = 0;
@@ -140,8 +143,26 @@ export function attachRemotePty(
 			console.warn(`[pty-socket] WebSocket error for ${id}:`, err);
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (ev?: CloseEvent) => {
 			if (closedByCaller) return;
+			// G-ACCESS §3.10. The shell keeps running on the host either way.
+			const access = handleAccessClose(ev?.code, ev?.reason);
+			if (access === 'revoked') {
+				// The credential is dead: a retry would be refused. The re-auth
+				// overlay is up; signing in again reloads into a fresh attach.
+				closedByCaller = true;
+				if (reconnectTimer) clearTimeout(reconnectTimer);
+				connectionStateStore.terminalClosed(id);
+				emitLocal(banner(YELLOW, 'signed out · sign in again to reattach'));
+				return;
+			}
+			if (access === 'caps_changed' && capsReconnectAllowed(capsKey)) {
+				// "The client reconnects at once with its new caps."
+				attempt = 0;
+				connectionStateStore.terminalClosed(id);
+				reconnectTimer = setTimeout(connect, 0);
+				return;
+			}
 			scheduleReconnect();
 		};
 	};

@@ -1,27 +1,24 @@
-import { Copy, Terminal } from 'lucide-react';
-import { useMemo, useState } from 'react';
 import {
-	Outlet,
 	createFileRoute,
+	Outlet,
 	redirect,
 	useNavigate,
 	useRouterState,
 } from '@tanstack/react-router';
+import { Copy, Terminal } from 'lucide-react';
+import { useMemo, useState } from 'react';
 
 import { useShellStore } from '@/lib/shell/shell-store';
+import { SettingsSectionProvider, useSettingsDocument } from '@/shell/settings/field';
+import { SettingsSectionHeader } from '@/shell/settings/header';
 import {
+	type SettingsFieldRoute,
 	SettingsNav,
+	type SettingsScopeId,
+	type SettingsSectionId,
 	settingsIykeLine,
 	settingsSection,
-	type SettingsFieldRoute,
-	type SettingsSectionId,
-	type SettingsScopeId,
 } from '@/shell/settings/nav';
-import {
-	SettingsSectionProvider,
-	useSettingsDocument,
-} from '@/shell/settings/field';
-import { SettingsSectionHeader } from '@/shell/settings/header';
 import { SettingsSearchResults } from '@/shell/settings/search';
 
 export const Route = createFileRoute('/settings')({
@@ -67,7 +64,15 @@ function SettingsLayout() {
 			isLoading: document.isLoading,
 			refresh: document.refresh,
 		}),
-		[scope, projectId, projectRoot, document.result, overrides, document.isLoading, document.refresh]
+		[
+			scope,
+			projectId,
+			projectRoot,
+			document.result,
+			overrides,
+			document.isLoading,
+			document.refresh,
+		]
 	);
 
 	function goToSection(id: SettingsSectionId, route?: SettingsFieldRoute) {
@@ -106,7 +111,8 @@ function SettingsLayout() {
 							<Outlet />
 						)}
 					</div>
-					{!searchActive && (
+					{/* D-05 D-10 (G-ACCESS §11.2): no iyke line on People until its verbs ship. */}
+					{!searchActive && activeId !== 'people' && (
 						<div className="flex h-8 shrink-0 items-center gap-2 border-t border-border-soft bg-[var(--bg-sunken)] px-5 font-mono text-[10px] text-muted-foreground">
 							<Terminal className="h-3 w-3 shrink-0" />
 							<span className="truncate text-foreground">{iykeLine}</span>

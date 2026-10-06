@@ -24,6 +24,7 @@ import {
 import type { PaneId, PaneView } from '@/lib/panes/types';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
+import { guardedClosePane } from '@/lib/panes/unsaved-guard';
 import { hasAddressBar } from '@/lib/panes/pane-address';
 import { IconButton } from '@/components/ui/icon-button';
 import { useEffectiveMenu } from '@/lib/actions/store';
@@ -48,6 +49,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { desktopOnlyReason } from '@/lib/desktop-only';
 import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
 import { type ReactNode, useState } from 'react';
 import { cn } from '@/components/ui/utils';
@@ -232,7 +234,6 @@ function PaneMenuBody({
 	pkg,
 }: Pick<PaneToolbarProps, 'paneId' | 'history' | 'onPinToArtifacts'> & { pkg: PkgPaneMenuData }) {
 	const splitPane = usePaneStore((s) => s.splitPane);
-	const closePane = usePaneStore((s) => s.closePane);
 	const revealPath = usePaneStore((s) => s.revealPath);
 	const canSplit = usePaneStore((s) => s.canSplit());
 	const leafCount = usePaneStore((s) => s.leafCount());
@@ -285,6 +286,10 @@ function PaneMenuBody({
 					return alreadyPinned ? 'Already pinned' : false;
 				case 'pane.close':
 					return closeDisabled ? 'Cannot close last pane' : false;
+				// `screenshot_pane` is not served to a browser session (gap
+				// audit rank 15).
+				case 'pane.screenshot':
+					return desktopOnlyReason();
 				default:
 					return false;
 			}
@@ -344,7 +349,7 @@ function PaneMenuBody({
 			},
 			'viewer.toggle-history': () =>
 				setVariant(paneId, viewerState.variant === 'history' ? 'default' : 'history'),
-			'pane.close': () => closePane(paneId),
+			'pane.close': () => void guardedClosePane(paneId),
 		},
 	});
 

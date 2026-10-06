@@ -1,5 +1,6 @@
 import { connectionStateStore } from './connection-state';
 import { transportToken, withShareQuery } from './index';
+import { capsReconnectAllowed, handleAccessClose } from './ws-close';
 
 /** `?token=` for T0; nothing under T1, where the session cookie rides the
  *  WebSocket handshake (G-PRINCIPAL §2.3). */
@@ -106,6 +107,7 @@ export class ChatWebSocketClient {
 			this.attempt = 0;
 			this.nextRetryDelayMs = 1000;
 			this.setStatus('connected');
+			connectionStateStore.socketConnected(`chat:${this.threadId}`);
 		};
 
 		this.ws.onmessage = (event) => {
@@ -129,18 +131,31 @@ export class ChatWebSocketClient {
 			console.warn('[chat-client] WebSocket error:', err);
 		};
 
-		this.ws.onclose = () => {
-			if (!this.isExplicitDisconnect) {
-				this.scheduleReconnect();
-			} else {
+		this.ws.onclose = (ev?: CloseEvent) => {
+			if (this.isExplicitDisconnect) {
 				this.setStatus('disconnected', 0, 1000);
+				return;
 			}
+			// G-ACCESS §3.10: 4401 → the re-auth overlay, no retry (it would
+			// be refused); 4403 → reconnect now with the new caps. The turn
+			// itself keeps running on the host.
+			const access = handleAccessClose(ev?.code, ev?.reason);
+			if (access === 'revoked') {
+				this.setStatus('disconnected', 0, 1000);
+				return;
+			}
+			if (access === 'caps_changed' && capsReconnectAllowed(this)) {
+				this.attempt = 0;
+				this.connect();
+				return;
+			}
+			this.scheduleReconnect();
 		};
 	}
 
 	private scheduleReconnect(): void {
 		this.attempt += 1;
-		const delay = Math.min(1000 * Math.pow(2, this.attempt - 1), 16000);
+		const delay = Math.min(1000 * 2 ** (this.attempt - 1), 16000);
 		this.setStatus('reconnecting', this.attempt, delay);
 
 		this.reconnectTimer = setTimeout(() => {

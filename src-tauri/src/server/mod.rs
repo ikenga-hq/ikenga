@@ -30,6 +30,7 @@ pub mod health;
 /// provisioning core (G-PRINCIPAL §4, §6, §7; WP-20). Linux-only, like T1.
 #[cfg(target_os = "linux")]
 pub mod operator;
+mod pkg_cookie;
 pub mod pkg_index;
 pub mod pkg_static;
 /// The principal-child side of topology B: the data-dir flock (I-3).
@@ -44,6 +45,11 @@ mod rpc_local;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;
+/// `ikenga-server supervise`: a minimal init that keeps detached runs alive
+/// across server restarts where there is no systemd (containers). Linux-only.
+pub mod supervisor;
+/// Trusted proxy and client IP resolution (IKENGA_TRUSTED_PROXIES).
+pub mod trusted_proxy;
 
 /// Tauri-command ↔ daemon-RPC parity ratchet (WP-19). Test-only; reads
 /// `lib.rs` and `rpc.rs` as text so it compiles in both feature sets.
@@ -51,13 +57,15 @@ pub mod static_files;
 /// lexer.
 #[cfg(test)]
 pub(crate) mod parity;
+#[cfg(test)]
+mod share_router_tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -71,6 +79,15 @@ pub use health::health_handler;
 pub use pkg_index::PkgIndex;
 pub use pkg_static::PkgStaticService;
 pub use static_files::SpaStaticService;
+
+/// Request-body cap for `/api/rpc` (plans/file-editing Shape 5). axum's
+/// default is 2 MB, which held browser text saves to roughly 400 KB once a
+/// file's bytes were sent as a JSON number array. 16 MiB covers the editor's
+/// 2 MiB edit limit even at worst-case JSON escaping. Not 64 MiB like the T1
+/// broker's `MAX_RPC_BODY`: the RPC parses into `serde_json::Value`, and a
+/// byte-array body inflates to ~32 B per element there. The SPA mirrors this
+/// value as `RPC_BODY_LIMIT_BYTES` in `src/lib/tauri-cmd.ts`.
+pub const RPC_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -225,6 +242,12 @@ pub struct AppState {
     /// the broker's wrapping key out of the process environment before
     /// anything is spawned. See `crate::secrets_env`.
     pub(crate) secrets: Arc<crate::secrets_env::DaemonSecrets>,
+    /// The `chi_run` / `chi_resume` / `chi_cancel` arms' live-run registry
+    /// and engine resolver (WP-P10; see `server::rpc_local::DaemonChi`). One
+    /// per process — under T1, one per principal child — so a run is only
+    /// ever reachable from the process that started it. Share-mode clones of
+    /// `AppState` keep the same `Arc`.
+    pub(crate) chi: Arc<rpc_local::DaemonChi>,
     /// Channel for triggering graceful server shutdown.
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -281,15 +304,8 @@ fn origin_permitted(req: &Request, state: &AppState) -> bool {
 /// boot (G-ACCESS §2.4).
 fn operator_bearer_ok(req: &Request, expected: &str) -> bool {
     // 1. Authorization: Bearer <TOKEN>
-    if let Some(header) = req
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-    {
-        if ct_eq(header, expected) {
-            return true;
-        }
+    if header_bearer_ok(req, expected) {
+        return true;
     }
 
     // 2. ?token=<TOKEN> — the only way to authenticate a WebSocket handshake
@@ -310,6 +326,15 @@ fn operator_bearer_ok(req: &Request, expected: &str) -> bool {
         }
     }
     false
+}
+
+/// `Authorization: Bearer <token>` equals the operator bearer (constant time).
+fn header_bearer_ok(req: &Request, expected: &str) -> bool {
+    req.headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_some_and(|header| ct_eq(header, expected))
 }
 
 fn forbidden(e: &crate::access::AccessError) -> Response {
@@ -356,10 +381,12 @@ async fn auth_middleware(
         .cloned()
         .unwrap_or_else(DaemonAccess::unavailable);
     let meta = RequestMeta {
-        remote_addr: req
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip().to_string()),
+        remote_addr: trusted_proxy::client_addr(
+            req.extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0.ip()),
+            req.headers(),
+        ),
         user_agent: req
             .headers()
             .get("user-agent")
@@ -441,11 +468,28 @@ async fn auth_middleware(
         }
     }
 
+    // App files under `/pkgs/*` (single-user server only): the browser loads
+    // them itself and can't attach the bearer header, so a request that
+    // authenticates with the header gets a `/pkgs`-scoped cookie, and a
+    // `/pkgs` request may authenticate with that cookie (`pkg_cookie`).
+    let now = pkg_cookie::now_secs();
+    let mut pkgs_cookie: Option<String> = None;
     if ctx.is_none() && operator_bearer_ok(&req, &expected) {
         ctx = Some(match access.mode {
             DaemonMode::PrincipalChild => access.child_ctx(req.headers(), meta),
-            DaemonMode::T0 => access.operator_ctx(meta).await,
+            DaemonMode::T0 => {
+                if header_bearer_ok(&req, &expected) {
+                    pkgs_cookie = Some(pkg_cookie::set_cookie(&expected, now, insecure));
+                }
+                access.operator_ctx(meta).await
+            }
         });
+    } else if ctx.is_none()
+        && access.mode == DaemonMode::T0
+        && pkg_cookie::is_pkgs_path(req.uri().path())
+        && pkg_cookie::presented_ok(req.headers(), &expected, now)
+    {
+        ctx = Some(access.operator_ctx(meta).await);
     }
 
     let with_cookie = |mut res: Response, cookie: &Option<String>| {
@@ -474,7 +518,7 @@ async fn auth_middleware(
     }
     req.extensions_mut().insert(ctx);
     let res = activity::track_request(next.run(req)).await;
-    Ok(with_cookie(res, &set_cookie))
+    Ok(with_cookie(with_cookie(res, &set_cookie), &pkgs_cookie))
 }
 
 pub async fn shutdown_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -554,6 +598,7 @@ pub(crate) fn create_router_with_access(
         rpc_shell::PathGuard::allowlist(),
         crate::pkg::skill_actions::store_root(),
         access,
+        None,
     )
 }
 
@@ -580,6 +625,7 @@ pub(crate) fn router_with(
         // G-PRINCIPAL seam: the daemon process's own store.
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
+        None,
     )
 }
 
@@ -606,6 +652,30 @@ pub(crate) fn router_with_store(
         path_guard,
         store,
         crate::access::DaemonAccess::unavailable(),
+        None,
+    )
+}
+
+/// [`router_with_home`] with the Chi arms' state made explicit, so their
+/// tests drive a stub engine instead of whatever `claude` is on PATH.
+#[cfg(test)]
+pub(crate) fn router_with_chi(
+    config: ServerConfig,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    chi: Arc<rpc_local::DaemonChi>,
+) -> Router {
+    build_router(
+        config,
+        Arc::new(PtyManager::new()),
+        Arc::new(EngineRegistry::new()),
+        pa_db,
+        None,
+        home,
+        rpc_shell::PathGuard::allowlist(),
+        crate::pkg::skill_actions::store_root(),
+        crate::access::DaemonAccess::unavailable(),
+        Some(chi),
     )
 }
 
@@ -620,6 +690,7 @@ fn build_router(
     path_guard: rpc_shell::PathGuard,
     store: Option<PathBuf>,
     access: Arc<crate::access::DaemonAccess>,
+    chi: Option<Arc<rpc_local::DaemonChi>>,
 ) -> Router {
     // Whatever the allowlist covers, no caller path reaches this daemon's own
     // state: its `--data-dir` (fs_roots.json, ikenga.db, supabase.json,
@@ -676,6 +747,7 @@ fn build_router(
         actions,
         store,
         secrets,
+        chi: chi.unwrap_or_else(|| Arc::new(rpc_local::DaemonChi::host())),
         shutdown_tx,
     });
 
@@ -693,7 +765,10 @@ fn build_router(
 
     // Protected API and WebSocket endpoints
     let protected_routes = Router::new()
-        .route("/api/rpc", post(rpc::rpc_handler))
+        .route(
+            "/api/rpc",
+            post(rpc::rpc_handler).layer(axum::extract::DefaultBodyLimit::max(RPC_BODY_LIMIT)),
+        )
         .route("/api/shutdown", post(shutdown_handler))
         .route("/ws/pty/:id", get(pty_ws::pty_ws_handler))
         .route("/ws/chat/:id", get(chat_ws::chat_ws_handler))
@@ -736,8 +811,12 @@ fn build_router(
         .layer(Extension(access))
 }
 
-async fn spa_fallback_handler(State(state): State<Arc<AppState>>, uri: Uri) -> impl IntoResponse {
-    state.spa_service.handle(uri).await
+async fn spa_fallback_handler(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    state.spa_service.handle_with(uri, &headers).await
 }
 
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
@@ -882,7 +961,17 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
         // Opened lazily: `PaDb::new` only records the path. The pools (and the
         // migration apply) happen on the first `db_query` / `db_exec`, so a
         // daemon nobody queries never touches the file.
-        pa_db = Some(Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db"))));
+        let db = Arc::new(crate::db::PaDb::new(data_dir.join("ikenga.db")));
+        // Persistent Chi runs (detached chi-runners) outlive the daemon; the
+        // sweep folds the ones that ended while it was down into their rows.
+        // Only when there is a chi cache at all, so a daemon that never ran a
+        // chi run still never opens ikenga.db here (see above). A daemon whose
+        // first detached run comes later starts the sweep then (WP-P10).
+        let chi_cache = data_dir.join(shared::chi::CACHE_DIR);
+        if chi_cache.is_dir() {
+            shared::chi_exec::ensure_detached_sweep(db.clone(), chi_cache);
+        }
+        pa_db = Some(db);
     } else {
         warn!(
             "no --data-dir: fs_* RPC commands will reject every path and \
@@ -912,7 +1001,12 @@ async fn serve_single_tenant(mut config: ServerConfig, mode: SingleTenant) -> an
     let access = if mode.principal_child {
         crate::access::DaemonAccess::principal_child(mode.access.clone())
     } else {
-        crate::access::DaemonAccess::boot_t0(config.data_dir.as_deref(), mode.access.clone()).await
+        crate::access::DaemonAccess::boot_t0(
+            config.data_dir.as_deref(),
+            pa_db.clone(),
+            mode.access.clone(),
+        )
+        .await
     };
     let router = create_router_with_access(
         config.clone(),
@@ -1358,7 +1452,8 @@ mod tests {
             dir.join("manifest.json"),
             format!(
                 r#"{{"id":"{id}","name":"T","version":"0.1.0","ikenga_api":"1",
-                    "ui":{{"routes":[{{"path":"/x","kind":"iframe","source":"dist/index.html"}}]}}}}"#
+                    "ui":{{"routes":[{{"path":"/x","kind":"iframe","source":"dist/index.html"}}],
+                           "views":[{{"id":"v1","title":"V1","route":"/x"}}]}}}}"#
             ),
         )
         .unwrap();
@@ -1398,16 +1493,23 @@ mod tests {
         assert_eq!(entry["kind"], "iframe");
         assert_eq!(
             data["registries"].as_object().unwrap().len(),
-            1,
-            "only the registry the daemon runs may be reported"
+            3,
+            "daemon reports ui_routes, views, and activity_bar registries"
         );
+        assert!(data["registries"].get("ui_routes").is_some());
+        assert!(data["registries"].get("views").is_some());
+        assert!(data["registries"].get("activity_bar").is_some());
 
         // Shape-equality with the Tauri side: `Kernel::status` goes through
         // the same `assemble_status`, so building it here from the same inputs
         // must reproduce the daemon's payload exactly.
         let pkg = crate::pkg::manifest::Package::load(&dir).unwrap();
         let ui = crate::pkg::registries::UiRoutesRegistry::new();
+        let views = crate::pkg::registries::ViewsRegistry::new();
+        let bar = crate::pkg::registries::ActivityBarRegistry::new();
         crate::pkg::Registry::register(&ui, &pkg).unwrap();
+        crate::pkg::Registry::register(&views, &pkg).unwrap();
+        crate::pkg::Registry::register(&bar, &pkg).unwrap();
         let expected = crate::pkg::assemble_status(
             vec![crate::pkg::InstalledSummary {
                 id: "com.test.good".into(),
@@ -1422,7 +1524,7 @@ mod tests {
                 },
                 project_id: None,
             }],
-            &[&ui],
+            &[&ui, &views, &bar],
             crate::pkg::manifest::IKENGA_API_VERSION,
         );
         assert_eq!(data, &serde_json::to_value(expected).unwrap());
@@ -1476,5 +1578,195 @@ mod tests {
         .await;
         assert_eq!(res["ok"], true, "{res}");
         assert!(res["data"].is_array());
+    }
+
+    async fn get_pkgs(router: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The `ikenga_pkgs` Set-Cookie a response carries, if any.
+    fn pkgs_set_cookie(res: &Response) -> Option<String> {
+        res.headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("ikenga_pkgs="))
+            .map(str::to_string)
+    }
+
+    /// `name=value` from a Set-Cookie line.
+    fn cookie_pair(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn pkgs_routes_take_the_scoped_cookie_minted_by_a_bearer_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+        let file = "/pkgs/com.test.good/index.html";
+
+        // No credential: refused.
+        let res = get_pkgs(&router, file, &[]).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // The bearer header works, and mints the `/pkgs` cookie.
+        let res = get_pkgs(&router, file, &[("authorization", "Bearer tok")]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let set = pkgs_set_cookie(&res).expect("a bearer request mints the cookie");
+        assert!(set.contains("; HttpOnly"), "{set}");
+        assert!(set.contains("; SameSite=Strict"), "{set}");
+        assert!(set.contains("; Path=/pkgs;"), "{set}");
+        assert!(!set.contains("tok;"), "the cookie must not carry the bearer: {set}");
+        let pair = cookie_pair(&set);
+        assert!(!pair.contains("=tok"), "{pair}");
+
+        // That cookie alone now loads app files (an ES module import, say).
+        let res = get_pkgs(&router, file, &[("cookie", pair.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = get_pkgs(&router, "/pkgs/com.test.good/", &[("cookie", pair.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // ...but nothing outside `/pkgs`.
+        {
+            use axum::body::Body;
+            use tower::ServiceExt;
+            let res = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/rpc")
+                        .header("cookie", pair.as_str())
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"cmd":"pkg_kernel_status"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // A wrong, forged or raw-bearer cookie is refused.
+        for bad in [
+            "ikenga_pkgs=nope",
+            "ikenga_pkgs=tok",
+            "ikenga_session=tok",
+            "ikenga_pkgs=99999999999.00",
+        ] {
+            let res = get_pkgs(&router, file, &[("cookie", bad)]).await;
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{bad}");
+        }
+
+        // A cookie minted under another bearer is refused.
+        let other = format!(
+            "{}={}",
+            pkg_cookie::COOKIE,
+            pkg_cookie::mint("another-token", pkg_cookie::now_secs())
+        );
+        let res = get_pkgs(&router, file, &[("cookie", other.as_str())]).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // A token in the query string mints nothing.
+        let res = get_pkgs(&router, &format!("{file}?token=tok"), &[]).await;
+        assert!(pkgs_set_cookie(&res).is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_app_rpcs_answer_on_the_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_iframe_pkg(tmp.path(), "com.test.good");
+        let router = rpc_router(Some(tmp.path().to_path_buf()));
+
+        // pkg_activity_bar_set_badge: set, visible in pkg_kernel_status, clear.
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_activity_bar_set_badge",
+                "args": { "pkgId": "com.test.good", "badge": { "dot": true, "count": 3 } }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+        let status = rpc(&router, serde_json::json!({ "cmd": "pkg_kernel_status" })).await;
+        assert!(
+            status["data"]["registries"]["activity_bar"]
+                .to_string()
+                .contains("\"count\":3"),
+            "{status}"
+        );
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_activity_bar_set_badge",
+                "args": { "pkgId": "com.test.good", "badge": null }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+
+        // Unknown pkg, missing id and a malformed badge are errors.
+        for args in [
+            serde_json::json!({ "pkgId": "com.test.unknown", "badge": null }),
+            serde_json::json!({ "badge": null }),
+            serde_json::json!({ "pkgId": "com.test.good", "badge": { "count": "x" } }),
+        ] {
+            let res = rpc(
+                &router,
+                serde_json::json!({ "cmd": "pkg_activity_bar_set_badge", "args": args }),
+            )
+            .await;
+            assert_eq!(res["ok"], false, "{res}");
+        }
+
+        // The server grants no elevated trust, to any pkg.
+        for id in ["com.test.good", "com.test.unknown"] {
+            let res = rpc(
+                &router,
+                serde_json::json!({
+                    "cmd": "pkg_is_trusted_for_elevated",
+                    "args": { "pkgId": id }
+                }),
+            )
+            .await;
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(res["data"], false, "{res}");
+        }
+
+        // Nothing is ever parked for review.
+        let res = rpc(&router, serde_json::json!({ "cmd": "pkg_trust_list_pending" })).await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["data"], serde_json::json!([]));
+
+        // Approving stays desktop-only.
+        let res = rpc(
+            &router,
+            serde_json::json!({ "cmd": "pkg_trust_approve", "args": { "pkgId": "com.test.good" } }),
+        )
+        .await;
+        assert_eq!(res["ok"], false, "{res}");
+
+        // pkg_preview_manifest reads an installed pkg's manifest.
+        let res = rpc(
+            &router,
+            serde_json::json!({
+                "cmd": "pkg_preview_manifest",
+                "args": { "installPath": dir.to_str().unwrap() }
+            }),
+        )
+        .await;
+        assert_eq!(res["ok"], true, "{res}");
+        assert_eq!(res["data"]["id"], "com.test.good");
     }
 }

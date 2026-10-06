@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
+use crate::pkg::install_progress::{cancelled_error, InstallReporter, InstallStage};
 use crate::pkg::manifest::Manifest;
 use crate::runtime::augmented_path;
 
@@ -119,6 +120,16 @@ fn write_sanitized_package_json(
 /// synchronous so it can run inside `tokio::task::spawn_blocking` without
 /// holding an async runtime worker for the duration.
 pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
+    materialize_npm_deps_with(install_path, None)
+}
+
+/// [`materialize_npm_deps`], reporting on `reporter` when given: npm's output
+/// is streamed so the install row can show how many packages it has fetched,
+/// and a cancel request stops npm (the caller then cleans up the pkg dir).
+pub fn materialize_npm_deps_with(
+    install_path: &Path,
+    reporter: Option<&InstallReporter>,
+) -> Result<()> {
     // Gate: only packages with long-lived MCP servers pay the npm cost. Pure
     // UI pkgs, per-call MCPs, and sidecar-only pkgs don't need node_modules.
     let manifest_path = install_path.join("manifest.json");
@@ -218,25 +229,28 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
         .args(["install", "--omit=dev", "--no-audit", "--no-fund"])
         .current_dir(install_path)
         .env("PATH", search_path);
-    let output = crate::executor::current().spawn_output_blocking(npm_spec, OUTPUT_OPTS);
+    let output = run_npm(npm_spec, reporter);
 
     // Restore the pkg's own package.json before inspecting the result, so a
     // failure can never leave the pkg with our synthesized one on disk.
     manifest_backup.restore(install_path);
 
-    let output = output.context("spawn npm install")?;
+    let output = output?;
 
-    if output.status.success() {
+    if output.success {
         log::info!("npm install succeeded in {}", install_path.display());
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = without_fetch_lines(&output.stderr);
     log::warn!(
         "npm install failed in {} (exit {}): {stderr}",
         install_path.display(),
         output.status
     );
+    if reporter.is_some_and(|r| r.is_cancelled()) {
+        return Err(cancelled_error());
+    }
 
     // Fallback: try bun install --production if bun is on the augmented PATH.
     if let Ok(bun) = which::which_in("bun", Some(search_path), install_path)
@@ -266,6 +280,143 @@ pub fn materialize_npm_deps(install_path: &Path) -> Result<()> {
     }
 
     Err(anyhow!("npm dependency materialization failed: {stderr}"))
+}
+
+/// What a finished npm run left behind.
+struct NpmRun {
+    success: bool,
+    status: String,
+    stderr: String,
+}
+
+/// The same opts as [`OUTPUT_OPTS`], for the streamed spawn: killed if the
+/// handle is dropped (a cancel, or the install task going away).
+const STREAM_OPTS: PipedOpts = PipedOpts {
+    kill_on_drop: true,
+    ..OUTPUT_OPTS
+};
+
+/// Run npm. With a reporter and a tokio runtime to use (the install command
+/// runs this on a blocking thread), stream its output: count the packages it
+/// fetches for the progress row and stop it on cancel. Otherwise run it to
+/// completion the old way.
+fn run_npm(mut spec: SpawnSpec, reporter: Option<&InstallReporter>) -> Result<NpmRun> {
+    if let (Some(rep), Ok(handle)) = (reporter, tokio::runtime::Handle::try_current()) {
+        // `http` level makes npm print one line per fetched package.
+        spec.arg("--loglevel=http");
+        return handle.block_on(run_npm_streaming(spec, rep.clone()));
+    }
+    let out = crate::executor::current()
+        .spawn_output_blocking(spec, OUTPUT_OPTS)
+        .context("spawn npm install")?;
+    Ok(NpmRun {
+        success: out.status.success(),
+        status: out.status.to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// One npm `http` log line per package tarball / packument fetched.
+fn is_fetch_line(line: &str) -> bool {
+    line.contains("http fetch GET 200") || line.contains("http fetch GET 304")
+}
+
+/// npm's error output with the `--loglevel=http` fetch chatter removed, so a
+/// failure message carries the error and not a list of every request.
+fn without_fetch_lines(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|l| !l.contains("npm http fetch"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse npm's closing "added N packages" summary, if it printed one.
+fn added_count(line: &str) -> Option<u64> {
+    let rest = line.trim().strip_prefix("added ")?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+async fn read_lines<R>(
+    reader: Option<R>,
+    fetched: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncBufReadExt;
+    let Some(reader) = reader else {
+        return String::new();
+    };
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let mut out = String::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if is_fetch_line(&line) {
+            fetched.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(n) = added_count(&line) {
+            fetched.store(n, Ordering::Relaxed);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+async fn run_npm_streaming(spec: SpawnSpec, rep: InstallReporter) -> Result<NpmRun> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let mut child = crate::executor::current()
+        .spawn_piped(spec, STREAM_OPTS)
+        .context("spawn npm install")?;
+    let fetched = Arc::new(AtomicU64::new(0));
+    let out_task = tokio::spawn(read_lines(child.stdout.take(), fetched.clone()));
+    let err_task = tokio::spawn(read_lines(child.stderr.take(), fetched.clone()));
+
+    let mut tick = tokio::time::interval(Duration::from_millis(300));
+    let mut last = 0u64;
+    let status = loop {
+        let exited = tokio::select! {
+            st = child.wait() => Some(st),
+            _ = tick.tick() => None,
+        };
+        if let Some(st) = exited {
+            break st.context("wait for npm install")?;
+        }
+        if rep.is_cancelled() {
+            let _ = child.kill().await;
+            out_task.abort();
+            err_task.abort();
+            return Err(cancelled_error());
+        }
+        let n = fetched.load(Ordering::Relaxed);
+        if n != last {
+            last = n;
+            let noun = if n == 1 { "package" } else { "packages" };
+            rep.progress(
+                InstallStage::InstallingDeps,
+                None,
+                None,
+                None,
+                Some(format!("{n} {noun} fetched")),
+            );
+        }
+    };
+    // A grandchild that inherited the pipes could keep them open past npm's
+    // own exit; don't wait on it for long.
+    let grace = Duration::from_secs(5);
+    let _ = tokio::time::timeout(grace, out_task).await;
+    let stderr = match tokio::time::timeout(grace, err_task).await {
+        Ok(Ok(s)) => s,
+        _ => String::new(),
+    };
+    Ok(NpmRun {
+        success: status.success(),
+        status: status.to_string(),
+        stderr,
+    })
 }
 
 #[cfg(test)]
@@ -375,6 +526,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn counts_fetch_lines_and_reads_the_added_summary() {
+        assert!(is_fetch_line(
+            "npm http fetch GET 200 https://registry.npmjs.org/ajv 120ms (cache miss)"
+        ));
+        assert!(!is_fetch_line(
+            "npm warn tar TAR_ENTRY_ERROR ENOSPC: no space left on device, write"
+        ));
+        assert_eq!(added_count("added 42 packages in 3s"), Some(42));
+        assert_eq!(added_count("added 1 package, and audited 2 packages in 1s"), Some(1));
+        assert_eq!(added_count("up to date in 1s"), None);
+    }
+
+    #[test]
+    fn failure_text_drops_fetch_chatter() {
+        let raw = "npm http fetch GET 200 https://r/a 5ms\nnpm error code ENOSPC\nnpm http fetch GET 200 https://r/b 5ms";
+        assert_eq!(without_fetch_lines(raw), "npm error code ENOSPC");
+    }
 
     #[test]
     fn skips_packages_without_long_lived_mcp() {

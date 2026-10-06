@@ -222,10 +222,13 @@ fn refusal(e: &AccessError) -> Refusal {
 }
 
 fn remote_addr(parts: &Parts) -> Option<String> {
-    parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|c| c.0.ip().to_string())
+    crate::server::trusted_proxy::client_addr(
+        parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip()),
+        &parts.headers,
+    )
 }
 
 /// What [`device_cookie_middleware`] found, handed to the resolver through
@@ -305,10 +308,12 @@ pub async fn device_cookie_middleware(
     // §2.4: the same pick and the same cookie decision as T0's
     // `auth_middleware` (`devices::presented` / `devices::cookie_action`).
     if let Some((raw, presented)) = devices::presented(req.headers()) {
-        let addr = req
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|c| c.0.ip().to_string());
+        let addr = crate::server::trusted_proxy::client_addr(
+            req.extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|c| c.0.ip()),
+            req.headers(),
+        );
         match devices::resolve(&t1.store, &t1.seen, &raw, addr.as_deref()).await {
             Ok(auth) => {
                 let upgrade = req.headers().contains_key(header::UPGRADE);
@@ -357,7 +362,7 @@ impl RpcAuthorizer for AccessAuthorizer {
         ctx: &'a PrincipalCtx,
         req: &'a Parts,
         cmd: &'a str,
-        _args: &'a Value,
+        args: &'a Value,
     ) -> BoxFuture<'a, Decision> {
         Box::pin(async move {
             let deny = |e: AccessError| Decision::Deny {
@@ -370,8 +375,22 @@ impl RpcAuthorizer for AccessAuthorizer {
                 Err(e) => return deny(e),
             };
             match super::authorize(&b.access, cmd) {
-                Ok(()) => Decision::Allow,
-                Err(e) => deny(e),
+                Ok(()) => {
+                    // §6.5 `share.artifact_viewed`: Guest and artifact-scope
+                    // reads, one per (member, path, hour).
+                    super::audit::on_share_read(Some(&self.0.store), &b.access, cmd, args);
+                    Decision::Allow
+                }
+                Err(e) => {
+                    // A-23: a refused decision is audited `permission.refused`
+                    // here too — the broker is the T1 store's writer, as the
+                    // T0 daemon's pre-hook is T0's.
+                    use crate::server::shared::notifications::routing;
+                    if let Some(ev) = routing::prehook_refusal_event(&b.access, cmd, &e) {
+                        routing::append_audit(&self.0.store, &ev).await;
+                    }
+                    deny(e)
+                }
             }
         })
     }
@@ -1068,6 +1087,64 @@ mod tests {
                 .await,
             Decision::Deny { .. }
         ));
+    }
+
+    /// A-23 under T1: the broker answers `routing_refused` for a decision
+    /// from a device the routing preference excludes — and audits it
+    /// (`permission.refused {reason: routing_refused}`), as the T0 daemon's
+    /// pre-hook does. Other refusals and other commands write nothing.
+    #[tokio::test]
+    async fn a_routing_refused_decision_is_audited_by_the_broker() {
+        let (_tmp, t1, ada) = setup().await;
+        let (_row, tok) = pair(&t1, ada, Tier::Approve).await;
+        sqlx::query(
+            "INSERT INTO routing_prefs (principal_id, mode, device_id, updated_at) \
+             VALUES (?, 'this_device', 'another-device', 0)",
+        )
+        .bind(ada.to_string())
+        .execute(&t1.pool)
+        .await
+        .unwrap();
+        let parts = parts_with("authorization", &format!("Bearer {tok}"));
+        let Resolution::Resolved { ctx, .. } = DeviceGrantResolver(t1.clone())
+            .resolve(&parts)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let refused = |kind: &'static str| {
+            let pool = t1.store.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT detail FROM audit_events WHERE kind = ? ORDER BY seq",
+                )
+                .bind(kind)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let authz = AccessAuthorizer(t1.clone());
+        match authz
+            .authorize_rpc(&ctx, &parts, "permission_decide", &Value::Null)
+            .await
+        {
+            Decision::Deny { code, .. } => assert_eq!(code, "routing_refused"),
+            other => panic!("{other:?}"),
+        }
+        let rows = refused("permission.refused").await;
+        assert_eq!(rows.len(), 1);
+        let detail: Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(detail["reason"], "routing_refused");
+        // Not a decision: refused (missing caps / class), never audited here.
+        assert!(matches!(
+            authz
+                .authorize_rpc(&ctx, &parts, "permission_relay_put", &Value::Null)
+                .await,
+            Decision::Deny { .. }
+        ));
+        assert_eq!(refused("permission.refused").await.len(), 1);
     }
 
     /// Review F-2: the tier is the one this request resolved — the

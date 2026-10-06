@@ -1,0 +1,86 @@
+{
+  "$schema": "https://registry.ikenga.dev/schemas/models/catalog-v1.json",
+  "version": 1,
+  "pricingUnit": "USD per million tokens",
+  "defaultModel": "claude-sonnet-5-5",
+  "roles": {
+    "chi": "claude-sonnet-5-5",
+    "pane": "claude-sonnet-5-5",
+    "plan": "claude-opus-5-5"
+  },
+  "aliases": {
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "haiku": "claude-haiku-4-5",
+    "fable": "claude-fable-5-1"
+  },
+  "models": [
+    {
+      "id": "claude-fable-5-1",
+      "alias": "fable",
+      "family": "Claude Fable 5.1",
+      "tier": 1,
+      "contextTokens": 1000000,
+      "pricing": {
+        "inPerMtok": 10,
+        "outPerMtok": 50,
+        "cacheReadPerMtok": 0.25,
+        "cacheWritePerMtok": 12.5
+      },
+      "pricingVerifiedAt": "2026-10-04",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table), cross-checked with the claude-api skill reference (Claude Code 2.1.289)"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "alias": "opus",
+      "family": "Claude Opus 5.5",
+      "tier": 2,
+      "contextTokens": 1000000,
+      "pricing": {
+        "inPerMtok": 4,
+        "outPerMtok": 20,
+        "cacheReadPerMtok": 0.2,
+        "cacheWritePerMtok": 5
+      },
+      "pricingVerifiedAt": "2026-10-04",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table), cross-checked with the claude-api skill reference (Claude Code 2.1.289)",
+      "defaultFor": [
+        "plan"
+      ]
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "alias": "sonnet",
+      "family": "Claude Sonnet 5.5",
+      "tier": 3,
+      "contextTokens": 1000000,
+      "pricing": {
+        "inPerMtok": 2,
+        "outPerMtok": 10,
+        "cacheReadPerMtok": 0.2,
+        "cacheWritePerMtok": 2.5
+      },
+      "pricingVerifiedAt": "2026-10-04",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table), cross-checked with the claude-api skill reference (Claude Code 2.1.289)",
+      "defaultFor": [
+        "chi",
+        "pane"
+      ]
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "alias": "haiku",
+      "family": "Claude Haiku 4.5",
+      "tier": 4,
+      "contextTokens": 200000,
+      "pricing": {
+        "inPerMtok": 1,
+        "outPerMtok": 5,
+        "cacheReadPerMtok": 0.1,
+        "cacheWritePerMtok": 1.25
+      },
+      "pricingVerifiedAt": "2026-10-04",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table), cross-checked with the claude-api skill reference (Claude Code 2.1.289)"
+    }
+  ]
+}

@@ -413,7 +413,8 @@ export async function prunePinsForUninstalledPkg(pkgId: string): Promise<string[
 }
 
 /** Subscribe to the kernel's `pkg-uninstalled` event and prune that pkg's
- *  pins. Mount once (the rail does). Returns the unsubscribe. */
+ *  pins, and to `pkg-installed` to pick up pins a fresh install added. Mount
+ *  once (the rail does). Returns the unsubscribe. */
 export function subscribePinPruneOnUninstall(): () => void {
 	// Caught at once: with no event transport (tests, a browser without the
 	// bridge) `listen` rejects, and that must not surface as an unhandled
@@ -425,5 +426,16 @@ export function subscribePinPruneOnUninstall(): () => void {
 		console.warn('[pins] pkg-uninstalled subscription failed:', err);
 		return () => {};
 	});
-	return () => void unlisten.then((fn) => fn());
+	// A fresh install may have pinned views (`pin_on_install`, applied by the
+	// kernel before it emits the event): re-read so they show at once.
+	const unlistenInstall = listen('pkg-installed', () => {
+		void usePinsStore.getState().refresh();
+	}).catch((err) => {
+		console.warn('[pins] pkg-installed subscription failed:', err);
+		return () => {};
+	});
+	return () => {
+		void unlisten.then((fn) => fn());
+		void unlistenInstall.then((fn) => fn());
+	};
 }

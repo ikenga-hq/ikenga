@@ -3,6 +3,11 @@
 // Calls `detectSystem()` on mount via TanStack Query and renders the 5+
 // checks. Continue is gated on no `fail` rows (warnings OK).
 //
+// In a browser session (`isRemoteWebSession()`: T0 token, T1 cookie or a
+// paired device) the daemon does not serve `detect_system` (WP-19, its
+// report is half desktop vault), so the step shows a server report built
+// from what the daemon does serve instead — see `server-preflight.ts`.
+//
 // Mirrors the Phase 1 prototype `01-welcome.html`: two columns — a left
 // hero (caption + headline + three reassurance bullets) and a right
 // aside listing the preflight items as cards. The host wizard chrome
@@ -10,7 +15,7 @@
 
 import { Link } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
-import { openExternalUrl } from '@/lib/transport';
+import { isRemoteWebSession, openExternalUrl } from '@/lib/transport';
 
 import { LoreTerm } from '@/components/lore/lore-term';
 import { Button } from '@/components/ui/button';
@@ -19,14 +24,10 @@ import { Input } from '@/components/ui/input';
 import { quoteOfTheDay } from '@/lib/lore';
 import { openSettingsFile } from '@/lib/settings/client';
 import { ONBOARDING_STEPS, useShellStore } from '@/lib/shell/shell-store';
-import {
-	type CheckLevel,
-	type SystemCheck,
-	type SystemReport,
-	detectSystem,
-} from '@/lib/tauri-cmd';
+import { type CheckLevel, type SystemCheck, detectSystem } from '@/lib/tauri-cmd';
 import { WritesNote } from '@/shell/onboarding/footer';
 import { RAIL_COPY } from '@/shell/onboarding/rail';
+import { type PreflightReport, detectServerPreflight } from '@/shell/onboarding/server-preflight';
 
 interface WelcomeBodyProps {
 	/** Pass-through from the wizard chrome — re-rendered onto the
@@ -50,9 +51,12 @@ const DOC_LINKS: Record<string, string> = {
 const DEFAULT_DOC = 'https://github.com/ikenga-hq/ikenga/blob/main/docs/onboarding.md';
 
 export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
-	const { data, isLoading, isError, error, refetch } = useQuery<SystemReport>({
-		queryKey: QUERY_KEY,
-		queryFn: detectSystem,
+	// Fixed for the life of the tab: the boot path settles the session kind
+	// before the wizard mounts.
+	const remote = isRemoteWebSession();
+	const { data, isLoading, isError, error, refetch } = useQuery<PreflightReport>({
+		queryKey: [...QUERY_KEY, remote ? 'server' : 'desktop'],
+		queryFn: remote ? detectServerPreflight : detectSystem,
 		// Preflight is informational — refetching on focus would just thrash
 		// the row colors as the user comes back to the wizard.
 		refetchOnWindowFocus: false,
@@ -127,10 +131,17 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 						title="No cloud account required to start."
 						meta="Connect Supabase, Resend & co. only if a package needs them."
 					/>
-					<Bullet
-						title="Local-first — your files stay on this machine."
-						meta="Secrets sit in Stronghold, never in env files."
-					/>
+					{remote ? (
+						<Bullet
+							title="Runs on the server you connected to."
+							meta="Your files, terminals and agent sessions live there, not in this browser."
+						/>
+					) : (
+						<Bullet
+							title="Local-first — your files stay on this machine."
+							meta="Secrets sit in Stronghold, never in env files."
+						/>
+					)}
 					<Bullet
 						title="Skip any step you don't need."
 						meta="We'll surface the gap in Settings if it matters later."
@@ -166,21 +177,22 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 					</p>
 				</div>
 
-				<WritesNote
-					stepId="welcome"
-					onOpenFile={() => void openSettingsFile('personal').catch(() => {})}
-				/>
+				{/* WritesNote hides "Open file" when the OS can't open files (a browser
+				    session: `settings_open_file` is desktop-only) and surfaces errors. */}
+				<WritesNote stepId="welcome" onOpenFile={() => openSettingsFile('personal')} />
 
-				<div className="mt-4">
-					<Link
-						to="/settings/storage"
-						className="text-xs underline-offset-2 hover:underline"
-						style={{ color: 'var(--primary)' }}
-						data-testid="welcome-restore-link"
-					>
-						Coming from another machine? Restore from backup…
-					</Link>
-				</div>
+				{!remote && (
+					<div className="mt-4">
+						<Link
+							to="/settings/storage"
+							className="text-xs underline-offset-2 hover:underline"
+							style={{ color: 'var(--primary)' }}
+							data-testid="welcome-restore-link"
+						>
+							Coming from another machine? Restore from backup…
+						</Link>
+					</div>
+				)}
 			</section>
 
 			{/* ── Right: preflight ────────────────────────────────────────── */}
@@ -190,7 +202,7 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 						className="text-xs font-semibold uppercase tracking-[0.04em]"
 						style={{ color: 'var(--fg-muted)' }}
 					>
-						System preflight
+						{remote ? 'Server preflight' : 'System preflight'}
 					</p>
 					{!isLoading && (
 						<button
@@ -209,7 +221,7 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 					<div data-testid="preflight-loading">
 						<FeedbackState
 							variant="loading"
-							heading="Detecting system…"
+							heading={remote ? 'Checking the server…' : 'Detecting system…'}
 							fill={false}
 							className="min-h-0 py-4"
 						/>
@@ -239,6 +251,17 @@ export function WelcomeBody({ onContinue }: WelcomeBodyProps) {
 							<PreflightRow key={check.id} check={check} />
 						))}
 					</div>
+				)}
+
+				{remote && !isLoading && !isError && data && (
+					<p
+						className="mt-3 text-[11.5px]"
+						style={{ color: 'var(--fg-faint)' }}
+						data-testid="preflight-server-note"
+					>
+						A browser can't see the server's disk space or data folder, so those checks are left out
+						here.
+					</p>
 				)}
 
 				{/* In-body Continue mirrors the footer button but is reachable
@@ -342,6 +365,13 @@ function labelFor(id: string): string {
 			return 'Claude projects dir';
 		case 'network':
 			return 'Network connectivity';
+		// Server report (browser sessions) — `server-preflight.ts`.
+		case 'server':
+			return 'Server';
+		case 'access':
+			return 'Access';
+		case 'sessions':
+			return 'Terminals & agents';
 		default:
 			return id;
 	}
@@ -385,7 +415,7 @@ function toneFor(level: CheckLevel): Tone {
 
 /** Exported for tests — pure decision on whether Continue should be
  *  enabled given a preflight report. Keeps the rule in one place. */
-export function canContinueFromPreflight(report: SystemReport | undefined): boolean {
+export function canContinueFromPreflight(report: PreflightReport | undefined): boolean {
 	if (!report) return false;
 	return !report.checks.some((c) => c.level === 'fail');
 }

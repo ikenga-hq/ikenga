@@ -37,7 +37,7 @@ export function vaultAxis(opts: {
 }
 
 export const OPERATOR_SCOPE_REASON =
-	"The server's operator default is one flat namespace. Project and pkg secrets need your own store — an Ikenga server with accounts.";
+	"The server's operator default is one flat namespace. Project and pkg secrets need your own store on a multi-user server.";
 export const SHARED_REASON =
 	"Secrets stay with the project's Owner. A shared project shares files, sessions and dispatch — never credentials.";
 
@@ -58,21 +58,40 @@ export function scopeDisabledReason(axis: VaultAxis, scope: ScopeKind): string |
  *    value of your own into your store).
  *  `indexNames` is `secrets_index_names` (env names bare, store names
  *  `workspace::KEY`); while it is unknown every principal Workspace row is
- *  treated as `default` (read-only) rather than presented as yours. */
+ *  treated as `default` (read-only) rather than presented as yours.
+ *  `defaultNames` is `secrets_default_names`, the operator default's names
+ *  alone (review WP76-RV1): a bare key in your own store is bare in the
+ *  index too, so only this list says whether a default really sits under
+ *  your value. Unknown (an older daemon) → the index's bare names. */
 export type SecretLayer = 'own' | 'override' | 'default';
 
 export function secretLayer(
 	axis: VaultAxis,
 	scope: ScopeKind,
 	key: string,
-	indexNames: readonly string[] | undefined
+	indexNames: readonly string[] | undefined,
+	defaultNames?: readonly string[]
 ): SecretLayer {
 	if (axis === 'operator') return 'default';
 	if (axis !== 'principal' || scope !== 'workspace') return 'own';
 	if (!indexNames) return 'default';
 	const inStore = indexNames.includes(`workspace::${key}`);
 	if (!inStore) return 'default';
-	return indexNames.includes(key) ? 'override' : 'own';
+	const overDefault = (defaultNames ?? indexNames).includes(key);
+	return overDefault ? 'override' : 'own';
+}
+
+/** What {@link secretLayer} reads while `secrets_default_names` is in
+ *  flight (review WP78a-R6): the index is held back — every principal
+ *  Workspace row reads `default` (read-only) — until the default list
+ *  resolves, so a bare key of yours never flashes as an override; only a
+ *  failed query (an older daemon) falls back to the index's bare names. */
+export function settledLayerNames(
+	indexNames: readonly string[] | undefined,
+	defaults: { data?: readonly string[]; isError: boolean }
+): { indexNames: readonly string[] | undefined; defaultNames: readonly string[] | undefined } {
+	if (defaults.data) return { indexNames, defaultNames: defaults.data };
+	return { indexNames: defaults.isError ? indexNames : undefined, defaultNames: undefined };
 }
 
 /** Whether the lock / passphrase controls apply: only the desktop keychain
@@ -116,7 +135,7 @@ export function PrincipalAxis({
 				sub:
 					axis === 'principal'
 						? 'Yours alone, on this server. Sealed under a key the server holds for you — there is no passphrase to unlock. Overrides the operator default key by key.'
-						: 'Needs an Ikenga server with accounts (T1).',
+						: 'Needs a multi-user server.',
 				active: axis === 'principal',
 			},
 			{

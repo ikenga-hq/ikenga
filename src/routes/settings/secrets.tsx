@@ -39,6 +39,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import {
 	isRemoteWebSession,
 	pkgKernelStatus,
+	secretsDefaultNames,
 	secretsIndexNames,
 	type VaultScope,
 } from '@/lib/tauri-cmd';
@@ -51,6 +52,7 @@ import {
 	type SecretLayer,
 	scopeDisabledReason,
 	secretLayer,
+	settledLayerNames,
 	type VaultAxis,
 	vaultAxis,
 } from '@/shell/secrets/principal-axis';
@@ -121,8 +123,19 @@ function SecretsPage() {
 		queryFn: () => secretsIndexNames(),
 		enabled: layered && vaultUnlocked,
 	});
+	// WP76-RV1: the default layer's own names — a bare key of yours is not
+	// an override.
+	const defaultsQuery = useQuery({
+		queryKey: ['secrets', 'default-names'] as const,
+		queryFn: () => secretsDefaultNames(),
+		enabled: layered && vaultUnlocked,
+	});
+	const names = settledLayerNames(layered ? indexQuery.data : undefined, {
+		data: layered ? defaultsQuery.data : undefined,
+		isError: defaultsQuery.isError,
+	});
 	const layerOf = (key: string): SecretLayer =>
-		secretLayer(axis, tab, key, layered ? indexQuery.data : undefined);
+		secretLayer(axis, tab, key, names.indexNames, names.defaultNames);
 
 	const [editKey, setEditKey] = useState<string | null>(null);
 	const [editLayer, setEditLayer] = useState<SecretLayer>('own');
@@ -153,9 +166,9 @@ function SecretsPage() {
 					Vault secrets
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
-					Encrypted at rest in the OS keychain, partitioned by scope. Workspace and active-project
-					secrets are dumped into the runtime env-vault file that sidecars read; pkg secrets resolve
-					at command-handling time inside the kernel.
+					Encrypted at rest in the OS keychain, partitioned by scope. Personal and active-project
+					secrets are dumped into the runtime env-vault file that sidecars read; app and extension
+					secrets resolve at command-handling time inside the kernel.
 				</p>
 			</header>
 
@@ -202,7 +215,7 @@ function SecretsPage() {
 			)}
 			{tab === 'pkg' && (
 				<div className="flex items-center gap-2 text-xs text-muted-foreground">
-					<span>Pkg:</span>
+					<span>App or extension:</span>
 					<select
 						className="rounded-md border border-input bg-background px-2 py-1 text-xs"
 						value={effectivePkgId}
@@ -210,11 +223,11 @@ function SecretsPage() {
 						disabled={pkgs.length === 0}
 					>
 						{pkgs.length === 0 ? (
-							<option value="">(no installed pkgs)</option>
+							<option value="">(no installed apps or extensions)</option>
 						) : (
 							pkgs.map((p) => (
 								<option key={p.id} value={p.id}>
-									{p.id} {p.project_id ? `· project:${p.project_id}` : '· workspace'}
+									{p.id} {p.project_id ? `· project:${p.project_id}` : '· personal'}
 								</option>
 							))
 						)}
@@ -256,7 +269,7 @@ function SecretsPage() {
 					</div>
 					{!canQuery && (
 						<div className="px-3 py-6 text-center text-xs text-muted-foreground">
-							Select a pkg to view its secrets.
+							Select an app or extension to view its secrets.
 						</div>
 					)}
 					{canQuery && keysQuery.isError && (
@@ -423,9 +436,9 @@ function RemoteVaultBanner({
 }
 
 const TAB_ITEMS: Array<{ kind: TabKind; label: string; icon: React.ReactNode }> = [
-	{ kind: 'workspace', label: 'Workspace', icon: <Layers className="h-3.5 w-3.5" /> },
+	{ kind: 'workspace', label: 'Personal', icon: <Layers className="h-3.5 w-3.5" /> },
 	{ kind: 'project', label: 'Project', icon: <FolderKanban className="h-3.5 w-3.5" /> },
-	{ kind: 'pkg', label: 'Pkg', icon: <Package className="h-3.5 w-3.5" /> },
+	{ kind: 'pkg', label: 'App or extension', icon: <Package className="h-3.5 w-3.5" /> },
 ];
 
 function ScopeTabList({

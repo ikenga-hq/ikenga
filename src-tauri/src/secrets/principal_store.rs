@@ -460,21 +460,111 @@ fn ensure_private_dir(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn parse_envelope(body: &[u8]) -> Result<Envelope, StoreError> {
+    if body.len() as u64 > MAX_ENVELOPE_BYTES {
+        return Err(StoreError::unavailable(format!(
+            "secret envelope is larger than {MAX_ENVELOPE_BYTES} bytes"
+        )));
+    }
+    let envelope: Envelope = serde_json::from_slice(body)
+        .map_err(|e| StoreError::invalid(format!("invalid envelope JSON: {e}")))?;
+    if envelope.version != STORE_VERSION || envelope.alg != ALG {
+        return Err(StoreError::invalid(format!(
+            "unsupported envelope (version {}, alg {:?})",
+            envelope.version, envelope.alg
+        )));
+    }
+    Ok(envelope)
+}
+
 fn read_envelope(path: &Path) -> Result<Option<Envelope>, StoreError> {
     let Some(body) = read_bounded(path, MAX_ENVELOPE_BYTES, "secret envelope")? else {
         return Ok(None);
     };
-    let envelope: Envelope = serde_json::from_slice(&body)
-        .map_err(|e| StoreError::invalid(format!("{}: {e}", path.display())))?;
-    if envelope.version != STORE_VERSION || envelope.alg != ALG {
-        return Err(StoreError::invalid(format!(
-            "{}: unsupported envelope (version {}, alg {:?})",
-            path.display(),
-            envelope.version,
-            envelope.alg
-        )));
+    parse_envelope(&body)
+        .map_err(|e| StoreError::invalid(format!("{}: {e}", path.display())))
+        .map(Some)
+}
+
+/// Helper for root-safe rewrapping: given the raw JSON bytes of `envelope.json`,
+/// decrypt the DEK under `current` and re-wrap it under `next`.
+pub fn rewrap_envelope_bytes(
+    body: &[u8],
+    current: &WrapKey,
+    next: &WrapKey,
+) -> Result<Vec<u8>, StoreError> {
+    if current.principal != next.principal {
+        return Err(StoreError::invalid(
+            "a rewrap keeps the store's principal; the two keys name different principals",
+        ));
     }
-    Ok(Some(envelope))
+    let envelope = parse_envelope(body)?;
+    let dek = current.unwrap(&envelope)?;
+    let new_envelope = Envelope {
+        version: STORE_VERSION,
+        alg: ALG.to_string(),
+        principal: next.principal.clone(),
+        wrapped_dek: next.wrap(&dek)?,
+    };
+    let mut out = serde_json::to_vec_pretty(&new_envelope)
+        .map_err(|e| StoreError::uncommitted(format!("serialize envelope: {e}")))?;
+    out.push(b'\n');
+    Ok(out)
+}
+
+/// Helper to unwrap the DEK from raw envelope bytes.
+pub fn unwrap_envelope_bytes(
+    body: &[u8],
+    key: &WrapKey,
+) -> Result<Zeroizing<[u8; crypto::DEK_LEN]>, StoreError> {
+    let envelope = parse_envelope(body)?;
+    key.unwrap(&envelope)
+}
+
+/// Verify that an envelope unwraps with `key`, and that every secret in `values_body`
+/// (if present) decrypts cleanly with the resulting DEK.
+pub fn verify_envelope_and_values(
+    envelope_body: &[u8],
+    values_body: Option<&[u8]>,
+    key: &WrapKey,
+) -> Result<(), StoreError> {
+    let dek = unwrap_envelope_bytes(envelope_body, key)?;
+    if let Some(body) = values_body {
+        if body.len() as u64 > MAX_VALUES_BYTES {
+            return Err(StoreError::unavailable(format!(
+                "secret values file is larger than {MAX_VALUES_BYTES} bytes"
+            )));
+        }
+        let values: Values = serde_json::from_slice(body)
+            .map_err(|e| StoreError::invalid(format!("invalid values json: {e}")))?;
+        if values.version != STORE_VERSION {
+            return Err(StoreError::invalid(format!(
+                "unsupported values version {}",
+                values.version
+            )));
+        }
+        if values.principal != key.principal {
+            return Err(StoreError::invalid(format!(
+                "values belong to principal {}, not {}",
+                values.principal, key.principal
+            )));
+        }
+        for (name, sealed) in &values.entries {
+            let undecryptable = || {
+                StoreError::invalid(format!(
+                    "secret {name:?} could not be decrypted under verified DEK"
+                ))
+            };
+            let bytes = STANDARD
+                .decode(sealed.as_bytes())
+                .map_err(|_| undecryptable())?;
+            let aad = format!("{VALUE_AAD_PREFIX}{}\0{name}", key.principal).into_bytes();
+            let plain = crypto::decrypt_value(&dek, &bytes, &aad)
+                .map_err(|_| undecryptable())?;
+            String::from_utf8(plain.to_vec()).map_err(|_| undecryptable())?;
+        }
+    }
+    Ok(())
 }
 
 fn write_envelope(path: &Path, key: &WrapKey, dek: &[u8; DEK_LEN]) -> Result<(), StoreError> {
@@ -1070,5 +1160,39 @@ mod tests {
         drop(store);
         let reopened = PrincipalStore::open(tmp.path(), &key(&KEK, ADA)).unwrap();
         assert_eq!(reopened.get("AFTER").unwrap().as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn rewrap_and_verify_helpers_work() {
+        let tmp = data_dir();
+        let old = key(&KEK, ADA);
+        let new = key(&[42u8; KEY_LEN], ADA);
+        let store = PrincipalStore::open(tmp.path(), &old).unwrap();
+        store.set("SECRET1", "val1").unwrap();
+        store.set("SECRET2", "val2").unwrap();
+        drop(store);
+
+        let env_path = tmp.path().join("secrets/envelope.json");
+        let val_path = tmp.path().join("secrets/values.json");
+        let env_bytes = fs::read(&env_path).unwrap();
+        let val_bytes = fs::read(&val_path).unwrap();
+
+        // Verifying with old key succeeds
+        assert!(verify_envelope_and_values(&env_bytes, Some(&val_bytes), &old).is_ok());
+        // Verifying with new key before rewrap fails
+        assert!(verify_envelope_and_values(&env_bytes, Some(&val_bytes), &new).is_err());
+
+        // Rewrap envelope
+        let new_env_bytes = rewrap_envelope_bytes(&env_bytes, &old, &new).unwrap();
+
+        // Verifying with new key succeeds
+        assert!(verify_envelope_and_values(&new_env_bytes, Some(&val_bytes), &new).is_ok());
+        // Verifying with old key now fails
+        assert!(verify_envelope_and_values(&new_env_bytes, Some(&val_bytes), &old).is_err());
+
+        // Unwrapping DEK yields identical DEK
+        let dek_old = unwrap_envelope_bytes(&env_bytes, &old).unwrap();
+        let dek_new = unwrap_envelope_bytes(&new_env_bytes, &new).unwrap();
+        assert_eq!(*dek_old, *dek_new);
     }
 }

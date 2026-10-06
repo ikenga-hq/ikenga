@@ -14,7 +14,7 @@
 // menu).
 
 import { spawnWindow, windowJoinSurface, windowRemoveSurface } from '@/lib/tauri-cmd';
-import { isTauri } from '@/lib/transport';
+import { isRemoteWebSession, isTauri } from '@/lib/transport';
 import { clearPendingSurface, markSurfaceDetached, syncDetachedSurfaces } from './detached-surfaces';
 import { MAKE_TARGET_TOPIC, type MakeTargetRequest, PENDING_WINDOW_LABEL } from './surfaces-topic';
 
@@ -43,6 +43,21 @@ export function forgetWindowTwoLabel(label: string): void {
 	windowTwoLabels.delete(label);
 }
 
+/**
+ * Whether *Pop out* can work here. Detached windows are a native-shell
+ * concept: a browser session has no second window to join, and the daemon
+ * serves neither `window_join_surface` nor `window_list` (gap audit rank 16).
+ * Callers hide or disable their Pop out control when this is false; a browser
+ * user opens another tab instead. Not `isTauri()`: jsdom harnesses are
+ * neither, and keep the desktop path.
+ */
+export function canPopOut(): boolean {
+	return !isRemoteWebSession();
+}
+
+/** Why Pop out is unavailable here (shown as a disabled row's title). */
+export const POP_OUT_DESKTOP_ONLY = 'Desktop app only — open another browser tab instead';
+
 /** A fresh detached-window label. Must start `detached-`: that is the
  *  capability glob (`capabilities/window-detached.json`). */
 export function newDetachedLabel(kind = 'terminal'): string {
@@ -61,6 +76,10 @@ export async function popOutSurface(
 	surfaceId: string,
 	opts: { projectId: string | null; kind?: string }
 ): Promise<PopOutResult> {
+	// Defensive: every caller hides the control in a browser session, but a
+	// stray call must not mark the surface detached and leave the pane on a
+	// placeholder.
+	if (!canPopOut()) throw new Error(POP_OUT_DESKTOP_ONLY);
 	markSurfaceDetached(surfaceId, PENDING_WINDOW_LABEL);
 	try {
 		const joined = await windowJoinSurface(surfaceId, opts.projectId);

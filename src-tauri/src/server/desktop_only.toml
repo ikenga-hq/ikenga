@@ -85,18 +85,6 @@ reason = "Reply half of the same bg_spike_* debug harness; resolves a pending no
 tag = "desktop-only-forever"
 reason = "Phase 0.5 debug harness pinging the primary native webview window via eval round-trips; explicit 'debug spikes like bg_spike_*' example."
 
-[chi_cancel]
-tag = "WP-18b"
-reason = "Kills the chi engine child (child.start_kill()) and/or the detached chi-runner process group by pid — controls the chi_run spawns (both executor-routed since WP-18b); rpc.rs arm still pending."
-
-[chi_resume]
-tag = "WP-18b"
-reason = "resume_chi_run re-spawns the engine child through the same executor-routed path as chi_run (build_engine_command SpawnSpec -> executor::current().spawn_piped); rpc.rs arm still pending."
-
-[chi_run]
-tag = "WP-18b"
-reason = "spawn_chi_run spawns the in-process engine child via executor::current().spawn_piped (build_engine_command -> SpawnSpec), or for persistent runs a detached chi-runner (PipedOpts::detached); executor-routed since WP-18b part b, rpc.rs arm still pending."
-
 [claude_assets_discover]
 tag = "WP-19"
 reason = "discovery::discover reads the live pkg kernel's installed set (app.state::<KernelState>()) for tiers 2 and 4; the daemon runs no kernel (its --pkgs-dir PkgIndex is a read-only view, not an install record), so it could only answer tiers 1 and 3 — a partial tree that would read as complete. Not served in slice 5b."
@@ -111,7 +99,7 @@ reason = "Registers FsWatchManager watchers that emit `claude-config:changed` on
 
 [comment_route]
 tag = "WP-18b"
-reason = "RouteSink::Chi calls spawn_chi_run, which spawns the in-process engine child (or a detached chi-runner for persistent runs) through executor::current(); executor-routed since WP-18b part b, rpc.rs arm still pending."
+reason = "RouteSink::Chi calls commands::chi::spawn_chi_run with the desktop's managed ChiCache/ChiRuntime/AppHandle; the chi core itself is daemon-served since WP-P10 (shared::chi_exec), but comment_route's sink resolution and its other sinks are still desktop-state-bound, so no rpc.rs arm yet."
 
 [db_export_ndjson]
 tag = "WP-19"
@@ -120,14 +108,6 @@ reason = "dest_dir is unconfined (Path::new(&dest_dir), no allowlist or data-dir
 [db_import_ndjson]
 tag = "WP-19"
 reason = "src_dir is unconfined (no allowlist check), and import_ndjson_from_dir interpolates each file's filename-derived stem into SQL as the table name (INSERT OR REPLACE INTO \"{table}\" ...) with no check against the real schema, so a crafted filename can break out of the quoted identifier. No FE caller (test-only). Needs containment + a table allowlist first."
-
-[detect_agent]
-tag = "WP-18b"
-reason = "agents::detect_by_id runs the same probe_version spawn as detect_agents for one agent id; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[detect_agents]
-tag = "WP-18b"
-reason = "agents::detect_all -> probe_version runs each detected CLI's --version; executor-routed since WP-18b part b, rpc.rs arm still pending."
 
 [detect_system]
 tag = "WP-19"
@@ -153,10 +133,6 @@ reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the opera
 [fs_roots_reset]
 tag = "WP-20"
 reason = "On the daemon the fs allowlist (<data-dir>/fs_roots.json) is the operator's boundary on the token holder — the one every served fs_* / project / actions arm checks, and the only one when an executor tier isolates the PTYs. Serving the mutation would let a remote caller redefine it (add '/'), and FsRoots::add/remove update the live set before persisting (non-atomic; concurrent persists share one .tmp). Needs the owner-vs-operator authority decided under G-PRINCIPAL; add/remove/reset stay together (remove alone would be a one-way lockout)."
-
-[fs_trash]
-tag = "desktop-only-forever"
-reason = "trash::delete moves the file into the OS trash (freedesktop: $XDG_DATA_HOME/Trash of the daemon's home, or a .Trash-$uid at the mount top) — outside the fs allowlist, with no daemon verb to list or restore it and no trash UI on a headless host, so over RPC it is a delete that leaves a copy outside the boundary. Not served, and never downgraded to a hard delete."
 
 [fs_unwatch]
 tag = "desktop-only-forever"
@@ -279,10 +255,6 @@ reason = "update_core re-fetches via fetch_and_adopt/npx_skills_add_all — same
 tag = "desktop-only-forever"
 reason = "#[cfg(feature=\"desktop\")], registers OS-global keyboard shortcuts against the native `main` WebviewWindow (global shortcuts)."
 
-[pkg_activity_bar_set_badge]
-tag = "WP-19"
-reason = "Mutates in-memory ActivityBarRegistry badge state + emits an event; data-only, no native UI or spawn."
-
 [pkg_content_url]
 tag = "WP-19"
 reason = "server.mint(&pkg_id) allocates a token/URL on the desktop pkg_content server; the daemon mounts via pkg_content_html."
@@ -315,6 +287,10 @@ reason = "kernel.purge_all_broken bulk-deletes broken records/orphans via SQL an
 tag = "WP-19"
 reason = "kernel.health_scan is documented read-only, scans pkg_installed rows for broken/orphaned records; no spawn."
 
+[pkg_install_cancel]
+tag = "WP-18b"
+reason = "Sets the cancel flag of an in-flight pkg_install_from_registry, which the daemon does not serve yet; it is served together with that command."
+
 [pkg_install_from_path]
 tag = "WP-18b"
 reason = "materialize_npm_deps (npm/bun spawn) then kernel.install_from_path, whose SidecarSupervisor spawns long-lived MCP children."
@@ -326,10 +302,6 @@ reason = "Downloads/untars then calls materialize_npm_deps + kernel.install_from
 [pkg_invoke]
 tag = "WP-18b"
 reason = "Plan §j spawn-site table: pkg_invoke runs a manifest-declared one-shot CLI; executor-routed since WP-18b part b, rpc.rs arm still pending."
-
-[pkg_is_trusted_for_elevated]
-tag = "WP-19"
-reason = "Calls pkg::trust::resolve_elevated_trust (db + manifest read); plan §k names trust.rs as Tauri-only logic pending WP-19, not multi-user."
 
 [pkg_mcp_call]
 tag = "WP-18b"
@@ -382,10 +354,6 @@ reason = "Resolves the pkg via kernel.installed_summary() and reloads its instal
 [pkg_trust_list]
 tag = "WP-19"
 reason = "Walks kernel.list_installed() and evaluates each pkg against its trust row + app_data_dir; the daemon has no kernel install registry, so it would answer an empty list that reads as \"nothing needs trust\"."
-
-[pkg_trust_list_pending]
-tag = "WP-19"
-reason = "Walks kernel.list_installed() + cap_snapshot rows for capability diffs parked for review; the daemon has no kernel install registry or install-time trust gate, so there is nothing to park. Every FE call site catches the error."
 
 [pkg_trust_preview]
 tag = "WP-19"
@@ -493,7 +461,7 @@ reason = "Read-only engine install-state info for the create form."
 
 [seats_fill]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run, the same executor-routed chi spawn path as chi_run; rpc.rs arm still pending."
+reason = "Calls call_engine(EngineCall::Start) which invokes chi.rs's spawn_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
 
 [seats_get]
 tag = "WP-19"
@@ -529,7 +497,7 @@ reason = "Routing decision only; doc comment 'Never resumes or starts anything',
 
 [seats_resume]
 tag = "WP-18b"
-reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run, the same executor-routed engine spawn path as chi_resume; rpc.rs arm still pending."
+reason = "Calls call_engine(EngineCall::ResumeRun) which invokes chi.rs's resume_chi_run; the chi core is daemon-served since WP-P10 (shared::chi_exec), but the seat store (iyke::seats) is AppHandle-bound, so no rpc.rs arm yet."
 
 [session_cancel]
 tag = "WP-19"

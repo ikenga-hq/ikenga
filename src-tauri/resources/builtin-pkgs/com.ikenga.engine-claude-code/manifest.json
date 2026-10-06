@@ -31,7 +31,7 @@
         "key": "model",
         "type": "string",
         "label": "Default model",
-        "default": "claude-sonnet-4-6"
+        "default": "claude-sonnet-5-5"
       }
     ]
   },

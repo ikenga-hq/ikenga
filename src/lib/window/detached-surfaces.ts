@@ -33,7 +33,7 @@
 
 import { WINDOW_TOPICS } from '@ikenga/contract';
 import { listen } from '@/lib/transport';
-import { isTauri } from '@/lib/transport';
+import { isRemoteWebSession, isTauri } from '@/lib/transport';
 import { create } from 'zustand';
 
 import { listWindows, windowRemoveSurface } from '@/lib/tauri-cmd';
@@ -154,6 +154,10 @@ export function clearPendingReclaimNudge(surfaceId: string): void {
  * registry list.
  */
 export async function syncDetachedSurfaces(): Promise<void> {
+	// No detached windows exist in a browser session and the daemon does not
+	// serve `window_list`; a re-sync there only logged "refresh failed"
+	// (gap audit rank 16).
+	if (isRemoteWebSession()) return;
 	try {
 		const windows = await listWindows();
 		const map: Record<string, string> = {};

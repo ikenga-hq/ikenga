@@ -58,7 +58,7 @@ function EnginesPage() {
 					className="text-2xl font-semibold tracking-tight"
 					style={{ fontFamily: 'var(--font-display)' }}
 				>
-					Chi & engines
+					Engines
 				</h2>
 				<p className="max-w-prose text-sm leading-relaxed text-muted-foreground">
 					Which engine drives terminal sessions, which shells they run in, and whether terminals
@@ -93,6 +93,8 @@ function EngineSectionBody() {
 	const {
 		data: detected,
 		isLoading,
+		isError,
+		error,
 		refetch,
 	} = useQuery<DetectedAgent[]>({
 		queryKey: ['settings', 'agent', 'detect'],
@@ -123,6 +125,26 @@ function EngineSectionBody() {
 					Re-scan
 				</Button>
 			</header>
+			{isError && (
+				<div className="border-b border-[var(--border-soft)] px-4 py-3">
+					<Banner
+						tone="danger"
+						icon={<AlertTriangle />}
+						role="alert"
+						className="rounded-md border"
+						actions={
+							<Button variant="ghost" size="sm" onClick={() => refetch()}>
+								Retry
+							</Button>
+						}
+					>
+						<div className="text-[13px] font-semibold">Engine detection failed</div>
+						<div className="mt-1 text-xs" style={{ color: 'var(--fg-muted)' }}>
+							{error instanceof Error ? error.message : String(error ?? 'Could not check installed engines')}
+						</div>
+					</Banner>
+				</div>
+			)}
 			<div className="divide-y divide-border">
 				<SettingsFieldRow
 					field="engines.defaultEngineId"

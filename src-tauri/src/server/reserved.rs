@@ -146,7 +146,28 @@ impl Snapshot {
         }
         self.files.iter().any(|f| is_file_or_staging(path, f))
     }
+
+    /// Why moving or deleting `path` (canonical) *as a whole* would take the
+    /// daemon's state with it: `path` is a strict ancestor of the data dir or
+    /// of the discovery file. [`Self::reason`] only refuses paths at or under
+    /// them, which is right for a read or a write but not for a subtree
+    /// operation (`fs_trash`) — an allowlist that covers the data dir
+    /// (`["~"]`, say) would otherwise let a caller trash its ancestor.
+    pub(crate) fn holds_reason(&self, path: &Path) -> Option<&'static str> {
+        if let Some(dd) = &self.data_dir {
+            if dd.path.starts_with(path) {
+                return Some(HOLDS_DATA_DIR);
+            }
+        }
+        if self.files.iter().any(|f| f.starts_with(path)) {
+            return Some(HOLDS_DISCOVERY_FILE);
+        }
+        None
+    }
 }
+
+pub(crate) const HOLDS_DATA_DIR: &str = "path holds the daemon's data directory";
+pub(crate) const HOLDS_DISCOVERY_FILE: &str = "path holds the daemon's discovery file";
 
 /// Why an absolute `path` that could not be canonicalized (its parent is
 /// missing) would be reserved once it existed: its nearest existing ancestor
@@ -422,14 +443,14 @@ mod router_tests {
     }
 
     /// Refused as the daemon's data dir by every path arm that errors, and
-    /// folded into `"missing"` by `fs_kind` (the desktop's contract).
+    /// folded into `"missing"` by `fs_kind` and `false` by `fs_exists` (the
+    /// desktop's contract).
     async fn refused_everywhere(r: &Router, path: &str) {
         for (cmd, args) in [
             ("fs_read", json!({ "path": path })),
             ("fs_write", json!({ "path": path, "content": "pwned" })),
             ("fs_mkdir", json!({ "path": path })),
             ("fs_list", json!({ "path": path })),
-            ("fs_exists", json!({ "path": path })),
             ("fs_mime", json!({ "path": path })),
             ("fs_rename", json!({ "from": path, "toName": "moved" })),
         ] {
@@ -437,6 +458,7 @@ mod router_tests {
             assert!(e.contains(INSIDE_DATA_DIR), "{cmd} {path}: {e}");
         }
         assert_eq!(ok(r, "fs_kind", json!({ "path": path })).await, "missing");
+        assert_eq!(ok(r, "fs_exists", json!({ "path": path })).await, false);
     }
 
     /// The data dir holds exactly what the fixture put there, unchanged.
@@ -480,7 +502,9 @@ mod router_tests {
         let d = daemon();
         let r = &d.router;
         let sib = s(&d.root.join("sibling.txt"));
-        assert_eq!(ok(r, "fs_read", json!({ "path": sib })).await, "hello");
+        // The desktop's FileReadResult: the bytes of "hello", and a MIME.
+        let read = ok(r, "fs_read", json!({ "path": sib })).await;
+        assert_eq!(read["bytes"], json!([104, 101, 108, 108, 111]));
         assert_eq!(ok(r, "fs_exists", json!({ "path": sib })).await, true);
         assert_eq!(ok(r, "fs_kind", json!({ "path": sib })).await, "file");
         assert_eq!(ok(r, "fs_mime", json!({ "path": sib })).await, "text/plain");
@@ -713,7 +737,6 @@ mod router_tests {
         let file = s(&dir.join(&name));
         for (cmd, args) in [
             ("fs_read", json!({ "path": file })),
-            ("fs_exists", json!({ "path": file })),
             ("fs_mime", json!({ "path": file })),
         ] {
             let e = err(&router, cmd, args).await;
@@ -722,6 +745,11 @@ mod router_tests {
         assert_eq!(
             ok(&router, "fs_kind", json!({ "path": file })).await,
             "missing"
+        );
+        // Whether or not a daemon has written it, refused reads as absent.
+        assert_eq!(
+            ok(&router, "fs_exists", json!({ "path": file })).await,
+            false
         );
         // Its staging sibling (`discovery::write_private`) too.
         let staging = s(&dir.join(format!(".{name}.0123abcd.tmp")));

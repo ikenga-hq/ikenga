@@ -19,18 +19,23 @@ import { isT1Session } from '@/lib/transport/t1-session';
 import { AccountBlock } from './account';
 import { AppLockBlock } from './app-lock-settings';
 import { startAppLockSync, useAppLockStore } from './app-lock-store';
+import { D05_FOCUS } from './focus';
 import { Kv, PeopleBlock, PeopleHeader, PeopleRow } from './frame';
 
 export function ProfileTab() {
 	return (
 		<div
 			data-state={isT1Session() ? 'profile-account' : 'profile'}
-			className="mx-auto w-full max-w-[720px] space-y-4 px-6 py-6"
+			className={`${D05_FOCUS} mx-auto w-full max-w-[960px] space-y-4 px-6 py-6`}
 		>
 			<PeopleHeader tab="profile" />
-			<LocalProfileBlock />
-			{isT1Session() && <AccountBlock />}
-			<AppLockBlock />
+			{/* D-05 draws the profile blocks narrower than the tables, under
+			    the same header as every other tab (it doesn't move). */}
+			<div className="max-w-[720px] space-y-4">
+				<LocalProfileBlock />
+				{isT1Session() && <AccountBlock />}
+				<AppLockBlock />
+			</div>
 		</div>
 	);
 }
@@ -104,7 +109,7 @@ function LocalProfileBlock() {
 								}
 							}}
 							placeholder={osUser ?? 'Your name'}
-							className="h-7 w-[240px] max-w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
+							className="h-7 w-[240px] max-w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--bg-sunken)] px-2 text-[length:var(--text-caption,12px)] text-[var(--fg)] outline-none focus:border-[var(--primary)]"
 						/>
 					</PeopleRow>
 					<PeopleRow

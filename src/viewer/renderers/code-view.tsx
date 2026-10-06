@@ -2,12 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Loader2 } from 'lucide-react';
 import { useTheme } from '@/lib/theme';
 import { fsRead } from '@/lib/tauri-cmd';
+import { EditableTextFrame } from '../editing/editable-text-frame';
 import { detectLang } from '../lib/lang';
 
 interface CodeViewProps {
 	path: string;
 	line?: number;
 	col?: number;
+	/** Show the Edit toggle (plans/file-editing). Defaults false so thumbnails,
+	 *  history and grid embeds stay read-only. */
+	editable?: boolean;
+	/** The pane this view lives in — scopes its editing session. */
+	paneId?: string;
 }
 
 // Shiki is heavy — load lazily on first mount and cache the highlighter
@@ -20,13 +26,83 @@ function loadShiki() {
 	return highlighterPromise;
 }
 
-export function CodeView({ path, line, col }: CodeViewProps) {
+export function CodeView({ path, line, col, editable = false, paneId }: CodeViewProps) {
+	if (editable) {
+		return (
+			<EditableTextFrame
+				path={path}
+				paneId={paneId}
+				line={line}
+				col={col}
+				renderView={(text) => <CodeBody path={path} text={text} line={line} col={col} />}
+			/>
+		);
+	}
+	return <CodeReadOnly path={path} line={line} col={col} />;
+}
+
+/** Read-only loader — the thumbnail / history / grid path. */
+function CodeReadOnly({ path, line, col }: { path: string; line?: number; col?: number }) {
+	const [state, setState] = useState<
+		{ kind: 'loading' } | { kind: 'ready'; text: string } | { kind: 'error'; message: string }
+	>({ kind: 'loading' });
+
+	useEffect(() => {
+		let cancelled = false;
+		setState({ kind: 'loading' });
+		fsRead(path)
+			.then((res) => {
+				if (cancelled) return;
+				const text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
+				setState({ kind: 'ready', text });
+			})
+			.catch((err) => {
+				if (cancelled) return;
+				setState({ kind: 'error', message: err instanceof Error ? err.message : String(err) });
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [path]);
+
+	if (state.kind === 'loading') return <CodeLoading />;
+	if (state.kind === 'error') {
+		return (
+			<div className="flex h-full items-start justify-center p-6 text-xs text-destructive">
+				<AlertCircle className="mr-2 mt-0.5 h-4 w-4 shrink-0" />
+				<span className="break-all">{state.message}</span>
+			</div>
+		);
+	}
+	return <CodeBody path={path} text={state.text} line={line} col={col} />;
+}
+
+function CodeLoading() {
+	return (
+		<div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+			<Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading…
+		</div>
+	);
+}
+
+/** Shiki-highlighted, read-only rendering of `text` (language from `path`). */
+export function CodeBody({
+	path,
+	text,
+	line,
+	col,
+}: {
+	path: string;
+	text: string;
+	line?: number;
+	col?: number;
+}) {
 	const { resolvedTheme } = useTheme();
 	const isDark = resolvedTheme === 'dark';
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const [state, setState] = useState<
 		| { kind: 'loading' }
-		| { kind: 'ready'; html: string; raw: string; lang: string }
+		| { kind: 'ready'; html: string; lang: string }
 		| { kind: 'error'; message: string }
 	>({ kind: 'loading' });
 
@@ -36,9 +112,6 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 
 		(async () => {
 			try {
-				const res = await fsRead(path);
-				if (cancelled) return;
-				const text = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes));
 				const lang = detectLang(path);
 				const shiki = await loadShiki();
 				const html = await shiki.codeToHtml(text, {
@@ -46,7 +119,7 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 					theme: isDark ? 'github-dark' : 'github-light',
 				});
 				if (cancelled) return;
-				setState({ kind: 'ready', html, raw: text, lang });
+				setState({ kind: 'ready', html, lang });
 			} catch (err) {
 				if (cancelled) return;
 				setState({
@@ -59,7 +132,7 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 		return () => {
 			cancelled = true;
 		};
-	}, [path, isDark]);
+	}, [path, text, isDark]);
 
 	useEffect(() => {
 		if (state.kind !== 'ready' || !line || !containerRef.current) return;
@@ -134,17 +207,11 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 		}
 	}, [state.kind, line, col, isDark]);
 
-	if (state.kind === 'loading') {
-		return (
-			<div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-				<Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading…
-			</div>
-		);
-	}
+	if (state.kind === 'loading') return <CodeLoading />;
 	if (state.kind === 'error') {
 		// Shiki throws if the language grammar is missing. Fall back to a plain
 		// <pre> render so the user still sees the file.
-		return <FallbackPre path={path} message={state.message} line={line} col={col} />;
+		return <FallbackPre text={text} message={state.message} line={line} />;
 	}
 	return (
 		<div
@@ -157,40 +224,25 @@ export function CodeView({ path, line, col }: CodeViewProps) {
 	);
 }
 
-function FallbackPre({
-	path,
-	message,
-	line,
-	col: _col,
-}: { path: string; message: string; line?: number; col?: number }) {
-	const [text, setText] = useState<string | null>(null);
+function FallbackPre({ text, message, line }: { text: string; message: string; line?: number }) {
 	const preRef = useRef<HTMLPreElement | null>(null);
-	useEffect(() => {
-		let cancelled = false;
-		fsRead(path)
-			.then((res) => {
-				if (cancelled) return;
-				setText(new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(res.bytes)));
-			})
-			.catch(() => {});
-		return () => {
-			cancelled = true;
-		};
-	}, [path]);
 
 	useEffect(() => {
 		if (!line || !preRef.current) return;
 		const approxLineHeight = 18;
 		preRef.current.scrollTop = Math.max(0, (line - 5) * approxLineHeight);
-	}, [line, text]);
+	}, [line]);
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex shrink-0 items-center gap-2 border-b border-border bg-amber-500/10 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">
 				<AlertCircle className="h-3.5 w-3.5" />
 				<span>Highlighter failed: {message}. Showing raw text.</span>
 			</div>
-			<pre className="m-0 flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-foreground">
-				{text ?? ''}
+			<pre
+				ref={preRef}
+				className="m-0 flex-1 overflow-auto px-4 py-3 font-mono text-xs leading-relaxed text-foreground"
+			>
+				{text}
 			</pre>
 		</div>
 	);

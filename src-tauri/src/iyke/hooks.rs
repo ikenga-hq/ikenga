@@ -344,28 +344,27 @@ pub async fn post_hook_event(
     // pending. Spawned, as above.
     let event = payload.hook_event_name.as_deref().unwrap_or("");
     let finishes_tool = crate::notifications::producers::finishes_terminal_tool(event);
-    let resolve_keys = if finishes_tool
-        || crate::notifications::producers::ends_terminal_permissions(event)
-    {
-        let keys = crate::notifications::producers::terminal_permission_keys(
-            payload.ikenga_terminal_id.as_deref(),
-            payload.session_id.as_deref(),
-        );
-        match terminal_prompts().lock() {
-            Ok(mut prompts) if finishes_tool => prompts.tool_finished(
-                &keys,
-                payload.tool_use_id.as_deref(),
-                payload.tool_name.as_deref(),
-                payload.tool_input.as_ref(),
-            ),
-            Ok(mut prompts) => prompts.ended(&keys),
-            // Poisoned: only an end event may still resolve, blindly.
-            Err(_) if !finishes_tool => keys,
-            Err(_) => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+    let resolve_keys =
+        if finishes_tool || crate::notifications::producers::ends_terminal_permissions(event) {
+            let keys = crate::notifications::producers::terminal_permission_keys(
+                payload.ikenga_terminal_id.as_deref(),
+                payload.session_id.as_deref(),
+            );
+            match terminal_prompts().lock() {
+                Ok(mut prompts) if finishes_tool => prompts.tool_finished(
+                    &keys,
+                    payload.tool_use_id.as_deref(),
+                    payload.tool_name.as_deref(),
+                    payload.tool_input.as_ref(),
+                ),
+                Ok(mut prompts) => prompts.ended(&keys),
+                // Poisoned: only an end event may still resolve, blindly.
+                Err(_) if !finishes_tool => keys,
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
     if !resolve_keys.is_empty() {
         if let Some(db) = app_db(&app) {
             tauri::async_runtime::spawn(async move {
@@ -424,31 +423,55 @@ pub async fn post_hook_decision(
             ),
         };
     }
-    // No row to decide through (the record is slow or failed): still never
-    // answer past the routing preference (§5.1; review WP75-R10). This path
+    // No row to decide through (the record is slow or failed, or routing
+    // never installed — no `PaDb`): still never answer past the routing
+    // preference (§5.1; reviews WP75-R10, WP75-RV1). The host's routing is
+    // read from the AppHandle either way, so this fails closed. This path
     // writes no `decided_*` and no audit — there is no row to attribute.
-    use crate::server::shared::notifications::routing;
-    if let Some(local) = routing::local() {
-        let refused = match local.host.host_routing().await {
-            Ok(r) if r.routing_ok => None,
-            Ok(_) => Some(routing::Refusal::RoutingRefused.to_error()),
-            Err(e) => Some(e),
-        };
-        if let Some(e) = refused {
-            return (
-                e.code.status(),
-                Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
-            );
-        }
+    let host = crate::notifications::host_side(&app);
+    match answer_without_row(&host, || resolve_held(&app, &decision.request_id, approved)).await {
+        Ok(was_gated) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "recorded": true,
+                "gated": was_gated,
+            })),
+        ),
+        Err(e) => (
+            e.code.status(),
+            Json(serde_json::json!({ "recorded": false, "error": e.to_string() })),
+        ),
     }
-    let was_gated = resolve_held(&app, &decision.request_id, approved);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "recorded": true,
-            "gated": was_gated,
-        })),
-    )
+}
+
+/// The no-row fallback (review WP75-RV1): reads the host's routing from
+/// `host` — never from the installed runtime (`routing::local()`), which is
+/// absent without a `PaDb` — and answers the hold through `answer` only
+/// when it admits this device. `Ok(gated)`, or the refusal.
+async fn answer_without_row(
+    host: &dyn crate::server::shared::notifications::routing::HostSide,
+    answer: impl FnOnce() -> bool,
+) -> Result<bool, crate::access::AccessError> {
+    if let Some(e) = no_row_refusal(host.host_routing().await) {
+        return Err(e);
+    }
+    Ok(answer())
+}
+
+/// Whether the no-row fallback must refuse: the host may not answer its
+/// own asks (§5.1), or who may could not be read (fail closed).
+fn no_row_refusal(
+    routing: Result<
+        crate::server::shared::notifications::routing::HostRouting,
+        crate::access::AccessError,
+    >,
+) -> Option<crate::access::AccessError> {
+    use crate::server::shared::notifications::routing::Refusal;
+    match routing {
+        Ok(r) if r.routing_ok => None,
+        Ok(_) => Some(Refusal::RoutingRefused.to_error()),
+        Err(e) => Some(e),
+    }
 }
 
 /// The open `permission` row of a still-held gate, waiting up to ~0.5 s for
@@ -527,6 +550,84 @@ mod tests {
             payload.tool_input.as_ref().unwrap()["file_path"],
             "src/main.rs"
         );
+    }
+
+    /// Review WP75-RV1: the no-row fallback answers the hold only when the
+    /// host's routing admits it; a routed-away or unreadable preference is
+    /// refused (`routing_refused`, 403), never answered.
+    #[test]
+    fn the_no_row_fallback_fails_closed() {
+        use crate::access::{AccessError, Code};
+        use crate::server::shared::notifications::routing::HostRouting;
+        let admit = HostRouting {
+            routing_ok: true,
+            ..Default::default()
+        };
+        assert!(no_row_refusal(Ok(admit)).is_none());
+        let away = no_row_refusal(Ok(HostRouting::default())).unwrap();
+        assert_eq!(away.code, Code::RoutingRefused);
+        assert_eq!(away.code.status(), StatusCode::FORBIDDEN);
+        let unread = AccessError::new(Code::RoutingRefused, "couldn't read who may answer asks");
+        assert_eq!(
+            no_row_refusal(Err(unread)).unwrap().code,
+            Code::RoutingRefused
+        );
+    }
+
+    /// Review WP78a-R4: the no-row branch itself, with no routing runtime
+    /// installed (`routing::local()` is None — no `PaDb`): a routed-away or
+    /// unreadable host refuses and never touches the hold; an admitted one
+    /// answers it.
+    #[tokio::test]
+    async fn the_no_row_branch_refuses_without_a_routing_runtime() {
+        use crate::access::{AccessError, Code};
+        use crate::server::shared::notifications::routing::{self, HostRouting, HostSide};
+        use futures_util::future::BoxFuture;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Fake(Result<HostRouting, AccessError>);
+        impl HostSide for Fake {
+            fn host_routing(&self) -> BoxFuture<'_, Result<HostRouting, AccessError>> {
+                let r = self.0.clone();
+                Box::pin(async move { r })
+            }
+            fn audit_local(
+                &self,
+                _kind: &'static str,
+                _target: String,
+                _detail: serde_json::Value,
+            ) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        assert!(
+            routing::local().is_none(),
+            "no routing runtime in unit tests"
+        );
+        let touched = AtomicBool::new(false);
+        let answer = || {
+            touched.store(true, Ordering::SeqCst);
+            true
+        };
+        let away = Fake(Ok(HostRouting::default()));
+        let e = answer_without_row(&away, answer).await.unwrap_err();
+        assert_eq!(e.code, Code::RoutingRefused);
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "a refused hold is not answered"
+        );
+
+        let unread = Fake(Err(AccessError::new(Code::RoutingRefused, "unreadable")));
+        assert!(answer_without_row(&unread, answer).await.is_err());
+        assert!(!touched.load(Ordering::SeqCst));
+
+        let admit = Fake(Ok(HostRouting {
+            routing_ok: true,
+            ..Default::default()
+        }));
+        assert!(answer_without_row(&admit, answer).await.unwrap());
+        assert!(touched.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -14,8 +14,8 @@ import {
 } from './rail-gloss';
 
 const TERMS: RailGlossTerm[] = [
-	{ term: 'ngwa', text: 'Ngwa — your equipment', keyLabel: 'Ctrl+3', anchor: 'ngwa' },
-	{ term: 'chi', text: 'Chi — your engine session', keyLabel: 'Ctrl+2', anchor: 'chi' },
+	{ term: 'ngwa', text: 'Ngwa — your store', keyLabel: 'Ctrl+3', anchor: 'ngwa' },
+	{ term: 'chi', text: 'Chi — your agent companion', keyLabel: 'Ctrl+2', anchor: 'chi' },
 ];
 
 function Rail() {
@@ -51,7 +51,7 @@ describe('RailGloss', () => {
 	it('shows the first unseen term, pointing at its key, then expires after 4 s', () => {
 		render(<Rail />);
 		expect(gloss()?.dataset.glossTerm).toBe('ngwa');
-		expect(gloss()?.textContent).toBe('Ngwa — your equipmentCtrl+3');
+		expect(gloss()?.textContent).toBe('Ngwa — your storeCtrl+3');
 		expect(gloss()?.style.visibility).not.toBe('hidden');
 		const ngwaKey = document.querySelector('[data-rail-item="ngwa"]')!;
 		expect(ngwaKey.getAttribute('aria-describedby')).toBe('rail-gloss');
