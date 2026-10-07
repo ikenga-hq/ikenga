@@ -47,3 +47,17 @@ export function engineFacts(
 		version: live?.version ?? payload?.version,
 	};
 }
+
+/** D-18: the one "WSL unavailable — <reason>" notice a list of agents shows
+ *  above its rows, taking the reason from the first affected agent; null when
+ *  every agent was checked. Rows then carry only a short "WSL unavailable"
+ *  chip, so the reason appears once instead of on every row. */
+export function firstAgentUnavailableText(
+	agents: ReadonlyArray<Pick<DetectedAgent, 'unavailable'> | null | undefined>
+): string | null {
+	for (const agent of agents) {
+		const text = agentUnavailableText(agent);
+		if (text) return text;
+	}
+	return null;
+}

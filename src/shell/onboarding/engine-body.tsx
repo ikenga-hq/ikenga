@@ -27,6 +27,8 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { StatusChip } from '@/components/ui/status-chip';
 import { cn } from '@/components/ui/utils';
+import { WslUnavailableChip, WslUnavailableNotice } from '@/components/wsl-unavailable-notice';
+import { firstAgentUnavailableText } from '@/lib/agent-unavailable';
 import {
 	fetchIndex,
 	fetchPkgDetail,
@@ -286,6 +288,13 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 		(id) => results[id]?.status === 'unknown' || results[id]?.status === 'unavailable'
 	);
 	const allMissing = computeAllMissing(results);
+	// D-18: one notice above the grid for every engine WSL couldn't check;
+	// the cards themselves carry only a short chip.
+	const wslNotice = firstAgentUnavailableText(
+		SUPPORTED_ENGINE_IDS.map((id) =>
+			results[id]?.status === 'unavailable' ? results[id]?.agent : null
+		)
+	);
 
 	const offlineButtonLabel = (long: boolean) => {
 		if (offlineMut.isPending) return 'Installing offline engine…';
@@ -320,6 +329,18 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 					Re-scan
 				</Button>
 			</div>
+
+			{wslNotice && (
+				<WslUnavailableNotice
+					text={wslNotice}
+					className="mb-4"
+					actions={
+						<Button variant="ghost" size="sm" onClick={() => refresh()}>
+							Re-check
+						</Button>
+					}
+				/>
+			)}
 
 			{/* ── Engine grid (always 7 cards; status reveals per-engine) ── */}
 			<div className="grid gap-4 md:grid-cols-2" data-testid="agents-grid">
@@ -559,62 +580,59 @@ export function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: Engi
 				{entry.status === 'detected' && <AuthPill authed={entry.agent?.authed ?? null} />}
 			</div>
 
-			<div
-				className="mt-3 border-t border-dashed pt-3 text-xs"
-				style={{ borderColor: 'var(--border-soft)' }}
-			>
-				{entry.status === 'pending' ? (
-					<SkeletonRow />
-				) : entry.status === 'detected' && entry.agent ? (
-					<div className="flex gap-3">
-						<span className="w-20 flex-none" style={{ color: 'var(--fg-faint)' }}>
-							Binary
-						</span>
-						<span className="truncate font-mono text-[11.5px]" title={entry.agent.executable_path}>
-							{entry.agent.executable_path}
-						</span>
-					</div>
-				) : entry.status === 'unavailable' ? (
-					<div className="flex items-center justify-between gap-2">
-						<span
-							className="truncate text-[11.5px]"
-							style={{ color: 'var(--warning)' }}
-							title={entry.error}
-							data-testid="agent-unavailable"
-						>
-							Couldn&apos;t check: {entry.error ?? 'WSL unavailable'}
-						</span>
-					</div>
-				) : entry.status === 'unknown' ? (
-					<div className="flex items-center justify-between gap-2">
-						<span
-							className="truncate text-[11.5px]"
-							style={{ color: 'var(--danger, #ef4444)' }}
-							title={entry.error}
-							data-testid="agent-probe-error"
-						>
-							{entry.error ? `Error: ${entry.error}` : "Couldn't check engine status"}
-						</span>
-					</div>
-				) : (
-					<div className="flex items-center justify-between gap-2">
-						<span style={{ color: 'var(--fg-faint)' }}>
-							Not on $PATH. Try: <span className="font-mono text-[11.5px]">{meta.binaryHint}</span>
-						</span>
-						<button
-							type="button"
-							onClick={(e) => {
-								e.stopPropagation();
-								onOpenDocs();
-							}}
-							className="text-[11.5px] underline-offset-2 hover:underline"
-							style={{ color: 'var(--primary)' }}
-						>
-							Docs →
-						</button>
-					</div>
-				)}
-			</div>
+			{/* D-18: an unchecked card shows only its chip — the WSL reason is in
+			    the one notice above the grid. */}
+			{entry.status !== 'unavailable' && (
+				<div
+					className="mt-3 border-t border-dashed pt-3 text-xs"
+					style={{ borderColor: 'var(--border-soft)' }}
+				>
+					{entry.status === 'pending' ? (
+						<SkeletonRow />
+					) : entry.status === 'detected' && entry.agent ? (
+						<div className="flex gap-3">
+							<span className="w-20 flex-none" style={{ color: 'var(--fg-faint)' }}>
+								Binary
+							</span>
+							<span
+								className="truncate font-mono text-[11.5px]"
+								title={entry.agent.executable_path}
+							>
+								{entry.agent.executable_path}
+							</span>
+						</div>
+					) : entry.status === 'unknown' ? (
+						<div className="flex items-center justify-between gap-2">
+							<span
+								className="truncate text-[11.5px]"
+								style={{ color: 'var(--danger, #ef4444)' }}
+								title={entry.error}
+								data-testid="agent-probe-error"
+							>
+								{entry.error ? `Error: ${entry.error}` : "Couldn't check engine status"}
+							</span>
+						</div>
+					) : (
+						<div className="flex items-center justify-between gap-2">
+							<span style={{ color: 'var(--fg-faint)' }}>
+								Not on $PATH. Try:{' '}
+								<span className="font-mono text-[11.5px]">{meta.binaryHint}</span>
+							</span>
+							<button
+								type="button"
+								onClick={(e) => {
+									e.stopPropagation();
+									onOpenDocs();
+								}}
+								className="text-[11.5px] underline-offset-2 hover:underline"
+								style={{ color: 'var(--primary)' }}
+							>
+								Docs →
+							</button>
+						</div>
+					)}
+				</div>
+			)}
 			{entry.status === 'missing' && meta.installCmd && (
 				<div
 					className="mt-2 font-mono text-[11px]"
@@ -664,10 +682,8 @@ function StatusPill({ entry }: { entry: AgentDetectEntry }) {
 	}
 	if (entry.status === 'unavailable') {
 		return (
-			<span data-testid="status-pill" data-status="unavailable" title={entry.error}>
-				<StatusChip tone="warn" dot>
-					WSL unavailable
-				</StatusChip>
+			<span data-testid="status-pill" data-status="unavailable">
+				<WslUnavailableChip title={entry.error} />
 			</span>
 		);
 	}

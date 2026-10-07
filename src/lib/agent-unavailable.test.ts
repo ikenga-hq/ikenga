@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { DetectedAgent } from '@/lib/tauri-cmd';
 
-import { agentUnavailableText, engineFacts } from './agent-unavailable';
+import { agentUnavailableText, engineFacts, firstAgentUnavailableText } from './agent-unavailable';
 
 function live(over: Partial<DetectedAgent> = {}): DetectedAgent {
 	return {
@@ -69,5 +69,24 @@ describe('engineFacts (D-10)', () => {
 			execPath: undefined,
 			version: null,
 		});
+	});
+});
+
+describe('firstAgentUnavailableText (D-18)', () => {
+	it('is null when every agent was checked', () => {
+		expect(firstAgentUnavailableText([])).toBeNull();
+		expect(
+			firstAgentUnavailableText([live(), null, undefined, live({ unavailable: null })])
+		).toBeNull();
+	});
+
+	it('takes the reason from the first affected agent', () => {
+		expect(
+			firstAgentUnavailableText([
+				live(),
+				live({ unavailable: { kind: 'wsl', reason: 'E_FAIL' } }),
+				live({ unavailable: { kind: 'wsl', reason: 'timed out' } }),
+			])
+		).toBe('WSL unavailable — E_FAIL');
 	});
 });
