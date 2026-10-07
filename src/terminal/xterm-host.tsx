@@ -3,13 +3,16 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { type ITheme, Terminal } from '@xterm/xterm';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
 import { isWindows } from '@/lib/platform';
 import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notify';
-import { readClipboardText, writeClipboardText } from '@/lib/transport/shims';
+import { copyText } from '@/lib/clipboard';
+import { readClipboardText } from '@/lib/transport/shims';
+import { handleOsc52, handleTerminalCopyKey, openTerminalUrl } from './clipboard-actions';
+import { useDismissMenu } from './use-dismiss-menu';
 import { menuPasteBlockedHint, pasteKeyIsNative } from './paste-policy';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
@@ -643,7 +646,7 @@ export function XTermHost({
 				linkHandler: {
 					activate: (_e: MouseEvent, text: string) => {
 						if (/^[a-z]+:\/\//i.test(text) && !text.startsWith('file://')) {
-							window.open(text, '_blank');
+							openTerminalUrl(text);
 							return;
 						}
 						let filePath = text;
@@ -720,15 +723,7 @@ export function XTermHost({
 			// clipboard. Read queries (`?`) are ignored: letting a PTY program
 			// read the clipboard is an exfiltration vector.
 			term.parser.registerOscHandler(52, (data) => {
-				const sep = data.indexOf(';');
-				const payload = sep === -1 ? data : data.slice(sep + 1);
-				if (!payload || payload === '?') return true;
-				try {
-					const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
-					writeClipboardText(new TextDecoder().decode(bytes)).catch(() => {});
-				} catch {
-					/* ignore malformed OSC 52 */
-				}
+				handleOsc52(data);
 				return true;
 			});
 
@@ -890,14 +885,8 @@ export function XTermHost({
 			// hook — their owner — fires them.
 			const action = evaluateTerminalKey(e, { mac });
 			if (action === 'copy') {
-				const sel = term.getSelection();
-				if (sel) {
-					writeClipboardText(sel).catch(() => {});
-					return false;
-				}
-				// On Mac with Cmd+C, if no selection, fall through to PTY (SIGINT).
-				if (mac) return true;
-				return false;
+				// On Mac with Cmd+C and no selection, falls through to the PTY (SIGINT).
+				return handleTerminalCopyKey(e, { selection: term.getSelection(), mac });
 			}
 
 			// Paste goes through the Tauri clipboard plugin, not
@@ -930,7 +919,7 @@ export function XTermHost({
 			// Widget-local PTY conventions, not registry commands: they depend on
 			// the selection and on what the PTY would otherwise receive.
 			if (!mac && eventMatchesCombo(e, 'ctrl+c', false) && term.hasSelection()) {
-				writeClipboardText(term.getSelection()).catch(() => {});
+				void copyText(term.getSelection());
 				term.clearSelection();
 				return false;
 			}
@@ -1229,21 +1218,8 @@ export function XTermHost({
 	// Shown when a browser refuses a menu-driven clipboard read.
 	const [pasteHint, setPasteHint] = useState<string | null>(null);
 
-	useEffect(() => {
-		if (!contextMenu) return;
-		const close = () => setContextMenu(null);
-		const onKey = (e: KeyboardEvent) => {
-			if (e.key === 'Escape') setContextMenu(null);
-		};
-		window.addEventListener('click', close);
-		window.addEventListener('contextmenu', close);
-		window.addEventListener('keydown', onKey);
-		return () => {
-			window.removeEventListener('click', close);
-			window.removeEventListener('contextmenu', close);
-			window.removeEventListener('keydown', onKey);
-		};
-	}, [contextMenu]);
+	const closeContextMenu = useCallback(() => setContextMenu(null), []);
+	useDismissMenu(contextMenu !== null, closeContextMenu);
 
 	const handleContextMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
@@ -1304,7 +1280,7 @@ export function XTermHost({
 						disabled={!termRef.current?.hasSelection()}
 						onClick={() => {
 							const sel = termRef.current?.getSelection();
-							if (sel) writeClipboardText(sel).catch(() => {});
+							if (sel) void copyText(sel);
 							setContextMenu(null);
 						}}
 						style={{

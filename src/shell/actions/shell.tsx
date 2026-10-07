@@ -28,6 +28,7 @@ import { KeysSurface } from './keys';
 import { ImportSurface } from './import';
 import '@/shell/ngwa/ngwa.css';
 import './actions.css';
+import { copyText } from '@/lib/clipboard';
 
 function iykeCommandFor(tab: ActionsTabId, scope: ActionsScope): string {
 	switch (tab) {
@@ -74,11 +75,7 @@ export function ActionsShell({ tab }: ActionsShellProps) {
 	const iykeCommand = iykeCommandFor(tab, scope);
 
 	async function copyIyke() {
-		try {
-			await navigator.clipboard.writeText(`iyke ${iykeCommand}`);
-		} catch {
-			// clipboard access denied — nothing further to do
-		}
+		await copyText(`iyke ${iykeCommand}`);
 	}
 
 	function onNavigate(target: ActionsTabId, opts?: { action?: string }) {
