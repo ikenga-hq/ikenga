@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 
 import { BackupSectionBody } from './-components/backup-body';
 import { ClearDataSectionBody } from './-components/clear-data';
+import { FsAllowlistSectionBody } from './-components/fs-allowlist';
 import { ScreenshotDirSectionBody } from './-components/screenshot-dir';
 
 function StoragePage() {
@@ -26,11 +27,12 @@ function StoragePage() {
 			<section className="overflow-hidden rounded-lg border border-[var(--border-soft)] bg-card">
 				<header className="border-b border-[var(--border-soft)] bg-[var(--bg-sunken)] px-4 py-2.5">
 					<h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-						File roots
+						Folders you can open
 					</h3>
 				</header>
-				<div className="px-4 py-3 text-xs leading-relaxed text-muted-foreground">
-					Extra file roots moved to{' '}
+				<FsAllowlistSectionBody />
+				<div className="border-t border-[var(--border-soft)] px-4 py-3 text-xs leading-relaxed text-muted-foreground">
+					A project's extra roots live in{' '}
 					<Link to="/settings/projects" className="text-primary underline-offset-2 hover:underline">
 						Projects
 					</Link>

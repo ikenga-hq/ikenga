@@ -415,24 +415,30 @@ function remoteFsSocket(): ReturnType<typeof getFsSocketClient> | null {
 // ─── FS allowlist (user-configurable) ────────────────────────────────────────
 //
 // The allowlist is owned by Rust (`src-tauri/src/fs_roots.rs`, persisted to
-// `app_data_dir/fs_roots.json`). Every mutation returns the canonical list so
+// `<data-dir>/fs_roots.json`). Every mutation returns the canonical list so
 // the frontend can sync from the response rather than maintaining a parallel
-// store. Default roots: `~/royalti-co`, `~/.claude/projects`, `~/.company`.
+// store. Empty by default; on a multi-user (T1) server each person's list
+// starts with their home folder. `principal` (a username or principal id)
+// names someone else's list — an admin's call on a T1 server only
+// (`server::broker::fs_roots_admin`); the desktop has one list.
 
-export async function fsRootsList(): Promise<string[]> {
-	return invoke('fs_roots_list');
+const withPrincipal = (args: Record<string, unknown>, principal?: string) =>
+	principal ? { ...args, principal } : args;
+
+export async function fsRootsList(principal?: string): Promise<string[]> {
+	return invoke('fs_roots_list', withPrincipal({}, principal));
 }
 
-export async function fsRootsAdd(path: string): Promise<string[]> {
-	return invoke('fs_roots_add', { path });
+export async function fsRootsAdd(path: string, principal?: string): Promise<string[]> {
+	return invoke('fs_roots_add', withPrincipal({ path }, principal));
 }
 
-export async function fsRootsRemove(path: string): Promise<string[]> {
-	return invoke('fs_roots_remove', { path });
+export async function fsRootsRemove(path: string, principal?: string): Promise<string[]> {
+	return invoke('fs_roots_remove', withPrincipal({ path }, principal));
 }
 
-export async function fsRootsReset(): Promise<string[]> {
-	return invoke('fs_roots_reset');
+export async function fsRootsReset(principal?: string): Promise<string[]> {
+	return invoke('fs_roots_reset', withPrincipal({}, principal));
 }
 
 /** OS-level username fallback (`$USER`/`%USERNAME%`, or `"unknown"`). Used

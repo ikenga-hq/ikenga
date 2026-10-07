@@ -9,6 +9,7 @@ use tracing::debug;
 use super::rpc_claude;
 use super::rpc_exec;
 use super::rpc_files;
+use super::rpc_fs_roots;
 use super::rpc_local;
 use super::rpc_shell;
 use super::AppState;
@@ -295,12 +296,14 @@ pub async fn rpc_handler(
                 Err(e) => RpcResponse::error(e),
             }
         }
-        "fs_roots_list" => {
-            let roots = crate::fs_roots::current()
-                .map(|r| r.list_inputs())
-                .unwrap_or_default();
-            RpcResponse::success(roots)
-        }
+        // The caller's own folder list (gap audit 2026-10-06 rank 1): under
+        // T1 this child's principal's, seeded with its home; on T0 the one
+        // owner's. Validation, scoping and the admin route in
+        // `server::rpc_fs_roots`.
+        "fs_roots_list" => rpc_fs_roots::fs_roots_list(&state, &payload.args),
+        "fs_roots_add" => rpc_fs_roots::fs_roots_add(&state, &payload.args),
+        "fs_roots_remove" => rpc_fs_roots::fs_roots_remove(&state, &payload.args),
+        "fs_roots_reset" => rpc_fs_roots::fs_roots_reset(&state, &payload.args),
         // The browser has no `@tauri-apps/api/path`, so `homeDir()` resolves
         // here. Without it the shim silently returns the literal string "~",
         // which then gets joined into paths and handed to `fs_read` — a
@@ -729,8 +732,7 @@ pub async fn rpc_handler(
         // root is inside it. No `actions://changed` is emitted (no event
         // channel). Writes never touch the trust record, which lives in
         // `--data-dir`. Left allowlisted: `fs_trash` (OS trash outside the
-        // allowlist), `fs_roots_*` (would let the token holder redefine the
-        // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
+        // allowlist), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
         "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
         "fs_write" => rpc_files::fs_write(&state, &payload.args).await,
