@@ -1,5 +1,24 @@
 # ikenga-desktop
 
+## 0.21.2
+
+### Patch Changes
+
+- 1daa56e: Browser sessions now get five things that were desktop-only: the title-row git branch chip and the Explorer's git-status badges (`pkg_sidecar_call`), project and personal shell actions (`action_exec`), pin routing to a terminal, Chi or the clipboard (`comment_route`), the schedule table's "Run now" (`agent_ops_run_now`), and pkg settings edits (`pkg_settings_set`). On a multi-user server each of these runs as the signed-in person and stays inside their own files. A sidecar runs only from its own pkg's folder. An action or pin runs only in a folder the server's allowlist covers. "Run now" fires only your own jobs, through your own agent-ops daemon. Settings writes go to your own database, and only for keys the pkg declares. Enabling, uninstalling or restarting a pkg is still desktop-only, because the server has no pkg kernel.
+- 2aacb83: Remote daemon: serve Ngwa (`ngwa_snapshot`, `pkg_health_scan`, `pkg_trust_list`). What the daemon cannot evaluate — trust, pkg runtime, usage, install records — reads "Not available on this server" instead of empty or healthy. The Store no longer blames the registry for a snapshot failure, and the Create tab's hardcoded "live" label is gone.
+- aff7984: Chi seats now work in a browser connected to `ikenga-server`. The seat rail no longer shows a permanent error, and you can create, rename, clear, remove, hold and release seats. Dispatching to a seat resumes or fills it with a headless Chi run on the server, and a text queued behind a running turn is sent when that turn ends.
+  
+  Under multi-user (T1) servers, each person sees and changes only their own seats. Things the server can't do are labelled as such rather than failing silently:
+  
+  - Terminal sessions can't be seated on a server. A seat there runs headless Chi runs instead.
+  - `openrouter` seats need the desktop app.
+  - An engine missing from the server reads "not installed on this server".
+  
+  The seat roster also refreshes after your own changes without needing live events.
+- e8ff6fd: Browser sessions on a headless server stop offering or claiming what the server cannot do. Native-webview pkgs and the webview "Clear session" control, "Open in browser" / "Copy viewer URL", and the Backup export/restore controls are hidden or read "Not available on this server yet"; HTML, audio and video panes say "Preview not available in the browser yet" instead of a broken localhost frame; package install and update buttons (Store, update sheet, banners, onboarding) are disabled before the click, and the onboarding Done step now counts only installs that actually succeeded and lists the ones that did not (the offline-engine failure names its real cause instead of blaming the registry). The statusline HUD says telemetry isn't available in the browser, Claude-config queries refetch on window focus in place of live watcher events, and "Run now" (Automations), the webview "Clear session" action and the pin composer surface their failures instead of swallowing them.
+- e7e8e9e: Browser sessions: the address bar follows the focused pane (in-pane links included), deep links open in the focused pane on load, and a restored terminal no longer steals focus from a deep-linked route.
+- 6ba9aa7: Browser sessions can now open folders. On a multi-user (T1) server each person's folder list starts with their home folder: new accounts get it on first sign-in, and existing accounts with an empty list get it too, while a list someone emptied on purpose stays empty. People can add, remove and reset their own folders under Settings → Storage → "Folders you can open", and admins can change anyone's list by username. A single-user (T0) server keeps an empty list until the owner adds a folder, which now also works from the browser. The folder picker no longer falls back to the server's working directory or saves `.` as a project. With no folders it offers "Add a folder", or tells people who to ask when they can't add one themselves.
+
 ## 0.21.1
 
 ### Patch Changes
