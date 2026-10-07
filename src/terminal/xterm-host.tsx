@@ -3,7 +3,7 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { type ITheme, Terminal } from '@xterm/xterm';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { OS_FILE_DROP_EVENT, type OsFileDropDetail } from '@/lib/dnd/os-file-drop';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { fileUrlToPath, resolvePath } from '@/lib/paths/file-paths';
@@ -12,6 +12,7 @@ import { createOscObserver, fireOscNotification } from '@/lib/terminal/osc-notif
 import { copyText } from '@/lib/clipboard';
 import { readClipboardText } from '@/lib/transport/shims';
 import { handleOsc52, handleTerminalCopyKey, openTerminalUrl } from './clipboard-actions';
+import { useDismissMenu } from './use-dismiss-menu';
 import { menuPasteBlockedHint, pasteKeyIsNative } from './paste-policy';
 import { FloatingToastChip } from '@/components/ui/floating-toast-chip';
 import { type KeyPeek, peekKeypress } from '@/lib/keymap/dispatcher';
@@ -1217,21 +1218,8 @@ export function XTermHost({
 	// Shown when a browser refuses a menu-driven clipboard read.
 	const [pasteHint, setPasteHint] = useState<string | null>(null);
 
-	useEffect(() => {
-		if (!contextMenu) return;
-		const close = () => setContextMenu(null);
-		const onKey = (e: KeyboardEvent) => {
-			if (e.key === 'Escape') setContextMenu(null);
-		};
-		window.addEventListener('click', close);
-		window.addEventListener('contextmenu', close);
-		window.addEventListener('keydown', onKey);
-		return () => {
-			window.removeEventListener('click', close);
-			window.removeEventListener('contextmenu', close);
-			window.removeEventListener('keydown', onKey);
-		};
-	}, [contextMenu]);
+	const closeContextMenu = useCallback(() => setContextMenu(null), []);
+	useDismissMenu(contextMenu !== null, closeContextMenu);
 
 	const handleContextMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
