@@ -16,34 +16,20 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
 use tauri::State;
-use tokio::io::AsyncWriteExt;
-use tokio::time::{timeout, Duration};
 
 use crate::commands::pkg::KernelState;
-use crate::executor::{PipedOpts, SpawnSpec, StdioMode};
+use crate::executor::SpawnSpec;
 use crate::pkg::registries::SidecarsRegistry;
+pub use crate::server::shared::sidecar_call::PkgSidecarCallResult;
 
 /// Tauri-state wrapper so commands can resolve sidecar paths without going
 /// through the kernel snapshot.
 pub struct SidecarsRegistryState(pub Arc<SidecarsRegistry>);
 
-#[derive(Serialize)]
-pub struct PkgSidecarCallResult {
-    pub ok: bool,
-    pub error: Option<String>,
-    pub stdout: Option<String>,
-    pub stderr: Option<String>,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-}
-
-/// Default timeout for one-shot sidecar invocations. Pollers/sends should
-/// finish in well under a minute; 120s gives slow networks headroom without
-/// letting a hung process pin a Tauri worker forever.
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
-
+/// The spawn, stdin, timeout and capture live in
+/// `server::shared::sidecar_call::run_one_shot`, which the daemon's
+/// `pkg_sidecar_call` arm calls too (gap audit 2026-10-06 rank 21).
 #[tauri::command]
 pub async fn pkg_sidecar_call(
     kernel: State<'_, KernelState>,
@@ -86,7 +72,7 @@ pub async fn pkg_sidecar_call(
         )));
     }
 
-    log::info!(
+    tracing::info!(
         "[pkg_sidecar_call] pkg={pkg_id} name={name} bin={} args={:?}",
         entry.bin_path.display(),
         args
@@ -102,90 +88,20 @@ pub async fn pkg_sidecar_call(
     // two `/iyke/pkg-db/*` routes, enforced against this pkg's own
     // `permissions["sqlite.tables"]`. See `pkg::db_scope`.
     crate::pkg::db_scope::inject_env(&mut cmd, &pkg_id, &install_path);
-    let opts = PipedOpts {
-        stdin: StdioMode::Piped,
-        stdout: StdioMode::Piped,
-        stderr: StdioMode::Piped,
-        kill_on_drop: true,
-        no_console_window: true,
-        detached: false,
-        new_process_group: false,
-    };
 
-    let mut child = match crate::executor::current().spawn_piped(cmd, opts) {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(err(format!("spawn `{}`: {e}", entry.bin_path.display())));
-        }
-    };
-
-    // Pipe stdin if provided, then drop the writer so the child sees EOF.
-    if let Some(payload) = stdin {
-        if let Some(mut stdin_handle) = child.stdin.take() {
-            if let Err(e) = stdin_handle.write_all(payload.as_bytes()).await {
-                // Best-effort: kill the child and return the write error.
-                let _ = child.start_kill();
-                return Ok(err(format!("write stdin: {e}")));
-            }
-            if let Err(e) = stdin_handle.shutdown().await {
-                log::warn!("[pkg_sidecar_call] stdin shutdown: {e}");
-            }
-        }
-    } else {
-        // Drop stdin handle immediately so the child sees EOF.
-        drop(child.stdin.take());
-    }
-
-    let dur = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-    let output = match timeout(dur, child.wait_with_output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            return Ok(err(format!("wait: {e}")));
-        }
-        Err(_) => {
-            return Ok(PkgSidecarCallResult {
-                ok: false,
-                error: Some(format!("sidecar timed out after {}s", dur.as_secs())),
-                stdout: None,
-                stderr: None,
-                exit_code: None,
-                timed_out: true,
-            });
-        }
-    };
-
-    let exit_code = output.status.code();
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    Ok(PkgSidecarCallResult {
-        ok: output.status.success(),
-        error: if output.status.success() {
-            None
-        } else {
-            Some(format!(
-                "exit code {}",
-                exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "<signal>".into())
-            ))
-        },
-        stdout: Some(stdout),
-        stderr: Some(stderr),
-        exit_code,
-        timed_out: false,
-    })
+    Ok(
+        crate::server::shared::sidecar_call::run_one_shot(
+            cmd,
+            &entry.bin_path,
+            stdin,
+            timeout_secs,
+        )
+        .await,
+    )
 }
 
 fn err(msg: String) -> PkgSidecarCallResult {
-    PkgSidecarCallResult {
-        ok: false,
-        error: Some(msg),
-        stdout: None,
-        stderr: None,
-        exit_code: None,
-        timed_out: false,
-    }
+    PkgSidecarCallResult::failed(msg)
 }
 
 #[cfg(test)]

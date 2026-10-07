@@ -79,6 +79,7 @@ pub struct T1Access {
 impl T1Access {
     pub fn new(store: AccessStore, pool: SqlitePool, options: AccessOptions) -> Arc<Self> {
         let pairing = super::pairing::Registry::new();
+        pairing.set_on_awaiting(crate::server::push::pairing_hook());
         super::pairing::spawn_sweeper(&pairing, store.clone());
         Arc::new(Self {
             store,

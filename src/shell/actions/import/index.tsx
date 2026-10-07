@@ -20,11 +20,12 @@
 // diff against the fresh model: rows already written now read `skip`
 // ("already bound"), and pressing Add again only ever touches what's left.
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Box, Download, TriangleAlert, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { open as openFileDialog } from '@/lib/transport/dialog-shim';
 import { fsRead } from '@/lib/tauri-cmd';
+import { isBrowserHost } from '@/lib/transport';
 import type { ActionsSurfaceProps } from '../types';
 import { buildPackageDiff, applyPackageImport, type PackageImportRow } from '@/lib/actions/import/package';
 import {
@@ -133,7 +134,38 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 		setTeamError(null);
 	}
 
+	// Browser sessions: the native dialog would browse the SERVER's disk, so the
+	// file is chosen with a hidden <input type=file> and read in the page.
+	const vsCodeFileInput = useRef<HTMLInputElement | null>(null);
+
+	async function readBrowserVSCodeFile(file: File) {
+		setVsCodeError(null);
+		setError(null);
+		setVsCodeLoading(true);
+		try {
+			if (file.size > MAX_IMPORT_FILE_BYTES) {
+				throw new Error(
+					`this file is ${(file.size / (1024 * 1024)).toFixed(1)} MiB — imports are capped at ${MAX_IMPORT_FILE_BYTES / (1024 * 1024)} MiB`
+				);
+			}
+			const rules = parseVSCodeKeybindingsText(await file.text());
+			setVsCodePath(file.name);
+			setVsCodeRawRules(rules);
+			setVsCodePasteMode(false);
+		} catch (err) {
+			setVsCodePath(null);
+			setVsCodeRawRules(null);
+			setVsCodeError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setVsCodeLoading(false);
+		}
+	}
+
 	async function pickVSCodeFile() {
+		if (isBrowserHost()) {
+			vsCodeFileInput.current?.click();
+			return;
+		}
 		setVsCodeError(null);
 		setError(null);
 		const picked = await openFileDialog({
@@ -295,6 +327,21 @@ export function ImportSurface({ scope, model, onNavigate }: ActionsSurfaceProps)
 							<Download className="h-3.5 w-3.5" />
 							Choose keybindings.json…
 						</Button>
+						{isBrowserHost() && (
+							<input
+								ref={vsCodeFileInput}
+								type="file"
+								accept=".json,application/json"
+								hidden
+								data-testid="vscode-file-input"
+								onChange={(e) => {
+									const file = e.target.files?.[0];
+									// Reset so choosing the same file again still fires `change`.
+									e.target.value = '';
+									if (file) void readBrowserVSCodeFile(file);
+								}}
+							/>
+						)}
 					</div>
 				);
 			}

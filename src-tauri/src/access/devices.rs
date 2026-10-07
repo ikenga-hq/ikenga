@@ -449,8 +449,24 @@ async fn expire_idle(
 }
 
 /// Revoke in place: `revoked_*`, hashes nulled, `grant_epoch` bumped. The
-/// row stays as a tombstone; its id is never reused (§3.10).
+/// row stays as a tombstone; its id is never reused (§3.10). The device's
+/// push subscriptions (plans/pwa S2) go in the same transaction: every
+/// revoke path — user, undelivered, idle expiry, forced logout — comes
+/// through here.
 async fn mark_revoked(
+    conn: &mut SqliteConnection,
+    device_id: &str,
+    by: Option<&str>,
+    reason: &str,
+) -> Result<u64, sqlx::Error> {
+    let n = mark_revoked_row(conn, device_id, by, reason).await?;
+    if n > 0 {
+        crate::server::push::store::delete_for_device(conn, device_id).await?;
+    }
+    Ok(n)
+}
+
+async fn mark_revoked_row(
     conn: &mut SqliteConnection,
     device_id: &str,
     by: Option<&str>,

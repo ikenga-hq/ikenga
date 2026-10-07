@@ -1801,3 +1801,37 @@ fn the_daemon_expands_only_tilde_in_a_run_cwd() {
     assert_eq!(desktop.cwd_expansion, CwdExpansion::Full);
     assert_eq!(desktop.run_cwd(Some("$HOME/proj")), format!("{home}/proj"));
 }
+
+fn tail_of(lines: &[&str]) -> StderrTail {
+    let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    StderrTail(Some(tokio::spawn(async move { lines })))
+}
+
+/// A failed run names an infrastructure cause found in the engine's stderr,
+/// and only the classified cause — never the raw stderr text.
+#[tokio::test]
+async fn failed_run_error_names_the_stderr_cause() {
+    let err = explain_failure(
+        Some("engine child exited without a done envelope"),
+        tail_of(&["prompt: secret stuff", "OAuth error: getaddrinfo EAI_AGAIN platform.claude.com"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        err,
+        "engine child exited without a done envelope — network unreachable from the engine (EAI_AGAIN)"
+    );
+    assert!(!err.contains("secret"));
+
+    // Nothing recognisable: the base error stands alone.
+    let err = explain_failure(Some("codex reported turn.failed"), tail_of(&["boom"])).await;
+    assert_eq!(err.as_deref(), Some("codex reported turn.failed"));
+
+    // A run that didn't fail gets no error at all.
+    assert_eq!(explain_failure(None, tail_of(&["EAI_AGAIN"])).await, None);
+    // No stderr pipe: base error.
+    assert_eq!(
+        explain_failure(Some("x"), StderrTail(None)).await.as_deref(),
+        Some("x")
+    );
+}

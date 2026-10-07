@@ -246,12 +246,32 @@ pub(crate) fn wsl_which(name: &str) -> Option<String> {
                 ..PROBE_OUTPUT_OPTS
             },
         )
+        .map_err(|e| tracing::warn!(target: "ikenga::agents", "wsl.exe spawn failed probing `{name}`: {e}"))
         .ok()?;
     if !output.status.success() {
+        // A miss and a WSL that couldn't start both land here; only the
+        // latter is worth a warning.
+        if let Some(class) =
+            super::failure_class::classify_output(&output.stdout, &output.stderr)
+        {
+            tracing::warn!(target: "ikenga::agents", "probing `{name}` in WSL: {}", class.describe());
+        }
         return None;
     }
-    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!path_str.is_empty() && path_str.starts_with('/')).then_some(path_str)
+    which_output_path(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The path `which` printed, from a login shell's stdout. Profile scripts
+/// (nvm, motd, conda) can print before it, so this is the last line that is
+/// an absolute path, not the first line.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn which_output_path(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/'))
+        .last()
+        .map(str::to_string)
 }
 
 /// Resolve `spec` against `search_path` (production passes the augmented
@@ -438,23 +458,29 @@ async fn probe_auth_with_hint(
         }
         AuthCheck::FilePresent { paths } => probe_auth_files(paths),
         AuthCheck::Any { checks } => {
-            // First successful inner check short-circuits.
+            // First successful inner check short-circuits. Without one, the
+            // verdict is "signed out" only if every inner check concluded so;
+            // an inner check that couldn't run (timeout, spawn failure, WSL or
+            // network down) leaves the whole answer unknown.
             let mut hints: Vec<String> = Vec::new();
+            let mut inconclusive = false;
             for inner in *checks {
                 let (val, hint) = Box::pin(probe_auth_with_hint(exec, inner)).await;
                 if val == Some(true) {
                     return (Some(true), None);
                 }
+                inconclusive |= val.is_none();
                 if let Some(h) = hint {
                     hints.push(h);
                 }
             }
+            let prefix = if inconclusive { "inconclusive" } else { "none of" };
             let hint = if hints.is_empty() {
                 None
             } else {
-                Some(format!("none of: {}", hints.join(" / ")))
+                Some(format!("{prefix}: {}", hints.join(" / ")))
             };
-            (Some(false), hint)
+            (if inconclusive { None } else { Some(false) }, hint)
         }
         AuthCheck::AcpHandshake { args, timeout_ms } => {
             probe_auth_acp_handshake(exec, args, *timeout_ms).await
@@ -654,143 +680,96 @@ async fn acp_handshake(exec: &std::path::Path, args: &[&str]) -> Result<bool, St
     Err("child closed stdout before responding to session/new".to_string())
 }
 
+/// The verdict of an `AuthCheck::Exec` probe that ran to completion. Exit 0
+/// is signed in. A non-zero exit is signed out *unless* the output names an
+/// infrastructure failure (WSL down, no network): `claude doctor` and friends
+/// fail for those too, and reading that as "signed out" both misleads and
+/// hides the engine from the Chi target picker.
+fn exec_verdict(out: &std::process::Output, what: &str) -> (Option<bool>, Option<String>) {
+    if out.status.success() {
+        return (Some(true), None);
+    }
+    if let Some(class) = super::failure_class::classify_output(&out.stdout, &out.stderr) {
+        return (None, Some(format!("couldn't check `{what}`: {}", class.describe())));
+    }
+    let code = out
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "?".into());
+    (Some(false), Some(format!("`{what}` exited {code}")))
+}
+
+/// Run an `AuthCheck::Exec` probe. Anything that stops the probe from running
+/// — the binary isn't where we looked, the spawn fails, it times out — is
+/// inconclusive (`None`), never "signed out".
 async fn probe_auth_exec(
     exec_fallback: &std::path::Path,
     cmd: &str,
     args: &[&str],
     timeout_ms: u64,
 ) -> (Option<bool>, Option<String>) {
-    #[cfg(windows)]
-    {
-        let exec_str = exec_fallback.to_string_lossy();
-        if let Some(rest) = exec_str.strip_prefix("wsl:") {
-            let bin_name = rest.split(':').next().unwrap_or(cmd);
-            let args_joined = args.join(" ");
-            let full_cmd = format!("{bin_name} {args_joined}");
-            let mut command = SpawnSpec::new("wsl.exe");
-            command.args(["bash", "-l", "-c", &full_cmd]);
-            let fut = probe_output(command);
-            match timeout(Duration::from_millis(timeout_ms), fut).await {
-                Ok(Ok(out)) => {
-                    if out.status.success() {
-                        (Some(true), None)
-                    } else {
-                        (
-                            Some(false),
-                            Some(format!(
-                                "auth probe `{cmd}` in WSL returned exit code {}",
-                                out.status.code().unwrap_or(-1)
-                            )),
-                        )
-                    }
-                }
-                Ok(Err(e)) => (
-                    None,
-                    Some(format!("failed to spawn auth probe `{cmd}` in WSL: {e}")),
-                ),
-                Err(_) => (
-                    None,
-                    Some(format!("auth probe `{cmd}` in WSL timed out after {timeout_ms}ms")),
-                ),
-            }
-        } else {
-            let target: PathBuf = if exec_fallback
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n == cmd || n == format!("{cmd}.cmd") || n == format!("{cmd}.exe") || n == format!("{cmd}.bat"))
-                .unwrap_or(false)
-            {
-                exec_fallback.to_path_buf()
-            } else {
-                match which::which_in(cmd, Some(crate::runtime::augmented_path()), ".") {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return (
-                            Some(false),
-                            Some(format!("auth probe binary `{cmd}` not on PATH")),
-                        );
-                    }
-                }
-            };
-            let mut command = create_agent_command(&target);
-            command.args(args);
-            command.env("PATH", crate::runtime::augmented_path());
-            let fut = probe_output(command);
-            match timeout(Duration::from_millis(timeout_ms), fut).await {
-                Ok(Ok(out)) => {
-                    if out.status.success() {
-                        (Some(true), None)
-                    } else {
-                        (
-                            Some(false),
-                            Some(format!(
-                                "`{cmd} {}` exited {}",
-                                args.join(" "),
-                                out.status
-                                    .code()
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "?".into())
-                            )),
-                        )
-                    }
-                }
-                Ok(Err(e)) => (Some(false), Some(format!("auth probe failed: {e}"))),
-                Err(_) => (
-                    None,
-                    Some(format!("auth probe `{cmd}` timed out after {timeout_ms}ms")),
-                ),
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let target: PathBuf = if exec_fallback
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n == cmd)
-            .unwrap_or(false)
+    let what = format!("{cmd} {}", args.join(" "));
+    let command = {
+        #[cfg(windows)]
         {
-            exec_fallback.to_path_buf()
-        } else {
-            match which::which_in(cmd, Some(crate::runtime::augmented_path()), ".") {
-                Ok(p) => p,
-                Err(_) => {
-                    return (
-                        Some(false),
-                        Some(format!("auth probe binary `{cmd}` not on PATH")),
-                    );
+            let exec_str = exec_fallback.to_string_lossy();
+            if let Some(rest) = exec_str.strip_prefix("wsl:") {
+                let bin_name = rest.split(':').next().unwrap_or(cmd);
+                let mut command = SpawnSpec::new("wsl.exe");
+                command.args(["bash", "-l", "-c", &format!("{bin_name} {}", args.join(" "))]);
+                command
+            } else {
+                match host_auth_command(exec_fallback, cmd, args) {
+                    Ok(c) => c,
+                    Err(hint) => return (None, Some(hint)),
                 }
             }
-        };
-        let mut command = create_agent_command(&target);
-        command.args(args);
-        command.env("PATH", crate::runtime::augmented_path());
-        let fut = probe_output(command);
-        match timeout(Duration::from_millis(timeout_ms), fut).await {
-            Ok(Ok(out)) => {
-                if out.status.success() {
-                    (Some(true), None)
-                } else {
-                    (
-                        Some(false),
-                        Some(format!(
-                            "`{cmd} {}` exited {}",
-                            args.join(" "),
-                            out.status
-                                .code()
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "?".into())
-                        )),
-                    )
-                }
-            }
-            Ok(Err(e)) => (Some(false), Some(format!("auth probe failed: {e}"))),
-            Err(_) => (
-                None,
-                Some(format!("auth probe `{cmd}` timed out after {timeout_ms}ms")),
-            ),
         }
+        #[cfg(not(windows))]
+        {
+            match host_auth_command(exec_fallback, cmd, args) {
+                Ok(c) => c,
+                Err(hint) => return (None, Some(hint)),
+            }
+        }
+    };
+    match timeout(Duration::from_millis(timeout_ms), probe_output(command)).await {
+        Ok(Ok(out)) => exec_verdict(&out, &what),
+        Ok(Err(e)) => (None, Some(format!("couldn't run `{what}`: {e}"))),
+        Err(_) => (None, Some(format!("`{what}` timed out after {timeout_ms}ms"))),
     }
+}
+
+/// The spec for a host-side (non-WSL) auth probe, or the hint when `cmd`
+/// can't be found.
+fn host_auth_command(
+    exec_fallback: &std::path::Path,
+    cmd: &str,
+    args: &[&str],
+) -> Result<SpawnSpec, String> {
+    let is_cmd = |n: &str| {
+        n == cmd
+            || (cfg!(windows)
+                && [".cmd", ".exe", ".bat"]
+                    .iter()
+                    .any(|ext| n == format!("{cmd}{ext}")))
+    };
+    let target: PathBuf = if exec_fallback
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(is_cmd)
+        .unwrap_or(false)
+    {
+        exec_fallback.to_path_buf()
+    } else {
+        which::which_in(cmd, Some(crate::runtime::augmented_path()), ".")
+            .map_err(|_| format!("auth probe binary `{cmd}` not on PATH"))?
+    };
+    let mut command = create_agent_command(&target);
+    command.args(args);
+    command.env("PATH", crate::runtime::augmented_path());
+    Ok(command)
 }
 
 fn probe_auth_files(paths: &[&str]) -> (Option<bool>, Option<String>) {
@@ -1017,5 +996,78 @@ mod tests {
         assert_eq!(probe_auth_with_hint(dummy, &check).await.0, Some(false));
 
         std::env::remove_var("IKENGA_FC_PRESENT");
+    }
+
+    /// An `Exec` probe whose binary can't be found never ran — the `Any`
+    /// wrapping it must say "unknown", not "signed out" (which also drops the
+    /// engine from the Chi target picker).
+    #[tokio::test]
+    async fn any_with_an_inconclusive_inner_check_is_unknown() {
+        std::env::remove_var("IKENGA_ANY_ABSENT");
+        let dummy = std::path::Path::new("/nonexistent-exec");
+        let check = AuthCheck::Any {
+            checks: &[
+                AuthCheck::EnvVar {
+                    name: "IKENGA_ANY_ABSENT",
+                },
+                AuthCheck::Exec {
+                    cmd: "ikenga-definitely-not-a-real-cli",
+                    args: &["doctor"],
+                    timeout_ms: 1000,
+                },
+            ],
+        };
+        let (val, hint) = probe_auth_with_hint(dummy, &check).await;
+        assert_eq!(val, None);
+        assert!(hint.unwrap().starts_with("inconclusive:"));
+
+        // All inner checks conclusive and negative: still a firm "no".
+        let check = AuthCheck::Any {
+            checks: &[AuthCheck::EnvVar {
+                name: "IKENGA_ANY_ABSENT",
+            }],
+        };
+        assert_eq!(probe_auth_with_hint(dummy, &check).await.0, Some(false));
+    }
+
+    fn output(code: i32, stderr: &str) -> std::process::Output {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        let status = std::process::ExitStatus::from_raw(code << 8);
+        #[cfg(windows)]
+        let status = std::process::ExitStatus::from_raw(code as u32);
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn exec_verdict_separates_infrastructure_from_signed_out() {
+        assert_eq!(exec_verdict(&output(0, ""), "claude doctor").0, Some(true));
+        let (val, hint) = exec_verdict(
+            &output(1, "OAuth error: getaddrinfo EAI_AGAIN platform.claude.com"),
+            "claude doctor",
+        );
+        assert_eq!(val, None);
+        assert!(hint.unwrap().contains("EAI_AGAIN"));
+        assert_eq!(
+            exec_verdict(&output(1, "Not logged in"), "claude doctor").0,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn which_output_path_skips_profile_banners() {
+        assert_eq!(
+            which_output_path("Now using node v22.3.0 (npm v10.8.1)\n/home/u/.nvm/versions/node/v22.3.0/bin/claude\n"),
+            Some("/home/u/.nvm/versions/node/v22.3.0/bin/claude".into())
+        );
+        assert_eq!(which_output_path("claude not found\n"), None);
+        assert_eq!(which_output_path(""), None);
     }
 }
