@@ -47,7 +47,6 @@ import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
 
 import { useOnboardingStep } from './use-onboarding-step';
-import { offlineInstallErrorMessage } from './offline-install-error';
 
 export interface EngineStepPayload {
 	agentId: string;
@@ -66,6 +65,8 @@ interface EngineBodyProps {
 const OFFLINE_AGENT_ID = 'engine-noop';
 const ENGINE_NOOP_NPM_NAME = '@ikenga/pkg-engine-noop';
 const ENGINE_NOOP_PKG_ID = 'com.ikenga.engine-noop';
+const REGISTRY_UNREACHABLE_MSG =
+	"Couldn't reach the registry — you can install the offline engine later from Ngwa → Store.";
 
 // Stable display order. The Rust side already knows about these ids in
 // `KNOWN_AGENTS`; the wizard surfaces them whether the binary is present
@@ -270,7 +271,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 			} else {
 				console.error('[onboarding] engine-noop install failed', e);
 			}
-			setOfflineError(offlineInstallErrorMessage(e));
+			setOfflineError(REGISTRY_UNREACHABLE_MSG);
 		},
 	});
 
