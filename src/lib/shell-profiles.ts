@@ -31,23 +31,33 @@ export function getFallbackProfile(): ShellProfile {
 	};
 }
 
+/**
+ * Parse the stored custom-profile list. `null` (never saved) is a confirmed
+ * empty list; anything unreadable throws, because the caller must not treat
+ * "couldn't read" as "there are none" — the next add/remove would overwrite
+ * the saved list with one that's missing every saved profile.
+ */
+export function parseCustomShellProfiles(raw: string | null): ShellProfile[] {
+	if (raw === null || raw === '') return [];
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		throw new Error(`saved custom shell profiles are not valid JSON (${String(err)})`);
+	}
+	if (!Array.isArray(parsed)) {
+		throw new Error('saved custom shell profiles are not a list');
+	}
+	return parsed as ShellProfile[];
+}
+
 export function useCustomShellProfiles() {
 	const queryClient = useQueryClient();
 
+	// A failed read surfaces as a query error — never as `[]`.
 	const customQuery = useQuery<ShellProfile[]>({
 		queryKey: ['settings', CUSTOM_SHELL_KEY],
-		queryFn: async () => {
-			try {
-				const raw = await settingsGet(CUSTOM_SHELL_KEY);
-				if (raw) {
-					const parsed = JSON.parse(raw) as ShellProfile[];
-					if (Array.isArray(parsed)) return parsed;
-				}
-			} catch {
-				/* swallow */
-			}
-			return [];
-		},
+		queryFn: async () => parseCustomShellProfiles(await settingsGet(CUSTOM_SHELL_KEY)),
 		staleTime: 60_000,
 	});
 
@@ -61,26 +71,35 @@ export function useCustomShellProfiles() {
 		},
 	});
 
-	const addCustomProfile = (profile: Omit<ShellProfile, 'id' | 'isDefault'>) => {
-		const existing = customQuery.data ?? [];
+	// Writes rewrite the whole list, so they are only safe once the current
+	// list has been read successfully. Until then add/remove refuse.
+	const canEdit = customQuery.isSuccess;
+
+	const addCustomProfile = (profile: Omit<ShellProfile, 'id' | 'isDefault'>): boolean => {
+		if (!customQuery.isSuccess) return false;
 		const newProfile: ShellProfile = {
 			...profile,
 			id: `custom-${Date.now()}`,
 			isDefault: false,
 		};
-		saveMutation.mutate([...existing, newProfile]);
+		saveMutation.mutate([...customQuery.data, newProfile]);
+		return true;
 	};
 
-	const removeCustomProfile = (id: string) => {
-		const existing = customQuery.data ?? [];
-		saveMutation.mutate(existing.filter((p) => p.id !== id));
+	const removeCustomProfile = (id: string): boolean => {
+		if (!customQuery.isSuccess) return false;
+		saveMutation.mutate(customQuery.data.filter((p) => p.id !== id));
+		return true;
 	};
 
 	return {
 		customProfiles: customQuery.data ?? [],
 		addCustomProfile,
 		removeCustomProfile,
+		canEdit,
 		isLoading: customQuery.isLoading,
+		error: customQuery.error,
+		refetch: customQuery.refetch,
 	};
 }
 
