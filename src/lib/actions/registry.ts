@@ -13,7 +13,7 @@
 // commands, WP-55's menu renderers) binds the id to behaviour. This catalog
 // only names them, so menus, the Actions tab and the Keys tab can list them.
 
-import { iconNames } from 'lucide-react/dynamic';
+import { isLucideIconName } from '@/lib/icons/lucide-icons';
 import { DEFAULT_KEYMAP } from '@/lib/keymap/defaults';
 import { isHostedCommand } from '@/lib/keymap/registry';
 import type { ActionRun, Placement, UserAction } from './types';
@@ -270,11 +270,9 @@ export function isBuiltinActionId(id: string): boolean {
 // ─── Icons (§1.2, W_UNKNOWN_ICON) ────────────────────────────────────────────
 
 export const DEFAULT_ACTION_ICON = 'zap';
-const KNOWN_ICONS: ReadonlySet<string> = new Set<string>(iconNames);
-
 /** Is `name` a Lucide icon name exactly as the file stores it (kebab-case)? */
 export function isKnownIconName(name: string): boolean {
-	return KNOWN_ICONS.has(name);
+	return isLucideIconName(name);
 }
 
 /** The icon a user action renders: its own when known, else `zap` (§1.2). */

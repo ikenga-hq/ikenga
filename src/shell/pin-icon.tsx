@@ -3,19 +3,19 @@
 // the fallback. If neither is set, falls back to a generic Folder/Pin
 // glyph the caller picks via `fallback`.
 //
-// Lucide icon names are kebab-case (the dynamic-icons loader's `iconNames`).
+// Lucide icon names are kebab-case (`LUCIDE_ICON_NAMES`; the glyphs themselves
+// arrive from one lazily-loaded chunk, see `lib/icons/lucide-icons.ts`).
 // Since WP-03 the rail no longer carries its own pkg icon whitelist
 // (`PKG_ICONS`): a package's rail presence is a pin seeded from its manifest
 // `ui.views[0].icon` (WP-22), and manifests spell those names either way
 // (`layout-dashboard`, `LayoutDashboard`, `Box`). So the name is normalized
-// to kebab-case and checked against `iconNames`; anything unknown renders
+// to kebab-case and checked against that list; anything unknown renders
 // the fallback instead of an empty button.
 
 import type { LucideIcon } from 'lucide-react';
-import { DynamicIcon, type IconName, iconNames } from 'lucide-react/dynamic';
-import { Suspense } from 'react';
-
-const KNOWN_ICONS: ReadonlySet<string> = new Set(iconNames);
+import type { IconName } from 'lucide-react/dynamic';
+import { isLucideIconName } from '@/lib/icons/lucide-icons';
+import { NamedLucideIcon } from '@/lib/icons/named-lucide-icon';
 
 /** `LayoutDashboard` / `layoutDashboard` / `layout_dashboard` / ` Box ` →
  *  kebab-case, or null when the result is not a lucide icon name. Exported
@@ -28,7 +28,7 @@ export function normalizeLucideName(name: string | null | undefined): IconName |
 		.replace(/([A-Z])([A-Z][a-z])/g, '$1-$2')
 		.replace(/[\s_]+/g, '-')
 		.toLowerCase();
-	return KNOWN_ICONS.has(kebab) ? (kebab as IconName) : null;
+	return isLucideIconName(kebab) ? (kebab as IconName) : null;
 }
 
 interface PinIconProps {
@@ -50,9 +50,11 @@ export function PinIcon({
 	const lucide = normalizeLucideName(iconLucide);
 	if (lucide) {
 		return (
-			<Suspense fallback={<Fallback className={`${sizeClass} ${className ?? ''}`} />}>
-				<DynamicIcon name={lucide} className={`${sizeClass} ${className ?? ''}`} />
-			</Suspense>
+			<NamedLucideIcon
+				name={lucide}
+				Fallback={Fallback}
+				className={`${sizeClass} ${className ?? ''}`}
+			/>
 		);
 	}
 	if (iconEmoji) {

@@ -5,6 +5,7 @@ import { TanStackRouterVite } from '@tanstack/router-vite-plugin';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 import { swPlugin } from './scripts/pwa/vite-plugin-sw';
+import { lucideIconsPlugin } from './scripts/vite-plugin-lucide-icons';
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -44,6 +45,8 @@ function stripDevRoutesPlugin(): import('vite').Plugin {
 // https://vitejs.dev/config/
 export default defineConfig({
 	plugins: [
+		// Name-resolved lucide icons ship as ONE lazy chunk, not one file per icon.
+		lucideIconsPlugin(),
 		TanStackRouterVite({
 			routesDirectory: './src/routes',
 			generatedRouteTree: './src/routeTree.gen.ts',

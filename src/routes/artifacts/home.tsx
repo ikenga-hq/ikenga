@@ -18,7 +18,6 @@ import { useMemo } from 'react';
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { open as openDialog } from '@/lib/transport/dialog-shim';
-import * as Icons from 'lucide-react';
 import { FileText, FolderOpen, Plus, Sparkles, Star } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -31,6 +30,7 @@ import {
 } from '@/lib/queries/project-artifacts';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { openArtifactGrid } from '@/lib/shell/artifact-grid-recents';
+import { ArchetypeGlyph } from '@/shell/artifact-wizard/archetype-glyph';
 import { ARCHETYPES, type Archetype } from '@/shell/artifact-wizard/archetypes';
 import type { Project } from '@/lib/tauri-cmd';
 
@@ -193,7 +193,6 @@ function ArchetypeTile({
 	loading: boolean;
 	onPick: () => void;
 }) {
-	const Glyph = resolveGlyph(archetype.glyphName);
 	return (
 		<button
 			type="button"
@@ -204,7 +203,7 @@ function ArchetypeTile({
 			)}
 		>
 			<div className="flex w-full items-center gap-2">
-				<Glyph className="h-4 w-4 text-muted-foreground" />
+				<ArchetypeGlyph name={archetype.glyphName} className="h-4 w-4 text-muted-foreground" />
 				<span className="flex-1 text-sm font-medium text-foreground">{archetype.label}</span>
 				<span className="font-mono text-[11px] text-muted-foreground">{loading ? '…' : count}</span>
 			</div>
@@ -321,11 +320,4 @@ function relativeAt(ms: number): string {
 	if (wk < 5) return `${wk}w`;
 	const mo = Math.round(day / 30);
 	return `${mo}mo`;
-}
-
-type LucideIcon = (typeof Icons)['Square'];
-
-function resolveGlyph(name: string): LucideIcon {
-	const map = Icons as unknown as Record<string, LucideIcon>;
-	return map[name] ?? Icons.Square;
 }
