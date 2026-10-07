@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": patch
+---
+
+WSL detection and launches are more accurate on Windows. When WSL can't be asked (it's down, has no distro, or hangs), a Chi run now fails with "WSL unavailable: <reason>" instead of telling you to install a CLI you already have, and agent detection skips that agent for the scan instead of reporting it as missing. A wedged `wsl.exe` no longer hangs detection or run start: every WSL probe has a timeout sized for a cold start. Agents are now probed concurrently. Chi runs, detection and sign-in checks use the WSL distribution set in Settings › Engines, as terminals already did. A project that lives inside WSL (`\\wsl.localhost\…`) no longer fails to start with "The directory name is invalid". WSL credential checks read `/root`, skip Docker Desktop's distros, and report an unreadable WSL share as unknown instead of "not signed in". The terminal menu no longer offers a "WSL (Default)" profile when no distro is installed or `wsl.exe` fails, and it hides Docker Desktop's distros. Seats now check whether an engine is installed on Windows. "Run … login" for a WSL-only engine now runs inside WSL.
