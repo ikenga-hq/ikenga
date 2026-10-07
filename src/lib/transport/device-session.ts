@@ -34,13 +34,30 @@ export function bootAccessStatus(): BootAccessStatus | null {
 }
 
 /**
- * `access_status` with whatever the browser sends by itself (cookies), plus
- * the T0 token when the tab has one. `null` on 401, a network error, or a
- * server too old to know the arm. Never throws.
+ * plans/pwa S1 (W2): the server could not be reached at all — a network
+ * error, the browser offline, or a gateway in front of a stopped daemon.
+ * Distinct from `null` (reached, but no credential) so the boot path shows
+ * "can't reach the server" rather than offering to pair a device that is
+ * already paired.
  */
-export async function detectAccessStatus(
-	token: string | null = null
-): Promise<BootAccessStatus | null> {
+export const UNREACHABLE = 'unreachable' as const;
+
+/** What the boot probe found. */
+export type AccessProbe = BootAccessStatus | null | typeof UNREACHABLE;
+
+/** A gateway (tailscale serve, a reverse proxy) answering for a daemon that is down. */
+const GATEWAY_DOWN = new Set([502, 503, 504]);
+
+function browserOffline(): boolean {
+	return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
+/**
+ * `access_status` with whatever the browser sends by itself (cookies), plus
+ * the T0 token when the tab has one. `null` on 401 or a server too old to
+ * know the arm; {@link UNREACHABLE} when no server answered. Never throws.
+ */
+export async function detectAccessStatus(token: string | null = null): Promise<AccessProbe> {
 	try {
 		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 		if (token) headers.Authorization = `Bearer ${token}`;
@@ -50,20 +67,24 @@ export async function detectAccessStatus(
 			credentials: 'same-origin',
 			body: JSON.stringify({ cmd: 'access_status', args: {} }),
 		});
+		if (GATEWAY_DOWN.has(res.status)) return UNREACHABLE;
 		if (!res.ok) return null;
 		const json = (await res.json()) as { ok?: boolean; data?: BootAccessStatus } | null;
 		if (!json?.ok || !json.data?.credential) return null;
 		status = json.data;
 		device = json.data.credential.via === 'device';
 		return status;
-	} catch {
+	} catch (err) {
+		// `fetch` rejects with a TypeError only when no response arrived.
+		if (err instanceof TypeError || browserOffline()) return UNREACHABLE;
 		return null;
 	}
 }
 
 /** P-21: a device grant below `full` boots into `/remote`. */
-export function bootsIntoRemote(s: BootAccessStatus | null): boolean {
-	return s?.credential.via === 'device' && s.credential.tier !== 'full';
+export function bootsIntoRemote(s: AccessProbe): boolean {
+	if (s === null || s === UNREACHABLE) return false;
+	return s.credential.via === 'device' && s.credential.tier !== 'full';
 }
 
 /** Test seam. */

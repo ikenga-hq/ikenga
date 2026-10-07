@@ -8,6 +8,7 @@
 //!                      ├─ /access/pair/*, /access/invite/*    (extension point, R16 §14.1)
 //!                      └─ require_principal ─▶ PrincipalCtx
 //!                          ├─ /auth/{logout,me,password}
+//!                          ├─ /api/server/update{,/apply}   (answered here, admins only; never proxied)
 //!                          ├─ /api/rpc ─ R-3 authorize / access_* ─▶ 127.0.0.1:<port> /api/rpc
 //!                          ├─ /pkgs/*  ──────────────────────────▶ 127.0.0.1:<port> /pkgs/*
 //!                          └─ /ws/*    ─ ws_registry ───────────▶ 127.0.0.1:<port> /ws/*
@@ -31,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{any, get, post};
@@ -104,6 +105,12 @@ pub struct BrokerState {
     pub ws: Arc<WsRegistry>,
     pub http: reqwest::Client,
     pub hooks: BrokerHooks,
+    /// In-app updates (WP-P9; `server::update`). `None` in unit tests that
+    /// don't set it, which answers `unsupported`.
+    pub update: Option<Arc<crate::server::update::UpdateCtl>>,
+    /// The access layer, for the update routes' admin-strength check and
+    /// audit row. `None` in unit tests: then only a password session counts.
+    pub access_t1: Option<Arc<crate::access::t1::T1Access>>,
 }
 
 impl BrokerState {
@@ -125,6 +132,8 @@ impl BrokerState {
             children: Arc::new(Children::new(launcher)),
             ws: WsRegistry::new(),
             http,
+            update: None,
+            access_t1: None,
         })
     }
 }
@@ -184,6 +193,16 @@ pub fn router(
         .route("/auth/logout", post(auth_mod::routes::logout))
         .route("/auth/me", get(auth_mod::routes::me))
         .route("/auth/password", post(auth_mod::routes::change_password))
+        // In-app updates (WP-P9): the broker answers these itself, after a
+        // fresh admin check; they never reach a principal's child.
+        .route(
+            "/api/server/update",
+            get(crate::server::update::broker_status),
+        )
+        .route(
+            "/api/server/update/apply",
+            post(crate::server::update::broker_apply),
+        )
         // `/api/shutdown` and anything else under /api: no such route here,
         // and an unauthenticated caller can't even learn that.
         .route("/api/*rest", any(api_not_found))
@@ -216,9 +235,11 @@ pub fn router(
     Router::new()
         .merge(public)
         .merge(protected)
-        .fallback(move |uri: Uri| {
+        // With the request headers, so the broker gzips like the T0 daemon
+        // and refuses a non-`/sw.js` service-worker install the same way.
+        .fallback(move |uri: Uri, headers: HeaderMap| {
             let spa = spa.clone();
-            async move { spa.handle(uri).await }
+            async move { spa.handle_with(uri, &headers).await }
         })
         .layer(auth_layer)
         .layer(middleware::from_fn_with_state(
@@ -241,6 +262,8 @@ pub struct BrokerBoot {
     /// The Part B flags (G-ACCESS §10.1): `--public-url`, `--max-accounts`,
     /// `--invite-ttl`, `--member-invites-create-accounts`.
     pub access: crate::access::AccessOptions,
+    /// Web Push flags (plans/pwa S2): the broker owns the hub under T1.
+    pub push: crate::server::push::PushOptions,
 }
 
 /// Refuse to exec a binary a principal could have replaced (I-9: nothing a
@@ -272,6 +295,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         bootstrap,
         insecure_cookie,
         access: access_options,
+        push: push_options,
     } = boot;
 
     // Only the broker migrates (§6.1); the probe already did, so this is a
@@ -293,6 +317,15 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // every start"). Only the broker migrates it.
     let access_store = crate::access::AccessStore::attach_t1(pool.clone()).await?;
     let max_accounts = access_options.max_accounts;
+    // plans/pwa S2: the broker owns push under T1 — the VAPID key in the
+    // root-only `operator/push/`, subscriptions in `accounts.db`. Children
+    // never see either; they queue events the pump below drains.
+    let push_hub = crate::server::push::hub::boot(
+        access_store.clone(),
+        &crate::server::push::vapid::path_in(&root.operator_dir()),
+        &push_options,
+        access_options.public_url.as_deref(),
+    );
     let access_t1 = crate::access::t1::T1Access::new(access_store, pool.clone(), access_options);
     // G-ACCESS P-27 / §4.4: `--max-accounts` caps every creation path — the
     // root CLI and the env bootstrap included, which never see this flag —
@@ -347,7 +380,19 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
     // the two-epoch socket check.
     let installed = crate::access::t1::install(&access_t1, broker_state.ws.clone());
     broker_state.hooks = BrokerHooks::access(&installed);
+    // WP-P9: root's update files, and the request path under operator/
+    // (root 0700: no principal can see or write it).
+    broker_state.update = Some(Arc::new(crate::server::update::UpdateCtl::new(
+        crate::server::update::state_dir(),
+        root.operator_dir()
+            .join(crate::server::update::REQUEST_FILE),
+    )));
+    broker_state.access_t1 = Some(access_t1.clone());
     let state = Arc::new(broker_state);
+    if let Some(hub) = push_hub {
+        crate::server::push::install_hub(hub);
+        crate::server::push::pump::spawn(state.children.clone());
+    }
     // G-ACCESS §4.5 / §7 (WP-76): the broker's handle on owner children
     // (share validation, the `invite` notification, member socket closes),
     // the membership expiry sweeper, and the invite-accept host (the §7.2

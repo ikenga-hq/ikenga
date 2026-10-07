@@ -236,6 +236,15 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("pkg_preview_manifest", req!(owner[Files])),
     ("pkg_discover_workspace", req!(owner[Files])),
     ("pkg_scaffold", req!(owner[Install])),
+    // ── executor-routed + pkg settings (gap audit 2026-10-06 ranks 21/23/20).
+    // Owner-class: each spawns (or writes the pkg config) as the serving
+    // principal, and neither a sidecar's inputs, an action's run, a pin's
+    // PTY / chi run nor an agent-ops job is share-root-confined. ──
+    ("pkg_sidecar_call", req!(owner[Dispatch])),
+    ("action_exec", req!(owner[Dispatch])),
+    ("comment_route", req!(owner[Dispatch])),
+    ("agent_ops_run_now", req!(owner[Dispatch])),
+    ("pkg_settings_set", req!(owner[Settings])),
     // ── New (§9): G-ACCESS's own arms (WP-74a registers; W3–W5 fill) ──
     ("access_status", req!(access)),
     ("access_devices_list", req!(access)),
@@ -262,9 +271,18 @@ pub const RPC_REQUIREMENTS: &[(&str, Requirement)] = &[
     ("access_audit_export", req!(access)),
     ("access_audit_record_local", req!(access)),
     ("access_audit_reseal", req!(access)),
+    // ── push (plans/pwa S2 §7) ──
+    ("access_push_config", req!(access)),
+    ("access_push_subscribe", req!(access)),
+    ("access_push_update", req!(access)),
+    ("access_push_unsubscribe", req!(access)),
+    ("access_push_list", req!(access)),
+    ("access_push_test", req!(access)),
     ("permission_decide", req!(shared[Approve])),
     ("notifications_record_access", req!(internal)),
     ("share_project_info", req!(internal)),
+    // WP-P9: the broker's cross-principal open-terminal count.
+    ("server_open_terminals", req!(internal)),
     ("permission_relay_put", req!(operator)),
     ("permission_relay_take", req!(operator)),
     ("permission_relay_resolve", req!(operator)),

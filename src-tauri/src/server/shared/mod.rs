@@ -14,6 +14,7 @@
 //! HTTP server — no axum, no `AppState`.
 
 pub mod acp_mode;
+pub mod action_exec;
 pub mod actions;
 pub mod activity_bar;
 pub mod agent_config;
@@ -27,6 +28,7 @@ pub mod chi;
 pub mod chi_exec;
 pub mod chi_liveness;
 pub mod chi_runner;
+pub mod comment_route;
 pub mod known;
 pub mod claude_config;
 pub mod claude_launch;
@@ -36,6 +38,7 @@ pub mod comments;
 pub mod confined_fs;
 pub mod data_health;
 pub mod engine_layout;
+pub mod failure_class;
 pub mod fs;
 pub mod git;
 pub mod identity;
@@ -47,6 +50,7 @@ pub mod pkg_scaffold;
 pub mod pkg_workspace;
 pub mod projects;
 pub mod seat_grammar;
+pub mod sidecar_call;
 pub mod settings;
 pub mod settings_cascade;
 pub mod shell_detect;

@@ -115,6 +115,7 @@ async fn child() -> Child {
         None,
         DaemonAccess::principal_child(Default::default()),
         None,
+        super::UpdateSource::Default,
     );
     Child {
         _tmp: tmp,
