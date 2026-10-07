@@ -83,7 +83,8 @@ interface TerminalState {
 	dismissRestoreError: () => void;
 	/** D-12: copy the unreadable saved list to a timestamped side key, and
 	 *  only once that worked, resume saving. Saving stays paused (with the
-	 *  reason) if the copy can't be made. */
+	 *  reason) if the copy can't be made. If the list reads fine by now (the
+	 *  first failure was transient), its tabs are restored instead. */
 	resumeSaving: () => Promise<void>;
 
 	add: (spec: TerminalTab['spec'], title?: string, id?: string) => string;
@@ -437,6 +438,70 @@ export function openTabPty(tab: TerminalTab, opts: { forceEphemeral?: boolean } 
 	);
 }
 
+/** A saved tab as it comes back after a reload: reattached to a live PTY
+ *  when one survived, otherwise marked to respawn or left exited. */
+function toRestoredTab(
+	p: SerializedTab,
+	liveByTerminalId: Map<string, TerminalDescriptor> | null
+): TerminalTab {
+	const shouldAutoRespawn =
+		p.wasRunning ?? (p.status === 'running' || p.status === 'spawning');
+	const live = liveByTerminalId?.get(p.id);
+	if (live && shouldAutoRespawn) {
+		// The PTY survived the refresh: reattach instead of respawning.
+		return {
+			...p,
+			ptyId: live.pty_id,
+			mode: 'ephemeral',
+			status: 'running',
+			wasRunning: true,
+			exitCode: null,
+			owner: { kind: 'sidepane' },
+		};
+	}
+
+	// Persistent (daemon-backed) tab that survived reload/restart:
+	// Attempt reattach to the daemon session.
+	if (p.mode === 'persistent' && p.ptyId && shouldAutoRespawn) {
+		return {
+			...p,
+			ptyId: p.ptyId,
+			mode: 'persistent',
+			status: 'running',
+			wasRunning: true,
+			exitCode: null,
+			owner: { kind: 'sidepane' },
+		};
+	}
+
+	return {
+		...p,
+		ptyId: null,
+		mode: p.mode ?? 'ephemeral',
+		// Restored tabs that were active before app exit restart in 'spawning' status
+		status: shouldAutoRespawn ? 'spawning' : 'exited',
+		wasRunning: shouldAutoRespawn,
+		exitCode: p.exitCode,
+		// Force-default ownership to sidepane on rehydrate. Studio
+		// attachments are re-established by the Studio pane on mount
+		// (saved `attachedTerminalId` in PaneView); cross-store
+		// ordering with `loadPaneTree` makes restoring the saved
+		// owner here fragile.
+		owner: { kind: 'sidepane' },
+	};
+}
+
+/** Live PTYs by terminal id, or null when the list can't be read. */
+async function liveTerminalsById(): Promise<Map<string, TerminalDescriptor> | null> {
+	try {
+		const live = await ptyTerminalList();
+		return new Map(live.map((d) => [d.terminal_id, d]));
+	} catch (err) {
+		console.warn('[terminal/session-store] ptyTerminalList failed during rehydrate', err);
+		return null;
+	}
+}
+
 async function respawnTab(tab: TerminalTab): Promise<void> {
 	if (tab.ptyId || getPty(tab.id)) return;
 	try {
@@ -452,6 +517,28 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		if (get().restoreError?.holdsSave) return;
 		void writePersisted(serialize(get().tabs));
 	}, 300);
+
+	/** Bring back a saved list that is readable after all: its tabs join the
+	 *  ones opened meanwhile (same id = already open), then saving resumes. */
+	const restoreReadableList = async (saved: SerializedTab[]): Promise<void> => {
+		const liveByTerminalId = await liveTerminalsById();
+		const openIds = new Set(get().tabs.map((t) => t.id));
+		const restored = saved
+			.filter((p) => !openIds.has(p.id))
+			.map((p) => toRestoredTab(p, liveByTerminalId));
+		set((s) => ({
+			tabs: [...s.tabs, ...restored],
+			activeId: s.activeId ?? restored[0]?.id ?? null,
+			restoreError: null,
+		}));
+		persistDebounced();
+		const { resume } = await readResumeSetting();
+		if (resume) {
+			for (const tab of restored) {
+				if (tab.status === 'spawning') void respawnTab(tab);
+			}
+		}
+	};
 
 	return {
 		tabs: [],
@@ -472,21 +559,35 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 			if (!notice?.holdsSave) return;
 			let backupKey: string | undefined;
 			let where: SavedLocation | undefined;
+			let readable: SerializedTab[] | null = null;
 			try {
 				const saved = await readRawSaved();
 				where = saved.where;
 				if (saved.raw) {
-					backupKey = unreadableBackupKey();
-					await writeSideKey(saved.where, backupKey, saved.raw);
+					const parsed = parseSerialized(saved.raw);
+					if (parsed.error === null) {
+						// The earlier failure was transient and the list reads fine
+						// now: restore it rather than back it up and overwrite it.
+						readable = parsed.tabs;
+					} else {
+						backupKey = unreadableBackupKey();
+						await writeSideKey(saved.where, backupKey, saved.raw);
+					}
 				}
 			} catch (err) {
 				// Without a copy, resuming would destroy the list: stay paused.
+				// A read that keeps failing keeps saving paused for the session;
+				// that is deliberate (D-12: nothing is overwritten unbacked).
 				set({
 					restoreError: {
 						message: `Couldn't back up the unreadable terminal list (${errText(err)}), so saving is still paused.`,
 						holdsSave: true,
 					},
 				});
+				return;
+			}
+			if (readable) {
+				await restoreReadableList(readable);
 				return;
 			}
 			set({
@@ -674,61 +775,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 
 				// On a webview reload the Tauri process (and its PTYs) survive.
 				// Reconcile against the live PTY list before deciding to respawn.
-				let liveByTerminalId: Map<string, TerminalDescriptor> | null = null;
-				try {
-					const live = await ptyTerminalList();
-					liveByTerminalId = new Map(live.map((d) => [d.terminal_id, d]));
-				} catch (err) {
-					console.warn('[terminal/session-store] ptyTerminalList failed during rehydrate', err);
-				}
+				const liveByTerminalId = await liveTerminalsById();
 
-				const restored: TerminalTab[] = persisted.map((p) => {
-					const shouldAutoRespawn =
-						p.wasRunning ?? (p.status === 'running' || p.status === 'spawning');
-					const live = liveByTerminalId?.get(p.id);
-					if (live && shouldAutoRespawn) {
-						// The PTY survived the refresh: reattach instead of respawning.
-						return {
-							...p,
-							ptyId: live.pty_id,
-							mode: 'ephemeral',
-							status: 'running',
-							wasRunning: true,
-							exitCode: null,
-							owner: { kind: 'sidepane' },
-						};
-					}
-
-					// Persistent (daemon-backed) tab that survived reload/restart:
-					// Attempt reattach to the daemon session.
-					if (p.mode === 'persistent' && p.ptyId && shouldAutoRespawn) {
-						return {
-							...p,
-							ptyId: p.ptyId,
-							mode: 'persistent',
-							status: 'running',
-							wasRunning: true,
-							exitCode: null,
-							owner: { kind: 'sidepane' },
-						};
-					}
-
-					return {
-						...p,
-						ptyId: null,
-						mode: p.mode ?? 'ephemeral',
-						// Restored tabs that were active before app exit restart in 'spawning' status
-						status: shouldAutoRespawn ? 'spawning' : 'exited',
-						wasRunning: shouldAutoRespawn,
-						exitCode: p.exitCode,
-						// Force-default ownership to sidepane on rehydrate. Studio
-						// attachments are re-established by the Studio pane on mount
-						// (saved `attachedTerminalId` in PaneView); cross-store
-						// ordering with `loadPaneTree` makes restoring the saved
-						// owner here fragile.
-						owner: { kind: 'sidepane' },
-					};
-				});
+				const restored = persisted.map((p) => toRestoredTab(p, liveByTerminalId));
 				set({
 					tabs: restored,
 					activeId: restored[0]?.id ?? null,

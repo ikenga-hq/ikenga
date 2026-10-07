@@ -71,13 +71,22 @@ export function customShellsBackupKey(now: number = Date.now()): string {
 }
 
 /**
- * Reset a corrupt custom-shells list: copy the raw value to a side key, and
- * only once that write succeeded, clear the list. Returns the backup key.
- * Throws (with nothing cleared) if the backup can't be written.
+ * Reset a corrupt custom-shells list: read the value fresh (it may have been
+ * fixed since the error was shown, e.g. from another window), copy it to a
+ * side key, and only once that write succeeded, clear the list. Returns the
+ * backup key, or null when the value reads fine now and nothing was touched.
+ * Throws (with nothing cleared) if the read or the backup write fails.
  */
-export async function resetCorruptCustomShells(raw: string, now: number = Date.now()): Promise<string> {
+export async function resetCorruptCustomShells(now: number = Date.now()): Promise<string | null> {
+	const raw = await settingsGet(CUSTOM_SHELL_KEY);
+	try {
+		parseCustomShellProfiles(raw);
+		return null;
+	} catch (err) {
+		if (!(err instanceof CorruptCustomShellsError)) throw err;
+	}
 	const backupKey = customShellsBackupKey(now);
-	await settingsSet(backupKey, raw);
+	await settingsSet(backupKey, raw as string);
 	await settingsSet(CUSTOM_SHELL_KEY, '[]');
 	return backupKey;
 }
@@ -110,7 +119,7 @@ export function useCustomShellProfiles() {
 	// bad value up to a side key first, then clears the list (D-13).
 	const corrupt = customQuery.error instanceof CorruptCustomShellsError ? customQuery.error : null;
 	const resetMutation = useMutation({
-		mutationFn: async (raw: string) => resetCorruptCustomShells(raw),
+		mutationFn: async () => resetCorruptCustomShells(),
 		onSuccess: () => {
 			void queryClient.invalidateQueries({ queryKey: ['settings', CUSTOM_SHELL_KEY] });
 			void queryClient.invalidateQueries({ queryKey: ['terminal', 'shells'] });
@@ -118,7 +127,7 @@ export function useCustomShellProfiles() {
 	});
 	const resetCorrupt = async (): Promise<string | null> => {
 		if (!corrupt) return null;
-		return resetMutation.mutateAsync(corrupt.raw);
+		return resetMutation.mutateAsync();
 	};
 
 	const addCustomProfile = (profile: Omit<ShellProfile, 'id' | 'isDefault'>): boolean => {

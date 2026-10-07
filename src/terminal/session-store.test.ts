@@ -414,6 +414,33 @@ describe('rehydrate: a failed read is not "no saved terminals"', () => {
 		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
 	});
 
+	it('Resume saving restores a list that reads fine by now instead of overwriting it', async () => {
+		// First read fails transiently (e.g. a locked store).
+		const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementationOnce(() => {
+			throw new Error('store locked');
+		});
+		const saved = [
+			{ id: 'saved-1', title: 'one', spec: { cwd: '/a', cmd: ['bash'] }, status: 'exited', exitCode: 0, createdAt: 1 },
+			{ id: 'saved-2', title: 'two', spec: { cwd: '/b', cmd: ['bash'] }, status: 'exited', exitCode: 0, createdAt: 2 },
+		];
+		localStorage.setItem('terminal.tabs', JSON.stringify(saved));
+		await useTerminalStore.getState().rehydrateFromDb();
+		getItem.mockRestore();
+		expect(useTerminalStore.getState().restoreError?.holdsSave).toBe(true);
+		const openNow = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+
+		await useTerminalStore.getState().resumeSaving();
+
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+		const ids = useTerminalStore.getState().tabs.map((t) => t.id);
+		expect(ids).toEqual([openNow, 'saved-1', 'saved-2']);
+		// No backup was made of a readable list.
+		expect(Object.keys(localStorage).filter((k) => k.includes('.unreadable-'))).toEqual([]);
+		await useTerminalStore.getState().persistToDb();
+		const persisted = JSON.parse(localStorage.getItem('terminal.tabs') ?? '[]') as { id: string }[];
+		expect(persisted.map((t) => t.id)).toEqual([openNow, 'saved-1', 'saved-2']);
+	});
+
 	it('a failed resume-setting read is reported, and nothing is respawned', async () => {
 		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
 		useTerminalStore.getState().setStatus(id, 'running');

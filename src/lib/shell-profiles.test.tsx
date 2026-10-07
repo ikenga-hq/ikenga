@@ -150,10 +150,29 @@ describe('corrupt custom shells (D-13)', () => {
 	});
 
 	it('does not clear the list when the backup write fails', async () => {
+		settingsGetMock.mockResolvedValue('{bad');
 		settingsSetMock.mockRejectedValueOnce(new Error('disk full'));
-		await expect(resetCorruptCustomShells('{bad', 42)).rejects.toThrow('disk full');
+		await expect(resetCorruptCustomShells(42)).rejects.toThrow('disk full');
 		expect(settingsSetMock).toHaveBeenCalledTimes(1);
 		expect(settingsSetMock.mock.calls[0]).toEqual([`${CUSTOM_SHELL_KEY}.corrupt-42`, '{bad']);
+	});
+
+	it('re-reads before resetting: a value fixed meanwhile is neither backed up nor cleared', async () => {
+		let stored: string | null = '{not json';
+		settingsGetMock.mockImplementation(async (key: string) => (key === CUSTOM_SHELL_KEY ? stored : null));
+		const { result } = renderHook(() => useCustomShellProfiles(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.isCorrupt).toBe(true));
+
+		// Another window writes a good list after the error was shown.
+		stored = JSON.stringify(SAVED);
+		let backupKey: string | null = 'unset';
+		await act(async () => {
+			backupKey = await result.current.resetCorrupt();
+		});
+		expect(backupKey).toBeNull();
+		expect(settingsSetMock).not.toHaveBeenCalled();
+		await waitFor(() => expect(result.current.canEdit).toBe(true));
+		expect(result.current.customProfiles).toEqual(SAVED);
 	});
 });
 

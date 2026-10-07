@@ -74,6 +74,8 @@ export function SessionsSection(_ctx: ExplorerSectionContext) {
 			message={restoreError.message}
 			onRetry={dismissRestoreError}
 			actionLabel={restoreError.holdsSave ? 'Resume saving' : 'Dismiss'}
+			// The "saving resumed, copied to …" notice reports a success.
+			tone={restoreError.backupKey ? 'info' : 'error'}
 		/>
 	) : null;
 

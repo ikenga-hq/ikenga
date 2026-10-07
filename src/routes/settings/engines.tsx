@@ -41,6 +41,7 @@ import {
 } from '@/terminal/single-terminal';
 import { buildAgentWrappedCmd, type AgentEngineKind } from '@/terminal/claude-wrap';
 import { SettingsFieldRow, useSettingsSection } from '@/shell/settings/field';
+import { CustomShellsStatus } from './-components/custom-shells-status';
 
 const OFFLINE_AGENT_ID = 'engine-noop';
 
@@ -664,66 +665,15 @@ function TerminalSectionBody() {
 					</Button>
 				</div>
 
-				{customProfilesError && (
-					<div className="border-t border-border px-4 py-3">
-						<Banner
-							tone="danger"
-							icon={<AlertTriangle />}
-							role="alert"
-							className="rounded-md border"
-							data-testid="custom-shells-read-error"
-							actions={
-								<>
-									{customProfilesCorrupt && (
-										<Button
-											variant="ghost"
-											size="sm"
-											disabled={isResettingCustomProfiles}
-											data-testid="custom-shells-reset"
-											onClick={() => void resetCorruptCustomProfiles().catch(() => {})}
-										>
-											Reset custom shells
-										</Button>
-									)}
-									<Button variant="ghost" size="sm" onClick={() => void refetchCustomProfiles()}>
-										Retry
-									</Button>
-								</>
-							}
-						>
-							<div className="text-[13px] font-semibold">Couldn't read your custom shells</div>
-							<div className="mt-1 text-xs" style={{ color: 'var(--fg-muted)' }}>
-								{customProfilesError instanceof Error
-									? customProfilesError.message
-									: String(customProfilesError)}
-								. Adding or removing custom shells is paused so the saved list isn't overwritten.
-								{customProfilesCorrupt &&
-									' Reset custom shells saves a copy of the current value under a backup setting, then starts an empty list.'}
-							</div>
-							{customProfilesResetError && (
-								<div className="mt-1 text-xs" style={{ color: 'var(--danger)' }}>
-									Couldn't reset (
-									{customProfilesResetError instanceof Error
-										? customProfilesResetError.message
-										: String(customProfilesResetError)}
-									). Your custom shells were not cleared.
-								</div>
-							)}
-						</Banner>
-					</div>
-				)}
-
-				{!customProfilesError && customProfilesBackupKey && (
-					<div
-						className="border-t border-border px-4 py-3 text-xs"
-						style={{ color: 'var(--fg-muted)' }}
-						role="status"
-						data-testid="custom-shells-reset-done"
-					>
-						Custom shells were reset. The unreadable value was saved as the setting{' '}
-						<code>{customProfilesBackupKey}</code>.
-					</div>
-				)}
+				<CustomShellsStatus
+					error={customProfilesError}
+					isCorrupt={customProfilesCorrupt}
+					onReset={resetCorruptCustomProfiles}
+					onRetry={() => void refetchCustomProfiles()}
+					isResetting={isResettingCustomProfiles}
+					resetError={customProfilesResetError}
+					resetBackupKey={customProfilesBackupKey}
+				/>
 
 				<div className="divide-y divide-border">
 					{profiles.map((p) => {
