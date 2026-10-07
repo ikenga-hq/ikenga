@@ -1,0 +1,5 @@
+---
+"ikenga-desktop": patch
+---
+
+Live updates now reach the browser. A remote (browser) session used to receive no server events at all, so notifications, the approve gate, settings and the active project only refreshed when something re-fetched them. The server now has an authenticated `/ws/events` channel, and the browser's event listeners use it. The server publishes the same events the desktop app does for settings changes (`settings://changed`), project switches (`projects:active-changed`), actions and keybindings writes and trust changes (`actions://changed`), notifications (`notifications://changed`, with the muted flag), the approve gate (`pa-action-paused` / `-committed` / `-retried` / `-rejected`) and seats (`seats://changed`). Each event goes only to sockets whose access level can read that state. On a multi-user server, each person only receives events about their own workspace. Events the server has no source for, such as the hooks bus, the statusline HUD and runtime downloads, are noted once in the browser console and no longer warn on every subscription.

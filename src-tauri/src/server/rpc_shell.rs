@@ -17,11 +17,12 @@
 //! same thing for an `Option`, so `Option<Option<T>>` "clear" semantics are
 //! exactly the desktop's (`null` = leave unchanged).
 //!
-//! **No events.** The desktop emits `projects:active-changed` and relays
-//! notification changes as `notifications://changed`. The daemon has no event
-//! channel — the web transport's `listen()` is a no-op — so these arms change
-//! the same rows and simply emit nothing; the browser refetches on its own
-//! schedule.
+//! **Events.** The desktop emits `projects:active-changed` and relays
+//! notification changes as `notifications://changed`. The daemon publishes
+//! the same names and payloads on its event bus (`server::events`), which
+//! `/ws/events` delivers to the browser: `project_set_active` here, and every
+//! notification change through the bus's relay of the process-wide
+//! notification channel.
 //!
 //! **Paths.** Caller-controlled paths never reach past the daemon's fs
 //! allowlist (`<data-dir>/fs_roots.json`, the `fs_*` arms' boundary) or out
@@ -646,13 +647,17 @@ pub(super) async fn project_archive(state: &AppState, args: &Value) -> RpcRespon
     respond("project_archive", r)
 }
 
-/// The desktop also emits `projects:active-changed`; the daemon has no event
-/// channel (see the module doc), so it only writes the row.
+/// Then `projects:active-changed { id }`, exactly as the desktop emits it.
 pub(super) async fn project_set_active(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let id: String = targ(args, &["id"])?;
         let pool = pa_db(state)?.ensure_pool().await?;
-        projects::set_active_project_id(&pool, &id).await
+        projects::set_active_project_id(&pool, &id).await?;
+        state.events.publish(
+            super::events::Topic::ProjectsActiveChanged,
+            serde_json::json!({ "id": id }),
+        );
+        Ok(())
     }
     .await;
     respond("project_set_active", r)

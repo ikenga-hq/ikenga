@@ -31,9 +31,10 @@
 //! * Every change is published on a process-wide broadcast channel
 //!   ([`subscribe`]). On the desktop, `crate::notifications::
 //!   spawn_event_forwarder` relays it to the webview as the
-//!   `notifications://changed` Tauri event. The daemon runs no forwarder (it
-//!   has no event channel; the web transport's `listen()` is a no-op), so
-//!   there the channel simply has no receiver. Producers therefore only need
+//!   `notifications://changed` Tauri event. On the daemon the event bus
+//!   (`server::events`) relays it under the same name to `/ws/events`, once
+//!   a browser is listening; until then the channel has no receiver.
+//!   Producers therefore only need
 //!   a `SqlitePool` — `pkg::permissions_check::record_violation` has no
 //!   `AppHandle` and does not need one.
 //!

@@ -13,10 +13,11 @@
 //! The only thing that ever needed an `AppHandle` was the change signal
 //! (`settings://changed`, fired after a write and from the file watchers).
 //! That is now an optional [`ChangeNotifier`]: the desktop passes one that
-//! emits exactly what it always emitted; the daemon passes `None`, because it
-//! has no event channel (the web transport's `listen()` is a documented
-//! no-op). With no notifier there is nothing to tell about a change, so no
-//! file watcher is started either.
+//! emits exactly what it always emitted; the daemon passes one that publishes
+//! on its event bus (`server::events`, delivered over `/ws/events`) and turns
+//! the file watchers off ([`SettingsManager::without_file_watchers`]), so it
+//! announces its own writes only. With no notifier there is nothing to tell
+//! about a change, so no file watcher is started either.
 
 pub mod migrate;
 pub mod schema;
@@ -74,8 +75,12 @@ pub struct SettingsChangeEvent {
 pub type ChangeNotifier = Arc<dyn Fn(&Path) + Send + Sync>;
 
 pub struct SettingsManager {
-    /// `None` on the daemon: no event channel, so no emits and no watchers.
+    /// The desktop's emits `settings://changed`; the daemon's publishes on
+    /// its event bus. `None` (tests): no emits and no watchers.
     notifier: Option<ChangeNotifier>,
+    /// `false` on the daemon: the notifier hears only this manager's own
+    /// writes, never a file watcher.
+    watch_files: bool,
     db: Arc<PaDb>,
     home: PathBuf,
     app_data_dir: PathBuf,
@@ -101,6 +106,7 @@ impl SettingsManager {
     ) -> Self {
         Self {
             notifier,
+            watch_files: true,
             db,
             home,
             app_data_dir,
@@ -840,10 +846,18 @@ impl SettingsManager {
         }
     }
 
+    /// Announce this manager's own writes only: no file watcher is ever
+    /// started, so an external edit is seen by the next read. The daemon's
+    /// choice — it has no watcher of its own state today.
+    pub fn without_file_watchers(mut self) -> Self {
+        self.watch_files = false;
+        self
+    }
+
     fn watch_path(&self, path: &Path) -> Result<(), String> {
-        // A watcher exists only to feed the notifier; with none (the daemon)
-        // there is nobody to tell, so none is started.
-        let Some(notifier) = self.notifier.clone() else {
+        // A watcher exists only to feed the notifier; with none there is
+        // nobody to tell, and the daemon opts out of watching altogether.
+        let Some(notifier) = self.notifier.clone().filter(|_| self.watch_files) else {
             return Ok(());
         };
         let parent = path
