@@ -8,6 +8,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Clock, History, Info, Pencil, Play } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { agentOpsRunNow, agentOpsSetEnabled } from '@/lib/tauri-cmd';
+import { honestRpcError } from '@/lib/transport/unavailable';
 import { AGENT_OPS_JOBS_QUERY_KEY } from './use-automations';
 import type { AutomationRow } from './types';
 
@@ -45,19 +46,30 @@ function RunNowButton({ row }: { row: AutomationRow }) {
 	const disabledReason = row.runNowDisabledReason ?? (runNow.isPending ? 'Running…' : null);
 
 	return (
-		<Button
-			type="button"
-			size="sm"
-			variant="ghost"
-			className="h-8 gap-1 px-2 text-xs"
-			disabled={disabledReason !== null}
-			title={disabledReason ?? undefined}
-			aria-busy={runNow.isPending}
-			onClick={() => runNow.mutate()}
-		>
-			<Play className="h-3.5 w-3.5" />
-			Run now
-		</Button>
+		<>
+			<Button
+				type="button"
+				size="sm"
+				variant="ghost"
+				className="h-8 gap-1 px-2 text-xs"
+				disabled={disabledReason !== null}
+				title={disabledReason ?? undefined}
+				aria-busy={runNow.isPending}
+				onClick={() => runNow.mutate()}
+			>
+				<Play className="h-3.5 w-3.5" />
+				Run now
+			</Button>
+			{runNow.isError && (
+				<span
+					role="alert"
+					className="ml-1 max-w-[14rem] text-xs text-destructive"
+					data-testid="run-now-error"
+				>
+					{honestRpcError(runNow.error)}
+				</span>
+			)}
+		</>
 	);
 }
 

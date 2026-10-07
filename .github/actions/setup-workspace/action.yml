@@ -38,6 +38,21 @@ runs:
           - contract
           - tokens
         EOF
+        # No lockfile here, so every dependency floats. Pin what upstream has
+        # broken: @codemirror/language 6.13.0 (2026-10-07) imports
+        # @codemirror/streamparser without declaring it, which fails the vite
+        # build and any vitest file importing the viewer. Same pin as
+        # release.yml (#430); drop both once upstream fixes it.
+        cat > package.json <<'EOF'
+        {
+          "private": true,
+          "pnpm": {
+            "overrides": {
+              "@codemirror/language": "<6.13.0"
+            }
+          }
+        }
+        EOF
 
     - name: Install bun
       uses: oven-sh/setup-bun@v2

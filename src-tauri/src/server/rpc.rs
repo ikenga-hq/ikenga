@@ -7,8 +7,11 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::rpc_claude;
+use super::rpc_exec;
 use super::rpc_files;
+use super::rpc_fs_roots;
 use super::rpc_local;
+use super::rpc_seats;
 use super::rpc_shell;
 use super::AppState;
 use crate::pty::SpawnOpts;
@@ -97,6 +100,12 @@ pub struct RpcResponse {
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// A typed rejection's own fields, for a command whose desktop `invoke`
+    /// rejects with an object rather than a string (the seats' `SeatError`,
+    /// `{code, message, details?}`). The web transport assigns them onto the
+    /// `Error` it throws, so the frontend reads the same rejection on both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_data: Option<Value>,
 }
 
 impl RpcResponse {
@@ -105,14 +114,21 @@ impl RpcResponse {
             ok: true,
             data: serde_json::to_value(data).ok(),
             error: None,
+            error_data: None,
         }
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
+        Self::error_with_data(msg, None)
+    }
+
+    /// [`RpcResponse::error`] carrying the typed rejection (see `error_data`).
+    pub fn error_with_data(msg: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             ok: false,
             data: None,
             error: Some(msg.into()),
+            error_data: data,
         }
     }
 }
@@ -294,12 +310,14 @@ pub async fn rpc_handler(
                 Err(e) => RpcResponse::error(e),
             }
         }
-        "fs_roots_list" => {
-            let roots = crate::fs_roots::current()
-                .map(|r| r.list_inputs())
-                .unwrap_or_default();
-            RpcResponse::success(roots)
-        }
+        // The caller's own folder list (gap audit 2026-10-06 rank 1): under
+        // T1 this child's principal's, seeded with its home; on T0 the one
+        // owner's. Validation, scoping and the admin route in
+        // `server::rpc_fs_roots`.
+        "fs_roots_list" => rpc_fs_roots::fs_roots_list(&state, &payload.args),
+        "fs_roots_add" => rpc_fs_roots::fs_roots_add(&state, &payload.args),
+        "fs_roots_remove" => rpc_fs_roots::fs_roots_remove(&state, &payload.args),
+        "fs_roots_reset" => rpc_fs_roots::fs_roots_reset(&state, &payload.args),
         // The browser has no `@tauri-apps/api/path`, so `homeDir()` resolves
         // here. Without it the shim silently returns the literal string "~",
         // which then gets joined into paths and handed to `fs_read` — a
@@ -453,6 +471,19 @@ pub async fn rpc_handler(
         // The server has no install-time trust gate, so nothing is ever
         // parked for a capability review.
         "pkg_trust_list_pending" => RpcResponse::success(Vec::<serde_json::Value>::new()),
+        // No trust store, so no pkg's trust can be evaluated. An empty list
+        // would read as "nothing to trust"; the refusal names why, and the
+        // frontend renders it as "not available on this server".
+        "pkg_trust_list" => RpcResponse::error(format!(
+            "pkg_trust_list: {}",
+            rpc_claude::TRUST_NOT_SERVED
+        )),
+        // What the daemon can see: `--pkgs-dir` entries that failed to load,
+        // are api-incompatible, or a registry rejected — plus one
+        // `records_unavailable` row saying install-record health is not
+        // checked here, so the answer is never a bare `[]` that reads as
+        // healthy. Removal (`pkg_health_remove*`) stays desktop-only.
+        "pkg_health_scan" => RpcResponse::success(state.pkg_index.health_scan()),
         // Elevated trust (`host.fetch`, `host.invoke`) is granted on the
         // desktop only, and the server runs neither, so the answer here is
         // always no: the app reports the capability as unavailable instead
@@ -531,8 +562,8 @@ pub async fn rpc_handler(
         // this handler runs in the signed-in principal's child — a run
         // executes as that principal, against that principal's own ikenga.db
         // and chi-cache. The agent-ops arms resolve the router's home
-        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` stays
-        // desktop-only.
+        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` is
+        // served below with the executor-routed arms.
         "chi_run" => rpc_local::chi_run(&state, &payload.args).await,
         "chi_resume" => rpc_local::chi_resume(&state, &payload.args).await,
         "chi_cancel" => rpc_local::chi_cancel(&state, &payload.args).await,
@@ -555,8 +586,8 @@ pub async fn rpc_handler(
         // (no event channel here). The project filesystem arms stay inside the
         // fs allowlist and the project root. Left desktop-only:
         // `notifications_record_update` (its sweep needs the shell version +
-        // pkg kernel), `comment_route` (spawns chi). `pin_screenshot_write`
-        // joined in slice 8 (below).
+        // pkg kernel). `pin_screenshot_write` joined in slice 8, and
+        // `comment_route` with the executor-routed arms (both below).
         "notifications_list" => rpc_shell::notifications_list(&state, &payload.args).await,
         "notifications_unread_count" => rpc_shell::notifications_unread_count(&state).await,
         "notifications_mark_read" => {
@@ -697,6 +728,15 @@ pub async fn rpc_handler(
         "oba_relink_dependents" => rpc_claude::oba_relink_dependents(&state, &payload.args).await,
         "oba_unlink_one" => rpc_claude::oba_unlink_one(&state, &payload.args).await,
 
+        // --- Ngwa snapshot (WP-19) ---
+        //
+        // The desktop's own join over the projects, `--pkgs-dir` index,
+        // config scan and Ọba store this router can see, read as its
+        // principal (router home, router store). Pkg runtime, engine-asset
+        // placements, trust and transcript usage are reported unavailable in
+        // `sources`, never as an empty or zeroed set. Body in `rpc_claude`.
+        "ngwa_snapshot" => rpc_claude::ngwa_snapshot(&state).await,
+
         // --- fs family + actions / keybindings / trust (WP-19 slice 5a) ---
         //
         // Bodies in `server::rpc_files`, over `server::shared::{fs, actions}`
@@ -706,8 +746,7 @@ pub async fn rpc_handler(
         // root is inside it. No `actions://changed` is emitted (no event
         // channel). Writes never touch the trust record, which lives in
         // `--data-dir`. Left allowlisted: `fs_trash` (OS trash outside the
-        // allowlist), `fs_roots_*` (would let the token holder redefine the
-        // boundary), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
+        // allowlist), `fs_watch` / `fs_unwatch` (`/ws/fs` covers them),
         // `actions_open_file` (spawns the OS opener).
         "fs_read" => rpc_files::fs_read(&state, &payload.args).await,
         "fs_write" => rpc_files::fs_write(&state, &payload.args).await,
@@ -733,7 +772,8 @@ pub async fn rpc_handler(
         // allowlist and refused inside the daemon's own state). No
         // `pa-action-*` events (no event channel). Commit / retry wake the
         // mutation worker with the hardcoded `mutation:send-worker` only —
-        // `agent_ops_run_now` itself stays allowlisted.
+        // `agent_ops_run_now` is its own arm (below), confined to the
+        // principal's own jobs.
         "pa_actions_pause" => rpc_local::pa_actions_pause(&state, &payload.args).await,
         "pa_actions_list" => rpc_local::pa_actions_list(&state, &payload.args).await,
         "pa_actions_update" => rpc_local::pa_actions_update(&state, &payload.args).await,
@@ -769,6 +809,47 @@ pub async fn rpc_handler(
         "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
 
+        // --- Chi seats (gap audit 2026-10-06 rank 7) ---
+        //
+        // The desktop's seat store (`shared::seats`) over `--data-dir`'s
+        // ikenga.db; resume / fill / the §4.5 queue start their runs through
+        // `chi_exec` like `chi_run`. Bodies and the daemon's world in
+        // `server/rpc_seats.rs`.
+        "seats_list" => rpc_seats::seats_list(&state, &payload.args).await,
+        "seats_get" => rpc_seats::seats_get(&state, &payload.args).await,
+        "seats_engines" => rpc_seats::seats_engines(&state).await,
+        "seats_resolve" => rpc_seats::seats_resolve(&state, &payload.args).await,
+        "seats_create" => rpc_seats::seats_create(&state, &payload.args).await,
+        "seats_move" => rpc_seats::seats_move(&state, &payload.args).await,
+        "seats_resume" => rpc_seats::seats_resume(&state, &payload.args).await,
+        "seats_fill" => rpc_seats::seats_fill(&state, &payload.args).await,
+        "seats_queue" => rpc_seats::seats_queue(&state, &payload.args).await,
+        "seats_clear" => rpc_seats::seats_clear(&state, &payload.args).await,
+        "seats_rename" => rpc_seats::seats_rename(&state, &payload.args).await,
+        "seats_remove" => rpc_seats::seats_remove(&state, &payload.args).await,
+        "seats_release" => rpc_seats::seats_release(&state, &payload.args).await,
+
+        // --- Executor-routed arms + the pkg-settings write (gap audit
+        //     2026-10-06 ranks 21, 23, 20-partial) ---
+        //
+        // Bodies in `server::rpc_exec`, over the cores the desktop commands
+        // call (`server::shared::{sidecar_call, action_exec, comment_route,
+        // agent_ops}`, `pkg::settings_values`). Every spawn goes through
+        // `executor::current()`: under T1 this handler runs in the signed-in
+        // principal's child, so a sidecar, action or pin run executes as that
+        // principal, against that principal's home, ikenga.db and PTYs. A
+        // sidecar resolves only from the `--pkgs-dir` index and only inside
+        // its pkg; an action or pin cwd only inside the fs allowlist; run-now
+        // only for the principal's own job through the principal's own
+        // agent-ops daemon; a setting only for a declared key. The kernel
+        // verbs (`pkg_set_enabled`, `pkg_uninstall`, `pkg_supervisor_restart`)
+        // stay in `desktop_only.toml`: the daemon has no kernel to run them.
+        "pkg_sidecar_call" => rpc_exec::pkg_sidecar_call(&state, &payload.args).await,
+        "action_exec" => rpc_exec::action_exec(&state, &payload.args).await,
+        "comment_route" => rpc_exec::comment_route(&state, &payload.args).await,
+        "agent_ops_run_now" => rpc_exec::agent_ops_run_now(&state, &payload.args).await,
+        "pkg_settings_set" => rpc_exec::pkg_settings_set(&state, &payload.args).await,
+
         // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
         //
         // Every access arm, the permission decide core, the T0 ask relay and
@@ -802,6 +883,12 @@ pub async fn rpc_handler(
         | "access_audit_export"
         | "access_audit_record_local"
         | "access_audit_reseal"
+        | "access_push_config"
+        | "access_push_subscribe"
+        | "access_push_update"
+        | "access_push_unsubscribe"
+        | "access_push_list"
+        | "access_push_test"
         | "permission_decide"
         | "permission_relay_put"
         | "permission_relay_take"
@@ -811,6 +898,15 @@ pub async fn rpc_handler(
             crate::access::rpc::serve_daemon(access.as_deref(), ctx.as_ref(), cmd, &payload.args)
                 .await
         }
+
+        // --- WP-P9: in-app updates ---
+        //
+        // `internal` (only the T1 broker's own call reaches it): how many
+        // terminals a restart of this process would end. Served by T0 and
+        // principal children alike; nothing else.
+        "server_open_terminals" => RpcResponse::success(serde_json::json!({
+            "open": state.pty_manager.active_session_count(),
+        })),
 
         // --- Unknown Command Fallback ---
         other => {

@@ -3,6 +3,8 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { settingsGet, settingsSet } from '@/lib/tauri-cmd';
 import {
+	browserNotificationPermission,
+	isBrowserHost,
 	isNotificationPermissionGranted,
 	listen,
 	requestNotificationPermission,
@@ -36,6 +38,15 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 	// this inbox renders them read-only with the reason.
 	const [blocked, setBlocked] = useState<string | null>(hostDecideBlock());
 	const [error, setError] = useState<string | null>(null);
+	// Browser only: whether the explicit "Enable notifications" control shows.
+	const [canEnableNotifications, setCanEnableNotifications] = useState(
+		() => isBrowserHost() && browserNotificationPermission() === 'default'
+	);
+
+	async function enableNotifications() {
+		await requestNotificationPermission();
+		setCanEnableNotifications(browserNotificationPermission() === 'default');
+	}
 
 	useEffect(() => {
 		let live = true;
@@ -48,14 +59,18 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 	}, []);
 
 	useEffect(() => {
-		// Initialize desktop notification permissions
-		(async () => {
-			let granted = await isNotificationPermissionGranted();
-			if (!granted) {
-				const permission = await requestNotificationPermission();
-				granted = permission === 'granted';
-			}
-		})();
+		// Initialize desktop notification permissions. A browser only honours
+		// the prompt from a click, so there it is the "Enable notifications"
+		// button below, not an on-mount request.
+		if (!isBrowserHost()) {
+			(async () => {
+				let granted = await isNotificationPermissionGranted();
+				if (!granted) {
+					const permission = await requestNotificationPermission();
+					granted = permission === 'granted';
+				}
+			})();
+		}
 
 		// Read whether this terminal has PreToolUse gating enabled.
 		settingsGet(holdSettingKey(sessionId))
@@ -192,6 +207,20 @@ export function PermissionInbox({ sessionId }: { sessionId: string }) {
 					Hold PreToolUse
 				</label>
 			</div>
+
+			{canEnableNotifications && (
+				<div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+					<span>Get a browser notification when Claude needs you.</span>
+					<Button
+						size="sm"
+						variant="outline"
+						className="h-6 px-2 text-[10px]"
+						onClick={() => void enableNotifications()}
+					>
+						Enable notifications
+					</Button>
+				</div>
+			)}
 
 			{error && (
 				<p role="alert" className="text-[10px] text-rose-400">

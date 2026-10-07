@@ -26,6 +26,7 @@ import { routeOutcomeLabel, routePin } from '@/lib/artifact/route-pin';
 import { focusMarkerProps } from '@/lib/keymap/context-keys';
 import { useCommands } from '@/lib/keymap/dispatcher';
 import { commentCreate, pinScreenshotWrite } from '@/lib/tauri-cmd';
+import { honestRpcError } from '@/lib/transport/unavailable';
 import {
 	readArtifactSink,
 	studioSinkToPreferredPtyId,
@@ -70,6 +71,10 @@ export function PinComposer({
 	const [text, setText] = useState('');
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	// Set when the pin was saved but routing it failed: the dialog stays open to
+	// say so (it used to close with only a console.error), and re-submitting is
+	// off the table because it would create a second pin.
+	const [routeFailure, setRouteFailure] = useState<string | null>(null);
 	const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
 	// Reset state every time we open with a fresh pick. Closing keeps the
@@ -78,6 +83,7 @@ export function PinComposer({
 		if (open && pick) {
 			setText('');
 			setError(null);
+			setRouteFailure(null);
 			// Defer focus until the Radix portal finishes mounting.
 			queueMicrotask(() => textareaRef.current?.focus());
 		}
@@ -123,11 +129,16 @@ export function PinComposer({
 				// against the live PTY snapshot and falls back if it's gone.
 				preferredPtyId = studioSinkToPreferredPtyId(sink) ?? activeTerminalPtyId();
 			}
-			void routePin({ id: created.id, overrideSink, preferredPtyId })
-				.then((res) => console.info('[pin-composer] pin routed:', routeOutcomeLabel(res)))
-				.catch((e) => console.error('[pin-composer] route failed', e));
 			// Bust the grid's pins query so the new pin pops in immediately.
 			void qc.invalidateQueries({ queryKey: ['artifact-grid'] });
+			try {
+				const res = await routePin({ id: created.id, overrideSink, preferredPtyId });
+				console.info('[pin-composer] pin routed:', routeOutcomeLabel(res));
+			} catch (e) {
+				console.error('[pin-composer] route failed', e);
+				setRouteFailure(honestRpcError(e));
+				return;
+			}
 			onClose(true);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
@@ -145,13 +156,16 @@ export function PinComposer({
 	// mount-time gate the last-mounted one's registration always wins
 	// (`registerCommand`'s stack), stealing ⌘↵ from whichever composer is
 	// actually open. Register the handler only while this one is open.
-	useCommands({ 'studio.pin-submit': () => void submit() }, { enabled: open && pick !== null });
+	useCommands(
+		{ 'studio.pin-submit': () => void submit() },
+		{ enabled: open && pick !== null && routeFailure === null }
+	);
 
 	return (
 		<Dialog
 			open={open && pick !== null}
 			onOpenChange={(o) => {
-				if (!o && !busy) onClose(false);
+				if (!o && !busy) onClose(routeFailure !== null);
 			}}
 		>
 			<DialogContent className="sm:max-w-lg">
@@ -186,20 +200,31 @@ export function PinComposer({
 					onChange={(e) => setText(e.target.value)}
 					placeholder="What needs to change here?"
 					rows={4}
-					disabled={busy}
+					disabled={busy || routeFailure !== null}
 					className="w-full resize-none rounded border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					{...focusMarkerProps('pin-composer')}
 				/>
 
 				{error && <p className="text-xs text-destructive">{error}</p>}
+				{routeFailure && (
+					<p role="alert" className="text-xs text-destructive">
+						Pin saved, but it wasn't sent anywhere: {routeFailure}
+					</p>
+				)}
 
 				<DialogFooter>
-					<Button variant="ghost" disabled={busy} onClick={() => onClose(false)}>
-						Cancel
-					</Button>
-					<Button disabled={busy || !text.trim()} onClick={() => void submit()}>
-						{busy ? 'Saving…' : 'Add pin'}
-					</Button>
+					{routeFailure ? (
+						<Button onClick={() => onClose(true)}>Close</Button>
+					) : (
+						<>
+							<Button variant="ghost" disabled={busy} onClick={() => onClose(false)}>
+								Cancel
+							</Button>
+							<Button disabled={busy || !text.trim()} onClick={() => void submit()}>
+								{busy ? 'Saving…' : 'Add pin'}
+							</Button>
+						</>
+					)}
 				</DialogFooter>
 				<p className="text-right text-[10px] text-muted-foreground">⌘↵ to submit</p>
 			</DialogContent>

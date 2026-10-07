@@ -329,7 +329,11 @@ mod tests {
                 .fetch_all(&mut conn)
                 .await
                 .unwrap();
-        assert_eq!(applied, ["0001_core", "0002_absorb_auth_events"]);
+        // plans/pwa added `0003_push` after the absorb.
+        assert_eq!(
+            applied,
+            ["0001_core", "0002_absorb_auth_events", "0003_push"]
+        );
 
         let (mut conn, ada) = accounts_db().await;
         migrate(&mut conn, &t1()).await.unwrap();

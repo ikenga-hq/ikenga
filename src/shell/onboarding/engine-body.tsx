@@ -47,6 +47,8 @@ import { type DetectedAgent, pkgInstallFromRegistry, pkgKernelStatus } from '@/l
 import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
 
+import { installUnavailableReason } from '@/lib/desktop-only';
+import { offlineInstallErrorMessage } from './offline-install-error';
 import { useOnboardingStep } from './use-onboarding-step';
 
 export interface EngineStepPayload {
@@ -66,8 +68,6 @@ interface EngineBodyProps {
 const OFFLINE_AGENT_ID = 'engine-noop';
 const ENGINE_NOOP_NPM_NAME = '@ikenga/pkg-engine-noop';
 const ENGINE_NOOP_PKG_ID = 'com.ikenga.engine-noop';
-const REGISTRY_UNREACHABLE_MSG =
-	"Couldn't reach the registry — you can install the offline engine later from Ngwa → Store.";
 
 // Stable display order. The Rust side already knows about these ids in
 // `KNOWN_AGENTS`; the wizard surfaces them whether the binary is present
@@ -272,7 +272,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 			} else {
 				console.error('[onboarding] engine-noop install failed', e);
 			}
-			setOfflineError(REGISTRY_UNREACHABLE_MSG);
+			setOfflineError(offlineInstallErrorMessage(e));
 		},
 	});
 
@@ -296,7 +296,11 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 		)
 	);
 
+	// Gap audit rank 3: offline mode installs the engine-noop pkg, which the
+	// daemon can't do yet — say so up front instead of failing on click.
+	const offlineBlocked = installUnavailableReason();
 	const offlineButtonLabel = (long: boolean) => {
+		if (offlineBlocked && !isOffline) return offlineBlocked;
 		if (offlineMut.isPending) return 'Installing offline engine…';
 		if (isOffline) return 'Offline selected';
 		return long ? 'Use offline mode' : 'Continue offline';
@@ -450,7 +454,8 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 					variant={isOffline ? 'default' : 'secondary'}
 					size="sm"
 					onClick={handleOffline}
-					disabled={offlineMut.isPending}
+					disabled={offlineMut.isPending || (!!offlineBlocked && !isOffline)}
+					title={offlineBlocked || undefined}
 					data-testid="agents-offline-cta"
 				>
 					{offlineButtonLabel(false)}

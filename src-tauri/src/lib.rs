@@ -55,6 +55,11 @@ mod runtime;
 pub mod secrets;
 pub mod secrets_env;
 pub mod server;
+// Transcript usage mirror (`transcript::usage`) compiles into both binaries:
+// the shared Ngwa snapshot join (`server::shared::ngwa`) names its types. The
+// live-session watcher, which emits on a Tauri event channel, stays
+// desktop-only inside the module.
+pub mod transcript;
 
 // --- Desktop facades over the headless `server::shared` substrate ---
 // The implementations already compile into both binaries (WP-19 slices
@@ -91,8 +96,6 @@ mod iyke;
 pub mod notifications;
 #[cfg(feature = "desktop")]
 mod pkg_content;
-#[cfg(feature = "desktop")]
-pub mod transcript;
 #[cfg(feature = "desktop")]
 mod viewer_server;
 // Multi-window substrate (plans/multi-window): the G-WINDOW-MODEL contract

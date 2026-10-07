@@ -14,7 +14,9 @@ import {
 	Lock,
 } from 'lucide-react';
 
+import { NOT_AVAILABLE_ON_SERVER_YET } from '@/lib/transport/unavailable';
 import {
+	isRemoteWebSession,
 	backupExport,
 	backupList,
 	backupDelete,
@@ -39,6 +41,10 @@ import { RestoreWizard } from '@/shell/backup/restore-wizard';
 const BACKUPS_QUERY_KEY = ['settings', 'backup', 'list'] as const;
 
 export function BackupSectionBody() {
+	// Gap audit rank 18: the daemon serves backup_list / backup_delete (confined
+	// to <data-dir>/backups) but not export / restore, so a browser session
+	// keeps the list and says so for the two controls that can't run.
+	const remote = isRemoteWebSession();
 	const qc = useQueryClient();
 	const backups = useQuery({
 		queryKey: BACKUPS_QUERY_KEY,
@@ -154,7 +160,6 @@ export function BackupSectionBody() {
 
 	return (
 		<div className="space-y-4">
-
 			{error && (
 				<Alert variant="destructive">
 					<AlertTriangle className="h-4 w-4" />
@@ -170,36 +175,45 @@ export function BackupSectionBody() {
 				</Alert>
 			)}
 
-			<Card className="p-5">
-				<div className="flex items-start justify-between gap-4">
-					<div>
-						<h2 className="text-base font-medium">Export now</h2>
-						<p className="mt-1 text-sm text-muted-foreground">
-							You'll be asked for a passphrase to protect any vault secrets in the bundle.
-						</p>
-					</div>
-					<Button onClick={onPickExportDest} disabled={busy !== null}>
-						<Download className="mr-2 h-4 w-4" />
-						{busy === 'export' ? 'Exportingâ€¦' : 'Export'}
-					</Button>
-				</div>
-			</Card>
+			{remote ? (
+				<Card className="p-5" data-testid="backup-unavailable">
+					<h2 className="text-base font-medium">Export and restore</h2>
+					<p className="mt-1 text-sm text-muted-foreground">{NOT_AVAILABLE_ON_SERVER_YET}.</p>
+				</Card>
+			) : (
+				<>
+					<Card className="p-5">
+						<div className="flex items-start justify-between gap-4">
+							<div>
+								<h2 className="text-base font-medium">Export now</h2>
+								<p className="mt-1 text-sm text-muted-foreground">
+									You'll be asked for a passphrase to protect any vault secrets in the bundle.
+								</p>
+							</div>
+							<Button onClick={onPickExportDest} disabled={busy !== null}>
+								<Download className="mr-2 h-4 w-4" />
+								{busy === 'export' ? 'Exportingâ€¦' : 'Export'}
+							</Button>
+						</div>
+					</Card>
 
-			<Card className="p-5">
-				<div className="flex items-start justify-between gap-4">
-					<div>
-						<h2 className="text-base font-medium">Restore from file</h2>
-						<p className="mt-1 text-sm text-muted-foreground">
-							Pick a <code>.ikbak</code> file. The wizard walks through what will be replaced
-							before anything is applied.
-						</p>
-					</div>
-					<Button variant="outline" onClick={onOpenRestoreWizard} disabled={busy !== null}>
-						<Upload className="mr-2 h-4 w-4" />
-						Restore
-					</Button>
-				</div>
-			</Card>
+					<Card className="p-5">
+						<div className="flex items-start justify-between gap-4">
+							<div>
+								<h2 className="text-base font-medium">Restore from file</h2>
+								<p className="mt-1 text-sm text-muted-foreground">
+									Pick a <code>.ikbak</code> file. The wizard walks through what will be replaced
+									before anything is applied.
+								</p>
+							</div>
+							<Button variant="outline" onClick={onOpenRestoreWizard} disabled={busy !== null}>
+								<Upload className="mr-2 h-4 w-4" />
+								Restore
+							</Button>
+						</div>
+					</Card>
+				</>
+			)}
 
 			<Card className="p-5">
 				<div className="mb-3 flex items-center justify-between">
@@ -333,7 +347,13 @@ export function BackupSectionBody() {
 				</DialogContent>
 			</Dialog>
 
-			<RestoreWizard open={restoreOpen} onOpenChange={setRestoreOpen} onStaged={onRestoreStaged} />
+			{!remote && (
+				<RestoreWizard
+					open={restoreOpen}
+					onOpenChange={setRestoreOpen}
+					onStaged={onRestoreStaged}
+				/>
+			)}
 		</div>
 	);
 }
@@ -390,4 +410,3 @@ function shortPath(p: string): string {
 	const slash = p.indexOf('/', idx + home.length);
 	return slash > 0 ? `~${p.slice(slash)}` : p;
 }
-
