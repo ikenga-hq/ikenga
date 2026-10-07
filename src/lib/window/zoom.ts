@@ -28,7 +28,7 @@
 
 import { emit, listen } from '@/lib/transport';
 import { getCurrentWebview } from '@/lib/transport';
-import { isTauri } from '../transport';
+import { isBrowserSession, isTauri } from '../transport';
 import { registerCommands } from '@/lib/keymap/commands';
 
 const STORAGE_KEY = 'ikenga.zoom';
@@ -160,7 +160,12 @@ export const ZOOM_COMMANDS = {
 export function installZoom(): () => void {
 	void applyLocally(readStored());
 
-	const unregister = registerCommands(ZOOM_COMMANDS);
+	// In a browser tab the browser's own zoom owns Ctrl/Cmd + = / - / 0:
+	// `applyLocally` cannot zoom a page, and with a handler registered the
+	// dispatcher would claim the key and `preventDefault` it, killing native
+	// zoom for nothing. No handler → `canRunCommand` is false → the dispatcher
+	// never claims the key.
+	const unregister = isBrowserSession() ? () => {} : registerCommands(ZOOM_COMMANDS);
 
 	// Follow sibling windows. `emit` is broadcast-to-all including the sender,
 	// so guard on the value to avoid re-applying our own change.

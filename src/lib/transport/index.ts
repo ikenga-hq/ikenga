@@ -437,7 +437,22 @@ export function isRemoteWebSession(): boolean {
  * behaviour and the mocked-`invoke` test harnesses are unchanged.
  */
 export function isBrowserHost(): boolean {
-	return !isTauri() && (isRemoteWebSession() || isBrowserEntry());
+	return isBrowserSession();
+}
+
+/**
+ * True when this page is the SPA running in a normal browser tab against
+ * `ikenga-server` (any tier), as opposed to the Tauri desktop shell, a test
+ * harness or a Node import.
+ *
+ * Use this — not `isRemoteWebSession()` alone — to decide browser-only UI
+ * behaviour (browser shortcut layer, unload guard, drop guard): a T1 or
+ * paired-device tab has no bearer token, so `isRemoteWebSession()` can be
+ * false there before boot's tier probe lands. `isBrowserEntry()` is set by
+ * the first module `main.tsx` evaluates, so it covers that window.
+ */
+export function isBrowserSession(): boolean {
+	return !isTauri() && (isBrowserEntry() || isRemoteWebSession());
 }
 
 /**

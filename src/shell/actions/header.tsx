@@ -42,6 +42,7 @@ import {
 import { SettingsScopeSwitch } from '@/shell/settings/scope-switch';
 import { handToChi } from '@/shell/companion/companion-store';
 import type { ActionsTabId } from './types';
+import { copyText } from '@/lib/clipboard';
 
 function fileBaseName(root: string | null): string {
 	return (
@@ -103,11 +104,10 @@ export function ActionsHeader({ tab, scope, onScopeChange, model }: ActionsHeade
 	const canReset = tab === 'actions' || tab === 'menus' || tab === 'keys';
 
 	async function handleCopy() {
-		try {
-			await navigator.clipboard.writeText(iykeLine);
+		if (await copyText(iykeLine)) {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1200);
-		} catch {
+		} else {
 			setCopied(false);
 		}
 	}
