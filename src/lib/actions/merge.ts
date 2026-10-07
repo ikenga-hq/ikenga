@@ -29,7 +29,8 @@
 //   binding commands), `W_NEGATIVE_NOOP`; plus the merge's own
 //   `E_LOCKED_HIDDEN` rejection.
 
-import { DEFAULT_KEYMAP, type KeymapEntry, type KeymapSource } from '@/lib/keymap/defaults';
+import { defaultKeymap } from '@/lib/keymap/browser-layer';
+import type { KeymapEntry, KeymapSource } from '@/lib/keymap/defaults';
 import { canonicalizeKeySequence, validateKeySequence } from '@/lib/keymap/platform';
 import {
 	comparableKeySequence,
@@ -182,7 +183,8 @@ export interface MergeInput {
 	files: ActionsFilesResult | null;
 	/** Package actions in grant order (`readPackageActions`). */
 	packages: readonly PackageActionSource[];
-	/** The default layer; `DEFAULT_KEYMAP` unless a test substitutes one. */
+	/** The default layer; `defaultKeymap()` (desktop defaults or their browser
+	 *  remap) unless a test substitutes one. */
 	defaults?: readonly KeymapEntry[];
 }
 
@@ -517,7 +519,7 @@ export function mergeKeymap(
 	knownCommand: (id: string) => boolean
 ): KeymapMergeResult {
 	const files = input.files;
-	const defaults = defaultRecs(input.defaults ?? DEFAULT_KEYMAP);
+	const defaults = defaultRecs(input.defaults ?? defaultKeymap());
 	const personalBindings = files?.personal.keybindings.document?.bindings ?? [];
 	const projectBindings = files?.project?.keybindings.document?.bindings ?? [];
 	const projectHeld = isProjectKeybindingsHeld(files);

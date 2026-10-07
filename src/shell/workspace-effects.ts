@@ -21,6 +21,7 @@ import { useRemoteConfigFocusRefetch } from '@/lib/queries/claude-config';
 import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
+import { installUnloadGuard } from '@/lib/window/unload-guard';
 import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useTerminalStore } from '@/terminal/session-store';
 import { isTauri } from '@/lib/transport';
@@ -136,6 +137,11 @@ export function useWorkspaceEffects(
 			dispose?.();
 		};
 	}, []);
+
+	// Browser tab only: a terminal's Ctrl+W / T / N / Q belong to the browser
+	// and close the Ikenga tab, which a page cannot stop — so ask before the
+	// tab goes while terminals are open. No-op on the desktop.
+	useEffect(() => installUnloadGuard(), []);
 
 	// Rehydrate terminal sessions, then the pane tree, then start
 	// persisting pane-tree changes. Order matters: pane-persistence

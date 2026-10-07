@@ -35,7 +35,7 @@
  */
 
 import { getCurrentWebview } from '@/lib/transport';
-import { isTauri } from '../transport';
+import { isBrowserSession, isTauri } from '../transport';
 
 export const OS_FILE_DROP_EVENT = 'ikenga:os-file-drop';
 
@@ -123,10 +123,97 @@ function hideOverlay(): void {
 	if (overlay) overlay.style.display = 'none';
 }
 
+/** True for a drag that carries files from the user's computer (not an
+ *  in-app drag, which uses its own MIME types). */
+function hasFiles(e: DragEvent): boolean {
+	return Array.from(e.dataTransfer?.types ?? []).includes('Files');
+}
+
+export const BROWSER_DROP_NOTICE_ID = 'os-file-drop-notice';
+export const BROWSER_DROP_MESSAGE = "Dropping local files isn't supported in the browser yet.";
+const NOTICE_MS = 3500;
+
+let noticeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Inline, toast-free message: one fixed pill, anchored over the drop surface
+ *  under the cursor when there is one, else bottom-centre. */
+function showBrowserDropNotice(e: DragEvent): void {
+	let el = document.getElementById(BROWSER_DROP_NOTICE_ID) as HTMLDivElement | null;
+	if (!el) {
+		el = document.createElement('div');
+		el.id = BROWSER_DROP_NOTICE_ID;
+		el.setAttribute('role', 'status');
+		Object.assign(el.style, {
+			position: 'fixed',
+			zIndex: '2147483647',
+			pointerEvents: 'none',
+			padding: '6px 14px',
+			borderRadius: '999px',
+			font: '500 12px/1.4 var(--font-sans, system-ui, sans-serif)',
+			color: 'var(--primary-fg, #fff)',
+			background: 'var(--primary, #6ea8fe)',
+			boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+			whiteSpace: 'nowrap',
+			transform: 'translate(-50%, -50%)',
+		} as Partial<CSSStyleDeclaration>);
+		document.body.appendChild(el);
+	}
+	const surface = surfaceAt(e.clientX, e.clientY);
+	if (surface) {
+		const r = surface.getBoundingClientRect();
+		el.style.left = `${r.left + r.width / 2}px`;
+		el.style.top = `${r.top + r.height / 2}px`;
+	} else {
+		el.style.left = '50%';
+		el.style.top = `${Math.max(0, window.innerHeight - 40)}px`;
+	}
+	el.textContent = BROWSER_DROP_MESSAGE;
+	el.style.display = 'block';
+	if (noticeTimer) clearTimeout(noticeTimer);
+	noticeTimer = setTimeout(() => {
+		el.style.display = 'none';
+		noticeTimer = null;
+	}, NOTICE_MS);
+}
+
+/**
+ * Browser tab only. A file dragged in from the user's computer would make the
+ * browser navigate the tab to that file (replacing Ikenga), because nothing on
+ * the page cancels the default. Cancel it at the window, for `Files` drags
+ * only (in-app drags carry their own types and are untouched), and say why
+ * nothing happened. Capture phase, so it holds even where a surface's own
+ * handler forgets to `preventDefault`.
+ */
+export function installBrowserFileDropGuard(): () => void {
+	const onDragOver = (e: DragEvent) => {
+		if (!hasFiles(e)) return;
+		// preventDefault alone marks the surface a valid drop target so Chromium
+		// still fires `drop` (which is what shows the notice). Do NOT set
+		// dropEffect='none': that makes Chromium cancel the drag and never fire
+		// `drop`, so the notice would never appear on a real file drop.
+		e.preventDefault();
+	};
+	const onDrop = (e: DragEvent) => {
+		if (!hasFiles(e)) return;
+		e.preventDefault();
+		showBrowserDropNotice(e);
+	};
+	window.addEventListener('dragover', onDragOver, true);
+	window.addEventListener('drop', onDrop, true);
+	return () => {
+		window.removeEventListener('dragover', onDragOver, true);
+		window.removeEventListener('drop', onDrop, true);
+		if (noticeTimer) clearTimeout(noticeTimer);
+		noticeTimer = null;
+		document.getElementById(BROWSER_DROP_NOTICE_ID)?.remove();
+	};
+}
+
 export async function initOsFileDrop(): Promise<() => void> {
 	if (!isTauri()) {
-		console.log('[transport] api/webview (os-file-drop) is desktop-only — deferred to Wave 2');
-		return () => {};
+		// Browser tab: no native drag-drop event, and an unguarded file drop
+		// navigates away. Anything else non-Tauri (tests, harnesses) is a no-op.
+		return isBrowserSession() ? installBrowserFileDropGuard() : () => {};
 	}
 	const webview = getCurrentWebview();
 	const unlisten = await webview.onDragDropEvent((event: any) => {

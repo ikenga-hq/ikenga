@@ -11,7 +11,6 @@ import {
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
-import { writeClipboardText } from '@/lib/transport';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';
@@ -30,6 +29,7 @@ import { PreviewUnavailable } from './preview-unavailable';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
+import { copyText } from '@/lib/clipboard';
 
 function isHtmlPath(path: string): boolean {
 	const lower = path.toLowerCase();
@@ -209,7 +209,7 @@ function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 		'viewer.add-pin': () => {
 			if (menu) setPick(menu.pick);
 		},
-		'copy-path': () => void writeClipboardText(path).catch(() => {}),
+		'copy-path': () => void copyText(path),
 		'viewer.open-in-studio': () => {
 			if (paneId) replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' });
 		},

@@ -375,7 +375,13 @@ type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 pub struct Registry {
     inner: Mutex<Inner>,
     clock: Clock,
+    /// Called (outside the lock) when a device's key confirmation moves a
+    /// session to `awaiting_host`: the push producer (plans/pwa S3 §5).
+    on_awaiting: std::sync::OnceLock<OnAwaiting>,
 }
+
+/// `(beginner principal id, pairing id)`.
+pub type OnAwaiting = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 impl Default for Registry {
     fn default() -> Self {
@@ -398,7 +404,13 @@ impl Registry {
         Self {
             inner: Mutex::new(Inner::default()),
             clock,
+            on_awaiting: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the "a device is asking to pair" hook (once).
+    pub fn set_on_awaiting(&self, f: OnAwaiting) {
+        let _ = self.on_awaiting.set(f);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -871,8 +883,13 @@ impl Registry {
                 Some(pairing_id.to_string()),
             ));
         }
-        if let Some(s) = inner.sessions.get_mut(pairing_id) {
+        let beginner = inner.sessions.get_mut(pairing_id).map(|s| {
             s.state = State::AwaitingHost;
+            s.beginner.clone()
+        });
+        drop(inner);
+        if let (Some(beginner), Some(f)) = (beginner, self.on_awaiting.get()) {
+            f(&beginner, pairing_id);
         }
         Ok(())
     }
@@ -1788,6 +1805,45 @@ mod tests {
                 pairing_id: t.pairing_id.clone()
             }]
         );
+    }
+
+    /// plans/pwa S3 §5: a good key confirmation (and only that) tells the
+    /// push producer "a device is asking to pair", naming the beginner.
+    #[test]
+    fn a_confirmed_device_fires_the_awaiting_hook_once() {
+        let (_, reg) = manual_clock();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        {
+            let seen = seen.clone();
+            reg.set_on_awaiting(Arc::new(move |b: &str, p: &str| {
+                seen.lock().unwrap().push((b.to_string(), p.to_string()))
+            }));
+        }
+        let t = reg.begin("owner-x", None).unwrap();
+        let (dev, _) = device_hello(&reg, &t.code, "s", "10.0.0.2").unwrap();
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "hello alone is not a request"
+        );
+        reg.confirm(
+            &dev.pairing_id,
+            &spake::b64(&dev.keys.device_confirm()),
+            "10.0.0.2",
+        )
+        .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("owner-x".to_string(), t.pairing_id.clone())]
+        );
+        // A replayed confirm is refused and fires nothing.
+        assert!(reg
+            .confirm(
+                &dev.pairing_id,
+                &spake::b64(&dev.keys.device_confirm()),
+                "10.0.0.2"
+            )
+            .is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// Review m3: during the host-wide pause, pending reports the burned

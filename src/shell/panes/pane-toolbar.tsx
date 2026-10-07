@@ -49,7 +49,7 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
-import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { openExternalUrl } from '@/lib/transport';
 import { desktopOnlyReason } from '@/lib/desktop-only';
 import { isRemoteWebSession, pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
 import { type ReactNode, useState } from 'react';
@@ -58,6 +58,7 @@ import { handToChi } from '@/shell/companion/companion-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
+import { copyText } from '@/lib/clipboard';
 
 // No shortcut on the viewer-zoom rows: the shipped `⌘+` / `⌘−` / `⌘0` labels
 // belonged to the window-level `zoom.*` keys, not to these items (G-ACTIONS
@@ -319,7 +320,7 @@ function PaneMenuBody({
 			'pane.split-right': () => splitPane(paneId, 'horizontal'),
 			'pane.split-down': () => splitPane(paneId, 'vertical'),
 			'copy-path': () => {
-				if (tabPath !== undefined) void writeClipboardText(tabPath).catch(() => {});
+				if (tabPath !== undefined) void copyText(tabPath);
 			},
 			'viewer.open-in-browser': () => {
 				if (artifactPath)
@@ -334,7 +335,7 @@ function PaneMenuBody({
 			'viewer.copy-url': () => {
 				if (artifactPath)
 					void resolveHtmlViewerUrl(artifactPath)
-						.then((url) => writeClipboardText(url))
+						.then((url) => copyText(url))
 						.catch(() => {});
 			},
 			'viewer.zoom-in': () => zoomBy(paneId, 10),
