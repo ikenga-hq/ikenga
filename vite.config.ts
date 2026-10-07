@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react';
 import { TanStackRouterVite } from '@tanstack/router-vite-plugin';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
+import { swPlugin } from './scripts/pwa/vite-plugin-sw';
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -50,6 +51,9 @@ export default defineConfig({
 		stripDevRoutesPlugin(),
 		react(),
 		tailwindcss(),
+		// plans/pwa S1: emits dist/sw.js (build only). Registered by the
+		// browser-served app alone — never under Tauri (src/lib/pwa/register.ts).
+		swPlugin({ root: __dirname }),
 	],
 
 	resolve: {

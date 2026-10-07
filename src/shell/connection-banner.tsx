@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useOnline } from '@/lib/pwa/use-online';
 import { connectionStateStore, type RemoteConnectionInfo } from '@/lib/transport/connection-state';
 
 function plural(n: number, one: string, many: string): string {
@@ -33,6 +34,9 @@ export function summarize(info: RemoteConnectionInfo): string {
 export function ConnectionBanner() {
 	const [info, setInfo] = useState<RemoteConnectionInfo>(() => connectionStateStore.get());
 	const [countdown, setCountdown] = useState<number>(0);
+	// plans/pwa S1 (W2): offline is said as such — the host is fine, this
+	// device just can't reach it.
+	const online = useOnline();
 
 	useEffect(() => {
 		return connectionStateStore.subscribe((nextInfo) => {
@@ -101,9 +105,11 @@ export function ConnectionBanner() {
 				style={{ background: 'var(--warning, #eab308)' }}
 			/>
 			<b className="font-semibold" style={{ color: 'var(--warning, #eab308)' }}>
-				{info.state === 'reconnecting' ? 'Reconnecting' : 'Disconnected'}
+				{!online ? 'Offline' : info.state === 'reconnecting' ? 'Reconnecting' : 'Disconnected'}
 			</b>
-			<span className="text-muted-foreground">— {summarize(info)}</span>
+			<span className="text-muted-foreground">
+				— {online ? summarize(info) : "Can't reach the Ikenga server from this device."}
+			</span>
 			<span
 				className="ml-auto font-mono text-[10px]"
 				style={{ color: 'var(--fg-faint, rgba(255, 255, 255, 0.4))' }}

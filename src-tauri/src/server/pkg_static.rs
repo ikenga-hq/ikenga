@@ -53,7 +53,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{header, Response, StatusCode};
+use axum::http::{header, HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use mime_guess::from_path;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -484,11 +484,32 @@ fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     Some(canonical)
 }
 
+/// Pkg bytes are same-origin with the SPA (see the module docs), so a pkg
+/// script fetched as a service worker would install under `/pkgs/<id>/` and
+/// intercept that pkg's requests, credentials and all. No pkg is a worker:
+/// the browser's `Service-Worker: script` fetch is refused outright.
+fn refuse_service_worker(headers: &HeaderMap) -> Option<Response<Body>> {
+    if !super::static_files::is_service_worker_fetch(headers) {
+        return None;
+    }
+    Some(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from("Forbidden"))
+            .expect("static 403 response is well-formed"),
+    )
+}
+
 /// `GET /pkgs/:id` — the pkg's `index.html`.
 pub async fn pkg_static_root_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(pkg_id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Some(refused) = refuse_service_worker(&headers) {
+        return refused;
+    }
     state.pkg_static.handle(&pkg_id, "").await
 }
 
@@ -496,7 +517,11 @@ pub async fn pkg_static_root_handler(
 pub async fn pkg_static_file_handler(
     State(state): State<Arc<AppState>>,
     AxumPath((pkg_id, path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Some(refused) = refuse_service_worker(&headers) {
+        return refused;
+    }
     state.pkg_static.handle(&pkg_id, &path).await
 }
 
@@ -683,6 +708,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // plans/pwa S1: no pkg file installs as a service worker, even with a
+        // valid credential, under every URL form.
+        std::fs::write(
+            tmp.path().join("com.test.good/dist/sw.js"),
+            "self.onfetch=()=>{}",
+        )
+        .unwrap();
+        for uri in [
+            "/pkgs/com.test.good",
+            "/pkgs/com.test.good/",
+            "/pkgs/com.test.good/sw.js",
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .header("authorization", "Bearer tok")
+                .header("service-worker", "script")
+                .body(AxumBody::empty())
+                .unwrap();
+            let res = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} installed as a worker"
+            );
+        }
+        assert_eq!(
+            get("/pkgs/com.test.good/sw.js", true)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "the same file still loads as an ordinary script"
+        );
     }
 
     #[tokio::test]

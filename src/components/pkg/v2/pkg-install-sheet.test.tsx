@@ -32,6 +32,13 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	pkgInstallFromRegistry: (...args: unknown[]) => pkgInstallFromRegistryMock(...args),
 }));
 
+// Gap audit rank 3: flipped per test to emulate a browser session.
+const installBlockedMock = vi.hoisted(() => ({ reason: false as string | false }));
+vi.mock('@/lib/desktop-only', async (orig) => ({
+	...(await orig<typeof import('@/lib/desktop-only')>()),
+	installUnavailableReason: () => installBlockedMock.reason,
+}));
+
 const useRegistryIndexMock = vi.fn();
 const useRegistryPkgDetailMock = vi.fn();
 const useInstallPlanResolverMock = vi.fn();
@@ -48,7 +55,10 @@ vi.mock('@/lib/registry/use-registry', async (orig) => ({
 // Import AFTER the mocks are declared so the module picks them up.
 import { PkgInstallSheet } from './pkg-install-sheet';
 
-afterEach(cleanup);
+afterEach(() => {
+	cleanup();
+	installBlockedMock.reason = false;
+});
 
 beforeEach(() => {
 	useRegistryIndexMock.mockReturnValue({
@@ -265,5 +275,27 @@ describe('PkgInstallSheet — pkg-targeted', () => {
 		});
 		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} pkg={makePkg()} />));
 		expect(screen.getByText(/registry unreachable: offline/i)).toBeTruthy();
+	});
+});
+
+/* ───── Browser session (gap audit rank 3) ───── */
+
+describe('PkgInstallSheet — install unavailable on this server', () => {
+	it('Local path Install is disabled and reads the honest reason', async () => {
+		installBlockedMock.reason = 'Not available on this server yet';
+		const user = userEvent.setup();
+		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} defaultTab="local-path" />));
+		await user.type(screen.getByPlaceholderText(/\/Users\/you\/my-pkg/i), '/tmp/my-pkg');
+		const btn = screen.getByRole('button', { name: 'Not available on this server yet' });
+		expect((btn as HTMLButtonElement).disabled).toBe(true);
+		await user.click(btn);
+		expect(pkgInstallFromPathMock).not.toHaveBeenCalled();
+	});
+
+	it('the registry CTA is disabled and reads the honest reason', () => {
+		installBlockedMock.reason = 'Not available on this server yet';
+		render(withQuery(<PkgInstallSheet open onOpenChange={() => {}} pkg={makePkg()} />));
+		const btn = screen.getByRole('button', { name: 'Not available on this server yet' });
+		expect((btn as HTMLButtonElement).disabled).toBe(true);
 	});
 });

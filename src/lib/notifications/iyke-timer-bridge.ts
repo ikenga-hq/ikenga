@@ -11,6 +11,7 @@
 import { listen } from '@/lib/transport';
 import { isTauri } from '@/lib/transport';
 import {
+	isBrowserHost,
 	isNotificationPermissionGranted,
 	requestNotificationPermission,
 	sendNotification,
@@ -93,9 +94,10 @@ async function fireOsNotification(payload: IykeTimerFiredPayload): Promise<void>
 		const granted = await isNotificationPermissionGranted();
 		if (!granted) {
 			const result = await requestNotificationPermission();
-			if (result !== 'granted') return;
+			// In a browser `sendNotification` falls back to a toast.
+			if (result !== 'granted' && !isBrowserHost()) return;
 		}
-		sendNotification({
+		void sendNotification({
 			title: payload.title,
 			body: payload.body ?? '',
 		});

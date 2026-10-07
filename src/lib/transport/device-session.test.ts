@@ -7,6 +7,7 @@ import {
 	bootsIntoRemote,
 	detectAccessStatus,
 	isDeviceSession,
+	UNREACHABLE,
 } from './device-session';
 
 afterEach(() => {
@@ -64,5 +65,47 @@ describe('detectAccessStatus', () => {
 		stubFetch(401, {});
 		expect(await detectAccessStatus()).toBeNull();
 		expect(isDeviceSession()).toBe(false);
+	});
+
+	// plans/pwa S1 (W2): no server at all is not "no credential".
+	it('reports an unreachable server distinctly from a missing credential', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => {
+				throw new TypeError('Failed to fetch');
+			})
+		);
+		expect(await detectAccessStatus()).toBe(UNREACHABLE);
+		expect(bootsIntoRemote(UNREACHABLE)).toBe(false);
+		expect(isDeviceSession()).toBe(false);
+
+		for (const gateway of [502, 503, 504]) {
+			stubFetch(gateway, {});
+			expect(await detectAccessStatus()).toBe(UNREACHABLE);
+		}
+
+		// A malformed body from a server that DID answer is still "no session".
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => ({
+				ok: true,
+				status: 200,
+				json: async () => {
+					throw new SyntaxError('bad json');
+				},
+			}))
+		);
+		expect(await detectAccessStatus()).toBeNull();
+	});
+
+	it('treats any failure while the browser is offline as unreachable', async () => {
+		vi.stubGlobal('navigator', { ...navigator, onLine: false });
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => {
+				throw new Error('aborted');
+			})
+		);
+		expect(await detectAccessStatus()).toBe(UNREACHABLE);
 	});
 });

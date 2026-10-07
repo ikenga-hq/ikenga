@@ -62,7 +62,7 @@ import {
 	seatsResolve,
 	seatsResume,
 } from '@/lib/tauri-cmd';
-import { ensureSeatsLiveSync, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
+import { ensureSeatsLiveSync, invalidateSeats, seatErrorOf, UI_SEAT_CLIENT } from '@/lib/queries/seats';
 import { useShellStore, type CompanionTarget } from '@/lib/shell/shell-store';
 import { useCompanionStore } from '@/shell/companion/companion-store';
 import { resolveTarget } from '@/shell/companion/resolve-target';
@@ -348,6 +348,10 @@ async function sendToSeat(request: ChiSendRequest, seat: SeatAddress, retried = 
 			return sendToSeat(request, seat, true);
 		}
 		throw seatUnavailable(err);
+	} finally {
+		// The roster re-reads after this write even where no `seats://changed`
+		// arrives (a browser session has no event channel yet).
+		void invalidateSeats(route.seat.project_id);
 	}
 }
 

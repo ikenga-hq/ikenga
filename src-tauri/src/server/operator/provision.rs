@@ -1420,6 +1420,13 @@ impl Provisioner {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let account = Self::lookup(&mut tx, username).await?;
         let account = accounts::mark_disabled_in(&mut tx, account.principal_id, self.actor).await?;
+        // plans/pwa S2: a disabled account's devices stop getting pushes now,
+        // not at their next send-time check.
+        crate::server::push::store::delete_for_principal(
+            &mut tx,
+            &account.principal_id.to_string(),
+        )
+        .await?;
         self.backend
             .lock(&account.unix_name, &self.nologin)
             .map_err(ProvisionError::Host)?;

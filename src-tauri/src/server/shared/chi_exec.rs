@@ -944,6 +944,11 @@ async fn cache_finish(
         return Ok(false);
     }
     notify_run_terminal(db, run_id, status, error, artifacts).await;
+    // plans/pwa S3 §3: `cancelled` has no notification row; it is pushed
+    // directly (deduped per run with `cancel_run`'s own call).
+    if status == "cancelled" {
+        crate::server::push::emit_run_cancelled(run_id);
+    }
     Ok(true)
 }
 
@@ -2366,6 +2371,7 @@ pub(crate) async fn cancel_run(
     }
 
     cache_update_status(db, run_id, "cancelled", None).await?;
+    crate::server::push::emit_run_cancelled(run_id);
 
     Ok(ChiRunResult {
         run_id: row.run_id,

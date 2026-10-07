@@ -47,6 +47,8 @@ import type { WorkflowGraph } from '@/lib/workflows/graph';
 import {
 	formatUsageDisplay,
 	resolveTrustFacet,
+	trustFacetLabel,
+	trustUnavailableReason,
 } from '@/lib/ngwa/enrichment';
 import {
 	pkgSettingsGet,
@@ -56,7 +58,9 @@ import {
 	type PkgSettingsField,
 	type PkgSettingsSnapshot,
 } from '@/lib/tauri-cmd';
-import { openExternalUrl } from '@/lib/transport';
+import { toast } from '@/lib/toast';
+import { canOpenLocalPath, isBrowserHost, openLocalPath } from '@/lib/transport';
+import { NOT_AVAILABLE_ON_SERVER_LABEL } from '@/lib/transport/unavailable';
 import type { NgwaAct, NgwaActionStatus, NgwaItemActionSet } from '@/lib/ngwa/use-ngwa-actions';
 import { NgwaFlowRenderer } from './ngwa-flow-renderer';
 import { NgwaPopMenu, type PopItem } from './ngwa-scope-ops';
@@ -179,7 +183,7 @@ export function NgwaItemDetailSurface({
 							{item.version && <span className="vbadge">v{item.version}</span>}
 							<span className={`badge t-${trustFacet}`}>
 								<Shield className="h-3 w-3" />
-								{trustFacet}
+								{trustFacetLabel(trustFacet)}
 							</span>
 							<span className="kindtag">{item.kind}</span>
 						</div>
@@ -641,9 +645,16 @@ function PkgSettingsTab({ item }: { item: NgwaItem }) {
 					<button
 						type="button"
 						className="btn ghost"
-						onClick={() => void openExternalUrl(settingsFilePath)}
+						onClick={() =>
+							void openLocalPath(settingsFilePath, { kind: 'file' }).catch((e) =>
+								toast({
+									label: `Could not open the settings file: ${e instanceof Error ? e.message : String(e)}`,
+									variant: 'error',
+								})
+							)
+						}
 					>
-						<FileText className="h-3.5 w-3.5" /> Open file
+						<FileText className="h-3.5 w-3.5" /> {isBrowserHost() ? 'Download file' : 'Open file'}
 					</button>
 				</span>
 			</div>
@@ -768,6 +779,11 @@ function SettingsFieldRow({
 function PkgPermissionsTab({ item }: { item: NgwaItem }) {
 	const qc = useQueryClient();
 	const trustFacet = resolveTrustFacet(item.trust);
+	// The host never evaluated this pkg's trust (the headless daemon): its
+	// state is unknown — not unsigned, not sandboxed — and there is nothing
+	// here to approve or revoke. `perms` is then only what the manifest
+	// declares (read, not evaluated), or null when it could not be read.
+	const trustUnavailable = trustUnavailableReason(item.trust);
 
 	const grantMutation = useMutation({
 		mutationFn: () => pkgTrustGrant(item.id, item.version ?? '0.0.0'),
@@ -795,9 +811,9 @@ function PkgPermissionsTab({ item }: { item: NgwaItem }) {
 		<div className="idinner">
 			<div className="setscope">
 				<span>trust status: </span>
-				<span className={`badge t-${trustFacet}`}>{trustFacet}</span>
+				<span className={`badge t-${trustFacet}`}>{trustFacetLabel(trustFacet)}</span>
 				<span className="rt">
-					{item.trust.state === 'needs_approval' ? (
+					{trustUnavailable ? null : item.trust.state === 'needs_approval' ? (
 						<button
 							type="button"
 							className="btn primary"
@@ -819,48 +835,70 @@ function PkgPermissionsTab({ item }: { item: NgwaItem }) {
 				</span>
 			</div>
 
-			<div className="grouphead first">Sensitive permissions declared ({totalSensitive})</div>
-			{totalSensitive === 0 ? (
-				<div className="empty">No sensitive permissions requested. Runs fully sandboxed.</div>
-			) : (
-				<div className="perms-list space-y-2">
-					{shellExec.map((cmd) => (
-						<div key={cmd} className="prow2 sensitive">
-							<Terminal className="h-4 w-4 flex-none" />
-							<span className="pt">
-								<span className="p1">shell:exec · {cmd}</span>
-								<span className="p2">Spawn subshell command outside sandbox</span>
-							</span>
-						</div>
-					))}
-					{fsWrite.map((path) => (
-						<div key={path} className="prow2 sensitive">
-							<Folder className="h-4 w-4 flex-none" />
-							<span className="pt">
-								<span className="p1">fs:write · {path}</span>
-								<span className="p2">Write files outside package sandbox</span>
-							</span>
-						</div>
-					))}
-					{net.map((domain) => (
-						<div key={domain} className="prow2">
-							<ExternalLink className="h-4 w-4 flex-none" />
-							<span className="pt">
-								<span className="p1">net · {domain}</span>
-								<span className="p2">Outbound network access</span>
-							</span>
-						</div>
-					))}
-					{vault.map((key) => (
-						<div key={key} className="prow2 sensitive">
-							<Lock className="h-4 w-4 flex-none" />
-							<span className="pt">
-								<span className="p1">vault · {key}</span>
-								<span className="p2">Read protected secret key</span>
-							</span>
-						</div>
-					))}
+			{trustUnavailable && (
+				<div className="empty" data-trust-unavailable>
+					<b>{NOT_AVAILABLE_ON_SERVER_LABEL}.</b> {trustUnavailable}. This pkg's trust state is
+					unknown here — not unsigned, not approved, not sandboxed.{' '}
+					{perms
+						? 'Below is what its manifest declares; nothing here evaluated or approved it.'
+						: 'Its manifest could not be read, so its declared permissions are unknown too.'}
 				</div>
+			)}
+
+			{(!trustUnavailable || perms) && (
+				<>
+					<div className="grouphead first" data-perms-heading>
+						{trustUnavailable
+							? `Sensitive permissions declared in the manifest — not evaluated (${totalSensitive})`
+							: `Sensitive permissions declared (${totalSensitive})`}
+					</div>
+					{totalSensitive === 0 ? (
+						<div className="empty" data-perms-empty>
+							{trustUnavailable
+								? 'The manifest declares no sensitive permissions.'
+								: 'No sensitive permissions requested. Runs fully sandboxed.'}
+						</div>
+					) : (
+						<div className="perms-list space-y-2" data-perms-declared>
+							{shellExec.map((cmd) => (
+								<div key={cmd} className="prow2 sensitive">
+									<Terminal className="h-4 w-4 flex-none" />
+									<span className="pt">
+										<span className="p1">shell:exec · {cmd}</span>
+										<span className="p2">Spawn subshell command outside sandbox</span>
+									</span>
+								</div>
+							))}
+							{fsWrite.map((path) => (
+								<div key={path} className="prow2 sensitive">
+									<Folder className="h-4 w-4 flex-none" />
+									<span className="pt">
+										<span className="p1">fs:write · {path}</span>
+										<span className="p2">Write files outside package sandbox</span>
+									</span>
+								</div>
+							))}
+							{net.map((domain) => (
+								<div key={domain} className="prow2">
+									<ExternalLink className="h-4 w-4 flex-none" />
+									<span className="pt">
+										<span className="p1">net · {domain}</span>
+										<span className="p2">Outbound network access</span>
+									</span>
+								</div>
+							))}
+							{vault.map((key) => (
+								<div key={key} className="prow2 sensitive">
+									<Lock className="h-4 w-4 flex-none" />
+									<span className="pt">
+										<span className="p1">vault · {key}</span>
+										<span className="p2">Read protected secret key</span>
+									</span>
+								</div>
+							))}
+						</div>
+					)}
+				</>
 			)}
 		</div>
 	);
@@ -881,11 +919,18 @@ function PkgFilesTab({
 				<span>install path: </span>
 				<span className="path">{item.install_path ?? '—'}</span>
 				<span className="rt">
-					{item.install_path && (
+					{item.install_path && canOpenLocalPath('folder') && (
 						<button
 							type="button"
 							className="btn ghost"
-							onClick={() => void openExternalUrl(item.install_path!)}
+							onClick={() =>
+								void openLocalPath(item.install_path!, { kind: 'folder' }).catch((e) =>
+									toast({
+										label: `Could not open the folder: ${e instanceof Error ? e.message : String(e)}`,
+										variant: 'error',
+									})
+								)
+							}
 						>
 							<Folder className="h-3.5 w-3.5" /> Reveal in Files
 						</button>

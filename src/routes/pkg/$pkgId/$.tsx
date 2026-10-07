@@ -24,7 +24,9 @@ import { ActionBar } from '@/components/pkg/actions/action-bar';
 import { PkgIframeHost } from '@/components/pkg/pkg-iframe-host';
 import { PkgConsentState } from '@/components/pkg/pkg-view-states';
 import { PkgWebviewHost } from '@/components/pkg/pkg-webview-host';
+import { DESKTOP_ONLY_REASON } from '@/lib/desktop-only';
 import {
+	isRemoteWebSession,
 	type PkgTrustReview,
 	pkgKernelStatus,
 	pkgTrustApprove,
@@ -206,6 +208,19 @@ function PkgRouteCatchAll() {
 		);
 	}
 	if (state.kind === 'webview') {
+		// A native webview can never mount in a browser (gap audit rank 20): say
+		// so instead of asking the daemon for a child webview it cannot create.
+		if (isRemoteWebSession()) {
+			return (
+				<div className="p-6 text-sm" role="status">
+					<div className="font-semibold mb-1">{DESKTOP_ONLY_REASON}</div>
+					<div className="opacity-70">
+						This package opens in a native webview, which the browser can't show. Open it in the
+						Ikenga desktop app.
+					</div>
+				</div>
+			);
+		}
 		return (
 			<PkgWebviewHost
 				pkgId={state.entry.pkg_id}

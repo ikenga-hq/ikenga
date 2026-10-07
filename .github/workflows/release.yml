@@ -171,6 +171,21 @@ jobs:
             - contract
             - tokens
           EOF
+          # This install has no lockfile, so every dependency floats. Pin
+          # what upstream has broken: @codemirror/language 6.13.0
+          # (2026-10-07) imports @codemirror/streamparser without declaring
+          # it, which fails the vite build on every platform. The lockfile
+          # (and so CI) is on 6.12.3. Drop the pin once upstream fixes it.
+          cat > package.json <<'EOF'
+          {
+            "private": true,
+            "pnpm": {
+              "overrides": {
+                "@codemirror/language": "<6.13.0"
+              }
+            }
+          }
+          EOF
           echo "Workspace layout:"
           ls -la
 

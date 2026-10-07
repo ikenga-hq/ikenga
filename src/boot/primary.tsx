@@ -19,7 +19,7 @@ import { useShellStore } from '@/lib/shell/shell-store';
 import { startActionsStore } from '@/lib/actions/store';
 import { installKeyDispatcher, startOsShortcutSync } from '@/lib/keymap/dispatcher';
 import { awaitingFirstToken, detectBrowserTier, getAuthToken, isTauri } from '@/lib/transport';
-import { bootsIntoRemote, detectAccessStatus } from '@/lib/transport/device-session';
+import { bootsIntoRemote, detectAccessStatus, UNREACHABLE } from '@/lib/transport/device-session';
 import { useReauthStore } from '@/lib/transport/reauth-store';
 import { fetchAuthMe, isT1Session } from '@/lib/transport/t1-session';
 import { initDetachedSurfaceTracking } from '@/lib/window/detached-surfaces';
@@ -28,6 +28,7 @@ import { SecretsUnlockSheetProvider } from '@/shell/secrets/unlock-sheet';
 import { AppLockOverlay } from '@/shell/people/app-lock-overlay';
 import { useAppLockStore } from '@/shell/people/app-lock-store';
 import { PairConfirmOverlay } from '@/shell/people/devices-pair-confirm';
+import { ServerUnreachable } from '@/shell/pwa/server-unreachable';
 import { ErrorBoundary } from '@/components/ui/error-boundary';
 import { FilepickerModal } from '@/components/ui/filepicker-modal';
 import { ReauthOverlay } from '@/components/ui/reauth-overlay';
@@ -99,6 +100,18 @@ export async function bootPrimary(): Promise<void> {
 	// device or a password session can also open by hand.
 	if (!isTauri()) {
 		const access = await detectAccessStatus(isT1Session() ? null : getAuthToken());
+		// plans/pwa S1 (W2): the service worker can start this shell with no
+		// network, but nothing here works without the server. Say that, rather
+		// than offering to pair a device that only lost its connection.
+		if (access === UNREACHABLE) {
+			installIkengaDomSync();
+			createRoot(document.getElementById('root')!).render(
+				<React.StrictMode>
+					<ServerUnreachable />
+				</React.StrictMode>
+			);
+			return;
+		}
 		if (!access && !isT1Session() && !getAuthToken()) {
 			installIkengaDomSync();
 			useReauthStore.getState().showPair();

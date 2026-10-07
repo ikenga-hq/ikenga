@@ -26,6 +26,7 @@ import { useUpdatePkgs, type UpdateFailure, type UpdateProgress } from '@/lib/pk
 import { plural } from '@/lib/updater/updater-store';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { isRemoteWebSession } from '@/lib/tauri-cmd';
+import { installUnavailableReason } from '@/lib/desktop-only';
 
 export function PkgAutoUpdater() {
 	const autoCheck = useShellStore((s) => s.updatesAutoCheck);
@@ -148,6 +149,7 @@ export function PkgAutoUpdater() {
 	// · Update all (N)"), opening the shared sheet's Packages tab rather than
 	// running the batch inline — the badge + /packages strip still work too.
 	if (!d.updates.length) return null;
+	const installBlocked = installUnavailableReason();
 	const names = d.updates
 		.slice(0, 2)
 		.map((r) => r.name)
@@ -158,8 +160,13 @@ export function PkgAutoUpdater() {
 			tone="warning"
 			icon={<Package />}
 			actions={
-				<Button size="sm" onClick={() => openSheet('pkgs')}>
-					Update all ({d.updates.length})
+				<Button
+					size="sm"
+					disabled={!!installBlocked}
+					title={installBlocked || undefined}
+					onClick={() => openSheet('pkgs')}
+				>
+					{installBlocked || `Update all (${d.updates.length})`}
 				</Button>
 			}
 		>

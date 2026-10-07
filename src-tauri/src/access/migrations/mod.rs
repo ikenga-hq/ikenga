@@ -59,6 +59,12 @@ pub const STEPS: &[Step] = &[
         name: "0002_absorb_auth_events",
         body: Body::AbsorbAuthEvents,
     },
+    // plans/pwa S2: Web Push subscriptions (`server::push`).
+    Step {
+        version: 3,
+        name: "0003_push",
+        body: Body::Sql(include_str!("0003_push.sql")),
+    },
 ];
 
 pub fn latest() -> i64 {
@@ -277,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn t0_migrates_once_and_seeds_owner_host_and_genesis() {
         let mut conn = mem().await;
-        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 2);
+        assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 3);
         assert_eq!(migrate(&mut conn, &t0()).await.unwrap(), 0);
         assert_eq!(state(&mut conn).await.unwrap(), SetState::Current);
         let tier: String = sqlx::query_scalar("SELECT v FROM store_meta WHERE k = 'tier'")
@@ -344,11 +350,11 @@ mod tests {
     async fn a_newer_set_is_refused_untouched() {
         let mut conn = mem().await;
         migrate(&mut conn, &t0()).await.unwrap();
-        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 3, '0003_future', 0)")
+        sqlx::query("INSERT INTO _operator_migrations VALUES ('access', 4, '0004_future', 0)")
             .execute(&mut conn)
             .await
             .unwrap();
-        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(3));
+        assert_eq!(state(&mut conn).await.unwrap(), SetState::Ahead(4));
         assert!(migrate(&mut conn, &t0()).await.is_err());
     }
 

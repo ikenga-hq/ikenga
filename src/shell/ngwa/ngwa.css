@@ -829,6 +829,12 @@
 	border-color: transparent;
 }
 
+/* Trust the host never evaluated (the headless daemon): neutral, dashed —
+   neither the unsigned warning nor a pass. */
+.view-ngwa .badge.t-unavailable {
+	border-style: dashed;
+}
+
 .view-ngwa .state {
 	font-size: var(--text-micro);
 	display: inline-flex;

@@ -34,6 +34,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => {
 		detectAgent: vi.fn(never),
 		pkgHealthRemove: vi.fn(),
 		pkgHealthRemoveAll: vi.fn(),
+		isRemoteWebSession: vi.fn(() => false),
 	};
 });
 
@@ -150,6 +151,7 @@ describe('a pkg on disk that failed to register (Bug 2)', () => {
 	it('labels the new kinds', () => {
 		expect(issueLabel({ kind: 'pkgs_dir_unloadable' })).toBe('failed to load');
 		expect(issueLabel({ kind: 'register_failed' })).toBe('not registered');
+		expect(issueLabel({ kind: 'pkgs_dir_duplicate', served_path: '/p/a' })).toBe('duplicate, not served');
 	});
 
 	const row = async (container: HTMLElement) =>
@@ -250,6 +252,65 @@ describe('a pkg on disk that failed to register (Bug 2)', () => {
 		expect(notice.textContent).not.toContain('done');
 		// The list reflects the kernel's rescan: the item is still shown.
 		expect(container.querySelector('[data-install="com.ikenga.meetings"]')).not.toBeNull();
+	});
+
+	describe('in a remote web session (the headless daemon)', () => {
+		afterEach(() => {
+			vi.mocked(cmd.isRemoteWebSession).mockReturnValue(false);
+		});
+
+		it('Reinstall from registry is shown disabled with the desktop-only reason, like Remove', async () => {
+			vi.mocked(cmd.isRemoteWebSession).mockReturnValue(true);
+			const onReinstall = vi.fn();
+			const { container } = mount({ canReinstall: () => true, onReinstall });
+			const r = await row(container);
+			const re = r.querySelector<HTMLButtonElement>('[data-reinstall="com.ikenga.meetings"]');
+			expect(re).not.toBeNull();
+			expect(re?.disabled).toBe(true);
+			expect(re?.title).toBe('Desktop app only');
+			fireEvent.click(re as HTMLElement);
+			expect(onReinstall).not.toHaveBeenCalled();
+			const rm = r.querySelector<HTMLButtonElement>('[data-remove="com.ikenga.meetings"]');
+			expect(rm?.disabled).toBe(true);
+			expect(rm?.title).toBe('Desktop app only');
+		});
+	});
+
+	it('a duplicate pkgs-folder copy reads "duplicate, not served": no Reinstall, not "bad", not "disabled"', async () => {
+		vi.mocked(cmd.pkgHealthScan).mockResolvedValueOnce([
+			{
+				id: 'com.ikenga.hello',
+				install_path: '/pkgs/zz-dup',
+				enabled: false,
+				issue: { kind: 'pkgs_dir_duplicate', served_path: '/pkgs/hello' },
+				detail: 'duplicate, not served: com.ikenga.hello is served from /pkgs/hello; this copy is ignored',
+			},
+		]);
+		const onReinstall = vi.fn();
+		const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const { container } = render(
+			<QueryClientProvider client={qc}>
+				<NgwaHealthSurface
+					items={[]}
+					snapshot={mkSnapshot([])}
+					onOpenBackup={() => {}}
+					onOpenStore={() => {}}
+					canReinstall={() => true}
+					onReinstall={onReinstall}
+				/>
+			</QueryClientProvider>
+		);
+		const r = await waitFor(() => {
+			const el = container.querySelector('[data-install="com.ikenga.hello"]');
+			if (!el) throw new Error('row not rendered yet');
+			return el as HTMLElement;
+		});
+		const tag = r.querySelector('[data-issue="pkgs_dir_duplicate"]') as HTMLElement;
+		expect(tag.textContent).toBe('duplicate, not served');
+		expect(tag.className).not.toContain('bad');
+		expect(r.querySelector('[data-reinstall]')).toBeNull();
+		expect(r.textContent).not.toMatch(/\bdisabled\b/);
+		expect(r.textContent).toContain('/pkgs/zz-dup');
 	});
 });
 

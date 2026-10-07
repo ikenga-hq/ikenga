@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Loader2, Music } from 'lucide-react';
-import { viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
+import { isRemoteWebSession, viewerServe, viewerStop, type ViewerHandle } from '@/lib/tauri-cmd';
 import { basename, dirname } from '../lib/path';
+import { PreviewUnavailable } from './preview-unavailable';
 
 interface AudioViewProps {
 	path: string;
@@ -12,7 +13,13 @@ interface AudioViewProps {
 // worth it for a feature that already had to gracefully degrade when
 // WebAudio rejected the codec. Reachable from the file viewer the
 // moment a user opens an audio file from Files mode.
-export function AudioView({ path }: AudioViewProps) {
+export function AudioView(props: AudioViewProps) {
+	// No viewer server in a browser session (gap audit rank 8).
+	if (isRemoteWebSession()) return <PreviewUnavailable name={basename(props.path)} />;
+	return <LocalAudioView {...props} />;
+}
+
+function LocalAudioView({ path }: AudioViewProps) {
 	const [state, setState] = useState<
 		| { kind: 'loading' }
 		| { kind: 'ready'; src: string; handle: ViewerHandle }

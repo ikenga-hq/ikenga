@@ -94,6 +94,7 @@ const ACTION_LABELS: Readonly<Record<string, string>> = {
 	'audit.chain_broken': 'Audit chain broken',
 	'audit.resealed': 'Resealed the audit chain',
 	'secrets.kek_rotated': 'Rotated the secrets key',
+	'server.update_requested': 'Requested a server update',
 };
 
 /** The Action column for one row. */
