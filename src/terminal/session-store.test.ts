@@ -379,11 +379,39 @@ describe('rehydrate: a failed read is not "no saved terminals"', () => {
 		await useTerminalStore.getState().persistToDb();
 		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
 
-		// Dismissing the notice resumes saving.
-		useTerminalStore.getState().dismissRestoreError();
-		expect(useTerminalStore.getState().restoreError).toBeNull();
+		// Resume saving first copies the unreadable list to a side key (D-12),
+		// says where it went, and only then saves the open terminals.
+		await useTerminalStore.getState().resumeSaving();
+		const notice = useTerminalStore.getState().restoreError;
+		expect(notice?.holdsSave).toBe(false);
+		expect(notice?.backupKey).toMatch(/^terminal\.tabs\.unreadable-\d+$/);
+		expect(notice?.message).toContain(notice?.backupKey ?? '<none>');
+		expect(localStorage.getItem(notice?.backupKey ?? '')).toBe('{corrupt');
 		await useTerminalStore.getState().persistToDb();
 		expect(localStorage.getItem('terminal.tabs')).not.toBe('{corrupt');
+
+		useTerminalStore.getState().dismissRestoreError();
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+	});
+
+	it('Resume saving stays paused when the backup copy cannot be written', async () => {
+		localStorage.setItem('terminal.tabs', '{corrupt');
+		await useTerminalStore.getState().rehydrateFromDb();
+		useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+
+		const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+			throw new Error('quota exceeded');
+		});
+		try {
+			await useTerminalStore.getState().resumeSaving();
+		} finally {
+			setItem.mockRestore();
+		}
+		const notice = useTerminalStore.getState().restoreError;
+		expect(notice?.holdsSave).toBe(true);
+		expect(notice?.message).toMatch(/Couldn't back up .*quota exceeded/);
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
 	});
 
 	it('a failed resume-setting read is reported, and nothing is respawned', async () => {

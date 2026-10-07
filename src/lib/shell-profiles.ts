@@ -43,12 +43,43 @@ export function parseCustomShellProfiles(raw: string | null): ShellProfile[] {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		throw new Error(`saved custom shell profiles are not valid JSON (${String(err)})`);
+		throw new CorruptCustomShellsError(`saved custom shell profiles are not valid JSON (${String(err)})`, raw);
 	}
 	if (!Array.isArray(parsed)) {
-		throw new Error('saved custom shell profiles are not a list');
+		throw new CorruptCustomShellsError('saved custom shell profiles are not a list', raw);
 	}
 	return parsed as ShellProfile[];
+}
+
+/**
+ * The saved custom-shells value was read but is corrupt (not a transient read
+ * failure). Carries the raw value so a reset can back it up first (D-13).
+ */
+export class CorruptCustomShellsError extends Error {
+	constructor(
+		message: string,
+		readonly raw: string
+	) {
+		super(message);
+		this.name = 'CorruptCustomShellsError';
+	}
+}
+
+/** Side key a corrupt custom-shells value is copied to before a reset. */
+export function customShellsBackupKey(now: number = Date.now()): string {
+	return `${CUSTOM_SHELL_KEY}.corrupt-${now}`;
+}
+
+/**
+ * Reset a corrupt custom-shells list: copy the raw value to a side key, and
+ * only once that write succeeded, clear the list. Returns the backup key.
+ * Throws (with nothing cleared) if the backup can't be written.
+ */
+export async function resetCorruptCustomShells(raw: string, now: number = Date.now()): Promise<string> {
+	const backupKey = customShellsBackupKey(now);
+	await settingsSet(backupKey, raw);
+	await settingsSet(CUSTOM_SHELL_KEY, '[]');
+	return backupKey;
 }
 
 export function useCustomShellProfiles() {
@@ -75,6 +106,21 @@ export function useCustomShellProfiles() {
 	// list has been read successfully. Until then add/remove refuse.
 	const canEdit = customQuery.isSuccess;
 
+	// Corrupt (not merely unreadable right now): offer a reset that backs the
+	// bad value up to a side key first, then clears the list (D-13).
+	const corrupt = customQuery.error instanceof CorruptCustomShellsError ? customQuery.error : null;
+	const resetMutation = useMutation({
+		mutationFn: async (raw: string) => resetCorruptCustomShells(raw),
+		onSuccess: () => {
+			void queryClient.invalidateQueries({ queryKey: ['settings', CUSTOM_SHELL_KEY] });
+			void queryClient.invalidateQueries({ queryKey: ['terminal', 'shells'] });
+		},
+	});
+	const resetCorrupt = async (): Promise<string | null> => {
+		if (!corrupt) return null;
+		return resetMutation.mutateAsync(corrupt.raw);
+	};
+
 	const addCustomProfile = (profile: Omit<ShellProfile, 'id' | 'isDefault'>): boolean => {
 		if (!customQuery.isSuccess) return false;
 		const newProfile: ShellProfile = {
@@ -97,6 +143,13 @@ export function useCustomShellProfiles() {
 		addCustomProfile,
 		removeCustomProfile,
 		canEdit,
+		/** True when the saved value is corrupt and `resetCorrupt` is offered. */
+		isCorrupt: corrupt !== null,
+		resetCorrupt,
+		/** Side key the corrupt value was copied to by the last reset. */
+		resetBackupKey: resetMutation.data ?? null,
+		resetError: resetMutation.error,
+		isResetting: resetMutation.isPending,
 		isLoading: customQuery.isLoading,
 		error: customQuery.error,
 		refetch: customQuery.refetch,

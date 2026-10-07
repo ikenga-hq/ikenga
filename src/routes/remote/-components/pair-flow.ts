@@ -64,7 +64,18 @@ export function deviceNameFromUA(ua: string): { name: string; platform: string |
 
 /** How a run ended, for the page's outcome states. */
 export type PairOutcome =
-	| { kind: 'allowed'; deviceId: string; tier: string }
+	| {
+			kind: 'allowed';
+			deviceId: string;
+			tier: string;
+			/**
+			 * D-16: the cookie probe answered something unexpected (a proxy 502,
+			 * a network drop), so whether the browser kept the device cookie is
+			 * unconfirmed. Pairing still proceeds, but the page says so. The
+			 * value is the reason, e.g. "the check answered HTTP 502".
+			 */
+			cookieUnconfirmed?: string;
+	  }
 	/**
 	 * The host allowed the device, but the browser didn't keep the
 	 * `ikenga_device` cookie — a `Secure` cookie over plain HTTP off
@@ -232,10 +243,14 @@ export async function runPairing(
 		if (state === 'allowed') {
 			const deviceId = String(st.body.device_id ?? '');
 			// The status response set the cookie — if the browser kept it.
-			const cookie = await probeDeviceCookie(f, deviceId);
-			if (cookie === 'missing') return { kind: 'cookie_rejected', deviceId };
-			if (cookie === 'auth_unavailable') return { kind: 'auth_unavailable', deviceId };
-			return { kind: 'allowed', deviceId, tier: String(st.body.tier ?? '') };
+			const cookie = await probeDeviceCookieDetailed(f, deviceId);
+			if (cookie.state === 'missing') return { kind: 'cookie_rejected', deviceId };
+			if (cookie.state === 'auth_unavailable') return { kind: 'auth_unavailable', deviceId };
+			const tier = String(st.body.tier ?? '');
+			if (cookie.state === 'unknown') {
+				return { kind: 'allowed', deviceId, tier, cookieUnconfirmed: cookie.detail };
+			}
+			return { kind: 'allowed', deviceId, tier };
 		}
 		const done = STATE_OUTCOME[state];
 		if (done) return done;
@@ -254,7 +269,17 @@ export async function runPairing(
 export async function probeDeviceCookie(
 	f: typeof fetch,
 	deviceId: string
-): Promise<'ok' | 'missing' | 'auth_unavailable' | 'unknown'> {
+): Promise<CookieProbeState> {
+	return (await probeDeviceCookieDetailed(f, deviceId)).state;
+}
+
+type CookieProbeState = 'ok' | 'missing' | 'auth_unavailable' | 'unknown';
+
+/** `probeDeviceCookie` plus, for `unknown`, why (for the D-16 warning). */
+export async function probeDeviceCookieDetailed(
+	f: typeof fetch,
+	deviceId: string
+): Promise<{ state: CookieProbeState; detail?: string }> {
 	let res: { status: number; body: Json };
 	try {
 		res = await call(f, '/api/rpc', {
@@ -263,14 +288,15 @@ export async function probeDeviceCookie(
 			body: JSON.stringify({ cmd: 'access_status', args: {} }),
 		});
 	} catch {
-		return 'unknown';
+		return { state: 'unknown', detail: "the check didn't reach the computer" };
 	}
 	const data = res.body.data as
 		| { credential?: { via?: string; deviceId?: string | null } }
 		| undefined;
-	if (res.status === 503 && res.body.code === 'auth_unavailable') return 'auth_unavailable';
-	if (res.status === 401) return 'missing';
-	if (res.status !== 200 || !res.body.ok) return 'unknown';
+	if (res.status === 503 && res.body.code === 'auth_unavailable') return { state: 'auth_unavailable' };
+	if (res.status === 401) return { state: 'missing' };
+	if (res.status !== 200) return { state: 'unknown', detail: `the check answered HTTP ${res.status}` };
+	if (!res.body.ok) return { state: 'unknown', detail: 'the check returned an error' };
 	const cred = data?.credential;
-	return cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing';
+	return { state: cred?.via === 'device' && cred.deviceId === deviceId ? 'ok' : 'missing' };
 }

@@ -21,7 +21,9 @@ import {
 	CUSTOM_SHELL_KEY,
 	DEFAULT_SHELL_KEY,
 	defaultShellReadError,
+	CorruptCustomShellsError,
 	parseCustomShellProfiles,
+	resetCorruptCustomShells,
 	useCustomShellProfiles,
 	useDefaultShellProfile,
 } from './shell-profiles';
@@ -92,6 +94,66 @@ describe('useCustomShellProfiles', () => {
 		const written = JSON.parse(value as string) as { id: string }[];
 		expect(written.map((p) => p.id)[0]).toBe('custom-1');
 		expect(written).toHaveLength(2);
+	});
+});
+
+describe('corrupt custom shells (D-13)', () => {
+	beforeEach(() => {
+		settingsGetMock.mockReset();
+		settingsSetMock.mockReset();
+		settingsSetMock.mockResolvedValue(undefined);
+	});
+
+	it('a parse failure is "corrupt" and carries the raw value', () => {
+		let caught: unknown;
+		try {
+			parseCustomShellProfiles('{not json');
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(CorruptCustomShellsError);
+		expect((caught as CorruptCustomShellsError).raw).toBe('{not json');
+	});
+
+	it('a transient read failure is not corrupt: no reset offered', async () => {
+		settingsGetMock.mockRejectedValue(new Error('ipc timeout'));
+		const { result } = renderHook(() => useCustomShellProfiles(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.error).toBeTruthy());
+		expect(result.current.isCorrupt).toBe(false);
+		await act(async () => {
+			expect(await result.current.resetCorrupt()).toBeNull();
+		});
+		expect(settingsSetMock).not.toHaveBeenCalled();
+	});
+
+	it('reset backs the raw value up to a side key first, then clears the list and re-enables editing', async () => {
+		let stored: string | null = '{not json';
+		settingsGetMock.mockImplementation(async (key: string) => (key === CUSTOM_SHELL_KEY ? stored : null));
+		settingsSetMock.mockImplementation(async (key: string, value: string) => {
+			if (key === CUSTOM_SHELL_KEY) stored = value;
+		});
+		const { result } = renderHook(() => useCustomShellProfiles(), { wrapper: wrapper() });
+		await waitFor(() => expect(result.current.isCorrupt).toBe(true));
+		expect(result.current.canEdit).toBe(false);
+
+		let backupKey: string | null = null;
+		await act(async () => {
+			backupKey = await result.current.resetCorrupt();
+		});
+		expect(String(backupKey).startsWith(`${CUSTOM_SHELL_KEY}.corrupt-`)).toBe(true);
+		expect(settingsSetMock.mock.calls[0]).toEqual([backupKey, '{not json']);
+		expect(settingsSetMock.mock.calls[1]).toEqual([CUSTOM_SHELL_KEY, '[]']);
+
+		await waitFor(() => expect(result.current.canEdit).toBe(true));
+		expect(result.current.isCorrupt).toBe(false);
+		expect(result.current.resetBackupKey).toBe(backupKey);
+	});
+
+	it('does not clear the list when the backup write fails', async () => {
+		settingsSetMock.mockRejectedValueOnce(new Error('disk full'));
+		await expect(resetCorruptCustomShells('{bad', 42)).rejects.toThrow('disk full');
+		expect(settingsSetMock).toHaveBeenCalledTimes(1);
+		expect(settingsSetMock.mock.calls[0]).toEqual([`${CUSTOM_SHELL_KEY}.corrupt-42`, '{bad']);
 	});
 });
 

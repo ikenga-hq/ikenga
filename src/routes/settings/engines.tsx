@@ -297,6 +297,11 @@ function TerminalSectionBody() {
 		canEdit: canEditCustomProfiles,
 		error: customProfilesError,
 		refetch: refetchCustomProfiles,
+		isCorrupt: customProfilesCorrupt,
+		resetCorrupt: resetCorruptCustomProfiles,
+		resetBackupKey: customProfilesBackupKey,
+		resetError: customProfilesResetError,
+		isResetting: isResettingCustomProfiles,
 	} = useCustomShellProfiles();
 
 	const [isAddingCustom, setIsAddingCustom] = useState(false);
@@ -666,10 +671,24 @@ function TerminalSectionBody() {
 							icon={<AlertTriangle />}
 							role="alert"
 							className="rounded-md border"
+							data-testid="custom-shells-read-error"
 							actions={
-								<Button variant="ghost" size="sm" onClick={() => void refetchCustomProfiles()}>
-									Retry
-								</Button>
+								<>
+									{customProfilesCorrupt && (
+										<Button
+											variant="ghost"
+											size="sm"
+											disabled={isResettingCustomProfiles}
+											data-testid="custom-shells-reset"
+											onClick={() => void resetCorruptCustomProfiles().catch(() => {})}
+										>
+											Reset custom shells
+										</Button>
+									)}
+									<Button variant="ghost" size="sm" onClick={() => void refetchCustomProfiles()}>
+										Retry
+									</Button>
+								</>
 							}
 						>
 							<div className="text-[13px] font-semibold">Couldn't read your custom shells</div>
@@ -678,8 +697,31 @@ function TerminalSectionBody() {
 									? customProfilesError.message
 									: String(customProfilesError)}
 								. Adding or removing custom shells is paused so the saved list isn't overwritten.
+								{customProfilesCorrupt &&
+									' Reset custom shells saves a copy of the current value under a backup setting, then starts an empty list.'}
 							</div>
+							{customProfilesResetError && (
+								<div className="mt-1 text-xs" style={{ color: 'var(--danger)' }}>
+									Couldn't reset (
+									{customProfilesResetError instanceof Error
+										? customProfilesResetError.message
+										: String(customProfilesResetError)}
+									). Your custom shells were not cleared.
+								</div>
+							)}
 						</Banner>
+					</div>
+				)}
+
+				{!customProfilesError && customProfilesBackupKey && (
+					<div
+						className="border-t border-border px-4 py-3 text-xs"
+						style={{ color: 'var(--fg-muted)' }}
+						role="status"
+						data-testid="custom-shells-reset-done"
+					>
+						Custom shells were reset. The unreadable value was saved as the setting{' '}
+						<code>{customProfilesBackupKey}</code>.
 					</div>
 				)}
 

@@ -62,6 +62,13 @@ export interface TerminalTab {
 	wasRunning?: boolean;
 }
 
+export interface RestoreNotice {
+	message: string;
+	holdsSave: boolean;
+	/** Where Resume saving put the unreadable list, when it did. */
+	backupKey?: string;
+}
+
 interface TerminalState {
 	tabs: TerminalTab[];
 	activeId: string | null;
@@ -69,9 +76,15 @@ interface TerminalState {
 	/** Set when the last rehydrate couldn't read the saved tab list or the
 	 *  resume setting. `holdsSave` means the saved list was unreadable, so
 	 *  saving is paused (the next save would overwrite it with whatever is
-	 *  open now) until the user dismisses the notice. */
-	restoreError: { message: string; holdsSave: boolean } | null;
+	 *  open now) until the user chooses Resume saving. `backupKey` is set
+	 *  after Resume saving copied the unreadable list to a side key. */
+	restoreError: RestoreNotice | null;
+	/** Clears a notice. For one that holds saving this is `resumeSaving`. */
 	dismissRestoreError: () => void;
+	/** D-12: copy the unreadable saved list to a timestamped side key, and
+	 *  only once that worked, resume saving. Saving stays paused (with the
+	 *  reason) if the copy can't be made. */
+	resumeSaving: () => Promise<void>;
 
 	add: (spec: TerminalTab['spec'], title?: string, id?: string) => string;
 	setActive: (id: string) => void;
@@ -259,6 +272,46 @@ async function readPersisted(): Promise<{ tabs: SerializedTab[]; error: string |
 	return parseSerialized(raw);
 }
 
+type SavedLocation = 'sql' | 'local';
+
+/** Side key an unreadable saved list is copied to before saving resumes. */
+export function unreadableBackupKey(now: number = Date.now()): string {
+	return `${STORAGE_KEY}.unreadable-${now}`;
+}
+
+/** The saved list's raw text (null when there is none) and where it lives.
+ *  Throws when it can't be read. */
+async function readRawSaved(): Promise<{ raw: string | null; where: SavedLocation }> {
+	const db = await loadDb();
+	if (db) {
+		const rows = await db.select<{ value: string }[]>(
+			'SELECT value FROM layout_state WHERE key = $1',
+			[STORAGE_KEY]
+		);
+		return { raw: rows && rows.length > 0 ? rows[0].value : null, where: 'sql' };
+	}
+	return { raw: localStorage.getItem(STORAGE_KEY), where: 'local' };
+}
+
+/** Write `value` under `key` next to the saved list. Throws on failure —
+ *  unlike `writePersisted`, a backup must not silently land elsewhere. */
+async function writeSideKey(where: SavedLocation, key: string, value: string): Promise<void> {
+	if (where === 'sql') {
+		const db = await loadDb();
+		if (!db) throw new Error('the terminal database is unavailable');
+		await db.execute(
+			'INSERT INTO layout_state (key, value, updated_at) VALUES ($1, $2, $3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+			[key, value, Date.now()]
+		);
+		return;
+	}
+	localStorage.setItem(key, value);
+}
+
+function describeLocation(where: SavedLocation): string {
+	return where === 'sql' ? 'ikenga-terminal.sqlite (layout_state)' : "this window's local storage";
+}
+
 function parseSerialized(raw: string): { tabs: SerializedTab[]; error: string | null } {
 	try {
 		const parsed: unknown = JSON.parse(raw);
@@ -407,10 +460,46 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		restoreError: null,
 
 		dismissRestoreError: () => {
-			const held = get().restoreError?.holdsSave;
+			if (get().restoreError?.holdsSave) {
+				void get().resumeSaving();
+				return;
+			}
 			set({ restoreError: null });
+		},
+
+		resumeSaving: async () => {
+			const notice = get().restoreError;
+			if (!notice?.holdsSave) return;
+			let backupKey: string | undefined;
+			let where: SavedLocation | undefined;
+			try {
+				const saved = await readRawSaved();
+				where = saved.where;
+				if (saved.raw) {
+					backupKey = unreadableBackupKey();
+					await writeSideKey(saved.where, backupKey, saved.raw);
+				}
+			} catch (err) {
+				// Without a copy, resuming would destroy the list: stay paused.
+				set({
+					restoreError: {
+						message: `Couldn't back up the unreadable terminal list (${errText(err)}), so saving is still paused.`,
+						holdsSave: true,
+					},
+				});
+				return;
+			}
+			set({
+				restoreError: backupKey
+					? {
+							message: `Saving resumed. The unreadable terminal list was copied to "${backupKey}" in ${describeLocation(where ?? 'local')}.`,
+							holdsSave: false,
+							backupKey,
+						}
+					: null,
+			});
 			// Saving was paused; catch up with what is open now.
-			if (held) persistDebounced();
+			persistDebounced();
 		},
 
 		add: (spec, title, id) => {

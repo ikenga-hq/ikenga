@@ -33,6 +33,12 @@ type Phase =
 export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 	switch (o.kind) {
 		case 'allowed':
+			if (o.cookieUnconfirmed) {
+				return {
+					title: "Paired, but couldn't confirm the pairing cookie",
+					body: `The computer allowed this device, but checking that this browser kept the device credential failed (${o.cookieUnconfirmed}). Opening your workspace anyway; if it asks you to pair again, the browser didn't keep it.`,
+				};
+			}
 			return { title: 'Paired', body: 'Opening your workspace…' };
 		case 'cookie_rejected':
 			return {
@@ -82,6 +88,10 @@ export function outcomeCopy(o: PairOutcome): { title: string; body: string } {
 	}
 }
 
+/** How long the "couldn't confirm the pairing cookie" warning shows before
+ *  the page proceeds to the workspace on its own. */
+export const UNCONFIRMED_COOKIE_PROCEED_MS = 6000;
+
 export function RemotePairPage({
 	onPaired = () => window.location.assign('/remote'),
 }: {
@@ -124,8 +134,21 @@ export function RemotePairPage({
 		});
 		if (ctl.signal.aborted) return;
 		setPhase({ kind: 'done', outcome });
-		if (outcome.kind === 'allowed') onPaired();
+		// An unconfirmed cookie still proceeds, after a pause so the warning
+		// is seen (D-16); the effect below does that.
+		if (outcome.kind === 'allowed' && !outcome.cookieUnconfirmed) onPaired();
 	};
+
+	const unconfirmed =
+		phase.kind === 'done' && phase.outcome.kind === 'allowed' && !!phase.outcome.cookieUnconfirmed;
+	// A ref, so a parent re-render (new `onPaired`) doesn't restart the timer.
+	const onPairedRef = useRef(onPaired);
+	onPairedRef.current = onPaired;
+	useEffect(() => {
+		if (!unconfirmed) return;
+		const t = setTimeout(() => onPairedRef.current(), UNCONFIRMED_COOKIE_PROCEED_MS);
+		return () => clearTimeout(t);
+	}, [unconfirmed]);
 
 	const card =
 		'w-full max-w-[390px] overflow-hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] text-[var(--fg)] shadow-2xl';
@@ -201,14 +224,18 @@ export function RemotePairPage({
 				)}
 
 				{phase.kind === 'done' && (
-					<div className="flex flex-col gap-3 p-4" role="status">
+					<div
+						className="flex flex-col gap-3 p-4"
+						role={unconfirmed ? 'alert' : 'status'}
+						data-pair-warning={unconfirmed ? 'cookie-unconfirmed' : undefined}
+					>
 						<h2 className="m-0 text-[length:var(--text-body)] font-semibold">
 							{outcomeCopy(phase.outcome).title}
 						</h2>
 						<p className="m-0 text-[length:var(--text-body-sm)] leading-relaxed text-[var(--fg-muted)]">
 							{outcomeCopy(phase.outcome).body}
 						</p>
-						{phase.outcome.kind === 'auth_unavailable' && (
+						{(phase.outcome.kind === 'auth_unavailable' || unconfirmed) && (
 							<button
 								type="button"
 								onClick={() => onPaired()}

@@ -149,10 +149,21 @@ describe('runPairing', () => {
 		expect(out).toEqual({ kind: 'auth_unavailable', deviceId: 'd1' });
 	});
 
-	it('any other non-200 cookie probe is unknown (the boot path finds out), not cookie_rejected', async () => {
+	it('D-16: an unexpected non-200 cookie probe (proxy 502) proceeds, flagged as unconfirmed', async () => {
 		const host = fakeHost({ code: 'K7P42Q', probe: { status: 502, body: {} } });
 		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
-		expect(out).toEqual({ kind: 'allowed', deviceId: 'd1', tier: 'dispatch' });
+		expect(out).toEqual({
+			kind: 'allowed',
+			deviceId: 'd1',
+			tier: 'dispatch',
+			cookieUnconfirmed: 'the check answered HTTP 502',
+		});
+	});
+
+	it('D-16: a 503 that is not auth_unavailable is unconfirmed too, not auth_unavailable', async () => {
+		const host = fakeHost({ code: 'K7P42Q', probe: { status: 503, body: { ok: false } } });
+		const out = await runPairing('K7P42Q', device, {}, { fetch: host.f, ...fast });
+		expect(out).toMatchObject({ kind: 'allowed', cookieUnconfirmed: 'the check answered HTTP 503' });
 	});
 
 	it('review m5: a QR-pinned store id beats a substituted one in the hello reply', async () => {
