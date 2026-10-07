@@ -46,6 +46,7 @@ import { WritesNote } from '@/shell/onboarding/footer';
 import { EngineLogo } from '@/shell/onboarding/engine-logo';
 
 import { useOnboardingStep } from './use-onboarding-step';
+import { offlineInstallErrorMessage } from './offline-install-error';
 
 export interface EngineStepPayload {
 	agentId: string;
@@ -64,8 +65,6 @@ interface EngineBodyProps {
 const OFFLINE_AGENT_ID = 'engine-noop';
 const ENGINE_NOOP_NPM_NAME = '@ikenga/pkg-engine-noop';
 const ENGINE_NOOP_PKG_ID = 'com.ikenga.engine-noop';
-const REGISTRY_UNREACHABLE_MSG =
-	"Couldn't reach the registry — you can install the offline engine later from Ngwa → Store.";
 
 // Stable display order. The Rust side already knows about these ids in
 // `KNOWN_AGENTS`; the wizard surfaces them whether the binary is present
@@ -270,7 +269,7 @@ export function EngineBody({ onContinue, results, refresh }: EngineBodyProps) {
 			} else {
 				console.error('[onboarding] engine-noop install failed', e);
 			}
-			setOfflineError(REGISTRY_UNREACHABLE_MSG);
+			setOfflineError(offlineInstallErrorMessage(e));
 		},
 	});
 
@@ -553,7 +552,9 @@ function EngineCard({ meta, entry, selected, onSelect, onOpenDocs }: EngineCardP
 						<span className="font-mono text-[11px]">{entry.agent.version}</span>
 					</Pill>
 				)}
-				{entry.status === 'detected' && <AuthPill authed={entry.agent?.authed ?? null} />}
+				{entry.status === 'detected' && (
+					<AuthPill authed={entry.agent?.authed ?? null} hint={entry.agent?.auth_hint ?? null} />
+				)}
 			</div>
 
 			<div
@@ -675,14 +676,20 @@ function Pill({ children }: { children: React.ReactNode }) {
 	);
 }
 
-function AuthPill({ authed }: { authed: boolean | null }) {
+function AuthPill({ authed, hint }: { authed: boolean | null; hint: string | null }) {
 	if (authed === true) {
 		return <StatusChip tone="live">signed in</StatusChip>;
 	}
 	if (authed === false) {
 		return <StatusChip tone="warn">auth required</StatusChip>;
 	}
-	return null;
+	// `null` is "couldn't tell" — say so (with the probe's reason when it
+	// gave one) rather than rendering nothing, which reads as fine.
+	return (
+		<span title={hint ?? undefined} data-testid="auth-pill-unknown">
+			<StatusChip tone="faint">sign-in unknown</StatusChip>
+		</span>
+	);
 }
 
 // ── Pure helpers (testable without DOM) ─────────────────────────────────

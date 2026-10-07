@@ -672,3 +672,17 @@ describe('C4 — drag between the Companion rail and the pane tree', () => {
 		expect(useCompanionStore.getState().tabs).toEqual([]);
 	});
 });
+
+describe('target picker: engine detection failed', () => {
+	it('shows a check-failed state with the reason, not "No engine installed"', async () => {
+		useShellStore.setState({ defaultEngineId: null });
+		const tauri = await import('@/lib/tauri-cmd');
+		vi.mocked(tauri.detectAgents).mockRejectedValueOnce(new Error('wsl.exe did not answer'));
+		useCompanionStore.setState({ state: 'expanded' });
+		wrap(<Companion />);
+		fireEvent.click(await screen.findByRole('button', { name: /^Dispatch target:/ }));
+		expect(await screen.findByText("Couldn't check installed engines")).toBeTruthy();
+		expect(screen.getByText('wsl.exe did not answer')).toBeTruthy();
+		expect(screen.queryByText('No engine installed')).toBeNull();
+	});
+});

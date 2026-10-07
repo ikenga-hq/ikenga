@@ -37,7 +37,7 @@ const RULES: Array<[InstallErrorKind, RegExp]> = [
 	['not-found', /\bE404\b|\b404 Not Found\b|status client error \(404|registry returned 404/i],
 	[
 		'network',
-		/\b(EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ENETUNREACH|EHOSTUNREACH)\b|error sending request|tarball stream read|network (is )?unreachable|timed out|dns error/i,
+		/\b(EAI_AGAIN|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ENETUNREACH|EHOSTUNREACH)\b|error sending request|tarball stream read|network (is )?unreachable|timed out|dns error|failed to fetch|fetch failed|NetworkError when attempting to fetch/i,
 	],
 	['permission', /\b(EPERM|EACCES)\b|permission denied|access is denied|os error 5\b|operation not permitted/i],
 ];

@@ -13,7 +13,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { Bot, ChevronDown, ChevronRight, User } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { EmptyState, OfflineState } from '@/components/states';
+import { EmptyState, ErrorState, OfflineState } from '@/components/states';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { type CompanionTarget, useShellStore } from '@/lib/shell/shell-store';
 import { useSeats } from '@/lib/queries/seats';
@@ -61,6 +61,12 @@ export function offeredEngines(defaultEngineId: string | null, detected: readonl
 		out.push(a.id);
 	}
 	return out;
+}
+
+/** Body copy for the signed-out state when the probe gave no hint. States only
+ *  what the probe saw (it reported signed out) — not a guessed cause. */
+export function signedOutFallback(agent: Pick<DetectedAgent, 'executable_path'>): string {
+	return `The binary is on your PATH at ${agent.executable_path}, and its sign-in check reported it signed out. Sign in to use it here.`;
 }
 
 /** ⌥↑ / ⌥↓: seats, then unseated sessions, then new-on each engine, then a
@@ -443,10 +449,7 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 								data-state="companion-signed-out"
 								icon={User}
 								heading={`${unauthedEngine.display} is not signed in`}
-								body={
-									unauthedEngine.auth_hint ??
-									`The binary is on your PATH at ${unauthedEngine.executable_path}. It just has no credentials.`
-								}
+								body={unauthedEngine.auth_hint ?? signedOutFallback(unauthedEngine)}
 								action={{
 									label: `Run ${unauthedEngine.id} login`,
 									onClick: () => {
@@ -459,6 +462,16 @@ export function TargetPicker({ roster }: { roster: SeatRoster }) {
 										close();
 									},
 								}}
+								className="min-h-0"
+							/>
+						) : engines.isError ? (
+							// Detection failed — that says nothing about what is
+							// installed, so never fall through to "No engine installed".
+							<ErrorState
+								data-state="companion-engine-check-failed"
+								heading="Couldn't check installed engines"
+								body={engines.error instanceof Error ? engines.error.message : String(engines.error)}
+								action={{ label: 'Retry', onClick: () => void engines.refetch() }}
 								className="min-h-0"
 							/>
 						) : (

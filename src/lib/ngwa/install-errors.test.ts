@@ -32,6 +32,9 @@ describe('classifyInstallKind', () => {
 		['network', 'npm error code ECONNRESET'],
 		['network', 'npm error code ETIMEDOUT'],
 		['network', 'download https://x: GET https://x: error sending request for url'],
+		// The webview's own fetch() rejects with a bare TypeError (registry index / detail reads).
+		['network', 'TypeError: Failed to fetch'],
+		['network', 'NetworkError when attempting to fetch resource.'],
 		['not-found', 'download https://x: HTTP error from https://x: HTTP status client error (404 Not Found) for url (https://x)'],
 		['not-found', 'npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/nope'],
 		['permission', 'npm error code EPERM\nnpm error syscall rename'],
