@@ -819,13 +819,43 @@ pub(crate) fn engines_info(world: &WorldSnapshot) -> Vec<SeatEngineInfo> {
         .collect()
 }
 
-fn binary_available(binary: &str) -> bool {
-    // On Windows the engine may live inside WSL, and that probe costs seconds;
-    // chi resolves it at spawn time and fails the run cleanly if it's absent.
-    if cfg!(windows) {
-        return true;
+/// How long a "not installed" answer is reused. A WSL probe costs seconds,
+/// and seat listings are rebuilt often; a CLI installed meanwhile shows up
+/// within this window. Hits are remembered by the resolver itself, and
+/// "couldn't tell" is never remembered.
+const ENGINE_MISS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether `binary` is installed — on the host PATH or, on Windows, inside
+/// the configured WSL distro (the same lookup a chi run makes). It used to
+/// answer `true` unconditionally on Windows, so an engine installed nowhere
+/// was offered as seatable. A WSL that couldn't be asked counts as
+/// available: "couldn't tell" must not read as "not installed", and chi
+/// still fails the run with the real reason if it is absent.
+async fn binary_available(binary: &str) -> bool {
+    type Misses = std::sync::Mutex<HashMap<String, std::time::Instant>>;
+    static MISSES: std::sync::OnceLock<Misses> = std::sync::OnceLock::new();
+    let misses = MISSES.get_or_init(Default::default);
+    let fresh_miss = misses
+        .lock()
+        .ok()
+        .and_then(|m| m.get(binary).map(|at| at.elapsed() < ENGINE_MISS_TTL))
+        .unwrap_or(false);
+    if fresh_miss {
+        return false;
     }
-    which::which_in(binary, Some(crate::runtime::augmented_path()), ".").is_ok()
+    match crate::server::shared::chi_exec::engine_installed(binary).await {
+        Some(installed) => {
+            if let Ok(mut m) = misses.lock() {
+                if installed {
+                    m.remove(binary);
+                } else {
+                    m.insert(binary.to_string(), std::time::Instant::now());
+                }
+            }
+            installed
+        }
+        None => true,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3439,11 +3469,14 @@ async fn tauri_world(
     if all_engines {
         engines.extend(ENGINE_CAPS.iter().map(|c| c.engine_id.to_string()));
     }
-    for engine in &engines {
-        if let Some(binary) = engine_cap(engine).and_then(|c| c.binary) {
-            if !binary_available(binary) {
-                world.unavailable_engines.push(engine.clone());
-            }
+    // Probed concurrently: each may wait on a cold WSL start.
+    let probes = engines.iter().filter_map(|engine| {
+        let binary = engine_cap(engine).and_then(|c| c.binary)?;
+        Some(async move { (engine.clone(), binary_available(binary).await) })
+    });
+    for (engine, available) in futures_util::future::join_all(probes).await {
+        if !available {
+            world.unavailable_engines.push(engine);
         }
     }
 

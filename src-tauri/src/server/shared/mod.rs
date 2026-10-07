@@ -54,3 +54,4 @@ pub mod shell_detect;
 pub mod studio_threads;
 pub mod supabase_config;
 pub mod transcoder;
+pub mod wsl;

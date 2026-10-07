@@ -213,7 +213,10 @@ pub async fn pty_terminal_list(
 /// Detects available host shell profiles (e.g. PowerShell 7, Windows PowerShell, WSL distros, Git Bash, cmd.exe on Windows, or zsh/bash on Unix).
 #[tauri::command]
 pub async fn terminal_detect_shells() -> Result<Vec<crate::terminal::shell_detect::ShellProfile>, String> {
-    Ok(crate::terminal::shell_detect::detect_shells())
+    // Off the async runtime: on Windows this waits on `wsl.exe -l -q`.
+    tokio::task::spawn_blocking(crate::terminal::shell_detect::detect_shells)
+        .await
+        .map_err(|e| format!("shell detection failed: {e}"))
 }
 
 /// Retrieve the active daemon connection info or fallback status.

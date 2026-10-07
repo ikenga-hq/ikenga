@@ -40,6 +40,9 @@ impl TestCache {
 struct FakeResolver {
     native: Vec<&'static str>,
     wsl: Vec<&'static str>,
+    /// `Some(reason)`: WSL can't be asked.
+    wsl_down: Option<&'static str>,
+    distro: Option<&'static str>,
 }
 
 impl FakeResolver {
@@ -47,12 +50,16 @@ impl FakeResolver {
         Self {
             native: bins.to_vec(),
             wsl: vec![],
+            wsl_down: None,
+            distro: None,
         }
     }
     fn wsl(bins: &[&'static str]) -> Self {
         Self {
             native: vec![],
             wsl: bins.to_vec(),
+            wsl_down: None,
+            distro: None,
         }
     }
 }
@@ -61,8 +68,16 @@ impl EngineResolver for FakeResolver {
     fn native(&self, binary: &str) -> Option<PathBuf> {
         self.native.contains(&binary).then(|| PathBuf::from(binary))
     }
-    fn in_wsl(&self, binary: &str) -> bool {
-        self.wsl.contains(&binary)
+    fn in_wsl<'a>(&'a self, binary: &'a str) -> BoxFuture<'a, WslLookup> {
+        let lookup = match self.wsl_down {
+            Some(why) => WslLookup::WslUnavailable(why.to_string()),
+            None if self.wsl.contains(&binary) => WslLookup::Found(format!("/usr/bin/{binary}")),
+            None => WslLookup::NotFound,
+        };
+        Box::pin(std::future::ready(lookup))
+    }
+    fn wsl_distro(&self) -> Option<String> {
+        self.distro.map(str::to_string)
     }
 }
 
@@ -137,8 +152,8 @@ impl EngineResolver for StubResolver {
     fn native(&self, binary: &str) -> Option<PathBuf> {
         (binary == "claude").then(|| self.0.clone())
     }
-    fn in_wsl(&self, _binary: &str) -> bool {
-        false
+    fn in_wsl<'a>(&'a self, _binary: &'a str) -> BoxFuture<'a, WslLookup> {
+        Box::pin(std::future::ready(WslLookup::NotFound))
     }
 }
 
@@ -231,8 +246,8 @@ async fn chi_output_file_round_trip() {
     assert_eq!(file.output.as_deref(), Some("partial output"));
 }
 
-#[test]
-fn test_build_engine_command_antigravity() {
+#[tokio::test]
+async fn test_build_engine_command_antigravity() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["agy"]),
         "antigravity-cli",
@@ -240,7 +255,7 @@ fn test_build_engine_command_antigravity() {
         Some("gemini-2.0-flash"),
         Some("plan"),
         Some("conv-123"),
-    )
+    ).await
     .unwrap();
 
     assert_eq!(cmd.program, "agy");
@@ -262,8 +277,8 @@ fn test_build_engine_command_antigravity() {
     );
 }
 
-#[test]
-fn test_build_engine_command_opencode() {
+#[tokio::test]
+async fn test_build_engine_command_opencode() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["opencode"]),
         "opencode",
@@ -271,7 +286,7 @@ fn test_build_engine_command_opencode() {
         Some("claude-3-7-sonnet"),
         None,
         None,
-    )
+    ).await
     .unwrap();
 
     assert_eq!(cmd.program, "opencode");
@@ -288,7 +303,7 @@ fn test_build_engine_command_opencode() {
         None,
         None,
         Some("ses_1"),
-    )
+    ).await
     .unwrap();
     assert_eq!(
         args_of(&resumed),
@@ -296,8 +311,8 @@ fn test_build_engine_command_opencode() {
     );
 }
 
-#[test]
-fn test_build_engine_command_pi() {
+#[tokio::test]
+async fn test_build_engine_command_pi() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["pi"]),
         "pi",
@@ -305,7 +320,7 @@ fn test_build_engine_command_pi() {
         Some("claude-3-7-sonnet"),
         None,
         None,
-    )
+    ).await
     .unwrap();
 
     assert_eq!(cmd.program, "pi");
@@ -319,36 +334,118 @@ fn test_build_engine_command_pi() {
         None,
         None,
         Some("0b1c"),
-    )
+    ).await
     .unwrap();
     assert_eq!(args_of(&resumed), ["--mode", "json", "--session", "0b1c"]);
 }
 
-#[test]
-fn resolve_engine_prefers_host_path_over_wsl() {
+#[tokio::test]
+async fn resolve_engine_prefers_host_path_over_wsl() {
     let r = FakeResolver {
         native: vec!["claude"],
-        wsl: vec!["claude"],
+        ..FakeResolver::wsl(&["claude"])
     };
     assert_eq!(
-        resolve_engine("claude", &r).unwrap(),
+        resolve_engine("claude", &r).await.unwrap(),
         EngineLaunch::Native(PathBuf::from("claude"))
     );
 }
 
-#[test]
-fn resolve_engine_falls_back_to_wsl() {
+#[tokio::test]
+async fn resolve_engine_falls_back_to_wsl() {
     assert_eq!(
-        resolve_engine("claude", &FakeResolver::wsl(&["claude"])).unwrap(),
+        resolve_engine("claude", &FakeResolver::wsl(&["claude"])).await.unwrap(),
         EngineLaunch::Wsl {
-            binary: "claude".into()
+            binary: "claude".into(),
+            distro: None,
         }
     );
 }
 
+/// A WSL that couldn't be asked is not "not installed": the error names
+/// WSL and its reason, and never tells the user to install the CLI.
+#[tokio::test]
+async fn resolve_engine_reports_wsl_unavailable_instead_of_not_installed() {
+    let r = FakeResolver {
+        wsl_down: Some("wsl.exe did not answer within 20s"),
+        ..FakeResolver::wsl(&["claude"])
+    };
+    let err = resolve_engine("claude", &r).await.unwrap_err();
+    assert!(
+        err.contains("WSL unavailable: wsl.exe did not answer within 20s"),
+        "{err}"
+    );
+    assert!(!err.contains("install it"), "{err}");
+    let err = build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("WSL unavailable:"), "{err}");
+}
+
+/// Chi launches WSL engines in the configured distro, as the terminal does.
+#[tokio::test]
+async fn wsl_launch_uses_the_configured_distro() {
+    let r = FakeResolver {
+        distro: Some("Debian"),
+        ..FakeResolver::wsl(&["claude"])
+    };
+    assert_eq!(
+        resolve_engine("claude", &r).await.unwrap(),
+        EngineLaunch::Wsl {
+            binary: "claude".into(),
+            distro: Some("Debian".into()),
+        }
+    );
+    let cmd = build_engine_command_with(&r, "claude-code", r"C:\work", None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        &args_of(&cmd)[..6],
+        ["-d", "Debian", "--cd", "C:/work", "-e", "bash"]
+    );
+}
+
+/// Regression: a project that lives only inside the distro
+/// (`\\wsl.localhost\Ubuntu\home\me\proj`) failed to start with "The
+/// directory name is invalid (os error 267)" — the host-side cwd was set to
+/// a path Windows can't enter. Now the cwd goes only to `wsl.exe --cd`, as
+/// the Linux path, and codex's own `--cd` gets the same Linux path.
+#[tokio::test]
+async fn wsl_share_project_runs_without_a_host_cwd() {
+    let share = r"\\wsl.localhost\Ubuntu\home\me\proj";
+    let claude = build_engine_command_with(
+        &FakeResolver::wsl(&["claude"]),
+        "claude-code",
+        share,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claude.cwd, None);
+    assert_eq!(&args_of(&claude)[..2], ["--cd", "/home/me/proj"]);
+
+    let codex =
+        build_engine_command_with(&FakeResolver::wsl(&["codex"]), "codex", share, None, None, None)
+            .await
+            .unwrap();
+    assert_eq!(codex.cwd, None);
+    let args = args_of(&codex);
+    assert!(args[6].contains("'--cd' '/home/me/proj'"), "{args:?}");
+}
+
 #[test]
-fn resolve_engine_errors_clearly_when_nothing_resolves() {
-    let err = resolve_engine("claude", &FakeResolver::native(&[])).unwrap_err();
+fn to_wsl_path_maps_share_paths_into_the_distro() {
+    assert_eq!(to_wsl_path(r"\\wsl.localhost\Ubuntu\home\me"), "/home/me");
+    assert_eq!(to_wsl_path(r"\\wsl$\Debian\srv\app"), "/srv/app");
+    assert_eq!(to_wsl_path(r"C:\Users\x"), "/mnt/c/Users/x");
+    assert_eq!(to_wsl_path("/already/linux"), "/already/linux");
+}
+
+#[tokio::test]
+async fn resolve_engine_errors_clearly_when_nothing_resolves() {
+    let err = resolve_engine("claude", &FakeResolver::native(&[])).await.unwrap_err();
     assert!(err.contains("`claude` not found"), "{err}");
     assert!(err.contains("install it or add it to PATH"), "{err}");
     // …and build_engine_command surfaces it instead of an OS spawn error.
@@ -359,13 +456,13 @@ fn resolve_engine_errors_clearly_when_nothing_resolves() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap_err();
     assert!(err.contains("`claude` not found"), "{err}");
 }
 
-#[test]
-fn claude_code_in_wsl_launches_like_the_terminal() {
+#[tokio::test]
+async fn claude_code_in_wsl_launches_like_the_terminal() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["claude"]),
         "claude-code",
@@ -373,7 +470,7 @@ fn claude_code_in_wsl_launches_like_the_terminal() {
         Some("opus"),
         None,
         Some("sess-1"),
-    )
+    ).await
     .unwrap();
     assert_eq!(cmd.program, "wsl.exe");
     let args = args_of(&cmd);
@@ -390,8 +487,8 @@ fn claude_code_in_wsl_launches_like_the_terminal() {
     assert_eq!(args.len(), 7);
 }
 
-#[test]
-fn claude_code_chi_run_defaults_to_the_chi_role_model() {
+#[tokio::test]
+async fn claude_code_chi_run_defaults_to_the_chi_role_model() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["claude"]),
         "claude-code",
@@ -399,13 +496,13 @@ fn claude_code_chi_run_defaults_to_the_chi_role_model() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert_eq!(model_flags(&cmd), ["claude-sonnet-5-5"]);
 }
 
-#[test]
-fn claude_code_chi_run_explicit_model_wins_once() {
+#[tokio::test]
+async fn claude_code_chi_run_explicit_model_wins_once() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["claude"]),
         "claude-code",
@@ -413,7 +510,7 @@ fn claude_code_chi_run_explicit_model_wins_once() {
         Some("claude-opus-5-5"),
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert_eq!(model_flags(&cmd), ["claude-opus-5-5"]);
 }
@@ -435,8 +532,8 @@ fn runner_conf_model_resolves_for_claude_only() {
     );
 }
 
-#[test]
-fn non_claude_engines_get_no_role_default() {
+#[tokio::test]
+async fn non_claude_engines_get_no_role_default() {
     let cmd = build_engine_command_with(
         &FakeResolver::native(&["pi"]),
         "pi",
@@ -444,13 +541,13 @@ fn non_claude_engines_get_no_role_default() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert!(model_flags(&cmd).is_empty());
 }
 
-#[test]
-fn wsl_launch_quotes_args_for_bash() {
+#[tokio::test]
+async fn wsl_launch_quotes_args_for_bash() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["pi"]),
         "pi",
@@ -458,7 +555,7 @@ fn wsl_launch_quotes_args_for_bash() {
         Some("it's $HOME; rm -rf /"),
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert_eq!(
         args_of(&cmd)[6],
@@ -470,8 +567,8 @@ fn wsl_launch_quotes_args_for_bash() {
 /// takes it as a flag — codex `--cd`), and since WP-P10 an explicit env:
 /// cleared, the host env minus the host-only secrets, then the augmented
 /// `PATH` on a native launch.
-#[test]
-fn engine_spec_keeps_path_and_the_set_cwd_split() {
+#[tokio::test]
+async fn engine_spec_keeps_path_and_the_set_cwd_split() {
     let host_only = |spec: &SpawnSpec| {
         spec.env
             .vars
@@ -485,7 +582,7 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert_eq!(claude.cwd, Some(PathBuf::from("/tmp")));
     assert!(claude.env.clear);
@@ -505,7 +602,7 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     assert_eq!(codex.cwd, None);
     assert!(codex.env.clear);
@@ -514,12 +611,15 @@ fn engine_spec_keeps_path_and_the_set_cwd_split() {
         Some("PATH".into())
     );
 
-    // WSL: cwd is set on the host side too; wsl.exe gets the scrubbed env
-    // but no augmented PATH override.
+    // WSL: no host-side cwd — the directory may exist only inside the
+    // distro, where Windows can't enter it (os error 267); it reaches the
+    // engine through `wsl.exe --cd` alone. wsl.exe gets the scrubbed env but
+    // no augmented PATH override.
     let wsl =
-        build_engine_command_with(&FakeResolver::wsl(&["pi"]), "pi", "/tmp", None, None, None)
+        build_engine_command_with(&FakeResolver::wsl(&["pi"]), "pi", "/tmp", None, None, None).await
             .unwrap();
-    assert_eq!(wsl.cwd, Some(PathBuf::from("/tmp")));
+    assert_eq!(wsl.cwd, None);
+    assert_eq!(&args_of(&wsl)[..2], ["--cd", "/tmp"]);
     assert!(wsl.env.clear);
     assert!(!host_only(&wsl));
 
@@ -560,8 +660,8 @@ async fn spawn_engine_child_pipes_all_three_streams() {
     assert_eq!(err.trim(), "err");
 }
 
-#[test]
-fn codex_in_wsl_gets_a_linux_cd_path() {
+#[tokio::test]
+async fn codex_in_wsl_gets_a_linux_cd_path() {
     let cmd = build_engine_command_with(
         &FakeResolver::wsl(&["codex"]),
         "codex",
@@ -569,7 +669,7 @@ fn codex_in_wsl_gets_a_linux_cd_path() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     let args = args_of(&cmd);
     assert_eq!(args[1], "C:/Users/x/proj");
@@ -1394,8 +1494,8 @@ impl EngineResolver for StubDirResolver {
         let path = self.0.join(binary);
         path.is_file().then_some(path)
     }
-    fn in_wsl(&self, _binary: &str) -> bool {
-        false
+    fn in_wsl<'a>(&'a self, _binary: &'a str) -> BoxFuture<'a, WslLookup> {
+        Box::pin(std::future::ready(WslLookup::NotFound))
     }
 }
 
@@ -1751,8 +1851,8 @@ async fn runner_conf_is_private_and_removed_when_the_run_ends() {
 /// and the value went into codex's `--cd` argv and the runner's conf file,
 /// handing a Dispatch-only caller what needs Secrets. `$HOME` / `$PATH`
 /// stand in for the secret (same mechanism, no process-env mutation).
-#[test]
-fn the_daemon_expands_only_tilde_in_a_run_cwd() {
+#[tokio::test]
+async fn the_daemon_expands_only_tilde_in_a_run_cwd() {
     let home = std::env::var("HOME").expect("HOME is set");
     let path = std::env::var("PATH").expect("PATH is set");
     let mut env = ChiEnv::new(
@@ -1786,7 +1886,7 @@ fn the_daemon_expands_only_tilde_in_a_run_cwd() {
         None,
         None,
         None,
-    )
+    ).await
     .unwrap();
     let args = args_of(&cmd);
     let cd = args.iter().position(|a| a == "--cd").unwrap();
