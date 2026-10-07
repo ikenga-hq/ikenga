@@ -51,6 +51,7 @@ pub mod pkg_scaffold;
 pub mod pkg_workspace;
 pub mod projects;
 pub mod seat_grammar;
+pub mod seats;
 pub mod sidecar_call;
 pub mod settings;
 pub mod settings_cascade;

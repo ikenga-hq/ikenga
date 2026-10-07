@@ -267,7 +267,13 @@ export class WebRemoteTransport implements RpcTransport {
 		}
 		const json = await res.json();
 		if (!json.ok) {
-			throw new Error(json.error || `RPC command '${cmd}' failed`);
+			const err = new Error(json.error || `RPC command '${cmd}' failed`);
+			// A typed rejection (the seats' `{code, message, details?}`): the
+			// same fields a Tauri `invoke` rejects with, on the thrown Error.
+			if (json.error_data && typeof json.error_data === 'object') {
+				Object.assign(err, json.error_data);
+			}
+			throw err;
 		}
 		return json.data as T;
 	}

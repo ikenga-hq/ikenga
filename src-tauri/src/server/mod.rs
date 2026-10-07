@@ -46,6 +46,7 @@ mod rpc_exec;
 mod rpc_files;
 mod rpc_fs_roots;
 mod rpc_local;
+mod rpc_seats;
 mod rpc_shell;
 pub mod shared;
 pub mod static_files;

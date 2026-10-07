@@ -24,6 +24,7 @@ vi.mock('@/lib/tauri-cmd', async (orig) => ({
 
 vi.mock('@/shell/companion/resolve-target', () => ({ resolveTarget: m.resolveTarget }));
 
+import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import type { SeatView } from '@/lib/tauri-cmd';
 import { useCompanionStore } from '@/shell/companion/companion-store';
@@ -154,6 +155,19 @@ describe('routes', () => {
 			via: 'chi-resume',
 		});
 		expect(m.seatsResume).toHaveBeenCalledWith('seat-1', 'go', { client: 'ui' }, { fallback: 'fresh' });
+	});
+
+	it('re-reads the roster after its own write, with or without a seats://changed event', async () => {
+		const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+		m.seatsResolve.mockResolvedValue({ route: 'vacant', seat: seat({ status: 'vacant' }), resume: { resumable: true }, claim: null });
+		m.seatsResume.mockResolvedValue({ seat: seat(), run_id: 'run-2', outcome: 'resumed', previous: null });
+		await send({ prompt: 'go', target: 'seat', seat: 'docs', scope: 'project' });
+		expect(invalidate).toHaveBeenCalledWith({ queryKey: ['seats', 'list', 'p1'] });
+		invalidate.mockClear();
+		m.seatsResume.mockRejectedValue({ code: 'engine_failed', message: 'no engine' });
+		await expect(send({ prompt: 'go', target: 'seat', seat: 'docs', scope: 'project' })).rejects.toThrow('no engine');
+		expect(invalidate).toHaveBeenCalledWith({ queryKey: ['seats', 'list', 'p1'] });
+		invalidate.mockRestore();
 	});
 
 	it('a fresh start reports via chi-run', async () => {
