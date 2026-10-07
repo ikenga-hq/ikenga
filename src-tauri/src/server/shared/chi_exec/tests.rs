@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::server::shared::chi::{cache_list, parse_output_file};
+use crate::server::shared::wsl_health::WslHealthState;
 
 pub(crate) async fn test_db() -> PaDb {
     let file_name = format!("ikenga-chi-test-{}.db", uuid::Uuid::new_v4());
@@ -45,6 +46,11 @@ struct FakeResolver {
     distro: Option<&'static str>,
     /// The distro each `in_wsl` probe asked.
     probed: std::sync::Mutex<Vec<Option<String>>>,
+    /// The WSL network health a pre-run probe reports (D-21); `None` = no
+    /// probe, as for a host without WSL.
+    health: Option<WslHealthState>,
+    /// The distro each pre-run health probe asked.
+    health_asked: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 impl FakeResolver {
@@ -55,6 +61,8 @@ impl FakeResolver {
             wsl_down: None,
             distro: None,
             probed: Default::default(),
+            health: None,
+            health_asked: Default::default(),
         }
     }
     fn wsl(bins: &[&'static str]) -> Self {
@@ -64,6 +72,8 @@ impl FakeResolver {
             wsl_down: None,
             distro: None,
             probed: Default::default(),
+            health: None,
+            health_asked: Default::default(),
         }
     }
 }
@@ -83,6 +93,26 @@ impl EngineResolver for FakeResolver {
     }
     fn wsl_distro(&self) -> Option<String> {
         self.distro.map(str::to_string)
+    }
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        self.health_asked.lock().unwrap().push(distro.map(str::to_string));
+        let health = self.health.map(|state| {
+            (
+                WslHealth {
+                    state,
+                    distro: distro.map(str::to_string),
+                    detail: format!("probe said {}", state.as_str()),
+                    mirrored_failure: None,
+                    networking_mode: Some("mirrored".into()),
+                    checked_at: 1,
+                },
+                true,
+            )
+        });
+        Box::pin(std::future::ready(health))
     }
 }
 
@@ -1969,4 +1999,111 @@ async fn failed_run_error_names_the_stderr_cause() {
         explain_failure(Some("x"), StderrTail(None)).await.as_deref(),
         Some("x")
     );
+}
+
+// ── WSL pre-run probe (honest-failure-states WP-7, D-21) ─────────────────
+
+fn wsl_with_health(state: WslHealthState) -> FakeResolver {
+    FakeResolver {
+        distro: Some("Ubuntu"),
+        health: Some(state),
+        ..FakeResolver::wsl(&["claude", "codex"])
+    }
+}
+
+/// `no_route`, `dns_only` and `wsl_down` are WSL's own fault: the launch
+/// fails with the cause instead of building a command.
+#[tokio::test]
+async fn a_wsl_launch_with_broken_wsl_networking_fails_before_building() {
+    for state in [
+        WslHealthState::NoRoute,
+        WslHealthState::DnsOnly,
+        WslHealthState::WslDown,
+    ] {
+        let r = wsl_with_health(state);
+        let err = build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("WSL has no network — probe said {}", state.as_str()),
+            "{state:?}"
+        );
+        assert_eq!(*r.health_asked.lock().unwrap(), [Some("Ubuntu".to_string())]);
+    }
+}
+
+/// `ok`, `host_offline` (not WSL's fault) and `not_installed` (the lookup
+/// already answered) launch as before.
+#[tokio::test]
+async fn a_wsl_launch_proceeds_when_wsl_is_not_at_fault() {
+    for state in [
+        WslHealthState::Ok,
+        WslHealthState::HostOffline,
+        WslHealthState::NotInstalled,
+    ] {
+        let r = wsl_with_health(state);
+        let cmd = build_engine_command_with(&r, "codex", "/tmp", None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{state:?}: {e}"));
+        assert_eq!(cmd.program, std::ffi::OsString::from("wsl.exe"), "{state:?}");
+        assert_eq!(r.health_asked.lock().unwrap().len(), 1, "{state:?}");
+    }
+    // No probe at all (a host without WSL health): proceeds too.
+    let r = FakeResolver::wsl(&["claude"]);
+    assert!(build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .is_ok());
+}
+
+/// A native engine is never probed: the check costs non-WSL launches
+/// nothing, even while WSL is down.
+#[tokio::test]
+async fn a_native_launch_never_probes_wsl() {
+    let r = FakeResolver {
+        native: vec!["claude"],
+        ..wsl_with_health(WslHealthState::NoRoute)
+    };
+    build_engine_command_with(&r, "claude-code", "/tmp", None, None, None)
+        .await
+        .unwrap();
+    assert!(r.health_asked.lock().unwrap().is_empty());
+}
+
+/// Through the run path: the run fails at once without spawning, the row
+/// carries the cause, and the same `fix.wsl_network` row the desktop's probe
+/// raises is recorded (alongside the run's own `run_failed`).
+#[tokio::test]
+async fn a_run_on_broken_wsl_fails_immediately_and_raises_the_wsl_notification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(test_db().await);
+    let env = ChiEnv {
+        resolver: Arc::new(wsl_with_health(WslHealthState::NoRoute)),
+        ..ChiEnv::new(db.clone(), tmp.path().join("chi-cache"), Arc::new(ChiRuntime::new()))
+    };
+    let err = spawn_run(
+        &env,
+        &NoInProcessEngines,
+        opts("claude-code", "hi", Some("/tmp")),
+        "cli",
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(err, "WSL has no network — probe said no_route");
+    let rows = cache_list(&db, Some("claude-code"), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].error.as_deref(), Some(err.as_str()));
+    assert!(env.runtime.remove(&rows[0].run_id).await.is_none(), "nothing was spawned");
+
+    let pool = db.ensure_pool().await.unwrap();
+    let open = crate::server::shared::notifications::open_rows_with_key_prefix(
+        &pool,
+        crate::server::shared::notifications::wsl::WSL_NETWORK_KEY_PREFIX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].0, "wsl:network:ubuntu");
 }

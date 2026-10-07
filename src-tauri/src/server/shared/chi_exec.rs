@@ -48,6 +48,7 @@ use super::chi::{
     OutputFiles, RunOutputFile,
 };
 use super::chi_runner::{self, RunLiveness};
+use super::wsl_health::WslHealth;
 use super::claude_sessions::event::ChatEvent;
 use super::claude_sessions::stream_parser::StreamParser;
 use crate::db::PaDb;
@@ -165,6 +166,15 @@ pub(crate) trait EngineResolver: Send + Sync {
     fn wsl_distro(&self) -> Option<String> {
         None
     }
+    /// WSL network health for a launch in `distro` (D-21), and whether it
+    /// was freshly measured; `None` = don't probe (stub resolvers, hosts
+    /// without WSL). Only asked for a WSL launch, never a native one.
+    fn wsl_health<'a>(
+        &'a self,
+        _distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(std::future::ready(None))
+    }
 }
 
 /// The real resolver: augmented host PATH first, then WSL on Windows.
@@ -218,6 +228,64 @@ impl EngineResolver for HostResolver {
         } else {
             None
         }
+    }
+
+    /// The shared WSL health probe, reusing a result younger than its 30 s
+    /// cache (D-7). Bounded: every spawn in it has a timeout.
+    #[cfg(windows)]
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(async move { Some(super::wsl_health::probe(distro, false).await) })
+    }
+}
+
+/// An [`EngineResolver`] whose fresh WSL health probes are reported to the
+/// `notifications` table (`fix.wsl_network`, D-21) — the same record /
+/// resolve the desktop's `wsl_health_probe` command does. Wraps the run's
+/// resolver for the spawn paths, which hold the run's `PaDb`.
+struct ReportingResolver<'a> {
+    inner: &'a dyn EngineResolver,
+    db: &'a PaDb,
+}
+
+impl EngineResolver for ReportingResolver<'_> {
+    fn native(&self, binary: &str) -> Option<PathBuf> {
+        self.inner.native(binary)
+    }
+    fn in_wsl<'a>(&'a self, binary: &'a str, distro: Option<&'a str>) -> BoxFuture<'a, WslLookup> {
+        self.inner.in_wsl(binary, distro)
+    }
+    fn wsl_distro(&self) -> Option<String> {
+        self.inner.wsl_distro()
+    }
+    fn wsl_health<'a>(
+        &'a self,
+        distro: Option<&'a str>,
+    ) -> BoxFuture<'a, Option<(WslHealth, bool)>> {
+        Box::pin(async move {
+            let probed = self.inner.wsl_health(distro).await;
+            if let Some((health, true)) = &probed {
+                super::notifications::wsl::report_with_db(self.db, health).await;
+            }
+            probed
+        })
+    }
+}
+
+/// The pre-run WSL check (D-21): a launch inside WSL whose network is
+/// broken in a way that is WSL's own fault (`no_route`, `dns_only`,
+/// `wsl_down`) fails now with the cause, instead of spawning an engine that
+/// can't sign in or reach its API. `ok` and `host_offline` (Windows is
+/// offline too — not WSL's fault, and not ours to block) proceed, as does
+/// `not_installed` (the binary lookup that got us here already answered).
+async fn wsl_preflight(resolver: &dyn EngineResolver, distro: Option<&str>) -> Result<(), String> {
+    match resolver.wsl_health(distro).await {
+        Some((health, _)) if health.state.is_wsl_fault() => {
+            Err(format!("WSL has no network — {}", health.detail))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -370,6 +438,15 @@ impl ChiEnv {
             files: OutputFiles::AsStored,
             resolver: Arc::new(HostResolver),
             cwd_expansion: CwdExpansion::Full,
+        }
+    }
+
+    /// The run's resolver, reporting its WSL pre-run probes (D-21) to the
+    /// run's `notifications` table.
+    fn reporting_resolver(&self) -> ReportingResolver<'_> {
+        ReportingResolver {
+            inner: &*self.resolver,
+            db: &self.db,
         }
     }
 
@@ -891,10 +968,13 @@ pub(crate) async fn resolve_engine(
     }
     let distro = launch_distro(cwd, resolver);
     match resolver.in_wsl(binary, distro.as_deref()).await {
-        WslLookup::Found(_) => Ok(EngineLaunch::Wsl {
-            binary: binary.to_string(),
-            distro,
-        }),
+        WslLookup::Found(_) => {
+            wsl_preflight(resolver, distro.as_deref()).await?;
+            Ok(EngineLaunch::Wsl {
+                binary: binary.to_string(),
+                distro,
+            })
+        }
         // Not "install it": the CLI may well be installed in a WSL that
         // didn't answer, and reinstalling would not help.
         WslLookup::WslUnavailable(reason) => Err(format!(
@@ -2003,7 +2083,7 @@ pub(crate) async fn spawn_run(
 
     // ── In-process (non-persistent) path ─────────────────────────────────────
     let cmd = build_engine_command_with(
-        &*env.resolver,
+        &env.reporting_resolver(),
         &opts.engine_id,
         &cwd,
         opts.model.as_deref(),
@@ -2091,7 +2171,7 @@ pub(crate) async fn resume_run(
 
     let cwd = env.run_cwd(row.cwd.as_deref());
     let cmd = build_engine_command_with(
-        &*env.resolver,
+        &env.reporting_resolver(),
         &row.engine_id,
         &cwd,
         row.model.as_deref(),
