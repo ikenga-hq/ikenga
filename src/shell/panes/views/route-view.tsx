@@ -7,7 +7,9 @@ import {
 import { useEffect, useMemo } from 'react';
 import { findLeaf, getLeafIdsInOrder } from '@/lib/panes/pane-reducer';
 import { usePaneStore } from '@/lib/panes/pane-store';
+import { syncPaneRouterLocation } from '@/lib/panes/router-pane-sync';
 import { queryClient } from '@/lib/query-client';
+import { isRemoteWebSession } from '@/lib/transport';
 import { routeTree } from '@/routeTree.gen';
 import { PaneScopeProvider } from '../pane-scope';
 import { tabUid } from '../view-key';
@@ -117,6 +119,21 @@ export function RouteView({ paneId, path }: RouteViewProps) {
 			void router.navigate({ to: path });
 		}
 	}, [path, router]);
+
+	// The other direction, remote web sessions only: this pane's own
+	// navigations (an in-pane `<Link>` such as Ngwa's Installed/Store tabs)
+	// move just this memory router, so write the resolved location back into
+	// the tab. That is what the pane's address bar and, via router-pane-sync,
+	// the browser address bar follow. The effect above then sees router and
+	// `path` agree and does nothing, so the two never ping-pong. Desktop is
+	// left as it was (its pane paths persist and drive the activity mode).
+	useEffect(() => {
+		if (!tabId || !isRemoteWebSession()) return;
+		return router.subscribe('onResolved', () => {
+			const l = router.state.location;
+			syncPaneRouterLocation(paneId, tabId, l.pathname + (l.searchStr ?? ''));
+		});
+	}, [router, paneId, tabId]);
 
 	// Bound the route content to the pane height. The main-window render gets
 	// this via content-pane.tsx's `<main className="flex h-full …">`; pane
