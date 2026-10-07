@@ -780,3 +780,291 @@ echo '{"type":"turn.completed","usage":{}}'
     drop(broker);
     drop(users);
 }
+
+/// A root-owned secrets directory (0711, like `provision.sh`'s) with one
+/// `<unix_name>.env` per entry: root:`gid`, mode 0640.
+fn write_account_secrets(dir: &Path, files: &[(&str, u32, &str)]) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+    for (unix_name, gid, body) in files {
+        let path = dir.join(format!("{unix_name}.env"));
+        std::fs::write(&path, body).unwrap();
+        std::os::unix::fs::chown(&path, Some(0), Some(*gid)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+}
+
+/// The primary gid of a host user (`id -g`).
+fn host_gid(unix_name: &str) -> u32 {
+    let out = Command::new("id").args(["-g", unix_name]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// Run `cmd` as a PTY of `who` and return what it wrote to `$HOME/<out>`.
+async fn pty_env(broker: &Broker, who: &str, home: &Path, tag: &str) -> String {
+    let out = home.join(format!("pty-env-{tag}.txt"));
+    let spawned = rpc(
+        broker,
+        who,
+        "pty_spawn",
+        json!({
+            "terminal_id": format!("env-{tag}"),
+            "cmd": ["/bin/sh", "-c", format!("env > {0}.tmp && mv {0}.tmp {0}", out.display())],
+        }),
+    )
+    .await;
+    assert_eq!(spawned["ok"], true, "{spawned}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(s) = std::fs::read_to_string(&out) {
+            return s;
+        }
+        assert!(Instant::now() < deadline, "the PTY never wrote its env");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Per-account secrets (`/etc/ikenga/secrets/<unix_name>.env`, here under
+/// `--account-secrets-dir`): the broker reads each account's own file when it
+/// launches that account's child, and the entries reach that account's PTYs,
+/// Chi runs and engine CLIs, and nobody else's. The box-wide
+/// `IKENGA_SECRET_*` stays out of all of them; denylisted names in the file
+/// are ignored; an untrusted file is skipped whole; a changed file applies
+/// when the child next starts. FAKE values throughout.
+#[test]
+#[ignore = "t1-root"]
+fn t1_root_broker_account_secrets_reach_pty_and_chi_per_account() {
+    assert!(is_root(), "t1-root tests run as root");
+    const BOX_WIDE: &str = "box-wide-operator-default-FAKE";
+    let users = HostUsers(vec![
+        "ik-t1sec-ada".into(),
+        "ik-t1sec-bob".into(),
+        "ik-t1sec-eve".into(),
+    ]);
+    let tmp = TempDir::new("acct-secrets");
+    let root = tmp.0.join("root");
+    let secrets = tmp.0.join("secrets");
+    let range = "28260-28270";
+    for (name, admin) in [
+        ("t1sec-ada", true),
+        ("t1sec-bob", false),
+        ("t1sec-eve", false),
+    ] {
+        let mut args = vec!["create", name, "--password-stdin"];
+        if admin {
+            args.push("--admin");
+        }
+        accounts(&root, range, &args, &format!("{PASSWORD}\n"));
+    }
+    let (ada_gid, bob_gid, eve_gid) = (
+        host_gid("ik-t1sec-ada"),
+        host_gid("ik-t1sec-bob"),
+        host_gid("ik-t1sec-eve"),
+    );
+    write_account_secrets(
+        &secrets,
+        &[
+            (
+                "ik-t1sec-ada",
+                ada_gid,
+                "# managed by provision.sh\nFAL_KEY=fake-ada-fal\n\
+                 WEIRD=a=b # $(id) \"q\" `x`\n\
+                 LD_PRELOAD=/evil.so\nPATH=/evil\nHOME=/evil\nIKENGA_SECRET_SNEAKY=ada-sneaky-FAKE\n",
+            ),
+            (
+                "ik-t1sec-bob",
+                bob_gid,
+                "FAL_KEY=fake-bob-fal\nBOB_ONLY=fake-bob-only\n",
+            ),
+        ],
+    );
+    // Eve's file is world-readable: skipped whole (and so is a file with the
+    // wrong group, covered by the unit tests).
+    write_account_secrets(
+        &secrets,
+        &[("ik-t1sec-eve", eve_gid, "EVE_ONLY=fake-eve\n")],
+    );
+    std::fs::set_permissions(
+        secrets.join("ik-t1sec-eve.env"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    let broker = start_broker_with_env(
+        &tmp.0,
+        &root,
+        range,
+        &[
+            ("IKENGA_SECRET_DEMO_KEY", BOX_WIDE),
+            ("IKENGA_ACCOUNT_SECRETS_DIR", secrets.to_str().unwrap()),
+            // Each principal child's idle timeout: the reload step below
+            // relies on the real idle reap.
+            ("IKENGA_IDLE_TIMEOUT", "8"),
+        ],
+    );
+    let home_of = |name: &str| {
+        let id = account_id(&root, range, name);
+        root.join("principals").join(id).join("home")
+    };
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let ada = login(&broker, "t1sec-ada", PASSWORD).await;
+        let bob = login(&broker, "t1sec-bob", PASSWORD).await;
+        let eve = login(&broker, "t1sec-eve", PASSWORD).await;
+        for who in [&ada, &bob, &eve] {
+            let r = rpc(&broker, who, "os_username", json!({})).await;
+            assert_eq!(r["ok"], true, "{r}");
+        }
+        let (ada_home, bob_home, eve_home) = (
+            home_of("t1sec-ada"),
+            home_of("t1sec-bob"),
+            home_of("t1sec-eve"),
+        );
+
+        // PTYs: each sees its own file's variables, as literal values.
+        let ada_env = pty_env(&broker, &ada, &ada_home, "a").await;
+        let bob_env = pty_env(&broker, &bob, &bob_home, "a").await;
+        let eve_env = pty_env(&broker, &eve, &eve_home, "a").await;
+        let lines = |s: &str| s.lines().map(str::to_string).collect::<Vec<_>>();
+        let ada_l = lines(&ada_env);
+        assert!(
+            ada_l.contains(&"FAL_KEY=fake-ada-fal".to_string()),
+            "{ada_env}"
+        );
+        assert!(
+            ada_l.contains(&"WEIRD=a=b # $(id) \"q\" `x`".to_string()),
+            "values are literal: {ada_env}"
+        );
+        assert!(!ada_env.contains("fake-bob") && !ada_env.contains("fake-eve"));
+        let bob_l = lines(&bob_env);
+        assert!(
+            bob_l.contains(&"FAL_KEY=fake-bob-fal".to_string()),
+            "{bob_env}"
+        );
+        assert!(bob_l.contains(&"BOB_ONLY=fake-bob-only".to_string()));
+        assert!(!bob_env.contains("fake-ada") && !bob_env.contains("WEIRD"));
+        // Denylisted names in the file never land; the floor is untouched.
+        for (env, home) in [(&ada_env, &ada_home)] {
+            assert!(!env.contains("/evil"), "denylisted name applied: {env}");
+            assert!(!env.contains("ada-sneaky"), "IKENGA_* applied: {env}");
+            assert!(!env.contains("LD_PRELOAD"), "{env}");
+            assert!(
+                env.lines().any(|l| l == format!("HOME={}", home.display())),
+                "{env}"
+            );
+        }
+        // The box-wide operator default and the daemon's own keys: nowhere.
+        for env in [&ada_env, &bob_env, &eve_env] {
+            assert!(!env.contains(BOX_WIDE), "IKENGA_SECRET_* reached a PTY");
+            assert!(!env.contains("IKENGA_SECRET_"), "{env}");
+            assert!(!env.contains("IKENGA_AUTH_TOKEN"));
+            assert!(!env.contains("IKENGA_ACCOUNT_SECRETS_DIR"));
+        }
+        // Eve's untrusted (world-readable) file was skipped whole.
+        assert!(!eve_env.contains("EVE_ONLY"), "{eve_env}");
+        assert!(
+            broker.log().contains("account secrets file not used")
+                || std::fs::read_to_string(tmp.0.join("broker.err"))
+                    .unwrap_or_default()
+                    .contains("account secrets file not used"),
+            "a warning names the skipped file"
+        );
+        // No value is ever logged.
+        let logs = format!(
+            "{}{}",
+            broker.log(),
+            std::fs::read_to_string(tmp.0.join("broker.err")).unwrap_or_default()
+        );
+        for v in [
+            "fake-ada-fal",
+            "fake-bob-fal",
+            "fake-bob-only",
+            "fake-eve",
+            "ada-sneaky",
+        ] {
+            assert!(
+                !logs.contains(v),
+                "a secret value is in the broker log: {v}"
+            );
+        }
+
+        // Chi runs and engine CLIs: the stub `claude` records its environment.
+        for home in [&ada_home, &bob_home] {
+            install_principal_stub(
+                home,
+                "claude",
+                r#"#!/bin/sh
+cat > /dev/null
+env > "$HOME/claude-env.txt.tmp" && mv "$HOME/claude-env.txt.tmp" "$HOME/claude-env.txt"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-sec"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+"#,
+            );
+        }
+        for (who, home, mine, theirs) in [
+            (&ada, &ada_home, "fake-ada-fal", "fake-bob"),
+            (&bob, &bob_home, "fake-bob-fal", "fake-ada"),
+        ] {
+            let run = rpc(
+                &broker,
+                who,
+                "chi_run",
+                json!({ "opts": { "engineId": "claude-code", "prompt": "hello" } }),
+            )
+            .await;
+            assert_eq!(run["ok"], true, "{run}");
+            let file = home.join("claude-env.txt");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !file.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the engine never ran: {}",
+                    broker.log()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let env = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                env.contains(&format!("FAL_KEY={mine}")),
+                "chi run env: {env}"
+            );
+            assert!(
+                !env.contains(theirs),
+                "another account's secret in a chi run"
+            );
+            assert!(
+                !env.contains(BOX_WIDE) && !env.contains("IKENGA_SECRET_"),
+                "{env}"
+            );
+        }
+
+        // Reload: a changed file applies when the child next starts.
+        write_account_secrets(
+            &secrets,
+            &[("ik-t1sec-ada", ada_gid, "FAL_KEY=fake-ada-fal-v2\n")],
+        );
+        let before = pty_env(&broker, &ada, &ada_home, "b").await;
+        assert!(
+            before.contains("FAL_KEY=fake-ada-fal\n"),
+            "a running child keeps the environment it was started with: {before}"
+        );
+        let ada_uid = std::fs::metadata(&ada_home).unwrap().uid();
+        // The child's own idle watcher (IKENGA_IDLE_TIMEOUT below) ends it;
+        // the broker relaunches it on Ada's next request.
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while child_uids().contains(&ada_uid) {
+            assert!(Instant::now() < deadline, "ada's child never idled out");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let after = pty_env(&broker, &ada, &ada_home, "c").await;
+        assert!(after.contains("FAL_KEY=fake-ada-fal-v2\n"), "{after}");
+        assert!(
+            !after.contains("WEIRD="),
+            "the file was replaced, not merged"
+        );
+    });
+    drop(broker);
+    drop(users);
+}

@@ -259,6 +259,10 @@ pub struct BrokerBoot {
     pub provisioning: ProvisioningMode,
     pub bootstrap: Option<BootstrapAdmin>,
     pub insecure_cookie: bool,
+    /// `--account-secrets-dir`: where the per-account secrets files live
+    /// (`None` = `/etc/ikenga/secrets`). Root's to set; see
+    /// [`children::T1Launcher::account_secrets_dir`].
+    pub account_secrets_dir: Option<PathBuf>,
     /// The Part B flags (G-ACCESS §10.1): `--public-url`, `--max-accounts`,
     /// `--invite-ttl`, `--member-invites-create-accounts`.
     pub access: crate::access::AccessOptions,
@@ -294,6 +298,7 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         provisioning,
         bootstrap,
         insecure_cookie,
+        account_secrets_dir,
         access: access_options,
         push: push_options,
     } = boot;
@@ -373,6 +378,9 @@ pub async fn serve(boot: BrokerBoot) -> anyhow::Result<()> {
         root: root.clone(),
         pkgs_dir: config.pkgs_dir.clone(),
         idle_timeout,
+        account_secrets_dir: crate::executor::t1_account_env::dir_or_default(
+            account_secrets_dir.as_deref(),
+        ),
     });
     let mut broker_state = BrokerState::new(pool.clone(), verifier, launcher)?;
     // G-ACCESS R-3 / R-4 / R-5: the device-grant resolver, authorize_rpc, the

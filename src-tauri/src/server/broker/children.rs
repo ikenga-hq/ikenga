@@ -41,6 +41,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 
 use crate::executor::t1::T1Executor;
+use crate::executor::t1_account_env;
 use crate::executor::{PipedOpts, Principal, PrincipalId, SpawnSpec, StdioMode};
 use crate::secrets::principal_store::{WrapKey, WRAP_KEY_ENV};
 use crate::server::auth::BoxFuture;
@@ -330,6 +331,11 @@ pub struct T1Launcher {
     pub root: OperatorRoot,
     pub pkgs_dir: Option<PathBuf>,
     pub idle_timeout: Duration,
+    /// Where the provisioner puts each account's granted secrets
+    /// (`<dir>/<unix_name>.env`). Root-controlled: `--account-secrets-dir` /
+    /// `IKENGA_ACCOUNT_SECRETS_DIR` on the broker, never a child's or an
+    /// account's to set. [`t1_account_env::DEFAULT_DIR`] when unset.
+    pub account_secrets_dir: PathBuf,
 }
 
 impl T1Launcher {
@@ -430,10 +436,19 @@ impl ChildLauncher for T1Launcher {
                 new_process_group: true,
             };
             let secrets_key = self.secrets_key(principal).await?;
-            let child = self.executor.spawn_piped_with_host_env(
+            // The account's own granted secrets, from its root-owned file. A
+            // small bounded read, off the runtime threads like any file I/O.
+            let account_env = {
+                let (dir, p) = (self.account_secrets_dir.clone(), principal.clone());
+                tokio::task::spawn_blocking(move || t1_account_env::for_principal(&dir, &p))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("reading the account's secrets file: {e}"))?
+            };
+            let child = self.executor.spawn_piped_with_envs(
                 spec,
                 opts,
                 &Self::host_env(token, &secrets_key),
+                &account_env,
             )?;
             let pid = child
                 .id()
@@ -738,6 +753,7 @@ pub(crate) mod tests {
             root: root.clone(),
             pkgs_dir: Some("/opt/ikenga/pkgs".into()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            account_secrets_dir: t1_account_env::DEFAULT_DIR.into(),
         };
         let args: Vec<String> = launcher
             .args(&p)

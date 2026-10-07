@@ -45,6 +45,13 @@
 //! the broker's child launcher uses for its per-child token and the
 //! `IKENGA_SECRET_*` operator defaults (§5 row 15).
 //!
+//! The one other addition is the principal's own granted secrets
+//! (`t1_account_env`, `/etc/ikenga/secrets/<unix_name>.env`, read by the
+//! broker): [`T1Executor::spawn_piped_with_envs`] places them after the
+//! floor and before the spec's vars, refusing any name `is_refused_name`
+//! denies, so they can never displace `HOME`/`PATH`/... or reach a host-only
+//! name.
+//!
 //! A missing cwd becomes the principal's home, and a relative one is resolved
 //! against it: the executor never inherits the broker's cwd.
 //!
@@ -202,6 +209,7 @@ impl T1Executor {
         p: &Principal,
         spec: &SpawnSpec,
         host_env: &[(OsString, OsString)],
+        account_env: &[(OsString, OsString)],
     ) -> Vec<(OsString, OsString)> {
         let tmpdir = self
             .config
@@ -224,6 +232,18 @@ impl T1Executor {
             ("TMPDIR".into(), tmpdir.into_os_string()),
         ];
         env.extend(std::env::vars_os().filter(|(k, _)| is_locale_env(k)));
+        // The account's own granted secrets (`t1_account_env`): after the
+        // floor, before the spec, so neither can be overridden by them (the
+        // names are screened in `std_command` and again here).
+        env.extend(
+            account_env
+                .iter()
+                .filter(|(k, _)| {
+                    !super::t1_account_env::is_refused_name(&k.to_string_lossy())
+                        && !is_denied_env(k)
+                })
+                .cloned(),
+        );
         env.extend(
             spec.env
                 .vars
@@ -241,8 +261,18 @@ impl T1Executor {
         spec: &SpawnSpec,
         opts: &PipedOpts,
         host_env: &[(OsString, OsString)],
+        account_env: &[(OsString, OsString)],
     ) -> io::Result<std::process::Command> {
         let p = self.admit(spec)?;
+        for (k, _) in account_env {
+            let name = k.to_string_lossy();
+            if super::t1_account_env::is_refused_name(&name) || is_denied_env(k) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} is not a name an account secret may take"),
+                ));
+            }
+        }
         for (k, _) in host_env {
             if !crate::pty::is_host_only_env(&k.to_string_lossy()) {
                 return Err(io::Error::new(
@@ -270,7 +300,7 @@ impl T1Executor {
             .stdout(opts.stdout.to_stdio())
             .stderr(opts.stderr.to_stdio())
             .env_clear()
-            .envs(self.environment(p, spec, host_env))
+            .envs(self.environment(p, spec, host_env, account_env))
             .gid(p.gid)
             .uid(p.uid);
         if opts.new_process_group || opts.detached {
@@ -320,7 +350,7 @@ impl T1Executor {
                 "spawn_std is for children the caller waits on; `detached` makes no sense here",
             ));
         }
-        let mut cmd = self.std_command(&spec, &opts, &[])?;
+        let mut cmd = self.std_command(&spec, &opts, &[], &[])?;
         self.after_spawn(cmd.spawn())
     }
 
@@ -334,7 +364,23 @@ impl T1Executor {
         opts: PipedOpts,
         host_env: &[(OsString, OsString)],
     ) -> io::Result<tokio::process::Child> {
-        let mut cmd = tokio::process::Command::from(self.std_command(&spec, &opts, host_env)?);
+        self.spawn_piped_with_envs(spec, opts, host_env, &[])
+    }
+
+    /// [`spawn_piped_with_host_env`](Self::spawn_piped_with_host_env) plus the
+    /// principal's own granted secrets (`t1_account_env`). They travel beside
+    /// the spec, not in it, so a `{:?}` of the spec can never print one; every
+    /// name must pass [`t1_account_env::is_refused_name`] (the loader already
+    /// filtered, this is the executor refusing anything that slipped past).
+    pub fn spawn_piped_with_envs(
+        &self,
+        spec: SpawnSpec,
+        opts: PipedOpts,
+        host_env: &[(OsString, OsString)],
+        account_env: &[(OsString, OsString)],
+    ) -> io::Result<tokio::process::Child> {
+        let mut cmd =
+            tokio::process::Command::from(self.std_command(&spec, &opts, host_env, account_env)?);
         cmd.kill_on_drop(opts.kill_on_drop && !opts.detached);
         self.after_spawn(cmd.spawn())
     }
@@ -413,7 +459,7 @@ impl SessionExecutor for T1Executor {
                 "spawn_output_blocking waits for the child; `detached` makes no sense here",
             ));
         }
-        let mut cmd = self.std_command(&spec, &opts, &[])?;
+        let mut cmd = self.std_command(&spec, &opts, &[], &[])?;
         self.after_spawn(cmd.output())
     }
 }
@@ -598,7 +644,7 @@ pub(crate) mod tests {
             .env("IKENGA_BOOTSTRAP_ADMIN", "ada")
             .env("IKENGA_BOOTSTRAP_ADMIN_PASSWORD", "pw")
             .env("PATH", "/custom");
-        let env = exec.environment(&p, &spec, &[]);
+        let env = exec.environment(&p, &spec, &[], &[]);
         let get = |k: &str| {
             env.iter()
                 .rev()
@@ -642,7 +688,7 @@ pub(crate) mod tests {
 
         // Default PATH (§9.3) and the operator's --principal-path.
         let spec = sh("true", Some(p.clone()));
-        let env = exec.environment(&p, &spec, &[]);
+        let env = exec.environment(&p, &spec, &[], &[]);
         let path = env.iter().find(|(k, _)| k == "PATH").unwrap().1.clone();
         assert_eq!(
             path,
@@ -652,7 +698,7 @@ pub(crate) mod tests {
             principal_path: Some("/opt/bin:/usr/bin".into()),
             ..config()
         });
-        let env = exec.environment(&p, &spec, &[]);
+        let env = exec.environment(&p, &spec, &[], &[]);
         let path = env.iter().find(|(k, _)| k == "PATH").unwrap().1.clone();
         assert_eq!(path, OsString::from("/opt/bin:/usr/bin"));
     }
@@ -667,14 +713,73 @@ pub(crate) mod tests {
             &p,
             &spec,
             &[("IKENGA_AUTH_TOKEN".into(), "per-child".into())],
+            &[],
         );
         assert!(env
             .iter()
             .any(|(k, v)| k == "IKENGA_AUTH_TOKEN" && v == "per-child"));
         let err = exec
-            .std_command(&spec, &piped(), &[("NOT_HOST_ONLY".into(), "x".into())])
+            .std_command(
+                &spec,
+                &piped(),
+                &[("NOT_HOST_ONLY".into(), "x".into())],
+                &[],
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The account's granted secrets reach the child's environment, after the
+    /// floor and never over it; a refused name is an error, not a skip.
+    #[test]
+    fn account_env_joins_the_environment_but_cannot_displace_the_floor() {
+        let exec = T1Executor::new(config());
+        let p = principal(20_004, "/h");
+        let spec = sh("true", Some(p.clone()));
+        let acct: Vec<(OsString, OsString)> = vec![
+            ("FAL_KEY".into(), "fake-fal".into()),
+            ("ANTHROPIC_API_KEY".into(), "fake-ant=with=equals".into()),
+        ];
+        let env = exec.environment(&p, &spec, &[], &acct);
+        let get = |k: &str| {
+            env.iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .last()
+        };
+        assert_eq!(get("FAL_KEY"), Some("fake-fal".into()));
+        assert_eq!(
+            get("ANTHROPIC_API_KEY"),
+            Some("fake-ant=with=equals".into())
+        );
+        assert_eq!(get("HOME"), Some(p.home.clone().into_os_string()));
+        assert!(exec.std_command(&spec, &piped(), &[], &acct).is_ok());
+
+        // `environment` itself drops what `std_command` would have refused.
+        let bad: Vec<(OsString, OsString)> = vec![
+            ("HOME".into(), "/evil".into()),
+            ("PATH".into(), "/evil".into()),
+            ("LD_PRELOAD".into(), "/evil.so".into()),
+            ("IKENGA_SECRET_X".into(), "box-wide".into()),
+            ("IKENGA_AUTH_TOKEN".into(), "tok".into()),
+        ];
+        let env = exec.environment(&p, &spec, &[], &bad);
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "HOME").unwrap().1,
+            p.home.clone().into_os_string()
+        );
+        for k in ["LD_PRELOAD", "IKENGA_SECRET_X", "IKENGA_AUTH_TOKEN"] {
+            assert!(!env.iter().any(|(n, _)| n == k), "{k} leaked");
+        }
+        for (k, v) in &bad {
+            let one = [(k.clone(), v.clone())];
+            let err = exec.std_command(&spec, &piped(), &[], &one).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{k:?}");
+            assert!(
+                !err.to_string().contains(&*v.to_string_lossy()),
+                "no value in errors"
+            );
+        }
     }
 
     /// §9.3 / review S2-3: the child's cwd is never relative to the broker's.
@@ -688,7 +793,7 @@ pub(crate) mod tests {
             if let Some(cwd) = cwd {
                 spec.current_dir(cwd);
             }
-            let cmd = exec.std_command(&spec, &piped(), &[]).unwrap();
+            let cmd = exec.std_command(&spec, &piped(), &[], &[]).unwrap();
             cmd.get_current_dir().map(PathBuf::from)
         };
         assert_eq!(cwd_of(None), Some(home.clone()));

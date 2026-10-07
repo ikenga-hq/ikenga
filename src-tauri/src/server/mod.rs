@@ -158,6 +158,10 @@ pub struct T1ServeOptions {
     pub provisioning_external: bool,
     /// `--principal-path`: the `PATH` principals' children get (§9.3).
     pub principal_path: Option<std::ffi::OsString>,
+    /// `--account-secrets-dir`: where the T1 broker reads each account's
+    /// granted secrets (`<dir>/<unix_name>.env`) from when it launches that
+    /// account's child. `None` = `/etc/ikenga/secrets`.
+    pub account_secrets_dir: Option<PathBuf>,
     /// `--insecure-cookie` (P-3, G-ACCESS R-9): drop `Secure` from the
     /// session and device cookies, for a plain-HTTP deploy. Read by every
     /// tier's boot. On T0 a tailnet peer gets a non-`Secure` device cookie
@@ -1380,6 +1384,7 @@ async fn t1_boot(config: ServerConfig, t1: T1ServeOptions) -> anyhow::Result<()>
         provisioning,
         bootstrap,
         insecure_cookie: t1.insecure_cookie,
+        account_secrets_dir: t1.account_secrets_dir.clone(),
         access: access_options,
         push: t1.push,
     })
