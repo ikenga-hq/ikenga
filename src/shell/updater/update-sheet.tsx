@@ -50,7 +50,7 @@ export function UpdateSheet() {
 
 	return (
 		<Sheet open={open} onOpenChange={(v) => (v ? openSheet(source) : close())}>
-			<SheetContent side="right" className="w-full sm:max-w-md">
+			<SheetContent side="right" className="flex w-full flex-col sm:max-w-md">
 				<SheetHeader>
 					<SheetTitle>Update</SheetTitle>
 					<SheetDescription className="sr-only">
@@ -85,7 +85,7 @@ export function UpdateSheet() {
 						Apps and extensions ({pkgCount})
 					</button>
 				</div>
-				<div className="flex-1 overflow-y-auto px-4 py-3">
+				<div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
 					{source === 'shell' ? <ShellUpdatePanel /> : <PkgUpdatePanel />}
 				</div>
 			</SheetContent>
