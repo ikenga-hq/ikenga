@@ -42,6 +42,7 @@ pub mod push;
 mod reserved;
 pub mod rpc;
 mod rpc_claude;
+mod rpc_exec;
 mod rpc_files;
 mod rpc_local;
 mod rpc_shell;
@@ -730,6 +731,32 @@ pub(crate) fn router_with_chi(
         crate::access::DaemonAccess::unavailable(),
         Some(chi),
         UpdateSource::Default,
+    )
+}
+
+/// [`router_with`] with the Chi arms' state as well, for the executor-routed
+/// arms' tests (`server::rpc_exec`): a local allowlist, a stub engine and a
+/// PTY manager the test holds, all at once.
+#[cfg(test)]
+pub(crate) fn router_for_exec_tests(
+    config: ServerConfig,
+    pty_manager: Arc<PtyManager>,
+    pa_db: Option<Arc<crate::db::PaDb>>,
+    home: Option<PathBuf>,
+    path_guard: rpc_shell::PathGuard,
+    chi: Arc<rpc_local::DaemonChi>,
+) -> Router {
+    build_router(
+        config,
+        pty_manager,
+        Arc::new(EngineRegistry::new()),
+        pa_db,
+        None,
+        home,
+        path_guard,
+        crate::pkg::skill_actions::store_root(),
+        crate::access::DaemonAccess::unavailable(),
+        Some(chi),
     )
 }
 

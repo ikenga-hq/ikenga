@@ -67,7 +67,7 @@ impl Registry for SidecarsRegistry {
         // Target gate: a package can ship multiple targets, but at install
         // time at least one must match this host. Skill packs (`targets:
         // []`) bypass this check.
-        let host_target = host_target_triple();
+        let host_target = crate::server::shared::sidecar_call::host_target_triple();
         if !pkg.manifest.targets.is_empty() && !pkg.manifest.targets.contains(&host_target) {
             return Err(anyhow!(
                 "package `{}` ships targets {:?}, host is `{}`",
@@ -170,24 +170,5 @@ impl Registry for SidecarsRegistry {
             })
             .collect();
         json!({ "count": list.len(), "entries": list })
-    }
-}
-
-/// Host's rust target triple. Hard-coded per-OS arms cover what the host
-/// supports today; wrong arch hits the catch-all and surfaces as an install
-/// error rather than silently accepting an incompatible binary.
-fn host_target_triple() -> String {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu".into()
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "aarch64-unknown-linux-gnu".into()
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin".into()
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin".into()
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "x86_64-pc-windows-msvc".into()
-    } else {
-        "unknown".into()
     }
 }

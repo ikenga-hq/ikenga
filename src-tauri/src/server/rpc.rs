@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::rpc_claude;
+use super::rpc_exec;
 use super::rpc_files;
 use super::rpc_local;
 use super::rpc_shell;
@@ -531,8 +532,8 @@ pub async fn rpc_handler(
         // this handler runs in the signed-in principal's child — a run
         // executes as that principal, against that principal's own ikenga.db
         // and chi-cache. The agent-ops arms resolve the router's home
-        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` stays
-        // desktop-only.
+        // (single-user seam, G-PRINCIPAL / WP-20); `agent_ops_run_now` is
+        // served below with the executor-routed arms.
         "chi_run" => rpc_local::chi_run(&state, &payload.args).await,
         "chi_resume" => rpc_local::chi_resume(&state, &payload.args).await,
         "chi_cancel" => rpc_local::chi_cancel(&state, &payload.args).await,
@@ -555,8 +556,8 @@ pub async fn rpc_handler(
         // (no event channel here). The project filesystem arms stay inside the
         // fs allowlist and the project root. Left desktop-only:
         // `notifications_record_update` (its sweep needs the shell version +
-        // pkg kernel), `comment_route` (spawns chi). `pin_screenshot_write`
-        // joined in slice 8 (below).
+        // pkg kernel). `pin_screenshot_write` joined in slice 8, and
+        // `comment_route` with the executor-routed arms (both below).
         "notifications_list" => rpc_shell::notifications_list(&state, &payload.args).await,
         "notifications_unread_count" => rpc_shell::notifications_unread_count(&state).await,
         "notifications_mark_read" => {
@@ -733,7 +734,8 @@ pub async fn rpc_handler(
         // allowlist and refused inside the daemon's own state). No
         // `pa-action-*` events (no event channel). Commit / retry wake the
         // mutation worker with the hardcoded `mutation:send-worker` only —
-        // `agent_ops_run_now` itself stays allowlisted.
+        // `agent_ops_run_now` is its own arm (below), confined to the
+        // principal's own jobs.
         "pa_actions_pause" => rpc_local::pa_actions_pause(&state, &payload.args).await,
         "pa_actions_list" => rpc_local::pa_actions_list(&state, &payload.args).await,
         "pa_actions_update" => rpc_local::pa_actions_update(&state, &payload.args).await,
@@ -768,6 +770,27 @@ pub async fn rpc_handler(
         "pkg_preview_manifest" => rpc_files::pkg_preview_manifest(&state, &payload.args),
         "pkg_discover_workspace" => rpc_files::pkg_discover_workspace(&state, &payload.args),
         "pkg_scaffold" => rpc_files::pkg_scaffold(&state, &payload.args).await,
+
+        // --- Executor-routed arms + the pkg-settings write (gap audit
+        //     2026-10-06 ranks 21, 23, 20-partial) ---
+        //
+        // Bodies in `server::rpc_exec`, over the cores the desktop commands
+        // call (`server::shared::{sidecar_call, action_exec, comment_route,
+        // agent_ops}`, `pkg::settings_values`). Every spawn goes through
+        // `executor::current()`: under T1 this handler runs in the signed-in
+        // principal's child, so a sidecar, action or pin run executes as that
+        // principal, against that principal's home, ikenga.db and PTYs. A
+        // sidecar resolves only from the `--pkgs-dir` index and only inside
+        // its pkg; an action or pin cwd only inside the fs allowlist; run-now
+        // only for the principal's own job through the principal's own
+        // agent-ops daemon; a setting only for a declared key. The kernel
+        // verbs (`pkg_set_enabled`, `pkg_uninstall`, `pkg_supervisor_restart`)
+        // stay in `desktop_only.toml`: the daemon has no kernel to run them.
+        "pkg_sidecar_call" => rpc_exec::pkg_sidecar_call(&state, &payload.args).await,
+        "action_exec" => rpc_exec::action_exec(&state, &payload.args).await,
+        "comment_route" => rpc_exec::comment_route(&state, &payload.args).await,
+        "agent_ops_run_now" => rpc_exec::agent_ops_run_now(&state, &payload.args).await,
+        "pkg_settings_set" => rpc_exec::pkg_settings_set(&state, &payload.args).await,
 
         // --- G-ACCESS §9.1 (WP-74a, skeleton-first §9.2) ---
         //
