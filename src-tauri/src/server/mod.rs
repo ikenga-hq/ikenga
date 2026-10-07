@@ -757,6 +757,7 @@ pub(crate) fn router_for_exec_tests(
         crate::pkg::skill_actions::store_root(),
         crate::access::DaemonAccess::unavailable(),
         Some(chi),
+        UpdateSource::Default,
     )
 }
 
