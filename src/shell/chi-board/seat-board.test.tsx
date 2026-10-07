@@ -442,8 +442,17 @@ describe('the rail’s menu and actions, from the board', () => {
 		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe('terminal-send --seat lead "…"');
 		fireEvent.click(row('seat:seat-docs'));
 		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe('seat resume docs --prompt "…"');
+		// jsdom has no clipboard; give it a working one. Without it the copy now
+		// (correctly) fails and shows an error, not a false "Copied".
+		const writeText = vi.fn().mockResolvedValue(undefined);
+		Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
 		fireEvent.click(document.querySelector('[data-board-iyke-copy]') as HTMLElement);
-		expect(useSeatNotice.getState().notice?.message).toBe('Copied iyke seat resume docs --prompt "…"');
+		// The notice waits for the clipboard write to succeed (no false "Copied").
+		await waitFor(() =>
+			expect(useSeatNotice.getState().notice?.message).toBe('Copied iyke seat resume docs --prompt "…"')
+		);
+		expect(writeText).toHaveBeenCalledWith('iyke seat resume docs --prompt "…"');
+		Reflect.deleteProperty(navigator, 'clipboard');
 	});
 });
 

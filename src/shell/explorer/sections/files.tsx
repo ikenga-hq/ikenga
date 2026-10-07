@@ -16,7 +16,6 @@ import {
 	X,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { writeClipboardText } from '@/lib/transport';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useFilesStore } from '@/lib/shell/files-store';
 import { usePaneStore } from '@/lib/panes/pane-store';
@@ -58,6 +57,7 @@ import { useEffectiveMenu } from '@/lib/actions/store';
 import { confirm as confirmDialog } from '@/lib/transport/dialog-shim';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
+import { copyText } from '@/lib/clipboard';
 
 // Folders we never auto-list by default. The dot-file filter already catches
 // `.git`, `.next`, `.cache`, `.turbo`, etc.; this catches the un-prefixed ones
@@ -527,7 +527,7 @@ function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 
 	const terminalCwd = entry.isDir ? entry.path : parentOf(entry.path);
 	const copyPath = useCallback(() => {
-		void writeClipboardText(entry.path).catch(() => {});
+		void copyText(entry.path);
 	}, [entry.path]);
 
 	const { data: gitStatus } = useGitStatus();
@@ -557,7 +557,7 @@ function TreeNode({ entry, depth, rootPath, filter }: TreeNodeProps) {
 		'open-terminal-below': () => openTerminalAt(terminalCwd, 'bottom'),
 		'hand-to-chi': () => handToChi(entry.path),
 		'copy-path': copyPath,
-		'copy-name': () => void writeClipboardText(entry.name).catch(() => {}),
+		'copy-name': () => void copyText(entry.name),
 		rename: () => {
 			keepFocusOnMenuClose.current = true;
 			startRename();

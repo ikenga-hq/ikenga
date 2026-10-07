@@ -140,6 +140,8 @@ const KINDS: &[(&str, Category, bool)] = &[
     ("audit.chain_broken", Category::Access, false),
     ("audit.resealed", Category::Access, false),
     ("secrets.kek_rotated", Category::Access, false),
+    // WP-P9: an admin asked root to apply a server update.
+    ("server.update_requested", Category::Access, false),
 ];
 
 /// `kind` as the list's `'static` spelling, or `None` outside §6.5.
@@ -504,6 +506,11 @@ mod tests {
         assert!(is_access_change("device.tier_changed"));
         assert!(!is_access_change("permission.decided"));
         assert!(!is_access_change("auth.sessions_revoked"));
+        assert_eq!(
+            category_of("server.update_requested"),
+            Some(Category::Access)
+        );
+        assert!(!is_access_change("server.update_requested"));
     }
 
     #[test]

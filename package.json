@@ -1,7 +1,7 @@
 {
 	"name": "ikenga-desktop",
 	"private": true,
-	"version": "0.20.1",
+	"version": "0.21.2",
 	"license": "Apache-2.0",
 	"type": "module",
 	"description": "Ikenga — Tauri 2 desktop app (control plane for terminals, chat, viewer)",
@@ -16,7 +16,7 @@
 		"tokens:copy": "node -e \"const fs=require('fs');fs.copyFileSync(require.resolve('@ikenga/tokens/tokens.css'),'src-tauri/resources/ikenga-tokens.css')\"",
 		"iyke:mcp:build": "bash scripts/build-iyke-mcp.sh",
 		"engine:cc:materialize": "node scripts/materialize-engine-cc.mjs",
-		"typecheck": "tsc --noEmit",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p pwa && tsc --noEmit -p scripts/pwa",
 		"tsr:generate": "tsr generate",
 		"tsr:watch": "tsr watch",
 		"preview": "vite preview",

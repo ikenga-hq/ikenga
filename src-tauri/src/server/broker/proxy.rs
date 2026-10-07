@@ -634,6 +634,13 @@ pub async fn rpc_proxy(
             message,
         } => return json_error(status, code, &message),
     }
+    // An admin's `fs_roots_*` call naming another principal goes to that
+    // principal's child (`fs_roots_admin`); everything else is unchanged.
+    let (narrowing, bytes) =
+        match super::fs_roots_admin::route(&state, &ctx, narrowing, &cmd, &args, bytes).await {
+            Ok(routed) => routed,
+            Err(res) => return res,
+        };
     forward(
         &state,
         &narrowing,

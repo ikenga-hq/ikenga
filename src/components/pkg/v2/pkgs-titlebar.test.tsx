@@ -26,6 +26,7 @@ function makeDerived(overrides: Partial<DerivedPkgs> = {}): DerivedPkgs {
 		sidecarsRunning: 0,
 		isLoading: false,
 		error: null,
+		trustUnavailable: null,
 		...overrides,
 	};
 }

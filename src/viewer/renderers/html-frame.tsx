@@ -7,10 +7,10 @@ import {
 	fsWatch,
 	viewerPort,
 	viewerServe,
+	isRemoteWebSession,
 	viewerStop,
 	type ViewerHandle,
 } from '@/lib/tauri-cmd';
-import { writeClipboardText } from '@/lib/transport';
 import { registerIykeIframe } from '@/lib/iyke/iframe-registry';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { cn } from '@/components/ui/utils';
@@ -25,9 +25,11 @@ import { useEffectiveMenu } from '@/lib/actions/store';
 import { findLeaf } from '@/lib/panes/pane-reducer';
 import { resolveMenuItems } from '@/shell/menu/resolve';
 import { pickViewerRoot } from '../lib/relative-root';
+import { PreviewUnavailable } from './preview-unavailable';
 import { PinComposer, type PickResult } from '@/shell/artifact-studio/pin-composer';
 import * as M from '@/lib/artifact/bridge-messages';
 import { wrapHostMessage } from '@/lib/artifact/bridge-messages';
+import { copyText } from '@/lib/clipboard';
 
 function isHtmlPath(path: string): boolean {
 	const lower = path.toLowerCase();
@@ -66,7 +68,14 @@ interface HtmlFrameProps {
 //   below) and the CSP explicitly allows that origin.
 // External script loads are blocked by the CSP header injected on every
 // response from the viewer server.
-export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
+export function HtmlFrame(props: HtmlFrameProps) {
+	// The viewer server is desktop-only (gap audit rank 8): its localhost URL
+	// would point at the browser's own machine.
+	if (isRemoteWebSession()) return <PreviewUnavailable name={props.path.split('/').pop()} />;
+	return <LocalHtmlFrame {...props} />;
+}
+
+function LocalHtmlFrame({ path, paneId }: HtmlFrameProps) {
 	const [state, setState] = useState<
 		| { kind: 'loading' }
 		| { kind: 'ready'; src: string; handle: ViewerHandle }
@@ -200,7 +209,7 @@ export function HtmlFrame({ path, paneId }: HtmlFrameProps) {
 		'viewer.add-pin': () => {
 			if (menu) setPick(menu.pick);
 		},
-		'copy-path': () => void writeClipboardText(path).catch(() => {}),
+		'copy-path': () => void copyText(path),
 		'viewer.open-in-studio': () => {
 			if (paneId) replaceView(paneId, { kind: 'artifact-studio', path, density: 'loupe' });
 		},

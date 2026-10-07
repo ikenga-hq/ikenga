@@ -18,6 +18,8 @@
 // neither configured nor explicitly skipped, mirroring the shipped
 // `connectors` step's `allHandled` gate.
 
+import { installUnavailableReason } from '@/lib/desktop-only';
+import { honestRpcError } from '@/lib/transport/unavailable';
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
@@ -161,6 +163,10 @@ const STARTER_PREVIEW = {
 
 export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps) {
 	const isOffline = stateOverride === 'offline';
+	// Gap audit rank 3: the daemon serves no package install yet. The batch is
+	// not attempted; Continue records each pick as not installed with this
+	// reason, so the Done step never reads as a success.
+	const installBlocked = installUnavailableReason();
 	const { record, setPayload } = useOnboardingStep<EquipmentStepPayload>('equipment');
 	const persisted = record.payload;
 
@@ -410,7 +416,23 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 			});
 
 			// (b) fire package installs in the background — don't block Continue.
-			if (!isOffline) {
+			if (installBlocked) {
+				setPayload({
+					selected: Array.from(selected).sort(),
+					connectorsConfigured,
+					connectorsSkipped,
+					installResults: Array.from(selected)
+						.sort()
+						.map((pkgId) => ({
+							pkgId,
+							display: pkgId,
+							ok: false,
+							skipped: false,
+							error: installBlocked,
+						})),
+					scaffolding: scaffoldingResult,
+				});
+			} else if (!isOffline) {
 				const skippedPkgIds = new Set<string>();
 				for (const req of requirements) {
 					if (skippedSet.has(req.connectorId)) {
@@ -434,6 +456,23 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 						});
 					} catch (e) {
 						console.warn('[onboarding] equipment install batch failed', e);
+						// Never leave the Done step guessing: a batch that threw is a
+						// batch where nothing is known to be installed.
+						setPayload({
+							selected: Array.from(selected).sort(),
+							connectorsConfigured,
+							connectorsSkipped,
+							installResults: Array.from(selected)
+								.sort()
+								.map((pkgId) => ({
+									pkgId,
+									display: pkgId,
+									ok: false,
+									skipped: false,
+									error: honestRpcError(e),
+								})),
+							scaffolding: scaffoldingResult,
+						});
 					}
 				})();
 			}
@@ -457,6 +496,20 @@ export function EquipmentBody({ onContinue, stateOverride }: EquipmentBodyProps)
 					<b>The registry is unreachable</b> — suggested packages are disabled. What's already on
 					this machine is unaffected (read from disk, not fetched). Install suggestions later from{' '}
 					<LoreTerm term="Ngwa">Ngwa</LoreTerm> → Store.
+				</div>
+			)}
+
+			{installBlocked && (
+				<div
+					className="mb-6 rounded-md border p-4 text-sm"
+					style={{
+						borderColor: 'var(--warning, var(--border-strong))',
+						background: 'var(--warning-soft, var(--bg-surface))',
+					}}
+					data-testid="equipment-install-unavailable"
+				>
+					<b>{installBlocked}</b> — packages can't be installed from the browser yet, so nothing you
+					pick here will be installed. Install them from the Ikenga desktop app.
 				</div>
 			)}
 

@@ -72,7 +72,7 @@ export function SettingsSearchResults({ query, onGo }: SettingsSearchResultsProp
 			{hits.length === 0 ? (
 				<div className="mt-4 text-sm text-muted-foreground">
 					Nothing matches that. Search runs over every field label, its help text and its options,
-					in all nine sections.
+					in all ten sections.
 				</div>
 			) : (
 				<ul className="mt-3 divide-y divide-border overflow-hidden rounded-lg border border-border-soft bg-card">

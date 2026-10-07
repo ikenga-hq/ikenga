@@ -34,6 +34,7 @@ import {
 	type PausedDraftView,
 	type WorkerHealth,
 } from '@/lib/queries/pa-actions';
+import { copyText } from '@/lib/clipboard';
 
 // ── Types ─────────────────────────────────────────────────────────────────────────────────────
 // PausedDraft / DraftChannel are the shared run-then-pause contract — the renderer injects them
@@ -922,7 +923,8 @@ function healthFacts(h: WorkerHealth): ReactNode {
 function DeliveryHealthStrip({ health }: { health: WorkerHealth }) {
 	const [copied, setCopied] = useState(false);
 	const copyDiag = () => {
-		void navigator.clipboard?.writeText(DIAG_CMD).then(() => {
+		void copyText(DIAG_CMD).then((ok) => {
+			if (!ok) return;
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1400);
 		});
@@ -1074,7 +1076,7 @@ function DeliveryChip({
 								className="btn btn-sm btn-ghost"
 								onClick={(e) => {
 									e.stopPropagation();
-									if (draft.errorMessage) void navigator.clipboard?.writeText(draft.errorMessage);
+									if (draft.errorMessage) void copyText(draft.errorMessage);
 								}}
 							>
 								Copy error

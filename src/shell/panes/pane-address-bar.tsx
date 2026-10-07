@@ -22,13 +22,13 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { guardedCloseTab } from '@/lib/panes/unsaved-guard';
 import { useDragState } from '@/lib/panes/drag-state';
 import { beginPointerDrag } from '@/lib/panes/pointer-drag';
-import { writeClipboardText } from '@/lib/transport';
 import { usePathToManifestId, usePinsStore } from '@/lib/shell/pins-store';
 import { PinArtifactDialog } from './pin-artifact-dialog';
 import { PaneTools } from './pane-toolbar';
 import { viewLabel } from './pane-view-label';
 import { usePaneDisplayNameResolver } from './use-pane-display-names';
 import { NewTabMenu, useAnchorRect } from './new-tab-menu';
+import { copyText } from '@/lib/clipboard';
 
 interface PaneAddressBarProps {
 	paneId: PaneId;
@@ -143,9 +143,7 @@ export function PaneAddressBar({ paneId, view, leaf, mergedTools }: PaneAddressB
 		'tab.toggle-pin': () => {
 			if (leaf) toggleTabPinned(leaf.id, 0);
 		},
-		...(soleTabPath !== undefined
-			? { 'copy-path': () => void writeClipboardText(soleTabPath).catch(() => {}) }
-			: {}),
+		...(soleTabPath !== undefined ? { 'copy-path': () => void copyText(soleTabPath) } : {}),
 		'tab.close': () => {
 			if (leaf) void guardedCloseTab(leaf.id, 0);
 		},

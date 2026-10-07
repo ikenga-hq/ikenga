@@ -84,8 +84,10 @@ export type StoreDetailLoader = (
 export interface NgwaStoreSurfaceProps {
 	catalog: NgwaStoreEntry[];
 	isLoading?: boolean;
+	/** The Ngwa snapshot failed: what is installed is unknown, so no row can
+	 *  say installed / update / install. Not a registry outage. */
 	error?: Error | null;
-	/** D-07 offline state's one next action. */
+	/** Re-read the snapshot (the snapshot error state's one next action). */
 	onRetry?: () => void;
 	/**
 	 * Detail-file loader for the selected row. Absent (e.g. the index hasn't
@@ -698,11 +700,11 @@ export function NgwaStoreSurface({
 						)}
 
 						{!isLoading && error && (
-							<OfflineState
-								data-state="ngwa-store-offline"
+							<ErrorState
+								data-state="ngwa-store-snapshot-error"
 								fill
-								heading="Registry unreachable"
-								body="Everything installed still runs. Only browsing and installing new packages needs the network."
+								heading="Can't read installed packages"
+								body={error.message}
 								action={onRetry ? { label: 'Retry', onClick: onRetry } : undefined}
 							/>
 						)}
@@ -759,7 +761,8 @@ export function NgwaStoreSurface({
 
 						{!isLoading && !error && catalogStatus === 'error' && (
 							<div className="empty" data-catalog-unavailable role="status">
-								The signed catalog is unavailable{catalogError ? ` — ${catalogError}` : ''}. None of
+								<b>Registry unreachable.</b> The signed catalog is unavailable
+								{catalogError ? ` — ${catalogError}` : ''}. None of
 								its entries are listed: a catalog that fails to verify is never replaced by the
 								bundled copy.
 								{onRecheckCatalog && (

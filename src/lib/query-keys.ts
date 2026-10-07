@@ -88,4 +88,9 @@ export const queryKeys = {
 		runs: () => ['daily-address', 'runs'] as const,
 		todos: (projectId: string) => ['daily-address', 'todos', projectId] as const,
 	},
+	// WP-P9 in-app server updates (browser sessions only; admins / T0 operator).
+	serverUpdate: {
+		all: ['server-update'] as const,
+		status: () => ['server-update', 'status'] as const,
+	},
 } as const;

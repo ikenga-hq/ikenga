@@ -14,7 +14,7 @@
 // server is down, not just this file's mount.
 
 import { useCallback, useEffect, useState } from 'react';
-import { viewerPort } from '@/lib/tauri-cmd';
+import { isRemoteWebSession, viewerPort } from '@/lib/tauri-cmd';
 import { isHtmlArtifactPath } from '../lib/viewer-url';
 
 export interface ViewerServerHealth {
@@ -25,7 +25,9 @@ export interface ViewerServerHealth {
 }
 
 export function useViewerServerHealth(path: string): ViewerServerHealth {
-	const applies = isHtmlArtifactPath(path);
+	// No viewer server in a browser session: nothing to have "stopped" (the pane
+	// shows its own preview-unavailable state).
+	const applies = isHtmlArtifactPath(path) && !isRemoteWebSession();
 	const [stopped, setStopped] = useState(false);
 
 	const check = useCallback(async () => {

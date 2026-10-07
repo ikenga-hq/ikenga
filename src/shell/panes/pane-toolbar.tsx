@@ -30,6 +30,7 @@ import { IconButton } from '@/components/ui/icon-button';
 import { useEffectiveMenu } from '@/lib/actions/store';
 import { resolveMenuItems, type RenderableMenuItem } from '@/shell/menu/resolve';
 import { useWebviewRoute } from './pane-views';
+import { dropRemoteHiddenRows } from './remote-menu-rows';
 import {
 	NO_PKG_PANE_MENU,
 	PkgPaneMenuDataProvider,
@@ -48,15 +49,16 @@ import {
 	DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
-import { openExternalUrl, writeClipboardText } from '@/lib/transport';
+import { openExternalUrl } from '@/lib/transport';
 import { desktopOnlyReason } from '@/lib/desktop-only';
-import { pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
+import { isRemoteWebSession, pkgWebviewClearSession, screenshotPane } from '@/lib/tauri-cmd';
 import { type ReactNode, useState } from 'react';
 import { cn } from '@/components/ui/utils';
 import { handToChi } from '@/shell/companion/companion-store';
 import { usePinsStore } from '@/lib/shell/pins-store';
 import { isHtmlArtifactPath, resolveHtmlViewerUrl } from '@/viewer/lib/viewer-url';
 import { type DeviceWidth, useViewerPaneState } from '@/viewer/viewer-pane-state';
+import { copyText } from '@/lib/clipboard';
 
 // No shortcut on the viewer-zoom rows: the shipped `⌘+` / `⌘−` / `⌘0` labels
 // belonged to the window-level `zoom.*` keys, not to these items (G-ACTIONS
@@ -262,7 +264,7 @@ function PaneMenuBody({
 	);
 
 	const paneMenu = useEffectiveMenu('pane');
-	const rows = resolveMenuItems(paneMenu, {
+	const resolvedRows = resolveMenuItems(paneMenu, {
 		target: { resource: tabPath, paneKind: activeTab?.kind },
 		conditions: {
 			history: Boolean(history),
@@ -318,7 +320,7 @@ function PaneMenuBody({
 			'pane.split-right': () => splitPane(paneId, 'horizontal'),
 			'pane.split-down': () => splitPane(paneId, 'vertical'),
 			'copy-path': () => {
-				if (tabPath !== undefined) void writeClipboardText(tabPath).catch(() => {});
+				if (tabPath !== undefined) void copyText(tabPath);
 			},
 			'viewer.open-in-browser': () => {
 				if (artifactPath)
@@ -333,7 +335,7 @@ function PaneMenuBody({
 			'viewer.copy-url': () => {
 				if (artifactPath)
 					void resolveHtmlViewerUrl(artifactPath)
-						.then((url) => writeClipboardText(url))
+						.then((url) => copyText(url))
 						.catch(() => {});
 			},
 			'viewer.zoom-in': () => zoomBy(paneId, 10),
@@ -352,6 +354,8 @@ function PaneMenuBody({
 			'pane.close': () => void guardedClosePane(paneId),
 		},
 	});
+	// Browser sessions: drop the rows that need the desktop's viewer server.
+	const rows = dropRemoteHiddenRows(resolvedRows);
 
 	// Adjacent `viewer.device-*` rows render as one "Device width" radio group
 	// (§1.3 rendering rule); every other row is a plain item.
@@ -420,16 +424,32 @@ function PaneMenuBody({
 // `⟳ + ⋯` tools slot — it predates this WP and isn't in the list of items
 // that moved into `⋯`). Only ever renders for a webview-backed tab, so it
 // doesn't add to the resting control count on the common (non-webview) pane.
-function WebviewSessionControl({ view, paneId }: { view: PaneView | undefined; paneId: PaneId }) {
+export function WebviewSessionControl({
+	view,
+	paneId,
+}: {
+	view: PaneView | undefined;
+	paneId: PaneId;
+}) {
 	const webviewEntry = useWebviewRoute(view);
 	const [isOpen, setIsOpen] = useState(false);
 	const [persistence, setPersistence] = useState<'keep' | 'clear-on-exit' | 'ask'>('ask');
+	const [clearError, setClearError] = useState<string | null>(null);
 
-	if (!webviewEntry) return null;
+	// Native webviews are desktop-only forever (gap audit rank 20): no session
+	// to clear in a browser.
+	if (!webviewEntry || isRemoteWebSession()) return null;
 
+	// A failed clear keeps the popover open and says so; closing it first made a
+	// rejected call an unhandled rejection with no feedback.
 	const handleClearSession = async () => {
-		setIsOpen(false);
-		await pkgWebviewClearSession(webviewEntry.pkg_id, paneId);
+		setClearError(null);
+		try {
+			await pkgWebviewClearSession(webviewEntry.pkg_id, paneId);
+			setIsOpen(false);
+		} catch (e) {
+			setClearError(e instanceof Error ? e.message : String(e));
+		}
 	};
 
 	return (
@@ -534,6 +554,11 @@ function WebviewSessionControl({ view, paneId }: { view: PaneView | undefined; p
 					</svg>
 					Clear session now
 				</button>
+				{clearError && (
+					<p role="alert" className="mt-2 text-[11px] leading-tight text-destructive">
+						Couldn't clear the session: {clearError}
+					</p>
+				)}
 				<p className="mt-2 text-[11px] leading-tight text-muted-foreground">
 					Wipes <code>webjars/{webviewEntry.pkg_id}/default/</code> after the webview is destroyed.
 					Forces re-login.

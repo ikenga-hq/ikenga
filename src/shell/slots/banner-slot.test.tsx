@@ -44,11 +44,23 @@ vi.mock('@/shell/trust-review-banner', async () => ({
 vi.mock('@/shell/updater/updater-banner', async () => ({
 	UpdaterBanner: make(await import('react'), 'updater'),
 }));
+vi.mock('@/shell/updater/server-update-banner', async () => ({
+	ServerUpdateBanner: make(await import('react'), 'server-update'),
+}));
 vi.mock('@/shell/pkg-auto-updater', async () => ({
 	PkgAutoUpdater: make(await import('react'), 'pkg-auto-updater'),
 }));
 vi.mock('@/shell/connector-banner', async () => ({
 	ConnectorBanner: make(await import('react'), 'connector'),
+}));
+vi.mock('@/shell/pwa/pwa-update-banner', async () => ({
+	PwaUpdateBanner: make(await import('react'), 'pwa-update'),
+}));
+vi.mock('@/shell/pwa/install-hint', async () => ({
+	InstalledTokenBanner: make(await import('react'), 'pwa-token-session'),
+}));
+vi.mock('@/shell/pwa/push-open', async () => ({
+	PushOpenBanner: make(await import('react'), 'push-open'),
 }));
 
 import { BANNER_QUEUE, BannerSlot, LEGACY_BANNER_MOUNT_ORDER } from './banner-slot';
@@ -78,11 +90,16 @@ describe('<BannerSlot />', () => {
 			'violation:connection',
 			'violation:trust-review',
 			'update:updater',
+			'update:server-update',
 			'update:pkg-auto-updater',
+			'update:pwa-update',
 			'info:connector',
+			'info:pwa-token-session',
+			'info:push-open',
 		]);
 		// Every banner that mounted before still mounts — nothing dropped.
-		expect([...LEGACY_BANNER_MOUNT_ORDER].sort()).toEqual(BANNER_QUEUE.map((b) => b.id).sort());
+		const ids = BANNER_QUEUE.map((b) => b.id);
+		for (const legacy of LEGACY_BANNER_MOUNT_ORDER) expect(ids).toContain(legacy);
 	});
 
 	it('T4: renders only one banner when three are eligible — the violation', async () => {
@@ -117,6 +134,14 @@ describe('<BannerSlot />', () => {
 		expect(screen.queryByRole('button', { name: /more notice/ })).toBeNull();
 		await setEligible([]);
 		expect(visibleBanners()).toEqual([]);
+	});
+
+	it('WP-P9: the server update sits after the app updater, before pkg progress', async () => {
+		render(<BannerSlot />);
+		await setEligible(['pkg-auto-updater', 'server-update', 'connector']);
+		expect(visibleBanners()).toEqual(['server-update']);
+		await setEligible(['pkg-auto-updater', 'server-update', 'updater']);
+		expect(visibleBanners()).toEqual(['updater']);
 	});
 
 	it('snaps back to the top notice when a higher-priority banner appears', async () => {
