@@ -1,9 +1,10 @@
-import { render, screen, cleanup, waitFor, renderHook } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, renderHook, fireEvent } from '@testing-library/react';
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import type { NgwaSnapshot } from '@ikenga/contract';
 import * as tauriCmd from '@/lib/tauri-cmd';
+import { dismissToast, useToastStore } from '@/lib/toast';
 import { NgwaProjectSection, useNgwaProjectRowCount } from './ngwa-project';
 import { mkItem, mkSnapshot } from '@/routes/ngwa/-ngwa-test-fixtures';
 
@@ -264,5 +265,30 @@ describe('useNgwaProjectRowCount', () => {
 
 		const { result } = renderCount('proj-1');
 		await waitFor(() => expect(result.current).toBe(0));
+	});
+});
+
+describe('NgwaProjectSection — Disable / Uninstall failures are surfaced', () => {
+	it('toasts when Disable is refused instead of swallowing it', async () => {
+		while (useToastStore.getState().queue.length) dismissToast();
+		m.ngwaSnapshot.mockReturnValue(pendingForever());
+		m.pkgKernelStatus.mockResolvedValue(kernelStatus([{ id: 'com.ikenga.studio' }]));
+		m.pkgSetEnabled.mockRejectedValue(new Error('not permitted in a browser session'));
+
+		renderSection('proj-1');
+		const row = await screen.findByText('com.ikenga.studio');
+		fireEvent.contextMenu(row);
+		const disable = (await screen.findAllByRole('menuitem')).find((el) =>
+			/disable/i.test(el.textContent ?? '')
+		);
+		expect(disable).toBeDefined();
+		fireEvent.click(disable as HTMLElement);
+
+		await waitFor(() =>
+			expect(useToastStore.getState().queue.map((t) => t.label)).toEqual([
+				'Could not disable com.ikenga.studio: not permitted in a browser session',
+			])
+		);
+		expect(useToastStore.getState().queue[0]?.variant).toBe('error');
 	});
 });

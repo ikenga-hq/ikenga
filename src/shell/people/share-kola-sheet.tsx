@@ -34,6 +34,7 @@ import { accessInviteIssue, accessPolicyGet, parseAccessError } from '@/lib/acce
 import { NewChip } from './devices-pair-confirm';
 import { D05_FOCUS } from './focus';
 import type { MemberRole } from './members';
+import { copyText } from '@/lib/clipboard';
 
 export type InviteMode = 'email' | 'link';
 export type InviteScope = 'project' | 'artifact';
@@ -245,12 +246,7 @@ export function ShareKolaSheet({
 
 	const copy = async () => {
 		if (!issued) return;
-		try {
-			await navigator.clipboard.writeText(issued.url);
-			setCopied(true);
-		} catch {
-			setCopied(false);
-		}
+		setCopied(await copyText(issued.url));
 	};
 
 	const field =

@@ -30,6 +30,7 @@ import { fsExists } from '@/lib/tauri-cmd';
 import { isRemoteWebSession } from '@/lib/transport';
 import { looksLikePath, resolvePath } from '@/lib/paths/file-paths';
 import { cn } from '@/components/ui/utils';
+import { copyText } from '@/lib/clipboard';
 
 interface MarkdownProps {
 	content: string;
@@ -262,12 +263,9 @@ function CodeFence({ code, lang }: { code: string; lang: string }) {
 	}, [code, lang, isDark]);
 
 	async function handleCopy() {
-		try {
-			await navigator.clipboard.writeText(code);
+		if (await copyText(code)) {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1200);
-		} catch (e) {
-			console.warn('clipboard:', e);
 		}
 	}
 

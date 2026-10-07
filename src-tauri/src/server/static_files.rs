@@ -23,6 +23,18 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const REVALIDATE: &str = "no-cache";
 const SHORT: &str = "public, max-age=3600";
 
+/// The PWA entry files (plans/pwa W1/W2). Both decide what a returning or
+/// installed client runs next, so both always revalidate, and both are served
+/// with an explicit type rather than whatever `mime_guess` happens to know.
+const SW_SCRIPT: &str = "sw.js";
+const WEB_MANIFEST: &str = "manifest.webmanifest";
+const SW_MIME: &str = "text/javascript; charset=utf-8";
+const MANIFEST_MIME: &str = "application/manifest+json";
+
+/// Sent by a browser on the fetch of a script it is about to install as a
+/// service worker.
+const SERVICE_WORKER_HEADER: &str = "service-worker";
+
 /// `(path, mtime secs, byte length)`: a rebuilt `dist/` changes the key, so a
 /// stale compressed copy is never served.
 type CacheKey = (PathBuf, u64, u64);
@@ -64,6 +76,36 @@ impl SpaStaticService {
         }
 
         let wants_gzip = accepts_gzip(req_headers);
+
+        // Only `/sw.js` may be installed as a service worker. Any other
+        // same-origin script (a worker bundle, a stray `.mjs`) registered with
+        // scope `/` would control every page of the app, so a browser asking
+        // for one is refused before the file is read.
+        if is_service_worker_fetch(req_headers) && path != SW_SCRIPT {
+            return status_response(StatusCode::FORBIDDEN, "Forbidden");
+        }
+
+        // `/sw.js` and `/manifest.webmanifest` never fall back to the SPA: a
+        // build without the PWA plugin (the desktop dist) would otherwise
+        // hand `index.html` to `navigator.serviceWorker.register`, or to the
+        // browser as the app manifest. Missing means 404.
+        if path == SW_SCRIPT || path == WEB_MANIFEST {
+            if file_path.is_file() {
+                if let Ok(bytes) = fs::read(&file_path).await {
+                    let mime = if path == SW_SCRIPT {
+                        SW_MIME
+                    } else {
+                        MANIFEST_MIME
+                    };
+                    // No `Service-Worker-Allowed`: the worker's scope is
+                    // capped at `/`, the directory it is served from.
+                    return self
+                        .respond(&file_path, mime, REVALIDATE, bytes, wants_gzip)
+                        .await;
+                }
+            }
+            return status_response(StatusCode::NOT_FOUND, "Not Found");
+        }
 
         // If file exists and is a file, serve it directly
         if file_path.is_file() {
@@ -166,6 +208,24 @@ impl SpaStaticService {
         }
         Some(compressed)
     }
+}
+
+/// True when the browser is fetching this script to install it as a service
+/// worker (`Service-Worker: script`).
+pub fn is_service_worker_fetch(headers: &HeaderMap) -> bool {
+    headers
+        .get(SERVICE_WORKER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("script"))
+}
+
+fn status_response(status: StatusCode, text: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, REVALIDATE)
+        .body(Body::from(text))
+        .expect("static status response is well-formed")
 }
 
 /// True when the client lists `gzip` with a non-zero quality.
@@ -315,6 +375,144 @@ mod tests {
         let mut out = Vec::new();
         flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out).unwrap();
         assert_eq!(out, newer);
+    }
+
+    fn sw_fetch() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(SERVICE_WORKER_HEADER, "script".parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn the_service_worker_is_revalidated_typed_and_never_widens_its_scope() {
+        let sw = b"self.addEventListener('fetch',()=>{});".to_vec();
+        let (_d, svc) = service_with(&[
+            ("index.html", b"<html></html>".to_vec()),
+            ("sw.js", sw.clone()),
+        ]);
+        for headers in [HeaderMap::new(), sw_fetch()] {
+            let resp = svc.handle_with("/sw.js".parse().unwrap(), &headers).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], REVALIDATE);
+            assert_eq!(resp.headers()[header::CONTENT_TYPE], SW_MIME);
+            assert!(
+                resp.headers().get("service-worker-allowed").is_none(),
+                "the worker must stay scoped to the directory it is served from"
+            );
+            assert_eq!(body_bytes(resp).await, sw);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_manifest_is_revalidated_with_the_manifest_type() {
+        let manifest = br#"{"name":"Ikenga","start_url":"/"}"#.to_vec();
+        let (_d, svc) = service_with(&[("manifest.webmanifest", manifest.clone())]);
+        let resp = svc.handle("/manifest.webmanifest".parse().unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], REVALIDATE);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], MANIFEST_MIME);
+        assert_eq!(body_bytes(resp).await, manifest);
+    }
+
+    #[tokio::test]
+    async fn a_missing_worker_or_manifest_is_404_not_the_spa_fallback() {
+        // The desktop dist has no PWA files. Falling back to index.html here
+        // would register HTML as a service worker.
+        let (_d, svc) = service_with(&[("index.html", b"<html>spa</html>".to_vec())]);
+        for (uri, headers) in [
+            ("/sw.js", HeaderMap::new()),
+            ("/sw.js", sw_fetch()),
+            ("/manifest.webmanifest", HeaderMap::new()),
+        ] {
+            let resp = svc.handle_with(uri.parse().unwrap(), &headers).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(!String::from_utf8_lossy(&body_bytes(resp).await).contains("spa"));
+        }
+    }
+
+    #[tokio::test]
+    async fn no_other_script_can_be_installed_as_a_service_worker() {
+        let (_d, svc) = service_with(&[
+            ("index.html", b"<html></html>".to_vec()),
+            ("assets/app-abc12345.js", big_js()),
+            ("pdf.worker.min.mjs", b"x".to_vec()),
+        ]);
+        for uri in [
+            "/assets/app-abc12345.js",
+            "/pdf.worker.min.mjs",
+            "/nope.js",
+            "/",
+        ] {
+            let resp = svc.handle_with(uri.parse().unwrap(), &sw_fetch()).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            // The same files still load normally.
+            let plain = svc.handle(uri.parse().unwrap()).await;
+            assert_eq!(plain.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    /// Through the real T0 router: the worker and manifest are fetched by the
+    /// browser with no bearer token (a service-worker script fetch never
+    /// carries `Authorization`), so they must sit outside the auth layer.
+    #[tokio::test]
+    async fn the_t0_router_serves_the_pwa_entry_files_without_a_token() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (dir, _svc) = service_with(&[
+            ("index.html", b"<html></html>".to_vec()),
+            ("sw.js", b"/* sw */".to_vec()),
+            ("manifest.webmanifest", b"{}".to_vec()),
+        ]);
+        let config = crate::server::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            static_dir: dir.path().to_path_buf(),
+            pkgs_dir: None,
+            data_dir: None,
+            auth_token: Some("tok".into()),
+            allowed_origins: vec![],
+            idle_timeout_secs: None,
+            executor_tier: crate::executor::ExecutorTier::T0,
+        };
+        let router = crate::server::create_router(
+            config,
+            Arc::new(crate::pty::PtyManager::new()),
+            Arc::new(crate::engines::EngineRegistry::new()),
+            None,
+            None,
+        );
+        for (uri, mime) in [
+            ("/sw.js", SW_MIME),
+            ("/manifest.webmanifest", MANIFEST_MIME),
+        ] {
+            let req = Request::builder()
+                .uri(uri)
+                .header(SERVICE_WORKER_HEADER, "script")
+                .body(Body::empty())
+                .unwrap();
+            let req = if uri == "/sw.js" {
+                req
+            } else {
+                Request::builder().uri(uri).body(Body::empty()).unwrap()
+            };
+            let res = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            assert_eq!(res.headers()[header::CONTENT_TYPE], mime, "{uri}");
+            assert_eq!(res.headers()[header::CACHE_CONTROL], REVALIDATE, "{uri}");
+            assert!(
+                res.headers().get("service-worker-allowed").is_none(),
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn icons_keep_the_short_cache() {
+        let (_d, svc) = service_with(&[("icons/icon-192.png", vec![0x89u8; 64])]);
+        let resp = svc.handle("/icons/icon-192.png".parse().unwrap()).await;
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], SHORT);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
     }
 
     #[tokio::test]

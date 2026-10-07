@@ -12,17 +12,19 @@ import { initOsFileDrop } from '@/lib/dnd/os-file-drop';
 import { useIykeBridge } from '@/lib/iyke/bridge';
 import { useIykeControlListener } from '@/lib/iyke/control-listener';
 import { useIykeShellSync } from '@/lib/iyke/use-iyke-shell-sync';
-import { loadPaneTree, persistPaneTree } from '@/lib/panes/pane-persistence';
+import { loadPaneTree, persistPaneTree, type PaneTreeSnapshot } from '@/lib/panes/pane-persistence';
 import { usePaneStore } from '@/lib/panes/pane-store';
 import { useRouterPaneSync } from '@/lib/panes/router-pane-sync';
+import { applyBootDeepLink, urlPathForView } from '@/lib/panes/url-sync';
 import { loadPanelSizes, registerPanelSizesSetter } from '@/lib/shell/panel-sizes';
 import { useProjectsSync } from '@/lib/shell/use-projects-sync';
 import { usePaActionsListener } from '@/lib/use-pa-actions';
 import { usePreloadViewers } from '@/lib/use-preload-viewers';
 import { useScreenshotListener } from '@/lib/use-screenshot-listener';
+import { installUnloadGuard } from '@/lib/window/unload-guard';
 import { loadClaudeSettingsPath } from '@/terminal/claude-settings';
 import { useTerminalStore } from '@/terminal/session-store';
-import { isTauri } from '@/lib/transport';
+import { isRemoteWebSession, isTauri } from '@/lib/transport';
 
 /**
  * `useIykeShellSync` on the desktop, a no-op anywhere else (gap audit rank
@@ -41,6 +43,22 @@ export function pickIykeShellSync(desktop: boolean = isTauri()): () => void {
 function noop(): void {}
 
 const useDesktopIykeShellSync = pickIykeShellSync();
+
+/**
+ * Hydrate the pane store from the restored layout. In a remote web session
+ * the first pane opened the page URL's route before the saved layout
+ * arrived; keep that deep link over the restored layout (url-sync.ts). The
+ * link is read from the store at hydrate time, so a navigation made while
+ * the layout loaded survives too. Desktop hydrates the snapshot as saved.
+ */
+export function hydrateRestoredLayout(
+	snapshot: PaneTreeSnapshot,
+	web: boolean = isRemoteWebSession()
+): void {
+	const store = usePaneStore.getState();
+	const deepLink = web ? urlPathForView(store.focusedView()) : null;
+	store.hydrate(applyBootDeepLink(snapshot, deepLink));
+}
 
 export function useWorkspaceEffects(
 	setInitialSizes: Dispatch<SetStateAction<[number, number] | null>>
@@ -133,6 +151,11 @@ export function useWorkspaceEffects(
 		};
 	}, []);
 
+	// Browser tab only: a terminal's Ctrl+W / T / N / Q belong to the browser
+	// and close the Ikenga tab, which a page cannot stop — so ask before the
+	// tab goes while terminals are open. No-op on the desktop.
+	useEffect(() => installUnloadGuard(), []);
+
 	// Rehydrate terminal sessions, then the pane tree, then start
 	// persisting pane-tree changes. Order matters: pane-persistence
 	// checks useTerminalStore for live session ids when filtering
@@ -183,7 +206,7 @@ export function useWorkspaceEffects(
 			if (cancelled) return;
 			const snapshot = await raceTimeout(loadPaneTree(), 2000, 'loadPaneTree');
 			if (cancelled) return;
-			if (snapshot) usePaneStore.getState().hydrate(snapshot);
+			if (snapshot) hydrateRestoredLayout(snapshot);
 			unsubPersist = usePaneStore.subscribe((state) => {
 				persistPaneTree({
 					root: state.root,

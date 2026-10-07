@@ -310,7 +310,7 @@ pub(crate) fn daemon_actions(
     ActionsManager::with_notifier(None, db, data_dir, home).with_root_guard(root_guard)
 }
 
-fn actions(state: &AppState) -> Result<&ActionsManager, String> {
+pub(super) fn actions(state: &AppState) -> Result<&ActionsManager, String> {
     match &state.actions {
         Some(m) => Ok(m),
         None if state.config.data_dir.is_none() || state.pa_db.is_none() => {

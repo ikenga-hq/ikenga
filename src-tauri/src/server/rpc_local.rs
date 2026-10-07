@@ -312,12 +312,9 @@ pub(super) fn backup_delete(state: &AppState, args: &Value) -> RpcResponse {
 /// An unknown pkg is the desktop's answer: `schema: null` + whatever rows the
 /// table holds for that id — not an error.
 ///
-/// `pkg_settings_set` is NOT served (see `desktop_only.toml`):
-/// `pkg_settings.pkg_id` REFERENCES `pkg_installed(id)` and sqlx enforces
-/// foreign keys, so an upsert needs an installed row — which the daemon, which
-/// installs nothing, never has. On a daemon `ikenga.db` the stored rows here
-/// are therefore whatever the file already holds; normally none, so `values`
-/// is the manifest defaults.
+/// The stored rows are those `pkg_settings_set` (`server::rpc_exec`) wrote
+/// to this daemon's `ikenga.db` — under T1, the principal's own — over the
+/// manifest defaults.
 pub(super) async fn pkg_settings_get(state: &AppState, args: &Value) -> RpcResponse {
     let r = async {
         let pkg_id = req_str(args, &["pkgId", "pkg_id"])?;
@@ -507,9 +504,10 @@ pub(super) async fn chi_list(state: &AppState, args: &Value) -> RpcResponse {
 // manages the same `~/.atelier/skill-agent-ops/jobs.json`; under T1 this must
 // be the calling principal's home. Each core resolves `{ ok, ... }` exactly
 // as the desktop command does (a missing home is its `io_error`), so these
-// are RPC successes carrying that value. `agent_ops_run_now` is not served
-// (see `desktop_only.toml`); the approve gate's hardcoded mutation-worker wake
-// below is the only daemon caller of `agent_ops::run_now`.
+// are RPC successes carrying that value. `agent_ops_run_now` lives in
+// `server::rpc_exec`, confined to the principal's own jobs and agent-ops
+// daemon; the approve gate's hardcoded mutation-worker wake below is the other
+// daemon caller of `agent_ops::run_now`.
 //
 // A fresh host has no `jobs.json` (gap audit 2026-10-06 rank 12), so list and
 // upsert pass `MissingConfig::Empty`: an empty list, and the first upsert

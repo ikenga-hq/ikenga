@@ -272,3 +272,58 @@ export const accessAuditRecordLocal = (kind: AuditLocalKind, target: string, det
 	});
 export const accessAuditReseal = (ackSeq: number) =>
 	invoke<Record<string, never>>('access_audit_reseal', { ackSeq });
+
+// ── push (plans/pwa S2 §7) ───────────────────────────────────────────────────
+//
+// Browser-only: the desktop never registers a service worker, so these arms
+// are daemon-only (`server/parity.rs`). Called from `src/lib/pwa/push-client.ts`,
+// never from components directly.
+
+/** Every kind a push can carry (W3). `test` is never selectable. */
+export type PushKind =
+	| 'permission'
+	| 'run_finished'
+	| 'run_failed'
+	| 'run_cancelled'
+	| 'invite'
+	| 'pairing'
+	| 'update';
+
+export type PushConfig =
+	| {
+			enabled: true;
+			/** `applicationServerKey`, base64url. */
+			publicKey: string;
+			keyId: string;
+			/** The kinds this credential may receive. */
+			kinds: PushKind[];
+	  }
+	| { enabled: false; reason?: string };
+
+export interface PushSubscriptionView {
+	subId: string;
+	label: string | null;
+	via: 'device' | 'session' | 'operator';
+	deviceId: string | null;
+	/** The push service's host only — never the endpoint path. */
+	endpointHost: string;
+	kinds: PushKind[];
+	createdAt: number;
+	lastSuccessAt: number | null;
+	thisDevice: boolean;
+}
+
+export const accessPushConfig = () => invoke<PushConfig>('access_push_config', {});
+export const accessPushSubscribe = (args: {
+	endpoint: string;
+	keys: { p256dh: string; auth: string };
+	kinds?: PushKind[];
+	label?: string;
+}) => invoke<{ subId: string }>('access_push_subscribe', args);
+export const accessPushUpdate = (subId: string, kinds: PushKind[]) =>
+	invoke<{ kinds: PushKind[] }>('access_push_update', { subId, kinds });
+export const accessPushUnsubscribe = (target: { subId: string } | { endpoint: string }) =>
+	invoke<{ removed: number }>('access_push_unsubscribe', target);
+export const accessPushList = () => invoke<PushSubscriptionView[]>('access_push_list', {});
+export const accessPushTest = (subId: string) =>
+	invoke<{ queued: true }>('access_push_test', { subId });

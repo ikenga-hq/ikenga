@@ -736,6 +736,11 @@ async fn cache_finish(
         return Ok(false);
     }
     notify_run_terminal(db, run_id, status, error, artifacts).await;
+    // plans/pwa S3 §3: `cancelled` has no notification row; it is pushed
+    // directly (deduped per run with `cancel_run`'s own call).
+    if status == "cancelled" {
+        crate::server::push::emit_run_cancelled(run_id);
+    }
     Ok(true)
 }
 
@@ -1132,16 +1137,52 @@ pub(crate) async fn spawn_engine_or_fail(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Log an engine's stderr at debug (it can carry prompts and paths, so never
-/// louder).
-fn log_stderr(engine: &'static str, stderr: Option<tokio::process::ChildStderr>) {
-    if let Some(stderr) = stderr {
+/// louder), keeping the last few lines in memory so a failed run can name its
+/// cause — see [`explain_failure`].
+fn log_stderr(engine: &'static str, stderr: Option<tokio::process::ChildStderr>) -> StderrTail {
+    const KEEP: usize = 40;
+    StderrTail(stderr.map(|stderr| {
         tokio::spawn(async move {
+            let mut tail = std::collections::VecDeque::with_capacity(KEEP);
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(target: "ikenga::chi", "{engine} stderr: {line}");
+                if tail.len() == KEEP {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
             }
-        });
+            Vec::from(tail)
+        })
+    }))
+}
+
+/// The tail of an engine's stderr, collected by [`log_stderr`].
+struct StderrTail(Option<tokio::task::JoinHandle<Vec<String>>>);
+
+impl StderrTail {
+    /// The infrastructure cause named in the tail, if any. Waits briefly for
+    /// stderr to reach EOF — the child has usually exited by now.
+    async fn cause(self) -> Option<String> {
+        let lines = tokio::time::timeout(std::time::Duration::from_millis(500), self.0?)
+            .await
+            .ok()?
+            .ok()?;
+        super::failure_class::classify(&lines.join("
+")).map(|c| c.describe())
     }
+}
+
+/// `error` with the cause from the engine's stderr appended, when there is
+/// one: "engine child exited without a done envelope" alone hides a WSL with
+/// no network or a missing distro. Only the classified cause is surfaced,
+/// never the raw stderr.
+async fn explain_failure(error: Option<&str>, tail: StderrTail) -> Option<String> {
+    let base = error?;
+    Some(match tail.cause().await {
+        Some(cause) => format!("{base} — {cause}"),
+        None => base.to_string(),
+    })
 }
 
 /// Register the run's cancel handle and start its reader task. The task
@@ -1298,7 +1339,7 @@ async fn claude_one_off_task(
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
 ) {
-    log_stderr("claude", stderr);
+    let stderr_tail = log_stderr("claude", stderr);
 
     let mut parser = StreamParser::new();
     let mut reader = BufReader::new(stdout);
@@ -1388,10 +1429,11 @@ async fn claude_one_off_task(
     let output_truncated = is_truncated(&output);
 
     // Write final output file.
-    let file_error = if let Err(e) = write_output_file(&output_path, &output, error).await {
+    let error = explain_failure(error, stderr_tail).await;
+    let file_error = if let Err(e) = write_output_file(&output_path, &output, error.as_deref()).await {
         Some(format!("write output file: {e}"))
     } else {
-        error.map(|s| s.to_string())
+        error
     };
 
     let artifacts_value = if artifacts.is_empty() {
@@ -1425,7 +1467,7 @@ async fn antigravity_one_off_task(
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
 ) {
-    log_stderr("antigravity", stderr);
+    let stderr_tail = log_stderr("antigravity", stderr);
 
     let mut reader = BufReader::new(stdout).lines();
     let mut output = String::new();
@@ -1497,10 +1539,11 @@ async fn antigravity_one_off_task(
     };
 
     let output_truncated = is_truncated(&output);
-    let file_error = if let Err(e) = write_output_file(&output_path, &output, error).await {
+    let error = explain_failure(error, stderr_tail).await;
+    let file_error = if let Err(e) = write_output_file(&output_path, &output, error.as_deref()).await {
         Some(format!("write output file: {e}"))
     } else {
-        error.map(|s| s.to_string())
+        error
     };
 
     cache_update_done(
@@ -1533,7 +1576,7 @@ async fn codex_one_off_task(
     stdout: tokio::process::ChildStdout,
     stderr: Option<tokio::process::ChildStderr>,
 ) {
-    log_stderr("codex", stderr);
+    let stderr_tail = log_stderr("codex", stderr);
 
     let mut reader = BufReader::new(stdout).lines();
     let mut output = String::new();
@@ -1602,10 +1645,11 @@ async fn codex_one_off_task(
     };
 
     let output_truncated = is_truncated(&output);
-    let file_error = if let Err(e) = write_output_file(&output_path, &output, error).await {
+    let error = explain_failure(error, stderr_tail).await;
+    let file_error = if let Err(e) = write_output_file(&output_path, &output, error.as_deref()).await {
         Some(format!("write output file: {e}"))
     } else {
-        error.map(|s| s.to_string())
+        error
     };
 
     cache_update_done(
@@ -1720,7 +1764,7 @@ async fn json_lines_task(
     engine: &'static str,
     parse: fn(&serde_json::Value) -> LineEvent,
 ) {
-    log_stderr(engine, stderr);
+    let stderr_tail = log_stderr(engine, stderr);
 
     let mut reader = BufReader::new(stdout).lines();
     let mut output = String::new();
@@ -1770,6 +1814,7 @@ async fn json_lines_task(
     };
 
     let output_truncated = is_truncated(&output);
+    let error = explain_failure(error.as_deref(), stderr_tail).await;
     let file_error = match write_output_file(&output_path, &output, error.as_deref()).await {
         Err(e) => Some(format!("write output file: {e}")),
         Ok(()) => error,
@@ -2073,6 +2118,7 @@ pub(crate) async fn cancel_run(
     }
 
     cache_update_status(db, run_id, "cancelled", None).await?;
+    crate::server::push::emit_run_cancelled(run_id);
 
     Ok(ChiRunResult {
         run_id: row.run_id,
