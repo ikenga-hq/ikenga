@@ -26,9 +26,7 @@ vi.mock('@/lib/transport', async (orig) => ({
 	...(await orig<typeof import('@/lib/transport')>()),
 	listen: vi.fn(() => Promise.resolve(() => {})),
 }));
-vi.mock('@/lib/iyke/client', () => ({
-	iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })),
-}));
+vi.mock('@/lib/iyke/client', () => ({ iykeFetch: vi.fn(async () => ({ ok: false, json: async () => ({}) })) }));
 vi.mock('@/lib/tauri-cmd', async (orig) => ({
 	...(await orig<typeof import('@/lib/tauri-cmd')>()),
 	seatsList: m.seatsList,
@@ -54,10 +52,7 @@ import { usePaneStore } from '@/lib/panes/pane-store';
 import { queryClient } from '@/lib/query-client';
 import { useShellStore } from '@/lib/shell/shell-store';
 import { useDetachedSurfaces } from '@/lib/window/detached-surfaces';
-import {
-	__resetCompanionTimersForTests,
-	useCompanionStore,
-} from '@/shell/companion/companion-store';
+import { __resetCompanionTimersForTests, useCompanionStore } from '@/shell/companion/companion-store';
 import { __resetSeatUndoForTests, openSeatBoard, useSeatUi } from '@/shell/companion/seat-actions';
 import { UNREPORTED } from '@/shell/companion/seat-model';
 import { useSeatNotice } from '@/shell/companion/seat-notice';
@@ -209,12 +204,7 @@ beforeEach(() => {
 		quietSince: null,
 	});
 	useTerminalStore.setState({
-		tabs: [
-			tab('term-1', 'codex', 1),
-			tab('term-2', 'claude', 2),
-			tab('term-3', 'claude', 3),
-			tab('term-4', 'claude', 4),
-		],
+		tabs: [tab('term-1', 'codex', 1), tab('term-2', 'claude', 2), tab('term-3', 'claude', 3), tab('term-4', 'claude', 4)],
 	} as never);
 	usePaneStore.setState({
 		root: {
@@ -222,12 +212,7 @@ beforeEach(() => {
 			direction: 'horizontal',
 			sizes: [50, 50],
 			children: [
-				{
-					type: 'leaf',
-					id: 'L1',
-					tabs: [{ kind: 'terminal', sessionId: 'term-3' }],
-					activeTabIdx: 0,
-				},
+				{ type: 'leaf', id: 'L1', tabs: [{ kind: 'terminal', sessionId: 'term-3' }], activeTabIdx: 0 },
 				{ type: 'leaf', id: 'L2', tabs: [{ kind: 'route', path: '/chi' }], activeTabIdx: 0 },
 			],
 		},
@@ -247,16 +232,8 @@ describe('roster (D-09 default state)', () => {
 		await mountBoard();
 		expect(board().dataset.state).toBe('board-roster');
 		const grid = screen.getByRole('grid', { name: `Seats in ${PROJECT}` });
-		const rows = Array.from(grid.querySelectorAll<HTMLElement>('[data-row-key]')).map(
-			(r) => r.dataset.rowKey
-		);
-		expect(rows).toEqual([
-			'seat:seat-lead',
-			'seat:seat-review',
-			'seat:seat-nightly',
-			'seat:seat-docs',
-			'session:term-4',
-		]);
+		const rows = Array.from(grid.querySelectorAll<HTMLElement>('[data-row-key]')).map((r) => r.dataset.rowKey);
+		expect(rows).toEqual(['seat:seat-lead', 'seat:seat-review', 'seat:seat-nightly', 'seat:seat-docs', 'session:term-4']);
 		expect(within(grid).getByText('Unseated sessions')).toBeTruthy();
 		expect(screen.getByText(`${PROJECT} · 4 seats · 1 vacant · 1 unseated session`)).toBeTruthy();
 		// The rail selected @lead; the board opens on it, detail column included.
@@ -284,9 +261,7 @@ describe('roster (D-09 default state)', () => {
 
 	it('figures an engine didn’t report read "—" with the not-reported tooltip; reported ones show', async () => {
 		useSessionFiguresStore.setState({
-			snaps: {
-				'term-3': { cost: { total_cost_usd: 1.42 }, context_window: { total_input_tokens: 38120 } },
-			},
+			snaps: { 'term-3': { cost: { total_cost_usd: 1.42 }, context_window: { total_input_tokens: 38120 } } },
 		});
 		await mountBoard();
 		const lead = row('seat:seat-lead');
@@ -309,35 +284,19 @@ describe('roster (D-09 default state)', () => {
 			.getState()
 			.receivePermission({ id: 'p1', kind: 'permission', toolName: 'Read', sessionId: 'term-3' });
 		await mountBoard();
-		expect(row('seat:seat-lead').querySelector('.c-pend .pp')?.getAttribute('title')).toBe(
-			'1 permission pending'
-		);
+		expect(row('seat:seat-lead').querySelector('.c-pend .pp')?.getAttribute('title')).toBe('1 permission pending');
 		fireEvent.click(document.querySelector('[data-board-review]') as HTMLElement);
 		expect(useCompanionStore.getState().state).toBe('expanded');
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-lead',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
 	});
 
 	it('a hold reads "held by X since T" (§5.2)', async () => {
 		const seats = roster();
-		seats[1] = {
-			...seats[1],
-			hold: {
-				client: 'orchestrator',
-				since: Date.now() - 60_000,
-				expires_at: Date.now() + 600_000,
-			},
-		};
+		seats[1] = { ...seats[1], hold: { client: 'orchestrator', since: Date.now() - 60_000, expires_at: Date.now() + 600_000 } };
 		await mountBoard(seats);
-		expect(
-			row('seat:seat-review').querySelector('.c-pend [aria-label^="held by orchestrator since"]')
-		).not.toBeNull();
+		expect(row('seat:seat-review').querySelector('.c-pend [aria-label^="held by orchestrator since"]')).not.toBeNull();
 		fireEvent.click(row('seat:seat-review'));
-		expect(document.querySelector('[data-board-detail]')?.textContent).toContain(
-			'held by orchestrator since'
-		);
+		expect(document.querySelector('[data-board-detail]')?.textContent).toContain('held by orchestrator since');
 	});
 });
 
@@ -347,20 +306,11 @@ describe('selection is board-local; the target moves only on purpose', () => {
 		fireEvent.click(row('seat:seat-review'));
 		expect(row('seat:seat-review').getAttribute('aria-selected')).toBe('true');
 		expect(useBoardUi.getState().selection).toEqual({ kind: 'seat', id: 'seat-review' });
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-lead',
-		});
-		expect(useCompanionStore.getState().railSelection).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-lead',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
+		expect(useCompanionStore.getState().railSelection).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
 
 		fireEvent.click(document.querySelector('[data-board-make-target]') as HTMLElement);
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-review',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-review' });
 		expect(useCompanionStore.getState().panelScopeSessionId).toBe('term-1');
 		// It is the target now: the button goes, the chip shows.
 		await waitFor(() => expect(document.querySelector('[data-board-make-target]')).toBeNull());
@@ -381,15 +331,10 @@ describe('selection is board-local; the target moves only on purpose', () => {
 		fireEvent.keyDown(row('session:term-4'), { key: 'Enter' });
 		const { root, focusedId } = usePaneStore.getState();
 		expect(focusedId).toBe('L1');
-		expect(
-			findLeaf(root, 'L1')?.tabs.some((t) => t.kind === 'terminal' && t.sessionId === 'term-4')
-		).toBe(true);
+		expect(findLeaf(root, 'L1')?.tabs.some((t) => t.kind === 'terminal' && t.sessionId === 'term-4')).toBe(true);
 		expect(findLeaf(root, 'L2')?.tabs).toEqual([{ kind: 'route', path: '/chi' }]);
 		// Still no retarget.
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-lead',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
 	});
 });
 
@@ -415,16 +360,11 @@ describe('the rail’s menu and actions, from the board', () => {
 		]);
 		// Right-click selected the row on the board, not the target.
 		expect(useBoardUi.getState().selection).toEqual({ kind: 'seat', id: 'seat-review' });
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-lead',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-lead' });
 		fireEvent.keyDown(menu, { key: 'Escape' });
 		expect(screen.queryByRole('menu')).toBeNull();
 
-		fireEvent.click(
-			within(row('seat:seat-lead')).getByRole('button', { name: 'Seat actions for @lead' })
-		);
+		fireEvent.click(within(row('seat:seat-lead')).getByRole('button', { name: 'Seat actions for @lead' }));
 		expect(screen.getByRole('menu', { name: 'Seat actions for @lead' })).toBeTruthy();
 	});
 
@@ -435,9 +375,7 @@ describe('the rail’s menu and actions, from the board', () => {
 		const { root, focusedId } = usePaneStore.getState();
 		expect(focusedId).toBe('L1');
 		expect(
-			findLeaf(root, 'L1')?.tabs.some(
-				(t) => t.kind === 'scratchpad' && t.scope === 'seat:royalti-co/lead'
-			)
+			findLeaf(root, 'L1')?.tabs.some((t) => t.kind === 'scratchpad' && t.scope === 'seat:royalti-co/lead')
 		).toBe(true);
 		expect(findLeaf(root, 'L2')?.tabs).toEqual([{ kind: 'route', path: '/chi' }]);
 	});
@@ -473,10 +411,7 @@ describe('the rail’s menu and actions, from the board', () => {
 		await mountBoard();
 		fireEvent.contextMenu(row('seat:seat-review'));
 		fireEvent.click(screen.getByRole('menuitem', { name: /Make dispatch target/ }));
-		expect(useShellStore.getState().companion.activeTarget).toEqual({
-			kind: 'seat',
-			seat_id: 'seat-review',
-		});
+		expect(useShellStore.getState().companion.activeTarget).toEqual({ kind: 'seat', seat_id: 'seat-review' });
 		expect(usePaneStore.getState().focusedId).toBe('L2');
 	});
 
@@ -498,21 +433,15 @@ describe('the rail’s menu and actions, from the board', () => {
 		expect(useCompanionStore.getState().state).toBe('expanded');
 		await waitFor(() => expect(board().dataset.state).toBe('board-create'));
 		act(() => useSeatUi.setState({ form: null }));
-		fireEvent.click(
-			within(row('session:term-4')).getByRole('button', { name: /Seat this session…/ })
-		);
+		fireEvent.click(within(row('session:term-4')).getByRole('button', { name: /Seat this session…/ }));
 		expect(useSeatUi.getState().form).toEqual({ seatSession: 'term-4' });
 	});
 
 	it('the iyke line names the selected row, and Copy copies it', async () => {
 		await mountBoard();
-		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe(
-			'terminal-send --seat lead "…"'
-		);
+		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe('terminal-send --seat lead "…"');
 		fireEvent.click(row('seat:seat-docs'));
-		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe(
-			'seat resume docs --prompt "…"'
-		);
+		expect(document.querySelector('[data-iyke-line]')?.textContent).toBe('seat resume docs --prompt "…"');
 		// jsdom has no clipboard; give it a working one. Without it the copy now
 		// (correctly) fails and shows an error, not a false "Copied".
 		const writeText = vi.fn().mockResolvedValue(undefined);
@@ -520,9 +449,7 @@ describe('the rail’s menu and actions, from the board', () => {
 		fireEvent.click(document.querySelector('[data-board-iyke-copy]') as HTMLElement);
 		// The notice waits for the clipboard write to succeed (no false "Copied").
 		await waitFor(() =>
-			expect(useSeatNotice.getState().notice?.message).toBe(
-				'Copied iyke seat resume docs --prompt "…"'
-			)
+			expect(useSeatNotice.getState().notice?.message).toBe('Copied iyke seat resume docs --prompt "…"')
 		);
 		expect(writeText).toHaveBeenCalledWith('iyke seat resume docs --prompt "…"');
 		Reflect.deleteProperty(navigator, 'clipboard');
@@ -536,9 +463,7 @@ describe('vacant, empty, popout', () => {
 		expect(board().dataset.state).toBe('board-vacant');
 		const detail = document.querySelector('[data-board-detail="seat:seat-docs"]') as HTMLElement;
 		expect(detail.querySelector('[data-state="seats-vacant"]')).not.toBeNull();
-		expect(
-			within(detail).getByRole('button', { name: `Resume session ${sessionNumber('term-2')}` })
-		).toBeTruthy();
+		expect(within(detail).getByRole('button', { name: `Resume session ${sessionNumber('term-2')}` })).toBeTruthy();
 		expect(within(detail).getByRole('button', { name: 'Fill with a new session' })).toBeTruthy();
 		expect(within(detail).getByRole('button', { name: 'Clear seat' })).toBeTruthy();
 		expect(detail.querySelector('[data-promise]')?.textContent).toContain('@docs');
@@ -549,16 +474,12 @@ describe('vacant, empty, popout', () => {
 		useShellStore.setState({ companion: { activeTarget: { kind: 'new', engine_id: null } } });
 		await mountBoard([]);
 		expect(board().dataset.state).toBe('board-empty');
-		expect(
-			screen.getByText('A seat keeps an agent’s name when its pane moves or its session ends.')
-		).toBeTruthy();
+		expect(screen.getByText('A seat keeps an agent’s name when its pane moves or its session ends.')).toBeTruthy();
 		expect(document.querySelector('[data-board-empty-new]')).not.toBeNull();
-		expect((document.querySelector('[data-board-empty-seat]') as HTMLButtonElement).disabled).toBe(
-			false
+		expect((document.querySelector('[data-board-empty-seat]') as HTMLButtonElement).disabled).toBe(false);
+		const unseated = Array.from(document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]')).map(
+			(r) => r.dataset.session
 		);
-		const unseated = Array.from(
-			document.querySelectorAll<HTMLElement>('[data-row-key^="session:"]')
-		).map((r) => r.dataset.session);
 		expect(unseated.length).toBeGreaterThan(0);
 		// No "New seat" in the head until a seat exists (D-09).
 		expect(document.querySelector('[data-board-new-seat]')).toBeNull();
@@ -567,9 +488,7 @@ describe('vacant, empty, popout', () => {
 	it('Pop out: the Window 2 chip carries the "moved" highlight (G-93, G-96), then settles', async () => {
 		await mountBoard();
 		vi.useFakeTimers();
-		act(() =>
-			useDetachedSurfaces.setState({ surfaceToWindow: { 'terminal:pty-term-3': 'detached-1' } })
-		);
+		act(() => useDetachedSurfaces.setState({ surfaceToWindow: { 'terminal:pty-term-3': 'detached-1' } }));
 		const chip = row('seat:seat-lead').querySelector('.w2chip') as HTMLElement;
 		expect(chip).not.toBeNull();
 		expect(chip.textContent).toContain('Window 2');
@@ -578,9 +497,7 @@ describe('vacant, empty, popout', () => {
 		act(() => {
 			vi.advanceTimersByTime(MOVED_MS + 10);
 		});
-		expect(
-			(row('seat:seat-lead').querySelector('.w2chip') as HTMLElement).dataset.moved
-		).toBeUndefined();
+		expect((row('seat:seat-lead').querySelector('.w2chip') as HTMLElement).dataset.moved).toBeUndefined();
 		expect(board().dataset.state).toBe('board-roster');
 	});
 
@@ -596,12 +513,7 @@ describe('vacant, empty, popout', () => {
 describe('entry points', () => {
 	it('openBoard() opens /chi in the focused pane once — a second open reuses the tab', () => {
 		usePaneStore.setState({
-			root: {
-				type: 'leaf',
-				id: 'L1',
-				tabs: [{ kind: 'terminal', sessionId: 'term-3' }],
-				activeTabIdx: 0,
-			},
+			root: { type: 'leaf', id: 'L1', tabs: [{ kind: 'terminal', sessionId: 'term-3' }], activeTabIdx: 0 },
 			focusedId: 'L1',
 		});
 		const before = useBoardUi.getState().focusRequest;
@@ -644,12 +556,7 @@ describe('entry points', () => {
 	it('the Explorer Sessions header’s "Seats" link opens the board, and reads as current while it shows', () => {
 		useTerminalStore.setState({ tabs: [] } as never);
 		usePaneStore.setState({
-			root: {
-				type: 'leaf',
-				id: 'L1',
-				tabs: [{ kind: 'route', path: '/project/dashboard' }],
-				activeTabIdx: 0,
-			},
+			root: { type: 'leaf', id: 'L1', tabs: [{ kind: 'route', path: '/project/dashboard' }], activeTabIdx: 0 },
 			focusedId: 'L1',
 		});
 		// WP-71a: the link lives in the Sessions header row (the registry's
