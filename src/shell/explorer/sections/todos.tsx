@@ -7,19 +7,17 @@ import { completeTodo, listTodos, updateTodo, type Todo } from '@/lib/iyke/memor
 import { EffectiveContextMenu } from '@/shell/menu/effective-context-menu';
 import { handToChi } from '@/shell/companion/companion-store';
 import type { ExplorerSectionContext } from '../section-registry';
+import { errorMessageOf, SectionErrorRow } from '../section-error-row';
 
 export function TodosSection({ projectId }: ExplorerSectionContext) {
 	const qc = useQueryClient();
 	const queryKey = ['explorer-todos', projectId];
 	const query = useQuery<Todo[]>({
 		queryKey,
+		// A failed read is an error, not "no open todos".
 		queryFn: async () => {
-			try {
-				const res = await listTodos({ scope: `project:${projectId}` });
-				return res?.todos?.filter((t) => t.status !== 'done') ?? [];
-			} catch {
-				return [];
-			}
+			const res = await listTodos({ scope: `project:${projectId}` });
+			return res?.todos?.filter((t) => t.status !== 'done') ?? [];
 		},
 		staleTime: 15_000,
 	});
@@ -42,6 +40,16 @@ export function TodosSection({ projectId }: ExplorerSectionContext) {
 		const { focusedId, addTab } = usePaneStore.getState();
 		addTab(focusedId, { kind: 'route', path: '/todos' });
 	}, []);
+
+	if (query.isError) {
+		return (
+			<SectionErrorRow
+				message="Couldn't load todos"
+				detail={errorMessageOf(query.error)}
+				onRetry={() => void query.refetch()}
+			/>
+		);
+	}
 
 	if (todos.length === 0) {
 		return (

@@ -66,6 +66,12 @@ interface TerminalState {
 	tabs: TerminalTab[];
 	activeId: string | null;
 	rehydrated: boolean;
+	/** Set when the last rehydrate couldn't read the saved tab list or the
+	 *  resume setting. `holdsSave` means the saved list was unreadable, so
+	 *  saving is paused (the next save would overwrite it with whatever is
+	 *  open now) until the user dismisses the notice. */
+	restoreError: { message: string; holdsSave: boolean } | null;
+	dismissRestoreError: () => void;
 
 	add: (spec: TerminalTab['spec'], title?: string, id?: string) => string;
 	setActive: (id: string) => void;
@@ -220,29 +226,46 @@ async function loadDb(): Promise<SqlDb | null> {
 	}
 }
 
-async function readPersisted(): Promise<SerializedTab[]> {
+function errText(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/** The saved tab list, or `error` when it exists but couldn't be read. A
+ *  failed read is never reported as "no saved tabs". */
+async function readPersisted(): Promise<{ tabs: SerializedTab[]; error: string | null }> {
 	const db = await loadDb();
 	if (db) {
+		let rows: { value: string }[];
 		try {
-			const rows = await db.select<{ value: string }[]>(
+			rows = await db.select<{ value: string }[]>(
 				'SELECT value FROM layout_state WHERE key = $1',
 				[STORAGE_KEY]
 			);
-			if (rows && rows.length > 0) {
-				return JSON.parse(rows[0].value) as SerializedTab[];
-			}
-			return [];
 		} catch (err) {
-			console.warn('[terminal/session-store] read failed, falling back', err);
+			console.warn('[terminal/session-store] read failed', err);
+			return { tabs: [], error: `couldn't read the saved terminal list (${errText(err)})` };
 		}
+		if (!rows || rows.length === 0) return { tabs: [], error: null };
+		return parseSerialized(rows[0].value);
 	}
-	// localStorage fallback.
+	// localStorage fallback (no SQL plugin).
+	let raw: string | null;
 	try {
-		const raw = localStorage.getItem(STORAGE_KEY);
-		if (!raw) return [];
-		return JSON.parse(raw) as SerializedTab[];
-	} catch {
-		return [];
+		raw = localStorage.getItem(STORAGE_KEY);
+	} catch (err) {
+		return { tabs: [], error: `couldn't read the saved terminal list (${errText(err)})` };
+	}
+	if (!raw) return { tabs: [], error: null };
+	return parseSerialized(raw);
+}
+
+function parseSerialized(raw: string): { tabs: SerializedTab[]; error: string | null } {
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (Array.isArray(parsed)) return { tabs: parsed as SerializedTab[], error: null };
+		return { tabs: [], error: 'the saved terminal list is not a list' };
+	} catch (err) {
+		return { tabs: [], error: `the saved terminal list is unreadable (${errText(err)})` };
 	}
 }
 
@@ -302,14 +325,21 @@ export function makeTerminalId(): string {
 	return makeId();
 }
 
-async function readResumeSetting(): Promise<boolean> {
+/** The resume-on-start setting, or `error` when it couldn't be read (the
+ *  caller then skips auto-resume, but says why). */
+async function readResumeSetting(): Promise<{ resume: boolean; error: string | null }> {
 	try {
 		const v = await settingsGet(RESUME_TERMINALS_KEY);
-		if (v == null) return false;
-		return v === 'true' || v === '1';
-	} catch {
-		return false;
+		if (v == null) return { resume: false, error: null };
+		return { resume: v === 'true' || v === '1', error: null };
+	} catch (err) {
+		return { resume: false, error: errText(err) };
 	}
+}
+
+/** True while an unreadable saved list must not be overwritten. */
+function saveHeld(): boolean {
+	return useTerminalStore.getState().restoreError?.holdsSave === true;
 }
 
 /**
@@ -366,6 +396,7 @@ async function respawnTab(tab: TerminalTab): Promise<void> {
 
 export const useTerminalStore = create<TerminalState>((set, get) => {
 	const persistDebounced = debounce(() => {
+		if (get().restoreError?.holdsSave) return;
 		void writePersisted(serialize(get().tabs));
 	}, 300);
 
@@ -373,6 +404,14 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 		tabs: [],
 		activeId: null,
 		rehydrated: false,
+		restoreError: null,
+
+		dismissRestoreError: () => {
+			const held = get().restoreError?.holdsSave;
+			set({ restoreError: null });
+			// Saving was paused; catch up with what is open now.
+			if (held) persistDebounced();
+		},
 
 		add: (spec, title, id) => {
 			const tabId = id ?? makeId();
@@ -534,7 +573,15 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 
 		rehydrateFromDb: async () => {
 			try {
-				const persisted = await readPersisted();
+				const { tabs: persisted, error: readError } = await readPersisted();
+				if (readError) {
+					set({
+						restoreError: {
+							message: `Couldn't restore your previous terminals: ${readError}. Saving is paused so the saved list isn't overwritten — dismiss to start saving again.`,
+							holdsSave: true,
+						},
+					});
+				}
 
 				// On a webview reload the Tauri process (and its PTYs) survive.
 				// Reconcile against the live PTY list before deciding to respawn.
@@ -603,7 +650,15 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 				// 'spawning' state. Respawning here instead of inside SingleTerminal
 				// means unfocused panes also get a PTY immediately, not when the
 				// user switches to them. Skipped when the user turns the setting off.
-				const resume = await readResumeSetting();
+				const { resume, error: resumeError } = await readResumeSetting();
+				if (resumeError && restored.some((t) => t.status === 'spawning') && !get().restoreError) {
+					set({
+						restoreError: {
+							message: `Couldn't read the "resume terminals" setting (${resumeError}), so your previous terminals weren't restarted. Open one to start it.`,
+							holdsSave: false,
+						},
+					});
+				}
 				if (resume) {
 					for (const tab of restored) {
 						if (tab.status === 'spawning') {
@@ -613,11 +668,18 @@ export const useTerminalStore = create<TerminalState>((set, get) => {
 				}
 			} catch (err) {
 				console.warn('[terminal/session-store] rehydrate failed', err);
-				set({ rehydrated: true });
+				set({
+					rehydrated: true,
+					restoreError: get().restoreError ?? {
+						message: `Couldn't restore your previous terminals: ${errText(err)}.`,
+						holdsSave: false,
+					},
+				});
 			}
 		},
 
 		persistToDb: async () => {
+			if (get().restoreError?.holdsSave) return;
 			await writePersisted(serialize(get().tabs));
 		},
 	};
@@ -740,6 +802,7 @@ if (typeof window !== 'undefined') installAgentHookListener();
 // Immediate close-flush on beforeunload (issue #133): ensures pending tab state is written on app exit
 if (typeof window !== 'undefined') {
 	window.addEventListener('beforeunload', () => {
+		if (saveHeld()) return;
 		const tabs = useTerminalStore.getState().tabs;
 		void writePersisted(serialize(tabs));
 	});

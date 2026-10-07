@@ -132,11 +132,36 @@ describe('AutomationsSection (WP-04 contract / WP-31)', () => {
       throw new Error('disabled pkg must not be read');
     });
 
-    const items = await listDeclaredWorkflows();
+    const unreadable: string[] = [];
+    const items = await listDeclaredWorkflows(unreadable);
 
     expect(items.map((i) => i.id)).toEqual(['com.ikenga.studio:nightly']);
+    // The unreadable pkg is reported, not read as "declares no workflows".
+    expect(unreadable).toEqual(['com.ikenga.broken']);
     expect(items[0].kind).toBe('workflow');
     expect(tauriCmd.pkgPreviewManifest).not.toHaveBeenCalledWith('/pkgs/off');
+  });
+
+  it('a failed kernel read shows an error row, not "Nothing scheduled"', async () => {
+    vi.mocked(tauriCmd.pkgKernelStatus).mockRejectedValue(new Error('kernel not ready'));
+
+    renderSection();
+
+    await waitFor(() => expect(screen.getByText("Couldn't load automations")).toBeDefined());
+    expect(screen.queryByText('Nothing scheduled')).toBeNull();
+  });
+
+  it('an unreadable pkg manifest shows an error row instead of the empty state', async () => {
+    vi.mocked(tauriCmd.pkgKernelStatus).mockResolvedValue(
+      kernelStatus([{ id: 'com.ikenga.broken', install_path: '/pkgs/broken' }]),
+    );
+    vi.mocked(tauriCmd.pkgPreviewManifest).mockRejectedValue(new Error('EACCES'));
+
+    renderSection();
+
+    await waitFor(() => expect(screen.getByText("Couldn't read workflows for 1 package")).toBeDefined());
+    expect(screen.getByText('com.ikenga.broken')).toBeDefined();
+    expect(screen.queryByText('Nothing scheduled')).toBeNull();
   });
 
   it('lists manifest cron[] entries from registries.cron (WP-42, Round 32 G-45)', async () => {

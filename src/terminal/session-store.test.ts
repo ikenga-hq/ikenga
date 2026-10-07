@@ -23,7 +23,7 @@ vi.mock('@/lib/tauri-cmd', () => ({
 }));
 
 function reset() {
-	useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+	useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false, restoreError: null });
 }
 
 describe('useTerminalStore ownership', () => {
@@ -356,5 +356,56 @@ describe('stripSecretEnv (ADR-013 §Addendum Decision 3)', () => {
 
 	it('passes through undefined', () => {
 		expect(stripSecretEnv(undefined)).toBeUndefined();
+	});
+});
+
+describe('rehydrate: a failed read is not "no saved terminals"', () => {
+	beforeEach(() => {
+		reset();
+		localStorage.clear();
+	});
+
+	it('an unreadable saved list reports an error and is not overwritten by the next save', async () => {
+		localStorage.setItem('terminal.tabs', '{corrupt');
+
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const err = useTerminalStore.getState().restoreError;
+		expect(err?.holdsSave).toBe(true);
+		expect(err?.message).toMatch(/Couldn't restore your previous terminals/);
+
+		// A new tab this session must not clobber the unreadable saved list.
+		useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).toBe('{corrupt');
+
+		// Dismissing the notice resumes saving.
+		useTerminalStore.getState().dismissRestoreError();
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+		await useTerminalStore.getState().persistToDb();
+		expect(localStorage.getItem('terminal.tabs')).not.toBe('{corrupt');
+	});
+
+	it('a failed resume-setting read is reported, and nothing is respawned', async () => {
+		const id = useTerminalStore.getState().add({ cwd: '/tmp', cmd: ['bash'] });
+		useTerminalStore.getState().setStatus(id, 'running');
+		await useTerminalStore.getState().persistToDb();
+		useTerminalStore.setState({ tabs: [], activeId: null, rehydrated: false });
+
+		vi.mocked(settingsGet).mockRejectedValueOnce(new Error('settings store locked'));
+		vi.mocked(ptySpawn).mockClear();
+		await useTerminalStore.getState().rehydrateFromDb();
+
+		const err = useTerminalStore.getState().restoreError;
+		expect(err?.holdsSave).toBe(false);
+		expect(err?.message).toContain('settings store locked');
+		expect(useTerminalStore.getState().tabs.find((t) => t.id === id)?.status).toBe('spawning');
+		expect(ptySpawn).not.toHaveBeenCalled();
+	});
+
+	it('an empty store is a clean empty restore with no error', async () => {
+		await useTerminalStore.getState().rehydrateFromDb();
+		expect(useTerminalStore.getState().restoreError).toBeNull();
+		expect(useTerminalStore.getState().tabs).toEqual([]);
 	});
 });
